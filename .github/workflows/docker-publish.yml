@@ -233,6 +233,7 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/custom' }}
             type=raw,value=pre,enable=${{ contains(github.ref, '-') }}
             type=raw,value=fix,enable=${{ contains(github.ref, '-fix') }}
             type=sha,prefix=
