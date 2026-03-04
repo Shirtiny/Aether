@@ -11,8 +11,8 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  GHCR_IMAGE: fawney19/aether-proxy
-  DOCKERHUB_IMAGE: fawney19/aether-proxy
+  GHCR_IMAGE: Shirtiny/aether-proxy
+  DOCKERHUB_IMAGE: Shirtiny/aether-proxy
 
 jobs:
   build:
@@ -189,14 +189,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: master
+          ref: custom
 
       - name: Update README download links
         env:
           TAG: ${{ github.ref_name }}
         run: |
           VERSION="${TAG#proxy-v}"
-          BASE="https://github.com/fawney19/Aether/releases/download/${TAG}"
+          BASE="https://github.com/Shirtiny/Aether/releases/download/${TAG}"
           cd aether-proxy
 
           TABLE="| Platform | Download |\n|----------|----------|\n"

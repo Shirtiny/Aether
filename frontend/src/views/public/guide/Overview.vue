@@ -20,7 +20,7 @@ const copiedStep = ref<string | null>(null)
 const productionSteps = [
   {
     title: '克隆代码',
-    code: 'git clone https://github.com/fawney19/Aether.git\ncd Aether',
+    code: 'git clone https://github.com/Shirtiny/Aether.git\ncd Aether',
     icon: Code
   },
   {
@@ -47,7 +47,7 @@ const productionSteps = [
 const localBuildSteps = [
   {
     title: '克隆代码',
-    code: 'git clone https://github.com/fawney19/Aether.git\ncd Aether',
+    code: 'git clone https://github.com/Shirtiny/Aether.git\ncd Aether',
     icon: Code
   },
   {
@@ -474,7 +474,7 @@ function copyStep(stepId: string, code: string) {
           <h3>1. Aether-Proxy</h3>
           <p>Rust实现, 超小资源占有, 适合性能低的VPS直接使用。</p>
           <a
-            href="https://github.com/fawney19/Aether/tree/master/aether-proxy"
+            href="https://github.com/Shirtiny/Aether/tree/master/aether-proxy"
             target="_blank"
             rel="noopener noreferrer"
             class="text-[#cc785c] dark:text-[#d4a27f] hover:underline mt-2 inline-block"

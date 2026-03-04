@@ -6,7 +6,7 @@
 ### 1. 预构建镜像 (Docker Compose)
 ```markdown
 # 1. 克隆代码
-git clone https://github.com/fawney19/Aether.git
+git clone https://github.com/Shirtiny/Aether.git
 cd Aether
 
 # 2. 配置环境变量
@@ -23,7 +23,7 @@ docker compose exec postgres pg_dump -U postgres aether | gzip > backup_$(date +
 ### 2. 本地代码构建镜像 (Docker Compose)
 ```markdown
 # 1. 克隆代码
-git clone https://github.com/fawney19/Aether.git
+git clone https://github.com/Shirtiny/Aether.git
 cd Aether
 
 # 2. 配置环境变量
@@ -119,7 +119,7 @@ cd frontend && npm install && npm run dev
 
 1. **Aether-Proxy**
    Rust实现, 超小资源占有, 适合性能低的vps直接使用。
-   [https://github.com/fawney19/Aether/tree/master/aether-proxy](https://github.com/fawney19/Aether/tree/master/aether-proxy)
+   [https://github.com/Shirtiny/Aether/tree/master/aether-proxy](https://github.com/Shirtiny/Aether/tree/master/aether-proxy)
 
 2. **代理节点**
    在模块管理中, 开启代理模块后可以添加和使用代理功能, 包括手动添加和Aether-Proxy自动连接。

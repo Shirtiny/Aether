@@ -62,9 +62,9 @@ tls = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/fawney19/Aether"
-Repository = "https://github.com/fawney19/Aether.git"
-Issues = "https://github.com/fawney19/Aether/issues"
+Homepage = "https://github.com/Shirtiny/Aether"
+Repository = "https://github.com/Shirtiny/Aether.git"
+Issues = "https://github.com/Shirtiny/Aether/issues"
 
 [project.scripts]
 aether = "src.main:main"

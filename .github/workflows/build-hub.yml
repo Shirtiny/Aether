@@ -11,8 +11,8 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  GHCR_IMAGE: fawney19/aether-hub
-  DOCKERHUB_IMAGE: fawney19/aether-hub
+  GHCR_IMAGE: Shirtiny/aether-hub
+  DOCKERHUB_IMAGE: Shirtiny/aether-hub
 
 jobs:
   build:

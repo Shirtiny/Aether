@@ -13,7 +13,7 @@ RUN cd frontend && npm run build
 FROM python:3.13-slim
 WORKDIR /app
 
-ARG HUB_RELEASE_REPO=fawney19/Aether
+ARG HUB_RELEASE_REPO=Shirtiny/Aether
 ARG HUB_TAG
 ARG TARGETARCH
 

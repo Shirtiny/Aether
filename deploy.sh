@@ -34,7 +34,7 @@ CODE_HASH_FILE=".code-hash"
 MIGRATION_HASH_FILE=".migration-hash"
 
 # Hub release 配置
-GITHUB_REPO="fawney19/Aether"
+GITHUB_REPO="Shirtiny/Aether"
 HUB_TAG_STATE_FILE=".hub-tag"
 
 usage() {

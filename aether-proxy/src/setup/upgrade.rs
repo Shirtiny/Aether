@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 const GITHUB_API_BASE: &str = "https://api.github.com";
-const GITHUB_REPO: &str = "fawney19/Aether";
+const GITHUB_REPO: &str = "Shirtiny/Aether";
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // ── GitHub API types ─────────────────────────────────────────────────────────
