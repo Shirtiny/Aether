@@ -1,6 +1,6 @@
 services:
   aether-proxy:
-    image: ghcr.io/Shirtiny/aether-proxy:latest
+    image: ghcr.io/shirtiny/aether-proxy:latest
     container_name: aether-proxy
     restart: unless-stopped
     env_file:

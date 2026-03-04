@@ -13,7 +13,7 @@
 #
 #   # image 模式（多架构推送）
 #   ./build.sh --image --tag v0.2.5 --push --latest
-#   ./build.sh --image --tag sha-abc123 --image-name ghcr.io/Shirtiny/aether-hub --push
+#   ./build.sh --image --tag sha-abc123 --image-name ghcr.io/shirtiny/aether-hub --push
 #   ./build.sh --image --tag local-test --platforms linux/amd64 --load
 
 set -euo pipefail
@@ -33,7 +33,7 @@ UPLOAD_TAG=""
 BINARY_TARGETS=""
 
 # image mode options
-IMAGE_NAME="${IMAGE_NAME:-ghcr.io/Shirtiny/aether-hub}"
+IMAGE_NAME="${IMAGE_NAME:-ghcr.io/shirtiny/aether-hub}"
 IMAGE_TAG=""
 IMAGE_PLATFORMS="linux/amd64,linux/arm64"
 IMAGE_PUSH=false
@@ -53,7 +53,7 @@ binary 模式（默认）:
 image 模式:
   --image                  启用镜像模式
   --tag <tag>              镜像 tag（默认自动从 git describe 推导）
-  --image-name <name>      镜像名（默认 ghcr.io/Shirtiny/aether-hub）
+  --image-name <name>      镜像名（默认 ghcr.io/shirtiny/aether-hub）
   --platforms <list>       平台列表，逗号分隔（默认 linux/amd64,linux/arm64）
   --push                   推送镜像到仓库
   --load                   加载到本地 Docker（仅单平台）

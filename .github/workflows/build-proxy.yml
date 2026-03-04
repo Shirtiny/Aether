@@ -12,8 +12,8 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  GHCR_IMAGE: Shirtiny/aether-proxy
-  DOCKERHUB_IMAGE: Shirtiny/aether-proxy
+  GHCR_IMAGE: shirtiny/aether-proxy
+  DOCKERHUB_IMAGE: shirtiny/aether-proxy
 
 jobs:
   build:

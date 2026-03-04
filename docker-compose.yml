@@ -31,7 +31,7 @@ services:
     restart: unless-stopped
 
   app:
-    image: ${APP_IMAGE:-ghcr.io/Shirtiny/aether:latest}
+    image: ${APP_IMAGE:-ghcr.io/shirtiny/aether:latest}
     container_name: aether-app
     env_file:
       - .env

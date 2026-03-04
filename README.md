@@ -138,13 +138,13 @@ gunzip < backup_xxx.sql.gz | docker compose exec -T postgres psql -U postgres -d
 
 # 3. 拉取旧版本镜像并重启
 #    方式一：使用具体版本 tag（如果有发布版本号）
-#    将 docker-compose.yml 中 image 从 ghcr.io/Shirtiny/aether:latest 改为指定版本
+#    将 docker-compose.yml 中 image 从 ghcr.io/shirtiny/aether:latest 改为指定版本
 #    方式二：使用之前记录的镜像 digest
-#    将 image 改为 ghcr.io/Shirtiny/aether@sha256:xxxxx
+#    将 image 改为 ghcr.io/shirtiny/aether@sha256:xxxxx
 docker compose up -d app
 ```
 
-> 可以在升级前通过 `docker inspect ghcr.io/Shirtiny/aether:latest --format '{{index .RepoDigests 0}}'` 记录当前镜像 digest，方便回滚时使用。
+> 可以在升级前通过 `docker inspect ghcr.io/shirtiny/aether:latest --format '{{index .RepoDigests 0}}'` 记录当前镜像 digest，方便回滚时使用。
 
 **没有备份的情况：**
 

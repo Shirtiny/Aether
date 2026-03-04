@@ -14,8 +14,8 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  BASE_IMAGE_NAME: Shirtiny/aether-base
-  APP_IMAGE_NAME: Shirtiny/aether
+  BASE_IMAGE_NAME: shirtiny/aether-base
+  APP_IMAGE_NAME: shirtiny/aether
   GITHUB_REPO: Shirtiny/Aether
   # Base image hash inputs:
   # - Dockerfile.base
@@ -229,7 +229,7 @@ jobs:
         with:
           images: |
             ${{ env.REGISTRY }}/${{ env.APP_IMAGE_NAME }}
-            docker.io/Shirtiny/aether
+            docker.io/shirtiny/aether
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
@@ -284,7 +284,7 @@ jobs:
             HUB_RELEASE_REPO=${{ env.GITHUB_REPO }}
             HUB_TAG=${{ needs.download-hub.outputs.hub_tag }}
           platforms: linux/amd64
-          outputs: type=image,"name=${{ env.REGISTRY }}/${{ env.APP_IMAGE_NAME }},docker.io/Shirtiny/aether",push-by-digest=true,name-canonical=true,push=true
+          outputs: type=image,"name=${{ env.REGISTRY }}/${{ env.APP_IMAGE_NAME }},docker.io/shirtiny/aether",push-by-digest=true,name-canonical=true,push=true
 
       - name: Build and push app image (arm64)
         id: build-arm64
@@ -300,7 +300,7 @@ jobs:
             HUB_RELEASE_REPO=${{ env.GITHUB_REPO }}
             HUB_TAG=${{ needs.download-hub.outputs.hub_tag }}
           platforms: linux/arm64
-          outputs: type=image,"name=${{ env.REGISTRY }}/${{ env.APP_IMAGE_NAME }},docker.io/Shirtiny/aether",push-by-digest=true,name-canonical=true,push=true
+          outputs: type=image,"name=${{ env.REGISTRY }}/${{ env.APP_IMAGE_NAME }},docker.io/shirtiny/aether",push-by-digest=true,name-canonical=true,push=true
 
       - name: Create multi-arch manifest and push
         run: |
@@ -317,7 +317,7 @@ jobs:
             if [[ "$FULL_TAG" == ghcr.io/* ]]; then
               REPO="${{ env.REGISTRY }}/${{ env.APP_IMAGE_NAME }}"
             elif [[ "$FULL_TAG" == docker.io/* ]]; then
-              REPO="docker.io/Shirtiny/aether"
+              REPO="docker.io/shirtiny/aether"
             else
               continue
             fi

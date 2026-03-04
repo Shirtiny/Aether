@@ -7,7 +7,7 @@
 
 ### 3. 添加Docker容器镜像
 
-1. 镜像: ghcr.io/Shirtiny/aether:latest
+1. 镜像: ghcr.io/shirtiny/aether:latest
 
 2. 环境变量
 
