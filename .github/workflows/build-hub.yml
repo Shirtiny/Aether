@@ -2,6 +2,7 @@ name: Build aether-hub
 
 on:
   push:
+    branches: [custom]
     tags: ['hub-v*']
   workflow_dispatch:
 
