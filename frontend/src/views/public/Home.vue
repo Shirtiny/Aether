@@ -74,7 +74,7 @@
               class="h-3.5 w-3.5"
             />
           </button>
-          <a
+          <!-- <a
             href="https://github.com/Shirtiny/Aether"
             target="_blank"
             rel="noopener noreferrer"
@@ -82,7 +82,7 @@
             title="GitHub 仓库"
           >
             <GithubIcon class="h-3.5 w-3.5" />
-          </a>
+          </a> -->
         </div>
       </div>
 
@@ -127,12 +127,12 @@
                 :class="currentSection === index ? 'bg-[#cc785c] dark:bg-[#d4a27f] scale-x-100' : 'bg-transparent scale-x-0'"
               />
             </button>
-            <RouterLink
+            <!-- <RouterLink
               to="/guide"
               class="group relative px-3 py-2 text-sm font-medium transition whitespace-nowrap text-[#666663] dark:text-muted-foreground hover:text-[#191919] dark:hover:text-white"
             >
               文档
-            </RouterLink>
+            </RouterLink> -->
             <button
               class="group relative px-3 py-2 text-sm font-medium transition whitespace-nowrap"
               :class="currentSection === SECTIONS.FEATURES
@@ -185,7 +185,7 @@
               class="h-4 w-4"
             />
           </button>
-          <a
+          <!-- <a
             href="https://github.com/Shirtiny/Aether"
             target="_blank"
             rel="noopener noreferrer"
@@ -193,7 +193,7 @@
             title="GitHub 仓库"
           >
             <GithubIcon class="h-4 w-4" />
-          </a>
+          </a> -->
         </div>
       </div>
     </header>

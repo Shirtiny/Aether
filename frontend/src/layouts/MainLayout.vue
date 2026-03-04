@@ -299,7 +299,7 @@
             />
           </button>
           <!-- GitHub Link -->
-          <a
+          <!-- <a
             href="https://github.com/Shirtiny/Aether"
             target="_blank"
             rel="noopener noreferrer"
@@ -307,7 +307,7 @@
             title="GitHub 仓库"
           >
             <GithubIcon class="h-4 w-4" />
-          </a>
+          </a> -->
         </div>
       </header>
     </template>
