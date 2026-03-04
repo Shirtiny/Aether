@@ -37,3 +37,35 @@
 ### Next Steps
 
 - None - task complete
+
+
+## Session 2: Fork 去上游化：替换仓库所有者为 Shirtiny
+
+**Date**: 2026-03-04
+**Task**: Fork 去上游化：替换仓库所有者为 Shirtiny
+
+### Summary
+
+将项目内所有 fawney19 引用（GitHub 仓库链接、GHCR/Docker Hub 镜像名、Pages 地址、Rust 常量、CI/CD workflow）全量替换为 Shirtiny；删除 deploy-pages.yml；build-proxy.yml 的 README 更新步骤 checkout 改为 custom 分支；确立 custom 为生产分支、master 仅接收上游更新的分支策略
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `398641f` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
