@@ -294,9 +294,6 @@
                 <TableHead class="w-24 font-semibold whitespace-nowrap">
                   状态
                 </TableHead>
-                <TableHead class="w-20 font-semibold text-center whitespace-nowrap">
-                  会话
-                </TableHead>
                 <TableHead class="w-24 font-semibold whitespace-nowrap">
                   最后使用
                 </TableHead>
@@ -347,18 +344,6 @@
                         {{ key.auth_type === 'oauth' ? '[OAuth Token]' : (key.auth_type === 'service_account' ? '[Service Account]' : '[Key]') }}
                       </span>
                       <template v-if="key.auth_type === 'oauth'">
-                        <span
-                          v-if="getKeyOAuthExpires(key)"
-                          class="text-[10px]"
-                          :class="{
-                            'text-destructive': getKeyOAuthExpires(key)?.isInvalid || getKeyOAuthExpires(key)?.isExpired,
-                            'text-warning': getKeyOAuthExpires(key)?.isExpiringSoon && !getKeyOAuthExpires(key)?.isExpired && !getKeyOAuthExpires(key)?.isInvalid,
-                            'text-muted-foreground': !getKeyOAuthExpires(key)?.isExpired && !getKeyOAuthExpires(key)?.isExpiringSoon && !getKeyOAuthExpires(key)?.isInvalid
-                          }"
-                          :title="getOAuthStatusTitle(key)"
-                        >
-                          {{ getKeyOAuthExpires(key)?.text }}
-                        </span>
                         <Button
                           variant="ghost"
                           size="icon"
@@ -372,6 +357,18 @@
                             :class="{ 'animate-spin': refreshingOAuthKeyId === key.key_id }"
                           />
                         </Button>
+                        <span
+                          v-if="getKeyOAuthExpires(key)"
+                          class="text-[10px]"
+                          :class="{
+                            'text-destructive': getKeyOAuthExpires(key)?.isInvalid || getKeyOAuthExpires(key)?.isExpired,
+                            'text-warning': getKeyOAuthExpires(key)?.isExpiringSoon && !getKeyOAuthExpires(key)?.isExpired && !getKeyOAuthExpires(key)?.isInvalid,
+                            'text-muted-foreground': !getKeyOAuthExpires(key)?.isExpired && !getKeyOAuthExpires(key)?.isExpiringSoon && !getKeyOAuthExpires(key)?.isInvalid
+                          }"
+                          :title="getOAuthStatusTitle(key)"
+                        >
+                          {{ getKeyOAuthExpires(key)?.text }}
+                        </span>
                       </template>
                       <Badge
                         v-if="key.oauth_plan_type"
@@ -528,11 +525,6 @@
                   >
                     {{ getSchedulingBadgeLabel(key) }}
                   </Badge>
-                </TableCell>
-                <TableCell class="py-3 text-center">
-                  <span class="text-xs tabular-nums">
-                    {{ formatSessionCount(key.sticky_sessions) }}
-                  </span>
                 </TableCell>
                 <TableCell class="py-3">
                   <span class="text-[10px] text-muted-foreground whitespace-nowrap">
@@ -735,18 +727,6 @@
                     {{ key.auth_type === 'oauth' ? '[OAuth Token]' : (key.auth_type === 'service_account' ? '[Service Account]' : '[Key]') }}
                   </span>
                   <template v-if="key.auth_type === 'oauth'">
-                    <span
-                      v-if="getKeyOAuthExpires(key)"
-                      class="text-[10px]"
-                      :class="{
-                        'text-destructive': getKeyOAuthExpires(key)?.isInvalid || getKeyOAuthExpires(key)?.isExpired,
-                        'text-warning': getKeyOAuthExpires(key)?.isExpiringSoon && !getKeyOAuthExpires(key)?.isExpired && !getKeyOAuthExpires(key)?.isInvalid,
-                        'text-muted-foreground': !getKeyOAuthExpires(key)?.isExpired && !getKeyOAuthExpires(key)?.isExpiringSoon && !getKeyOAuthExpires(key)?.isInvalid
-                      }"
-                      :title="getOAuthStatusTitle(key)"
-                    >
-                      {{ getKeyOAuthExpires(key)?.text }}
-                    </span>
                     <Button
                       variant="ghost"
                       size="icon"
@@ -760,6 +740,18 @@
                         :class="{ 'animate-spin': refreshingOAuthKeyId === key.key_id }"
                       />
                     </Button>
+                    <span
+                      v-if="getKeyOAuthExpires(key)"
+                      class="text-[10px]"
+                      :class="{
+                        'text-destructive': getKeyOAuthExpires(key)?.isInvalid || getKeyOAuthExpires(key)?.isExpired,
+                        'text-warning': getKeyOAuthExpires(key)?.isExpiringSoon && !getKeyOAuthExpires(key)?.isExpired && !getKeyOAuthExpires(key)?.isInvalid,
+                        'text-muted-foreground': !getKeyOAuthExpires(key)?.isExpired && !getKeyOAuthExpires(key)?.isExpiringSoon && !getKeyOAuthExpires(key)?.isInvalid
+                      }"
+                      :title="getOAuthStatusTitle(key)"
+                    >
+                      {{ getKeyOAuthExpires(key)?.text }}
+                    </span>
                   </template>
                   <Badge
                     v-if="key.oauth_plan_type"
@@ -971,16 +963,6 @@
                     :class="getSchedulingScoreBarColor(getSchedulingScore(key))"
                     :style="{ width: `${Math.max(Math.min(getSchedulingScore(key), 100), 0)}%` }"
                   />
-                </div>
-              </div>
-              <div class="p-2 bg-muted/50 rounded-lg text-xs">
-                <div class="text-muted-foreground mb-0.5">
-                  会话
-                </div>
-                <div
-                  class="font-medium tabular-nums text-[11px]"
-                >
-                  {{ formatSessionCount(key.sticky_sessions) }}
                 </div>
               </div>
               <div class="p-2 bg-muted/50 rounded-lg text-xs">
@@ -2219,12 +2201,6 @@ function formatStatUsd(value: number | null | undefined): string {
   if (n < 1) return `$${n.toFixed(3)}`
   if (n < 1000) return `$${n.toFixed(2)}`
   return `$${n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
-}
-
-function formatSessionCount(value: number | null | undefined): string {
-  const n = Number(value ?? 0)
-  if (!Number.isFinite(n) || n <= 0) return '0'
-  return Math.round(n).toLocaleString('en-US')
 }
 
 function formatRelativeTime(isoStr: string): string {

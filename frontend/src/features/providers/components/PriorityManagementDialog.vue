@@ -174,22 +174,33 @@
             v-else
             class="flex gap-0 h-full"
           >
-            <!-- 左侧：API 格式列表 -->
-            <div class="w-36 shrink-0 space-y-0.5 overflow-y-auto border-r border-border/50 pr-3 mr-3 py-0.5">
-              <button
-                v-for="format in availableFormats"
-                :key="format"
-                type="button"
-                class="w-full px-3 py-2 text-xs font-medium rounded-lg text-left transition-all duration-200"
-                :class="[
-                  activeFormatTab === format
-                    ? 'bg-primary text-primary-foreground shadow-sm'
-                    : 'text-muted-foreground hover:text-foreground hover:bg-muted/50'
-                ]"
-                @click="activeFormatTab = format"
+            <!-- 左侧：API 格式列表（按 family 分组） -->
+            <div class="w-36 shrink-0 overflow-y-auto border-r border-border/50 pr-3 mr-3 py-0.5">
+              <div
+                v-for="(group, gi) in groupedFormats"
+                :key="group.family"
+                :class="gi > 0 ? 'mt-3' : ''"
               >
-                {{ formatApiFormat(format) }}
-              </button>
+                <div class="px-2 pb-1 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/60">
+                  {{ group.label }}
+                </div>
+                <div class="space-y-0.5">
+                  <button
+                    v-for="format in group.formats"
+                    :key="format"
+                    type="button"
+                    class="w-full px-3 py-1.5 text-xs font-medium rounded-lg text-left transition-all duration-200"
+                    :class="[
+                      activeFormatTab === format
+                        ? 'bg-primary text-primary-foreground shadow-sm'
+                        : 'text-muted-foreground hover:text-foreground hover:bg-muted/50'
+                    ]"
+                    @click="activeFormatTab = format"
+                  >
+                    {{ formatKind(format) }}
+                  </button>
+                </div>
+              </div>
             </div>
 
             <!-- 右侧：Key 列表 -->
@@ -201,33 +212,33 @@
                 class="h-full"
               >
                 <div
-                  v-if="keysByFormat[format]?.length > 0"
+                  v-if="displayKeysByFormat[format]?.length > 0"
                   class="space-y-0.5 h-full overflow-y-auto pr-1"
                 >
                   <div
-                    v-for="(key, index) in keysByFormat[format]"
+                    v-for="key in displayKeysByFormat[format]"
                     :key="key.id"
                     class="group flex items-center gap-2 px-2.5 py-1.5 rounded-lg border transition-all duration-200"
                     :class="[
                       !(key.is_active && key.provider_active)
                         ? 'border-border/30 bg-muted/20 opacity-50'
-                        : draggedKey[format] === index
+                        : draggedKey[format] === key.id
                           ? 'border-primary/50 bg-primary/5 shadow-md scale-[1.01]'
-                          : dragOverKey[format] === index
+                          : dragOverKey[format] === key.id
                             ? 'border-primary/30 bg-primary/5'
                             : 'border-border/50 bg-background hover:border-border hover:bg-muted/30'
                     ]"
-                    :draggable="key.is_active && key.provider_active"
-                    @dragstart="(key.is_active && key.provider_active) && handleKeyDragStart(format, index, $event)"
+                    :draggable="!key.is_pool_aggregate && key.is_active && key.provider_active"
+                    @dragstart="(!key.is_pool_aggregate && key.is_active && key.provider_active) && handleKeyDragStart(format, key.id, $event)"
                     @dragend="handleKeyDragEnd(format)"
-                    @dragover.prevent="handleKeyDragOver(format, index)"
+                    @dragover.prevent="!key.is_pool_aggregate && handleKeyDragOver(format, key.id)"
                     @dragleave="handleKeyDragLeave(format)"
-                    @drop="handleKeyDrop(format, index)"
+                    @drop="!key.is_pool_aggregate && handleKeyDrop(format, key.id)"
                   >
                     <!-- 拖拽手柄 -->
                     <div
                       class="p-0.5 rounded transition-colors shrink-0"
-                      :class="(key.is_active && key.provider_active)
+                      :class="(!key.is_pool_aggregate && key.is_active && key.provider_active)
                         ? 'cursor-grab active:cursor-grabbing text-muted-foreground/30 group-hover:text-muted-foreground'
                         : 'text-muted-foreground/15 cursor-default'"
                     >
@@ -237,7 +248,7 @@
                     <!-- 可编辑序号 -->
                     <div class="shrink-0">
                       <input
-                        v-if="editingKeyPriority[format] === key.id"
+                        v-if="!key.is_pool_aggregate && editingKeyPriority[format] === key.id"
                         type="number"
                         min="1"
                         :value="key.priority"
@@ -249,9 +260,12 @@
                       >
                       <div
                         v-else
-                        class="w-5 h-5 rounded bg-muted/50 flex items-center justify-center text-[11px] font-medium text-muted-foreground cursor-pointer hover:bg-primary/10 hover:text-primary transition-colors"
-                        title="点击编辑优先级"
-                        @click.stop="startEditKeyPriority(format, key)"
+                        class="w-5 h-5 rounded bg-muted/50 flex items-center justify-center text-[11px] font-medium transition-colors"
+                        :class="key.is_pool_aggregate
+                          ? 'text-muted-foreground/60 cursor-not-allowed'
+                          : 'text-muted-foreground cursor-pointer hover:bg-primary/10 hover:text-primary'"
+                        :title="key.is_pool_aggregate ? '号池优先级请在号池配置中调整' : '点击编辑优先级'"
+                        @click.stop="!key.is_pool_aggregate && startEditKeyPriority(format, key)"
                       >
                         {{ key.priority }}
                       </div>
@@ -266,7 +280,14 @@
                           :class="!(key.is_active && key.provider_active) ? 'text-muted-foreground' : ''"
                         >{{ key.name }}</span>
                         <Badge
-                          v-if="key.circuit_breaker_open"
+                          v-if="key.is_pool_aggregate"
+                          variant="outline"
+                          class="text-[9px] h-4 px-1 shrink-0"
+                        >
+                          号池
+                        </Badge>
+                        <Badge
+                          v-else-if="key.circuit_breaker_open"
                           variant="destructive"
                           class="text-[9px] h-4 px-1 shrink-0"
                         >
@@ -282,9 +303,20 @@
                       </div>
                       <!-- 第二行：密钥脱敏 · Provider 名称 + Provider 级别状态 -->
                       <div class="flex items-center gap-0 mt-0.5">
-                        <span class="font-mono text-[10px] text-muted-foreground/50 truncate">{{ key.api_key_masked }}</span>
-                        <span class="text-[10px] text-muted-foreground/40 mx-1">·</span>
-                        <span class="text-[10px] text-muted-foreground shrink-0">{{ key.provider_name }}</span>
+                        <template v-if="key.is_pool_aggregate">
+                          <span class="text-[10px] text-muted-foreground/70 truncate">
+                            号池: {{ key.pool_active_key_count ?? 0 }}/{{ key.pool_key_count ?? 0 }}
+                          </span>
+                          <template v-if="key.provider_type">
+                            <span class="text-[10px] text-muted-foreground/40 mx-1">·</span>
+                            <span class="text-[10px] text-muted-foreground shrink-0">{{ formatProviderType(key.provider_type) }}</span>
+                          </template>
+                        </template>
+                        <template v-else>
+                          <span class="font-mono text-[10px] text-muted-foreground/50 truncate">{{ key.api_key_masked }}</span>
+                          <span class="text-[10px] text-muted-foreground/40 mx-1">·</span>
+                          <span class="text-[10px] text-muted-foreground shrink-0">{{ key.provider_name }}</span>
+                        </template>
                         <Badge
                           v-if="!key.provider_active"
                           variant="secondary"
@@ -312,20 +344,26 @@
                           --
                         </div>
                         <div class="text-[10px] text-muted-foreground tabular-nums">
-                          {{ key.rate_multipliers?.[format] ?? 1 }}x
+                          {{ key.is_pool_aggregate ? 'Pool' : (key.rate_multipliers?.[format] ?? 1) + 'x' }}
                         </div>
                       </div>
                       <!-- 快捷启用/禁用开关 -->
                       <button
                         class="p-0.5 rounded transition-colors shrink-0"
-                        :class="!key.provider_active
+                        :class="(key.is_pool_aggregate || !key.provider_active)
                           ? 'text-muted-foreground/20 cursor-not-allowed'
                           : key.is_active
                             ? 'text-foreground/70 hover:bg-muted hover:text-foreground'
                             : 'text-muted-foreground hover:bg-muted hover:text-foreground'"
-                        :title="!key.provider_active ? 'Provider 停用' : key.is_active ? '点击停用' : '点击启用'"
-                        :disabled="!key.provider_active"
-                        @click.stop="toggleKeyActive(format, key)"
+                        :title="key.is_pool_aggregate
+                          ? '号池聚合项不支持在此单独开关'
+                          : !key.provider_active
+                            ? 'Provider 停用'
+                            : key.is_active
+                              ? '点击停用'
+                              : '点击启用'"
+                        :disabled="key.is_pool_aggregate || !key.provider_active"
+                        @click.stop="!key.is_pool_aggregate && toggleKeyActive(format, key)"
                       >
                         <Power class="w-3.5 h-3.5" />
                       </button>
@@ -438,11 +476,12 @@ import type { ProviderWithEndpointsSummary } from '@/api/endpoints'
 import { adminApi } from '@/api/admin'
 import { batchQueryBalance, type ActionResultResponse, type BalanceInfo } from '@/api/providerOps'
 import { API_FORMAT_SHORT } from '@/api/endpoints/types'
-import { formatApiFormat } from '@/api/endpoints/types/api-format'
+import { sortApiFormats, groupApiFormats, parseApiFormat, API_FORMAT_KIND_LABELS } from '@/api/endpoints/types/api-format'
 import { log } from '@/utils/logger'
 
 interface KeyWithMeta {
   id: string
+  provider_id: string
   name: string
   api_key_masked: string
   internal_priority: number
@@ -461,6 +500,10 @@ interface KeyWithMeta {
   success_rate: number | null
   avg_response_time_ms: number | null
   request_count: number
+  is_pool_aggregate?: boolean
+  pool_key_count?: number
+  pool_active_key_count?: number
+  provider_type?: string
 }
 
 const props = defineProps<{
@@ -493,8 +536,8 @@ const dragOverProvider = ref<number | null>(null)
 
 // Key 排序状态
 const keysByFormat = ref<Record<string, KeyWithMeta[]>>({})
-const draggedKey = ref<Record<string, number | null>>({})
-const dragOverKey = ref<Record<string, number | null>>({})
+const draggedKey = ref<Record<string, string | null>>({})
+const dragOverKey = ref<Record<string, string | null>>({})
 const loadingKeys = ref(false)
 const saving = ref(false)
 
@@ -561,10 +604,143 @@ async function loadBalances() {
   }
 }
 
+const LEGACY_API_FORMAT_MAP: Record<string, string> = {
+  CLAUDE: 'claude:chat',
+  CLAUDE_CLI: 'claude:cli',
+  OPENAI: 'openai:chat',
+  OPENAI_CLI: 'openai:cli',
+  OPENAI_COMPACT: 'openai:compact',
+  OPENAI_VIDEO: 'openai:video',
+  GEMINI: 'gemini:chat',
+  GEMINI_CLI: 'gemini:cli',
+  GEMINI_VIDEO: 'gemini:video',
+}
+
+function normalizeApiFormatKey(value: string | null | undefined): string {
+  const raw = String(value || '').trim()
+  if (!raw) return ''
+
+  if (raw.includes(':')) {
+    const [family, kind] = raw.split(':', 2)
+    const familyNorm = family?.trim().toLowerCase()
+    const kindNorm = kind?.trim().toLowerCase()
+    if (familyNorm && kindNorm) return `${familyNorm}:${kindNorm}`
+  }
+
+  const legacy = raw.toUpperCase().replace(/-/g, '_')
+  return LEGACY_API_FORMAT_MAP[legacy] || raw.toLowerCase()
+}
+
+function normalizePriorityMap(
+  value: Record<string, unknown> | null | undefined
+): Record<string, number> {
+  if (!value) return {}
+  const normalized: Record<string, number> = {}
+  for (const [rawFormat, rawPriority] of Object.entries(value)) {
+    const format = normalizeApiFormatKey(rawFormat)
+    if (!format || format in normalized) continue
+    const num = Number(rawPriority)
+    if (!Number.isFinite(num)) continue
+    normalized[format] = Math.trunc(num)
+  }
+  return normalized
+}
+
+function normalizeRateMultipliers(
+  value: Record<string, unknown> | null | undefined
+): Record<string, number> | null {
+  if (!value) return null
+  const normalized: Record<string, number> = {}
+  for (const [rawFormat, rawMultiplier] of Object.entries(value)) {
+    const format = normalizeApiFormatKey(rawFormat)
+    if (!format || format in normalized) continue
+    const num = Number(rawMultiplier)
+    if (!Number.isFinite(num)) continue
+    normalized[format] = num
+  }
+  return Object.keys(normalized).length > 0 ? normalized : null
+}
+
+const providerById = computed(() => {
+  const map = new Map<string, ProviderWithEndpointsSummary>()
+  props.providers.forEach((provider) => {
+    map.set(provider.id, provider)
+  })
+  return map
+})
+
+const providerIdByName = computed(() => {
+  const map = new Map<string, string>()
+  props.providers.forEach((provider) => {
+    if (!map.has(provider.name)) {
+      map.set(provider.name, provider.id)
+    }
+  })
+  return map
+})
+
+function resolveProviderId(key: Pick<KeyWithMeta, 'provider_id' | 'provider_name'>): string {
+  if (key.provider_id) return key.provider_id
+  return providerIdByName.value.get(key.provider_name) || ''
+}
+
+const poolProviderIds = computed(() => {
+  const set = new Set<string>()
+  props.providers.forEach((provider) => {
+    if (provider.pool_advanced) {
+      set.add(provider.id)
+    }
+  })
+  return set
+})
+
+const PROVIDER_TYPE_LABELS: Record<string, string> = {
+  custom: '自定义',
+  vertex_ai: 'Vertex AI',
+  claude_code: 'ClaudeCode',
+  codex: 'Codex',
+  gemini_cli: 'Gemini CLI',
+  antigravity: 'Antigravity',
+  kiro: 'Kiro',
+}
+
+function formatProviderType(type?: string): string {
+  if (!type) return ''
+  return PROVIDER_TYPE_LABELS[type] || type
+}
+
+function isPoolManagedProvider(providerId: string): boolean {
+  return providerId !== '' && poolProviderIds.value.has(providerId)
+}
+
+function isPoolManagedKey(key: KeyWithMeta): boolean {
+  return isPoolManagedProvider(resolveProviderId(key))
+}
+
+function isPoolAggregateItem(key: KeyWithMeta): boolean {
+  return key.is_pool_aggregate === true
+}
+
+function toNumberOrNull(value: unknown): number | null {
+  const num = Number(value)
+  return Number.isFinite(num) ? num : null
+}
+
 // 可用的 API 格式
 const availableFormats = computed(() => {
-  return Object.keys(keysByFormat.value).sort()
+  return sortApiFormats(Object.keys(keysByFormat.value))
 })
+
+// 按 family 分组的 API 格式（用于侧边栏分组显示）
+const groupedFormats = computed(() => {
+  return groupApiFormats(availableFormats.value)
+})
+
+// 获取格式的 kind 显示名称
+function formatKind(format: string): string {
+  const { kind } = parseApiFormat(format)
+  return API_FORMAT_KIND_LABELS[kind] || kind || format
+}
 
 // 排序 Key：活跃的在前，停用的(Key或Provider)在后，各自按优先级排序
 function sortKeysByActiveAndPriority(keys: KeyWithMeta[]): KeyWithMeta[] {
@@ -575,6 +751,79 @@ function sortKeysByActiveAndPriority(keys: KeyWithMeta[]): KeyWithMeta[] {
     return a.priority - b.priority
   })
 }
+
+function buildPoolAggregateItem(format: string, providerId: string, sourceKeys: KeyWithMeta[]): KeyWithMeta {
+  const provider = providerById.value.get(providerId)
+  const poolPriorityRaw = provider?.pool_advanced?.global_priority
+  const fallbackPriority = provider?.provider_priority ?? 999999
+  const poolPriority = Number.isFinite(poolPriorityRaw ?? NaN)
+    ? Number(poolPriorityRaw)
+    : fallbackPriority
+
+  const providerName = provider?.name || sourceKeys[0]?.provider_name || '未知 Provider'
+  const activeKeyCount = sourceKeys.filter((k) => k.is_active).length
+  const providerActive = provider?.is_active ?? sourceKeys.some((k) => k.provider_active)
+  const healthCandidates = sourceKeys.map((k) => k.health_score).filter((v): v is number => v != null)
+  const avgHealth = healthCandidates.length > 0
+    ? healthCandidates.reduce((sum, score) => sum + score, 0) / healthCandidates.length
+    : null
+
+  return {
+    id: `pool:${providerId}:${format}`,
+    provider_id: providerId,
+    name: providerName,
+    api_key_masked: '[Pool]',
+    internal_priority: 0,
+    global_priority_by_format: null,
+    format_priority: poolPriority,
+    priority: poolPriority,
+    rate_multipliers: { [format]: 1 },
+    is_active: activeKeyCount > 0,
+    provider_active: providerActive,
+    circuit_breaker_open: false,
+    provider_name: providerName,
+    endpoint_base_url: sourceKeys.find((k) => k.endpoint_base_url)?.endpoint_base_url || '',
+    api_format: format,
+    capabilities: [],
+    health_score: avgHealth,
+    success_rate: null,
+    avg_response_time_ms: null,
+    request_count: sourceKeys.reduce((sum, key) => sum + (key.request_count || 0), 0),
+    is_pool_aggregate: true,
+    pool_key_count: sourceKeys.length,
+    pool_active_key_count: activeKeyCount,
+    provider_type: provider?.provider_type || undefined,
+  }
+}
+
+const displayKeysByFormat = computed<Record<string, KeyWithMeta[]>>(() => {
+  const display: Record<string, KeyWithMeta[]> = {}
+
+  for (const [format, rawKeys] of Object.entries(keysByFormat.value)) {
+    const normalKeys: KeyWithMeta[] = []
+    const poolGroups = new Map<string, KeyWithMeta[]>()
+
+    for (const key of rawKeys) {
+      const providerId = resolveProviderId(key)
+      if (isPoolManagedProvider(providerId)) {
+        if (!poolGroups.has(providerId)) {
+          poolGroups.set(providerId, [])
+        }
+        poolGroups.get(providerId)?.push(key)
+      } else {
+        normalKeys.push(key)
+      }
+    }
+
+    const poolItems = Array.from(poolGroups.entries()).map(([providerId, keys]) =>
+      buildPoolAggregateItem(format, providerId, keys)
+    )
+
+    display[format] = sortKeysByActiveAndPriority([...normalKeys, ...poolItems])
+  }
+
+  return display
+})
 
 // 排序 providers：启用的在前，停用的在后，各自按优先级排序
 function sortProvidersByActiveAndPriority(providers: ProviderWithEndpointsSummary[]) {
@@ -632,21 +881,103 @@ async function loadKeysByFormat() {
     const { default: client } = await import('@/api/client')
     const response = await client.get('/api/admin/endpoints/keys/grouped-by-format')
 
-    // 每个格式独立管理优先级，使用后端返回的 format_priority
+    // 每个格式独立管理优先级，额外做一次前端归一化兜底，避免历史数据导致重复格式/脏键
     const data: Record<string, KeyWithMeta[]> = {}
-    for (const [format, keys] of Object.entries(response.data as Record<string, Record<string, unknown>[]>)) {
-      // 计算该格式下的默认优先级
-      let maxPriority = 0
+    const grouped = response.data as Record<string, Record<string, unknown>[]>
+
+    for (const [rawFormat, keys] of Object.entries(grouped)) {
+      const format = normalizeApiFormatKey(rawFormat)
+      if (!format) continue
+
+      if (!data[format]) {
+        data[format] = []
+      }
+
       for (const key of keys) {
+        const providerName = typeof key.provider_name === 'string' ? key.provider_name : ''
+        const providerIdRaw = typeof key.provider_id === 'string' ? key.provider_id : ''
+        const providerId = providerIdRaw || providerIdByName.value.get(providerName) || ''
+
+        const priorityMap = normalizePriorityMap(
+          (key.global_priority_by_format as Record<string, unknown> | null | undefined)
+        )
+        const rateMultipliers = normalizeRateMultipliers(
+          (key.rate_multipliers as Record<string, unknown> | null | undefined)
+        )
+        const explicitFormatPriority = toNumberOrNull(key.format_priority)
+        const inferredFormatPriority = priorityMap[format]
+        const formatPriority = explicitFormatPriority ?? (typeof inferredFormatPriority === 'number'
+          ? inferredFormatPriority
+          : null)
+
+        data[format].push({
+          id: String(key.id || ''),
+          provider_id: providerId,
+          name: String(key.name || 'Unnamed Key'),
+          api_key_masked: String(key.api_key_masked || '***'),
+          internal_priority: toNumberOrNull(key.internal_priority) ?? 0,
+          global_priority_by_format: Object.keys(priorityMap).length > 0 ? priorityMap : null,
+          format_priority: formatPriority,
+          priority: formatPriority ?? 0,
+          rate_multipliers: rateMultipliers,
+          is_active: key.is_active !== false,
+          provider_active: key.provider_active !== false,
+          circuit_breaker_open: key.circuit_breaker_open === true,
+          provider_name: providerName || 'Unknown Provider',
+          endpoint_base_url: String(key.endpoint_base_url || ''),
+          api_format: format,
+          capabilities: Array.isArray(key.capabilities)
+            ? key.capabilities.map((cap) => String(cap))
+            : [],
+          health_score: toNumberOrNull(key.health_score),
+          success_rate: toNumberOrNull(key.success_rate),
+          avg_response_time_ms: toNumberOrNull(key.avg_response_time_ms),
+          request_count: toNumberOrNull(key.request_count) ?? 0,
+        })
+      }
+    }
+
+    for (const [format, keys] of Object.entries(data)) {
+      const dedupedById = new Map<string, KeyWithMeta>()
+      for (const key of keys) {
+        if (!key.id) continue
+        const existing = dedupedById.get(key.id)
+        if (!existing) {
+          dedupedById.set(key.id, key)
+          continue
+        }
+
+        const mergedPriorityMap = {
+          ...(existing.global_priority_by_format || {}),
+          ...(key.global_priority_by_format || {})
+        }
+        const mergedRateMap = {
+          ...(existing.rate_multipliers || {}),
+          ...(key.rate_multipliers || {})
+        }
+
+        const preferredFormatPriority = existing.format_priority ?? key.format_priority
+        dedupedById.set(key.id, {
+          ...existing,
+          ...key,
+          global_priority_by_format: Object.keys(mergedPriorityMap).length > 0 ? mergedPriorityMap : null,
+          rate_multipliers: Object.keys(mergedRateMap).length > 0 ? mergedRateMap : null,
+          format_priority: preferredFormatPriority,
+          priority: preferredFormatPriority ?? existing.priority ?? key.priority,
+        })
+      }
+
+      const deduped = Array.from(dedupedById.values())
+      let maxPriority = 0
+      for (const key of deduped) {
         if (key.format_priority != null) {
           maxPriority = Math.max(maxPriority, key.format_priority)
         }
       }
 
       let nextPriority = maxPriority + 1
-      data[format] = keys.map((key) => ({
+      data[format] = deduped.map((key) => ({
         ...key,
-        // 使用格式特定优先级，如果没有则分配默认值
         priority: key.format_priority ?? nextPriority++
       }))
       // 按优先级排序：活跃的在前，停用的(Key或Provider)在后，各自按优先级排序
@@ -654,7 +985,7 @@ async function loadKeysByFormat() {
     }
     keysByFormat.value = data
 
-    const formats = Object.keys(data)
+    const formats = sortApiFormats(Object.keys(data))
     if (formats.length > 0 && !formats.includes(activeFormatTab.value)) {
       activeFormatTab.value = formats[0]
     }
@@ -667,6 +998,7 @@ async function loadKeysByFormat() {
 
 // 快捷切换 Key 启用/禁用状态
 async function toggleKeyActive(format: string, key: KeyWithMeta) {
+  if (isPoolAggregateItem(key)) return
   const newStatus = !key.is_active
   try {
     await updateProviderKey(key.id, { is_active: newStatus })
@@ -690,6 +1022,7 @@ async function toggleKeyActive(format: string, key: KeyWithMeta) {
 
 // Key 优先级编辑
 function startEditKeyPriority(format: string, key: KeyWithMeta) {
+  if (isPoolAggregateItem(key)) return
   editingKeyPriority.value[format] = key.id
 }
 
@@ -698,6 +1031,10 @@ function cancelEditKeyPriority(format: string) {
 }
 
 function finishEditKeyPriority(format: string, key: KeyWithMeta, event: FocusEvent) {
+  if (isPoolAggregateItem(key)) {
+    editingKeyPriority.value[format] = null
+    return
+  }
   const input = event.target as HTMLInputElement
   const newPriority = parseInt(input.value, 10)
 
@@ -825,8 +1162,12 @@ function handleProviderDrop(dropIndex: number) {
 }
 
 // Key 拖拽处理
-function handleKeyDragStart(format: string, index: number, event: DragEvent) {
-  draggedKey.value[format] = index
+function getEditableKeysForFormat(format: string): KeyWithMeta[] {
+  return (keysByFormat.value[format] || []).filter((key) => !isPoolManagedKey(key))
+}
+
+function handleKeyDragStart(format: string, keyId: string, event: DragEvent) {
+  draggedKey.value[format] = keyId
   if (event.dataTransfer) {
     event.dataTransfer.effectAllowed = 'move'
     event.dataTransfer.setData('text/html', '')
@@ -838,25 +1179,33 @@ function handleKeyDragEnd(format: string) {
   dragOverKey.value[format] = null
 }
 
-function handleKeyDragOver(format: string, index: number) {
-  dragOverKey.value[format] = index
+function handleKeyDragOver(format: string, keyId: string) {
+  dragOverKey.value[format] = keyId
 }
 
 function handleKeyDragLeave(format: string) {
   dragOverKey.value[format] = null
 }
 
-function handleKeyDrop(format: string, dropIndex: number) {
-  const dragIndex = draggedKey.value[format]
-  if (dragIndex === null || dragIndex === dropIndex) {
+function handleKeyDrop(format: string, dropKeyId: string) {
+  const draggedKeyId = draggedKey.value[format]
+  if (!draggedKeyId || draggedKeyId === dropKeyId) {
     draggedKey.value[format] = null
     dragOverKey.value[format] = null
     return
   }
 
-  const keys = keysByFormat.value[format]
-  const draggedItem = keys[dragIndex]
-  const targetItem = keys[dropIndex]
+  const editableKeys = getEditableKeysForFormat(format)
+  const dragIndex = editableKeys.findIndex((k) => k.id === draggedKeyId)
+  const dropIndex = editableKeys.findIndex((k) => k.id === dropKeyId)
+  if (dragIndex === -1 || dropIndex === -1) {
+    draggedKey.value[format] = null
+    dragOverKey.value[format] = null
+    return
+  }
+
+  const draggedItem = editableKeys[dragIndex]
+  const targetItem = editableKeys[dropIndex]
   const draggedPriority = draggedItem.priority
   const targetPriority = targetItem.priority
 
@@ -869,14 +1218,22 @@ function handleKeyDrop(format: string, dropIndex: number) {
 
   // 记录每个 key 的原始优先级
   const originalPriorityMap = new Map<string, number>()
-  keys.forEach(k => {
+  editableKeys.forEach(k => {
     originalPriorityMap.set(k.id, k.priority)
   })
 
   // 重排数组：将被拖动项移到目标位置
-  const items = [...keys]
-  items.splice(dragIndex, 1)
-  items.splice(dropIndex, 0, draggedItem)
+  const items = editableKeys.map((key) => ({ ...key }))
+  const dragItemIndex = items.findIndex((k) => k.id === draggedKeyId)
+  const dropItemIndex = items.findIndex((k) => k.id === dropKeyId)
+  if (dragItemIndex === -1 || dropItemIndex === -1) {
+    draggedKey.value[format] = null
+    dragOverKey.value[format] = null
+    return
+  }
+  const draggedClone = items[dragItemIndex]
+  items.splice(dragItemIndex, 1)
+  items.splice(dropItemIndex, 0, draggedClone)
 
   // 按新顺序分配优先级：被拖动项单独成组，其他同组项保持在一起
   const groupNewPriority = new Map<number, number>()
@@ -885,7 +1242,7 @@ function handleKeyDrop(format: string, dropIndex: number) {
   items.forEach(key => {
     const originalPriority = originalPriorityMap.get(key.id) ?? 0
 
-    if (key === draggedItem) {
+    if (key.id === draggedKeyId) {
       // 被拖动的项单独成组
       key.priority = currentPriority
       currentPriority++
@@ -902,8 +1259,22 @@ function handleKeyDrop(format: string, dropIndex: number) {
     }
   })
 
-  // 按优先级重新排序
-  keysByFormat.value[format] = sortKeysByActiveAndPriority(items)
+  const updatedPriorityById = new Map<string, number>()
+  items.forEach((key) => {
+    updatedPriorityById.set(key.id, key.priority)
+  })
+
+  // 将新的优先级写回原始数据（含号池 key），但只修改非号池条目
+  keysByFormat.value[format] = sortKeysByActiveAndPriority(
+    (keysByFormat.value[format] || []).map((key) => {
+      const nextPriority = updatedPriorityById.get(key.id)
+      if (nextPriority == null) return key
+      return {
+        ...key,
+        priority: nextPriority,
+      }
+    })
+  )
   draggedKey.value[format] = null
   dragOverKey.value[format] = null
 }
@@ -924,11 +1295,12 @@ async function save() {
     // 收集每个 Key 的按格式优先级（保留原有其他格式的配置）
     const keyPriorityByFormatMap = new Map<string, Record<string, number>>()
     for (const format of Object.keys(keysByFormat.value)) {
-      const keys = keysByFormat.value[format]
+      const keys = keysByFormat.value[format].filter((key) => !isPoolManagedKey(key))
       keys.forEach((key) => {
         // 合并原有配置，避免丢失未显示格式的优先级
-        const existing = keyPriorityByFormatMap.get(key.id) || { ...key.global_priority_by_format }
-        existing[format] = key.priority
+        const existing = keyPriorityByFormatMap.get(key.id)
+          || normalizePriorityMap(key.global_priority_by_format)
+        existing[normalizeApiFormatKey(format)] = key.priority
         keyPriorityByFormatMap.set(key.id, existing)
       })
     }

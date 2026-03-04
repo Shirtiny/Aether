@@ -414,7 +414,60 @@ def _normalize_oauth_plan_type(plan_type: Any, provider_type: str) -> str | None
     return text or None
 
 
-def _derive_oauth_plan_type(key: ProviderAPIKey, provider_type: str) -> str | None:
+def _extract_oauth_auth_config(key: ProviderAPIKey) -> dict[str, Any] | None:
+    if str(getattr(key, "auth_type", "") or "").strip().lower() != "oauth":
+        return None
+
+    auth_config_raw = getattr(key, "auth_config", None)
+    if not auth_config_raw:
+        return None
+
+    try:
+        decrypted = crypto_service.decrypt(auth_config_raw)
+        parsed = json.loads(decrypted)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        return None
+
+    return None
+
+
+def _normalize_oauth_expires_at(raw: Any) -> int | None:
+    value = _to_float(raw)
+    if value is None or value <= 0:
+        return None
+    # 兼容毫秒时间戳
+    if value > 1_000_000_000_000:
+        value /= 1000
+    return int(value)
+
+
+def _derive_oauth_expires_at(
+    key: ProviderAPIKey, auth_config: dict[str, Any] | None = None
+) -> int | None:
+    if str(getattr(key, "auth_type", "") or "").strip().lower() != "oauth":
+        return None
+
+    cfg = auth_config if isinstance(auth_config, dict) else _extract_oauth_auth_config(key)
+    if cfg:
+        for field in ("expires_at", "expiresAt", "expiry", "exp"):
+            expires_at = _normalize_oauth_expires_at(cfg.get(field))
+            if expires_at is not None:
+                return expires_at
+
+    # 兼容历史字段
+    expires_dt = getattr(key, "expires_at", None)
+    if isinstance(expires_dt, datetime):
+        return int(expires_dt.timestamp())
+    return None
+
+
+def _derive_oauth_plan_type(
+    key: ProviderAPIKey,
+    provider_type: str,
+    auth_config: dict[str, Any] | None = None,
+) -> str | None:
     # Prefer persisted normalized field
     persisted = _normalize_oauth_plan_type(getattr(key, "oauth_plan_type", None), provider_type)
     if persisted:
@@ -424,20 +477,12 @@ def _derive_oauth_plan_type(key: ProviderAPIKey, provider_type: str) -> str | No
         return None
 
     # Fallback 1: encrypted auth_config (common for Codex/Antigravity)
-    auth_config_raw = getattr(key, "auth_config", None)
-    if auth_config_raw:
-        try:
-            decrypted = crypto_service.decrypt(auth_config_raw)
-            auth_config = json.loads(decrypted)
-            if isinstance(auth_config, dict):
-                for plan_key in ("plan_type", "tier", "plan", "subscription_plan"):
-                    normalized = _normalize_oauth_plan_type(
-                        auth_config.get(plan_key), provider_type
-                    )
-                    if normalized:
-                        return normalized
-        except Exception:
-            pass
+    cfg = auth_config if isinstance(auth_config, dict) else _extract_oauth_auth_config(key)
+    if cfg:
+        for plan_key in ("plan_type", "tier", "plan", "subscription_plan"):
+            normalized = _normalize_oauth_plan_type(cfg.get(plan_key), provider_type)
+            if normalized:
+                return normalized
 
     # Fallback 2: upstream_metadata
     upstream_metadata = getattr(key, "upstream_metadata", None)
@@ -902,6 +947,7 @@ class AdminListPoolKeysAdapter(AdminApiAdapter):
             key_last_used_at = getattr(k, "last_used_at", None) or key_usage_stats.get(
                 "last_used_at"
             )
+            oauth_auth_config = _extract_oauth_auth_config(k)
 
             key_details.append(
                 PoolKeyDetail(
@@ -909,10 +955,8 @@ class AdminListPoolKeysAdapter(AdminApiAdapter):
                     key_name=k.name or "",
                     is_active=bool(k.is_active),
                     auth_type=str(getattr(k, "auth_type", "api_key") or "api_key"),
-                    oauth_expires_at=(
-                        int(k.oauth_expires_at.timestamp())
-                        if getattr(k, "oauth_expires_at", None)
-                        else None
+                    oauth_expires_at=_derive_oauth_expires_at(
+                        k, auth_config=oauth_auth_config
                     ),
                     oauth_invalid_at=(
                         int(k.oauth_invalid_at.timestamp())
@@ -920,7 +964,9 @@ class AdminListPoolKeysAdapter(AdminApiAdapter):
                         else None
                     ),
                     oauth_invalid_reason=getattr(k, "oauth_invalid_reason", None),
-                    oauth_plan_type=_derive_oauth_plan_type(k, provider_type),
+                    oauth_plan_type=_derive_oauth_plan_type(
+                        k, provider_type, auth_config=oauth_auth_config
+                    ),
                     quota_updated_at=_extract_quota_updated_at(
                         provider_type,
                         getattr(k, "upstream_metadata", None),

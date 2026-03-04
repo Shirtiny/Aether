@@ -10,6 +10,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from src.core.api_format.signature import normalize_signature_key
 from src.core.crypto import crypto_service
 from src.core.exceptions import InvalidRequestException, NotFoundException
 from src.core.key_capabilities import get_capability
@@ -18,6 +19,47 @@ from src.models.database import Provider, ProviderAPIKey, ProviderEndpoint
 from src.models.endpoint_models import EndpointAPIKeyResponse
 from src.services.provider_keys.auth_type import normalize_auth_type
 from src.services.provider_keys.response_builder import build_key_response
+
+_LEGACY_API_FORMAT_MAP: dict[str, str] = {
+    "CLAUDE": "claude:chat",
+    "CLAUDE_CLI": "claude:cli",
+    "OPENAI": "openai:chat",
+    "OPENAI_CLI": "openai:cli",
+    "OPENAI_COMPACT": "openai:compact",
+    "OPENAI_VIDEO": "openai:video",
+    "GEMINI": "gemini:chat",
+    "GEMINI_CLI": "gemini:cli",
+    "GEMINI_VIDEO": "gemini:video",
+}
+
+
+def _normalize_api_format_key(raw_format: Any) -> str | None:
+    """Normalize api_format to canonical signature key; keeps legacy import compatibility."""
+    text = str(raw_format or "").strip()
+    if not text:
+        return None
+
+    try:
+        return normalize_signature_key(text)
+    except Exception:
+        pass
+
+    legacy = text.upper().replace("-", "_")
+    return _LEGACY_API_FORMAT_MAP.get(legacy)
+
+
+def _normalize_format_dict(raw_dict: Any) -> dict[str, Any]:
+    """Normalize dict keys from any format aliases to canonical api_format."""
+    if not isinstance(raw_dict, dict):
+        return {}
+
+    normalized: dict[str, Any] = {}
+    for raw_key, value in raw_dict.items():
+        format_key = _normalize_api_format_key(raw_key)
+        if not format_key or format_key in normalized:
+            continue
+        normalized[format_key] = value
+    return normalized
 
 
 def get_keys_grouped_by_format(db: Session) -> dict:
@@ -49,11 +91,22 @@ def get_keys_grouped_by_format(db: Session) -> dict:
     endpoint_base_url_map: dict[tuple[str, str], str] = {}
     for provider_id, api_format, base_url in endpoints:
         fmt = api_format.value if hasattr(api_format, "value") else str(api_format)
-        endpoint_base_url_map[(str(provider_id), fmt)] = base_url
+        normalized_fmt = _normalize_api_format_key(fmt)
+        if not normalized_fmt:
+            continue
+        endpoint_base_url_map[(str(provider_id), normalized_fmt)] = base_url
 
     grouped: dict[str, list[dict]] = {}
     for key, provider in keys:
-        api_formats = key.api_formats or []
+        raw_api_formats = key.api_formats or []
+        api_formats: list[str] = []
+        seen_formats: set[str] = set()
+        for raw_format in raw_api_formats:
+            normalized_format = _normalize_api_format_key(raw_format)
+            if not normalized_format or normalized_format in seen_formats:
+                continue
+            seen_formats.add(normalized_format)
+            api_formats.append(normalized_format)
 
         if not api_formats:
             continue  # 跳过没有 API 格式的 Key
@@ -88,14 +141,17 @@ def get_keys_grouped_by_format(db: Session) -> dict:
                     caps_list.append(cap_def.short_name if cap_def else cap_name)
 
         # 构建 Key 信息（基础数据）
+        normalized_rate_multipliers = _normalize_format_dict(key.rate_multipliers)
+        normalized_priority_by_format = _normalize_format_dict(key.global_priority_by_format)
         key_info = {
             "id": key.id,
+            "provider_id": str(provider.id),
             "name": key.name,
             "auth_type": auth_type,
             "api_key_masked": masked_key,
             "internal_priority": key.internal_priority,
-            "global_priority_by_format": key.global_priority_by_format,
-            "rate_multipliers": key.rate_multipliers,
+            "global_priority_by_format": normalized_priority_by_format,
+            "rate_multipliers": normalized_rate_multipliers or None,
             "is_active": key.is_active,
             "provider_active": provider.is_active,
             "provider_name": provider.name,
@@ -107,9 +163,14 @@ def get_keys_grouped_by_format(db: Session) -> dict:
         }
 
         # 将 Key 添加到每个支持的格式分组中，并附加格式特定的数据
-        health_by_format = key.health_by_format or {}
-        circuit_by_format = key.circuit_breaker_by_format or {}
-        priority_by_format = key.global_priority_by_format or {}
+        health_by_format = _normalize_format_dict(key.health_by_format)
+        circuit_by_format = _normalize_format_dict(key.circuit_breaker_by_format)
+        priority_by_format: dict[str, int] = {}
+        for k, v in normalized_priority_by_format.items():
+            try:
+                priority_by_format[k] = int(v)
+            except Exception:
+                continue
         provider_id = str(provider.id)
         for api_format in api_formats:
             if api_format not in grouped:
