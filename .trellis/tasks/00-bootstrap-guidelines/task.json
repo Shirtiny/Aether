@@ -2,22 +2,22 @@
   "id": "00-bootstrap-guidelines",
   "name": "Bootstrap Guidelines",
   "description": "Fill in project development guidelines for AI agents",
-  "status": "in_progress",
+  "status": "completed",
   "dev_type": "docs",
   "priority": "P1",
   "creator": "shirtiny",
   "assignee": "shirtiny",
   "createdAt": "2026-03-04",
-  "completedAt": null,
+  "completedAt": "2026-03-04",
   "commit": null,
   "subtasks": [
     {
       "name": "Fill backend guidelines",
-      "status": "pending"
+      "status": "completed"
     },
     {
       "name": "Add code examples",
-      "status": "pending"
+      "status": "completed"
     }
   ],
   "relatedFiles": [
