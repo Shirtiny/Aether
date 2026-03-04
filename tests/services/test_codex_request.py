@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import jwt
+import pytest
+
 from src.services.provider.adapters.codex.request_patching import (
     maybe_patch_request_for_codex,
     patch_openai_cli_request_for_codex,
@@ -143,3 +146,37 @@ def test_codex_envelope_extra_headers_uses_account_id_header() -> None:
     headers = codex_oauth_envelope.extra_headers() or {}
     assert headers.get("Chatgpt-Account-Id") == "acc_123"
     set_codex_request_context(None)
+
+
+def _encode_unsigned_jwt(payload: dict[str, object]) -> str:
+    token = jwt.encode(payload, key="", algorithm="none")
+    return token.decode("utf-8") if isinstance(token, bytes) else token
+
+
+@pytest.mark.asyncio
+async def test_enrich_codex_uses_access_token_when_id_token_missing() -> None:
+    from src.services.provider.adapters.codex.plugin import enrich_codex
+
+    access_token = _encode_unsigned_jwt(
+        {
+            "email": "u@example.com",
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "acc-access",
+                "chatgpt_plan_type": "team",
+                "chatgpt_user_id": "user-access",
+            },
+        }
+    )
+
+    auth_config: dict[str, object] = {}
+    out = await enrich_codex(
+        auth_config=auth_config,
+        token_response={"access_token": access_token},
+        access_token=access_token,
+        proxy_config=None,
+    )
+
+    assert out["email"] == "u@example.com"
+    assert out["account_id"] == "acc-access"
+    assert out["plan_type"] == "team"
+    assert out["user_id"] == "user-access"

@@ -82,17 +82,68 @@ async def enrich_codex(
     """Codex auth_config enrichment: parse id_token -> email/account_id/plan_type/user_id."""
     from src.core.provider_oauth_utils import parse_codex_id_token
 
-    id_token = token_response.get("id_token")
+    def _read_non_empty_str(*values: Any) -> str | None:
+        for value in values:
+            if isinstance(value, str):
+                normalized = value.strip()
+                if normalized:
+                    return normalized
+        return None
+
+    # Prefer explicit fields if token endpoint returns them directly.
+    direct_account_id = _read_non_empty_str(
+        token_response.get("account_id"),
+        token_response.get("accountId"),
+        token_response.get("chatgpt_account_id"),
+        token_response.get("chatgptAccountId"),
+    )
+    if direct_account_id and not auth_config.get("account_id"):
+        auth_config["account_id"] = direct_account_id
+
+    direct_plan_type = _read_non_empty_str(
+        token_response.get("plan_type"),
+        token_response.get("planType"),
+        token_response.get("chatgpt_plan_type"),
+        token_response.get("chatgptPlanType"),
+    )
+    if direct_plan_type and not auth_config.get("plan_type"):
+        auth_config["plan_type"] = direct_plan_type
+
+    direct_user_id = _read_non_empty_str(
+        token_response.get("user_id"),
+        token_response.get("userId"),
+        token_response.get("chatgpt_user_id"),
+        token_response.get("chatgptUserId"),
+    )
+    if direct_user_id and not auth_config.get("user_id"):
+        auth_config["user_id"] = direct_user_id
+
+    direct_email = _read_non_empty_str(token_response.get("email"))
+    if direct_email and not auth_config.get("email"):
+        auth_config["email"] = direct_email
+
     logger.debug(
-        "Codex enrich_auth_config: id_token_present={} token_keys={}",
-        bool(id_token),
+        "Codex enrich_auth_config: id_token_present={} access_token_present={} token_keys={}",
+        bool(token_response.get("id_token") or token_response.get("idToken")),
+        bool(token_response.get("access_token") or token_response.get("accessToken")),
         list(token_response.keys()),
     )
-    # parse_codex_id_token 仅返回非空有效字段，直接 update 即可
-    codex_info = parse_codex_id_token(id_token)
-    if codex_info:
-        logger.debug("Codex parsed id_token fields: {}", list(codex_info.keys()))
-        auth_config.update(codex_info)
+
+    token_candidates = [
+        token_response.get("id_token"),
+        token_response.get("idToken"),
+        token_response.get("access_token"),
+        token_response.get("accessToken"),
+    ]
+    for token_payload in token_candidates:
+        codex_info = parse_codex_id_token(token_payload)
+        if not codex_info:
+            continue
+        logger.debug("Codex parsed token fields: {}", list(codex_info.keys()))
+        for key, value in codex_info.items():
+            if not auth_config.get(key):
+                auth_config[key] = value
+
     return auth_config
 
 

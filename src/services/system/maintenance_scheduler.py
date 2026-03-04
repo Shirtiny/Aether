@@ -9,6 +9,8 @@
 - 连接池监控：定期检查数据库连接池状态
 - Pending 状态清理：清理异常的 Pending 状态记录
 - Gemini 文件映射清理：清理过期的 Gemini 文件→Key 映射
+- 请求候选记录清理：定期清理过期的 request_candidates 记录
+- 数据库表维护：定期 VACUUM ANALYZE 防止表和索引膨胀
 
 使用 APScheduler 进行任务调度，支持时区配置。
 """
@@ -19,12 +21,11 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import delete
-from sqlalchemy.orm import Session
+from sqlalchemy import delete, text
 
 from src.core.logger import logger
 from src.database import create_session
-from src.models.database import ApiKey, AuditLog, Provider, Usage
+from src.models.database import ApiKey, AuditLog, Provider, RequestCandidate, Usage
 from src.services.provider_ops.service import ProviderOpsService
 from src.services.system.config import SystemConfigService
 from src.services.system.scheduler import get_scheduler
@@ -280,6 +281,25 @@ class MaintenanceScheduler:
             name="Gemini文件映射清理",
         )
 
+        # 请求候选记录清理 - 凌晨 3:30 执行
+        scheduler.add_cron_job(
+            self._scheduled_candidate_cleanup,
+            hour=3,
+            minute=30,
+            job_id="candidate_cleanup",
+            name="请求候选记录清理",
+        )
+
+        # 数据库表维护 - 每周日凌晨 5 点执行 VACUUM ANALYZE
+        scheduler.add_cron_job(
+            self._scheduled_db_maintenance,
+            day_of_week="sun",
+            hour=5,
+            minute=0,
+            job_id="db_maintenance",
+            name="数据库表维护",
+        )
+
         # Antigravity User-Agent 版本刷新 - 每 6 小时
         scheduler.add_interval_job(
             self._scheduled_antigravity_ua_refresh,
@@ -388,6 +408,14 @@ class MaintenanceScheduler:
     async def _scheduled_audit_cleanup(self) -> None:
         """审计日志清理任务（定时调用）"""
         await self._perform_audit_cleanup()
+
+    async def _scheduled_candidate_cleanup(self) -> None:
+        """请求候选记录清理任务（定时调用）"""
+        await self._perform_candidate_cleanup()
+
+    async def _scheduled_db_maintenance(self) -> None:
+        """数据库表维护任务（定时调用）"""
+        await self._perform_db_maintenance()
 
     async def _scheduled_gemini_file_mapping_cleanup(self) -> None:
         """Gemini 文件映射清理任务（定时调用）"""
@@ -614,92 +642,99 @@ class MaintenanceScheduler:
 
     async def _perform_pending_cleanup(self) -> None:
         """执行 pending 状态清理"""
-        db = create_session()
-        try:
-            from src.services.usage.service import UsageService
 
-            # 获取配置的超时时间（默认 10 分钟）
-            timeout_minutes = SystemConfigService.get_config(
-                db, "pending_request_timeout_minutes", 10
-            )
+        def _do_pending_cleanup() -> int:
+            db = create_session()
+            try:
+                from src.services.usage.service import UsageService
 
-            # 执行清理
-            cleaned_count = UsageService.cleanup_stale_pending_requests(
-                db, timeout_minutes=timeout_minutes
-            )
+                timeout_minutes = SystemConfigService.get_config(
+                    db, "pending_request_timeout_minutes", 10
+                )
+                return UsageService.cleanup_stale_pending_requests(
+                    db, timeout_minutes=timeout_minutes
+                )
+            except Exception as e:
+                logger.exception(f"清理 pending 请求失败: {e}")
+                db.rollback()
+                return 0
+            finally:
+                db.close()
 
-            if cleaned_count > 0:
-                logger.info(f"清理了 {cleaned_count} 条超时的 pending/streaming 请求")
-
-        except Exception as e:
-            logger.exception(f"清理 pending 请求失败: {e}")
-            db.rollback()
-        finally:
-            db.close()
+        loop = asyncio.get_running_loop()
+        cleaned_count = await loop.run_in_executor(None, _do_pending_cleanup)
+        if cleaned_count > 0:
+            logger.info(f"清理了 {cleaned_count} 条超时的 pending/streaming 请求")
 
     async def _perform_audit_cleanup(self) -> None:
         """执行审计日志清理任务"""
-        db = create_session()
-        try:
-            # 检查是否启用自动清理
-            if not SystemConfigService.get_config(db, "enable_auto_cleanup", True):
-                logger.info("自动清理已禁用，跳过审计日志清理")
-                return
 
-            # 获取审计日志保留天数（默认 30 天，最少 7 天）
-            audit_retention_days = max(
-                SystemConfigService.get_config(db, "audit_log_retention_days", 30),
-                7,  # 最少保留 7 天，防止误配置删除所有审计日志
-            )
-            batch_size = SystemConfigService.get_config(db, "cleanup_batch_size", 1000)
-
-            cutoff_time = datetime.now(timezone.utc) - timedelta(days=audit_retention_days)
-
-            logger.info(f"开始清理 {audit_retention_days} 天前的审计日志...")
-
-            total_deleted = 0
-            while True:
-                # 先查询要删除的记录 ID（分批）
-                records_to_delete = (
-                    db.query(AuditLog.id)
-                    .filter(AuditLog.created_at < cutoff_time)
-                    .limit(batch_size)
-                    .all()
-                )
-
-                if not records_to_delete:
-                    break
-
-                record_ids = [r.id for r in records_to_delete]
-
-                # 执行删除
-                result = db.execute(
-                    delete(AuditLog)
-                    .where(AuditLog.id.in_(record_ids))
-                    .execution_options(synchronize_session=False)
-                )
-
-                rows_deleted = result.rowcount
-                db.commit()
-
-                total_deleted += rows_deleted
-                logger.debug(f"已删除 {rows_deleted} 条审计日志，累计 {total_deleted} 条")
-
-                await asyncio.sleep(0.1)
-
-            if total_deleted > 0:
-                logger.info(f"审计日志清理完成，共删除 {total_deleted} 条记录")
-            else:
-                logger.info("无需清理的审计日志")
-
-        except Exception as e:
-            logger.exception(f"审计日志清理失败: {e}")
+        def _do_audit_cleanup() -> int:
+            db = create_session()
             try:
-                db.rollback()
-            except Exception:
-                pass
-        finally:
-            db.close()
+                if not SystemConfigService.get_config(db, "enable_auto_cleanup", True):
+                    logger.info("自动清理已禁用，跳过审计日志清理")
+                    return 0
+
+                audit_retention_days = max(
+                    SystemConfigService.get_config(db, "audit_log_retention_days", 30),
+                    7,
+                )
+                batch_size = SystemConfigService.get_config(db, "cleanup_batch_size", 1000)
+                cutoff_time = datetime.now(timezone.utc) - timedelta(days=audit_retention_days)
+
+                logger.info(f"开始清理 {audit_retention_days} 天前的审计日志...")
+
+                total_deleted = 0
+                while True:
+                    batch_db = create_session()
+                    try:
+                        records_to_delete = (
+                            batch_db.query(AuditLog.id)
+                            .filter(AuditLog.created_at < cutoff_time)
+                            .limit(batch_size)
+                            .all()
+                        )
+
+                        if not records_to_delete:
+                            break
+
+                        record_ids = [r.id for r in records_to_delete]
+
+                        result = batch_db.execute(
+                            delete(AuditLog)
+                            .where(AuditLog.id.in_(record_ids))
+                            .execution_options(synchronize_session=False)
+                        )
+
+                        rows_deleted = result.rowcount
+                        batch_db.commit()
+
+                        total_deleted += rows_deleted
+                        logger.debug(f"已删除 {rows_deleted} 条审计日志，累计 {total_deleted} 条")
+                    except Exception as e:
+                        logger.exception(f"删除审计日志批次失败: {e}")
+                        try:
+                            batch_db.rollback()
+                        except Exception:
+                            pass
+                        break
+                    finally:
+                        batch_db.close()
+
+                return total_deleted
+            except Exception as e:
+                logger.exception(f"审计日志清理失败: {e}")
+                return 0
+            finally:
+                db.close()
+
+        loop = asyncio.get_running_loop()
+        total_deleted = await loop.run_in_executor(None, _do_audit_cleanup)
+        if total_deleted > 0:
+            logger.info(f"审计日志清理完成，共删除 {total_deleted} 条记录")
+        else:
+            logger.info("无需清理的审计日志")
 
     async def _perform_gemini_file_mapping_cleanup(self) -> None:
         """清理过期的 Gemini 文件映射记录"""
@@ -1038,82 +1073,208 @@ class MaintenanceScheduler:
         finally:
             db.close()
 
-    async def _perform_cleanup(self) -> None:
-        """执行清理任务"""
+    async def _perform_candidate_cleanup(self) -> None:
+        """清理过期的 request_candidates 记录"""
+
+        def _do_candidate_cleanup() -> int:
+            db = create_session()
+            try:
+                if not SystemConfigService.get_config(db, "enable_auto_cleanup", True):
+                    logger.info("自动清理已禁用，跳过候选记录清理")
+                    return 0
+
+                retention_days = max(
+                    SystemConfigService.get_config(db, "detail_log_retention_days", 7),
+                    3,
+                )
+                batch_size = SystemConfigService.get_config(db, "cleanup_batch_size", 1000)
+                cutoff_time = datetime.now(timezone.utc) - timedelta(days=retention_days)
+
+                logger.info(f"开始清理 {retention_days} 天前的请求候选记录...")
+            except Exception as e:
+                logger.exception(f"候选记录清理配置读取失败: {e}")
+                return 0
+            finally:
+                db.close()
+
+            total_deleted = 0
+            while True:
+                batch_db = create_session()
+                try:
+                    records_to_delete = (
+                        batch_db.query(RequestCandidate.id)
+                        .filter(RequestCandidate.created_at < cutoff_time)
+                        .limit(batch_size)
+                        .all()
+                    )
+
+                    if not records_to_delete:
+                        break
+
+                    record_ids = [r.id for r in records_to_delete]
+
+                    result = batch_db.execute(
+                        delete(RequestCandidate)
+                        .where(RequestCandidate.id.in_(record_ids))
+                        .execution_options(synchronize_session=False)
+                    )
+
+                    rows_deleted = result.rowcount
+                    batch_db.commit()
+
+                    total_deleted += rows_deleted
+                    logger.debug(f"已删除 {rows_deleted} 条候选记录，累计 {total_deleted} 条")
+                except Exception as e:
+                    logger.exception(f"删除候选记录批次失败: {e}")
+                    try:
+                        batch_db.rollback()
+                    except Exception:
+                        pass
+                    break
+                finally:
+                    batch_db.close()
+
+            return total_deleted
+
+        loop = asyncio.get_running_loop()
+        total_deleted = await loop.run_in_executor(None, _do_candidate_cleanup)
+        if total_deleted > 0:
+            logger.info(f"请求候选记录清理完成，共删除 {total_deleted} 条记录")
+        else:
+            logger.info("无需清理的候选记录")
+
+    async def _perform_db_maintenance(self) -> None:
+        """执行数据库表维护（VACUUM ANALYZE）
+
+        对大表执行 VACUUM ANALYZE，防止表和索引膨胀。
+        VACUUM 不能在事务内执行，需要使用 autocommit 连接。
+        使用线程池执行，避免阻塞事件循环。
+        """
         db = create_session()
         try:
-            # 检查是否启用自动清理
-            if not SystemConfigService.get_config(db, "enable_auto_cleanup", True):
-                logger.info("自动清理已禁用，跳过清理任务")
+            if not SystemConfigService.get_config(db, "enable_db_maintenance", True):
+                logger.info("数据库维护已禁用，跳过")
                 return
-
-            logger.info("开始执行使用记录分级清理...")
-
-            # 获取配置参数
-            detail_retention = SystemConfigService.get_config(db, "detail_log_retention_days", 7)
-            compressed_retention = SystemConfigService.get_config(
-                db, "compressed_log_retention_days", 30
-            )
-            header_retention = SystemConfigService.get_config(db, "header_retention_days", 90)
-            log_retention = SystemConfigService.get_config(db, "log_retention_days", 365)
-            batch_size = SystemConfigService.get_config(db, "cleanup_batch_size", 1000)
-
-            now = datetime.now(timezone.utc)
-
-            # 1. 压缩详细日志 (body 字段 -> 压缩字段)
-            detail_cutoff = now - timedelta(days=detail_retention)
-            body_compressed = await self._cleanup_body_fields(db, detail_cutoff, batch_size)
-
-            # 2. 清理压缩字段（90天后）
-            compressed_cutoff = now - timedelta(days=compressed_retention)
-            compressed_cleaned = await self._cleanup_compressed_fields(
-                db, compressed_cutoff, batch_size
-            )
-
-            # 3. 清理请求头
-            header_cutoff = now - timedelta(days=header_retention)
-            header_cleaned = await self._cleanup_header_fields(db, header_cutoff, batch_size)
-
-            # 4. 删除过期记录
-            log_cutoff = now - timedelta(days=log_retention)
-            records_deleted = await self._delete_old_records(db, log_cutoff, batch_size)
-
-            # 5. 清理过期的API Keys
-            auto_delete = SystemConfigService.get_config(db, "auto_delete_expired_keys", False)
-            keys_cleaned = ApiKeyService.cleanup_expired_keys(db, auto_delete=auto_delete)
-
-            logger.info(
-                f"清理完成: 压缩 {body_compressed} 条, "
-                f"清理压缩字段 {compressed_cleaned} 条, "
-                f"清理header {header_cleaned} 条, "
-                f"删除记录 {records_deleted} 条, "
-                f"清理过期Keys {keys_cleaned} 条"
-            )
-
         except Exception as e:
-            logger.exception(f"清理任务执行失败: {e}")
-            db.rollback()
+            logger.exception(f"读取数据库维护配置失败: {e}")
+            return
         finally:
             db.close()
 
-    async def _cleanup_body_fields(
-        self, db: Session, cutoff_time: datetime, batch_size: int
-    ) -> int:
+        tables = ["usage", "request_candidates", "audit_logs"]
+
+        logger.info(f"开始数据库表维护（VACUUM ANALYZE），目标表: {', '.join(tables)}")
+
+        from src.database.database import _ensure_engine
+
+        engine = _ensure_engine()
+
+        def _vacuum_table(table_name: str) -> tuple[str, bool, str]:
+            """在线程池中执行 VACUUM ANALYZE（同步阻塞操作）"""
+            try:
+                with engine.connect() as raw_conn:
+                    conn = raw_conn.execution_options(isolation_level="AUTOCOMMIT")
+                    conn.execute(text(f"VACUUM ANALYZE {table_name}"))
+                return table_name, True, ""
+            except Exception as e:
+                return table_name, False, str(e)
+
+        loop = asyncio.get_running_loop()
+        for table in tables:
+            table_name, success, error = await loop.run_in_executor(None, _vacuum_table, table)
+            if success:
+                logger.info(f"VACUUM ANALYZE {table_name} 完成")
+            else:
+                logger.warning(f"VACUUM ANALYZE {table_name} 失败: {error}")
+
+        logger.info("数据库表维护完成")
+
+    async def _perform_cleanup(self) -> None:
+        """执行清理任务（在线程池中运行，避免阻塞事件循环）"""
+
+        def _do_cleanup() -> None:
+            db = create_session()
+            try:
+                if not SystemConfigService.get_config(db, "enable_auto_cleanup", True):
+                    logger.info("自动清理已禁用，跳过清理任务")
+                    return
+
+                logger.info("开始执行使用记录分级清理...")
+
+                detail_retention = SystemConfigService.get_config(
+                    db, "detail_log_retention_days", 7
+                )
+                compressed_retention = SystemConfigService.get_config(
+                    db, "compressed_log_retention_days", 30
+                )
+                header_retention = SystemConfigService.get_config(db, "header_retention_days", 90)
+                log_retention = SystemConfigService.get_config(db, "log_retention_days", 365)
+                batch_size = SystemConfigService.get_config(db, "cleanup_batch_size", 1000)
+                auto_delete = SystemConfigService.get_config(db, "auto_delete_expired_keys", False)
+            except Exception as e:
+                logger.exception(f"清理任务配置读取失败: {e}")
+                return
+            finally:
+                db.close()
+
+            try:
+                now = datetime.now(timezone.utc)
+
+                # 1. 压缩详细日志 (body 字段 -> 压缩字段)
+                detail_cutoff = now - timedelta(days=detail_retention)
+                body_compressed = self._cleanup_body_fields(detail_cutoff, batch_size)
+
+                # 2. 清理压缩字段
+                compressed_cutoff = now - timedelta(days=compressed_retention)
+                compressed_cleaned = self._cleanup_compressed_fields(compressed_cutoff, batch_size)
+
+                # 3. 清理请求头
+                header_cutoff = now - timedelta(days=header_retention)
+                header_cleaned = self._cleanup_header_fields(header_cutoff, batch_size)
+
+                # 4. 删除过期记录
+                log_cutoff = now - timedelta(days=log_retention)
+                records_deleted = self._delete_old_records(log_cutoff, batch_size)
+
+                # 5. 清理过期的API Keys
+                keys_db = create_session()
+                try:
+                    keys_cleaned = ApiKeyService.cleanup_expired_keys(
+                        keys_db, auto_delete=auto_delete
+                    )
+                except Exception as e:
+                    logger.exception(f"清理过期 Keys 失败: {e}")
+                    keys_cleaned = 0
+                finally:
+                    keys_db.close()
+
+                logger.info(
+                    f"清理完成: 压缩 {body_compressed} 条, "
+                    f"清理压缩字段 {compressed_cleaned} 条, "
+                    f"清理header {header_cleaned} 条, "
+                    f"删除记录 {records_deleted} 条, "
+                    f"清理过期Keys {keys_cleaned} 条"
+                )
+            except Exception as e:
+                logger.exception(f"清理任务执行失败: {e}")
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _do_cleanup)
+
+    def _cleanup_body_fields(self, cutoff_time: datetime, batch_size: int) -> int:
         """压缩 request_body 和 response_body 字段到压缩字段
 
-        逐条处理，确保每条记录都正确更新
+        逐条处理，确保每条记录都正确更新（同步方法，在线程池中调用）
         """
         from sqlalchemy import null, update
 
         total_compressed = 0
-        no_progress_count = 0  # 连续无进展计数
-        processed_ids: set = set()  # 记录已处理的 ID，防止重复处理
+        no_progress_count = 0
+        processed_ids: set = set()
 
         while True:
             batch_db = create_session()
             try:
-                # 1. 查询需要压缩的记录
-                # 注意：排除已经是 NULL 或 JSON null 的记录
                 records = (
                     batch_db.query(
                         Usage.id,
@@ -1136,7 +1297,6 @@ class MaintenanceScheduler:
                 if not records:
                     break
 
-                # 过滤掉实际值为 None 的记录（JSON null 被解析为 Python None）
                 valid_records = [
                     r
                     for r in records
@@ -1147,7 +1307,6 @@ class MaintenanceScheduler:
                 ]
 
                 if not valid_records:
-                    # 所有记录都是 JSON null，需要清理它们
                     logger.warning(
                         f"检测到 {len(records)} 条记录的 body 字段为 JSON null，进行清理"
                     )
@@ -1165,7 +1324,6 @@ class MaintenanceScheduler:
                     batch_db.commit()
                     continue
 
-                # 检测是否有重复的 ID（说明更新未生效）
                 current_ids = {r.id for r in valid_records}
                 repeated_ids = current_ids & processed_ids
                 if repeated_ids:
@@ -1177,10 +1335,8 @@ class MaintenanceScheduler:
 
                 batch_success = 0
 
-                # 2. 逐条更新（确保每条都正确处理）
                 for r in valid_records:
                     try:
-                        # 使用 null() 确保设置的是 SQL NULL 而不是 JSON null
                         result = batch_db.execute(
                             update(Usage)
                             .where(Usage.id == r.id)
@@ -1216,7 +1372,6 @@ class MaintenanceScheduler:
 
                 batch_db.commit()
 
-                # 3. 检查是否有实际进展
                 if batch_success == 0:
                     no_progress_count += 1
                     if no_progress_count >= 3:
@@ -1226,14 +1381,12 @@ class MaintenanceScheduler:
                         )
                         break
                 else:
-                    no_progress_count = 0  # 重置计数
+                    no_progress_count = 0
 
                 total_compressed += batch_success
                 logger.debug(
                     f"已压缩 {batch_success} 条记录的 body 字段，累计 {total_compressed} 条"
                 )
-
-                await asyncio.sleep(0.1)
 
             except Exception as e:
                 logger.exception(f"压缩 body 字段失败: {e}")
@@ -1247,12 +1400,10 @@ class MaintenanceScheduler:
 
         return total_compressed
 
-    async def _cleanup_compressed_fields(
-        self, db: Session, cutoff_time: datetime, batch_size: int
-    ) -> int:
-        """清理压缩字段（90天后删除压缩的body）
+    def _cleanup_compressed_fields(self, cutoff_time: datetime, batch_size: int) -> int:
+        """清理压缩字段（删除压缩的body）
 
-        每批使用短生命周期 session，避免 ORM 缓存问题
+        每批使用短生命周期 session（同步方法，在线程池中调用）
         """
         from sqlalchemy import null, update
 
@@ -1261,7 +1412,6 @@ class MaintenanceScheduler:
         while True:
             batch_db = create_session()
             try:
-                # 查询需要清理压缩字段的记录
                 records_to_clean = (
                     batch_db.query(Usage.id)
                     .filter(Usage.created_at < cutoff_time)
@@ -1280,7 +1430,6 @@ class MaintenanceScheduler:
 
                 record_ids = [r.id for r in records_to_clean]
 
-                # 批量更新，使用 null() 确保设置 SQL NULL
                 result = batch_db.execute(
                     update(Usage)
                     .where(Usage.id.in_(record_ids))
@@ -1302,8 +1451,6 @@ class MaintenanceScheduler:
                 total_cleaned += rows_updated
                 logger.debug(f"已清理 {rows_updated} 条记录的压缩字段，累计 {total_cleaned} 条")
 
-                await asyncio.sleep(0.1)
-
             except Exception as e:
                 logger.exception(f"清理压缩字段失败: {e}")
                 try:
@@ -1316,12 +1463,10 @@ class MaintenanceScheduler:
 
         return total_cleaned
 
-    async def _cleanup_header_fields(
-        self, db: Session, cutoff_time: datetime, batch_size: int
-    ) -> int:
+    def _cleanup_header_fields(self, cutoff_time: datetime, batch_size: int) -> int:
         """清理 request_headers, response_headers 和 provider_request_headers 字段
 
-        每批使用短生命周期 session，避免 ORM 缓存问题
+        每批使用短生命周期 session（同步方法，在线程池中调用）
         """
         from sqlalchemy import null, update
 
@@ -1330,7 +1475,6 @@ class MaintenanceScheduler:
         while True:
             batch_db = create_session()
             try:
-                # 先查询需要清理的记录ID（分批）
                 records_to_clean = (
                     batch_db.query(Usage.id)
                     .filter(Usage.created_at < cutoff_time)
@@ -1348,7 +1492,6 @@ class MaintenanceScheduler:
 
                 record_ids = [r.id for r in records_to_clean]
 
-                # 批量更新，使用 null() 确保设置 SQL NULL
                 result = batch_db.execute(
                     update(Usage)
                     .where(Usage.id.in_(record_ids))
@@ -1369,8 +1512,6 @@ class MaintenanceScheduler:
                 total_cleaned += rows_updated
                 logger.debug(f"已清理 {rows_updated} 条记录的 header 字段，累计 {total_cleaned} 条")
 
-                await asyncio.sleep(0.1)
-
             except Exception as e:
                 logger.exception(f"清理 header 字段失败: {e}")
                 try:
@@ -1383,15 +1524,15 @@ class MaintenanceScheduler:
 
         return total_cleaned
 
-    async def _delete_old_records(self, db: Session, cutoff_time: datetime, batch_size: int) -> int:
-        """删除过期的完整记录"""
+    def _delete_old_records(self, cutoff_time: datetime, batch_size: int) -> int:
+        """删除过期的完整记录（同步方法，在线程池中调用）"""
         total_deleted = 0
 
         while True:
+            batch_db = create_session()
             try:
-                # 查询要删除的记录ID（分批）
                 records_to_delete = (
-                    db.query(Usage.id)
+                    batch_db.query(Usage.id)
                     .filter(Usage.created_at < cutoff_time)
                     .limit(batch_size)
                     .all()
@@ -1402,28 +1543,27 @@ class MaintenanceScheduler:
 
                 record_ids = [r.id for r in records_to_delete]
 
-                # 执行删除
-                result = db.execute(
+                result = batch_db.execute(
                     delete(Usage)
                     .where(Usage.id.in_(record_ids))
                     .execution_options(synchronize_session=False)
                 )
 
                 rows_deleted = result.rowcount
-                db.commit()
+                batch_db.commit()
 
                 total_deleted += rows_deleted
                 logger.debug(f"已删除 {rows_deleted} 条过期记录，累计 {total_deleted} 条")
 
-                await asyncio.sleep(0.1)
-
             except Exception as e:
                 logger.exception(f"删除过期记录失败: {e}")
                 try:
-                    db.rollback()
+                    batch_db.rollback()
                 except Exception:
                     pass
                 break
+            finally:
+                batch_db.close()
 
         return total_deleted
 

@@ -417,6 +417,31 @@ def test_parse_codex_usage_missing_plan_type_infers_paid_windows() -> None:
     assert parsed["secondary_window_minutes"] == 300
 
 
+def test_parse_codex_usage_blank_credits_balance_is_ignored() -> None:
+    parsed = parse_codex_wham_usage_response(
+        {
+            "plan_type": "team",
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 10,
+                    "reset_after_seconds": 100,
+                    "reset_at": 1700000000,
+                    "limit_window_seconds": 18000,
+                }
+            },
+            "credits": {
+                "has_credits": False,
+                "balance": "",
+                "unlimited": "false",
+            },
+        }
+    )
+    assert parsed is not None
+    assert parsed["has_credits"] is False
+    assert parsed["credits_unlimited"] is False
+    assert "credits_balance" not in parsed
+
+
 def test_parse_codex_usage_invalid_type_raises_diagnostic_error() -> None:
     with pytest.raises(CodexUsageParseError, match="rate_limit.primary_window 类型错误"):
         parse_codex_wham_usage_response({"rate_limit": {"primary_window": []}})

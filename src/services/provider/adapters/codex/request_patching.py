@@ -40,7 +40,7 @@ def maybe_patch_request_for_codex(
     """
     if (provider_type or "").lower() != ProviderType.CODEX:
         return request_body
-    if (provider_api_format or "").lower() not in {"openai:cli"}:
+    if (provider_api_format or "").lower() not in {"openai:cli", "openai:compact"}:
         return request_body
     if not isinstance(request_body, dict):
         return request_body

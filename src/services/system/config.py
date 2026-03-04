@@ -208,6 +208,10 @@ class SystemConfigService:
             "value": 30,
             "description": "审计日志保留天数，超过此天数的审计日志将被自动清理",
         },
+        "enable_db_maintenance": {
+            "value": True,
+            "description": "是否启用数据库表维护任务（定期 VACUUM ANALYZE 防止表和索引膨胀）",
+        },
         # 系统代理
         "system_proxy_node_id": {
             "value": None,

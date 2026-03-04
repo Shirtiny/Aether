@@ -264,9 +264,14 @@ def parse_codex_wham_usage_response(data: dict[str, Any]) -> dict[str, Any] | No
     has_credits = credits.get("has_credits")
     if has_credits is not None:
         result["has_credits"] = _coerce_bool(has_credits, "credits.has_credits")
-    balance = credits.get("balance")
-    if balance is not None:
-        result["credits_balance"] = _coerce_float(balance, "credits.balance")
+
+    credits_balance = _coerce_optional_float(credits.get("balance"), "credits.balance")
+    if credits_balance is not None:
+        result["credits_balance"] = credits_balance
+
+    credits_unlimited = _coerce_optional_bool(credits.get("unlimited"), "credits.unlimited")
+    if credits_unlimited is not None:
+        result["credits_unlimited"] = credits_unlimited
 
     # 添加更新时间戳
     if result:

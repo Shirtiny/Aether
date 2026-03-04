@@ -1301,60 +1301,113 @@ async def complete_provider_oauth(
 # ==============================================================================
 
 
-def _parse_tokens_input(raw_input: str) -> list[str]:
+def _coerce_import_str(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
+def _extract_standard_oauth_import_entry(item: Any) -> dict[str, str] | None:
+    if isinstance(item, str):
+        token = _coerce_import_str(item)
+        if token:
+            return {"refresh_token": token}
+        return None
+    if not isinstance(item, dict):
+        return None
+
+    refresh_token = _coerce_import_str(item.get("refresh_token")) or _coerce_import_str(
+        item.get("refreshToken")
+    )
+    if not refresh_token:
+        return None
+
+    entry: dict[str, str] = {"refresh_token": refresh_token}
+
+    account_id = (
+        _coerce_import_str(item.get("account_id"))
+        or _coerce_import_str(item.get("accountId"))
+        or _coerce_import_str(item.get("chatgpt_account_id"))
+        or _coerce_import_str(item.get("chatgptAccountId"))
+    )
+    if account_id:
+        entry["account_id"] = account_id
+
+    plan_type = (
+        _coerce_import_str(item.get("plan_type"))
+        or _coerce_import_str(item.get("planType"))
+        or _coerce_import_str(item.get("chatgpt_plan_type"))
+        or _coerce_import_str(item.get("chatgptPlanType"))
+    )
+    if plan_type:
+        entry["plan_type"] = plan_type.lower()
+
+    user_id = (
+        _coerce_import_str(item.get("user_id"))
+        or _coerce_import_str(item.get("userId"))
+        or _coerce_import_str(item.get("chatgpt_user_id"))
+        or _coerce_import_str(item.get("chatgptUserId"))
+    )
+    if user_id:
+        entry["user_id"] = user_id
+
+    email = _coerce_import_str(item.get("email"))
+    if email:
+        entry["email"] = email
+
+    return entry
+
+
+def _parse_standard_oauth_import_entries(raw_input: str) -> list[dict[str, str]]:
     """
-    解析通用 Token 导入输入，支持多种格式。
+    解析标准 OAuth 导入输入，保留 refresh_token 及可用账号提示字段。
 
     支持的格式：
     1. 单个 Token 字符串
     2. JSON 字符串数组: ["token1", "token2", ...]
-    3. JSON 对象数组: [{"refresh_token": "token1", ...}, ...]
+    3. JSON 对象数组: [{"refresh_token": "token1", "account_id": "...", ...}, ...]
     4. 单个 JSON 对象: {"refresh_token": "token1", ...}
     5. 纯 Token 导入（一行一个）: "token1\\ntoken2\\ntoken3"
-
-    返回: Token 字符串列表
     """
     raw = raw_input.strip()
     if not raw:
         return []
 
-    result: list[str] = []
+    result: list[dict[str, str]] = []
 
-    # 尝试解析为 JSON 数组
     if raw.startswith("["):
         try:
             parsed = json.loads(raw)
-            if isinstance(parsed, list):
-                for item in parsed:
-                    if isinstance(item, str) and item.strip():
-                        result.append(item.strip())
-                    elif isinstance(item, dict):
-                        token = item.get("refresh_token", "")
-                        if isinstance(token, str) and token.strip():
-                            result.append(token.strip())
-                return result
         except json.JSONDecodeError:
-            pass  # 不是有效 JSON，继续尝试其他格式
+            parsed = None
+        if isinstance(parsed, list):
+            for item in parsed:
+                entry = _extract_standard_oauth_import_entry(item)
+                if entry:
+                    result.append(entry)
+            return result
 
-    # 单个 JSON 对象
     if raw.startswith("{"):
         try:
             parsed = json.loads(raw)
-            if isinstance(parsed, dict):
-                token = parsed.get("refresh_token", "")
-                if isinstance(token, str) and token.strip():
-                    return [token.strip()]
         except json.JSONDecodeError:
-            pass
+            parsed = None
+        if isinstance(parsed, dict):
+            entry = _extract_standard_oauth_import_entry(parsed)
+            return [entry] if entry else []
 
-    # 纯 Token 导入（一行一个）
-    lines = raw.splitlines()
-    for line in lines:
+    for line in raw.splitlines():
         token = line.strip()
-        if token and not token.startswith("#"):  # 忽略空行和注释行
-            result.append(token)
+        if token and not token.startswith("#"):
+            result.append({"refresh_token": token})
 
     return result
+
+
+def _parse_tokens_input(raw_input: str) -> list[str]:
+    """兼容旧逻辑：仅返回 refresh_token 列表。"""
+    return [entry["refresh_token"] for entry in _parse_standard_oauth_import_entries(raw_input)]
 
 
 def _parse_kiro_import_input(raw_input: str) -> list[dict[str, Any]]:
@@ -1581,7 +1634,15 @@ def _task_state_to_response(state: dict[str, Any]) -> BatchImportTaskStatusRespo
 def _estimate_batch_import_total(provider_type: str, raw_credentials: str) -> int:
     if provider_type == ProviderType.KIRO.value:
         return len(_parse_kiro_import_input(raw_credentials))
-    return len(_parse_tokens_input(raw_credentials))
+    return len(_parse_standard_oauth_import_entries(raw_credentials))
+
+
+def _apply_codex_import_hints(auth_config: dict[str, Any], import_entry: dict[str, str]) -> None:
+    """将导入文件中可用的 Codex 账号信息作为兜底补全（不覆盖已有值）。"""
+    for field in ("account_id", "plan_type", "user_id", "email"):
+        value = import_entry.get(field)
+        if value and not auth_config.get(field):
+            auth_config[field] = value
 
 
 @router.post(
@@ -1823,8 +1884,8 @@ async def _batch_import_standard_oauth_internal(
     template = _require_oauth_template(provider_type)
     timeout_seconds = _resolve_batch_import_timeout_seconds(proxy_config)
 
-    tokens = _parse_tokens_input(raw_credentials)
-    if not tokens:
+    import_entries = _parse_standard_oauth_import_entries(raw_credentials)
+    if not import_entries:
         raise InvalidRequestException("未找到有效的 Token 数据")
 
     api_formats = _get_provider_api_formats(provider)
@@ -1836,7 +1897,8 @@ async def _batch_import_standard_oauth_internal(
     success_count = 0
     failed_count = 0
 
-    for idx, refresh_token in enumerate(tokens):
+    for idx, import_entry in enumerate(import_entries):
+        refresh_token = import_entry.get("refresh_token", "")
         result_item: BatchImportResultItem
         try:
             if not refresh_token or len(refresh_token) < 10:
@@ -1895,7 +1957,7 @@ async def _batch_import_standard_oauth_internal(
                     results.append(result_item)
                     if progress_hook is not None:
                         await progress_hook(
-                            len(tokens),
+                            len(import_entries),
                             idx + 1,
                             success_count,
                             failed_count,
@@ -1923,7 +1985,7 @@ async def _batch_import_standard_oauth_internal(
                     results.append(result_item)
                     if progress_hook is not None:
                         await progress_hook(
-                            len(tokens),
+                            len(import_entries),
                             idx + 1,
                             success_count,
                             failed_count,
@@ -1945,7 +2007,7 @@ async def _batch_import_standard_oauth_internal(
                     results.append(result_item)
                     if progress_hook is not None:
                         await progress_hook(
-                            len(tokens),
+                            len(import_entries),
                             idx + 1,
                             success_count,
                             failed_count,
@@ -1981,6 +2043,9 @@ async def _batch_import_standard_oauth_internal(
                 except Exception as exc:
                     logger.warning("批量导入: enrich_auth_config 失败 (index={}): {}", idx, exc)
 
+                if provider_type == ProviderType.CODEX.value:
+                    _apply_codex_import_hints(auth_config, import_entry)
+
                 try:
                     existing_key = _check_duplicate_oauth_account(db, provider_id, auth_config)
                 except InvalidRequestException as exc:
@@ -1993,7 +2058,7 @@ async def _batch_import_standard_oauth_internal(
                     results.append(result_item)
                     if progress_hook is not None:
                         await progress_hook(
-                            len(tokens),
+                            len(import_entries),
                             idx + 1,
                             success_count,
                             failed_count,
@@ -2053,7 +2118,9 @@ async def _batch_import_standard_oauth_internal(
 
         results.append(result_item)
         if progress_hook is not None:
-            await progress_hook(len(tokens), idx + 1, success_count, failed_count, result_item)
+            await progress_hook(
+                len(import_entries), idx + 1, success_count, failed_count, result_item
+            )
 
     if success_count > 0:
         db.commit()
@@ -2063,12 +2130,12 @@ async def _batch_import_standard_oauth_internal(
         provider_id,
         provider_type,
         success_count,
-        len(tokens),
+        len(import_entries),
         failed_count,
     )
 
     return BatchImportResponse(
-        total=len(tokens),
+        total=len(import_entries),
         success=success_count,
         failed=failed_count,
         results=results,

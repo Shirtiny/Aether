@@ -10,20 +10,18 @@ const props = withDefaults(defineProps<{
   status?: string | null
   responseTimeMs?: number | null
   precision?: number
-  intervalMs?: number
 }>(), {
   createdAt: null,
   status: null,
   responseTimeMs: null,
   precision: 2,
-  intervalMs: 200
 })
 
 const now = ref(Date.now())
 const precision = computed(() => Math.max(0, props.precision))
 const isActive = computed(() => props.status === 'pending' || props.status === 'streaming')
 
-let timer: ReturnType<typeof setInterval> | null = null
+let rafId: number | null = null
 
 function parseCreatedAtMs(value: string | null | undefined): number {
   if (!value) return Number.NaN
@@ -32,31 +30,33 @@ function parseCreatedAtMs(value: string | null | undefined): number {
   return new Date(normalized).getTime()
 }
 
-function stopTimer() {
-  if (!timer) return
-  clearInterval(timer)
-  timer = null
+function stopRaf() {
+  if (rafId == null) return
+  cancelAnimationFrame(rafId)
+  rafId = null
 }
 
-function startTimer() {
-  stopTimer()
-  const intervalMs = Math.max(100, props.intervalMs)
-  timer = setInterval(() => {
-    now.value = Date.now()
-  }, intervalMs)
+function tick() {
+  now.value = Date.now()
+  rafId = requestAnimationFrame(tick)
 }
 
-watch([isActive, () => props.intervalMs], ([active]) => {
+function startRaf() {
+  stopRaf()
+  now.value = Date.now()
+  rafId = requestAnimationFrame(tick)
+}
+
+watch(isActive, (active) => {
   if (active) {
-    now.value = Date.now()
-    startTimer()
+    startRaf()
   } else {
-    stopTimer()
+    stopRaf()
   }
 }, { immediate: true })
 
 onUnmounted(() => {
-  stopTimer()
+  stopRaf()
 })
 
 const displayText = computed(() => {

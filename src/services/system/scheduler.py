@@ -44,6 +44,7 @@ class TaskScheduler:
         func: Callable[..., Any],
         hour: int | str,
         minute: int = 0,
+        day_of_week: str | int | None = None,
         job_id: str | None = None,
         name: str | None = None,
         timezone: str | None = None,
@@ -56,12 +57,15 @@ class TaskScheduler:
             func: 要执行的函数
             hour: 执行时间（小时），使用业务时区
             minute: 执行时间（分钟）
+            day_of_week: 星期几执行（如 "sun", "mon" 或 0-6）
             job_id: 任务ID
             name: 任务名称（用于日志）
             **kwargs: 传递给任务函数的参数
         """
         trigger_timezone = timezone or APP_TIMEZONE
-        trigger = CronTrigger(hour=hour, minute=minute, timezone=trigger_timezone)
+        trigger = CronTrigger(
+            day_of_week=day_of_week, hour=hour, minute=minute, timezone=trigger_timezone
+        )
 
         job_id = job_id or func.__name__
         display_name = name or job_id

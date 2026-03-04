@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any, Awaitable, Callable
 from urllib.parse import urlsplit, urlunsplit
 
@@ -208,51 +209,130 @@ async def post_oauth_token(
     )
 
 
-def parse_codex_id_token(id_token: str | None) -> dict[str, Any]:
-    """Parse Codex id_token WITHOUT signature verification.
+def _as_non_empty_str(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text or None
 
-    Extract from claim `https://api.openai.com/auth`:
-    - email: claim `email`
-    - account_id: `chatgpt_account_id`
-    - plan_type: `chatgpt_plan_type` (e.g. "plus", "free", "team", "enterprise")
-    - user_id: `chatgpt_user_id`
 
-    Return dict with extracted fields. On any failure returns empty dict.
-    """
+def _first_non_empty_str(values: list[Any]) -> str | None:
+    for value in values:
+        text = _as_non_empty_str(value)
+        if text:
+            return text
+    return None
 
-    if not id_token:
-        return {}
+
+def _decode_unverified_jwt_payload(token: str) -> dict[str, Any] | None:
     try:
         claims = jwt.decode(
-            id_token,
+            token,
             options={
                 "verify_signature": False,
                 "verify_aud": False,
             },
         )
-        result: dict[str, Any] = {}
-
-        email = claims.get("email")
-        if isinstance(email, str) and email:
-            result["email"] = email
-
-        auth_info = claims.get("https://api.openai.com/auth") or {}
-        if isinstance(auth_info, dict):
-            account_id = auth_info.get("chatgpt_account_id")
-            if isinstance(account_id, str) and account_id:
-                result["account_id"] = account_id
-
-            plan_type = auth_info.get("chatgpt_plan_type")
-            if isinstance(plan_type, str) and plan_type:
-                result["plan_type"] = plan_type
-
-            user_id = auth_info.get("chatgpt_user_id")
-            if isinstance(user_id, str) and user_id:
-                result["user_id"] = user_id
-
-        return result
     except Exception:
+        return None
+    return claims if isinstance(claims, dict) else None
+
+
+def _extract_codex_fields_from_claims(claims: dict[str, Any]) -> dict[str, Any]:
+    auth_info = claims.get("https://api.openai.com/auth")
+    auth = auth_info if isinstance(auth_info, dict) else {}
+
+    result: dict[str, Any] = {}
+
+    email = _first_non_empty_str(
+        [
+            claims.get("email"),
+            auth.get("email"),
+        ]
+    )
+    if email:
+        result["email"] = email
+
+    account_id = _first_non_empty_str(
+        [
+            auth.get("chatgpt_account_id"),
+            auth.get("chatgptAccountId"),
+            auth.get("account_id"),
+            auth.get("accountId"),
+            claims.get("chatgpt_account_id"),
+            claims.get("chatgptAccountId"),
+            claims.get("account_id"),
+            claims.get("accountId"),
+        ]
+    )
+    if account_id:
+        result["account_id"] = account_id
+
+    plan_type = _first_non_empty_str(
+        [
+            auth.get("chatgpt_plan_type"),
+            auth.get("chatgptPlanType"),
+            auth.get("plan_type"),
+            auth.get("planType"),
+            claims.get("chatgpt_plan_type"),
+            claims.get("chatgptPlanType"),
+            claims.get("plan_type"),
+            claims.get("planType"),
+        ]
+    )
+    if plan_type:
+        result["plan_type"] = plan_type
+
+    user_id = _first_non_empty_str(
+        [
+            auth.get("chatgpt_user_id"),
+            auth.get("chatgptUserId"),
+            auth.get("user_id"),
+            auth.get("userId"),
+            claims.get("chatgpt_user_id"),
+            claims.get("chatgptUserId"),
+            claims.get("user_id"),
+            claims.get("userId"),
+            claims.get("sub"),
+        ]
+    )
+    if user_id:
+        result["user_id"] = user_id
+
+    return result
+
+
+def parse_codex_id_token(id_token: Any) -> dict[str, Any]:
+    """Parse Codex token payload without signature verification.
+
+    Supports:
+    - JWT string (typical id_token / sometimes access_token)
+    - JSON string containing claims
+    - Already-decoded dict payload
+    """
+
+    claims: dict[str, Any] | None = None
+    if isinstance(id_token, dict):
+        claims = id_token
+    else:
+        token_text = _as_non_empty_str(id_token)
+        if not token_text:
+            return {}
+
+        if token_text.startswith("{"):
+            try:
+                payload = json.loads(token_text)
+            except Exception:
+                payload = None
+            if isinstance(payload, dict):
+                claims = payload
+
+        if claims is None:
+            claims = _decode_unverified_jwt_payload(token_text)
+
+    if not isinstance(claims, dict):
         return {}
+    return _extract_codex_fields_from_claims(claims)
 
 
 async def fetch_google_email(

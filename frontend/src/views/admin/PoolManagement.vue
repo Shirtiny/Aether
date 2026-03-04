@@ -373,12 +373,6 @@
                           />
                         </Button>
                       </template>
-                      <span
-                        v-if="formatQuotaUpdatedAt(key)"
-                        class="text-[10px] text-muted-foreground/70 whitespace-nowrap"
-                      >
-                        {{ formatQuotaUpdatedAt(key) }}
-                      </span>
                       <Badge
                         v-if="key.oauth_plan_type"
                         variant="outline"
@@ -767,12 +761,6 @@
                       />
                     </Button>
                   </template>
-                  <span
-                    v-if="formatQuotaUpdatedAt(key)"
-                    class="text-[10px] text-muted-foreground/70 truncate"
-                  >
-                    {{ formatQuotaUpdatedAt(key) }}
-                  </span>
                   <Badge
                     v-if="key.oauth_plan_type"
                     variant="outline"
@@ -2076,27 +2064,6 @@ function getOAuthStatusTitle(key: PoolKeyDetail): string {
     return 'Token 已过期，请重新授权'
   }
   return `Token 剩余有效期: ${status.text}`
-}
-
-function formatUpdatedAt(updatedAtSeconds: number | null | undefined): string {
-  if (!updatedAtSeconds) return ''
-
-  // 触发响应式更新，保持“xx分钟前更新”实时变化
-  void countdownTick.value
-
-  const now = Math.floor(Date.now() / 1000)
-  const diff = now - updatedAtSeconds
-  if (diff <= 60) return '刚刚更新'
-  const minutes = Math.floor(diff / 60)
-  if (minutes < 60) return `${minutes}分钟前更新`
-  const hours = Math.floor(minutes / 60)
-  if (hours < 24) return `${hours}小时前更新`
-  const days = Math.floor(hours / 24)
-  return `${days}天前更新`
-}
-
-function formatQuotaUpdatedAt(key: PoolKeyDetail): string {
-  return formatUpdatedAt(key.quota_updated_at)
 }
 
 function normalizeQuotaLabel(label: string): string {
