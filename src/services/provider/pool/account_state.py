@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from typing import Any
 
 OAUTH_ACCOUNT_BLOCK_PREFIX = "[ACCOUNT_BLOCK] "
+OAUTH_REFRESH_FAILED_PREFIX = "[REFRESH_FAILED] "
+OAUTH_EXPIRED_PREFIX = "[OAUTH_EXPIRED] "
 
 # -- 按原因细分的关键词组 --
 # 封禁类 (suspended / banned)
@@ -184,6 +186,15 @@ def _resolve_from_oauth_invalid_reason(reason: str | None) -> PoolAccountState |
             reason=cleaned or "账号异常",
         )
 
+    if text.startswith(OAUTH_EXPIRED_PREFIX):
+        cleaned = text[len(OAUTH_EXPIRED_PREFIX) :].strip()
+        return PoolAccountState(
+            blocked=True,
+            code="oauth_expired",
+            label="Token 失效",
+            reason=cleaned or "OAuth Token 已过期且无法续期",
+        )
+
     lowered = text.lower()
     if any(keyword in lowered for keyword in ACCOUNT_BLOCK_REASON_KEYWORDS):
         code, label = _classify_block_reason(text)
@@ -219,6 +230,8 @@ def resolve_pool_account_state(
 __all__ = [
     "ACCOUNT_BLOCK_REASON_KEYWORDS",
     "OAUTH_ACCOUNT_BLOCK_PREFIX",
+    "OAUTH_EXPIRED_PREFIX",
+    "OAUTH_REFRESH_FAILED_PREFIX",
     "PoolAccountState",
     "resolve_pool_account_state",
 ]

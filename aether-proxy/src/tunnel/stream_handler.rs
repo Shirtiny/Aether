@@ -34,8 +34,18 @@ const MIN_TIMEOUT_SECS: u64 = 5;
 const MAX_TIMEOUT_SECS: u64 = 300;
 
 /// Headers that must not be forwarded to upstream (hop-by-hop or security-sensitive).
+///
+/// `host` and `content-length` are managed by the HTTP client (reqwest/hyper):
+/// - `host` → translated to `:authority` pseudo-header in HTTP/2; forwarding
+///   the original `host` alongside `:authority` triggers PROTOCOL_ERROR on
+///   strict H2 implementations (e.g. Google APIs).
+/// - `content-length` → recalculated by hyper from the actual body; a stale
+///   value from the tunnel (body may have been re-compressed) causes H2
+///   PROTOCOL_ERROR when it mismatches the real frame length.
 const BLOCKED_HEADERS: &[&str] = &[
     "connection",
+    "content-length",
+    "host",
     "keep-alive",
     "proxy-authenticate",
     "proxy-authorization",

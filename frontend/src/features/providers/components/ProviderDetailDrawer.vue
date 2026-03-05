@@ -2059,19 +2059,16 @@ function startEditMultiplier(key: EndpointAPIKey, format: string) {
 function cancelEditMultiplier() {
   editingMultiplierKey.value = null
   editingMultiplierFormat.value = null
-  multiplierSaving.value = false
 }
 
 function handleMultiplierKeydown(e: KeyboardEvent, key: EndpointAPIKey, format: string) {
   if (e.key === 'Enter') {
     e.preventDefault()
     e.stopPropagation()
-    if (!multiplierSaving.value) {
-      multiplierSaving.value = true
-      saveMultiplier(key, format)
-    }
+    saveMultiplier(key, format)
   } else if (e.key === 'Escape') {
     e.preventDefault()
+    multiplierSaving.value = true // 阻止 blur 触发保存
     cancelEditMultiplier()
   }
 }
@@ -2082,7 +2079,7 @@ function handleMultiplierBlur(key: EndpointAPIKey, format: string) {
 }
 
 async function saveMultiplier(key: EndpointAPIKey, format: string) {
-  // 防止重复调用
+  // 防止重复调用（Enter 触发后阻止 blur 再次进入）
   if (multiplierSaving.value) return
   multiplierSaving.value = true
 
@@ -2093,6 +2090,7 @@ async function saveMultiplier(key: EndpointAPIKey, format: string) {
   if (!keyId || isNaN(newMultiplier)) {
     showError('请输入有效的倍率值')
     cancelEditMultiplier()
+    multiplierSaving.value = false
     return
   }
 
@@ -2100,6 +2098,7 @@ async function saveMultiplier(key: EndpointAPIKey, format: string) {
   if (newMultiplier <= 0 || newMultiplier > 100) {
     showError('倍率必须在 0.01 到 100 之间')
     cancelEditMultiplier()
+    multiplierSaving.value = false
     return
   }
 
@@ -2107,6 +2106,7 @@ async function saveMultiplier(key: EndpointAPIKey, format: string) {
   const currentMultiplier = getKeyRateMultiplier(key, format)
   if (Math.abs(currentMultiplier - newMultiplier) < 0.0001) {
     cancelEditMultiplier()
+    multiplierSaving.value = false
     return
   }
 

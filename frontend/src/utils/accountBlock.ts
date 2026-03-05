@@ -44,11 +44,13 @@ export function isAccountLevelBlockReason(reason: string | null | undefined): bo
   const text = reason.trim()
   if (!text) return false
   if (text.startsWith('[ACCOUNT_BLOCK]')) return true
+  if (text.startsWith('[OAUTH_EXPIRED]')) return true
   const lowered = text.toLowerCase()
   return ACCOUNT_BLOCK_REASON_KEYWORDS.some(keyword => lowered.includes(keyword))
 }
 
 export function classifyAccountBlockLabel(reason: string): string {
+  if (reason.trim().startsWith('[OAUTH_EXPIRED]')) return 'Token 失效'
   const lowered = reason.toLowerCase()
   if (KEYWORDS_VERIFICATION.some(kw => lowered.includes(kw))) return '需要验证'
   if (KEYWORDS_DISABLED.some(kw => lowered.includes(kw))) return '账号停用'
@@ -57,5 +59,15 @@ export function classifyAccountBlockLabel(reason: string): string {
 }
 
 export function cleanAccountBlockReason(reason: string): string {
-  return reason.replace(/^\[ACCOUNT_BLOCK\]\s*/i, '').trim()
+  return reason.replace(/^\[(ACCOUNT_BLOCK|OAUTH_EXPIRED)\]\s*/i, '').trim()
+}
+
+export function isRefreshFailedReason(reason: string | null | undefined): boolean {
+  if (!reason) return false
+  return reason.trim().startsWith('[REFRESH_FAILED]')
+}
+
+export function isOAuthExpiredReason(reason: string | null | undefined): boolean {
+  if (!reason) return false
+  return reason.trim().startsWith('[OAUTH_EXPIRED]')
 }

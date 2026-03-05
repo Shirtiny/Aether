@@ -1963,6 +1963,7 @@ async function handleRefreshOAuth(key: PoolKeyDetail) {
     await loadKeys()
   } catch (err) {
     showError(parseApiError(err, 'Token 刷新失败'))
+    await loadKeys()
   } finally {
     refreshingOAuthKeyId.value = null
   }
