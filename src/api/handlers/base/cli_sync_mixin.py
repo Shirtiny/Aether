@@ -169,6 +169,7 @@ class CliSyncMixin:
                     key_id=str(getattr(key, "id", "") or ""),
                     is_stream=upstream_is_stream,
                     provider_id=str(getattr(provider, "id", "") or ""),
+                    key=key,
                 )
 
             # 跨格式：先做请求体转换（失败触发 failover）

@@ -75,6 +75,7 @@ class RequestTraceResponse(BaseModel):
 async def get_request_trace(
     request_id: str,
     request: Request,
+    attempted_only: bool = Query(False, description="仅返回实际尝试过的候选"),
     db: Session = Depends(get_db),
 ) -> Any:
     """
@@ -119,7 +120,7 @@ async def get_request_trace(
       - `finished_at`: 完成时间
     """
 
-    adapter = AdminGetRequestTraceAdapter(request_id=request_id)
+    adapter = AdminGetRequestTraceAdapter(request_id=request_id, attempted_only=attempted_only)
     return await pipeline.run(adapter=adapter, http_request=request, db=db, mode=adapter.mode)
 
 
@@ -159,6 +160,18 @@ async def get_provider_failure_rate(
 @dataclass
 class AdminGetRequestTraceAdapter(AdminApiAdapter):
     request_id: str
+    attempted_only: bool = False
+
+    @staticmethod
+    def _is_attempted_candidate(candidate: Any) -> bool:
+        status = str(getattr(candidate, "status", "") or "").strip().lower()
+        # pre-created / never executed rows should not be considered as attempted
+        if status in {"", "available", "unused", "skipped"}:
+            return False
+        # pending must have started_at to be considered truly entered execution
+        if status == "pending" and getattr(candidate, "started_at", None) is None:
+            return False
+        return True
 
     async def handle(self, context: ApiRequestContext) -> Any:  # type: ignore[override]
         db = context.db
@@ -173,7 +186,11 @@ class AdminGetRequestTraceAdapter(AdminApiAdapter):
         if not all_candidates:
             raise HTTPException(status_code=404, detail="Request not found")
 
-        candidates = all_candidates
+        candidates = (
+            [c for c in all_candidates if self._is_attempted_candidate(c)]
+            if self.attempted_only
+            else all_candidates
+        )
 
         # 计算总延迟（只统计已完成的候选：success, failed, cancelled）
         # 使用显式的 is not None 检查，避免过滤掉 0ms 的快速响应
@@ -191,14 +208,15 @@ class AdminGetRequestTraceAdapter(AdminApiAdapter):
         # 3. status="streaming" 表示流式请求正在进行中
         # 4. status="pending" 表示请求尚未开始执行
         # 5. status="cancelled" 表示客户端主动断开连接（不算失败）
+        final_status_source = all_candidates if self.attempted_only else candidates
         has_success = any(
             c.status == "success" or (c.status_code is not None and 200 <= c.status_code < 300)
-            for c in candidates
+            for c in final_status_source
         )
-        has_streaming = any(c.status == "streaming" for c in candidates)
-        has_pending = any(c.status == "pending" for c in candidates)
-        has_cancelled = any(c.status == "cancelled" for c in candidates)
-        has_failed = any(c.status == "failed" for c in candidates)
+        has_streaming = any(c.status == "streaming" for c in final_status_source)
+        has_pending = any(c.status == "pending" for c in final_status_source)
+        has_cancelled = any(c.status == "cancelled" for c in final_status_source)
+        has_failed = any(c.status == "failed" for c in final_status_source)
 
         if has_success:
             final_status = "success"
@@ -385,6 +403,7 @@ class AdminGetRequestTraceAdapter(AdminApiAdapter):
             total_candidates=len(candidates),
             final_status=final_status,
             total_latency_ms=total_latency,
+            attempted_only=self.attempted_only,
         )
         return response
 

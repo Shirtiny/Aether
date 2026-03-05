@@ -118,7 +118,7 @@ async def test_402_sets_long_cooldown(config: PoolConfig) -> None:
 
 
 @pytest.mark.asyncio
-async def test_403_sets_long_cooldown(config: PoolConfig) -> None:
+async def test_403_default_sets_medium_cooldown(config: PoolConfig) -> None:
     with patch(
         "src.services.provider.pool.redis_ops.set_cooldown",
         new_callable=AsyncMock,
@@ -128,6 +128,24 @@ async def test_403_sets_long_cooldown(config: PoolConfig) -> None:
             key_id=KID,
             status_code=403,
             error_body=None,
+            response_headers=None,
+            config=config,
+        )
+
+    mock_cd.assert_called_once_with(PID, KID, "forbidden_403", ttl=300)
+
+
+@pytest.mark.asyncio
+async def test_403_suspended_body_sets_long_cooldown(config: PoolConfig) -> None:
+    with patch(
+        "src.services.provider.pool.redis_ops.set_cooldown",
+        new_callable=AsyncMock,
+    ) as mock_cd:
+        await apply_health_policy(
+            provider_id=PID,
+            key_id=KID,
+            status_code=403,
+            error_body=json.dumps({"error": {"message": "account suspended"}}),
             response_headers=None,
             config=config,
         )
@@ -226,6 +244,42 @@ async def test_529_uses_overload_cooldown(config: PoolConfig) -> None:
         )
 
     mock_cd.assert_called_once_with(PID, KID, "overloaded_529", ttl=30)
+
+
+@pytest.mark.asyncio
+async def test_503_uses_retry_after_when_present(config: PoolConfig) -> None:
+    with patch(
+        "src.services.provider.pool.redis_ops.set_cooldown",
+        new_callable=AsyncMock,
+    ) as mock_cd:
+        await apply_health_policy(
+            provider_id=PID,
+            key_id=KID,
+            status_code=503,
+            error_body=None,
+            response_headers={"retry-after": "45"},
+            config=config,
+        )
+
+    mock_cd.assert_called_once_with(PID, KID, "service_unavailable_503", ttl=45)
+
+
+@pytest.mark.asyncio
+async def test_500_uses_overload_cooldown(config: PoolConfig) -> None:
+    with patch(
+        "src.services.provider.pool.redis_ops.set_cooldown",
+        new_callable=AsyncMock,
+    ) as mock_cd:
+        await apply_health_policy(
+            provider_id=PID,
+            key_id=KID,
+            status_code=500,
+            error_body=None,
+            response_headers=None,
+            config=config,
+        )
+
+    mock_cd.assert_called_once_with(PID, KID, "server_error_500", ttl=30)
 
 
 # ---------------------------------------------------------------------------

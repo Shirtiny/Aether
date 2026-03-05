@@ -13,6 +13,10 @@ from src.core.logger import logger
 from src.core.provider_types import ProviderType, normalize_provider_type
 from src.models.database import Provider, ProviderAPIKey, ProviderEndpoint
 from src.services.model.upstream_fetcher import merge_upstream_metadata
+from src.services.provider.pool import redis_ops as pool_redis
+from src.services.provider.pool.account_state import resolve_pool_account_state
+from src.services.provider.pool.config import parse_pool_config
+from src.services.provider_keys.key_side_effects import run_delete_key_side_effects
 from src.services.provider_keys.quota_refresh import (
     refresh_antigravity_key_quota,
     refresh_codex_key_quota,
@@ -74,6 +78,8 @@ async def refresh_provider_quota_for_provider(
     provider_type = normalize_provider_type(getattr(provider, "provider_type", ""))
     if provider_type not in {ProviderType.CODEX, ProviderType.ANTIGRAVITY, ProviderType.KIRO}:
         raise InvalidRequestException("仅支持 Codex / Antigravity / Kiro 类型的 Provider 刷新限额")
+    pool_cfg = parse_pool_config(getattr(provider, "config", None))
+    auto_remove_banned_keys = bool(pool_cfg and pool_cfg.auto_remove_banned_keys)
 
     selected_key_ids: list[str] | None = None
     if key_ids is not None:
@@ -100,6 +106,7 @@ async def refresh_provider_quota_for_provider(
                 "total": 0,
                 "results": [],
                 "message": "未提供可刷新的 Key",
+                "auto_removed": 0,
             }
         keys_query = keys_query.filter(ProviderAPIKey.id.in_(selected_key_ids))
 
@@ -111,6 +118,7 @@ async def refresh_provider_quota_for_provider(
             "total": 0,
             "results": [],
             "message": "没有可刷新的 Key",
+            "auto_removed": 0,
         }
 
     endpoint = _select_refresh_endpoint(provider, provider_type)
@@ -159,7 +167,14 @@ async def refresh_provider_quota_for_provider(
                 failed_count += 1
 
     # 统一更新数据库（避免在并发任务中操作 session）
-    if metadata_updates or state_updates:
+    auto_removed_contexts: list[tuple[str, str | None, list[str] | None]] = []
+    result_index_by_key_id: dict[str, dict[str, Any]] = {}
+    for result in results:
+        rid = str(result.get("key_id", "")).strip()
+        if rid:
+            result_index_by_key_id[rid] = result
+
+    if metadata_updates or state_updates or auto_remove_banned_keys:
         for key in keys:
             key_dirty = False
             if key.id in metadata_updates:
@@ -173,10 +188,57 @@ async def refresh_provider_quota_for_provider(
                     for field_name, field_value in updates.items():
                         setattr(key, field_name, field_value)
                     key_dirty = True
+
+            if auto_remove_banned_keys:
+                account_state = resolve_pool_account_state(
+                    provider_type=provider_type,
+                    upstream_metadata=getattr(key, "upstream_metadata", None),
+                    oauth_invalid_reason=getattr(key, "oauth_invalid_reason", None),
+                )
+                if account_state.blocked:
+                    key_id = str(getattr(key, "id", "") or "")
+                    auto_removed_contexts.append(
+                        (
+                            key_id,
+                            (
+                                str(getattr(key, "provider_id", "") or "")
+                                if getattr(key, "provider_id", None)
+                                else None
+                            ),
+                            getattr(key, "allowed_models", None),
+                        )
+                    )
+                    if key_id and key_id in result_index_by_key_id:
+                        result_index_by_key_id[key_id]["auto_removed"] = True
+                    db.delete(key)
+                    continue
+
             if key_dirty:
                 db.add(key)
 
     db.commit()
+
+    if auto_removed_contexts:
+        cleanup_coros = []
+        for key_id, pid, _allowed_models in auto_removed_contexts:
+            if not key_id or not pid:
+                continue
+            cleanup_coros.append(pool_redis.clear_cooldown(pid, key_id))
+            cleanup_coros.append(pool_redis.clear_cost(pid, key_id))
+        if cleanup_coros:
+            await asyncio.gather(*cleanup_coros, return_exceptions=True)
+        for _key_id, pid, allowed_models in auto_removed_contexts:
+            await run_delete_key_side_effects(
+                db=db,
+                provider_id=pid,
+                deleted_key_allowed_models=allowed_models,
+            )
+        logger.warning(
+            "[QUOTA_REFRESH] Provider {}: auto removed {} banned key(s): {}",
+            provider_id,
+            len(auto_removed_contexts),
+            [ctx[0][:8] for ctx in auto_removed_contexts if ctx[0]],
+        )
 
     failed_details = [
         f"{r.get('key_name', r.get('key_id', '?'))}: {r.get('message', 'unknown')}"
@@ -205,4 +267,5 @@ async def refresh_provider_quota_for_provider(
         "failed": failed_count,
         "total": len(keys),
         "results": results,
+        "auto_removed": len(auto_removed_contexts),
     }

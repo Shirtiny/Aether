@@ -1101,6 +1101,7 @@ import {
 import type { UpstreamMetadata, AntigravityModelQuota } from '@/api/endpoints/types'
 import { formatApiFormat } from '@/api/endpoints/types/api-format'
 import { isOAuthAccountProviderType, isKeyManagedProviderType } from '../utils/providerTypeUtils'
+import { isAccountLevelBlockReason } from '@/utils/accountBlock'
 
 // 扩展端点类型,包含密钥列表
 interface ProviderEndpointWithKeys extends ProviderEndpoint {
@@ -1568,8 +1569,7 @@ async function handleRefreshOAuth(key: EndpointAPIKey) {
 
 // 判断是否为账号级别的封禁（刷新 token 无法修复）
 function isAccountLevelBlock(key: EndpointAPIKey): boolean {
-  if (!key.oauth_invalid_reason) return false
-  return key.oauth_invalid_reason.startsWith('[ACCOUNT_BLOCK]')
+  return isAccountLevelBlockReason(key.oauth_invalid_reason)
 }
 
 // 清除 OAuth 失效标记

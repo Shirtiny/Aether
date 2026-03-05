@@ -10,14 +10,16 @@ ap:{pid}:sticky:{session_uuid}             STRING  -> key_id   (TTL: config)
 ap:{pid}:lru                               ZSET    member=key_id, score=unix_ts
 ap:{pid}:cooldown:{key_id}                 STRING  -> reason   (TTL: error-specific)
 ap:{pid}:cost:{key_id}                     ZSET    member=req_id, score=unix_ts
+ap:{pid}:latency:{key_id}                  ZSET    member=req_id:ttfb_ms, score=unix_ts
 provider_oauth_token_cache:{key_id}        STRING  -> access_token (TTL: expires - 60)
 """
 
 from __future__ import annotations
 
+import asyncio
 import time
 import uuid
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from src.clients.redis_client import get_redis_client
 from src.core.logger import logger
@@ -42,6 +44,10 @@ def _cooldown_key(provider_id: str, key_id: str) -> str:
 
 def _cost_key(provider_id: str, key_id: str) -> str:
     return f"{PREFIX}:{provider_id}:cost:{key_id}"
+
+
+def _latency_key(provider_id: str, key_id: str) -> str:
+    return f"{PREFIX}:{provider_id}:latency:{key_id}"
 
 
 def _oauth_cache_key(key_id: str) -> str:
@@ -89,6 +95,32 @@ for _, m in ipairs(members) do
     end
 end
 return total
+"""
+
+# Latency window cleanup + average in a single round-trip.
+# KEYS[1] = latency zset key, ARGV[1] = window_start timestamp
+# Returns nil when there are no samples, or avg(ms) as number.
+_LATENCY_WINDOW_AVG_LUA = """
+local key = KEYS[1]
+local window_start = tonumber(ARGV[1])
+redis.call("ZREMRANGEBYSCORE", key, "-inf", window_start)
+local members = redis.call("ZRANGEBYSCORE", key, window_start, "+inf")
+local total = 0
+local count = 0
+for _, m in ipairs(members) do
+    local colon = string.find(m, ":", 1, true)
+    if colon then
+        local n = tonumber(string.sub(m, colon + 1))
+        if n then
+            total = total + n
+            count = count + 1
+        end
+    end
+end
+if count == 0 then
+    return nil
+end
+return total / count
 """
 
 
@@ -337,6 +369,64 @@ async def batch_get_cost_totals(
         return {k: 0 for k in key_ids}
 
 
+async def record_latency(
+    provider_id: str,
+    key_id: str,
+    ttfb_ms: int,
+    window_seconds: int,
+    sample_limit: int,
+) -> None:
+    """Record one TTFB sample with rolling-window cleanup."""
+    redis = await _get_redis()
+    if redis is None:
+        return
+    try:
+        now = time.time()
+        latency_k = _latency_key(provider_id, key_id)
+        sample = max(int(ttfb_ms), 0)
+        member = f"{uuid.uuid4().hex}:{sample}"
+        pipe = redis.pipeline()
+        pipe.zadd(latency_k, {member: now})
+        window_start = now - max(int(window_seconds), 1)
+        pipe.zremrangebyscore(latency_k, "-inf", window_start)
+        capped_limit = max(int(sample_limit), 1)
+        pipe.zremrangebyrank(latency_k, 0, -(capped_limit + 1))
+        pipe.expire(latency_k, max(int(window_seconds), 1) + 600)
+        await pipe.execute()
+    except Exception:
+        logger.debug("Pool: latency ADD failed for key {}", key_id[:8])
+
+
+async def batch_get_latency_avgs(
+    provider_id: str,
+    key_ids: list[str],
+    window_seconds: int,
+) -> dict[str, float]:
+    """Batch-fetch latency averages (ms) for keys in a rolling window."""
+    redis = await _get_redis()
+    if redis is None:
+        return {}
+    try:
+        now = time.time()
+        window_start = now - max(int(window_seconds), 1)
+        pipe = redis.pipeline()
+        for kid in key_ids:
+            pipe.eval(_LATENCY_WINDOW_AVG_LUA, 1, _latency_key(provider_id, kid), str(window_start))
+        results = await pipe.execute()
+        out: dict[str, float] = {}
+        for kid, val in zip(key_ids, results):
+            if val is None:
+                continue
+            try:
+                out[kid] = float(val)
+            except Exception:
+                continue
+        return out
+    except Exception:
+        logger.debug("Pool: batch latency AVG failed for provider {}", provider_id[:8])
+        return {}
+
+
 async def clear_cost(provider_id: str, key_id: str) -> None:
     redis = await _get_redis()
     if redis is None:
@@ -512,6 +602,44 @@ async def batch_get_cooldown_ttls(provider_id: str, key_ids: list[str]) -> dict[
         return out
     except Exception:
         return {k: None for k in key_ids}
+
+
+async def batch_count_provider_cooldowns(provider_ids: list[str]) -> dict[str, int]:
+    """Count cooldown entries per provider using per-provider SCAN.
+
+    Each provider's cooldown keys are scanned independently with a
+    targeted pattern ``ap:{pid}:cooldown:*``, avoiding full-keyspace traversal.
+    Multiple providers are scanned concurrently via ``asyncio.gather``.
+    """
+    if not provider_ids:
+        return {}
+
+    redis = await _get_redis()
+    if redis is None:
+        return {pid: 0 for pid in provider_ids}
+
+    async def _count_one(r: Any, pid: str) -> tuple[str, int]:
+        pattern = f"{PREFIX}:{pid}:cooldown:*"
+        count = 0
+        async for _key in r.scan_iter(match=pattern, count=200):
+            count += 1
+        return pid, count
+
+    try:
+        results = await asyncio.gather(
+            *[_count_one(redis, pid) for pid in provider_ids],
+            return_exceptions=True,
+        )
+        counts: dict[str, int] = {}
+        for r in results:
+            if isinstance(r, Exception):
+                continue
+            counts[r[0]] = r[1]
+        for pid in provider_ids:
+            counts.setdefault(pid, 0)
+        return counts
+    except Exception:
+        return {pid: 0 for pid in provider_ids}
 
 
 # ---------------------------------------------------------------------------

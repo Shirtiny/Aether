@@ -25,6 +25,10 @@ class PoolSchedulingSnapshot:
     cost_limit: int | None
     cost_soft_threshold_percent: int = 80
     health_score: float = 1.0
+    latency_avg_ms: float | None = None
+    account_blocked: bool = False
+    account_block_label: str | None = None
+    account_block_reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,7 +53,6 @@ class PoolSchedulingSummary:
     status: str  # available / degraded / blocked
     reason: str
     label: str
-    score: float
     candidate_eligible: bool
     blocked_count: int
     degraded_count: int
@@ -65,6 +68,44 @@ class PoolSchedulingDimension(Protocol):
 
     def evaluate(self, snapshot: PoolSchedulingSnapshot) -> PoolSchedulingDimensionResult:
         """Evaluate one dimension from snapshot."""
+
+
+@dataclass(frozen=True, slots=True)
+class _AccountStateDimension:
+    code: str = "account_state"
+    label: str = "账号状态"
+    source: str = "policy"
+    weight: int = 10
+
+    def evaluate(self, snapshot: PoolSchedulingSnapshot) -> PoolSchedulingDimensionResult:
+        if not snapshot.account_blocked:
+            return PoolSchedulingDimensionResult(
+                code=self.code,
+                label=self.label,
+                source=self.source,
+                weight=self.weight,
+                status="ok",
+                score=1.0,
+            )
+
+        blocked_label = snapshot.account_block_label or "账号异常"
+        if blocked_label == "账号封禁":
+            blocked_code = "account_banned"
+        elif blocked_label == "访问受限":
+            blocked_code = "account_forbidden"
+        else:
+            blocked_code = "account_blocked"
+
+        return PoolSchedulingDimensionResult(
+            code=blocked_code,
+            label=blocked_label,
+            source=self.source,
+            weight=self.weight,
+            status="blocked",
+            blocking=True,
+            score=0.0,
+            detail=snapshot.account_block_reason or blocked_label,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -264,6 +305,59 @@ class _HealthDimension:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class _LatencyDimension:
+    code: str = "latency"
+    label: str = "延迟"
+    source: str = "runtime"
+    weight: int = 3
+
+    def evaluate(self, snapshot: PoolSchedulingSnapshot) -> PoolSchedulingDimensionResult:
+        latency = snapshot.latency_avg_ms
+        if latency is None:
+            return PoolSchedulingDimensionResult(
+                code=self.code,
+                label=self.label,
+                source=self.source,
+                weight=self.weight,
+                status="ok",
+                score=1.0,
+                detail="-",
+            )
+
+        value = max(float(latency), 0.0)
+        detail = f"{value:.0f}ms"
+        if value >= 3000:
+            return PoolSchedulingDimensionResult(
+                code="latency_high",
+                label="延迟偏高",
+                source=self.source,
+                weight=self.weight,
+                status="degraded",
+                score=0.5,
+                detail=detail,
+            )
+        if value >= 1200:
+            return PoolSchedulingDimensionResult(
+                code="latency_slow",
+                label="延迟较慢",
+                source=self.source,
+                weight=self.weight,
+                status="degraded",
+                score=0.72,
+                detail=detail,
+            )
+        return PoolSchedulingDimensionResult(
+            code=self.code,
+            label=self.label,
+            source=self.source,
+            weight=self.weight,
+            status="ok",
+            score=1.0,
+            detail=detail,
+        )
+
+
 _POOL_DIMENSION_REGISTRY: dict[str, PoolSchedulingDimension] = {}
 _POOL_DIMENSION_ORDER: list[str] = []
 
@@ -313,7 +407,6 @@ def summarize_pool_scheduling_dimensions(
             status="available",
             reason="available",
             label="可用",
-            score=100.0,
             candidate_eligible=True,
             blocked_count=0,
             degraded_count=0,
@@ -322,18 +415,12 @@ def summarize_pool_scheduling_dimensions(
     blocked = [item for item in dimensions if item.status == "blocked" or item.blocking]
     degraded = [item for item in dimensions if item.status == "degraded"]
 
-    total_weight = sum(max(item.weight, 1) for item in dimensions)
-    weighted_score = sum(
-        max(item.weight, 1) * max(min(item.score, 1.0), 0.0) for item in dimensions
-    ) / max(total_weight, 1)
-
     if blocked:
         primary = blocked[0]
         return PoolSchedulingSummary(
             status="blocked",
             reason=primary.code,
             label=primary.label,
-            score=round(weighted_score * 100, 1),
             candidate_eligible=False,
             blocked_count=len(blocked),
             degraded_count=len(degraded),
@@ -345,7 +432,6 @@ def summarize_pool_scheduling_dimensions(
             status="degraded",
             reason=primary.code,
             label=primary.label,
-            score=round(weighted_score * 100, 1),
             candidate_eligible=True,
             blocked_count=0,
             degraded_count=len(degraded),
@@ -355,7 +441,6 @@ def summarize_pool_scheduling_dimensions(
         status="available",
         reason="available",
         label="可用",
-        score=round(weighted_score * 100, 1),
         candidate_eligible=True,
         blocked_count=0,
         degraded_count=0,
@@ -363,10 +448,12 @@ def summarize_pool_scheduling_dimensions(
 
 
 def _register_default_dimensions() -> None:
+    register_pool_scheduling_dimension("account_state", _AccountStateDimension())
     register_pool_scheduling_dimension("manual", _ManualEnableDimension())
     register_pool_scheduling_dimension("cooldown", _CooldownDimension())
     register_pool_scheduling_dimension("circuit", _CircuitBreakerDimension())
     register_pool_scheduling_dimension("cost", _CostDimension())
+    register_pool_scheduling_dimension("latency", _LatencyDimension())
     register_pool_scheduling_dimension("health", _HealthDimension())
 
 

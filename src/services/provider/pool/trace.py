@@ -23,9 +23,16 @@ class PoolCandidateTrace:
     cost_limit: int | None = None
     cost_soft_threshold: bool = False
     skipped: bool = False
-    skip_type: str | None = None  # cooldown / cost_exhausted
+    skip_type: str | None = None  # cooldown / cost_exhausted / account_blocked / upstream
     cooldown_reason: str | None = None
     cooldown_ttl: int | None = None
+    account_block_code: str | None = None
+    account_block_label: str | None = None
+    account_block_reason: str | None = None
+    latency_avg_ms: float = 0.0
+    health_score: float = 1.0
+    composite_score: float = 0.0
+    scoring_mode: str = "lru"
 
     def to_extra_data(self) -> dict[str, Any]:
         """Build dict to merge into ``RequestCandidate.extra_data``."""
@@ -35,8 +42,16 @@ class PoolCandidateTrace:
                 skip_info["cooldown_reason"] = self.cooldown_reason
             if self.cooldown_ttl is not None:
                 skip_info["cooldown_ttl"] = self.cooldown_ttl
+            if self.account_block_code is not None:
+                skip_info["account_block_code"] = self.account_block_code
+            if self.account_block_label is not None:
+                skip_info["account_block_label"] = self.account_block_label
+            if self.account_block_reason is not None:
+                skip_info["account_block_reason"] = self.account_block_reason
             if self.cost_window_usage:
                 skip_info["cost_window_usage"] = self.cost_window_usage
+            if self.scoring_mode:
+                skip_info["scoring_mode"] = self.scoring_mode
             return {"pool_skip": skip_info}
 
         sel: dict[str, Any] = {"reason": self.reason}
@@ -50,6 +65,14 @@ class PoolCandidateTrace:
             sel["cost_limit"] = self.cost_limit
         if self.cost_soft_threshold:
             sel["cost_soft_threshold"] = True
+        if self.latency_avg_ms > 0:
+            sel["latency_avg_ms"] = round(self.latency_avg_ms, 2)
+        if self.health_score < 1.0:
+            sel["health_score"] = round(self.health_score, 4)
+        if self.reason == "multi_score":
+            sel["composite_score"] = round(self.composite_score, 6)
+        if self.scoring_mode:
+            sel["scoring_mode"] = self.scoring_mode
         return {"pool_selection": sel}
 
 
@@ -72,6 +95,7 @@ class PoolSchedulingTrace:
         """Build compact dict for ``Usage.request_metadata["pool_summary"]``."""
         skipped_cooldown = 0
         skipped_cost = 0
+        skipped_account_blocked = 0
         attempted = 0
         for t in self.candidate_traces.values():
             if t.skipped:
@@ -79,6 +103,8 @@ class PoolSchedulingTrace:
                     skipped_cooldown += 1
                 elif t.skip_type == "cost_exhausted":
                     skipped_cost += 1
+                elif t.skip_type == "account_blocked":
+                    skipped_account_blocked += 1
 
         if attempted_key_ids is None:
             # Backward-compatible behavior: count all schedulable keys.
@@ -101,6 +127,7 @@ class PoolSchedulingTrace:
             "attempted": attempted,
             "skipped_cooldown": skipped_cooldown,
             "skipped_cost": skipped_cost,
+            "skipped_account_blocked": skipped_account_blocked,
             "sticky_session": self.sticky_session_used,
         }
         if success_key_id:

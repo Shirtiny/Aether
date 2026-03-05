@@ -75,6 +75,22 @@ export interface PoolOverviewResponse {
   items: PoolOverviewItem[]
 }
 
+export interface PoolPresetModeMeta {
+  value: string
+  label: string
+}
+
+export interface PoolPresetMeta {
+  name: string
+  label: string
+  description: string
+  providers: string[]
+  modes?: PoolPresetModeMeta[] | null
+  default_mode?: string | null
+  mutex_group?: string | null
+  evidence_hint?: string | null
+}
+
 export interface PoolKeyDetail {
   key_id: string
   key_name: string
@@ -128,11 +144,6 @@ export interface PoolKeyDetail {
     | string
   scheduling_label?: string
   scheduling_reasons?: PoolSchedulingReason[]
-  scheduling_score?: number
-  candidate_eligible?: boolean
-  scheduling_blocked_count?: number
-  scheduling_degraded_count?: number
-  scheduling_dimensions?: PoolSchedulingDimension[]
 }
 
 export interface PoolSchedulingReason {
@@ -140,18 +151,6 @@ export interface PoolSchedulingReason {
   label: string
   blocking: boolean
   source: 'manual' | 'pool' | 'health' | 'policy' | string
-  ttl_seconds?: number | null
-  detail?: string | null
-}
-
-export interface PoolSchedulingDimension {
-  code: string
-  label: string
-  status: 'ok' | 'degraded' | 'blocked' | string
-  blocking: boolean
-  source: 'manual' | 'pool' | 'health' | 'policy' | string
-  weight: number
-  score: number
   ttl_seconds?: number | null
   detail?: string | null
 }
@@ -172,12 +171,25 @@ export interface PoolKeysQuery {
 
 export interface PoolBatchAction {
   key_ids: string[]
-  action: 'enable' | 'disable' | 'delete' | 'clear_cooldown' | 'reset_cost'
+  action:
+    | 'enable'
+    | 'disable'
+    | 'delete'
+    | 'clear_cooldown'
+    | 'reset_cost'
+    | 'regenerate_fingerprint'
 }
 
 export async function getPoolOverview(): Promise<PoolOverviewResponse> {
   return dedupedRequest('pool:overview', async () => {
     const response = await client.get<PoolOverviewResponse>('/api/admin/pool/overview')
+    return response.data
+  })
+}
+
+export async function getPoolSchedulingPresets(): Promise<PoolPresetMeta[]> {
+  return dedupedRequest('pool:scheduling-presets', async () => {
+    const response = await client.get<PoolPresetMeta[]>('/api/admin/pool/scheduling-presets')
     return response.data
   })
 }

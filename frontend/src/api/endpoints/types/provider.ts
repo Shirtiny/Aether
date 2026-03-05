@@ -442,8 +442,6 @@ export interface ClaudeCodeAdvancedConfig {
   // 会话数量控制：null/undefined 表示不限制
   max_sessions?: number | null
   session_idle_timeout_minutes?: number | null
-  // TLS 指纹模拟（模拟 Node.js/Claude Code 客户端指纹）
-  enable_tls_fingerprint?: boolean
   // 会话 ID 伪装（固定 metadata.user_id 中 session 片段）
   session_id_masking_enabled?: boolean
   // Cache TTL 统一（强制所有 cache_control 使用相同 TTL 类型）
@@ -453,11 +451,29 @@ export interface ClaudeCodeAdvancedConfig {
   cli_only_enabled?: boolean
 }
 
+export interface SchedulingPresetItem {
+  preset: string
+  enabled: boolean
+  mode?: string | null
+}
+
 export interface PoolAdvancedConfig {
   global_priority?: number | null
   sticky_session_ttl_seconds?: number | null
   load_threshold_percent?: number | null
+  // 旧字段（兼容读取）
   lru_enabled?: boolean
+  scheduling_mode?: 'lru' | 'multi_score' | null
+  // 新格式：对象列表；旧格式：字符串列表
+  scheduling_presets?: SchedulingPresetItem[] | string[] | null
+  scoring_weights?: {
+    lru?: number
+    latency?: number
+    health?: number
+    cost_remaining?: number
+  } | null
+  latency_window_seconds?: number | null
+  latency_sample_limit?: number | null
   cost_window_seconds?: number | null
   cost_limit_per_key_tokens?: number | null
   cost_soft_threshold_percent?: number | null
@@ -466,6 +482,10 @@ export interface PoolAdvancedConfig {
   proactive_refresh_seconds?: number | null
   health_policy_enabled?: boolean
   unschedulable_rules?: Array<Record<string, unknown>> | null
+  batch_concurrency?: number | null
+  probing_enabled?: boolean
+  probing_interval_minutes?: number | null
+  auto_remove_banned_keys?: boolean
 }
 
 export interface FailoverRuleItem {

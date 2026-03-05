@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from typing import Any
@@ -25,6 +26,7 @@ from src.core.logger import logger
 from src.models.database import Provider, ProviderAPIKey, ProviderEndpoint
 from src.services.health.monitor import health_monitor
 from src.services.provider.format import normalize_endpoint_signature
+from src.services.provider.pool.config import parse_pool_config
 from src.services.rate_limit.adaptive_rpm import get_adaptive_rpm_manager
 from src.services.rate_limit.detector import RateLimitType, detect_rate_limit_type
 from src.services.scheduling.aware_scheduler import CacheAwareScheduler
@@ -168,7 +170,7 @@ class ErrorHandlerService:
                 and str(getattr(key, "auth_type", "") or "").lower() == "oauth"
                 and self._is_account_validation_required(error_response_text)
             ):
-                self._mark_oauth_key_blocked(key, request_id)
+                self._mark_oauth_key_blocked(key, request_id, provider=provider)
             # 403 suspended -> 标记 OAuth key 为账号被暂停
             elif (
                 status_code == 403
@@ -176,7 +178,25 @@ class ErrorHandlerService:
                 and str(getattr(key, "auth_type", "") or "").lower() == "oauth"
                 and self._is_account_suspended(error_response_text)
             ):
-                self._mark_oauth_key_blocked(key, request_id, reason="AWS 账号被暂停")
+                self._mark_oauth_key_blocked(
+                    key,
+                    request_id,
+                    reason="AWS 账号被暂停",
+                    provider=provider,
+                )
+            # 401 account_deactivated -> 标记 OAuth key 为账号被永久停用
+            elif (
+                status_code == 401
+                and key
+                and str(getattr(key, "auth_type", "") or "").lower() == "oauth"
+                and self._is_account_deactivated(error_response_text)
+            ):
+                self._mark_oauth_key_blocked(
+                    key,
+                    request_id,
+                    reason="账号已被停用 (account_deactivated)",
+                    provider=provider,
+                )
             return
 
         # 限流错误
@@ -340,11 +360,34 @@ class ErrorHandlerService:
             return True
         return False
 
+    @staticmethod
+    def _is_account_deactivated(error_text: str | None) -> bool:
+        """
+        检测 401 错误是否为账号被永久停用 (deactivated)
+
+        匹配条件：
+        - 错误文本包含 "account_deactivated" (OpenAI error code)
+        - 错误文本包含 "account has been deactivated"
+        - 错误文本包含 "account deactivated"
+        """
+        if not error_text:
+            return False
+        search_text = error_text.lower()
+        if "account_deactivated" in search_text:
+            return True
+        if "account has been deactivated" in search_text:
+            return True
+        if "account deactivated" in search_text:
+            return True
+        return False
+
     def _mark_oauth_key_blocked(
         self,
         key: ProviderAPIKey,
         request_id: str | None,
         reason: str = "Google 要求验证账号",
+        *,
+        provider: Provider,
     ) -> None:
         """标记 OAuth key 为账号级别封禁"""
         try:
@@ -355,6 +398,26 @@ class ErrorHandlerService:
             key.oauth_invalid_at = datetime.now(timezone.utc)
             key.oauth_invalid_reason = f"{OAUTH_ACCOUNT_BLOCK_PREFIX}{reason}"
             key.is_active = False
+
+            pool_cfg = parse_pool_config(getattr(provider, "config", None))
+            auto_remove_enabled = bool(pool_cfg and pool_cfg.auto_remove_banned_keys)
+
+            if auto_remove_enabled:
+                key_id = str(getattr(key, "id", "") or "")
+                provider_id = str(getattr(key, "provider_id", "") or "")
+                display = self._format_key_display(key)
+
+                self.db.delete(key)
+                self.db.commit()
+                self._schedule_auto_cleanup_after_delete(provider_id=provider_id, key_id=key_id)
+                logger.warning(
+                    "  [{}] {} 因 {} 已标记为账号异常并自动清除",
+                    request_id,
+                    display,
+                    reason,
+                )
+                return
+
             self.db.commit()
             logger.warning(
                 "  [{}] {} 因 {} 已标记为账号异常并自动停用",
@@ -364,3 +427,31 @@ class ErrorHandlerService:
             )
         except Exception as mark_exc:
             logger.debug("  [{}] 标记 oauth_invalid 失败: {}", request_id, mark_exc)
+
+    @staticmethod
+    def _schedule_auto_cleanup_after_delete(*, provider_id: str, key_id: str) -> None:
+        if not provider_id or not key_id:
+            return
+
+        async def _cleanup() -> None:
+            from src.api.base.models_service import invalidate_models_list_cache
+            from src.services.cache.provider_cache import ProviderCacheService
+            from src.services.provider.pool import redis_ops as pool_redis
+
+            await ProviderCacheService.invalidate_provider_api_key_cache(key_id)
+            await invalidate_models_list_cache()
+            await asyncio.gather(
+                pool_redis.clear_cooldown(provider_id, key_id),
+                pool_redis.clear_cost(provider_id, key_id),
+                return_exceptions=True,
+            )
+
+        task = asyncio.get_running_loop().create_task(_cleanup())
+
+        def _log_async_error(done_task: asyncio.Task[Any]) -> None:
+            try:
+                done_task.result()
+            except Exception as exc:
+                logger.debug("auto cleanup side effect failed for key {}: {}", key_id[:8], exc)
+
+        task.add_done_callback(_log_async_error)

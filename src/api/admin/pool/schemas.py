@@ -30,6 +30,27 @@ class PoolOverviewResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Scheduling presets metadata
+# ---------------------------------------------------------------------------
+
+
+class PresetModeMetaResponse(BaseModel):
+    value: str
+    label: str
+
+
+class PresetDimensionMetaResponse(BaseModel):
+    name: str
+    label: str
+    description: str
+    providers: list[str] = Field(default_factory=list)
+    modes: list[PresetModeMetaResponse] | None = None
+    default_mode: str | None = None
+    mutex_group: str | None = None
+    evidence_hint: str | None = None
+
+
+# ---------------------------------------------------------------------------
 # Paginated key list
 # ---------------------------------------------------------------------------
 
@@ -41,20 +62,6 @@ class PoolSchedulingReason(BaseModel):
     label: str
     blocking: bool = False
     source: str = "pool"  # manual / pool / health / policy
-    ttl_seconds: int | None = None
-    detail: str | None = None
-
-
-class PoolSchedulingDimension(BaseModel):
-    """Detailed scheduling dimension status."""
-
-    code: str
-    label: str
-    status: str = "ok"  # ok / degraded / blocked
-    blocking: bool = False
-    source: str = "pool"
-    weight: int = 1
-    score: float = 1.0  # normalized 0~1
     ttl_seconds: int | None = None
     detail: str | None = None
 
@@ -89,6 +96,7 @@ class PoolKeyDetail(BaseModel):
     model_include_patterns: list[str] | None = None
     model_exclude_patterns: list[str] | None = None
     proxy: dict[str, Any] | None = None
+    fingerprint: dict[str, Any] | None = None
     account_quota: str | None = None
     cooldown_reason: str | None = None
     cooldown_ttl_seconds: int | None = None
@@ -105,11 +113,6 @@ class PoolKeyDetail(BaseModel):
     scheduling_reason: str = "available"
     scheduling_label: str = "可用"
     scheduling_reasons: list[PoolSchedulingReason] = Field(default_factory=list)
-    scheduling_score: float = 100.0
-    candidate_eligible: bool = True
-    scheduling_blocked_count: int = 0
-    scheduling_degraded_count: int = 0
-    scheduling_dimensions: list[PoolSchedulingDimension] = Field(default_factory=list)
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -162,7 +165,7 @@ class BatchImportResponse(BaseModel):
 
 class BatchActionRequest(BaseModel):
     key_ids: list[str] = Field(..., max_length=500)
-    action: str  # enable / disable / delete / clear_cooldown / reset_cost
+    action: str  # enable / disable / delete / clear_cooldown / reset_cost / regenerate_fingerprint
 
 
 class BatchActionResponse(BaseModel):

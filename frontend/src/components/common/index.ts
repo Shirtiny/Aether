@@ -10,4 +10,5 @@ export { default as LoadingState } from './LoadingState.vue'
 
 // 表单组件
 export { default as ModelMultiSelect } from './ModelMultiSelect.vue'
+export { default as MultiSelect } from './MultiSelect.vue'
 export { default as TimeRangePicker } from './TimeRangePicker.vue'

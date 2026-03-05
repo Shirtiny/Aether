@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from src.services.provider.pool.config import (
     PoolConfig,
+    SchedulingPreset,
+    ScoringWeights,
     UnschedulableRule,
     parse_pool_config,
 )
@@ -21,6 +23,14 @@ def test_parse_pool_config_returns_defaults_for_empty_advanced() -> None:
     assert cfg.sticky_session_ttl_seconds == 3600
     assert cfg.load_threshold_percent == 80
     assert cfg.lru_enabled is True
+    assert cfg.scheduling_mode == "lru"
+    assert cfg.scoring_weights == ScoringWeights()
+    # Default: only LRU preset enabled
+    assert len(cfg.scheduling_presets) == 1
+    assert cfg.scheduling_presets[0].preset == "lru"
+    assert cfg.scheduling_presets[0].enabled is True
+    assert cfg.latency_window_seconds == 3600
+    assert cfg.latency_sample_limit == 50
     assert cfg.cost_window_seconds == 18000
     assert cfg.cost_limit_per_key_tokens is None
     assert cfg.cost_soft_threshold_percent == 80
@@ -29,15 +39,29 @@ def test_parse_pool_config_returns_defaults_for_empty_advanced() -> None:
     assert cfg.proactive_refresh_seconds == 180
     assert cfg.health_policy_enabled is True
     assert cfg.unschedulable_rules == []
+    assert cfg.probing_enabled is False
+    assert cfg.probing_interval_minutes == 10
+    assert cfg.auto_remove_banned_keys is False
 
 
-def test_parse_pool_config_overrides_values() -> None:
+def test_parse_pool_config_overrides_values_legacy_string_list() -> None:
+    """Legacy string-list format with scheduling_mode/lru_enabled."""
     cfg = parse_pool_config(
         {
             "pool_advanced": {
                 "sticky_session_ttl_seconds": 7200,
                 "load_threshold_percent": 90,
                 "lru_enabled": False,
+                "scheduling_mode": "multi_score",
+                "scheduling_presets": ["free_team_first", "recent_refresh", "free_team_first"],
+                "scoring_weights": {
+                    "lru": 0.1,
+                    "latency": 0.5,
+                    "health": 0.2,
+                    "cost_remaining": 0.2,
+                },
+                "latency_window_seconds": 7200,
+                "latency_sample_limit": 80,
                 "cost_window_seconds": 36000,
                 "cost_limit_per_key_tokens": 100000,
                 "cost_soft_threshold_percent": 70,
@@ -45,6 +69,9 @@ def test_parse_pool_config_overrides_values() -> None:
                 "overload_cooldown_seconds": 60,
                 "proactive_refresh_seconds": 300,
                 "health_policy_enabled": False,
+                "probing_enabled": True,
+                "probing_interval_minutes": 15,
+                "auto_remove_banned_keys": True,
             }
         }
     )
@@ -52,6 +79,20 @@ def test_parse_pool_config_overrides_values() -> None:
     assert cfg.sticky_session_ttl_seconds == 7200
     assert cfg.load_threshold_percent == 90
     assert cfg.lru_enabled is False
+    assert cfg.scheduling_mode == "multi_score"
+    # Legacy string list → SchedulingPreset objects, deduped
+    preset_names = tuple(p.preset for p in cfg.scheduling_presets)
+    assert "free_team_first" in preset_names
+    assert "recent_refresh" in preset_names
+    assert cfg.scoring_weights == ScoringWeights(
+        lru=0.1,
+        latency=0.5,
+        health=0.2,
+        cost_remaining=0.2,
+    )
+    assert cfg.latency_window_seconds == 7200
+    assert cfg.latency_sample_limit == 80
+    assert "multi_score" in cfg.strategies
     assert cfg.cost_window_seconds == 36000
     assert cfg.cost_limit_per_key_tokens == 100000
     assert cfg.cost_soft_threshold_percent == 70
@@ -59,6 +100,117 @@ def test_parse_pool_config_overrides_values() -> None:
     assert cfg.overload_cooldown_seconds == 60
     assert cfg.proactive_refresh_seconds == 300
     assert cfg.health_policy_enabled is False
+    assert cfg.probing_enabled is True
+    assert cfg.probing_interval_minutes == 15
+    assert cfg.auto_remove_banned_keys is True
+
+
+def test_parse_pool_config_new_object_list_format() -> None:
+    """New object-list format: [{preset, enabled, mode}]."""
+    cfg = parse_pool_config(
+        {
+            "pool_advanced": {
+                "scheduling_presets": [
+                    {"preset": "lru", "enabled": True},
+                    {"preset": "free_team_first", "enabled": True, "mode": "free_only"},
+                    {"preset": "quota_balanced", "enabled": False},
+                    {"preset": "recent_refresh", "enabled": True},
+                ],
+            }
+        }
+    )
+    assert cfg is not None
+    assert len(cfg.scheduling_presets) == 4
+
+    lru = cfg.scheduling_presets[0]
+    assert lru.preset == "lru"
+    assert lru.enabled is True
+
+    ftf = cfg.scheduling_presets[1]
+    assert ftf.preset == "free_team_first"
+    assert ftf.enabled is True
+    assert ftf.mode == "free_only"
+
+    qb = cfg.scheduling_presets[2]
+    assert qb.preset == "quota_balanced"
+    assert qb.enabled is False
+
+    rr = cfg.scheduling_presets[3]
+    assert rr.preset == "recent_refresh"
+    assert rr.enabled is True
+
+    # Derived fields: lru enabled, non-lru enabled → multi_score
+    assert cfg.lru_enabled is True
+    assert cfg.scheduling_mode == "multi_score"
+
+
+def test_parse_pool_config_new_format_lru_only() -> None:
+    """When only LRU is enabled, scheduling_mode should be 'lru'."""
+    cfg = parse_pool_config(
+        {
+            "pool_advanced": {
+                "scheduling_presets": [
+                    {"preset": "lru", "enabled": True},
+                    {"preset": "quota_balanced", "enabled": False},
+                ],
+            }
+        }
+    )
+    assert cfg is not None
+    assert cfg.lru_enabled is True
+    assert cfg.scheduling_mode == "lru"
+
+
+def test_parse_pool_config_new_format_lru_disabled() -> None:
+    """LRU disabled, other presets enabled → multi_score + lru_enabled=False."""
+    cfg = parse_pool_config(
+        {
+            "pool_advanced": {
+                "scheduling_presets": [
+                    {"preset": "lru", "enabled": False},
+                    {"preset": "quota_balanced", "enabled": True},
+                ],
+            }
+        }
+    )
+    assert cfg is not None
+    assert cfg.lru_enabled is False
+    assert cfg.scheduling_mode == "multi_score"
+
+
+def test_parse_pool_config_new_format_free_team_mode_validation() -> None:
+    """Invalid mode falls back to 'both'."""
+    cfg = parse_pool_config(
+        {
+            "pool_advanced": {
+                "scheduling_presets": [
+                    {"preset": "free_team_first", "enabled": True, "mode": "invalid_mode"},
+                ],
+            }
+        }
+    )
+    assert cfg is not None
+    ftf = [p for p in cfg.scheduling_presets if p.preset == "free_team_first"][0]
+    assert ftf.mode == "both"
+
+
+def test_parse_pool_config_new_format_dedup_presets() -> None:
+    """Duplicate presets in object list should be deduplicated."""
+    cfg = parse_pool_config(
+        {
+            "pool_advanced": {
+                "scheduling_presets": [
+                    {"preset": "lru", "enabled": True},
+                    {"preset": "lru", "enabled": False},
+                    {"preset": "quota_balanced", "enabled": True},
+                ],
+            }
+        }
+    )
+    assert cfg is not None
+    lru_presets = [p for p in cfg.scheduling_presets if p.preset == "lru"]
+    assert len(lru_presets) == 1
+    assert lru_presets[0].enabled is True  # first occurrence wins
 
 
 def test_parse_pool_config_parses_unschedulable_rules() -> None:
@@ -97,10 +249,60 @@ def test_parse_pool_config_handles_invalid_types_gracefully() -> None:
     assert cfg.cost_limit_per_key_tokens is None  # default for opt_int
 
 
+def test_parse_pool_config_invalid_scheduling_mode_falls_back_to_lru() -> None:
+    cfg = parse_pool_config({"pool_advanced": {"scheduling_mode": "unknown"}})
+    assert cfg is not None
+    assert cfg.scheduling_mode == "lru"
+
+
+def test_parse_pool_config_scoring_weights_invalid_values_are_clamped() -> None:
+    cfg = parse_pool_config(
+        {
+            "pool_advanced": {
+                "scheduling_mode": "multi_score",
+                "scoring_weights": {
+                    "lru": 2.0,
+                    "latency": -1.0,
+                    "health": "bad",
+                },
+            }
+        }
+    )
+    assert cfg is not None
+    assert cfg.scoring_weights.lru == 1.0
+    assert cfg.scoring_weights.latency == 0.0
+    assert cfg.scoring_weights.health == 0.2
+
+
+def test_parse_pool_config_invalid_scheduling_presets_are_ignored() -> None:
+    cfg = parse_pool_config(
+        {
+            "pool_advanced": {
+                "scheduling_mode": "multi_score",
+                "scheduling_presets": ["quota_balanced", "unknown", 123, "single_account"],
+            }
+        }
+    )
+    assert cfg is not None
+    preset_names = tuple(p.preset for p in cfg.scheduling_presets if p.preset != "lru")
+    assert "quota_balanced" in preset_names
+    assert "single_account" in preset_names
+    assert "unknown" not in preset_names
+
+
 def test_pool_config_is_frozen() -> None:
     cfg = PoolConfig()
     try:
         cfg.sticky_session_ttl_seconds = 999  # type: ignore[misc]
+        assert False, "Should have raised FrozenInstanceError"
+    except AttributeError:
+        pass
+
+
+def test_scheduling_preset_is_frozen() -> None:
+    preset = SchedulingPreset(preset="lru", enabled=True)
+    try:
+        preset.enabled = False  # type: ignore[misc]
         assert False, "Should have raised FrozenInstanceError"
     except AttributeError:
         pass

@@ -61,6 +61,7 @@ class ProviderEnvelope(Protocol):
         key_id: str,
         is_stream: bool,
         provider_id: str | None = None,
+        key: Any = None,
     ) -> str | None:
         """Pre-wrap hook: build provider-specific request context.
 

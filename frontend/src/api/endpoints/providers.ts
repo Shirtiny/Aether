@@ -39,6 +39,7 @@ export async function updateProvider(
     description: string | null
     website: string
     provider_priority: number
+    keep_priority_on_conversion: boolean
     billing_type: 'monthly_quota' | 'pay_as_you_go' | 'free_tier'
     monthly_quota_usd: number
     quota_reset_day: number

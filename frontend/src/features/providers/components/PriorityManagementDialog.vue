@@ -264,7 +264,7 @@
                         :class="key.is_pool_aggregate
                           ? 'text-muted-foreground/60 cursor-not-allowed'
                           : 'text-muted-foreground cursor-pointer hover:bg-primary/10 hover:text-primary'"
-                        :title="key.is_pool_aggregate ? '号池优先级请在号池配置中调整' : '点击编辑优先级'"
+                        :title="key.is_pool_aggregate ? '号池优先级请在号池调度中调整' : '点击编辑优先级'"
                         @click.stop="!key.is_pool_aggregate && startEditKeyPriority(format, key)"
                       >
                         {{ key.priority }}

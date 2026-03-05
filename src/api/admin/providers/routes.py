@@ -470,6 +470,7 @@ class AdminCreateProviderAdapter(AdminApiAdapter):
                 quota_last_reset_at=validated_data.quota_last_reset_at,
                 quota_expires_at=validated_data.quota_expires_at,
                 provider_priority=validated_data.provider_priority,
+                keep_priority_on_conversion=validated_data.keep_priority_on_conversion,
                 is_active=validated_data.is_active,
                 concurrent_limit=validated_data.concurrent_limit,
                 max_retries=validated_data.max_retries,

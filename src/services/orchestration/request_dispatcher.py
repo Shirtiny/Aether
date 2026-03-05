@@ -60,7 +60,7 @@ class RequestDispatcher:
         attempt_counter: int,
         max_attempts: int,
         is_stream: bool = False,
-    ) -> tuple[Any, str, str, str, str, str]:
+    ) -> tuple[Any, str, str, str, str, str, int | None]:
         """
         执行请求并返回结果
 
@@ -81,7 +81,7 @@ class RequestDispatcher:
             is_stream: 是否为流式请求
 
         Returns:
-            (response, provider_name, candidate_record_id, provider_id, endpoint_id, key_id)
+            (response, provider_name, candidate_record_id, provider_id, endpoint_id, key_id, ttfb_ms)
 
         Raises:
             ExecutionError: 执行失败时
@@ -144,6 +144,19 @@ class RequestDispatcher:
 
         logger.debug(f"  [{request_id}] 请求成功: Provider={provider_name}, 耗时={elapsed_ms}ms")
 
+        # Non-stream requests don't have first-byte telemetry in this path.
+        # Use elapsed latency as a conservative fallback for pool latency sampling.
+        ttfb_ms: int | None = None
+        if not is_stream:
+            raw_ttfb = getattr(execution_result.response, "first_byte_time_ms", None)
+            try:
+                if raw_ttfb is not None:
+                    ttfb_ms = max(int(raw_ttfb), 0)
+            except (TypeError, ValueError):
+                ttfb_ms = None
+            if ttfb_ms is None and elapsed_ms >= 0:
+                ttfb_ms = int(elapsed_ms)
+
         return (
             execution_result.response,
             provider_name,
@@ -151,4 +164,5 @@ class RequestDispatcher:
             provider_id,
             endpoint_id,
             key_id,
+            ttfb_ms,
         )

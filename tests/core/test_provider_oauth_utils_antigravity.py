@@ -12,6 +12,10 @@ async def test_enrich_auth_config_antigravity_adds_project_id_and_email() -> Non
     auth_config: dict[str, object] = {}
     token_response: dict[str, object] = {}
 
+    from src.services.provider.envelope import ensure_providers_bootstrapped
+
+    ensure_providers_bootstrapped()
+
     with (
         patch(
             "src.core.provider_oauth_utils.fetch_google_email",

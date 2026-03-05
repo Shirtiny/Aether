@@ -235,7 +235,7 @@ class TaskService:
 
                 provider_type = str(getattr(provider, "provider_type", "") or "")
                 session_uuid = TaskService._extract_session_uuid(provider_type, request_body)
-                manager = PoolManager(provider_id, pool_cfg)
+                manager = PoolManager(provider_id, pool_cfg, provider_type=provider_type)
 
                 candidate_keys = list(candidate.pool_keys or [])
                 if not candidate_keys and getattr(candidate, "key", None) is not None:
@@ -334,6 +334,7 @@ class TaskService:
     async def _pool_on_success(
         candidate: Any,
         request_body: dict[str, Any] | None,
+        ttfb_ms: int | None = None,
     ) -> None:
         """Notify the pool manager about a successful request (sticky + LRU)."""
         try:
@@ -354,10 +355,11 @@ class TaskService:
             provider_type = str(getattr(provider, "provider_type", "") or "")
             session_uuid = TaskService._extract_session_uuid(provider_type, request_body)
 
-            mgr = PoolManager(provider_id, pool_cfg)
+            mgr = PoolManager(provider_id, pool_cfg, provider_type=provider_type)
             await mgr.on_request_success(
                 session_uuid=session_uuid,
                 key_id=key_id,
+                ttfb_ms=ttfb_ms,
             )
         except Exception:
             logger.opt(exception=True).debug("Pool on_request_success failed (non-blocking)")
@@ -571,28 +573,38 @@ class TaskService:
                 candidate_record_id = str(created.id)
                 candidate_record_map[(candidate_index, retry_index)] = candidate_record_id
 
-            response, _provider_name, attempt_id, _provider_id, _endpoint_id, _key_id = (
-                await request_dispatcher.dispatch(
-                    candidate=candidate,
-                    candidate_index=candidate_index,
-                    retry_index=retry_index,
-                    candidate_record_id=candidate_record_id,
-                    user_api_key=user_api_key,
-                    request_func=request_func,
-                    request_id=request_id,
-                    api_format=api_format_norm,
-                    model_name=model_name,
-                    affinity_key=affinity_key,
-                    global_model_id=global_model_id,
-                    attempt_counter=attempt_counter,
-                    max_attempts=max_attempts_local,
-                    is_stream=is_stream,
-                )
+            (
+                response,
+                _provider_name,
+                attempt_id,
+                _provider_id,
+                _endpoint_id,
+                _key_id,
+                _first_byte_time_ms,
+            ) = await request_dispatcher.dispatch(
+                candidate=candidate,
+                candidate_index=candidate_index,
+                retry_index=retry_index,
+                candidate_record_id=candidate_record_id,
+                user_api_key=user_api_key,
+                request_func=request_func,
+                request_id=request_id,
+                api_format=api_format_norm,
+                model_name=model_name,
+                affinity_key=affinity_key,
+                global_model_id=global_model_id,
+                attempt_counter=attempt_counter,
+                max_attempts=max_attempts_local,
+                is_stream=is_stream,
             )
             _ = (attempt_id, _provider_name, _provider_id, _endpoint_id, _key_id)
 
             # Account Pool: on success, update sticky binding + LRU.
-            await self._pool_on_success(candidate, request_body)
+            await self._pool_on_success(
+                candidate,
+                request_body,
+                ttfb_ms=_first_byte_time_ms,
+            )
 
             if is_stream:
                 return AttemptResult(

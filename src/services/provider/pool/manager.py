@@ -20,7 +20,9 @@ from typing import TYPE_CHECKING, Any, TypeVar
 
 from src.core.logger import logger
 from src.services.provider.pool import redis_ops
+from src.services.provider.pool.account_state import resolve_pool_account_state
 from src.services.provider.pool.config import PoolConfig
+from src.services.provider.pool.health_cache import get_health_scores
 from src.services.provider.pool.trace import PoolCandidateTrace, PoolSchedulingTrace
 
 if TYPE_CHECKING:
@@ -31,11 +33,17 @@ if TYPE_CHECKING:
 class PoolManager:
     """Coordinate pool-level scheduling for a single Provider."""
 
-    __slots__ = ("provider_id", "config")
+    __slots__ = ("provider_id", "config", "provider_type")
 
-    def __init__(self, provider_id: str, config: PoolConfig) -> None:
+    def __init__(
+        self,
+        provider_id: str,
+        config: PoolConfig,
+        provider_type: str | None = None,
+    ) -> None:
         self.provider_id = provider_id
         self.config = config
+        self.provider_type = str(provider_type or "").strip().lower() or None
 
     # ------------------------------------------------------------------
     # Core scheduling: reorder candidate list for pool-aware selection
@@ -53,7 +61,7 @@ class PoolManager:
         1. **Sticky session hit** -- if the session is already bound to a key
            and that key appears in *candidates* and is not in cooldown, move it
            to position 0.
-        2. **Filter** out keys in cooldown or cost-exhausted state (mark
+        2. **Filter** out keys in account-blocked / cooldown / cost-exhausted state (mark
            ``is_skipped``).
         3. **LRU sort** -- among remaining candidates at the same priority
            level, sort by least-recently-used.
@@ -102,6 +110,13 @@ class PoolManager:
                 pid, session_uuid, self.config.sticky_session_ttl_seconds
             )
 
+        provider_type = self.provider_type
+        if provider_type is None and candidates:
+            first_provider = getattr(candidates[0], "provider", None)
+            provider_type = str(getattr(first_provider, "provider_type", "") or "").strip().lower()
+            if not provider_type:
+                provider_type = None
+
         # --- 2. Batch fetch pool state (parallel) ---------------------
         all_key_ids = [str(c.key.id) for c in candidates]
 
@@ -109,21 +124,33 @@ class PoolManager:
         _cooldown_coro = redis_ops.batch_get_cooldowns(pid, all_key_ids, include_ttl=True)
         _cost_coro = (
             redis_ops.batch_get_cost_totals(pid, all_key_ids, self.config.cost_window_seconds)
-            if self.config.cost_limit_per_key_tokens is not None
+            if (
+                self.config.cost_limit_per_key_tokens is not None
+                or self.config.scheduling_mode == "multi_score"
+            )
             else None
         )
         _lru_coro = redis_ops.get_lru_scores(pid, all_key_ids) if self.config.lru_enabled else None
+        _latency_coro = (
+            redis_ops.batch_get_latency_avgs(pid, all_key_ids, self.config.latency_window_seconds)
+            if self.config.scheduling_mode == "multi_score"
+            else None
+        )
 
         # Gather all non-None coroutines in parallel.
         coros: list[Any] = [_cooldown_coro]
         _cost_idx = -1
         _lru_idx = -1
+        _latency_idx = -1
         if _cost_coro is not None:
             _cost_idx = len(coros)
             coros.append(_cost_coro)
         if _lru_coro is not None:
             _lru_idx = len(coros)
             coros.append(_lru_coro)
+        if _latency_coro is not None:
+            _latency_idx = len(coros)
+            coros.append(_latency_coro)
 
         gathered = await asyncio.gather(*coros)
 
@@ -146,19 +173,42 @@ class PoolManager:
         if _cost_idx >= 0:
             cost_totals = gathered[_cost_idx]
             limit = self.config.cost_limit_per_key_tokens
-            assert limit is not None  # guarded by _cost_idx >= 0
-            for kid, total in cost_totals.items():
-                if total >= limit:
-                    cost_exhausted.add(kid)
-                elif total >= limit * self.config.cost_soft_threshold_percent / 100:
-                    cost_soft.add(kid)
+            if limit is not None:
+                for kid, total in cost_totals.items():
+                    if total >= limit:
+                        cost_exhausted.add(kid)
+                    elif total >= limit * self.config.cost_soft_threshold_percent / 100:
+                        cost_soft.add(kid)
 
         # LRU scores
         lru_scores: dict[str, float] = {}
         if _lru_idx >= 0:
             lru_scores = gathered[_lru_idx]
 
+        # Latency averages
+        latency_avgs: dict[str, float] = {}
+        if _latency_idx >= 0:
+            latency_avgs = gathered[_latency_idx]
+
+        # Health scores (TTL cached, no Redis round-trip) -- only needed for multi_score
+        health_scores: dict[str, float] = {}
+        if self.config.scheduling_mode == "multi_score":
+            health_scores = get_health_scores(pid, [c.key for c in candidates])
+
+        strategy_context.update(
+            {
+                "all_key_ids": all_key_ids,
+                "lru_scores": lru_scores,
+                "cost_totals": cost_totals,
+                "cost_limit_per_key_tokens": self.config.cost_limit_per_key_tokens,
+                "latency_avgs": latency_avgs,
+                "health_scores": health_scores,
+                "keys_by_id": {str(c.key.id): c.key for c in candidates},
+            }
+        )
+
         # --- Strategy: compute_score ----------------------------------
+        custom_scores: dict[str, float] = {}
         for strategy in strategies:
             if hasattr(strategy, "compute_score"):
                 for kid in all_key_ids:
@@ -169,7 +219,8 @@ class PoolManager:
                             context=strategy_context,
                         )
                         if custom is not None:
-                            lru_scores[kid] = custom
+                            custom_scores[kid] = float(custom)
+                            lru_scores[kid] = float(custom)
                     except Exception:
                         pass
 
@@ -181,6 +232,11 @@ class PoolManager:
         for c in candidates:
             kid = str(c.key.id)
             ct = PoolCandidateTrace(key_id=kid)
+            ct.scoring_mode = self.config.scheduling_mode
+            ct.latency_avg_ms = float(latency_avgs.get(kid, 0.0) or 0.0)
+            ct.health_score = float(health_scores.get(kid, 1.0) or 1.0)
+            if kid in custom_scores:
+                ct.composite_score = float(custom_scores[kid])
 
             # Already skipped upstream?
             if c.is_skipped:
@@ -191,6 +247,25 @@ class PoolManager:
                 continue
 
             # Cooldown?
+            account_state = resolve_pool_account_state(
+                provider_type=provider_type,
+                upstream_metadata=getattr(c.key, "upstream_metadata", None),
+                oauth_invalid_reason=getattr(c.key, "oauth_invalid_reason", None),
+            )
+            if account_state.blocked:
+                c.is_skipped = True
+                skip_reason = account_state.reason or account_state.label or "account blocked"
+                c.skip_reason = f"pool account blocked: {skip_reason}"
+                skipped.append(c)
+                ct.skipped = True
+                ct.skip_type = "account_blocked"
+                ct.account_block_code = account_state.code
+                ct.account_block_label = account_state.label
+                ct.account_block_reason = account_state.reason
+                _attach_pool_extra(c, ct)
+                trace.candidate_traces[kid] = ct
+                continue
+
             cd_reason = cooldowns.get(kid)
             if cd_reason is not None:
                 c.is_skipped = True
@@ -225,7 +300,10 @@ class PoolManager:
                 trace.sticky_session_used = True
             else:
                 available.append(c)
-                ct.reason = "lru" if lru_scores.get(kid, 0) > 0 else "random"
+                if kid in custom_scores and self.config.scheduling_mode == "multi_score":
+                    ct.reason = "multi_score"
+                else:
+                    ct.reason = "lru" if lru_scores.get(kid, 0) > 0 else "random"
 
             ct.lru_score = lru_scores.get(kid, 0.0)
             ct.cost_window_usage = cost_totals.get(kid, 0)
@@ -363,7 +441,7 @@ class PoolManager:
         :class:`ProviderAPIKey` objects instead of candidates:
 
         1. Sticky session hit (if bound and still healthy).
-        2. Filter out keys in cooldown or cost-exhausted.
+        2. Filter out keys in account-blocked / cooldown / cost-exhausted.
         3. LRU sort among remaining keys.
         4. Random tiebreak for identical LRU scores.
         5. Return the first available key, or ``None``.
@@ -386,39 +464,70 @@ class PoolManager:
         _cooldown_coro = redis_ops.batch_get_cooldowns(pid, key_ids)
         _cost_coro = (
             redis_ops.batch_get_cost_totals(pid, key_ids, self.config.cost_window_seconds)
-            if self.config.cost_limit_per_key_tokens is not None
+            if (
+                self.config.cost_limit_per_key_tokens is not None
+                or self.config.scheduling_mode == "multi_score"
+            )
             else None
         )
         _lru_coro = redis_ops.get_lru_scores(pid, key_ids) if self.config.lru_enabled else None
+        _latency_coro = (
+            redis_ops.batch_get_latency_avgs(pid, key_ids, self.config.latency_window_seconds)
+            if self.config.scheduling_mode == "multi_score"
+            else None
+        )
 
         coros_sk: list[Any] = [_cooldown_coro]
         _cost_idx_sk = -1
         _lru_idx_sk = -1
+        _latency_idx_sk = -1
         if _cost_coro is not None:
             _cost_idx_sk = len(coros_sk)
             coros_sk.append(_cost_coro)
         if _lru_coro is not None:
             _lru_idx_sk = len(coros_sk)
             coros_sk.append(_lru_coro)
+        if _latency_coro is not None:
+            _latency_idx_sk = len(coros_sk)
+            coros_sk.append(_latency_coro)
 
         gathered_sk = await asyncio.gather(*coros_sk)
 
         cooldowns = gathered_sk[0]
 
         cost_exhausted: set[str] = set()
+        cost_totals: dict[str, int] = {}
         if _cost_idx_sk >= 0:
             cost_totals = gathered_sk[_cost_idx_sk]
-            for kid, total in cost_totals.items():
-                if total >= self.config.cost_limit_per_key_tokens:  # type: ignore[operator]
-                    cost_exhausted.add(kid)
+            if self.config.cost_limit_per_key_tokens is not None:
+                for kid, total in cost_totals.items():
+                    if total >= self.config.cost_limit_per_key_tokens:
+                        cost_exhausted.add(kid)
 
         lru_scores: dict[str, float] = {}
         if _lru_idx_sk >= 0:
             lru_scores = gathered_sk[_lru_idx_sk]
 
+        latency_avgs: dict[str, float] = {}
+        if _latency_idx_sk >= 0:
+            latency_avgs = gathered_sk[_latency_idx_sk]
+
+        health_scores: dict[str, float] = {}
+        if self.config.scheduling_mode == "multi_score":
+            health_scores = get_health_scores(pid, keys)
+
         # --- Strategy: compute_score ------------------------------------------
         strategies = _get_active_strategies(self.config)
-        strategy_context: dict[str, Any] = {"session_uuid": session_uuid}
+        strategy_context: dict[str, Any] = {
+            "session_uuid": session_uuid,
+            "all_key_ids": key_ids,
+            "lru_scores": lru_scores,
+            "cost_totals": cost_totals if _cost_idx_sk >= 0 else {},
+            "cost_limit_per_key_tokens": self.config.cost_limit_per_key_tokens,
+            "latency_avgs": latency_avgs,
+            "health_scores": health_scores,
+            "keys_by_id": {str(k.id): k for k in keys},
+        }
         for strategy in strategies:
             if hasattr(strategy, "compute_score"):
                 for kid in key_ids:
@@ -429,7 +538,7 @@ class PoolManager:
                             context=strategy_context,
                         )
                         if custom is not None:
-                            lru_scores[kid] = custom
+                            lru_scores[kid] = float(custom)
                     except Exception:
                         pass
 
@@ -439,6 +548,14 @@ class PoolManager:
 
         for k in keys:
             kid = str(k.id)
+
+            account_state = resolve_pool_account_state(
+                provider_type=self.provider_type,
+                upstream_metadata=getattr(k, "upstream_metadata", None),
+                oauth_invalid_reason=getattr(k, "oauth_invalid_reason", None),
+            )
+            if account_state.blocked:
+                continue
 
             if cooldowns.get(kid) is not None:
                 continue
@@ -480,6 +597,7 @@ class PoolManager:
         session_uuid: str | None,
         key_id: str,
         tokens_used: int = 0,
+        ttfb_ms: int | None = None,
     ) -> None:
         """Called after a successful upstream request."""
         pid = self.provider_id
@@ -498,6 +616,16 @@ class PoolManager:
         if tokens_used > 0 and self.config.cost_limit_per_key_tokens is not None:
             await redis_ops.add_cost_entry(
                 pid, key_id, tokens_used, self.config.cost_window_seconds
+            )
+
+        # Record latency sample for multi-score scheduling.
+        if self.config.scheduling_mode == "multi_score" and ttfb_ms is not None and ttfb_ms >= 0:
+            await redis_ops.record_latency(
+                pid,
+                key_id,
+                ttfb_ms,
+                self.config.latency_window_seconds,
+                self.config.latency_sample_limit,
             )
 
     async def on_request_error(
@@ -570,6 +698,8 @@ def _get_active_strategies(config: PoolConfig) -> list[Any]:
     if not config.strategies:
         return []
     try:
+        # Import triggers built-in strategy registration via module-level side effects.
+        from src.services.provider.pool import strategies as _builtin_strategies  # noqa: F401
         from src.services.provider.pool.strategy import get_active_strategies
 
         return get_active_strategies(config.strategies)

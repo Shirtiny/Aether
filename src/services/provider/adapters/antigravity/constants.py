@@ -39,11 +39,27 @@ def _detect_platform_info() -> str:
 
 _PLATFORM_INFO = _detect_platform_info()
 
+
+def _build_antigravity_http_user_agent(
+    *,
+    platform_token: str,
+    version: str,
+    chrome_version: str,
+    electron_version: str,
+) -> str:
+    return (
+        f"Mozilla/5.0 ({platform_token}) AppleWebKit/537.36 (KHTML, like Gecko) "
+        f"Antigravity/{version} Chrome/{chrome_version} "
+        f"Electron/{electron_version} Safari/537.36"
+    )
+
+
 # HTTP Header User-Agent（对齐 AM constants.rs: 完整 Electron 浏览器格式）
-HTTP_USER_AGENT = (
-    f"Mozilla/5.0 ({_PLATFORM_INFO}) AppleWebKit/537.36 (KHTML, like Gecko) "
-    f"Antigravity/{_FALLBACK_VERSION} Chrome/{_FALLBACK_CHROME} "
-    f"Electron/{_FALLBACK_ELECTRON} Safari/537.36"
+HTTP_USER_AGENT = _build_antigravity_http_user_agent(
+    platform_token=_PLATFORM_INFO,
+    version=_FALLBACK_VERSION,
+    chrome_version=_FALLBACK_CHROME,
+    electron_version=_FALLBACK_ELECTRON,
 )
 
 # V1InternalRequest.userAgent 字段（固定值）
@@ -57,10 +73,11 @@ _ua_version: str = _FALLBACK_VERSION
 def get_http_user_agent() -> str:
     """返回当前 HTTP User-Agent 字符串（对齐 AM Electron UA 格式）。"""
     with _ua_lock:
-        return (
-            f"Mozilla/5.0 ({_PLATFORM_INFO}) AppleWebKit/537.36 (KHTML, like Gecko) "
-            f"Antigravity/{_ua_version} Chrome/{_FALLBACK_CHROME} "
-            f"Electron/{_FALLBACK_ELECTRON} Safari/537.36"
+        return _build_antigravity_http_user_agent(
+            platform_token=_PLATFORM_INFO,
+            version=_ua_version,
+            chrome_version=_FALLBACK_CHROME,
+            electron_version=_FALLBACK_ELECTRON,
         )
 
 
@@ -72,10 +89,11 @@ def update_user_agent_version(version: str) -> None:
         return
     with _ua_lock:
         _ua_version = version
-        HTTP_USER_AGENT = (
-            f"Mozilla/5.0 ({_PLATFORM_INFO}) AppleWebKit/537.36 (KHTML, like Gecko) "
-            f"Antigravity/{_ua_version} Chrome/{_FALLBACK_CHROME} "
-            f"Electron/{_FALLBACK_ELECTRON} Safari/537.36"
+        HTTP_USER_AGENT = _build_antigravity_http_user_agent(
+            platform_token=_PLATFORM_INFO,
+            version=_ua_version,
+            chrome_version=_FALLBACK_CHROME,
+            electron_version=_FALLBACK_ELECTRON,
         )
 
 
@@ -98,6 +116,7 @@ def get_v1internal_extra_headers() -> dict[str, str]:
     """构建 v1internal 请求需要的额外 header（对齐 AM upstream/client.rs）。"""
     with _ua_lock:
         version = _ua_version
+
     return {
         "User-Agent": get_http_user_agent(),
         "x-client-name": "antigravity",

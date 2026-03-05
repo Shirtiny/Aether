@@ -632,6 +632,19 @@ const makeAttemptKey = (candidateIndex: number, retryIndex: number): string => {
   return `${candidateIndex}:${retryIndex}`
 }
 
+const POOL_UNATTEMPTED_STATUS = new Set<CandidateRecord['status']>([
+  'available',
+  'unused',
+  'skipped',
+])
+
+const isPoolAttemptedCandidate = (candidate: CandidateRecord): boolean => {
+  if (POOL_UNATTEMPTED_STATUS.has(candidate.status)) return false
+  // pending 只有开始执行后才算真正进入号池内部尝试
+  if (candidate.status === 'pending' && !candidate.started_at) return false
+  return true
+}
+
 const normalizeTimelineStatus = (value: unknown): CandidateRecord['status'] => {
   if (typeof value !== 'string') return 'failed'
   const normalized = value.trim().toLowerCase()
@@ -640,10 +653,6 @@ const normalizeTimelineStatus = (value: unknown): CandidateRecord['status'] => {
   }
   // 兜底：内部调度轨迹里非标准状态统一按失败展示
   return 'failed'
-}
-
-const isPlannedOnlyStatus = (status: CandidateRecord['status']): boolean => {
-  return status === 'available'
 }
 
 const extractPoolGroupId = (candidate: CandidateRecord): string | null => {
@@ -671,22 +680,6 @@ const rawTimeline = computed<CandidateRecord[]>(() => {
     })
 })
 
-// 仅保留”已进入执行链路”的节点，过滤预创建但未执行的 available 占位记录。
-// unused 候选：代表因前序候选成功而未被执行的备选项。
-//   - 号池内 unused key：不显示（号池只展示实际参与调度的 key）
-//   - 非号池 unused：每个 candidate_index 保留 retry_index=0（代表该候选存在但未执行）
-const executableTimeline = computed<CandidateRecord[]>(() => {
-  return rawTimeline.value.filter(candidate => {
-    if (isPlannedOnlyStatus(candidate.status)) return false
-    if (candidate.status === 'unused') {
-      // 号池内 unused key 不需要展示
-      if (extractPoolGroupId(candidate) !== null) return false
-      // 非号池的 unused retry slot 只保留首个
-      return candidate.retry_index === 0
-    }
-    return true
-  })
-})
 
 const schedulingAudit = computed<Record<string, unknown> | null>(() => {
   const metadata = props.requestMetadata
@@ -697,8 +690,11 @@ const schedulingAudit = computed<Record<string, unknown> | null>(() => {
 })
 
 const poolAttemptCandidates = computed<CandidateRecord[]>(() => {
-  // 新链路：优先使用后端写入的 extra_data.pool_group_id。
-  const fromTrace = executableTimeline.value.filter((candidate) => extractPoolGroupId(candidate) !== null)
+  // 新链路：优先使用后端写入的 extra_data.pool_group_id，
+  // 但仅展示实际进入号池执行的 key（排除 available/unused/skipped）。
+  const fromTrace = rawTimeline.value.filter(
+    (candidate) => extractPoolGroupId(candidate) !== null && isPoolAttemptedCandidate(candidate),
+  )
   if (fromTrace.length > 0) {
     return fromTrace
   }
@@ -708,6 +704,28 @@ const poolAttemptCandidates = computed<CandidateRecord[]>(() => {
   if (!audit) return []
   const attempts = audit.attempts
   if (!Array.isArray(attempts) || attempts.length === 0) return []
+
+  const providerNameById = new Map<string, string>()
+  for (const candidate of rawTimeline.value) {
+    const providerId = String(candidate.provider_id || '').trim()
+    const providerName = String(candidate.provider_name || '').trim()
+    if (!providerId || !providerName) continue
+    if (!providerNameById.has(providerId)) {
+      providerNameById.set(providerId, providerName)
+    }
+  }
+  const providerTypeLikeNames = new Set<string>([
+    'codex',
+    'kiro',
+    'antigravity',
+    'claude_code',
+    'claude code',
+    'gemini_cli',
+    'gemini cli',
+    'oauth',
+    'api_key',
+    'api key',
+  ])
 
   const traceMap = new Map<string, CandidateRecord>()
   for (const candidate of rawTimeline.value) {
@@ -757,6 +775,21 @@ const poolAttemptCandidates = computed<CandidateRecord[]>(() => {
           pool_group_id: finalPoolGroupId,
         }
       }
+
+      const mergedProviderId = String(merged.provider_id || '').trim()
+      if (mergedProviderId) {
+        const inferredProviderName = providerNameById.get(mergedProviderId)
+        const currentProviderName = String(merged.provider_name || '').trim()
+        if (
+          inferredProviderName
+          && (
+            !currentProviderName
+            || providerTypeLikeNames.has(currentProviderName.toLowerCase())
+          )
+        ) {
+          merged.provider_name = inferredProviderName
+        }
+      }
       return merged
     })
     .filter((item): item is CandidateRecord => item !== null)
@@ -786,8 +819,8 @@ const poolAttemptKeySet = computed<Set<string>>(() => {
 })
 
 const timeline = computed<CandidateRecord[]>(() => {
-  if (poolAttemptCandidates.value.length === 0) return executableTimeline.value
-  return executableTimeline.value.filter(
+  if (poolAttemptCandidates.value.length === 0) return rawTimeline.value
+  return rawTimeline.value.filter(
     (candidate) => !poolAttemptKeySet.value.has(makeAttemptKey(candidate.candidate_index, candidate.retry_index)),
   )
 })
@@ -807,14 +840,23 @@ const normalizeProviderName = (value: string): string => {
   return text.replace(/反代$/u, '').trim() || text
 }
 
-const getProviderDisplayName = (attempt: CandidateRecord | null | undefined): string => {
+const getProviderDisplayName = (
+  attempt: CandidateRecord | null | undefined,
+  options: { allowAuthTypeFallback?: boolean } = {},
+): string => {
+  const allowAuthTypeFallback = options.allowAuthTypeFallback ?? true
   if (!attempt) return '未知'
-  const authType = String(attempt.key_auth_type || '').trim().toLowerCase()
-  if (authType && AUTH_TYPE_PROVIDER_LABEL_MAP[authType]) {
-    return AUTH_TYPE_PROVIDER_LABEL_MAP[authType]
-  }
+  // 优先使用提供商名称（管理后台设置的名称）
   const providerName = String(attempt.provider_name || '').trim()
-  return providerName ? normalizeProviderName(providerName) : '未知'
+  if (providerName) return normalizeProviderName(providerName)
+  if (allowAuthTypeFallback) {
+    // 回退：根据 auth_type 推断显示名称
+    const authType = String(attempt.key_auth_type || '').trim().toLowerCase()
+    if (authType && AUTH_TYPE_PROVIDER_LABEL_MAP[authType]) {
+      return AUTH_TYPE_PROVIDER_LABEL_MAP[authType]
+    }
+  }
+  return '未知'
 }
 
 const normalizeProviderIdentity = (value: unknown): string => {
@@ -898,7 +940,7 @@ const groupedTimeline = computed<NodeGroup[]>(() => {
 
     poolGroups.push({
       id: `pool:${groupId}`,
-      providerName: getProviderDisplayName(poolPrimary),
+      providerName: getProviderDisplayName(poolPrimary, { allowAuthTypeFallback: false }),
       primary: poolPrimary,
       primaryStatus: poolPrimaryStatus,
       allAttempts: attempts,

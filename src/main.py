@@ -235,6 +235,9 @@ async def lifespan(app: FastAPI) -> Any:
     # 启动月卡额度重置调度器（仅一个 worker 执行）
     logger.info("启动月卡额度重置调度器...")
     from src.services.model.fetch_scheduler import get_model_fetch_scheduler
+    from src.services.provider_keys.pool_quota_probe_scheduler import (
+        get_pool_quota_probe_scheduler,
+    )
     from src.services.system.maintenance_scheduler import get_maintenance_scheduler
     from src.services.task.task_poller import get_task_poller
     from src.services.usage.quota_scheduler import get_quota_scheduler
@@ -243,6 +246,7 @@ async def lifespan(app: FastAPI) -> Any:
     quota_scheduler = get_quota_scheduler()
     maintenance_scheduler = get_maintenance_scheduler()
     model_fetch_scheduler = get_model_fetch_scheduler()
+    pool_quota_probe_scheduler = get_pool_quota_probe_scheduler()
     task_poller = get_task_poller()
     task_coordinator = StartupTaskCoordinator(redis_client)
 
@@ -271,6 +275,15 @@ async def lifespan(app: FastAPI) -> Any:
     else:
         logger.info("检测到其他 worker 已运行模型获取调度器，本实例跳过")
         model_fetch_scheduler = None  # type: ignore[assignment]
+
+    # 启动号池额度主动探测调度器
+    pool_quota_probe_scheduler_active = await task_coordinator.acquire("pool_quota_probe_scheduler")
+    if pool_quota_probe_scheduler_active:
+        logger.info("启动号池额度主动探测调度器...")
+        await pool_quota_probe_scheduler.start()
+    else:
+        logger.info("检测到其他 worker 已运行号池额度主动探测调度器，本实例跳过")
+        pool_quota_probe_scheduler = None  # type: ignore[assignment]
 
     # 启动异步任务轮询服务（当前仅视频）
     task_poller_active = await task_coordinator.acquire("task_poller:video")
@@ -338,6 +351,11 @@ async def lifespan(app: FastAPI) -> Any:
         logger.info("停止模型自动获取调度器...")
         await model_fetch_scheduler.stop()
         await task_coordinator.release("model_fetch_scheduler")
+
+    if pool_quota_probe_scheduler:
+        logger.info("停止号池额度主动探测调度器...")
+        await pool_quota_probe_scheduler.stop()
+        await task_coordinator.release("pool_quota_probe_scheduler")
 
     if task_poller:
         logger.info("停止 TaskPoller（video）...")

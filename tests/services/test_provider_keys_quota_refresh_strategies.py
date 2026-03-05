@@ -33,10 +33,20 @@ class _FakeResponse:
         status_code: int,
         payload: Any = None,
         json_exc: Exception | None = None,
+        *,
+        headers: dict[str, str] | None = None,
+        text: str | None = None,
     ) -> None:
         self.status_code = status_code
         self._payload = payload
         self._json_exc = json_exc
+        self.headers = headers or {}
+        if text is not None:
+            self.text = text
+        elif isinstance(payload, (dict, list)):
+            self.text = json.dumps(payload, ensure_ascii=False)
+        else:
+            self.text = ""
 
     def json(self) -> Any:
         if self._json_exc:
@@ -137,6 +147,121 @@ async def test_codex_refresher_http_non_200_returns_error(
 
     assert result["status"] == "error"
     assert result["status_code"] == 503
+
+
+@pytest.mark.asyncio
+async def test_codex_refresher_http_401_marks_auth_invalid_and_disables(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.services.provider_keys.quota_refresh import codex_refresher as module
+
+    key = SimpleNamespace(
+        id="k1", name="K1", api_key="enc", auth_type="api_key", auth_config=None, proxy=None
+    )
+    provider = SimpleNamespace(proxy=None)
+    endpoint = SimpleNamespace()
+    metadata_updates: dict[str, dict[str, Any]] = {}
+    state_updates: dict[str, dict[str, Any]] = {}
+
+    async def _fake_auth_info(_endpoint: Any, _key: Any) -> Any:
+        return None
+
+    _install_module(
+        monkeypatch,
+        "src.services.proxy_node.resolver",
+        {
+            "resolve_effective_proxy": lambda provider_proxy, key_proxy: None,
+            "build_proxy_client_kwargs": lambda proxy, timeout: {"timeout": timeout},
+        },
+    )
+    monkeypatch.setattr(module, "get_provider_auth", _fake_auth_info)
+    monkeypatch.setattr(module.crypto_service, "decrypt", lambda _v: "sk-test")
+    response = _FakeResponse(status_code=401, payload={"error": {"message": "token expired"}})
+    monkeypatch.setattr(
+        module.httpx, "AsyncClient", lambda **kwargs: _FakeAsyncClient(response, **kwargs)
+    )
+
+    result = await refresh_codex_key_quota(
+        db=cast(Any, _FakeDB()),
+        provider=cast(Any, provider),
+        key=cast(Any, key),
+        endpoint=cast(Any, endpoint),
+        codex_wham_usage_url="https://example.test",
+        metadata_updates=metadata_updates,
+        state_updates=state_updates,
+    )
+
+    assert result["status"] == "auth_invalid"
+    assert result["status_code"] == 401
+    assert result["auto_disabled"] is True
+    assert metadata_updates == {}
+    assert state_updates["k1"]["is_active"] is False
+    assert "401" in str(state_updates["k1"]["oauth_invalid_reason"])
+
+
+@pytest.mark.asyncio
+async def test_codex_refresher_http_402_sets_quota_exhausted_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.services.provider_keys.quota_refresh import codex_refresher as module
+
+    key = SimpleNamespace(
+        id="k1",
+        name="K1",
+        api_key="enc-key",
+        auth_type="oauth",
+        auth_config="enc-config",
+        proxy=None,
+    )
+    provider = SimpleNamespace(proxy=None)
+    endpoint = SimpleNamespace()
+    metadata_updates: dict[str, dict[str, Any]] = {}
+    state_updates: dict[str, dict[str, Any]] = {}
+
+    async def _fake_auth_info(_endpoint: Any, _key: Any) -> Any:
+        return None
+
+    _install_module(
+        monkeypatch,
+        "src.services.proxy_node.resolver",
+        {
+            "resolve_effective_proxy": lambda provider_proxy, key_proxy: None,
+            "build_proxy_client_kwargs": lambda proxy, timeout: {"timeout": timeout},
+        },
+    )
+    monkeypatch.setattr(module, "get_provider_auth", _fake_auth_info)
+    monkeypatch.setattr(
+        module.crypto_service,
+        "decrypt",
+        lambda value: (
+            "sk-test"
+            if value == "enc-key"
+            else json.dumps({"plan_type": "team", "account_id": "acc-1"})
+        ),
+    )
+    response = _FakeResponse(status_code=402, payload={"error": {"message": "payment required"}})
+    monkeypatch.setattr(
+        module.httpx, "AsyncClient", lambda **kwargs: _FakeAsyncClient(response, **kwargs)
+    )
+
+    result = await refresh_codex_key_quota(
+        db=cast(Any, _FakeDB()),
+        provider=cast(Any, provider),
+        key=cast(Any, key),
+        endpoint=cast(Any, endpoint),
+        codex_wham_usage_url="https://example.test",
+        metadata_updates=metadata_updates,
+        state_updates=state_updates,
+    )
+
+    assert result["status"] == "quota_exhausted"
+    assert result["status_code"] == 402
+    codex_meta = metadata_updates["k1"]["codex"]
+    assert codex_meta["plan_type"] == "team"
+    assert codex_meta["primary_used_percent"] == 100.0
+    assert codex_meta["secondary_used_percent"] == 100.0
+    assert state_updates["k1"]["oauth_invalid_at"] is None
+    assert state_updates["k1"]["oauth_invalid_reason"] is None
 
 
 @pytest.mark.asyncio

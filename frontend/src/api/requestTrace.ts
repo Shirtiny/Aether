@@ -55,8 +55,14 @@ export const requestTraceApi = {
   /**
    * 获取特定请求的完整追踪信息
    */
-  async getRequestTrace(requestId: string): Promise<RequestTrace> {
-    const response = await apiClient.get<RequestTrace>(`/api/admin/monitoring/trace/${requestId}`)
+  async getRequestTrace(
+    requestId: string,
+    options: { attemptedOnly?: boolean } = {},
+  ): Promise<RequestTrace> {
+    const attemptedOnly = options.attemptedOnly ?? true
+    const response = await apiClient.get<RequestTrace>(`/api/admin/monitoring/trace/${requestId}`, {
+      params: { attempted_only: attemptedOnly },
+    })
     return response.data
   },
 
