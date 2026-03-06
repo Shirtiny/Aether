@@ -145,6 +145,8 @@ export interface RequestDetail {
   output_tokens?: number
   total_tokens?: number
   cache_creation_input_tokens?: number
+  cache_creation_input_tokens_5m?: number
+  cache_creation_input_tokens_1h?: number
   cache_read_input_tokens?: number
   // Additional cost fields
   input_cost?: number
@@ -189,7 +191,8 @@ export interface RequestDetail {
       cache_read_price_per_1m?: number
       cache_ttl_pricing?: Array<{
         ttl_minutes: number
-        cache_read_price_per_1m: number
+        cache_creation_price_per_1m?: number
+        cache_read_price_per_1m?: number
       }>
     }
     tiers: Array<{  // 完整阶梯配置列表
@@ -200,7 +203,8 @@ export interface RequestDetail {
       cache_read_price_per_1m?: number
       cache_ttl_pricing?: Array<{
         ttl_minutes: number
-        cache_read_price_per_1m: number
+        cache_creation_price_per_1m?: number
+        cache_read_price_per_1m?: number
       }>
     }>
   } | null

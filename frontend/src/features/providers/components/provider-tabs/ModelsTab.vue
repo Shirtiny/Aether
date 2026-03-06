@@ -87,14 +87,14 @@
                   </span>
                 </template>
                 <template v-if="getEffectiveCachePrice(model, 'creation') > 0 || getEffectiveCachePrice(model, 'read') > 0">
-                  <span class="text-muted-foreground text-right">缓存:</span>
+                  <span class="text-muted-foreground text-right">{{ get1hCachePrice(model) > 0 ? '5min 缓存:' : '缓存:' }}</span>
                   <span class="font-mono font-semibold">
                     ${{ formatPrice(getEffectiveCachePrice(model, 'creation')) }}/${{ formatPrice(getEffectiveCachePrice(model, 'read')) }}
                   </span>
                 </template>
                 <!-- 1h 缓存价格 -->
                 <template v-if="get1hCachePrice(model) > 0">
-                  <span class="text-muted-foreground text-right">1h 缓存:</span>
+                  <span class="text-muted-foreground text-right">1h 缓存创建:</span>
                   <span class="font-mono font-semibold">
                     ${{ formatPrice(get1hCachePrice(model)) }}
                   </span>
@@ -211,11 +211,18 @@
     </div>
   </Card>
 
-  <!-- 测试结果对话框 -->
-  <TestResultDialog
+  <ModelTestDialog
+    :open="testDialogOpen"
     :result="testResult"
     :mode="testResultMode"
-    @close="testResult = null"
+    :selecting-model-name="pendingTestModel ? (pendingTestModel.global_model_display_name || pendingTestModel.provider_model_name) : null"
+    :endpoints="activeEndpoints"
+    :selected-endpoint="selectedTestEndpoint"
+    :testing="!!pendingTestModel && testingModelId === pendingTestModel.id"
+    :show-endpoint-selector="activeEndpoints.length > 1"
+    @close="handleTestDialogClose"
+    @back="handleTestDialogBack"
+    @select-endpoint="handleSelectTestEndpoint"
   />
 </template>
 
@@ -231,16 +238,19 @@ import { sortResolutionEntries } from '@/utils/form'
 import {
   testModelFailover,
   type Model,
+  type ProviderEndpoint,
   type TestModelFailoverResponse,
 } from '@/api/endpoints'
 import { updateModel } from '@/api/endpoints/models'
 import { parseApiError } from '@/utils/errorParser'
+import { formatApiFormat } from '@/api/endpoints/types/api-format'
 import type { ProviderWithEndpointsSummary } from '@/api/endpoints'
-import TestResultDialog from './TestResultDialog.vue'
+import ModelTestDialog from './ModelTestDialog.vue'
 
 const props = defineProps<{
   provider: ProviderWithEndpointsSummary
   models?: Model[]
+  endpoints?: ProviderEndpoint[]
 }>()
 
 const emit = defineEmits<{
@@ -259,6 +269,11 @@ const togglingModelId = ref<string | null>(null)
 const testingModelId = ref<string | null>(null)
 const testResult = ref<TestModelFailoverResponse | null>(null)
 const testResultMode = ref<'global' | 'direct'>('global')
+const testDialogOpen = ref(false)
+const pendingTestModel = ref<Model | null>(null)
+const selectedTestEndpoint = ref<ProviderEndpoint | null>(null)
+// 使用 props 传入的数据，或使用本地数据
+const activeEndpoints = computed(() => (props.endpoints ?? []).filter(endpoint => endpoint.is_active))
 // 使用 props 传入的数据，或使用本地数据
 const models = computed(() => props.models ?? localModels.value)
 // 按名称排序的模型列表
@@ -421,11 +436,36 @@ async function toggleModelActive(model: Model) {
   }
 }
 
-// 测试模型连接性（模拟外部请求，带故障转移）
-async function testModelConnection(model: Model) {
+function resetTestDialogState() {
+  testDialogOpen.value = false
+  pendingTestModel.value = null
+  selectedTestEndpoint.value = null
+  testResult.value = null
+}
+
+function handleTestDialogClose() {
+  resetTestDialogState()
+}
+
+function handleTestDialogBack() {
+  if (testingModelId.value) return
+  testResult.value = null
+  selectedTestEndpoint.value = null
+}
+
+async function handleSelectTestEndpoint(endpointId: string) {
+  if (!pendingTestModel.value) return
+  const endpoint = activeEndpoints.value.find(item => item.id === endpointId)
+  if (!endpoint) return
+  await runModelTest(pendingTestModel.value, endpoint)
+}
+
+async function runModelTest(model: Model, endpoint?: ProviderEndpoint) {
   if (testingModelId.value) return
 
   testingModelId.value = model.id
+  testDialogOpen.value = true
+  selectedTestEndpoint.value = endpoint ?? null
   try {
     const modelName = model.global_model_name || model.provider_model_name
 
@@ -433,7 +473,9 @@ async function testModelConnection(model: Model) {
       provider_id: props.provider.id,
       mode: 'global',
       model_name: modelName,
-      message: "hello",
+      api_format: endpoint?.api_format,
+      endpoint_id: endpoint?.id,
+      message: 'hello',
     })
 
     if (result.success) {
@@ -442,15 +484,41 @@ async function testModelConnection(model: Model) {
       const mapped = successAttempt?.effective_model && successAttempt.effective_model !== modelName
         ? ` -> ${successAttempt.effective_model}`
         : ''
-      showSuccess(`${modelName}${mapped} 测试成功${latency}`)
-    } else {
-      testResultMode.value = 'global'
-      testResult.value = result
+      const endpointPrefix = endpoint ? `[${formatApiFormat(endpoint.api_format)}] ` : ''
+      showSuccess(`${endpointPrefix}${modelName}${mapped} 测试成功${latency}`)
+      resetTestDialogState()
+      return
     }
+    testResultMode.value = 'global'
+    testResult.value = result
   } catch (err: unknown) {
     showError(`模型测试失败: ${parseApiError(err, '测试请求失败')}`)
+    if (activeEndpoints.value.length <= 1) {
+      resetTestDialogState()
+      return
+    }
+    selectedTestEndpoint.value = null
   } finally {
     testingModelId.value = null
+  }
+}
+
+// 测试模型连接性（模拟外部请求，带故障转移）
+async function testModelConnection(model: Model) {
+  if (testingModelId.value) return
+
+  if (activeEndpoints.value.length === 0) {
+    showError('暂无可用于测试的活跃端点')
+    return
+  }
+
+  pendingTestModel.value = model
+  selectedTestEndpoint.value = null
+  testResult.value = null
+  testDialogOpen.value = true
+
+  if (activeEndpoints.value.length === 1) {
+    await runModelTest(model, activeEndpoints.value[0])
   }
 }
 

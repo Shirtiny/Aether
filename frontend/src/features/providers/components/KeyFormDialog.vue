@@ -32,7 +32,7 @@
             data-1p-ignore="true"
           />
         </div>
-        <div v-if="providerType === 'vertex_ai'">
+        <div v-if="showAuthTypeSelector">
           <Label :for="authTypeSelectId">认证类型</Label>
           <Select
             v-model="form.auth_type"
@@ -50,10 +50,30 @@
             </SelectContent>
           </Select>
         </div>
+        <div v-else>
+          <Label :for="apiKeyInputId">
+            {{ form.auth_type === 'service_account' ? 'Service Account JSON' : 'API 密钥' }}
+            {{ editingKey ? '' : '*' }}
+          </Label>
+          <Input
+            :id="apiKeyInputId"
+            v-model="form.api_key"
+            :name="apiKeyFieldName"
+            masked
+            :required="!editingKey"
+            :placeholder="editingKey ? editingKey.api_key_masked : 'sk-...'"
+          />
+          <p
+            v-if="editingKey && form.auth_type === 'api_key'"
+            class="text-xs text-muted-foreground mt-1"
+          >
+            留空表示不修改
+          </p>
+        </div>
       </div>
 
       <!-- API 密钥 / Service Account JSON -->
-      <div>
+      <div v-if="showAuthTypeSelector || form.auth_type === 'service_account'">
         <Label :for="apiKeyInputId">
           {{ form.auth_type === 'service_account' ? 'Service Account JSON' : 'API 密钥' }}
           {{ editingKey ? '' : '*' }}
@@ -366,6 +386,8 @@ const visibleApiFormats = computed(() => {
   const allowed = getVertexAllowedFormatsByAuth(form.value.auth_type)
   return sorted.filter(fmt => allowed.has(normalizeApiFormat(fmt)))
 })
+
+const showAuthTypeSelector = computed(() => props.providerType === 'vertex_ai')
 
 // 默认认证类型
 const defaultAuthType = 'api_key' as const

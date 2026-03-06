@@ -143,6 +143,7 @@ export interface TestModelFailoverRequest {
   mode: 'global' | 'direct'
   model_name: string
   api_format?: string
+  endpoint_id?: string
   message?: string
 }
 

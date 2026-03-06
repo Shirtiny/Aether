@@ -155,6 +155,12 @@ PRESET_MODELS: dict[str, list[dict[str, Any]]] = {
             "owned_by": "openai",
             "display_name": "GPT-5.3 Codex",
         },
+        {
+            "id": "gpt-5.4",
+            "object": "model",
+            "owned_by": "openai",
+            "display_name": "GPT-5.4",
+        },
     ],
 }
 

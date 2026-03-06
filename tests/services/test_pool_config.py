@@ -39,6 +39,7 @@ def test_parse_pool_config_returns_defaults_for_empty_advanced() -> None:
     assert cfg.proactive_refresh_seconds == 180
     assert cfg.health_policy_enabled is True
     assert cfg.unschedulable_rules == []
+    assert cfg.batch_concurrency == 8
     assert cfg.probing_enabled is False
     assert cfg.probing_interval_minutes == 10
     assert cfg.auto_remove_banned_keys is False
@@ -100,9 +101,22 @@ def test_parse_pool_config_overrides_values_legacy_string_list() -> None:
     assert cfg.overload_cooldown_seconds == 60
     assert cfg.proactive_refresh_seconds == 300
     assert cfg.health_policy_enabled is False
+    assert cfg.batch_concurrency == 8
     assert cfg.probing_enabled is True
     assert cfg.probing_interval_minutes == 15
     assert cfg.auto_remove_banned_keys is True
+
+
+def test_parse_pool_config_parses_batch_concurrency() -> None:
+    cfg = parse_pool_config({"pool_advanced": {"batch_concurrency": 12}})
+    assert cfg is not None
+    assert cfg.batch_concurrency == 12
+
+
+def test_parse_pool_config_clamps_batch_concurrency() -> None:
+    cfg = parse_pool_config({"pool_advanced": {"batch_concurrency": 99}})
+    assert cfg is not None
+    assert cfg.batch_concurrency == 32
 
 
 def test_parse_pool_config_new_object_list_format() -> None:

@@ -21,9 +21,16 @@ const KEYWORDS_DISABLED = [
   'account deactivated',
   'organization has been disabled',
   'organization_disabled',
+  'deactivated_workspace',
   'deactivated',
   '访问被禁止',
   '账户访问被禁止',
+]
+
+const KEYWORDS_TOKEN_INVALID = [
+  'authentication token has been invalidated',
+  'token has been invalidated',
+  'codex token 无效或已过期',
 ]
 
 // 需要验证类
@@ -36,6 +43,7 @@ const KEYWORDS_VERIFICATION = [
 const ACCOUNT_BLOCK_REASON_KEYWORDS = [
   ...KEYWORDS_SUSPENDED,
   ...KEYWORDS_DISABLED,
+  ...KEYWORDS_TOKEN_INVALID,
   ...KEYWORDS_VERIFICATION,
 ]
 
@@ -52,7 +60,9 @@ export function isAccountLevelBlockReason(reason: string | null | undefined): bo
 export function classifyAccountBlockLabel(reason: string): string {
   if (reason.trim().startsWith('[OAUTH_EXPIRED]')) return 'Token 失效'
   const lowered = reason.toLowerCase()
+  if (KEYWORDS_TOKEN_INVALID.some(kw => lowered.includes(kw))) return 'Token 失效'
   if (KEYWORDS_VERIFICATION.some(kw => lowered.includes(kw))) return '需要验证'
+  if (lowered.includes('deactivated_workspace')) return '工作区停用'
   if (KEYWORDS_DISABLED.some(kw => lowered.includes(kw))) return '账号停用'
   if (KEYWORDS_SUSPENDED.some(kw => lowered.includes(kw))) return '账号封禁'
   return '账号异常'

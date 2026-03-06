@@ -273,7 +273,8 @@ import { useProxyNodesStore } from '@/stores/proxy-nodes'
 
 type QuickSelectorValue =
   | 'banned'
-  | 'no_quota'
+  | 'no_5h_limit'
+  | 'no_weekly_limit'
   | 'plan_free'
   | 'plan_team'
   | 'oauth_invalid'
@@ -305,7 +306,8 @@ const emit = defineEmits<{
 
 const QUICK_SELECT_OPTIONS: Array<{ value: QuickSelectorValue; label: string }> = [
   { value: 'banned', label: '已封号' },
-  { value: 'no_quota', label: '无额度' },
+  { value: 'no_5h_limit', label: '无5H限额' },
+  { value: 'no_weekly_limit', label: '无周限额' },
   { value: 'plan_free', label: '全部 Free' },
   { value: 'plan_team', label: '全部 Team' },
   { value: 'oauth_invalid', label: 'OAuth 失效' },
@@ -408,14 +410,31 @@ function isBannedKey(key: PoolKeyDetail): boolean {
   return false
 }
 
-function hasNoQuota(key: PoolKeyDetail): boolean {
-  const quotaText = normalizeText(key.account_quota)
-  if (!quotaText) return false
-  if (/(无额度|额度不足|已耗尽|耗尽|depleted|exhausted|insufficient)/.test(quotaText)) return true
-  if (/剩余\s*0(\.0+)?/.test(quotaText)) return true
-  if (/\b0(\.0+)?\s*\/\s*\d/.test(quotaText)) return true
-  if (/\b0(\.0+)?%/.test(quotaText)) return true
+function getQuotaSegments(accountQuota: string | null | undefined): string[] {
+  return String(accountQuota || '')
+    .split('|')
+    .map((segment) => normalizeText(segment))
+    .filter(Boolean)
+}
+
+function isDepletedQuotaSegment(segment: string): boolean {
+  if (/(无额度|额度不足|已耗尽|耗尽|depleted|exhausted|insufficient)/.test(segment)) return true
+  if (/剩余\s*0(\.0+)?/.test(segment)) return true
+  if (/\b0(\.0+)?\s*\/\s*\d/.test(segment)) return true
+  if (/\b0(\.0+)?%/.test(segment)) return true
   return false
+}
+
+function hasNoFiveHourLimit(key: PoolKeyDetail): boolean {
+  return getQuotaSegments(key.account_quota)
+    .filter((segment) => /5h|5小时/.test(segment))
+    .some(isDepletedQuotaSegment)
+}
+
+function hasNoWeeklyLimit(key: PoolKeyDetail): boolean {
+  return getQuotaSegments(key.account_quota)
+    .filter((segment) => /周|weekly|week/.test(segment))
+    .some(isDepletedQuotaSegment)
 }
 
 function isOAuthInvalid(key: PoolKeyDetail): boolean {
@@ -455,7 +474,8 @@ function toggleSelectFiltered(checked: boolean | 'indeterminate'): void {
 
 function matchesSelector(key: PoolKeyDetail, selector: QuickSelectorValue): boolean {
   if (selector === 'banned') return isBannedKey(key)
-  if (selector === 'no_quota') return hasNoQuota(key)
+  if (selector === 'no_5h_limit') return hasNoFiveHourLimit(key)
+  if (selector === 'no_weekly_limit') return hasNoWeeklyLimit(key)
   if (selector === 'plan_free') return isFreePlan(key)
   if (selector === 'plan_team') return isTeamPlan(key)
   if (selector === 'oauth_invalid') return isOAuthInvalid(key)

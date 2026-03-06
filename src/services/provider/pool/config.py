@@ -82,6 +82,9 @@ class PoolConfig:
     # -- Temporary Unschedulable Rules ----------------------------------------
     unschedulable_rules: list[UnschedulableRule] = field(default_factory=list)
 
+    # -- Batch Operations -----------------------------------------------------
+    batch_concurrency: int = 8
+
     # -- Quota Probing --------------------------------------------------------
     probing_enabled: bool = False
     probing_interval_minutes: int = 10
@@ -193,6 +196,7 @@ def parse_pool_config(provider_config: Any) -> PoolConfig | None:
         proactive_refresh_seconds=_int_or("proactive_refresh_seconds", 180),
         health_policy_enabled=_bool_or("health_policy_enabled", True),
         unschedulable_rules=rules,
+        batch_concurrency=max(1, min(_int_or("batch_concurrency", 8), 32)),
         probing_enabled=_bool_or("probing_enabled", False),
         probing_interval_minutes=max(1, min(_int_or("probing_interval_minutes", 10), 1440)),
         auto_remove_banned_keys=_bool_or("auto_remove_banned_keys", False),
