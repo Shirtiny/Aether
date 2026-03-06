@@ -193,7 +193,7 @@
                     <!-- 阶梯标题 -->
                     <div class="text-xs text-muted-foreground flex items-center gap-2 flex-wrap">
                       <span class="font-medium text-foreground">Token 计费</span>
-                      <span class="text-muted-foreground/60">(输入 {{ formatNumber(detail.tokens?.input || detail.input_tokens || 0) }} + 缓存创建 {{ formatNumber(detail.cache_creation_input_tokens || 0) }} + 缓存读取 {{ formatNumber(detail.cache_read_input_tokens || 0) }})</span>
+                      <span class="text-muted-foreground/60">(输入 {{ formatNumber(detail.tokens?.input || detail.input_tokens || 0) }} + 缓存创建 {{ cacheCreationSummaryText }} + 缓存读取 {{ formatNumber(detail.cache_read_input_tokens || 0) }})</span>
                       <Badge
                         v-if="displayTiers.length > 1"
                         variant="outline"
@@ -236,7 +236,15 @@
                         <div class="text-muted-foreground flex items-center gap-2 flex-wrap">
                           <span>输入 ${{ formatPrice(tier.input_price_per_1m) }}/M</span>
                           <span>输出 ${{ formatPrice(tier.output_price_per_1m) }}/M</span>
-                          <span v-if="tier.cache_creation_price_per_1m">
+                          <template v-if="hasTierCacheCreationSplitPricing(tier)">
+                            <span v-if="getTierCachePriceForTTL(tier, 5, 'cache_creation_price_per_1m') !== null">
+                              缓存创建(5min) ${{ formatPrice(getTierCachePriceForTTL(tier, 5, 'cache_creation_price_per_1m') || 0) }}/M
+                            </span>
+                            <span v-if="getTierCachePriceForTTL(tier, 60, 'cache_creation_price_per_1m') !== null">
+                              缓存创建(1h) ${{ formatPrice(getTierCachePriceForTTL(tier, 60, 'cache_creation_price_per_1m') || 0) }}/M
+                            </span>
+                          </template>
+                          <span v-else-if="tier.cache_creation_price_per_1m">
                             缓存创建 ${{ formatPrice(tier.cache_creation_price_per_1m) }}/M
                           </span>
                           <span v-if="tier.cache_read_price_per_1m">
@@ -267,7 +275,7 @@
                         <!-- 缓存创建 缓存读取 -->
                         <div class="flex items-center">
                           <div class="flex items-center flex-1">
-                            <span class="text-xs text-muted-foreground w-[56px]">缓存创建</span>
+                            <span class="text-xs text-muted-foreground w-[56px]">{{ cacheCreationSplitRows.length > 0 ? '创建合计' : '缓存创建' }}</span>
                             <span class="text-sm font-semibold font-mono flex-1 text-center">{{ detail.cache_creation_input_tokens || 0 }}</span>
                             <span class="text-xs font-mono">${{ (detail.cache_creation_cost || 0).toFixed(6) }}</span>
                           </div>
@@ -283,11 +291,22 @@
                         </div>
                         <!-- 缓存创建 5m/1h 细分 -->
                         <div
-                          v-if="(detail.cache_creation_input_tokens_5m || 0) > 0 || (detail.cache_creation_input_tokens_1h || 0) > 0"
-                          class="flex items-center pl-[56px]"
+                          v-if="cacheCreationSplitRows.length > 0"
+                          class="space-y-1 pl-[56px]"
                         >
-                          <span class="text-xs text-muted-foreground/50">5min: {{ detail.cache_creation_input_tokens_5m || 0 }}</span>
-                          <span class="text-xs text-muted-foreground/50 ml-4">1h: {{ detail.cache_creation_input_tokens_1h || 0 }}</span>
+                          <div
+                            v-for="row in cacheCreationSplitRows"
+                            :key="row.key"
+                            class="flex items-center gap-4 text-xs text-muted-foreground/70"
+                          >
+                            <span class="w-[72px]">{{ row.label }}</span>
+                            <span class="font-mono text-foreground/90">{{ formatNumber(row.tokens) }}</span>
+                            <span v-if="row.pricePer1M !== null">${{ formatPrice(row.pricePer1M) }}/M</span>
+                            <span
+                              v-if="row.cost !== null"
+                              class="font-mono"
+                            >${{ row.cost.toFixed(6) }}</span>
+                          </div>
                         </div>
                       </template>
                     </div>
@@ -714,6 +733,18 @@ const historicalPricing = ref<{
   cache_read_price: string
   request_price: string
 } | null>(null)
+
+type CacheTTLPriceEntry = {
+  ttl_minutes?: number | null
+  cache_creation_price_per_1m?: number | null
+  cache_read_price_per_1m?: number | null
+}
+
+type PricingTierLike = {
+  cache_creation_price_per_1m?: number | null
+  cache_read_price_per_1m?: number | null
+  cache_ttl_pricing?: CacheTTLPriceEntry[] | null
+}
 const autoRefreshTimer = ref<ReturnType<typeof setInterval> | null>(null)
 const autoRefreshing = ref(false)
 const isPageVisible = ref(typeof document === 'undefined' ? true : !document.hidden)
@@ -943,6 +974,70 @@ const currentTierIndex = computed(() => {
   return 0
 })
 
+const currentTier = computed<PricingTierLike | null>(() => {
+  const tier = displayTiers.value[currentTierIndex.value]
+  if (!tier || typeof tier !== 'object') return null
+  return tier as PricingTierLike
+})
+
+const cacheCreationSummaryText = computed(() => {
+  if (!detail.value) return '0'
+
+  const total = detail.value.cache_creation_input_tokens || 0
+  const cache5m = detail.value.cache_creation_input_tokens_5m || 0
+  const cache1h = detail.value.cache_creation_input_tokens_1h || 0
+
+  if (cache5m <= 0 && cache1h <= 0) {
+    return formatNumber(total)
+  }
+
+  const parts: string[] = []
+  if (cache5m > 0) parts.push(`5min ${formatNumber(cache5m)}`)
+  if (cache1h > 0) parts.push(`1h ${formatNumber(cache1h)}`)
+  const remaining = Math.max(0, total - cache5m - cache1h)
+  if (remaining > 0) parts.push(`其他 ${formatNumber(remaining)}`)
+  return parts.join(' + ')
+})
+
+const cacheCreationSplitRows = computed(() => {
+  if (!detail.value) return []
+
+  const rows: Array<{
+    key: string
+    label: string
+    tokens: number
+    pricePer1M: number | null
+    cost: number | null
+  }> = []
+
+  const cache5m = detail.value.cache_creation_input_tokens_5m || 0
+  const cache1h = detail.value.cache_creation_input_tokens_1h || 0
+
+  if (cache5m > 0) {
+    const pricePer1M = getActiveCachePriceForTTL(5, 'cache_creation_price_per_1m')
+    rows.push({
+      key: '5m',
+      label: '5min 创建',
+      tokens: cache5m,
+      pricePer1M,
+      cost: pricePer1M !== null ? (cache5m * pricePer1M) / 1_000_000 : null,
+    })
+  }
+
+  if (cache1h > 0) {
+    const pricePer1M = getActiveCachePriceForTTL(60, 'cache_creation_price_per_1m')
+    rows.push({
+      key: '1h',
+      label: '1h 创建',
+      tokens: cache1h,
+      pricePer1M,
+      cost: pricePer1M !== null ? (cache1h * pricePer1M) / 1_000_000 : null,
+    })
+  }
+
+  return rows
+})
+
 // 总输入上下文（输入 + 缓存创建 + 缓存读取）
 const _totalInputContext = computed(() => {
   if (!detail.value) return 0
@@ -1011,6 +1106,52 @@ function hasContent(data: unknown): boolean {
     return Object.keys(data as object).length > 0
   }
   return true
+}
+
+function toFiniteNumber(value: unknown): number | null {
+  const num = Number(value)
+  return Number.isFinite(num) ? num : null
+}
+
+function getTierCachePriceForTTL(
+  tier: PricingTierLike | null | undefined,
+  ttlMinutes: number,
+  priceKey: 'cache_creation_price_per_1m' | 'cache_read_price_per_1m',
+): number | null {
+  const fallback = toFiniteNumber(tier?.[priceKey])
+  const ttlPricing = Array.isArray(tier?.cache_ttl_pricing)
+    ? tier.cache_ttl_pricing
+        .filter((entry): entry is CacheTTLPriceEntry => !!entry && typeof entry === 'object')
+        .sort((a, b) => Number(a.ttl_minutes || 0) - Number(b.ttl_minutes || 0))
+    : []
+
+  if (ttlPricing.length === 0) return fallback
+
+  const matched = ttlPricing.find((entry) => Number(entry.ttl_minutes || 0) >= ttlMinutes)
+    || ttlPricing[ttlPricing.length - 1]
+  const price = toFiniteNumber(matched?.[priceKey])
+  return price ?? fallback
+}
+
+function hasTierCacheCreationSplitPricing(tier: PricingTierLike | null | undefined): boolean {
+  const ttlPricing = Array.isArray(tier?.cache_ttl_pricing) ? tier.cache_ttl_pricing : []
+  return ttlPricing.some((entry) =>
+    Number(entry?.ttl_minutes || 0) >= 60
+    && toFiniteNumber(entry?.cache_creation_price_per_1m) !== null,
+  )
+}
+
+function getActiveCachePriceForTTL(
+  ttlMinutes: number,
+  priceKey: 'cache_creation_price_per_1m' | 'cache_read_price_per_1m',
+): number | null {
+  const tierPrice = getTierCachePriceForTTL(currentTier.value, ttlMinutes, priceKey)
+  if (tierPrice !== null) return tierPrice
+
+  if (priceKey === 'cache_creation_price_per_1m') {
+    return toFiniteNumber(detail.value?.cache_creation_price_per_1m)
+  }
+  return toFiniteNumber(detail.value?.cache_read_price_per_1m)
 }
 
 function getDefaultDataSourceForTab(tab: string): 'client' | 'provider' {

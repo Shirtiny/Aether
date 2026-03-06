@@ -35,9 +35,16 @@ _KEYWORDS_DISABLED: tuple[str, ...] = (
     "account deactivated",
     "organization has been disabled",
     "organization_disabled",
+    "deactivated_workspace",
     "deactivated",
     "访问被禁止",
     "账户访问被禁止",
+)
+
+_TOKEN_INVALID_KEYWORDS: tuple[str, ...] = (
+    "authentication token has been invalidated",
+    "token has been invalidated",
+    "codex token 无效或已过期",
 )
 
 # 需要验证类
@@ -50,6 +57,7 @@ _KEYWORDS_VERIFICATION: tuple[str, ...] = (
 ACCOUNT_BLOCK_REASON_KEYWORDS: tuple[str, ...] = (
     *_KEYWORDS_SUSPENDED,
     *_KEYWORDS_DISABLED,
+    *_TOKEN_INVALID_KEYWORDS,
     *_KEYWORDS_VERIFICATION,
 )
 
@@ -57,8 +65,12 @@ ACCOUNT_BLOCK_REASON_KEYWORDS: tuple[str, ...] = (
 def _classify_block_reason(text: str) -> tuple[str, str]:
     """Return (code, label) based on the oauth_invalid_reason text."""
     lowered = text.lower()
+    if any(kw in lowered for kw in _TOKEN_INVALID_KEYWORDS):
+        return "oauth_expired", "Token 失效"
     if any(kw in lowered for kw in _KEYWORDS_VERIFICATION):
         return "account_verification", "需要验证"
+    if 'deactivated_workspace' in lowered:
+        return "workspace_deactivated", "工作区停用"
     if any(kw in lowered for kw in _KEYWORDS_DISABLED):
         return "account_disabled", "账号停用"
     if any(kw in lowered for kw in _KEYWORDS_SUSPENDED):

@@ -394,7 +394,7 @@ class CreateProviderRequest(BaseModel):
     quota_last_reset_at: datetime | None = Field(None, description="当前周期开始时间")
     quota_expires_at: datetime | None = Field(None, description="配额过期时间")
     provider_priority: int | None = Field(
-        100, ge=0, le=10000, description="提供商优先级（数字越小越优先）"
+        None, ge=0, le=10000, description="提供商优先级（数字越小越优先，留空时新建自动置顶）"
     )
     keep_priority_on_conversion: bool = Field(
         False,

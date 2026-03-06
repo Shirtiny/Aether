@@ -892,6 +892,7 @@
                 :key="`models-${provider.id}`"
                 :provider="provider"
                 :models="providerModels"
+                :endpoints="endpoints"
                 @edit-model="handleEditModel"
                 @batch-assign="handleBatchAssign"
                 @refresh="loadEndpoints"
@@ -1101,7 +1102,7 @@ import {
 import type { UpstreamMetadata, AntigravityModelQuota } from '@/api/endpoints/types'
 import { formatApiFormat } from '@/api/endpoints/types/api-format'
 import { isOAuthAccountProviderType, isKeyManagedProviderType } from '../utils/providerTypeUtils'
-import { isAccountLevelBlockReason } from '@/utils/accountBlock'
+import { isAccountLevelBlockReason, cleanAccountBlockReason } from '@/utils/accountBlock'
 
 // 扩展端点类型,包含密钥列表
 interface ProviderEndpointWithKeys extends ProviderEndpoint {
@@ -2504,7 +2505,10 @@ function getOAuthStatusTitle(key: EndpointAPIKey): string {
   const status = getKeyOAuthExpires(key)
   if (!status) return ''
   if (status.isInvalid) {
-    return status.invalidReason ? `Token 已失效: ${status.invalidReason}` : 'Token 已失效'
+    const cleaned = status.invalidReason && isAccountLevelBlockReason(status.invalidReason)
+      ? cleanAccountBlockReason(status.invalidReason)
+      : status.invalidReason
+    return cleaned ? `Token 已失效: ${cleaned}` : 'Token 已失效'
   }
   if (status.isExpired) {
     return 'Token 已过期，请重新授权'

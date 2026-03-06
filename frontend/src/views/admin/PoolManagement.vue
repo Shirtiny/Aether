@@ -2307,7 +2307,10 @@ function getOAuthStatusTitle(key: PoolKeyDetail): string {
   const status = getKeyOAuthExpires(key)
   if (!status) return ''
   if (status.isInvalid) {
-    return status.invalidReason ? `Token 已失效: ${status.invalidReason}` : 'Token 已失效'
+    const cleaned = status.invalidReason && isAccountLevelBlockReason(status.invalidReason)
+      ? cleanAccountBlockReason(status.invalidReason)
+      : status.invalidReason
+    return cleaned ? `Token 已失效: ${cleaned}` : 'Token 已失效'
   }
   if (status.isExpired) {
     return 'Token 已过期，请重新授权'

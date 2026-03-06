@@ -437,7 +437,7 @@ const handleSubmit = async () => {
 
   loading.value = true
   try {
-    const payload = {
+    const basePayload = {
       name: form.value.name,
       provider_type: form.value.provider_type,
       description: form.value.description || undefined,
@@ -447,7 +447,6 @@ const handleSubmit = async () => {
       quota_reset_day: form.value.quota_reset_day,
       quota_last_reset_at: form.value.quota_last_reset_at || undefined,
       quota_expires_at: form.value.quota_expires_at || undefined,
-      provider_priority: form.value.provider_priority,
       keep_priority_on_conversion: form.value.keep_priority_on_conversion,
       is_active: form.value.is_active,
       // 请求配置
@@ -462,12 +461,15 @@ const handleSubmit = async () => {
 
     if (isEditMode.value && props.provider) {
       // 更新提供商
-      const updated = await updateProvider(props.provider.id, payload)
+      const updated = await updateProvider(props.provider.id, {
+        ...basePayload,
+        provider_priority: form.value.provider_priority,
+      })
       success('提供商更新成功')
       emit('providerUpdated', updated)
     } else {
-      // 创建提供商
-      await createProvider(payload)
+      // 创建提供商（优先级由后端自动置顶）
+      await createProvider(basePayload)
       success('提供商已创建，请继续添加端点和密钥，或在优先级管理中调整顺序', '创建成功')
       emit('providerCreated')
     }

@@ -115,3 +115,25 @@ def test_antigravity_oauth_reason_text_detected_as_disabled() -> None:
     assert state.blocked is True
     assert state.code == "account_disabled"
     assert state.label == "账号停用"
+
+
+def test_resolve_from_structured_oauth_reason_workspace_deactivated() -> None:
+    state = resolve_pool_account_state(
+        provider_type="codex",
+        upstream_metadata=None,
+        oauth_invalid_reason="[ACCOUNT_BLOCK] 工作区已停用 (deactivated_workspace)",
+    )
+    assert state.blocked is True
+    assert state.code == "workspace_deactivated"
+    assert state.label == "工作区停用"
+
+
+def test_resolve_from_structured_oauth_reason_token_invalidated() -> None:
+    state = resolve_pool_account_state(
+        provider_type="codex",
+        upstream_metadata=None,
+        oauth_invalid_reason="[OAUTH_EXPIRED] Your authentication token has been invalidated. Please try signing in again.",
+    )
+    assert state.blocked is True
+    assert state.code == "oauth_expired"
+    assert state.label == "Token 失效"

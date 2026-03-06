@@ -196,7 +196,7 @@ async def test_codex_refresher_http_401_marks_auth_invalid_and_disables(
     assert result["auto_disabled"] is True
     assert metadata_updates == {}
     assert state_updates["k1"]["is_active"] is False
-    assert "401" in str(state_updates["k1"]["oauth_invalid_reason"])
+    assert str(state_updates["k1"]["oauth_invalid_reason"]).startswith("[OAUTH_EXPIRED]")
 
 
 @pytest.mark.asyncio
@@ -847,3 +847,66 @@ async def test_kiro_refresher_success_updates_metadata_and_auth_config(
     assert state_updates["k1"]["oauth_invalid_at"] is None
     assert state_updates["k1"]["oauth_invalid_reason"] is None
     assert state_updates["k1"]["auth_config"].startswith("ENC:")
+
+
+@pytest.mark.asyncio
+async def test_codex_refresher_http_402_workspace_deactivated_marks_account_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.services.provider_keys.quota_refresh import codex_refresher as module
+
+    key = SimpleNamespace(
+        id="k1",
+        name="K1",
+        api_key="enc-key",
+        auth_type="oauth",
+        auth_config="enc-config",
+        proxy=None,
+    )
+    provider = SimpleNamespace(proxy=None)
+    endpoint = SimpleNamespace()
+    metadata_updates: dict[str, dict[str, Any]] = {}
+    state_updates: dict[str, dict[str, Any]] = {}
+
+    async def _fake_auth_info(_endpoint: Any, _key: Any) -> Any:
+        return None
+
+    _install_module(
+        monkeypatch,
+        "src.services.proxy_node.resolver",
+        {
+            "resolve_effective_proxy": lambda provider_proxy, key_proxy: None,
+            "build_proxy_client_kwargs": lambda proxy, timeout: {"timeout": timeout},
+        },
+    )
+    monkeypatch.setattr(module, "get_provider_auth", _fake_auth_info)
+    monkeypatch.setattr(
+        module.crypto_service,
+        "decrypt",
+        lambda value: (
+            "sk-test"
+            if value == "enc-key"
+            else json.dumps({"plan_type": "team", "account_id": "acc-1"})
+        ),
+    )
+    response = _FakeResponse(status_code=402, payload={"detail": {"code": "deactivated_workspace"}})
+    monkeypatch.setattr(
+        module.httpx, "AsyncClient", lambda **kwargs: _FakeAsyncClient(response, **kwargs)
+    )
+
+    result = await refresh_codex_key_quota(
+        db=cast(Any, _FakeDB()),
+        provider=cast(Any, provider),
+        key=cast(Any, key),
+        endpoint=cast(Any, endpoint),
+        codex_wham_usage_url="https://example.test",
+        metadata_updates=metadata_updates,
+        state_updates=state_updates,
+    )
+
+    assert result["status"] == "workspace_deactivated"
+    assert result["status_code"] == 402
+    assert metadata_updates["k1"]["codex"]["account_disabled"] is True
+    assert metadata_updates["k1"]["codex"]["reason"] == "deactivated_workspace"
+    assert state_updates["k1"]["oauth_invalid_at"] is not None
+    assert str(state_updates["k1"]["oauth_invalid_reason"]).startswith("[ACCOUNT_BLOCK]")

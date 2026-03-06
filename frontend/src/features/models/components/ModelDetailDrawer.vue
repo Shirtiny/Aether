@@ -165,7 +165,7 @@
                       </p>
                     </div>
                     <div class="p-3 rounded-lg border">
-                      <Label class="text-xs text-muted-foreground">缓存创建 ($/M)</Label>
+                      <Label class="text-xs text-muted-foreground">{{ getFirst1hCachePrice(model.default_tiered_pricing) !== '-' ? '5min 缓存创建 ($/M)' : '缓存创建 ($/M)' }}</Label>
                       <p class="text-sm font-mono mt-1">
                         {{ getFirstTierPrice(model.default_tiered_pricing, 'cache_creation_price_per_1m') }}
                       </p>
@@ -182,7 +182,7 @@
                     v-if="getFirst1hCachePrice(model.default_tiered_pricing) !== '-'"
                     class="flex items-center gap-3 p-3 rounded-lg border bg-muted/20"
                   >
-                    <Label class="text-xs text-muted-foreground whitespace-nowrap">1h 缓存</Label>
+                    <Label class="text-xs text-muted-foreground whitespace-nowrap">1h 缓存创建</Label>
                     <span class="text-sm font-mono">{{ getFirst1hCachePrice(model.default_tiered_pricing) }}</span>
                   </div>
                   <!-- 按次计费 -->

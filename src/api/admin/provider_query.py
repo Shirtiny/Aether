@@ -205,6 +205,7 @@ class TestModelFailoverRequest(BaseModel):
     mode: str  # "global" = 模拟外部请求(用全局模型名), "direct" = 直接测试(用provider_model_name)
     model_name: str  # global 模式传 global_model_name, direct 模式传 provider_model_name
     api_format: str | None = None  # 指定 API 格式（endpoint signature）
+    endpoint_id: str | None = None  # 指定仅使用该端点测试
     message: str | None = "Hello"
 
 
@@ -1124,6 +1125,7 @@ async def test_model(
 def _build_direct_test_candidates(
     provider: Provider,
     api_format: str | None = None,
+    endpoint_id: str | None = None,
 ) -> list[ProviderCandidate]:
     """
     为直接测试模式构建候选列表。
@@ -1134,6 +1136,8 @@ def _build_direct_test_candidates(
 
     candidates: list[ProviderCandidate] = []
     for endpoint in provider.endpoints or []:
+        if endpoint_id and str(getattr(endpoint, "id", "") or "") != str(endpoint_id):
+            continue
         if not getattr(endpoint, "is_active", False):
             continue
         ep_format = str(getattr(endpoint, "api_format", "") or "")
@@ -1159,6 +1163,21 @@ def _build_direct_test_candidates(
                 )
             )
     return candidates
+
+
+def _filter_test_candidates_by_endpoint(
+    candidates: list[ProviderCandidate],
+    endpoint_id: str | None,
+) -> list[ProviderCandidate]:
+    if not endpoint_id:
+        return list(candidates)
+
+    target_id = str(endpoint_id)
+    return [
+        candidate
+        for candidate in candidates
+        if str(getattr(getattr(candidate, "endpoint", None), "id", "") or "") == target_id
+    ]
 
 
 @router.post("/test-model-failover")
@@ -1198,6 +1217,19 @@ async def test_model_failover(
     # 2. 构建候选列表
     candidates = []
     gm_obj = None  # GlobalModel 对象，global 模式下用于 fallback 映射
+    endpoint_by_id = {
+        str(getattr(ep, "id", "") or ""): ep
+        for ep in (provider.endpoints or [])
+        if getattr(ep, "id", None)
+    }
+    requested_endpoint = None
+    if request.endpoint_id:
+        requested_endpoint = endpoint_by_id.get(str(request.endpoint_id))
+        if requested_endpoint is None:
+            raise HTTPException(status_code=404, detail="Endpoint not found")
+        ep_format = str(getattr(requested_endpoint, "api_format", "") or "")
+        if request.api_format and ep_format != request.api_format:
+            raise HTTPException(status_code=400, detail="endpoint_id does not match api_format")
 
     if request.mode == "global":
         # 模拟外部请求：走 CandidateBuilder 候选解析
@@ -1210,6 +1242,8 @@ async def test_model_failover(
 
         # 确定 client_format
         client_format = request.api_format
+        if not client_format and requested_endpoint is not None:
+            client_format = str(getattr(requested_endpoint, "api_format", "") or "")
         if not client_format:
             # 取第一个活跃端点的格式
             for ep in provider.endpoints or []:
@@ -1249,11 +1283,13 @@ async def test_model_failover(
         except Exception as e:
             logger.warning("[test-model-failover] CandidateBuilder failed: {}", e)
             candidates = []
+        candidates = _filter_test_candidates_by_endpoint(candidates, request.endpoint_id)
     else:
         # 直接测试：简单匹配 Endpoint + Key
         candidates = _build_direct_test_candidates(
             provider=provider,
             api_format=request.api_format,
+            endpoint_id=request.endpoint_id,
         )
 
     if not candidates:
