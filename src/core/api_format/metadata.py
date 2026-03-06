@@ -68,19 +68,6 @@ class EndpointDefinition:
                 yield value
 
 
-_CODEX_DEFAULT_BODY_RULES: tuple[dict[str, Any], ...] = (
-    {"action": "drop", "path": "max_output_tokens"},
-    {"action": "drop", "path": "temperature"},
-    {"action": "drop", "path": "top_p"},
-    {"action": "set", "path": "store", "value": False},
-    {
-        "action": "set",
-        "path": "instructions",
-        "value": "You are GPT-5.",
-        "condition": {"path": "instructions", "op": "not_exists"},
-    },
-)
-
 _ENDPOINT_DEFINITIONS: dict[tuple[ApiFamily, EndpointKind], EndpointDefinition] = {
     # Claude
     (ApiFamily.CLAUDE, EndpointKind.CHAT): EndpointDefinition(
@@ -138,7 +125,6 @@ _ENDPOINT_DEFINITIONS: dict[tuple[ApiFamily, EndpointKind], EndpointDefinition] 
         auth_type="bearer",
         protected_keys=frozenset({"authorization", "content-type"}),
         data_format_id="openai_responses",
-        default_body_rules=_CODEX_DEFAULT_BODY_RULES,
     ),
     (ApiFamily.OPENAI, EndpointKind.COMPACT): EndpointDefinition(
         api_family=ApiFamily.OPENAI,
@@ -311,11 +297,71 @@ def get_data_format_id_for_endpoint(
 
 def get_default_body_rules_for_endpoint(
     value: str | EndpointSignature | tuple[ApiFamily, EndpointKind],
+    *,
+    provider_type: str | None = None,
 ) -> list[dict[str, Any]]:
+    """获取端点的默认 body_rules。
+
+    优先查找 provider_type 维度的注册规则（如 Codex 对 openai:cli 的定制规则），
+    找不到时回退到 EndpointDefinition 上的通用默认规则。
+    """
+    # 确保 provider plugins 已注册（填充 _provider_default_body_rules）
+    # ensure_providers_bootstrapped 是幂等的，重复调用无副作用
+    if provider_type:
+        try:
+            from src.services.provider.envelope import ensure_providers_bootstrapped
+
+            ensure_providers_bootstrapped()
+        except Exception:
+            pass
+
+    # 1) provider_type 维度的注册规则优先
+    if provider_type:
+        pt = provider_type.strip().lower()
+        sig = _normalize_sig_key(value)
+        provider_rules = _provider_default_body_rules.get((pt, sig))
+        if provider_rules is not None:
+            return deepcopy(list(provider_rules))
+
+    # 2) 回退到 EndpointDefinition 上的通用默认规则
     definition = resolve_endpoint_definition(value)
     if not definition or not definition.default_body_rules:
         return []
     return deepcopy(list(definition.default_body_rules))
+
+
+# ---------------------------------------------------------------------------
+# Provider-scoped default body rules registry
+# ---------------------------------------------------------------------------
+# key: (provider_type, endpoint_sig_key)  e.g. ("codex", "openai:cli")
+_provider_default_body_rules: dict[tuple[str, str], Sequence[dict[str, Any]]] = {}
+
+
+def register_provider_default_body_rules(
+    provider_type: str,
+    endpoint_sig: str,
+    rules: Sequence[dict[str, Any]],
+) -> None:
+    """注册特定 provider_type + endpoint_sig 的默认 body_rules。"""
+    pt = provider_type.strip().lower()
+    sig = _normalize_sig_key(endpoint_sig)
+    _provider_default_body_rules[(pt, sig)] = tuple(rules)
+
+
+def _normalize_sig_key(
+    value: str | EndpointSignature | tuple[ApiFamily, EndpointKind],
+) -> str:
+    """将各种端点标识形式归一化为 signature key 字符串。"""
+    if isinstance(value, str):
+        try:
+            return parse_signature_key(value).key
+        except Exception:
+            return value.strip().lower()
+    if isinstance(value, EndpointSignature):
+        return value.key
+    if isinstance(value, tuple) and len(value) == 2:
+        return make_signature_key(value[0], value[1])
+    return str(value).strip().lower()
 
 
 def can_passthrough_endpoint(

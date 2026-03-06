@@ -141,10 +141,13 @@ async def create_provider_endpoint(
 async def get_default_endpoint_body_rules(
     api_format: str,
     request: Request,
+    provider_type: str | None = None,
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     """获取指定 endpoint signature 的默认 body_rules。"""
-    adapter = AdminGetDefaultBodyRulesAdapter(api_format=api_format)
+    adapter = AdminGetDefaultBodyRulesAdapter(
+        api_format=api_format, provider_type=provider_type or None
+    )
     return await pipeline.run(adapter=adapter, http_request=request, db=db, mode=adapter.mode)
 
 
@@ -308,7 +311,7 @@ class AdminCreateProviderEndpointAdapter(AdminApiAdapter):
             raise NotFoundException(f"Provider {self.provider_id} 不存在")
 
         # 固定类型 Provider：禁止通过该接口新增 Endpoints（端点由模板自动创建并锁定）
-        provider_type = getattr(provider, "provider_type", "custom")
+        provider_type = getattr(provider, "provider_type", None) or "custom"
         if _is_fixed_provider(provider_type):
             raise InvalidRequestException("固定类型 Provider 不允许手动新增 Endpoint")
 
@@ -338,7 +341,12 @@ class AdminCreateProviderEndpointAdapter(AdminApiAdapter):
         normalized_api_format = sig.key
         body_rules = self.endpoint_data.body_rules
         if body_rules is None:
-            body_rules = get_default_body_rules_for_endpoint(normalized_api_format) or None
+            body_rules = (
+                get_default_body_rules_for_endpoint(
+                    normalized_api_format, provider_type=provider_type
+                )
+                or None
+            )
 
         new_endpoint = ProviderEndpoint(
             id=str(uuid.uuid4()),
@@ -613,6 +621,7 @@ class AdminDeleteProviderEndpointAdapter(AdminApiAdapter):
 @dataclass
 class AdminGetDefaultBodyRulesAdapter(AdminApiAdapter):
     api_format: str
+    provider_type: str | None = None
 
     async def handle(self, context: ApiRequestContext) -> Any:  # type: ignore[override]
         try:
@@ -622,5 +631,7 @@ class AdminGetDefaultBodyRulesAdapter(AdminApiAdapter):
 
         return {
             "api_format": normalized_api_format,
-            "body_rules": get_default_body_rules_for_endpoint(normalized_api_format),
+            "body_rules": get_default_body_rules_for_endpoint(
+                normalized_api_format, provider_type=self.provider_type
+            ),
         }

@@ -112,6 +112,13 @@ class TunnelConnection:
         raise TunnelStreamError("stream ID space exhausted")
 
     def cancel_all_streams(self) -> None:
+        if self._pending_streams:
+            logger.warning(
+                "tunnel cancel_all_streams: node_id={}, name={}, count={}",
+                self.node_id,
+                self.node_name,
+                len(self._pending_streams),
+            )
         for state in self._pending_streams.values():
             state.set_error("tunnel disconnected")
         self._pending_streams.clear()
@@ -169,17 +176,37 @@ class _StreamState:
             raise TunnelStreamError(self._error)
 
     async def iter_body(self, chunk_timeout: float = 60.0) -> AsyncGenerator[bytes, None]:
+        chunks_received = 0
+        total_bytes = 0
         while True:
             try:
                 chunk = await asyncio.wait_for(self._body_chunks.get(), timeout=chunk_timeout)
             except asyncio.TimeoutError:
                 self._error = "body chunk timeout"
                 self._done_event.set()
+                logger.warning(
+                    "tunnel stream body chunk timeout: stream_id={}, "
+                    "chunk_timeout={:.0f}s, chunks_received={}, total_bytes={}",
+                    self.stream_id,
+                    chunk_timeout,
+                    chunks_received,
+                    total_bytes,
+                )
                 raise TunnelStreamError("body chunk timeout")
             if chunk is None:
                 if self._error:
+                    logger.warning(
+                        "tunnel stream ended with error: stream_id={}, error={}, "
+                        "chunks_received={}, total_bytes={}",
+                        self.stream_id,
+                        self._error,
+                        chunks_received,
+                        total_bytes,
+                    )
                     raise TunnelStreamError(self._error)
                 return
+            chunks_received += 1
+            total_bytes += len(chunk)
             yield chunk
 
 
@@ -439,6 +466,12 @@ class TunnelManager:
         elif frame.msg_type == MsgType.STREAM_ERROR:
             if stream:
                 msg = frame.payload.decode(errors="replace") if frame.payload else "stream error"
+                logger.warning(
+                    "tunnel received STREAM_ERROR: node={}, stream_id={}, message={}",
+                    conn.node_name,
+                    frame.stream_id,
+                    msg[:500],
+                )
                 stream.set_error(msg)
                 conn.remove_stream(frame.stream_id)
 

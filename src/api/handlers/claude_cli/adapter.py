@@ -122,7 +122,12 @@ class ClaudeCliAdapter(CliAdapterBase):
 
     @classmethod
     def build_endpoint_url(
-        cls, base_url: str, request_data: dict[str, Any], model_name: str | None = None
+        cls,
+        base_url: str,
+        request_data: dict[str, Any],
+        model_name: str | None = None,
+        *,
+        provider_type: str | None = None,
     ) -> str:
         """构建Claude CLI API端点URL"""
         base_url = base_url.rstrip("/")

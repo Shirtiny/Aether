@@ -2,30 +2,68 @@
   <Dialog
     :model-value="modelValue"
     title="号池调度"
-    description="拖拽排序调度维度，越靠前优先级越高"
+    description="管理号池内 Key 的分配模式和排序偏好"
     size="lg"
     @update:model-value="emit('update:modelValue', $event)"
   >
-    <div class="space-y-5">
-      <!-- Preset List -->
+    <div class="space-y-6">
+      <!-- Section 1: 分配模式 (distribution_mode 互斥组, 四选一) -->
       <div class="space-y-3">
         <div class="space-y-1">
           <h3 class="text-sm font-medium border-b pb-2">
-            调度维度
+            分配模式
           </h3>
           <p class="text-xs text-muted-foreground">
-            拖拽排序，越靠前优先级越高。不适用当前 Provider 类型的维度已禁用。
+            控制 Key 的基础分配方式，选择一种模式。
+          </p>
+        </div>
+
+        <div class="flex gap-0.5 p-1 bg-muted/40 rounded-lg">
+          <button
+            v-for="{ index, item } in distributionItems"
+            :key="item.preset"
+            type="button"
+            class="flex-1 px-3 py-2 text-sm font-medium rounded-md transition-all duration-200"
+            :disabled="!item.applicable"
+            :class="[
+              activeDistributionPreset === item.preset
+                ? 'bg-primary text-primary-foreground shadow-sm'
+                : item.applicable
+                  ? 'text-muted-foreground hover:text-foreground hover:bg-background/60'
+                  : 'text-muted-foreground/40 cursor-not-allowed'
+            ]"
+            @click="item.applicable && selectDistribution(index, item.preset)"
+          >
+            {{ item.label }}
+          </button>
+        </div>
+
+        <p
+          v-if="activeDistributionDesc"
+          class="text-xs text-muted-foreground px-1"
+        >
+          {{ activeDistributionDesc }}
+        </p>
+      </div>
+
+      <!-- Section 2: 策略调度 (非互斥, 可叠加组合 + 拖拽排序) -->
+      <div class="space-y-3">
+        <div class="space-y-1">
+          <h3 class="text-sm font-medium border-b pb-2">
+            策略调度
+          </h3>
+          <p class="text-xs text-muted-foreground">
+            在分配模式基础上叠加排序因素，可组合启用，拖拽调整优先级。
           </p>
         </div>
 
         <div class="space-y-0.5">
           <div
-            v-for="(item, index) in presetList"
-            v-show="!isMutexFollower(index)"
+            v-for="{ index, item } in strategyItems"
             :key="item.preset"
             class="group flex items-center gap-3 px-3 py-2.5 rounded-lg border transition-all duration-200"
             :class="[
-              !displayItems[index].applicable
+              !item.applicable
                 ? 'border-border/30 bg-muted/20 opacity-50'
                 : draggedIndex === index
                   ? 'border-primary/50 bg-primary/5 shadow-md scale-[1.01]'
@@ -33,45 +71,24 @@
                     ? 'border-primary/30 bg-primary/5'
                     : 'border-border/50 bg-background hover:border-border hover:bg-muted/30'
             ]"
-            :draggable="canDragPreset(index)"
-            @dragstart="canDragPreset(index) && handleDragStart(index, $event)"
+            :draggable="item.applicable"
+            @dragstart="item.applicable && handleDragStart(index, $event)"
             @dragend="handleDragEnd"
-            @dragover.prevent="canDragPreset(index) && handleDragOver(index)"
+            @dragover.prevent="item.applicable && handleDragOver(index)"
             @dragleave="handleDragLeave"
-            @drop="canDragPreset(index) && handleDrop(index)"
+            @drop="item.applicable && handleDrop(index)"
           >
             <!-- Drag handle -->
             <div
               class="p-1 rounded transition-colors shrink-0"
-              :class="canDragPreset(index)
+              :class="item.applicable
                 ? 'cursor-grab active:cursor-grabbing text-muted-foreground/40 group-hover:text-muted-foreground'
                 : 'text-muted-foreground/15 cursor-default'"
             >
               <GripVertical class="w-4 h-4" />
             </div>
 
-            <template v-if="item.mutexGroup">
-              <div class="flex gap-0.5 p-0.5 bg-muted/40 rounded-md shrink-0">
-                <button
-                  v-for="member in getMutexGroupItems(index)"
-                  :key="member.preset"
-                  type="button"
-                  class="px-2.5 py-1 text-xs font-medium rounded transition-all"
-                  :disabled="!member.applicable"
-                  :class="[
-                    member.preset === displayItems[index].preset
-                      ? 'bg-primary text-primary-foreground shadow-sm'
-                      : 'text-muted-foreground hover:text-foreground hover:bg-background/50',
-                    !member.applicable ? 'opacity-40 cursor-not-allowed' : ''
-                  ]"
-                  @click="selectMutexPreset(index, member.preset)"
-                >
-                  {{ member.label }}
-                </button>
-              </div>
-            </template>
             <Switch
-              v-else
               :model-value="item.enabled"
               :disabled="!item.applicable"
               @update:model-value="(v: boolean) => togglePreset(index, v)"
@@ -82,41 +99,33 @@
               <div class="flex items-center gap-2">
                 <span
                   class="text-sm font-medium"
-                  :class="!displayItems[index].applicable ? 'text-muted-foreground' : ''"
-                >{{ displayItems[index].label }}</span>
+                  :class="!item.applicable ? 'text-muted-foreground' : ''"
+                >{{ item.label }}</span>
                 <span
-                  v-if="!displayItems[index].applicable"
+                  v-if="!item.applicable"
                   class="text-[10px] text-muted-foreground/60"
-                >
-                  (不适用)
-                </span>
+                >(不适用)</span>
               </div>
               <p class="text-xs text-muted-foreground mt-0.5">
-                {{ displayItems[index].desc }}
-              </p>
-              <p
-                v-if="displayItems[index].evidenceHint"
-                class="text-[11px] text-muted-foreground/80 mt-1"
-              >
-                依据: {{ displayItems[index].evidenceHint }}
+                {{ item.desc }}
               </p>
 
               <!-- Mode sub-config -->
               <div
-                v-if="displayItems[index].modeOptions.length > 0 && displayItems[index].enabled && displayItems[index].applicable"
+                v-if="item.modeOptions.length > 0 && item.enabled && item.applicable"
                 class="flex gap-0.5 mt-2 p-0.5 bg-muted/40 rounded-md w-fit"
               >
                 <button
-                  v-for="modeOpt in displayItems[index].modeOptions"
+                  v-for="modeOpt in item.modeOptions"
                   :key="modeOpt.value"
                   type="button"
                   class="px-2.5 py-1 text-xs font-medium rounded transition-all"
                   :class="[
-                    displayItems[index].mode === modeOpt.value
+                    item.mode === modeOpt.value
                       ? 'bg-primary text-primary-foreground shadow-sm'
                       : 'text-muted-foreground hover:text-foreground hover:bg-background/50'
                   ]"
-                  @click="setPresetModeByPreset(displayItems[index].preset, modeOpt.value)"
+                  @click="setPresetModeByPreset(item.preset, modeOpt.value)"
                 >
                   {{ modeOpt.label }}
                 </button>
@@ -189,29 +198,75 @@ const emit = defineEmits<{
   saved: [provider: ProviderWithEndpointsSummary]
 }>()
 
+const DISTRIBUTION_GROUP = 'distribution_mode'
+
 const FALLBACK_PRESET_DEFS: PoolPresetMeta[] = [
+  {
+    name: 'cache_affinity',
+    label: '缓存亲和',
+    description: '优先复用最近使用过的 Key，利用 Prompt Caching',
+    mutex_group: DISTRIBUTION_GROUP,
+    evidence_hint: '依据 LRU 时间戳（最近使用优先，与 LRU 轮转相反）',
+    providers: [],
+    modes: null,
+    default_mode: null,
+  },
   {
     name: 'lru',
     label: 'LRU 轮转',
     description: '最久未使用的 Key 优先',
-    mutex_group: 'distribution_mode',
+    mutex_group: DISTRIBUTION_GROUP,
     evidence_hint: '依据 LRU 时间戳（最近未使用优先）',
     providers: [],
     modes: null,
     default_mode: null,
   },
   {
-    name: 'free_team_first',
-    label: 'Free/Team 优先',
-    description: '优先消耗低档账号（依赖 plan_type）',
-    evidence_hint: '依据 plan_type（oauth_plan_type 或 upstream_metadata）',
+    name: 'single_account',
+    label: '单号优先',
+    description: '集中使用同一账号（反向 LRU）',
+    mutex_group: DISTRIBUTION_GROUP,
+    evidence_hint: '先按账号优先级（internal_priority），同级再按反向 LRU 集中',
+    providers: [],
+    modes: null,
+    default_mode: null,
+  },
+  {
+    name: 'load_balance',
+    label: '负载均衡',
+    description: '随机分散 Key 使用，均匀分摊负载',
+    mutex_group: DISTRIBUTION_GROUP,
+    evidence_hint: '每次随机分值，实现完全均匀分散',
+    providers: [],
+    modes: null,
+    default_mode: null,
+  },
+  {
+    name: 'free_first',
+    label: 'Free 优先',
+    description: '优先消耗 Free 账号（依赖 plan_type）',
+    evidence_hint: '依据 plan_type（Free 账号优先调度）',
     providers: ['codex', 'kiro'],
-    modes: [
-      { value: 'free_only', label: 'Free' },
-      { value: 'team_only', label: 'Team' },
-      { value: 'both', label: '全部' },
-    ],
-    default_mode: 'both',
+    modes: null,
+    default_mode: null,
+  },
+  {
+    name: 'team_first',
+    label: 'Team 优先',
+    description: '优先消耗 Team 账号（依赖 plan_type）',
+    evidence_hint: '依据 plan_type（Team 账号优先调度）',
+    providers: ['codex', 'kiro'],
+    modes: null,
+    default_mode: null,
+  },
+  {
+    name: 'plus_first',
+    label: 'Plus 优先',
+    description: '优先消耗 Plus/Pro 账号（依赖 plan_type）',
+    evidence_hint: '依据 plan_type（Plus/Pro 账号优先调度）',
+    providers: ['codex', 'kiro'],
+    modes: null,
+    default_mode: null,
   },
   {
     name: 'quota_balanced',
@@ -228,16 +283,6 @@ const FALLBACK_PRESET_DEFS: PoolPresetMeta[] = [
     description: '优先选即将刷新额度的账号',
     evidence_hint: '依据账号额度重置倒计时（next_reset / reset_seconds）',
     providers: ['codex', 'kiro'],
-    modes: null,
-    default_mode: null,
-  },
-  {
-    name: 'single_account',
-    label: '单号优先',
-    description: '集中使用同一账号（反向 LRU）',
-    mutex_group: 'distribution_mode',
-    evidence_hint: '先按账号优先级（internal_priority），同级再按反向 LRU 集中',
-    providers: [],
     modes: null,
     default_mode: null,
   },
@@ -279,7 +324,7 @@ const FALLBACK_PRESET_DEFS: PoolPresetMeta[] = [
   },
 ]
 
-const DEFAULT_ENABLED_PRESETS = new Set(['lru', 'quota_balanced'])
+const DEFAULT_ENABLED_PRESETS = new Set(['cache_affinity', 'quota_balanced'])
 
 const { success, error: showError } = useToast()
 const loading = ref(false)
@@ -308,6 +353,8 @@ function normalizeMutexGroup(value: unknown): string | null {
   const normalized = String(value ?? '').trim().toLowerCase()
   return normalized || null
 }
+
+const FALLBACK_ORDER = FALLBACK_PRESET_DEFS.map(d => d.name)
 
 function normalizePresetDefs(defs: PoolPresetMeta[]): PoolPresetMeta[] {
   const ordered: PoolPresetMeta[] = []
@@ -339,6 +386,12 @@ function normalizePresetDefs(defs: PoolPresetMeta[]): PoolPresetMeta[] {
       evidence_hint: String(raw.evidence_hint ?? '').trim() || null,
     })
   }
+  // Re-order by FALLBACK_PRESET_DEFS order; unknown presets go to the end.
+  ordered.sort((a, b) => {
+    const ia = FALLBACK_ORDER.indexOf(a.name)
+    const ib = FALLBACK_ORDER.indexOf(b.name)
+    return (ia === -1 ? 9999 : ia) - (ib === -1 ? 9999 : ib)
+  })
   return ordered
 }
 
@@ -394,18 +447,22 @@ function defaultModeForPreset(def: PoolPresetMeta): string | null {
   return options[0].value
 }
 
-function buildDefaultPresetList(): PresetListItem[] {
-  return getPresetDefs().map(def => ({
+function buildPresetListItem(def: PoolPresetMeta, enabled: boolean, mode?: unknown): PresetListItem {
+  return {
     preset: def.name,
     label: def.label,
     desc: def.description,
-    enabled: DEFAULT_ENABLED_PRESETS.has(def.name),
-    mode: defaultModeForPreset(def),
+    enabled,
+    mode: mode !== undefined ? resolveMode(def, mode) : defaultModeForPreset(def),
     modeOptions: getModeOptions(def),
     applicable: isApplicablePreset(def),
     mutexGroup: normalizeMutexGroup(def.mutex_group),
     evidenceHint: String(def.evidence_hint ?? '').trim(),
-  }))
+  }
+}
+
+function buildDefaultPresetList(): PresetListItem[] {
+  return getPresetDefs().map(def => buildPresetListItem(def, DEFAULT_ENABLED_PRESETS.has(def.name)))
 }
 
 function isNewFormatPresetItem(item: unknown): item is SchedulingPresetItem {
@@ -420,6 +477,68 @@ function resolveMode(def: PoolPresetMeta, mode: unknown): string | null {
     return normalized
   }
   return defaultModeForPreset(def)
+}
+
+function insertMissingByPreferredOrder(
+  ordered: PresetListItem[],
+  seen: Set<string>,
+  defs: PoolPresetMeta[],
+  defsByName: Map<string, PoolPresetMeta>,
+) {
+  // Insert missing presets at their preferred position from FALLBACK_ORDER
+  // rather than appending to the end.
+  for (const name of FALLBACK_ORDER) {
+    if (seen.has(name)) continue
+    const def = defsByName.get(name)
+    if (!def) continue
+    seen.add(name)
+    const item = buildPresetListItem(def, false)
+    // Find the best insertion point: right after the last item whose
+    // FALLBACK_ORDER index is smaller than ours.
+    const myIdx = FALLBACK_ORDER.indexOf(name)
+    let insertAt = ordered.length
+    for (let i = ordered.length - 1; i >= 0; i--) {
+      const peerIdx = FALLBACK_ORDER.indexOf(ordered[i].preset)
+      if (peerIdx !== -1 && peerIdx < myIdx) {
+        insertAt = i + 1
+        break
+      }
+      if (i === 0) insertAt = 0
+    }
+    ordered.splice(insertAt, 0, item)
+  }
+  // Any remaining defs not in FALLBACK_ORDER go to the end.
+  for (const def of defs) {
+    if (seen.has(def.name)) continue
+    seen.add(def.name)
+    ordered.push(buildPresetListItem(def, false))
+  }
+}
+
+function reorderDistributionGroup(items: PresetListItem[]): PresetListItem[] {
+  // Distribution mode items are rendered as a fixed button group,
+  // so their order should always match FALLBACK_ORDER regardless of saved config.
+  const distIndexes: number[] = []
+  const distItems: PresetListItem[] = []
+  items.forEach((item, i) => {
+    if (item.mutexGroup === DISTRIBUTION_GROUP) {
+      distIndexes.push(i)
+      distItems.push(item)
+    }
+  })
+  if (distItems.length <= 1) return items
+
+  distItems.sort((a, b) => {
+    const ia = FALLBACK_ORDER.indexOf(a.preset)
+    const ib = FALLBACK_ORDER.indexOf(b.preset)
+    return (ia === -1 ? 9999 : ia) - (ib === -1 ? 9999 : ib)
+  })
+
+  const result = [...items]
+  distIndexes.forEach((origIdx, i) => {
+    result[origIdx] = distItems[i]
+  })
+  return result
 }
 
 function loadFromConfig(cfg: PoolAdvancedConfig | null): PresetListItem[] {
@@ -450,34 +569,11 @@ function loadFromConfig(cfg: PoolAdvancedConfig | null): PresetListItem[] {
       const def = defsByName.get(presetName)
       if (!def || seen.has(presetName)) continue
       seen.add(presetName)
-      ordered.push({
-        preset: presetName,
-        label: def.label,
-        desc: def.description,
-        enabled: ci.enabled !== false,
-        mode: resolveMode(def, ci.mode),
-        modeOptions: getModeOptions(def),
-        applicable: isApplicablePreset(def),
-        mutexGroup: normalizeMutexGroup(def.mutex_group),
-        evidenceHint: String(def.evidence_hint ?? '').trim(),
-      })
+      ordered.push(buildPresetListItem(def, ci.enabled !== false, ci.mode))
     }
 
-    for (const def of defs) {
-      if (seen.has(def.name)) continue
-      ordered.push({
-        preset: def.name,
-        label: def.label,
-        desc: def.description,
-        enabled: false,
-        mode: defaultModeForPreset(def),
-        modeOptions: getModeOptions(def),
-        applicable: isApplicablePreset(def),
-        mutexGroup: normalizeMutexGroup(def.mutex_group),
-        evidenceHint: String(def.evidence_hint ?? '').trim(),
-      })
-    }
-    return ordered
+    insertMissingByPreferredOrder(ordered, seen, defs, defsByName)
+    return reorderDistributionGroup(ordered)
   }
 
   const legacyPresets = rawPresets as string[]
@@ -487,17 +583,7 @@ function loadFromConfig(cfg: PoolAdvancedConfig | null): PresetListItem[] {
 
   const lruDef = defsByName.get('lru')
   if (lruDef) {
-    ordered.push({
-      preset: 'lru',
-      label: lruDef.label,
-      desc: lruDef.description,
-      enabled: lruEnabled,
-      mode: null,
-      modeOptions: [],
-      applicable: isApplicablePreset(lruDef),
-      mutexGroup: normalizeMutexGroup(lruDef.mutex_group),
-      evidenceHint: String(lruDef.evidence_hint ?? '').trim(),
-    })
+    ordered.push(buildPresetListItem(lruDef, lruEnabled))
     seen.add('lru')
   }
 
@@ -506,34 +592,11 @@ function loadFromConfig(cfg: PoolAdvancedConfig | null): PresetListItem[] {
     const def = defsByName.get(presetName)
     if (!def || seen.has(presetName)) continue
     seen.add(presetName)
-    ordered.push({
-      preset: presetName,
-      label: def.label,
-      desc: def.description,
-      enabled: true,
-      mode: resolveMode(def, undefined),
-      modeOptions: getModeOptions(def),
-      applicable: isApplicablePreset(def),
-      mutexGroup: normalizeMutexGroup(def.mutex_group),
-      evidenceHint: String(def.evidence_hint ?? '').trim(),
-    })
+    ordered.push(buildPresetListItem(def, true, undefined))
   }
 
-  for (const def of defs) {
-    if (seen.has(def.name)) continue
-    ordered.push({
-      preset: def.name,
-      label: def.label,
-      desc: def.description,
-      enabled: false,
-      mode: defaultModeForPreset(def),
-      modeOptions: getModeOptions(def),
-      applicable: isApplicablePreset(def),
-      mutexGroup: normalizeMutexGroup(def.mutex_group),
-      evidenceHint: String(def.evidence_hint ?? '').trim(),
-    })
-  }
-  return ordered
+  insertMissingByPreferredOrder(ordered, seen, defs, defsByName)
+  return reorderDistributionGroup(ordered)
 }
 
 function normalizeMutexSelection(items: PresetListItem[]): PresetListItem[] {
@@ -565,26 +628,15 @@ function normalizeMutexSelection(items: PresetListItem[]): PresetListItem[] {
 function togglePreset(index: number, enabled: boolean) {
   const item = presetList.value[index]
   if (!item) return
-  if (!item.mutexGroup) {
-    item.enabled = enabled
-    return
-  }
+  item.enabled = enabled
+}
 
-  const memberIndexes = getMutexGroupIndexes(index)
-  if (enabled) {
-    for (const memberIndex of memberIndexes) {
-      const member = presetList.value[memberIndex]
-      if (!member) continue
-      member.enabled = member.preset === item.preset && member.applicable
+function selectDistribution(_anchorIndex: number, presetName: string) {
+  presetList.value.forEach(item => {
+    if (item.mutexGroup === DISTRIBUTION_GROUP) {
+      item.enabled = item.preset === presetName && item.applicable
     }
-    return
-  }
-
-  for (const memberIndex of memberIndexes) {
-    const member = presetList.value[memberIndex]
-    if (!member) continue
-    member.enabled = false
-  }
+  })
 }
 
 function setPresetModeByPreset(preset: string, mode: string) {
@@ -593,78 +645,35 @@ function setPresetModeByPreset(preset: string, mode: string) {
   presetList.value[targetIndex].mode = mode
 }
 
-const mutexGroupIndexMap = computed<Record<string, number[]>>(() => {
-  const grouped: Record<string, number[]> = {}
+const distributionItems = computed(() => {
+  const items: { index: number; item: PresetListItem }[] = []
   presetList.value.forEach((item, index) => {
-    if (!item.mutexGroup) return
-    if (!grouped[item.mutexGroup]) grouped[item.mutexGroup] = []
-    grouped[item.mutexGroup].push(index)
+    if (item.mutexGroup === DISTRIBUTION_GROUP) {
+      items.push({ index, item })
+    }
   })
-  return grouped
+  return items
 })
 
-function getMutexGroupIndexes(index: number): number[] {
-  const item = presetList.value[index]
-  if (!item?.mutexGroup) return []
-  return mutexGroupIndexMap.value[item.mutexGroup] || []
-}
+const activeDistributionPreset = computed(() => {
+  const found = distributionItems.value.find(({ item }) => item.enabled && item.applicable)
+  return found?.item.preset ?? null
+})
 
-function isMutexFollower(index: number): boolean {
-  const memberIndexes = getMutexGroupIndexes(index)
-  if (memberIndexes.length <= 1) return false
-  return memberIndexes[0] !== index
-}
+const activeDistributionDesc = computed(() => {
+  const found = distributionItems.value.find(({ item }) => item.enabled && item.applicable)
+  return found?.item.desc ?? null
+})
 
-function getMutexGroupItems(index: number): PresetListItem[] {
-  return getMutexGroupIndexes(index)
-    .map(memberIndex => presetList.value[memberIndex])
-    .filter((item): item is PresetListItem => Boolean(item))
-}
-
-function getMutexSelectedItem(index: number): PresetListItem | null {
-  const members = getMutexGroupItems(index)
-  if (members.length === 0) return null
-  return members.find(member => member.enabled && member.applicable)
-    || members.find(member => member.applicable)
-    || members[0]
-}
-
-function selectMutexPreset(index: number, presetName: string) {
-  const memberIndexes = getMutexGroupIndexes(index)
-  if (memberIndexes.length === 0) return
-  for (const memberIndex of memberIndexes) {
-    const member = presetList.value[memberIndex]
-    if (!member) continue
-    member.enabled = member.preset === presetName && member.applicable
-  }
-}
-
-function canDragPreset(index: number): boolean {
-  const item = presetList.value[index]
-  if (!item) return false
-  if (item.mutexGroup) return false
-  return item.applicable
-}
-
-const EMPTY_DISPLAY_ITEM: PresetListItem = {
-  preset: '',
-  label: '',
-  desc: '',
-  enabled: false,
-  mode: null,
-  modeOptions: [],
-  applicable: false,
-  mutexGroup: null,
-  evidenceHint: '',
-}
-
-const displayItems = computed<PresetListItem[]>(() =>
-  presetList.value.map((item, index) => {
-    if (!item) return EMPTY_DISPLAY_ITEM
-    if (!item.mutexGroup) return item
-    return getMutexSelectedItem(index) || item
-  }),
-)
+const strategyItems = computed(() => {
+  const items: { index: number; item: PresetListItem }[] = []
+  presetList.value.forEach((item, index) => {
+    if (!item.mutexGroup) {
+      items.push({ index, item })
+    }
+  })
+  return items
+})
 
 function handleDragStart(index: number, event: DragEvent) {
   draggedIndex.value = index
@@ -722,7 +731,6 @@ async function handleSave() {
       return result
     })
 
-    // 合并已有配置，仅覆盖 scheduling_presets，保留其他字段
     const mergedAdvanced: Record<string, unknown> = {
       ...(props.currentConfig ?? {}),
       scheduling_presets: schedulingPresets,
@@ -731,6 +739,7 @@ async function handleSave() {
       pool_advanced: mergedAdvanced as PoolAdvancedConfig,
     }
     const updatedProvider = await updateProvider(props.providerId, payload)
+
     success('号池调度已保存')
     emit('saved', updatedProvider)
     emit('update:modelValue', false)

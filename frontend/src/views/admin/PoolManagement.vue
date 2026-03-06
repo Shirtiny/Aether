@@ -485,14 +485,6 @@
                         </span>
                       </template>
                       <Badge
-                        v-if="getAccountAlertLabel(key)"
-                        variant="destructive"
-                        class="text-[9px] px-1 py-0 h-4 shrink-0"
-                        :title="getAccountAlertTitle(key)"
-                      >
-                        {{ getAccountAlertLabel(key) }}
-                      </Badge>
-                      <Badge
                         v-if="key.oauth_plan_type"
                         variant="outline"
                         class="text-[9px] px-1 py-0 h-4 shrink-0"
@@ -795,14 +787,6 @@
                     </span>
                   </template>
                   <Badge
-                    v-if="getAccountAlertLabel(key)"
-                    variant="destructive"
-                    class="text-[9px] px-1 py-0 h-4 shrink-0"
-                    :title="getAccountAlertTitle(key)"
-                  >
-                    {{ getAccountAlertLabel(key) }}
-                  </Badge>
-                  <Badge
                     v-if="key.oauth_plan_type"
                     variant="outline"
                     class="text-[9px] px-1 py-0 h-4 shrink-0"
@@ -1083,9 +1067,11 @@
     <KeyFormDialog
       v-if="selectedProviderId"
       :open="keyFormDialogOpen"
+      :endpoint="null"
       :provider-type="selectedProviderData?.provider_type || selectedProviderType"
       :editing-key="editingKey"
       :provider-id="selectedProviderId"
+      :available-api-formats="selectedProviderData?.api_formats || []"
       @close="closeKeyFormDialog"
       @saved="handleDialogSaved"
     />
@@ -1977,6 +1963,7 @@ async function handleRefreshOAuth(key: PoolKeyDetail) {
     await loadKeys()
   } catch (err) {
     showError(parseApiError(err, 'Token 刷新失败'))
+    await loadKeys()
   } finally {
     refreshingOAuthKeyId.value = null
   }

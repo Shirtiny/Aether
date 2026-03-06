@@ -309,11 +309,12 @@ class HandlerAdapterBase(ApiAdapter):
         request_data: dict[str, Any] | None = None,
         *,
         base_url: str | None = None,
+        provider_type: str | None = None,
     ) -> dict[str, Any]:
         """构建测试请求体，使用转换器注册表自动处理格式转换"""
         from src.api.handlers.base.request_builder import build_test_request_body
 
-        _ = base_url
+        _ = base_url, provider_type
         return build_test_request_body(cls.FORMAT_ID, request_data)
 
     @classmethod
@@ -408,10 +409,12 @@ class HandlerAdapterBase(ApiAdapter):
                 decrypted_auth_config=effective_auth_config,
             )
         else:
-            url = cls.build_endpoint_url(base_url, request_data, model_name)
+            url = cls.build_endpoint_url(
+                base_url, request_data, model_name, provider_type=provider_type
+            )
 
         # ---- Headers ----
-        cli_extra = cls.get_cli_extra_headers(base_url=base_url)
+        cli_extra = cls.get_cli_extra_headers(base_url=base_url, provider_type=provider_type)
         merged_extra = dict(extra_headers) if extra_headers else {}
         merged_extra.update(cli_extra)
 
@@ -458,7 +461,7 @@ class HandlerAdapterBase(ApiAdapter):
                 headers["Authorization"] = f"Bearer {api_key}"
 
         # ---- Body ----
-        body = cls.build_request_body(request_data, base_url=base_url)
+        body = cls.build_request_body(request_data, base_url=base_url, provider_type=provider_type)
 
         if body_rules:
             body = apply_body_rules(body, body_rules)
@@ -536,6 +539,8 @@ class HandlerAdapterBase(ApiAdapter):
         base_url: str,
         request_data: dict[str, Any] | None = None,
         model_name: str | None = None,
+        *,
+        provider_type: str | None = None,
     ) -> str:
         """构建 API 端点 URL - 子类应覆盖"""
         return base_url
@@ -546,7 +551,9 @@ class HandlerAdapterBase(ApiAdapter):
         return None
 
     @classmethod
-    def get_cli_extra_headers(cls, *, base_url: str | None = None) -> dict[str, str]:
+    def get_cli_extra_headers(
+        cls, *, base_url: str | None = None, provider_type: str | None = None
+    ) -> dict[str, str]:
         """获取额外请求头 - 子类可覆盖"""
         headers: dict[str, str] = {}
         cli_user_agent = cls.get_cli_user_agent()

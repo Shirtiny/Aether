@@ -131,6 +131,8 @@ class HubConnectionManager:
     def _start_reconnect_loop(self) -> None:
         if self._closing:
             return
+        if not self._config.enabled:
+            return
         if self._reconnect_task is not None and not self._reconnect_task.done():
             return
         self._reconnect_task = asyncio.create_task(self._reconnect_loop())
@@ -151,7 +153,8 @@ class HubConnectionManager:
                     break
             except Exception as e:
                 attempt += 1
-                logger.debug("Hub reconnect attempt {} failed: {}", attempt, e)
+                if attempt <= 3 or attempt % 10 == 0 or attempt in (20, 50, 100):
+                    logger.debug("Hub reconnect attempt {} failed: {}", attempt, e)
 
     async def _handle_disconnect(
         self,
@@ -175,6 +178,15 @@ class HubConnectionManager:
                 pass
 
         if self._pending_streams:
+            affected_count = len(self._pending_streams)
+            affected_ids = list(self._pending_streams.keys())[:10]  # 最多记录 10 个
+            logger.warning(
+                "Hub disconnect affecting {} in-flight streams: reason={}, stream_ids={}{}",
+                affected_count,
+                reason,
+                affected_ids,
+                "..." if affected_count > 10 else "",
+            )
             for state in self._pending_streams.values():
                 state.set_error("hub disconnected")
             self._pending_streams.clear()
@@ -289,6 +301,11 @@ class HubConnectionManager:
                 if stream:
                     message = (
                         frame.payload.decode(errors="replace") if frame.payload else "stream error"
+                    )
+                    logger.warning(
+                        "Hub received STREAM_ERROR: stream_id={}, message={}",
+                        frame.stream_id,
+                        message[:500],
                     )
                     stream.set_error(message)
 
@@ -599,11 +616,30 @@ class HubTunnelTransport(httpx.AsyncBaseTransport):
                 stream=HubResponseStream(manager, stream_state, timeout=self._timeout),
             )
         except TunnelStreamError as e:
+            stream_id = stream_state.stream_id if stream_state else None
+            has_headers = bool(stream_state and stream_state.status > 0)
+            logger.warning(
+                "HubTunnelTransport error: node_id={}, url={}, stream_id={}, "
+                "has_headers={}, error={}",
+                self._node_id,
+                str(request.url),
+                stream_id,
+                has_headers,
+                e,
+            )
             self._cleanup_stream(manager, stream_state)
-            if stream_state and stream_state.status > 0:
+            if has_headers:
                 raise httpx.ReadError(str(e)) from e
             raise httpx.ConnectError(str(e)) from e
         except asyncio.TimeoutError:
+            stream_id = stream_state.stream_id if stream_state else None
+            logger.warning(
+                "HubTunnelTransport timeout: node_id={}, url={}, stream_id={}, timeout={:.0f}s",
+                self._node_id,
+                str(request.url),
+                stream_id,
+                self._timeout,
+            )
             self._cleanup_stream(manager, stream_state)
             raise httpx.ReadTimeout("hub tunnel request timeout") from None
 

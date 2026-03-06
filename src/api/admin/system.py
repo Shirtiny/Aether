@@ -910,6 +910,67 @@ class AdminExportConfigAdapter(AdminApiAdapter):
         "cookie",
     }
 
+    @staticmethod
+    def _normalize_api_formats(raw_formats: Any) -> list[str]:
+        """规范化 api_formats 为 endpoint signature 列表。"""
+        from src.core.api_format.signature import normalize_signature_key
+
+        if not isinstance(raw_formats, list):
+            return []
+
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for raw in raw_formats:
+            if not isinstance(raw, str):
+                continue
+            value = raw.strip()
+            if not value:
+                continue
+            try:
+                fmt = normalize_signature_key(value)
+            except Exception:
+                continue
+            if fmt in seen:
+                continue
+            seen.add(fmt)
+            normalized.append(fmt)
+        return normalized
+
+    def _resolve_export_key_api_formats(
+        self, raw_formats: Any, provider_endpoint_formats: list[str]
+    ) -> list[str]:
+        """导出 Key 时解析支持端点：
+
+        - 优先使用 Key 自身 api_formats（规范化后）
+        - 当 api_formats 为 None（历史语义：全支持）时回退为 Provider 端点列表
+        - 当 api_formats 显式为空列表时保留空列表
+        """
+        normalized = self._normalize_api_formats(raw_formats)
+        if normalized:
+            return normalized
+
+        if raw_formats is None:
+            return list(provider_endpoint_formats)
+        return []
+
+    def _collect_provider_endpoint_formats(self, endpoints: list[Any]) -> list[str]:
+        """收集 Provider 下所有 endpoint signature（去重后排序）。"""
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for ep in endpoints:
+            raw = getattr(ep, "api_format", None)
+            if hasattr(raw, "value"):
+                raw = raw.value
+            fmt_list = self._normalize_api_formats([raw])
+            if not fmt_list:
+                continue
+            fmt = fmt_list[0]
+            if fmt in seen:
+                continue
+            seen.add(fmt)
+            normalized.append(fmt)
+        return sorted(normalized)
+
     def _decrypt_provider_config(self, config: dict, crypto_service: Any) -> dict:
         """解密 Provider config 中的 provider_ops credentials"""
         if not config:
@@ -959,6 +1020,7 @@ class AdminExportConfigAdapter(AdminApiAdapter):
                 db.query(ProviderEndpoint).filter(ProviderEndpoint.provider_id == provider.id).all()
             )
             endpoints_data = [ep.to_export_dict() for ep in endpoints]
+            provider_endpoint_formats = self._collect_provider_endpoint_formats(endpoints)
 
             # 导出 Provider Keys（按 provider_id 归属，包含 api_formats）
             keys = (
@@ -970,6 +1032,13 @@ class AdminExportConfigAdapter(AdminApiAdapter):
             keys_data = []
             for key in keys:
                 key_data = key.to_export_dict()
+                key_formats = self._resolve_export_key_api_formats(
+                    key_data.get("api_formats"),
+                    provider_endpoint_formats,
+                )
+                # 保持现有字段名 api_formats，并补充可读别名 supported_endpoints。
+                key_data["api_formats"] = key_formats
+                key_data["supported_endpoints"] = list(key_formats)
                 # 解密 API Key
                 try:
                     key_data["api_key"] = crypto_service.decrypt(key.api_key)
@@ -1121,6 +1190,29 @@ class AdminImportConfigAdapter(AdminApiAdapter):
         "cookie_string",
         "cookie",
     }
+
+    @staticmethod
+    def _extract_import_key_api_formats(
+        key_data: dict[str, Any], endpoint_formats: set[str]
+    ) -> list[str]:
+        """导入 Key 时提取 api_formats（兼容历史字段与旧语义）。"""
+        raw_formats = key_data.get("api_formats")
+        if isinstance(raw_formats, list):
+            if raw_formats:
+                return raw_formats
+            legacy_formats = key_data.get("supported_endpoints")
+            if isinstance(legacy_formats, list) and legacy_formats:
+                return legacy_formats
+            return []
+
+        legacy_formats = key_data.get("supported_endpoints")
+        if isinstance(legacy_formats, list) and legacy_formats:
+            return legacy_formats
+
+        # 兼容历史数据：api_formats=None 代表支持 Provider 的全部端点。
+        if raw_formats is None and endpoint_formats:
+            return sorted(endpoint_formats)
+        return []
 
     def _encrypt_provider_config(self, config: dict, crypto_service: Any) -> dict:
         """加密 Provider config 中的 provider_ops credentials"""
@@ -1436,8 +1528,8 @@ class AdminImportConfigAdapter(AdminApiAdapter):
                         stats["keys"]["skipped"] += 1
                         continue
 
-                    raw_formats = key_data.get("api_formats") or []
-                    if not isinstance(raw_formats, list) or len(raw_formats) == 0:
+                    raw_formats = self._extract_import_key_api_formats(key_data, endpoint_formats)
+                    if len(raw_formats) == 0:
                         stats["errors"].append(
                             f"跳过无 api_formats 的 Key (Provider: {prov_data['name']})"
                         )

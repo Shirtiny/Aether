@@ -1057,6 +1057,31 @@ class StreamProcessor:
         except GeneratorExit:
             raise
         except (httpx.StreamClosed, httpx.HTTPError) as exc:
+            # 记录上游流中断的详细诊断信息
+            elapsed = time.monotonic() - start_time if start_time else 0
+            exc_chain = []
+            seen: set[int] = set()
+            cause: BaseException | None = exc
+            while cause is not None and id(cause) not in seen:
+                seen.add(id(cause))
+                exc_chain.append(f"{type(cause).__name__}: {cause}")
+                cause = cause.__cause__ or cause.__context__
+            logger.warning(
+                "[{}] upstream stream error: provider={}, model={}, "
+                "yielded_any={}, has_completion={}, elapsed={:.1f}s, "
+                "input_tokens={}, output_tokens={}, "
+                "exception_chain=[{}]",
+                self.request_id,
+                ctx.provider_name,
+                ctx.model,
+                yielded_any,
+                ctx.has_completion,
+                elapsed,
+                ctx.input_tokens,
+                ctx.output_tokens,
+                " -> ".join(exc_chain),
+            )
+
             # 连接关闭/协议错误：best-effort flush 残留 SSE，避免丢失尾部 usage。
             try:
                 if buffer:

@@ -1,0 +1,182 @@
+from __future__ import annotations
+
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import MagicMock
+
+import pytest
+
+from src.services.usage._billing_integration import UsageBillingIntegrationMixin
+from src.services.usage._types import UsageRecordParams
+
+
+class _TestUsageBillingIntegration(UsageBillingIntegrationMixin):
+    @classmethod
+    async def _get_rate_multiplier_and_free_tier(
+        cls,
+        db: Any,  # noqa: ARG003
+        provider_api_key_id: str | None,  # noqa: ARG003
+        provider_id: str | None,  # noqa: ARG003
+        api_format: str | None = None,  # noqa: ARG003
+    ) -> tuple[float, bool]:
+        return 1.0, False
+
+
+class _DummyBillingService:
+    last_dimensions: dict[str, Any] | None = None
+
+    def __init__(self, db: Any) -> None:  # noqa: D107, ARG002
+        pass
+
+    def calculate(
+        self,
+        *,
+        task_type: str,  # noqa: ARG002
+        model: str,  # noqa: ARG002
+        provider_id: str,  # noqa: ARG002
+        dimensions: dict[str, Any],
+        strict_mode: bool | None,  # noqa: ARG002
+    ) -> Any:
+        _DummyBillingService.last_dimensions = dict(dimensions)
+        snapshot = SimpleNamespace(
+            cost_breakdown={
+                "input_cost": 0.0,
+                "output_cost": 0.0,
+                "cache_creation_cost": 0.0,
+                "cache_read_cost": 0.0,
+                "request_cost": 0.0,
+            },
+            total_cost=0.0,
+            resolved_variables={},
+            to_dict=lambda: {},
+        )
+        return SimpleNamespace(snapshot=snapshot)
+
+
+def _build_params(
+    db: Any,
+    *,
+    cache_creation_input_tokens: int = 0,
+    cache_read_input_tokens: int = 0,
+    cache_creation_input_tokens_5m: int = 0,
+    cache_creation_input_tokens_1h: int = 0,
+    cache_ttl_minutes: int | None = None,
+    provider_api_key_id: str | None = "pak-test",
+) -> UsageRecordParams:
+    return UsageRecordParams(
+        db=db,
+        user=None,
+        api_key=None,
+        provider="provider-x",
+        model="claude-sonnet",
+        input_tokens=100,
+        output_tokens=50,
+        cache_creation_input_tokens=cache_creation_input_tokens,
+        cache_read_input_tokens=cache_read_input_tokens,
+        cache_creation_input_tokens_5m=cache_creation_input_tokens_5m,
+        cache_creation_input_tokens_1h=cache_creation_input_tokens_1h,
+        request_type="chat",
+        api_format="claude:chat",
+        api_family="claude",
+        endpoint_kind="chat",
+        endpoint_api_format="claude:chat",
+        has_format_conversion=False,
+        is_stream=False,
+        response_time_ms=123,
+        first_byte_time_ms=None,
+        status_code=200,
+        error_message=None,
+        metadata={},
+        request_headers=None,
+        request_body=None,
+        provider_request_headers=None,
+        provider_request_body=None,
+        response_headers=None,
+        client_response_headers=None,
+        response_body=None,
+        client_response_body=None,
+        request_id="req-test",
+        provider_id="provider-id",
+        provider_endpoint_id="endpoint-id",
+        provider_api_key_id=provider_api_key_id,
+        status="completed",
+        cache_ttl_minutes=cache_ttl_minutes,
+        use_tiered_pricing=True,
+        target_model=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_prepare_usage_record_uses_provider_key_ttl_for_cache_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = MagicMock()
+    db.query.return_value.filter.return_value.scalar.return_value = 60
+
+    monkeypatch.setattr("src.services.billing.service.BillingService", _DummyBillingService)
+    monkeypatch.setattr(
+        "src.services.usage._billing_integration.sanitize_request_metadata",
+        lambda metadata: metadata,
+    )
+    monkeypatch.setattr(
+        "src.services.usage._billing_integration.build_usage_params",
+        lambda **kwargs: {"total_cost_usd": 0.0, "actual_total_cost_usd": 0.0},
+    )
+
+    params = _build_params(db, cache_read_input_tokens=321)
+    await _TestUsageBillingIntegration._prepare_usage_record(params)
+
+    assert _DummyBillingService.last_dimensions is not None
+    assert _DummyBillingService.last_dimensions.get("cache_ttl_minutes") == 60
+
+
+@pytest.mark.asyncio
+async def test_prepare_usage_record_prefers_explicit_cache_ttl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = MagicMock()
+    db.query.return_value.filter.return_value.scalar.return_value = 60
+
+    monkeypatch.setattr("src.services.billing.service.BillingService", _DummyBillingService)
+    monkeypatch.setattr(
+        "src.services.usage._billing_integration.sanitize_request_metadata",
+        lambda metadata: metadata,
+    )
+    monkeypatch.setattr(
+        "src.services.usage._billing_integration.build_usage_params",
+        lambda **kwargs: {"total_cost_usd": 0.0, "actual_total_cost_usd": 0.0},
+    )
+
+    params = _build_params(db, cache_read_input_tokens=123, cache_ttl_minutes=5)
+    await _TestUsageBillingIntegration._prepare_usage_record(params)
+
+    assert _DummyBillingService.last_dimensions is not None
+    assert _DummyBillingService.last_dimensions.get("cache_ttl_minutes") == 5
+
+
+@pytest.mark.asyncio
+async def test_prepare_usage_record_infers_ttl_from_1h_cache_split(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = MagicMock()
+
+    monkeypatch.setattr("src.services.billing.service.BillingService", _DummyBillingService)
+    monkeypatch.setattr(
+        "src.services.usage._billing_integration.sanitize_request_metadata",
+        lambda metadata: metadata,
+    )
+    monkeypatch.setattr(
+        "src.services.usage._billing_integration.build_usage_params",
+        lambda **kwargs: {"total_cost_usd": 0.0, "actual_total_cost_usd": 0.0},
+    )
+
+    params = _build_params(
+        db,
+        provider_api_key_id=None,
+        cache_creation_input_tokens=1000,
+        cache_creation_input_tokens_1h=1000,
+    )
+    await _TestUsageBillingIntegration._prepare_usage_record(params)
+
+    assert _DummyBillingService.last_dimensions is not None
+    assert _DummyBillingService.last_dimensions.get("cache_ttl_minutes") == 60

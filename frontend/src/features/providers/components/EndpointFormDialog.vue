@@ -1280,30 +1280,30 @@ const deleteConfirmDescription = computed(() => {
 
 async function loadDefaultBodyRulesForFormat(apiFormat: string, force = false): Promise<BodyRule[]> {
   if (!apiFormat) return []
-  if (!force && defaultBodyRulesLoaded.value[apiFormat]) {
-    return defaultBodyRulesByFormat.value[apiFormat] || []
+  const providerType = (props.provider?.provider_type || '').toLowerCase()
+  // 缓存 key 需要包含 provider_type，不同类型的 provider 有不同的默认规则
+  const cacheKey = providerType ? `${apiFormat}:${providerType}` : apiFormat
+  if (!force && defaultBodyRulesLoaded.value[cacheKey]) {
+    return defaultBodyRulesByFormat.value[cacheKey] || []
   }
-  if (loadingDefaultBodyRulesByFormat.value[apiFormat]) {
-    return defaultBodyRulesByFormat.value[apiFormat] || []
+  if (loadingDefaultBodyRulesByFormat.value[cacheKey]) {
+    return defaultBodyRulesByFormat.value[cacheKey] || []
   }
 
-  loadingDefaultBodyRulesByFormat.value[apiFormat] = true
+  loadingDefaultBodyRulesByFormat.value[cacheKey] = true
   try {
-    const response = await getDefaultBodyRules(apiFormat)
-    const normalized = response.api_format || apiFormat
+    const response = await getDefaultBodyRules(apiFormat, providerType || undefined)
     const rules = response.body_rules || []
-    defaultBodyRulesByFormat.value[normalized] = rules
-    defaultBodyRulesByFormat.value[apiFormat] = rules
-    defaultBodyRulesLoaded.value[normalized] = true
-    defaultBodyRulesLoaded.value[apiFormat] = true
+    defaultBodyRulesByFormat.value[cacheKey] = rules
+    defaultBodyRulesLoaded.value[cacheKey] = true
     return rules
   } catch (error: unknown) {
-    defaultBodyRulesByFormat.value[apiFormat] = []
-    defaultBodyRulesLoaded.value[apiFormat] = true
+    defaultBodyRulesByFormat.value[cacheKey] = []
+    defaultBodyRulesLoaded.value[cacheKey] = true
     log.warn('加载默认请求体规则失败', apiFormat, error)
     return []
   } finally {
-    loadingDefaultBodyRulesByFormat.value[apiFormat] = false
+    loadingDefaultBodyRulesByFormat.value[cacheKey] = false
   }
 }
 
@@ -1317,7 +1317,11 @@ function getDefaultPath(apiFormat: string, baseUrl?: string): string {
   const format = apiFormats.value.find(f => f.value === apiFormat)
   const defaultPath = format?.default_path || ''
   // Codex 端点使用 /responses 而非 /v1/responses
-  if (apiFormat === 'openai:cli' && baseUrl && isCodexUrl(baseUrl)) {
+  const providerType = (props.provider?.provider_type || '').toLowerCase()
+  const isCodex = providerType
+    ? providerType === 'codex'
+    : (!!baseUrl && isCodexUrl(baseUrl))
+  if (apiFormat === 'openai:cli' && isCodex) {
     return '/responses'
   }
   return defaultPath

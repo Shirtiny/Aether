@@ -219,7 +219,10 @@ def extract_health_score(key_obj: Any) -> float | None:
 
 
 def plan_priority_score(plan_type: str | None, mode: str | None = None) -> float:
-    """Score a key based on plan type and free_team_first mode."""
+    """Score a key based on plan type and scheduling mode.
+
+    Lower score = higher priority.
+    """
 
     effective_mode = (mode or "both").strip().lower()
     if effective_mode == "free_only":
@@ -232,6 +235,11 @@ def plan_priority_score(plan_type: str | None, mode: str | None = None) -> float
             return 0.0
         if plan_type == "free":
             return 0.5
+    elif effective_mode == "plus_only":
+        if plan_type in {"plus", "pro"}:
+            return 0.0
+        if plan_type in {"enterprise", "business"}:
+            return 0.3
     else:
         # "both" or unrecognized -> original behavior
         if plan_type in {"free", "team"}:

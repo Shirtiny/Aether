@@ -72,7 +72,9 @@ export async function deleteEndpoint(endpointId: string): Promise<{ message: str
 /**
  * 获取指定 API 格式的默认请求体规则
  */
-export async function getDefaultBodyRules(apiFormat: string): Promise<{ api_format: string; body_rules: BodyRule[] }> {
-  const response = await client.get(`/api/admin/endpoints/defaults/${encodeURIComponent(apiFormat)}/body-rules`)
+export async function getDefaultBodyRules(apiFormat: string, providerType?: string): Promise<{ api_format: string; body_rules: BodyRule[] }> {
+  const params: Record<string, string> = {}
+  if (providerType) params.provider_type = providerType
+  const response = await client.get(`/api/admin/endpoints/defaults/${encodeURIComponent(apiFormat)}/body-rules`, { params })
   return response.data
 }

@@ -68,6 +68,41 @@ class UsageBillingIntegrationMixin:
         from src.services.billing.service import BillingService
 
         request_count = 0 if is_failed_request else 1
+        has_cache_tokens = bool(
+            params.cache_creation_input_tokens > 0 or params.cache_read_input_tokens > 0
+        )
+        effective_cache_ttl_minutes = params.cache_ttl_minutes
+
+        # 主链路很多场景不会显式传 cache_ttl_minutes，这里补全以确保 1h/5m TTL 差异化计价生效。
+        if effective_cache_ttl_minutes is None and has_cache_tokens and params.provider_api_key_id:
+            try:
+                from src.models.database import ProviderAPIKey
+
+                key_ttl = (
+                    params.db.query(ProviderAPIKey.cache_ttl_minutes)
+                    .filter(ProviderAPIKey.id == params.provider_api_key_id)
+                    .scalar()
+                )
+                if key_ttl is not None:
+                    key_ttl_int = int(key_ttl)
+                    if key_ttl_int >= 0:
+                        effective_cache_ttl_minutes = key_ttl_int
+            except Exception:
+                # Best-effort fallback below.
+                pass
+
+        # 无法从 key 获取时，尽量从 5m/1h 细分回推（主要覆盖 Claude cache_creation）。
+        if effective_cache_ttl_minutes is None and has_cache_tokens:
+            t5m = int(params.cache_creation_input_tokens_5m or 0)
+            t1h = int(params.cache_creation_input_tokens_1h or 0)
+            if t1h > 0 and t5m == 0:
+                effective_cache_ttl_minutes = 60
+            elif t5m > 0 and t1h == 0:
+                effective_cache_ttl_minutes = 5
+            elif t1h > 0:
+                # 混合场景优先按长 TTL 计，避免 1h 缓存被按 5m 误计。
+                effective_cache_ttl_minutes = 60
+
         dims: dict[str, Any] = {
             "input_tokens": input_tokens_for_billing,
             "output_tokens": params.output_tokens,
@@ -75,8 +110,8 @@ class UsageBillingIntegrationMixin:
             "cache_read_input_tokens": params.cache_read_input_tokens,
             "request_count": request_count,
         }
-        if params.cache_ttl_minutes is not None:
-            dims["cache_ttl_minutes"] = params.cache_ttl_minutes
+        if effective_cache_ttl_minutes is not None:
+            dims["cache_ttl_minutes"] = effective_cache_ttl_minutes
         # If tiered pricing is disabled, force first tier by using tier-key=0.
         if not params.use_tiered_pricing:
             dims["total_input_context"] = 0

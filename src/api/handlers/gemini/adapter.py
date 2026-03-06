@@ -264,6 +264,8 @@ class GeminiChatAdapter(ChatAdapterBase):
         base_url: str,
         request_data: dict[str, Any] | None = None,
         model_name: str | None = None,
+        *,
+        provider_type: str | None = None,
     ) -> str:
         """构建Gemini API端点URL"""
         base_url = base_url.rstrip("/")

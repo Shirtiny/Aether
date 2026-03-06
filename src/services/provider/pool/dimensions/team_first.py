@@ -1,4 +1,4 @@
-"""free_team_first preset dimension."""
+"""team_first preset dimension."""
 
 from __future__ import annotations
 
@@ -8,38 +8,26 @@ from ._helpers import extract_plan_type, plan_priority_score, rank_ascending
 from .registry import PresetDimensionBase, register_preset_dimension
 
 
-class FreeTeamFirstDimension(PresetDimensionBase):
+class TeamFirstDimension(PresetDimensionBase):
     @property
     def name(self) -> str:
-        return "free_team_first"
+        return "team_first"
 
     @property
     def label(self) -> str:
-        return "Free/Team 优先"
+        return "Team 优先"
 
     @property
     def description(self) -> str:
-        return "优先消耗低档账号（依赖 plan_type）"
+        return "优先消耗 Team 账号（依赖 plan_type）"
 
     @property
     def evidence_hint(self) -> str | None:
-        return "依据 plan_type（oauth_plan_type 或 upstream_metadata）"
+        return "依据 plan_type（Team 账号优先调度）"
 
     @property
     def providers(self) -> tuple[str, ...]:
         return ("codex", "kiro")
-
-    @property
-    def modes(self) -> tuple[str, ...] | None:
-        return ("free_only", "team_only", "both")
-
-    @property
-    def default_mode(self) -> str | None:
-        return "both"
-
-    @property
-    def hidden(self) -> bool:
-        return True
 
     def compute_metric(
         self,
@@ -52,7 +40,7 @@ class FreeTeamFirstDimension(PresetDimensionBase):
         mode: str | None,
     ) -> float:
         plan_scores = {
-            kid: plan_priority_score(extract_plan_type(keys_by_id.get(kid)), mode)
+            kid: plan_priority_score(extract_plan_type(keys_by_id.get(kid)), "team_only")
             for kid in all_key_ids
         }
         if len(set(plan_scores.values())) <= 1:
@@ -60,4 +48,4 @@ class FreeTeamFirstDimension(PresetDimensionBase):
         return rank_ascending(key_id, plan_scores, all_key_ids)
 
 
-register_preset_dimension(FreeTeamFirstDimension())
+register_preset_dimension(TeamFirstDimension())

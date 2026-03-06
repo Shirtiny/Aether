@@ -76,6 +76,16 @@ class PresetDimensionBase(ABC):
 
         return None
 
+    @property
+    def hidden(self) -> bool:
+        """If True, this dimension is excluded from API metadata listings.
+
+        The dimension remains functional for backward compatibility but
+        will not appear in the scheduling dialog.
+        """
+
+        return False
+
     @abstractmethod
     def compute_metric(
         self,
@@ -170,6 +180,10 @@ def register_preset_dimension(dim: PresetDimensionBase) -> None:
             raw = str(self._wrapped.evidence_hint or "").strip()
             return raw or None
 
+        @property
+        def hidden(self) -> bool:
+            return self._wrapped.hidden
+
         def compute_metric(
             self,
             *,
@@ -223,6 +237,8 @@ def get_preset_dimension_metas() -> list[PresetDimensionMeta]:
 
     metas: list[PresetDimensionMeta] = []
     for dim in get_all_preset_dimensions():
+        if dim.hidden:
+            continue
         metas.append(
             PresetDimensionMeta(
                 name=dim.name,

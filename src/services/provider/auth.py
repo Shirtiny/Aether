@@ -141,6 +141,42 @@ def _mark_refresh_token_invalid(
         )
 
 
+def _mark_oauth_token_expired(key: Any, expires_at: Any) -> None:
+    """标记 OAuth key 为 Token 已过期且无法续期，阻止后续调度。
+
+    当 refresh token 已失效且 access token 也已过期时调用。
+    使用 [OAUTH_EXPIRED] 前缀，account_state 会将其判定为 blocked。
+    不设置 is_active = False（管理员可通过重新导入凭据恢复）。
+    """
+    from datetime import datetime, timezone
+
+    # 如果已经有更严重的标记（[ACCOUNT_BLOCK]），不降级
+    existing = str(getattr(key, "oauth_invalid_reason", None) or "")
+    if existing.startswith("[ACCOUNT_BLOCK]"):
+        return
+
+    reason = f"[OAUTH_EXPIRED] Token 已过期且续期失败 (expired_at={expires_at})"
+
+    try:
+        key.oauth_invalid_at = datetime.now(timezone.utc)
+        key.oauth_invalid_reason = reason
+
+        sess = object_session(key)
+        if sess is not None:
+            sess.add(key)
+            sess.commit()
+            logger.info(
+                "[OAUTH_EXPIRED] key {} token expired and refresh failed, blocking scheduling",
+                str(getattr(key, "id", "?"))[:8],
+            )
+    except Exception as exc:
+        logger.warning(
+            "[OAUTH_EXPIRED] failed to mark key {} as expired: {}",
+            str(getattr(key, "id", "?"))[:8],
+            str(exc),
+        )
+
+
 def _get_proxy_config(key: Any, endpoint: Any = None) -> Any:
     """获取有效代理配置（Key 级别优先于 Provider 级别）。"""
     try:
@@ -414,6 +450,7 @@ async def get_provider_auth(
                 should_refresh = True
 
         _refreshed = False
+        _lost_lock = False  # 其他实例持有刷新锁，不应标记过期
         if should_refresh and refresh_token and provider_type:
             try:
                 from src.core.provider_templates.fixed_providers import FIXED_PROVIDERS
@@ -437,9 +474,21 @@ async def get_provider_auth(
                     finally:
                         if got_lock:
                             await _release_refresh_lock(redis, key.id)
+                else:
+                    _lost_lock = True
             except Exception:
                 # 刷新失败不阻断请求；后续由上游返回 401 再触发管理端处理
                 pass
+
+        # Refresh 失败（非锁竞争）且 access token 已过期 → 升级标记为 [OAUTH_EXPIRED]
+        # 注意：未获取到锁说明其他实例正在刷新，不应在此标记为过期
+        if should_refresh and not _refreshed and not _lost_lock and expires_at is not None:
+            try:
+                token_truly_expired = int(time.time()) >= int(expires_at)
+            except Exception:
+                token_truly_expired = False
+            if token_truly_expired:
+                _mark_oauth_token_expired(key, expires_at)
 
         # 获取最终使用的 access_token
         # Kiro 优先使用 token_meta 中缓存的 access_token（刷新后会更新到 token_meta）

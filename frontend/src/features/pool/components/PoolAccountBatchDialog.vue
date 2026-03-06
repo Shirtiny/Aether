@@ -223,7 +223,22 @@
       </div>
 
       <div
-        v-if="lastResultMessage"
+        v-if="executing && progressTotal > 0"
+        class="space-y-1"
+      >
+        <div class="flex items-center justify-between text-xs text-muted-foreground">
+          <span>{{ progressLabel }}</span>
+          <span>{{ progressDone }} / {{ progressTotal }}</span>
+        </div>
+        <div class="h-1.5 w-full rounded-full bg-muted overflow-hidden">
+          <div
+            class="h-full rounded-full bg-primary transition-all duration-150"
+            :style="{ width: `${Math.round((progressDone / progressTotal) * 100)}%` }"
+          />
+        </div>
+      </div>
+      <div
+        v-else-if="lastResultMessage"
         class="rounded-md border bg-background px-3 py-2 text-xs text-muted-foreground"
       >
         {{ lastResultMessage }}
@@ -322,6 +337,9 @@ const searchText = ref('')
 const selectedAction = ref<BatchActionValue>('delete')
 const proxyNodeIdForAction = ref('')
 const lastResultMessage = ref('')
+const progressTotal = ref(0)
+const progressDone = ref(0)
+const progressLabel = ref('')
 const activeQuickSelectors = ref<QuickSelectorValue[]>([])
 const currentPage = ref(1)
 const PAGE_SIZE = 50
@@ -571,6 +589,12 @@ async function executeAction(): Promise<void> {
   let failedCount = 0
   let skippedCount = 0
 
+  const actionLabel = ACTION_OPTIONS.find((a) => a.value === selectedAction.value)?.label || '执行'
+  progressDone.value = 0
+  progressTotal.value = selectedKeys.length
+  progressLabel.value = `正在${actionLabel}...`
+  lastResultMessage.value = ''
+
   try {
     if (selectedAction.value === 'refresh_quota') {
       const targetIds = selectedKeys.map((key) => key.key_id)
@@ -578,6 +602,7 @@ async function executeAction(): Promise<void> {
       successCount = Number(result.success || 0)
       failedCount = Number(result.failed || 0)
       skippedCount = Math.max(0, targetIds.length - Number(result.total || 0))
+      progressDone.value = targetIds.length
     } else {
       const CONCURRENCY = props.batchConcurrency || 8
       const taskForKey = (key: PoolKeyDetail): (() => Promise<'success' | 'skip'>) | null => {
@@ -609,8 +634,12 @@ async function executeAction(): Promise<void> {
       for (const key of selectedKeys) {
         const task = taskForKey(key)
         if (task) tasks.push(task)
-        else skippedCount += 1
+        else {
+          skippedCount += 1
+          progressDone.value += 1
+        }
       }
+      progressTotal.value = selectedKeys.length
 
       // 并发执行，限制并发数
       let cursor = 0
@@ -623,6 +652,7 @@ async function executeAction(): Promise<void> {
           } catch {
             failedCount += 1
           }
+          progressDone.value += 1
         }
       }
       const workers = Array.from({ length: Math.min(CONCURRENCY, tasks.length) }, () => runNext())
@@ -647,6 +677,9 @@ async function executeAction(): Promise<void> {
     showError(parseApiError(err, '批量操作失败'))
   } finally {
     executing.value = false
+    progressTotal.value = 0
+    progressDone.value = 0
+    progressLabel.value = ''
   }
 }
 
