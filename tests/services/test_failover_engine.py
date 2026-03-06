@@ -9,6 +9,7 @@ import pytest
 from src.services.candidate.failover import FailoverEngine
 from src.services.candidate.policy import RetryMode, RetryPolicy, SkipPolicy
 from src.services.orchestration.error_classifier import ErrorAction
+from src.services.scheduling.schemas import PoolCandidate
 from src.services.task.protocol import AttemptKind, AttemptResult
 
 
@@ -502,3 +503,69 @@ async def test_failover_engine_rotates_client_on_stream_capacity_error(
 
     rotate_mock.assert_awaited_once()
     sleep_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_failover_engine_stops_when_cancelled_before_attempt() -> None:
+    db = MagicMock()
+    engine = FailoverEngine(db, error_classifier=_StubErrorClassifier(action=ErrorAction.BREAK))
+
+    candidates = [_make_candidate(provider_id="p1"), _make_candidate(provider_id="p2")]
+    attempt = AsyncMock()
+
+    async def _cancelled() -> bool:
+        return True
+
+    result = await engine.execute(
+        candidates=candidates,
+        attempt_func=attempt,
+        retry_policy=RetryPolicy(mode=RetryMode.DISABLED, max_retries=1),
+        skip_policy=SkipPolicy(),
+        request_id=None,
+        is_cancelled=_cancelled,
+    )
+
+    assert result.success is False
+    assert result.error_type == "cancelled"
+    assert result.last_status_code == 499
+    assert result.attempt_count == 0
+    assert attempt.await_count == 0
+    assert [item.status for item in result.candidate_keys] == ["cancelled", "cancelled"]
+
+
+@pytest.mark.asyncio
+async def test_failover_engine_stops_before_next_pool_key_when_cancelled() -> None:
+    db = MagicMock()
+    engine = FailoverEngine(db, error_classifier=_StubErrorClassifier(action=ErrorAction.BREAK))
+
+    provider = SimpleNamespace(id="p1", name="prov", max_retries=1, config={})
+    endpoint = SimpleNamespace(id="e1")
+    key1 = SimpleNamespace(id="k1", name="key-1", auth_type="api_key", priority=0)
+    key2 = SimpleNamespace(id="k2", name="key-2", auth_type="api_key", priority=0)
+    pool_candidate = PoolCandidate(
+        provider=provider,  # type: ignore[arg-type]
+        endpoint=endpoint,  # type: ignore[arg-type]
+        key=key1,  # type: ignore[arg-type]
+        pool_keys=[key1, key2],  # type: ignore[list-item]
+    )
+
+    attempt = AsyncMock(side_effect=RuntimeError("boom"))
+    cancel_checks = {"count": 0}
+
+    async def _cancelled() -> bool:
+        cancel_checks["count"] += 1
+        return cancel_checks["count"] >= 4
+
+    result = await engine.execute(
+        candidates=[pool_candidate],
+        attempt_func=attempt,
+        retry_policy=RetryPolicy(mode=RetryMode.DISABLED, max_retries=1),
+        skip_policy=SkipPolicy(),
+        request_id=None,
+        is_cancelled=_cancelled,
+    )
+
+    assert result.success is False
+    assert result.error_type == "cancelled"
+    assert attempt.await_count == 1
+    assert any(item.key_id == "k2" and item.status == "cancelled" for item in result.candidate_keys)

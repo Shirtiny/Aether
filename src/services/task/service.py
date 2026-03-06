@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import Any
 from uuid import uuid4
 
@@ -54,6 +54,47 @@ _SENSITIVE_PATTERN = re.compile(
     r"(api[_-]?key|token|bearer|authorization)[=:\s]+\S+",
     re.IGNORECASE,
 )
+
+
+async def pool_on_error(
+    provider: Any,
+    key: Any,
+    status_code: int,
+    cause: Any,
+) -> None:
+    """Notify the pool manager about an upstream error (health policy)."""
+    try:
+        from src.services.provider.pool.config import parse_pool_config
+        from src.services.provider.pool.health_policy import apply_health_policy
+
+        pool_cfg = parse_pool_config(getattr(provider, "config", None))
+        if pool_cfg is None:
+            return
+
+        error_text = ""
+        resp_headers: dict[str, str] = {}
+        if getattr(cause, "response", None) is not None:
+            try:
+                error_text = (cause.response.text or "")[:4000]
+            except Exception:
+                pass
+            try:
+                resp_headers = dict(cause.response.headers)
+            except Exception:
+                pass
+        elif isinstance(getattr(cause, "error_message", None), str):
+            error_text = str(getattr(cause, "error_message", "") or "")[:4000]
+
+        await apply_health_policy(
+            provider_id=str(provider.id),
+            key_id=str(key.id),
+            status_code=status_code,
+            error_body=error_text,
+            response_headers=resp_headers,
+            config=pool_cfg,
+        )
+    except Exception:
+        pass
 
 
 class TaskService:
@@ -205,6 +246,7 @@ class TaskService:
         affinity_key: str | None = None,
         create_pending_usage: bool = False,
         enable_cache_affinity: bool = False,
+        is_cancelled: Callable[[], Awaitable[bool]] | None = None,
     ) -> ExecutionResult:
         """Execute a pre-built candidate set through the unified SYNC runtime."""
         from src.services.rate_limit.adaptive_rpm import get_adaptive_rpm_manager
@@ -478,6 +520,7 @@ class TaskService:
             candidate_record_map=candidate_record_map,
             max_attempts=max_attempts,
             execution_error_handler=_handle_exec_err,
+            is_cancelled=is_cancelled,
         )
 
         if result.success:
@@ -687,44 +730,7 @@ class TaskService:
         except Exception:
             logger.opt(exception=True).debug("Pool on_request_success failed (non-blocking)")
 
-    @staticmethod
-    async def _pool_on_error(
-        provider: Any,
-        key: Any,
-        status_code: int,
-        cause: Any,
-    ) -> None:
-        """Notify the pool manager about an upstream error (health policy)."""
-        try:
-            from src.services.provider.pool.config import parse_pool_config
-            from src.services.provider.pool.health_policy import apply_health_policy
-
-            pool_cfg = parse_pool_config(getattr(provider, "config", None))
-            if pool_cfg is None:
-                return
-
-            error_text = ""
-            resp_headers: dict[str, str] = {}
-            if getattr(cause, "response", None) is not None:
-                try:
-                    error_text = (cause.response.text or "")[:4000]
-                except Exception:
-                    pass
-                try:
-                    resp_headers = dict(cause.response.headers)
-                except Exception:
-                    pass
-
-            await apply_health_policy(
-                provider_id=str(provider.id),
-                key_id=str(key.id),
-                status_code=status_code,
-                error_body=error_text,
-                response_headers=resp_headers,
-                config=pool_cfg,
-            )
-        except Exception:
-            pass
+    _pool_on_error = staticmethod(pool_on_error)
 
     async def _execute_sync_unified(
         self,
@@ -1472,11 +1478,13 @@ class TaskService:
         if isinstance(cause, EmbeddedErrorException):
             error_message = cause.error_message or ""
             embedded_status = cause.error_code or 200
+            embedded_detail = error_message[:200] or cause.error_status or f"code={embedded_status}"
             if error_classifier.is_client_error(error_message):
                 logger.warning(
-                    "  [{}] 嵌入式客户端错误，继续转移: {}",
+                    "  [{}] 嵌入式客户端错误 (HTTP 200, status={}), 继续转移: {}",
                     request_id,
-                    error_message[:200],
+                    cause.error_status or embedded_status,
+                    embedded_detail,
                 )
                 RequestCandidateService.mark_candidate_failed(
                     db=self.db,
@@ -1488,12 +1496,14 @@ class TaskService:
                     concurrent_requests=captured_key_concurrent,
                     extra_data=_proxy_extra,
                 )
+                await self._pool_on_error(provider, key, embedded_status, cause)
                 return "break"
 
             logger.warning(
-                "  [{}] 嵌入式服务端错误，尝试重试: {}",
+                "  [{}] 嵌入式服务端错误 (HTTP 200, status={}), 尝试重试: {}",
                 request_id,
-                error_message[:200],
+                cause.error_status or embedded_status,
+                embedded_detail,
             )
             RequestCandidateService.mark_candidate_failed(
                 db=self.db,
@@ -1505,6 +1515,7 @@ class TaskService:
                 concurrent_requests=captured_key_concurrent,
                 extra_data=_proxy_extra,
             )
+            await self._pool_on_error(provider, key, embedded_status, cause)
             return "continue" if has_retry_left else "break"
 
         if isinstance(cause, httpx.HTTPStatusError):

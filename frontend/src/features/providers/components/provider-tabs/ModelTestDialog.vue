@@ -159,7 +159,7 @@
                     :variant="statusVariant(candidate.status)"
                     class="text-[10px] px-1.5 py-0 shrink-0"
                   >
-                    {{ candidate.status_code || statusLabel(candidate.status) }}
+                    {{ statusDisplay(candidate) }}
                   </Badge>
                   <span class="truncate font-medium">{{ formatTraceCandidateAccount(candidate) }}</span>
                 </div>
@@ -221,13 +221,51 @@
         {{ result.error }}
       </div>
 
+      <div
+        v-if="attemptSummaryItems.length > 0"
+        class="rounded-md border border-border/60 bg-muted/20 p-3 space-y-2"
+      >
+        <div class="text-xs font-medium text-muted-foreground">
+          结果概览
+        </div>
+        <div class="flex flex-wrap gap-2">
+          <div
+            v-for="item in attemptSummaryItems"
+            :key="item.key"
+            class="flex items-center gap-2 rounded-md border border-border/60 bg-background/80 px-2.5 py-1.5 text-xs"
+          >
+            <Badge
+              :variant="item.variant"
+              class="text-[10px] px-1.5 py-0"
+            >
+              {{ item.count }}x
+            </Badge>
+            <span class="text-muted-foreground break-all">{{ item.label }}</span>
+          </div>
+        </div>
+      </div>
+
+      <div
+        v-if="shouldCollapseAttempts"
+        class="flex items-center justify-between gap-3 text-xs text-muted-foreground"
+      >
+        <span>仅展示前 {{ visibleAttempts.length }} 条，共 {{ resultAttempts.length }} 条</span>
+        <Button
+          variant="ghost"
+          size="sm"
+          @click="showAllAttempts = !showAllAttempts"
+        >
+          {{ showAllAttempts ? '收起详情' : `展开全部 ${resultAttempts.length} 条` }}
+        </Button>
+      </div>
+
       <!-- mobile: list layout -->
       <div
-        v-if="result.attempts.length > 0"
+        v-if="resultAttempts.length > 0"
         class="space-y-2 sm:hidden"
       >
         <div
-          v-for="(attempt, idx) in result.attempts"
+          v-for="(attempt, idx) in visibleAttempts"
           :key="'m' + idx"
           class="rounded-md border px-3 py-2 text-xs"
           :class="attemptRowClass(attempt.status)"
@@ -239,7 +277,7 @@
                 :variant="statusVariant(attempt.status)"
                 class="text-[10px] px-1.5 py-0 shrink-0"
               >
-                {{ attempt.status_code || statusLabel(attempt.status) }}
+                {{ statusDisplay(attempt) }}
               </Badge>
               <span
                 v-if="attempt.latency_ms != null"
@@ -248,6 +286,10 @@
                 {{ attempt.latency_ms }}ms
               </span>
             </div>
+            <code
+              v-if="showEndpointColumn"
+              class="text-[11px] bg-muted px-1 py-0.5 rounded shrink-0"
+            >{{ attempt.endpoint_api_format }}</code>
           </div>
           <div class="mt-1.5 space-y-0.5">
             <div
@@ -277,7 +319,7 @@
 
       <!-- desktop: table layout -->
       <div
-        v-if="result.attempts.length > 0"
+        v-if="resultAttempts.length > 0"
         class="border rounded-md overflow-hidden hidden sm:block"
       >
         <table class="w-full text-xs table-fixed">
@@ -285,8 +327,12 @@
             <col class="w-8">
             <col class="w-[22%]">
             <col
+              v-if="showEndpointColumn"
+              class="w-20"
+            >
+            <col
               v-if="hasEffectiveModel"
-              class="w-[18%]"
+              class="w-[16%]"
             >
             <col class="w-16">
             <col class="w-16">
@@ -299,6 +345,12 @@
               </th>
               <th class="px-3 py-2 text-left font-medium">
                 Key
+              </th>
+              <th
+                v-if="showEndpointColumn"
+                class="px-3 py-2 text-left font-medium"
+              >
+                端点
               </th>
               <th
                 v-if="hasEffectiveModel"
@@ -319,7 +371,7 @@
           </thead>
           <tbody>
             <tr
-              v-for="(attempt, idx) in result.attempts"
+              v-for="(attempt, idx) in visibleAttempts"
               :key="idx"
               class="border-b last:border-b-0 align-top"
               :class="attemptRowClass(attempt.status)"
@@ -343,6 +395,12 @@
                 </div>
               </td>
               <td
+                v-if="showEndpointColumn"
+                class="px-3 py-2"
+              >
+                <code class="text-[11px] bg-muted px-1 py-0.5 rounded">{{ attempt.endpoint_api_format }}</code>
+              </td>
+              <td
                 v-if="hasEffectiveModel"
                 class="px-3 py-2 truncate"
                 :title="attempt.effective_model || '-'"
@@ -354,7 +412,7 @@
                   :variant="statusVariant(attempt.status)"
                   class="text-[10px] px-1.5 py-0"
                 >
-                  {{ attempt.status_code || statusLabel(attempt.status) }}
+                  {{ statusDisplay(attempt) }}
                 </Badge>
               </td>
               <td class="px-3 py-2 text-right text-muted-foreground tabular-nums">
@@ -402,7 +460,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { Loader2 } from 'lucide-vue-next'
 import { Dialog, Badge } from '@/components/ui'
 import Button from '@/components/ui/button.vue'
@@ -472,6 +530,67 @@ const successEffectiveModel = computed(() => {
 const hasEffectiveModel = computed(() => {
   if (!props.result) return false
   return props.result.attempts.some(a => a.effective_model && a.effective_model !== props.result?.model)
+})
+
+const showEndpointColumn = computed(() => {
+  if (!props.result) return false
+  if (props.mode === 'direct') return true
+  const formats = new Set(props.result.attempts.map(a => a.endpoint_api_format))
+  return formats.size > 1
+})
+
+const resultAttempts = computed(() => props.result?.attempts ?? [])
+const showAllAttempts = ref(false)
+
+watch(() => props.result, () => {
+  showAllAttempts.value = false
+})
+
+const shouldCollapseAttempts = computed(() => resultAttempts.value.length > 20)
+
+const visibleAttempts = computed(() => {
+  if (!shouldCollapseAttempts.value || showAllAttempts.value) {
+    return resultAttempts.value
+  }
+  return resultAttempts.value.slice(0, 20)
+})
+
+type AttemptSummaryItem = {
+  key: string
+  label: string
+  count: number
+  variant: 'success' | 'destructive' | 'secondary'
+}
+
+const attemptSummaryItems = computed<AttemptSummaryItem[]>(() => {
+  const groups = new Map<string, AttemptSummaryItem>()
+
+  for (const attempt of resultAttempts.value) {
+    const label = summarizeAttempt(attempt)
+    const key = `${attempt.status}:${label}`
+    const existing = groups.get(key)
+    if (existing) {
+      existing.count += 1
+      continue
+    }
+    groups.set(key, {
+      key,
+      label,
+      count: 1,
+      variant: statusVariant(attempt.status),
+    })
+  }
+
+  const variantRank: Record<AttemptSummaryItem['variant'], number> = {
+    destructive: 0,
+    secondary: 1,
+    success: 2,
+  }
+
+  return [...groups.values()].sort((left, right) => {
+    if (right.count !== left.count) return right.count - left.count
+    return variantRank[left.variant] - variantRank[right.variant]
+  })
 })
 
 const liveTraceSummary = computed(() => {
@@ -552,7 +671,7 @@ const liveRecentCandidates = computed(() => {
 
 function statusVariant(status: string) {
   if (status === 'success') return 'success' as const
-  if (status === 'failed') return 'destructive' as const
+  if (status === 'failed' || status === 'stream_interrupted') return 'destructive' as const
   return 'secondary' as const
 }
 
@@ -568,9 +687,44 @@ function statusLabel(status: string) {
   return status
 }
 
+function statusDisplay(item: { status: string; status_code?: number | null }): string {
+  const code = item.status_code
+  const status = item.status
+  if (!code) return statusLabel(status)
+  // 失败但 HTTP 状态码是 2xx：显示 "200 体内错误" 以区分
+  if (status === 'failed' && code >= 200 && code < 300) {
+    return `${code} 体内错误`
+  }
+  return String(code)
+}
+
+function compactDetail(value: string | null | undefined, maxLength = 64): string | null {
+  if (!value) return null
+  const compact = value.replace(/\s+/g, ' ').trim()
+  if (!compact) return null
+  return compact.length > maxLength ? `${compact.slice(0, maxLength)}…` : compact
+}
+
+function summarizeAttempt(attempt: TestAttemptDetail): string {
+  if (attempt.status === 'skipped') return '跳过'
+  if (attempt.status === 'cancelled') return '已取消'
+  if (attempt.status === 'success') return '成功'
+
+  const detail = compactDetail(attempt.error_message || attempt.skip_reason)
+  if (attempt.status_code != null) {
+    if (detail) return `${attempt.status_code} ${detail}`
+    if (attempt.status === 'failed' && attempt.status_code >= 200 && attempt.status_code < 300) {
+      return `${attempt.status_code} 体内错误`
+    }
+    return `${attempt.status_code} ${statusLabel(attempt.status)}`
+  }
+  return detail || statusLabel(attempt.status)
+}
+
 function attemptRowClass(status: string) {
   if (status === 'success') return 'bg-green-500/5'
   if (status === 'failed') return 'bg-red-500/5'
+  if (status === 'cancelled') return 'bg-amber-500/5'
   if (status === 'skipped') return 'bg-muted/20'
   return ''
 }
@@ -612,6 +766,7 @@ function traceCandidateDetail(candidate: CandidateRecord): string {
 }
 
 function attemptDetail(attempt: TestAttemptDetail): string {
+  if (attempt.status === 'cancelled') return '测试已取消'
   if (attempt.skip_reason) return attempt.skip_reason
   if (attempt.error_message) return attempt.error_message
   if (attempt.status === 'success') return attempt.endpoint_base_url

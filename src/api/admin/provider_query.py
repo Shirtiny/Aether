@@ -7,13 +7,17 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
+from collections.abc import Awaitable, Callable
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
-from sqlalchemy.orm import Session, joinedload
+from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel, Field
+from sqlalchemy import update
+from sqlalchemy.orm import Session, joinedload, make_transient
 
 from src.config.constants import TimeoutDefaults
 from src.core.api_format import get_extra_headers_from_endpoint
@@ -21,8 +25,9 @@ from src.core.cache_service import CacheService
 from src.core.crypto import crypto_service
 from src.core.logger import logger
 from src.core.provider_types import ProviderType
+from src.database import create_session
 from src.database.database import get_db
-from src.models.database import Provider, ProviderEndpoint, User
+from src.models.database import Provider, ProviderAPIKey, ProviderEndpoint, RequestCandidate, User
 from src.services.model.fetch_scheduler import (
     MODEL_FETCH_HTTP_TIMEOUT,
     UPSTREAM_MODELS_CACHE_TTL_SECONDS,
@@ -39,6 +44,7 @@ from src.services.model.upstream_fetcher import (
 )
 from src.services.provider.oauth_token import resolve_oauth_access_token
 from src.services.proxy_node.resolver import resolve_effective_proxy
+from src.services.request.candidate import RequestCandidateService
 from src.utils.auth_utils import get_current_user
 
 if TYPE_CHECKING:
@@ -209,6 +215,7 @@ class TestModelFailoverRequest(BaseModel):
     endpoint_id: str | None = None  # 指定仅使用该端点测试
     message: str | None = "Hello"
     request_id: str | None = None
+    concurrency: int = Field(default=1, ge=1, le=20)
 
 
 class TestAttemptDetail(BaseModel):
@@ -893,7 +900,7 @@ async def test_model(
 
         def _response_has_error(resp: dict) -> bool:
             """快速判断响应是否包含错误"""
-            if "error" in resp:
+            if resp.get("error"):
                 return True
             if resp.get("status_code", 0) != 200:
                 return True
@@ -905,7 +912,7 @@ async def test_model(
                     parsed = json.loads(resp_body)
                 except (json.JSONDecodeError, ValueError):
                     pass
-            if isinstance(parsed, dict) and "error" in parsed:
+            if isinstance(parsed, dict) and parsed.get("error"):
                 return True
             return False
 
@@ -987,7 +994,7 @@ async def test_model(
             except json.JSONDecodeError:
                 pass
 
-        if isinstance(parsed_body, dict) and "error" in parsed_body:
+        if isinstance(parsed_body, dict) and parsed_body.get("error"):
             error_obj = parsed_body["error"]
             # 兼容 error 可能是字典或字符串的情况
             if isinstance(error_obj, dict):
@@ -1055,7 +1062,7 @@ async def test_model(
                     status_code=upstream_status,
                     detail=str(error_obj)[:500] if error_obj else "Provider error",
                 )
-        elif "error" in response:
+        elif response.get("error"):
             logger.debug(f"[test-model] Error: {response['error']}")
             upstream_status = int(response.get("status_code", 0) or 500)
             if not (400 <= upstream_status <= 599):
@@ -1134,6 +1141,7 @@ def _build_direct_test_candidates(
     为直接测试模式构建候选列表。
 
     遍历 Provider 的活跃 Endpoint 和 Key，不经过 GlobalModel 解析。
+    按可用性排序：熔断器关闭 > 健康度高 > 连续失败少 > Key 优先级。
     """
     from src.services.scheduling.schemas import ProviderCandidate
 
@@ -1165,7 +1173,48 @@ def _build_direct_test_candidates(
                     provider_api_format=ep_format,
                 )
             )
+
+    candidates.sort(key=lambda c: _direct_candidate_sort_key(c))
     return candidates
+
+
+def _direct_candidate_sort_key(candidate: ProviderCandidate) -> tuple[int, float, int, int]:
+    """
+    按可用性排序候选：
+    1. 熔断器状态：关闭(0) > 打开(2)
+    2. 健康度评分：越高越好（取负值以升序排列）
+    3. 连续失败次数：越少越好
+    4. Key 优先级：数字越小越优先
+    """
+    key = candidate.key
+    ep_format = candidate.provider_api_format
+
+    # 熔断器状态
+    circuit_breaker_order = 0
+    cb_data = getattr(key, "circuit_breaker_by_format", None) or {}
+    cb_entry = cb_data.get(ep_format, {}) if isinstance(cb_data, dict) else {}
+    if isinstance(cb_entry, dict) and cb_entry.get("open"):
+        circuit_breaker_order = 2
+
+    # 健康度评分（默认 1.0 表示完全健康）
+    health_score = 1.0
+    consecutive_failures = 0
+    health_data = getattr(key, "health_by_format", None) or {}
+    health_entry = health_data.get(ep_format, {}) if isinstance(health_data, dict) else {}
+    if isinstance(health_entry, dict):
+        health_score = health_entry.get("health_score", 1.0)
+        consecutive_failures = health_entry.get("consecutive_failures", 0)
+
+    # Key 优先级
+    internal_priority_raw = getattr(key, "internal_priority", None)
+    try:
+        internal_priority = (
+            int(internal_priority_raw) if internal_priority_raw is not None else 999999
+        )
+    except (TypeError, ValueError):
+        internal_priority = 999999
+
+    return (circuit_breaker_order, -health_score, consecutive_failures, internal_priority)
 
 
 def _filter_test_candidates_by_endpoint(
@@ -1278,6 +1327,457 @@ def _build_test_candidate_meta(
     return by_pair, by_candidate
 
 
+def _flatten_test_candidates_for_concurrency(
+    candidates: list[ProviderCandidate],
+) -> list[ProviderCandidate]:
+    from src.services.scheduling.schemas import (
+        PoolCandidate,
+    )
+    from src.services.scheduling.schemas import ProviderCandidate as SchedulerCandidate
+
+    flattened: list[ProviderCandidate] = []
+    for candidate in candidates:
+        if not isinstance(candidate, PoolCandidate):
+            flattened.append(candidate)
+            continue
+
+        for pool_key in candidate.pool_keys or []:
+            key_skipped = candidate.is_skipped or bool(getattr(pool_key, "_pool_skipped", False))
+            key_skip_reason_raw = (
+                getattr(pool_key, "_pool_skip_reason", None) if key_skipped else None
+            )
+            key_skip_reason = (
+                str(key_skip_reason_raw)
+                if key_skip_reason_raw
+                else (str(candidate.skip_reason) if candidate.skip_reason else None)
+            )
+            flattened.append(
+                SchedulerCandidate(
+                    provider=candidate.provider,
+                    endpoint=candidate.endpoint,
+                    key=pool_key,
+                    is_cached=bool(getattr(candidate, "is_cached", False)),
+                    is_skipped=key_skipped,
+                    skip_reason=key_skip_reason,
+                    mapping_matched_model=(
+                        getattr(pool_key, "_pool_mapping_matched_model", None)
+                        or getattr(candidate, "mapping_matched_model", None)
+                    ),
+                    needs_conversion=bool(getattr(candidate, "needs_conversion", False)),
+                    provider_api_format=(
+                        getattr(candidate, "provider_api_format", "")
+                        or str(getattr(candidate.endpoint, "api_format", "") or "")
+                    ),
+                    output_limit=getattr(candidate, "output_limit", None),
+                    capability_miss_count=int(getattr(candidate, "capability_miss_count", 0) or 0),
+                )
+            )
+
+    return flattened
+
+
+def _build_test_candidate_extra_data(candidate: ProviderCandidate) -> dict[str, Any]:
+    extra_data: dict[str, Any] = {
+        "needs_conversion": bool(getattr(candidate, "needs_conversion", False)),
+        "provider_api_format": (
+            getattr(candidate, "provider_api_format", None)
+            or getattr(getattr(candidate, "endpoint", None), "api_format", None)
+        ),
+        "mapping_matched_model": (
+            getattr(candidate, "mapping_matched_model", None)
+            or getattr(getattr(candidate, "key", None), "_pool_mapping_matched_model", None)
+        ),
+    }
+    key_extra = getattr(getattr(candidate, "key", None), "_pool_extra_data", None)
+    if isinstance(key_extra, dict):
+        extra_data.update(key_extra)
+    return extra_data
+
+
+def _precreate_concurrent_test_records(
+    *,
+    db: Session,
+    request_id: str,
+    candidates: list[ProviderCandidate],
+    user: User | None,
+) -> dict[int, str]:
+    record_map: dict[int, str] = {}
+    rows: list[dict[str, Any]] = []
+
+    user_id = str(getattr(user, "id", "") or "") or None
+    now = datetime.now(timezone.utc)
+    for candidate_index, candidate in enumerate(candidates):
+        record_id = str(uuid4())
+        record_map[candidate_index] = record_id
+        rows.append(
+            {
+                "id": record_id,
+                "request_id": request_id,
+                "candidate_index": candidate_index,
+                "retry_index": 0,
+                "user_id": user_id,
+                "api_key_id": None,
+                "provider_id": str(getattr(candidate.provider, "id", "") or "") or None,
+                "endpoint_id": str(getattr(candidate.endpoint, "id", "") or "") or None,
+                "key_id": str(getattr(candidate.key, "id", "") or "") or None,
+                "status": (
+                    "skipped" if bool(getattr(candidate, "is_skipped", False)) else "available"
+                ),
+                "skip_reason": getattr(candidate, "skip_reason", None),
+                "is_cached": bool(getattr(candidate, "is_cached", False)),
+                "extra_data": _build_test_candidate_extra_data(candidate),
+                "required_capabilities": None,
+                "created_at": now,
+            }
+        )
+
+    if rows:
+        db.bulk_insert_mappings(RequestCandidate, rows)  # type: ignore[arg-type]
+        db.commit()
+
+    return record_map
+
+
+def _mark_concurrent_test_record_cancelled(record_id: str) -> None:
+    if not record_id:
+        return
+    with create_session() as local_db:
+        RequestCandidateService.mark_candidate_cancelled(
+            db=local_db,
+            candidate_id=record_id,
+            status_code=499,
+        )
+
+
+def _cancel_remaining_concurrent_test_records(request_id: str) -> None:
+    if not request_id:
+        return
+    with create_session() as local_db:
+        local_db.execute(
+            update(RequestCandidate)
+            .where(RequestCandidate.request_id == request_id)
+            .where(RequestCandidate.status.in_(["available", "pending"]))
+            .values(
+                status="cancelled",
+                status_code=499,
+                finished_at=datetime.now(timezone.utc),
+            )
+        )
+        local_db.commit()
+
+
+async def _execute_test_check(
+    *,
+    provider_obj: Any,
+    endpoint: Any,
+    key: Any,
+    effective_model: str,
+    request_payload: dict[str, Any],
+    request_timeout: float,
+    provider_type: str,
+    user: User | None,
+    db: Session | None,
+) -> tuple[dict[str, Any], str]:
+    effective_proxy = resolve_effective_proxy(
+        getattr(provider_obj, "proxy", None), getattr(key, "proxy", None)
+    )
+    try:
+        api_key_value, auth_config = await _resolve_key_auth(
+            key,
+            provider_obj,
+            provider_proxy_config=effective_proxy,
+        )
+    except _KeyAuthError as e:
+        raise RuntimeError(e.message) from e
+
+    auth_type = str(getattr(key, "auth_type", "api_key") or "api_key").lower()
+    extra_headers = get_extra_headers_from_endpoint(endpoint) or {}
+    if auth_type == "oauth":
+        account_id = (auth_config or {}).get("account_id")
+        if account_id:
+            extra_headers["chatgpt-account-id"] = str(account_id)
+
+    adapter_class = get_adapter_for_format(endpoint.api_format)
+    if not adapter_class:
+        raise ValueError(f"Unknown API format: {endpoint.api_format}")
+
+    response = await adapter_class.check_endpoint(
+        None,
+        endpoint.base_url,
+        api_key_value,
+        {
+            **request_payload,
+            "model": effective_model,
+        },
+        extra_headers if extra_headers else None,
+        body_rules=getattr(endpoint, "body_rules", None),
+        header_rules=getattr(endpoint, "header_rules", None),
+        db=db,
+        user=user,
+        provider_name=provider_obj.name,
+        provider_id=str(provider_obj.id),
+        api_key_id=str(key.id),
+        model_name=effective_model,
+        auth_type=auth_type,
+        provider_type=provider_type if provider_type else None,
+        decrypted_auth_config=auth_config if auth_config else None,
+        provider_endpoint=endpoint,
+        provider_api_key=key,
+        proxy_config=effective_proxy,
+        timeout_seconds=request_timeout,
+    )
+    return response, auth_type
+
+
+async def _run_concurrent_test(
+    *,
+    candidates: list[ProviderCandidate],
+    concurrency: int,
+    is_cancelled: Callable[[], Awaitable[bool]],
+    request_id: str,
+    request_payload: dict[str, Any],
+    effective_model_by_candidate_index: dict[int, str],
+    request_timeout: float,
+    provider_type: str,
+    user: User | None,
+    db: Session,
+) -> dict[str, Any]:
+    from src.core.exceptions import EmbeddedErrorException
+    from src.services.candidate.recorder import CandidateRecorder
+    from src.services.task.service import pool_on_error
+
+    semaphore = asyncio.Semaphore(max(1, concurrency))
+    record_map = _precreate_concurrent_test_records(
+        db=db,
+        request_id=request_id,
+        candidates=candidates,
+        user=user,
+    )
+
+    # 预加载所有候选的 provider/endpoint/key，避免每个 worker 重复查询
+    _preloaded: dict[int, tuple[Provider, ProviderEndpoint, ProviderAPIKey]] = {}
+    with create_session() as preload_db:
+        provider_ids = {str(getattr(c.provider, "id", "") or "") for c in candidates}
+        endpoint_ids = {str(getattr(c.endpoint, "id", "") or "") for c in candidates}
+        key_ids = {str(getattr(c.key, "id", "") or "") for c in candidates}
+        providers_by_id = {
+            str(p.id): p
+            for p in preload_db.query(Provider).filter(Provider.id.in_(provider_ids)).all()
+        }
+        endpoints_by_id = {
+            str(e.id): e
+            for e in preload_db.query(ProviderEndpoint)
+            .filter(ProviderEndpoint.id.in_(endpoint_ids))
+            .all()
+        }
+        keys_by_id = {
+            str(k.id): k
+            for k in preload_db.query(ProviderAPIKey).filter(ProviderAPIKey.id.in_(key_ids)).all()
+        }
+        _already_detached: set[int] = set()
+        for idx, cand in enumerate(candidates):
+            p = providers_by_id.get(str(getattr(cand.provider, "id", "") or ""))
+            e = endpoints_by_id.get(str(getattr(cand.endpoint, "id", "") or ""))
+            k = keys_by_id.get(str(getattr(cand.key, "id", "") or ""))
+            if p is not None and e is not None and k is not None:
+                # make_transient 将对象脱离 session 并保留已加载属性，
+                # 避免 expired 状态导致跨协程访问时触发 lazy load 报错。
+                # 同一个对象（多个 candidate 可能共享同一 provider/endpoint）
+                # 只需处理一次。
+                for obj in (p, e, k):
+                    obj_id = id(obj)
+                    if obj_id not in _already_detached:
+                        make_transient(obj)
+                        _already_detached.add(obj_id)
+                _preloaded[idx] = (p, e, k)
+
+    success_payload: dict[str, Any] = {}
+    success_event = asyncio.Event()
+    candidate_recorder = CandidateRecorder(db)
+    last_error: Exception | None = None
+
+    async def _worker(candidate_index: int) -> dict[str, Any]:
+        nonlocal last_error
+        record_id = record_map[candidate_index]
+
+        started = False
+        started_at = 0.0
+
+        try:
+            preloaded = _preloaded.get(candidate_index)
+            if preloaded is None:
+                raise RuntimeError("并发测试目标不存在或已被删除")
+            local_provider, local_endpoint, local_key = preloaded
+            if success_event.is_set() or await is_cancelled():
+                _mark_concurrent_test_record_cancelled(record_id)
+                return {"status": "cancelled"}
+
+            async with semaphore:
+                if success_event.is_set() or await is_cancelled():
+                    _mark_concurrent_test_record_cancelled(record_id)
+                    return {"status": "cancelled"}
+
+                with create_session() as update_db:
+                    RequestCandidateService.mark_candidate_started(update_db, record_id)
+
+                started = True
+                started_at = time.perf_counter()
+                response, auth_type = await _execute_test_check(
+                    provider_obj=local_provider,
+                    endpoint=local_endpoint,
+                    key=local_key,
+                    effective_model=effective_model_by_candidate_index.get(
+                        candidate_index,
+                        str(request_payload.get("model", "") or ""),
+                    ),
+                    request_payload=request_payload,
+                    request_timeout=request_timeout,
+                    provider_type=provider_type,
+                    user=user,
+                    db=None,
+                )
+                elapsed_ms = max(0, int((time.perf_counter() - started_at) * 1000))
+
+                with create_session() as parse_db:
+                    parse_key = (
+                        parse_db.query(ProviderAPIKey)
+                        .filter(ProviderAPIKey.id == str(getattr(local_key, "id", "") or ""))
+                        .first()
+                    )
+                    parsed = _extract_test_response_or_raise(
+                        response=response,
+                        endpoint=local_endpoint,
+                        provider_name=str(local_provider.name),
+                        auth_type=auth_type,
+                        api_key=parse_key or local_key,
+                        db=parse_db,
+                    )
+
+                with create_session() as update_db:
+                    RequestCandidateService.mark_candidate_success(
+                        db=update_db,
+                        candidate_id=record_id,
+                        status_code=200,
+                        latency_ms=elapsed_ms,
+                    )
+
+                if not success_event.is_set():
+                    success_payload.update(
+                        {
+                            "response": parsed,
+                            "candidate_index": candidate_index,
+                            "key_id": str(getattr(local_key, "id", "") or "") or None,
+                        }
+                    )
+                    success_event.set()
+                return {"status": "success"}
+        except asyncio.CancelledError:
+            if started or not success_event.is_set():
+                _mark_concurrent_test_record_cancelled(record_id)
+            return {"status": "cancelled"}
+        except Exception as exc:
+            last_error = exc
+            elapsed_ms = max(0, int((time.perf_counter() - started_at) * 1000)) if started else None
+            status_code = None
+            if isinstance(exc, httpx.HTTPStatusError):
+                status_code = int(exc.response.status_code)
+            elif isinstance(exc, httpx.TimeoutException):
+                status_code = 408
+            elif isinstance(exc, EmbeddedErrorException):
+                status_code = int(exc.error_code or 200)
+
+            loaded = _preloaded.get(candidate_index)
+            if loaded is not None and status_code is not None:
+                await pool_on_error(loaded[0], loaded[2], status_code, exc)
+
+            with create_session() as update_db:
+                RequestCandidateService.mark_candidate_failed(
+                    db=update_db,
+                    candidate_id=record_id,
+                    error_type=type(exc).__name__,
+                    error_message=str(
+                        getattr(exc, "error_message", None)
+                        or getattr(exc, "upstream_response", None)
+                        or exc
+                    ),
+                    status_code=status_code,
+                    latency_ms=elapsed_ms,
+                )
+            return {"status": "failed", "error": exc}
+
+    async def _watch_disconnect() -> bool:
+        while not success_event.is_set():
+            if await is_cancelled():
+                return True
+            await asyncio.sleep(0.1)
+        return False
+
+    tasks = [
+        asyncio.create_task(_worker(candidate_index))
+        for candidate_index, candidate in enumerate(candidates)
+        if not bool(getattr(candidate, "is_skipped", False))
+    ]
+    disconnect_task = asyncio.create_task(_watch_disconnect())
+    pending: set[asyncio.Task[Any]] = set(tasks)
+    pending.add(disconnect_task)
+
+    try:
+        while pending:
+            if pending == {disconnect_task}:
+                disconnect_task.cancel()
+                pending.clear()
+                break
+
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            if disconnect_task in done and disconnect_task.result() is True:
+                for task in pending:
+                    task.cancel()
+                break
+
+            for finished in done:
+                if finished is disconnect_task:
+                    continue
+                result = finished.result()
+                if result.get("status") == "success":
+                    for task in pending:
+                        task.cancel()
+                    pending.discard(disconnect_task)
+                    disconnect_task.cancel()
+                    break
+            if success_event.is_set():
+                break
+    finally:
+        await asyncio.gather(*pending, return_exceptions=True)
+        if not disconnect_task.done():
+            disconnect_task.cancel()
+        await asyncio.gather(disconnect_task, return_exceptions=True)
+
+    if success_event.is_set():
+        _cancel_remaining_concurrent_test_records(request_id)
+    elif await is_cancelled():
+        _cancel_remaining_concurrent_test_records(request_id)
+
+    try:
+        db.expire_all()
+        candidate_keys = candidate_recorder.get_candidate_keys(request_id)
+    except Exception:
+        candidate_keys = []
+
+    attempt_count = sum(
+        1
+        for item in candidate_keys
+        if str(getattr(item, "status", "") or "")
+        not in {"skipped", "cancelled", "available", "unused"}
+    )
+    return {
+        "success": success_event.is_set(),
+        "candidate_keys": candidate_keys,
+        "attempt_count": attempt_count,
+        "run_error": last_error,
+        "response": success_payload.get("response"),
+    }
+
+
 def _maybe_mark_test_oauth_key_invalid(
     *,
     db: Session,
@@ -1326,7 +1826,7 @@ def _extract_test_response_or_raise(
     if isinstance(parsed_payload, dict) and "response_body" in parsed_payload:
         parsed_payload = _parse_jsonish(parsed_payload.get("response_body"))
 
-    if isinstance(parsed_payload, dict) and "error" in parsed_payload:
+    if isinstance(parsed_payload, dict) and parsed_payload.get("error"):
         _maybe_mark_test_oauth_key_invalid(
             db=db,
             key=api_key,
@@ -1444,6 +1944,7 @@ def _build_test_attempts_from_candidate_keys(
 @router.post("/test-model-failover")
 async def test_model_failover(
     request: TestModelFailoverRequest,
+    http_request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> Any:
@@ -1571,25 +2072,6 @@ async def test_model_failover(
     provider_type = str(getattr(provider, "provider_type", "") or "").lower()
 
     async def _request_func(provider_obj: Any, endpoint: Any, key: Any, candidate: Any) -> Any:
-        effective_proxy = resolve_effective_proxy(
-            getattr(provider_obj, "proxy", None), getattr(key, "proxy", None)
-        )
-        try:
-            api_key_value, auth_config = await _resolve_key_auth(
-                key,
-                provider_obj,
-                provider_proxy_config=effective_proxy,
-            )
-        except _KeyAuthError as e:
-            raise RuntimeError(e.message) from e
-
-        auth_type = str(getattr(key, "auth_type", "api_key") or "api_key").lower()
-        extra_headers = get_extra_headers_from_endpoint(endpoint) or {}
-        if auth_type == "oauth":
-            account_id = (auth_config or {}).get("account_id")
-            if account_id:
-                extra_headers["chatgpt-account-id"] = str(account_id)
-
         effective_model = _resolve_test_effective_model(
             provider=provider,
             candidate=candidate,
@@ -1597,34 +2079,16 @@ async def test_model_failover(
             gm_obj=gm_obj,
             key=key,
         )
-        adapter_class = get_adapter_for_format(endpoint.api_format)
-        if not adapter_class:
-            raise ValueError(f"Unknown API format: {endpoint.api_format}")
-
-        response = await adapter_class.check_endpoint(
-            None,
-            endpoint.base_url,
-            api_key_value,
-            {
-                **request_payload,
-                "model": effective_model,
-            },
-            extra_headers if extra_headers else None,
-            body_rules=getattr(endpoint, "body_rules", None),
-            header_rules=getattr(endpoint, "header_rules", None),
-            db=db,
+        response, auth_type = await _execute_test_check(
+            provider_obj=provider_obj,
+            endpoint=endpoint,
+            key=key,
+            effective_model=effective_model,
+            request_payload=request_payload,
+            request_timeout=request_timeout,
+            provider_type=provider_type,
             user=current_user,
-            provider_name=provider_obj.name,
-            provider_id=str(provider_obj.id),
-            api_key_id=str(key.id),
-            model_name=effective_model,
-            auth_type=auth_type,
-            provider_type=provider_type if provider_type else None,
-            decrypted_auth_config=auth_config if auth_config else None,
-            provider_endpoint=endpoint,
-            provider_api_key=key,
-            proxy_config=effective_proxy,
-            timeout_seconds=request_timeout,
+            db=db,
         )
         return _extract_test_response_or_raise(
             response=response,
@@ -1639,46 +2103,97 @@ async def test_model_failover(
     task_service = TaskService(db)
     exec_result = None
     run_error: Exception | None = None
+    concurrent_result: dict[str, Any] | None = None
+    result_candidates = candidates
+
+    if request.concurrency > 1:
+        result_candidates = _flatten_test_candidates_for_concurrency(candidates)
+
+    candidate_meta_by_pair, candidate_meta_by_index = _build_test_candidate_meta(
+        candidates=result_candidates,
+        provider=provider,
+        request=request,
+        gm_obj=gm_obj,
+    )
+    effective_model_by_candidate_index = {
+        index: str(meta.get("effective_model") or request.model_name)
+        for index, meta in candidate_meta_by_index.items()
+    }
 
     try:
-        exec_result = await task_service.execute_sync_candidates(
-            api_format=client_format or "openai:chat",
-            model_name=request.model_name,
-            candidates=candidates,
-            request_func=_request_func,
-            request_id=request_id,
-            current_user=current_user,
-            user_api_key=None,
-            is_stream=False,
-            capability_requirements=None,
-            request_body_ref={"body": dict(request_payload)},
-            request_headers=None,
-            request_body=dict(request_payload),
-            affinity_key=f"provider-test:{provider.id}",
-            create_pending_usage=False,
-            enable_cache_affinity=False,
-        )
+        if request.concurrency > 1:
+            concurrent_result = await _run_concurrent_test(
+                candidates=result_candidates,
+                concurrency=request.concurrency,
+                is_cancelled=http_request.is_disconnected,
+                request_id=request_id,
+                request_payload=dict(request_payload),
+                effective_model_by_candidate_index=effective_model_by_candidate_index,
+                request_timeout=request_timeout,
+                provider_type=provider_type,
+                user=current_user,
+                db=db,
+            )
+        else:
+            exec_result = await task_service.execute_sync_candidates(
+                api_format=client_format or "openai:chat",
+                model_name=request.model_name,
+                candidates=result_candidates,
+                request_func=_request_func,
+                request_id=request_id,
+                current_user=current_user,
+                user_api_key=None,
+                is_stream=False,
+                capability_requirements=None,
+                request_body_ref={"body": dict(request_payload)},
+                request_headers=None,
+                request_body=dict(request_payload),
+                affinity_key=f"provider-test:{provider.id}",
+                create_pending_usage=False,
+                enable_cache_affinity=False,
+                is_cancelled=http_request.is_disconnected,
+            )
     except Exception as exc:
         run_error = exc
         logger.error("[test-model-failover] Error: {}", exc)
 
     try:
-        candidate_keys = candidate_recorder.get_candidate_keys(request_id)
+        candidate_keys = (
+            list(concurrent_result.get("candidate_keys", []))
+            if concurrent_result is not None
+            else candidate_recorder.get_candidate_keys(request_id)
+        )
     except Exception:
         candidate_keys = list(exec_result.candidate_keys) if exec_result else []
-
-    candidate_meta_by_pair, candidate_meta_by_index = _build_test_candidate_meta(
-        candidates=candidates,
-        provider=provider,
-        request=request,
-        gm_obj=gm_obj,
-    )
     attempts = _build_test_attempts_from_candidate_keys(
         candidate_keys=candidate_keys,
         candidate_meta_by_pair=candidate_meta_by_pair,
         candidate_meta_by_index=candidate_meta_by_index,
     )
-    total_attempts = sum(1 for attempt in attempts if attempt.status != "skipped")
+    total_attempts = (
+        int(exec_result.attempt_count)
+        if exec_result is not None
+        else (
+            int(concurrent_result.get("attempt_count", 0))
+            if concurrent_result is not None
+            else sum(1 for attempt in attempts if attempt.status not in {"skipped", "cancelled"})
+        )
+    )
+
+    if concurrent_result is not None and concurrent_result.get("success"):
+        return TestModelFailoverResponse(
+            success=True,
+            model=request.model_name,
+            provider={"id": str(provider.id), "name": provider.name},
+            attempts=attempts,
+            total_candidates=len(result_candidates),
+            total_attempts=total_attempts,
+            data={
+                "stream": True,
+                "response": concurrent_result.get("response"),
+            },
+            error=None,
+        ).model_dump()
 
     if exec_result and exec_result.success:
         return TestModelFailoverResponse(
@@ -1686,7 +2201,7 @@ async def test_model_failover(
             model=request.model_name,
             provider={"id": str(provider.id), "name": provider.name},
             attempts=attempts,
-            total_candidates=len(candidates),
+            total_candidates=len(result_candidates),
             total_attempts=exec_result.attempt_count,
             data={
                 "stream": True,
@@ -1703,6 +2218,10 @@ async def test_model_failover(
             error_message = str(run_error.upstream_response)[:500]
         if not error_message:
             error_message = str(run_error)
+    if not error_message and concurrent_result is not None and concurrent_result.get("run_error"):
+        error_message = str(concurrent_result.get("run_error"))
+    if not error_message and exec_result is not None and exec_result.error_message:
+        error_message = str(exec_result.error_message)
     if not error_message:
         failed_attempt = next(
             (attempt for attempt in reversed(attempts) if attempt.error_message),
@@ -1717,7 +2236,7 @@ async def test_model_failover(
         model=request.model_name,
         provider={"id": str(provider.id), "name": provider.name},
         attempts=attempts,
-        total_candidates=len(candidates),
+        total_candidates=len(result_candidates),
         total_attempts=total_attempts,
         error=str(error_message)[:500],
     ).model_dump()

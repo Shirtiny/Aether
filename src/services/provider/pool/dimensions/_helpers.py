@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import math
-import time
 from typing import Any
+
+from src.core.provider_types import ProviderType
+from src.services.provider_keys.quota_reader import get_quota_reader
 
 
 def safe_float(value: Any) -> float | None:
@@ -98,26 +100,10 @@ def extract_plan_type(key_obj: Any) -> str | None:
         return direct
 
     metadata = safe_metadata(key_obj)
-    codex = metadata.get("codex")
-    if isinstance(codex, dict):
-        codex_plan = normalize_plan(codex.get("plan_type"))
-        if codex_plan:
-            return codex_plan
-
-    kiro = metadata.get("kiro")
-    if isinstance(kiro, dict):
-        subscription_title = normalize_plan(kiro.get("subscription_title"))
-        if subscription_title:
-            # Normalize common Kiro labels into free/team buckets used by free_team_first.
-            if "team" in subscription_title:
-                return "team"
-            if "free" in subscription_title:
-                return "free"
-            if "pro" in subscription_title:
-                return "pro"
-            if "plus" in subscription_title:
-                return "plus"
-            return subscription_title
+    for provider_type in (ProviderType.CODEX, ProviderType.KIRO, ProviderType.ANTIGRAVITY):
+        plan_type = get_quota_reader(provider_type, metadata).plan_type()
+        if plan_type:
+            return plan_type
 
     return None
 
@@ -126,19 +112,11 @@ def extract_reset_seconds(key_obj: Any) -> float | None:
     metadata = safe_metadata(key_obj)
     candidates: list[float] = []
 
-    codex = metadata.get("codex")
-    if isinstance(codex, dict):
-        for field in ("secondary_reset_seconds", "primary_reset_seconds"):
-            parsed = safe_float(codex.get(field))
-            if parsed is None or parsed < 0:
-                continue
-            candidates.append(parsed)
-
-    kiro = metadata.get("kiro")
-    if isinstance(kiro, dict):
-        next_reset_at = safe_float(kiro.get("next_reset_at"))
-        if next_reset_at is not None and next_reset_at > 0:
-            candidates.append(max(0.0, next_reset_at - time.time()))
+    for provider_type in (ProviderType.CODEX, ProviderType.KIRO, ProviderType.ANTIGRAVITY):
+        reset_seconds = get_quota_reader(provider_type, metadata).reset_seconds()
+        if reset_seconds is None:
+            continue
+        candidates.append(reset_seconds)
 
     if not candidates:
         return None
@@ -148,41 +126,10 @@ def extract_reset_seconds(key_obj: Any) -> float | None:
 def extract_usage_ratio(key_obj: Any) -> float | None:
     metadata = safe_metadata(key_obj)
 
-    codex = metadata.get("codex")
-    if isinstance(codex, dict):
-        codex_values: list[float] = []
-        for field in ("primary_used_percent", "secondary_used_percent"):
-            parsed = safe_float(codex.get(field))
-            if parsed is None:
-                continue
-            codex_values.append(max(0.0, min(parsed, 100.0)) / 100.0)
-        if codex_values:
-            return sum(codex_values) / len(codex_values)
-
-    kiro = metadata.get("kiro")
-    if isinstance(kiro, dict):
-        parsed = safe_float(kiro.get("usage_percentage"))
-        if parsed is not None:
-            return max(0.0, min(parsed, 100.0)) / 100.0
-
-    antigravity = metadata.get("antigravity")
-    if isinstance(antigravity, dict):
-        quota_by_model = antigravity.get("quota_by_model")
-        if isinstance(quota_by_model, dict):
-            usage_values: list[float] = []
-            for model_info in quota_by_model.values():
-                if not isinstance(model_info, dict):
-                    continue
-                used_percent = safe_float(model_info.get("used_percent"))
-                if used_percent is None:
-                    remaining_fraction = safe_float(model_info.get("remaining_fraction"))
-                    if remaining_fraction is not None:
-                        used_percent = (1.0 - remaining_fraction) * 100.0
-                if used_percent is None:
-                    continue
-                usage_values.append(max(0.0, min(used_percent, 100.0)) / 100.0)
-            if usage_values:
-                return sum(usage_values) / len(usage_values)
+    for provider_type in (ProviderType.CODEX, ProviderType.KIRO, ProviderType.ANTIGRAVITY):
+        usage_ratio = get_quota_reader(provider_type, metadata).usage_ratio()
+        if usage_ratio is not None:
+            return usage_ratio
 
     return None
 

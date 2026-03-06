@@ -202,7 +202,11 @@ export async function refreshProviderQuota(
   keyIds?: string[],
 ): Promise<RefreshQuotaResult> {
   const body = keyIds && keyIds.length > 0 ? { key_ids: keyIds } : undefined
-  const response = await client.post(`/api/admin/endpoints/providers/${providerId}/refresh-quota`, body)
+  const response = await client.post(
+    `/api/admin/endpoints/providers/${providerId}/refresh-quota`,
+    body,
+    { timeout: 5 * 60 * 1000 },
+  )
   return response.data
 }
 

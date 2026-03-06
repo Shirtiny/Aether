@@ -26,6 +26,13 @@ from src.services.provider_keys.quota_refresh import (
 QuotaRefreshHandler = Callable[..., Awaitable[dict]]
 
 
+_QUOTA_REFRESH_HANDLERS: dict[str, QuotaRefreshHandler] = {
+    ProviderType.CODEX: refresh_codex_key_quota,
+    ProviderType.ANTIGRAVITY: refresh_antigravity_key_quota,
+    ProviderType.KIRO: refresh_kiro_key_quota,
+}
+
+
 def _normalize_api_format(api_format: Any) -> str:
     """规范化 api_format，兼容大小写和首尾空白。"""
     if not isinstance(api_format, str):
@@ -55,12 +62,9 @@ def _select_refresh_endpoint(provider: Provider, provider_type: str) -> Provider
 
 def _resolve_quota_refresh_handler(provider_type: str) -> QuotaRefreshHandler:
     """按 provider 类型返回刷新策略。"""
-    if provider_type == ProviderType.CODEX:
-        return refresh_codex_key_quota
-    if provider_type == ProviderType.ANTIGRAVITY:
-        return refresh_antigravity_key_quota
-    if provider_type == ProviderType.KIRO:
-        return refresh_kiro_key_quota
+    handler = _QUOTA_REFRESH_HANDLERS.get(provider_type)
+    if handler is not None:
+        return handler
     raise InvalidRequestException("仅支持 Codex / Antigravity / Kiro 类型的 Provider 刷新限额")
 
 

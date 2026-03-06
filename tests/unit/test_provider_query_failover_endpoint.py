@@ -1,11 +1,17 @@
 from types import SimpleNamespace
 
+import pytest
+from pydantic import ValidationError
+
+from src.api.admin.provider_query import TestModelFailoverRequest as FailoverRequestModel
 from src.api.admin.provider_query import (
     _build_direct_test_candidates,
     _build_test_attempts_from_candidate_keys,
     _filter_test_candidates_by_endpoint,
+    _flatten_test_candidates_for_concurrency,
     _resolve_test_effective_model,
 )
+from src.services.scheduling.schemas import PoolCandidate
 
 
 def _build_provider() -> tuple[SimpleNamespace, SimpleNamespace, SimpleNamespace]:
@@ -89,3 +95,56 @@ def test_build_test_attempts_from_candidate_keys_includes_retry_index() -> None:
     assert attempts[0].retry_index == 1
     assert attempts[0].effective_model == "mapped-model"
     assert attempts[0].endpoint_api_format == "openai:chat"
+
+
+def test_flatten_test_candidates_for_concurrency_expands_pool_keys() -> None:
+    provider, endpoint_a, _endpoint_b = _build_provider()
+    pool_key_a = SimpleNamespace(
+        id="pool-a",
+        name="Pool A",
+        auth_type="oauth",
+        _pool_mapping_matched_model="mapped-a",
+    )
+    pool_key_b = SimpleNamespace(
+        id="pool-b",
+        name="Pool B",
+        auth_type="oauth",
+        _pool_skipped=True,
+        _pool_skip_reason="quota_exhausted",
+    )
+    candidate = PoolCandidate(
+        provider=provider,  # type: ignore[arg-type]
+        endpoint=endpoint_a,  # type: ignore[arg-type]
+        key=pool_key_a,  # type: ignore[arg-type]
+        pool_keys=[pool_key_a, pool_key_b],  # type: ignore[list-item]
+        is_cached=True,
+        provider_api_format="openai:chat",
+    )
+
+    flattened = _flatten_test_candidates_for_concurrency([candidate])
+
+    assert len(flattened) == 2
+    assert flattened[0].key.id == "pool-a"
+    assert flattened[0].mapping_matched_model == "mapped-a"
+    assert flattened[0].is_skipped is False
+    assert flattened[1].key.id == "pool-b"
+    assert flattened[1].is_skipped is True
+    assert flattened[1].skip_reason == "quota_exhausted"
+
+
+def test_test_model_failover_request_validates_concurrency_range() -> None:
+    ok = FailoverRequestModel(
+        provider_id="p1",
+        mode="global",
+        model_name="gpt-4o-mini",
+        concurrency=5,
+    )
+    assert ok.concurrency == 5
+
+    with pytest.raises(ValidationError):
+        FailoverRequestModel(
+            provider_id="p1",
+            mode="global",
+            model_name="gpt-4o-mini",
+            concurrency=0,
+        )

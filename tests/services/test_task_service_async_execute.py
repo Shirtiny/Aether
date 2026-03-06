@@ -5,8 +5,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from src.core.exceptions import EmbeddedErrorException
 from src.services.candidate.schema import CandidateKey
 from src.services.candidate.submit import SubmitOutcome
+from src.services.request.executor import ExecutionContext, ExecutionError
+from src.services.task import service as task_service_module
 from src.services.task.context import TaskMode
 from src.services.task.protocol import AttemptKind
 from src.services.task.service import TaskService
@@ -107,3 +110,115 @@ async def test_task_service_execute_sync_passes_request_headers_and_body() -> No
     assert kwargs["request_headers"] == request_headers
     assert kwargs["request_body"] == request_body
     assert kwargs["request_body_ref"] == request_body_ref
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("is_client_error", "retry_index", "max_retries_for_candidate", "expected_action"),
+    [
+        (True, 0, 1, "break"),
+        (False, 0, 2, "continue"),
+    ],
+)
+async def test_task_service_embedded_error_branch_applies_pool_health_policy(
+    monkeypatch: pytest.MonkeyPatch,
+    is_client_error: bool,
+    retry_index: int,
+    max_retries_for_candidate: int,
+    expected_action: str,
+) -> None:
+    db = MagicMock()
+    svc = TaskService(db)
+
+    monkeypatch.setattr(
+        task_service_module.RequestCandidateService, "mark_candidate_failed", MagicMock()
+    )
+    monkeypatch.setattr(
+        "src.services.proxy_node.resolver.resolve_effective_proxy",
+        lambda provider_proxy, key_proxy: provider_proxy or key_proxy,
+    )
+    monkeypatch.setattr("src.services.proxy_node.resolver.resolve_proxy_info", lambda _proxy: None)
+
+    pool_on_error = AsyncMock()
+    monkeypatch.setattr(svc, "_pool_on_error", pool_on_error)
+
+    candidate = SimpleNamespace(
+        provider=SimpleNamespace(id="p1", name="prov", proxy=None),
+        endpoint=SimpleNamespace(id="e1"),
+        key=SimpleNamespace(id="k1", proxy=None),
+    )
+    cause = EmbeddedErrorException(
+        provider_name="prov",
+        error_code=429,
+        error_message="usage_limit_reached",
+        error_status="RESOURCE_EXHAUSTED",
+    )
+    context = ExecutionContext(
+        candidate_id="cid-1",
+        candidate_index=0,
+        provider_id="p1",
+        endpoint_id="e1",
+        key_id="k1",
+        user_id=None,
+        api_key_id=None,
+        is_cached_user=False,
+        elapsed_ms=12,
+        concurrent_requests=3,
+    )
+    exec_err = ExecutionError(cause, context)
+    classifier = SimpleNamespace(is_client_error=lambda _text: is_client_error)
+
+    action = await svc._handle_candidate_error(
+        exec_err=exec_err,
+        candidate=candidate,
+        candidate_record_id="cand-1",
+        retry_index=retry_index,
+        max_retries_for_candidate=max_retries_for_candidate,
+        affinity_key="provider-test:p1",
+        api_format="openai:chat",
+        global_model_id="gpt-4o-mini",
+        request_id="req-1",
+        attempt=1,
+        max_attempts=3,
+        error_classifier=classifier,
+    )
+
+    assert action == expected_action
+    pool_on_error.assert_awaited_once_with(candidate.provider, candidate.key, 429, cause)
+
+
+@pytest.mark.asyncio
+async def test_task_service_pool_on_error_uses_embedded_error_message_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = MagicMock()
+    svc = TaskService(db)
+
+    parsed_pool_cfg = object()
+    apply_health_policy = AsyncMock()
+    monkeypatch.setattr(
+        "src.services.provider.pool.config.parse_pool_config", lambda _cfg: parsed_pool_cfg
+    )
+    monkeypatch.setattr(
+        "src.services.provider.pool.health_policy.apply_health_policy",
+        apply_health_policy,
+    )
+
+    provider = SimpleNamespace(id="p1", config={})
+    key = SimpleNamespace(id="k1")
+    cause = EmbeddedErrorException(
+        provider_name="prov",
+        error_code=429,
+        error_message="usage_limit_reached",
+    )
+
+    await svc._pool_on_error(provider, key, 429, cause)
+
+    apply_health_policy.assert_awaited_once()
+    kwargs = apply_health_policy.await_args.kwargs
+    assert kwargs["provider_id"] == "p1"
+    assert kwargs["key_id"] == "k1"
+    assert kwargs["status_code"] == 429
+    assert kwargs["error_body"] == "usage_limit_reached"
+    assert kwargs["response_headers"] == {}
+    assert kwargs["config"] is parsed_pool_cfg

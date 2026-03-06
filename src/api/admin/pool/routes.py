@@ -37,6 +37,7 @@ from src.services.provider.pool.scheduling_dimensions import (
     evaluate_pool_scheduling_dimensions,
     summarize_pool_scheduling_dimensions,
 )
+from src.services.provider_keys.quota_reader import get_quota_reader
 
 from .schemas import (
     BatchActionRequest,
@@ -197,180 +198,12 @@ def _is_known_banned_key(key: ProviderAPIKey, provider_type: str) -> bool:
     return state.blocked
 
 
-def _format_percent(value: float) -> str:
-    clamped = max(0.0, min(value, 100.0))
-    return f"{clamped:.1f}%"
-
-
-def _format_quota_value(value: float) -> str:
-    rounded = round(value)
-    if abs(value - rounded) < 1e-6:
-        return str(rounded)
-    return f"{value:.1f}"
-
-
-def _format_reset_after(seconds_raw: Any) -> str | None:
-    seconds = _to_float(seconds_raw)
-    if seconds is None:
-        return None
-
-    total_seconds = int(seconds)
-    if total_seconds <= 0:
-        return "已重置"
-
-    days = total_seconds // 86400
-    hours = (total_seconds % 86400) // 3600
-    minutes = (total_seconds % 3600) // 60
-
-    if days > 0:
-        return f"{days}天{hours}小时后重置"
-    if hours > 0:
-        return f"{hours}小时{minutes}分钟后重置"
-    if minutes > 0:
-        return f"{minutes}分钟后重置"
-    return "即将重置"
-
-
-def _build_codex_account_quota(upstream_metadata: dict[str, Any]) -> str | None:
-    codex = upstream_metadata.get("codex")
-    if not isinstance(codex, dict):
-        return None
-
-    parts: list[str] = []
-
-    primary_used = _to_float(codex.get("primary_used_percent"))
-    if primary_used is not None:
-        part = f"周剩余 {_format_percent(100.0 - primary_used)}"
-        reset_text = _format_reset_after(codex.get("primary_reset_seconds"))
-        if reset_text:
-            part = f"{part} ({reset_text})"
-        parts.append(part)
-
-    secondary_used = _to_float(codex.get("secondary_used_percent"))
-    if secondary_used is not None:
-        part = f"5H剩余 {_format_percent(100.0 - secondary_used)}"
-        reset_text = _format_reset_after(codex.get("secondary_reset_seconds"))
-        if reset_text:
-            part = f"{part} ({reset_text})"
-        parts.append(part)
-
-    if parts:
-        return " | ".join(parts)
-
-    has_credits = codex.get("has_credits")
-    credits_balance = _to_float(codex.get("credits_balance"))
-    if has_credits is True and credits_balance is not None:
-        return f"积分 {credits_balance:.2f}"
-    if has_credits is True:
-        return "有积分"
-    return None
-
-
-def _build_kiro_account_quota(upstream_metadata: dict[str, Any]) -> str | None:
-    kiro = upstream_metadata.get("kiro")
-    if not isinstance(kiro, dict):
-        return None
-
-    if kiro.get("is_banned") is True:
-        return "账号已封禁"
-
-    usage_percentage = _to_float(kiro.get("usage_percentage"))
-    if usage_percentage is not None:
-        remaining = 100.0 - usage_percentage
-        current_usage = _to_float(kiro.get("current_usage"))
-        usage_limit = _to_float(kiro.get("usage_limit"))
-        if current_usage is not None and usage_limit is not None and usage_limit > 0:
-            return (
-                f"剩余 {_format_percent(remaining)} "
-                f"({_format_quota_value(current_usage)}/{_format_quota_value(usage_limit)})"
-            )
-        return f"剩余 {_format_percent(remaining)}"
-
-    remaining = _to_float(kiro.get("remaining"))
-    usage_limit = _to_float(kiro.get("usage_limit"))
-    if remaining is not None and usage_limit is not None and usage_limit > 0:
-        return f"剩余 {_format_quota_value(remaining)}/{_format_quota_value(usage_limit)}"
-    return None
-
-
-def _build_antigravity_account_quota(upstream_metadata: dict[str, Any]) -> str | None:
-    antigravity = upstream_metadata.get("antigravity")
-    if not isinstance(antigravity, dict):
-        return None
-
-    if antigravity.get("is_forbidden") is True:
-        return "访问受限"
-
-    quota_by_model = antigravity.get("quota_by_model")
-    if not isinstance(quota_by_model, dict) or not quota_by_model:
-        return None
-
-    remaining_list: list[float] = []
-    for raw_info in quota_by_model.values():
-        if not isinstance(raw_info, dict):
-            continue
-
-        used_percent = _to_float(raw_info.get("used_percent"))
-        if used_percent is None:
-            remaining_fraction = _to_float(raw_info.get("remaining_fraction"))
-            if remaining_fraction is not None:
-                used_percent = (1.0 - remaining_fraction) * 100.0
-
-        if used_percent is None:
-            continue
-
-        remaining = max(0.0, min(100.0 - used_percent, 100.0))
-        remaining_list.append(remaining)
-
-    if not remaining_list:
-        return None
-
-    min_remaining = min(remaining_list)
-    if len(remaining_list) == 1:
-        return f"剩余 {_format_percent(min_remaining)}"
-    return f"最低剩余 {_format_percent(min_remaining)} ({len(remaining_list)} 模型)"
-
-
 def _build_account_quota(provider_type: str, upstream_metadata: Any) -> str | None:
-    if not isinstance(upstream_metadata, dict):
-        return None
-
-    normalized_type = provider_type.strip().lower()
-    if normalized_type == "codex":
-        return _build_codex_account_quota(upstream_metadata)
-    if normalized_type == "kiro":
-        return _build_kiro_account_quota(upstream_metadata)
-    if normalized_type == "antigravity":
-        return _build_antigravity_account_quota(upstream_metadata)
-    return None
+    return get_quota_reader(provider_type, upstream_metadata).display_summary()
 
 
 def _extract_quota_updated_at(provider_type: str, upstream_metadata: Any) -> int | None:
-    if not isinstance(upstream_metadata, dict):
-        return None
-
-    normalized_type = provider_type.strip().lower()
-    if normalized_type == "codex":
-        source = upstream_metadata.get("codex")
-    elif normalized_type == "antigravity":
-        source = upstream_metadata.get("antigravity")
-    elif normalized_type == "kiro":
-        source = upstream_metadata.get("kiro")
-    else:
-        return None
-
-    if not isinstance(source, dict):
-        return None
-
-    updated_at = _to_float(source.get("updated_at"))
-    if updated_at is None or updated_at <= 0:
-        return None
-
-    # 部分上游可能返回毫秒时间戳，统一转换为秒
-    if updated_at > 1_000_000_000_000:
-        updated_at /= 1000
-
-    return int(updated_at)
+    return get_quota_reader(provider_type, upstream_metadata).updated_at()
 
 
 def _normalize_oauth_plan_type(plan_type: Any, provider_type: str) -> str | None:

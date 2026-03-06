@@ -600,11 +600,25 @@ async function executeAction(): Promise<void> {
   try {
     if (selectedAction.value === 'refresh_quota') {
       const targetIds = selectedKeys.map((key) => key.key_id)
-      const result = await refreshProviderQuota(props.providerId, targetIds)
-      successCount = Number(result.success || 0)
-      failedCount = Number(result.failed || 0)
-      skippedCount = Math.max(0, targetIds.length - Number(result.total || 0))
-      progressDone.value = targetIds.length
+      const BATCH_SIZE = 20
+      const totalBatches = Math.ceil(targetIds.length / BATCH_SIZE)
+
+      for (let i = 0; i < targetIds.length; i += BATCH_SIZE) {
+        const batchIndex = Math.floor(i / BATCH_SIZE) + 1
+        const batch = targetIds.slice(i, i + BATCH_SIZE)
+        progressLabel.value = `正在${actionLabel}...（第 ${batchIndex}/${totalBatches} 批）`
+
+        try {
+          const result = await refreshProviderQuota(props.providerId, batch)
+          successCount += Number(result.success || 0)
+          failedCount += Number(result.failed || 0)
+          skippedCount += Math.max(0, batch.length - Number(result.total || 0))
+        } catch {
+          failedCount += batch.length
+        }
+
+        progressDone.value = Math.min(i + BATCH_SIZE, targetIds.length)
+      }
     } else {
       const CONCURRENCY = props.batchConcurrency || 8
       const taskForKey = (key: PoolKeyDetail): (() => Promise<'success' | 'skip'>) | null => {
