@@ -10,7 +10,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "aether-proxy"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -21,6 +21,9 @@ dependencies = [
  "flate2",
  "futures-util",
  "hex",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "libc",
  "ratatui",
  "reqwest",
@@ -33,8 +36,10 @@ dependencies = [
  "tar",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-rustls",
  "tokio-tungstenite",
  "toml",
+ "tower-service",
  "tracing",
  "tracing-subscriber",
  "url",

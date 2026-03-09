@@ -456,3 +456,49 @@ async def test_error_stop_pattern_without_status_codes_matches_any() -> None:
     # No status_codes filter, pattern matches -> stop
     assert result.success is False
     assert attempt.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_failover_engine_applies_backoff_every_tenth_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = MagicMock()
+    engine = FailoverEngine(db, error_classifier=_StubErrorClassifier(action=ErrorAction.BREAK))
+
+    sleep_mock = AsyncMock()
+    rotate_mock = AsyncMock(return_value=False)
+    monkeypatch.setattr("src.services.candidate.failover.asyncio.sleep", sleep_mock)
+    monkeypatch.setattr(engine, "_rotate_upstream_client", rotate_mock)
+
+    await engine._apply_retry_pacing(
+        candidate=_make_candidate(),
+        consecutive_failures=10,
+        error=RuntimeError("boom"),
+        request_id="req-1",
+    )
+
+    sleep_mock.assert_awaited_once()
+    rotate_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_failover_engine_rotates_client_on_stream_capacity_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = MagicMock()
+    engine = FailoverEngine(db, error_classifier=_StubErrorClassifier(action=ErrorAction.BREAK))
+
+    sleep_mock = AsyncMock()
+    rotate_mock = AsyncMock(return_value=True)
+    monkeypatch.setattr("src.services.candidate.failover.asyncio.sleep", sleep_mock)
+    monkeypatch.setattr(engine, "_rotate_upstream_client", rotate_mock)
+
+    await engine._apply_retry_pacing(
+        candidate=_make_candidate(),
+        consecutive_failures=3,
+        error=RuntimeError("LocalProtocolError: Max outbound streams is 100, 100 open"),
+        request_id="req-2",
+    )
+
+    rotate_mock.assert_awaited_once()
+    sleep_mock.assert_awaited_once()

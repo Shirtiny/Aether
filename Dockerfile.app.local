@@ -145,6 +145,15 @@ RUN printf '%s\n' \
     '        proxy_set_header Content-Type $content_type;' \
     '        proxy_set_header Authorization $http_authorization;' \
     '        proxy_set_header X-Api-Key $http_x_api_key;' \
+    '        # 剥离 CF 头，防止泄露给上游 AI 提供商' \
+    '        proxy_set_header CF-Connecting-IP "";' \
+    '        proxy_set_header CF-IPCountry "";' \
+    '        proxy_set_header CF-Ray "";' \
+    '        proxy_set_header CF-Visitor "";' \
+    '        proxy_set_header CDN-Loop "";' \
+    '        proxy_set_header True-Client-IP "";' \
+    '        proxy_set_header CF-Worker "";' \
+    '        proxy_set_header CF-EW-Via "";' \
     '        proxy_buffering off;' \
     '        proxy_cache off;' \
     '        proxy_request_buffering off;' \

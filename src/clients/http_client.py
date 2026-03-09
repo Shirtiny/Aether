@@ -458,6 +458,68 @@ class HTTPClientPool:
         return httpx.AsyncClient(**client_config)  # type: ignore[arg-type]
 
     @classmethod
+    async def reset_upstream_client(
+        cls,
+        delegate_cfg: dict[str, Any] | None,
+        proxy_config: dict[str, Any] | None = None,
+        tls_profile: str | None = None,
+    ) -> bool:
+        """Reset cached upstream client for the given proxy/tunnel route.
+
+        Returns True when a cached client was closed and removed.
+        For the shared no-proxy default client this is a no-op to avoid
+        disrupting unrelated in-flight requests.
+        """
+        if delegate_cfg and delegate_cfg.get("tunnel"):
+            node_id = str(delegate_cfg.get("node_id") or "")
+            if not node_id:
+                return False
+            lock = cls._get_proxy_clients_lock()
+            async with lock:
+                client = cls._tunnel_clients.pop(node_id, None)
+            if client is None:
+                return False
+            try:
+                await client.aclose()
+            except Exception as exc:
+                logger.warning("关闭 Tunnel 客户端失败(node_id={}): {}", node_id, exc)
+            return True
+
+        if not proxy_config:
+            proxy_config = get_system_proxy_config()
+
+        base_cache_key = compute_proxy_cache_key(proxy_config)
+        if base_cache_key == "__no_proxy__":
+            return False
+
+        cache_key_prefixes = [base_cache_key]
+        tls_profile_key = str(tls_profile or "").strip().lower()
+        if tls_profile_key:
+            cache_key_prefixes = [f"{base_cache_key}::tls:{tls_profile_key}"]
+
+        lock = cls._get_proxy_clients_lock()
+        async with lock:
+            keys_to_remove = [
+                key
+                for key in list(cls._proxy_clients.keys())
+                if any(
+                    key == prefix
+                    or key.startswith(f"{prefix}::")
+                    or key.startswith(f"{prefix}::tls:")
+                    for prefix in cache_key_prefixes
+                )
+            ]
+            clients = [cls._proxy_clients.pop(key)[0] for key in keys_to_remove]
+
+        for client in clients:
+            try:
+                await client.aclose()
+            except Exception as exc:
+                logger.warning("关闭上游代理客户端失败: {}", exc)
+
+        return bool(clients)
+
+    @classmethod
     async def get_upstream_client(
         cls,
         delegate_cfg: dict[str, Any] | None,

@@ -566,7 +566,12 @@ const proxyTimingBreakdown = (proxy: Record<string, unknown>): string => {
   }
 
   const ttfbMs = t.ttfb_ms ?? t.upstream_ms
-  const processingMs = t.upstream_processing_ms ?? (
+  const responseWaitMs = t.response_wait_ms ?? (
+    t.connection_acquire_ms != null && ttfbMs != null
+      ? Math.max(0, (ttfbMs as number) - (t.connection_acquire_ms as number))
+      : null
+  )
+  const legacyWaitMs = t.upstream_processing_ms ?? (
     ttfbMs != null && t.connect_ms != null && t.tls_ms != null
       ? Math.max(0, (ttfbMs as number) - (t.connect_ms as number) - (t.tls_ms as number))
       : null
@@ -574,6 +579,9 @@ const proxyTimingBreakdown = (proxy: Record<string, unknown>): string => {
 
   if (t.dns_ms != null && (t.dns_ms as number) > 0) {
     parts.push(`DNS ${formatLatency(t.dns_ms as number)}`)
+  }
+  if (t.connection_reused === true) {
+    parts.push('复用连接')
   }
   if (t.connect_ms != null && (t.connect_ms as number) > 0) {
     parts.push(`连接 ${formatLatency(t.connect_ms as number)}`)
@@ -584,8 +592,10 @@ const proxyTimingBreakdown = (proxy: Record<string, unknown>): string => {
   if (ttfbMs != null && (ttfbMs as number) > 0) {
     parts.push(`TTFB ${formatLatency(ttfbMs as number)}`)
   }
-  if (processingMs != null && (processingMs as number) > 0) {
-    parts.push(`上游处理 ${formatLatency(Math.round(processingMs as number))}`)
+  if (responseWaitMs != null && (responseWaitMs as number) > 0) {
+    parts.push(`等待响应头 ${formatLatency(Math.round(responseWaitMs as number))}`)
+  } else if (legacyWaitMs != null && (legacyWaitMs as number) > 0) {
+    parts.push(`等待响应头(旧版估算) ${formatLatency(Math.round(legacyWaitMs as number))}`)
   }
 
   // 计算 Aether→代理 之间无法解释的耗时差

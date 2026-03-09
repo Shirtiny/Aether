@@ -192,7 +192,6 @@ def register_all() -> None:
         },
     )
     register_provider_default_body_rules("codex", "openai:cli", _codex_body_rules)
-    register_provider_default_body_rules("codex", "openai:compact", _codex_body_rules)
 
     # Export: Codex uses the default export builder (strip null + temp fields)
     # No need to register a custom one — the default in export.py suffices.

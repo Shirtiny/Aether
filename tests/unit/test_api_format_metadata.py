@@ -14,9 +14,9 @@ def test_get_default_body_rules_for_endpoint_returns_empty_for_no_rules() -> Non
     assert get_default_body_rules_for_endpoint("claude:chat") == []
 
 
-def test_get_default_body_rules_for_endpoint_returns_codex_rules() -> None:
-    """openai:cli 和 openai:compact 应返回 Codex 默认规则。"""
-    cli_rules = get_default_body_rules_for_endpoint("openai:cli")
+def test_get_default_body_rules_for_endpoint_returns_codex_cli_rules_only() -> None:
+    """只有 codex + openai:cli 返回默认请求体规则。"""
+    cli_rules = get_default_body_rules_for_endpoint("openai:cli", provider_type="codex")
     assert len(cli_rules) == 5
     actions = [r["action"] for r in cli_rules]
     assert actions == ["drop", "drop", "drop", "set", "set"]
@@ -27,8 +27,8 @@ def test_get_default_body_rules_for_endpoint_returns_codex_rules() -> None:
     assert cli_rules[4]["path"] == "instructions"
     assert cli_rules[4]["condition"]["op"] == "not_exists"
 
-    compact_rules = get_default_body_rules_for_endpoint("openai:compact")
-    assert compact_rules == cli_rules
+    compact_rules = get_default_body_rules_for_endpoint("openai:compact", provider_type="codex")
+    assert compact_rules == []
 
 
 def test_get_default_body_rules_for_endpoint_returns_deep_copy(

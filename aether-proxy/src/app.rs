@@ -13,8 +13,8 @@ use crate::config::{Config, ServerEntry};
 use crate::net;
 use crate::registration::client::AetherClient;
 use crate::runtime::{self, DynamicConfig};
-use crate::safe_dns::SafeDnsResolver;
 use crate::state::{AppState, ProxyMetrics, ServerContext};
+use crate::upstream_client;
 use crate::{hardware, target_filter, tunnel};
 
 /// Run the full application lifecycle after config has been parsed.
@@ -67,27 +67,10 @@ pub async fn run(mut config: Config, servers: Vec<ServerEntry>) -> anyhow::Resul
         config.dns_cache_capacity,
     ));
 
-    // Build reqwest client for tunnel upstream requests (shared).
-    // Inject SafeDnsResolver so reqwest only connects to addresses that were
-    // validated by validate_target() — this eliminates the DNS rebinding
-    // TOCTTOU gap where a second DNS lookup could return a private IP.
-    let safe_resolver = SafeDnsResolver::new(Arc::clone(&dns_cache));
-    let mut reqwest_builder = reqwest::Client::builder()
-        .dns_resolver(Arc::new(safe_resolver))
-        .pool_max_idle_per_host(config.upstream_pool_max_idle_per_host)
-        .pool_idle_timeout(Duration::from_secs(config.upstream_pool_idle_timeout_secs))
-        .connect_timeout(Duration::from_secs(config.upstream_connect_timeout_secs))
-        .tcp_nodelay(config.upstream_tcp_nodelay);
-
-    if config.upstream_tcp_keepalive_secs > 0 {
-        reqwest_builder = reqwest_builder.tcp_keepalive(Some(Duration::from_secs(
-            config.upstream_tcp_keepalive_secs,
-        )));
-    }
-
-    let reqwest_client = reqwest_builder
-        .build()
-        .expect("failed to build reqwest client");
+    // Build Hyper client for tunnel upstream requests (shared).
+    // DNS still flows through validated addresses from DnsCache, while the
+    // custom connector exposes per-request connect/TLS timing when available.
+    let upstream_client = upstream_client::build_upstream_client(&config, Arc::clone(&dns_cache));
 
     // Register with each Aether server and build per-server contexts.
     // Wrapped in Arc<Mutex> so retry_failed_registrations can append later.
@@ -160,7 +143,7 @@ pub async fn run(mut config: Config, servers: Vec<ServerEntry>) -> anyhow::Resul
     let state = Arc::new(AppState {
         config: Arc::new(config),
         dns_cache,
-        reqwest_client,
+        upstream_client,
         tunnel_tls_config,
     });
 

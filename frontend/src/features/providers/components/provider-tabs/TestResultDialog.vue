@@ -75,8 +75,15 @@
             <code class="text-[11px] bg-muted px-1 py-0.5 rounded shrink-0">{{ attempt.endpoint_api_format }}</code>
           </div>
           <div class="mt-1.5 space-y-0.5">
-            <div v-if="attempt.key_name" class="font-medium truncate">{{ attempt.key_name }}</div>
-            <div class="text-muted-foreground">{{ maskKey(attempt.key_id) }}</div>
+            <div
+              v-if="attempt.key_name"
+              class="font-medium truncate"
+            >
+              {{ attempt.key_name }}
+            </div>
+            <div class="text-muted-foreground">
+              {{ maskKey(attempt.key_id) }}
+            </div>
             <div
               v-if="hasEffectiveModel && attempt.effective_model"
               class="text-muted-foreground"
@@ -100,26 +107,43 @@
       >
         <table class="w-full text-xs table-fixed">
           <colgroup>
-            <col class="w-8" />
-            <col class="w-[22%]" />
-            <col class="w-20" />
-            <col v-if="hasEffectiveModel" class="w-[16%]" />
-            <col class="w-16" />
-            <col class="w-16" />
-            <col />
+            <col class="w-8">
+            <col class="w-[22%]">
+            <col class="w-20">
+            <col
+              v-if="hasEffectiveModel"
+              class="w-[16%]"
+            >
+            <col class="w-16">
+            <col class="w-16">
+            <col>
           </colgroup>
           <thead>
             <tr class="border-b bg-muted/30">
-              <th class="pl-3 pr-1 py-2 text-left font-medium">#</th>
-              <th class="px-3 py-2 text-left font-medium">Key</th>
-              <th class="px-3 py-2 text-left font-medium">端点</th>
+              <th class="pl-3 pr-1 py-2 text-left font-medium">
+                #
+              </th>
+              <th class="px-3 py-2 text-left font-medium">
+                Key
+              </th>
+              <th class="px-3 py-2 text-left font-medium">
+                端点
+              </th>
               <th
                 v-if="hasEffectiveModel"
                 class="px-3 py-2 text-left font-medium"
-              >发送模型</th>
-              <th class="px-3 py-2 text-left font-medium">状态</th>
-              <th class="px-3 py-2 text-right font-medium">延迟</th>
-              <th class="px-3 py-2 text-left font-medium">详情</th>
+              >
+                发送模型
+              </th>
+              <th class="px-3 py-2 text-left font-medium">
+                状态
+              </th>
+              <th class="px-3 py-2 text-right font-medium">
+                延迟
+              </th>
+              <th class="px-3 py-2 text-left font-medium">
+                详情
+              </th>
             </tr>
           </thead>
           <tbody>
@@ -129,7 +153,9 @@
               class="border-b last:border-b-0 align-top"
               :class="attemptRowClass(attempt.status)"
             >
-              <td class="pl-3 pr-1 py-2 text-muted-foreground">{{ attempt.candidate_index }}</td>
+              <td class="pl-3 pr-1 py-2 text-muted-foreground">
+                {{ attempt.candidate_index }}
+              </td>
               <td class="px-3 py-2">
                 <div
                   v-if="attempt.key_name"
@@ -138,7 +164,10 @@
                 >
                   {{ attempt.key_name }}
                 </div>
-                <div class="text-muted-foreground truncate" :title="attempt.key_id">
+                <div
+                  class="text-muted-foreground truncate"
+                  :title="attempt.key_id"
+                >
                   {{ maskKey(attempt.key_id) }}
                 </div>
               </td>

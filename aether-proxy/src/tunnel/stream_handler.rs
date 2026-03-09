@@ -9,11 +9,13 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures_util::StreamExt;
+use http_body_util::BodyExt;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use crate::state::{AppState, ServerContext};
 use crate::target_filter;
+use crate::upstream_client::{self, UpstreamRequestBody};
 
 use super::protocol::{
     compress_payload, decompress_if_gzip, flags, Frame, MsgType, RequestMeta, ResponseMeta,
@@ -203,49 +205,75 @@ async fn handle_stream_inner(
     let dns_ms = connect_start.elapsed().as_millis() as u64;
 
     // Execute upstream request
-    let client = &state.reqwest_client;
+    let client = &state.upstream_client;
     let timeout = Duration::from_secs(meta.timeout.clamp(MIN_TIMEOUT_SECS, MAX_TIMEOUT_SECS));
 
-    let method: reqwest::Method = meta.method.parse().unwrap_or(reqwest::Method::GET);
-    // Build a complete HeaderMap from tunnel headers, then set it all at once
-    // via .headers() which *replaces* reqwest defaults (e.g. Accept: */*),
-    // ensuring upstream sees exactly what Aether server intended.
-    let mut header_map = reqwest::header::HeaderMap::with_capacity(meta.headers.len());
+    let method: hyper::Method = meta.method.parse().unwrap_or(hyper::Method::GET);
+    let mut request = match hyper::Request::builder()
+        .method(method)
+        .uri(meta.url.as_str())
+        .body(UpstreamRequestBody::new(body.clone()))
+    {
+        Ok(request) => request,
+        Err(e) => {
+            send_error(
+                frame_tx,
+                stream_id,
+                &format!("invalid upstream request: {e}"),
+            )
+            .await;
+            return None;
+        }
+    };
+
+    let headers = request.headers_mut();
     for (k, v) in &meta.headers {
         let k_lower = k.to_ascii_lowercase();
         if BLOCKED_HEADERS.contains(&k_lower.as_str()) {
             continue;
         }
         if let (Ok(name), Ok(value)) = (
-            reqwest::header::HeaderName::from_bytes(k.as_bytes()),
-            reqwest::header::HeaderValue::from_str(v),
+            hyper::header::HeaderName::from_bytes(k.as_bytes()),
+            hyper::header::HeaderValue::from_str(v),
         ) {
-            header_map.insert(name, value);
+            headers.insert(name, value);
         }
     }
-    let mut req = client.request(method, &meta.url).headers(header_map);
+
     let body_size = body.len();
-    if !body.is_empty() {
-        req = req.body(body);
-    }
-    req = req.timeout(timeout);
+    let mut captured_connection = upstream_client::capture_connection(&mut request);
+    let connection_start = Instant::now();
+    let connection_capture = tokio::spawn(async move {
+        let connected = captured_connection.wait_for_connection_metadata().await;
+        connected
+            .as_ref()
+            .map(|_| connection_start.elapsed().as_millis() as u64)
+    });
 
     let upstream_start = Instant::now();
-    let response = match req.send().await {
-        Ok(r) => r,
-        Err(e) => {
+    let response = match tokio::time::timeout(timeout, client.request(request)).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(e)) => {
+            connection_capture.abort();
             server
                 .metrics
                 .failed_requests
                 .fetch_add(1, Ordering::Release);
-            let msg = if e.is_timeout() {
-                "upstream timeout".to_string()
-            } else if e.is_connect() {
+            let msg = if e.is_connect() {
                 format!("upstream connect error: {e}")
             } else {
                 format!("upstream error: {e}")
             };
             send_error(frame_tx, stream_id, &msg).await;
+            return None;
+        }
+        Err(_) => {
+            connection_capture.abort();
+            server
+                .metrics
+                .failed_requests
+                .fetch_add(1, Ordering::Release);
+            send_error(frame_tx, stream_id, "upstream timeout").await;
             return None;
         }
     };
@@ -257,18 +285,34 @@ async fn handle_stream_inner(
     // Send RESPONSE_HEADERS
     let status = response.status().as_u16();
     let ttfb_ms = upstream_start.elapsed().as_millis() as u64;
+    // Short timeout: on connection reuse hyper may never fire the connect
+    // callback, so avoid blocking indefinitely.
+    let connection_acquire_ms =
+        match tokio::time::timeout(Duration::from_millis(100), connection_capture).await {
+            Ok(Ok(ms)) => ms,
+            Ok(Err(_)) => None, // JoinError (task panicked / cancelled)
+            Err(_) => None,     // timeout -- task is detached but lightweight
+        };
+    let request_timing =
+        upstream_client::resolve_request_timing(&response, connection_acquire_ms, ttfb_ms);
     let mut resp_headers: Vec<(String, String)> = Vec::with_capacity(response.headers().len() + 1);
     for (k, v) in response.headers() {
         if let Ok(vs) = v.to_str() {
             resp_headers.push((k.as_str().to_string(), vs.to_string()));
         }
     }
-    // Inject proxy timing (same format as delegate mode)
     let timing = serde_json::json!({
         "dns_ms": dns_ms,
+        "connection_acquire_ms": request_timing.connection_acquire_ms,
+        "connection_reused": request_timing.connection_reused,
+        "connect_ms": request_timing.connect_ms,
+        "tls_ms": request_timing.tls_ms,
         "ttfb_ms": ttfb_ms,
         "upstream_ms": ttfb_ms,
-        "upstream_processing_ms": ttfb_ms.saturating_sub(dns_ms),
+        "response_wait_ms": request_timing.response_wait_ms,
+        "upstream_processing_ms": request_timing.response_wait_ms,
+        "timing_source": "instrumented_connector",
+        "total_ms": connect_elapsed.as_millis() as u64,
         "body_size": body_size,
         "mode": "tunnel",
     });
@@ -298,7 +342,7 @@ async fn handle_stream_inner(
     // (e.g. uncompressed SSE text). Already-compressed data (gzip/br from
     // upstream Content-Encoding) won't shrink further and will be sent as-is
     // thanks to the size check in compress_payload().
-    let mut stream = response.bytes_stream();
+    let mut stream = response.into_body().into_data_stream();
     while let Some(chunk_result) = stream.next().await {
         match chunk_result {
             Ok(chunk) => {

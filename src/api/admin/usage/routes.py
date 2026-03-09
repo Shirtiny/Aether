@@ -348,6 +348,7 @@ async def replay_usage_request(
 async def get_usage_detail(
     usage_id: str,
     request: Request,
+    include_bodies: bool = Query(True, description="是否返回请求/响应 body 内容"),
     db: Session = Depends(get_db),
 ) -> Any:
     """
@@ -395,7 +396,7 @@ async def get_usage_detail(
     - `metadata`: 提供商响应元数据
     - `tiered_pricing`: 阶梯计费信息（如适用）
     """
-    adapter = AdminUsageDetailAdapter(usage_id=usage_id)
+    adapter = AdminUsageDetailAdapter(usage_id=usage_id, include_bodies=include_bodies)
     return await pipeline.run(adapter=adapter, http_request=request, db=db, mode=adapter.mode)
 
 
@@ -1236,6 +1237,7 @@ class AdminUsageDetailAdapter(AdminApiAdapter):
     """Get detailed usage record with request/response body"""
 
     usage_id: str
+    include_bodies: bool = True
 
     async def handle(self, context: ApiRequestContext) -> Any:  # type: ignore[override]
         db = context.db
@@ -1260,6 +1262,32 @@ class AdminUsageDetailAdapter(AdminApiAdapter):
 
         # 提取视频/图像/音频计费信息
         video_billing_info = self._extract_video_billing_info(usage_record)
+
+        has_request_body = bool(
+            usage_record.request_body is not None
+            or usage_record.request_body_compressed is not None
+        )
+        has_provider_request_body = bool(
+            usage_record.provider_request_body is not None
+            or usage_record.provider_request_body_compressed is not None
+        )
+        has_response_body = bool(
+            usage_record.response_body is not None
+            or usage_record.response_body_compressed is not None
+        )
+        has_client_response_body = bool(
+            usage_record.client_response_body is not None
+            or usage_record.client_response_body_compressed is not None
+        )
+
+        request_body = usage_record.get_request_body() if self.include_bodies else None
+        provider_request_body = (
+            usage_record.get_provider_request_body() if self.include_bodies else None
+        )
+        response_body = usage_record.get_response_body() if self.include_bodies else None
+        client_response_body = (
+            usage_record.get_client_response_body() if self.include_bodies else None
+        )
 
         return {
             "id": usage_record.id,
@@ -1308,14 +1336,18 @@ class AdminUsageDetailAdapter(AdminApiAdapter):
             "response_time_ms": usage_record.response_time_ms,
             "first_byte_time_ms": usage_record.first_byte_time_ms,  # 首字时间 (TTFB)
             "created_at": usage_record.created_at.isoformat() if usage_record.created_at else None,
+            "has_request_body": has_request_body,
+            "has_provider_request_body": has_provider_request_body,
+            "has_response_body": has_response_body,
+            "has_client_response_body": has_client_response_body,
             "request_headers": usage_record.request_headers,
-            "request_body": usage_record.get_request_body(),
+            "request_body": request_body,
             "provider_request_headers": usage_record.provider_request_headers,
-            "provider_request_body": usage_record.get_provider_request_body(),
+            "provider_request_body": provider_request_body,
             "response_headers": usage_record.response_headers,
             "client_response_headers": usage_record.client_response_headers,
-            "response_body": usage_record.get_response_body(),
-            "client_response_body": usage_record.get_client_response_body(),
+            "response_body": response_body,
+            "client_response_body": client_response_body,
             "metadata": usage_record.request_metadata,
             "tiered_pricing": tiered_pricing_info,
             "video_billing": video_billing_info,

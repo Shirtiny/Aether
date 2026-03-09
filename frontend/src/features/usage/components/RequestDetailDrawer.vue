@@ -398,8 +398,9 @@
               </Card>
 
               <!-- 请求链路追踪卡片 -->
-              <div v-if="detail.request_id || detail.id">
+              <div>
                 <HorizontalRequestTimeline
+                  v-if="showTimeline && (detail.request_id || detail.id)"
                   ref="timelineRef"
                   :request-id="detail.request_id || detail.id"
                   :override-status-code="detail.status_code"
@@ -584,13 +585,17 @@
                       </TabsContent>
 
                       <TabsContent value="request-body">
-                        <!-- 对话视图 -->
+                        <div
+                          v-if="isRequestBodyLoading"
+                          class="p-4"
+                        >
+                          <Skeleton class="h-32 w-full" />
+                        </div>
                         <ConversationView
-                          v-if="contentViewMode === 'conversation'"
+                          v-else-if="contentViewMode === 'conversation'"
                           :render-result="requestRenderResult"
                           empty-message="无请求体信息"
                         />
-                        <!-- JSON 视图 -->
                         <JsonContent
                           v-else
                           :data="currentRequestBody"
@@ -629,13 +634,17 @@
                       </TabsContent>
 
                       <TabsContent value="response-body">
-                        <!-- 对话视图 -->
+                        <div
+                          v-if="isResponseBodyLoading"
+                          class="p-4"
+                        >
+                          <Skeleton class="h-32 w-full" />
+                        </div>
                         <ConversationView
-                          v-if="contentViewMode === 'conversation'"
+                          v-else-if="contentViewMode === 'conversation'"
                           :render-result="responseRenderResult"
                           empty-message="无响应体信息"
                         />
-                        <!-- JSON 视图 -->
                         <JsonContent
                           v-else
                           :data="currentResponseBody"
@@ -751,9 +760,15 @@ const isPageVisible = ref(typeof document === 'undefined' ? true : !document.hid
 const curlCopying = ref(false)
 const curlCopied = ref(false)
 const replayDialogOpen = ref(false)
+const bodyLoading = ref(false)
+const bodiesLoadedForRequestId = ref<string | null>(null)
+const showTimeline = ref(false)
 const AUTO_REFRESH_INTERVAL_MS = 1000
+const TIMELINE_MOUNT_DELAY_MS = 120
 let loadDetailRequestId = 0
+let bodyLoadRequestId = 0
 let loadDetailInFlight = false
+let timelineMountTimer: ReturnType<typeof setTimeout> | null = null
 
 // 监听标签页切换
 watch(activeTab, (newTab) => {
@@ -765,6 +780,10 @@ watch(activeTab, (newTab) => {
     contentViewMode.value = 'json'
   }
   dataSource.value = getDefaultDataSourceForTab(newTab)
+
+  if (['request-body', 'response-body'].includes(newTab)) {
+    void ensureBodyContentLoaded()
+  }
 })
 
 // 检测暗色模式
@@ -778,6 +797,46 @@ const traceRequestMetadata = computed<Record<string, unknown> | null>(() => {
   return meta as Record<string, unknown>
 })
 
+function hasBodyContent(flag: boolean | undefined, data: unknown): boolean {
+  return Boolean(flag) || hasContent(data)
+}
+
+const hasRequestBodyAvailable = computed(() => {
+  return hasBodyContent(detail.value?.has_request_body, detail.value?.request_body)
+    || hasBodyContent(detail.value?.has_provider_request_body, detail.value?.provider_request_body)
+})
+
+const hasResponseBodyAvailable = computed(() => {
+  return hasBodyContent(detail.value?.has_response_body, detail.value?.response_body)
+    || hasBodyContent(detail.value?.has_client_response_body, detail.value?.client_response_body)
+})
+
+const isRequestBodyLoading = computed(() => {
+  return bodyLoading.value && activeTab.value === 'request-body' && !currentRequestBody.value
+})
+
+const isResponseBodyLoading = computed(() => {
+  return bodyLoading.value && activeTab.value === 'response-body' && !currentResponseBody.value
+})
+
+function clearTimelineMountTimer() {
+  if (timelineMountTimer) {
+    clearTimeout(timelineMountTimer)
+    timelineMountTimer = null
+  }
+}
+
+function scheduleTimelineMount() {
+  clearTimelineMountTimer()
+  if (typeof window === 'undefined') {
+    showTimeline.value = true
+    return
+  }
+  timelineMountTimer = window.setTimeout(() => {
+    showTimeline.value = true
+  }, TIMELINE_MOUNT_DELAY_MS)
+}
+
 // 检测是否有提供商请求头
 const hasProviderHeaders = computed(() => {
   return !!(detail.value?.provider_request_headers &&
@@ -786,12 +845,13 @@ const hasProviderHeaders = computed(() => {
 
 // 请求体：仅当 provider_request_body 存在时才展示来源切换
 const hasProviderRequestBody = computed(() => {
-  return hasContent(detail.value?.provider_request_body)
+  return hasBodyContent(detail.value?.has_provider_request_body, detail.value?.provider_request_body)
 })
 
 // 响应体：只有客户端侧和 provider 侧都存在时才展示来源切换
 const hasProviderResponseBody = computed(() => {
-  return hasContent(detail.value?.response_body) && hasContent(detail.value?.client_response_body)
+  return hasBodyContent(detail.value?.has_response_body, detail.value?.response_body)
+    && hasBodyContent(detail.value?.has_client_response_body, detail.value?.client_response_body)
 })
 
 // 检测是否有两套响应头（客户端侧 + 提供商侧）
@@ -895,6 +955,9 @@ const requestRenderResult = computed<RenderResult>(() => {
   if (!body) {
     return { blocks: [], isStream: false }
   }
+  if (activeTab.value !== 'request-body' || contentViewMode.value !== 'conversation') {
+    return { blocks: [], isStream: false }
+  }
   return renderRequest(body, currentResponseBody.value, detail.value?.api_format)
 })
 
@@ -902,6 +965,9 @@ const requestRenderResult = computed<RenderResult>(() => {
 const responseRenderResult = computed<RenderResult>(() => {
   const body = currentResponseBody.value
   if (!body) {
+    return { blocks: [], isStream: false }
+  }
+  if (activeTab.value !== 'response-body' || contentViewMode.value !== 'conversation') {
     return { blocks: [], isStream: false }
   }
   return renderResponse(body, currentRequestBody.value, detail.value?.api_format)
@@ -913,14 +979,13 @@ const supportsConversationView = computed(() => {
 })
 
 // 当前对话数据是否有效（用于禁用按钮）
+// 不依赖带 tab/mode 守卫的 renderResult，直接检查 body 数据是否存在
 const hasValidConversation = computed(() => {
   if (activeTab.value === 'request-body') {
-    return !requestRenderResult.value.error &&
-      requestRenderResult.value.blocks.length > 0
+    return !!currentRequestBody.value
   }
   if (activeTab.value === 'response-body') {
-    return !responseRenderResult.value.error &&
-      responseRenderResult.value.blocks.length > 0
+    return !!currentResponseBody.value
   }
   return false
 })
@@ -1168,8 +1233,8 @@ function getDefaultDataSourceForTab(tab: string): 'client' | 'provider' {
   }
 
   if (tab === 'request-body') {
-    if (hasContent(detail.value.provider_request_body)) return 'provider'
-    if (hasContent(detail.value.request_body)) return 'client'
+    if (hasBodyContent(detail.value.has_provider_request_body, detail.value.provider_request_body)) return 'provider'
+    if (hasBodyContent(detail.value.has_request_body, detail.value.request_body)) return 'client'
     return 'provider'
   }
 
@@ -1180,8 +1245,8 @@ function getDefaultDataSourceForTab(tab: string): 'client' | 'provider' {
   }
 
   if (tab === 'response-body') {
-    if (hasContent(detail.value.client_response_body)) return 'client'
-    if (hasContent(detail.value.response_body)) return 'provider'
+    if (hasBodyContent(detail.value.has_client_response_body, detail.value.client_response_body)) return 'client'
+    if (hasBodyContent(detail.value.has_response_body, detail.value.response_body)) return 'provider'
     return 'client'
   }
 
@@ -1213,11 +1278,11 @@ const visibleTabs = computed(() => {
       case 'request-headers':
         return hasContent(detail.value?.request_headers) || hasContent(detail.value?.provider_request_headers)
       case 'request-body':
-        return hasContent(detail.value?.request_body) || hasContent(detail.value?.provider_request_body)
+        return hasRequestBodyAvailable.value
       case 'response-headers':
         return hasContent(detail.value?.response_headers) || hasContent(detail.value?.client_response_headers)
       case 'response-body':
-        return hasContent(detail.value?.response_body) || hasContent(detail.value?.client_response_body)
+        return hasResponseBodyAvailable.value
       case 'metadata':
         return hasContent(detail.value?.metadata)
       default:
@@ -1237,8 +1302,46 @@ watch(() => props.isOpen, async (isOpen) => {
     await loadDetail(props.requestId)
   } else if (!isOpen) {
     stopAutoRefresh()
+    showTimeline.value = false
+    clearTimelineMountTimer()
+    bodyLoading.value = false
+    bodiesLoadedForRequestId.value = null
   }
 })
+
+async function ensureBodyContentLoaded() {
+  if (!props.requestId || !detail.value) return
+
+  const cacheKey = detail.value.request_id || detail.value.id
+  if (bodiesLoadedForRequestId.value === cacheKey || bodyLoading.value) return
+  if (!hasRequestBodyAvailable.value && !hasResponseBodyAvailable.value) return
+
+  const requestId = ++bodyLoadRequestId
+  bodyLoading.value = true
+  try {
+    const response = await dashboardApi.getRequestDetail(props.requestId, { includeBodies: true })
+    if (requestId !== bodyLoadRequestId || !detail.value) return
+    detail.value = {
+      ...detail.value,
+      request_body: response.request_body,
+      provider_request_body: response.provider_request_body,
+      response_body: response.response_body,
+      client_response_body: response.client_response_body,
+      has_request_body: response.has_request_body,
+      has_provider_request_body: response.has_provider_request_body,
+      has_response_body: response.has_response_body,
+      has_client_response_body: response.has_client_response_body,
+    }
+    bodiesLoadedForRequestId.value = cacheKey
+  } catch (err) {
+    if (requestId !== bodyLoadRequestId) return
+    log.error('Failed to load request bodies:', err)
+  } finally {
+    if (requestId === bodyLoadRequestId) {
+      bodyLoading.value = false
+    }
+  }
+}
 
 async function loadDetail(id: string, silent = false) {
   if (silent && loadDetailInFlight) {
@@ -1249,23 +1352,40 @@ async function loadDetail(id: string, silent = false) {
   if (!silent) {
     loading.value = true
     historicalPricing.value = null
+    showTimeline.value = false
+    clearTimelineMountTimer()
+    ++bodyLoadRequestId
+    bodyLoading.value = false
   }
   error.value = null
   try {
-    const response = await dashboardApi.getRequestDetail(id)
+    const response = await dashboardApi.getRequestDetail(id, { includeBodies: false })
     if (requestId !== loadDetailRequestId) return
-    detail.value = response
+
+    const previousDetail = detail.value
+    const prevKey = previousDetail?.request_id || previousDetail?.id
+    const currKey = response.request_id || response.id
+    const sameRequest = !!prevKey && prevKey === currKey
+    detail.value = {
+      ...response,
+      request_body: sameRequest ? previousDetail?.request_body : undefined,
+      provider_request_body: sameRequest ? previousDetail?.provider_request_body : undefined,
+      response_body: sameRequest ? previousDetail?.response_body : undefined,
+      client_response_body: sameRequest ? previousDetail?.client_response_body : undefined,
+    }
+    bodiesLoadedForRequestId.value = sameRequest ? bodiesLoadedForRequestId.value : null
 
     // 首次加载时选择默认 tab
     if (!silent) {
       const visibleTabNames = visibleTabs.value.map(t => t.name)
-      if ((detail.value.request_body || detail.value.provider_request_body) && visibleTabNames.includes('request-body')) {
+      if (hasRequestBodyAvailable.value && visibleTabNames.includes('request-body')) {
         activeTab.value = 'request-body'
-      } else if ((detail.value.response_body || detail.value.client_response_body) && visibleTabNames.includes('response-body')) {
+      } else if (hasResponseBodyAvailable.value && visibleTabNames.includes('response-body')) {
         activeTab.value = 'response-body'
       } else if (visibleTabNames.length > 0) {
         activeTab.value = visibleTabNames[0]
       }
+      scheduleTimelineMount()
     }
 
     // 根据当前 Tab 的数据可用性自动选择默认数据源
@@ -1396,6 +1516,7 @@ onMounted(() => {
 onBeforeUnmount(() => {
   document.removeEventListener('visibilitychange', handleVisibilityChange)
   stopAutoRefresh()
+  clearTimelineMountTimer()
   loadDetailRequestId += 1
   loadDetailInFlight = false
 })

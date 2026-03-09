@@ -176,6 +176,10 @@ export interface RequestDetail {
   client_response_headers?: Record<string, unknown>
   response_body?: Record<string, unknown>
   client_response_body?: Record<string, unknown>
+  has_request_body?: boolean
+  has_provider_request_body?: boolean
+  has_response_body?: boolean
+  has_client_response_body?: boolean
   metadata?: Record<string, unknown>
   // 阶梯计费信息
   tiered_pricing?: {
@@ -327,8 +331,10 @@ export const dashboardApi = {
 
   // 获取请求详情
   // NOTE: This method now calls the new RESTful API at /api/admin/usage/{id}
-  async getRequestDetail(requestId: string): Promise<RequestDetail> {
-    const response = await apiClient.get<RequestDetail>(`/api/admin/usage/${requestId}`)
+  async getRequestDetail(requestId: string, options: { includeBodies?: boolean } = {}): Promise<RequestDetail> {
+    const response = await apiClient.get<RequestDetail>(`/api/admin/usage/${requestId}`, {
+      params: { include_bodies: options.includeBodies ?? true },
+    })
     return response.data
   },
 

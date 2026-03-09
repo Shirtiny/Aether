@@ -1287,6 +1287,14 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
                     response_ctx = None
                     continue
 
+                try:
+                    if response_ctx is not None:
+                        await response_ctx.__aexit__(None, None, None)
+                except Exception:
+                    pass
+                finally:
+                    response_ctx = None
+
                 from src.api.handlers.base.chat_sync_executor import ChatSyncExecutor
 
                 error_text = await ChatSyncExecutor(self)._extract_error_text(e)
@@ -1306,6 +1314,13 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
                 raise
 
             except Exception:
+                try:
+                    if response_ctx is not None:
+                        await response_ctx.__aexit__(None, None, None)
+                except Exception:
+                    pass
+                finally:
+                    response_ctx = None
                 raise
 
         # 类型断言：成功执行后这些变量不会为 None

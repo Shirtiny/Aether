@@ -4,11 +4,11 @@ mod hardware;
 mod net;
 mod registration;
 mod runtime;
-mod safe_dns;
 mod setup;
 mod state;
 mod target_filter;
 mod tunnel;
+mod upstream_client;
 
 use std::path::PathBuf;
 

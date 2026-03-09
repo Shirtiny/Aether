@@ -270,6 +270,7 @@ import { listPoolKeys, type PoolKeyDetail } from '@/api/endpoints/pool'
 import { deleteEndpointKey, refreshProviderQuota, updateProviderKey } from '@/api/endpoints/keys'
 import { refreshProviderOAuth } from '@/api/endpoints/provider_oauth'
 import { useProxyNodesStore } from '@/stores/proxy-nodes'
+import { hasNoFiveHourLimit as hasNoFiveHourLimitByQuota, hasNoWeeklyLimit as hasNoWeeklyLimitByQuota } from '@/features/pool/utils/quota-selectors'
 
 type QuickSelectorValue =
   | 'banned'
@@ -410,31 +411,12 @@ function isBannedKey(key: PoolKeyDetail): boolean {
   return false
 }
 
-function getQuotaSegments(accountQuota: string | null | undefined): string[] {
-  return String(accountQuota || '')
-    .split('|')
-    .map((segment) => normalizeText(segment))
-    .filter(Boolean)
+function hasNoFiveHourQuota(key: PoolKeyDetail): boolean {
+  return hasNoFiveHourLimitByQuota(key.account_quota)
 }
 
-function isDepletedQuotaSegment(segment: string): boolean {
-  if (/(无额度|额度不足|已耗尽|耗尽|depleted|exhausted|insufficient)/.test(segment)) return true
-  if (/剩余\s*0(\.0+)?/.test(segment)) return true
-  if (/\b0(\.0+)?\s*\/\s*\d/.test(segment)) return true
-  if (/\b0(\.0+)?%/.test(segment)) return true
-  return false
-}
-
-function hasNoFiveHourLimit(key: PoolKeyDetail): boolean {
-  return getQuotaSegments(key.account_quota)
-    .filter((segment) => /5h|5小时/.test(segment))
-    .some(isDepletedQuotaSegment)
-}
-
-function hasNoWeeklyLimit(key: PoolKeyDetail): boolean {
-  return getQuotaSegments(key.account_quota)
-    .filter((segment) => /周|weekly|week/.test(segment))
-    .some(isDepletedQuotaSegment)
+function hasNoWeeklyQuota(key: PoolKeyDetail): boolean {
+  return hasNoWeeklyLimitByQuota(key.account_quota)
 }
 
 function isOAuthInvalid(key: PoolKeyDetail): boolean {
@@ -474,8 +456,8 @@ function toggleSelectFiltered(checked: boolean | 'indeterminate'): void {
 
 function matchesSelector(key: PoolKeyDetail, selector: QuickSelectorValue): boolean {
   if (selector === 'banned') return isBannedKey(key)
-  if (selector === 'no_5h_limit') return hasNoFiveHourLimit(key)
-  if (selector === 'no_weekly_limit') return hasNoWeeklyLimit(key)
+  if (selector === 'no_5h_limit') return hasNoFiveHourQuota(key)
+  if (selector === 'no_weekly_limit') return hasNoWeeklyQuota(key)
   if (selector === 'plan_free') return isFreePlan(key)
   if (selector === 'plan_team') return isTeamPlan(key)
   if (selector === 'oauth_invalid') return isOAuthInvalid(key)

@@ -8,14 +8,15 @@ use crate::config::Config;
 use crate::registration::client::AetherClient;
 use crate::runtime::SharedDynamicConfig;
 use crate::target_filter::DnsCache;
+use crate::upstream_client::UpstreamClient;
 
 /// Central application state shared across all servers/tunnels.
 pub struct AppState {
     pub config: Arc<Config>,
     /// DNS cache for upstream target resolution (shared).
     pub dns_cache: Arc<DnsCache>,
-    /// Reqwest client for tunnel upstream requests (shared).
-    pub reqwest_client: reqwest::Client,
+    /// Hyper client for tunnel upstream requests with validated DNS and connection timing.
+    pub upstream_client: UpstreamClient,
     /// Shared TLS config for tunnel WebSocket connections (avoids re-parsing root CAs on each reconnect).
     pub tunnel_tls_config: Arc<rustls::ClientConfig>,
 }

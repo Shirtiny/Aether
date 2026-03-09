@@ -19,10 +19,16 @@
       >
         <div class="flex items-center justify-between gap-3">
           <div class="min-w-0">
-            <div class="text-sm font-medium">{{ formatApiFormat(endpoint.api_format) }}</div>
-            <div class="mt-1 text-xs text-muted-foreground truncate">{{ endpoint.base_url }}</div>
+            <div class="text-sm font-medium">
+              {{ formatApiFormat(endpoint.api_format) }}
+            </div>
+            <div class="mt-1 text-xs text-muted-foreground truncate">
+              {{ endpoint.base_url }}
+            </div>
           </div>
-          <Badge variant="outline">{{ endpoint.is_active ? '已启用' : '已禁用' }}</Badge>
+          <Badge variant="outline">
+            {{ endpoint.is_active ? '已启用' : '已禁用' }}
+          </Badge>
         </div>
       </button>
       <div
@@ -39,8 +45,12 @@
     >
       <Loader2 class="w-8 h-8 animate-spin text-primary" />
       <div class="space-y-1">
-        <p class="text-sm font-medium">正在测试模型</p>
-        <p class="text-xs text-muted-foreground">{{ selectingModelName || '-' }}</p>
+        <p class="text-sm font-medium">
+          正在测试模型
+        </p>
+        <p class="text-xs text-muted-foreground">
+          {{ selectingModelName || '-' }}
+        </p>
         <p
           v-if="selectedEndpoint"
           class="text-xs text-muted-foreground"
@@ -124,8 +134,15 @@
             </div>
           </div>
           <div class="mt-1.5 space-y-0.5">
-            <div v-if="attempt.key_name" class="font-medium truncate">{{ attempt.key_name }}</div>
-            <div class="text-muted-foreground">{{ maskKey(attempt.key_id) }}</div>
+            <div
+              v-if="attempt.key_name"
+              class="font-medium truncate"
+            >
+              {{ attempt.key_name }}
+            </div>
+            <div class="text-muted-foreground">
+              {{ maskKey(attempt.key_id) }}
+            </div>
             <div
               v-if="hasEffectiveModel && attempt.effective_model"
               class="text-muted-foreground"
@@ -149,24 +166,39 @@
       >
         <table class="w-full text-xs table-fixed">
           <colgroup>
-            <col class="w-8" />
-            <col class="w-[22%]" />
-            <col v-if="hasEffectiveModel" class="w-[18%]" />
-            <col class="w-16" />
-            <col class="w-16" />
-            <col />
+            <col class="w-8">
+            <col class="w-[22%]">
+            <col
+              v-if="hasEffectiveModel"
+              class="w-[18%]"
+            >
+            <col class="w-16">
+            <col class="w-16">
+            <col>
           </colgroup>
           <thead>
             <tr class="border-b bg-muted/30">
-              <th class="pl-3 pr-1 py-2 text-left font-medium">#</th>
-              <th class="px-3 py-2 text-left font-medium">Key</th>
+              <th class="pl-3 pr-1 py-2 text-left font-medium">
+                #
+              </th>
+              <th class="px-3 py-2 text-left font-medium">
+                Key
+              </th>
               <th
                 v-if="hasEffectiveModel"
                 class="px-3 py-2 text-left font-medium"
-              >发送模型</th>
-              <th class="px-3 py-2 text-left font-medium">状态</th>
-              <th class="px-3 py-2 text-right font-medium">延迟</th>
-              <th class="px-3 py-2 text-left font-medium">详情</th>
+              >
+                发送模型
+              </th>
+              <th class="px-3 py-2 text-left font-medium">
+                状态
+              </th>
+              <th class="px-3 py-2 text-right font-medium">
+                延迟
+              </th>
+              <th class="px-3 py-2 text-left font-medium">
+                详情
+              </th>
             </tr>
           </thead>
           <tbody>
@@ -176,7 +208,9 @@
               class="border-b last:border-b-0 align-top"
               :class="attemptRowClass(attempt.status)"
             >
-              <td class="pl-3 pr-1 py-2 text-muted-foreground">{{ attempt.candidate_index }}</td>
+              <td class="pl-3 pr-1 py-2 text-muted-foreground">
+                {{ attempt.candidate_index }}
+              </td>
               <td class="px-3 py-2">
                 <div
                   v-if="attempt.key_name"
@@ -185,7 +219,10 @@
                 >
                   {{ attempt.key_name }}
                 </div>
-                <div class="text-muted-foreground truncate" :title="attempt.key_id">
+                <div
+                  class="text-muted-foreground truncate"
+                  :title="attempt.key_id"
+                >
                   {{ maskKey(attempt.key_id) }}
                 </div>
               </td>

@@ -49,6 +49,11 @@ class FailoverEngine:
 
     # Hard constraint: streaming first chunk probe timeout
     STREAM_FIRST_CHUNK_TIMEOUT_SECONDS: int = 30
+    RETRY_BACKOFF_EVERY_FAILURES: int = 10
+    RETRY_ROTATE_CLIENT_EVERY_FAILURES: int = 40
+    RETRY_BACKOFF_BASE_SECONDS: float = 0.025
+    RETRY_BACKOFF_MAX_SECONDS: float = 0.15
+    STREAM_CAPACITY_BACKOFF_SECONDS: float = 0.3
 
     def __init__(
         self,
@@ -60,6 +65,121 @@ class FailoverEngine:
         self.db = db
         self._error_classifier = error_classifier or ErrorClassifier(db=db)
         self._recorder = recorder or CandidateRecorder(db)
+
+    @staticmethod
+    def _collect_error_messages(error: Exception | None) -> str:
+        if error is None:
+            return ""
+
+        parts: list[str] = []
+        for item in (
+            getattr(error, "message", None),
+            getattr(error, "upstream_response", None),
+            str(error),
+        ):
+            if isinstance(item, str) and item.strip():
+                parts.append(item.strip())
+
+        cause = getattr(error, "cause", None)
+        if cause is not None and cause is not error:
+            for item in (
+                getattr(cause, "message", None),
+                getattr(cause, "upstream_response", None),
+                str(cause),
+            ):
+                if isinstance(item, str) and item.strip():
+                    parts.append(item.strip())
+
+        return " | ".join(parts)
+
+    @classmethod
+    def _is_stream_capacity_error(cls, error: Exception | None) -> bool:
+        lowered = cls._collect_error_messages(error).lower()
+        return (
+            "max outbound streams" in lowered
+            or "too many concurrent streams" in lowered
+            or "max concurrent streams" in lowered
+        )
+
+    @classmethod
+    def _compute_retry_backoff_seconds(
+        cls,
+        *,
+        consecutive_failures: int,
+        error: Exception | None,
+    ) -> float:
+        if consecutive_failures <= 0:
+            return 0.0
+        if cls._is_stream_capacity_error(error):
+            return cls.STREAM_CAPACITY_BACKOFF_SECONDS
+        if consecutive_failures % cls.RETRY_BACKOFF_EVERY_FAILURES != 0:
+            return 0.0
+        step = max(1, consecutive_failures // cls.RETRY_BACKOFF_EVERY_FAILURES)
+        return min(cls.RETRY_BACKOFF_BASE_SECONDS * step, cls.RETRY_BACKOFF_MAX_SECONDS)
+
+    @classmethod
+    def _should_rotate_upstream_client(
+        cls,
+        *,
+        consecutive_failures: int,
+        error: Exception | None,
+    ) -> bool:
+        if cls._is_stream_capacity_error(error):
+            return True
+        return (
+            consecutive_failures >= cls.RETRY_ROTATE_CLIENT_EVERY_FAILURES
+            and consecutive_failures % cls.RETRY_ROTATE_CLIENT_EVERY_FAILURES == 0
+        )
+
+    async def _rotate_upstream_client(self, candidate: ProviderCandidate) -> bool:
+        from src.clients.http_client import HTTPClientPool
+        from src.services.proxy_node.resolver import (
+            resolve_delegate_config,
+            resolve_effective_proxy,
+        )
+
+        effective_proxy = resolve_effective_proxy(
+            getattr(candidate.provider, "proxy", None),
+            getattr(candidate.key, "proxy", None),
+        )
+        delegate_cfg = resolve_delegate_config(effective_proxy)
+        return await HTTPClientPool.reset_upstream_client(
+            delegate_cfg, proxy_config=effective_proxy
+        )
+
+    async def _apply_retry_pacing(
+        self,
+        *,
+        candidate: ProviderCandidate,
+        consecutive_failures: int,
+        error: Exception | None,
+        request_id: str | None,
+    ) -> None:
+        should_rotate = self._should_rotate_upstream_client(
+            consecutive_failures=consecutive_failures,
+            error=error,
+        )
+        if should_rotate:
+            rotated = await self._rotate_upstream_client(candidate)
+            if rotated:
+                logger.warning(
+                    "  [{}] 连续失败 {} 次，已重建上游客户端复用",
+                    request_id,
+                    consecutive_failures,
+                )
+
+        backoff_seconds = self._compute_retry_backoff_seconds(
+            consecutive_failures=consecutive_failures,
+            error=error,
+        )
+        if backoff_seconds > 0:
+            logger.warning(
+                "  [{}] 连续失败 {} 次，退避 {:.0f}ms 后继续尝试",
+                request_id,
+                consecutive_failures,
+                backoff_seconds * 1000,
+            )
+            await asyncio.sleep(backoff_seconds)
 
     async def execute(
         self,
@@ -95,6 +215,7 @@ class FailoverEngine:
             candidates = candidates[:max_candidates]
 
         attempt_count = 0
+        consecutive_failures = 0
         last_status_code: int | None = None
 
         # For logging / dispatcher parity only; callers may pass an exact value.
@@ -142,20 +263,23 @@ class FailoverEngine:
                 continue
 
             if isinstance(candidate, PoolCandidate):
-                pool_result, attempt_count, last_status_code = await self._execute_pool_candidate(
-                    candidate=candidate,
-                    candidate_index=candidate_index,
-                    attempt_func=attempt_func,
-                    retry_policy=retry_policy,
-                    request_id=request_id,
-                    user_id=user_id,
-                    api_key_id=api_key_id,
-                    candidate_record_map=candidate_record_map,
-                    candidate_keys_fallback=candidate_keys_fallback,
-                    candidates=candidates,
-                    attempt_count=attempt_count,
-                    max_attempts=max_attempts,
-                    execution_error_handler=execution_error_handler,
+                pool_result, attempt_count, consecutive_failures, last_status_code = (
+                    await self._execute_pool_candidate(
+                        candidate=candidate,
+                        candidate_index=candidate_index,
+                        attempt_func=attempt_func,
+                        retry_policy=retry_policy,
+                        request_id=request_id,
+                        user_id=user_id,
+                        api_key_id=api_key_id,
+                        candidate_record_map=candidate_record_map,
+                        candidate_keys_fallback=candidate_keys_fallback,
+                        candidates=candidates,
+                        attempt_count=attempt_count,
+                        max_attempts=max_attempts,
+                        execution_error_handler=execution_error_handler,
+                        consecutive_failures=consecutive_failures,
+                    )
                 )
                 if pool_result is not None:
                     return pool_result
@@ -217,6 +341,7 @@ class FailoverEngine:
                             retry_policy=retry_policy,
                         )
 
+                    consecutive_failures = 0
                     return ExecutionResult(
                         success=True,
                         attempt_result=attempt_result,
@@ -240,6 +365,13 @@ class FailoverEngine:
                     last_status_code = exc.http_status
                     self._record_attempt_failure(record_id, exc, exc.http_status)
                     action = FailoverAction.CONTINUE
+                    consecutive_failures += 1
+                    await self._apply_retry_pacing(
+                        candidate=candidate,
+                        consecutive_failures=consecutive_failures,
+                        error=exc,
+                        request_id=request_id,
+                    )
 
                 except Exception as exc:
                     outcome = await self._handle_attempt_error(
@@ -263,6 +395,14 @@ class FailoverEngine:
                     max_retries = outcome.max_retries
                     if outcome.stop_result is not None:
                         return outcome.stop_result
+                    if action in {FailoverAction.CONTINUE, FailoverAction.RETRY}:
+                        consecutive_failures += 1
+                        await self._apply_retry_pacing(
+                            candidate=candidate,
+                            consecutive_failures=consecutive_failures,
+                            error=exc,
+                            request_id=request_id,
+                        )
 
                 # action switch: continue/ retry
                 if action == FailoverAction.CONTINUE:
@@ -313,9 +453,10 @@ class FailoverEngine:
         candidate_keys_fallback: list[CandidateKey],
         candidates: list[ProviderCandidate],
         attempt_count: int,
+        consecutive_failures: int,
         max_attempts: int | None,
         execution_error_handler: Any,
-    ) -> tuple[ExecutionResult | None, int, int | None]:
+    ) -> tuple[ExecutionResult | None, int, int, int | None]:
         """Execute a PoolCandidate with in-pool key failover."""
         last_status_code: int | None = None
         retry_slots_per_key = self._get_pool_key_max_retries(candidate, retry_policy)
@@ -421,6 +562,7 @@ class FailoverEngine:
                             retry_policy=retry_policy,
                         )
 
+                    consecutive_failures = 0
                     return (
                         ExecutionResult(
                             success=True,
@@ -441,6 +583,7 @@ class FailoverEngine:
                             request_candidate_id=record_id,
                         ),
                         attempt_count,
+                        consecutive_failures,
                         last_status_code,
                     )
 
@@ -448,6 +591,13 @@ class FailoverEngine:
                     last_status_code = exc.http_status
                     self._record_attempt_failure(record_id, exc, exc.http_status)
                     action = FailoverAction.CONTINUE
+                    consecutive_failures += 1
+                    await self._apply_retry_pacing(
+                        candidate=candidate,
+                        consecutive_failures=consecutive_failures,
+                        error=exc,
+                        request_id=request_id,
+                    )
 
                 except Exception as exc:
                     outcome = await self._handle_pool_attempt_error(
@@ -465,6 +615,14 @@ class FailoverEngine:
                     action = outcome.action
                     last_status_code = outcome.last_status_code
                     max_retries_for_key = min(outcome.max_retries, retry_slots_per_key)
+                    if action in {FailoverAction.CONTINUE, FailoverAction.RETRY}:
+                        consecutive_failures += 1
+                        await self._apply_retry_pacing(
+                            candidate=candidate,
+                            consecutive_failures=consecutive_failures,
+                            error=exc,
+                            request_id=request_id,
+                        )
 
                 if action == FailoverAction.CONTINUE:
                     if retry_policy.mode == RetryMode.PRE_EXPAND and candidate_record_map:
@@ -496,9 +654,9 @@ class FailoverEngine:
                         from_retry_idx=composite_retry_index + 1,
                         retry_policy=retry_policy,
                     )
-                return None, attempt_count, last_status_code
+                return None, attempt_count, consecutive_failures, last_status_code
 
-        return None, attempt_count, last_status_code
+        return None, attempt_count, consecutive_failures, last_status_code
 
     async def _handle_pool_attempt_error(
         self,
