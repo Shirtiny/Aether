@@ -332,7 +332,10 @@ def _convert_legacy_string_list(
 
 def _build_from_legacy_fields(legacy_mode: Any, legacy_lru: Any) -> tuple[SchedulingPreset, ...]:
     """Build presets from legacy scheduling_mode / lru_enabled only."""
-    lru_enabled = legacy_lru if isinstance(legacy_lru, bool) else True
-    if lru_enabled:
-        return (SchedulingPreset(preset="lru", enabled=True),)
+    # Explicit lru_enabled=True -> LRU; explicit lru_enabled=False -> cache_affinity.
+    # No legacy fields at all -> default to cache_affinity.
+    if isinstance(legacy_lru, bool):
+        if legacy_lru:
+            return (SchedulingPreset(preset="lru", enabled=True),)
+        return (SchedulingPreset(preset="cache_affinity", enabled=True),)
     return (SchedulingPreset(preset="cache_affinity", enabled=True),)

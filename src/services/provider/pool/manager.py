@@ -132,7 +132,11 @@ class PoolManager:
             )
             else None
         )
-        _lru_coro = redis_ops.get_lru_scores(pid, all_key_ids) if self.config.lru_enabled else None
+        # LRU scores are needed both for plain LRU sorting and for multi_score
+        # dimensions (e.g. cache_affinity / single_account) that rely on
+        # lru_scores data.
+        _need_lru = self.config.lru_enabled or self.config.scheduling_mode == "multi_score"
+        _lru_coro = redis_ops.get_lru_scores(pid, all_key_ids) if _need_lru else None
         _latency_coro = (
             redis_ops.batch_get_latency_avgs(pid, all_key_ids, self.config.latency_window_seconds)
             if self.config.scheduling_mode == "multi_score"
@@ -504,7 +508,8 @@ class PoolManager:
             )
             else None
         )
-        _lru_coro = redis_ops.get_lru_scores(pid, key_ids) if self.config.lru_enabled else None
+        _need_lru_sk = self.config.lru_enabled or self.config.scheduling_mode == "multi_score"
+        _lru_coro = redis_ops.get_lru_scores(pid, key_ids) if _need_lru_sk else None
         _latency_coro = (
             redis_ops.batch_get_latency_avgs(pid, key_ids, self.config.latency_window_seconds)
             if self.config.scheduling_mode == "multi_score"
@@ -648,8 +653,9 @@ class PoolManager:
                 pid, session_uuid, key_id, self.config.sticky_session_ttl_seconds
             )
 
-        # Touch LRU
-        if self.config.lru_enabled:
+        # Touch LRU -- needed for both plain LRU mode and multi_score dimensions
+        # (e.g. cache_affinity) that rely on LRU timestamps.
+        if self.config.lru_enabled or self.config.scheduling_mode == "multi_score":
             await redis_ops.touch_lru(pid, key_id)
 
         # Record cost
