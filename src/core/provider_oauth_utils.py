@@ -481,11 +481,9 @@ async def _enrich_gemini_cli(
 
 
 def _bootstrap_auth_enrichers() -> None:
-    # 简单的内置 enrichers 直接注册
+    # 简单的内置 enrichers 直接注册（兜底，会被 plugin.register_all() 覆盖）
     register_auth_enricher("claude_code", _enrich_claude_code)
     register_auth_enricher("gemini_cli", _enrich_gemini_cli)
-    # Provider-specific enrichers 通过 plugin.register_all() 注册
-    # (called from envelope.py bootstrap)
 
 
 _bootstrap_auth_enrichers()
