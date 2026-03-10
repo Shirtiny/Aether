@@ -640,12 +640,14 @@ def main() -> Any:
 
     # Start server
     # 根据环境设置热重载
+    is_dev = config.environment == "development"
     uvicorn.run(
         "src.main:app",
         host=config.host,
         port=config.port,
         log_level=log_level,
-        reload=config.environment == "development",  # 只在开发环境启用热重载
+        reload=is_dev,
+        reload_dirs=["src"] if is_dev else None,
         access_log=False,  # 禁用 uvicorn 访问日志，使用自定义中间件
         log_config=uvicorn_log_config,  # 使用自定义日志配置
     )

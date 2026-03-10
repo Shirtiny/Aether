@@ -345,7 +345,7 @@ class Config:
         per_worker_total = available_connections // max(self.worker_processes, 1)
         # pool_size 取总数的一半，另一半留给 overflow
         pool_size = max(per_worker_total // 2, 5)  # 最小 5 个连接
-        return min(pool_size, 30)  # 最大 30 个连接
+        return min(pool_size, 15)  # 最大 15 个连接
 
     def _auto_max_overflow(self) -> int:
         """智能计算最大溢出连接数 - 与 pool_size 相同"""
@@ -361,21 +361,17 @@ class Config:
         3. 需要为数据库连接、Redis 连接等预留资源
 
         公式: base_connections / workers
-        - 单 Worker: 200 连接（适合开发/低负载）
+        - 单 Worker: 100 连接
         - 多 Worker: 按比例分配，确保总数不超过系统限制
 
-        范围: 50 - 200
+        范围: 30 - 100
         """
-        # 基础连接数：默认将总 HTTP 连接预算控制在 200
-        # （预留给 DB、Redis、内部服务等）
-        base_connections = 200
+        base_connections = 100
         workers = max(self.worker_processes, 1)
 
-        # 每个 Worker 分配的连接数
         per_worker = base_connections // workers
 
-        # 限制范围：最小 50（保证基本并发），最大 200（控制内存与 socket 占用）
-        return max(50, min(per_worker, 200))
+        return max(30, min(per_worker, 100))
 
     def _auto_http_keepalive_connections(self) -> int:
         """
