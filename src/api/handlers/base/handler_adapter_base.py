@@ -4,11 +4,11 @@ Handler Adapter 公共基类
 从 ChatAdapterBase 和 CliAdapterBase 提取的共享逻辑：
 - API 格式与头部处理
 - 异常处理和错误响应
-- 计费策略
-- 模型列表查询和端点测试
+- 通过 `core.api_format` 注册表解析计费模板与抓模能力
+- 端点测试辅助
 - 路径参数合并
 
-子类（ChatAdapterBase / CliAdapterBase）只需关注各自的 handle() 流程差异。
+子类（ChatAdapterBase / CliAdapterBase）只需关注各自的 `handle()` 流程差异。
 """
 
 from __future__ import annotations
@@ -27,9 +27,13 @@ from src.core.api_format import (
     EndpointKind,
     build_adapter_base_headers_for_endpoint,
     build_adapter_headers_for_endpoint,
+    compute_total_input_context_for_api_format,
+    fetch_models_for_api_format,
     get_adapter_protected_keys_for_endpoint,
     get_auth_handler,
     get_default_auth_method_for_endpoint,
+    resolve_billing_template_for_api_format,
+    resolve_header_name_case,
 )
 from src.core.exceptions import (
     ProviderAuthException,
@@ -49,10 +53,10 @@ class HandlerAdapterBase(ApiAdapter):
     封装两者共享的逻辑：
     - API 格式与头部处理
     - 异常处理和错误响应
-    - 计费策略
-    - 模型列表查询和端点测试
+    - 通过 `core.api_format` 注册表解析计费模板与模型抓取能力
+    - 端点测试辅助
 
-    子类（ChatAdapterBase / CliAdapterBase）只需实现 handle() 和格式特有的方法。
+    子类（ChatAdapterBase / CliAdapterBase）只需实现 `handle()` 和格式特有的方法。
     """
 
     # 子类必须覆盖
@@ -62,7 +66,7 @@ class HandlerAdapterBase(ApiAdapter):
     API_FAMILY: ClassVar[ApiFamily | None] = None
     ENDPOINT_KIND: ClassVar[EndpointKind] = EndpointKind.CHAT
 
-    # 计费模板配置（子类可覆盖，如 "claude", "openai", "gemini"）
+    # 兼容性回退：若 api_format 注册表未声明计费模板，则使用该默认值。
     BILLING_TEMPLATE: str = "claude"
 
     def __init__(self, allowed_api_formats: list[str] | None = None):
@@ -241,17 +245,8 @@ class HandlerAdapterBase(ApiAdapter):
         )
 
     # =========================================================================
-    # 计费策略
+    # 计费能力委托
     # =========================================================================
-
-    def compute_total_input_context(
-        self,
-        input_tokens: int,
-        cache_read_input_tokens: int,
-        cache_creation_input_tokens: int = 0,
-    ) -> int:
-        """计算总输入上下文（用于阶梯计费判定）- 子类可覆盖"""
-        return input_tokens + cache_read_input_tokens
 
     def compute_cost(
         self,
@@ -268,8 +263,11 @@ class HandlerAdapterBase(ApiAdapter):
         cache_ttl_minutes: int | None = None,
     ) -> dict[str, Any]:
         """计算请求成本"""
-        total_input_context = self.compute_total_input_context(
-            input_tokens, cache_read_input_tokens, cache_creation_input_tokens
+        total_input_context = compute_total_input_context_for_api_format(
+            self.FORMAT_ID, input_tokens, cache_read_input_tokens, cache_creation_input_tokens
+        )
+        billing_template = (
+            resolve_billing_template_for_api_format(self.FORMAT_ID) or self.BILLING_TEMPLATE
         )
 
         return _calculate_request_cost(
@@ -285,11 +283,11 @@ class HandlerAdapterBase(ApiAdapter):
             tiered_pricing=tiered_pricing,
             cache_ttl_minutes=cache_ttl_minutes,
             total_input_context=total_input_context,
-            billing_template=self.BILLING_TEMPLATE,
+            billing_template=billing_template,
         )
 
     # =========================================================================
-    # 模型列表查询与端点测试
+    # 模型抓取委托与端点测试
     # =========================================================================
 
     @classmethod
@@ -300,8 +298,14 @@ class HandlerAdapterBase(ApiAdapter):
         api_key: str,
         extra_headers: dict[str, str] | None = None,
     ) -> tuple[list, str | None]:
-        """查询上游 API 支持的模型列表 - 子类应覆盖"""
-        return [], f"{cls.FORMAT_ID} adapter does not implement fetch_models"
+        """查询上游 API 支持的模型列表。"""
+        return await fetch_models_for_api_format(
+            client,
+            api_format=cls.FORMAT_ID,
+            base_url=base_url,
+            api_key=api_key,
+            extra_headers=extra_headers,
+        )
 
     @classmethod
     def build_request_body(
@@ -343,6 +347,7 @@ class HandlerAdapterBase(ApiAdapter):
         provider_api_key: Any | None = None,
         # 代理配置
         proxy_config: dict[str, Any] | None = None,
+        timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
         """
         测试模型连接性（非流式）
@@ -458,7 +463,8 @@ class HandlerAdapterBase(ApiAdapter):
                 default_auth_header, _ = get_auth_config_for_endpoint(cls.FORMAT_ID)
                 if default_auth_header.lower() != "authorization":
                     headers.pop(default_auth_header, None)
-                headers["Authorization"] = f"Bearer {api_key}"
+                auth_header_name = resolve_header_name_case(extra_headers, "Authorization")
+                headers[auth_header_name] = f"Bearer {api_key}"
 
         # ---- Body ----
         body = cls.build_request_body(request_data, base_url=base_url, provider_type=provider_type)
@@ -527,6 +533,7 @@ class HandlerAdapterBase(ApiAdapter):
             api_key_id=api_key_id,
             model_name=effective_model_name,
             proxy_config=proxy_config,
+            timeout=timeout_seconds,
         )
 
     # =========================================================================

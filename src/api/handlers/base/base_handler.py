@@ -533,18 +533,21 @@ class BaseMessageHandler:
 
         target_request_id = request_id or self.request_id
 
+        def _sync_update() -> None:
+            db_gen = get_db()
+            db = next(db_gen)
+            try:
+                UsageService.update_usage_status(
+                    db=db,
+                    request_id=target_request_id,
+                    status="streaming",
+                )
+            finally:
+                db.close()
+
         async def _do_update() -> None:
             try:
-                db_gen = get_db()
-                db = next(db_gen)
-                try:
-                    UsageService.update_usage_status(
-                        db=db,
-                        request_id=target_request_id,
-                        status="streaming",
-                    )
-                finally:
-                    db.close()
+                await asyncio.to_thread(_sync_update)
             except Exception as e:
                 logger.warning(f"[{target_request_id}] 更新 Usage 状态为 streaming 失败: {e}")
 
@@ -585,29 +588,36 @@ class BaseMessageHandler:
                 f"ctx.provider_name={ctx.provider_name}, ctx.provider_id={ctx.provider_id}"
             )
 
+        # Capture mutable ctx attrs before handing off to thread
+        provider_request_headers = ctx.provider_request_headers or None
+        provider_request_body = ctx.provider_request_body
+
+        def _sync_update() -> None:
+            db_gen = get_db()
+            db = next(db_gen)
+            try:
+                UsageService.update_usage_status(
+                    db=db,
+                    request_id=target_request_id,
+                    status="streaming",
+                    provider=provider,
+                    target_model=target_model,
+                    provider_id=provider_id,
+                    provider_endpoint_id=endpoint_id,
+                    provider_api_key_id=key_id,
+                    first_byte_time_ms=first_byte_time_ms,
+                    api_format=api_format,
+                    endpoint_api_format=endpoint_api_format,
+                    has_format_conversion=has_format_conversion,
+                    provider_request_headers=provider_request_headers,
+                    provider_request_body=provider_request_body,
+                )
+            finally:
+                db.close()
+
         async def _do_update() -> None:
             try:
-                db_gen = get_db()
-                db = next(db_gen)
-                try:
-                    UsageService.update_usage_status(
-                        db=db,
-                        request_id=target_request_id,
-                        status="streaming",
-                        provider=provider,
-                        target_model=target_model,
-                        provider_id=provider_id,
-                        provider_endpoint_id=endpoint_id,
-                        provider_api_key_id=key_id,
-                        first_byte_time_ms=first_byte_time_ms,
-                        api_format=api_format,
-                        endpoint_api_format=endpoint_api_format,
-                        has_format_conversion=has_format_conversion,
-                        provider_request_headers=ctx.provider_request_headers or None,
-                        provider_request_body=ctx.provider_request_body,
-                    )
-                finally:
-                    db.close()
+                await asyncio.to_thread(_sync_update)
             except Exception as e:
                 logger.warning(f"[{target_request_id}] 更新 Usage 状态为 streaming 失败: {e}")
 
@@ -622,9 +632,9 @@ class BaseMessageHandler:
             error: 异常对象
         """
         from src.core.exceptions import (
+            BalanceInsufficientException,
             ModelNotSupportedException,
             ProviderException,
-            QuotaExceededException,
             RateLimitException,
             UpstreamClientException,
         )
@@ -633,7 +643,7 @@ class BaseMessageHandler:
             error,
             (
                 ProviderException,
-                QuotaExceededException,
+                BalanceInsufficientException,
                 RateLimitException,
                 ModelNotSupportedException,
                 UpstreamClientException,

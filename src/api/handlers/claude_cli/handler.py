@@ -10,8 +10,8 @@ from src.api.handlers.base.cli_handler_base import (
     CliMessageHandlerBase,
     StreamContext,
 )
-from src.api.handlers.base.utils import extract_cache_creation_tokens_detail
 from src.core.api_format import ApiFamily, EndpointKind
+from src.core.usage_tokens import extract_cache_creation_tokens_detail
 
 
 class ClaudeCliMessageHandler(CliMessageHandlerBase):

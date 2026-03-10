@@ -16,6 +16,7 @@ WORKDIR /app
 ARG HUB_RELEASE_REPO=Shirtiny/Aether
 ARG HUB_TAG
 ARG TARGETARCH
+ARG GITHUB_TOKEN
 
 # 运行时依赖（无 gcc/nodejs/npm，使用 BuildKit 缓存加速）
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
@@ -32,10 +33,15 @@ COPY --from=builder /usr/local/bin/gunicorn /usr/local/bin/
 COPY --from=builder /usr/local/bin/uvicorn /usr/local/bin/
 COPY --from=builder /usr/local/bin/alembic /usr/local/bin/
 # Hub 预编译二进制（构建时从 GitHub Release 下载）
+# GITHUB_TOKEN 可选：未认证 API 限流 60 次/小时，认证后 5000 次/小时
 RUN set -eux; \
+    auth_header=""; \
+    if [ -n "${GITHUB_TOKEN:-}" ]; then \
+        auth_header="Authorization: token ${GITHUB_TOKEN}"; \
+    fi; \
     tag="${HUB_TAG:-}"; \
     if [ -z "$tag" ]; then \
-        tag="$(curl -sL "https://api.github.com/repos/${HUB_RELEASE_REPO}/releases" | python3 -c "import json,sys;print(next((r['tag_name'] for r in json.load(sys.stdin) if r.get('tag_name','').startswith('hub-v') and not r.get('draft') and not r.get('prerelease')),''))")"; \
+        tag="$(curl -sL ${auth_header:+-H "$auth_header"} "https://api.github.com/repos/${HUB_RELEASE_REPO}/releases" | python3 -c "import json,sys;print(next((r['tag_name'] for r in json.load(sys.stdin) if r.get('tag_name','').startswith('hub-v') and not r.get('draft') and not r.get('prerelease')),''))")"; \
     fi; \
     if [ -z "$tag" ]; then \
         echo "Failed to resolve hub release tag"; \
@@ -185,7 +191,7 @@ RUN printf '%s\n' \
     'stderr_logfile=/var/log/nginx/error.log' \
     '' \
     '[program:app]' \
-    'command=/bin/bash -c "MAX_REQUESTS_JITTER=$((${MAX_REQUESTS:-50000}/20)); exec gunicorn src.main:app -c gunicorn_conf.py --preload -w %(ENV_GUNICORN_WORKERS)s -k uvicorn.workers.UvicornWorker --bind 127.0.0.1:8084 --timeout 120 --max-requests ${MAX_REQUESTS:-50000} --max-requests-jitter $MAX_REQUESTS_JITTER --access-logfile - --error-logfile - --log-level info"' \
+    'command=/bin/bash -c "MAX_REQUESTS_JITTER=$((${MAX_REQUESTS:-50000}/20)); exec gunicorn src.main:app -c gunicorn_conf.py --preload -w %(ENV_GUNICORN_WORKERS)s -k uvicorn.workers.UvicornWorker --bind 127.0.0.1:8084 --max-requests ${MAX_REQUESTS:-50000} --max-requests-jitter $MAX_REQUESTS_JITTER --access-logfile - --error-logfile - --log-level info"' \
     'directory=/app' \
     'autostart=true' \
     'autorestart=true' \

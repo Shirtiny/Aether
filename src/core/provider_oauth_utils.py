@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from typing import Any, Awaitable, Callable
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import httpx
 import jwt
@@ -17,16 +17,74 @@ _GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v1/userinfo?alt=json"
 
 
 def _coerce_proxy_url(proxy_config: dict[str, Any] | None) -> str | None:
-    if not proxy_config:
-        return None
-    try:
-        if not proxy_config.get("enabled", True):
-            return None
-        from src.services.proxy_node.resolver import build_proxy_url  # lazy: core→services
+    """为 tls-client 构建可用的代理 URL（best-effort）。
 
-        return build_proxy_url(proxy_config)
-    except Exception:
+    说明：
+    - core 层不解析 ProxyNode（node_id）模式，避免 core→services 反向依赖。
+    - 仅支持手工 URL 模式：{url, username, password, enabled}。
+    - node_id / tunnel 等复杂模式由 httpx 路径（HTTPClientPool）处理。
+    """
+    if not proxy_config or not proxy_config.get("enabled", True):
         return None
+
+    raw_url = proxy_config.get("url")
+    if not isinstance(raw_url, str) or not raw_url.strip():
+        return None
+
+    proxy_url = raw_url.strip()
+    username = proxy_config.get("username")
+    password = proxy_config.get("password")
+    if isinstance(username, str) and username.strip():
+        return _inject_auth_into_url(
+            proxy_url, username.strip(), str(password) if password else None
+        )
+    return proxy_url
+
+
+def _inject_auth_into_url(url: str, username: str, password: str | None = None) -> str:
+    """将用户名密码注入 URL（仅用于 tls-client 同步请求）。"""
+    try:
+        parsed = urlsplit(url)
+        if not parsed.scheme or not parsed.hostname:
+            return url
+
+        encoded_username = quote(username, safe="")
+        encoded_password = quote(password, safe="") if password else ""
+        host_part = parsed.hostname
+        if parsed.port:
+            host_part = f"{host_part}:{parsed.port}"
+        auth_part = (
+            f"{encoded_username}:{encoded_password}" if encoded_password else encoded_username
+        )
+        netloc = f"{auth_part}@{host_part}"
+
+        return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+    except Exception:
+        return url
+
+
+def _proxy_display(proxy_config: dict[str, Any] | None) -> str | None:
+    """生成用于日志输出的 proxy 摘要（不泄露认证信息）。"""
+    if not proxy_config or not proxy_config.get("enabled", True):
+        return None
+
+    node_id = proxy_config.get("node_id")
+    if isinstance(node_id, str) and node_id.strip():
+        return f"node_id:{node_id.strip()}"
+
+    proxy_url = _coerce_proxy_url(proxy_config)
+    if not proxy_url:
+        return None
+
+    try:
+        parts = urlsplit(proxy_url)
+        host = parts.hostname or ""
+        if parts.port:
+            host = f"{host}:{parts.port}"
+        # 仅保留 scheme + host + path，移除 userinfo/query/fragment
+        return urlunsplit((parts.scheme, host, parts.path, "", ""))
+    except Exception:
+        return "<invalid_proxy>"
 
 
 def _redact_url(url: str) -> str:
@@ -58,7 +116,7 @@ async def _httpx_post(
     timeout_seconds: float,
 ) -> httpx.Response:
     client = await HTTPClientPool.get_proxy_client(proxy_config)
-    proxy_url = _coerce_proxy_url(proxy_config)
+    proxy_url = _proxy_display(proxy_config)
     safe_url = _redact_url(url)
 
     last_exc: Exception | None = None

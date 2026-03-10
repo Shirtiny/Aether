@@ -9,7 +9,7 @@ from typing import Any, cast
 import pytest
 
 from src.core.exceptions import InvalidRequestException
-from src.models.endpoint_models import EndpointAPIKeyUpdate
+from src.models.endpoint_models import EndpointAPIKeyCreate, EndpointAPIKeyUpdate
 
 
 async def _noop_invalidate_models_list_cache() -> None:
@@ -70,6 +70,25 @@ def _build_key(**overrides: Any) -> SimpleNamespace:
     }
     base.update(overrides)
     return SimpleNamespace(**base)
+
+
+def test_key_create_accepts_zero_max_probe_interval_minutes() -> None:
+    payload = EndpointAPIKeyCreate.model_validate(
+        {
+            "name": "key-1",
+            "api_key": "secret",
+            "api_formats": ["openai:chat"],
+            "max_probe_interval_minutes": 0,
+        }
+    )
+
+    assert payload.max_probe_interval_minutes == 0
+
+
+def test_key_update_accepts_zero_max_probe_interval_minutes() -> None:
+    payload = EndpointAPIKeyUpdate.model_validate({"max_probe_interval_minutes": 0})
+
+    assert payload.max_probe_interval_minutes == 0
 
 
 def test_prepare_update_payload_auth_type_null_ignored() -> None:
@@ -159,11 +178,13 @@ def test_clear_oauth_invalid_response_invalidates_caches(
         sys.modules, "src.services.cache.provider_cache", fake_provider_cache_module
     )
 
-    fake_models_service_module = types.ModuleType("src.api.base.models_service")
+    fake_models_service_module = types.ModuleType("src.services.cache.model_list_cache")
     setattr(
         fake_models_service_module, "invalidate_models_list_cache", _fake_invalidate_models_cache
     )
-    monkeypatch.setitem(sys.modules, "src.api.base.models_service", fake_models_service_module)
+    monkeypatch.setitem(
+        sys.modules, "src.services.cache.model_list_cache", fake_models_service_module
+    )
 
     key = SimpleNamespace(
         oauth_invalid_at=datetime.now(timezone.utc),
@@ -183,7 +204,7 @@ def test_clear_oauth_invalid_response_invalidates_caches(
 
 
 @pytest.mark.asyncio
-async def test_run_delete_key_side_effects_not_skip_disassociate(
+async def test_run_delete_key_side_effects_skip_disassociate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: dict[str, Any] = {}
@@ -206,4 +227,4 @@ async def test_run_delete_key_side_effects_not_skip_disassociate(
     )
 
     assert captured["provider_id"] == "provider-1"
-    assert "skip_disassociate" not in captured
+    assert captured["skip_disassociate"] is True

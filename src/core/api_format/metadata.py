@@ -68,6 +68,20 @@ class EndpointDefinition:
                 yield value
 
 
+CODEX_DEFAULT_BODY_RULES: tuple[dict[str, Any], ...] = (
+    {"action": "drop", "path": "max_output_tokens"},
+    {"action": "drop", "path": "temperature"},
+    {"action": "drop", "path": "top_p"},
+    {"action": "set", "path": "store", "value": False},
+    {
+        "action": "set",
+        "path": "instructions",
+        "value": "You are GPT-5.",
+        "condition": {"path": "instructions", "op": "not_exists"},
+    },
+)
+
+
 _ENDPOINT_DEFINITIONS: dict[tuple[ApiFamily, EndpointKind], EndpointDefinition] = {
     # Claude
     (ApiFamily.CLAUDE, EndpointKind.CHAT): EndpointDefinition(
@@ -138,6 +152,7 @@ _ENDPOINT_DEFINITIONS: dict[tuple[ApiFamily, EndpointKind], EndpointDefinition] 
         # compact endpoint is non-streaming by design.
         stream_in_body=False,
         data_format_id="openai_responses",
+        default_body_rules=CODEX_DEFAULT_BODY_RULES,
     ),
     (ApiFamily.OPENAI, EndpointKind.VIDEO): EndpointDefinition(
         api_family=ApiFamily.OPENAI,
@@ -302,16 +317,17 @@ def get_default_body_rules_for_endpoint(
 ) -> list[dict[str, Any]]:
     """获取端点的默认 body_rules。
 
-    优先查找 provider_type 维度的注册规则（如 Codex 对 openai:cli 的定制规则），
+    优先查找 unified api_format capability registry 中的 provider 维度规则（如 Codex 对 openai:cli 的定制规则），
     找不到时回退到 EndpointDefinition 上的通用默认规则。
     """
-    # 确保 provider plugins 已注册（填充 _provider_default_body_rules）
+    # 确保 provider plugins 已注册（填充 capabilities 中的 provider registry）
     # ensure_providers_bootstrapped 是幂等的，重复调用无副作用
     if provider_type:
         try:
-            from src.services.provider.envelope import ensure_providers_bootstrapped
+            import importlib
 
-            ensure_providers_bootstrapped()
+            envelope = importlib.import_module("src.services.provider.envelope")
+            getattr(envelope, "ensure_providers_bootstrapped")()
         except Exception:
             pass
 
@@ -319,9 +335,11 @@ def get_default_body_rules_for_endpoint(
     if provider_type:
         pt = provider_type.strip().lower()
         sig = _normalize_sig_key(value)
-        provider_rules = _provider_default_body_rules.get((pt, sig))
+        from src.core.api_format.capabilities import get_provider_default_body_rules
+
+        provider_rules = get_provider_default_body_rules(pt, sig)
         if provider_rules is not None:
-            return deepcopy(list(provider_rules))
+            return provider_rules
 
     # 2) 回退到 EndpointDefinition 上的通用默认规则
     definition = resolve_endpoint_definition(value)
@@ -331,10 +349,8 @@ def get_default_body_rules_for_endpoint(
 
 
 # ---------------------------------------------------------------------------
-# Provider-scoped default body rules registry
+# Provider-scoped default body rules compatibility wrappers
 # ---------------------------------------------------------------------------
-# key: (provider_type, endpoint_sig_key)  e.g. ("codex", "openai:cli")
-_provider_default_body_rules: dict[tuple[str, str], Sequence[dict[str, Any]]] = {}
 
 
 def register_provider_default_body_rules(
@@ -342,10 +358,14 @@ def register_provider_default_body_rules(
     endpoint_sig: str,
     rules: Sequence[dict[str, Any]],
 ) -> None:
-    """注册特定 provider_type + endpoint_sig 的默认 body_rules。"""
+    """兼容入口：注册特定 provider_type + endpoint_sig 的默认 body_rules，真实存储位于 core registry。"""
     pt = provider_type.strip().lower()
     sig = _normalize_sig_key(endpoint_sig)
-    _provider_default_body_rules[(pt, sig)] = tuple(rules)
+    from src.core.api_format.capabilities import (
+        register_provider_default_body_rules as register_provider_default_body_rules_in_registry,
+    )
+
+    register_provider_default_body_rules_in_registry(pt, sig, rules)
 
 
 def _normalize_sig_key(
@@ -397,6 +417,7 @@ def make_endpoint_signature(api_family: str, endpoint_kind: str) -> str:
 
 
 __all__ = [
+    "CODEX_DEFAULT_BODY_RULES",
     "EndpointDefinition",
     "ENDPOINT_DEFINITIONS",
     "list_endpoint_definitions",

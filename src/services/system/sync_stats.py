@@ -37,7 +37,8 @@ class SyncStatsService:
         try:
             # 获取要同步的API密钥（使用分页避免大数据量问题）
             if api_key_id:
-                api_keys = db.query(ApiKey).filter(ApiKey.id == api_key_id).all()
+                single_key = db.query(ApiKey).filter(ApiKey.id == api_key_id).first()
+                api_keys = [single_key] if single_key else []
             else:
                 # 分页处理，避免一次加载所有数据
                 offset = 0
@@ -106,7 +107,7 @@ class SyncStatsService:
                         api_key.total_requests = actual_requests
                         needs_update = True
 
-                    if abs(api_key.total_cost_usd - actual_cost) > 0.0001:
+                    if abs(float(api_key.total_cost_usd or 0) - actual_cost) > 0.0001:
                         logger.info(
                             f"API密钥 {api_key.id} 费用不一致: {api_key.total_cost_usd} -> {actual_cost}"
                         )

@@ -1,7 +1,7 @@
 """
 上游模型获取公共模块
 
-提供从上游 API 获取模型列表的公共函数，供以下场景使用：
+提供从上游 API 获取模型列表的公共函数；通用 api_format 抓取能力统一来自 core.api_format.capabilities，供以下场景使用：
 - 定时任务自动获取（fetch_scheduler.py）
 - 管理后台手动查询（provider_query.py）
 """
@@ -155,19 +155,6 @@ def merge_upstream_metadata(
     return merged
 
 
-# Provider-specific fetchers are registered by plugin.register_all()
-# (called from envelope.py bootstrap)
-
-
-def get_adapter_for_format(api_format: str) -> type | None:
-    """根据 API 格式获取对应的 Adapter 类"""
-    # TODO(arch): 引入 adapter 能力注册表，消除 services->api 依赖
-    from src.api.handlers.base.chat_adapter_base import get_adapter_class
-    from src.api.handlers.base.cli_adapter_base import get_cli_adapter_class
-
-    return get_adapter_class(api_format) or get_cli_adapter_class(api_format)
-
-
 def build_all_format_configs(
     api_key_value: str,
     format_to_endpoint: dict[str, EndpointFetchConfig],
@@ -252,13 +239,15 @@ async def fetch_models_from_endpoints(
         extra_headers = config.get("extra_headers")
 
         try:
-            adapter_class = get_adapter_for_format(api_format)
-            if not adapter_class:
-                return [], f"Unknown API format: {api_format}", False
-
             async with semaphore:
-                models, error = await adapter_class.fetch_models(  # type: ignore[attr-defined]
-                    client, base_url, api_key_value, extra_headers
+                from src.core.api_format.capabilities import fetch_models_for_api_format
+
+                models, error = await fetch_models_for_api_format(
+                    client,
+                    api_format=api_format,
+                    base_url=base_url,
+                    api_key=api_key_value,
+                    extra_headers=extra_headers,
                 )
 
             for m in models:

@@ -266,8 +266,8 @@ import { RefreshCw, Play, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight
 import { useToast } from '@/composables/useToast'
 import { useConfirm } from '@/composables/useConfirm'
 import { parseApiError } from '@/utils/errorParser'
-import { listPoolKeys, type PoolKeyDetail } from '@/api/endpoints/pool'
-import { deleteEndpointKey, refreshProviderQuota, updateProviderKey } from '@/api/endpoints/keys'
+import { listPoolKeys, batchActionPoolKeys, getPoolBatchDeleteTask, type PoolKeyDetail } from '@/api/endpoints/pool'
+import { refreshProviderQuota } from '@/api/endpoints/keys'
 import { refreshProviderOAuth } from '@/api/endpoints/provider_oauth'
 import { useProxyNodesStore } from '@/stores/proxy-nodes'
 import { hasNoFiveHourLimit as hasNoFiveHourLimitByQuota, hasNoWeeklyLimit as hasNoWeeklyLimitByQuota } from '@/features/pool/utils/quota-selectors'
@@ -526,10 +526,14 @@ async function loadAllKeys(): Promise<void> {
     return
   }
   loading.value = true
+  const startedAt = performance.now()
+  let fetchedPages = 0
+  let total = 0
+  let loadedCount = 0
+  let ok = false
   try {
     const pageSize = 200
     let page = 1
-    let total = 0
     const collected: PoolKeyDetail[] = []
 
     while (page <= 50) {
@@ -538,6 +542,7 @@ async function loadAllKeys(): Promise<void> {
         page_size: pageSize,
         status: 'all',
       })
+      fetchedPages = page
       const keys = Array.isArray(res.keys) ? res.keys : []
       collected.push(...keys)
       total = Number(res.total || 0)
@@ -546,15 +551,56 @@ async function loadAllKeys(): Promise<void> {
     }
 
     allKeys.value = collected
+    loadedCount = collected.length
     const validIds = new Set(collected.map((key) => key.key_id))
     selectedKeyIds.value = selectedKeyIds.value.filter((id) => validIds.has(id))
+    ok = true
   } catch (err) {
     showError(parseApiError(err, '加载账号列表失败'))
     allKeys.value = []
     selectedKeyIds.value = []
   } finally {
     loading.value = false
+    // eslint-disable-next-line no-console
+    console.info('[PoolAccountBatchDialog] loadAllKeys timing', {
+      providerId: props.providerId,
+      ok,
+      fetchedPages,
+      total,
+      loadedCount,
+      durationMs: Math.round(performance.now() - startedAt),
+    })
   }
+}
+
+const DELETE_POLL_INTERVAL_MS = 2000
+const DELETE_POLL_MAX_MS = 10 * 60 * 1000
+const DELETE_POLL_MAX_FAILURES = 3
+
+async function pollDeleteTask(
+  providerId: string,
+  taskId: string,
+  progressOffset: number,
+): Promise<{ status: string; deleted: number }> {
+  const deadline = Date.now() + DELETE_POLL_MAX_MS
+  let consecutiveFailures = 0
+  while (Date.now() < deadline) {
+    try {
+      const task = await getPoolBatchDeleteTask(providerId, taskId)
+      consecutiveFailures = 0
+      progressDone.value = progressOffset + task.deleted
+      if (task.status === 'completed' || task.status === 'failed') {
+        return { status: task.status, deleted: task.deleted }
+      }
+    } catch {
+      consecutiveFailures++
+      if (consecutiveFailures >= DELETE_POLL_MAX_FAILURES) {
+        return { status: 'failed', deleted: 0 }
+      }
+    }
+    await new Promise((r) => setTimeout(r, DELETE_POLL_INTERVAL_MS))
+  }
+  return { status: 'failed', deleted: 0 }
 }
 
 async function executeAction(): Promise<void> {
@@ -590,6 +636,9 @@ async function executeAction(): Promise<void> {
   let successCount = 0
   let failedCount = 0
   let skippedCount = 0
+  const actionStartedAt = performance.now()
+  let actionPhaseMs = 0
+  let reloadPhaseMs = 0
 
   const actionLabel = ACTION_OPTIONS.find((a) => a.value === selectedAction.value)?.label || '执行'
   progressDone.value = 0
@@ -600,50 +649,108 @@ async function executeAction(): Promise<void> {
   try {
     if (selectedAction.value === 'refresh_quota') {
       const targetIds = selectedKeys.map((key) => key.key_id)
-      const result = await refreshProviderQuota(props.providerId, targetIds)
-      successCount = Number(result.success || 0)
-      failedCount = Number(result.failed || 0)
-      skippedCount = Math.max(0, targetIds.length - Number(result.total || 0))
-      progressDone.value = targetIds.length
-    } else {
-      const CONCURRENCY = props.batchConcurrency || 8
-      const taskForKey = (key: PoolKeyDetail): (() => Promise<'success' | 'skip'>) | null => {
-        if (selectedAction.value === 'delete') {
-          return () => deleteEndpointKey(key.key_id).then(() => 'success' as const)
-        }
-        if (selectedAction.value === 'refresh_oauth') {
-          if (normalizeText(key.auth_type) !== 'oauth') return null
-          return () => refreshProviderOAuth(key.key_id).then(() => 'success' as const)
-        }
-        if (selectedAction.value === 'clear_proxy') {
-          return () => updateProviderKey(key.key_id, { proxy: null }).then(() => 'success' as const)
-        }
-        if (selectedAction.value === 'set_proxy') {
-          return () => updateProviderKey(key.key_id, {
-            proxy: { node_id: proxyNodeIdForAction.value, enabled: true },
-          }).then(() => 'success' as const)
-        }
-        if (selectedAction.value === 'enable') {
-          return () => updateProviderKey(key.key_id, { is_active: true }).then(() => 'success' as const)
-        }
-        if (selectedAction.value === 'disable') {
-          return () => updateProviderKey(key.key_id, { is_active: false }).then(() => 'success' as const)
-        }
-        return null
-      }
+      const BATCH_SIZE = 20
+      const totalBatches = Math.ceil(targetIds.length / BATCH_SIZE)
 
+      for (let i = 0; i < targetIds.length; i += BATCH_SIZE) {
+        const batchIndex = Math.floor(i / BATCH_SIZE) + 1
+        const batch = targetIds.slice(i, i + BATCH_SIZE)
+        progressLabel.value = `正在${actionLabel}...（第 ${batchIndex}/${totalBatches} 批）`
+
+        try {
+          const result = await refreshProviderQuota(props.providerId, batch)
+          successCount += Number(result.success || 0)
+          failedCount += Number(result.failed || 0)
+          skippedCount += Math.max(0, batch.length - Number(result.total || 0))
+        } catch {
+          failedCount += batch.length
+        }
+
+        progressDone.value = Math.min(i + BATCH_SIZE, targetIds.length)
+      }
+    } else if (selectedAction.value === 'delete') {
+      // 删除走异步任务模式：提交后轮询进度
+      const targetIds = selectedKeys.map((key) => key.key_id)
+      const BATCH_SIZE = 2000
+      const totalBatches = Math.ceil(targetIds.length / BATCH_SIZE)
+
+      for (let i = 0; i < targetIds.length; i += BATCH_SIZE) {
+        const batchIndex = Math.floor(i / BATCH_SIZE) + 1
+        const batch = targetIds.slice(i, i + BATCH_SIZE)
+        if (totalBatches > 1) {
+          progressLabel.value = `正在${actionLabel}...（第 ${batchIndex}/${totalBatches} 批）`
+        }
+
+        try {
+          const result = await batchActionPoolKeys(props.providerId, {
+            key_ids: batch,
+            action: 'delete',
+          })
+
+          if (result.task_id) {
+            // 异步任务：轮询进度
+            progressLabel.value = `正在${actionLabel}...（后台执行中）`
+            const taskResult = await pollDeleteTask(props.providerId, result.task_id, i)
+            successCount += taskResult.deleted
+            if (taskResult.status === 'failed') {
+              failedCount += batch.length - taskResult.deleted
+            }
+          } else {
+            successCount += result.affected
+          }
+        } catch (err) {
+          // eslint-disable-next-line no-console
+          console.error(`batch delete failed (batch ${batchIndex}/${totalBatches}):`, err)
+          failedCount += batch.length
+        }
+
+        progressDone.value = Math.min(i + BATCH_SIZE, targetIds.length)
+      }
+    } else if (['enable', 'disable', 'clear_proxy', 'set_proxy'].includes(selectedAction.value)) {
+      const targetIds = selectedKeys.map((key) => key.key_id)
+      const BATCH_SIZE = 2000
+      const totalBatches = Math.ceil(targetIds.length / BATCH_SIZE)
+
+      for (let i = 0; i < targetIds.length; i += BATCH_SIZE) {
+        const batchIndex = Math.floor(i / BATCH_SIZE) + 1
+        const batch = targetIds.slice(i, i + BATCH_SIZE)
+        if (totalBatches > 1) {
+          progressLabel.value = `正在${actionLabel}...（第 ${batchIndex}/${totalBatches} 批）`
+        }
+
+        const payload = selectedAction.value === 'set_proxy'
+          ? { node_id: proxyNodeIdForAction.value, enabled: true }
+          : undefined
+
+        try {
+          const result = await batchActionPoolKeys(props.providerId, {
+            key_ids: batch,
+            action: selectedAction.value as 'enable' | 'disable' | 'clear_proxy' | 'set_proxy',
+            ...(payload ? { payload } : {}),
+          })
+          successCount += result.affected
+        } catch (err) {
+          // eslint-disable-next-line no-console
+          console.error(`batch ${selectedAction.value} failed (batch ${batchIndex}/${totalBatches}):`, err)
+          failedCount += batch.length
+        }
+
+        progressDone.value = Math.min(i + BATCH_SIZE, targetIds.length)
+      }
+    } else {
+      // refresh_oauth: 逐个并发调用（涉及外部 OAuth 令牌刷新）
+      const CONCURRENCY = props.batchConcurrency || 8
       const tasks: Array<() => Promise<'success' | 'skip'>> = []
       for (const key of selectedKeys) {
-        const task = taskForKey(key)
-        if (task) tasks.push(task)
-        else {
+        if (selectedAction.value === 'refresh_oauth' && normalizeText(key.auth_type) !== 'oauth') {
           skippedCount += 1
           progressDone.value += 1
+          continue
         }
+        tasks.push(() => refreshProviderOAuth(key.key_id).then(() => 'success' as const))
       }
       progressTotal.value = selectedKeys.length
 
-      // 并发执行，限制并发数
       let cursor = 0
       const runNext = async (): Promise<void> => {
         while (cursor < tasks.length) {
@@ -665,19 +772,36 @@ async function executeAction(): Promise<void> {
     if (failedCount > 0) warning(lastResultMessage.value)
     else success(lastResultMessage.value)
 
-    const shouldClearSelection = selectedAction.value === 'delete'
-    const previousSelection = new Set(selectedKeyIds.value)
-    await loadAllKeys()
-    if (shouldClearSelection) {
+    actionPhaseMs = performance.now() - actionStartedAt
+    const reloadStartedAt = performance.now()
+    if (selectedAction.value === 'delete' && successCount > 0 && failedCount === 0) {
+      // 全部删除成功：直接从本地列表移除，不做全量重载
+      const deletedIds = new Set(selectedKeys.map((key) => key.key_id))
+      allKeys.value = allKeys.value.filter((key) => !deletedIds.has(key.key_id))
       selectedKeyIds.value = []
     } else {
+      const previousSelection = new Set(selectedKeyIds.value)
+      await loadAllKeys()
       const existingIds = new Set(allKeys.value.map((key) => key.key_id))
       selectedKeyIds.value = [...previousSelection].filter((id) => existingIds.has(id))
     }
+    reloadPhaseMs = performance.now() - reloadStartedAt
     emit('changed')
   } catch (err) {
     showError(parseApiError(err, '批量操作失败'))
   } finally {
+    // eslint-disable-next-line no-console
+    console.info('[PoolAccountBatchDialog] executeAction timing', {
+      providerId: props.providerId,
+      action: selectedAction.value,
+      selectedCount: selectedKeys.length,
+      successCount,
+      failedCount,
+      skippedCount,
+      actionPhaseMs: Math.round(actionPhaseMs),
+      reloadPhaseMs: Math.round(reloadPhaseMs),
+      totalMs: Math.round(performance.now() - actionStartedAt),
+    })
     executing.value = false
     progressTotal.value = 0
     progressDone.value = 0

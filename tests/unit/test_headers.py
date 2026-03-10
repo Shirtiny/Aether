@@ -65,7 +65,8 @@ class TestHeaderBuilder:
         builder.add("authorization", "b")
         built = builder.build()
         assert len(built) == 1
-        assert list(built.values()) == ["b"]
+        assert built["Authorization"] == "b"
+        assert "authorization" not in built
 
     def test_add_protected_does_not_override(self) -> None:
         builder = HeaderBuilder()
@@ -135,7 +136,8 @@ class TestBuildUpstreamHeaders:
             extra_headers={"User-Agent": "b"},
         )
         assert len([k for k in result if k.lower() == "user-agent"]) == 1
-        assert result["User-Agent"] == "b"
+        assert result["user-agent"] == "b"
+        assert "User-Agent" not in result
 
     def test_default_content_type(self) -> None:
         result = build_upstream_headers_for_endpoint({}, "openai:chat", "provider")
@@ -169,3 +171,35 @@ class TestCapabilityResolverHeaderParsing:
             request_headers={"x-require-capability": "context_1m"}
         )
         assert reqs == {"context_1m": True}
+
+
+class TestAuthHeaderCasePreservation:
+    def test_build_upstream_headers_preserves_lowercase_authorization_key(self) -> None:
+        result = build_upstream_headers_for_endpoint(
+            {"authorization": "Bearer client-token", "X-Test": "1"},
+            "openai:chat",
+            "provider",
+        )
+        assert "authorization" in result
+        assert "Authorization" not in result
+        assert result["authorization"] == "Bearer provider"
+
+    def test_passthrough_request_builder_preserves_lowercase_authorization_key(self) -> None:
+        from types import SimpleNamespace
+
+        from src.api.handlers.base.request_builder import PassthroughRequestBuilder
+
+        builder = PassthroughRequestBuilder()
+        endpoint = SimpleNamespace(api_family="openai", endpoint_kind="cli", header_rules=None)
+        key = SimpleNamespace(api_key="unused")
+
+        headers = builder.build_headers(
+            original_headers={"authorization": "Bearer client-token"},
+            endpoint=endpoint,
+            key=key,
+            pre_computed_auth=("Authorization", "Bearer provider-token"),
+        )
+
+        assert "authorization" in headers
+        assert "Authorization" not in headers
+        assert headers["authorization"] == "Bearer provider-token"

@@ -8,11 +8,11 @@ import pytest
 from src.api.handlers.base.utils import (
     build_json_response_for_client,
     build_sse_headers,
-    extract_cache_creation_tokens,
     filter_proxy_response_headers,
     resolve_client_accept_encoding,
     resolve_client_content_encoding,
 )
+from src.core.usage_tokens import extract_cache_creation_tokens
 
 
 class TestExtractCacheCreationTokens:
@@ -60,7 +60,7 @@ class TestExtractCacheCreationTokens:
 
     def test_empty_usage(self) -> None:
         """测试空字典"""
-        usage = {}
+        usage: dict[str, int] = {}
         assert extract_cache_creation_tokens(usage) == 0
 
     def test_all_zeros(self) -> None:

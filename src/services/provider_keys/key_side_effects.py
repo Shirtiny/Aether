@@ -4,12 +4,48 @@ Provider Key 写操作后的副作用处理。
 
 from __future__ import annotations
 
+from sqlalchemy import delete as sa_delete
 from sqlalchemy.orm import Session
 
-from src.api.base.models_service import invalidate_models_list_cache
 from src.core.logger import logger
-from src.models.database import ProviderAPIKey
+from src.models.database import GeminiFileMapping, ProviderAPIKey, RequestCandidate, VideoTask
+from src.services.cache.model_list_cache import invalidate_models_list_cache
 from src.services.cache.provider_cache import ProviderCacheService
+
+_SQLITE_BATCH_SIZE = 900
+_DEFAULT_BATCH_SIZE = 2000
+
+
+def cleanup_key_references(db: Session, key_ids: list[str]) -> None:
+    """在删除 ProviderAPIKey 前，先清理关联表记录，避免 CASCADE 级联删除超时。
+
+    PostgreSQL 下直接使用 DELETE WHERE key_id IN (...)，利用 key_id 索引高效删除。
+    SQLite 下按 key_id 批次拆分，避免超出变量数限制。
+    """
+    if not key_ids:
+        return
+    batch_size = _resolve_batch_size(db)
+    for batch in _iter_batches(key_ids, batch_size):
+        db.execute(sa_delete(RequestCandidate).where(RequestCandidate.key_id.in_(batch)))
+        db.execute(sa_delete(GeminiFileMapping).where(GeminiFileMapping.key_id.in_(batch)))
+        db.execute(sa_delete(VideoTask).where(VideoTask.key_id.in_(batch)))
+
+
+def _resolve_batch_size(db: Session) -> int:
+    try:
+        bind = db.get_bind()
+        dialect_name = str(getattr(getattr(bind, "dialect", None), "name", "") or "").lower()
+    except Exception:
+        dialect_name = ""
+    if dialect_name == "sqlite":
+        return _SQLITE_BATCH_SIZE
+    return _DEFAULT_BATCH_SIZE
+
+
+def _iter_batches(items: list[str], batch_size: int) -> list[list[str]]:
+    if batch_size <= 0:
+        return [items]
+    return [items[i : i + batch_size] for i in range(0, len(items), batch_size)]
 
 
 async def run_update_key_side_effects(
@@ -134,9 +170,6 @@ async def run_delete_key_side_effects(
     deleted_key_allowed_models: list[str] | None,
 ) -> None:
     """执行删除 Key 后的副作用。"""
-    # 触发缓存失效和自动解除关联检查
-    # 注意：删除后是否需要解除关联，应基于“删除后的活跃 Key 集合”判断。
-    # 不能仅凭被删除 Key 的 allowed_models 是否为 null 来跳过 disassociate。
     _ = deleted_key_allowed_models
     if provider_id:
         from src.services.model.global_model import on_key_allowed_models_changed
@@ -144,6 +177,7 @@ async def run_delete_key_side_effects(
         await on_key_allowed_models_changed(
             db=db,
             provider_id=provider_id,
+            skip_disassociate=True,
         )
     else:
         # 无 provider_id 时仅清除缓存

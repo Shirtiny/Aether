@@ -11,13 +11,17 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+from sqlalchemy import delete as sa_delete
 from sqlalchemy.orm import Session
 
 from src.core.crypto import crypto_service
 from src.core.exceptions import InvalidRequestException, NotFoundException
 from src.core.logger import logger
 from src.core.provider_types import ProviderType
-from src.models.database import Provider, ProviderAPIKey
+from src.models.database import (
+    Provider,
+    ProviderAPIKey,
+)
 from src.models.endpoint_models import (
     EndpointAPIKeyCreate,
     EndpointAPIKeyResponse,
@@ -106,7 +110,7 @@ def _run_async_with_fallback(coro: Any) -> None:
 
 async def _invalidate_cache_after_clear_oauth_invalid(key_id: str) -> None:
     """清除 OAuth 失效标记后同步失效相关缓存。"""
-    from src.api.base.models_service import invalidate_models_list_cache
+    from src.services.cache.model_list_cache import invalidate_models_list_cache
     from src.services.cache.provider_cache import ProviderCacheService
 
     await ProviderCacheService.invalidate_provider_api_key_cache(key_id)
@@ -497,3 +501,55 @@ async def delete_endpoint_key_response(db: Session, key_id: str) -> dict[str, st
     )
     logger.warning("[DELETE] 删除 Key: ID={}, Provider={}", key_id, delete_result.provider_id)
     return {"message": f"Key {key_id} 已删除"}
+
+
+async def batch_delete_endpoint_keys_response(db: Session, key_ids: list[str]) -> dict[str, Any]:
+    """批量删除 Keys，按 provider_id 聚合后仅执行一次副作用。"""
+    if not key_ids:
+        return {"success_count": 0, "failed_count": 0, "failed": []}
+
+    # 一次查询所有 Key
+    keys = db.query(ProviderAPIKey).filter(ProviderAPIKey.id.in_(key_ids)).all()
+    found_ids = {key.id for key in keys}
+    not_found_ids = [kid for kid in key_ids if kid not in found_ids]
+
+    failed: list[dict[str, str]] = [{"id": kid, "error": "not found"} for kid in not_found_ids]
+
+    # 收集受影响的 provider_id
+    affected_provider_ids = {key.provider_id for key in keys if key.provider_id}
+
+    # 批量 SQL DELETE，依赖数据库 CASCADE/SET NULL 自动清理关联表
+    success_count = 0
+    try:
+        found_id_list = list(found_ids)
+        db.execute(sa_delete(ProviderAPIKey).where(ProviderAPIKey.id.in_(found_id_list)))
+        db.commit()
+        success_count = len(found_ids)
+    except Exception as exc:
+        db.rollback()
+        logger.error("批量删除 Key 提交失败: {}", exc)
+        failed.extend({"id": kid, "error": str(exc)} for kid in found_ids)
+        return {"success_count": 0, "failed_count": len(failed), "failed": failed}
+
+    # 按 provider_id 聚合，每个 provider 仅执行一次副作用
+    for provider_id in affected_provider_ids:
+        try:
+            await run_delete_key_side_effects(
+                db=db,
+                provider_id=provider_id,
+                deleted_key_allowed_models=None,
+            )
+        except Exception as exc:
+            logger.error("批量删除副作用执行失败: provider_id={}, Error={}", provider_id, exc)
+
+    logger.warning(
+        "[BATCH_DELETE] 批量删除 Keys: success={}, failed={}, providers={}",
+        success_count,
+        len(failed),
+        len(affected_provider_ids),
+    )
+    return {
+        "success_count": success_count,
+        "failed_count": len(failed),
+        "failed": failed,
+    }

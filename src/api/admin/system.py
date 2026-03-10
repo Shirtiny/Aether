@@ -22,7 +22,9 @@ from src.database import get_db
 from src.models.api import SystemSettingsRequest, SystemSettingsResponse
 from src.models.database import ApiKey, Provider, Usage, User
 from src.services.email.email_template import EmailTemplate
+from src.services.provider_ops.types import SENSITIVE_CREDENTIAL_FIELDS
 from src.services.system.config import SystemConfigService
+from src.services.wallet import WalletService
 from src.utils.cache_decorator import cache_result
 
 router = APIRouter(prefix="/api/admin/system", tags=["Admin - System"])
@@ -677,26 +679,6 @@ class AdminSetSystemConfigAdapter(AdminApiAdapter):
             except Exception as e:
                 logger.warning(f"更新签到任务时间失败: {e}")
 
-        # 如果更新的是用户配额重置任务时间，动态更新调度器
-        if self.key == "user_quota_reset_time" and value:
-            try:
-                from src.services.system.maintenance_scheduler import get_maintenance_scheduler
-
-                scheduler = get_maintenance_scheduler()
-                scheduler.update_user_quota_reset_time(value)
-            except Exception as e:
-                logger.warning(f"更新用户配额重置任务时间失败: {e}")
-
-        # 如果更新的是独立密钥额度重置任务时间，动态更新调度器
-        if self.key == "standalone_key_quota_reset_time" and value:
-            try:
-                from src.services.system.maintenance_scheduler import get_maintenance_scheduler
-
-                scheduler = get_maintenance_scheduler()
-                scheduler.update_standalone_key_quota_reset_time(value)
-            except Exception as e:
-                logger.warning(f"更新独立密钥额度重置任务时间失败: {e}")
-
         # 如果更新的是调度模式或优先级模式，立即更新当前 Worker 的 Scheduler 单例
         if self.key in ("scheduling_mode", "provider_priority_mode"):
             try:
@@ -899,16 +881,7 @@ class AdminExportConfigAdapter(AdminApiAdapter):
     """导出提供商和模型配置"""
 
     # Provider Ops 中需要解密的敏感字段
-    SENSITIVE_CREDENTIALS = {
-        "api_key",
-        "password",
-        "session_token",
-        "session_cookie",
-        "token_cookie",
-        "auth_cookie",
-        "cookie_string",
-        "cookie",
-    }
+    SENSITIVE_CREDENTIALS = SENSITIVE_CREDENTIAL_FIELDS
 
     @staticmethod
     def _normalize_api_formats(raw_formats: Any) -> list[str]:
@@ -1000,7 +973,13 @@ class AdminExportConfigAdapter(AdminApiAdapter):
         from datetime import datetime, timezone
 
         from src.core.crypto import crypto_service
-        from src.models.database import GlobalModel, Model, ProviderAPIKey, ProviderEndpoint
+        from src.models.database import (
+            GlobalModel,
+            Model,
+            ProviderAPIKey,
+            ProviderEndpoint,
+            ProxyNode,
+        )
 
         db = context.db
 
@@ -1165,11 +1144,34 @@ class AdminExportConfigAdapter(AdminApiAdapter):
                 }
             )
 
+        # 导出 ProxyNode（手动节点 + 隧道节点，不含运行时状态）
+        proxy_nodes = db.query(ProxyNode).all()
+        proxy_nodes_data = []
+        for node in proxy_nodes:
+            proxy_nodes_data.append(
+                {
+                    "id": node.id,
+                    "name": node.name,
+                    "ip": node.ip,
+                    "port": node.port,
+                    "region": node.region,
+                    "is_manual": node.is_manual,
+                    "proxy_url": node.proxy_url,
+                    "proxy_username": node.proxy_username,
+                    "proxy_password": node.proxy_password,
+                    "tunnel_mode": node.tunnel_mode,
+                    "heartbeat_interval": node.heartbeat_interval,
+                    "remote_config": node.remote_config,
+                    "config_version": node.config_version,
+                }
+            )
+
         return {
             "version": CONFIG_EXPORT_VERSION,
             "exported_at": datetime.now(timezone.utc).isoformat(),
             "global_models": global_models_data,
             "providers": providers_data,
+            "proxy_nodes": proxy_nodes_data,
             "ldap_config": ldap_data,
             "oauth_providers": oauth_data,
             "system_configs": system_configs_data,
@@ -1180,16 +1182,33 @@ class AdminImportConfigAdapter(AdminApiAdapter):
     """导入提供商和模型配置"""
 
     # Provider Ops 中需要加密的敏感字段
-    SENSITIVE_CREDENTIALS = {
-        "api_key",
-        "password",
-        "session_token",
-        "session_cookie",
-        "token_cookie",
-        "auth_cookie",
-        "cookie_string",
-        "cookie",
-    }
+    SENSITIVE_CREDENTIALS = SENSITIVE_CREDENTIAL_FIELDS
+
+    @staticmethod
+    def _remap_proxy_node_id(
+        proxy: dict[str, Any] | None,
+        node_id_map: dict[str, str],
+    ) -> dict[str, Any] | None:
+        """替换 proxy 配置中的 node_id 为新实例的 ID。
+
+        - node_id 在映射表中：替换为新 ID
+        - node_id 不在映射表中（节点未导入）：清除 proxy 配置
+        - 无 node_id（手动 URL 模式）：原样返回
+        """
+        if not proxy or not isinstance(proxy, dict):
+            return proxy
+
+        old_node_id = proxy.get("node_id")
+        if not old_node_id or not isinstance(old_node_id, str):
+            return proxy  # 手动 URL 模式，无需映射
+
+        new_node_id = node_id_map.get(old_node_id)
+        if new_node_id is None:
+            return None  # 节点未导入，清除代理配置
+
+        remapped = dict(proxy)
+        remapped["node_id"] = new_node_id
+        return remapped
 
     @staticmethod
     def _extract_import_key_api_formats(
@@ -1243,7 +1262,13 @@ class AdminImportConfigAdapter(AdminApiAdapter):
 
         from src.core.crypto import crypto_service
         from src.core.enums import ProviderBillingType
-        from src.models.database import GlobalModel, Model, ProviderAPIKey, ProviderEndpoint
+        from src.models.database import (
+            GlobalModel,
+            Model,
+            ProviderAPIKey,
+            ProviderEndpoint,
+            ProxyNode,
+        )
 
         # 检查请求体大小
         if context.raw_body and len(context.raw_body) > MAX_IMPORT_SIZE:
@@ -1263,12 +1288,14 @@ class AdminImportConfigAdapter(AdminApiAdapter):
         merge_mode = payload.get("merge_mode", "skip")  # skip, overwrite, error
         global_models_data = payload.get("global_models", [])
         providers_data = payload.get("providers", [])
+        proxy_nodes_data = payload.get("proxy_nodes", [])
         ldap_data = payload.get("ldap_config")  # 2.1 新增
         oauth_data = payload.get("oauth_providers", [])  # 2.1 新增
         system_configs_data = payload.get("system_configs", [])  # 2.2 新增
 
         stats = {
             "global_models": {"created": 0, "updated": 0, "skipped": 0},
+            "proxy_nodes": {"created": 0, "updated": 0, "skipped": 0},
             "providers": {"created": 0, "updated": 0, "skipped": 0},
             "endpoints": {"created": 0, "updated": 0, "skipped": 0},
             "keys": {"created": 0, "updated": 0, "skipped": 0},
@@ -1334,6 +1361,77 @@ class AdminImportConfigAdapter(AdminApiAdapter):
                     global_model_map[gm_data["name"]] = new_gm.id
                     stats["global_models"]["created"] += 1
 
+            # 导入 ProxyNodes（在 Providers 之前，建立 old_id -> new_id 映射）
+            proxy_node_id_map: dict[str, str] = {}  # old_node_id -> new_node_id
+            for node_data in proxy_nodes_data:
+                old_id = node_data.get("id", "")
+                ip = node_data.get("ip", "")
+                port = node_data.get("port", 0)
+
+                if not ip or not port:
+                    stats["errors"].append(f"跳过无效的代理节点: {node_data.get('name', '?')}")
+                    continue
+
+                existing_node = (
+                    db.query(ProxyNode).filter(ProxyNode.ip == ip, ProxyNode.port == port).first()
+                )
+
+                if existing_node:
+                    proxy_node_id_map[old_id] = existing_node.id
+                    if merge_mode == "skip":
+                        stats["proxy_nodes"]["skipped"] += 1
+                    elif merge_mode == "error":
+                        raise InvalidRequestException(
+                            f"代理节点 '{node_data.get('name')}' ({ip}:{port}) 已存在"
+                        )
+                    elif merge_mode == "overwrite":
+                        existing_node.name = node_data.get("name", existing_node.name)
+                        existing_node.region = node_data.get("region", existing_node.region)
+                        existing_node.is_manual = node_data.get(
+                            "is_manual", existing_node.is_manual
+                        )
+                        existing_node.proxy_url = node_data.get(
+                            "proxy_url", existing_node.proxy_url
+                        )
+                        existing_node.proxy_username = node_data.get(
+                            "proxy_username", existing_node.proxy_username
+                        )
+                        existing_node.proxy_password = node_data.get(
+                            "proxy_password", existing_node.proxy_password
+                        )
+                        existing_node.tunnel_mode = node_data.get(
+                            "tunnel_mode", existing_node.tunnel_mode
+                        )
+                        existing_node.remote_config = node_data.get(
+                            "remote_config", existing_node.remote_config
+                        )
+                        existing_node.updated_at = datetime.now(timezone.utc)
+                        stats["proxy_nodes"]["updated"] += 1
+                else:
+                    from src.models.database import ProxyNodeStatus
+
+                    is_manual = node_data.get("is_manual", False)
+                    new_node = ProxyNode(
+                        id=str(uuid.uuid4()),
+                        name=node_data.get("name", "Imported Node"),
+                        ip=ip,
+                        port=port,
+                        region=node_data.get("region"),
+                        is_manual=is_manual,
+                        proxy_url=node_data.get("proxy_url"),
+                        proxy_username=node_data.get("proxy_username"),
+                        proxy_password=node_data.get("proxy_password"),
+                        tunnel_mode=node_data.get("tunnel_mode", False),
+                        heartbeat_interval=node_data.get("heartbeat_interval", 0),
+                        remote_config=node_data.get("remote_config"),
+                        config_version=node_data.get("config_version", 0),
+                        status=ProxyNodeStatus.ONLINE if is_manual else ProxyNodeStatus.OFFLINE,
+                    )
+                    db.add(new_node)
+                    db.flush()
+                    proxy_node_id_map[old_id] = new_node.id
+                    stats["proxy_nodes"]["created"] += 1
+
             # 导入 Providers
             for prov_data in providers_data:
                 existing_provider = (
@@ -1384,7 +1482,12 @@ class AdminImportConfigAdapter(AdminApiAdapter):
                         existing_provider.request_timeout = prov_data.get(
                             "request_timeout", existing_provider.request_timeout
                         )
-                        existing_provider.proxy = prov_data.get("proxy", existing_provider.proxy)
+                        if "proxy" in prov_data:
+                            existing_provider.proxy = self._remap_proxy_node_id(
+                                prov_data["proxy"],
+                                proxy_node_id_map,
+                            )
+                        # 未提供 proxy 字段时保留现有配置
                         # 加密 provider_ops credentials 后再保存
                         existing_provider.config = self._encrypt_provider_config(
                             prov_data.get("config"), crypto_service
@@ -1421,7 +1524,7 @@ class AdminImportConfigAdapter(AdminApiAdapter):
                         max_retries=prov_data.get("max_retries"),
                         stream_first_byte_timeout=prov_data.get("stream_first_byte_timeout"),
                         request_timeout=prov_data.get("request_timeout"),
-                        proxy=prov_data.get("proxy"),
+                        proxy=self._remap_proxy_node_id(prov_data.get("proxy"), proxy_node_id_map),
                         config=encrypted_config,
                     )
                     db.add(new_provider)
@@ -1464,7 +1567,9 @@ class AdminImportConfigAdapter(AdminApiAdapter):
                             existing_ep.format_acceptance_config = ep_data.get(
                                 "format_acceptance_config"
                             )
-                            existing_ep.proxy = ep_data.get("proxy")
+                            existing_ep.proxy = self._remap_proxy_node_id(
+                                ep_data.get("proxy"), proxy_node_id_map
+                            )
                             sig = parse_signature_key(ep_format)
                             existing_ep.api_format = sig.key  # 使用归一化后的格式
                             existing_ep.api_family = sig.api_family.value
@@ -1489,7 +1594,9 @@ class AdminImportConfigAdapter(AdminApiAdapter):
                             custom_path=ep_data.get("custom_path"),
                             config=ep_data.get("config"),
                             format_acceptance_config=ep_data.get("format_acceptance_config"),
-                            proxy=ep_data.get("proxy"),
+                            proxy=self._remap_proxy_node_id(
+                                ep_data.get("proxy"), proxy_node_id_map
+                            ),
                         )
                         db.add(new_ep)
                         db.flush()
@@ -1557,8 +1664,7 @@ class AdminImportConfigAdapter(AdminApiAdapter):
                         if endpoint_formats and fmt_normalized not in endpoint_formats:
                             missing_formats.append(fmt_normalized.upper())
                             continue
-                        # 存储时使用大写格式以保持向后兼容
-                        normalized_formats.append(fmt_normalized.upper())
+                        normalized_formats.append(fmt_normalized)
 
                     if missing_formats:
                         stats["errors"].append(
@@ -1608,7 +1714,7 @@ class AdminImportConfigAdapter(AdminApiAdapter):
                         model_include_patterns=key_data.get("model_include_patterns"),
                         model_exclude_patterns=key_data.get("model_exclude_patterns"),
                         is_active=key_data.get("is_active", True),
-                        proxy=key_data.get("proxy"),
+                        proxy=self._remap_proxy_node_id(key_data.get("proxy"), proxy_node_id_map),
                         fingerprint=generate_fingerprint(seed=new_key_id),
                         health_by_format={},
                         circuit_breaker_by_format={},
@@ -1962,8 +2068,52 @@ class AdminImportConfigAdapter(AdminApiAdapter):
 
 
 class AdminExportUsersAdapter(AdminApiAdapter):
+    @staticmethod
+    def _serialize_api_key(
+        key: ApiKey,
+        include_is_standalone: bool = False,
+        db: Any = None,
+    ) -> dict[str, Any]:
+        """序列化用户 API Key 为导出格式。"""
+        from src.core.crypto import crypto_service
+
+        wallet = None
+        if db is not None and key.is_standalone:
+            wallet = WalletService.get_wallet(db, api_key_id=key.id)
+
+        data: dict[str, Any] = {
+            "key_hash": key.key_hash,
+            "name": key.name,
+            "allowed_providers": key.allowed_providers,
+            "allowed_api_formats": key.allowed_api_formats,
+            "allowed_models": key.allowed_models,
+            "rate_limit": key.rate_limit,
+            "concurrent_limit": key.concurrent_limit,
+            "force_capabilities": key.force_capabilities,
+            "is_active": key.is_active,
+            "expires_at": key.expires_at.isoformat() if key.expires_at else None,
+            "auto_delete_on_expiry": key.auto_delete_on_expiry,
+            "total_requests": key.total_requests,
+            "total_cost_usd": key.total_cost_usd,
+            "wallet": WalletService.serialize_wallet_summary(wallet) if wallet else None,
+        }
+
+        if key.key_encrypted:
+            try:
+                data["key"] = crypto_service.decrypt(key.key_encrypted, silent=True)
+            except Exception:
+                logger.warning(
+                    "[USERS_EXPORT] API Key 解密失败，回退为 legacy 密文字段: key_id={}", key.id
+                )
+                data["key_encrypted"] = key.key_encrypted
+
+        if include_is_standalone:
+            data["is_standalone"] = key.is_standalone
+
+        return data
+
     async def handle(self, context: ApiRequestContext) -> Any:  # type: ignore[override]
-        """导出用户数据（保留加密数据，排除管理员）"""
+        """导出用户数据（优先导出解密后的完整 Key，排除管理员）"""
         from datetime import datetime, timezone
 
         from src.core.enums import UserRole
@@ -1971,34 +2121,11 @@ class AdminExportUsersAdapter(AdminApiAdapter):
 
         db = context.db
 
-        def _serialize_api_key(key: ApiKey, include_is_standalone: bool = False) -> dict:
-            """序列化 API Key 为导出格式"""
-            data = {
-                "key_hash": key.key_hash,
-                "key_encrypted": key.key_encrypted,
-                "name": key.name,
-                "balance_used_usd": key.balance_used_usd,
-                "current_balance_usd": key.current_balance_usd,
-                "allowed_providers": key.allowed_providers,
-                "allowed_api_formats": key.allowed_api_formats,
-                "allowed_models": key.allowed_models,
-                "rate_limit": key.rate_limit,
-                "concurrent_limit": key.concurrent_limit,
-                "force_capabilities": key.force_capabilities,
-                "is_active": key.is_active,
-                "expires_at": key.expires_at.isoformat() if key.expires_at else None,
-                "auto_delete_on_expiry": key.auto_delete_on_expiry,
-                "total_requests": key.total_requests,
-                "total_cost_usd": key.total_cost_usd,
-            }
-            if include_is_standalone:
-                data["is_standalone"] = key.is_standalone
-            return data
-
         # 导出 Users（排除管理员）
         users = db.query(User).filter(User.is_deleted.is_(False), User.role != UserRole.ADMIN).all()
         users_data = []
         for user in users:
+            wallet = WalletService.get_wallet(db, user_id=user.id)
             # 导出用户的 API Keys（排除独立余额Key，独立Key单独导出）
             api_keys = (
                 db.query(ApiKey)
@@ -2006,12 +2133,13 @@ class AdminExportUsersAdapter(AdminApiAdapter):
                 .all()
             )
             api_keys_data = [
-                _serialize_api_key(key, include_is_standalone=True) for key in api_keys
+                self._serialize_api_key(key, include_is_standalone=True) for key in api_keys
             ]
 
             users_data.append(
                 {
                     "email": user.email,
+                    "email_verified": user.email_verified,
                     "username": user.username,
                     "password_hash": user.password_hash,
                     "role": user.role.value if user.role else "user",
@@ -2019,9 +2147,8 @@ class AdminExportUsersAdapter(AdminApiAdapter):
                     "allowed_api_formats": user.allowed_api_formats,
                     "allowed_models": user.allowed_models,
                     "model_capability_settings": user.model_capability_settings,
-                    "quota_usd": user.quota_usd,
-                    "used_usd": user.used_usd,
-                    "total_usd": user.total_usd,
+                    "unlimited": WalletService.is_unlimited_wallet(wallet),
+                    "wallet": WalletService.serialize_wallet_summary(wallet) if wallet else None,
                     "is_active": user.is_active,
                     "api_keys": api_keys_data,
                 }
@@ -2029,10 +2156,10 @@ class AdminExportUsersAdapter(AdminApiAdapter):
 
         # 导出独立余额 Keys（管理员创建的，不属于普通用户）
         standalone_keys = db.query(ApiKey).filter(ApiKey.is_standalone.is_(True)).all()
-        standalone_keys_data = [_serialize_api_key(key) for key in standalone_keys]
+        standalone_keys_data = [self._serialize_api_key(key, db=db) for key in standalone_keys]
 
         return {
-            "version": "1.1",
+            "version": "1.2",
             "exported_at": datetime.now(timezone.utc).isoformat(),
             "users": users_data,
             "standalone_keys": standalone_keys_data,
@@ -2040,6 +2167,22 @@ class AdminExportUsersAdapter(AdminApiAdapter):
 
 
 class AdminImportUsersAdapter(AdminApiAdapter):
+    @staticmethod
+    def _resolve_api_key_material(key_data: dict[str, Any]) -> tuple[str | None, str | None]:
+        """解析用户 API Key 导入材料，优先使用明文 key。"""
+        from src.core.crypto import crypto_service
+        from src.models.database import ApiKey
+
+        plaintext_key = key_data.get("key")
+        if isinstance(plaintext_key, str):
+            normalized = plaintext_key.strip()
+            if normalized:
+                return ApiKey.hash_key(normalized), crypto_service.encrypt(normalized)
+
+        key_hash = str(key_data.get("key_hash") or "").strip() or None
+        key_encrypted = key_data.get("key_encrypted")
+        return key_hash, key_encrypted
+
     async def handle(self, context: ApiRequestContext) -> Any:  # type: ignore[override]
         """导入用户数据"""
         import uuid
@@ -2079,7 +2222,7 @@ class AdminImportUsersAdapter(AdminApiAdapter):
                 (None, "skipped"): key 已存在，跳过
                 (None, "invalid"): 数据无效，跳过
             """
-            key_hash = key_data.get("key_hash", "").strip()
+            key_hash, key_encrypted = self._resolve_api_key_material(key_data)
             if not key_hash:
                 return None, "invalid"
 
@@ -2103,11 +2246,9 @@ class AdminImportUsersAdapter(AdminApiAdapter):
                     id=str(uuid.uuid4()),
                     user_id=owner_id,
                     key_hash=key_hash,
-                    key_encrypted=key_data.get("key_encrypted"),
+                    key_encrypted=key_encrypted,
                     name=key_data.get("name"),
                     is_standalone=is_standalone or key_data.get("is_standalone", False),
-                    balance_used_usd=key_data.get("balance_used_usd", 0.0),
-                    current_balance_usd=key_data.get("current_balance_usd"),
                     allowed_providers=key_data.get("allowed_providers"),
                     allowed_api_formats=key_data.get("allowed_api_formats"),
                     allowed_models=key_data.get("allowed_models"),
@@ -2140,6 +2281,15 @@ class AdminImportUsersAdapter(AdminApiAdapter):
                     continue
 
                 existing_user = db.query(User).filter(User.email == import_email).first()
+                wallet_payload = (
+                    user_data.get("wallet") if isinstance(user_data.get("wallet"), dict) else None
+                )
+                wallet_limit_mode = (
+                    str(wallet_payload.get("limit_mode"))
+                    if wallet_payload
+                    and wallet_payload.get("limit_mode") in {"finite", "unlimited"}
+                    else ("unlimited" if user_data.get("unlimited") else "finite")
+                )
 
                 if existing_user:
                     user_id = existing_user.id
@@ -2160,11 +2310,22 @@ class AdminImportUsersAdapter(AdminApiAdapter):
                         existing_user.model_capability_settings = user_data.get(
                             "model_capability_settings"
                         )
-                        existing_user.quota_usd = user_data.get("quota_usd")
-                        existing_user.used_usd = user_data.get("used_usd", 0.0)
-                        existing_user.total_usd = user_data.get("total_usd", 0.0)
                         existing_user.is_active = user_data.get("is_active", True)
                         existing_user.updated_at = datetime.now(timezone.utc)
+                        wallet = WalletService.get_or_create_wallet(db, user=existing_user)
+                        if wallet is not None:
+                            wallet.limit_mode = wallet_limit_mode
+                            if wallet_payload:
+                                wallet.balance = wallet_payload.get("recharge_balance", 0) or 0
+                                wallet.gift_balance = wallet_payload.get("gift_balance", 0) or 0
+                                wallet.total_recharged = (
+                                    wallet_payload.get("total_recharged", 0) or 0
+                                )
+                                wallet.total_consumed = wallet_payload.get("total_consumed", 0) or 0
+                                wallet.total_refunded = wallet_payload.get("total_refunded", 0) or 0
+                                wallet.total_adjusted = wallet_payload.get("total_adjusted", 0) or 0
+                                wallet.status = wallet_payload.get("status", "active") or "active"
+                            wallet.updated_at = datetime.now(timezone.utc)
                         stats["users"]["updated"] += 1
                 else:
                     # 创建新用户
@@ -2183,13 +2344,22 @@ class AdminImportUsersAdapter(AdminApiAdapter):
                         allowed_api_formats=user_data.get("allowed_api_formats"),
                         allowed_models=user_data.get("allowed_models"),
                         model_capability_settings=user_data.get("model_capability_settings"),
-                        quota_usd=user_data.get("quota_usd"),
-                        used_usd=user_data.get("used_usd", 0.0),
-                        total_usd=user_data.get("total_usd", 0.0),
                         is_active=user_data.get("is_active", True),
                     )
                     db.add(new_user)
                     db.flush()
+                    wallet = WalletService.get_or_create_wallet(db, user=new_user)
+                    if wallet is not None:
+                        wallet.limit_mode = wallet_limit_mode
+                        if wallet_payload:
+                            wallet.balance = wallet_payload.get("recharge_balance", 0) or 0
+                            wallet.gift_balance = wallet_payload.get("gift_balance", 0) or 0
+                            wallet.total_recharged = wallet_payload.get("total_recharged", 0) or 0
+                            wallet.total_consumed = wallet_payload.get("total_consumed", 0) or 0
+                            wallet.total_refunded = wallet_payload.get("total_refunded", 0) or 0
+                            wallet.total_adjusted = wallet_payload.get("total_adjusted", 0) or 0
+                            wallet.status = wallet_payload.get("status", "active") or "active"
+                        wallet.updated_at = datetime.now(timezone.utc)
                     user_id = new_user.id
                     stats["users"]["created"] += 1
 
@@ -2216,6 +2386,39 @@ class AdminImportUsersAdapter(AdminApiAdapter):
                         )
                         if new_key:
                             db.add(new_key)
+                            db.flush()
+                            wallet = WalletService.get_or_create_wallet(db, api_key=new_key)
+                            wallet_payload = (
+                                key_data.get("wallet")
+                                if isinstance(key_data.get("wallet"), dict)
+                                else None
+                            )
+                            if wallet is not None:
+                                wallet.limit_mode = (
+                                    str(wallet_payload.get("limit_mode"))
+                                    if wallet_payload
+                                    and wallet_payload.get("limit_mode") in {"finite", "unlimited"}
+                                    else ("unlimited" if key_data.get("unlimited") else "finite")
+                                )
+                                if wallet_payload:
+                                    wallet.balance = wallet_payload.get("recharge_balance", 0) or 0
+                                    wallet.gift_balance = wallet_payload.get("gift_balance", 0) or 0
+                                    wallet.total_recharged = (
+                                        wallet_payload.get("total_recharged", 0) or 0
+                                    )
+                                    wallet.total_consumed = (
+                                        wallet_payload.get("total_consumed", 0) or 0
+                                    )
+                                    wallet.total_refunded = (
+                                        wallet_payload.get("total_refunded", 0) or 0
+                                    )
+                                    wallet.total_adjusted = (
+                                        wallet_payload.get("total_adjusted", 0) or 0
+                                    )
+                                    wallet.status = (
+                                        wallet_payload.get("status", "active") or "active"
+                                    )
+                                wallet.updated_at = datetime.now(timezone.utc)
                             stats["standalone_keys"]["created"] += 1
                         elif status == "skipped":
                             stats["standalone_keys"]["skipped"] += 1
@@ -2642,15 +2845,11 @@ def _purge_stats_and_reset_counters(db: Session) -> None:
     db.query(StatsSummary).delete()
     db.query(StatsUserDaily).delete()
 
-    # 重置 User 上的累计统计字段
-    db.query(User).update({User.used_usd: 0.0, User.total_usd: 0.0}, synchronize_session=False)
-
     # 重置 ApiKey 上的缓存统计字段
     db.query(ApiKey).update(
         {
             ApiKey.total_requests: 0,
             ApiKey.total_cost_usd: 0.0,
-            ApiKey.balance_used_usd: 0.0,
         },
         synchronize_session=False,
     )

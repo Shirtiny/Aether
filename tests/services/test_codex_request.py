@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import jwt
 import pytest
 
+from src.api.handlers.base.request_builder import PassthroughRequestBuilder
 from src.services.provider.adapters.codex.request_patching import (
     maybe_patch_request_for_codex,
     patch_openai_cli_request_for_codex,
@@ -110,42 +113,49 @@ def test_openai_cli_normalizer_request_from_internal_codex_variant_defaults_stor
     assert out["store"] is False
 
 
-def test_codex_envelope_extra_headers_includes_sse_accept_and_session() -> None:
+def test_codex_envelope_extra_headers_does_not_inject_synthetic_headers() -> None:
     from src.services.provider.adapters.codex.envelope import codex_oauth_envelope
 
-    headers = codex_oauth_envelope.extra_headers() or {}
-    assert headers.get("Accept") == "text/event-stream"
-    assert headers.get("Originator") == "codex_cli_rs"
-    assert headers.get("Version") == "0.101.0"
-    assert headers.get("Connection") == "Keep-Alive"
-    assert isinstance(headers.get("Session_id"), str)
-    assert headers.get("Session_id")
+    assert codex_oauth_envelope.extra_headers() is None
 
 
-def test_codex_envelope_extra_headers_compact_uses_json_accept() -> None:
-    from src.services.provider.adapters.codex.context import (
-        CodexRequestContext,
-        set_codex_request_context,
+def test_codex_passthrough_builder_preserves_real_codex_headers() -> None:
+    from src.services.provider.adapters.codex.envelope import codex_oauth_envelope
+
+    builder = PassthroughRequestBuilder()
+    endpoint = SimpleNamespace(api_family="openai", endpoint_kind="cli", header_rules=None)
+    key = SimpleNamespace(api_key="unused")
+
+    headers = builder.build_headers(
+        original_headers={
+            "accept": "text/event-stream",
+            "content-type": "application/json",
+            "user-agent": "Codex Desktop/0.108.0-alpha.12",
+            "originator": "Codex Desktop",
+            "x-codex-turn-metadata": '{"turn_id":"abc"}',
+            "x-forwarded-scheme": "https",
+            "host": "aether.hetunai.cn",
+            "content-length": "123",
+        },
+        endpoint=endpoint,
+        key=key,
+        pre_computed_auth=("Authorization", "Bearer upstream-token"),
+        envelope=codex_oauth_envelope,
     )
-    from src.services.provider.adapters.codex.envelope import codex_oauth_envelope
 
-    set_codex_request_context(CodexRequestContext(is_compact=True))
-    headers = codex_oauth_envelope.extra_headers() or {}
-    assert headers.get("Accept") == "application/json"
-    set_codex_request_context(None)
-
-
-def test_codex_envelope_extra_headers_uses_account_id_header() -> None:
-    from src.services.provider.adapters.codex.context import (
-        CodexRequestContext,
-        set_codex_request_context,
-    )
-    from src.services.provider.adapters.codex.envelope import codex_oauth_envelope
-
-    set_codex_request_context(CodexRequestContext(account_id="acc_123"))
-    headers = codex_oauth_envelope.extra_headers() or {}
-    assert headers.get("Chatgpt-Account-Id") == "acc_123"
-    set_codex_request_context(None)
+    assert headers["accept"] == "text/event-stream"
+    assert headers["content-type"] == "application/json"
+    assert headers["user-agent"] == "Codex Desktop/0.108.0-alpha.12"
+    assert headers["originator"] == "Codex Desktop"
+    assert headers["x-codex-turn-metadata"] == '{"turn_id":"abc"}'
+    assert headers["Authorization"] == "Bearer upstream-token"
+    assert "Version" not in headers
+    assert "Session_id" not in headers
+    assert "Connection" not in headers
+    assert "Chatgpt-Account-Id" not in headers
+    assert "host" not in headers
+    assert "content-length" not in headers
+    assert "x-forwarded-scheme" not in headers
 
 
 def _encode_unsigned_jwt(payload: dict[str, object]) -> str:

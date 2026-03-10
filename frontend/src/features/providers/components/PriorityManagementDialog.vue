@@ -472,7 +472,7 @@ import Badge from '@/components/ui/badge.vue'
 import { useToast } from '@/composables/useToast'
 import { parseApiError } from '@/utils/errorParser'
 import { updateProvider, updateProviderKey } from '@/api/endpoints'
-import type { ProviderWithEndpointsSummary } from '@/api/endpoints'
+import { getProvidersSummary, type ProviderWithEndpointsSummary } from '@/api/endpoints'
 import { adminApi } from '@/api/admin'
 import { batchQueryBalance, type ActionResultResponse, type BalanceInfo } from '@/api/providerOps'
 import { API_FORMAT_SHORT } from '@/api/endpoints/types'
@@ -508,7 +508,6 @@ interface KeyWithMeta {
 
 const props = defineProps<{
   modelValue: boolean
-  providers: ProviderWithEndpointsSummary[]
 }>()
 
 const emit = defineEmits<{
@@ -663,7 +662,7 @@ function normalizeRateMultipliers(
 
 const providerById = computed(() => {
   const map = new Map<string, ProviderWithEndpointsSummary>()
-  props.providers.forEach((provider) => {
+  sortedProviders.value.forEach((provider) => {
     map.set(provider.id, provider)
   })
   return map
@@ -671,7 +670,7 @@ const providerById = computed(() => {
 
 const providerIdByName = computed(() => {
   const map = new Map<string, string>()
-  props.providers.forEach((provider) => {
+  sortedProviders.value.forEach((provider) => {
     if (!map.has(provider.name)) {
       map.set(provider.name, provider.id)
     }
@@ -686,7 +685,7 @@ function resolveProviderId(key: Pick<KeyWithMeta, 'provider_id' | 'provider_name
 
 const poolProviderIds = computed(() => {
   const set = new Set<string>()
-  props.providers.forEach((provider) => {
+  sortedProviders.value.forEach((provider) => {
     if (provider.pool_advanced) {
       set.add(provider.id)
     }
@@ -835,22 +834,26 @@ function sortProvidersByActiveAndPriority(providers: ProviderWithEndpointsSummar
   })
 }
 
-// 监听 props.providers 变化
-watch(() => props.providers, (newProviders) => {
-  if (newProviders) {
-    sortedProviders.value = sortProvidersByActiveAndPriority(newProviders)
-  }
-}, { immediate: true })
-
 // 监听对话框打开
 watch(internalOpen, async (open) => {
   if (open) {
+    await loadAllProviders()
     await loadCurrentPriorityMode()
     await loadKeysByFormat()
     // 异步加载余额数据
     loadBalances()
   }
 })
+
+// 加载全量 providers（优先级管理需要完整列表）
+async function loadAllProviders() {
+  try {
+    const response = await getProvidersSummary({ page: 1, page_size: 9999 })
+    sortedProviders.value = sortProvidersByActiveAndPriority(response.items)
+  } catch {
+    sortedProviders.value = []
+  }
+}
 
 // 加载当前的优先级模式配置
 async function loadCurrentPriorityMode() {

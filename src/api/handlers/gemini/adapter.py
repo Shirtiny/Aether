@@ -14,13 +14,11 @@ from fastapi.responses import JSONResponse
 
 from src.api.handlers.base.chat_adapter_base import ChatAdapterBase, register_adapter
 from src.api.handlers.base.chat_handler_base import ChatHandlerBase
-from src.core.api_format import ApiFamily, get_auth_handler
+from src.core.api_format import ApiFamily, get_auth_handler, resolve_header_name_case
 from src.core.api_format.enums import AuthMethod
-from src.core.api_format.headers import BROWSER_FINGERPRINT_HEADERS
 from src.core.logger import logger
 from src.models.gemini import GeminiRequest
 from src.services.gemini_files_mapping import extract_file_names_from_request
-from src.services.provider.transport import redact_url_for_log
 
 
 class GeminiCapabilityDetector:
@@ -54,7 +52,6 @@ class GeminiChatAdapter(ChatAdapterBase):
 
     FORMAT_ID = "gemini:chat"
     API_FAMILY = ApiFamily.GEMINI
-    BILLING_TEMPLATE = "gemini"  # 使用 Gemini 计费模板
     name = "gemini.chat"
 
     @property
@@ -204,61 +201,6 @@ class GeminiChatAdapter(ChatAdapterBase):
         )
 
     @classmethod
-    async def fetch_models(
-        cls,
-        client: httpx.AsyncClient,
-        base_url: str,
-        api_key: str,
-        extra_headers: dict[str, str] | None = None,
-    ) -> tuple[list, str | None]:
-        """查询 Gemini API 支持的模型列表"""
-        # Gemini 使用 URL 参数传递 key，不需要 headers 中的认证
-        base_url_clean = base_url.rstrip("/")
-        if base_url_clean.endswith("/v1beta"):
-            models_url = f"{base_url_clean}/models?key={api_key}"
-        else:
-            models_url = f"{base_url_clean}/v1beta/models?key={api_key}"
-
-        headers: dict[str, str] = {**BROWSER_FINGERPRINT_HEADERS}
-        if extra_headers:
-            headers.update(extra_headers)
-
-        try:
-            response = await client.get(models_url, headers=headers)
-            logger.debug(
-                f"Gemini models request to {redact_url_for_log(models_url)}: status={response.status_code}"
-            )
-            if response.status_code == 200:
-                data = response.json()
-                if "models" in data:
-                    # 转换为统一格式
-                    return [
-                        {
-                            "id": m.get("name", "").replace("models/", ""),
-                            "owned_by": "google",
-                            "display_name": m.get("displayName", ""),
-                            "api_format": cls.FORMAT_ID,
-                        }
-                        for m in data["models"]
-                    ], None
-                return [], None
-            else:
-                error_body = response.text[:500] if response.text else "(empty)"
-                error_msg = f"HTTP {response.status_code}: {error_body}"
-                logger.warning(
-                    f"Gemini models request to {redact_url_for_log(models_url)} failed: {error_msg}"
-                )
-                return [], error_msg
-        except Exception as e:
-            # 异常信息可能包含带 key 参数的 URL，需要脱敏
-            sanitized_error = redact_url_for_log(str(e))
-            error_msg = f"Request error: {sanitized_error}"
-            logger.warning(
-                f"Failed to fetch Gemini models from {redact_url_for_log(models_url)}: {sanitized_error}"
-            )
-            return [], error_msg
-
-    @classmethod
     def build_endpoint_url(
         cls,
         base_url: str,
@@ -302,6 +244,7 @@ class GeminiChatAdapter(ChatAdapterBase):
         provider_api_key: Any | None = None,
         # 代理配置
         proxy_config: dict[str, Any] | None = None,
+        timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
         """测试 Gemini API 模型连接性（非流式）"""
         from src.api.handlers.base.endpoint_checker import run_endpoint_check
@@ -382,7 +325,8 @@ class GeminiChatAdapter(ChatAdapterBase):
                 default_auth_header, _ = get_auth_config_for_endpoint(cls.FORMAT_ID)
                 if default_auth_header.lower() != "authorization":
                     headers.pop(default_auth_header, None)
-                headers["Authorization"] = f"Bearer {api_key}"
+                auth_header_name = resolve_header_name_case(extra_headers, "Authorization")
+                headers[auth_header_name] = f"Bearer {api_key}"
 
         body = cls.build_request_body(request_data)
 
@@ -432,6 +376,7 @@ class GeminiChatAdapter(ChatAdapterBase):
             api_key_id=api_key_id,
             model_name=effective_model_name,
             proxy_config=proxy_config,
+            timeout=timeout_seconds,
         )
 
 

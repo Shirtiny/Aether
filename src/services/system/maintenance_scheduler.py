@@ -18,14 +18,14 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import delete, text
+from sqlalchemy import delete, literal_column, text
 
 from src.core.logger import logger
 from src.database import create_session
-from src.models.database import ApiKey, AuditLog, Provider, RequestCandidate, Usage
+from src.models.database import AuditLog, Provider, RequestCandidate, Usage
 from src.services.provider_ops.service import ProviderOpsService
 from src.services.system.config import SystemConfigService
 from src.services.system.scheduler import get_scheduler
@@ -39,10 +39,6 @@ class MaintenanceScheduler:
 
     # 签到任务的 job_id
     CHECKIN_JOB_ID = "provider_checkin"
-    # 用户配额重置任务的 job_id
-    USER_QUOTA_RESET_JOB_ID = "user_quota_reset"
-    # 独立密钥额度重置任务的 job_id
-    STANDALONE_KEY_QUOTA_RESET_JOB_ID = "standalone_key_quota_reset"
 
     def __init__(self) -> None:
         self.running = False
@@ -59,19 +55,6 @@ class MaintenanceScheduler:
         try:
             time_str = SystemConfigService.get_config(db, "provider_checkin_time", "01:05")
             return self._parse_time_string(time_str)
-        finally:
-            db.close()
-
-    def _get_user_quota_reset_time(self) -> tuple[int, int]:
-        """获取用户配额重置任务的执行时间
-
-        Returns:
-            (hour, minute) 元组
-        """
-        db = create_session()
-        try:
-            time_str = SystemConfigService.get_config(db, "user_quota_reset_time", "05:00")
-            return self._parse_user_quota_reset_time_string(time_str)
         finally:
             db.close()
 
@@ -98,26 +81,6 @@ class MaintenanceScheduler:
         except (ValueError, IndexError):
             return (1, 5)
 
-    @staticmethod
-    def _parse_user_quota_reset_time_string(time_str: str) -> tuple[int, int]:
-        """解析用户配额重置时间字符串为 (hour, minute) 元组
-
-        Returns:
-            (hour, minute) 元组，解析失败返回默认值 (5, 0)
-        """
-        try:
-            if not time_str or ":" not in time_str:
-                return (5, 0)
-            parts = time_str.split(":")
-            hour = int(parts[0])
-            minute = int(parts[1])
-            # 验证范围
-            if 0 <= hour <= 23 and 0 <= minute <= 59:
-                return (hour, minute)
-            return (5, 0)
-        except (ValueError, IndexError):
-            return (5, 0)
-
     def update_checkin_time(self, time_str: str) -> bool:
         """更新签到任务的执行时间
 
@@ -138,56 +101,6 @@ class MaintenanceScheduler:
 
         if success:
             logger.info(f"Provider 签到任务时间已更新为: {hour:02d}:{minute:02d}")
-
-        return success
-
-    def update_user_quota_reset_time(self, time_str: str) -> bool:
-        """更新用户配额重置任务的执行时间
-
-        Args:
-            time_str: HH:MM 格式的时间字符串
-
-        Returns:
-            是否成功更新
-        """
-        hour, minute = self._parse_user_quota_reset_time_string(time_str)
-
-        scheduler = get_scheduler()
-        success = scheduler.reschedule_cron_job(
-            self.USER_QUOTA_RESET_JOB_ID,
-            hour=hour,
-            minute=minute,
-        )
-
-        if success:
-            logger.info(f"用户配额重置任务时间已更新为: {hour:02d}:{minute:02d}")
-
-        return success
-
-    def _get_standalone_key_quota_reset_time(self) -> tuple[int, int]:
-        """获取独立密钥额度重置任务的执行时间"""
-        db = create_session()
-        try:
-            time_str = SystemConfigService.get_config(
-                db, "standalone_key_quota_reset_time", "05:00"
-            )
-            return self._parse_user_quota_reset_time_string(time_str)
-        finally:
-            db.close()
-
-    def update_standalone_key_quota_reset_time(self, time_str: str) -> bool:
-        """更新独立密钥额度重置任务的执行时间"""
-        hour, minute = self._parse_user_quota_reset_time_string(time_str)
-
-        scheduler = get_scheduler()
-        success = scheduler.reschedule_cron_job(
-            self.STANDALONE_KEY_QUOTA_RESET_JOB_ID,
-            hour=hour,
-            minute=minute,
-        )
-
-        if success:
-            logger.info(f"独立密钥额度重置任务时间已更新为: {hour:02d}:{minute:02d}")
 
         return success
 
@@ -318,26 +231,6 @@ class MaintenanceScheduler:
             name="Provider签到",
         )
 
-        # 用户配额重置任务 - 根据配置时间执行（按周期配置决定是否执行）
-        quota_reset_hour, quota_reset_minute = self._get_user_quota_reset_time()
-        scheduler.add_cron_job(
-            self._scheduled_user_quota_reset,
-            hour=quota_reset_hour,
-            minute=quota_reset_minute,
-            job_id=self.USER_QUOTA_RESET_JOB_ID,
-            name="用户配额自动重置",
-        )
-
-        # 独立密钥额度重置任务 - 根据配置时间执行（按周期配置决定是否执行）
-        sk_reset_hour, sk_reset_minute = self._get_standalone_key_quota_reset_time()
-        scheduler.add_cron_job(
-            self._scheduled_standalone_key_quota_reset,
-            hour=sk_reset_hour,
-            minute=sk_reset_minute,
-            job_id=self.STANDALONE_KEY_QUOTA_RESET_JOB_ID,
-            name="独立密钥额度自动重置",
-        )
-
         # 启动时执行一次初始化任务
         asyncio.create_task(self._run_startup_tasks())
 
@@ -360,6 +253,12 @@ class MaintenanceScheduler:
             await self._perform_cleanup()
         except Exception as e:
             logger.exception(f"启动时清理任务执行出错: {e}")
+
+        try:
+            logger.info("启动时清理残留的 pending/streaming 请求...")
+            await self._perform_pending_cleanup()
+        except Exception as e:
+            logger.exception(f"启动时 pending 清理执行出错: {e}")
 
         try:
             logger.info("启动时检查统计数据...")
@@ -434,14 +333,6 @@ class MaintenanceScheduler:
         """Provider 签到任务（定时调用）"""
         await self._perform_provider_checkin()
 
-    async def _scheduled_user_quota_reset(self) -> None:
-        """用户配额重置任务（定时调用）"""
-        await self._perform_user_quota_reset()
-
-    async def _scheduled_standalone_key_quota_reset(self) -> None:
-        """独立密钥额度重置任务（定时调用）"""
-        await self._perform_standalone_key_quota_reset()
-
     # ========== 实际任务实现 ==========
 
     async def _perform_stats_aggregation(self, backfill: bool = False) -> None:
@@ -502,40 +393,43 @@ class MaintenanceScheduler:
                         check_start_date, datetime.min.time(), tzinfo=timezone.utc
                     )
 
-                    # 获取 StatsDaily 和 StatsDailyModel 中已有数据的日期集合
-                    existing_daily_dates = set()
-                    existing_model_dates = set()
-                    existing_provider_dates = set()
+                    # 单次查询获取三张统计表中已有数据的日期（UNION ALL 合并）
+                    existing_daily_dates: set[date] = set()
+                    existing_model_dates: set[date] = set()
+                    existing_provider_dates: set[date] = set()
 
-                    daily_stats = (
-                        db.query(StatsDaily.date).filter(StatsDaily.date >= check_start_dt).all()
-                    )
-                    for (stat_date,) in daily_stats:
-                        if stat_date.tzinfo is None:
-                            stat_date = stat_date.replace(tzinfo=timezone.utc)
-                        existing_daily_dates.add(stat_date.date())
-
-                    model_stats = (
-                        db.query(StatsDailyModel.date)
+                    q_daily = db.query(
+                        StatsDaily.date.label("dt"),
+                        literal_column("'daily'").label("src"),
+                    ).filter(StatsDaily.date >= check_start_dt)
+                    q_model = (
+                        db.query(
+                            StatsDailyModel.date.label("dt"),
+                            literal_column("'model'").label("src"),
+                        )
                         .filter(StatsDailyModel.date >= check_start_dt)
                         .distinct()
-                        .all()
                     )
-                    for (stat_date,) in model_stats:
-                        if stat_date.tzinfo is None:
-                            stat_date = stat_date.replace(tzinfo=timezone.utc)
-                        existing_model_dates.add(stat_date.date())
-
-                    provider_stats = (
-                        db.query(StatsDailyProvider.date)
+                    q_provider = (
+                        db.query(
+                            StatsDailyProvider.date.label("dt"),
+                            literal_column("'provider'").label("src"),
+                        )
                         .filter(StatsDailyProvider.date >= check_start_dt)
                         .distinct()
-                        .all()
                     )
-                    for (stat_date,) in provider_stats:
+                    combined = q_daily.union_all(q_model).union_all(q_provider).all()
+
+                    for stat_date, src in combined:
                         if stat_date.tzinfo is None:
                             stat_date = stat_date.replace(tzinfo=timezone.utc)
-                        existing_provider_dates.add(stat_date.date())
+                        d = stat_date.date()
+                        if src == "daily":
+                            existing_daily_dates.add(d)
+                        elif src == "model":
+                            existing_model_dates.add(d)
+                        else:
+                            existing_provider_dates.add(d)
 
                     # 找出需要回填的日期
                     all_dates = set()
@@ -851,227 +745,6 @@ class MaintenanceScheduler:
         finally:
             if db is not None:
                 db.close()
-
-    async def _perform_user_quota_reset(self) -> None:
-        """执行用户配额自动重置任务
-
-        适用范围：
-        - 未删除（is_deleted=false）
-        - 仅对 quota_usd != NULL 的用户生效
-        """
-        db = create_session()
-        try:
-            # 检查是否启用用户配额重置
-            if not SystemConfigService.get_config(db, "enable_user_quota_reset", False):
-                logger.info("用户配额自动重置已禁用，跳过任务")
-                return
-
-            # 重置周期（天数），不限制上限
-            interval_value = SystemConfigService.get_config(db, "user_quota_reset_interval_days", 1)
-            try:
-                interval_days = int(interval_value)
-            except Exception:
-                interval_days = 1
-            if interval_days < 1:
-                interval_days = 1
-
-            # 滚动计算：根据上次执行日（APP_TIMEZONE）判断是否到期
-            last_reset_at = SystemConfigService.get_config(db, "user_quota_last_reset_at")
-
-            should_run = True
-            if last_reset_at:
-                last_dt: datetime | None = None
-                try:
-                    if isinstance(last_reset_at, str):
-                        last_dt = datetime.fromisoformat(last_reset_at)
-                except Exception:
-                    last_dt = None
-
-                if last_dt is None:
-                    logger.warning("user_quota_last_reset_at 格式无效，视为需要执行一次")
-                else:
-                    if last_dt.tzinfo is None:
-                        last_dt = last_dt.replace(tzinfo=timezone.utc)
-
-                    from zoneinfo import ZoneInfo
-
-                    from src.services.system.scheduler import APP_TIMEZONE
-
-                    tz = ZoneInfo(APP_TIMEZONE)
-                    now_local = datetime.now(tz)
-                    last_local_date = last_dt.astimezone(tz).date()
-                    days_since_reset = (now_local.date() - last_local_date).days
-
-                    if days_since_reset < 0:
-                        logger.warning("user_quota_last_reset_at 在未来，跳过本次用户配额自动重置")
-                        should_run = False
-                    elif days_since_reset < interval_days:
-                        logger.info(
-                            f"用户配额自动重置未到周期，跳过任务（{days_since_reset}/{interval_days}天）"
-                        )
-                        should_run = False
-
-            if not should_run:
-                return
-
-            from src.models.database import User as DBUser
-
-            now_utc = datetime.now(timezone.utc)
-            reset_count = (
-                db.query(DBUser)
-                .filter(
-                    DBUser.is_deleted.is_(False),
-                    DBUser.quota_usd.isnot(None),
-                )
-                .update(
-                    {
-                        DBUser.used_usd: 0.0,
-                        DBUser.updated_at: now_utc,
-                    },
-                    synchronize_session=False,
-                )
-            )
-            db.commit()
-
-            # 记录 last_reset_at（成功执行后更新，滚动计算用）
-            SystemConfigService.set_config(
-                db,
-                "user_quota_last_reset_at",
-                now_utc.isoformat(),
-                "用户配额自动重置的上次执行时间（UTC，内部使用）",
-            )
-
-            logger.info(
-                f"用户配额自动重置完成: interval_days={interval_days}, 重置用户数={reset_count}"
-            )
-
-        except Exception as e:
-            logger.exception(f"用户配额自动重置任务执行失败: {e}")
-            try:
-                db.rollback()
-            except Exception:
-                pass
-        finally:
-            db.close()
-
-    async def _perform_standalone_key_quota_reset(self) -> None:
-        """执行独立密钥额度自动重置任务
-
-        适用范围：
-        - is_standalone=True 的密钥
-        - current_balance_usd != NULL（有限额的密钥）
-        - 支持 all（全部）和 selected（指定密钥）两种模式
-        """
-        db = create_session()
-        try:
-            if not SystemConfigService.get_config(db, "enable_standalone_key_quota_reset", False):
-                logger.info("独立密钥额度自动重置已禁用，跳过任务")
-                return
-
-            # 重置周期
-            interval_value = SystemConfigService.get_config(
-                db, "standalone_key_quota_reset_interval_days", 1
-            )
-            try:
-                interval_days = int(interval_value)
-            except Exception:
-                interval_days = 1
-            if interval_days < 1:
-                interval_days = 1
-
-            # 滚动计算
-            last_reset_at = SystemConfigService.get_config(db, "standalone_key_quota_last_reset_at")
-
-            should_run = True
-            if last_reset_at:
-                last_dt: datetime | None = None
-                try:
-                    if isinstance(last_reset_at, str):
-                        last_dt = datetime.fromisoformat(last_reset_at)
-                except Exception:
-                    last_dt = None
-
-                if last_dt is None:
-                    logger.warning("standalone_key_quota_last_reset_at 格式无效，视为需要执行一次")
-                else:
-                    if last_dt.tzinfo is None:
-                        last_dt = last_dt.replace(tzinfo=timezone.utc)
-
-                    from zoneinfo import ZoneInfo
-
-                    from src.services.system.scheduler import APP_TIMEZONE
-
-                    tz = ZoneInfo(APP_TIMEZONE)
-                    now_local = datetime.now(tz)
-                    last_local_date = last_dt.astimezone(tz).date()
-                    days_since_reset = (now_local.date() - last_local_date).days
-
-                    if days_since_reset < 0:
-                        logger.warning("standalone_key_quota_last_reset_at 在未来，跳过本次重置")
-                        should_run = False
-                    elif days_since_reset < interval_days:
-                        logger.info(
-                            f"独立密钥额度自动重置未到周期，跳过任务"
-                            f"（{days_since_reset}/{interval_days}天）"
-                        )
-                        should_run = False
-
-            if not should_run:
-                return
-
-            # 确定重置范围
-            reset_mode = SystemConfigService.get_config(
-                db, "standalone_key_quota_reset_mode", "all"
-            )
-
-            now_utc = datetime.now(timezone.utc)
-            base_filter = [
-                ApiKey.is_standalone.is_(True),
-                ApiKey.current_balance_usd.isnot(None),
-            ]
-
-            if reset_mode == "selected":
-                key_ids = SystemConfigService.get_config(
-                    db, "standalone_key_quota_reset_key_ids", []
-                )
-                if not key_ids:
-                    logger.info("独立密钥额度重置模式为 selected 但未选择任何密钥，跳过")
-                    return
-                base_filter.append(ApiKey.id.in_(key_ids))
-
-            reset_count = (
-                db.query(ApiKey)
-                .filter(*base_filter)
-                .update(
-                    {
-                        ApiKey.balance_used_usd: 0.0,
-                        ApiKey.updated_at: now_utc,
-                    },
-                    synchronize_session=False,
-                )
-            )
-            db.commit()
-
-            SystemConfigService.set_config(
-                db,
-                "standalone_key_quota_last_reset_at",
-                now_utc.isoformat(),
-                "独立密钥额度自动重置的上次执行时间（UTC，内部使用）",
-            )
-
-            logger.info(
-                f"独立密钥额度自动重置完成: mode={reset_mode}, "
-                f"interval_days={interval_days}, 重置密钥数={reset_count}"
-            )
-
-        except Exception as e:
-            logger.exception(f"独立密钥额度自动重置任务执行失败: {e}")
-            try:
-                db.rollback()
-            except Exception:
-                pass
-        finally:
-            db.close()
 
     async def _perform_candidate_cleanup(self) -> None:
         """清理过期的 request_candidates 记录"""

@@ -41,6 +41,8 @@ from src.database import create_session
 from src.database.database import get_db
 from src.models.database import Provider, ProviderAPIKey, User
 from src.services.provider.pool.config import parse_pool_config
+from src.services.provider_keys.auth_type import OAUTH_AUTH_TYPES
+from src.services.scheduling.utils import release_db_connection_before_await
 from src.utils.auth_utils import require_admin
 
 router = APIRouter(prefix="/api/admin/provider-oauth", tags=["Provider OAuth"])
@@ -128,6 +130,7 @@ _PROVIDER_OAUTH_BATCH_TASK_TTL_SECONDS = 24 * 3600
 _PROVIDER_OAUTH_BATCH_TASK_MAX_ERROR_SAMPLES = 20
 _PROVIDER_OAUTH_DEFAULT_TIMEOUT_SECONDS = 30.0
 _PROVIDER_OAUTH_BATCH_IMPORT_PROXY_TIMEOUT_SECONDS = 60.0
+_PROVIDER_OAUTH_BATCH_IMPORT_COMMIT_BATCH_SIZE = 25
 _PROVIDER_OAUTH_BATCH_TASK_ALLOWED_STATUSES = {
     "submitted",
     "processing",
@@ -550,7 +553,7 @@ def _check_duplicate_oauth_account(
     # 查询该 Provider 下所有 OAuth 类型的 Keys
     query = db.query(ProviderAPIKey).filter(
         ProviderAPIKey.provider_id == provider_id,
-        ProviderAPIKey.auth_type.in_(["oauth", "kiro"]),  # kiro 也是 OAuth 类型
+        ProviderAPIKey.auth_type.in_(OAUTH_AUTH_TYPES),
     )
     if exclude_key_id:
         query = query.filter(ProviderAPIKey.id != exclude_key_id)
@@ -1287,7 +1290,7 @@ async def complete_provider_oauth(
             proxy=key_proxy,
         )
 
-    return ProviderCompleteOAuthResponse(
+    response = ProviderCompleteOAuthResponse(
         key_id=str(new_key.id),
         provider_type=provider_type,
         expires_at=expires_at,
@@ -1295,6 +1298,11 @@ async def complete_provider_oauth(
         email=auth_config.get("email"),
         replaced=replaced,
     )
+
+    # 单个导入完成后，后台触发一次配额刷新
+    asyncio.create_task(_refresh_quota_after_import(provider_id, provider_type, [str(new_key.id)]))
+
+    return response
 
 
 # ==============================================================================
@@ -1638,6 +1646,27 @@ def _estimate_batch_import_total(provider_type: str, raw_credentials: str) -> in
     return len(_parse_standard_oauth_import_entries(raw_credentials))
 
 
+def _release_batch_import_db_connection_before_await(db: Session) -> None:
+    """Best-effort 释放批量导入任务的只读 DB 连接。
+
+    批量导入会在单个后台任务里执行大量 await（上游 token 校验、邮箱探测、Redis 进度更新）。
+    如果前面做过 Provider 查询而 Session 一直保持事务打开，连接会长时间占着不放，
+    在大批量导入且多数条目最终失败时尤其容易把连接池拖满。
+
+    这里复用调度器已有的 helper：仅在 Session 没有挂起写入时才提前结束事务，
+    避免影响 flush 后尚未提交的数据。
+    """
+    release_db_connection_before_await(db)
+
+
+def _commit_batch_import_writes_if_needed(db: Session, pending_writes: int) -> int:
+    """按固定批次提交导入写入，避免长事务持续占用连接。"""
+    if pending_writes < _PROVIDER_OAUTH_BATCH_IMPORT_COMMIT_BATCH_SIZE:
+        return pending_writes
+    db.commit()
+    return 0
+
+
 def _apply_codex_import_hints(auth_config: dict[str, Any], import_entry: dict[str, str]) -> None:
     """将导入文件中可用的 Codex 账号信息作为兜底补全（不覆盖已有值）。"""
     for field in ("account_id", "plan_type", "user_id", "email"):
@@ -1731,7 +1760,7 @@ async def import_refresh_token(
                 proxy=key_proxy,
             )
 
-        return ProviderCompleteOAuthResponse(
+        response = ProviderCompleteOAuthResponse(
             key_id=str(new_key.id),
             provider_type=provider_type,
             expires_at=new_cfg.expires_at or None,
@@ -1739,6 +1768,13 @@ async def import_refresh_token(
             email=email,
             replaced=replaced,
         )
+
+        # 单个导入完成后，后台触发一次配额刷新
+        asyncio.create_task(
+            _refresh_quota_after_import(provider_id, provider_type, [str(new_key.id)])
+        )
+
+        return response
 
     template = _require_oauth_template(provider_type)
 
@@ -1855,7 +1891,7 @@ async def import_refresh_token(
             proxy=key_proxy,
         )
 
-    return ProviderCompleteOAuthResponse(
+    response = ProviderCompleteOAuthResponse(
         key_id=str(new_key.id),
         provider_type=provider_type,
         expires_at=expires_at,
@@ -1863,6 +1899,50 @@ async def import_refresh_token(
         email=auth_config.get("email"),
         replaced=replaced,
     )
+
+    # 单个导入完成后，后台触发一次配额刷新
+    asyncio.create_task(_refresh_quota_after_import(provider_id, provider_type, [str(new_key.id)]))
+
+    return response
+
+
+# ==============================================================================
+# 导入后配额刷新
+# ==============================================================================
+
+
+def _extract_success_key_ids(result: BatchImportResponse) -> list[str]:
+    """从批量导入结果中提取成功导入的 key_id 列表。"""
+    return [r.key_id for r in result.results if r.status == "success" and r.key_id]
+
+
+async def _refresh_quota_after_import(
+    provider_id: str,
+    provider_type: str,
+    key_ids: list[str],
+) -> None:
+    """导入完成后触发一次配额刷新（使用独立 db session）。"""
+    from src.services.provider_keys.key_quota_service import (
+        CODEX_WHAM_USAGE_URL,
+        QUOTA_REFRESH_PROVIDER_TYPES,
+        refresh_provider_quota_for_provider,
+    )
+
+    if not key_ids or provider_type not in QUOTA_REFRESH_PROVIDER_TYPES:
+        return
+    try:
+        db = create_session()
+        try:
+            await refresh_provider_quota_for_provider(
+                db=db,
+                provider_id=provider_id,
+                codex_wham_usage_url=CODEX_WHAM_USAGE_URL,
+                key_ids=key_ids,
+            )
+        finally:
+            db.close()
+    except Exception as exc:
+        logger.warning("[BATCH_IMPORT] 导入后配额刷新失败 (provider={}): {}", provider_id, exc)
 
 
 # ==============================================================================
@@ -1900,11 +1980,14 @@ async def _batch_import_standard_oauth_internal(
     success_count = 0
     failed_count = 0
     processed_count = 0
+    pending_success_writes = 0
     db_lock = asyncio.Lock()
     sem = asyncio.Semaphore(max(concurrency, 1))
 
+    _release_batch_import_db_connection_before_await(db)
+
     async def _process_entry(idx: int, import_entry: dict[str, Any]) -> None:
-        nonlocal success_count, failed_count, processed_count
+        nonlocal success_count, failed_count, processed_count, pending_success_writes
         result_item: BatchImportResultItem
 
         async with sem:
@@ -1950,6 +2033,7 @@ async def _batch_import_standard_oauth_internal(
                         json_body = None
 
                     try:
+                        _release_batch_import_db_connection_before_await(db)
                         resp = await post_oauth_token(
                             provider_type=provider_type,
                             token_url=token_url,
@@ -1969,6 +2053,7 @@ async def _batch_import_standard_oauth_internal(
                         processed_count += 1
                         results[idx] = result_item
                         if progress_hook is not None:
+                            _release_batch_import_db_connection_before_await(db)
                             await progress_hook(
                                 total, processed_count, success_count, failed_count, result_item
                             )
@@ -1996,6 +2081,7 @@ async def _batch_import_standard_oauth_internal(
                         processed_count += 1
                         results[idx] = result_item
                         if progress_hook is not None:
+                            _release_batch_import_db_connection_before_await(db)
                             await progress_hook(
                                 total, processed_count, success_count, failed_count, result_item
                             )
@@ -2015,6 +2101,7 @@ async def _batch_import_standard_oauth_internal(
                         processed_count += 1
                         results[idx] = result_item
                         if progress_hook is not None:
+                            _release_batch_import_db_connection_before_await(db)
                             await progress_hook(
                                 total, processed_count, success_count, failed_count, result_item
                             )
@@ -2038,6 +2125,7 @@ async def _batch_import_standard_oauth_internal(
                     }
 
                     try:
+                        _release_batch_import_db_connection_before_await(db)
                         auth_config = await enrich_auth_config(
                             provider_type=provider_type,
                             auth_config=auth_config,
@@ -2066,6 +2154,7 @@ async def _batch_import_standard_oauth_internal(
                             processed_count += 1
                             results[idx] = result_item
                             if progress_hook is not None:
+                                _release_batch_import_db_connection_before_await(db)
                                 await progress_hook(
                                     total,
                                     processed_count,
@@ -2107,6 +2196,11 @@ async def _batch_import_standard_oauth_internal(
                                 proxy=key_proxy,
                             )
 
+                        pending_success_writes += 1
+                        pending_success_writes = _commit_batch_import_writes_if_needed(
+                            db, pending_success_writes
+                        )
+
                     result_item = BatchImportResultItem(
                         index=idx,
                         status="success",
@@ -2128,6 +2222,7 @@ async def _batch_import_standard_oauth_internal(
         processed_count += 1
         results[idx] = result_item
         if progress_hook is not None:
+            _release_batch_import_db_connection_before_await(db)
             await progress_hook(total, processed_count, success_count, failed_count, result_item)
 
     await asyncio.gather(
@@ -2135,7 +2230,7 @@ async def _batch_import_standard_oauth_internal(
         return_exceptions=True,
     )
 
-    if success_count > 0:
+    if success_count > 0 and pending_success_writes > 0:
         db.commit()
 
     final_results = [r for r in results if r is not None]
@@ -2196,7 +2291,7 @@ async def batch_import_oauth(
     batch_concurrency = (_pool_cfg.batch_concurrency or 8) if _pool_cfg else 8
 
     if provider_type == ProviderType.KIRO.value:
-        return await _batch_import_kiro_internal(
+        result = await _batch_import_kiro_internal(
             provider_id=provider_id,
             provider=provider,
             raw_credentials=payload.credentials,
@@ -2205,17 +2300,26 @@ async def batch_import_oauth(
             key_proxy=key_proxy,
             concurrency=batch_concurrency,
         )
+    else:
+        result = await _batch_import_standard_oauth_internal(
+            provider_id=provider_id,
+            provider_type=provider_type,
+            provider=provider,
+            raw_credentials=payload.credentials,
+            db=db,
+            proxy_config=proxy_config,
+            key_proxy=key_proxy,
+            concurrency=batch_concurrency,
+        )
 
-    return await _batch_import_standard_oauth_internal(
-        provider_id=provider_id,
-        provider_type=provider_type,
-        provider=provider,
-        raw_credentials=payload.credentials,
-        db=db,
-        proxy_config=proxy_config,
-        key_proxy=key_proxy,
-        concurrency=batch_concurrency,
-    )
+    # 导入完成后，后台触发一次配额刷新
+    success_key_ids = _extract_success_key_ids(result)
+    if success_key_ids:
+        asyncio.create_task(
+            _refresh_quota_after_import(provider_id, provider_type, success_key_ids)
+        )
+
+    return result
 
 
 async def _run_batch_import_task(
@@ -2311,6 +2415,11 @@ async def _run_batch_import_task(
         state["finished_at"] = int(time.time())
         state["message"] = f"导入完成：成功 {result.success}，失败 {result.failed}"
         await _save_batch_task_state(task_id, state, redis=redis)
+
+        # 导入完成后触发一次配额刷新
+        success_key_ids = _extract_success_key_ids(result)
+        if success_key_ids:
+            await _refresh_quota_after_import(provider_id, provider_type, success_key_ids)
 
     except Exception as exc:
         try:
@@ -2445,11 +2554,14 @@ async def _batch_import_kiro_internal(
     success_count = 0
     failed_count = 0
     processed_count = 0
+    pending_success_writes = 0
     db_lock = asyncio.Lock()
     sem = asyncio.Semaphore(max(concurrency, 1))
 
+    _release_batch_import_db_connection_before_await(db)
+
     async def _process_entry(idx: int, cred: dict[str, Any]) -> None:
-        nonlocal success_count, failed_count, processed_count
+        nonlocal success_count, failed_count, processed_count, pending_success_writes
         result_item: BatchImportResultItem
 
         async with sem:
@@ -2465,6 +2577,7 @@ async def _batch_import_kiro_internal(
                     processed_count += 1
                     results[idx] = result_item
                     if progress_hook is not None:
+                        _release_batch_import_db_connection_before_await(db)
                         await progress_hook(
                             total, processed_count, success_count, failed_count, result_item
                         )
@@ -2474,6 +2587,7 @@ async def _batch_import_kiro_internal(
                 cfg.provider_type = ProviderType.KIRO.value
 
                 try:
+                    _release_batch_import_db_connection_before_await(db)
                     access_token, new_cfg = await refresh_access_token(
                         cfg,
                         proxy_config=proxy_config,
@@ -2489,11 +2603,13 @@ async def _batch_import_kiro_internal(
                     processed_count += 1
                     results[idx] = result_item
                     if progress_hook is not None:
+                        _release_batch_import_db_connection_before_await(db)
                         await progress_hook(
                             total, processed_count, success_count, failed_count, result_item
                         )
                     return
 
+                _release_batch_import_db_connection_before_await(db)
                 email = await _fetch_kiro_email(new_cfg.to_dict(), proxy_config=proxy_config)
                 if email and not new_cfg.email:
                     new_cfg.email = email
@@ -2513,6 +2629,7 @@ async def _batch_import_kiro_internal(
                         processed_count += 1
                         results[idx] = result_item
                         if progress_hook is not None:
+                            _release_batch_import_db_connection_before_await(db)
                             await progress_hook(
                                 total,
                                 processed_count,
@@ -2549,6 +2666,11 @@ async def _batch_import_kiro_internal(
                             proxy=key_proxy,
                         )
 
+                    pending_success_writes += 1
+                    pending_success_writes = _commit_batch_import_writes_if_needed(
+                        db, pending_success_writes
+                    )
+
                 result_item = BatchImportResultItem(
                     index=idx,
                     status="success",
@@ -2571,6 +2693,7 @@ async def _batch_import_kiro_internal(
         processed_count += 1
         results[idx] = result_item
         if progress_hook is not None:
+            _release_batch_import_db_connection_before_await(db)
             await progress_hook(total, processed_count, success_count, failed_count, result_item)
 
     await asyncio.gather(
@@ -2579,7 +2702,7 @@ async def _batch_import_kiro_internal(
     )
 
     # 提交所有成功的记录
-    if success_count > 0:
+    if success_count > 0 and pending_success_writes > 0:
         db.commit()
 
     final_results = [r for r in results if r is not None]
@@ -3002,6 +3125,10 @@ async def device_poll(
     session["email"] = email
     session["replaced"] = replaced
     await redis.setex(redis_key, 60, json.dumps(session))
+
+    # 单个导入完成后，后台触发一次配额刷新
+    provider_type = ProviderType.KIRO.value
+    asyncio.create_task(_refresh_quota_after_import(provider_id, provider_type, [str(new_key.id)]))
 
     return DevicePollResponse(
         status="authorized",

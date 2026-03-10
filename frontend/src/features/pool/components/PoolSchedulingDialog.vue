@@ -324,7 +324,7 @@ const FALLBACK_PRESET_DEFS: PoolPresetMeta[] = [
   },
 ]
 
-const DEFAULT_ENABLED_PRESETS = new Set(['cache_affinity', 'quota_balanced'])
+const DEFAULT_ENABLED_PRESETS = new Set(['cache_affinity', 'recent_refresh'])
 
 const { success, error: showError } = useToast()
 const loading = ref(false)

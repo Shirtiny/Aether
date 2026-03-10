@@ -557,7 +557,7 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
 
             # 统一入口：总是通过 TaskService
             from src.services.task import TaskService
-            from src.services.task.context import TaskMode
+            from src.services.task.core.context import TaskMode
 
             exec_result = await TaskService(self.db, self.redis).execute(
                 task_type="chat",
@@ -1287,6 +1287,10 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
                     response_ctx = None
                     continue
 
+                from src.api.handlers.base.chat_sync_executor import ChatSyncExecutor
+
+                error_text = await ChatSyncExecutor(self)._extract_error_text(e)
+
                 try:
                     if response_ctx is not None:
                         await response_ctx.__aexit__(None, None, None)
@@ -1294,10 +1298,6 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
                     pass
                 finally:
                     response_ctx = None
-
-                from src.api.handlers.base.chat_sync_executor import ChatSyncExecutor
-
-                error_text = await ChatSyncExecutor(self)._extract_error_text(e)
                 logger.error(
                     f"Provider 返回错误: {e.response.status_code}\n  Response: {error_text}"
                 )

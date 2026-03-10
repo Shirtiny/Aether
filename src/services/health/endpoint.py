@@ -16,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import case, func
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, load_only
 
 from src.core.logger import logger
 from src.models.database import Provider, ProviderAPIKey, ProviderEndpoint, RequestCandidate
@@ -75,11 +75,21 @@ class EndpointHealthService:
         # 收集所有 provider_ids
         all_provider_ids = list({ep.provider_id for ep in endpoints})
 
-        # 批量查询所有密钥（通过 provider_id 关联）
+        # 批量查询所有密钥（通过 provider_id 关联，只加载分组和统计所需列）
         all_keys = (
             (
                 db.query(ProviderAPIKey)
                 .filter(ProviderAPIKey.provider_id.in_(all_provider_ids))
+                .options(
+                    load_only(
+                        ProviderAPIKey.id,
+                        ProviderAPIKey.provider_id,
+                        ProviderAPIKey.is_active,
+                        ProviderAPIKey.api_formats,
+                        ProviderAPIKey.health_by_format,
+                        ProviderAPIKey.circuit_breaker_by_format,
+                    )
+                )
                 .all()
             )
             if all_provider_ids

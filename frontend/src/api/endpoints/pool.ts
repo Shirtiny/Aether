@@ -2,6 +2,8 @@ import client from '../client'
 import { dedupedRequest } from '@/utils/cache'
 import type { AllowedModels, ProxyConfig } from './types/provider'
 
+const POOL_BATCH_ACTION_TIMEOUT_MS = 5 * 60 * 1000
+
 export interface PoolKeyStatus {
   key_id: string
   key_name: string
@@ -123,8 +125,6 @@ export interface PoolKeyDetail {
   cost_window_usage: number
   cost_limit: number | null
   request_count: number
-  total_tokens: number
-  total_cost_usd: number
   sticky_sessions: number
   lru_score: number | null
   created_at: string | null
@@ -178,6 +178,9 @@ export interface PoolBatchAction {
     | 'clear_cooldown'
     | 'reset_cost'
     | 'regenerate_fingerprint'
+    | 'clear_proxy'
+    | 'set_proxy'
+  payload?: Record<string, unknown> | null
 }
 
 export async function getPoolOverview(): Promise<PoolOverviewResponse> {
@@ -208,14 +211,40 @@ export async function listPoolKeys(
 export async function batchActionPoolKeys(
   providerId: string,
   body: PoolBatchAction,
-): Promise<{ affected: number; message: string }> {
-  const response = await client.post(`/api/admin/pool/${providerId}/keys/batch-action`, body)
+): Promise<{ affected: number; message: string; task_id?: string }> {
+  const response = await client.post(
+    `/api/admin/pool/${providerId}/keys/batch-action`,
+    body,
+    { timeout: POOL_BATCH_ACTION_TIMEOUT_MS },
+  )
+  return response.data
+}
+
+export interface BatchDeleteTaskStatus {
+  task_id: string
+  status: 'pending' | 'running' | 'completed' | 'failed'
+  total: number
+  deleted: number
+  message: string
+}
+
+export async function getPoolBatchDeleteTask(
+  providerId: string,
+  taskId: string,
+): Promise<BatchDeleteTaskStatus> {
+  const response = await client.get<BatchDeleteTaskStatus>(
+    `/api/admin/pool/${providerId}/keys/batch-delete-task/${taskId}`,
+  )
   return response.data
 }
 
 export async function cleanupBannedPoolKeys(
   providerId: string,
 ): Promise<{ affected: number; message: string }> {
-  const response = await client.post(`/api/admin/pool/${providerId}/keys/cleanup-banned`)
+  const response = await client.post(
+    `/api/admin/pool/${providerId}/keys/cleanup-banned`,
+    undefined,
+    { timeout: POOL_BATCH_ACTION_TIMEOUT_MS },
+  )
   return response.data
 }

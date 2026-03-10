@@ -7,7 +7,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Body, Depends, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -22,6 +22,7 @@ from src.models.endpoint_models import (
     EndpointAPIKeyUpdate,
 )
 from src.services.provider_keys import (
+    batch_delete_endpoint_keys_response,
     clear_oauth_invalid_response,
     create_provider_key_response,
     delete_endpoint_key_response,
@@ -33,6 +34,9 @@ from src.services.provider_keys import (
     refresh_provider_quota_for_provider,
     reveal_endpoint_key_payload,
     update_endpoint_key_response,
+)
+from src.services.provider_keys.key_quota_service import (
+    CODEX_WHAM_USAGE_URL as _CODEX_WHAM_USAGE_URL,
 )
 from src.utils.auth_utils import require_admin
 
@@ -172,6 +176,30 @@ async def delete_endpoint_key(
     return await pipeline.run(adapter=adapter, http_request=request, db=db, mode=adapter.mode)
 
 
+@router.post("/keys/batch-delete")
+async def batch_delete_endpoint_keys(
+    request: Request,
+    ids: list[str] = Body(..., embed=True, max_length=100),
+    db: Session = Depends(get_db),
+) -> dict:
+    """
+    批量删除 Provider Keys
+
+    一次性删除多个 Key，按 Provider 聚合执行副作用（缓存失效、模型关联检查），
+    避免逐个删除导致的重复 Redis 操作和性能问题。
+
+    **请求体字段**:
+    - `ids`: Key ID 列表（最多 100 个）
+
+    **返回字段**:
+    - `success_count`: 成功删除的数量
+    - `failed_count`: 失败的数量
+    - `failed`: 失败的详情列表
+    """
+    adapter = AdminBatchDeleteEndpointKeysAdapter(ids=ids)
+    return await pipeline.run(adapter=adapter, http_request=request, db=db, mode=adapter.mode)
+
+
 @router.post("/keys/{key_id}/clear-oauth-invalid")
 async def clear_oauth_invalid(
     key_id: str,
@@ -297,6 +325,16 @@ class AdminDeleteEndpointKeyAdapter(AdminApiAdapter):
 
 
 @dataclass
+class AdminBatchDeleteEndpointKeysAdapter(AdminApiAdapter):
+    """批量删除多个 Provider Key"""
+
+    ids: list[str]
+
+    async def handle(self, context: ApiRequestContext) -> Any:  # type: ignore[override]
+        return await batch_delete_endpoint_keys_response(db=context.db, key_ids=self.ids)
+
+
+@dataclass
 class AdminClearOAuthInvalidAdapter(AdminApiAdapter):
     """清除 Key 的 OAuth 失效标记。"""
 
@@ -341,13 +379,7 @@ class AdminCreateProviderKeyAdapter(AdminApiAdapter):
         )
 
 
-# ========== Codex Quota Refresh API ==========
-
-# Codex wham/usage API 地址（用于查询限额信息）
-CODEX_WHAM_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
-
-
-# ========== Kiro Quota Refresh API ==========
+# ========== Quota Refresh API ==========
 
 
 class RefreshProviderQuotaRequest(BaseModel):
@@ -397,6 +429,6 @@ class AdminRefreshProviderQuotaAdapter(AdminApiAdapter):
         return await refresh_provider_quota_for_provider(
             db=context.db,
             provider_id=self.provider_id,
-            codex_wham_usage_url=CODEX_WHAM_USAGE_URL,
+            codex_wham_usage_url=_CODEX_WHAM_USAGE_URL,
             key_ids=self.key_ids,
         )

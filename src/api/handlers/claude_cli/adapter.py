@@ -8,11 +8,9 @@ from __future__ import annotations
 
 from typing import Any
 
-import httpx
-
 from src.api.handlers.base.cli_adapter_base import CliAdapterBase, register_cli_adapter
 from src.api.handlers.base.cli_handler_base import CliMessageHandlerBase
-from src.api.handlers.claude.adapter import ClaudeCapabilityDetector, ClaudeChatAdapter
+from src.api.handlers.claude.adapter import ClaudeCapabilityDetector
 from src.config.settings import config
 from src.core.api_format import ApiFamily
 
@@ -27,7 +25,6 @@ class ClaudeCliAdapter(CliAdapterBase):
 
     FORMAT_ID = "claude:cli"
     API_FAMILY = ApiFamily.CLAUDE
-    BILLING_TEMPLATE = "claude"  # 使用 Claude 计费模板
     name = "claude.cli"
 
     @property
@@ -47,23 +44,6 @@ class ClaudeCliAdapter(CliAdapterBase):
     ) -> dict[str, bool]:
         """检测 Claude CLI 请求中隐含的能力需求"""
         return ClaudeCapabilityDetector.detect_from_headers(headers, request_body)
-
-    # =========================================================================
-    # Claude CLI 特定的计费逻辑
-    # =========================================================================
-
-    def compute_total_input_context(
-        self,
-        input_tokens: int,
-        cache_read_input_tokens: int,
-        cache_creation_input_tokens: int = 0,
-    ) -> int:
-        """
-        计算 Claude CLI 的总输入上下文（用于阶梯计费判定）
-
-        Claude 的总输入 = input_tokens + cache_creation_input_tokens + cache_read_input_tokens
-        """
-        return input_tokens + cache_creation_input_tokens + cache_read_input_tokens
 
     def _extract_message_count(self, payload: dict[str, Any]) -> int:
         """Claude CLI 使用 messages 字段"""
@@ -97,28 +77,6 @@ class ClaudeCliAdapter(CliAdapterBase):
             "tool_count": len(payload.get("tools") or []),
             "system_present": bool(payload.get("system")),
         }
-
-    # =========================================================================
-    # 模型列表查询
-    # =========================================================================
-
-    @classmethod
-    async def fetch_models(
-        cls,
-        client: httpx.AsyncClient,
-        base_url: str,
-        api_key: str,
-        extra_headers: dict[str, str] | None = None,
-    ) -> tuple[list, str | None]:
-        """查询 Claude API 支持的模型列表（使用 CLI Bearer 认证）"""
-        cli_headers = {"User-Agent": config.internal_user_agent_claude_cli}
-        if extra_headers:
-            cli_headers.update(extra_headers)
-        # 使用 CLI adapter 自己的认证头（Authorization: Bearer），而非 Chat 的 x-api-key
-        headers = cls.build_headers_with_extra(api_key, cli_headers)
-        return await ClaudeChatAdapter._fetch_models_paginated(
-            client, base_url, headers, cls.FORMAT_ID
-        )
 
     @classmethod
     def build_endpoint_url(

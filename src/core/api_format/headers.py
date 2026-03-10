@@ -82,6 +82,7 @@ UPSTREAM_DROP_HEADERS: frozenset[str] = frozenset(
         "x-real-proto",
         "x-forwarded-for",
         "x-forwarded-proto",
+        "x-forwarded-scheme",
         "x-forwarded-host",
         "x-forwarded-port",
     }
@@ -189,6 +190,19 @@ def extract_client_api_key_for_endpoint(
     return value
 
 
+def resolve_header_name_case(
+    headers: dict[str, str] | None,
+    preferred_key: str,
+) -> str:
+    """Preserve original header casing when replacing an existing header."""
+    if headers:
+        preferred_lower = preferred_key.lower()
+        for key in headers.keys():
+            if str(key).lower() == preferred_lower:
+                return str(key)
+    return preferred_key
+
+
 def extract_client_api_key_for_endpoint_with_query(
     headers: dict[str, str],
     query_params: dict[str, str] | None,
@@ -279,8 +293,11 @@ class HeaderBuilder:
         self._headers: dict[str, tuple[str, str]] = {}
 
     def add(self, key: str, value: str) -> HeaderBuilder:
-        """添加单个头部（会覆盖同名头部）"""
-        self._headers[key.lower()] = (key, value)
+        """添加单个头部（会覆盖同名头部，但保留已存在 key 的原始大小写）"""
+        key_lower = key.lower()
+        existing = self._headers.get(key_lower)
+        stored_key = existing[0] if existing else key
+        self._headers[key_lower] = (stored_key, value)
         return self
 
     def add_many(self, headers: dict[str, str]) -> HeaderBuilder:
@@ -454,7 +471,7 @@ def build_upstream_headers_for_endpoint(
     if extra_headers:
         builder.add_many(extra_headers)
 
-    builder.add(auth_header, auth_value)
+    builder.add(resolve_header_name_case(original_headers, auth_header), auth_value)
 
     result = builder.build()
     if not any(k.lower() == "content-type" for k in result):

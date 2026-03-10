@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import os
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -118,10 +119,10 @@ class HealthMonitor:
 
     # === 其他配置 ===
     ALLOW_AUTO_RECOVER = os.getenv("HEALTH_AUTO_RECOVER_ENABLED", "true").lower() == "true"
-    CIRCUIT_HISTORY_LIMIT = int(os.getenv("HEALTH_CIRCUIT_HISTORY_LIMIT", "200"))
-
     # 进程级别状态缓存
-    _circuit_history: list[dict[str, Any]] = []
+    _circuit_history: deque[dict[str, Any]] = deque(
+        maxlen=int(os.getenv("HEALTH_CIRCUIT_HISTORY_LIMIT", "200"))
+    )
     _open_circuit_keys: int = 0
 
     # ==================== 数据访问辅助方法 ====================
@@ -810,16 +811,22 @@ class HealthMonitor:
                 ),
             ).first()
 
-            # 统计 Key（需要遍历 JSON 字段计算熔断状态）
-            keys = db.query(ProviderAPIKey).all()
-            total_keys = len(keys)
-            active_keys = sum(1 for k in keys if k.is_active)
+            # 统计 Key（只加载必要列，避免全字段全表扫描）
+            key_rows = db.query(
+                ProviderAPIKey.is_active,
+                ProviderAPIKey.health_by_format,
+                ProviderAPIKey.circuit_breaker_by_format,
+            ).all()
+            total_keys = len(key_rows)
+            active_keys = 0
             unhealthy_keys = 0
             circuit_open_keys = 0
 
-            for key in keys:
-                health_by_format = key.health_by_format or {}
-                circuit_by_format = key.circuit_breaker_by_format or {}
+            for is_active, health_by_format, circuit_by_format in key_rows:
+                if is_active:
+                    active_keys += 1
+                health_by_format = health_by_format or {}
+                circuit_by_format = circuit_by_format or {}
 
                 # 检查是否有任何格式健康度低于 0.5
                 for fmt, health_data in health_by_format.items():
@@ -859,14 +866,12 @@ class HealthMonitor:
     @classmethod
     def _push_circuit_event(cls, event: dict[str, Any]) -> None:
         cls._circuit_history.append(event)
-        if len(cls._circuit_history) > cls.CIRCUIT_HISTORY_LIMIT:
-            cls._circuit_history.pop(0)
 
     @classmethod
     def get_circuit_history(cls, limit: int = 50) -> list[dict[str, Any]]:
         if limit <= 0:
             return []
-        return cls._circuit_history[-limit:]
+        return list(cls._circuit_history)[-limit:]
 
     # ==================== 兼容旧方法 ====================
 

@@ -434,7 +434,7 @@ class ErrorHandlerService:
             return
 
         async def _cleanup() -> None:
-            from src.api.base.models_service import invalidate_models_list_cache
+            from src.services.cache.model_list_cache import invalidate_models_list_cache
             from src.services.cache.provider_cache import ProviderCacheService
             from src.services.provider.pool import redis_ops as pool_redis
 

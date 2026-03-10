@@ -20,6 +20,7 @@ from src.api.base.pipeline import ApiRequestPipeline
 from src.clients.redis_client import get_redis_client_sync
 from src.core.crypto import crypto_service
 from src.core.logger import logger
+from src.core.redis_utils import scan_delete_pattern
 from src.database import get_db
 from src.models.database import ApiKey, User
 from src.services.scheduling.affinity_manager import get_affinity_manager
@@ -28,6 +29,8 @@ from src.services.system.config import SystemConfigService
 
 router = APIRouter(prefix="/api/admin/monitoring/cache", tags=["Admin - Monitoring: Cache"])
 pipeline = ApiRequestPipeline()
+REDIS_SCAN_BATCH_SIZE = 200
+REDIS_DELETE_BATCH_SIZE = 500
 
 
 def mask_api_key(api_key: str | None, prefix_len: int = 8, suffix_len: int = 4) -> str | None:
@@ -1649,13 +1652,16 @@ class AdminRedisCacheCategoriesAdapter(AdminApiAdapter):
                     "data": {"available": False, "message": "Redis 未启用"},
                 }
 
-            async def _count_keys(pattern: str) -> int:
-                count = 0
-                async for _ in redis.scan_iter(match=pattern, count=500):
-                    count += 1
-                return count
+            semaphore = asyncio.Semaphore(4)
 
-            # 并行扫描所有分类的 key 数量，避免串行 20 次 SCAN
+            async def _count_keys(pattern: str) -> int:
+                async with semaphore:
+                    count = 0
+                    async for _ in redis.scan_iter(match=pattern, count=500):
+                        count += 1
+                    return count
+
+            # 限制扫描并发，避免刷新监控页时对 Redis 造成瞬时压力
             counts = await asyncio.gather(
                 *[_count_keys(pattern) for _, _, pattern, _ in _CACHE_CATEGORIES]
             )
@@ -1719,16 +1725,7 @@ class AdminClearRedisCacheCategoryAdapter(AdminApiAdapter):
             if not redis:
                 raise HTTPException(status_code=503, detail="Redis 未启用")
 
-            keys_to_delete: list[str] = []
-            async for key in redis.scan_iter(match=pattern, count=200):
-                keys_to_delete.append(key)
-
-            deleted_count = 0
-            # 分批删除，避免单次 DELETE 命令阻塞 Redis 事件循环
-            batch_size = 1000
-            for i in range(0, len(keys_to_delete), batch_size):
-                batch = keys_to_delete[i : i + batch_size]
-                deleted_count += await redis.delete(*batch)
+            deleted_count = await scan_delete_pattern(redis, pattern)
 
             logger.warning(
                 "已清除 Redis 缓存分类（管理员操作）: {} ({}), pattern={}, deleted={}",
@@ -1767,17 +1764,8 @@ class AdminClearAllModelMappingCacheAdapter(AdminApiAdapter):
             if not redis:
                 raise HTTPException(status_code=503, detail="Redis 未启用")
 
-            deleted_count = 0
-
-            # 删除所有模型相关的缓存键
-            keys_to_delete = []
-            async for key in redis.scan_iter(match="model:*", count=100):
-                keys_to_delete.append(key)
-            async for key in redis.scan_iter(match="global_model:*", count=100):
-                keys_to_delete.append(key)
-
-            if keys_to_delete:
-                deleted_count = await redis.delete(*keys_to_delete)
+            deleted_count = await scan_delete_pattern(redis, "model:*")
+            deleted_count += await scan_delete_pattern(redis, "global_model:*")
 
             logger.warning(f"已清除所有模型映射缓存（管理员操作）: {deleted_count} 个键")
             context.add_audit_metadata(

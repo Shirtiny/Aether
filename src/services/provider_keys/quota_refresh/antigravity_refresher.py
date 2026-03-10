@@ -9,9 +9,9 @@ from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
-from src.api.handlers.base.request_builder import get_provider_auth
 from src.core.logger import logger
 from src.models.database import Provider, ProviderAPIKey, ProviderEndpoint
+from src.services.provider.auth import get_provider_auth
 
 
 async def refresh_antigravity_key_quota(

@@ -65,11 +65,17 @@ pub async fn handle_worker_connection(
         .await;
     });
 
-    // Wait for reader to end, then cleanup writer/ping and unregister from hub.
+    // Wait for reader to end, then cleanup.
     let _ = reader.await;
     ping_task.abort();
-    writer.abort();
+    // Unregister first so all channel senders are dropped (reader_tx dropped
+    // when reader completes, ping_tx dropped by abort, conn.tx dropped when
+    // the last Arc<WorkerConn> is removed from hub). This lets the writer
+    // drain buffered messages (e.g. GOAWAY) before we force-abort it.
     hub.unregister_worker(conn_id);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    writer.abort();
+    let _ = writer.await;
 }
 
 async fn run_worker_reader(

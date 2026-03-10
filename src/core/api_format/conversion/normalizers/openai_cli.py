@@ -120,11 +120,10 @@ class OpenAICliNormalizer(FormatNormalizer):
         """Codex 同格式透传：直接在原始请求体上做最小补丁，跳过 internal 转换。"""
         if variant.lower() != "codex":
             return None
-        from src.services.provider.adapters.codex.request_patching import (
-            patch_openai_cli_request_for_codex,
-        )
-
-        return patch_openai_cli_request_for_codex(request)
+        out: dict[str, Any] = dict(request)
+        # 内部路由标记：绝不能透传到上游。
+        out.pop("_aether_compact", None)
+        return out
 
     def request_to_internal(self, request: dict[str, Any]) -> InternalRequest:
         model = str(request.get("model") or "")

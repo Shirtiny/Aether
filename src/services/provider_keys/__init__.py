@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     )
 
 __all__ = [
+    "batch_delete_endpoint_keys_response",
     "clear_oauth_invalid_response",
     "create_provider_key_response",
     "delete_endpoint_key_response",
@@ -44,6 +45,15 @@ async def create_provider_key_response(
     from src.services.provider_keys.key_command_service import create_provider_key_response as _impl
 
     return await _impl(db=db, provider_id=provider_id, key_data=key_data)
+
+
+async def batch_delete_endpoint_keys_response(db: Session, key_ids: list[str]) -> dict:
+    """批量删除 Keys 并返回统一响应（惰性导入实现）。"""
+    from src.services.provider_keys.key_command_service import (
+        batch_delete_endpoint_keys_response as _impl,
+    )
+
+    return await _impl(db=db, key_ids=key_ids)
 
 
 async def delete_endpoint_key_response(db: Session, key_id: str) -> dict[str, str]:

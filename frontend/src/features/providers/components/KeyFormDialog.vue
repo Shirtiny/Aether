@@ -232,14 +232,14 @@
             id="max_probe_interval_minutes"
             :model-value="form.max_probe_interval_minutes ?? ''"
             type="number"
-            min="2"
+            min="0"
             max="32"
             placeholder="32"
             class="h-8"
-            @update:model-value="(v) => form.max_probe_interval_minutes = parseNumberInput(v, { min: 2, max: 32 }) ?? 32"
+            @update:model-value="(v) => form.max_probe_interval_minutes = parseNumberInput(v, { min: 0, max: 32 }) ?? 32"
           />
           <p class="text-xs text-muted-foreground mt-0.5">
-            分钟，2-32
+            分钟，0-32
           </p>
         </div>
       </div>
@@ -377,6 +377,32 @@ function normalizeApiFormat(format: string): string {
   return String(format || '').trim().toLowerCase()
 }
 
+function getAvailableApiFormatSet(): Set<string> {
+  return new Set(props.availableApiFormats.map(normalizeApiFormat))
+}
+
+function filterAvailableApiFormats(formats: string[]): string[] {
+  const availableFormatSet = getAvailableApiFormatSet()
+  if (availableFormatSet.size === 0) {
+    return []
+  }
+
+  return formats.filter(format => availableFormatSet.has(normalizeApiFormat(format)))
+}
+
+function getDefaultApiFormats(): string[] {
+  const endpointFormat = props.endpoint?.api_format
+  if (endpointFormat) {
+    const endpointFormats = filterAvailableApiFormats([endpointFormat])
+    if (endpointFormats.length > 0) {
+      return endpointFormats
+    }
+  }
+
+  const firstAvailableFormat = sortApiFormats(props.availableApiFormats)[0]
+  return firstAvailableFormat ? [firstAvailableFormat] : []
+}
+
 // 按 provider/auth_type 过滤后的可用 API 格式列表
 const visibleApiFormats = computed(() => {
   const sorted = sortApiFormats(props.availableApiFormats)
@@ -486,6 +512,29 @@ watch(
   { immediate: true }
 )
 
+watch(
+  [() => props.availableApiFormats, () => props.open, () => props.editingKey],
+  ([, open, editingKey]) => {
+    if (!open) {
+      return
+    }
+
+    const filtered = filterAvailableApiFormats(form.value.api_formats)
+    if (filtered.length !== form.value.api_formats.length) {
+      form.value.api_formats = [...filtered]
+      return
+    }
+
+    if (!editingKey && form.value.api_formats.length === 0) {
+      const defaults = getDefaultApiFormats()
+      if (defaults.length > 0) {
+        form.value.api_formats = defaults
+      }
+    }
+  },
+  { deep: true, immediate: true }
+)
+
 // 加载能力列表
 async function loadCapabilities() {
   try {
@@ -540,7 +589,7 @@ function resetForm() {
     api_key: '',
     auth_type: defaultAuthType,
     auth_config_text: '',
-    api_formats: [],  // 默认不选中任何格式
+    api_formats: getDefaultApiFormats(),
     rate_multipliers: {},
     internal_priority: 10,
     rpm_limit: undefined,
@@ -573,7 +622,7 @@ function loadKeyData() {
     auth_type: props.editingKey.auth_type === 'service_account' ? 'service_account' : 'api_key',
     auth_config_text: '',  // auth_config 不返回给前端，编辑时需要重新输入
     api_formats: props.editingKey.api_formats?.length > 0
-      ? [...props.editingKey.api_formats]
+      ? filterAvailableApiFormats(props.editingKey.api_formats)
       : [],  // 编辑模式下保持原有选择，不默认全选
     rate_multipliers: { ...(props.editingKey.rate_multipliers || {}) },
     internal_priority: props.editingKey.internal_priority ?? 10,

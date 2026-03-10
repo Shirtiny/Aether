@@ -41,8 +41,8 @@ class AdminQuotaUsageAdapter(AdminApiAdapter):
 
         result = []
         for provider in providers:
-            quota = provider.monthly_quota_usd or 0.0
-            used = float(provider.monthly_used_usd or 0.0)
+            quota = float(provider.monthly_quota_usd or 0)
+            used = float(provider.monthly_used_usd or 0)
             remaining = max(quota - used, 0.0)
             usage_percent = round((used / quota) * 100, 2) if quota > 0 else 0.0
 

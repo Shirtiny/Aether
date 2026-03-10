@@ -23,6 +23,9 @@
           <li>
             API Keys: {{ importPreview.providers?.reduce((sum: number, p: { api_keys?: unknown[] }) => sum + (p.api_keys?.length || 0), 0) }} 个
           </li>
+          <li v-if="importPreview.proxy_nodes?.length">
+            代理节点: {{ importPreview.proxy_nodes.length }} 个
+          </li>
           <li v-if="importPreview.ldap_config">
             LDAP 配置: 1 个
           </li>
@@ -167,6 +170,16 @@
             创建: {{ importResult.stats.oauth.created }},
             更新: {{ importResult.stats.oauth.updated }},
             跳过: {{ importResult.stats.oauth.skipped }}
+          </p>
+        </div>
+        <div v-if="importResult.stats.proxy_nodes">
+          <p class="font-medium">
+            代理节点
+          </p>
+          <p class="text-muted-foreground">
+            创建: {{ importResult.stats.proxy_nodes.created }},
+            更新: {{ importResult.stats.proxy_nodes.updated }},
+            跳过: {{ importResult.stats.proxy_nodes.skipped }}
           </p>
         </div>
       </div>

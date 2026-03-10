@@ -24,6 +24,7 @@ from src.models.database import Provider
 from src.services.provider_ops.architectures import ProviderConnector
 from src.services.provider_ops.registry import get_registry
 from src.services.provider_ops.types import (
+    SENSITIVE_CREDENTIAL_FIELDS,
     ActionResult,
     ActionStatus,
     BalanceInfo,
@@ -42,6 +43,9 @@ AUTH_FAILED_CACHE_TTL = 60
 # 后台余额刷新并发限制（避免启动时耗尽连接池）
 # 使用较小的值（3）确保不会对连接池造成过大压力
 _balance_refresh_semaphore: asyncio.Semaphore | None = None
+
+# 正在异步刷新余额的 provider 集合（per-provider 防重入）
+_refreshing_providers: set[str] = set()
 
 
 def _get_balance_refresh_semaphore() -> asyncio.Semaphore:
@@ -94,17 +98,7 @@ class ProviderOpsService:
     """
 
     # 凭据中需要加密的字段
-    SENSITIVE_FIELDS = {
-        "api_key",
-        "password",
-        "refresh_token",
-        "session_token",
-        "session_cookie",
-        "token_cookie",
-        "auth_cookie",
-        "cookie_string",
-        "cookie",
-    }
+    SENSITIVE_FIELDS = SENSITIVE_CREDENTIAL_FIELDS
 
     def __init__(self, db: Session):
         self.db = db
@@ -520,7 +514,14 @@ class ProviderOpsService:
         避免长时间占用连接池资源。
 
         使用信号量限制并发数，避免启动时多个刷新任务同时运行导致连接池耗尽。
+        使用 _refreshing_providers 集合防止同一 provider 被并发刷新。
         """
+        # per-provider 防重入
+        if provider_id in _refreshing_providers:
+            logger.debug("异步刷新余额跳过（已在刷新中）: provider_id={}", provider_id)
+            return
+        _refreshing_providers.add(provider_id)
+
         semaphore = _get_balance_refresh_semaphore()
 
         # 尝试获取信号量，如果无法立即获取则跳过本次刷新
@@ -530,6 +531,7 @@ class ProviderOpsService:
             await asyncio.wait_for(semaphore.acquire(), timeout=5.0)
         except asyncio.TimeoutError:
             logger.debug("异步刷新余额跳过（并发限制）: provider_id={}", provider_id)
+            _refreshing_providers.discard(provider_id)
             return
 
         db = None
@@ -547,8 +549,9 @@ class ProviderOpsService:
                     db.close()
                 except Exception:
                     pass
-            # 释放信号量
+            # 释放信号量并移除防重入标记
             semaphore.release()
+            _refreshing_providers.discard(provider_id)
 
     async def _clear_balance_cache(self, provider_id: str) -> None:
         """清除余额缓存"""

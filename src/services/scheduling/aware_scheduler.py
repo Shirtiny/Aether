@@ -476,18 +476,10 @@ class CacheAwareScheduler:
         release_db_connection_before_await(db)
 
         logger.debug(
-            "[Scheduler] Found {} active providers",
+            "[Scheduler] Found {} active providers: {}",
             len(providers),
+            ", ".join(p.name for p in providers),
         )
-        for p in providers:
-            logger.debug(
-                "[Scheduler] Provider: id={}, name={}, is_active={}, endpoints={}, models={}",
-                p.id[:8] if p.id else "N/A",
-                p.name,
-                p.is_active,
-                len(p.endpoints) if p.endpoints else 0,
-                len(p.models) if p.models else 0,
-            )
 
         if not providers:
             return [], global_model_id, queried_provider_count
@@ -575,6 +567,9 @@ class CacheAwareScheduler:
         candidates = self._candidate_sorter._apply_priority_mode_sort(
             candidates, db, affinity_key, api_format
         )
+
+        # 排序完成后释放 DB 连接，避免后续 Redis 操作期间占用连接
+        release_db_connection_before_await(db)
 
         # 2. 调度模式排序
         if self.scheduling_mode == self.SCHEDULING_MODE_CACHE_AFFINITY:

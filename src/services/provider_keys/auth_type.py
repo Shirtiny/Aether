@@ -2,6 +2,10 @@
 Provider Key 认证类型相关规则。
 """
 
+# 数据库中所有属于 OAuth 的 auth_type 值（含历史别名）。
+# 新增 OAuth 类型时只需在此追加，SQL 过滤和 Python 判断均引用此常量。
+OAUTH_AUTH_TYPES: tuple[str, ...] = ("oauth", "kiro")
+
 
 def normalize_auth_type(raw: str) -> str:
     """将数据库中的 auth_type 归一化为逻辑类型。

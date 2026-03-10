@@ -8,12 +8,11 @@ from __future__ import annotations
 
 from typing import Any
 
-import httpx
 from fastapi import Request
 
 from src.api.handlers.base.cli_adapter_base import CliAdapterBase, register_cli_adapter
 from src.api.handlers.base.cli_handler_base import CliMessageHandlerBase
-from src.api.handlers.gemini.adapter import GeminiCapabilityDetector, GeminiChatAdapter
+from src.api.handlers.gemini.adapter import GeminiCapabilityDetector
 from src.config.settings import config
 from src.core.api_format import ApiFamily, get_auth_handler
 from src.core.api_format.enums import AuthMethod
@@ -29,7 +28,6 @@ class GeminiCliAdapter(CliAdapterBase):
 
     FORMAT_ID = "gemini:cli"
     API_FAMILY = ApiFamily.GEMINI
-    BILLING_TEMPLATE = "gemini"  # 使用 Gemini 计费模板
     name = "gemini.cli"
 
     @property
@@ -118,29 +116,6 @@ class GeminiCliAdapter(CliAdapterBase):
             "system_instruction_present": bool(payload.get("system_instruction")),
             "safety_settings_count": len(payload.get("safety_settings") or []),
         }
-
-    # =========================================================================
-    # 模型列表查询
-    # =========================================================================
-
-    @classmethod
-    async def fetch_models(
-        cls,
-        client: httpx.AsyncClient,
-        base_url: str,
-        api_key: str,
-        extra_headers: dict[str, str] | None = None,
-    ) -> tuple[list, str | None]:
-        """查询 Gemini API 支持的模型列表（带 CLI User-Agent）"""
-        # 复用 GeminiChatAdapter 的实现，添加 CLI User-Agent
-        cli_headers = {"User-Agent": config.internal_user_agent_gemini_cli}
-        if extra_headers:
-            cli_headers.update(extra_headers)
-        models, error = await GeminiChatAdapter.fetch_models(client, base_url, api_key, cli_headers)
-        # 更新 api_format 为 CLI 格式
-        for m in models:
-            m["api_format"] = cls.FORMAT_ID
-        return models, error
 
     @classmethod
     def build_endpoint_url(

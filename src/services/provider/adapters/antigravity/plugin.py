@@ -1,11 +1,11 @@
 """Antigravity provider plugin — 统一注册入口。
 
-将 Antigravity 对各通用 registry 的注册集中在一个文件中：
+将 Antigravity 对各通用 registry / capability registry 的注册集中在一个文件中：
 - Envelope (v1internal 信封)
 - Transport Hook (URL 构建)
 - Auth Enricher (OAuth enrichment)
 - Model Fetcher (模型获取)
-- Behavior Variants (格式变体)
+- Provider Format Capability（跨格式变体）
 
 新增 provider 时参照此文件创建对应的 plugin.py 即可。
 """
@@ -353,10 +353,10 @@ def antigravity_export_builder(
 
 def register_all() -> None:
     """一次性注册 Antigravity 的所有 hooks 到各通用 registry。"""
+    from src.core.api_format.capabilities import register_provider_behavior_variant
     from src.core.provider_oauth_utils import register_auth_enricher
     from src.services.model.upstream_fetcher import UpstreamModelsFetcherRegistry
     from src.services.provider.adapters.antigravity.envelope import antigravity_v1internal_envelope
-    from src.services.provider.behavior import register_behavior_variant
     from src.services.provider.envelope import register_envelope
     from src.services.provider.export import register_export_builder
     from src.services.provider.transport import register_transport_hook
@@ -384,5 +384,5 @@ def register_all() -> None:
         fetcher=fetch_models_antigravity,
     )
 
-    # Behavior
-    register_behavior_variant("antigravity", cross_format=True)
+    # Provider Format Capability
+    register_provider_behavior_variant("antigravity", cross_format=True)

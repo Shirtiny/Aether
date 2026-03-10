@@ -392,56 +392,67 @@ class StreamTelemetryRecorder:
         if not ctx.attempt_id:
             return
 
-        from src.services.request.candidate import RequestCandidateService
+        # Capture all needed ctx attrs before handing off to thread
+        attempt_id = ctx.attempt_id
+        is_success = ctx.is_success()
+        is_disconnected = ctx.is_client_disconnected()
+        status_code = ctx.status_code
+        data_count = ctx.data_count
+        rectified = ctx.rectified
+        proxy_info = ctx.proxy_info
+        first_byte_time_ms_val = ctx.first_byte_time_ms
+        upstream_response = ctx.upstream_response
+        error_message = ctx.error_message
 
-        extra_data: dict[str, Any] = {
-            "stream_completed": ctx.is_success(),
-            "data_count": ctx.data_count,
-        }
-        if ctx.rectified:
-            extra_data["rectified"] = True
-        if ctx.proxy_info:
-            extra_data["proxy"] = ctx.proxy_info
-        if ctx.first_byte_time_ms is not None:
-            # 计算候选自身的 TTFB
-            first_byte_time_ms = RequestCandidateService.calculate_candidate_ttfb(
-                db=db,
-                candidate_id=ctx.attempt_id,
-                request_start_time=request_start_time,
-                global_first_byte_time_ms=ctx.first_byte_time_ms,
-            )
-            extra_data["first_byte_time_ms"] = first_byte_time_ms
+        def _sync() -> None:
+            from src.services.request.candidate import RequestCandidateService
 
-        if ctx.is_success():
-            RequestCandidateService.mark_candidate_success(
-                db=db,
-                candidate_id=ctx.attempt_id,
-                status_code=ctx.status_code,
-                latency_ms=response_time_ms,
-                extra_data=extra_data,
-            )
-        elif ctx.is_client_disconnected():
-            RequestCandidateService.mark_candidate_cancelled(
-                db=db,
-                candidate_id=ctx.attempt_id,
-                status_code=ctx.status_code,
-                latency_ms=response_time_ms,
-                extra_data=extra_data,
-            )
-        else:
-            # 请求链路追踪使用 upstream_response（原始响应），回退到 error_message（友好消息）
-            trace_error_message = (
-                ctx.upstream_response or ctx.error_message or f"HTTP {ctx.status_code}"
-            )
-            RequestCandidateService.mark_candidate_failed(
-                db=db,
-                candidate_id=ctx.attempt_id,
-                error_type="stream_error",
-                error_message=trace_error_message,
-                status_code=ctx.status_code,
-                latency_ms=response_time_ms,
-                extra_data=extra_data,
-            )
+            extra_data: dict[str, Any] = {
+                "stream_completed": is_success,
+                "data_count": data_count,
+            }
+            if rectified:
+                extra_data["rectified"] = True
+            if proxy_info:
+                extra_data["proxy"] = proxy_info
+            if first_byte_time_ms_val is not None:
+                candidate_ttfb = RequestCandidateService.calculate_candidate_ttfb(
+                    db=db,
+                    candidate_id=attempt_id,
+                    request_start_time=request_start_time,
+                    global_first_byte_time_ms=first_byte_time_ms_val,
+                )
+                extra_data["first_byte_time_ms"] = candidate_ttfb
+
+            if is_success:
+                RequestCandidateService.mark_candidate_success(
+                    db=db,
+                    candidate_id=attempt_id,
+                    status_code=status_code,
+                    latency_ms=response_time_ms,
+                    extra_data=extra_data,
+                )
+            elif is_disconnected:
+                RequestCandidateService.mark_candidate_cancelled(
+                    db=db,
+                    candidate_id=attempt_id,
+                    status_code=status_code,
+                    latency_ms=response_time_ms,
+                    extra_data=extra_data,
+                )
+            else:
+                trace_error_message = upstream_response or error_message or f"HTTP {status_code}"
+                RequestCandidateService.mark_candidate_failed(
+                    db=db,
+                    candidate_id=attempt_id,
+                    error_type="stream_error",
+                    error_message=trace_error_message,
+                    status_code=status_code,
+                    latency_ms=response_time_ms,
+                    extra_data=extra_data,
+                )
+
+        await asyncio.to_thread(_sync)
 
     async def _update_usage_status_on_error(
         self,
@@ -474,10 +485,12 @@ class StreamTelemetryRecorder:
         error_message: str | None = None,
     ) -> None:
         """直接更新 Usage 表的状态字段"""
-        try:
+        request_id = self.request_id
+
+        def _sync() -> None:
             from src.models.database import Usage
 
-            usage = db.query(Usage).filter(Usage.request_id == self.request_id).first()
+            usage = db.query(Usage).filter(Usage.request_id == request_id).first()
             if usage:
                 setattr(usage, "status", status)
                 setattr(usage, "status_code", status_code)
@@ -485,7 +498,10 @@ class StreamTelemetryRecorder:
                 if error_message:
                     setattr(usage, "error_message", error_message)
                 db.commit()
-                logger.debug(f"[{self.request_id}] Usage 状态已更新: {status}")
+                logger.debug(f"[{request_id}] Usage 状态已更新: {status}")
+
+        try:
+            await asyncio.to_thread(_sync)
         except Exception as e:
             logger.error(f"[{self.request_id}] 直接更新 Usage 状态失败: {e}")
 

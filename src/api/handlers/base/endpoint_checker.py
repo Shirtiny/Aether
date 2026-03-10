@@ -74,6 +74,7 @@ async def run_endpoint_check(
     user: Any | None = None,  # User对象
     proxy_config: dict[str, Any] | None = None,  # 原始代理配置（支持 tunnel 模式）
     is_stream: bool | None = None,  # 显式流式标记（优先于 body/url 推断）
+    timeout: float | None = None,
 ) -> dict[str, Any]:
     """
     执行端点检查（重构版本，使用新的架构）：
@@ -97,6 +98,7 @@ async def run_endpoint_check(
         request_id=str(uuid.uuid4())[:8],
         proxy_config=proxy_config,
         is_stream=is_stream,
+        timeout=float(timeout) if timeout is not None else 30.0,
     )
 
     # 使用协调器执行检查
@@ -427,7 +429,7 @@ def _extract_tokens_from_response(
 
             # 尝试提取cache creation tokens
             try:
-                from src.api.handlers.base.utils import extract_cache_creation_tokens
+                from src.core.usage_tokens import extract_cache_creation_tokens
 
                 cache_creation_input_tokens = extract_cache_creation_tokens(usage_info)
             except Exception as e:
@@ -458,7 +460,7 @@ def _extract_tokens_from_response(
             output_tokens = usage_info.get("output_tokens", 0)
             cache_read_input_tokens = usage_info.get("cache_read_input_tokens", 0)
             try:
-                from src.api.handlers.base.utils import extract_cache_creation_tokens
+                from src.core.usage_tokens import extract_cache_creation_tokens
 
                 cache_creation_input_tokens = extract_cache_creation_tokens(usage_info)
             except Exception as e:
@@ -595,6 +597,7 @@ class HttpRequestExecutor:
         """执行HTTP请求（支持流式和非流式响应）"""
         start_time = time.time()
         request_id = request.request_id or str(uuid.uuid4())[:8]
+        effective_timeout = float(request.timeout if request.timeout is not None else self.timeout)
 
         # 检查是否是流式请求（优先显式参数，其次 body，最后 URL 推断）
         if request.is_stream is not None:
@@ -618,7 +621,7 @@ class HttpRequestExecutor:
 
             # 统一通过 build_proxy_client_kwargs 构建（支持 tunnel 模式 + 普通代理 + 系统默认回退）
             client_kwargs = build_proxy_client_kwargs(
-                proxy_config=request.proxy_config, timeout=self.timeout
+                proxy_config=request.proxy_config, timeout=effective_timeout
             )
 
             async with httpx.AsyncClient(**client_kwargs) as client:

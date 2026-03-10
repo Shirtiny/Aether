@@ -15,6 +15,65 @@ from src.models.database import RequestCandidate, Usage
 class UsageActiveRequestsMixin:
     """活跃请求管理方法"""
 
+    @staticmethod
+    def _find_completed_request_ids(
+        db: Session,
+        request_ids: list[str],
+    ) -> set[str]:
+        """查询已成功完成的 request_id 集合
+
+        通过 RequestCandidate 表判断哪些请求实际已成功完成：
+        1. status='success' 且 stream_completed=True（正常完成）
+        2. status='streaming'（Provider 已返回成功响应头，流因重启中断）
+        """
+        if not request_ids:
+            return set()
+
+        from sqlalchemy import or_
+
+        candidates = (
+            db.query(
+                RequestCandidate.request_id,
+                RequestCandidate.status,
+                RequestCandidate.extra_data,
+            )
+            .filter(
+                RequestCandidate.request_id.in_(request_ids),
+                or_(
+                    RequestCandidate.status == "success",
+                    RequestCandidate.status == "streaming",
+                ),
+            )
+            .all()
+        )
+        completed: set[str] = set()
+        for c in candidates:
+            extra_data = c.extra_data or {}
+            if c.status == "success" and extra_data.get("stream_completed", False):
+                completed.add(c.request_id)
+            elif c.status == "streaming":
+                completed.add(c.request_id)
+        return completed
+
+    @staticmethod
+    def _sync_candidate_status_to_success(
+        db: Session,
+        request_ids: list[str],
+        now: datetime | None = None,
+    ) -> None:
+        """将指定请求的 streaming candidate 同步更新为 success"""
+        if not request_ids:
+            return
+        if now is None:
+            now = datetime.now(timezone.utc)
+        db.query(RequestCandidate).filter(
+            RequestCandidate.request_id.in_(request_ids),
+            RequestCandidate.status == "streaming",
+        ).update(
+            {"status": "success", "finished_at": now},
+            synchronize_session=False,
+        )
+
     @classmethod
     def get_active_requests(
         cls,
@@ -49,8 +108,9 @@ class UsageActiveRequestsMixin:
         """
         清理超时的 pending/streaming 请求
 
-        将超过指定时间仍处于 pending 或 streaming 状态的请求标记为 failed。
-        这些请求可能是由于网络问题、服务重启或其他异常导致未能正常完成。
+        将超过指定时间仍处于 pending 或 streaming 状态的请求标记为 failed 或恢复为 completed。
+        会检查 RequestCandidate 表，如果 Provider 已返回成功响应（status=streaming 或 stream_completed），
+        则恢复为 completed 而非标记为 failed，同时同步更新 candidate 状态。
 
         Args:
             db: 数据库会话
@@ -59,7 +119,8 @@ class UsageActiveRequestsMixin:
         Returns:
             清理的记录数
         """
-        cutoff_time = datetime.now(timezone.utc) - timedelta(minutes=timeout_minutes)
+        now = datetime.now(timezone.utc)
+        cutoff_time = now - timedelta(minutes=timeout_minutes)
 
         # 查找超时的请求
         stale_requests = (
@@ -71,21 +132,69 @@ class UsageActiveRequestsMixin:
             .all()
         )
 
-        count = 0
+        if not stale_requests:
+            return 0
+
+        # 收集所有超时请求的 request_id，查询哪些实际已成功完成
+        stale_request_ids = [u.request_id for u in stale_requests if u.request_id]
+        completed_request_ids = cls._find_completed_request_ids(db, stale_request_ids)
+
+        failed_count = 0
+        recovered_count = 0
+
         for usage in stale_requests:
             old_status = usage.status
-            usage.status = "failed"
-            usage.error_message = f"请求超时: 状态 '{old_status}' 超过 {timeout_minutes} 分钟未完成"
-            usage.status_code = 504  # Gateway Timeout
-            count += 1
+            if usage.request_id and usage.request_id in completed_request_ids:
+                # Provider 已返回成功，恢复为 completed
+                usage.status = "completed"
+                usage.status_code = 200
+                usage.error_message = None
+                recovered_count += 1
+            else:
+                # 无成功 candidate，标记为 failed
+                usage.status = "failed"
+                usage.error_message = (
+                    f"请求超时: 状态 '{old_status}' 超过 {timeout_minutes} 分钟未完成"
+                )
+                usage.status_code = 504
+                failed_count += 1
 
-        if count > 0:
-            db.commit()
-            logger.info(
-                f"清理超时请求: 将 {count} 条超过 {timeout_minutes} 分钟的 pending/streaming 请求标记为 failed"
+        # 同步更新成功请求的 candidate 状态：streaming -> success
+        cls._sync_candidate_status_to_success(db, list(completed_request_ids), now)
+
+        # 同步更新失败请求的 candidate 状态：streaming/pending -> failed
+        failed_request_ids = [
+            u.request_id
+            for u in stale_requests
+            if u.request_id and u.request_id not in completed_request_ids
+        ]
+        if failed_request_ids:
+            db.query(RequestCandidate).filter(
+                RequestCandidate.request_id.in_(failed_request_ids),
+                RequestCandidate.status.in_(["streaming", "pending"]),
+            ).update(
+                {
+                    "status": "failed",
+                    "finished_at": now,
+                    "error_message": "请求超时（服务器可能已重启）",
+                },
+                synchronize_session=False,
             )
 
-        return count
+        total = failed_count + recovered_count
+        if total > 0:
+            db.commit()
+            parts = []
+            if failed_count:
+                parts.append(f"{failed_count} 条标记为 failed")
+            if recovered_count:
+                parts.append(f"{recovered_count} 条恢复为 completed")
+            logger.info(
+                f"清理超时请求: 超过 {timeout_minutes} 分钟的 pending/streaming 请求 - "
+                + ", ".join(parts)
+            )
+
+        return total
 
     @classmethod
     def get_stale_pending_count(
@@ -210,8 +319,6 @@ class UsageActiveRequestsMixin:
         # 批量更新超时的请求（排除已有成功完成记录的请求）
         timeout_ids = []
         if timeout_candidates:
-            # 检查 RequestCandidate 表是否有成功完成的记录
-            # 如果流已经成功完成（stream_completed: true），不应该标记为超时
             # 先获取这些 Usage 的 request_id
             usage_request_ids = (
                 db.query(Usage.id, Usage.request_id).filter(Usage.id.in_(timeout_candidates)).all()
@@ -220,47 +327,13 @@ class UsageActiveRequestsMixin:
             request_id_to_usage_id = {u.request_id: u.id for u in usage_request_ids}
             request_ids = list(request_id_to_usage_id.keys())
 
-            # 查询这些请求中已有成功完成记录的 request_id
-            # 包括两种情况：
-            # 1. status='success' 且 stream_completed=True（正常完成）
-            # 2. status='streaming' 且 status_code=200（流传输中但 Provider 已返回 200，可能是服务重启导致回调丢失）
-            completed_usage_ids = set()
-            if request_ids:
-                from sqlalchemy import or_
-
-                candidates = (
-                    db.query(
-                        RequestCandidate.request_id,
-                        RequestCandidate.status,
-                        RequestCandidate.status_code,
-                        RequestCandidate.extra_data,
-                    )
-                    .filter(
-                        RequestCandidate.request_id.in_(request_ids),
-                        or_(
-                            RequestCandidate.status == "success",
-                            # streaming 状态且 status_code=200，说明 Provider 响应成功
-                            # 但流传输可能因服务重启而中断
-                            (RequestCandidate.status == "streaming")
-                            & (RequestCandidate.status_code == 200),
-                        ),
-                    )
-                    .all()
-                )
-                for candidate in candidates:
-                    extra_data = candidate.extra_data or {}
-                    # 情况1：status='success' 且 stream_completed=True
-                    if candidate.status == "success" and extra_data.get("stream_completed", False):
-                        usage_id = request_id_to_usage_id.get(candidate.request_id)
-                        if usage_id:
-                            completed_usage_ids.add(usage_id)
-                    # 情况2：status='streaming' 且 status_code=200
-                    # 这表示 Provider 返回了 200，但流传输可能因服务重启而未正常结束
-                    # 此时应该恢复为 completed 而不是标记为 failed
-                    elif candidate.status == "streaming" and candidate.status_code == 200:
-                        usage_id = request_id_to_usage_id.get(candidate.request_id)
-                        if usage_id:
-                            completed_usage_ids.add(usage_id)
+            # 查询已成功完成的 request_id
+            completed_rids = cls._find_completed_request_ids(db, request_ids)
+            completed_usage_ids = {
+                request_id_to_usage_id[rid]
+                for rid in completed_rids
+                if rid in request_id_to_usage_id
+            }
 
             # 只对没有成功完成记录的请求标记超时
             timeout_ids = [uid for uid in timeout_candidates if uid not in completed_usage_ids]
@@ -273,12 +346,18 @@ class UsageActiveRequestsMixin:
                 db.commit()
 
             # 对于已完成但状态未更新的请求，主动恢复状态为 completed
-            # 这处理了遥测回调丢失的情况（例如服务重启、后台任务未执行等）
             if completed_usage_ids:
                 db.query(Usage).filter(Usage.id.in_(list(completed_usage_ids))).update(
                     {"status": "completed"},
                     synchronize_session=False,
                 )
+                # 同步更新 candidate 状态：streaming -> success
+                completed_request_ids = [
+                    usage_id_to_request_id[uid]
+                    for uid in completed_usage_ids
+                    if uid in usage_id_to_request_id
+                ]
+                cls._sync_candidate_status_to_success(db, completed_request_ids)
                 db.commit()
                 logger.info(
                     f"[Usage] 恢复 {len(completed_usage_ids)} 个已完成请求的状态（遥测回调丢失）"

@@ -44,6 +44,7 @@ const listLoading = ref(false)
 const tableKeyword = ref('')
 const matchedUserId = ref<string | null>(null)
 const clearingRowAffinityKey = ref<string | null>(null)
+const clearingAllAffinity = ref(false)
 const currentPage = ref(1)
 const pageSize = ref(20)
 const currentTime = ref(Math.floor(Date.now() / 1000))
@@ -203,6 +204,7 @@ async function clearAllCache() {
   })
   if (!secondConfirm) return
 
+  clearingAllAffinity.value = true
   try {
     await cacheApi.clearAllCache()
     showSuccess('已清除所有缓存')
@@ -211,6 +213,8 @@ async function clearAllCache() {
   } catch (error) {
     showError('清除失败')
     log.error('清除所有缓存失败', error)
+  } finally {
+    clearingAllAffinity.value = false
   }
 }
 
@@ -571,6 +575,7 @@ onBeforeUnmount(() => {
               variant="ghost"
               size="icon"
               class="h-8 w-8 text-muted-foreground/70 hover:text-destructive"
+              :disabled="clearingAllAffinity"
               title="清除全部缓存"
               @click="clearAllCache"
             >

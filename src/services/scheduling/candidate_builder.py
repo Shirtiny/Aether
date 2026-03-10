@@ -97,7 +97,18 @@ class CandidateBuilder:
             db.query(Provider)
             .options(
                 # 预加载 Provider 级别的 api_keys
-                selectinload(Provider.api_keys),
+                # defer 排除仅后台管理/模型获取用的冷字段，热路径字段全部加载
+                selectinload(Provider.api_keys)
+                .defer(ProviderAPIKey.note)
+                .defer(ProviderAPIKey.last_error_msg)
+                .defer(ProviderAPIKey.auto_fetch_models)
+                .defer(ProviderAPIKey.locked_models)
+                .defer(ProviderAPIKey.model_include_patterns)
+                .defer(ProviderAPIKey.model_exclude_patterns)
+                .defer(ProviderAPIKey.last_models_fetch_at)
+                .defer(ProviderAPIKey.last_models_fetch_error)
+                .defer(ProviderAPIKey.max_probe_interval_minutes)
+                .defer(ProviderAPIKey.expires_at),
                 # 预加载 endpoints（用于按 api_format 选择请求配置）
                 selectinload(Provider.endpoints),
                 # 同时加载 models 和 global_model 关系
@@ -425,11 +436,6 @@ class CandidateBuilder:
             allowed_kinds = {client_kind}
 
         for provider in providers:
-            logger.debug(
-                "[Scheduler] Checking provider: {}, endpoints={}",
-                provider.name,
-                len(provider.endpoints) if provider.endpoints else 0,
-            )
             # 按端点格式分别判断兼容性与模型/Key 可用性：
             # - 同格式端点优先（needs_conversion=False）
             # - 跨格式端点次之（needs_conversion=True）
@@ -487,15 +493,7 @@ class CandidateBuilder:
             )
 
             for endpoint in endpoints:
-                logger.debug(
-                    "[Scheduler] Checking endpoint: family={}, kind={}, is_active={}, base_url={}",
-                    getattr(endpoint, "api_family", None),
-                    getattr(endpoint, "endpoint_kind", None),
-                    getattr(endpoint, "is_active", None),
-                    (endpoint.base_url[:50] if endpoint.base_url else "N/A"),
-                )
                 if not endpoint.is_active:
-                    logger.debug("[Scheduler] Endpoint skipped: not active")
                     continue
 
                 endpoint_format_str = make_signature_key(
@@ -520,17 +518,6 @@ class CandidateBuilder:
                     global_conversion_enabled,
                     skip_endpoint_check=skip_endpoint_check,
                 )
-                logger.debug(
-                    "[Scheduler] Format compatibility: client={}, endpoint={}, compatible={}, "
-                    "global={}, provider={}, skip_endpoint={}, reason={}",
-                    client_format_str,
-                    endpoint_format_str,
-                    is_compatible,
-                    global_conversion_enabled,
-                    provider_conversion_enabled,
-                    skip_endpoint_check,
-                    _compat_reason,
-                )
                 if not is_compatible:
                     continue
 
@@ -547,21 +534,7 @@ class CandidateBuilder:
                 supports_model, skip_reason, _model_caps, provider_model_names = (
                     model_support_cache[endpoint_format_str]
                 )
-                logger.debug(
-                    "[Scheduler] Model support: provider={}, model={}, supports={}, reason={}",
-                    provider.name,
-                    model_name,
-                    supports_model,
-                    skip_reason,
-                )
                 if not supports_model:
-                    logger.debug(
-                        "Provider {} 端点 {} 不支持模型 {}: {}",
-                        provider.name,
-                        endpoint_format_str,
-                        model_name,
-                        skip_reason,
-                    )
                     continue
 
                 # Key 直属 Provider，通过 api_formats 按端点格式筛选
@@ -590,33 +563,13 @@ class CandidateBuilder:
                 )
 
                 if pool_cfg is not None:
-                    # 号池 Provider 仅构建一个 PoolCandidate，内部 key 选择延迟到执行阶段。
-                    pool_keys: list[ProviderAPIKey] = []
-                    pool_miss_counts: list[int] = []
-                    pool_mapping: dict[str, str | None] = {}
-                    for key in keys_to_check:
-                        is_available, _key_skip_reason, mapping_matched_model = (
-                            self._check_key_availability(
-                                key,
-                                endpoint_format_str,
-                                model_name,
-                                capability_requirements,
-                                model_mappings=model_mappings,
-                                candidate_models=provider_model_names,
-                                provider_type=getattr(provider, "provider_type", None),
-                            )
-                        )
-                        if not is_available:
-                            continue
+                    # 号池优化：跳过逐 key 的 _check_key_availability 检查，
+                    # 直接收集全部 active key，将检查推迟到 PoolManager 排序后分页执行。
+                    # 在此释放 DB 连接，因为后续的 PoolManager 排序涉及大量 Redis 操作，
+                    # 避免在 Redis I/O 期间长时间占用 DB 连接池。
+                    release_db_connection_before_await(db)
 
-                        pool_keys.append(key)
-                        pool_miss_counts.append(
-                            compute_capability_score(
-                                key.capabilities or {},
-                                capability_requirements,
-                            )
-                        )
-                        pool_mapping[str(key.id)] = mapping_matched_model
+                    pool_keys = list(keys_to_check)
 
                     if not pool_keys:
                         continue
@@ -646,20 +599,21 @@ class CandidateBuilder:
                         pool_keys=pool_keys,
                         pool_config=pool_cfg,
                         pool_priority=pool_priority,
-                        mapping_matched_model=pool_mapping.get(str(pool_keys[0].id)),
                         needs_conversion=needs_conversion,
                         provider_api_format=str(endpoint_format_str or ""),
                         output_limit=output_limit,
-                        capability_miss_count=min(pool_miss_counts) if pool_miss_counts else 0,
+                        capability_miss_count=0,
                     )
 
-                    # 在 key 对象上附加映射结果，供 PoolCandidate 运行时切 key 后同步模型名。
-                    for pool_key in pool_keys:
-                        setattr(
-                            pool_key,
-                            "_pool_mapping_matched_model",
-                            pool_mapping.get(str(pool_key.id)),
-                        )
+                    # 打包延迟检查参数，供 PoolManager 排序后分页调用
+                    pool_candidate._deferred_check_params = {
+                        "endpoint_format": endpoint_format_str,
+                        "model_name": model_name,
+                        "capability_requirements": capability_requirements,
+                        "model_mappings": model_mappings,
+                        "candidate_models": provider_model_names,
+                        "provider_type": getattr(provider, "provider_type", None),
+                    }
 
                     if needs_conversion:
                         convertible_candidates.append(pool_candidate)

@@ -12,14 +12,14 @@ from typing import Any
 import httpx
 from sqlalchemy.orm import Session
 
-from src.api.handlers.base.request_builder import get_provider_auth
 from src.core.crypto import crypto_service
 from src.models.database import Provider, ProviderAPIKey, ProviderEndpoint
-from src.services.provider_keys.auth_type import normalize_auth_type
+from src.services.provider.auth import get_provider_auth
 from src.services.provider.pool.account_state import (
     OAUTH_ACCOUNT_BLOCK_PREFIX,
     OAUTH_EXPIRED_PREFIX,
 )
+from src.services.provider_keys.auth_type import normalize_auth_type
 from src.services.provider_keys.codex_usage_parser import (
     parse_codex_usage_headers,
     parse_codex_wham_usage_response,
@@ -68,37 +68,42 @@ def _extract_error_message_from_response(response: httpx.Response) -> str:
 
 
 def _looks_like_token_invalidated(message: str | None) -> bool:
-    lowered = str(message or '').strip().lower()
-    return 'authentication token has been invalidated' in lowered or 'token has been invalidated' in lowered
+    lowered = str(message or "").strip().lower()
+    return (
+        "authentication token has been invalidated" in lowered
+        or "token has been invalidated" in lowered
+    )
 
 
 def _looks_like_account_deactivated(message: str | None) -> bool:
-    lowered = str(message or '').strip().lower()
-    return 'account has been deactivated' in lowered or 'account deactivated' in lowered
+    lowered = str(message or "").strip().lower()
+    return "account has been deactivated" in lowered or "account deactivated" in lowered
 
 
 def _looks_like_workspace_deactivated(message: str | None) -> bool:
-    lowered = str(message or '').strip().lower()
-    return 'deactivated_workspace' in lowered or ('workspace' in lowered and 'deactivated' in lowered)
+    lowered = str(message or "").strip().lower()
+    return "deactivated_workspace" in lowered or (
+        "workspace" in lowered and "deactivated" in lowered
+    )
 
 
 def _build_structured_invalid_reason(*, status_code: int, upstream_message: str | None) -> str:
-    message = str(upstream_message or '').strip()
+    message = str(upstream_message or "").strip()
 
     if status_code == 402 and _looks_like_workspace_deactivated(message):
-        return f'{OAUTH_ACCOUNT_BLOCK_PREFIX}工作区已停用 (deactivated_workspace)'
+        return f"{OAUTH_ACCOUNT_BLOCK_PREFIX}工作区已停用 (deactivated_workspace)"
 
     if _looks_like_account_deactivated(message):
-        detail = message or 'OpenAI 账号已停用'
-        return f'{OAUTH_ACCOUNT_BLOCK_PREFIX}{detail}'
+        detail = message or "OpenAI 账号已停用"
+        return f"{OAUTH_ACCOUNT_BLOCK_PREFIX}{detail}"
 
     if status_code == 401:
-        detail = message or 'Codex Token 无效或已过期 (401)'
-        return f'{OAUTH_EXPIRED_PREFIX}{detail}'
+        detail = message or "Codex Token 无效或已过期 (401)"
+        return f"{OAUTH_EXPIRED_PREFIX}{detail}"
 
     if status_code == 403:
-        detail = message or 'Codex 账户访问受限 (403)'
-        return f'{OAUTH_ACCOUNT_BLOCK_PREFIX}{detail}'
+        detail = message or "Codex 账户访问受限 (403)"
+        return f"{OAUTH_ACCOUNT_BLOCK_PREFIX}{detail}"
 
     return message
 
@@ -202,32 +207,32 @@ async def refresh_codex_key_quota(
 
         if status_code == 402:
             if _looks_like_workspace_deactivated(err_msg):
-                codex_meta = metadata_updates.get(key.id, {}).get('codex')
+                codex_meta = metadata_updates.get(key.id, {}).get("codex")
                 if not isinstance(codex_meta, dict):
                     codex_meta = {}
                 codex_meta = {
                     **codex_meta,
-                    'updated_at': int(time.time()),
-                    'account_disabled': True,
-                    'reason': 'deactivated_workspace',
-                    'message': err_msg or 'deactivated_workspace',
+                    "updated_at": int(time.time()),
+                    "account_disabled": True,
+                    "reason": "deactivated_workspace",
+                    "message": err_msg or "deactivated_workspace",
                 }
-                if oauth_plan_type and not codex_meta.get('plan_type'):
-                    codex_meta['plan_type'] = oauth_plan_type
-                metadata_updates[key.id] = {'codex': codex_meta}
+                if oauth_plan_type and not codex_meta.get("plan_type"):
+                    codex_meta["plan_type"] = oauth_plan_type
+                metadata_updates[key.id] = {"codex": codex_meta}
                 state_updates[key.id] = {
-                    'oauth_invalid_at': datetime.now(timezone.utc),
-                    'oauth_invalid_reason': _build_structured_invalid_reason(
+                    "oauth_invalid_at": datetime.now(timezone.utc),
+                    "oauth_invalid_reason": _build_structured_invalid_reason(
                         status_code=402,
                         upstream_message=err_msg,
                     ),
                 }
                 return {
-                    'key_id': key.id,
-                    'key_name': key.name,
-                    'status': 'workspace_deactivated',
-                    'message': f"wham/usage API 返回状态码 402{f': {err_msg}' if err_msg else ''}",
-                    'status_code': 402,
+                    "key_id": key.id,
+                    "key_name": key.name,
+                    "status": "workspace_deactivated",
+                    "message": f"wham/usage API 返回状态码 402{f': {err_msg}' if err_msg else ''}",
+                    "status_code": 402,
                 }
 
             if key.id not in metadata_updates:

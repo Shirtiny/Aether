@@ -543,23 +543,11 @@
                   >-</span>
                 </TableCell>
                 <TableCell class="py-3 px-2 align-middle">
-                  <div class="grid grid-rows-3 gap-0.5 w-[136px] mx-auto text-[10px] leading-4">
+                  <div class="w-[136px] mx-auto text-[10px] leading-4">
                     <div class="flex items-center justify-between gap-2">
                       <span class="text-muted-foreground">请求</span>
                       <span class="tabular-nums text-foreground/90">
                         {{ formatStatInteger(key.request_count) }}
-                      </span>
-                    </div>
-                    <div class="flex items-center justify-between gap-2">
-                      <span class="text-muted-foreground">Token</span>
-                      <span class="tabular-nums text-foreground/90">
-                        {{ formatTokenCount(key.total_tokens) }}
-                      </span>
-                    </div>
-                    <div class="flex items-center justify-between gap-2">
-                      <span class="text-muted-foreground">费用</span>
-                      <span class="tabular-nums text-foreground/90">
-                        {{ formatStatUsd(key.total_cost_usd) }}
                       </span>
                     </div>
                   </div>
@@ -924,18 +912,10 @@
                 <div class="text-muted-foreground mb-0.5">
                   统计
                 </div>
-                <div class="space-y-0.5 text-[10px]">
+                <div class="text-[10px]">
                   <div class="flex items-center justify-between gap-2">
                     <span class="text-muted-foreground">请求</span>
                     <span class="tabular-nums">{{ formatStatInteger(key.request_count) }}</span>
-                  </div>
-                  <div class="flex items-center justify-between gap-2">
-                    <span class="text-muted-foreground">Token</span>
-                    <span class="tabular-nums">{{ formatTokenCount(key.total_tokens) }}</span>
-                  </div>
-                  <div class="flex items-center justify-between gap-2">
-                    <span class="text-muted-foreground">费用</span>
-                    <span class="tabular-nums">{{ formatStatUsd(key.total_cost_usd) }}</span>
                   </div>
                 </div>
               </div>
@@ -1261,6 +1241,8 @@ const selectedProviderClaudeConfig = computed(() => {
   return (selectedProviderData.value as Record<string, unknown> | null)?.claude_code_advanced as ClaudeCodeAdvancedConfig | null ?? null
 })
 
+const DEFAULT_ENABLED_PRESETS = new Set(['cache_affinity', 'recent_refresh'])
+
 const DEFAULT_PRESET_LABELS: Record<string, string> = {
   lru: 'LRU',
   free_team_first: 'Free/Team',
@@ -1304,7 +1286,11 @@ const poolSchedulingLabel = computed(() => {
   }
 
   const cfg = selectedProviderConfig.value
-  const presets = Array.isArray(cfg?.scheduling_presets) ? cfg.scheduling_presets : []
+
+  // No pool_advanced config at all: use default enabled presets count
+  if (!cfg) return `${DEFAULT_ENABLED_PRESETS.size} 维度`
+
+  const presets = Array.isArray(cfg.scheduling_presets) ? cfg.scheduling_presets : []
   const presetLabels = presetLabelsByName.value
 
   if (presets.length > 0) {
@@ -1327,12 +1313,12 @@ const poolSchedulingLabel = computed(() => {
   }
 
   // Fallback: legacy scheduling_mode field
-  if (cfg?.scheduling_mode === 'multi_score') {
+  if (cfg.scheduling_mode === 'multi_score') {
     return '多维评分'
   }
 
-  const lruEnabled = cfg?.lru_enabled !== false
-  const stickyTtl = Number(cfg?.sticky_session_ttl_seconds ?? 3600)
+  const lruEnabled = cfg.lru_enabled !== false
+  const stickyTtl = Number(cfg.sticky_session_ttl_seconds ?? 3600)
   const stickyEnabled = Number.isFinite(stickyTtl) && stickyTtl > 0
 
   if (lruEnabled && stickyEnabled) return 'LRU + 粘性'
@@ -1885,7 +1871,13 @@ async function handleDeleteKey(key: PoolKeyDetail) {
   try {
     await deleteEndpointKey(key.key_id)
     success('账号已删除')
-    await loadKeys()
+    // 乐观更新：直接从本地列表移除，避免等待网络重载
+    keyPage.value.keys = keyPage.value.keys.filter(k => k.key_id !== key.key_id)
+    keyPage.value.total = Math.max(0, keyPage.value.total - 1)
+    // 当前页已空且不是第一页时，自动跳转到前一页
+    if (keyPage.value.keys.length === 0 && currentPage.value > 1) {
+      currentPage.value--
+    }
   } catch (err) {
     showError(parseApiError(err, '删除账号失败'))
   } finally {
@@ -2501,23 +2493,6 @@ function formatStatInteger(value: number | null | undefined): string {
   const n = Number(value ?? 0)
   if (!Number.isFinite(n) || n <= 0) return '0'
   return Math.round(n).toLocaleString('en-US')
-}
-
-function formatTokenCount(value: number | null | undefined): string {
-  const n = Number(value ?? 0)
-  if (!Number.isFinite(n) || n <= 0) return '0'
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`
-  return String(Math.round(n))
-}
-
-function formatStatUsd(value: number | null | undefined): string {
-  const n = Number(value ?? 0)
-  if (!Number.isFinite(n) || n <= 0) return '$0.00'
-  if (n < 0.01) return `$${n.toFixed(4)}`
-  if (n < 1) return `$${n.toFixed(3)}`
-  if (n < 1000) return `$${n.toFixed(2)}`
-  return `$${n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
 }
 
 function formatRelativeTime(isoStr: string): string {

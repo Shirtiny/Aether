@@ -5,17 +5,20 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 from fastapi import HTTPException, Request
+from fastapi.responses import JSONResponse
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
+from starlette.requests import ClientDisconnect
 
 from src.config.settings import config
 from src.core.enums import UserRole
-from src.core.exceptions import QuotaExceededException
+from src.core.exceptions import BalanceInsufficientException
 from src.core.logger import logger
 from src.models.database import ApiKey, AuditEventType, User
 from src.services.auth.service import AuthService
 from src.services.system.audit import AuditService
 from src.services.usage.service import UsageService
+from src.services.wallet import WalletService
 from src.utils.perf import PerfRecorder
 
 if TYPE_CHECKING:
@@ -35,7 +38,7 @@ QUIET_POLLING_PATHS: set[str] = {
 
 
 class ApiRequestPipeline:
-    """负责统一执行认证、配额校验、上下文构建等通用逻辑的管道。"""
+    """负责统一执行认证、余额校验、上下文构建等通用逻辑的管道。"""
 
     def __init__(
         self,
@@ -143,6 +146,16 @@ class ApiRequestPipeline:
                     status_code=408,
                     detail=f"Request timeout: body not received within {timeout_sec} seconds",
                 )
+            except ClientDisconnect:
+                logger.warning(
+                    "[Pipeline] 客户端在读取请求体期间断开连接: {} {}",
+                    http_request.method,
+                    http_request.url.path,
+                )
+                return JSONResponse(
+                    status_code=499,
+                    content={"error": "client_disconnected", "message": "Client closed request"},
+                )
         context_start = PerfRecorder.start(force=perf_sampled)
         context = ApiRequestContext.build(
             request=http_request,
@@ -164,7 +177,8 @@ class ApiRequestPipeline:
         # 存储 quiet 标志到 context，用于审计日志判断
         context.quiet_logging = is_quiet
         if mode != ApiMode.ADMIN and user:
-            context.quota_remaining = self._calculate_quota_remaining(user)
+            remaining = self._calculate_balance_remaining(db, user, api_key=api_key)
+            context.balance_remaining = remaining
         # authorize 可能是异步的，需要检查并 await
         authorize_start = PerfRecorder.start(force=perf_sampled)
         try:
@@ -197,6 +211,25 @@ class ApiRequestPipeline:
                 error=err_detail,
             )
             raise
+        except ClientDisconnect:
+            handle_duration = PerfRecorder.stop(handle_start, "pipeline_handle", labels=perf_labels)
+            _record_perf_metric("handle_ms", handle_duration)
+            logger.warning(
+                "[Pipeline] 客户端在处理期间断开连接: {} {}",
+                context.request.method,
+                context.request.url.path,
+            )
+            self._record_audit_event(
+                context,
+                adapter,
+                success=False,
+                status_code=499,
+                error="client_disconnected",
+            )
+            return JSONResponse(
+                status_code=499,
+                content={"error": "client_disconnected", "message": "Client closed request"},
+            )
         except Exception as exc:
             handle_duration = PerfRecorder.stop(handle_start, "pipeline_handle", labels=perf_labels)
             _record_perf_metric("handle_ms", handle_duration)
@@ -238,25 +271,11 @@ class ApiRequestPipeline:
         request.state.user_id = user.id
         request.state.api_key_id = api_key.id
 
-        # 检查配额或余额（支持独立Key）
-        quota_ok, message = self.usage_service.check_user_quota(db, user, api_key=api_key)
-        if not quota_ok:
-            # 根据Key类型计算剩余额度
-            if api_key.is_standalone:
-                # 独立Key：显示剩余余额
-                remaining = (
-                    None
-                    if api_key.current_balance_usd is None
-                    else float(api_key.current_balance_usd - (api_key.balance_used_usd or 0))
-                )
-            else:
-                # 普通Key：显示用户配额剩余
-                remaining = (
-                    None
-                    if user.quota_usd is None or user.quota_usd < 0
-                    else float(user.quota_usd - user.used_usd)
-                )
-            raise QuotaExceededException(quota_type="USD", remaining=remaining)
+        # 检查余额（支持独立 Key）
+        access_ok, _message = self.usage_service.check_request_balance(db, user, api_key=api_key)
+        if not access_ok:
+            remaining = self._calculate_balance_remaining(db, user, api_key=api_key)
+            raise BalanceInsufficientException(balance_type="USD", remaining=remaining)
 
         return user, api_key
 
@@ -418,12 +437,15 @@ class ApiRequestPipeline:
             detail="无效的 Token 格式，需要 Management Token",
         )
 
-    def _calculate_quota_remaining(self, user: User | None) -> float | None:
+    def _calculate_balance_remaining(
+        self, db: Session, user: User | None, api_key: ApiKey | None = None
+    ) -> float | None:
         if not user:
             return None
-        if user.quota_usd is None or user.quota_usd < 0:
+        balance = WalletService.get_balance_snapshot(db, user=user, api_key=api_key)
+        if balance is None:
             return None
-        return max(float(user.quota_usd - user.used_usd), 0.0)
+        return float(balance)
 
     def _record_audit_event(
         self,
@@ -513,7 +535,7 @@ class ApiRequestPipeline:
             "request_body_bytes": len(context.raw_body or b""),
             "has_body": bool(context.raw_body),
             "request_content_type": request.headers.get("content-type"),
-            "quota_remaining": context.quota_remaining,
+            "balance_remaining": context.balance_remaining,
             "success": success,
             # 传递 quiet_logging 标志给审计服务，用于抑制高频轮询日志
             "quiet_logging": getattr(context, "quiet_logging", False),

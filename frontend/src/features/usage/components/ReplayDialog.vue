@@ -388,8 +388,8 @@ watch(() => props.isOpen, async (isOpen) => {
     showRequestHeaders.value = false
     showResponseHeaders.value = false
     try {
-      const summary = await getProvidersSummary()
-      providers.value = summary
+      const response = await getProvidersSummary({ page_size: 9999 })
+      providers.value = response.items
         .filter(p => p.is_active && p.active_endpoints > 0)
         .map(p => ({ id: p.id, name: p.name }))
     } catch (e) {

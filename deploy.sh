@@ -140,8 +140,13 @@ calc_code_hash() {
 }
 
 # 获取最新 hub release tag
+# 支持 GITHUB_TOKEN 环境变量以避免未认证 API 限流（60 次/小时 -> 5000 次/小时）
 get_latest_hub_tag() {
-    curl -sL "https://api.github.com/repos/$GITHUB_REPO/releases" | \
+    local auth_args=()
+    if [ -n "${GITHUB_TOKEN:-}" ]; then
+        auth_args=(-H "Authorization: token ${GITHUB_TOKEN}")
+    fi
+    curl -sL "${auth_args[@]}" "https://api.github.com/repos/$GITHUB_REPO/releases" | \
         python3 -c "
 import json, sys
 releases = json.load(sys.stdin)
@@ -272,14 +277,19 @@ EOF
 build_app() {
     echo ">>> Building app image (code only)..."
     if [ -z "${RESOLVED_HUB_TAG:-}" ]; then
-        echo "❌ RESOLVED_HUB_TAG 为空，无法构建 app 镜像"
+        echo ">>> RESOLVED_HUB_TAG 为空，无法构建 app 镜像"
         exit 1
     fi
     echo ">>> Build args: HUB_TAG=$RESOLVED_HUB_TAG"
     generate_version_file
+    local token_args=()
+    if [ -n "${GITHUB_TOKEN:-}" ]; then
+        token_args=(--build-arg "GITHUB_TOKEN=${GITHUB_TOKEN}")
+    fi
     docker build --pull=false \
         --build-arg HUB_RELEASE_REPO="$GITHUB_REPO" \
         --build-arg HUB_TAG="$RESOLVED_HUB_TAG" \
+        "${token_args[@]}" \
         -f Dockerfile.app.local \
         -t aether-app:latest .
     save_code_hash

@@ -9,6 +9,7 @@ import os
 import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
+from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import Float, and_, case, cast, func
@@ -426,6 +427,7 @@ class StatsAggregatorService:
         stats = (
             db.query(
                 Usage.api_key_id,
+                func.max(Usage.api_key_name).label("api_key_name"),
                 func.count(Usage.id).label("total_requests"),
                 func.sum(case((error_cond, 1), else_=0)).label("error_requests"),
                 func.sum(Usage.input_tokens).label("input_tokens"),
@@ -459,6 +461,10 @@ class StatsAggregatorService:
                 record = StatsDailyApiKey(
                     id=str(uuid.uuid4()), date=day_start, api_key_id=stat.api_key_id
                 )
+
+            # 填充 api_key_name 快照（优先用已有值，新数据从 usage 聚合获取）
+            if not record.api_key_name and stat.api_key_name:
+                record.api_key_name = stat.api_key_name
 
             error_requests = int(stat.error_requests or 0)
             total_requests = int(stat.total_requests or 0)
@@ -598,6 +604,7 @@ class StatsAggregatorService:
                 func.sum(Usage.cache_creation_input_tokens).label("cache_creation_tokens"),
                 func.sum(Usage.cache_read_input_tokens).label("cache_read_tokens"),
                 func.sum(Usage.total_cost_usd).label("total_cost"),
+                func.max(Usage.username).label("username"),
             )
             .filter(
                 and_(
@@ -608,6 +615,12 @@ class StatsAggregatorService:
             )
             .first()
         )
+
+        # 填充 username 快照：从 Usage 聚合获取，用户删除后仍可追溯
+        if not stats.username:
+            username = getattr(aggregated, "username", None)
+            if username:
+                stats.username = username
 
         total_requests = int(getattr(aggregated, "total_requests", 0) or 0)
         if total_requests == 0:
@@ -949,8 +962,8 @@ class StatsAggregatorService:
         summary.all_time_output_tokens = int(daily_aggregated.output_tokens or 0)
         summary.all_time_cache_creation_tokens = int(daily_aggregated.cache_creation_tokens or 0)
         summary.all_time_cache_read_tokens = int(daily_aggregated.cache_read_tokens or 0)
-        summary.all_time_cost = float(daily_aggregated.total_cost or 0)
-        summary.all_time_actual_cost = float(daily_aggregated.actual_total_cost or 0)
+        summary.all_time_cost = Decimal(str(daily_aggregated.total_cost or 0))
+        summary.all_time_actual_cost = Decimal(str(daily_aggregated.actual_total_cost or 0))
         summary.total_users = total_users
         summary.active_users = active_users
         summary.total_api_keys = total_api_keys
@@ -998,8 +1011,8 @@ class StatsAggregatorService:
                 "output_tokens": 0,
                 "cache_creation_tokens": 0,
                 "cache_read_tokens": 0,
-                "total_cost": 0.0,
-                "actual_total_cost": 0.0,
+                "total_cost": Decimal(0),
+                "actual_total_cost": Decimal(0),
                 "avg_response_time_ms": 0.0,
                 "unique_models": 0,
                 "unique_providers": 0,
@@ -1015,8 +1028,8 @@ class StatsAggregatorService:
             "output_tokens": int(getattr(aggregated, "output_tokens", 0) or 0),
             "cache_creation_tokens": int(getattr(aggregated, "cache_creation_tokens", 0) or 0),
             "cache_read_tokens": int(getattr(aggregated, "cache_read_tokens", 0) or 0),
-            "total_cost": float(getattr(aggregated, "total_cost", 0) or 0.0),
-            "actual_total_cost": float(getattr(aggregated, "actual_total_cost", 0) or 0.0),
+            "total_cost": Decimal(str(getattr(aggregated, "total_cost", 0) or 0)),
+            "actual_total_cost": Decimal(str(getattr(aggregated, "actual_total_cost", 0) or 0)),
             "avg_response_time_ms": float(getattr(aggregated, "avg_response_time", 0) or 0.0),
             "unique_models": int(getattr(aggregated, "unique_models", 0) or 0),
             "unique_providers": int(getattr(aggregated, "unique_providers", 0) or 0),
@@ -1327,10 +1340,10 @@ def query_stats_hybrid(
         result.output_tokens += stats.output_tokens
         result.cache_creation_tokens += stats.cache_creation_tokens
         result.cache_read_tokens += stats.cache_read_tokens
-        result.cache_creation_cost += stats.cache_creation_cost
-        result.cache_read_cost += stats.cache_read_cost
-        result.total_cost += stats.total_cost
-        result.actual_total_cost += stats.actual_total_cost
+        result.cache_creation_cost += float(stats.cache_creation_cost or 0)
+        result.cache_read_cost += float(stats.cache_read_cost or 0)
+        result.total_cost += float(stats.total_cost or 0)
+        result.actual_total_cost += float(stats.actual_total_cost or 0)
         result.total_response_time_ms += (stats.avg_response_time_ms or 0.0) * stats.total_requests
 
     # Realtime per day

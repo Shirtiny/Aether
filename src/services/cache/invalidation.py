@@ -15,12 +15,11 @@ class CacheInvalidationService:
     """缓存失效服务"""
 
     def __init__(self) -> None:
-        self._model_mappers = []
+        pass
 
     def register_model_mapper(self, model_mapper: Any) -> None:
-        """注册 ModelMapper 实例"""
-        if model_mapper not in self._model_mappers:
-            self._model_mappers.append(model_mapper)
+        """注册 ModelMapper 实例（已弃用，保留兼容性，不执行任何操作）"""
+        pass
 
     async def on_global_model_changed(
         self, model_name: str, global_model_id: str | None = None
@@ -39,9 +38,10 @@ class CacheInvalidationService:
 
         clear_regex_cache()
 
-        # 2. 清空 ModelMapper 缓存
-        for mapper in self._model_mappers:
-            mapper.clear_cache()
+        # 2. 清空 ModelMapper 共享缓存
+        from src.services.model.mapper import ModelMapperMiddleware
+
+        ModelMapperMiddleware.clear_cache()
 
         # 3. 清空 ModelCacheService 缓存
         from src.services.cache.model_cache import ModelCacheService
@@ -88,13 +88,15 @@ class CacheInvalidationService:
 
     def _refresh_provider_cache(self, provider_id: str) -> None:
         """刷新指定 Provider 的 ModelMapper 缓存"""
-        for mapper in self._model_mappers:
-            mapper.refresh_cache(provider_id)
+        from src.services.model.mapper import ModelMapperMiddleware
+
+        ModelMapperMiddleware.refresh_cache(provider_id)
 
     def clear_all_caches(self) -> None:
         """清空所有缓存"""
-        for mapper in self._model_mappers:
-            mapper.clear_cache()
+        from src.services.model.mapper import ModelMapperMiddleware
+
+        ModelMapperMiddleware.clear_cache()
 
 
 # 全局单例

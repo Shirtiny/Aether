@@ -39,6 +39,7 @@ class CandidateResponse(BaseModel):
     endpoint_name: str | None = None  # 端点显示名称（api_format）
     key_id: str | None = None
     key_name: str | None = None  # 密钥名称
+    key_account_label: str | None = None  # 更适合展示的测试账号标签（优先 OAuth 邮箱）
     key_preview: str | None = None  # 密钥脱敏预览（如 sk-***abc），OAuth 类型不返回
     key_auth_type: str | None = None  # 密钥认证类型（api_key, service_account, oauth）
     key_oauth_plan_type: str | None = None  # OAuth 账号套餐类型（free/plus/team/enterprise）
@@ -257,6 +258,7 @@ class AdminGetRequestTraceAdapter(AdminApiAdapter):
         key_ids = {c.key_id for c in candidates if c.key_id}
         key_map: dict[str, str] = {}
         key_preview_map: dict[str, str] = {}
+        key_account_label_map: dict[str, str | None] = {}
         key_capabilities_map: dict[str, dict | None] = {}
         key_auth_type_map: dict[str, str] = {}
         key_oauth_plan_map: dict[str, str | None] = {}
@@ -268,6 +270,7 @@ class AdminGetRequestTraceAdapter(AdminApiAdapter):
             keys = db.query(ProviderAPIKey).filter(ProviderAPIKey.id.in_(key_ids)).all()
             for k in keys:
                 key_map[k.id] = k.name
+                key_account_label_map[k.id] = k.name
                 key_capabilities_map[k.id] = k.capabilities
 
                 is_oauth = k.auth_type == "oauth"
@@ -286,6 +289,9 @@ class AdminGetRequestTraceAdapter(AdminApiAdapter):
                         try:
                             decrypted_config = crypto_service.decrypt(k.auth_config)
                             auth_config = json.loads(decrypted_config)
+                            email = auth_config.get("email")
+                            if isinstance(email, str) and email.strip():
+                                key_account_label_map[k.id] = email.strip()
                             oauth_plan_type = auth_config.get("plan_type")
                             if not oauth_plan_type:
                                 ag_tier = auth_config.get("tier")
@@ -348,6 +354,9 @@ class AdminGetRequestTraceAdapter(AdminApiAdapter):
                 endpoint_map.get(candidate.endpoint_id) if candidate.endpoint_id else None
             )
             key_name = key_map.get(candidate.key_id) if candidate.key_id else None
+            key_account_label = (
+                key_account_label_map.get(candidate.key_id) if candidate.key_id else None
+            )
             key_preview = key_preview_map.get(candidate.key_id) if candidate.key_id else None
             key_auth_type = key_auth_type_map.get(candidate.key_id) if candidate.key_id else None
             key_oauth_plan_type = (
@@ -370,6 +379,7 @@ class AdminGetRequestTraceAdapter(AdminApiAdapter):
                     endpoint_name=endpoint_name,
                     key_id=candidate.key_id,
                     key_name=key_name,
+                    key_account_label=key_account_label,
                     key_preview=key_preview,
                     key_auth_type=key_auth_type,
                     key_oauth_plan_type=key_oauth_plan_type,

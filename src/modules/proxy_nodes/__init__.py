@@ -109,7 +109,7 @@ async def _on_startup() -> None:
         logger.info("Hub worker channel initialized on startup")
     except Exception as e:
         # ensure_connected 失败时内部会启动重连循环，这里仅记录告警不阻塞启动
-        logger.warning("Hub worker channel init failed, reconnecting in background: {}", e)
+        logger.warning("Hub worker channel init failed, reconnecting in background: %s", e)
 
     if active:
         logger.info("启动 ProxyNode 心跳检测调度器...")

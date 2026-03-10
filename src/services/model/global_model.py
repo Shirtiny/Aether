@@ -8,7 +8,9 @@ from __future__ import annotations
 
 from typing import cast
 
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy import delete as sa_delete
+from sqlalchemy import func
+from sqlalchemy.orm import Session, joinedload, load_only
 
 from src.core.exceptions import InvalidRequestException, NotFoundException
 from src.core.logger import logger
@@ -199,21 +201,15 @@ class GlobalModelService:
         """
         global_model = GlobalModelService.get_global_model(db, global_model_id)
 
-        # 查找所有关联的 Model（使用 global_model.id，预加载 provider 关联）
-        associated_models = (
-            db.query(Model)
-            .options(joinedload(Model.provider))
-            .filter(Model.global_model_id == global_model.id)
-            .all()
+        # 批量删除所有关联的 Provider 模型实现
+        assoc_count = (
+            db.query(func.count(Model.id)).filter(Model.global_model_id == global_model.id).scalar()
         )
-
-        # 级联删除所有关联的 Provider 模型实现
-        if associated_models:
+        if assoc_count:
             logger.info(
-                f"删除 GlobalModel {global_model.name} 的 {len(associated_models)} 个关联 Provider 模型"
+                f"删除 GlobalModel {global_model.name} 的 {assoc_count} 个关联 Provider 模型"
             )
-            for model in associated_models:
-                db.delete(model)
+            db.execute(sa_delete(Model).where(Model.global_model_id == global_model.id))
 
         # 删除 GlobalModel
         db.delete(global_model)
@@ -502,46 +498,65 @@ class GlobalModelService:
             logger.warning(f"Provider {provider_id} not found for auto-disassociation")
             return results
 
-        # 1. 获取 Provider 下所有活跃 Key 的 allowed_models 并集
-        keys = (
-            db.query(ProviderAPIKey)
+        # 1. 先快速检查是否存在"允许所有模型"的活跃 Key。
+        # 这种情况下无需解除任何关联，避免继续扫描整张 key 表。
+        # 注意：跳过 OAuth Key，OAuth Key 的 allowed_models 由上游动态获取，数量庞大，
+        # 不应参与 disassociate 判定。
+        from src.services.provider_keys.auth_type import OAUTH_AUTH_TYPES
+
+        non_oauth_filter = ProviderAPIKey.auth_type.notin_(OAUTH_AUTH_TYPES)
+        has_unlimited_key = (
+            db.query(ProviderAPIKey.id)
             .filter(
                 ProviderAPIKey.provider_id == provider_id,
                 ProviderAPIKey.is_active == True,
+                ProviderAPIKey.allowed_models.is_(None),
+                non_oauth_filter,
+            )
+            .limit(1)
+            .first()
+            is not None
+        )
+        if has_unlimited_key:
+            return results
+
+        # 2. 仅查询活跃 Key 的 allowed_models 列，避免把 api_key/auth_config 等大字段整行拉出。
+        allowed_model_rows = (
+            db.query(ProviderAPIKey.allowed_models)
+            .filter(
+                ProviderAPIKey.provider_id == provider_id,
+                ProviderAPIKey.is_active == True,
+                non_oauth_filter,
             )
             .all()
         )
 
-        # 收集所有 Key 的 allowed_models 并集
-        # 注意：allowed_models 为 null 表示允许所有模型，此时不应解除任何关联
-        all_allowed_models: set[str] = set()
-        has_unlimited_key = False  # 是否存在允许所有模型的 Key
-
-        for key in keys:
-            if key.allowed_models is None:
-                # null 表示允许所有模型，直接返回不做任何解除
-                has_unlimited_key = True
-                break
-            if key.allowed_models:
-                all_allowed_models.update(key.allowed_models)
-
-        # 如果存在允许所有模型的 Key，不需要解除任何关联
-        if has_unlimited_key:
-            return results
-
         # 如果 Provider 无活跃 Key，不做任何解除（保留现有关联）
-        if not keys:
+        if not allowed_model_rows:
             return results
 
-        # 2. 获取 Provider 当前关联的所有 Model（带 GlobalModel 信息）
+        # 收集所有 Key 的 allowed_models 并集
+        all_allowed_models: set[str] = set()
+        for (allowed_models,) in allowed_model_rows:
+            if isinstance(allowed_models, list) and allowed_models:
+                all_allowed_models.update(m for m in allowed_models if isinstance(m, str))
+
+        # 3. 获取 Provider 当前关联的所有 Model（仅加载判定所需字段）
         models = (
             db.query(Model)
-            .options(joinedload(Model.global_model))
+            .options(
+                load_only(Model.id, Model.provider_id, Model.global_model_id),
+                joinedload(Model.global_model).load_only(
+                    GlobalModel.id,
+                    GlobalModel.name,
+                    GlobalModel.config,
+                ),
+            )
             .filter(Model.provider_id == provider_id)
             .all()
         )
 
-        # 3. 检查每个 Model 是否还能匹配，收集需要删除的 Model
+        # 4. 检查每个 Model 是否还能匹配，收集需要删除的 Model
         models_to_delete: list[Model] = []
 
         for model in models:
@@ -577,7 +592,7 @@ class GlobalModelService:
             if not matched:
                 models_to_delete.append(model)
 
-        # 4. 批量删除不再匹配的 Model（全部成功或全部失败）
+        # 5. 批量删除不再匹配的 Model（全部成功或全部失败）
         if models_to_delete:
             try:
                 for model in models_to_delete:

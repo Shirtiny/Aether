@@ -100,14 +100,14 @@
             id="max_probe_interval_minutes"
             :model-value="form.max_probe_interval_minutes ?? ''"
             type="number"
-            min="2"
+            min="0"
             max="32"
             placeholder="32"
             class="h-8"
-            @update:model-value="(v) => form.max_probe_interval_minutes = parseNumberInput(v, { min: 2, max: 32 }) ?? 32"
+            @update:model-value="(v) => form.max_probe_interval_minutes = parseNumberInput(v, { min: 0, max: 32 }) ?? 32"
           />
           <p class="text-xs text-muted-foreground mt-0.5">
-            2-32分钟
+            0-32分钟
           </p>
         </div>
       </div>

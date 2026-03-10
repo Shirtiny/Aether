@@ -1375,12 +1375,18 @@ async function loadDetail(id: string, silent = false) {
     }
     bodiesLoadedForRequestId.value = sameRequest ? bodiesLoadedForRequestId.value : null
 
-    // 首次加载时选择默认 tab
+    // 首次加载时优先停留在轻量 tab，避免默认触发大 body 加载
     if (!silent) {
       const visibleTabNames = visibleTabs.value.map(t => t.name)
-      if (hasRequestBodyAvailable.value && visibleTabNames.includes('request-body')) {
+      if (visibleTabNames.includes('request-headers')) {
+        activeTab.value = 'request-headers'
+      } else if (visibleTabNames.includes('response-headers')) {
+        activeTab.value = 'response-headers'
+      } else if (visibleTabNames.includes('metadata')) {
+        activeTab.value = 'metadata'
+      } else if (visibleTabNames.includes('request-body')) {
         activeTab.value = 'request-body'
-      } else if (hasResponseBodyAvailable.value && visibleTabNames.includes('response-body')) {
+      } else if (visibleTabNames.includes('response-body')) {
         activeTab.value = 'response-body'
       } else if (visibleTabNames.length > 0) {
         activeTab.value = visibleTabNames[0]

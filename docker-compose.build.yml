@@ -43,6 +43,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.app.local
+      args:
+        GITHUB_TOKEN: ${GITHUB_TOKEN:-}
     image: aether-app:latest
     container_name: aether-app
     env_file:

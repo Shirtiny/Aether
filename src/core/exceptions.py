@@ -63,7 +63,7 @@ FIELD_NAME_TRANSLATIONS = {
     "username": "用户名",
     "email": "邮箱",
     "role": "角色",
-    "quota_usd": "配额",
+    "initial_gift_usd": "初始赠款",
     "name": "名称",
     "title": "标题",
     "content": "内容",
@@ -261,18 +261,25 @@ class ProviderRateLimitException(ProviderException):
         )
 
 
-class QuotaExceededException(ProxyException):
-    """配额超限"""
+class BalanceInsufficientException(ProxyException):
+    """余额或额度不足"""
 
-    def __init__(self, quota_type: str = "tokens", remaining: float | None = None):
-        message = f"{quota_type}配额已用尽"
-        if remaining is not None:
-            message += f"（剩余: {remaining}）"
+    def __init__(self, balance_type: str = "tokens", remaining: float | None = None, **kwargs: Any):
+        # 兼容旧调用方使用 quota_type= 关键字参数
+        balance_type = kwargs.get("quota_type", balance_type)
+        if balance_type.upper() == "USD":
+            message = "余额不足"
+            if remaining is not None:
+                message += f"（剩余: ${remaining:.2f}）"
+        else:
+            message = f"{balance_type}额度已用尽"
+            if remaining is not None:
+                message += f"（剩余: {remaining}）"
         super().__init__(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            error_type="quota_exceeded",
+            error_type="balance_exceeded",
             message=message,
-            details={"quota_type": quota_type, "remaining": remaining},
+            details={"balance_type": balance_type, "remaining": remaining},
         )
 
 

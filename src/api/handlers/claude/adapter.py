@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from typing import Any
 
-import httpx
 from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse
 
@@ -111,7 +110,6 @@ class ClaudeChatAdapter(ChatAdapterBase):
 
     FORMAT_ID = "claude:chat"
     API_FAMILY = ApiFamily.CLAUDE
-    BILLING_TEMPLATE = "claude"  # 使用 Claude 计费模板
     name = "claude.chat"
 
     @property
@@ -132,23 +130,6 @@ class ClaudeChatAdapter(ChatAdapterBase):
     ) -> dict[str, bool]:
         """检测 Claude 请求中隐含的能力需求"""
         return ClaudeCapabilityDetector.detect_from_headers(headers, request_body)
-
-    # =========================================================================
-    # Claude 特定的计费逻辑
-    # =========================================================================
-
-    def compute_total_input_context(
-        self,
-        input_tokens: int,
-        cache_read_input_tokens: int,
-        cache_creation_input_tokens: int = 0,
-    ) -> int:
-        """
-        计算 Claude 的总输入上下文（用于阶梯计费判定）
-
-        Claude 的总输入 = input_tokens + cache_creation_input_tokens + cache_read_input_tokens
-        """
-        return input_tokens + cache_creation_input_tokens + cache_read_input_tokens
 
     def _validate_request_body(
         self, original_request_body: dict, path_params: dict | None = None
@@ -203,102 +184,6 @@ class ClaudeChatAdapter(ChatAdapterBase):
             "thinking_enabled": bool(request_obj.thinking),
         }
 
-    @classmethod
-    async def fetch_models(
-        cls,
-        client: httpx.AsyncClient,
-        base_url: str,
-        api_key: str,
-        extra_headers: dict[str, str] | None = None,
-    ) -> tuple[list, str | None]:
-        """查询 Claude API 支持的模型列表（兼容 x-api-key 和 Bearer 认证）"""
-        headers = cls.build_headers_with_extra(api_key, extra_headers)
-        # 兼容第三方提供商：同时发送 Authorization: Bearer 认证头
-        # 官方 Claude API 使用 x-api-key，第三方代理可能使用 Bearer Token
-        if "authorization" not in {k.lower() for k in headers}:
-            headers["Authorization"] = f"Bearer {api_key}"
-        return await cls._fetch_models_paginated(client, base_url, headers, cls.FORMAT_ID)
-
-    @staticmethod
-    async def _fetch_models_paginated(
-        client: httpx.AsyncClient,
-        base_url: str,
-        headers: dict[str, str],
-        format_id: str,
-    ) -> tuple[list, str | None]:
-        """Claude 模型列表分页获取核心逻辑
-
-        Anthropic 的 /v1/models 是分页接口（has_more/first_id/last_id），
-        默认只返回一页。这里做 best-effort 的全量拉取，确保管理端能展示完整模型列表。
-        """
-        # 构建 /v1/models URL
-        base_url = base_url.rstrip("/")
-        if base_url.endswith("/v1"):
-            models_url = f"{base_url}/models"
-        else:
-            models_url = f"{base_url}/v1/models"
-
-        try:
-            all_models: list[dict] = []
-            seen_ids: set[str] = set()
-
-            after_id: str | None = None
-            limit = 100  # Anthropic 支持 limit，尽量减少分页次数
-            max_pages = 20  # safety guard
-
-            for _ in range(max_pages):
-                params: dict[str, Any] = {"limit": limit}
-                if after_id:
-                    params["after_id"] = after_id
-
-                response = await client.get(models_url, headers=headers, params=params)
-                logger.debug(
-                    f"Claude models request to {models_url}: status={response.status_code}, after_id={after_id}"
-                )
-                if response.status_code != 200:
-                    error_body = response.text[:500] if response.text else "(empty)"
-                    error_msg = f"HTTP {response.status_code}: {error_body}"
-                    logger.warning(f"Claude models request to {models_url} failed: {error_msg}")
-                    return [], error_msg
-
-                data = response.json()
-                page_models: list[dict] = []
-                if isinstance(data, dict) and isinstance(data.get("data"), list):
-                    page_models = [m for m in data["data"] if isinstance(m, dict)]
-                elif isinstance(data, list):
-                    page_models = [m for m in data if isinstance(m, dict)]
-
-                for m in page_models:
-                    mid = m.get("id")
-                    if isinstance(mid, str) and mid and mid in seen_ids:
-                        continue
-                    if isinstance(mid, str) and mid:
-                        seen_ids.add(mid)
-                    m["api_format"] = format_id
-                    all_models.append(m)
-
-                # Pagination (Anthropic list response shape)
-                if not isinstance(data, dict):
-                    break
-
-                has_more = bool(data.get("has_more"))
-                last_id = data.get("last_id")
-                if not has_more:
-                    break
-                if not isinstance(last_id, str) or not last_id:
-                    break
-                if after_id == last_id:
-                    # Prevent infinite loops on unexpected upstream behavior.
-                    break
-                after_id = last_id
-
-            return all_models, None
-        except Exception as e:
-            error_msg = f"Request error: {str(e)}"
-            logger.warning(f"Failed to fetch Claude models from {models_url}: {e}")
-            return [], error_msg
-
-    @classmethod
     def build_endpoint_url(
         cls,
         base_url: str,

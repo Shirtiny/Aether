@@ -48,12 +48,16 @@ class HTTPClientPool:
     _instance: HTTPClientPool | None = None
     _default_client: httpx.AsyncClient | None = None
     _clients: dict[str, httpx.AsyncClient] = {}
+    _max_named_clients: int = 20
     # 代理客户端缓存：{cache_key: (client, last_used_time)}
     _proxy_clients: dict[str, tuple[httpx.AsyncClient, float]] = {}
     # 代理客户端缓存上限（避免内存泄漏）
     _max_proxy_clients: int = 50
-    # Tunnel 客户端缓存：{node_id: client}
-    _tunnel_clients: dict[str, httpx.AsyncClient] = {}
+    # Tunnel 客户端缓存：{node_id: (client, last_used_time)}
+    _tunnel_clients: dict[str, tuple[httpx.AsyncClient, float]] = {}
+    _max_tunnel_clients: int = 30
+    # 后台清理任务引用集合（防止被 GC 回收）
+    _background_tasks: set[asyncio.Task[None]] = set()
 
     def __new__(cls) -> "HTTPClientPool":
         if cls._instance is None:
@@ -141,23 +145,37 @@ class HTTPClientPool:
             name: 客户端标识符
             **kwargs: httpx.AsyncClient的配置参数
         """
-        if name not in cls._clients:
-            # 合并默认配置和自定义配置
-            default_config = {
-                "http2": config.enable_http2,
-                "verify": get_ssl_context(),
-                "timeout": httpx.Timeout(
-                    connect=config.http_connect_timeout,
-                    read=config.http_read_timeout,
-                    write=config.http_write_timeout,
-                    pool=config.http_pool_timeout,
-                ),
-                "follow_redirects": True,
-            }
-            default_config.update(kwargs)
+        if name in cls._clients:
+            # 命中缓存：移到末尾以维护 LRU 顺序
+            cls._clients[name] = cls._clients.pop(name)
+            return cls._clients[name]
 
-            cls._clients[name] = httpx.AsyncClient(**default_config)  # type: ignore[arg-type]
-            logger.debug("创建命名HTTP客户端: {}", name)
+        # 淘汰最久未使用的客户端（dict 头部即 LRU）
+        if len(cls._clients) >= cls._max_named_clients:
+            oldest_name = next(iter(cls._clients))
+            old_client = cls._clients.pop(oldest_name)
+            try:
+                asyncio.get_running_loop().create_task(old_client.aclose())
+            except RuntimeError:
+                pass
+            logger.debug("淘汰命名HTTP客户端: {}", oldest_name)
+
+        # 合并默认配置和自定义配置
+        default_config = {
+            "http2": config.enable_http2,
+            "verify": get_ssl_context(),
+            "timeout": httpx.Timeout(
+                connect=config.http_connect_timeout,
+                read=config.http_read_timeout,
+                write=config.http_write_timeout,
+                pool=config.http_pool_timeout,
+            ),
+            "follow_redirects": True,
+        }
+        default_config.update(kwargs)
+
+        cls._clients[name] = httpx.AsyncClient(**default_config)  # type: ignore[arg-type]
+        logger.debug("创建命名HTTP客户端: {}", name)
 
         return cls._clients[name]
 
@@ -355,7 +373,7 @@ class HTTPClientPool:
         cls._proxy_clients.clear()
 
         # 关闭 tunnel 客户端缓存
-        for nid, client in cls._tunnel_clients.items():
+        for nid, (client, _) in cls._tunnel_clients.items():
             try:
                 await client.aclose()
                 logger.debug("tunnel 客户端已关闭: {}", nid)
@@ -458,6 +476,51 @@ class HTTPClientPool:
         return httpx.AsyncClient(**client_config)  # type: ignore[arg-type]
 
     @classmethod
+    async def _reset_default_client(cls) -> bool:
+        """Atomically replace the shared default client with a fresh instance.
+
+        The old client is kept open briefly so that in-flight requests can
+        finish on their existing HTTP/2 streams; it is closed asynchronously
+        after a short grace period.
+        """
+        async with _default_client_lock:
+            old_client = cls._default_client
+            if old_client is None:
+                return False
+
+            # Create a new client before discarding the old one
+            cls._default_client = httpx.AsyncClient(
+                http2=config.enable_http2,
+                verify=get_ssl_context(),
+                timeout=httpx.Timeout(
+                    connect=config.http_connect_timeout,
+                    read=config.http_read_timeout,
+                    write=config.http_write_timeout,
+                    pool=config.http_pool_timeout,
+                ),
+                limits=httpx.Limits(
+                    max_connections=config.http_max_connections,
+                    max_keepalive_connections=config.http_keepalive_connections,
+                    keepalive_expiry=config.http_keepalive_expiry,
+                ),
+                follow_redirects=True,
+            )
+
+        # Close old client after a grace period so in-flight requests can drain
+        async def _close_old() -> None:
+            await asyncio.sleep(5)
+            try:
+                await old_client.aclose()
+            except Exception as exc:
+                logger.warning("关闭旧默认客户端失败: {}", exc)
+
+        task = asyncio.create_task(_close_old())
+        cls._background_tasks.add(task)
+        task.add_done_callback(cls._background_tasks.discard)
+        logger.warning("默认HTTP客户端已重建(HTTP/2 流容量恢复)")
+        return True
+
+    @classmethod
     async def reset_upstream_client(
         cls,
         delegate_cfg: dict[str, Any] | None,
@@ -467,8 +530,9 @@ class HTTPClientPool:
         """Reset cached upstream client for the given proxy/tunnel route.
 
         Returns True when a cached client was closed and removed.
-        For the shared no-proxy default client this is a no-op to avoid
-        disrupting unrelated in-flight requests.
+        For the shared no-proxy default client, atomically replaces it with a
+        new instance so that subsequent requests get a fresh HTTP/2 connection
+        while in-flight requests on the old client can finish naturally.
         """
         if delegate_cfg and delegate_cfg.get("tunnel"):
             node_id = str(delegate_cfg.get("node_id") or "")
@@ -476,9 +540,10 @@ class HTTPClientPool:
                 return False
             lock = cls._get_proxy_clients_lock()
             async with lock:
-                client = cls._tunnel_clients.pop(node_id, None)
-            if client is None:
+                entry = cls._tunnel_clients.pop(node_id, None)
+            if entry is None:
                 return False
+            client, _ = entry
             try:
                 await client.aclose()
             except Exception as exc:
@@ -490,7 +555,7 @@ class HTTPClientPool:
 
         base_cache_key = compute_proxy_cache_key(proxy_config)
         if base_cache_key == "__no_proxy__":
-            return False
+            return await cls._reset_default_client()
 
         cache_key_prefixes = [base_cache_key]
         tls_profile_key = str(tls_profile or "").strip().lower()
@@ -587,13 +652,27 @@ class HTTPClientPool:
         # 非流式请求：复用缓存的 client（加锁与 proxy_clients 保持一致）
         lock = cls._get_proxy_clients_lock()
         async with lock:
-            existing = cls._tunnel_clients.get(node_id)
-            if existing and not existing.is_closed:
-                return existing
+            entry = cls._tunnel_clients.get(node_id)
+            if entry is not None:
+                existing, _ = entry
+                if not existing.is_closed:
+                    cls._tunnel_clients[node_id] = (existing, time.time())
+                    return existing
+                del cls._tunnel_clients[node_id]
+
+            # 淘汰最久未使用的 tunnel 客户端
+            if len(cls._tunnel_clients) >= cls._max_tunnel_clients:
+                oldest_nid = min(cls._tunnel_clients, key=lambda k: cls._tunnel_clients[k][1])
+                old_client, _ = cls._tunnel_clients.pop(oldest_nid)
+                try:
+                    await old_client.aclose()
+                except Exception:
+                    pass
+                logger.debug("淘汰 tunnel 客户端: {}", oldest_nid)
 
             transport = create_tunnel_transport(node_id, timeout=timeout_secs or 60.0)
             client = httpx.AsyncClient(transport=transport, timeout=t)
-            cls._tunnel_clients[node_id] = client
+            cls._tunnel_clients[node_id] = (client, time.time())
             return client
 
     @classmethod

@@ -7,6 +7,7 @@ Chat Adapter 通用基类
 - Handler 创建和调用
 
 公共逻辑（异常处理、计费、头部构建等）继承自 HandlerAdapterBase。
+计费策略、模型抓取与 provider 格式能力由 `core.api_format` 注册表统一提供。
 
 子类只需提供：
 - FORMAT_ID: API 格式标识
@@ -28,13 +29,13 @@ from src.api.base.context import ApiRequestContext
 from src.api.handlers.base.chat_handler_base import ChatHandlerBase
 from src.api.handlers.base.handler_adapter_base import HandlerAdapterBase
 from src.core.exceptions import (
+    BalanceInsufficientException,
     InvalidRequestException,
     ModelNotSupportedException,
     ProviderAuthException,
     ProviderNotAvailableException,
     ProviderRateLimitException,
     ProviderTimeoutException,
-    QuotaExceededException,
     UpstreamClientException,
 )
 from src.core.logger import logger
@@ -63,7 +64,7 @@ class ChatAdapterBase(HandlerAdapterBase):
         api_key = context.api_key
         db = context.db
         request_id = context.request_id
-        quota_remaining_value = context.quota_remaining
+        balance_remaining_value = context.balance_remaining
         start_time = context.start_time
         client_ip = context.client_ip
         user_agent = context.user_agent
@@ -91,14 +92,14 @@ class ChatAdapterBase(HandlerAdapterBase):
         context.add_audit_metadata(**audit_metadata)
 
         # 格式化额度显示
-        quota_display = (
-            "unlimited" if quota_remaining_value is None else f"${quota_remaining_value:.2f}"
+        balance_display = (
+            "unlimited" if balance_remaining_value is None else f"${balance_remaining_value:.2f}"
         )
 
         # 请求开始日志
         logger.info(
             f"[REQ] {request_id[:8]} | {self.FORMAT_ID} | {getattr(api_key, 'name', 'unknown')} | "
-            f"{model} | {'stream' if stream else 'sync'} | quota:{quota_display}"
+            f"{model} | {'stream' if stream else 'sync'} | balance:{balance_display}"
         )
 
         try:
@@ -146,7 +147,7 @@ class ChatAdapterBase(HandlerAdapterBase):
 
         except (
             ModelNotSupportedException,
-            QuotaExceededException,
+            BalanceInsufficientException,
             InvalidRequestException,
         ) as e:
             logger.info(f"客户端请求错误: {e.error_type}")

@@ -1168,7 +1168,7 @@ async function ensureProviderOptions() {
   providerOptionsRequest = (async () => {
     try {
       loadingProviderOptions.value = true
-      providerOptions.value = await getProvidersSummary()
+      providerOptions.value = (await getProvidersSummary({ page_size: 9999 })).items
     } catch (err: unknown) {
       const message = parseApiError(err, '加载 Provider 列表失败')
       showError(message, '错误')
@@ -1494,7 +1494,7 @@ async function refreshData() {
 async function loadProviders() {
   const requestId = ++providersRequestId
   try {
-    const nextProviders = await getProvidersSummary()
+    const nextProviders = (await getProvidersSummary({ page_size: 9999 })).items
     if (requestId !== providersRequestId) return
     providers.value = nextProviders
   } catch (err: unknown) {

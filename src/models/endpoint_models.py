@@ -475,7 +475,7 @@ class EndpointAPIKeyCreate(BaseModel):
         default=5, ge=0, le=60, description="缓存 TTL（分钟），0=禁用，默认5分钟"
     )
     max_probe_interval_minutes: int = Field(
-        default=32, ge=2, le=32, description="熔断探测间隔（分钟），范围 2-32"
+        default=32, ge=0, le=32, description="熔断探测间隔（分钟），范围 0-32"
     )
 
     # 备注
@@ -631,7 +631,7 @@ class EndpointAPIKeyUpdate(BaseModel):
         default=None, ge=0, le=60, description="缓存 TTL（分钟），0=禁用"
     )
     max_probe_interval_minutes: int | None = Field(
-        default=None, ge=2, le=32, description="熔断探测间隔（分钟），范围 2-32"
+        default=None, ge=0, le=32, description="熔断探测间隔（分钟），范围 0-32"
     )
     is_active: bool | None = Field(default=None, description="是否启用")
     note: str | None = Field(default=None, max_length=500, description="备注说明")
@@ -1039,6 +1039,15 @@ class ProviderWithEndpointsSummary(BaseModel):
     updated_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class ProviderSummaryPageResponse(BaseModel):
+    """Provider 摘要分页响应"""
+
+    total: int
+    page: int
+    page_size: int
+    items: list[ProviderWithEndpointsSummary]
 
 
 # ========== 健康监控可视化模型 ==========

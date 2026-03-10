@@ -289,7 +289,7 @@ class OpenAIVideoHandler(VideoHandlerBase):
         )
         response_body = self._normalizer.video_task_from_internal(internal_task)
 
-        # 提交成功后立即结算 Usage（费用暂时为 0，轮询完成后更新）
+        # 提交成功后补齐 Usage 的 provider 上下文，真正结算留到轮询完成时
         response_time_ms = int((time.time() - self.start_time) * 1000)
         try:
             # 构建发送给上游的请求头（脱敏）
@@ -887,6 +887,8 @@ class OpenAIVideoHandler(VideoHandlerBase):
             external_task_id=external_task_id,
             user_id=self.user.id,
             api_key_id=self.api_key.id,
+            username=self.user.username,
+            api_key_name=self.api_key.name,
             provider_id=candidate.provider.id,
             endpoint_id=candidate.endpoint.id,
             key_id=candidate.key.id,
@@ -1049,6 +1051,8 @@ class OpenAIVideoHandler(VideoHandlerBase):
             external_task_id=None,
             user_id=self.user.id,
             api_key_id=self.api_key.id,
+            username=self.user.username,
+            api_key_name=self.api_key.name,
             provider_id=None,
             endpoint_id=None,
             key_id=None,

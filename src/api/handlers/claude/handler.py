@@ -8,8 +8,8 @@ Claude Chat Handler - 基于通用 Chat Handler 基类的简化实现
 from typing import Any
 
 from src.api.handlers.base.chat_handler_base import ChatHandlerBase
-from src.api.handlers.base.utils import extract_cache_creation_tokens_detail
 from src.core.api_format import ApiFamily, EndpointKind
+from src.core.usage_tokens import extract_cache_creation_tokens_detail
 
 
 class ClaudeChatHandler(ChatHandlerBase):

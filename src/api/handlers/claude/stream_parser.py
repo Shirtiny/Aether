@@ -7,7 +7,7 @@ Claude SSE 流解析器
 import json
 from typing import Any
 
-from src.api.handlers.base.utils import extract_cache_creation_tokens
+from src.core.usage_tokens import extract_cache_creation_tokens
 
 
 class ClaudeStreamParser:

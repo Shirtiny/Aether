@@ -69,7 +69,8 @@ class RequestExecutor:
         candidate: Any,
         candidate_id: str,
         candidate_index: int,
-        user_api_key: Any,
+        user_api_key: Any | None,
+        user_id: str | None = None,
         request_func: Callable[..., Any],
         request_id: str | None,
         api_format: str,
@@ -93,8 +94,8 @@ class RequestExecutor:
             provider_id=provider.id,
             endpoint_id=endpoint.id,
             key_id=key.id,
-            user_id=user_api_key.user_id,
-            api_key_id=user_api_key.id,
+            user_id=user_id if user_id is not None else getattr(user_api_key, "user_id", None),
+            api_key_id=getattr(user_api_key, "id", None),
             is_cached_user=is_cached_user,
         )
 
@@ -196,7 +197,6 @@ class RequestExecutor:
                     RequestCandidateService.mark_candidate_streaming(
                         db=self.db,
                         candidate_id=candidate_id,
-                        status_code=200,
                         concurrent_requests=key_rpm_count,
                     )
                 else:

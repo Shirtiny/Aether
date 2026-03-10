@@ -363,6 +363,7 @@ import {
   SunMoon,
   ChevronRight,
   Megaphone,
+  Wallet,
   Menu,
   X,
   Puzzle,
@@ -521,6 +522,7 @@ const navigation = computed(() => {
     {
       title: '账户',
       items: [
+         { name: '钱包中心', href: '/dashboard/wallet', icon: Wallet },
          { name: '使用统计', href: '/dashboard/usage', icon: BarChart3 },
          { name: '异步任务', href: '/dashboard/async-tasks', icon: Zap },
       ]
@@ -579,6 +581,7 @@ const navigation = computed(() => {
         { name: '模型管理', href: '/admin/models', icon: Layers },
         { name: '号池管理', href: '/admin/pool', icon: Database },
         { name: '独立密钥', href: '/admin/keys', icon: Key },
+        { name: '钱包管理', href: '/admin/wallets', icon: Wallet },
         { name: '异步任务', href: '/admin/async-tasks', icon: Zap },
         { name: '使用记录', href: '/admin/usage', icon: BarChart3 },
       ]

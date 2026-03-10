@@ -14,10 +14,10 @@ from src.api.handlers.base.response_parser import (
     ResponseParser,
     StreamStats,
 )
-from src.api.handlers.base.utils import extract_cache_creation_tokens
 
 # is_cli_format 权威定义在 core 层
 from src.core.api_format import is_cli_format
+from src.core.usage_tokens import extract_cache_creation_tokens
 
 
 def _check_nested_error(response: dict[str, Any]) -> tuple[bool, dict[str, Any] | None]:

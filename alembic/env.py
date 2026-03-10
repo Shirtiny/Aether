@@ -14,6 +14,8 @@ from alembic import context
 
 # 添加项目根目录到 Python 路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+# 添加 alembic 目录，让迁移文件可以 `from helpers import ...`
+sys.path.insert(0, os.path.dirname(__file__))
 
 # 加载 .env 文件（本地开发时需要）
 try:
@@ -51,7 +53,7 @@ if config.config_file_name is not None:
 target_metadata = Base.metadata
 
 # PostgreSQL 全局迁移锁，避免多进程并发执行 Alembic 导致竞态（重复加列/索引等）
-# 使用事务级 advisory lock（pg_advisory_xact_lock），在迁移事务结束后自动释放。
+# 使用会话级 advisory lock（pg_advisory_lock），在迁移完成后手动释放。
 # ID 由 crc32("aether-alembic-migration") 拼接生成，仅需全局唯一即可。
 MIGRATION_ADVISORY_LOCK_ID = 582694137405821
 
@@ -90,20 +92,28 @@ def run_migrations_online() -> None:
     )
 
     with connectable.connect() as connection:
-        context.configure(
-            connection=connection,
-            target_metadata=target_metadata,
-            compare_type=True,  # 比较列类型变更
-            compare_server_default=True,  # 比较默认值变更
-        )
-
-        with context.begin_transaction():
+        try:
+            # 使用会话级 advisory lock（非事务级），避免干扰 Alembic 的事务管理。
+            # pg_advisory_lock 在会话结束时自动释放，不受 COMMIT/ROLLBACK 影响。
             if connection.dialect.name == "postgresql":
                 connection.execute(
-                    text("SELECT pg_advisory_xact_lock(:lock_id)"),
+                    text("SELECT pg_advisory_lock(:lock_id)"),
                     {"lock_id": MIGRATION_ADVISORY_LOCK_ID},
                 )
-            context.run_migrations()
+                connection.commit()
+
+            context.configure(
+                connection=connection,
+                target_metadata=target_metadata,
+                compare_type=True,
+                compare_server_default=True,
+                transaction_per_migration=True,  # 每个迁移文件独立事务，完成即提交
+            )
+
+            with context.begin_transaction():
+                context.run_migrations()
+        except Exception:
+            raise
 
 
 # 根据模式选择运行方式

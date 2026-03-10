@@ -12,6 +12,7 @@ export interface CandidateRecord {
   endpoint_name?: string  // 端点显示名称（api_format）
   key_id?: string
   key_name?: string  // 密钥名称
+  key_account_label?: string  // 更适合展示的测试账号标签（优先 OAuth 邮箱）
   key_preview?: string  // 密钥脱敏预览（如 sk-***abc），OAuth 类型不返回
   key_auth_type?: string  // 密钥认证类型（api_key, service_account, oauth 等）
   key_oauth_plan_type?: string  // OAuth 账号套餐类型（free/plus/team/enterprise）
@@ -59,7 +60,7 @@ export const requestTraceApi = {
     requestId: string,
     options: { attemptedOnly?: boolean } = {},
   ): Promise<RequestTrace> {
-    const attemptedOnly = options.attemptedOnly ?? true
+    const attemptedOnly = options.attemptedOnly ?? false
     const response = await apiClient.get<RequestTrace>(`/api/admin/monitoring/trace/${requestId}`, {
       params: { attempted_only: attemptedOnly },
     })

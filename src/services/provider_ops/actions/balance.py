@@ -8,6 +8,8 @@ from typing import Any
 
 import httpx
 
+from src.core.cache_service import CacheService
+from src.core.logger import logger as _logger
 from src.services.provider_ops.actions.base import ProviderAction
 from src.services.provider_ops.types import (
     ActionResult,
@@ -15,6 +17,9 @@ from src.services.provider_ops.types import (
     BalanceInfo,
     ProviderActionType,
 )
+
+# 签到缓存 TTL（6 小时）
+_CHECKIN_CACHE_TTL = 6 * 3600
 
 
 class BalanceAction(ProviderAction):
@@ -40,7 +45,7 @@ class BalanceAction(ProviderAction):
         """
         执行余额查询（模板方法）
 
-        1. 先尝试签到（如果子类实现了 _do_checkin）
+        1. 先尝试签到（如果子类实现了 _do_checkin），带缓存冷却
         2. 执行余额查询
 
         Args:
@@ -49,10 +54,8 @@ class BalanceAction(ProviderAction):
         Returns:
             ActionResult，其中 data 字段为 BalanceInfo
         """
-        from src.core.logger import logger
-
-        # 先尝试签到
-        checkin_result = await self._do_checkin(client)
+        # 先尝试签到（带缓存冷却）
+        checkin_result = await self._get_or_do_checkin(client)
 
         # 执行余额查询
         result = await self._do_query_balance(client)
@@ -66,11 +69,11 @@ class BalanceAction(ProviderAction):
                 result.data.extra["cookie_expired"] = True
                 result.data.extra["cookie_expired_message"] = checkin_result.get("message", "")
                 result.status = ActionStatus.AUTH_EXPIRED
-                logger.warning(f"Cookie 已失效: {checkin_result}")
+                _logger.warning("Cookie 已失效: {}", checkin_result)
             else:
                 result.data.extra["checkin_success"] = checkin_result.get("success")
                 result.data.extra["checkin_message"] = checkin_result.get("message", "")
-                logger.debug(f"签到结果已附加到 extra: {checkin_result}")
+                _logger.debug("签到结果已附加到 extra: {}", checkin_result)
 
         return result
 
@@ -190,6 +193,39 @@ class BalanceAction(ProviderAction):
                 f"HTTP {status_code}: {response.reason_phrase}",
                 raw_response=raw_data,
             )
+
+    async def _get_or_do_checkin(self, client: httpx.AsyncClient) -> dict[str, Any] | None:
+        """
+        带缓存冷却的签到：优先返回缓存结果，未命中才实际执行签到。
+
+        缓存 key 使用 host（同一站点多个 provider 只需签到一次），TTL 6 小时。
+        签到失败或 cookie_expired 不写入缓存，允许下次重试。
+        """
+        host = str(client.base_url.host or client.base_url.netloc or client.base_url)
+        cache_key = f"provider_ops:checkin:{host}"
+
+        # 检查缓存
+        try:
+            cached = await CacheService.get(cache_key)
+            if cached is not None:
+                _logger.debug("[{}] 签到缓存命中，跳过签到: {}", host, cached)
+                return cached
+        except Exception:
+            pass
+
+        # 缓存未命中，执行签到
+        result = await self._do_checkin(client)
+
+        # 签到成功或"已签到"时写入缓存；失败/cookie_expired 不缓存
+        if result is not None and not result.get("cookie_expired"):
+            success = result.get("success")
+            if success is True or success is None:
+                try:
+                    await CacheService.set(cache_key, result, _CHECKIN_CACHE_TTL)
+                except Exception:
+                    pass
+
+        return result
 
     async def _do_checkin(self, client: httpx.AsyncClient) -> dict[str, Any] | None:
         """

@@ -16,6 +16,7 @@ from src.api.base.context import ApiRequestContext
 from src.api.base.pipeline import ApiRequestPipeline
 from src.config.constants import CacheTTL
 from src.core.crypto import crypto_service
+from src.core.enums import UserRole
 from src.core.exceptions import (
     ForbiddenException,
     InvalidRequestException,
@@ -45,7 +46,9 @@ from src.models.database import (
 from src.services.system.time_range import TimeRangeParams
 from src.services.usage.service import UsageService
 from src.services.user.apikey import ApiKeyService
+from src.services.user.bulk_cleanup import pre_clean_api_key
 from src.services.user.preference import PreferenceService
+from src.services.wallet import WalletService
 from src.utils.cache_decorator import cache_result
 
 router = APIRouter(prefix="/api/users/me", tags=["User Profile"])
@@ -80,7 +83,7 @@ async def get_my_profile(request: Request, db: Session = Depends(get_db)) -> Any
 
     返回当前登录用户的完整信息，包括基本信息和偏好设置。
 
-    **返回字段**: id, email, username, role, is_active, quota_usd, used_usd, preferences 等
+    **返回字段**: id, email, username, role, is_active, billing, preferences 等
     """
     adapter = MeProfileAdapter()
     return await pipeline.run(adapter=adapter, http_request=request, db=db, mode=adapter.mode)
@@ -499,6 +502,7 @@ class UpdateProfileAdapter(AuthenticatedApiAdapter):
 
         user.updated_at = datetime.now(timezone.utc)
         db.commit()
+        context.request.state.tx_committed_by_route = True
         db.refresh(user)
         return {"message": "个人信息更新成功"}
 
@@ -541,6 +545,7 @@ class ChangePasswordAdapter(AuthenticatedApiAdapter):
         user.set_password(request.new_password)
         user.updated_at = datetime.now(timezone.utc)
         db.commit()
+        context.request.state.tx_committed_by_route = True
         action = "修改" if has_password else "设置"
         logger.info(f"用户{action}密码: {user.email}")
         return {"message": f"密码{action}成功"}
@@ -729,8 +734,10 @@ class DeleteMyApiKeyAdapter(AuthenticatedApiAdapter):
             raise NotFoundException("API密钥不存在", "api_key")
         if api_key.is_locked:
             raise ForbiddenException("该密钥已被管理员锁定，无法删除")
+        pre_clean_api_key(context.db, api_key.id)
         context.db.delete(api_key)
         context.db.commit()
+        context.request.state.tx_committed_by_route = True
         return {"message": "API密钥已删除"}
 
 
@@ -752,6 +759,7 @@ class ToggleMyApiKeyAdapter(AuthenticatedApiAdapter):
             raise ForbiddenException("该密钥已被管理员锁定，无法修改状态")
         api_key.is_active = not api_key.is_active
         context.db.commit()
+        context.request.state.tx_committed_by_route = True
         context.db.refresh(api_key)
         return {
             "id": api_key.id,
@@ -826,7 +834,7 @@ class GetUsageAdapter(AuthenticatedApiAdapter):
 
         # 管理员可以看到真实成本
         total_actual_cost = 0.0
-        if user.role == "admin":
+        if user.role == UserRole.ADMIN:
             total_actual_cost = (
                 sum(item.get("actual_total_cost_usd", 0.0) for item in filtered_summary)
                 if filtered_summary
@@ -845,7 +853,7 @@ class GetUsageAdapter(AuthenticatedApiAdapter):
                 "total_cost_usd": 0.0,
             }
             # 管理员可以看到真实成本
-            if user.role == "admin":
+            if user.role == UserRole.ADMIN:
                 base_stats["actual_total_cost_usd"] = 0.0
 
             stats = model_summary.setdefault(model_name, base_stats)
@@ -855,7 +863,7 @@ class GetUsageAdapter(AuthenticatedApiAdapter):
             stats["total_tokens"] += item["total_tokens"]
             stats["total_cost_usd"] += item["total_cost_usd"]
             # 管理员可以看到真实成本
-            if user.role == "admin":
+            if user.role == UserRole.ADMIN:
                 stats["actual_total_cost_usd"] += item.get("actual_total_cost_usd", 0.0)
 
         summary_by_model = sorted(model_summary.values(), key=lambda x: x["requests"], reverse=True)
@@ -983,6 +991,7 @@ class GetUsageAdapter(AuthenticatedApiAdapter):
             if total_success_response_count > 0
             else 0.0
         )
+        wallet = WalletService.get_wallet(db, user_id=user.id)
 
         # 构建响应数据
         response_data = {
@@ -992,8 +1001,7 @@ class GetUsageAdapter(AuthenticatedApiAdapter):
             "total_tokens": total_tokens,
             "total_cost": total_cost,
             "avg_response_time": avg_response_time,
-            "quota_usd": user.quota_usd,
-            "used_usd": user.used_usd,
+            "billing": WalletService.serialize_wallet_summary(wallet),
             "summary_by_model": summary_by_model,
             # 分页信息
             "pagination": {
@@ -1002,11 +1010,13 @@ class GetUsageAdapter(AuthenticatedApiAdapter):
                 "offset": self.offset,
                 "has_more": self.offset + self.limit < total_records,
             },
-            "records": self._build_usage_records(usage_records, is_admin=(user.role == "admin")),
+            "records": self._build_usage_records(
+                usage_records, is_admin=(user.role == UserRole.ADMIN)
+            ),
         }
 
         # 管理员可以看到真实成本
-        if user.role == "admin":
+        if user.role == UserRole.ADMIN:
             response_data["total_actual_cost"] = total_actual_cost
             # 为每条记录添加真实成本和倍率信息
             for i, (r, _, _) in enumerate(usage_records):
@@ -1062,7 +1072,7 @@ class GetUsageAdapter(AuthenticatedApiAdapter):
                     "input_tokens": r.input_tokens,
                     "output_tokens": r.output_tokens,
                     "total_tokens": r.total_tokens,
-                    "cost": r.total_cost_usd,
+                    "cost": float(r.total_cost_usd or 0),
                     "response_time_ms": r.response_time_ms,
                     "first_byte_time_ms": r.first_byte_time_ms,
                     "is_stream": r.is_stream,
@@ -1146,7 +1156,7 @@ class GetMyActivityHeatmapAdapter(AuthenticatedApiAdapter):
         result = await UsageService.get_cached_heatmap(
             db=context.db,
             user_id=user.id,
-            include_actual_cost=user.role == "admin",
+            include_actual_cost=user.role == UserRole.ADMIN,
         )
         context.add_audit_metadata(action="activity_heatmap")
         return result
@@ -1476,6 +1486,7 @@ class UpdateApiKeyProvidersAdapter(AuthenticatedApiAdapter):
         )
         api_key.updated_at = datetime.now(timezone.utc)
         db.commit()
+        context.request.state.tx_committed_by_route = True
         logger.debug(f"用户 {user.id} 更新API密钥 {self.api_key_id} 的可用提供商")
         return {"message": "API密钥可用提供商已更新"}
 
@@ -1525,6 +1536,7 @@ class UpdateApiKeyCapabilitiesAdapter(AuthenticatedApiAdapter):
         api_key.force_capabilities = force_capabilities
         api_key.updated_at = datetime.now(timezone.utc)
         db.commit()
+        context.request.state.tx_committed_by_route = True
 
         # 记录审计日志
         audit_service.log_event(
@@ -1656,6 +1668,7 @@ class UpdateModelCapabilitySettingsAdapter(AuthenticatedApiAdapter):
         user.model_capability_settings = settings
         user.updated_at = datetime.now(timezone.utc)
         db.commit()
+        context.request.state.tx_committed_by_route = True
 
         # 清除用户缓存，确保下次读取时获取最新数据
         await UserCacheService.invalidate_user_cache(user.id, user.email)

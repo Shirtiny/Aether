@@ -9,13 +9,32 @@ import type {
 } from './types'
 
 /**
- * 获取 Providers 摘要（包含 Endpoints 统计）
+ * 获取 Providers 摘要（分页）
  */
-export async function getProvidersSummary(): Promise<ProviderWithEndpointsSummary[]> {
-  return dedupedRequest('providers:summary', async () => {
-    const response = await client.get<ProviderWithEndpointsSummary[]>('/api/admin/providers/summary')
-    return response.data
-  })
+export interface ProviderSummaryQuery {
+  page?: number
+  page_size?: number
+  search?: string
+  status?: string
+  api_format?: string
+  model_id?: string
+}
+
+export interface ProviderSummaryPageResponse {
+  total: number
+  page: number
+  page_size: number
+  items: ProviderWithEndpointsSummary[]
+}
+
+export async function getProvidersSummary(
+  params: ProviderSummaryQuery = {},
+): Promise<ProviderSummaryPageResponse> {
+  const response = await client.get<ProviderSummaryPageResponse>(
+    '/api/admin/providers/summary',
+    { params },
+  )
+  return response.data
 }
 
 /**
@@ -131,7 +150,9 @@ export interface TestModelResponse {
 }
 
 export async function testModel(data: TestModelRequest): Promise<TestModelResponse> {
-  const response = await client.post('/api/admin/provider-query/test-model', data)
+  const response = await client.post('/api/admin/provider-query/test-model', data, {
+    timeout: 10 * 60 * 1000,
+  })
   return response.data
 }
 
@@ -145,17 +166,20 @@ export interface TestModelFailoverRequest {
   api_format?: string
   endpoint_id?: string
   message?: string
+  request_id?: string
+  concurrency?: number
 }
 
 export interface TestAttemptDetail {
   candidate_index: number
+  retry_index?: number
   endpoint_api_format: string
   endpoint_base_url: string
   key_name: string | null
   key_id: string
   auth_type: string
   effective_model?: string | null
-  status: 'success' | 'failed' | 'skipped'
+  status: 'success' | 'failed' | 'skipped' | 'cancelled' | 'pending' | 'streaming' | 'stream_interrupted' | 'available' | 'unused'
   skip_reason?: string | null
   error_message?: string | null
   status_code?: number | null
@@ -173,8 +197,14 @@ export interface TestModelFailoverResponse {
   error?: string | null
 }
 
-export async function testModelFailover(data: TestModelFailoverRequest): Promise<TestModelFailoverResponse> {
-  const response = await client.post('/api/admin/provider-query/test-model-failover', data)
+export async function testModelFailover(
+  data: TestModelFailoverRequest,
+  options: { signal?: AbortSignal } = {}
+): Promise<TestModelFailoverResponse> {
+  const response = await client.post('/api/admin/provider-query/test-model-failover', data, {
+    timeout: 10 * 60 * 1000,
+    signal: options.signal,
+  })
   return response.data
 }
 

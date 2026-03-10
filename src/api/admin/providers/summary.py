@@ -35,6 +35,7 @@ from src.models.endpoint_models import (
     EndpointHealthEvent,
     EndpointHealthMonitor,
     ProviderEndpointHealthMonitorResponse,
+    ProviderSummaryPageResponse,
     ProviderUpdateRequest,
     ProviderWithEndpointsSummary,
 )
@@ -46,46 +47,26 @@ router = APIRouter(tags=["Provider Summary"])
 pipeline = ApiRequestPipeline()
 
 
-@router.get("/summary", response_model=list[ProviderWithEndpointsSummary])
+@router.get("/summary", response_model=ProviderSummaryPageResponse)
 async def get_providers_summary(
     request: Request,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=10000),
+    search: str = Query("", description="按名称搜索"),
+    status: str = Query("all", description="all/active/inactive"),
+    api_format: str = Query("all", description="API 格式筛选"),
+    model_id: str = Query("all", description="全局模型 ID 筛选"),
     db: Session = Depends(get_db),
-) -> list[ProviderWithEndpointsSummary]:
-    """
-    获取所有提供商摘要信息
-
-    获取所有提供商的详细摘要信息，包含端点、密钥、模型统计和健康状态。
-
-    **返回字段**（数组，每项包含）:
-    - `id`: 提供商 ID
-    - `name`: 提供商名称
-    - `description`: 描述信息
-    - `website`: 官网地址
-    - `provider_priority`: 优先级
-    - `is_active`: 是否启用
-    - `billing_type`: 计费类型
-    - `monthly_quota_usd`: 月度配额（美元）
-    - `monthly_used_usd`: 本月已使用金额（美元）
-    - `quota_reset_day`: 配额重置日期
-    - `quota_last_reset_at`: 上次配额重置时间
-    - `quota_expires_at`: 配额过期时间
-    - `timeout`: 默认请求超时（秒）
-    - `max_retries`: 默认最大重试次数
-    - `proxy`: 默认代理配置
-    - `total_endpoints`: 端点总数
-    - `active_endpoints`: 活跃端点数
-    - `total_keys`: 密钥总数
-    - `active_keys`: 活跃密钥数
-    - `total_models`: 模型总数
-    - `active_models`: 活跃模型数
-    - `avg_health_score`: 平均健康分数（0-1）
-    - `unhealthy_endpoints`: 不健康端点数（健康分数 < 0.5）
-    - `api_formats`: 支持的 API 格式列表
-    - `endpoint_health_details`: 端点健康详情（包含 api_format, health_score, is_active, active_keys）
-    - `created_at`: 创建时间
-    - `updated_at`: 更新时间
-    """
-    adapter = AdminProviderSummaryAdapter()
+) -> ProviderSummaryPageResponse:
+    """获取提供商摘要信息（分页）"""
+    adapter = AdminProviderSummaryAdapter(
+        page=page,
+        page_size=page_size,
+        search=search,
+        status=status,
+        api_format=api_format,
+        model_id=model_id,
+    )
     return await pipeline.run(adapter=adapter, http_request=request, db=db, mode=adapter.mode)
 
 
@@ -788,20 +769,71 @@ class AdminProviderHealthMonitorAdapter(AdminApiAdapter):
         return response.model_dump()
 
 
+@dataclass
 class AdminProviderSummaryAdapter(AdminApiAdapter):
-    @cache_result(
-        key_prefix="admin:providers:summary",
-        ttl=CacheTTL.ADMIN_USAGE_RECORDS,
-        user_specific=False,
-    )
+    page: int = 1
+    page_size: int = 20
+    search: str = ""
+    status: str = "all"
+    api_format: str = "all"
+    model_id: str = "all"
+
     async def handle(self, context: ApiRequestContext) -> Any:  # type: ignore[override]
         db = context.db
+
+        query = db.query(Provider)
+
+        # 搜索筛选
+        if self.search.strip():
+            keywords = self.search.strip().lower().split()
+            for kw in keywords:
+                query = query.filter(func.lower(Provider.name).contains(kw))
+
+        # 状态筛选
+        if self.status == "active":
+            query = query.filter(Provider.is_active == True)
+        elif self.status == "inactive":
+            query = query.filter(Provider.is_active == False)
+
+        # API 格式筛选
+        if self.api_format != "all":
+            query = query.filter(
+                Provider.id.in_(
+                    db.query(ProviderEndpoint.provider_id)
+                    .filter(ProviderEndpoint.api_format == self.api_format)
+                    .distinct()
+                )
+            )
+
+        # 全局模型 ID 筛选
+        if self.model_id != "all":
+            query = query.filter(
+                Provider.id.in_(
+                    db.query(Model.provider_id)
+                    .filter(
+                        Model.global_model_id == self.model_id,
+                        Model.is_active == True,
+                    )
+                    .distinct()
+                )
+            )
+
+        total = query.count()
+
         providers = (
-            db.query(Provider)
-            .order_by(Provider.provider_priority.asc(), Provider.created_at.asc())
+            query.order_by(Provider.provider_priority.asc(), Provider.created_at.asc())
+            .offset((self.page - 1) * self.page_size)
+            .limit(self.page_size)
             .all()
         )
-        return [item.model_dump() for item in _build_provider_summaries_batch(db, providers)]
+
+        items = _build_provider_summaries_batch(db, providers)
+        return ProviderSummaryPageResponse(
+            total=total,
+            page=self.page,
+            page_size=self.page_size,
+            items=items,
+        ).model_dump()
 
 
 @dataclass

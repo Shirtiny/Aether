@@ -1,9 +1,9 @@
 """Vertex AI provider plugin — 统一注册入口。
 
-注册 Vertex AI 对各通用 registry 的 hooks：
+注册 Vertex AI 对各通用 registry / capability registry 的 hooks：
 - Transport Hook (URL 构建，支持 API Key / Service Account 双策略)
 - Model Fetcher (专用上游模型获取链路，不走通用 /v1beta/models / /v1/models)
-- Behavior Variants (跨格式支持：同一 Provider 同时访问 Gemini 和 Claude 模型)
+- Provider Format Capability（跨格式支持：同一 Provider 同时访问 Gemini 和 Claude 模型）
 """
 
 from __future__ import annotations
@@ -452,9 +452,9 @@ async def fetch_models_vertex_ai(
 
 def register_all() -> None:
     """一次性注册 Vertex AI 的所有 hooks 到各通用 registry。"""
+    from src.core.api_format.capabilities import register_provider_behavior_variant
     from src.services.model.upstream_fetcher import UpstreamModelsFetcherRegistry
     from src.services.provider.adapters.vertex_ai.transport import build_vertex_ai_url
-    from src.services.provider.behavior import register_behavior_variant
     from src.services.provider.transport import register_transport_hook
 
     # Transport: Vertex AI 同时支持 gemini:chat 和 claude:chat 格式
@@ -467,8 +467,8 @@ def register_all() -> None:
         fetcher=fetch_models_vertex_ai,
     )
 
-    # Behavior: 跨格式支持（同一 Vertex AI Provider 可同时访问 Gemini 和 Claude 模型）
-    register_behavior_variant("vertex_ai", cross_format=True)
+    # Provider Format Capability：跨格式支持（同一 Vertex AI Provider 可同时访问 Gemini 和 Claude 模型）
+    register_provider_behavior_variant("vertex_ai", cross_format=True)
 
 
 __all__ = ["fetch_models_vertex_ai", "register_all"]

@@ -26,6 +26,17 @@ from src.services.provider_keys.quota_refresh import (
 QuotaRefreshHandler = Callable[..., Awaitable[dict]]
 
 
+CODEX_WHAM_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+
+_QUOTA_REFRESH_HANDLERS: dict[str, QuotaRefreshHandler] = {
+    ProviderType.CODEX: refresh_codex_key_quota,
+    ProviderType.ANTIGRAVITY: refresh_antigravity_key_quota,
+    ProviderType.KIRO: refresh_kiro_key_quota,
+}
+
+QUOTA_REFRESH_PROVIDER_TYPES: frozenset[str] = frozenset(_QUOTA_REFRESH_HANDLERS.keys())
+
+
 def _normalize_api_format(api_format: Any) -> str:
     """规范化 api_format，兼容大小写和首尾空白。"""
     if not isinstance(api_format, str):
@@ -55,12 +66,9 @@ def _select_refresh_endpoint(provider: Provider, provider_type: str) -> Provider
 
 def _resolve_quota_refresh_handler(provider_type: str) -> QuotaRefreshHandler:
     """按 provider 类型返回刷新策略。"""
-    if provider_type == ProviderType.CODEX:
-        return refresh_codex_key_quota
-    if provider_type == ProviderType.ANTIGRAVITY:
-        return refresh_antigravity_key_quota
-    if provider_type == ProviderType.KIRO:
-        return refresh_kiro_key_quota
+    handler = _QUOTA_REFRESH_HANDLERS.get(provider_type)
+    if handler is not None:
+        return handler
     raise InvalidRequestException("仅支持 Codex / Antigravity / Kiro 类型的 Provider 刷新限额")
 
 
@@ -76,7 +84,7 @@ async def refresh_provider_quota_for_provider(
         raise NotFoundException(f"Provider {provider_id} 不存在")
 
     provider_type = normalize_provider_type(getattr(provider, "provider_type", ""))
-    if provider_type not in {ProviderType.CODEX, ProviderType.ANTIGRAVITY, ProviderType.KIRO}:
+    if provider_type not in QUOTA_REFRESH_PROVIDER_TYPES:
         raise InvalidRequestException("仅支持 Codex / Antigravity / Kiro 类型的 Provider 刷新限额")
     pool_cfg = parse_pool_config(getattr(provider, "config", None))
     auto_remove_banned_keys = bool(pool_cfg and pool_cfg.auto_remove_banned_keys)

@@ -10,6 +10,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from src.api.base.admin_adapter import AdminApiAdapter
@@ -228,20 +229,26 @@ class AdminProviderStatsAdapter(AdminApiAdapter):
             raise HTTPException(status_code=404, detail="Provider not found")
 
         since = datetime.now(timezone.utc) - timedelta(hours=self.hours)
-        stats = (
-            db.query(ProviderUsageTracking)
+        row = (
+            db.query(
+                func.coalesce(func.sum(ProviderUsageTracking.total_requests), 0),
+                func.coalesce(func.sum(ProviderUsageTracking.successful_requests), 0),
+                func.coalesce(func.sum(ProviderUsageTracking.failed_requests), 0),
+                func.coalesce(func.avg(ProviderUsageTracking.avg_response_time_ms), 0),
+                func.coalesce(func.sum(ProviderUsageTracking.total_cost_usd), 0),
+            )
             .filter(
                 ProviderUsageTracking.provider_id == self.provider_id,
                 ProviderUsageTracking.window_start >= since,
             )
-            .all()
+            .one()
         )
 
-        total_requests = sum(s.total_requests for s in stats)
-        total_success = sum(s.successful_requests for s in stats)
-        total_failures = sum(s.failed_requests for s in stats)
-        avg_response_time = sum(s.avg_response_time_ms for s in stats) / len(stats) if stats else 0
-        total_cost = sum(s.total_cost_usd for s in stats)
+        total_requests = int(row[0])
+        total_success = int(row[1])
+        total_failures = int(row[2])
+        avg_response_time = float(row[3])
+        total_cost = float(row[4])
 
         return JSONResponse(
             {
@@ -250,10 +257,14 @@ class AdminProviderStatsAdapter(AdminApiAdapter):
                 "period_hours": self.hours,
                 "billing_info": {
                     "billing_type": provider.billing_type.value,
-                    "monthly_quota_usd": provider.monthly_quota_usd,
-                    "monthly_used_usd": provider.monthly_used_usd,
+                    "monthly_quota_usd": (
+                        float(provider.monthly_quota_usd)
+                        if provider.monthly_quota_usd is not None
+                        else None
+                    ),
+                    "monthly_used_usd": float(provider.monthly_used_usd or 0),
                     "quota_remaining_usd": (
-                        provider.monthly_quota_usd - provider.monthly_used_usd
+                        float(provider.monthly_quota_usd - provider.monthly_used_usd)
                         if provider.monthly_quota_usd is not None
                         else None
                     ),

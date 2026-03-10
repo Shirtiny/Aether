@@ -16,7 +16,8 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field, ValidationError
-from sqlalchemy.orm import Session
+from sqlalchemy import func
+from sqlalchemy.orm import Session, load_only
 
 from src.api.base.admin_adapter import AdminApiAdapter
 from src.api.base.context import ApiRequestContext
@@ -360,18 +361,35 @@ class SetRPMLimitAdapter(AdminApiAdapter):
 
 class AdaptiveSummaryAdapter(AdminApiAdapter):
     async def handle(self, context: ApiRequestContext) -> Any:  # type: ignore[override]
-        # 自适应模式：rpm_limit = NULL
-        adaptive_keys = (
-            context.db.query(ProviderAPIKey).filter(ProviderAPIKey.rpm_limit.is_(None)).all()
+        db = context.db
+        is_adaptive = ProviderAPIKey.rpm_limit.is_(None)
+
+        # SQL 聚合获取 count / sum，避免全表 ORM 加载
+        total_keys, total_concurrent_429, total_rpm_429 = (
+            db.query(
+                func.count(ProviderAPIKey.id),
+                func.coalesce(func.sum(ProviderAPIKey.concurrent_429_count), 0),
+                func.coalesce(func.sum(ProviderAPIKey.rpm_429_count), 0),
+            )
+            .filter(is_adaptive)
+            .one()
         )
 
-        total_keys = len(adaptive_keys)
-        total_concurrent_429 = sum(key.concurrent_429_count or 0 for key in adaptive_keys)
-        total_rpm_429 = sum(key.rpm_429_count or 0 for key in adaptive_keys)
-        total_adjustments = sum(len(key.adjustment_history or []) for key in adaptive_keys)
+        # adjustment_history 是 JSON 列，长度只能在 Python 侧统计；
+        # 只加载有历史记录的 key 的必要列
+        keys_with_history = (
+            db.query(ProviderAPIKey)
+            .options(
+                load_only(ProviderAPIKey.id, ProviderAPIKey.name, ProviderAPIKey.adjustment_history)
+            )
+            .filter(is_adaptive, ProviderAPIKey.adjustment_history.isnot(None))
+            .all()
+        )
+
+        total_adjustments = sum(len(key.adjustment_history or []) for key in keys_with_history)
 
         recent_adjustments = []
-        for key in adaptive_keys:
+        for key in keys_with_history:
             if key.adjustment_history:
                 for adj in key.adjustment_history[-3:]:
                     recent_adjustments.append(
@@ -386,8 +404,8 @@ class AdaptiveSummaryAdapter(AdminApiAdapter):
 
         return {
             "total_adaptive_keys": total_keys,
-            "total_concurrent_429_errors": total_concurrent_429,
-            "total_rpm_429_errors": total_rpm_429,
+            "total_concurrent_429_errors": int(total_concurrent_429),
+            "total_rpm_429_errors": int(total_rpm_429),
             "total_adjustments": total_adjustments,
             "recent_adjustments": recent_adjustments[:10],
         }

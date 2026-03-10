@@ -717,49 +717,44 @@ function parseAllowedModels(allowed: AllowedModels): string[] {
   return [...allowed]
 }
 
-// 监听对话框打开
-watch(() => props.open, async (open) => {
-  if (open && props.apiKey) {
-    loadingCancelled = false
+async function initializeDialogState(apiKey: EndpointAPIKey) {
+  loadingCancelled = false
 
-    const parsed = parseAllowedModels(props.apiKey.allowed_models ?? null)
-    selectedModels.value = [...parsed]
-    initialSelectedModels.value = [...parsed]
+  const parsed = parseAllowedModels(apiKey.allowed_models ?? null)
+  selectedModels.value = [...parsed]
+  initialSelectedModels.value = [...parsed]
 
-    // 加载锁定的模型
-    const locked = props.apiKey.locked_models ?? []
-    lockedModels.value = [...locked]
-    initialLockedModels.value = [...locked]
+  const locked = apiKey.locked_models ?? []
+  lockedModels.value = [...locked]
+  initialLockedModels.value = [...locked]
 
-    searchQuery.value = ''
-    upstreamModels.value = []
-    upstreamModelsLoaded.value = false
-    allCustomModels.value = []
+  searchQuery.value = ''
+  upstreamModels.value = []
+  upstreamModelsLoaded.value = false
+  allCustomModels.value = []
 
-    // 自动获取模式下展开上游模型，其他收缩；非自动获取模式下全部展开
-    if (props.apiKey.auto_fetch_models) {
-      collapsedGroups.value = new Set(['global', 'custom'])
-    } else {
-      collapsedGroups.value = new Set()
-    }
+  if (apiKey.auto_fetch_models) {
+    collapsedGroups.value = new Set(['global', 'custom'])
+  } else {
+    collapsedGroups.value = new Set()
+  }
 
-    // 加载该 Provider 已关联模型
-    await loadProviderModels()
+  await loadProviderModels()
 
-    // 自动获取模式下，获取上游模型用于显示（但选中状态使用已保存的 allowed_models）
-    if (props.apiKey.auto_fetch_models) {
-      await fetchUpstreamModels()
-      // 注意：不再将所有上游模型自动标记为选中
-      // 因为后端有过滤规则，实际保存的 allowed_models 是过滤后的结果
-      // selectedModels 已在上面从 props.apiKey.allowed_models 初始化
-    }
+  if (apiKey.auto_fetch_models) {
+    await fetchUpstreamModels()
+  }
 
-    // 提取自定义模型（不在提供商模型和上游模型中的）
-    const upstreamModelIdsSet = new Set(upstreamModels.value.map(m => m.id))
-    // 自定义模型是用户手动添加的、不在已知模型列表中的
-    allCustomModels.value = selectedModels.value.filter(m =>
-      !providerModelNamesSet.value.has(m) && !upstreamModelIdsSet.has(m)
-    )
+  const upstreamModelIdsSet = new Set(upstreamModels.value.map(m => m.id))
+  allCustomModels.value = selectedModels.value.filter(m =>
+    !providerModelNamesSet.value.has(m) && !upstreamModelIdsSet.has(m)
+  )
+}
+
+// 监听对话框打开 / 当前 key 变化
+watch([() => props.open, () => props.apiKey], async ([open, apiKey]) => {
+  if (open && apiKey) {
+    await initializeDialogState(apiKey)
   } else {
     loadingCancelled = true
   }

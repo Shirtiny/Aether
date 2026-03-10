@@ -10,13 +10,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query, Request
-from sqlalchemy import case, func
+from sqlalchemy import case
+from sqlalchemy import delete as sa_delete
+from sqlalchemy import func
 from sqlalchemy.orm import Session, load_only
 
 from src.api.base.admin_adapter import AdminApiAdapter
@@ -26,7 +29,7 @@ from src.core.crypto import crypto_service
 from src.core.exceptions import NotFoundException
 from src.core.logger import logger
 from src.database import get_db
-from src.models.database import Provider, ProviderAPIKey, Usage
+from src.models.database import Provider, ProviderAPIKey
 from src.services.provider.fingerprint import generate_fingerprint
 from src.services.provider.pool import redis_ops as pool_redis
 from src.services.provider.pool.account_state import resolve_pool_account_state
@@ -37,10 +40,13 @@ from src.services.provider.pool.scheduling_dimensions import (
     evaluate_pool_scheduling_dimensions,
     summarize_pool_scheduling_dimensions,
 )
+from src.services.provider_keys.key_side_effects import cleanup_key_references
+from src.services.provider_keys.quota_reader import get_quota_reader
 
 from .schemas import (
     BatchActionRequest,
     BatchActionResponse,
+    BatchDeleteTaskResponse,
     BatchImportError,
     BatchImportRequest,
     BatchImportResponse,
@@ -151,7 +157,31 @@ ALLOWED_ACTIONS = {
     "clear_cooldown",
     "reset_cost",
     "regenerate_fingerprint",
+    "clear_proxy",
+    "set_proxy",
 }
+
+_SQLITE_DELETE_BATCH_SIZE = 900
+_DEFAULT_DELETE_BATCH_SIZE = 2000
+
+
+def _iter_batches(items: list[str], batch_size: int) -> list[list[str]]:
+    if batch_size <= 0:
+        return [items]
+    return [items[i : i + batch_size] for i in range(0, len(items), batch_size)]
+
+
+def _resolve_delete_batch_size(db: Session) -> int:
+    try:
+        bind = db.get_bind()
+        dialect_name = str(getattr(getattr(bind, "dialect", None), "name", "") or "").lower()
+    except Exception:
+        dialect_name = ""
+
+    if dialect_name == "sqlite":
+        return _SQLITE_DELETE_BATCH_SIZE
+    return _DEFAULT_DELETE_BATCH_SIZE
+
 
 _COOLDOWN_REASON_LABELS: dict[str, str] = {
     "rate_limited_429": "429 限流",
@@ -197,180 +227,12 @@ def _is_known_banned_key(key: ProviderAPIKey, provider_type: str) -> bool:
     return state.blocked
 
 
-def _format_percent(value: float) -> str:
-    clamped = max(0.0, min(value, 100.0))
-    return f"{clamped:.1f}%"
-
-
-def _format_quota_value(value: float) -> str:
-    rounded = round(value)
-    if abs(value - rounded) < 1e-6:
-        return str(rounded)
-    return f"{value:.1f}"
-
-
-def _format_reset_after(seconds_raw: Any) -> str | None:
-    seconds = _to_float(seconds_raw)
-    if seconds is None:
-        return None
-
-    total_seconds = int(seconds)
-    if total_seconds <= 0:
-        return "已重置"
-
-    days = total_seconds // 86400
-    hours = (total_seconds % 86400) // 3600
-    minutes = (total_seconds % 3600) // 60
-
-    if days > 0:
-        return f"{days}天{hours}小时后重置"
-    if hours > 0:
-        return f"{hours}小时{minutes}分钟后重置"
-    if minutes > 0:
-        return f"{minutes}分钟后重置"
-    return "即将重置"
-
-
-def _build_codex_account_quota(upstream_metadata: dict[str, Any]) -> str | None:
-    codex = upstream_metadata.get("codex")
-    if not isinstance(codex, dict):
-        return None
-
-    parts: list[str] = []
-
-    primary_used = _to_float(codex.get("primary_used_percent"))
-    if primary_used is not None:
-        part = f"周剩余 {_format_percent(100.0 - primary_used)}"
-        reset_text = _format_reset_after(codex.get("primary_reset_seconds"))
-        if reset_text:
-            part = f"{part} ({reset_text})"
-        parts.append(part)
-
-    secondary_used = _to_float(codex.get("secondary_used_percent"))
-    if secondary_used is not None:
-        part = f"5H剩余 {_format_percent(100.0 - secondary_used)}"
-        reset_text = _format_reset_after(codex.get("secondary_reset_seconds"))
-        if reset_text:
-            part = f"{part} ({reset_text})"
-        parts.append(part)
-
-    if parts:
-        return " | ".join(parts)
-
-    has_credits = codex.get("has_credits")
-    credits_balance = _to_float(codex.get("credits_balance"))
-    if has_credits is True and credits_balance is not None:
-        return f"积分 {credits_balance:.2f}"
-    if has_credits is True:
-        return "有积分"
-    return None
-
-
-def _build_kiro_account_quota(upstream_metadata: dict[str, Any]) -> str | None:
-    kiro = upstream_metadata.get("kiro")
-    if not isinstance(kiro, dict):
-        return None
-
-    if kiro.get("is_banned") is True:
-        return "账号已封禁"
-
-    usage_percentage = _to_float(kiro.get("usage_percentage"))
-    if usage_percentage is not None:
-        remaining = 100.0 - usage_percentage
-        current_usage = _to_float(kiro.get("current_usage"))
-        usage_limit = _to_float(kiro.get("usage_limit"))
-        if current_usage is not None and usage_limit is not None and usage_limit > 0:
-            return (
-                f"剩余 {_format_percent(remaining)} "
-                f"({_format_quota_value(current_usage)}/{_format_quota_value(usage_limit)})"
-            )
-        return f"剩余 {_format_percent(remaining)}"
-
-    remaining = _to_float(kiro.get("remaining"))
-    usage_limit = _to_float(kiro.get("usage_limit"))
-    if remaining is not None and usage_limit is not None and usage_limit > 0:
-        return f"剩余 {_format_quota_value(remaining)}/{_format_quota_value(usage_limit)}"
-    return None
-
-
-def _build_antigravity_account_quota(upstream_metadata: dict[str, Any]) -> str | None:
-    antigravity = upstream_metadata.get("antigravity")
-    if not isinstance(antigravity, dict):
-        return None
-
-    if antigravity.get("is_forbidden") is True:
-        return "访问受限"
-
-    quota_by_model = antigravity.get("quota_by_model")
-    if not isinstance(quota_by_model, dict) or not quota_by_model:
-        return None
-
-    remaining_list: list[float] = []
-    for raw_info in quota_by_model.values():
-        if not isinstance(raw_info, dict):
-            continue
-
-        used_percent = _to_float(raw_info.get("used_percent"))
-        if used_percent is None:
-            remaining_fraction = _to_float(raw_info.get("remaining_fraction"))
-            if remaining_fraction is not None:
-                used_percent = (1.0 - remaining_fraction) * 100.0
-
-        if used_percent is None:
-            continue
-
-        remaining = max(0.0, min(100.0 - used_percent, 100.0))
-        remaining_list.append(remaining)
-
-    if not remaining_list:
-        return None
-
-    min_remaining = min(remaining_list)
-    if len(remaining_list) == 1:
-        return f"剩余 {_format_percent(min_remaining)}"
-    return f"最低剩余 {_format_percent(min_remaining)} ({len(remaining_list)} 模型)"
-
-
 def _build_account_quota(provider_type: str, upstream_metadata: Any) -> str | None:
-    if not isinstance(upstream_metadata, dict):
-        return None
-
-    normalized_type = provider_type.strip().lower()
-    if normalized_type == "codex":
-        return _build_codex_account_quota(upstream_metadata)
-    if normalized_type == "kiro":
-        return _build_kiro_account_quota(upstream_metadata)
-    if normalized_type == "antigravity":
-        return _build_antigravity_account_quota(upstream_metadata)
-    return None
+    return get_quota_reader(provider_type, upstream_metadata).display_summary()
 
 
 def _extract_quota_updated_at(provider_type: str, upstream_metadata: Any) -> int | None:
-    if not isinstance(upstream_metadata, dict):
-        return None
-
-    normalized_type = provider_type.strip().lower()
-    if normalized_type == "codex":
-        source = upstream_metadata.get("codex")
-    elif normalized_type == "antigravity":
-        source = upstream_metadata.get("antigravity")
-    elif normalized_type == "kiro":
-        source = upstream_metadata.get("kiro")
-    else:
-        return None
-
-    if not isinstance(source, dict):
-        return None
-
-    updated_at = _to_float(source.get("updated_at"))
-    if updated_at is None or updated_at <= 0:
-        return None
-
-    # 部分上游可能返回毫秒时间戳，统一转换为秒
-    if updated_at > 1_000_000_000_000:
-        updated_at /= 1000
-
-    return int(updated_at)
+    return get_quota_reader(provider_type, upstream_metadata).updated_at()
 
 
 def _normalize_oauth_plan_type(plan_type: Any, provider_type: str) -> str | None:
@@ -588,6 +450,21 @@ async def batch_action_keys(
     return await pipeline.run(adapter=adapter, http_request=request, db=db, mode=adapter.mode)
 
 
+@router.get(
+    "/{provider_id}/keys/batch-delete-task/{task_id}",
+    response_model=BatchDeleteTaskResponse,
+)
+async def get_batch_delete_task_status(
+    provider_id: str,
+    task_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> BatchDeleteTaskResponse:
+    """Query the progress of an async batch-delete task."""
+    adapter = AdminBatchDeleteTaskStatusAdapter(provider_id=provider_id, task_id=task_id)
+    return await pipeline.run(adapter=adapter, http_request=request, db=db, mode=adapter.mode)
+
+
 @router.post("/{provider_id}/keys/cleanup-banned", response_model=BatchActionResponse)
 async def cleanup_banned_keys(
     provider_id: str,
@@ -602,6 +479,28 @@ async def cleanup_banned_keys(
 # ---------------------------------------------------------------------------
 # Adapters
 # ---------------------------------------------------------------------------
+
+
+@dataclass
+class AdminBatchDeleteTaskStatusAdapter(AdminApiAdapter):
+    provider_id: str = ""
+    task_id: str = ""
+
+    async def handle(self, context: ApiRequestContext) -> Any:  # type: ignore[override]
+        from fastapi import HTTPException
+
+        from src.services.provider_keys.batch_delete_task import get_batch_delete_task
+
+        task = await get_batch_delete_task(self.task_id)
+        if task is None or task.provider_id != self.provider_id:
+            raise HTTPException(status_code=404, detail="Task not found")
+        return BatchDeleteTaskResponse(
+            task_id=task.task_id,
+            status=task.status,
+            total=task.total,
+            deleted=task.deleted,
+            message=task.message,
+        )
 
 
 class AdminListSchedulingPresetsAdapter(AdminApiAdapter):
@@ -731,6 +630,12 @@ class AdminListPoolKeysAdapter(AdminApiAdapter):
     status: str = "all"
 
     async def handle(self, context: ApiRequestContext) -> Any:  # type: ignore[override]
+        started_at = time.perf_counter()
+        count_query_ms = 0.0
+        keys_query_ms = 0.0
+        redis_state_ms = 0.0
+        serialize_ms = 0.0
+
         db = context.db
         provider = db.query(Provider).filter(Provider.id == self.provider_id).first()
         if not provider:
@@ -796,6 +701,7 @@ class AdminListPoolKeysAdapter(AdminApiAdapter):
         # Limit scan range to avoid loading the entire table into memory.
         if self.status == "cooldown":
             _max_scan = 2000
+            keys_query_started_at = time.perf_counter()
             all_keys = (
                 q.order_by(
                     ProviderAPIKey.internal_priority.asc(),
@@ -804,15 +710,21 @@ class AdminListPoolKeysAdapter(AdminApiAdapter):
                 .limit(_max_scan)
                 .all()
             )
+            keys_query_ms = (time.perf_counter() - keys_query_started_at) * 1000.0
             key_ids = [str(k.id) for k in all_keys]
+            cooldown_scan_started_at = time.perf_counter()
             cooldowns = await pool_redis.batch_get_cooldowns(pid, key_ids) if key_ids else {}
+            redis_state_ms += (time.perf_counter() - cooldown_scan_started_at) * 1000.0
             all_keys = [k for k in all_keys if cooldowns.get(str(k.id)) is not None]
             total = len(all_keys)
             offset = (self.page - 1) * self.page_size
             keys = all_keys[offset : offset + self.page_size]
         else:
+            count_query_started_at = time.perf_counter()
             total = int(q.with_entities(func.count(ProviderAPIKey.id)).scalar() or 0)
+            count_query_ms = (time.perf_counter() - count_query_started_at) * 1000.0
             offset = (self.page - 1) * self.page_size
+            keys_query_started_at = time.perf_counter()
             keys = (
                 q.order_by(
                     ProviderAPIKey.internal_priority.asc(),
@@ -822,6 +734,7 @@ class AdminListPoolKeysAdapter(AdminApiAdapter):
                 .limit(self.page_size)
                 .all()
             )
+            keys_query_ms = (time.perf_counter() - keys_query_started_at) * 1000.0
 
         # Batch fetch Redis state (parallel where possible)
         key_ids = [str(k.id) for k in keys]
@@ -844,6 +757,7 @@ class AdminListPoolKeysAdapter(AdminApiAdapter):
                 if pcfg
                 else asyncio.sleep(0, result={})
             )
+            redis_started_at = time.perf_counter()
             (
                 cooldowns,
                 cooldown_ttls,
@@ -857,6 +771,7 @@ class AdminListPoolKeysAdapter(AdminApiAdapter):
                 _latency_coro,
                 _cost_coro,
             )
+            redis_state_ms += (time.perf_counter() - redis_started_at) * 1000.0
         else:
             cooldowns, cooldown_ttls, lru_scores, latency_avgs, cost_totals = (
                 {},
@@ -866,36 +781,8 @@ class AdminListPoolKeysAdapter(AdminApiAdapter):
                 {},
             )
 
-        usage_stats_by_key: dict[str, dict[str, Any]] = {}
-        if key_ids:
-            usage_rows = (
-                db.query(
-                    Usage.provider_api_key_id.label("key_id"),
-                    func.count(Usage.id).label("request_count"),
-                    func.coalesce(func.sum(Usage.total_tokens), 0).label("total_tokens"),
-                    func.coalesce(func.sum(Usage.total_cost_usd), 0.0).label("total_cost_usd"),
-                    func.max(Usage.created_at).label("last_used_at"),
-                )
-                .filter(
-                    Usage.provider_id == pid,
-                    Usage.provider_api_key_id.in_(key_ids),
-                    Usage.status.notin_(["pending", "streaming"]),
-                )
-                .group_by(Usage.provider_api_key_id)
-                .all()
-            )
-            usage_stats_by_key = {
-                str(row.key_id): {
-                    "request_count": int(row.request_count or 0),
-                    "total_tokens": int(row.total_tokens or 0),
-                    "total_cost_usd": float(row.total_cost_usd or 0.0),
-                    "last_used_at": getattr(row, "last_used_at", None),
-                }
-                for row in usage_rows
-                if getattr(row, "key_id", None)
-            }
-
         key_details: list[PoolKeyDetail] = []
+        serialize_started_at = time.perf_counter()
         for k in keys:
             kid = str(k.id)
             cd_reason = cooldowns.get(kid)
@@ -976,15 +863,8 @@ class AdminListPoolKeysAdapter(AdminApiAdapter):
                 if isinstance(getattr(k, "api_formats", None), list)
                 else []
             )
-            key_usage_stats = usage_stats_by_key.get(kid, {})
-            key_request_count = int(
-                key_usage_stats.get("request_count") or getattr(k, "request_count", 0) or 0
-            )
-            key_total_tokens = int(key_usage_stats.get("total_tokens") or 0)
-            key_total_cost_usd = float(key_usage_stats.get("total_cost_usd") or 0.0)
-            key_last_used_at = getattr(k, "last_used_at", None) or key_usage_stats.get(
-                "last_used_at"
-            )
+            key_request_count = int(getattr(k, "request_count", 0) or 0)
+            key_last_used_at = getattr(k, "last_used_at", None)
             oauth_auth_config = _extract_oauth_auth_config(k)
 
             key_details.append(
@@ -1013,9 +893,13 @@ class AdminListPoolKeysAdapter(AdminApiAdapter):
                     rate_multipliers=rate_multipliers,
                     internal_priority=int(getattr(k, "internal_priority", 50) or 50),
                     rpm_limit=getattr(k, "rpm_limit", None),
-                    cache_ttl_minutes=int(getattr(k, "cache_ttl_minutes", 5) or 5),
-                    max_probe_interval_minutes=int(
-                        getattr(k, "max_probe_interval_minutes", 32) or 32
+                    cache_ttl_minutes=(
+                        v if (v := getattr(k, "cache_ttl_minutes", None)) is not None else 5
+                    ),
+                    max_probe_interval_minutes=(
+                        v
+                        if (v := getattr(k, "max_probe_interval_minutes", None)) is not None
+                        else 32
                     ),
                     note=getattr(k, "note", None),
                     allowed_models=allowed_models,
@@ -1039,8 +923,6 @@ class AdminListPoolKeysAdapter(AdminApiAdapter):
                     cost_window_usage=cost_usage,
                     cost_limit=cost_limit,
                     request_count=key_request_count,
-                    total_tokens=key_total_tokens,
-                    total_cost_usd=key_total_cost_usd,
                     sticky_sessions=sticky_counts.get(kid, 0),
                     lru_score=lru_scores.get(kid),
                     created_at=(
@@ -1053,6 +935,23 @@ class AdminListPoolKeysAdapter(AdminApiAdapter):
                     scheduling_reasons=scheduling_reasons,
                 )
             )
+        serialize_ms = (time.perf_counter() - serialize_started_at) * 1000.0
+
+        total_ms = (time.perf_counter() - started_at) * 1000.0
+        logger.info(
+            "[POOL_KEYS_TIMING] provider={} page={} page_size={} status={} search={} total={} count_ms={:.2f} fetch_ms={:.2f} redis_ms={:.2f} serialize_ms={:.2f} total_ms={:.2f}",
+            pid[:8],
+            self.page,
+            self.page_size,
+            self.status,
+            bool(self.search),
+            total,
+            count_query_ms,
+            keys_query_ms,
+            redis_state_ms,
+            serialize_ms,
+            total_ms,
+        )
 
         return PoolKeysPageResponse(
             total=total,
@@ -1151,6 +1050,13 @@ class AdminBatchActionKeysAdapter(AdminApiAdapter):
                 ),
             )
 
+        if self.body.action == "set_proxy":
+            if not isinstance(self.body.payload, dict) or not self.body.payload:
+                raise HTTPException(
+                    status_code=400,
+                    detail="set_proxy action requires a non-empty payload with proxy config",
+                )
+
         db = context.db
         provider = db.query(Provider).filter(Provider.id == self.provider_id).first()
         if not provider:
@@ -1159,49 +1065,81 @@ class AdminBatchActionKeysAdapter(AdminApiAdapter):
         pid = str(provider.id)
         affected = 0
 
-        keys = (
-            db.query(ProviderAPIKey)
-            .filter(
-                ProviderAPIKey.provider_id == pid,
-                ProviderAPIKey.id.in_(self.body.key_ids),
+        if self.body.action == "delete":
+            from src.services.provider_keys.batch_delete_task import submit_batch_delete
+
+            key_ids = list(dict.fromkeys(self.body.key_ids))
+            task_id = await submit_batch_delete(pid, key_ids)
+            admin_name = context.user.username if context.user else "admin"
+            logger.info(
+                "Pool batch delete submitted by {}: provider={}, keys={}, task_id={}",
+                admin_name,
+                pid[:8],
+                len(key_ids),
+                task_id,
             )
-            .all()
-        )
+            return BatchActionResponse(
+                affected=0,
+                message=f"delete task submitted ({len(key_ids)} keys)",
+                task_id=task_id,
+            )
+        else:
+            keys = (
+                db.query(ProviderAPIKey)
+                .filter(
+                    ProviderAPIKey.provider_id == pid,
+                    ProviderAPIKey.id.in_(self.body.key_ids),
+                )
+                .all()
+            )
 
-        for key in keys:
-            kid = str(key.id)
+            for key in keys:
+                kid = str(key.id)
 
-            if self.body.action == "enable":
-                key.is_active = True
-                affected += 1
+                if self.body.action == "enable":
+                    key.is_active = True
+                    affected += 1
 
-            elif self.body.action == "disable":
-                key.is_active = False
-                affected += 1
+                elif self.body.action == "disable":
+                    key.is_active = False
+                    affected += 1
 
-            elif self.body.action == "delete":
-                db.delete(key)
-                affected += 1
+                elif self.body.action == "clear_cooldown":
+                    await pool_redis.clear_cooldown(pid, kid)
+                    affected += 1
 
-            elif self.body.action == "clear_cooldown":
-                await pool_redis.clear_cooldown(pid, kid)
-                affected += 1
+                elif self.body.action == "reset_cost":
+                    await pool_redis.clear_cost(pid, kid)
+                    affected += 1
 
-            elif self.body.action == "reset_cost":
-                await pool_redis.clear_cost(pid, kid)
-                affected += 1
+                elif self.body.action == "clear_proxy":
+                    key.proxy = None
+                    affected += 1
 
-            elif self.body.action == "regenerate_fingerprint":
-                key.fingerprint = generate_fingerprint(seed=None)
-                affected += 1
+                elif self.body.action == "set_proxy":
+                    key.proxy = self.body.payload
+                    affected += 1
 
-        if self.body.action in {"enable", "disable", "delete", "regenerate_fingerprint"}:
-            try:
-                db.commit()
-            except Exception as exc:
-                db.rollback()
-                logger.error("batch action commit failed: {}", exc)
-                return BatchActionResponse(affected=0, message=f"commit failed: {exc}")
+                elif self.body.action == "regenerate_fingerprint":
+                    key.fingerprint = generate_fingerprint(seed=None)
+                    affected += 1
+
+            if self.body.action in {
+                "enable",
+                "disable",
+                "regenerate_fingerprint",
+                "clear_proxy",
+                "set_proxy",
+            }:
+                try:
+                    db.commit()
+                except Exception as exc:
+                    db.rollback()
+                    logger.error("batch action commit failed: {}", exc)
+                    return BatchActionResponse(affected=0, message=f"commit failed: {exc}")
+
+            admin_name = context.user.username if context.user else "admin"
+            affected_ids = [str(k.id)[:8] for k in keys]
 
         action_labels = {
             "enable": "enabled",
@@ -1210,10 +1148,9 @@ class AdminBatchActionKeysAdapter(AdminApiAdapter):
             "clear_cooldown": "cooldown cleared",
             "reset_cost": "cost reset",
             "regenerate_fingerprint": "fingerprint regenerated",
+            "clear_proxy": "proxy cleared",
+            "set_proxy": "proxy set",
         }
-
-        admin_name = context.user.username if context.user else "admin"
-        affected_ids = [str(k.id)[:8] for k in keys]
         logger.info(
             "Pool batch action by {}: provider={}, action={}, affected={}, key_ids={}",
             admin_name,
@@ -1249,10 +1186,14 @@ class AdminCleanupBannedKeysAdapter(AdminApiAdapter):
             return BatchActionResponse(affected=0, message="未发现已知封号账号")
 
         banned_key_ids = [str(key.id) for key in banned_keys]
-        for key in banned_keys:
-            db.delete(key)
-
         try:
+            cleanup_key_references(db, banned_key_ids)
+            db.execute(
+                sa_delete(ProviderAPIKey).where(
+                    ProviderAPIKey.provider_id == pid,
+                    ProviderAPIKey.id.in_(banned_key_ids),
+                )
+            )
             db.commit()
         except Exception as exc:
             db.rollback()

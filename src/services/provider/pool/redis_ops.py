@@ -16,10 +16,9 @@ provider_oauth_token_cache:{key_id}        STRING  -> access_token (TTL: expires
 
 from __future__ import annotations
 
-import asyncio
 import time
 import uuid
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from src.clients.redis_client import get_redis_client
 from src.core.logger import logger
@@ -40,6 +39,11 @@ def _lru_key(provider_id: str) -> str:
 
 def _cooldown_key(provider_id: str, key_id: str) -> str:
     return f"{PREFIX}:{provider_id}:cooldown:{key_id}"
+
+
+def _cooldown_index_key(provider_id: str) -> str:
+    """SET tracking which keys are in cooldown (for O(1) count queries)."""
+    return f"{PREFIX}:{provider_id}:cooldown_idx"
 
 
 def _cost_key(provider_id: str, key_id: str) -> str:
@@ -78,13 +82,12 @@ redis.call("EXPIRE", KEYS[1], tonumber(ARGV[1]))
 return binding
 """
 
-# Cost window cleanup + sum tokens in a single round-trip.
+# Cost window sum (read-only, no cleanup on read path for performance).
 # KEYS[1] = cost zset key, ARGV[1] = window_start timestamp
 # Returns total token count within the window.
 _COST_WINDOW_SUM_LUA = """
 local key = KEYS[1]
 local window_start = tonumber(ARGV[1])
-redis.call("ZREMRANGEBYSCORE", key, "-inf", window_start)
 local members = redis.call("ZRANGEBYSCORE", key, window_start, "+inf")
 local total = 0
 for _, m in ipairs(members) do
@@ -97,13 +100,12 @@ end
 return total
 """
 
-# Latency window cleanup + average in a single round-trip.
+# Latency window average (read-only, no cleanup on read path for performance).
 # KEYS[1] = latency zset key, ARGV[1] = window_start timestamp
 # Returns nil when there are no samples, or avg(ms) as number.
 _LATENCY_WINDOW_AVG_LUA = """
 local key = KEYS[1]
 local window_start = tonumber(ARGV[1])
-redis.call("ZREMRANGEBYSCORE", key, "-inf", window_start)
 local members = redis.call("ZRANGEBYSCORE", key, window_start, "+inf")
 local total = 0
 local count = 0
@@ -218,7 +220,16 @@ async def set_cooldown(provider_id: str, key_id: str, reason: str, ttl: int) -> 
     if redis is None:
         return
     try:
-        await redis.setex(_cooldown_key(provider_id, key_id), ttl, reason)
+        pipe = redis.pipeline()
+        pipe.setex(_cooldown_key(provider_id, key_id), ttl, reason)
+        # Track in index set for O(1) count queries.
+        idx_key = _cooldown_index_key(provider_id)
+        pipe.sadd(idx_key, key_id)
+        # Keep index alive at least as long as the longest cooldown entry.
+        # Each set_cooldown call refreshes the TTL so the SET won't expire
+        # while there are still active cooldowns.
+        pipe.expire(idx_key, ttl + 60)
+        await pipe.execute()
         logger.info(
             "Pool: key {} cooldown set: {} ({}s)",
             key_id[:8],
@@ -247,7 +258,10 @@ async def clear_cooldown(provider_id: str, key_id: str) -> None:
     if redis is None:
         return
     try:
-        await redis.delete(_cooldown_key(provider_id, key_id))
+        pipe = redis.pipeline()
+        pipe.delete(_cooldown_key(provider_id, key_id))
+        pipe.srem(_cooldown_index_key(provider_id), key_id)
+        await pipe.execute()
     except Exception:
         pass
 
@@ -320,8 +334,11 @@ async def add_cost_entry(provider_id: str, key_id: str, tokens: int, window_seco
         now = time.time()
         cost_k = _cost_key(provider_id, key_id)
         member = f"{uuid.uuid4().hex}:{tokens}"
+        window_start = now - max(int(window_seconds), 1)
         pipe = redis.pipeline()
         pipe.zadd(cost_k, {member: now})
+        # Prune expired entries on the write path (moved from read Lua script).
+        pipe.zremrangebyscore(cost_k, "-inf", window_start)
         # Set a TTL slightly larger than the window to auto-clean abandoned keys.
         pipe.expire(cost_k, window_seconds + 600)
         await pipe.execute()
@@ -605,11 +622,15 @@ async def batch_get_cooldown_ttls(provider_id: str, key_ids: list[str]) -> dict[
 
 
 async def batch_count_provider_cooldowns(provider_ids: list[str]) -> dict[str, int]:
-    """Count cooldown entries per provider using per-provider SCAN.
+    """Count cooldown entries per provider using the cooldown index set.
 
-    Each provider's cooldown keys are scanned independently with a
-    targeted pattern ``ap:{pid}:cooldown:*``, avoiding full-keyspace traversal.
-    Multiple providers are scanned concurrently via ``asyncio.gather``.
+    Uses ``SCARD`` on the ``ap:{pid}:cooldown_idx`` set for O(1) count
+    instead of scanning the key-space.  The index set is maintained by
+    :func:`set_cooldown` / :func:`clear_cooldown`.
+
+    Note: the index set may contain stale entries (expired cooldowns whose
+    TTL elapsed before an explicit clear). This over-count is acceptable
+    for admin display purposes -- precision is not critical here.
     """
     if not provider_ids:
         return {}
@@ -618,25 +639,14 @@ async def batch_count_provider_cooldowns(provider_ids: list[str]) -> dict[str, i
     if redis is None:
         return {pid: 0 for pid in provider_ids}
 
-    async def _count_one(r: Any, pid: str) -> tuple[str, int]:
-        pattern = f"{PREFIX}:{pid}:cooldown:*"
-        count = 0
-        async for _key in r.scan_iter(match=pattern, count=200):
-            count += 1
-        return pid, count
-
     try:
-        results = await asyncio.gather(
-            *[_count_one(redis, pid) for pid in provider_ids],
-            return_exceptions=True,
-        )
-        counts: dict[str, int] = {}
-        for r in results:
-            if isinstance(r, Exception):
-                continue
-            counts[r[0]] = r[1]
+        pipe = redis.pipeline()
         for pid in provider_ids:
-            counts.setdefault(pid, 0)
+            pipe.scard(_cooldown_index_key(pid))
+        results = await pipe.execute()
+        counts: dict[str, int] = {}
+        for pid, val in zip(provider_ids, results):
+            counts[pid] = max(int(val or 0), 0)
         return counts
     except Exception:
         return {pid: 0 for pid in provider_ids}

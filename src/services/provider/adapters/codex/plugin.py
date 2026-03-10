@@ -1,10 +1,10 @@
 """Codex provider plugin — 统一注册入口。
 
-将 Codex 对各通用 registry 的注册集中在一个文件中：
+将 Codex 对各通用 registry / capability registry 的注册集中在一个文件中：
 - Envelope (OAuth headers)
 - Transport Hook (URL 构建)
 - Auth Enricher (OAuth enrichment)
-- Behavior Variants (格式变体)
+- Provider Format Capability（格式变体 + 默认 body_rules）
 - Model Fetcher (fixed catalog — Codex has no /v1/models endpoint)
 
 新增 provider 时参照此文件创建对应的 plugin.py 即可。
@@ -154,10 +154,13 @@ async def enrich_codex(
 
 def register_all() -> None:
     """一次性注册 Codex 的所有 hooks 到各通用 registry。"""
+    from src.core.api_format.capabilities import (
+        register_provider_behavior_variant,
+        register_provider_default_body_rules,
+    )
     from src.core.provider_oauth_utils import register_auth_enricher
     from src.services.model.upstream_fetcher import UpstreamModelsFetcherRegistry
     from src.services.provider.adapters.codex.envelope import codex_oauth_envelope
-    from src.services.provider.behavior import register_behavior_variant
     from src.services.provider.envelope import register_envelope
     from src.services.provider.transport import register_transport_hook
 
@@ -173,25 +176,11 @@ def register_all() -> None:
     # Auth
     register_auth_enricher("codex", enrich_codex)
 
-    # Behavior
-    register_behavior_variant("codex", same_format=True, cross_format=True)
+    # Provider Format Capability：格式变体 + 默认 body_rules
+    from src.core.api_format.metadata import CODEX_DEFAULT_BODY_RULES
 
-    # Default Body Rules (Codex-specific, not format-wide)
-    from src.core.api_format.metadata import register_provider_default_body_rules
-
-    _codex_body_rules = (
-        {"action": "drop", "path": "max_output_tokens"},
-        {"action": "drop", "path": "temperature"},
-        {"action": "drop", "path": "top_p"},
-        {"action": "set", "path": "store", "value": False},
-        {
-            "action": "set",
-            "path": "instructions",
-            "value": "You are GPT-5.",
-            "condition": {"path": "instructions", "op": "not_exists"},
-        },
-    )
-    register_provider_default_body_rules("codex", "openai:cli", _codex_body_rules)
+    register_provider_behavior_variant("codex", same_format=True, cross_format=True)
+    register_provider_default_body_rules("codex", "openai:cli", CODEX_DEFAULT_BODY_RULES)
 
     # Export: Codex uses the default export builder (strip null + temp fields)
     # No need to register a custom one — the default in export.py suffices.

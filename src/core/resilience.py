@@ -11,6 +11,7 @@ import threading
 import time
 import traceback
 import uuid
+from collections import deque
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -115,11 +116,15 @@ class CircuitBreaker:
 class ResilienceManager:
     """系统韧性管理器"""
 
+    _MAX_ERROR_STATS = 500
+    _MAX_CIRCUIT_BREAKERS = 200
+    _MAX_LAST_ERRORS = 100
+
     def __init__(self) -> None:
         self.error_patterns: list[ErrorPattern] = []
         self.circuit_breakers: dict[str, CircuitBreaker] = {}
         self.error_stats: dict[str, int] = {}
-        self.last_errors: list[dict[str, Any]] = []
+        self.last_errors: deque[dict[str, Any]] = deque(maxlen=self._MAX_LAST_ERRORS)
         self._setup_default_patterns()
 
     def _setup_default_patterns(self) -> None:
@@ -203,6 +208,11 @@ class ResilienceManager:
     def get_circuit_breaker(self, key: str) -> CircuitBreaker:
         """获取或创建熔断器"""
         if key not in self.circuit_breakers:
+            # 淘汰已恢复的旧熔断器，防止无界增长
+            if len(self.circuit_breakers) >= self._MAX_CIRCUIT_BREAKERS:
+                closed_keys = [k for k, cb in self.circuit_breakers.items() if cb.state == "closed"]
+                for k in closed_keys:
+                    del self.circuit_breakers[k]
             self.circuit_breakers[key] = CircuitBreaker()
         return self.circuit_breakers[key]
 
@@ -226,13 +236,18 @@ class ResilienceManager:
         }
 
         self.last_errors.append(error_info)
-        # 只保留最近100个错误
-        if len(self.last_errors) > 100:
-            self.last_errors.pop(0)
 
-        # 更新错误统计
+        # 更新错误统计（超上限时淘汰计数最低的条目）
         error_key = f"{type(error).__name__}:{operation}"
         self.error_stats[error_key] = self.error_stats.get(error_key, 0) + 1
+        if len(self.error_stats) > self._MAX_ERROR_STATS:
+            min_key = min(
+                (k for k in self.error_stats if k != error_key),
+                key=lambda k: self.error_stats[k],
+                default=None,
+            )
+            if min_key is not None:
+                del self.error_stats[min_key]
 
         # 查找匹配的错误处理模式
         pattern = self._find_matching_pattern(error)

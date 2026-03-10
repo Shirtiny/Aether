@@ -9,6 +9,20 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
+SENSITIVE_CREDENTIAL_FIELDS = frozenset(
+    {
+        "api_key",
+        "password",
+        "refresh_token",
+        "session_token",
+        "session_cookie",
+        "token_cookie",
+        "auth_cookie",
+        "cookie_string",
+        "cookie",
+    }
+)
+
 
 class ConnectorAuthType(str, Enum):
     """连接器认证类型"""

@@ -5,7 +5,7 @@
 
 功能:
 - 扫描所有启用了 auto_fetch_models 的 ProviderAPIKey
-- 调用 Adapter.fetch_models() 获取模型列表
+- 调用 core.api_format 注册表获取模型列表
 - 更新 Key 的 allowed_models（保留 locked_models 中的模型）
 - 支持包含/排除规则过滤模型
 - 记录获取结果和错误信息

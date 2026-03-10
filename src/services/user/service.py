@@ -8,13 +8,14 @@ import asyncio
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import and_, func
-from sqlalchemy.orm import Session
+from sqlalchemy import and_, func, or_
+from sqlalchemy.orm import Session, contains_eager
 
 from src.core.logger import logger
 from src.core.validators import EmailValidator, PasswordValidator, UsernameValidator
 from src.models.database import ApiKey, GlobalModel, Model, Provider, Usage, User, UserRole
 from src.services.cache.user_cache import UserCacheService
+from src.services.user.bulk_cleanup import batch_nullify_fk, pre_clean_api_key
 from src.utils.transaction_manager import retry_on_database_error, transactional
 
 
@@ -30,13 +31,14 @@ class UserService:
         username: str,
         password: str,
         role: UserRole = UserRole.USER,
-        quota_usd: float | None = 10.0,
+        initial_gift_usd: float | None = 10.0,
+        unlimited: bool = False,
         email_verified: bool = False,
         allowed_providers: list[str] | None = None,
         allowed_api_formats: list[str] | None = None,
         allowed_models: list[str] | None = None,
     ) -> User:
-        """创建新用户，quota_usd 为 None 表示无限制，email 为 None 表示无邮箱"""
+        """创建新用户。"""
 
         # 验证邮箱格式（仅当提供邮箱时）
         if email is not None:
@@ -66,7 +68,6 @@ class UserService:
             email_verified=email_verified if email else False,
             username=username,
             role=role,
-            quota_usd=quota_usd,
             is_active=True,
             allowed_providers=allowed_providers,
             allowed_api_formats=allowed_api_formats,
@@ -75,6 +76,18 @@ class UserService:
         user.set_password(password)
 
         db.add(user)
+        db.flush()
+
+        from src.services.wallet import WalletService
+
+        WalletService.initialize_user_wallet(
+            db,
+            user=user,
+            initial_gift_usd=initial_gift_usd,
+            unlimited=unlimited,
+            description="用户初始赠款",
+        )
+
         db.commit()  # 立即提交事务,释放数据库锁
         db.refresh(user)
 
@@ -91,7 +104,8 @@ class UserService:
         password: str,
         api_key_name: str = "默认密钥",
         role: UserRole = UserRole.USER,
-        quota_usd: float | None = 10.0,
+        initial_gift_usd: float | None = 10.0,
+        unlimited: bool = False,
         concurrent_limit: int = 5,
     ) -> tuple[User, ApiKey]:
         """
@@ -104,7 +118,8 @@ class UserService:
             password: 密码
             api_key_name: API密钥名称
             role: 用户角色
-            quota_usd: USD配额，None 表示无限制
+            initial_gift_usd: 初始赠款（USD）
+            unlimited: 是否无限制
             concurrent_limit: 并发限制
 
         Returns:
@@ -115,7 +130,13 @@ class UserService:
         """
         # 创建用户
         user = UserService.create_user(
-            db=db, email=email, username=username, password=password, role=role, quota_usd=quota_usd
+            db=db,
+            email=email,
+            username=username,
+            password=password,
+            role=role,
+            initial_gift_usd=initial_gift_usd,
+            unlimited=unlimited,
         )
 
         # 导入API密钥服务（避免循环导入）
@@ -173,7 +194,9 @@ class UserService:
         if is_active is not None:
             query = query.filter(User.is_active == is_active)
 
-        return query.offset(skip).limit(limit).all()
+        return (
+            query.order_by(User.created_at.desc(), User.id.desc()).offset(skip).limit(limit).all()
+        )
 
     @staticmethod
     @transactional()
@@ -187,7 +210,6 @@ class UserService:
         updatable_fields = [
             "email",
             "username",
-            "quota_usd",
             "is_active",
             "role",
             # 访问限制字段
@@ -198,7 +220,6 @@ class UserService:
 
         # 允许设置为 None 的字段（表示无限制）
         nullable_fields = [
-            "quota_usd",
             "allowed_providers",
             "allowed_api_formats",
             "allowed_models",
@@ -232,21 +253,25 @@ class UserService:
         return user
 
     @staticmethod
-    @transactional()
     def delete_user(db: Session, user_id: str) -> bool:
         """删除用户（硬删除）
 
         删除流程：
-        1. 手动删除关联的子记录（避免 SQLAlchemy ORM 与数据库 CASCADE 冲突）
-        2. 删除用户记录
-        3. 历史 Usage 记录保留，user_id 会被数据库设为 NULL
-        4. 新用户注册时会有新的 UUID，看不到旧用户的记录
+        1. 检查未完结账务，阻止删除
+        2. 预清理 Usage / RequestCandidate 等大表外键
+        3. 手动删除 ORM cascade 冲突的子记录
+        4. 删除用户记录
+        5. 财务记录（Wallet/PaymentOrder/RefundRequest/WalletTransaction）和
+           Usage 记录保留，外键 SET NULL，由自动清理策略统一回收
         """
         from src.models.database import (
             AnnouncementRead,
             ApiKey,
+            PaymentOrder,
+            RefundRequest,
+            RequestCandidate,
             UserPreference,
-            UserQuota,
+            Wallet,
         )
 
         user = db.query(User).filter(User.id == user_id).first()
@@ -256,24 +281,72 @@ class UserService:
         # 记录删除信息用于日志
         email = user.email
 
-        # 手动删除子记录，避免 SQLAlchemy 的 ORM cascade 与数据库 CASCADE 冲突
-        # 这些表的数据库外键已经设置了 ON DELETE CASCADE，但 SQLAlchemy 会先尝试 UPDATE 设置为 NULL
-        # 所以我们手动删除来避免这个问题
-        db.query(UserPreference).filter(UserPreference.user_id == user_id).delete(
-            synchronize_session=False
-        )
-        db.query(UserQuota).filter(UserQuota.user_id == user_id).delete(synchronize_session=False)
-        db.query(AnnouncementRead).filter(AnnouncementRead.user_id == user_id).delete(
-            synchronize_session=False
-        )
-        api_key_count = int(
-            db.query(func.count(ApiKey.id)).filter(ApiKey.user_id == user_id).scalar() or 0
-        )
-        db.query(ApiKey).filter(ApiKey.user_id == user_id).delete(synchronize_session=False)
+        # 删除前阻断未完结账务，避免删除导致资金状态不一致。
+        wallet_ids = [
+            wallet_id
+            for (wallet_id,) in (
+                db.query(Wallet.id)
+                .outerjoin(ApiKey, Wallet.api_key_id == ApiKey.id)
+                .filter(or_(Wallet.user_id == user_id, ApiKey.user_id == user_id))
+                .all()
+            )
+        ]
+        if wallet_ids:
+            pending_refund_count = (
+                db.query(RefundRequest)
+                .filter(
+                    RefundRequest.wallet_id.in_(wallet_ids),
+                    RefundRequest.status.in_(["pending_approval", "approved", "processing"]),
+                )
+                .count()
+            )
+            if pending_refund_count > 0:
+                raise ValueError("用户存在未完结退款，禁止删除")
 
-        # 现在删除用户（Usage, AuditLog, RequestAttempt 会通过数据库 SET NULL 保留）
-        db.delete(user)
-        db.commit()  # 立即提交事务,释放数据库锁
+            pending_order_count = (
+                db.query(PaymentOrder)
+                .filter(
+                    PaymentOrder.wallet_id.in_(wallet_ids),
+                    PaymentOrder.status.in_(["pending", "paid"]),
+                )
+                .count()
+            )
+            if pending_order_count > 0:
+                raise ValueError("用户存在未完结充值订单，禁止删除")
+
+        api_key_ids = [
+            api_key_id
+            for (api_key_id,) in db.query(ApiKey.id).filter(ApiKey.user_id == user_id).all()
+        ]
+        api_key_count = len(api_key_ids)
+
+        # 注意：batch_nullify_fk 内部分批 commit，预清理部分不可回滚。
+        # 这是预期行为：SET NULL 是幂等操作，即使后续步骤失败，
+        # 已置空的外键不影响数据完整性，重新执行删除即可。
+        try:
+            for api_key_id in api_key_ids:
+                pre_clean_api_key(db, api_key_id)
+
+            batch_nullify_fk(db, Usage, "user_id", user_id)
+            batch_nullify_fk(db, RequestCandidate, "user_id", user_id)
+
+            db.query(UserPreference).filter(UserPreference.user_id == user_id).delete(
+                synchronize_session=False
+            )
+            db.query(AnnouncementRead).filter(AnnouncementRead.user_id == user_id).delete(
+                synchronize_session=False
+            )
+
+            # 财务记录（Wallet/WalletTransaction/PaymentOrder/RefundRequest/PaymentCallback）
+            # 和 Usage / RequestCandidate / VideoTask 记录全部保留，数据库外键 SET NULL 自动断开关联。
+            db.query(ApiKey).filter(ApiKey.user_id == user_id).delete(synchronize_session=False)
+
+            # 现在删除用户（Usage, AuditLog, RequestAttempt 等会通过数据库 SET NULL 保留）
+            db.delete(user)
+            db.commit()  # 立即提交事务,释放数据库锁
+        except Exception:
+            db.rollback()
+            raise
 
         # 清除用户缓存
         asyncio.create_task(UserCacheService.invalidate_user_cache(user_id, email))
@@ -325,29 +398,6 @@ class UserService:
 
         logger.info(f"密码更改成功: 用户ID {user_id}")
         return True, "密码更改成功"
-
-    @staticmethod
-    def update_user_quota(
-        db: Session,
-        user_id: str,
-        quota_usd: float | None = None,
-    ) -> User | None:
-        """更新用户配额"""
-        user = db.query(User).filter(User.id == user_id).first()
-        if not user:
-            return None
-
-        if quota_usd is not None:
-            user.quota_usd = quota_usd
-
-        db.commit()
-        db.refresh(user)
-
-        # 清除用户缓存
-        asyncio.create_task(UserCacheService.invalidate_user_cache(user.id, user.email))
-
-        logger.debug(f"更新用户配额: {user.email} (USD: {quota_usd})")
-        return user
 
     @staticmethod
     def get_user_usage_stats(
@@ -431,10 +481,11 @@ class UserService:
         if not all_active_provider_ids:
             return []
 
-        # 查询所有活跃的 Model（关联 GlobalModel）
+        # 查询所有活跃的 Model（关联 GlobalModel，contains_eager 避免循环中懒加载）
         all_models = (
             db.query(Model)
             .join(GlobalModel, Model.global_model_id == GlobalModel.id)
+            .options(contains_eager(Model.global_model))
             .filter(
                 and_(
                     Model.provider_id.in_(all_active_provider_ids),

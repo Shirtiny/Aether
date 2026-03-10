@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from collections import deque
@@ -479,7 +480,7 @@ class StreamUsageTracker:
         """
         import time
 
-        from src.api.handlers.base.utils import extract_cache_creation_tokens_detail
+        from src.core.usage_tokens import extract_cache_creation_tokens_detail
 
         self.start_time = time.time()
         self.request_data = request_data  # 保存请求数据
@@ -518,7 +519,8 @@ class StreamUsageTracker:
                 # yield 后再更新数据库状态（仅第一个 chunk 时执行）
                 if chunk_count == 1 and self.request_id:
                     try:
-                        UsageService.update_usage_status(
+                        await asyncio.to_thread(
+                            UsageService.update_usage_status,
                             db=self.db,
                             request_id=self.request_id,
                             status="streaming",
@@ -800,7 +802,7 @@ class StreamUsageTracker:
             if usage_record:
                 try:
                     # 在 usage_record 仍在会话中时，立即获取所需属性
-                    total_cost = usage_record.total_cost_usd or 0.0
+                    total_cost = float(usage_record.total_cost_usd or 0)
                 except Exception as e:
                     logger.warning(f"Failed to access total_cost_usd from usage_record: {e}")
                     total_cost = 0.0
@@ -1022,7 +1024,8 @@ class EnhancedStreamUsageTracker(StreamUsageTracker):
                 # yield 后再更新数据库状态（仅第一个 chunk 时执行）
                 if chunk_count == 1 and self.request_id:
                     try:
-                        UsageService.update_usage_status(
+                        await asyncio.to_thread(
+                            UsageService.update_usage_status,
                             db=self.db,
                             request_id=self.request_id,
                             status="streaming",

@@ -36,7 +36,7 @@
 
       <!-- 空状态 -->
       <div
-        v-else-if="filteredProviders.length === 0"
+        v-else-if="providers.length === 0"
         class="flex flex-col items-center justify-center py-16 text-center"
       >
         <div class="text-muted-foreground mb-2">
@@ -87,7 +87,7 @@
           </TableHeader>
           <TableBody>
             <ProviderTableRow
-              v-for="provider in paginatedProviders"
+              v-for="provider in providers"
               :key="provider.id"
               :provider="provider"
               :editing-description-id="editingDescriptionId"
@@ -118,11 +118,11 @@
 
       <!-- 移动端卡片列表 -->
       <div
-        v-if="!loading && filteredProviders.length > 0"
+        v-if="!loading && providers.length > 0"
         class="xl:hidden divide-y divide-border/40"
       >
         <ProviderMobileCard
-          v-for="provider in paginatedProviders"
+          v-for="provider in providers"
           :key="provider.id"
           :provider="provider"
           :editing-description-id="editingDescriptionId"
@@ -146,9 +146,9 @@
 
       <!-- 分页 -->
       <Pagination
-        v-if="!loading && filteredProviders.length > 0"
+        v-if="!loading && total > 0"
         :current="currentPage"
-        :total="filteredProviders.length"
+        :total="total"
         :page-size="pageSize"
         cache-key="provider-management-page-size"
         @update:current="currentPage = $event"
@@ -168,7 +168,6 @@
 
   <PriorityManagementDialog
     v-model="priorityDialogOpen"
-    :providers="providers"
     @saved="handlePrioritySaved"
   />
 
@@ -190,7 +189,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import Button from '@/components/ui/button.vue'
 import Card from '@/components/ui/card.vue'
 import Table from '@/components/ui/table.vue'
@@ -247,13 +246,12 @@ const {
   apiFormatFilters,
   modelFilters,
   hasActiveFilters,
-  filteredProviders,
   currentPage,
   pageSize,
-  paginatedProviders,
+  total,
+  queryParams,
   resetFilters,
 } = useProviderFilters(
-  () => providers.value,
   () => globalModels.value,
 )
 
@@ -349,14 +347,15 @@ async function loadGlobalModelList() {
   }
 }
 
-// 加载提供商列表
+// 加载提供商列表（服务端分页）
 async function loadProviders() {
   const requestId = ++providersRequestId
   loading.value = true
   try {
-    const nextProviders = await getProvidersSummary()
+    const response = await getProvidersSummary(queryParams.value)
     if (requestId !== providersRequestId) return
-    providers.value = nextProviders
+    providers.value = response.items
+    total.value = response.total
     // 异步加载配置了 ops 的 provider 的余额数据
     loadBalances(providers.value)
   } catch (err: unknown) {
@@ -368,6 +367,24 @@ async function loadProviders() {
     }
   }
 }
+
+// 分页/筛选/搜索变化时重新加载
+let debounceTimer: ReturnType<typeof setTimeout> | null = null
+watch(queryParams, (newParams, oldParams) => {
+  if (debounceTimer) clearTimeout(debounceTimer)
+  // 搜索输入 debounce 300ms，其他变化立即执行
+  const isSearchOnly = newParams.search !== oldParams?.search &&
+    newParams.page === oldParams?.page &&
+    newParams.page_size === oldParams?.page_size &&
+    newParams.status === oldParams?.status &&
+    newParams.api_format === oldParams?.api_format &&
+    newParams.model_id === oldParams?.model_id
+  if (isSearchOnly) {
+    debounceTimer = setTimeout(loadProviders, 300)
+  } else {
+    loadProviders()
+  }
+}, { deep: true })
 
 // 使用复用的行点击逻辑
 const { handleMouseDown, shouldTriggerRowClick } = useRowClick()
@@ -420,7 +437,7 @@ function handleProviderUpdated(updated: ProviderWithEndpointsSummary) {
   if (index !== -1) {
     providers.value[index] = updated
     // 刷新该提供商的余额数据
-    loadBalances([updated])
+    loadBalances([updated], false)
   }
 }
 
@@ -432,7 +449,7 @@ async function handleDrawerRefresh() {
     const index = providers.value.findIndex(p => p.id === updated.id)
     if (index !== -1) {
       providers.value[index] = updated
-      loadBalances([updated])
+      loadBalances([updated], false)
     }
   } catch (err) {
     showError(parseApiError(err, '刷新提供商数据失败'), '错误')
@@ -508,6 +525,7 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
+  if (debounceTimer) clearTimeout(debounceTimer)
   document.removeEventListener('click', handleGlobalClick, true)
   stopTick()
 })

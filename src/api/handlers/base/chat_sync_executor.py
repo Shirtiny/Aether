@@ -74,6 +74,7 @@ class SyncRequestContext:
     mapped_model_result: str | None = None
     sync_proxy_info: dict[str, Any] | None = None
     provider_response_json: dict[str, Any] | None = None  # 格式转换前的提供商原始响应
+    pool_summary: dict[str, Any] | None = None
 
 
 class ChatSyncExecutor:
@@ -160,7 +161,7 @@ class ChatSyncExecutor:
 
             # 统一入口：总是通过 TaskService
             from src.services.task import TaskService
-            from src.services.task.context import TaskMode
+            from src.services.task.core.context import TaskMode
 
             exec_result = await TaskService(handler.db, handler.redis).execute(
                 task_type="chat",

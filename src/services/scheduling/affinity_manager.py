@@ -29,6 +29,7 @@ from typing import Any, NamedTuple
 
 from src.config.constants import CacheTTL
 from src.core.logger import logger
+from src.core.redis_utils import delete_redis_keys, scan_delete_pattern
 
 
 class CacheAffinity(NamedTuple):
@@ -76,6 +77,8 @@ class CacheAffinityManager:
 
     # 默认缓存TTL（秒）- 使用统一常量
     DEFAULT_CACHE_TTL = CacheTTL.CACHE_AFFINITY
+    REDIS_SCAN_BATCH_SIZE = 200
+    REDIS_DELETE_BATCH_SIZE = 500
 
     def __init__(
         self, redis_client: Any | None = None, default_ttl: int = DEFAULT_CACHE_TTL
@@ -260,6 +263,29 @@ class CacheAffinityManager:
                 self._memory_store.pop(cache_key, None)
 
         await self._set_l1_entry(cache_key, None)
+
+    async def _delete_redis_keys(self, keys: list[str]) -> int:
+        if self._is_memory_backend() or not keys:
+            return 0
+        return await delete_redis_keys(self.redis, keys)
+
+    async def _scan_delete_pattern(self, pattern: str) -> int:
+        if self._is_memory_backend():
+            return 0
+        return await scan_delete_pattern(
+            self.redis,
+            pattern,
+            scan_batch_size=self.REDIS_SCAN_BATCH_SIZE,
+            delete_batch_size=self.REDIS_DELETE_BATCH_SIZE,
+        )
+
+    async def _clear_l1_entries_by_prefix(self, prefix: str) -> int:
+        """清理匹配前缀的 L1 本地缓存。"""
+        async with self._l1_lock:
+            keys_to_remove = [key for key in self._l1_cache if key.startswith(prefix)]
+            for key in keys_to_remove:
+                self._l1_cache.pop(key, None)
+            return len(keys_to_remove)
 
     async def _snapshot_memory_items(self) -> dict[str, dict[str, Any]]:
         """复制内存存储内容（仅内存模式使用）"""
@@ -494,20 +520,49 @@ class CacheAffinityManager:
             invalidated_count = 0
 
             if not self._is_memory_backend():
-                pattern = "cache_affinity:*"
-                keys = await self.redis.keys(pattern)
+                cursor: int | str = 0
+                while True:
+                    cursor, scan_keys = await self.redis.scan(
+                        cursor=cursor,
+                        match="cache_affinity:*",
+                        count=self.REDIS_SCAN_BATCH_SIZE,
+                    )
+
+                    if scan_keys:
+                        # Pipeline batch GET to reduce round-trips.
+                        values = await self.redis.mget(scan_keys)
+                        keys_to_delete: list[str] = []
+                        for key, raw in zip(scan_keys, values):
+                            if not raw:
+                                continue
+                            try:
+                                data = json.loads(raw)
+                            except Exception:
+                                continue
+                            if data.get("provider_id") == provider_id:
+                                keys_to_delete.append(key)
+
+                        if keys_to_delete:
+                            deleted = await self._delete_redis_keys(keys_to_delete)
+                            invalidated_count += deleted
+                            self._stats["cache_invalidations"] += deleted
+                            # Clear L1 for deleted keys.
+                            for key in keys_to_delete:
+                                await self._set_l1_entry(key, None)
+
+                    if int(cursor) == 0:
+                        break
             else:
                 keys = list((await self._snapshot_memory_items()).keys())
+                for key in keys:
+                    affinity_dict = await self._load_affinity_dict(key)
+                    if not affinity_dict:
+                        continue
 
-            for key in keys:
-                affinity_dict = await self._load_affinity_dict(key)
-                if not affinity_dict:
-                    continue
-
-                if affinity_dict.get("provider_id") == provider_id:
-                    await self._delete_affinity_key(key)
-                    invalidated_count += 1
-                    self._stats["cache_invalidations"] += 1
+                    if affinity_dict.get("provider_id") == provider_id:
+                        await self._delete_affinity_key(key)
+                        invalidated_count += 1
+                        self._stats["cache_invalidations"] += 1
 
             if invalidated_count > 0:
                 logger.debug(
@@ -530,17 +585,17 @@ class CacheAffinityManager:
         """
         try:
             if not self._is_memory_backend():
-                keys = await self.redis.keys("cache_affinity:*")
-                if keys:
-                    await self.redis.delete(*keys)
-                    logger.debug(f"清除所有Redis缓存亲和性: {len(keys)} 个")
-                    return len(keys)
-                return 0
+                count = await self._scan_delete_pattern("cache_affinity:*")
+                await self._clear_l1_entries_by_prefix("cache_affinity:")
+                if count:
+                    logger.debug(f"清除所有Redis缓存亲和性: {count} 个")
+                return count
 
             lock = self._get_memory_lock()
             async with lock:
                 count = len(self._memory_store)
                 self._memory_store.clear()
+            await self._clear_l1_entries_by_prefix("cache_affinity:")
             if count:
                 logger.debug(f"清除所有内存缓存亲和性: {count} 个")
             return count

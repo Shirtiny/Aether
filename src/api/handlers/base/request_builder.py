@@ -24,6 +24,7 @@ from src.core.api_format import (
     HeaderBuilder,
     get_auth_config_for_endpoint,
     make_signature_key,
+    resolve_header_name_case,
 )
 from src.core.crypto import crypto_service
 from src.models.endpoint_models import _CONDITION_OPS, _TYPE_IS_VALUES, parse_re_flags
@@ -1250,7 +1251,7 @@ class PassthroughRequestBuilder(RequestBuilder):
             builder.add_many(effective_extra_headers)
 
         # 5. 设置认证头（最高优先级，上游始终使用 header 认证）
-        builder.add(auth_header, auth_value)
+        builder.add(resolve_header_name_case(original_headers, auth_header), auth_value)
 
         # 6. 确保有 Content-Type
         headers = builder.build()

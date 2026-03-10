@@ -308,31 +308,35 @@
     @cancel="deleteConfirmOpen = false"
   />
 
-  <!-- 测试结果对话框（仅失败时显示） -->
-  <TestResultDialog
-    :result="testResult"
+  <!-- 模型测试对话框 -->
+  <ModelTestDialog
+    :open="modelTest.dialogOpen.value"
+    :result="modelTest.testResult.value"
     mode="direct"
-    @close="testResult = null"
+    :selecting-model-name="testingModelName"
+    :testing="modelTest.testing.value"
+    :trace="modelTest.testTrace.value"
+    :request-id="modelTest.requestId.value"
+    @close="handleTestDialogClose"
   />
 </template>
 
 <script setup lang="ts">
 import { ref, computed } from 'vue'
 import { useSmartPagination } from '@/composables/useSmartPagination'
+import { useModelTest } from '@/composables/useModelTest'
 import { Tag, Plus, Edit, Trash2, ChevronRight, Loader2, Play } from 'lucide-vue-next'
 import {
   Card, Button, Badge,
 } from '@/components/ui'
 import AlertDialog from '@/components/common/AlertDialog.vue'
 import ModelMappingDialog, { type AliasGroup } from '../ModelMappingDialog.vue'
-import TestResultDialog from './TestResultDialog.vue'
+import ModelTestDialog from './ModelTestDialog.vue'
 import { useToast } from '@/composables/useToast'
 import {
-  testModelFailover,
   type Model,
   type ProviderModelAlias,
   type ProviderMappingPreviewResponse,
-  type TestModelFailoverResponse
 } from '@/api/endpoints'
 import { type EndpointAPIKey } from '@/api/endpoints/keys'
 import { updateModel } from '@/api/endpoints/models'
@@ -376,6 +380,9 @@ const emit = defineEmits<{
 
 const { error: showError, success: showSuccess } = useToast()
 
+// 模型测试 composable
+const modelTest = useModelTest({ providerId: () => props.provider.id })
+
 // 状态
 const loading = ref(false)
 const dialogOpen = ref(false)
@@ -383,7 +390,7 @@ const deleteConfirmOpen = ref(false)
 const editingGroup = ref<AliasGroup | null>(null)
 const deletingGroup = ref<AliasGroup | null>(null)
 const testingMapping = ref<string | null>(null)
-const testResult = ref<TestModelFailoverResponse | null>(null)
+const testingModelName = ref<string | null>(null)
 const preselectedModelId = ref<string | null>(null)
 
 // 使用 props 传入的数据
@@ -617,30 +624,25 @@ async function onDialogSaved() {
   emit('refresh')
 }
 
-// 测试映射（直连测试，带故障转移）
+function handleTestDialogClose() {
+  modelTest.resetState()
+  testingModelName.value = null
+}
+
+// 测试映射（直连测试，带故障转移和实时进度）
 async function runMappingTest(testingKey: string, modelName: string) {
   testingMapping.value = testingKey
-
-  try {
-    const result = await testModelFailover({
-      provider_id: props.provider.id,
-      mode: 'direct',
-      model_name: modelName,
-      message: "hello",
-    })
-
-    if (result.success) {
-      const successAttempt = result.attempts.find(a => a.status === 'success')
-      const latency = successAttempt?.latency_ms != null ? ` (${successAttempt.latency_ms}ms)` : ''
-      showSuccess(`映射 "${modelName}" 测试成功${latency}`)
-    } else {
-      testResult.value = result
-    }
-  } catch (err: unknown) {
-    showError(`映射测试失败: ${parseApiError(err, '测试请求失败')}`)
-  } finally {
-    testingMapping.value = null
-  }
+  testingModelName.value = modelName
+  await modelTest.startTest({
+    mode: 'direct',
+    modelName,
+    displayLabel: `映射 "${modelName}"`,
+    message: 'hello',
+    onSuccess: () => {
+      testingModelName.value = null
+    },
+  })
+  testingMapping.value = null
 }
 
 // 测试精确映射

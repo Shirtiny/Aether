@@ -7,7 +7,9 @@
     <template #header>
       <div class="border-b border-border px-6 py-4">
         <div class="flex items-center gap-3">
-          <div class="flex h-9 w-9 items-center justify-center rounded-lg bg-primary/10 flex-shrink-0">
+          <div
+            class="flex h-9 w-9 items-center justify-center rounded-lg bg-primary/10 flex-shrink-0"
+          >
             <Plus
               v-if="!isEditMode"
               class="h-5 w-5 text-primary"
@@ -22,7 +24,7 @@
               {{ isEditMode ? '编辑独立余额 API Key' : '创建独立余额 API Key' }}
             </h3>
             <p class="text-xs text-muted-foreground">
-              {{ isEditMode ? '修改密钥名称、有效期和访问限制' : '用于非注册用户调用接口，不关联用户配额，必须设置余额限制' }}
+              {{ isEditMode ? '修改密钥名称、有效期和访问限制' : '用于非注册用户调用接口，可设置初始余额或无限制额度' }}
             </p>
           </div>
         </div>
@@ -34,7 +36,6 @@
         <!-- 左侧：基础设置 -->
         <div class="pr-6 space-y-4">
           <div class="flex items-center gap-2 pb-2 border-b border-border/60">
-            <Key class="h-4 w-4 text-muted-foreground" />
             <span class="text-sm font-medium">基础设置</span>
           </div>
 
@@ -50,31 +51,6 @@
               placeholder="例如: 用户A专用"
               class="h-10"
             />
-          </div>
-
-          <!-- 初始余额 - 仅创建模式显示 -->
-          <div
-            v-if="!isEditMode"
-            class="space-y-2"
-          >
-            <Label
-              for="form-balance"
-              class="text-sm font-medium"
-            >初始余额 (USD) <span class="text-rose-500">*</span></Label>
-            <Input
-              id="form-balance"
-              :model-value="form.initial_balance_usd ?? ''"
-              type="number"
-              step="0.01"
-              min="0.01"
-              required
-              placeholder="10.00"
-              class="h-10"
-              @update:model-value="(v) => form.initial_balance_usd = parseNumberInput(v, { allowFloat: true }) ?? 10"
-            />
-            <p class="text-xs text-muted-foreground">
-              独立Key必须设置余额限制，最小值 $0.01
-            </p>
           </div>
 
           <div class="space-y-2">
@@ -137,12 +113,52 @@
               @update:model-value="(v) => form.rate_limit = parseNumberInput(v, { min: 1, max: 10000 })"
             />
           </div>
+
+          <div class="space-y-2">
+            <Label class="text-sm font-medium">无限制额度</Label>
+            <div class="flex items-center gap-3">
+              <Switch
+                :model-value="form.unlimited_balance ?? false"
+                @update:model-value="(v) => form.unlimited_balance = v"
+              />
+              <div class="flex flex-col">
+                <span class="text-sm text-foreground">
+                  {{ form.unlimited_balance ? '已启用' : '已关闭' }}
+                </span>
+                <span class="text-xs text-muted-foreground">
+                  {{ form.unlimited_balance ? '无限制：忽略钱包余额校验' : '有限制：按钱包余额校验' }}
+                </span>
+              </div>
+            </div>
+          </div>
+
+          <div
+            v-if="!isEditMode && !form.unlimited_balance"
+            class="space-y-2"
+          >
+            <Label
+              for="form-balance"
+              class="text-sm font-medium"
+            >初始余额 (USD) <span class="text-rose-500">*</span></Label>
+            <Input
+              id="form-balance"
+              :model-value="form.initial_balance_usd ?? ''"
+              type="number"
+              step="0.01"
+              min="0.01"
+              placeholder="10.00"
+              class="h-10"
+              @update:model-value="(v) => form.initial_balance_usd = parseNumberInput(v, { allowFloat: true, min: 0.01 })"
+            />
+            <p class="text-xs text-muted-foreground">
+              最小值 $0.01
+            </p>
+          </div>
         </div>
 
         <!-- 右侧：访问限制 -->
         <div class="pl-6 space-y-4 border-l border-border">
           <div class="flex items-center gap-2 pb-2 border-b border-border/60">
-            <Shield class="h-4 w-4 text-muted-foreground" />
             <span class="text-sm font-medium">访问限制</span>
             <span class="text-xs text-muted-foreground">(留空不限)</span>
           </div>
@@ -150,103 +166,36 @@
           <!-- Provider 多选下拉框 -->
           <div class="space-y-2">
             <Label class="text-sm font-medium">允许的 Provider</Label>
-            <div class="relative">
-              <button
-                type="button"
-                class="w-full h-10 px-3 border rounded-lg bg-background text-left flex items-center justify-between hover:bg-muted/50 transition-colors"
-                @click="providerDropdownOpen = !providerDropdownOpen"
-              >
-                <span :class="form.allowed_providers.length ? 'text-foreground' : 'text-muted-foreground'">
-                  {{ form.allowed_providers.length ? `已选择 ${form.allowed_providers.length} 个` : '全部可用' }}
-                </span>
-                <ChevronDown
-                  class="h-4 w-4 text-muted-foreground transition-transform"
-                  :class="providerDropdownOpen ? 'rotate-180' : ''"
-                />
-              </button>
-              <div
-                v-if="providerDropdownOpen"
-                class="fixed inset-0 z-[80]"
-                @click.stop="providerDropdownOpen = false"
-              />
-              <div
-                v-if="providerDropdownOpen"
-                class="absolute z-[90] w-full mt-1 bg-popover border rounded-lg shadow-lg max-h-48 overflow-y-auto"
-              >
-                <div
-                  v-for="provider in providers"
-                  :key="provider.id"
-                  class="flex items-center gap-2 px-3 py-2 hover:bg-muted/50 cursor-pointer"
-                  @click="toggleSelection('allowed_providers', provider.id)"
-                >
-                  <input
-                    type="checkbox"
-                    :checked="form.allowed_providers.includes(provider.id)"
-                    class="h-4 w-4 rounded border-gray-300 cursor-pointer"
-                    @click.stop
-                    @change="toggleSelection('allowed_providers', provider.id)"
-                  >
-                  <span class="text-sm">{{ provider.name }}</span>
-                </div>
-                <div
-                  v-if="providers.length === 0"
-                  class="px-3 py-2 text-sm text-muted-foreground"
-                >
-                  暂无可用 Provider
-                </div>
-              </div>
-            </div>
+            <MultiSelect
+              v-model="form.allowed_providers"
+              :options="providerOptions"
+              :search-threshold="0"
+              placeholder="全部可用"
+              empty-text="暂无可用 Provider"
+              no-results-text="未找到匹配的 Provider"
+              search-placeholder="搜索 Provider 名称..."
+            />
           </div>
 
           <!-- API 格式多选下拉框 -->
           <div class="space-y-2">
             <Label class="text-sm font-medium">允许的 API 格式</Label>
-            <div class="relative">
-              <button
-                type="button"
-                class="w-full h-10 px-3 border rounded-lg bg-background text-left flex items-center justify-between hover:bg-muted/50 transition-colors"
-                @click="apiFormatDropdownOpen = !apiFormatDropdownOpen"
-              >
-                <span :class="form.allowed_api_formats.length ? 'text-foreground' : 'text-muted-foreground'">
-                  {{ form.allowed_api_formats.length ? `已选择 ${form.allowed_api_formats.length} 个` : '全部可用' }}
-                </span>
-                <ChevronDown
-                  class="h-4 w-4 text-muted-foreground transition-transform"
-                  :class="apiFormatDropdownOpen ? 'rotate-180' : ''"
-                />
-              </button>
-              <div
-                v-if="apiFormatDropdownOpen"
-                class="fixed inset-0 z-[80]"
-                @click.stop="apiFormatDropdownOpen = false"
-              />
-              <div
-                v-if="apiFormatDropdownOpen"
-                class="absolute z-[90] w-full mt-1 bg-popover border rounded-lg shadow-lg max-h-48 overflow-y-auto"
-              >
-                <div
-                  v-for="format in allApiFormats"
-                  :key="format"
-                  class="flex items-center gap-2 px-3 py-2 hover:bg-muted/50 cursor-pointer"
-                  @click="toggleSelection('allowed_api_formats', format)"
-                >
-                  <input
-                    type="checkbox"
-                    :checked="form.allowed_api_formats.includes(format)"
-                    class="h-4 w-4 rounded border-gray-300 cursor-pointer"
-                    @click.stop
-                    @change="toggleSelection('allowed_api_formats', format)"
-                  >
-                  <span class="text-sm">{{ format }}</span>
-                </div>
-              </div>
-            </div>
+            <MultiSelect
+              v-model="form.allowed_api_formats"
+              :options="apiFormatOptions"
+              :search-threshold="0"
+              placeholder="全部可用"
+              empty-text="暂无可用 API 格式"
+              no-results-text="未找到匹配的 API 格式"
+              search-placeholder="搜索 API 格式..."
+            />
           </div>
 
           <!-- 模型多选下拉框 -->
           <ModelMultiSelect
             v-model="form.allowed_models"
             :models="globalModels"
+            :search-threshold="0"
           />
         </div>
       </div>
@@ -279,10 +228,11 @@ import {
   Button,
   Input,
   Label,
+  Switch,
 } from '@/components/ui'
-import { Plus, SquarePen, Key, Shield, ChevronDown, X } from 'lucide-vue-next'
+import { Plus, SquarePen, X } from 'lucide-vue-next'
 import { useFormDialog } from '@/composables/useFormDialog'
-import { ModelMultiSelect } from '@/components/common'
+import { ModelMultiSelect, MultiSelect } from '@/components/common'
 import { getProvidersSummary } from '@/api/endpoints/providers'
 import { getGlobalModels } from '@/api/global-models'
 import { adminApi } from '@/api/admin'
@@ -294,6 +244,7 @@ export interface StandaloneKeyFormData {
   id?: string
   name: string
   initial_balance_usd?: number
+  unlimited_balance?: boolean
   expires_at?: string  // ISO 日期字符串，如 "2025-12-31"，undefined = 永不过期
   rate_limit?: number
   auto_delete_on_expiry: boolean
@@ -315,25 +266,35 @@ const emit = defineEmits<{
 const isOpen = computed(() => props.open)
 const saving = ref(false)
 
-// 下拉框状态
-const providerDropdownOpen = ref(false)
-const apiFormatDropdownOpen = ref(false)
-
 // 选项数据
 const providers = ref<ProviderWithEndpointsSummary[]>([])
 const globalModels = ref<GlobalModelResponse[]>([])
 const allApiFormats = ref<string[]>([])
 
+const providerOptions = computed(() =>
+  providers.value.map((provider) => ({
+    value: provider.id,
+    label: provider.name,
+  }))
+)
+const apiFormatOptions = computed(() =>
+  allApiFormats.value.map((format) => ({
+    value: format,
+    label: format,
+  }))
+)
+
 // 表单数据
 const form = ref<StandaloneKeyFormData>({
   name: '',
   initial_balance_usd: 10,
+  unlimited_balance: false,
   expires_at: undefined,
   rate_limit: undefined,
   auto_delete_on_expiry: false,
   allowed_providers: [],
   allowed_api_formats: [],
-  allowed_models: []
+  allowed_models: [],
 })
 
 // 计算最小可选日期（明天）
@@ -347,15 +308,14 @@ function resetForm() {
   form.value = {
     name: '',
     initial_balance_usd: 10,
+    unlimited_balance: false,
     expires_at: undefined,
     rate_limit: undefined,
     auto_delete_on_expiry: false,
     allowed_providers: [],
     allowed_api_formats: [],
-    allowed_models: []
+    allowed_models: [],
   }
-  providerDropdownOpen.value = false
-  apiFormatDropdownOpen.value = false
 }
 
 function loadKeyData() {
@@ -364,12 +324,13 @@ function loadKeyData() {
     id: props.apiKey.id,
     name: props.apiKey.name || '',
     initial_balance_usd: props.apiKey.initial_balance_usd,
+    unlimited_balance: props.apiKey.initial_balance_usd == null,
     expires_at: props.apiKey.expires_at,
     rate_limit: props.apiKey.rate_limit,
     auto_delete_on_expiry: props.apiKey.auto_delete_on_expiry,
     allowed_providers: props.apiKey.allowed_providers || [],
     allowed_api_formats: props.apiKey.allowed_api_formats || [],
-    allowed_models: props.apiKey.allowed_models || []
+    allowed_models: props.apiKey.allowed_models || [],
   }
 }
 
@@ -385,27 +346,16 @@ const { isEditMode, handleDialogUpdate, handleCancel } = useFormDialog({
 // 加载选项数据
 async function loadAccessRestrictionOptions() {
   try {
-    const [providersData, modelsData, formatsData] = await Promise.all([
-      getProvidersSummary(),
+    const [providersResponse, modelsData, formatsData] = await Promise.all([
+      getProvidersSummary({ page_size: 9999 }),
       getGlobalModels({ limit: 1000, is_active: true }),
       adminApi.getApiFormats()
     ])
-    providers.value = providersData
+    providers.value = providersResponse.items
     globalModels.value = modelsData.models || []
     allApiFormats.value = formatsData.formats?.map((f: { value: string }) => f.value) || []
   } catch (err) {
     log.error('加载访问限制选项失败:', err)
-  }
-}
-
-// 切换选择
-function toggleSelection(field: 'allowed_providers' | 'allowed_api_formats' | 'allowed_models', value: string) {
-  const arr = form.value[field]
-  const index = arr.indexOf(value)
-  if (index === -1) {
-    arr.push(value)
-  } else {
-    arr.splice(index, 1)
   }
 }
 
@@ -431,6 +381,17 @@ watch(isOpen, (val) => {
     loadAccessRestrictionOptions()
   }
 })
+
+watch(
+  () => form.value.unlimited_balance,
+  (unlimited) => {
+    if (unlimited) {
+      form.value.initial_balance_usd = undefined
+    } else if (form.value.initial_balance_usd == null) {
+      form.value.initial_balance_usd = 10
+    }
+  }
+)
 
 defineExpose({
   setSaving

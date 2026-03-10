@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from src.models.database import (
     Provider,
@@ -84,6 +84,8 @@ class PoolCandidate(ProviderCandidate):
     pool_config: PoolConfig | None = None
     pool_priority: int = 999999
     _pool_key_index: int = 0
+    # 延迟可用性检查参数（号池优化：先排序再分页检查）
+    _deferred_check_params: dict[str, Any] | None = field(default=None, repr=False)
 
 
 @dataclass

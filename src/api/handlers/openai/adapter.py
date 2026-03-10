@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from typing import Any
 
-import httpx
 from fastapi.responses import JSONResponse
 
 from src.api.handlers.base.chat_adapter_base import ChatAdapterBase, register_adapter
@@ -28,7 +27,6 @@ class OpenAIChatAdapter(ChatAdapterBase):
 
     FORMAT_ID = "openai:chat"
     API_FAMILY = ApiFamily.OPENAI
-    BILLING_TEMPLATE = "openai"  # 使用 OpenAI 计费模板
     name = "openai.chat"
 
     @property
@@ -104,48 +102,6 @@ class OpenAIChatAdapter(ChatAdapterBase):
                 }
             },
         )
-
-    @classmethod
-    async def fetch_models(
-        cls,
-        client: httpx.AsyncClient,
-        base_url: str,
-        api_key: str,
-        extra_headers: dict[str, str] | None = None,
-    ) -> tuple[list, str | None]:
-        """查询 OpenAI 兼容 API 支持的模型列表"""
-        headers = cls.build_headers_with_extra(api_key, extra_headers)
-
-        # 构建 /v1/models URL
-        base_url = base_url.rstrip("/")
-        if base_url.endswith("/v1"):
-            models_url = f"{base_url}/models"
-        else:
-            models_url = f"{base_url}/v1/models"
-
-        try:
-            response = await client.get(models_url, headers=headers)
-            logger.debug(f"OpenAI models request to {models_url}: status={response.status_code}")
-            if response.status_code == 200:
-                data = response.json()
-                models = []
-                if "data" in data:
-                    models = data["data"]
-                elif isinstance(data, list):
-                    models = data
-                # 为每个模型添加 api_format 字段
-                for m in models:
-                    m["api_format"] = cls.FORMAT_ID
-                return models, None
-            else:
-                error_body = response.text[:500] if response.text else "(empty)"
-                error_msg = f"HTTP {response.status_code}: {error_body}"
-                logger.warning(f"OpenAI models request to {models_url} failed: {error_msg}")
-                return [], error_msg
-        except Exception as e:
-            error_msg = f"Request error: {str(e)}"
-            logger.warning(f"Failed to fetch models from {models_url}: {e}")
-            return [], error_msg
 
     @classmethod
     def build_endpoint_url(

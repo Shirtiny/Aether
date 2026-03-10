@@ -1,9 +1,17 @@
 from types import SimpleNamespace
 
+import pytest
+from pydantic import ValidationError
+
+from src.api.admin.provider_query import TestModelFailoverRequest as FailoverRequestModel
 from src.api.admin.provider_query import (
     _build_direct_test_candidates,
+    _build_test_attempts_from_candidate_keys,
     _filter_test_candidates_by_endpoint,
+    _flatten_test_candidates_for_concurrency,
+    _resolve_test_effective_model,
 )
+from src.services.scheduling.schemas import PoolCandidate
 
 
 def _build_provider() -> tuple[SimpleNamespace, SimpleNamespace, SimpleNamespace]:
@@ -36,3 +44,107 @@ def test_filter_test_candidates_by_endpoint_keeps_matching_candidates() -> None:
 
     assert {candidate.endpoint.id for candidate in filtered} == {endpoint_a.id}
     assert all(candidate.endpoint.id != endpoint_b.id for candidate in filtered)
+
+
+def test_resolve_test_effective_model_prefers_pool_key_mapping() -> None:
+    provider, endpoint_a, _endpoint_b = _build_provider()
+    candidate = _build_direct_test_candidates(provider, endpoint_id=endpoint_a.id)[0]  # type: ignore[arg-type]
+    pool_key = SimpleNamespace(id="pool-key", _pool_mapping_matched_model="mapped-model")
+    request = SimpleNamespace(mode="global", model_name="gpt-4")
+
+    effective = _resolve_test_effective_model(
+        provider=provider,  # type: ignore[arg-type]
+        candidate=candidate,
+        request=request,  # type: ignore[arg-type]
+        gm_obj=None,
+        key=pool_key,
+    )
+
+    assert effective == "mapped-model"
+
+
+def test_build_test_attempts_from_candidate_keys_includes_retry_index() -> None:
+    candidate_keys = [
+        SimpleNamespace(
+            candidate_index=2,
+            retry_index=1,
+            key_id="key-b",
+            key_name="Key B",
+            auth_type="api_key",
+            status="failed",
+            skip_reason=None,
+            error_message="timeout",
+            status_code=504,
+            latency_ms=1200,
+        )
+    ]
+
+    attempts = _build_test_attempts_from_candidate_keys(
+        candidate_keys=candidate_keys,
+        candidate_meta_by_pair={
+            (2, "key-b"): {
+                "endpoint_api_format": "openai:chat",
+                "endpoint_base_url": "https://example.test/v1",
+                "effective_model": "mapped-model",
+            }
+        },
+        candidate_meta_by_index={},
+    )
+
+    assert len(attempts) == 1
+    assert attempts[0].retry_index == 1
+    assert attempts[0].effective_model == "mapped-model"
+    assert attempts[0].endpoint_api_format == "openai:chat"
+
+
+def test_flatten_test_candidates_for_concurrency_expands_pool_keys() -> None:
+    provider, endpoint_a, _endpoint_b = _build_provider()
+    pool_key_a = SimpleNamespace(
+        id="pool-a",
+        name="Pool A",
+        auth_type="oauth",
+        _pool_mapping_matched_model="mapped-a",
+    )
+    pool_key_b = SimpleNamespace(
+        id="pool-b",
+        name="Pool B",
+        auth_type="oauth",
+        _pool_skipped=True,
+        _pool_skip_reason="quota_exhausted",
+    )
+    candidate = PoolCandidate(
+        provider=provider,  # type: ignore[arg-type]
+        endpoint=endpoint_a,  # type: ignore[arg-type]
+        key=pool_key_a,  # type: ignore[arg-type]
+        pool_keys=[pool_key_a, pool_key_b],  # type: ignore[list-item]
+        is_cached=True,
+        provider_api_format="openai:chat",
+    )
+
+    flattened = _flatten_test_candidates_for_concurrency([candidate])
+
+    assert len(flattened) == 2
+    assert flattened[0].key.id == "pool-a"
+    assert flattened[0].mapping_matched_model == "mapped-a"
+    assert flattened[0].is_skipped is False
+    assert flattened[1].key.id == "pool-b"
+    assert flattened[1].is_skipped is True
+    assert flattened[1].skip_reason == "quota_exhausted"
+
+
+def test_test_model_failover_request_validates_concurrency_range() -> None:
+    ok = FailoverRequestModel(
+        provider_id="p1",
+        mode="global",
+        model_name="gpt-4o-mini",
+        concurrency=5,
+    )
+    assert ok.concurrency == 5
+
+    with pytest.raises(ValidationError):
+        FailoverRequestModel(
+            provider_id="p1",
+            mode="global",
+            model_name="gpt-4o-mini",
+            concurrency=0,
+        )

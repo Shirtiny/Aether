@@ -1,6 +1,6 @@
 """backfill_codex_default_body_rules
 
-Backfill default body_rules for openai:cli endpoints
+Backfill default body_rules for codex providers with openai:cli endpoints
 that currently have body_rules IS NULL.
 
 Rules:
@@ -48,17 +48,20 @@ _DEFAULT_BODY_RULES = [
 def upgrade() -> None:
     conn = op.get_bind()
 
-    # 幂等性: 仅回填 body_rules 为空（SQL NULL 或 JSON null）的记录
+    # 幂等性: 仅回填 codex 提供商中 body_rules 为空（SQL NULL 或 JSON null）的记录
     rules_json = json.dumps(_DEFAULT_BODY_RULES, ensure_ascii=False)
     result = conn.execute(
         sa.text("""
-            UPDATE provider_endpoints
+            UPDATE provider_endpoints pe
             SET body_rules = CAST(:rules AS json),
                 updated_at = CURRENT_TIMESTAMP
-            WHERE api_format = :fmt
-              AND (body_rules IS NULL OR body_rules::text = 'null')
+            FROM providers p
+            WHERE pe.provider_id = p.id
+              AND p.provider_type = :ptype
+              AND pe.api_format = :fmt
+              AND (pe.body_rules IS NULL OR pe.body_rules::text = 'null')
         """),
-        {"rules": rules_json, "fmt": _TARGET_FORMATS[0]},
+        {"rules": rules_json, "ptype": "codex", "fmt": _TARGET_FORMATS[0]},
     )
     if result.rowcount:
         print(f"  backfilled body_rules for {result.rowcount} endpoint(s)")

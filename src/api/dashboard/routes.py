@@ -33,6 +33,7 @@ from src.services.system.stats_aggregator import (
     query_time_series,
 )
 from src.services.system.time_range import TimeRangeParams
+from src.services.wallet import WalletService
 from src.utils.cache_decorator import cache_result
 
 router = APIRouter(prefix="/api/dashboard", tags=["Dashboard"])
@@ -102,7 +103,7 @@ async def get_dashboard_stats(request: Request, db: Session = Depends(get_db)) -
     - `users`: 用户统计（total, active）
 
     **返回字段（普通用户）**:
-    - `stats`: 统计卡片数组，包含 API 密钥、本月请求、配额使用、总Token 等信息
+    - `stats`: 统计卡片数组，包含 API 密钥、本月请求、钱包状态、总Token 等信息
     - `today`: 今日统计
     - `token_breakdown`: Token 详细分类
     - `cache_stats`: 缓存统计信息
@@ -302,7 +303,7 @@ class AdminDashboardStatsAdapter(AdminApiAdapter):
         yesterday_stats = db.query(StatsDaily).filter(StatsDaily.date == yesterday).first()
         if yesterday_stats:
             requests_yesterday = yesterday_stats.total_requests
-            cost_yesterday = yesterday_stats.total_cost
+            cost_yesterday = float(yesterday_stats.total_cost or 0)
             input_tokens_yesterday = yesterday_stats.input_tokens
             output_tokens_yesterday = yesterday_stats.output_tokens
             cache_creation_yesterday = yesterday_stats.cache_creation_tokens
@@ -373,8 +374,8 @@ class AdminDashboardStatsAdapter(AdminApiAdapter):
         if monthly_stats and monthly_stats.total_requests:
             total_requests = int(monthly_stats.total_requests or 0) + requests_today
             error_requests = int(monthly_stats.error_requests or 0) + today_stats["error_requests"]
-            total_cost = float(monthly_stats.total_cost or 0) + cost_today
-            total_actual_cost = float(monthly_stats.actual_total_cost or 0) + actual_cost_today
+            total_cost = float(monthly_stats.total_cost or 0) + float(cost_today)
+            total_actual_cost = float(monthly_stats.actual_total_cost or 0) + float(actual_cost_today)
             total_tokens = int(monthly_stats.total_tokens or 0) + tokens_today
             cache_creation_tokens = (
                 int(monthly_stats.cache_creation_tokens or 0) + cache_creation_today
@@ -770,20 +771,18 @@ class UserDashboardStatsAdapter(DashboardAdapter):
             int(usage_stats.today_cache_read_tokens or 0) if usage_stats else 0
         )
 
-        # 配额状态
-        if user.quota_usd is None:
-            quota_value = "无限制"
-            quota_change = f"已用 ${user.used_usd:.2f}"
-            quota_high = False
-        elif user.quota_usd > 0:
-            percent = min(100, int((user.used_usd / user.quota_usd) * 100))
-            quota_value = f"${user.quota_usd:.0f}"
-            quota_change = f"已用 ${user.used_usd:.2f}"
-            quota_high = percent > 80
+        wallet = WalletService.get_wallet(db, user_id=user.id)
+        billing = WalletService.serialize_wallet_summary(wallet)
+        wallet_balance = float(billing["balance"])
+        wallet_consumed = float(billing["total_consumed"])
+        if bool(billing["unlimited"]):
+            wallet_value = "无限制"
+            wallet_change = f"累计消费 ${wallet_consumed:.2f}"
+            wallet_high = False
         else:
-            quota_value = "$0"
-            quota_change = f"已用 ${user.used_usd:.2f}"
-            quota_high = True
+            wallet_value = f"${wallet_balance:.2f}"
+            wallet_change = f"累计消费 ${wallet_consumed:.2f}"
+            wallet_high = wallet_balance <= 0
 
         return {
             "stats": [
@@ -804,10 +803,10 @@ class UserDashboardStatsAdapter(DashboardAdapter):
                     "icon": "Activity",
                 },
                 {
-                    "name": "配额使用",
-                    "value": quota_value,
-                    "change": quota_change,
-                    "changeType": "increase" if quota_high else "neutral",
+                    "name": "钱包状态",
+                    "value": wallet_value,
+                    "change": wallet_change,
+                    "changeType": "increase" if wallet_high else "neutral",
                     "icon": "TrendingUp",
                 },
                 {
@@ -1198,7 +1197,7 @@ class DashboardDailyStatsAdapter(DashboardAdapter):
                     + stat.output_tokens
                     + stat.cache_creation_tokens
                     + stat.cache_read_tokens,
-                    "cost": stat.total_cost,
+                    "cost": float(stat.total_cost or 0),
                     "avg_response_time": (
                         stat.avg_response_time_ms / 1000.0 if stat.avg_response_time_ms else 0
                     ),
@@ -1240,7 +1239,7 @@ class DashboardDailyStatsAdapter(DashboardAdapter):
                         + today_stats["cache_creation_tokens"]
                         + today_stats["cache_read_tokens"]
                     ),
-                    "cost": today_stats["total_cost"],
+                    "cost": float(today_stats["total_cost"]),
                     "avg_response_time": today_avg_rt_ms / 1000.0 if today_avg_rt_ms else 0,
                     "unique_models": today_unique_models,
                     "unique_providers": today_unique_providers,
@@ -1384,10 +1383,10 @@ class DashboardDailyStatsAdapter(DashboardAdapter):
                     + stat.cache_read_tokens
                 )
                 model_agg[model]["tokens"] += tokens
-                model_agg[model]["cost"] += stat.total_cost
+                model_agg[model]["cost"] += float(stat.total_cost or 0)
                 if stat.avg_response_time_ms is not None:
                     model_agg[model]["total_response_time"] += (
-                        stat.avg_response_time_ms * stat.total_requests
+                        float(stat.avg_response_time_ms) * stat.total_requests
                     )
                     model_agg[model]["response_count"] += stat.total_requests
 
@@ -1403,7 +1402,7 @@ class DashboardDailyStatsAdapter(DashboardAdapter):
                         "model": model,
                         "requests": stat.total_requests,
                         "tokens": tokens,
-                        "cost": stat.total_cost,
+                        "cost": float(stat.total_cost or 0),
                     }
                 )
 
@@ -1572,7 +1571,7 @@ class DashboardDailyStatsAdapter(DashboardAdapter):
                     + stat.cache_read_tokens
                 )
                 provider_agg[provider]["tokens"] += tokens
-                provider_agg[provider]["cost"] += stat.total_cost
+                provider_agg[provider]["cost"] += float(stat.total_cost or 0)
 
             # 今日实时供应商统计
             today_provider_stats = (

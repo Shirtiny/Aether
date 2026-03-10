@@ -2,7 +2,7 @@
 计费相关数据类
 
 定义计费计算所需的数据结构。
-实际的计费逻辑已移至 ChatAdapterBase，每种 API 格式可以覆盖计费方法。
+实际的计费能力已收敛到 core.api_format 注册表，避免依赖 API Adapter。
 
 数据类：
 - UsageTokens: 请求的 token 使用量

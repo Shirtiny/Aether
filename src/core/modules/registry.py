@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import importlib
 import importlib.util
 import os
 from typing import TYPE_CHECKING, Any, Protocol
@@ -31,6 +32,19 @@ class ConfigBackend(Protocol):
 
     def get_config(self, db: Any, key: str, default: Any = None) -> Any: ...
     def set_config(self, db: Any, key: str, value: Any, description: Any = None) -> Any: ...
+
+
+class _DefaultConfigBackend:
+    """默认配置后端：始终返回 default（用于独立脚本/极简测试场景）。"""
+
+    def get_config(self, _db: Any, _key: str, default: Any = None) -> Any:
+        return default
+
+    def set_config(self, _db: Any, _key: str, _value: Any, _description: Any = None) -> Any:
+        return None
+
+
+_DEFAULT_CONFIG_BACKEND: ConfigBackend = _DefaultConfigBackend()
 
 
 class ModuleRegistry:
@@ -142,13 +156,21 @@ class ModuleRegistry:
     # ========== 启用状态检查（运行级）==========
 
     def _get_config_backend(self) -> ConfigBackend:
-        """获取配置后端（优先使用已注入的，兜底 lazy import）"""
+        """获取配置后端（优先使用已注入的）。"""
         if self._config_backend is not None:
             return self._config_backend
-        # 兜底: 未注入时使用 lazy import（向后兼容独立脚本/测试场景）
-        from src.services.system.config import SystemConfigService  # noqa: lazy fallback
 
-        return SystemConfigService  # type: ignore[return-value]
+        # 兜底：best-effort 动态加载（避免 core→services 的静态依赖）。
+        try:
+            module = importlib.import_module("src.services.system.config")
+            backend = getattr(module, "SystemConfigService", None)
+            if backend is not None:
+                return backend  # type: ignore[return-value]
+        except Exception:
+            pass
+
+        # 最终兜底：未注入且无法动态加载时，使用默认后端（始终返回 default）。
+        return _DEFAULT_CONFIG_BACKEND
 
     def is_enabled(self, name: str, db: Session) -> bool:
         """

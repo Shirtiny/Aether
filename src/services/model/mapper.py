@@ -13,6 +13,9 @@ from src.models.claude import ClaudeMessagesRequest
 from src.models.database import GlobalModel, Model, Provider, ProviderEndpoint
 from src.services.cache.model_cache import ModelCacheService
 
+# 模块级共享缓存，所有 ModelMapperMiddleware 实例共用
+_shared_cache = SyncLRUCache(max_size=1000, ttl=300)
+
 
 class ModelMapperMiddleware:
     """
@@ -20,29 +23,14 @@ class ModelMapperMiddleware:
     负责将用户请求的模型名映射到提供商的实际模型名
     """
 
-    def __init__(self, db: Session, cache_max_size: int = 1000, cache_ttl: int = 300):
+    def __init__(self, db: Session):
         """
         初始化模型映射中间件
 
         Args:
             db: 数据库会话
-            cache_max_size: 缓存最大容量（默认 1000）
-            cache_ttl: 缓存过期时间（秒，默认 300）
         """
         self.db = db
-        self._cache = SyncLRUCache(max_size=cache_max_size, ttl=cache_ttl)
-
-        logger.debug(f"[ModelMapper] 初始化（max_size={cache_max_size}, ttl={cache_ttl}s）")
-
-        # 注册到缓存失效服务
-        try:
-            from src.services.cache.invalidation import get_cache_invalidation_service
-
-            cache_service = get_cache_invalidation_service()
-            cache_service.register_model_mapper(self)
-            logger.debug("[ModelMapper] 已注册到缓存失效服务")
-        except Exception as e:
-            logger.warning(f"[ModelMapper] 注册缓存失效服务失败: {e}")
 
     async def apply_mapping(
         self, request: ClaudeMessagesRequest, provider: Provider
@@ -104,8 +92,8 @@ class ModelMapperMiddleware:
 
         # 检查缓存（使用规范化后的名称）
         cache_key = f"{provider_id}:{normalized_name}"
-        if cache_key in self._cache:
-            return self._cache[cache_key]
+        if cache_key in _shared_cache:
+            return _shared_cache[cache_key]
 
         mapping = None
 
@@ -113,7 +101,7 @@ class ModelMapperMiddleware:
 
         if not global_model or not global_model.is_active:
             logger.debug(f"GlobalModel not found or inactive: {normalized_name}")
-            self._cache[cache_key] = None
+            _shared_cache[cache_key] = None
             return None
 
         # 步骤 2: 查找该 Provider 是否有实现这个 GlobalModel 的 Model（使用缓存）
@@ -122,6 +110,13 @@ class ModelMapperMiddleware:
         )
 
         if model:
+            # 将 ORM Model 转为无 Session 绑定的实例，避免跨请求缓存导致 DetachedInstanceError
+            from sqlalchemy.orm.session import object_session
+
+            if object_session(model) is not None:
+                model_dict = ModelCacheService._model_to_dict(model)
+                model = ModelCacheService._dict_to_model(model_dict)
+
             # 创建映射对象
             mapping = type(
                 "obj",
@@ -140,7 +135,7 @@ class ModelMapperMiddleware:
             )
 
         # 缓存结果
-        self._cache[cache_key] = mapping
+        _shared_cache[cache_key] = mapping
 
         return mapping
 
@@ -221,12 +216,14 @@ class ModelMapperMiddleware:
 
         return True, None
 
-    def clear_cache(self) -> None:
-        """清空缓存"""
-        self._cache.clear()
+    @staticmethod
+    def clear_cache() -> None:
+        """清空共享缓存"""
+        _shared_cache.clear()
         logger.debug("Model mapping cache cleared")
 
-    def refresh_cache(self, provider_id: str | None = None) -> None:
+    @staticmethod
+    def refresh_cache(provider_id: str | None = None) -> None:
         """
         刷新缓存
 
@@ -234,16 +231,14 @@ class ModelMapperMiddleware:
             provider_id: 如果指定，只刷新该提供商的缓存 (UUID)
         """
         if provider_id:
-            # 清除特定提供商的缓存
             keys_to_remove = [
-                key for key in self._cache.keys() if key.startswith(f"{provider_id}:")
+                key for key in _shared_cache.keys() if key.startswith(f"{provider_id}:")
             ]
             for key in keys_to_remove:
-                del self._cache[key]
+                del _shared_cache[key]
             logger.debug(f"Refreshed cache for provider {provider_id}")
         else:
-            # 清空所有缓存
-            self.clear_cache()
+            ModelMapperMiddleware.clear_cache()
 
 
 class ModelRoutingMiddleware:
