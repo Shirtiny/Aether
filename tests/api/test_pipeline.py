@@ -8,54 +8,139 @@ API Pipeline 测试
 """
 
 from datetime import datetime, timezone
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
 
+from src.api.base.adapter import ApiMode
 from src.api.base.pipeline import ApiRequestPipeline
 from src.core.enums import UserRole
+from src.core.modules.hooks import AUTH_TOKEN_PREFIX_AUTHENTICATORS
 
 
 class TestPipelineBalanceCalculation:
-    """测试 Pipeline 余额计算"""
+    """Balance calculation tests for Pipeline."""
 
     @pytest.fixture
     def pipeline(self) -> ApiRequestPipeline:
         return ApiRequestPipeline()
 
-    def test_calculate_balance_remaining_with_balance(self, pipeline: ApiRequestPipeline) -> None:
-        """测试有限制钱包时计算剩余余额"""
+    @pytest.mark.asyncio
+    async def test_calculate_balance_remaining_with_balance(
+        self, pipeline: ApiRequestPipeline
+    ) -> None:
+        """Returns remaining balance for limited wallets."""
         mock_user = MagicMock()
-        mock_db = MagicMock()
+        mock_user.id = "user-123"
 
-        with patch(
-            "src.api.base.pipeline.WalletService.get_balance_snapshot",
-            return_value=70.0,
-        ):
-            remaining = pipeline._calculate_balance_remaining(mock_db, mock_user)
+        thread_db = MagicMock()
+        db_user = MagicMock()
+        thread_db.query.return_value.filter.return_value.first.return_value = db_user
+
+        with patch("src.api.base.pipeline.create_session", return_value=thread_db):
+            with patch(
+                "src.api.base.pipeline.WalletService.get_balance_snapshot",
+                return_value=70.0,
+            ):
+                remaining = await pipeline._calculate_balance_remaining_async(mock_user)
 
         assert remaining == 70.0
+        thread_db.close.assert_called_once()
 
-    def test_calculate_balance_remaining_unlimited(self, pipeline: ApiRequestPipeline) -> None:
-        """测试无限制钱包时返回 None"""
+    @pytest.mark.asyncio
+    async def test_calculate_balance_remaining_unlimited(
+        self, pipeline: ApiRequestPipeline
+    ) -> None:
+        """Returns None for unlimited wallets."""
         mock_user = MagicMock()
-        mock_db = MagicMock()
+        mock_user.id = "user-123"
 
-        with patch(
-            "src.api.base.pipeline.WalletService.get_balance_snapshot",
-            return_value=None,
+        thread_db = MagicMock()
+        db_user = MagicMock()
+        thread_db.query.return_value.filter.return_value.first.return_value = db_user
+
+        with patch("src.api.base.pipeline.create_session", return_value=thread_db):
+            with patch(
+                "src.api.base.pipeline.WalletService.get_balance_snapshot",
+                return_value=None,
+            ):
+                remaining = await pipeline._calculate_balance_remaining_async(mock_user)
+
+        assert remaining is None
+        thread_db.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_calculate_balance_remaining_none_user(
+        self, pipeline: ApiRequestPipeline
+    ) -> None:
+        """Returns None when user is missing."""
+        remaining = await pipeline._calculate_balance_remaining_async(None)
+
+        assert remaining is None
+
+
+class TestPipelineRunModes:
+    """Returns remaining balance for limited wallets."""
+
+    @pytest.fixture
+    def pipeline(self) -> ApiRequestPipeline:
+        return ApiRequestPipeline()
+
+    @pytest.mark.asyncio
+    async def test_run_management_mode_skips_balance_calculation(
+        self, pipeline: ApiRequestPipeline
+    ) -> None:
+        """Management mode skips balance calculation."""
+        mock_request = MagicMock()
+        mock_request.method = "GET"
+        mock_request.url.path = "/api/admin/tokens"
+        mock_request.state = MagicMock()
+
+        mock_db = MagicMock()
+        mock_user = MagicMock()
+        mock_user.id = "admin-123"
+        mock_token = MagicMock()
+        mock_token.id = "mt-123"
+
+        mock_adapter = MagicMock()
+        mock_adapter.name = "test-adapter"
+        mock_adapter.authorize = MagicMock(return_value=None)
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_adapter.handle = AsyncMock(return_value=mock_response)
+
+        mock_context = MagicMock()
+        mock_context.db = mock_db
+        mock_context.request = mock_request
+
+        with patch.object(
+            pipeline,
+            "_authenticate_management",
+            new_callable=AsyncMock,
+            return_value=(mock_user, mock_token),
         ):
-            remaining = pipeline._calculate_balance_remaining(mock_db, mock_user)
+            with patch(
+                "src.api.base.pipeline.ApiRequestContext.build",
+                return_value=mock_context,
+            ):
+                with patch.object(
+                    pipeline,
+                    "_calculate_balance_remaining_async",
+                    new_callable=AsyncMock,
+                ) as mock_balance:
+                    with patch.object(pipeline, "_record_audit_event"):
+                        response = await pipeline.run(
+                            mock_adapter,
+                            mock_request,
+                            mock_db,
+                            mode=ApiMode.MANAGEMENT,
+                        )
 
-        assert remaining is None
-
-    def test_calculate_balance_remaining_none_user(self, pipeline: ApiRequestPipeline) -> None:
-        """测试用户为 None 时返回 None"""
-        mock_db = MagicMock()
-        remaining = pipeline._calculate_balance_remaining(mock_db, None)
-
-        assert remaining is None
+        assert response == mock_response
+        assert mock_context.management_token == mock_token
+        mock_balance.assert_not_called()
 
 
 class TestPipelineAuditLogging:
@@ -213,7 +298,8 @@ class TestPipelineAuthentication:
     def pipeline(self) -> ApiRequestPipeline:
         return ApiRequestPipeline()
 
-    def test_authenticate_client_missing_key(self, pipeline: ApiRequestPipeline) -> None:
+    @pytest.mark.asyncio
+    async def test_authenticate_client_missing_key(self, pipeline: ApiRequestPipeline) -> None:
         """测试缺少 API Key 时抛出异常"""
         mock_request = MagicMock()
         mock_request.headers = {}
@@ -226,12 +312,13 @@ class TestPipelineAuthentication:
         mock_adapter.extract_api_key = MagicMock(return_value=None)
 
         with pytest.raises(HTTPException) as exc_info:
-            pipeline._authenticate_client(mock_request, mock_db, mock_adapter)
+            await pipeline._authenticate_client(mock_request, mock_db, mock_adapter)
 
         assert exc_info.value.status_code == 401
         assert "API密钥" in exc_info.value.detail
 
-    def test_authenticate_client_invalid_key(self, pipeline: ApiRequestPipeline) -> None:
+    @pytest.mark.asyncio
+    async def test_authenticate_client_invalid_key(self, pipeline: ApiRequestPipeline) -> None:
         """测试无效的 API Key"""
         mock_request = MagicMock()
         mock_request.headers = {"Authorization": "Bearer sk-invalid"}
@@ -245,15 +332,17 @@ class TestPipelineAuthentication:
 
         with patch.object(
             pipeline.auth_service,
-            "authenticate_api_key",
+            "authenticate_api_key_threadsafe",
+            new_callable=AsyncMock,
             return_value=None,
         ):
             with pytest.raises(HTTPException) as exc_info:
-                pipeline._authenticate_client(mock_request, mock_db, mock_adapter)
+                await pipeline._authenticate_client(mock_request, mock_db, mock_adapter)
 
         assert exc_info.value.status_code == 401
 
-    def test_authenticate_client_balance_exceeded(self, pipeline: ApiRequestPipeline) -> None:
+    @pytest.mark.asyncio
+    async def test_authenticate_client_balance_exceeded(self, pipeline: ApiRequestPipeline) -> None:
         """测试余额不足时抛出异常"""
         mock_user = MagicMock()
         mock_user.id = "user-123"
@@ -268,28 +357,198 @@ class TestPipelineAuthentication:
         mock_request.state = MagicMock()
 
         mock_db = MagicMock()
+        db_user = MagicMock()
+        db_user.id = "user-123"
+        db_user.is_active = True
+        db_user.is_deleted = False
+        db_api_key = MagicMock()
+        db_api_key.id = "key-123"
+        db_api_key.user_id = "user-123"
+        db_api_key.is_active = True
+        db_api_key.is_locked = False
+        db_api_key.is_standalone = False
+        db_api_key.expires_at = None
+        user_query = MagicMock()
+        user_query.filter.return_value.first.return_value = db_user
+        api_key_query = MagicMock()
+        api_key_query.filter.return_value.first.return_value = db_api_key
+        mock_db.query.side_effect = [user_query, api_key_query]
 
         mock_adapter = MagicMock()
         mock_adapter.extract_api_key = MagicMock(return_value="sk-test")
 
         with patch.object(
             pipeline.auth_service,
-            "authenticate_api_key",
-            return_value=(mock_user, mock_api_key),
+            "authenticate_api_key_threadsafe",
+            new_callable=AsyncMock,
+            return_value=MagicMock(
+                user=mock_user,
+                api_key=mock_api_key,
+                access_allowed=False,
+                balance_remaining=0.0,
+            ),
         ):
-            with patch.object(
-                pipeline.usage_service,
-                "check_request_balance",
-                return_value=(False, "余额不足"),
-            ):
-                with patch(
-                    "src.api.base.pipeline.WalletService.get_balance_snapshot",
-                    return_value=0.0,
-                ):
-                    from src.core.exceptions import BalanceInsufficientException
+            from src.core.exceptions import BalanceInsufficientException
 
-                    with pytest.raises(BalanceInsufficientException):
-                        pipeline._authenticate_client(mock_request, mock_db, mock_adapter)
+            with pytest.raises(BalanceInsufficientException):
+                await pipeline._authenticate_client(mock_request, mock_db, mock_adapter)
+
+    @pytest.mark.asyncio
+    async def test_authenticate_client_requery_detects_inactive_user(
+        self, pipeline: ApiRequestPipeline
+    ) -> None:
+        mock_user = MagicMock()
+        mock_user.id = "user-123"
+        mock_api_key = MagicMock()
+        mock_api_key.id = "key-123"
+
+        mock_request = MagicMock()
+        mock_request.headers = {"Authorization": "Bearer sk-test"}
+        mock_request.url.path = "/v1/messages"
+        mock_request.state = MagicMock()
+
+        mock_adapter = MagicMock()
+        mock_adapter.extract_api_key = MagicMock(return_value="sk-test")
+
+        db_user = MagicMock()
+        db_user.id = "user-123"
+        db_user.is_active = False
+        db_user.is_deleted = False
+        db_api_key = MagicMock()
+        db_api_key.id = "key-123"
+        db_api_key.user_id = "user-123"
+        db_api_key.is_active = True
+        db_api_key.is_locked = False
+        db_api_key.is_standalone = False
+        db_api_key.expires_at = None
+
+        mock_db = MagicMock()
+        user_query = MagicMock()
+        user_query.filter.return_value.first.return_value = db_user
+        api_key_query = MagicMock()
+        api_key_query.filter.return_value.first.return_value = db_api_key
+        mock_db.query.side_effect = [user_query, api_key_query]
+
+        with patch.object(
+            pipeline.auth_service,
+            "authenticate_api_key_threadsafe",
+            new_callable=AsyncMock,
+            return_value=MagicMock(
+                user=mock_user,
+                api_key=mock_api_key,
+                access_allowed=True,
+                balance_remaining=10.0,
+            ),
+        ):
+            with pytest.raises(HTTPException) as exc_info:
+                await pipeline._authenticate_client(mock_request, mock_db, mock_adapter)
+
+        assert exc_info.value.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_authenticate_client_requery_detects_locked_key(
+        self, pipeline: ApiRequestPipeline
+    ) -> None:
+        mock_user = MagicMock()
+        mock_user.id = "user-123"
+        mock_api_key = MagicMock()
+        mock_api_key.id = "key-123"
+
+        mock_request = MagicMock()
+        mock_request.headers = {"Authorization": "Bearer sk-test"}
+        mock_request.url.path = "/v1/messages"
+        mock_request.state = MagicMock()
+
+        mock_adapter = MagicMock()
+        mock_adapter.extract_api_key = MagicMock(return_value="sk-test")
+
+        db_user = MagicMock()
+        db_user.id = "user-123"
+        db_user.is_active = True
+        db_user.is_deleted = False
+        db_api_key = MagicMock()
+        db_api_key.id = "key-123"
+        db_api_key.user_id = "user-123"
+        db_api_key.is_active = True
+        db_api_key.is_locked = True
+        db_api_key.is_standalone = False
+        db_api_key.expires_at = None
+
+        mock_db = MagicMock()
+        user_query = MagicMock()
+        user_query.filter.return_value.first.return_value = db_user
+        api_key_query = MagicMock()
+        api_key_query.filter.return_value.first.return_value = db_api_key
+        mock_db.query.side_effect = [user_query, api_key_query]
+
+        with patch.object(
+            pipeline.auth_service,
+            "authenticate_api_key_threadsafe",
+            new_callable=AsyncMock,
+            return_value=MagicMock(
+                user=mock_user,
+                api_key=mock_api_key,
+                access_allowed=True,
+                balance_remaining=10.0,
+            ),
+        ):
+            with pytest.raises(HTTPException) as exc_info:
+                await pipeline._authenticate_client(mock_request, mock_db, mock_adapter)
+
+        assert exc_info.value.status_code == 403
+        assert "锁定" in str(exc_info.value.detail)
+
+
+class TestPipelineTokenPrefixAuth:
+    """Tests token-prefix auth isolation."""
+
+    @pytest.fixture
+    def pipeline(self) -> ApiRequestPipeline:
+        return ApiRequestPipeline()
+
+    @pytest.mark.asyncio
+    async def test_try_token_prefix_auth_uses_isolated_session(
+        self, pipeline: ApiRequestPipeline
+    ) -> None:
+        mock_request = MagicMock()
+        mock_request.headers = {}
+        mock_request.client = MagicMock(host="127.0.0.1")
+
+        route_db = MagicMock()
+        auth_db = MagicMock()
+        mock_user = MagicMock()
+        mock_token = MagicMock()
+
+        async def authenticate(db: Any, token: str, client_ip: str) -> tuple[Any, Any]:
+            assert db is auth_db
+            assert token == "ae_test"
+            assert client_ip == "127.0.0.1"
+            return mock_user, mock_token
+
+        with patch("src.api.base.pipeline.create_session", return_value=auth_db):
+            with patch("src.utils.request_utils.get_client_ip", return_value="127.0.0.1"):
+                with patch("src.core.modules.hooks.get_hook_dispatcher") as mock_get_dispatcher:
+                    dispatcher = MagicMock()
+                    dispatcher.dispatch = AsyncMock(
+                        return_value=[
+                            {
+                                "prefix": "ae_",
+                                "module": "management_tokens",
+                                "authenticate": authenticate,
+                            }
+                        ]
+                    )
+                    mock_get_dispatcher.return_value = dispatcher
+
+                    result = await pipeline._try_token_prefix_auth(
+                        "ae_test", mock_request, route_db
+                    )
+
+        assert result == (mock_user, mock_token)
+        dispatcher.dispatch.assert_awaited_once_with(AUTH_TOKEN_PREFIX_AUTHENTICATORS)
+        auth_db.expunge.assert_any_call(mock_user)
+        auth_db.expunge.assert_any_call(mock_token)
+        auth_db.close.assert_called_once()
 
 
 class TestPipelineAdminAuth:

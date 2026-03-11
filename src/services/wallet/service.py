@@ -43,6 +43,7 @@ class WalletAccessResult:
     remaining: Decimal | None
     message: str
     wallet: Wallet | None = None
+    balance_snapshot: Decimal | None = None
 
 
 class WalletService:
@@ -230,6 +231,17 @@ class WalletService:
         return None
 
     @classmethod
+    def get_wallets_by_user_ids(
+        cls,
+        db: Session,
+        user_ids: list[str],
+    ) -> dict[str, Wallet]:
+        if not user_ids:
+            return {}
+        wallets = db.query(Wallet).filter(Wallet.user_id.in_(user_ids)).all()
+        return {wallet.user_id: wallet for wallet in wallets if wallet.user_id is not None}
+
+    @classmethod
     def get_or_create_wallet(
         cls,
         db: Session,
@@ -292,6 +304,18 @@ class WalletService:
             raise
 
     @classmethod
+    def _get_balance_snapshot_from_wallet(cls, wallet: Wallet | None) -> Decimal | None:
+        if wallet is None:
+            return None
+
+        recharge_balance = cls.get_recharge_balance_value(wallet)
+        if recharge_balance < Decimal("0"):
+            return recharge_balance
+        if cls.is_unlimited_wallet(wallet):
+            return None
+        return cls.get_spendable_balance_value(wallet)
+
+    @classmethod
     def check_request_allowed(
         cls,
         db: Session,
@@ -299,25 +323,29 @@ class WalletService:
         user: User | None,
         api_key: ApiKey | None = None,
     ) -> WalletAccessResult:
-        if user and user.role == UserRole.ADMIN:
-            return WalletAccessResult(True, None, "OK", None)
-
         wallet = cls.get_or_create_wallet(db, user=user, api_key=api_key)
+        balance_snapshot = cls._get_balance_snapshot_from_wallet(wallet)
+
+        if user and user.role == UserRole.ADMIN:
+            return WalletAccessResult(True, None, "OK", wallet, balance_snapshot)
+
         if wallet is None:
-            return WalletAccessResult(False, Decimal("0"), "钱包不存在", None)
+            return WalletAccessResult(False, Decimal("0"), "钱包不存在", None, None)
 
         remaining = cls.get_spendable_balance_value(wallet)
         recharge_balance = cls.get_recharge_balance_value(wallet)
         if wallet.status != "active":
-            return WalletAccessResult(False, remaining, "钱包不可用", wallet)
-        # 充值余额为负视为欠费，禁止继续消费（即使总可用余额仍为正）。
+            return WalletAccessResult(False, remaining, "钱包不可用", wallet, balance_snapshot)
+        # Negative recharge balance means overdue; block further spending.
         if recharge_balance < Decimal("0"):
-            return WalletAccessResult(False, recharge_balance, "钱包欠费，请先充值", wallet)
+            return WalletAccessResult(
+                False, recharge_balance, "钱包欠费，请先充值", wallet, balance_snapshot
+            )
         if cls.is_unlimited_wallet(wallet):
-            return WalletAccessResult(True, None, "OK", wallet)
+            return WalletAccessResult(True, None, "OK", wallet, balance_snapshot)
         if remaining <= Decimal("0"):
-            return WalletAccessResult(False, remaining, "钱包余额不足", wallet)
-        return WalletAccessResult(True, remaining, "OK", wallet)
+            return WalletAccessResult(False, remaining, "钱包余额不足", wallet, balance_snapshot)
+        return WalletAccessResult(True, remaining, "OK", wallet, balance_snapshot)
 
     @classmethod
     def get_balance_snapshot(
@@ -328,14 +356,7 @@ class WalletService:
         api_key: ApiKey | None = None,
     ) -> Decimal | None:
         wallet = cls.get_or_create_wallet(db, user=user, api_key=api_key)
-        if wallet is None:
-            return None
-        recharge_balance = cls.get_recharge_balance_value(wallet)
-        if recharge_balance < Decimal("0"):
-            return recharge_balance
-        if cls.is_unlimited_wallet(wallet):
-            return None
-        return cls.get_spendable_balance_value(wallet)
+        return cls._get_balance_snapshot_from_wallet(wallet)
 
     @classmethod
     def _resolve_wallet_for_usage(

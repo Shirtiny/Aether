@@ -245,7 +245,7 @@ const activeRequestIds = computed(() => {
 const hasActiveRequests = computed(() => activeRequestIds.value.length > 0)
 
 // 自动刷新定时器
-let autoRefreshTimer: ReturnType<typeof setInterval> | null = null
+let autoRefreshTimer: ReturnType<typeof setTimeout> | null = null
 let globalAutoRefreshTimer: ReturnType<typeof setInterval> | null = null
 let refreshInFlight: Promise<void> | null = null
 const AUTO_REFRESH_INTERVAL = 1000 // 1秒刷新一次（用于活跃请求）
@@ -271,8 +271,10 @@ async function pollActiveRequests() {
 
     let shouldRefresh = false
 
+    const recordMap = new Map(currentRecords.value.map(record => [record.id, record]))
+
     for (const update of requests) {
-      const record = currentRecords.value.find(r => r.id === update.id)
+      const record = recordMap.get(update.id)
       if (!record) {
         // 后端返回了未知的活跃请求，触发刷新以获取完整数据
         shouldRefresh = true
@@ -339,17 +341,26 @@ async function pollActiveRequests() {
   }
 }
 
+function scheduleNextAutoRefresh() {
+  if (autoRefreshTimer) return
+  if (!isPageVisible.value || !hasActiveRequests.value) return
+  autoRefreshTimer = setTimeout(async () => {
+    autoRefreshTimer = null
+    await pollActiveRequests()
+    scheduleNextAutoRefresh()
+  }, AUTO_REFRESH_INTERVAL)
+}
+
 // 启动自动刷新
 function startAutoRefresh() {
   if (!isPageVisible.value) return
-  if (autoRefreshTimer) return
-  autoRefreshTimer = setInterval(pollActiveRequests, AUTO_REFRESH_INTERVAL)
+  scheduleNextAutoRefresh()
 }
 
 // 停止自动刷新
 function stopAutoRefresh() {
   if (autoRefreshTimer) {
-    clearInterval(autoRefreshTimer)
+    clearTimeout(autoRefreshTimer)
     autoRefreshTimer = null
   }
 }

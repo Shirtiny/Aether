@@ -104,6 +104,7 @@ class UsageActiveRequestsMixin:
         cls,
         db: Session,
         timeout_minutes: int = 10,
+        batch_size: int = 200,
     ) -> int:
         """
         清理超时的 pending/streaming 请求
@@ -115,6 +116,7 @@ class UsageActiveRequestsMixin:
         Args:
             db: 数据库会话
             timeout_minutes: 超时时间（分钟），默认 10 分钟
+            batch_size: 每次处理的记录数，限制在 1-200 之间
 
         Returns:
             清理的记录数
@@ -122,68 +124,80 @@ class UsageActiveRequestsMixin:
         now = datetime.now(timezone.utc)
         cutoff_time = now - timedelta(minutes=timeout_minutes)
 
-        # 查找超时的请求
-        stale_requests = (
-            db.query(Usage)
-            .filter(
-                Usage.status.in_(["pending", "streaming"]),
-                Usage.created_at < cutoff_time,
-            )
-            .all()
-        )
-
-        if not stale_requests:
-            return 0
-
-        # 收集所有超时请求的 request_id，查询哪些实际已成功完成
-        stale_request_ids = [u.request_id for u in stale_requests if u.request_id]
-        completed_request_ids = cls._find_completed_request_ids(db, stale_request_ids)
-
+        batch_size = max(1, batch_size)
         failed_count = 0
         recovered_count = 0
 
-        for usage in stale_requests:
-            old_status = usage.status
-            if usage.request_id and usage.request_id in completed_request_ids:
-                # Provider 已返回成功，恢复为 completed
-                usage.status = "completed"
-                usage.status_code = 200
-                usage.error_message = None
-                recovered_count += 1
-            else:
-                # 无成功 candidate，标记为 failed
-                usage.status = "failed"
-                usage.error_message = (
-                    f"请求超时: 状态 '{old_status}' 超过 {timeout_minutes} 分钟未完成"
+        while True:
+            stale_requests = (
+                db.query(Usage.id, Usage.request_id, Usage.status)
+                .filter(
+                    Usage.status.in_(["pending", "streaming"]),
+                    Usage.created_at < cutoff_time,
                 )
-                usage.status_code = 504
-                failed_count += 1
-
-        # 同步更新成功请求的 candidate 状态：streaming -> success
-        cls._sync_candidate_status_to_success(db, list(completed_request_ids), now)
-
-        # 同步更新失败请求的 candidate 状态：streaming/pending -> failed
-        failed_request_ids = [
-            u.request_id
-            for u in stale_requests
-            if u.request_id and u.request_id not in completed_request_ids
-        ]
-        if failed_request_ids:
-            db.query(RequestCandidate).filter(
-                RequestCandidate.request_id.in_(failed_request_ids),
-                RequestCandidate.status.in_(["streaming", "pending"]),
-            ).update(
-                {
-                    "status": "failed",
-                    "finished_at": now,
-                    "error_message": "请求超时（服务器可能已重启）",
-                },
-                synchronize_session=False,
+                .order_by(Usage.created_at.asc(), Usage.id.asc())
+                .limit(batch_size)
+                .all()
             )
+
+            if not stale_requests:
+                break
+
+            stale_request_ids = [request_id for _, request_id, _ in stale_requests if request_id]
+            completed_request_ids = cls._find_completed_request_ids(db, stale_request_ids)
+
+            usage_updates = []
+            failed_request_ids: list[str] = []
+
+            for usage_id, request_id, old_status in stale_requests:
+                if request_id and request_id in completed_request_ids:
+                    usage_updates.append(
+                        {
+                            "id": usage_id,
+                            "status": "completed",
+                            "status_code": 200,
+                            "error_message": None,
+                        }
+                    )
+                    recovered_count += 1
+                else:
+                    usage_updates.append(
+                        {
+                            "id": usage_id,
+                            "status": "failed",
+                            "status_code": 504,
+                            "error_message": (
+                                f"请求超时: 状态 '{old_status}' 超过 {timeout_minutes} 分钟未完成"
+                            ),
+                        }
+                    )
+                    failed_count += 1
+                    if request_id:
+                        failed_request_ids.append(request_id)
+
+            if usage_updates:
+                db.bulk_update_mappings(Usage, usage_updates)
+
+            cls._sync_candidate_status_to_success(db, list(completed_request_ids), now)
+
+            if failed_request_ids:
+                db.query(RequestCandidate).filter(
+                    RequestCandidate.request_id.in_(failed_request_ids),
+                    RequestCandidate.status.in_(["streaming", "pending"]),
+                ).update(
+                    {
+                        "status": "failed",
+                        "finished_at": now,
+                        "error_message": "请求超时（服务器可能已重启）",
+                    },
+                    synchronize_session=False,
+                )
+
+            db.commit()
+            db.expunge_all()
 
         total = failed_count + recovered_count
         if total > 0:
-            db.commit()
             parts = []
             if failed_count:
                 parts.append(f"{failed_count} 条标记为 failed")
@@ -233,13 +247,14 @@ class UsageActiveRequestsMixin:
         default_timeout_seconds: int = 300,
         *,
         include_admin_fields: bool = False,
+        maintain_status: bool | None = None,
     ) -> list[dict[str, Any]]:
         """
-        获取活跃请求状态（用于前端轮询），并自动清理超时的 pending/streaming 请求
+        获取活跃请求状态（用于前端轮询）。
 
         与 get_active_requests 不同，此方法：
         1. 返回轻量级的状态字典而非完整 Usage 对象
-        2. 自动检测并清理超时的 pending/streaming 请求
+        2. 可选地检测并清理超时的 pending/streaming 请求
         3. 支持按 ID 列表查询特定请求
 
         Args:
@@ -247,6 +262,7 @@ class UsageActiveRequestsMixin:
             ids: 指定要查询的请求 ID 列表（可选）
             user_id: 限制只查询该用户的请求（可选，用于普通用户接口）
             default_timeout_seconds: 默认超时时间（秒），当端点未配置时使用
+            maintain_status: 是否执行超时修复与状态回写；默认仅在全量活跃请求查询时执行
 
         Returns:
             请求状态列表
@@ -297,28 +313,26 @@ class UsageActiveRequestsMixin:
             query = query.order_by(Usage.created_at.desc()).limit(50)
 
         records = query.all()
+        should_maintain_status = maintain_status if maintain_status is not None else not ids
 
         # 检查超时的 pending/streaming 请求
         # 收集可能超时的 usage_id 列表
         timeout_candidates: list[str] = []
-        for r in records:
-            if r.status in ("pending", "streaming") and r.created_at:
-                # 使用全局配置的超时时间
-                timeout_seconds = default_timeout_seconds
+        if should_maintain_status:
+            for r in records:
+                if r.status in ("pending", "streaming") and r.created_at:
+                    timeout_seconds = default_timeout_seconds
 
-                # 处理时区：如果 created_at 没有时区信息，假定为 UTC
-                created_at = r.created_at
-                if created_at.tzinfo is None:
-                    created_at = created_at.replace(tzinfo=timezone.utc)
-                elapsed = (now - created_at).total_seconds()
-                if elapsed > timeout_seconds:
-                    # 需要获取 request_id 以便检查 RequestCandidate 表
-                    # r.id 是 usage_id，需要查询 request_id
-                    timeout_candidates.append(r.id)
+                    created_at = r.created_at
+                    if created_at.tzinfo is None:
+                        created_at = created_at.replace(tzinfo=timezone.utc)
+                    elapsed = (now - created_at).total_seconds()
+                    if elapsed > timeout_seconds:
+                        timeout_candidates.append(r.id)
 
         # 批量更新超时的请求（排除已有成功完成记录的请求）
         timeout_ids = []
-        if timeout_candidates:
+        if should_maintain_status and timeout_candidates:
             # 先获取这些 Usage 的 request_id
             usage_request_ids = (
                 db.query(Usage.id, Usage.request_id).filter(Usage.id.in_(timeout_candidates)).all()
@@ -360,7 +374,8 @@ class UsageActiveRequestsMixin:
                 cls._sync_candidate_status_to_success(db, completed_request_ids)
                 db.commit()
                 logger.info(
-                    f"[Usage] 恢复 {len(completed_usage_ids)} 个已完成请求的状态（遥测回调丢失）"
+                    "[Usage] 恢复 {} 个已完成请求的状态（遥测回调丢失）",
+                    len(completed_usage_ids),
                 )
 
         result: list[dict[str, Any]] = []

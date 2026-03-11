@@ -35,6 +35,7 @@ class VideoAdapterBase(ApiAdapter):
 
     name: str = "video.base"
     mode = ApiMode.STANDARD
+    eager_request_body = False
 
     def __init__(self, allowed_api_formats: list[str] | None = None):
         self.allowed_api_formats = allowed_api_formats or [self.FORMAT_ID]
@@ -103,7 +104,7 @@ class VideoAdapterBase(ApiAdapter):
 
         # Remix task
         if method == "POST" and path.endswith("/remix") and task_id:
-            original_request_body = context.ensure_json_body()
+            original_request_body = await context.ensure_json_body_async()
             return await handler.handle_remix_task(
                 task_id=task_id,
                 http_request=http_request,
@@ -134,7 +135,7 @@ class VideoAdapterBase(ApiAdapter):
 
         # Create task (default)
         if method in {"POST", "PUT", "PATCH"}:
-            original_request_body = context.ensure_json_body()
+            original_request_body = await context.ensure_json_body_async()
         return await handler.handle_create_task(
             http_request=http_request,
             original_headers=context.original_headers,

@@ -392,7 +392,7 @@ function generateMockUsageRecords(count: number = 100) {
       status,
       created_at: createdAt.toISOString(),
       has_fallback: Math.random() > 0.9,
-      request_metadata: model.provider === 'google' ? { model_version: 'gemini-3-pro-preview-2025-01' } : undefined
+      model_version: model.provider === 'google' ? 'gemini-3-pro-preview-2025-01' : undefined
     })
   }
 

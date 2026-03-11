@@ -20,7 +20,6 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import HTTPException
-from fastapi.responses import JSONResponse
 
 from src.api.base.adapter import ApiMode
 from src.api.base.context import ApiRequestContext
@@ -58,6 +57,7 @@ class CliAdapterBase(HandlerAdapterBase):
     # 适配器配置
     name: str = "cli.base"
     mode = ApiMode.PROXY
+    eager_request_body = False
 
     async def handle(self, context: ApiRequestContext) -> Any:
         """处理 CLI API 请求"""
@@ -82,7 +82,7 @@ class CliAdapterBase(HandlerAdapterBase):
 
             set_original_request_headers(original_headers)
 
-        original_request_body = context.ensure_json_body()
+        original_request_body = await context.ensure_json_body_async()
 
         # 合并 path_params 到请求体（如 Gemini API 的 model 在 URL 路径中）
         if context.path_params:

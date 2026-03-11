@@ -46,6 +46,13 @@ interface Props {
 const chartRef = ref<HTMLCanvasElement>()
 let chart: ChartJS<'line'> | null = null
 
+function buildChartOptions(): ChartOptions<'line'> {
+  return {
+    ...defaultOptions,
+    ...props.options
+  }
+}
+
 const defaultOptions: ChartOptions<'line'> = {
   responsive: true,
   maintainAspectRatio: false,
@@ -89,10 +96,7 @@ function createChart() {
   chart = new ChartJS(chartRef.value, {
     type: 'line',
     data: props.data,
-    options: {
-      ...defaultOptions,
-      ...props.options
-    }
+    options: buildChartOptions()
   })
 }
 
@@ -115,15 +119,12 @@ onUnmounted(() => {
   }
 })
 
-// 监听数据变化
-watch(() => props.data, updateChart, { deep: true })
+// 监听引用变化，避免深监听触发整图重算
+watch(() => props.data, updateChart)
 watch(() => props.options, () => {
   if (chart) {
-    chart.options = {
-      ...defaultOptions,
-      ...props.options
-    }
-    chart.update()
+    chart.options = buildChartOptions()
+    chart.update('none')
   }
-}, { deep: true })
+})
 </script>

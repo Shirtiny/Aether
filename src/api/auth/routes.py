@@ -274,10 +274,10 @@ class AuthLoginAdapter(AuthPublicAdapter):
                 detail=f"登录请求过于频繁，请在 {reset_after} 秒后重试",
             )
 
-        user = await AuthService.authenticate_user(
+        authenticated_user = await AuthService.authenticate_user_threadsafe(
             db, login_request.email, login_request.password, login_request.auth_type
         )
-        if not user:
+        if not authenticated_user:
             AuditService.log_login_attempt(
                 db=db,
                 email=login_request.email,
@@ -296,22 +296,30 @@ class AuthLoginAdapter(AuthPublicAdapter):
             success=True,
             ip_address=client_ip,
             user_agent=user_agent,
-            user_id=user.id,
+            user_id=authenticated_user.user_id,
         )
         db.commit()
         context.request.state.tx_committed_by_route = True
 
         access_token = AuthService.create_access_token(
             data={
-                "user_id": user.id,
-                "role": user.role.value,
-                "created_at": user.created_at.isoformat() if user.created_at else None,
+                "user_id": authenticated_user.user_id,
+                "role": authenticated_user.role.value,
+                "created_at": (
+                    authenticated_user.created_at.isoformat()
+                    if authenticated_user.created_at
+                    else None
+                ),
             }
         )
         refresh_token = AuthService.create_refresh_token(
             data={
-                "user_id": user.id,
-                "created_at": user.created_at.isoformat() if user.created_at else None,
+                "user_id": authenticated_user.user_id,
+                "created_at": (
+                    authenticated_user.created_at.isoformat()
+                    if authenticated_user.created_at
+                    else None
+                ),
             }
         )
         response = LoginResponse(
@@ -319,10 +327,10 @@ class AuthLoginAdapter(AuthPublicAdapter):
             refresh_token=refresh_token,
             token_type="bearer",
             expires_in=86400,
-            user_id=user.id,
-            email=user.email,
-            username=user.username,
-            role=user.role.value,
+            user_id=authenticated_user.user_id,
+            email=authenticated_user.email,
+            username=authenticated_user.username,
+            role=authenticated_user.role.value,
         )
         return response.model_dump()
 
@@ -332,9 +340,6 @@ class AuthRefreshAdapter(AuthPublicAdapter):
         db = context.db
         payload = context.ensure_json_body()
         refresh_request = RefreshTokenRequest.model_validate(payload)
-        client_ip = get_client_ip(context.request)
-        user_agent = get_user_agent(context.request)
-
         try:
             token_payload = await AuthService.verify_token(
                 refresh_request.refresh_token, token_type="refresh"
@@ -745,7 +750,6 @@ class AuthSendVerificationCodeAdapter(AuthPublicAdapter):
 class AuthVerifyEmailAdapter(AuthPublicAdapter):
     async def handle(self, context: ApiRequestContext) -> Any:  # type: ignore[override]
         """验证邮箱验证码"""
-        db = context.db
         payload = context.ensure_json_body()
 
         try:

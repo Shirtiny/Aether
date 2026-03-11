@@ -1,5 +1,6 @@
 from decimal import Decimal
 from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -52,7 +53,9 @@ def test_get_or_create_wallet_prefers_user_owner_for_non_standalone_key() -> Non
     user = SimpleNamespace(id="user-1")
     api_key = SimpleNamespace(id="key-1", is_standalone=False)
 
-    wallet = WalletService.get_or_create_wallet(db, user=user, api_key=api_key)
+    wallet = WalletService.get_or_create_wallet(
+        db, user=cast(Any, user), api_key=cast(Any, api_key)
+    )
 
     assert wallet is not None
     assert wallet.user_id == "user-1"
@@ -68,11 +71,33 @@ def test_get_or_create_wallet_uses_api_key_owner_for_standalone_key() -> None:
     user = SimpleNamespace(id="user-1")
     api_key = SimpleNamespace(id="key-1", is_standalone=True)
 
-    wallet = WalletService.get_or_create_wallet(db, user=user, api_key=api_key)
+    wallet = WalletService.get_or_create_wallet(
+        db, user=cast(Any, user), api_key=cast(Any, api_key)
+    )
 
     assert wallet is not None
     assert wallet.user_id is None
     assert wallet.api_key_id == "key-1"
+
+
+def test_get_wallets_by_user_ids_returns_mapping() -> None:
+    db = MagicMock()
+    wallet_1 = SimpleNamespace(user_id="user-1")
+    wallet_2 = SimpleNamespace(user_id="user-2")
+    db.query.return_value.filter.return_value.all.return_value = [wallet_1, wallet_2]
+
+    result = WalletService.get_wallets_by_user_ids(db, ["user-1", "user-2"])
+
+    assert result == {"user-1": wallet_1, "user-2": wallet_2}
+
+
+def test_get_wallets_by_user_ids_skips_query_for_empty_ids() -> None:
+    db = MagicMock()
+
+    result = WalletService.get_wallets_by_user_ids(db, [])
+
+    assert result == {}
+    db.query.assert_not_called()
 
 
 def test_check_request_allowed_denies_when_recharge_negative_even_total_positive() -> None:
@@ -104,7 +129,7 @@ def test_admin_adjust_balance_negative_from_gift_spills_to_recharge() -> None:
 
     tx = WalletService.admin_adjust_balance(
         db,
-        wallet=wallet,
+        wallet=cast(Any, wallet),
         amount_usd=Decimal("-10"),
         balance_type="gift",
         operator_id="admin-1",
@@ -127,7 +152,7 @@ def test_admin_adjust_balance_negative_from_recharge_then_gift() -> None:
 
     tx = WalletService.admin_adjust_balance(
         db,
-        wallet=wallet,
+        wallet=cast(Any, wallet),
         amount_usd=Decimal("-4"),
         balance_type="recharge",
         operator_id="admin-1",
@@ -148,7 +173,7 @@ def test_admin_adjust_balance_positive_adds_to_selected_bucket_without_offset() 
 
     tx = WalletService.admin_adjust_balance(
         db,
-        wallet=wallet,
+        wallet=cast(Any, wallet),
         amount_usd=Decimal("1"),
         balance_type="gift",
         operator_id="admin-1",
@@ -181,7 +206,9 @@ def test_apply_usage_charge_prefers_gift_then_recharge() -> None:
     db = _build_locked_db(wallet)
 
     with patch.object(WalletService, "_resolve_wallet_for_usage", return_value=wallet):
-        before, after = WalletService.apply_usage_charge(db, usage=usage, amount_usd=Decimal("6"))
+        before, after = WalletService.apply_usage_charge(
+            db, usage=cast(Any, usage), amount_usd=Decimal("6")
+        )
 
     assert before == Decimal("8.00000000")
     assert after == Decimal("2.00000000")
@@ -212,7 +239,9 @@ def test_apply_usage_charge_unlimited_wallet_keeps_balances() -> None:
     db = _build_locked_db(wallet)
 
     with patch.object(WalletService, "_resolve_wallet_for_usage", return_value=wallet):
-        before, after = WalletService.apply_usage_charge(db, usage=usage, amount_usd=Decimal("4"))
+        before, after = WalletService.apply_usage_charge(
+            db, usage=cast(Any, usage), amount_usd=Decimal("4")
+        )
 
     assert before == Decimal("8.00000000")
     assert after == Decimal("8.00000000")
@@ -237,7 +266,7 @@ def test_complete_refund_requires_processing_status() -> None:
     db.query.return_value = query
 
     with pytest.raises(ValueError, match="processing"):
-        WalletService.complete_refund(db, refund=refund)
+        WalletService.complete_refund(db, refund=cast(Any, refund))
 
 
 def test_get_or_create_wallet_reuses_existing_after_integrity_error() -> None:
@@ -252,7 +281,7 @@ def test_get_or_create_wallet_reuses_existing_after_integrity_error() -> None:
     with patch.object(WalletService, "get_wallet", side_effect=[None, existing_wallet]):
         wallet = WalletService.get_or_create_wallet(
             db,
-            user=SimpleNamespace(id="user-1"),
+            user=cast(Any, SimpleNamespace(id="user-1")),
             api_key=None,
         )
 
@@ -287,18 +316,20 @@ def test_create_refund_request_rejects_uncredited_payment_order() -> None:
 
     db.query.side_effect = _query
 
-    with patch.object(WalletService, "_get_pending_refund_reserved_amount", return_value=Decimal("0")):
+    with patch.object(
+        WalletService, "_get_pending_refund_reserved_amount", return_value=Decimal("0")
+    ):
         with pytest.raises(ValueError, match="payment order is not refundable"):
             WalletService.create_refund_request(
                 db,
-                wallet=wallet,
+                wallet=cast(Any, wallet),
                 user_id="user-1",
                 amount_usd=Decimal("2"),
                 refund_no="rf-1",
                 source_type="payment_order",
                 source_id="order-1",
                 refund_mode="original_channel",
-                payment_order=payment_order,
+                payment_order=cast(Any, payment_order),
             )
 
 
@@ -326,7 +357,7 @@ def test_create_refund_request_reserves_pending_wallet_amount() -> None:
         with pytest.raises(ValueError, match="available refundable recharge balance"):
             WalletService.create_refund_request(
                 db,
-                wallet=wallet,
+                wallet=cast(Any, wallet),
                 user_id="user-1",
                 amount_usd=Decimal("2"),
                 refund_no="rf-2",
@@ -372,14 +403,14 @@ def test_create_refund_request_reserves_pending_order_amount() -> None:
         with pytest.raises(ValueError, match="available refundable amount"):
             WalletService.create_refund_request(
                 db,
-                wallet=wallet,
+                wallet=cast(Any, wallet),
                 user_id="user-1",
                 amount_usd=Decimal("2"),
                 refund_no="rf-3",
                 source_type="payment_order",
                 source_id="order-1",
                 refund_mode="original_channel",
-                payment_order=payment_order,
+                payment_order=cast(Any, payment_order),
             )
 
 
@@ -430,9 +461,13 @@ def test_move_refund_to_processing_rejects_double_transition() -> None:
     tx = SimpleNamespace(id="tx-1")
 
     with patch.object(WalletService, "create_wallet_transaction", return_value=tx) as create_tx:
-        first_tx = WalletService.move_refund_to_processing(db, refund=refund, operator_id="admin-1")
+        first_tx = WalletService.move_refund_to_processing(
+            db, refund=cast(Any, refund), operator_id="admin-1"
+        )
         with pytest.raises(ValueError, match="not approvable"):
-            WalletService.move_refund_to_processing(db, refund=refund, operator_id="admin-1")
+            WalletService.move_refund_to_processing(
+                db, refund=cast(Any, refund), operator_id="admin-1"
+            )
 
     assert first_tx is tx
     assert create_tx.call_count == 1
@@ -488,7 +523,9 @@ def test_move_refund_to_processing_rechecks_payment_order_refundable_amount() ->
 
     with patch.object(WalletService, "create_wallet_transaction") as create_tx:
         with pytest.raises(ValueError, match="refund amount exceeds refundable amount"):
-            WalletService.move_refund_to_processing(db, refund=refund, operator_id="admin-1")
+            WalletService.move_refund_to_processing(
+                db, refund=cast(Any, refund), operator_id="admin-1"
+            )
 
     create_tx.assert_not_called()
     assert refund.status == "pending_approval"
@@ -531,14 +568,14 @@ def test_fail_refund_rejects_invalid_status_after_first_failure() -> None:
     with patch.object(WalletService, "create_wallet_transaction", return_value=tx) as create_tx:
         first_tx = WalletService.fail_refund(
             db,
-            refund=refund,
+            refund=cast(Any, refund),
             reason="first-failure",
             operator_id="admin-1",
         )
         with pytest.raises(ValueError, match="cannot fail refund in status: failed"):
             WalletService.fail_refund(
                 db,
-                refund=refund,
+                refund=cast(Any, refund),
                 reason="retry-failure",
                 operator_id="admin-1",
             )
@@ -577,7 +614,7 @@ def test_fail_refund_rejects_succeeded_status() -> None:
     with pytest.raises(ValueError, match="cannot fail refund in status: succeeded"):
         WalletService.fail_refund(
             db,
-            refund=refund,
+            refund=cast(Any, refund),
             reason="should-not-override",
             operator_id="admin-1",
         )

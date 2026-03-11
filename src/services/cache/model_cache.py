@@ -42,6 +42,8 @@ class ModelCacheService:
 
     # 缓存 TTL（秒）- 使用统一常量
     CACHE_TTL = CacheTTL.MODEL
+    PROVIDER_MAPPING_INDEX_CACHE_KEY = "global_model:resolve_index:provider_model_mappings"
+    MODEL_MAPPING_RULES_CACHE_KEY = "global_model:resolve_index:model_mappings"
 
     @staticmethod
     async def get_model_by_id(db: Session, model_id: str) -> Model | None:
@@ -238,6 +240,9 @@ class ModelCacheService:
         if resolve_keys_to_clear:
             logger.debug(f"Model resolve 缓存已清除: {resolve_keys_to_clear}")
 
+        # provider_model_mappings 更新后，需要重建映射索引缓存。
+        await CacheService.delete(ModelCacheService.PROVIDER_MAPPING_INDEX_CACHE_KEY)
+
     @staticmethod
     async def invalidate_global_model_cache(global_model_id: str, name: str | None = None) -> None:
         """清除 GlobalModel 缓存"""
@@ -249,6 +254,8 @@ class ModelCacheService:
         # 全量清除 resolve 缓存，确保映射规则变更后不命中旧缓存
         try:
             await CacheService.delete_pattern("global_model:resolve:*")
+            await CacheService.delete(ModelCacheService.PROVIDER_MAPPING_INDEX_CACHE_KEY)
+            await CacheService.delete(ModelCacheService.MODEL_MAPPING_RULES_CACHE_KEY)
         except Exception as e:
             logger.error(f"GlobalModel resolve 缓存清除失败，可能导致映射不一致: {e}")
         logger.debug(f"GlobalModel 缓存已清除: {global_model_id}")
@@ -262,9 +269,107 @@ class ModelCacheService:
         """
         try:
             deleted = await CacheService.delete_pattern("global_model:resolve:*")
+            await CacheService.delete(ModelCacheService.PROVIDER_MAPPING_INDEX_CACHE_KEY)
+            await CacheService.delete(ModelCacheService.MODEL_MAPPING_RULES_CACHE_KEY)
             logger.debug(f"已清除 {deleted} 个 GlobalModel resolve 缓存")
         except Exception as e:
             logger.error(f"GlobalModel resolve 缓存清除失败: {e}")
+
+    @staticmethod
+    async def _get_provider_mapping_index(
+        db: Session,
+    ) -> dict[str, list[dict[str, object]]]:
+        cached_data = await CacheService.get(ModelCacheService.PROVIDER_MAPPING_INDEX_CACHE_KEY)
+        if isinstance(cached_data, dict):
+            return {
+                str(name): value
+                for name, value in cached_data.items()
+                if isinstance(name, str) and isinstance(value, list)
+            }
+
+        from src.models.database import Provider
+
+        rows = (
+            db.query(Model, GlobalModel)
+            .join(Provider, Model.provider_id == Provider.id)
+            .join(GlobalModel, Model.global_model_id == GlobalModel.id)
+            .filter(
+                Provider.is_active == True,
+                Model.is_active == True,
+                GlobalModel.is_active == True,
+                Model.provider_model_mappings.isnot(None),
+            )
+            .all()
+        )
+
+        index: dict[str, list[dict[str, object]]] = {}
+        seen_pairs: set[tuple[str, str]] = set()
+        for model, global_model in rows:
+            raw_mappings = getattr(model, "provider_model_mappings", None)
+            if not isinstance(raw_mappings, list):
+                continue
+
+            global_model_dict = ModelCacheService._global_model_to_dict(global_model)
+            for raw in raw_mappings:
+                if not isinstance(raw, dict):
+                    continue
+                name = raw.get("name")
+                if not isinstance(name, str):
+                    continue
+                normalized_name = name.strip()
+                if not normalized_name:
+                    continue
+                pair_key = (normalized_name, str(global_model.id))
+                if pair_key in seen_pairs:
+                    continue
+                seen_pairs.add(pair_key)
+                index.setdefault(normalized_name, []).append(global_model_dict)
+
+        await CacheService.set(
+            ModelCacheService.PROVIDER_MAPPING_INDEX_CACHE_KEY,
+            index,
+            ttl_seconds=ModelCacheService.CACHE_TTL,
+        )
+        return index
+
+    @staticmethod
+    async def _get_model_mapping_rules(
+        db: Session,
+    ) -> list[dict[str, object]]:
+        cached_data = await CacheService.get(ModelCacheService.MODEL_MAPPING_RULES_CACHE_KEY)
+        if isinstance(cached_data, list):
+            return [entry for entry in cached_data if isinstance(entry, dict)]
+
+        rows = (
+            db.query(GlobalModel)
+            .filter(GlobalModel.is_active == True, GlobalModel.config.isnot(None))
+            .all()
+        )
+
+        rules: list[dict[str, object]] = []
+        for global_model in rows:
+            config = getattr(global_model, "config", None) or {}
+            mappings = config.get("model_mappings")
+            if not isinstance(mappings, list) or not mappings:
+                continue
+            patterns = [
+                pattern for pattern in mappings if isinstance(pattern, str) and pattern.strip()
+            ]
+            if not patterns:
+                continue
+            rules.append(
+                {
+                    "global_model": ModelCacheService._global_model_to_dict(global_model),
+                    "patterns": patterns,
+                }
+            )
+
+        await CacheService.set(
+            ModelCacheService.MODEL_MAPPING_RULES_CACHE_KEY,
+            rules,
+            ttl_seconds=ModelCacheService.CACHE_TTL,
+        )
+        return rules
 
     @staticmethod
     async def resolve_global_model_by_name_or_mapping(
@@ -391,41 +496,18 @@ class ModelCacheService:
                 return result_global_model
 
             # 4. 通过 provider_model_mappings 匹配
-            models_with_mappings = (
-                db.query(Model, GlobalModel)
-                .join(Provider, Model.provider_id == Provider.id)
-                .join(GlobalModel, Model.global_model_id == GlobalModel.id)
-                .filter(
-                    Provider.is_active == True,
-                    Model.is_active == True,
-                    GlobalModel.is_active == True,
-                    Model.provider_model_mappings.isnot(None),
-                )
-                .all()
-            )
+            provider_mapping_index = await ModelCacheService._get_provider_mapping_index(db)
+            mapping_matched_global_models = [
+                ModelCacheService._dict_to_global_model(global_model_dict)
+                for global_model_dict in provider_mapping_index.get(normalized_name, [])
+                if isinstance(global_model_dict, dict)
+            ]
 
-            mapping_matched_global_models: list[GlobalModel] = []
-            mapping_seen_ids: set[str] = set()
-            for model, gm in models_with_mappings:
-                raw_mappings = model.provider_model_mappings
-                if not isinstance(raw_mappings, list):
-                    continue
-                for raw in raw_mappings:
-                    if not isinstance(raw, dict):
-                        continue
-                    name = raw.get("name")
-                    if not isinstance(name, str):
-                        continue
-                    if name.strip() != normalized_name:
-                        continue
-                    if gm.id not in mapping_seen_ids:
-                        mapping_seen_ids.add(gm.id)
-                        mapping_matched_global_models.append(gm)
-                        logger.debug(
-                            f"模型名称 '{normalized_name}' 通过 provider_model_mappings 匹配到 "
-                            f"GlobalModel: {gm.name} (Model: {model.id[:8]}...)"
-                        )
-                    break
+            for gm in mapping_matched_global_models:
+                logger.debug(
+                    f"模型名称 '{normalized_name}' 通过 provider_model_mappings 匹配到 "
+                    f"GlobalModel: {gm.name}"
+                )
 
             if mapping_matched_global_models:
                 resolution_method = "provider_model_mappings"
@@ -453,32 +535,21 @@ class ModelCacheService:
                 return result_global_model
 
             # 5. 通过 GlobalModel.config.model_mappings 匹配（支持正则）
-            from sqlalchemy import func
-
             from src.core.model_permissions import match_model_with_pattern
 
-            mapping_rows = (
-                db.query(GlobalModel)
-                .filter(
-                    GlobalModel.is_active == True,
-                    GlobalModel.config.isnot(None),
-                    GlobalModel.config["model_mappings"].isnot(None),
-                    func.jsonb_array_length(GlobalModel.config["model_mappings"]) > 0,
-                )
-                .all()
-            )
-
             mapping_matches: list[GlobalModel] = []
-            for gm in mapping_rows:
-                config = gm.config or {}
-                mappings = config.get("model_mappings")
-                if not isinstance(mappings, list):
+            for entry in await ModelCacheService._get_model_mapping_rules(db):
+                global_model_dict = entry.get("global_model")
+                patterns = entry.get("patterns")
+                if not isinstance(global_model_dict, dict) or not isinstance(patterns, list):
                     continue
-                for pattern in mappings:
+                for pattern in patterns:
                     if isinstance(pattern, str) and match_model_with_pattern(
                         pattern, normalized_name
                     ):
-                        mapping_matches.append(gm)
+                        mapping_matches.append(
+                            ModelCacheService._dict_to_global_model(global_model_dict)
+                        )
                         break
 
             if mapping_matches:

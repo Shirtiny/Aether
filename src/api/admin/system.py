@@ -10,7 +10,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import ValidationError
 from sqlalchemy import case, func
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from src.api.base.admin_adapter import AdminApiAdapter
 from src.api.base.context import ApiRequestContext
@@ -975,9 +975,6 @@ class AdminExportConfigAdapter(AdminApiAdapter):
         from src.core.crypto import crypto_service
         from src.models.database import (
             GlobalModel,
-            Model,
-            ProviderAPIKey,
-            ProviderEndpoint,
             ProxyNode,
         )
 
@@ -991,22 +988,35 @@ class AdminExportConfigAdapter(AdminApiAdapter):
         gm_name_map: dict[str, str] = {gm.id: gm.name for gm in global_models}
 
         # 导出 Providers 及其关联数据
-        providers = db.query(Provider).all()
+        providers = (
+            db.query(Provider)
+            .options(
+                selectinload(Provider.endpoints),
+                selectinload(Provider.api_keys),
+                selectinload(Provider.models),
+            )
+            .all()
+        )
         providers_data = []
+
+        def _normalize_created_at_for_sort(value: datetime | None) -> datetime:
+            if value is None:
+                return datetime.min.replace(tzinfo=timezone.utc)
+            return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+
         for provider in providers:
             # 导出 Endpoints
-            endpoints = (
-                db.query(ProviderEndpoint).filter(ProviderEndpoint.provider_id == provider.id).all()
-            )
+            endpoints = list(provider.endpoints)
             endpoints_data = [ep.to_export_dict() for ep in endpoints]
             provider_endpoint_formats = self._collect_provider_endpoint_formats(endpoints)
 
             # 导出 Provider Keys（按 provider_id 归属，包含 api_formats）
-            keys = (
-                db.query(ProviderAPIKey)
-                .filter(ProviderAPIKey.provider_id == provider.id)
-                .order_by(ProviderAPIKey.internal_priority.asc(), ProviderAPIKey.created_at.asc())
-                .all()
+            keys = sorted(
+                provider.api_keys,
+                key=lambda key: (
+                    key.internal_priority if key.internal_priority is not None else float("inf"),
+                    _normalize_created_at_for_sort(key.created_at),
+                ),
             )
             keys_data = []
             for key in keys:
@@ -1046,7 +1056,7 @@ class AdminExportConfigAdapter(AdminApiAdapter):
             # 导出 Provider Models
             # 注意：提供商模型（Model）必须关联全局模型（GlobalModel）才能参与路由
             # 导入时未关联 GlobalModel 的模型会被跳过，这是业务规则而非 bug
-            models = db.query(Model).filter(Model.provider_id == provider.id).all()
+            models = list(provider.models)
             models_data = []
             for model in models:
                 model_data = model.to_export_dict()
@@ -2044,10 +2054,11 @@ class AdminImportConfigAdapter(AdminApiAdapter):
                     import asyncio
 
                     from src.services.model.fetch_scheduler import get_model_fetch_scheduler
+                    from src.utils.async_utils import safe_create_task
 
                     scheduler = get_model_fetch_scheduler()
                     for key_id in keys_to_fetch:
-                        asyncio.create_task(scheduler._fetch_models_for_key_by_id(key_id))
+                        safe_create_task(scheduler._fetch_models_for_key_by_id(key_id))
                 except Exception as e:
                     logger.error(f"触发模型获取失败: {e}")
                     # 不影响导入成功的返回

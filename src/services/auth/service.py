@@ -9,6 +9,7 @@ import secrets
 import time
 import uuid
 from collections import OrderedDict
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from threading import Lock
 from typing import TYPE_CHECKING, Any
@@ -23,6 +24,7 @@ from src.config import config
 from src.core.enums import AuthSource
 from src.core.exceptions import ForbiddenException
 from src.core.logger import logger
+from src.database.database import create_session
 from src.services.system.config import SystemConfigService
 
 if TYPE_CHECKING:
@@ -31,6 +33,31 @@ if TYPE_CHECKING:
 from src.models.database import ApiKey, User, UserRole
 from src.services.auth.jwt_blacklist import JWTBlacklistService
 from src.services.cache.user_cache import UserCacheService
+
+
+@dataclass
+class AuthenticatedUserSnapshot:
+    user_id: str
+    email: str | None
+    username: str
+    role: UserRole
+    created_at: datetime | None
+
+
+@dataclass
+class ThreadsafeAPIKeyAuthResult:
+    user: User
+    api_key: ApiKey | None = None
+    balance_remaining: float | None = None
+    access_allowed: bool = True
+    access_message: str = "OK"
+
+    @property
+    def access_ok(self) -> bool:
+        return self.access_allowed
+
+
+PipelineThreadsafeAuthResult = ThreadsafeAPIKeyAuthResult
 
 # API Key last_used_at 更新节流配置
 # 同一个 API Key 在此时间间隔内只会更新一次 last_used_at
@@ -178,6 +205,192 @@ class AuthService:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="无效的Token")
 
     @staticmethod
+    def _authenticate_local_user_sync(
+        db: Session,
+        email: str,
+        password: str,
+    ) -> User | None:
+        """同步执行本地认证，供线程池隔离入口复用。"""
+        from sqlalchemy import or_
+
+        user = db.query(User).filter(or_(User.email == email, User.username == email)).first()
+
+        if not user:
+            logger.warning("登录失败 - 用户不存在: {}", email)
+            return None
+
+        if user.is_deleted:
+            logger.warning("登录失败 - 用户已删除: {}", email)
+            return None
+
+        from src.core.modules.hooks import AUTH_CHECK_EXCLUSIVE_MODE, get_hook_dispatcher
+
+        is_exclusive = get_hook_dispatcher().dispatch_sync(AUTH_CHECK_EXCLUSIVE_MODE, db=db)
+        if is_exclusive:
+            if user.role != UserRole.ADMIN or user.auth_source != AuthSource.LOCAL:
+                logger.warning("登录失败 - 排他登录模式下仅管理员可本地登录: {}", email)
+                return None
+            logger.warning("[EXCLUSIVE-MODE] 紧急恢复通道：本地管理员登录: {}", email)
+
+        if user.auth_source == AuthSource.LDAP:
+            logger.warning("登录失败 - 该用户使用 LDAP 认证: {}", email)
+            return None
+
+        if not user.verify_password(password):
+            logger.warning("登录失败 - 密码错误: {}", email)
+            return None
+
+        if not user.is_active:
+            logger.warning("登录失败 - 用户已禁用: {}", email)
+            return None
+
+        return user
+
+    @staticmethod
+    def _build_authenticated_snapshot(user: User) -> AuthenticatedUserSnapshot:
+        return AuthenticatedUserSnapshot(
+            user_id=user.id,
+            email=user.email,
+            username=user.username,
+            role=user.role,
+            created_at=user.created_at,
+        )
+
+    @staticmethod
+    def _detach_instance(db: Session, instance: User | ApiKey | None) -> None:
+        if instance is None:
+            return
+        try:
+            db.expunge(instance)
+        except Exception as exc:
+            logger.debug("expunge failed: {}", exc)
+
+    @staticmethod
+    def _load_user_for_token_sync(db: Session, user_id: str) -> User | None:
+        user = db.query(User).filter(User.id == user_id).first()
+        if not user or not user.is_active or user.is_deleted:
+            return None
+        return user
+
+    @staticmethod
+    async def load_user_for_token_threadsafe(user_id: str) -> User | None:
+        """Load the JWT user in a threadpool and return a detached object."""
+
+        def _load_in_thread() -> User | None:
+            thread_db = create_session()
+            try:
+                user = AuthService._load_user_for_token_sync(thread_db, user_id)
+                if not user:
+                    return None
+
+                AuthService._detach_instance(thread_db, user)
+                return user
+            finally:
+                thread_db.close()
+
+        return await run_in_threadpool(_load_in_thread)
+
+    @staticmethod
+    async def load_user_for_pipeline_threadsafe(
+        user_id: str,
+        *,
+        include_balance: bool = False,
+    ) -> PipelineThreadsafeAuthResult | None:
+        """Compatibility helper: load a user in a threadpool and optionally prefetch balance."""
+
+        def _load_in_thread() -> PipelineThreadsafeAuthResult | None:
+            from src.services.wallet import WalletService
+
+            thread_db = create_session()
+            try:
+                user = AuthService._load_user_for_token_sync(thread_db, user_id)
+                if not user:
+                    return None
+
+                balance_remaining: float | None = None
+                if include_balance:
+                    balance = WalletService.get_balance_snapshot(thread_db, user=user)
+                    balance_remaining = float(balance) if balance is not None else None
+
+                AuthService._detach_instance(thread_db, user)
+                return PipelineThreadsafeAuthResult(
+                    user=user,
+                    balance_remaining=balance_remaining,
+                )
+            finally:
+                thread_db.close()
+
+        return await run_in_threadpool(_load_in_thread)
+
+    @staticmethod
+    async def authenticate_api_key_threadsafe(
+        api_key: str,
+    ) -> ThreadsafeAPIKeyAuthResult | None:
+        """Authenticate API key and check balance in a threadpool."""
+
+        def _authenticate_in_thread() -> ThreadsafeAPIKeyAuthResult | None:
+            from src.services.usage.service import UsageService
+
+            thread_db = create_session()
+            try:
+                auth_result = AuthService.authenticate_api_key(thread_db, api_key)
+                if not auth_result:
+                    return None
+
+                user, key_record = auth_result
+                balance_result = UsageService.check_request_balance_details(
+                    thread_db,
+                    user,
+                    api_key=key_record,
+                )
+
+                AuthService._detach_instance(thread_db, user)
+                AuthService._detach_instance(thread_db, key_record)
+                return ThreadsafeAPIKeyAuthResult(
+                    user=user,
+                    api_key=key_record,
+                    balance_remaining=balance_result.remaining,
+                    access_allowed=balance_result.allowed,
+                    access_message=balance_result.message,
+                )
+            finally:
+                thread_db.close()
+
+        return await run_in_threadpool(_authenticate_in_thread)
+
+    @staticmethod
+    async def authenticate_user_threadsafe(
+        db: Session, email: str, password: str, auth_type: str = "local"
+    ) -> AuthenticatedUserSnapshot | None:
+        """为异步登录路由提供线程池隔离的本地认证入口。"""
+        if auth_type != "local":
+            user = await AuthService.authenticate_user(db, email, password, auth_type)
+            if not user:
+                return None
+            return AuthService._build_authenticated_snapshot(user)
+
+        def _authenticate_in_thread() -> AuthenticatedUserSnapshot | None:
+            thread_db = create_session()
+            try:
+                user = AuthService._authenticate_local_user_sync(thread_db, email, password)
+                if not user:
+                    return None
+
+                user.last_login_at = datetime.now(timezone.utc)
+                thread_db.commit()
+                return AuthService._build_authenticated_snapshot(user)
+            finally:
+                thread_db.close()
+
+        snapshot = await run_in_threadpool(_authenticate_in_thread)
+        if not snapshot:
+            return None
+
+        await UserCacheService.invalidate_user_cache(snapshot.user_id, snapshot.email or "")
+        logger.info("用户登录成功: {} (ID: {})", email, snapshot.user_id)
+        return snapshot
+
+    @staticmethod
     async def authenticate_user(
         db: Session, email: str, password: str, auth_type: str = "local"
     ) -> User | None:
@@ -208,40 +421,8 @@ class AuthService:
         # 本地认证
         # 登录校验必须读取密码哈希，不能使用不包含 password_hash 的缓存对象
         # 支持邮箱或用户名登录
-        from sqlalchemy import or_
-
-        user = db.query(User).filter(or_(User.email == email, User.username == email)).first()
-
+        user = AuthService._authenticate_local_user_sync(db, email, password)
         if not user:
-            logger.warning(f"登录失败 - 用户不存在: {email}")
-            return None
-
-        if user.is_deleted:
-            logger.warning(f"登录失败 - 用户已删除: {email}")
-            return None
-
-        # 检查排他登录模式（如 LDAP exclusive）：仅允许本地管理员登录（紧急恢复通道）
-        from src.core.modules.hooks import AUTH_CHECK_EXCLUSIVE_MODE, get_hook_dispatcher
-
-        is_exclusive = get_hook_dispatcher().dispatch_sync(AUTH_CHECK_EXCLUSIVE_MODE, db=db)
-        if is_exclusive:
-            if user.role != UserRole.ADMIN or user.auth_source != AuthSource.LOCAL:
-                logger.warning(f"登录失败 - 排他登录模式下仅管理员可本地登录: {email}")
-                return None
-            logger.warning(f"[EXCLUSIVE-MODE] 紧急恢复通道：本地管理员登录: {email}")
-
-        # 检查用户认证来源
-        if user.auth_source == AuthSource.LDAP:
-            logger.warning(f"登录失败 - 该用户使用 LDAP 认证: {email}")
-            return None
-
-        # 在线程池中执行 bcrypt 密码验证，避免阻塞事件循环
-        if not await run_in_threadpool(user.verify_password, password):
-            logger.warning(f"登录失败 - 密码错误: {email}")
-            return None
-
-        if not user.is_active:
-            logger.warning(f"登录失败 - 用户已禁用: {email}")
             return None
 
         # 更新最后登录时间

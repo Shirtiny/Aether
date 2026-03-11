@@ -25,6 +25,7 @@ class ApiAdapter(ABC):
     audit_log_enabled: bool = True
     audit_success_event = None
     audit_failure_event = None
+    eager_request_body: bool = True
 
     @abstractmethod
     async def handle(self, context: ApiRequestContext) -> Response:

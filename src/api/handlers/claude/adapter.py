@@ -184,6 +184,7 @@ class ClaudeChatAdapter(ChatAdapterBase):
             "thinking_enabled": bool(request_obj.thinking),
         }
 
+    @classmethod
     def build_endpoint_url(
         cls,
         base_url: str,
@@ -224,6 +225,7 @@ class ClaudeTokenCountAdapter(ApiAdapter):
 
     name = "claude.token_count"
     mode = ApiMode.STANDARD
+    eager_request_body = False
 
     def extract_api_key(self, request: Request) -> str | None:
         """从请求中提取 API 密钥 (x-api-key 或 Authorization: Bearer)"""
@@ -239,7 +241,7 @@ class ClaudeTokenCountAdapter(ApiAdapter):
         return bearer_handler.extract_credentials(request)
 
     async def handle(self, context: ApiRequestContext) -> Any:
-        payload = context.ensure_json_body()
+        payload = await context.ensure_json_body_async()
 
         try:
             request = ClaudeTokenCountRequest.model_validate(payload, strict=False)

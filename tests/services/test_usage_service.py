@@ -8,7 +8,7 @@ UsageService 测试
 """
 
 from decimal import Decimal
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -145,6 +145,58 @@ class TestBalanceCheck:
             )
 
         assert is_ok is True
+
+    def test_check_request_balance_details_returns_remaining(self) -> None:
+        """Balance detail helper returns remaining."""
+        mock_user = MagicMock()
+        mock_user.role = MagicMock()
+        mock_user.role.value = "user"
+
+        mock_api_key = MagicMock()
+        mock_api_key.is_standalone = False
+
+        mock_db = MagicMock()
+
+        with patch(
+            "src.services.wallet.WalletService.check_request_allowed",
+            return_value=WalletAccessResult(
+                False, Decimal("12.5"), "\u94b1\u5305\u4f59\u989d\u4e0d\u8db3"
+            ),
+        ):
+            result = UsageService.check_request_balance_details(
+                mock_db, mock_user, api_key=mock_api_key
+            )
+
+        assert result.allowed is False
+        assert result.remaining == 12.5
+        assert "\u4f59\u989d\u4e0d\u8db3" in result.message
+
+    def test_check_request_balance_details_maps_overdue_message(self) -> None:
+        """欠费状态应映射为对外统一文案。"""
+        mock_user = MagicMock()
+        mock_api_key = MagicMock()
+        mock_api_key.is_standalone = False
+        mock_db = MagicMock()
+
+        with patch(
+            "src.services.wallet.WalletService.check_request_allowed",
+            return_value=WalletAccessResult(False, Decimal("-1"), "钱包欠费，请先充值"),
+        ):
+            normal_result = UsageService.check_request_balance_details(
+                mock_db, mock_user, api_key=mock_api_key
+            )
+
+        mock_api_key.is_standalone = True
+        with patch(
+            "src.services.wallet.WalletService.check_request_allowed",
+            return_value=WalletAccessResult(False, Decimal("-1"), "钱包欠费，请先充值"),
+        ):
+            standalone_result = UsageService.check_request_balance_details(
+                mock_db, mock_user, api_key=mock_api_key
+            )
+
+        assert normal_result.message == "账户欠费，请先充值"
+        assert standalone_result.message == "Key欠费，请先调账或充值"
 
     def test_check_request_balance_exceeded(self) -> None:
         """测试余额耗尽时拦截新请求"""

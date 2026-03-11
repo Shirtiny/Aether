@@ -224,10 +224,11 @@ async def get_usage_records(
 
     **返回字段**:
     - `records`: 使用记录列表，包含 id, user_id, user_email, username, api_key, provider, model, target_model,
-      input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens, total_tokens,
-      cost, actual_cost, rate_multiplier, response_time_ms, first_byte_time_ms, created_at, is_stream,
-      input_price_per_1m, output_price_per_1m, cache_creation_price_per_1m, cache_read_price_per_1m,
-      status_code, error_message, status, has_fallback, has_retry, has_rectified, api_format, api_key_name, request_metadata
+      model_version, input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+      total_tokens, cost, actual_cost, rate_multiplier, response_time_ms, first_byte_time_ms, created_at,
+      is_stream, input_price_per_1m, output_price_per_1m, cache_creation_price_per_1m,
+      cache_read_price_per_1m, status_code, error_message, status, has_fallback, has_retry,
+      has_rectified, api_format, api_key_name
     - `total`: 符合条件的总记录数
     - `limit`: 当前分页限制
     - `offset`: 当前分页偏移量
@@ -885,8 +886,12 @@ class AdminUsageRecordsAdapter(AdminApiAdapter):
             count_query = count_query.outerjoin(ApiKey, Usage.api_key_id == ApiKey.id)
 
         # -- 构建数据查询（完整 JOIN） --
+        usage_model_version = Usage.request_metadata["model_version"].as_string().label(
+            "model_version"
+        )
+
         query = (
-            db.query(Usage, User, ProviderEndpoint, ProviderAPIKey, ApiKey)
+            db.query(Usage, User, ProviderEndpoint, ProviderAPIKey, ApiKey, usage_model_version)
             .outerjoin(User, Usage.user_id == User.id)
             .outerjoin(ProviderEndpoint, Usage.provider_endpoint_id == ProviderEndpoint.id)
             .outerjoin(ProviderAPIKey, Usage.provider_api_key_id == ProviderAPIKey.id)
@@ -1001,7 +1006,7 @@ class AdminUsageRecordsAdapter(AdminApiAdapter):
         # Perf: count query uses fewer JOINs than the data query
         total = int(count_query.scalar() or 0)
 
-        # Perf: do not load large request/response columns for list view
+        # Perf: do not load large request/response columns or full request_metadata for list view
         query = query.options(
             load_only(
                 Usage.id,
@@ -1032,7 +1037,6 @@ class AdminUsageRecordsAdapter(AdminApiAdapter):
                 Usage.api_format,
                 Usage.endpoint_api_format,
                 Usage.has_format_conversion,
-                Usage.request_metadata,
                 Usage.input_price_per_1m,
                 Usage.output_price_per_1m,
                 Usage.cache_creation_price_per_1m,
@@ -1047,7 +1051,7 @@ class AdminUsageRecordsAdapter(AdminApiAdapter):
             query.order_by(Usage.created_at.desc()).offset(self.offset).limit(self.limit).all()
         )
 
-        request_ids = [usage.request_id for usage, _, _, _, _ in records if usage.request_id]
+        request_ids = [usage.request_id for usage, _, _, _, _, _ in records if usage.request_id]
         fallback_map = {}
         retry_map = {}
         rectified_map = {}
@@ -1110,7 +1114,7 @@ class AdminUsageRecordsAdapter(AdminApiAdapter):
 
         # 构建 provider_id -> Provider 名称的映射，避免 N+1 查询
         provider_ids = list(
-            {usage.provider_id for usage, _, _, _, _ in records if usage.provider_id}
+            {usage.provider_id for usage, _, _, _, _, _ in records if usage.provider_id}
         )
         provider_map = {}
         if provider_ids:
@@ -1121,7 +1125,7 @@ class AdminUsageRecordsAdapter(AdminApiAdapter):
 
         data = []
         api_key_display_cache: dict[str, str] = {}
-        for usage, user, endpoint, provider_api_key, user_api_key in records:
+        for usage, user, endpoint, provider_api_key, user_api_key, model_version in records:
             actual_cost = (
                 float(usage.actual_total_cost_usd)
                 if usage.actual_total_cost_usd is not None
@@ -1198,7 +1202,7 @@ class AdminUsageRecordsAdapter(AdminApiAdapter):
                     "endpoint_api_format": endpoint_api_format,
                     "has_format_conversion": bool(has_format_conversion),
                     "api_key_name": provider_api_key.name if provider_api_key else None,
-                    "request_metadata": usage.request_metadata,  # Provider 响应元数据
+                    "model_version": model_version,  # Provider 返回的实际模型版本（轻量字段）
                 }
             )
 
@@ -1227,7 +1231,10 @@ class AdminActiveRequestsAdapter(AdminApiAdapter):
                 return {"requests": []}
 
         requests = UsageService.get_active_requests_status(
-            db=db, ids=id_list, include_admin_fields=True
+            db=db,
+            ids=id_list,
+            include_admin_fields=True,
+            maintain_status=True,
         )
         return {"requests": requests}
 

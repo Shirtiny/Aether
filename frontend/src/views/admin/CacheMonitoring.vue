@@ -49,6 +49,7 @@ const currentPage = ref(1)
 const pageSize = ref(20)
 const currentTime = ref(Math.floor(Date.now() / 1000))
 const isPageVisible = ref(typeof document === 'undefined' ? true : !document.hidden)
+const nextExpireAt = ref<number | null>(null)
 
 // ==================== 模型映射缓存 ====================
 
@@ -121,6 +122,8 @@ async function fetchAffinityList(keyword?: string) {
     const response = await cacheApi.listAffinities(keyword)
     affinityList.value = response.items
     matchedUserId.value = response.matched_user_id ?? null
+    currentTime.value = Math.floor(Date.now() / 1000)
+    pruneExpiredAffinities(currentTime.value, true)
 
     if (keyword && response.total === 0) {
       showInfo('未找到匹配的缓存记录')
@@ -238,6 +241,38 @@ function handlePageChange() {
   window.scrollTo({ top: 0, behavior: 'smooth' })
 }
 
+function recalculateNextExpireAt(now: number = currentTime.value) {
+  let nearestExpireAt: number | null = null
+
+  for (const item of affinityList.value) {
+    if (!item.expire_at || item.expire_at <= now) continue
+    if (nearestExpireAt === null || item.expire_at < nearestExpireAt) {
+      nearestExpireAt = item.expire_at
+    }
+  }
+
+  nextExpireAt.value = nearestExpireAt
+}
+
+function pruneExpiredAffinities(now: number, silent = false) {
+  const beforeCount = affinityList.value.length
+  const activeItems = affinityList.value.filter(
+    item => item.expire_at && item.expire_at > now
+  )
+
+  if (activeItems.length === beforeCount) {
+    recalculateNextExpireAt(now)
+    return
+  }
+
+  affinityList.value = activeItems
+  recalculateNextExpireAt(now)
+
+  if (!silent) {
+    showInfo(`${beforeCount - activeItems.length} 个缓存已自动过期移除`)
+  }
+}
+
 // ==================== 定时器管理 ====================
 
 function startCountdown() {
@@ -247,14 +282,8 @@ function startCountdown() {
   countdownTimer = setInterval(() => {
     currentTime.value = Math.floor(Date.now() / 1000)
 
-    const beforeCount = affinityList.value.length
-    affinityList.value = affinityList.value.filter(
-      item => item.expire_at && item.expire_at > currentTime.value
-    )
-
-    if (beforeCount > affinityList.value.length) {
-      const removedCount = beforeCount - affinityList.value.length
-      showInfo(`${removedCount} 个缓存已自动过期移除`)
+    if (nextExpireAt.value !== null && currentTime.value >= nextExpireAt.value) {
+      pruneExpiredAffinities(currentTime.value)
     }
   }, 1000)
 }
@@ -273,6 +302,9 @@ function handleVisibilityChange() {
     return
   }
   currentTime.value = Math.floor(Date.now() / 1000)
+  if (nextExpireAt.value !== null && currentTime.value >= nextExpireAt.value) {
+    pruneExpiredAffinities(currentTime.value)
+  }
   startCountdown()
 }
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -8,6 +9,13 @@ from sqlalchemy.orm import Session
 
 from src.core.logger import logger
 from src.models.database import ApiKey, Usage, User
+
+
+@dataclass(slots=True)
+class RequestBalanceCheckResult:
+    allowed: bool
+    message: str
+    remaining: float | None
 
 
 class UsageQueryMixin:
@@ -125,14 +133,14 @@ class UsageQueryMixin:
         return result
 
     @staticmethod
-    def check_request_balance(
+    def check_request_balance_details(
         db: Session,
         user: User,
         estimated_tokens: int = 0,
         estimated_cost: float = 0,
         api_key: ApiKey | None = None,
-    ) -> tuple[bool, str]:
-        """检查请求是否满足余额条件（支持独立 Key）。"""
+    ) -> RequestBalanceCheckResult:
+        """Return a structured balance-check result."""
         from src.services.wallet import WalletService
 
         wallet_access = WalletService.check_request_allowed(
@@ -140,29 +148,52 @@ class UsageQueryMixin:
             user=None if (api_key and api_key.is_standalone) else user,
             api_key=api_key,
         )
+        snapshot = wallet_access.balance_snapshot
+        if snapshot is None:
+            snapshot = wallet_access.remaining
+        remaining = float(snapshot) if snapshot is not None else None
         if wallet_access.allowed:
-            return True, "OK"
+            return RequestBalanceCheckResult(True, "OK", remaining)
 
-        if wallet_access.message == "钱包欠费，请先充值":
+        if wallet_access.message in {"钱包欠费，请先充值", "账户欠费，请先充值"}:
             if api_key and api_key.is_standalone:
-                return False, "Key欠费，请先调账或充值"
-            return False, "账户欠费，请先充值"
+                return RequestBalanceCheckResult(False, "Key欠费，请先调账或充值", remaining)
+            return RequestBalanceCheckResult(False, "账户欠费，请先充值", remaining)
 
         if wallet_access.message == "钱包不可用":
             if api_key and api_key.is_standalone:
-                return False, "Key钱包不可用"
-            return False, "钱包不可用"
+                return RequestBalanceCheckResult(False, "Key钱包不可用", remaining)
+            return RequestBalanceCheckResult(False, "钱包不可用", remaining)
 
-        remaining = float(wallet_access.remaining) if wallet_access.remaining is not None else None
         if api_key and api_key.is_standalone:
             if remaining is None:
-                return False, "Key余额不足"
-            return False, f"Key余额不足（剩余: ${remaining:.2f}）"
+                return RequestBalanceCheckResult(False, "Key余额不足", remaining)
+            return RequestBalanceCheckResult(
+                False, f"Key余额不足（剩余: ${remaining:.2f}）", remaining
+            )
 
-        # admin 已在 WalletService.check_request_allowed 中放行，此处不再重复检查
+        # Admin users are already allowed in WalletService.check_request_allowed.
         if remaining is None:
-            return False, wallet_access.message or "余额不足"
-        return False, f"余额不足（剩余: ${remaining:.2f}）"
+            return RequestBalanceCheckResult(False, wallet_access.message or "余额不足", remaining)
+        return RequestBalanceCheckResult(False, f"余额不足（剩余: ${remaining:.2f}）", remaining)
+
+    @staticmethod
+    def check_request_balance(
+        db: Session,
+        user: User,
+        estimated_tokens: int = 0,
+        estimated_cost: float = 0,
+        api_key: ApiKey | None = None,
+    ) -> tuple[bool, str]:
+        """Check whether the request passes balance rules."""
+        result = UsageQueryMixin.check_request_balance_details(
+            db,
+            user,
+            estimated_tokens=estimated_tokens,
+            estimated_cost=estimated_cost,
+            api_key=api_key,
+        )
+        return result.allowed, result.message
 
     @staticmethod
     def get_usage_summary(
@@ -171,7 +202,7 @@ class UsageQueryMixin:
         api_key_id: str | None = None,
         start_date: datetime | None = None,
         end_date: datetime | None = None,
-        group_by: str = "day",  # day, week, month
+        group_by: str | None = "day",  # day, week, month, None(不按时间分桶)
     ) -> list[dict[str, Any]]:
         """获取使用汇总"""
 
@@ -188,34 +219,35 @@ class UsageQueryMixin:
         if end_date:
             query = query.filter(Usage.created_at < end_date)
 
-        # 使用跨数据库可用的日期函数
-        from src.utils.database_helpers import date_trunc_portable
+        select_columns = [Usage.provider_name, Usage.model]
+        group_columns = [Usage.provider_name, Usage.model]
 
-        # 检测数据库方言
-        bind = db.bind
-        dialect = bind.dialect.name if bind is not None else "sqlite"
+        if group_by is not None:
+            from src.utils.database_helpers import date_trunc_portable
 
-        # 根据分组类型选择日期函数（适配多种数据库）
-        if group_by == "day":
-            date_func = date_trunc_portable(dialect, "day", Usage.created_at)
-        elif group_by == "week":
-            date_func = date_trunc_portable(dialect, "week", Usage.created_at)
-        elif group_by == "month":
-            date_func = date_trunc_portable(dialect, "month", Usage.created_at)
-        else:
-            # 默认按天分组
-            date_func = date_trunc_portable(dialect, "day", Usage.created_at)
+            bind = db.bind
+            dialect = bind.dialect.name if bind is not None else "sqlite"
 
-        # 汇总查询
+            if group_by == "day":
+                date_func = date_trunc_portable(dialect, "day", Usage.created_at)
+            elif group_by == "week":
+                date_func = date_trunc_portable(dialect, "week", Usage.created_at)
+            elif group_by == "month":
+                date_func = date_trunc_portable(dialect, "month", Usage.created_at)
+            else:
+                date_func = date_trunc_portable(dialect, "day", Usage.created_at)
+            select_columns.insert(0, date_func.label("period"))
+            group_columns.insert(0, date_func)
+
         summary = db.query(
-            date_func.label("period"),
-            Usage.provider_name,
-            Usage.model,
+            *select_columns,
             func.count(Usage.id).label("requests"),
             func.sum(Usage.input_tokens).label("input_tokens"),
             func.sum(Usage.output_tokens).label("output_tokens"),
             func.sum(Usage.total_tokens).label("total_tokens"),
             func.sum(Usage.total_cost_usd).label("total_cost_usd"),
+            func.sum(Usage.actual_total_cost_usd).label("actual_total_cost_usd"),
+            func.sum(case((Usage.status_code == 200, 1), else_=0)).label("success_count"),
             func.avg(Usage.response_time_ms).label("avg_response_time"),
             func.sum(
                 case(
@@ -246,18 +278,20 @@ class UsageQueryMixin:
         if end_date:
             summary = summary.filter(Usage.created_at < end_date)
 
-        summary = summary.group_by(date_func, Usage.provider_name, Usage.model).all()
+        summary = summary.group_by(*group_columns).all()
 
         return [
             {
-                "period": row.period,
+                "period": getattr(row, "period", None),
                 "provider": row.provider_name,
                 "model": row.model,
                 "requests": row.requests,
                 "input_tokens": row.input_tokens,
                 "output_tokens": row.output_tokens,
                 "total_tokens": row.total_tokens,
-                "total_cost_usd": float(row.total_cost_usd),
+                "total_cost_usd": float(row.total_cost_usd or 0.0),
+                "actual_total_cost_usd": float(row.actual_total_cost_usd or 0.0),
+                "success_count": int(row.success_count or 0),
                 "avg_response_time_ms": (
                     float(row.avg_response_time) if row.avg_response_time else 0
                 ),

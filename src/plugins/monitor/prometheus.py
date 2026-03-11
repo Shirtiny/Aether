@@ -74,21 +74,19 @@ class PrometheusPlugin(MonitorPlugin):
             http_label_names,
         )
 
-        # Token使用指标
+        # Token使用指标（仅按 provider 维度聚合，避免 provider x model 笛卡尔积导致基数爆炸）
         self._metrics["tokens_input_total"] = Counter(
-            "tokens_input_total", "Total input tokens", ["provider", "model"]
+            "tokens_input_total", "Total input tokens", ["provider"]
         )
 
         self._metrics["tokens_output_total"] = Counter(
-            "tokens_output_total", "Total output tokens", ["provider", "model"]
+            "tokens_output_total", "Total output tokens", ["provider"]
         )
 
-        self._metrics["tokens_total"] = Counter(
-            "tokens_total", "Total tokens", ["provider", "model"]
-        )
+        self._metrics["tokens_total"] = Counter("tokens_total", "Total tokens", ["provider"])
 
         self._metrics["usage_cost_total"] = Counter(
-            "usage_cost_total", "Total usage cost in USD", ["provider", "model"]
+            "usage_cost_total", "Total usage cost in USD", ["provider"]
         )
 
         # 系统指标
@@ -112,7 +110,7 @@ class PrometheusPlugin(MonitorPlugin):
         self._metrics["provider_latency_seconds"] = Histogram(
             "provider_latency_seconds",
             "Provider response latency in seconds",
-            ["provider", "model"],
+            ["provider"],
             buckets=(0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30),
         )
 

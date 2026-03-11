@@ -809,7 +809,7 @@ function getApiFormatTooltip(record: UsageRecord): string {
   return record.api_format
 }
 
-// 获取实际使用的模型（优先 target_model，其次 model_version）
+// 获取实际使用的模型（优先 target_model，其次列表接口下发的 model_version）
 // 只有当实际模型与请求模型不同时才返回，用于显示映射箭头
 function getActualModel(record: UsageRecord): string | null {
   // 优先显示模型映射
@@ -817,8 +817,8 @@ function getActualModel(record: UsageRecord): string | null {
     return record.target_model
   }
   // 其次显示 Provider 返回的实际版本（如 Gemini 的 modelVersion）
-  if (record.request_metadata?.model_version && record.request_metadata.model_version !== record.model) {
-    return record.request_metadata.model_version
+  if (record.model_version && record.model_version !== record.model) {
+    return record.model_version
   }
   return null
 }

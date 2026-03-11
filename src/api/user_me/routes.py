@@ -809,6 +809,7 @@ class GetUsageAdapter(AuthenticatedApiAdapter):
             user_id=user.id,
             start_date=start_utc,
             end_date=end_utc,
+            group_by=None,
         )
 
         # 过滤掉 unknown/pending provider 的记录（请求未到达任何提供商）
@@ -818,31 +819,23 @@ class GetUsageAdapter(AuthenticatedApiAdapter):
             if item.get("provider") not in ("unknown", "pending", None)
         ]
 
-        total_requests = sum(item["requests"] for item in filtered_summary)
-        total_input_tokens = (
-            sum(item["input_tokens"] for item in filtered_summary) if filtered_summary else 0
-        )
-        total_output_tokens = (
-            sum(item["output_tokens"] for item in filtered_summary) if filtered_summary else 0
-        )
-        total_tokens = (
-            sum(item["total_tokens"] for item in filtered_summary) if filtered_summary else 0
-        )
-        total_cost = (
-            sum(item["total_cost_usd"] for item in filtered_summary) if filtered_summary else 0.0
-        )
-
-        # 管理员可以看到真实成本
+        total_requests = 0
+        total_input_tokens = 0
+        total_output_tokens = 0
+        total_tokens = 0
+        total_cost = 0.0
         total_actual_cost = 0.0
-        if user.role == UserRole.ADMIN:
-            total_actual_cost = (
-                sum(item.get("actual_total_cost_usd", 0.0) for item in filtered_summary)
-                if filtered_summary
-                else 0.0
-            )
-
         model_summary = {}
+        provider_summary = {}
         for item in filtered_summary:
+            total_requests += item["requests"]
+            total_input_tokens += item["input_tokens"]
+            total_output_tokens += item["output_tokens"]
+            total_tokens += item["total_tokens"]
+            total_cost += item["total_cost_usd"]
+            if user.role == UserRole.ADMIN:
+                total_actual_cost += item.get("actual_total_cost_usd", 0.0)
+
             model_name = item["model"]
             base_stats = {
                 "model": model_name,
@@ -866,13 +859,8 @@ class GetUsageAdapter(AuthenticatedApiAdapter):
             if user.role == UserRole.ADMIN:
                 stats["actual_total_cost_usd"] += item.get("actual_total_cost_usd", 0.0)
 
-        summary_by_model = sorted(model_summary.values(), key=lambda x: x["requests"], reverse=True)
-
-        # 按提供商汇总（用于 UsageProviderTable）
-        provider_summary = {}
-        for item in filtered_summary:
             provider_name = item["provider"]
-            base_stats = {
+            provider_base_stats = {
                 "provider": provider_name,
                 "requests": 0,
                 "total_tokens": 0,
@@ -881,32 +869,37 @@ class GetUsageAdapter(AuthenticatedApiAdapter):
                 "total_response_time_ms": 0.0,
                 "response_time_count": 0,
             }
-            stats = provider_summary.setdefault(provider_name, base_stats)
-            stats["requests"] += item["requests"]
-            stats["total_tokens"] += item["total_tokens"]
-            stats["total_cost_usd"] += item["total_cost_usd"]
-            # 假设 summary 中的都是成功的请求
-            stats["success_count"] += item["requests"]
-            if item.get("avg_response_time_ms") is not None:
-                stats["total_response_time_ms"] += item["avg_response_time_ms"] * item["requests"]
-                stats["response_time_count"] += item["requests"]
+            provider_stats = provider_summary.setdefault(provider_name, provider_base_stats)
+            provider_stats["requests"] += item["requests"]
+            provider_stats["total_tokens"] += item["total_tokens"]
+            provider_stats["total_cost_usd"] += item["total_cost_usd"]
+            provider_stats["success_count"] += int(item.get("success_count", 0) or 0)
+            success_response_time_count = int(item.get("success_response_time_count", 0) or 0)
+            if success_response_time_count > 0:
+                provider_stats["total_response_time_ms"] += float(
+                    item.get("success_response_time_sum_ms", 0.0) or 0.0
+                )
+                provider_stats["response_time_count"] += success_response_time_count
 
+        summary_by_model = sorted(model_summary.values(), key=lambda x: x["requests"], reverse=True)
         summary_by_provider = []
-        for stats in provider_summary.values():
+        for provider_stats in provider_summary.values():
             avg_response_time_ms = (
-                stats["total_response_time_ms"] / stats["response_time_count"]
-                if stats["response_time_count"] > 0
+                provider_stats["total_response_time_ms"] / provider_stats["response_time_count"]
+                if provider_stats["response_time_count"] > 0
                 else 0
             )
             success_rate = (
-                (stats["success_count"] / stats["requests"] * 100) if stats["requests"] > 0 else 100
+                (provider_stats["success_count"] / provider_stats["requests"] * 100)
+                if provider_stats["requests"] > 0
+                else 100
             )
             summary_by_provider.append(
                 {
-                    "provider": stats["provider"],
-                    "requests": stats["requests"],
-                    "total_tokens": stats["total_tokens"],
-                    "total_cost_usd": stats["total_cost_usd"],
+                    "provider": provider_stats["provider"],
+                    "requests": provider_stats["requests"],
+                    "total_tokens": provider_stats["total_tokens"],
+                    "total_cost_usd": provider_stats["total_cost_usd"],
                     "success_rate": round(success_rate, 2),
                     "avg_response_time_ms": round(avg_response_time_ms, 2),
                 }
@@ -1003,6 +996,7 @@ class GetUsageAdapter(AuthenticatedApiAdapter):
             "avg_response_time": avg_response_time,
             "billing": WalletService.serialize_wallet_summary(wallet),
             "summary_by_model": summary_by_model,
+            "summary_by_provider": summary_by_provider,
             # 分页信息
             "pagination": {
                 "total": total_records,
@@ -1117,7 +1111,12 @@ class GetActiveRequestsAdapter(AuthenticatedApiAdapter):
             if not id_list:
                 return {"requests": []}
 
-        requests = UsageService.get_active_requests_status(db=db, ids=id_list, user_id=user.id)
+        requests = UsageService.get_active_requests_status(
+            db=db,
+            ids=id_list,
+            user_id=user.id,
+            maintain_status=True,
+        )
         return {"requests": requests}
 
 

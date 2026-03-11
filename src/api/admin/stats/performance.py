@@ -73,13 +73,7 @@ class AdminPercentilesAdapter(AdminApiAdapter):
                 )
             return result
 
-        result = []
-        for local_date, day_start_utc, day_end_utc in time_range.get_local_day_hours():
-            percentiles = StatsAggregatorService.compute_daily_percentiles(
-                context.db, day_start_utc, day_end_utc
-            )
-            result.append({"date": local_date.isoformat(), **percentiles})
-        return result
+        return StatsAggregatorService.compute_percentiles_by_local_day(context.db, time_range)
 
 
 @router.get("/performance/percentiles")

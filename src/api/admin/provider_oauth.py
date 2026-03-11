@@ -43,6 +43,7 @@ from src.models.database import Provider, ProviderAPIKey, User
 from src.services.provider.pool.config import parse_pool_config
 from src.services.provider_keys.auth_type import OAUTH_AUTH_TYPES
 from src.services.scheduling.utils import release_db_connection_before_await
+from src.utils.async_utils import safe_create_task
 from src.utils.auth_utils import require_admin
 
 router = APIRouter(prefix="/api/admin/provider-oauth", tags=["Provider OAuth"])
@@ -1300,7 +1301,7 @@ async def complete_provider_oauth(
     )
 
     # 单个导入完成后，后台触发一次配额刷新
-    asyncio.create_task(_refresh_quota_after_import(provider_id, provider_type, [str(new_key.id)]))
+    safe_create_task(_refresh_quota_after_import(provider_id, provider_type, [str(new_key.id)]))
 
     return response
 
@@ -1770,9 +1771,7 @@ async def import_refresh_token(
         )
 
         # 单个导入完成后，后台触发一次配额刷新
-        asyncio.create_task(
-            _refresh_quota_after_import(provider_id, provider_type, [str(new_key.id)])
-        )
+        safe_create_task(_refresh_quota_after_import(provider_id, provider_type, [str(new_key.id)]))
 
         return response
 
@@ -1901,7 +1900,7 @@ async def import_refresh_token(
     )
 
     # 单个导入完成后，后台触发一次配额刷新
-    asyncio.create_task(_refresh_quota_after_import(provider_id, provider_type, [str(new_key.id)]))
+    safe_create_task(_refresh_quota_after_import(provider_id, provider_type, [str(new_key.id)]))
 
     return response
 
@@ -2315,9 +2314,7 @@ async def batch_import_oauth(
     # 导入完成后，后台触发一次配额刷新
     success_key_ids = _extract_success_key_ids(result)
     if success_key_ids:
-        asyncio.create_task(
-            _refresh_quota_after_import(provider_id, provider_type, success_key_ids)
-        )
+        safe_create_task(_refresh_quota_after_import(provider_id, provider_type, success_key_ids))
 
     return result
 
@@ -3128,7 +3125,7 @@ async def device_poll(
 
     # 单个导入完成后，后台触发一次配额刷新
     provider_type = ProviderType.KIRO.value
-    asyncio.create_task(_refresh_quota_after_import(provider_id, provider_type, [str(new_key.id)]))
+    safe_create_task(_refresh_quota_after_import(provider_id, provider_type, [str(new_key.id)]))
 
     return DevicePollResponse(
         status="authorized",

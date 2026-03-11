@@ -18,7 +18,7 @@ from src.core.logger import logger
 from src.database import get_db
 from src.models.admin_requests import UpdateUserRequest
 from src.models.api import CreateApiKeyRequest, CreateUserRequest
-from src.models.database import ApiKey, User, UserRole
+from src.models.database import ApiKey, User, UserRole, Wallet
 from src.services.system.config import SystemConfigService
 from src.services.user.apikey import ApiKeyService
 from src.services.user.bulk_cleanup import pre_clean_api_key
@@ -30,8 +30,23 @@ router = APIRouter(prefix="/api/admin/users", tags=["Admin - Users"])
 pipeline = ApiRequestPipeline()
 
 
-def _serialize_user(db: Session, user: User) -> dict[str, Any]:
-    wallet = WalletService.get_wallet(db, user_id=user.id)
+class _WalletSentinelType:
+    pass
+
+
+_WALLET_SENTINEL = _WalletSentinelType()
+
+
+def _serialize_user(
+    db: Session,
+    user: User,
+    wallet: Wallet | None | _WalletSentinelType = _WALLET_SENTINEL,
+) -> dict[str, Any]:
+    resolved_wallet: Wallet | None
+    if wallet is _WALLET_SENTINEL:
+        resolved_wallet = WalletService.get_wallet(db, user_id=user.id)
+    else:
+        resolved_wallet = wallet
     return {
         "id": user.id,
         "email": user.email,
@@ -40,7 +55,7 @@ def _serialize_user(db: Session, user: User) -> dict[str, Any]:
         "allowed_providers": user.allowed_providers,
         "allowed_api_formats": user.allowed_api_formats,
         "allowed_models": user.allowed_models,
-        "unlimited": WalletService.is_unlimited_wallet(wallet),
+        "unlimited": WalletService.is_unlimited_wallet(resolved_wallet),
         "is_active": user.is_active,
         "created_at": user.created_at.isoformat(),
         "updated_at": user.updated_at.isoformat() if user.updated_at else None,
@@ -334,7 +349,8 @@ class AdminListUsersAdapter(AdminApiAdapter):
         except KeyError as exc:
             raise InvalidRequestException("角色参数不合法") from exc
         users = UserService.list_users(db, self.skip, self.limit, role_enum, self.is_active)
-        return [_serialize_user(db, u) for u in users]
+        wallets_by_user_id = WalletService.get_wallets_by_user_ids(db, [user.id for user in users])
+        return [_serialize_user(db, user, wallets_by_user_id.get(user.id)) for user in users]
 
 
 class AdminGetUserAdapter(AdminApiAdapter):

@@ -37,13 +37,12 @@ class CircuitState:
     HALF_OPEN = "half_open"  # 半开（验证恢复）
 
 
-# 默认健康度数据结构
+# 默认健康度数据结构（不含 request_results_window，窗口数据仅存进程内存）
 def _default_health_data() -> dict[str, Any]:
     return {
         "health_score": 1.0,
         "consecutive_failures": 0,
         "last_failure_at": None,
-        "request_results_window": [],
     }
 
 
@@ -125,6 +124,12 @@ class HealthMonitor:
     )
     _open_circuit_keys: int = 0
 
+    # === 滑动窗口进程内存缓存 ===
+    # Key: (key_id, api_format), Value: list of {"ts": float, "ok": bool}
+    # 不再持久化到数据库，进程重启后自然重建
+    _window_cache: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    _WINDOW_CACHE_MAX_ENTRIES = int(os.getenv("HEALTH_WINDOW_CACHE_MAX_ENTRIES", "10000"))
+
     # ==================== 数据访问辅助方法 ====================
 
     @classmethod
@@ -137,10 +142,42 @@ class HealthMonitor:
 
     @classmethod
     def _set_health_data(cls, key: ProviderAPIKey, api_format: str, data: dict[str, Any]) -> None:
-        """设置指定格式的健康度数据"""
+        """设置指定格式的健康度数据（写入 DB 前剥离窗口数据）"""
         health_by_format = dict(key.health_by_format or {})
-        health_by_format[api_format] = data
+        db_data = {k: v for k, v in data.items() if k != "request_results_window"}
+        health_by_format[api_format] = db_data
         key.health_by_format = health_by_format  # type: ignore[assignment]
+
+    # ==================== 滑动窗口进程内存缓存方法 ====================
+
+    @classmethod
+    def _get_window(cls, key_id: str, api_format: str) -> list[dict[str, Any]]:
+        """从进程内存缓存获取滑动窗口"""
+        return cls._window_cache.get((key_id, api_format), [])
+
+    @classmethod
+    def _set_window(cls, key_id: str, api_format: str, window: list[dict[str, Any]]) -> None:
+        """设置滑动窗口到进程内存缓存（带容量淘汰）"""
+        cache_key = (key_id, api_format)
+        if (
+            cache_key not in cls._window_cache
+            and len(cls._window_cache) >= cls._WINDOW_CACHE_MAX_ENTRIES
+        ):
+            try:
+                oldest_key = next(iter(cls._window_cache))
+                del cls._window_cache[oldest_key]
+            except StopIteration:
+                pass
+        cls._window_cache[cache_key] = window
+
+    @classmethod
+    def _clear_window(cls, key_id: str, api_format: str | None = None) -> None:
+        """清理滑动窗口缓存"""
+        if api_format:
+            cls._window_cache.pop((key_id, api_format), None)
+        else:
+            for k in [k for k in cls._window_cache if k[0] == key_id]:
+                del cls._window_cache[k]
 
     @classmethod
     def _get_circuit_data(cls, key: ProviderAPIKey, api_format: str) -> dict[str, Any]:
@@ -208,14 +245,15 @@ class HealthMonitor:
             health_data = cls._get_health_data(key, effective_api_format)
             circuit_data = cls._get_circuit_data(key, effective_api_format)
 
-            # 1. 更新滑动窗口
-            window = health_data.get("request_results_window") or []
+            # 1. 更新滑动窗口（进程内存缓存，不持久化到 DB）
+            window = cls._get_window(key.id, effective_api_format)
+            window = list(window)  # 避免原地修改
             window.append({"ts": now_ts, "ok": True})
             cutoff_ts = now_ts - cls.WINDOW_SECONDS
             window = [r for r in window if r["ts"] > cutoff_ts]
             if len(window) > cls.WINDOW_SIZE:
                 window = window[-cls.WINDOW_SIZE :]
-            health_data["request_results_window"] = window
+            cls._set_window(key.id, effective_api_format, window)
 
             # 2. 更新健康度（用于展示）
             current_score = float(health_data.get("health_score") or 0)
@@ -333,14 +371,15 @@ class HealthMonitor:
             health_data = cls._get_health_data(key, effective_api_format)
             circuit_data = cls._get_circuit_data(key, effective_api_format)
 
-            # 1. 更新滑动窗口
-            window = health_data.get("request_results_window") or []
+            # 1. 更新滑动窗口（进程内存缓存，不持久化到 DB）
+            window = cls._get_window(key.id, effective_api_format)
+            window = list(window)  # 避免原地修改
             window.append({"ts": now_ts, "ok": False})
             cutoff_ts = now_ts - cls.WINDOW_SECONDS
             window = [r for r in window if r["ts"] > cutoff_ts]
             if len(window) > cls.WINDOW_SIZE:
                 window = window[-cls.WINDOW_SIZE :]
-            health_data["request_results_window"] = window
+            cls._set_window(key.id, effective_api_format, window)
 
             # 2. 更新健康度（用于展示）
             current_score = float(health_data.get("health_score") or 1)
@@ -654,7 +693,7 @@ class HealthMonitor:
                 # 查询单个格式
                 health_data = cls._get_health_data(key, api_format)
                 circuit_data = cls._get_circuit_data(key, api_format)
-                window = health_data.get("request_results_window") or []
+                window = cls._get_window(key_id, api_format)
                 valid_window = [r for r in window if r["ts"] > now_ts - cls.WINDOW_SECONDS]
 
                 result["api_format"] = api_format
@@ -678,7 +717,7 @@ class HealthMonitor:
                 for fmt in key.api_formats or []:
                     health_data = health_by_format.get(fmt, _default_health_data())
                     circuit_data = circuit_by_format.get(fmt, _default_circuit_data())
-                    window = health_data.get("request_results_window") or []
+                    window = cls._get_window(key_id, fmt)
                     valid_window = [r for r in window if r["ts"] > now_ts - cls.WINDOW_SECONDS]
 
                     formats_health[fmt] = {
@@ -755,11 +794,13 @@ class HealthMonitor:
                         # 重置单个格式
                         cls._set_health_data(key, api_format, _default_health_data())
                         cls._set_circuit_data(key, api_format, _default_circuit_data())
+                        cls._clear_window(key_id, api_format)
                         logger.info(f"[RESET] 重置 Key 健康度: {key_id}/{api_format}")
                     else:
                         # 重置所有格式
                         key.health_by_format = {}  # type: ignore[assignment]
                         key.circuit_breaker_by_format = {}  # type: ignore[assignment]
+                        cls._clear_window(key_id)
                         logger.info(f"[RESET] 重置 Key 所有格式健康度: {key_id}")
 
             db.flush()
@@ -788,6 +829,7 @@ class HealthMonitor:
                     # 重置所有格式的健康度
                     key.health_by_format = {}  # type: ignore[assignment]
                     key.circuit_breaker_by_format = {}  # type: ignore[assignment]
+                    cls._clear_window(key_id)
                     logger.info(f"[OK] 手动启用 Key: {key_id}")
 
             db.flush()

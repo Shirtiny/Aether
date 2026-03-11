@@ -69,26 +69,33 @@ async def test_list_all_candidates_returns_provider_batch_count_even_when_candid
     global_model = _make_global_model(gid="gm1", name="gpt-4o")
 
     with patch.object(scheduler, "_ensure_initialized", new=AsyncMock(return_value=None)):
-        with patch.object(scheduler._candidate_builder, "_query_providers", return_value=providers):
-            with patch(
-                "src.services.scheduling.aware_scheduler.ModelCacheService.get_global_model_by_name",
-                new=AsyncMock(return_value=global_model),
-            ):
+        with patch.object(
+            scheduler._candidate_builder,
+            "_query_provider_refs",
+            return_value=[("p1", "p1"), ("p2", "p2")],
+        ):
+            with patch.object(scheduler._candidate_builder, "_query_providers") as query_providers:
                 with patch(
-                    "src.services.scheduling.aware_scheduler.SystemConfigService.is_format_conversion_enabled",
-                    return_value=True,
+                    "src.services.scheduling.aware_scheduler.ModelCacheService.get_global_model_by_name",
+                    new=AsyncMock(return_value=global_model),
                 ):
-                    candidates, global_model_id, provider_batch_count = (
-                        await scheduler.list_all_candidates(
-                            db=db,
-                            api_format="openai:chat",
-                            model_name="gpt-4o",
-                            affinity_key=None,
-                            user_api_key=user_api_key,  # type: ignore[arg-type]
-                            provider_offset=0,
-                            provider_limit=20,
+                    with patch(
+                        "src.services.scheduling.aware_scheduler.SystemConfigService.is_format_conversion_enabled",
+                        return_value=True,
+                    ):
+                        candidates, global_model_id, provider_batch_count = (
+                            await scheduler.list_all_candidates(
+                                db=db,
+                                api_format="openai:chat",
+                                model_name="gpt-4o",
+                                affinity_key=None,
+                                user_api_key=user_api_key,  # type: ignore[arg-type]
+                                provider_offset=0,
+                                provider_limit=20,
+                            )
                         )
-                    )
+
+    query_providers.assert_not_called()
 
     assert candidates == []
     assert global_model_id == "gm1"

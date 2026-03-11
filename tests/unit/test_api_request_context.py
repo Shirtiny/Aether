@@ -11,6 +11,13 @@ from src.api.base.context import ApiRequestContext
 
 
 def _build_request(headers: dict[str, str] | None = None) -> Request:
+    return _build_request_with_body(b"", headers=headers)
+
+
+def _build_request_with_body(
+    body: bytes,
+    headers: dict[str, str] | None = None,
+) -> Request:
     header_items = [
         (str(key).encode("latin-1"), str(value).encode("latin-1"))
         for key, value in (headers or {}).items()
@@ -28,8 +35,14 @@ def _build_request(headers: dict[str, str] | None = None) -> Request:
         "server": ("testserver", 80),
     }
 
+    received = False
+
     async def receive() -> dict[str, object]:
-        return {"type": "http.request", "body": b"", "more_body": False}
+        nonlocal received
+        if received:
+            return {"type": "http.request", "body": b"", "more_body": False}
+        received = True
+        return {"type": "http.request", "body": body, "more_body": False}
 
     request = Request(scope, receive)
     request.state.perf_metrics = {}
@@ -89,3 +102,22 @@ class TestApiRequestContextEnsureJsonBody:
 
         assert context.client_content_encoding == "gzip"
         assert context.client_accept_encoding == "gzip, deflate"
+
+    @pytest.mark.asyncio
+    async def test_ensure_json_body_async_loads_body_lazily(self) -> None:
+        payload = {"message": "hello", "count": 2}
+        request = _build_request_with_body(json.dumps(payload).encode("utf-8"))
+        context = ApiRequestContext.build(
+            request=request,
+            db=None,  # type: ignore[arg-type]
+            user=None,
+            api_key=None,
+            raw_body=None,
+        )
+
+        assert context.raw_body is None
+
+        result = await context.ensure_json_body_async()
+
+        assert result == payload
+        assert context.raw_body == json.dumps(payload).encode("utf-8")

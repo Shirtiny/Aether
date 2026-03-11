@@ -12,7 +12,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import Float, and_, case, cast, func
+from sqlalchemy import Date, Float, and_, case, cast, func, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -47,8 +47,63 @@ def _get_utc_day_range(value: datetime) -> tuple[datetime, datetime]:
     return day_start, day_start + timedelta(days=1)
 
 
+def _merge_consecutive_utc_days(days: list[date]) -> list[tuple[datetime, datetime]]:
+    """将连续 UTC 日期合并为更少的 [start, end) 区间。"""
+    if not days:
+        return []
+
+    sorted_days = sorted(days)
+    ranges: list[tuple[datetime, datetime]] = []
+    start_day = sorted_days[0]
+    end_day = start_day
+
+    for current_day in sorted_days[1:]:
+        if current_day == end_day + timedelta(days=1):
+            end_day = current_day
+            continue
+
+        range_start = datetime.combine(start_day, time.min, tzinfo=timezone.utc)
+        range_end = datetime.combine(end_day + timedelta(days=1), time.min, tzinfo=timezone.utc)
+        ranges.append((range_start, range_end))
+        start_day = current_day
+        end_day = current_day
+
+    range_start = datetime.combine(start_day, time.min, tzinfo=timezone.utc)
+    range_end = datetime.combine(end_day + timedelta(days=1), time.min, tzinfo=timezone.utc)
+    ranges.append((range_start, range_end))
+    return ranges
+
+
 class StatsAggregatorService:
     """统计数据聚合服务"""
+
+    @staticmethod
+    def _resolve_percentile_row(row: Any | None) -> tuple[int | None, int | None, int | None]:
+        if not row:
+            return None, None, None
+        count = int(getattr(row, "count", 0) or 0)
+        if count < MIN_PERCENTILE_SAMPLES:
+            return None, None, None
+        p50 = getattr(row, "p50", None)
+        p90 = getattr(row, "p90", None)
+        p99 = getattr(row, "p99", None)
+        return (
+            int(p50) if p50 is not None else None,
+            int(p90) if p90 is not None else None,
+            int(p99) if p99 is not None else None,
+        )
+
+    @staticmethod
+    def _build_local_day_expression(time_range: TimeRangeParams) -> Any:
+        if time_range.timezone and time_range.timezone != "UTC":
+            local_time_expr = func.timezone(time_range.timezone, Usage.created_at)
+        elif time_range.tz_offset_minutes:
+            interval_literal = text(f"INTERVAL '{int(time_range.tz_offset_minutes)} minutes'")
+            local_time_expr = Usage.created_at + interval_literal
+        else:
+            local_time_expr = Usage.created_at
+
+        return cast(func.date_trunc("day", local_time_expr), Date)
 
     @staticmethod
     def compute_daily_stats(db: Session, date: datetime) -> dict:
@@ -196,23 +251,8 @@ class StatsAggregatorService:
             .first()
         )
 
-        def _resolve(row: Any | None) -> tuple[int | None, int | None, int | None]:
-            if not row:
-                return None, None, None
-            count = int(getattr(row, "count", 0) or 0)
-            if count < MIN_PERCENTILE_SAMPLES:
-                return None, None, None
-            p50 = getattr(row, "p50", None)
-            p90 = getattr(row, "p90", None)
-            p99 = getattr(row, "p99", None)
-            return (
-                int(p50) if p50 is not None else None,
-                int(p90) if p90 is not None else None,
-                int(p99) if p99 is not None else None,
-            )
-
-        p50_rt, p90_rt, p99_rt = _resolve(rt_row)
-        p50_ttfb, p90_ttfb, p99_ttfb = _resolve(ttfb_row)
+        p50_rt, p90_rt, p99_rt = StatsAggregatorService._resolve_percentile_row(rt_row)
+        p50_ttfb, p90_ttfb, p99_ttfb = StatsAggregatorService._resolve_percentile_row(ttfb_row)
 
         return {
             "p50_response_time_ms": p50_rt,
@@ -222,6 +262,103 @@ class StatsAggregatorService:
             "p90_first_byte_time_ms": p90_ttfb,
             "p99_first_byte_time_ms": p99_ttfb,
         }
+
+    @staticmethod
+    def compute_percentiles_by_local_day(
+        db: Session, time_range: TimeRangeParams
+    ) -> list[dict[str, int | None | str]]:
+        """按本地日期批量计算性能百分位，避免逐天 fan-out。"""
+        bind = db.bind
+        dialect = bind.dialect.name if bind is not None else "sqlite"
+
+        local_dates: list[date] = []
+        current_date = time_range.start_date
+        while current_date <= time_range.end_date:
+            local_dates.append(current_date)
+            current_date += timedelta(days=1)
+
+        if dialect != "postgresql":
+            return [
+                {
+                    "date": local_date.isoformat(),
+                    "p50_response_time_ms": None,
+                    "p90_response_time_ms": None,
+                    "p99_response_time_ms": None,
+                    "p50_first_byte_time_ms": None,
+                    "p90_first_byte_time_ms": None,
+                    "p99_first_byte_time_ms": None,
+                }
+                for local_date in local_dates
+            ]
+
+        start_utc, end_utc = time_range.to_utc_datetime_range()
+        local_day_expr = StatsAggregatorService._build_local_day_expression(time_range)
+
+        rt_rows = (
+            db.query(
+                local_day_expr.label("local_day"),
+                func.percentile_cont(0.5).within_group(Usage.response_time_ms).label("p50"),
+                func.percentile_cont(0.9).within_group(Usage.response_time_ms).label("p90"),
+                func.percentile_cont(0.99).within_group(Usage.response_time_ms).label("p99"),
+                func.count().label("count"),
+            )
+            .filter(
+                Usage.created_at >= start_utc,
+                Usage.created_at < end_utc,
+                Usage.status == "completed",
+                Usage.response_time_ms.isnot(None),
+            )
+            .group_by(local_day_expr)
+            .all()
+        )
+
+        ttfb_rows = (
+            db.query(
+                local_day_expr.label("local_day"),
+                func.percentile_cont(0.5).within_group(Usage.first_byte_time_ms).label("p50"),
+                func.percentile_cont(0.9).within_group(Usage.first_byte_time_ms).label("p90"),
+                func.percentile_cont(0.99).within_group(Usage.first_byte_time_ms).label("p99"),
+                func.count().label("count"),
+            )
+            .filter(
+                Usage.created_at >= start_utc,
+                Usage.created_at < end_utc,
+                Usage.status == "completed",
+                Usage.first_byte_time_ms.isnot(None),
+            )
+            .group_by(local_day_expr)
+            .all()
+        )
+
+        rt_by_day: dict[date, tuple[int | None, int | None, int | None]] = {}
+        for row in rt_rows:
+            local_day = getattr(row, "local_day", None)
+            if local_day is not None:
+                rt_by_day[local_day] = StatsAggregatorService._resolve_percentile_row(row)
+
+        ttfb_by_day: dict[date, tuple[int | None, int | None, int | None]] = {}
+        for row in ttfb_rows:
+            local_day = getattr(row, "local_day", None)
+            if local_day is not None:
+                ttfb_by_day[local_day] = StatsAggregatorService._resolve_percentile_row(row)
+
+        result: list[dict[str, int | None | str]] = []
+        for local_date in local_dates:
+            p50_rt, p90_rt, p99_rt = rt_by_day.get(local_date, (None, None, None))
+            p50_ttfb, p90_ttfb, p99_ttfb = ttfb_by_day.get(local_date, (None, None, None))
+            result.append(
+                {
+                    "date": local_date.isoformat(),
+                    "p50_response_time_ms": p50_rt,
+                    "p90_response_time_ms": p90_rt,
+                    "p99_response_time_ms": p99_rt,
+                    "p50_first_byte_time_ms": p50_ttfb,
+                    "p90_first_byte_time_ms": p90_ttfb,
+                    "p99_first_byte_time_ms": p99_ttfb,
+                }
+            )
+
+        return result
 
     @staticmethod
     def aggregate_daily_stats(db: Session, date: datetime, commit: bool = True) -> StatsDaily:
@@ -657,6 +794,82 @@ class StatsAggregatorService:
         return stats
 
     @staticmethod
+    def aggregate_user_daily_stats_batch(
+        db: Session, date: datetime, user_ids: list[str], commit: bool = True
+    ) -> list[StatsUserDaily]:
+        """批量聚合单日用户统计，避免逐用户 fan-out 查询。"""
+        if not user_ids:
+            return []
+
+        day_start, day_end = _get_utc_day_range(date)
+        ordered_user_ids = list(dict.fromkeys(user_ids))
+        existing_rows = (
+            db.query(StatsUserDaily)
+            .filter(
+                and_(
+                    StatsUserDaily.date == day_start,
+                    StatsUserDaily.user_id.in_(ordered_user_ids),
+                )
+            )
+            .all()
+        )
+        existing_by_user = {row.user_id: row for row in existing_rows}
+
+        error_cond = (Usage.status_code >= 400) | (Usage.error_message.isnot(None))
+        aggregated_rows = (
+            db.query(
+                Usage.user_id.label("user_id"),
+                func.count(Usage.id).label("total_requests"),
+                func.sum(case((error_cond, 1), else_=0)).label("error_requests"),
+                func.sum(Usage.input_tokens).label("input_tokens"),
+                func.sum(Usage.output_tokens).label("output_tokens"),
+                func.sum(Usage.cache_creation_input_tokens).label("cache_creation_tokens"),
+                func.sum(Usage.cache_read_input_tokens).label("cache_read_tokens"),
+                func.sum(Usage.total_cost_usd).label("total_cost"),
+                func.max(Usage.username).label("username"),
+            )
+            .filter(
+                and_(
+                    Usage.user_id.in_(ordered_user_ids),
+                    Usage.created_at >= day_start,
+                    Usage.created_at < day_end,
+                )
+            )
+            .group_by(Usage.user_id)
+            .all()
+        )
+        aggregated_by_user = {row.user_id: row for row in aggregated_rows}
+
+        result: list[StatsUserDaily] = []
+        for user_id in ordered_user_ids:
+            stats = existing_by_user.get(user_id)
+            if stats is None:
+                stats = StatsUserDaily(id=str(uuid.uuid4()), user_id=user_id, date=day_start)
+                db.add(stats)
+
+            aggregated = aggregated_by_user.get(user_id)
+            if not stats.username and aggregated is not None:
+                username = getattr(aggregated, "username", None)
+                if username:
+                    stats.username = username
+
+            total_requests = int(getattr(aggregated, "total_requests", 0) or 0)
+            error_requests = int(getattr(aggregated, "error_requests", 0) or 0)
+            stats.total_requests = total_requests
+            stats.success_requests = total_requests - error_requests
+            stats.error_requests = error_requests
+            stats.input_tokens = int(getattr(aggregated, "input_tokens", 0) or 0)
+            stats.output_tokens = int(getattr(aggregated, "output_tokens", 0) or 0)
+            stats.cache_creation_tokens = int(getattr(aggregated, "cache_creation_tokens", 0) or 0)
+            stats.cache_read_tokens = int(getattr(aggregated, "cache_read_tokens", 0) or 0)
+            stats.total_cost = float(getattr(aggregated, "total_cost", 0) or 0.0)
+            result.append(stats)
+
+        if commit:
+            db.commit()
+        return result
+
+    @staticmethod
     def aggregate_daily_stats_bundle(
         db: Session, date: datetime, user_ids: list[str] | None = None
     ) -> StatsDaily:
@@ -668,8 +881,9 @@ class StatsAggregatorService:
         StatsAggregatorService.aggregate_daily_error_stats(db, date, commit=False)
 
         if user_ids:
-            for user_id in user_ids:
-                StatsAggregatorService.aggregate_user_daily_stats(db, user_id, date, commit=False)
+            StatsAggregatorService.aggregate_user_daily_stats_batch(
+                db, date, user_ids, commit=False
+            )
 
         stats.is_complete = True
         stats.aggregated_at = datetime.now(timezone.utc)
@@ -1096,6 +1310,7 @@ class StatsAggregatorService:
         current_date = start_date
         while current_date < today_utc:
             StatsAggregatorService.aggregate_daily_stats_bundle(db, current_date, user_ids=user_ids)
+            db.expunge_all()  # 释放 Session identity map，防止 ORM 对象累积导致内存暴涨
             count += 1
             current_date += timedelta(days=1)
 
@@ -1114,6 +1329,7 @@ class StatsAggregatorService:
         count = 0
         while current <= end_dt:
             StatsAggregatorService.aggregate_daily_api_key_stats(db, current, commit=True)
+            db.expunge_all()
             count += 1
             current += timedelta(days=1)
         return count
@@ -1145,9 +1361,11 @@ class StatsAggregatorService:
                 processed += 1
             if processed % 30 == 0:
                 db.commit()
+                db.expunge_all()
             current += timedelta(days=1)
 
         db.commit()
+        db.expunge_all()
         return processed
 
     @staticmethod
@@ -1183,6 +1401,7 @@ class StatsAggregatorService:
             db.commit()
             last_id = records[-1].id
             total_processed += len(records)
+            db.expunge_all()
 
         return total_processed
 
@@ -1194,6 +1413,7 @@ class StatsAggregatorService:
         count = 0
         while current <= end_dt:
             StatsAggregatorService.aggregate_daily_error_stats(db, current, commit=True)
+            db.expunge_all()
             count += 1
             current += timedelta(days=1)
         return count
@@ -1311,28 +1531,32 @@ def query_stats_hybrid(
 
     result = AggregatedStats()
 
-    preaggregate_dates: list[datetime] = []
-    realtime_dates: list[datetime] = []
-    for day in complete_dates:
-        if day >= today_utc:
-            realtime_dates.append(datetime.combine(day, time.min, tzinfo=timezone.utc))
-            continue
-        day_dt = datetime.combine(day, time.min, tzinfo=timezone.utc)
-        stats = (
-            db.query(StatsDaily)
-            .filter(StatsDaily.date == day_dt, StatsDaily.is_complete.is_(True))
-            .first()
-        )
-        if stats:
-            preaggregate_dates.append(day_dt)
-        else:
-            realtime_dates.append(day_dt)
+    historical_dates = [day for day in complete_dates if day < today_utc]
+    realtime_dates = [day for day in complete_dates if day >= today_utc]
 
-    # Pre-aggregated totals
-    for day_dt in preaggregate_dates:
-        stats = db.query(StatsDaily).filter(StatsDaily.date == day_dt).first()
-        if not stats:
-            continue
+    preaggregated_by_date: dict[date, StatsDaily] = {}
+    if historical_dates:
+        historical_start = datetime.combine(min(historical_dates), time.min, tzinfo=timezone.utc)
+        historical_end = datetime.combine(
+            max(historical_dates) + timedelta(days=1),
+            time.min,
+            tzinfo=timezone.utc,
+        )
+        historical_rows = (
+            db.query(StatsDaily)
+            .filter(
+                StatsDaily.date >= historical_start,
+                StatsDaily.date < historical_end,
+                StatsDaily.is_complete.is_(True),
+            )
+            .all()
+        )
+        preaggregated_by_date = {
+            row.date.astimezone(timezone.utc).date() if row.date.tzinfo else row.date.date(): row
+            for row in historical_rows
+        }
+
+    for stats in preaggregated_by_date.values():
         result.total_requests += stats.total_requests
         result.success_requests += stats.success_requests
         result.error_requests += stats.error_requests
@@ -1346,9 +1570,10 @@ def query_stats_hybrid(
         result.actual_total_cost += float(stats.actual_total_cost or 0)
         result.total_response_time_ms += (stats.avg_response_time_ms or 0.0) * stats.total_requests
 
-    # Realtime per day
-    for day_dt in realtime_dates:
-        result.add(aggregate_usage_range(db, day_dt, day_dt + timedelta(days=1), filters=filters))
+    missing_historical_dates = [day for day in historical_dates if day not in preaggregated_by_date]
+    realtime_ranges = _merge_consecutive_utc_days(missing_historical_dates + realtime_dates)
+    for range_start, range_end in realtime_ranges:
+        result.add(aggregate_usage_range(db, range_start, range_end, filters=filters))
 
     if head_boundary:
         result.add(aggregate_usage_range(db, head_boundary[0], head_boundary[1], filters=filters))

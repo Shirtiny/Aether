@@ -48,7 +48,7 @@ class OpenAICliAdapter(CliAdapterBase):
     async def handle(self, context: ApiRequestContext) -> Any:
         """处理 CLI API 请求 -- compact 模式下注入标记并强制非流式"""
         if self._compact:
-            body = context.ensure_json_body()
+            body = await context.ensure_json_body_async()
             body["_aether_compact"] = True
             # compact 端点永远非流式
             body.pop("stream", None)

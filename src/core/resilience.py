@@ -208,11 +208,21 @@ class ResilienceManager:
     def get_circuit_breaker(self, key: str) -> CircuitBreaker:
         """获取或创建熔断器"""
         if key not in self.circuit_breakers:
-            # 淘汰已恢复的旧熔断器，防止无界增长
+            # 淘汰旧熔断器，防止无界增长
             if len(self.circuit_breakers) >= self._MAX_CIRCUIT_BREAKERS:
+                # 优先淘汰已恢复(closed)的
                 closed_keys = [k for k, cb in self.circuit_breakers.items() if cb.state == "closed"]
-                for k in closed_keys:
-                    del self.circuit_breakers[k]
+                if closed_keys:
+                    for k in closed_keys:
+                        del self.circuit_breakers[k]
+                else:
+                    # 全部处于 open/half-open，按最后失败时间淘汰最旧的一半
+                    sorted_keys = sorted(
+                        self.circuit_breakers,
+                        key=lambda cb_key: self.circuit_breakers[cb_key].last_failure_time or 0,
+                    )
+                    for k in sorted_keys[: len(sorted_keys) // 2 or 1]:
+                        del self.circuit_breakers[k]
             self.circuit_breakers[key] = CircuitBreaker()
         return self.circuit_breakers[key]
 

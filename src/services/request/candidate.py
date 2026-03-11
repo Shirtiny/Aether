@@ -16,6 +16,14 @@ class RequestCandidateService:
     """请求候选记录服务"""
 
     @staticmethod
+    def _persist_candidate_update(db: Session, *, immediate: bool) -> None:
+        if immediate:
+            db.commit()
+            return
+        db.flush()
+        get_batch_committer().mark_dirty(db)
+
+    @staticmethod
     def create_candidate(
         db: Session,
         request_id: str,
@@ -93,9 +101,9 @@ class RequestCandidateService:
         if candidate:
             candidate.status = "pending"
             candidate.started_at = datetime.now(timezone.utc)
-            # 关键状态更新：立即提交，不使用批量提交
-            # 原因：前端需要实时看到请求开始执行
-            db.commit()
+            # 中间态改为 flush：最终 success/failed 仍会立即提交，
+            # 但开始执行这一跳不再单独制造一次事务往返。
+            RequestCandidateService._persist_candidate_update(db, immediate=False)
 
     @staticmethod
     def update_candidate_status(db: Session, candidate_id: str, status: str) -> None:
@@ -113,8 +121,9 @@ class RequestCandidateService:
             # 如果状态变更为 pending，记录开始时间
             if status == "pending" and not candidate.started_at:
                 candidate.started_at = datetime.now(timezone.utc)
-            # 立即提交，确保前端能实时看到状态变化
-            db.commit()
+            RequestCandidateService._persist_candidate_update(
+                db, immediate=status not in {"pending", "streaming"}
+            )
 
     @staticmethod
     def mark_candidate_streaming(
@@ -141,7 +150,7 @@ class RequestCandidateService:
             candidate.status = "streaming"
             candidate.concurrent_requests = concurrent_requests
             # streaming 状态不设置 finished_at 和 status_code，因为请求还在进行中
-            db.commit()
+            RequestCandidateService._persist_candidate_update(db, immediate=False)
 
     @staticmethod
     def mark_candidate_success(

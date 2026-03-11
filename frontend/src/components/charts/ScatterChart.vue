@@ -119,6 +119,11 @@ let chart: ChartJS<'scatter'> | null = null
 const crosshairY = ref<number | null>(null)
 const gapInfoList = ref<GapInfo[]>([])
 
+interface PreparedRenderData {
+  chartData: ChartData<'scatter'>
+  gaps: GapInfo[]
+}
+
 const crosshairStats = computed<CrosshairStats | null>(() => {
   if (crosshairY.value === null || !props.data.datasets) return null
 
@@ -291,6 +296,22 @@ function transformData(data: ChartData<'scatter'>): ChartData<'scatter'> {
         _originalY: point.y  // 保存原始值用于 tooltip
       }))
     }))
+  }
+}
+
+function prepareRenderData(): PreparedRenderData {
+  let dataToUse = props.data
+  let gaps: GapInfo[] = []
+
+  if (props.compressGaps) {
+    const compressedResult = compressTimeGaps(props.data)
+    dataToUse = compressedResult.data
+    gaps = compressedResult.gaps
+  }
+
+  return {
+    chartData: transformData(dataToUse),
+    gaps
   }
 }
 
@@ -516,22 +537,12 @@ function handleMouseLeave() {
 function createChart() {
   if (!chartRef.value) return
 
-  let dataToUse = props.data
-  gapInfoList.value = []
-
-  // 如果启用间隙压缩
-  if (props.compressGaps) {
-    const { data: compressedData, gaps } = compressTimeGaps(props.data)
-    dataToUse = compressedData
-    gapInfoList.value = gaps
-  }
-
-  // 转换数据
-  const transformedData = transformData(dataToUse)
+  const { chartData, gaps } = prepareRenderData()
+  gapInfoList.value = gaps
 
   chart = new ChartJS(chartRef.value, {
     type: 'scatter',
-    data: transformedData,
+    data: chartData,
     options: {
       ...defaultOptions,
       ...props.options
@@ -544,16 +555,9 @@ function createChart() {
 
 function updateChart() {
   if (chart) {
-    let dataToUse = props.data
-    gapInfoList.value = []
-
-    if (props.compressGaps) {
-      const { data: compressedData, gaps } = compressTimeGaps(props.data)
-      dataToUse = compressedData
-      gapInfoList.value = gaps
-    }
-
-    chart.data = transformData(dataToUse)
+    const { chartData, gaps } = prepareRenderData()
+    gapInfoList.value = gaps
+    chart.data = chartData
     chart.update('none')
   }
 }
@@ -573,21 +577,22 @@ onUnmounted(() => {
   }
 })
 
-watch(() => props.data, updateChart, { deep: true })
-watch(() => props.compressGaps, () => {
-  if (chart) {
-    chart.destroy()
-    chart = null
-  }
-  createChart()
-})
+watch(
+  [
+    () => props.data,
+    () => props.compressGaps,
+    () => props.gapThreshold,
+    () => props.compressedGapSize
+  ],
+  updateChart
+)
 watch(() => props.options, () => {
   if (chart) {
     chart.options = {
       ...defaultOptions,
       ...props.options
     }
-    chart.update()
+    chart.update('none')
   }
-}, { deep: true })
+})
 </script>

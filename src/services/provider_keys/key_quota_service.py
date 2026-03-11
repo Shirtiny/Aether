@@ -6,7 +6,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, defer
 
 from src.core.exceptions import InvalidRequestException, NotFoundException
 from src.core.logger import logger
@@ -101,8 +101,17 @@ async def refresh_provider_quota_for_provider(
             deduped.append(value)
         selected_key_ids = deduped
 
-    keys_query = db.query(ProviderAPIKey).filter(
-        ProviderAPIKey.provider_id == provider_id,
+    keys_query = (
+        db.query(ProviderAPIKey)
+        .options(
+            defer(ProviderAPIKey.health_by_format),
+            defer(ProviderAPIKey.circuit_breaker_by_format),
+            defer(ProviderAPIKey.adjustment_history),
+            defer(ProviderAPIKey.utilization_samples),
+        )
+        .filter(
+            ProviderAPIKey.provider_id == provider_id,
+        )
     )
     if selected_key_ids is None:
         keys_query = keys_query.filter(ProviderAPIKey.is_active.is_(True))

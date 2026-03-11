@@ -1,0 +1,143 @@
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from decimal import Decimal
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+from src.api.admin.usage.routes import AdminUsageRecordsAdapter
+
+
+class _FakeQuery:
+    def __init__(
+        self,
+        *,
+        scalar_result: int | None = None,
+        all_result: list[Any] | None = None,
+    ) -> None:
+        self.scalar_result = scalar_result
+        self.all_result = all_result or []
+        self.options_args: tuple[Any, ...] = ()
+
+    def outerjoin(self, *args: Any, **kwargs: Any) -> _FakeQuery:
+        return self
+
+    def join(self, *args: Any, **kwargs: Any) -> _FakeQuery:
+        return self
+
+    def filter(self, *args: Any, **kwargs: Any) -> _FakeQuery:
+        return self
+
+    def options(self, *args: Any) -> _FakeQuery:
+        self.options_args = args
+        return self
+
+    def order_by(self, *args: Any, **kwargs: Any) -> _FakeQuery:
+        return self
+
+    def offset(self, *args: Any, **kwargs: Any) -> _FakeQuery:
+        return self
+
+    def limit(self, *args: Any, **kwargs: Any) -> _FakeQuery:
+        return self
+
+    def scalar(self) -> int | None:
+        return self.scalar_result
+
+    def all(self) -> list[Any]:
+        return self.all_result
+
+
+class _FakeDb:
+    def __init__(self, queries: list[_FakeQuery]) -> None:
+        self._queries = queries
+        self.query_calls: list[tuple[Any, ...]] = []
+
+    def query(self, *args: Any) -> _FakeQuery:
+        self.query_calls.append(args)
+        return self._queries[len(self.query_calls) - 1]
+
+
+@pytest.mark.asyncio
+async def test_admin_usage_records_returns_model_version_without_request_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("src.utils.cache_decorator.get_redis_client_sync", lambda: None)
+
+    usage = SimpleNamespace(
+        id="usage-1",
+        request_id=None,
+        user_id="user-1",
+        api_key_id=None,
+        provider_name="google",
+        provider_id=None,
+        provider_endpoint_id=None,
+        provider_api_key_id=None,
+        model="gemini-2.5-pro",
+        target_model=None,
+        input_tokens=120,
+        output_tokens=80,
+        cache_creation_input_tokens=0,
+        cache_read_input_tokens=0,
+        total_tokens=200,
+        total_cost_usd=Decimal("1.25"),
+        actual_total_cost_usd=Decimal("1.25"),
+        rate_multiplier=Decimal("1.0"),
+        response_time_ms=850,
+        first_byte_time_ms=230,
+        created_at=datetime(2026, 3, 9, 8, 30, tzinfo=timezone.utc),
+        is_stream=False,
+        status_code=200,
+        error_message=None,
+        status="completed",
+        api_format="gemini:chat",
+        endpoint_api_format=None,
+        has_format_conversion=False,
+        input_price_per_1m=Decimal("0.10"),
+        output_price_per_1m=Decimal("0.30"),
+        cache_creation_price_per_1m=None,
+        cache_read_price_per_1m=None,
+    )
+    user = SimpleNamespace(id="user-1", email="user@example.com", username="tester")
+
+    count_query = _FakeQuery(scalar_result=1)
+    data_query = _FakeQuery(
+        all_result=[
+            (usage, user, None, None, None, "gemini-2.5-pro-001"),
+        ]
+    )
+    db = _FakeDb([count_query, data_query])
+    context = SimpleNamespace(
+        db=db,
+        user=SimpleNamespace(id="admin-1"),
+        add_audit_metadata=lambda **_: None,
+    )
+
+    adapter = AdminUsageRecordsAdapter(
+        time_range=None,
+        search=None,
+        user_id=None,
+        username=None,
+        model=None,
+        provider=None,
+        api_format=None,
+        status=None,
+        limit=100,
+        offset=0,
+    )
+
+    result = await adapter.handle(context)
+
+    assert len(db.query_calls) == 2
+    assert len(db.query_calls[1]) == 6
+    assert getattr(db.query_calls[1][-1], "name", None) == "model_version"
+
+    record = result["records"][0]
+    assert record["model_version"] == "gemini-2.5-pro-001"
+    assert "request_metadata" not in record
+
+    usage_load_only = data_query.options_args[0]
+    usage_paths = {str(option.path) for option in usage_load_only.context}
+    assert "ORM Path[Mapper[Usage(usage)] -> Usage.request_metadata]" not in usage_paths

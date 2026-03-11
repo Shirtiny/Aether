@@ -42,11 +42,20 @@ class CandidateSorterProtocol(Protocol):
 
 
 class CandidateBuilderProtocol(Protocol):
+    def _query_provider_refs(
+        self,
+        db: Session,
+        provider_offset: int = 0,
+        provider_limit: int | None = None,
+    ) -> list[tuple[str, str]]: ...
+
     def _query_providers(
         self,
         db: Session,
         provider_offset: int = 0,
         provider_limit: int | None = None,
+        allowed_providers: list[str] | None = None,
+        provider_ids: list[str] | None = None,
     ) -> list[Provider]: ...
 
     async def _build_candidates(

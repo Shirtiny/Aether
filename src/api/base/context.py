@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import gzip
 import json
 import time
@@ -9,7 +10,9 @@ from typing import Any
 
 from fastapi import HTTPException, Request
 from sqlalchemy.orm import Session
+from starlette.requests import ClientDisconnect
 
+from src.config.settings import config
 from src.core.api_format.headers import get_header_value
 from src.core.http_compression import is_gzip_content_encoding, normalize_content_encoding
 from src.core.logger import logger
@@ -52,6 +55,56 @@ class ApiRequestContext:
     quiet_logging: bool = False
     client_content_encoding: str | None = None
     client_accept_encoding: str | None = None
+
+    async def ensure_raw_body_async(self) -> bytes:
+        """按需读取原始请求体，避免所有请求都在 Pipeline 阶段预读。"""
+        if self.raw_body is not None:
+            return self.raw_body
+
+        perf_metrics = getattr(self.request.state, "perf_metrics", None)
+        perf_sampled = isinstance(perf_metrics, dict) and bool(perf_metrics)
+        body_start = PerfRecorder.start(force=perf_sampled)
+        body_size = 0
+        try:
+            self.raw_body = await asyncio.wait_for(
+                self.request.body(), timeout=config.request_body_timeout
+            )
+            body_size = len(self.raw_body or b"")
+        except TimeoutError as exc:
+            timeout_sec = int(config.request_body_timeout)
+            logger.error("读取请求体超时({}s),可能客户端未发送完整请求体", timeout_sec)
+            raise HTTPException(
+                status_code=408,
+                detail=f"Request timeout: body not received within {timeout_sec} seconds",
+            ) from exc
+        except ClientDisconnect:
+            logger.warning(
+                "[Context] 客户端在读取请求体期间断开连接: {} {}",
+                self.request.method,
+                self.request.url.path,
+            )
+            raise HTTPException(
+                status_code=499,
+                detail="Client closed request",
+            )
+        finally:
+            body_duration = PerfRecorder.stop(
+                body_start,
+                "pipeline_body_read",
+                labels={"mode": self.mode},
+                log_hint=f"size={body_size}",
+            )
+            if isinstance(perf_metrics, dict):
+                pipeline_metrics = perf_metrics.setdefault("pipeline", {})
+                pipeline_metrics["body_read_ms"] = int((body_duration or 0) * 1000)
+                pipeline_metrics["body_bytes"] = int(body_size)
+
+        return self.raw_body or b""
+
+    async def ensure_json_body_async(self) -> dict[str, Any]:
+        """异步懒加载 JSON 请求体。"""
+        await self.ensure_raw_body_async()
+        return self.ensure_json_body()
 
     def ensure_json_body(self) -> dict[str, Any]:
         """确保请求体已解析为JSON并返回。"""

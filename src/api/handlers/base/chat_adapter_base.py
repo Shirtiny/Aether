@@ -56,6 +56,7 @@ class ChatAdapterBase(HandlerAdapterBase):
     # 适配器配置
     name: str = "chat.base"
     mode = ApiMode.STANDARD
+    eager_request_body = False
 
     async def handle(self, context: ApiRequestContext) -> Any:
         """处理 Chat API 请求"""
@@ -71,7 +72,7 @@ class ChatAdapterBase(HandlerAdapterBase):
         original_headers = context.original_headers
         query_params = context.query_params
 
-        original_request_body = context.ensure_json_body()
+        original_request_body = await context.ensure_json_body_async()
 
         # 合并 path_params 到请求体（如 Gemini API 的 model 在 URL 路径中）
         if context.path_params:

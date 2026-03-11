@@ -8,18 +8,20 @@
 """
 
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import jwt
 import pytest
 
-from src.core.exceptions import ForbiddenException
 from src.core.enums import AuthSource
+from src.core.exceptions import ForbiddenException
 from src.models.database import UserRole
 from src.services.auth.service import (
     JWT_ALGORITHM,
     JWT_EXPIRATION_HOURS,
     JWT_SECRET_KEY,
+    AuthenticatedUserSnapshot,
     AuthService,
 )
 
@@ -234,6 +236,115 @@ class TestUserAuthentication:
         result = await AuthService.authenticate_user(mock_db, "test@example.com", "password123")
 
         assert result is None
+
+    @pytest.mark.asyncio
+    async def test_authenticate_user_threadsafe_uses_isolated_session_for_local_login(self) -> None:
+        mock_user = MagicMock()
+        mock_user.id = "user-123"
+        mock_user.email = "test@example.com"
+        mock_user.username = "tester"
+        mock_user.created_at = datetime.now(timezone.utc)
+        mock_user.is_deleted = False
+        mock_user.is_active = True
+        mock_user.auth_source = AuthSource.LOCAL
+        mock_user.role = UserRole.USER
+        mock_user.verify_password.return_value = True
+
+        thread_db = MagicMock()
+        thread_db.query.return_value.filter.return_value.first.return_value = mock_user
+        route_db = MagicMock()
+
+        with patch("src.services.auth.service.create_session", return_value=thread_db):
+            with patch(
+                "src.services.auth.service.UserCacheService.invalidate_user_cache",
+                new_callable=AsyncMock,
+            ) as invalidate_cache:
+                result = await AuthService.authenticate_user_threadsafe(
+                    route_db,
+                    "test@example.com",
+                    "password123",
+                )
+
+        assert isinstance(result, AuthenticatedUserSnapshot)
+        assert result.user_id == "user-123"
+        assert result.username == "tester"
+        thread_db.commit.assert_called_once()
+        thread_db.close.assert_called_once()
+        route_db.commit.assert_not_called()
+        invalidate_cache.assert_awaited_once_with("user-123", "test@example.com")
+
+    @pytest.mark.asyncio
+    async def test_load_user_for_pipeline_threadsafe_prefetches_balance(self) -> None:
+        mock_user = MagicMock()
+        mock_user.id = "user-123"
+        mock_user.is_active = True
+        mock_user.is_deleted = False
+
+        thread_db = MagicMock()
+        thread_db.query.return_value.filter.return_value.first.return_value = mock_user
+
+        with patch("src.services.auth.service.create_session", return_value=thread_db):
+            with patch(
+                "src.services.wallet.service.WalletService.get_balance_snapshot",
+                return_value=Decimal("7.5"),
+            ):
+                result = await AuthService.load_user_for_pipeline_threadsafe(
+                    "user-123",
+                    include_balance=True,
+                )
+
+        assert result is not None
+        assert result.user == mock_user
+        assert result.balance_remaining == 7.5
+        thread_db.expunge.assert_called_with(mock_user)
+        thread_db.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_authenticate_api_key_threadsafe_returns_balance_and_access_result(self) -> None:
+        mock_user = MagicMock()
+        mock_user.id = "user-123"
+        mock_api_key = MagicMock()
+        mock_api_key.id = "key-123"
+
+        thread_db = MagicMock()
+
+        with patch("src.services.auth.service.create_session", return_value=thread_db):
+            with patch.object(
+                AuthService,
+                "authenticate_api_key",
+                return_value=(mock_user, mock_api_key),
+            ):
+                with patch(
+                    "src.services.usage.service.UsageService.check_request_balance_details",
+                    return_value=MagicMock(allowed=False, message="????", remaining=0.0),
+                ) as mock_balance_details:
+                    with patch(
+                        "src.services.wallet.service.WalletService.get_balance_snapshot"
+                    ) as mock_balance_snapshot:
+                        result = await AuthService.authenticate_api_key_threadsafe("sk-test")
+
+        assert result is not None
+        assert result.user == mock_user
+        assert result.api_key == mock_api_key
+        assert result.access_ok is False
+        assert result.balance_remaining == 0.0
+        assert result.access_message == "????"
+        mock_balance_details.assert_called_once()
+        mock_balance_snapshot.assert_not_called()
+        thread_db.expunge.assert_any_call(mock_user)
+        thread_db.expunge.assert_any_call(mock_api_key)
+        thread_db.close.assert_called_once()
+
+    def test_detach_instance_logs_debug_when_expunge_fails(self) -> None:
+        mock_db = MagicMock()
+        mock_db.expunge.side_effect = RuntimeError("expunge boom")
+        mock_instance = MagicMock()
+
+        with patch("src.services.auth.service.logger.debug") as mock_debug:
+            AuthService._detach_instance(mock_db, mock_instance)
+
+        mock_debug.assert_called_once()
+        assert "expunge failed" in mock_debug.call_args[0][0]
 
 
 class TestAPIKeyAuthentication:
