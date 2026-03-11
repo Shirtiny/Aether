@@ -130,7 +130,7 @@ class UsageActiveRequestsMixin:
 
         while True:
             stale_requests = (
-                db.query(Usage.id, Usage.request_id, Usage.status)
+                db.query(Usage.id, Usage.request_id, Usage.status, Usage.billing_status)
                 .filter(
                     Usage.status.in_(["pending", "streaming"]),
                     Usage.created_at < cutoff_time,
@@ -143,13 +143,13 @@ class UsageActiveRequestsMixin:
             if not stale_requests:
                 break
 
-            stale_request_ids = [request_id for _, request_id, _ in stale_requests if request_id]
+            stale_request_ids = [request_id for _, request_id, _, _ in stale_requests if request_id]
             completed_request_ids = cls._find_completed_request_ids(db, stale_request_ids)
 
             usage_updates = []
             failed_request_ids: list[str] = []
 
-            for usage_id, request_id, old_status in stale_requests:
+            for usage_id, request_id, old_status, billing_status in stale_requests:
                 if request_id and request_id in completed_request_ids:
                     usage_updates.append(
                         {
@@ -161,16 +161,22 @@ class UsageActiveRequestsMixin:
                     )
                     recovered_count += 1
                 else:
-                    usage_updates.append(
-                        {
-                            "id": usage_id,
-                            "status": "failed",
-                            "status_code": 504,
-                            "error_message": (
-                                f"请求超时: 状态 '{old_status}' 超过 {timeout_minutes} 分钟未完成"
-                            ),
-                        }
-                    )
+                    entry: dict[str, Any] = {
+                        "id": usage_id,
+                        "status": "failed",
+                        "status_code": 504,
+                        "error_message": (
+                            f"请求超时: 状态 '{old_status}' 超过 {timeout_minutes} 分钟未完成"
+                        ),
+                    }
+                    if billing_status == "pending":
+                        entry["billing_status"] = "void"
+                        entry["finalized_at"] = now
+                        entry["total_cost_usd"] = 0.0
+                        entry["request_cost_usd"] = 0.0
+                        entry["actual_total_cost_usd"] = 0.0
+                        entry["actual_request_cost_usd"] = 0.0
+                    usage_updates.append(entry)
                     failed_count += 1
                     if request_id:
                         failed_request_ids.append(request_id)

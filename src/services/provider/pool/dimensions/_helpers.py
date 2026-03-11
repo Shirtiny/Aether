@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from typing import Any
 
-from src.core.provider_types import ProviderType
+from src.core.provider_types import ProviderType, normalize_provider_type
 from src.services.provider_keys.quota_reader import get_quota_reader
 
 
@@ -108,8 +108,54 @@ def extract_plan_type(key_obj: Any) -> str | None:
     return None
 
 
-def extract_reset_seconds(key_obj: Any) -> float | None:
+def _resolve_key_provider_type(key_obj: Any, provider_type: str | None = None) -> str | None:
+    explicit = normalize_provider_type(provider_type)
+    if explicit:
+        return explicit
+
+    direct = normalize_provider_type(getattr(key_obj, "provider_type", None))
+    if direct:
+        return direct
+
+    provider = getattr(key_obj, "provider", None)
+    related = normalize_provider_type(getattr(provider, "provider_type", None))
+    if related:
+        return related
+
     metadata = safe_metadata(key_obj)
+    candidates = [
+        provider.value
+        for provider in (ProviderType.CODEX, ProviderType.KIRO, ProviderType.ANTIGRAVITY)
+        if isinstance(metadata.get(provider.value), dict)
+    ]
+    if len(candidates) == 1:
+        return candidates[0]
+
+    return None
+
+
+def _extract_codex_weekly_reset_seconds(metadata: dict[str, Any]) -> float | None:
+    codex = metadata.get(ProviderType.CODEX.value)
+    if not isinstance(codex, dict):
+        return None
+
+    parsed = safe_float(codex.get("primary_reset_seconds"))
+    if parsed is None or parsed < 0:
+        return None
+    return parsed
+
+
+def extract_reset_seconds(key_obj: Any, provider_type: str | None = None) -> float | None:
+    metadata = safe_metadata(key_obj)
+    resolved_provider_type = _resolve_key_provider_type(key_obj, provider_type)
+
+    if resolved_provider_type == ProviderType.CODEX:
+        # Codex metadata 已统一约定：primary_* 表示周限额，secondary_* 表示 5H 限额。
+        return _extract_codex_weekly_reset_seconds(metadata)
+
+    if resolved_provider_type in (ProviderType.KIRO, ProviderType.ANTIGRAVITY):
+        return get_quota_reader(resolved_provider_type, metadata).reset_seconds()
+
     candidates: list[float] = []
 
     for provider_type in (ProviderType.CODEX, ProviderType.KIRO, ProviderType.ANTIGRAVITY):

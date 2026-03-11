@@ -542,6 +542,35 @@ def test_parse_codex_usage_missing_plan_type_infers_paid_windows() -> None:
     assert parsed["secondary_window_minutes"] == 300
 
 
+@pytest.mark.parametrize("plan_type", ["plus", "enterprise"])
+def test_parse_codex_usage_paid_plan_windows_mapping(plan_type: str) -> None:
+    parsed = parse_codex_wham_usage_response(
+        {
+            "plan_type": plan_type,
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 25,
+                    "reset_after_seconds": 600,
+                    "reset_at": 1700000000,
+                    "limit_window_seconds": 18000,
+                },
+                "secondary_window": {
+                    "used_percent": 80,
+                    "reset_after_seconds": 3600,
+                    "reset_at": 1700003600,
+                    "limit_window_seconds": 604800,
+                },
+            },
+        }
+    )
+    assert parsed is not None
+    assert parsed["plan_type"] == plan_type
+    assert parsed["primary_used_percent"] == 80.0
+    assert parsed["secondary_used_percent"] == 25.0
+    assert parsed["primary_window_minutes"] == 10080
+    assert parsed["secondary_window_minutes"] == 300
+
+
 def test_parse_codex_usage_blank_credits_balance_is_ignored() -> None:
     parsed = parse_codex_wham_usage_response(
         {

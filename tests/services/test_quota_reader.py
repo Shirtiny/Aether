@@ -74,6 +74,20 @@ def test_dimension_helpers_delegate_to_unified_reader(monkeypatch: pytest.Monkey
     assert extract_usage_ratio(key_obj) == pytest.approx(0.45)
 
 
+def test_extract_reset_seconds_uses_codex_weekly_reset_for_codex_provider() -> None:
+    key_obj = SimpleNamespace(
+        provider_type="codex",
+        upstream_metadata={
+            "codex": {
+                "primary_reset_seconds": 1800.0,
+                "secondary_reset_seconds": 120.0,
+            }
+        },
+    )
+
+    assert extract_reset_seconds(key_obj) == pytest.approx(1800.0)
+
+
 def test_resolve_pool_account_state_keeps_codex_metadata_block() -> None:
     state = resolve_pool_account_state(
         provider_type="codex",

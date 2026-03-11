@@ -53,7 +53,10 @@ def _index_exists(table_name: str, index_name: str) -> bool:
 def _to_decimal(value: object | None) -> Decimal:
     if value is None:
         return Decimal("0")
-    return Decimal(str(value)).quantize(_MONEY_QUANT, rounding=ROUND_HALF_UP)
+    d = Decimal(str(value))
+    if d.is_nan() or d.is_infinite():
+        return Decimal("0")
+    return d.quantize(_MONEY_QUANT, rounding=ROUND_HALF_UP)
 
 
 # NUMERIC(20, 8) -> 整数部分最多 12 位 -> 绝对值上限

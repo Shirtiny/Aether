@@ -39,9 +39,10 @@ class RecentRefreshDimension(PresetDimensionBase):
         context: dict[str, Any],
         mode: str | None,
     ) -> float:
+        provider_type = context.get("provider_type")
         reset_scores: dict[str, float] = {}
         for kid in all_key_ids:
-            reset_seconds = extract_reset_seconds(keys_by_id.get(kid))
+            reset_seconds = extract_reset_seconds(keys_by_id.get(kid), provider_type=provider_type)
             if reset_seconds is not None:
                 reset_scores[kid] = reset_seconds
         if not reset_scores:

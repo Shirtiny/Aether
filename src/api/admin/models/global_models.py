@@ -427,6 +427,12 @@ class AdminCreateGlobalModelAdapter(AdminApiAdapter):
 
         logger.info(f"GlobalModel 已创建: id={global_model.id} name={global_model.name}")
 
+        # 创建成功后失效缓存（避免 mapping-preview 在 TTL 内读到旧结果）
+        from src.services.cache.invalidation import get_cache_invalidation_service
+
+        cache_service = get_cache_invalidation_service()
+        await cache_service.on_global_model_changed(global_model.name, str(global_model.id))
+
         return GlobalModelResponse.model_validate(global_model)
 
 

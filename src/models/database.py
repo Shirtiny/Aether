@@ -7,7 +7,7 @@ from __future__ import annotations
 import hashlib
 import secrets
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from enum import Enum as PyEnum
 from typing import Any, ClassVar
 
@@ -18,6 +18,7 @@ from sqlalchemy import (
     Boolean,
     CheckConstraint,
     Column,
+    Date,
     DateTime,
     Enum,
     Float,
@@ -413,10 +414,10 @@ class Usage(Base):
     status = Column(String(20), default="completed", nullable=False, index=True)
 
     # 结算状态（与 status 解耦）
-    # - pending: 等待结算（任务未完成 / 流式未结束）
-    # - settled: 已结算（cost 已写入，可能 > 0 或 = 0）
-    # - void: 作废（不收费，如任务未开始就取消）
-    billing_status = Column(String(20), default="settled", nullable=False, index=True)
+    # - pending: 等待结算（请求已创建，但账务尚未进入最终状态）
+    # - settled: 已结算（cost 已写入，且钱包侧结算动作已完成）
+    # - void: 作废（明确不收费）
+    billing_status = Column(String(20), default="pending", nullable=False, index=True)
     finalized_at = Column(DateTime(timezone=True), nullable=True)  # 结算完成时间（可选）
     wallet_balance_before = Column(Numeric(20, 8), nullable=True)  # 结算前可用总余额快照
     wallet_balance_after = Column(Numeric(20, 8), nullable=True)  # 结算后可用总余额快照
@@ -556,6 +557,9 @@ class Wallet(Base):
     transactions = relationship(
         "WalletTransaction", back_populates="wallet", cascade="all, delete-orphan"
     )
+    daily_usage_ledgers = relationship(
+        "WalletDailyUsageLedger", back_populates="wallet", cascade="all, delete-orphan"
+    )
     payment_orders = relationship("PaymentOrder", back_populates="wallet")
     refund_requests = relationship("RefundRequest", back_populates="wallet")
 
@@ -607,6 +611,50 @@ class WalletTransaction(Base):
 
     wallet = relationship("Wallet", back_populates="transactions")
     operator = relationship("User")
+
+
+class WalletDailyUsageLedger(Base):
+    """钱包按天汇总的消费流水投影。"""
+
+    __tablename__ = "wallet_daily_usage_ledgers"
+    __table_args__ = (
+        UniqueConstraint(
+            "wallet_id",
+            "billing_date",
+            "billing_timezone",
+            name="uq_wallet_daily_usage_ledgers_wallet_date_tz",
+        ),
+        Index("idx_wallet_daily_usage_wallet_date", "wallet_id", "billing_date"),
+        Index("idx_wallet_daily_usage_date", "billing_date"),
+    )
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    wallet_id = Column(String(36), ForeignKey("wallets.id", ondelete="CASCADE"), nullable=False)
+
+    billing_date = Column(Date, nullable=False)
+    billing_timezone = Column(String(64), nullable=False, default="Asia/Shanghai")
+
+    total_cost_usd = Column(Numeric(20, 8), nullable=False, default=0)
+    total_requests = Column(Integer, nullable=False, default=0)
+    input_tokens = Column(BigInteger, nullable=False, default=0)
+    output_tokens = Column(BigInteger, nullable=False, default=0)
+    cache_creation_tokens = Column(BigInteger, nullable=False, default=0)
+    cache_read_tokens = Column(BigInteger, nullable=False, default=0)
+
+    first_finalized_at = Column(DateTime(timezone=True), nullable=True)
+    last_finalized_at = Column(DateTime(timezone=True), nullable=True)
+    aggregated_at = Column(DateTime(timezone=True), nullable=False)
+    created_at = Column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    wallet = relationship("Wallet", back_populates="daily_usage_ledgers")
 
 
 class PaymentOrder(Base):
@@ -1760,6 +1808,8 @@ class ProviderAPIKey(ExportMixin, Base):
             "health_by_format",
             "circuit_breaker_by_format",
             "request_count",
+            "total_tokens",
+            "total_cost_usd",
             "success_count",
             "error_count",
             "total_response_time_ms",
@@ -1865,6 +1915,8 @@ class ProviderAPIKey(ExportMixin, Base):
 
     # 使用统计
     request_count = Column(Integer, default=0)  # 请求次数
+    total_tokens = Column(BigInteger, default=0, nullable=False)  # 累计 Token 数
+    total_cost_usd = Column(Numeric(20, 8), default=0.0, nullable=False)  # 累计成本
     success_count = Column(Integer, default=0)  # 成功次数
     error_count = Column(Integer, default=0)  # 错误次数
     total_response_time_ms = Column(Integer, default=0)  # 总响应时间（用于计算平均值）

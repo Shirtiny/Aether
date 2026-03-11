@@ -6,9 +6,14 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Any
 
 from src.core.logger import logger
+
+_PROVIDER_MAPPING_PREVIEW_CACHE_KEY_PREFIX = "admin:providers:mapping-preview:global"
+_PROVIDER_MAPPING_PREVIEW_CACHE_PATTERN = f"{_PROVIDER_MAPPING_PREVIEW_CACHE_KEY_PREFIX}:v:*"
 
 
 class CacheInvalidationService:
@@ -61,6 +66,12 @@ class CacheInvalidationService:
         except Exception as e:
             logger.error(f"[CacheInvalidation] 失效 models list 缓存失败: {e}")
 
+        # 5. 清除 Provider 映射预览缓存（GlobalModel 映射规则变化会影响所有 Provider）
+        try:
+            await self._invalidate_all_provider_mapping_preview_cache()
+        except Exception as e:
+            logger.error(f"[CacheInvalidation] 失效 Provider 映射预览缓存失败: {e}")
+
     def on_model_changed(self, provider_id: str, global_model_id: str) -> Any:
         """Model 变更时的缓存失效"""
         self._refresh_provider_cache(provider_id)
@@ -78,6 +89,12 @@ class CacheInvalidationService:
         logger.info(f"[CacheInvalidation] Key allowed_models 变更: provider_id={provider_id}")
         self._refresh_provider_cache(provider_id)
 
+        # 清除该 Provider 的映射预览缓存（详情页模型映射依赖）
+        try:
+            await self._invalidate_provider_mapping_preview_cache(provider_id)
+        except Exception as e:
+            logger.error(f"[CacheInvalidation] 失效 Provider 映射预览缓存失败: {e}")
+
         # 清除 /v1/models 列表缓存（allowed_models 变更会影响模型可用性）
         from src.services.cache.model_list_cache import invalidate_models_list_cache
 
@@ -91,6 +108,31 @@ class CacheInvalidationService:
         from src.services.model.mapper import ModelMapperMiddleware
 
         ModelMapperMiddleware.refresh_cache(provider_id)
+
+    @staticmethod
+    def _build_provider_mapping_preview_cache_key(provider_id: str) -> str:
+        """构建指定 Provider 的 mapping-preview 缓存键。"""
+        raw = json.dumps(
+            {"provider_id": provider_id},
+            sort_keys=True,
+            ensure_ascii=False,
+            default=str,
+        )
+        vary_hash = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+        return f"{_PROVIDER_MAPPING_PREVIEW_CACHE_KEY_PREFIX}:v:{vary_hash}"
+
+    async def _invalidate_provider_mapping_preview_cache(self, provider_id: str) -> None:
+        """失效指定 Provider 的 mapping-preview 缓存。"""
+        from src.core.cache_service import CacheService
+
+        cache_key = self._build_provider_mapping_preview_cache_key(provider_id)
+        await CacheService.delete(cache_key)
+
+    async def _invalidate_all_provider_mapping_preview_cache(self) -> None:
+        """失效所有 Provider 的 mapping-preview 缓存。"""
+        from src.core.cache_service import CacheService
+
+        await CacheService.delete_pattern(_PROVIDER_MAPPING_PREVIEW_CACHE_PATTERN)
 
     def clear_all_caches(self) -> None:
         """清空所有缓存"""

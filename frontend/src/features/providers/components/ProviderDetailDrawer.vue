@@ -1136,6 +1136,7 @@ const providerModels = ref<Model[]>([])  // Provider 级别的 models
 const providerMappingPreview = ref<ProviderMappingPreviewResponse | null>(null)  // 映射预览
 let providerLoadRequestId = 0
 let endpointsLoadRequestId = 0
+let mappingPreviewLoadRequestId = 0
 
 // 系统级格式转换配置
 const systemFormatConversionEnabled = ref(false)
@@ -1349,6 +1350,7 @@ watch(
       // 使在途请求失效，避免关闭后旧响应回写
       providerLoadRequestId += 1
       endpointsLoadRequestId += 1
+      mappingPreviewLoadRequestId += 1
 
       // 停止倒计时定时器
       stopCountdownTimer()
@@ -1926,7 +1928,7 @@ async function openAntigravityQuotaDialog(key: EndpointAPIKey) {
 }
 
 async function handleKeyChanged() {
-  await loadEndpoints()
+  await Promise.all([loadEndpoints(), loadMappingPreview()])
   emit('refresh')
   // 添加/修改 key 后自动获取 Antigravity 配额（新 key 的 upstream_metadata 为空）
   void autoRefreshQuotaInBackground()
@@ -2015,21 +2017,20 @@ function handleBatchAssign() {
 
 // 处理批量关联完成
 async function handleBatchAssignChanged() {
-  await loadEndpoints()
+  await Promise.all([loadEndpoints(), loadMappingPreview()])
   emit('refresh')
 }
 
 // 处理模型映射变更
 async function handleModelMappingChanged() {
-  void loadMappingPreview()
-  await loadEndpoints()
+  await Promise.all([loadEndpoints(), loadMappingPreview()])
   emit('refresh')
 }
 
 // 处理模型保存完成
 async function handleModelSaved() {
   editingModel.value = null
-  await loadEndpoints()
+  await Promise.all([loadEndpoints(), loadMappingPreview()])
   emit('refresh')
 }
 
@@ -2719,9 +2720,13 @@ async function loadEndpoints() {
 // 加载映射预览（独立于 loadEndpoints，不阻塞首屏渲染）
 async function loadMappingPreview() {
   if (!props.providerId) return
+  const requestId = ++mappingPreviewLoadRequestId
   try {
-    providerMappingPreview.value = await getProviderMappingPreview(props.providerId)
+    const preview = await getProviderMappingPreview(props.providerId)
+    if (requestId !== mappingPreviewLoadRequestId) return
+    providerMappingPreview.value = preview
   } catch {
+    if (requestId !== mappingPreviewLoadRequestId) return
     providerMappingPreview.value = null
   }
 }

@@ -76,19 +76,19 @@
           <!-- 响应式布局：窄屏上下两行，宽屏左右结构 -->
           <div class="flex flex-col sm:flex-row sm:gap-6 sm:items-center">
             <!-- 第一行/左侧：信息区域 -->
-            <div class="sm:w-44 flex-shrink-0 space-y-1.5 mb-3 sm:mb-0">
+            <div class="sm:w-52 flex-shrink-0 space-y-1.5 mb-3 sm:mb-0">
               <!-- API 格式标签和成功率 -->
               <div class="flex items-center gap-2 flex-wrap">
                 <Badge
                   variant="outline"
-                  class="font-mono text-xs"
+                  class="font-mono text-xs whitespace-nowrap"
                 >
                   {{ formatApiFormat(monitor.api_format) }}
                 </Badge>
                 <Badge
                   v-if="monitor.total_attempts > 0"
                   :variant="getSuccessRateVariant(monitor.success_rate)"
-                  class="text-xs"
+                  class="text-xs whitespace-nowrap"
                 >
                   {{ (monitor.success_rate * 100).toFixed(0) }}%
                 </Badge>

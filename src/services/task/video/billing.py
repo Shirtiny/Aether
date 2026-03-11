@@ -92,6 +92,7 @@ class VideoTaskBillingService:
                 provider_api_key_id=getattr(task, "key_id", None),
                 status="completed" if task.status == "completed" else "failed",
                 target_model=None,
+                finalized_at=getattr(task, "completed_at", None),
             )
             return True
         except Exception as exc:
@@ -122,6 +123,8 @@ class VideoTaskBillingService:
         if not request_id:
             return False
 
+        # Advisory check（无锁）：仅用于快速跳过，实际状态转换由 update_settled_billing 的
+        # with_for_update() 保证原子性。
         existing = self.db.query(Usage).filter(Usage.request_id == request_id).first()
         if not existing:
             logger.warning(
@@ -131,12 +134,12 @@ class VideoTaskBillingService:
             )
             return await self._create_fallback_usage_for_video_task(task, request_id)
 
-        metadata = existing.request_metadata or {}
-        if metadata.get("billing_updated_at"):
+        if getattr(existing, "billing_status", None) != "pending":
             logger.debug(
-                "Video task billing already updated: task_id={} request_id={}",
+                "Skip video task billing finalize because Usage is already terminal: task_id={} request_id={} billing_status={}",
                 getattr(task, "id", None),
                 request_id,
+                getattr(existing, "billing_status", None),
             )
             return False
 
@@ -300,6 +303,7 @@ class VideoTaskBillingService:
                     "field": "video_tasks.request_metadata.poll_raw_response",
                 },
             },
+            finalized_at=getattr(task, "completed_at", None),
         )
 
         if updated:

@@ -83,6 +83,17 @@ def test_parse_codex_usage_headers_paid_windows_mapping() -> None:
     assert "credits_balance" not in parsed
 
 
+@pytest.mark.parametrize("plan_type", ["plus", "enterprise"])
+def test_parse_codex_usage_headers_paid_plan_windows_mapping(plan_type: str) -> None:
+    parsed = parse_codex_usage_headers(_paid_headers(**{"x-codex-plan-type": plan_type}))
+    assert parsed is not None
+    assert parsed["plan_type"] == plan_type
+    assert parsed["primary_used_percent"] == 64.0
+    assert parsed["secondary_used_percent"] == 3.0
+    assert parsed["primary_window_minutes"] == 10080
+    assert parsed["secondary_window_minutes"] == 300
+
+
 def test_parse_codex_usage_headers_free_uses_primary_only() -> None:
     parsed = parse_codex_usage_headers(
         {

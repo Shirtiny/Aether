@@ -193,6 +193,7 @@ class PoolManager:
 
         strategy_context.update(
             {
+                "provider_type": provider_type,
                 "all_key_ids": all_key_ids,
                 "lru_scores": lru_scores,
                 "cost_totals": cost_totals,
@@ -561,10 +562,18 @@ class PoolManager:
         if self.config.scheduling_mode == "multi_score":
             health_scores = get_health_scores(pid, keys)
 
+        provider_type = self.provider_type
+        if provider_type is None and keys:
+            first_provider = getattr(keys[0], "provider", None)
+            provider_type = str(getattr(first_provider, "provider_type", "") or "").strip().lower()
+            if not provider_type:
+                provider_type = None
+
         # --- Strategy: compute_score ------------------------------------------
         strategies = _get_active_strategies(self.config)
         strategy_context: dict[str, Any] = {
             "session_uuid": session_uuid,
+            "provider_type": provider_type,
             "all_key_ids": key_ids,
             "lru_scores": lru_scores,
             "cost_totals": cost_totals if _cost_idx_sk >= 0 else {},

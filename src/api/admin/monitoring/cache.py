@@ -1558,6 +1558,12 @@ _CACHE_CATEGORIES: list[tuple[str, str, str, str]] = [
         "model:provider_global:*",
         "Provider-GlobalModel 模型映射缓存",
     ),
+    (
+        "provider_mapping_preview",
+        "映射预览",
+        "admin:providers:mapping-preview:*",
+        "Provider 详情页 mapping-preview 缓存",
+    ),
     ("global_model", "全局模型", "global_model:*", "GlobalModel 缓存（ID/名称/解析）"),
     ("models_list", "模型列表", "models:list:*", "/v1/models 端点模型列表缓存"),
     ("user", "用户", "user:*", "用户信息缓存（ID/Email）"),

@@ -9,7 +9,15 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from src.core.logger import logger
-from src.models.database import ApiKey, Provider, ProxyNode, Usage, User, UserModelUsageCount
+from src.models.database import (
+    ApiKey,
+    Provider,
+    ProviderAPIKey,
+    ProxyNode,
+    Usage,
+    User,
+    UserModelUsageCount,
+)
 from src.services.billing.precision import to_money_decimal
 from src.services.provider_keys.codex_quota_sync_dispatcher import (
     dispatch_codex_quota_sync_from_response_headers,
@@ -24,6 +32,18 @@ from src.services.usage._recording_helpers import (
 )
 from src.services.usage._types import UsageCostInfo, UsageRecordParams
 from src.services.wallet import WalletService
+
+
+def _coerce_finalized_at(value: Any, fallback: datetime | None = None) -> datetime | None:
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return fallback
+    return fallback
 
 
 def _extract_manual_proxy_node_id(metadata: dict[str, Any] | None) -> str | None:
@@ -68,6 +88,41 @@ def _increment_proxy_node_requests(
                 .where(ProxyNode.id == node_id, ProxyNode.is_manual == True)  # noqa: E712
                 .values(**values)
             )
+
+
+def _increment_provider_api_key_totals(
+    db: Session,
+    provider_api_key_id: str | None,
+    *,
+    total_tokens: int = 0,
+    total_cost: float = 0.0,
+) -> None:
+    """原子更新 ProviderAPIKey 统计并刷新最后使用时间。"""
+    if not provider_api_key_id:
+        return
+
+    from sqlalchemy import func as sql_func
+    token_increment = int(total_tokens or 0)
+    cost_increment = to_money_decimal(total_cost)
+
+    from sqlalchemy import update
+
+    values: dict[str, Any] = {
+        "last_used_at": sql_func.now(),
+        "updated_at": sql_func.now(),
+    }
+    if token_increment > 0:
+        values["total_tokens"] = ProviderAPIKey.total_tokens + token_increment
+    if cost_increment > 0:
+        values["total_cost_usd"] = ProviderAPIKey.total_cost_usd + Decimal(str(cost_increment))
+
+    db.execute(
+        update(ProviderAPIKey).where(ProviderAPIKey.id == provider_api_key_id).values(**values)
+    )
+
+
+def _get_actual_total_cost_usd(usage_params: dict[str, Any]) -> float:
+    return float(to_money_decimal(usage_params.get("actual_total_cost_usd") or 0.0))
 
 
 class UsageRecordingMixin(UsageBillingIntegrationMixin):
@@ -131,10 +186,8 @@ class UsageRecordingMixin(UsageBillingIntegrationMixin):
 
     @staticmethod
     def _is_usage_finalized(usage: Usage) -> bool:
-        return (
-            getattr(usage, "billing_status", None) in {"settled", "void"}
-            and getattr(usage, "finalized_at", None) is not None
-        )
+        # 与 UsageLifecycleMixin._is_billing_terminal 语义一致
+        return getattr(usage, "billing_status", None) in {"settled", "void"}
 
     @classmethod
     def _finalize_usage_billing(
@@ -157,10 +210,7 @@ class UsageRecordingMixin(UsageBillingIntegrationMixin):
                 usage.billing_status = "pending"
             return False, False
 
-        if (
-            getattr(usage, "billing_status", None) in {"settled", "void"}
-            and getattr(usage, "finalized_at", None) is not None
-        ):
+        if getattr(usage, "billing_status", None) in {"settled", "void"}:
             return False, False
 
         now = finalized_at or datetime.now(timezone.utc)
@@ -221,6 +271,7 @@ class UsageRecordingMixin(UsageBillingIntegrationMixin):
         cache_ttl_minutes: int | None = None,
         use_tiered_pricing: bool = True,
         target_model: str | None = None,
+        finalized_at: datetime | None = None,
     ) -> Usage:
         """异步记录使用量（简化版，仅插入新记录）
 
@@ -305,12 +356,21 @@ class UsageRecordingMixin(UsageBillingIntegrationMixin):
                 .values(monthly_used_usd=Provider.monthly_used_usd + actual_total_cost)
             )
 
-        cls._finalize_usage_billing(
+        accounted, _charge_applied = cls._finalize_usage_billing(
             db,
             usage=usage,
             total_cost=total_cost,
             status=status,
+            finalized_at=finalized_at,
         )
+
+        if accounted:
+            _increment_provider_api_key_totals(
+                db,
+                provider_api_key_id,
+                total_tokens=int(usage_params.get("total_tokens") or 0),
+                total_cost=_get_actual_total_cost_usd(usage_params),
+            )
 
         dispatch_codex_quota_sync_from_response_headers(
             provider_api_key_id=provider_api_key_id,
@@ -363,6 +423,7 @@ class UsageRecordingMixin(UsageBillingIntegrationMixin):
         cache_ttl_minutes: int | None = None,
         use_tiered_pricing: bool = True,
         target_model: str | None = None,
+        finalized_at: datetime | None = None,
     ) -> Usage:
         """记录使用量（完整版，支持更新已存在记录和用户统计）
 
@@ -464,6 +525,7 @@ class UsageRecordingMixin(UsageBillingIntegrationMixin):
                 usage=usage,
                 total_cost=total_cost,
                 status=status,
+                finalized_at=finalized_at,
             )
 
             if accounted:
@@ -481,6 +543,13 @@ class UsageRecordingMixin(UsageBillingIntegrationMixin):
                     db.execute(
                         sa_update(ApiKeyModel).where(ApiKeyModel.id == api_key.id).values(**values)
                     )
+
+                _increment_provider_api_key_totals(
+                    db,
+                    provider_api_key_id,
+                    total_tokens=int(usage_params.get("total_tokens") or 0),
+                    total_cost=_get_actual_total_cost_usd(usage_params),
+                )
 
                 # 更新 GlobalModel 使用计数
                 db.execute(
@@ -568,6 +637,7 @@ class UsageRecordingMixin(UsageBillingIntegrationMixin):
         provider_api_key_id: str | None = None,
         status: str = "completed",
         target_model: str | None = None,
+        finalized_at: datetime | None = None,
     ) -> Usage:
         """
         记录"已计算好的"成本（用于 Video/Image/Audio 等异步任务的 FormulaEngine 计费结果）。
@@ -690,6 +760,7 @@ class UsageRecordingMixin(UsageBillingIntegrationMixin):
             usage=usage,
             total_cost=total_cost,
             status=status,
+            finalized_at=finalized_at,
         )
 
         if accounted:
@@ -705,6 +776,13 @@ class UsageRecordingMixin(UsageBillingIntegrationMixin):
                         str(total_cost_decimal)
                     )
                 db.execute(update(ApiKeyModel).where(ApiKeyModel.id == api_key.id).values(**values))
+
+            _increment_provider_api_key_totals(
+                db,
+                provider_api_key_id,
+                total_tokens=int(usage_params.get("total_tokens") or 0),
+                total_cost=_get_actual_total_cost_usd(usage_params),
+            )
 
             # 更新 GlobalModel 使用计数
             db.execute(
@@ -842,6 +920,9 @@ class UsageRecordingMixin(UsageBillingIntegrationMixin):
         apikey_stats: dict[str, dict[str, Any]] = defaultdict(
             lambda: {"requests": 0, "cost": 0.0, "is_standalone": False}
         )
+        provider_key_stats: dict[str, dict[str, Any]] = defaultdict(
+            lambda: {"tokens": 0, "actual_cost": 0.0}
+        )
         model_counts: dict[str, int] = defaultdict(int)  # model -> count
         user_model_counts: dict[tuple[str, str], int] = defaultdict(
             int
@@ -961,7 +1042,7 @@ class UsageRecordingMixin(UsageBillingIntegrationMixin):
         update_results = prepared_results[: len(update_params_list)]
         insert_results = prepared_results[len(update_params_list) :]
 
-        finalized_at = datetime.now(timezone.utc)
+        batch_finalized_at = datetime.now(timezone.utc)
 
         # 1. 处理需要更新的记录
         for i, (record, request_id, params) in enumerate(update_params_list):
@@ -982,7 +1063,9 @@ class UsageRecordingMixin(UsageBillingIntegrationMixin):
                     usage=existing_usage,
                     total_cost=total_cost,
                     status=usage_params.get("status"),
-                    finalized_at=finalized_at,
+                    finalized_at=_coerce_finalized_at(
+                        record.get("finalized_at"), batch_finalized_at
+                    ),
                 )
                 usages.append(existing_usage)
                 updated_count += 1
@@ -1005,6 +1088,15 @@ class UsageRecordingMixin(UsageBillingIntegrationMixin):
                         if charge_applied:
                             apikey_stats[key_id]["cost"] += total_cost
                         apikey_stats[key_id]["is_standalone"] = api_key.is_standalone
+
+                    provider_api_key_id = record.get("provider_api_key_id")
+                    if isinstance(provider_api_key_id, str) and provider_api_key_id:
+                        provider_key_stats[provider_api_key_id]["tokens"] += int(
+                            usage_params.get("total_tokens") or 0
+                        )
+                        provider_key_stats[provider_api_key_id][
+                            "actual_cost"
+                        ] += _get_actual_total_cost_usd(usage_params)
 
                     manual_nid = _extract_manual_proxy_node_id(record.get("metadata"))
                     if manual_nid:
@@ -1043,7 +1135,9 @@ class UsageRecordingMixin(UsageBillingIntegrationMixin):
                     usage=usage,
                     total_cost=total_cost,
                     status=usage_params.get("status"),
-                    finalized_at=finalized_at,
+                    finalized_at=_coerce_finalized_at(
+                        record.get("finalized_at"), batch_finalized_at
+                    ),
                 )
                 usages.append(usage)
                 inserted_count += 1
@@ -1067,6 +1161,15 @@ class UsageRecordingMixin(UsageBillingIntegrationMixin):
                         if charge_applied:
                             apikey_stats[key_id]["cost"] += total_cost
                         apikey_stats[key_id]["is_standalone"] = api_key.is_standalone
+
+                    provider_api_key_id = record.get("provider_api_key_id")
+                    if isinstance(provider_api_key_id, str) and provider_api_key_id:
+                        provider_key_stats[provider_api_key_id]["tokens"] += int(
+                            usage_params.get("total_tokens") or 0
+                        )
+                        provider_key_stats[provider_api_key_id][
+                            "actual_cost"
+                        ] += _get_actual_total_cost_usd(usage_params)
 
                     manual_nid = _extract_manual_proxy_node_id(record.get("metadata"))
                     if manual_nid:
@@ -1154,6 +1257,14 @@ class UsageRecordingMixin(UsageBillingIntegrationMixin):
                     last_used_at=sql_func.now(),
                     updated_at=sql_func.now(),
                 )
+            )
+
+        for provider_key_id, stats in provider_key_stats.items():
+            _increment_provider_api_key_totals(
+                db,
+                provider_key_id,
+                total_tokens=int(stats["tokens"]),
+                total_cost=float(stats["actual_cost"]),
             )
 
         # 批量更新手动代理节点请求计数
