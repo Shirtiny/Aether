@@ -1069,9 +1069,9 @@ function editUser(user: User) {
     unlimited: user.unlimited,
     role: user.role,
     is_active: user.is_active,
-    allowed_providers: [...(user.allowed_providers || [])],
-    allowed_api_formats: [...(user.allowed_api_formats || [])],
-    allowed_models: [...(user.allowed_models || [])]
+    allowed_providers: user.allowed_providers == null ? null : [...user.allowed_providers],
+    allowed_api_formats: user.allowed_api_formats == null ? null : [...user.allowed_api_formats],
+    allowed_models: user.allowed_models == null ? null : [...user.allowed_models]
   }
   showUserFormDialog.value = true
 }

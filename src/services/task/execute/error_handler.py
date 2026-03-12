@@ -199,7 +199,10 @@ class TaskErrorOperationsService:
         - "raise": raise the underlying exception
         """
         from src.core.api_format.conversion.exceptions import FormatConversionError
-        from src.services.proxy_node.resolver import resolve_effective_proxy, resolve_proxy_info
+        from src.services.proxy_node.resolver import (
+            resolve_effective_proxy,
+            resolve_proxy_info_async,
+        )
         from src.services.request.executor import ExecutionError
 
         # 提前解析代理信息，写入候选记录的 extra_data（用于链路追踪展示）
@@ -207,7 +210,7 @@ class TaskErrorOperationsService:
             getattr(candidate.provider, "proxy", None),
             getattr(candidate.key, "proxy", None),
         )
-        _proxy_info = resolve_proxy_info(_eff_proxy)
+        _proxy_info = await resolve_proxy_info_async(_eff_proxy)
         _proxy_extra: dict[str, Any] | None = {"proxy": _proxy_info} if _proxy_info else None
 
         if not isinstance(exec_err, ExecutionError):

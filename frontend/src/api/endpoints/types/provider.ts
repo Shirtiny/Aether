@@ -12,6 +12,13 @@ export interface ProxyConfig {
   enabled?: boolean   // 是否启用代理（false 时保留配置但不使用）
 }
 
+export interface OAuthOrganizationInfo {
+  id?: string | null
+  title?: string | null
+  is_default?: boolean | null
+  role?: string | null
+}
+
 /**
  * 请求头规则类型
  * - set: 设置/覆盖请求头
@@ -264,6 +271,8 @@ export interface EndpointAPIKey {
   oauth_email?: string | null  // OAuth 授权的邮箱
   oauth_plan_type?: string | null  // Codex 订阅类型: plus/free/team/enterprise
   oauth_account_id?: string | null  // Codex ChatGPT 账号 ID
+  oauth_account_user_id?: string | null  // Codex ChatGPT account-user 联合 ID
+  oauth_organizations?: OAuthOrganizationInfo[] | null  // OAuth 关联组织/工作区摘要
   oauth_invalid_at?: number | null  // OAuth Token 失效时间（Unix 时间戳）
   oauth_invalid_reason?: string | null  // OAuth Token 失效原因
   // 上游元数据（由上游响应采集，如 Codex 额度信息 / Antigravity 配额信息）

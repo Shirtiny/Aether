@@ -12,6 +12,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from src.core.logger import logger
+from src.core.validators import PasswordPolicyLevel
 from src.models.database import Provider, SystemConfig
 
 REQUEST_RECORD_LEVEL_KEY = "request_record_level"
@@ -97,6 +98,10 @@ class SystemConfigService:
         "default_user_initial_gift_usd": {
             "value": 10.0,
             "description": "新用户默认初始赠款（美元）",
+        },
+        "password_policy_level": {
+            "value": PasswordPolicyLevel.WEAK.value,
+            "description": "密码策略等级：weak(弱密码), medium(中等强度), strong(强密码)",
         },
         REQUEST_RECORD_LEVEL_KEY: {
             "value": RequestRecordLevel.BASIC.value,
@@ -296,6 +301,13 @@ class SystemConfigService:
         db: Session, key: str, value: Any, description: str | None = None
     ) -> SystemConfig:
         """设置系统配置值"""
+        if key == "password_policy_level":
+            normalized = str(value).strip().lower() if value is not None else ""
+            value = (
+                PasswordPolicyLevel(normalized).value
+                if normalized
+                else PasswordPolicyLevel.WEAK.value
+            )
         # Backward-compatible alias: request_log_level -> request_record_level
         if key in {REQUEST_RECORD_LEVEL_KEY, _LEGACY_REQUEST_LOG_LEVEL_KEY}:
             config = (
@@ -353,6 +365,18 @@ class SystemConfigService:
         invalidate_config_cache(key)
 
         return config
+
+    @staticmethod
+    def get_password_policy_level(db: Session) -> str:
+        """获取密码策略等级，异常值自动回退为弱策略。"""
+        value = SystemConfigService.get_config(
+            db, "password_policy_level", PasswordPolicyLevel.WEAK.value
+        )
+        return (
+            PasswordPolicyLevel(value).value
+            if value in PasswordPolicyLevel._value2member_map_
+            else PasswordPolicyLevel.WEAK.value
+        )
 
     @staticmethod
     def get_default_provider(db: Session) -> str | None:

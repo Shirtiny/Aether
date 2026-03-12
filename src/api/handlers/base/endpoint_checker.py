@@ -161,29 +161,43 @@ async def _calculate_and_record_usage(
     from src.services.request.candidate import RequestCandidateService
     from src.services.usage.service import UsageService
 
-    # 获取Provider API Key对象（不是用户API Key）
-    provider_api_key = db.query(ProviderAPIKey).filter(ProviderAPIKey.id == api_key_id).first()
+    def _load_usage_context() -> tuple[Any, Any, Any]:
+        # 获取Provider API Key对象（不是用户API Key）
+        provider_api_key_local = (
+            db.query(ProviderAPIKey).filter(ProviderAPIKey.id == api_key_id).first()
+        )
+        if not provider_api_key_local:
+            return None, None, None
+
+        provider_endpoint_local = None
+        if api_format and provider_api_key_local.provider_id:
+            from src.models.database import Provider
+
+            provider = (
+                db.query(Provider).filter(Provider.id == provider_api_key_local.provider_id).first()
+            )
+            if provider:
+                for ep in provider.endpoints:
+                    if ep.api_format == api_format:
+                        provider_endpoint_local = ep
+                        break
+
+        user_api_key_local = None
+        if user:
+            try:
+                user_api_key_local = db.query(ApiKey).filter(ApiKey.user_id == user.id).first()
+            except Exception:
+                user_api_key_local = None
+
+        return provider_api_key_local, provider_endpoint_local, user_api_key_local
+
+    provider_api_key, provider_endpoint, user_api_key = await asyncio.to_thread(_load_usage_context)
     if not provider_api_key:
         logger.warning(f"Provider API Key not found for usage calculation: {api_key_id}")
         return {"error": "Provider API Key not found"}
 
-    # 获取Provider Endpoint信息（通过 api_format 查找）
-    provider_endpoint = None
-    if api_format and provider_api_key.provider_id:
-        from src.models.database import Provider
-
-        provider = db.query(Provider).filter(Provider.id == provider_api_key.provider_id).first()
-        if provider:
-            for ep in provider.endpoints:
-                if ep.api_format == api_format:
-                    provider_endpoint = ep
-                    break
-
-    # 获取用户的API Key（用于记录关联，即使实际使用的是Provider API Key）
-    user_api_key = None
     if user:
         try:
-            user_api_key = db.query(ApiKey).filter(ApiKey.user_id == user.id).first()
             logger.info(
                 f"[endpoint_check] User API Key found: {user_api_key.id if user_api_key else None}"
             )
@@ -317,45 +331,46 @@ async def _calculate_and_record_usage(
 
         # 创建RequestCandidate记录，用于监控追踪API
         try:
-            # 首先创建候选记录
-            candidate = RequestCandidateService.create_candidate(
-                db=db,
-                request_id=f"test_{request_id}",
-                candidate_index=0,  # 测试请求只有一个候选
-                user_id=user.id if user else None,
-                api_key_id=user_api_key.id if user_api_key else None,
-                provider_id=provider_id,
-                endpoint_id=provider_endpoint.id if provider_endpoint else None,
-                key_id=api_key_id,
-                status="available",
-                extra_data={"model_name": model_name, "request_type": "endpoint_test"},
-            )
 
-            # 立即标记为开始执行
-            RequestCandidateService.mark_candidate_started(db, candidate.id)
-
-            # 根据结果标记为成功或失败
-            if status_code == 200:
-                RequestCandidateService.mark_candidate_success(
+            def _record_candidate_sync() -> str:
+                candidate = RequestCandidateService.create_candidate(
                     db=db,
-                    candidate_id=candidate.id,
-                    status_code=status_code,
-                    latency_ms=response_time_ms,
-                    extra_data={"model_name": model_name, "api_format": api_format},
-                )
-            else:
-                RequestCandidateService.mark_candidate_failed(
-                    db=db,
-                    candidate_id=candidate.id,
-                    error_type="http_error" if status_code > 0 else "network_error",
-                    error_message=error_message or "Unknown error",
-                    status_code=status_code,
-                    latency_ms=response_time_ms,
-                    extra_data={"model_name": model_name, "api_format": api_format},
+                    request_id=f"test_{request_id}",
+                    candidate_index=0,  # 测试请求只有一个候选
+                    user_id=user.id if user else None,
+                    api_key_id=user_api_key.id if user_api_key else None,
+                    provider_id=provider_id,
+                    endpoint_id=provider_endpoint.id if provider_endpoint else None,
+                    key_id=api_key_id,
+                    status="available",
+                    extra_data={"model_name": model_name, "request_type": "endpoint_test"},
                 )
 
+                RequestCandidateService.mark_candidate_started(db, candidate.id)
+
+                if status_code == 200:
+                    RequestCandidateService.mark_candidate_success(
+                        db=db,
+                        candidate_id=candidate.id,
+                        status_code=status_code,
+                        latency_ms=response_time_ms,
+                        extra_data={"model_name": model_name, "api_format": api_format},
+                    )
+                else:
+                    RequestCandidateService.mark_candidate_failed(
+                        db=db,
+                        candidate_id=candidate.id,
+                        error_type="http_error" if status_code > 0 else "network_error",
+                        error_message=error_message or "Unknown error",
+                        status_code=status_code,
+                        latency_ms=response_time_ms,
+                        extra_data={"model_name": model_name, "api_format": api_format},
+                    )
+                return str(candidate.id)
+
+            candidate_id = await asyncio.to_thread(_record_candidate_sync)
             logger.info(
-                f"[endpoint_check] RequestCandidate created | request_id=test_{request_id}, candidate_id={candidate.id}"
+                f"[endpoint_check] RequestCandidate created | request_id=test_{request_id}, candidate_id={candidate_id}"
             )
         except Exception as e:
             logger.warning(f"[endpoint_check] Failed to create RequestCandidate: {e}")

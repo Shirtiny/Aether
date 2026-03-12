@@ -18,8 +18,10 @@ def test_parse_codex_id_token_extracts_auth_claim_fields() -> None:
             "email": "u@example.com",
             "https://api.openai.com/auth": {
                 "chatgpt_account_id": "acc-1",
+                "chatgpt_account_user_id": "user-1__acc-1",
                 "chatgpt_plan_type": "team",
                 "chatgpt_user_id": "user-1",
+                "organizations": [{"id": "org-1", "title": "Personal", "is_default": True}],
             },
         }
     )
@@ -29,8 +31,10 @@ def test_parse_codex_id_token_extracts_auth_claim_fields() -> None:
     assert parsed == {
         "email": "u@example.com",
         "account_id": "acc-1",
+        "account_user_id": "user-1__acc-1",
         "plan_type": "team",
         "user_id": "user-1",
+        "organizations": [{"id": "org-1", "title": "Personal", "is_default": True}],
     }
 
 

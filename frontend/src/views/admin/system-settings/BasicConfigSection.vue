@@ -54,6 +54,40 @@
         </p>
       </div>
 
+      <div>
+        <Label
+          for="password-policy-level"
+          class="block text-sm font-medium mb-2"
+        >
+          密码策略
+        </Label>
+        <Select
+          :model-value="passwordPolicyLevel"
+          @update:model-value="$emit('update:passwordPolicyLevel', $event)"
+        >
+          <SelectTrigger
+            id="password-policy-level"
+            class="mt-1"
+          >
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="weak">
+              弱密码 - 至少 6 个字符
+            </SelectItem>
+            <SelectItem value="medium">
+              中等密码 - 至少 8 位，含字母和数字
+            </SelectItem>
+            <SelectItem value="strong">
+              强密码 - 至少 8 位，含大小写字母、数字和特殊字符
+            </SelectItem>
+          </SelectContent>
+        </Select>
+        <p class="mt-1 text-xs text-muted-foreground">
+          影响注册、创建用户、重置/修改密码的校验规则
+        </p>
+      </div>
+
       <div class="flex items-center h-full">
         <div class="flex items-center space-x-2">
           <Checkbox
@@ -125,12 +159,18 @@ import Button from '@/components/ui/button.vue'
 import Input from '@/components/ui/input.vue'
 import Label from '@/components/ui/label.vue'
 import Checkbox from '@/components/ui/checkbox.vue'
+import Select from '@/components/ui/select.vue'
+import SelectTrigger from '@/components/ui/select-trigger.vue'
+import SelectValue from '@/components/ui/select-value.vue'
+import SelectContent from '@/components/ui/select-content.vue'
+import SelectItem from '@/components/ui/select-item.vue'
 import { CardSection } from '@/components/layout'
 
 defineProps<{
   defaultUserInitialGiftUsd: number
   rateLimitPerMinute: number
   enableRegistration: boolean
+  passwordPolicyLevel: string
   autoDeleteExpiredKeys: boolean
   enableFormatConversion: boolean
   loading: boolean
@@ -142,6 +182,7 @@ defineEmits<{
   'update:defaultUserInitialGiftUsd': [value: number]
   'update:rateLimitPerMinute': [value: number]
   'update:enableRegistration': [value: boolean]
+  'update:passwordPolicyLevel': [value: string]
   'update:autoDeleteExpiredKeys': [value: boolean]
   'update:enableFormatConversion': [value: boolean]
 }>()

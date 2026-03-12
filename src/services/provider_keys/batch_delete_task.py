@@ -19,6 +19,7 @@ from sqlalchemy import text
 
 from src.clients.redis_client import get_redis_client
 from src.core.logger import logger
+from src.services.provider_keys.key_side_effects import cleanup_key_references
 
 # 任务状态
 STATUS_PENDING = "pending"
@@ -183,7 +184,7 @@ def _sync_delete(
 ) -> int:
     """在线程中执行的同步删除逻辑，避免阻塞事件循环。
 
-    按小批次（_CLEANUP_BATCH_SIZE）直接删除 key，依赖数据库 CASCADE/SET NULL 自动清理关联表。
+    按小批次（_CLEANUP_BATCH_SIZE）先显式处理关联表，再删除 key。
     每个批次独立事务，单批失败跳过并继续。
     """
     from src.database import create_session
@@ -212,6 +213,7 @@ def _sync_delete(
                 # 设置 statement_timeout，防止单条 SQL 无限等锁
                 timeout_ms = _BATCH_STATEMENT_TIMEOUT_S * 1000
                 db.execute(text(f"SET LOCAL statement_timeout = '{timeout_ms}'"))
+                cleanup_key_references(db, batch)
                 result = db.execute(
                     sa_delete(ProviderAPIKey).where(
                         ProviderAPIKey.provider_id == provider_id,

@@ -8,12 +8,14 @@ from __future__ import annotations
 import hashlib
 from typing import Any
 
-from fastapi import Depends, Header, HTTPException, status
+from fastapi import Depends, Header, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
 from src.core.logger import logger
+from src.models.database import ManagementToken
 from src.services.auth.service import AuthService
+from src.utils.request_utils import get_client_ip
 
 from ..core.exceptions import ForbiddenException
 from ..database import get_db
@@ -22,8 +24,91 @@ from ..models.database import User, UserRole
 security = HTTPBearer()
 
 
+async def authenticate_user_from_bearer_token(
+    token: str,
+    db: Session,
+    request: Request | None = None,
+) -> User:
+    if token.startswith(ManagementToken.TOKEN_PREFIX):
+        client_ip = get_client_ip(request) if request is not None else "unknown"
+        result = await AuthService.authenticate_management_token(db, token, client_ip)
+        if not result:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="无效的Token")
+
+        user, management_token = result
+        if request is not None:
+            request.state.user_id = user.id
+            request.state.management_token_id = management_token.id
+        return user
+
+    # 验证Token格式和签名
+    try:
+        payload = await AuthService.verify_token(token, token_type="access")
+    except HTTPException as token_error:
+        token_fp = hashlib.sha256(token.encode()).hexdigest()[:12]
+        logger.error(
+            "Token验证失败: {}: {}, token_fp={}",
+            token_error.status_code,
+            token_error.detail,
+            token_fp,
+        )
+        raise
+    except Exception as token_error:
+        token_fp = hashlib.sha256(token.encode()).hexdigest()[:12]
+        logger.error("Token验证失败: {}, token_fp={}", token_error, token_fp)
+        raise ForbiddenException("无效的Token")
+
+    user_id = payload.get("user_id")
+
+    if not user_id:
+        logger.error("Token缺少user_id字段: payload={}", payload)
+        raise ForbiddenException("无效的认证凭据")
+
+    token_fp = hashlib.sha256(token.encode()).hexdigest()[:12]
+
+    if not isinstance(user_id, str):
+        logger.error("Token中user_id格式错误: {} - {}", type(user_id), user_id)
+        raise ForbiddenException("认证信息格式错误，请重新登录")
+
+    try:
+        from src.services.user.service import UserService
+
+        user = UserService.get_user(db, user_id)
+    except Exception as db_error:
+        logger.error("数据库查询失败: user_id={}, error={}", user_id, db_error)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="数据库查询失败，请稍后重试",
+        )
+
+    if not user:
+        logger.error("用户不存在: user_id={}", user_id)
+        raise ForbiddenException("用户不存在或已禁用")
+
+    if not user.is_active:
+        logger.error("用户已禁用: user_id={}", user_id)
+        raise ForbiddenException("用户不存在或已禁用")
+
+    if user.is_deleted:
+        logger.error("用户已删除: user_id={}", user_id)
+        raise ForbiddenException("用户不存在或已禁用")
+
+    if not AuthService.token_identity_matches_user(payload, user):
+        logger.error("Token身份校验失败: user_id={}, token_fp={}", user_id, token_fp)
+        raise ForbiddenException("身份验证失败")
+
+    if request is not None:
+        request.state.user_id = user.id
+        if hasattr(request.state, "management_token_id"):
+            request.state.management_token_id = None
+
+    return user
+
+
 async def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(security), db: Session = Depends(get_db)
+    request: Request,
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: Session = Depends(get_db),
 ) -> User:
     """
     获取当前登录用户
@@ -39,71 +124,8 @@ async def get_current_user(
     Raises:
         HTTPException: 认证失败时抛出
     """
-    token = credentials.credentials
-
     try:
-        # 验证Token格式和签名
-        try:
-            payload = await AuthService.verify_token(token, token_type="access")
-        except HTTPException as token_error:
-            # 保持原始的HTTP状态码（如401 Unauthorized），不要转换为403
-            token_fp = hashlib.sha256(token.encode()).hexdigest()[:12]
-            logger.error(
-                "Token验证失败: {}: {}, token_fp={}",
-                token_error.status_code,
-                token_error.detail,
-                token_fp,
-            )
-            raise  # 重新抛出原始异常，保持状态码
-        except Exception as token_error:
-            token_fp = hashlib.sha256(token.encode()).hexdigest()[:12]
-            logger.error("Token验证失败: {}, token_fp={}", token_error, token_fp)
-            raise ForbiddenException("无效的Token")
-
-        user_id = payload.get("user_id")
-
-        if not user_id:
-            logger.error("Token缺少user_id字段: payload={}", payload)
-            raise ForbiddenException("无效的认证凭据")
-
-        # 兼容旧 token：email 字段可能存在；新 token 不再包含 email（支持无邮箱用户）
-
-        token_fp = hashlib.sha256(token.encode()).hexdigest()[:12]
-
-        # 确保user_id是字符串格式（UUID）
-        if not isinstance(user_id, str):
-            logger.error("Token中user_id格式错误: {} - {}", type(user_id), user_id)
-            raise ForbiddenException("认证信息格式错误，请重新登录")
-
-        # 使用新的数据库会话获取用户，避免会话状态问题
-        try:
-            from src.services.user.service import UserService
-
-            user = UserService.get_user(db, user_id)
-        except Exception as db_error:
-            logger.error("数据库查询失败: user_id={}, error={}", user_id, db_error)
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="数据库查询失败，请稍后重试",
-            )
-
-        if not user:
-            logger.error("用户不存在: user_id={}", user_id)
-            raise ForbiddenException("用户不存在或已禁用")
-
-        if not user.is_active:
-            logger.error("用户已禁用: user_id={}", user_id)
-            raise ForbiddenException("用户不存在或已禁用")
-
-        if user.is_deleted:
-            logger.error("用户已删除: user_id={}", user_id)
-            raise ForbiddenException("用户不存在或已禁用")
-
-        if not AuthService.token_identity_matches_user(payload, user):
-            logger.error("Token身份校验失败: user_id={}, token_fp={}", user_id, token_fp)
-            raise ForbiddenException("身份验证失败")
-
-        return user
+        return await authenticate_user_from_bearer_token(credentials.credentials, db, request)
 
     except HTTPException:
         raise
@@ -116,7 +138,9 @@ async def get_current_user(
 
 
 async def get_current_user_from_header(
-    authorization: str | None = Header(None), db: Session = Depends(get_db)
+    request: Request,
+    authorization: str | None = Header(None),
+    db: Session = Depends(get_db),
 ) -> User:
     """
     从Header中获取当前用户（兼容性函数）
@@ -134,29 +158,12 @@ async def get_current_user_from_header(
     if not authorization or not authorization.startswith("Bearer "):
         raise ForbiddenException("未提供认证令牌")
 
-    token = authorization.replace("Bearer ", "")
-
     try:
-        payload = await AuthService.verify_token(token, token_type="access")
-        user_id = payload.get("user_id")
-
-        if not user_id:
-            raise ForbiddenException("无效的认证凭据")
-
-        user = db.query(User).filter(User.id == user_id).first()
-        if not user:
-            raise ForbiddenException("用户不存在")
-
-        if not user.is_active:
-            raise ForbiddenException("用户已被禁用")
-
-        if user.is_deleted:
-            raise ForbiddenException("用户不存在或已禁用")
-
-        if not AuthService.token_identity_matches_user(payload, user):
-            raise ForbiddenException("身份验证失败")
-
-        return user
+        return await authenticate_user_from_bearer_token(
+            authorization.replace("Bearer ", ""),
+            db,
+            request,
+        )
     except HTTPException:
         # 保持原始的HTTPException (包括401)
         raise

@@ -66,6 +66,13 @@ class PoolSchedulingReason(BaseModel):
     detail: str | None = None
 
 
+class OAuthOrganizationSummary(BaseModel):
+    id: str | None = None
+    title: str | None = None
+    is_default: bool = False
+    role: str | None = None
+
+
 class PoolKeyDetail(BaseModel):
     """Detailed status of a single pool key."""
 
@@ -77,6 +84,9 @@ class PoolKeyDetail(BaseModel):
     oauth_invalid_at: int | None = None
     oauth_invalid_reason: str | None = None
     oauth_plan_type: str | None = None
+    oauth_account_id: str | None = None
+    oauth_account_user_id: str | None = None
+    oauth_organizations: list[OAuthOrganizationSummary] = Field(default_factory=list)
     quota_updated_at: int | None = None
     # 健康度聚合字段（与 Provider Key 列表口径一致）
     health_score: float = 1.0
@@ -156,6 +166,27 @@ class BatchImportResponse(BaseModel):
     imported: int = 0
     skipped: int = 0
     errors: list[BatchImportError] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Batch selection
+# ---------------------------------------------------------------------------
+
+
+class PoolKeySelectionRequest(BaseModel):
+    search: str = ""
+    quick_selectors: list[str] = Field(default_factory=list, max_length=10)
+
+
+class PoolKeySelectionItem(BaseModel):
+    key_id: str
+    key_name: str = ""
+    auth_type: str = "api_key"
+
+
+class PoolKeySelectionResponse(BaseModel):
+    total: int = 0
+    items: list[PoolKeySelectionItem] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------

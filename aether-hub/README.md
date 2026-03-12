@@ -28,6 +28,11 @@ cd /path/to/Aether
 - `--load`: 加载到本地 Docker（单平台）
 - `--latest`: 额外打 `latest` tag
 
+## 运行时参数
+
+- `TUNNEL_HUB_WORKER_IDLE_TIMEOUT`：worker 心跳空闲超时，默认 `60` 秒
+- `TUNNEL_HUB_OUTBOUND_QUEUE_CAPACITY`：单连接出站队列容量，默认 `128`；队列打满时会把连接视为拥塞并主动关闭，避免 Hub 内存无限增长
+
 ## 与部署脚本关系
 
 - `./deploy.sh`: 本地构建部署（会本地构建 app/base，并在构建 app 时从 GitHub Release 下载 Hub，可用 `--hub-tag` 固定版本）。

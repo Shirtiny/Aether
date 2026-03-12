@@ -930,11 +930,11 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
         from src.services.proxy_node.resolver import (
             get_proxy_label,
             resolve_effective_proxy,
-            resolve_proxy_info,
+            resolve_proxy_info_async,
         )
 
         effective_proxy = resolve_effective_proxy(provider.proxy, getattr(key, "proxy", None))
-        ctx.proxy_info = resolve_proxy_info(effective_proxy)
+        ctx.proxy_info = await resolve_proxy_info_async(effective_proxy)
         proxy_label = get_proxy_label(ctx.proxy_info)
 
         logger.debug(
@@ -946,10 +946,13 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
         # simulate streaming to the client (sync -> stream bridge).
         if not upstream_is_stream:
             from src.clients.http_client import HTTPClientPool
-            from src.services.proxy_node.resolver import build_post_kwargs, resolve_delegate_config
+            from src.services.proxy_node.resolver import (
+                build_post_kwargs_async,
+                resolve_delegate_config_async,
+            )
 
             request_timeout_sync = provider.request_timeout or config.http_request_timeout
-            delegate_cfg = resolve_delegate_config(effective_proxy)
+            delegate_cfg = await resolve_delegate_config_async(effective_proxy)
             http_client = await HTTPClientPool.get_upstream_client(
                 delegate_cfg,
                 proxy_config=effective_proxy,
@@ -957,7 +960,7 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
             )
 
             try:
-                _pkw = build_post_kwargs(
+                _pkw = await build_post_kwargs_async(
                     delegate_cfg,
                     url=url,
                     headers=provider_headers,
@@ -997,7 +1000,7 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
                         ctx.provider_request_headers = provider_headers
 
                     # retry once
-                    _pkw = build_post_kwargs(
+                    _pkw = await build_post_kwargs_async(
                         delegate_cfg,
                         url=url,
                         headers=provider_headers,
@@ -1147,9 +1150,12 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
         # 获取 HTTP 客户端（支持代理配置，Key 级别优先于 Provider 级别）
         # 使用连接池复用客户端，避免每次流式请求都新建 TCP/TLS 连接
         from src.clients.http_client import HTTPClientPool
-        from src.services.proxy_node.resolver import build_stream_kwargs, resolve_delegate_config
+        from src.services.proxy_node.resolver import (
+            build_stream_kwargs_async,
+            resolve_delegate_config_async,
+        )
 
-        delegate_cfg = resolve_delegate_config(effective_proxy)
+        delegate_cfg = await resolve_delegate_config_async(effective_proxy)
         http_client = await HTTPClientPool.get_upstream_client(
             delegate_cfg,
             proxy_config=effective_proxy,
@@ -1164,7 +1170,7 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
         async def _connect_and_prefetch() -> None:
             """建立连接并预读首字节（受整体超时控制）"""
             nonlocal byte_iterator, prefetched_chunks, response_ctx
-            _skw = build_stream_kwargs(
+            _skw = await build_stream_kwargs_async(
                 delegate_cfg,
                 url=url,
                 headers=provider_headers,

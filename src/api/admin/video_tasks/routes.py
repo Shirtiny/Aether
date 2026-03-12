@@ -144,7 +144,7 @@ async def proxy_video_stream(
     **返回**:
     - 视频流
     """
-    from src.services.auth.service import AuthService
+    from src.utils.auth_utils import authenticate_user_from_bearer_token
 
     # 尝试从多个来源获取 token：query param > cookie > header
     auth_token = token
@@ -159,15 +159,7 @@ async def proxy_video_stream(
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     try:
-        # 验证 token 并获取 payload
-        payload = await AuthService.verify_token(auth_token, token_type="access")
-        user_id = payload.get("user_id") or payload.get("sub")
-        if not user_id:
-            raise HTTPException(status_code=401, detail="Unauthorized")
-        # 查询用户
-        user = db.query(User).filter(User.id == user_id).first()
-        if not user:
-            raise HTTPException(status_code=401, detail="Unauthorized")
+        user = await authenticate_user_from_bearer_token(auth_token, db, request)
     except HTTPException:
         raise
     except Exception:

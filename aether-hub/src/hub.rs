@@ -2,16 +2,88 @@
 ///
 /// Manages proxy connections (node_id -> [ProxyConn]) and worker connections (conn_id -> WorkerConn).
 /// Routes frames between workers and proxies with stream_id remapping.
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::ws::Message;
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 use crate::protocol;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendStatus {
+    Queued,
+    Closed,
+    Congested,
+}
+
+// ---------------------------------------------------------------------------
+// Connection configuration (shared by proxy and worker handlers)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy)]
+pub struct ConnConfig {
+    pub ping_interval: Duration,
+    pub idle_timeout: Duration,
+    pub outbound_queue_capacity: usize,
+}
+
+// ---------------------------------------------------------------------------
+// Bounded outbound channel with congestion-aware close
+// ---------------------------------------------------------------------------
+
+pub struct BoundedOutbound {
+    tx: mpsc::Sender<Message>,
+    close_tx: watch::Sender<bool>,
+    closing: AtomicBool,
+}
+
+impl BoundedOutbound {
+    pub fn new(tx: mpsc::Sender<Message>, close_tx: watch::Sender<bool>) -> Self {
+        Self {
+            tx,
+            close_tx,
+            closing: AtomicBool::new(false),
+        }
+    }
+
+    pub fn send(&self, msg: Message) -> SendStatus {
+        if self.is_closing() {
+            return SendStatus::Closed;
+        }
+
+        match self.tx.try_send(msg) {
+            Ok(()) => SendStatus::Queued,
+            Err(TrySendError::Closed(_)) => {
+                self.mark_closing();
+                SendStatus::Closed
+            }
+            Err(TrySendError::Full(_)) => {
+                self.mark_closing();
+                SendStatus::Congested
+            }
+        }
+    }
+
+    pub fn is_closing(&self) -> bool {
+        self.closing.load(Ordering::Acquire)
+    }
+
+    /// Mark as closing. Returns `true` if this call was the first to flip the flag.
+    pub fn mark_closing(&self) -> bool {
+        if self.closing.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        let _ = self.close_tx.send(true);
+        true
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Proxy connection
@@ -21,7 +93,7 @@ pub struct ProxyConn {
     pub id: u64,
     pub node_id: String,
     pub node_name: String,
-    pub tx: mpsc::UnboundedSender<Message>,
+    pub outbound: BoundedOutbound,
     next_stream_id: AtomicU32,
     pub stream_count: AtomicUsize,
     pub max_streams: usize,
@@ -32,14 +104,15 @@ impl ProxyConn {
         id: u64,
         node_id: String,
         node_name: String,
-        tx: mpsc::UnboundedSender<Message>,
+        tx: mpsc::Sender<Message>,
+        close_tx: watch::Sender<bool>,
         max_streams: usize,
     ) -> Self {
         Self {
             id,
             node_id,
             node_name,
-            tx,
+            outbound: BoundedOutbound::new(tx, close_tx),
             next_stream_id: AtomicU32::new(2), // even IDs, start at 2
             stream_count: AtomicUsize::new(0),
             max_streams,
@@ -51,7 +124,7 @@ impl ProxyConn {
         // Reserve one stream slot first (CAS to honor max_streams under contention).
         let mut current = self.stream_count.load(Ordering::Relaxed);
         loop {
-            if current >= self.max_streams {
+            if current >= self.max_streams || !self.is_available() {
                 return None;
             }
             match self.stream_count.compare_exchange_weak(
@@ -99,8 +172,27 @@ impl ProxyConn {
         }
     }
 
-    pub fn send(&self, msg: Message) -> bool {
-        self.tx.send(msg).is_ok()
+    pub fn is_available(&self) -> bool {
+        !self.outbound.is_closing()
+    }
+
+    pub fn request_close(&self) {
+        self.outbound.mark_closing();
+    }
+
+    pub fn send(&self, msg: Message) -> SendStatus {
+        let was_closing = self.outbound.is_closing();
+        let status = self.outbound.send(msg);
+        if status == SendStatus::Congested && !was_closing {
+            warn!(
+                conn_id = self.id,
+                node_id = %self.node_id,
+                node_name = %self.node_name,
+                queued_streams = self.stream_count.load(Ordering::Relaxed),
+                "proxy outbound queue full, closing congested connection"
+            );
+        }
+        status
     }
 }
 
@@ -110,16 +202,35 @@ impl ProxyConn {
 
 pub struct WorkerConn {
     pub id: u64,
-    pub tx: mpsc::UnboundedSender<Message>,
+    pub outbound: BoundedOutbound,
 }
 
 impl WorkerConn {
-    pub fn new(id: u64, tx: mpsc::UnboundedSender<Message>) -> Self {
-        Self { id, tx }
+    pub fn new(id: u64, tx: mpsc::Sender<Message>, close_tx: watch::Sender<bool>) -> Self {
+        Self {
+            id,
+            outbound: BoundedOutbound::new(tx, close_tx),
+        }
     }
 
-    pub fn send(&self, msg: Message) -> bool {
-        self.tx.send(msg).is_ok()
+    pub fn is_available(&self) -> bool {
+        !self.outbound.is_closing()
+    }
+
+    pub fn request_close(&self) {
+        self.outbound.mark_closing();
+    }
+
+    pub fn send(&self, msg: Message) -> SendStatus {
+        let was_closing = self.outbound.is_closing();
+        let status = self.outbound.send(msg);
+        if status == SendStatus::Congested && !was_closing {
+            warn!(
+                worker_id = self.id,
+                "worker outbound queue full, closing congested connection"
+            );
+        }
+        status
     }
 }
 
@@ -242,6 +353,7 @@ impl HubRouter {
         let conns = map.get(node_id)?;
         conns
             .iter()
+            .filter(|c| c.is_available())
             .min_by_key(|c| c.stream_count.load(Ordering::Relaxed))
             .cloned()
     }
@@ -404,14 +516,17 @@ impl HubRouter {
             },
         );
 
-        if !proxy_conn.send(Message::Binary(rebuilt_frame.into())) {
-            // Send failed, clean up mapping
-            self.worker_to_proxy
-                .remove(&(worker_conn_id, worker_stream_id));
-            self.proxy_to_worker
-                .remove(&(proxy_conn.id, proxy_stream_id));
-            proxy_conn.release_stream();
-            return Some("proxy connection send failed".to_string());
+        match proxy_conn.send(Message::Binary(rebuilt_frame.into())) {
+            SendStatus::Queued => {}
+            SendStatus::Closed | SendStatus::Congested => {
+                // Send failed, clean up mapping
+                self.worker_to_proxy
+                    .remove(&(worker_conn_id, worker_stream_id));
+                self.proxy_to_worker
+                    .remove(&(proxy_conn.id, proxy_stream_id));
+                proxy_conn.release_stream();
+                return Some("proxy connection congested".to_string());
+            }
         }
 
         None
@@ -558,7 +673,10 @@ impl HubRouter {
         let workers: Vec<Arc<WorkerConn>> = self
             .worker_conns
             .iter()
-            .map(|e| e.value().clone())
+            .filter_map(|e| {
+                let worker = e.value().clone();
+                worker.is_available().then_some(worker)
+            })
             .collect();
         if workers.is_empty() {
             debug!("no workers to forward heartbeat to");
@@ -654,7 +772,7 @@ impl HubRouter {
 
         let mut sent = 0usize;
         for entry in self.worker_conns.iter() {
-            if entry.value().send(msg.clone()) {
+            if matches!(entry.value().send(msg.clone()), SendStatus::Queued) {
                 sent += 1;
             }
         }

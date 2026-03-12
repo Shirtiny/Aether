@@ -11,6 +11,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from ..core.enums import UserRole
+from ..core.validators import PasswordValidator
 
 
 # ========== 认证相关 ==========
@@ -112,15 +113,10 @@ class RegisterRequest(BaseModel):
     @classmethod
     @field_validator("password")
     def validate_password(cls, v: Any) -> Any:
-        """验证密码强度"""
-        if len(v) < 6:
-            raise ValueError("密码至少需要6个字符")
-        if not re.search(r"[A-Z]", v):
-            raise ValueError("密码必须包含至少一个大写字母")
-        if not re.search(r"[a-z]", v):
-            raise ValueError("密码必须包含至少一个小写字母")
-        if not re.search(r"\d", v):
-            raise ValueError("密码必须包含至少一个数字")
+        """基础校验（长度上下限），策略级别校验在服务层按系统配置执行。"""
+        valid, error_msg = PasswordValidator.validate(v)
+        if not valid:
+            raise ValueError(error_msg or "密码格式无效")
         return v
 
 
@@ -231,6 +227,7 @@ class RegistrationSettingsResponse(BaseModel):
     enable_registration: bool
     require_email_verification: bool
     email_configured: bool = Field(description="是否配置了邮箱服务")
+    password_policy_level: str = Field(description="密码策略等级：weak/medium/strong")
 
 
 # ========== 用户管理 ==========
@@ -320,15 +317,10 @@ class CreateUserRequest(BaseModel):
     @classmethod
     @field_validator("password")
     def validate_password(cls, v: Any) -> Any:
-        """验证密码强度"""
-        if len(v) < 6:
-            raise ValueError("密码至少需要6个字符")
-        if not re.search(r"[A-Z]", v):
-            raise ValueError("密码必须包含至少一个大写字母")
-        if not re.search(r"[a-z]", v):
-            raise ValueError("密码必须包含至少一个小写字母")
-        if not re.search(r"\d", v):
-            raise ValueError("密码必须包含至少一个数字")
+        """基础校验（长度上下限），策略级别校验在服务层按系统配置执行。"""
+        valid, error_msg = PasswordValidator.validate(v)
+        if not valid:
+            raise ValueError(error_msg or "密码格式无效")
         return v
 
 
@@ -645,6 +637,7 @@ class SystemSettingsRequest(BaseModel):
     default_provider: str | None = None
     default_model: str | None = None
     enable_usage_tracking: bool | None = None
+    password_policy_level: Literal["weak", "medium", "strong"] | None = None
 
 
 class SystemSettingsResponse(BaseModel):
@@ -653,6 +646,7 @@ class SystemSettingsResponse(BaseModel):
     default_provider: str | None
     default_model: str | None
     enable_usage_tracking: bool
+    password_policy_level: str
 
 
 # ========== 使用统计 ==========

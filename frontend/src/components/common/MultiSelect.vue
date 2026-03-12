@@ -4,7 +4,8 @@
       type="button"
       :class="
         cn(
-          'flex h-10 w-full items-center justify-between rounded-lg border bg-background px-3 text-left transition-colors hover:bg-muted/50',
+          'flex h-10 w-full items-center justify-between rounded-lg border bg-background px-3 text-left transition-colors',
+          disabled ? 'cursor-not-allowed opacity-60 hover:bg-background' : 'hover:bg-muted/50',
           triggerClass,
         )
       "
@@ -16,6 +17,10 @@
         class="truncate text-sm"
       >
         {{ displayText }}
+        <span
+          v-if="invalidItems.length"
+          class="text-destructive"
+        >({{ invalidItems.length }} 个已失效)</span>
       </span>
       <ChevronDown
         class="h-4 w-4 shrink-0 text-muted-foreground transition-transform"
@@ -51,6 +56,23 @@
 
       <div class="max-h-48 overflow-y-auto">
         <div
+          v-for="item in filteredInvalidItems"
+          :key="'invalid-' + item"
+          class="flex cursor-pointer items-center gap-2 bg-destructive/5 px-3 py-2 hover:bg-muted/50"
+          @click="remove(item)"
+        >
+          <input
+            type="checkbox"
+            :checked="true"
+            class="h-4 w-4 shrink-0 cursor-pointer rounded border-gray-300"
+            @click.stop
+            @change="remove(item)"
+          >
+          <span class="min-w-0 truncate text-sm text-destructive">{{ item }}</span>
+          <span class="shrink-0 text-xs text-destructive/70">(已失效)</span>
+        </div>
+
+        <div
           v-for="item in filteredOptions"
           :key="item.value"
           class="flex cursor-pointer items-center gap-2 px-3 py-2 hover:bg-muted/50"
@@ -66,7 +88,7 @@
           <span class="min-w-0 truncate text-sm">{{ item.label }}</span>
         </div>
         <div
-          v-if="filteredOptions.length === 0"
+          v-if="filteredOptions.length === 0 && filteredInvalidItems.length === 0"
           class="px-3 py-2 text-sm text-muted-foreground"
         >
           {{ searchQuery.trim() ? noResultsText : emptyText }}
@@ -122,9 +144,27 @@ const emit = defineEmits<{
 const isOpen = ref(false)
 const searchQuery = ref('')
 
-const showSearch = computed(
-  () => props.searchable && props.options.length >= props.searchThreshold,
+const validValues = computed(() => new Set(props.options.map(o => o.value)))
+
+const invalidItems = computed(() =>
+  props.modelValue.filter(v => !validValues.value.has(v)),
 )
+
+const totalCount = computed(() => props.options.length + invalidItems.value.length)
+
+const showSearch = computed(
+  () => props.searchable && totalCount.value >= props.searchThreshold,
+)
+
+const filteredInvalidItems = computed(() => {
+  if (!showSearch.value || !searchQuery.value.trim()) {
+    return invalidItems.value
+  }
+  return invalidItems.value.filter((item) =>
+    matchesSearchQuery(searchQuery.value, item),
+  )
+})
+
 const filteredOptions = computed(() => {
   if (!showSearch.value || !searchQuery.value.trim()) {
     return props.options
@@ -160,5 +200,9 @@ function toggle(value: string) {
     newValue.splice(index, 1)
   }
   emit('update:modelValue', newValue)
+}
+
+function remove(value: string) {
+  emit('update:modelValue', props.modelValue.filter(v => v !== value))
 }
 </script>

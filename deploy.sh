@@ -372,10 +372,6 @@ if [ "$FORCE_UPDATE_HUB" = true ]; then
     exit 0
 fi
 
-# 拉取最新代码
-echo ">>> Pulling latest code..."
-git pull
-
 # 标记是否需要重启
 NEED_RESTART=false
 BASE_REBUILT=false

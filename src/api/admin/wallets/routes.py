@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query, Request
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy.orm import Session, joinedload
 
@@ -18,7 +19,7 @@ from src.api.serializers import (
     serialize_admin_wallet_transaction,
 )
 from src.core.exceptions import InvalidRequestException, NotFoundException, translate_pydantic_error
-from src.database import get_db
+from src.database import get_db, get_db_context
 from src.models.database import RefundRequest, Wallet, WalletTransaction
 from src.services.wallet import WalletService
 
@@ -89,6 +90,152 @@ def _parse_payload(model_cls: type[BaseModel], payload: dict[str, Any]) -> BaseM
         if errors:
             raise InvalidRequestException(translate_pydantic_error(errors[0]))
         raise InvalidRequestException("请求数据验证失败")
+
+
+def _recharge_wallet_sync(
+    wallet_id: str,
+    payload: ManualRechargePayload,
+    operator_id: str | None,
+) -> dict[str, Any]:
+    with get_db_context() as db:
+        wallet = _get_wallet_or_raise(db, wallet_id)
+        _ensure_api_key_wallet_manual_recharge(wallet, payload.payment_method)
+        try:
+            order = WalletService.create_manual_recharge_order(
+                db,
+                wallet=wallet,
+                amount_usd=payload.amount_usd,
+                payment_method=payload.payment_method,
+                operator_id=operator_id,
+                description=payload.description,
+            )
+        except ValueError as exc:
+            raise InvalidRequestException(str(exc)) from exc
+        db.commit()
+        db.refresh(wallet)
+        return {
+            "wallet": serialize_admin_wallet(wallet),
+            "payment_order": {
+                "id": order.id,
+                "order_no": order.order_no,
+                "amount_usd": float(order.amount_usd or 0),
+                "payment_method": order.payment_method,
+                "status": order.status,
+                "created_at": order.created_at,
+                "credited_at": order.credited_at,
+            },
+        }
+
+
+def _adjust_wallet_sync(
+    wallet_id: str,
+    payload: WalletAdjustPayload,
+    operator_id: str | None,
+) -> dict[str, Any]:
+    with get_db_context() as db:
+        wallet = _get_wallet_or_raise(db, wallet_id)
+        if wallet.api_key_id is not None and payload.balance_type == "gift":
+            raise InvalidRequestException("独立密钥钱包不支持赠款调账")
+        try:
+            tx = WalletService.admin_adjust_balance(
+                db,
+                wallet=wallet,
+                amount_usd=payload.amount_usd,
+                balance_type=payload.balance_type,
+                operator_id=operator_id,
+                description=payload.description,
+            )
+        except ValueError as exc:
+            raise InvalidRequestException(str(exc)) from exc
+        db.commit()
+        db.refresh(wallet)
+        return {
+            "wallet": serialize_admin_wallet(wallet),
+            "transaction": serialize_admin_wallet_transaction(tx),
+        }
+
+
+def _process_refund_sync(
+    wallet_id: str,
+    refund_id: str,
+    operator_id: str | None,
+) -> dict[str, Any]:
+    with get_db_context() as db:
+        wallet = _get_wallet_or_raise(db, wallet_id)
+        _ensure_user_wallet_for_refund(wallet)
+        refund = _get_refund_or_raise(db, wallet_id, refund_id)
+        try:
+            tx = WalletService.move_refund_to_processing(
+                db,
+                refund=refund,
+                operator_id=operator_id,
+            )
+        except ValueError as exc:
+            raise InvalidRequestException(str(exc)) from exc
+        db.commit()
+        db.refresh(wallet)
+        db.refresh(refund)
+        return {
+            "wallet": serialize_admin_wallet(wallet),
+            "refund": serialize_admin_wallet_refund(refund),
+            "transaction": serialize_admin_wallet_transaction(tx),
+        }
+
+
+def _fail_refund_sync(
+    wallet_id: str,
+    refund_id: str,
+    payload: RefundFailPayload,
+    operator_id: str | None,
+) -> dict[str, Any]:
+    with get_db_context() as db:
+        wallet = _get_wallet_or_raise(db, wallet_id)
+        _ensure_user_wallet_for_refund(wallet)
+        refund = _get_refund_or_raise(db, wallet_id, refund_id)
+        try:
+            tx = WalletService.fail_refund(
+                db,
+                refund=refund,
+                reason=payload.reason,
+                operator_id=operator_id,
+            )
+        except ValueError as exc:
+            raise InvalidRequestException(str(exc)) from exc
+        db.commit()
+        db.refresh(wallet)
+        db.refresh(refund)
+        return {
+            "wallet": serialize_admin_wallet(wallet),
+            "refund": serialize_admin_wallet_refund(refund),
+            "transaction": serialize_admin_wallet_transaction(tx) if tx is not None else None,
+        }
+
+
+def _complete_refund_sync(
+    wallet_id: str,
+    refund_id: str,
+    payload: RefundCompletePayload,
+) -> dict[str, Any]:
+    with get_db_context() as db:
+        wallet = _get_wallet_or_raise(db, wallet_id)
+        _ensure_user_wallet_for_refund(wallet)
+        refund = _get_refund_or_raise(db, wallet_id, refund_id)
+        if refund.status != "processing":
+            raise InvalidRequestException("只有 processing 状态的退款可以标记完成")
+
+        try:
+            updated = WalletService.complete_refund(
+                db,
+                refund=refund,
+                gateway_refund_id=payload.gateway_refund_id,
+                payout_reference=payload.payout_reference,
+                payout_proof=payload.payout_proof,
+            )
+        except ValueError as exc:
+            raise InvalidRequestException(str(exc)) from exc
+        db.commit()
+        db.refresh(updated)
+        return {"refund": serialize_admin_wallet_refund(updated)}
 
 
 @router.get("")
@@ -397,33 +544,12 @@ class AdminWalletRechargeAdapter(AdminApiAdapter):
         payload = _parse_payload(ManualRechargePayload, context.ensure_json_body())
         assert isinstance(payload, ManualRechargePayload)
 
-        wallet = _get_wallet_or_raise(context.db, self.wallet_id)
-        _ensure_api_key_wallet_manual_recharge(wallet, payload.payment_method)
-        try:
-            order = WalletService.create_manual_recharge_order(
-                context.db,
-                wallet=wallet,
-                amount_usd=payload.amount_usd,
-                payment_method=payload.payment_method,
-                operator_id=context.user.id if context.user else None,
-                description=payload.description,
-            )
-        except ValueError as exc:
-            raise InvalidRequestException(str(exc))
-        context.db.commit()
-        context.db.refresh(wallet)
-        return {
-            "wallet": serialize_admin_wallet(wallet),
-            "payment_order": {
-                "id": order.id,
-                "order_no": order.order_no,
-                "amount_usd": float(order.amount_usd or 0),
-                "payment_method": order.payment_method,
-                "status": order.status,
-                "created_at": order.created_at,
-                "credited_at": order.credited_at,
-            },
-        }
+        return await run_in_threadpool(
+            _recharge_wallet_sync,
+            self.wallet_id,
+            payload,
+            context.user.id if context.user else None,
+        )
 
 
 @dataclass
@@ -434,27 +560,12 @@ class AdminWalletAdjustAdapter(AdminApiAdapter):
         payload = _parse_payload(WalletAdjustPayload, context.ensure_json_body())
         assert isinstance(payload, WalletAdjustPayload)
 
-        wallet = _get_wallet_or_raise(context.db, self.wallet_id)
-        if wallet.api_key_id is not None and payload.balance_type == "gift":
-            raise InvalidRequestException("独立密钥钱包不支持赠款调账")
-        try:
-            tx = WalletService.admin_adjust_balance(
-                context.db,
-                wallet=wallet,
-                amount_usd=payload.amount_usd,
-                balance_type=payload.balance_type,  # recharge | gift
-                operator_id=context.user.id if context.user else None,
-                description=payload.description,
-            )
-        except ValueError as exc:
-            raise InvalidRequestException(str(exc))
-
-        context.db.commit()
-        context.db.refresh(wallet)
-        return {
-            "wallet": serialize_admin_wallet(wallet),
-            "transaction": serialize_admin_wallet_transaction(tx),
-        }
+        return await run_in_threadpool(
+            _adjust_wallet_sync,
+            self.wallet_id,
+            payload,
+            context.user.id if context.user else None,
+        )
 
 
 @dataclass
@@ -463,26 +574,12 @@ class AdminWalletRefundProcessAdapter(AdminApiAdapter):
     refund_id: str
 
     async def handle(self, context: ApiRequestContext) -> dict[str, Any]:
-        wallet = _get_wallet_or_raise(context.db, self.wallet_id)
-        _ensure_user_wallet_for_refund(wallet)
-        refund = _get_refund_or_raise(context.db, self.wallet_id, self.refund_id)
-        try:
-            tx = WalletService.move_refund_to_processing(
-                context.db,
-                refund=refund,
-                operator_id=context.user.id if context.user else None,
-            )
-        except ValueError as exc:
-            raise InvalidRequestException(str(exc))
-
-        context.db.commit()
-        context.db.refresh(wallet)
-        context.db.refresh(refund)
-        return {
-            "wallet": serialize_admin_wallet(wallet),
-            "refund": serialize_admin_wallet_refund(refund),
-            "transaction": serialize_admin_wallet_transaction(tx),
-        }
+        return await run_in_threadpool(
+            _process_refund_sync,
+            self.wallet_id,
+            self.refund_id,
+            context.user.id if context.user else None,
+        )
 
 
 @dataclass
@@ -494,26 +591,13 @@ class AdminWalletRefundFailAdapter(AdminApiAdapter):
         payload = _parse_payload(RefundFailPayload, context.ensure_json_body())
         assert isinstance(payload, RefundFailPayload)
 
-        wallet = _get_wallet_or_raise(context.db, self.wallet_id)
-        _ensure_user_wallet_for_refund(wallet)
-        refund = _get_refund_or_raise(context.db, self.wallet_id, self.refund_id)
-        try:
-            tx = WalletService.fail_refund(
-                context.db,
-                refund=refund,
-                reason=payload.reason,
-                operator_id=context.user.id if context.user else None,
-            )
-        except ValueError as exc:
-            raise InvalidRequestException(str(exc))
-        context.db.commit()
-        context.db.refresh(wallet)
-        context.db.refresh(refund)
-        return {
-            "wallet": serialize_admin_wallet(wallet),
-            "refund": serialize_admin_wallet_refund(refund),
-            "transaction": serialize_admin_wallet_transaction(tx) if tx is not None else None,
-        }
+        return await run_in_threadpool(
+            _fail_refund_sync,
+            self.wallet_id,
+            self.refund_id,
+            payload,
+            context.user.id if context.user else None,
+        )
 
 
 @dataclass
@@ -525,22 +609,9 @@ class AdminWalletRefundCompleteAdapter(AdminApiAdapter):
         payload = _parse_payload(RefundCompletePayload, context.ensure_json_body())
         assert isinstance(payload, RefundCompletePayload)
 
-        wallet = _get_wallet_or_raise(context.db, self.wallet_id)
-        _ensure_user_wallet_for_refund(wallet)
-        refund = _get_refund_or_raise(context.db, self.wallet_id, self.refund_id)
-        if refund.status != "processing":
-            raise InvalidRequestException("只有 processing 状态的退款可以标记完成")
-
-        try:
-            updated = WalletService.complete_refund(
-                context.db,
-                refund=refund,
-                gateway_refund_id=payload.gateway_refund_id,
-                payout_reference=payload.payout_reference,
-                payout_proof=payload.payout_proof,
-            )
-        except ValueError as exc:
-            raise InvalidRequestException(str(exc))
-        context.db.commit()
-        context.db.refresh(updated)
-        return {"refund": serialize_admin_wallet_refund(updated)}
+        return await run_in_threadpool(
+            _complete_refund_sync,
+            self.wallet_id,
+            self.refund_id,
+            payload,
+        )

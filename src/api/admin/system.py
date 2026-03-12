@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.concurrency import run_in_threadpool
 from pydantic import ValidationError
 from sqlalchemy import case, func
 from sqlalchemy.orm import Session, selectinload
@@ -18,7 +19,7 @@ from src.api.base.pipeline import ApiRequestPipeline
 from src.config.constants import CacheTTL
 from src.core.exceptions import InvalidRequestException, NotFoundException, translate_pydantic_error
 from src.core.logger import logger
-from src.database import get_db
+from src.database import get_db, get_db_context
 from src.models.api import SystemSettingsRequest, SystemSettingsResponse
 from src.models.database import ApiKey, Provider, Usage, User
 from src.services.email.email_template import EmailTemplate
@@ -571,6 +572,7 @@ class AdminGetSystemSettingsAdapter(AdminApiAdapter):
             default_provider=default_provider,
             default_model=default_model,
             enable_usage_tracking=enable_usage_tracking,
+            password_policy_level=SystemConfigService.get_password_policy_level(db),
         )
 
 
@@ -620,6 +622,13 @@ class AdminUpdateSystemSettingsAdapter(AdminApiAdapter):
                 str(settings_request.enable_usage_tracking).lower(),
             )
 
+        if settings_request.password_policy_level is not None:
+            SystemConfigService.set_config(
+                db,
+                "password_policy_level",
+                settings_request.password_policy_level,
+            )
+
         return {"message": "系统设置更新成功"}
 
 
@@ -662,12 +671,15 @@ class AdminSetSystemConfigAdapter(AdminApiAdapter):
 
             value = crypto_service.encrypt(value)
 
-        config = SystemConfigService.set_config(
-            context.db,
-            self.key,
-            value,
-            payload.get("description"),
-        )
+        try:
+            config = SystemConfigService.set_config(
+                context.db,
+                self.key,
+                value,
+                payload.get("description"),
+            )
+        except ValueError as exc:
+            raise InvalidRequestException(str(exc))
 
         # 如果更新的是签到任务时间，动态更新调度器
         if self.key == "provider_checkin_time" and value:
@@ -1243,6 +1255,41 @@ class AdminImportConfigAdapter(AdminApiAdapter):
             return sorted(endpoint_formats)
         return []
 
+    @staticmethod
+    def _normalize_import_endpoint_payload(
+        provider_id: str,
+        ep_data: dict[str, Any],
+        existing_ep: Any | None = None,
+    ) -> dict[str, Any]:
+        """校验并规范化导入的 Endpoint 数据。"""
+        from src.models.endpoint_models import ProviderEndpointCreate
+
+        payload = {
+            "provider_id": provider_id,
+            "api_format": ep_data.get("api_format", getattr(existing_ep, "api_format", None)),
+            "base_url": ep_data.get("base_url", getattr(existing_ep, "base_url", None)),
+            "custom_path": ep_data.get("custom_path", getattr(existing_ep, "custom_path", None)),
+            "header_rules": ep_data.get("header_rules", getattr(existing_ep, "header_rules", None)),
+            "body_rules": ep_data.get("body_rules", getattr(existing_ep, "body_rules", None)),
+            "max_retries": ep_data.get("max_retries", getattr(existing_ep, "max_retries", 2)),
+            "config": ep_data.get("config", getattr(existing_ep, "config", None)),
+            "proxy": ep_data.get("proxy", getattr(existing_ep, "proxy", None)),
+            "format_acceptance_config": ep_data.get(
+                "format_acceptance_config",
+                getattr(existing_ep, "format_acceptance_config", None),
+            ),
+        }
+
+        try:
+            validated = ProviderEndpointCreate.model_validate(payload)
+        except Exception as exc:
+            api_format = payload.get("api_format") or "unknown"
+            raise InvalidRequestException(
+                f"导入 Endpoint 失败: provider_id={provider_id}, api_format={api_format}, error={exc}"
+            ) from exc
+
+        return validated.model_dump(mode="python")
+
     def _encrypt_provider_config(self, config: dict, crypto_service: Any) -> dict:
         """加密 Provider config 中的 provider_ops credentials"""
         if not config:
@@ -1567,18 +1614,23 @@ class AdminImportConfigAdapter(AdminApiAdapter):
                                 f"Endpoint '{ep_format}' 已存在于 Provider '{prov_data['name']}'"
                             )
                         elif merge_mode == "overwrite":
-                            existing_ep.base_url = ep_data.get("base_url", existing_ep.base_url)
-                            existing_ep.header_rules = ep_data.get("header_rules")
-                            existing_ep.body_rules = ep_data.get("body_rules")
-                            existing_ep.max_retries = ep_data.get("max_retries", 2)
+                            normalized_ep = self._normalize_import_endpoint_payload(
+                                provider_id,
+                                {**ep_data, "api_format": ep_format},
+                                existing_ep=existing_ep,
+                            )
+                            existing_ep.base_url = normalized_ep["base_url"]
+                            existing_ep.header_rules = normalized_ep.get("header_rules")
+                            existing_ep.body_rules = normalized_ep.get("body_rules")
+                            existing_ep.max_retries = normalized_ep.get("max_retries", 2)
                             existing_ep.is_active = ep_data.get("is_active", True)
-                            existing_ep.custom_path = ep_data.get("custom_path")
-                            existing_ep.config = ep_data.get("config")
-                            existing_ep.format_acceptance_config = ep_data.get(
+                            existing_ep.custom_path = normalized_ep.get("custom_path")
+                            existing_ep.config = normalized_ep.get("config")
+                            existing_ep.format_acceptance_config = normalized_ep.get(
                                 "format_acceptance_config"
                             )
                             existing_ep.proxy = self._remap_proxy_node_id(
-                                ep_data.get("proxy"), proxy_node_id_map
+                                normalized_ep.get("proxy"), proxy_node_id_map
                             )
                             sig = parse_signature_key(ep_format)
                             existing_ep.api_format = sig.key  # 使用归一化后的格式
@@ -1587,6 +1639,10 @@ class AdminImportConfigAdapter(AdminApiAdapter):
                             existing_ep.updated_at = datetime.now(timezone.utc)
                             stats["endpoints"]["updated"] += 1
                     else:
+                        normalized_ep = self._normalize_import_endpoint_payload(
+                            provider_id,
+                            {**ep_data, "api_format": ep_format},
+                        )
                         sig = parse_signature_key(ep_format)
                         api_family = sig.api_family.value
                         endpoint_kind = sig.endpoint_kind.value
@@ -1596,16 +1652,16 @@ class AdminImportConfigAdapter(AdminApiAdapter):
                             api_format=sig.key,  # 使用归一化后的格式
                             api_family=api_family,
                             endpoint_kind=endpoint_kind,
-                            base_url=ep_data["base_url"],
-                            header_rules=ep_data.get("header_rules"),
-                            body_rules=ep_data.get("body_rules"),
-                            max_retries=ep_data.get("max_retries", 2),
+                            base_url=normalized_ep["base_url"],
+                            header_rules=normalized_ep.get("header_rules"),
+                            body_rules=normalized_ep.get("body_rules"),
+                            max_retries=normalized_ep.get("max_retries", 2),
                             is_active=ep_data.get("is_active", True),
-                            custom_path=ep_data.get("custom_path"),
-                            config=ep_data.get("config"),
-                            format_acceptance_config=ep_data.get("format_acceptance_config"),
+                            custom_path=normalized_ep.get("custom_path"),
+                            config=normalized_ep.get("config"),
+                            format_acceptance_config=normalized_ep.get("format_acceptance_config"),
                             proxy=self._remap_proxy_node_id(
-                                ep_data.get("proxy"), proxy_node_id_map
+                                normalized_ep.get("proxy"), proxy_node_id_map
                             ),
                         )
                         db.add(new_ep)
@@ -2715,30 +2771,25 @@ class AdminResetEmailTemplateAdapter(AdminApiAdapter):
 # -------- 数据清空适配器 --------
 
 
-class AdminPurgeConfigAdapter(AdminApiAdapter):
-    async def handle(self, context: ApiRequestContext) -> Any:  # type: ignore[override]
-        """清空所有提供商配置（Provider、Endpoint、API Key、Model、GlobalModel）"""
-        from src.models.database import (
-            GeminiFileMapping,
-            GlobalModel,
-            Model,
-            ProviderAPIKey,
-            ProviderEndpoint,
-            UserPreference,
-            VideoTask,
-        )
-        from src.models.database_extensions import ApiKeyProviderMapping, ProviderUsageTracking
+def _purge_config_sync() -> dict[str, Any]:
+    from src.models.database import (
+        GeminiFileMapping,
+        GlobalModel,
+        Model,
+        ProviderAPIKey,
+        ProviderEndpoint,
+        UserPreference,
+        VideoTask,
+    )
+    from src.models.database_extensions import ApiKeyProviderMapping, ProviderUsageTracking
 
-        db = context.db
-
-        # 统计
+    with get_db_context() as db:
         providers_count = int(db.query(func.count(Provider.id)).scalar() or 0)
         endpoints_count = int(db.query(func.count(ProviderEndpoint.id)).scalar() or 0)
         keys_count = int(db.query(func.count(ProviderAPIKey.id)).scalar() or 0)
         models_count = int(db.query(func.count(Model.id)).scalar() or 0)
         global_models_count = int(db.query(func.count(GlobalModel.id)).scalar() or 0)
 
-        # VideoTask 的 provider_id/endpoint_id/key_id 无 ondelete，置 NULL 保留任务记录
         db.query(VideoTask).filter(
             (VideoTask.provider_id.isnot(None))
             | (VideoTask.endpoint_id.isnot(None))
@@ -2752,23 +2803,19 @@ class AdminPurgeConfigAdapter(AdminApiAdapter):
             synchronize_session=False,
         )
 
-        # 先清理有外键引用的关联表
         db.query(GeminiFileMapping).delete()
         db.query(ApiKeyProviderMapping).delete()
         db.query(ProviderUsageTracking).delete()
 
-        # 清空 UserPreference 中的 default_provider_id（无 ondelete 设置）
         db.query(UserPreference).filter(UserPreference.default_provider_id.isnot(None)).update(
             {UserPreference.default_provider_id: None}, synchronize_session=False
         )
 
-        # 按依赖顺序删除配置
         db.query(Model).delete()
         db.query(ProviderAPIKey).delete()
         db.query(ProviderEndpoint).delete()
         db.query(Provider).delete()
         db.query(GlobalModel).delete()
-        db.commit()
 
         return {
             "message": "配置已清空",
@@ -2782,37 +2829,27 @@ class AdminPurgeConfigAdapter(AdminApiAdapter):
         }
 
 
-class AdminPurgeUsersAdapter(AdminApiAdapter):
-    async def handle(self, context: ApiRequestContext) -> Any:  # type: ignore[override]
-        """清空所有非管理员用户及其关联数据"""
-        from src.core.enums import UserRole
+def _purge_users_sync() -> dict[str, Any]:
+    from src.core.enums import UserRole
+    from src.models.database import VideoTask
 
-        db = context.db
-
+    with get_db_context() as db:
         user_ids = [uid for (uid,) in db.query(User.id).filter(User.role != UserRole.ADMIN).all()]
         users_count = len(user_ids)
 
         if user_ids:
-            from src.models.database import VideoTask
-
-            # 删除关联的 VideoTask（user_id 无 ondelete 设置）
             db.query(VideoTask).filter(VideoTask.user_id.in_(user_ids)).delete(
                 synchronize_session=False
             )
 
-            # 统计关联 API Keys 数量（DB 级别 CASCADE 会随 User 自动删除）
             keys_count = int(
                 db.query(func.count(ApiKey.id)).filter(ApiKey.user_id.in_(user_ids)).scalar() or 0
             )
 
-            # 将使用记录的 user_id 置空（保留记录）
             db.query(Usage).filter(Usage.user_id.in_(user_ids)).update(
                 {Usage.user_id: None}, synchronize_session=False
             )
-
-            # 删除用户
             db.query(User).filter(User.id.in_(user_ids)).delete(synchronize_session=False)
-            db.commit()
         else:
             keys_count = 0
 
@@ -2823,6 +2860,105 @@ class AdminPurgeUsersAdapter(AdminApiAdapter):
                 "api_keys": keys_count,
             },
         }
+
+
+def _purge_usage_sync() -> dict[str, Any]:
+    from src.models.database import RequestCandidate, UserModelUsageCount
+
+    with get_db_context() as db:
+        usage_count = int(db.query(func.count(Usage.id)).scalar() or 0)
+        candidates_count = int(db.query(func.count(RequestCandidate.id)).scalar() or 0)
+        usage_counts_count = int(db.query(func.count(UserModelUsageCount.id)).scalar() or 0)
+
+        db.query(RequestCandidate).delete()
+        db.query(Usage).delete()
+        db.query(UserModelUsageCount).delete()
+        _purge_stats_and_reset_counters(db)
+
+        return {
+            "message": "使用记录已清空",
+            "deleted": {
+                "usage_records": usage_count,
+                "request_candidates": candidates_count,
+                "user_model_usage_counts": usage_counts_count,
+            },
+        }
+
+
+def _purge_audit_logs_sync() -> dict[str, Any]:
+    from src.models.database import AuditLog
+
+    with get_db_context() as db:
+        count = int(db.query(func.count(AuditLog.id)).scalar() or 0)
+        db.query(AuditLog).delete()
+        return {
+            "message": "审计日志已清空",
+            "deleted": {
+                "audit_logs": count,
+            },
+        }
+
+
+def _purge_request_bodies_sync() -> dict[str, Any]:
+    with get_db_context() as db:
+        with_body = int(
+            db.query(func.count(Usage.id))
+            .filter(
+                (Usage.request_body.isnot(None))
+                | (Usage.response_body.isnot(None))
+                | (Usage.provider_request_body.isnot(None))
+                | (Usage.client_response_body.isnot(None))
+                | (Usage.request_body_compressed.isnot(None))
+                | (Usage.response_body_compressed.isnot(None))
+                | (Usage.provider_request_body_compressed.isnot(None))
+                | (Usage.client_response_body_compressed.isnot(None))
+            )
+            .scalar()
+            or 0
+        )
+
+        db.query(Usage).update(
+            {
+                Usage.request_body: None,
+                Usage.response_body: None,
+                Usage.provider_request_body: None,
+                Usage.client_response_body: None,
+                Usage.request_body_compressed: None,
+                Usage.response_body_compressed: None,
+                Usage.provider_request_body_compressed: None,
+                Usage.client_response_body_compressed: None,
+                Usage.request_headers: None,
+                Usage.response_headers: None,
+                Usage.provider_request_headers: None,
+                Usage.client_response_headers: None,
+            },
+            synchronize_session=False,
+        )
+
+        return {
+            "message": "请求体已清空",
+            "cleaned": {
+                "records_with_body": with_body,
+            },
+        }
+
+
+def _purge_stats_sync() -> dict[str, Any]:
+    with get_db_context() as db:
+        _purge_stats_and_reset_counters(db)
+        return {"message": "聚合统计数据已清空"}
+
+
+class AdminPurgeConfigAdapter(AdminApiAdapter):
+    async def handle(self, context: ApiRequestContext) -> Any:  # type: ignore[override]
+        """清空所有提供商配置（Provider、Endpoint、API Key、Model、GlobalModel）"""
+        return await run_in_threadpool(_purge_config_sync)
+
+
+class AdminPurgeUsersAdapter(AdminApiAdapter):
+    async def handle(self, context: ApiRequestContext) -> Any:  # type: ignore[override]
+        """清空所有非管理员用户及其关联数据"""
+        return await run_in_threadpool(_purge_users_sync)
 
 
 def _purge_stats_and_reset_counters(db: Session) -> None:
@@ -2891,112 +3027,25 @@ def _purge_stats_and_reset_counters(db: Session) -> None:
 class AdminPurgeUsageAdapter(AdminApiAdapter):
     async def handle(self, context: ApiRequestContext) -> Any:  # type: ignore[override]
         """清空全部使用记录及相关统计数据"""
-        from src.models.database import RequestCandidate, UserModelUsageCount
-
-        db = context.db
-
-        usage_count = int(db.query(func.count(Usage.id)).scalar() or 0)
-        candidates_count = int(db.query(func.count(RequestCandidate.id)).scalar() or 0)
-        usage_counts_count = int(db.query(func.count(UserModelUsageCount.id)).scalar() or 0)
-
-        # 清空使用记录
-        db.query(RequestCandidate).delete()
-        db.query(Usage).delete()
-        db.query(UserModelUsageCount).delete()
-
-        _purge_stats_and_reset_counters(db)
-        db.commit()
-
-        return {
-            "message": "使用记录已清空",
-            "deleted": {
-                "usage_records": usage_count,
-                "request_candidates": candidates_count,
-                "user_model_usage_counts": usage_counts_count,
-            },
-        }
+        return await run_in_threadpool(_purge_usage_sync)
 
 
 class AdminPurgeAuditLogsAdapter(AdminApiAdapter):
     async def handle(self, context: ApiRequestContext) -> Any:  # type: ignore[override]
         """清空全部审计日志"""
-        from src.models.database import AuditLog
-
-        db = context.db
-
-        count = int(db.query(func.count(AuditLog.id)).scalar() or 0)
-        db.query(AuditLog).delete()
-        db.commit()
-
-        return {
-            "message": "审计日志已清空",
-            "deleted": {
-                "audit_logs": count,
-            },
-        }
+        return await run_in_threadpool(_purge_audit_logs_sync)
 
 
 class AdminPurgeRequestBodiesAdapter(AdminApiAdapter):
     async def handle(self, context: ApiRequestContext) -> Any:  # type: ignore[override]
         """清空全部请求体/响应体（保留使用记录的统计信息）"""
-        db = context.db
-
-        # 统计有 body 的记录数
-        with_body = int(
-            db.query(func.count(Usage.id))
-            .filter(
-                (Usage.request_body.isnot(None))
-                | (Usage.response_body.isnot(None))
-                | (Usage.provider_request_body.isnot(None))
-                | (Usage.client_response_body.isnot(None))
-                | (Usage.request_body_compressed.isnot(None))
-                | (Usage.response_body_compressed.isnot(None))
-                | (Usage.provider_request_body_compressed.isnot(None))
-                | (Usage.client_response_body_compressed.isnot(None))
-            )
-            .scalar()
-            or 0
-        )
-
-        # 批量清空所有 body 字段
-        db.query(Usage).update(
-            {
-                Usage.request_body: None,
-                Usage.response_body: None,
-                Usage.provider_request_body: None,
-                Usage.client_response_body: None,
-                Usage.request_body_compressed: None,
-                Usage.response_body_compressed: None,
-                Usage.provider_request_body_compressed: None,
-                Usage.client_response_body_compressed: None,
-                Usage.request_headers: None,
-                Usage.response_headers: None,
-                Usage.provider_request_headers: None,
-                Usage.client_response_headers: None,
-            },
-            synchronize_session=False,
-        )
-        db.commit()
-
-        return {
-            "message": "请求体已清空",
-            "cleaned": {
-                "records_with_body": with_body,
-            },
-        }
+        return await run_in_threadpool(_purge_request_bodies_sync)
 
 
 class AdminPurgeStatsAdapter(AdminApiAdapter):
     async def handle(self, context: ApiRequestContext) -> Any:  # type: ignore[override]
         """清空全部聚合统计数据（保留原始使用记录）"""
-        db = context.db
-
-        _purge_stats_and_reset_counters(db)
-        db.commit()
-
-        return {
-            "message": "聚合统计数据已清空",
-        }
+        return await run_in_threadpool(_purge_stats_sync)
 
 
 # ---------------------------------------------------------------------------

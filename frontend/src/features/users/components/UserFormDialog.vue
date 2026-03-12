@@ -82,27 +82,30 @@
             <Input
               :id="`pwd-${formNonce}`"
               v-model="form.password"
-              :type="passwordFocused ? 'password' : 'text'"
+              type="text"
+              masked
               autocomplete="new-password"
-              data-form-type="other"
-              data-lpignore="true"
+              disable-autofill
               :name="`field-${formNonce}`"
               :required="!isEditMode"
               minlength="6"
-              :placeholder="isEditMode ? '留空保持原密码' : '至少6个字符'"
-              :class="
-                !passwordFocused && form.password.length === 0
-                  ? 'h-10 text-transparent'
-                  : 'h-10'
-              "
-              @focus="passwordFocused = true"
-              @blur="passwordFocused = form.password.length > 0"
+              :placeholder="isEditMode ? '留空保持原密码' : getPasswordPolicyPlaceholder(passwordPolicyLevel)"
+              :class="[
+                'h-10',
+                passwordError ? 'border-destructive' : '',
+              ]"
             />
             <p
-              v-if="!isEditMode"
+              v-if="passwordError"
+              class="text-xs text-destructive"
+            >
+              {{ passwordError }}
+            </p>
+            <p
+              v-else-if="!isEditMode"
               class="text-xs text-muted-foreground"
             >
-              密码至少需要6个字符
+              {{ passwordHint }}
             </p>
           </div>
 
@@ -176,110 +179,109 @@
               </Select>
             </div>
           </div>
-
-          <div
-            v-if="!isEditMode"
-            class="space-y-2"
-          >
-            <Label
-              for="form-active"
-              class="text-sm font-medium"
-            >启用用户</Label>
-            <div class="flex items-center gap-3">
-              <Switch
-                id="form-active"
-                v-model="form.is_active"
-              />
-              <div class="flex flex-col">
-                <span class="text-sm text-foreground">
-                  {{ form.is_active ? '已启用' : '已禁用' }}
-                </span>
-                <span class="text-xs text-muted-foreground">
-                  {{ form.is_active ? '允许登录与请求' : '阻止登录与请求' }}
-                </span>
-              </div>
-            </div>
-          </div>
         </div>
 
         <!-- 右侧：访问限制 -->
         <div class="pl-6 space-y-4 border-l border-border">
           <div class="flex items-center gap-2 pb-2 border-b border-border/60">
             <span class="text-sm font-medium">访问限制</span>
-            <span class="text-xs text-muted-foreground">(留空不限)</span>
           </div>
 
-          <!-- Provider 多选下拉框 -->
+          <!-- Provider -->
           <div class="space-y-2">
             <Label class="text-sm font-medium">允许的 Provider</Label>
-            <MultiSelect
-              v-model="form.allowed_providers"
-              :options="providerOptions"
-              :search-threshold="0"
-              placeholder="全部可用"
-              empty-text="暂无可用 Provider"
-              no-results-text="未找到匹配的 Provider"
-              search-placeholder="搜索 Provider 名称..."
-            />
-          </div>
-
-          <!-- API 格式多选下拉框 -->
-          <div class="space-y-2">
-            <Label class="text-sm font-medium">允许的 API 格式</Label>
-            <MultiSelect
-              v-model="form.allowed_api_formats"
-              :options="apiFormatOptions"
-              :search-threshold="0"
-              placeholder="全部可用"
-              empty-text="暂无可用 API 格式"
-              no-results-text="未找到匹配的 API 格式"
-              search-placeholder="搜索 API 格式..."
-            />
-          </div>
-
-          <!-- 模型多选下拉框 -->
-          <ModelMultiSelect
-            v-model="form.allowed_models"
-            :models="globalModels"
-            :search-threshold="0"
-          />
-
-          <div class="space-y-2">
-            <Label class="text-sm font-medium">无限制额度</Label>
             <div class="flex items-center gap-3">
-              <Switch v-model="form.unlimited" />
-              <div class="flex flex-col">
-                <span class="text-sm text-foreground">
-                  {{ form.unlimited ? '已启用' : '已关闭' }}
-                </span>
-                <span class="text-xs text-muted-foreground">
-                  {{ form.unlimited ? '无限制：忽略钱包余额校验' : '有限制：按钱包余额校验' }}
-                </span>
+              <div class="flex-1 min-w-0">
+                <MultiSelect
+                  v-model="form.allowed_providers"
+                  :options="providerOptions"
+                  :search-threshold="0"
+                  :disabled="form.provider_unrestricted"
+                  :placeholder="form.provider_unrestricted ? '不限制' : '未选择（全部禁用）'"
+                  empty-text="暂无可用 Provider"
+                  no-results-text="未找到匹配的 Provider"
+                  search-placeholder="搜索 Provider 名称..."
+                />
               </div>
+              <Switch
+                v-model="form.provider_unrestricted"
+                class="shrink-0"
+              />
             </div>
           </div>
 
-          <div
-            v-if="!isEditMode && !form.unlimited"
-            class="space-y-2"
-          >
-            <Label
-              for="form-initial-gift"
-              class="text-sm font-medium"
-            >初始赠款额度 (USD) <span class="text-muted-foreground">*</span></Label>
-            <Input
-              id="form-initial-gift"
-              :model-value="form.initial_gift_usd ?? ''"
-              type="number"
-              step="0.01"
-              min="0.01"
-              placeholder="10.00"
-              class="h-10"
-              @update:model-value="(v) => form.initial_gift_usd = parseNumberInput(v, { allowFloat: true, min: 0.01 })"
-            />
-            <p class="text-xs text-muted-foreground">
-              最小值 $0.01
-            </p>
+          <!-- API 格式 -->
+          <div class="space-y-2">
+            <Label class="text-sm font-medium">允许的 API 格式</Label>
+            <div class="flex items-center gap-3">
+              <div class="flex-1 min-w-0">
+                <MultiSelect
+                  v-model="form.allowed_api_formats"
+                  :options="apiFormatOptions"
+                  :search-threshold="0"
+                  :disabled="form.api_format_unrestricted"
+                  :placeholder="form.api_format_unrestricted ? '不限制' : '未选择（全部禁用）'"
+                  empty-text="暂无可用 API 格式"
+                  no-results-text="未找到匹配的 API 格式"
+                  search-placeholder="搜索 API 格式..."
+                />
+              </div>
+              <Switch
+                v-model="form.api_format_unrestricted"
+                class="shrink-0"
+              />
+            </div>
+          </div>
+
+          <!-- 模型 -->
+          <div class="space-y-2">
+            <Label class="text-sm font-medium">允许的模型</Label>
+            <div class="flex items-center gap-3">
+              <div class="flex-1 min-w-0">
+                <MultiSelect
+                  v-model="form.allowed_models"
+                  :options="modelOptions"
+                  :search-threshold="0"
+                  :disabled="form.model_unrestricted"
+                  :placeholder="form.model_unrestricted ? '不限制' : '未选择（全部禁用）'"
+                  empty-text="暂无可用模型"
+                  no-results-text="未找到匹配的模型"
+                  search-placeholder="输入模型名搜索..."
+                />
+              </div>
+              <Switch
+                v-model="form.model_unrestricted"
+                class="shrink-0"
+              />
+            </div>
+          </div>
+
+          <!-- 额度 -->
+          <div class="space-y-2">
+            <Label class="text-sm font-medium">额度</Label>
+            <div class="flex items-center gap-3">
+              <div class="flex-1 min-w-0">
+                <Input
+                  v-if="!isEditMode && !form.unlimited"
+                  id="form-initial-gift"
+                  :model-value="form.initial_gift_usd ?? ''"
+                  type="number"
+                  step="0.01"
+                  min="0.01"
+                  placeholder="初始额度 (USD)"
+                  class="h-10"
+                  @update:model-value="(v) => form.initial_gift_usd = parseNumberInput(v, { allowFloat: true, min: 0.01 })"
+                />
+                <span
+                  v-else
+                  class="flex h-10 w-full items-center rounded-lg border bg-background px-3 text-sm text-muted-foreground opacity-60"
+                >{{ form.unlimited ? '无限制' : '按钱包余额限制' }}</span>
+              </div>
+              <Switch
+                v-model="form.unlimited"
+                class="shrink-0"
+              />
+            </div>
           </div>
         </div>
       </div>
@@ -321,12 +323,19 @@ import {
 } from '@/components/ui'
 import { UserPlus, SquarePen } from 'lucide-vue-next'
 import { useFormDialog } from '@/composables/useFormDialog'
-import { ModelMultiSelect, MultiSelect } from '@/components/common'
+import { MultiSelect } from '@/components/common'
 import { getProvidersSummary } from '@/api/endpoints/providers'
 import { getGlobalModels } from '@/api/global-models'
 import { adminApi } from '@/api/admin'
 import { log } from '@/utils/logger'
 import { parseNumberInput } from '@/utils/form'
+import {
+  getPasswordPolicyHint,
+  getPasswordPolicyPlaceholder,
+  normalizePasswordPolicyLevel,
+  validatePasswordByPolicy,
+  type PasswordPolicyLevel,
+} from '@/utils/passwordPolicy'
 import type {
   ProviderWithEndpointsSummary,
   GlobalModelResponse,
@@ -358,7 +367,7 @@ const emit = defineEmits<{
 const isOpen = computed(() => props.open)
 const saving = ref(false)
 const formNonce = ref(createFieldNonce())
-const passwordFocused = ref(false)
+const passwordPolicyLevel = ref<PasswordPolicyLevel>('weak')
 
 // 选项数据
 const providers = ref<ProviderWithEndpointsSummary[]>([])
@@ -377,6 +386,12 @@ const apiFormatOptions = computed(() =>
     label: format.label,
   })),
 )
+const modelOptions = computed(() =>
+  globalModels.value.map((model) => ({
+    value: model.name,
+    label: model.name,
+  })),
+)
 
 // 表单数据
 const form = ref({
@@ -388,6 +403,9 @@ const form = ref({
   role: 'user' as 'admin' | 'user',
   unlimited: false,
   is_active: true,
+  provider_unrestricted: true,
+  api_format_unrestricted: true,
+  model_unrestricted: true,
   allowed_providers: [] as string[],
   allowed_api_formats: [] as string[],
   allowed_models: [] as string[],
@@ -399,7 +417,6 @@ function createFieldNonce(): string {
 
 function resetForm() {
   formNonce.value = createFieldNonce()
-  passwordFocused.value = false
   form.value = {
     username: '',
     password: '',
@@ -409,6 +426,9 @@ function resetForm() {
     role: 'user',
     unlimited: false,
     is_active: true,
+    provider_unrestricted: true,
+    api_format_unrestricted: true,
+    model_unrestricted: true,
     allowed_providers: [],
     allowed_api_formats: [],
     allowed_models: [],
@@ -418,7 +438,6 @@ function resetForm() {
 function loadUserData() {
   if (!props.user) return
   formNonce.value = createFieldNonce()
-  passwordFocused.value = false
   // 创建数组副本，避免与 props 数据共享引用
   form.value = {
     username: props.user.username,
@@ -429,9 +448,12 @@ function loadUserData() {
     role: props.user.role,
     unlimited: props.user.unlimited ?? false,
     is_active: props.user.is_active ?? true,
-    allowed_providers: [...(props.user.allowed_providers || [])],
-    allowed_api_formats: [...(props.user.allowed_api_formats || [])],
-    allowed_models: [...(props.user.allowed_models || [])],
+    provider_unrestricted: props.user.allowed_providers == null,
+    api_format_unrestricted: props.user.allowed_api_formats == null,
+    model_unrestricted: props.user.allowed_models == null,
+    allowed_providers: props.user.allowed_providers ? [...props.user.allowed_providers] : [],
+    allowed_api_formats: props.user.allowed_api_formats ? [...props.user.allowed_api_formats] : [],
+    allowed_models: props.user.allowed_models ? [...props.user.allowed_models] : [],
   }
 }
 
@@ -456,13 +478,14 @@ const usernameError = computed(() => {
   return ''
 })
 
-function getPasswordValidationError(password: string): string | null {
-  if (password.length < 8) return '密码长度至少为8个字符'
-  if (!/[A-Z]/.test(password)) return '密码必须包含至少一个大写字母'
-  if (!/[a-z]/.test(password)) return '密码必须包含至少一个小写字母'
-  if (!/[0-9]/.test(password)) return '密码必须包含至少一个数字'
-  return null
-}
+const passwordHint = computed(() => getPasswordPolicyHint(passwordPolicyLevel.value))
+
+const passwordError = computed(() => {
+  if (!form.value.password) {
+    return ''
+  }
+  return validatePasswordByPolicy(form.value.password, passwordPolicyLevel.value)
+})
 
 // 表单验证
 const isFormValid = computed(() => {
@@ -470,7 +493,7 @@ const isFormValid = computed(() => {
   const usernameValid = !usernameError.value
   const passwordFilled = form.value.password.length > 0
   const passwordValid = passwordFilled
-    ? !getPasswordValidationError(form.value.password)
+    ? !passwordError.value
     : isEditMode.value
   // 编辑模式下可留空；填写时必须确认一致。创建模式不展示确认输入框。
   const passwordConfirmed = isEditMode.value
@@ -486,16 +509,19 @@ const isFormValid = computed(() => {
 // 加载访问控制选项
 async function loadAccessControlOptions(): Promise<void> {
   try {
-    const [providersResponse, modelsData, formatsData] = await Promise.all([
+    const [providersResponse, modelsData, formatsData, passwordPolicyResponse] = await Promise.all([
       getProvidersSummary({ page_size: 9999 }),
       getGlobalModels({ limit: 1000, is_active: true }),
       adminApi.getApiFormats(),
+      adminApi.getSystemConfig('password_policy_level').catch(() => ({ value: 'weak' })),
     ])
     providers.value = providersResponse.items
     globalModels.value = modelsData.models || []
     apiFormats.value = formatsData.formats || []
+    passwordPolicyLevel.value = normalizePasswordPolicyLevel(passwordPolicyResponse.value)
   } catch (err) {
     log.error('加载访问限制选项失败:', err)
+    passwordPolicyLevel.value = 'weak'
   }
 }
 
@@ -508,16 +534,15 @@ async function handleSubmit() {
       email: form.value.email.trim() || '',
       unlimited: form.value.unlimited,
       role: form.value.role,
-      allowed_providers:
-        form.value.allowed_providers.length > 0
-          ? form.value.allowed_providers
-          : null,
-      allowed_api_formats:
-        form.value.allowed_api_formats.length > 0
-          ? form.value.allowed_api_formats
-          : null,
-      allowed_models:
-        form.value.allowed_models.length > 0 ? form.value.allowed_models : null,
+      allowed_providers: form.value.provider_unrestricted
+        ? null
+        : [...form.value.allowed_providers],
+      allowed_api_formats: form.value.api_format_unrestricted
+        ? null
+        : [...form.value.allowed_api_formats],
+      allowed_models: form.value.model_unrestricted
+        ? null
+        : [...form.value.allowed_models],
     }
 
     if (isEditMode.value && props.user?.id) {

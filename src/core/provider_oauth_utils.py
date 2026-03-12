@@ -326,6 +326,21 @@ def _extract_codex_fields_from_claims(claims: dict[str, Any]) -> dict[str, Any]:
     if account_id:
         result["account_id"] = account_id
 
+    account_user_id = _first_non_empty_str(
+        [
+            auth.get("chatgpt_account_user_id"),
+            auth.get("chatgptAccountUserId"),
+            auth.get("account_user_id"),
+            auth.get("accountUserId"),
+            claims.get("chatgpt_account_user_id"),
+            claims.get("chatgptAccountUserId"),
+            claims.get("account_user_id"),
+            claims.get("accountUserId"),
+        ]
+    )
+    if account_user_id:
+        result["account_user_id"] = account_user_id
+
     plan_type = _first_non_empty_str(
         [
             auth.get("chatgpt_plan_type"),
@@ -356,6 +371,10 @@ def _extract_codex_fields_from_claims(claims: dict[str, Any]) -> dict[str, Any]:
     )
     if user_id:
         result["user_id"] = user_id
+
+    organizations = auth.get("organizations")
+    if isinstance(organizations, list) and organizations:
+        result["organizations"] = organizations
 
     return result
 
@@ -509,3 +528,35 @@ async def enrich_auth_config(
     if enricher:
         return await enricher(auth_config, token_response, access_token, proxy_config)
     return auth_config
+
+
+def normalize_oauth_organizations(raw: Any) -> list[dict[str, Any]]:
+    """Normalize raw organizations list from OAuth auth_config into a clean list of dicts."""
+    if not isinstance(raw, list):
+        return []
+
+    result: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+
+        normalized: dict[str, Any] = {}
+        org_id = item.get("id")
+        if isinstance(org_id, str) and org_id.strip():
+            normalized["id"] = org_id.strip()
+
+        title = item.get("title")
+        if isinstance(title, str) and title.strip():
+            normalized["title"] = title.strip()
+
+        role = item.get("role")
+        if isinstance(role, str) and role.strip():
+            normalized["role"] = role.strip()
+
+        if "is_default" in item:
+            normalized["is_default"] = bool(item.get("is_default"))
+
+        if normalized:
+            result.append(normalized)
+
+    return result

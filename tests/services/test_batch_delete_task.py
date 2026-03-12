@@ -140,8 +140,14 @@ def test_sync_delete_reports_progress_after_each_batch(
 
     session = _FakeSession()
     progress_updates: list[int] = []
+    cleanup_batches: list[list[str]] = []
 
     monkeypatch.setattr(taskmod, "_CLEANUP_BATCH_SIZE", 2)
+    monkeypatch.setattr(
+        taskmod,
+        "cleanup_key_references",
+        lambda _db, batch: cleanup_batches.append(list(batch)),
+    )
     monkeypatch.setattr("src.database.create_session", lambda: session)
     monkeypatch.setattr(
         "src.models.database.ProviderAPIKey",
@@ -157,5 +163,6 @@ def test_sync_delete_reports_progress_after_each_batch(
 
     assert affected == 3
     assert progress_updates == [2, 3]
+    assert cleanup_batches == [["key-1", "key-2"], ["key-3"]]
     assert session.commits == 2
     assert session.closed is True

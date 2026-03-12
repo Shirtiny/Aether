@@ -8,6 +8,7 @@ import json
 
 from src.core.crypto import crypto_service
 from src.core.logger import logger
+from src.core.provider_oauth_utils import normalize_oauth_organizations
 from src.models.database import ProviderAPIKey
 from src.models.endpoint_models import EndpointAPIKeyResponse
 from src.services.provider_keys.auth_type import normalize_auth_type
@@ -47,6 +48,8 @@ def build_key_response(
     oauth_email = None
     oauth_plan_type = None
     oauth_account_id = None
+    oauth_account_user_id = None
+    oauth_organizations: list[dict[str, object]] = []
     encrypted_auth_config = key_dict.pop("auth_config", None)  # 移除敏感字段，避免泄露
     if auth_type == "oauth" and encrypted_auth_config:
         try:
@@ -61,6 +64,8 @@ def build_key_response(
                 if ag_tier and isinstance(ag_tier, str):
                     oauth_plan_type = ag_tier.lower()
             oauth_account_id = auth_config.get("account_id")  # Codex: chatgpt_account_id
+            oauth_account_user_id = auth_config.get("account_user_id")
+            oauth_organizations = normalize_oauth_organizations(auth_config.get("organizations"))
         except Exception as e:
             logger.error("Failed to decrypt auth_config for key {}: {}", key.id, e)
 
@@ -112,6 +117,8 @@ def build_key_response(
             "oauth_email": oauth_email,
             "oauth_plan_type": oauth_plan_type,
             "oauth_account_id": oauth_account_id,
+            "oauth_account_user_id": oauth_account_user_id,
+            "oauth_organizations": oauth_organizations,
             "oauth_invalid_at": (
                 int(key.oauth_invalid_at.timestamp()) if key.oauth_invalid_at else None
             ),

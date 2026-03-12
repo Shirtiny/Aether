@@ -14,6 +14,7 @@ export interface SystemConfig {
   default_user_initial_gift_usd: number
   rate_limit_per_minute: number
   enable_registration: boolean
+  password_policy_level: string
   // 独立余额 Key 过期管理
   auto_delete_expired_keys: boolean
   // 格式转换
@@ -47,6 +48,7 @@ const CONFIG_KEYS = [
   'default_user_initial_gift_usd',
   'rate_limit_per_minute',
   'enable_registration',
+  'password_policy_level',
   // 独立余额 Key 过期管理
   'auto_delete_expired_keys',
   // 格式转换
@@ -81,6 +83,7 @@ function createDefaultConfig(): SystemConfig {
     default_user_initial_gift_usd: 10.0,
     rate_limit_per_minute: 0,
     enable_registration: false,
+    password_policy_level: 'weak',
     // 独立余额 Key 过期管理
     auto_delete_expired_keys: false,
     // 格式转换
@@ -140,6 +143,7 @@ export function useSystemConfig() {
       systemConfig.value.default_user_initial_gift_usd !== originalConfig.value.default_user_initial_gift_usd ||
       systemConfig.value.rate_limit_per_minute !== originalConfig.value.rate_limit_per_minute ||
       systemConfig.value.enable_registration !== originalConfig.value.enable_registration ||
+      systemConfig.value.password_policy_level !== originalConfig.value.password_policy_level ||
       systemConfig.value.auto_delete_expired_keys !== originalConfig.value.auto_delete_expired_keys ||
       systemConfig.value.enable_format_conversion !== originalConfig.value.enable_format_conversion
     )
@@ -297,6 +301,11 @@ export function useSystemConfig() {
           description: '是否开放用户注册',
         },
         {
+          key: 'password_policy_level',
+          value: systemConfig.value.password_policy_level,
+          description: '密码策略等级',
+        },
+        {
           key: 'auto_delete_expired_keys',
           value: systemConfig.value.auto_delete_expired_keys,
           description: '是否自动删除过期的API Key',
@@ -317,6 +326,7 @@ export function useSystemConfig() {
         originalConfig.value.default_user_initial_gift_usd = systemConfig.value.default_user_initial_gift_usd
         originalConfig.value.rate_limit_per_minute = systemConfig.value.rate_limit_per_minute
         originalConfig.value.enable_registration = systemConfig.value.enable_registration
+        originalConfig.value.password_policy_level = systemConfig.value.password_policy_level
         originalConfig.value.auto_delete_expired_keys =
           systemConfig.value.auto_delete_expired_keys
         originalConfig.value.enable_format_conversion =

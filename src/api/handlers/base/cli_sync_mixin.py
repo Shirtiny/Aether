@@ -272,11 +272,11 @@ class CliSyncMixin:
             from src.services.proxy_node.resolver import (
                 get_proxy_label,
                 resolve_effective_proxy,
-                resolve_proxy_info,
+                resolve_proxy_info_async,
             )
 
             _effective_proxy = resolve_effective_proxy(provider.proxy, getattr(key, "proxy", None))
-            sync_proxy_info = resolve_proxy_info(_effective_proxy)
+            sync_proxy_info = await resolve_proxy_info_async(_effective_proxy)
             _proxy_label = get_proxy_label(sync_proxy_info)
 
             logger.info(
@@ -291,16 +291,16 @@ class CliSyncMixin:
             # 注意：使用 get_proxy_client 复用连接池，不再每次创建新客户端
             from src.clients.http_client import HTTPClientPool
             from src.services.proxy_node.resolver import (
-                build_post_kwargs,
-                build_stream_kwargs,
-                resolve_delegate_config,
+                build_post_kwargs_async,
+                build_stream_kwargs_async,
+                resolve_delegate_config_async,
             )
 
             # 非流式请求使用 http_request_timeout 作为整体超时
             # 优先使用 Provider 配置，否则使用全局配置
             request_timeout = provider.request_timeout or config.http_request_timeout
 
-            delegate_cfg = resolve_delegate_config(_effective_proxy)
+            delegate_cfg = await resolve_delegate_config_async(_effective_proxy)
             http_client = await HTTPClientPool.get_upstream_client(
                 delegate_cfg,
                 proxy_config=_effective_proxy,
@@ -312,7 +312,7 @@ class CliSyncMixin:
             resp: httpx.Response | None = None
             if not upstream_is_stream:
                 try:
-                    _pkw = build_post_kwargs(
+                    _pkw = await build_post_kwargs_async(
                         delegate_cfg,
                         url=url,
                         headers=provider_headers,
@@ -337,7 +337,7 @@ class CliSyncMixin:
                 )
 
                 try:
-                    _stream_args = build_stream_kwargs(
+                    _stream_args = await build_stream_kwargs_async(
                         delegate_cfg,
                         url=url,
                         headers=provider_headers,

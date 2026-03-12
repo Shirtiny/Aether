@@ -153,7 +153,7 @@ class FailoverEngine:
     async def _rotate_upstream_client(self, candidate: ProviderCandidate) -> bool:
         from src.clients.http_client import HTTPClientPool
         from src.services.proxy_node.resolver import (
-            resolve_delegate_config,
+            resolve_delegate_config_async,
             resolve_effective_proxy,
         )
 
@@ -161,7 +161,7 @@ class FailoverEngine:
             getattr(candidate.provider, "proxy", None),
             getattr(candidate.key, "proxy", None),
         )
-        delegate_cfg = resolve_delegate_config(effective_proxy)
+        delegate_cfg = await resolve_delegate_config_async(effective_proxy)
         return await HTTPClientPool.reset_upstream_client(
             delegate_cfg, proxy_config=effective_proxy
         )

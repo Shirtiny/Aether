@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -28,6 +29,7 @@ from src.api.base.pipeline import ApiRequestPipeline
 from src.core.crypto import crypto_service
 from src.core.exceptions import NotFoundException
 from src.core.logger import logger
+from src.core.provider_oauth_utils import normalize_oauth_organizations
 from src.database import get_db
 from src.models.database import Provider, ProviderAPIKey
 from src.services.billing.precision import to_money_decimal
@@ -52,6 +54,9 @@ from .schemas import (
     BatchImportRequest,
     BatchImportResponse,
     PoolKeyDetail,
+    PoolKeySelectionItem,
+    PoolKeySelectionRequest,
+    PoolKeySelectionResponse,
     PoolKeysPageResponse,
     PoolOverviewItem,
     PoolOverviewResponse,
@@ -117,6 +122,10 @@ async def list_pool_keys(
     page_size: int = Query(50, ge=1, le=200),
     search: str = Query("", description="Search by key name"),
     status: str = Query("all", description="all/active/cooldown/inactive"),
+    quick_selectors: str = Query(
+        "", description="Comma-separated quick selectors for batch dialog"
+    ),
+    search_scope: str = Query("name", description="Search scope: name/full"),
     db: Session = Depends(get_db),
 ) -> PoolKeysPageResponse:
     """Server-side paginated account list for a pool-enabled provider."""
@@ -126,6 +135,8 @@ async def list_pool_keys(
         page_size=page_size,
         search=search,
         status=status,
+        quick_selectors=quick_selectors.split(",") if quick_selectors else [],
+        search_scope=search_scope,
     )
     return await pipeline.run(adapter=adapter, http_request=request, db=db, mode=adapter.mode)
 
@@ -345,6 +356,32 @@ def _derive_oauth_plan_type(
     return None
 
 
+def _derive_oauth_account_id(auth_config: dict[str, Any] | None = None) -> str | None:
+    if not isinstance(auth_config, dict):
+        return None
+    raw = auth_config.get("account_id")
+    if not isinstance(raw, str):
+        return None
+    normalized = raw.strip()
+    return normalized or None
+
+
+def _derive_oauth_account_user_id(auth_config: dict[str, Any] | None = None) -> str | None:
+    if not isinstance(auth_config, dict):
+        return None
+    raw = auth_config.get("account_user_id")
+    if not isinstance(raw, str):
+        return None
+    normalized = raw.strip()
+    return normalized or None
+
+
+def _derive_oauth_organizations(auth_config: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    if not isinstance(auth_config, dict):
+        return []
+    return normalize_oauth_organizations(auth_config.get("organizations"))
+
+
 def _compute_health_aggregate(
     health_by_format: Any, circuit_breaker_by_format: Any
 ) -> tuple[float, bool]:
@@ -452,6 +489,18 @@ async def batch_action_keys(
 ) -> BatchActionResponse:
     """Batch enable/disable/delete/clear_cooldown/reset_cost/regenerate_fingerprint on pool keys."""
     adapter = AdminBatchActionKeysAdapter(provider_id=provider_id, body=body)
+    return await pipeline.run(adapter=adapter, http_request=request, db=db, mode=adapter.mode)
+
+
+@router.post("/{provider_id}/keys/resolve-selection", response_model=PoolKeySelectionResponse)
+async def resolve_pool_key_selection(
+    provider_id: str,
+    body: PoolKeySelectionRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> PoolKeySelectionResponse:
+    """Resolve all key ids matching the current batch dialog filters."""
+    adapter = AdminResolvePoolKeySelectionAdapter(provider_id=provider_id, body=body)
     return await pipeline.run(adapter=adapter, http_request=request, db=db, mode=adapter.mode)
 
 
@@ -626,6 +675,514 @@ class AdminPoolOverviewAdapter(AdminApiAdapter):
         return PoolOverviewResponse(items=items)
 
 
+_FULL_SEARCH_SCOPE = "full"
+_ALLOWED_POOL_KEY_QUICK_SELECTORS = frozenset(
+    {
+        "banned",
+        "no_5h_limit",
+        "no_weekly_limit",
+        "plan_free",
+        "plan_team",
+        "oauth_invalid",
+        "proxy_unset",
+        "proxy_set",
+        "disabled",
+        "enabled",
+    }
+)
+_ACCOUNT_BANNED_CODES = frozenset({"account_banned", "account_forbidden", "account_blocked"})
+_BANNED_REASON_PATTERN = re.compile(r"(banned|forbidden|blocked|suspend|封|禁|受限)")
+
+
+def _normalize_batch_text(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _normalize_pool_search_scope(value: Any) -> str:
+    return _FULL_SEARCH_SCOPE if _normalize_batch_text(value) == _FULL_SEARCH_SCOPE else "name"
+
+
+def _normalize_pool_quick_selectors(values: Any) -> list[str]:
+    if values is None:
+        return []
+    if isinstance(values, str):
+        raw_items = values.split(",")
+    elif isinstance(values, (list, tuple, set)):
+        raw_items = [str(item) for item in values]
+    else:
+        return []
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_items:
+        item = _normalize_batch_text(raw)
+        if not item or item not in _ALLOWED_POOL_KEY_QUICK_SELECTORS or item in seen:
+            continue
+        seen.add(item)
+        normalized.append(item)
+    return normalized
+
+
+def _normalize_quota_segment(value: Any) -> str:
+    return str(value or "").strip().lower().replace("％", "%")
+
+
+def _get_quota_segments(account_quota: Any) -> list[str]:
+    return [
+        segment
+        for segment in (
+            _normalize_quota_segment(part) for part in str(account_quota or "").split("|")
+        )
+        if segment
+    ]
+
+
+def _quota_segment_has_depleted_keyword(segment: str) -> bool:
+    return bool(
+        re.search(r"(无额度|额度不足|已耗尽|耗尽|depleted|exhausted|insufficient)", segment)
+    )
+
+
+def _quota_segment_has_zero_remaining_text(segment: str) -> bool:
+    return bool(re.search(r"剩余\s*0(?:\.0+)?(?!\d)", segment))
+
+
+def _quota_segment_has_zero_ratio(segment: str) -> bool:
+    for match in re.finditer(r"(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)", segment):
+        numerator = float(match.group(1))
+        denominator = float(match.group(2))
+        if numerator == 0 and denominator > 0:
+            return True
+    return False
+
+
+def _quota_segment_has_zero_percent(segment: str) -> bool:
+    for match in re.finditer(r"(\d+(?:\.\d+)?)\s*%", segment):
+        if float(match.group(1)) == 0:
+            return True
+    return False
+
+
+def _is_depleted_quota_segment(segment: str) -> bool:
+    return (
+        _quota_segment_has_depleted_keyword(segment)
+        or _quota_segment_has_zero_remaining_text(segment)
+        or _quota_segment_has_zero_ratio(segment)
+        or _quota_segment_has_zero_percent(segment)
+    )
+
+
+def _has_no_five_hour_limit(account_quota: Any) -> bool:
+    return any(
+        _is_depleted_quota_segment(segment)
+        for segment in _get_quota_segments(account_quota)
+        if "5h" in segment or "5小时" in segment
+    )
+
+
+def _has_no_weekly_limit(account_quota: Any) -> bool:
+    return any(
+        _is_depleted_quota_segment(segment)
+        for segment in _get_quota_segments(account_quota)
+        if "周" in segment or "weekly" in segment or "week" in segment
+    )
+
+
+def _detail_is_oauth_invalid(detail: PoolKeyDetail) -> bool:
+    if _normalize_batch_text(detail.auth_type) != "oauth":
+        return False
+    if detail.oauth_invalid_at is not None or _normalize_batch_text(detail.oauth_invalid_reason):
+        return True
+    expires_at = detail.oauth_expires_at
+    return isinstance(expires_at, int) and expires_at > 0 and expires_at <= int(time.time())
+
+
+def _detail_is_banned(detail: PoolKeyDetail) -> bool:
+    reason = _normalize_batch_text(detail.oauth_invalid_reason)
+    if reason and _BANNED_REASON_PATTERN.search(reason):
+        return True
+    for item in detail.scheduling_reasons or []:
+        code = _normalize_batch_text(getattr(item, "code", ""))
+        if code in _ACCOUNT_BANNED_CODES:
+            return True
+    return False
+
+
+def _detail_has_proxy(detail: PoolKeyDetail) -> bool:
+    proxy = detail.proxy if isinstance(detail.proxy, dict) else None
+    return bool(_normalize_batch_text((proxy or {}).get("node_id")))
+
+
+def _matches_pool_key_search(
+    detail: PoolKeyDetail,
+    search: str,
+    *,
+    search_scope: str = _FULL_SEARCH_SCOPE,
+) -> bool:
+    keyword = _normalize_batch_text(search)
+    if not keyword:
+        return True
+    if search_scope != _FULL_SEARCH_SCOPE:
+        return keyword in _normalize_batch_text(detail.key_name)
+
+    parts = [
+        detail.key_name,
+        detail.auth_type,
+        detail.oauth_plan_type,
+        detail.account_quota,
+        "独立代理" if _detail_has_proxy(detail) else "未配置代理",
+        "已启用" if detail.is_active else "已禁用",
+        detail.oauth_invalid_reason,
+    ]
+    return any(keyword in _normalize_batch_text(part) for part in parts)
+
+
+def _matches_pool_key_quick_selector(detail: PoolKeyDetail, selector: str) -> bool:
+    if selector == "banned":
+        return _detail_is_banned(detail)
+    if selector == "no_5h_limit":
+        return _has_no_five_hour_limit(detail.account_quota)
+    if selector == "no_weekly_limit":
+        return _has_no_weekly_limit(detail.account_quota)
+    if selector == "plan_free":
+        return "free" in _normalize_batch_text(detail.oauth_plan_type)
+    if selector == "plan_team":
+        return "team" in _normalize_batch_text(detail.oauth_plan_type)
+    if selector == "oauth_invalid":
+        return _detail_is_oauth_invalid(detail)
+    if selector == "proxy_unset":
+        return not _detail_has_proxy(detail)
+    if selector == "proxy_set":
+        return _detail_has_proxy(detail)
+    if selector == "disabled":
+        return not detail.is_active
+    if selector == "enabled":
+        return detail.is_active
+    return False
+
+
+def _filter_pool_key_details(
+    details: list[PoolKeyDetail],
+    *,
+    search: str = "",
+    quick_selectors: list[str] | None = None,
+    search_scope: str = _FULL_SEARCH_SCOPE,
+    require_cooldown: bool = False,
+) -> list[PoolKeyDetail]:
+    normalized_selectors = _normalize_pool_quick_selectors(quick_selectors)
+    normalized_search_scope = _normalize_pool_search_scope(search_scope)
+    filtered: list[PoolKeyDetail] = []
+    for detail in details:
+        if require_cooldown and not detail.cooldown_reason:
+            continue
+        if not _matches_pool_key_search(detail, search, search_scope=normalized_search_scope):
+            continue
+        if normalized_selectors and not any(
+            _matches_pool_key_quick_selector(detail, selector) for selector in normalized_selectors
+        ):
+            continue
+        filtered.append(detail)
+    return filtered
+
+
+def _build_pool_keys_base_query(db: Session, provider_id: str) -> Any:
+    return (
+        db.query(ProviderAPIKey)
+        .options(
+            load_only(
+                ProviderAPIKey.id,
+                ProviderAPIKey.provider_id,
+                ProviderAPIKey.name,
+                ProviderAPIKey.auth_type,
+                ProviderAPIKey.auth_config,
+                ProviderAPIKey.is_active,
+                ProviderAPIKey.expires_at,
+                ProviderAPIKey.oauth_invalid_at,
+                ProviderAPIKey.oauth_invalid_reason,
+                ProviderAPIKey.api_formats,
+                ProviderAPIKey.rate_multipliers,
+                ProviderAPIKey.internal_priority,
+                ProviderAPIKey.rpm_limit,
+                ProviderAPIKey.cache_ttl_minutes,
+                ProviderAPIKey.max_probe_interval_minutes,
+                ProviderAPIKey.note,
+                ProviderAPIKey.allowed_models,
+                ProviderAPIKey.capabilities,
+                ProviderAPIKey.auto_fetch_models,
+                ProviderAPIKey.locked_models,
+                ProviderAPIKey.model_include_patterns,
+                ProviderAPIKey.model_exclude_patterns,
+                ProviderAPIKey.proxy,
+                ProviderAPIKey.fingerprint,
+                ProviderAPIKey.health_by_format,
+                ProviderAPIKey.circuit_breaker_by_format,
+                ProviderAPIKey.request_count,
+                ProviderAPIKey.total_tokens,
+                ProviderAPIKey.total_cost_usd,
+                ProviderAPIKey.last_used_at,
+                ProviderAPIKey.created_at,
+                ProviderAPIKey.upstream_metadata,
+            )
+        )
+        .filter(ProviderAPIKey.provider_id == provider_id)
+    )
+
+
+def _apply_pool_key_order(query: Any) -> Any:
+    return query.order_by(
+        ProviderAPIKey.internal_priority.asc(),
+        ProviderAPIKey.created_at.asc(),
+    )
+
+
+async def _serialize_pool_key_details(
+    *,
+    keys: list[ProviderAPIKey],
+    pid: str,
+    provider_type: str,
+    pcfg: Any,
+) -> tuple[list[PoolKeyDetail], float, float]:
+    redis_state_ms = 0.0
+    key_ids = [str(k.id) for k in keys]
+    sticky_counts: dict[str, int] = {kid: 0 for kid in key_ids}
+
+    if key_ids:
+        _lru_coro = (
+            pool_redis.get_lru_scores(pid, key_ids)
+            if pcfg and pcfg.lru_enabled
+            else asyncio.sleep(0, result={})
+        )
+        _latency_coro = (
+            pool_redis.batch_get_latency_avgs(pid, key_ids, pcfg.latency_window_seconds)
+            if pcfg and pcfg.scheduling_mode == "multi_score"
+            else asyncio.sleep(0, result={})
+        )
+        _cost_coro = (
+            pool_redis.batch_get_cost_totals(pid, key_ids, pcfg.cost_window_seconds)
+            if pcfg
+            else asyncio.sleep(0, result={})
+        )
+        redis_started_at = time.perf_counter()
+        (
+            cooldowns,
+            cooldown_ttls,
+            lru_scores,
+            latency_avgs,
+            cost_totals,
+        ) = await asyncio.gather(
+            pool_redis.batch_get_cooldowns(pid, key_ids),
+            pool_redis.batch_get_cooldown_ttls(pid, key_ids),
+            _lru_coro,
+            _latency_coro,
+            _cost_coro,
+        )
+        redis_state_ms += (time.perf_counter() - redis_started_at) * 1000.0
+    else:
+        cooldowns, cooldown_ttls, lru_scores, latency_avgs, cost_totals = (
+            {},
+            {},
+            {},
+            {},
+            {},
+        )
+
+    key_details: list[PoolKeyDetail] = []
+    serialize_started_at = time.perf_counter()
+    for k in keys:
+        kid = str(k.id)
+        cd_reason = cooldowns.get(kid)
+        cd_ttl = cooldown_ttls.get(kid) if cd_reason else None
+        health_score, any_circuit_open = _compute_health_aggregate(
+            getattr(k, "health_by_format", None),
+            getattr(k, "circuit_breaker_by_format", None),
+        )
+        cost_usage = int(cost_totals.get(kid, 0) or 0)
+        cost_limit = pcfg.cost_limit_per_key_tokens if pcfg else None
+        latency_avg_raw = latency_avgs.get(kid)
+        latency_avg_ms = float(latency_avg_raw) if latency_avg_raw is not None else None
+        account_state = resolve_pool_account_state(
+            provider_type=provider_type,
+            upstream_metadata=getattr(k, "upstream_metadata", None),
+            oauth_invalid_reason=getattr(k, "oauth_invalid_reason", None),
+        )
+        (
+            scheduling_status,
+            scheduling_reason,
+            scheduling_label,
+            scheduling_reasons,
+        ) = _build_pool_scheduling_state(
+            is_active=bool(k.is_active),
+            account_blocked=account_state.blocked,
+            account_block_label=account_state.label,
+            account_block_reason=account_state.reason,
+            latency_avg_ms=latency_avg_ms,
+            cooldown_reason=cd_reason,
+            cooldown_ttl_seconds=cd_ttl,
+            circuit_breaker_open=any_circuit_open,
+            cost_window_usage=cost_usage,
+            cost_limit=cost_limit,
+            cost_soft_threshold_percent=(pcfg.cost_soft_threshold_percent if pcfg else 80),
+            health_score=health_score,
+        )
+
+        raw_allowed_models = getattr(k, "allowed_models", None)
+        allowed_models = (
+            [str(item) for item in raw_allowed_models]
+            if isinstance(raw_allowed_models, list)
+            else None
+        )
+        raw_locked_models = getattr(k, "locked_models", None)
+        locked_models = (
+            [str(item) for item in raw_locked_models]
+            if isinstance(raw_locked_models, list)
+            else None
+        )
+        raw_include_patterns = getattr(k, "model_include_patterns", None)
+        include_patterns = (
+            [str(item) for item in raw_include_patterns]
+            if isinstance(raw_include_patterns, list)
+            else None
+        )
+        raw_exclude_patterns = getattr(k, "model_exclude_patterns", None)
+        exclude_patterns = (
+            [str(item) for item in raw_exclude_patterns]
+            if isinstance(raw_exclude_patterns, list)
+            else None
+        )
+        capabilities = (
+            {str(name): bool(enabled) for name, enabled in k.capabilities.items()}
+            if isinstance(getattr(k, "capabilities", None), dict)
+            else None
+        )
+        rate_multipliers: dict[str, float] | None = None
+        if isinstance(getattr(k, "rate_multipliers", None), dict):
+            converted: dict[str, float] = {}
+            for fmt, raw_val in k.rate_multipliers.items():
+                num_val = _to_float(raw_val)
+                if num_val is None:
+                    continue
+                converted[str(fmt)] = num_val
+            rate_multipliers = converted or None
+        api_formats = (
+            [str(fmt) for fmt in getattr(k, "api_formats", []) if isinstance(fmt, str)]
+            if isinstance(getattr(k, "api_formats", None), list)
+            else []
+        )
+        key_request_count = int(getattr(k, "request_count", 0) or 0)
+        key_total_tokens = int(getattr(k, "total_tokens", 0) or 0)
+        key_total_cost_usd = _serialize_money(getattr(k, "total_cost_usd", 0.0))
+        key_last_used_at = getattr(k, "last_used_at", None)
+        oauth_auth_config = _extract_oauth_auth_config(k)
+
+        key_details.append(
+            PoolKeyDetail(
+                key_id=kid,
+                key_name=k.name or "",
+                is_active=bool(k.is_active),
+                auth_type=str(getattr(k, "auth_type", "api_key") or "api_key"),
+                oauth_expires_at=_derive_oauth_expires_at(k, auth_config=oauth_auth_config),
+                oauth_invalid_at=(
+                    int(k.oauth_invalid_at.timestamp())
+                    if getattr(k, "oauth_invalid_at", None)
+                    else None
+                ),
+                oauth_invalid_reason=getattr(k, "oauth_invalid_reason", None),
+                oauth_plan_type=_derive_oauth_plan_type(
+                    k, provider_type, auth_config=oauth_auth_config
+                ),
+                oauth_account_id=_derive_oauth_account_id(oauth_auth_config),
+                oauth_account_user_id=_derive_oauth_account_user_id(oauth_auth_config),
+                oauth_organizations=_derive_oauth_organizations(oauth_auth_config),
+                quota_updated_at=_extract_quota_updated_at(
+                    provider_type,
+                    getattr(k, "upstream_metadata", None),
+                ),
+                health_score=health_score,
+                circuit_breaker_open=any_circuit_open,
+                api_formats=api_formats,
+                rate_multipliers=rate_multipliers,
+                internal_priority=int(getattr(k, "internal_priority", 50) or 50),
+                rpm_limit=getattr(k, "rpm_limit", None),
+                cache_ttl_minutes=(
+                    v if (v := getattr(k, "cache_ttl_minutes", None)) is not None else 5
+                ),
+                max_probe_interval_minutes=(
+                    v if (v := getattr(k, "max_probe_interval_minutes", None)) is not None else 32
+                ),
+                note=getattr(k, "note", None),
+                allowed_models=allowed_models,
+                capabilities=capabilities,
+                auto_fetch_models=bool(getattr(k, "auto_fetch_models", False)),
+                locked_models=locked_models,
+                model_include_patterns=include_patterns,
+                model_exclude_patterns=exclude_patterns,
+                proxy=_mask_proxy_password(getattr(k, "proxy", None)),
+                fingerprint=(
+                    getattr(k, "fingerprint", None)
+                    if isinstance(getattr(k, "fingerprint", None), dict)
+                    else None
+                ),
+                account_quota=_build_account_quota(
+                    provider_type,
+                    getattr(k, "upstream_metadata", None),
+                ),
+                cooldown_reason=cd_reason,
+                cooldown_ttl_seconds=cd_ttl,
+                cost_window_usage=cost_usage,
+                cost_limit=cost_limit,
+                request_count=key_request_count,
+                total_tokens=key_total_tokens,
+                total_cost_usd=key_total_cost_usd,
+                sticky_sessions=sticky_counts.get(kid, 0),
+                lru_score=lru_scores.get(kid),
+                created_at=(k.created_at.isoformat() if getattr(k, "created_at", None) else None),
+                last_used_at=(key_last_used_at.isoformat() if key_last_used_at else None),
+                scheduling_status=scheduling_status,
+                scheduling_reason=scheduling_reason,
+                scheduling_label=scheduling_label,
+                scheduling_reasons=scheduling_reasons,
+            )
+        )
+    serialize_ms = (time.perf_counter() - serialize_started_at) * 1000.0
+    return key_details, redis_state_ms, serialize_ms
+
+
+_DEFAULT_POOL_KEY_SCAN_LIMIT = 5000
+_RESOLVE_SELECTION_SCAN_LIMIT = 10000
+
+
+async def _resolve_filtered_pool_key_details(
+    *,
+    query: Any,
+    pid: str,
+    provider_type: str,
+    pcfg: Any,
+    search: str,
+    quick_selectors: list[str],
+    search_scope: str,
+    require_cooldown: bool,
+    max_scan: int = _DEFAULT_POOL_KEY_SCAN_LIMIT,
+) -> tuple[list[PoolKeyDetail], float, float, float]:
+    keys_query_started_at = time.perf_counter()
+    ordered = _apply_pool_key_order(query)
+    keys = ordered.limit(max_scan).all() if max_scan > 0 else ordered.all()
+    keys_query_ms = (time.perf_counter() - keys_query_started_at) * 1000.0
+    key_details, redis_state_ms, serialize_ms = await _serialize_pool_key_details(
+        keys=keys,
+        pid=pid,
+        provider_type=provider_type,
+        pcfg=pcfg,
+    )
+    filtered_details = _filter_pool_key_details(
+        key_details,
+        search=search,
+        quick_selectors=quick_selectors,
+        search_scope=search_scope,
+        require_cooldown=require_cooldown,
+    )
+    return filtered_details, keys_query_ms, redis_state_ms, serialize_ms
+
+
 @dataclass
 class AdminListPoolKeysAdapter(AdminApiAdapter):
     provider_id: str = ""
@@ -633,6 +1190,8 @@ class AdminListPoolKeysAdapter(AdminApiAdapter):
     page_size: int = 50
     search: str = ""
     status: str = "all"
+    quick_selectors: list[str] = field(default_factory=list)
+    search_scope: str = "name"
 
     async def handle(self, context: ApiRequestContext) -> Any:  # type: ignore[override]
         started_at = time.perf_counter()
@@ -649,50 +1208,11 @@ class AdminListPoolKeysAdapter(AdminApiAdapter):
         pcfg = parse_pool_config(getattr(provider, "config", None))
         pid = str(provider.id)
         provider_type = str(getattr(provider, "provider_type", "custom") or "custom")
+        normalized_quick_selectors = _normalize_pool_quick_selectors(self.quick_selectors)
+        normalized_search_scope = _normalize_pool_search_scope(self.search_scope)
 
-        # Base query
-        q = (
-            db.query(ProviderAPIKey)
-            .options(
-                load_only(
-                    ProviderAPIKey.id,
-                    ProviderAPIKey.provider_id,
-                    ProviderAPIKey.name,
-                    ProviderAPIKey.auth_type,
-                    ProviderAPIKey.auth_config,
-                    ProviderAPIKey.is_active,
-                    ProviderAPIKey.expires_at,
-                    ProviderAPIKey.oauth_invalid_at,
-                    ProviderAPIKey.oauth_invalid_reason,
-                    ProviderAPIKey.api_formats,
-                    ProviderAPIKey.rate_multipliers,
-                    ProviderAPIKey.internal_priority,
-                    ProviderAPIKey.rpm_limit,
-                    ProviderAPIKey.cache_ttl_minutes,
-                    ProviderAPIKey.max_probe_interval_minutes,
-                    ProviderAPIKey.note,
-                    ProviderAPIKey.allowed_models,
-                    ProviderAPIKey.capabilities,
-                    ProviderAPIKey.auto_fetch_models,
-                    ProviderAPIKey.locked_models,
-                    ProviderAPIKey.model_include_patterns,
-                    ProviderAPIKey.model_exclude_patterns,
-                    ProviderAPIKey.proxy,
-                    ProviderAPIKey.fingerprint,
-                    ProviderAPIKey.health_by_format,
-                    ProviderAPIKey.circuit_breaker_by_format,
-                    ProviderAPIKey.request_count,
-                    ProviderAPIKey.total_tokens,
-                    ProviderAPIKey.total_cost_usd,
-                    ProviderAPIKey.last_used_at,
-                    ProviderAPIKey.created_at,
-                    ProviderAPIKey.upstream_metadata,
-                )
-            )
-            .filter(ProviderAPIKey.provider_id == pid)
-        )
-
-        if self.search:
+        q = _build_pool_keys_base_query(db, pid)
+        if self.search and normalized_search_scope != _FULL_SEARCH_SCOPE:
             escaped = self.search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
             q = q.filter(ProviderAPIKey.name.ilike(f"%{escaped}%"))
 
@@ -700,253 +1220,43 @@ class AdminListPoolKeysAdapter(AdminApiAdapter):
             q = q.filter(ProviderAPIKey.is_active.is_(True))
         elif self.status == "inactive":
             q = q.filter(ProviderAPIKey.is_active.is_(False))
-        # "cooldown" filtering is done post-query (Redis state)
 
         total = 0
-
-        # For cooldown filtering we need to fetch all, then filter, then paginate.
-        # Limit scan range to avoid loading the entire table into memory.
-        if self.status == "cooldown":
-            _max_scan = 2000
-            keys_query_started_at = time.perf_counter()
-            all_keys = (
-                q.order_by(
-                    ProviderAPIKey.internal_priority.asc(),
-                    ProviderAPIKey.created_at.asc(),
+        if (
+            normalized_quick_selectors
+            or self.status == "cooldown"
+            or (bool(self.search) and normalized_search_scope == _FULL_SEARCH_SCOPE)
+        ):
+            filtered_details, keys_query_ms, redis_state_ms, serialize_ms = (
+                await _resolve_filtered_pool_key_details(
+                    query=q,
+                    pid=pid,
+                    provider_type=provider_type,
+                    pcfg=pcfg,
+                    search=self.search,
+                    quick_selectors=normalized_quick_selectors,
+                    search_scope=normalized_search_scope,
+                    require_cooldown=self.status == "cooldown",
                 )
-                .limit(_max_scan)
-                .all()
             )
-            keys_query_ms = (time.perf_counter() - keys_query_started_at) * 1000.0
-            key_ids = [str(k.id) for k in all_keys]
-            cooldown_scan_started_at = time.perf_counter()
-            cooldowns = await pool_redis.batch_get_cooldowns(pid, key_ids) if key_ids else {}
-            redis_state_ms += (time.perf_counter() - cooldown_scan_started_at) * 1000.0
-            all_keys = [k for k in all_keys if cooldowns.get(str(k.id)) is not None]
-            total = len(all_keys)
+            total = len(filtered_details)
             offset = (self.page - 1) * self.page_size
-            keys = all_keys[offset : offset + self.page_size]
+            key_details = filtered_details[offset : offset + self.page_size]
         else:
             count_query_started_at = time.perf_counter()
             total = int(q.with_entities(func.count(ProviderAPIKey.id)).scalar() or 0)
             count_query_ms = (time.perf_counter() - count_query_started_at) * 1000.0
             offset = (self.page - 1) * self.page_size
             keys_query_started_at = time.perf_counter()
-            keys = (
-                q.order_by(
-                    ProviderAPIKey.internal_priority.asc(),
-                    ProviderAPIKey.created_at.asc(),
-                )
-                .offset(offset)
-                .limit(self.page_size)
-                .all()
-            )
+            keys = _apply_pool_key_order(q).offset(offset).limit(self.page_size).all()
             keys_query_ms = (time.perf_counter() - keys_query_started_at) * 1000.0
-
-        # Batch fetch Redis state (parallel where possible)
-        key_ids = [str(k.id) for k in keys]
-        # Sticky session counts are no longer fetched from Redis to reduce
-        # round-trips; the field is kept at 0 for schema compatibility.
-        sticky_counts: dict[str, int] = {kid: 0 for kid in key_ids}
-        if key_ids:
-            _lru_coro = (
-                pool_redis.get_lru_scores(pid, key_ids)
-                if pcfg and pcfg.lru_enabled
-                else asyncio.sleep(0, result={})
-            )
-            _latency_coro = (
-                pool_redis.batch_get_latency_avgs(pid, key_ids, pcfg.latency_window_seconds)
-                if pcfg and pcfg.scheduling_mode == "multi_score"
-                else asyncio.sleep(0, result={})
-            )
-            _cost_coro = (
-                pool_redis.batch_get_cost_totals(pid, key_ids, pcfg.cost_window_seconds)
-                if pcfg
-                else asyncio.sleep(0, result={})
-            )
-            redis_started_at = time.perf_counter()
-            (
-                cooldowns,
-                cooldown_ttls,
-                lru_scores,
-                latency_avgs,
-                cost_totals,
-            ) = await asyncio.gather(
-                pool_redis.batch_get_cooldowns(pid, key_ids),
-                pool_redis.batch_get_cooldown_ttls(pid, key_ids),
-                _lru_coro,
-                _latency_coro,
-                _cost_coro,
-            )
-            redis_state_ms += (time.perf_counter() - redis_started_at) * 1000.0
-        else:
-            cooldowns, cooldown_ttls, lru_scores, latency_avgs, cost_totals = (
-                {},
-                {},
-                {},
-                {},
-                {},
-            )
-
-        key_details: list[PoolKeyDetail] = []
-        serialize_started_at = time.perf_counter()
-        for k in keys:
-            kid = str(k.id)
-            cd_reason = cooldowns.get(kid)
-            cd_ttl = cooldown_ttls.get(kid) if cd_reason else None
-            health_score, any_circuit_open = _compute_health_aggregate(
-                getattr(k, "health_by_format", None),
-                getattr(k, "circuit_breaker_by_format", None),
-            )
-            cost_usage = int(cost_totals.get(kid, 0) or 0)
-            cost_limit = pcfg.cost_limit_per_key_tokens if pcfg else None
-            latency_avg_raw = latency_avgs.get(kid)
-            latency_avg_ms = float(latency_avg_raw) if latency_avg_raw is not None else None
-            account_state = resolve_pool_account_state(
+            key_details, extra_redis_ms, serialize_ms = await _serialize_pool_key_details(
+                keys=keys,
+                pid=pid,
                 provider_type=provider_type,
-                upstream_metadata=getattr(k, "upstream_metadata", None),
-                oauth_invalid_reason=getattr(k, "oauth_invalid_reason", None),
+                pcfg=pcfg,
             )
-            (
-                scheduling_status,
-                scheduling_reason,
-                scheduling_label,
-                scheduling_reasons,
-            ) = _build_pool_scheduling_state(
-                is_active=bool(k.is_active),
-                account_blocked=account_state.blocked,
-                account_block_label=account_state.label,
-                account_block_reason=account_state.reason,
-                latency_avg_ms=latency_avg_ms,
-                cooldown_reason=cd_reason,
-                cooldown_ttl_seconds=cd_ttl,
-                circuit_breaker_open=any_circuit_open,
-                cost_window_usage=cost_usage,
-                cost_limit=cost_limit,
-                cost_soft_threshold_percent=(pcfg.cost_soft_threshold_percent if pcfg else 80),
-                health_score=health_score,
-            )
-
-            raw_allowed_models = getattr(k, "allowed_models", None)
-            allowed_models = (
-                [str(item) for item in raw_allowed_models]
-                if isinstance(raw_allowed_models, list)
-                else None
-            )
-            raw_locked_models = getattr(k, "locked_models", None)
-            locked_models = (
-                [str(item) for item in raw_locked_models]
-                if isinstance(raw_locked_models, list)
-                else None
-            )
-            raw_include_patterns = getattr(k, "model_include_patterns", None)
-            include_patterns = (
-                [str(item) for item in raw_include_patterns]
-                if isinstance(raw_include_patterns, list)
-                else None
-            )
-            raw_exclude_patterns = getattr(k, "model_exclude_patterns", None)
-            exclude_patterns = (
-                [str(item) for item in raw_exclude_patterns]
-                if isinstance(raw_exclude_patterns, list)
-                else None
-            )
-            capabilities = (
-                {str(name): bool(enabled) for name, enabled in k.capabilities.items()}
-                if isinstance(getattr(k, "capabilities", None), dict)
-                else None
-            )
-            rate_multipliers: dict[str, float] | None = None
-            if isinstance(getattr(k, "rate_multipliers", None), dict):
-                converted: dict[str, float] = {}
-                for fmt, raw_val in k.rate_multipliers.items():
-                    num_val = _to_float(raw_val)
-                    if num_val is None:
-                        continue
-                    converted[str(fmt)] = num_val
-                rate_multipliers = converted or None
-            api_formats = (
-                [str(fmt) for fmt in getattr(k, "api_formats", []) if isinstance(fmt, str)]
-                if isinstance(getattr(k, "api_formats", None), list)
-                else []
-            )
-            key_request_count = int(getattr(k, "request_count", 0) or 0)
-            key_total_tokens = int(getattr(k, "total_tokens", 0) or 0)
-            key_total_cost_usd = _serialize_money(getattr(k, "total_cost_usd", 0.0))
-            key_last_used_at = getattr(k, "last_used_at", None)
-            oauth_auth_config = _extract_oauth_auth_config(k)
-
-            key_details.append(
-                PoolKeyDetail(
-                    key_id=kid,
-                    key_name=k.name or "",
-                    is_active=bool(k.is_active),
-                    auth_type=str(getattr(k, "auth_type", "api_key") or "api_key"),
-                    oauth_expires_at=_derive_oauth_expires_at(k, auth_config=oauth_auth_config),
-                    oauth_invalid_at=(
-                        int(k.oauth_invalid_at.timestamp())
-                        if getattr(k, "oauth_invalid_at", None)
-                        else None
-                    ),
-                    oauth_invalid_reason=getattr(k, "oauth_invalid_reason", None),
-                    oauth_plan_type=_derive_oauth_plan_type(
-                        k, provider_type, auth_config=oauth_auth_config
-                    ),
-                    quota_updated_at=_extract_quota_updated_at(
-                        provider_type,
-                        getattr(k, "upstream_metadata", None),
-                    ),
-                    health_score=health_score,
-                    circuit_breaker_open=any_circuit_open,
-                    api_formats=api_formats,
-                    rate_multipliers=rate_multipliers,
-                    internal_priority=int(getattr(k, "internal_priority", 50) or 50),
-                    rpm_limit=getattr(k, "rpm_limit", None),
-                    cache_ttl_minutes=(
-                        v if (v := getattr(k, "cache_ttl_minutes", None)) is not None else 5
-                    ),
-                    max_probe_interval_minutes=(
-                        v
-                        if (v := getattr(k, "max_probe_interval_minutes", None)) is not None
-                        else 32
-                    ),
-                    note=getattr(k, "note", None),
-                    allowed_models=allowed_models,
-                    capabilities=capabilities,
-                    auto_fetch_models=bool(getattr(k, "auto_fetch_models", False)),
-                    locked_models=locked_models,
-                    model_include_patterns=include_patterns,
-                    model_exclude_patterns=exclude_patterns,
-                    proxy=_mask_proxy_password(getattr(k, "proxy", None)),
-                    fingerprint=(
-                        getattr(k, "fingerprint", None)
-                        if isinstance(getattr(k, "fingerprint", None), dict)
-                        else None
-                    ),
-                    account_quota=_build_account_quota(
-                        provider_type,
-                        getattr(k, "upstream_metadata", None),
-                    ),
-                    cooldown_reason=cd_reason,
-                    cooldown_ttl_seconds=cd_ttl,
-                    cost_window_usage=cost_usage,
-                    cost_limit=cost_limit,
-                    request_count=key_request_count,
-                    total_tokens=key_total_tokens,
-                    total_cost_usd=key_total_cost_usd,
-                    sticky_sessions=sticky_counts.get(kid, 0),
-                    lru_score=lru_scores.get(kid),
-                    created_at=(
-                        k.created_at.isoformat() if getattr(k, "created_at", None) else None
-                    ),
-                    last_used_at=(key_last_used_at.isoformat() if key_last_used_at else None),
-                    scheduling_status=scheduling_status,
-                    scheduling_reason=scheduling_reason,
-                    scheduling_label=scheduling_label,
-                    scheduling_reasons=scheduling_reasons,
-                )
-            )
-        serialize_ms = (time.perf_counter() - serialize_started_at) * 1000.0
+            redis_state_ms += extra_redis_ms
 
         total_ms = (time.perf_counter() - started_at) * 1000.0
         logger.info(
@@ -969,6 +1279,47 @@ class AdminListPoolKeysAdapter(AdminApiAdapter):
             page=self.page,
             page_size=self.page_size,
             keys=key_details,
+        )
+
+
+@dataclass
+class AdminResolvePoolKeySelectionAdapter(AdminApiAdapter):
+    provider_id: str = ""
+    body: PoolKeySelectionRequest = field(default_factory=PoolKeySelectionRequest)
+
+    async def handle(self, context: ApiRequestContext) -> Any:  # type: ignore[override]
+        db = context.db
+        provider = db.query(Provider).filter(Provider.id == self.provider_id).first()
+        if not provider:
+            raise NotFoundException("Provider not found", "provider")
+
+        pcfg = parse_pool_config(getattr(provider, "config", None))
+        pid = str(provider.id)
+        provider_type = str(getattr(provider, "provider_type", "custom") or "custom")
+        q = _build_pool_keys_base_query(db, pid)
+
+        filtered_details, _, _, _ = await _resolve_filtered_pool_key_details(
+            query=q,
+            pid=pid,
+            provider_type=provider_type,
+            pcfg=pcfg,
+            search=self.body.search,
+            quick_selectors=_normalize_pool_quick_selectors(self.body.quick_selectors),
+            search_scope=_FULL_SEARCH_SCOPE,
+            require_cooldown=False,
+            max_scan=_RESOLVE_SELECTION_SCAN_LIMIT,
+        )
+
+        return PoolKeySelectionResponse(
+            total=len(filtered_details),
+            items=[
+                PoolKeySelectionItem(
+                    key_id=detail.key_id,
+                    key_name=detail.key_name,
+                    auth_type=detail.auth_type,
+                )
+                for detail in filtered_details
+            ],
         )
 
 

@@ -226,6 +226,7 @@
     v-model:open="showRegisterDialog"
     :require-email-verification="requireEmailVerification"
     :email-configured="emailConfigured"
+    :password-policy-level="passwordPolicyLevel"
     @success="handleRegisterSuccess"
     @switch-to-login="handleSwitchToLogin"
   />
@@ -241,6 +242,7 @@ import Label from '@/components/ui/label.vue'
 import { useAuthStore } from '@/stores/auth'
 import { useToast } from '@/composables/useToast'
 import { useSiteInfo } from '@/composables/useSiteInfo'
+import { normalizePasswordPolicyLevel, type PasswordPolicyLevel } from '@/utils/passwordPolicy'
 import { isDemoMode, DEMO_ACCOUNTS } from '@/config/demo'
 import RegisterDialog from './RegisterDialog.vue'
 import { authApi } from '@/api/auth'
@@ -266,6 +268,7 @@ const isDemo = computed(() => isDemoMode())
 const showRegisterDialog = ref(false)
 const requireEmailVerification = ref(false)
 const emailConfigured = ref(true) // 邮箱服务是否已配置
+const passwordPolicyLevel = ref<PasswordPolicyLevel>('weak')
 const allowRegistration = ref(false) // 由系统配置控制，默认关闭
 
 // LDAP authentication settings
@@ -378,6 +381,7 @@ onMounted(async () => {
     allowRegistration.value = !!regSettings.enable_registration
     requireEmailVerification.value = !!regSettings.require_email_verification
     emailConfigured.value = !!regSettings.email_configured
+    passwordPolicyLevel.value = normalizePasswordPolicyLevel(regSettings.password_policy_level)
 
     localEnabled.value = authSettings.local_enabled
     ldapEnabled.value = authSettings.ldap_enabled
@@ -402,6 +406,7 @@ onMounted(async () => {
     allowRegistration.value = false
     requireEmailVerification.value = false
     emailConfigured.value = false
+    passwordPolicyLevel.value = 'weak'
     localEnabled.value = true
     ldapEnabled.value = false
     ldapExclusive.value = false

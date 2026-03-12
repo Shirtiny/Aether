@@ -7,6 +7,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.concurrency import run_in_threadpool
 from pydantic import ValidationError
 from sqlalchemy import and_, func
 from sqlalchemy.orm import Session
@@ -24,7 +25,8 @@ from src.core.exceptions import (
     translate_pydantic_error,
 )
 from src.core.logger import logger
-from src.database import get_db
+from src.core.validators import PasswordValidator
+from src.database import get_db, get_db_context
 from src.models.api import (
     ChangePasswordRequest,
     CreateMyApiKeyRequest,
@@ -43,6 +45,8 @@ from src.models.database import (
     User,
     UserModelUsageCount,
 )
+from src.services.cache.user_cache import UserCacheService
+from src.services.system.config import SystemConfigService
 from src.services.system.time_range import TimeRangeParams
 from src.services.usage.service import UsageService
 from src.services.user.apikey import ApiKeyService
@@ -53,6 +57,280 @@ from src.utils.cache_decorator import cache_result
 
 router = APIRouter(prefix="/api/users/me", tags=["User Profile"])
 pipeline = ApiRequestPipeline()
+
+
+def _update_profile_sync(
+    user_id: str,
+    request: UpdateProfileRequest,
+) -> tuple[dict[str, Any], str | None, str | None]:
+    with get_db_context() as db:
+        user = db.query(User).filter(User.id == user_id).first()
+        if not user:
+            raise NotFoundException("用户不存在", "user")
+
+        old_email = user.email
+        new_email = old_email
+
+        if request.email:
+            existing = (
+                db.query(User).filter(User.email == request.email, User.id != user.id).first()
+            )
+            if existing:
+                raise InvalidRequestException("邮箱已被使用")
+            user.email = request.email
+            new_email = request.email
+
+        if request.username:
+            existing = (
+                db.query(User).filter(User.username == request.username, User.id != user.id).first()
+            )
+            if existing:
+                raise InvalidRequestException("用户名已被使用")
+            user.username = request.username
+
+        user.updated_at = datetime.now(timezone.utc)
+        return {"message": "个人信息更新成功"}, old_email, new_email
+
+
+def _change_password_sync(
+    user_id: str,
+    request: ChangePasswordRequest,
+) -> tuple[dict[str, Any], str | None, str]:
+    from src.core.enums import AuthSource
+
+    with get_db_context() as db:
+        user = db.query(User).filter(User.id == user_id).first()
+        if not user:
+            raise NotFoundException("用户不存在", "user")
+
+        if user.auth_source == AuthSource.LDAP:
+            raise ForbiddenException("LDAP 用户不能在此修改密码")
+
+        has_password = bool(user.password_hash)
+        if has_password:
+            if not request.old_password:
+                raise InvalidRequestException("请输入当前密码")
+            if not user.verify_password(request.old_password):
+                raise InvalidRequestException("旧密码错误")
+
+        policy_level = SystemConfigService.get_password_policy_level(db)
+        valid, error_msg = PasswordValidator.validate(request.new_password, policy=policy_level)
+        if not valid:
+            raise InvalidRequestException(error_msg or "密码格式无效")
+
+        user.set_password(request.new_password)
+        user.updated_at = datetime.now(timezone.utc)
+        action = "修改" if has_password else "设置"
+        return {"message": f"密码{action}成功"}, user.email, action
+
+
+def _create_my_api_key_sync(user_id: str, request: CreateMyApiKeyRequest) -> dict[str, Any]:
+    with get_db_context() as db:
+        try:
+            api_key, plain_key = ApiKeyService.create_api_key(
+                db=db,
+                user_id=user_id,
+                name=request.name,
+            )
+        except ValueError as exc:
+            raise InvalidRequestException(str(exc)) from exc
+        return {
+            "id": api_key.id,
+            "name": api_key.name,
+            "key": plain_key,
+            "key_display": api_key.get_display_key(),
+            "message": "API密钥创建成功",
+        }
+
+
+def _delete_my_api_key_sync(user_id: str, key_id: str) -> dict[str, str]:
+    with get_db_context() as db:
+        api_key = db.query(ApiKey).filter(ApiKey.id == key_id, ApiKey.user_id == user_id).first()
+        if not api_key:
+            raise NotFoundException("API密钥不存在", "api_key")
+        if api_key.is_locked:
+            raise ForbiddenException("该密钥已被管理员锁定，无法删除")
+
+        pre_clean_api_key(db, api_key.id)
+        db.delete(api_key)
+        return {"message": "API密钥已删除"}
+
+
+def _toggle_my_api_key_sync(user_id: str, key_id: str) -> dict[str, Any]:
+    with get_db_context() as db:
+        api_key = db.query(ApiKey).filter(ApiKey.id == key_id, ApiKey.user_id == user_id).first()
+        if not api_key:
+            raise NotFoundException("API密钥不存在", "api_key")
+        if api_key.is_locked:
+            raise ForbiddenException("该密钥已被管理员锁定，无法修改状态")
+
+        api_key.is_active = not api_key.is_active
+        db.commit()
+        db.refresh(api_key)
+        return {
+            "id": api_key.id,
+            "is_active": api_key.is_active,
+            "message": f"API密钥已{'启用' if api_key.is_active else '禁用'}",
+        }
+
+
+def _update_api_key_providers_sync(
+    user_id: str,
+    api_key_id: str,
+    request: UpdateApiKeyProvidersRequest,
+) -> dict[str, str]:
+    with get_db_context() as db:
+        api_key = (
+            db.query(ApiKey).filter(ApiKey.id == api_key_id, ApiKey.user_id == user_id).first()
+        )
+        if not api_key:
+            raise NotFoundException("API密钥不存在")
+        if api_key.is_locked:
+            raise ForbiddenException("该密钥已被管理员锁定，无法修改")
+
+        if request.allowed_providers is not None and len(request.allowed_providers) > 0:
+            provider_ids = [cfg.provider_id for cfg in request.allowed_providers]
+            valid = (
+                db.query(Provider.id)
+                .filter(Provider.id.in_(provider_ids), Provider.is_active.is_(True))
+                .all()
+            )
+            valid_ids = {p.id for p in valid}
+            invalid = set(provider_ids) - valid_ids
+            if invalid:
+                raise InvalidRequestException(f"无效的提供商ID: {', '.join(invalid)}")
+
+        api_key.allowed_providers = (
+            [cfg.provider_id for cfg in request.allowed_providers]
+            if request.allowed_providers is not None
+            else None
+        )
+        api_key.updated_at = datetime.now(timezone.utc)
+        return {"message": "API密钥可用提供商已更新"}
+
+
+def _update_api_key_capabilities_sync(
+    user_id: str,
+    api_key_id: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    from src.core.key_capabilities import CAPABILITY_DEFINITIONS, CapabilityConfigMode
+    from src.models.database import AuditEventType
+    from src.services.system.audit import audit_service
+
+    with get_db_context() as db:
+        api_key = (
+            db.query(ApiKey).filter(ApiKey.id == api_key_id, ApiKey.user_id == user_id).first()
+        )
+        if not api_key:
+            raise NotFoundException("API密钥不存在")
+        if api_key.is_locked:
+            raise ForbiddenException("该密钥已被管理员锁定，无法修改")
+
+        old_capabilities = api_key.force_capabilities
+        force_capabilities = payload.get("force_capabilities")
+        if force_capabilities is not None:
+            if not isinstance(force_capabilities, dict):
+                raise InvalidRequestException("force_capabilities 必须是对象类型")
+
+            for cap_name, cap_value in force_capabilities.items():
+                cap_def = CAPABILITY_DEFINITIONS.get(cap_name)
+                if not cap_def:
+                    raise InvalidRequestException(f"未知的能力类型: {cap_name}")
+                if cap_def.config_mode != CapabilityConfigMode.USER_CONFIGURABLE:
+                    raise InvalidRequestException(f"能力 {cap_name} 不支持用户配置")
+                if not isinstance(cap_value, bool):
+                    raise InvalidRequestException(f"能力 {cap_name} 的值必须是布尔类型")
+
+        api_key.force_capabilities = force_capabilities
+        api_key.updated_at = datetime.now(timezone.utc)
+        audit_service.log_event(
+            db=db,
+            event_type=AuditEventType.CONFIG_CHANGED,
+            description="用户更新 API Key 能力配置",
+            user_id=user_id,
+            api_key_id=api_key.id,
+            metadata={
+                "action": "update_api_key_capabilities",
+                "old_capabilities": old_capabilities,
+                "new_capabilities": force_capabilities,
+            },
+        )
+        return {
+            "message": "API密钥能力配置已更新",
+            "force_capabilities": api_key.force_capabilities,
+        }
+
+
+def _update_preferences_sync(user_id: str, request: UpdatePreferencesRequest) -> dict[str, str]:
+    with get_db_context() as db:
+        PreferenceService.update_preferences(
+            db=db,
+            user_id=user_id,
+            avatar_url=request.avatar_url,
+            bio=request.bio,
+            default_provider_id=request.default_provider_id,
+            theme=request.theme,
+            language=request.language,
+            timezone=request.timezone,
+            email_notifications=request.email_notifications,
+            usage_alerts=request.usage_alerts,
+            announcement_notifications=request.announcement_notifications,
+        )
+        return {"message": "偏好设置更新成功"}
+
+
+def _update_model_capability_settings_sync(
+    user_id: str,
+    payload: dict[str, Any],
+) -> tuple[dict[str, Any], str | None]:
+    from src.core.key_capabilities import CAPABILITY_DEFINITIONS, CapabilityConfigMode
+    from src.models.database import AuditEventType
+    from src.services.system.audit import audit_service
+
+    with get_db_context() as db:
+        user = db.query(User).filter(User.id == user_id).first()
+        if not user:
+            raise NotFoundException("用户不存在")
+
+        old_settings = user.model_capability_settings
+        settings = payload.get("model_capability_settings")
+        if settings is not None:
+            if not isinstance(settings, dict):
+                raise InvalidRequestException("model_capability_settings 必须是对象类型")
+
+            for model_name, capabilities in settings.items():
+                if not isinstance(model_name, str):
+                    raise InvalidRequestException("模型名称必须是字符串")
+                if not isinstance(capabilities, dict):
+                    raise InvalidRequestException(f"模型 {model_name} 的能力配置必须是对象类型")
+
+                for cap_name, cap_value in capabilities.items():
+                    cap_def = CAPABILITY_DEFINITIONS.get(cap_name)
+                    if not cap_def:
+                        raise InvalidRequestException(f"未知的能力类型: {cap_name}")
+                    if cap_def.config_mode != CapabilityConfigMode.USER_CONFIGURABLE:
+                        raise InvalidRequestException(f"能力 {cap_name} 不支持用户配置")
+                    if not isinstance(cap_value, bool):
+                        raise InvalidRequestException(f"能力 {cap_name} 的值必须是布尔类型")
+
+        user.model_capability_settings = settings
+        user.updated_at = datetime.now(timezone.utc)
+        audit_service.log_event(
+            db=db,
+            event_type=AuditEventType.CONFIG_CHANGED,
+            description="用户更新模型能力配置",
+            user_id=user.id,
+            metadata={
+                "action": "update_model_capability_settings",
+                "old_settings": old_settings,
+                "new_settings": settings,
+            },
+        )
+        return {
+            "message": "模型能力配置已更新",
+            "model_capability_settings": user.model_capability_settings,
+        }, user.email
 
 
 def _build_time_range_params(
@@ -484,27 +762,15 @@ class UpdateProfileAdapter(AuthenticatedApiAdapter):
                 raise InvalidRequestException(translate_pydantic_error(errors[0]))
             raise InvalidRequestException("请求数据验证失败")
 
-        if request.email:
-            existing = (
-                db.query(User).filter(User.email == request.email, User.id != user.id).first()
-            )
-            if existing:
-                raise InvalidRequestException("邮箱已被使用")
-            user.email = request.email
-
-        if request.username:
-            existing = (
-                db.query(User).filter(User.username == request.username, User.id != user.id).first()
-            )
-            if existing:
-                raise InvalidRequestException("用户名已被使用")
-            user.username = request.username
-
-        user.updated_at = datetime.now(timezone.utc)
-        db.commit()
-        context.request.state.tx_committed_by_route = True
-        db.refresh(user)
-        return {"message": "个人信息更新成功"}
+        result, old_email, new_email = await run_in_threadpool(
+            _update_profile_sync,
+            user.id,
+            request,
+        )
+        await UserCacheService.invalidate_user_cache(user.id, old_email)
+        if new_email and new_email != old_email:
+            await UserCacheService.invalidate_user_cache(user.id, new_email)
+        return result
 
 
 class ChangePasswordAdapter(AuthenticatedApiAdapter):
@@ -522,33 +788,13 @@ class ChangePasswordAdapter(AuthenticatedApiAdapter):
                 raise InvalidRequestException(translate_pydantic_error(errors[0]))
             raise InvalidRequestException("请求数据验证失败")
 
-        # LDAP 用户不能修改密码
-        from src.core.enums import AuthSource
-
-        if user.auth_source == AuthSource.LDAP:
-            raise ForbiddenException("LDAP 用户不能在此修改密码")
-
-        # 判断用户是否已有密码
-        has_password = bool(user.password_hash)
-
-        if has_password:
-            # 已有密码：需要验证旧密码
-            if not request.old_password:
-                raise InvalidRequestException("请输入当前密码")
-            if not user.verify_password(request.old_password):
-                raise InvalidRequestException("旧密码错误")
-        # 无密码（如 OAuth 用户首次设置）：无需旧密码
-
-        if len(request.new_password) < 6:
-            raise InvalidRequestException("密码长度至少6位")
-
-        user.set_password(request.new_password)
-        user.updated_at = datetime.now(timezone.utc)
-        db.commit()
-        context.request.state.tx_committed_by_route = True
-        action = "修改" if has_password else "设置"
-        logger.info(f"用户{action}密码: {user.email}")
-        return {"message": f"密码{action}成功"}
+        result, email, action = await run_in_threadpool(
+            _change_password_sync,
+            user.id,
+            request,
+        )
+        logger.info(f"用户{action}密码: {email}")
+        return result
 
 
 class ListMyApiKeysAdapter(AuthenticatedApiAdapter):
@@ -635,22 +881,8 @@ class CreateMyApiKeyAdapter(AuthenticatedApiAdapter):
             if errors:
                 raise InvalidRequestException(translate_pydantic_error(errors[0]))
             raise InvalidRequestException("请求数据验证失败")
-        try:
-            api_key, plain_key = ApiKeyService.create_api_key(
-                db=context.db,
-                user_id=context.user.id,
-                name=request.name,
-            )
-        except ValueError as exc:
-            raise InvalidRequestException(str(exc))
 
-        return {
-            "id": api_key.id,
-            "name": api_key.name,
-            "key": plain_key,
-            "key_display": api_key.get_display_key(),
-            "message": "API密钥创建成功",
-        }
+        return await run_in_threadpool(_create_my_api_key_sync, context.user.id, request)
 
 
 @dataclass
@@ -725,20 +957,7 @@ class DeleteMyApiKeyAdapter(AuthenticatedApiAdapter):
     key_id: str
 
     async def handle(self, context: ApiRequestContext) -> Any:  # type: ignore[override]
-        api_key = (
-            context.db.query(ApiKey)
-            .filter(ApiKey.id == self.key_id, ApiKey.user_id == context.user.id)
-            .first()
-        )
-        if not api_key:
-            raise NotFoundException("API密钥不存在", "api_key")
-        if api_key.is_locked:
-            raise ForbiddenException("该密钥已被管理员锁定，无法删除")
-        pre_clean_api_key(context.db, api_key.id)
-        context.db.delete(api_key)
-        context.db.commit()
-        context.request.state.tx_committed_by_route = True
-        return {"message": "API密钥已删除"}
+        return await run_in_threadpool(_delete_my_api_key_sync, context.user.id, self.key_id)
 
 
 @dataclass
@@ -748,24 +967,7 @@ class ToggleMyApiKeyAdapter(AuthenticatedApiAdapter):
     key_id: str
 
     async def handle(self, context: ApiRequestContext) -> Any:  # type: ignore[override]
-        api_key = (
-            context.db.query(ApiKey)
-            .filter(ApiKey.id == self.key_id, ApiKey.user_id == context.user.id)
-            .first()
-        )
-        if not api_key:
-            raise NotFoundException("API密钥不存在", "api_key")
-        if api_key.is_locked:
-            raise ForbiddenException("该密钥已被管理员锁定，无法修改状态")
-        api_key.is_active = not api_key.is_active
-        context.db.commit()
-        context.request.state.tx_committed_by_route = True
-        context.db.refresh(api_key)
-        return {
-            "id": api_key.id,
-            "is_active": api_key.is_active,
-            "message": f"API密钥已{'启用' if api_key.is_active else '禁用'}",
-        }
+        return await run_in_threadpool(_toggle_my_api_key_sync, context.user.id, self.key_id)
 
 
 @dataclass
@@ -1456,38 +1658,14 @@ class UpdateApiKeyProvidersAdapter(AuthenticatedApiAdapter):
                 raise InvalidRequestException(translate_pydantic_error(errors[0]))
             raise InvalidRequestException("请求数据验证失败")
 
-        api_key = (
-            db.query(ApiKey).filter(ApiKey.id == self.api_key_id, ApiKey.user_id == user.id).first()
+        result = await run_in_threadpool(
+            _update_api_key_providers_sync,
+            user.id,
+            self.api_key_id,
+            request,
         )
-        if not api_key:
-            raise NotFoundException("API密钥不存在")
-        if api_key.is_locked:
-            raise ForbiddenException("该密钥已被管理员锁定，无法修改")
-
-        if request.allowed_providers is not None and len(request.allowed_providers) > 0:
-            provider_ids = [cfg.provider_id for cfg in request.allowed_providers]
-            valid = (
-                db.query(Provider.id)
-                .filter(Provider.id.in_(provider_ids), Provider.is_active.is_(True))
-                .all()
-            )
-            valid_ids = {p.id for p in valid}
-            invalid = set(provider_ids) - valid_ids
-            if invalid:
-                raise InvalidRequestException(f"无效的提供商ID: {', '.join(invalid)}")
-
-        # 只存储 provider_id 列表，而不是完整的 ProviderConfig 字典
-        # 因为 allowed_providers 字段设计为存储 provider ID 字符串列表
-        api_key.allowed_providers = (
-            [cfg.provider_id for cfg in request.allowed_providers]
-            if request.allowed_providers
-            else None
-        )
-        api_key.updated_at = datetime.now(timezone.utc)
-        db.commit()
-        context.request.state.tx_committed_by_route = True
         logger.debug(f"用户 {user.id} 更新API密钥 {self.api_key_id} 的可用提供商")
-        return {"message": "API密钥可用提供商已更新"}
+        return result
 
 
 @dataclass
@@ -1505,59 +1683,16 @@ class UpdateApiKeyCapabilitiesAdapter(AuthenticatedApiAdapter):
         user = context.user
         payload = context.ensure_json_body()
 
-        api_key = (
-            db.query(ApiKey).filter(ApiKey.id == self.api_key_id, ApiKey.user_id == user.id).first()
+        result = await run_in_threadpool(
+            _update_api_key_capabilities_sync,
+            user.id,
+            self.api_key_id,
+            payload,
         )
-        if not api_key:
-            raise NotFoundException("API密钥不存在")
-        if api_key.is_locked:
-            raise ForbiddenException("该密钥已被管理员锁定，无法修改")
-
-        # 保存旧值用于审计
-        old_capabilities = api_key.force_capabilities
-
-        # 验证 force_capabilities 字段
-        force_capabilities = payload.get("force_capabilities")
-        if force_capabilities is not None:
-            if not isinstance(force_capabilities, dict):
-                raise InvalidRequestException("force_capabilities 必须是对象类型")
-
-            # 验证只允许用户可配置的能力
-            for cap_name, cap_value in force_capabilities.items():
-                cap_def = CAPABILITY_DEFINITIONS.get(cap_name)
-                if not cap_def:
-                    raise InvalidRequestException(f"未知的能力类型: {cap_name}")
-                if cap_def.config_mode != CapabilityConfigMode.USER_CONFIGURABLE:
-                    raise InvalidRequestException(f"能力 {cap_name} 不支持用户配置")
-                if not isinstance(cap_value, bool):
-                    raise InvalidRequestException(f"能力 {cap_name} 的值必须是布尔类型")
-
-        api_key.force_capabilities = force_capabilities
-        api_key.updated_at = datetime.now(timezone.utc)
-        db.commit()
-        context.request.state.tx_committed_by_route = True
-
-        # 记录审计日志
-        audit_service.log_event(
-            db=db,
-            event_type=AuditEventType.CONFIG_CHANGED,
-            description=f"用户更新 API Key 能力配置",
-            user_id=user.id,
-            api_key_id=api_key.id,
-            metadata={
-                "action": "update_api_key_capabilities",
-                "old_capabilities": old_capabilities,
-                "new_capabilities": force_capabilities,
-            },
-        )
-
         logger.debug(
-            f"用户 {user.id} 更新API密钥 {self.api_key_id} 的强制能力配置: {force_capabilities}"
+            f"用户 {user.id} 更新API密钥 {self.api_key_id} 的强制能力配置: {result['force_capabilities']}"
         )
-        return {
-            "message": "API密钥能力配置已更新",
-            "force_capabilities": api_key.force_capabilities,
-        }
+        return result
 
 
 class GetPreferencesAdapter(AuthenticatedApiAdapter):
@@ -1596,20 +1731,7 @@ class UpdatePreferencesAdapter(AuthenticatedApiAdapter):
                 raise InvalidRequestException(translate_pydantic_error(errors[0]))
             raise InvalidRequestException("请求数据验证失败")
 
-        PreferenceService.update_preferences(
-            db=context.db,
-            user_id=context.user.id,
-            avatar_url=request.avatar_url,
-            bio=request.bio,
-            default_provider_id=request.default_provider_id,
-            theme=request.theme,
-            language=request.language,
-            timezone=request.timezone,
-            email_notifications=request.email_notifications,
-            usage_alerts=request.usage_alerts,
-            announcement_notifications=request.announcement_notifications,
-        )
-        return {"message": "偏好设置更新成功"}
+        return await run_in_threadpool(_update_preferences_sync, context.user.id, request)
 
 
 class GetModelCapabilitySettingsAdapter(AuthenticatedApiAdapter):
@@ -1628,68 +1750,19 @@ class UpdateModelCapabilitySettingsAdapter(AuthenticatedApiAdapter):
     async def handle(self, context: ApiRequestContext) -> Any:  # type: ignore[override]
         from src.core.key_capabilities import CAPABILITY_DEFINITIONS, CapabilityConfigMode
         from src.models.database import AuditEventType
-        from src.services.cache.user_cache import UserCacheService
         from src.services.system.audit import audit_service
 
-        db = context.db
-        # 重新从数据库查询用户，确保在 session 中（context.user 可能来自缓存，是分离对象）
-        user = db.query(User).filter(User.id == context.user.id).first()
-        if not user:
-            raise NotFoundException("用户不存在")
         payload = context.ensure_json_body()
-
-        # 保存旧值用于审计
-        old_settings = user.model_capability_settings
-
-        # 验证 model_capability_settings 字段
-        settings = payload.get("model_capability_settings")
-        if settings is not None:
-            if not isinstance(settings, dict):
-                raise InvalidRequestException("model_capability_settings 必须是对象类型")
-
-            # 验证每个模型的能力配置
-            for model_name, capabilities in settings.items():
-                if not isinstance(model_name, str):
-                    raise InvalidRequestException("模型名称必须是字符串")
-                if not isinstance(capabilities, dict):
-                    raise InvalidRequestException(f"模型 {model_name} 的能力配置必须是对象类型")
-
-                # 验证只允许用户可配置的能力
-                for cap_name, cap_value in capabilities.items():
-                    cap_def = CAPABILITY_DEFINITIONS.get(cap_name)
-                    if not cap_def:
-                        raise InvalidRequestException(f"未知的能力类型: {cap_name}")
-                    if cap_def.config_mode != CapabilityConfigMode.USER_CONFIGURABLE:
-                        raise InvalidRequestException(f"能力 {cap_name} 不支持用户配置")
-                    if not isinstance(cap_value, bool):
-                        raise InvalidRequestException(f"能力 {cap_name} 的值必须是布尔类型")
-
-        user.model_capability_settings = settings
-        user.updated_at = datetime.now(timezone.utc)
-        db.commit()
-        context.request.state.tx_committed_by_route = True
-
-        # 清除用户缓存，确保下次读取时获取最新数据
-        await UserCacheService.invalidate_user_cache(user.id, user.email)
-
-        # 记录审计日志
-        audit_service.log_event(
-            db=db,
-            event_type=AuditEventType.CONFIG_CHANGED,
-            description=f"用户更新模型能力配置",
-            user_id=user.id,
-            metadata={
-                "action": "update_model_capability_settings",
-                "old_settings": old_settings,
-                "new_settings": settings,
-            },
+        result, email = await run_in_threadpool(
+            _update_model_capability_settings_sync,
+            context.user.id,
+            payload,
         )
-
-        logger.debug(f"用户 {user.id} 更新模型能力配置: {settings}")
-        return {
-            "message": "模型能力配置已更新",
-            "model_capability_settings": user.model_capability_settings,
-        }
+        await UserCacheService.invalidate_user_cache(context.user.id, email)
+        logger.debug(
+            f"用户 {context.user.id} 更新模型能力配置: {result['model_capability_settings']}"
+        )
+        return result
 
 
 class GetEndpointStatusAdapter(AuthenticatedApiAdapter):

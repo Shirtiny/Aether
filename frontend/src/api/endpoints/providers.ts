@@ -114,8 +114,36 @@ export async function createProvider(
 /**
  * 删除 Provider
  */
-export async function deleteProvider(providerId: string): Promise<{ message: string }> {
-  const response = await client.delete(`/api/admin/providers/${providerId}`)
+export interface ProviderDeleteSubmitResponse {
+  task_id: string
+  status: string
+  message: string
+}
+
+export interface ProviderDeleteTaskResponse {
+  task_id: string
+  provider_id: string
+  status: string
+  stage: string
+  total_keys: number
+  deleted_keys: number
+  total_endpoints: number
+  deleted_endpoints: number
+  message: string
+}
+
+export async function deleteProvider(providerId: string): Promise<ProviderDeleteSubmitResponse> {
+  const response = await client.delete<ProviderDeleteSubmitResponse>(`/api/admin/providers/${providerId}`)
+  return response.data
+}
+
+export async function getProviderDeleteTask(
+  providerId: string,
+  taskId: string,
+): Promise<ProviderDeleteTaskResponse> {
+  const response = await client.get<ProviderDeleteTaskResponse>(
+    `/api/admin/providers/${providerId}/delete-task/${taskId}`,
+  )
   return response.data
 }
 

@@ -14,7 +14,7 @@ use axum::Router;
 use clap::Parser;
 use tracing::{info, warn};
 
-use crate::hub::HubRouter;
+use crate::hub::{ConnConfig, HubRouter};
 
 #[derive(Parser, Debug)]
 #[command(name = "aether-hub", about = "Tunnel Hub for Aether")]
@@ -23,11 +23,11 @@ struct Args {
     #[arg(long, default_value = "0.0.0.0:8085", env = "TUNNEL_HUB_BIND")]
     bind: String,
 
-    /// Proxy-side idle timeout in seconds
-    #[arg(long, default_value_t = 90, env = "TUNNEL_HUB_PROXY_IDLE_TIMEOUT")]
+    /// Proxy-side idle timeout in seconds (0 to disable)
+    #[arg(long, default_value_t = 0, env = "TUNNEL_HUB_PROXY_IDLE_TIMEOUT")]
     proxy_idle_timeout: u64,
 
-    /// Worker-side idle timeout in seconds
+    /// Worker-side idle timeout in seconds (0 to disable)
     #[arg(long, default_value_t = 60, env = "TUNNEL_HUB_WORKER_IDLE_TIMEOUT")]
     worker_idle_timeout: u64,
 
@@ -38,14 +38,21 @@ struct Args {
     /// Max concurrent streams per proxy connection
     #[arg(long, default_value_t = 2048, env = "TUNNEL_HUB_MAX_STREAMS")]
     max_streams: usize,
+
+    /// Per-connection outbound queue capacity before treating the socket as congested
+    #[arg(
+        long,
+        default_value_t = 128,
+        env = "TUNNEL_HUB_OUTBOUND_QUEUE_CAPACITY"
+    )]
+    outbound_queue_capacity: usize,
 }
 
 #[derive(Clone)]
 struct AppState {
     hub: Arc<HubRouter>,
-    proxy_idle_timeout: Duration,
-    worker_idle_timeout: Duration,
-    ping_interval: Duration,
+    proxy_conn_cfg: ConnConfig,
+    worker_conn_cfg: ConnConfig,
     max_streams: usize,
 }
 
@@ -62,11 +69,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     let hub = HubRouter::new();
+    let outbound_queue_capacity = args.outbound_queue_capacity.clamp(8, 4096);
+    let ping_interval = Duration::from_secs(args.ping_interval);
     let state = AppState {
         hub,
-        proxy_idle_timeout: Duration::from_secs(args.proxy_idle_timeout),
-        worker_idle_timeout: Duration::from_secs(args.worker_idle_timeout),
-        ping_interval: Duration::from_secs(args.ping_interval),
+        proxy_conn_cfg: ConnConfig {
+            ping_interval,
+            idle_timeout: Duration::from_secs(args.proxy_idle_timeout),
+            outbound_queue_capacity,
+        },
+        worker_conn_cfg: ConnConfig {
+            ping_interval,
+            idle_timeout: Duration::from_secs(args.worker_idle_timeout),
+            outbound_queue_capacity,
+        },
         max_streams: args.max_streams,
     };
 
@@ -139,8 +155,7 @@ async fn ws_proxy(
                 node_id,
                 node_name,
                 max_streams,
-                state.ping_interval,
-                state.proxy_idle_timeout,
+                state.proxy_conn_cfg,
             )
         })
         .into_response()
@@ -149,11 +164,6 @@ async fn ws_proxy(
 async fn ws_worker(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
     ws.max_frame_size(64 * 1024 * 1024)
         .on_upgrade(move |socket| {
-            worker_conn::handle_worker_connection(
-                socket,
-                state.hub,
-                state.ping_interval,
-                state.worker_idle_timeout,
-            )
+            worker_conn::handle_worker_connection(socket, state.hub, state.worker_conn_cfg)
         })
 }

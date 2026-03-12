@@ -83,51 +83,59 @@ class ProxyNodeHealthScheduler:
             await self._cleanup_old_events()
 
     async def _check_heartbeats(self) -> None:
-        db = create_session()
-        try:
-            now = datetime.now(timezone.utc)
-            # 检查所有非手动节点（手动节点无心跳，始终保持 ONLINE）
-            # 包括 OFFLINE 节点：心跳恢复后可自愈
-            nodes = (
-                db.query(ProxyNode)
-                .filter(
-                    ProxyNode.is_manual == False,  # noqa: E712
-                )
-                .all()
-            )
-            if not nodes:
-                return
+        import asyncio
 
-            changed = 0
-            for node in nodes:
-                if heartbeat_is_stale(node, now):
-                    if node.tunnel_connected:
-                        node.tunnel_connected = False
-                        node.tunnel_connected_at = now
-                        changed += 1
-                    if node.status != ProxyNodeStatus.OFFLINE:
-                        node.status = ProxyNodeStatus.OFFLINE
+        def _sync_check() -> None:
+            db = create_session()
+            try:
+                now = datetime.now(timezone.utc)
+                # 检查所有非手动节点（手动节点无心跳，始终保持 ONLINE）
+                # 包括 OFFLINE 节点：心跳恢复后可自愈
+                nodes = (
+                    db.query(ProxyNode)
+                    .filter(
+                        ProxyNode.is_manual == False,  # noqa: E712
+                    )
+                    .all()
+                )
+                if not nodes:
+                    return
+
+                changed = 0
+                for node in nodes:
+                    if heartbeat_is_stale(node, now):
+                        if node.tunnel_connected:
+                            node.tunnel_connected = False
+                            node.tunnel_connected_at = now
+                            changed += 1
+                        if node.status != ProxyNodeStatus.OFFLINE:
+                            node.status = ProxyNodeStatus.OFFLINE
+                            node.updated_at = now
+                            changed += 1
+                        continue
+
+                    # 心跳正常且连接状态为已连时，确保 ONLINE（自愈状态不一致）
+                    if node.tunnel_connected and node.status != ProxyNodeStatus.ONLINE:
+                        node.status = ProxyNodeStatus.ONLINE
                         node.updated_at = now
                         changed += 1
-                    continue
 
-                # 心跳正常且连接状态为已连时，确保 ONLINE（自愈状态不一致）
-                if node.tunnel_connected and node.status != ProxyNodeStatus.ONLINE:
-                    node.status = ProxyNodeStatus.ONLINE
-                    node.updated_at = now
-                    changed += 1
+                if changed:
+                    db.commit()
+                    logger.info("ProxyNode 心跳状态已更新: {} 个节点", changed)
+            except Exception as e:
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+                logger.exception("ProxyNode 心跳检测失败: {}", e)
+            finally:
+                db.close()
 
-            if changed:
-                db.commit()
-                logger.info("ProxyNode 心跳状态已更新: {} 个节点", changed)
+        try:
+            await asyncio.to_thread(_sync_check)
         except Exception as e:
-            try:
-                db.rollback()
-            except Exception:
-                pass
-            logger.exception("ProxyNode 心跳检测失败: {}", e)
-        finally:
-            db.close()
+            logger.warning("ProxyNode 心跳检测线程执行失败: {}", e)
 
     async def _cleanup_old_events(self) -> None:
         """清理超过保留期的连接事件记录（在线程池中执行，避免阻塞事件循环）"""

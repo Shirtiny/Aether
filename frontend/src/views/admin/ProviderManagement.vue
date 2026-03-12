@@ -1,5 +1,72 @@
 <template>
   <div class="space-y-4">
+    <Card
+      v-if="providerDeleteProgress"
+      class="border-primary/30 bg-primary/5"
+    >
+      <div class="px-5 py-4 space-y-4">
+        <div class="flex items-start justify-between gap-4">
+          <div class="min-w-0">
+            <div class="text-sm font-semibold text-foreground">
+              正在删除提供商：{{ providerDeleteProgress.providerName }}
+            </div>
+            <div class="mt-1 text-xs text-muted-foreground">
+              {{ providerDeleteStageLabel }} · {{ providerDeleteProgress.message || '后台处理中' }}
+            </div>
+          </div>
+          <div class="shrink-0 text-right">
+            <div class="text-xs font-medium text-primary">
+              {{ providerDeleteOverallPercent }}%
+            </div>
+            <div class="text-[11px] text-muted-foreground">
+              {{ providerDeleteCompletedUnits }}/{{ providerDeleteTotalUnits }}
+            </div>
+          </div>
+        </div>
+
+        <div class="space-y-2">
+          <div class="flex items-center justify-between text-xs text-muted-foreground">
+            <span>总体进度</span>
+            <span>{{ providerDeleteCompletedUnits }}/{{ providerDeleteTotalUnits }}</span>
+          </div>
+          <div class="h-2 rounded-full bg-primary/10 overflow-hidden">
+            <div
+              class="h-full bg-primary transition-all duration-300"
+              :style="{ width: `${providerDeleteOverallPercent}%` }"
+            />
+          </div>
+        </div>
+
+        <div class="grid gap-3 md:grid-cols-2">
+          <div class="space-y-2">
+            <div class="flex items-center justify-between text-xs text-muted-foreground">
+              <span>账号删除</span>
+              <span>{{ providerDeleteProgress.deletedKeys }}/{{ providerDeleteProgress.totalKeys || '...' }}</span>
+            </div>
+            <div class="h-2 rounded-full bg-primary/10 overflow-hidden">
+              <div
+                class="h-full bg-primary/80 transition-all duration-300"
+                :style="{ width: `${providerDeleteKeysPercent}%` }"
+              />
+            </div>
+          </div>
+
+          <div class="space-y-2">
+            <div class="flex items-center justify-between text-xs text-muted-foreground">
+              <span>端点删除</span>
+              <span>{{ providerDeleteProgress.deletedEndpoints }}/{{ providerDeleteProgress.totalEndpoints || '...' }}</span>
+            </div>
+            <div class="h-2 rounded-full bg-primary/10 overflow-hidden">
+              <div
+                class="h-full bg-primary/60 transition-all duration-300"
+                :style="{ width: `${providerDeleteEndpointsPercent}%` }"
+              />
+            </div>
+          </div>
+        </div>
+      </div>
+    </Card>
+
     <!-- 提供商表格 -->
     <Card
       variant="default"
@@ -212,6 +279,7 @@ import {
   getProvidersSummary,
   getProvider,
   deleteProvider,
+  getProviderDeleteTask,
   updateProvider,
   getGlobalModels,
   type ProviderWithEndpointsSummary,
@@ -219,7 +287,20 @@ import {
 import { adminApi } from '@/api/admin'
 import { parseApiError } from '@/utils/errorParser'
 
-const { error: showError, success: showSuccess } = useToast()
+interface ProviderDeleteProgressState {
+  providerId: string
+  providerName: string
+  taskId: string
+  status: string
+  stage: string
+  totalKeys: number
+  deletedKeys: number
+  totalEndpoints: number
+  deletedEndpoints: number
+  message: string
+}
+
+const { error: showError, success: showSuccess, info: showInfo } = useToast()
 const { confirmDanger } = useConfirm()
 
 // 状态
@@ -232,6 +313,113 @@ const priorityDialogOpen = ref(false)
 const priorityMode = ref<'provider' | 'global_key'>('provider')
 const providerDrawerOpen = ref(false)
 const selectedProviderId = ref<string | null>(null)
+const providerDeleteProgress = ref<ProviderDeleteProgressState | null>(null)
+let deletePollAbort: AbortController | null = null
+
+const DELETE_POLL_INTERVAL_MS = 2000
+const DELETE_POLL_MAX_MS = 30 * 60 * 1000
+const DELETE_POLL_MAX_FAILURES = 3
+
+async function pollProviderDeleteTask(providerId: string, taskId: string) {
+  deletePollAbort?.abort()
+  const abort = new AbortController()
+  deletePollAbort = abort
+
+  const deadline = Date.now() + DELETE_POLL_MAX_MS
+  let consecutiveFailures = 0
+
+  while (Date.now() < deadline) {
+    if (abort.signal.aborted) return null
+    try {
+      const task = await getProviderDeleteTask(providerId, taskId)
+      consecutiveFailures = 0
+      if (providerDeleteProgress.value?.taskId === taskId) {
+        providerDeleteProgress.value = {
+          ...providerDeleteProgress.value,
+          status: task.status,
+          stage: task.stage,
+          totalKeys: task.total_keys,
+          deletedKeys: task.deleted_keys,
+          totalEndpoints: task.total_endpoints,
+          deletedEndpoints: task.deleted_endpoints,
+          message: task.message,
+        }
+      }
+      if (task.status === 'completed' || task.status === 'failed') {
+        return task
+      }
+    } catch {
+      consecutiveFailures += 1
+      if (consecutiveFailures >= DELETE_POLL_MAX_FAILURES) {
+        throw new Error('provider delete task polling failed')
+      }
+    }
+    await new Promise((resolve) => {
+      const timer = setTimeout(resolve, DELETE_POLL_INTERVAL_MS)
+      abort.signal.addEventListener('abort', () => { clearTimeout(timer); resolve(undefined) }, { once: true })
+    })
+  }
+
+  throw new Error('provider delete task timeout')
+}
+
+const providerDeleteStageLabel = computed(() => {
+  switch (providerDeleteProgress.value?.stage) {
+    case 'preparing':
+      return '准备删除'
+    case 'disabling':
+      return '停用提供商'
+    case 'cleaning_restrictions':
+      return '清理访问限制'
+    case 'cleaning_provider_refs':
+      return '清理历史引用'
+    case 'deleting_keys':
+      return '删除号池账号'
+    case 'deleting_endpoints':
+      return '删除端点'
+    case 'completed':
+      return '删除完成'
+    case 'failed':
+      return '删除失败'
+    default:
+      return '等待执行'
+  }
+})
+
+const providerDeleteTotalUnits = computed(() => {
+  const progress = providerDeleteProgress.value
+  if (!progress) return 0
+  return progress.totalKeys + progress.totalEndpoints
+})
+
+const providerDeleteCompletedUnits = computed(() => {
+  const progress = providerDeleteProgress.value
+  if (!progress) return 0
+  return Math.min(progress.deletedKeys + progress.deletedEndpoints, providerDeleteTotalUnits.value)
+})
+
+const providerDeleteOverallPercent = computed(() => {
+  const progress = providerDeleteProgress.value
+  if (!progress) return 0
+  if (progress.status === 'completed') return 100
+  if (providerDeleteTotalUnits.value <= 0) return 0
+  return Math.min(
+    100,
+    Math.round((providerDeleteCompletedUnits.value / providerDeleteTotalUnits.value) * 100),
+  )
+})
+
+const providerDeleteKeysPercent = computed(() => {
+  const progress = providerDeleteProgress.value
+  if (!progress?.totalKeys) return 0
+  return Math.min(100, Math.round((progress.deletedKeys / progress.totalKeys) * 100))
+})
+
+const providerDeleteEndpointsPercent = computed(() => {
+  const progress = providerDeleteProgress.value
+  if (!progress?.totalEndpoints) return 0
+  return Math.min(100, Math.round((progress.deletedEndpoints / progress.totalEndpoints) * 100))
+})
 
 // 全局模型数据（用于模型筛选下拉）
 const globalModels = ref<{ id: string; name: string }[]>([])
@@ -477,10 +665,32 @@ async function handleDeleteProvider(provider: ProviderWithEndpointsSummary) {
   if (!confirmed) return
 
   try {
-    await deleteProvider(provider.id)
+    const result = await deleteProvider(provider.id)
+    providerDeleteProgress.value = {
+      providerId: provider.id,
+      providerName: provider.name,
+      taskId: result.task_id,
+      status: result.status,
+      stage: 'queued',
+      totalKeys: provider.total_keys || 0,
+      deletedKeys: 0,
+      totalEndpoints: provider.total_endpoints || 0,
+      deletedEndpoints: 0,
+      message: result.message || '删除任务已提交，后台处理中',
+    }
+    showInfo(result.message || '删除任务已提交，后台处理中')
+
+    const task = await pollProviderDeleteTask(provider.id, result.task_id)
+    if (!task) return // aborted
+    if (task.status === 'failed') {
+      throw new Error(task.message || 'provider delete task failed')
+    }
+
     showSuccess('提供商已删除')
+    providerDeleteProgress.value = null
     loadProviders()
   } catch (err: unknown) {
+    providerDeleteProgress.value = null
     showError(parseApiError(err, '删除提供商失败'), '错误')
   }
 }
@@ -525,6 +735,7 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
+  deletePollAbort?.abort()
   if (debounceTimer) clearTimeout(debounceTimer)
   document.removeEventListener('click', handleGlobalClick, true)
   stopTick()

@@ -9,6 +9,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from src.api.admin.users.routes import AdminCreateUserAdapter
 from src.api.admin.users.routes import router as admin_users_router
 from src.database import get_db
 
@@ -91,3 +92,53 @@ def test_list_users_uses_wallet_batch_lookup(monkeypatch: pytest.MonkeyPatch) ->
     assert response.json()[1]["unlimited"] is False
     batch_getter.assert_called_once()
     assert batch_getter.call_args.args[1] == ["user-1", "user-2"]
+
+
+@pytest.mark.asyncio
+async def test_create_user_adapter_preserves_empty_restriction_lists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = MagicMock()
+    captured: dict[str, Any] = {}
+
+    def _create_user(**kwargs: Any) -> SimpleNamespace:
+        captured.update(kwargs)
+        return SimpleNamespace(
+            id="user-3",
+            email="u3@example.com",
+            username="user3",
+            role=SimpleNamespace(value="user"),
+            is_active=True,
+            allowed_providers=[],
+            allowed_api_formats=[],
+            allowed_models=[],
+        )
+
+    monkeypatch.setattr("src.api.admin.users.routes.UserService.create_user", _create_user)
+    monkeypatch.setattr(
+        "src.api.admin.users.routes._serialize_user",
+        lambda _db, user: {"id": user.id},
+    )
+
+    context = SimpleNamespace(
+        db=db,
+        request=SimpleNamespace(state=SimpleNamespace()),
+        ensure_json_body=lambda: {
+            "username": "user3",
+            "password": "Abcd12",
+            "email": "u3@example.com",
+            "role": "user",
+            "initial_gift_usd": 10,
+            "allowed_providers": [],
+            "allowed_api_formats": [],
+            "allowed_models": [],
+        },
+        add_audit_metadata=lambda **_: None,
+    )
+
+    result = await AdminCreateUserAdapter().handle(context)
+
+    assert result == {"id": "user-3"}
+    assert captured["allowed_providers"] == []
+    assert captured["allowed_api_formats"] == []
+    assert captured["allowed_models"] == []

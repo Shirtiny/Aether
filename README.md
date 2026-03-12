@@ -62,6 +62,7 @@ cp .env.example .env
 python generate_keys.py  # 生成密钥, 并将生成的密钥填入 .env
 
 # 3. 部署 / 更新（自动构建、启动、迁移）
+git pull
 ./deploy.sh
 ```
 

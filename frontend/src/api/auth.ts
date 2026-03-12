@@ -81,6 +81,7 @@ export interface RegistrationSettingsResponse {
   enable_registration: boolean
   require_email_verification: boolean
   email_configured: boolean
+  password_policy_level: string
 }
 
 export interface AuthSettingsResponse {

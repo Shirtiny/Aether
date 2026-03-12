@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import gzip
 import json
+import time as _time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
@@ -27,8 +28,15 @@ if TYPE_CHECKING:
 
 
 _TUNNEL_COMPRESS_MIN_SIZE = 512
+_TUNNEL_ASYNC_COMPRESS_THRESHOLD = 64 * 1024
 _RECONNECT_DELAYS_SECONDS: tuple[float, ...] = (0.0, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0)
 _HEARTBEAT_DEDUP_TTL_SECONDS = 600
+_LOOP_WATCHDOG_INTERVAL_SECONDS = 1.0
+_LOOP_LAG_WARNING_SECONDS = 1.0
+_LOOP_LAG_DEGRADE_SECONDS = 3.0
+_LOOP_LAG_DEGRADE_MIN_COOLDOWN_SECONDS = 2.0
+_LOOP_LAG_DEGRADE_MAX_COOLDOWN_SECONDS = 5.0
+_LOOP_LAG_WARNING_LOG_INTERVAL_SECONDS = 10.0
 
 _HOP_BY_HOP_HEADERS = frozenset(
     {
@@ -64,9 +72,17 @@ class HubConnectionManager:
         self._reader_task: asyncio.Task[None] | None = None
         self._ping_task: asyncio.Task[None] | None = None
         self._reconnect_task: asyncio.Task[None] | None = None
+        self._watchdog_task: asyncio.Task[None] | None = None
         self._background_tasks: set[asyncio.Task[None]] = set()
 
         self._closing = False
+        self._degraded_until: float = 0.0
+        self._last_loop_lag_warning_ts: float = 0.0
+
+        self._disconnect_count = 0  # 连续断开计数，用于抑制重复日志
+        # 连续快速断开退避：防止 Hub 端持续发送 GOAWAY 时产生重连风暴
+        self._last_disconnect_ts: float = 0.0
+        self._rapid_disconnect_count: int = 0
 
     @property
     def is_connected(self) -> bool:
@@ -79,6 +95,7 @@ class HubConnectionManager:
         task.add_done_callback(self._background_tasks.discard)
 
     async def ensure_connected(self) -> None:
+        self._ensure_watchdog_running()
         if self._closing:
             raise TunnelStreamError("hub connection manager is shutting down")
         if self.is_connected:
@@ -126,7 +143,64 @@ class HubConnectionManager:
 
         self._reader_task = asyncio.create_task(self._reader_loop(ws))
         self._ping_task = asyncio.create_task(self._ping_loop(ws))
-        logger.info("Hub worker channel connected: {}", self._config.worker_ws_url)
+        if self._disconnect_count == 0:
+            logger.info("Hub worker channel connected: {}", self._config.worker_ws_url)
+        else:
+            logger.debug(
+                "Hub worker channel connected: {} (after {} disconnects)",
+                self._config.worker_ws_url,
+                self._disconnect_count,
+            )
+        self._disconnect_count = 0
+
+    def _ensure_watchdog_running(self) -> None:
+        if self._closing:
+            return
+        if self._watchdog_task is not None and not self._watchdog_task.done():
+            return
+        self._watchdog_task = asyncio.create_task(self._loop_watchdog())
+
+    def _record_loop_lag(self, lag_seconds: float) -> None:
+        if lag_seconds < _LOOP_LAG_WARNING_SECONDS:
+            return
+
+        now = _time.monotonic()
+        if lag_seconds >= _LOOP_LAG_DEGRADE_SECONDS:
+            cooldown = min(
+                _LOOP_LAG_DEGRADE_MAX_COOLDOWN_SECONDS,
+                max(_LOOP_LAG_DEGRADE_MIN_COOLDOWN_SECONDS, lag_seconds * 1.5),
+            )
+            degraded_until = now + cooldown
+            self._degraded_until = max(self._degraded_until, degraded_until)
+            logger.warning(
+                "Hub worker event loop lag detected: lag={:.2f}s, pausing new streams for {:.1f}s",
+                lag_seconds,
+                cooldown,
+            )
+            return
+
+        if now - self._last_loop_lag_warning_ts >= _LOOP_LAG_WARNING_LOG_INTERVAL_SECONDS:
+            self._last_loop_lag_warning_ts = now
+            logger.warning("Hub worker event loop lag observed: lag={:.2f}s", lag_seconds)
+
+    def _raise_if_degraded(self) -> None:
+        remaining = self._degraded_until - _time.monotonic()
+        if remaining <= 0:
+            return
+        raise TunnelStreamError(f"hub worker event loop degraded, retry in {remaining:.1f}s")
+
+    async def _loop_watchdog(self) -> None:
+        interval = _LOOP_WATCHDOG_INTERVAL_SECONDS
+        expected_at = _time.monotonic() + interval
+        try:
+            while not self._closing:
+                await asyncio.sleep(interval)
+                now = _time.monotonic()
+                lag_seconds = max(0.0, now - expected_at)
+                expected_at = now + interval
+                self._record_loop_lag(lag_seconds)
+        except asyncio.CancelledError:
+            return
 
     def _start_reconnect_loop(self) -> None:
         if self._closing:
@@ -138,7 +212,9 @@ class HubConnectionManager:
         self._reconnect_task = asyncio.create_task(self._reconnect_loop())
 
     async def _reconnect_loop(self) -> None:
-        attempt = 0
+        # 如果连续快速断开（GOAWAY 风暴），初始 attempt 跳过 0-delay 阶段
+        rapid = self._rapid_disconnect_count
+        attempt = min(rapid, len(_RECONNECT_DELAYS_SECONDS) - 1)
         while not self._closing and not self.is_connected:
             delay = _RECONNECT_DELAYS_SECONDS[min(attempt, len(_RECONNECT_DELAYS_SECONDS) - 1)]
             if delay > 0:
@@ -149,7 +225,7 @@ class HubConnectionManager:
                         break
                     await self._connect_once()
                 if self.is_connected:
-                    logger.info("Hub worker channel reconnected")
+                    logger.debug("Hub worker channel reconnected (attempt {})", attempt + 1)
                     break
             except Exception as e:
                 attempt += 1
@@ -192,7 +268,26 @@ class HubConnectionManager:
             self._pending_streams.clear()
 
         if not self._closing:
-            logger.warning("Hub worker channel disconnected: {}", reason)
+            self._disconnect_count += 1
+
+            # 追踪连续快速断开：如果距上次断开不足 2 秒，累加计数；否则重置
+            now_mono = _time.monotonic()
+            if now_mono - self._last_disconnect_ts < 2.0:
+                self._rapid_disconnect_count += 1
+            else:
+                self._rapid_disconnect_count = 0
+            self._last_disconnect_ts = now_mono
+
+            if self._disconnect_count <= 1:
+                logger.warning("Hub worker channel disconnected: {}", reason)
+            elif self._disconnect_count % 10 == 0:
+                logger.info(
+                    "Hub worker channel disconnected: {} (repeated {} times)",
+                    reason,
+                    self._disconnect_count,
+                )
+            else:
+                logger.debug("Hub worker channel disconnected: {}", reason)
             self._start_reconnect_loop()
 
     async def _send_frame(self, frame: Frame) -> None:
@@ -495,6 +590,7 @@ class HubConnectionManager:
         timeout: float = 60.0,
     ) -> _StreamState:
         await self.ensure_connected()
+        self._raise_if_degraded()
 
         if len(self._pending_streams) >= self._config.max_streams:
             raise TunnelStreamError(
@@ -524,7 +620,7 @@ class HubConnectionManager:
 
             body_data = body or b""
             if body_data:
-                body_payload, body_flags = _compress_frame_payload(body_data)
+                body_payload, body_flags = await _compress_frame_payload_async(body_data)
             else:
                 body_payload, body_flags = body_data, 0
             body_flags |= FrameFlags.END_STREAM
@@ -552,6 +648,8 @@ class HubConnectionManager:
             self._reader_task.cancel()
         if self._ping_task is not None:
             self._ping_task.cancel()
+        if self._watchdog_task is not None:
+            self._watchdog_task.cancel()
 
         tasks = list(self._background_tasks)
         for task in tasks:
@@ -684,6 +782,12 @@ def _compress_frame_payload(data: bytes) -> tuple[bytes, int]:
         if len(compressed) < len(data):
             return compressed, FrameFlags.GZIP_COMPRESSED
     return data, 0
+
+
+async def _compress_frame_payload_async(data: bytes) -> tuple[bytes, int]:
+    if len(data) < _TUNNEL_ASYNC_COMPRESS_THRESHOLD:
+        return _compress_frame_payload(data)
+    return await asyncio.to_thread(_compress_frame_payload, data)
 
 
 def _decompress_frame_payload(frame: Frame) -> bytes:

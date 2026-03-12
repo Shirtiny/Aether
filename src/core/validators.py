@@ -3,29 +3,48 @@
 包含密码复杂度验证和其他输入验证
 """
 
+from __future__ import annotations
+
 import re
+from enum import Enum
+
+
+class PasswordPolicyLevel(str, Enum):
+    """密码策略级别。"""
+
+    WEAK = "weak"
+    MEDIUM = "medium"
+    STRONG = "strong"
 
 
 class PasswordValidator:
     """密码复杂度验证器"""
 
-    MIN_LENGTH = 6  # 降低到6位
+    MIN_LENGTH = 6
+    MEDIUM_MIN_LENGTH = 8
+    STRONG_MIN_LENGTH = 8
     MAX_LENGTH = 128
 
     @classmethod
-    def validate(cls, password: str) -> tuple[bool, str | None]:
-        """
-        验证密码复杂度
+    def normalize_policy(cls, policy: PasswordPolicyLevel | str | None) -> PasswordPolicyLevel:
+        """规范化密码策略级别，异常值回退为弱策略。"""
+        if isinstance(policy, PasswordPolicyLevel):
+            return policy
+        if isinstance(policy, str):
+            normalized = policy.strip().lower()
+            try:
+                return PasswordPolicyLevel(normalized)
+            except ValueError:
+                pass
+        return PasswordPolicyLevel.WEAK
 
-        要求：
-        - 长度至少6个字符
-
-        Args:
-            password: 待验证的密码
-
-        Returns:
-            (是否通过, 错误消息)
-        """
+    @classmethod
+    def validate(
+        cls,
+        password: str,
+        policy: PasswordPolicyLevel | str | None = None,
+    ) -> tuple[bool, str | None]:
+        """验证密码复杂度。"""
         if not password:
             return False, "密码不能为空"
 
@@ -35,22 +54,26 @@ class PasswordValidator:
         if len(password) > cls.MAX_LENGTH:
             return False, f"密码长度不能超过{cls.MAX_LENGTH}个字符"
 
-        # 简化密码复杂度要求 - 只检查长度
-        # 不再要求大小写字母、数字和特殊字符
+        policy_level = cls.normalize_policy(policy)
 
-        # 检查常见弱密码
-        weak_passwords = [
-            "password123",
-            "admin123",
-            "12345678",
-            "qwerty123",
-            "password@123",
-            "admin@123",
-            "Password123!",
-            "Admin123!",
-        ]
-        if password.lower() in [p.lower() for p in weak_passwords]:
-            return False, "密码过于简单，请使用更复杂的密码"
+        if policy_level == PasswordPolicyLevel.MEDIUM:
+            if len(password) < cls.MEDIUM_MIN_LENGTH:
+                return False, f"密码长度至少为{cls.MEDIUM_MIN_LENGTH}个字符"
+            if not re.search(r"[A-Za-z]", password):
+                return False, "密码必须包含至少一个字母"
+            if not re.search(r"\d", password):
+                return False, "密码必须包含至少一个数字"
+        elif policy_level == PasswordPolicyLevel.STRONG:
+            if len(password) < cls.STRONG_MIN_LENGTH:
+                return False, f"密码长度至少为{cls.STRONG_MIN_LENGTH}个字符"
+            if not re.search(r"[A-Z]", password):
+                return False, "密码必须包含至少一个大写字母"
+            if not re.search(r"[a-z]", password):
+                return False, "密码必须包含至少一个小写字母"
+            if not re.search(r"\d", password):
+                return False, "密码必须包含至少一个数字"
+            if not re.search(r"[!@#$%^&*()_+\-=\[\]{};:'\",.<>?/\\|`~]", password):
+                return False, "密码必须包含至少一个特殊字符"
 
         return True, None
 
@@ -85,7 +108,7 @@ class PasswordValidator:
             score += 1
         if re.search(r"\d", password):
             score += 1
-        if re.search(r'[!@#$%^&*()_+\-=\[\]{};:\'",.<>?/\\|`~]', password):
+        if re.search(r"[!@#$%^&*()_+\-=\[\]{};:\'\",.<>?/\\|`~]", password):
             score += 2
 
         # 额外复杂度评分

@@ -21,10 +21,11 @@ from src.config import config
 from src.core.logger import logger
 from src.services.provider.fingerprint import KNOWN_IMPERSONATE_PROFILES
 from src.services.proxy_node.resolver import (
-    build_proxy_url,
+    build_proxy_url_async,
     compute_proxy_cache_key,
-    get_system_proxy_config,
+    get_system_proxy_config_async,
     make_proxy_param,
+    resolve_delegate_config_async,
 )
 from src.utils.ssl_utils import get_ssl_context, get_ssl_context_for_profile
 
@@ -222,12 +223,9 @@ class HTTPClientPool:
         """
         # 无特定代理时，回退到系统默认代理
         if not proxy_config:
-            proxy_config = get_system_proxy_config()
+            proxy_config = await get_system_proxy_config_async()
 
-        # tunnel 模式检查：tunnel 节点走专用的 TunnelTransport 客户端
-        from src.services.proxy_node.resolver import resolve_delegate_config
-
-        delegate_cfg = resolve_delegate_config(proxy_config)
+        delegate_cfg = await resolve_delegate_config_async(proxy_config)
         if delegate_cfg and delegate_cfg.get("tunnel"):
             return await cls._get_tunnel_client(delegate_cfg["node_id"])
 
@@ -262,7 +260,7 @@ class HTTPClientPool:
             await cls._evict_lru_proxy_client()
 
             # 添加代理配置
-            proxy_url = build_proxy_url(proxy_config) if proxy_config else None
+            proxy_url = await build_proxy_url_async(proxy_config) if proxy_config else None
 
             # curl_cffi Transport: real TLS fingerprint impersonation.
             # Supports:
@@ -425,57 +423,6 @@ class HTTPClientPool:
             await client.aclose()
 
     @classmethod
-    def create_client_with_proxy(
-        cls,
-        proxy_config: dict[str, Any] | None = None,
-        timeout: httpx.Timeout | None = None,
-        tls_profile: str | None = None,
-        **kwargs: Any,
-    ) -> httpx.AsyncClient:
-        """
-        创建带代理配置的HTTP客户端
-
-        ⚠️ 性能警告：此方法每次都创建新客户端，推荐使用 get_proxy_client() 复用连接。
-
-        Args:
-            proxy_config: 代理配置字典，包含 url, username, password
-            timeout: 超时配置
-            **kwargs: 其他 httpx.AsyncClient 配置参数
-
-        Returns:
-            配置好的 httpx.AsyncClient 实例（调用者需要负责关闭）
-        """
-        client_config: dict[str, Any] = {
-            "http2": config.enable_http2,
-            "verify": get_ssl_context_for_profile(tls_profile),
-            "follow_redirects": True,
-        }
-
-        if timeout:
-            client_config["timeout"] = timeout
-        else:
-            client_config["timeout"] = httpx.Timeout(
-                connect=config.http_connect_timeout,
-                read=config.http_read_timeout,
-                write=config.http_write_timeout,
-                pool=config.http_pool_timeout,
-            )
-
-        # 无特定代理时，回退到系统默认代理（与 get_proxy_client 行为一致）
-        if proxy_config is None:
-            proxy_config = get_system_proxy_config()
-
-        # 添加代理配置
-        proxy_url = build_proxy_url(proxy_config) if proxy_config else None
-        proxy_param = make_proxy_param(proxy_url)
-        if proxy_param:
-            client_config["proxy"] = proxy_param
-            logger.debug("创建带代理的HTTP客户端(一次性): {}", proxy_config.get("url", "unknown"))
-
-        client_config.update(kwargs)
-        return httpx.AsyncClient(**client_config)  # type: ignore[arg-type]
-
-    @classmethod
     async def _reset_default_client(cls) -> bool:
         """Atomically replace the shared default client with a fresh instance.
 
@@ -551,7 +498,7 @@ class HTTPClientPool:
             return True
 
         if not proxy_config:
-            proxy_config = get_system_proxy_config()
+            proxy_config = await get_system_proxy_config_async()
 
         base_cache_key = compute_proxy_cache_key(proxy_config)
         if base_cache_key == "__no_proxy__":
@@ -616,11 +563,37 @@ class HTTPClientPool:
         """
         if delegate_cfg and delegate_cfg.get("tunnel"):
             return await cls._get_tunnel_client(delegate_cfg["node_id"], timeout=timeout)
-        return cls.create_client_with_proxy(
-            proxy_config=proxy_config,
-            timeout=timeout,
-            tls_profile=tls_profile,
+        client_config: dict[str, Any] = {
+            "http2": config.enable_http2,
+            "verify": get_ssl_context_for_profile(tls_profile),
+            "follow_redirects": True,
+        }
+        if timeout:
+            client_config["timeout"] = timeout
+        else:
+            client_config["timeout"] = httpx.Timeout(
+                connect=config.http_connect_timeout,
+                read=config.http_read_timeout,
+                write=config.http_write_timeout,
+                pool=config.http_pool_timeout,
+            )
+
+        resolved_proxy_config = proxy_config
+        if resolved_proxy_config is None:
+            resolved_proxy_config = await get_system_proxy_config_async()
+
+        proxy_url = (
+            await build_proxy_url_async(resolved_proxy_config) if resolved_proxy_config else None
         )
+        proxy_param = make_proxy_param(proxy_url)
+        if proxy_param:
+            client_config["proxy"] = proxy_param
+            logger.debug(
+                "创建带代理的HTTP客户端(一次性): {}",
+                resolved_proxy_config.get("url", "unknown") if resolved_proxy_config else "unknown",
+            )
+
+        return httpx.AsyncClient(**client_config)
 
     @classmethod
     async def _get_tunnel_client(

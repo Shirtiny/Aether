@@ -5,10 +5,17 @@ Provider Key 写操作后的副作用处理。
 from __future__ import annotations
 
 from sqlalchemy import delete as sa_delete
+from sqlalchemy import update as sa_update
 from sqlalchemy.orm import Session
 
 from src.core.logger import logger
-from src.models.database import GeminiFileMapping, ProviderAPIKey, RequestCandidate, VideoTask
+from src.models.database import (
+    GeminiFileMapping,
+    ProviderAPIKey,
+    RequestCandidate,
+    Usage,
+    VideoTask,
+)
 from src.services.cache.model_list_cache import invalidate_models_list_cache
 from src.services.cache.provider_cache import ProviderCacheService
 
@@ -17,9 +24,12 @@ _DEFAULT_BATCH_SIZE = 2000
 
 
 def cleanup_key_references(db: Session, key_ids: list[str]) -> None:
-    """在删除 ProviderAPIKey 前，先清理关联表记录，避免 CASCADE 级联删除超时。
+    """在删除 ProviderAPIKey 前，先显式处理关联表引用，降低级联删除/置空成本。
 
-    PostgreSQL 下直接使用 DELETE WHERE key_id IN (...)，利用 key_id 索引高效删除。
+    - request_candidates / gemini_file_mappings: 直接删除
+    - usage / video_tasks: 先置空外键，保留快照与历史记录
+
+    PostgreSQL 下直接按 key_id/provider_api_key_id 批量处理；
     SQLite 下按 key_id 批次拆分，避免超出变量数限制。
     """
     if not key_ids:
@@ -28,7 +38,12 @@ def cleanup_key_references(db: Session, key_ids: list[str]) -> None:
     for batch in _iter_batches(key_ids, batch_size):
         db.execute(sa_delete(RequestCandidate).where(RequestCandidate.key_id.in_(batch)))
         db.execute(sa_delete(GeminiFileMapping).where(GeminiFileMapping.key_id.in_(batch)))
-        db.execute(sa_delete(VideoTask).where(VideoTask.key_id.in_(batch)))
+        db.execute(
+            sa_update(Usage)
+            .where(Usage.provider_api_key_id.in_(batch))
+            .values(provider_api_key_id=None)
+        )
+        db.execute(sa_update(VideoTask).where(VideoTask.key_id.in_(batch)).values(key_id=None))
 
 
 def _resolve_batch_size(db: Session) -> int:

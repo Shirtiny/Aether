@@ -1,8 +1,12 @@
 # Gunicorn configuration file
 from __future__ import annotations
 
+import faulthandler
 import gc
 import os
+import signal
+import sys
+import traceback
 from typing import Any
 
 # worker 心跳超时（秒）：异步 worker 在此时间内必须向 arbiter 发送心跳
@@ -25,6 +29,52 @@ def _log_current_rss(log: Any, message: str) -> None:
         pass
 
 
+def _enable_fault_handler(log: Any) -> None:
+    try:
+        faulthandler.enable(file=sys.stderr, all_threads=True)
+    except Exception as exc:
+        log.warning(f"Failed to enable faulthandler: {exc}")
+        return
+
+    sigusr2 = getattr(signal, "SIGUSR2", None)
+    if sigusr2 is None:
+        return
+
+    try:
+        faulthandler.unregister(sigusr2)
+    except Exception:
+        pass
+
+    try:
+        faulthandler.register(sigusr2, file=sys.stderr, all_threads=True, chain=False)
+        log.info("Registered faulthandler stack dump on SIGUSR2")
+    except Exception as exc:
+        log.warning(f"Failed to register faulthandler SIGUSR2 hook: {exc}")
+
+
+def _dump_all_thread_traces(log: Any, reason: str) -> None:
+    pid = os.getpid()
+    log.critical(f"===== Python stack dump begin: reason={reason}, pid={pid} =====")
+    _log_current_rss(log, f"Worker {pid} RSS before traceback dump")
+
+    try:
+        faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+    except Exception as exc:
+        log.warning(f"faulthandler.dump_traceback failed: {exc}")
+
+    try:
+        current_frames = sys._current_frames()
+        for thread_id, frame in current_frames.items():
+            stack = "".join(traceback.format_stack(frame))
+            log.critical(
+                f"--- thread_id={thread_id} stack begin ---\n{stack}--- thread_id={thread_id} stack end ---"
+            )
+    except Exception as exc:
+        log.warning(f"Failed to dump Python frames via sys._current_frames(): {exc}")
+
+    log.critical(f"===== Python stack dump end: reason={reason}, pid={pid} =====")
+
+
 def when_ready(server: Any) -> None:
     """
     Called just after the server is started.
@@ -43,3 +93,8 @@ def post_fork(server: Any, worker: Any) -> None:
 
 def post_worker_init(worker: Any) -> None:
     _log_current_rss(worker.log, f"Worker {worker.pid} RSS after app init")
+    _enable_fault_handler(worker.log)
+
+
+def worker_abort(worker: Any) -> None:
+    _dump_all_thread_traces(worker.log, "gunicorn worker timeout / SIGABRT")

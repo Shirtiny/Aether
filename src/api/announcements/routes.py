@@ -18,8 +18,8 @@ from src.core.exceptions import InvalidRequestException, translate_pydantic_erro
 from src.database import get_db
 from src.models.api import CreateAnnouncementRequest, UpdateAnnouncementRequest
 from src.models.database import User
-from src.services.auth.service import AuthService
 from src.services.system.announcement import AnnouncementService
+from src.utils.auth_utils import authenticate_user_from_bearer_token
 
 router = APIRouter(prefix="/api/announcements", tags=["Announcements"])
 pipeline = ApiRequestPipeline()
@@ -262,27 +262,7 @@ class AnnouncementOptionalAuthAdapter(ApiAdapter):
 
         token = authorization[7:].strip()
         try:
-            payload = await AuthService.verify_token(token, token_type="access")
-            user_id = payload.get("user_id")
-            if not user_id:
-                return None
-            user = (
-                context.db.query(User)
-                .filter(
-                    User.id == user_id,
-                    User.is_active.is_(True),
-                    User.is_deleted.is_(False),
-                )
-                .first()
-            )
-
-            if not user:
-                return None
-
-            if not AuthService.token_identity_matches_user(payload, user):
-                return None
-
-            return user
+            return await authenticate_user_from_bearer_token(token, context.db, context.request)
         except Exception:
             return None
 

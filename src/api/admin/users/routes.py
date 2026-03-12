@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi.concurrency import run_in_threadpool
 from pydantic import ValidationError
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -15,10 +16,11 @@ from src.api.base.pipeline import ApiRequestPipeline
 from src.config.constants import CacheTTL
 from src.core.exceptions import InvalidRequestException, NotFoundException, translate_pydantic_error
 from src.core.logger import logger
-from src.database import get_db
+from src.database import get_db, get_db_context
 from src.models.admin_requests import UpdateUserRequest
 from src.models.api import CreateApiKeyRequest, CreateUserRequest
 from src.models.database import ApiKey, User, UserRole, Wallet
+from src.services.cache.user_cache import UserCacheService
 from src.services.system.config import SystemConfigService
 from src.services.user.apikey import ApiKeyService
 from src.services.user.bulk_cleanup import pre_clean_api_key
@@ -61,6 +63,232 @@ def _serialize_user(
         "updated_at": user.updated_at.isoformat() if user.updated_at else None,
         "last_login_at": user.last_login_at.isoformat() if user.last_login_at else None,
     }
+
+
+def _create_user_sync(
+    request: CreateUserRequest, role: UserRole
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    with get_db_context() as db:
+        if request.unlimited:
+            initial_gift_usd = None
+        elif request.initial_gift_usd is not None:
+            initial_gift_usd = request.initial_gift_usd
+        else:
+            initial_gift_usd = SystemConfigService.get_config(
+                db, "default_user_initial_gift_usd", default=None
+            )
+
+        user = UserService.create_user(
+            db=db,
+            email=request.email,
+            username=request.username,
+            password=request.password,
+            role=role,
+            initial_gift_usd=initial_gift_usd,
+            unlimited=request.unlimited,
+            allowed_providers=request.allowed_providers,
+            allowed_api_formats=request.allowed_api_formats,
+            allowed_models=request.allowed_models,
+        )
+        return _serialize_user(db, user), {
+            "action": "create_user",
+            "target_user_id": user.id,
+            "target_email": user.email,
+            "target_username": user.username,
+            "target_role": user.role.value,
+            "initial_gift_usd": initial_gift_usd,
+            "unlimited": request.unlimited,
+            "is_active": user.is_active,
+        }
+
+
+def _update_user_sync(
+    user_id: str,
+    request: UpdateUserRequest,
+) -> tuple[dict[str, Any], dict[str, Any], bool, str | None]:
+    with get_db_context() as db:
+        existing_user = UserService.get_user(db, user_id)
+        if not existing_user:
+            raise NotFoundException("用户不存在", "user")
+
+        update_data = request.model_dump(exclude_unset=True)
+        old_role = existing_user.role
+        existing_wallet = WalletService.get_or_create_wallet(db, user=existing_user)
+        unlimited_before = WalletService.is_unlimited_wallet(existing_wallet)
+
+        requested_unlimited = update_data.pop("unlimited", None)
+
+        if "role" in update_data and update_data["role"]:
+            if not hasattr(update_data["role"], "value"):
+                update_data["role"] = UserRole[update_data["role"].upper()]
+
+        user = UserService.update_user(db, user_id, **update_data)
+        if not user:
+            raise NotFoundException("用户不存在", "user")
+
+        changed_fields = list(update_data.keys())
+        if requested_unlimited is not None:
+            wallet = WalletService.get_or_create_wallet(db, user=user)
+            if wallet is not None:
+                WalletService.set_wallet_limit_mode(
+                    db,
+                    wallet=wallet,
+                    limit_mode="unlimited" if requested_unlimited else "finite",
+                )
+            changed_fields.append("unlimited")
+
+        role_changed = "role" in update_data and update_data["role"] != old_role
+        response = _serialize_user(db, user)
+        return (
+            response,
+            {
+                "action": "update_user",
+                "target_user_id": user.id,
+                "updated_fields": changed_fields,
+                "role_before": old_role.value if old_role else None,
+                "role_after": user.role.value,
+                "unlimited_before": unlimited_before,
+                "unlimited_after": (
+                    requested_unlimited if requested_unlimited is not None else unlimited_before
+                ),
+                "is_active": user.is_active,
+            },
+            role_changed,
+            user.email,
+        )
+
+
+def _delete_user_sync(user_id: str) -> tuple[dict[str, Any], dict[str, Any], str | None]:
+    with get_db_context() as db:
+        user = UserService.get_user(db, user_id)
+        if not user:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="用户不存在")
+
+        if user.role == UserRole.ADMIN:
+            admin_count = int(
+                db.query(func.count(User.id)).filter(User.role == UserRole.ADMIN).scalar() or 0
+            )
+            if admin_count <= 1:
+                raise InvalidRequestException("不能删除最后一个管理员账户")
+
+        try:
+            success = UserService.delete_user(db, user_id)
+        except ValueError as exc:
+            raise InvalidRequestException(str(exc)) from exc
+        if not success:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="用户不存在")
+
+        return (
+            {"message": "用户删除成功"},
+            {
+                "action": "delete_user",
+                "target_user_id": user.id,
+                "target_email": user.email,
+                "target_role": user.role.value,
+            },
+            user.email,
+        )
+
+
+def _create_user_key_sync(
+    user_id: str,
+    key_data: CreateApiKeyRequest,
+) -> tuple[dict[str, Any], dict[str, Any], str | None]:
+    with get_db_context() as db:
+        user = db.query(User).filter(User.id == user_id).first()
+        if not user:
+            raise NotFoundException("用户不存在", "user")
+
+        api_key, plain_key = ApiKeyService.create_api_key(
+            db=db,
+            user_id=user_id,
+            name=key_data.name,
+            allowed_providers=key_data.allowed_providers,
+            allowed_models=key_data.allowed_models,
+            rate_limit=key_data.rate_limit,
+            expire_days=key_data.expire_days,
+            is_standalone=False,
+        )
+
+        return (
+            {
+                "id": api_key.id,
+                "key": plain_key,
+                "name": api_key.name,
+                "key_display": api_key.get_display_key(),
+                "rate_limit": api_key.rate_limit,
+                "expires_at": api_key.expires_at.isoformat() if api_key.expires_at else None,
+                "created_at": api_key.created_at.isoformat(),
+                "message": "API Key创建成功，请妥善保存完整密钥",
+            },
+            {
+                "action": "create_user_api_key",
+                "target_user_id": user_id,
+                "key_id": api_key.id,
+            },
+            user.email,
+        )
+
+
+def _delete_user_key_sync(user_id: str, key_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    with get_db_context() as db:
+        api_key = (
+            db.query(ApiKey)
+            .filter(
+                ApiKey.id == key_id,
+                ApiKey.user_id == user_id,
+                ApiKey.is_standalone == False,
+            )
+            .first()
+        )
+
+        if not api_key:
+            raise NotFoundException("API Key不存在或不属于该用户", "api_key")
+
+        pre_clean_api_key(db, api_key.id)
+        db.delete(api_key)
+
+        return {"message": "API Key已删除"}, {
+            "action": "delete_user_api_key",
+            "target_user_id": user_id,
+            "key_id": key_id,
+        }
+
+
+def _toggle_user_key_lock_sync(
+    user_id: str,
+    key_id: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    with get_db_context() as db:
+        api_key = (
+            db.query(ApiKey)
+            .filter(
+                ApiKey.id == key_id,
+                ApiKey.user_id == user_id,
+                ApiKey.is_standalone == False,
+            )
+            .first()
+        )
+        if not api_key:
+            raise NotFoundException("API Key不存在或不属于该用户", "api_key")
+
+        api_key.is_locked = not api_key.is_locked
+        db.commit()
+        db.refresh(api_key)
+
+        return (
+            {
+                "id": api_key.id,
+                "is_locked": api_key.is_locked,
+                "message": f"API密钥已{'锁定' if api_key.is_locked else '解锁'}",
+            },
+            {
+                "action": "toggle_user_api_key_lock",
+                "target_user_id": user_id,
+                "key_id": key_id,
+                "new_lock_status": "locked" if api_key.is_locked else "unlocked",
+            },
+        )
 
 
 # 管理员端点
@@ -269,7 +497,6 @@ async def get_user_api_key_full_key(
 
 class AdminCreateUserAdapter(AdminApiAdapter):
     async def handle(self, context: ApiRequestContext) -> Any:  # type: ignore[override]
-        db = context.db
         payload = context.ensure_json_body()
         try:
             request = CreateUserRequest.model_validate(payload)
@@ -285,48 +512,12 @@ class AdminCreateUserAdapter(AdminApiAdapter):
         except (KeyError, AttributeError):
             raise InvalidRequestException("角色参数不合法")
 
-        # 确定初始赠款：仅有限制用户才会发放初始赠款
-        if request.unlimited:
-            initial_gift_usd = None
-        elif request.initial_gift_usd is not None:
-            initial_gift_usd = request.initial_gift_usd
-        else:
-            initial_gift_usd = SystemConfigService.get_config(
-                db, "default_user_initial_gift_usd", default=None
-            )
-
-        # 处理访问权限字段：空数组转为 None（表示无限制）
-        allowed_providers = request.allowed_providers if request.allowed_providers else None
-        allowed_api_formats = request.allowed_api_formats if request.allowed_api_formats else None
-        allowed_models = request.allowed_models if request.allowed_models else None
-
         try:
-            user = UserService.create_user(
-                db=db,
-                email=request.email,
-                username=request.username,
-                password=request.password,
-                role=role,
-                initial_gift_usd=initial_gift_usd,
-                unlimited=request.unlimited,
-                allowed_providers=allowed_providers,
-                allowed_api_formats=allowed_api_formats,
-                allowed_models=allowed_models,
-            )
+            response, audit_meta = await run_in_threadpool(_create_user_sync, request, role)
         except ValueError as exc:
-            raise InvalidRequestException(str(exc))
-
-        context.add_audit_metadata(
-            action="create_user",
-            target_user_id=user.id,
-            target_email=user.email,
-            target_username=user.username,
-            target_role=user.role.value,
-            initial_gift_usd=initial_gift_usd,
-            unlimited=request.unlimited,
-            is_active=user.is_active,
-        )
-        return _serialize_user(db, user)
+            raise InvalidRequestException(str(exc)) from exc
+        context.add_audit_metadata(**audit_meta)
+        return response
 
 
 class AdminListUsersAdapter(AdminApiAdapter):
@@ -378,11 +569,6 @@ class AdminUpdateUserAdapter(AdminApiAdapter):
         self.user_id = user_id
 
     async def handle(self, context: ApiRequestContext) -> Any:  # type: ignore[override]
-        db = context.db
-        existing_user = UserService.get_user(db, self.user_id)
-        if not existing_user:
-            raise NotFoundException("用户不存在", "user")
-
         payload = context.ensure_json_body()
         try:
             request = UpdateUserRequest.model_validate(payload)
@@ -392,52 +578,19 @@ class AdminUpdateUserAdapter(AdminApiAdapter):
                 raise InvalidRequestException(translate_pydantic_error(errors[0]))
             raise InvalidRequestException("请求数据验证失败")
 
-        update_data = request.model_dump(exclude_unset=True)
-        old_role = existing_user.role
-        existing_wallet = WalletService.get_or_create_wallet(db, user=existing_user)
-        unlimited_before = WalletService.is_unlimited_wallet(existing_wallet)
-
-        requested_unlimited = update_data.pop("unlimited", None)
-
-        if "role" in update_data and update_data["role"]:
-            if hasattr(update_data["role"], "value"):
-                update_data["role"] = update_data["role"]
-            else:
-                update_data["role"] = UserRole[update_data["role"].upper()]
-
-        user = UserService.update_user(db, self.user_id, **update_data)
-        if not user:
-            raise NotFoundException("用户不存在", "user")
-
-        # 角色变更时清除热力图缓存（影响 include_actual_cost 权限）
-        if "role" in update_data and update_data["role"] != old_role:
+        response, audit_meta, role_changed, user_email = await run_in_threadpool(
+            _update_user_sync,
+            self.user_id,
+            request,
+        )
+        if user_email:
+            await UserCacheService.invalidate_user_cache(self.user_id, user_email)
+        if role_changed:
             from src.services.usage.service import UsageService
 
             await UsageService.clear_user_heatmap_cache(self.user_id)
-
-        changed_fields = list(update_data.keys())
-        if requested_unlimited is not None:
-            wallet = WalletService.get_or_create_wallet(db, user=user)
-            if wallet is not None:
-                WalletService.set_wallet_limit_mode(
-                    db,
-                    wallet=wallet,
-                    limit_mode="unlimited" if requested_unlimited else "finite",
-                )
-            changed_fields.append("unlimited")
-        context.add_audit_metadata(
-            action="update_user",
-            target_user_id=user.id,
-            updated_fields=changed_fields,
-            role_before=existing_user.role.value if existing_user.role else None,
-            role_after=user.role.value,
-            unlimited_before=unlimited_before,
-            unlimited_after=(
-                requested_unlimited if requested_unlimited is not None else unlimited_before
-            ),
-            is_active=user.is_active,
-        )
-        return _serialize_user(db, user)
+        context.add_audit_metadata(**audit_meta)
+        return response
 
 
 class AdminDeleteUserAdapter(AdminApiAdapter):
@@ -445,33 +598,11 @@ class AdminDeleteUserAdapter(AdminApiAdapter):
         self.user_id = user_id
 
     async def handle(self, context: ApiRequestContext) -> Any:  # type: ignore[override]
-        db = context.db
-        user = UserService.get_user(db, self.user_id)
-        if not user:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="用户不存在")
-
-        if user.role == UserRole.ADMIN:
-            admin_count = int(
-                db.query(func.count(User.id)).filter(User.role == UserRole.ADMIN).scalar() or 0
-            )
-            if admin_count <= 1:
-                raise InvalidRequestException("不能删除最后一个管理员账户")
-
-        try:
-            success = UserService.delete_user(db, self.user_id)
-        except ValueError as exc:
-            raise InvalidRequestException(str(exc))
-        if not success:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="用户不存在")
-
-        context.add_audit_metadata(
-            action="delete_user",
-            target_user_id=user.id,
-            target_email=user.email,
-            target_role=user.role.value,
-        )
-
-        return {"message": "用户删除成功"}
+        response, audit_meta, user_email = await run_in_threadpool(_delete_user_sync, self.user_id)
+        if user_email:
+            await UserCacheService.invalidate_user_cache(self.user_id, user_email)
+        context.add_audit_metadata(**audit_meta)
+        return response
 
 
 class AdminGetUserKeysAdapter(AdminApiAdapter):
@@ -530,7 +661,6 @@ class AdminCreateUserKeyAdapter(AdminApiAdapter):
         self.user_id = user_id
 
     async def handle(self, context: ApiRequestContext) -> Any:  # type: ignore[override]
-        db = context.db
         payload = context.ensure_json_body()
         try:
             key_data = CreateApiKeyRequest.model_validate(payload)
@@ -540,41 +670,17 @@ class AdminCreateUserKeyAdapter(AdminApiAdapter):
                 raise InvalidRequestException(translate_pydantic_error(errors[0]))
             raise InvalidRequestException("请求数据验证失败")
 
-        # 验证用户存在
-        user = db.query(User).filter(User.id == self.user_id).first()
-        if not user:
-            raise NotFoundException("用户不存在", "user")
-
-        # 为用户创建Key（不是独立Key）
-        api_key, plain_key = ApiKeyService.create_api_key(
-            db=db,
-            user_id=self.user_id,
-            name=key_data.name,
-            allowed_providers=key_data.allowed_providers,
-            allowed_models=key_data.allowed_models,
-            rate_limit=key_data.rate_limit,  # None = 无限制
-            expire_days=key_data.expire_days,
-            is_standalone=False,  # 不是独立Key
+        response, audit_meta, user_email = await run_in_threadpool(
+            _create_user_key_sync,
+            self.user_id,
+            key_data,
         )
-
-        logger.info(f"管理员为用户创建API Key: 用户 {user.email}, Key ID {api_key.id}")
-
-        context.add_audit_metadata(
-            action="create_user_api_key",
-            target_user_id=self.user_id,
-            key_id=api_key.id,
-        )
-
-        return {
-            "id": api_key.id,
-            "key": plain_key,  # 只在创建时返回
-            "name": api_key.name,
-            "key_display": api_key.get_display_key(),
-            "rate_limit": api_key.rate_limit,
-            "expires_at": api_key.expires_at.isoformat() if api_key.expires_at else None,
-            "created_at": api_key.created_at.isoformat(),
-            "message": "API Key创建成功，请妥善保存完整密钥",
-        }
+        if user_email:
+            logger.info(
+                "管理员为用户创建API Key: 用户 {}, Key ID {}", user_email, audit_meta["key_id"]
+            )
+        context.add_audit_metadata(**audit_meta)
+        return response
 
 
 class AdminDeleteUserKeyAdapter(AdminApiAdapter):
@@ -585,36 +691,13 @@ class AdminDeleteUserKeyAdapter(AdminApiAdapter):
         self.key_id = key_id
 
     async def handle(self, context: ApiRequestContext) -> Any:  # type: ignore[override]
-        db = context.db
-
-        # 验证Key存在且属于该用户
-        api_key = (
-            db.query(ApiKey)
-            .filter(
-                ApiKey.id == self.key_id,
-                ApiKey.user_id == self.user_id,
-                ApiKey.is_standalone == False,  # 只能删除普通Key
-            )
-            .first()
+        response, audit_meta = await run_in_threadpool(
+            _delete_user_key_sync,
+            self.user_id,
+            self.key_id,
         )
-
-        if not api_key:
-            raise NotFoundException("API Key不存在或不属于该用户", "api_key")
-
-        pre_clean_api_key(db, api_key.id)
-        db.delete(api_key)
-        db.commit()
-        context.request.state.tx_committed_by_route = True
-
-        logger.info(f"管理员删除用户API Key: 用户ID {self.user_id}, Key ID {self.key_id}")
-
-        context.add_audit_metadata(
-            action="delete_user_api_key",
-            target_user_id=self.user_id,
-            key_id=self.key_id,
-        )
-
-        return {"message": "API Key已删除"}
+        context.add_audit_metadata(**audit_meta)
+        return response
 
 
 class AdminToggleUserKeyLockAdapter(AdminApiAdapter):
@@ -625,42 +708,13 @@ class AdminToggleUserKeyLockAdapter(AdminApiAdapter):
         self.key_id = key_id
 
     async def handle(self, context: ApiRequestContext) -> Any:  # type: ignore[override]
-        db = context.db
-
-        api_key = (
-            db.query(ApiKey)
-            .filter(
-                ApiKey.id == self.key_id,
-                ApiKey.user_id == self.user_id,
-                ApiKey.is_standalone == False,  # 只能锁定普通Key
-            )
-            .first()
+        response, audit_meta = await run_in_threadpool(
+            _toggle_user_key_lock_sync,
+            self.user_id,
+            self.key_id,
         )
-        if not api_key:
-            raise NotFoundException("API Key不存在或不属于该用户", "api_key")
-
-        api_key.is_locked = not api_key.is_locked
-        db.commit()
-        context.request.state.tx_committed_by_route = True
-        db.refresh(api_key)
-
-        logger.info(
-            f"管理员切换用户API Key锁定状态: 用户ID {self.user_id}, Key ID {self.key_id}, "
-            f"新状态 {'锁定' if api_key.is_locked else '解锁'}"
-        )
-
-        context.add_audit_metadata(
-            action="toggle_user_api_key_lock",
-            target_user_id=self.user_id,
-            key_id=self.key_id,
-            new_lock_status="locked" if api_key.is_locked else "unlocked",
-        )
-
-        return {
-            "id": api_key.id,
-            "is_locked": api_key.is_locked,
-            "message": f"API密钥已{'锁定' if api_key.is_locked else '解锁'}",
-        }
+        context.add_audit_metadata(**audit_meta)
+        return response
 
 
 class AdminGetUserKeyFullKeyAdapter(AdminApiAdapter):

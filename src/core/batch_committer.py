@@ -32,7 +32,7 @@ class BatchCommitter:
         """启动后台批量提交任务"""
         if self._task is None:
             self._task = asyncio.create_task(self._batch_commit_loop())
-            logger.info(f"批量提交器已启动，间隔: {self.interval_seconds}s")
+            logger.info("批量提交器已启动，间隔: {}s", self.interval_seconds)
 
     async def stop(self) -> Any:
         """停止后台任务"""
@@ -65,7 +65,7 @@ class BatchCommitter:
                 await self._commit_all()
                 raise
             except Exception as e:
-                logger.error(f"批量提交出错: {e}")
+                logger.error("批量提交出错: {}", e)
 
     async def _commit_all(self) -> None:
         """提交所有待处理的 Session"""
@@ -76,25 +76,34 @@ class BatchCommitter:
             sessions_to_commit = list(self._pending_sessions)
             self._pending_sessions.clear()
 
-            committed = 0
-            failed = 0
+        committed = 0
+        failed = 0
 
+        def _sync_commit_all() -> tuple[int, int]:
+            ok = 0
+            err = 0
             for session in sessions_to_commit:
                 try:
                     session.commit()
-                    committed += 1
+                    ok += 1
                 except Exception as e:
-                    logger.error(f"提交 Session 失败: {e}")
+                    logger.error("提交 Session 失败: {}", e)
                     try:
                         session.rollback()
                     except:
                         pass
-                    failed += 1
+                    err += 1
+            return ok, err
 
-            if committed > 0:
-                logger.debug(f"批量提交完成: {committed} 个 Session")
-            if failed > 0:
-                logger.warning(f"批量提交失败: {failed} 个 Session")
+        try:
+            committed, failed = await asyncio.to_thread(_sync_commit_all)
+        except Exception as e:
+            logger.error("批量提交线程异常: {}", e)
+
+        if committed > 0:
+            logger.debug("批量提交完成: {} 个 Session", committed)
+        if failed > 0:
+            logger.warning("批量提交失败: {} 个 Session", failed)
 
 
 # 全局单例

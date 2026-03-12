@@ -1,6 +1,6 @@
 import client from '../client'
 import { dedupedRequest } from '@/utils/cache'
-import type { AllowedModels, ProxyConfig } from './types/provider'
+import type { AllowedModels, OAuthOrganizationInfo, ProxyConfig } from './types/provider'
 
 const POOL_BATCH_ACTION_TIMEOUT_MS = 5 * 60 * 1000
 
@@ -102,6 +102,9 @@ export interface PoolKeyDetail {
   oauth_invalid_at?: number | null
   oauth_invalid_reason?: string | null
   oauth_plan_type?: string | null
+  oauth_account_id?: string | null
+  oauth_account_user_id?: string | null
+  oauth_organizations?: OAuthOrganizationInfo[] | null
   quota_updated_at?: number | null
   health_score?: number
   circuit_breaker_open?: boolean
@@ -169,6 +172,24 @@ export interface PoolKeysQuery {
   page_size?: number
   search?: string
   status?: 'all' | 'active' | 'cooldown' | 'inactive'
+  quick_selectors?: string[]
+  search_scope?: 'name' | 'full'
+}
+
+export interface PoolKeySelectionRequest {
+  search?: string
+  quick_selectors?: string[]
+}
+
+export interface PoolKeySelectionItem {
+  key_id: string
+  key_name: string
+  auth_type: string
+}
+
+export interface PoolKeySelectionResponse {
+  total: number
+  items: PoolKeySelectionItem[]
 }
 
 export interface PoolBatchAction {
@@ -203,11 +224,27 @@ export async function listPoolKeys(
   providerId: string,
   params: PoolKeysQuery = {},
 ): Promise<PoolKeysPageResponse> {
-  const key = `pool:keys:${providerId}|${params.page ?? ''}|${params.page_size ?? ''}|${params.search ?? ''}|${params.status ?? ''}`
+  const normalizedParams = {
+    ...params,
+    quick_selectors: params.quick_selectors?.length ? params.quick_selectors.join(',') : undefined,
+  }
+  const key = `pool:keys:${providerId}|${normalizedParams.page ?? ''}|${normalizedParams.page_size ?? ''}|${normalizedParams.search ?? ''}|${normalizedParams.status ?? ''}|${normalizedParams.quick_selectors ?? ''}|${normalizedParams.search_scope ?? ''}`
   return dedupedRequest(key, async () => {
-    const response = await client.get<PoolKeysPageResponse>(`/api/admin/pool/${providerId}/keys`, { params })
+    const response = await client.get<PoolKeysPageResponse>(`/api/admin/pool/${providerId}/keys`, { params: normalizedParams })
     return response.data
   })
+}
+
+export async function resolvePoolKeySelection(
+  providerId: string,
+  body: PoolKeySelectionRequest,
+): Promise<PoolKeySelectionResponse> {
+  const response = await client.post<PoolKeySelectionResponse>(
+    `/api/admin/pool/${providerId}/keys/resolve-selection`,
+    body,
+    { timeout: POOL_BATCH_ACTION_TIMEOUT_MS },
+  )
+  return response.data
 }
 
 export async function batchActionPoolKeys(

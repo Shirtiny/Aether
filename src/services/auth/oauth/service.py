@@ -6,6 +6,7 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import httpx
 from fastapi import HTTPException, status
+from fastapi.concurrency import run_in_threadpool
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -15,6 +16,7 @@ from src.core.enums import AuthSource, UserRole
 from src.core.exceptions import ConfirmationRequiredException, InvalidRequestException
 from src.core.logger import logger
 from src.core.modules import get_module_registry
+from src.database import get_db_context
 from src.models.database import OAuthProvider, User, UserOAuthLink
 from src.services.auth.oauth.base import OAuthProviderBase
 from src.services.auth.oauth.models import OAuthFlowError, OAuthUserInfo
@@ -38,6 +40,322 @@ def _build_oauth_client_kwargs(
 
 class OAuthService:
     """OAuth 核心业务服务（v1）。"""
+
+    @staticmethod
+    def _handle_login_sync(provider_type: str, oauth_user: OAuthUserInfo) -> User:
+        now = datetime.now(timezone.utc)
+
+        with get_db_context() as db:
+            existing_link = (
+                db.query(UserOAuthLink)
+                .filter(
+                    UserOAuthLink.provider_type == provider_type,
+                    UserOAuthLink.provider_user_id == oauth_user.id,
+                )
+                .first()
+            )
+            if existing_link:
+                linked_user = db.query(User).filter(User.id == existing_link.user_id).first()
+                if not linked_user or not linked_user.is_active or linked_user.is_deleted:
+                    raise OAuthFlowError("account_disabled", "用户不存在或已禁用")
+
+                linked_user.last_login_at = now
+                existing_link.last_login_at = now
+                db.commit()
+                db.expunge(linked_user)
+                return linked_user
+
+            enable_registration = SystemConfigService.get_config(
+                db, "enable_registration", default=False
+            )
+            if not enable_registration:
+                raise OAuthFlowError("registration_disabled")
+
+            email = oauth_user.email
+            if email:
+                if not OAuthService._validate_email_suffix(db, email):
+                    raise OAuthFlowError("email_suffix_denied")
+
+                existing_user = db.query(User).filter(User.email == email).first()
+                if existing_user and not existing_user.is_deleted:
+                    if existing_user.auth_source == AuthSource.LOCAL:
+                        raise OAuthFlowError("email_exists_local")
+                    if existing_user.auth_source == AuthSource.LDAP:
+                        raise OAuthFlowError("email_is_ldap")
+                    raise OAuthFlowError("email_is_oauth")
+
+            base_username = (
+                oauth_user.username
+                or (email.split("@", 1)[0] if email else None)
+                or f"user_{uuid.uuid4().hex[:8]}"
+            )
+            default_initial_gift = SystemConfigService.get_config(
+                db, "default_user_initial_gift_usd", default=None
+            )
+
+            user: User | None = None
+            last_error: Exception | None = None
+            for _ in range(3):
+                try:
+                    username = OAuthService._generate_unique_username(db, base_username)
+                    user = User(
+                        email=email,
+                        email_verified=bool(oauth_user.email_verified) if email else False,
+                        username=username,
+                        password_hash=None,
+                        auth_source=AuthSource.OAUTH,
+                        role=UserRole.USER,
+                        is_active=True,
+                        last_login_at=now,
+                    )
+                    db.add(user)
+                    db.flush()
+
+                    from src.services.wallet import WalletService
+
+                    WalletService.initialize_user_wallet(
+                        db,
+                        user=user,
+                        initial_gift_usd=default_initial_gift,
+                        unlimited=False,
+                        description="OAuth 注册初始赠款",
+                    )
+
+                    db.commit()
+                    db.refresh(user)
+                    last_error = None
+                    break
+                except IntegrityError as e:
+                    db.rollback()
+                    last_error = e
+                except Exception as e:
+                    db.rollback()
+                    last_error = e
+
+            if last_error is not None or user is None:
+                raise OAuthFlowError("provider_error", "user_create_failed")
+
+            assert user.id is not None
+            try:
+                link = UserOAuthLink(
+                    user_id=user.id,
+                    provider_type=provider_type,
+                    provider_user_id=oauth_user.id,
+                    provider_username=oauth_user.username,
+                    provider_email=email,
+                    extra_data=oauth_user.raw,
+                    linked_at=now,
+                    last_login_at=now,
+                )
+                db.add(link)
+                db.commit()
+            except IntegrityError as e:
+                db.rollback()
+                constraint = OAuthService._get_constraint_name(e)
+                if constraint == "uq_oauth_provider_user":
+                    existing_link = (
+                        db.query(UserOAuthLink)
+                        .filter(
+                            UserOAuthLink.provider_type == provider_type,
+                            UserOAuthLink.provider_user_id == oauth_user.id,
+                        )
+                        .first()
+                    )
+                    if existing_link:
+                        existing_user = (
+                            db.query(User).filter(User.id == existing_link.user_id).first()
+                        )
+                        if (
+                            existing_user
+                            and existing_user.is_active
+                            and not existing_user.is_deleted
+                        ):
+                            existing_user.last_login_at = now
+                            existing_link.last_login_at = now
+                            db.commit()
+                            db.expunge(existing_user)
+                            return existing_user
+                    raise OAuthFlowError("oauth_already_bound")
+                raise OAuthFlowError("provider_error", "link_create_failed")
+
+            db.expunge(user)
+            return user
+
+    @staticmethod
+    def _handle_bind_sync(
+        user_id: str, provider_type: str, oauth_user: OAuthUserInfo
+    ) -> UserOAuthLink:
+        now = datetime.now(timezone.utc)
+
+        with get_db_context() as db:
+            user = db.query(User).filter(User.id == user_id).first()
+            if not user or not user.is_active or user.is_deleted:
+                raise OAuthFlowError("user_not_found")
+            if user.auth_source == AuthSource.LDAP:
+                raise OAuthFlowError("ldap_no_oauth")
+
+            link = UserOAuthLink(
+                user_id=user.id,
+                provider_type=provider_type,
+                provider_user_id=oauth_user.id,
+                provider_username=oauth_user.username,
+                provider_email=oauth_user.email,
+                extra_data=oauth_user.raw,
+                linked_at=now,
+            )
+
+            try:
+                db.add(link)
+                db.commit()
+                db.refresh(link)
+                db.expunge(link)
+                return link
+            except IntegrityError as e:
+                db.rollback()
+                constraint = OAuthService._get_constraint_name(e)
+
+                if constraint == "uq_oauth_provider_user":
+                    existing = (
+                        db.query(UserOAuthLink)
+                        .filter(
+                            UserOAuthLink.provider_type == provider_type,
+                            UserOAuthLink.provider_user_id == oauth_user.id,
+                        )
+                        .first()
+                    )
+                    if existing and existing.user_id == user.id:
+                        db.expunge(existing)
+                        return existing
+                    raise OAuthFlowError("oauth_already_bound")
+
+                if constraint == "uq_user_oauth_provider":
+                    raise OAuthFlowError("already_bound_provider")
+
+                raise OAuthFlowError("provider_error", "bind_failed")
+
+    @staticmethod
+    def _upsert_provider_config_sync(provider_type: str, data: Any) -> OAuthProvider:
+        with get_db_context() as db:
+            provider = OAuthService._get_provider_impl(provider_type)
+            if not provider:
+                raise InvalidRequestException("不支持的 provider_type")
+
+            OAuthService._validate_provider_config(provider, data)
+
+            row = (
+                db.query(OAuthProvider).filter(OAuthProvider.provider_type == provider_type).first()
+            )
+            creating = row is None
+            if not row:
+                row = OAuthProvider(provider_type=provider_type)
+                db.add(row)
+
+            if row.is_enabled and data.is_enabled is False:
+                affected = OAuthService._check_provider_disable_safety(db, provider_type)
+                if affected and not getattr(data, "force", False):
+                    raise ConfirmationRequiredException(
+                        message=f"禁用该 Provider 会导致 {len(affected)} 个用户无法登录",
+                        affected_count=len(affected),
+                        action="disable_oauth_provider",
+                    )
+
+            row.display_name = data.display_name
+            row.client_id = data.client_id
+            row.authorization_url_override = data.authorization_url_override
+            row.token_url_override = data.token_url_override
+            row.userinfo_url_override = data.userinfo_url_override
+            row.scopes = data.scopes
+            row.redirect_uri = data.redirect_uri
+            row.frontend_callback_url = data.frontend_callback_url
+            row.attribute_mapping = data.attribute_mapping
+            row.extra_config = data.extra_config
+            row.is_enabled = data.is_enabled
+
+            if data.client_secret is not None:
+                secret_value = data.client_secret.strip()
+                if secret_value == "__CLEAR__":
+                    row.client_secret_encrypted = None
+                elif secret_value:
+                    row.set_client_secret(secret_value)
+
+            try:
+                db.commit()
+                db.refresh(row)
+            except Exception:
+                db.rollback()
+                raise
+
+            db.expunge(row)
+            if creating:
+                logger.info("OAuth provider 配置已创建: {}", provider_type)
+            else:
+                logger.info("OAuth provider 配置已更新: {}", provider_type)
+            return row
+
+    @staticmethod
+    def _delete_provider_config_sync(provider_type: str) -> None:
+        with get_db_context() as db:
+            row = (
+                db.query(OAuthProvider).filter(OAuthProvider.provider_type == provider_type).first()
+            )
+            if not row:
+                raise InvalidRequestException("Provider 配置不存在")
+
+            if row.is_enabled:
+                affected = OAuthService._check_provider_disable_safety(db, provider_type)
+                if affected:
+                    raise InvalidRequestException(
+                        f"删除该 Provider 会导致部分用户无法登录（数量: {len(affected)}），已阻止操作"
+                    )
+
+            db.delete(row)
+
+    @staticmethod
+    def _unbind_provider_sync(user_id: str, provider_type: str) -> None:
+        with get_db_context() as db:
+            OAuthService._require_module_active(db)
+            user = db.query(User).filter(User.id == user_id).first()
+            if not user:
+                raise InvalidRequestException("用户不存在")
+
+            if user.auth_source == AuthSource.LDAP:
+                raise HTTPException(status_code=403, detail="LDAP 用户不允许解绑 OAuth")
+
+            link = (
+                db.query(UserOAuthLink)
+                .filter(
+                    UserOAuthLink.user_id == user.id, UserOAuthLink.provider_type == provider_type
+                )
+                .first()
+            )
+            if not link:
+                raise InvalidRequestException("未绑定该 Provider")
+
+            total_links = (
+                db.query(func.count(UserOAuthLink.id))
+                .filter(UserOAuthLink.user_id == user.id)
+                .scalar()
+                or 0
+            )
+
+            if user.auth_source == AuthSource.OAUTH and total_links <= 1:
+                raise InvalidRequestException("OAUTH 用户必须至少保留一个 OAuth 绑定")
+
+            if user.auth_source == AuthSource.LOCAL and not user.password_hash and total_links <= 1:
+                raise InvalidRequestException("请先设置密码后再解绑")
+
+            from src.core.modules.hooks import AUTH_CHECK_EXCLUSIVE_MODE, get_hook_dispatcher
+
+            is_exclusive = get_hook_dispatcher().dispatch_sync(AUTH_CHECK_EXCLUSIVE_MODE, db=db)
+            if (
+                is_exclusive
+                and user.auth_source == AuthSource.LOCAL
+                and user.role != UserRole.ADMIN
+            ):
+                if total_links <= 1:
+                    raise InvalidRequestException("当前处于 LDAP 专属模式，解绑后将无法登录")
+
+            db.delete(link)
 
     @staticmethod
     def _require_module_active(db: Session) -> None:
@@ -379,144 +697,11 @@ class OAuthService:
     async def _handle_login(
         db: Session, *, config: OAuthProvider, oauth_user: OAuthUserInfo
     ) -> User:
-        now = datetime.now(timezone.utc)
-
-        # 1) 已绑定账号：直接登录
-        existing_link = (
-            db.query(UserOAuthLink)
-            .filter(
-                UserOAuthLink.provider_type == config.provider_type,
-                UserOAuthLink.provider_user_id == oauth_user.id,
-            )
-            .first()
+        user = await run_in_threadpool(
+            OAuthService._handle_login_sync,
+            config.provider_type,
+            oauth_user,
         )
-        if existing_link:
-            linked_user = db.query(User).filter(User.id == existing_link.user_id).first()
-            if not linked_user or not linked_user.is_active or linked_user.is_deleted:
-                raise OAuthFlowError("account_disabled", "用户不存在或已禁用")
-
-            linked_user.last_login_at = now
-            existing_link.last_login_at = now
-            db.commit()
-            assert linked_user.id is not None
-            await UserCacheService.invalidate_user_cache(linked_user.id, linked_user.email)
-            return linked_user
-
-        # 2) 未绑定账号：可能需要新建用户（受注册开关控制）
-        enable_registration = SystemConfigService.get_config(
-            db, "enable_registration", default=False
-        )
-        if not enable_registration:
-            raise OAuthFlowError("registration_disabled")
-
-        email = oauth_user.email
-        if email:
-            if not OAuthService._validate_email_suffix(db, email):
-                raise OAuthFlowError("email_suffix_denied")
-
-            existing_user = db.query(User).filter(User.email == email).first()
-            # 已删除用户不阻塞新建（邮箱可复用）
-            if existing_user and not existing_user.is_deleted:
-                if existing_user.auth_source == AuthSource.LOCAL:
-                    raise OAuthFlowError("email_exists_local")
-                if existing_user.auth_source == AuthSource.LDAP:
-                    raise OAuthFlowError("email_is_ldap")
-                raise OAuthFlowError("email_is_oauth")
-
-        base_username = (
-            oauth_user.username
-            or (email.split("@", 1)[0] if email else None)
-            or f"user_{uuid.uuid4().hex[:8]}"
-        )
-        default_initial_gift = SystemConfigService.get_config(
-            db, "default_user_initial_gift_usd", default=None
-        )
-
-        # 生成唯一用户名 + 创建用户（简单重试）
-        user: User | None = None
-        last_error: Exception | None = None
-        for _ in range(3):
-            try:
-                username = OAuthService._generate_unique_username(db, base_username)
-                user = User(
-                    email=email,
-                    email_verified=bool(oauth_user.email_verified) if email else False,
-                    username=username,
-                    password_hash=None,
-                    auth_source=AuthSource.OAUTH,
-                    role=UserRole.USER,
-                    is_active=True,
-                    last_login_at=now,
-                )
-                db.add(user)
-                db.flush()
-
-                from src.services.wallet import WalletService
-
-                WalletService.initialize_user_wallet(
-                    db,
-                    user=user,
-                    initial_gift_usd=default_initial_gift,
-                    unlimited=False,
-                    description="OAuth 注册初始赠款",
-                )
-
-                db.commit()
-                db.refresh(user)
-                last_error = None
-                break
-            except IntegrityError as e:
-                db.rollback()
-                last_error = e
-            except Exception as e:
-                db.rollback()
-                last_error = e
-
-        if last_error is not None or user is None:
-            raise OAuthFlowError("provider_error", "user_create_failed")
-
-        # 创建绑定关系
-        assert user.id is not None
-        try:
-            link = UserOAuthLink(
-                user_id=user.id,
-                provider_type=config.provider_type,
-                provider_user_id=oauth_user.id,
-                provider_username=oauth_user.username,
-                provider_email=email,
-                extra_data=oauth_user.raw,
-                linked_at=now,
-                last_login_at=now,
-            )
-            db.add(link)
-            db.commit()
-        except IntegrityError as e:
-            db.rollback()
-            constraint = OAuthService._get_constraint_name(e)
-            if constraint == "uq_oauth_provider_user":
-                # 并发：该第三方账号已先被绑定，尝试读取并登录
-                existing_link = (
-                    db.query(UserOAuthLink)
-                    .filter(
-                        UserOAuthLink.provider_type == config.provider_type,
-                        UserOAuthLink.provider_user_id == oauth_user.id,
-                    )
-                    .first()
-                )
-                if existing_link:
-                    existing_user = db.query(User).filter(User.id == existing_link.user_id).first()
-                    if existing_user and existing_user.is_active and not existing_user.is_deleted:
-                        existing_user.last_login_at = now
-                        existing_link.last_login_at = now
-                        db.commit()
-                        assert existing_user.id is not None
-                        await UserCacheService.invalidate_user_cache(
-                            existing_user.id, existing_user.email
-                        )
-                        return existing_user
-                raise OAuthFlowError("oauth_already_bound")
-            raise OAuthFlowError("provider_error", "link_create_failed")
-
         assert user.id is not None
         await UserCacheService.invalidate_user_cache(user.id, user.email)
         return user
@@ -525,49 +710,12 @@ class OAuthService:
     async def _handle_bind(
         db: Session, *, user_id: str, config: OAuthProvider, oauth_user: OAuthUserInfo
     ) -> UserOAuthLink:
-        now = datetime.now(timezone.utc)
-        user = db.query(User).filter(User.id == user_id).first()
-        if not user or not user.is_active or user.is_deleted:
-            raise OAuthFlowError("user_not_found")
-        if user.auth_source == AuthSource.LDAP:
-            raise OAuthFlowError("ldap_no_oauth")
-
-        link = UserOAuthLink(
-            user_id=user.id,
-            provider_type=config.provider_type,
-            provider_user_id=oauth_user.id,
-            provider_username=oauth_user.username,
-            provider_email=oauth_user.email,
-            extra_data=oauth_user.raw,
-            linked_at=now,
+        return await run_in_threadpool(
+            OAuthService._handle_bind_sync,
+            user_id,
+            config.provider_type,
+            oauth_user,
         )
-
-        try:
-            db.add(link)
-            db.commit()
-            db.refresh(link)
-            return link
-        except IntegrityError as e:
-            db.rollback()
-            constraint = OAuthService._get_constraint_name(e)
-
-            if constraint == "uq_oauth_provider_user":
-                existing = (
-                    db.query(UserOAuthLink)
-                    .filter(
-                        UserOAuthLink.provider_type == config.provider_type,
-                        UserOAuthLink.provider_user_id == oauth_user.id,
-                    )
-                    .first()
-                )
-                if existing and existing.user_id == user.id:
-                    return existing
-                raise OAuthFlowError("oauth_already_bound")
-
-            if constraint == "uq_user_oauth_provider":
-                raise OAuthFlowError("already_bound_provider")
-
-            raise OAuthFlowError("provider_error", "bind_failed")
 
     @staticmethod
     async def list_bindable_providers(db: Session, user: User) -> list[dict[str, str]]:
@@ -686,79 +834,13 @@ class OAuthService:
 
     @staticmethod
     async def upsert_provider_config(db: Session, provider_type: str, data: Any) -> OAuthProvider:
-        provider = OAuthService._get_provider_impl(provider_type)
-        if not provider:
-            raise InvalidRequestException("不支持的 provider_type")
-
-        OAuthService._validate_provider_config(provider, data)
-
-        row = db.query(OAuthProvider).filter(OAuthProvider.provider_type == provider_type).first()
-        creating = row is None
-        if not row:
-            row = OAuthProvider(provider_type=provider_type)
-            db.add(row)
-
-        # 禁用前防锁号检查（仅在从 enabled -> disabled 时触发）
-        if row.is_enabled and data.is_enabled is False:
-            affected = OAuthService._check_provider_disable_safety(db, provider_type)
-            if affected and not getattr(data, "force", False):
-                raise ConfirmationRequiredException(
-                    message=f"禁用该 Provider 会导致 {len(affected)} 个用户无法登录",
-                    affected_count=len(affected),
-                    action="disable_oauth_provider",
-                )
-
-        row.display_name = data.display_name
-        row.client_id = data.client_id
-        row.authorization_url_override = data.authorization_url_override
-        row.token_url_override = data.token_url_override
-        row.userinfo_url_override = data.userinfo_url_override
-        row.scopes = data.scopes
-        row.redirect_uri = data.redirect_uri
-        row.frontend_callback_url = data.frontend_callback_url
-        row.attribute_mapping = data.attribute_mapping
-        row.extra_config = data.extra_config
-        row.is_enabled = data.is_enabled
-
-        # client_secret 处理逻辑：
-        # - None 或空字符串：保持不变
-        # - "__CLEAR__"：清空 secret
-        # - 其他值：设置新 secret
-        if data.client_secret is not None:
-            secret_value = data.client_secret.strip()
-            if secret_value == "__CLEAR__":
-                row.client_secret_encrypted = None
-            elif secret_value:
-                row.set_client_secret(secret_value)
-
-        try:
-            db.commit()
-            db.refresh(row)
-        except Exception:
-            db.rollback()
-            raise
-
-        if creating:
-            logger.info("OAuth provider 配置已创建: {}", provider_type)
-        else:
-            logger.info("OAuth provider 配置已更新: {}", provider_type)
-        return row
+        return await run_in_threadpool(
+            OAuthService._upsert_provider_config_sync, provider_type, data
+        )
 
     @staticmethod
     async def delete_provider_config(db: Session, provider_type: str) -> None:
-        row = db.query(OAuthProvider).filter(OAuthProvider.provider_type == provider_type).first()
-        if not row:
-            raise InvalidRequestException("Provider 配置不存在")
-
-        if row.is_enabled:
-            affected = OAuthService._check_provider_disable_safety(db, provider_type)
-            if affected:
-                raise InvalidRequestException(
-                    f"删除该 Provider 会导致部分用户无法登录（数量: {len(affected)}），已阻止操作"
-                )
-
-        db.delete(row)
-        db.commit()
+        await run_in_threadpool(OAuthService._delete_provider_config_sync, provider_type)
 
     @staticmethod
     def _validate_provider_config(provider: OAuthProviderBase, data: Any) -> None:
@@ -991,38 +1073,6 @@ class OAuthService:
 
     @staticmethod
     async def unbind_provider(db: Session, user: User, provider_type: str) -> None:
-        OAuthService._require_module_active(db)
-
-        if user.auth_source == AuthSource.LDAP:
-            raise HTTPException(status_code=403, detail="LDAP 用户不允许解绑 OAuth")
-
-        link = (
-            db.query(UserOAuthLink)
-            .filter(UserOAuthLink.user_id == user.id, UserOAuthLink.provider_type == provider_type)
-            .first()
-        )
-        if not link:
-            raise InvalidRequestException("未绑定该 Provider")
-
-        total_links = (
-            db.query(func.count(UserOAuthLink.id)).filter(UserOAuthLink.user_id == user.id).scalar()
-            or 0
-        )
-
-        if user.auth_source == AuthSource.OAUTH and total_links <= 1:
-            raise InvalidRequestException("OAUTH 用户必须至少保留一个 OAuth 绑定")
-
-        # 本地用户无密码时，解绑最后一个 OAuth 会导致无法登录
-        if user.auth_source == AuthSource.LOCAL and not user.password_hash and total_links <= 1:
-            raise InvalidRequestException("请先设置密码后再解绑")
-
-        from src.core.modules.hooks import AUTH_CHECK_EXCLUSIVE_MODE, get_hook_dispatcher
-
-        is_exclusive = get_hook_dispatcher().dispatch_sync(AUTH_CHECK_EXCLUSIVE_MODE, db=db)
-        if is_exclusive and user.auth_source == AuthSource.LOCAL and user.role != UserRole.ADMIN:
-            # ldap_exclusive=true 时，普通本地用户解绑最后一个 OAuth 会锁死（密码登录被禁用）
-            if total_links <= 1:
-                raise InvalidRequestException("当前处于 LDAP 专属模式，解绑后将无法登录")
-
-        db.delete(link)
-        db.commit()
+        await run_in_threadpool(OAuthService._unbind_provider_sync, user.id, provider_type)
+        if user.id is not None:
+            await UserCacheService.invalidate_user_cache(user.id, user.email)

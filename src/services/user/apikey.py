@@ -61,15 +61,14 @@ class ApiKeyService:
         if final_expires_at is None and expire_days:
             final_expires_at = datetime.now(timezone.utc) + timedelta(days=expire_days)
 
-        # 空数组转为 None（表示不限制）
         api_key = ApiKey(
             user_id=user_id,
             key_hash=key_hash,
             key_encrypted=key_encrypted,
             name=name or f"API Key {datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}",
-            allowed_providers=allowed_providers or None,
-            allowed_api_formats=allowed_api_formats or None,
-            allowed_models=allowed_models or None,
+            allowed_providers=allowed_providers,
+            allowed_api_formats=allowed_api_formats,
+            allowed_models=allowed_models,
             rate_limit=rate_limit,
             concurrent_limit=concurrent_limit,
             expires_at=final_expires_at,
@@ -142,7 +141,7 @@ class ApiKeyService:
             "auto_delete_on_expiry",
         ]
 
-        # 允许显式设置为空数组/None 的字段（空数组会转为 None，表示"全部"）
+        # 允许显式设置为空数组/None 的字段（NULL=不限制，[]=全部禁用）
         nullable_list_fields = {"allowed_providers", "allowed_api_formats", "allowed_models"}
 
         # 允许显式设置为 None 的字段（如 expires_at=None 表示永不过期，rate_limit=None 表示无限制）
@@ -151,11 +150,9 @@ class ApiKeyService:
         for field, value in kwargs.items():
             if field not in updatable_fields:
                 continue
-            # 对于 nullable_list_fields，空数组应该转为 None（表示不限制）
+            # 对于 nullable_list_fields，保留 None/[] 的语义差异
             if field in nullable_list_fields:
-                if value is not None:
-                    # 空数组转为 None（表示允许全部）
-                    setattr(api_key, field, value if value else None)
+                setattr(api_key, field, value)
             elif field in nullable_fields:
                 # 这些字段允许显式设置为 None
                 setattr(api_key, field, value)

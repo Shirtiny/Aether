@@ -852,9 +852,9 @@ function editApiKey(apiKey: AdminApiKey) {
     expires_at: expiresAt,
     rate_limit: apiKey.rate_limit ?? undefined,
     auto_delete_on_expiry: apiKey.auto_delete_on_expiry || false,
-    allowed_providers: apiKey.allowed_providers || [],
-    allowed_api_formats: apiKey.allowed_api_formats || [],
-    allowed_models: apiKey.allowed_models || []
+    allowed_providers: apiKey.allowed_providers == null ? null : [...apiKey.allowed_providers],
+    allowed_api_formats: apiKey.allowed_api_formats == null ? null : [...apiKey.allowed_api_formats],
+    allowed_models: apiKey.allowed_models == null ? null : [...apiKey.allowed_models]
   }
 
   showKeyFormDialog.value = true

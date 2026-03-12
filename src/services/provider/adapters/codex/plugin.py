@@ -79,7 +79,7 @@ async def enrich_codex(
     access_token: str,  # noqa: ARG001
     proxy_config: dict[str, Any] | None,  # noqa: ARG001
 ) -> dict[str, Any]:
-    """Codex auth_config enrichment: parse id_token -> email/account_id/plan_type/user_id."""
+    """Codex auth_config enrichment: parse token claims -> account/team identity metadata."""
     from src.core.provider_oauth_utils import parse_codex_id_token
 
     def _read_non_empty_str(*values: Any) -> str | None:
@@ -99,6 +99,15 @@ async def enrich_codex(
     )
     if direct_account_id and not auth_config.get("account_id"):
         auth_config["account_id"] = direct_account_id
+
+    direct_account_user_id = _read_non_empty_str(
+        token_response.get("account_user_id"),
+        token_response.get("accountUserId"),
+        token_response.get("chatgpt_account_user_id"),
+        token_response.get("chatgptAccountUserId"),
+    )
+    if direct_account_user_id and not auth_config.get("account_user_id"):
+        auth_config["account_user_id"] = direct_account_user_id
 
     direct_plan_type = _read_non_empty_str(
         token_response.get("plan_type"),

@@ -455,19 +455,22 @@ class CliStreamMixin:
         # 解析有效代理（Key 级别优先于 Provider 级别）
         from src.services.proxy_node.resolver import get_proxy_label as _gpl
         from src.services.proxy_node.resolver import resolve_effective_proxy as _rep
-        from src.services.proxy_node.resolver import resolve_proxy_info as _rpi
+        from src.services.proxy_node.resolver import resolve_proxy_info_async as _rpi_async
 
         effective_proxy = _rep(provider.proxy, getattr(key, "proxy", None))
-        ctx.proxy_info = _rpi(effective_proxy)
+        ctx.proxy_info = await _rpi_async(effective_proxy)
 
         # If upstream is forced to non-stream mode, we execute a sync request and then
         # simulate streaming to the client (sync -> stream bridge).
         if not upstream_is_stream:
             from src.clients.http_client import HTTPClientPool
-            from src.services.proxy_node.resolver import build_post_kwargs, resolve_delegate_config
+            from src.services.proxy_node.resolver import (
+                build_post_kwargs_async,
+                resolve_delegate_config_async,
+            )
 
             request_timeout_sync = provider.request_timeout or config.http_request_timeout
-            delegate_cfg = resolve_delegate_config(effective_proxy)
+            delegate_cfg = await resolve_delegate_config_async(effective_proxy)
             http_client = await HTTPClientPool.get_upstream_client(
                 delegate_cfg,
                 proxy_config=effective_proxy,
@@ -475,7 +478,7 @@ class CliStreamMixin:
             )
 
             try:
-                _pkw = build_post_kwargs(
+                _pkw = await build_post_kwargs_async(
                     delegate_cfg,
                     url=url,
                     headers=provider_headers,
@@ -517,7 +520,7 @@ class CliStreamMixin:
                         ctx.provider_request_headers = provider_headers
 
                     # retry once
-                    _pkw = build_post_kwargs(
+                    _pkw = await build_post_kwargs_async(
                         delegate_cfg,
                         url=url,
                         headers=provider_headers,
@@ -663,9 +666,12 @@ class CliStreamMixin:
         # 获取 HTTP 客户端（支持代理配置，Key 级别优先于 Provider 级别）
         # 使用连接池复用客户端，避免每次流式请求都新建 TCP/TLS 连接
         from src.clients.http_client import HTTPClientPool
-        from src.services.proxy_node.resolver import build_stream_kwargs, resolve_delegate_config
+        from src.services.proxy_node.resolver import (
+            build_stream_kwargs_async,
+            resolve_delegate_config_async,
+        )
 
-        delegate_cfg = resolve_delegate_config(effective_proxy)
+        delegate_cfg = await resolve_delegate_config_async(effective_proxy)
         http_client = await HTTPClientPool.get_upstream_client(
             delegate_cfg,
             proxy_config=effective_proxy,
@@ -680,7 +686,7 @@ class CliStreamMixin:
         async def _connect_and_prefetch() -> None:
             """建立连接并预读首字节（受整体超时控制）"""
             nonlocal byte_iterator, prefetched_chunks, response_ctx
-            _skw = build_stream_kwargs(
+            _skw = await build_stream_kwargs_async(
                 delegate_cfg,
                 url=url,
                 headers=provider_headers,

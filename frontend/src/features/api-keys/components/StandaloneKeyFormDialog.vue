@@ -113,90 +113,111 @@
               @update:model-value="(v) => form.rate_limit = parseNumberInput(v, { min: 1, max: 10000 })"
             />
           </div>
-
-          <div class="space-y-2">
-            <Label class="text-sm font-medium">无限制额度</Label>
-            <div class="flex items-center gap-3">
-              <Switch
-                :model-value="form.unlimited_balance ?? false"
-                @update:model-value="(v) => form.unlimited_balance = v"
-              />
-              <div class="flex flex-col">
-                <span class="text-sm text-foreground">
-                  {{ form.unlimited_balance ? '已启用' : '已关闭' }}
-                </span>
-                <span class="text-xs text-muted-foreground">
-                  {{ form.unlimited_balance ? '无限制：忽略钱包余额校验' : '有限制：按钱包余额校验' }}
-                </span>
-              </div>
-            </div>
-          </div>
-
-          <div
-            v-if="!isEditMode && !form.unlimited_balance"
-            class="space-y-2"
-          >
-            <Label
-              for="form-balance"
-              class="text-sm font-medium"
-            >初始余额 (USD) <span class="text-rose-500">*</span></Label>
-            <Input
-              id="form-balance"
-              :model-value="form.initial_balance_usd ?? ''"
-              type="number"
-              step="0.01"
-              min="0.01"
-              placeholder="10.00"
-              class="h-10"
-              @update:model-value="(v) => form.initial_balance_usd = parseNumberInput(v, { allowFloat: true, min: 0.01 })"
-            />
-            <p class="text-xs text-muted-foreground">
-              最小值 $0.01
-            </p>
-          </div>
         </div>
 
         <!-- 右侧：访问限制 -->
         <div class="pl-6 space-y-4 border-l border-border">
           <div class="flex items-center gap-2 pb-2 border-b border-border/60">
             <span class="text-sm font-medium">访问限制</span>
-            <span class="text-xs text-muted-foreground">(留空不限)</span>
           </div>
 
-          <!-- Provider 多选下拉框 -->
+          <!-- Provider -->
           <div class="space-y-2">
             <Label class="text-sm font-medium">允许的 Provider</Label>
-            <MultiSelect
-              v-model="form.allowed_providers"
-              :options="providerOptions"
-              :search-threshold="0"
-              placeholder="全部可用"
-              empty-text="暂无可用 Provider"
-              no-results-text="未找到匹配的 Provider"
-              search-placeholder="搜索 Provider 名称..."
-            />
+            <div class="flex items-center gap-3">
+              <div class="flex-1 min-w-0">
+                <MultiSelect
+                  v-model="form.allowed_providers"
+                  :options="providerOptions"
+                  :search-threshold="0"
+                  :disabled="form.provider_unrestricted"
+                  :placeholder="form.provider_unrestricted ? '不限制' : '未选择（全部禁用）'"
+                  empty-text="暂无可用 Provider"
+                  no-results-text="未找到匹配的 Provider"
+                  search-placeholder="搜索 Provider 名称..."
+                />
+              </div>
+              <Switch
+                v-model="form.provider_unrestricted"
+                class="shrink-0"
+              />
+            </div>
           </div>
 
-          <!-- API 格式多选下拉框 -->
+          <!-- API 格式 -->
           <div class="space-y-2">
             <Label class="text-sm font-medium">允许的 API 格式</Label>
-            <MultiSelect
-              v-model="form.allowed_api_formats"
-              :options="apiFormatOptions"
-              :search-threshold="0"
-              placeholder="全部可用"
-              empty-text="暂无可用 API 格式"
-              no-results-text="未找到匹配的 API 格式"
-              search-placeholder="搜索 API 格式..."
-            />
+            <div class="flex items-center gap-3">
+              <div class="flex-1 min-w-0">
+                <MultiSelect
+                  v-model="form.allowed_api_formats"
+                  :options="apiFormatOptions"
+                  :search-threshold="0"
+                  :disabled="form.api_format_unrestricted"
+                  :placeholder="form.api_format_unrestricted ? '不限制' : '未选择（全部禁用）'"
+                  empty-text="暂无可用 API 格式"
+                  no-results-text="未找到匹配的 API 格式"
+                  search-placeholder="搜索 API 格式..."
+                />
+              </div>
+              <Switch
+                v-model="form.api_format_unrestricted"
+                class="shrink-0"
+              />
+            </div>
           </div>
 
-          <!-- 模型多选下拉框 -->
-          <ModelMultiSelect
-            v-model="form.allowed_models"
-            :models="globalModels"
-            :search-threshold="0"
-          />
+          <!-- 模型 -->
+          <div class="space-y-2">
+            <Label class="text-sm font-medium">允许的模型</Label>
+            <div class="flex items-center gap-3">
+              <div class="flex-1 min-w-0">
+                <MultiSelect
+                  v-model="form.allowed_models"
+                  :options="modelOptions"
+                  :search-threshold="0"
+                  :disabled="form.model_unrestricted"
+                  :placeholder="form.model_unrestricted ? '不限制' : '未选择（全部禁用）'"
+                  empty-text="暂无可用模型"
+                  no-results-text="未找到匹配的模型"
+                  search-placeholder="输入模型名搜索..."
+                />
+              </div>
+              <Switch
+                v-model="form.model_unrestricted"
+                class="shrink-0"
+              />
+            </div>
+          </div>
+
+          <!-- 额度 -->
+          <div class="space-y-2">
+            <Label class="text-sm font-medium">额度</Label>
+            <div class="flex items-center gap-3">
+              <div class="flex-1 min-w-0">
+                <Input
+                  v-if="!isEditMode && !form.unlimited_balance"
+                  id="form-balance"
+                  :model-value="form.initial_balance_usd ?? ''"
+                  type="number"
+                  step="0.01"
+                  min="0.01"
+                  placeholder="初始额度 (USD)"
+                  class="h-10"
+                  @update:model-value="(v) => form.initial_balance_usd = parseNumberInput(v, { allowFloat: true, min: 0.01 })"
+                />
+                <span
+                  v-else-if="form.unlimited_balance"
+                  class="flex h-10 w-full items-center rounded-lg border bg-background px-3 text-sm text-muted-foreground opacity-60"
+                >无限制</span>
+              </div>
+              <Switch
+                :model-value="form.unlimited_balance ?? false"
+                class="shrink-0"
+                @update:model-value="(v) => form.unlimited_balance = v"
+              />
+            </div>
+          </div>
         </div>
       </div>
     </form>
@@ -232,7 +253,7 @@ import {
 } from '@/components/ui'
 import { Plus, SquarePen, X } from 'lucide-vue-next'
 import { useFormDialog } from '@/composables/useFormDialog'
-import { ModelMultiSelect, MultiSelect } from '@/components/common'
+import { MultiSelect } from '@/components/common'
 import { getProvidersSummary } from '@/api/endpoints/providers'
 import { getGlobalModels } from '@/api/global-models'
 import { adminApi } from '@/api/admin'
@@ -248,6 +269,22 @@ export interface StandaloneKeyFormData {
   expires_at?: string  // ISO 日期字符串，如 "2025-12-31"，undefined = 永不过期
   rate_limit?: number
   auto_delete_on_expiry: boolean
+  allowed_providers?: string[] | null
+  allowed_api_formats?: string[] | null
+  allowed_models?: string[] | null
+}
+
+interface StandaloneKeyFormState {
+  id?: string
+  name: string
+  initial_balance_usd?: number
+  unlimited_balance?: boolean
+  expires_at?: string
+  rate_limit?: number
+  auto_delete_on_expiry: boolean
+  provider_unrestricted: boolean
+  api_format_unrestricted: boolean
+  model_unrestricted: boolean
   allowed_providers: string[]
   allowed_api_formats: string[]
   allowed_models: string[]
@@ -283,15 +320,24 @@ const apiFormatOptions = computed(() =>
     label: format,
   }))
 )
+const modelOptions = computed(() =>
+  globalModels.value.map((model) => ({
+    value: model.name,
+    label: model.name,
+  }))
+)
 
 // 表单数据
-const form = ref<StandaloneKeyFormData>({
+const form = ref<StandaloneKeyFormState>({
   name: '',
   initial_balance_usd: 10,
   unlimited_balance: false,
   expires_at: undefined,
   rate_limit: undefined,
   auto_delete_on_expiry: false,
+  provider_unrestricted: true,
+  api_format_unrestricted: true,
+  model_unrestricted: true,
   allowed_providers: [],
   allowed_api_formats: [],
   allowed_models: [],
@@ -312,10 +358,13 @@ function resetForm() {
     expires_at: undefined,
     rate_limit: undefined,
     auto_delete_on_expiry: false,
+    provider_unrestricted: true,
+    api_format_unrestricted: true,
+    model_unrestricted: true,
     allowed_providers: [],
     allowed_api_formats: [],
     allowed_models: [],
-  }
+  } as typeof form.value
 }
 
 function loadKeyData() {
@@ -328,10 +377,13 @@ function loadKeyData() {
     expires_at: props.apiKey.expires_at,
     rate_limit: props.apiKey.rate_limit,
     auto_delete_on_expiry: props.apiKey.auto_delete_on_expiry,
-    allowed_providers: props.apiKey.allowed_providers || [],
-    allowed_api_formats: props.apiKey.allowed_api_formats || [],
-    allowed_models: props.apiKey.allowed_models || [],
-  }
+    provider_unrestricted: props.apiKey.allowed_providers == null,
+    api_format_unrestricted: props.apiKey.allowed_api_formats == null,
+    model_unrestricted: props.apiKey.allowed_models == null,
+    allowed_providers: props.apiKey.allowed_providers ? [...props.apiKey.allowed_providers] : [],
+    allowed_api_formats: props.apiKey.allowed_api_formats ? [...props.apiKey.allowed_api_formats] : [],
+    allowed_models: props.apiKey.allowed_models ? [...props.apiKey.allowed_models] : [],
+  } as typeof form.value
 }
 
 const { isEditMode, handleDialogUpdate, handleCancel } = useFormDialog({
@@ -367,7 +419,18 @@ function clearExpiryDate() {
 
 // 提交表单
 function handleSubmit() {
-  emit('submit', { ...form.value })
+  emit('submit', {
+    id: form.value.id,
+    name: form.value.name,
+    initial_balance_usd: form.value.initial_balance_usd,
+    unlimited_balance: form.value.unlimited_balance,
+    expires_at: form.value.expires_at,
+    rate_limit: form.value.rate_limit,
+    auto_delete_on_expiry: form.value.auto_delete_on_expiry,
+    allowed_providers: form.value.provider_unrestricted ? null : [...form.value.allowed_providers],
+    allowed_api_formats: form.value.api_format_unrestricted ? null : [...form.value.allowed_api_formats],
+    allowed_models: form.value.model_unrestricted ? null : [...form.value.allowed_models],
+  })
 }
 
 // 设置保存状态

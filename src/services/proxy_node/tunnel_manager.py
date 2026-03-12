@@ -229,6 +229,8 @@ class TunnelManager:
         self._connections: dict[str, list[TunnelConnection]] = {}  # node_id -> [conn, ...]
         self._background_tasks: set[asyncio.Task[None]] = set()
         self._draining: bool = False
+        # 每个 node 的连续 reconnect 计数，用于抑制高频 connect/disconnect 日志
+        self._reconnect_counts: dict[str, int] = {}
 
     def _background(self, coro: Any) -> None:  # noqa: ANN401
         """启动 fire-and-forget task，通过 set 持有引用防止 GC 回收，完成后自动清理"""
@@ -269,12 +271,22 @@ class TunnelManager:
             conns = []
             self._connections[conn.node_id] = conns
         conns.append(conn)
-        logger.info(
-            "tunnel connected: node_id={}, name={}, pool_size={}",
-            conn.node_id,
-            conn.node_name,
-            len(conns),
-        )
+        reconn = self._reconnect_counts.get(conn.node_id, 0)
+        if reconn == 0:
+            logger.info(
+                "tunnel connected: node_id={}, name={}, pool_size={}",
+                conn.node_id,
+                conn.node_name,
+                len(conns),
+            )
+        else:
+            logger.debug(
+                "tunnel reconnected: node_id={}, name={}, pool_size={}, reconnect_count={}",
+                conn.node_id,
+                conn.node_name,
+                len(conns),
+                reconn,
+            )
 
     def unregister(self, conn: TunnelConnection) -> bool:
         """
@@ -297,13 +309,36 @@ class TunnelManager:
             self._connections.pop(conn.node_id, None)
 
         remaining = len(conns) if conns else 0
-        logger.info(
-            "tunnel disconnected: node_id={}, name={}, remaining={}",
-            conn.node_id,
-            conn.node_name,
-            remaining,
-        )
+        reconn = self._reconnect_counts.get(conn.node_id, 0) + 1
+        self._reconnect_counts[conn.node_id] = reconn
+        # 首次断开 info，后续每 10 次 info 汇总，其余 debug
+        if reconn == 1:
+            logger.info(
+                "tunnel disconnected: node_id={}, name={}, remaining={}",
+                conn.node_id,
+                conn.node_name,
+                remaining,
+            )
+        elif reconn % 10 == 0:
+            logger.info(
+                "tunnel disconnected: node_id={}, name={}, remaining={} (repeated {} times)",
+                conn.node_id,
+                conn.node_name,
+                remaining,
+                reconn,
+            )
+        else:
+            logger.debug(
+                "tunnel disconnected: node_id={}, name={}, remaining={}",
+                conn.node_id,
+                conn.node_name,
+                remaining,
+            )
         return True
+
+    def reset_reconnect_count(self, node_id: str) -> None:
+        """重置 reconnect 计数（当连接恢复正常活动时调用）"""
+        self._reconnect_counts.pop(node_id, None)
 
     async def shutdown_all(self, drain_timeout: float = 60.0) -> None:
         """优雅关闭所有 tunnel 连接：drain 飞行中请求 -> GoAway -> 关闭 WebSocket。

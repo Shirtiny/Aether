@@ -26,6 +26,9 @@ router = APIRouter()
 # Per-node 锁: 防止并发的 connect/disconnect 写入 DB 时出现竞态（后断连覆盖先连接）
 _node_status_locks: dict[str, asyncio.Lock] = {}
 
+# Per-node idle timeout 连续计数: 用于抑制重复日志
+_idle_timeout_counts: dict[str, int] = {}
+
 
 def _get_node_lock(node_id: str) -> asyncio.Lock:
     lock = _node_status_locks.get(node_id)
@@ -38,8 +41,8 @@ def _get_node_lock(node_id: str) -> asyncio.Lock:
 # 单帧最大 64 MB -- AI API 请求体可能包含多张 base64 图片，需要足够余量
 _MAX_FRAME_SIZE = 64 * 1024 * 1024
 
-# 默认 WebSocket 空闲超时（秒）-- 需覆盖客户端 stale_timeout(45s) + 重连延迟窗口
-_DEFAULT_IDLE_TIMEOUT = 90.0
+# 默认 WebSocket 空闲超时（秒）-- 0 表示禁用（依赖 PING/PONG 心跳检测连接存活）
+_DEFAULT_IDLE_TIMEOUT = 0.0
 
 # 默认服务端应用层 ping 间隔（秒）-- 与客户端 ping 间隔一致，确保高频心跳
 _DEFAULT_SERVER_PING_INTERVAL = 15.0
@@ -78,12 +81,12 @@ _SERVER_PING_INTERVAL = _env_float(
 _IDLE_TIMEOUT = _env_float(
     "AETHER_PROXY_TUNNEL_SERVER_IDLE_TIMEOUT",
     _DEFAULT_IDLE_TIMEOUT,
-    min_value=30.0,
+    min_value=0.0,
     max_value=600.0,
 )
 
-# 避免 idle timeout 过小导致 ping 尚未生效就被服务端断开
-if _IDLE_TIMEOUT <= _SERVER_PING_INTERVAL * 2:
+# 避免 idle timeout 过小导致 ping 尚未生效就被服务端断开（0 表示禁用，跳过校验）
+if _IDLE_TIMEOUT > 0 and _IDLE_TIMEOUT <= _SERVER_PING_INTERVAL * 2:
     adjusted_idle = max(_SERVER_PING_INTERVAL * 3, 30.0)
     logger.warning(
         "AETHER_PROXY_TUNNEL_SERVER_IDLE_TIMEOUT too low for ping interval, auto-adjust to {}",
@@ -193,9 +196,24 @@ async def proxy_tunnel_ws(ws: WebSocket) -> None:
         oversized_count = 0
         while True:
             try:
-                data = await asyncio.wait_for(ws.receive_bytes(), timeout=_IDLE_TIMEOUT)
+                if _IDLE_TIMEOUT > 0:
+                    data = await asyncio.wait_for(ws.receive_bytes(), timeout=_IDLE_TIMEOUT)
+                else:
+                    data = await ws.receive_bytes()
             except asyncio.TimeoutError:
-                logger.warning("tunnel idle timeout for node_id={}", node_id)
+                count = _idle_timeout_counts.get(node_id, 0) + 1
+                _idle_timeout_counts[node_id] = count
+                # 首次 warning，后续每 10 次打印一条 info，其余 debug
+                if count == 1:
+                    logger.warning("tunnel idle timeout for node_id={}", node_id)
+                elif count % 10 == 0:
+                    logger.info(
+                        "tunnel idle timeout for node_id={} (repeated {} times)",
+                        node_id,
+                        count,
+                    )
+                else:
+                    logger.debug("tunnel idle timeout for node_id={}", node_id)
                 disconnect_reason = "idle timeout"
                 await ws.close(code=4004, reason="idle timeout")
                 break
@@ -209,6 +227,8 @@ async def proxy_tunnel_ws(ws: WebSocket) -> None:
                     break
                 continue
             oversized_count = 0  # 正常帧重置计数
+            _idle_timeout_counts.pop(node_id, None)  # 收到正常帧，重置 idle timeout 计数
+            manager.reset_reconnect_count(node_id)  # 连接正常活跃，重置 reconnect 计数
             try:
                 frame = Frame.decode(data)
             except ValueError as e:

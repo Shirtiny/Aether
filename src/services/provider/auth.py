@@ -54,6 +54,44 @@ async def _release_refresh_lock(redis: Any, key_id: str) -> None:
             pass
 
 
+def _safe_object_session(key: Any) -> Any | None:
+    try:
+        return object_session(key)
+    except Exception:
+        return None
+
+
+def _persist_detached_oauth_invalid_state(
+    key: Any,
+    *,
+    invalid_at: Any,
+    invalid_reason: str,
+) -> None:
+    key.oauth_invalid_at = invalid_at
+    key.oauth_invalid_reason = invalid_reason
+
+    sess = _safe_object_session(key)
+    if sess is not None:
+        sess.add(key)
+        sess.commit()
+        return
+
+    key_id = str(getattr(key, "id", "") or "").strip()
+    if not key_id:
+        raise ValueError("OAuth key missing id")
+
+    from src.database import create_session
+    from src.models.database import ProviderAPIKey
+
+    with create_session() as db:
+        row = db.query(ProviderAPIKey).filter(ProviderAPIKey.id == key_id).first()
+        if row is None:
+            raise ValueError(f"OAuth key not found: {key_id}")
+        row.oauth_invalid_at = invalid_at
+        row.oauth_invalid_reason = invalid_reason
+        db.commit()
+
+
 def _persist_refreshed_token(
     key: Any,
     access_token: str,
@@ -71,7 +109,7 @@ def _persist_refreshed_token(
             key.oauth_invalid_at = None
             key.oauth_invalid_reason = None
 
-    sess = object_session(key)
+    sess = _safe_object_session(key)
     if sess is not None:
         sess.add(key)
         sess.commit()
@@ -120,19 +158,16 @@ def _mark_refresh_token_invalid(
         reason = f"{reason}: {detail}"
 
     try:
-        key.oauth_invalid_at = datetime.now(timezone.utc)
-        key.oauth_invalid_reason = reason
-        # 不设置 is_active = False：access token 过期前 key 仍可调度
-
-        sess = object_session(key)
-        if sess is not None:
-            sess.add(key)
-            sess.commit()
-            logger.info(
-                "[OAUTH_REFRESH] key {} marked refresh_token invalid: {}",
-                str(getattr(key, "id", "?"))[:8],
-                reason[:120],
-            )
+        _persist_detached_oauth_invalid_state(
+            key,
+            invalid_at=datetime.now(timezone.utc),
+            invalid_reason=reason,
+        )
+        logger.info(
+            "[OAUTH_REFRESH] key {} marked refresh_token invalid: {}",
+            str(getattr(key, "id", "?"))[:8],
+            reason[:120],
+        )
     except Exception as exc:
         logger.warning(
             "[OAUTH_REFRESH] failed to mark key {} refresh invalid: {}",
@@ -158,17 +193,15 @@ def _mark_oauth_token_expired(key: Any, expires_at: Any) -> None:
     reason = f"[OAUTH_EXPIRED] Token 已过期且续期失败 (expired_at={expires_at})"
 
     try:
-        key.oauth_invalid_at = datetime.now(timezone.utc)
-        key.oauth_invalid_reason = reason
-
-        sess = object_session(key)
-        if sess is not None:
-            sess.add(key)
-            sess.commit()
-            logger.info(
-                "[OAUTH_EXPIRED] key {} token expired and refresh failed, blocking scheduling",
-                str(getattr(key, "id", "?"))[:8],
-            )
+        _persist_detached_oauth_invalid_state(
+            key,
+            invalid_at=datetime.now(timezone.utc),
+            invalid_reason=reason,
+        )
+        logger.info(
+            "[OAUTH_EXPIRED] key {} token expired and refresh failed, blocking scheduling",
+            str(getattr(key, "id", "?"))[:8],
+        )
     except Exception as exc:
         logger.warning(
             "[OAUTH_EXPIRED] failed to mark key {} as expired: {}",

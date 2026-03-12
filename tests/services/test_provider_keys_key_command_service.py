@@ -57,6 +57,18 @@ class _FakeClearOAuthDB:
         self.commit_count += 1
 
 
+class _FakeQueryAll:
+    def __init__(self, rows: list[Any]) -> None:
+        self._rows = rows
+
+    def filter(self, *args: Any, **kwargs: Any) -> _FakeQueryAll:
+        _ = args, kwargs
+        return self
+
+    def all(self) -> list[Any]:
+        return self._rows
+
+
 def _build_key(**overrides: Any) -> SimpleNamespace:
     base: dict[str, Any] = {
         "auto_fetch_models": False,
@@ -228,3 +240,121 @@ async def test_run_delete_key_side_effects_skip_disassociate(
 
     assert captured["provider_id"] == "provider-1"
     assert captured["skip_disassociate"] is True
+
+
+def test_cleanup_key_references_preserves_usage_and_video_tasks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FakeDeleteStatement:
+        def __init__(self, model: Any) -> None:
+            self.kind = "delete"
+            self.model = model
+            self.conditions: list[Any] = []
+
+        def where(self, *conditions: Any) -> _FakeDeleteStatement:
+            self.conditions.extend(conditions)
+            return self
+
+    class _FakeUpdateStatement:
+        def __init__(self, model: Any) -> None:
+            self.kind = "update"
+            self.model = model
+            self.conditions: list[Any] = []
+            self.values_dict: dict[str, Any] = {}
+
+        def where(self, *conditions: Any) -> _FakeUpdateStatement:
+            self.conditions.extend(conditions)
+            return self
+
+        def values(self, **values: Any) -> _FakeUpdateStatement:
+            self.values_dict.update(values)
+            return self
+
+    class _FakeDB:
+        def __init__(self) -> None:
+            self.statements: list[Any] = []
+
+        def execute(self, statement: Any) -> None:
+            self.statements.append(statement)
+
+        def get_bind(self) -> Any:
+            return SimpleNamespace(dialect=SimpleNamespace(name="postgresql"))
+
+    monkeypatch.setattr(side_effects_module, "sa_delete", lambda model: _FakeDeleteStatement(model))
+    monkeypatch.setattr(side_effects_module, "sa_update", lambda model: _FakeUpdateStatement(model))
+
+    db = _FakeDB()
+    side_effects_module.cleanup_key_references(cast(Any, db), ["key-1", "key-2"])
+
+    assert [(stmt.kind, stmt.model.__name__) for stmt in db.statements] == [
+        ("delete", "RequestCandidate"),
+        ("delete", "GeminiFileMapping"),
+        ("update", "Usage"),
+        ("update", "VideoTask"),
+    ]
+    assert db.statements[2].values_dict == {"provider_api_key_id": None}
+    assert db.statements[3].values_dict == {"key_id": None}
+
+
+@pytest.mark.asyncio
+async def test_batch_delete_endpoint_keys_response_cleans_related_references(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cleanup_calls: list[list[str]] = []
+    side_effect_calls: list[str | None] = []
+
+    class _FakeBatchDeleteDB:
+        def __init__(self, keys: list[Any]) -> None:
+            self._keys = keys
+            self.commit_count = 0
+            self.executed: list[Any] = []
+
+        def query(self, model: Any) -> _FakeQueryAll:
+            _ = model
+            return _FakeQueryAll(self._keys)
+
+        def execute(self, statement: Any) -> None:
+            self.executed.append(statement)
+
+        def commit(self) -> None:
+            self.commit_count += 1
+
+        def rollback(self) -> None:
+            raise AssertionError("rollback should not be called")
+
+    async def _fake_run_delete_key_side_effects(
+        db: Any,
+        provider_id: str | None,
+        deleted_key_allowed_models: list[str] | None,
+    ) -> None:
+        _ = db, deleted_key_allowed_models
+        side_effect_calls.append(provider_id)
+
+    monkeypatch.setattr(
+        command_module,
+        "cleanup_key_references",
+        lambda _db, key_ids: cleanup_calls.append(list(key_ids)),
+    )
+    monkeypatch.setattr(
+        command_module,
+        "run_delete_key_side_effects",
+        _fake_run_delete_key_side_effects,
+    )
+
+    keys = [
+        SimpleNamespace(id="key-1", provider_id="provider-1"),
+        SimpleNamespace(id="key-2", provider_id="provider-1"),
+    ]
+    db = _FakeBatchDeleteDB(keys)
+
+    result = await command_module.batch_delete_endpoint_keys_response(
+        cast(Any, db),
+        ["key-1", "key-2"],
+    )
+
+    assert result["success_count"] == 2
+    assert result["failed_count"] == 0
+    assert cleanup_calls == [["key-1", "key-2"]] or cleanup_calls == [["key-2", "key-1"]]
+    assert side_effect_calls == ["provider-1"]
+    assert db.commit_count == 1
+    assert len(db.executed) == 1

@@ -157,11 +157,23 @@
             data-lpignore="true"
             data-1p-ignore="true"
             :name="`pwd-${formNonce}`"
-            placeholder="至少 6 个字符"
+            :placeholder="getPasswordPolicyPlaceholder(props.passwordPolicyLevel)"
             required
             class="-webkit-text-security-disc"
             :disabled="isLoading"
           />
+          <p
+            v-if="passwordError"
+            class="text-xs text-destructive"
+          >
+            {{ passwordError }}
+          </p>
+          <p
+            v-else
+            class="text-xs text-muted-foreground"
+          >
+            {{ passwordHint }}
+          </p>
         </div>
 
         <!-- Confirm Password -->
@@ -223,6 +235,12 @@ import { ref, computed, watch, onUnmounted, nextTick } from 'vue'
 import { authApi } from '@/api/auth'
 import { useToast } from '@/composables/useToast'
 import { parseApiError } from '@/utils/errorParser'
+import {
+  getPasswordPolicyHint,
+  getPasswordPolicyPlaceholder,
+  validatePasswordByPolicy,
+  type PasswordPolicyLevel,
+} from '@/utils/passwordPolicy'
 import { Dialog } from '@/components/ui'
 import Button from '@/components/ui/button.vue'
 import Input from '@/components/ui/input.vue'
@@ -232,6 +250,7 @@ interface Props {
   open?: boolean
   requireEmailVerification?: boolean
   emailConfigured?: boolean
+  passwordPolicyLevel?: PasswordPolicyLevel
 }
 
 interface Emits {
@@ -243,7 +262,8 @@ interface Emits {
 const props = withDefaults(defineProps<Props>(), {
   open: false,
   requireEmailVerification: false,
-  emailConfigured: true
+  emailConfigured: true,
+  passwordPolicyLevel: 'weak'
 })
 
 const emit = defineEmits<Emits>()
@@ -386,6 +406,11 @@ const usernameError = computed(() => {
   return ''
 })
 
+const passwordHint = computed(() => getPasswordPolicyHint(props.passwordPolicyLevel))
+const passwordError = computed(() =>
+  validatePasswordByPolicy(formData.value.password, props.passwordPolicyLevel)
+)
+
 const canSubmit = computed(() => {
   // 基本信息：用户名和密码必填
   const hasBasicInfo =
@@ -410,8 +435,7 @@ const canSubmit = computed(() => {
     return false
   }
 
-  // Check password length
-  if (formData.value.password.length < 6) {
+  if (passwordError.value) {
     return false
   }
 
@@ -623,9 +647,8 @@ const handleSubmit = async () => {
     return
   }
 
-  // Validate password length
-  if (formData.value.password.length < 6) {
-    showError('密码长度至少 6 位', '密码过短')
+  if (passwordError.value) {
+    showError(passwordError.value, '密码错误')
     return
   }
 

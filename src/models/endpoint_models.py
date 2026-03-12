@@ -710,6 +710,13 @@ class EndpointAPIKeyUpdate(BaseModel):
         return v.strip()
 
 
+class OAuthOrganizationResponse(BaseModel):
+    id: str | None = Field(default=None, description="OAuth 组织/工作区 ID")
+    title: str | None = Field(default=None, description="OAuth 组织/工作区标题")
+    is_default: bool = Field(default=False, description="是否为默认组织/工作区")
+    role: str | None = Field(default=None, description="当前账号在组织中的角色")
+
+
 class EndpointAPIKeyResponse(BaseModel):
     """Endpoint API Key 响应"""
 
@@ -753,6 +760,14 @@ class EndpointAPIKeyResponse(BaseModel):
         default=None, description="OAuth 账号套餐类型（如 free/plus/team/enterprise）"
     )
     oauth_account_id: str | None = Field(default=None, description="OAuth 账号 ID")
+    oauth_account_user_id: str | None = Field(
+        default=None,
+        description="OAuth 账号-工作区联合 ID（如 Codex chatgpt_account_user_id）",
+    )
+    oauth_organizations: list[OAuthOrganizationResponse] = Field(
+        default_factory=list,
+        description="OAuth 关联的组织/工作区摘要列表",
+    )
     oauth_invalid_at: int | None = Field(
         default=None, description="OAuth Token 失效时间（Unix 时间戳），如账号被封、授权撤销等"
     )

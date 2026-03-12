@@ -59,6 +59,7 @@
             :default-user-initial-gift-usd="systemConfig.default_user_initial_gift_usd"
             :rate-limit-per-minute="systemConfig.rate_limit_per_minute"
             :enable-registration="systemConfig.enable_registration"
+            :password-policy-level="systemConfig.password_policy_level"
             :auto-delete-expired-keys="systemConfig.auto_delete_expired_keys"
             :enable-format-conversion="systemConfig.enable_format_conversion"
             :loading="basicConfigLoading"
@@ -67,6 +68,7 @@
             @update:default-user-initial-gift-usd="systemConfig.default_user_initial_gift_usd = $event"
             @update:rate-limit-per-minute="systemConfig.rate_limit_per_minute = $event"
             @update:enable-registration="systemConfig.enable_registration = $event"
+            @update:password-policy-level="systemConfig.password_policy_level = $event"
             @update:auto-delete-expired-keys="systemConfig.auto_delete_expired_keys = $event"
             @update:enable-format-conversion="systemConfig.enable_format_conversion = $event"
           />

@@ -4,6 +4,7 @@ Endpoint 健康监控 API
 
 from __future__ import annotations
 
+import asyncio
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -31,6 +32,60 @@ from src.services.health.endpoint import EndpointHealthService
 from src.services.health.monitor import HealthMonitor, health_monitor
 
 router = APIRouter(tags=["Endpoint Health"])
+
+
+def _recover_key_health_sync(db: Session, key_id: str, api_format: str | None) -> dict[str, Any]:
+    key = db.query(ProviderAPIKey).filter(ProviderAPIKey.id == key_id).first()
+    if not key:
+        raise NotFoundException(f"Key {key_id} 不存在")
+
+    success = health_monitor.reset_health(db, key_id=key_id, api_format=api_format)
+    if not success:
+        raise Exception("重置健康度失败")
+
+    if not key.is_active:
+        key.is_active = True  # type: ignore[assignment]
+
+    db.commit()
+    return {
+        "is_active": bool(key.is_active),
+        "api_format": api_format,
+    }
+
+
+def _recover_all_keys_health_sync(db: Session) -> list[dict[str, Any]]:
+    candidates = (
+        db.query(ProviderAPIKey)
+        .filter(
+            ProviderAPIKey.circuit_breaker_by_format.isnot(None),
+            ProviderAPIKey.circuit_breaker_by_format != "{}",
+        )
+        .all()
+    )
+
+    circuit_open_keys = [
+        key
+        for key in candidates
+        if any(cb.get("open") for cb in (key.circuit_breaker_by_format or {}).values())
+    ]
+
+    recovered_keys: list[dict[str, Any]] = []
+    for key in circuit_open_keys:
+        key.health_by_format = {}  # type: ignore[assignment]
+        key.circuit_breaker_by_format = {}  # type: ignore[assignment]
+        recovered_keys.append(
+            {
+                "key_id": key.id,
+                "key_name": key.name,
+                "provider_id": key.provider_id,
+                "api_formats": key.api_formats,
+            }
+        )
+
+    if recovered_keys:
+        db.commit()
+
+    return recovered_keys
 
 
 def _format_str(api_format_enum: Any) -> str:
@@ -491,20 +546,7 @@ class AdminRecoverKeyHealthAdapter(AdminApiAdapter):
 
     async def handle(self, context: ApiRequestContext) -> Any:  # type: ignore[override]
         db = context.db
-        key = db.query(ProviderAPIKey).filter(ProviderAPIKey.id == self.key_id).first()
-        if not key:
-            raise NotFoundException(f"Key {self.key_id} 不存在")
-
-        # 使用 health_monitor.reset_health 重置健康度
-        success = health_monitor.reset_health(db, key_id=self.key_id, api_format=self.api_format)
-        if not success:
-            raise Exception("重置健康度失败")
-
-        # 如果 Key 被禁用，重新启用
-        if not key.is_active:
-            key.is_active = True  # type: ignore[assignment]
-
-        db.commit()
+        await asyncio.to_thread(_recover_key_health_sync, db, self.key_id, self.api_format)
 
         if self.api_format:
             logger.info(f"管理员恢复Key健康状态: {self.key_id}/{self.api_format}")
@@ -534,46 +576,14 @@ class AdminRecoverAllKeysHealthAdapter(AdminApiAdapter):
 
     async def handle(self, context: ApiRequestContext) -> Any:  # type: ignore[override]
         db = context.db
+        recovered_keys = await asyncio.to_thread(_recover_all_keys_health_sync, db)
 
-        # 粗过滤：仅加载 circuit_breaker_by_format 非空的 Key，避免全表扫描
-        candidates = (
-            db.query(ProviderAPIKey)
-            .filter(
-                ProviderAPIKey.circuit_breaker_by_format.isnot(None),
-                ProviderAPIKey.circuit_breaker_by_format != "{}",
-            )
-            .all()
-        )
-
-        # 精确筛选有任何格式熔断的 Key
-        circuit_open_keys = [
-            key
-            for key in candidates
-            if any(cb.get("open") for cb in (key.circuit_breaker_by_format or {}).values())
-        ]
-
-        if not circuit_open_keys:
+        if not recovered_keys:
             return {
                 "message": "没有需要恢复的 Key",
                 "recovered_count": 0,
                 "recovered_keys": [],
             }
-
-        recovered_keys = []
-        for key in circuit_open_keys:
-            # 重置所有格式的健康度
-            key.health_by_format = {}  # type: ignore[assignment]
-            key.circuit_breaker_by_format = {}  # type: ignore[assignment]
-            recovered_keys.append(
-                {
-                    "key_id": key.id,
-                    "key_name": key.name,
-                    "provider_id": key.provider_id,
-                    "api_formats": key.api_formats,
-                }
-            )
-
-        db.commit()
 
         # 重置健康监控器的熔断计数
         HealthMonitor.reset_open_circuit_count()

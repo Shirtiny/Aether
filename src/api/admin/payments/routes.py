@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query, Request
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy.orm import Session
 
@@ -14,7 +15,7 @@ from src.api.base.context import ApiRequestContext
 from src.api.base.pipeline import ApiRequestPipeline
 from src.api.serializers import serialize_payment_callback, serialize_payment_order
 from src.core.exceptions import InvalidRequestException, NotFoundException, translate_pydantic_error
-from src.database import get_db
+from src.database import get_db, get_db_context
 from src.services.payment import PaymentService
 
 router = APIRouter(prefix="/api/admin/payments", tags=["Admin - Payments"])
@@ -37,6 +38,100 @@ def _parse_payload(model_cls: type[BaseModel], payload: dict[str, Any]) -> BaseM
         if errors:
             raise InvalidRequestException(translate_pydantic_error(errors[0]))
         raise InvalidRequestException("请求数据验证失败")
+
+
+def _list_payment_orders_sync(
+    status: str | None,
+    payment_method: str | None,
+    limit: int,
+    offset: int,
+) -> dict[str, Any]:
+    with get_db_context() as db:
+        items, total, _changed = PaymentService.list_orders(
+            db,
+            status=status,
+            payment_method=payment_method,
+            limit=limit,
+            offset=offset,
+        )
+        return {
+            "items": [serialize_payment_order(item) for item in items],
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        }
+
+
+def _get_payment_order_sync(order_id: str) -> dict[str, Any]:
+    with get_db_context() as db:
+        order = PaymentService.get_order(db, order_id=order_id)
+        if order is None:
+            raise NotFoundException("Payment order not found")
+        PaymentService.refresh_order_status(order)
+        return {"order": serialize_payment_order(order)}
+
+
+def _expire_payment_order_sync(order_id: str) -> dict[str, Any]:
+    with get_db_context() as db:
+        order = PaymentService.get_order(db, order_id=order_id)
+        if order is None:
+            raise NotFoundException("Payment order not found")
+        try:
+            updated, expired = PaymentService.expire_order(
+                db,
+                order=order,
+                reason="admin_mark_expired",
+            )
+        except ValueError as exc:
+            raise InvalidRequestException(str(exc)) from exc
+        return {"order": serialize_payment_order(updated), "expired": expired}
+
+
+def _credit_payment_order_sync(
+    order_id: str,
+    payload: AdminPaymentOrderCreditPayload,
+    operator_id: str | None,
+) -> dict[str, Any]:
+    with get_db_context() as db:
+        order = PaymentService.get_order(db, order_id=order_id)
+        if order is None:
+            raise NotFoundException("Payment order not found")
+
+        gateway_response = dict(order.gateway_response or {})
+        if payload.gateway_response:
+            gateway_response.update(payload.gateway_response)
+        gateway_response["manual_credit"] = True
+        gateway_response["credited_by"] = operator_id
+
+        try:
+            updated, credited = PaymentService.credit_order(
+                db,
+                order=order,
+                gateway_order_id=payload.gateway_order_id,
+                gateway_response=gateway_response,
+                pay_amount=payload.pay_amount,
+                pay_currency=payload.pay_currency,
+                exchange_rate=payload.exchange_rate,
+            )
+        except ValueError as exc:
+            raise InvalidRequestException(str(exc)) from exc
+        return {"order": serialize_payment_order(updated), "credited": credited}
+
+
+def _fail_payment_order_sync(order_id: str) -> dict[str, Any]:
+    with get_db_context() as db:
+        order = PaymentService.get_order(db, order_id=order_id)
+        if order is None:
+            raise NotFoundException("Payment order not found")
+        try:
+            updated = PaymentService.fail_order(
+                db,
+                order=order,
+                reason="admin_mark_failed",
+            )
+        except ValueError as exc:
+            raise InvalidRequestException(str(exc)) from exc
+        return {"order": serialize_payment_order(updated)}
 
 
 @router.get("/orders")
@@ -121,21 +216,13 @@ class AdminPaymentOrderListAdapter(AdminApiAdapter):
     offset: int
 
     async def handle(self, context: ApiRequestContext) -> dict[str, Any]:
-        items, total, changed = PaymentService.list_orders(
-            context.db,
-            status=self.status,
-            payment_method=self.payment_method,
-            limit=self.limit,
-            offset=self.offset,
+        return await run_in_threadpool(
+            _list_payment_orders_sync,
+            self.status,
+            self.payment_method,
+            self.limit,
+            self.offset,
         )
-        if changed:
-            context.db.commit()
-        return {
-            "items": [serialize_payment_order(item) for item in items],
-            "total": total,
-            "limit": self.limit,
-            "offset": self.offset,
-        }
 
 
 @dataclass
@@ -143,12 +230,7 @@ class AdminPaymentOrderDetailAdapter(AdminApiAdapter):
     order_id: str
 
     async def handle(self, context: ApiRequestContext) -> dict[str, Any]:
-        order = PaymentService.get_order(context.db, order_id=self.order_id)
-        if order is None:
-            raise NotFoundException("Payment order not found")
-        if PaymentService.refresh_order_status(order):
-            context.db.commit()
-        return {"order": serialize_payment_order(order)}
+        return await run_in_threadpool(_get_payment_order_sync, self.order_id)
 
 
 @dataclass
@@ -156,19 +238,7 @@ class AdminPaymentOrderExpireAdapter(AdminApiAdapter):
     order_id: str
 
     async def handle(self, context: ApiRequestContext) -> dict[str, Any]:
-        order = PaymentService.get_order(context.db, order_id=self.order_id)
-        if order is None:
-            raise NotFoundException("Payment order not found")
-        try:
-            updated, expired = PaymentService.expire_order(
-                context.db,
-                order=order,
-                reason="admin_mark_expired",
-            )
-        except ValueError as exc:
-            raise InvalidRequestException(str(exc))
-        context.db.commit()
-        return {"order": serialize_payment_order(updated), "expired": expired}
+        return await run_in_threadpool(_expire_payment_order_sync, self.order_id)
 
 
 @dataclass
@@ -176,33 +246,15 @@ class AdminPaymentOrderCreditAdapter(AdminApiAdapter):
     order_id: str
 
     async def handle(self, context: ApiRequestContext) -> dict[str, Any]:
-        order = PaymentService.get_order(context.db, order_id=self.order_id)
-        if order is None:
-            raise NotFoundException("Payment order not found")
-
         raw_payload = context.ensure_json_body() if context.raw_body else {}
         req = _parse_payload(AdminPaymentOrderCreditPayload, raw_payload)
 
-        gateway_response = dict(order.gateway_response or {})
-        if req.gateway_response:
-            gateway_response.update(req.gateway_response)
-        gateway_response["manual_credit"] = True
-        gateway_response["credited_by"] = context.user.id if context.user else None
-
-        try:
-            updated, credited = PaymentService.credit_order(
-                context.db,
-                order=order,
-                gateway_order_id=req.gateway_order_id,
-                gateway_response=gateway_response,
-                pay_amount=req.pay_amount,
-                pay_currency=req.pay_currency,
-                exchange_rate=req.exchange_rate,
-            )
-        except ValueError as exc:
-            raise InvalidRequestException(str(exc))
-        context.db.commit()
-        return {"order": serialize_payment_order(updated), "credited": credited}
+        return await run_in_threadpool(
+            _credit_payment_order_sync,
+            self.order_id,
+            req,
+            context.user.id if context.user else None,
+        )
 
 
 @dataclass
@@ -210,19 +262,7 @@ class AdminPaymentOrderFailAdapter(AdminApiAdapter):
     order_id: str
 
     async def handle(self, context: ApiRequestContext) -> dict[str, Any]:
-        order = PaymentService.get_order(context.db, order_id=self.order_id)
-        if order is None:
-            raise NotFoundException("Payment order not found")
-        try:
-            updated = PaymentService.fail_order(
-                context.db,
-                order=order,
-                reason="admin_mark_failed",
-            )
-        except ValueError as exc:
-            raise InvalidRequestException(str(exc))
-        context.db.commit()
-        return {"order": serialize_payment_order(updated)}
+        return await run_in_threadpool(_fail_payment_order_sync, self.order_id)
 
 
 @dataclass

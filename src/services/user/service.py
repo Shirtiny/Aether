@@ -14,6 +14,7 @@ from src.core.logger import logger
 from src.core.validators import EmailValidator, PasswordValidator, UsernameValidator
 from src.models.database import ApiKey, GlobalModel, Model, Provider, Usage, User, UserRole
 from src.services.cache.user_cache import UserCacheService
+from src.services.system.config import SystemConfigService
 from src.services.user.bulk_cleanup import batch_nullify_fk, pre_clean_api_key
 from src.utils.async_utils import safe_create_task
 from src.utils.transaction_manager import retry_on_database_error, transactional
@@ -55,7 +56,8 @@ class UserService:
             raise ValueError(error_msg)
 
         # 验证密码复杂度
-        valid, error_msg = PasswordValidator.validate(password)
+        policy_level = SystemConfigService.get_password_policy_level(db)
+        valid, error_msg = PasswordValidator.validate(password, policy=policy_level)
         if not valid:
             raise ValueError(error_msg)
 
@@ -237,7 +239,8 @@ class UserService:
         # 如果提供了新密码
         if "password" in kwargs and kwargs["password"]:
             # 验证新密码复杂度
-            valid, error_msg = PasswordValidator.validate(kwargs["password"])
+            policy_level = SystemConfigService.get_password_policy_level(db)
+            valid, error_msg = PasswordValidator.validate(kwargs["password"], policy=policy_level)
             if not valid:
                 raise ValueError(error_msg)
             user.set_password(kwargs["password"])
@@ -381,7 +384,8 @@ class UserService:
             return False, "旧密码错误"
 
         # 验证新密码复杂度
-        valid, error_msg = PasswordValidator.validate(new_password)
+        policy_level = SystemConfigService.get_password_policy_level(db)
+        valid, error_msg = PasswordValidator.validate(new_password, policy=policy_level)
         if not valid:
             return False, error_msg
 

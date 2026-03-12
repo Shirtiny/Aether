@@ -17,6 +17,7 @@ from src.api.base.context import ApiRequestContext
 from src.api.base.pipeline import ApiRequestPipeline
 from src.core.exceptions import InvalidRequestException
 from src.core.logger import logger
+from src.core.validators import PasswordValidator
 from src.database import get_db
 from src.models.api import (
     LoginRequest,
@@ -415,6 +416,7 @@ class AuthRegistrationSettingsAdapter(AuthPublicAdapter):
             enable_registration=bool(enable_registration),
             require_email_verification=bool(require_verification),
             email_configured=email_configured,
+            password_policy_level=SystemConfigService.get_password_policy_level(db),
         ).model_dump()
 
 
@@ -619,8 +621,10 @@ class AuthChangePasswordAdapter(AuthenticatedApiAdapter):
         user = context.user
         if not user.verify_password(old_password):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="旧密码错误")
-        if len(new_password) < 6:
-            raise InvalidRequestException("密码长度至少6位")
+        policy_level = SystemConfigService.get_password_policy_level(context.db)
+        valid, error_msg = PasswordValidator.validate(new_password, policy=policy_level)
+        if not valid:
+            raise InvalidRequestException(error_msg or "密码格式无效")
         user.set_password(new_password)
         context.db.commit()
         context.request.state.tx_committed_by_route = True

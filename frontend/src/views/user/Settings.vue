@@ -119,6 +119,18 @@
                 type="password"
                 class="mt-1"
               />
+              <p
+                v-if="passwordError"
+                class="mt-1 text-xs text-destructive"
+              >
+                {{ passwordError }}
+              </p>
+              <p
+                v-else
+                class="mt-1 text-xs text-muted-foreground"
+              >
+                {{ passwordPolicyHint }}
+              </p>
             </div>
             <div>
               <Label for="confirm-password">确认{{ profile?.has_password ? '新' : '' }}密码</Label>
@@ -465,6 +477,12 @@ import { authApi } from '@/api/auth'
 import { oauthApi, type OAuthLinkInfo, type OAuthProviderInfo } from '@/api/oauth'
 import { getOAuthIcon } from '@/utils/oauth-icons'
 import { useDarkMode, type ThemeMode } from '@/composables/useDarkMode'
+import {
+  getPasswordPolicyHint,
+  normalizePasswordPolicyLevel,
+  validatePasswordByPolicy,
+  type PasswordPolicyLevel,
+} from '@/utils/passwordPolicy'
 import Card from '@/components/ui/card.vue'
 import Button from '@/components/ui/button.vue'
 import Badge from '@/components/ui/badge.vue'
@@ -516,6 +534,7 @@ const preferencesForm = ref({
 
 const savingProfile = ref(false)
 const changingPassword = ref(false)
+const passwordPolicyLevel = ref<PasswordPolicyLevel>('weak')
 const themeSelectOpen = ref(false)
 const languageSelectOpen = ref(false)
 
@@ -538,6 +557,11 @@ const hasProfileChanges = computed(() => {
     preferencesForm.value.bio !== originalPreferencesForm.value.bio
   )
 })
+
+const passwordPolicyHint = computed(() => getPasswordPolicyHint(passwordPolicyLevel.value))
+const passwordError = computed(() =>
+  validatePasswordByPolicy(passwordForm.value.new_password, passwordPolicyLevel.value)
+)
 
 // 检测密码表单是否有内容
 const hasPasswordChanges = computed(() => {
@@ -577,8 +601,10 @@ async function loadEmailConfigured() {
   try {
     const settings = await authApi.getRegistrationSettings()
     emailConfigured.value = !!settings.email_configured
+    passwordPolicyLevel.value = normalizePasswordPolicyLevel(settings.password_policy_level)
   } catch {
     emailConfigured.value = false
+    passwordPolicyLevel.value = 'weak'
   }
 }
 
@@ -766,8 +792,8 @@ async function changePassword() {
     return
   }
 
-  if (passwordForm.value.new_password.length < 6) {
-    showError('密码长度至少6位', '密码错误')
+  if (passwordError.value) {
+    showError(passwordError.value, '密码错误')
     return
   }
 

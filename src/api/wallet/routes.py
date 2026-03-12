@@ -9,6 +9,7 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, Query, Request
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -25,10 +26,11 @@ from src.api.serializers import (
     serialize_wallet_transaction,
 )
 from src.core.exceptions import InvalidRequestException, NotFoundException, translate_pydantic_error
-from src.database import get_db
+from src.database import get_db, get_db_context
 from src.models.database import (
     PaymentOrder,
     RefundRequest,
+    User,
     Wallet,
     WalletDailyUsageLedger,
     WalletTransaction,
@@ -38,6 +40,154 @@ from src.services.wallet import WalletDailyUsageLedgerService, WalletService
 
 router = APIRouter(prefix="/api/wallet", tags=["Wallet"])
 pipeline = ApiRequestPipeline()
+
+
+def _create_recharge_order_sync(user_id: str, req: CreateRechargePayload) -> dict[str, Any]:
+    with get_db_context() as db:
+        user = db.query(User).filter(User.id == user_id).first()
+        if user is None:
+            raise InvalidRequestException("未登录")
+
+        try:
+            order = PaymentService.create_recharge_order(
+                db,
+                user=user,
+                amount_usd=req.amount_usd,
+                payment_method=req.payment_method,
+                pay_amount=req.pay_amount,
+                pay_currency=req.pay_currency,
+                exchange_rate=req.exchange_rate,
+            )
+        except ValueError as exc:
+            raise InvalidRequestException(str(exc)) from exc
+
+        db.commit()
+        db.refresh(order)
+        return {
+            "order": serialize_payment_order(order, sanitize_gateway_response=True),
+            "payment_instructions": safe_gateway_response(order.gateway_response),
+        }
+
+
+def _list_recharge_orders_sync(user_id: str, limit: int, offset: int) -> dict[str, Any]:
+    with get_db_context() as db:
+        items, total, _changed = PaymentService.list_user_orders(
+            db,
+            user_id=user_id,
+            limit=limit,
+            offset=offset,
+        )
+        return {
+            "items": [
+                serialize_payment_order(item, sanitize_gateway_response=True) for item in items
+            ],
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        }
+
+
+def _get_recharge_order_sync(user_id: str, order_id: str) -> dict[str, Any]:
+    with get_db_context() as db:
+        order = PaymentService.get_user_order(db, user_id=user_id, order_id=order_id)
+        if order is None:
+            raise NotFoundException("Payment order not found")
+        PaymentService.refresh_order_status(order)
+        return {"order": serialize_payment_order(order, sanitize_gateway_response=True)}
+
+
+def _list_refunds_sync(user_id: str, limit: int, offset: int) -> dict[str, Any]:
+    with get_db_context() as db:
+        user = db.query(User).filter(User.id == user_id).first()
+        if user is None:
+            raise InvalidRequestException("未登录")
+
+        existing_wallet = WalletService.get_wallet(db, user_id=user.id)
+        wallet = existing_wallet or WalletService.get_or_create_wallet(db, user=user)
+        if wallet is None:
+            return {"items": [], "total": 0, "limit": limit, "offset": offset}
+
+        if existing_wallet is None:
+            db.commit()
+            db.refresh(wallet)
+
+        base_query = db.query(RefundRequest).filter(RefundRequest.wallet_id == wallet.id)
+        total = base_query.count()
+        items = (
+            base_query.order_by(RefundRequest.created_at.desc()).offset(offset).limit(limit).all()
+        )
+        return {
+            "items": [serialize_wallet_refund(item) for item in items],
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        }
+
+
+def _create_refund_sync(user_id: str, req: CreateRefundPayload) -> dict[str, Any]:
+    with get_db_context() as db:
+        user = db.query(User).filter(User.id == user_id).first()
+        if user is None:
+            raise InvalidRequestException("未登录")
+
+        wallet = WalletService.get_or_create_wallet(db, user=user)
+        if wallet is None:
+            raise InvalidRequestException("当前账户尚未开通钱包，无法申请退款")
+
+        payment_order = None
+        source_type = req.source_type or "wallet_balance"
+        source_id = req.source_id
+        refund_mode = req.refund_mode or "offline_payout"
+
+        if req.payment_order_id:
+            payment_order = (
+                db.query(PaymentOrder)
+                .filter(
+                    PaymentOrder.id == req.payment_order_id, PaymentOrder.wallet_id == wallet.id
+                )
+                .first()
+            )
+            if payment_order is None:
+                raise NotFoundException("Payment order not found")
+            source_type = "payment_order"
+            source_id = payment_order.id
+            refund_mode = req.refund_mode or _default_refund_mode_for_order(payment_order)
+
+        try:
+            refund = WalletService.create_refund_request(
+                db,
+                wallet=wallet,
+                user_id=user.id,
+                amount_usd=req.amount_usd,
+                refund_no=_build_refund_no(),
+                source_type=source_type,
+                source_id=source_id,
+                refund_mode=refund_mode,
+                payment_order=payment_order,
+                reason=req.reason,
+                requested_by=user.id,
+                idempotency_key=req.idempotency_key,
+            )
+            db.commit()
+            db.refresh(refund)
+            return serialize_wallet_refund(refund)
+        except ValueError as exc:
+            db.rollback()
+            raise InvalidRequestException(str(exc)) from exc
+        except IntegrityError:
+            db.rollback()
+            if req.idempotency_key:
+                existing = (
+                    db.query(RefundRequest)
+                    .filter(
+                        RefundRequest.idempotency_key == req.idempotency_key,
+                        RefundRequest.user_id == user.id,
+                    )
+                    .first()
+                )
+                if existing is not None:
+                    return serialize_wallet_refund(existing)
+            raise InvalidRequestException("退款申请重复，请勿重复提交")
 
 
 class CreateRefundPayload(BaseModel):
@@ -340,25 +490,7 @@ class WalletRechargeCreateAdapter(AuthenticatedApiAdapter):
                 raise InvalidRequestException(translate_pydantic_error(errors[0]))
             raise InvalidRequestException("请求数据验证失败")
 
-        try:
-            order = PaymentService.create_recharge_order(
-                db,
-                user=user,
-                amount_usd=req.amount_usd,
-                payment_method=req.payment_method,
-                pay_amount=req.pay_amount,
-                pay_currency=req.pay_currency,
-                exchange_rate=req.exchange_rate,
-            )
-        except ValueError as exc:
-            raise InvalidRequestException(str(exc))
-
-        db.commit()
-        db.refresh(order)
-        return {
-            "order": serialize_payment_order(order, sanitize_gateway_response=True),
-            "payment_instructions": safe_gateway_response(order.gateway_response),
-        }
+        return await run_in_threadpool(_create_recharge_order_sync, user.id, req)
 
 
 @dataclass
@@ -371,22 +503,12 @@ class WalletRechargeListAdapter(AuthenticatedApiAdapter):
         if user is None:
             raise InvalidRequestException("未登录")
 
-        items, total, changed = PaymentService.list_user_orders(
-            context.db,
-            user_id=user.id,
-            limit=self.limit,
-            offset=self.offset,
+        return await run_in_threadpool(
+            _list_recharge_orders_sync,
+            user.id,
+            self.limit,
+            self.offset,
         )
-        if changed:
-            context.db.commit()
-        return {
-            "items": [
-                serialize_payment_order(item, sanitize_gateway_response=True) for item in items
-            ],
-            "total": total,
-            "limit": self.limit,
-            "offset": self.offset,
-        }
 
 
 @dataclass
@@ -398,12 +520,7 @@ class WalletRechargeDetailAdapter(AuthenticatedApiAdapter):
         if user is None:
             raise InvalidRequestException("未登录")
 
-        order = PaymentService.get_user_order(context.db, user_id=user.id, order_id=self.order_id)
-        if order is None:
-            raise NotFoundException("Payment order not found")
-        if PaymentService.refresh_order_status(order):
-            context.db.commit()
-        return {"order": serialize_payment_order(order, sanitize_gateway_response=True)}
+        return await run_in_threadpool(_get_recharge_order_sync, user.id, self.order_id)
 
 
 @dataclass
@@ -417,29 +534,7 @@ class WalletRefundListAdapter(AuthenticatedApiAdapter):
         if user is None:
             raise InvalidRequestException("未登录")
 
-        existing_wallet = WalletService.get_wallet(db, user_id=user.id)
-        wallet = existing_wallet or WalletService.get_or_create_wallet(db, user=user)
-        if wallet is None:
-            return {"items": [], "total": 0, "limit": self.limit, "offset": self.offset}
-
-        if existing_wallet is None:
-            db.commit()
-            db.refresh(wallet)
-
-        base_query = db.query(RefundRequest).filter(RefundRequest.wallet_id == wallet.id)
-        total = base_query.count()
-        items = (
-            base_query.order_by(RefundRequest.created_at.desc())
-            .offset(self.offset)
-            .limit(self.limit)
-            .all()
-        )
-        return {
-            "items": [serialize_wallet_refund(item) for item in items],
-            "total": total,
-            "limit": self.limit,
-            "offset": self.offset,
-        }
+        return await run_in_threadpool(_list_refunds_sync, user.id, self.limit, self.offset)
 
 
 @dataclass
@@ -478,65 +573,4 @@ class WalletRefundCreateAdapter(AuthenticatedApiAdapter):
                 raise InvalidRequestException(translate_pydantic_error(errors[0]))
             raise InvalidRequestException("请求数据验证失败")
 
-        wallet = WalletService.get_or_create_wallet(db, user=user)
-        if wallet is None:
-            raise InvalidRequestException("当前账户尚未开通钱包，无法申请退款")
-
-        payment_order = None
-        source_type = req.source_type or "wallet_balance"
-        source_id = req.source_id
-        refund_mode = req.refund_mode or "offline_payout"
-
-        if req.payment_order_id:
-            payment_order = (
-                db.query(PaymentOrder)
-                .filter(
-                    PaymentOrder.id == req.payment_order_id,
-                    PaymentOrder.wallet_id == wallet.id,
-                )
-                .first()
-            )
-            if payment_order is None:
-                raise NotFoundException("Payment order not found")
-            source_type = "payment_order"
-            source_id = payment_order.id
-            refund_mode = req.refund_mode or _default_refund_mode_for_order(payment_order)
-
-        try:
-            refund = WalletService.create_refund_request(
-                db,
-                wallet=wallet,
-                user_id=user.id,
-                amount_usd=req.amount_usd,
-                refund_no=_build_refund_no(),
-                source_type=source_type,
-                source_id=source_id,
-                refund_mode=refund_mode,
-                payment_order=payment_order,
-                reason=req.reason,
-                requested_by=user.id,
-                idempotency_key=req.idempotency_key,
-            )
-            db.commit()
-            db.refresh(refund)
-            return serialize_wallet_refund(refund)
-        except ValueError as exc:
-            db.rollback()
-            raise InvalidRequestException(str(exc)) from exc
-        except IntegrityError:
-            db.rollback()
-            if req.idempotency_key:
-                existing = (
-                    db.query(RefundRequest)
-                    .filter(
-                        RefundRequest.idempotency_key == req.idempotency_key,
-                        RefundRequest.user_id == user.id,
-                    )
-                    .first()
-                )
-                if existing is not None:
-                    return serialize_wallet_refund(existing)
-            raise InvalidRequestException("退款申请重复，请勿重复提交")
-        except ValueError as exc:
-            db.rollback()
-            raise InvalidRequestException(str(exc))
+        return await run_in_threadpool(_create_refund_sync, user.id, req)

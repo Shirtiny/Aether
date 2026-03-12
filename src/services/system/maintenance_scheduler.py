@@ -518,19 +518,46 @@ class MaintenanceScheduler:
             return
 
         async with self._wallet_daily_usage_lock:
+
+            def _do() -> None:
+                db = create_session()
+                try:
+                    logger.info("开始执行钱包每日消费汇总...")
+                    billing_today = WalletDailyUsageLedgerService.get_today_billing_date()
+                    billing_yesterday = billing_today - timedelta(days=1)
+                    affected = WalletDailyUsageLedgerService.aggregate_day(db, billing_yesterday)
+                    logger.info(
+                        "钱包每日消费汇总完成: date={}, wallets={}",
+                        billing_yesterday.isoformat(),
+                        affected,
+                    )
+                except Exception as e:
+                    logger.exception("钱包每日消费汇总任务执行失败: {}", e)
+                    try:
+                        db.rollback()
+                    except Exception:
+                        pass
+                finally:
+                    db.close()
+
+            await asyncio.to_thread(_do)
+
+    async def _perform_hourly_stats_aggregation(self) -> None:
+        """执行小时统计聚合任务"""
+
+        def _do() -> None:
             db = create_session()
             try:
-                logger.info("开始执行钱包每日消费汇总...")
-                billing_today = WalletDailyUsageLedgerService.get_today_billing_date()
-                billing_yesterday = billing_today - timedelta(days=1)
-                affected = WalletDailyUsageLedgerService.aggregate_day(db, billing_yesterday)
-                logger.info(
-                    "钱包每日消费汇总完成: date={}, wallets={}",
-                    billing_yesterday.isoformat(),
-                    affected,
-                )
+                if not SystemConfigService.get_config(db, "enable_stats_aggregation", True):
+                    logger.info("统计聚合已禁用，跳过小时聚合任务")
+                    return
+
+                now_utc = datetime.now(timezone.utc)
+                last_hour = now_utc.replace(minute=0, second=0, microsecond=0) - timedelta(hours=1)
+                StatsAggregatorService.aggregate_hourly_stats_bundle(db, last_hour)
+                logger.info("小时统计聚合完成: {}", last_hour.isoformat())
             except Exception as e:
-                logger.exception("钱包每日消费汇总任务执行失败: {}", e)
+                logger.exception("小时统计聚合任务执行失败: {}", e)
                 try:
                     db.rollback()
                 except Exception:
@@ -538,26 +565,7 @@ class MaintenanceScheduler:
             finally:
                 db.close()
 
-    async def _perform_hourly_stats_aggregation(self) -> None:
-        """执行小时统计聚合任务"""
-        db = create_session()
-        try:
-            if not SystemConfigService.get_config(db, "enable_stats_aggregation", True):
-                logger.info("统计聚合已禁用，跳过小时聚合任务")
-                return
-
-            now_utc = datetime.now(timezone.utc)
-            last_hour = now_utc.replace(minute=0, second=0, microsecond=0) - timedelta(hours=1)
-            StatsAggregatorService.aggregate_hourly_stats_bundle(db, last_hour)
-            logger.info(f"小时统计聚合完成: {last_hour.isoformat()}")
-        except Exception as e:
-            logger.exception(f"小时统计聚合任务执行失败: {e}")
-            try:
-                db.rollback()
-            except Exception:
-                pass
-        finally:
-            db.close()
+        await asyncio.to_thread(_do)
 
     async def _perform_pending_cleanup(self) -> None:
         """执行 pending 状态清理"""
@@ -664,23 +672,27 @@ class MaintenanceScheduler:
 
     async def _perform_gemini_file_mapping_cleanup(self) -> None:
         """清理过期的 Gemini 文件映射记录"""
-        db = create_session()
-        try:
-            from src.services.gemini_files_mapping import cleanup_expired_mappings
 
-            deleted_count = cleanup_expired_mappings(db)
-
-            if deleted_count > 0:
-                logger.info(f"清理了 {deleted_count} 条过期的 Gemini 文件映射")
-
-        except Exception as e:
-            logger.exception(f"Gemini 文件映射清理失败: {e}")
+        def _do() -> None:
+            db = create_session()
             try:
-                db.rollback()
-            except Exception:
-                pass
-        finally:
-            db.close()
+                from src.services.gemini_files_mapping import cleanup_expired_mappings
+
+                deleted_count = cleanup_expired_mappings(db)
+
+                if deleted_count > 0:
+                    logger.info(f"清理了 {deleted_count} 条过期的 Gemini 文件映射")
+
+            except Exception as e:
+                logger.exception(f"Gemini 文件映射清理失败: {e}")
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+            finally:
+                db.close()
+
+        await asyncio.to_thread(_do)
 
     async def _perform_provider_checkin(self) -> None:
         """执行 Provider 签到任务
@@ -688,40 +700,28 @@ class MaintenanceScheduler:
         遍历所有已配置 provider_ops 的 Provider，触发签到。
         签到会在余额查询时一起执行（先签到再查询余额）。
         """
-        db = create_session()
+
+        def _load_provider_ids() -> list[str]:
+            db = create_session()
+            try:
+                if not SystemConfigService.get_config(db, "enable_provider_checkin", True):
+                    return []
+                providers = (
+                    db.query(Provider.id, Provider.config)
+                    .filter(Provider.is_active.is_(True))
+                    .all()
+                )
+                return [p.id for p in providers if p.config and p.config.get("provider_ops")]
+            finally:
+                db.close()
+
         try:
-            # 检查是否启用签到任务
-            if not SystemConfigService.get_config(db, "enable_provider_checkin", True):
-                logger.info("Provider 签到已禁用，跳过签到任务")
-                return
-
-            # 获取所有已配置 provider_ops 的活跃 Provider（只查询需要的字段）
-            providers = (
-                db.query(Provider.id, Provider.config).filter(Provider.is_active.is_(True)).all()
-            )
-            provider_ids = [p.id for p in providers if p.config and p.config.get("provider_ops")]
-
+            provider_ids = await asyncio.to_thread(_load_provider_ids)
             if not provider_ids:
                 logger.info("无已配置的 Provider，跳过签到任务")
                 return
 
             logger.info(f"开始执行 Provider 签到，共 {len(provider_ids)} 个...")
-
-            # 释放主 session 的连接，避免在整个签到期间占用连接池
-            # （后续每个 provider 将使用独立短生命周期 session）
-            try:
-                if db.in_transaction():
-                    db.commit()
-            except Exception:
-                try:
-                    db.rollback()
-                except Exception:
-                    pass
-            try:
-                db.close()
-            except Exception:
-                pass
-            db = None
 
             # 使用信号量限制并发，避免同时发起过多请求
             concurrency = 3  # 签到任务并发数
@@ -774,9 +774,6 @@ class MaintenanceScheduler:
 
         except Exception as e:
             logger.exception(f"Provider 签到任务执行失败: {e}")
-        finally:
-            if db is not None:
-                db.close()
 
     async def _perform_candidate_cleanup(self) -> None:
         """清理过期的 request_candidates 记录"""

@@ -289,6 +289,14 @@
                             >
                               {{ formatOAuthPlanType(key.oauth_plan_type) }}
                             </Badge>
+                            <Badge
+                              v-if="getOAuthOrgBadge(key)"
+                              variant="secondary"
+                              class="text-[10px] px-1.5 py-0 shrink-0"
+                              :title="getOAuthOrgBadge(key)?.id"
+                            >
+                              {{ getOAuthOrgBadge(key)?.label }}
+                            </Badge>
                             <!-- Kiro 订阅类型标签 -->
                             <Badge
                               v-if="provider.provider_type === 'kiro' && key.upstream_metadata?.kiro?.subscription_title"
@@ -1103,6 +1111,7 @@ import type { UpstreamMetadata, AntigravityModelQuota } from '@/api/endpoints/ty
 import { formatApiFormat } from '@/api/endpoints/types/api-format'
 import { isOAuthAccountProviderType, isKeyManagedProviderType } from '../utils/providerTypeUtils'
 import { isAccountLevelBlockReason, cleanAccountBlockReason } from '@/utils/accountBlock'
+import { getOAuthOrgBadge } from '@/utils/oauthIdentity'
 
 // 扩展端点类型,包含密钥列表
 interface ProviderEndpointWithKeys extends ProviderEndpoint {

@@ -7,9 +7,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import gzip
 import hashlib
 import json
+import threading
 import time
 from typing import Any
 from urllib.parse import quote, urlparse
@@ -24,18 +26,22 @@ from src.core.logger import logger
 # ProxyNode 信息缓存（降低高频 DB 查询开销）
 # ---------------------------------------------------------------------------
 _proxy_node_cache: dict[str, tuple[dict[str, Any] | None, float]] = {}
+_proxy_node_cache_lock = threading.Lock()
 _PROXY_NODE_CACHE_TTL_SECONDS = 15.0
 _PROXY_NODE_CACHE_NEGATIVE_TTL_SECONDS = 5.0  # 不可用节点使用更短的 TTL，加速恢复感知
 _PROXY_NODE_CACHE_MAX_SIZE = 256
+
+# payload 超过此阈值时 build_*_kwargs_async 才走 to_thread，
+# 避免小 payload 承担不必要的线程调度开销
+_ASYNC_PAYLOAD_THRESHOLD = 64 * 1024
 
 
 def _get_proxy_node_info(node_id: str) -> dict[str, Any] | None:
     """
     读取 ProxyNode 信息（带内存 TTL 缓存）
 
-    NOTE: 使用同步 DB session（create_session），在 async 上下文中会短暂阻塞
-    事件循环。60s TTL 缓存覆盖绝大多数请求，阻塞仅发生在缓存未命中时。
-    若后续 delegate 模式导致调用频率显著上升，应考虑改为 run_in_executor 包装。
+    通过 asyncio.to_thread 在工作线程中运行，使用 _proxy_node_cache_lock 保护
+    缓存的并发读写安全。
 
     Returns:
         aether-proxy 节点: {"ip": str, "port": int, "name": str, ...}
@@ -43,20 +49,16 @@ def _get_proxy_node_info(node_id: str) -> dict[str, Any] | None:
         不存在/非在线: None
     """
     now = time.time()
-    cached = _proxy_node_cache.get(node_id)
-    if cached:
-        value, expires_at = cached
-        if now < expires_at:
-            return value
 
-    # 防止无效 node_id 导致缓存无限膨胀：淘汰最旧的条目而非全部清除
-    if len(_proxy_node_cache) >= _PROXY_NODE_CACHE_MAX_SIZE:
-        # 按过期时间排序，删除最旧的 25%
-        evict_count = _PROXY_NODE_CACHE_MAX_SIZE // 4
-        sorted_keys = sorted(_proxy_node_cache, key=lambda k: _proxy_node_cache[k][1])
-        for k in sorted_keys[:evict_count]:
-            del _proxy_node_cache[k]
+    # 快速路径：缓存命中
+    with _proxy_node_cache_lock:
+        cached = _proxy_node_cache.get(node_id)
+        if cached:
+            value, expires_at = cached
+            if now < expires_at:
+                return value
 
+    # 缓存未命中，查询 DB
     from src.database import create_session
     from src.models.database import ProxyNode, ProxyNodeStatus
 
@@ -64,71 +66,77 @@ def _get_proxy_node_info(node_id: str) -> dict[str, Any] | None:
     try:
         node = db.query(ProxyNode).filter(ProxyNode.id == node_id).first()
         if not node:
-            _proxy_node_cache[node_id] = (None, now + _PROXY_NODE_CACHE_NEGATIVE_TTL_SECONDS)
-            return None
-
-        # tunnel 模式节点：统一以 DB 的 tunnel_connected/status 为准（由 Hub 广播维护）
-        if node.tunnel_mode and not node.is_manual:
+            result: dict[str, Any] | None = None
+            ttl = _PROXY_NODE_CACHE_NEGATIVE_TTL_SECONDS
+        elif node.tunnel_mode and not node.is_manual:
             if node.status != ProxyNodeStatus.ONLINE or not bool(node.tunnel_connected):
-                _proxy_node_cache[node_id] = (
-                    None,
-                    now + _PROXY_NODE_CACHE_NEGATIVE_TTL_SECONDS,
-                )
-                return None
-            value: dict[str, Any] = {
-                "name": node.name,
-                "ip": node.ip,
-                "port": node.port,
-                "tunnel_mode": True,
-                "tunnel_connected": True,
-            }
-            _proxy_node_cache[node_id] = (value, now + _PROXY_NODE_CACHE_TTL_SECONDS)
-            return value
-
-        # 手动节点 / 非 tunnel 节点：仍依赖 DB status
-        if node.status != ProxyNodeStatus.ONLINE:
-            _proxy_node_cache[node_id] = (None, now + _PROXY_NODE_CACHE_NEGATIVE_TTL_SECONDS)
-            return None
-
-        if node.is_manual:
-            value = {
+                result = None
+                ttl = _PROXY_NODE_CACHE_NEGATIVE_TTL_SECONDS
+            else:
+                result = {
+                    "name": node.name,
+                    "ip": node.ip,
+                    "port": node.port,
+                    "tunnel_mode": True,
+                    "tunnel_connected": True,
+                }
+                ttl = _PROXY_NODE_CACHE_TTL_SECONDS
+        elif node.status != ProxyNodeStatus.ONLINE:
+            result = None
+            ttl = _PROXY_NODE_CACHE_NEGATIVE_TTL_SECONDS
+        elif node.is_manual:
+            result = {
                 "is_manual": True,
                 "name": node.name,
                 "proxy_url": node.proxy_url,
                 "username": node.proxy_username,
                 "password": node.proxy_password,
             }
+            ttl = _PROXY_NODE_CACHE_TTL_SECONDS
         else:
-            value = {
+            result = {
                 "name": node.name,
                 "ip": node.ip,
                 "port": node.port,
                 "tunnel_mode": bool(node.tunnel_mode),
                 "tunnel_connected": bool(node.tunnel_connected),
             }
-
-        _proxy_node_cache[node_id] = (value, now + _PROXY_NODE_CACHE_TTL_SECONDS)
-        return value
+            ttl = _PROXY_NODE_CACHE_TTL_SECONDS
     finally:
         db.close()
+
+    # 写回缓存（持锁做淘汰+写入，使用新时间戳以排除 DB 查询耗时）
+    write_now = time.time()
+    with _proxy_node_cache_lock:
+        if len(_proxy_node_cache) >= _PROXY_NODE_CACHE_MAX_SIZE:
+            evict_count = _PROXY_NODE_CACHE_MAX_SIZE // 4
+            sorted_keys = sorted(_proxy_node_cache, key=lambda k: _proxy_node_cache[k][1])
+            for k in sorted_keys[:evict_count]:
+                del _proxy_node_cache[k]
+        _proxy_node_cache[node_id] = (result, write_now + ttl)
+
+    return result
 
 
 # ---------------------------------------------------------------------------
 # 系统默认代理
 # ---------------------------------------------------------------------------
 _system_proxy_cache: tuple[dict[str, Any] | None, float] | None = None
+_system_proxy_cache_lock = threading.Lock()
 _SYSTEM_PROXY_CACHE_TTL = 60.0
 
 
 def invalidate_proxy_node_cache(node_id: str) -> None:
     """主动清除指定节点的信息缓存（tunnel 断开时调用，避免使用过期的连接状态）"""
-    _proxy_node_cache.pop(node_id, None)
+    with _proxy_node_cache_lock:
+        _proxy_node_cache.pop(node_id, None)
 
 
 def invalidate_system_proxy_cache() -> None:
     """手动失效系统代理缓存（在删除节点等操作后调用）"""
     global _system_proxy_cache
-    _system_proxy_cache = None
+    with _system_proxy_cache_lock:
+        _system_proxy_cache = None
 
 
 def get_system_proxy_config() -> dict[str, Any] | None:
@@ -140,10 +148,13 @@ def get_system_proxy_config() -> dict[str, Any] | None:
     """
     global _system_proxy_cache
     now = time.time()
-    if _system_proxy_cache:
-        value, expires_at = _system_proxy_cache
-        if now < expires_at:
-            return value
+
+    # 快速路径：缓存命中
+    with _system_proxy_cache_lock:
+        if _system_proxy_cache:
+            value, expires_at = _system_proxy_cache
+            if now < expires_at:
+                return value
 
     from src.database import create_session
     from src.services.system.config import SystemConfigService
@@ -155,14 +166,20 @@ def get_system_proxy_config() -> dict[str, Any] | None:
             result: dict[str, Any] | None = {"node_id": node_id.strip(), "enabled": True}
         else:
             result = None
-        _system_proxy_cache = (result, now + _SYSTEM_PROXY_CACHE_TTL)
-        return result
     except Exception as exc:
         logger.warning("获取系统默认代理配置失败: {}", exc)
-        _system_proxy_cache = (None, now + _SYSTEM_PROXY_CACHE_TTL)
-        return None
+        result = None
     finally:
         db.close()
+
+    with _system_proxy_cache_lock:
+        _system_proxy_cache = (result, now + _SYSTEM_PROXY_CACHE_TTL)
+    return result
+
+
+async def get_system_proxy_config_async() -> dict[str, Any] | None:
+    """异步读取系统默认代理配置，避免在事件循环中执行同步 DB 查询。"""
+    return await asyncio.to_thread(get_system_proxy_config)
 
 
 # ---------------------------------------------------------------------------
@@ -472,6 +489,13 @@ def build_proxy_url(proxy_config: dict[str, Any]) -> str | None:
     return proxy_url
 
 
+async def build_proxy_url_async(proxy_config: dict[str, Any] | None) -> str | None:
+    """异步构建代理 URL，避免 ProxyNode 查询阻塞事件循环。"""
+    if not proxy_config:
+        return None
+    return await asyncio.to_thread(build_proxy_url, proxy_config)
+
+
 # ---------------------------------------------------------------------------
 # 代理信息追踪（日志/usage）
 # ---------------------------------------------------------------------------
@@ -526,6 +550,11 @@ def resolve_proxy_info(proxy_config: dict[str, Any] | None) -> dict[str, Any] | 
         return {"url": safe_url, "source": source}
 
     return None
+
+
+async def resolve_proxy_info_async(proxy_config: dict[str, Any] | None) -> dict[str, Any] | None:
+    """异步解析代理摘要信息，避免事件循环被同步代理解析阻塞。"""
+    return await asyncio.to_thread(resolve_proxy_info, proxy_config)
 
 
 def get_proxy_label(proxy_info: dict[str, Any] | None) -> str:
@@ -612,6 +641,13 @@ def resolve_delegate_config(proxy_config: dict[str, Any] | None) -> dict[str, An
     return None
 
 
+async def resolve_delegate_config_async(
+    proxy_config: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """异步解析 tunnel 代理配置，避免同步 DB 查询阻塞事件循环。"""
+    return await asyncio.to_thread(resolve_delegate_config, proxy_config)
+
+
 # ---------------------------------------------------------------------------
 # 统一上游请求参数构建
 # ---------------------------------------------------------------------------
@@ -638,6 +674,25 @@ def _maybe_compress_payload(
         compressed = gzip.compress(json_bytes, compresslevel=6)
         normalized_headers = {**normalized_headers, "Content-Encoding": "gzip"}
         return compressed, normalized_headers
+
+    return json_bytes, normalized_headers
+
+
+async def _maybe_compress_payload_async(
+    payload: Any,
+    headers: dict[str, str],
+    client_content_encoding: str | None = None,
+) -> tuple[bytes, dict[str, str]]:
+    """异步版 _maybe_compress_payload，仅在 payload 超过阈值时走线程池。"""
+    json_bytes = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    normalized_headers = {k: v for k, v in headers.items() if k.lower() != "content-encoding"}
+
+    if is_gzip_content_encoding(client_content_encoding):
+        if len(json_bytes) >= _ASYNC_PAYLOAD_THRESHOLD:
+            compressed = await asyncio.to_thread(gzip.compress, json_bytes, 6)
+        else:
+            compressed = gzip.compress(json_bytes, compresslevel=6)
+        return compressed, {**normalized_headers, "Content-Encoding": "gzip"}
 
     return json_bytes, normalized_headers
 
@@ -673,6 +728,28 @@ def build_post_kwargs(
     }
 
 
+async def build_post_kwargs_async(
+    _delegate_cfg: dict[str, Any] | None = None,
+    *,
+    url: str,
+    headers: dict[str, str],
+    payload: Any,
+    timeout: float,
+    client_content_encoding: str | None = None,
+    refresh_auth: bool = False,
+) -> dict[str, Any]:
+    """构建 POST kwargs，大 payload 的序列化/压缩走线程池避免阻塞事件循环。"""
+    content, final_headers = await _maybe_compress_payload_async(
+        payload, headers, client_content_encoding
+    )
+    return {
+        "url": url,
+        "content": content,
+        "headers": final_headers,
+        "timeout": httpx.Timeout(timeout),
+    }
+
+
 def build_stream_kwargs(
     _delegate_cfg: dict[str, Any] | None = None,
     *,
@@ -694,6 +771,30 @@ def build_stream_kwargs(
         payload,
         headers,
         client_content_encoding=client_content_encoding,
+    )
+    kwargs: dict[str, Any] = {
+        "method": "POST",
+        "url": url,
+        "content": content,
+        "headers": final_headers,
+    }
+    if timeout is not None:
+        kwargs["timeout"] = httpx.Timeout(timeout)
+    return kwargs
+
+
+async def build_stream_kwargs_async(
+    _delegate_cfg: dict[str, Any] | None = None,
+    *,
+    url: str,
+    headers: dict[str, str],
+    payload: Any,
+    timeout: float | None = None,
+    client_content_encoding: str | None = None,
+) -> dict[str, Any]:
+    """构建 stream kwargs，大 payload 的序列化/压缩走线程池避免阻塞事件循环。"""
+    content, final_headers = await _maybe_compress_payload_async(
+        payload, headers, client_content_encoding
     )
     kwargs: dict[str, Any] = {
         "method": "POST",
