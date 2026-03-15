@@ -11,7 +11,9 @@ import json
 from typing import Any
 
 from src.core.api_format.conversion.field_mappings import (
+    CLAUDE_EFFORT_TO_REASONING_EFFORT,
     ERROR_TYPE_MAPPINGS,
+    REASONING_EFFORT_TO_CLAUDE_EFFORT,
     RETRYABLE_ERROR_TYPES,
     STOP_REASON_MAPPINGS,
     THINKING_BUDGET_TOKENS_MIN,
@@ -187,10 +189,18 @@ class ClaudeNormalizer(FormatNormalizer):
                         "tools",
                         "tool_choice",
                         "thinking",
+                        "output_config",
                     },
                 )
             },
         )
+
+        # output_config.effort -> reasoning_effort (独立于 thinking)
+        output_config = request.get("output_config")
+        if isinstance(output_config, dict):
+            effort = output_config.get("effort")
+            if isinstance(effort, str) and effort in CLAUDE_EFFORT_TO_REASONING_EFFORT:
+                internal.extra["reasoning_effort"] = CLAUDE_EFFORT_TO_REASONING_EFFORT[effort]
 
         if dropped:
             internal.extra.setdefault("raw", {})["dropped_blocks"] = dropped
@@ -313,6 +323,11 @@ class ClaudeNormalizer(FormatNormalizer):
                 if max_t is not None and bt >= max_t:
                     result["max_tokens"] = bt + 1
                 result["thinking"] = thinking_out
+
+        # reasoning_effort -> output_config.effort (独立于 thinking)
+        effort = internal.extra.get("reasoning_effort") if internal.extra else None
+        if isinstance(effort, str) and effort in REASONING_EFFORT_TO_CLAUDE_EFFORT:
+            result["output_config"] = {"effort": REASONING_EFFORT_TO_CLAUDE_EFFORT[effort]}
 
         # web_search_options -> Claude web_search tool
         web_search_opts = internal.extra.get("web_search_options") if internal.extra else None

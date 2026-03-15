@@ -130,14 +130,33 @@ REASONING_EFFORT_TO_THINKING_BUDGET: dict[str, int] = {
     "low": 1280,
     "medium": 2048,
     "high": 4096,
+    "xhigh": 8192,
 }
 
 # thinking budget_tokens -> OpenAI reasoning_effort（反向映射，取最近区间）
 THINKING_BUDGET_TO_REASONING_EFFORT: list[tuple[int, str]] = [
     (1664, "low"),  # <= 1664 -> low  (midpoint of 1280..2048)
     (3072, "medium"),  # <= 3072 -> medium  (midpoint of 2048..4096)
-    (2**31, "high"),  # > 3072 -> high
+    (6144, "high"),  # <= 6144 -> high  (midpoint of 4096..8192)
+    (2**31, "xhigh"),  # > 6144 -> xhigh
 ]
+
+# Claude output_config.effort -> 标准化 reasoning_effort
+CLAUDE_EFFORT_TO_REASONING_EFFORT: dict[str, str] = {
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "max": "xhigh",
+    # "auto" 不映射，让目标格式使用默认行为
+}
+
+# 标准化 reasoning_effort -> Claude output_config.effort
+REASONING_EFFORT_TO_CLAUDE_EFFORT: dict[str, str] = {
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "max",
+}
 
 
 # OpenAI web_search_options.search_context_size -> Claude web_search max_uses
@@ -190,6 +209,8 @@ __all__ = [
     "RETRYABLE_ERROR_TYPES",
     "REASONING_EFFORT_TO_THINKING_BUDGET",
     "THINKING_BUDGET_TO_REASONING_EFFORT",
+    "CLAUDE_EFFORT_TO_REASONING_EFFORT",
+    "REASONING_EFFORT_TO_CLAUDE_EFFORT",
     "WEB_SEARCH_CONTEXT_SIZE_TO_MAX_USES",
     "CLAUDE_DEFAULT_MAX_TOKENS",
     "THINKING_BUDGET_TOKENS_PERCENTAGE",

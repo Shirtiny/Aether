@@ -196,6 +196,10 @@ class OpenAICliNormalizer(FormatNormalizer):
             },
         )
 
+        # reasoning_effort 同步存入 extra (支持独立于 thinking 的跨格式转换)
+        if thinking and thinking.extra.get("reasoning_effort"):
+            internal.extra["reasoning_effort"] = thinking.extra["reasoning_effort"]
+
         return internal
 
     def request_from_internal(
@@ -259,11 +263,13 @@ class OpenAICliNormalizer(FormatNormalizer):
             result["tool_choice"] = self._tool_choice_to_openai(internal.tool_choice)
 
         # thinking -> reasoning (Responses API)
+        effort: str | None = None
         if internal.thinking and internal.thinking.enabled:
             # 优先还原原始 reasoning 对象
             original_reasoning = internal.thinking.extra.get("reasoning")
             if isinstance(original_reasoning, dict):
                 result["reasoning"] = original_reasoning
+                effort = None  # 已还原，不需要再构造
             else:
                 effort = internal.thinking.extra.get("reasoning_effort")
                 if not effort and internal.thinking.budget_tokens is not None:
@@ -271,8 +277,14 @@ class OpenAICliNormalizer(FormatNormalizer):
                         if internal.thinking.budget_tokens <= threshold:
                             effort = level
                             break
-                if effort:
-                    result["reasoning"] = {"effort": effort}
+        # 兜底: 从 internal.extra 读取
+        if not effort and internal.extra and "reasoning" not in result:
+            effort = internal.extra.get("reasoning_effort")
+        if effort:
+            # xhigh 降级为 high (Responses API 也仅支持 low/medium/high)
+            if effort == "xhigh":
+                effort = "high"
+            result["reasoning"] = {"effort": effort}
 
         # parallel_tool_calls
         if internal.parallel_tool_calls is not None:

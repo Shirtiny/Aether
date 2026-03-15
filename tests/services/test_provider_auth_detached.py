@@ -107,3 +107,40 @@ def test_mark_refresh_token_invalid_persists_detached_key(
     assert row.oauth_invalid_at is not None
     assert str(key.oauth_invalid_reason).startswith("[REFRESH_FAILED] Token 续期失败 (401)")
     assert "refresh_token_reused" in str(row.oauth_invalid_reason)
+
+
+def test_account_block_token_invalidated_is_refresh_recoverable() -> None:
+    from src.services.provider.oauth_token import is_account_level_block
+
+    assert (
+        is_account_level_block(
+            "[ACCOUNT_BLOCK] Authentication token has been invalidated. Please sign in again."
+        )
+        is False
+    )
+
+
+def test_persist_refreshed_token_clears_legacy_token_invalidated_account_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key = SimpleNamespace(
+        id="key-1",
+        api_key="old-api",
+        auth_config="old-config",
+        oauth_invalid_at=datetime.now(timezone.utc),
+        oauth_invalid_reason=(
+            "[ACCOUNT_BLOCK] Authentication token has been invalidated. Please sign in again."
+        ),
+    )
+
+    monkeypatch.setattr(
+        module, "object_session", lambda _key: (_ for _ in ()).throw(RuntimeError())
+    )
+    monkeypatch.setattr(module.crypto_service, "encrypt", lambda value: f"enc:{value}")
+
+    module._persist_refreshed_token(key, "new-token", {"refresh_token": "rt-2"})
+
+    assert key.api_key == "enc:new-token"
+    assert key.auth_config == 'enc:{"refresh_token": "rt-2"}'
+    assert key.oauth_invalid_at is None
+    assert key.oauth_invalid_reason is None

@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 from src.core.crypto import crypto_service
 from src.models.database import Provider, ProviderAPIKey, ProviderEndpoint
 from src.services.provider.auth import get_provider_auth
+from src.services.provider.oauth_token import looks_like_token_invalidated
 from src.services.provider.pool.account_state import (
     OAUTH_ACCOUNT_BLOCK_PREFIX,
     OAUTH_EXPIRED_PREFIX,
@@ -67,14 +68,6 @@ def _extract_error_message_from_response(response: httpx.Response) -> str:
     return text[:300] if text else ""
 
 
-def _looks_like_token_invalidated(message: str | None) -> bool:
-    lowered = str(message or "").strip().lower()
-    return (
-        "authentication token has been invalidated" in lowered
-        or "token has been invalidated" in lowered
-    )
-
-
 def _looks_like_account_deactivated(message: str | None) -> bool:
     lowered = str(message or "").strip().lower()
     return "account has been deactivated" in lowered or "account deactivated" in lowered
@@ -96,6 +89,12 @@ def _build_structured_invalid_reason(*, status_code: int, upstream_message: str 
     if _looks_like_account_deactivated(message):
         detail = message or "OpenAI 账号已停用"
         return f"{OAUTH_ACCOUNT_BLOCK_PREFIX}{detail}"
+
+    # Codex 某些场景会返回 403，但语义仍是 access token 已失效/被轮换。
+    # 这类异常可通过 refresh_token 恢复，不应落成账号级 block。
+    if looks_like_token_invalidated(message):
+        detail = message or "Codex Token 无效或已过期"
+        return f"{OAUTH_EXPIRED_PREFIX}{detail}"
 
     if status_code == 401:
         detail = message or "Codex Token 无效或已过期 (401)"
