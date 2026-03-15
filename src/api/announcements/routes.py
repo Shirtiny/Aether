@@ -13,7 +13,7 @@ from src.api.base.adapter import ApiAdapter, ApiMode
 from src.api.base.admin_adapter import AdminApiAdapter
 from src.api.base.authenticated_adapter import AuthenticatedApiAdapter
 from src.api.base.context import ApiRequestContext
-from src.api.base.pipeline import ApiRequestPipeline
+from src.api.base.pipeline import get_pipeline
 from src.core.exceptions import InvalidRequestException, translate_pydantic_error
 from src.database import get_db
 from src.models.api import CreateAnnouncementRequest, UpdateAnnouncementRequest
@@ -22,7 +22,7 @@ from src.services.system.announcement import AnnouncementService
 from src.utils.auth_utils import authenticate_user_from_bearer_token
 
 router = APIRouter(prefix="/api/announcements", tags=["Announcements"])
-pipeline = ApiRequestPipeline()
+pipeline = get_pipeline()
 
 
 # ============== 公共端点（所有用户可访问） ==============

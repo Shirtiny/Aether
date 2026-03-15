@@ -4,11 +4,26 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import case, func
+from sqlalchemy import Case, case, func
 from sqlalchemy.orm import Session
 
 from src.core.logger import logger
 from src.models.database import ApiKey, Usage, User
+
+
+def input_context_expr() -> Case:
+    """构造 SQL CASE 表达式，根据 api_format 精确计算每条记录的总输入上下文 token 数。
+
+    - OpenAI/Gemini: input_tokens 已包含 cache_read_input_tokens，直接使用
+    - Claude/未知: input_tokens 不含 cache_read，需要加上
+    """
+    return case(
+        (
+            Usage.api_format.like("openai:%") | Usage.api_format.like("gemini:%"),
+            Usage.input_tokens,
+        ),
+        else_=Usage.input_tokens + Usage.cache_read_input_tokens,
+    )
 
 
 @dataclass(slots=True)
@@ -245,6 +260,9 @@ class UsageQueryMixin:
             func.sum(Usage.input_tokens).label("input_tokens"),
             func.sum(Usage.output_tokens).label("output_tokens"),
             func.sum(Usage.total_tokens).label("total_tokens"),
+            func.sum(Usage.cache_read_input_tokens).label("cache_read_tokens"),
+            func.sum(Usage.cache_creation_input_tokens).label("cache_creation_tokens"),
+            func.sum(input_context_expr()).label("total_input_context"),
             func.sum(Usage.total_cost_usd).label("total_cost_usd"),
             func.sum(Usage.actual_total_cost_usd).label("actual_total_cost_usd"),
             func.sum(case((Usage.status_code == 200, 1), else_=0)).label("success_count"),
@@ -289,6 +307,9 @@ class UsageQueryMixin:
                 "input_tokens": row.input_tokens,
                 "output_tokens": row.output_tokens,
                 "total_tokens": row.total_tokens,
+                "cache_read_tokens": int(row.cache_read_tokens or 0),
+                "cache_creation_tokens": int(row.cache_creation_tokens or 0),
+                "total_input_context": int(row.total_input_context or 0),
                 "total_cost_usd": float(row.total_cost_usd or 0.0),
                 "actual_total_cost_usd": float(row.actual_total_cost_usd or 0.0),
                 "success_count": int(row.success_count or 0),

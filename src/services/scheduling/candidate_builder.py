@@ -34,7 +34,7 @@ from src.models.database import (
     ProviderAPIKey,
     ProviderEndpoint,
 )
-from src.services.health.monitor import health_monitor
+from src.services.health.monitor import get_health_monitor
 from src.services.provider.format import normalize_endpoint_signature
 from src.services.provider.pool.account_state import (
     resolve_pool_account_state as _resolve_pool_account_state,
@@ -365,7 +365,7 @@ class CandidateBuilder:
             - mapping_matched_model: 通过映射匹配到的模型名（用于实际请求）
         """
         # 检查熔断器状态（使用详细状态方法获取更丰富的跳过原因，按 API 格式）
-        is_available, circuit_reason = health_monitor.get_circuit_breaker_status(
+        is_available, circuit_reason = get_health_monitor().get_circuit_breaker_status(
             key, api_format=api_format
         )
         if not is_available:

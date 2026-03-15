@@ -6,6 +6,7 @@ from src.core.api_format.signature import normalize_signature_key
 from src.services.billing.token_normalization import normalize_input_tokens_for_billing
 from src.services.usage._recording_helpers import (
     build_usage_params,
+    deserialize_body_if_json,
     sanitize_request_metadata,
 )
 from src.services.usage._types import UsageCostInfo, UsageRecordParams
@@ -158,6 +159,10 @@ class UsageBillingIntegrationMixin:
         metadata = sanitize_request_metadata(metadata)
 
         # 构建 Usage 参数
+        request_body = deserialize_body_if_json(params.request_body)
+        provider_request_body = deserialize_body_if_json(params.provider_request_body)
+        response_body = deserialize_body_if_json(params.response_body)
+        client_response_body = deserialize_body_if_json(params.client_response_body)
         usage_params = build_usage_params(
             db=params.db,
             user=params.user,
@@ -183,13 +188,13 @@ class UsageBillingIntegrationMixin:
             error_message=params.error_message,
             metadata=metadata,
             request_headers=params.request_headers,
-            request_body=params.request_body,
+            request_body=request_body,
             provider_request_headers=params.provider_request_headers,
-            provider_request_body=params.provider_request_body,
+            provider_request_body=provider_request_body,
             response_headers=params.response_headers,
             client_response_headers=params.client_response_headers,
-            response_body=params.response_body,
-            client_response_body=params.client_response_body,
+            response_body=response_body,
+            client_response_body=client_response_body,
             request_id=params.request_id,
             provider_id=params.provider_id,
             provider_endpoint_id=params.provider_endpoint_id,

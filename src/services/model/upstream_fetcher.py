@@ -113,7 +113,7 @@ async def fetch_models_for_key(
     # Ensure provider plugins (including custom model fetchers) are registered.
     from src.services.provider.envelope import ensure_providers_bootstrapped
 
-    ensure_providers_bootstrapped()
+    ensure_providers_bootstrapped(provider_types=[ctx.provider_type] if ctx.provider_type else None)
 
     fetcher = UpstreamModelsFetcherRegistry.get(ctx.provider_type) or _fetch_models_default
     return await fetcher(ctx, timeout_seconds)

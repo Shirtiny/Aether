@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 
 from src.api.base.admin_adapter import AdminApiAdapter
 from src.api.base.context import ApiRequestContext
-from src.api.base.pipeline import ApiRequestPipeline
+from src.api.base.pipeline import get_pipeline
 from src.core.exceptions import NotFoundException
 from src.core.logger import logger
 from src.database import get_db
@@ -29,7 +29,7 @@ from src.models.endpoint_models import (
     HealthSummaryResponse,
 )
 from src.services.health.endpoint import EndpointHealthService
-from src.services.health.monitor import HealthMonitor, health_monitor
+from src.services.health.monitor import HealthMonitor, get_health_monitor
 
 router = APIRouter(tags=["Endpoint Health"])
 
@@ -39,7 +39,7 @@ def _recover_key_health_sync(db: Session, key_id: str, api_format: str | None) -
     if not key:
         raise NotFoundException(f"Key {key_id} 不存在")
 
-    success = health_monitor.reset_health(db, key_id=key_id, api_format=api_format)
+    success = get_health_monitor().reset_health(db, key_id=key_id, api_format=api_format)
     if not success:
         raise Exception("重置健康度失败")
 
@@ -93,7 +93,7 @@ def _format_str(api_format_enum: Any) -> str:
     return api_format_enum.value if hasattr(api_format_enum, "value") else str(api_format_enum)
 
 
-pipeline = ApiRequestPipeline()
+pipeline = get_pipeline()
 
 
 @router.get("/health/summary", response_model=HealthSummaryResponse)
@@ -285,7 +285,7 @@ async def recover_all_keys_health(
 
 class AdminHealthSummaryAdapter(AdminApiAdapter):
     async def handle(self, context: ApiRequestContext) -> Any:  # type: ignore[override]
-        summary = health_monitor.get_all_health_status(context.db)
+        summary = get_health_monitor().get_all_health_status(context.db)
         return HealthSummaryResponse(**summary)
 
 
@@ -507,7 +507,7 @@ class AdminKeyHealthAdapter(AdminApiAdapter):
     api_format: str | None = None
 
     async def handle(self, context: ApiRequestContext) -> Any:  # type: ignore[override]
-        health_data = health_monitor.get_key_health(context.db, self.key_id, self.api_format)
+        health_data = get_health_monitor().get_key_health(context.db, self.key_id, self.api_format)
         if not health_data:
             raise NotFoundException(f"Key {self.key_id} 不存在")
 

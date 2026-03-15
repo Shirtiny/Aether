@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from src.api.base.admin_adapter import AdminApiAdapter
 from src.api.base.context import ApiRequestContext
-from src.api.base.pipeline import ApiRequestPipeline
+from src.api.base.pipeline import get_pipeline
 from src.core.exceptions import NotFoundException
 from src.database import get_db
 from src.models.database import ProviderAPIKey
@@ -18,7 +18,7 @@ from src.models.endpoint_models import KeyRpmStatusResponse
 from src.services.rate_limit.concurrency_manager import get_concurrency_manager
 
 router = APIRouter(tags=["RPM Control"])
-pipeline = ApiRequestPipeline()
+pipeline = get_pipeline()
 
 
 @router.get("/rpm/key/{key_id}", response_model=KeyRpmStatusResponse)

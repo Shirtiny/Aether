@@ -32,6 +32,8 @@ export interface SystemConfig {
   log_retention_days: number
   cleanup_batch_size: number
   audit_log_retention_days: number
+  request_candidates_retention_days: number
+  request_candidates_cleanup_batch_size: number
   // 定时任务
   enable_provider_checkin: boolean
   provider_checkin_time: string
@@ -66,6 +68,8 @@ const CONFIG_KEYS = [
   'log_retention_days',
   'cleanup_batch_size',
   'audit_log_retention_days',
+  'request_candidates_retention_days',
+  'request_candidates_cleanup_batch_size',
   // 定时任务
   'enable_provider_checkin',
   'provider_checkin_time',
@@ -101,6 +105,8 @@ function createDefaultConfig(): SystemConfig {
     log_retention_days: 365,
     cleanup_batch_size: 1000,
     audit_log_retention_days: 30,
+    request_candidates_retention_days: 30,
+    request_candidates_cleanup_batch_size: 5000,
     // 定时任务
     enable_provider_checkin: true,
     provider_checkin_time: '01:05',
@@ -171,7 +177,11 @@ export function useSystemConfig() {
       systemConfig.value.log_retention_days !== originalConfig.value.log_retention_days ||
       systemConfig.value.cleanup_batch_size !== originalConfig.value.cleanup_batch_size ||
       systemConfig.value.audit_log_retention_days !==
-      originalConfig.value.audit_log_retention_days
+      originalConfig.value.audit_log_retention_days ||
+      systemConfig.value.request_candidates_retention_days !==
+      originalConfig.value.request_candidates_retention_days ||
+      systemConfig.value.request_candidates_cleanup_batch_size !==
+      originalConfig.value.request_candidates_cleanup_batch_size
     )
   })
 
@@ -421,6 +431,16 @@ export function useSystemConfig() {
           value: systemConfig.value.audit_log_retention_days,
           description: '审计日志保留天数',
         },
+        {
+          key: 'request_candidates_retention_days',
+          value: systemConfig.value.request_candidates_retention_days,
+          description: '请求候选记录保留天数',
+        },
+        {
+          key: 'request_candidates_cleanup_batch_size',
+          value: systemConfig.value.request_candidates_cleanup_batch_size,
+          description: '请求候选记录每批次清理条数',
+        },
       ]
 
       await Promise.all(
@@ -438,6 +458,10 @@ export function useSystemConfig() {
         originalConfig.value.cleanup_batch_size = systemConfig.value.cleanup_batch_size
         originalConfig.value.audit_log_retention_days =
           systemConfig.value.audit_log_retention_days
+        originalConfig.value.request_candidates_retention_days =
+          systemConfig.value.request_candidates_retention_days
+        originalConfig.value.request_candidates_cleanup_batch_size =
+          systemConfig.value.request_candidates_cleanup_batch_size
       }
       success('请求记录清理配置已保存')
     } catch (err) {

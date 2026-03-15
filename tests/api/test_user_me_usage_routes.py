@@ -19,6 +19,7 @@ async def test_get_usage_adapter_uses_coarse_summary_grouping(
     count_query.scalar.return_value = 0
     query.outerjoin.return_value = query
     query.filter.return_value = query
+    query.group_by.return_value = query
     query.with_entities.return_value = count_query
     query.options.return_value = query
     query.order_by.return_value = query
@@ -36,6 +37,8 @@ async def test_get_usage_adapter_uses_coarse_summary_grouping(
                 "input_tokens": 10,
                 "output_tokens": 5,
                 "total_tokens": 15,
+                "cache_read_tokens": 5,
+                "total_input_context": 15,
                 "total_cost_usd": 1.5,
                 "actual_total_cost_usd": 1.2,
                 "success_count": 2,
@@ -49,6 +52,8 @@ async def test_get_usage_adapter_uses_coarse_summary_grouping(
                 "input_tokens": 999,
                 "output_tokens": 999,
                 "total_tokens": 1998,
+                "cache_read_tokens": 50,
+                "total_input_context": 1049,
                 "total_cost_usd": 9.9,
                 "actual_total_cost_usd": 9.9,
                 "success_count": 0,
@@ -82,15 +87,20 @@ async def test_get_usage_adapter_uses_coarse_summary_grouping(
             "input_tokens": 10,
             "output_tokens": 5,
             "total_tokens": 15,
+            "cache_read_tokens": 5,
+            "cache_hit_rate": 33.33,
             "total_cost_usd": 1.5,
         }
     ]
+    assert result["summary_by_api_format"] == []
     assert "total_actual_cost" not in result
     assert result["summary_by_provider"] == [
         {
             "provider": "provider-a",
             "requests": 2,
             "total_tokens": 15,
+            "cache_read_tokens": 5,
+            "cache_hit_rate": 33.33,
             "total_cost_usd": 1.5,
             "success_rate": 100.0,
             "avg_response_time_ms": 500.0,
@@ -109,6 +119,7 @@ async def test_get_usage_adapter_provider_success_rate_uses_success_count(
     count_query.scalar.return_value = 0
     query.outerjoin.return_value = query
     query.filter.return_value = query
+    query.group_by.return_value = query
     query.with_entities.return_value = count_query
     query.options.return_value = query
     query.order_by.return_value = query
@@ -126,6 +137,8 @@ async def test_get_usage_adapter_provider_success_rate_uses_success_count(
                 "input_tokens": 30,
                 "output_tokens": 15,
                 "total_tokens": 45,
+                "cache_read_tokens": 15,
+                "total_input_context": 45,
                 "total_cost_usd": 4.5,
                 "actual_total_cost_usd": 4.5,
                 "success_count": 2,
@@ -139,6 +152,8 @@ async def test_get_usage_adapter_provider_success_rate_uses_success_count(
                 "input_tokens": 10,
                 "output_tokens": 5,
                 "total_tokens": 15,
+                "cache_read_tokens": 5,
+                "total_input_context": 15,
                 "total_cost_usd": 1.5,
                 "actual_total_cost_usd": 1.5,
                 "success_count": 0,
@@ -168,6 +183,8 @@ async def test_get_usage_adapter_provider_success_rate_uses_success_count(
             "provider": "provider-a",
             "requests": 4,
             "total_tokens": 60,
+            "cache_read_tokens": 20,
+            "cache_hit_rate": 33.33,
             "total_cost_usd": 6.0,
             "success_rate": 50.0,
             "avg_response_time_ms": 300.0,

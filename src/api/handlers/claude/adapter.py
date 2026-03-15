@@ -17,7 +17,6 @@ from src.api.handlers.base.chat_adapter_base import ChatAdapterBase, register_ad
 from src.api.handlers.base.chat_handler_base import ChatHandlerBase
 from src.core.api_format import ApiFamily, get_header_value
 from src.core.logger import logger
-from src.core.optimization_utils import TokenCounter
 from src.models.claude import ClaudeMessagesRequest, ClaudeTokenCountRequest
 
 
@@ -98,6 +97,53 @@ def _detect_cache_1h_in_body(body: dict[str, Any]) -> bool:
                 return True
 
     return False
+
+
+_TOKEN_COUNTER_PLUGIN: Any = None
+
+
+def _get_token_counter() -> Any:
+    global _TOKEN_COUNTER_PLUGIN  # noqa: PLW0603
+    if _TOKEN_COUNTER_PLUGIN is None:
+        from src.plugins.token.tiktoken_counter import TiktokenCounterPlugin
+
+        _TOKEN_COUNTER_PLUGIN = TiktokenCounterPlugin(name="tiktoken")
+    return _TOKEN_COUNTER_PLUGIN
+
+
+async def _count_text_tokens_with_fallback(text: str, model: str) -> int:
+    """使用 tiktoken 插件计数，失败时回退到轻量估算。"""
+    if not text:
+        return 0
+    try:
+        plugin = _get_token_counter()
+        if plugin.enabled:
+            return await plugin.count_tokens(text, model)
+    except Exception as exc:
+        logger.debug("tiktoken token 计数失败，使用估算回退: {}", exc)
+    # 与旧实现保持一致：按字符估算
+    return max(1, len(text) // 4)
+
+
+async def _count_messages_tokens_with_fallback(messages: list[dict[str, Any]], model: str) -> int:
+    """按历史逻辑统计 messages token（每条消息固定开销 + 内容 token）。"""
+    total = 0
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        total += 4  # 角色与分隔符开销
+
+        content = message.get("content", "")
+        if isinstance(content, str):
+            total += await _count_text_tokens_with_fallback(content, model)
+        elif isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict):
+                    text = item.get("text")
+                    if isinstance(text, str):
+                        total += await _count_text_tokens_with_fallback(text, model)
+
+    return total
 
 
 @register_adapter
@@ -249,21 +295,24 @@ class ClaudeTokenCountAdapter(ApiAdapter):
             logger.error(f"Token count payload invalid: {e}")
             raise HTTPException(status_code=400, detail="Invalid token count payload") from e
 
-        token_counter = TokenCounter()
         total_tokens = 0
 
         if request.system:
             if isinstance(request.system, str):
-                total_tokens += token_counter.count_tokens(request.system, request.model)
+                total_tokens += await _count_text_tokens_with_fallback(
+                    request.system, request.model
+                )
             elif isinstance(request.system, list):
                 for block in request.system:
                     if hasattr(block, "text"):
-                        total_tokens += token_counter.count_tokens(block.text, request.model)
+                        total_tokens += await _count_text_tokens_with_fallback(
+                            block.text, request.model
+                        )
 
         messages_dict = [
             msg.model_dump() if hasattr(msg, "model_dump") else msg for msg in request.messages
         ]
-        total_tokens += token_counter.count_messages_tokens(messages_dict, request.model)
+        total_tokens += await _count_messages_tokens_with_fallback(messages_dict, request.model)
 
         context.add_audit_metadata(
             action="claude_token_count",

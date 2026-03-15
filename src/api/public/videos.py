@@ -9,13 +9,13 @@ from typing import Any
 from fastapi import APIRouter, Depends, Request
 from sqlalchemy.orm import Session
 
-from src.api.base.pipeline import ApiRequestPipeline
+from src.api.base.pipeline import get_pipeline
 from src.api.handlers.gemini.video_adapter import GeminiVeoAdapter
 from src.api.handlers.openai.video_adapter import OpenAIVideoAdapter
 from src.database import get_db
 
 router = APIRouter(tags=["Video Generation"])
-pipeline = ApiRequestPipeline()
+pipeline = get_pipeline()
 
 
 # -------------------- OpenAI Sora compatible --------------------

@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 
 from src.api.base.admin_adapter import AdminApiAdapter
 from src.api.base.context import ApiRequestContext
-from src.api.base.pipeline import ApiRequestPipeline
+from src.api.base.pipeline import get_pipeline
 from src.core.exceptions import InvalidRequestException, NotFoundException
 from src.database import get_db
 from src.models.database import BillingRule, DimensionCollector
@@ -27,7 +27,7 @@ from src.services.billing.formula_engine import SafeExpressionEvaluator, UnsafeE
 from src.services.billing.presets import BillingPresetService, PresetApplyMode, list_preset_packs
 
 router = APIRouter(prefix="/api/admin/billing", tags=["Admin - Billing"])
-pipeline = ApiRequestPipeline()
+pipeline = get_pipeline()
 _expr_validator = SafeExpressionEvaluator()
 
 

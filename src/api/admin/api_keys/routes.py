@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 from zoneinfo import ZoneInfo
@@ -17,18 +16,18 @@ from sqlalchemy.orm import Session
 
 from src.api.base.admin_adapter import AdminApiAdapter
 from src.api.base.context import ApiRequestContext
-from src.api.base.pipeline import ApiRequestPipeline
+from src.api.base.pipeline import get_pipeline
+from src.config import config
 from src.core.exceptions import InvalidRequestException, NotFoundException
 from src.core.logger import logger
 from src.database import get_db, get_db_context
 from src.models.api import CreateApiKeyRequest
-from src.models.database import ApiKey, Wallet
+from src.models.database import ApiKey, Usage, Wallet
 from src.services.user.apikey import ApiKeyService
 from src.services.user.bulk_cleanup import pre_clean_api_key
 from src.services.wallet import WalletService
 
-# 应用时区配置，默认为 Asia/Shanghai
-APP_TIMEZONE = ZoneInfo(os.getenv("APP_TIMEZONE", "Asia/Shanghai"))
+APP_TIMEZONE = ZoneInfo(config.app_timezone)
 
 
 def parse_expiry_date(date_str: str | None) -> datetime | None:
@@ -68,10 +67,12 @@ def parse_expiry_date(date_str: str | None) -> datetime | None:
 
 
 router = APIRouter(prefix="/api/admin/api-keys", tags=["Admin - API Keys (Standalone)"])
-pipeline = ApiRequestPipeline()
+pipeline = get_pipeline()
 
 
-def _serialize_standalone_key_item(api_key: ApiKey) -> dict[str, Any]:
+def _serialize_standalone_key_item(
+    api_key: ApiKey, *, total_tokens: int | None = None
+) -> dict[str, Any]:
     return {
         "id": api_key.id,
         "user_id": api_key.user_id,
@@ -80,6 +81,7 @@ def _serialize_standalone_key_item(api_key: ApiKey) -> dict[str, Any]:
         "is_active": api_key.is_active,
         "is_standalone": api_key.is_standalone,
         "total_requests": api_key.total_requests,
+        "total_tokens": int(total_tokens or 0),
         "total_cost_usd": float(api_key.total_cost_usd or 0),
         "rate_limit": api_key.rate_limit,
         "allowed_providers": api_key.allowed_providers,
@@ -117,8 +119,27 @@ def _list_standalone_api_keys_sync(
             for api_key in api_keys:
                 db.refresh(api_key)
 
+        token_map: dict[str, int] = {}
+        if api_keys:
+            stats_rows = (
+                db.query(
+                    Usage.api_key_id,
+                    func.sum(Usage.total_tokens).label("total_tokens"),
+                )
+                .filter(Usage.api_key_id.in_([api_key.id for api_key in api_keys]))
+                .group_by(Usage.api_key_id)
+                .all()
+            )
+            token_map = {row.api_key_id: int(row.total_tokens or 0) for row in stats_rows}
+
         return {
-            "api_keys": [_serialize_standalone_key_item(api_key) for api_key in api_keys],
+            "api_keys": [
+                _serialize_standalone_key_item(
+                    api_key,
+                    total_tokens=token_map.get(api_key.id, 0),
+                )
+                for api_key in api_keys
+            ],
             "total": total,
             "limit": limit,
             "skip": skip,
@@ -386,7 +407,7 @@ async def create_standalone_api_key(
     - `allowed_providers`: 可选，允许使用的提供商列表
     - `allowed_api_formats`: 可选，允许使用的 API 格式列表
     - `allowed_models`: 可选，允许使用的模型列表
-    - `rate_limit`: 可选，速率限制配置（请求数/秒）
+    - `rate_limit`: 可选，每分钟请求限制（null 表示跟随系统默认，0 表示不限制）
     - `expire_days`: 可选，过期天数（与 expires_at 二选一）
     - `expires_at`: 可选，过期时间（ISO 格式或 YYYY-MM-DD 格式，优先级高于 expire_days）
     - `auto_delete_on_expiry`: 可选，过期后是否自动删除
@@ -422,7 +443,7 @@ async def update_api_key(
     **请求体字段**:
     - `name`: 可选，API Key 的名称
     - `unlimited_balance`: 可选，是否无限余额（true=无限，false=有限，不修改余额数值）
-    - `rate_limit`: 可选，速率限制配置（null 表示无限制）
+    - `rate_limit`: 可选，每分钟请求限制（null 表示跟随系统默认，0 表示不限制）
     - `allowed_providers`: 可选，允许使用的提供商列表
     - `allowed_api_formats`: 可选，允许使用的 API 格式列表
     - `allowed_models`: 可选，允许使用的模型列表
@@ -684,6 +705,14 @@ class AdminGetKeyDetailAdapter(AdminApiAdapter):
             "is_active": api_key.is_active,
             "is_standalone": api_key.is_standalone,
             "total_requests": api_key.total_requests,
+            "total_tokens": int(
+                (
+                    db.query(func.sum(Usage.total_tokens))
+                    .filter(Usage.api_key_id == api_key.id)
+                    .scalar()
+                )
+                or 0
+            ),
             "total_cost_usd": float(api_key.total_cost_usd or 0),
             "rate_limit": api_key.rate_limit,
             "allowed_providers": api_key.allowed_providers,

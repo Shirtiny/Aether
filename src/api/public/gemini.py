@@ -15,13 +15,11 @@ from typing import Any
 from fastapi import APIRouter, Depends, Request
 from sqlalchemy.orm import Session
 
-from src.api.base.pipeline import ApiRequestPipeline
-from src.api.handlers.gemini import build_gemini_adapter
-from src.api.handlers.gemini_cli import build_gemini_cli_adapter
+from src.api.base.pipeline import get_pipeline
 from src.database import get_db
 
 router = APIRouter(tags=["Gemini API"])
-pipeline = ApiRequestPipeline()
+pipeline = get_pipeline()
 
 
 def _is_cli_request(request: Request) -> bool:
@@ -44,6 +42,18 @@ def _is_cli_request(request: Request) -> bool:
         return True
 
     return False
+
+
+def _build_adapter_for_request(request: Request) -> Any:
+    """按请求类型懒加载 Gemini 适配器，降低模块导入开销。"""
+    if _is_cli_request(request):
+        from src.api.handlers.gemini_cli import build_gemini_cli_adapter
+
+        return build_gemini_cli_adapter()
+
+    from src.api.handlers.gemini import build_gemini_adapter
+
+    return build_gemini_adapter()
 
 
 @router.post("/v1beta/models/{model}:generateContent")
@@ -72,10 +82,7 @@ async def generate_content(
     - `model`: 模型名称，如 gemini-2.0-flash
     """
     # 根据 user-agent 或 x-app header 选择适配器
-    if _is_cli_request(http_request):
-        adapter = build_gemini_cli_adapter()
-    else:
-        adapter = build_gemini_adapter()
+    adapter = _build_adapter_for_request(http_request)
 
     return await pipeline.run(
         adapter=adapter,
@@ -109,10 +116,7 @@ async def stream_generate_content(
     注意: Gemini API 通过 URL 端点区分流式/非流式，不需要在请求体中添加 stream 字段
     """
     # 根据 user-agent 或 x-app header 选择适配器
-    if _is_cli_request(http_request):
-        adapter = build_gemini_cli_adapter()
-    else:
-        adapter = build_gemini_adapter()
+    adapter = _build_adapter_for_request(http_request)
 
     return await pipeline.run(
         adapter=adapter,

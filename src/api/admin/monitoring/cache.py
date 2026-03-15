@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 from src.api.base.admin_adapter import AdminApiAdapter
 from src.api.base.context import ApiRequestContext
 from src.api.base.pagination import build_pagination_payload, paginate_sequence
-from src.api.base.pipeline import ApiRequestPipeline
+from src.api.base.pipeline import get_pipeline
 from src.clients.redis_client import get_redis_client_sync
 from src.core.crypto import crypto_service
 from src.core.logger import logger
@@ -28,7 +28,7 @@ from src.services.scheduling.aware_scheduler import CacheAwareScheduler, get_cac
 from src.services.system.config import SystemConfigService
 
 router = APIRouter(prefix="/api/admin/monitoring/cache", tags=["Admin - Monitoring: Cache"])
-pipeline = ApiRequestPipeline()
+pipeline = get_pipeline()
 REDIS_SCAN_BATCH_SIZE = 200
 REDIS_DELETE_BATCH_SIZE = 500
 

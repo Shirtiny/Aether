@@ -15,7 +15,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from src.api.base.context import ApiRequestContext
-from src.api.base.pipeline import ApiRequestPipeline
+from src.api.base.pipeline import get_pipeline
 from src.api.dashboard.routes import DashboardAdapter
 from src.clients.http_client import HTTPClientPool
 from src.config.constants import CacheTTL
@@ -27,7 +27,7 @@ from src.models.database import Provider, ProviderAPIKey, ProviderEndpoint, User
 from src.utils.cache_decorator import cache_result
 
 router = APIRouter(prefix="/api/admin/video-tasks", tags=["Admin - Video Tasks"])
-pipeline = ApiRequestPipeline()
+pipeline = get_pipeline()
 
 
 @router.get("")

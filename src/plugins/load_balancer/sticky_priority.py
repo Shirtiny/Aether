@@ -16,7 +16,7 @@ WARNING: 多进程环境注意事项
 3. 使用独立的健康检查服务：所有 worker 共享同一个健康状态源
 
 目前项目已有 Redis 依赖，建议在高可用场景下将状态迁移到 Redis。
-参考：src/services/health_monitor.py 中的实现
+参考：src/services/health/monitor.py 中的实现
 """
 
 from __future__ import annotations

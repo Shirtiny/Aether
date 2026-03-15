@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 
 from src.api.base.admin_adapter import AdminApiAdapter
 from src.api.base.context import ApiRequestContext
-from src.api.base.pipeline import ApiRequestPipeline
+from src.api.base.pipeline import get_pipeline
 from src.core.enums import ProviderBillingType
 from src.core.exceptions import InvalidRequestException, translate_pydantic_error
 from src.core.logger import logger
@@ -24,7 +24,7 @@ from src.models.database import Provider
 from src.models.database_extensions import ProviderUsageTracking
 
 router = APIRouter(prefix="/api/admin/provider-strategy", tags=["Provider Strategy"])
-pipeline = ApiRequestPipeline()
+pipeline = get_pipeline()
 
 
 class ProviderBillingUpdate(BaseModel):

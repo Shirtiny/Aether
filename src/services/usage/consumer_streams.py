@@ -7,7 +7,6 @@ Usage Redis Streams consumer.
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import socket
 import time
@@ -20,7 +19,7 @@ from redis.exceptions import TimeoutError as RedisTimeoutError
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from src.clients.redis_client import get_redis_client
+from src.clients.redis_client import get_usage_queue_redis_client as get_redis_client
 from src.config.settings import config
 from src.core.logger import logger
 from src.database.database import create_session
@@ -34,19 +33,7 @@ def _consumer_name() -> str:
 
 
 def _parse_body(value: Any) -> Any:
-    """将 JSON 字符串 body 反序列化为 dict，否则原样返回。
-
-    QueueTelemetryWriter 会将 body 序列化为 JSON 字符串以便传输，
-    消费者需要将其反序列化回 dict 以正确存入 JSON 列。
-    """
-    if value is None or isinstance(value, dict):
-        return value
-    if isinstance(value, str):
-        try:
-            return json.loads(value)
-        except (json.JSONDecodeError, TypeError):
-            # 解析失败，保留原字符串（可能已被截断）
-            return value
+    """消费者阶段保留原始 body，反序列化延迟到写库阶段。"""
     return value
 
 
@@ -115,7 +102,7 @@ async def ensure_usage_stream_group() -> None:
             id="0-0",
             mkstream=True,
         )
-        logger.info(f"[usage-queue] Created consumer group {config.usage_queue_stream_group}")
+        logger.info("[usage-queue] Created consumer group {}", config.usage_queue_stream_group)
     except ResponseError as exc:
         if "BUSYGROUP" in str(exc):
             return
@@ -160,7 +147,7 @@ class UsageQueueConsumer:
             return
         self._running = True
         self._task = asyncio.create_task(self._run(), name="usage-queue-consumer")
-        logger.info(f"[usage-queue] Consumer started: {self._consumer}")
+        logger.info("[usage-queue] Consumer started: {}", self._consumer)
 
     async def stop(self) -> None:
         if not self._running:
@@ -172,7 +159,7 @@ class UsageQueueConsumer:
                 await self._task
             except asyncio.CancelledError:
                 pass
-        logger.info(f"[usage-queue] Consumer stopped: {self._consumer}")
+        logger.info("[usage-queue] Consumer stopped: {}", self._consumer)
 
     async def _run(self) -> None:
         while self._running:
@@ -188,10 +175,10 @@ class UsageQueueConsumer:
             except asyncio.CancelledError:
                 break
             except (RedisTimeoutError, RedisConnectionError) as exc:
-                logger.warning(f"[usage-queue] Redis connection issue: {exc}")
+                logger.warning("[usage-queue] Redis connection issue: {}", exc)
                 await asyncio.sleep(1)
             except Exception as exc:
-                logger.exception(f"[usage-queue] Consumer loop error: {exc}")
+                logger.exception("[usage-queue] Consumer loop error: {}", exc)
                 await asyncio.sleep(1)
 
     async def _maybe_claim_pending(self, redis_client: Any) -> None:
@@ -209,7 +196,7 @@ class UsageQueueConsumer:
                 count=self._batch_size,
             )
         except ResponseError as exc:
-            logger.warning(f"[usage-queue] XAUTOCLAIM failed: {exc}")
+            logger.warning("[usage-queue] XAUTOCLAIM failed: {}", exc)
             return
         if not result:
             return
@@ -315,12 +302,12 @@ class UsageQueueConsumer:
                 pipe.xack(self._stream_key, self._stream_group, message_id)
             await pipe.execute()
 
-            logger.debug(f"[usage-queue] Batch processed {len(records)} records")
+            logger.debug("[usage-queue] Batch processed {} records", len(records))
 
         except Exception as exc:
             # 批量处理失败，回退到逐条处理（复用已创建的 db session）
             logger.warning(
-                f"[usage-queue] Batch processing failed, falling back to individual: {exc}"
+                "[usage-queue] Batch processing failed, falling back to individual: {}", exc
             )
             try:
                 db.rollback()  # 清理批量失败的事务状态
@@ -339,7 +326,7 @@ class UsageQueueConsumer:
                         pass
                     if self._is_duplicate_key_error(ie):
                         logger.debug(
-                            f"[usage-queue] Duplicate request_id, skipping: {event.request_id}"
+                            "[usage-queue] Duplicate request_id, skipping: {}", event.request_id
                         )
                         success_ids.append(message_id)
                     else:
@@ -381,13 +368,16 @@ class UsageQueueConsumer:
                     await redis_client.xadd(self._dlq_key, dlq_fields)
                 await redis_client.xack(self._stream_key, self._stream_group, message_id)
                 logger.error(
-                    f"[usage-queue] Message moved to DLQ after {retries} attempts: {message_id}"
+                    "[usage-queue] Message moved to DLQ after {} attempts: {}", retries, message_id
                 )
             except Exception as exc:
-                logger.error(f"[usage-queue] Failed to move message to DLQ: {exc}")
+                logger.error("[usage-queue] Failed to move message to DLQ: {}", exc)
         else:
             logger.warning(
-                f"[usage-queue] Processing failed (attempt {retries}): {message_id} error={error}"
+                "[usage-queue] Processing failed (attempt {}): {} error={}",
+                retries,
+                message_id,
+                error,
             )
 
     async def _get_delivery_count(self, redis_client: Any, message_id: str) -> int:
@@ -531,9 +521,9 @@ class UsageQueueConsumer:
                     break
             # lag=未读消息数, pending=已读但未ACK的消息数
             if lag > 0 or pending_count > 0:
-                logger.info(f"[usage-queue] lag={lag} pending={pending_count}")
+                logger.info("[usage-queue] lag={} pending={}", lag, pending_count)
         except Exception as exc:
-            logger.debug(f"[usage-queue] metrics log failed: {exc}")
+            logger.debug("[usage-queue] metrics log failed: {}", exc)
 
 
 _consumer_instance: UsageQueueConsumer | None = None

@@ -5,13 +5,11 @@ import uuid
 import pytest
 
 from src.core.exceptions import ConcurrencyLimitError
-from src.services.provider.adapters.claude_code.constants import TLS_PROFILE_CLAUDE_CODE
 from src.services.provider.adapters.claude_code.context import (
     ClaudeCodeRequestContext,
     build_and_set_claude_code_request_context,
     build_claude_code_request_context,
     get_claude_code_request_context,
-    resolve_claude_code_tls_profile,
     set_claude_code_request_context,
 )
 from src.services.provider.adapters.claude_code.envelope import claude_code_envelope
@@ -35,7 +33,6 @@ def test_build_context_reads_claude_code_advanced_from_provider_config() -> None
             "claude_code_advanced": {
                 "max_sessions": 3,
                 "session_idle_timeout_minutes": 7,
-                "enable_tls_fingerprint": True,
                 "session_id_masking_enabled": True,
             }
         },
@@ -47,26 +44,23 @@ def test_build_context_reads_claude_code_advanced_from_provider_config() -> None
     assert ctx.key_id == "key-123"
     assert ctx.max_sessions == 3
     assert ctx.session_idle_timeout_minutes == 7
-    assert ctx.enable_tls_fingerprint is True
     assert ctx.session_id_masking_enabled is True
 
 
-def test_build_and_set_context_returns_tls_profile_when_enabled() -> None:
-    ctx, tls_profile = build_and_set_claude_code_request_context(
-        provider_config={"claude_code_advanced": {"enable_tls_fingerprint": True}},
+def test_build_and_set_context_stores_context_in_contextvar() -> None:
+    ctx = build_and_set_claude_code_request_context(
+        provider_config={},
         key_id="key-tls",
         is_stream=True,
     )
 
     assert ctx.key_id == "key-tls"
     assert get_claude_code_request_context() == ctx
-    assert tls_profile == TLS_PROFILE_CLAUDE_CODE
-    assert resolve_claude_code_tls_profile(ctx) == TLS_PROFILE_CLAUDE_CODE
 
 
 def test_get_ssl_context_for_claude_code_profile_is_cached() -> None:
-    first = get_ssl_context_for_profile(TLS_PROFILE_CLAUDE_CODE)
-    second = get_ssl_context_for_profile(TLS_PROFILE_CLAUDE_CODE)
+    first = get_ssl_context_for_profile("claude_code_nodejs")
+    second = get_ssl_context_for_profile("claude_code_nodejs")
 
     assert first is second
 

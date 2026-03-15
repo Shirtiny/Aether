@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session, joinedload
 
 from src.api.base.admin_adapter import AdminApiAdapter
 from src.api.base.context import ApiRequestContext
-from src.api.base.pipeline import ApiRequestPipeline
+from src.api.base.pipeline import get_pipeline
 from src.api.serializers import (
     serialize_admin_wallet,
     serialize_admin_wallet_refund,
@@ -24,7 +24,7 @@ from src.models.database import RefundRequest, Wallet, WalletTransaction
 from src.services.wallet import WalletService
 
 router = APIRouter(prefix="/api/admin/wallets", tags=["Admin - Wallets"])
-pipeline = ApiRequestPipeline()
+pipeline = get_pipeline()
 
 
 class ManualRechargePayload(BaseModel):

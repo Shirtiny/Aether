@@ -12,14 +12,14 @@ from sqlalchemy.orm import Session
 
 from src.api.base.admin_adapter import AdminApiAdapter
 from src.api.base.context import ApiRequestContext
-from src.api.base.pipeline import ApiRequestPipeline
+from src.api.base.pipeline import get_pipeline
 from src.core.exceptions import NotFoundException
 from src.database import get_db
 from src.models.database import AuditEventType, ManagementToken, User
 from src.services.management_token import ManagementTokenService, token_to_dict
 
 router = APIRouter(prefix="/api/admin/management-tokens", tags=["Admin - Management Tokens"])
-pipeline = ApiRequestPipeline()
+pipeline = get_pipeline()
 
 
 # ============== 安全基类 ==============

@@ -16,10 +16,16 @@
               请求数
             </TableHead>
             <TableHead class="h-8 px-2 text-right">
-              Tokens
+              <div class="flex flex-col text-xs gap-0.5 whitespace-nowrap">
+                <span>输入/输出</span>
+                <span class="text-muted-foreground font-normal">缓存</span>
+              </div>
             </TableHead>
             <TableHead class="h-8 px-2 text-right">
               费用
+            </TableHead>
+            <TableHead class="h-8 px-2 text-right">
+              命中率
             </TableHead>
             <TableHead class="h-8 px-2 text-right">
               效率
@@ -29,7 +35,7 @@
         <TableBody>
           <TableRow v-if="data.length === 0">
             <TableCell
-              :colspan="5"
+              :colspan="6"
               class="text-center py-6 text-muted-foreground px-2"
             >
               暂无模型统计数据
@@ -46,7 +52,10 @@
               {{ model.request_count }}
             </TableCell>
             <TableCell class="text-right py-2 px-2">
-              <span>{{ formatTokens(model.total_tokens) }}</span>
+              <div class="flex flex-col items-end text-xs gap-0.5 whitespace-nowrap">
+                <span>{{ formatTokens(model.total_input_context || 0) }} / {{ formatTokens(model.output_tokens || 0) }}</span>
+                <span class="text-muted-foreground">{{ formatTokens(model.cache_read_tokens || 0) }}</span>
+              </div>
             </TableCell>
             <TableCell class="text-right py-2 px-2">
               <div class="flex flex-col items-end text-xs gap-0.5">
@@ -58,6 +67,9 @@
                   {{ formatCurrency(model.actual_cost) }}
                 </span>
               </div>
+            </TableCell>
+            <TableCell class="text-right py-2 px-2">
+              <span>{{ formatHitRate(model.cache_hit_rate) }}</span>
             </TableCell>
             <TableCell class="text-right text-muted-foreground py-2 px-2">
               {{ model.costPerToken }}
@@ -77,7 +89,7 @@ import TableBody from '@/components/ui/table-body.vue'
 import TableRow from '@/components/ui/table-row.vue'
 import TableHead from '@/components/ui/table-head.vue'
 import TableCell from '@/components/ui/table-cell.vue'
-import { formatTokens, formatCurrency } from '@/utils/format'
+import { formatTokens, formatCurrency, formatHitRate } from '@/utils/format'
 import type { EnhancedModelStatsItem } from '../types'
 
 defineProps<{

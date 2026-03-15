@@ -8,7 +8,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import time
 from typing import TYPE_CHECKING
 
@@ -41,17 +40,21 @@ class PluginMiddleware:
     - 纯 ASGI 可以直接透传流式响应，无额外开销
     """
 
+    _NOTIFICATION_CACHE_TTL = 30.0  # 通知模块开关缓存 TTL (秒)
+
     def __init__(self, app: ASGIApp) -> None:
         self.app = app
         self.plugin_manager = get_plugin_manager()
+        self._notification_enabled_cache: bool | None = None
+        self._notification_cache_expires: float = 0.0
 
         # 从配置读取速率限制值
-        self.llm_api_rate_limit = config.llm_api_rate_limit
         self.public_api_rate_limit = config.public_api_rate_limit
 
         # 完全跳过限流的路径（静态资源、文档等）
         self.skip_rate_limit_paths = [
             "/health",
+            "/readyz",
             "/docs",
             "/redoc",
             "/openapi.json",
@@ -62,14 +65,6 @@ class PluginMiddleware:
             "/api/auth/",  # 认证端点（由路由层的 IPRateLimiter 处理）
             "/api/users/",  # 用户端点
             "/api/monitoring/",  # 监控端点
-        ]
-
-        # LLM API 端点（需要特殊的速率限制策略）
-        self.llm_api_paths = [
-            "/v1/messages",
-            "/v1/chat/completions",
-            "/v1/responses",
-            "/v1/completions",
         ]
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -286,13 +281,6 @@ class PluginMiddleware:
 
         return "unknown"
 
-    def _is_llm_api_path(self, path: str) -> bool:
-        """检查是否为 LLM API 端点"""
-        for llm_path in self.llm_api_paths:
-            if path.startswith(llm_path):
-                return True
-        return False
-
     async def _get_rate_limit_key_and_config(
         self, request: Request
     ) -> tuple[str | None, int | None]:
@@ -300,7 +288,6 @@ class PluginMiddleware:
         获取速率限制的key和配置
 
         策略说明:
-        - /v1/messages, /v1/chat/completions 等 LLM API: 按 API Key 限流
         - /api/public/* 端点: 使用服务器级别 IP 限制
         - /api/admin/* 端点: 跳过（在 skip_rate_limit_paths 中跳过）
         - /api/auth/* 端点: 跳过（由路由层的 IPRateLimiter 处理）
@@ -309,30 +296,6 @@ class PluginMiddleware:
             (key, rate_limit_value) - key用于标识限制对象，rate_limit_value是限制值
         """
         path = request.url.path
-
-        # LLM API 端点: 按 API Key 或 IP 限流
-        if self._is_llm_api_path(path):
-            # 尝试从请求头获取 API Key
-            auth_header = request.headers.get("authorization", "")
-            api_key = request.headers.get("x-api-key", "")
-
-            if auth_header.lower().startswith("bearer "):
-                api_key = auth_header[7:]
-
-            if api_key:
-                # 使用 API Key 的哈希作为限制 key（避免日志泄露完整 key）
-                key_hash = hashlib.sha256(api_key.encode()).hexdigest()[:16]
-                key = f"llm_api_key:{key_hash}"
-                request.state.rate_limit_key_type = "api_key"
-            else:
-                # 无 API Key 时使用 IP 限制（更严格）
-                client_ip = self._get_client_ip(request)
-                key = f"llm_ip:{client_ip}"
-                request.state.rate_limit_key_type = "ip"
-
-            rate_limit = self.llm_api_rate_limit
-            request.state.rate_limit_value = rate_limit
-            return key, rate_limit
 
         # /api/public/* 端点: 使用服务器级别 IP 地址作为限制 key
         if path.startswith("/api/public/"):
@@ -465,6 +428,36 @@ class PluginMiddleware:
             except Exception as e:
                 logger.error(f"Monitor plugin failed: {e}")
 
+    async def _is_notification_email_module_enabled(self, request: Request) -> bool:
+        """检查通知邮件模块是否启用（带内存缓存，避免 5xx 雪崩时放大 DB 压力）。"""
+        now = time.time()
+        if self._notification_enabled_cache is not None and now < self._notification_cache_expires:
+            return self._notification_enabled_cache
+
+        from sqlalchemy.orm import Session
+
+        from src.database import create_session
+        from src.services.system.config import SystemConfigService
+
+        config_key = "module.notification_email.enabled"
+        try:
+            request_db = getattr(request.state, "db", None)
+            if isinstance(request_db, Session):
+                result = bool(SystemConfigService.get_config(request_db, config_key, default=False))
+            else:
+                db = create_session()
+                try:
+                    result = bool(SystemConfigService.get_config(db, config_key, default=False))
+                finally:
+                    db.close()
+        except Exception as e:
+            logger.warning("读取通知邮件模块开关失败: {}", e)
+            return False
+
+        self._notification_enabled_cache = result
+        self._notification_cache_expires = now + self._NOTIFICATION_CACHE_TTL
+        return result
+
     async def _call_error_plugins(
         self, request: Request, error: Exception, start_time: float
     ) -> None:
@@ -475,6 +468,9 @@ class PluginMiddleware:
 
         # 通知插件 - 发送严重错误通知
         if not isinstance(error, HTTPException) or error.status_code >= 500:
+            if not await self._is_notification_email_module_enabled(request):
+                return
+
             notification_plugin = self.plugin_manager.get_plugin("notification")
             if notification_plugin and notification_plugin.enabled:
                 try:

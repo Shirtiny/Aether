@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from src.api.base.admin_adapter import AdminApiAdapter
 from src.api.base.context import ApiRequestContext
-from src.api.base.pipeline import ApiRequestPipeline
+from src.api.base.pipeline import get_pipeline
 from src.core.crypto import crypto_service
 from src.core.enums import AuthSource
 from src.core.exceptions import InvalidRequestException, translate_pydantic_error
@@ -21,7 +21,7 @@ from src.models.database import AuditEventType, LDAPConfig, User, UserRole
 from src.services.system.audit import AuditService
 
 router = APIRouter(prefix="/api/admin/ldap", tags=["Admin - LDAP"])
-pipeline = ApiRequestPipeline()
+pipeline = get_pipeline()
 
 # bcrypt 哈希格式正则：$2a$, $2b$, $2y$ + 2位cost + $ + 53字符(22位salt + 31位hash)
 BCRYPT_HASH_PATTERN = re.compile(r"^\$2[aby]\$\d{2}\$.{53}$")

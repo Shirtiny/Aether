@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 from src.api.base.adapter import ApiAdapter, ApiMode
 from src.api.base.authenticated_adapter import AuthenticatedApiAdapter
 from src.api.base.context import ApiRequestContext
-from src.api.base.pipeline import ApiRequestPipeline
+from src.api.base.pipeline import get_pipeline
 from src.core.exceptions import InvalidRequestException
 from src.core.logger import logger
 from src.core.validators import PasswordValidator
@@ -93,7 +93,7 @@ def validate_email_suffix(db: Session, email: str) -> tuple[bool, str | None]:
 
 router = APIRouter(prefix="/api/auth", tags=["Authentication"])
 security = HTTPBearer()
-pipeline = ApiRequestPipeline()
+pipeline = get_pipeline()
 
 
 # API端点

@@ -457,42 +457,41 @@ function confirmCustomInput(index: number) {
 }
 
 function updateCacheCreation(index: number, value: string | number) {
-  const numValue = parseFloatInput(value)
-  if (numValue > 0) {
-    cacheManuallySet[index] = { ...cacheManuallySet[index], creation: true }
-    localTiers.value[index].cache_creation_price_per_1m = numValue
-  } else {
+  if (value === '' || value === null || value === undefined) {
     // 清空时恢复自动计算
     cacheManuallySet[index] = { ...cacheManuallySet[index], creation: false }
     localTiers.value[index].cache_creation_price_per_1m = undefined
+  } else {
+    const numValue = parseFloatInput(value)
+    cacheManuallySet[index] = { ...cacheManuallySet[index], creation: true }
+    localTiers.value[index].cache_creation_price_per_1m = numValue
   }
   syncToParent()
 }
 
 function updateCacheRead(index: number, value: string | number) {
-  const numValue = parseFloatInput(value)
-  if (numValue > 0) {
-    cacheManuallySet[index] = { ...cacheManuallySet[index], read: true }
-    localTiers.value[index].cache_read_price_per_1m = numValue
-  } else {
+  if (value === '' || value === null || value === undefined) {
     // 清空时恢复自动计算
     cacheManuallySet[index] = { ...cacheManuallySet[index], read: false }
     localTiers.value[index].cache_read_price_per_1m = undefined
+  } else {
+    const numValue = parseFloatInput(value)
+    cacheManuallySet[index] = { ...cacheManuallySet[index], read: true }
+    localTiers.value[index].cache_read_price_per_1m = numValue
   }
   syncToParent()
 }
 
 function updateCache1h(index: number, value: string | number) {
-  const numValue = parseFloatInput(value)
   const tier = localTiers.value[index]
-  if (numValue > 0) {
-    // 手动设置 1 小时缓存创建价格
-    cacheManuallySet[index] = { ...cacheManuallySet[index], cache1h: true }
-    tier.cache_ttl_pricing = [{ ttl_minutes: 60, cache_creation_price_per_1m: numValue }]
-  } else {
+  if (value === '' || value === null || value === undefined) {
     // 清空时恢复自动计算
     cacheManuallySet[index] = { ...cacheManuallySet[index], cache1h: false }
     tier.cache_ttl_pricing = undefined
+  } else {
+    const numValue = parseFloatInput(value)
+    cacheManuallySet[index] = { ...cacheManuallySet[index], cache1h: true }
+    tier.cache_ttl_pricing = [{ ttl_minutes: 60, cache_creation_price_per_1m: numValue }]
   }
   syncToParent()
 }

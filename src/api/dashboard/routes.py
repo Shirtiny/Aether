@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 from src.api.base.adapter import ApiAdapter, ApiMode
 from src.api.base.admin_adapter import AdminApiAdapter
 from src.api.base.context import ApiRequestContext
-from src.api.base.pipeline import ApiRequestPipeline
+from src.api.base.pipeline import get_pipeline
 from src.config.constants import CacheTTL
 from src.core.enums import UserRole
 from src.database import get_db
@@ -37,7 +37,7 @@ from src.services.wallet import WalletService
 from src.utils.cache_decorator import cache_result
 
 router = APIRouter(prefix="/api/dashboard", tags=["Dashboard"])
-pipeline = ApiRequestPipeline()
+pipeline = get_pipeline()
 
 
 def format_tokens(num: int) -> str:
@@ -375,7 +375,9 @@ class AdminDashboardStatsAdapter(AdminApiAdapter):
             total_requests = int(monthly_stats.total_requests or 0) + requests_today
             error_requests = int(monthly_stats.error_requests or 0) + today_stats["error_requests"]
             total_cost = float(monthly_stats.total_cost or 0) + float(cost_today)
-            total_actual_cost = float(monthly_stats.actual_total_cost or 0) + float(actual_cost_today)
+            total_actual_cost = float(monthly_stats.actual_total_cost or 0) + float(
+                actual_cost_today
+            )
             total_tokens = int(monthly_stats.total_tokens or 0) + tokens_today
             cache_creation_tokens = (
                 int(monthly_stats.cache_creation_tokens or 0) + cache_creation_today
@@ -647,12 +649,12 @@ class UserDashboardStatsAdapter(DashboardAdapter):
     async def handle(self, context: ApiRequestContext) -> Any:  # type: ignore[override]
         from zoneinfo import ZoneInfo
 
-        from src.services.system.stats_aggregator import APP_TIMEZONE
+        from src.config import config
 
         db = context.db
         user = context.user
         # 使用业务时区计算日期，确保与用户感知的"今天"一致
-        app_tz = ZoneInfo(APP_TIMEZONE)
+        app_tz = ZoneInfo(config.app_timezone)
         now_local = datetime.now(app_tz)
         today_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
         # 转换为 UTC 用于数据库查询
@@ -1159,9 +1161,9 @@ class DashboardDailyStatsAdapter(DashboardAdapter):
         # 使用业务时区计算日期，确保每日统计与业务日期一致
         from zoneinfo import ZoneInfo
 
-        from src.services.system.stats_aggregator import APP_TIMEZONE
+        from src.config import config
 
-        app_tz = ZoneInfo(APP_TIMEZONE)
+        app_tz = ZoneInfo(config.app_timezone)
         now_local = datetime.now(app_tz)
         today_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
         # 转换为 UTC 用于数据库查询

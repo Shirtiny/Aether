@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session, joinedload
 
 from src.api.base.admin_adapter import AdminApiAdapter
 from src.api.base.context import ApiRequestContext
-from src.api.base.pipeline import ApiRequestPipeline
+from src.api.base.pipeline import get_pipeline
 from src.database import get_db
 from src.models.database import GlobalModel, Model
 from src.models.pydantic_models import (
@@ -24,7 +24,7 @@ from src.models.pydantic_models import (
 )
 
 router = APIRouter(prefix="/catalog", tags=["Admin - Model Catalog"])
-pipeline = ApiRequestPipeline()
+pipeline = get_pipeline()
 
 
 @router.get("", response_model=ModelCatalogResponse)

@@ -88,6 +88,72 @@ def test_extract_reset_seconds_uses_codex_weekly_reset_for_codex_provider() -> N
     assert extract_reset_seconds(key_obj) == pytest.approx(1800.0)
 
 
+def test_extract_reset_seconds_prefers_codex_reset_at(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("src.services.provider.pool.dimensions._helpers.time.time", lambda: 1000.0)
+    key_obj = SimpleNamespace(
+        provider_type="codex",
+        upstream_metadata={
+            "codex": {
+                "primary_reset_at": 1200.0,
+                "primary_reset_seconds": 9999.0,
+            }
+        },
+    )
+
+    assert extract_reset_seconds(key_obj) == pytest.approx(200.0)
+
+
+def test_extract_reset_seconds_codex_fallback_corrects_elapsed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("src.services.provider.pool.dimensions._helpers.time.time", lambda: 2000.0)
+    key_obj = SimpleNamespace(
+        provider_type="codex",
+        upstream_metadata={
+            "codex": {
+                "primary_reset_seconds": 180.0,
+                "updated_at": 1900.0,
+            }
+        },
+    )
+
+    assert extract_reset_seconds(key_obj) == pytest.approx(80.0)
+
+
+def test_extract_reset_seconds_codex_fallback_clamps_to_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("src.services.provider.pool.dimensions._helpers.time.time", lambda: 2000.0)
+    key_obj = SimpleNamespace(
+        provider_type="codex",
+        upstream_metadata={
+            "codex": {
+                "primary_reset_seconds": 120.0,
+                "updated_at": 1500.0,
+            }
+        },
+    )
+
+    assert extract_reset_seconds(key_obj) == pytest.approx(0.0)
+
+
+def test_extract_reset_seconds_codex_fallback_future_updated_at_no_inflation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("src.services.provider.pool.dimensions._helpers.time.time", lambda: 2000.0)
+    key_obj = SimpleNamespace(
+        provider_type="codex",
+        upstream_metadata={
+            "codex": {
+                "primary_reset_seconds": 120.0,
+                "updated_at": 2600.0,
+            }
+        },
+    )
+
+    assert extract_reset_seconds(key_obj) == pytest.approx(120.0)
+
+
 def test_resolve_pool_account_state_keeps_codex_metadata_block() -> None:
     state = resolve_pool_account_state(
         provider_type="codex",

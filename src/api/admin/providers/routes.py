@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session, load_only
 from src.api.base.admin_adapter import AdminApiAdapter
 from src.api.base.context import ApiRequestContext
 from src.api.base.models_service import invalidate_models_list_cache
-from src.api.base.pipeline import ApiRequestPipeline
+from src.api.base.pipeline import get_pipeline
 from src.config.constants import CacheTTL
 from src.core.enums import ProviderBillingType
 from src.core.exceptions import InvalidRequestException, NotFoundException
@@ -35,7 +35,7 @@ from src.utils.cache_decorator import cache_result
 from .summary import _build_provider_summary
 
 router = APIRouter(tags=["Provider CRUD"])
-pipeline = ApiRequestPipeline()
+pipeline = get_pipeline()
 
 
 # 映射预览配置（管理后台功能，限制宽松）

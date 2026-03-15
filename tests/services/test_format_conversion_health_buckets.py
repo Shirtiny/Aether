@@ -57,11 +57,12 @@ async def test_executor_records_health_by_provider_format() -> None:
         patch("src.services.request.executor.RequestCandidateService.mark_candidate_started"),
         patch("src.services.request.executor.RequestCandidateService.mark_candidate_success"),
         patch("src.services.request.executor.get_adaptive_reservation_manager") as mock_res_mgr,
-        patch("src.services.request.executor.health_monitor.record_success") as record_success,
+        patch("src.services.request.executor.get_health_monitor") as mock_get_health_monitor,
     ):
         mock_res_mgr.return_value.calculate_reservation.return_value = MagicMock(
             ratio=0.0, phase="stable", confidence=1.0
         )
+        record_success = mock_get_health_monitor.return_value.record_success
 
         executor = RequestExecutor(
             db=db, concurrency_manager=concurrency_manager, adaptive_manager=adaptive_manager
@@ -100,8 +101,9 @@ async def test_error_classifier_records_failure_by_provider_format() -> None:
     key.id = "k1"
 
     with patch(
-        "src.services.orchestration.error_handler.health_monitor.record_failure"
-    ) as record_failure:
+        "src.services.orchestration.error_handler.get_health_monitor"
+    ) as mock_get_health_monitor:
+        record_failure = mock_get_health_monitor.return_value.record_failure
         await classifier.handle_retriable_error(
             error=RuntimeError("boom"),
             provider=provider,

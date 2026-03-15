@@ -15,14 +15,14 @@ from sqlalchemy.orm import Session
 
 from src.api.base.admin_adapter import AdminApiAdapter
 from src.api.base.context import ApiRequestContext
-from src.api.base.pipeline import ApiRequestPipeline
+from src.api.base.pipeline import get_pipeline
 from src.core.crypto import crypto_service
 from src.database import get_db
 from src.models.database import Provider, ProviderAPIKey, ProviderEndpoint
 from src.services.request.candidate import RequestCandidateService
 
 router = APIRouter(prefix="/api/admin/monitoring/trace", tags=["Admin - Monitoring: Trace"])
-pipeline = ApiRequestPipeline()
+pipeline = get_pipeline()
 
 
 class CandidateResponse(BaseModel):

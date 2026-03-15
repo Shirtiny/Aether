@@ -11,7 +11,7 @@ from src.services.system.maintenance_scheduler import (
     MaintenanceScheduler,
     get_maintenance_scheduler,
 )
-from src.services.system.scheduler import APP_TIMEZONE, TaskScheduler, get_scheduler
+from src.services.system.scheduler import TaskScheduler, get_scheduler
 from src.services.system.sync_stats import SyncStatsService
 
 __all__ = [
@@ -23,5 +23,4 @@ __all__ = [
     "SyncStatsService",
     "TaskScheduler",
     "get_scheduler",
-    "APP_TIMEZONE",
 ]

@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, Any
 
 from src.core.logger import logger
 from src.models.admin_requests import ClaudeCodeAdvancedConfig
-from src.services.provider.adapters.claude_code.constants import TLS_PROFILE_CLAUDE_CODE
 
 if TYPE_CHECKING:
     from src.services.provider.pool.config import PoolConfig
@@ -22,7 +21,6 @@ class ClaudeCodeRequestContext:
     key_id: str | None = None
     max_sessions: int | None = None
     session_idle_timeout_minutes: int = 5
-    enable_tls_fingerprint: bool = False
     session_id_masking_enabled: bool = False
     cache_ttl_override_enabled: bool = False
     cache_ttl_override_target: str = "ephemeral"
@@ -85,9 +83,6 @@ def build_claude_code_request_context(
         if advanced_config and advanced_config.session_idle_timeout_minutes is not None
         else 5
     )
-    enable_tls_fingerprint = (
-        bool(advanced_config.enable_tls_fingerprint) if advanced_config else False
-    )
     session_id_masking_enabled = (
         bool(advanced_config.session_id_masking_enabled) if advanced_config else False
     )
@@ -110,7 +105,6 @@ def build_claude_code_request_context(
         key_id=normalized_key_id,
         max_sessions=max_sessions,
         session_idle_timeout_minutes=idle_timeout_minutes,
-        enable_tls_fingerprint=enable_tls_fingerprint,
         session_id_masking_enabled=session_id_masking_enabled,
         cache_ttl_override_enabled=cache_ttl_override_enabled,
         cache_ttl_override_target=cache_ttl_override_target,
@@ -120,22 +114,14 @@ def build_claude_code_request_context(
     )
 
 
-def resolve_claude_code_tls_profile(
-    ctx: ClaudeCodeRequestContext | None,
-) -> str | None:
-    if ctx and ctx.enable_tls_fingerprint:
-        return TLS_PROFILE_CLAUDE_CODE
-    return None
-
-
 def build_and_set_claude_code_request_context(
     *,
     provider_config: Any,
     key_id: str | None,
     is_stream: bool,
     provider_id: str | None = None,
-) -> tuple[ClaudeCodeRequestContext, str | None]:
-    """构建并写入 Claude Code 上下文，同时返回对应 TLS profile。"""
+) -> ClaudeCodeRequestContext:
+    """构建并写入 Claude Code 上下文。"""
     ctx = build_claude_code_request_context(
         provider_config=provider_config,
         key_id=key_id,
@@ -143,7 +129,7 @@ def build_and_set_claude_code_request_context(
         provider_id=provider_id,
     )
     set_claude_code_request_context(ctx)
-    return ctx, resolve_claude_code_tls_profile(ctx)
+    return ctx
 
 
 __all__ = [
@@ -151,6 +137,5 @@ __all__ = [
     "build_claude_code_request_context",
     "ClaudeCodeRequestContext",
     "get_claude_code_request_context",
-    "resolve_claude_code_tls_profile",
     "set_claude_code_request_context",
 ]

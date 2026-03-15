@@ -10,7 +10,9 @@ provider-specific envelopes live in their own service modules.
 
 from __future__ import annotations
 
+import importlib
 import threading
+from collections.abc import Iterable
 from typing import Any, Protocol
 
 
@@ -117,7 +119,7 @@ def get_provider_envelope(
     endpoint_sig: str | None,
 ) -> ProviderEnvelope | None:
     """Return envelope hooks for the given provider_type + endpoint signature."""
-    ensure_providers_bootstrapped()
+    ensure_providers_bootstrapped(provider_types=[provider_type] if provider_type else None)
 
     from src.core.provider_types import normalize_provider_type
 
@@ -136,37 +138,111 @@ def get_provider_envelope(
 # ---------------------------------------------------------------------------
 # 所有 registry 共享同一个 bootstrap，首次访问任何 registry 时自动触发。
 # 不再依赖模块 import 顺序。
-_bootstrapped = False
 _bootstrap_lock = threading.Lock()
+_bootstrap_condition = threading.Condition(_bootstrap_lock)
+_bootstrap_in_progress = False
+_bootstrapped_provider_types: set[str] = set()
+_auto_detected_provider_types: frozenset[str] | None = None
+
+_PROVIDER_PLUGIN_MODULES: dict[str, str] = {
+    "antigravity": "src.services.provider.adapters.antigravity.plugin",
+    "claude_code": "src.services.provider.adapters.claude_code.plugin",
+    "codex": "src.services.provider.adapters.codex.plugin",
+    "gemini_cli": "src.services.provider.adapters.gemini_cli.plugin",
+    "kiro": "src.services.provider.adapters.kiro.plugin",
+    "vertex_ai": "src.services.provider.adapters.vertex_ai.plugin",
+}
 
 
-def ensure_providers_bootstrapped() -> None:
-    """确保所有 provider plugin 已注册（幂等，只执行一次）。"""
-    global _bootstrapped  # noqa: PLW0603
-    if _bootstrapped:
-        return
-    with _bootstrap_lock:
-        if _bootstrapped:
+def _normalize_bootstrap_targets(provider_types: Iterable[str] | None) -> set[str]:
+    from src.core.provider_types import normalize_provider_type
+
+    if provider_types is None:
+        return set()
+    if isinstance(provider_types, str):
+        provider_types = [provider_types]
+
+    targets: set[str] = set()
+    for raw in provider_types:
+        pt = normalize_provider_type(raw)
+        if pt in _PROVIDER_PLUGIN_MODULES:
+            targets.add(pt)
+    return targets
+
+
+def _discover_active_provider_types() -> set[str]:
+    """从数据库读取活跃 provider_type，用于按需 bootstrap。"""
+    from src.core.provider_types import normalize_provider_type
+    from src.database.database import create_session
+    from src.models.database import Provider
+
+    db = create_session()
+    try:
+        rows = (
+            db.query(Provider.provider_type).filter(Provider.is_active.is_(True)).distinct().all()
+        )
+    finally:
+        db.close()
+
+    discovered: set[str] = set()
+    for (raw_provider_type,) in rows:
+        pt = normalize_provider_type(raw_provider_type)
+        if pt in _PROVIDER_PLUGIN_MODULES:
+            discovered.add(pt)
+    return discovered
+
+
+def _bootstrap_provider_type(provider_type: str) -> None:
+    module_path = _PROVIDER_PLUGIN_MODULES[provider_type]
+    module = importlib.import_module(module_path)
+    register_all = getattr(module, "register_all", None)
+    if callable(register_all):
+        register_all()
+
+
+def ensure_providers_bootstrapped(provider_types: Iterable[str] | None = None) -> None:
+    """确保 provider plugins 已注册（幂等，支持按 provider_type 精准注册）。"""
+    global _auto_detected_provider_types, _bootstrap_in_progress  # noqa: PLW0603
+
+    targets = _normalize_bootstrap_targets(provider_types)
+
+    # DB 查询在锁外执行，避免慢查询阻塞其他线程的 bootstrap 操作。
+    need_discover = not targets and _auto_detected_provider_types is None
+    if need_discover:
+        try:
+            detected = _discover_active_provider_types()
+        except Exception:
+            detected = set()
+    else:
+        detected = set()
+
+    with _bootstrap_condition:
+        if not targets:
+            if _auto_detected_provider_types is None:
+                # 回退策略：DB 不可用/无记录时，保持原有全量 bootstrap 语义。
+                _auto_detected_provider_types = frozenset(
+                    detected if detected else _PROVIDER_PLUGIN_MODULES.keys()
+                )
+            targets = set(_auto_detected_provider_types)
+
+        while _bootstrap_in_progress:
+            _bootstrap_condition.wait()
+
+        missing = targets - _bootstrapped_provider_types
+        if not missing:
             return
-        _bootstrapped = True
+        _bootstrap_in_progress = True
 
-        from src.services.provider.adapters.antigravity.plugin import (
-            register_all as _reg_antigravity,
-        )
-        from src.services.provider.adapters.claude_code.plugin import (
-            register_all as _reg_claude_code,
-        )
-        from src.services.provider.adapters.codex.plugin import register_all as _reg_codex
-        from src.services.provider.adapters.gemini_cli.plugin import register_all as _reg_gemini_cli
-        from src.services.provider.adapters.kiro.plugin import register_all as _reg_kiro
-        from src.services.provider.adapters.vertex_ai.plugin import register_all as _reg_vertex_ai
-
-        _reg_antigravity()
-        _reg_claude_code()
-        _reg_codex()
-        _reg_gemini_cli()
-        _reg_kiro()
-        _reg_vertex_ai()
+    bootstrapped_now: set[str] = set()
+    try:
+        for pt in sorted(missing):
+            _bootstrap_provider_type(pt)
+            bootstrapped_now.add(pt)
+    finally:
+        with _bootstrap_condition:
+            _bootstrapped_provider_types.update(bootstrapped_now)
+            _bootstrap_in_progress = False
+            _bootstrap_condition.notify_all()
 
 
 __all__ = [

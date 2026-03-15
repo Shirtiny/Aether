@@ -197,7 +197,7 @@ def build_provider_url(
     # Provider transport hook: 如果有注册的 hook 则委托处理
     from src.services.provider.envelope import ensure_providers_bootstrapped
 
-    ensure_providers_bootstrapped()
+    ensure_providers_bootstrapped(provider_types=[provider_type] if provider_type else None)
     if provider_type and endpoint_sig:
         hook = _transport_hooks.get((provider_type, endpoint_sig))
         # Codex hook 仅在无 custom_path 时生效

@@ -144,6 +144,14 @@ class SystemConfigService:
             "value": 1000,
             "description": "每批次清理的记录数，避免单次操作过大影响数据库性能",
         },
+        "request_candidates_retention_days": {
+            "value": 30,
+            "description": "请求候选记录保留天数，超过此天数的 request_candidates 审计记录将被自动清理",
+        },
+        "request_candidates_cleanup_batch_size": {
+            "value": 5000,
+            "description": "请求候选记录每批次清理条数，使用独立批次控制大表删除压力",
+        },
         "enable_provider_checkin": {
             "value": True,
             "description": "是否启用 Provider 自动签到任务",

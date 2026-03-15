@@ -20,6 +20,8 @@ Design notes:
 from __future__ import annotations
 
 import asyncio
+import os
+from collections import OrderedDict
 from typing import Any
 
 import httpx
@@ -46,10 +48,21 @@ except ImportError:
 DEFAULT_IMPERSONATE = "chrome120"
 
 
+def _get_max_sessions() -> int:
+    raw = os.getenv("CURL_CFFI_MAX_SESSIONS", "20")
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("环境变量 CURL_CFFI_MAX_SESSIONS 非法: {}, 使用默认值 20", raw)
+        return 20
+    return max(1, value)
+
+
 # ---------------------------------------------------------------------------
 # Session pool (module-level, async-safe)
 # ---------------------------------------------------------------------------
-_session_pool: dict[str, AsyncSession] = {}
+_MAX_SESSIONS = _get_max_sessions()
+_session_pool: OrderedDict[str, AsyncSession] = OrderedDict()
 _pool_lock = asyncio.Lock()
 
 
@@ -63,9 +76,11 @@ async def _get_or_create_session(
 ) -> AsyncSession:
     """Get or create a cached curl_cffi AsyncSession."""
     key = _session_key(impersonate, proxy)
+    evicted_sessions: list[tuple[str, AsyncSession]] = []
     async with _pool_lock:
         session = _session_pool.get(key)
         if session is not None:
+            _session_pool.move_to_end(key)
             return session
 
         kwargs: dict[str, Any] = {
@@ -77,12 +92,22 @@ async def _get_or_create_session(
 
         session = AsyncSession(**kwargs)
         _session_pool[key] = session
+        _session_pool.move_to_end(key)
+        while len(_session_pool) > _MAX_SESSIONS:
+            old_key, old_session = _session_pool.popitem(last=False)
+            evicted_sessions.append((old_key, old_session))
         logger.info(
             "curl_cffi session created: impersonate={}, proxy={}",
             impersonate,
             proxy or "direct",
         )
-        return session
+    for old_key, old_session in evicted_sessions:
+        try:
+            await old_session.close()
+            logger.debug("curl_cffi session evicted: {}", old_key)
+        except Exception as exc:
+            logger.warning("curl_cffi session close failed during eviction ({}): {}", old_key, exc)
+    return session
 
 
 async def close_all_sessions() -> None:

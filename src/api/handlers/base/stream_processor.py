@@ -32,6 +32,7 @@ from src.api.handlers.base.stream_context import StreamContext
 from src.api.handlers.base.utils import (
     check_html_response,
     check_prefetched_response_error,
+    ensure_stream_buffer_limit,
     get_format_converter_registry,
 )
 from src.config.constants import StreamDefaults
@@ -416,12 +417,22 @@ class StreamProcessor:
             if kiro_binary_stream:
                 return prefetched_chunks
             buffer += first_chunk
+            ensure_stream_buffer_limit(
+                buffer,
+                request_id=self.request_id,
+                provider_name=str(provider.name),
+            )
 
             # 继续读取剩余的预读数据
             async for chunk in aiter:
                 prefetched_chunks.append(chunk)
                 total_prefetched_bytes += len(chunk)
                 buffer += chunk
+                ensure_stream_buffer_limit(
+                    buffer,
+                    request_id=self.request_id,
+                    provider_name=str(provider.name),
+                )
 
                 # 尝试按行解析缓冲区
                 while b"\n" in buffer:
@@ -880,6 +891,11 @@ class StreamProcessor:
                 if prefetched_chunks:
                     for chunk in prefetched_chunks:
                         buffer += chunk
+                        ensure_stream_buffer_limit(
+                            buffer,
+                            request_id=self.request_id,
+                            provider_name=ctx.provider_name,
+                        )
                         while b"\n" in buffer:
                             line_bytes, buffer = buffer.split(b"\n", 1)
                             try:
@@ -916,6 +932,11 @@ class StreamProcessor:
 
                 async for chunk in byte_iterator:
                     buffer += chunk
+                    ensure_stream_buffer_limit(
+                        buffer,
+                        request_id=self.request_id,
+                        provider_name=ctx.provider_name,
+                    )
                     while b"\n" in buffer:
                         line_bytes, buffer = buffer.split(b"\n", 1)
                         try:
@@ -982,6 +1003,11 @@ class StreamProcessor:
                         yield chunk
 
                         buffer += chunk
+                        ensure_stream_buffer_limit(
+                            buffer,
+                            request_id=self.request_id,
+                            provider_name=ctx.provider_name,
+                        )
                         # 处理缓冲区中的完整行
                         while b"\n" in buffer:
                             line_bytes, buffer = buffer.split(b"\n", 1)
@@ -1006,6 +1032,11 @@ class StreamProcessor:
                     yield chunk
 
                     buffer += chunk
+                    ensure_stream_buffer_limit(
+                        buffer,
+                        request_id=self.request_id,
+                        provider_name=ctx.provider_name,
+                    )
                     # 处理缓冲区中的完整行
                     while b"\n" in buffer:
                         line_bytes, buffer = buffer.split(b"\n", 1)
@@ -1246,6 +1277,8 @@ class StreamProcessor:
     async def create_smoothed_stream(
         self,
         stream_generator: AsyncGenerator[bytes],
+        *,
+        provider_name: str | None = None,
     ) -> AsyncGenerator[bytes]:
         """
         创建平滑输出的流生成器
@@ -1271,6 +1304,11 @@ class StreamProcessor:
 
         async for chunk in stream_generator:
             buffer += chunk
+            ensure_stream_buffer_limit(
+                buffer,
+                request_id=self.request_id,
+                provider_name=provider_name,
+            )
 
             # 按双换行分割 SSE 事件（标准 SSE 格式）
             while b"\n\n" in buffer:
@@ -1406,6 +1444,9 @@ async def create_smoothed_stream(
     stream_generator: AsyncGenerator[bytes],
     chunk_size: int = 20,
     delay_ms: int = 8,
+    *,
+    request_id: str | None = None,
+    provider_name: str | None = None,
 ) -> AsyncGenerator[bytes]:
     """
     独立的平滑流生成函数
@@ -1420,7 +1461,12 @@ async def create_smoothed_stream(
     Yields:
         平滑处理后的响应数据块
     """
-    processor = _LightweightSmoother(chunk_size=chunk_size, delay_ms=delay_ms)
+    processor = _LightweightSmoother(
+        chunk_size=chunk_size,
+        delay_ms=delay_ms,
+        request_id=request_id,
+        provider_name=provider_name,
+    )
     async for chunk in processor.smooth(stream_generator):
         yield chunk
 
@@ -1432,9 +1478,17 @@ class _LightweightSmoother:
     只包含平滑输出所需的最小逻辑，不依赖 StreamProcessor 的其他功能。
     """
 
-    def __init__(self, chunk_size: int = 20, delay_ms: int = 8) -> None:
+    def __init__(
+        self,
+        chunk_size: int = 20,
+        delay_ms: int = 8,
+        request_id: str | None = None,
+        provider_name: str | None = None,
+    ) -> None:
         self.chunk_size = chunk_size
         self.delay_ms = delay_ms
+        self.request_id = request_id
+        self.provider_name = provider_name
         self._extractors: dict[str, ContentExtractor] = {}
 
     def _get_extractor(self, format_name: str) -> ContentExtractor | None:
@@ -1468,6 +1522,11 @@ class _LightweightSmoother:
 
         async for chunk in stream_generator:
             buffer += chunk
+            ensure_stream_buffer_limit(
+                buffer,
+                request_id=self.request_id or "unknown",
+                provider_name=self.provider_name,
+            )
 
             while b"\n\n" in buffer:
                 event_block, buffer = buffer.split(b"\n\n", 1)

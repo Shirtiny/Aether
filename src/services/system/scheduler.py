@@ -8,7 +8,6 @@
 
 from __future__ import annotations
 
-import os
 from datetime import datetime
 from typing import Any, Callable
 
@@ -17,10 +16,11 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
+from src.config import config
 from src.core.logger import logger
 
-# 应用时区配置，默认为 Asia/Shanghai
-APP_TIMEZONE = os.getenv("APP_TIMEZONE", "Asia/Shanghai")
+# 统一从 config 读取，不再重复 os.getenv
+APP_TIMEZONE = config.app_timezone
 
 
 class TaskScheduler:

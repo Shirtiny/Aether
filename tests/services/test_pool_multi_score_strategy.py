@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 from src.services.provider.pool.config import PoolConfig, SchedulingPreset, ScoringWeights
 from src.services.provider.pool.strategies.multi_score import MultiScoreStrategy
-from src.services.provider.pool.strategy import get_pool_strategy, register_pool_strategy
+from src.services.provider.pool.strategy import get_pool_strategy
 
 
 def _context() -> dict:
@@ -61,9 +61,8 @@ def test_multi_score_combines_health_and_cost() -> None:
 
 
 def test_multi_score_strategy_is_registered() -> None:
-    register_pool_strategy("multi_score", MultiScoreStrategy())
     registered = get_pool_strategy("multi_score")
-    assert registered is not None
+    assert isinstance(registered, MultiScoreStrategy)
 
 
 def test_multi_score_preset_free_team_first_prefers_free_or_team() -> None:
@@ -194,6 +193,51 @@ def test_multi_score_preset_recent_refresh_uses_codex_weekly_reset() -> None:
     s2 = strategy.compute_score(key_id="k2", config=cfg, context=ctx)
     assert s1 is not None and s2 is not None
     assert s2 < s1
+
+
+def test_multi_score_codex_default_enables_recent_refresh_when_missing() -> None:
+    strategy = MultiScoreStrategy()
+    cfg = PoolConfig(
+        scheduling_mode="multi_score",
+        scheduling_presets=(SchedulingPreset(preset="cache_affinity", enabled=True),),
+    )
+    ctx = {
+        "provider_type": "codex",
+        "all_key_ids": ["k1", "k2"],
+        "lru_scores": {},
+        "keys_by_id": {
+            "k1": _key_with_metadata({"codex": {"primary_reset_seconds": 600}}),
+            "k2": _key_with_metadata({"codex": {"primary_reset_seconds": 120}}),
+        },
+    }
+    s1 = strategy.compute_score(key_id="k1", config=cfg, context=ctx)
+    s2 = strategy.compute_score(key_id="k2", config=cfg, context=ctx)
+    assert s1 is not None and s2 is not None
+    assert s2 < s1
+
+
+def test_multi_score_codex_recent_refresh_can_be_explicitly_disabled() -> None:
+    strategy = MultiScoreStrategy()
+    cfg = PoolConfig(
+        scheduling_mode="multi_score",
+        scheduling_presets=(
+            SchedulingPreset(preset="cache_affinity", enabled=True),
+            SchedulingPreset(preset="recent_refresh", enabled=False),
+        ),
+    )
+    ctx = {
+        "provider_type": "codex",
+        "all_key_ids": ["k1", "k2"],
+        "lru_scores": {},
+        "keys_by_id": {
+            "k1": _key_with_metadata({"codex": {"primary_reset_seconds": 600}}),
+            "k2": _key_with_metadata({"codex": {"primary_reset_seconds": 120}}),
+        },
+    }
+    s1 = strategy.compute_score(key_id="k1", config=cfg, context=ctx)
+    s2 = strategy.compute_score(key_id="k2", config=cfg, context=ctx)
+    assert s1 is not None and s2 is not None
+    assert s1 < s2
 
 
 def test_multi_score_preset_single_account_prefers_internal_priority_then_reverse_lru() -> None:

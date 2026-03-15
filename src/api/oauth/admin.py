@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from src.api.base.admin_adapter import AdminApiAdapter
 from src.api.base.context import ApiRequestContext
-from src.api.base.pipeline import ApiRequestPipeline
+from src.api.base.pipeline import get_pipeline
 from src.core.exceptions import InvalidRequestException, translate_pydantic_error
 from src.database import get_db
 from src.models.database import OAuthProvider
@@ -18,7 +18,7 @@ from src.services.auth.oauth.registry import get_oauth_provider_registry
 from src.services.auth.oauth.service import OAuthService
 
 router = APIRouter(prefix="/api/admin/oauth", tags=["Admin - OAuth"])
-pipeline = ApiRequestPipeline()
+pipeline = get_pipeline()
 
 
 class SupportedOAuthType(BaseModel):

@@ -266,6 +266,8 @@
                 {{ crumb.label }}
               </span>
             </template>
+            <!-- 页面级操作插入点 -->
+            <div id="breadcrumb-actions" />
           </div>
         </div>
 
@@ -279,6 +281,11 @@
         </div>
 
         <div class="flex items-center gap-2">
+          <!-- Page-level header actions (right side) -->
+          <div
+            id="header-actions-right"
+            class="flex items-center"
+          />
           <!-- Theme Toggle -->
           <button
             class="flex h-9 w-9 items-center justify-center rounded-lg text-muted-foreground hover:text-foreground hover:bg-muted/50 transition"

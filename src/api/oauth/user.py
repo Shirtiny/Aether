@@ -9,7 +9,7 @@ from starlette.responses import RedirectResponse
 from src.api.base.adapter import ApiMode
 from src.api.base.authenticated_adapter import AuthenticatedApiAdapter
 from src.api.base.context import ApiRequestContext
-from src.api.base.pipeline import ApiRequestPipeline
+from src.api.base.pipeline import get_pipeline
 from src.clients.redis_client import get_redis_client
 from src.database import get_db
 from src.models.database import User
@@ -17,7 +17,7 @@ from src.services.auth.oauth.service import OAuthService
 from src.services.auth.oauth.state import consume_oauth_bind_token, create_oauth_bind_token
 
 router = APIRouter(prefix="/api/user/oauth", tags=["User - OAuth"])
-pipeline = ApiRequestPipeline()
+pipeline = get_pipeline()
 
 
 @router.get("/bindable-providers")

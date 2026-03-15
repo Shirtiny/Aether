@@ -15,13 +15,13 @@ from sqlalchemy.orm import Session
 
 from src.api.base.admin_adapter import AdminApiAdapter
 from src.api.base.context import ApiRequestContext
-from src.api.base.pipeline import ApiRequestPipeline
+from src.api.base.pipeline import get_pipeline
 from src.core.exceptions import InvalidRequestException
 from src.database import get_db
 from src.services.proxy_node.service import ProxyNodeService, node_to_dict
 
 router = APIRouter(prefix="/api/admin/proxy-nodes", tags=["Admin - Proxy Nodes"])
-pipeline = ApiRequestPipeline()
+pipeline = get_pipeline()
 
 
 # ---------------------------------------------------------------------------

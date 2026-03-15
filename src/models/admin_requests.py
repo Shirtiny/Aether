@@ -308,9 +308,6 @@ class ClaudeCodeAdvancedConfig(BaseModel):
     session_idle_timeout_minutes: int | None = Field(
         None, ge=1, le=1440, description="会话空闲超时（分钟）"
     )
-    enable_tls_fingerprint: bool = Field(
-        False, description="是否启用 TLS 指纹模拟（模拟 Node.js/Claude Code 客户端）"
-    )
     session_id_masking_enabled: bool = Field(
         False, description="是否启用会话 ID 伪装（固定 metadata.user_id 中 session 片段）"
     )
@@ -695,6 +692,11 @@ class UpdateUserRequest(BaseModel):
     allowed_providers: list[str] | None = Field(None, description="允许使用的提供商 ID 列表")
     allowed_api_formats: list[str] | None = Field(None, description="允许使用的 API 格式列表")
     allowed_models: list[str] | None = Field(None, description="允许使用的模型名称列表")
+    rate_limit: int | None = Field(
+        None,
+        ge=0,
+        description="每分钟请求限制；null 表示继承系统默认，0 表示不限制",
+    )
 
     @field_validator("username")
     @classmethod

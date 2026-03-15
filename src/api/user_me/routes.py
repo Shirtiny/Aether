@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 
 from src.api.base.authenticated_adapter import AuthenticatedApiAdapter
 from src.api.base.context import ApiRequestContext
-from src.api.base.pipeline import ApiRequestPipeline
+from src.api.base.pipeline import get_pipeline
 from src.config.constants import CacheTTL
 from src.core.crypto import crypto_service
 from src.core.enums import UserRole
@@ -33,6 +33,7 @@ from src.models.api import (
     PublicGlobalModelListResponse,
     PublicGlobalModelResponse,
     UpdateApiKeyProvidersRequest,
+    UpdateMyApiKeyRequest,
     UpdatePreferencesRequest,
     UpdateProfileRequest,
 )
@@ -48,6 +49,7 @@ from src.models.database import (
 from src.services.cache.user_cache import UserCacheService
 from src.services.system.config import SystemConfigService
 from src.services.system.time_range import TimeRangeParams
+from src.services.usage.query import input_context_expr
 from src.services.usage.service import UsageService
 from src.services.user.apikey import ApiKeyService
 from src.services.user.bulk_cleanup import pre_clean_api_key
@@ -56,7 +58,21 @@ from src.services.wallet import WalletService
 from src.utils.cache_decorator import cache_result
 
 router = APIRouter(prefix="/api/users/me", tags=["User Profile"])
-pipeline = ApiRequestPipeline()
+pipeline = get_pipeline()
+
+
+def _calculate_token_cache_hit_rate(total_input_context: int, cache_read_tokens: int) -> float:
+    """计算缓存命中率。
+
+    Args:
+        total_input_context: 已归一化的总输入上下文 token 数（由 query.py 按 API 格式精确计算）。
+        cache_read_tokens: 缓存读取 token 数。
+    """
+    context = max(0, int(total_input_context))
+    cached = max(0, int(cache_read_tokens))
+    if context == 0:
+        return 0.0
+    return round(cached / context * 100, 2)
 
 
 def _update_profile_sync(
@@ -131,6 +147,7 @@ def _create_my_api_key_sync(user_id: str, request: CreateMyApiKeyRequest) -> dic
                 db=db,
                 user_id=user_id,
                 name=request.name,
+                rate_limit=request.rate_limit,
             )
         except ValueError as exc:
             raise InvalidRequestException(str(exc)) from exc
@@ -139,6 +156,7 @@ def _create_my_api_key_sync(user_id: str, request: CreateMyApiKeyRequest) -> dic
             "name": api_key.name,
             "key": plain_key,
             "key_display": api_key.get_display_key(),
+            "rate_limit": api_key.rate_limit,
             "message": "API密钥创建成功",
         }
 
@@ -171,6 +189,50 @@ def _toggle_my_api_key_sync(user_id: str, key_id: str) -> dict[str, Any]:
             "id": api_key.id,
             "is_active": api_key.is_active,
             "message": f"API密钥已{'启用' if api_key.is_active else '禁用'}",
+        }
+
+
+def _update_my_api_key_sync(
+    user_id: str,
+    key_id: str,
+    request: UpdateMyApiKeyRequest,
+) -> dict[str, Any]:
+    with get_db_context() as db:
+        api_key = (
+            db.query(ApiKey)
+            .filter(
+                ApiKey.id == key_id,
+                ApiKey.user_id == user_id,
+                ApiKey.is_standalone == False,
+            )
+            .first()
+        )
+        if not api_key:
+            raise NotFoundException("API密钥不存在", "api_key")
+        if api_key.is_locked:
+            raise ForbiddenException("该密钥已被管理员锁定，无法修改")
+
+        update_data = request.model_dump(exclude_unset=True)
+        if "rate_limit" in update_data and update_data["rate_limit"] is None:
+            update_data["rate_limit"] = 0
+
+        updated = ApiKeyService.update_api_key(db, key_id, **update_data)
+        if not updated:
+            raise NotFoundException("API密钥不存在", "api_key")
+
+        return {
+            "id": updated.id,
+            "name": updated.name,
+            "key_display": updated.get_display_key(),
+            "is_active": updated.is_active,
+            "is_locked": updated.is_locked,
+            "allowed_providers": updated.allowed_providers,
+            "force_capabilities": updated.force_capabilities,
+            "rate_limit": updated.rate_limit,
+            "last_used_at": updated.last_used_at.isoformat() if updated.last_used_at else None,
+            "expires_at": updated.expires_at.isoformat() if updated.expires_at else None,
+            "created_at": updated.created_at.isoformat(),
+            "message": "API密钥已更新",
         }
 
 
@@ -469,6 +531,20 @@ async def delete_my_api_key(key_id: str, request: Request, db: Session = Depends
     return await pipeline.run(adapter=adapter, http_request=request, db=db, mode=adapter.mode)
 
 
+@router.put("/api-keys/{key_id}")
+async def update_my_api_key(key_id: str, request: Request, db: Session = Depends(get_db)) -> Any:
+    """
+    更新 API 密钥
+
+    更新指定 API 密钥的基础配置。
+
+    **路径参数**:
+    - `key_id`: 密钥 ID
+    """
+    adapter = UpdateMyApiKeyAdapter(key_id=key_id)
+    return await pipeline.run(adapter=adapter, http_request=request, db=db, mode=adapter.mode)
+
+
 @router.patch("/api-keys/{key_id}")
 async def toggle_my_api_key(key_id: str, request: Request, db: Session = Depends(get_db)) -> Any:
     """
@@ -508,8 +584,8 @@ async def get_my_usage(
     - `total_requests`: 总请求数
     - `total_tokens`: 总 Token 数
     - `total_cost`: 总成本（USD）
-    - `summary_by_model`: 按模型分组统计
-    - `summary_by_provider`: 按提供商分组统计
+    - `summary_by_model`: 按模型分组统计（含 `cache_read_tokens`、`cache_hit_rate`）
+    - `summary_by_provider`: 按提供商分组统计（含 `cache_read_tokens`、`cache_hit_rate`）
     - `records`: 详细使用记录列表
     - `pagination`: 分页信息
     """
@@ -862,6 +938,7 @@ class ListMyApiKeysAdapter(AuthenticatedApiAdapter):
                     "created_at": key.created_at.isoformat(),
                     "total_requests": real_stats["total_requests"],
                     "total_cost_usd": real_stats["total_cost_usd"],
+                    "rate_limit": key.rate_limit,
                     "allowed_providers": key.allowed_providers,
                     "force_capabilities": key.force_capabilities,
                 }
@@ -948,6 +1025,27 @@ class GetMyApiKeyDetailAdapter(AuthenticatedApiAdapter):
             "expires_at": api_key.expires_at.isoformat() if api_key.expires_at else None,
             "created_at": api_key.created_at.isoformat(),
         }
+
+
+@dataclass
+class UpdateMyApiKeyAdapter(AuthenticatedApiAdapter):
+    """更新 API 密钥基础配置的适配器"""
+
+    key_id: str
+
+    async def handle(self, context: ApiRequestContext) -> Any:  # type: ignore[override]
+        payload = context.ensure_json_body()
+        try:
+            request = UpdateMyApiKeyRequest.model_validate(payload)
+        except ValidationError as e:
+            errors = e.errors()
+            if errors:
+                raise InvalidRequestException(translate_pydantic_error(errors[0]))
+            raise InvalidRequestException("请求数据验证失败")
+
+        return await run_in_threadpool(
+            _update_my_api_key_sync, context.user.id, self.key_id, request
+        )
 
 
 @dataclass
@@ -1045,6 +1143,10 @@ class GetUsageAdapter(AuthenticatedApiAdapter):
                 "input_tokens": 0,
                 "output_tokens": 0,
                 "total_tokens": 0,
+                "cache_read_tokens": 0,
+                "cache_creation_tokens": 0,
+                "total_input_context": 0,
+                "cache_hit_rate": 0.0,
                 "total_cost_usd": 0.0,
             }
             # 管理员可以看到真实成本
@@ -1056,6 +1158,9 @@ class GetUsageAdapter(AuthenticatedApiAdapter):
             stats["input_tokens"] += item["input_tokens"]
             stats["output_tokens"] += item["output_tokens"]
             stats["total_tokens"] += item["total_tokens"]
+            stats["cache_read_tokens"] += int(item.get("cache_read_tokens", 0) or 0)
+            stats["cache_creation_tokens"] += int(item.get("cache_creation_tokens", 0) or 0)
+            stats["total_input_context"] += int(item.get("total_input_context", 0) or 0)
             stats["total_cost_usd"] += item["total_cost_usd"]
             # 管理员可以看到真实成本
             if user.role == UserRole.ADMIN:
@@ -1066,6 +1171,10 @@ class GetUsageAdapter(AuthenticatedApiAdapter):
                 "provider": provider_name,
                 "requests": 0,
                 "total_tokens": 0,
+                "output_tokens": 0,
+                "cache_read_tokens": 0,
+                "cache_creation_tokens": 0,
+                "total_input_context": 0,
                 "total_cost_usd": 0.0,
                 "success_count": 0,
                 "total_response_time_ms": 0.0,
@@ -1074,6 +1183,12 @@ class GetUsageAdapter(AuthenticatedApiAdapter):
             provider_stats = provider_summary.setdefault(provider_name, provider_base_stats)
             provider_stats["requests"] += item["requests"]
             provider_stats["total_tokens"] += item["total_tokens"]
+            provider_stats["output_tokens"] += item.get("output_tokens", 0) or 0
+            provider_stats["cache_read_tokens"] += int(item.get("cache_read_tokens", 0) or 0)
+            provider_stats["cache_creation_tokens"] += int(
+                item.get("cache_creation_tokens", 0) or 0
+            )
+            provider_stats["total_input_context"] += int(item.get("total_input_context", 0) or 0)
             provider_stats["total_cost_usd"] += item["total_cost_usd"]
             provider_stats["success_count"] += int(item.get("success_count", 0) or 0)
             success_response_time_count = int(item.get("success_response_time_count", 0) or 0)
@@ -1082,6 +1197,12 @@ class GetUsageAdapter(AuthenticatedApiAdapter):
                     item.get("success_response_time_sum_ms", 0.0) or 0.0
                 )
                 provider_stats["response_time_count"] += success_response_time_count
+
+        for model_stats in model_summary.values():
+            model_stats["cache_hit_rate"] = _calculate_token_cache_hit_rate(
+                total_input_context=int(model_stats.get("total_input_context", 0) or 0),
+                cache_read_tokens=int(model_stats.get("cache_read_tokens", 0) or 0),
+            )
 
         summary_by_model = sorted(model_summary.values(), key=lambda x: x["requests"], reverse=True)
         summary_by_provider = []
@@ -1101,12 +1222,73 @@ class GetUsageAdapter(AuthenticatedApiAdapter):
                     "provider": provider_stats["provider"],
                     "requests": provider_stats["requests"],
                     "total_tokens": provider_stats["total_tokens"],
+                    "total_input_context": provider_stats["total_input_context"],
+                    "output_tokens": provider_stats["output_tokens"],
+                    "cache_read_tokens": provider_stats["cache_read_tokens"],
+                    "cache_creation_tokens": provider_stats["cache_creation_tokens"],
+                    "cache_hit_rate": _calculate_token_cache_hit_rate(
+                        total_input_context=int(provider_stats.get("total_input_context", 0) or 0),
+                        cache_read_tokens=int(provider_stats.get("cache_read_tokens", 0) or 0),
+                    ),
                     "total_cost_usd": provider_stats["total_cost_usd"],
                     "success_rate": round(success_rate, 2),
                     "avg_response_time_ms": round(avg_response_time_ms, 2),
                 }
             )
         summary_by_provider = sorted(summary_by_provider, key=lambda x: x["requests"], reverse=True)
+
+        # 按 api_format 聚合统计（独立查询，因为 get_usage_summary 按 provider+model 分组无此维度）
+        api_format_query = db.query(
+            Usage.api_format,
+            func.count(Usage.id).label("request_count"),
+            func.sum(Usage.total_tokens).label("total_tokens"),
+            func.sum(Usage.cache_read_input_tokens).label("cache_read_tokens"),
+            func.sum(input_context_expr()).label("total_input_context"),
+            func.sum(Usage.output_tokens).label("output_tokens"),
+            func.sum(Usage.cache_creation_input_tokens).label("cache_creation_tokens"),
+            func.sum(Usage.total_cost_usd).label("total_cost_usd"),
+            func.avg(Usage.response_time_ms).label("avg_response_time_ms"),
+        ).filter(
+            Usage.user_id == user.id,
+            Usage.status.notin_(["pending", "streaming"]),
+            Usage.provider_name.notin_(["unknown", "pending"]),
+            Usage.api_format.isnot(None),
+        )
+        if start_utc and end_utc:
+            api_format_query = api_format_query.filter(
+                Usage.created_at >= start_utc, Usage.created_at < end_utc
+            )
+        api_format_stats = (
+            api_format_query.group_by(Usage.api_format).order_by(func.count(Usage.id).desc()).all()
+        )
+        summary_by_api_format = [
+            {
+                "api_format": api_format or "unknown",
+                "request_count": count,
+                "total_tokens": int(total_tokens or 0),
+                "total_input_context": int(total_input_context or 0),
+                "output_tokens": int(output_tokens or 0),
+                "cache_read_tokens": int(cache_read_tokens or 0),
+                "cache_creation_tokens": int(cache_creation_tokens or 0),
+                "cache_hit_rate": _calculate_token_cache_hit_rate(
+                    total_input_context=total_input_context,
+                    cache_read_tokens=cache_read_tokens,
+                ),
+                "total_cost_usd": float(total_cost_usd or 0),
+                "avg_response_time_ms": float(avg_response_time_ms or 0),
+            }
+            for (
+                api_format,
+                count,
+                total_tokens,
+                cache_read_tokens,
+                total_input_context,
+                output_tokens,
+                cache_creation_tokens,
+                total_cost_usd,
+                avg_response_time_ms,
+            ) in api_format_stats
+        ]
 
         query = (
             db.query(Usage, ApiKey, ProviderEndpoint)
@@ -1199,6 +1381,7 @@ class GetUsageAdapter(AuthenticatedApiAdapter):
             "billing": WalletService.serialize_wallet_summary(wallet),
             "summary_by_model": summary_by_model,
             "summary_by_provider": summary_by_provider,
+            "summary_by_api_format": summary_by_api_format,
             # 分页信息
             "pagination": {
                 "total": total_records,

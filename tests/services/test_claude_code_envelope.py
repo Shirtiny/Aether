@@ -93,7 +93,7 @@ def test_claude_code_prepare_context_prefers_fingerprint_tls_profile() -> None:
     set_current_fingerprint(fp)
 
     tls_profile = claude_code_envelope.prepare_context(
-        provider_config={"claude_code_advanced": {"enable_tls_fingerprint": True}},
+        provider_config={},
         key_id="key-fingerprint-2",
         is_stream=False,
         provider_id="provider-1",

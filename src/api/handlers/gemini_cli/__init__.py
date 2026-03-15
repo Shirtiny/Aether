@@ -1,12 +1,25 @@
-"""
-Gemini CLI 透传处理器
-"""
+"""Gemini CLI handler package (lazy exports)."""
 
-from src.api.handlers.gemini_cli.adapter import GeminiCliAdapter, build_gemini_cli_adapter
-from src.api.handlers.gemini_cli.handler import GeminiCliMessageHandler
+from __future__ import annotations
 
-__all__ = [
-    "GeminiCliAdapter",
-    "GeminiCliMessageHandler",
-    "build_gemini_cli_adapter",
-]
+from importlib import import_module
+from typing import Any
+
+_LAZY_EXPORTS: dict[str, tuple[str, str]] = {
+    "GeminiCliAdapter": (".adapter", "GeminiCliAdapter"),
+    "build_gemini_cli_adapter": (".adapter", "build_gemini_cli_adapter"),
+    "GeminiCliMessageHandler": (".handler", "GeminiCliMessageHandler"),
+}
+
+__all__ = list(_LAZY_EXPORTS.keys())
+
+
+def __getattr__(name: str) -> Any:
+    if name not in _LAZY_EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+    module_name, attr_name = _LAZY_EXPORTS[name]
+    module = import_module(module_name, __name__)
+    value = getattr(module, attr_name)
+    globals()[name] = value
+    return value

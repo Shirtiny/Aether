@@ -13,13 +13,11 @@ from typing import Any
 from fastapi import APIRouter, Depends, Request
 from sqlalchemy.orm import Session
 
-from src.api.base.pipeline import ApiRequestPipeline
-from src.api.handlers.openai import OpenAIChatAdapter
-from src.api.handlers.openai_cli import OpenAICliAdapter, OpenAICompactAdapter
+from src.api.base.pipeline import get_pipeline
 from src.database import get_db
 
 router = APIRouter(tags=["OpenAI API"])
-pipeline = ApiRequestPipeline()
+pipeline = get_pipeline()
 
 
 @router.post("/v1/chat/completions")
@@ -45,6 +43,8 @@ async def create_chat_completion(
 
     **支持的参数**: model, messages, stream, temperature, max_tokens 等标准 OpenAI 参数
     """
+    from src.api.handlers.openai import OpenAIChatAdapter
+
     adapter = OpenAIChatAdapter()
     return await pipeline.run(
         adapter=adapter,
@@ -68,6 +68,8 @@ async def create_responses_compact(
 
     **认证方式**: Bearer Token（API Key 或 JWT Token）
     """
+    from src.api.handlers.openai_cli import OpenAICompactAdapter
+
     adapter = OpenAICompactAdapter()
     return await pipeline.run(
         adapter=adapter,
@@ -90,6 +92,8 @@ async def create_responses(
 
     **认证方式**: Bearer Token（API Key 或 JWT Token）
     """
+    from src.api.handlers.openai_cli import OpenAICliAdapter
+
     adapter = OpenAICliAdapter()
     return await pipeline.run(
         adapter=adapter,

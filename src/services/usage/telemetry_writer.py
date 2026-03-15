@@ -8,7 +8,7 @@ import json
 from abc import ABC, abstractmethod
 from typing import Any
 
-from src.clients.redis_client import get_redis_client
+from src.clients.redis_client import get_usage_queue_redis_client as get_redis_client
 from src.config.settings import config
 from src.core.logger import logger
 from src.services.usage.events import UsageEventType, build_usage_event
@@ -125,7 +125,7 @@ class QueueTelemetryWriter(TelemetryWriter):
             else:
                 await redis_client.xadd(config.usage_queue_stream_key, event.to_stream_fields())
         except Exception as exc:
-            logger.error(f"[usage-queue] XADD failed: {exc}")
+            logger.error("[usage-queue] XADD failed: {}", exc)
             raise
 
     def _mask_headers(self, headers: Any) -> Any:

@@ -7,8 +7,6 @@ DEFAULT_ANTHROPIC_VERSION = "2023-06-01"
 DEFAULT_ACCEPT = "application/json"
 STREAM_HELPER_METHOD = "stream"
 SESSION_ID_MASKING_TTL_SECONDS = 15 * 60
-# 仅代表“启用 Claude Code TLS 配置”的客户端 profile 标识（best-effort）。
-TLS_PROFILE_CLAUDE_CODE = "claude_code_nodejs"
 
 # Claude Code OAuth required betas.
 BETA_CLAUDE_CODE = "claude-code-20250219"
@@ -48,5 +46,4 @@ __all__ = [
     "DEFAULT_ANTHROPIC_VERSION",
     "SESSION_ID_MASKING_TTL_SECONDS",
     "STREAM_HELPER_METHOD",
-    "TLS_PROFILE_CLAUDE_CODE",
 ]

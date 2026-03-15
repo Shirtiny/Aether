@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -128,7 +129,7 @@ class HealthMonitor:
     # Key: (key_id, api_format), Value: list of {"ts": float, "ok": bool}
     # 不再持久化到数据库，进程重启后自然重建
     _window_cache: dict[tuple[str, str], list[dict[str, Any]]] = {}
-    _WINDOW_CACHE_MAX_ENTRIES = int(os.getenv("HEALTH_WINDOW_CACHE_MAX_ENTRIES", "10000"))
+    _WINDOW_CACHE_MAX_ENTRIES = int(os.getenv("HEALTH_WINDOW_CACHE_MAX_ENTRIES", "5000"))
 
     # ==================== 数据访问辅助方法 ====================
 
@@ -847,7 +848,7 @@ class HealthMonitor:
         try:
             endpoint_stats = db.query(
                 func.count(ProviderEndpoint.id).label("total"),
-                func.sum(case((ProviderEndpoint.is_active == True, 1), else_=0)).label("active"),
+                func.sum(case((ProviderEndpoint.is_active.is_(True), 1), else_=0)).label("active"),
                 func.sum(case((ProviderEndpoint.health_score < 0.5, 1), else_=0)).label(
                     "unhealthy"
                 ),
@@ -978,6 +979,21 @@ class HealthMonitor:
         return False
 
 
-# 全局健康监控器实例
-health_monitor = HealthMonitor()
+# 全局健康监控器懒加载（避免 import 阶段实例化）
+_health_monitor_instance: HealthMonitor | None = None
+_health_monitor_lock = threading.Lock()
+
+
+def get_health_monitor() -> HealthMonitor:
+    """获取全局 HealthMonitor 单例（线程安全懒加载）。"""
+    global _health_monitor_instance  # noqa: PLW0603
+
+    if _health_monitor_instance is None:
+        with _health_monitor_lock:
+            if _health_monitor_instance is None:
+                _health_monitor_instance = HealthMonitor()
+
+    return _health_monitor_instance
+
+
 health_open_circuits.set(0)

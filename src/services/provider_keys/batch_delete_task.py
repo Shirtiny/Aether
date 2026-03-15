@@ -16,6 +16,7 @@ from concurrent.futures import Future
 import redis.asyncio as aioredis
 from sqlalchemy import delete as sa_delete
 from sqlalchemy import text
+from sqlalchemy.orm import Session
 
 from src.clients.redis_client import get_redis_client
 from src.core.logger import logger
@@ -36,8 +37,14 @@ _CLEANUP_BATCH_SIZE = 50
 # 单个批次的数据库 statement 超时（秒）
 _BATCH_STATEMENT_TIMEOUT_S = 30
 
+# 单个批次的数据库锁等待超时（秒）
+_BATCH_LOCK_TIMEOUT_S = 5
+
 # 整个任务的最大执行时间（秒）
 _TASK_TIMEOUT_S = 600
+
+# 发生超时/锁等待时降批到的最小 Key 数
+_MIN_RETRY_BATCH_SIZE = 1
 
 # Redis key 前缀
 _REDIS_KEY_PREFIX = "batch_delete_task"
@@ -48,6 +55,30 @@ _running_tasks: set[asyncio.Task[None]] = set()
 
 def _task_key(task_id: str) -> str:
     return f"{_REDIS_KEY_PREFIX}:{task_id}"
+
+
+
+def _apply_statement_timeouts(db: Session) -> None:
+    db.execute(text(f"SET LOCAL statement_timeout = '{_BATCH_STATEMENT_TIMEOUT_S * 1000}'"))
+    db.execute(text(f"SET LOCAL lock_timeout = '{_BATCH_LOCK_TIMEOUT_S * 1000}'"))
+
+
+def _is_retryable_batch_error(exc: Exception) -> bool:
+    messages = [str(exc)]
+    orig = getattr(exc, "orig", None)
+    if orig is not None:
+        messages.append(str(orig))
+    text_blob = " ".join(messages).lower()
+    return any(
+        marker in text_blob
+        for marker in (
+            "querycanceled",
+            "statement timeout",
+            "canceling statement due to statement timeout",
+            "lock timeout",
+            "canceling statement due to lock timeout",
+        )
+    )
 
 
 class BatchDeleteTaskInfo:
@@ -177,6 +208,115 @@ async def get_batch_delete_task(task_id: str) -> BatchDeleteTaskInfo | None:
     return await _load_task(task_id)
 
 
+def _delete_key_batch(
+    db: Session,
+    provider_id: str,
+    batch: list[str],
+) -> int:
+    from src.models.database import ProviderAPIKey
+
+    phase = "cleanup_key_references"
+
+    def _set_phase(stage_name: str, _batch_size: int) -> None:
+        nonlocal phase
+        phase = stage_name
+
+    try:
+        _apply_statement_timeouts(db)
+        cleanup_key_references(
+            db,
+            batch,
+            batch_size=len(batch),
+            stage_callback=_set_phase,
+        )
+        phase = "provider_api_keys"
+        result = db.execute(
+            sa_delete(ProviderAPIKey).where(
+                ProviderAPIKey.provider_id == provider_id,
+                ProviderAPIKey.id.in_(batch),
+            )
+        )
+        rowcount = getattr(result, "rowcount", 0) or 0
+        db.commit()
+        return int(rowcount)
+    except Exception as exc:
+        setattr(exc, "_aether_batch_phase", phase)
+        raise
+
+
+def _delete_key_batch_with_retry(
+    db: Session,
+    provider_id: str,
+    batch: list[str],
+    *,
+    batch_idx: int,
+    total_batches: int,
+    start_offset: int,
+    attempt: int = 1,
+) -> int:
+    try:
+        return _delete_key_batch(db, provider_id, batch)
+    except Exception as exc:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+
+        is_retryable = _is_retryable_batch_error(exc)
+        phase = getattr(exc, "_aether_batch_phase", "unknown")
+        can_split = len(batch) > _MIN_RETRY_BATCH_SIZE
+        if is_retryable and can_split:
+            split_at = max(len(batch) // 2, _MIN_RETRY_BATCH_SIZE)
+            left = batch[:split_at]
+            right = batch[split_at:]
+            logger.warning(
+                "[BATCH_DELETE] batch {}/{} retrying after timeout/lock (keys {}-{}, size={}, attempt={}, phase={}): split into {} + {}",
+                batch_idx,
+                total_batches,
+                start_offset,
+                start_offset + len(batch),
+                len(batch),
+                attempt,
+                phase,
+                len(left),
+                len(right),
+            )
+            deleted = _delete_key_batch_with_retry(
+                db,
+                provider_id,
+                left,
+                batch_idx=batch_idx,
+                total_batches=total_batches,
+                start_offset=start_offset,
+                attempt=attempt + 1,
+            )
+            if right:
+                deleted += _delete_key_batch_with_retry(
+                    db,
+                    provider_id,
+                    right,
+                    batch_idx=batch_idx,
+                    total_batches=total_batches,
+                    start_offset=start_offset + len(left),
+                    attempt=attempt + 1,
+                )
+            return deleted
+
+        logger.warning(
+            "[BATCH_DELETE] batch {}/{} failed (keys {}-{} size={} attempt={} phase={} retryable={}): {}",
+            batch_idx,
+            total_batches,
+            start_offset,
+            start_offset + len(batch),
+            len(batch),
+            attempt,
+            phase,
+            is_retryable,
+            exc,
+        )
+        return 0
+
+
 def _sync_delete(
     provider_id: str,
     key_ids: list[str],
@@ -188,7 +328,6 @@ def _sync_delete(
     每个批次独立事务，单批失败跳过并继续。
     """
     from src.database import create_session
-    from src.models.database import ProviderAPIKey
 
     db = create_session()
     try:
@@ -209,33 +348,14 @@ def _sync_delete(
 
             batch = key_ids[i : i + _CLEANUP_BATCH_SIZE]
             batch_idx += 1
-            try:
-                # 设置 statement_timeout，防止单条 SQL 无限等锁
-                timeout_ms = _BATCH_STATEMENT_TIMEOUT_S * 1000
-                db.execute(text(f"SET LOCAL statement_timeout = '{timeout_ms}'"))
-                cleanup_key_references(db, batch)
-                result = db.execute(
-                    sa_delete(ProviderAPIKey).where(
-                        ProviderAPIKey.provider_id == provider_id,
-                        ProviderAPIKey.id.in_(batch),
-                    )
-                )
-                rowcount = getattr(result, "rowcount", 0) or 0
-                affected += int(rowcount)
-                db.commit()
-            except Exception as exc:
-                logger.warning(
-                    "[BATCH_DELETE] batch {}/{} failed (keys {}-{}): {}",
-                    batch_idx,
-                    total_batches,
-                    i,
-                    i + len(batch),
-                    exc,
-                )
-                try:
-                    db.rollback()
-                except Exception:
-                    pass
+            affected += _delete_key_batch_with_retry(
+                db,
+                provider_id,
+                batch,
+                batch_idx=batch_idx,
+                total_batches=total_batches,
+                start_offset=i,
+            )
             # 每个批次都上报一次进度
             if progress_callback is not None:
                 progress_callback(affected)

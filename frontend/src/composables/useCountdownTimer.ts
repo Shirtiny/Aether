@@ -69,6 +69,77 @@ export function getProbeCountdown(nextProbeAt: string | null | undefined, _tick:
 }
 
 /**
+ * Codex 配额重置倒计时状态
+ */
+export interface CodexResetStatus {
+  text: string
+  isUrgent: boolean
+  isCritical: boolean
+  isExpired: boolean
+}
+
+/**
+ * 计算 Codex 配额重置倒计时
+ * @param resetAt 绝对重置时间（Unix 秒）
+ * @param resetSecs 相对剩余秒数（用于 fallback）
+ * @param updatedAt 元数据更新时间（Unix 秒）
+ * @param _tick 响应式触发器（传入 tick.value 以触发响应式更新）
+ */
+export function getCodexResetCountdown(
+  resetAt: number | null | undefined,
+  resetSecs: number | null | undefined,
+  updatedAt: number | null | undefined,
+  _tick: number
+): CodexResetStatus | null {
+  void _tick
+
+  const nowSec = Math.floor(Date.now() / 1000)
+  let remaining: number
+
+  if (resetAt != null && resetAt > 0) {
+    // 优先绝对时间戳，避免相对秒数快照漂移。
+    remaining = resetAt - nowSec
+  } else if (resetSecs != null && resetSecs >= 0) {
+    if (updatedAt != null && updatedAt > 0) {
+      // 时钟偏移下 updatedAt 可能晚于当前时间，elapsed 需要下限钳制到 0。
+      const elapsedSec = Math.max(nowSec - updatedAt, 0)
+      remaining = resetSecs - elapsedSec
+    } else {
+      remaining = resetSecs
+    }
+  } else {
+    return null
+  }
+
+  if (remaining <= 0) {
+    return { text: '已重置', isUrgent: false, isCritical: false, isExpired: true }
+  }
+
+  const total = Math.floor(remaining)
+  const days = Math.floor(total / 86400)
+  const hours = Math.floor((total % 86400) / 3600)
+  const minutes = Math.floor((total % 3600) / 60)
+  const seconds = total % 60
+  const pad = (n: number) => n.toString().padStart(2, '0')
+
+  let text: string
+  if (days > 0) {
+    text = `${days}天 ${hours}:${pad(minutes)}:${pad(seconds)}`
+  } else if (hours > 0) {
+    text = `${hours}:${pad(minutes)}:${pad(seconds)}`
+  } else {
+    text = `${minutes}:${pad(seconds)}`
+  }
+
+  return {
+    text,
+    isUrgent: total < 3600,
+    isCritical: total < 300,
+    isExpired: false,
+  }
+}
+
+/**
  * OAuth Token 状态信息
  */
 export interface OAuthStatusInfo {

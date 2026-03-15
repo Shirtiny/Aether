@@ -9,10 +9,14 @@ source -> internal -> target
 - 转换失败将抛出 `FormatConversionError`（不再静默回退）。
 """
 
+import ast
+import importlib
+import inspect
 import threading
 import time
 from collections.abc import Generator
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 
 from src.core.api_format.conversion.exceptions import FormatConversionError
@@ -43,32 +47,136 @@ def _track_conversion_metrics(
         )
 
 
+_MATERIALIZING: tuple[str, str] = ("__materializing__", "")
+
+
 class FormatConversionRegistry:
     """基于 Normalizer 的格式转换注册表"""
 
     def __init__(self) -> None:
         self._normalizers: dict[str, FormatNormalizer] = {}
+        self._lazy_normalizers: dict[str, tuple[str, str]] = {}
+        self._lock = threading.RLock()
 
     def register(self, normalizer: FormatNormalizer) -> None:
-        self._normalizers[str(normalizer.FORMAT_ID).upper()] = normalizer
+        key = str(normalizer.FORMAT_ID).upper()
+        with self._lock:
+            self._normalizers[key] = normalizer
+            self._lazy_normalizers.pop(key, None)
         logger.info(f"[FormatConversionRegistry] 注册 normalizer: {normalizer.FORMAT_ID}")
+
+    def register_lazy(self, format_id: str, module_path: str, class_name: str) -> None:
+        key = str(format_id).upper()
+        with self._lock:
+            if key in self._normalizers:
+                logger.debug(
+                    "[FormatConversionRegistry] 跳过 lazy 注册（normalizer 已实例化）: {}",
+                    key,
+                )
+                return
+            existing = self._lazy_normalizers.get(key)
+            if existing and existing != (module_path, class_name):
+                logger.warning(
+                    "[FormatConversionRegistry] FORMAT_ID '{}' 重复 lazy 注册，{}.{}, 将覆盖 {}.{}",
+                    key,
+                    module_path,
+                    class_name,
+                    existing[0],
+                    existing[1],
+                )
+            self._lazy_normalizers[key] = (module_path, class_name)
+        logger.info(
+            "[FormatConversionRegistry] 注册 lazy normalizer: {} -> {}.{}",
+            key,
+            module_path,
+            class_name,
+        )
+
+    def _materialize_lazy_normalizer(self, key: str) -> FormatNormalizer | None:
+        with self._lock:
+            existing = self._normalizers.get(key)
+            if existing is not None:
+                return existing
+            lazy_spec = self._lazy_normalizers.get(key)
+            if lazy_spec is None or lazy_spec is _MATERIALIZING:
+                return None
+            # 标记为正在加载，防止其他线程重复 materialize
+            self._lazy_normalizers[key] = _MATERIALIZING
+
+        module_path, class_name = lazy_spec
+        try:
+            mod = importlib.import_module(module_path)
+            obj = getattr(mod, class_name, None)
+            if not inspect.isclass(obj) or not issubclass(obj, FormatNormalizer):
+                raise TypeError(f"{module_path}.{class_name} 不是有效的 FormatNormalizer")
+            normalizer = obj()
+        except Exception as e:
+            logger.error(
+                "[FormatConversionRegistry] lazy 加载 {}.{} 失败: {}",
+                module_path,
+                class_name,
+                e,
+            )
+            # 恢复 lazy_spec 以便后续重试
+            with self._lock:
+                if self._lazy_normalizers.get(key) is _MATERIALIZING:
+                    self._lazy_normalizers[key] = lazy_spec
+            return None
+
+        self.register(normalizer)
+        key_upper = str(normalizer.FORMAT_ID).upper()
+        with self._lock:
+            return self._normalizers.get(key) or self._normalizers.get(key_upper)
+
+    def _find_registered_by_data_format_id(self, target_dfid: str) -> FormatNormalizer | None:
+        from src.core.api_format.metadata import get_data_format_id_for_endpoint
+
+        with self._lock:
+            registered_items = list(self._normalizers.items())
+        for reg_key, reg_normalizer in registered_items:
+            if get_data_format_id_for_endpoint(reg_key) == target_dfid:
+                return reg_normalizer
+        return None
+
+    def _find_lazy_key_by_data_format_id(self, target_dfid: str) -> str | None:
+        from src.core.api_format.metadata import get_data_format_id_for_endpoint
+
+        with self._lock:
+            lazy_keys = list(self._lazy_normalizers.keys())
+        for lazy_key in lazy_keys:
+            if get_data_format_id_for_endpoint(lazy_key) == target_dfid:
+                return lazy_key
+        return None
 
     def get_normalizer(self, format_id: str) -> FormatNormalizer | None:
         key = str(format_id).upper()
         # 1. 精确匹配
-        normalizer = self._normalizers.get(key)
+        with self._lock:
+            normalizer = self._normalizers.get(key)
         if normalizer is not None:
             return normalizer
+
+        # 2. lazy 精确匹配
+        normalizer = self._materialize_lazy_normalizer(key)
+        if normalizer is not None:
+            return normalizer
+
         # 2. data_format_id 回退：如 "claude:cli" (dfid="claude") -> ClaudeNormalizer (dfid="claude")
         from src.core.api_format.metadata import get_data_format_id_for_endpoint
 
         target_dfid = get_data_format_id_for_endpoint(format_id)
         if not target_dfid:
             return None
-        for reg_key, reg_normalizer in self._normalizers.items():
-            reg_dfid = get_data_format_id_for_endpoint(reg_key)
-            if reg_dfid == target_dfid:
-                return reg_normalizer
+
+        # 3. data_format_id 在已实例化 normalizer 中回退
+        normalizer = self._find_registered_by_data_format_id(target_dfid)
+        if normalizer is not None:
+            return normalizer
+
+        # 4. data_format_id 在 lazy normalizer 中回退
+        lazy_key = self._find_lazy_key_by_data_format_id(target_dfid)
+        if lazy_key:
+            return self._materialize_lazy_normalizer(lazy_key)
         return None
 
     def _require_normalizer(self, format_id: str) -> FormatNormalizer:
@@ -467,13 +575,17 @@ class FormatConversionRegistry:
         return True
 
     def list_normalizers(self) -> list[str]:
-        return sorted(self._normalizers.keys())
+        with self._lock:
+            all_keys = set(self._normalizers.keys()) | set(self._lazy_normalizers.keys())
+        return sorted(all_keys)
 
     def get_supported_targets(self, source_format: str) -> list[str]:
         src = str(source_format).upper()
-        if src not in self._normalizers:
+        with self._lock:
+            all_keys = set(self._normalizers.keys()) | set(self._lazy_normalizers.keys())
+        if src not in all_keys:
             return []
-        return [k for k in self._normalizers.keys() if k != src]
+        return [k for k in sorted(all_keys) if k != src]
 
 
 # 全局注册表（唯一实现）
@@ -482,8 +594,91 @@ _DEFAULT_NORMALIZERS_REGISTERED = False
 _REGISTRATION_LOCK = threading.Lock()
 
 
+def _is_format_normalizer_base(node: ast.expr) -> bool:
+    if isinstance(node, ast.Name):
+        return node.id == "FormatNormalizer"
+    if isinstance(node, ast.Attribute):
+        return node.attr == "FormatNormalizer"
+    return False
+
+
+def _extract_format_id_literal(class_node: ast.ClassDef) -> str | None:
+    for stmt in class_node.body:
+        if isinstance(stmt, ast.Assign):
+            for target in stmt.targets:
+                if isinstance(target, ast.Name) and target.id == "FORMAT_ID":
+                    if isinstance(stmt.value, ast.Constant) and isinstance(stmt.value.value, str):
+                        value = stmt.value.value.strip()
+                        return value or None
+        elif isinstance(stmt, ast.AnnAssign):
+            target = stmt.target
+            if isinstance(target, ast.Name) and target.id == "FORMAT_ID":
+                value = stmt.value
+                if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                    text = value.value.strip()
+                    return text or None
+    return None
+
+
+def _discover_normalizer_specs(normalizers_dir: Path) -> list[tuple[str, str, str]]:
+    specs: list[tuple[str, str, str]] = []
+
+    for py_file in sorted(normalizers_dir.glob("*.py")):
+        if py_file.name.startswith("_"):
+            continue
+
+        module_name = py_file.stem
+        module_path = f"src.core.api_format.conversion.normalizers.{module_name}"
+        module_specs: list[tuple[str, str, str]] = []
+
+        # 优先 AST 发现，避免导入大模块
+        try:
+            source = py_file.read_text(encoding="utf-8")
+            tree = ast.parse(source, filename=str(py_file))
+            for node in tree.body:
+                if not isinstance(node, ast.ClassDef):
+                    continue
+                if not any(_is_format_normalizer_base(base) for base in node.bases):
+                    continue
+                fmt_id = _extract_format_id_literal(node)
+                if fmt_id:
+                    module_specs.append((fmt_id, module_path, node.name))
+        except Exception as e:
+            logger.warning("[FormatConversionRegistry] AST 扫描 {} 失败: {}", module_path, e)
+
+        if module_specs:
+            specs.extend(module_specs)
+            continue
+
+        # AST 无法识别时，回退到反射发现（保持兼容）
+        try:
+            mod = importlib.import_module(module_path)
+        except Exception as e:
+            logger.error("[FormatConversionRegistry] 导入 {} 失败: {}", module_path, e)
+            continue
+
+        for _attr_name, obj in inspect.getmembers(mod, inspect.isclass):
+            if (
+                issubclass(obj, FormatNormalizer)
+                and obj is not FormatNormalizer
+                and hasattr(obj, "FORMAT_ID")
+                and obj.__module__ == mod.__name__
+            ):
+                fmt_id = str(getattr(obj, "FORMAT_ID", "")).strip()
+                if fmt_id:
+                    module_specs.append((fmt_id, module_path, obj.__name__))
+
+        if not module_specs:
+            logger.warning("[FormatConversionRegistry] 未在 {} 发现可注册 normalizer", module_path)
+            continue
+
+        specs.extend(module_specs)
+
+    return specs
+
+
 def register_default_normalizers() -> None:
-    """自动发现并注册 normalizers/ 目录下的所有 FormatNormalizer 实现"""
+    """自动发现并懒注册 normalizers/ 目录下的所有 FormatNormalizer 实现"""
     global _DEFAULT_NORMALIZERS_REGISTERED  # noqa: PLW0603 - module-level 缓存
 
     # 快速路径：已注册则直接返回（无锁）
@@ -495,43 +690,13 @@ def register_default_normalizers() -> None:
         if _DEFAULT_NORMALIZERS_REGISTERED:
             return
 
-        import importlib
-        import inspect
-        from pathlib import Path
-
         normalizers_dir = Path(__file__).parent / "normalizers"
-        for py_file in sorted(normalizers_dir.glob("*.py")):
-            if py_file.name.startswith("_"):
-                continue
-            module_name = py_file.stem
-            module_path = f"src.core.api_format.conversion.normalizers.{module_name}"
-            try:
-                mod = importlib.import_module(module_path)
-            except Exception as e:
-                logger.error("[FormatConversionRegistry] 导入 {} 失败: {}", module_path, e)
-                continue
-            for _attr_name, obj in inspect.getmembers(mod, inspect.isclass):
-                if (
-                    issubclass(obj, FormatNormalizer)
-                    and obj is not FormatNormalizer
-                    and hasattr(obj, "FORMAT_ID")
-                    and obj.__module__ == mod.__name__
-                ):
-                    fmt_id = str(obj.FORMAT_ID).upper()
-                    if format_conversion_registry.get_normalizer(fmt_id) is not None:
-                        logger.warning(
-                            "[FormatConversionRegistry] FORMAT_ID '{}' 重复注册，{} 将覆盖已有实现",
-                            fmt_id,
-                            obj.__name__,
-                        )
-                    try:
-                        format_conversion_registry.register(obj())
-                    except Exception as e:
-                        logger.error("[FormatConversionRegistry] 注册 {} 失败: {}", obj.__name__, e)
+        for fmt_id, module_path, class_name in _discover_normalizer_specs(normalizers_dir):
+            format_conversion_registry.register_lazy(fmt_id, module_path, class_name)
 
         _DEFAULT_NORMALIZERS_REGISTERED = True
         logger.info(
-            "[FormatConversionRegistry] 已注册 {} 个 normalizer",
+            "[FormatConversionRegistry] 已懒注册 {} 个 normalizer",
             len(format_conversion_registry.list_normalizers()),
         )
 

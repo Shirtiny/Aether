@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 
 from src.api.base.authenticated_adapter import AuthenticatedApiAdapter
 from src.api.base.context import ApiRequestContext
-from src.api.base.pipeline import ApiRequestPipeline
+from src.api.base.pipeline import get_pipeline
 from src.api.serializers import (
     safe_gateway_response,
     serialize_payment_order,
@@ -39,7 +39,7 @@ from src.services.payment import PaymentService
 from src.services.wallet import WalletDailyUsageLedgerService, WalletService
 
 router = APIRouter(prefix="/api/wallet", tags=["Wallet"])
-pipeline = ApiRequestPipeline()
+pipeline = get_pipeline()
 
 
 def _create_recharge_order_sync(user_id: str, req: CreateRechargePayload) -> dict[str, Any]:

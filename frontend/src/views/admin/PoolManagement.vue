@@ -516,7 +516,7 @@
                       :key="`${key.key_id}-quota-${idx}`"
                       class="w-full"
                     >
-                      <div class="h-4 grid grid-cols-[20px_minmax(0,1fr)_42px] items-center gap-1 text-[10px] leading-tight">
+                      <div class="min-h-4 grid grid-cols-[20px_minmax(0,1fr)_42px] items-center gap-1 text-[10px] leading-tight">
                         <span
                           class="text-muted-foreground whitespace-nowrap text-right tabular-nums"
                           :title="getQuotaProgressTooltip(item)"
@@ -1153,7 +1153,7 @@ import {
 import RefreshButton from '@/components/ui/refresh-button.vue'
 import { useToast } from '@/composables/useToast'
 import { useClipboard } from '@/composables/useClipboard'
-import { useCountdownTimer, getOAuthExpiresCountdown } from '@/composables/useCountdownTimer'
+import { useCountdownTimer, getOAuthExpiresCountdown, getCodexResetCountdown } from '@/composables/useCountdownTimer'
 import { useConfirm } from '@/composables/useConfirm'
 import { parseApiError } from '@/utils/errorParser'
 import {
@@ -2426,10 +2426,22 @@ function getQuotaProgressLabel(label: string): string {
   return label
 }
 
+function getQuotaProgressCountdown(item: QuotaProgressItem) {
+  if ((item.label !== '5H' && item.label !== '周') || item.resetAtSeconds == null) return null
+  return getCodexResetCountdown(item.resetAtSeconds, null, null, countdownTick.value)
+}
+
+function getQuotaProgressCountdownText(item: QuotaProgressItem): string {
+  const status = getQuotaProgressCountdown(item)
+  if (!status) return ''
+  return status.isExpired ? status.text : `${status.text} 后重置`
+}
+
 function getQuotaProgressTooltip(item: QuotaProgressItem): string {
   const detail = item.detail?.trim() || ''
-  if ((item.label === '5H' || item.label === '周') && item.resetAtSeconds != null) {
-    return `${formatQuotaInlineCountdown(item.resetAtSeconds)} 后重置`
+  const countdownText = getQuotaProgressCountdownText(item)
+  if (countdownText) {
+    return countdownText
   }
   return detail
 }
@@ -2470,26 +2482,6 @@ function parseQuotaResetRemainingSeconds(detail: string | undefined): number | n
 
   if (total <= 0) return 1
   return total
-}
-
-function formatQuotaInlineCountdown(resetAtSeconds: number): string {
-  // 触发响应式更新，保持倒计时每秒刷新
-  void countdownTick.value
-
-  const now = Math.floor(Date.now() / 1000)
-  const remain = Math.max(0, Math.floor(resetAtSeconds - now))
-  const days = Math.floor(remain / 86400)
-  const hours = Math.floor((remain % 86400) / 3600)
-  const minutes = Math.floor((remain % 3600) / 60)
-  const seconds = remain % 60
-
-  if (days > 0) {
-    return `${days}d${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}`
-  }
-  if (hours > 0) {
-    return `${hours}:${String(minutes).padStart(2, '0')}`
-  }
-  return `${minutes}:${String(seconds).padStart(2, '0')}`
 }
 
 function parseQuotaProgressItems(quotaText: string | null | undefined): QuotaProgressItem[] {

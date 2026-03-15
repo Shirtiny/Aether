@@ -8,8 +8,10 @@ import pytest
 from src.api.handlers.base.upstream_stream_bridge import (
     aggregate_upstream_stream_to_internal_response,
 )
+from src.config.constants import StreamDefaults
 from src.core.api_format.conversion import register_default_normalizers
 from src.core.api_format.conversion.internal import TextBlock
+from src.core.exceptions import ProviderNotAvailableException
 
 
 async def _iter_stream_lines(lines: list[str]) -> AsyncIterator[bytes]:
@@ -82,3 +84,62 @@ async def test_aggregate_claude_stream_uses_message_start_usage_when_message_del
     assert len(internal.content) == 1
     assert isinstance(internal.content[0], TextBlock)
     assert internal.content[0].text == "hello"
+
+
+@pytest.mark.asyncio
+async def test_aggregate_stream_raises_when_buffer_exceeds_limit() -> None:
+    register_default_normalizers()
+
+    async def _iter_overflow_bytes() -> AsyncIterator[bytes]:
+        yield b"x" * (StreamDefaults.MAX_STREAM_BUFFER_BYTES + 1)
+
+    with pytest.raises(ProviderNotAvailableException):
+        await aggregate_upstream_stream_to_internal_response(
+            _iter_overflow_bytes(),
+            provider_api_format="claude:cli",
+            provider_name="claude_code",
+            model="claude-sonnet-4-5",
+            request_id="req_bridge_overflow",
+        )
+
+
+@pytest.mark.asyncio
+async def test_aggregate_stream_raises_when_total_buffer_exceeds_hard_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    register_default_normalizers()
+    monkeypatch.setattr(StreamDefaults, "MAX_STREAM_BUFFER_BYTES", 64)
+    monkeypatch.setattr(StreamDefaults, "MAX_STREAM_BUFFER_TOTAL_BYTES", 80)
+
+    async def _iter_total_overflow_bytes() -> AsyncIterator[bytes]:
+        yield b":" + (b"a" * 30) + b"\n" + b":" + (b"b" * 30) + b"\n" + b":" + (b"c" * 30) + b"\n"
+
+    with pytest.raises(ProviderNotAvailableException):
+        await aggregate_upstream_stream_to_internal_response(
+            _iter_total_overflow_bytes(),
+            provider_api_format="claude:cli",
+            provider_name="claude_code",
+            model="claude-sonnet-4-5",
+            request_id="req_bridge_total_overflow",
+        )
+
+
+@pytest.mark.asyncio
+async def test_aggregate_stream_allows_large_chunk_with_multiple_complete_lines(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    register_default_normalizers()
+    monkeypatch.setattr(StreamDefaults, "MAX_STREAM_BUFFER_BYTES", 64)
+
+    async def _iter_multiline_bytes() -> AsyncIterator[bytes]:
+        yield b":" + (b"a" * 30) + b"\n" + b":" + (b"b" * 30) + b"\n" + b":" + (b"c" * 30) + b"\n"
+
+    internal = await aggregate_upstream_stream_to_internal_response(
+        _iter_multiline_bytes(),
+        provider_api_format="claude:cli",
+        provider_name="claude_code",
+        model="claude-sonnet-4-5",
+        request_id="req_bridge_multiline",
+    )
+
+    assert internal is not None

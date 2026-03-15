@@ -644,16 +644,16 @@ class ClaudeCodeEnvelope:
 
             set_current_fingerprint(ensure_key_fingerprint(key, persist_if_missing=True))
 
-        _ctx, tls_profile = build_and_set_claude_code_request_context(
+        build_and_set_claude_code_request_context(
             provider_config=provider_config,
             key_id=key_id,
             is_stream=is_stream,
             provider_id=provider_id,
         )
         fp = get_current_fingerprint()
-        if _ctx.enable_tls_fingerprint and fp:
+        if fp:
             return fp.impersonate
-        return tls_profile
+        return None
 
     async def post_wrap_request(self, request_body: dict[str, Any]) -> None:
         await enforce_distributed_session_controls(

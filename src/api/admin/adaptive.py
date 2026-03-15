@@ -21,14 +21,14 @@ from sqlalchemy.orm import Session, load_only
 
 from src.api.base.admin_adapter import AdminApiAdapter
 from src.api.base.context import ApiRequestContext
-from src.api.base.pipeline import ApiRequestPipeline
+from src.api.base.pipeline import get_pipeline
 from src.core.exceptions import InvalidRequestException, translate_pydantic_error
 from src.database import get_db
 from src.models.database import ProviderAPIKey
 from src.services.rate_limit.adaptive_rpm import get_adaptive_rpm_manager
 
 router = APIRouter(prefix="/api/admin/adaptive", tags=["Adaptive RPM"])
-pipeline = ApiRequestPipeline()
+pipeline = get_pipeline()
 
 
 # ==================== Pydantic Models ====================

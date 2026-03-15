@@ -519,11 +519,13 @@ async def enrich_auth_config(
     """Enrich auth_config with non-secret metadata (email/account_id).
 
     各 provider 的 enrichment 逻辑通过 register_auth_enricher 注册。
-    注意: ensure_providers_bootstrapped() 在应用启动时(main.py lifespan)已显式调用。
+    为支持按需 bootstrap，这里会尝试按 provider_type 触发插件注册。
     """
     from src.core.provider_types import normalize_provider_type
+    from src.services.provider.envelope import ensure_providers_bootstrapped
 
     pt = normalize_provider_type(provider_type)
+    ensure_providers_bootstrapped(provider_types=[pt] if pt else None)
     enricher = _auth_enrichers.get(pt)
     if enricher:
         return await enricher(auth_config, token_response, access_token, proxy_config)

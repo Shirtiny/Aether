@@ -15,13 +15,13 @@ from sqlalchemy.orm import Session
 from src.api.base.adapter import ApiMode
 from src.api.base.authenticated_adapter import AuthenticatedApiAdapter
 from src.api.base.context import ApiRequestContext
-from src.api.base.pipeline import ApiRequestPipeline
+from src.api.base.pipeline import get_pipeline
 from src.core.exceptions import InvalidRequestException, translate_pydantic_error
 from src.database import get_db
 from src.services.rate_limit.ip_limiter import IPRateLimiter
 
 router = APIRouter(prefix="/api/admin/security/ip", tags=["Admin - Security"])
-pipeline = ApiRequestPipeline()
+pipeline = get_pipeline()
 
 
 # ========== Pydantic 模型 ==========

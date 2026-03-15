@@ -22,6 +22,11 @@ export interface ModelStatsItem {
   model: string
   request_count: number
   total_tokens: number
+  total_input_context?: number
+  output_tokens?: number
+  cache_read_tokens?: number
+  cache_creation_tokens?: number
+  cache_hit_rate?: number
   total_cost: number
   actual_cost?: number  // 倍率消耗
 }
@@ -36,6 +41,11 @@ export interface ProviderStatsItem {
   provider: string
   requests: number
   totalTokens: number
+  totalInputContext?: number
+  outputTokens?: number
+  cacheReadTokens?: number
+  cacheCreationTokens?: number
+  cacheHitRate?: number
   totalCost: number
   actualCost?: number
   successRate: number
@@ -47,6 +57,11 @@ export interface ApiFormatStatsItem {
   api_format: string
   request_count: number
   total_tokens: number
+  total_input_context?: number
+  output_tokens?: number
+  cache_read_tokens?: number
+  cache_creation_tokens?: number
+  cache_hit_rate?: number
   total_cost: number
   actual_cost?: number
   avgResponseTime: string

@@ -122,10 +122,12 @@ def test_sync_delete_reports_progress_after_each_batch(
             self.rowcounts = [2, 1]
             self.commits = 0
             self.closed = False
+            self.text_statements: list[str] = []
 
         def execute(self, _statement: object) -> SimpleNamespace:
-            # SET LOCAL statement_timeout 不消耗 rowcount
+            # SET LOCAL statement_timeout / lock_timeout 不消耗 rowcount
             if hasattr(_statement, "text"):
+                self.text_statements.append(_statement.text)
                 return SimpleNamespace(rowcount=0)
             return SimpleNamespace(rowcount=self.rowcounts.pop(0))
 
@@ -146,7 +148,7 @@ def test_sync_delete_reports_progress_after_each_batch(
     monkeypatch.setattr(
         taskmod,
         "cleanup_key_references",
-        lambda _db, batch: cleanup_batches.append(list(batch)),
+        lambda _db, batch, **_kwargs: cleanup_batches.append(list(batch)),
     )
     monkeypatch.setattr("src.database.create_session", lambda: session)
     monkeypatch.setattr(
@@ -165,4 +167,85 @@ def test_sync_delete_reports_progress_after_each_batch(
     assert progress_updates == [2, 3]
     assert cleanup_batches == [["key-1", "key-2"], ["key-3"]]
     assert session.commits == 2
+    assert session.text_statements == [
+        "SET LOCAL statement_timeout = '30000'",
+        "SET LOCAL lock_timeout = '5000'",
+        "SET LOCAL statement_timeout = '30000'",
+        "SET LOCAL lock_timeout = '5000'",
+    ]
+    assert session.closed is True
+
+
+def test_sync_delete_retries_with_smaller_batches_after_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FakeColumn:
+        def __eq__(self, other: object) -> tuple[str, object]:  # type: ignore[override]
+            return ("eq", other)
+
+        def in_(self, values: list[str]) -> tuple[str, tuple[str, ...]]:
+            return ("in", tuple(values))
+
+    class _FakeProviderAPIKey:
+        provider_id = _FakeColumn()
+        id = _FakeColumn()
+
+    class _FakeDeleteStatement:
+        def where(self, *_conditions: object) -> "_FakeDeleteStatement":
+            return self
+
+    class _FakeSession:
+        def __init__(self) -> None:
+            self.rowcounts = [2, 2]
+            self.commits = 0
+            self.rollbacks = 0
+            self.closed = False
+
+        def execute(self, _statement: object) -> SimpleNamespace:
+            if hasattr(_statement, "text"):
+                return SimpleNamespace(rowcount=0)
+            return SimpleNamespace(rowcount=self.rowcounts.pop(0))
+
+        def commit(self) -> None:
+            self.commits += 1
+
+        def rollback(self) -> None:
+            self.rollbacks += 1
+
+        def close(self) -> None:
+            self.closed = True
+
+    session = _FakeSession()
+    progress_updates: list[int] = []
+    cleanup_batches: list[list[str]] = []
+
+    def fake_cleanup(_db: object, batch: list[str], **_kwargs: object) -> None:
+        cleanup_batches.append(list(batch))
+        if len(batch) >= 4:
+            raise RuntimeError(
+                "(psycopg2.errors.QueryCanceled) canceling statement due to statement timeout"
+            )
+
+    monkeypatch.setattr(taskmod, "_CLEANUP_BATCH_SIZE", 4)
+    monkeypatch.setattr(taskmod, "_MIN_RETRY_BATCH_SIZE", 1)
+    monkeypatch.setattr(taskmod, "cleanup_key_references", fake_cleanup)
+    monkeypatch.setattr("src.database.create_session", lambda: session)
+    monkeypatch.setattr("src.models.database.ProviderAPIKey", _FakeProviderAPIKey)
+    monkeypatch.setattr(taskmod, "sa_delete", lambda _model: _FakeDeleteStatement())
+
+    affected = taskmod._sync_delete(
+        "provider-1",
+        ["key-1", "key-2", "key-3", "key-4"],
+        progress_updates.append,
+    )
+
+    assert affected == 4
+    assert progress_updates == [4]
+    assert cleanup_batches == [
+        ["key-1", "key-2", "key-3", "key-4"],
+        ["key-1", "key-2"],
+        ["key-3", "key-4"],
+    ]
+    assert session.commits == 2
+    assert session.rollbacks == 1
     assert session.closed is True

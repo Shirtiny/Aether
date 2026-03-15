@@ -83,7 +83,7 @@ def get_pool_hook(provider_type: str | None) -> PoolSchedulingHook | None:
         return None
     from src.services.provider.envelope import ensure_providers_bootstrapped
 
-    ensure_providers_bootstrapped()
+    ensure_providers_bootstrapped(provider_types=[provider_type])
 
     from src.core.provider_types import normalize_provider_type
 

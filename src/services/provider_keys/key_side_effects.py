@@ -4,6 +4,8 @@ Provider Key 写操作后的副作用处理。
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from sqlalchemy import delete as sa_delete
 from sqlalchemy import update as sa_update
 from sqlalchemy.orm import Session
@@ -12,7 +14,6 @@ from src.core.logger import logger
 from src.models.database import (
     GeminiFileMapping,
     ProviderAPIKey,
-    RequestCandidate,
     Usage,
     VideoTask,
 )
@@ -22,11 +23,34 @@ from src.services.cache.provider_cache import ProviderCacheService
 _SQLITE_BATCH_SIZE = 900
 _DEFAULT_BATCH_SIZE = 2000
 
+_CLEANUP_STAGES = (
+    (
+        "gemini_file_mappings",
+        lambda batch: sa_delete(GeminiFileMapping).where(GeminiFileMapping.key_id.in_(batch)),
+    ),
+    (
+        "usage",
+        lambda batch: sa_update(Usage)
+        .where(Usage.provider_api_key_id.in_(batch))
+        .values(provider_api_key_id=None),
+    ),
+    (
+        "video_tasks",
+        lambda batch: sa_update(VideoTask).where(VideoTask.key_id.in_(batch)).values(key_id=None),
+    ),
+)
 
-def cleanup_key_references(db: Session, key_ids: list[str]) -> None:
+
+def cleanup_key_references(
+    db: Session,
+    key_ids: list[str],
+    *,
+    batch_size: int | None = None,
+    stage_callback: Callable[[str, int], None] | None = None,
+) -> None:
     """在删除 ProviderAPIKey 前，先显式处理关联表引用，降低级联删除/置空成本。
 
-    - request_candidates / gemini_file_mappings: 直接删除
+    - gemini_file_mappings: 直接删除
     - usage / video_tasks: 先置空外键，保留快照与历史记录
 
     PostgreSQL 下直接按 key_id/provider_api_key_id 批量处理；
@@ -34,16 +58,12 @@ def cleanup_key_references(db: Session, key_ids: list[str]) -> None:
     """
     if not key_ids:
         return
-    batch_size = _resolve_batch_size(db)
-    for batch in _iter_batches(key_ids, batch_size):
-        db.execute(sa_delete(RequestCandidate).where(RequestCandidate.key_id.in_(batch)))
-        db.execute(sa_delete(GeminiFileMapping).where(GeminiFileMapping.key_id.in_(batch)))
-        db.execute(
-            sa_update(Usage)
-            .where(Usage.provider_api_key_id.in_(batch))
-            .values(provider_api_key_id=None)
-        )
-        db.execute(sa_update(VideoTask).where(VideoTask.key_id.in_(batch)).values(key_id=None))
+    effective_batch_size = batch_size if batch_size is not None else _resolve_batch_size(db)
+    for batch in iter_key_batches(key_ids, effective_batch_size):
+        for stage_name, statement_factory in _CLEANUP_STAGES:
+            if stage_callback is not None:
+                stage_callback(stage_name, len(batch))
+            db.execute(statement_factory(batch))
 
 
 def _resolve_batch_size(db: Session) -> int:
@@ -57,10 +77,13 @@ def _resolve_batch_size(db: Session) -> int:
     return _DEFAULT_BATCH_SIZE
 
 
-def _iter_batches(items: list[str], batch_size: int) -> list[list[str]]:
+def iter_key_batches(items: list[str], batch_size: int) -> list[list[str]]:
+    """将 key_ids 列表按 batch_size 拆分为子列表。"""
+    if not items:
+        return []
     if batch_size <= 0:
-        return [items]
-    return [items[i : i + batch_size] for i in range(0, len(items), batch_size)]
+        return [list(items)]
+    return [list(items[i : i + batch_size]) for i in range(0, len(items), batch_size)]
 
 
 async def run_update_key_side_effects(

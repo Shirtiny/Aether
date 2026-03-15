@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from src.api.base.admin_adapter import AdminApiAdapter
 from src.api.base.context import ApiRequestContext
-from src.api.base.pipeline import ApiRequestPipeline
+from src.api.base.pipeline import get_pipeline
 from src.core.crypto import CryptoService
 from src.core.model_permissions import (
     check_model_allowed_with_mappings,
@@ -36,7 +36,7 @@ from src.services.scheduling.aware_scheduler import CacheAwareScheduler
 from src.services.system.config import SystemConfigService
 
 router = APIRouter(prefix="/global", tags=["Admin - Global Models"])
-pipeline = ApiRequestPipeline()
+pipeline = get_pipeline()
 
 
 # ========== Response Models ==========

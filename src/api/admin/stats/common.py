@@ -10,12 +10,12 @@ from typing import Any, Literal
 from fastapi import HTTPException
 from sqlalchemy import and_, or_
 
-from src.api.base.pipeline import ApiRequestPipeline
+from src.api.base.pipeline import get_pipeline
 from src.config.settings import config
 from src.models.database import Usage
 from src.services.system.time_range import TimeRangeParams
 
-pipeline = ApiRequestPipeline()
+pipeline = get_pipeline()
 
 
 def _apply_admin_default_range(

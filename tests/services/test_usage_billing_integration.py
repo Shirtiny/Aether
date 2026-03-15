@@ -180,3 +180,73 @@ async def test_prepare_usage_record_infers_ttl_from_1h_cache_split(
 
     assert _DummyBillingService.last_dimensions is not None
     assert _DummyBillingService.last_dimensions.get("cache_ttl_minutes") == 60
+
+
+@pytest.mark.asyncio
+async def test_prepare_usage_record_deserializes_body_json_before_build_params(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = MagicMock()
+
+    monkeypatch.setattr("src.services.billing.service.BillingService", _DummyBillingService)
+    monkeypatch.setattr(
+        "src.services.usage._billing_integration.sanitize_request_metadata",
+        lambda metadata: metadata,
+    )
+
+    captured: dict[str, Any] = {}
+
+    def _capture_build_usage_params(**kwargs: Any) -> dict[str, Any]:
+        captured.update(kwargs)
+        return {"total_cost_usd": 0.0, "actual_total_cost_usd": 0.0}
+
+    monkeypatch.setattr(
+        "src.services.usage._billing_integration.build_usage_params",
+        _capture_build_usage_params,
+    )
+
+    params = _build_params(db)
+    params.request_body = '{"messages":[{"role":"user","content":"hello"}]}'
+    params.provider_request_body = '{"tools":[{"name":"calc"}]}'
+    params.response_body = '{"choices":[{"index":0}]}'
+    params.client_response_body = '{"output":[{"type":"text"}]}'
+
+    await _TestUsageBillingIntegration._prepare_usage_record(params)
+
+    assert isinstance(captured["request_body"], dict)
+    assert captured["request_body"]["messages"][0]["content"] == "hello"
+    assert isinstance(captured["provider_request_body"], dict)
+    assert isinstance(captured["response_body"], dict)
+    assert isinstance(captured["client_response_body"], dict)
+
+
+@pytest.mark.asyncio
+async def test_prepare_usage_record_keeps_invalid_json_body_string(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = MagicMock()
+
+    monkeypatch.setattr("src.services.billing.service.BillingService", _DummyBillingService)
+    monkeypatch.setattr(
+        "src.services.usage._billing_integration.sanitize_request_metadata",
+        lambda metadata: metadata,
+    )
+
+    captured: dict[str, Any] = {}
+
+    def _capture_build_usage_params(**kwargs: Any) -> dict[str, Any]:
+        captured.update(kwargs)
+        return {"total_cost_usd": 0.0, "actual_total_cost_usd": 0.0}
+
+    monkeypatch.setattr(
+        "src.services.usage._billing_integration.build_usage_params",
+        _capture_build_usage_params,
+    )
+
+    invalid_json = '{"content":"x...[truncated]'
+    params = _build_params(db)
+    params.request_body = invalid_json
+
+    await _TestUsageBillingIntegration._prepare_usage_record(params)
+
+    assert captured["request_body"] == invalid_json

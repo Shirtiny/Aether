@@ -27,13 +27,7 @@ class CandidateRecorder:
             if getattr(row, "provider", None) is not None:
                 provider_name = getattr(row.provider, "name", None)
 
-            key_name = None
-            auth_type = None
-            priority = None
-            if getattr(row, "key", None) is not None:
-                key_name = getattr(row.key, "name", None)
-                auth_type = getattr(row.key, "auth_type", None)
-                priority = getattr(row.key, "priority", None)
+            key_name = getattr(row, "api_key_name", None)
 
             result.append(
                 CandidateKey(
@@ -44,8 +38,6 @@ class CandidateRecorder:
                     endpoint_id=str(row.endpoint_id) if row.endpoint_id else None,
                     key_id=str(row.key_id) if row.key_id else None,
                     key_name=str(key_name) if key_name else None,
-                    auth_type=str(auth_type) if auth_type else None,
-                    priority=int(priority) if priority is not None else None,
                     is_cached=bool(getattr(row, "is_cached", False)),
                     status=str(getattr(row, "status", "") or "pending"),
                     skip_reason=getattr(row, "skip_reason", None),

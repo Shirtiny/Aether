@@ -27,7 +27,11 @@ def _get_preset_mutex_group(preset_name: str) -> str | None:
     return _normalize_mutex_group(getattr(dim, "mutex_group", None))
 
 
-def _normalize_presets_from_config(config: Any) -> tuple[tuple[str, str | None], ...]:
+def _normalize_presets_from_config(
+    config: Any,
+    *,
+    provider_type: str | None = None,
+) -> tuple[tuple[str, str | None], ...]:
     """Extract enabled (preset_name, mode) tuples from config.scheduling_presets.
 
     Supports both new SchedulingPreset objects and legacy string lists.
@@ -40,6 +44,7 @@ def _normalize_presets_from_config(config: Any) -> tuple[tuple[str, str | None],
     if not isinstance(raw, (list, tuple)):
         return ()
 
+    normalized_provider_type = str(provider_type or "").strip().lower()
     allowed = get_preset_names() | {"lru"}
     entries: list[tuple[int, str, bool, str | None]] = []
     seen: set[str] = set()
@@ -63,6 +68,15 @@ def _normalize_presets_from_config(config: Any) -> tuple[tuple[str, str | None],
             continue
         seen.add(preset_name)
         entries.append((idx, preset_name, enabled, mode))
+
+    # Codex 默认启用额度刷新优先维度（除非显式配置了 recent_refresh）。
+    if (
+        normalized_provider_type == "codex"
+        and entries
+        and "recent_refresh" not in {name for _idx, name, _enabled, _mode in entries}
+        and "recent_refresh" in allowed
+    ):
+        entries.append((len(entries), "recent_refresh", True, None))
 
     if not entries:
         return ()
@@ -127,7 +141,10 @@ class MultiScoreStrategy:
         if not isinstance(keys_by_id, dict):
             keys_by_id = {}
 
-        presets = _normalize_presets_from_config(config)
+        presets = _normalize_presets_from_config(
+            config,
+            provider_type=context.get("provider_type"),
+        )
         lru_enabled = bool(getattr(config, "lru_enabled", True))
         if presets:
             return self._compute_preset_score(

@@ -93,7 +93,6 @@ class AdaptiveReservationManager:
 
     def __init__(self, config: ReservationConfig | None = None):
         self.config = config or ReservationConfig()
-        self._cache: dict[str, ReservationResult] = {}  # 简单的内存缓存
 
     def calculate_reservation(
         self,

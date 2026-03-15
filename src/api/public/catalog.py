@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session, joinedload, load_only
 
 from src.api.base.adapter import ApiAdapter, ApiMode
 from src.api.base.context import ApiRequestContext
-from src.api.base.pipeline import ApiRequestPipeline
+from src.api.base.pipeline import get_pipeline
 from src.config.constants import CacheTTL
 from src.core.logger import logger
 from src.database import get_db
@@ -44,7 +44,7 @@ from src.services.system.config import SystemConfigService
 from src.utils.cache_decorator import cache_result
 
 router = APIRouter(prefix="/api/public", tags=["System Catalog"])
-pipeline = ApiRequestPipeline()
+pipeline = get_pipeline()
 
 
 @router.get("/site-info")

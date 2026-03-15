@@ -18,11 +18,13 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import delete, literal_column, text
 
+from src.clients.http_client import HTTPClientPool
 from src.config.settings import config
 from src.core.logger import logger
 from src.database import create_session
@@ -47,6 +49,20 @@ class MaintenanceScheduler:
         self._interval_tasks = []
         self._stats_aggregation_lock = asyncio.Lock()
         self._wallet_daily_usage_lock = asyncio.Lock()
+
+    @staticmethod
+    def _get_http_client_idle_cleanup_interval_minutes() -> int:
+        """获取 HTTP 客户端空闲清理调度间隔（分钟）。"""
+        raw = os.getenv("HTTP_CLIENT_IDLE_CLEANUP_INTERVAL_MINUTES", "5")
+        try:
+            minutes = int(raw)
+        except ValueError:
+            logger.warning(
+                "环境变量 HTTP_CLIENT_IDLE_CLEANUP_INTERVAL_MINUTES 非法: {}, 使用默认值 5",
+                raw,
+            )
+            return 5
+        return max(1, minutes)
 
     def _get_checkin_time(self) -> tuple[int, int]:
         """获取签到任务的执行时间
@@ -168,6 +184,14 @@ class MaintenanceScheduler:
             minutes=5,
             job_id="pool_monitor",
             name="连接池监控",
+        )
+
+        # HTTP 代理/Tunnel 客户端空闲清理 - 默认每 5 分钟
+        scheduler.add_interval_job(
+            self._scheduled_http_client_idle_cleanup,
+            minutes=self._get_http_client_idle_cleanup_interval_minutes(),
+            job_id="http_client_idle_cleanup",
+            name="HTTP客户端空闲清理",
         )
 
         # Pending 状态清理 - 每 5 分钟
@@ -296,7 +320,20 @@ class MaintenanceScheduler:
 
             log_pool_status()
         except Exception as e:
-            logger.exception(f"连接池监控任务出错: {e}")
+            logger.exception("连接池监控任务出错: {}", e)
+
+    async def _scheduled_http_client_idle_cleanup(self) -> None:
+        """HTTP 客户端空闲清理任务（定时调用）。"""
+        try:
+            stats = await HTTPClientPool.cleanup_idle_clients()
+            if stats.get("proxy_closed", 0) or stats.get("tunnel_closed", 0):
+                logger.info(
+                    "HTTP 客户端空闲清理释放连接: proxy={}, tunnel={}",
+                    stats.get("proxy_closed", 0),
+                    stats.get("tunnel_closed", 0),
+                )
+        except Exception as e:
+            logger.exception("HTTP 客户端空闲清理任务出错: {}", e)
 
     async def _scheduled_pending_cleanup(self) -> None:
         """Pending 清理任务（定时调用）"""
@@ -786,13 +823,28 @@ class MaintenanceScheduler:
                     return 0
 
                 retention_days = max(
-                    SystemConfigService.get_config(db, "detail_log_retention_days", 7),
+                    SystemConfigService.get_config(
+                        db,
+                        "request_candidates_retention_days",
+                        SystemConfigService.get_config(db, "detail_log_retention_days", 7),
+                    ),
                     3,
                 )
-                batch_size = SystemConfigService.get_config(db, "cleanup_batch_size", 1000)
+                batch_size = max(
+                    SystemConfigService.get_config(
+                        db,
+                        "request_candidates_cleanup_batch_size",
+                        SystemConfigService.get_config(db, "cleanup_batch_size", 1000),
+                    ),
+                    1,
+                )
                 cutoff_time = datetime.now(timezone.utc) - timedelta(days=retention_days)
 
-                logger.info(f"开始清理 {retention_days} 天前的请求候选记录...")
+                logger.info(
+                    "开始清理 {} 天前的请求候选记录，batch_size={}",
+                    retention_days,
+                    batch_size,
+                )
             except Exception as e:
                 logger.exception(f"候选记录清理配置读取失败: {e}")
                 return 0
@@ -806,6 +858,7 @@ class MaintenanceScheduler:
                     records_to_delete = (
                         batch_db.query(RequestCandidate.id)
                         .filter(RequestCandidate.created_at < cutoff_time)
+                        .order_by(RequestCandidate.created_at.asc(), RequestCandidate.id.asc())
                         .limit(batch_size)
                         .all()
                     )

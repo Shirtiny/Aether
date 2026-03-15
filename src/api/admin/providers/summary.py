@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session, load_only
 from src.api.base.admin_adapter import AdminApiAdapter
 from src.api.base.context import ApiRequestContext
 from src.api.base.models_service import invalidate_models_list_cache
-from src.api.base.pipeline import ApiRequestPipeline
+from src.api.base.pipeline import get_pipeline
 from src.config.constants import CacheTTL
 from src.core.enums import ProviderBillingType
 from src.core.exceptions import InvalidRequestException, NotFoundException
@@ -44,7 +44,7 @@ from src.services.cache.provider_cache import ProviderCacheService
 from src.utils.cache_decorator import cache_result
 
 router = APIRouter(tags=["Provider Summary"])
-pipeline = ApiRequestPipeline()
+pipeline = get_pipeline()
 
 
 @router.get("/summary", response_model=ProviderSummaryPageResponse)

@@ -45,6 +45,24 @@ class PluginManager:
         "load_balancer": LoadBalancerStrategy,
         # 移除 "audit" - 审计功能现在是核心服务
     }
+    # 默认按需加载集合（未显式配置时使用）
+    # notification 默认不加载，避免未配置插件（如 email）在启动时初始化失败并占用内存。
+    DEFAULT_ENABLED_PLUGIN_MODULES: dict[str, tuple[str, ...]] = {
+        "auth": ("api_key",),
+        "rate_limit": ("sliding_window",),
+        "cache": ("memory",),
+        "monitor": ("prometheus",),
+        "token": ("claude",),
+        "notification": (),
+        "load_balancer": ("sticky_priority",),
+    }
+    # 部分插件“实例名”与“模块名”不同，按需加载时需要映射。
+    MODULE_ALIASES: dict[str, dict[str, str]] = {
+        "token": {
+            "claude": "claude_counter",
+            "tiktoken": "tiktoken_counter",
+        }
+    }
 
     def __init__(self, config: dict[str, Any] | None = None):
         """
@@ -92,17 +110,61 @@ class PluginManager:
             if not type_dir.exists():
                 continue
 
-            # 扫描插件目录
-            for file_path in type_dir.glob("*.py"):
-                if file_path.name.startswith("_") or file_path.name == "base.py":
-                    continue
-
-                module_name = f"src.plugins.{plugin_type}.{file_path.stem}"
+            enabled_modules = self._resolve_enabled_plugin_modules(plugin_type, type_dir)
+            for module_stem in enabled_modules:
+                module_name = f"src.plugins.{plugin_type}.{module_stem}"
                 try:
                     module = importlib.import_module(module_name)
                     self._load_plugin_from_module(module, plugin_type)
                 except Exception as e:
                     logger.error(f"Failed to load plugin module {module_name}: {e}")
+
+    def _resolve_enabled_plugin_modules(self, plugin_type: str, type_dir: Path) -> list[str]:
+        """解析某类型当前应加载的插件模块名列表。"""
+        available_modules = {
+            file_path.stem
+            for file_path in type_dir.glob("*.py")
+            if not file_path.name.startswith("_") and file_path.name != "base.py"
+        }
+        if not available_modules:
+            return []
+
+        type_config_raw = self.config.get(plugin_type, {})
+        type_config = type_config_raw if isinstance(type_config_raw, dict) else {}
+        enabled_modules: set[str] = set()
+
+        # 显式配置优先：仅加载配置中启用的插件 + default 指向插件
+        if type_config:
+            default_name = type_config.get("default")
+            if isinstance(default_name, str) and default_name:
+                enabled_modules.add(default_name)
+
+            for plugin_name, plugin_cfg in type_config.items():
+                if plugin_name == "default":
+                    continue
+                if isinstance(plugin_cfg, dict):
+                    if plugin_cfg.get("enabled", True):
+                        enabled_modules.add(plugin_name)
+                elif plugin_cfg is not False:
+                    enabled_modules.add(plugin_name)
+        else:
+            # 无显式配置时使用默认按需集合
+            enabled_modules.update(self.DEFAULT_ENABLED_PLUGIN_MODULES.get(plugin_type, ()))
+
+        aliases = self.MODULE_ALIASES.get(plugin_type, {})
+        resolved_modules = set()
+        for module_name in enabled_modules:
+            resolved_modules.add(aliases.get(module_name, module_name))
+
+        missing_modules = resolved_modules - available_modules
+        if missing_modules:
+            logger.warning(
+                "Plugin modules configured but not found for type {}: {}",
+                plugin_type,
+                sorted(missing_modules),
+            )
+
+        return sorted(resolved_modules & available_modules)
 
     def _is_api_version_compatible(self, plugin_api_version: str) -> bool:
         """

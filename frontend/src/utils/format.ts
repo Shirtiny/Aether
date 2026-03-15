@@ -153,3 +153,31 @@ export function formatRemainingTime(expireAt: number | undefined, currentTime: n
   const seconds = Math.floor(remaining % 60)
   return `${minutes}分${seconds}秒`
 }
+
+// Cache hit rate formatting
+export function formatHitRate(rate: number | undefined): string {
+  if (typeof rate !== 'number' || Number.isNaN(rate)) return '-'
+  return `${rate.toFixed(2)}%`
+}
+
+// Rate limit formatting (supports "inherit" semantics: null = inherit system default)
+export function formatRateLimitInheritable(rateLimit?: number | null): string {
+  if (rateLimit == null) return '跟随系统'
+  if (rateLimit === 0) return '不限速'
+  return `${rateLimit}/min`
+}
+
+// Rate limit formatting (simple: null/0 both mean unlimited)
+export function formatRateLimitSimple(rateLimit?: number | null): string {
+  if (rateLimit == null || rateLimit === 0) return '不限速'
+  return `${rateLimit}/min`
+}
+
+// Rate limit state helpers
+export function isRateLimitInherited(rateLimit?: number | null): boolean {
+  return rateLimit == null
+}
+
+export function isRateLimitUnlimited(rateLimit?: number | null): boolean {
+  return rateLimit === 0
+}

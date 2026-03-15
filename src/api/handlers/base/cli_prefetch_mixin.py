@@ -15,6 +15,7 @@ from src.api.handlers.base.stream_context import StreamContext
 from src.api.handlers.base.utils import (
     check_html_response,
     check_prefetched_response_error,
+    ensure_stream_buffer_limit,
 )
 from src.config.constants import StreamDefaults
 from src.config.settings import config
@@ -199,12 +200,22 @@ class CliPrefetchMixin:
             prefetched_chunks.append(first_chunk)
             total_prefetched_bytes += len(first_chunk)
             buffer += first_chunk
+            ensure_stream_buffer_limit(
+                buffer,
+                request_id=self.request_id,
+                provider_name=str(provider.name),
+            )
 
             # 继续读取剩余的预读数据
             async for chunk in aiter:
                 prefetched_chunks.append(chunk)
                 total_prefetched_bytes += len(chunk)
                 buffer += chunk
+                ensure_stream_buffer_limit(
+                    buffer,
+                    request_id=self.request_id,
+                    provider_name=str(provider.name),
+                )
 
                 # 尝试按行解析缓冲区（SSE 格式）
                 while b"\n" in buffer:
@@ -381,6 +392,11 @@ class CliPrefetchMixin:
             # 先处理预读的字节块
             for chunk in prefetched_chunks:
                 buffer += chunk
+                ensure_stream_buffer_limit(
+                    buffer,
+                    request_id=self.request_id,
+                    provider_name=ctx.provider_name,
+                )
                 # 处理缓冲区中的完整行
                 while b"\n" in buffer:
                     line_bytes, buffer = buffer.split(b"\n", 1)
@@ -442,6 +458,11 @@ class CliPrefetchMixin:
             # 继续处理剩余的流数据（使用同一个迭代器）
             async for chunk in byte_iterator:
                 buffer += chunk
+                ensure_stream_buffer_limit(
+                    buffer,
+                    request_id=self.request_id,
+                    provider_name=ctx.provider_name,
+                )
                 # 处理缓冲区中的完整行
                 while b"\n" in buffer:
                     line_bytes, buffer = buffer.split(b"\n", 1)

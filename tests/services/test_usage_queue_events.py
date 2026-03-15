@@ -1,7 +1,6 @@
-import asyncio
 import json
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from redis.exceptions import ResponseError
@@ -26,13 +25,13 @@ from src.services.usage.telemetry_writer import (
 
 class DummyRedis:
     def __init__(self) -> None:
-        self.calls: list[tuple[str, dict[str, str], int | None, bool | None]] = []
+        self.calls: list[tuple[str, dict[str, bytes], int | None, bool | None]] = []
         self.xadd_error: Exception | None = None
 
     async def xadd(
         self,
         key: str,
-        fields: dict[str, str],
+        fields: dict[str, bytes],
         maxlen: int | None = None,
         approximate: bool | None = None,
     ) -> str:
@@ -118,18 +117,65 @@ async def test_usage_event_all_types() -> None:
 
 
 @pytest.mark.asyncio
-async def test_usage_event_bytes_payload() -> None:
-    """测试 bytes 类型 payload 的反序列化"""
+async def test_usage_event_to_stream_fields_sanitizes_non_json_value() -> None:
+    event = build_usage_event(
+        event_type=UsageEventType.COMPLETED,
+        request_id="req-non-json",
+        data={"meta": {"obj": object()}},
+    )
+    fields = event.to_stream_fields()
+    restored = UsageEvent.from_stream_fields(fields)
+    assert isinstance(restored.data["meta"]["obj"], str)
+
+
+def test_usage_event_bytes_payload() -> None:
+    """测试 surrogateescape 字符串 payload 的反序列化（msgpack）"""
     event = build_usage_event(
         event_type=UsageEventType.COMPLETED,
         request_id="req-bytes",
         data={"key": "value"},
     )
     fields = event.to_stream_fields()
-    # 模拟 Redis 返回 bytes
-    fields["payload"] = fields["payload"].encode("utf-8")  # type: ignore[assignment]
+    # 模拟 decode_responses=True + surrogateescape 返回的 str
+    fields["payload"] = fields["payload"].decode("utf-8", errors="surrogateescape")  # type: ignore[assignment]
     restored = UsageEvent.from_stream_fields(fields)
     assert restored.request_id == "req-bytes"
+
+
+def test_usage_event_legacy_json_payload_string() -> None:
+    """兼容旧格式：payload 为 JSON 字符串"""
+    fields = {
+        "payload": json.dumps(
+            {
+                "v": 1,
+                "type": UsageEventType.COMPLETED.value,
+                "request_id": "req-legacy-json",
+                "timestamp_ms": 123,
+                "data": {"foo": "bar"},
+            }
+        )
+    }
+    restored = UsageEvent.from_stream_fields(fields)
+    assert restored.request_id == "req-legacy-json"
+    assert restored.data["foo"] == "bar"
+
+
+def test_usage_event_legacy_json_payload_bytes() -> None:
+    """兼容旧格式：payload 为 bytes(JSON)"""
+    fields = {
+        "payload": json.dumps(
+            {
+                "v": 1,
+                "type": UsageEventType.COMPLETED.value,
+                "request_id": "req-legacy-json-bytes",
+                "timestamp_ms": 123,
+                "data": {"foo": "bar"},
+            }
+        ).encode("utf-8")
+    }
+    restored = UsageEvent.from_stream_fields(fields)
+    assert restored.request_id == "req-legacy-json-bytes"
+    assert restored.data["foo"] == "bar"
 
 
 @pytest.mark.asyncio
@@ -159,14 +205,13 @@ def test_sanitize_payload_nested() -> None:
 
 
 def test_parse_body_json_string() -> None:
-    """测试 _parse_body 正确反序列化 JSON 字符串"""
+    """测试 _parse_body 在消费阶段不反序列化 JSON 字符串"""
     from src.services.usage.consumer_streams import _parse_body
 
-    # JSON 字符串应被解析为 dict
+    # JSON 字符串应保持原样，反序列化延迟到写库前
     json_str = '{"messages": [{"role": "user", "content": "hello"}]}'
     result = _parse_body(json_str)
-    assert isinstance(result, dict)
-    assert result["messages"][0]["content"] == "hello"
+    assert result == json_str
 
 
 def test_parse_body_dict_passthrough() -> None:
@@ -370,8 +415,8 @@ async def test_queue_writer_failure_preserves_empty_request_headers(monkeypatch:
 
 
 @pytest.mark.asyncio
-async def test_event_to_record_body_deserialization(monkeypatch: Any) -> None:
-    """测试 _event_to_record 正确反序列化 body 字符串为 dict"""
+async def test_event_to_record_body_passthrough() -> None:
+    """测试 _event_to_record 保留 body 字符串，交由写库阶段再解析"""
     from src.services.usage.consumer_streams import _event_to_record
 
     # 模拟 QueueTelemetryWriter 产生的事件（body 被序列化为 JSON 字符串）
@@ -392,11 +437,9 @@ async def test_event_to_record_body_deserialization(monkeypatch: Any) -> None:
 
     record = _event_to_record(event)
 
-    # 验证 body 被正确反序列化为 dict
-    assert isinstance(record["request_body"], dict)
-    assert record["request_body"]["messages"][0]["content"] == "hello"
-    assert isinstance(record["response_body"], dict)
-    assert record["response_body"]["choices"][0]["message"]["content"] == "hi"
+    # 消费阶段不做 json.loads，保留原字符串
+    assert record["request_body"] == event.data["request_body"]
+    assert record["response_body"] == event.data["response_body"]
     assert record["finalized_at"] is not None
 
 

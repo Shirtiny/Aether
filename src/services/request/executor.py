@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 from src.core.api_format.signature import make_signature_key
 from src.core.exceptions import ConcurrencyLimitError
 from src.core.logger import logger
-from src.services.health.monitor import health_monitor
+from src.services.health.monitor import get_health_monitor
 from src.services.provider.format import normalize_endpoint_signature
 from src.services.rate_limit.adaptive_reservation import get_adaptive_reservation_manager
 from src.services.rate_limit.adaptive_rpm import get_adaptive_rpm_manager
@@ -176,7 +176,7 @@ class RequestExecutor:
                 health_format = provider_format_str or client_format_str
 
                 await asyncio.to_thread(
-                    health_monitor.record_success,
+                    get_health_monitor().record_success,
                     db=self.db,
                     key_id=key.id,
                     api_format=health_format,

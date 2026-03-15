@@ -8,10 +8,12 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from src.config import config
 from src.core.logger import logger
 from src.models.database import Usage, WalletDailyUsageLedger
 from src.services.billing.precision import to_money_decimal
-from src.services.system.scheduler import APP_TIMEZONE
+
+APP_TIMEZONE = config.app_timezone
 
 
 @dataclass(slots=True)

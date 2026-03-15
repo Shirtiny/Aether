@@ -152,6 +152,46 @@
           超过后删除审计日志记录
         </p>
       </div>
+
+      <div>
+        <Label
+          for="request-candidates-retention-days"
+          class="block text-sm font-medium"
+        >
+          候选记录保留天数
+        </Label>
+        <Input
+          id="request-candidates-retention-days"
+          :model-value="requestCandidatesRetentionDays"
+          type="number"
+          placeholder="30"
+          class="mt-1"
+          @update:model-value="$emit('update:requestCandidatesRetentionDays', Number($event))"
+        />
+        <p class="mt-1 text-xs text-muted-foreground">
+          过期后按时间窗口批量清理 request_candidates 审计记录
+        </p>
+      </div>
+
+      <div>
+        <Label
+          for="request-candidates-cleanup-batch-size"
+          class="block text-sm font-medium"
+        >
+          候选记录清理批次
+        </Label>
+        <Input
+          id="request-candidates-cleanup-batch-size"
+          :model-value="requestCandidatesCleanupBatchSize"
+          type="number"
+          placeholder="5000"
+          class="mt-1"
+          @update:model-value="$emit('update:requestCandidatesCleanupBatchSize', Number($event))"
+        />
+        <p class="mt-1 text-xs text-muted-foreground">
+          独立控制候选记录大表清理节奏，不再跟随 Key 删除联动
+        </p>
+      </div>
     </div>
 
     <!-- 清理策略说明 -->
@@ -164,7 +204,7 @@
         <p>2. <strong>压缩日志阶段</strong>: body 字段被压缩存储，节省空间</p>
         <p>3. <strong>统计阶段</strong>: 仅保留 tokens、成本等统计信息</p>
         <p>4. <strong>归档删除</strong>: 超过保留期限后完全删除记录</p>
-        <p>5. <strong>候选记录</strong>: 与详细记录同步清理请求候选记录（request_candidates）</p>
+        <p>5. <strong>候选记录</strong>: 独立按保留天数清理 request_candidates 审计记录，不再跟随 Key 删除联动</p>
         <p>6. <strong>审计日志</strong>: 独立清理，记录用户登录、操作等安全事件</p>
       </div>
     </div>
@@ -186,6 +226,8 @@ defineProps<{
   logRetentionDays: number
   cleanupBatchSize: number
   auditLogRetentionDays: number
+  requestCandidatesRetentionDays: number
+  requestCandidatesCleanupBatchSize: number
   loading: boolean
   hasChanges: boolean
 }>()
@@ -199,5 +241,7 @@ defineEmits<{
   'update:logRetentionDays': [value: number]
   'update:cleanupBatchSize': [value: number]
   'update:auditLogRetentionDays': [value: number]
+  'update:requestCandidatesRetentionDays': [value: number]
+  'update:requestCandidatesCleanupBatchSize': [value: number]
 }>()
 </script>

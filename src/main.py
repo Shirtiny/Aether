@@ -5,12 +5,14 @@
 
 from __future__ import annotations
 
+import asyncio
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from src.api.admin import router as admin_router
@@ -24,7 +26,7 @@ from src.api.payment import router as payment_router
 from src.api.public import router as public_router
 from src.api.user_me import router as me_router
 from src.api.wallet import router as wallet_router
-from src.clients.http_client import HTTPClientPool, close_http_clients
+from src.clients.http_client import close_http_clients
 
 # 核心模块
 from src.config import config
@@ -43,6 +45,7 @@ if TYPE_CHECKING:
     from src.services.model.fetch_scheduler import ModelFetchScheduler
     from src.services.provider_keys.pool_quota_probe_scheduler import PoolQuotaProbeScheduler
     from src.services.rate_limit.concurrency_manager import ConcurrencyManager
+    from src.services.rate_limit.user_rpm_limiter import UserRpmLimiter
     from src.services.system.maintenance_scheduler import MaintenanceScheduler
     from src.services.system.scheduler import TaskScheduler
     from src.services.task.polling.task_poller import TaskPollerService
@@ -97,6 +100,7 @@ class LifecycleState:
 
     redis_client: Redis | None = None
     concurrency_manager: ConcurrencyManager | None = None
+    user_rpm_limiter: UserRpmLimiter | None = None
     plugin_manager: PluginManager | None = None
     available_modules: list[ModuleDefinition] = field(default_factory=list)
     task_coordinator: StartupTaskCoordinator | None = None
@@ -106,6 +110,7 @@ class LifecycleState:
     pool_quota_probe_scheduler: PoolQuotaProbeScheduler | None = None
     task_poller: TaskPollerService | None = None
     task_scheduler: TaskScheduler | None = None
+    warmup_task: asyncio.Task[None] | None = None
 
 
 def _configure_uvicorn_access_log() -> None:
@@ -150,9 +155,8 @@ async def _initialize_core_infrastructure(state: LifecycleState) -> None:
     # 从数据库初始化提供商
     await initialize_providers()
 
-    # 初始化全局HTTP客户端池
-    logger.info("初始化全局HTTP客户端池...")
-    HTTPClientPool.get_default_client()  # 预创建默认客户端
+    # 全局HTTP客户端池按需初始化，避免启动阶段预分配连接池资源
+    logger.info("全局HTTP客户端池采用按需初始化")
 
     # 初始化全局Redis客户端（可根据配置降级为内存模式）
     logger.info("初始化全局Redis客户端...")
@@ -178,6 +182,11 @@ async def _initialize_core_infrastructure(state: LifecycleState) -> None:
     from src.services.rate_limit.concurrency_manager import get_concurrency_manager
 
     state.concurrency_manager = await get_concurrency_manager()
+
+    logger.info("初始化用户/API Key RPM 限流器...")
+    from src.services.rate_limit.user_rpm_limiter import get_user_rpm_limiter
+
+    state.user_rpm_limiter = await get_user_rpm_limiter()
 
     # 初始化批量提交器（提升数据库并发能力）
     logger.info("初始化批量提交器...")
@@ -268,6 +277,96 @@ async def _initialize_plugins_and_modules(app: FastAPI, state: LifecycleState) -
     register_default_parsers()
 
 
+def _warmup_lazy_request_dependencies(provider_types: list[str] | None = None) -> int:
+    """预热懒加载链路，减少首个真实请求的导入与实例化抖动。
+
+    逐个 adapter 独立 try-except，确保单个失败不影响其余组件的预热。
+    """
+    import importlib
+
+    warmed = 0
+
+    try:
+        from src.services.provider.envelope import ensure_providers_bootstrapped
+
+        ensure_providers_bootstrapped(provider_types=provider_types)
+        warmed += 1
+    except Exception as exc:
+        logger.warning("预热 provider bootstrap 失败: {}", exc)
+
+    try:
+        from src.services.health.monitor import get_health_monitor
+
+        get_health_monitor()
+        warmed += 1
+    except Exception as exc:
+        logger.warning("预热 health monitor 失败: {}", exc)
+
+    adapter_specs: list[tuple[str, str]] = [
+        ("src.api.handlers.openai", "OpenAIChatAdapter"),
+        ("src.api.handlers.openai_cli", "OpenAICliAdapter"),
+        ("src.api.handlers.openai_cli", "OpenAICompactAdapter"),
+        ("src.api.handlers.claude", "ClaudeChatAdapter"),
+        ("src.api.handlers.claude", "ClaudeTokenCountAdapter"),
+        ("src.api.handlers.claude_cli", "ClaudeCliAdapter"),
+        ("src.api.handlers.gemini", "GeminiChatAdapter"),
+        ("src.api.handlers.gemini_cli", "GeminiCliAdapter"),
+    ]
+    for module_path, class_name in adapter_specs:
+        try:
+            mod = importlib.import_module(module_path)
+            cls = getattr(mod, class_name)
+            cls()
+            warmed += 1
+        except Exception as exc:
+            logger.warning("预热 {} 失败: {}", class_name, exc)
+
+    return warmed
+
+
+async def _run_startup_warmup(app: FastAPI) -> None:
+    """异步执行启动预热，结果写入 app.state 供 /readyz 读取。"""
+    app.state.startup_warmup_started_at = time.monotonic()
+    provider_types = config.startup_warmup_provider_types
+    logger.info(
+        "启动预热任务开始（provider_types={}）",
+        provider_types if provider_types else "auto",
+    )
+
+    try:
+        warmed_count = await asyncio.to_thread(
+            _warmup_lazy_request_dependencies,
+            provider_types,
+        )
+        app.state.startup_warmup_status = "ready"
+        elapsed_ms = int((time.monotonic() - app.state.startup_warmup_started_at) * 1000)
+        logger.info("启动预热完成（adapters={}, elapsed_ms={}）", warmed_count, elapsed_ms)
+    except Exception as exc:
+        app.state.startup_warmup_status = "failed"
+        app.state.startup_warmup_error = str(exc)
+        logger.exception("启动预热失败，/readyz 将返回 503")
+    finally:
+        app.state.startup_warmup_finished_at = time.monotonic()
+        app.state.startup_warmup_done.set()
+
+
+def _schedule_startup_warmup(app: FastAPI, state: LifecycleState) -> None:
+    """初始化预热状态并按配置启动后台预热任务。"""
+    app.state.startup_warmup_done = asyncio.Event()
+    app.state.startup_warmup_status = "pending"
+    app.state.startup_warmup_error = None
+    app.state.startup_warmup_started_at = None
+    app.state.startup_warmup_finished_at = None
+
+    if not config.startup_warmup_enabled:
+        app.state.startup_warmup_status = "disabled"
+        app.state.startup_warmup_done.set()
+        logger.info("启动预热已禁用（STARTUP_WARMUP_ENABLED=false）")
+        return
+
+    state.warmup_task = asyncio.create_task(_run_startup_warmup(app), name="startup_warmup")
+
+
 async def _start_background_services(state: LifecycleState) -> None:
     """启动调度器与后台轮询服务。"""
     # 启动月卡额度重置调度器（仅一个 worker 执行）
@@ -281,16 +380,12 @@ async def _start_background_services(state: LifecycleState) -> None:
     from src.services.usage.quota_scheduler import get_quota_scheduler
     from src.utils.task_coordinator import StartupTaskCoordinator
 
-    state.quota_scheduler = get_quota_scheduler()
-    state.maintenance_scheduler = get_maintenance_scheduler()
-    state.model_fetch_scheduler = get_model_fetch_scheduler()
-    state.pool_quota_probe_scheduler = get_pool_quota_probe_scheduler()
-    state.task_poller = get_task_poller()
     state.task_coordinator = StartupTaskCoordinator(state.redis_client)
 
     # 启动额度调度器
     quota_scheduler_active = await state.task_coordinator.acquire("quota_scheduler")
     if quota_scheduler_active:
+        state.quota_scheduler = get_quota_scheduler()
         await state.quota_scheduler.start()
     else:
         logger.info("检测到其他 worker 已运行额度调度器，本实例跳过")
@@ -299,6 +394,7 @@ async def _start_background_services(state: LifecycleState) -> None:
     # 启动维护调度器
     maintenance_scheduler_active = await state.task_coordinator.acquire("maintenance_scheduler")
     if maintenance_scheduler_active:
+        state.maintenance_scheduler = get_maintenance_scheduler()
         logger.info("启动系统维护调度器...")
         await state.maintenance_scheduler.start()
     else:
@@ -308,6 +404,7 @@ async def _start_background_services(state: LifecycleState) -> None:
     # 启动模型自动获取调度器
     model_fetch_scheduler_active = await state.task_coordinator.acquire("model_fetch_scheduler")
     if model_fetch_scheduler_active:
+        state.model_fetch_scheduler = get_model_fetch_scheduler()
         logger.info("启动模型自动获取调度器...")
         await state.model_fetch_scheduler.start()
     else:
@@ -319,6 +416,7 @@ async def _start_background_services(state: LifecycleState) -> None:
         "pool_quota_probe_scheduler"
     )
     if pool_quota_probe_scheduler_active:
+        state.pool_quota_probe_scheduler = get_pool_quota_probe_scheduler()
         logger.info("启动号池额度主动探测调度器...")
         await state.pool_quota_probe_scheduler.start()
     else:
@@ -328,6 +426,7 @@ async def _start_background_services(state: LifecycleState) -> None:
     # 启动异步任务轮询服务（当前仅视频）
     task_poller_active = await state.task_coordinator.acquire("task_poller:video")
     if task_poller_active:
+        state.task_poller = get_task_poller()
         logger.info("启动 TaskPoller（video）...")
         await state.task_poller.start()
     else:
@@ -350,6 +449,7 @@ async def _run_startup(app: FastAPI) -> LifecycleState:
     state = LifecycleState()
     await _initialize_core_infrastructure(state)
     await _initialize_plugins_and_modules(app, state)
+    _schedule_startup_warmup(app, state)
 
     logger.info(f"服务启动成功: http://{config.host}:{config.port}")
     logger.info("=" * 60)
@@ -361,6 +461,15 @@ async def _run_startup(app: FastAPI) -> LifecycleState:
 async def _run_shutdown(state: LifecycleState) -> None:
     """执行完整关闭流程。"""
     logger.info("正在关闭服务...")
+
+    # 停止启动预热任务
+    if state.warmup_task and not state.warmup_task.done():
+        logger.info("停止启动预热任务...")
+        state.warmup_task.cancel()
+        try:
+            await asyncio.wait_for(state.warmup_task, timeout=5.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
 
     # 停止 Codex 配额异步同步器（停止前会 flush 待同步事件）
     logger.info("停止 Codex 配额异步同步器...")
@@ -438,6 +547,10 @@ async def _run_shutdown(state: LifecycleState) -> None:
     logger.info("关闭并发管理器...")
     if state.concurrency_manager:
         await state.concurrency_manager.close()
+
+    logger.info("关闭用户/API Key RPM 限流器...")
+    if state.user_rpm_limiter:
+        await state.user_rpm_limiter.close()
 
     # 关闭全局Redis客户端
     logger.info("关闭全局Redis客户端...")
@@ -602,6 +715,40 @@ app.include_router(announcement_router)  # 公告系统
 app.include_router(dashboard_router)  # 仪表盘端点
 app.include_router(public_router)  # 公开API端点（用户可查看提供商和模型）
 app.include_router(monitoring_router)  # 监控端点
+
+
+@app.get("/readyz", include_in_schema=False)
+async def readiness_check(request: Request) -> Any:
+    """就绪检查：可选绑定启动预热状态，用于流量门禁。"""
+    warmup_status = getattr(request.app.state, "startup_warmup_status", "unknown")
+    warmup_error = getattr(request.app.state, "startup_warmup_error", None)
+    started_at = getattr(request.app.state, "startup_warmup_started_at", None)
+
+    payload: dict[str, Any] = {
+        "status": "ready",
+        "warmup_status": warmup_status,
+        "gate_readiness": config.startup_warmup_gate_readiness,
+    }
+    if isinstance(started_at, (int, float)):
+        payload["warmup_elapsed_ms"] = int((time.monotonic() - started_at) * 1000)
+
+    if not config.startup_warmup_gate_readiness:
+        return payload
+    if warmup_status in {"ready", "disabled"}:
+        return payload
+
+    reason_map = {
+        "failed": "startup_warmup_failed",
+        "pending": "startup_warmup_pending",
+    }
+    detail = {
+        "status": "not_ready",
+        "reason": reason_map.get(warmup_status, "startup_warmup_pending"),
+        "warmup_status": warmup_status,
+    }
+    if warmup_error:
+        detail["warmup_error"] = warmup_error
+    raise HTTPException(status_code=503, detail=detail)
 
 
 def main() -> Any:

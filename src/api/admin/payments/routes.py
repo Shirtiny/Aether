@@ -12,14 +12,14 @@ from sqlalchemy.orm import Session
 
 from src.api.base.admin_adapter import AdminApiAdapter
 from src.api.base.context import ApiRequestContext
-from src.api.base.pipeline import ApiRequestPipeline
+from src.api.base.pipeline import get_pipeline
 from src.api.serializers import serialize_payment_callback, serialize_payment_order
 from src.core.exceptions import InvalidRequestException, NotFoundException, translate_pydantic_error
 from src.database import get_db, get_db_context
 from src.services.payment import PaymentService
 
 router = APIRouter(prefix="/api/admin/payments", tags=["Admin - Payments"])
-pipeline = ApiRequestPipeline()
+pipeline = get_pipeline()
 
 
 class AdminPaymentOrderCreditPayload(BaseModel):

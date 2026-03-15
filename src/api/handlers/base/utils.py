@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 from fastapi.responses import JSONResponse, Response
 
+from src.config.constants import StreamDefaults
 from src.core.api_format import filter_response_headers
 from src.core.api_format.headers import get_header_value
 from src.core.exceptions import EmbeddedErrorException, ProviderNotAvailableException
@@ -141,6 +142,40 @@ def check_html_response(line: str) -> bool:
     """
     lower_line = line.lstrip().lower()
     return lower_line.startswith("<!doctype") or lower_line.startswith("<html")
+
+
+def ensure_stream_buffer_limit(
+    buffer: bytes,
+    *,
+    request_id: str,
+    provider_name: str | None = None,
+) -> None:
+    """防止上游单行流式数据过大导致内存失控。"""
+    total_limit = StreamDefaults.MAX_STREAM_BUFFER_TOTAL_BYTES
+    if len(buffer) > total_limit:
+        raise ProviderNotAvailableException(
+            "上游流式响应异常：总缓冲区超过安全上限",
+            provider_name=provider_name,
+            upstream_status=502,
+            upstream_response=(
+                f"stream buffer total overflow: {len(buffer)} bytes > {total_limit}, "
+                f"request_id={request_id}"
+            ),
+        )
+
+    limit = StreamDefaults.MAX_STREAM_BUFFER_BYTES
+    if len(buffer) <= limit:
+        return
+    # 允许 chunk 中存在大量完整行；只限制“最后一行未闭合缓冲”的体积。
+    trailing_line = buffer.rsplit(b"\n", 1)[-1]
+    if len(trailing_line) <= limit:
+        return
+    raise ProviderNotAvailableException(
+        "上游流式响应异常：单行数据超过安全上限",
+        provider_name=provider_name,
+        upstream_status=502,
+        upstream_response=f"stream buffer overflow: {len(buffer)} bytes > {limit}, request_id={request_id}",
+    )
 
 
 def check_prefetched_response_error(

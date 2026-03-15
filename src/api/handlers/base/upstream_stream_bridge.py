@@ -17,7 +17,10 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from src.api.handlers.base.response_parser import ResponseParser
-from src.api.handlers.base.utils import get_format_converter_registry
+from src.api.handlers.base.utils import (
+    ensure_stream_buffer_limit,
+    get_format_converter_registry,
+)
 from src.core.api_format.conversion.internal import InternalResponse
 from src.core.api_format.conversion.stream_bridge import InternalStreamAggregator
 from src.core.api_format.conversion.stream_state import StreamState
@@ -184,6 +187,11 @@ async def aggregate_upstream_stream_to_internal_response(
 
     async for chunk in byte_iter:
         buffer += chunk
+        ensure_stream_buffer_limit(
+            buffer,
+            request_id=str(request_id or ""),
+            provider_name=str(provider_name or "unknown"),
+        )
         while b"\n" in buffer:
             line_bytes, buffer = buffer.split(b"\n", 1)
             line = decoder.decode(line_bytes + b"\n", False).rstrip("\n")

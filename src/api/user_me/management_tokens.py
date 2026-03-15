@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 
 from src.api.base.authenticated_adapter import AuthenticatedApiAdapter
 from src.api.base.context import ApiRequestContext
-from src.api.base.pipeline import ApiRequestPipeline
+from src.api.base.pipeline import get_pipeline
 from src.core.exceptions import InvalidRequestException, NotFoundException
 from src.database import get_db
 from src.models.database import AuditEventType
@@ -25,7 +25,7 @@ from src.services.management_token import (
 )
 
 router = APIRouter(prefix="/api/me/management-tokens", tags=["Management Tokens"])
-pipeline = ApiRequestPipeline()
+pipeline = get_pipeline()
 
 
 # ============== 安全基类 ==============

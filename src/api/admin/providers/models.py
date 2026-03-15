@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session, joinedload
 from src.api.base.admin_adapter import AdminApiAdapter
 from src.api.base.context import ApiRequestContext
 from src.api.base.models_service import invalidate_models_list_cache
-from src.api.base.pipeline import ApiRequestPipeline
+from src.api.base.pipeline import get_pipeline
 from src.core.exceptions import InvalidRequestException, NotFoundException
 from src.core.logger import logger
 from src.database import get_db
@@ -40,7 +40,7 @@ from src.models.pydantic_models import (
 from src.services.model.service import ModelService
 
 router = APIRouter(tags=["Model Management"])
-pipeline = ApiRequestPipeline()
+pipeline = get_pipeline()
 
 
 @router.get("/{provider_id}/models", response_model=list[ModelResponse])

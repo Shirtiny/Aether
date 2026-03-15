@@ -12,15 +12,11 @@ from typing import Any
 from fastapi import APIRouter, Depends, Request
 from sqlalchemy.orm import Session
 
-from src.api.base.pipeline import ApiRequestPipeline
-from src.api.handlers.claude import (
-    ClaudeTokenCountAdapter,
-    build_claude_adapter,
-)
+from src.api.base.pipeline import get_pipeline
 from src.database import get_db
 
 router = APIRouter(tags=["Claude API"])
-pipeline = ApiRequestPipeline()
+pipeline = get_pipeline()
 
 
 @router.post("/v1/messages")
@@ -45,6 +41,8 @@ async def create_message(
     }
     ```
     """
+    from src.api.handlers.claude import build_claude_adapter
+
     adapter = build_claude_adapter(http_request)
     return await pipeline.run(
         adapter=adapter,
@@ -67,6 +65,8 @@ async def count_tokens(
 
     **认证方式**: x-api-key 请求头
     """
+    from src.api.handlers.claude import ClaudeTokenCountAdapter
+
     adapter = ClaudeTokenCountAdapter()
     return await pipeline.run(
         adapter=adapter,

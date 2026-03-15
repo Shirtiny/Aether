@@ -12,14 +12,15 @@ from sqlalchemy.orm import Session
 from src.api.base.adapter import ApiAdapter, ApiMode
 from src.api.base.context import ApiRequestContext
 from src.api.base.pagination import PaginationMeta, build_pagination_payload, paginate_query
-from src.api.base.pipeline import ApiRequestPipeline
+from src.api.base.pipeline import get_pipeline
 from src.core.logger import logger
 from src.database import get_db
 from src.models.database import ApiKey, AuditLog
-from src.plugins.manager import get_plugin_manager
+from src.services.rate_limit.user_rpm_limiter import SYSTEM_RPM_CONFIG_KEY, get_user_rpm_limiter
+from src.services.system.config import SystemConfigService
 
 router = APIRouter(prefix="/api/monitoring", tags=["Monitoring"])
-pipeline = ApiRequestPipeline()
+pipeline = get_pipeline()
 
 
 @router.get("/my-audit-logs")
@@ -146,10 +147,6 @@ class UserRateLimitStatusAdapter(AuthenticatedApiAdapter):
         if not user:
             raise HTTPException(status_code=401, detail="未登录")
 
-        rate_limiter = _get_rate_limit_plugin()
-        if not rate_limiter or not hasattr(rate_limiter, "get_rate_limit_headers"):
-            raise HTTPException(status_code=503, detail="速率限制插件未启用或不支持状态查询")
-
         api_keys = (
             db.query(ApiKey)
             .filter(ApiKey.user_id == user.id, ApiKey.is_active.is_(True))
@@ -157,31 +154,84 @@ class UserRateLimitStatusAdapter(AuthenticatedApiAdapter):
             .all()
         )
 
+        try:
+            limiter = await get_user_rpm_limiter()
+            system_default_raw = SystemConfigService.get_config(
+                db, SYSTEM_RPM_CONFIG_KEY, default=0
+            )
+            system_default = max(int(system_default_raw or 0), 0)
+            reset_at = limiter.get_reset_at()
+            window = f"{limiter.bucket_seconds}s"
+        except Exception as exc:
+            logger.warning("读取新 RPM 限流状态失败，回退插件状态接口: {}", exc)
+            limiter = None
+            system_default = 0
+            reset_at = None
+            window = None
+
         rate_limit_info = []
         for key in api_keys:
-            try:
-                headers = rate_limiter.get_rate_limit_headers(key)
-            except Exception as exc:
-                logger.warning(f"无法获取Key {key.id} 的限流信息: {exc}")
-                headers = {}
+            if limiter is not None:
+                if key.is_standalone:
+                    user_limit = key.rate_limit if key.rate_limit is not None else system_default
+                    user_scope_key = limiter.get_standalone_rpm_key(key.id)
+                    key_limit = 0
+                else:
+                    user_limit = user.rate_limit if user.rate_limit is not None else system_default
+                    user_scope_key = limiter.get_user_rpm_key(user.id)
+                    key_limit = max(int(key.rate_limit or 0), 0)
+
+                user_count = (
+                    await limiter.get_scope_count(user_scope_key)
+                    if user_limit and user_limit > 0
+                    else 0
+                )
+                key_count = (
+                    await limiter.get_scope_count(limiter.get_key_rpm_key(key.id))
+                    if key_limit > 0
+                    else 0
+                )
+                user_remaining = max(user_limit - user_count, 0) if user_limit > 0 else None
+                key_remaining = max(key_limit - key_count, 0) if key_limit > 0 else None
+
+                scoped_statuses: list[tuple[str, int, int]] = []
+                if user_limit > 0 and user_remaining is not None:
+                    scoped_statuses.append(("user", user_limit, user_remaining))
+                if key_limit > 0 and key_remaining is not None:
+                    scoped_statuses.append(("key", key_limit, key_remaining))
+
+                primary_scope = (
+                    min(scoped_statuses, key=lambda item: item[2]) if scoped_statuses else None
+                )
+                rate_limit_info.append(
+                    {
+                        "api_key_name": key.name or f"Key-{key.id}",
+                        "limit": primary_scope[1] if primary_scope else None,
+                        "remaining": primary_scope[2] if primary_scope else None,
+                        "scope": primary_scope[0] if primary_scope else None,
+                        "reset_time": reset_at.isoformat() if reset_at else None,
+                        "window": window,
+                        "user_limit": user_limit,
+                        "user_remaining": user_remaining,
+                        "key_limit": key_limit if key_limit > 0 else None,
+                        "key_remaining": key_remaining,
+                    }
+                )
+                continue
 
             rate_limit_info.append(
                 {
                     "api_key_name": key.name or f"Key-{key.id}",
-                    "limit": headers.get("X-RateLimit-Limit"),
-                    "remaining": headers.get("X-RateLimit-Remaining"),
-                    "reset_time": headers.get("X-RateLimit-Reset"),
-                    "window": headers.get("X-RateLimit-Window"),
+                    "limit": None,
+                    "remaining": None,
+                    "scope": None,
+                    "reset_time": None,
+                    "window": None,
+                    "user_limit": None,
+                    "user_remaining": None,
+                    "key_limit": None,
+                    "key_remaining": None,
                 }
             )
 
         return {"user_id": user.id, "api_keys": rate_limit_info}
-
-
-def _get_rate_limit_plugin() -> Any:
-    try:
-        plugin_manager = get_plugin_manager()
-        return plugin_manager.get_plugin("rate_limit")
-    except Exception as exc:
-        logger.warning(f"获取速率限制插件失败: {exc}")
-        return None

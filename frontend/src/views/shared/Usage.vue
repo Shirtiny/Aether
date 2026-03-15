@@ -1,55 +1,82 @@
 <template>
   <div class="space-y-6 pb-8">
-    <!-- 活跃度热图 + 请求间隔时间线 -->
-    <div class="grid grid-cols-1 xl:grid-cols-2 gap-4">
-      <ActivityHeatmapCard
-        :data="activityHeatmapData"
-        :title="isAdminPage ? '总体活跃天数' : '我的活跃天数'"
-        :is-loading="isLoadingHeatmap"
-        :has-error="heatmapError"
-      />
-      <IntervalTimelineCard
-        :title="isAdminPage ? '请求间隔时间线' : '我的请求间隔'"
-        :is-admin="isAdminPage"
-        :hours="24"
-      />
+    <!-- 面包屑旁的折叠按钮 -->
+    <Teleport
+      to="#header-actions-right"
+      defer
+    >
+      <button
+        class="flex h-9 w-9 items-center justify-center rounded-lg text-muted-foreground hover:text-foreground hover:bg-muted/50 transition"
+        :title="statsExpanded ? '收起用量分析' : '展开用量分析'"
+        @click="statsExpanded = !statsExpanded"
+      >
+        <PanelTopClose
+          v-if="statsExpanded"
+          class="h-4 w-4"
+        />
+        <PanelTopOpen
+          v-else
+          class="h-4 w-4"
+        />
+      </button>
+    </Teleport>
+
+    <!-- 用量分析面板（可折叠） -->
+    <div
+      v-if="statsExpanded"
+      class="space-y-4"
+    >
+      <!-- 活跃度热图 + 请求间隔时间线 -->
+      <div class="grid grid-cols-1 xl:grid-cols-2 gap-4">
+        <ActivityHeatmapCard
+          :data="activityHeatmapData"
+          :title="isAdminPage ? '总体活跃天数' : '我的活跃天数'"
+          :is-loading="isLoadingHeatmap"
+          :has-error="heatmapError"
+        />
+        <IntervalTimelineCard
+          :title="isAdminPage ? '请求间隔时间线' : '我的请求间隔'"
+          :is-admin="isAdminPage"
+          :hours="24"
+        />
+      </div>
+
+      <!-- 分析统计 -->
+      <!-- 管理员：模型 + 提供商 + API格式（3列） -->
+      <div
+        v-if="isAdminPage"
+        class="grid grid-cols-1 lg:grid-cols-3 gap-4"
+      >
+        <UsageModelTable
+          :data="enhancedModelStats"
+          :is-admin="authStore.isAdmin"
+        />
+        <UsageProviderTable
+          :data="providerStats"
+          :is-admin="authStore.isAdmin"
+        />
+        <UsageApiFormatTable
+          :data="apiFormatStats"
+          :is-admin="authStore.isAdmin"
+        />
+      </div>
+      <!-- 用户：模型 + API格式（2列） -->
+      <div
+        v-else
+        class="grid grid-cols-1 lg:grid-cols-2 gap-4"
+      >
+        <UsageModelTable
+          :data="enhancedModelStats"
+          :is-admin="authStore.isAdmin"
+        />
+        <UsageApiFormatTable
+          :data="apiFormatStats"
+          :is-admin="false"
+        />
+      </div>
     </div>
 
-    <!-- 分析统计 -->
-    <!-- 管理员：模型 + 提供商 + API格式（3列） -->
-    <div
-      v-if="isAdminPage"
-      class="grid grid-cols-1 lg:grid-cols-3 gap-4"
-    >
-      <UsageModelTable
-        :data="enhancedModelStats"
-        :is-admin="authStore.isAdmin"
-      />
-      <UsageProviderTable
-        :data="providerStats"
-        :is-admin="authStore.isAdmin"
-      />
-      <UsageApiFormatTable
-        :data="apiFormatStats"
-        :is-admin="authStore.isAdmin"
-      />
-    </div>
-    <!-- 用户：模型 + API格式（2列） -->
-    <div
-      v-else
-      class="grid grid-cols-1 lg:grid-cols-2 gap-4"
-    >
-      <UsageModelTable
-        :data="enhancedModelStats"
-        :is-admin="authStore.isAdmin"
-      />
-      <UsageApiFormatTable
-        :data="apiFormatStats"
-        :is-admin="false"
-      />
-    </div>
-
-    <!-- 请求详情 -->
+    <!-- 使用记录 -->
     <UsageRecordsTable
       :records="displayRecords"
       :is-admin="isAdminPage"
@@ -97,10 +124,12 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRoute } from 'vue-router'
+import { useLocalStorage } from '@vueuse/core'
 import { useAuthStore } from '@/stores/auth'
 import { usageApi } from '@/api/usage'
 import { usersApi } from '@/api/users'
 import { meApi } from '@/api/me'
+import { PanelTopClose, PanelTopOpen } from 'lucide-vue-next'
 import {
   UsageModelTable,
   UsageProviderTable,
@@ -126,6 +155,9 @@ const authStore = useAuthStore()
 
 // 判断是否是管理员页面
 const isAdminPage = computed(() => route.path.startsWith('/admin'))
+
+// 用量分析面板折叠状态（默认展开，持久化到 localStorage）
+const statsExpanded = useLocalStorage('usage-stats-expanded', true)
 
 // 时间范围选择
 const timeRange = ref<DateRangeParams>(getDateRangeFromPeriod('today'))

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from collections import deque
 from collections.abc import AsyncIterator
 from typing import Any
@@ -19,6 +20,17 @@ from src.core.stream_types import StreamStats, get_parser_for_format
 from src.database.database import create_session
 from src.models.database import ApiKey, User
 from src.services.usage.service import UsageService
+
+
+def _get_response_chunks_max_size() -> int:
+    """读取响应块存储上限（字节），默认 2MB。"""
+    raw_mb = os.getenv("RESPONSE_CHUNKS_MAX_SIZE_MB", "2")
+    try:
+        mb = int(raw_mb)
+    except ValueError:
+        logger.warning("环境变量 RESPONSE_CHUNKS_MAX_SIZE_MB 非法: {}, 使用默认值 2", raw_mb)
+        mb = 2
+    return max(1, mb) * 1024 * 1024
 
 
 class StreamUsageTracker:
@@ -120,7 +132,7 @@ class StreamUsageTracker:
         self.response_chunks = []  # 保存解析后的响应块
         self.response_chunks_count = 0  # 响应块总计数（含被丢弃的）
         self.response_chunks_size = 0  # 响应块累计序列化大小（字节）
-        self._response_chunks_max_size = 4 * 1024 * 1024  # 4MB，留余量给 truncate_body 的 5MB 上限
+        self._response_chunks_max_size = _get_response_chunks_max_size()
         self.raw_chunks: deque[str | bytes] = deque(
             maxlen=50
         )  # 仅保留最后50个原始chunk（用于错误诊断）

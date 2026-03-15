@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from contextlib import asynccontextmanager
 from typing import Any
@@ -19,7 +20,6 @@ import httpx
 
 from src.config import config
 from src.core.logger import logger
-from src.services.provider.fingerprint import KNOWN_IMPERSONATE_PROFILES
 from src.services.proxy_node.resolver import (
     build_proxy_url_async,
     compute_proxy_cache_key,
@@ -32,6 +32,19 @@ from src.utils.ssl_utils import get_ssl_context, get_ssl_context_for_profile
 # 模块级锁，避免类属性延迟初始化的竞态条件
 _proxy_clients_lock = asyncio.Lock()
 _default_client_lock = asyncio.Lock()
+
+
+def _get_int_env(name: str, default: int, minimum: int) -> int:
+    """Read positive integer env value with bounds and fallback."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("环境变量 {} 不是有效整数: {}, 使用默认值 {}", name, raw, default)
+        return default
+    return max(minimum, value)
 
 
 class HTTPClientPool:
@@ -268,6 +281,8 @@ class HTTPClientPool:
             # - direct chrome impersonate profile names (e.g. "chrome124")
             use_curl_cffi_tls = False
             if tls_profile_key:
+                from src.services.provider.fingerprint import KNOWN_IMPERSONATE_PROFILES
+
                 use_curl_cffi_tls = (
                     tls_profile_key == "claude_code_nodejs"
                     or tls_profile_key in KNOWN_IMPERSONATE_PROFILES
@@ -391,6 +406,78 @@ class HTTPClientPool:
             logger.debug("关闭 curl_cffi sessions 失败: {}", e)
 
         logger.info("所有HTTP客户端已关闭")
+
+    @classmethod
+    async def cleanup_idle_clients(
+        cls,
+        max_idle_seconds: int | None = None,
+    ) -> dict[str, int]:
+        """清理空闲的代理/Tunnel 客户端并关闭连接池资源。"""
+        idle_seconds = max_idle_seconds
+        if idle_seconds is None:
+            idle_seconds = _get_int_env("HTTP_CLIENT_IDLE_CLEANUP_MAX_SECONDS", 600, minimum=60)
+
+        now = time.time()
+        stale_proxy_clients: list[tuple[str, httpx.AsyncClient]] = []
+        stale_tunnel_clients: list[tuple[str, httpx.AsyncClient]] = []
+        removed_closed_proxy = 0
+        removed_closed_tunnel = 0
+
+        lock = cls._get_proxy_clients_lock()
+        async with lock:
+            for cache_key, (client, last_used) in list(cls._proxy_clients.items()):
+                if client.is_closed:
+                    cls._proxy_clients.pop(cache_key, None)
+                    removed_closed_proxy += 1
+                    continue
+                if now - last_used > idle_seconds:
+                    entry = cls._proxy_clients.pop(cache_key, None)
+                    if entry is not None:
+                        stale_proxy_clients.append((cache_key, entry[0]))
+
+            for node_id, (client, last_used) in list(cls._tunnel_clients.items()):
+                if client.is_closed:
+                    cls._tunnel_clients.pop(node_id, None)
+                    removed_closed_tunnel += 1
+                    continue
+                if now - last_used > idle_seconds:
+                    entry = cls._tunnel_clients.pop(node_id, None)
+                    if entry is not None:
+                        stale_tunnel_clients.append((node_id, entry[0]))
+
+        proxy_closed = 0
+        tunnel_closed = 0
+        for cache_key, client in stale_proxy_clients:
+            try:
+                await client.aclose()
+                proxy_closed += 1
+            except Exception as e:
+                logger.warning("关闭空闲代理客户端失败(key={}): {}", cache_key, e)
+
+        for node_id, client in stale_tunnel_clients:
+            try:
+                await client.aclose()
+                tunnel_closed += 1
+            except Exception as e:
+                logger.warning("关闭空闲 Tunnel 客户端失败(node_id={}): {}", node_id, e)
+
+        if proxy_closed or tunnel_closed or removed_closed_proxy or removed_closed_tunnel:
+            logger.info(
+                "HTTP 客户端空闲清理完成: proxy_closed={}, tunnel_closed={}, "
+                "proxy_already_closed={}, tunnel_already_closed={}, idle_seconds={}",
+                proxy_closed,
+                tunnel_closed,
+                removed_closed_proxy,
+                removed_closed_tunnel,
+                idle_seconds,
+            )
+
+        return {
+            "proxy_closed": proxy_closed,
+            "tunnel_closed": tunnel_closed,
+            "proxy_already_closed": removed_closed_proxy,
+            "tunnel_already_closed": removed_closed_tunnel,
+        }
 
     @classmethod
     @asynccontextmanager

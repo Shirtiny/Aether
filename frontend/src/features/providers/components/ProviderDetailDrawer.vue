@@ -573,10 +573,19 @@
                             />
                           </div>
                           <div
-                            v-if="key.upstream_metadata.codex.primary_reset_seconds"
-                            class="text-[9px] text-muted-foreground/70 mt-0.5"
+                            v-if="key.upstream_metadata.codex.primary_reset_at || key.upstream_metadata.codex.primary_reset_seconds"
+                            class="text-[9px] mt-0.5 tabular-nums"
+                            :class="getResetCountdownClass(
+                              key.upstream_metadata.codex.primary_reset_at,
+                              key.upstream_metadata.codex.primary_reset_seconds,
+                              key.upstream_metadata.codex.updated_at
+                            )"
                           >
-                            {{ formatResetTime(key.upstream_metadata.codex.primary_reset_seconds) }}后重置
+                            {{ getResetCountdownText(
+                              key.upstream_metadata.codex.primary_reset_at,
+                              key.upstream_metadata.codex.primary_reset_seconds,
+                              key.upstream_metadata.codex.updated_at
+                            ) }}
                           </div>
                         </div>
                         <!-- 5H限额（仅 Team/Plus/Enterprise 显示） -->
@@ -594,9 +603,20 @@
                               :style="{ width: `${Math.max(100 - key.upstream_metadata.codex.secondary_used_percent, 0)}%` }"
                             />
                           </div>
-                          <div class="text-[9px] text-muted-foreground/70 mt-0.5">
-                            <template v-if="key.upstream_metadata.codex.secondary_reset_seconds">
-                              {{ formatResetTime(key.upstream_metadata.codex.secondary_reset_seconds) }}后重置
+                          <div
+                            class="text-[9px] mt-0.5 tabular-nums"
+                            :class="getResetCountdownClass(
+                              key.upstream_metadata.codex.secondary_reset_at,
+                              key.upstream_metadata.codex.secondary_reset_seconds,
+                              key.upstream_metadata.codex.updated_at
+                            )"
+                          >
+                            <template v-if="key.upstream_metadata.codex.secondary_reset_at || key.upstream_metadata.codex.secondary_reset_seconds">
+                              {{ getResetCountdownText(
+                                key.upstream_metadata.codex.secondary_reset_at,
+                                key.upstream_metadata.codex.secondary_reset_seconds,
+                                key.upstream_metadata.codex.updated_at
+                              ) }}
                             </template>
                             <template v-else>
                               已重置
@@ -1063,7 +1083,7 @@ import { Popover, PopoverTrigger, PopoverContent } from '@/components/ui'
 import { useToast } from '@/composables/useToast'
 import { useConfirm } from '@/composables/useConfirm'
 import { useClipboard } from '@/composables/useClipboard'
-import { useCountdownTimer, formatCountdown, getOAuthExpiresCountdown } from '@/composables/useCountdownTimer'
+import { useCountdownTimer, formatCountdown, getOAuthExpiresCountdown, getCodexResetCountdown } from '@/composables/useCountdownTimer'
 import {
   getProvider,
   getProviderEndpoints,
@@ -2524,6 +2544,28 @@ function getAntigravityQuotaSummary(metadata: UpstreamMetadata | null | undefine
     })
   }
   return result
+}
+
+function getResetCountdownText(
+  resetAt: number | null | undefined,
+  resetSecs: number | null | undefined,
+  updatedAt: number | null | undefined
+): string {
+  const status = getCodexResetCountdown(resetAt, resetSecs, updatedAt, countdownTick.value)
+  if (!status) return ''
+  return status.isExpired ? status.text : `${status.text} 后重置`
+}
+
+function getResetCountdownClass(
+  resetAt: number | null | undefined,
+  resetSecs: number | null | undefined,
+  updatedAt: number | null | undefined
+): string {
+  const status = getCodexResetCountdown(resetAt, resetSecs, updatedAt, countdownTick.value)
+  if (!status || status.isExpired) return 'text-muted-foreground/70'
+  if (status.isCritical) return 'text-destructive font-medium animate-pulse'
+  if (status.isUrgent) return 'text-amber-500 dark:text-amber-400'
+  return 'text-muted-foreground/70'
 }
 
 // 格式化重置时间

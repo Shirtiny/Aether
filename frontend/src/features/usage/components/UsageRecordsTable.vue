@@ -24,7 +24,6 @@
       <!-- 用户筛选（仅管理员可见） -->
       <Select
         v-if="isAdmin && availableUsers.length > 0"
-
         :model-value="filterUser"
         @update:model-value="$emit('update:filterUser', $event)"
       >
@@ -47,7 +46,6 @@
 
       <!-- 模型筛选 -->
       <Select
-
         :model-value="filterModel"
         @update:model-value="$emit('update:filterModel', $event)"
       >
@@ -71,7 +69,6 @@
       <!-- 提供商筛选（仅管理员可见） -->
       <Select
         v-if="isAdmin"
-
         :model-value="filterProvider"
         @update:model-value="$emit('update:filterProvider', $event)"
       >
@@ -94,7 +91,6 @@
 
       <!-- API格式筛选 -->
       <Select
-
         :model-value="filterApiFormat"
         @update:model-value="$emit('update:filterApiFormat', $event)"
       >
@@ -117,7 +113,6 @@
 
       <!-- 状态筛选 -->
       <Select
-
         :model-value="filterStatus"
         @update:model-value="$emit('update:filterStatus', $event)"
       >

@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import os
 import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
@@ -16,6 +15,7 @@ from sqlalchemy import Date, Float, and_, case, cast, func, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from src.config import config
 from src.core.logger import logger
 from src.models.database import (
     ApiKey,
@@ -36,8 +36,7 @@ from src.models.database import (
 from src.models.database import User as DBUser
 from src.services.system.time_range import TimeRangeParams, split_time_range_for_hourly
 
-# App timezone (legacy defaults for dashboard)
-APP_TIMEZONE = os.getenv("APP_TIMEZONE", "Asia/Shanghai")
+APP_TIMEZONE = config.app_timezone
 MIN_PERCENTILE_SAMPLES = 10
 
 

@@ -3,6 +3,8 @@
 
 # AI Assistant Configuration
 # .claude/
+.codex/
+.claude/
 .serena/
 .gemini*/
 .plans

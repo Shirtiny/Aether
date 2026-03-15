@@ -287,13 +287,12 @@ def test_cleanup_key_references_preserves_usage_and_video_tasks(
     side_effects_module.cleanup_key_references(cast(Any, db), ["key-1", "key-2"])
 
     assert [(stmt.kind, stmt.model.__name__) for stmt in db.statements] == [
-        ("delete", "RequestCandidate"),
         ("delete", "GeminiFileMapping"),
         ("update", "Usage"),
         ("update", "VideoTask"),
     ]
-    assert db.statements[2].values_dict == {"provider_api_key_id": None}
-    assert db.statements[3].values_dict == {"key_id": None}
+    assert db.statements[1].values_dict == {"provider_api_key_id": None}
+    assert db.statements[2].values_dict == {"key_id": None}
 
 
 @pytest.mark.asyncio

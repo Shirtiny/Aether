@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 
 from src.api.base.admin_adapter import AdminApiAdapter
 from src.api.base.context import ApiRequestContext
-from src.api.base.pipeline import ApiRequestPipeline
+from src.api.base.pipeline import get_pipeline
 from src.database import get_db
 from src.models.database import User
 from src.models.endpoint_models import (
@@ -41,7 +41,7 @@ from src.services.provider_keys.key_quota_service import (
 from src.utils.auth_utils import require_admin
 
 router = APIRouter(tags=["Provider Keys"])
-pipeline = ApiRequestPipeline()
+pipeline = get_pipeline()
 
 
 @router.put("/keys/{key_id}", response_model=EndpointAPIKeyResponse)
