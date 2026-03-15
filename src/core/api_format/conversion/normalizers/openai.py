@@ -66,6 +66,21 @@ from src.core.api_format.conversion.stream_state import StreamState
 from src.core.logger import logger
 
 
+def _normalize_chat_completion_id(raw_id: str) -> str:
+    """将非 chatcmpl- 前缀的 ID 规范化为 Chat Completions 格式。
+
+    OpenAI Chat Completions 响应的 id 约定使用 chatcmpl- 前缀，
+    当上游返回 Responses API 格式（resp_ 前缀）或其他格式时需要转换。
+    """
+    if not raw_id:
+        return "chatcmpl-unknown"
+    if raw_id.startswith("chatcmpl-"):
+        return raw_id
+    if raw_id.startswith("resp_"):
+        return "chatcmpl-" + raw_id[5:]
+    return raw_id
+
+
 class OpenAINormalizer(FormatNormalizer):
     # 新模式：ApiFamily + EndpointKind 的 signature key
     FORMAT_ID = "openai:chat"
@@ -450,7 +465,7 @@ class OpenAINormalizer(FormatNormalizer):
         # 优先使用用户请求的原始模型名，回退到上游返回的模型名
         model_name = requested_model if requested_model else internal.model
         out: dict[str, Any] = {
-            "id": internal.id or "chatcmpl-unknown",
+            "id": _normalize_chat_completion_id(internal.id or ""),
             "object": "chat.completion",
             "created": int(time.time()),
             "model": model_name,
@@ -728,7 +743,7 @@ class OpenAINormalizer(FormatNormalizer):
 
         def base_chunk(delta: dict[str, Any], finish_reason: str | None = None) -> dict[str, Any]:
             return {
-                "id": state.message_id or "chatcmpl-stream",
+                "id": _normalize_chat_completion_id(state.message_id or "chatcmpl-stream"),
                 "object": "chat.completion.chunk",
                 "created": int(time.time()),
                 "model": state.model or "",
@@ -772,7 +787,7 @@ class OpenAINormalizer(FormatNormalizer):
         if isinstance(event, ContentBlockStartEvent) and event.block_type == ContentType.TOOL_USE:
             tool_id = event.tool_id or ""
             tool_name = event.tool_name or ""
-            tool_index = self._ensure_tool_call_index(ss, tool_id)
+            tool_index = self._ensure_tool_call_index(ss, tool_id, event.block_index)
             out.append(
                 base_chunk(
                     {
@@ -839,7 +854,7 @@ class OpenAINormalizer(FormatNormalizer):
             return out
 
         if isinstance(event, ToolCallDeltaEvent):
-            tool_index = self._ensure_tool_call_index(ss, event.tool_id)
+            tool_index = self._ensure_tool_call_index(ss, event.tool_id, event.block_index)
             # 后续 delta 只需 index + function.arguments；id/type 仅在 ContentBlockStartEvent 首次发送
             tc_delta: dict[str, Any] = {
                 "index": tool_index,
@@ -1783,17 +1798,34 @@ class OpenAINormalizer(FormatNormalizer):
         ss["next_block_index"] = next_idx + 1
         return next_idx
 
-    def _ensure_tool_call_index(self, ss: dict[str, Any], tool_id: str) -> int:
-        mapping = ss.get("tool_id_to_index")
+    def _ensure_tool_call_index(
+        self, ss: dict[str, Any], tool_id: str, block_index: int | None = None
+    ) -> int:
+        mapping: dict[str, int] = ss.get("tool_id_to_index")  # type: ignore[assignment]
         if not isinstance(mapping, dict):
             mapping = {}
             ss["tool_id_to_index"] = mapping
             ss["next_tool_index"] = 0
 
-        if tool_id in mapping:
-            return int(mapping[tool_id])
+        # block_index -> tool_index 的辅助映射，用于 tool_id 丢失时回落
+        block_mapping: dict[int, int] = ss.get("block_to_tool_index")  # type: ignore[assignment]
+        if not isinstance(block_mapping, dict):
+            block_mapping = {}
+            ss["block_to_tool_index"] = block_mapping
 
+        # 优先用 tool_id 查找
+        if tool_id and tool_id in mapping:
+            return mapping[tool_id]
+
+        # tool_id 为空时，用 block_index 回落查找
+        if not tool_id and block_index is not None and block_index in block_mapping:
+            return block_mapping[block_index]
+
+        # 首次出现：分配新 index
         next_idx = int(ss.get("next_tool_index") or 0)
-        mapping[tool_id] = next_idx
+        if tool_id:
+            mapping[tool_id] = next_idx
+        if block_index is not None:
+            block_mapping[block_index] = next_idx
         ss["next_tool_index"] = next_idx + 1
         return next_idx

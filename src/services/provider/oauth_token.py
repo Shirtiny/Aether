@@ -31,12 +31,49 @@ from src.models.database import ProviderAPIKey
 # 其余 reason 属于 token 级别异常，成功刷新 token 后自动清除。
 OAUTH_ACCOUNT_BLOCK_PREFIX = "[ACCOUNT_BLOCK] "
 
+# 上游返回 "token 已失效" 语义的关键词（小写匹配）。
+# 被 codex_refresher 前向分类和 oauth_token 回溯清理共用。
+TOKEN_INVALIDATED_KEYWORDS: tuple[str, ...] = (
+    "authentication token has been invalidated",
+    "token has been invalidated",
+)
+
+# 回溯清理专用：历史写入的中文 reason 也需匹配
+_LEGACY_TOKEN_INVALID_KEYWORDS: tuple[str, ...] = (
+    *TOKEN_INVALIDATED_KEYWORDS,
+    "codex token 无效或已过期",
+)
+
+
+def looks_like_token_invalidated(message: str | None) -> bool:
+    """判断上游错误消息是否表示 access token 已失效/被轮换。"""
+    lowered = str(message or "").strip().lower()
+    return any(keyword in lowered for keyword in TOKEN_INVALIDATED_KEYWORDS)
+
+
+def _is_refresh_recoverable_account_block(reason: str | None) -> bool:
+    """历史兼容：部分 token 级异常曾被错误写成 [ACCOUNT_BLOCK]。
+
+    这类原因在手动刷新成功后应自动清除，否则前端会继续展示
+    "Token 失效/账号异常"，并阻止 Key 恢复调度。
+    """
+    if not reason:
+        return False
+    text = str(reason)
+    if not text.startswith(OAUTH_ACCOUNT_BLOCK_PREFIX):
+        return False
+    lowered = text[len(OAUTH_ACCOUNT_BLOCK_PREFIX) :].strip().lower()
+    return any(keyword in lowered for keyword in _LEGACY_TOKEN_INVALID_KEYWORDS)
+
 
 def is_account_level_block(reason: str | None) -> bool:
     """判断 oauth_invalid_reason 是否属于账号级别的 block（刷新 token 无法修复）。"""
     if not reason:
         return False
-    return str(reason).startswith(OAUTH_ACCOUNT_BLOCK_PREFIX)
+    text = str(reason)
+    return text.startswith(
+        OAUTH_ACCOUNT_BLOCK_PREFIX
+    ) and not _is_refresh_recoverable_account_block(text)
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,4 +153,9 @@ async def resolve_oauth_access_token(
     )
 
 
-__all__ = ["OAuthAccessTokenResult", "resolve_oauth_access_token"]
+__all__ = [
+    "OAuthAccessTokenResult",
+    "TOKEN_INVALIDATED_KEYWORDS",
+    "looks_like_token_invalidated",
+    "resolve_oauth_access_token",
+]

@@ -702,3 +702,170 @@ def test_real_claude_cli_stream_to_openai_cli() -> None:
         e for e in all_events if e.get("type") in ("response.completed", "response.done")
     ]
     assert len(done_events) >= 1
+
+
+def test_resp_id_normalized_to_chatcmpl_in_response_conversion() -> None:
+    """openai:cli -> openai:chat 响应转换时 resp_ 前缀应转为 chatcmpl-。"""
+    reg = _make_registry_with_cli()
+
+    cli_response = {
+        "id": "resp_67ccfcdd16748190a91872c75d38539e",
+        "object": "response",
+        "model": "gpt-4o",
+        "status": "completed",
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "hello"}],
+            }
+        ],
+        "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+    }
+
+    chat_response = reg.convert_response(
+        cli_response, "openai:cli", "openai:chat", requested_model="gpt-4o"
+    )
+    assert chat_response["id"].startswith("chatcmpl-")
+    assert "resp_" not in chat_response["id"]
+
+
+def test_resp_id_normalized_to_chatcmpl_in_stream_conversion() -> None:
+    """openai:cli -> openai:chat 流式转换时 chunk id 应为 chatcmpl- 前缀。"""
+    reg = _make_registry_with_cli()
+
+    cli_chunks: list[dict[str, Any]] = [
+        {
+            "type": "response.created",
+            "response": {
+                "id": "resp_abc123",
+                "object": "response",
+                "model": "gpt-4o",
+                "status": "in_progress",
+                "output": [],
+            },
+        },
+        {
+            "type": "response.output_text.delta",
+            "delta": "hi",
+            "content_index": 0,
+            "output_index": 0,
+        },
+        {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_abc123",
+                "object": "response",
+                "model": "gpt-4o",
+                "status": "completed",
+                "output": [],
+                "usage": {"input_tokens": 5, "output_tokens": 2, "total_tokens": 7},
+            },
+        },
+    ]
+
+    state = StreamState()
+    all_events: list[dict[str, Any]] = []
+    for chunk in cli_chunks:
+        events = reg.convert_stream_chunk(chunk, "openai:cli", "openai:chat", state=state)
+        all_events.extend(events)
+
+    # 所有 chunk 的 id 都应为 chatcmpl- 前缀
+    for event in all_events:
+        event_id = event.get("id", "")
+        if event_id:
+            assert event_id.startswith(
+                "chatcmpl-"
+            ), f"chunk id should start with chatcmpl-: {event_id}"
+
+
+def test_tool_call_stream_index_stable_across_deltas() -> None:
+    """openai:cli -> openai:chat 流式 tool_call 的所有 delta 应保持同一 index。"""
+    reg = _make_registry_with_cli()
+
+    cli_chunks: list[dict[str, Any]] = [
+        {
+            "type": "response.created",
+            "response": {
+                "id": "resp_tc_idx",
+                "object": "response",
+                "model": "gpt-4o",
+                "status": "in_progress",
+                "output": [],
+            },
+        },
+        {
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "type": "function_call",
+                "call_id": "fc_001",
+                "id": "fc_001",
+                "name": "get_weather",
+                "status": "in_progress",
+                "arguments": "",
+            },
+        },
+        {
+            "type": "response.function_call_arguments.delta",
+            "output_index": 0,
+            "item_id": "fc_001",
+            "delta": '{"loc',
+        },
+        {
+            "type": "response.function_call_arguments.delta",
+            "output_index": 0,
+            "item_id": "fc_001",
+            "delta": 'ation": "Tokyo"}',
+        },
+        {
+            "type": "response.function_call_arguments.done",
+            "output_index": 0,
+            "item_id": "fc_001",
+            "arguments": '{"location": "Tokyo"}',
+        },
+        {
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "type": "function_call",
+                "call_id": "fc_001",
+                "id": "fc_001",
+                "name": "get_weather",
+                "status": "completed",
+                "arguments": '{"location": "Tokyo"}',
+            },
+        },
+        {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_tc_idx",
+                "object": "response",
+                "model": "gpt-4o",
+                "status": "completed",
+                "output": [],
+                "usage": {"input_tokens": 20, "output_tokens": 10, "total_tokens": 30},
+            },
+        },
+    ]
+
+    state = StreamState()
+    all_events: list[dict[str, Any]] = []
+    for chunk in cli_chunks:
+        events = reg.convert_stream_chunk(chunk, "openai:cli", "openai:chat", state=state)
+        all_events.extend(events)
+
+    # 收集所有 tool_calls chunk
+    tc_indices: list[int] = []
+    for event in all_events:
+        for choice in event.get("choices", []):
+            tcs = choice.get("delta", {}).get("tool_calls")
+            if isinstance(tcs, list):
+                for tc in tcs:
+                    tc_indices.append(tc["index"])
+
+    assert len(tc_indices) >= 2, f"expected at least 2 tool_call chunks, got {len(tc_indices)}"
+    # 同一个 tool call 的所有 chunk 必须使用相同的 index
+    assert all(
+        idx == tc_indices[0] for idx in tc_indices
+    ), f"tool_call index should be stable, got: {tc_indices}"
