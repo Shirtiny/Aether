@@ -4062,6 +4062,11 @@ pub(crate) fn gemini_usage_to_canonical(value: Option<&Value>) -> Option<Canonic
         .or_else(|| usage.get("thoughts_token_count"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
+    let cache_read_tokens = usage
+        .get("cachedContentTokenCount")
+        .or_else(|| usage.get("cached_content_token_count"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     let output_tokens = visible_output_tokens + reasoning_tokens;
     Some(CanonicalUsage {
         input_tokens,
@@ -4070,7 +4075,8 @@ pub(crate) fn gemini_usage_to_canonical(value: Option<&Value>) -> Option<Canonic
             .get("totalTokenCount")
             .or_else(|| usage.get("total_token_count"))
             .and_then(Value::as_u64)
-            .unwrap_or(input_tokens + output_tokens),
+            .unwrap_or(input_tokens + output_tokens + cache_read_tokens),
+        cache_read_tokens,
         reasoning_tokens,
         extensions: gemini_extensions(
             usage,
@@ -4081,6 +4087,8 @@ pub(crate) fn gemini_usage_to_canonical(value: Option<&Value>) -> Option<Canonic
                 "candidates_token_count",
                 "thoughtsTokenCount",
                 "thoughts_token_count",
+                "cachedContentTokenCount",
+                "cached_content_token_count",
                 "totalTokenCount",
                 "total_token_count",
             ],

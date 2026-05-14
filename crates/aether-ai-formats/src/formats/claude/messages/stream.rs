@@ -747,13 +747,44 @@ impl ClaudeClientEmitter {
                     }),
                 );
                 let usage = usage.unwrap_or_default();
-                payload.insert(
-                    "usage".to_string(),
-                    json!({
-                        "input_tokens": usage.input_tokens,
-                        "output_tokens": usage.output_tokens,
-                    }),
+                let mut usage_payload = Map::new();
+                usage_payload.insert("input_tokens".to_string(), Value::from(usage.input_tokens));
+                usage_payload.insert(
+                    "output_tokens".to_string(),
+                    Value::from(usage.output_tokens),
                 );
+                if usage.cache_read_tokens > 0 {
+                    usage_payload.insert(
+                        "cache_read_input_tokens".to_string(),
+                        Value::from(usage.cache_read_tokens),
+                    );
+                }
+                if usage.cache_creation_tokens > 0 {
+                    usage_payload.insert(
+                        "cache_creation_input_tokens".to_string(),
+                        Value::from(usage.cache_creation_tokens),
+                    );
+                }
+                if usage.cache_creation_ephemeral_5m_tokens > 0
+                    || usage.cache_creation_ephemeral_1h_tokens > 0
+                {
+                    let mut cache_creation = Map::new();
+                    if usage.cache_creation_ephemeral_5m_tokens > 0 {
+                        cache_creation.insert(
+                            "ephemeral_5m_input_tokens".to_string(),
+                            Value::from(usage.cache_creation_ephemeral_5m_tokens),
+                        );
+                    }
+                    if usage.cache_creation_ephemeral_1h_tokens > 0 {
+                        cache_creation.insert(
+                            "ephemeral_1h_input_tokens".to_string(),
+                            Value::from(usage.cache_creation_ephemeral_1h_tokens),
+                        );
+                    }
+                    usage_payload
+                        .insert("cache_creation".to_string(), Value::Object(cache_creation));
+                }
+                payload.insert("usage".to_string(), Value::Object(usage_payload));
                 out.extend(encode_json_sse(
                     Some("message_delta"),
                     &Value::Object(payload),
@@ -1281,6 +1312,36 @@ mod tests {
         assert!(sse.contains("event: message_delta"));
         assert!(sse.contains("\"stop_reason\":\"end_turn\""));
         assert!(sse.contains("\"usage\":{\"input_tokens\":0,\"output_tokens\":0}"));
+    }
+
+    #[test]
+    fn claude_client_emitter_emits_cache_usage_into_finish_events() {
+        let mut emitter = ClaudeClientEmitter::default();
+        let bytes = emitter
+            .emit(CanonicalStreamFrame {
+                id: "msg_456".to_string(),
+                model: "gpt-5.4".to_string(),
+                event: CanonicalStreamEvent::Finish {
+                    finish_reason: Some("stop".to_string()),
+                    usage: Some(CanonicalUsage {
+                        input_tokens: 5,
+                        output_tokens: 7,
+                        cache_creation_tokens: 11,
+                        cache_creation_ephemeral_5m_tokens: 13,
+                        cache_creation_ephemeral_1h_tokens: 17,
+                        cache_read_tokens: 19,
+                        ..Default::default()
+                    }),
+                },
+            })
+            .expect("finish should encode");
+
+        let sse = String::from_utf8(bytes).expect("sse should be utf8");
+        assert!(sse.contains("\"cache_read_input_tokens\":19"));
+        assert!(sse.contains("\"cache_creation_input_tokens\":11"));
+        assert!(sse.contains("\"cache_creation\":{"));
+        assert!(sse.contains("\"ephemeral_5m_input_tokens\":13"));
+        assert!(sse.contains("\"ephemeral_1h_input_tokens\":17"));
     }
 
     #[test]

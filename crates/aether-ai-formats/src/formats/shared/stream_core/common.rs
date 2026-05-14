@@ -294,6 +294,8 @@ pub fn build_openai_chat_usage_chunk(
     completion_tokens: u64,
     total_tokens: u64,
     reasoning_tokens: u64,
+    cache_read_tokens: u64,
+    cache_creation_tokens: u64,
 ) -> Value {
     let mut usage = Map::new();
     usage.insert("prompt_tokens".to_string(), Value::from(prompt_tokens));
@@ -302,6 +304,23 @@ pub fn build_openai_chat_usage_chunk(
         Value::from(completion_tokens),
     );
     usage.insert("total_tokens".to_string(), Value::from(total_tokens));
+    if cache_read_tokens > 0 || cache_creation_tokens > 0 {
+        let mut prompt_tokens_details = Map::new();
+        if cache_read_tokens > 0 {
+            prompt_tokens_details
+                .insert("cached_tokens".to_string(), Value::from(cache_read_tokens));
+        }
+        if cache_creation_tokens > 0 {
+            prompt_tokens_details.insert(
+                "cached_creation_tokens".to_string(),
+                Value::from(cache_creation_tokens),
+            );
+        }
+        usage.insert(
+            "prompt_tokens_details".to_string(),
+            Value::Object(prompt_tokens_details),
+        );
+    }
     if reasoning_tokens > 0 {
         usage.insert(
             "completion_tokens_details".to_string(),

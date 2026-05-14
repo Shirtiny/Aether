@@ -351,5 +351,46 @@ fn canonical_usage_to_gemini_usage_metadata(usage: &CanonicalUsage) -> Value {
             Value::from(usage.reasoning_tokens),
         );
     }
+    if usage.cache_read_tokens > 0 {
+        out.insert(
+            "cachedContentTokenCount".to_string(),
+            Value::from(usage.cache_read_tokens),
+        );
+    }
     Value::Object(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gemini_response_round_trips_cached_content_usage() {
+        let response = from_raw(&json!({
+            "responseId": "resp_123",
+            "modelVersion": "gemini-2.5-pro",
+            "candidates": [{
+                "index": 0,
+                "content": {
+                    "role": "model",
+                    "parts": [{"text": "Hello"}]
+                },
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 1,
+                "candidatesTokenCount": 2,
+                "cachedContentTokenCount": 5,
+                "totalTokenCount": 8
+            }
+        }))
+        .expect("response should parse");
+
+        assert_eq!(
+            response.usage.as_ref().map(|usage| usage.cache_read_tokens),
+            Some(5)
+        );
+        let rebuilt = to_raw(&response, &json!({})).expect("response should rebuild");
+        assert_eq!(rebuilt["usageMetadata"]["cachedContentTokenCount"], 5);
+    }
 }

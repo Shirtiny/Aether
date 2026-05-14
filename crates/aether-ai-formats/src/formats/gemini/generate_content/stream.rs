@@ -424,6 +424,12 @@ impl GeminiClientEmitter {
                     Value::from(usage.reasoning_tokens),
                 );
             }
+            if usage.cache_read_tokens > 0 {
+                usage_metadata.insert(
+                    "cachedContentTokenCount".to_string(),
+                    Value::from(usage.cache_read_tokens),
+                );
+            }
             response.insert("usageMetadata".to_string(), Value::Object(usage_metadata));
         }
         encode_json_sse(None, &Value::Object(response))
@@ -883,6 +889,7 @@ mod tests {
                         "promptTokenCount": 1,
                         "candidatesTokenCount": 2,
                         "thoughtsTokenCount": 4,
+                        "cachedContentTokenCount": 5,
                         "totalTokenCount": 7
                     }
                 })),
@@ -914,6 +921,7 @@ mod tests {
                     input_tokens: 1,
                     output_tokens: 6,
                     reasoning_tokens: 4,
+                    cache_read_tokens: 5,
                     total_tokens: 7,
                     ..
                 }),
@@ -990,6 +998,7 @@ mod tests {
                             output_tokens: 3,
                             reasoning_tokens: 1,
                             total_tokens: 4,
+                            cache_read_tokens: 5,
                             ..CanonicalUsage::default()
                         }),
                     },
@@ -1001,6 +1010,7 @@ mod tests {
         assert!(sse.contains("\"thought\":true"));
         assert!(sse.contains("\"thoughtSignature\":\"sig_123\""));
         assert!(sse.contains("\"thoughtsTokenCount\":1"));
+        assert!(sse.contains("\"cachedContentTokenCount\":5"));
         assert!(sse.contains("\"candidatesTokenCount\":2"));
         assert!(sse.contains("\"finishReason\":\"STOP\""));
     }

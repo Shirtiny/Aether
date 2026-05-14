@@ -1477,6 +1477,8 @@ impl OpenAIChatClientEmitter {
                             usage.output_tokens,
                             usage.total_tokens,
                             usage.reasoning_tokens,
+                            usage.cache_read_tokens,
+                            usage.cache_creation_tokens,
                         ),
                     )?);
                 }
@@ -2067,6 +2069,25 @@ impl OpenAIResponsesClientEmitter {
             Value::from(usage.output_tokens),
         );
         usage_payload.insert("total_tokens".to_string(), Value::from(usage.total_tokens));
+        if usage.cache_read_tokens > 0 || usage.cache_creation_tokens > 0 {
+            let mut input_tokens_details = Map::new();
+            if usage.cache_read_tokens > 0 {
+                input_tokens_details.insert(
+                    "cached_tokens".to_string(),
+                    Value::from(usage.cache_read_tokens),
+                );
+            }
+            if usage.cache_creation_tokens > 0 {
+                input_tokens_details.insert(
+                    "cached_creation_tokens".to_string(),
+                    Value::from(usage.cache_creation_tokens),
+                );
+            }
+            usage_payload.insert(
+                "input_tokens_details".to_string(),
+                Value::Object(input_tokens_details),
+            );
+        }
         if usage.reasoning_tokens > 0 {
             usage_payload.insert(
                 "output_tokens_details".to_string(),
@@ -3025,6 +3046,8 @@ mod tests {
                             output_tokens: 2,
                             total_tokens: 3,
                             reasoning_tokens: 1,
+                            cache_read_tokens: 5,
+                            cache_creation_tokens: 7,
                             ..CanonicalUsage::default()
                         }),
                     },
@@ -3037,6 +3060,9 @@ mod tests {
         assert!(sse.contains("\"choices\":[]"));
         assert!(sse.contains("\"prompt_tokens\":1"));
         assert!(sse.contains("\"completion_tokens\":2"));
+        assert!(sse.contains("\"prompt_tokens_details\":"));
+        assert!(sse.contains("\"cached_tokens\":5"));
+        assert!(sse.contains("\"cached_creation_tokens\":7"));
         assert!(sse.contains("\"completion_tokens_details\":{\"reasoning_tokens\":1}"));
         assert!(sse.contains("\"total_tokens\":3"));
         assert!(sse.contains("data: [DONE]\n\n"));
@@ -3146,6 +3172,8 @@ mod tests {
                             output_tokens: 2,
                             total_tokens: 3,
                             reasoning_tokens: 1,
+                            cache_read_tokens: 5,
+                            cache_creation_tokens: 7,
                             ..CanonicalUsage::default()
                         }),
                     },
@@ -3156,6 +3184,9 @@ mod tests {
         let sse = String::from_utf8(bytes).expect("sse should be utf8");
         assert!(sse.contains("\"type\":\"reasoning\""));
         assert!(sse.contains("\"text\":\"because\""));
+        assert!(sse.contains("\"input_tokens_details\":"));
+        assert!(sse.contains("\"cached_tokens\":5"));
+        assert!(sse.contains("\"cached_creation_tokens\":7"));
         assert!(sse.contains("\"output_tokens_details\":{\"reasoning_tokens\":1}"));
     }
 
