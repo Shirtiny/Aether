@@ -87,6 +87,8 @@ mod tests {
         assert!(service.supports_quota_refresh("codex"));
         assert!(service.supports_quota_refresh("antigravity"));
         assert!(!service.supports_quota_refresh("gemini_cli"));
+        assert!(service.supports_account_self_check("codex"));
+        assert!(!service.supports_account_self_check("gemini_cli"));
         assert_eq!(
             service.quota_refresh_unsupported_message("claude_code"),
             "Claude Code 暂不支持自动刷新额度：上游没有稳定可用的账号额度查询接口"

@@ -1,11 +1,13 @@
 # Build artifacts
 build/
+target/
 *.so
 *.egg
 *.egg-info/
 
 # Frontend
 frontend/node_modules/
+frontend/dist/
 frontend/.vite/
 
 # Development

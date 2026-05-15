@@ -146,6 +146,21 @@
                 <Plug class="w-3.5 h-3.5" />
               </Button>
             </div>
+            <div
+              v-if="showAdaptiveHotPoolMetricsButton"
+              class="min-w-0 flex-1 flex justify-center"
+            >
+              <Button
+                variant="ghost"
+                size="icon"
+                class="h-8 w-8 shrink-0"
+                data-testid="pool-demand-metrics-button"
+                title="查看自适应热池指标"
+                @click="showDemandMetricsDialog = true"
+              >
+                <Activity class="w-3.5 h-3.5" />
+              </Button>
+            </div>
             <div class="min-w-0 flex-1 flex justify-center">
               <Button
                 variant="ghost"
@@ -292,6 +307,17 @@
               @click="openEndpointEditDialog"
             >
               <Plug class="w-3.5 h-3.5" />
+            </Button>
+            <Button
+              v-if="showAdaptiveHotPoolMetricsButton"
+              variant="ghost"
+              size="icon"
+              class="h-8 w-8"
+              data-testid="pool-demand-metrics-button"
+              title="查看自适应热池指标"
+              @click="showDemandMetricsDialog = true"
+            >
+              <Activity class="w-3.5 h-3.5" />
             </Button>
             <Button
               v-if="selectedProviderId"
@@ -1393,6 +1419,11 @@
       :current-claude-config="selectedProviderClaudeConfig"
       @saved="handleSchedulingSaved"
     />
+    <PoolDemandMetricsDialog
+      v-model="showDemandMetricsDialog"
+      :provider-name="selectedProviderOverview?.provider_name"
+      :samples="providerDemandMetricSamples"
+    />
     <ProviderFormDialog
       v-model="providerEditDialogOpen"
       :provider="providerToEdit"
@@ -1451,6 +1482,7 @@ import {
   Upload,
   ChevronDown,
   RefreshCw,
+  Activity,
   Power,
   Database,
   KeyRound,
@@ -1533,6 +1565,7 @@ import { getProvider, getProviderEndpoints, updateProvider } from '@/api/endpoin
 import { useProxyNodesStore } from '@/stores/proxy-nodes'
 import PoolSchedulingDialog from '@/features/pool/components/PoolSchedulingDialog.vue'
 import PoolAdvancedDialog from '@/features/pool/components/PoolAdvancedDialog.vue'
+import PoolDemandMetricsDialog from '@/features/pool/components/PoolDemandMetricsDialog.vue'
 import PoolAccountBatchDialog from '@/features/pool/components/PoolAccountBatchDialog.vue'
 import ProviderProxyPopover from '@/features/pool/components/ProviderProxyPopover.vue'
 import KeyAllowedModelsEditDialog from '@/features/providers/components/KeyAllowedModelsEditDialog.vue'
@@ -1621,11 +1654,28 @@ let selectProviderRequestId = 0
 let providerDataRequestId = 0
 let keysRequestId = 0
 let keysSearchDebounceTimer: number | null = null
+let demandMetricsPollingTimer: number | null = null
+let demandMetricsRequestId = 0
 let suppressFiltersWatch = false
 let hasHydratedInitialProviderSelection = false
 const POOL_OVERVIEW_CACHE_TTL_MS = 10 * 1000
 const POOL_KEYS_CACHE_TTL_MS = 10 * 1000
 const POOL_SCHEDULING_PRESETS_CACHE_TTL_MS = 5 * 60 * 1000
+const POOL_DEMAND_METRICS_SAMPLES_LIMIT = 120
+const POOL_DEMAND_METRICS_POLL_INTERVAL_MS = 10 * 1000
+
+interface PoolDemandMetricSample {
+  providerId: string
+  sampledAt: number
+  hotCount: number
+  desiredHot: number
+  inFlight: number
+  emaInFlight: number
+  burstPending: boolean
+}
+
+const showDemandMetricsDialog = ref(false)
+const providerDemandMetricSamples = ref<PoolDemandMetricSample[]>([])
 const poolKeyStatusFilterOptions: Array<{ value: PoolManagementViewState['status'], label: string }> = [
   { value: 'all', label: '全部状态' },
   { value: 'active', label: '可调度' },
@@ -1651,9 +1701,11 @@ const poolScoreProbeStatusOptions = [
   { value: 'in_progress', label: '探测中' },
 ]
 
-async function loadOverview(options: { cacheTtlMs?: number } = {}) {
+async function loadOverview(options: { cacheTtlMs?: number, silent?: boolean } = {}) {
   const requestId = ++overviewRequestId
-  overviewLoading.value = true
+  if (!options.silent) {
+    overviewLoading.value = true
+  }
   try {
     const res = await getPoolOverview({ cacheTtlMs: options.cacheTtlMs ?? 0 })
     if (requestId !== overviewRequestId) return
@@ -1711,9 +1763,11 @@ async function loadOverview(options: { cacheTtlMs?: number } = {}) {
     }
   } catch (err) {
     if (requestId !== overviewRequestId) return
-    showError(parseApiError(err))
+    if (!options.silent) {
+      showError(parseApiError(err))
+    }
   } finally {
-    if (requestId === overviewRequestId) {
+    if (requestId === overviewRequestId && !options.silent) {
       overviewLoading.value = false
     }
   }
@@ -1795,6 +1849,97 @@ const selectedProviderOverview = computed<PoolOverviewItem | null>(() => {
   return poolProviders.value.find(item => item.provider_id === selectedId) || null
 })
 
+const showAdaptiveHotPoolMetricsButton = computed(() => {
+  if (!selectedProviderId.value) return false
+  return selectedProviderConfig.value?.probing_enabled === true
+})
+
+function normalizeDemandMetricNumber(value: unknown): number {
+  const normalized = Number(value ?? 0)
+  if (!Number.isFinite(normalized) || normalized <= 0) return 0
+  return normalized
+}
+
+function buildDemandMetricSample(overview: PoolOverviewItem): PoolDemandMetricSample {
+  return {
+    providerId: overview.provider_id,
+    sampledAt: Date.now(),
+    hotCount: Math.floor(normalizeDemandMetricNumber(overview.provider_hot_count)),
+    desiredHot: Math.floor(normalizeDemandMetricNumber(overview.provider_desired_hot)),
+    inFlight: Math.floor(normalizeDemandMetricNumber(overview.provider_in_flight)),
+    emaInFlight: normalizeDemandMetricNumber(overview.provider_ema_in_flight),
+    burstPending: overview.provider_burst_pending === true,
+  }
+}
+
+function appendDemandMetricSample(overview: PoolOverviewItem | null): void {
+  if (!overview || !showDemandMetricsDialog.value || !showAdaptiveHotPoolMetricsButton.value) return
+  const nextSample = buildDemandMetricSample(overview)
+  const existing = providerDemandMetricSamples.value.filter(
+    sample => sample.providerId === overview.provider_id,
+  )
+  const lastSample = existing.at(-1)
+  if (
+    lastSample
+    && nextSample.sampledAt - lastSample.sampledAt < 1000
+    && lastSample.hotCount === nextSample.hotCount
+    && lastSample.desiredHot === nextSample.desiredHot
+    && lastSample.inFlight === nextSample.inFlight
+    && lastSample.emaInFlight === nextSample.emaInFlight
+    && lastSample.burstPending === nextSample.burstPending
+  ) {
+    providerDemandMetricSamples.value = existing
+    return
+  }
+  providerDemandMetricSamples.value = [...existing, nextSample]
+    .slice(-POOL_DEMAND_METRICS_SAMPLES_LIMIT)
+}
+
+function stopDemandMetricsPolling(): void {
+  if (demandMetricsPollingTimer !== null) {
+    window.clearInterval(demandMetricsPollingTimer)
+    demandMetricsPollingTimer = null
+  }
+}
+
+async function refreshDemandMetricsOverview(): Promise<void> {
+  const providerId = selectedProviderId.value
+  if (!showDemandMetricsDialog.value || !showAdaptiveHotPoolMetricsButton.value || !providerId) {
+    return
+  }
+
+  const requestId = ++demandMetricsRequestId
+  try {
+    const res = await getPoolOverview({ cacheTtlMs: 0 })
+    if (
+      requestId !== demandMetricsRequestId
+      || !showDemandMetricsDialog.value
+      || selectedProviderId.value !== providerId
+    ) {
+      return
+    }
+    const allProviders = Array.isArray(res.items) ? res.items : []
+    const enabledProviders = allProviders.filter(item => item.pool_enabled)
+    poolProviders.value = enabledProviders
+    appendDemandMetricSample(
+      enabledProviders.find(item => item.provider_id === providerId) || null,
+    )
+  } catch {
+    // 指标弹窗只做尽力刷新，失败不打断主流程。
+  }
+}
+
+function startDemandMetricsPolling(): void {
+  stopDemandMetricsPolling()
+  appendDemandMetricSample(selectedProviderOverview.value)
+  void refreshDemandMetricsOverview()
+  demandMetricsPollingTimer = window.setInterval(() => {
+    if (!showDemandMetricsDialog.value || !showAdaptiveHotPoolMetricsButton.value) return
+    if (document.visibilityState === 'hidden') return
+    void refreshDemandMetricsOverview()
+  }, POOL_DEMAND_METRICS_POLL_INTERVAL_MS)
+}
+
 const poolSchedulingLabel = computed(() => {
   if (!selectedProviderConfig.value && selectedProviderOverview.value?.pool_enabled === false) {
     return '未启用'
@@ -1864,11 +2009,63 @@ const selectedProviderStatusText = computed(() => {
   return ''
 })
 
+function formatDemandEma(value: number | undefined): string {
+  const normalized = Number(value ?? 0)
+  if (!Number.isFinite(normalized) || normalized <= 0) return '0.0'
+  return normalized.toFixed(1)
+}
+
+const selectedProviderDemandMetaText = computed(() => {
+  const overview = selectedProviderOverview.value
+  if (!overview) return ''
+  const segments: string[] = []
+  const desiredHot = Number(overview.provider_desired_hot ?? 0)
+  const hotCount = Number(overview.provider_hot_count ?? 0)
+  const inFlight = Number(overview.provider_in_flight ?? 0)
+  if (Number.isFinite(desiredHot) && desiredHot > 0) {
+    segments.push(`热池 ${hotCount} / ${desiredHot}`)
+    segments.push(`EMA ${formatDemandEma(overview.provider_ema_in_flight)}`)
+  }
+  if (Number.isFinite(inFlight) && inFlight > 0) {
+    segments.push(`in-flight ${inFlight}`)
+  }
+  if (overview.provider_burst_pending) {
+    segments.push('补热中')
+  }
+  return segments.join(' | ')
+})
+
 const poolHeaderMetaText = computed(() => {
-  const providerType = selectedProviderType.value
-  const status = selectedProviderStatusText.value
-  if (providerType && status) return `${providerType} | ${status}`
-  return providerType || status || ''
+  return [
+    selectedProviderType.value,
+    selectedProviderStatusText.value,
+    selectedProviderDemandMetaText.value,
+  ].filter(Boolean).join(' | ')
+})
+
+watch(showDemandMetricsDialog, (open) => {
+  if (open) {
+    startDemandMetricsPolling()
+  } else {
+    stopDemandMetricsPolling()
+  }
+})
+
+watch(selectedProviderId, () => {
+  providerDemandMetricSamples.value = []
+  if (showDemandMetricsDialog.value) {
+    appendDemandMetricSample(selectedProviderOverview.value)
+  }
+})
+
+watch(selectedProviderOverview, (overview) => {
+  appendDemandMetricSample(overview)
+})
+
+watch(showAdaptiveHotPoolMetricsButton, (enabled) => {
+  if (!enabled && showDemandMetricsDialog.value) {
+    showDemandMetricsDialog.value = false
+  }
 })
 
 const showAccountQuotaColumn = computed(() => {
@@ -3955,6 +4152,7 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  stopDemandMetricsPolling()
   if (keysSearchDebounceTimer !== null) {
     clearTimeout(keysSearchDebounceTimer)
     keysSearchDebounceTimer = null

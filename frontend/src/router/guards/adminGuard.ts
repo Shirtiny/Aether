@@ -12,8 +12,7 @@ export async function checkAdminAccess(
   authStore: ReturnType<typeof useAuthStore>,
   moduleStore: ReturnType<typeof useModuleStore>
 ): Promise<string | null> {
-  const isAdmin = authStore.user?.role === 'admin'
-  if (!isAdmin) {
+  if (!authStore.canAccessAdmin) {
     log.warn('Non-admin user attempted to access admin page, redirecting to user dashboard')
     return '/dashboard'
   }

@@ -8,20 +8,23 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+LOCAL_APP_IMAGE="${LOCAL_APP_IMAGE:-aether-app:latest}"
+export LOCAL_APP_IMAGE
+
 # 兼容 docker-compose 和 docker compose
 if command -v docker-compose &> /dev/null; then
-    DC="docker-compose -f docker-compose.build.yml"
+    DC=(docker-compose -f docker-compose.yml -f docker-compose.local.yml)
     USE_LEGACY_COMPOSE=true
 else
-    DC="docker compose -f docker-compose.build.yml"
+    DC=(docker compose -f docker-compose.yml -f docker-compose.local.yml)
     USE_LEGACY_COMPOSE=false
 fi
 
 compose_up() {
     if [ "$USE_LEGACY_COMPOSE" = true ]; then
-        $DC up -d --no-build "$@"
+        "${DC[@]}" up -d --no-build "$@"
     else
-        $DC up -d --no-build --pull never "$@"
+        "${DC[@]}" up -d --no-build --pull never "$@"
     fi
 }
 
@@ -35,6 +38,9 @@ Usage: ./deploy.sh [options]
 Options:
   --force, -f             强制重建并重启
   -h, --help              显示帮助
+
+Environment:
+  LOCAL_APP_IMAGE          本地构建镜像名，默认 aether-app:latest
 EOF
 }
 
@@ -58,22 +64,78 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+require_file() {
+    if [ ! -f "$1" ]; then
+        echo "Required file not found: $1"
+        exit 1
+    fi
+}
+
+hash_stream() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum | cut -d' ' -f1
+    else
+        shasum -a 256 | cut -d' ' -f1
+    fi
+}
+
+emit_file_for_hash() {
+    local path="$1"
+    [ -f "$path" ] || return 0
+    printf '\n>>> %s\n' "$path"
+    cat "$path"
+}
+
+emit_tree_for_hash() {
+    local root="$1"
+    [ -d "$root" ] || return 0
+    find "$root" -type f \
+        ! -path '*/node_modules/*' \
+        ! -path '*/target/*' \
+        ! -path '*/dist/*' \
+        ! -path '*/.mypy_cache/*' \
+        ! -path '*/.vite/*' \
+        2>/dev/null | sort | while IFS= read -r path; do
+        emit_file_for_hash "$path"
+    done
+}
+
 # 计算代码文件的哈希值
 calc_code_hash() {
     {
-        cat Dockerfile.app.local 2>/dev/null
-        cat Cargo.toml Cargo.lock 2>/dev/null
-        find frontend/src -type f \( -name "*.vue" -o -name "*.ts" -o -name "*.tsx" -o -name "*.js" \) 2>/dev/null | sort | xargs cat 2>/dev/null
-        find apps -type f \( -name "*.rs" -o -name "Cargo.toml" \) 2>/dev/null | sort | xargs cat 2>/dev/null
-        find crates -type f \( -name "*.rs" -o -name "*.sql" -o -name "Cargo.toml" \) 2>/dev/null | sort | xargs cat 2>/dev/null
-    } | md5sum | cut -d' ' -f1
+        for file in \
+            Dockerfile.app.local \
+            docker-compose.yml \
+            docker-compose.local.yml \
+            .dockerignore \
+            Cargo.toml \
+            Cargo.lock \
+            rust-toolchain.toml \
+            frontend/package.json \
+            frontend/package-lock.json \
+            frontend/index.html \
+            frontend/vite.config.ts \
+            frontend/tsconfig.json \
+            frontend/tsconfig.app.json \
+            frontend/tsconfig.node.json \
+            frontend/postcss.config.js \
+            frontend/tailwind.config.js; do
+            emit_file_for_hash "$file"
+        done
+
+        for dir in frontend/src frontend/public apps crates; do
+            emit_tree_for_hash "$dir"
+        done
+    } | hash_stream
 }
 
 # 检查代码是否变化
 check_code_changed() {
-    local current_hash=$(calc_code_hash)
+    local current_hash
+    current_hash=$(calc_code_hash)
     if [ -f "$CODE_HASH_FILE" ]; then
-        local saved_hash=$(cat "$CODE_HASH_FILE")
+        local saved_hash
+        saved_hash=$(cat "$CODE_HASH_FILE")
         if [ "$current_hash" = "$saved_hash" ]; then
             return 1
         fi
@@ -85,8 +147,9 @@ save_code_hash() { calc_code_hash > "$CODE_HASH_FILE"; }
 
 # 构建应用镜像
 build_app() {
-    echo ">>> Building app image (rust gateway + frontend)..."
-    docker build --pull=false -f Dockerfile.app.local -t aether-app:latest .
+    require_file Dockerfile.app.local
+    echo ">>> Building app image: $LOCAL_APP_IMAGE"
+    DOCKER_BUILDKIT="${DOCKER_BUILDKIT:-1}" docker build --pull=false -f Dockerfile.app.local -t "$LOCAL_APP_IMAGE" .
     save_code_hash
 }
 
@@ -97,7 +160,7 @@ if [ "$FORCE_REBUILD_ALL" = true ]; then
     compose_up --force-recreate
     docker image prune -f
     echo ">>> Done!"
-    $DC ps
+    "${DC[@]}" ps
     exit 0
 fi
 
@@ -105,7 +168,7 @@ fi
 NEED_RESTART=false
 
 # 检查代码是否变化
-if ! docker image inspect aether-app:latest >/dev/null 2>&1; then
+if ! docker image inspect "$LOCAL_APP_IMAGE" >/dev/null 2>&1; then
     echo ">>> App image not found, building..."
     build_app
     NEED_RESTART=true
@@ -119,7 +182,7 @@ fi
 
 # 检查容器是否在运行
 CONTAINERS_RUNNING=true
-if [ -z "$($DC ps -q 2>/dev/null)" ]; then
+if [ -z "$("${DC[@]}" ps -q 2>/dev/null)" ]; then
     CONTAINERS_RUNNING=false
 fi
 
@@ -141,4 +204,4 @@ echo ">>> Done!"
 echo ">>> Note: empty databases auto-bootstrap on first start."
 echo ">>> Note: docker compose now defaults to auto-running pending migrations/backfills on app startup."
 echo ">>> Note: set AETHER_GATEWAY_AUTO_PREPARE_DATABASE=false if you want to keep manual rollout."
-$DC ps
+"${DC[@]}" ps

@@ -76,6 +76,22 @@ pub(crate) fn provider_quota_refresh_endpoint_for_provider(
     )
 }
 
+pub(crate) fn provider_type_supports_account_self_check(provider_type: &str) -> bool {
+    ProviderPoolService::with_builtin_adapters().supports_account_self_check(provider_type)
+}
+
+pub(crate) fn provider_account_self_check_endpoint_for_provider(
+    provider_type: &str,
+    endpoints: &[StoredProviderCatalogEndpoint],
+    include_inactive: bool,
+) -> Option<StoredProviderCatalogEndpoint> {
+    ProviderPoolService::with_builtin_adapters().account_self_check_endpoint_for_provider(
+        provider_type,
+        endpoints,
+        include_inactive,
+    )
+}
+
 pub(crate) fn provider_quota_refresh_missing_endpoint_message(provider_type: &str) -> String {
     ProviderPoolService::with_builtin_adapters()
         .quota_refresh_missing_endpoint_message(provider_type)

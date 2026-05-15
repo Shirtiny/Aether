@@ -623,7 +623,7 @@ async function loadAnnouncements(page = 1) {
   currentPage.value = page
   try {
     const response = await announcementApi.getAnnouncements({
-      active_only: !isAdmin.value, // 管理员可以看到所有公告
+      active_only: !authStore.canAccessAdmin, // 管理员和审计管理员可以看到所有公告
       limit: pageSize.value,
       offset: (page - 1) * pageSize.value
     })

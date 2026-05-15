@@ -3,7 +3,7 @@
     <!-- Header -->
     <div class="p-4 border-b border-border/60">
       <div class="flex items-center justify-between">
-        <div class="flex items-center gap-2">
+        <div class="flex flex-wrap items-center gap-2">
           <h3 class="text-sm font-semibold">
             号池状态
           </h3>
@@ -20,6 +20,34 @@
             class="text-xs"
           >
             {{ poolStatus.total_sticky_sessions }} 个粘性会话
+          </Badge>
+          <Badge
+            v-if="poolStatus && poolStatus.provider_desired_hot > 0"
+            variant="outline"
+            class="text-xs"
+          >
+            热池 {{ poolStatus.provider_hot_count }} / {{ poolStatus.provider_desired_hot }}
+          </Badge>
+          <Badge
+            v-if="poolStatus && poolStatus.provider_in_flight > 0"
+            variant="outline"
+            class="text-xs"
+          >
+            in-flight {{ poolStatus.provider_in_flight }}
+          </Badge>
+          <Badge
+            v-if="poolStatus && poolStatus.provider_desired_hot > 0"
+            variant="outline"
+            class="text-xs"
+          >
+            EMA {{ formatEmaHeat(poolStatus.provider_ema_in_flight) }}
+          </Badge>
+          <Badge
+            v-if="poolStatus?.provider_burst_pending"
+            variant="secondary"
+            class="text-xs"
+          >
+            补热中
           </Badge>
         </div>
         <RefreshButton
@@ -263,6 +291,11 @@ function formatTokens(tokens: number): string {
   if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(1)}M`
   if (tokens >= 1_000) return `${(tokens / 1_000).toFixed(1)}K`
   return String(tokens)
+}
+
+function formatEmaHeat(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return '0.0'
+  return value.toFixed(1)
 }
 
 function getCostBarColor(usage: number, limit: number): string {

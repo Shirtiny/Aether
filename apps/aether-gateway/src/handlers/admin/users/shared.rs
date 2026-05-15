@@ -225,16 +225,13 @@ pub(super) fn validate_admin_user_password(password: &str, policy: &str) -> Resu
 }
 
 pub(super) fn normalize_admin_user_role(value: Option<&str>) -> Result<String, String> {
-    match value
+    let role = value
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or("user")
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "user" => Ok("user".to_string()),
-        "admin" => Ok("admin".to_string()),
-        _ => Err("角色参数不合法".to_string()),
+        .unwrap_or("user");
+    match crate::roles::normalize_assignable_user_role(role) {
+        Some(role) => Ok(role.to_string()),
+        None => Err("角色参数不合法".to_string()),
     }
 }
 

@@ -349,6 +349,14 @@ impl MemoryRuntimeBackend {
         before.saturating_sub(set.len())
     }
 
+    pub(crate) async fn score_remove(&self, key: &str, member: &str) -> bool {
+        self.scores
+            .lock()
+            .await
+            .get_mut(key)
+            .is_some_and(|set| set.remove(member).is_some())
+    }
+
     pub(crate) async fn score_len(&self, key: &str) -> usize {
         self.scores.lock().await.get(key).map_or(0, BTreeMap::len)
     }

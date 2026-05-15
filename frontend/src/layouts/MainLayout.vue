@@ -66,7 +66,7 @@
             </div>
             <div class="flex flex-col min-w-0">
               <span class="text-xs font-semibold leading-none truncate opacity-90 text-foreground">{{ authStore.user?.username }}</span>
-              <span class="text-[10px] opacity-50 leading-none mt-1.5 text-muted-foreground">{{ authStore.user?.role === 'admin' ? '管理员' : '用户' }}</span>
+              <span class="text-[10px] opacity-50 leading-none mt-1.5 text-muted-foreground">{{ currentRoleLabel }}</span>
             </div>
           </div>
 
@@ -227,7 +227,7 @@
                     </div>
                     <div class="flex flex-col min-w-0">
                       <span class="text-sm font-semibold leading-none truncate text-[#191919] dark:text-white">{{ authStore.user?.username }}</span>
-                      <span class="text-[10px] text-[#91918d] dark:text-muted-foreground leading-none mt-1">{{ authStore.user?.role === 'admin' ? '管理员' : '用户' }}</span>
+                      <span class="text-[10px] text-[#91918d] dark:text-muted-foreground leading-none mt-1">{{ currentRoleLabel }}</span>
                     </div>
                   </div>
                   <div class="flex items-center gap-1">
@@ -520,7 +520,7 @@ function showDebugVersionStatus(hasUpdate = true) {
 // 检查更新
 async function checkForUpdate() {
   // 只有管理员才检查更新
-  if (!isAdmin.value) return
+  if (!authStore.canOperateAdmin) return
 
   // 同一会话内只检查一次
   const sessionKey = 'aether_update_checked'
@@ -567,7 +567,7 @@ onMounted(() => {
   syncAuthNotice()
 
   // 管理员预加载模块状态（路由守卫会按需加载，这里提前加载以避免菜单闪烁）
-  if (isAdmin.value && !moduleStore.loaded && !moduleStore.loading) {
+  if (authStore.canAccessAdmin && !moduleStore.loaded && !moduleStore.loading) {
     moduleStore.fetchModules()
   }
   void loadVersionStatus()
@@ -707,7 +707,13 @@ const navigation = computed(() => {
     }
   ]
 
-  return authStore.user?.role === 'admin' ? adminNavigation : baseNavigation
+  return authStore.canAccessAdmin ? adminNavigation : baseNavigation
+})
+
+const currentRoleLabel = computed(() => {
+  if (authStore.isAdmin) return '管理员'
+  if (authStore.isAuditAdmin) return '审计管理员'
+  return '用户'
 })
 
 // Breadcrumbs

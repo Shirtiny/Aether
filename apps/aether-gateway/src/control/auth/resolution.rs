@@ -273,7 +273,7 @@ async fn resolve_local_admin_principal(
     if claims
         .get("role")
         .and_then(Value::as_str)
-        .is_some_and(|role| !role.eq_ignore_ascii_case("admin"))
+        .is_some_and(|role| !crate::roles::can_access_admin_console(role))
     {
         return Ok(None);
     }
@@ -300,7 +300,7 @@ async fn resolve_local_admin_principal_from_claims(
     let Some(user) = state.find_user_auth_by_id(user_id).await? else {
         return Ok(None);
     };
-    if !user.is_active || user.is_deleted || !user.role.eq_ignore_ascii_case("admin") {
+    if !user.is_active || user.is_deleted || !crate::roles::can_access_admin_console(&user.role) {
         return Ok(None);
     }
 
@@ -329,7 +329,7 @@ async fn resolve_local_admin_principal_from_claims(
 
     Ok(Some(GatewayAdminPrincipalContext {
         user_id: user.id,
-        user_role: "admin".to_string(),
+        user_role: user.role,
         session_id: Some(session.id),
         management_token_id: None,
         management_token_permissions: None,

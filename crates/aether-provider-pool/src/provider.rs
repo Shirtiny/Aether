@@ -53,6 +53,21 @@ pub trait ProviderPoolAdapter: Send + Sync {
         "找不到有效端点".to_string()
     }
 
+    fn supports_account_self_check(&self) -> bool {
+        self.supports_quota_refresh()
+    }
+
+    fn account_self_check_endpoint(
+        &self,
+        endpoints: &[StoredProviderCatalogEndpoint],
+        include_inactive: bool,
+    ) -> Option<StoredProviderCatalogEndpoint> {
+        if !self.supports_account_self_check() {
+            return None;
+        }
+        self.quota_refresh_endpoint(endpoints, include_inactive)
+    }
+
     fn normalize_plan_tier(&self, value: &str) -> Option<String> {
         normalize_provider_plan_tier(value, self.provider_type())
     }

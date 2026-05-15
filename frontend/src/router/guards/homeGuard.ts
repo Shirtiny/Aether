@@ -26,12 +26,11 @@ export function resolveHomeRedirect(
   }
 
   // 已登录用户首次访问首页(非返回/刷新场景),根据角色跳转到对应仪表盘
-  const isAdmin = authStore.user?.role === 'admin'
   const redirectPath = sessionStorage.getItem('redirectPath')
   if (redirectPath && redirectPath !== '/') {
     sessionStorage.removeItem('redirectPath')
     return redirectPath
   }
 
-  return isAdmin ? '/admin/dashboard' : '/dashboard'
+  return authStore.canAccessAdmin ? '/admin/dashboard' : '/dashboard'
 }

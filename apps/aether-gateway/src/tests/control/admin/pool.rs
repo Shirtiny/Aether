@@ -236,6 +236,11 @@ async fn gateway_handles_admin_pool_overview_locally_with_trusted_admin_principa
     assert_eq!(items[0]["active_keys"], 1);
     assert_eq!(items[0]["cooldown_count"], 0);
     assert_eq!(items[0]["pool_enabled"], true);
+    assert_eq!(items[0]["provider_hot_count"], 0);
+    assert_eq!(items[0]["provider_desired_hot"], 0);
+    assert_eq!(items[0]["provider_in_flight"], 0);
+    assert_eq!(items[0]["provider_ema_in_flight"], 0.0);
+    assert_eq!(items[0]["provider_burst_pending"], false);
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();

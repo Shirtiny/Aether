@@ -109,7 +109,7 @@ onMounted(async () => {
   success('登录成功')
 
   const redirectPath = consumeRedirectPath()
-  const target = redirectPath || (authStore.user?.role === 'admin' ? '/admin/dashboard' : '/dashboard')
+  const target = redirectPath || (authStore.canAccessAdmin ? '/admin/dashboard' : '/dashboard')
   await router.replace(target)
 })
 </script>

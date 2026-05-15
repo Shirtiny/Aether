@@ -90,6 +90,41 @@
         </div>
 
         <div
+          v-if="form.account_self_check_enabled"
+          class="space-y-3 rounded-xl border border-dashed border-primary/25 bg-primary/5 p-4"
+        >
+          <div class="grid gap-3 sm:grid-cols-2">
+            <div class="space-y-1.5">
+              <Label>
+                自检间隔
+                <span class="text-xs text-muted-foreground">(分钟)</span>
+              </Label>
+              <Input
+                :model-value="form.account_self_check_interval_minutes ?? ''"
+                type="number"
+                min="1"
+                max="1440"
+                placeholder="60"
+                @update:model-value="(v) => form.account_self_check_interval_minutes = parseNum(v)"
+              />
+            </div>
+            <div class="space-y-1.5">
+              <Label>
+                自检并发
+              </Label>
+              <Input
+                :model-value="form.account_self_check_concurrency ?? ''"
+                type="number"
+                min="1"
+                max="64"
+                placeholder="4"
+                @update:model-value="(v) => form.account_self_check_concurrency = parseNum(v)"
+              />
+            </div>
+          </div>
+        </div>
+
+        <div
           class="grid gap-3 sm:grid-cols-2"
           :class="cooldownFieldLayout.desktopColumnsClass"
         >
@@ -301,7 +336,7 @@
             </span>
           </div>
           <p class="text-xs leading-5 text-muted-foreground">
-            调整主动探测、健康、额度、延迟和使用成本进入号池候选排序时的权重。
+            调整探测结果、健康、额度、延迟和使用成本进入号池候选排序时的权重。
           </p>
         </div>
 
@@ -674,6 +709,9 @@ const form = ref({
   probe_failure_cooldown_threshold: null as number | null | undefined,
   probing_enabled: false,
   probing_interval_minutes: null as number | null | undefined,
+  account_self_check_enabled: false,
+  account_self_check_interval_minutes: null as number | null | undefined,
+  account_self_check_concurrency: null as number | null | undefined,
   auto_remove_banned_keys: false,
   skip_exhausted_accounts: false,
 })
@@ -710,6 +748,8 @@ function getHealthToggleValue(key: PoolHealthToggleKey): boolean {
       return form.value.health_policy_enabled
     case 'probing_enabled':
       return form.value.probing_enabled
+    case 'account_self_check_enabled':
+      return form.value.account_self_check_enabled
     case 'auto_remove_banned_keys':
       return form.value.auto_remove_banned_keys
     case 'skip_exhausted_accounts':
@@ -724,6 +764,9 @@ function updateHealthToggleValue(key: PoolHealthToggleKey, value: boolean): void
       return
     case 'probing_enabled':
       form.value.probing_enabled = value
+      return
+    case 'account_self_check_enabled':
+      form.value.account_self_check_enabled = value
       return
     case 'auto_remove_banned_keys':
       form.value.auto_remove_banned_keys = value
@@ -765,6 +808,9 @@ watch(() => props.modelValue, (open) => {
     probe_failure_cooldown_threshold: scoreRules?.probe_failure_cooldown_threshold ?? null,
     probing_enabled: cfg?.probing_enabled ?? false,
     probing_interval_minutes: cfg?.probing_interval_minutes ?? null,
+    account_self_check_enabled: cfg?.account_self_check_enabled ?? false,
+    account_self_check_interval_minutes: cfg?.account_self_check_interval_minutes ?? null,
+    account_self_check_concurrency: cfg?.account_self_check_concurrency ?? null,
     auto_remove_banned_keys: cfg?.auto_remove_banned_keys ?? false,
     skip_exhausted_accounts: cfg?.skip_exhausted_accounts ?? false,
   }
@@ -801,9 +847,24 @@ async function handleSave() {
       request_failure_penalty: form.value.request_failure_penalty ?? undefined,
       probe_failure_cooldown_threshold: form.value.probe_failure_cooldown_threshold ?? undefined,
     }
+    const existingPoolAdvanced: Record<string, unknown> = { ...(props.currentConfig ?? {}) }
+    for (const key of [
+      'probing_target_percent',
+      'probing_target_count',
+      'probing_active_target_percent',
+      'probing_active_target_count',
+      'active_probe_target_percent',
+      'active_probe_target_count',
+      'account_self_check_method',
+      'self_check_method',
+      'account_self_check_request',
+      'self_check_request',
+    ]) {
+      delete existingPoolAdvanced[key]
+    }
     // 合并已有配置（保留 scheduling_presets 等不在此对话框编辑的字段）
     const poolAdvanced: Record<string, unknown> = {
-      ...(props.currentConfig ?? {}),
+      ...existingPoolAdvanced,
       global_priority: form.value.global_priority ?? undefined,
       sticky_session_ttl_seconds: form.value.sticky_session_ttl_seconds ?? undefined,
       cost_window_seconds: form.value.cost_window_seconds ?? undefined,
@@ -820,6 +881,13 @@ async function handleSave() {
       probing_enabled: form.value.probing_enabled,
       probing_interval_minutes: form.value.probing_enabled
         ? (form.value.probing_interval_minutes ?? undefined)
+        : undefined,
+      account_self_check_enabled: form.value.account_self_check_enabled,
+      account_self_check_interval_minutes: form.value.account_self_check_enabled
+        ? (form.value.account_self_check_interval_minutes ?? undefined)
+        : undefined,
+      account_self_check_concurrency: form.value.account_self_check_enabled
+        ? (form.value.account_self_check_concurrency ?? undefined)
         : undefined,
       auto_remove_banned_keys: form.value.auto_remove_banned_keys,
       skip_exhausted_accounts: form.value.skip_exhausted_accounts,

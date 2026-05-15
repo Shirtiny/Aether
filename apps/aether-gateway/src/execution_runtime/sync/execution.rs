@@ -59,6 +59,7 @@ use crate::orchestration::{
     LocalExecutionEffect, LocalExecutionEffectContext, LocalHealthFailureEffect,
     LocalHealthSuccessEffect, LocalOAuthInvalidationEffect, LocalPoolErrorEffect,
 };
+use crate::provider_pool_demand::acquire_provider_pool_in_flight_guard;
 use crate::request_candidate_runtime::{
     ensure_execution_request_candidate_slot, record_local_request_candidate_extra_data,
     record_local_request_candidate_status,
@@ -1064,6 +1065,14 @@ async fn execute_execution_runtime_sync_impl(
             started_at_unix_ms: Some(candidate_started_unix_secs),
             finished_at_unix_ms: None,
         },
+    )
+    .await;
+    let _provider_pool_in_flight_guard = acquire_provider_pool_in_flight_guard(
+        state.runtime_state.clone(),
+        &plan.provider_id,
+        plan_request_id.as_str(),
+        plan_candidate_id.as_deref(),
+        key_id.as_str(),
     )
     .await;
     #[cfg(not(test))]

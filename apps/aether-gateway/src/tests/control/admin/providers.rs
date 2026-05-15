@@ -1839,6 +1839,11 @@ async fn gateway_handles_admin_provider_pool_status_locally_with_trusted_admin_p
     assert_eq!(payload["pool_enabled"], true);
     assert_eq!(payload["total_keys"], 1);
     assert_eq!(payload["total_sticky_sessions"], 0);
+    assert_eq!(payload["provider_hot_count"], 0);
+    assert_eq!(payload["provider_desired_hot"], 0);
+    assert_eq!(payload["provider_in_flight"], 0);
+    assert_eq!(payload["provider_ema_in_flight"], 0.0);
+    assert_eq!(payload["provider_burst_pending"], false);
     let keys = payload["keys"].as_array().expect("keys should be an array");
     assert_eq!(keys.len(), 1);
     assert_eq!(keys[0]["key_id"], "key-openai-pool");

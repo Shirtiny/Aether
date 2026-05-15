@@ -498,7 +498,7 @@ const { copyToClipboard } = useClipboard()
 const { siteName, siteSubtitle } = useSiteInfo()
 
 const dashboardPath = computed(() =>
-  authStore.user?.role === 'admin' ? '/admin/dashboard' : '/dashboard'
+  authStore.canAccessAdmin ? '/admin/dashboard' : '/dashboard'
 )
 const baseUrl = computed(() => window.location.origin)
 

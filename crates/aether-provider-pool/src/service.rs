@@ -104,6 +104,20 @@ impl ProviderPoolService {
             .quota_refresh_missing_endpoint_message()
     }
 
+    pub fn supports_account_self_check(&self, provider_type: &str) -> bool {
+        self.adapter(provider_type).supports_account_self_check()
+    }
+
+    pub fn account_self_check_endpoint_for_provider(
+        &self,
+        provider_type: &str,
+        endpoints: &[StoredProviderCatalogEndpoint],
+        include_inactive: bool,
+    ) -> Option<StoredProviderCatalogEndpoint> {
+        self.adapter(provider_type)
+            .account_self_check_endpoint(endpoints, include_inactive)
+    }
+
     pub fn normalize_scheduling_presets(
         &self,
         provider_type: &str,

@@ -2,14 +2,20 @@ use crate::handlers::admin::request::AdminAppState;
 use crate::LocalProviderDeleteTaskState;
 use aether_pool_core::PoolMemberScoreRules;
 use serde_json::json;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) const ADMIN_PROVIDER_MAPPING_PREVIEW_MAX_KEYS: usize = 200;
 pub(crate) const ADMIN_PROVIDER_MAPPING_PREVIEW_MAX_MODELS: usize = 500;
 pub(crate) const ADMIN_PROVIDER_MAPPING_PREVIEW_FETCH_LIMIT: usize = 10_000;
 pub(crate) const ADMIN_PROVIDER_POOL_SCAN_BATCH: u64 = 200;
+pub(crate) const ADMIN_PROVIDER_POOL_QUOTA_PROBE_ACTIVE_SET_PREFIX: &str =
+    "ap:quota_probe:active_members";
 pub(crate) const ADMIN_PROVIDER_OAUTH_DATA_UNAVAILABLE_DETAIL: &str =
     "Admin provider OAuth data unavailable";
+
+pub(crate) fn admin_provider_pool_quota_probe_active_members_key(provider_id: &str) -> String {
+    format!("{ADMIN_PROVIDER_POOL_QUOTA_PROBE_ACTIVE_SET_PREFIX}:{provider_id}")
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AdminProviderPoolSchedulingPreset {
@@ -40,7 +46,12 @@ pub(crate) struct AdminProviderPoolConfig {
     pub(crate) health_policy_enabled: bool,
     pub(crate) probing_enabled: bool,
     pub(crate) probing_interval_minutes: u64,
+    pub(crate) probing_target_percent: Option<f64>,
+    pub(crate) probing_target_count: Option<u64>,
     pub(crate) probe_concurrency: u64,
+    pub(crate) account_self_check_enabled: bool,
+    pub(crate) account_self_check_interval_minutes: u64,
+    pub(crate) account_self_check_concurrency: u64,
     pub(crate) score_top_n: u64,
     pub(crate) score_fallback_scan_limit: u64,
     pub(crate) score_rules: PoolMemberScoreRules,
@@ -54,6 +65,11 @@ pub(crate) struct AdminProviderPoolRuntimeState {
     pub(crate) total_sticky_sessions: usize,
     pub(crate) sticky_sessions_by_key: BTreeMap<String, usize>,
     pub(crate) sticky_bound_key_id: Option<String>,
+    pub(crate) active_probe_member_ids: BTreeSet<String>,
+    pub(crate) provider_in_flight: usize,
+    pub(crate) provider_ema_in_flight: f64,
+    pub(crate) provider_desired_hot: usize,
+    pub(crate) provider_burst_pending: bool,
     pub(crate) cooldown_reason_by_key: BTreeMap<String, String>,
     pub(crate) cooldown_ttl_by_key: BTreeMap<String, u64>,
     pub(crate) cost_window_usage_by_key: BTreeMap<String, u64>,

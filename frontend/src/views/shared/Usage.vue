@@ -50,15 +50,15 @@
       >
         <UsageModelTable
           :data="enhancedModelStats"
-          :is-admin="authStore.isAdmin"
+        :is-admin="authStore.canAccessAdmin"
         />
         <UsageProviderTable
           :data="providerStats"
-          :is-admin="authStore.isAdmin"
+        :is-admin="authStore.canAccessAdmin"
         />
         <UsageApiFormatTable
           :data="apiFormatStats"
-          :is-admin="authStore.isAdmin"
+        :is-admin="authStore.canAccessAdmin"
         />
       </div>
       <!-- 用户：模型 + API格式（2列） -->
@@ -68,7 +68,7 @@
       >
         <UsageModelTable
           :data="enhancedModelStats"
-          :is-admin="authStore.isAdmin"
+        :is-admin="authStore.canAccessAdmin"
         />
         <UsageApiFormatTable
           :data="apiFormatStats"
@@ -81,7 +81,7 @@
     <UsageRecordsTable
       :records="displayRecords"
       :is-admin="isAdminPage"
-      :show-actual-cost="authStore.isAdmin"
+        :show-actual-cost="authStore.canAccessAdmin"
       :loading="isLoadingRecords"
       :time-range="timeRange"
       :filter-search="filterSearch"

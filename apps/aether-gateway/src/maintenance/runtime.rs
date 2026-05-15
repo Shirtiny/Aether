@@ -6,6 +6,8 @@ use crate::admin_api::admin_provider_ops_local_action_response;
 use crate::data::GatewayDataState;
 use crate::{AppState, GatewayError};
 
+#[path = "runtime/account_self_check.rs"]
+mod account_self_check;
 #[path = "runtime/audit_cleanup.rs"]
 mod audit_cleanup;
 #[path = "runtime/cleanup_runs.rs"]
@@ -49,6 +51,11 @@ mod usage_cleanup;
 mod wallet_daily_usage;
 #[path = "runtime/workers.rs"]
 mod workers;
+pub(crate) use account_self_check::{
+    perform_account_self_check_once, perform_account_self_check_once_with_config,
+    select_account_self_check_key_ids, spawn_account_self_check_worker, AccountSelfCheckRunSummary,
+    AccountSelfCheckWorkerConfig,
+};
 pub(crate) use aether_data_contracts::repository::usage::{
     UsageCleanupSummary, UsageCleanupWindow,
 };
@@ -65,9 +72,10 @@ pub(crate) use oauth_token_refresh::{
 };
 use pending_cleanup::*;
 pub(crate) use pool_quota_probe::{
-    perform_pool_quota_probe_once, perform_pool_quota_probe_once_with_config,
-    select_pool_quota_probe_key_ids, spawn_pool_quota_probe_worker, PoolQuotaProbeRunSummary,
-    PoolQuotaProbeWorkerConfig,
+    perform_pool_quota_probe_once, perform_pool_quota_probe_once_for_provider_with_config,
+    perform_pool_quota_probe_once_with_config, pool_quota_probe_target_count,
+    select_pool_quota_probe_key_ids, spawn_pool_quota_probe_replenish_for_request,
+    spawn_pool_quota_probe_worker, PoolQuotaProbeRunSummary, PoolQuotaProbeWorkerConfig,
 };
 pub(crate) use pool_score_rebuild::{
     ensure_provider_key_pool_scores_for_keys, perform_pool_score_rebuild_once,

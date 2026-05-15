@@ -340,7 +340,7 @@ async function handleLogin() {
     // 延迟一下让用户看到成功消息
     setTimeout(() => {
       // 根据用户角色跳转到不同的仪表盘
-      const targetPath = authStore.user?.role === 'admin' ? '/admin/dashboard' : '/dashboard'
+      const targetPath = authStore.canAccessAdmin ? '/admin/dashboard' : '/dashboard'
       router.push(targetPath)
     }, 1000)
   } else {

@@ -224,6 +224,19 @@ pub(crate) fn read_only_management_token_permissions() -> Vec<String> {
         .collect()
 }
 
+pub(crate) fn audit_admin_read_only_management_token_permissions() -> Vec<String> {
+    let mut permissions = read_only_management_token_permissions()
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    permissions.extend(
+        PERMISSION_GROUPS
+            .iter()
+            .filter(|group| !group.assignable)
+            .map(|group| permission_key(group.scope, "read").to_string()),
+    );
+    permissions.into_iter().collect()
+}
+
 pub(crate) fn normalize_assignable_management_token_permissions(
     value: Option<&Value>,
 ) -> Result<Value, String> {
@@ -613,6 +626,64 @@ mod tests {
             Some(&permissions),
         )
         .is_ok());
+    }
+
+    #[test]
+    fn read_only_permissions_allow_reads_and_reject_writes() {
+        let decision = GatewayControlDecision::synthetic(
+            "/api/admin/providers".to_string(),
+            Some("admin_proxy".to_string()),
+            Some("providers_manage".to_string()),
+            Some("create_provider".to_string()),
+            Some("admin:providers".to_string()),
+        );
+        let permissions = read_only_management_token_permissions();
+
+        assert!(validate_management_token_admin_route_permission(
+            &http::Method::GET,
+            &decision,
+            Some(&permissions),
+        )
+        .is_ok());
+        assert_eq!(
+            validate_management_token_admin_route_permission(
+                &http::Method::POST,
+                &decision,
+                Some(&permissions),
+            )
+            .expect_err("read-only permissions should reject writes")
+            .required_permission,
+            "admin:providers:write"
+        );
+    }
+
+    #[test]
+    fn audit_admin_read_only_permissions_allow_management_tokens_reads_and_reject_writes() {
+        let decision = GatewayControlDecision::synthetic(
+            "/api/admin/management-tokens".to_string(),
+            Some("admin_proxy".to_string()),
+            Some("management_tokens_manage".to_string()),
+            Some("list_tokens".to_string()),
+            Some("admin:management_tokens".to_string()),
+        );
+        let permissions = audit_admin_read_only_management_token_permissions();
+
+        assert!(validate_management_token_admin_route_permission(
+            &http::Method::GET,
+            &decision,
+            Some(&permissions),
+        )
+        .is_ok());
+        assert_eq!(
+            validate_management_token_admin_route_permission(
+                &http::Method::POST,
+                &decision,
+                Some(&permissions),
+            )
+            .expect_err("read-only permissions should reject management token writes")
+            .required_permission,
+            "admin:management_tokens:write"
+        );
     }
 
     fn extract_admin_route_scopes(source: &'static str) -> BTreeSet<&'static str> {

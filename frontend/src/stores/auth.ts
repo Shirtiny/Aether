@@ -32,6 +32,9 @@ export const useAuthStore = defineStore('auth', () => {
     }
   }
   const isAdmin = computed(() => user.value?.role === 'admin')
+  const isAuditAdmin = computed(() => user.value?.role === 'audit_admin')
+  const canAccessAdmin = computed(() => isAdmin.value || isAuditAdmin.value)
+  const canOperateAdmin = computed(() => isAdmin.value)
 
   async function login(email: string, password: string, authType: 'local' | 'ldap' = 'local') {
     loading.value = true
@@ -114,6 +117,9 @@ export const useAuthStore = defineStore('auth', () => {
     error,
     isAuthenticated,
     isAdmin,
+    isAuditAdmin,
+    canAccessAdmin,
+    canOperateAdmin,
     login,
     logout,
     applyExternalLogout,

@@ -375,9 +375,9 @@ INSERT INTO api_keys (
   feature_settings,
   is_active,
   expires_at,
+  auto_delete_on_expiry,
   is_locked,
   is_standalone,
-  auto_delete_on_expiry,
   total_requests,
   total_tokens,
   total_cost_usd,
@@ -398,10 +398,10 @@ VALUES (
   $11,
   NULL,
   $12,
-  FALSE,
-  FALSE,
   $13,
   $14,
+  FALSE,
+  FALSE,
   $15,
   $16,
   $17,
@@ -449,9 +449,9 @@ INSERT INTO api_keys (
   feature_settings,
   is_active,
   expires_at,
+  auto_delete_on_expiry,
   is_locked,
   is_standalone,
-  auto_delete_on_expiry,
   total_requests,
   total_tokens,
   total_cost_usd,
@@ -472,10 +472,10 @@ VALUES (
   $11,
   NULL,
   $12,
-  FALSE,
-  TRUE,
   $13,
   $14,
+  FALSE,
+  TRUE,
   $15,
   $16,
   $17,
@@ -551,7 +551,7 @@ SET
   allowed_providers = CASE WHEN $7 THEN $8::json ELSE allowed_providers END,
   allowed_api_formats = CASE WHEN $9 THEN $10::json ELSE allowed_api_formats END,
   allowed_models = CASE WHEN $11 THEN $12::json ELSE allowed_models END,
-  expires_at = CASE WHEN $13 THEN $14 ELSE expires_at END,
+  expires_at = CASE WHEN $13 THEN $14::timestamptz ELSE expires_at END,
   auto_delete_on_expiry = CASE WHEN $15 THEN $16 ELSE auto_delete_on_expiry END,
   updated_at = NOW()
 WHERE id = $1
@@ -1535,8 +1535,24 @@ fn map_auth_api_key_export_row(
 
 #[cfg(test)]
 mod tests {
-    use super::{SqlxAuthApiKeySnapshotReadRepository, UPDATE_STANDALONE_API_KEY_BASIC_SQL};
+    use super::{
+        SqlxAuthApiKeySnapshotReadRepository, CREATE_STANDALONE_API_KEY_SQL,
+        CREATE_USER_API_KEY_SQL, UPDATE_STANDALONE_API_KEY_BASIC_SQL,
+    };
     use crate::driver::postgres::{PostgresPoolConfig, PostgresPoolFactory};
+
+    #[test]
+    fn create_api_key_sql_orders_expiry_before_standalone_flags() {
+        assert!(CREATE_USER_API_KEY_SQL
+            .contains("expires_at,\n  auto_delete_on_expiry,\n  is_locked,\n  is_standalone,"));
+        assert!(
+            CREATE_USER_API_KEY_SQL.contains("$12,\n  $13,\n  $14,\n  FALSE,\n  FALSE,\n  $15,")
+        );
+        assert!(CREATE_STANDALONE_API_KEY_SQL
+            .contains("expires_at,\n  auto_delete_on_expiry,\n  is_locked,\n  is_standalone,"));
+        assert!(CREATE_STANDALONE_API_KEY_SQL
+            .contains("$12,\n  $13,\n  $14,\n  FALSE,\n  TRUE,\n  $15,"));
+    }
 
     #[test]
     fn update_standalone_api_key_basic_sql_casts_json_case_values() {
@@ -1552,7 +1568,7 @@ mod tests {
         assert!(UPDATE_STANDALONE_API_KEY_BASIC_SQL
             .contains("rate_limit = CASE WHEN $3 THEN $4 ELSE rate_limit END"));
         assert!(UPDATE_STANDALONE_API_KEY_BASIC_SQL
-            .contains("expires_at = CASE WHEN $13 THEN $14 ELSE expires_at END"));
+            .contains("expires_at = CASE WHEN $13 THEN $14::timestamptz ELSE expires_at END"));
         assert!(UPDATE_STANDALONE_API_KEY_BASIC_SQL.contains(
             "auto_delete_on_expiry = CASE WHEN $15 THEN $16 ELSE auto_delete_on_expiry END"
         ));

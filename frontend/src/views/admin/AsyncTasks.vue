@@ -414,7 +414,7 @@
               使用记录
             </Button>
             <Button
-              v-if="canCancel(task.status)"
+              v-if="authStore.canOperateAdmin && canCancel(task.status)"
               variant="outline"
               size="sm"
               class="h-7 text-xs text-red-500 border-red-200 hover:bg-red-50"
@@ -830,7 +830,7 @@
 
               <!-- 操作按钮 -->
               <div
-                v-if="canCancel(selectedTask.status)"
+                v-if="authStore.canOperateAdmin && canCancel(selectedTask.status)"
                 class="pt-4 border-t border-border/60"
               >
                 <Button
@@ -902,7 +902,7 @@ import { useAuthStore } from '@/stores/auth'
 import { log } from '@/utils/logger'
 
 const authStore = useAuthStore()
-const isAdmin = computed(() => authStore.user?.role === 'admin')
+const isAdmin = computed(() => authStore.canAccessAdmin)
 const { toast } = useToast()
 const { copyToClipboard } = useClipboard()
 

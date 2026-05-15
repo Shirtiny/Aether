@@ -228,7 +228,7 @@ async fn maybe_promote_management_token_admin_principal(
     let Some(user) = state.find_user_auth_by_id(&token_with_user.user.id).await? else {
         return Ok(());
     };
-    if !user.is_active || user.is_deleted || !user.role.eq_ignore_ascii_case("admin") {
+    if !user.is_active || user.is_deleted || !crate::roles::can_access_admin_console(&user.role) {
         return Ok(());
     }
     let management_token_permissions = match management_token_permission_keys_from_value(

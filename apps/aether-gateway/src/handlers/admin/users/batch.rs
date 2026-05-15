@@ -503,7 +503,7 @@ fn normalize_selection_filters(
         .map(|value| value.trim().to_ascii_lowercase())
         .filter(|value| !value.is_empty() && value != "all")
     {
-        Some(role) if matches!(role.as_str(), "user" | "admin") => Some(role),
+        Some(role) if crate::roles::normalize_assignable_user_role(&role).is_some() => Some(role),
         Some(_) => return Err("role 参数不合法".to_string()),
         None => None,
     };

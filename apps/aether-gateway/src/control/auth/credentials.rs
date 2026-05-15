@@ -153,7 +153,7 @@ pub(super) fn extract_trusted_admin_headers(
     let user_role = header_value_str(headers, crate::constants::TRUSTED_ADMIN_USER_ROLE_HEADER)?
         .trim()
         .to_string();
-    if !user_role.eq_ignore_ascii_case("admin") {
+    if !crate::roles::can_access_admin_console(&user_role) {
         return None;
     }
     let session_id = header_value_str(headers, crate::constants::TRUSTED_ADMIN_SESSION_ID_HEADER)
@@ -171,7 +171,7 @@ pub(super) fn extract_trusted_admin_headers(
 
     Some(GatewayTrustedAdminHeaders {
         user_id,
-        user_role: "admin".to_string(),
+        user_role,
         session_id,
         management_token_id,
     })
@@ -558,6 +558,42 @@ mod tests {
                 user_id: "admin-user-1".to_string(),
                 user_role: "admin".to_string(),
                 session_id: Some("sess-1".to_string()),
+                management_token_id: None,
+            })
+        );
+    }
+
+    #[test]
+    fn extracts_trusted_audit_admin_headers() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            crate::constants::GATEWAY_HEADER,
+            "rust-phase3b".parse().unwrap(),
+        );
+        headers.insert(
+            crate::constants::TRUSTED_ADMIN_USER_ID_HEADER,
+            "audit-admin-1".parse().unwrap(),
+        );
+        headers.insert(
+            crate::constants::TRUSTED_ADMIN_USER_ROLE_HEADER,
+            "audit_admin".parse().unwrap(),
+        );
+        headers.insert(
+            crate::constants::TRUSTED_ADMIN_SESSION_ID_HEADER,
+            "sess-audit-1".parse().unwrap(),
+        );
+
+        let extracted = extract_request_credentials(
+            &headers,
+            &uri("/api/admin/endpoints/health/api-formats"),
+            "admin:endpoints_health",
+        );
+        assert_eq!(
+            extracted.trusted_admin_headers,
+            Some(GatewayTrustedAdminHeaders {
+                user_id: "audit-admin-1".to_string(),
+                user_role: "audit_admin".to_string(),
+                session_id: Some("sess-audit-1".to_string()),
                 management_token_id: None,
             })
         );

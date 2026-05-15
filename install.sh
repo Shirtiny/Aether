@@ -4,7 +4,7 @@ set -euo pipefail
 REPO="${AETHER_REPO:-fawney19/Aether}"
 SOURCE_REF="${AETHER_SOURCE_REF:-aether-rust-pioneer}"
 VERSION="${AETHER_VERSION:-}"
-CHANNEL="${AETHER_CHANNEL:-pre}"
+CHANNEL="${AETHER_CHANNEL:-stable}"
 CHANNEL_EXPLICIT="false"
 if [[ -n "${AETHER_CHANNEL:-}" ]]; then
     CHANNEL_EXPLICIT="true"
@@ -49,16 +49,16 @@ Usage: install.sh [options]
 Install Aether Gateway.
 
 Options:
-  --mode MODE          Deployment mode: compose, compose-solo, single, or cluster
+  --mode MODE          Deployment mode: compose, compose-sqlite, or single
                       compose: Docker Compose app + Postgres + Redis
-                      compose-solo: Docker Compose app + SQLite
-                      single: system service with SQLite + in-process runtime
-                      cluster: system service connected to shared database + Redis
+                      compose-sqlite: Docker Compose app + SQLite
+                      single: system service with SQLite
                       Linux services use systemd; macOS services use launchd
-  --channel CHANNEL    Release channel to resolve when --version is omitted: pre or rc
-                      pre resolves the latest semver prerelease tag (default)
-                      rc restricts resolution to tags like v0.7.0-rc23
-  --version VERSION    Exact release tag to install, for example v0.7.0-rc23
+  --channel CHANNEL    Release channel to resolve when --version is omitted: stable, latest, rc, or beta
+                      stable/latest resolves the latest stable tag (default)
+                      rc resolves the latest tag like v0.7.0-rc.1
+                      beta resolves the latest tag like v0.7.0-beta.1
+  --version VERSION    Exact release tag to install, for example v0.7.0-rc.1
   --repo OWNER/REPO    GitHub repository to download from (default: fawney19/Aether)
   --source-ref REF     Source branch/tag used for compose templates (default: aether-rust-pioneer)
   --archive PATH       Install from a local release tarball instead of downloading
@@ -80,7 +80,6 @@ Environment overrides:
   AETHER_IMAGE_REPO, AETHER_APP_IMAGE
   INSTALL_ROOT, AETHER_COMPOSE_DIR, CONFIG_DIR, SERVICE_USER, SERVICE_GROUP
   ADMIN_PASSWORD (required for non-interactive first install when generating a new env)
-  DATABASE_URL, REDIS_URL (required when generating a cluster env)
 EOF
 }
 
@@ -368,8 +367,10 @@ select_version() {
             cat >/dev/tty <<'EOF'
 
 请选择 Aether 版本:
-  1) 最新预发布版本
-  2) 指定 tag，例如 v0.7.0-rc23
+  1) 最新正式版
+  2) 最新 RC 预发布版
+  3) 最新 Beta 预发布版
+  4) 指定 tag，例如 v0.7.0-rc.1
 
 请输入选项 [1]:
 EOF
@@ -377,8 +378,10 @@ EOF
             cat >/dev/tty <<'EOF'
 
 Choose Aether version:
-  1) Latest pre release
-  2) Exact tag, for example v0.7.0-rc23
+  1) Latest stable release
+  2) Latest RC prerelease
+  3) Latest beta prerelease
+  4) Exact tag, for example v0.7.0-rc.1
 
 Enter choice [1]:
 EOF
@@ -387,9 +390,15 @@ EOF
         IFS= read -r choice </dev/tty || choice=""
         case "${choice:-1}" in
             1)
-                CHANNEL="pre"
+                CHANNEL="stable"
                 ;;
             2)
+                CHANNEL="rc"
+                ;;
+            3)
+                CHANNEL="beta"
+                ;;
+            4)
                 if ui_is_zh; then
                     cat >/dev/tty <<'EOF'
 请输入准确 tag:
@@ -425,8 +434,8 @@ select_mode() {
             MODE="compose"
             return
             ;;
-        compose-solo|solo|docker-solo|docker-solo-compose)
-            MODE="compose-solo"
+        compose-sqlite|sqlite-compose|compose-solo|solo|docker-solo|docker-solo-compose)
+            MODE="compose-sqlite"
             return
             ;;
         single|service|systemd|launchd|sqlite)
@@ -434,56 +443,52 @@ select_mode() {
             return
             ;;
         cluster|multi|multi-node)
-            MODE="cluster"
-            return
+            if ui_is_zh; then
+                die "集群部署模式暂未开放；请先选择 compose、compose-sqlite 或 single"
+            else
+                die "cluster deployment mode is temporarily disabled; choose compose, compose-sqlite, or single"
+            fi
             ;;
         auto|"")
             ;;
         *)
-            die "unsupported install mode: ${MODE}; expected compose, compose-solo, single, or cluster"
+            die "unsupported install mode: ${MODE}; expected compose, compose-sqlite, or single"
             ;;
     esac
 
     if interactive_tty_available; then
-        local service_manager
-        service_manager="$(service_manager_name)"
         if ui_is_zh; then
             cat >/dev/tty <<EOF
 
 请选择 Aether 部署模式:
-  1) Docker Compose: 应用 + Postgres + Redis
-  2) 单机服务: ${service_manager} + SQLite + 进程内运行时
-  3) 集群节点服务: ${service_manager} + 共享数据库 + Redis
-  4) Docker Compose: 应用 + SQLite
+  1) Docker Compose 应用: Postgres + Redis
+  3) Docker Compose 应用: 仅SQLite
+  4) 系统服务: 仅SQLite
 
-请输入选项 [2]:
+请输入选项 [4]:
 EOF
         else
             cat >/dev/tty <<EOF
 
 Choose Aether deployment mode:
-  1) Docker Compose: app + Postgres + Redis
-  2) Single-node service: ${service_manager} + SQLite + in-process runtime
-  3) Cluster node service: ${service_manager} + shared database + Redis
-  4) Docker Compose: app + SQLite
+  1) Docker Compose app: Postgres + Redis
+  3) Docker Compose app: SQLite only
+  4) System service: SQLite only
 
-Enter choice [2]:
+Enter choice [4]:
 EOF
         fi
         local choice
         IFS= read -r choice </dev/tty || choice=""
-        case "${choice:-2}" in
+        case "${choice:-4}" in
             1)
                 MODE="compose"
                 ;;
-            2)
-                MODE="single"
-                ;;
             3)
-                MODE="cluster"
+                MODE="compose-sqlite"
                 ;;
             4)
-                MODE="compose-solo"
+                MODE="single"
                 ;;
             *)
                 if ui_is_zh; then
@@ -713,20 +718,26 @@ resolve_version() {
 
     local tag=""
     case "${CHANNEL}" in
-        pre)
+        stable|latest)
             tag="$(download_stdout "https://api.github.com/repos/${REPO}/releases?per_page=50" |
                 sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' |
-                grep -E '^v[0-9]+(\.[0-9]+)*-[0-9A-Za-z][0-9A-Za-z.-]*$' |
+                grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' |
                 head -n1 || true)"
             ;;
         rc)
             tag="$(download_stdout "https://api.github.com/repos/${REPO}/releases?per_page=50" |
                 sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' |
-                grep -E '^v[0-9]+(\.[0-9]+)*-rc[0-9]+$' |
+                grep -E '^v[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+$' |
+                head -n1 || true)"
+            ;;
+        beta)
+            tag="$(download_stdout "https://api.github.com/repos/${REPO}/releases?per_page=50" |
+                sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' |
+                grep -E '^v[0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]+$' |
                 head -n1 || true)"
             ;;
         *)
-            die "unsupported release channel: ${CHANNEL}; expected pre or rc"
+            die "unsupported release channel: ${CHANNEL}; expected stable, latest, rc, or beta"
             ;;
     esac
     echo "${tag}"
@@ -928,16 +939,13 @@ AETHER_LOG_RETENTION_DAYS=7
 AETHER_LOG_MAX_FILES=30
 
 APP_PORT=${APP_PORT:-8084}
-AETHER_GATEWAY_DEPLOYMENT_TOPOLOGY=single-node
-AETHER_GATEWAY_NODE_ROLE=all
 AETHER_GATEWAY_STATIC_DIR=${INSTALL_ROOT}/current/frontend
 AETHER_GATEWAY_VIDEO_TASK_TRUTH_SOURCE_MODE=rust-authoritative
 AETHER_GATEWAY_AUTO_PREPARE_DATABASE=true
 AETHER_RUNTIME_BACKEND=memory
 API_KEY_PREFIX=sk
 
-AETHER_DATABASE_DRIVER=sqlite
-AETHER_DATABASE_URL=sqlite://${INSTALL_ROOT}/data/aether.db
+DATABASE_URL=sqlite://${INSTALL_ROOT}/data/aether.db
 
 JWT_SECRET_KEY=${jwt_key}
 ENCRYPTION_KEY=${encryption_key}
@@ -999,11 +1007,14 @@ compose_image() {
         tag="${VERSION#v}"
     else
         case "${CHANNEL}" in
-            pre|rc)
+            stable|latest)
+                tag="latest"
+                ;;
+            rc|beta)
                 tag="${CHANNEL}"
                 ;;
             *)
-                tag="${CHANNEL}"
+                die "unsupported release channel: ${CHANNEL}; expected stable, latest, rc, or beta"
                 ;;
         esac
     fi
@@ -1034,7 +1045,7 @@ generate_compose_env() {
     replace_or_append_env "${output}" "AETHER_GATEWAY_AUTO_PREPARE_DATABASE" "true"
 }
 
-generate_compose_solo_env() {
+generate_compose_sqlite_env() {
     local output="$1"
     local jwt_key encryption_key
     prompt_admin_password
@@ -1054,16 +1065,13 @@ AETHER_LOG_MAX_FILES=30
 
 APP_IMAGE=$(compose_image)
 APP_PORT=${APP_PORT:-8084}
-AETHER_GATEWAY_DEPLOYMENT_TOPOLOGY=single-node
-AETHER_GATEWAY_NODE_ROLE=all
 AETHER_GATEWAY_STATIC_DIR=/srv/frontend
 AETHER_GATEWAY_VIDEO_TASK_TRUTH_SOURCE_MODE=rust-authoritative
 AETHER_GATEWAY_AUTO_PREPARE_DATABASE=true
 AETHER_RUNTIME_BACKEND=memory
 API_KEY_PREFIX=sk
 
-AETHER_DATABASE_DRIVER=sqlite
-AETHER_DATABASE_URL=sqlite:///app/data/aether.db
+DATABASE_URL=sqlite:///app/data/aether.db
 
 JWT_SECRET_KEY=${JWT_SECRET_KEY:-${jwt_key}}
 ENCRYPTION_KEY=${ENCRYPTION_KEY:-${encryption_key}}
@@ -1222,7 +1230,7 @@ ensure_env_matches_requested_mode() {
         [[ "${topology}" == "multi-node" ]] || die "existing env ${file} is ${topology}; set AETHER_GATEWAY_DEPLOYMENT_TOPOLOGY=multi-node or use --mode single"
         cluster_env_has_required_backends "${file}" || die "existing multi-node env ${file} must define DATABASE_URL and REDIS_URL"
     elif [[ "${mode}" == "single" && "${topology}" == "multi-node" ]]; then
-        die "existing env ${file} is multi-node; use --mode cluster or edit the env file"
+        die "existing env ${file} is multi-node; cluster mode is temporarily disabled, edit the env file"
     fi
 }
 
@@ -1361,7 +1369,7 @@ validate_env_file() {
         [[ -z "${video_task_store_path}" ]] || die "multi-node deployment must not set AETHER_GATEWAY_VIDEO_TASK_STORE_PATH"
     else
         if [[ "${node_role}" != "all" ]]; then
-            warn "single-node deployment usually uses AETHER_GATEWAY_NODE_ROLE=all; split roles are only useful for cluster drills"
+            warn "single-node deployment usually uses AETHER_GATEWAY_NODE_ROLE=all; split roles are not enabled by this installer"
         fi
         if [[ "${runtime_backend}" == "redis" && -z "${redis_url}" ]]; then
             die "AETHER_RUNTIME_BACKEND=redis requires REDIS_URL or AETHER_GATEWAY_DATA_REDIS_URL"
@@ -1468,11 +1476,11 @@ Generate a fresh key set any time:
 EOF
 }
 
-install_compose_solo_mode() {
-    info "preparing Docker Compose solo deployment in ${COMPOSE_DIR}"
+install_compose_sqlite_mode() {
+    info "preparing Docker Compose SQLite deployment in ${COMPOSE_DIR}"
     install -d -m 0755 "${COMPOSE_DIR}" "${COMPOSE_DIR}/logs" "${COMPOSE_DIR}/data"
 
-    install_project_file "docker-compose.solo.yml" "${COMPOSE_DIR}/docker-compose.yml" "0644"
+    install_project_file "docker-compose.sqlite.yml" "${COMPOSE_DIR}/docker-compose.yml" "0644"
     install_project_file ".env.example" "${COMPOSE_DIR}/.env.example" "0644"
     write_generate_keys_script "${COMPOSE_DIR}/generate_keys.sh"
 
@@ -1480,13 +1488,13 @@ install_compose_solo_mode() {
         warn "keeping existing ${COMPOSE_DIR}/.env"
     else
         info "generating ${COMPOSE_DIR}/.env"
-        generate_compose_solo_env "${COMPOSE_DIR}/.env"
+        generate_compose_sqlite_env "${COMPOSE_DIR}/.env"
         chmod 0600 "${COMPOSE_DIR}/.env"
     fi
 
     cat <<EOF
 
-Docker Compose solo files are ready:
+Docker Compose SQLite files are ready:
   ${COMPOSE_DIR}/docker-compose.yml
   ${COMPOSE_DIR}/.env
   ${COMPOSE_DIR}/.env.example
@@ -1496,6 +1504,7 @@ Docker Compose solo files are ready:
 
 Next steps:
   cd ${COMPOSE_DIR}
+  docker compose pull
   docker compose up -d
   docker compose logs -f app
 
@@ -1921,8 +1930,8 @@ main() {
 
     if [[ "${MODE}" == "compose" ]]; then
         install_compose_mode
-    elif [[ "${MODE}" == "compose-solo" ]]; then
-        install_compose_solo_mode
+    elif [[ "${MODE}" == "compose-sqlite" ]]; then
+        install_compose_sqlite_mode
     else
         require_root
         require_service_manager

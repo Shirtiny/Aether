@@ -80,6 +80,9 @@
                   <SelectItem value="admin">
                     管理员
                   </SelectItem>
+                  <SelectItem value="audit_admin">
+                    审计管理员
+                  </SelectItem>
                 </SelectContent>
               </Select>
             </div>

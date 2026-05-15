@@ -66,7 +66,7 @@ impl AppState {
         role: &str,
     ) -> Result<Vec<String>, GatewayError> {
         let mut group_ids = normalized_user_group_ids(group_ids);
-        if role.trim().eq_ignore_ascii_case("admin") {
+        if crate::roles::can_access_admin_console(role) {
             if let Some(default_group_id) = self.configured_default_user_group_id().await? {
                 group_ids.remove(&default_group_id);
             }

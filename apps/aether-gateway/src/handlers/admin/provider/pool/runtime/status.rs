@@ -23,6 +23,11 @@ pub(crate) async fn build_admin_provider_pool_status_payload(
             "pool_enabled": false,
             "total_keys": 0,
             "total_sticky_sessions": 0,
+            "provider_hot_count": 0,
+            "provider_desired_hot": 0,
+            "provider_in_flight": 0,
+            "provider_ema_in_flight": 0.0,
+            "provider_burst_pending": false,
             "keys": [],
         }));
     };
@@ -68,6 +73,11 @@ pub(crate) async fn build_admin_provider_pool_status_payload(
         "pool_enabled": true,
         "total_keys": key_payloads.len(),
         "total_sticky_sessions": runtime.total_sticky_sessions,
+        "provider_hot_count": runtime.active_probe_member_ids.len(),
+        "provider_desired_hot": runtime.provider_desired_hot,
+        "provider_in_flight": runtime.provider_in_flight,
+        "provider_ema_in_flight": runtime.provider_ema_in_flight,
+        "provider_burst_pending": runtime.provider_burst_pending,
         "keys": key_payloads,
     }))
 }

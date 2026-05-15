@@ -807,6 +807,22 @@ impl RuntimeState {
         }
     }
 
+    pub async fn score_remove(&self, key: &str, member: &str) -> Result<bool, DataLayerError> {
+        match self.backend.as_ref() {
+            RuntimeStateBackend::Memory(memory) => Ok(memory.score_remove(key, member).await),
+            RuntimeStateBackend::Redis(redis) => {
+                let key = redis.keyspace.key(key);
+                let removed = redis_query_i64(redis, "runtime score remove", {
+                    let mut command = redis_cmd("ZREM");
+                    command.arg(&key).arg(member);
+                    command
+                })
+                .await?;
+                Ok(removed > 0)
+            }
+        }
+    }
+
     pub async fn score_remove_by_rank(
         &self,
         key: &str,

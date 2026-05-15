@@ -105,4 +105,21 @@ describe('auth store logout', () => {
     expect(store.user).toBeNull()
     expect(store.token).toBeNull()
   })
+
+  it('separates admin access from admin operations for audit administrators', () => {
+    const store = useAuthStore()
+
+    store.user = {
+      id: 'audit-1',
+      username: 'auditor',
+      role: 'audit_admin',
+      is_active: true,
+      created_at: '2026-03-16T00:00:00Z',
+    }
+
+    expect(store.isAdmin).toBe(false)
+    expect(store.isAuditAdmin).toBe(true)
+    expect(store.canAccessAdmin).toBe(true)
+    expect(store.canOperateAdmin).toBe(false)
+  })
 })

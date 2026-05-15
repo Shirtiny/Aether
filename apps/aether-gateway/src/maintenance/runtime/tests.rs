@@ -20,15 +20,15 @@ use super::{
     next_stats_hourly_aggregation_run_after, pending_cleanup_batch_size,
     pending_cleanup_timeout_minutes, plan_pending_cleanup_batch, provider_checkin_schedule,
     proxy_node_metrics_cleanup_settings, record_proxy_upgrade_traffic_success,
-    run_db_maintenance_with, run_proxy_upgrade_rollout_once, spawn_audit_cleanup_worker,
-    spawn_db_maintenance_worker, spawn_oauth_token_refresh_worker, spawn_pending_cleanup_worker,
-    spawn_pool_monitor_worker, spawn_pool_quota_probe_worker, spawn_provider_checkin_worker,
-    spawn_proxy_node_stale_cleanup_worker, spawn_proxy_upgrade_rollout_worker,
-    spawn_stats_aggregation_worker, spawn_stats_hourly_aggregation_worker,
-    spawn_usage_cleanup_worker, spawn_wallet_daily_usage_aggregation_worker,
-    start_proxy_upgrade_rollout, stats_aggregation_target_day,
-    stats_hourly_aggregation_target_hour, summarize_database_pool, usage_cleanup_settings,
-    usage_cleanup_window, usage_cleanup_window_with_override,
+    run_db_maintenance_with, run_proxy_upgrade_rollout_once, spawn_account_self_check_worker,
+    spawn_audit_cleanup_worker, spawn_db_maintenance_worker, spawn_oauth_token_refresh_worker,
+    spawn_pending_cleanup_worker, spawn_pool_monitor_worker, spawn_pool_quota_probe_worker,
+    spawn_provider_checkin_worker, spawn_proxy_node_stale_cleanup_worker,
+    spawn_proxy_upgrade_rollout_worker, spawn_stats_aggregation_worker,
+    spawn_stats_hourly_aggregation_worker, spawn_usage_cleanup_worker,
+    spawn_wallet_daily_usage_aggregation_worker, start_proxy_upgrade_rollout,
+    stats_aggregation_target_day, stats_hourly_aggregation_target_hour, summarize_database_pool,
+    usage_cleanup_settings, usage_cleanup_window, usage_cleanup_window_with_override,
     wallet_daily_usage_aggregation_target, AppState, DbMaintenanceRunSummary,
     FailedPendingUsageRow, GatewayDataState, ProxyNodeMetricsCleanupSettings,
     ProxyUpgradeRolloutProbeConfig, StalePendingUsageRow, UsageCleanupSettings, USAGE_CLEANUP_HOUR,
@@ -96,6 +96,15 @@ async fn spawn_pool_quota_probe_worker_skips_when_provider_catalog_unavailable()
         .with_data_state_for_tests(GatewayDataState::disabled());
 
     assert!(spawn_pool_quota_probe_worker(state).is_none());
+}
+
+#[tokio::test]
+async fn spawn_account_self_check_worker_skips_when_provider_catalog_unavailable() {
+    let state = AppState::new()
+        .expect("gateway state should build")
+        .with_data_state_for_tests(GatewayDataState::disabled());
+
+    assert!(spawn_account_self_check_worker(state).is_none());
 }
 
 fn sample_connected_proxy_node(

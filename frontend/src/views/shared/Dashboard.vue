@@ -8,10 +8,10 @@
         class="flex-1 min-w-0 flex flex-col"
       >
         <Badge
-          :variant="authStore.user?.role === 'admin' ? 'default' : 'secondary'"
+          :variant="authStore.isAdmin ? 'default' : 'secondary'"
           class="uppercase tracking-[0.45em] mb-4 self-start"
         >
-          {{ authStore.user?.role === 'admin' ? 'ADMIN MODE' : 'PERSONAL MODE' }}
+          {{ dashboardModeLabel }}
         </Badge>
 
         <!-- 主要统计卡片 -->
@@ -915,7 +915,12 @@ function setupTimelineResizeObserver() {
   announcementsTimelineObserver.observe(container)
 }
 
-const isAdmin = computed(() => authStore.user?.role === 'admin')
+const isAdmin = computed(() => authStore.canAccessAdmin)
+const dashboardModeLabel = computed(() => {
+  if (authStore.isAdmin) return 'ADMIN MODE'
+  if (authStore.isAuditAdmin) return 'AUDIT MODE'
+  return 'PERSONAL MODE'
+})
 
 const statCardBorders = [
   'border-book-cloth/30 dark:border-book-cloth/25',

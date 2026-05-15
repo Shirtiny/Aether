@@ -8,6 +8,7 @@ pub(crate) use super::super::admin::provider::pool::runtime::{
     release_admin_provider_pool_key_lease,
 };
 pub(crate) use super::super::admin::provider::shared::support::{
-    AdminProviderPoolConfig, AdminProviderPoolRuntimeState, AdminProviderPoolSchedulingPreset,
+    admin_provider_pool_quota_probe_active_members_key, AdminProviderPoolConfig,
+    AdminProviderPoolRuntimeState, AdminProviderPoolSchedulingPreset,
     AdminProviderPoolUnschedulableRule, ADMIN_PROVIDER_POOL_SCAN_BATCH,
 };

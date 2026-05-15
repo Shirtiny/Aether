@@ -125,6 +125,7 @@ vi.mock('lucide-vue-next', async () => {
     Upload: Icon,
     ChevronDown: Icon,
     RefreshCw: Icon,
+    Activity: Icon,
     Power: Icon,
     Database: Icon,
     KeyRound: Icon,
@@ -140,6 +141,8 @@ vi.mock('lucide-vue-next', async () => {
     Settings2: Icon,
     SlidersHorizontal: Icon,
     CircleHelp: Icon,
+    Edit: Icon,
+    Plug: Icon,
   }
 })
 
@@ -312,6 +315,17 @@ vi.mock('@/features/pool/components/PoolAdvancedDialog.vue', async () => {
     }),
   }
 })
+vi.mock('@/features/pool/components/PoolDemandMetricsDialog.vue', async () => {
+  const { defineComponent } = await import('vue')
+  return {
+    default: defineComponent({
+      name: 'PoolDemandMetricsDialogStub',
+      setup() {
+        return () => null
+      },
+    }),
+  }
+})
 vi.mock('@/features/pool/components/PoolAccountBatchDialog.vue', async () => {
   const { defineComponent } = await import('vue')
   return {
@@ -328,6 +342,28 @@ vi.mock('@/features/pool/components/ProviderProxyPopover.vue', async () => {
   return {
     default: defineComponent({
       name: 'ProviderProxyPopoverStub',
+      setup() {
+        return () => null
+      },
+    }),
+  }
+})
+vi.mock('@/features/providers/components/EndpointFormDialog.vue', async () => {
+  const { defineComponent } = await import('vue')
+  return {
+    default: defineComponent({
+      name: 'EndpointFormDialogStub',
+      setup() {
+        return () => null
+      },
+    }),
+  }
+})
+vi.mock('@/features/providers/components/ProviderFormDialog.vue', async () => {
+  const { defineComponent } = await import('vue')
+  return {
+    default: defineComponent({
+      name: 'ProviderFormDialogStub',
       setup() {
         return () => null
       },
@@ -404,7 +440,7 @@ function createOverview(providerType: string): PoolOverviewItem {
   }
 }
 
-function createProvider(providerType: string) {
+function createProvider(providerType: string, overrides: Record<string, unknown> = {}) {
   return {
     id: `${providerType}-provider`,
     name: `${providerType} Provider`,
@@ -414,6 +450,7 @@ function createProvider(providerType: string) {
     proxy: null,
     pool_advanced: null,
     claude_code_advanced: null,
+    ...overrides,
   }
 }
 
@@ -771,5 +808,38 @@ describe('PoolManagement Codex cycle stats mode', () => {
     expect(root.textContent).toContain('12')
     expect(root.textContent).toContain('3.5K')
     expect(root.textContent).toContain('$1.25')
+  })
+
+  it('shows adaptive hot pool metrics entry only when probing is enabled', async () => {
+    endpointMocks.getPoolOverview.mockResolvedValue({
+      items: [{ ...createOverview('codex'), provider_desired_hot: 4, provider_in_flight: 2, provider_ema_in_flight: 1.8 }],
+    })
+    endpointMocks.listPoolKeys.mockResolvedValue(createKeyPage(createPoolKey('codex')))
+    endpointMocks.getProvider.mockResolvedValue(createProvider('codex', {
+      pool_advanced: {
+        probing_enabled: true,
+      },
+    }))
+
+    const enabledRoot = mountPoolManagement()
+    await settle()
+
+    expect(enabledRoot.querySelectorAll('[data-testid="pool-demand-metrics-button"]').length).toBeGreaterThan(0)
+
+    for (const { app, root } of mountedApps.splice(0)) {
+      app.unmount()
+      root.remove()
+    }
+
+    endpointMocks.getProvider.mockResolvedValue(createProvider('codex', {
+      pool_advanced: {
+        probing_enabled: false,
+      },
+    }))
+
+    const disabledRoot = mountPoolManagement()
+    await settle()
+
+    expect(disabledRoot.querySelector('[data-testid="pool-demand-metrics-button"]')).toBeNull()
   })
 })

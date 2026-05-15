@@ -135,12 +135,15 @@
               <SelectItem value="admin">
                 管理员
               </SelectItem>
+              <SelectItem value="audit_admin">
+                审计管理员
+              </SelectItem>
             </SelectContent>
           </Select>
         </div>
 
         <div class="rounded-xl border border-amber-200/70 bg-amber-50/70 px-3 py-2.5 text-xs leading-relaxed text-amber-800 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-200">
-          {{ targetRole === 'admin' ? '提示：设置为管理员会授予用户后台管理能力。' : '提示：设置为普通用户会移除目标用户的管理员权限。' }}
+          {{ targetRole === 'admin' ? '提示：设置为管理员会授予用户完整后台管理能力。' : targetRole === 'audit_admin' ? '提示：设置为审计管理员会授予后台只读查看能力。' : '提示：设置为普通用户会移除目标用户的管理员权限。' }}
         </div>
       </div>
 

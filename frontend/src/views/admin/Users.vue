@@ -65,6 +65,9 @@
                 <SelectItem value="admin">
                   管理员
                 </SelectItem>
+                <SelectItem value="audit_admin">
+                  审计管理员
+                </SelectItem>
                 <SelectItem value="user">
                   用户
                 </SelectItem>
@@ -148,6 +151,9 @@
                   <SelectItem value="admin">
                     管理员
                   </SelectItem>
+                  <SelectItem value="audit_admin">
+                    审计管理员
+                  </SelectItem>
                   <SelectItem value="user">
                     普通用户
                   </SelectItem>
@@ -200,6 +206,7 @@
 
             <!-- 新增用户按钮 -->
             <Button
+              v-if="authStore.canOperateAdmin"
               variant="ghost"
               size="icon"
               class="h-8 w-8"
@@ -211,6 +218,7 @@
 
             <!-- 新增用户按钮 -->
             <Button
+              v-if="authStore.canOperateAdmin"
               variant="ghost"
               size="icon"
               class="h-8 w-8"
@@ -262,6 +270,7 @@
             清空选择
           </Button>
           <Button
+            v-if="authStore.canOperateAdmin"
             size="sm"
             class="h-7 px-3 text-[11px]"
             :disabled="(selectedCount === 0 && userGroups.length === 0) || usersStore.loading"
@@ -362,10 +371,10 @@
                         {{ user.username }}
                       </div>
                       <Badge
-                        :variant="user.role === 'admin' ? 'default' : 'secondary'"
+                        :variant="userRoleBadgeVariant(user.role)"
                         class="h-5 px-1.5 py-0 text-[10px] font-medium flex-shrink-0"
                       >
-                        {{ user.role === 'admin' ? '管理员' : '普通用户' }}
+                        {{ formatUserRole(user.role) }}
                       </Badge>
                     </div>
                     <div
@@ -468,6 +477,7 @@
               <TableCell class="py-4">
                 <div class="flex justify-center gap-1">
                   <Button
+                    v-if="authStore.canOperateAdmin"
                     variant="ghost"
                     size="icon"
                     class="h-8 w-8"
@@ -477,6 +487,7 @@
                     <SquarePen class="h-4 w-4" />
                   </Button>
                   <Button
+                    v-if="authStore.canOperateAdmin"
                     variant="ghost"
                     size="icon"
                     class="h-8 w-8"
@@ -486,6 +497,7 @@
                     <DollarSign class="h-4 w-4" />
                   </Button>
                   <Button
+                    v-if="authStore.canOperateAdmin"
                     variant="ghost"
                     size="icon"
                     class="h-8 w-8"
@@ -495,6 +507,7 @@
                     <Key class="h-4 w-4" />
                   </Button>
                   <Button
+                    v-if="authStore.canOperateAdmin"
                     variant="ghost"
                     size="icon"
                     class="h-8 w-8"
@@ -588,10 +601,10 @@
                       {{ user.username }}
                     </div>
                     <Badge
-                      :variant="user.role === 'admin' ? 'default' : 'secondary'"
+                      :variant="userRoleBadgeVariant(user.role)"
                       class="h-5 px-1.5 py-0 text-[10px] font-medium flex-shrink-0"
                     >
-                      {{ user.role === 'admin' ? '管理员' : '普通用户' }}
+                      {{ formatUserRole(user.role) }}
                     </Badge>
                   </div>
                   <div
@@ -694,6 +707,7 @@
 
               <div class="grid grid-cols-2 gap-2 pt-0.5">
                 <Button
+                  v-if="authStore.canOperateAdmin"
                   variant="outline"
                   size="sm"
                   class="h-8 text-xs"
@@ -703,6 +717,7 @@
                   编辑
                 </Button>
                 <Button
+                  v-if="authStore.canOperateAdmin"
                   variant="outline"
                   size="sm"
                   class="h-8 text-xs"
@@ -712,6 +727,7 @@
                   资金
                 </Button>
                 <Button
+                  v-if="authStore.canOperateAdmin"
                   variant="outline"
                   size="sm"
                   class="h-8 text-xs"
@@ -721,6 +737,7 @@
                   API Keys
                 </Button>
                 <Button
+                  v-if="authStore.canOperateAdmin"
                   variant="outline"
                   size="sm"
                   class="h-8 text-xs"
@@ -1236,6 +1253,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, watch } from 'vue'
 import { useUsersStore } from '@/stores/users'
+import { useAuthStore } from '@/stores/auth'
 import type { User, ApiKey, UserSession, UserBatchActionResponse, UserBatchSelectionFilters, UserGroup } from '@/api/users'
 import { formatSessionMeta } from '@/types/session'
 import { adminWalletApi, type AdminWallet } from '@/api/admin-wallets'
@@ -1310,6 +1328,7 @@ const { success, error } = useToast()
 const { confirmDanger } = useConfirm()
 const { copyToClipboard } = useClipboard()
 const usersStore = useUsersStore()
+const authStore = useAuthStore()
 
 // 用户表单对话框状态
 const showUserFormDialog = ref(false)
@@ -1354,6 +1373,7 @@ const userGroups = ref<UserGroup[]>([])
 const userRoleFilterOptions = [
   { value: 'all', label: '全部角色' },
   { value: 'admin', label: '管理员' },
+  { value: 'audit_admin', label: '审计管理员' },
   { value: 'user', label: '普通用户' },
 ]
 const userStatusFilterOptions = [
@@ -1373,9 +1393,9 @@ const filteredUsers = computed(() => {
 
   // 先排序：管理员优先，然后按创建时间倒序
   filtered.sort((a, b) => {
-    // 管理员优先
-    if (a.role === 'admin' && b.role !== 'admin') return -1
-    if (a.role !== 'admin' && b.role === 'admin') return 1
+    const roleRank = (role: string) => role === 'admin' ? 0 : role === 'audit_admin' ? 1 : 2
+    const roleDiff = roleRank(a.role) - roleRank(b.role)
+    if (roleDiff !== 0) return roleDiff
     // 同角色按创建时间倒序（新用户在前）
     return new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
   })
@@ -1437,7 +1457,7 @@ const batchSelectionFilters = computed<UserBatchSelectionFilters>(() => {
   const filters: UserBatchSelectionFilters = {}
   const search = searchQuery.value.trim()
   if (search) filters.search = search
-  if (filterRole.value === 'admin' || filterRole.value === 'user') filters.role = filterRole.value
+  if (filterRole.value === 'admin' || filterRole.value === 'audit_admin' || filterRole.value === 'user') filters.role = filterRole.value
   if (filterStatus.value === 'active') filters.is_active = true
   if (filterStatus.value === 'inactive') filters.is_active = false
   if (filterGroup.value !== 'all') filters.group_id = filterGroup.value
@@ -1451,6 +1471,16 @@ watch([searchQuery, filterRole, filterStatus, filterGroup], () => {
 })
 
 watch(paginatedUsers, (users) => rememberBatchPageUsers(users), { immediate: true })
+
+function formatUserRole(role: string) {
+  if (role === 'admin') return '管理员'
+  if (role === 'audit_admin') return '审计管理员'
+  return '普通用户'
+}
+
+function userRoleBadgeVariant(role: string) {
+  return role === 'admin' ? 'default' : 'secondary'
+}
 
 onMounted(() => {
   void refreshUsers({ preferCache: true })

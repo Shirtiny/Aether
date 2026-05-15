@@ -12,6 +12,8 @@ services:
       TZ: Asia/Shanghai
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:${DB_PORT:-5432}:5432"
     command: postgres -c idle_in_transaction_session_timeout=30000 -c tcp_keepalives_idle=30 -c tcp_keepalives_interval=10
     healthcheck:
       test: [ "CMD-SHELL", "pg_isready -U postgres" ]
@@ -26,6 +28,8 @@ services:
     command: redis-server --appendonly yes --appendfsync everysec --save 60 1000 --requirepass ${REDIS_PASSWORD}
     volumes:
       - redis_data:/data
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
     healthcheck:
       test: [ "CMD-SHELL", "redis-cli -a \"${REDIS_PASSWORD}\" ping | grep -q PONG" ]
       interval: 5s
@@ -58,7 +62,7 @@ services:
     restart: unless-stopped
 
   app:
-    image: ${APP_IMAGE:-ghcr.io/fawney19/aether:pre}
+    image: ${APP_IMAGE:-ghcr.io/fawney19/aether:latest}
     container_name: aether-app
     env_file:
       - .env

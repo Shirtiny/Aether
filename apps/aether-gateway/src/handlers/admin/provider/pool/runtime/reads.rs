@@ -5,10 +5,15 @@ use super::keys::{
 };
 use crate::handlers::admin::provider::pool::config::admin_provider_pool_cache_affinity_enabled;
 use crate::handlers::admin::provider::shared::support::{
-    AdminProviderPoolConfig, AdminProviderPoolRuntimeState,
+    admin_provider_pool_quota_probe_active_members_key, AdminProviderPoolConfig,
+    AdminProviderPoolRuntimeState,
+};
+use crate::maintenance::PoolQuotaProbeWorkerConfig;
+use crate::provider_pool_demand::{
+    provider_pool_burst_pending, read_provider_pool_demand_snapshot,
 };
 use aether_runtime_state::{DataLayerError, RuntimeState};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::warn;
 
@@ -17,6 +22,10 @@ fn current_unix_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn should_load_active_probe_members(pool_config: &AdminProviderPoolConfig) -> bool {
+    pool_config.probing_enabled
 }
 
 pub(crate) async fn read_admin_provider_pool_cooldown_counts(
@@ -101,6 +110,40 @@ pub(crate) async fn read_admin_provider_pool_runtime_state(
             }
         }
     }
+
+    if should_load_active_probe_members(pool_config) {
+        state.active_probe_member_ids = runtime
+            .set_members(&admin_provider_pool_quota_probe_active_members_key(
+                provider_id,
+            ))
+            .await
+            .map(|values| {
+                values
+                    .into_iter()
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default();
+    }
+
+    let probe_config = PoolQuotaProbeWorkerConfig::from_env();
+    let demand_snapshot = read_provider_pool_demand_snapshot(
+        runtime,
+        provider_id,
+        key_ids.len(),
+        probe_config.max_keys_per_provider,
+    )
+    .await;
+    state.provider_in_flight = demand_snapshot.in_flight;
+    state.provider_ema_in_flight = demand_snapshot.ema_in_flight;
+    state.provider_desired_hot = if pool_config.probing_enabled {
+        demand_snapshot.desired_hot
+    } else {
+        0
+    };
+    state.provider_burst_pending =
+        pool_config.probing_enabled && provider_pool_burst_pending(runtime, provider_id).await;
 
     if !cooldown_keys.is_empty() {
         let cooldown_reasons = runtime

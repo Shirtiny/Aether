@@ -40,6 +40,7 @@ use super::super::router::RequestAdmissionError;
 use super::super::{control::GatewayControlDecision, error::GatewayError};
 use super::super::{provider_transport, usage};
 
+use crate::maintenance::spawn_account_self_check_worker;
 use crate::maintenance::spawn_audit_cleanup_worker;
 use crate::maintenance::spawn_db_maintenance_worker;
 use crate::maintenance::spawn_gemini_file_mapping_cleanup_worker;
@@ -1171,6 +1172,10 @@ impl AppState {
         supervise_worker(
             crate::task_runtime::TASK_KEY_POOL_QUOTA_PROBE,
             spawn_pool_quota_probe_worker(self.clone()),
+        );
+        supervise_worker(
+            crate::task_runtime::TASK_KEY_ACCOUNT_SELF_CHECK,
+            spawn_account_self_check_worker(self.clone()),
         );
         supervise_worker(
             crate::task_runtime::TASK_KEY_POOL_SCORE_REBUILD,

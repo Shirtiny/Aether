@@ -561,7 +561,7 @@
             <div class="flex justify-between">
               <span class="text-muted-foreground">角色</span>
               <Badge :variant="profile?.role === 'admin' ? 'default' : 'secondary'">
-                {{ profile?.role === 'admin' ? '管理员' : '普通用户' }}
+                {{ profileRoleLabel }}
               </Badge>
             </div>
             <div class="flex justify-between">
@@ -682,6 +682,11 @@ const { setThemeMode } = useDarkMode()
 
 const profile = ref<Profile | null>(null)
 const userSessions = ref<UserSession[]>([])
+const profileRoleLabel = computed(() => {
+  if (profile.value?.role === 'admin') return '管理员'
+  if (profile.value?.role === 'audit_admin') return '审计管理员'
+  return '普通用户'
+})
 
 const profileForm = ref({
   email: '',

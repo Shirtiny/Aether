@@ -89,6 +89,9 @@ use crate::orchestration::{
     LocalExecutionEffect, LocalExecutionEffectContext, LocalHealthFailureEffect,
     LocalHealthSuccessEffect, LocalOAuthInvalidationEffect, LocalPoolErrorEffect,
 };
+use crate::provider_pool_demand::{
+    acquire_provider_pool_in_flight_guard, ProviderPoolInFlightGuard,
+};
 use crate::request_candidate_runtime::{
     ensure_execution_request_candidate_slot, record_local_request_candidate_status,
     record_local_request_candidate_status_snapshot, snapshot_local_request_candidate_status,
@@ -514,6 +517,14 @@ pub(crate) async fn execute_execution_runtime_stream(
         .and_then(|context| context.candidate_index)
         .map(|value| value.to_string())
         .unwrap_or_else(|| "-".to_string());
+    let mut provider_pool_in_flight_guard = acquire_provider_pool_in_flight_guard(
+        state.runtime_state.clone(),
+        &plan.provider_id,
+        plan.request_id.as_str(),
+        plan.candidate_id.as_deref(),
+        key_id.as_str(),
+    )
+    .await;
     match maybe_execute_kiro_web_search_stream(state, &plan, report_context.as_ref()).await {
         Ok(Some(kiro_web_search)) => {
             return execute_stream_from_frame_stream(
@@ -527,6 +538,7 @@ pub(crate) async fn execute_execution_runtime_stream(
                 candidate_started_unix_secs,
                 stream_started_at,
                 kiro_web_search.frame_stream,
+                provider_pool_in_flight_guard.take(),
             )
             .await;
         }
@@ -578,6 +590,7 @@ pub(crate) async fn execute_execution_runtime_stream(
                 candidate_started_unix_secs,
                 stream_started_at,
                 chatgpt_web_image.frame_stream,
+                provider_pool_in_flight_guard.take(),
             )
             .await;
         }
@@ -673,6 +686,7 @@ pub(crate) async fn execute_execution_runtime_stream(
             candidate_started_unix_secs,
             stream_started_at,
             frame_stream,
+            provider_pool_in_flight_guard.take(),
         )
         .await;
     }
@@ -737,6 +751,7 @@ pub(crate) async fn execute_execution_runtime_stream(
                 candidate_started_unix_secs,
                 stream_started_at,
                 frame_stream,
+                provider_pool_in_flight_guard.take(),
             )
             .await;
         }
@@ -822,6 +837,7 @@ pub(crate) async fn execute_execution_runtime_stream(
             candidate_started_unix_secs,
             stream_started_at,
             frame_stream,
+            provider_pool_in_flight_guard.take(),
         )
         .await;
     }
@@ -1089,6 +1105,7 @@ async fn execute_stream_from_frame_stream(
     candidate_started_unix_secs: u64,
     stream_started_at: Instant,
     frame_stream: BoxStream<'static, Result<Bytes, IoError>>,
+    in_flight_guard: Option<ProviderPoolInFlightGuard>,
 ) -> Result<Option<Response<Body>>, GatewayError> {
     let request_id = plan.request_id.as_str();
     let request_id_for_log = short_request_id(request_id);
@@ -1923,7 +1940,9 @@ async fn execute_stream_from_frame_stream(
     };
     let plan_kind_for_report = plan_kind.to_string();
     let stream_started_at_for_report = stream_started_at;
+    let provider_pool_in_flight_guard_for_report = in_flight_guard;
     tokio::spawn(async move {
+        let _provider_pool_in_flight_guard = provider_pool_in_flight_guard_for_report;
         let mut provider_buffered_body = Vec::new();
         let mut buffered_body = Vec::new();
         let mut provider_body_truncated = false;
@@ -3136,6 +3155,7 @@ mod tests {
             crate::clock::current_unix_ms(),
             Instant::now(),
             frame_stream,
+            None,
         )
         .await
         .expect("execution should succeed")

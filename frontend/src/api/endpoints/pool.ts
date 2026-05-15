@@ -28,6 +28,11 @@ export interface PoolStatusResponse {
   pool_enabled: boolean
   total_keys: number
   total_sticky_sessions: number
+  provider_hot_count: number
+  provider_desired_hot: number
+  provider_in_flight: number
+  provider_ema_in_flight: number
+  provider_burst_pending: boolean
   keys: PoolKeyStatus[]
 }
 
@@ -77,6 +82,11 @@ export interface PoolOverviewItem {
   active_keys: number
   cooldown_count: number
   pool_enabled: boolean
+  provider_hot_count?: number
+  provider_desired_hot?: number
+  provider_in_flight?: number
+  provider_ema_in_flight?: number
+  provider_burst_pending?: boolean
 }
 
 export interface PoolOverviewResponse {
