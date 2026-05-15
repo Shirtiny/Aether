@@ -54,12 +54,12 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.95.0
-          components: clippy
 
       - name: Show Rust toolchain
         run: rustup show active-toolchain
+
+      - name: Install clippy component
+        run: rustup component add clippy
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
@@ -91,12 +91,12 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.95.0
-          components: clippy
 
       - name: Show Rust toolchain
         run: rustup show active-toolchain
+
+      - name: Install clippy component
+        run: rustup component add clippy
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
@@ -128,12 +128,12 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.95.0
-          components: clippy
 
       - name: Show Rust toolchain
         run: rustup show active-toolchain
+
+      - name: Install clippy component
+        run: rustup component add clippy
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
