@@ -18,7 +18,6 @@ on:
       - "crates/**"
       - "apps/**"
       - ".github/workflows/rust-ci.yml"
-  workflow_dispatch:
 
 concurrency:
   group: rust-ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
