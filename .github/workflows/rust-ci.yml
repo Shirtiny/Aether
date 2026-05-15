@@ -1,23 +1,7 @@
 name: Rust CI
 
 on:
-  push:
-    branches:
-      - master
-      - aether-rust-pioneer
-    paths:
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "crates/**"
-      - "apps/**"
-      - ".github/workflows/rust-ci.yml"
-  pull_request:
-    paths:
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "crates/**"
-      - "apps/**"
-      - ".github/workflows/rust-ci.yml"
+  workflow_dispatch:
 
 concurrency:
   group: rust-ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
