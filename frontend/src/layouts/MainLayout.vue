@@ -325,7 +325,7 @@
           </button>
           <!-- GitHub Link -->
           <a
-            href="https://github.com/fawney19/Aether"
+            href="https://github.com/Shirtiny/Aether"
             target="_blank"
             rel="noopener noreferrer"
             class="flex h-9 w-9 items-center justify-center rounded-lg text-muted-foreground hover:text-foreground hover:bg-muted/50 transition"
@@ -486,7 +486,7 @@ function showDebugUpdateDialog() {
     current_version: currentVersion,
     latest_version: 'v0.7.0-rc99',
     has_update: true,
-    release_url: 'https://github.com/fawney19/Aether/releases',
+    release_url: 'https://github.com/Shirtiny/Aether/releases',
     release_notes: [
       "### What's Changed",
       '- 调整版本更新提示样式',
@@ -505,7 +505,7 @@ function showDebugVersionStatus(hasUpdate = true) {
     current_version: currentVersion,
     latest_version: hasUpdate ? 'v0.7.0-rc99' : currentVersion,
     has_update: hasUpdate,
-    release_url: hasUpdate ? 'https://github.com/fawney19/Aether/releases' : null,
+    release_url: hasUpdate ? 'https://github.com/Shirtiny/Aether/releases' : null,
     release_notes: hasUpdate
       ? [
         "### What's Changed",

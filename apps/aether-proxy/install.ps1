@@ -1,6 +1,6 @@
 $ErrorActionPreference = 'Stop'
 
-$Repo = if ($env:AETHER_PROXY_RELEASE_REPO) { $env:AETHER_PROXY_RELEASE_REPO } else { 'fawney19/Aether' }
+$Repo = if ($env:AETHER_PROXY_RELEASE_REPO) { $env:AETHER_PROXY_RELEASE_REPO } else { 'Shirtiny/Aether' }
 $ReleaseTag = $env:AETHER_PROXY_RELEASE_TAG
 $InstallDir = $env:AETHER_PROXY_INSTALL_DIR
 $ConfigPath = $env:AETHER_PROXY_CONFIG

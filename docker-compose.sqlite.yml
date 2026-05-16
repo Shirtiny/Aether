@@ -1,6 +1,6 @@
 services:
   app:
-    image: ${APP_IMAGE:-ghcr.io/fawney19/aether:latest}
+    image: ${APP_IMAGE:-ghcr.io/shirtiny/aether:latest}
     container_name: aether-app
     env_file:
       - .env

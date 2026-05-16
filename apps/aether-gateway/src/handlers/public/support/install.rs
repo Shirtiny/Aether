@@ -16,9 +16,9 @@ const INSTALL_SESSION_TTL_SECS: u64 = 15 * 60;
 const INSTALL_SESSION_KEY_PREFIX: &str = "install:session:";
 const PROXY_INSTALL_SESSION_KEY_PREFIX: &str = "proxy-install:session:";
 const PROXY_INSTALL_UNIX_SCRIPT_URL: &str =
-    "https://raw.githubusercontent.com/fawney19/Aether/main/apps/aether-proxy/install.sh";
+    "https://raw.githubusercontent.com/Shirtiny/Aether/custom/apps/aether-proxy/install.sh";
 const PROXY_INSTALL_POWERSHELL_SCRIPT_URL: &str =
-    "https://raw.githubusercontent.com/fawney19/Aether/main/apps/aether-proxy/install.ps1";
+    "https://raw.githubusercontent.com/Shirtiny/Aether/custom/apps/aether-proxy/install.ps1";
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -915,7 +915,7 @@ mod tests {
         assert!(script.contains("export AETHER_PROXY_MANAGEMENT_TOKEN='ae-test-token'"));
         assert!(script.contains("export AETHER_PROXY_NODE_NAME='jp-proxy-01'"));
         assert!(script.contains(
-            "https://raw.githubusercontent.com/fawney19/Aether/main/apps/aether-proxy/install.sh"
+            "https://raw.githubusercontent.com/Shirtiny/Aether/custom/apps/aether-proxy/install.sh"
         ));
         assert!(!script.contains("aether-rust-pioneer"));
         assert!(!script.contains("[[servers]]"));
@@ -929,7 +929,7 @@ mod tests {
         assert!(script.contains("$env:AETHER_PROXY_MANAGEMENT_TOKEN = 'ae-test-token'"));
         assert!(script.contains("$env:AETHER_PROXY_NODE_NAME = 'jp-proxy-01'"));
         assert!(script.contains(
-            "https://raw.githubusercontent.com/fawney19/Aether/main/apps/aether-proxy/install.ps1"
+            "https://raw.githubusercontent.com/Shirtiny/Aether/custom/apps/aether-proxy/install.ps1"
         ));
         assert!(!script.contains("aether-rust-pioneer"));
         assert!(!script.contains("[[servers]]"));

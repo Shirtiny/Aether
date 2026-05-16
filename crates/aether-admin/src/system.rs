@@ -2570,7 +2570,7 @@ mod tests {
             Some(AdminSystemUpdateRelease {
                 version: "v0.7.0-rc28".to_string(),
                 release_url: Some(
-                    "https://github.com/fawney19/Aether/releases/tag/v0.7.0-rc28".to_string(),
+                    "https://github.com/Shirtiny/Aether/releases/tag/v0.7.0-rc28".to_string(),
                 ),
                 release_notes: Some("release notes".to_string()),
                 published_at: Some("2026-05-13T00:00:00Z".to_string()),
@@ -2583,7 +2583,7 @@ mod tests {
         assert_eq!(payload["has_update"], true);
         assert_eq!(
             payload["release_url"],
-            "https://github.com/fawney19/Aether/releases/tag/v0.7.0-rc28"
+            "https://github.com/Shirtiny/Aether/releases/tag/v0.7.0-rc28"
         );
         assert_eq!(payload["release_notes"], "release notes");
         assert_eq!(payload["published_at"], "2026-05-13T00:00:00Z");

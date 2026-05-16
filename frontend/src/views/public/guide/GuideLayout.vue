@@ -261,7 +261,7 @@
             />
           </button>
           <a
-            href="https://github.com/fawney19/Aether"
+            href="https://github.com/Shirtiny/Aether"
             target="_blank"
             rel="noopener noreferrer"
             class="flex h-9 w-9 items-center justify-center rounded-lg text-muted-foreground hover:text-foreground hover:bg-muted/50 transition"

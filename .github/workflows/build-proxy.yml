@@ -192,7 +192,7 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           VERSION="${TAG#proxy-v}"
-          BASE="https://github.com/fawney19/Aether/releases/download/${TAG}"
+          BASE="https://github.com/Shirtiny/Aether/releases/download/${TAG}"
 
           if [ -d apps/aether-proxy ]; then
             PROXY_DIR="apps/aether-proxy"

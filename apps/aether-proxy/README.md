@@ -15,13 +15,13 @@ Tunnel 模式下代理节点**无需对外监听端口**，仅需出站连接到
 <!-- DOWNLOAD_TABLE_START -->
 | Platform | Download |
 |----------|----------|
-| Linux x86_64 (GNU) | [aether-proxy-linux-amd64.tar.gz](https://github.com/fawney19/Aether/releases/download/proxy-v0.3.11/aether-proxy-linux-amd64.tar.gz) |
-| Linux ARM64 (GNU) | [aether-proxy-linux-arm64.tar.gz](https://github.com/fawney19/Aether/releases/download/proxy-v0.3.11/aether-proxy-linux-arm64.tar.gz) |
-| Linux x86_64 (musl) | [aether-proxy-linux-musl-amd64.tar.gz](https://github.com/fawney19/Aether/releases/download/proxy-v0.3.11/aether-proxy-linux-musl-amd64.tar.gz) |
-| Linux ARM64 (musl) | [aether-proxy-linux-musl-arm64.tar.gz](https://github.com/fawney19/Aether/releases/download/proxy-v0.3.11/aether-proxy-linux-musl-arm64.tar.gz) |
-| macOS x86_64 | [aether-proxy-macos-amd64.tar.gz](https://github.com/fawney19/Aether/releases/download/proxy-v0.3.11/aether-proxy-macos-amd64.tar.gz) |
-| macOS ARM64 | [aether-proxy-macos-arm64.tar.gz](https://github.com/fawney19/Aether/releases/download/proxy-v0.3.11/aether-proxy-macos-arm64.tar.gz) |
-| Windows x86_64 | [aether-proxy-windows-amd64.zip](https://github.com/fawney19/Aether/releases/download/proxy-v0.3.11/aether-proxy-windows-amd64.zip) |
+| Linux x86_64 (GNU) | [aether-proxy-linux-amd64.tar.gz](https://github.com/Shirtiny/Aether/releases/download/proxy-v0.3.11/aether-proxy-linux-amd64.tar.gz) |
+| Linux ARM64 (GNU) | [aether-proxy-linux-arm64.tar.gz](https://github.com/Shirtiny/Aether/releases/download/proxy-v0.3.11/aether-proxy-linux-arm64.tar.gz) |
+| Linux x86_64 (musl) | [aether-proxy-linux-musl-amd64.tar.gz](https://github.com/Shirtiny/Aether/releases/download/proxy-v0.3.11/aether-proxy-linux-musl-amd64.tar.gz) |
+| Linux ARM64 (musl) | [aether-proxy-linux-musl-arm64.tar.gz](https://github.com/Shirtiny/Aether/releases/download/proxy-v0.3.11/aether-proxy-linux-musl-arm64.tar.gz) |
+| macOS x86_64 | [aether-proxy-macos-amd64.tar.gz](https://github.com/Shirtiny/Aether/releases/download/proxy-v0.3.11/aether-proxy-macos-amd64.tar.gz) |
+| macOS ARM64 | [aether-proxy-macos-arm64.tar.gz](https://github.com/Shirtiny/Aether/releases/download/proxy-v0.3.11/aether-proxy-macos-arm64.tar.gz) |
+| Windows x86_64 | [aether-proxy-windows-amd64.zip](https://github.com/Shirtiny/Aether/releases/download/proxy-v0.3.11/aether-proxy-windows-amd64.zip) |
 <!-- DOWNLOAD_TABLE_END -->
 
 上表展示的是最新已发布版本的下载链接。从下一次 `proxy-v*` 发布开始，表格会自动补上 `Linux x86_64 (musl)` / `Linux ARM64 (musl)` 包，供 Alpine 等 musl 系统直接使用。
@@ -37,19 +37,19 @@ Tunnel 模式下代理节点**无需对外监听端口**，仅需出站连接到
 macOS / Linux:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/fawney19/Aether/main/apps/aether-proxy/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Shirtiny/Aether/custom/apps/aether-proxy/install.sh | sh
 ```
 
 Windows PowerShell:
 
 ```powershell
-irm https://raw.githubusercontent.com/fawney19/Aether/main/apps/aether-proxy/install.ps1 | iex
+irm https://raw.githubusercontent.com/Shirtiny/Aether/custom/apps/aether-proxy/install.ps1 | iex
 ```
 
 也可以用环境变量非交互式执行，适合在控制台“添加代理节点”时生成命令：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/fawney19/Aether/main/apps/aether-proxy/install.sh | \
+curl -fsSL https://raw.githubusercontent.com/Shirtiny/Aether/custom/apps/aether-proxy/install.sh | \
   AETHER_PROXY_AETHER_URL="https://aether.example.com" \
   AETHER_PROXY_MANAGEMENT_TOKEN="ae_xxx" \
   AETHER_PROXY_NODE_NAME="jp-proxy-01" \
@@ -60,7 +60,7 @@ curl -fsSL https://raw.githubusercontent.com/fawney19/Aether/main/apps/aether-pr
 $env:AETHER_PROXY_AETHER_URL = "https://aether.example.com"
 $env:AETHER_PROXY_MANAGEMENT_TOKEN = "ae_xxx"
 $env:AETHER_PROXY_NODE_NAME = "jp-proxy-01"
-irm https://raw.githubusercontent.com/fawney19/Aether/main/apps/aether-proxy/install.ps1 | iex
+irm https://raw.githubusercontent.com/Shirtiny/Aether/custom/apps/aether-proxy/install.ps1 | iex
 ```
 
 可选变量：`AETHER_PROXY_RELEASE_TAG` 固定安装某个 `proxy-v*` tag，`AETHER_PROXY_CONFIG` 指定配置文件路径，`AETHER_PROXY_INSTALL_DIR` 指定二进制安装目录。

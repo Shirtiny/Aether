@@ -19,7 +19,7 @@ use serde_json::json;
 use std::time::Duration;
 
 const AETHER_RELEASES_API_URL: &str =
-    "https://api.github.com/repos/fawney19/Aether/releases?per_page=20";
+    "https://api.github.com/repos/Shirtiny/Aether/releases?per_page=20";
 
 pub(crate) fn current_aether_version() -> String {
     option_env!("AETHER_BUILD_VERSION")
