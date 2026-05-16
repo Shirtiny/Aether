@@ -63,6 +63,14 @@ pub(super) fn classify_admin_system_family_route(
             "admin:system",
             false,
         ))
+    } else if method == http::Method::GET && normalized_path == "/api/admin/system/data/export" {
+        Some(classified(
+            "admin_proxy",
+            "system_manage",
+            "data_export",
+            "admin:system",
+            false,
+        ))
     } else if method == http::Method::POST && normalized_path == "/api/admin/system/config/import" {
         Some(classified(
             "admin_proxy",
@@ -76,6 +84,14 @@ pub(super) fn classify_admin_system_family_route(
             "admin_proxy",
             "system_manage",
             "users_import",
+            "admin:system",
+            false,
+        ))
+    } else if method == http::Method::POST && normalized_path == "/api/admin/system/data/import" {
+        Some(classified(
+            "admin_proxy",
+            "system_manage",
+            "data_import",
             "admin:system",
             false,
         ))

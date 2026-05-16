@@ -5,7 +5,8 @@ use super::{
     clear_auth_email_pending_code, clear_auth_email_verification, generate_auth_verification_code,
     http, json, mark_auth_email_verified, read_auth_email_verification_code, read_auth_smtp_config,
     send_auth_email, store_auth_email_verification_code, system_config_bool, system_config_f64,
-    system_config_string, system_config_string_list, AppState, Body, GatewayError, Regex, Response,
+    system_config_string, system_config_string_list, verify_auth_turnstile, AppState,
+    AuthTurnstileAction, Body, GatewayError, Regex, Response,
 };
 use serde::Deserialize;
 
@@ -16,11 +17,13 @@ struct AuthRegisterRequest {
     email: Option<String>,
     username: String,
     password: String,
+    turnstile_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct AuthEmailRequest {
     email: String,
+    turnstile_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -176,6 +179,8 @@ async fn validate_auth_email_suffix(
 
 pub(super) async fn handle_auth_send_verification_code(
     state: &AppState,
+    headers: &http::HeaderMap,
+    cf_connecting_ip: Option<&str>,
     request_body: Option<&axum::body::Bytes>,
 ) -> Response<Body> {
     let Some(request_body) = request_body else {
@@ -194,6 +199,18 @@ pub(super) async fn handle_auth_send_verification_code(
     let Some(email) = normalize_auth_email(&payload.email) else {
         return build_auth_error_response(http::StatusCode::BAD_REQUEST, "邮箱格式无效", false);
     };
+
+    if let Err(response) = verify_auth_turnstile(
+        state,
+        headers,
+        cf_connecting_ip,
+        payload.turnstile_token.as_deref(),
+        AuthTurnstileAction::SendVerificationCode,
+    )
+    .await
+    {
+        return response;
+    }
 
     if state
         .find_user_auth_by_identifier(&email)
@@ -316,6 +333,8 @@ pub(super) async fn handle_auth_send_verification_code(
 
 pub(super) async fn handle_auth_register(
     state: &AppState,
+    headers: &http::HeaderMap,
+    cf_connecting_ip: Option<&str>,
     request_body: Option<&axum::body::Bytes>,
 ) -> Response<Body> {
     let Some(request_body) = request_body else {
@@ -368,6 +387,18 @@ pub(super) async fn handle_auth_register(
     };
     if !enable_registration {
         return build_auth_error_response(http::StatusCode::FORBIDDEN, "系统暂不开放注册", false);
+    }
+
+    if let Err(response) = verify_auth_turnstile(
+        state,
+        headers,
+        cf_connecting_ip,
+        payload.turnstile_token.as_deref(),
+        AuthTurnstileAction::Register,
+    )
+    .await
+    {
+        return response;
     }
 
     let email_configured = match auth_registration_email_configured(state).await {

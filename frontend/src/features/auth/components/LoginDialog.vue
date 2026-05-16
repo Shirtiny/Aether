@@ -227,6 +227,8 @@
     :require-email-verification="requireEmailVerification"
     :email-configured="emailConfigured"
     :password-policy-level="passwordPolicyLevel"
+    :turnstile-enabled="turnstileEnabled"
+    :turnstile-site-key="turnstileSiteKey"
     @success="handleRegisterSuccess"
     @switch-to-login="handleSwitchToLogin"
   />
@@ -271,6 +273,8 @@ const requireEmailVerification = ref(false)
 const emailConfigured = ref(true) // 邮箱服务是否已配置
 const passwordPolicyLevel = ref<PasswordPolicyLevel>('weak')
 const allowRegistration = ref(false) // 由系统配置控制，默认关闭
+const turnstileEnabled = ref(false)
+const turnstileSiteKey = ref<string | null>(null)
 
 // LDAP authentication settings
 const PREFERRED_AUTH_TYPE_KEY = 'aether_preferred_auth_type'
@@ -388,6 +392,8 @@ onMounted(async () => {
     requireEmailVerification.value = !!regSettings.require_email_verification
     emailConfigured.value = !!regSettings.email_configured
     passwordPolicyLevel.value = normalizePasswordPolicyLevel(regSettings.password_policy_level)
+    turnstileEnabled.value = !!regSettings.turnstile_enabled
+    turnstileSiteKey.value = regSettings.turnstile_site_key || null
 
     localEnabled.value = authSettings.local_enabled
     ldapEnabled.value = authSettings.ldap_enabled
@@ -413,6 +419,8 @@ onMounted(async () => {
     requireEmailVerification.value = false
     emailConfigured.value = false
     passwordPolicyLevel.value = 'weak'
+    turnstileEnabled.value = false
+    turnstileSiteKey.value = null
     localEnabled.value = true
     ldapEnabled.value = false
     ldapExclusive.value = false

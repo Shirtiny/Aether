@@ -1,7 +1,11 @@
 use axum::{body::Body, http, response::Response};
 
-pub(super) use super::{build_auth_error_response, AppState, GatewayPublicRequestContext};
+pub(super) use super::{
+    build_auth_error_response, build_auth_json_response, AppState, GatewayPublicRequestContext,
+};
 
+#[path = "payment/epay.rs"]
+pub(super) mod payment_epay;
 #[path = "payment/gateway.rs"]
 pub(super) mod payment_gateway;
 #[path = "payment/repository.rs"]

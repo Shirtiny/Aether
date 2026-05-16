@@ -53,6 +53,7 @@ pub const DEFAULT_REDIRECT_REPLAY_BUDGET_BYTES: usize = 5_242_880;
 pub const DEFAULT_REDIRECT_REPLAY_BUDGET_HUMAN: &str = "5M";
 pub const DEFAULT_LOG_RETENTION_DAYS: u64 = 7;
 pub const DEFAULT_LOG_MAX_FILES: usize = 30;
+pub const DEFAULT_LOG_DIR: &str = "logs";
 pub const DEFAULT_TUNNEL_RECONNECT_BASE_MS: u64 = 50;
 pub const DEFAULT_TUNNEL_RECONNECT_MAX_MS: u64 = 250;
 pub const DEFAULT_TUNNEL_PING_INTERVAL_MS: u64 = 10_000;
@@ -487,12 +488,12 @@ pub struct Config {
         long,
         env = "AETHER_PROXY_LOG_DESTINATION",
         value_enum,
-        default_value = "stdout"
+        default_value = "both"
     )]
     pub log_destination: ProxyLogDestinationArg,
 
     /// Log directory when file logging is enabled
-    #[arg(long, env = "AETHER_PROXY_LOG_DIR")]
+    #[arg(long, env = "AETHER_PROXY_LOG_DIR", default_value = DEFAULT_LOG_DIR)]
     pub log_dir: Option<String>,
 
     /// Log rotation schedule for file logging
@@ -1357,6 +1358,36 @@ mod tests {
             explicit.effective_aether_proxy_url(),
             Some("http://127.0.0.1:8080")
         );
+    }
+
+    #[test]
+    fn proxy_logs_default_to_rotating_file_and_stdout() {
+        let config = Config::parse_from([
+            "aether-proxy",
+            "--aether-url",
+            "https://example.com",
+            "--management-token",
+            "ae_test",
+            "--node-name",
+            "proxy-test",
+        ]);
+
+        assert_eq!(config.log_destination, ProxyLogDestinationArg::Both);
+        assert_eq!(config.log_dir.as_deref(), Some(DEFAULT_LOG_DIR));
+        assert_eq!(config.log_rotation, ProxyLogRotationArg::Daily);
+        assert_eq!(config.log_retention_days, DEFAULT_LOG_RETENTION_DAYS);
+
+        let runtime = config
+            .service_runtime_config()
+            .expect("default file logging should be valid");
+        assert_eq!(runtime.observability.log_destination, LogDestination::Both);
+        let file_logging = runtime
+            .observability
+            .file_logging
+            .expect("file logging should be enabled by default");
+        assert_eq!(file_logging.dir, std::path::PathBuf::from(DEFAULT_LOG_DIR));
+        assert_eq!(file_logging.rotation, LogRotation::Daily);
+        assert_eq!(file_logging.retention_days, DEFAULT_LOG_RETENTION_DAYS);
     }
 
     #[test]

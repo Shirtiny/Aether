@@ -1,48 +1,159 @@
 <template>
   <CardSection
     title="数据管理"
-    description="清空系统数据，操作不可逆，请谨慎使用"
+    description="导出、导入或清空系统数据"
   >
-    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-      <div
-        v-for="item in purgeItems"
-        :key="item.key"
-        class="flex flex-col gap-2 p-4 rounded-lg border border-border"
-      >
-        <div class="flex items-center gap-2">
-          <component
-            :is="item.icon"
-            class="w-4 h-4 text-muted-foreground"
-          />
-          <span class="text-sm font-medium">{{ item.title }}</span>
+    <div class="space-y-6">
+      <div>
+        <div class="flex items-center gap-2 mb-3">
+          <Database class="w-4 h-4 text-muted-foreground" />
+          <h4 class="text-sm font-medium">
+            导出 / 导入
+          </h4>
         </div>
-        <p class="text-xs text-muted-foreground flex-1">
-          {{ item.description }}
-        </p>
-        <Button
-          variant="destructive"
-          size="sm"
-          class="w-full mt-1"
-          :disabled="loadingKey === item.key"
-          @click="handlePurge(item)"
+
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
+          <div
+            v-for="item in dataItems"
+            :key="item.key"
+            class="flex flex-col gap-3 p-4 rounded-lg border border-border"
+          >
+            <div class="flex items-center gap-2">
+              <component
+                :is="item.icon"
+                class="w-4 h-4 text-muted-foreground"
+              />
+              <span class="text-sm font-medium">{{ item.title }}</span>
+            </div>
+            <p class="text-xs text-muted-foreground flex-1">
+              {{ item.description }}
+            </p>
+            <div class="grid grid-cols-2 gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                class="w-full"
+                :disabled="item.exportLoading"
+                @click="$emit('export', item.key)"
+              >
+                <Download class="w-3.5 h-3.5 mr-1.5" />
+                {{ item.exportLoading ? '导出中...' : item.exportLabel }}
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                class="w-full"
+                :disabled="item.importLoading"
+                @click="triggerDataFileSelect(item.key)"
+              >
+                <Upload class="w-3.5 h-3.5 mr-1.5" />
+                {{ item.importLoading ? '导入中...' : item.importLabel }}
+              </Button>
+            </div>
+          </div>
+        </div>
+
+        <input
+          ref="configFileInput"
+          type="file"
+          accept=".json"
+          class="hidden"
+          @change="$emit('fileSelect', 'config', $event)"
         >
-          <Trash2 class="w-3.5 h-3.5 mr-1.5" />
-          {{ loadingKey === item.key ? '清空中...' : item.buttonText }}
-        </Button>
+        <input
+          ref="usersFileInput"
+          type="file"
+          accept=".json"
+          class="hidden"
+          @change="$emit('fileSelect', 'users', $event)"
+        >
+        <input
+          ref="aggregateFileInput"
+          type="file"
+          accept=".json"
+          class="hidden"
+          @change="$emit('fileSelect', 'aggregate', $event)"
+        >
+      </div>
+
+      <Separator />
+
+      <div>
+        <div class="flex items-center gap-2 mb-3">
+          <Trash2 class="w-4 h-4 text-muted-foreground" />
+          <h4 class="text-sm font-medium">
+            清空数据
+          </h4>
+        </div>
+
+        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+          <div
+            v-for="item in purgeItems"
+            :key="item.key"
+            class="flex flex-col gap-2 p-4 rounded-lg border border-border"
+          >
+            <div class="flex items-center gap-2">
+              <component
+                :is="item.icon"
+                class="w-4 h-4 text-muted-foreground"
+              />
+              <span class="text-sm font-medium">{{ item.title }}</span>
+            </div>
+            <p class="text-xs text-muted-foreground flex-1">
+              {{ item.description }}
+            </p>
+            <Button
+              variant="destructive"
+              size="sm"
+              class="w-full mt-1"
+              :disabled="loadingKey === item.key"
+              @click="handlePurge(item)"
+            >
+              <Trash2 class="w-3.5 h-3.5 mr-1.5" />
+              {{ loadingKey === item.key ? '清空中...' : item.buttonText }}
+            </Button>
+          </div>
+        </div>
       </div>
     </div>
   </CardSection>
 </template>
 
 <script setup lang="ts">
-import { ref, markRaw, type Component } from 'vue'
-import { Trash2, Settings, Users, BarChart3, Shield, FileText, PieChart } from 'lucide-vue-next'
+import { computed, ref, markRaw, type Component } from 'vue'
+import {
+  Download,
+  Upload,
+  Settings,
+  Users,
+  Database,
+  Layers3,
+  Trash2,
+  BarChart3,
+  Shield,
+  FileText,
+  PieChart,
+} from 'lucide-vue-next'
 import Button from '@/components/ui/button.vue'
+import { Separator } from '@/components/ui'
 import { CardSection } from '@/components/layout'
 import { adminApi } from '@/api/admin'
 import { useToast } from '@/composables/useToast'
 import { useConfirm } from '@/composables/useConfirm'
 import { parseApiError } from '@/utils/errorParser'
+
+type DataItemKey = 'config' | 'users' | 'aggregate'
+
+interface DataItem {
+  key: DataItemKey
+  title: string
+  description: string
+  exportLabel: string
+  importLabel: string
+  icon: Component
+  exportLoading: boolean
+  importLoading: boolean
+}
 
 interface PurgeItem {
   key: string
@@ -54,9 +165,59 @@ interface PurgeItem {
   action: () => Promise<{ message: string }>
 }
 
+const props = defineProps<{
+  configExportLoading: boolean
+  configImportLoading: boolean
+  usersExportLoading: boolean
+  usersImportLoading: boolean
+  aggregateExportLoading: boolean
+  aggregateImportLoading: boolean
+}>()
+
+defineEmits<{
+  export: [key: DataItemKey]
+  fileSelect: [key: DataItemKey, event: Event]
+}>()
+
 const { success, error } = useToast()
 const { confirmDanger } = useConfirm()
 const loadingKey = ref<string | null>(null)
+const configFileInput = ref<HTMLInputElement | null>(null)
+const usersFileInput = ref<HTMLInputElement | null>(null)
+const aggregateFileInput = ref<HTMLInputElement | null>(null)
+
+const dataItems = computed<DataItem[]>(() => [
+  {
+    key: 'config',
+    title: '配置数据',
+    description: '提供商、端点、API Key、模型与系统配置',
+    exportLabel: '导出配置',
+    importLabel: '导入配置',
+    icon: markRaw(Settings),
+    exportLoading: props.configExportLoading,
+    importLoading: props.configImportLoading,
+  },
+  {
+    key: 'users',
+    title: '用户数据',
+    description: '普通用户、用户组、API Keys 与钱包快照（不含管理员）',
+    exportLabel: '导出用户',
+    importLabel: '导入用户',
+    icon: markRaw(Users),
+    exportLoading: props.usersExportLoading,
+    importLoading: props.usersImportLoading,
+  },
+  {
+    key: 'aggregate',
+    title: '聚合数据',
+    description: '配置数据和用户数据的一体化备份文件',
+    exportLabel: '导出聚合',
+    importLabel: '导入聚合',
+    icon: markRaw(Layers3),
+    exportLoading: props.aggregateExportLoading,
+    importLoading: props.aggregateImportLoading,
+  },
+])
 
 const purgeItems: PurgeItem[] = [
   {
@@ -114,6 +275,16 @@ const purgeItems: PurgeItem[] = [
     action: () => adminApi.purgeStats(),
   },
 ]
+
+function triggerDataFileSelect(key: DataItemKey) {
+  if (key === 'config') {
+    configFileInput.value?.click()
+  } else if (key === 'users') {
+    usersFileInput.value?.click()
+  } else {
+    aggregateFileInput.value?.click()
+  }
+}
 
 async function handlePurge(item: PurgeItem) {
   const confirmed = await confirmDanger(item.confirmMessage, item.title)

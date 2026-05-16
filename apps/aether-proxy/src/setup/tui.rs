@@ -171,7 +171,7 @@ impl App {
                 Field {
                     label: "Save Logs to File",
                     key: "save_logs_to_file",
-                    value: "false".into(),
+                    value: "true".into(),
                     kind: FieldKind::Bool,
                     required: false,
                     help: "Write pretty .log files with daily rotation and 7-day retention",

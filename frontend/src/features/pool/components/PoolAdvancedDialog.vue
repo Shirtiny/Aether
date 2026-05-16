@@ -18,7 +18,7 @@
             </span>
           </div>
           <p class="text-xs leading-5 text-muted-foreground">
-            控制自动冷却、主动探测、异常清理和全局调度优先级。
+            控制自动冷却、自适应热池、异常清理和全局调度优先级。
           </p>
         </div>
 
@@ -64,28 +64,6 @@
               class="shrink-0"
               @update:model-value="(v: boolean) => updateHealthToggleValue(item.key, v)"
             />
-          </div>
-        </div>
-
-        <div
-          v-if="form.probing_enabled"
-          class="rounded-xl border border-dashed border-primary/25 bg-primary/5 p-4"
-        >
-          <div class="grid gap-3 sm:grid-cols-2">
-            <div class="space-y-1.5">
-              <Label>
-                探测间隔
-                <span class="text-xs text-muted-foreground">(分钟)</span>
-              </Label>
-              <Input
-                :model-value="form.probing_interval_minutes ?? ''"
-                type="number"
-                min="1"
-                max="1440"
-                placeholder="10"
-                @update:model-value="(v) => form.probing_interval_minutes = parseNum(v)"
-              />
-            </div>
           </div>
         </div>
 
@@ -261,7 +239,7 @@
               </span>
             </div>
             <p class="text-xs leading-5 text-muted-foreground">
-              控制刷新 OAuth、主动探测和批量额度处理时的并行请求数。
+              控制刷新 OAuth、自适应热池和批量额度处理时的并行请求数。
             </p>
           </div>
 
@@ -708,7 +686,6 @@ const form = ref({
   request_failure_penalty: null as number | null | undefined,
   probe_failure_cooldown_threshold: null as number | null | undefined,
   probing_enabled: false,
-  probing_interval_minutes: null as number | null | undefined,
   account_self_check_enabled: false,
   account_self_check_interval_minutes: null as number | null | undefined,
   account_self_check_concurrency: null as number | null | undefined,
@@ -807,7 +784,6 @@ watch(() => props.modelValue, (open) => {
     request_failure_penalty: scoreRules?.request_failure_penalty ?? null,
     probe_failure_cooldown_threshold: scoreRules?.probe_failure_cooldown_threshold ?? null,
     probing_enabled: cfg?.probing_enabled ?? false,
-    probing_interval_minutes: cfg?.probing_interval_minutes ?? null,
     account_self_check_enabled: cfg?.account_self_check_enabled ?? false,
     account_self_check_interval_minutes: cfg?.account_self_check_interval_minutes ?? null,
     account_self_check_concurrency: cfg?.account_self_check_concurrency ?? null,
@@ -855,6 +831,7 @@ async function handleSave() {
       'probing_active_target_count',
       'active_probe_target_percent',
       'active_probe_target_count',
+      'probing_interval_minutes',
       'account_self_check_method',
       'self_check_method',
       'account_self_check_request',
@@ -879,9 +856,6 @@ async function handleSave() {
       score_fallback_scan_limit: form.value.score_fallback_scan_limit ?? undefined,
       score_rules: scoreRules,
       probing_enabled: form.value.probing_enabled,
-      probing_interval_minutes: form.value.probing_enabled
-        ? (form.value.probing_interval_minutes ?? undefined)
-        : undefined,
       account_self_check_enabled: form.value.account_self_check_enabled,
       account_self_check_interval_minutes: form.value.account_self_check_enabled
         ? (form.value.account_self_check_interval_minutes ?? undefined)

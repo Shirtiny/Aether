@@ -1,5 +1,6 @@
 use crate::handlers::admin::request::AdminAppState;
 use crate::handlers::admin::shared::unix_secs_to_rfc3339;
+use crate::handlers::shared::round_to;
 use crate::GatewayError;
 use serde_json::json;
 
@@ -158,6 +159,79 @@ pub(in super::super) fn build_admin_wallet_summary_payload(
         "created_at": serde_json::Value::Null,
         "updated_at": unix_secs_to_rfc3339(wallet.updated_at_unix_secs),
     })
+}
+
+pub(in super::super) async fn build_admin_wallet_summary_payload_with_package(
+    state: &AdminAppState<'_>,
+    wallet: &aether_data::repository::wallet::StoredWalletSnapshot,
+    owner: &AdminWalletOwnerSummary,
+) -> Result<serde_json::Value, GatewayError> {
+    let mut payload = build_admin_wallet_summary_payload(wallet, owner);
+    enrich_admin_wallet_package_summary(
+        state,
+        &mut payload,
+        wallet.user_id.as_deref(),
+        wallet.balance + wallet.gift_balance,
+        wallet.limit_mode.eq_ignore_ascii_case("unlimited"),
+    )
+    .await?;
+    Ok(payload)
+}
+
+pub(in super::super) async fn enrich_admin_wallet_package_summary(
+    state: &AdminAppState<'_>,
+    payload: &mut serde_json::Value,
+    user_id: Option<&str>,
+    wallet_balance: f64,
+    unlimited: bool,
+) -> Result<(), GatewayError> {
+    let daily_quota = match user_id {
+        Some(user_id) if !user_id.trim().is_empty() => {
+            state
+                .app()
+                .find_user_daily_quota_availability(user_id)
+                .await?
+        }
+        _ => None,
+    };
+    let (has_active_daily_quota, total_quota_usd, used_usd, remaining_usd, allow_wallet_overage) =
+        daily_quota
+            .map(|quota| {
+                (
+                    quota.has_active_daily_quota,
+                    quota.total_quota_usd,
+                    quota.used_usd,
+                    quota.remaining_usd,
+                    quota.allow_wallet_overage,
+                )
+            })
+            .unwrap_or((false, 0.0, 0.0, 0.0, false));
+    let package_balance = if has_active_daily_quota {
+        remaining_usd.max(0.0)
+    } else {
+        0.0
+    };
+
+    payload["daily_quota"] = json!({
+        "has_active": has_active_daily_quota,
+        "total_usd": round_to(total_quota_usd.max(0.0), 6),
+        "used_usd": round_to(used_usd.max(0.0), 6),
+        "remaining_usd": round_to(package_balance, 6),
+        "allow_wallet_overage": allow_wallet_overage,
+    });
+    payload["package_balance"] = json!(round_to(package_balance, 6));
+    payload["wallet_balance"] = json!(round_to(wallet_balance.max(0.0), 6));
+    payload["total_available_balance"] = if unlimited {
+        serde_json::Value::Null
+    } else {
+        json!(round_to((wallet_balance + package_balance).max(0.0), 6))
+    };
+    payload["deduction_order"] = json!([
+        "package_daily_quota",
+        "wallet_recharge_balance",
+        "wallet_gift_balance"
+    ]);
+    Ok(())
 }
 
 pub(in super::super) fn build_admin_wallet_refund_payload(

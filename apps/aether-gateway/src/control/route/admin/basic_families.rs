@@ -488,6 +488,66 @@ pub(super) fn classify_admin_basic_family_route(
     } else if method == http::Method::GET
         && matches!(
             normalized_path,
+            "/api/admin/billing/plans" | "/api/admin/billing/plans/"
+        )
+    {
+        Some(classified(
+            "admin_proxy",
+            "billing_manage",
+            "list_plans",
+            "admin:billing",
+            false,
+        ))
+    } else if method == http::Method::POST
+        && matches!(
+            normalized_path,
+            "/api/admin/billing/plans" | "/api/admin/billing/plans/"
+        )
+    {
+        Some(classified(
+            "admin_proxy",
+            "billing_manage",
+            "create_plan",
+            "admin:billing",
+            false,
+        ))
+    } else if method == http::Method::PUT
+        && normalized_path_no_trailing.starts_with("/api/admin/billing/plans/")
+        && normalized_path_no_trailing.matches('/').count() == 5
+    {
+        Some(classified(
+            "admin_proxy",
+            "billing_manage",
+            "update_plan",
+            "admin:billing",
+            false,
+        ))
+    } else if method == http::Method::DELETE
+        && normalized_path_no_trailing.starts_with("/api/admin/billing/plans/")
+        && normalized_path_no_trailing.matches('/').count() == 5
+    {
+        Some(classified(
+            "admin_proxy",
+            "billing_manage",
+            "delete_plan",
+            "admin:billing",
+            false,
+        ))
+    } else if method == http::Method::PATCH
+        && normalized_path_no_trailing.starts_with("/api/admin/billing/plans/")
+        && normalized_path_no_trailing.ends_with("/status")
+        && normalized_path_no_trailing.matches('/').count() == 6
+    {
+        Some(classified(
+            "admin_proxy",
+            "billing_manage",
+            "set_plan_status",
+            "admin:billing",
+            false,
+        ))
+    } else if method == http::Method::GET
+        && matches!(
+            normalized_path,
             "/api/admin/payments/orders" | "/api/admin/payments/orders/"
         )
     {
@@ -495,6 +555,45 @@ pub(super) fn classify_admin_basic_family_route(
             "admin_proxy",
             "payments_manage",
             "list_orders",
+            "admin:payments",
+            false,
+        ))
+    } else if method == http::Method::GET
+        && matches!(
+            normalized_path,
+            "/api/admin/payments/gateways/epay" | "/api/admin/payments/gateways/epay/"
+        )
+    {
+        Some(classified(
+            "admin_proxy",
+            "payments_manage",
+            "get_epay_gateway",
+            "admin:payments",
+            false,
+        ))
+    } else if method == http::Method::PUT
+        && matches!(
+            normalized_path,
+            "/api/admin/payments/gateways/epay" | "/api/admin/payments/gateways/epay/"
+        )
+    {
+        Some(classified(
+            "admin_proxy",
+            "payments_manage",
+            "update_epay_gateway",
+            "admin:payments",
+            false,
+        ))
+    } else if method == http::Method::POST
+        && matches!(
+            normalized_path,
+            "/api/admin/payments/gateways/epay/test" | "/api/admin/payments/gateways/epay/test/"
+        )
+    {
+        Some(classified(
+            "admin_proxy",
+            "payments_manage",
+            "test_epay_gateway",
             "admin:payments",
             false,
         ))

@@ -97,6 +97,7 @@ const TUNNEL_ERROR_MESSAGE_MAX_CHARS: usize = 320;
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TunnelErrorEvent {
     pub timestamp_unix_secs: u64,
+    pub timestamp_unix_ms: u64,
     pub category: String,
     pub message: String,
     pub severity: String,
@@ -240,8 +241,10 @@ impl TunnelMetrics {
         let message = normalize_error_field(message, TUNNEL_ERROR_MESSAGE_MAX_CHARS, "n/a");
         let diagnostic = classify_tunnel_error(category.as_str(), message.as_str());
 
+        let timestamp_unix_ms = now_unix_ms();
         let event = TunnelErrorEvent {
-            timestamp_unix_secs: now_unix_secs(),
+            timestamp_unix_secs: timestamp_unix_ms / 1_000,
+            timestamp_unix_ms,
             category,
             message,
             severity: diagnostic.severity.to_string(),
@@ -298,9 +301,13 @@ impl TunnelMetrics {
 }
 
 fn now_unix_secs() -> u64 {
+    now_unix_ms() / 1_000
+}
+
+fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or(0)
 }
 

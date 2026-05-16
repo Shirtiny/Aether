@@ -667,7 +667,7 @@ struct AdminApiFormatDefinition {
 
 const REQUEST_RECORD_LEVEL_KEY: &str = "request_record_level";
 const LEGACY_REQUEST_LOG_LEVEL_KEY: &str = "request_log_level";
-const SENSITIVE_SYSTEM_CONFIG_KEYS: &[&str] = &["smtp_password"];
+const SENSITIVE_SYSTEM_CONFIG_KEYS: &[&str] = &["smtp_password", "turnstile_secret_key"];
 const ADMIN_API_FORMAT_DEFINITIONS: &[AdminApiFormatDefinition] = &[
     AdminApiFormatDefinition {
         value: "openai:chat",
@@ -1490,6 +1490,10 @@ pub fn admin_system_config_default_value(key: &str) -> Option<serde_json::Value>
         "provider_priority_mode" => Some(json!("provider")),
         "scheduling_mode" => Some(json!("cache_affinity")),
         "auto_delete_expired_keys" => Some(json!(false)),
+        "turnstile_enabled" => Some(json!(false)),
+        "turnstile_site_key" => Some(serde_json::Value::Null),
+        "turnstile_secret_key" => Some(serde_json::Value::Null),
+        "turnstile_allowed_hostnames" => Some(json!([])),
         "email_suffix_mode" => Some(json!("none")),
         "email_suffix_list" => Some(json!([])),
         "enable_format_conversion" => Some(json!(false)),
@@ -2821,6 +2825,21 @@ mod tests {
     fn sensitive_admin_system_config_keys_are_case_insensitive() {
         assert!(is_sensitive_admin_system_config_key("smtp_password"));
         assert!(is_sensitive_admin_system_config_key("SMTP_PASSWORD"));
+        assert!(is_sensitive_admin_system_config_key("turnstile_secret_key"));
+        assert!(is_sensitive_admin_system_config_key("TURNSTILE_SECRET_KEY"));
         assert!(!is_sensitive_admin_system_config_key("site_name"));
+    }
+
+    #[test]
+    fn build_admin_system_config_detail_masks_turnstile_secret_key() {
+        let payload = build_admin_system_config_detail_payload(
+            "turnstile_secret_key",
+            Some(json!("encrypted-turnstile-secret")),
+        )
+        .expect("turnstile secret detail should build");
+
+        assert_eq!(payload["key"], "turnstile_secret_key");
+        assert_eq!(payload["value"], serde_json::Value::Null);
+        assert_eq!(payload["is_set"], json!(true));
     }
 }

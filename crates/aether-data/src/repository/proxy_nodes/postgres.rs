@@ -5,13 +5,13 @@ use sqlx::{postgres::PgRow, PgPool, Row};
 
 use super::types::{
     bucket_start_unix_secs, build_tunnel_error_event_detail, build_tunnel_metrics_sample,
-    normalize_proxy_metadata, reconcile_remote_config_after_heartbeat, ProxyNodeEventQuery,
-    ProxyNodeHeartbeatMutation, ProxyNodeManualCreateMutation, ProxyNodeManualUpdateMutation,
-    ProxyNodeMetricsCleanupSummary, ProxyNodeMetricsStep, ProxyNodeReadRepository,
-    ProxyNodeRegistrationMutation, ProxyNodeRemoteConfigMutation, ProxyNodeTrafficMutation,
-    ProxyNodeTunnelStatusMutation, ProxyNodeWriteRepository, StoredProxyFleetMetricsBucket,
-    StoredProxyNode, StoredProxyNodeEvent, StoredProxyNodeMetricsBucket, TunnelMetricsSample,
-    PROXY_NODE_EVENT_TYPE_TUNNEL_ERROR,
+    log_reported_tunnel_error_event, normalize_proxy_metadata,
+    reconcile_remote_config_after_heartbeat, ProxyNodeEventQuery, ProxyNodeHeartbeatMutation,
+    ProxyNodeManualCreateMutation, ProxyNodeManualUpdateMutation, ProxyNodeMetricsCleanupSummary,
+    ProxyNodeMetricsStep, ProxyNodeReadRepository, ProxyNodeRegistrationMutation,
+    ProxyNodeRemoteConfigMutation, ProxyNodeTrafficMutation, ProxyNodeTunnelStatusMutation,
+    ProxyNodeWriteRepository, StoredProxyFleetMetricsBucket, StoredProxyNode, StoredProxyNodeEvent,
+    StoredProxyNodeMetricsBucket, TunnelMetricsSample, PROXY_NODE_EVENT_TYPE_TUNNEL_ERROR,
 };
 use crate::{
     error::{postgres_error, SqlxResultExt},
@@ -1219,6 +1219,7 @@ impl ProxyNodeWriteRepository for SqlxProxyNodeRepository {
             .await?;
 
             for error in &sample.recent_error_events {
+                log_reported_tunnel_error_event(&updated.id, error, now_unix_secs);
                 let detail = build_tunnel_error_event_detail(error);
                 let event_metadata = serde_json::json!({
                     "source": "heartbeat",
@@ -1229,6 +1230,7 @@ impl ProxyNodeWriteRepository for SqlxProxyNodeRepository {
                     "summary": error.summary.as_deref(),
                     "operator_action": error.operator_action.as_deref(),
                     "timestamp_unix_secs": error.timestamp_unix_secs,
+                    "timestamp_unix_ms": error.timestamp_unix_ms,
                 });
                 self.insert_event(
                     &updated.id,

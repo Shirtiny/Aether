@@ -24,7 +24,7 @@ compose_up() {
     if [ "$USE_LEGACY_COMPOSE" = true ]; then
         "${DC[@]}" up -d --no-build "$@"
     else
-        "${DC[@]}" up -d --no-build --pull never "$@"
+        "${DC[@]}" up -d --no-build --pull missing "$@"
     fi
 }
 

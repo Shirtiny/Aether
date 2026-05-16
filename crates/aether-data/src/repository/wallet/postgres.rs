@@ -10,10 +10,10 @@ use super::types::{
     AdminRedeemCodeBatchListQuery, AdminRedeemCodeListQuery, AdminWalletLedgerQuery,
     AdminWalletListQuery, AdminWalletRefundRequestListQuery, CompleteAdminWalletRefundInput,
     CreateAdminRedeemCodeBatchInput, CreateAdminRedeemCodeBatchResult,
-    CreateManualWalletRechargeInput, CreateWalletRechargeOrderInput,
-    CreateWalletRechargeOrderOutcome, CreateWalletRefundRequestInput,
-    CreateWalletRefundRequestOutcome, CreatedAdminRedeemCodePlaintext,
-    CreditAdminPaymentOrderInput, DeleteAdminRedeemCodeBatchInput,
+    CreateManualWalletRechargeInput, CreatePlanPurchaseOrderInput, CreatePlanPurchaseOrderOutcome,
+    CreateWalletRechargeOrderInput, CreateWalletRechargeOrderOutcome,
+    CreateWalletRefundRequestInput, CreateWalletRefundRequestOutcome,
+    CreatedAdminRedeemCodePlaintext, CreditAdminPaymentOrderInput, DeleteAdminRedeemCodeBatchInput,
     DisableAdminRedeemCodeBatchInput, DisableAdminRedeemCodeInput, FailAdminWalletRefundInput,
     ProcessAdminWalletRefundInput, ProcessPaymentCallbackInput, ProcessPaymentCallbackOutcome,
     RedeemWalletCodeInput, RedeemWalletCodeOutcome, StoredAdminPaymentCallback,
@@ -437,6 +437,11 @@ SELECT
   CAST(refunded_amount_usd AS DOUBLE PRECISION) AS refunded_amount_usd,
   CAST(refundable_amount_usd AS DOUBLE PRECISION) AS refundable_amount_usd,
   payment_method,
+  payment_provider,
+  payment_channel,
+  order_kind,
+  product_id,
+  product_snapshot,
   gateway_order_id,
   gateway_response,
   status,
@@ -473,6 +478,11 @@ SELECT
   CAST(refunded_amount_usd AS DOUBLE PRECISION) AS refunded_amount_usd,
   CAST(refundable_amount_usd AS DOUBLE PRECISION) AS refundable_amount_usd,
   payment_method,
+  payment_provider,
+  payment_channel,
+  order_kind,
+  product_id,
+  product_snapshot,
   gateway_order_id,
   gateway_response,
   status,
@@ -511,6 +521,11 @@ SELECT
   CAST(refunded_amount_usd AS DOUBLE PRECISION) AS refunded_amount_usd,
   CAST(refundable_amount_usd AS DOUBLE PRECISION) AS refundable_amount_usd,
   payment_method,
+  payment_provider,
+  payment_channel,
+  order_kind,
+  product_id,
+  product_snapshot,
   gateway_order_id,
   gateway_response,
   CASE
@@ -541,6 +556,11 @@ SELECT
   CAST(refunded_amount_usd AS DOUBLE PRECISION) AS refunded_amount_usd,
   CAST(refundable_amount_usd AS DOUBLE PRECISION) AS refundable_amount_usd,
   payment_method,
+  payment_provider,
+  payment_channel,
+  order_kind,
+  product_id,
+  product_snapshot,
   gateway_order_id,
   gateway_response,
   CASE
@@ -1399,6 +1419,10 @@ INSERT INTO payment_orders (
   refunded_amount_usd,
   refundable_amount_usd,
   payment_method,
+  payment_provider,
+  payment_channel,
+  order_kind,
+  fulfillment_status,
   gateway_order_id,
   gateway_response,
   status,
@@ -1419,9 +1443,13 @@ VALUES (
   $9,
   $10,
   $11,
+  'wallet_recharge',
+  'pending',
+  $12,
+  $13,
   'pending',
   NOW(),
-  to_timestamp($12)
+  to_timestamp($14)
 )
 RETURNING
   id,
@@ -1435,6 +1463,11 @@ RETURNING
   CAST(refunded_amount_usd AS DOUBLE PRECISION) AS refunded_amount_usd,
   CAST(refundable_amount_usd AS DOUBLE PRECISION) AS refundable_amount_usd,
   payment_method,
+  payment_provider,
+  payment_channel,
+  order_kind,
+  product_id,
+  product_snapshot,
   gateway_order_id,
   gateway_response,
   status,
@@ -1453,6 +1486,8 @@ RETURNING
                     .bind(input.pay_currency.as_deref())
                     .bind(input.exchange_rate)
                     .bind(&input.payment_method)
+                    .bind(input.payment_provider.as_deref())
+                    .bind(input.payment_channel.as_deref())
                     .bind(&input.gateway_order_id)
                     .bind(&input.gateway_response)
                     .bind(expires_at)
@@ -1460,6 +1495,204 @@ RETURNING
                     .await
                     .map_postgres_err()?;
                     Ok(CreateWalletRechargeOrderOutcome::Created(
+                        map_admin_payment_order_row(&row)?,
+                    ))
+                })
+            })
+            .await
+    }
+
+    async fn create_plan_purchase_order(
+        &self,
+        input: CreatePlanPurchaseOrderInput,
+    ) -> Result<CreatePlanPurchaseOrderOutcome, DataLayerError> {
+        self.tx_runner
+            .run_read_write(|tx| {
+                Box::pin(async move {
+                    let wallet_row = match sqlx::query(
+                        r#"
+SELECT id, status
+FROM wallets
+WHERE user_id = $1
+LIMIT 1
+FOR UPDATE
+                        "#,
+                    )
+                    .bind(&input.user_id)
+                    .fetch_optional(&mut **tx)
+                    .await
+                    .map_postgres_err()?
+                    {
+                        Some(row) => row,
+                        None => {
+                            let wallet_id = input
+                                .preferred_wallet_id
+                                .clone()
+                                .unwrap_or_else(|| Uuid::new_v4().to_string());
+                            sqlx::query(
+                                r#"
+INSERT INTO wallets (
+  id, user_id, balance, gift_balance, limit_mode, currency, status,
+  total_recharged, total_consumed, total_refunded, total_adjusted,
+  created_at, updated_at
+)
+VALUES ($1, $2, 0, 0, 'finite', 'USD', 'active', 0, 0, 0, 0, NOW(), NOW())
+ON CONFLICT (user_id) DO UPDATE
+SET updated_at = wallets.updated_at
+RETURNING id, status
+                                "#,
+                            )
+                            .bind(&wallet_id)
+                            .bind(&input.user_id)
+                            .fetch_one(&mut **tx)
+                            .await
+                            .map_postgres_err()?
+                        }
+                    };
+                    let wallet_id: String = row_get(&wallet_row, "id")?;
+                    let wallet_status: String = row_get(&wallet_row, "status")?;
+                    if wallet_status != "active" {
+                        return Ok(CreatePlanPurchaseOrderOutcome::WalletInactive);
+                    }
+
+                    let purchase_limit_scope = plan_purchase_limit_scope(&input.product_snapshot);
+                    if purchase_limit_scope != "unlimited" {
+                        let max_active_per_user = plan_max_active_per_user(&input.product_snapshot);
+                        let mut active_count = if purchase_limit_scope == "lifetime" {
+                            sqlx::query_scalar::<_, i64>(
+                                r#"
+SELECT COUNT(*)::bigint
+FROM user_plan_entitlements
+WHERE user_id = $1
+  AND plan_id = $2
+  AND status = 'active'
+                        "#,
+                            )
+                            .bind(&input.user_id)
+                            .bind(&input.product_id)
+                            .fetch_one(&mut **tx)
+                            .await
+                            .map_postgres_err()?
+                        } else {
+                            sqlx::query_scalar::<_, i64>(
+                                r#"
+SELECT COUNT(*)::bigint
+FROM user_plan_entitlements
+WHERE user_id = $1
+  AND plan_id = $2
+  AND status = 'active'
+  AND expires_at > NOW()
+                        "#,
+                            )
+                            .bind(&input.user_id)
+                            .bind(&input.product_id)
+                            .fetch_one(&mut **tx)
+                            .await
+                            .map_postgres_err()?
+                        };
+                        active_count += sqlx::query_scalar::<_, i64>(
+                            r#"
+	SELECT COUNT(*)::bigint
+	FROM payment_orders
+	WHERE user_id = $1
+	  AND product_id = $2
+	  AND order_kind = 'plan_purchase'
+	  AND status = 'pending'
+	  AND expires_at > NOW()
+	                        "#,
+                        )
+                        .bind(&input.user_id)
+                        .bind(&input.product_id)
+                        .fetch_one(&mut **tx)
+                        .await
+                        .map_postgres_err()?;
+                        if active_count >= max_active_per_user {
+                            return Ok(CreatePlanPurchaseOrderOutcome::ActivePlanLimitReached);
+                        }
+                    }
+
+                    let expires_at = i64::try_from(input.expires_at_unix_secs).map_err(|_| {
+                        DataLayerError::InvalidInput(
+                            "plan purchase expires_at overflow".to_string(),
+                        )
+                    })?;
+                    let row = sqlx::query(
+                        r#"
+INSERT INTO payment_orders (
+  id,
+  order_no,
+  wallet_id,
+  user_id,
+  amount_usd,
+  pay_amount,
+  pay_currency,
+  exchange_rate,
+  refunded_amount_usd,
+  refundable_amount_usd,
+  payment_method,
+  payment_provider,
+  payment_channel,
+  order_kind,
+  product_id,
+  product_snapshot,
+  fulfillment_status,
+  gateway_order_id,
+  gateway_response,
+  status,
+  created_at,
+  expires_at
+)
+VALUES (
+  $1, $2, $3, $4, $5, $6, $7, $8, 0, 0, $9, $10, $11,
+  'plan_purchase', $12, $13, 'pending', $14, $15, 'pending', NOW(),
+  to_timestamp($16)
+)
+RETURNING
+  id,
+  order_no,
+  wallet_id,
+  user_id,
+  CAST(amount_usd AS DOUBLE PRECISION) AS amount_usd,
+  CAST(pay_amount AS DOUBLE PRECISION) AS pay_amount,
+  pay_currency,
+  CAST(exchange_rate AS DOUBLE PRECISION) AS exchange_rate,
+  CAST(refunded_amount_usd AS DOUBLE PRECISION) AS refunded_amount_usd,
+  CAST(refundable_amount_usd AS DOUBLE PRECISION) AS refundable_amount_usd,
+  payment_method,
+  payment_provider,
+  payment_channel,
+  order_kind,
+  product_id,
+  product_snapshot,
+  gateway_order_id,
+  gateway_response,
+  status,
+  CAST(EXTRACT(EPOCH FROM created_at) AS BIGINT) AS created_at_unix_ms,
+  CAST(EXTRACT(EPOCH FROM paid_at) AS BIGINT) AS paid_at_unix_secs,
+  CAST(EXTRACT(EPOCH FROM credited_at) AS BIGINT) AS credited_at_unix_secs,
+  CAST(EXTRACT(EPOCH FROM expires_at) AS BIGINT) AS expires_at_unix_secs
+                        "#,
+                    )
+                    .bind(Uuid::new_v4().to_string())
+                    .bind(&input.order_no)
+                    .bind(&wallet_id)
+                    .bind(&input.user_id)
+                    .bind(input.amount_usd)
+                    .bind(input.pay_amount)
+                    .bind(&input.pay_currency)
+                    .bind(input.exchange_rate)
+                    .bind(&input.payment_method)
+                    .bind(input.payment_provider.as_deref())
+                    .bind(input.payment_channel.as_deref())
+                    .bind(&input.product_id)
+                    .bind(&input.product_snapshot)
+                    .bind(&input.gateway_order_id)
+                    .bind(&input.gateway_response)
+                    .bind(expires_at)
+                    .fetch_one(&mut **tx)
+                    .await
+                    .map_postgres_err()?;
+                    Ok(CreatePlanPurchaseOrderOutcome::Created(
                         map_admin_payment_order_row(&row)?,
                     ))
                 })
@@ -1834,6 +2067,11 @@ SELECT
   CAST(refunded_amount_usd AS DOUBLE PRECISION) AS refunded_amount_usd,
   CAST(refundable_amount_usd AS DOUBLE PRECISION) AS refundable_amount_usd,
   payment_method,
+  payment_provider,
+  payment_channel,
+  order_kind,
+  product_id,
+  product_snapshot,
   gateway_order_id,
   gateway_response,
   status,
@@ -1866,6 +2104,11 @@ SELECT
   CAST(refunded_amount_usd AS DOUBLE PRECISION) AS refunded_amount_usd,
   CAST(refundable_amount_usd AS DOUBLE PRECISION) AS refundable_amount_usd,
   payment_method,
+  payment_provider,
+  payment_channel,
+  order_kind,
+  product_id,
+  product_snapshot,
   gateway_order_id,
   gateway_response,
   status,
@@ -1905,12 +2148,26 @@ FOR UPDATE
                     let order_no: String = row_get(&order_row, "order_no")?;
                     let order_wallet_id: String = row_get(&order_row, "wallet_id")?;
                     let order_payment_method: String = row_get(&order_row, "payment_method")?;
+                    let order_payment_provider: Option<String> =
+                        row_get(&order_row, "payment_provider")?;
+                    let order_payment_channel: Option<String> =
+                        row_get(&order_row, "payment_channel")?;
+                    let order_kind: String = row_get(&order_row, "order_kind")?;
                     let order_amount_usd: f64 = row_get(&order_row, "amount_usd")?;
+                    let order_pay_amount: Option<f64> = row_get(&order_row, "pay_amount")?;
                     let order_status: String = row_get(&order_row, "status")?;
                     let expires_at_unix_secs: Option<i64> =
                         row_get(&order_row, "expires_at_unix_secs")?;
 
-                    if (input.amount_usd - order_amount_usd).abs() > f64::EPSILON {
+                    let amount_matches =
+                        if let (Some(callback_pay_amount), Some(order_pay_amount)) =
+                            (input.pay_amount, order_pay_amount)
+                        {
+                            (callback_pay_amount - order_pay_amount).abs() <= 0.01
+                        } else {
+                            (input.amount_usd - order_amount_usd).abs() <= f64::EPSILON
+                        };
+                    if !amount_matches {
                         update_payment_callback_failure(
                             tx,
                             &callback_id,
@@ -1935,6 +2192,42 @@ FOR UPDATE
                             duplicate,
                             error: "payment method mismatch".to_string(),
                         });
+                    }
+                    if let Some(expected_provider) = input.payment_provider.as_deref() {
+                        if order_payment_provider
+                            .as_deref()
+                            .is_some_and(|value| !value.eq_ignore_ascii_case(expected_provider))
+                        {
+                            update_payment_callback_failure(
+                                tx,
+                                &callback_id,
+                                &input,
+                                "payment provider mismatch",
+                            )
+                            .await?;
+                            return Ok(ProcessPaymentCallbackOutcome::Failed {
+                                duplicate,
+                                error: "payment provider mismatch".to_string(),
+                            });
+                        }
+                    }
+                    if let Some(expected_channel) = input.payment_channel.as_deref() {
+                        if order_payment_channel
+                            .as_deref()
+                            .is_some_and(|value| !value.eq_ignore_ascii_case(expected_channel))
+                        {
+                            update_payment_callback_failure(
+                                tx,
+                                &callback_id,
+                                &input,
+                                "payment channel mismatch",
+                            )
+                            .await?;
+                            return Ok(ProcessPaymentCallbackOutcome::Failed {
+                                duplicate,
+                                error: "payment channel mismatch".to_string(),
+                            });
+                        }
                     }
                     if order_status == "credited" {
                         mark_payment_callback_processed(
@@ -1979,6 +2272,201 @@ FOR UPDATE
                                 error: "payment order expired".to_string(),
                             });
                         }
+                    }
+
+                    if order_kind == "plan_purchase" {
+                        let product_id: Option<String> = row_get(&order_row, "product_id")?;
+                        let product_snapshot: Option<serde_json::Value> =
+                            row_get(&order_row, "product_snapshot")?;
+                        let order_user_id: Option<String> = row_get(&order_row, "user_id")?;
+                        let Some(user_id) = order_user_id else {
+                            update_payment_callback_failure(
+                                tx,
+                                &callback_id,
+                                &input,
+                                "payment order user missing",
+                            )
+                            .await?;
+                            return Ok(ProcessPaymentCallbackOutcome::Failed {
+                                duplicate,
+                                error: "payment order user missing".to_string(),
+                            });
+                        };
+                        let snapshot = product_snapshot.unwrap_or_else(|| serde_json::json!({}));
+                        let plan_id = product_id.unwrap_or_else(|| {
+                            snapshot
+                                .get("id")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("unknown")
+                                .to_string()
+                        });
+                        let entitlements = plan_entitlements_snapshot(&snapshot);
+                        let now = Utc::now();
+                        let expires_at = plan_expires_at(&snapshot, now);
+                        let existing_entitlement_id = sqlx::query_scalar::<_, String>(
+                            r#"
+SELECT id
+FROM user_plan_entitlements
+WHERE payment_order_id = $1
+LIMIT 1
+                            "#,
+                        )
+                        .bind(&order_id)
+                        .fetch_optional(&mut **tx)
+                        .await
+                        .map_postgres_err()?;
+                        if existing_entitlement_id.is_none() {
+                            sqlx::query("SELECT id FROM wallets WHERE id = $1 LIMIT 1 FOR UPDATE")
+                                .bind(&order_wallet_id)
+                                .fetch_optional(&mut **tx)
+                                .await
+                                .map_postgres_err()?;
+                            let purchase_limit_scope = plan_purchase_limit_scope(&snapshot);
+                            if purchase_limit_scope != "unlimited" {
+                                let max_active_per_user = plan_max_active_per_user(&snapshot);
+                                let active_count = if purchase_limit_scope == "lifetime" {
+                                    sqlx::query_scalar::<_, i64>(
+                                        r#"
+SELECT COUNT(*)::bigint
+FROM user_plan_entitlements
+WHERE user_id = $1
+  AND plan_id = $2
+  AND status = 'active'
+                                "#,
+                                    )
+                                    .bind(&user_id)
+                                    .bind(&plan_id)
+                                    .fetch_one(&mut **tx)
+                                    .await
+                                    .map_postgres_err()?
+                                } else {
+                                    sqlx::query_scalar::<_, i64>(
+                                        r#"
+SELECT COUNT(*)::bigint
+FROM user_plan_entitlements
+WHERE user_id = $1
+  AND plan_id = $2
+  AND status = 'active'
+  AND expires_at > NOW()
+                                "#,
+                                    )
+                                    .bind(&user_id)
+                                    .bind(&plan_id)
+                                    .fetch_one(&mut **tx)
+                                    .await
+                                    .map_postgres_err()?
+                                };
+                                if active_count >= max_active_per_user {
+                                    update_payment_callback_failure(
+                                        tx,
+                                        &callback_id,
+                                        &input,
+                                        "plan purchase limit reached",
+                                    )
+                                    .await?;
+                                    return Ok(ProcessPaymentCallbackOutcome::Failed {
+                                        duplicate,
+                                        error: "plan purchase limit reached".to_string(),
+                                    });
+                                }
+                            }
+                            replace_matching_plan_entitlements_postgres(
+                                tx, &user_id, &snapshot, now,
+                            )
+                            .await?;
+                            sqlx::query(
+                                r#"
+INSERT INTO user_plan_entitlements (
+  id, user_id, plan_id, payment_order_id, status, starts_at, expires_at,
+  entitlements_snapshot, created_at, updated_at
+)
+VALUES ($1, $2, $3, $4, 'active', $5, $6, $7, NOW(), NOW())
+                                "#,
+                            )
+                            .bind(Uuid::new_v4().to_string())
+                            .bind(&user_id)
+                            .bind(&plan_id)
+                            .bind(&order_id)
+                            .bind(now)
+                            .bind(expires_at)
+                            .bind(&entitlements)
+                            .execute(&mut **tx)
+                            .await
+                            .map_postgres_err()?;
+                            apply_plan_wallet_credit_postgres(
+                                tx,
+                                &order_wallet_id,
+                                &order_id,
+                                &input.payment_method,
+                                &entitlements,
+                            )
+                            .await?;
+                        }
+                        let updated_order_row = sqlx::query(
+                            r#"
+UPDATE payment_orders
+SET gateway_order_id = COALESCE($2, gateway_order_id),
+    gateway_response = $3,
+    pay_amount = COALESCE($4, pay_amount),
+    pay_currency = COALESCE($5, pay_currency),
+    exchange_rate = COALESCE($6, exchange_rate),
+    status = 'credited',
+    fulfillment_status = 'fulfilled',
+    fulfillment_error = NULL,
+    paid_at = COALESCE(paid_at, NOW()),
+    credited_at = NOW(),
+    refundable_amount_usd = 0
+WHERE id = $1
+RETURNING
+  id,
+  order_no,
+  wallet_id,
+  user_id,
+  CAST(amount_usd AS DOUBLE PRECISION) AS amount_usd,
+  CAST(pay_amount AS DOUBLE PRECISION) AS pay_amount,
+  pay_currency,
+  CAST(exchange_rate AS DOUBLE PRECISION) AS exchange_rate,
+	  CAST(refunded_amount_usd AS DOUBLE PRECISION) AS refunded_amount_usd,
+	  CAST(refundable_amount_usd AS DOUBLE PRECISION) AS refundable_amount_usd,
+	  payment_method,
+	  payment_provider,
+	  payment_channel,
+	  order_kind,
+	  product_id,
+	  product_snapshot,
+	  gateway_order_id,
+	  gateway_response,
+	  status,
+  CAST(EXTRACT(EPOCH FROM created_at) AS BIGINT) AS created_at_unix_ms,
+  CAST(EXTRACT(EPOCH FROM paid_at) AS BIGINT) AS paid_at_unix_secs,
+  CAST(EXTRACT(EPOCH FROM credited_at) AS BIGINT) AS credited_at_unix_secs,
+  CAST(EXTRACT(EPOCH FROM expires_at) AS BIGINT) AS expires_at_unix_secs
+                            "#,
+                        )
+                        .bind(&order_id)
+                        .bind(input.gateway_order_id.as_deref())
+                        .bind(&input.payload)
+                        .bind(input.pay_amount)
+                        .bind(input.pay_currency.as_deref())
+                        .bind(input.exchange_rate)
+                        .fetch_one(&mut **tx)
+                        .await
+                        .map_postgres_err()?;
+                        mark_payment_callback_processed(
+                            tx,
+                            &callback_id,
+                            &input,
+                            &order_id,
+                            &order_no,
+                        )
+                        .await?;
+                        return Ok(ProcessPaymentCallbackOutcome::Applied {
+                            duplicate,
+                            order_id,
+                            order_no,
+                            wallet_id: order_wallet_id,
+                            order: map_admin_payment_order_row(&updated_order_row)?,
+                        });
                     }
 
                     let Some(wallet_row) = sqlx::query(
@@ -2127,8 +2615,13 @@ RETURNING
   CAST(exchange_rate AS DOUBLE PRECISION) AS exchange_rate,
   CAST(refunded_amount_usd AS DOUBLE PRECISION) AS refunded_amount_usd,
   CAST(refundable_amount_usd AS DOUBLE PRECISION) AS refundable_amount_usd,
-  payment_method,
-  gateway_order_id,
+	  payment_method,
+	  payment_provider,
+	  payment_channel,
+	  order_kind,
+	  product_id,
+	  product_snapshot,
+	  gateway_order_id,
   gateway_response,
   status,
   CAST(EXTRACT(EPOCH FROM created_at) AS BIGINT) AS created_at_unix_ms,
@@ -3338,17 +3831,22 @@ SELECT
   CAST(exchange_rate AS DOUBLE PRECISION) AS exchange_rate,
   CAST(refunded_amount_usd AS DOUBLE PRECISION) AS refunded_amount_usd,
   CAST(refundable_amount_usd AS DOUBLE PRECISION) AS refundable_amount_usd,
-  payment_method,
-  gateway_order_id,
-  gateway_response,
-  status,
-  CAST(EXTRACT(EPOCH FROM created_at) AS BIGINT) AS created_at_unix_ms,
-  CAST(EXTRACT(EPOCH FROM paid_at) AS BIGINT) AS paid_at_unix_secs,
-  CAST(EXTRACT(EPOCH FROM credited_at) AS BIGINT) AS credited_at_unix_secs,
-  CAST(EXTRACT(EPOCH FROM expires_at) AS BIGINT) AS expires_at_unix_secs
-FROM payment_orders
-WHERE id = $1
-FOR UPDATE
+	  payment_method,
+	  payment_provider,
+	  payment_channel,
+	  order_kind,
+	  product_id,
+	  product_snapshot,
+	  gateway_order_id,
+	  gateway_response,
+	  status,
+	  CAST(EXTRACT(EPOCH FROM created_at) AS BIGINT) AS created_at_unix_ms,
+	  CAST(EXTRACT(EPOCH FROM paid_at) AS BIGINT) AS paid_at_unix_secs,
+	  CAST(EXTRACT(EPOCH FROM credited_at) AS BIGINT) AS credited_at_unix_secs,
+	  CAST(EXTRACT(EPOCH FROM expires_at) AS BIGINT) AS expires_at_unix_secs
+	FROM payment_orders
+	WHERE id = $1
+	FOR UPDATE
                         "#,
                     )
                     .bind(&order_id)
@@ -3544,6 +4042,11 @@ SELECT
   CAST(refunded_amount_usd AS DOUBLE PRECISION) AS refunded_amount_usd,
   CAST(refundable_amount_usd AS DOUBLE PRECISION) AS refundable_amount_usd,
   payment_method,
+  payment_provider,
+  payment_channel,
+  order_kind,
+  product_id,
+  product_snapshot,
   gateway_order_id,
   gateway_response,
   status,
@@ -3580,6 +4083,199 @@ FOR UPDATE
                         return Ok(WalletMutationOutcome::Invalid(
                             "payment order expired".to_string(),
                         ));
+                    }
+
+                    let order_kind: String = row_get(&order_row, "order_kind")?;
+                    if order_kind == "plan_purchase" {
+                        let order_user_id: Option<String> = row_get(&order_row, "user_id")?;
+                        let Some(user_id) = order_user_id else {
+                            return Ok(WalletMutationOutcome::Invalid(
+                                "payment order user missing".to_string(),
+                            ));
+                        };
+                        let product_id: Option<String> = row_get(&order_row, "product_id")?;
+                        let product_snapshot: Option<serde_json::Value> =
+                            row_get(&order_row, "product_snapshot")?;
+                        let snapshot = product_snapshot.unwrap_or_else(|| serde_json::json!({}));
+                        let plan_id = product_id.unwrap_or_else(|| {
+                            snapshot
+                                .get("id")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("unknown")
+                                .to_string()
+                        });
+                        let entitlements = plan_entitlements_snapshot(&snapshot);
+                        let now = Utc::now();
+                        let expires_at = plan_expires_at(&snapshot, now);
+                        let existing_entitlement_id = sqlx::query_scalar::<_, String>(
+                            r#"
+SELECT id
+FROM user_plan_entitlements
+WHERE payment_order_id = $1
+LIMIT 1
+                            "#,
+                        )
+                        .bind(&input.order_id)
+                        .fetch_optional(&mut **tx)
+                        .await
+                        .map_postgres_err()?;
+                        if existing_entitlement_id.is_none() {
+                            let purchase_limit_scope = plan_purchase_limit_scope(&snapshot);
+                            if purchase_limit_scope != "unlimited" {
+                                let max_active_per_user = plan_max_active_per_user(&snapshot);
+                                let active_count = if purchase_limit_scope == "lifetime" {
+                                    sqlx::query_scalar::<_, i64>(
+                                        r#"
+SELECT COUNT(*)::bigint
+FROM user_plan_entitlements
+WHERE user_id = $1
+  AND plan_id = $2
+  AND status = 'active'
+                                "#,
+                                    )
+                                    .bind(&user_id)
+                                    .bind(&plan_id)
+                                    .fetch_one(&mut **tx)
+                                    .await
+                                    .map_postgres_err()?
+                                } else {
+                                    sqlx::query_scalar::<_, i64>(
+                                        r#"
+SELECT COUNT(*)::bigint
+FROM user_plan_entitlements
+WHERE user_id = $1
+  AND plan_id = $2
+  AND status = 'active'
+  AND expires_at > NOW()
+                                "#,
+                                    )
+                                    .bind(&user_id)
+                                    .bind(&plan_id)
+                                    .fetch_one(&mut **tx)
+                                    .await
+                                    .map_postgres_err()?
+                                };
+                                if active_count >= max_active_per_user {
+                                    return Ok(WalletMutationOutcome::Invalid(
+                                        "plan purchase limit reached".to_string(),
+                                    ));
+                                }
+                            }
+                            replace_matching_plan_entitlements_postgres(
+                                tx, &user_id, &snapshot, now,
+                            )
+                            .await?;
+                            sqlx::query(
+                                r#"
+INSERT INTO user_plan_entitlements (
+  id, user_id, plan_id, payment_order_id, status, starts_at, expires_at,
+  entitlements_snapshot, created_at, updated_at
+)
+VALUES ($1, $2, $3, $4, 'active', $5, $6, $7, NOW(), NOW())
+                                "#,
+                            )
+                            .bind(Uuid::new_v4().to_string())
+                            .bind(&user_id)
+                            .bind(&plan_id)
+                            .bind(&input.order_id)
+                            .bind(now)
+                            .bind(expires_at)
+                            .bind(&entitlements)
+                            .execute(&mut **tx)
+                            .await
+                            .map_postgres_err()?;
+                            apply_plan_wallet_credit_postgres(
+                                tx,
+                                &order.wallet_id,
+                                &input.order_id,
+                                &order.payment_method,
+                                &entitlements,
+                            )
+                            .await?;
+                        }
+
+                        let mut gateway_response =
+                            payment_gateway_response_map(order.gateway_response.clone());
+                        if let Some(serde_json::Value::Object(map)) =
+                            input.gateway_response_patch.clone()
+                        {
+                            gateway_response.extend(map);
+                        }
+                        gateway_response
+                            .insert("manual_credit".to_string(), serde_json::Value::Bool(true));
+                        gateway_response.insert(
+                            "credited_by".to_string(),
+                            input
+                                .operator_id
+                                .clone()
+                                .map(serde_json::Value::String)
+                                .unwrap_or(serde_json::Value::Null),
+                        );
+                        let next_gateway_order_id =
+                            input.gateway_order_id.clone().or(order.gateway_order_id);
+                        let next_pay_amount = input.pay_amount.or(order.pay_amount);
+                        let next_pay_currency = input.pay_currency.clone().or(order.pay_currency);
+                        let next_exchange_rate = input.exchange_rate.or(order.exchange_rate);
+                        let next_paid_at_unix_secs = order
+                            .paid_at_unix_secs
+                            .or(Some(now.timestamp().max(0) as u64));
+
+                        let row = sqlx::query(
+                            r#"
+UPDATE payment_orders
+SET
+  gateway_order_id = $2,
+  gateway_response = $3,
+  pay_amount = $4,
+  pay_currency = $5,
+  exchange_rate = $6,
+  status = 'credited',
+  fulfillment_status = 'fulfilled',
+  fulfillment_error = NULL,
+  paid_at = COALESCE(to_timestamp($7), NOW()),
+  credited_at = NOW(),
+  refundable_amount_usd = 0
+WHERE id = $1
+RETURNING
+  id,
+  order_no,
+  wallet_id,
+  user_id,
+  CAST(amount_usd AS DOUBLE PRECISION) AS amount_usd,
+  CAST(pay_amount AS DOUBLE PRECISION) AS pay_amount,
+  pay_currency,
+  CAST(exchange_rate AS DOUBLE PRECISION) AS exchange_rate,
+  CAST(refunded_amount_usd AS DOUBLE PRECISION) AS refunded_amount_usd,
+  CAST(refundable_amount_usd AS DOUBLE PRECISION) AS refundable_amount_usd,
+  payment_method,
+  gateway_order_id,
+  gateway_response,
+  status,
+  CAST(EXTRACT(EPOCH FROM created_at) AS BIGINT) AS created_at_unix_ms,
+  CAST(EXTRACT(EPOCH FROM paid_at) AS BIGINT) AS paid_at_unix_secs,
+  CAST(EXTRACT(EPOCH FROM credited_at) AS BIGINT) AS credited_at_unix_secs,
+  CAST(EXTRACT(EPOCH FROM expires_at) AS BIGINT) AS expires_at_unix_secs
+                        "#,
+                        )
+                        .bind(&input.order_id)
+                        .bind(next_gateway_order_id)
+                        .bind(serde_json::Value::Object(gateway_response))
+                        .bind(next_pay_amount)
+                        .bind(next_pay_currency)
+                        .bind(next_exchange_rate)
+                        .bind(
+                            i64::try_from(
+                                next_paid_at_unix_secs.unwrap_or(now.timestamp().max(0) as u64),
+                            )
+                            .unwrap_or_default(),
+                        )
+                        .fetch_one(&mut **tx)
+                        .await
+                        .map_postgres_err()?;
+                        return Ok(WalletMutationOutcome::Applied((
+                            map_admin_payment_order_row(&row)?,
+                            true,
+                        )));
                     }
 
                     let Some(wallet_row) = sqlx::query(
@@ -4775,6 +5471,247 @@ fn redeem_code_suffix(normalized: &str) -> String {
 
 fn mask_redeem_code(prefix: &str, suffix: &str) -> String {
     format!("{prefix}****{suffix}")
+}
+
+fn plan_entitlements_snapshot(snapshot: &serde_json::Value) -> serde_json::Value {
+    snapshot
+        .get("entitlements")
+        .or_else(|| snapshot.get("entitlements_json"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]))
+}
+
+fn plan_max_active_per_user(snapshot: &serde_json::Value) -> i64 {
+    snapshot
+        .get("max_active_per_user")
+        .and_then(|value| value.as_i64())
+        .unwrap_or(1)
+        .max(1)
+}
+
+fn plan_purchase_limit_scope(snapshot: &serde_json::Value) -> &str {
+    match snapshot
+        .get("purchase_limit_scope")
+        .and_then(|value| value.as_str())
+    {
+        Some("lifetime") => "lifetime",
+        Some("unlimited") => "unlimited",
+        _ => "active_period",
+    }
+}
+
+fn plan_replacement_entitlement_types(snapshot: &serde_json::Value) -> Vec<&'static str> {
+    let entitlements = plan_entitlements_snapshot(snapshot);
+    let mut kinds = Vec::new();
+    if entitlement_snapshot_has_type(&entitlements, "daily_quota") {
+        kinds.push("daily_quota");
+    }
+    if entitlement_snapshot_has_type(&entitlements, "membership_group") {
+        kinds.push("membership_group");
+    }
+    kinds
+}
+
+fn entitlement_snapshot_has_type(snapshot: &serde_json::Value, entitlement_type: &str) -> bool {
+    snapshot.as_array().is_some_and(|items| {
+        items
+            .iter()
+            .any(|item| item.get("type").and_then(|value| value.as_str()) == Some(entitlement_type))
+    })
+}
+
+async fn replace_matching_plan_entitlements_postgres(
+    tx: &mut crate::driver::postgres::PostgresTransaction,
+    user_id: &str,
+    snapshot: &serde_json::Value,
+    now: chrono::DateTime<Utc>,
+) -> Result<(), DataLayerError> {
+    let replacement_types = plan_replacement_entitlement_types(snapshot);
+    if replacement_types.is_empty() {
+        return Ok(());
+    }
+
+    let rows = sqlx::query(
+        r#"
+SELECT id, entitlements_snapshot
+FROM user_plan_entitlements
+WHERE user_id = $1
+  AND status = 'active'
+  AND expires_at > $2
+        "#,
+    )
+    .bind(user_id)
+    .bind(now)
+    .fetch_all(&mut **tx)
+    .await
+    .map_postgres_err()?;
+
+    for row in rows {
+        let entitlements: serde_json::Value = row_get(&row, "entitlements_snapshot")?;
+        let should_replace = replacement_types
+            .iter()
+            .any(|kind| entitlement_snapshot_has_type(&entitlements, kind));
+        if !should_replace {
+            continue;
+        }
+        let entitlement_id: String = row_get(&row, "id")?;
+        sqlx::query(
+            r#"
+UPDATE user_plan_entitlements
+SET status = 'replaced',
+    expires_at = LEAST(expires_at, $1),
+    updated_at = NOW()
+WHERE id = $2
+  AND status = 'active'
+  AND expires_at > $1
+        "#,
+        )
+        .bind(now)
+        .bind(entitlement_id)
+        .execute(&mut **tx)
+        .await
+        .map_postgres_err()?;
+    }
+    Ok(())
+}
+
+fn plan_expires_at(
+    snapshot: &serde_json::Value,
+    starts_at: chrono::DateTime<Utc>,
+) -> chrono::DateTime<Utc> {
+    let duration_value = snapshot
+        .get("duration_value")
+        .and_then(|value| value.as_i64())
+        .unwrap_or(1)
+        .max(1);
+    match snapshot
+        .get("duration_unit")
+        .and_then(|value| value.as_str())
+        .unwrap_or("month")
+    {
+        "day" => starts_at + chrono::Duration::days(duration_value),
+        "year" => starts_at + chrono::Duration::days(365 * duration_value),
+        "custom" => starts_at + chrono::Duration::days(duration_value),
+        _ => starts_at + chrono::Duration::days(30 * duration_value),
+    }
+}
+
+async fn apply_plan_wallet_credit_postgres(
+    tx: &mut crate::driver::postgres::PostgresTransaction,
+    wallet_id: &str,
+    order_id: &str,
+    payment_method: &str,
+    entitlements: &serde_json::Value,
+) -> Result<(), DataLayerError> {
+    let credits = entitlements
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|item| item.get("type").and_then(|value| value.as_str()) == Some("wallet_credit"))
+        .filter_map(|item| {
+            let amount = item.get("amount_usd").and_then(|value| value.as_f64())?;
+            if amount <= 0.0 || !amount.is_finite() {
+                return None;
+            }
+            let bucket = item
+                .get("balance_bucket")
+                .and_then(|value| value.as_str())
+                .unwrap_or("gift")
+                .to_ascii_lowercase();
+            Some((amount, bucket))
+        })
+        .collect::<Vec<_>>();
+    if credits.is_empty() {
+        return Ok(());
+    }
+
+    let Some(wallet_row) = sqlx::query(
+        r#"
+SELECT
+  id,
+  status,
+  CAST(balance AS DOUBLE PRECISION) AS balance,
+  CAST(gift_balance AS DOUBLE PRECISION) AS gift_balance
+FROM wallets
+WHERE id = $1
+LIMIT 1
+FOR UPDATE
+        "#,
+    )
+    .bind(wallet_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_postgres_err()?
+    else {
+        return Err(DataLayerError::UnexpectedValue(
+            "wallet not found for plan wallet_credit".to_string(),
+        ));
+    };
+    let wallet_status: String = row_get(&wallet_row, "status")?;
+    if wallet_status != "active" {
+        return Err(DataLayerError::UnexpectedValue(
+            "wallet is not active for plan wallet_credit".to_string(),
+        ));
+    }
+    let mut recharge_balance: f64 = row_get(&wallet_row, "balance")?;
+    let mut gift_balance: f64 = row_get(&wallet_row, "gift_balance")?;
+    for (amount, bucket) in credits {
+        let before_recharge = recharge_balance;
+        let before_gift = gift_balance;
+        let before_total = before_recharge + before_gift;
+        let credits_recharge = bucket == "recharge";
+        if credits_recharge {
+            recharge_balance += amount;
+        } else {
+            gift_balance += amount;
+        }
+        let after_total = recharge_balance + gift_balance;
+        sqlx::query(
+            r#"
+UPDATE wallets
+SET balance = $2,
+    gift_balance = $3,
+    total_recharged = total_recharged + $4,
+    updated_at = NOW()
+WHERE id = $1
+            "#,
+        )
+        .bind(wallet_id)
+        .bind(recharge_balance)
+        .bind(gift_balance)
+        .bind(if credits_recharge { amount } else { 0.0 })
+        .execute(&mut **tx)
+        .await
+        .map_postgres_err()?;
+        sqlx::query(
+            r#"
+INSERT INTO wallet_transactions (
+  id, wallet_id, category, reason_code, amount, balance_before, balance_after,
+  recharge_balance_before, recharge_balance_after, gift_balance_before,
+  gift_balance_after, link_type, link_id, operator_id, description, created_at
+)
+VALUES (
+  $1, $2, 'recharge', 'plan_wallet_credit', $3, $4, $5, $6, $7, $8, $9,
+  'payment_order', $10, NULL, $11, NOW()
+)
+            "#,
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(wallet_id)
+        .bind(amount)
+        .bind(before_total)
+        .bind(after_total)
+        .bind(before_recharge)
+        .bind(recharge_balance)
+        .bind(before_gift)
+        .bind(gift_balance)
+        .bind(order_id)
+        .bind(format!("套餐附赠余额({payment_method})"))
+        .execute(&mut **tx)
+        .await
+        .map_postgres_err()?;
+    }
+    Ok(())
 }
 
 async fn update_payment_callback_failure(

@@ -180,6 +180,40 @@ fn local_openai_responses_compact_wrapper_strips_store_for_same_format_requests(
 }
 
 #[test]
+fn local_openai_responses_compact_wrapper_strips_include_for_codex_requests() {
+    let body_json = json!({
+        "model": "gpt-5.4",
+        "input": [],
+        "include": ["reasoning.encrypted_content"],
+        "store": true,
+        "stream": true
+    });
+
+    let provider_request_body = build_local_openai_responses_request_body(
+        &body_json,
+        "gpt-5.4",
+        false,
+        false,
+        "codex",
+        "openai:responses:compact",
+        None,
+        Some("key-123"),
+        &http::HeaderMap::new(),
+        false,
+    )
+    .expect("local codex compact body should build");
+
+    assert!(provider_request_body.get("include").is_none());
+    assert!(provider_request_body.get("store").is_none());
+    assert!(provider_request_body.get("stream").is_none());
+    assert_eq!(provider_request_body["instructions"], "");
+    assert_eq!(
+        provider_request_body["prompt_cache_key"],
+        "172c39e6-c0a0-5a70-8b63-e0f8e0d185a3"
+    );
+}
+
+#[test]
 fn local_openai_responses_wrapper_applies_model_directive_before_body_rules() {
     let body_json = json!({
         "model": "gpt-5.4-max",

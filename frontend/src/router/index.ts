@@ -128,6 +128,11 @@ const routes: RouteRecordRaw[] = [
         component: () => importWithRetry(() => import('@/views/user/WalletCenter.vue'))
       },
       {
+        path: 'billing',
+        name: 'BillingPlans',
+        component: () => importWithRetry(() => import('@/views/user/BillingPlans.vue'))
+      },
+      {
         path: 'models',
         name: 'ModelCatalog',
         component: () => importWithRetry(() => import('@/views/user/ModelCatalog.vue'))
@@ -163,6 +168,16 @@ const routes: RouteRecordRaw[] = [
         path: 'wallets',
         name: 'WalletsManagement',
         component: () => importWithRetry(() => import('@/views/admin/WalletsManagement.vue'))
+      },
+      {
+        path: 'payment-gateways',
+        name: 'PaymentGatewaySettings',
+        component: () => importWithRetry(() => import('@/views/admin/PaymentGatewaySettings.vue'))
+      },
+      {
+        path: 'billing-plans',
+        name: 'BillingPlansManagement',
+        component: () => importWithRetry(() => import('@/views/admin/BillingPlansManagement.vue'))
       },
       {
         path: 'management-tokens',

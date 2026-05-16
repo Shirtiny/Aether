@@ -536,6 +536,10 @@ mod tests {
             .pointer("/proxy_metadata/recent_tunnel_errors/0")
             .and_then(serde_json::Value::as_object)
             .expect("recent tunnel error should be reported");
+        assert!(recent_error
+            .get("timestamp_unix_ms")
+            .and_then(serde_json::Value::as_u64)
+            .is_some());
         assert_eq!(
             recent_error
                 .get("component")

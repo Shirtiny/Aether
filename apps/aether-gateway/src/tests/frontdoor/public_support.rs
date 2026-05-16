@@ -1,4 +1,4 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::{
     sample_endpoint, sample_key, sample_models_candidate_row, sample_provider,
@@ -1409,6 +1409,12 @@ async fn gateway_handles_auth_registration_settings_without_proxying_upstream() 
         ("smtp_host".to_string(), json!("smtp.example.com")),
         ("smtp_from_email".to_string(), json!("noreply@example.com")),
         ("password_policy_level".to_string(), json!("strong")),
+        ("turnstile_enabled".to_string(), json!(true)),
+        ("turnstile_site_key".to_string(), json!("site-public-key")),
+        (
+            "turnstile_secret_key".to_string(),
+            json!("secret-private-key"),
+        ),
     ]);
 
     let (upstream_url, upstream_handle) = start_server(upstream).await;
@@ -1434,6 +1440,9 @@ async fn gateway_handles_auth_registration_settings_without_proxying_upstream() 
             "require_email_verification": true,
             "email_configured": true,
             "password_policy_level": "strong",
+            "turnstile_enabled": true,
+            "turnstile_site_key": "site-public-key",
+            "turnstile_required_actions": ["send_verification_code", "register"],
         })
     );
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
@@ -7873,6 +7882,551 @@ async fn gateway_handles_auth_register_locally_without_proxying_upstream() {
 
     gateway_handle.abort();
     upstream_handle.abort();
+}
+
+async fn start_turnstile_siteverify_server(
+    response_payload: serde_json::Value,
+    status: StatusCode,
+) -> (
+    String,
+    Arc<Mutex<Vec<std::collections::HashMap<String, String>>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    start_turnstile_siteverify_server_with_delay(response_payload, status, None).await
+}
+
+async fn start_turnstile_siteverify_server_with_delay(
+    response_payload: serde_json::Value,
+    status: StatusCode,
+    delay: Option<Duration>,
+) -> (
+    String,
+    Arc<Mutex<Vec<std::collections::HashMap<String, String>>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_clone = Arc::clone(&requests);
+    let upstream = Router::new().route(
+        "/turnstile/siteverify",
+        any(
+            move |axum::extract::Form(form): axum::extract::Form<
+                std::collections::HashMap<String, String>,
+            >| {
+                let requests_inner = Arc::clone(&requests_clone);
+                let response_payload = response_payload.clone();
+                async move {
+                    if let Some(delay) = delay {
+                        tokio::time::sleep(delay).await;
+                    }
+                    requests_inner
+                        .lock()
+                        .expect("turnstile requests should lock")
+                        .push(form);
+                    (status, Json(response_payload))
+                }
+            },
+        ),
+    );
+    let (url, handle) = start_server(upstream).await;
+    (format!("{url}/turnstile/siteverify"), requests, handle)
+}
+
+fn turnstile_enabled_data_state() -> crate::data::GatewayDataState {
+    crate::data::GatewayDataState::disabled().with_system_config_values_for_tests(vec![
+        ("enable_registration".to_string(), json!(true)),
+        ("require_email_verification".to_string(), json!(true)),
+        ("smtp_host".to_string(), json!("smtp.example.com")),
+        ("smtp_from_email".to_string(), json!("ops@example.com")),
+        ("default_user_initial_gift_usd".to_string(), json!(12.5)),
+        ("turnstile_enabled".to_string(), json!(true)),
+        ("turnstile_site_key".to_string(), json!("site-public-key")),
+        (
+            "turnstile_secret_key".to_string(),
+            json!("secret-private-key"),
+        ),
+        (
+            "turnstile_allowed_hostnames".to_string(),
+            json!(["gateway.example.com"]),
+        ),
+    ])
+}
+
+#[tokio::test]
+async fn gateway_rejects_auth_register_without_turnstile_token_when_enabled() {
+    let (gateway_url, upstream_hits, gateway_handle, upstream_handle) =
+        start_auth_gateway_with_builder(|| {
+            AppState::new()
+                .expect("gateway should build")
+                .with_data_state_for_tests(turnstile_enabled_data_state())
+                .with_auth_email_verified_for_tests("alice@example.com")
+        })
+        .await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/api/auth/register"))
+        .json(&json!({
+            "email": "alice@example.com",
+            "username": "alice",
+            "password": "secret123",
+        }))
+        .send()
+        .await
+        .expect("register request should succeed");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(payload["detail"], "请先完成人机验证");
+    assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
+
+    gateway_handle.abort();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_rejects_auth_send_verification_code_without_turnstile_token_when_enabled() {
+    let (gateway_url, upstream_hits, gateway_handle, upstream_handle) =
+        start_auth_gateway_with_builder(|| {
+            AppState::new()
+                .expect("gateway should build")
+                .with_data_state_for_tests(turnstile_enabled_data_state())
+        })
+        .await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/api/auth/send-verification-code"))
+        .json(&json!({ "email": "alice@example.com" }))
+        .send()
+        .await
+        .expect("send verification request should succeed");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(payload["detail"], "请先完成人机验证");
+    assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
+
+    gateway_handle.abort();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_rejects_auth_register_with_oversized_turnstile_token() {
+    let (gateway_url, upstream_hits, gateway_handle, upstream_handle) =
+        start_auth_gateway_with_builder(|| {
+            AppState::new()
+                .expect("gateway should build")
+                .with_data_state_for_tests(turnstile_enabled_data_state())
+                .with_auth_email_verified_for_tests("alice@example.com")
+        })
+        .await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/api/auth/register"))
+        .json(&json!({
+            "email": "alice@example.com",
+            "username": "alice",
+            "password": "secret123",
+            "turnstile_token": "x".repeat(2049),
+        }))
+        .send()
+        .await
+        .expect("register request should succeed");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(payload["detail"], "人机验证失败，请重试");
+    assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
+
+    gateway_handle.abort();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_returns_service_unavailable_when_turnstile_keys_are_incomplete() {
+    let (gateway_url, upstream_hits, gateway_handle, upstream_handle) =
+        start_auth_gateway_with_builder(|| {
+            let data_state =
+                turnstile_enabled_data_state().with_system_config_values_for_tests(vec![
+                    ("enable_registration".to_string(), json!(true)),
+                    ("require_email_verification".to_string(), json!(true)),
+                    ("smtp_host".to_string(), json!("smtp.example.com")),
+                    ("smtp_from_email".to_string(), json!("ops@example.com")),
+                    ("turnstile_enabled".to_string(), json!(true)),
+                    ("turnstile_site_key".to_string(), json!("site-public-key")),
+                    ("turnstile_secret_key".to_string(), serde_json::Value::Null),
+                ]);
+            AppState::new()
+                .expect("gateway should build")
+                .with_data_state_for_tests(data_state)
+                .with_auth_email_verified_for_tests("alice@example.com")
+        })
+        .await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/api/auth/register"))
+        .json(&json!({
+            "email": "alice@example.com",
+            "username": "alice",
+            "password": "secret123",
+            "turnstile_token": "valid-token",
+        }))
+        .send()
+        .await
+        .expect("register request should succeed");
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(payload["detail"], "人机验证服务暂不可用，请稍后重试");
+    assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
+
+    gateway_handle.abort();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_allows_auth_register_after_successful_turnstile_verification() {
+    let (siteverify_url, turnstile_requests, turnstile_handle) = start_turnstile_siteverify_server(
+        json!({
+            "success": true,
+            "action": "register",
+            "hostname": "gateway.example.com",
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    let (gateway_url, upstream_hits, gateway_handle, upstream_handle) =
+        start_auth_gateway_with_builder({
+            let siteverify_url = siteverify_url.clone();
+            move || {
+                AppState::new()
+                    .expect("gateway should build")
+                    .with_data_state_for_tests(turnstile_enabled_data_state())
+                    .with_auth_email_verified_for_tests("alice@example.com")
+                    .with_turnstile_siteverify_url_for_tests(&siteverify_url)
+            }
+        })
+        .await;
+
+    let register_response = reqwest::Client::new()
+        .post(format!("{gateway_url}/api/auth/register"))
+        .header("cf-connecting-ip", "203.0.113.10")
+        .json(&json!({
+            "email": "alice@example.com",
+            "username": "alice",
+            "password": "secret123",
+            "turnstile_token": "valid-token",
+        }))
+        .send()
+        .await
+        .expect("register request should succeed");
+
+    assert_eq!(register_response.status(), StatusCode::OK);
+    let register_payload: serde_json::Value = register_response
+        .json()
+        .await
+        .expect("json body should parse");
+    assert_eq!(register_payload["message"], "注册成功");
+
+    let requests = turnstile_requests
+        .lock()
+        .expect("turnstile requests should lock");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].get("secret").map(String::as_str),
+        Some("secret-private-key")
+    );
+    assert_eq!(
+        requests[0].get("response").map(String::as_str),
+        Some("valid-token")
+    );
+    assert_eq!(
+        requests[0].get("remoteip").map(String::as_str),
+        Some("203.0.113.10")
+    );
+    assert!(requests[0].contains_key("idempotency_key"));
+    drop(requests);
+    assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
+
+    gateway_handle.abort();
+    upstream_handle.abort();
+    turnstile_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_rejects_auth_register_when_turnstile_action_mismatches() {
+    let (siteverify_url, _turnstile_requests, turnstile_handle) =
+        start_turnstile_siteverify_server(
+            json!({
+                "success": true,
+                "action": "send_verification_code",
+                "hostname": "gateway.example.com",
+            }),
+            StatusCode::OK,
+        )
+        .await;
+    let (gateway_url, upstream_hits, gateway_handle, upstream_handle) =
+        start_auth_gateway_with_builder({
+            let siteverify_url = siteverify_url.clone();
+            move || {
+                AppState::new()
+                    .expect("gateway should build")
+                    .with_data_state_for_tests(turnstile_enabled_data_state())
+                    .with_auth_email_verified_for_tests("alice@example.com")
+                    .with_turnstile_siteverify_url_for_tests(&siteverify_url)
+            }
+        })
+        .await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/api/auth/register"))
+        .json(&json!({
+            "email": "alice@example.com",
+            "username": "alice",
+            "password": "secret123",
+            "turnstile_token": "valid-token",
+        }))
+        .send()
+        .await
+        .expect("register request should succeed");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(payload["detail"], "人机验证失败，请重试");
+    assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
+
+    gateway_handle.abort();
+    upstream_handle.abort();
+    turnstile_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_rejects_auth_register_when_turnstile_siteverify_rejects_token() {
+    let (siteverify_url, _turnstile_requests, turnstile_handle) =
+        start_turnstile_siteverify_server(
+            json!({
+                "success": false,
+                "error-codes": ["invalid-input-response"],
+            }),
+            StatusCode::OK,
+        )
+        .await;
+    let (gateway_url, upstream_hits, gateway_handle, upstream_handle) =
+        start_auth_gateway_with_builder({
+            let siteverify_url = siteverify_url.clone();
+            move || {
+                AppState::new()
+                    .expect("gateway should build")
+                    .with_data_state_for_tests(turnstile_enabled_data_state())
+                    .with_auth_email_verified_for_tests("alice@example.com")
+                    .with_turnstile_siteverify_url_for_tests(&siteverify_url)
+            }
+        })
+        .await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/api/auth/register"))
+        .json(&json!({
+            "email": "alice@example.com",
+            "username": "alice",
+            "password": "secret123",
+            "turnstile_token": "invalid-token",
+        }))
+        .send()
+        .await
+        .expect("register request should succeed");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(payload["detail"], "人机验证失败，请重试");
+    assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
+
+    gateway_handle.abort();
+    upstream_handle.abort();
+    turnstile_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_returns_service_unavailable_when_turnstile_siteverify_reports_secret_error() {
+    let (siteverify_url, _turnstile_requests, turnstile_handle) =
+        start_turnstile_siteverify_server(
+            json!({
+                "success": false,
+                "error-codes": ["invalid-input-secret"],
+            }),
+            StatusCode::OK,
+        )
+        .await;
+    let (gateway_url, upstream_hits, gateway_handle, upstream_handle) =
+        start_auth_gateway_with_builder({
+            let siteverify_url = siteverify_url.clone();
+            move || {
+                AppState::new()
+                    .expect("gateway should build")
+                    .with_data_state_for_tests(turnstile_enabled_data_state())
+                    .with_auth_email_verified_for_tests("alice@example.com")
+                    .with_turnstile_siteverify_url_for_tests(&siteverify_url)
+            }
+        })
+        .await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/api/auth/register"))
+        .json(&json!({
+            "email": "alice@example.com",
+            "username": "alice",
+            "password": "secret123",
+            "turnstile_token": "valid-token",
+        }))
+        .send()
+        .await
+        .expect("register request should succeed");
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(payload["detail"], "人机验证服务暂不可用，请稍后重试");
+    assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
+
+    gateway_handle.abort();
+    upstream_handle.abort();
+    turnstile_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_rejects_auth_register_when_turnstile_hostname_mismatches() {
+    let (siteverify_url, _turnstile_requests, turnstile_handle) =
+        start_turnstile_siteverify_server(
+            json!({
+                "success": true,
+                "action": "register",
+                "hostname": "evil.example.com",
+            }),
+            StatusCode::OK,
+        )
+        .await;
+    let (gateway_url, upstream_hits, gateway_handle, upstream_handle) =
+        start_auth_gateway_with_builder({
+            let siteverify_url = siteverify_url.clone();
+            move || {
+                AppState::new()
+                    .expect("gateway should build")
+                    .with_data_state_for_tests(turnstile_enabled_data_state())
+                    .with_auth_email_verified_for_tests("alice@example.com")
+                    .with_turnstile_siteverify_url_for_tests(&siteverify_url)
+            }
+        })
+        .await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/api/auth/register"))
+        .json(&json!({
+            "email": "alice@example.com",
+            "username": "alice",
+            "password": "secret123",
+            "turnstile_token": "valid-token",
+        }))
+        .send()
+        .await
+        .expect("register request should succeed");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(payload["detail"], "人机验证失败，请重试");
+    assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
+
+    gateway_handle.abort();
+    upstream_handle.abort();
+    turnstile_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_returns_service_unavailable_when_turnstile_siteverify_fails() {
+    let (siteverify_url, _turnstile_requests, turnstile_handle) =
+        start_turnstile_siteverify_server(
+            json!({ "error": "unavailable" }),
+            StatusCode::BAD_GATEWAY,
+        )
+        .await;
+    let (gateway_url, upstream_hits, gateway_handle, upstream_handle) =
+        start_auth_gateway_with_builder({
+            let siteverify_url = siteverify_url.clone();
+            move || {
+                AppState::new()
+                    .expect("gateway should build")
+                    .with_data_state_for_tests(turnstile_enabled_data_state())
+                    .with_auth_email_verified_for_tests("alice@example.com")
+                    .with_turnstile_siteverify_url_for_tests(&siteverify_url)
+            }
+        })
+        .await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/api/auth/register"))
+        .json(&json!({
+            "email": "alice@example.com",
+            "username": "alice",
+            "password": "secret123",
+            "turnstile_token": "valid-token",
+        }))
+        .send()
+        .await
+        .expect("register request should succeed");
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(payload["detail"], "人机验证服务暂不可用，请稍后重试");
+    assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
+
+    gateway_handle.abort();
+    upstream_handle.abort();
+    turnstile_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_returns_service_unavailable_when_turnstile_siteverify_times_out() {
+    let (siteverify_url, _turnstile_requests, turnstile_handle) =
+        start_turnstile_siteverify_server_with_delay(
+            json!({
+                "success": true,
+                "action": "register",
+                "hostname": "gateway.example.com",
+            }),
+            StatusCode::OK,
+            Some(Duration::from_millis(250)),
+        )
+        .await;
+    let (gateway_url, upstream_hits, gateway_handle, upstream_handle) =
+        start_auth_gateway_with_builder({
+            let siteverify_url = siteverify_url.clone();
+            move || {
+                AppState::new()
+                    .expect("gateway should build")
+                    .with_data_state_for_tests(turnstile_enabled_data_state())
+                    .with_auth_email_verified_for_tests("alice@example.com")
+                    .with_turnstile_siteverify_url_for_tests(&siteverify_url)
+                    .with_turnstile_siteverify_timeout_for_tests(Duration::from_millis(20))
+            }
+        })
+        .await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/api/auth/register"))
+        .json(&json!({
+            "email": "alice@example.com",
+            "username": "alice",
+            "password": "secret123",
+            "turnstile_token": "valid-token",
+        }))
+        .send()
+        .await
+        .expect("register request should succeed");
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(payload["detail"], "人机验证服务暂不可用，请稍后重试");
+    assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
+
+    gateway_handle.abort();
+    upstream_handle.abort();
+    turnstile_handle.abort();
 }
 
 #[tokio::test]

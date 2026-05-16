@@ -88,6 +88,21 @@ END $mig$;
 
 
 --
+-- Name: billing_plans billing_plans_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+DO $mig$ BEGIN
+  ALTER TABLE ONLY public.billing_plans
+    ADD CONSTRAINT billing_plans_pkey PRIMARY KEY (id);
+EXCEPTION
+  WHEN duplicate_object THEN NULL;
+  WHEN duplicate_table THEN NULL;
+  WHEN invalid_table_definition THEN NULL;
+END $mig$;
+
+
+
+--
 -- Name: dimension_collectors dimension_collectors_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -223,12 +238,42 @@ END $mig$;
 
 
 --
+-- Name: payment_gateway_configs payment_gateway_configs_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+DO $mig$ BEGIN
+  ALTER TABLE ONLY public.payment_gateway_configs
+    ADD CONSTRAINT payment_gateway_configs_pkey PRIMARY KEY (provider);
+EXCEPTION
+  WHEN duplicate_object THEN NULL;
+  WHEN duplicate_table THEN NULL;
+  WHEN invalid_table_definition THEN NULL;
+END $mig$;
+
+
+
+--
 -- Name: payment_orders payment_orders_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 DO $mig$ BEGIN
   ALTER TABLE ONLY public.payment_orders
     ADD CONSTRAINT payment_orders_pkey PRIMARY KEY (id);
+EXCEPTION
+  WHEN duplicate_object THEN NULL;
+  WHEN duplicate_table THEN NULL;
+  WHEN invalid_table_definition THEN NULL;
+END $mig$;
+
+
+
+--
+-- Name: entitlement_usage_ledgers entitlement_usage_ledgers_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+DO $mig$ BEGIN
+  ALTER TABLE ONLY public.entitlement_usage_ledgers
+    ADD CONSTRAINT entitlement_usage_ledgers_pkey PRIMARY KEY (id);
 EXCEPTION
   WHEN duplicate_object THEN NULL;
   WHEN duplicate_table THEN NULL;
@@ -604,6 +649,21 @@ END $mig$;
 DO $mig$ BEGIN
   ALTER TABLE ONLY public.user_oauth_links
     ADD CONSTRAINT uq_oauth_provider_user UNIQUE (provider_type, provider_user_id);
+EXCEPTION
+  WHEN duplicate_object THEN NULL;
+  WHEN duplicate_table THEN NULL;
+  WHEN invalid_table_definition THEN NULL;
+END $mig$;
+
+
+
+--
+-- Name: entitlement_usage_ledgers uq_entitlement_usage_request; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+DO $mig$ BEGIN
+  ALTER TABLE ONLY public.entitlement_usage_ledgers
+    ADD CONSTRAINT uq_entitlement_usage_request UNIQUE (user_entitlement_id, request_id);
 EXCEPTION
   WHEN duplicate_object THEN NULL;
   WHEN duplicate_table THEN NULL;
@@ -1159,6 +1219,21 @@ END $mig$;
 DO $mig$ BEGIN
   ALTER TABLE ONLY public.users
     ADD CONSTRAINT users_pkey PRIMARY KEY (id);
+EXCEPTION
+  WHEN duplicate_object THEN NULL;
+  WHEN duplicate_table THEN NULL;
+  WHEN invalid_table_definition THEN NULL;
+END $mig$;
+
+
+
+--
+-- Name: user_plan_entitlements user_plan_entitlements_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+DO $mig$ BEGIN
+  ALTER TABLE ONLY public.user_plan_entitlements
+    ADD CONSTRAINT user_plan_entitlements_pkey PRIMARY KEY (id);
 EXCEPTION
   WHEN duplicate_object THEN NULL;
   WHEN duplicate_table THEN NULL;

@@ -14,6 +14,7 @@ const ADMIN_BILLING_DATA_UNAVAILABLE_DETAIL: &str = "Admin billing data unavaila
 
 mod collectors;
 mod payments;
+mod plans;
 mod presets;
 mod routes;
 mod rules;
@@ -42,6 +43,14 @@ fn build_admin_billing_data_unavailable_response() -> Response<Body> {
 fn build_admin_billing_bad_request_response(detail: impl Into<String>) -> Response<Body> {
     (
         http::StatusCode::BAD_REQUEST,
+        Json(json!({ "detail": detail.into() })),
+    )
+        .into_response()
+}
+
+fn build_admin_billing_conflict_response(detail: impl Into<String>) -> Response<Body> {
+    (
+        http::StatusCode::CONFLICT,
         Json(json!({ "detail": detail.into() })),
     )
         .into_response()
@@ -239,7 +248,24 @@ pub(crate) async fn maybe_build_local_admin_billing_response(
             ))
         || (request_context.method() == http::Method::PUT
             && path.starts_with("/api/admin/billing/collectors/")
-            && path.matches('/').count() == 5);
+            && path.matches('/').count() == 5)
+        || (matches!(
+            request_context.method(),
+            &http::Method::GET | &http::Method::POST
+        ) && matches!(
+            path,
+            "/api/admin/billing/plans" | "/api/admin/billing/plans/"
+        ))
+        || (request_context.method() == http::Method::PUT
+            && path.starts_with("/api/admin/billing/plans/")
+            && path.matches('/').count() == 5)
+        || (request_context.method() == http::Method::DELETE
+            && path.starts_with("/api/admin/billing/plans/")
+            && path.matches('/').count() == 5)
+        || (request_context.method() == http::Method::PATCH
+            && path.starts_with("/api/admin/billing/plans/")
+            && path.ends_with("/status")
+            && path.matches('/').count() == 6);
 
     if !is_billing_route {
         return Ok(None);
@@ -266,6 +292,12 @@ pub(crate) async fn maybe_build_local_admin_billing_response(
         request_body,
     )
     .await?
+    {
+        return Ok(Some(response));
+    }
+    if let Some(response) =
+        plans::maybe_build_local_admin_billing_plans_response(state, request_context, request_body)
+            .await?
     {
         return Ok(Some(response));
     }

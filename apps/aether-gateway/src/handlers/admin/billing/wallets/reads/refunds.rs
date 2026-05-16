@@ -1,6 +1,6 @@
 use super::super::shared::{
     admin_wallet_id_from_suffix_path, build_admin_wallet_not_found_response,
-    build_admin_wallet_refund_payload, build_admin_wallet_summary_payload,
+    build_admin_wallet_refund_payload, build_admin_wallet_summary_payload_with_package,
     build_admin_wallets_bad_request_response, parse_admin_wallets_limit,
     parse_admin_wallets_offset, resolve_admin_wallet_owner_summary,
     ADMIN_WALLETS_API_KEY_REFUND_DETAIL,
@@ -46,7 +46,8 @@ pub(in super::super) async fn build_admin_wallet_refunds_response(
     }
 
     let owner = resolve_admin_wallet_owner_summary(state, &wallet).await?;
-    let wallet_payload = build_admin_wallet_summary_payload(&wallet, &owner);
+    let wallet_payload =
+        build_admin_wallet_summary_payload_with_package(state, &wallet, &owner).await?;
     let (refunds, total) = state
         .list_admin_wallet_refunds(&wallet.id, limit, offset)
         .await?;

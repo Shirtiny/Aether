@@ -4,6 +4,7 @@ const ADMIN_USERS_DATA_UNAVAILABLE_DETAIL: &str = "Admin user management data un
 
 mod api_keys;
 mod batch;
+mod billing;
 mod groups;
 mod lifecycle;
 mod route_seam;
@@ -23,6 +24,10 @@ pub(crate) use self::api_keys::{
 };
 use self::batch::{
     build_admin_resolve_user_selection_response, build_admin_user_batch_action_response,
+};
+use self::billing::{
+    build_admin_grant_user_billing_plan_response,
+    build_admin_list_user_billing_entitlements_response,
 };
 use self::groups::{
     build_admin_create_user_group_response, build_admin_delete_user_group_response,

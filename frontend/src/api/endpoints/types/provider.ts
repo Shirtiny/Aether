@@ -583,7 +583,6 @@ export interface PoolAdvancedConfig {
   score_fallback_scan_limit?: number | null
   score_rules?: PoolScoreRules | null
   probing_enabled?: boolean
-  probing_interval_minutes?: number | null
   // deprecated: retained only for backward-compatible reads
   probing_target_percent?: number | null
   // deprecated: retained only for backward-compatible reads

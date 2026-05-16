@@ -8,30 +8,65 @@
     </div>
 
     <template v-else>
-      <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
+      <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
         <Card class="p-5 space-y-2">
           <div class="text-xs uppercase tracking-wider text-muted-foreground">
-            可用余额
+            总可用额度
           </div>
           <div class="text-3xl font-bold tabular-nums">
-            {{ formatCurrency(walletBalance?.balance) }}
+            {{ walletBalance?.unlimited ? '无限制' : formatCurrency(totalAvailableBalance) }}
           </div>
           <div class="text-xs text-muted-foreground">
-            充值余额: {{ formatCurrency(walletBalance?.wallet?.recharge_balance) }} · 赠款余额: {{ formatCurrency(walletBalance?.wallet?.gift_balance) }}
+            套餐额度: {{ formatCurrency(packageBalance) }} · 钱包余额: {{ formatCurrency(walletOnlyBalance) }}
+          </div>
+        </Card>
+
+        <Card class="p-5 space-y-3">
+          <div class="text-xs uppercase tracking-wider text-muted-foreground">
+            套餐今日额度
+          </div>
+          <div class="text-2xl font-bold tabular-nums">
+            <template v-if="hasActiveDailyQuota">
+              {{ formatCurrency(packageBalance) }}
+            </template>
+            <template v-else>
+              未开通
+            </template>
+          </div>
+          <div
+            v-if="hasActiveDailyQuota"
+            class="space-y-1.5"
+          >
+            <div class="h-1.5 overflow-hidden rounded-full bg-muted">
+              <div
+                class="h-full rounded-full bg-primary transition-all"
+                :style="{ width: `${dailyQuotaRemainingPercent}%` }"
+              />
+            </div>
+            <div class="text-xs text-muted-foreground">
+              已用 {{ formatCurrency(dailyQuotaUsed) }} / 每日 {{ formatCurrency(dailyQuotaTotal) }}
+            </div>
+            <div class="text-xs text-muted-foreground">
+              {{ dailyQuota?.allow_wallet_overage ? '套餐不足时继续扣钱包余额' : '套餐额度不足时会拒绝请求' }}
+            </div>
+          </div>
+          <div
+            v-else
+            class="text-xs text-muted-foreground"
+          >
+            开通每日额度套餐后会优先消耗这里的额度。
           </div>
         </Card>
 
         <Card class="p-5 space-y-2">
           <div class="text-xs uppercase tracking-wider text-muted-foreground">
-            累计充值 / 消费
+            钱包余额
           </div>
-          <div class="text-lg font-semibold tabular-nums">
-            {{ formatCurrency(walletBalance?.wallet?.total_recharged) }}
-            <span class="text-muted-foreground font-normal mx-1">/</span>
-            {{ formatCurrency(walletBalance?.wallet?.total_consumed) }}
+          <div class="text-2xl font-semibold tabular-nums">
+            {{ formatCurrency(walletOnlyBalance) }}
           </div>
           <div class="text-xs text-muted-foreground">
-            累计退款: {{ formatCurrency(walletBalance?.wallet?.total_refunded) }} · 可退款余额: {{ formatCurrency(walletBalance?.wallet?.refundable_balance) }}
+            充值余额: {{ formatCurrency(walletBalance?.wallet?.recharge_balance) }} · 赠款余额: {{ formatCurrency(walletBalance?.wallet?.gift_balance) }}
           </div>
         </Card>
 
@@ -43,6 +78,15 @@
             <Badge :variant="walletStatusBadge(walletBalance?.wallet?.status)">
               {{ walletStatusLabel(walletBalance?.wallet?.status) }}
             </Badge>
+          </div>
+          <div class="text-xs text-muted-foreground">
+            累计充值 / 消费:
+            {{ formatCurrency(walletBalance?.wallet?.total_recharged) }}
+            <span class="text-muted-foreground font-normal mx-1">/</span>
+            {{ formatCurrency(walletBalance?.wallet?.total_consumed) }}
+          </div>
+          <div class="text-xs text-muted-foreground">
+            累计退款: {{ formatCurrency(walletBalance?.wallet?.total_refunded) }} · 可退款余额: {{ formatCurrency(walletBalance?.wallet?.refundable_balance) }}
           </div>
           <div
             v-if="walletBalance?.unlimited"
@@ -132,25 +176,47 @@
 
             <div class="space-y-1.5">
               <Label>支付方式</Label>
-              <Select v-model="rechargeForm.payment_method">
+              <Select v-model="rechargeForm.payment_option_key">
                 <SelectTrigger>
-                  <SelectValue placeholder="选择支付方式" />
+                  <SelectValue
+                    :placeholder="rechargeOptionsWithKey.length ? '选择支付方式' : '暂无可用支付方式'"
+                  />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="alipay">
-                    支付宝
-                  </SelectItem>
-                  <SelectItem value="wechat">
-                    微信支付
+                  <SelectItem
+                    v-for="option in rechargeOptionsWithKey"
+                    :key="option.key"
+                    :value="option.key"
+                  >
+                    {{ option.display_name }}
+                    <span
+                      v-if="option.pay_currency && option.usd_exchange_rate"
+                      class="text-xs text-muted-foreground"
+                    >
+                      · {{ option.pay_currency }}
+                    </span>
                   </SelectItem>
                 </SelectContent>
               </Select>
             </div>
           </div>
 
+          <div
+            v-if="selectedRechargeOption?.usd_exchange_rate"
+            class="rounded-xl border border-border/60 bg-muted/20 p-3 text-xs text-muted-foreground"
+          >
+            预计支付:
+            <span class="font-medium text-foreground">
+              {{ estimatedRechargePayAmount }}
+              {{ selectedRechargeOption.pay_currency || 'CNY' }}
+            </span>
+            · 1 USD = {{ Number(selectedRechargeOption.usd_exchange_rate).toFixed(4) }}
+            {{ selectedRechargeOption.pay_currency || 'CNY' }}
+          </div>
+
           <Button
             class="w-full"
-            :disabled="submittingRecharge"
+            :disabled="submittingRecharge || rechargeOptionsWithKey.length === 0"
             @click="submitRecharge"
           >
             {{ submittingRecharge ? '创建订单中...' : '创建充值订单' }}
@@ -178,6 +244,7 @@
               :href="String(latestRecharge.payment_instructions.payment_url)"
               target="_blank"
               rel="noopener noreferrer"
+              @click.prevent="submitPaymentInstructions(latestRecharge.payment_instructions)"
             >
               打开支付链接
             </a>
@@ -619,6 +686,7 @@ import {
   type RefundRequest,
   type WalletBalanceResponse,
   type WalletRedeemResponse,
+  type WalletRechargeOption,
 } from '@/api/wallet'
 import { useToast } from '@/composables/useToast'
 import { parseApiError } from '@/utils/errorParser'
@@ -641,8 +709,7 @@ import {
 
 const { success, error: showError } = useToast()
 
-// TODO(wallet): 充值和退款前台入口尚未正式启用；联调完成后改为 true 即可恢复显示。
-const ENABLE_WALLET_ACTION_FORMS = false
+const ENABLE_WALLET_ACTION_FORMS = true
 
 const loadingInitial = ref(true)
 const loadingTransactions = ref(false)
@@ -655,6 +722,7 @@ const submittingRefund = ref(false)
 const walletBalance = ref<WalletBalanceResponse | null>(null)
 const latestRecharge = ref<{ order: PaymentOrder; payment_instructions: Record<string, unknown> } | null>(null)
 const latestRedeem = ref<WalletRedeemResponse | null>(null)
+const rechargeOptions = ref<WalletRechargeOption[]>([])
 
 const flowItems = ref<FlowItem[]>([])
 const todayUsage = ref<DailyUsageRecord | null>(null)
@@ -677,7 +745,7 @@ let todayCostPollTimer: ReturnType<typeof setInterval> | null = null
 
 const rechargeForm = reactive({
   amount_usd: 10,
-  payment_method: 'alipay',
+  payment_option_key: '',
 })
 
 const refundForm = reactive({
@@ -695,6 +763,70 @@ const refundableOrders = computed(() =>
   rechargeOrders.value.filter(o => (o.refundable_amount_usd || 0) > 0)
 )
 
+const rechargeOptionsWithKey = computed(() =>
+  rechargeOptions.value.map((option, index) => ({
+    ...option,
+    key: [
+      option.payment_provider || option.provider || option.payment_method,
+      option.payment_method,
+      option.payment_channel || '',
+      index,
+    ].join(':'),
+  }))
+)
+
+const selectedRechargeOption = computed(() => {
+  if (rechargeOptionsWithKey.value.length === 0) return null
+  return rechargeOptionsWithKey.value.find(option => option.key === rechargeForm.payment_option_key)
+    || rechargeOptionsWithKey.value[0]
+})
+
+const estimatedRechargePayAmount = computed(() => {
+  const rate = Number(selectedRechargeOption.value?.usd_exchange_rate || 0)
+  if (!Number.isFinite(rate) || rate <= 0) return '-'
+  return (Number(rechargeForm.amount_usd || 0) * rate).toFixed(2)
+})
+
+const dailyQuota = computed(() => walletBalance.value?.daily_quota ?? null)
+const hasActiveDailyQuota = computed(() => Boolean(dailyQuota.value?.has_active))
+const walletOnlyBalance = computed(() => {
+  const explicitBalance = walletBalance.value?.wallet_balance
+  if (typeof explicitBalance === 'number' && Number.isFinite(explicitBalance)) {
+    return explicitBalance
+  }
+  return Number(walletBalance.value?.balance ?? 0)
+})
+const packageBalance = computed(() => {
+  const quotaRemaining = dailyQuota.value?.remaining_usd
+  if (hasActiveDailyQuota.value && typeof quotaRemaining === 'number' && Number.isFinite(quotaRemaining)) {
+    return Math.max(0, quotaRemaining)
+  }
+  const explicitBalance = walletBalance.value?.package_balance
+  if (typeof explicitBalance === 'number' && Number.isFinite(explicitBalance)) {
+    return Math.max(0, explicitBalance)
+  }
+  return 0
+})
+const totalAvailableBalance = computed(() => {
+  const explicitBalance = walletBalance.value?.total_available_balance
+  if (typeof explicitBalance === 'number' && Number.isFinite(explicitBalance)) {
+    return explicitBalance
+  }
+  return walletOnlyBalance.value + packageBalance.value
+})
+const dailyQuotaTotal = computed(() => {
+  const value = dailyQuota.value?.total_usd
+  return typeof value === 'number' && Number.isFinite(value) ? Math.max(0, value) : 0
+})
+const dailyQuotaUsed = computed(() => {
+  const value = dailyQuota.value?.used_usd
+  return typeof value === 'number' && Number.isFinite(value) ? Math.max(0, value) : 0
+})
+const dailyQuotaRemainingPercent = computed(() => {
+  if (!hasActiveDailyQuota.value || dailyQuotaTotal.value <= 0) return 0
+  return Math.min(100, Math.max(0, (packageBalance.value / dailyQuotaTotal.value) * 100))
+})
+
 onMounted(async () => {
   document.addEventListener('visibilitychange', handleVisibilityChange)
   try {
@@ -704,6 +836,7 @@ onMounted(async () => {
       loadTodayCost(),
       loadOrders(),
       loadRefunds(),
+      loadRechargeOptions(),
     ])
     syncTodayCostPolling()
   } finally {
@@ -722,6 +855,21 @@ watch(activeTab, () => {
 
 async function loadBalance() {
   walletBalance.value = await walletApi.getBalance()
+}
+
+async function loadRechargeOptions() {
+  try {
+    const response = await walletApi.listRechargeOptions()
+    rechargeOptions.value = response.items
+    if (!rechargeForm.payment_option_key && rechargeOptionsWithKey.value.length > 0) {
+      const preferred = rechargeOptionsWithKey.value.find(option => option.payment_provider === 'epay')
+        || rechargeOptionsWithKey.value[0]
+      rechargeForm.payment_option_key = preferred.key
+    }
+  } catch (error) {
+    log.error('加载充值方式失败:', error)
+    showError(parseApiError(error, '加载充值方式失败'))
+  }
 }
 
 async function loadTransactions() {
@@ -831,22 +979,70 @@ async function submitRecharge() {
     showError('请输入有效的充值金额')
     return
   }
+  const option = selectedRechargeOption.value
+  if (!option) {
+    showError('请选择支付方式')
+    return
+  }
+  if (option.min_recharge_usd && rechargeForm.amount_usd < option.min_recharge_usd) {
+    showError(`充值金额不能低于 ${formatCurrency(option.min_recharge_usd)}`)
+    return
+  }
 
   submittingRecharge.value = true
   try {
     latestRecharge.value = await walletApi.createRechargeOrder({
       amount_usd: rechargeForm.amount_usd,
-      payment_method: rechargeForm.payment_method,
+      payment_method: option.payment_method,
+      payment_provider: option.payment_provider,
+      payment_channel: option.payment_channel,
     })
     success('充值订单创建成功')
     await Promise.all([loadOrders(), loadBalance()])
     activeTab.value = 'orders'
+    submitPaymentInstructions(latestRecharge.value.payment_instructions)
   } catch (error) {
     log.error('创建充值订单失败:', error)
     showError(parseApiError(error, '创建充值订单失败'))
   } finally {
     submittingRecharge.value = false
   }
+}
+
+function submitPaymentInstructions(instructions: Record<string, unknown> | null | undefined) {
+  if (!instructions) return
+  const paymentUrl = instructions.payment_url
+  if (typeof paymentUrl !== 'string' || !paymentUrl) return
+  const paymentParams = instructions.payment_params
+  if (paymentParams && typeof paymentParams === 'object' && !Array.isArray(paymentParams)) {
+    submitPaymentForm(paymentUrl, paymentParams as Record<string, unknown>)
+    return
+  }
+  window.open(paymentUrl, '_blank', 'noopener,noreferrer')
+}
+
+function submitPaymentForm(url: string, params: Record<string, unknown>) {
+  const form = document.createElement('form')
+  form.action = url
+  form.method = 'POST'
+  if (!isSafariBrowser()) {
+    form.target = '_blank'
+  }
+  Object.entries(params).forEach(([key, value]) => {
+    if (value === null || value === undefined) return
+    const input = document.createElement('input')
+    input.type = 'hidden'
+    input.name = key
+    input.value = String(value)
+    form.appendChild(input)
+  })
+  document.body.appendChild(form)
+  form.submit()
+  document.body.removeChild(form)
+}
+
+function isSafariBrowser(): boolean {
+  return navigator.userAgent.includes('Safari') && !navigator.userAgent.includes('Chrome')
 }
 
 async function submitRefund() {

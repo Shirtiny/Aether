@@ -1,9 +1,10 @@
 use aether_data::repository::wallet::{
     AdjustWalletBalanceInput, CompleteAdminWalletRefundInput, CreateManualWalletRechargeInput,
-    CreateWalletRechargeOrderInput, CreateWalletRechargeOrderOutcome,
-    CreateWalletRefundRequestInput, CreateWalletRefundRequestOutcome, CreditAdminPaymentOrderInput,
-    FailAdminWalletRefundInput, ProcessAdminWalletRefundInput, ProcessPaymentCallbackInput,
-    ProcessPaymentCallbackOutcome, WalletMutationOutcome,
+    CreatePlanPurchaseOrderInput, CreatePlanPurchaseOrderOutcome, CreateWalletRechargeOrderInput,
+    CreateWalletRechargeOrderOutcome, CreateWalletRefundRequestInput,
+    CreateWalletRefundRequestOutcome, CreditAdminPaymentOrderInput, FailAdminWalletRefundInput,
+    ProcessAdminWalletRefundInput, ProcessPaymentCallbackInput, ProcessPaymentCallbackOutcome,
+    WalletMutationOutcome,
 };
 
 use crate::{AppState, GatewayError};
@@ -15,6 +16,16 @@ impl AppState {
     ) -> Result<Option<CreateWalletRechargeOrderOutcome>, GatewayError> {
         self.data
             .create_wallet_recharge_order(input)
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))
+    }
+
+    pub(crate) async fn create_plan_purchase_order(
+        &self,
+        input: CreatePlanPurchaseOrderInput,
+    ) -> Result<Option<CreatePlanPurchaseOrderOutcome>, GatewayError> {
+        self.data
+            .create_plan_purchase_order(input)
             .await
             .map_err(|err| GatewayError::Internal(err.to_string()))
     }

@@ -34,7 +34,7 @@ export function buildPoolHealthToggleCards(): PoolHealthToggleCard[] {
     },
     {
       key: 'probing_enabled',
-      label: '主动探测',
+      label: '自适应热池',
       description: '自动维护热池，缺口时异步补位。',
     },
     {

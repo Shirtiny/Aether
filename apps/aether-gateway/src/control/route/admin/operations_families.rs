@@ -291,6 +291,19 @@ pub(super) fn classify_admin_operations_family_route(
     } else if method == http::Method::POST
         && matches!(
             normalized_path,
+            "/api/admin/proxy-nodes/install-sessions" | "/api/admin/proxy-nodes/install-sessions/"
+        )
+    {
+        Some(classified(
+            "admin_proxy",
+            "proxy_nodes_manage",
+            "create_proxy_node_install_session",
+            "admin:proxy_nodes",
+            false,
+        ))
+    } else if method == http::Method::POST
+        && matches!(
+            normalized_path,
             "/api/admin/proxy-nodes/upgrade" | "/api/admin/proxy-nodes/upgrade/"
         )
     {
@@ -707,6 +720,30 @@ pub(super) fn classify_admin_operations_family_route(
             "admin_proxy",
             "users_manage",
             "batch_action_users",
+            "admin:users",
+            false,
+        ))
+    } else if method == http::Method::GET
+        && normalized_path_no_trailing.starts_with("/api/admin/users/")
+        && normalized_path_no_trailing.ends_with("/billing/entitlements")
+        && normalized_path_no_trailing.matches('/').count() == 6
+    {
+        Some(classified(
+            "admin_proxy",
+            "users_manage",
+            "list_user_billing_entitlements",
+            "admin:users",
+            false,
+        ))
+    } else if method == http::Method::POST
+        && normalized_path_no_trailing.starts_with("/api/admin/users/")
+        && normalized_path_no_trailing.ends_with("/billing/grant-plan")
+        && normalized_path_no_trailing.matches('/').count() == 6
+    {
+        Some(classified(
+            "admin_proxy",
+            "users_manage",
+            "grant_user_billing_plan",
             "admin:users",
             false,
         ))

@@ -4,7 +4,9 @@ use sqlx::{sqlite::SqliteRow, Row};
 use super::{
     AdminBillingCollectorRecord, AdminBillingCollectorWriteInput, AdminBillingMutationOutcome,
     AdminBillingPresetApplyResult, AdminBillingRuleRecord, AdminBillingRuleWriteInput,
-    BillingReadRepository, StoredBillingModelContext,
+    BillingPlanRecord, BillingPlanWriteInput, BillingReadRepository, PaymentGatewayConfigRecord,
+    PaymentGatewayConfigWriteInput, StoredBillingModelContext, UserDailyQuotaAvailabilityRecord,
+    UserPlanEntitlementRecord,
 };
 use crate::driver::sqlite::{sqlite_optional_real, SqlitePool};
 use crate::error::SqlResultExt;
@@ -609,7 +611,408 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             },
         ))
     }
+
+    async fn find_payment_gateway_config(
+        &self,
+        provider: &str,
+    ) -> Result<Option<PaymentGatewayConfigRecord>, DataLayerError> {
+        let row = sqlx::query(
+            r#"
+SELECT
+  provider, enabled, endpoint_url, callback_base_url, merchant_id,
+  merchant_key_encrypted, pay_currency, usd_exchange_rate, min_recharge_usd,
+  channels_json, created_at AS created_at_unix_secs, updated_at AS updated_at_unix_secs
+FROM payment_gateway_configs
+WHERE provider = ?
+LIMIT 1
+            "#,
+        )
+        .bind(provider.trim().to_ascii_lowercase())
+        .fetch_optional(&self.pool)
+        .await
+        .map_sql_err()?;
+        row.as_ref()
+            .map(map_payment_gateway_config_sqlite)
+            .transpose()
+    }
+
+    async fn upsert_payment_gateway_config(
+        &self,
+        input: &PaymentGatewayConfigWriteInput,
+    ) -> Result<AdminBillingMutationOutcome<PaymentGatewayConfigRecord>, DataLayerError> {
+        let provider = input.provider.trim().to_ascii_lowercase();
+        let existing_secret = if input.preserve_existing_secret {
+            sqlx::query_scalar::<_, String>(
+                "SELECT merchant_key_encrypted FROM payment_gateway_configs WHERE provider = ?",
+            )
+            .bind(&provider)
+            .fetch_optional(&self.pool)
+            .await
+            .map_sql_err()?
+        } else {
+            None
+        };
+        let secret = if input.preserve_existing_secret {
+            existing_secret
+        } else {
+            input.merchant_key_encrypted.clone()
+        };
+        let now = current_unix_secs_i64();
+        sqlx::query(
+            r#"
+INSERT INTO payment_gateway_configs (
+  provider, enabled, endpoint_url, callback_base_url, merchant_id,
+  merchant_key_encrypted, pay_currency, usd_exchange_rate, min_recharge_usd,
+  channels_json, created_at, updated_at
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(provider) DO UPDATE SET
+  enabled = excluded.enabled,
+  endpoint_url = excluded.endpoint_url,
+  callback_base_url = excluded.callback_base_url,
+  merchant_id = excluded.merchant_id,
+  merchant_key_encrypted = excluded.merchant_key_encrypted,
+  pay_currency = excluded.pay_currency,
+  usd_exchange_rate = excluded.usd_exchange_rate,
+  min_recharge_usd = excluded.min_recharge_usd,
+  channels_json = excluded.channels_json,
+  updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(&provider)
+        .bind(input.enabled)
+        .bind(&input.endpoint_url)
+        .bind(input.callback_base_url.as_deref())
+        .bind(&input.merchant_id)
+        .bind(secret.as_deref())
+        .bind(&input.pay_currency)
+        .bind(input.usd_exchange_rate)
+        .bind(input.min_recharge_usd)
+        .bind(json_to_string(&input.channels_json)?)
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_sql_err()?;
+        match self.find_payment_gateway_config(&provider).await? {
+            Some(record) => Ok(AdminBillingMutationOutcome::Applied(record)),
+            None => Err(DataLayerError::UnexpectedValue(
+                "upserted payment gateway config missing".to_string(),
+            )),
+        }
+    }
+
+    async fn list_billing_plans(
+        &self,
+        include_disabled: bool,
+    ) -> Result<Option<Vec<BillingPlanRecord>>, DataLayerError> {
+        let rows = sqlx::query(
+            r#"
+SELECT
+  id, title, description, price_amount, price_currency, duration_unit,
+  duration_value, enabled, sort_order, max_active_per_user, purchase_limit_scope,
+  entitlements_json,
+  created_at AS created_at_unix_secs, updated_at AS updated_at_unix_secs
+FROM billing_plans
+WHERE (? = 1 OR enabled = 1)
+ORDER BY sort_order ASC, price_amount ASC, id ASC
+            "#,
+        )
+        .bind(include_disabled)
+        .fetch_all(&self.pool)
+        .await
+        .map_sql_err()?;
+        Ok(Some(
+            rows.iter()
+                .map(map_billing_plan_sqlite)
+                .collect::<Result<Vec<_>, _>>()?,
+        ))
+    }
+
+    async fn find_billing_plan(
+        &self,
+        plan_id: &str,
+    ) -> Result<Option<BillingPlanRecord>, DataLayerError> {
+        let row = sqlx::query(
+            r#"
+SELECT
+  id, title, description, price_amount, price_currency, duration_unit,
+  duration_value, enabled, sort_order, max_active_per_user, purchase_limit_scope,
+  entitlements_json,
+  created_at AS created_at_unix_secs, updated_at AS updated_at_unix_secs
+FROM billing_plans
+WHERE id = ?
+LIMIT 1
+            "#,
+        )
+        .bind(plan_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_sql_err()?;
+        row.as_ref().map(map_billing_plan_sqlite).transpose()
+    }
+
+    async fn create_billing_plan(
+        &self,
+        input: &BillingPlanWriteInput,
+    ) -> Result<AdminBillingMutationOutcome<BillingPlanRecord>, DataLayerError> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = current_unix_secs_i64();
+        sqlx::query(BILLING_PLAN_INSERT_SQLITE)
+            .bind(&id)
+            .bind(&input.title)
+            .bind(input.description.as_deref())
+            .bind(input.price_amount)
+            .bind(&input.price_currency)
+            .bind(&input.duration_unit)
+            .bind(input.duration_value)
+            .bind(input.enabled)
+            .bind(input.sort_order)
+            .bind(input.max_active_per_user)
+            .bind(&input.purchase_limit_scope)
+            .bind(json_to_string(&input.entitlements_json)?)
+            .bind(now)
+            .bind(now)
+            .execute(&self.pool)
+            .await
+            .map_sql_err()?;
+        match self.find_billing_plan(&id).await? {
+            Some(record) => Ok(AdminBillingMutationOutcome::Applied(record)),
+            None => Err(DataLayerError::UnexpectedValue(
+                "created billing plan missing".to_string(),
+            )),
+        }
+    }
+
+    async fn update_billing_plan(
+        &self,
+        plan_id: &str,
+        input: &BillingPlanWriteInput,
+    ) -> Result<AdminBillingMutationOutcome<BillingPlanRecord>, DataLayerError> {
+        let result = sqlx::query(BILLING_PLAN_UPDATE_SQLITE)
+            .bind(&input.title)
+            .bind(input.description.as_deref())
+            .bind(input.price_amount)
+            .bind(&input.price_currency)
+            .bind(&input.duration_unit)
+            .bind(input.duration_value)
+            .bind(input.enabled)
+            .bind(input.sort_order)
+            .bind(input.max_active_per_user)
+            .bind(&input.purchase_limit_scope)
+            .bind(json_to_string(&input.entitlements_json)?)
+            .bind(current_unix_secs_i64())
+            .bind(plan_id)
+            .execute(&self.pool)
+            .await
+            .map_sql_err()?;
+        if result.rows_affected() == 0 {
+            return Ok(AdminBillingMutationOutcome::NotFound);
+        }
+        match self.find_billing_plan(plan_id).await? {
+            Some(record) => Ok(AdminBillingMutationOutcome::Applied(record)),
+            None => Ok(AdminBillingMutationOutcome::NotFound),
+        }
+    }
+
+    async fn set_billing_plan_enabled(
+        &self,
+        plan_id: &str,
+        enabled: bool,
+    ) -> Result<AdminBillingMutationOutcome<BillingPlanRecord>, DataLayerError> {
+        let result =
+            sqlx::query("UPDATE billing_plans SET enabled = ?, updated_at = ? WHERE id = ?")
+                .bind(enabled)
+                .bind(current_unix_secs_i64())
+                .bind(plan_id)
+                .execute(&self.pool)
+                .await
+                .map_sql_err()?;
+        if result.rows_affected() == 0 {
+            return Ok(AdminBillingMutationOutcome::NotFound);
+        }
+        match self.find_billing_plan(plan_id).await? {
+            Some(record) => Ok(AdminBillingMutationOutcome::Applied(record)),
+            None => Ok(AdminBillingMutationOutcome::NotFound),
+        }
+    }
+
+    async fn delete_billing_plan(
+        &self,
+        plan_id: &str,
+    ) -> Result<AdminBillingMutationOutcome<()>, DataLayerError> {
+        let exists =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM billing_plans WHERE id = ?")
+                .bind(plan_id)
+                .fetch_one(&self.pool)
+                .await
+                .map_sql_err()?;
+        if exists == 0 {
+            return Ok(AdminBillingMutationOutcome::NotFound);
+        }
+
+        let order_count = sqlx::query_scalar::<_, i64>(
+            r#"
+SELECT COUNT(*)
+FROM payment_orders
+WHERE product_id = ?
+  AND order_kind = 'plan_purchase'
+            "#,
+        )
+        .bind(plan_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_sql_err()?;
+        let entitlement_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM user_plan_entitlements WHERE plan_id = ?",
+        )
+        .bind(plan_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_sql_err()?;
+        if order_count > 0 || entitlement_count > 0 {
+            return Ok(AdminBillingMutationOutcome::Invalid(
+                "套餐已有订单或权益，不能删除，请停用该套餐".to_string(),
+            ));
+        }
+
+        let result = sqlx::query("DELETE FROM billing_plans WHERE id = ?")
+            .bind(plan_id)
+            .execute(&self.pool)
+            .await
+            .map_sql_err()?;
+        if result.rows_affected() == 0 {
+            Ok(AdminBillingMutationOutcome::NotFound)
+        } else {
+            Ok(AdminBillingMutationOutcome::Applied(()))
+        }
+    }
+
+    async fn list_user_plan_entitlements(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<Vec<UserPlanEntitlementRecord>>, DataLayerError> {
+        let rows = sqlx::query(
+            r#"
+SELECT
+  id, user_id, plan_id, payment_order_id, status,
+  starts_at AS starts_at_unix_secs, expires_at AS expires_at_unix_secs,
+  entitlements_snapshot, created_at AS created_at_unix_secs,
+  updated_at AS updated_at_unix_secs
+FROM user_plan_entitlements
+WHERE user_id = ?
+  AND status = 'active'
+  AND expires_at > ?
+ORDER BY expires_at ASC, created_at ASC
+            "#,
+        )
+        .bind(user_id)
+        .bind(current_unix_secs_i64())
+        .fetch_all(&self.pool)
+        .await
+        .map_sql_err()?;
+        Ok(Some(
+            rows.iter()
+                .map(map_user_plan_entitlement_sqlite)
+                .collect::<Result<Vec<_>, _>>()?,
+        ))
+    }
+
+    async fn find_user_daily_quota_availability(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<UserDailyQuotaAvailabilityRecord>, DataLayerError> {
+        let now_unix_secs = current_unix_secs_i64();
+        let rows = sqlx::query(
+            r#"
+SELECT id, entitlements_snapshot
+FROM user_plan_entitlements
+WHERE user_id = ?
+  AND status = 'active'
+  AND starts_at <= ?
+  AND expires_at > ?
+ORDER BY expires_at ASC, created_at ASC, id ASC
+            "#,
+        )
+        .bind(user_id)
+        .bind(now_unix_secs)
+        .bind(now_unix_secs)
+        .fetch_all(&self.pool)
+        .await
+        .map_sql_err()?;
+        let now = chrono::Utc::now();
+        let mut grants = Vec::new();
+        for row in rows {
+            let entitlement_id: String = row.try_get("id").map_sql_err()?;
+            let entitlements = parse_json(row.try_get("entitlements_snapshot").ok().flatten())?
+                .unwrap_or_else(|| serde_json::json!([]));
+            grants.extend(daily_quota_grants_from_entitlement(
+                &entitlement_id,
+                &entitlements,
+                now,
+            )?);
+        }
+
+        let mut total_quota_usd = 0.0;
+        let mut used_usd = 0.0;
+        let mut remaining_usd = 0.0;
+        let mut allow_wallet_overage = true;
+        for grant in &grants {
+            allow_wallet_overage &= grant.allow_wallet_overage;
+            let used = sqlx::query_scalar::<_, f64>(
+                r#"
+SELECT COALESCE(SUM(amount_usd), 0)
+FROM entitlement_usage_ledgers
+WHERE user_entitlement_id = ?
+  AND usage_date = ?
+                "#,
+            )
+            .bind(&grant.entitlement_id)
+            .bind(&grant.usage_date)
+            .fetch_one(&self.pool)
+            .await
+            .map_sql_err()?;
+            total_quota_usd += grant.daily_quota_usd;
+            used_usd += used.min(grant.daily_quota_usd).max(0.0);
+            remaining_usd += (grant.daily_quota_usd - used).max(0.0);
+        }
+        let has_active_daily_quota = !grants.is_empty();
+        Ok(Some(UserDailyQuotaAvailabilityRecord {
+            has_active_daily_quota,
+            total_quota_usd,
+            used_usd,
+            remaining_usd,
+            allow_wallet_overage: has_active_daily_quota && allow_wallet_overage,
+        }))
+    }
 }
+
+const BILLING_PLAN_INSERT_SQLITE: &str = r#"
+INSERT INTO billing_plans (
+  id, title, description, price_amount, price_currency, duration_unit,
+  duration_value, enabled, sort_order, max_active_per_user, purchase_limit_scope,
+  entitlements_json,
+  created_at, updated_at
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+"#;
+
+const BILLING_PLAN_UPDATE_SQLITE: &str = r#"
+UPDATE billing_plans
+SET title = ?,
+    description = ?,
+    price_amount = ?,
+    price_currency = ?,
+    duration_unit = ?,
+    duration_value = ?,
+    enabled = ?,
+    sort_order = ?,
+    max_active_per_user = ?,
+    purchase_limit_scope = ?,
+    entitlements_json = ?,
+    updated_at = ?
+WHERE id = ?
+"#;
 
 struct RankedContext {
     rank: u8,
@@ -745,8 +1148,151 @@ fn json_to_string(value: &serde_json::Value) -> Result<String, DataLayerError> {
     })
 }
 
+#[derive(Debug)]
+struct DailyQuotaGrant {
+    entitlement_id: String,
+    daily_quota_usd: f64,
+    usage_date: String,
+    allow_wallet_overage: bool,
+}
+
+fn daily_quota_usage_date(
+    reset_timezone: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<String, DataLayerError> {
+    let timezone = reset_timezone
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Asia/Shanghai")
+        .parse::<chrono_tz::Tz>()
+        .map_err(|err| DataLayerError::InvalidInput(format!("invalid reset_timezone: {err}")))?;
+    Ok(now.with_timezone(&timezone).date_naive().to_string())
+}
+
+fn daily_quota_grants_from_entitlement(
+    entitlement_id: &str,
+    entitlements: &serde_json::Value,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<DailyQuotaGrant>, DataLayerError> {
+    let mut grants = Vec::new();
+    let Some(items) = entitlements.as_array() else {
+        return Ok(grants);
+    };
+    for item in items {
+        if item.get("type").and_then(serde_json::Value::as_str) != Some("daily_quota") {
+            continue;
+        }
+        let daily_quota_usd = item
+            .get("daily_quota_usd")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0);
+        if !daily_quota_usd.is_finite() || daily_quota_usd <= 0.0 {
+            continue;
+        }
+        grants.push(DailyQuotaGrant {
+            entitlement_id: entitlement_id.to_string(),
+            daily_quota_usd,
+            usage_date: daily_quota_usage_date(
+                item.get("reset_timezone")
+                    .and_then(serde_json::Value::as_str),
+                now,
+            )?,
+            allow_wallet_overage: item
+                .get("allow_wallet_overage")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+        });
+    }
+    Ok(grants)
+}
+
 fn read_count_sqlite(row: &SqliteRow) -> Result<u64, DataLayerError> {
     Ok(row.try_get::<i64, _>("total").map_sql_err()?.max(0) as u64)
+}
+
+fn map_payment_gateway_config_sqlite(
+    row: &SqliteRow,
+) -> Result<PaymentGatewayConfigRecord, DataLayerError> {
+    Ok(PaymentGatewayConfigRecord {
+        provider: row.try_get("provider").map_sql_err()?,
+        enabled: row.try_get("enabled").map_sql_err()?,
+        endpoint_url: row.try_get("endpoint_url").map_sql_err()?,
+        callback_base_url: row.try_get("callback_base_url").map_sql_err()?,
+        merchant_id: row.try_get("merchant_id").map_sql_err()?,
+        merchant_key_encrypted: row.try_get("merchant_key_encrypted").map_sql_err()?,
+        pay_currency: row.try_get("pay_currency").map_sql_err()?,
+        usd_exchange_rate: sqlite_optional_real(row, "usd_exchange_rate")?.unwrap_or(0.0),
+        min_recharge_usd: sqlite_optional_real(row, "min_recharge_usd")?.unwrap_or(0.0),
+        channels_json: parse_json(row.try_get("channels_json").ok().flatten())?
+            .unwrap_or_else(|| serde_json::json!([])),
+        created_at_unix_secs: row
+            .try_get::<i64, _>("created_at_unix_secs")
+            .map_sql_err()?
+            .max(0) as u64,
+        updated_at_unix_secs: row
+            .try_get::<i64, _>("updated_at_unix_secs")
+            .map_sql_err()?
+            .max(0) as u64,
+    })
+}
+
+fn map_billing_plan_sqlite(row: &SqliteRow) -> Result<BillingPlanRecord, DataLayerError> {
+    Ok(BillingPlanRecord {
+        id: row.try_get("id").map_sql_err()?,
+        title: row.try_get("title").map_sql_err()?,
+        description: row.try_get("description").map_sql_err()?,
+        price_amount: sqlite_optional_real(row, "price_amount")?.unwrap_or(0.0),
+        price_currency: row.try_get("price_currency").map_sql_err()?,
+        duration_unit: row.try_get("duration_unit").map_sql_err()?,
+        duration_value: row.try_get("duration_value").map_sql_err()?,
+        enabled: row.try_get("enabled").map_sql_err()?,
+        sort_order: row.try_get("sort_order").map_sql_err()?,
+        max_active_per_user: row.try_get("max_active_per_user").map_sql_err()?,
+        purchase_limit_scope: row
+            .try_get::<Option<String>, _>("purchase_limit_scope")
+            .map_sql_err()?
+            .unwrap_or_else(|| "active_period".to_string()),
+        entitlements_json: parse_json(row.try_get("entitlements_json").ok().flatten())?
+            .unwrap_or_else(|| serde_json::json!([])),
+        created_at_unix_secs: row
+            .try_get::<i64, _>("created_at_unix_secs")
+            .map_sql_err()?
+            .max(0) as u64,
+        updated_at_unix_secs: row
+            .try_get::<i64, _>("updated_at_unix_secs")
+            .map_sql_err()?
+            .max(0) as u64,
+    })
+}
+
+fn map_user_plan_entitlement_sqlite(
+    row: &SqliteRow,
+) -> Result<UserPlanEntitlementRecord, DataLayerError> {
+    Ok(UserPlanEntitlementRecord {
+        id: row.try_get("id").map_sql_err()?,
+        user_id: row.try_get("user_id").map_sql_err()?,
+        plan_id: row.try_get("plan_id").map_sql_err()?,
+        payment_order_id: row.try_get("payment_order_id").map_sql_err()?,
+        status: row.try_get("status").map_sql_err()?,
+        starts_at_unix_secs: row
+            .try_get::<i64, _>("starts_at_unix_secs")
+            .map_sql_err()?
+            .max(0) as u64,
+        expires_at_unix_secs: row
+            .try_get::<i64, _>("expires_at_unix_secs")
+            .map_sql_err()?
+            .max(0) as u64,
+        entitlements_snapshot: parse_json(row.try_get("entitlements_snapshot").ok().flatten())?
+            .unwrap_or_else(|| serde_json::json!([])),
+        created_at_unix_secs: row
+            .try_get::<i64, _>("created_at_unix_secs")
+            .map_sql_err()?
+            .max(0) as u64,
+        updated_at_unix_secs: row
+            .try_get::<i64, _>("updated_at_unix_secs")
+            .map_sql_err()?
+            .max(0) as u64,
+    })
 }
 
 async fn find_admin_billing_rule_sqlite(
@@ -857,7 +1403,7 @@ mod tests {
     use crate::lifecycle::migrate::run_sqlite_migrations;
     use crate::repository::billing::{
         AdminBillingCollectorWriteInput, AdminBillingMutationOutcome, AdminBillingRuleWriteInput,
-        BillingReadRepository,
+        BillingPlanWriteInput, BillingReadRepository,
     };
 
     #[tokio::test]
@@ -1008,6 +1554,96 @@ mod tests {
         };
         assert_eq!(preset.updated, 1);
         assert_eq!(preset.errors, Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn sqlite_repository_deletes_unused_billing_plans_only() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("sqlite pool should connect");
+        run_sqlite_migrations(&pool)
+            .await
+            .expect("sqlite migrations should run");
+        let repository = SqliteBillingReadRepository::new(pool.clone());
+
+        let input = BillingPlanWriteInput {
+            title: "Daily Plan".to_string(),
+            description: None,
+            price_amount: 100.0,
+            price_currency: "CNY".to_string(),
+            duration_unit: "month".to_string(),
+            duration_value: 1,
+            enabled: true,
+            sort_order: 10,
+            max_active_per_user: 1,
+            purchase_limit_scope: "active_period".to_string(),
+            entitlements_json: json!([{
+                "type": "daily_quota",
+                "daily_quota_usd": 50.0,
+                "reset_timezone": "Asia/Shanghai",
+                "allow_wallet_overage": false
+            }]),
+        };
+        let removable = match repository
+            .create_billing_plan(&input)
+            .await
+            .expect("plan create should run")
+        {
+            AdminBillingMutationOutcome::Applied(plan) => plan,
+            other => panic!("unexpected plan create outcome: {other:?}"),
+        };
+        assert_eq!(
+            repository
+                .delete_billing_plan(&removable.id)
+                .await
+                .expect("plan delete should run"),
+            AdminBillingMutationOutcome::Applied(())
+        );
+        assert!(repository
+            .find_billing_plan(&removable.id)
+            .await
+            .expect("plan lookup should run")
+            .is_none());
+
+        let referenced = match repository
+            .create_billing_plan(&input)
+            .await
+            .expect("plan create should run")
+        {
+            AdminBillingMutationOutcome::Applied(plan) => plan,
+            other => panic!("unexpected plan create outcome: {other:?}"),
+        };
+        sqlx::query(
+            r#"
+INSERT INTO payment_orders (
+  id, order_no, wallet_id, amount_usd, payment_method, order_kind,
+  product_id, fulfillment_status, status, created_at
+)
+VALUES ('order-1', 'order-no-1', 'wallet-1', 0, 'epay', 'plan_purchase',
+        ?, 'pending', 'pending', 1)
+            "#,
+        )
+        .bind(&referenced.id)
+        .execute(&pool)
+        .await
+        .expect("payment order should seed");
+        match repository
+            .delete_billing_plan(&referenced.id)
+            .await
+            .expect("plan delete should run")
+        {
+            AdminBillingMutationOutcome::Invalid(detail) => {
+                assert!(detail.contains("不能删除"));
+            }
+            other => panic!("unexpected referenced plan delete outcome: {other:?}"),
+        }
+        assert!(repository
+            .find_billing_plan(&referenced.id)
+            .await
+            .expect("plan lookup should run")
+            .is_some());
     }
 
     async fn seed_billing_context(pool: &sqlx::SqlitePool) {

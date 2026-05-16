@@ -180,6 +180,55 @@ pub(super) async fn maybe_build_local_admin_core_system_response(
         ));
     }
 
+    if decision.route_kind.as_deref() == Some("data_export")
+        && request_method == http::Method::GET
+        && request_path == "/api/admin/system/data/export"
+    {
+        return Ok(Some(attach_admin_audit_response(
+            Json(state.build_admin_system_data_export_payload().await?).into_response(),
+            "admin_system_data_exported",
+            "export_system_data",
+            "system_data_export",
+            "global",
+        )));
+    }
+
+    if decision.route_kind.as_deref() == Some("data_import")
+        && request_method == http::Method::POST
+        && request_path == "/api/admin/system/data/import"
+    {
+        let Some(request_body) = request_body else {
+            return Ok(Some(
+                (
+                    http::StatusCode::BAD_REQUEST,
+                    Json(json!({ "detail": "请求数据验证失败" })),
+                )
+                    .into_response(),
+            ));
+        };
+        return Ok(Some(
+            match state
+                .import_admin_system_data(
+                    request_body,
+                    decision
+                        .admin_principal
+                        .as_ref()
+                        .map(|principal| principal.user_id.as_str()),
+                )
+                .await?
+            {
+                Ok(payload) => attach_admin_audit_response(
+                    Json(payload).into_response(),
+                    "admin_system_data_imported",
+                    "import_system_data",
+                    "system_data_import",
+                    "global",
+                ),
+                Err((status, payload)) => (status, Json(payload)).into_response(),
+            },
+        ));
+    }
+
     if decision.route_kind.as_deref() == Some("smtp_test")
         && request_method == http::Method::POST
         && request_path == "/api/admin/system/smtp/test"

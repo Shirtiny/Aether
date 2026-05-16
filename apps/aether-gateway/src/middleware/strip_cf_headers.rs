@@ -4,9 +4,21 @@ use http::{header::HeaderName, HeaderMap};
 /// Cloudflare-specific headers that are not part of the `cf-*` prefix family.
 const CF_EXACT_HEADERS: &[&str] = &["cdn-loop", "true-client-ip"];
 
+#[derive(Clone, Debug)]
+pub(crate) struct CfConnectingIp(pub(crate) String);
+
 fn should_strip_cf_header(name: &HeaderName) -> bool {
     let normalized = name.as_str();
     normalized.starts_with("cf-") || CF_EXACT_HEADERS.contains(&normalized)
+}
+
+fn cf_connecting_ip(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("cf-connecting-ip")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.chars().take(45).collect())
 }
 
 fn strip_cf_headers(headers: &mut HeaderMap) {
@@ -25,6 +37,9 @@ pub(crate) fn apply_cf_header_stripping(router: Router) -> Router {
 }
 
 pub async fn strip_cf_headers_middleware(mut request: Request, next: Next) -> Response {
+    if let Some(client_ip) = cf_connecting_ip(request.headers()) {
+        request.extensions_mut().insert(CfConnectingIp(client_ip));
+    }
     strip_cf_headers(request.headers_mut());
 
     let mut response = next.run(request).await;
@@ -51,6 +66,7 @@ mod tests {
             any(|headers: http::HeaderMap| async move {
                 let leaked = headers.contains_key("cf-ipcity")
                     || headers.contains_key("cf-ray")
+                    || headers.contains_key("cf-connecting-ip")
                     || headers.contains_key("true-client-ip")
                     || headers.contains_key("cdn-loop");
                 let mut response =
@@ -81,6 +97,7 @@ mod tests {
                     .uri("/")
                     .header("cf-ipcity", "Shanghai")
                     .header("cf-ray", "abc123")
+                    .header("cf-connecting-ip", "203.0.113.10")
                     .header("true-client-ip", "1.1.1.1")
                     .header("cdn-loop", "cloudflare")
                     .body(Body::empty())
@@ -91,6 +108,7 @@ mod tests {
 
         assert!(response.headers().get("cf-ipcity").is_none());
         assert!(response.headers().get("cf-cache-status").is_none());
+        assert!(response.headers().get("cf-connecting-ip").is_none());
         assert!(response.headers().get("true-client-ip").is_none());
         assert!(response.headers().get("cdn-loop").is_none());
 

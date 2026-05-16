@@ -407,7 +407,6 @@ pub(crate) fn admin_provider_pool_config_from_config_value(
             overload_cooldown_seconds: 30,
             health_policy_enabled: true,
             probing_enabled: false,
-            probing_interval_minutes: 10,
             probing_target_percent: None,
             probing_target_count: None,
             probe_concurrency: 4,
@@ -475,12 +474,6 @@ pub(crate) fn admin_provider_pool_config_from_config_value(
             .get("probing_enabled")
             .and_then(Value::as_bool)
             .unwrap_or(false),
-        probing_interval_minutes: pool_advanced
-            .get("probing_interval_minutes")
-            .and_then(json_u64)
-            .filter(|value| *value > 0)
-            .map(|value| value.min(1440))
-            .unwrap_or(10),
         probing_target_percent: parse_pool_probe_target_percent(pool_advanced),
         probing_target_count: parse_pool_probe_target_count(pool_advanced),
         probe_concurrency: pool_advanced
@@ -592,7 +585,6 @@ mod tests {
                 "overload_cooldown_seconds": 45,
                 "health_policy_enabled": false,
                 "probing_enabled": true,
-                "probing_interval_minutes": 20,
                 "probing_target_percent": 25,
                 "probing_target_count": 3,
                 "probe_concurrency": 6,
@@ -634,7 +626,6 @@ mod tests {
         assert_eq!(config.overload_cooldown_seconds, 45);
         assert!(!config.health_policy_enabled);
         assert!(config.probing_enabled);
-        assert_eq!(config.probing_interval_minutes, 20);
         assert_eq!(config.probing_target_percent, Some(25.0));
         assert_eq!(config.probing_target_count, Some(3));
         assert_eq!(config.probe_concurrency, 6);
@@ -656,7 +647,7 @@ mod tests {
     }
 
     #[test]
-    fn clamps_pool_quota_probe_interval_to_python_range() {
+    fn ignores_legacy_pool_quota_probe_interval() {
         let provider = sample_provider(json!({
             "pool_advanced": {
                 "probing_enabled": true,
@@ -664,7 +655,7 @@ mod tests {
             }
         }));
         let config = admin_provider_pool_config(&provider).expect("pool config should exist");
-        assert_eq!(config.probing_interval_minutes, 1440);
+        assert!(config.probing_enabled);
 
         let provider = sample_provider(json!({
             "pool_advanced": {
@@ -673,7 +664,7 @@ mod tests {
             }
         }));
         let config = admin_provider_pool_config(&provider).expect("pool config should exist");
-        assert_eq!(config.probing_interval_minutes, 10);
+        assert!(config.probing_enabled);
     }
 
     #[test]

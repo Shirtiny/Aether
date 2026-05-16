@@ -4,6 +4,8 @@ import {
   proxyNodesApi,
   type ManualProxyNodeCreateRequest,
   type ProxyNode,
+  type ProxyNodeInstallSession,
+  type ProxyNodeInstallSessionCreateRequest,
   type ProxyNodeUpgradeRolloutStatus,
 } from '@/api/proxy-nodes'
 import { parseApiError } from '@/utils/errorParser'
@@ -68,6 +70,15 @@ export const useProxyNodesStore = defineStore('proxy-nodes', () => {
     }
   }
 
+  async function createInstallSession(data: ProxyNodeInstallSessionCreateRequest): Promise<ProxyNodeInstallSession> {
+    try {
+      return await proxyNodesApi.createInstallSession(data)
+    } catch (err: unknown) {
+      error.value = parseApiError(err, '生成代理节点安装命令失败')
+      throw err
+    }
+  }
+
   async function deleteNode(nodeId: string) {
     loading.value = true
     error.value = null
@@ -95,6 +106,7 @@ export const useProxyNodesStore = defineStore('proxy-nodes', () => {
     fetchNodes,
     ensureLoaded,
     createManualNode,
+    createInstallSession,
     deleteNode,
   }
 })

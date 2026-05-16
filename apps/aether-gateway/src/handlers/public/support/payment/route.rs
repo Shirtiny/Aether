@@ -7,7 +7,8 @@ use super::payment_shared::{
 };
 use super::{
     build_auth_error_response, build_payment_callback_storage_unavailable_response,
-    handle_payment_callback_with_wallet_repository, AppState, GatewayPublicRequestContext,
+    handle_payment_callback_with_wallet_repository, payment_epay, AppState,
+    GatewayPublicRequestContext,
 };
 
 pub(super) async fn maybe_build_local_payment_callback_route_response(
@@ -17,9 +18,19 @@ pub(super) async fn maybe_build_local_payment_callback_route_response(
     request_body: Option<&axum::body::Bytes>,
 ) -> Option<Response<Body>> {
     let decision = request_context.control_decision.as_ref()?;
-    if decision.route_family.as_deref() != Some("payment_callback")
-        || decision.route_kind.as_deref() != Some("callback")
-    {
+    if decision.route_family.as_deref() != Some("payment_callback") {
+        return None;
+    }
+
+    if decision.route_kind.as_deref() == Some("epay_notify") {
+        return Some(payment_epay::handle_epay_notify(state, request_context, request_body).await);
+    }
+
+    if decision.route_kind.as_deref() == Some("epay_return") {
+        return Some(payment_epay::handle_epay_return(state, request_context, request_body).await);
+    }
+
+    if decision.route_kind.as_deref() != Some("callback") {
         return None;
     }
 

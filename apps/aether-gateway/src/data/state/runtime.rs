@@ -5,31 +5,34 @@ use super::{
     AdminBillingRuleWriteInput, AdminPaymentOrderListQuery, AdminRedeemCodeBatchListQuery,
     AdminRedeemCodeListQuery, AdminWalletLedgerQuery, AdminWalletListQuery,
     AdminWalletRefundRequestListQuery, AnnouncementListQuery, AuditLogListQuery,
-    BackgroundTaskListQuery, BackgroundTaskSummary, CompleteAdminWalletRefundInput,
-    CreateAdminRedeemCodeBatchInput, CreateAdminRedeemCodeBatchResult, CreateAnnouncementRecord,
-    CreateManualWalletRechargeInput, CreateWalletRechargeOrderInput,
+    BackgroundTaskListQuery, BackgroundTaskSummary, BillingPlanRecord, BillingPlanWriteInput,
+    CompleteAdminWalletRefundInput, CreateAdminRedeemCodeBatchInput,
+    CreateAdminRedeemCodeBatchResult, CreateAnnouncementRecord, CreateManualWalletRechargeInput,
+    CreatePlanPurchaseOrderInput, CreatePlanPurchaseOrderOutcome, CreateWalletRechargeOrderInput,
     CreateWalletRechargeOrderOutcome, CreateWalletRefundRequestInput,
     CreateWalletRefundRequestOutcome, CreditAdminPaymentOrderInput, DataLayerError,
     DatabaseMaintenanceSummary, DecisionTrace, DeleteAdminRedeemCodeBatchInput,
     DisableAdminRedeemCodeBatchInput, DisableAdminRedeemCodeInput, FailAdminWalletRefundInput,
     GatewayDataState, GatewayProviderTransportSnapshot, LocalVideoTaskReadResponse,
-    ProcessAdminWalletRefundInput, ProcessPaymentCallbackInput, ProcessPaymentCallbackOutcome,
-    RedeemWalletCodeInput, RedeemWalletCodeOutcome, RequestAuditBundle, RequestCandidateTrace,
-    StoredAdminAuditLogPage, StoredAdminPaymentCallbackPage, StoredAdminPaymentOrder,
-    StoredAdminPaymentOrderPage, StoredAdminRedeemCodeBatch, StoredAdminRedeemCodeBatchPage,
-    StoredAdminRedeemCodePage, StoredAdminWalletLedgerPage, StoredAdminWalletListPage,
-    StoredAdminWalletRefund, StoredAdminWalletRefundPage, StoredAdminWalletRefundRequestPage,
-    StoredAdminWalletTransaction, StoredAdminWalletTransactionPage, StoredAnnouncement,
-    StoredAnnouncementPage, StoredBackgroundTaskEvent, StoredBackgroundTaskRun,
-    StoredBackgroundTaskRunPage, StoredBillingModelContext, StoredProviderQuotaSnapshot,
-    StoredProviderUsageSummary, StoredRequestUsageAudit, StoredSuspiciousActivity,
-    StoredUsageSettlement, StoredUserAuditLogPage, StoredUserAuthRecord, StoredUserExportRow,
-    StoredUserSummary, StoredVideoTask, StoredWalletDailyUsageLedger,
-    StoredWalletDailyUsageLedgerPage, StoredWalletSnapshot, UpdateAnnouncementRecord,
-    UpsertBackgroundTaskEvent, UpsertBackgroundTaskRun, UpsertUsageRecord, UpsertVideoTask,
-    UsageSettlementInput, VideoTaskLookupKey, VideoTaskModelCount, VideoTaskQueryFilter,
-    VideoTaskStatusCount, WalletDailyUsageAggregationInput, WalletDailyUsageAggregationResult,
-    WalletLookupKey, WalletMutationOutcome,
+    PaymentGatewayConfigRecord, PaymentGatewayConfigWriteInput, ProcessAdminWalletRefundInput,
+    ProcessPaymentCallbackInput, ProcessPaymentCallbackOutcome, RedeemWalletCodeInput,
+    RedeemWalletCodeOutcome, RequestAuditBundle, RequestCandidateTrace, StoredAdminAuditLogPage,
+    StoredAdminPaymentCallbackPage, StoredAdminPaymentOrder, StoredAdminPaymentOrderPage,
+    StoredAdminRedeemCodeBatch, StoredAdminRedeemCodeBatchPage, StoredAdminRedeemCodePage,
+    StoredAdminWalletLedgerPage, StoredAdminWalletListPage, StoredAdminWalletRefund,
+    StoredAdminWalletRefundPage, StoredAdminWalletRefundRequestPage, StoredAdminWalletTransaction,
+    StoredAdminWalletTransactionPage, StoredAnnouncement, StoredAnnouncementPage,
+    StoredBackgroundTaskEvent, StoredBackgroundTaskRun, StoredBackgroundTaskRunPage,
+    StoredBillingModelContext, StoredProviderQuotaSnapshot, StoredProviderUsageSummary,
+    StoredRequestUsageAudit, StoredSuspiciousActivity, StoredUsageSettlement,
+    StoredUserAuditLogPage, StoredUserAuthRecord, StoredUserExportRow, StoredUserSummary,
+    StoredVideoTask, StoredWalletDailyUsageLedger, StoredWalletDailyUsageLedgerPage,
+    StoredWalletSnapshot, UpdateAnnouncementRecord, UpsertBackgroundTaskEvent,
+    UpsertBackgroundTaskRun, UpsertUsageRecord, UpsertVideoTask, UsageSettlementInput,
+    UserDailyQuotaAvailabilityRecord, UserPlanEntitlementRecord, VideoTaskLookupKey,
+    VideoTaskModelCount, VideoTaskQueryFilter, VideoTaskStatusCount,
+    WalletDailyUsageAggregationInput, WalletDailyUsageAggregationResult, WalletLookupKey,
+    WalletMutationOutcome,
 };
 use aether_data_contracts::repository::usage::{
     PendingUsageCleanupSummary, ProviderApiKeyWindowUsageRequest,
@@ -671,6 +674,16 @@ impl GatewayDataState {
                 .create_wallet_recharge_order(input)
                 .await
                 .map(Some),
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) async fn create_plan_purchase_order(
+        &self,
+        input: CreatePlanPurchaseOrderInput,
+    ) -> Result<Option<CreatePlanPurchaseOrderOutcome>, DataLayerError> {
+        match &self.wallet_writer {
+            Some(repository) => repository.create_plan_purchase_order(input).await.map(Some),
             None => Ok(None),
         }
     }
@@ -1688,6 +1701,108 @@ impl GatewayDataState {
                     .await
             }
             None => Ok(AdminBillingMutationOutcome::Unavailable),
+        }
+    }
+
+    pub(crate) async fn find_payment_gateway_config(
+        &self,
+        provider: &str,
+    ) -> Result<Option<PaymentGatewayConfigRecord>, DataLayerError> {
+        match &self.billing_reader {
+            Some(repository) => repository.find_payment_gateway_config(provider).await,
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) async fn upsert_payment_gateway_config(
+        &self,
+        input: &PaymentGatewayConfigWriteInput,
+    ) -> Result<AdminBillingMutationOutcome<PaymentGatewayConfigRecord>, DataLayerError> {
+        match &self.billing_reader {
+            Some(repository) => repository.upsert_payment_gateway_config(input).await,
+            None => Ok(AdminBillingMutationOutcome::Unavailable),
+        }
+    }
+
+    pub(crate) async fn list_billing_plans(
+        &self,
+        include_disabled: bool,
+    ) -> Result<Option<Vec<BillingPlanRecord>>, DataLayerError> {
+        match &self.billing_reader {
+            Some(repository) => repository.list_billing_plans(include_disabled).await,
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) async fn find_billing_plan(
+        &self,
+        plan_id: &str,
+    ) -> Result<Option<BillingPlanRecord>, DataLayerError> {
+        match &self.billing_reader {
+            Some(repository) => repository.find_billing_plan(plan_id).await,
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) async fn create_billing_plan(
+        &self,
+        input: &BillingPlanWriteInput,
+    ) -> Result<AdminBillingMutationOutcome<BillingPlanRecord>, DataLayerError> {
+        match &self.billing_reader {
+            Some(repository) => repository.create_billing_plan(input).await,
+            None => Ok(AdminBillingMutationOutcome::Unavailable),
+        }
+    }
+
+    pub(crate) async fn update_billing_plan(
+        &self,
+        plan_id: &str,
+        input: &BillingPlanWriteInput,
+    ) -> Result<AdminBillingMutationOutcome<BillingPlanRecord>, DataLayerError> {
+        match &self.billing_reader {
+            Some(repository) => repository.update_billing_plan(plan_id, input).await,
+            None => Ok(AdminBillingMutationOutcome::Unavailable),
+        }
+    }
+
+    pub(crate) async fn set_billing_plan_enabled(
+        &self,
+        plan_id: &str,
+        enabled: bool,
+    ) -> Result<AdminBillingMutationOutcome<BillingPlanRecord>, DataLayerError> {
+        match &self.billing_reader {
+            Some(repository) => repository.set_billing_plan_enabled(plan_id, enabled).await,
+            None => Ok(AdminBillingMutationOutcome::Unavailable),
+        }
+    }
+
+    pub(crate) async fn delete_billing_plan(
+        &self,
+        plan_id: &str,
+    ) -> Result<AdminBillingMutationOutcome<()>, DataLayerError> {
+        match &self.billing_reader {
+            Some(repository) => repository.delete_billing_plan(plan_id).await,
+            None => Ok(AdminBillingMutationOutcome::Unavailable),
+        }
+    }
+
+    pub(crate) async fn list_user_plan_entitlements(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<Vec<UserPlanEntitlementRecord>>, DataLayerError> {
+        match &self.billing_reader {
+            Some(repository) => repository.list_user_plan_entitlements(user_id).await,
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) async fn find_user_daily_quota_availability(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<UserDailyQuotaAvailabilityRecord>, DataLayerError> {
+        match &self.billing_reader {
+            Some(repository) => repository.find_user_daily_quota_availability(user_id).await,
+            None => Ok(None),
         }
     }
 

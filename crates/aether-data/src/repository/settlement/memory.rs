@@ -3,7 +3,10 @@ use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 
-use super::{SettlementWriteRepository, StoredUsageSettlement, UsageSettlementInput};
+use super::{
+    plan_finite_wallet_debit, SettlementWriteRepository, StoredUsageSettlement,
+    UsageSettlementInput, SETTLEMENT_EPSILON_USD,
+};
 use crate::repository::wallet::{InMemoryWalletRepository, StoredWalletSnapshot};
 use crate::DataLayerError;
 
@@ -99,10 +102,10 @@ impl SettlementWriteRepository for InMemorySettlementRepository {
             })));
         }
 
-        let final_billing_status = if input.status == "completed" {
-            "settled"
+        let mut final_billing_status = if input.status == "completed" {
+            "settled".to_string()
         } else {
-            "void"
+            "void".to_string()
         };
         let mut settlement = self.wallets.with_mut(|wallets| {
             let wallet_id = input
@@ -156,17 +159,31 @@ impl SettlementWriteRepository for InMemorySettlementRepository {
                     if wallet.limit_mode.eq_ignore_ascii_case("unlimited") {
                         wallet.total_consumed += input.total_cost_usd;
                     } else {
-                        let gift_deduction = before_gift.max(0.0).min(input.total_cost_usd);
-                        let recharge_deduction = input.total_cost_usd - gift_deduction;
-                        wallet.gift_balance = before_gift - gift_deduction;
-                        wallet.balance = before_recharge - recharge_deduction;
-                        wallet.total_consumed += input.total_cost_usd;
+                        let debit_plan = plan_finite_wallet_debit(
+                            before_recharge,
+                            before_gift,
+                            input.total_cost_usd,
+                        );
+                        if debit_plan.covered_usd() + SETTLEMENT_EPSILON_USD < input.total_cost_usd
+                        {
+                            final_billing_status = "insufficient_quota".to_string();
+                            settlement.billing_status = final_billing_status.clone();
+                        } else {
+                            wallet.balance = before_recharge - debit_plan.recharge_deduction;
+                            wallet.gift_balance = before_gift - debit_plan.gift_deduction;
+                            wallet.total_consumed += input.total_cost_usd;
+                        }
                     }
                 }
 
                 settlement.wallet_recharge_balance_after = Some(wallet.balance);
                 settlement.wallet_gift_balance_after = Some(wallet.gift_balance);
                 settlement.wallet_balance_after = Some(wallet.balance + wallet.gift_balance);
+            } else if final_billing_status == "settled"
+                && input.total_cost_usd > SETTLEMENT_EPSILON_USD
+            {
+                final_billing_status = "insufficient_quota".to_string();
+                settlement.billing_status = final_billing_status.clone();
             }
 
             settlement
@@ -312,9 +329,38 @@ mod tests {
             .expect("settlement should succeed")
             .expect("settlement should exist");
 
+        assert_eq!(settlement.billing_status, "insufficient_quota");
         assert_eq!(settlement.wallet_id, None);
         assert_eq!(settlement.wallet_balance_before, None);
         assert_eq!(settlement.wallet_balance_after, None);
+    }
+
+    #[tokio::test]
+    async fn finite_wallet_insufficient_balance_does_not_overdraw() {
+        let repository = InMemorySettlementRepository::seed(vec![sample_wallet()]);
+        let settlement = repository
+            .settle_usage(UsageSettlementInput {
+                request_id: "req-insufficient-wallet".to_string(),
+                user_id: Some("user-1".to_string()),
+                api_key_id: Some("key-1".to_string()),
+                api_key_is_standalone: false,
+                provider_id: Some("provider-1".to_string()),
+                status: "completed".to_string(),
+                billing_status: "pending".to_string(),
+                total_cost_usd: 15.0,
+                actual_total_cost_usd: 7.5,
+                finalized_at_unix_secs: Some(200),
+            })
+            .await
+            .expect("settlement should succeed")
+            .expect("settlement should exist");
+
+        assert_eq!(settlement.billing_status, "insufficient_quota");
+        assert_eq!(settlement.wallet_balance_before, Some(12.0));
+        assert_eq!(settlement.wallet_balance_after, Some(12.0));
+        assert_eq!(settlement.wallet_recharge_balance_after, Some(10.0));
+        assert_eq!(settlement.wallet_gift_balance_after, Some(2.0));
+        assert_eq!(settlement.provider_monthly_used_usd, None);
     }
 
     #[tokio::test]

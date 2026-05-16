@@ -21,6 +21,16 @@ impl AppState {
         self
     }
 
+    pub(crate) fn with_turnstile_siteverify_url_for_tests(mut self, url: &str) -> Self {
+        self.turnstile_siteverify_url_override = Some(url.trim().to_string());
+        self
+    }
+
+    pub(crate) fn with_turnstile_siteverify_timeout_for_tests(mut self, timeout: Duration) -> Self {
+        self.turnstile_siteverify_timeout_override = Some(timeout);
+        self
+    }
+
     pub(crate) fn with_tunnel_identity_for_tests(
         mut self,
         instance_id: &str,

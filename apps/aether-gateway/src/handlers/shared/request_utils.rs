@@ -249,6 +249,7 @@ pub(crate) fn admin_proxy_local_requires_buffered_body(
                 | (Some("provider_oauth_manage"), http::Method::POST, Some("device_poll"))
                 | (Some("system_manage"), http::Method::POST, Some("config_import"))
                 | (Some("system_manage"), http::Method::POST, Some("users_import"))
+                | (Some("system_manage"), http::Method::POST, Some("data_import"))
                 | (Some("system_manage"), http::Method::PUT, Some("settings_set"))
                 | (Some("system_manage"), http::Method::PUT, Some("config_set"))
                 | (Some("system_manage"), http::Method::PUT, Some("email_template_set"))
@@ -304,6 +305,10 @@ pub(crate) fn admin_proxy_local_requires_buffered_body(
                 | (Some("billing_manage"), http::Method::PUT, Some("update_rule"))
                 | (Some("billing_manage"), http::Method::POST, Some("create_collector"))
                 | (Some("billing_manage"), http::Method::PUT, Some("update_collector"))
+                | (Some("billing_manage"), http::Method::POST, Some("create_plan"))
+                | (Some("billing_manage"), http::Method::PUT, Some("update_plan"))
+                | (Some("billing_manage"), http::Method::PATCH, Some("set_plan_status"))
+                | (Some("payments_manage"), http::Method::PUT, Some("update_epay_gateway"))
                 | (Some("payments_manage"), http::Method::POST, Some("credit_order"))
                 | (Some("payments_manage"), http::Method::POST, Some("create_redeem_code_batch"))
                 | (Some("payments_manage"), http::Method::POST, Some("delete_redeem_code_batch"))
@@ -316,6 +321,11 @@ pub(crate) fn admin_proxy_local_requires_buffered_body(
                 | (Some("api_keys_manage"), http::Method::PATCH, Some("toggle_api_key"))
                 | (Some("adaptive_manage"), http::Method::PATCH, Some("toggle_mode"))
                 | (Some("proxy_nodes_manage"), http::Method::POST, Some("create_manual_node"))
+                | (
+                    Some("proxy_nodes_manage"),
+                    http::Method::POST,
+                    Some("create_proxy_node_install_session"),
+                )
                 | (Some("proxy_nodes_manage"), http::Method::POST, Some("register_node"))
                 | (Some("proxy_nodes_manage"), http::Method::POST, Some("heartbeat_node"))
                 | (Some("proxy_nodes_manage"), http::Method::POST, Some("unregister_node"))
@@ -328,6 +338,7 @@ pub(crate) fn admin_proxy_local_requires_buffered_body(
                 | (Some("users_manage"), http::Method::POST, Some("create_user"))
                 | (Some("users_manage"), http::Method::POST, Some("resolve_user_selection"))
                 | (Some("users_manage"), http::Method::POST, Some("batch_action_users"))
+                | (Some("users_manage"), http::Method::POST, Some("grant_user_billing_plan"))
                 | (Some("users_manage"), http::Method::PUT, Some("update_user"))
                 | (Some("users_manage"), http::Method::POST, Some("create_user_group"))
                 | (Some("users_manage"), http::Method::PUT, Some("update_user_group"))
@@ -463,11 +474,12 @@ pub(crate) fn public_support_local_requires_buffered_body(
                     Some("wallet"),
                     http::Method::POST,
                     Some("create_refund" | "create_recharge_order" | "redeem"),
-                ) | (
-                    Some("payment_callback"),
-                    http::Method::POST,
-                    Some("callback"),
-                )
+                ) | (Some("billing"), http::Method::POST, Some("plan_checkout"),)
+                    | (
+                        Some("payment_callback"),
+                        http::Method::POST,
+                        Some("callback" | "epay_notify" | "epay_return"),
+                    )
             )
         })
 }

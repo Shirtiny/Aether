@@ -7,6 +7,8 @@ use crate::control::GatewayLocalAuthRejection;
 use crate::data::auth::GatewayAuthApiKeySnapshot;
 use crate::{AppState, GatewayError};
 
+const DAILY_QUOTA_EPSILON_USD: f64 = 0.000_000_01;
+
 pub(crate) async fn resolve_wallet_auth_gate(
     state: &AppState,
     auth_snapshot: &GatewayAuthApiKeySnapshot,
@@ -27,11 +29,29 @@ pub(crate) async fn resolve_wallet_auth_gate(
         auth_snapshot.api_key_is_standalone,
     );
 
-    Ok(Some(match wallet.as_ref() {
+    let decision = match wallet.as_ref() {
         Some(wallet) => map_wallet_snapshot(wallet).access_decision(is_admin),
         None if is_admin => WalletAccessDecision::allowed(None),
         None => WalletAccessDecision::wallet_unavailable(None),
-    }))
+    };
+    if !auth_snapshot.api_key_is_standalone {
+        if let Some(quota) = state
+            .find_user_daily_quota_availability(&auth_snapshot.user_id)
+            .await?
+            .filter(|quota| quota.has_active_daily_quota)
+        {
+            let has_remaining_quota = quota.remaining_usd > DAILY_QUOTA_EPSILON_USD;
+            if decision.failure == Some(WalletAccessFailure::BalanceDenied) && has_remaining_quota {
+                return Ok(Some(WalletAccessDecision::allowed(Some(
+                    quota.remaining_usd,
+                ))));
+            }
+            if decision.failure.is_none() && !quota.allow_wallet_overage && !has_remaining_quota {
+                return Ok(Some(WalletAccessDecision::balance_denied(Some(0.0))));
+            }
+        }
+    }
+    Ok(Some(decision))
 }
 
 pub(crate) fn local_rejection_from_wallet_access(

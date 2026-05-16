@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::time::Duration;
 
 use aether_runtime::ConcurrencyGate;
 use aether_runtime_state::{RuntimeSemaphore, RuntimeState};
@@ -75,6 +76,10 @@ pub struct AppState {
         Arc<StdMutex<HashMap<String, LocalExecutionRuntimeMissDiagnostic>>>,
     pub(crate) admin_monitoring_error_stats_reset_at: Arc<StdMutex<Option<u64>>>,
     pub(crate) provider_delete_tasks: Arc<StdMutex<HashMap<String, LocalProviderDeleteTaskState>>>,
+    #[cfg(test)]
+    pub(crate) turnstile_siteverify_url_override: Option<String>,
+    #[cfg(test)]
+    pub(crate) turnstile_siteverify_timeout_override: Option<Duration>,
     #[cfg(test)]
     pub(crate) provider_oauth_state_store: Option<Arc<StdMutex<HashMap<String, String>>>>,
     #[cfg(test)]

@@ -8,6 +8,9 @@ mod modules;
 mod proxy_nodes;
 mod templates;
 
+const ADMIN_SYSTEM_DATA_EXPORT_VERSION: &str = "1.0";
+const ADMIN_SYSTEM_DATA_IMPORT_MAX_SIZE_BYTES: usize = 20 * 1024 * 1024;
+
 impl<'a> AdminAppState<'a> {
     pub(crate) async fn upsert_system_config_json_value(
         &self,

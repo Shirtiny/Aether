@@ -337,7 +337,7 @@
                   />
                 </template>
               </SortableTableHead>
-              <TableHead class="w-[220px] h-12 font-semibold text-center">
+              <TableHead class="w-[260px] h-12 font-semibold text-center">
                 操作
               </TableHead>
             </TableRow>
@@ -402,7 +402,7 @@
               <TableCell class="py-4">
                 <div class="space-y-1.5">
                   <div class="flex items-center gap-1 text-[11px] text-muted-foreground">
-                    <span>余额：</span>
+                    <span>总可用：</span>
                     <Badge
                       v-if="isUserUnlimited(user)"
                       variant="secondary"
@@ -417,6 +417,13 @@
                     >
                       {{ formatCurrencyValue(getUserWalletTotalBalance(user), '-') }}
                     </span>
+                  </div>
+                  <div
+                    v-if="!isUserUnlimited(user) && getUserWallet(user.id)"
+                    class="text-[11px] text-muted-foreground"
+                  >
+                    套餐 {{ formatCurrencyValue(getUserPackageBalance(user), '$0.00') }}
+                    · 钱包 {{ formatCurrencyValue(getUserWalletBalance(user), '$0.00') }}
                   </div>
                   <div class="flex items-center gap-2 text-[11px] text-muted-foreground flex-wrap">
                     <span>
@@ -498,6 +505,15 @@
                   </Button>
                   <Button
                     v-if="authStore.canOperateAdmin"
+                    variant="ghost"
+                    size="icon"
+                    class="h-8 w-8"
+                    title="套餐"
+                    @click="manageUserPlans(user)"
+                  >
+                    <PackageCheck class="h-4 w-4" />
+                  </Button>
+                  <Button
                     variant="ghost"
                     size="icon"
                     class="h-8 w-8"
@@ -651,7 +667,7 @@
                 <div class="flex items-start justify-between gap-3">
                   <div class="space-y-1">
                     <p class="text-[11px] text-muted-foreground">
-                      余额：
+                      总可用：
                     </p>
                     <Badge
                       v-if="isUserUnlimited(user)"
@@ -666,6 +682,13 @@
                       :class="isNegativeWalletValue(getUserWalletTotalBalance(user)) ? 'text-rose-600' : 'text-foreground'"
                     >
                       {{ formatCurrencyValue(getUserWalletTotalBalance(user), '-') }}
+                    </p>
+                    <p
+                      v-if="!isUserUnlimited(user) && getUserWallet(user.id)"
+                      class="text-[11px] text-muted-foreground"
+                    >
+                      套餐 {{ formatCurrencyValue(getUserPackageBalance(user), '$0.00') }}
+                      · 钱包 {{ formatCurrencyValue(getUserWalletBalance(user), '$0.00') }}
                     </p>
                   </div>
                   <div class="text-right">
@@ -728,6 +751,15 @@
                 </Button>
                 <Button
                   v-if="authStore.canOperateAdmin"
+                  variant="outline"
+                  size="sm"
+                  class="h-8 text-xs"
+                  @click="manageUserPlans(user)"
+                >
+                  <PackageCheck class="mr-1.5 h-3.5 w-3.5" />
+                  套餐
+                </Button>
+                <Button
                   variant="outline"
                   size="sm"
                   class="h-8 text-xs"
@@ -815,6 +847,172 @@
       @close="showUserGroupsDialog = false"
       @changed="handleUserGroupsChanged"
     />
+
+    <Dialog
+      v-model="showUserPlansDialog"
+      size="xl"
+    >
+      <template #header>
+        <div class="border-b border-border px-6 py-4">
+          <div class="flex items-center gap-3">
+            <div class="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-lg bg-kraft/10">
+              <PackageCheck class="h-5 w-5 text-kraft" />
+            </div>
+            <div class="min-w-0 flex-1">
+              <h3 class="text-lg font-semibold leading-tight text-foreground">
+                用户套餐
+              </h3>
+              <p class="text-xs text-muted-foreground">
+                {{ selectedUser?.username || '-' }} · 查看当前套餐并手动发放
+              </p>
+            </div>
+          </div>
+        </div>
+      </template>
+
+      <div class="max-h-[64vh] space-y-4 overflow-y-auto">
+        <div class="rounded-lg border border-amber-500/20 bg-amber-500/10 px-3 py-2.5 text-xs text-amber-100/90">
+          后台发放会立即生效；如果新套餐包含每日额度或会员权益，用户已有的同类旧套餐会自动失效。
+        </div>
+
+        <section class="space-y-2.5">
+          <div class="flex items-center justify-between gap-3">
+            <h4 class="text-sm font-semibold text-foreground">
+              当前有效套餐
+            </h4>
+            <Button
+              variant="ghost"
+              size="sm"
+              class="h-7 px-2 text-[11px]"
+              :disabled="loadingUserPlans || !selectedUser"
+              @click="selectedUser && loadUserPlanEntitlements(selectedUser.id)"
+            >
+              {{ loadingUserPlans ? '加载中...' : '刷新' }}
+            </Button>
+          </div>
+
+          <div
+            v-if="loadingUserPlans"
+            class="rounded-lg border border-dashed border-border/60 bg-muted/20 px-4 py-8 text-center text-sm text-muted-foreground"
+          >
+            正在加载用户套餐...
+          </div>
+          <div
+            v-else-if="userPlanEntitlements.length === 0"
+            class="rounded-lg border border-dashed border-border/60 bg-muted/20 px-4 py-8 text-center text-sm text-muted-foreground"
+          >
+            当前没有有效套餐
+          </div>
+          <div
+            v-else
+            class="space-y-2.5"
+          >
+            <div
+              v-for="item in userPlanEntitlements"
+              :key="item.id"
+              class="rounded-lg border border-border bg-card/80 p-3"
+            >
+              <div class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                <div class="min-w-0 flex-1">
+                  <div class="flex flex-wrap items-center gap-2">
+                    <span class="font-medium text-foreground">
+                      {{ item.plan_title || item.plan?.title || item.plan_id }}
+                    </span>
+                    <Badge
+                      :variant="item.active ? 'success' : 'secondary'"
+                      class="h-5 px-1.5 py-0 text-[10px]"
+                    >
+                      {{ item.active ? '生效中' : item.status }}
+                    </Badge>
+                  </div>
+                  <div class="mt-2 flex flex-wrap gap-1.5">
+                    <Badge
+                      v-for="label in entitlementLabels(item.entitlements)"
+                      :key="label"
+                      variant="outline"
+                      class="h-5 px-1.5 py-0 text-[10px]"
+                    >
+                      {{ label }}
+                    </Badge>
+                  </div>
+                </div>
+                <div class="text-left text-[11px] text-muted-foreground sm:text-right">
+                  <div>开始：{{ formatDateTime(item.starts_at) }}</div>
+                  <div>到期：{{ formatDateTime(item.expires_at) }}</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="space-y-3 rounded-lg border border-border bg-card/70 p-4">
+          <div class="space-y-1">
+            <h4 class="text-sm font-semibold text-foreground">
+              发放套餐
+            </h4>
+            <p class="text-xs text-muted-foreground">
+              仅发放套餐权益，不产生用户付款；同类旧套餐会按现有规则自动替换。
+            </p>
+          </div>
+
+          <Select v-model="selectedGrantPlanId">
+            <SelectTrigger
+              class="h-9 rounded-md bg-muted/50 px-3"
+              :disabled="loadingBillingPlans || grantableBillingPlans.length === 0"
+            >
+              <SelectValue :placeholder="loadingBillingPlans ? '加载套餐中...' : '选择要发放的套餐'" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem
+                v-for="plan in grantableBillingPlans"
+                :key="plan.id"
+                :value="plan.id"
+              >
+                <div class="flex min-w-0 items-center gap-2">
+                  <span class="truncate">{{ plan.title }}</span>
+                  <span class="shrink-0 text-xs text-muted-foreground">
+                    {{ formatPlanPrice(plan) }} · {{ formatPlanDuration(plan) }}
+                  </span>
+                  <span
+                    v-if="!plan.enabled"
+                    class="shrink-0 text-[10px] text-amber-400"
+                  >
+                    已下架
+                  </span>
+                </div>
+              </SelectItem>
+            </SelectContent>
+          </Select>
+
+          <Textarea
+            v-model="grantReason"
+            class="min-h-[60px] resize-y rounded-md bg-muted/50 text-sm"
+            maxlength="512"
+            placeholder="备注（可选，例如：人工补偿、活动赠送）"
+          />
+
+          <div class="flex justify-end">
+            <Button
+              size="sm"
+              :disabled="grantingUserPlan || !selectedUser || !selectedGrantPlanId"
+              @click="grantPlanToSelectedUser"
+            >
+              {{ grantingUserPlan ? '发放中...' : '发放套餐' }}
+            </Button>
+          </div>
+        </section>
+      </div>
+
+      <template #footer>
+        <Button
+          variant="outline"
+          class="h-10 px-5"
+          @click="showUserPlansDialog = false"
+        >
+          关闭
+        </Button>
+      </template>
+    </Dialog>
 
     <!-- API Keys 管理对话框 -->
     <Dialog
@@ -1254,9 +1452,10 @@
 import { ref, computed, onMounted, watch } from 'vue'
 import { useUsersStore } from '@/stores/users'
 import { useAuthStore } from '@/stores/auth'
-import type { User, ApiKey, UserSession, UserBatchActionResponse, UserBatchSelectionFilters, UserGroup } from '@/api/users'
+import { usersApi, type User, type ApiKey, type UserSession, type UserBatchActionResponse, type UserBatchSelectionFilters, type UserGroup, type AdminUserPlanEntitlement } from '@/api/users'
 import { formatSessionMeta } from '@/types/session'
 import { adminWalletApi, type AdminWallet } from '@/api/admin-wallets'
+import { adminBillingPlansApi, type BillingEntitlement, type BillingPlan } from '@/api/billing'
 import { useToast } from '@/composables/useToast'
 import { useConfirm } from '@/composables/useConfirm'
 import { useClipboard } from '@/composables/useClipboard'
@@ -1271,6 +1470,7 @@ import {
   Badge,
   Input,
   Label,
+  Textarea,
   Select,
   SelectTrigger,
   SelectValue,
@@ -1307,6 +1507,7 @@ import {
   LockOpen,
   MonitorSmartphone,
   FolderKanban,
+  PackageCheck,
 } from 'lucide-vue-next'
 
 // 功能组件
@@ -1338,14 +1539,22 @@ const userFormDialogRef = ref<InstanceType<typeof UserFormDialog>>()
 // API Keys 对话框状态
 const showApiKeysDialog = ref(false)
 const showUserSessionsDialog = ref(false)
+const showUserPlansDialog = ref(false)
 const showNewApiKeyDialog = ref(false)
 const showUserApiKeyFormDialog = ref(false)
 const selectedUser = ref<User | null>(null)
 const userApiKeys = ref<ApiKey[]>([])
 const userSessions = ref<UserSession[]>([])
+const userPlanEntitlements = ref<AdminUserPlanEntitlement[]>([])
+const availableBillingPlans = ref<BillingPlan[]>([])
+const selectedGrantPlanId = ref('')
+const grantReason = ref('')
 const newApiKey = ref('')
 const creatingApiKey = ref(false)
 const loadingUserSessions = ref(false)
+const loadingUserPlans = ref(false)
+const loadingBillingPlans = ref(false)
+const grantingUserPlan = ref(false)
 const sessionDialogActionLoading = ref<string | null>(null)
 const apiKeyInput = ref<HTMLInputElement>()
 const editingUserApiKey = ref<ApiKey | null>(null)
@@ -1464,6 +1673,10 @@ const batchSelectionFilters = computed<UserBatchSelectionFilters>(() => {
   return filters
 })
 
+const grantableBillingPlans = computed(() =>
+  availableBillingPlans.value.filter((plan) => hasPackageEntitlement(plan.entitlements))
+)
+
 // Watch filter changes and reset to first page
 watch([searchQuery, filterRole, filterStatus, filterGroup], () => {
   currentPage.value = 1
@@ -1527,6 +1740,51 @@ function formatDate(dateString: string) {
   return new Date(dateString).toLocaleDateString('zh-CN')
 }
 
+function formatDateTime(value?: string | null): string {
+  if (!value) return '-'
+  return new Date(value).toLocaleString('zh-CN', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  })
+}
+
+function formatPlanPrice(plan: BillingPlan): string {
+  return `${Number(plan.price_amount || 0).toFixed(2)} ${plan.price_currency || 'CNY'}`
+}
+
+function formatPlanDuration(plan: BillingPlan): string {
+  const labels: Record<string, string> = {
+    day: '天',
+    month: '个月',
+    year: '年',
+    custom: '天',
+  }
+  const unit = labels[plan.duration_unit] || '天'
+  return `${Number(plan.duration_value || 1)}${unit}`
+}
+
+function entitlementLabels(items: BillingEntitlement[] | undefined): string[] {
+  return (items || []).map((item) => {
+    if (item.type === 'wallet_credit') {
+      return `附赠余额 $${Number(item.amount_usd || 0).toFixed(2)}`
+    }
+    if (item.type === 'daily_quota') {
+      return `每日额度 $${Number(item.daily_quota_usd || 0).toFixed(2)}`
+    }
+    if (item.type === 'membership_group') {
+      return '会员权益'
+    }
+    return item.type
+  })
+}
+
+function hasPackageEntitlement(items: BillingEntitlement[] | undefined): boolean {
+  return (items || []).some((item) => item.type === 'daily_quota' || item.type === 'membership_group')
+}
+
 async function loadUserWallets(options: { cacheTtlMs?: number } = {}) {
   const requestId = ++userWalletsRequestId
   try {
@@ -1572,7 +1830,21 @@ function getUserWalletTotalBalance(user: User): number | null {
   if (!wallet) {
     return null
   }
-  return wallet.balance
+  if (typeof wallet.total_available_balance === 'number' && Number.isFinite(wallet.total_available_balance)) {
+    return wallet.total_available_balance
+  }
+  return getUserWalletBalance(user) + getUserPackageBalance(user)
+}
+
+function getUserWalletBalance(user: User): number {
+  const wallet = getUserWallet(user.id)
+  const value = wallet?.wallet_balance ?? wallet?.balance ?? 0
+  return Number.isFinite(value) ? value : 0
+}
+
+function getUserPackageBalance(user: User): number {
+  const value = getUserWallet(user.id)?.package_balance ?? 0
+  return Number.isFinite(value) ? value : 0
 }
 
 function getUserWalletConsumed(user: User): number {
@@ -1725,6 +1997,70 @@ async function manageUserSessions(user: User) {
     error(parseApiError(err, '加载用户设备会话失败'))
   } finally {
     loadingUserSessions.value = false
+  }
+}
+
+async function manageUserPlans(user: User) {
+  selectedUser.value = user
+  showUserPlansDialog.value = true
+  selectedGrantPlanId.value = ''
+  grantReason.value = ''
+  await Promise.all([
+    loadUserPlanEntitlements(user.id),
+    loadAvailableBillingPlans(),
+  ])
+  if (!selectedGrantPlanId.value && grantableBillingPlans.value.length > 0) {
+    selectedGrantPlanId.value = grantableBillingPlans.value[0].id
+  }
+}
+
+async function loadUserPlanEntitlements(userId: string) {
+  loadingUserPlans.value = true
+  try {
+    const response = await usersApi.listUserPlanEntitlements(userId)
+    userPlanEntitlements.value = response.items
+  } catch (err) {
+    error(parseApiError(err, '加载用户套餐失败'))
+    userPlanEntitlements.value = []
+  } finally {
+    loadingUserPlans.value = false
+  }
+}
+
+async function loadAvailableBillingPlans() {
+  loadingBillingPlans.value = true
+  try {
+    const response = await adminBillingPlansApi.list()
+    availableBillingPlans.value = response.items
+    if (
+      selectedGrantPlanId.value
+      && !response.items.some((plan) => plan.id === selectedGrantPlanId.value)
+    ) {
+      selectedGrantPlanId.value = ''
+    }
+  } catch (err) {
+    error(parseApiError(err, '加载套餐列表失败'))
+    availableBillingPlans.value = []
+  } finally {
+    loadingBillingPlans.value = false
+  }
+}
+
+async function grantPlanToSelectedUser() {
+  if (!selectedUser.value || !selectedGrantPlanId.value) return
+  grantingUserPlan.value = true
+  try {
+    const response = await usersApi.grantUserPlan(selectedUser.value.id, {
+      plan_id: selectedGrantPlanId.value,
+      reason: grantReason.value.trim() || null,
+    })
+    userPlanEntitlements.value = response.items
+    grantReason.value = ''
+    success('套餐已发放')
+  } catch (err) {
+    error(parseApiError(err, '发放套餐失败'))
+  } finally {
+    grantingUserPlan.value = false
   }
 }
 

@@ -150,6 +150,93 @@ pub enum AdminBillingMutationOutcome<T> {
     Unavailable,
 }
 
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PaymentGatewayConfigRecord {
+    pub provider: String,
+    pub enabled: bool,
+    pub endpoint_url: String,
+    pub callback_base_url: Option<String>,
+    pub merchant_id: String,
+    pub merchant_key_encrypted: Option<String>,
+    pub pay_currency: String,
+    pub usd_exchange_rate: f64,
+    pub min_recharge_usd: f64,
+    pub channels_json: Value,
+    pub created_at_unix_secs: u64,
+    pub updated_at_unix_secs: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PaymentGatewayConfigWriteInput {
+    pub provider: String,
+    pub enabled: bool,
+    pub endpoint_url: String,
+    pub callback_base_url: Option<String>,
+    pub merchant_id: String,
+    pub merchant_key_encrypted: Option<String>,
+    pub preserve_existing_secret: bool,
+    pub pay_currency: String,
+    pub usd_exchange_rate: f64,
+    pub min_recharge_usd: f64,
+    pub channels_json: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct BillingPlanRecord {
+    pub id: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub price_amount: f64,
+    pub price_currency: String,
+    pub duration_unit: String,
+    pub duration_value: i64,
+    pub enabled: bool,
+    pub sort_order: i64,
+    pub max_active_per_user: i64,
+    pub purchase_limit_scope: String,
+    pub entitlements_json: Value,
+    pub created_at_unix_secs: u64,
+    pub updated_at_unix_secs: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BillingPlanWriteInput {
+    pub title: String,
+    pub description: Option<String>,
+    pub price_amount: f64,
+    pub price_currency: String,
+    pub duration_unit: String,
+    pub duration_value: i64,
+    pub enabled: bool,
+    pub sort_order: i64,
+    pub max_active_per_user: i64,
+    pub purchase_limit_scope: String,
+    pub entitlements_json: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct UserPlanEntitlementRecord {
+    pub id: String,
+    pub user_id: String,
+    pub plan_id: String,
+    pub payment_order_id: String,
+    pub status: String,
+    pub starts_at_unix_secs: u64,
+    pub expires_at_unix_secs: u64,
+    pub entitlements_snapshot: Value,
+    pub created_at_unix_secs: u64,
+    pub updated_at_unix_secs: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct UserDailyQuotaAvailabilityRecord {
+    pub has_active_daily_quota: bool,
+    pub total_quota_usd: f64,
+    pub used_usd: f64,
+    pub remaining_usd: f64,
+    pub allow_wallet_overage: bool,
+}
+
 #[async_trait]
 pub trait BillingReadRepository: Send + Sync {
     async fn find_model_context(
@@ -272,5 +359,88 @@ pub trait BillingReadRepository: Send + Sync {
     {
         let _ = (preset, mode, collectors);
         Ok(AdminBillingMutationOutcome::Unavailable)
+    }
+
+    async fn find_payment_gateway_config(
+        &self,
+        provider: &str,
+    ) -> Result<Option<PaymentGatewayConfigRecord>, crate::DataLayerError> {
+        let _ = provider;
+        Ok(None)
+    }
+
+    async fn upsert_payment_gateway_config(
+        &self,
+        input: &PaymentGatewayConfigWriteInput,
+    ) -> Result<AdminBillingMutationOutcome<PaymentGatewayConfigRecord>, crate::DataLayerError>
+    {
+        let _ = input;
+        Ok(AdminBillingMutationOutcome::Unavailable)
+    }
+
+    async fn list_billing_plans(
+        &self,
+        include_disabled: bool,
+    ) -> Result<Option<Vec<BillingPlanRecord>>, crate::DataLayerError> {
+        let _ = include_disabled;
+        Ok(None)
+    }
+
+    async fn find_billing_plan(
+        &self,
+        plan_id: &str,
+    ) -> Result<Option<BillingPlanRecord>, crate::DataLayerError> {
+        let _ = plan_id;
+        Ok(None)
+    }
+
+    async fn create_billing_plan(
+        &self,
+        input: &BillingPlanWriteInput,
+    ) -> Result<AdminBillingMutationOutcome<BillingPlanRecord>, crate::DataLayerError> {
+        let _ = input;
+        Ok(AdminBillingMutationOutcome::Unavailable)
+    }
+
+    async fn update_billing_plan(
+        &self,
+        plan_id: &str,
+        input: &BillingPlanWriteInput,
+    ) -> Result<AdminBillingMutationOutcome<BillingPlanRecord>, crate::DataLayerError> {
+        let _ = (plan_id, input);
+        Ok(AdminBillingMutationOutcome::Unavailable)
+    }
+
+    async fn set_billing_plan_enabled(
+        &self,
+        plan_id: &str,
+        enabled: bool,
+    ) -> Result<AdminBillingMutationOutcome<BillingPlanRecord>, crate::DataLayerError> {
+        let _ = (plan_id, enabled);
+        Ok(AdminBillingMutationOutcome::Unavailable)
+    }
+
+    async fn delete_billing_plan(
+        &self,
+        plan_id: &str,
+    ) -> Result<AdminBillingMutationOutcome<()>, crate::DataLayerError> {
+        let _ = plan_id;
+        Ok(AdminBillingMutationOutcome::Unavailable)
+    }
+
+    async fn list_user_plan_entitlements(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<Vec<UserPlanEntitlementRecord>>, crate::DataLayerError> {
+        let _ = user_id;
+        Ok(None)
+    }
+
+    async fn find_user_daily_quota_availability(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<UserDailyQuotaAvailabilityRecord>, crate::DataLayerError> {
+        let _ = user_id;
+        Ok(None)
     }
 }

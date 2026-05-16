@@ -24,7 +24,7 @@
               <Button
                 size="sm"
                 class="h-7 text-xs"
-                @click="showAddDialog = true"
+                @click="openAddDialog"
               >
                 <Plus class="w-3 h-3 mr-1" />
                 添加
@@ -114,7 +114,7 @@
               size="icon"
               class="h-8 w-8"
               title="手动添加"
-              @click="showAddDialog = true"
+              @click="openAddDialog"
             >
               <Plus class="w-3.5 h-3.5" />
             </Button>
@@ -523,13 +523,117 @@
     <!-- 手动添加/编辑代理节点对话框 -->
     <Dialog
       :model-value="showAddDialog"
-      :title="editingNode ? '编辑代理节点' : '手动添加代理节点'"
-      :description="editingNode ? '修改手动代理节点的配置' : '手动配置的代理节点，用于无法部署 aether-proxy 的场景'"
+      :title="editingNode ? '编辑代理节点' : '添加代理节点'"
+      :description="editingNode ? '修改手动代理节点的配置' : '推荐使用一键脚本部署 aether-proxy，也可手动添加已有 HTTP/SOCKS 代理'"
       :icon="editingNode ? SquarePen : Plus"
-      size="md"
+      size="lg"
       @update:model-value="handleDialogClose"
     >
+      <div
+        v-if="!editingNode"
+        class="mb-4 grid grid-cols-2 gap-2 rounded-lg border border-border/60 bg-muted/30 p-1"
+      >
+        <Button
+          type="button"
+          :variant="addMode === 'script' ? 'default' : 'ghost'"
+          class="h-9"
+          @click="addMode = 'script'"
+        >
+          <Terminal class="w-3.5 h-3.5 mr-1.5" />
+          脚本自动添加
+        </Button>
+        <Button
+          type="button"
+          :variant="addMode === 'manual' ? 'default' : 'ghost'"
+          class="h-9"
+          @click="addMode = 'manual'"
+        >
+          <Plus class="w-3.5 h-3.5 mr-1.5" />
+          手动添加
+        </Button>
+      </div>
+
+      <div
+        v-if="!editingNode && addMode === 'script'"
+        class="space-y-4"
+      >
+        <div class="rounded-lg border border-border/60 bg-muted/30 p-3 text-xs text-muted-foreground">
+          输入节点名称后生成一次性安装命令，有效期 15 分钟。复制的命令不含敏感授权信息，只能在目标机器使用一次，避免 Token 暴露在页面或聊天记录中。
+        </div>
+
+        <div class="space-y-1.5">
+          <Label>节点名称 *</Label>
+          <Input
+            v-model="installForm.node_name"
+            placeholder="例如: jp-proxy-01"
+            @keyup.enter="refreshProxyInstallCommand"
+          />
+        </div>
+
+        <div class="space-y-2">
+          <Label class="text-sm font-semibold">目标系统</Label>
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
+            <Button
+              type="button"
+              :variant="installSystem === 'unix' ? 'default' : 'outline'"
+              class="justify-start h-auto py-3"
+              @click="installSystem = 'unix'"
+            >
+              macOS / Linux
+            </Button>
+            <Button
+              type="button"
+              :variant="installSystem === 'windows' ? 'default' : 'outline'"
+              class="justify-start h-auto py-3"
+              @click="installSystem = 'windows'"
+            >
+              Windows PowerShell
+            </Button>
+          </div>
+        </div>
+
+        <div class="space-y-2">
+          <div class="flex items-center justify-between gap-2">
+            <Label class="text-sm font-semibold">复制到代理节点机器执行</Label>
+            <div class="flex items-center gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                class="gap-1.5"
+                :disabled="installLoading || !proxyInstallCommand"
+                @click="copyProxyInstallCommand"
+              >
+                <CheckCircle
+                  v-if="installCopied"
+                  class="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400"
+                />
+                <Copy
+                  v-else
+                  class="h-3.5 w-3.5"
+                />
+                {{ installCopied ? '已复制' : '一键复制' }}
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                :disabled="installLoading || !installForm.node_name.trim()"
+                @click="refreshProxyInstallCommand"
+              >
+                {{ installLoading ? '生成中...' : (proxyInstallSession ? '重新生成' : '生成命令') }}
+              </Button>
+            </div>
+          </div>
+          <div class="rounded-lg border border-border/60 bg-background overflow-hidden">
+            <pre class="max-h-32 overflow-x-auto whitespace-pre-wrap break-all p-3 text-xs font-mono">{{ proxyInstallCommand || '输入节点名称后点击“生成命令”' }}</pre>
+          </div>
+          <p class="text-xs text-muted-foreground">
+            {{ proxyInstallHint }}
+          </p>
+        </div>
+      </div>
+
       <form
+        v-else
         class="space-y-4"
         @submit.prevent="handleAddManualNode"
       >
@@ -583,7 +687,27 @@
       </form>
 
       <template #footer>
-        <div class="flex items-center justify-between w-full">
+        <div
+          v-if="!editingNode && addMode === 'script'"
+          class="flex items-center justify-end gap-2 w-full"
+        >
+          <Button
+            variant="outline"
+            @click="handleDialogClose(false)"
+          >
+            关闭
+          </Button>
+          <Button
+            :disabled="installLoading || !proxyInstallCommand"
+            @click="copyProxyInstallCommand"
+          >
+            {{ installCopied ? '已复制' : '复制命令' }}
+          </Button>
+        </div>
+        <div
+          v-else
+          class="flex items-center justify-between w-full"
+        >
           <Button
             variant="outline"
             :disabled="testingUrl || !addForm.proxy_url"
@@ -833,14 +957,16 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, watch } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount, watch } from 'vue'
 import { useProxyNodesStore } from '@/stores/proxy-nodes'
 import { useToast } from '@/composables/useToast'
 import { useConfirm } from '@/composables/useConfirm'
+import { useClipboard } from '@/composables/useClipboard'
 import {
   proxyNodesApi,
   type ProxyNode,
   type ProxyNodeEvent,
+  type ProxyNodeInstallSession,
   type ProxyNodeMetricsResponse,
   type ProxyNodeRemoteConfig,
   type ProxyNodeSchedulingState,
@@ -871,7 +997,7 @@ import {
   Dialog,
 } from '@/components/ui'
 
-import { Search, Trash2, Plus, SquarePen, Activity, Loader2, Settings, History, ChevronDown, ChevronRight } from 'lucide-vue-next'
+import { Search, Trash2, Plus, SquarePen, Activity, Loader2, Settings, History, ChevronDown, ChevronRight, Terminal, Copy, CheckCircle } from 'lucide-vue-next'
 import { parseApiError } from '@/utils/errorParser'
 import { formatRegion } from '@/utils/region'
 import HardwareTooltip from './components/HardwareTooltip.vue'
@@ -879,6 +1005,7 @@ import ProxyNodeDataPanel from './components/ProxyNodeDataPanel.vue'
 
 const { success, error: toastError } = useToast()
 const { confirmDanger } = useConfirm()
+const { copyToClipboard } = useClipboard()
 const store = useProxyNodesStore()
 
 const searchQuery = ref('')
@@ -895,12 +1022,35 @@ const pageSize = ref(20)
 const showAddDialog = ref(false)
 const addingNode = ref(false)
 const editingNode = ref<ProxyNode | null>(null)
+const addMode = ref<'script' | 'manual'>('script')
 const addForm = ref({
   name: '',
   proxy_url: '',
   username: '',
   password: '',
   region: '',
+})
+const installForm = ref({
+  node_name: '',
+})
+const installSystem = ref<'unix' | 'windows'>('unix')
+const installLoading = ref(false)
+const installCopied = ref(false)
+const proxyInstallSession = ref<ProxyNodeInstallSession | null>(null)
+let installCopiedResetTimer: ReturnType<typeof setTimeout> | null = null
+
+const proxyInstallCommand = computed(() => {
+  if (!proxyInstallSession.value) return ''
+  return installSystem.value === 'windows'
+    ? proxyInstallSession.value.powershell_command
+    : proxyInstallSession.value.unix_command
+})
+
+const proxyInstallHint = computed(() => {
+  if (!proxyInstallSession.value) {
+    return '脚本会自动安装或更新代理程序，并保留已有配置。'
+  }
+  return `这条命令将在 ${Math.floor(proxyInstallSession.value.expires_in_seconds / 60)} 分钟内有效，成功使用后立即失效。`
 })
 
 // 远程配置对话框 (aether-proxy 节点)
@@ -967,8 +1117,21 @@ watch([searchQuery, filterStatus], () => {
   currentPage.value = 1
 })
 
+watch(() => installForm.value.node_name, () => {
+  resetProxyInstallState()
+})
+
+watch(installSystem, () => {
+  installCopied.value = false
+  clearInstallCopiedResetTimer()
+})
+
 onMounted(async () => {
   await store.fetchNodes()
+})
+
+onBeforeUnmount(() => {
+  clearInstallCopiedResetTimer()
 })
 
 async function refresh() {
@@ -1015,6 +1178,56 @@ async function handleTestUrl() {
   }
 }
 
+function clearInstallCopiedResetTimer() {
+  if (installCopiedResetTimer) {
+    clearTimeout(installCopiedResetTimer)
+    installCopiedResetTimer = null
+  }
+}
+
+function resetProxyInstallState() {
+  proxyInstallSession.value = null
+  installCopied.value = false
+  clearInstallCopiedResetTimer()
+}
+
+function openAddDialog() {
+  editingNode.value = null
+  addMode.value = 'script'
+  addForm.value = { name: '', proxy_url: '', username: '', password: '', region: '' }
+  installForm.value = { node_name: '' }
+  resetProxyInstallState()
+  showAddDialog.value = true
+}
+
+async function refreshProxyInstallCommand() {
+  const nodeName = installForm.value.node_name.trim()
+  if (!nodeName || installLoading.value) return
+  installLoading.value = true
+  resetProxyInstallState()
+  try {
+    proxyInstallSession.value = await store.createInstallSession({ node_name: nodeName })
+    success('代理节点安装命令已生成')
+  } catch (err: unknown) {
+    toastError(parseApiError(err, '生成代理节点安装命令失败'))
+  } finally {
+    installLoading.value = false
+  }
+}
+
+async function copyProxyInstallCommand() {
+  if (!proxyInstallCommand.value) return
+  const copied = await copyToClipboard(proxyInstallCommand.value, false)
+  if (!copied) return
+  installCopied.value = true
+  success('安装命令已复制到剪贴板')
+  clearInstallCopiedResetTimer()
+  installCopiedResetTimer = setTimeout(() => {
+    installCopied.value = false
+    installCopiedResetTimer = null
+  }, 2000)
+}
+
 async function handleEdit(node: ProxyNode) {
   try {
     const { node: detail } = await proxyNodesApi.getNode(node.id)
@@ -1026,6 +1239,8 @@ async function handleEdit(node: ProxyNode) {
       password: detail.proxy_password || '',
       region: detail.region || '',
     }
+    addMode.value = 'manual'
+    resetProxyInstallState()
     showAddDialog.value = true
   } catch (err: unknown) {
     toastError(parseApiError(err, '读取代理节点详情失败'))
@@ -1036,7 +1251,10 @@ function handleDialogClose(open: boolean) {
   if (!open) {
     showAddDialog.value = false
     editingNode.value = null
+    addMode.value = 'script'
     addForm.value = { name: '', proxy_url: '', username: '', password: '', region: '' }
+    installForm.value = { node_name: '' }
+    resetProxyInstallState()
   }
 }
 

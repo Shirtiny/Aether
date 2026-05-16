@@ -164,6 +164,20 @@ export interface ManualProxyNodeUpdateRequest {
   region?: string
 }
 
+export interface ProxyNodeInstallSessionCreateRequest {
+  node_name: string
+}
+
+export interface ProxyNodeInstallSession {
+  install_code: string
+  expires_at_unix_secs: number
+  expires_in_seconds: number
+  node_name: string
+  aether_url: string
+  unix_command: string
+  powershell_command: string
+}
+
 export interface ProxyNodeTestResult {
   success: boolean
   latency_ms: number | null
@@ -242,6 +256,11 @@ export const proxyNodesApi = {
 
   async createManualNode(data: ManualProxyNodeCreateRequest): Promise<{ node_id: string; node: ProxyNode }> {
     const response = await apiClient.post<{ node_id: string; node: ProxyNode }>('/api/admin/proxy-nodes/manual', data)
+    return response.data
+  },
+
+  async createInstallSession(data: ProxyNodeInstallSessionCreateRequest): Promise<ProxyNodeInstallSession> {
+    const response = await apiClient.post<ProxyNodeInstallSession>('/api/admin/proxy-nodes/install-sessions', data)
     return response.data
   },
 

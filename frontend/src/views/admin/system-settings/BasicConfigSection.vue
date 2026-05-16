@@ -171,6 +171,97 @@
           </div>
         </div>
       </div>
+
+      <div class="md:col-span-2 grid grid-cols-1 md:grid-cols-2 gap-4 border-t pt-5">
+        <div class="flex items-center h-full">
+          <div class="flex items-center space-x-2">
+            <Checkbox
+              id="turnstile-enabled"
+              :checked="turnstileEnabled"
+              @update:checked="$emit('update:turnstileEnabled', $event)"
+            />
+            <div>
+              <Label
+                for="turnstile-enabled"
+                class="cursor-pointer"
+              >
+                注册人机验证
+              </Label>
+              <p class="text-xs text-muted-foreground">
+                开启后注册与发送邮箱验证码前需要通过 Cloudflare Turnstile
+              </p>
+            </div>
+          </div>
+        </div>
+
+        <div>
+          <Label
+            for="turnstile-site-key"
+            class="block text-sm font-medium"
+          >
+            Turnstile Site Key
+          </Label>
+          <Input
+            id="turnstile-site-key"
+            :model-value="turnstileSiteKey || ''"
+            type="text"
+            placeholder="0x4AAAA..."
+            class="mt-1"
+            @update:model-value="$emit('update:turnstileSiteKey', String($event || '').trim() || null)"
+          />
+        </div>
+
+        <div>
+          <div class="flex items-center justify-between">
+            <Label
+              for="turnstile-secret-key"
+              class="block text-sm font-medium"
+            >
+              Turnstile Secret Key
+            </Label>
+            <Button
+              v-if="turnstileSecretConfigured"
+              type="button"
+              variant="link"
+              size="sm"
+              class="h-auto p-0 text-xs"
+              :disabled="loading"
+              @click="$emit('clearTurnstileSecret')"
+            >
+              清空
+            </Button>
+          </div>
+          <Input
+            id="turnstile-secret-key"
+            :model-value="turnstileSecretKey"
+            type="password"
+            :placeholder="turnstileSecretConfigured ? '已配置，留空不修改' : '输入 Secret Key'"
+            class="mt-1"
+            autocomplete="new-password"
+            @update:model-value="$emit('update:turnstileSecretKey', String($event || ''))"
+          />
+        </div>
+
+        <div>
+          <Label
+            for="turnstile-hostnames"
+            class="block text-sm font-medium"
+          >
+            允许的 Hostname
+          </Label>
+          <Input
+            id="turnstile-hostnames"
+            :model-value="turnstileAllowedHostnamesStr"
+            type="text"
+            placeholder="example.com, app.example.com"
+            class="mt-1"
+            @update:model-value="$emit('update:turnstileAllowedHostnamesStr', String($event || ''))"
+          />
+          <p class="mt-1 text-xs text-muted-foreground">
+            留空则不额外校验 Cloudflare 返回的 hostname
+          </p>
+        </div>
+      </div>
     </div>
   </CardSection>
 </template>
@@ -192,6 +283,11 @@ defineProps<{
   rateLimitPerMinute: number
   enableRegistration: boolean
   passwordPolicyLevel: string
+  turnstileEnabled: boolean
+  turnstileSiteKey: string | null
+  turnstileSecretKey: string
+  turnstileSecretConfigured: boolean
+  turnstileAllowedHostnamesStr: string
   autoDeleteExpiredKeys: boolean
   enableFormatConversion: boolean
   enableOpenaiImageSyncHeartbeat: boolean
@@ -205,6 +301,11 @@ defineEmits<{
   'update:rateLimitPerMinute': [value: number]
   'update:enableRegistration': [value: boolean]
   'update:passwordPolicyLevel': [value: string]
+  'update:turnstileEnabled': [value: boolean]
+  'update:turnstileSiteKey': [value: string | null]
+  'update:turnstileSecretKey': [value: string]
+  'update:turnstileAllowedHostnamesStr': [value: string]
+  clearTurnstileSecret: []
   'update:autoDeleteExpiredKeys': [value: boolean]
   'update:enableFormatConversion': [value: boolean]
   'update:enableOpenaiImageSyncHeartbeat': [value: boolean]

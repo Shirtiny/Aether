@@ -11,10 +11,10 @@ use super::{
     AdminRedeemCodeListQuery, AdminWalletLedgerQuery, AdminWalletListQuery,
     AdminWalletRefundRequestListQuery, CompleteAdminWalletRefundInput,
     CreateAdminRedeemCodeBatchInput, CreateAdminRedeemCodeBatchResult,
-    CreateManualWalletRechargeInput, CreateWalletRechargeOrderInput,
-    CreateWalletRechargeOrderOutcome, CreateWalletRefundRequestInput,
-    CreateWalletRefundRequestOutcome, CreatedAdminRedeemCodePlaintext,
-    CreditAdminPaymentOrderInput, DeleteAdminRedeemCodeBatchInput,
+    CreateManualWalletRechargeInput, CreatePlanPurchaseOrderInput, CreatePlanPurchaseOrderOutcome,
+    CreateWalletRechargeOrderInput, CreateWalletRechargeOrderOutcome,
+    CreateWalletRefundRequestInput, CreateWalletRefundRequestOutcome,
+    CreatedAdminRedeemCodePlaintext, CreditAdminPaymentOrderInput, DeleteAdminRedeemCodeBatchInput,
     DisableAdminRedeemCodeBatchInput, DisableAdminRedeemCodeInput, FailAdminWalletRefundInput,
     InMemoryWalletRepository, ProcessAdminWalletRefundInput, ProcessPaymentCallbackInput,
     ProcessPaymentCallbackOutcome, RedeemWalletCodeInput, RedeemWalletCodeOutcome,
@@ -75,6 +75,7 @@ FROM wallets
 SELECT
   id, order_no, wallet_id, user_id, amount_usd, pay_amount, pay_currency,
   exchange_rate, refunded_amount_usd, refundable_amount_usd, payment_method,
+  payment_provider, payment_channel, order_kind, product_id, product_snapshot,
   gateway_order_id, gateway_response, status,
   created_at AS created_at_unix_ms,
   paid_at AS paid_at_unix_secs,
@@ -653,9 +654,10 @@ VALUES (?, ?, 0, 0, 'finite', 'USD', 'active', 0, 0, 0, 0, ?, ?)
 INSERT INTO payment_orders (
   id, order_no, wallet_id, user_id, amount_usd, pay_amount, pay_currency,
   exchange_rate, refunded_amount_usd, refundable_amount_usd, payment_method,
+  payment_provider, payment_channel, order_kind, fulfillment_status,
   gateway_order_id, gateway_response, status, created_at, expires_at
 )
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, 'pending', ?, ?)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, 'wallet_recharge', 'pending', ?, ?, 'pending', ?, ?)
 "#,
         )
         .bind(&order_id)
@@ -667,6 +669,8 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, 'pending', ?, ?)
         .bind(input.pay_currency.as_deref())
         .bind(input.exchange_rate)
         .bind(&input.payment_method)
+        .bind(input.payment_provider.as_deref())
+        .bind(input.payment_channel.as_deref())
         .bind(&input.gateway_order_id)
         .bind(gateway_response)
         .bind(now)
@@ -678,6 +682,163 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, 'pending', ?, ?)
         let row = mysql_payment_order_by_id(&mut tx, &order_id).await?;
         tx.commit().await.map_sql_err()?;
         Ok(CreateWalletRechargeOrderOutcome::Created(
+            map_payment_order_row(&row)?,
+        ))
+    }
+
+    async fn create_plan_purchase_order(
+        &self,
+        input: CreatePlanPurchaseOrderInput,
+    ) -> Result<CreatePlanPurchaseOrderOutcome, DataLayerError> {
+        let now = current_unix_secs_i64();
+        let expires_at = i64::try_from(input.expires_at_unix_secs).map_err(|_| {
+            DataLayerError::InvalidInput("plan purchase expires_at overflow".to_string())
+        })?;
+        let gateway_response =
+            json_string(&input.gateway_response, "payment_orders.gateway_response")?;
+        let product_snapshot =
+            json_string(&input.product_snapshot, "payment_orders.product_snapshot")?;
+        let mut tx = self.pool.begin().await.map_sql_err()?;
+
+        let wallet_row = sqlx::query(
+            r#"
+SELECT id, status
+FROM wallets
+WHERE user_id = ?
+LIMIT 1
+FOR UPDATE
+"#,
+        )
+        .bind(&input.user_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_sql_err()?;
+        let (wallet_id, wallet_status) = if let Some(row) = wallet_row {
+            (get::<String>(&row, "id")?, get::<String>(&row, "status")?)
+        } else {
+            let wallet_id = input
+                .preferred_wallet_id
+                .clone()
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            sqlx::query(
+                r#"
+INSERT INTO wallets (
+  id, user_id, balance, gift_balance, limit_mode, currency, status,
+  total_recharged, total_consumed, total_refunded, total_adjusted,
+  created_at, updated_at
+)
+VALUES (?, ?, 0, 0, 'finite', 'USD', 'active', 0, 0, 0, 0, ?, ?)
+"#,
+            )
+            .bind(&wallet_id)
+            .bind(&input.user_id)
+            .bind(now)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_sql_err()?;
+            (wallet_id, "active".to_string())
+        };
+        if wallet_status != "active" {
+            tx.commit().await.map_sql_err()?;
+            return Ok(CreatePlanPurchaseOrderOutcome::WalletInactive);
+        }
+
+        let purchase_limit_scope = plan_purchase_limit_scope(&input.product_snapshot);
+        if purchase_limit_scope != "unlimited" {
+            let max_active_per_user = plan_max_active_per_user(&input.product_snapshot);
+            let mut active_count = if purchase_limit_scope == "lifetime" {
+                sqlx::query_scalar::<_, i64>(
+                    r#"
+SELECT COUNT(*)
+FROM user_plan_entitlements
+WHERE user_id = ?
+  AND plan_id = ?
+  AND status = 'active'
+"#,
+                )
+                .bind(&input.user_id)
+                .bind(&input.product_id)
+                .fetch_one(&mut *tx)
+                .await
+                .map_sql_err()?
+            } else {
+                sqlx::query_scalar::<_, i64>(
+                    r#"
+SELECT COUNT(*)
+FROM user_plan_entitlements
+WHERE user_id = ?
+  AND plan_id = ?
+  AND status = 'active'
+  AND expires_at > ?
+"#,
+                )
+                .bind(&input.user_id)
+                .bind(&input.product_id)
+                .bind(now)
+                .fetch_one(&mut *tx)
+                .await
+                .map_sql_err()?
+            };
+            active_count += sqlx::query_scalar::<_, i64>(
+                r#"
+	SELECT COUNT(*)
+	FROM payment_orders
+	WHERE user_id = ?
+	  AND product_id = ?
+	  AND order_kind = 'plan_purchase'
+	  AND status = 'pending'
+	  AND expires_at > ?
+	"#,
+            )
+            .bind(&input.user_id)
+            .bind(&input.product_id)
+            .bind(now)
+            .fetch_one(&mut *tx)
+            .await
+            .map_sql_err()?;
+            if active_count >= max_active_per_user {
+                tx.commit().await.map_sql_err()?;
+                return Ok(CreatePlanPurchaseOrderOutcome::ActivePlanLimitReached);
+            }
+        }
+
+        let order_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            r#"
+INSERT INTO payment_orders (
+  id, order_no, wallet_id, user_id, amount_usd, pay_amount, pay_currency,
+  exchange_rate, refunded_amount_usd, refundable_amount_usd, payment_method,
+  payment_provider, payment_channel, order_kind, product_id, product_snapshot,
+  fulfillment_status, gateway_order_id, gateway_response, status, created_at, expires_at
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, 'plan_purchase', ?, ?, 'pending', ?, ?, 'pending', ?, ?)
+"#,
+        )
+        .bind(&order_id)
+        .bind(&input.order_no)
+        .bind(&wallet_id)
+        .bind(&input.user_id)
+        .bind(input.amount_usd)
+        .bind(input.pay_amount)
+        .bind(&input.pay_currency)
+        .bind(input.exchange_rate)
+        .bind(&input.payment_method)
+        .bind(input.payment_provider.as_deref())
+        .bind(input.payment_channel.as_deref())
+        .bind(&input.product_id)
+        .bind(product_snapshot)
+        .bind(&input.gateway_order_id)
+        .bind(gateway_response)
+        .bind(now)
+        .bind(expires_at)
+        .execute(&mut *tx)
+        .await
+        .map_sql_err()?;
+
+        let row = mysql_payment_order_by_id(&mut tx, &order_id).await?;
+        tx.commit().await.map_sql_err()?;
+        Ok(CreatePlanPurchaseOrderOutcome::Created(
             map_payment_order_row(&row)?,
         ))
     }
@@ -949,11 +1110,22 @@ VALUES (?, NULL, ?, ?, ?, ?, ?, ?, 'received', ?, NULL, ?, NULL)
         let order_no: String = get(&order_row, "order_no")?;
         let order_wallet_id: String = get(&order_row, "wallet_id")?;
         let order_payment_method: String = get(&order_row, "payment_method")?;
+        let order_payment_provider: Option<String> = get(&order_row, "payment_provider")?;
+        let order_payment_channel: Option<String> = get(&order_row, "payment_channel")?;
+        let order_kind: String = get(&order_row, "order_kind")?;
         let order_amount_usd: f64 = get(&order_row, "amount_usd")?;
+        let order_pay_amount: Option<f64> = get(&order_row, "pay_amount")?;
         let order_status: String = get(&order_row, "status")?;
         let expires_at_unix_secs: Option<i64> = get(&order_row, "expires_at_unix_secs")?;
 
-        if (input.amount_usd - order_amount_usd).abs() > f64::EPSILON {
+        let amount_matches = if let (Some(callback_pay_amount), Some(order_pay_amount)) =
+            (input.pay_amount, order_pay_amount)
+        {
+            (callback_pay_amount - order_pay_amount).abs() <= 0.01
+        } else {
+            (input.amount_usd - order_amount_usd).abs() <= f64::EPSILON
+        };
+        if !amount_matches {
             update_mysql_payment_callback_failure(
                 &mut tx,
                 &callback_id,
@@ -982,6 +1154,46 @@ VALUES (?, NULL, ?, ?, ?, ?, ?, ?, 'received', ?, NULL, ?, NULL)
                 duplicate,
                 error: "payment method mismatch".to_string(),
             });
+        }
+        if let Some(expected_provider) = input.payment_provider.as_deref() {
+            if order_payment_provider
+                .as_deref()
+                .is_some_and(|value| !value.eq_ignore_ascii_case(expected_provider))
+            {
+                update_mysql_payment_callback_failure(
+                    &mut tx,
+                    &callback_id,
+                    &input,
+                    &payload,
+                    "payment provider mismatch",
+                )
+                .await?;
+                tx.commit().await.map_sql_err()?;
+                return Ok(ProcessPaymentCallbackOutcome::Failed {
+                    duplicate,
+                    error: "payment provider mismatch".to_string(),
+                });
+            }
+        }
+        if let Some(expected_channel) = input.payment_channel.as_deref() {
+            if order_payment_channel
+                .as_deref()
+                .is_some_and(|value| !value.eq_ignore_ascii_case(expected_channel))
+            {
+                update_mysql_payment_callback_failure(
+                    &mut tx,
+                    &callback_id,
+                    &input,
+                    &payload,
+                    "payment channel mismatch",
+                )
+                .await?;
+                tx.commit().await.map_sql_err()?;
+                return Ok(ProcessPaymentCallbackOutcome::Failed {
+                    duplicate,
+                    error: "payment channel mismatch".to_string(),
+                });
+            }
         }
         if order_status == "credited" {
             mark_mysql_payment_callback_processed(
@@ -1026,6 +1238,185 @@ VALUES (?, NULL, ?, ?, ?, ?, ?, ?, 'received', ?, NULL, ?, NULL)
             return Ok(ProcessPaymentCallbackOutcome::Failed {
                 duplicate,
                 error: "payment order expired".to_string(),
+            });
+        }
+
+        if order_kind == "plan_purchase" {
+            let order_user_id: Option<String> = get(&order_row, "user_id")?;
+            let Some(user_id) = order_user_id else {
+                update_mysql_payment_callback_failure(
+                    &mut tx,
+                    &callback_id,
+                    &input,
+                    &payload,
+                    "payment order user missing",
+                )
+                .await?;
+                tx.commit().await.map_sql_err()?;
+                return Ok(ProcessPaymentCallbackOutcome::Failed {
+                    duplicate,
+                    error: "payment order user missing".to_string(),
+                });
+            };
+            let product_id: Option<String> = get(&order_row, "product_id")?;
+            let snapshot = optional_json(
+                get::<Option<String>>(&order_row, "product_snapshot")?,
+                "payment_orders.product_snapshot",
+            )?
+            .unwrap_or_else(|| serde_json::json!({}));
+            let plan_id = product_id.unwrap_or_else(|| {
+                snapshot
+                    .get("id")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown")
+                    .to_string()
+            });
+            let entitlements = plan_entitlements_snapshot(&snapshot);
+            let existing_entitlement_id = sqlx::query_scalar::<_, String>(
+                "SELECT id FROM user_plan_entitlements WHERE payment_order_id = ? LIMIT 1",
+            )
+            .bind(&order_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_sql_err()?;
+            if existing_entitlement_id.is_none() {
+                sqlx::query("SELECT id FROM wallets WHERE id = ? LIMIT 1 FOR UPDATE")
+                    .bind(&order_wallet_id)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_sql_err()?;
+                let purchase_limit_scope = plan_purchase_limit_scope(&snapshot);
+                if purchase_limit_scope != "unlimited" {
+                    let max_active_per_user = plan_max_active_per_user(&snapshot);
+                    let active_count = if purchase_limit_scope == "lifetime" {
+                        sqlx::query_scalar::<_, i64>(
+                            r#"
+SELECT COUNT(*)
+FROM user_plan_entitlements
+WHERE user_id = ?
+  AND plan_id = ?
+  AND status = 'active'
+                    "#,
+                        )
+                        .bind(&user_id)
+                        .bind(&plan_id)
+                        .fetch_one(&mut *tx)
+                        .await
+                        .map_sql_err()?
+                    } else {
+                        sqlx::query_scalar::<_, i64>(
+                            r#"
+SELECT COUNT(*)
+FROM user_plan_entitlements
+WHERE user_id = ?
+  AND plan_id = ?
+  AND status = 'active'
+  AND expires_at > ?
+                    "#,
+                        )
+                        .bind(&user_id)
+                        .bind(&plan_id)
+                        .bind(now)
+                        .fetch_one(&mut *tx)
+                        .await
+                        .map_sql_err()?
+                    };
+                    if active_count >= max_active_per_user {
+                        update_mysql_payment_callback_failure(
+                            &mut tx,
+                            &callback_id,
+                            &input,
+                            &payload,
+                            "plan purchase limit reached",
+                        )
+                        .await?;
+                        tx.commit().await.map_sql_err()?;
+                        return Ok(ProcessPaymentCallbackOutcome::Failed {
+                            duplicate,
+                            error: "plan purchase limit reached".to_string(),
+                        });
+                    }
+                }
+                replace_matching_plan_entitlements_mysql(&mut tx, &user_id, &snapshot, now).await?;
+                sqlx::query(
+                    r#"
+INSERT INTO user_plan_entitlements (
+  id, user_id, plan_id, payment_order_id, status, starts_at, expires_at,
+  entitlements_snapshot, created_at, updated_at
+)
+VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)
+                    "#,
+                )
+                .bind(uuid::Uuid::new_v4().to_string())
+                .bind(&user_id)
+                .bind(&plan_id)
+                .bind(&order_id)
+                .bind(now)
+                .bind(plan_expires_at_unix(&snapshot, now))
+                .bind(json_string(
+                    &entitlements,
+                    "user_plan_entitlements.entitlements_snapshot",
+                )?)
+                .bind(now)
+                .bind(now)
+                .execute(&mut *tx)
+                .await
+                .map_sql_err()?;
+                apply_plan_wallet_credit_mysql(
+                    &mut tx,
+                    &order_wallet_id,
+                    &order_id,
+                    &input.payment_method,
+                    &entitlements,
+                    now,
+                )
+                .await?;
+            }
+            sqlx::query(
+                r#"
+UPDATE payment_orders
+SET gateway_order_id = COALESCE(?, gateway_order_id),
+    gateway_response = ?,
+    pay_amount = COALESCE(?, pay_amount),
+    pay_currency = COALESCE(?, pay_currency),
+    exchange_rate = COALESCE(?, exchange_rate),
+    status = 'credited',
+    fulfillment_status = 'fulfilled',
+    fulfillment_error = NULL,
+    paid_at = COALESCE(paid_at, ?),
+    credited_at = ?,
+    refundable_amount_usd = 0
+WHERE id = ?
+                "#,
+            )
+            .bind(input.gateway_order_id.as_deref())
+            .bind(&payload)
+            .bind(input.pay_amount)
+            .bind(input.pay_currency.as_deref())
+            .bind(input.exchange_rate)
+            .bind(now)
+            .bind(now)
+            .bind(&order_id)
+            .execute(&mut *tx)
+            .await
+            .map_sql_err()?;
+            let updated_order_row = mysql_payment_order_by_id(&mut tx, &order_id).await?;
+            mark_mysql_payment_callback_processed(
+                &mut tx,
+                &callback_id,
+                &input,
+                &payload,
+                &order_id,
+                &order_no,
+            )
+            .await?;
+            tx.commit().await.map_sql_err()?;
+            return Ok(ProcessPaymentCallbackOutcome::Applied {
+                duplicate,
+                order_id,
+                order_no,
+                wallet_id: order_wallet_id,
+                order: map_payment_order_row(&updated_order_row)?,
             });
         }
 
@@ -1912,6 +2303,173 @@ WHERE id = ? AND wallet_id = ?
             ));
         }
 
+        let order_kind: String = get(&order_row, "order_kind")?;
+        if order_kind == "plan_purchase" {
+            let order_user_id: Option<String> = get(&order_row, "user_id")?;
+            let Some(user_id) = order_user_id else {
+                tx.commit().await.map_sql_err()?;
+                return Ok(WalletMutationOutcome::Invalid(
+                    "payment order user missing".to_string(),
+                ));
+            };
+            let product_id: Option<String> = get(&order_row, "product_id")?;
+            let snapshot = optional_json(
+                get::<Option<String>>(&order_row, "product_snapshot")?,
+                "payment_orders.product_snapshot",
+            )?
+            .unwrap_or_else(|| serde_json::json!({}));
+            let plan_id = product_id.unwrap_or_else(|| {
+                snapshot
+                    .get("id")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown")
+                    .to_string()
+            });
+            let entitlements = plan_entitlements_snapshot(&snapshot);
+            let existing_entitlement_id = sqlx::query_scalar::<_, String>(
+                "SELECT id FROM user_plan_entitlements WHERE payment_order_id = ? LIMIT 1",
+            )
+            .bind(&input.order_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_sql_err()?;
+            if existing_entitlement_id.is_none() {
+                let purchase_limit_scope = plan_purchase_limit_scope(&snapshot);
+                if purchase_limit_scope != "unlimited" {
+                    let max_active_per_user = plan_max_active_per_user(&snapshot);
+                    let active_count = if purchase_limit_scope == "lifetime" {
+                        sqlx::query_scalar::<_, i64>(
+                            r#"
+SELECT COUNT(*)
+FROM user_plan_entitlements
+WHERE user_id = ?
+  AND plan_id = ?
+  AND status = 'active'
+                    "#,
+                        )
+                        .bind(&user_id)
+                        .bind(&plan_id)
+                        .fetch_one(&mut *tx)
+                        .await
+                        .map_sql_err()?
+                    } else {
+                        sqlx::query_scalar::<_, i64>(
+                            r#"
+SELECT COUNT(*)
+FROM user_plan_entitlements
+WHERE user_id = ?
+  AND plan_id = ?
+  AND status = 'active'
+  AND expires_at > ?
+                    "#,
+                        )
+                        .bind(&user_id)
+                        .bind(&plan_id)
+                        .bind(now)
+                        .fetch_one(&mut *tx)
+                        .await
+                        .map_sql_err()?
+                    };
+                    if active_count >= max_active_per_user {
+                        tx.commit().await.map_sql_err()?;
+                        return Ok(WalletMutationOutcome::Invalid(
+                            "plan purchase limit reached".to_string(),
+                        ));
+                    }
+                }
+                replace_matching_plan_entitlements_mysql(&mut tx, &user_id, &snapshot, now).await?;
+                sqlx::query(
+                    r#"
+INSERT INTO user_plan_entitlements (
+  id, user_id, plan_id, payment_order_id, status, starts_at, expires_at,
+  entitlements_snapshot, created_at, updated_at
+)
+VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)
+                    "#,
+                )
+                .bind(uuid::Uuid::new_v4().to_string())
+                .bind(&user_id)
+                .bind(&plan_id)
+                .bind(&input.order_id)
+                .bind(now)
+                .bind(plan_expires_at_unix(&snapshot, now))
+                .bind(json_string(
+                    &entitlements,
+                    "user_plan_entitlements.entitlements_snapshot",
+                )?)
+                .bind(now)
+                .bind(now)
+                .execute(&mut *tx)
+                .await
+                .map_sql_err()?;
+                apply_plan_wallet_credit_mysql(
+                    &mut tx,
+                    &order.wallet_id,
+                    &input.order_id,
+                    &order.payment_method,
+                    &entitlements,
+                    now,
+                )
+                .await?;
+            }
+
+            let mut gateway_response = payment_gateway_response_map(order.gateway_response.clone());
+            if let Some(serde_json::Value::Object(map)) = input.gateway_response_patch.clone() {
+                gateway_response.extend(map);
+            }
+            gateway_response.insert("manual_credit".to_string(), serde_json::Value::Bool(true));
+            gateway_response.insert(
+                "credited_by".to_string(),
+                input
+                    .operator_id
+                    .clone()
+                    .map(serde_json::Value::String)
+                    .unwrap_or(serde_json::Value::Null),
+            );
+            let gateway_response = json_string(
+                &serde_json::Value::Object(gateway_response),
+                "payment_orders.gateway_response",
+            )?;
+            let next_gateway_order_id = input.gateway_order_id.clone().or(order.gateway_order_id);
+            let next_pay_amount = input.pay_amount.or(order.pay_amount);
+            let next_pay_currency = input.pay_currency.clone().or(order.pay_currency);
+            let next_exchange_rate = input.exchange_rate.or(order.exchange_rate);
+            let next_paid_at = order.paid_at_unix_secs.unwrap_or(now as u64) as i64;
+
+            sqlx::query(
+                r#"
+UPDATE payment_orders
+SET gateway_order_id = ?,
+    gateway_response = ?,
+    pay_amount = ?,
+    pay_currency = ?,
+    exchange_rate = ?,
+    status = 'credited',
+    fulfillment_status = 'fulfilled',
+    fulfillment_error = NULL,
+    paid_at = ?,
+    credited_at = ?,
+    refundable_amount_usd = 0
+WHERE id = ?
+"#,
+            )
+            .bind(next_gateway_order_id.as_deref())
+            .bind(&gateway_response)
+            .bind(next_pay_amount)
+            .bind(next_pay_currency.as_deref())
+            .bind(next_exchange_rate)
+            .bind(next_paid_at)
+            .bind(now)
+            .bind(&input.order_id)
+            .execute(&mut *tx)
+            .await
+            .map_sql_err()?;
+            let order =
+                map_payment_order_row(&mysql_payment_order_by_id(&mut tx, &input.order_id).await?)?;
+            tx.commit().await.map_sql_err()?;
+            return Ok(WalletMutationOutcome::Applied((order, true)));
+        }
+
         let Some(wallet_row) = mysql_wallet_by_id_for_update(&mut tx, &order.wallet_id).await?
         else {
             tx.commit().await.map_sql_err()?;
@@ -2592,6 +3150,240 @@ fn json_string(value: &serde_json::Value, field_name: &str) -> Result<String, Da
     })
 }
 
+fn plan_entitlements_snapshot(snapshot: &serde_json::Value) -> serde_json::Value {
+    snapshot
+        .get("entitlements")
+        .or_else(|| snapshot.get("entitlements_json"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]))
+}
+
+fn plan_max_active_per_user(snapshot: &serde_json::Value) -> i64 {
+    snapshot
+        .get("max_active_per_user")
+        .and_then(|value| value.as_i64())
+        .unwrap_or(1)
+        .max(1)
+}
+
+fn plan_purchase_limit_scope(snapshot: &serde_json::Value) -> &str {
+    match snapshot
+        .get("purchase_limit_scope")
+        .and_then(|value| value.as_str())
+    {
+        Some("lifetime") => "lifetime",
+        Some("unlimited") => "unlimited",
+        _ => "active_period",
+    }
+}
+
+fn plan_replacement_entitlement_types(snapshot: &serde_json::Value) -> Vec<&'static str> {
+    let entitlements = plan_entitlements_snapshot(snapshot);
+    let mut kinds = Vec::new();
+    if entitlement_snapshot_has_type(&entitlements, "daily_quota") {
+        kinds.push("daily_quota");
+    }
+    if entitlement_snapshot_has_type(&entitlements, "membership_group") {
+        kinds.push("membership_group");
+    }
+    kinds
+}
+
+fn entitlement_snapshot_has_type(snapshot: &serde_json::Value, entitlement_type: &str) -> bool {
+    snapshot.as_array().is_some_and(|items| {
+        items
+            .iter()
+            .any(|item| item.get("type").and_then(|value| value.as_str()) == Some(entitlement_type))
+    })
+}
+
+async fn replace_matching_plan_entitlements_mysql(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    user_id: &str,
+    snapshot: &serde_json::Value,
+    now: i64,
+) -> Result<(), DataLayerError> {
+    let replacement_types = plan_replacement_entitlement_types(snapshot);
+    if replacement_types.is_empty() {
+        return Ok(());
+    }
+
+    let rows = sqlx::query(
+        r#"
+SELECT id, entitlements_snapshot
+FROM user_plan_entitlements
+WHERE user_id = ?
+  AND status = 'active'
+  AND expires_at > ?
+        "#,
+    )
+    .bind(user_id)
+    .bind(now)
+    .fetch_all(&mut **tx)
+    .await
+    .map_sql_err()?;
+
+    for row in rows {
+        let entitlements = optional_json(
+            get::<Option<String>>(&row, "entitlements_snapshot")?,
+            "user_plan_entitlements.entitlements_snapshot",
+        )?
+        .unwrap_or_else(|| serde_json::json!([]));
+        let should_replace = replacement_types
+            .iter()
+            .any(|kind| entitlement_snapshot_has_type(&entitlements, kind));
+        if !should_replace {
+            continue;
+        }
+        let entitlement_id: String = get(&row, "id")?;
+        sqlx::query(
+            r#"
+UPDATE user_plan_entitlements
+SET status = 'replaced',
+    expires_at = CASE WHEN expires_at > ? THEN ? ELSE expires_at END,
+    updated_at = ?
+WHERE id = ?
+  AND status = 'active'
+  AND expires_at > ?
+        "#,
+        )
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .bind(entitlement_id)
+        .bind(now)
+        .execute(&mut **tx)
+        .await
+        .map_sql_err()?;
+    }
+    Ok(())
+}
+
+fn plan_expires_at_unix(snapshot: &serde_json::Value, starts_at_unix_secs: i64) -> i64 {
+    let duration_value = snapshot
+        .get("duration_value")
+        .and_then(|value| value.as_i64())
+        .unwrap_or(1)
+        .max(1);
+    let days = match snapshot
+        .get("duration_unit")
+        .and_then(|value| value.as_str())
+        .unwrap_or("month")
+    {
+        "day" | "custom" => duration_value,
+        "year" => 365 * duration_value,
+        _ => 30 * duration_value,
+    };
+    starts_at_unix_secs.saturating_add(days.saturating_mul(86_400))
+}
+
+async fn apply_plan_wallet_credit_mysql(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    wallet_id: &str,
+    order_id: &str,
+    payment_method: &str,
+    entitlements: &serde_json::Value,
+    now: i64,
+) -> Result<(), DataLayerError> {
+    let credits = entitlements
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|item| item.get("type").and_then(|value| value.as_str()) == Some("wallet_credit"))
+        .filter_map(|item| {
+            let amount = item.get("amount_usd").and_then(|value| value.as_f64())?;
+            if amount <= 0.0 || !amount.is_finite() {
+                return None;
+            }
+            let bucket = item
+                .get("balance_bucket")
+                .and_then(|value| value.as_str())
+                .unwrap_or("gift")
+                .to_ascii_lowercase();
+            Some((amount, bucket))
+        })
+        .collect::<Vec<_>>();
+    if credits.is_empty() {
+        return Ok(());
+    }
+    let Some(wallet_row) = sqlx::query(
+        "SELECT id, status, balance, gift_balance FROM wallets WHERE id = ? LIMIT 1 FOR UPDATE",
+    )
+    .bind(wallet_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_sql_err()?
+    else {
+        return Err(DataLayerError::UnexpectedValue(
+            "wallet not found for plan wallet_credit".to_string(),
+        ));
+    };
+    let status: String = get(&wallet_row, "status")?;
+    if status != "active" {
+        return Err(DataLayerError::UnexpectedValue(
+            "wallet is not active for plan wallet_credit".to_string(),
+        ));
+    }
+    let mut recharge_balance: f64 = get(&wallet_row, "balance")?;
+    let mut gift_balance: f64 = get(&wallet_row, "gift_balance")?;
+    for (amount, bucket) in credits {
+        let before_recharge = recharge_balance;
+        let before_gift = gift_balance;
+        let before_total = before_recharge + before_gift;
+        let credits_recharge = bucket == "recharge";
+        if credits_recharge {
+            recharge_balance += amount;
+        } else {
+            gift_balance += amount;
+        }
+        let after_total = recharge_balance + gift_balance;
+        sqlx::query(
+            r#"
+UPDATE wallets
+SET balance = ?,
+    gift_balance = ?,
+    total_recharged = total_recharged + ?,
+    updated_at = ?
+WHERE id = ?
+            "#,
+        )
+        .bind(recharge_balance)
+        .bind(gift_balance)
+        .bind(if credits_recharge { amount } else { 0.0 })
+        .bind(now)
+        .bind(wallet_id)
+        .execute(&mut **tx)
+        .await
+        .map_sql_err()?;
+        sqlx::query(
+            r#"
+INSERT INTO wallet_transactions (
+  id, wallet_id, category, reason_code, amount, balance_before, balance_after,
+  recharge_balance_before, recharge_balance_after, gift_balance_before,
+  gift_balance_after, link_type, link_id, operator_id, description, created_at
+)
+VALUES (?, ?, 'recharge', 'plan_wallet_credit', ?, ?, ?, ?, ?, ?, ?, 'payment_order', ?, NULL, ?, ?)
+            "#,
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(wallet_id)
+        .bind(amount)
+        .bind(before_total)
+        .bind(after_total)
+        .bind(before_recharge)
+        .bind(recharge_balance)
+        .bind(before_gift)
+        .bind(gift_balance)
+        .bind(order_id)
+        .bind(format!("套餐附赠余额({payment_method})"))
+        .bind(now)
+        .execute(&mut **tx)
+        .await
+        .map_sql_err()?;
+    }
+    Ok(())
+}
+
 fn default_refund_mode_for_payment_method(payment_method: &str) -> &'static str {
     if matches!(
         payment_method,
@@ -2752,6 +3544,7 @@ fn payment_order_select_sql(where_clause: &str) -> String {
 SELECT
   id, order_no, wallet_id, user_id, amount_usd, pay_amount, pay_currency,
   exchange_rate, refunded_amount_usd, refundable_amount_usd, payment_method,
+  payment_provider, payment_channel, order_kind, product_id, product_snapshot,
   gateway_order_id, gateway_response, status,
   created_at AS created_at_unix_ms,
   paid_at AS paid_at_unix_secs,

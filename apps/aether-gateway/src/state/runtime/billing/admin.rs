@@ -1,7 +1,9 @@
 use super::{
     AdminBillingCollectorRecord, AdminBillingCollectorWriteInput, AdminBillingMutationOutcome,
     AdminBillingPresetApplyResult, AdminBillingRuleRecord, AdminBillingRuleWriteInput, AppState,
-    GatewayError, LocalMutationOutcome,
+    BillingPlanRecord, BillingPlanWriteInput, GatewayError, LocalMutationOutcome,
+    PaymentGatewayConfigRecord, PaymentGatewayConfigWriteInput, UserDailyQuotaAvailabilityRecord,
+    UserPlanEntitlementRecord,
 };
 
 fn data_error(err: impl ToString) -> GatewayError {
@@ -403,6 +405,113 @@ impl AppState {
             .apply_admin_billing_preset(preset, mode, collectors)
             .await
             .map(local_mutation_outcome)
+            .map_err(data_error)
+    }
+
+    pub(crate) async fn find_payment_gateway_config(
+        &self,
+        provider: &str,
+    ) -> Result<Option<PaymentGatewayConfigRecord>, GatewayError> {
+        self.data
+            .find_payment_gateway_config(provider)
+            .await
+            .map_err(data_error)
+    }
+
+    pub(crate) async fn upsert_payment_gateway_config(
+        &self,
+        input: &PaymentGatewayConfigWriteInput,
+    ) -> Result<LocalMutationOutcome<PaymentGatewayConfigRecord>, GatewayError> {
+        self.data
+            .upsert_payment_gateway_config(input)
+            .await
+            .map(local_mutation_outcome)
+            .map_err(data_error)
+    }
+
+    pub(crate) async fn list_billing_plans(
+        &self,
+        include_disabled: bool,
+    ) -> Result<Option<Vec<BillingPlanRecord>>, GatewayError> {
+        self.data
+            .list_billing_plans(include_disabled)
+            .await
+            .map_err(data_error)
+    }
+
+    pub(crate) async fn find_billing_plan(
+        &self,
+        plan_id: &str,
+    ) -> Result<Option<BillingPlanRecord>, GatewayError> {
+        self.data
+            .find_billing_plan(plan_id)
+            .await
+            .map_err(data_error)
+    }
+
+    pub(crate) async fn create_billing_plan(
+        &self,
+        input: &BillingPlanWriteInput,
+    ) -> Result<LocalMutationOutcome<BillingPlanRecord>, GatewayError> {
+        self.data
+            .create_billing_plan(input)
+            .await
+            .map(local_mutation_outcome)
+            .map_err(data_error)
+    }
+
+    pub(crate) async fn update_billing_plan(
+        &self,
+        plan_id: &str,
+        input: &BillingPlanWriteInput,
+    ) -> Result<LocalMutationOutcome<BillingPlanRecord>, GatewayError> {
+        self.data
+            .update_billing_plan(plan_id, input)
+            .await
+            .map(local_mutation_outcome)
+            .map_err(data_error)
+    }
+
+    pub(crate) async fn set_billing_plan_enabled(
+        &self,
+        plan_id: &str,
+        enabled: bool,
+    ) -> Result<LocalMutationOutcome<BillingPlanRecord>, GatewayError> {
+        self.data
+            .set_billing_plan_enabled(plan_id, enabled)
+            .await
+            .map(local_mutation_outcome)
+            .map_err(data_error)
+    }
+
+    pub(crate) async fn delete_billing_plan(
+        &self,
+        plan_id: &str,
+    ) -> Result<LocalMutationOutcome<()>, GatewayError> {
+        self.data
+            .delete_billing_plan(plan_id)
+            .await
+            .map(local_mutation_outcome)
+            .map_err(data_error)
+    }
+
+    pub(crate) async fn list_user_plan_entitlements(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<Vec<UserPlanEntitlementRecord>>, GatewayError> {
+        self.data
+            .list_user_plan_entitlements(user_id)
+            .await
+            .map_err(data_error)
+    }
+
+    pub(crate) async fn find_user_daily_quota_availability(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<UserDailyQuotaAvailabilityRecord>, GatewayError> {
+        self.data
+            .find_user_daily_quota_availability(user_id)
+            .await
             .map_err(data_error)
     }
 }

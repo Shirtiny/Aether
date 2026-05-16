@@ -17,6 +17,9 @@ use aether_admin::system::{
 use aether_contracts::tunnel::{
     TUNNEL_RELAY_FORWARDED_BY_HEADER, TUNNEL_RELAY_OWNER_INSTANCE_HEADER,
 };
+use aether_data::repository::management_tokens::{
+    CreateManagementTokenRecord, StoredManagementTokenUserSummary,
+};
 use aether_data::repository::proxy_nodes::{ProxyNodeEventQuery, ProxyNodeMetricsStep};
 use axum::{
     body::{Body, Bytes},
@@ -27,6 +30,12 @@ use axum::{
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
+
+use crate::handlers::public::build_proxy_node_install_session_response;
+use crate::handlers::shared::generate_gateway_secret_plaintext;
+use crate::LocalMutationOutcome;
 
 #[derive(Debug, Deserialize)]
 struct ProxyNodeRegisterRequest {
@@ -120,6 +129,11 @@ struct ProxyNodeTestUrlRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct ProxyNodeInstallSessionCreateRequest {
+    node_name: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct ProxyNodeBatchUpgradeRequest {
     version: String,
     #[serde(default)]
@@ -208,6 +222,7 @@ impl Drop for ProxyConnectivityProbeUrlOverrideGuard {
 pub(crate) async fn maybe_build_local_admin_proxy_nodes_response(
     state: &AdminAppState<'_>,
     request_context: &AdminRequestContext<'_>,
+    headers: &http::HeaderMap,
     request_body: Option<&Bytes>,
 ) -> Result<Option<Response<Body>>, GatewayError> {
     let Some(decision) = request_context.decision() else {
@@ -429,6 +444,37 @@ pub(crate) async fn maybe_build_local_admin_proxy_nodes_response(
                 "node": build_admin_proxy_node_payload(&node),
             }))
             .into_response(),
+        ));
+    }
+
+    if decision.route_kind.as_deref() == Some("create_proxy_node_install_session")
+        && request_context.method() == http::Method::POST
+    {
+        if !state.app().has_management_token_writer() {
+            return Ok(Some(build_admin_proxy_nodes_data_unavailable_response()));
+        }
+        let input = match parse_json_body::<ProxyNodeInstallSessionCreateRequest>(request_body) {
+            Ok(input) => input,
+            Err(response) => return Ok(Some(response)),
+        };
+        let node_name = match validate_proxy_install_node_name(&input.node_name) {
+            Ok(node_name) => node_name,
+            Err(response) => return Ok(Some(response)),
+        };
+        let raw_token =
+            match create_proxy_install_management_token(state, request_context, &node_name).await {
+                Ok(token) => token,
+                Err(response) => return Ok(Some(response)),
+            };
+        return Ok(Some(
+            build_proxy_node_install_session_response(
+                state.app(),
+                request_context.public(),
+                headers,
+                node_name,
+                raw_token,
+            )
+            .await,
         ));
     }
 
@@ -2019,6 +2065,121 @@ fn validate_optional_object(value: Option<&Value>, field: &str) -> Result<(), Re
         return Err(bad_request_response(format!("{field} 必须是 JSON 对象")));
     }
     Ok(())
+}
+
+fn validate_proxy_install_node_name(value: &str) -> Result<String, Response<Body>> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.chars().count() > 100 {
+        return Err(bad_request_response(
+            "节点名称不能为空，且不能超过 100 个字符",
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+fn generate_proxy_install_management_token_plaintext() -> String {
+    generate_gateway_secret_plaintext("ae", "-")
+}
+
+fn hash_proxy_install_management_token(value: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(value.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn proxy_install_management_token_prefix(value: &str) -> Option<String> {
+    (!value.is_empty()).then(|| value[..value.len().min(12)].to_string())
+}
+
+async fn create_proxy_install_management_token(
+    state: &AdminAppState<'_>,
+    request_context: &AdminRequestContext<'_>,
+    node_name: &str,
+) -> Result<String, Response<Body>> {
+    let Some(principal) = request_context
+        .decision()
+        .and_then(|decision| decision.admin_principal.as_ref())
+    else {
+        return Err((
+            http::StatusCode::UNAUTHORIZED,
+            Json(json!({ "detail": "未认证管理员" })),
+        )
+            .into_response());
+    };
+
+    let user = match state.app().find_user_auth_by_id(&principal.user_id).await {
+        Ok(value) => value,
+        Err(err) => {
+            return Err((
+                http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "detail": format!("admin user lookup failed: {err:?}") })),
+            )
+                .into_response())
+        }
+    };
+    let user = user
+        .map(|user| {
+            StoredManagementTokenUserSummary::new(
+                user.id,
+                user.email,
+                user.username,
+                user.role,
+            )
+        })
+        .unwrap_or_else(|| {
+            StoredManagementTokenUserSummary::new(
+                principal.user_id.clone(),
+                None,
+                principal.user_id.clone(),
+                principal.user_role.clone(),
+            )
+        })
+        .map_err(|err| {
+            (
+                http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "detail": format!("management token user summary build failed: {err:?}") })),
+            )
+                .into_response()
+        })?;
+
+    let raw_token = generate_proxy_install_management_token_plaintext();
+    let short_id = Uuid::new_v4()
+        .simple()
+        .to_string()
+        .chars()
+        .take(8)
+        .collect::<String>();
+    let record = CreateManagementTokenRecord {
+        id: Uuid::new_v4().to_string(),
+        user_id: user.id.clone(),
+        user,
+        token_hash: hash_proxy_install_management_token(&raw_token),
+        token_prefix: proxy_install_management_token_prefix(&raw_token),
+        name: format!("aether-proxy {node_name} {short_id}"),
+        description: Some("Created by proxy node one-click installer".to_string()),
+        allowed_ips: None,
+        permissions: Some(json!(["admin:proxy_nodes:write"])),
+        expires_at_unix_secs: None,
+        is_active: true,
+    };
+
+    match state.app().create_management_token(&record).await {
+        Ok(LocalMutationOutcome::Applied(_)) => Ok(raw_token),
+        Ok(LocalMutationOutcome::Invalid(detail)) => Err(bad_request_response(detail)),
+        Ok(LocalMutationOutcome::Unavailable) => {
+            Err(build_admin_proxy_nodes_data_unavailable_response())
+        }
+        Ok(LocalMutationOutcome::NotFound) => Err((
+            http::StatusCode::NOT_FOUND,
+            Json(json!({ "detail": "管理员不存在" })),
+        )
+            .into_response()),
+        Err(err) => Err((
+            http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "detail": format!("management token create failed: {err:?}") })),
+        )
+            .into_response()),
+    }
 }
 
 fn parse_proxy_node_event_query(

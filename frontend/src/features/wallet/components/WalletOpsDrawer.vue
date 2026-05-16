@@ -51,16 +51,41 @@
 
           <div class="p-4 sm:p-6 space-y-5">
             <div class="rounded-2xl border border-border/60 bg-muted/30 p-4">
-              <div class="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+              <div class="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
                 <div class="rounded-xl bg-background/80 p-3">
                   <div class="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
-                    总可用余额
+                    总可用额度
                   </div>
                   <div
                     class="mt-1 text-lg font-semibold"
-                    :class="localWallet.balance < 0 ? 'text-rose-600' : 'text-foreground'"
+                    :class="totalAvailableAmount !== null && totalAvailableAmount < 0 ? 'text-rose-600' : 'text-foreground'"
                   >
-                    ${{ formatFixed(localWallet.balance, 2) }}
+                    {{ totalAvailableAmount === null ? '不限额' : `$${formatFixed(totalAvailableAmount, 2)}` }}
+                  </div>
+                </div>
+                <div class="rounded-xl bg-background/80 p-3">
+                  <div class="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
+                    套餐今日额度
+                  </div>
+                  <div class="mt-1 text-lg font-semibold text-foreground">
+                    {{ isApiKeyWallet ? '不适用' : `$${formatFixed(packageBalanceAmount, 2)}` }}
+                  </div>
+                  <div
+                    v-if="dailyQuota?.has_active"
+                    class="mt-1 text-[11px] text-muted-foreground"
+                  >
+                    已用 ${{ formatFixed(dailyQuota.used_usd, 2) }} / ${{ formatFixed(dailyQuota.total_usd, 2) }}
+                  </div>
+                </div>
+                <div class="rounded-xl bg-background/80 p-3">
+                  <div class="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
+                    钱包余额
+                  </div>
+                  <div
+                    class="mt-1 text-lg font-semibold"
+                    :class="walletBalanceAmount < 0 ? 'text-rose-600' : 'text-foreground'"
+                  >
+                    ${{ formatFixed(walletBalanceAmount, 2) }}
                   </div>
                 </div>
                 <div class="rounded-xl bg-background/80 p-3">
@@ -88,6 +113,12 @@
                   </div>
                 </div>
               </div>
+              <p
+                v-if="!isApiKeyWallet"
+                class="mt-3 text-xs text-muted-foreground"
+              >
+                实际扣费顺序为套餐每日额度、充值余额、赠款余额；套餐额度不通过资金操作调整，请在用户套餐中发放或替换。
+              </p>
             </div>
 
             <Tabs v-model="activeTab">
@@ -583,6 +614,17 @@ const accentClasses = computed(() => {
   return props.accent === 'blue' ? 'bg-blue-500/10 text-blue-600' : 'bg-emerald-500/10 text-emerald-600'
 })
 const isApiKeyWallet = computed(() => localWallet.value?.owner_type === 'api_key')
+const dailyQuota = computed(() => localWallet.value?.daily_quota ?? null)
+const packageBalanceAmount = computed(() => toFiniteNumber(localWallet.value?.package_balance, 0))
+const walletBalanceAmount = computed(() => toFiniteNumber(localWallet.value?.wallet_balance ?? localWallet.value?.balance, 0))
+const totalAvailableAmount = computed(() => {
+  if (!localWallet.value) return 0
+  if (localWallet.value.unlimited || localWallet.value.total_available_balance === null) return null
+  return toFiniteNumber(
+    localWallet.value.total_available_balance,
+    walletBalanceAmount.value + packageBalanceAmount.value
+  )
+})
 const showRefunds = computed(() => props.showRefunds)
 const tabsListClass = computed(() => {
   return [
@@ -751,7 +793,7 @@ async function submitRecharge() {
   const totalAfter = totalBefore + actionAmount.value
   const confirmed = await confirm({
     title: '确认人工充值',
-    message: `将为 ${props.ownerName || '该钱包'} 充值 **$${formatFixed(actionAmount.value, 4)}**\n该账户**充值余额**将从 **$${formatFixed(rechargeBefore, 4)}** 变为 **$${formatFixed(rechargeAfter, 4)}**，**总可用余额**将从 **$${formatFixed(totalBefore, 4)}** 变为 **$${formatFixed(totalAfter, 4)}**`,
+    message: `将为 ${props.ownerName || '该钱包'} 充值 **$${formatFixed(actionAmount.value, 4)}**\n该账户**充值余额**将从 **$${formatFixed(rechargeBefore, 4)}** 变为 **$${formatFixed(rechargeAfter, 4)}**，**钱包余额**将从 **$${formatFixed(totalBefore, 4)}** 变为 **$${formatFixed(totalAfter, 4)}**`,
     confirmText: '确认充值',
     variant: 'warning',
   })
@@ -857,7 +899,7 @@ async function submitAdjust() {
     : `该账户**${balanceTypeLabel}**将从 **$${formatFixed(currentBucketBalance, 4)}** 变为 **$${formatFixed(afterBalance, 4)}**`
   const confirmed = await confirm({
     title: '确认钱包调账',
-    message: `将对 ${props.ownerName || '该钱包'} 的**${balanceTypeLabel}**${actionAmount.value > 0 ? '增加' : '扣减'} **$${formatFixed(Math.abs(actionAmount.value), 4)}**\n${detailLine}，**总可用余额**将从 **$${formatFixed(totalBefore, 4)}** 变为 **$${formatFixed(totalAfter, 4)}**`,
+    message: `将对 ${props.ownerName || '该钱包'} 的**${balanceTypeLabel}**${actionAmount.value > 0 ? '增加' : '扣减'} **$${formatFixed(Math.abs(actionAmount.value), 4)}**\n${detailLine}，**钱包余额**将从 **$${formatFixed(totalBefore, 4)}** 变为 **$${formatFixed(totalAfter, 4)}**`,
     confirmText: '确认调账',
     variant: 'warning',
   })

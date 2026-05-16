@@ -1,3 +1,4 @@
+use super::ADMIN_SYSTEM_DATA_EXPORT_VERSION;
 use crate::handlers::admin::request::AdminAppState;
 use crate::handlers::admin::system::shared::configs::is_sensitive_admin_system_config_key;
 use crate::handlers::admin::system::shared::export::{
@@ -305,6 +306,20 @@ impl<'a> AdminAppState<'a> {
             "user_groups": user_groups_data,
             "users": users_data,
             "standalone_keys": standalone_keys_data,
+        }))
+    }
+
+    pub(crate) async fn build_admin_system_data_export_payload(
+        &self,
+    ) -> Result<serde_json::Value, GatewayError> {
+        let config_data = self.build_admin_system_config_export_payload().await?;
+        let user_data = self.build_admin_system_users_export_payload().await?;
+
+        Ok(json!({
+            "version": ADMIN_SYSTEM_DATA_EXPORT_VERSION,
+            "exported_at": Utc::now().to_rfc3339(),
+            "config_data": config_data,
+            "user_data": user_data,
         }))
     }
 

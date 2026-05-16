@@ -185,7 +185,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: aether-rust-pioneer
+          ref: main
 
       - name: Update README download links
         env:

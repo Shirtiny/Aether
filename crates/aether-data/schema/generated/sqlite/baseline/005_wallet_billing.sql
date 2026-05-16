@@ -77,6 +77,13 @@ CREATE TABLE IF NOT EXISTS payment_orders (
     refunded_amount_usd REAL NOT NULL DEFAULT 0,
     refundable_amount_usd REAL NOT NULL DEFAULT 0,
     payment_method TEXT NOT NULL,
+    payment_provider TEXT,
+    payment_channel TEXT,
+    order_kind TEXT NOT NULL DEFAULT 'wallet_recharge',
+    product_id TEXT,
+    product_snapshot TEXT,
+    fulfillment_status TEXT NOT NULL DEFAULT 'pending',
+    fulfillment_error TEXT,
     gateway_order_id TEXT,
     gateway_response TEXT,
     status TEXT NOT NULL DEFAULT 'pending',
@@ -90,6 +97,23 @@ CREATE INDEX IF NOT EXISTS idx_payment_orders_wallet_created ON payment_orders (
 CREATE INDEX IF NOT EXISTS idx_payment_orders_user_created ON payment_orders (user_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_payment_orders_status ON payment_orders (status);
 CREATE INDEX IF NOT EXISTS idx_payment_orders_gateway_order_id ON payment_orders (gateway_order_id);
+CREATE INDEX IF NOT EXISTS idx_payment_orders_kind_status ON payment_orders (order_kind, status);
+CREATE INDEX IF NOT EXISTS idx_payment_orders_product ON payment_orders (product_id);
+
+CREATE TABLE IF NOT EXISTS payment_gateway_configs (
+    provider TEXT PRIMARY KEY NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 0,
+    endpoint_url TEXT NOT NULL,
+    callback_base_url TEXT,
+    merchant_id TEXT NOT NULL,
+    merchant_key_encrypted TEXT,
+    pay_currency TEXT NOT NULL DEFAULT 'CNY',
+    usd_exchange_rate REAL NOT NULL DEFAULT 7.2,
+    min_recharge_usd REAL NOT NULL DEFAULT 1,
+    channels_json TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS payment_callbacks (
     id TEXT PRIMARY KEY NOT NULL,
@@ -111,6 +135,53 @@ CREATE INDEX IF NOT EXISTS idx_payment_callbacks_order ON payment_callbacks (ord
 CREATE INDEX IF NOT EXISTS idx_payment_callbacks_gateway_order ON payment_callbacks (gateway_order_id);
 CREATE INDEX IF NOT EXISTS idx_payment_callbacks_created ON payment_callbacks (created_at);
 CREATE INDEX IF NOT EXISTS ix_payment_callbacks_payment_order_id ON payment_callbacks (payment_order_id);
+
+CREATE TABLE IF NOT EXISTS billing_plans (
+    id TEXT PRIMARY KEY NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT,
+    price_amount REAL NOT NULL,
+    price_currency TEXT NOT NULL DEFAULT 'CNY',
+    duration_unit TEXT NOT NULL,
+    duration_value INTEGER NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    max_active_per_user INTEGER NOT NULL DEFAULT 1,
+    purchase_limit_scope TEXT NOT NULL DEFAULT 'active_period',
+    entitlements_json TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_billing_plans_enabled_sort ON billing_plans (enabled, sort_order);
+
+CREATE TABLE IF NOT EXISTS user_plan_entitlements (
+    id TEXT PRIMARY KEY NOT NULL,
+    user_id TEXT NOT NULL,
+    plan_id TEXT NOT NULL,
+    payment_order_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    starts_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    entitlements_snapshot TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_user_plan_entitlements_user_active ON user_plan_entitlements (user_id, status, expires_at);
+CREATE INDEX IF NOT EXISTS idx_user_plan_entitlements_order ON user_plan_entitlements (payment_order_id);
+
+CREATE TABLE IF NOT EXISTS entitlement_usage_ledgers (
+    id TEXT PRIMARY KEY NOT NULL,
+    user_entitlement_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    amount_usd REAL NOT NULL,
+    balance_before REAL NOT NULL,
+    balance_after REAL NOT NULL,
+    usage_date TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE (user_entitlement_id, request_id)
+);
+CREATE INDEX IF NOT EXISTS idx_entitlement_usage_user_date ON entitlement_usage_ledgers (user_id, usage_date);
 
 CREATE TABLE IF NOT EXISTS refund_requests (
     id TEXT PRIMARY KEY NOT NULL,

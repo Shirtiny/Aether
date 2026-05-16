@@ -141,6 +141,25 @@ describe('usage status helpers', () => {
     })).toBe('failed')
   })
 
+  it('keeps active request lifecycle status authoritative over detail status code inference', () => {
+    expect(resolveTimelineFinalStatus({
+      requestStatus: 'streaming',
+      statusCode: 200,
+    })).toBe('streaming')
+
+    expect(resolveTimelineFinalStatus({
+      requestStatus: 'streaming',
+      statusCode: 503,
+      traceFinalStatus: 'failed',
+    })).toBe('streaming')
+
+    expect(resolveTimelineFinalStatus({
+      requestStatus: 'pending',
+      statusCode: 200,
+      traceFinalStatus: 'success',
+    })).toBe('pending')
+  })
+
   it('uses explicit has_fallback flag for transfer filtering', () => {
     expect(hasUsageFallback(buildUsageRecord({ has_fallback: true }))).toBe(true)
     expect(hasUsageFallback(buildUsageRecord({ has_fallback: false }))).toBe(false)

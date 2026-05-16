@@ -2,7 +2,7 @@
 set -euo pipefail
 
 REPO="${AETHER_REPO:-fawney19/Aether}"
-SOURCE_REF="${AETHER_SOURCE_REF:-aether-rust-pioneer}"
+SOURCE_REF="${AETHER_SOURCE_REF:-main}"
 VERSION="${AETHER_VERSION:-}"
 CHANNEL="${AETHER_CHANNEL:-stable}"
 CHANNEL_EXPLICIT="false"
@@ -10,9 +10,17 @@ if [[ -n "${AETHER_CHANNEL:-}" ]]; then
     CHANNEL_EXPLICIT="true"
 fi
 MODE="${AETHER_INSTALL_MODE:-auto}"
+INSTALL_ROOT_EXPLICIT="false"
+if [[ -n "${INSTALL_ROOT:-}" ]]; then
+    INSTALL_ROOT_EXPLICIT="true"
+fi
 INSTALL_ROOT="${INSTALL_ROOT:-/opt/aether}"
 CONFIG_DIR="${CONFIG_DIR:-/etc/aether}"
-COMPOSE_DIR="${AETHER_COMPOSE_DIR:-${INSTALL_ROOT}/compose}"
+COMPOSE_DIR="${AETHER_COMPOSE_DIR:-}"
+COMPOSE_DIR_EXPLICIT="false"
+if [[ -n "${AETHER_COMPOSE_DIR:-}" ]]; then
+    COMPOSE_DIR_EXPLICIT="true"
+fi
 IMAGE_REPO="${AETHER_IMAGE_REPO:-ghcr.io/fawney19/aether}"
 APP_IMAGE="${AETHER_APP_IMAGE:-}"
 SERVICE_USER_EXPLICIT="false"
@@ -60,15 +68,16 @@ Options:
                       beta resolves the latest tag like v0.7.0-beta.1
   --version VERSION    Exact release tag to install, for example v0.7.0-rc.1
   --repo OWNER/REPO    GitHub repository to download from (default: fawney19/Aether)
-  --source-ref REF     Source branch/tag used for compose templates (default: aether-rust-pioneer)
+  --source-ref REF     Source branch/tag used for compose templates (default: main)
   --archive PATH       Install from a local release tarball instead of downloading
   --download-url URL   Download the release archive from this URL instead of GitHub
   --env-file PATH      Use an existing aether-gateway.env file
-  --install-root PATH  Install root (default: /opt/aether)
-  --compose-dir PATH   Docker Compose deployment directory (default: /opt/aether/compose)
+  --install-root PATH  Install root for system service mode (default: /opt/aether)
+                      Also makes the default Docker Compose directory PATH/compose
+  --compose-dir PATH   Docker Compose deployment directory (default: current directory)
   --config-dir PATH    Config directory (default: /etc/aether)
   --lang LANG          Installer language: zh or en
-  --skip-start         Install files and unit, but do not restart the service
+  --skip-start         Install files, but do not start Docker Compose or restart the service
   --keep-releases N    Keep the latest N releases, prune older ones (default: 3, 0=disable)
   -h, --help           Show this help
 
@@ -225,16 +234,14 @@ parse_args() {
                 ;;
             --install-root)
                 [[ $# -ge 2 ]] || die "--install-root requires a path"
-                local previous_install_root="${INSTALL_ROOT}"
                 INSTALL_ROOT="$2"
-                if [[ "${COMPOSE_DIR}" == "${previous_install_root}/compose" ]]; then
-                    COMPOSE_DIR="${INSTALL_ROOT}/compose"
-                fi
+                INSTALL_ROOT_EXPLICIT="true"
                 shift 2
                 ;;
             --compose-dir)
                 [[ $# -ge 2 ]] || die "--compose-dir requires a path"
                 COMPOSE_DIR="$2"
+                COMPOSE_DIR_EXPLICIT="true"
                 shift 2
                 ;;
             --config-dir)
@@ -694,6 +701,33 @@ raw_project_url() {
     printf 'https://raw.githubusercontent.com/%s/%s/%s' "${REPO}" "${SOURCE_REF}" "${path}"
 }
 
+same_path() {
+    local left="$1"
+    local right="$2"
+    local left_dir right_dir left_base right_base
+
+    [[ -e "${left}" && -e "${right}" ]] || return 1
+
+    left_dir="$(cd -- "$(dirname -- "${left}")" && pwd -P)"
+    right_dir="$(cd -- "$(dirname -- "${right}")" && pwd -P)"
+    left_base="$(basename -- "${left}")"
+    right_base="$(basename -- "${right}")"
+
+    [[ "${left_dir}/${left_base}" == "${right_dir}/${right_base}" ]]
+}
+
+resolve_compose_dir() {
+    if [[ -n "${COMPOSE_DIR}" ]]; then
+        return
+    fi
+
+    if [[ "${INSTALL_ROOT_EXPLICIT}" == "true" || "${COMPOSE_DIR_EXPLICIT}" == "true" ]]; then
+        COMPOSE_DIR="${INSTALL_ROOT}/compose"
+    else
+        COMPOSE_DIR="$(pwd -P)"
+    fi
+}
+
 install_project_file() {
     local source_path="$1"
     local target_path="$2"
@@ -703,10 +737,123 @@ install_project_file() {
 
     install -d -m 0755 "$(dirname "${target_path}")"
     if [[ -f "${script_dir}/${source_path}" ]]; then
-        install -m "${mode}" "${script_dir}/${source_path}" "${target_path}"
+        if same_path "${script_dir}/${source_path}" "${target_path}"; then
+            chmod "${mode}" "${target_path}"
+        else
+            install -m "${mode}" "${script_dir}/${source_path}" "${target_path}"
+        fi
     else
         download_to "$(raw_project_url "${source_path}")" "${target_path}"
         chmod "${mode}" "${target_path}"
+    fi
+}
+
+install_generate_keys_script() {
+    local target_path="$1"
+    local script_dir
+    script_dir="$(current_script_dir)"
+
+    install -d -m 0755 "$(dirname "${target_path}")"
+    if [[ -f "${script_dir}/generate_keys.sh" ]]; then
+        if same_path "${script_dir}/generate_keys.sh" "${target_path}"; then
+            chmod 0755 "${target_path}"
+        else
+            install -m 0755 "${script_dir}/generate_keys.sh" "${target_path}"
+        fi
+    else
+        write_generate_keys_script "${target_path}"
+    fi
+}
+
+ensure_directory() {
+    local path="$1"
+    local mode="${2:-0755}"
+    if [[ ! -d "${path}" ]]; then
+        install -d -m "${mode}" "${path}"
+    fi
+}
+
+require_compose_runtime() {
+    if docker compose version >/dev/null 2>&1; then
+        return
+    fi
+
+    if command -v docker-compose >/dev/null 2>&1; then
+        return
+    fi
+
+    if ui_is_zh; then
+        die "未找到可用的 Docker Compose，请先安装 Docker 和 Compose 插件"
+    else
+        die "no usable Docker Compose found; install Docker and the Compose plugin first"
+    fi
+}
+
+compose_command() {
+    if docker compose version >/dev/null 2>&1; then
+        printf '%s\n' "docker compose"
+    else
+        printf '%s\n' "docker-compose"
+    fi
+}
+
+compose_next_steps() {
+    local gateway_port
+    local compose_cmd
+    compose_cmd="$(compose_command)"
+    gateway_port="$(awk -F= '/^[[:space:]]*APP_PORT=/{print $2}' "${COMPOSE_DIR}/.env" | tail -n1 | tr -d '[:space:]')"
+    gateway_port="${gateway_port:-8084}"
+
+    cat <<EOF
+
+Install complete.
+
+Docker Compose service:
+  cd ${COMPOSE_DIR}
+  ${compose_cmd} ps
+  ${compose_cmd} logs -f app
+
+Health checks:
+  curl -fsS http://127.0.0.1:${gateway_port}/_gateway/health
+  curl -fsS http://127.0.0.1:${gateway_port}/readyz
+
+Install directory:
+  ${COMPOSE_DIR}
+
+EOF
+}
+
+compose_manual_start_steps() {
+    local compose_cmd
+    compose_cmd="$(compose_command)"
+
+    cat <<EOF
+
+Next steps:
+  cd ${COMPOSE_DIR}
+  ${compose_cmd} pull
+  ${compose_cmd} up -d
+  ${compose_cmd} logs -f app
+
+Generate a fresh key set any time:
+  cd ${COMPOSE_DIR}
+  ./generate_keys.sh
+EOF
+}
+
+start_compose_deployment() {
+    local compose_cmd
+    compose_cmd="$(compose_command)"
+
+    info "pulling Docker Compose images"
+    if [[ "${compose_cmd}" == "docker compose" ]]; then
+        docker compose pull
+        info "starting Docker Compose services"
+        docker compose up -d
+    else
+        docker-compose pull
+        info "starting Docker Compose services"
+        docker-compose up -d
     fi
 }
 
@@ -1440,12 +1587,14 @@ EOF
 }
 
 install_compose_mode() {
+    resolve_compose_dir
     info "preparing Docker Compose deployment in ${COMPOSE_DIR}"
-    install -d -m 0755 "${COMPOSE_DIR}" "${COMPOSE_DIR}/logs"
+    ensure_directory "${COMPOSE_DIR}"
+    ensure_directory "${COMPOSE_DIR}/logs"
 
     install_project_file "docker-compose.yml" "${COMPOSE_DIR}/docker-compose.yml" "0644"
     install_project_file ".env.example" "${COMPOSE_DIR}/.env.example" "0644"
-    write_generate_keys_script "${COMPOSE_DIR}/generate_keys.sh"
+    install_generate_keys_script "${COMPOSE_DIR}/generate_keys.sh"
 
     if [[ -f "${COMPOSE_DIR}/.env" ]]; then
         warn "keeping existing ${COMPOSE_DIR}/.env"
@@ -1463,26 +1612,28 @@ Docker Compose files are ready:
   ${COMPOSE_DIR}/.env.example
   ${COMPOSE_DIR}/generate_keys.sh
   ${COMPOSE_DIR}/logs
-
-Next steps:
-  cd ${COMPOSE_DIR}
-  docker compose pull
-  docker compose up -d
-  docker compose logs -f app
-
-Generate a fresh key set any time:
-  cd ${COMPOSE_DIR}
-  ./generate_keys.sh
 EOF
+
+    if [[ "${SKIP_START}" == "true" ]]; then
+        compose_manual_start_steps
+        return
+    fi
+
+    require_compose_runtime
+    start_compose_deployment
+    compose_next_steps
 }
 
 install_compose_sqlite_mode() {
+    resolve_compose_dir
     info "preparing Docker Compose SQLite deployment in ${COMPOSE_DIR}"
-    install -d -m 0755 "${COMPOSE_DIR}" "${COMPOSE_DIR}/logs" "${COMPOSE_DIR}/data"
+    ensure_directory "${COMPOSE_DIR}"
+    ensure_directory "${COMPOSE_DIR}/logs"
+    ensure_directory "${COMPOSE_DIR}/data"
 
     install_project_file "docker-compose.sqlite.yml" "${COMPOSE_DIR}/docker-compose.yml" "0644"
     install_project_file ".env.example" "${COMPOSE_DIR}/.env.example" "0644"
-    write_generate_keys_script "${COMPOSE_DIR}/generate_keys.sh"
+    install_generate_keys_script "${COMPOSE_DIR}/generate_keys.sh"
 
     if [[ -f "${COMPOSE_DIR}/.env" ]]; then
         warn "keeping existing ${COMPOSE_DIR}/.env"
@@ -1501,17 +1652,16 @@ Docker Compose SQLite files are ready:
   ${COMPOSE_DIR}/generate_keys.sh
   ${COMPOSE_DIR}/data
   ${COMPOSE_DIR}/logs
-
-Next steps:
-  cd ${COMPOSE_DIR}
-  docker compose pull
-  docker compose up -d
-  docker compose logs -f app
-
-Generate a fresh key set any time:
-  cd ${COMPOSE_DIR}
-  ./generate_keys.sh
 EOF
+
+    if [[ "${SKIP_START}" == "true" ]]; then
+        compose_manual_start_steps
+        return
+    fi
+
+    require_compose_runtime
+    start_compose_deployment
+    compose_next_steps
 }
 
 install_env_file() {

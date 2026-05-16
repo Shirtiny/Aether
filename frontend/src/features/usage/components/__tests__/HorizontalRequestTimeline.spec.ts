@@ -350,6 +350,35 @@ describe('HorizontalRequestTimeline', () => {
     expect(nodeDot?.classList.contains('status-success')).toBe(false)
   })
 
+  it('keeps emitted trace state active while the request lifecycle is still streaming', async () => {
+    const onTraceState = vi.fn()
+    const trace = buildTrace([
+      buildCandidate({
+        id: 'cand-stale-failed',
+        provider_id: 'provider-stale',
+        provider_name: 'Provider Stale',
+        key_id: 'key-stale',
+        key_name: 'Stale Key',
+        candidate_index: 0,
+        status: 'failed',
+        status_code: 503,
+      }),
+    ])
+    trace.final_status = 'failed'
+
+    mountTimeline(trace, {
+      requestStatus: 'streaming',
+      overrideStatusCode: 200,
+      onTraceState,
+    })
+    await nextTick()
+
+    const lastCall = onTraceState.mock.calls.at(-1)?.[0]
+    expect(lastCall).toMatchObject({
+      finalStatus: 'streaming',
+    })
+  })
+
   it('shows request path from request metadata', async () => {
     const trace = buildTrace([
       buildCandidate({

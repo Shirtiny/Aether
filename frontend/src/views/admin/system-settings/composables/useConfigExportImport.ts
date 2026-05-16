@@ -2,6 +2,8 @@ import { ref } from 'vue'
 import { useToast } from '@/composables/useToast'
 import {
   adminApi,
+  type AggregateExportData,
+  type AggregateImportResponse,
   type ConfigExportData,
   type ConfigImportResponse,
   type UsersExportData,
@@ -11,8 +13,9 @@ import { parseApiError } from '@/utils/errorParser'
 import { log } from '@/utils/logger'
 import type { SystemConfig } from './useSystemConfig'
 
-// 文件大小限制 (10MB)
+// 文件大小限制：聚合数据包含配置和用户数据，允许更大的备份文件。
 const MAX_FILE_SIZE = 10 * 1024 * 1024
+const MAX_AGGREGATE_FILE_SIZE = 20 * 1024 * 1024
 
 type JsonObject = Record<string, unknown>
 
@@ -41,6 +44,23 @@ function looksLikeUsersExport(value: JsonObject): boolean {
     || hasArrayField(value, 'user_groups')
 }
 
+function looksLikeAggregateExport(value: JsonObject): boolean {
+  return asJsonObject(value.config_data) != null
+    && asJsonObject(value.user_data) != null
+}
+
+function downloadJson(data: unknown, filename: string) {
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  document.body.appendChild(a)
+  a.click()
+  document.body.removeChild(a)
+  URL.revokeObjectURL(url)
+}
+
 export function useConfigExportImport(systemConfig: { value: SystemConfig }) {
   const { success, error } = useToast()
 
@@ -66,20 +86,25 @@ export function useConfigExportImport(systemConfig: { value: SystemConfig }) {
   const usersMergeMode = ref<'skip' | 'overwrite' | 'error'>('skip')
   const usersMergeModeSelectOpen = ref(false)
 
+  // 聚合数据导出/导入相关
+  const exportAggregateLoading = ref(false)
+  const importAggregateLoading = ref(false)
+  const aggregateImportDialogOpen = ref(false)
+  const aggregateImportResultDialogOpen = ref(false)
+  const aggregateImportPreview = ref<AggregateExportData | null>(null)
+  const aggregateImportResult = ref<AggregateImportResponse | null>(null)
+  const aggregateMergeMode = ref<'skip' | 'overwrite' | 'error'>('skip')
+  const aggregateMergeModeSelectOpen = ref(false)
+
   // 导出配置
   async function handleExportConfig() {
     exportLoading.value = true
     try {
       const data = await adminApi.exportConfig()
-      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = `${systemConfig.value.site_name.toLowerCase()}-config-${new Date().toISOString().slice(0, 10)}.json`
-      document.body.appendChild(a)
-      a.click()
-      document.body.removeChild(a)
-      URL.revokeObjectURL(url)
+      downloadJson(
+        data,
+        `${systemConfig.value.site_name.toLowerCase()}-config-${new Date().toISOString().slice(0, 10)}.json`,
+      )
       success('配置已导出')
     } catch (err) {
       error('导出配置失败')
@@ -173,15 +198,10 @@ export function useConfigExportImport(systemConfig: { value: SystemConfig }) {
     exportUsersLoading.value = true
     try {
       const data = await adminApi.exportUsers()
-      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = `${systemConfig.value.site_name.toLowerCase()}-users-${new Date().toISOString().slice(0, 10)}.json`
-      document.body.appendChild(a)
-      a.click()
-      document.body.removeChild(a)
-      URL.revokeObjectURL(url)
+      downloadJson(
+        data,
+        `${systemConfig.value.site_name.toLowerCase()}-users-${new Date().toISOString().slice(0, 10)}.json`,
+      )
       success('用户数据已导出')
     } catch (err) {
       error('导出用户数据失败')
@@ -280,6 +300,110 @@ export function useConfigExportImport(systemConfig: { value: SystemConfig }) {
     }
   }
 
+  // 导出聚合数据
+  async function handleExportAggregate() {
+    exportAggregateLoading.value = true
+    try {
+      const data = await adminApi.exportAggregateData()
+      downloadJson(
+        data,
+        `${systemConfig.value.site_name.toLowerCase()}-data-${new Date().toISOString().slice(0, 10)}.json`,
+      )
+      success('聚合数据已导出')
+    } catch (err) {
+      error('导出聚合数据失败')
+      log.error('导出聚合数据失败:', err)
+    } finally {
+      exportAggregateLoading.value = false
+    }
+  }
+
+  // 处理聚合数据文件选择
+  function handleAggregateFileSelect(event: Event) {
+    const input = event.target as HTMLInputElement
+    const file = input.files?.[0]
+    if (!file) return
+
+    if (file.size > MAX_AGGREGATE_FILE_SIZE) {
+      error('文件大小不能超过 20MB')
+      input.value = ''
+      return
+    }
+
+    const reader = new FileReader()
+    reader.onload = (e) => {
+      try {
+        const content = e.target?.result as string
+        const root = asJsonObject(JSON.parse(content))
+        if (!root) {
+          error('无效的聚合数据文件：JSON 顶层必须是对象')
+          return
+        }
+
+        if (!looksLikeAggregateExport(root)) {
+          if (looksLikeConfigExport(root)) {
+            error('这是配置导出文件，请使用“导入配置数据”')
+          } else if (looksLikeUsersExport(root)) {
+            error('这是用户数据导出文件，请使用“导入用户数据”')
+          } else {
+            error('无效的聚合数据文件：未找到配置数据和用户数据')
+          }
+          return
+        }
+
+        if (!root.version) {
+          error('无效的聚合数据文件：缺少版本信息')
+          return
+        }
+
+        const configData = asJsonObject(root.config_data)
+        const userData = asJsonObject(root.user_data)
+        if (!configData || !looksLikeConfigExport(configData)) {
+          error('无效的聚合数据文件：config_data 格式不正确')
+          return
+        }
+        if (!userData || !looksLikeUsersExport(userData)) {
+          error('无效的聚合数据文件：user_data 格式不正确')
+          return
+        }
+
+        const data = root as unknown as AggregateExportData
+        aggregateImportPreview.value = data
+        aggregateMergeMode.value = 'skip'
+        aggregateImportDialogOpen.value = true
+      } catch (err) {
+        error('解析聚合数据文件失败，请确保是有效的 JSON 文件')
+        log.error('解析聚合数据文件失败:', err)
+      }
+    }
+    reader.readAsText(file)
+
+    input.value = ''
+  }
+
+  // 确认导入聚合数据
+  async function confirmImportAggregate() {
+    if (!aggregateImportPreview.value) return
+
+    importAggregateLoading.value = true
+    try {
+      const result = await adminApi.importAggregateData({
+        ...aggregateImportPreview.value,
+        merge_mode: aggregateMergeMode.value,
+      })
+      aggregateImportResult.value = result
+      aggregateImportDialogOpen.value = false
+      aggregateMergeModeSelectOpen.value = false
+      aggregateImportResultDialogOpen.value = true
+      success('聚合数据导入成功')
+    } catch (err: unknown) {
+      error(parseApiError(err, '导入聚合数据失败'))
+      log.error('导入聚合数据失败:', err)
+    } finally {
+      importAggregateLoading.value = false
+    }
+  }
+
   return {
     // 配置导出/导入
     exportLoading,
@@ -309,5 +433,17 @@ export function useConfigExportImport(systemConfig: { value: SystemConfig }) {
     triggerUsersFileSelect,
     handleUsersFileSelect,
     confirmImportUsers,
+    // 聚合数据导出/导入
+    exportAggregateLoading,
+    importAggregateLoading,
+    aggregateImportDialogOpen,
+    aggregateImportResultDialogOpen,
+    aggregateImportPreview,
+    aggregateImportResult,
+    aggregateMergeMode,
+    aggregateMergeModeSelectOpen,
+    handleExportAggregate,
+    handleAggregateFileSelect,
+    confirmImportAggregate,
   }
 }

@@ -1,3 +1,7 @@
+use super::super::support_payment::payment_epay::{
+    build_epay_checkout_url, configured_epay_channels, epay_callback_base_url, load_epay_config,
+    resolve_epay_channel, EpayCheckoutInput,
+};
 use super::super::support_payment::payment_gateway::{
     CreateCheckoutSessionInput, PaymentGatewayRegistry,
 };
@@ -23,6 +27,10 @@ struct WalletCreateRechargeRequest {
     amount_usd: f64,
     payment_method: String,
     #[serde(default)]
+    payment_provider: Option<String>,
+    #[serde(default)]
+    payment_channel: Option<String>,
+    #[serde(default)]
     pay_amount: Option<f64>,
     #[serde(default)]
     pay_currency: Option<String>,
@@ -34,6 +42,8 @@ struct WalletCreateRechargeRequest {
 struct NormalizedWalletCreateRechargeRequest {
     amount_usd: f64,
     payment_method: String,
+    payment_provider: Option<String>,
+    payment_channel: Option<String>,
     pay_amount: Option<f64>,
     pay_currency: Option<String>,
     exchange_rate: Option<f64>,
@@ -49,6 +59,10 @@ fn normalize_wallet_create_recharge_request(
     if payment_method.is_empty() || payment_method.chars().count() > 30 {
         return Err("输入验证失败");
     }
+    let payment_provider = wallet_normalize_optional_string_field(payload.payment_provider, 30)?
+        .map(|value| value.to_ascii_lowercase());
+    let payment_channel = wallet_normalize_optional_string_field(payload.payment_channel, 30)?
+        .map(|value| value.to_ascii_lowercase());
     if matches!(payload.pay_amount, Some(value) if !value.is_finite() || value <= 0.0) {
         return Err("输入验证失败");
     }
@@ -63,6 +77,8 @@ fn normalize_wallet_create_recharge_request(
     Ok(NormalizedWalletCreateRechargeRequest {
         amount_usd: payload.amount_usd,
         payment_method,
+        payment_provider,
+        payment_channel,
         pay_amount: payload.pay_amount,
         pay_currency,
         exchange_rate: payload.exchange_rate,
@@ -300,71 +316,135 @@ pub(super) async fn handle_wallet_create_recharge(
     let now = Utc::now();
     let order_no = wallet_build_order_no(now);
     let expires_at = now + chrono::Duration::minutes(30);
-    let Some(adapter) = PaymentGatewayRegistry::get(&payload.payment_method) else {
-        return build_auth_error_response(
-            http::StatusCode::BAD_REQUEST,
-            format!("unsupported payment_method: {}", payload.payment_method),
-            false,
-        );
-    };
-    let checkout = match adapter.create_checkout_session(&CreateCheckoutSessionInput {
-        order_no: order_no.clone(),
-        amount_usd: payload.amount_usd,
-        expires_at,
-    }) {
-        Ok(value) => value,
-        Err(detail) => {
-            return build_auth_error_response(http::StatusCode::BAD_REQUEST, detail, false);
-        }
-    };
-    let outcome = match state
-        .create_wallet_recharge_order(
-            aether_data::repository::wallet::CreateWalletRechargeOrderInput {
-                preferred_wallet_id: wallet.as_ref().map(|value| value.id.clone()),
-                user_id: auth.user.id.clone(),
-                amount_usd: payload.amount_usd,
-                pay_amount: payload.pay_amount,
-                pay_currency: payload.pay_currency.clone(),
-                exchange_rate: payload.exchange_rate,
-                payment_method: payload.payment_method.clone(),
-                gateway_order_id: checkout.gateway_order_id,
-                gateway_response: checkout.gateway_response.clone(),
-                order_no,
-                expires_at_unix_secs: expires_at.timestamp().max(0) as u64,
-            },
-        )
-        .await
-    {
-        Ok(Some(value)) => value,
-        Ok(None) => return build_wallet_recharge_storage_unavailable_response(),
-        Err(err) => {
-            return build_auth_error_response(
-                http::StatusCode::INTERNAL_SERVER_ERROR,
-                format!("wallet recharge create failed: {err:?}"),
-                false,
-            )
-        }
-    };
-    let order_payload = match outcome {
-        aether_data::repository::wallet::CreateWalletRechargeOrderOutcome::Created(order) => {
-            wallet_payment_order_payload_from_record(&order)
-        }
-        aether_data::repository::wallet::CreateWalletRechargeOrderOutcome::WalletInactive => {
+    let uses_epay =
+        payload.payment_provider.as_deref() == Some("epay") || payload.payment_method == "epay";
+    if uses_epay {
+        let config = match load_epay_config(state).await {
+            Ok(value) => value,
+            Err(detail) => {
+                return build_auth_error_response(http::StatusCode::BAD_REQUEST, detail, false);
+            }
+        };
+        if payload.amount_usd < config.min_recharge_usd {
             return build_auth_error_response(
                 http::StatusCode::BAD_REQUEST,
-                "wallet is not active",
+                "充值金额低于支付网关最小金额",
                 false,
-            )
+            );
         }
-    };
-    build_auth_json_response(
-        http::StatusCode::OK,
-        json!({
-            "order": order_payload,
-            "payment_instructions": sanitize_wallet_gateway_response(Some(checkout.gateway_response)),
-        }),
-        None,
+        let requested_channel = payload.payment_channel.as_deref().or_else(|| {
+            (payload.payment_method != "epay").then_some(payload.payment_method.as_str())
+        });
+        let payment_channel = match resolve_epay_channel(&config, requested_channel) {
+            Ok(value) => value,
+            Err(detail) => {
+                return build_auth_error_response(http::StatusCode::BAD_REQUEST, detail, false);
+            }
+        };
+        let pay_amount = (payload.amount_usd * config.usd_exchange_rate * 100.0).round() / 100.0;
+        let Some(callback_base_url) = epay_callback_base_url(
+            config.callback_base_url.as_deref(),
+            headers,
+            request_context,
+        ) else {
+            return build_auth_error_response(
+                http::StatusCode::BAD_REQUEST,
+                "epay callback_base_url is required",
+                false,
+            );
+        };
+        let checkout = build_epay_checkout_url(
+            &config,
+            &EpayCheckoutInput {
+                order_no: order_no.clone(),
+                channel: payment_channel.clone(),
+                subject: "钱包充值".to_string(),
+                pay_amount,
+                notify_url: format!("{callback_base_url}/api/payment/epay/notify"),
+                return_url: format!("{callback_base_url}/api/payment/epay/return"),
+            },
+        );
+        let outcome = match state
+            .create_wallet_recharge_order(
+                aether_data::repository::wallet::CreateWalletRechargeOrderInput {
+                    preferred_wallet_id: wallet.as_ref().map(|value| value.id.clone()),
+                    user_id: auth.user.id.clone(),
+                    amount_usd: payload.amount_usd,
+                    pay_amount: Some(pay_amount),
+                    pay_currency: Some(config.pay_currency.clone()),
+                    exchange_rate: Some(config.usd_exchange_rate),
+                    payment_method: "epay".to_string(),
+                    payment_provider: Some("epay".to_string()),
+                    payment_channel: Some(payment_channel),
+                    gateway_order_id: order_no.clone(),
+                    gateway_response: checkout.clone(),
+                    order_no,
+                    expires_at_unix_secs: expires_at.timestamp().max(0) as u64,
+                },
+            )
+            .await
+        {
+            Ok(Some(value)) => value,
+            Ok(None) => return build_wallet_recharge_storage_unavailable_response(),
+            Err(err) => {
+                return build_auth_error_response(
+                    http::StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("wallet recharge create failed: {err:?}"),
+                    false,
+                )
+            }
+        };
+        let order_payload = match outcome {
+            aether_data::repository::wallet::CreateWalletRechargeOrderOutcome::Created(order) => {
+                wallet_payment_order_payload_from_record(&order)
+            }
+            aether_data::repository::wallet::CreateWalletRechargeOrderOutcome::WalletInactive => {
+                return build_auth_error_response(
+                    http::StatusCode::BAD_REQUEST,
+                    "wallet is not active",
+                    false,
+                )
+            }
+        };
+        return build_auth_json_response(
+            http::StatusCode::OK,
+            json!({
+                "order": order_payload,
+                "payment_instructions": sanitize_wallet_gateway_response(Some(checkout)),
+            }),
+            None,
+        );
+    }
+    build_auth_error_response(
+        http::StatusCode::BAD_REQUEST,
+        format!("unsupported payment_method: {}", payload.payment_method),
+        false,
     )
+}
+
+pub(super) async fn handle_wallet_recharge_options(
+    state: &AppState,
+    request_context: &GatewayPublicRequestContext,
+    headers: &http::HeaderMap,
+) -> Response<Body> {
+    if let Err(response) = resolve_authenticated_local_user(state, request_context, headers).await {
+        return response;
+    }
+    let mut methods = Vec::new();
+    if let Ok(config) = load_epay_config(state).await {
+        for channel in configured_epay_channels(&config) {
+            methods.push(json!({
+                "payment_method": "epay",
+                "payment_provider": "epay",
+                "payment_channel": channel.channel,
+                "display_name": channel.display_name,
+                "pay_currency": config.pay_currency,
+                "usd_exchange_rate": config.usd_exchange_rate,
+                "min_recharge_usd": config.min_recharge_usd,
+            }));
+        }
+    }
+    build_auth_json_response(http::StatusCode::OK, json!({ "items": methods }), None)
 }
 
 pub(super) async fn handle_wallet_recharge_list(

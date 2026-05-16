@@ -91,6 +91,7 @@ END $mig$;
 DO $mig$ BEGIN
   CREATE TYPE public.userrole AS ENUM (
     'admin',
+    'audit_admin',
     'user'
 );
 EXCEPTION WHEN duplicate_object THEN NULL;
@@ -459,6 +460,13 @@ CREATE TABLE IF NOT EXISTS public.payment_orders (
     refunded_amount_usd numeric(20,8) DEFAULT '0'::numeric NOT NULL,
     refundable_amount_usd numeric(20,8) DEFAULT '0'::numeric NOT NULL,
     payment_method character varying(30) NOT NULL,
+    payment_provider character varying(64),
+    payment_channel character varying(64),
+    order_kind character varying(64) DEFAULT 'wallet_recharge'::character varying NOT NULL,
+    product_id character varying(64),
+    product_snapshot jsonb,
+    fulfillment_status character varying(64) DEFAULT 'pending'::character varying NOT NULL,
+    fulfillment_error text,
     gateway_order_id character varying(128),
     gateway_response jsonb,
     status character varying(20) DEFAULT 'pending'::character varying NOT NULL,
@@ -466,6 +474,87 @@ CREATE TABLE IF NOT EXISTS public.payment_orders (
     paid_at timestamp with time zone,
     credited_at timestamp with time zone,
     expires_at timestamp with time zone
+);
+
+
+
+--
+-- Name: payment_gateway_configs; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE IF NOT EXISTS public.payment_gateway_configs (
+    provider character varying(64) NOT NULL,
+    enabled boolean DEFAULT false NOT NULL,
+    endpoint_url character varying(512) NOT NULL,
+    callback_base_url character varying(512),
+    merchant_id character varying(128) NOT NULL,
+    merchant_key_encrypted text,
+    pay_currency character varying(16) DEFAULT 'CNY'::character varying NOT NULL,
+    usd_exchange_rate numeric(18,8) DEFAULT 7.2 NOT NULL,
+    min_recharge_usd numeric(20,8) DEFAULT 1 NOT NULL,
+    channels_json jsonb,
+    created_at timestamp with time zone NOT NULL,
+    updated_at timestamp with time zone NOT NULL
+);
+
+
+
+--
+-- Name: billing_plans; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE IF NOT EXISTS public.billing_plans (
+    id character varying(64) NOT NULL,
+    title character varying(128) NOT NULL,
+    description text,
+    price_amount numeric(20,8) NOT NULL,
+    price_currency character varying(16) DEFAULT 'CNY'::character varying NOT NULL,
+    duration_unit character varying(32) NOT NULL,
+    duration_value bigint NOT NULL,
+    enabled boolean DEFAULT true NOT NULL,
+    sort_order bigint DEFAULT 0 NOT NULL,
+    max_active_per_user bigint DEFAULT 1 NOT NULL,
+    purchase_limit_scope character varying(32) DEFAULT 'active_period'::character varying NOT NULL,
+    entitlements_json jsonb NOT NULL,
+    created_at timestamp with time zone NOT NULL,
+    updated_at timestamp with time zone NOT NULL
+);
+
+
+
+--
+-- Name: user_plan_entitlements; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE IF NOT EXISTS public.user_plan_entitlements (
+    id character varying(64) NOT NULL,
+    user_id character varying(64) NOT NULL,
+    plan_id character varying(64) NOT NULL,
+    payment_order_id character varying(64) NOT NULL,
+    status character varying(64) DEFAULT 'active'::character varying NOT NULL,
+    starts_at timestamp with time zone NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    entitlements_snapshot jsonb NOT NULL,
+    created_at timestamp with time zone NOT NULL,
+    updated_at timestamp with time zone NOT NULL
+);
+
+
+
+--
+-- Name: entitlement_usage_ledgers; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE IF NOT EXISTS public.entitlement_usage_ledgers (
+    id character varying(64) NOT NULL,
+    user_entitlement_id character varying(64) NOT NULL,
+    user_id character varying(64) NOT NULL,
+    request_id character varying(128) NOT NULL,
+    amount_usd numeric(20,8) NOT NULL,
+    balance_before numeric(20,8) NOT NULL,
+    balance_after numeric(20,8) NOT NULL,
+    usage_date character varying(16) NOT NULL,
+    created_at timestamp with time zone NOT NULL
 );
 
 

@@ -9,10 +9,10 @@ use super::types::{
     AdminRedeemCodeBatchListQuery, AdminRedeemCodeListQuery, AdminWalletLedgerQuery,
     AdminWalletListQuery, AdminWalletRefundRequestListQuery, CompleteAdminWalletRefundInput,
     CreateAdminRedeemCodeBatchInput, CreateAdminRedeemCodeBatchResult,
-    CreateManualWalletRechargeInput, CreateWalletRechargeOrderInput,
-    CreateWalletRechargeOrderOutcome, CreateWalletRefundRequestInput,
-    CreateWalletRefundRequestOutcome, CreatedAdminRedeemCodePlaintext,
-    CreditAdminPaymentOrderInput, DeleteAdminRedeemCodeBatchInput,
+    CreateManualWalletRechargeInput, CreatePlanPurchaseOrderInput, CreatePlanPurchaseOrderOutcome,
+    CreateWalletRechargeOrderInput, CreateWalletRechargeOrderOutcome,
+    CreateWalletRefundRequestInput, CreateWalletRefundRequestOutcome,
+    CreatedAdminRedeemCodePlaintext, CreditAdminPaymentOrderInput, DeleteAdminRedeemCodeBatchInput,
     DisableAdminRedeemCodeBatchInput, DisableAdminRedeemCodeInput, FailAdminWalletRefundInput,
     ProcessAdminWalletRefundInput, ProcessPaymentCallbackInput, ProcessPaymentCallbackOutcome,
     RedeemWalletCodeInput, RedeemWalletCodeOutcome, StoredAdminPaymentCallback,
@@ -947,6 +947,118 @@ impl WalletWriteRepository for InMemoryWalletRepository {
         Ok(CreateWalletRechargeOrderOutcome::Created(order))
     }
 
+    async fn create_plan_purchase_order(
+        &self,
+        input: CreatePlanPurchaseOrderInput,
+    ) -> Result<CreatePlanPurchaseOrderOutcome, DataLayerError> {
+        let wallet_id = {
+            let wallets = self.wallets_by_id.read().expect("wallet repo lock");
+            let Some(wallet) = wallets
+                .values()
+                .find(|wallet| wallet.user_id.as_deref() == Some(input.user_id.as_str()))
+            else {
+                return Ok(CreatePlanPurchaseOrderOutcome::WalletInactive);
+            };
+            if wallet.status != "active" {
+                return Ok(CreatePlanPurchaseOrderOutcome::WalletInactive);
+            }
+            wallet.id.clone()
+        };
+        let max_active_per_user = input
+            .product_snapshot
+            .get("max_active_per_user")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(1)
+            .max(1);
+        let purchase_limit_scope = input
+            .product_snapshot
+            .get("purchase_limit_scope")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("active_period");
+        if purchase_limit_scope != "unlimited" {
+            let now_secs = current_unix_secs();
+            let existing_count = self
+                .payment_orders_by_id
+                .read()
+                .expect("wallet repo lock")
+                .values()
+                .filter(|order| order.user_id.as_deref() == Some(input.user_id.as_str()))
+                .filter(|order| {
+                    let Some(gateway_response) = order.gateway_response.as_ref() else {
+                        return false;
+                    };
+                    gateway_response
+                        .get("order_kind")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("plan_purchase")
+                        && gateway_response
+                            .get("product_id")
+                            .and_then(serde_json::Value::as_str)
+                            == Some(input.product_id.as_str())
+                })
+                .filter(|order| {
+                    if order.status == "pending" {
+                        return order
+                            .expires_at_unix_secs
+                            .is_some_and(|expires_at| expires_at > now_secs);
+                    }
+                    if purchase_limit_scope == "lifetime" {
+                        return order.status == "credited";
+                    }
+                    order.status == "credited"
+                        && order
+                            .expires_at_unix_secs
+                            .is_some_and(|expires_at| expires_at > now_secs)
+                })
+                .count() as i64;
+            if existing_count >= max_active_per_user {
+                return Ok(CreatePlanPurchaseOrderOutcome::ActivePlanLimitReached);
+            }
+        }
+        let mut gateway_response = match input.gateway_response {
+            serde_json::Value::Object(map) => map,
+            value => {
+                let mut map = serde_json::Map::new();
+                map.insert("raw".to_string(), value);
+                map
+            }
+        };
+        gateway_response.insert(
+            "order_kind".to_string(),
+            serde_json::Value::String("plan_purchase".to_string()),
+        );
+        gateway_response.insert(
+            "product_id".to_string(),
+            serde_json::Value::String(input.product_id),
+        );
+        gateway_response.insert("product_snapshot".to_string(), input.product_snapshot);
+        let order = StoredAdminPaymentOrder {
+            id: format!("payment-order-{}", uuid::Uuid::new_v4()),
+            order_no: input.order_no,
+            wallet_id,
+            user_id: Some(input.user_id),
+            amount_usd: input.amount_usd,
+            pay_amount: Some(input.pay_amount),
+            pay_currency: Some(input.pay_currency),
+            exchange_rate: Some(input.exchange_rate),
+            refunded_amount_usd: 0.0,
+            refundable_amount_usd: 0.0,
+            payment_method: input.payment_method,
+            gateway_order_id: Some(input.gateway_order_id),
+            gateway_response: Some(serde_json::Value::Object(gateway_response)),
+            status: "pending".to_string(),
+            created_at_unix_ms: current_unix_ms(),
+            paid_at_unix_secs: None,
+            credited_at_unix_secs: None,
+            expires_at_unix_secs: Some(input.expires_at_unix_secs),
+        };
+        self.payment_orders_by_id
+            .write()
+            .expect("wallet repo lock")
+            .insert(order.id.clone(), order.clone());
+        Ok(CreatePlanPurchaseOrderOutcome::Created(order))
+    }
+
     async fn create_wallet_refund_request(
         &self,
         input: CreateWalletRefundRequestInput,
@@ -1541,9 +1653,11 @@ impl WalletWriteRepository for InMemoryWalletRepository {
 mod tests {
     use super::{InMemoryWalletRepository, WalletReadSeed};
     use crate::repository::wallet::{
-        AdminWalletListQuery, StoredAdminPaymentOrder, StoredAdminWalletRefund,
-        StoredWalletSnapshot, WalletLookupKey, WalletReadRepository,
+        AdminWalletListQuery, CreatePlanPurchaseOrderInput, CreatePlanPurchaseOrderOutcome,
+        StoredAdminPaymentOrder, StoredAdminWalletRefund, StoredWalletSnapshot, WalletLookupKey,
+        WalletReadRepository, WalletWriteRepository,
     };
+    use serde_json::json;
 
     fn sample_wallet() -> StoredWalletSnapshot {
         StoredWalletSnapshot::new(
@@ -1760,6 +1874,110 @@ mod tests {
         assert!(today.is_none());
         assert_eq!(history.total, 0);
         assert!(history.items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn lifetime_plan_purchase_blocks_duplicate_pending_order_in_memory() {
+        let repository = InMemoryWalletRepository::seed(vec![sample_wallet()]);
+        let snapshot = json!({
+            "id": "first-plan",
+            "duration_unit": "month",
+            "duration_value": 1,
+            "max_active_per_user": 1,
+            "purchase_limit_scope": "lifetime",
+            "entitlements": [
+                {
+                    "type": "wallet_credit",
+                    "amount_usd": 1.0,
+                    "balance_bucket": "gift"
+                }
+            ]
+        });
+
+        let first = repository
+            .create_plan_purchase_order(CreatePlanPurchaseOrderInput {
+                preferred_wallet_id: None,
+                user_id: "user-1".to_string(),
+                amount_usd: 1.0,
+                pay_amount: 7.2,
+                pay_currency: "CNY".to_string(),
+                exchange_rate: 7.2,
+                payment_method: "alipay".to_string(),
+                payment_provider: Some("epay".to_string()),
+                payment_channel: Some("alipay".to_string()),
+                gateway_order_id: "gateway-first-plan-1".to_string(),
+                gateway_response: json!({ "checkout": true }),
+                order_no: "order-first-plan-1".to_string(),
+                product_id: "first-plan".to_string(),
+                product_snapshot: snapshot.clone(),
+                expires_at_unix_secs: 4_102_444_800,
+            })
+            .await
+            .expect("first plan purchase should resolve");
+        assert!(matches!(first, CreatePlanPurchaseOrderOutcome::Created(_)));
+
+        let duplicate = repository
+            .create_plan_purchase_order(CreatePlanPurchaseOrderInput {
+                preferred_wallet_id: None,
+                user_id: "user-1".to_string(),
+                amount_usd: 1.0,
+                pay_amount: 7.2,
+                pay_currency: "CNY".to_string(),
+                exchange_rate: 7.2,
+                payment_method: "alipay".to_string(),
+                payment_provider: Some("epay".to_string()),
+                payment_channel: Some("alipay".to_string()),
+                gateway_order_id: "gateway-first-plan-2".to_string(),
+                gateway_response: json!({ "checkout": true }),
+                order_no: "order-first-plan-2".to_string(),
+                product_id: "first-plan".to_string(),
+                product_snapshot: snapshot,
+                expires_at_unix_secs: 4_102_444_800,
+            })
+            .await
+            .expect("duplicate plan purchase should resolve");
+        assert!(matches!(
+            duplicate,
+            CreatePlanPurchaseOrderOutcome::ActivePlanLimitReached
+        ));
+
+        let unlimited_snapshot = json!({
+            "id": "unlimited-plan",
+            "duration_unit": "month",
+            "duration_value": 1,
+            "max_active_per_user": 1,
+            "purchase_limit_scope": "unlimited",
+            "entitlements": [
+                {
+                    "type": "wallet_credit",
+                    "amount_usd": 1.0,
+                    "balance_bucket": "gift"
+                }
+            ]
+        });
+        for index in 1..=2 {
+            let order = repository
+                .create_plan_purchase_order(CreatePlanPurchaseOrderInput {
+                    preferred_wallet_id: None,
+                    user_id: "user-1".to_string(),
+                    amount_usd: 1.0,
+                    pay_amount: 7.2,
+                    pay_currency: "CNY".to_string(),
+                    exchange_rate: 7.2,
+                    payment_method: "alipay".to_string(),
+                    payment_provider: Some("epay".to_string()),
+                    payment_channel: Some("alipay".to_string()),
+                    gateway_order_id: format!("gateway-unlimited-plan-{index}"),
+                    gateway_response: json!({ "checkout": true }),
+                    order_no: format!("order-unlimited-plan-{index}"),
+                    product_id: "unlimited-plan".to_string(),
+                    product_snapshot: unlimited_snapshot.clone(),
+                    expires_at_unix_secs: 4_102_444_800,
+                })
+                .await
+                .expect("unlimited plan purchase should resolve");
+            assert!(matches!(order, CreatePlanPurchaseOrderOutcome::Created(_)));
+        }
     }
 
     #[tokio::test]

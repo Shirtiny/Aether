@@ -1,6 +1,6 @@
 import apiClient from './client'
 import { buildCacheKey, cachedRequest } from '@/utils/cache'
-import type { RefundRequest, WalletSummary, WalletTransaction } from './wallet'
+import type { RefundRequest, WalletDailyQuotaSummary, WalletSummary, WalletTransaction } from './wallet'
 
 export interface AdminWallet extends WalletSummary {
   user_id: string | null
@@ -8,6 +8,11 @@ export interface AdminWallet extends WalletSummary {
   owner_type: 'user' | 'api_key'
   owner_name: string | null
   created_at: string
+  wallet_balance?: number | null
+  package_balance?: number | null
+  total_available_balance?: number | null
+  daily_quota?: WalletDailyQuotaSummary | null
+  deduction_order?: string[]
 }
 
 export interface AdminWalletListResponse {

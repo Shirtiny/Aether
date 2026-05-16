@@ -1,4 +1,6 @@
-use super::AdminAppState;
+use super::{
+    AdminAppState, ADMIN_SYSTEM_DATA_EXPORT_VERSION, ADMIN_SYSTEM_DATA_IMPORT_MAX_SIZE_BYTES,
+};
 use crate::api::ai::admin_endpoint_signature_parts;
 use crate::handlers::admin::provider::endpoints_admin::payloads::AdminProviderEndpointUpdatePatch;
 use crate::handlers::admin::provider::shared::payloads::{
@@ -54,6 +56,26 @@ fn invalid_request(detail: impl Into<String>) -> (http::StatusCode, Value) {
         http::StatusCode::BAD_REQUEST,
         json!({ "detail": detail.into() }),
     )
+}
+
+fn build_admin_system_data_import_part_body(
+    root: &Map<String, Value>,
+    field_name: &str,
+    merge_mode: AdminImportMergeMode,
+) -> Result<Bytes, (http::StatusCode, Value)> {
+    let mut part = match root.get(field_name) {
+        Some(Value::Object(map)) => map.clone(),
+        Some(_) => return Err(invalid_request(format!("{field_name} 必须是对象"))),
+        None => return Err(invalid_request(format!("{field_name} 为必填字段"))),
+    };
+
+    let merge_mode_value = serde_json::to_value(merge_mode)
+        .map_err(|err| invalid_request(format!("merge_mode 序列化失败: {err}")))?;
+    part.insert("merge_mode".to_string(), merge_mode_value);
+
+    serde_json::to_vec(&Value::Object(part))
+        .map(Bytes::from)
+        .map_err(|err| invalid_request(format!("{field_name} 序列化失败: {err}")))
 }
 
 fn trim_required(value: &str, field_name: &str) -> Result<String, String> {
@@ -893,6 +915,91 @@ fn normalize_imported_wallet_target(
 }
 
 impl<'a> AdminAppState<'a> {
+    pub(crate) async fn import_admin_system_data(
+        &self,
+        request_body: &Bytes,
+        operator_id: Option<&str>,
+    ) -> Result<Result<Value, (http::StatusCode, Value)>, GatewayError> {
+        if !self.has_global_model_data_reader()
+            || !self.has_global_model_data_writer()
+            || !self.has_provider_catalog_data_reader()
+            || !self.has_provider_catalog_data_writer()
+            || !self.has_auth_user_write_capability()
+            || !self.has_auth_wallet_write_capability()
+            || !self.has_auth_api_key_writer()
+        {
+            return Ok(Err((
+                http::StatusCode::SERVICE_UNAVAILABLE,
+                json!({ "detail": "Admin system data unavailable" }),
+            )));
+        }
+
+        if request_body.len() > ADMIN_SYSTEM_DATA_IMPORT_MAX_SIZE_BYTES {
+            return Ok(Err(invalid_request("请求体大小不能超过 20MB")));
+        }
+
+        let root = match serde_json::from_slice::<Value>(request_body) {
+            Ok(Value::Object(map)) => map,
+            _ => return Ok(Err(invalid_request("请求数据验证失败"))),
+        };
+
+        let version = root
+            .get("version")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| invalid_request("version 为必填字段"));
+        let version = match version {
+            Ok(value) => value,
+            Err(err) => return Ok(Err(err)),
+        };
+        if version != ADMIN_SYSTEM_DATA_EXPORT_VERSION {
+            return Ok(Err(invalid_request(format!(
+                "不支持的聚合数据版本: {version}，支持的版本: {ADMIN_SYSTEM_DATA_EXPORT_VERSION}"
+            ))));
+        }
+
+        let merge_mode = match serde_json::from_value::<AdminImportMergeMode>(
+            root.get("merge_mode").cloned().unwrap_or(Value::Null),
+        ) {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(Err(invalid_request(
+                    "merge_mode 仅支持 skip / overwrite / error",
+                )))
+            }
+        };
+
+        let config_body =
+            match build_admin_system_data_import_part_body(&root, "config_data", merge_mode) {
+                Ok(value) => value,
+                Err(err) => return Ok(Err(err)),
+            };
+        let users_body =
+            match build_admin_system_data_import_part_body(&root, "user_data", merge_mode) {
+                Ok(value) => value,
+                Err(err) => return Ok(Err(err)),
+            };
+
+        let config_result = match self.import_admin_system_config(&config_body).await? {
+            Ok(payload) => payload,
+            Err(err) => return Ok(Err(err)),
+        };
+        let users_result = match self
+            .import_admin_system_users(&users_body, operator_id)
+            .await?
+        {
+            Ok(payload) => payload,
+            Err(err) => return Ok(Err(err)),
+        };
+
+        Ok(Ok(json!({
+            "message": "聚合数据导入成功",
+            "config": config_result,
+            "users": users_result,
+        })))
+    }
+
     pub(crate) async fn import_admin_system_config(
         &self,
         request_body: &Bytes,

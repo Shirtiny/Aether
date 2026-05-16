@@ -3,13 +3,13 @@ use sqlx::{sqlite::SqliteRow, Row};
 
 use super::types::{
     bucket_start_unix_secs, build_tunnel_error_event_detail, build_tunnel_metrics_sample,
-    normalize_proxy_metadata, reconcile_remote_config_after_heartbeat, ProxyNodeEventQuery,
-    ProxyNodeHeartbeatMutation, ProxyNodeManualCreateMutation, ProxyNodeManualUpdateMutation,
-    ProxyNodeMetricsCleanupSummary, ProxyNodeMetricsStep, ProxyNodeReadRepository,
-    ProxyNodeRegistrationMutation, ProxyNodeRemoteConfigMutation, ProxyNodeTrafficMutation,
-    ProxyNodeTunnelStatusMutation, ProxyNodeWriteRepository, StoredProxyFleetMetricsBucket,
-    StoredProxyNode, StoredProxyNodeEvent, StoredProxyNodeMetricsBucket,
-    PROXY_NODE_EVENT_TYPE_TUNNEL_ERROR,
+    log_reported_tunnel_error_event, normalize_proxy_metadata,
+    reconcile_remote_config_after_heartbeat, ProxyNodeEventQuery, ProxyNodeHeartbeatMutation,
+    ProxyNodeManualCreateMutation, ProxyNodeManualUpdateMutation, ProxyNodeMetricsCleanupSummary,
+    ProxyNodeMetricsStep, ProxyNodeReadRepository, ProxyNodeRegistrationMutation,
+    ProxyNodeRemoteConfigMutation, ProxyNodeTrafficMutation, ProxyNodeTunnelStatusMutation,
+    ProxyNodeWriteRepository, StoredProxyFleetMetricsBucket, StoredProxyNode, StoredProxyNodeEvent,
+    StoredProxyNodeMetricsBucket, PROXY_NODE_EVENT_TYPE_TUNNEL_ERROR,
 };
 use crate::driver::sqlite::SqlitePool;
 use crate::error::SqlResultExt;
@@ -833,6 +833,7 @@ WHERE is_manual = 0
             .await?;
 
             for error in &sample.recent_error_events {
+                log_reported_tunnel_error_event(&node.id, error, now_unix_secs);
                 let detail = build_tunnel_error_event_detail(error);
                 let event_metadata = serde_json::json!({
                     "source": "heartbeat",
@@ -843,6 +844,7 @@ WHERE is_manual = 0
                     "summary": error.summary.as_deref(),
                     "operator_action": error.operator_action.as_deref(),
                     "timestamp_unix_secs": error.timestamp_unix_secs,
+                    "timestamp_unix_ms": error.timestamp_unix_ms,
                 });
                 self.insert_event(
                     &node.id,

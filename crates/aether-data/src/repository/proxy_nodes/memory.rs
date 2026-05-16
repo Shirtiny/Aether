@@ -8,13 +8,13 @@ use uuid::Uuid;
 
 use super::types::{
     bucket_start_unix_secs, build_tunnel_error_event_detail, build_tunnel_metrics_sample,
-    normalize_proxy_metadata, reconcile_remote_config_after_heartbeat, ProxyNodeEventQuery,
-    ProxyNodeHeartbeatMutation, ProxyNodeManualCreateMutation, ProxyNodeManualUpdateMutation,
-    ProxyNodeMetricsCleanupSummary, ProxyNodeMetricsStep, ProxyNodeReadRepository,
-    ProxyNodeRegistrationMutation, ProxyNodeRemoteConfigMutation, ProxyNodeTrafficMutation,
-    ProxyNodeTunnelStatusMutation, ProxyNodeWriteRepository, StoredProxyFleetMetricsBucket,
-    StoredProxyNode, StoredProxyNodeEvent, StoredProxyNodeMetricsBucket, TunnelMetricsSample,
-    PROXY_NODE_EVENT_TYPE_TUNNEL_ERROR,
+    log_reported_tunnel_error_event, normalize_proxy_metadata,
+    reconcile_remote_config_after_heartbeat, ProxyNodeEventQuery, ProxyNodeHeartbeatMutation,
+    ProxyNodeManualCreateMutation, ProxyNodeManualUpdateMutation, ProxyNodeMetricsCleanupSummary,
+    ProxyNodeMetricsStep, ProxyNodeReadRepository, ProxyNodeRegistrationMutation,
+    ProxyNodeRemoteConfigMutation, ProxyNodeTrafficMutation, ProxyNodeTunnelStatusMutation,
+    ProxyNodeWriteRepository, StoredProxyFleetMetricsBucket, StoredProxyNode, StoredProxyNodeEvent,
+    StoredProxyNodeMetricsBucket, TunnelMetricsSample, PROXY_NODE_EVENT_TYPE_TUNNEL_ERROR,
 };
 use crate::DataLayerError;
 
@@ -640,6 +640,7 @@ impl ProxyNodeWriteRepository for InMemoryProxyNodeRepository {
 
             let mut events = self.events.write().expect("proxy node repository lock");
             for error in &sample.recent_error_events {
+                log_reported_tunnel_error_event(&node.id, error, now_unix_secs);
                 let event_id = Self::next_event_id(&events);
                 events.push(StoredProxyNodeEvent {
                     id: event_id,
@@ -655,6 +656,7 @@ impl ProxyNodeWriteRepository for InMemoryProxyNodeRepository {
                         "summary": error.summary.as_deref(),
                         "operator_action": error.operator_action.as_deref(),
                         "timestamp_unix_secs": error.timestamp_unix_secs,
+                        "timestamp_unix_ms": error.timestamp_unix_ms,
                     })),
                     created_at_unix_ms: Some(if error.timestamp_unix_secs == 0 {
                         now_unix_secs

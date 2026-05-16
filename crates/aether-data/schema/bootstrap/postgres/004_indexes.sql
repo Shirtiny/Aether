@@ -102,6 +102,22 @@ CREATE INDEX IF NOT EXISTS idx_payment_orders_gateway_order_id ON public.payment
 
 
 --
+-- Name: idx_payment_orders_kind_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX IF NOT EXISTS idx_payment_orders_kind_status ON public.payment_orders USING btree (order_kind, status);
+
+
+
+--
+-- Name: idx_payment_orders_product; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX IF NOT EXISTS idx_payment_orders_product ON public.payment_orders USING btree (product_id);
+
+
+
+--
 -- Name: idx_payment_orders_status; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -122,6 +138,38 @@ CREATE INDEX IF NOT EXISTS idx_payment_orders_user_created ON public.payment_ord
 --
 
 CREATE INDEX IF NOT EXISTS idx_payment_orders_wallet_created ON public.payment_orders USING btree (wallet_id, created_at);
+
+
+
+--
+-- Name: idx_billing_plans_enabled_sort; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX IF NOT EXISTS idx_billing_plans_enabled_sort ON public.billing_plans USING btree (enabled, sort_order);
+
+
+
+--
+-- Name: idx_user_plan_entitlements_user_active; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX IF NOT EXISTS idx_user_plan_entitlements_user_active ON public.user_plan_entitlements USING btree (user_id, status, expires_at);
+
+
+
+--
+-- Name: idx_user_plan_entitlements_order; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX IF NOT EXISTS idx_user_plan_entitlements_order ON public.user_plan_entitlements USING btree (payment_order_id);
+
+
+
+--
+-- Name: idx_entitlement_usage_user_date; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX IF NOT EXISTS idx_entitlement_usage_user_date ON public.entitlement_usage_ledgers USING btree (user_id, usage_date);
 
 
 

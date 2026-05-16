@@ -1735,6 +1735,21 @@ impl GatewayDataState {
         let mut groups = repository
             .list_user_groups_for_user(&snapshot.user_id)
             .await?;
+        let dynamic_group_ids = self
+            .active_membership_group_ids_for_user(&snapshot.user_id)
+            .await?;
+        if !dynamic_group_ids.is_empty() {
+            groups.extend(
+                repository
+                    .list_user_groups_by_ids(&dynamic_group_ids)
+                    .await?,
+            );
+            let mut deduped = std::collections::BTreeMap::new();
+            for group in groups {
+                deduped.insert(group.id.clone(), group);
+            }
+            groups = deduped.into_values().collect();
+        }
         groups.sort_by(|left, right| {
             left.name
                 .cmp(&right.name)
@@ -1781,6 +1796,51 @@ impl GatewayDataState {
             user_rate_limit,
         );
         Ok(Some(snapshot))
+    }
+
+    async fn active_membership_group_ids_for_user(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<String>, DataLayerError> {
+        let Some(repository) = self.billing_reader.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let Some(entitlements) = repository.list_user_plan_entitlements(user_id).await? else {
+            return Ok(Vec::new());
+        };
+        let now = chrono::Utc::now().timestamp().max(0) as u64;
+        let mut group_ids = std::collections::BTreeSet::new();
+        for entitlement in entitlements {
+            if entitlement.status != "active"
+                || entitlement.starts_at_unix_secs > now
+                || entitlement.expires_at_unix_secs <= now
+            {
+                continue;
+            }
+            let Some(items) = entitlement.entitlements_snapshot.as_array() else {
+                continue;
+            };
+            for item in items {
+                if item.get("type").and_then(serde_json::Value::as_str) != Some("membership_group")
+                {
+                    continue;
+                }
+                let Some(groups) = item
+                    .get("grant_user_groups")
+                    .and_then(serde_json::Value::as_array)
+                else {
+                    continue;
+                };
+                for group_id in groups {
+                    if let Some(group_id) = group_id.as_str().map(str::trim) {
+                        if !group_id.is_empty() {
+                            group_ids.insert(group_id.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        Ok(group_ids.into_iter().collect())
     }
 }
 

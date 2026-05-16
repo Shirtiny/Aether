@@ -14,6 +14,11 @@ use super::{
 
 const INSTALL_SESSION_TTL_SECS: u64 = 15 * 60;
 const INSTALL_SESSION_KEY_PREFIX: &str = "install:session:";
+const PROXY_INSTALL_SESSION_KEY_PREFIX: &str = "proxy-install:session:";
+const PROXY_INSTALL_UNIX_SCRIPT_URL: &str =
+    "https://raw.githubusercontent.com/fawney19/Aether/main/apps/aether-proxy/install.sh";
+const PROXY_INSTALL_POWERSHELL_SCRIPT_URL: &str =
+    "https://raw.githubusercontent.com/fawney19/Aether/main/apps/aether-proxy/install.ps1";
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -49,6 +54,14 @@ struct StoredInstallSession {
     expires_at_unix_secs: u64,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct StoredProxyInstallSession {
+    aether_url: String,
+    management_token: String,
+    node_name: String,
+    expires_at_unix_secs: u64,
+}
+
 pub(super) fn users_me_api_key_install_sessions_path_matches(request_path: &str) -> bool {
     users_me_api_key_install_session_id_from_path(request_path).is_some()
 }
@@ -78,8 +91,25 @@ fn install_code_from_path(request_path: &str) -> Option<(String, bool)> {
     (!code.is_empty()).then(|| (code.to_string(), is_powershell))
 }
 
+fn proxy_install_code_from_path(request_path: &str) -> Option<(String, bool)> {
+    let raw = request_path
+        .strip_prefix("/install-proxy/")?
+        .trim()
+        .trim_matches('/');
+    if raw.is_empty() || raw.contains('/') {
+        return None;
+    }
+    let is_powershell = raw.ends_with(".ps1");
+    let code = raw.strip_suffix(".ps1").unwrap_or(raw).trim();
+    (!code.is_empty()).then(|| (code.to_string(), is_powershell))
+}
+
 fn install_session_runtime_key(code: &str) -> String {
     format!("{INSTALL_SESSION_KEY_PREFIX}{code}")
+}
+
+fn proxy_install_session_runtime_key(code: &str) -> String {
+    format!("{PROXY_INSTALL_SESSION_KEY_PREFIX}{code}")
 }
 
 fn generate_install_code() -> String {
@@ -95,7 +125,7 @@ fn unix_secs_now() -> u64 {
     chrono::Utc::now().timestamp().max(0) as u64
 }
 
-fn base_url_from_request(
+pub(crate) fn base_url_from_request(
     headers: &http::HeaderMap,
     request_context: &GatewayPublicRequestContext,
 ) -> String {
@@ -132,6 +162,45 @@ fn shell_single_quote(value: &str) -> String {
 
 fn powershell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
+}
+
+fn build_proxy_unix_script(session: &StoredProxyInstallSession) -> String {
+    format!(
+        r###"#!/bin/sh
+set -eu
+export AETHER_PROXY_AETHER_URL={aether_url}
+export AETHER_PROXY_MANAGEMENT_TOKEN={management_token}
+export AETHER_PROXY_NODE_NAME={node_name}
+
+if command -v curl >/dev/null 2>&1; then
+  curl -fsSL {script_url} | sh
+elif command -v wget >/dev/null 2>&1; then
+  wget -qO- {script_url} | sh
+else
+  printf '%s\n' "[Aether Proxy] 需要 curl 或 wget 下载安装脚本" >&2
+  exit 1
+fi
+"###,
+        aether_url = shell_single_quote(&session.aether_url),
+        management_token = shell_single_quote(&session.management_token),
+        node_name = shell_single_quote(&session.node_name),
+        script_url = shell_single_quote(PROXY_INSTALL_UNIX_SCRIPT_URL),
+    )
+}
+
+fn build_proxy_powershell_script(session: &StoredProxyInstallSession) -> String {
+    format!(
+        r###"$ErrorActionPreference = 'Stop'
+$env:AETHER_PROXY_AETHER_URL = {aether_url}
+$env:AETHER_PROXY_MANAGEMENT_TOKEN = {management_token}
+$env:AETHER_PROXY_NODE_NAME = {node_name}
+irm {script_url} | iex
+"###,
+        aether_url = powershell_single_quote(&session.aether_url),
+        management_token = powershell_single_quote(&session.management_token),
+        node_name = powershell_single_quote(&session.node_name),
+        script_url = powershell_single_quote(PROXY_INSTALL_POWERSHELL_SCRIPT_URL),
+    )
 }
 
 fn cli_label(target_cli: InstallTargetCli) -> &'static str {
@@ -581,6 +650,59 @@ pub(crate) async fn build_api_key_install_session_response(
     .into_response()
 }
 
+pub(crate) async fn build_proxy_node_install_session_response(
+    state: &AppState,
+    request_context: &GatewayPublicRequestContext,
+    headers: &http::HeaderMap,
+    node_name: String,
+    management_token: String,
+) -> Response<Body> {
+    let code = generate_install_code();
+    let expires_at_unix_secs = unix_secs_now().saturating_add(INSTALL_SESSION_TTL_SECS);
+    let session = StoredProxyInstallSession {
+        aether_url: base_url_from_request(headers, request_context),
+        management_token,
+        node_name,
+        expires_at_unix_secs,
+    };
+    let serialized = match serde_json::to_string(&session) {
+        Ok(value) => value,
+        Err(err) => {
+            return build_auth_error_response(
+                http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("proxy install session serialize failed: {err:?}"),
+                false,
+            )
+        }
+    };
+    if let Err(err) = state
+        .runtime_kv_setex(
+            &proxy_install_session_runtime_key(&code),
+            &serialized,
+            INSTALL_SESSION_TTL_SECS,
+        )
+        .await
+    {
+        return build_auth_error_response(
+            http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("proxy install session create failed: {err:?}"),
+            false,
+        );
+    }
+
+    let base_url = session.aether_url.trim_end_matches('/');
+    Json(json!({
+        "install_code": code,
+        "expires_at_unix_secs": expires_at_unix_secs,
+        "expires_in_seconds": INSTALL_SESSION_TTL_SECS,
+        "node_name": session.node_name,
+        "aether_url": session.aether_url,
+        "unix_command": format!("curl -fsSL {base_url}/install-proxy/{code} | sh"),
+        "powershell_command": format!("irm {base_url}/install-proxy/{code}.ps1 | iex"),
+    }))
+    .into_response()
+}
+
 pub(super) async fn maybe_build_local_install_response(
     state: &AppState,
     request_context: &GatewayPublicRequestContext,
@@ -588,6 +710,9 @@ pub(super) async fn maybe_build_local_install_response(
     let decision = request_context.control_decision.as_ref()?;
     if decision.route_family.as_deref() != Some("install") {
         return None;
+    }
+    if request_context.request_path.starts_with("/install-proxy/") {
+        return Some(maybe_build_local_proxy_install_response(state, request_context).await);
     }
     let Some((code, wants_powershell)) = install_code_from_path(&request_context.request_path)
     else {
@@ -664,6 +789,86 @@ pub(super) async fn maybe_build_local_install_response(
     Some(response)
 }
 
+async fn maybe_build_local_proxy_install_response(
+    state: &AppState,
+    request_context: &GatewayPublicRequestContext,
+) -> Response<Body> {
+    let Some((code, wants_powershell)) =
+        proxy_install_code_from_path(&request_context.request_path)
+    else {
+        return build_auth_error_response(
+            http::StatusCode::NOT_FOUND,
+            "proxy install code 不存在或已失效",
+            false,
+        );
+    };
+    let raw = match state
+        .runtime_kv_getdel(&proxy_install_session_runtime_key(&code))
+        .await
+    {
+        Ok(Some(value)) => value,
+        Ok(None) => {
+            return build_auth_error_response(
+                http::StatusCode::NOT_FOUND,
+                "proxy install code 不存在、已过期或已使用",
+                false,
+            )
+        }
+        Err(err) => {
+            return build_auth_error_response(
+                http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("proxy install session lookup failed: {err:?}"),
+                false,
+            )
+        }
+    };
+    let session = match serde_json::from_str::<StoredProxyInstallSession>(&raw) {
+        Ok(value) => value,
+        Err(_) => {
+            return build_auth_error_response(
+                http::StatusCode::BAD_REQUEST,
+                "proxy install code 数据无效",
+                false,
+            )
+        }
+    };
+    if session.expires_at_unix_secs <= unix_secs_now() {
+        return build_auth_error_response(
+            http::StatusCode::NOT_FOUND,
+            "proxy install code 已过期",
+            false,
+        );
+    }
+    let body = if wants_powershell {
+        build_proxy_powershell_script(&session)
+    } else {
+        build_proxy_unix_script(&session)
+    };
+    let content_type = if wants_powershell {
+        "text/plain; charset=utf-8"
+    } else {
+        "text/x-shellscript; charset=utf-8"
+    };
+    let mut response = Response::new(Body::from(body));
+    response.headers_mut().insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static(content_type),
+    );
+    response.headers_mut().insert(
+        http::header::CACHE_CONTROL,
+        http::HeaderValue::from_static("no-store"),
+    );
+    response.headers_mut().insert(
+        http::header::PRAGMA,
+        http::HeaderValue::from_static("no-cache"),
+    );
+    response.headers_mut().insert(
+        http::header::HeaderName::from_static("x-content-type-options"),
+        http::HeaderValue::from_static("nosniff"),
+    );
+    response
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -678,6 +883,56 @@ mod tests {
             target_system: InstallTargetSystem::Linux,
             expires_at_unix_secs: u64::MAX,
         }
+    }
+
+    fn test_proxy_session() -> StoredProxyInstallSession {
+        StoredProxyInstallSession {
+            aether_url: "https://aether.example".to_string(),
+            management_token: "ae-test-token".to_string(),
+            node_name: "jp-proxy-01".to_string(),
+            expires_at_unix_secs: u64::MAX,
+        }
+    }
+
+    #[test]
+    fn proxy_install_path_accepts_shell_and_powershell_codes() {
+        assert_eq!(
+            proxy_install_code_from_path("/install-proxy/abc123"),
+            Some(("abc123".to_string(), false))
+        );
+        assert_eq!(
+            proxy_install_code_from_path("/install-proxy/abc123.ps1"),
+            Some(("abc123".to_string(), true))
+        );
+        assert_eq!(proxy_install_code_from_path("/install-proxy/a/b"), None);
+    }
+
+    #[test]
+    fn proxy_unix_script_exports_session_values_and_reuses_proxy_installer() {
+        let script = build_proxy_unix_script(&test_proxy_session());
+
+        assert!(script.contains("export AETHER_PROXY_AETHER_URL='https://aether.example'"));
+        assert!(script.contains("export AETHER_PROXY_MANAGEMENT_TOKEN='ae-test-token'"));
+        assert!(script.contains("export AETHER_PROXY_NODE_NAME='jp-proxy-01'"));
+        assert!(script.contains(
+            "https://raw.githubusercontent.com/fawney19/Aether/main/apps/aether-proxy/install.sh"
+        ));
+        assert!(!script.contains("aether-rust-pioneer"));
+        assert!(!script.contains("[[servers]]"));
+    }
+
+    #[test]
+    fn proxy_powershell_script_exports_session_values_and_reuses_proxy_installer() {
+        let script = build_proxy_powershell_script(&test_proxy_session());
+
+        assert!(script.contains("$env:AETHER_PROXY_AETHER_URL = 'https://aether.example'"));
+        assert!(script.contains("$env:AETHER_PROXY_MANAGEMENT_TOKEN = 'ae-test-token'"));
+        assert!(script.contains("$env:AETHER_PROXY_NODE_NAME = 'jp-proxy-01'"));
+        assert!(script.contains(
+            "https://raw.githubusercontent.com/fawney19/Aether/main/apps/aether-proxy/install.ps1"
+        ));
+        assert!(!script.contains("aether-rust-pioneer"));
+        assert!(!script.contains("[[servers]]"));
     }
 
     #[test]

@@ -3,6 +3,7 @@ use crate::GatewayError;
 use axum::{body::Body, response::Response};
 
 mod callbacks;
+mod gateways;
 mod orders;
 #[path = "../../payment/postgres.rs"]
 mod payment_postgres;

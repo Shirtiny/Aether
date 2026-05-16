@@ -259,6 +259,7 @@ fn admin_system_owns_system_route_helpers() {
         "build_admin_api_formats_payload",
         "build_admin_system_config_export_payload",
         "build_admin_system_users_export_payload",
+        "build_admin_system_data_export_payload",
         "build_admin_system_configs_payload",
         "build_admin_system_config_detail_payload",
         "apply_admin_system_config_update",
@@ -287,6 +288,7 @@ fn admin_system_owns_system_route_helpers() {
         "build_admin_api_formats_payload",
         "build_admin_system_config_export_payload",
         "build_admin_system_users_export_payload",
+        "build_admin_system_data_export_payload",
         "build_admin_system_configs_payload",
         "build_admin_system_config_detail_payload",
         "apply_admin_system_config_update",
@@ -315,6 +317,7 @@ fn admin_system_owns_system_route_helpers() {
         "pub(crate) async fn build_admin_system_settings_payload",
         "pub(crate) async fn build_admin_system_config_export_payload",
         "pub(crate) async fn build_admin_system_users_export_payload",
+        "pub(crate) async fn build_admin_system_data_export_payload",
         "pub(crate) fn build_admin_system_configs_payload",
         "pub(crate) async fn build_admin_system_config_detail_payload",
         "pub(crate) async fn apply_admin_system_config_update",
@@ -447,6 +450,7 @@ fn admin_system_owns_system_route_helpers() {
         "pub(crate) async fn reset_admin_email_template",
         "pub(crate) async fn build_admin_system_config_export_payload",
         "pub(crate) async fn build_admin_system_users_export_payload",
+        "pub(crate) async fn build_admin_system_data_export_payload",
     ] {
         assert!(
             request_system.contains(pattern),
@@ -511,6 +515,7 @@ fn admin_system_shared_configs_split_export_owners() {
     for pattern in [
         "pub(crate) async fn build_admin_system_config_export_payload(",
         "pub(crate) async fn build_admin_system_users_export_payload(",
+        "pub(crate) async fn build_admin_system_data_export_payload(",
     ] {
         assert!(
             request_system.contains(pattern),

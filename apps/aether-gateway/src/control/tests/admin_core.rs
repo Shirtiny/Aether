@@ -157,11 +157,31 @@ fn classifies_admin_system_users_export_as_admin_proxy_route() {
 }
 
 #[test]
+fn classifies_admin_system_data_export_as_admin_proxy_route() {
+    let headers = headers(&[]);
+    let uri: Uri = "/api/admin/system/data/export"
+        .parse()
+        .expect("uri should parse");
+    let decision =
+        classify_control_route(&http::Method::GET, &uri, &headers).expect("route should classify");
+
+    assert_eq!(decision.route_class.as_deref(), Some("admin_proxy"));
+    assert_eq!(decision.route_family.as_deref(), Some("system_manage"));
+    assert_eq!(decision.route_kind.as_deref(), Some("data_export"));
+    assert_eq!(
+        decision.auth_endpoint_signature.as_deref(),
+        Some("admin:system")
+    );
+    assert!(!decision.is_execution_runtime_candidate());
+}
+
+#[test]
 fn classifies_admin_system_maintenance_write_routes_as_admin_proxy_route() {
     let headers = headers(&[]);
     let cases = [
         ("/api/admin/system/config/import", "config_import"),
         ("/api/admin/system/users/import", "users_import"),
+        ("/api/admin/system/data/import", "data_import"),
         ("/api/admin/system/smtp/test", "smtp_test"),
         ("/api/admin/system/cleanup", "cleanup"),
         ("/api/admin/system/purge/config", "purge_config"),

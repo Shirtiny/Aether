@@ -1,7 +1,10 @@
 use async_trait::async_trait;
 use sqlx::{mysql::MySqlRow, Row};
 
-use super::{SettlementWriteRepository, StoredUsageSettlement, UsageSettlementInput};
+use super::{
+    finite_wallet_available_usd, plan_finite_wallet_debit, SettlementWriteRepository,
+    StoredUsageSettlement, UsageSettlementInput, SETTLEMENT_EPSILON_USD,
+};
 use crate::driver::mysql::MysqlPool;
 use crate::error::SqlResultExt;
 use crate::DataLayerError;
@@ -133,6 +136,197 @@ fn now_unix_secs() -> Result<i64, DataLayerError> {
     .map_err(|_| DataLayerError::InvalidInput("timestamp overflow".to_string()))
 }
 
+#[derive(Debug, Default)]
+struct DailyQuotaDebitResult {
+    debited_usd: f64,
+    insufficient: bool,
+}
+
+#[derive(Debug)]
+struct DailyQuotaGrant {
+    entitlement_id: String,
+    daily_quota_usd: f64,
+    usage_date: String,
+    allow_wallet_overage: bool,
+}
+
+fn daily_quota_usage_date(
+    reset_timezone: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<String, DataLayerError> {
+    let timezone = reset_timezone
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Asia/Shanghai")
+        .parse::<chrono_tz::Tz>()
+        .map_err(|err| DataLayerError::InvalidInput(format!("invalid reset_timezone: {err}")))?;
+    Ok(now.with_timezone(&timezone).date_naive().to_string())
+}
+
+fn daily_quota_grants_from_entitlement(
+    entitlement_id: &str,
+    entitlements: &serde_json::Value,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<DailyQuotaGrant>, DataLayerError> {
+    let mut grants = Vec::new();
+    let Some(items) = entitlements.as_array() else {
+        return Ok(grants);
+    };
+    for item in items {
+        if item.get("type").and_then(serde_json::Value::as_str) != Some("daily_quota") {
+            continue;
+        }
+        let daily_quota_usd = item
+            .get("daily_quota_usd")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0);
+        if !daily_quota_usd.is_finite() || daily_quota_usd <= 0.0 {
+            continue;
+        }
+        grants.push(DailyQuotaGrant {
+            entitlement_id: entitlement_id.to_string(),
+            daily_quota_usd,
+            usage_date: daily_quota_usage_date(
+                item.get("reset_timezone")
+                    .and_then(serde_json::Value::as_str),
+                now,
+            )?,
+            allow_wallet_overage: item
+                .get("allow_wallet_overage")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+        });
+    }
+    Ok(grants)
+}
+
+async fn consume_daily_quota_mysql(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    user_id: &str,
+    request_id: &str,
+    total_cost_usd: f64,
+    wallet_available_usd: Option<f64>,
+    now_unix_secs: i64,
+) -> Result<DailyQuotaDebitResult, DataLayerError> {
+    if total_cost_usd <= 0.0 {
+        return Ok(DailyQuotaDebitResult::default());
+    }
+    let rows = sqlx::query(
+        r#"
+SELECT id, entitlements_snapshot
+FROM user_plan_entitlements
+WHERE user_id = ?
+  AND status = 'active'
+  AND starts_at <= ?
+  AND expires_at > ?
+ORDER BY expires_at ASC, created_at ASC, id ASC
+FOR UPDATE
+"#,
+    )
+    .bind(user_id)
+    .bind(now_unix_secs)
+    .bind(now_unix_secs)
+    .fetch_all(&mut **tx)
+    .await
+    .map_sql_err()?;
+    let now = chrono::Utc::now();
+    let mut grants = Vec::new();
+    for row in rows {
+        let entitlement_id: String = row.try_get("id").map_sql_err()?;
+        let entitlements_raw: String = row.try_get("entitlements_snapshot").map_sql_err()?;
+        let entitlements =
+            serde_json::from_str::<serde_json::Value>(&entitlements_raw).map_err(|err| {
+                DataLayerError::UnexpectedValue(format!(
+                    "user_plan_entitlements.entitlements_snapshot invalid json: {err}"
+                ))
+            })?;
+        grants.extend(daily_quota_grants_from_entitlement(
+            &entitlement_id,
+            &entitlements,
+            now,
+        )?);
+    }
+    if grants.is_empty() {
+        return Ok(DailyQuotaDebitResult::default());
+    }
+
+    let mut grants_with_remaining = Vec::new();
+    let mut total_remaining = 0.0;
+    let mut allow_wallet_overage = true;
+    for grant in grants {
+        allow_wallet_overage &= grant.allow_wallet_overage;
+        let used = sqlx::query_scalar::<_, f64>(
+            r#"
+SELECT COALESCE(SUM(amount_usd), 0)
+FROM entitlement_usage_ledgers
+WHERE user_entitlement_id = ?
+  AND usage_date = ?
+"#,
+        )
+        .bind(&grant.entitlement_id)
+        .bind(&grant.usage_date)
+        .fetch_one(&mut **tx)
+        .await
+        .map_sql_err()?;
+        let remaining = (grant.daily_quota_usd - used).max(0.0);
+        total_remaining += remaining;
+        grants_with_remaining.push((grant, remaining));
+    }
+    if !allow_wallet_overage && total_remaining + 0.000_000_01 < total_cost_usd {
+        return Ok(DailyQuotaDebitResult {
+            debited_usd: 0.0,
+            insufficient: true,
+        });
+    }
+    if allow_wallet_overage
+        && wallet_available_usd.is_some_and(|available| {
+            total_remaining + available + SETTLEMENT_EPSILON_USD < total_cost_usd
+        })
+    {
+        return Ok(DailyQuotaDebitResult {
+            debited_usd: 0.0,
+            insufficient: true,
+        });
+    }
+
+    let mut remaining_cost = total_cost_usd;
+    let mut debited = 0.0;
+    for (grant, balance_before) in grants_with_remaining {
+        if remaining_cost <= 0.000_000_01 || balance_before <= 0.0 {
+            continue;
+        }
+        let amount = remaining_cost.min(balance_before);
+        let balance_after = balance_before - amount;
+        sqlx::query(
+            r#"
+INSERT IGNORE INTO entitlement_usage_ledgers (
+  id, user_entitlement_id, user_id, request_id, amount_usd,
+  balance_before, balance_after, usage_date, created_at
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+"#,
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(&grant.entitlement_id)
+        .bind(user_id)
+        .bind(request_id)
+        .bind(amount)
+        .bind(balance_before)
+        .bind(balance_after)
+        .bind(&grant.usage_date)
+        .bind(now_unix_secs)
+        .execute(&mut **tx)
+        .await
+        .map_sql_err()?;
+        remaining_cost -= amount;
+        debited += amount;
+    }
+    Ok(DailyQuotaDebitResult {
+        debited_usd: debited,
+        insufficient: false,
+    })
+}
+
 #[async_trait]
 impl SettlementWriteRepository for MysqlSettlementRepository {
     async fn settle_usage(
@@ -161,21 +355,24 @@ impl SettlementWriteRepository for MysqlSettlementRepository {
         };
 
         let current_billing_status: String = usage_row.try_get("billing_status").map_sql_err()?;
-        if current_billing_status == "settled" || current_billing_status == "void" {
+        if matches!(
+            current_billing_status.as_str(),
+            "settled" | "void" | "insufficient_quota"
+        ) {
             let settlement = settlement_from_row(&usage_row)?;
             tx.commit().await.map_sql_err()?;
             return Ok(Some(settlement));
         }
 
-        let final_billing_status = if input.status == "completed" {
-            "settled"
+        let mut final_billing_status = if input.status == "completed" {
+            "settled".to_string()
         } else {
-            "void"
+            "void".to_string()
         };
         let mut settlement = StoredUsageSettlement {
             request_id: input.request_id.clone(),
             wallet_id: None,
-            billing_status: final_billing_status.to_string(),
+            billing_status: final_billing_status.clone(),
             wallet_balance_before: None,
             wallet_balance_after: None,
             wallet_recharge_balance_before: None,
@@ -253,22 +450,101 @@ FOR UPDATE
                 None
             };
 
-            if let Some(wallet_row) = wallet_row {
-                let wallet_id: String = wallet_row.try_get("id").map_sql_err()?;
-                let before_recharge: f64 = wallet_row.try_get("balance").map_sql_err()?;
-                let before_gift: f64 = wallet_row.try_get("gift_balance").map_sql_err()?;
-                let limit_mode: String = wallet_row.try_get("limit_mode").map_sql_err()?;
-                let before_total = before_recharge + before_gift;
-                let mut after_recharge = before_recharge;
-                let mut after_gift = before_gift;
-                if !limit_mode.eq_ignore_ascii_case("unlimited") {
-                    let gift_deduction = before_gift.max(0.0).min(input.total_cost_usd);
-                    let recharge_deduction = input.total_cost_usd - gift_deduction;
-                    after_gift = before_gift - gift_deduction;
-                    after_recharge = before_recharge - recharge_deduction;
+            let wallet_available_usd = match wallet_row.as_ref() {
+                Some(row) => {
+                    let limit_mode: String = row.try_get("limit_mode").map_sql_err()?;
+                    if limit_mode.eq_ignore_ascii_case("unlimited") {
+                        None
+                    } else {
+                        Some(finite_wallet_available_usd(
+                            row.try_get("balance").map_sql_err()?,
+                            row.try_get("gift_balance").map_sql_err()?,
+                        ))
+                    }
                 }
-                sqlx::query(
-                    r#"
+                None => Some(0.0),
+            };
+
+            let wallet_debit_cost_usd = if !api_key_is_standalone {
+                if let Some(user_id) = input.user_id.as_deref().filter(|value| !value.is_empty()) {
+                    let quota = consume_daily_quota_mysql(
+                        &mut tx,
+                        user_id,
+                        &input.request_id,
+                        input.total_cost_usd,
+                        wallet_available_usd,
+                        updated_at,
+                    )
+                    .await?;
+                    if quota.insufficient {
+                        final_billing_status = "insufficient_quota".to_string();
+                        settlement.billing_status = final_billing_status.clone();
+                        0.0
+                    } else {
+                        (input.total_cost_usd - quota.debited_usd).max(0.0)
+                    }
+                } else {
+                    input.total_cost_usd
+                }
+            } else {
+                input.total_cost_usd
+            };
+            if final_billing_status != "settled" {
+                sqlx::query(UPSERT_USAGE_SETTLEMENT_SNAPSHOT_SQL)
+                    .bind(&settlement.request_id)
+                    .bind(&settlement.billing_status)
+                    .bind(settlement.wallet_id.as_deref())
+                    .bind(settlement.wallet_balance_before)
+                    .bind(settlement.wallet_balance_after)
+                    .bind(settlement.wallet_recharge_balance_before)
+                    .bind(settlement.wallet_recharge_balance_after)
+                    .bind(settlement.wallet_gift_balance_before)
+                    .bind(settlement.wallet_gift_balance_after)
+                    .bind(settlement.provider_monthly_used_usd)
+                    .bind(settlement.finalized_at_unix_secs.map(|value| value as i64))
+                    .bind(updated_at)
+                    .bind(updated_at)
+                    .execute(&mut *tx)
+                    .await
+                    .map_sql_err()?;
+                sqlx::query(FINALIZE_USAGE_BILLING_SQL)
+                    .bind(&final_billing_status)
+                    .bind(finalized_at)
+                    .bind(&input.request_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_sql_err()?;
+                tx.commit().await.map_sql_err()?;
+                return Ok(Some(settlement));
+            }
+
+            if wallet_debit_cost_usd > SETTLEMENT_EPSILON_USD {
+                if let Some(wallet_row) = wallet_row {
+                    let wallet_id: String = wallet_row.try_get("id").map_sql_err()?;
+                    let before_recharge: f64 = wallet_row.try_get("balance").map_sql_err()?;
+                    let before_gift: f64 = wallet_row.try_get("gift_balance").map_sql_err()?;
+                    let limit_mode: String = wallet_row.try_get("limit_mode").map_sql_err()?;
+                    let before_total = before_recharge + before_gift;
+                    let mut after_recharge = before_recharge;
+                    let mut after_gift = before_gift;
+                    if !limit_mode.eq_ignore_ascii_case("unlimited") {
+                        let debit_plan = plan_finite_wallet_debit(
+                            before_recharge,
+                            before_gift,
+                            wallet_debit_cost_usd,
+                        );
+                        if debit_plan.covered_usd() + SETTLEMENT_EPSILON_USD < wallet_debit_cost_usd
+                        {
+                            final_billing_status = "insufficient_quota".to_string();
+                            settlement.billing_status = final_billing_status.clone();
+                        } else {
+                            after_recharge = before_recharge - debit_plan.recharge_deduction;
+                            after_gift = before_gift - debit_plan.gift_deduction;
+                        }
+                    }
+                    if final_billing_status == "settled" {
+                        sqlx::query(
+                            r#"
 UPDATE wallets
 SET
   balance = ?,
@@ -277,23 +553,57 @@ SET
   updated_at = ?
 WHERE id = ?
 "#,
-                )
-                .bind(after_recharge)
-                .bind(after_gift)
-                .bind(input.total_cost_usd)
-                .bind(updated_at)
-                .bind(&wallet_id)
-                .execute(&mut *tx)
-                .await
-                .map_sql_err()?;
+                        )
+                        .bind(after_recharge)
+                        .bind(after_gift)
+                        .bind(wallet_debit_cost_usd)
+                        .bind(updated_at)
+                        .bind(&wallet_id)
+                        .execute(&mut *tx)
+                        .await
+                        .map_sql_err()?;
+                    }
 
-                settlement.wallet_id = Some(wallet_id);
-                settlement.wallet_balance_before = Some(before_total);
-                settlement.wallet_balance_after = Some(after_recharge + after_gift);
-                settlement.wallet_recharge_balance_before = Some(before_recharge);
-                settlement.wallet_recharge_balance_after = Some(after_recharge);
-                settlement.wallet_gift_balance_before = Some(before_gift);
-                settlement.wallet_gift_balance_after = Some(after_gift);
+                    settlement.wallet_id = Some(wallet_id);
+                    settlement.wallet_balance_before = Some(before_total);
+                    settlement.wallet_balance_after = Some(after_recharge + after_gift);
+                    settlement.wallet_recharge_balance_before = Some(before_recharge);
+                    settlement.wallet_recharge_balance_after = Some(after_recharge);
+                    settlement.wallet_gift_balance_before = Some(before_gift);
+                    settlement.wallet_gift_balance_after = Some(after_gift);
+                } else {
+                    final_billing_status = "insufficient_quota".to_string();
+                    settlement.billing_status = final_billing_status.clone();
+                }
+            }
+
+            if final_billing_status != "settled" {
+                sqlx::query(UPSERT_USAGE_SETTLEMENT_SNAPSHOT_SQL)
+                    .bind(&settlement.request_id)
+                    .bind(&settlement.billing_status)
+                    .bind(settlement.wallet_id.as_deref())
+                    .bind(settlement.wallet_balance_before)
+                    .bind(settlement.wallet_balance_after)
+                    .bind(settlement.wallet_recharge_balance_before)
+                    .bind(settlement.wallet_recharge_balance_after)
+                    .bind(settlement.wallet_gift_balance_before)
+                    .bind(settlement.wallet_gift_balance_after)
+                    .bind(settlement.provider_monthly_used_usd)
+                    .bind(settlement.finalized_at_unix_secs.map(|value| value as i64))
+                    .bind(updated_at)
+                    .bind(updated_at)
+                    .execute(&mut *tx)
+                    .await
+                    .map_sql_err()?;
+                sqlx::query(FINALIZE_USAGE_BILLING_SQL)
+                    .bind(&final_billing_status)
+                    .bind(finalized_at)
+                    .bind(&input.request_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_sql_err()?;
+                tx.commit().await.map_sql_err()?;
+                return Ok(Some(settlement));
             }
 
             if let Some(provider_id) = input
@@ -347,7 +657,7 @@ WHERE id = ?
             .map_sql_err()?;
 
         sqlx::query(FINALIZE_USAGE_BILLING_SQL)
-            .bind(final_billing_status)
+            .bind(&final_billing_status)
             .bind(finalized_at)
             .bind(&input.request_id)
             .execute(&mut *tx)

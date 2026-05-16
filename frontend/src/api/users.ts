@@ -1,6 +1,7 @@
 import apiClient from './client'
 import { cachedRequest } from '@/utils/cache'
 import type { UserSession as SessionRecord } from '@/types/session'
+import type { BillingPlan, UserPlanEntitlement } from './billing'
 
 export type UserRole = 'admin' | 'user'
 export type ListPolicyMode = 'inherit' | 'unrestricted' | 'specific' | 'deny_all'
@@ -233,6 +234,26 @@ export interface UpsertUserApiKeyRequest {
 
 export type UserSession = SessionRecord
 
+export interface AdminUserPlanEntitlement extends UserPlanEntitlement {
+  plan_title?: string | null
+  plan?: BillingPlan | null
+}
+
+export interface AdminUserPlanEntitlementsResponse {
+  items: AdminUserPlanEntitlement[]
+  total: number
+}
+
+export interface GrantUserPlanRequest {
+  plan_id: string
+  reason?: string | null
+}
+
+export interface GrantUserPlanResponse extends AdminUserPlanEntitlementsResponse {
+  order?: Record<string, unknown>
+  credited?: boolean
+}
+
 export interface GetAllUsersOptions {
   search?: string
   role?: UserRole
@@ -364,6 +385,24 @@ export const usersApi = {
 
   async getUserSessions(userId: string): Promise<SessionRecord[]> {
     const response = await apiClient.get<SessionRecord[]>(`/api/admin/users/${userId}/sessions`)
+    return response.data
+  },
+
+  async listUserPlanEntitlements(userId: string): Promise<AdminUserPlanEntitlementsResponse> {
+    const response = await apiClient.get<AdminUserPlanEntitlementsResponse>(
+      `/api/admin/users/${userId}/billing/entitlements`
+    )
+    return response.data
+  },
+
+  async grantUserPlan(
+    userId: string,
+    payload: GrantUserPlanRequest
+  ): Promise<GrantUserPlanResponse> {
+    const response = await apiClient.post<GrantUserPlanResponse>(
+      `/api/admin/users/${userId}/billing/grant-plan`,
+      payload
+    )
     return response.data
   },
 

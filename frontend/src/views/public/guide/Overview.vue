@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref } from 'vue'
 import {
+  Code,
   Server,
   Key,
   Container,
@@ -46,20 +47,20 @@ const productionSteps = [
 const developmentSteps = [
   {
     title: '启动依赖',
-    note: 'PostgreSQL + Redis',
+    note: '可选，make dev 会自动启动',
     code: 'docker compose up -d postgres redis',
     icon: Container
   },
   {
-    title: '后端',
-    note: '热重载开发服务器',
-    code: 'uv sync\n./dev.sh',
+    title: '安装前端依赖',
+    note: '首次本地开发',
+    code: '(cd frontend && npm install)',
     icon: Server
   },
   {
-    title: '前端',
-    note: '自动代理到 APP_PORT（默认 8084）',
-    code: 'cd frontend && npm install && npm run dev',
+    title: '启动开发服务',
+    note: '后端 + Vite dev server',
+    code: 'make dev',
     icon: Monitor
   }
 ]

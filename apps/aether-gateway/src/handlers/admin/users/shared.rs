@@ -140,10 +140,10 @@ pub(super) fn build_admin_users_read_only_response(detail: &'static str) -> Resp
         .into_response()
 }
 
-pub(super) fn build_admin_users_bad_request_response(detail: &'static str) -> Response<Body> {
+pub(super) fn build_admin_users_bad_request_response(detail: impl Into<String>) -> Response<Body> {
     (
         http::StatusCode::BAD_REQUEST,
-        Json(json!({ "detail": detail })),
+        Json(json!({ "detail": detail.into() })),
     )
         .into_response()
 }

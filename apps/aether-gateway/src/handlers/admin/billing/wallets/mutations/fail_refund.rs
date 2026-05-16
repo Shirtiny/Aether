@@ -1,7 +1,7 @@
 use super::super::shared::{
     admin_wallet_operator_id, admin_wallet_refund_ids_from_suffix_path,
     build_admin_wallet_not_found_response, build_admin_wallet_refund_not_found_response,
-    build_admin_wallet_refund_payload, build_admin_wallet_summary_payload,
+    build_admin_wallet_refund_payload, build_admin_wallet_summary_payload_with_package,
     build_admin_wallet_transaction_payload, build_admin_wallets_bad_request_response,
     build_admin_wallets_data_unavailable_response, normalize_admin_wallet_required_text,
     resolve_admin_wallet_owner_summary, AdminWalletRefundFailRequest,
@@ -62,8 +62,10 @@ pub(in super::super) async fn build_admin_wallet_fail_refund_response(
     {
         crate::AdminWalletMutationOutcome::Applied((wallet, refund, transaction)) => {
             let owner = resolve_admin_wallet_owner_summary(state, &wallet).await?;
+            let wallet_payload =
+                build_admin_wallet_summary_payload_with_package(state, &wallet, &owner).await?;
             let response = Json(json!({
-                "wallet": build_admin_wallet_summary_payload(&wallet, &owner),
+                "wallet": wallet_payload,
                 "refund": build_admin_wallet_refund_payload(&wallet, &owner, &refund),
                 "transaction": transaction
                     .map(|transaction| {

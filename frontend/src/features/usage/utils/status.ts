@@ -295,6 +295,9 @@ export function resolveTimelineFinalStatus(params: {
     }
     return requestStatus
   }
+  if (requestStatus === 'pending' || requestStatus === 'streaming') {
+    return requestStatus
+  }
 
   const traceStatus = normalizeTimelineFinalStatus(params.traceFinalStatus)
   if (traceStatus === 'success' || traceStatus === 'failed' || traceStatus === 'cancelled') {
@@ -304,12 +307,12 @@ export function resolveTimelineFinalStatus(params: {
     return traceStatus
   }
 
-  if (hasTerminalSuccessStatusCode !== undefined) {
-    return hasTerminalSuccessStatusCode ? 'success' : 'failed'
-  }
-
   if (params.hasPendingCandidates) {
     return 'pending'
+  }
+
+  if (hasTerminalSuccessStatusCode !== undefined) {
+    return hasTerminalSuccessStatusCode ? 'success' : 'failed'
   }
 
   if (traceStatus) {

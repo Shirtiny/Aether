@@ -20,6 +20,12 @@ pub(crate) async fn build_auth_registration_settings_payload(
     let password_policy_level_config = state
         .read_system_config_json_value("password_policy_level")
         .await?;
+    let turnstile_enabled_config = state
+        .read_system_config_json_value("turnstile_enabled")
+        .await?;
+    let turnstile_site_key_config = state
+        .read_system_config_json_value("turnstile_site_key")
+        .await?;
 
     let email_configured = smtp_host
         .as_ref()
@@ -40,12 +46,17 @@ pub(crate) async fn build_auth_registration_settings_payload(
         Some(value) if matches!(value.as_str(), "weak" | "medium" | "strong") => value,
         _ => "weak".to_string(),
     };
+    let turnstile_enabled = system_config_bool(turnstile_enabled_config.as_ref(), false);
+    let turnstile_site_key = system_config_string(turnstile_site_key_config.as_ref());
 
     Ok(json!({
         "enable_registration": enable_registration,
         "require_email_verification": require_email_verification,
         "email_configured": email_configured,
         "password_policy_level": password_policy_level,
+        "turnstile_enabled": turnstile_enabled,
+        "turnstile_site_key": turnstile_site_key,
+        "turnstile_required_actions": ["send_verification_code", "register"],
     }))
 }
 
@@ -288,6 +299,17 @@ pub(super) fn auth_client_ip(headers: &http::HeaderMap) -> Option<String> {
                 .filter(|value| !value.is_empty())
                 .map(|value| value.chars().take(45).collect())
         })
+}
+
+pub(super) fn auth_client_ip_with_cf(
+    headers: &http::HeaderMap,
+    cf_connecting_ip: Option<&str>,
+) -> Option<String> {
+    cf_connecting_ip
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.chars().take(45).collect())
+        .or_else(|| auth_client_ip(headers))
 }
 
 pub(super) fn normalize_auth_login_identifier(value: &str) -> String {

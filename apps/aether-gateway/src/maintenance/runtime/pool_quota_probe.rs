@@ -29,7 +29,7 @@ use crate::handlers::shared::provider_pool::{
 };
 use crate::provider_pool_demand::{
     provider_pool_burst_pending_key, read_provider_pool_demand_snapshot,
-    sample_provider_pool_demand,
+    sample_provider_pool_demand, ProviderPoolDemandSnapshot,
 };
 
 use super::pool_score_rebuild::ensure_provider_key_pool_scores_for_keys;
@@ -44,6 +44,9 @@ const POOL_QUOTA_PROBE_BURST_TRIGGER_LOCK_TTL_MS: u64 = 30_000;
 const POOL_QUOTA_PROBE_BURST_PENDING_PREFIX: &str = "ap:quota_probe:burst_pending";
 const POOL_QUOTA_PROBE_BURST_PENDING_TTL_SECONDS: u64 = 30;
 const POOL_QUOTA_PROBE_BURST_RETRY_GUARD_SECONDS: u64 = 15;
+const POOL_QUOTA_PROBE_AUTO_MIN_INTERVAL_SECONDS: u64 = 30;
+const POOL_QUOTA_PROBE_AUTO_MAX_INTERVAL_SECONDS: u64 = 10 * 60;
+const POOL_QUOTA_PROBE_AUTO_MAX_PRESSURE: u64 = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PoolQuotaProbeMode {
@@ -212,6 +215,34 @@ fn pool_quota_probe_selection_limit_for_mode(
         PoolQuotaProbeMode::Base => config.max_keys_per_provider,
         PoolQuotaProbeMode::Burst => pool_quota_probe_burst_batch_size(pool_config, config),
     }
+}
+
+fn pool_quota_probe_auto_interval_seconds(demand_snapshot: &ProviderPoolDemandSnapshot) -> u64 {
+    let live_pressure = u64::try_from(demand_snapshot.in_flight).unwrap_or(u64::MAX);
+    let ema_pressure =
+        if demand_snapshot.ema_in_flight.is_finite() && demand_snapshot.ema_in_flight > 0.0 {
+            demand_snapshot
+                .ema_in_flight
+                .ceil()
+                .clamp(0.0, POOL_QUOTA_PROBE_AUTO_MAX_PRESSURE as f64) as u64
+        } else {
+            0
+        };
+    let request_pressure = live_pressure.max(ema_pressure);
+    if request_pressure == 0 {
+        return POOL_QUOTA_PROBE_AUTO_MAX_INTERVAL_SECONDS;
+    }
+
+    let hot_pressure = u64::try_from(demand_snapshot.desired_hot).unwrap_or(u64::MAX);
+    let pressure = request_pressure
+        .max(hot_pressure)
+        .clamp(1, POOL_QUOTA_PROBE_AUTO_MAX_PRESSURE);
+    POOL_QUOTA_PROBE_AUTO_MAX_INTERVAL_SECONDS
+        .saturating_div(pressure)
+        .clamp(
+            POOL_QUOTA_PROBE_AUTO_MIN_INTERVAL_SECONDS,
+            POOL_QUOTA_PROBE_AUTO_MAX_INTERVAL_SECONDS,
+        )
 }
 
 fn active_probe_member_remains_valid(score: Option<&StoredPoolMemberScore>) -> bool {
@@ -894,10 +925,7 @@ async fn select_keys_for_provider(
                             .get(key_id.as_str())
                             .is_none_or(|last_probe_ts| {
                                 now_ts.saturating_sub(*last_probe_ts)
-                                    >= pool_config
-                                        .probing_interval_minutes
-                                        .clamp(1, 1440)
-                                        .saturating_mul(60)
+                                    >= pool_quota_probe_auto_interval_seconds(&demand_snapshot)
                             })
                     }
                     PoolQuotaProbeMode::Burst => {
@@ -925,10 +953,7 @@ async fn select_keys_for_provider(
         }
 
         let stamp_interval_seconds = match mode {
-            PoolQuotaProbeMode::Base => pool_config
-                .probing_interval_minutes
-                .clamp(1, 1440)
-                .saturating_mul(60),
+            PoolQuotaProbeMode::Base => pool_quota_probe_auto_interval_seconds(&demand_snapshot),
             PoolQuotaProbeMode::Burst => POOL_QUOTA_PROBE_BURST_PENDING_TTL_SECONDS,
         };
         mark_probe_timestamps(
@@ -1754,6 +1779,42 @@ mod tests {
         assert_eq!(pool_quota_probe_target_count(10, Some(20.0), None), 2);
         assert_eq!(pool_quota_probe_target_count(10, Some(20.0), Some(5)), 5);
         assert_eq!(pool_quota_probe_target_count(3, Some(80.0), Some(10)), 3);
+    }
+
+    #[test]
+    fn pool_quota_probe_auto_interval_tracks_request_pressure() {
+        let idle = ProviderPoolDemandSnapshot {
+            in_flight: 0,
+            ema_in_flight: 0.0,
+            desired_hot: 2,
+            sampled_at_unix_ms: 0,
+        };
+        assert_eq!(
+            pool_quota_probe_auto_interval_seconds(&idle),
+            POOL_QUOTA_PROBE_AUTO_MAX_INTERVAL_SECONDS
+        );
+
+        let active = ProviderPoolDemandSnapshot {
+            in_flight: 1,
+            ema_in_flight: 1.0,
+            desired_hot: 2,
+            sampled_at_unix_ms: 0,
+        };
+        assert!(
+            pool_quota_probe_auto_interval_seconds(&active)
+                < POOL_QUOTA_PROBE_AUTO_MAX_INTERVAL_SECONDS
+        );
+
+        let saturated = ProviderPoolDemandSnapshot {
+            in_flight: 128,
+            ema_in_flight: 128.0,
+            desired_hot: 128,
+            sampled_at_unix_ms: 0,
+        };
+        assert_eq!(
+            pool_quota_probe_auto_interval_seconds(&saturated),
+            POOL_QUOTA_PROBE_AUTO_MIN_INTERVAL_SECONDS
+        );
     }
 
     #[test]

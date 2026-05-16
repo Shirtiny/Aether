@@ -8,7 +8,7 @@ use tokio::sync::watch;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::egress_proxy::{connect_target_via_proxy, ProxyConnectOptions, UpstreamProxyConfig};
 use crate::state::{AppState, ServerContext};
@@ -224,9 +224,30 @@ pub async fn connect_and_run(
         let _ = tokio::time::timeout(Duration::from_secs(35), writer_handle).await;
     }
 
-    server
-        .tunnel_metrics
-        .record_disconnect(connected_at.elapsed());
+    let connected_for = connected_at.elapsed();
+    match &outcome {
+        Ok(TunnelOutcome::Shutdown) => info!(
+            conn = conn_idx,
+            connected_duration_ms = connected_for.as_millis() as u64,
+            close_reason = "shutdown",
+            "tunnel session ending"
+        ),
+        Ok(TunnelOutcome::Disconnected) => info!(
+            conn = conn_idx,
+            connected_duration_ms = connected_for.as_millis() as u64,
+            close_reason = "disconnected",
+            "tunnel session ending"
+        ),
+        Err(error) => warn!(
+            conn = conn_idx,
+            connected_duration_ms = connected_for.as_millis() as u64,
+            close_reason = "error",
+            error = %error,
+            "tunnel session ending"
+        ),
+    }
+
+    server.tunnel_metrics.record_disconnect(connected_for);
 
     debug!("tunnel disconnected");
     outcome
@@ -250,14 +271,26 @@ fn spawn_drain_signal(
         }
 
         debug!(conn = conn_idx, "sending GOAWAY for tunnel drain");
-        let _ = tokio::time::timeout(
+        match tokio::time::timeout(
             Duration::from_millis(250),
             frame_tx.send(super::protocol::Frame::control(
                 super::protocol::MsgType::GoAway,
                 bytes::Bytes::new(),
             )),
         )
-        .await;
+        .await
+        {
+            Ok(Ok(())) => info!(conn = conn_idx, "sent GOAWAY for tunnel drain"),
+            Ok(Err(error)) => warn!(
+                conn = conn_idx,
+                error = ?error,
+                "failed to queue GOAWAY for tunnel drain"
+            ),
+            Err(_) => warn!(
+                conn = conn_idx,
+                "timed out queueing GOAWAY for tunnel drain"
+            ),
+        }
     })
 }
 

@@ -302,12 +302,16 @@ fn empty_database_snapshot_covers_current_cutoff_versions() {
             20260511120000,
             20260511130000,
             20260512000000,
+            20260512090000,
+            20260512110000,
+            20260515000000,
         ]
     );
 }
 
 #[test]
-fn empty_database_snapshot_sql_includes_usage_body_blobs() {
+fn empty_database_snapshot_sql_includes_usage_body_blobs_and_audit_admin_role() {
+    assert!(EMPTY_DATABASE_SNAPSHOT_SQL.contains("'audit_admin'"));
     assert!(
         EMPTY_DATABASE_SNAPSHOT_SQL.contains("CREATE TABLE IF NOT EXISTS public.usage_body_blobs")
     );
@@ -372,6 +376,18 @@ fn empty_database_snapshot_sql_includes_usage_body_blobs() {
     assert!(EMPTY_DATABASE_SNAPSHOT_SQL.contains(
             "ALTER TABLE public.stats_daily_model\n    ADD COLUMN IF NOT EXISTS cache_creation_ephemeral_5m_tokens bigint DEFAULT '0'::bigint NOT NULL,"
         ));
+}
+
+#[test]
+fn empty_database_snapshot_sql_includes_payment_gateway_and_plans() {
+    assert!(EMPTY_DATABASE_SNAPSHOT_SQL.contains("payment_provider character varying(64)"));
+    assert!(EMPTY_DATABASE_SNAPSHOT_SQL
+        .contains("CREATE TABLE IF NOT EXISTS public.payment_gateway_configs"));
+    assert!(EMPTY_DATABASE_SNAPSHOT_SQL.contains("CREATE TABLE IF NOT EXISTS public.billing_plans"));
+    assert!(EMPTY_DATABASE_SNAPSHOT_SQL
+        .contains("purchase_limit_scope character varying(32) DEFAULT 'active_period'"));
+    assert!(EMPTY_DATABASE_SNAPSHOT_SQL
+        .contains("CREATE TABLE IF NOT EXISTS public.user_plan_entitlements"));
 }
 
 #[test]
@@ -569,6 +585,8 @@ fn mysql_and_sqlite_migrations_include_enabled_incrementals() {
             20260511120000,
             20260511130000,
             20260512000000,
+            20260512090000,
+            20260512110000,
         ]
     );
     assert_eq!(
@@ -583,6 +601,8 @@ fn mysql_and_sqlite_migrations_include_enabled_incrementals() {
             20260511120000,
             20260511130000,
             20260512000000,
+            20260512090000,
+            20260512110000,
         ]
     );
 }
@@ -1096,6 +1116,9 @@ fn pending_migrations_from_applied_skips_versions_already_applied() {
             20260511120000,
             20260511130000,
             20260512000000,
+            20260512090000,
+            20260512110000,
+            20260515000000,
         ]
     );
 }
@@ -1422,6 +1445,17 @@ async fn prepare_database_for_startup_bootstraps_clean_database() {
     assert!(column_exists(&pool, "api_keys", "total_tokens")
         .await
         .expect("api_keys.total_tokens lookup should succeed"));
+
+    let audit_admin_exists: bool = query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_enum WHERE enumtypid = 'public.userrole'::regtype AND enumlabel = 'audit_admin')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("public.userrole audit_admin lookup should succeed");
+    assert!(
+        audit_admin_exists,
+        "fresh database snapshot should include public.userrole.audit_admin"
+    );
 
     let applied_count: i64 = query_scalar("SELECT COUNT(*)::BIGINT FROM public._sqlx_migrations")
         .fetch_one(&pool)

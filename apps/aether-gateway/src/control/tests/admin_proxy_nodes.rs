@@ -83,6 +83,15 @@ fn classifies_admin_proxy_nodes_manual_create_as_admin_proxy_route() {
 }
 
 #[test]
+fn classifies_admin_proxy_nodes_install_session_create_as_admin_proxy_route() {
+    assert_proxy_nodes_admin_route(
+        http::Method::POST,
+        "/api/admin/proxy-nodes/install-sessions",
+        "create_proxy_node_install_session",
+    );
+}
+
+#[test]
 fn classifies_admin_proxy_nodes_manual_update_as_admin_proxy_route() {
     assert_proxy_nodes_admin_route(
         http::Method::PATCH,

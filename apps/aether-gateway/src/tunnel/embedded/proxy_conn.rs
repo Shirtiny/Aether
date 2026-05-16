@@ -62,18 +62,30 @@ pub async fn handle_proxy_connection(
                         match send_result {
                             Ok(Ok(())) => {}
                             Ok(Err(e)) => {
+                                let snapshot = writer_conn.outbound.snapshot();
                                 warn!(
                                     conn_id = writer_conn_id,
                                     frames_sent = frames_sent,
+                                    queue_depth = snapshot.depth,
+                                    queue_capacity = snapshot.capacity,
+                                    stream_count = writer_conn.stream_count.load(std::sync::atomic::Ordering::Relaxed),
+                                    closing = writer_conn.outbound.is_closing(),
+                                    draining = writer_conn.is_draining(),
                                     error = %e,
                                     "writer ws_tx.send failed"
                                 );
                                 break;
                             }
                             Err(_) => {
+                                let snapshot = writer_conn.outbound.snapshot();
                                 warn!(
                                     conn_id = writer_conn_id,
                                     frames_sent = frames_sent,
+                                    queue_depth = snapshot.depth,
+                                    queue_capacity = snapshot.capacity,
+                                    stream_count = writer_conn.stream_count.load(std::sync::atomic::Ordering::Relaxed),
+                                    closing = writer_conn.outbound.is_closing(),
+                                    draining = writer_conn.is_draining(),
                                     "writer ws_tx.send timed out"
                                 );
                                 break;
@@ -93,6 +105,17 @@ pub async fn handle_proxy_connection(
                 },
                 changed = close_rx.changed() => {
                     if changed.is_err() || *close_rx.borrow() {
+                        let snapshot = writer_conn.outbound.snapshot();
+                        info!(
+                            conn_id = writer_conn_id,
+                            frames_sent = frames_sent,
+                            queue_depth = snapshot.depth,
+                            queue_capacity = snapshot.capacity,
+                            stream_count = writer_conn.stream_count.load(std::sync::atomic::Ordering::Relaxed),
+                            closing = writer_conn.outbound.is_closing(),
+                            draining = writer_conn.is_draining(),
+                            "writer close signal received"
+                        );
                         break;
                     }
                 }
@@ -104,7 +127,24 @@ pub async fn handle_proxy_connection(
             "writer task exiting"
         );
         writer_conn.request_close();
-        let _ = tokio::time::timeout(Duration::from_secs(5), ws_tx.close()).await;
+        match tokio::time::timeout(Duration::from_secs(5), ws_tx.close()).await {
+            Ok(Ok(())) => debug!(
+                conn_id = writer_conn_id,
+                frames_sent = frames_sent,
+                "writer WebSocket close completed"
+            ),
+            Ok(Err(error)) => warn!(
+                conn_id = writer_conn_id,
+                frames_sent = frames_sent,
+                error = %error,
+                "writer WebSocket close failed"
+            ),
+            Err(_) => warn!(
+                conn_id = writer_conn_id,
+                frames_sent = frames_sent,
+                "writer WebSocket close timed out"
+            ),
+        }
     });
 
     let ping_conn = conn.clone();
@@ -113,10 +153,34 @@ pub async fn handle_proxy_connection(
         loop {
             tokio::time::sleep(ping_interval).await;
             let ping = protocol::encode_ping();
-            if !matches!(
-                ping_conn.send(Message::Binary(ping.into())),
-                SendStatus::Queued
-            ) {
+            let status = ping_conn.send(Message::Binary(ping.into()));
+            if !matches!(status, SendStatus::Queued) {
+                let snapshot = ping_conn.outbound.snapshot();
+                match status {
+                    SendStatus::Closed => info!(
+                        conn_id = ping_conn.id,
+                        queue_depth = snapshot.depth,
+                        queue_capacity = snapshot.capacity,
+                        stream_count = ping_conn
+                            .stream_count
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                        closing = ping_conn.outbound.is_closing(),
+                        draining = ping_conn.is_draining(),
+                        "ping task stopped because connection is closing"
+                    ),
+                    SendStatus::Congested => warn!(
+                        conn_id = ping_conn.id,
+                        queue_depth = snapshot.depth,
+                        queue_capacity = snapshot.capacity,
+                        stream_count = ping_conn
+                            .stream_count
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                        closing = ping_conn.outbound.is_closing(),
+                        draining = ping_conn.is_draining(),
+                        "ping task stopped because outbound queue is congested"
+                    ),
+                    SendStatus::Queued => {}
+                }
                 break;
             }
         }
@@ -130,6 +194,17 @@ pub async fn handle_proxy_connection(
 
     let _ = reader.await;
     ping_task.abort();
+    let snapshot = conn.outbound.snapshot();
+    info!(
+        conn_id = conn.id,
+        node_id = %conn.node_id,
+        queue_depth = snapshot.depth,
+        queue_capacity = snapshot.capacity,
+        stream_count = conn.stream_count.load(std::sync::atomic::Ordering::Relaxed),
+        closing = conn.outbound.is_closing(),
+        draining = conn.is_draining(),
+        "proxy connection cleanup starting"
+    );
     conn.request_close();
     hub.unregister_proxy(conn_id, &node_id);
     drop(conn);

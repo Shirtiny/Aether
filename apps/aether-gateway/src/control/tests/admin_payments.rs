@@ -1,6 +1,7 @@
 use http::Uri;
 
-use super::{classify_control_route, headers};
+use super::{classify_control_route, headers, GatewayPublicRequestContext};
+use crate::handlers::shared::local_proxy_route_requires_buffered_body;
 
 #[test]
 fn classifies_admin_payments_list_orders_as_admin_proxy_route() {
@@ -204,4 +205,58 @@ fn classifies_admin_payments_redeem_code_routes_as_admin_proxy_route() {
         delete_batch.route_kind.as_deref(),
         Some("delete_redeem_code_batch")
     );
+}
+
+#[test]
+fn classifies_admin_epay_gateway_routes_as_admin_proxy_route() {
+    let headers = headers(&[]);
+    for (method, uri, route_kind) in [
+        (
+            http::Method::GET,
+            "/api/admin/payments/gateways/epay",
+            "get_epay_gateway",
+        ),
+        (
+            http::Method::PUT,
+            "/api/admin/payments/gateways/epay",
+            "update_epay_gateway",
+        ),
+        (
+            http::Method::POST,
+            "/api/admin/payments/gateways/epay/test",
+            "test_epay_gateway",
+        ),
+    ] {
+        let uri: Uri = uri.parse().expect("uri should parse");
+        let decision =
+            classify_control_route(&method, &uri, &headers).expect("route should classify");
+
+        assert_eq!(decision.route_class.as_deref(), Some("admin_proxy"));
+        assert_eq!(decision.route_family.as_deref(), Some("payments_manage"));
+        assert_eq!(decision.route_kind.as_deref(), Some(route_kind));
+        assert_eq!(
+            decision.auth_endpoint_signature.as_deref(),
+            Some("admin:payments")
+        );
+        assert!(!decision.is_execution_runtime_candidate());
+    }
+}
+
+#[test]
+fn admin_epay_gateway_update_buffers_request_body() {
+    let headers = headers(&[]);
+    let uri: Uri = "/api/admin/payments/gateways/epay"
+        .parse()
+        .expect("uri should parse");
+    let decision =
+        classify_control_route(&http::Method::PUT, &uri, &headers).expect("route should classify");
+    let context = GatewayPublicRequestContext::from_request_parts(
+        "trace-epay-gateway-update",
+        &http::Method::PUT,
+        &uri,
+        &headers,
+        Some(decision),
+    );
+
+    assert!(local_proxy_route_requires_buffered_body(&context));
 }

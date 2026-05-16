@@ -322,6 +322,7 @@ pub const PROXY_NODE_EVENT_TYPE_TUNNEL_ERROR: &str = "tunnel_err";
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TunnelErrorEventRecord {
     pub timestamp_unix_secs: u64,
+    pub timestamp_unix_ms: Option<u64>,
     pub category: String,
     pub message: String,
     pub severity: Option<String>,
@@ -428,6 +429,28 @@ pub fn build_tunnel_error_event_detail(event: &TunnelErrorEventRecord) -> String
     )
 }
 
+pub fn log_reported_tunnel_error_event(
+    node_id: &str,
+    event: &TunnelErrorEventRecord,
+    received_at_unix_secs: u64,
+) {
+    tracing::warn!(
+        event_name = "proxy_tunnel_error_reported",
+        source = "heartbeat",
+        node_id = %node_id,
+        category = %event.category,
+        message = %event.message,
+        severity = ?event.severity,
+        component = ?event.component,
+        summary = ?event.summary,
+        operator_action = ?event.operator_action,
+        error_reported_at_unix_secs = event.timestamp_unix_secs,
+        error_reported_at_unix_ms = ?event.timestamp_unix_ms,
+        report_received_at_unix_secs = received_at_unix_secs,
+        "proxy reported tunnel error via heartbeat"
+    );
+}
+
 pub fn normalize_proxy_metadata(
     proxy_metadata: Option<&serde_json::Value>,
     proxy_version: Option<&str>,
@@ -495,6 +518,7 @@ fn extract_recent_tunnel_errors(proxy_metadata: Option<&Value>) -> Vec<TunnelErr
                     Some(TunnelErrorEventRecord {
                         timestamp_unix_secs: json_u64(item.get("timestamp_unix_secs"))
                             .unwrap_or_default(),
+                        timestamp_unix_ms: json_u64(item.get("timestamp_unix_ms")),
                         category: item
                             .get("category")
                             .and_then(Value::as_str)
@@ -865,6 +889,7 @@ mod tests {
                 {"timestamp_unix_secs": 100, "category": "older", "message": "old"},
                 {
                     "timestamp_unix_secs": 101,
+                    "timestamp_unix_ms": 101_999,
                     "category": "newer",
                     "message": "new",
                     "severity": "error",
@@ -897,6 +922,10 @@ mod tests {
         assert_eq!(
             sample.recent_error_events[1].component.as_deref(),
             Some("tunnel_write")
+        );
+        assert_eq!(
+            sample.recent_error_events[1].timestamp_unix_ms,
+            Some(101_999)
         );
         assert_eq!(
             build_tunnel_error_event_detail(&sample.recent_error_events[1]),

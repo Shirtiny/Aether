@@ -49,6 +49,28 @@ describe('provider model form embedding helpers', () => {
     expect('supports_embedding' in payload).toBe(false)
   })
 
+  it('uses manually supplied provider model name in create payload', () => {
+    const payload = buildProviderModelCreatePayload({
+      globalModelId: 'gm-local-manual',
+      providerModelName: 'intranet-chat-model-v1',
+      finalTieredPricing: pricing,
+      tieredPricingModified: false,
+      pricePerRequest: undefined,
+      cleanConfig: undefined,
+      configTouched: false,
+      isActive: true,
+    })
+
+    expect(payload).toMatchObject({
+      global_model_id: 'gm-local-manual',
+      provider_model_name: 'intranet-chat-model-v1',
+      tiered_pricing: undefined,
+      price_per_request: undefined,
+      config: undefined,
+      is_active: true,
+    })
+  })
+
   it('preserves edited provider embedding config without posting unsupported embedding controls', () => {
     const payload = buildProviderModelUpdatePayload({
       finalTieredPricing: pricing,

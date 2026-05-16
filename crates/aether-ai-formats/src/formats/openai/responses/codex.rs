@@ -284,7 +284,8 @@ pub fn apply_openai_responses_compact_special_body_edits(
         return;
     };
 
-    // `/v1/responses/compact` does not accept `store` or body-level `stream`.
+    // `/v1/responses/compact` does not accept `include`, `store`, or body-level `stream`.
+    body_object.remove("include");
     body_object.remove("store");
     body_object.remove("stream");
 }
@@ -514,7 +515,8 @@ pub fn apply_codex_openai_responses_special_headers(
 mod tests {
     use super::{
         apply_codex_openai_responses_chat_body_edits,
-        apply_codex_openai_responses_special_body_edits, CODEX_OPENAI_IMAGE_INTERNAL_MODEL,
+        apply_codex_openai_responses_special_body_edits,
+        apply_openai_responses_compact_special_body_edits, CODEX_OPENAI_IMAGE_INTERNAL_MODEL,
     };
     use serde_json::json;
 
@@ -591,6 +593,27 @@ mod tests {
             ])
         );
         assert_eq!(provider_request_body["parallel_tool_calls"], json!(false));
+    }
+
+    #[test]
+    fn compact_body_edits_strip_include_store_and_stream() {
+        let mut provider_request_body = json!({
+            "input": [],
+            "model": "gpt-5.4",
+            "include": ["reasoning.encrypted_content"],
+            "store": true,
+            "stream": true,
+        });
+
+        apply_openai_responses_compact_special_body_edits(
+            &mut provider_request_body,
+            "openai:responses:compact",
+        );
+
+        assert!(provider_request_body.get("include").is_none());
+        assert!(provider_request_body.get("store").is_none());
+        assert!(provider_request_body.get("stream").is_none());
+        assert_eq!(provider_request_body["model"], json!("gpt-5.4"));
     }
 
     #[test]

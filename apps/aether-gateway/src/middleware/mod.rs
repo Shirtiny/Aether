@@ -6,5 +6,5 @@ pub(crate) use access_log::{
     access_log_middleware, should_downgrade_access_log, RequestLogEmitted,
 };
 pub(crate) use frontdoor_cors::frontdoor_cors_middleware;
-pub(crate) use strip_cf_headers::apply_cf_header_stripping;
 pub use strip_cf_headers::strip_cf_headers_middleware;
+pub(crate) use strip_cf_headers::{apply_cf_header_stripping, CfConnectingIp};

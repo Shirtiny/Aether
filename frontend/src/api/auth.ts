@@ -33,6 +33,7 @@ export interface UserStats {
 
 export interface SendVerificationCodeRequest {
   email: string
+  turnstile_token?: string
 }
 
 export interface SendVerificationCodeResponse {
@@ -67,6 +68,7 @@ export interface RegisterRequest {
   email?: string
   username: string
   password: string
+  turnstile_token?: string
 }
 
 export interface RegisterResponse {
@@ -81,6 +83,9 @@ export interface RegistrationSettingsResponse {
   require_email_verification: boolean
   email_configured: boolean
   password_policy_level: string
+  turnstile_enabled?: boolean
+  turnstile_site_key?: string | null
+  turnstile_required_actions?: string[]
 }
 
 export interface AuthSettingsResponse {
@@ -153,10 +158,17 @@ export const authApi = {
     return response.data
   },
 
-  async sendVerificationCode(email: string): Promise<SendVerificationCodeResponse> {
+  async sendVerificationCode(
+    email: string,
+    turnstileToken?: string
+  ): Promise<SendVerificationCodeResponse> {
+    const payload: SendVerificationCodeRequest = { email }
+    if (turnstileToken) {
+      payload.turnstile_token = turnstileToken
+    }
     const response = await apiClient.post<SendVerificationCodeResponse>(
       '/api/auth/send-verification-code',
-      { email }
+      payload
     )
     return response.data
   },

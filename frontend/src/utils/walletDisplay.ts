@@ -71,6 +71,8 @@ export function paymentMethodLabel(method: string | null | undefined): string {
   const labels: Record<string, string> = {
     alipay: '支付宝',
     wechat: '微信支付',
+    wxpay: '微信支付',
+    epay: '易支付',
     admin_manual: '人工充值',
     card_code: '充值卡',
     gift_code: '礼品卡',

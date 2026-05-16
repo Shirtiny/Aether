@@ -1,6 +1,7 @@
 use super::{
     build_admin_payments_data_unavailable_response,
     callbacks::maybe_build_local_admin_payment_callbacks_response,
+    gateways::maybe_build_local_admin_payment_gateways_response,
     orders::maybe_build_local_admin_payment_orders_response,
     redeem_codes::maybe_build_local_admin_redeem_codes_response,
 };
@@ -29,6 +30,12 @@ pub(super) async fn maybe_build_local_admin_payments_response(
     };
     let is_payments_route = (request_context.method() == http::Method::GET
         && path == "/api/admin/payments/orders")
+        || (matches!(
+            request_context.method(),
+            &http::Method::GET | &http::Method::PUT
+        ) && path == "/api/admin/payments/gateways/epay")
+        || (request_context.method() == http::Method::POST
+            && path == "/api/admin/payments/gateways/epay/test")
         || (request_context.method() == http::Method::GET
             && path.starts_with("/api/admin/payments/orders/")
             && path.matches('/').count() == 5)
@@ -75,6 +82,16 @@ pub(super) async fn maybe_build_local_admin_payments_response(
     }
 
     let route_kind = decision.route_kind.as_deref();
+    if let Some(response) = maybe_build_local_admin_payment_gateways_response(
+        state,
+        request_context,
+        request_body,
+        route_kind,
+    )
+    .await?
+    {
+        return Ok(Some(response));
+    }
     if let Some(response) = maybe_build_local_admin_payment_orders_response(
         state,
         request_context,

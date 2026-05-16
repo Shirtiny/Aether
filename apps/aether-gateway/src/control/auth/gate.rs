@@ -3,7 +3,10 @@ use axum::http::Uri;
 
 use super::super::GatewayControlDecision;
 use super::credentials::{contains_string, extract_requested_model};
+use super::GatewayControlAuthContext;
 use crate::{AppState, GatewayError};
+
+const DAILY_QUOTA_EPSILON_USD: f64 = 0.000_000_01;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum GatewayLocalAuthRejection {
@@ -59,34 +62,309 @@ pub(crate) async fn request_model_local_rejection(
     let Some(auth_context) = decision.auth_context.as_ref() else {
         return Ok(None);
     };
-    let Some(allowed_models) = auth_context.allowed_models.as_deref() else {
-        return Ok(None);
-    };
-    let Some(requested_model) = extract_requested_model(decision, uri, headers, body) else {
-        return Ok(None);
-    };
-    if contains_string(allowed_models, &requested_model) {
-        return Ok(None);
-    }
-    if model_directive_base_model_is_allowed_for_request(
-        state,
-        decision,
-        &requested_model,
-        allowed_models,
-    )
-    .await
-    {
-        return Ok(None);
-    }
-    if request_model_resolves_to_allowed_model(state, decision, &requested_model, allowed_models)
-        .await?
-    {
-        return Ok(None);
+    let requested_model = extract_requested_model(decision, uri, headers, body);
+    if let (Some(allowed_models), Some(requested_model)) = (
+        auth_context.allowed_models.as_deref(),
+        requested_model.as_deref(),
+    ) {
+        if !contains_string(allowed_models, requested_model)
+            && !model_directive_base_model_is_allowed_for_request(
+                state,
+                decision,
+                requested_model,
+                allowed_models,
+            )
+            .await
+            && !request_model_resolves_to_allowed_model(
+                state,
+                decision,
+                requested_model,
+                allowed_models,
+            )
+            .await?
+        {
+            return Ok(Some(GatewayLocalAuthRejection::ModelNotAllowed {
+                model: requested_model.to_string(),
+            }));
+        }
     }
 
-    Ok(Some(GatewayLocalAuthRejection::ModelNotAllowed {
-        model: requested_model,
-    }))
+    balance_capacity_rejection(
+        state,
+        decision,
+        auth_context,
+        requested_model.as_deref(),
+        body,
+    )
+    .await
+}
+
+async fn balance_capacity_rejection(
+    state: &AppState,
+    decision: &GatewayControlDecision,
+    auth_context: &GatewayControlAuthContext,
+    requested_model: Option<&str>,
+    body: &Bytes,
+) -> Result<Option<GatewayLocalAuthRejection>, GatewayError> {
+    if auth_context.api_key_is_standalone || auth_context.admin_bypass_limits {
+        return Ok(None);
+    }
+    if auth_context.local_rejection.is_some() {
+        return Ok(None);
+    }
+    let quota = state
+        .find_user_daily_quota_availability(&auth_context.user_id)
+        .await?
+        .filter(|quota| quota.has_active_daily_quota);
+    let wallet = state
+        .read_wallet_snapshot_for_auth(
+            &auth_context.user_id,
+            &auth_context.api_key_id,
+            auth_context.api_key_is_standalone,
+        )
+        .await?;
+    let wallet_available_usd = wallet.as_ref().and_then(wallet_finite_available_usd);
+    let wallet_is_unlimited = wallet
+        .as_ref()
+        .is_some_and(|wallet| wallet.limit_mode.eq_ignore_ascii_case("unlimited"));
+    let (available_usd, require_cost_estimate) = match quota.as_ref() {
+        Some(quota) if !quota.allow_wallet_overage => (Some(quota.remaining_usd.max(0.0)), true),
+        Some(_) if wallet_is_unlimited => (None, false),
+        Some(quota) => (
+            Some(quota.remaining_usd.max(0.0) + wallet_available_usd.unwrap_or(0.0)),
+            true,
+        ),
+        None if wallet_is_unlimited => (None, false),
+        None => (wallet_available_usd, false),
+    };
+    let Some(available_usd) = available_usd else {
+        return Ok(None);
+    };
+    if available_usd <= DAILY_QUOTA_EPSILON_USD {
+        return Ok(Some(GatewayLocalAuthRejection::BalanceDenied {
+            remaining: Some(0.0),
+        }));
+    }
+    let Some(requested_model) = requested_model else {
+        return if require_cost_estimate {
+            Ok(Some(GatewayLocalAuthRejection::BalanceDenied {
+                remaining: Some(available_usd),
+            }))
+        } else {
+            Ok(None)
+        };
+    };
+    let Some(estimated_cost_usd) =
+        estimate_request_cost_upper_bound_usd(state, decision, requested_model, body).await?
+    else {
+        return if require_cost_estimate {
+            Ok(Some(GatewayLocalAuthRejection::BalanceDenied {
+                remaining: Some(available_usd),
+            }))
+        } else {
+            Ok(None)
+        };
+    };
+    if estimated_cost_usd > available_usd + DAILY_QUOTA_EPSILON_USD {
+        return Ok(Some(GatewayLocalAuthRejection::BalanceDenied {
+            remaining: Some(available_usd),
+        }));
+    }
+    Ok(None)
+}
+
+fn wallet_finite_available_usd(
+    wallet: &aether_data::repository::wallet::StoredWalletSnapshot,
+) -> Option<f64> {
+    if !wallet.status.eq_ignore_ascii_case("active")
+        || wallet.limit_mode.eq_ignore_ascii_case("unlimited")
+    {
+        return None;
+    }
+    Some(wallet.balance.max(0.0) + wallet.gift_balance.max(0.0))
+}
+
+async fn estimate_request_cost_upper_bound_usd(
+    state: &AppState,
+    decision: &GatewayControlDecision,
+    requested_model: &str,
+    body: &Bytes,
+) -> Result<Option<f64>, GatewayError> {
+    let Some(api_format) = decision
+        .auth_endpoint_signature
+        .as_deref()
+        .map(crate::ai_serving::normalize_api_format_alias)
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    let body_json = serde_json::from_slice::<serde_json::Value>(body).ok();
+    let Some(input_tokens) = body_json
+        .as_ref()
+        .map(estimate_json_tokens)
+        .filter(|value| *value > 0)
+    else {
+        return Ok(None);
+    };
+    let max_output_tokens = body_json.as_ref().and_then(max_output_tokens_from_request);
+    let candidates = state
+        .list_minimal_candidate_selection_rows_for_api_format_and_requested_model(
+            &api_format,
+            requested_model,
+        )
+        .await?;
+    let mut max_estimate = None::<f64>;
+    for candidate in candidates {
+        let context = state
+            .data
+            .find_billing_model_context_by_model_id(
+                &candidate.provider_id,
+                Some(&candidate.key_id),
+                &candidate.model_id,
+            )
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+        let Some(context) = context else {
+            continue;
+        };
+        let Some(estimate) = estimate_cost_from_billing_context(
+            &context,
+            &api_format,
+            input_tokens,
+            max_output_tokens,
+        ) else {
+            return Ok(None);
+        };
+        max_estimate = Some(max_estimate.map_or(estimate, |current| current.max(estimate)));
+    }
+    Ok(max_estimate.filter(|value| value.is_finite() && *value >= 0.0))
+}
+
+fn estimate_cost_from_billing_context(
+    context: &aether_data_contracts::repository::billing::StoredBillingModelContext,
+    api_format: &str,
+    input_tokens: u64,
+    max_output_tokens: Option<u64>,
+) -> Option<f64> {
+    if context
+        .provider_billing_type
+        .as_deref()
+        .is_some_and(|value| value.eq_ignore_ascii_case("free_tier"))
+    {
+        return Some(0.0);
+    }
+    let price_per_request = context
+        .model_price_per_request
+        .or(context.default_price_per_request)
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .unwrap_or(0.0);
+    let tiered_pricing = effective_tiered_pricing(context);
+    let input_price_per_1m = tiered_price_per_1m(tiered_pricing, "input_price_per_1m")
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .unwrap_or(0.0);
+    let output_price_per_1m = tiered_price_per_1m(tiered_pricing, "output_price_per_1m")
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .unwrap_or(0.0);
+    let output_tokens = if output_price_per_1m > 0.0 {
+        max_output_tokens?
+    } else {
+        0
+    };
+    let estimate = price_per_request
+        + (input_tokens as f64 * input_price_per_1m / 1_000_000.0)
+        + (output_tokens as f64 * output_price_per_1m / 1_000_000.0);
+    let rate_multiplier = rate_multiplier_for_api_format(context, api_format);
+    Some(estimate * rate_multiplier)
+}
+
+fn effective_tiered_pricing(
+    context: &aether_data_contracts::repository::billing::StoredBillingModelContext,
+) -> Option<&serde_json::Value> {
+    context
+        .model_tiered_pricing
+        .as_ref()
+        .filter(|value| tiered_pricing_has_rates(value))
+        .or(context.default_tiered_pricing.as_ref())
+}
+
+fn tiered_pricing_has_rates(value: &serde_json::Value) -> bool {
+    value
+        .get("tiers")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|tiers| !tiers.is_empty())
+        || ["input_price_per_1m", "output_price_per_1m"]
+            .iter()
+            .any(|field| {
+                value
+                    .get(*field)
+                    .and_then(serde_json::Value::as_f64)
+                    .is_some()
+            })
+}
+
+fn rate_multiplier_for_api_format(
+    context: &aether_data_contracts::repository::billing::StoredBillingModelContext,
+    api_format: &str,
+) -> f64 {
+    let normalized_api_format = api_format.trim().to_ascii_lowercase();
+    let Some(mapping) = context
+        .provider_api_key_rate_multipliers
+        .as_ref()
+        .and_then(serde_json::Value::as_object)
+    else {
+        return 1.0;
+    };
+    mapping
+        .get(&normalized_api_format)
+        .and_then(serde_json::Value::as_f64)
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .unwrap_or(1.0)
+}
+
+fn tiered_price_per_1m(tiered_pricing: Option<&serde_json::Value>, field: &str) -> Option<f64> {
+    let value = tiered_pricing?;
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_f64)
+        .or_else(|| {
+            value
+                .get("tiers")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|tier| tier.get(field).and_then(serde_json::Value::as_f64))
+                .filter(|price| price.is_finite() && *price >= 0.0)
+                .max_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))
+        })
+}
+
+fn max_output_tokens_from_request(value: &serde_json::Value) -> Option<u64> {
+    ["max_tokens", "max_completion_tokens", "max_output_tokens"]
+        .iter()
+        .find_map(|field| value.get(*field).and_then(serde_json::Value::as_u64))
+        .filter(|value| *value > 0)
+}
+
+fn estimate_json_tokens(value: &serde_json::Value) -> u64 {
+    match value {
+        serde_json::Value::String(text) => estimate_text_tokens(text),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .map(estimate_json_tokens)
+            .fold(0u64, u64::saturating_add),
+        serde_json::Value::Object(object) => object
+            .iter()
+            .map(|(key, value)| {
+                estimate_text_tokens(key).saturating_add(estimate_json_tokens(value))
+            })
+            .fold(0u64, u64::saturating_add),
+        _ => 1,
+    }
+}
+
+fn estimate_text_tokens(text: &str) -> u64 {
+    let chars = text.chars().count() as u64;
+    chars.div_ceil(4).max(1)
 }
 
 async fn model_directive_base_model_is_allowed_for_request(
@@ -200,13 +478,18 @@ mod tests {
     use std::sync::Arc;
 
     use aether_data::repository::candidate_selection::InMemoryMinimalCandidateSelectionReadRepository;
+    use aether_data_contracts::repository::billing::StoredBillingModelContext;
     use aether_data_contracts::repository::candidate_selection::{
         StoredMinimalCandidateSelectionRow, StoredProviderModelMapping,
     };
     use axum::body::Bytes;
     use axum::http::{HeaderMap, Uri};
+    use serde_json::json;
 
-    use super::{request_model_local_rejection, GatewayLocalAuthRejection};
+    use super::{
+        estimate_cost_from_billing_context, request_model_local_rejection,
+        GatewayLocalAuthRejection,
+    };
     use crate::control::{GatewayControlAuthContext, GatewayControlDecision};
     use crate::data::GatewayDataState;
     use crate::AppState;
@@ -320,6 +603,32 @@ mod tests {
         headers
     }
 
+    fn billing_context_with_pricing(
+        default_tiered_pricing: Option<serde_json::Value>,
+        model_tiered_pricing: Option<serde_json::Value>,
+        rate_multipliers: Option<serde_json::Value>,
+        billing_type: Option<&str>,
+    ) -> StoredBillingModelContext {
+        StoredBillingModelContext::new(
+            "provider-1".to_string(),
+            billing_type.map(ToOwned::to_owned),
+            Some("key-1".to_string()),
+            rate_multipliers,
+            Some(60),
+            "global-model-1".to_string(),
+            "gpt-5".to_string(),
+            None,
+            None,
+            default_tiered_pricing,
+            Some("model-1".to_string()),
+            Some("gpt-5-upstream".to_string()),
+            None,
+            None,
+            model_tiered_pricing,
+        )
+        .expect("billing context should build")
+    }
+
     #[tokio::test]
     async fn model_rejection_allows_requested_model_that_resolves_to_allowed_global_model() {
         let state = state_with_model_mapping();
@@ -391,5 +700,71 @@ mod tests {
                 model: "gpt-5.2".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn daily_quota_estimate_falls_back_to_default_tiers_when_model_tiers_empty() {
+        let context = billing_context_with_pricing(
+            Some(json!({
+                "tiers": [{
+                    "up_to": null,
+                    "input_price_per_1m": 3.0,
+                    "output_price_per_1m": 15.0
+                }]
+            })),
+            Some(json!({})),
+            None,
+            None,
+        );
+
+        let estimate =
+            estimate_cost_from_billing_context(&context, "openai:chat", 1_000_000, Some(1_000_000))
+                .expect("estimate should resolve");
+
+        assert_eq!(estimate, 18.0);
+    }
+
+    #[test]
+    fn daily_quota_estimate_applies_provider_key_rate_multiplier() {
+        let context = billing_context_with_pricing(
+            Some(json!({
+                "tiers": [{
+                    "up_to": null,
+                    "input_price_per_1m": 1.0,
+                    "output_price_per_1m": 2.0
+                }]
+            })),
+            None,
+            Some(json!({ "openai:chat": 2.0 })),
+            None,
+        );
+
+        let estimate =
+            estimate_cost_from_billing_context(&context, "openai:chat", 1_000_000, Some(1_000_000))
+                .expect("estimate should resolve");
+
+        assert_eq!(estimate, 6.0);
+    }
+
+    #[test]
+    fn daily_quota_estimate_treats_free_tier_as_zero_cost() {
+        let context = billing_context_with_pricing(
+            Some(json!({
+                "tiers": [{
+                    "up_to": null,
+                    "input_price_per_1m": 3.0,
+                    "output_price_per_1m": 15.0
+                }]
+            })),
+            None,
+            Some(json!({ "openai:chat": 10.0 })),
+            Some("free_tier"),
+        );
+
+        let estimate =
+            estimate_cost_from_billing_context(&context, "openai:chat", 1_000_000, Some(1_000_000))
+                .expect("estimate should resolve");
+
+        assert_eq!(estimate, 0.0);
     }
 }

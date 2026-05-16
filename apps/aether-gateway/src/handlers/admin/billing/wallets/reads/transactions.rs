@@ -1,6 +1,6 @@
 use super::super::shared::{
     admin_wallet_id_from_suffix_path, build_admin_wallet_not_found_response,
-    build_admin_wallet_summary_payload, build_admin_wallets_bad_request_response,
+    build_admin_wallet_summary_payload_with_package, build_admin_wallets_bad_request_response,
     parse_admin_wallets_limit, parse_admin_wallets_offset, resolve_admin_wallet_owner_summary,
 };
 use crate::handlers::admin::request::{AdminAppState, AdminRequestContext};
@@ -39,7 +39,8 @@ pub(in super::super) async fn build_admin_wallet_transactions_response(
         return Ok(build_admin_wallet_not_found_response());
     };
     let owner = resolve_admin_wallet_owner_summary(state, &wallet).await?;
-    let wallet_payload = build_admin_wallet_summary_payload(&wallet, &owner);
+    let wallet_payload =
+        build_admin_wallet_summary_payload_with_package(state, &wallet, &owner).await?;
 
     let (transactions, total) = state
         .list_admin_wallet_transactions(&wallet.id, limit, offset)

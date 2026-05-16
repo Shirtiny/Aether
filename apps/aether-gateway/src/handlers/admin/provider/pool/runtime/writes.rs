@@ -614,7 +614,6 @@ mod tests {
             overload_cooldown_seconds: 30,
             health_policy_enabled: true,
             probing_enabled: false,
-            probing_interval_minutes: 10,
             probing_target_percent: None,
             probing_target_count: None,
             probe_concurrency: 4,

@@ -15,18 +15,55 @@ Tunnel 模式下代理节点**无需对外监听端口**，仅需出站连接到
 <!-- DOWNLOAD_TABLE_START -->
 | Platform | Download |
 |----------|----------|
-| Linux x86_64 (GNU) | [aether-proxy-linux-amd64.tar.gz](https://github.com/fawney19/Aether/releases/download/proxy-v0.3.9/aether-proxy-linux-amd64.tar.gz) |
-| Linux ARM64 (GNU) | [aether-proxy-linux-arm64.tar.gz](https://github.com/fawney19/Aether/releases/download/proxy-v0.3.9/aether-proxy-linux-arm64.tar.gz) |
-| Linux x86_64 (musl) | [aether-proxy-linux-musl-amd64.tar.gz](https://github.com/fawney19/Aether/releases/download/proxy-v0.3.9/aether-proxy-linux-musl-amd64.tar.gz) |
-| Linux ARM64 (musl) | [aether-proxy-linux-musl-arm64.tar.gz](https://github.com/fawney19/Aether/releases/download/proxy-v0.3.9/aether-proxy-linux-musl-arm64.tar.gz) |
-| macOS x86_64 | [aether-proxy-macos-amd64.tar.gz](https://github.com/fawney19/Aether/releases/download/proxy-v0.3.9/aether-proxy-macos-amd64.tar.gz) |
-| macOS ARM64 | [aether-proxy-macos-arm64.tar.gz](https://github.com/fawney19/Aether/releases/download/proxy-v0.3.9/aether-proxy-macos-arm64.tar.gz) |
-| Windows x86_64 | [aether-proxy-windows-amd64.zip](https://github.com/fawney19/Aether/releases/download/proxy-v0.3.9/aether-proxy-windows-amd64.zip) |
+| Linux x86_64 (GNU) | [aether-proxy-linux-amd64.tar.gz](https://github.com/fawney19/Aether/releases/download/proxy-v0.3.11/aether-proxy-linux-amd64.tar.gz) |
+| Linux ARM64 (GNU) | [aether-proxy-linux-arm64.tar.gz](https://github.com/fawney19/Aether/releases/download/proxy-v0.3.11/aether-proxy-linux-arm64.tar.gz) |
+| Linux x86_64 (musl) | [aether-proxy-linux-musl-amd64.tar.gz](https://github.com/fawney19/Aether/releases/download/proxy-v0.3.11/aether-proxy-linux-musl-amd64.tar.gz) |
+| Linux ARM64 (musl) | [aether-proxy-linux-musl-arm64.tar.gz](https://github.com/fawney19/Aether/releases/download/proxy-v0.3.11/aether-proxy-linux-musl-arm64.tar.gz) |
+| macOS x86_64 | [aether-proxy-macos-amd64.tar.gz](https://github.com/fawney19/Aether/releases/download/proxy-v0.3.11/aether-proxy-macos-amd64.tar.gz) |
+| macOS ARM64 | [aether-proxy-macos-arm64.tar.gz](https://github.com/fawney19/Aether/releases/download/proxy-v0.3.11/aether-proxy-macos-arm64.tar.gz) |
+| Windows x86_64 | [aether-proxy-windows-amd64.zip](https://github.com/fawney19/Aether/releases/download/proxy-v0.3.11/aether-proxy-windows-amd64.zip) |
 <!-- DOWNLOAD_TABLE_END -->
 
 上表展示的是最新已发布版本的下载链接。从下一次 `proxy-v*` 发布开始，表格会自动补上 `Linux x86_64 (musl)` / `Linux ARM64 (musl)` 包，供 Alpine 等 musl 系统直接使用。
 
 ## 快速开始
+
+### 一键安装 / 添加节点
+
+一键脚本会自动从 GitHub Releases 中筛选最新的 `proxy-v*` tag，并按当前系统下载对应制品：Linux x86_64/ARM64（GNU 或 musl）、macOS x86_64/ARM64、Windows x86_64。仓库的通用 `latest` release 可能不是 proxy 版本，因此脚本不会使用 `/releases/latest`。
+
+脚本会安装/更新 `aether-proxy` 二进制，并把新的服务器配置追加到 `aether-proxy.toml` 的 `[[servers]]` 数组中；如果配置文件已存在，不会覆盖原有内容。检测到相同 `aether_url + node_name` 时会跳过追加。
+
+macOS / Linux:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/fawney19/Aether/main/apps/aether-proxy/install.sh | sh
+```
+
+Windows PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/fawney19/Aether/main/apps/aether-proxy/install.ps1 | iex
+```
+
+也可以用环境变量非交互式执行，适合在控制台“添加代理节点”时生成命令：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/fawney19/Aether/main/apps/aether-proxy/install.sh | \
+  AETHER_PROXY_AETHER_URL="https://aether.example.com" \
+  AETHER_PROXY_MANAGEMENT_TOKEN="ae_xxx" \
+  AETHER_PROXY_NODE_NAME="jp-proxy-01" \
+  sh
+```
+
+```powershell
+$env:AETHER_PROXY_AETHER_URL = "https://aether.example.com"
+$env:AETHER_PROXY_MANAGEMENT_TOKEN = "ae_xxx"
+$env:AETHER_PROXY_NODE_NAME = "jp-proxy-01"
+irm https://raw.githubusercontent.com/fawney19/Aether/main/apps/aether-proxy/install.ps1 | iex
+```
+
+可选变量：`AETHER_PROXY_RELEASE_TAG` 固定安装某个 `proxy-v*` tag，`AETHER_PROXY_CONFIG` 指定配置文件路径，`AETHER_PROXY_INSTALL_DIR` 指定二进制安装目录。
 
 ```bash
 # 1. 首次安装配置（TUI 向导，勾选 Install Service 随系统启动服务）
@@ -143,16 +180,16 @@ upstream_proxy_url = "socks5h://microwarp:1080"
 | 参数 | 环境变量 | 默认值 | 说明 |
 |------|----------|--------|------|
 | `--log-level` | `AETHER_PROXY_LOG_LEVEL` | `info` | 日志级别 |
-| `--log-destination` | `AETHER_PROXY_LOG_DESTINATION` | `stdout` | 输出到 `stdout`、文件或两者同时输出 |
-| `--log-dir` | `AETHER_PROXY_LOG_DIR` | 空 | 文件日志目录，`file/both` 时必填 |
+| `--log-destination` | `AETHER_PROXY_LOG_DESTINATION` | `both` | 输出到 `stdout`、文件或两者同时输出 |
+| `--log-dir` | `AETHER_PROXY_LOG_DIR` | `logs` | 文件日志目录，`file/both` 时必填 |
 | `--log-rotation` | `AETHER_PROXY_LOG_ROTATION` | `daily` | 文件日志按小时或按天轮转 |
 | `--log-retention-days` | `AETHER_PROXY_LOG_RETENTION_DAYS` | `7` | 文件日志保留天数 |
 | `--log-max-files` | `AETHER_PROXY_LOG_MAX_FILES` | `30` | 文件日志最多保留文件数 |
 
 ### 日志落点
 
-- 默认 `AETHER_PROXY_LOG_DESTINATION=stdout`，日志交给容器日志驱动或宿主机服务管理器
-- 需要落盘时改成 `file` 或 `both`，并设置 `AETHER_PROXY_LOG_DIR`；setup TUI 里用 `Save Logs to File` 开关即可
+- 默认 `AETHER_PROXY_LOG_DESTINATION=both`，同时输出到 stdout 和 `logs/` 文件目录
+- 需要只交给容器日志驱动或宿主机服务管理器时，可改成 `stdout`；setup TUI 里可用 `Save Logs to File` 开关关闭文件日志
 - 文件日志固定写普通文本，并支持 `hourly/daily` 轮转；默认按天轮换、保留 7 天，最多保留 30 个文件
 - 以 `systemd` 或 `OpenRC` 安装时默认会额外打开文件日志到 `/var/log/aether-proxy`
 - OpenRC 安装时，`aether-proxy logs` 实际读取 `/var/log/aether-proxy/current.log` 和 `/var/log/aether-proxy/error.log`；这些文件通常需要用 `sudo aether-proxy logs` 查看

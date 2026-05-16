@@ -1054,6 +1054,10 @@ pub(crate) async fn proxy_request(
         &state,
         &request_context,
         &parts.headers,
+        parts
+            .extensions
+            .get::<crate::middleware::CfConnectingIp>()
+            .map(|value| value.0.as_str()),
         local_proxy_body.as_ref(),
     )
     .await

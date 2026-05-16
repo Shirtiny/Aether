@@ -45,6 +45,7 @@ futures-util.workspace = true
 hmac.workspace = true
 http.workspace = true
 ldap3 = { version = "0.11", default-features = false, features = ["sync", "tls-rustls"] }
+md-5 = "0.10"
 parking_lot = "0.12"
 regex.workspace = true
 reqwest.workspace = true

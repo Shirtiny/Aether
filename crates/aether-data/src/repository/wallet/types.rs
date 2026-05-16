@@ -606,6 +606,8 @@ pub struct CreateWalletRechargeOrderInput {
     pub pay_currency: Option<String>,
     pub exchange_rate: Option<f64>,
     pub payment_method: String,
+    pub payment_provider: Option<String>,
+    pub payment_channel: Option<String>,
     pub gateway_order_id: String,
     pub gateway_response: serde_json::Value,
     pub order_no: String,
@@ -617,6 +619,33 @@ pub struct CreateWalletRechargeOrderInput {
 pub enum CreateWalletRechargeOrderOutcome {
     Created(StoredAdminPaymentOrder),
     WalletInactive,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CreatePlanPurchaseOrderInput {
+    pub preferred_wallet_id: Option<String>,
+    pub user_id: String,
+    pub amount_usd: f64,
+    pub pay_amount: f64,
+    pub pay_currency: String,
+    pub exchange_rate: f64,
+    pub payment_method: String,
+    pub payment_provider: Option<String>,
+    pub payment_channel: Option<String>,
+    pub gateway_order_id: String,
+    pub gateway_response: serde_json::Value,
+    pub order_no: String,
+    pub product_id: String,
+    pub product_snapshot: serde_json::Value,
+    pub expires_at_unix_secs: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[allow(clippy::large_enum_variant)]
+pub enum CreatePlanPurchaseOrderOutcome {
+    Created(StoredAdminPaymentOrder),
+    WalletInactive,
+    ActivePlanLimitReached,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -648,6 +677,8 @@ pub enum CreateWalletRefundRequestOutcome {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ProcessPaymentCallbackInput {
     pub payment_method: String,
+    pub payment_provider: Option<String>,
+    pub payment_channel: Option<String>,
     pub callback_key: String,
     pub order_no: Option<String>,
     pub gateway_order_id: Option<String>,
@@ -931,6 +962,16 @@ pub trait WalletWriteRepository: Send + Sync {
         &self,
         input: CreateWalletRechargeOrderInput,
     ) -> Result<CreateWalletRechargeOrderOutcome, crate::DataLayerError>;
+
+    async fn create_plan_purchase_order(
+        &self,
+        input: CreatePlanPurchaseOrderInput,
+    ) -> Result<CreatePlanPurchaseOrderOutcome, crate::DataLayerError> {
+        let _ = input;
+        Err(crate::DataLayerError::InvalidInput(
+            "plan purchase order creation is not available".to_string(),
+        ))
+    }
 
     async fn create_wallet_refund_request(
         &self,

@@ -47,7 +47,6 @@ use crate::maintenance::spawn_gemini_file_mapping_cleanup_worker;
 use crate::maintenance::spawn_oauth_token_refresh_worker;
 use crate::maintenance::spawn_pending_cleanup_worker;
 use crate::maintenance::spawn_pool_monitor_worker;
-use crate::maintenance::spawn_pool_quota_probe_worker;
 use crate::maintenance::spawn_pool_score_rebuild_worker;
 use crate::maintenance::spawn_provider_checkin_worker;
 use crate::maintenance::spawn_proxy_node_metrics_cleanup_worker;
@@ -258,6 +257,10 @@ impl AppState {
             local_execution_runtime_miss_diagnostics: Arc::new(StdMutex::new(HashMap::new())),
             admin_monitoring_error_stats_reset_at: Arc::new(StdMutex::new(None)),
             provider_delete_tasks: Arc::new(StdMutex::new(HashMap::new())),
+            #[cfg(test)]
+            turnstile_siteverify_url_override: None,
+            #[cfg(test)]
+            turnstile_siteverify_timeout_override: None,
             #[cfg(test)]
             provider_oauth_state_store: None,
             #[cfg(test)]
@@ -1168,10 +1171,6 @@ impl AppState {
         supervise_worker(
             crate::task_runtime::TASK_KEY_POOL_MONITOR,
             spawn_pool_monitor_worker(self.data.clone()),
-        );
-        supervise_worker(
-            crate::task_runtime::TASK_KEY_POOL_QUOTA_PROBE,
-            spawn_pool_quota_probe_worker(self.clone()),
         );
         supervise_worker(
             crate::task_runtime::TASK_KEY_ACCOUNT_SELF_CHECK,

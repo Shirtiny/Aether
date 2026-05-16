@@ -83,6 +83,13 @@ CREATE TABLE IF NOT EXISTS public.payment_orders (
     refunded_amount_usd double precision DEFAULT 0 NOT NULL,
     refundable_amount_usd double precision DEFAULT 0 NOT NULL,
     payment_method character varying(64) NOT NULL,
+    payment_provider character varying(64),
+    payment_channel character varying(64),
+    order_kind character varying(64) DEFAULT 'wallet_recharge' NOT NULL,
+    product_id character varying(64),
+    product_snapshot jsonb,
+    fulfillment_status character varying(64) DEFAULT 'pending' NOT NULL,
+    fulfillment_error text,
     gateway_order_id character varying(128),
     gateway_response jsonb,
     status character varying(64) DEFAULT 'pending' NOT NULL,
@@ -98,6 +105,25 @@ CREATE INDEX IF NOT EXISTS idx_payment_orders_wallet_created ON public.payment_o
 CREATE INDEX IF NOT EXISTS idx_payment_orders_user_created ON public.payment_orders USING btree (user_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_payment_orders_status ON public.payment_orders USING btree (status);
 CREATE INDEX IF NOT EXISTS idx_payment_orders_gateway_order_id ON public.payment_orders USING btree (gateway_order_id);
+CREATE INDEX IF NOT EXISTS idx_payment_orders_kind_status ON public.payment_orders USING btree (order_kind, status);
+CREATE INDEX IF NOT EXISTS idx_payment_orders_product ON public.payment_orders USING btree (product_id);
+
+CREATE TABLE IF NOT EXISTS public.payment_gateway_configs (
+    provider character varying(64) NOT NULL,
+    enabled boolean DEFAULT false NOT NULL,
+    endpoint_url character varying(512) NOT NULL,
+    callback_base_url character varying(512),
+    merchant_id character varying(128) NOT NULL,
+    merchant_key_encrypted text,
+    pay_currency character varying(16) DEFAULT 'CNY' NOT NULL,
+    usd_exchange_rate double precision DEFAULT 7.2 NOT NULL,
+    min_recharge_usd double precision DEFAULT 1 NOT NULL,
+    channels_json jsonb,
+    created_at bigint NOT NULL,
+    updated_at bigint NOT NULL
+);
+
+ALTER TABLE ONLY public.payment_gateway_configs ADD CONSTRAINT payment_gateway_configs_pkey PRIMARY KEY (provider);
 
 CREATE TABLE IF NOT EXISTS public.payment_callbacks (
     id character varying(64) NOT NULL,
@@ -121,6 +147,59 @@ CREATE INDEX IF NOT EXISTS idx_payment_callbacks_order ON public.payment_callbac
 CREATE INDEX IF NOT EXISTS idx_payment_callbacks_gateway_order ON public.payment_callbacks USING btree (gateway_order_id);
 CREATE INDEX IF NOT EXISTS idx_payment_callbacks_created ON public.payment_callbacks USING btree (created_at);
 CREATE INDEX IF NOT EXISTS ix_payment_callbacks_payment_order_id ON public.payment_callbacks USING btree (payment_order_id);
+
+CREATE TABLE IF NOT EXISTS public.billing_plans (
+    id character varying(64) NOT NULL,
+    title character varying(128) NOT NULL,
+    description text,
+    price_amount double precision NOT NULL,
+    price_currency character varying(16) DEFAULT 'CNY' NOT NULL,
+    duration_unit character varying(32) NOT NULL,
+    duration_value bigint NOT NULL,
+    enabled boolean DEFAULT true NOT NULL,
+    sort_order bigint DEFAULT 0 NOT NULL,
+    max_active_per_user bigint DEFAULT 1 NOT NULL,
+    purchase_limit_scope character varying(32) DEFAULT 'active_period' NOT NULL,
+    entitlements_json jsonb NOT NULL,
+    created_at bigint NOT NULL,
+    updated_at bigint NOT NULL
+);
+
+ALTER TABLE ONLY public.billing_plans ADD CONSTRAINT billing_plans_pkey PRIMARY KEY (id);
+CREATE INDEX IF NOT EXISTS idx_billing_plans_enabled_sort ON public.billing_plans USING btree (enabled, sort_order);
+
+CREATE TABLE IF NOT EXISTS public.user_plan_entitlements (
+    id character varying(64) NOT NULL,
+    user_id character varying(64) NOT NULL,
+    plan_id character varying(64) NOT NULL,
+    payment_order_id character varying(64) NOT NULL,
+    status character varying(64) DEFAULT 'active' NOT NULL,
+    starts_at bigint NOT NULL,
+    expires_at bigint NOT NULL,
+    entitlements_snapshot jsonb NOT NULL,
+    created_at bigint NOT NULL,
+    updated_at bigint NOT NULL
+);
+
+ALTER TABLE ONLY public.user_plan_entitlements ADD CONSTRAINT user_plan_entitlements_pkey PRIMARY KEY (id);
+CREATE INDEX IF NOT EXISTS idx_user_plan_entitlements_user_active ON public.user_plan_entitlements USING btree (user_id, status, expires_at);
+CREATE INDEX IF NOT EXISTS idx_user_plan_entitlements_order ON public.user_plan_entitlements USING btree (payment_order_id);
+
+CREATE TABLE IF NOT EXISTS public.entitlement_usage_ledgers (
+    id character varying(64) NOT NULL,
+    user_entitlement_id character varying(64) NOT NULL,
+    user_id character varying(64) NOT NULL,
+    request_id character varying(128) NOT NULL,
+    amount_usd double precision NOT NULL,
+    balance_before double precision NOT NULL,
+    balance_after double precision NOT NULL,
+    usage_date character varying(16) NOT NULL,
+    created_at bigint NOT NULL
+);
+
+ALTER TABLE ONLY public.entitlement_usage_ledgers ADD CONSTRAINT entitlement_usage_ledgers_pkey PRIMARY KEY (id);
+ALTER TABLE ONLY public.entitlement_usage_ledgers ADD CONSTRAINT uq_entitlement_usage_request UNIQUE (user_entitlement_id, request_id);
+CREATE INDEX IF NOT EXISTS idx_entitlement_usage_user_date ON public.entitlement_usage_ledgers USING btree (user_id, usage_date);
 
 CREATE TABLE IF NOT EXISTS public.refund_requests (
     id character varying(64) NOT NULL,

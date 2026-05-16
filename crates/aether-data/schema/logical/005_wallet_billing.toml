@@ -335,6 +335,46 @@ type = "text"
 length = 64
 
 [[table.payment_orders.columns]]
+name = "payment_provider"
+type = "text"
+length = 64
+nullable = true
+
+[[table.payment_orders.columns]]
+name = "payment_channel"
+type = "text"
+length = 64
+nullable = true
+
+[[table.payment_orders.columns]]
+name = "order_kind"
+type = "text"
+length = 64
+default = "wallet_recharge"
+
+[[table.payment_orders.columns]]
+name = "product_id"
+type = "text_id"
+length = 64
+nullable = true
+
+[[table.payment_orders.columns]]
+name = "product_snapshot"
+type = "json"
+nullable = true
+
+[[table.payment_orders.columns]]
+name = "fulfillment_status"
+type = "text"
+length = 64
+default = "pending"
+
+[[table.payment_orders.columns]]
+name = "fulfillment_error"
+type = "long_text"
+nullable = true
+
+[[table.payment_orders.columns]]
 name = "gateway_order_id"
 type = "text"
 length = 128
@@ -389,6 +429,79 @@ columns = ["status"]
 [[table.payment_orders.indexes]]
 name = "idx_payment_orders_gateway_order_id"
 columns = ["gateway_order_id"]
+
+[[table.payment_orders.indexes]]
+name = "idx_payment_orders_kind_status"
+columns = ["order_kind", "status"]
+
+[[table.payment_orders.indexes]]
+name = "idx_payment_orders_product"
+columns = ["product_id"]
+
+[table.payment_gateway_configs]
+domain = "wallet_billing"
+order = 45
+primary_key = ["provider"]
+
+[[table.payment_gateway_configs.columns]]
+name = "provider"
+type = "text"
+length = 64
+
+[[table.payment_gateway_configs.columns]]
+name = "enabled"
+type = "bool"
+default = false
+
+[[table.payment_gateway_configs.columns]]
+name = "endpoint_url"
+type = "text"
+length = 512
+
+[[table.payment_gateway_configs.columns]]
+name = "callback_base_url"
+type = "text"
+length = 512
+nullable = true
+
+[[table.payment_gateway_configs.columns]]
+name = "merchant_id"
+type = "text"
+length = 128
+
+[[table.payment_gateway_configs.columns]]
+name = "merchant_key_encrypted"
+type = "long_text"
+nullable = true
+
+[[table.payment_gateway_configs.columns]]
+name = "pay_currency"
+type = "text"
+length = 16
+default = "CNY"
+
+[[table.payment_gateway_configs.columns]]
+name = "usd_exchange_rate"
+type = "float64"
+default = { raw = "7.2" }
+
+[[table.payment_gateway_configs.columns]]
+name = "min_recharge_usd"
+type = "float64"
+default = 1
+
+[[table.payment_gateway_configs.columns]]
+name = "channels_json"
+type = "json"
+nullable = true
+
+[[table.payment_gateway_configs.columns]]
+name = "created_at"
+type = "unix_seconds"
+
+[[table.payment_gateway_configs.columns]]
+name = "updated_at"
+type = "unix_seconds"
 
 [table.payment_callbacks]
 domain = "wallet_billing"
@@ -467,6 +580,195 @@ nullable = true
 [[table.payment_callbacks.uniques]]
 name = "uq_payment_callbacks_callback_key"
 columns = ["callback_key"]
+
+[table.billing_plans]
+domain = "wallet_billing"
+order = 55
+primary_key = ["id"]
+
+[[table.billing_plans.columns]]
+name = "id"
+type = "text_id"
+length = 64
+
+[[table.billing_plans.columns]]
+name = "title"
+type = "text"
+length = 128
+
+[[table.billing_plans.columns]]
+name = "description"
+type = "long_text"
+nullable = true
+
+[[table.billing_plans.columns]]
+name = "price_amount"
+type = "float64"
+
+[[table.billing_plans.columns]]
+name = "price_currency"
+type = "text"
+length = 16
+default = "CNY"
+
+[[table.billing_plans.columns]]
+name = "duration_unit"
+type = "text"
+length = 32
+
+[[table.billing_plans.columns]]
+name = "duration_value"
+type = "int64"
+
+[[table.billing_plans.columns]]
+name = "enabled"
+type = "bool"
+default = true
+
+[[table.billing_plans.columns]]
+name = "sort_order"
+type = "int64"
+default = 0
+
+[[table.billing_plans.columns]]
+name = "max_active_per_user"
+type = "int64"
+default = 1
+
+[[table.billing_plans.columns]]
+name = "purchase_limit_scope"
+type = "text"
+length = 32
+default = "active_period"
+
+[[table.billing_plans.columns]]
+name = "entitlements_json"
+type = "json"
+
+[[table.billing_plans.columns]]
+name = "created_at"
+type = "unix_seconds"
+
+[[table.billing_plans.columns]]
+name = "updated_at"
+type = "unix_seconds"
+
+[[table.billing_plans.indexes]]
+name = "idx_billing_plans_enabled_sort"
+columns = ["enabled", "sort_order"]
+
+[table.user_plan_entitlements]
+domain = "wallet_billing"
+order = 56
+primary_key = ["id"]
+
+[[table.user_plan_entitlements.columns]]
+name = "id"
+type = "text_id"
+length = 64
+
+[[table.user_plan_entitlements.columns]]
+name = "user_id"
+type = "text_id"
+length = 64
+
+[[table.user_plan_entitlements.columns]]
+name = "plan_id"
+type = "text_id"
+length = 64
+
+[[table.user_plan_entitlements.columns]]
+name = "payment_order_id"
+type = "text_id"
+length = 64
+
+[[table.user_plan_entitlements.columns]]
+name = "status"
+type = "text"
+length = 64
+default = "active"
+
+[[table.user_plan_entitlements.columns]]
+name = "starts_at"
+type = "unix_seconds"
+
+[[table.user_plan_entitlements.columns]]
+name = "expires_at"
+type = "unix_seconds"
+
+[[table.user_plan_entitlements.columns]]
+name = "entitlements_snapshot"
+type = "json"
+
+[[table.user_plan_entitlements.columns]]
+name = "created_at"
+type = "unix_seconds"
+
+[[table.user_plan_entitlements.columns]]
+name = "updated_at"
+type = "unix_seconds"
+
+[[table.user_plan_entitlements.indexes]]
+name = "idx_user_plan_entitlements_user_active"
+columns = ["user_id", "status", "expires_at"]
+
+[[table.user_plan_entitlements.indexes]]
+name = "idx_user_plan_entitlements_order"
+columns = ["payment_order_id"]
+
+[table.entitlement_usage_ledgers]
+domain = "wallet_billing"
+order = 57
+primary_key = ["id"]
+
+[[table.entitlement_usage_ledgers.columns]]
+name = "id"
+type = "text_id"
+length = 64
+
+[[table.entitlement_usage_ledgers.columns]]
+name = "user_entitlement_id"
+type = "text_id"
+length = 64
+
+[[table.entitlement_usage_ledgers.columns]]
+name = "user_id"
+type = "text_id"
+length = 64
+
+[[table.entitlement_usage_ledgers.columns]]
+name = "request_id"
+type = "text"
+length = 128
+
+[[table.entitlement_usage_ledgers.columns]]
+name = "amount_usd"
+type = "float64"
+
+[[table.entitlement_usage_ledgers.columns]]
+name = "balance_before"
+type = "float64"
+
+[[table.entitlement_usage_ledgers.columns]]
+name = "balance_after"
+type = "float64"
+
+[[table.entitlement_usage_ledgers.columns]]
+name = "usage_date"
+type = "text"
+length = 16
+
+[[table.entitlement_usage_ledgers.columns]]
+name = "created_at"
+type = "unix_seconds"
+
+[[table.entitlement_usage_ledgers.uniques]]
+name = "uq_entitlement_usage_request"
+columns = ["user_entitlement_id", "request_id"]
+
+[[table.entitlement_usage_ledgers.indexes]]
+name = "idx_entitlement_usage_user_date"
+columns = ["user_id", "usage_date"]
 
 [[table.payment_callbacks.indexes]]
 name = "idx_payment_callbacks_order"

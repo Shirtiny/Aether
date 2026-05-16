@@ -179,10 +179,20 @@ async fn write_frame<S>(sink: &mut S, frame: Frame, tunnel_metrics: Option<&Tunn
 where
     S: SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin + Send + 'static,
 {
+    let stream_id = frame.stream_id;
+    let msg_type = frame.msg_type;
+    let flags = frame.flags;
     let data = frame.encode();
     let wire_len = data.len().max(HEADER_SIZE);
     if let Err(e) = sink.send(Message::Binary(data.into())).await {
-        error!(error = %e, "failed to write frame to WebSocket");
+        error!(
+            stream_id = stream_id,
+            msg_type = ?msg_type,
+            flags = flags,
+            wire_len = wire_len,
+            error = %e,
+            "failed to write frame to WebSocket"
+        );
         if let Some(metrics) = tunnel_metrics {
             metrics.record_error("ws_write_error", &e.to_string());
         }

@@ -219,6 +219,7 @@ dependencies = [
  "hmac",
  "http",
  "ldap3",
+ "md-5",
  "parking_lot",
  "regex",
  "reqwest",
@@ -335,7 +336,7 @@ dependencies = [
 
 [[package]]
 name = "aether-proxy"
-version = "0.3.10"
+version = "0.3.11"
 dependencies = [
  "aether-contracts",
  "aether-gateway",

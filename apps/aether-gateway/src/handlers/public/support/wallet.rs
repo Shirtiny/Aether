@@ -37,7 +37,7 @@ use self::reads::{
 pub(crate) use self::recharge::sanitize_wallet_gateway_response;
 use self::recharge::{
     handle_wallet_create_recharge, handle_wallet_recharge_detail, handle_wallet_recharge_list,
-    wallet_recharge_detail_path_matches,
+    handle_wallet_recharge_options, wallet_recharge_detail_path_matches,
 };
 use self::redeem::handle_wallet_redeem;
 use self::refunds::{
@@ -53,8 +53,13 @@ const WALLET_SAFE_GATEWAY_RESPONSE_KEYS: &[&str] = &[
     "display_name",
     "gateway_order_id",
     "payment_url",
+    "payment_params",
+    "submit_method",
     "qr_code",
     "expires_at",
+    "pay_amount",
+    "pay_currency",
+    "payment_channel",
     "manual_credit",
 ];
 
@@ -152,6 +157,12 @@ pub(super) async fn maybe_build_local_wallet_response(
         return Some(
             handle_wallet_create_recharge(state, request_context, headers, request_body).await,
         );
+    }
+
+    if decision.route_kind.as_deref() == Some("recharge_options")
+        && request_context.request_path == "/api/wallet/recharge/options"
+    {
+        return Some(handle_wallet_recharge_options(state, request_context, headers).await);
     }
 
     if decision.route_kind.as_deref() == Some("redeem")

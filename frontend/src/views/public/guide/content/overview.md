@@ -21,17 +21,16 @@ docker compose exec postgres pg_dump -U postgres aether | gzip > backup_$(date +
 ```
 
 ### 2. 本地开发
-依赖 Docker、uv、nodejs
+依赖 Docker、Rust toolchain、Node.js、make
 ```markdown
-# 启动数据库
+# 启动数据库（可选，make dev 会自动启动本地依赖）
 docker compose up -d postgres redis
 
-# 后端
-uv sync
-./dev.sh
+# 安装前端依赖（首次）
+(cd frontend && npm install)
 
-# 前端
-cd frontend && npm install && npm run dev
+# 启动前后端
+make dev
 ```
 
 ## 配置流程

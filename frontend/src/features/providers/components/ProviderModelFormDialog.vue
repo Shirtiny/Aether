@@ -11,36 +11,84 @@
       class="space-y-4"
       @submit.prevent="handleSubmit"
     >
-      <!-- 添加模式：选择全局模型 -->
+      <!-- 添加模式：选择或手动创建本地全局模型 -->
       <div
         v-if="!isEditing"
-        class="space-y-2"
+        class="space-y-3"
       >
-        <Label for="global-model">选择模型 *</Label>
-        <Select
-          :model-value="form.global_model_id"
-          :disabled="loadingGlobalModels"
-          @update:model-value="form.global_model_id = $event"
-        >
-          <SelectTrigger class="w-full">
-            <SelectValue :placeholder="loadingGlobalModels ? '加载中...' : '请选择模型'" />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem
-              v-for="model in availableGlobalModels"
-              :key="model.id"
-              :value="model.id"
-            >
-              {{ model.display_name }} ({{ model.name }})
-            </SelectItem>
-          </SelectContent>
-        </Select>
+        <div class="flex items-center justify-between gap-3">
+          <Label for="global-model">选择已有模型或手动添加 *</Label>
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            class="h-7 px-2 text-xs"
+            @click="manualGlobalModelMode = !manualGlobalModelMode"
+          >
+            {{ manualGlobalModelMode ? '选择已有模型' : '手动添加' }}
+          </Button>
+        </div>
+        <div v-if="!manualGlobalModelMode" class="space-y-2">
+          <Select
+            :model-value="form.global_model_id"
+            :disabled="loadingGlobalModels"
+            @update:model-value="handleGlobalModelSelect"
+          >
+            <SelectTrigger class="w-full">
+              <SelectValue :placeholder="loadingGlobalModels ? '加载中...' : '请选择模型'" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem
+                v-for="model in availableGlobalModels"
+                :key="model.id"
+                :value="model.id"
+              >
+                {{ model.display_name }} ({{ model.name }})
+              </SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+        <div v-else class="rounded-lg border border-border/60 bg-muted/20 p-3 space-y-3">
+          <div class="grid grid-cols-2 gap-3">
+            <div class="space-y-1.5">
+              <Label for="manual-global-model-name" class="text-xs">模型ID *</Label>
+              <Input
+                id="manual-global-model-name"
+                v-model="form.manual_global_model_name"
+                placeholder="如 gpt-4o-mini"
+                @update:model-value="syncManualProviderName"
+              />
+            </div>
+            <div class="space-y-1.5">
+              <Label for="manual-global-model-display-name" class="text-xs">显示名称</Label>
+              <Input
+                id="manual-global-model-display-name"
+                v-model="form.manual_global_model_display_name"
+                placeholder="默认使用模型ID"
+              />
+            </div>
+          </div>
+          <p class="text-xs text-muted-foreground">
+            无法联网获取模型目录时，可直接填写模型ID。保存时会先创建本地全局模型，再添加到当前 Provider。
+          </p>
+        </div>
         <p
-          v-if="availableGlobalModels.length === 0 && !loadingGlobalModels"
+          v-if="availableGlobalModels.length === 0 && !loadingGlobalModels && !manualGlobalModelMode"
           class="text-xs text-muted-foreground"
         >
-          所有全局模型已添加到此 Provider
+          没有可选择的本地全局模型。可以切换到“手动添加”继续保存。
         </p>
+        <div class="space-y-1.5">
+          <Label for="provider-model-name" class="text-xs">Provider 模型名 *</Label>
+          <Input
+            id="provider-model-name"
+            v-model="form.provider_model_name"
+            placeholder="Provider 实际接收的模型名，如 gpt-4o-mini"
+          />
+          <p class="text-xs text-muted-foreground">
+            默认跟随所选模型ID；如内网模型、兼容网关或别名不同，可手动覆盖。
+          </p>
+        </div>
         <div
           v-if="selectedGlobalModelSupportsEmbedding"
           class="rounded-lg border border-border/60 bg-muted/20 px-3 py-2"
@@ -205,7 +253,7 @@
         取消
       </Button>
       <Button
-        :disabled="submitting || (!isEditing && !form.global_model_id)"
+        :disabled="submitting || (!isEditing && !canSubmitCreate)"
         @click="handleSubmit"
       >
         <Loader2
@@ -237,7 +285,7 @@ import {
 import { useToast } from '@/composables/useToast'
 import { parseNumberInput, sortResolutionEntries } from '@/utils/form'
 import { createModel, updateModel, getProviderModels } from '@/api/endpoints/models'
-import { listGlobalModels, type GlobalModelResponse } from '@/api/global-models'
+import { createGlobalModel, listGlobalModels, type GlobalModelResponse } from '@/api/global-models'
 import TieredPricingEditor from '@/features/models/components/TieredPricingEditor.vue'
 import type { Model, TieredPricingConfig } from '@/api/endpoints'
 import {
@@ -286,6 +334,7 @@ const showCache1h = true
 const submitting = ref(false)
 const loadingGlobalModels = ref(false)
 const availableGlobalModels = ref<GlobalModelResponse[]>([])
+const manualGlobalModelMode = ref(false)
 
 // 阶梯计费配置
 const tieredPricing = ref<TieredPricingConfig | null>(null)
@@ -320,8 +369,15 @@ const VIDEO_RESOLUTION_PRICE_PRESETS: Record<
   ],
 }
 
+const DEFAULT_MANUAL_GLOBAL_MODEL_PRICING: TieredPricingConfig = {
+  tiers: [{ up_to: null, input_price_per_1m: 0, output_price_per_1m: 0 }],
+}
+
 const form = ref({
   global_model_id: '',
+  provider_model_name: '',
+  manual_global_model_name: '',
+  manual_global_model_display_name: '',
   price_per_request: undefined as number | undefined,
   config: {} as Record<string, unknown>,
   // 能力配置
@@ -331,6 +387,13 @@ const form = ref({
   supports_extended_thinking: undefined as boolean | undefined,
   supports_image_generation: undefined as boolean | undefined,
   is_active: true
+})
+
+const canSubmitCreate = computed(() => {
+  if (isEditing.value) return true
+  if (!form.value.provider_model_name.trim()) return false
+  if (manualGlobalModelMode.value) return !!form.value.manual_global_model_name.trim()
+  return !!form.value.global_model_id
 })
 
 // 监听 open 变化
@@ -343,6 +406,9 @@ watch(() => props.open, async (newOpen) => {
       const effectiveConfig = props.editingModel.effective_config || props.editingModel.config || {}
       form.value = {
         global_model_id: props.editingModel.global_model_id || '',
+        provider_model_name: props.editingModel.provider_model_name || '',
+        manual_global_model_name: '',
+        manual_global_model_display_name: '',
         // 显示有效的按次计费价格（继承自全局模型）
         price_per_request: props.editingModel.effective_price_per_request ?? props.editingModel.price_per_request ?? undefined,
         config: effectiveConfig ? JSON.parse(JSON.stringify(effectiveConfig)) : {},
@@ -372,6 +438,9 @@ watch(() => props.open, async (newOpen) => {
 watch(() => form.value.global_model_id, (newId) => {
   if (!isEditing.value && newId) {
     const selectedModel = availableGlobalModels.value.find(m => m.id === newId)
+    if (selectedModel && !form.value.provider_model_name.trim()) {
+      form.value.provider_model_name = selectedModel.name
+    }
     if (selectedModel?.default_tiered_pricing) {
       // 深拷贝阶梯计费配置用于预览
       const pricingCopy = JSON.parse(JSON.stringify(selectedModel.default_tiered_pricing))
@@ -400,6 +469,9 @@ watch(tieredPricing, (newValue) => {
 function resetForm() {
   form.value = {
     global_model_id: '',
+    provider_model_name: '',
+    manual_global_model_name: '',
+    manual_global_model_display_name: '',
     price_per_request: undefined,
     config: {},
     supports_vision: undefined,
@@ -415,6 +487,23 @@ function resetForm() {
   tieredPricingModified.value = false
   originalTieredPricing.value = ''
   availableGlobalModels.value = []
+  manualGlobalModelMode.value = false
+}
+
+function handleGlobalModelSelect(value: string) {
+  form.value.global_model_id = value
+  const selectedModel = availableGlobalModels.value.find(model => model.id === value)
+  form.value.provider_model_name = selectedModel?.name || form.value.provider_model_name
+}
+
+function syncManualProviderName(value: string | number) {
+  const modelName = String(value || '').trim()
+  if (!form.value.provider_model_name.trim()) {
+    form.value.provider_model_name = modelName
+  }
+  if (!form.value.manual_global_model_display_name.trim()) {
+    form.value.manual_global_model_display_name = modelName
+  }
 }
 
 function getNested(obj: Record<string, unknown>, path: string): unknown {
@@ -553,6 +642,28 @@ function _copyVideoPricingFromSelectedGlobal() {
   configTouched.value = true
 }
 
+async function createManualGlobalModel(finalTieredPricing: TieredPricingConfig | null, cleanConfig: Record<string, unknown> | undefined): Promise<GlobalModelResponse> {
+  const modelName = form.value.manual_global_model_name.trim()
+  const displayName = form.value.manual_global_model_display_name.trim() || modelName
+  const supportedCapabilities = [
+    form.value.supports_vision === true ? 'vision' : null,
+    form.value.supports_function_calling === true ? 'function_calling' : null,
+    form.value.supports_streaming === true ? 'streaming' : null,
+    form.value.supports_extended_thinking === true ? 'extended_thinking' : null,
+    form.value.supports_image_generation === true ? 'image_generation' : null,
+  ].filter((capability): capability is string => capability !== null)
+
+  return createGlobalModel({
+    name: modelName,
+    display_name: displayName,
+    default_price_per_request: form.value.price_per_request,
+    default_tiered_pricing: finalTieredPricing || DEFAULT_MANUAL_GLOBAL_MODEL_PRICING,
+    supported_capabilities: supportedCapabilities.length ? supportedCapabilities : undefined,
+    config: cleanConfig,
+    is_active: true,
+  })
+}
+
 // 加载可用的全局模型（排除已添加的）
 async function loadAvailableGlobalModels() {
   loadingGlobalModels.value = true
@@ -589,6 +700,10 @@ function handleClose(value: boolean) {
 // 提交表单
 async function handleSubmit() {
   if (submitting.value) return
+  if (!isEditing.value && !canSubmitCreate.value) {
+    showError(manualGlobalModelMode.value ? '请填写模型ID和 Provider 模型名' : '请选择模型并填写 Provider 模型名', '错误')
+    return
+  }
 
   submitting.value = true
   try {
@@ -619,15 +734,21 @@ async function handleSubmit() {
       showSuccess('模型配置已更新')
     } else {
       // 添加模式：只有用户修改了配置才提交 tiered_pricing，否则保持继承关系
-      const selectedModel = availableGlobalModels.value.find(m => m.id === form.value.global_model_id)
+      const selectedModel = manualGlobalModelMode.value
+        ? await createManualGlobalModel(finalTieredPricing, cleanConfig)
+        : availableGlobalModels.value.find(m => m.id === form.value.global_model_id)
+      if (!selectedModel) {
+        showError('请选择模型，或切换到手动添加后填写模型ID', '错误')
+        return
+      }
       await createModel(props.providerId, buildProviderModelCreatePayload({
-        globalModelId: form.value.global_model_id,
-        providerModelName: selectedModel?.name || '',
+        globalModelId: selectedModel.id,
+        providerModelName: form.value.provider_model_name.trim(),
         finalTieredPricing,
-        tieredPricingModified: tieredPricingModified.value,
-        pricePerRequest: form.value.price_per_request,
+        tieredPricingModified: manualGlobalModelMode.value ? false : tieredPricingModified.value,
+        pricePerRequest: manualGlobalModelMode.value ? undefined : form.value.price_per_request,
         cleanConfig,
-        configTouched: configTouched.value,
+        configTouched: manualGlobalModelMode.value ? false : configTouched.value,
         supportsVision: form.value.supports_vision,
         supportsFunctionCalling: form.value.supports_function_calling,
         supportsStreaming: form.value.supports_streaming,

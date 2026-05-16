@@ -45,7 +45,6 @@ pub(crate) struct AdminProviderPoolConfig {
     pub(crate) overload_cooldown_seconds: u64,
     pub(crate) health_policy_enabled: bool,
     pub(crate) probing_enabled: bool,
-    pub(crate) probing_interval_minutes: u64,
     pub(crate) probing_target_percent: Option<f64>,
     pub(crate) probing_target_count: Option<u64>,
     pub(crate) probe_concurrency: u64,

@@ -32,6 +32,8 @@ pub(super) async fn handle_payment_callback_with_wallet_repository(
         .process_payment_callback(
             aether_data::repository::wallet::ProcessPaymentCallbackInput {
                 payment_method: payment_method.to_string(),
+                payment_provider: None,
+                payment_channel: None,
                 callback_key: payload.callback_key.clone(),
                 order_no: payload.order_no.clone(),
                 gateway_order_id: payload.gateway_order_id.clone(),
