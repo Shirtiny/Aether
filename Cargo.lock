@@ -29,6 +29,7 @@ dependencies = [
  "aether-data",
  "aether-data-contracts",
  "aether-provider-pool",
+ "aether-provider-transport",
  "axum",
  "base64 0.22.1",
  "chrono",

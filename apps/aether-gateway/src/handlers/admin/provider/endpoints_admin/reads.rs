@@ -38,7 +38,8 @@ pub(crate) async fn build_admin_provider_endpoints_payload(
         .await
         .ok()
         .unwrap_or_default();
-    let (total_keys_by_format, active_keys_by_format) = endpoint_key_counts_by_format(&keys);
+    let (total_keys_by_format, active_keys_by_format) =
+        endpoint_key_counts_by_format(&provider.provider_type, &endpoints, &keys);
     let now_unix_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .ok()
@@ -51,15 +52,17 @@ pub(crate) async fn build_admin_provider_endpoints_payload(
             .skip(skip)
             .take(limit)
             .map(|endpoint| {
+                let endpoint_api_format =
+                    aether_ai_formats::normalize_api_format_alias(&endpoint.api_format);
                 build_admin_provider_endpoint_response(
                     &endpoint,
                     &provider.name,
                     total_keys_by_format
-                        .get(endpoint.api_format.as_str())
+                        .get(endpoint_api_format.as_str())
                         .copied()
                         .unwrap_or(0),
                     active_keys_by_format
-                        .get(endpoint.api_format.as_str())
+                        .get(endpoint_api_format.as_str())
                         .copied()
                         .unwrap_or(0),
                     now_unix_secs,
@@ -92,22 +95,27 @@ pub(crate) async fn build_admin_endpoint_payload(
         .await
         .ok()
         .unwrap_or_default();
-    let (total_keys_by_format, active_keys_by_format) = endpoint_key_counts_by_format(&keys);
+    let (total_keys_by_format, active_keys_by_format) = endpoint_key_counts_by_format(
+        &provider.provider_type,
+        std::slice::from_ref(&endpoint),
+        &keys,
+    );
     let now_unix_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .ok()
         .map(|duration| duration.as_secs())
         .unwrap_or(0);
+    let endpoint_api_format = aether_ai_formats::normalize_api_format_alias(&endpoint.api_format);
 
     Some(build_admin_provider_endpoint_response(
         &endpoint,
         &provider.name,
         total_keys_by_format
-            .get(endpoint.api_format.as_str())
+            .get(endpoint_api_format.as_str())
             .copied()
             .unwrap_or(0),
         active_keys_by_format
-            .get(endpoint.api_format.as_str())
+            .get(endpoint_api_format.as_str())
             .copied()
             .unwrap_or(0),
         now_unix_secs,
