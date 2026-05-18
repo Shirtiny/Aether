@@ -7,7 +7,13 @@ use aether_ai_serving::{
     AiCandidatePreselectionOutcome, AiSkippedCandidatePersistencePort,
 };
 use aether_dispatch_core::{DispatchSequence, DispatchSequenceItem};
-use aether_scheduler_core::{ClientSessionAffinity, SchedulerMinimalCandidateSelectionCandidate};
+use aether_routing_core::{
+    rank_vector_for_candidate, CandidateKind, ResolvedRoutingPolicy, RoutingCandidateFacts,
+    RoutingCandidateTrace, RoutingDecisionTrace,
+};
+use aether_scheduler_core::{
+    ClientSessionAffinity, SchedulerMinimalCandidateSelectionCandidate, SchedulerRankingOutcome,
+};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::VecDeque;
@@ -19,6 +25,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::ai_serving::planner::candidate_affinity_cache::remember_scheduler_affinity_for_candidate_at_epoch;
+use crate::ai_serving::planner::candidate_ranking::scheduler_ordering_config_for_routing_policy;
 use crate::ai_serving::planner::candidate_resolution::{
     resolve_and_rank_logical_local_execution_candidates, EligibleLocalExecutionCandidate,
     LocalExecutionCandidateKind, SkippedLocalExecutionCandidate,
@@ -36,7 +43,7 @@ use crate::dispatch::refs::dispatch_ref_for_local_candidate;
 use crate::handlers::shared::provider_pool::admin_provider_pool_config_from_config_value;
 use crate::orchestration::{local_attempt_slot_count, ExecutionAttemptIdentity};
 use crate::scheduler::candidate::API_KEY_CONCURRENCY_LIMIT_SKIP_REASON;
-use crate::scheduler::config::{read_scheduler_ordering_config, SchedulerSchedulingMode};
+use crate::scheduler::config::SchedulerSchedulingMode;
 use crate::{AppState, GatewayError};
 
 const POOL_KEY_RETRY_INDEX_STRIDE: u32 = 100;
@@ -189,6 +196,7 @@ struct GatewayLocalCandidateMaterializationPort<'a, F, G> {
     auth_snapshot: Option<&'a GatewayAuthApiKeySnapshot>,
     client_session_affinity: Option<&'a ClientSessionAffinity>,
     required_capabilities: Option<&'a Value>,
+    routing_policy: Option<&'a ResolvedRoutingPolicy>,
     sticky_session_token: Option<&'a str>,
     request_auth_channel: Option<&'a str>,
     persistence_policy: LocalCandidatePersistencePolicy<'a>,
@@ -243,6 +251,7 @@ where
             self.auth_snapshot,
             self.client_session_affinity,
             self.required_capabilities,
+            self.routing_policy,
             self.sticky_session_token,
             self.request_auth_channel,
             self.resolution_mode,
@@ -281,6 +290,8 @@ where
                 .skipped
                 .record_runtime_miss_diagnostic,
             candidates,
+            self.routing_policy,
+            self.client_api_format,
             self.sticky_session_token,
             self.requested_model,
             self.request_auth_channel,
@@ -294,6 +305,12 @@ where
         starting_candidate_index: u32,
         skipped_candidates: Vec<Self::Skipped>,
     ) -> Result<(), Self::Error> {
+        let skipped_candidates = attach_routing_trace_to_skipped_candidates(
+            self.routing_policy,
+            self.client_api_format,
+            starting_candidate_index,
+            skipped_candidates,
+        );
         persist_skipped_local_execution_candidates_with_context(
             self.state.app(),
             self.trace_id,
@@ -432,6 +449,7 @@ pub(crate) async fn materialize_local_execution_candidates_with_serving<F, G>(
     auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
     client_session_affinity: Option<&ClientSessionAffinity>,
     required_capabilities: Option<&Value>,
+    routing_policy: Option<&ResolvedRoutingPolicy>,
     sticky_session_token: Option<&str>,
     request_auth_channel: Option<&str>,
     persistence_policy: LocalCandidatePersistencePolicy<'_>,
@@ -445,7 +463,8 @@ where
     F: Fn(&EligibleLocalExecutionCandidate) -> Option<Value> + Send + Sync,
     G: Fn(SkippedLocalExecutionCandidate) -> SkippedLocalExecutionCandidate + Send + Sync,
 {
-    let scheduler_cache_affinity_enabled = scheduler_cache_affinity_enabled(state).await;
+    let scheduler_cache_affinity_enabled =
+        scheduler_cache_affinity_enabled(state, routing_policy).await;
     let port = GatewayLocalCandidateMaterializationPort {
         state,
         trace_id,
@@ -454,6 +473,7 @@ where
         auth_snapshot,
         client_session_affinity,
         required_capabilities,
+        routing_policy,
         sticky_session_token,
         request_auth_channel,
         persistence_policy,
@@ -478,6 +498,7 @@ pub(crate) async fn build_local_execution_candidate_attempt_source_with_serving<
     auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
     client_session_affinity: Option<&ClientSessionAffinity>,
     required_capabilities: Option<&Value>,
+    routing_policy: Option<&ResolvedRoutingPolicy>,
     sticky_session_token: Option<&str>,
     request_auth_channel: Option<&str>,
     persistence_policy: LocalCandidatePersistencePolicy<'_>,
@@ -491,7 +512,8 @@ where
     F: Fn(&EligibleLocalExecutionCandidate) -> Option<Value> + Send + Sync,
     G: Fn(SkippedLocalExecutionCandidate) -> SkippedLocalExecutionCandidate + Send + Sync,
 {
-    let scheduler_cache_affinity_enabled = scheduler_cache_affinity_enabled(state).await;
+    let scheduler_cache_affinity_enabled =
+        scheduler_cache_affinity_enabled(state, routing_policy).await;
     let _ = build_available_extra_data;
     let (candidates, resolved_skipped) = resolve_and_rank_logical_local_execution_candidates(
         state,
@@ -501,6 +523,7 @@ where
         auth_snapshot,
         client_session_affinity,
         required_capabilities,
+        routing_policy,
         sticky_session_token,
         request_auth_channel,
         resolution_mode,
@@ -529,7 +552,12 @@ where
         trace_id,
         persistence_policy.skipped,
         u32::try_from(candidates.len()).unwrap_or(u32::MAX),
-        skipped_candidates,
+        attach_routing_trace_to_skipped_candidates(
+            routing_policy,
+            client_api_format,
+            u32::try_from(candidates.len()).unwrap_or(u32::MAX),
+            skipped_candidates,
+        ),
     )
     .await;
 
@@ -542,6 +570,7 @@ where
         sticky_session_token,
         requested_model,
         request_auth_channel,
+        routing_policy,
     );
 
     (
@@ -559,6 +588,7 @@ fn build_logical_candidate_items<'a>(
     sticky_session_token: Option<&str>,
     requested_model: Option<&str>,
     request_auth_channel: Option<&str>,
+    routing_policy: Option<&ResolvedRoutingPolicy>,
 ) -> (VecDeque<LocalExecutionCandidateAttemptSourceItem<'a>>, u32) {
     let mut items = VecDeque::new();
     let mut next_candidate_index = starting_candidate_index;
@@ -578,12 +608,13 @@ fn build_logical_candidate_items<'a>(
                 }
             }
             LocalExecutionCandidateKind::PoolGroup => {
-                let cursor = PoolKeyCursor::new(
+                let cursor = PoolKeyCursor::new_with_routing_policy(
                     state,
                     candidate,
                     sticky_session_token,
                     requested_model,
                     request_auth_channel,
+                    routing_policy,
                 );
                 let cursor = if let Some(trace_id) = trace_id {
                     cursor.with_runtime_miss_diagnostic(trace_id, record_runtime_miss_diagnostic)
@@ -615,6 +646,7 @@ pub(crate) async fn build_lazy_requested_model_execution_candidate_attempt_sourc
     auth_snapshot: &GatewayAuthApiKeySnapshot,
     client_session_affinity: Option<&ClientSessionAffinity>,
     required_capabilities: Option<&Value>,
+    routing_policy: Option<&ResolvedRoutingPolicy>,
     sticky_session_token: Option<&str>,
     request_auth_channel: Option<&str>,
     persistence_policy: LocalCandidatePersistencePolicy<'_>,
@@ -628,7 +660,8 @@ where
     F: Fn(&EligibleLocalExecutionCandidate) -> Option<Value> + Send + Sync + 'a,
     G: Fn(SkippedLocalExecutionCandidate) -> SkippedLocalExecutionCandidate + Send + Sync + 'a,
 {
-    let scheduler_cache_affinity_enabled = scheduler_cache_affinity_enabled(state).await;
+    let scheduler_cache_affinity_enabled =
+        scheduler_cache_affinity_enabled(state, routing_policy).await;
     let _ = build_available_extra_data;
     let decorate_skipped_candidate = Arc::new(decorate_skipped_candidate);
     let record_runtime_miss_diagnostic = persistence_policy.skipped.record_runtime_miss_diagnostic;
@@ -639,6 +672,7 @@ where
         require_streaming,
         required_capabilities,
         auth_snapshot,
+        routing_policy,
         client_session_affinity,
         use_api_format_alias_match,
         key_mode,
@@ -652,6 +686,7 @@ where
         auth_snapshot: auth_snapshot.clone(),
         client_session_affinity: client_session_affinity.cloned(),
         required_capabilities: required_capabilities.cloned(),
+        routing_policy: routing_policy.cloned(),
         sticky_session_token: sticky_session_token.map(str::to_string),
         request_auth_channel: request_auth_channel.map(str::to_string),
         skipped_user_id: persistence_policy.skipped.user_id.to_string(),
@@ -693,6 +728,7 @@ struct RequestedModelAttemptPageCursor<'a> {
     auth_snapshot: GatewayAuthApiKeySnapshot,
     client_session_affinity: Option<ClientSessionAffinity>,
     required_capabilities: Option<Value>,
+    routing_policy: Option<ResolvedRoutingPolicy>,
     sticky_session_token: Option<String>,
     request_auth_channel: Option<String>,
     skipped_user_id: String,
@@ -756,6 +792,7 @@ impl<'a> RequestedModelAttemptPageCursor<'a> {
                     Some(&self.auth_snapshot),
                     self.client_session_affinity.as_ref(),
                     self.required_capabilities.as_ref(),
+                    self.routing_policy.as_ref(),
                     self.sticky_session_token.as_deref(),
                     self.request_auth_channel.as_deref(),
                     self.resolution_mode,
@@ -794,6 +831,7 @@ impl<'a> RequestedModelAttemptPageCursor<'a> {
                 self.sticky_session_token.as_deref(),
                 Some(&self.requested_model),
                 self.request_auth_channel.as_deref(),
+                self.routing_policy.as_ref(),
             );
             self.next_candidate_index = next_candidate_index
                 .saturating_add(u32::try_from(skipped_candidate_count).unwrap_or(u32::MAX));
@@ -814,7 +852,12 @@ impl<'a> RequestedModelAttemptPageCursor<'a> {
                 &self.trace_id,
                 skipped_persistence,
                 skipped_starting_candidate_index,
-                skipped_candidates,
+                attach_routing_trace_to_skipped_candidates(
+                    self.routing_policy.as_ref(),
+                    &self.client_api_format,
+                    skipped_starting_candidate_index,
+                    skipped_candidates,
+                ),
             )
             .await;
         }
@@ -858,7 +901,12 @@ impl<'a> RequestedModelAttemptPageCursor<'a> {
             &self.trace_id,
             skipped_persistence,
             self.next_candidate_index,
-            skipped_candidates,
+            attach_routing_trace_to_skipped_candidates(
+                self.routing_policy.as_ref(),
+                &self.client_api_format,
+                self.next_candidate_index,
+                skipped_candidates,
+            ),
         )
         .await;
         self.next_candidate_index = self
@@ -925,19 +973,14 @@ async fn pop_attempt_from_items(
     }
 }
 
-async fn scheduler_cache_affinity_enabled(state: PlannerAppState<'_>) -> bool {
-    match read_scheduler_ordering_config(state.app()).await {
-        Ok(config) => config.scheduling_mode == SchedulerSchedulingMode::CacheAffinity,
-        Err(error) => {
-            warn!(
-                event_name = "planner_scheduler_affinity_config_load_failed",
-                log_type = "event",
-                error = ?error,
-                "failed to load scheduler config while checking cache affinity mode"
-            );
-            SchedulerSchedulingMode::default() == SchedulerSchedulingMode::CacheAffinity
-        }
-    }
+async fn scheduler_cache_affinity_enabled(
+    state: PlannerAppState<'_>,
+    routing_policy: Option<&ResolvedRoutingPolicy>,
+) -> bool {
+    scheduler_ordering_config_for_routing_policy(state, routing_policy)
+        .await
+        .scheduling_mode
+        == SchedulerSchedulingMode::CacheAffinity
 }
 
 pub(crate) fn remember_first_local_candidate_affinity(
@@ -1038,6 +1081,8 @@ async fn materialize_logical_local_execution_candidate_attempts<F>(
     context: LocalAvailableCandidatePersistenceContext<'_>,
     record_runtime_miss_diagnostic: bool,
     candidates: Vec<EligibleLocalExecutionCandidate>,
+    routing_policy: Option<&ResolvedRoutingPolicy>,
+    client_api_format: &str,
     sticky_session_token: Option<&str>,
     requested_model: Option<&str>,
     request_auth_channel: Option<&str>,
@@ -1059,18 +1104,21 @@ where
                         context,
                         candidate,
                         candidate_index,
+                        routing_policy,
+                        client_api_format,
                         build_extra_data,
                     )
                     .await,
                 );
             }
             LocalExecutionCandidateKind::PoolGroup => {
-                let mut cursor = PoolKeyCursor::new(
+                let mut cursor = PoolKeyCursor::new_with_routing_policy(
                     state,
                     candidate,
                     sticky_session_token,
                     requested_model,
                     request_auth_channel,
+                    routing_policy,
                 )
                 .with_runtime_miss_diagnostic(trace_id, record_runtime_miss_diagnostic);
                 let attempt_count_before_pool = attempts.len();
@@ -1097,6 +1145,8 @@ async fn persist_available_local_execution_candidate_at_index<F>(
     context: LocalAvailableCandidatePersistenceContext<'_>,
     candidate: EligibleLocalExecutionCandidate,
     candidate_index: u32,
+    routing_policy: Option<&ResolvedRoutingPolicy>,
+    client_api_format: &str,
     build_extra_data: &F,
 ) -> Vec<LocalExecutionCandidateAttempt>
 where
@@ -1106,6 +1156,16 @@ where
     let extra_data = ai_candidate_extra_data_with_ranking(
         available_candidate_base_extra_data_with_dispatch_ref(&candidate, build_extra_data),
         candidate.ranking.as_ref(),
+    );
+    let extra_data = attach_routing_trace_to_extra_data(
+        routing_policy,
+        client_api_format,
+        &candidate.candidate,
+        candidate.kind,
+        candidate.ranking.as_ref(),
+        None,
+        Some(candidate_index),
+        extra_data,
     );
     let should_persist = should_persist_available_local_candidate(&candidate);
     let mut attempts = Vec::with_capacity(attempt_slots as usize);
@@ -1188,6 +1248,160 @@ where
     };
     object.insert("dispatch_ref".to_string(), dispatch_ref);
     Some(Value::Object(object))
+}
+
+fn attach_routing_trace_to_skipped_candidates(
+    routing_policy: Option<&ResolvedRoutingPolicy>,
+    client_api_format: &str,
+    starting_candidate_index: u32,
+    skipped_candidates: Vec<SkippedLocalExecutionCandidate>,
+) -> Vec<SkippedLocalExecutionCandidate> {
+    skipped_candidates
+        .into_iter()
+        .enumerate()
+        .map(|(offset, skipped)| {
+            let selected_order =
+                starting_candidate_index.saturating_add(u32::try_from(offset).unwrap_or(u32::MAX));
+            attach_routing_trace_to_skipped_candidate(
+                routing_policy,
+                client_api_format,
+                selected_order,
+                skipped,
+            )
+        })
+        .collect()
+}
+
+fn attach_routing_trace_to_skipped_candidate(
+    routing_policy: Option<&ResolvedRoutingPolicy>,
+    client_api_format: &str,
+    selected_order: u32,
+    mut skipped_candidate: SkippedLocalExecutionCandidate,
+) -> SkippedLocalExecutionCandidate {
+    let kind = if skipped_candidate
+        .transport
+        .as_ref()
+        .is_some_and(|transport| {
+            admin_provider_pool_config_from_config_value(transport.provider.config.as_ref())
+                .is_some()
+        }) {
+        LocalExecutionCandidateKind::PoolGroup
+    } else {
+        LocalExecutionCandidateKind::SingleKey
+    };
+    skipped_candidate.extra_data = attach_routing_trace_to_extra_data(
+        routing_policy,
+        client_api_format,
+        &skipped_candidate.candidate,
+        kind,
+        skipped_candidate.ranking.as_ref(),
+        Some(skipped_candidate.skip_reason),
+        Some(selected_order),
+        skipped_candidate.extra_data,
+    );
+    skipped_candidate
+}
+
+#[allow(clippy::too_many_arguments)]
+fn attach_routing_trace_to_extra_data(
+    routing_policy: Option<&ResolvedRoutingPolicy>,
+    client_api_format: &str,
+    candidate: &SchedulerMinimalCandidateSelectionCandidate,
+    kind: LocalExecutionCandidateKind,
+    ranking: Option<&SchedulerRankingOutcome>,
+    skip_reason: Option<&'static str>,
+    selected_order: Option<u32>,
+    extra_data: Option<Value>,
+) -> Option<Value> {
+    let Some(policy) = routing_policy else {
+        return extra_data;
+    };
+    let routing_trace = routing_trace_for_candidate(
+        policy,
+        client_api_format,
+        candidate,
+        kind,
+        ranking,
+        skip_reason,
+        selected_order,
+    );
+    Some(merge_routing_trace_into_extra_data(
+        extra_data,
+        routing_trace,
+    ))
+}
+
+fn merge_routing_trace_into_extra_data(
+    extra_data: Option<Value>,
+    routing_trace: RoutingDecisionTrace,
+) -> Value {
+    let mut object = match extra_data {
+        Some(Value::Object(object)) => object,
+        Some(value) => {
+            let mut object = serde_json::Map::new();
+            object.insert("extra".to_string(), value);
+            object
+        }
+        None => serde_json::Map::new(),
+    };
+    object.insert(
+        "routing_trace".to_string(),
+        serde_json::json!(routing_trace),
+    );
+    Value::Object(object)
+}
+
+fn routing_trace_for_candidate(
+    policy: &ResolvedRoutingPolicy,
+    client_api_format: &str,
+    candidate: &SchedulerMinimalCandidateSelectionCandidate,
+    kind: LocalExecutionCandidateKind,
+    ranking: Option<&SchedulerRankingOutcome>,
+    skip_reason: Option<&'static str>,
+    selected_order: Option<u32>,
+) -> RoutingDecisionTrace {
+    let candidate_kind = routing_candidate_kind(kind);
+    let mut trace = crate::routing::build_routing_trace_seed(policy, client_api_format);
+    trace.global_candidates.push(RoutingCandidateTrace {
+        candidate_kind,
+        provider_id: candidate.provider_id.clone(),
+        endpoint_id: candidate.endpoint_id.clone(),
+        model_id: candidate.model_id.clone(),
+        key_id: match candidate_kind {
+            CandidateKind::Provider => Some(candidate.key_id.clone()),
+            CandidateKind::PoolGroup => None,
+        },
+        ranking_vector: rank_vector_for_candidate(
+            &policy.ranking_overlay,
+            &RoutingCandidateFacts {
+                candidate_kind,
+                provider_id: candidate.provider_id.clone(),
+                endpoint_id: candidate.endpoint_id.clone(),
+                model_id: candidate.model_id.clone(),
+                key_id: match candidate_kind {
+                    CandidateKind::Provider => Some(candidate.key_id.clone()),
+                    CandidateKind::PoolGroup => None,
+                },
+                provider_priority: candidate.provider_priority,
+                key_priority: candidate
+                    .key_global_priority_for_format
+                    .unwrap_or(candidate.key_internal_priority),
+            },
+        ),
+        skip_reason: skip_reason.map(str::to_string),
+        selected_order,
+    });
+    if let Some(ranking) = ranking {
+        trace.runtime_facts.cache_affinity_hit = ranking.promoted_by == Some("cached_affinity");
+    }
+    trace
+}
+
+fn routing_candidate_kind(kind: LocalExecutionCandidateKind) -> CandidateKind {
+    match kind {
+        LocalExecutionCandidateKind::SingleKey => CandidateKind::Provider,
+        LocalExecutionCandidateKind::PoolGroup => CandidateKind::PoolGroup,
+    }
 }
 
 fn dispatch_sequence_from_attempts(
@@ -1644,6 +1858,7 @@ mod tests {
             auth_snapshot: Some(&auth_snapshot),
             client_session_affinity: None,
             required_capabilities: None,
+            routing_policy: None,
             sticky_session_token: None,
             request_auth_channel: None,
             persistence_policy: LocalCandidatePersistencePolicy {
@@ -1717,6 +1932,8 @@ mod tests {
             },
             false,
             vec![pool_group, sample_eligible("normal-key", None)],
+            None,
+            "openai:chat",
             None,
             Some("gpt-5"),
             None,

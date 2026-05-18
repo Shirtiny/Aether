@@ -23,6 +23,7 @@ aether-oauth.workspace = true
 aether-pool-core.workspace = true
 aether-provider-pool.workspace = true
 aether-provider-transport.workspace = true
+aether-routing-core.workspace = true
 aether-scheduler-core.workspace = true
 aether-runtime.workspace = true
 aether-runtime-state.workspace = true

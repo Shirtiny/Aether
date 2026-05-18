@@ -125,6 +125,9 @@ use aether_data_contracts::repository::provider_catalog::{
 use aether_data_contracts::repository::quota::{
     ProviderQuotaReadRepository, ProviderQuotaWriteRepository, StoredProviderQuotaSnapshot,
 };
+use aether_data_contracts::repository::routing_profiles::{
+    RoutingGroupReadRepository, RoutingGroupWriteRepository,
+};
 use aether_data_contracts::repository::settlement::{
     SettlementWriteRepository, StoredUsageSettlement, UsageSettlementInput,
 };
@@ -170,6 +173,8 @@ pub(crate) struct GatewayDataState {
     pool_score_writer: Option<Arc<dyn PoolMemberScoreWriteRepository>>,
     provider_quota_reader: Option<Arc<dyn ProviderQuotaReadRepository>>,
     provider_quota_writer: Option<Arc<dyn ProviderQuotaWriteRepository>>,
+    routing_group_reader: Option<Arc<dyn RoutingGroupReadRepository>>,
+    routing_group_writer: Option<Arc<dyn RoutingGroupWriteRepository>>,
     usage_reader: Option<Arc<dyn UsageReadRepository>>,
     usage_writer: Option<Arc<dyn UsageWriteRepository>>,
     user_reader: Option<Arc<dyn UserReadRepository>>,
@@ -279,6 +284,14 @@ impl fmt::Debug for GatewayDataState {
                 "has_provider_quota_writer",
                 &self.provider_quota_writer.is_some(),
             )
+            .field(
+                "has_routing_group_reader",
+                &self.routing_group_reader.is_some(),
+            )
+            .field(
+                "has_routing_group_writer",
+                &self.routing_group_writer.is_some(),
+            )
             .field("has_usage_reader", &self.usage_reader.is_some())
             .field("has_usage_writer", &self.usage_writer.is_some())
             .field("has_user_preferences", &self.user_preferences.is_some())
@@ -302,6 +315,7 @@ mod core;
 mod integrations;
 mod models;
 mod pool_scores;
+mod routing_profiles;
 mod runtime;
 #[cfg(test)]
 mod testing;

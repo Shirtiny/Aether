@@ -45,6 +45,7 @@ pub(super) async fn resolve_local_gemini_files_candidate_payload_parts(
     let spec_metadata = local_gemini_files_spec_metadata(spec);
     let candidate = &attempt.eligible.candidate;
     let transport = &attempt.eligible.transport;
+    let effective_headers = input.effective_headers(&parts.headers);
 
     if let Some(skip_reason) =
         gemini_files_transport_unsupported_reason(transport, GEMINI_FILES_CANDIDATE_API_FORMAT)
@@ -103,7 +104,7 @@ pub(super) async fn resolve_local_gemini_files_candidate_payload_parts(
         body_is_empty,
         spec_metadata.decision_kind == GEMINI_FILES_UPLOAD_PLAN_KIND,
         transport.endpoint.body_rules.as_ref(),
-        Some(&parts.headers),
+        Some(effective_headers),
     ) {
         Ok(parts) => parts,
         Err(GeminiFilesRequestBodyError::BodyRulesUnsupportedForBinaryUpload) => {
@@ -145,7 +146,7 @@ pub(super) async fn resolve_local_gemini_files_candidate_payload_parts(
     };
 
     let Some(provider_request_headers) = build_gemini_files_headers(GeminiFilesHeadersInput {
-        headers: &parts.headers,
+        headers: effective_headers,
         auth_header: &auth_header,
         auth_value: &auth_value,
         header_rules: transport.endpoint.header_rules.as_ref(),

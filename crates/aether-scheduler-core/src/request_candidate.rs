@@ -36,6 +36,7 @@ pub struct SchedulerRequestCandidateReportContext {
     pub priority_slot: Option<i32>,
     pub promoted_by: Option<String>,
     pub demoted_by: Option<String>,
+    pub routing_trace: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -83,6 +84,7 @@ struct ReportCandidateExtraDataInput {
     priority_slot: Option<i32>,
     promoted_by: Option<String>,
     demoted_by: Option<String>,
+    routing_trace: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -180,6 +182,10 @@ pub fn parse_request_candidate_report_context(
         priority_slot: i32_field(report_context, "priority_slot"),
         promoted_by: string_field(report_context, "promoted_by"),
         demoted_by: string_field(report_context, "demoted_by"),
+        routing_trace: report_context
+            .get("routing_trace")
+            .cloned()
+            .filter(|value| !value.is_null()),
     })
 }
 
@@ -221,6 +227,7 @@ pub fn resolve_report_request_candidate_slot(
         priority_slot,
         promoted_by,
         demoted_by,
+        routing_trace,
     } = metadata;
     let request_id = request_id?;
     let synthesized_extra_data = build_report_candidate_extra_data(ReportCandidateExtraDataInput {
@@ -245,6 +252,7 @@ pub fn resolve_report_request_candidate_slot(
         priority_slot,
         promoted_by,
         demoted_by,
+        routing_trace,
     });
     let created_at_unix_ms = matched_candidate
         .as_ref()
@@ -368,6 +376,7 @@ pub fn build_execution_request_candidate_seed(
             priority_slot: metadata.priority_slot,
             promoted_by: metadata.promoted_by,
             demoted_by: metadata.demoted_by,
+            routing_trace: metadata.routing_trace,
         })
     });
     append_seed_extra_data_from_report_context(&mut extra_data, &context);
@@ -477,6 +486,7 @@ pub fn build_local_request_candidate_status_record(
         priority_slot: metadata.priority_slot,
         promoted_by: metadata.promoted_by.clone(),
         demoted_by: metadata.demoted_by.clone(),
+        routing_trace: metadata.routing_trace.clone(),
     });
     let created_at_unix_ms = started_at_unix_ms.or(finished_at_unix_ms);
 
@@ -717,6 +727,7 @@ fn build_report_candidate_extra_data(input: ReportCandidateExtraDataInput) -> Op
         priority_slot,
         promoted_by,
         demoted_by,
+        routing_trace,
     } = input;
     let mut extra_data = Map::with_capacity(8);
     extra_data.insert("gateway_execution_runtime".to_string(), Value::Bool(true));
@@ -811,6 +822,9 @@ fn build_report_candidate_extra_data(input: ReportCandidateExtraDataInput) -> Op
     }
     if let Some(demoted_by) = demoted_by {
         extra_data.insert("demoted_by".to_string(), Value::String(demoted_by));
+    }
+    if let Some(routing_trace) = routing_trace {
+        extra_data.insert("routing_trace".to_string(), routing_trace);
     }
     (!extra_data.is_empty()).then_some(Value::Object(extra_data))
 }
@@ -1138,7 +1152,15 @@ mod tests {
                     "ranking_index": 2,
                     "priority_slot": 7,
                     "promoted_by": "cached_affinity",
-                    "demoted_by": "cross_format"
+                    "demoted_by": "cross_format",
+                    "routing_trace": {
+                        "group_id": "routing-group-1",
+                        "pool_expansion": [{
+                            "pool_group_id": "pool-1",
+                            "key_id": "key-1",
+                            "selected_order": 0
+                        }]
+                    }
                 })),
                 status_update: SchedulerRequestCandidateStatusUpdate {
                     status: RequestCandidateStatus::Failed,
@@ -1227,6 +1249,14 @@ mod tests {
                 .as_ref()
                 .and_then(|value| value.get("demoted_by")),
             Some(&json!("cross_format"))
+        );
+        assert_eq!(
+            record
+                .extra_data
+                .as_ref()
+                .and_then(|value| value.get("routing_trace"))
+                .and_then(|value| value.get("group_id")),
+            Some(&json!("routing-group-1"))
         );
     }
 

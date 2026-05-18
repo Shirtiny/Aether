@@ -32,7 +32,7 @@ pub(super) use crate::ai_serving::LocalOpenAiImageSpec;
 pub(crate) struct LocalOpenAiImageSyncAttemptSource<'a> {
     state: &'a AppState,
     parts: &'a http::request::Parts,
-    body_json: &'a serde_json::Value,
+    body_json: serde_json::Value,
     body_base64: Option<&'a str>,
     trace_id: &'a str,
     input: LocalOpenAiImageDecisionInput,
@@ -43,7 +43,7 @@ pub(crate) struct LocalOpenAiImageSyncAttemptSource<'a> {
 pub(crate) struct LocalOpenAiImageStreamAttemptSource<'a> {
     state: &'a AppState,
     parts: &'a http::request::Parts,
-    body_json: &'a serde_json::Value,
+    body_json: serde_json::Value,
     body_base64: Option<&'a str>,
     trace_id: &'a str,
     input: LocalOpenAiImageDecisionInput,
@@ -152,16 +152,17 @@ pub(crate) async fn build_local_image_sync_attempt_source_for_kind<'a>(
         trace_id,
         decision,
     )
-    .await
+    .await?
     else {
         return Ok(None);
     };
 
+    let effective_body_json = input.effective_body_json(body_json).clone();
     let Some((candidates, candidate_count)) = build_local_openai_image_candidate_attempt_source(
         state,
         trace_id,
         &input,
-        body_json,
+        &effective_body_json,
         spec_metadata.api_format,
         spec_metadata.decision_kind,
     )
@@ -178,7 +179,7 @@ pub(crate) async fn build_local_image_sync_attempt_source_for_kind<'a>(
         LocalOpenAiImageSyncAttemptSource {
             state,
             parts,
-            body_json,
+            body_json: effective_body_json,
             body_base64,
             trace_id,
             input,
@@ -211,16 +212,17 @@ pub(crate) async fn build_local_image_stream_attempt_source_for_kind<'a>(
         trace_id,
         decision,
     )
-    .await
+    .await?
     else {
         return Ok(None);
     };
 
+    let effective_body_json = input.effective_body_json(body_json).clone();
     let Some((candidates, candidate_count)) = build_local_openai_image_candidate_attempt_source(
         state,
         trace_id,
         &input,
-        body_json,
+        &effective_body_json,
         spec_metadata.api_format,
         spec_metadata.decision_kind,
     )
@@ -237,7 +239,7 @@ pub(crate) async fn build_local_image_stream_attempt_source_for_kind<'a>(
         LocalOpenAiImageStreamAttemptSource {
             state,
             parts,
-            body_json,
+            body_json: effective_body_json,
             body_base64,
             trace_id,
             input,
@@ -303,21 +305,21 @@ impl LocalOpenAiImageSyncAttemptSource<'_> {
         let Some(payload) = maybe_build_local_openai_image_decision_payload_for_candidate(
             self.state,
             self.parts,
-            self.body_json,
+            &self.body_json,
             self.body_base64,
             self.trace_id,
             &self.input,
             attempt,
             self.spec,
         )
-        .await
+        .await?
         else {
             return Ok(None);
         };
 
         let provider_api_format = payload.provider_api_format.as_deref().unwrap_or_default();
         let built = if provider_api_format == "gemini:generate_content" {
-            build_gemini_sync_plan_from_decision(self.parts, self.body_json, payload)
+            build_gemini_sync_plan_from_decision(self.parts, &self.body_json, payload)
         } else {
             build_passthrough_sync_plan_from_decision(self.parts, payload)
         };
@@ -345,23 +347,23 @@ impl LocalOpenAiImageStreamAttemptSource<'_> {
         let Some(payload) = maybe_build_local_openai_image_decision_payload_for_candidate(
             self.state,
             self.parts,
-            self.body_json,
+            &self.body_json,
             self.body_base64,
             self.trace_id,
             &self.input,
             attempt,
             self.spec,
         )
-        .await
+        .await?
         else {
             return Ok(None);
         };
 
         let provider_api_format = payload.provider_api_format.as_deref().unwrap_or_default();
         let built = if provider_api_format == "gemini:generate_content" {
-            build_gemini_stream_plan_from_decision(self.parts, self.body_json, payload)
+            build_gemini_stream_plan_from_decision(self.parts, &self.body_json, payload)
         } else {
-            build_standard_stream_plan_from_decision(self.parts, self.body_json, payload, false)
+            build_standard_stream_plan_from_decision(self.parts, &self.body_json, payload, false)
         };
         match built {
             Ok(value) => Ok(value),
@@ -400,10 +402,11 @@ pub(crate) async fn maybe_build_sync_local_image_decision_payload(
         trace_id,
         decision,
     )
-    .await
+    .await?
     else {
         return Ok(None);
     };
+    let body_json = input.effective_body_json(body_json);
 
     let Some((mut source, _)) = build_local_openai_image_candidate_attempt_source(
         state,
@@ -429,7 +432,7 @@ pub(crate) async fn maybe_build_sync_local_image_decision_payload(
             attempt,
             spec,
         )
-        .await
+        .await?
         {
             return Ok(Some(payload));
         }
@@ -460,10 +463,11 @@ pub(crate) async fn maybe_build_stream_local_image_decision_payload(
         trace_id,
         decision,
     )
-    .await
+    .await?
     else {
         return Ok(None);
     };
+    let body_json = input.effective_body_json(body_json);
 
     let Some((mut source, _)) = build_local_openai_image_candidate_attempt_source(
         state,
@@ -489,7 +493,7 @@ pub(crate) async fn maybe_build_stream_local_image_decision_payload(
             attempt,
             spec,
         )
-        .await
+        .await?
         {
             return Ok(Some(payload));
         }
@@ -516,10 +520,11 @@ async fn build_local_sync_plan_and_reports(
         trace_id,
         decision,
     )
-    .await
+    .await?
     else {
         return Ok(Vec::new());
     };
+    let body_json = input.effective_body_json(body_json);
 
     let Some((mut source, _)) = build_local_openai_image_candidate_attempt_source(
         state,
@@ -546,7 +551,7 @@ async fn build_local_sync_plan_and_reports(
             attempt,
             spec,
         )
-        .await
+        .await?
         else {
             continue;
         };
@@ -592,10 +597,11 @@ async fn build_local_stream_plan_and_reports(
         trace_id,
         decision,
     )
-    .await
+    .await?
     else {
         return Ok(Vec::new());
     };
+    let body_json = input.effective_body_json(body_json);
 
     let Some((mut source, _)) = build_local_openai_image_candidate_attempt_source(
         state,
@@ -622,7 +628,7 @@ async fn build_local_stream_plan_and_reports(
             attempt,
             spec,
         )
-        .await
+        .await?
         else {
             continue;
         };

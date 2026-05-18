@@ -103,10 +103,11 @@ pub(crate) async fn maybe_build_sync_local_openai_responses_decision_payload(
     let Some(input) = resolve_local_openai_responses_decision_input(
         state, parts, trace_id, decision, body_json, plan_kind,
     )
-    .await
+    .await?
     else {
         return Ok(None);
     };
+    let body_json = input.effective_body_json(body_json);
 
     let (mut source, _) = build_local_openai_responses_candidate_attempt_source(
         state, trace_id, &input, body_json, spec,
@@ -117,7 +118,7 @@ pub(crate) async fn maybe_build_sync_local_openai_responses_decision_payload(
         if let Some(payload) = maybe_build_local_openai_responses_decision_payload_for_candidate(
             state, parts, trace_id, body_json, &input, attempt, spec,
         )
-        .await
+        .await?
         {
             return Ok(Some(payload));
         }
@@ -141,10 +142,11 @@ pub(crate) async fn maybe_build_stream_local_openai_responses_decision_payload(
     let Some(input) = resolve_local_openai_responses_decision_input(
         state, parts, trace_id, decision, body_json, plan_kind,
     )
-    .await
+    .await?
     else {
         return Ok(None);
     };
+    let body_json = input.effective_body_json(body_json);
 
     let (mut source, _) = build_local_openai_responses_candidate_attempt_source(
         state, trace_id, &input, body_json, spec,
@@ -155,7 +157,7 @@ pub(crate) async fn maybe_build_stream_local_openai_responses_decision_payload(
         if let Some(payload) = maybe_build_local_openai_responses_decision_payload_for_candidate(
             state, parts, trace_id, body_json, &input, attempt, spec,
         )
-        .await
+        .await?
         {
             return Ok(Some(payload));
         }

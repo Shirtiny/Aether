@@ -3400,7 +3400,7 @@ fn ai_serving_decision_inputs_share_authenticated_input_helper() {
         ),
         (
             "apps/aether-gateway/src/ai_serving/planner/specialized/files/support.rs",
-            "LocalAuthenticatedDecisionInput as LocalGeminiFilesDecisionInput",
+            "LocalRequestedModelDecisionInput as LocalGeminiFilesDecisionInput",
         ),
     ] {
         let source = read_workspace_file(path);
@@ -3433,7 +3433,7 @@ fn ai_serving_decision_inputs_share_authenticated_input_helper() {
         ),
         (
             "apps/aether-gateway/src/ai_serving/planner/specialized/files/support.rs",
-            "build_local_authenticated_decision_input(",
+            "build_local_requested_model_decision_input(",
         ),
     ] {
         let source = read_workspace_file(path);

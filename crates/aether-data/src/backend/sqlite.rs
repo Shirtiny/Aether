@@ -50,6 +50,9 @@ use crate::repository::proxy_nodes::{
 use crate::repository::quota::{
     ProviderQuotaReadRepository, ProviderQuotaWriteRepository, SqliteProviderQuotaRepository,
 };
+use crate::repository::routing_profiles::{
+    RoutingGroupReadRepository, RoutingGroupWriteRepository, SqliteRoutingGroupRepository,
+};
 use crate::repository::settlement::{SettlementWriteRepository, SqliteSettlementRepository};
 use crate::repository::usage::{
     SqliteUsageReadRepository, SqliteUsageWriteRepository, UsageReadRepository,
@@ -206,6 +209,14 @@ impl SqliteBackend {
 
     pub fn pool_score_write_repository(&self) -> Arc<dyn PoolMemberScoreWriteRepository> {
         Arc::new(SqlitePoolMemberScoreRepository::new(self.pool_clone()))
+    }
+
+    pub fn routing_group_read_repository(&self) -> Arc<dyn RoutingGroupReadRepository> {
+        Arc::new(SqliteRoutingGroupRepository::new(self.pool_clone()))
+    }
+
+    pub fn routing_group_write_repository(&self) -> Arc<dyn RoutingGroupWriteRepository> {
+        Arc::new(SqliteRoutingGroupRepository::new(self.pool_clone()))
     }
 
     pub fn proxy_node_read_repository(&self) -> Arc<dyn ProxyNodeReadRepository> {

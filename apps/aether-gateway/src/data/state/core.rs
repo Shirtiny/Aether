@@ -49,6 +49,8 @@ impl GatewayDataState {
                 pool_score_writer: None,
                 provider_quota_reader: None,
                 provider_quota_writer: None,
+                routing_group_reader: None,
+                routing_group_writer: None,
                 usage_reader: None,
                 usage_writer: None,
                 user_reader: None,
@@ -92,6 +94,8 @@ impl GatewayDataState {
         let pool_score_writer = backends.write().pool_scores();
         let provider_quota_reader = backends.read().provider_quotas();
         let provider_quota_writer = backends.write().provider_quotas();
+        let routing_group_reader = backends.read().routing_groups();
+        let routing_group_writer = backends.write().routing_groups();
         let usage_reader = backends.read().usage();
         let usage_writer = backends.write().usage();
         let user_reader = backends.read().users();
@@ -133,6 +137,8 @@ impl GatewayDataState {
             pool_score_writer,
             provider_quota_reader,
             provider_quota_writer,
+            routing_group_reader,
+            routing_group_writer,
             usage_reader,
             usage_writer,
             user_reader,
@@ -259,6 +265,14 @@ impl GatewayDataState {
 
     pub(crate) fn has_request_candidate_writer(&self) -> bool {
         self.request_candidate_writer.is_some()
+    }
+
+    pub(crate) fn has_routing_group_reader(&self) -> bool {
+        self.routing_group_reader.is_some()
+    }
+
+    pub(crate) fn has_routing_group_writer(&self) -> bool {
+        self.routing_group_writer.is_some()
     }
 
     pub(crate) fn has_provider_catalog_reader(&self) -> bool {

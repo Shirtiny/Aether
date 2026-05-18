@@ -6,6 +6,7 @@ members = [
     "crates/aether-ai-serving",
     "crates/aether-pool-core",
     "crates/aether-provider-pool",
+    "crates/aether-routing-core",
     "crates/aether-data-contracts",
     "crates/aether-data-schema",
     "crates/aether-dispatch-core",
@@ -41,6 +42,7 @@ aether-ai-formats = { path = "crates/aether-ai-formats" }
 aether-ai-serving = { path = "crates/aether-ai-serving" }
 aether-pool-core = { path = "crates/aether-pool-core" }
 aether-provider-pool = { path = "crates/aether-provider-pool" }
+aether-routing-core = { path = "crates/aether-routing-core" }
 aether-data-contracts = { path = "crates/aether-data-contracts" }
 aether-data-schema = { path = "crates/aether-data-schema" }
 aether-dispatch-core = { path = "crates/aether-dispatch-core" }

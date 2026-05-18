@@ -9,6 +9,7 @@ mod observability;
 mod provider;
 mod provider_oauth;
 mod route_request;
+mod routing_profiles;
 mod state;
 mod system;
 mod users;

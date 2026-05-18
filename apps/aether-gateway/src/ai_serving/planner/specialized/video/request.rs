@@ -41,6 +41,7 @@ pub(super) async fn resolve_local_video_create_candidate_payload_parts(
     let spec_metadata = local_video_create_spec_metadata(spec);
     let candidate = &attempt.eligible.candidate;
     let transport = &attempt.eligible.transport;
+    let effective_headers = input.effective_headers(&parts.headers);
 
     let provider_family = provider_video_create_family(spec.family);
     let transport_unsupported_reason = video_create_transport_unsupported_reason(
@@ -124,7 +125,7 @@ pub(super) async fn resolve_local_video_create_candidate_payload_parts(
         provider_family,
         &mapped_model,
         transport.endpoint.body_rules.as_ref(),
-        Some(&parts.headers),
+        Some(effective_headers),
     ) else {
         mark_skipped_local_video_candidate_with_failure_diagnostic(
             state,
@@ -146,7 +147,7 @@ pub(super) async fn resolve_local_video_create_candidate_payload_parts(
 
     let Some(provider_request_headers) =
         build_video_create_headers(ProviderVideoCreateHeadersInput {
-            headers: &parts.headers,
+            headers: effective_headers,
             auth_header: &auth_header,
             auth_value: &auth_value,
             header_rules: transport.endpoint.header_rules.as_ref(),

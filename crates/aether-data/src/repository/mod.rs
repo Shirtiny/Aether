@@ -21,6 +21,7 @@ pub mod provider_catalog;
 pub mod provider_oauth;
 pub mod proxy_nodes;
 pub mod quota;
+pub mod routing_profiles;
 pub mod settlement;
 pub mod system;
 pub mod usage;

@@ -148,6 +148,7 @@ name = "aether-data-contracts"
 version = "0.1.0"
 dependencies = [
  "aether-ai-formats",
+ "aether-routing-core",
  "async-trait",
  "chrono",
  "serde",
@@ -196,6 +197,7 @@ dependencies = [
  "aether-pool-core",
  "aether-provider-pool",
  "aether-provider-transport",
+ "aether-routing-core",
  "aether-runtime",
  "aether-runtime-state",
  "aether-scheduler-core",
@@ -375,6 +377,16 @@ dependencies = [
  "tracing",
  "url",
  "webpki-roots 0.26.11",
+]
+
+[[package]]
+name = "aether-routing-core"
+version = "0.1.0"
+dependencies = [
+ "regex",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

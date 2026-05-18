@@ -6,6 +6,7 @@ pub(super) mod features;
 mod model;
 pub(super) mod observability;
 pub(super) mod provider;
+mod routing;
 mod system;
 mod users;
 

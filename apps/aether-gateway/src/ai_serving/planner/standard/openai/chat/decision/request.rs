@@ -196,6 +196,7 @@ pub(crate) async fn resolve_local_openai_chat_candidate_payload_parts(
         resolve_provider_chat_request_redaction(state, parts, body_json, input, candidate_id)
             .await?;
     let body_json = redaction.body_json.as_ref();
+    let effective_headers = input.effective_headers(&parts.headers);
 
     if provider_api_format == "openai:chat" {
         if let Some(skip_reason) = local_openai_chat_transport_unsupported_reason(transport) {
@@ -247,7 +248,7 @@ pub(crate) async fn resolve_local_openai_chat_candidate_payload_parts(
             upstream_is_stream,
             force_body_stream_field,
             transport.endpoint.body_rules.as_ref(),
-            &parts.headers,
+            effective_headers,
             enable_model_directives,
         ) else {
             mark_skipped_local_openai_chat_candidate_with_extra_data(
@@ -292,7 +293,7 @@ pub(crate) async fn resolve_local_openai_chat_candidate_payload_parts(
                 transport,
                 provider_api_format,
                 same_format: true,
-                headers: &parts.headers,
+                headers: effective_headers,
                 auth_header: &prepared_candidate.auth_header,
                 auth_value: &prepared_candidate.auth_value,
                 extra_headers: &BTreeMap::new(),
@@ -323,7 +324,7 @@ pub(crate) async fn resolve_local_openai_chat_candidate_payload_parts(
         apply_codex_openai_responses_special_headers(
             &mut provider_request_headers,
             &provider_request_body,
-            &parts.headers,
+            effective_headers,
             transport.provider.provider_type.as_str(),
             transport.endpoint.api_format.as_str(),
             Some(trace_id),
@@ -503,7 +504,7 @@ pub(crate) async fn resolve_local_openai_chat_candidate_payload_parts(
             transport.endpoint.body_rules.as_ref()
         },
         Some(input.auth_context.api_key_id.as_str()),
-        &parts.headers,
+        effective_headers,
         enable_model_directives,
     ) else {
         mark_skipped_local_openai_chat_candidate_with_extra_data(
@@ -598,7 +599,7 @@ pub(crate) async fn resolve_local_openai_chat_candidate_payload_parts(
             transport,
             provider_api_format: provider_api_format.as_str(),
             same_format: false,
-            headers: &parts.headers,
+            headers: effective_headers,
             auth_header: &prepared_candidate.auth_header,
             auth_value: &prepared_candidate.auth_value,
             extra_headers: &BTreeMap::new(),
@@ -629,7 +630,7 @@ pub(crate) async fn resolve_local_openai_chat_candidate_payload_parts(
     apply_codex_openai_responses_special_headers(
         &mut provider_request_headers,
         &provider_request_body,
-        &parts.headers,
+        effective_headers,
         transport.provider.provider_type.as_str(),
         provider_api_format.as_str(),
         Some(trace_id),
@@ -1174,12 +1175,13 @@ async fn build_kiro_openai_chat_cross_format_payload_parts(
     request_redacted: bool,
 ) -> Option<LocalOpenAiChatCandidatePayloadParts> {
     let candidate = &eligible.candidate;
+    let effective_headers = input.effective_headers(&parts.headers);
     let provider_request_body = match build_kiro_provider_request_body(
         &claude_request_body,
         &mapped_model,
         &kiro_auth.auth_config,
         transport.endpoint.body_rules.as_ref(),
-        Some(&parts.headers),
+        Some(effective_headers),
     ) {
         Some(body) => body,
         None => {
@@ -1230,7 +1232,7 @@ async fn build_kiro_openai_chat_cross_format_payload_parts(
         }
     };
     let mut provider_request_headers = match build_kiro_provider_headers(KiroProviderHeadersInput {
-        headers: &parts.headers,
+        headers: effective_headers,
         provider_request_body: &provider_request_body,
         original_request_body: original_body_json,
         header_rules: transport.endpoint.header_rules.as_ref(),

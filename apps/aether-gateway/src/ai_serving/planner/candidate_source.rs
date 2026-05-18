@@ -2,6 +2,7 @@ use aether_ai_serving::{
     run_ai_candidate_preselection, AiCandidatePreselectionOutcome, AiCandidatePreselectionPort,
 };
 use aether_data_contracts::repository::candidate_selection::StoredMinimalCandidateSelectionRow;
+use aether_routing_core::ResolvedRoutingPolicy;
 use aether_scheduler_core::{
     enumerate_minimal_candidate_selection_with_model_directives, normalize_api_format,
     resolve_requested_global_model_name_with_model_directives,
@@ -35,6 +36,7 @@ struct GatewayLocalCandidatePreselectionPort<'a> {
     require_streaming: bool,
     required_capabilities: Option<&'a serde_json::Value>,
     auth_snapshot: &'a GatewayAuthApiKeySnapshot,
+    routing_policy: Option<&'a ResolvedRoutingPolicy>,
     client_session_affinity: Option<&'a ClientSessionAffinity>,
     use_api_format_alias_match: bool,
     key_mode: LocalCandidatePreselectionKeyMode,
@@ -100,13 +102,14 @@ impl AiCandidatePreselectionPort for GatewayLocalCandidatePreselectionPort<'_> {
         let enable_model_directives = self.model_directive_enabled_api_formats.contains(
             &crate::ai_serving::normalize_api_format_alias(candidate_api_format),
         );
-        matches_client_format
-            || auth_snapshot_allows_cross_format_candidate(
-                self.auth_snapshot,
-                self.requested_model,
-                candidate,
-                enable_model_directives,
-            )
+        routing_policy_allows_provider(self.routing_policy, candidate)
+            && (matches_client_format
+                || auth_snapshot_allows_cross_format_candidate(
+                    self.auth_snapshot,
+                    self.requested_model,
+                    candidate,
+                    enable_model_directives,
+                ))
     }
 
     fn skipped_candidate_allowed(
@@ -118,13 +121,14 @@ impl AiCandidatePreselectionPort for GatewayLocalCandidatePreselectionPort<'_> {
         let enable_model_directives = self.model_directive_enabled_api_formats.contains(
             &crate::ai_serving::normalize_api_format_alias(candidate_api_format),
         );
-        matches_client_format
-            || auth_snapshot_allows_cross_format_candidate(
-                self.auth_snapshot,
-                self.requested_model,
-                &skipped_candidate.candidate,
-                enable_model_directives,
-            )
+        routing_policy_allows_provider(self.routing_policy, &skipped_candidate.candidate)
+            && (matches_client_format
+                || auth_snapshot_allows_cross_format_candidate(
+                    self.auth_snapshot,
+                    self.requested_model,
+                    &skipped_candidate.candidate,
+                    enable_model_directives,
+                ))
     }
 
     fn candidate_key(&self, candidate: &Self::Candidate) -> String {
@@ -144,6 +148,7 @@ pub(crate) async fn preselect_local_execution_candidates_with_serving(
     require_streaming: bool,
     required_capabilities: Option<&serde_json::Value>,
     auth_snapshot: &GatewayAuthApiKeySnapshot,
+    routing_policy: Option<&ResolvedRoutingPolicy>,
     client_session_affinity: Option<&ClientSessionAffinity>,
     use_api_format_alias_match: bool,
     key_mode: LocalCandidatePreselectionKeyMode,
@@ -166,6 +171,7 @@ pub(crate) async fn preselect_local_execution_candidates_with_serving(
         require_streaming,
         required_capabilities,
         auth_snapshot,
+        routing_policy,
         client_session_affinity,
         use_api_format_alias_match,
         key_mode,
@@ -182,6 +188,7 @@ pub(crate) async fn preselect_local_execution_candidates_for_api_formats_with_se
     require_streaming: bool,
     required_capabilities: Option<&serde_json::Value>,
     auth_snapshot: &GatewayAuthApiKeySnapshot,
+    routing_policy: Option<&ResolvedRoutingPolicy>,
     client_session_affinity: Option<&ClientSessionAffinity>,
     use_api_format_alias_match: bool,
     key_mode: LocalCandidatePreselectionKeyMode,
@@ -213,6 +220,7 @@ pub(crate) async fn preselect_local_execution_candidates_for_api_formats_with_se
         require_streaming,
         required_capabilities,
         auth_snapshot,
+        routing_policy,
         client_session_affinity,
         use_api_format_alias_match,
         key_mode,
@@ -230,6 +238,7 @@ pub(crate) struct LocalCandidatePreselectionPageCursor<'a> {
     require_streaming: bool,
     required_capabilities: Option<serde_json::Value>,
     auth_snapshot: GatewayAuthApiKeySnapshot,
+    routing_policy: Option<ResolvedRoutingPolicy>,
     client_session_affinity: Option<ClientSessionAffinity>,
     use_api_format_alias_match: bool,
     key_mode: LocalCandidatePreselectionKeyMode,
@@ -253,6 +262,7 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
         require_streaming: bool,
         required_capabilities: Option<&serde_json::Value>,
         auth_snapshot: &GatewayAuthApiKeySnapshot,
+        routing_policy: Option<&ResolvedRoutingPolicy>,
         client_session_affinity: Option<&ClientSessionAffinity>,
         use_api_format_alias_match: bool,
         key_mode: LocalCandidatePreselectionKeyMode,
@@ -283,6 +293,7 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
             require_streaming,
             required_capabilities: required_capabilities.cloned(),
             auth_snapshot: auth_snapshot.clone(),
+            routing_policy: routing_policy.cloned(),
             client_session_affinity: client_session_affinity.cloned(),
             use_api_format_alias_match,
             key_mode,
@@ -620,16 +631,17 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
         candidate_api_format: &str,
         enable_model_directives: bool,
     ) -> bool {
-        matches_client_api_format(
-            self.use_api_format_alias_match,
-            candidate_api_format,
-            &self.client_api_format,
-        ) || auth_snapshot_allows_cross_format_candidate(
-            &self.auth_snapshot,
-            &self.requested_model,
-            candidate,
-            enable_model_directives,
-        )
+        routing_policy_allows_provider(self.routing_policy.as_ref(), candidate)
+            && (matches_client_api_format(
+                self.use_api_format_alias_match,
+                candidate_api_format,
+                &self.client_api_format,
+            ) || auth_snapshot_allows_cross_format_candidate(
+                &self.auth_snapshot,
+                &self.requested_model,
+                candidate,
+                enable_model_directives,
+            ))
     }
 
     fn skipped_candidate_allowed_for_page(
@@ -638,16 +650,17 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
         candidate_api_format: &str,
         enable_model_directives: bool,
     ) -> bool {
-        matches_client_api_format(
-            self.use_api_format_alias_match,
-            candidate_api_format,
-            &self.client_api_format,
-        ) || auth_snapshot_allows_cross_format_candidate(
-            &self.auth_snapshot,
-            &self.requested_model,
-            &skipped_candidate.candidate,
-            enable_model_directives,
-        )
+        routing_policy_allows_provider(self.routing_policy.as_ref(), &skipped_candidate.candidate)
+            && (matches_client_api_format(
+                self.use_api_format_alias_match,
+                candidate_api_format,
+                &self.client_api_format,
+            ) || auth_snapshot_allows_cross_format_candidate(
+                &self.auth_snapshot,
+                &self.requested_model,
+                &skipped_candidate.candidate,
+                enable_model_directives,
+            ))
     }
 }
 
@@ -737,6 +750,18 @@ pub(crate) fn auth_snapshot_allows_cross_format_candidate(
     }
 
     true
+}
+
+fn routing_policy_allows_provider(
+    routing_policy: Option<&ResolvedRoutingPolicy>,
+    candidate: &SchedulerMinimalCandidateSelectionCandidate,
+) -> bool {
+    match routing_policy {
+        Some(policy) => policy
+            .ranking_overlay
+            .provider_allowed(candidate.provider_id.as_str()),
+        None => true,
+    }
 }
 
 #[cfg(test)]
@@ -887,6 +912,7 @@ mod tests {
             None,
             &auth_snapshot,
             None,
+            None,
             true,
             LocalCandidatePreselectionKeyMode::ProviderEndpointKeyModelAndApiFormat,
         )
@@ -942,6 +968,7 @@ mod tests {
             false,
             None,
             &auth_snapshot,
+            None,
             None,
             true,
             LocalCandidatePreselectionKeyMode::ProviderEndpointKeyModelAndApiFormat,

@@ -14,7 +14,8 @@ use crate::ai_serving::planner::candidate_metadata::{
     build_local_execution_candidate_metadata_for_candidate, LocalExecutionCandidateMetadataParts,
 };
 use crate::ai_serving::planner::decision_input::{
-    build_local_authenticated_decision_input, resolve_local_authenticated_decision_input,
+    attach_routing_policy_to_local_requested_model_input,
+    build_local_requested_model_decision_input, resolve_local_authenticated_decision_input,
 };
 use crate::ai_serving::planner::materialization_policy::{
     build_local_candidate_persistence_policy, LocalCandidatePersistencePolicyKind,
@@ -29,11 +30,12 @@ use crate::{AppState, GatewayError};
 
 pub(super) use crate::ai_serving::planner::candidate_materialization::LocalExecutionCandidateAttempt as LocalGeminiFilesCandidateAttempt;
 pub(super) use crate::ai_serving::planner::candidate_materialization::LocalExecutionCandidateAttemptSource as LocalGeminiFilesCandidateAttemptSource;
-pub(super) use crate::ai_serving::planner::decision_input::LocalAuthenticatedDecisionInput as LocalGeminiFilesDecisionInput;
+pub(super) use crate::ai_serving::planner::decision_input::LocalRequestedModelDecisionInput as LocalGeminiFilesDecisionInput;
 
 pub(super) const GEMINI_FILES_CANDIDATE_API_FORMAT: &str = "gemini:files";
 pub(super) const GEMINI_FILES_CLIENT_API_FORMAT: &str = "gemini:files";
 pub(super) const GEMINI_FILES_REQUIRED_CAPABILITY: &str = "gemini_files";
+pub(super) const GEMINI_FILES_ROUTING_MODEL: &str = "gemini-files";
 
 pub(super) async fn resolve_local_gemini_files_decision_input(
     state: &AppState,
@@ -41,9 +43,9 @@ pub(super) async fn resolve_local_gemini_files_decision_input(
     body_json: Option<&serde_json::Value>,
     trace_id: &str,
     decision: &GatewayControlDecision,
-) -> Option<LocalGeminiFilesDecisionInput> {
+) -> Result<Option<LocalGeminiFilesDecisionInput>, GatewayError> {
     let Some(auth_context) = resolve_local_decision_execution_runtime_auth_context(decision) else {
-        return None;
+        return Ok(None);
     };
 
     let explicit_required_capabilities = json!({ "gemini_files": true });
@@ -56,20 +58,33 @@ pub(super) async fn resolve_local_gemini_files_decision_input(
     .await
     {
         Ok(Some(resolved_input)) => resolved_input,
-        Ok(None) => return None,
+        Ok(None) => return Ok(None),
         Err(err) => {
             warn!(
                 trace_id = %trace_id,
                 error = ?err,
                 "gateway local gemini files decision auth snapshot read failed"
             );
-            return None;
+            return Err(err);
         }
     };
 
-    let mut input = build_local_authenticated_decision_input(resolved_input);
+    let routing_body_json = body_json.cloned().unwrap_or(serde_json::Value::Null);
+    let mut input = build_local_requested_model_decision_input(
+        resolved_input,
+        GEMINI_FILES_ROUTING_MODEL.to_string(),
+    );
+    input.request_auth_channel = decision.request_auth_channel.clone();
     input.client_session_affinity = client_session_affinity_from_parts(parts, body_json);
-    Some(input)
+    attach_routing_policy_to_local_requested_model_input(
+        state,
+        parts,
+        &mut input,
+        &routing_body_json,
+        GEMINI_FILES_CLIENT_API_FORMAT,
+    )
+    .await?;
+    Ok(Some(input))
 }
 
 pub(super) async fn materialize_local_gemini_files_candidate_attempts(
@@ -101,8 +116,9 @@ pub(super) async fn materialize_local_gemini_files_candidate_attempts(
         Some(&input.auth_snapshot),
         input.client_session_affinity.as_ref(),
         input.required_capabilities.as_ref(),
+        input.routing_policy.as_ref(),
         None,
-        None,
+        input.request_auth_channel.as_deref(),
         persistence_policy,
         candidates,
         Vec::new(),
@@ -173,8 +189,9 @@ pub(super) async fn build_local_gemini_files_candidate_attempt_source<'a>(
         Some(&input.auth_snapshot),
         input.client_session_affinity.as_ref(),
         input.required_capabilities.as_ref(),
+        input.routing_policy.as_ref(),
         None,
-        None,
+        input.request_auth_channel.as_deref(),
         persistence_policy,
         candidates,
         Vec::new(),

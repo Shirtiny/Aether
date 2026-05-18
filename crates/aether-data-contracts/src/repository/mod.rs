@@ -6,6 +6,7 @@ pub mod global_models;
 pub mod pool_scores;
 pub mod provider_catalog;
 pub mod quota;
+pub mod routing_profiles;
 pub mod settlement;
 pub mod usage;
 pub mod video_tasks;

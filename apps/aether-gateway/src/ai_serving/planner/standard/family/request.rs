@@ -65,6 +65,7 @@ pub(crate) async fn resolve_local_standard_candidate_payload_parts(
     let candidate = &attempt.eligible.candidate;
     let transport = &attempt.eligible.transport;
     let provider_api_format = attempt.eligible.provider_api_format.as_str();
+    let effective_headers = input.effective_headers(&parts.headers);
     if spec_metadata.api_format == "gemini:generate_content"
         && provider_api_format == "openai:image"
         && gemini_request_is_image_generation(body_json)
@@ -209,7 +210,7 @@ pub(crate) async fn resolve_local_standard_candidate_payload_parts(
                 transport.endpoint.body_rules.as_ref()
             },
             Some(input.auth_context.api_key_id.as_str()),
-            Some(&parts.headers),
+            Some(effective_headers),
             enable_model_directives,
         ) {
             Some(body) => body,
@@ -312,7 +313,7 @@ pub(crate) async fn resolve_local_standard_candidate_payload_parts(
             transport,
             provider_api_format,
             same_format: false,
-            headers: &parts.headers,
+            headers: effective_headers,
             auth_header: &prepared_candidate.auth_header,
             auth_value: &prepared_candidate.auth_value,
             extra_headers: &BTreeMap::new(),
@@ -343,7 +344,7 @@ pub(crate) async fn resolve_local_standard_candidate_payload_parts(
     apply_codex_openai_responses_special_headers(
         &mut provider_request_headers,
         &provider_request_body,
-        &parts.headers,
+        effective_headers,
         transport.provider.provider_type.as_str(),
         provider_api_format,
         Some(trace_id),
@@ -448,9 +449,10 @@ async fn resolve_local_gemini_image_to_openai_image_candidate_payload_parts(
 
     let upstream_is_stream = true;
     let upstream_url = build_openai_image_upstream_url(transport, None);
+    let effective_headers = input.effective_headers(&parts.headers);
     let Some(mut provider_request_headers) =
         build_openai_image_headers(ProviderOpenAiImageHeadersInput {
-            headers: &parts.headers,
+            headers: effective_headers,
             auth_header: &prepared_candidate.auth_header,
             auth_value: &prepared_candidate.auth_value,
             header_rules: transport.endpoint.header_rules.as_ref(),
@@ -478,7 +480,7 @@ async fn resolve_local_gemini_image_to_openai_image_candidate_payload_parts(
     apply_codex_openai_responses_special_headers(
         &mut provider_request_headers,
         &converted.body_json,
-        &parts.headers,
+        effective_headers,
         transport.provider.provider_type.as_str(),
         provider_api_format,
         Some(trace_id),
@@ -517,12 +519,13 @@ async fn build_kiro_cross_format_payload_parts(
     kiro_auth: &KiroRequestAuth,
 ) -> Option<LocalStandardCandidatePayloadParts> {
     let candidate = &attempt.eligible.candidate;
+    let effective_headers = input.effective_headers(&parts.headers);
     let provider_request_body = match build_kiro_provider_request_body(
         &claude_request_body,
         &mapped_model,
         &kiro_auth.auth_config,
         transport.endpoint.body_rules.as_ref(),
-        Some(&parts.headers),
+        Some(effective_headers),
     ) {
         Some(body) => body,
         None => {
@@ -573,7 +576,7 @@ async fn build_kiro_cross_format_payload_parts(
         }
     };
     let provider_request_headers = match build_kiro_provider_headers(KiroProviderHeadersInput {
-        headers: &parts.headers,
+        headers: effective_headers,
         provider_request_body: &provider_request_body,
         original_request_body: original_body_json,
         header_rules: transport.endpoint.header_rules.as_ref(),

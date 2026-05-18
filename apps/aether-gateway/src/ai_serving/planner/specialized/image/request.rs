@@ -59,6 +59,7 @@ pub(super) async fn resolve_local_openai_image_candidate_payload_parts(
     let candidate = &attempt.eligible.candidate;
     let transport = &attempt.eligible.transport;
     let provider_api_format = attempt.eligible.provider_api_format.as_str();
+    let effective_headers = input.effective_headers(&parts.headers);
 
     if provider_api_format == "gemini:generate_content" {
         return resolve_local_openai_image_to_gemini_candidate_payload_parts(
@@ -170,7 +171,7 @@ pub(super) async fn resolve_local_openai_image_candidate_payload_parts(
 
     let Some(mut provider_request_headers) =
         build_openai_image_headers(ProviderOpenAiImageHeadersInput {
-            headers: &parts.headers,
+            headers: effective_headers,
             auth_header: &auth_header,
             auth_value: &auth_value,
             header_rules: transport.endpoint.header_rules.as_ref(),
@@ -201,7 +202,7 @@ pub(super) async fn resolve_local_openai_image_candidate_payload_parts(
         apply_codex_openai_responses_special_headers(
             &mut provider_request_headers,
             &provider_request_body,
-            &parts.headers,
+            effective_headers,
             transport.provider.provider_type.as_str(),
             spec_metadata.api_format,
             Some(trace_id),
@@ -256,6 +257,7 @@ async fn resolve_local_openai_image_to_gemini_candidate_payload_parts(
     let candidate = &attempt.eligible.candidate;
     let transport = &attempt.eligible.transport;
     let provider_api_format = "gemini:generate_content";
+    let effective_headers = input.effective_headers(&parts.headers);
 
     let prepared_candidate = match prepare_header_authenticated_candidate(
         PlannerAppState::new(state),
@@ -332,7 +334,7 @@ async fn resolve_local_openai_image_to_gemini_candidate_payload_parts(
             converted.body_json,
             transport.endpoint.body_rules.as_ref(),
             body_json,
-            &parts.headers,
+            effective_headers,
         ) {
             Some(body) => body,
             None => {
@@ -384,7 +386,7 @@ async fn resolve_local_openai_image_to_gemini_candidate_payload_parts(
             transport,
             provider_api_format,
             same_format: false,
-            headers: &parts.headers,
+            headers: effective_headers,
             auth_header: &prepared_candidate.auth_header,
             auth_value: &prepared_candidate.auth_value,
             extra_headers: &BTreeMap::new(),

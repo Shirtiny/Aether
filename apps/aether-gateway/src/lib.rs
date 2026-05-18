@@ -59,6 +59,7 @@ mod rate_limit;
 mod request_candidate_runtime;
 mod roles;
 mod router;
+mod routing;
 mod scheduler;
 mod state;
 mod system_features;

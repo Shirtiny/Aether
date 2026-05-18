@@ -1694,3 +1694,155 @@ type = "unix_seconds"
 [[table.global_models.uniques]]
 name = "global_models_name_key"
 columns = ["name"]
+
+[table.routing_groups]
+domain = "provider_catalog"
+order = 110
+primary_key = ["id"]
+
+[[table.routing_groups.columns]]
+name = "id"
+type = "text_id"
+length = 64
+
+[[table.routing_groups.columns]]
+name = "name"
+type = "text"
+length = 255
+
+[[table.routing_groups.columns]]
+name = "description"
+type = "long_text"
+nullable = true
+
+[[table.routing_groups.columns]]
+name = "enabled"
+type = "bool"
+default = true
+
+[[table.routing_groups.columns]]
+name = "is_system_default"
+type = "bool"
+default = false
+
+[[table.routing_groups.columns]]
+name = "config_json"
+type = "json"
+
+[[table.routing_groups.columns]]
+name = "version"
+type = "int64"
+default = 1
+
+[[table.routing_groups.columns]]
+name = "created_at"
+type = "unix_seconds"
+
+[[table.routing_groups.columns]]
+name = "updated_at"
+type = "unix_seconds"
+
+[[table.routing_groups.columns]]
+name = "published_at"
+type = "unix_seconds"
+nullable = true
+
+[[table.routing_groups.uniques]]
+name = "routing_groups_name_key"
+columns = ["name"]
+
+[[table.routing_groups.indexes]]
+name = "routing_groups_system_default_idx"
+columns = ["is_system_default", "enabled"]
+
+[table.routing_group_bindings]
+domain = "provider_catalog"
+order = 111
+primary_key = ["id"]
+
+[[table.routing_group_bindings.columns]]
+name = "id"
+type = "text_id"
+length = 64
+
+[[table.routing_group_bindings.columns]]
+name = "group_id"
+type = "text_id"
+length = 64
+
+[[table.routing_group_bindings.columns]]
+name = "subject_type"
+type = "text"
+length = 32
+
+[[table.routing_group_bindings.columns]]
+name = "subject_id"
+type = "text_id"
+length = 64
+
+[[table.routing_group_bindings.columns]]
+name = "is_default"
+type = "bool"
+default = false
+
+[[table.routing_group_bindings.columns]]
+name = "allow_explicit_select"
+type = "bool"
+default = true
+
+[[table.routing_group_bindings.columns]]
+name = "created_at"
+type = "unix_seconds"
+
+[[table.routing_group_bindings.columns]]
+name = "updated_at"
+type = "unix_seconds"
+
+[[table.routing_group_bindings.indexes]]
+name = "routing_group_bindings_group_id_idx"
+columns = ["group_id"]
+
+[[table.routing_group_bindings.indexes]]
+name = "routing_group_bindings_subject_idx"
+columns = ["subject_type", "subject_id"]
+
+[table.routing_group_versions]
+domain = "provider_catalog"
+order = 112
+primary_key = ["id"]
+
+[[table.routing_group_versions.columns]]
+name = "id"
+type = "text_id"
+length = 64
+
+[[table.routing_group_versions.columns]]
+name = "group_id"
+type = "text_id"
+length = 64
+
+[[table.routing_group_versions.columns]]
+name = "version"
+type = "int64"
+
+[[table.routing_group_versions.columns]]
+name = "config_json"
+type = "json"
+
+[[table.routing_group_versions.columns]]
+name = "created_at"
+type = "unix_seconds"
+
+[[table.routing_group_versions.columns]]
+name = "created_by"
+type = "text_id"
+length = 64
+nullable = true
+
+[[table.routing_group_versions.uniques]]
+name = "routing_group_versions_group_version_key"
+columns = ["group_id", "version"]
+
+[[table.routing_group_versions.indexes]]
+name = "routing_group_versions_group_id_idx"
+columns = ["group_id"]

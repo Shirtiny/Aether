@@ -16,6 +16,7 @@ use aether_pool_core::{
     PoolMemberSignals, PoolRuntimeState, PoolSchedulingConfig, PoolSchedulingPreset,
 };
 use aether_provider_pool::ProviderPoolService;
+use aether_routing_core::{RankingOverlay, ResolvedRoutingPolicy};
 use tracing::warn;
 
 use crate::ai_serving::{
@@ -40,6 +41,7 @@ use crate::orchestration::LocalExecutionCandidateMetadata;
 
 static LOAD_BALANCE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const POOL_ACTIVE_PROBE_SEALED_SKIP_REASON: &str = "pool_active_probe_sealed";
+const ROUTING_PROFILE_DISALLOWED_KEY_SKIP_REASON: &str = "routing_profile_disallowed_key";
 
 type PoolCatalogKeyContext = PoolMemberSignals;
 
@@ -187,6 +189,7 @@ pub(crate) struct PoolKeyCursor<'a> {
     sticky_session_token: Option<String>,
     requested_model: Option<String>,
     request_auth_channel: Option<String>,
+    routing_overlay: Option<RankingOverlay>,
     runtime_miss_trace_id: Option<String>,
     record_runtime_miss_diagnostic: bool,
     pool_key_order: StoredPoolKeyCandidateOrder,
@@ -216,7 +219,26 @@ impl<'a> PoolKeyCursor<'a> {
         requested_model: Option<&str>,
         request_auth_channel: Option<&str>,
     ) -> Self {
-        let pool_key_order = pool_key_candidate_order_for_group(&group);
+        Self::new_with_routing_policy(
+            state,
+            group,
+            sticky_session_token,
+            requested_model,
+            request_auth_channel,
+            None,
+        )
+    }
+
+    pub(crate) fn new_with_routing_policy(
+        state: PlannerAppState<'a>,
+        group: EligibleLocalExecutionCandidate,
+        sticky_session_token: Option<&str>,
+        requested_model: Option<&str>,
+        request_auth_channel: Option<&str>,
+        routing_policy: Option<&ResolvedRoutingPolicy>,
+    ) -> Self {
+        let pool_key_order = pool_key_candidate_order_for_group(&group, routing_policy);
+        let routing_overlay = routing_policy.map(|policy| policy.ranking_overlay.clone());
         let pool_config = pool_config_for_candidate(&group);
         let score_top_n = pool_config
             .as_ref()
@@ -236,6 +258,7 @@ impl<'a> PoolKeyCursor<'a> {
             sticky_session_token: sticky_session_token.map(str::to_string),
             requested_model: requested_model.map(str::to_string),
             request_auth_channel: request_auth_channel.map(str::to_string),
+            routing_overlay,
             runtime_miss_trace_id: None,
             record_runtime_miss_diagnostic: false,
             pool_key_order,
@@ -551,6 +574,9 @@ impl<'a> PoolKeyCursor<'a> {
     async fn next_queued_candidate(&mut self) -> Option<EligibleLocalExecutionCandidate> {
         while let Some(candidate) = self.queued_candidates.pop_front() {
             let mut candidate = candidate;
+            if self.skip_candidate_if_routing_profile_disallowed(&candidate) {
+                continue;
+            }
             if self.skip_candidate_if_runtime_cooldown(&candidate).await {
                 continue;
             }
@@ -560,6 +586,28 @@ impl<'a> PoolKeyCursor<'a> {
         }
 
         None
+    }
+
+    fn skip_candidate_if_routing_profile_disallowed(
+        &mut self,
+        candidate: &EligibleLocalExecutionCandidate,
+    ) -> bool {
+        let Some(overlay) = self.routing_overlay.as_ref() else {
+            return false;
+        };
+        if overlay.key_allowed(candidate.candidate.key_id.as_str()) {
+            return false;
+        }
+        self.record_skip_reason(ROUTING_PROFILE_DISALLOWED_KEY_SKIP_REASON);
+        self.skipped_candidates
+            .push(SkippedLocalExecutionCandidate {
+                candidate: candidate.candidate.clone(),
+                skip_reason: ROUTING_PROFILE_DISALLOWED_KEY_SKIP_REASON,
+                transport: Some(candidate.transport.clone()),
+                ranking: candidate.ranking.clone(),
+                extra_data: None,
+            });
+        true
     }
 
     async fn skip_candidate_if_runtime_cooldown(
@@ -958,19 +1006,38 @@ fn should_trigger_active_probe_burst_for_request(
 
 fn pool_key_candidate_order_for_group(
     group: &EligibleLocalExecutionCandidate,
+    routing_policy: Option<&ResolvedRoutingPolicy>,
 ) -> StoredPoolKeyCandidateOrder {
     let Some(pool_config) = pool_config_for_candidate(group) else {
         return StoredPoolKeyCandidateOrder::InternalPriority;
     };
-    let presets = pool_config
-        .scheduling_presets
-        .iter()
-        .map(|preset| PoolSchedulingPreset {
-            preset: preset.preset.clone(),
-            enabled: preset.enabled,
-            mode: preset.mode.clone(),
+    let override_presets = routing_policy
+        .and_then(|policy| {
+            policy
+                .pool_policy_overrides
+                .get(group.candidate.provider_id.as_str())
         })
-        .collect::<Vec<_>>();
+        .filter(|override_policy| !override_policy.scheduling_presets.is_empty());
+    let presets = match override_presets {
+        Some(override_policy) => override_policy
+            .scheduling_presets
+            .iter()
+            .map(|preset| PoolSchedulingPreset {
+                preset: preset.preset.clone(),
+                enabled: preset.enabled,
+                mode: preset.mode.clone(),
+            })
+            .collect::<Vec<_>>(),
+        None => pool_config
+            .scheduling_presets
+            .iter()
+            .map(|preset| PoolSchedulingPreset {
+                preset: preset.preset.clone(),
+                enabled: preset.enabled,
+                mode: preset.mode.clone(),
+            })
+            .collect::<Vec<_>>(),
+    };
     let active_presets = ProviderPoolService::with_builtin_adapters()
         .normalize_scheduling_presets(group.transport.provider.provider_type.as_str(), &presets)
         .into_iter()
@@ -1071,6 +1138,7 @@ mod tests {
         apply_local_execution_pool_scheduler_with_runtime_map, build_pool_catalog_key_context,
         pool_config_for_candidate, should_trigger_active_probe_burst_for_request,
         PoolCatalogKeyContext, PoolKeyCursor, POOL_ACTIVE_PROBE_SEALED_SKIP_REASON,
+        ROUTING_PROFILE_DISALLOWED_KEY_SKIP_REASON,
     };
     use crate::ai_serving::{
         apply_local_runtime_candidate_terminal_reason, EligibleLocalExecutionCandidate,
@@ -1095,6 +1163,9 @@ mod tests {
     use aether_provider_transport::snapshot::{
         GatewayProviderTransportEndpoint, GatewayProviderTransportKey,
         GatewayProviderTransportProvider,
+    };
+    use aether_routing_core::{
+        RankingOverlay, ResolvedRoutingPolicy, RoutingSchedulingMode, RoutingSetPriorityMode,
     };
     use aether_scheduler_core::SchedulerMinimalCandidateSelectionCandidate;
     use serde_json::json;
@@ -2104,6 +2175,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pool_key_cursor_filters_expanded_keys_by_routing_profile_allowed_keys() {
+        let app = AppState::new().expect("state should build");
+        let provider_config = Some(json!({ "pool_advanced": { "lru_enabled": true } }));
+        let group = sample_eligible_candidate(
+            "provider-pool",
+            "endpoint-1",
+            "pool-group",
+            10,
+            provider_config.clone(),
+        );
+        let routing_policy = routing_policy_with_allowed_keys(["key-b"]);
+        let mut cursor = PoolKeyCursor::new_with_routing_policy(
+            PlannerAppState::new(&app),
+            group,
+            None,
+            None,
+            None,
+            Some(&routing_policy),
+        );
+        cursor.queued_candidates = VecDeque::from([
+            sample_eligible_candidate(
+                "provider-pool",
+                "endpoint-1",
+                "key-a",
+                10,
+                provider_config.clone(),
+            ),
+            sample_eligible_candidate("provider-pool", "endpoint-1", "key-b", 10, provider_config),
+        ]);
+
+        let candidate = cursor
+            .next_key()
+            .await
+            .expect("cursor should skip disallowed pool key and return allowed key");
+        assert_eq!(candidate.candidate.key_id, "key-b");
+        assert_eq!(candidate.orchestration.pool_key_index, Some(0));
+        assert_eq!(
+            cursor
+                .skip_reason_counts
+                .get(ROUTING_PROFILE_DISALLOWED_KEY_SKIP_REASON),
+            Some(&1)
+        );
+        let skipped = cursor.take_skipped_candidates();
+        assert_eq!(
+            skipped
+                .iter()
+                .map(|item| (item.candidate.key_id.as_str(), item.skip_reason))
+                .collect::<Vec<_>>(),
+            vec![("key-a", ROUTING_PROFILE_DISALLOWED_KEY_SKIP_REASON)]
+        );
+    }
+
+    #[tokio::test]
     async fn pool_key_cursor_allows_parallel_requests_to_use_same_healthy_key() {
         let app = AppState::new().expect("state should build");
         let provider_config = Some(json!({ "pool_advanced": { "lru_enabled": true } }));
@@ -2666,6 +2790,28 @@ mod tests {
             });
         }
         (provider, endpoint, keys, rows)
+    }
+
+    fn routing_policy_with_allowed_keys<const N: usize>(
+        key_ids: [&str; N],
+    ) -> ResolvedRoutingPolicy {
+        ResolvedRoutingPolicy {
+            group_id: Some("routing-group-1".to_string()),
+            group_version: Some(1),
+            selection_source: "test".to_string(),
+            requested_model: "gpt-5".to_string(),
+            resolved_model: "gpt-5".to_string(),
+            priority_mode: RoutingSetPriorityMode::Provider,
+            scheduling_mode: RoutingSchedulingMode::CacheAffinity,
+            keep_priority_on_conversion: false,
+            ranking_overlay: RankingOverlay {
+                allowed_keys: key_ids.into_iter().map(str::to_string).collect(),
+                ..RankingOverlay::default()
+            },
+            mutation_plan: Default::default(),
+            pool_policy_overrides: BTreeMap::new(),
+            matched_rules: Vec::new(),
+        }
     }
 
     fn sample_eligible_candidate(

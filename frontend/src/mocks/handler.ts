@@ -429,6 +429,102 @@ const MOCK_ALIASES = [
   { id: 'alias-004', source_model: 'gemini-pro', target_global_model_id: 'gm-005', target_global_model_name: 'gemini-3-pro-preview', target_global_model_display_name: 'Gemini 3 Pro Preview', provider_id: null, provider_name: null, scope: 'global', mapping_type: 'alias', is_active: true, created_at: '2024-01-01T00:00:00Z', updated_at: '2024-01-01T00:00:00Z' }
 ]
 
+interface MockRoutingGroup {
+  id: string
+  name: string
+  description: string | null
+  enabled: boolean
+  is_system_default: boolean
+  config_json: Record<string, unknown>
+  version: number
+  created_at: number
+  updated_at: number
+  published_at: number | null
+}
+
+interface MockRoutingGroupVersion {
+  id: string
+  group_id: string
+  version: number
+  config_json: Record<string, unknown>
+  created_at: number
+  created_by: string | null
+}
+
+interface MockRoutingGroupBinding {
+  id: string
+  group_id: string
+  subject_type: 'user' | 'api_key' | 'user_group'
+  subject_id: string
+  is_default: boolean
+  allow_explicit_select: boolean
+  created_at: number
+  updated_at: number
+}
+
+const mockRoutingNow = Math.floor(Date.now() / 1000)
+const MOCK_ROUTING_GROUPS: MockRoutingGroup[] = [
+  {
+    id: 'routing-default',
+    name: '默认调度策略',
+    description: '演示模式默认分组，保持 Provider 优先和缓存亲和',
+    enabled: true,
+    is_system_default: true,
+    config_json: {
+      allowed_models: [],
+      default_policy: {
+        priority_mode: 'provider',
+        scheduling_mode: 'cache_affinity',
+        keep_priority_on_conversion: false,
+      },
+      model_policies: [
+        {
+          model: 'gpt-5.1',
+          allowed_providers: ['provider-002'],
+          allowed_keys: [],
+          provider_priority_overrides: { 'provider-002': 0 },
+          key_priority_overrides: {},
+          pool_policy_overrides: {},
+        },
+      ],
+      rules: [],
+    },
+    version: 1,
+    created_at: mockRoutingNow - 86400,
+    updated_at: mockRoutingNow - 3600,
+    published_at: mockRoutingNow - 3600,
+  },
+]
+
+const MOCK_ROUTING_GROUP_VERSIONS: MockRoutingGroupVersion[] = [
+  {
+    id: 'routing-default-v1',
+    group_id: 'routing-default',
+    version: 1,
+    config_json: MOCK_ROUTING_GROUPS[0].config_json,
+    created_at: MOCK_ROUTING_GROUPS[0].published_at ?? mockRoutingNow,
+    created_by: null,
+  },
+]
+
+const MOCK_ROUTING_GROUP_BINDINGS: MockRoutingGroupBinding[] = []
+
+function cloneMockRoutingGroup(group: MockRoutingGroup): MockRoutingGroup {
+  return JSON.parse(JSON.stringify(group)) as MockRoutingGroup
+}
+
+function cloneMockRoutingVersion(version: MockRoutingGroupVersion): MockRoutingGroupVersion {
+  return JSON.parse(JSON.stringify(version)) as MockRoutingGroupVersion
+}
+
+function unsetOtherMockRoutingDefaults(groupId: string): void {
+  for (const group of MOCK_ROUTING_GROUPS) {
+    if (group.id !== groupId) {
+      group.is_system_default = false
+    }
+  }
+}
+
 function normalizeApiFormat(apiFormat: string): string {
   return apiFormat.toLowerCase().replace(/_/g, ':')
 }
@@ -947,6 +1043,68 @@ const mockHandlers: Record<string, (config: AxiosRequestConfig) => Promise<Axios
     requireAdmin()
     const body = JSON.parse(config.data || '{}')
     return createMockResponse({ ...body, id: `gm-demo-${Date.now()}`, created_at: new Date().toISOString() })
+  },
+
+  // ========== Admin: Routing Profiles ==========
+  'GET /api/admin/routing/groups': async () => {
+    await delay()
+    requireAdmin()
+    return createMockResponse({
+      items: MOCK_ROUTING_GROUPS.map(cloneMockRoutingGroup),
+      total: MOCK_ROUTING_GROUPS.length,
+    })
+  },
+
+  'POST /api/admin/routing/groups': async (config) => {
+    await delay()
+    requireAdmin()
+    const body = JSON.parse(config.data || '{}') as Partial<MockRoutingGroup>
+    const now = Math.floor(Date.now() / 1000)
+    const group: MockRoutingGroup = {
+      id: body.id || `routing-demo-${Date.now()}`,
+      name: body.name || '未命名调度策略',
+      description: body.description ?? null,
+      enabled: body.enabled ?? true,
+      is_system_default: body.is_system_default ?? false,
+      config_json: body.config_json ?? {},
+      version: 1,
+      created_at: now,
+      updated_at: now,
+      published_at: null,
+    }
+    if (group.is_system_default) {
+      unsetOtherMockRoutingDefaults(group.id)
+    }
+    MOCK_ROUTING_GROUPS.unshift(group)
+    return createMockResponse(cloneMockRoutingGroup(group))
+  },
+
+  'GET /api/admin/routing/bindings': async () => {
+    await delay()
+    requireAdmin()
+    return createMockResponse({
+      items: MOCK_ROUTING_GROUP_BINDINGS.map(binding => ({ ...binding })),
+      total: MOCK_ROUTING_GROUP_BINDINGS.length,
+    })
+  },
+
+  'POST /api/admin/routing/bindings': async (config) => {
+    await delay()
+    requireAdmin()
+    const body = JSON.parse(config.data || '{}') as Partial<MockRoutingGroupBinding>
+    const now = Math.floor(Date.now() / 1000)
+    const binding: MockRoutingGroupBinding = {
+      id: body.id || `routing-binding-demo-${Date.now()}`,
+      group_id: body.group_id || 'routing-default',
+      subject_type: body.subject_type || 'api_key',
+      subject_id: body.subject_id || 'demo',
+      is_default: body.is_default ?? false,
+      allow_explicit_select: body.allow_explicit_select ?? false,
+      created_at: now,
+      updated_at: now,
+    }
+    MOCK_ROUTING_GROUP_BINDINGS.unshift(binding)
+    return createMockResponse({ ...binding })
   },
 
   // ========== Admin: Model Mappings / Aliases ==========
@@ -2100,6 +2258,181 @@ registerDynamicRoute('POST', '/api/admin/models/global/:modelId/assign-to-provid
     errors: []
   }
   return createMockResponse(result)
+})
+
+registerDynamicRoute('GET', '/api/admin/routing/groups/:groupId', async (_config, params) => {
+  await delay()
+  requireAdmin()
+  const group = MOCK_ROUTING_GROUPS.find(item => item.id === params.groupId)
+  if (!group) {
+    throw { response: createMockResponse({ detail: '调度策略不存在' }, 404) }
+  }
+  return createMockResponse(cloneMockRoutingGroup(group))
+})
+
+registerDynamicRoute('PATCH', '/api/admin/routing/groups/:groupId', async (config, params) => {
+  await delay()
+  requireAdmin()
+  const index = MOCK_ROUTING_GROUPS.findIndex(item => item.id === params.groupId)
+  if (index < 0) {
+    throw { response: createMockResponse({ detail: '调度策略不存在' }, 404) }
+  }
+  const body = JSON.parse(config.data || '{}') as Partial<MockRoutingGroup>
+  const current = MOCK_ROUTING_GROUPS[index]
+  const now = Math.floor(Date.now() / 1000)
+  const updated: MockRoutingGroup = {
+    ...current,
+    ...body,
+    id: current.id,
+    config_json: body.config_json ?? current.config_json,
+    version: body.config_json ? current.version + 1 : (body.version ?? current.version),
+    updated_at: now,
+  }
+  if (updated.is_system_default) {
+    unsetOtherMockRoutingDefaults(updated.id)
+  }
+  MOCK_ROUTING_GROUPS[index] = updated
+  return createMockResponse(cloneMockRoutingGroup(updated))
+})
+
+registerDynamicRoute('DELETE', '/api/admin/routing/groups/:groupId', async (_config, params) => {
+  await delay()
+  requireAdmin()
+  const index = MOCK_ROUTING_GROUPS.findIndex(item => item.id === params.groupId)
+  if (index < 0) {
+    throw { response: createMockResponse({ detail: '调度策略不存在' }, 404) }
+  }
+  MOCK_ROUTING_GROUPS.splice(index, 1)
+  return createMockResponse({ message: '删除成功（演示模式）' })
+})
+
+registerDynamicRoute('POST', '/api/admin/routing/groups/:groupId/publish', async (_config, params) => {
+  await delay()
+  requireAdmin()
+  const group = MOCK_ROUTING_GROUPS.find(item => item.id === params.groupId)
+  if (!group) {
+    throw { response: createMockResponse({ detail: '调度策略不存在' }, 404) }
+  }
+  const now = Math.floor(Date.now() / 1000)
+  group.published_at = now
+  group.updated_at = now
+  MOCK_ROUTING_GROUP_VERSIONS.unshift({
+    id: `${group.id}-v${group.version}-${now}`,
+    group_id: group.id,
+    version: group.version,
+    config_json: group.config_json,
+    created_at: now,
+    created_by: null,
+  })
+  return createMockResponse(cloneMockRoutingGroup(group))
+})
+
+registerDynamicRoute('GET', '/api/admin/routing/groups/:groupId/versions', async (_config, params) => {
+  await delay()
+  requireAdmin()
+  const versions = MOCK_ROUTING_GROUP_VERSIONS
+    .filter(version => version.group_id === params.groupId)
+    .map(cloneMockRoutingVersion)
+  return createMockResponse({ items: versions, total: versions.length })
+})
+
+registerDynamicRoute('POST', '/api/admin/routing/groups/:groupId/dry-run', async (config, params) => {
+  await delay()
+  requireAdmin()
+  const group = MOCK_ROUTING_GROUPS.find(item => item.id === params.groupId)
+  if (!group) {
+    throw { response: createMockResponse({ detail: '调度策略不存在' }, 404) }
+  }
+  const body = JSON.parse(config.data || '{}') as {
+    model?: string
+    resolved_model?: string
+    api_format?: string
+    headers?: Record<string, string>
+    body?: unknown
+  }
+  const model = body.model || 'gpt-5.1'
+  const resolvedModel = body.resolved_model || model
+  const rules = Array.isArray(group.config_json.rules)
+    ? group.config_json.rules as Array<{ id?: unknown; enabled?: unknown }>
+    : []
+  const selectedRules = rules
+    .filter(rule => rule.enabled !== false && typeof rule.id === 'string')
+    .map(rule => String(rule.id))
+  const traceSeed = {
+    group_id: group.id,
+    group_version: group.version,
+    selection_source: 'admin_dry_run',
+    selected_rules: selectedRules,
+    original_model: model,
+    resolved_model: resolvedModel,
+    client_api_format: body.api_format || 'openai:chat',
+    global_candidates: [
+      {
+        candidate_kind: 'provider',
+        provider_id: 'provider-002',
+        endpoint_id: 'ep-002',
+        model_id: resolvedModel,
+        key_id: 'ekey-003',
+        ranking_vector: {
+          provider_priority_before: 0,
+          provider_priority_after: 0,
+          key_priority_before: 0,
+          key_priority_after: 0,
+        },
+        skip_reason: null,
+        selected_order: 0,
+      },
+    ],
+    pool_expansion: [],
+    runtime_facts: {
+      scheduler_mode: 'cache_affinity',
+      priority_mode: 'provider',
+    },
+  }
+  return createMockResponse({
+    group: cloneMockRoutingGroup(group),
+    policy: {
+      selected_rules: selectedRules,
+      ranking_overlay: {},
+    },
+    trace_seed: traceSeed,
+    patch_summary: { body_paths: [], header_names: [], failed_action: null },
+    mutated_body: body.body ?? { model },
+    mutated_headers: body.headers ?? {},
+    candidate_preview: {
+      status: 'policy_only',
+      ranking_overlay: {},
+      note: '演示模式候选预览',
+    },
+  })
+})
+
+registerDynamicRoute('PATCH', '/api/admin/routing/bindings/:bindingId', async (config, params) => {
+  await delay()
+  requireAdmin()
+  const index = MOCK_ROUTING_GROUP_BINDINGS.findIndex(item => item.id === params.bindingId)
+  if (index < 0) {
+    throw { response: createMockResponse({ detail: '调度绑定不存在' }, 404) }
+  }
+  const body = JSON.parse(config.data || '{}') as Partial<MockRoutingGroupBinding>
+  MOCK_ROUTING_GROUP_BINDINGS[index] = {
+    ...MOCK_ROUTING_GROUP_BINDINGS[index],
+    ...body,
+    id: MOCK_ROUTING_GROUP_BINDINGS[index].id,
+    updated_at: Math.floor(Date.now() / 1000),
+  }
+  return createMockResponse({ ...MOCK_ROUTING_GROUP_BINDINGS[index] })
+})
+
+registerDynamicRoute('DELETE', '/api/admin/routing/bindings/:bindingId', async (_config, params) => {
+  await delay()
+  requireAdmin()
+  const index = MOCK_ROUTING_GROUP_BINDINGS.findIndex(item => item.id === params.bindingId)
+  if (index < 0) {
+    throw { response: createMockResponse({ detail: '调度绑定不存在' }, 404) }
+  }
+  MOCK_ROUTING_GROUP_BINDINGS.splice(index, 1)
+  return createMockResponse({ message: '删除成功（演示模式）' })
 })
 
 // Endpoint Health 详情

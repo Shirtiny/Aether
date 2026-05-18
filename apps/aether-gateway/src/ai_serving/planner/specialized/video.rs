@@ -27,7 +27,7 @@ use self::support::{
 pub(crate) struct LocalVideoCreateSyncAttemptSource<'a> {
     state: &'a AppState,
     parts: &'a http::request::Parts,
-    body_json: &'a serde_json::Value,
+    body_json: serde_json::Value,
     trace_id: &'a str,
     input: LocalVideoCreateDecisionInput,
     spec: LocalVideoCreateSpec,
@@ -65,16 +65,17 @@ pub(crate) async fn build_local_video_sync_attempt_source_for_kind<'a>(
     let Some(input) = resolve_local_video_create_decision_input(
         state, parts, trace_id, decision, body_json, spec,
     )
-    .await
+    .await?
     else {
         return Ok(None);
     };
 
+    let effective_body_json = input.effective_body_json(body_json).clone();
     let Some((candidates, candidate_count)) = build_local_video_create_candidate_attempt_source(
         state,
         trace_id,
         &input,
-        body_json,
+        &effective_body_json,
         spec_metadata.api_format,
         spec_metadata.decision_kind,
     )
@@ -91,7 +92,7 @@ pub(crate) async fn build_local_video_sync_attempt_source_for_kind<'a>(
         LocalVideoCreateSyncAttemptSource {
             state,
             parts,
-            body_json,
+            body_json: effective_body_json,
             trace_id,
             input,
             spec,
@@ -133,13 +134,13 @@ impl LocalVideoCreateSyncAttemptSource<'_> {
         let Some(payload) = maybe_build_local_video_create_decision_payload_for_candidate(
             self.state,
             self.parts,
-            self.body_json,
+            &self.body_json,
             self.trace_id,
             &self.input,
             attempt,
             self.spec,
         )
-        .await
+        .await?
         else {
             return Ok(None);
         };
@@ -175,10 +176,11 @@ pub(crate) async fn maybe_build_sync_local_video_decision_payload(
     let Some(input) = resolve_local_video_create_decision_input(
         state, parts, trace_id, decision, body_json, spec,
     )
-    .await
+    .await?
     else {
         return Ok(None);
     };
+    let body_json = input.effective_body_json(body_json);
 
     let Some((mut source, _)) = build_local_video_create_candidate_attempt_source(
         state,
@@ -197,7 +199,7 @@ pub(crate) async fn maybe_build_sync_local_video_decision_payload(
         if let Some(payload) = maybe_build_local_video_create_decision_payload_for_candidate(
             state, parts, body_json, trace_id, &input, attempt, spec,
         )
-        .await
+        .await?
         {
             return Ok(Some(payload));
         }
@@ -218,10 +220,11 @@ async fn build_local_sync_plan_and_reports(
     let Some(input) = resolve_local_video_create_decision_input(
         state, parts, trace_id, decision, body_json, spec,
     )
-    .await
+    .await?
     else {
         return Ok(Vec::new());
     };
+    let body_json = input.effective_body_json(body_json);
 
     let Some((mut source, _)) = build_local_video_create_candidate_attempt_source(
         state,
@@ -241,7 +244,7 @@ async fn build_local_sync_plan_and_reports(
         let Some(payload) = maybe_build_local_video_create_decision_payload_for_candidate(
             state, parts, body_json, trace_id, &input, attempt, spec,
         )
-        .await
+        .await?
         else {
             continue;
         };

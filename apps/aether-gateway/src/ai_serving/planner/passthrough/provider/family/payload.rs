@@ -6,6 +6,7 @@ use crate::ai_serving::planner::candidate_materialization::{
     mark_skipped_local_execution_candidate, mark_skipped_local_execution_candidate_with_extra_data,
     mark_skipped_local_execution_candidate_with_failure_diagnostic,
 };
+use crate::ai_serving::planner::decision_input::apply_provider_request_routing_policy_to_decision;
 use crate::ai_serving::planner::materialization_policy::{
     build_local_candidate_persistence_policy, LocalCandidatePersistencePolicyKind,
 };
@@ -22,7 +23,7 @@ use crate::ai_serving::transport::{
 };
 use crate::{
     append_execution_contract_fields_to_value, append_local_failover_policy_to_value,
-    AiExecutionDecision, AppState,
+    AiExecutionDecision, AppState, GatewayError,
 };
 use aether_scheduler_core::SchedulerMinimalCandidateSelectionCandidate;
 
@@ -40,7 +41,7 @@ pub(crate) async fn maybe_build_local_same_format_provider_decision_payload_for_
     input: &LocalSameFormatProviderDecisionInput,
     attempt: LocalSameFormatProviderCandidateAttempt,
     spec: LocalSameFormatProviderSpec,
-) -> Option<AiExecutionDecision> {
+) -> Result<Option<AiExecutionDecision>, GatewayError> {
     let spec_metadata = local_same_format_provider_spec_metadata(spec);
     let LocalSameFormatProviderCandidateAttempt {
         eligible,
@@ -51,10 +52,13 @@ pub(crate) async fn maybe_build_local_same_format_provider_decision_payload_for_
     let candidate = &eligible.candidate;
     let (execution_strategy, conversion_mode) =
         ai_local_execution_contract_for_formats(spec_metadata.api_format, spec_metadata.api_format);
-    let resolved = resolve_local_same_format_provider_candidate_payload_parts(
+    let Some(resolved) = resolve_local_same_format_provider_candidate_payload_parts(
         state, parts, trace_id, body_json, input, &attempt, spec,
     )
-    .await?;
+    .await
+    else {
+        return Ok(None);
+    };
 
     let prompt_cache_key = resolved
         .provider_request_body
@@ -85,6 +89,7 @@ pub(crate) async fn maybe_build_local_same_format_provider_decision_payload_for_
         );
     }
     let provider_api_format = resolved.provider_api_format.clone();
+    let effective_headers = input.effective_headers(&parts.headers);
     let report_context = append_local_failover_policy_to_value(
         append_execution_contract_fields_to_value(
             build_local_execution_report_context(LocalExecutionReportContextParts {
@@ -112,7 +117,7 @@ pub(crate) async fn maybe_build_local_same_format_provider_decision_payload_for_
                 body_rules: resolved.transport.endpoint.body_rules.as_ref(),
                 provider_request_method: Some(serde_json::Value::Null),
                 provider_request_headers: Some(&resolved.provider_request_headers),
-                original_headers: &parts.headers,
+                original_headers: effective_headers,
                 request_path: Some(parts.uri.path()),
                 request_query_string: parts.uri.query(),
                 request_origin: Some(crate::ai_serving::request_origin_from_parts(parts)),
@@ -151,41 +156,41 @@ pub(crate) async fn maybe_build_local_same_format_provider_decision_payload_for_
         provider_request_body,
     } = resolved;
 
-    Some(build_ai_execution_decision_response(
-        AiExecutionDecisionResponseParts {
-            decision_is_stream: spec_metadata.require_streaming,
-            decision_kind: spec_metadata.decision_kind.to_string(),
-            execution_strategy,
-            conversion_mode,
-            request_id: trace_id.to_string(),
-            candidate_id: candidate_id.to_string(),
-            provider_name: transport.provider.name.clone(),
-            provider_id: candidate.provider_id.clone(),
-            endpoint_id: candidate.endpoint_id.clone(),
-            key_id: candidate.key_id.clone(),
-            upstream_base_url: transport.endpoint.base_url.clone(),
-            upstream_url,
-            provider_request_method: None,
-            auth_header,
-            auth_value,
-            provider_api_format,
-            client_api_format: spec_metadata.api_format.to_string(),
-            model_name: input.requested_model.clone(),
-            mapped_model,
-            prompt_cache_key,
-            provider_request_headers,
-            provider_request_body: Some(provider_request_body),
-            provider_request_body_base64: None,
-            content_type: Some("application/json".to_string()),
-            proxy,
-            transport_profile,
-            timeouts: resolve_transport_execution_timeouts(&transport),
-            upstream_is_stream,
-            report_kind: Some(report_kind.to_string()),
-            report_context: Some(report_context),
-            auth_context: input.auth_context.clone(),
-        },
-    ))
+    let mut decision = build_ai_execution_decision_response(AiExecutionDecisionResponseParts {
+        decision_is_stream: spec_metadata.require_streaming,
+        decision_kind: spec_metadata.decision_kind.to_string(),
+        execution_strategy,
+        conversion_mode,
+        request_id: trace_id.to_string(),
+        candidate_id: candidate_id.to_string(),
+        provider_name: transport.provider.name.clone(),
+        provider_id: candidate.provider_id.clone(),
+        endpoint_id: candidate.endpoint_id.clone(),
+        key_id: candidate.key_id.clone(),
+        upstream_base_url: transport.endpoint.base_url.clone(),
+        upstream_url,
+        provider_request_method: None,
+        auth_header,
+        auth_value,
+        provider_api_format,
+        client_api_format: spec_metadata.api_format.to_string(),
+        model_name: input.requested_model.clone(),
+        mapped_model,
+        prompt_cache_key,
+        provider_request_headers,
+        provider_request_body: Some(provider_request_body),
+        provider_request_body_base64: None,
+        content_type: Some("application/json".to_string()),
+        proxy,
+        transport_profile,
+        timeouts: resolve_transport_execution_timeouts(&transport),
+        upstream_is_stream,
+        report_kind: Some(report_kind.to_string()),
+        report_context: Some(report_context),
+        auth_context: input.auth_context.clone(),
+    });
+    apply_provider_request_routing_policy_to_decision(input, &mut decision)?;
+    Ok(Some(decision))
 }
 
 pub(super) async fn mark_skipped_local_same_format_provider_candidate(

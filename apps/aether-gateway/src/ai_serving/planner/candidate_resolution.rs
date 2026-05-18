@@ -4,6 +4,7 @@ use aether_ai_serving::{
     run_ai_candidate_resolution, AiCandidateResolutionMode, AiCandidateResolutionPort,
     AiCandidateResolutionRequest,
 };
+use aether_routing_core::ResolvedRoutingPolicy;
 use async_trait::async_trait;
 use std::convert::Infallible;
 use tracing::warn;
@@ -60,6 +61,7 @@ struct GatewayLocalCandidateResolutionPort<'a> {
     auth_snapshot: Option<&'a GatewayAuthApiKeySnapshot>,
     client_session_affinity: Option<&'a ClientSessionAffinity>,
     required_capabilities: Option<&'a serde_json::Value>,
+    routing_policy: Option<&'a ResolvedRoutingPolicy>,
     request_auth_channel: Option<&'a str>,
 }
 
@@ -97,6 +99,11 @@ impl AiCandidateResolutionPort for GatewayLocalCandidateResolutionPort<'_> {
         transport: &Self::Transport,
         requested_model: Option<&str>,
     ) -> Option<&'static str> {
+        if let Some(skip_reason) =
+            routing_policy_candidate_skip_reason(self.routing_policy, candidate, transport)
+        {
+            return Some(skip_reason);
+        }
         if provider_transport_uses_pool(transport) {
             return pool_group_common_transport_skip_reason(candidate, transport);
         }
@@ -172,6 +179,7 @@ impl AiCandidateResolutionPort for GatewayLocalCandidateResolutionPort<'_> {
             self.auth_snapshot,
             self.client_session_affinity,
             self.required_capabilities,
+            self.routing_policy,
         )
         .await)
     }
@@ -192,6 +200,7 @@ pub(crate) async fn resolve_and_rank_local_execution_candidates(
     auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
     client_session_affinity: Option<&ClientSessionAffinity>,
     required_capabilities: Option<&serde_json::Value>,
+    routing_policy: Option<&ResolvedRoutingPolicy>,
     _sticky_session_token: Option<&str>,
     request_auth_channel: Option<&str>,
 ) -> (
@@ -207,6 +216,7 @@ pub(crate) async fn resolve_and_rank_local_execution_candidates(
         auth_snapshot,
         client_session_affinity,
         required_capabilities,
+        routing_policy,
         None,
         request_auth_channel,
         AiCandidateResolutionMode::Standard,
@@ -222,6 +232,7 @@ pub(crate) async fn resolve_and_rank_local_execution_candidates_without_transpor
     auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
     client_session_affinity: Option<&ClientSessionAffinity>,
     required_capabilities: Option<&serde_json::Value>,
+    routing_policy: Option<&ResolvedRoutingPolicy>,
     _sticky_session_token: Option<&str>,
     request_auth_channel: Option<&str>,
 ) -> (
@@ -237,6 +248,7 @@ pub(crate) async fn resolve_and_rank_local_execution_candidates_without_transpor
         auth_snapshot,
         client_session_affinity,
         required_capabilities,
+        routing_policy,
         None,
         request_auth_channel,
         AiCandidateResolutionMode::WithoutTransportPairGate,
@@ -252,6 +264,7 @@ pub(crate) async fn resolve_and_rank_logical_local_execution_candidates(
     auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
     client_session_affinity: Option<&ClientSessionAffinity>,
     required_capabilities: Option<&serde_json::Value>,
+    routing_policy: Option<&ResolvedRoutingPolicy>,
     _sticky_session_token: Option<&str>,
     request_auth_channel: Option<&str>,
     mode: AiCandidateResolutionMode,
@@ -267,6 +280,7 @@ pub(crate) async fn resolve_and_rank_logical_local_execution_candidates(
         auth_snapshot,
         client_session_affinity,
         required_capabilities,
+        routing_policy,
         None,
         request_auth_channel,
         mode,
@@ -283,6 +297,7 @@ async fn resolve_and_rank_local_execution_candidates_with_mode(
     auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
     client_session_affinity: Option<&ClientSessionAffinity>,
     required_capabilities: Option<&serde_json::Value>,
+    routing_policy: Option<&ResolvedRoutingPolicy>,
     _sticky_session_token: Option<&str>,
     request_auth_channel: Option<&str>,
     mode: AiCandidateResolutionMode,
@@ -298,6 +313,7 @@ async fn resolve_and_rank_local_execution_candidates_with_mode(
         auth_snapshot,
         client_session_affinity,
         required_capabilities,
+        routing_policy,
         None,
         request_auth_channel,
         mode,
@@ -315,6 +331,7 @@ async fn resolve_and_rank_local_execution_candidates_with_pool_expansion(
     auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
     client_session_affinity: Option<&ClientSessionAffinity>,
     required_capabilities: Option<&serde_json::Value>,
+    routing_policy: Option<&ResolvedRoutingPolicy>,
     _sticky_session_token: Option<&str>,
     request_auth_channel: Option<&str>,
     mode: AiCandidateResolutionMode,
@@ -330,6 +347,7 @@ async fn resolve_and_rank_local_execution_candidates_with_pool_expansion(
         auth_snapshot,
         client_session_affinity,
         required_capabilities,
+        routing_policy,
         request_auth_channel,
     };
 
@@ -367,6 +385,28 @@ fn provider_transport_uses_pool(transport: &GatewayProviderTransportSnapshot) ->
         transport.provider.config.as_ref(),
     )
     .is_some()
+}
+
+fn routing_policy_candidate_skip_reason(
+    routing_policy: Option<&ResolvedRoutingPolicy>,
+    candidate: &SchedulerMinimalCandidateSelectionCandidate,
+    transport: &GatewayProviderTransportSnapshot,
+) -> Option<&'static str> {
+    let policy = routing_policy?;
+    if !policy
+        .ranking_overlay
+        .provider_allowed(candidate.provider_id.as_str())
+    {
+        return Some("routing_profile_disallowed_provider");
+    }
+    if !provider_transport_uses_pool(transport)
+        && !policy
+            .ranking_overlay
+            .key_allowed(candidate.key_id.as_str())
+    {
+        return Some("routing_profile_disallowed_key");
+    }
+    None
 }
 
 fn pool_group_common_transport_skip_reason(

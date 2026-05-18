@@ -11,6 +11,7 @@ mod cors;
 mod integrations;
 mod oauth;
 mod proxy;
+mod routing_profiles;
 mod runtime;
 #[cfg(test)]
 mod testing;

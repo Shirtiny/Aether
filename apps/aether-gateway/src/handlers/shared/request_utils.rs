@@ -300,6 +300,11 @@ pub(crate) fn admin_proxy_local_requires_buffered_body(
                     http::Method::POST,
                     Some("query_models" | "test_model" | "test_model_failover"),
                 )
+                | (Some("routing_profiles_manage"), http::Method::POST, Some("create_group"))
+                | (Some("routing_profiles_manage"), http::Method::PATCH, Some("update_group"))
+                | (Some("routing_profiles_manage"), http::Method::POST, Some("dry_run_group"))
+                | (Some("routing_profiles_manage"), http::Method::POST, Some("create_binding"))
+                | (Some("routing_profiles_manage"), http::Method::PATCH, Some("update_binding"))
                 | (Some("billing_manage"), http::Method::POST, Some("apply_preset"))
                 | (Some("billing_manage"), http::Method::POST, Some("create_rule"))
                 | (Some("billing_manage"), http::Method::PUT, Some("update_rule"))

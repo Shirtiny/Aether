@@ -33,7 +33,7 @@ pub(crate) async fn maybe_build_sync_local_same_format_provider_decision_payload
     let Some(input) = resolve_local_same_format_provider_decision_input(
         state, parts, trace_id, decision, body_json, spec,
     )
-    .await
+    .await?
     else {
         set_local_runtime_miss_diagnostic_reason(
             state,
@@ -55,6 +55,7 @@ pub(crate) async fn maybe_build_sync_local_same_format_provider_decision_payload
         Some(input.requested_model.as_str()),
         "candidate_evaluation_incomplete",
     );
+    let body_json = input.effective_body_json(body_json);
     let (mut source, candidate_count) = build_local_same_format_provider_candidate_attempt_source(
         state, trace_id, &input, body_json, spec,
     )
@@ -70,7 +71,7 @@ pub(crate) async fn maybe_build_sync_local_same_format_provider_decision_payload
             maybe_build_local_same_format_provider_decision_payload_for_candidate(
                 state, parts, trace_id, body_json, &input, attempt, spec,
             )
-            .await
+            .await?
         {
             return Ok(Some(payload));
         }
@@ -100,7 +101,7 @@ pub(crate) async fn maybe_build_stream_local_same_format_provider_decision_paylo
     let Some(input) = resolve_local_same_format_provider_decision_input(
         state, parts, trace_id, decision, body_json, spec,
     )
-    .await
+    .await?
     else {
         set_local_runtime_miss_diagnostic_reason(
             state,
@@ -122,6 +123,7 @@ pub(crate) async fn maybe_build_stream_local_same_format_provider_decision_paylo
         Some(input.requested_model.as_str()),
         "candidate_evaluation_incomplete",
     );
+    let body_json = input.effective_body_json(body_json);
     let (mut source, candidate_count) = build_local_same_format_provider_candidate_attempt_source(
         state, trace_id, &input, body_json, spec,
     )
@@ -137,7 +139,7 @@ pub(crate) async fn maybe_build_stream_local_same_format_provider_decision_paylo
             maybe_build_local_same_format_provider_decision_payload_for_candidate(
                 state, parts, trace_id, body_json, &input, attempt, spec,
             )
-            .await
+            .await?
         {
             return Ok(Some(payload));
         }

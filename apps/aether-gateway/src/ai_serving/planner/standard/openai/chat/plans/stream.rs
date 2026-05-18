@@ -25,7 +25,7 @@ pub(crate) struct LocalOpenAiChatStreamAttemptSource<'a> {
     state: &'a AppState,
     parts: &'a http::request::Parts,
     trace_id: &'a str,
-    body_json: &'a serde_json::Value,
+    body_json: serde_json::Value,
     input: LocalOpenAiChatDecisionInput,
     candidates: LocalOpenAiChatCandidateAttemptSource<'a>,
 }
@@ -45,37 +45,52 @@ pub(crate) async fn build_local_openai_chat_stream_attempt_source<'a>(
     let Some(input) = resolve_local_openai_chat_decision_input(
         state, parts, trace_id, decision, body_json, plan_kind, true,
     )
-    .await
+    .await?
     else {
         return Ok(None);
     };
+    let effective_body_json = input.effective_body_json(body_json).clone();
 
     let image_generation_intent =
         openai_request_is_image_generation_intent(&input.requested_model, body_json);
     let (mut candidates, mut candidate_count) = if image_generation_intent {
         let (image_candidates, image_candidate_count) =
             build_local_openai_chat_image_candidate_attempt_source(
-                state, trace_id, &input, body_json,
+                state,
+                trace_id,
+                &input,
+                &effective_body_json,
             )
             .await?;
         if image_candidate_count > 0 {
             (image_candidates, image_candidate_count)
         } else {
             build_lazy_local_openai_chat_candidate_attempt_source(
-                state, trace_id, &input, body_json, true,
+                state,
+                trace_id,
+                &input,
+                &effective_body_json,
+                true,
             )
             .await
         }
     } else {
         build_lazy_local_openai_chat_candidate_attempt_source(
-            state, trace_id, &input, body_json, true,
+            state,
+            trace_id,
+            &input,
+            &effective_body_json,
+            true,
         )
         .await
     };
     if !image_generation_intent && candidate_count == 0 {
         let (image_candidates, image_candidate_count) =
             build_local_openai_chat_image_candidate_attempt_source(
-                state, trace_id, &input, body_json,
+                state,
+                trace_id,
+                &input,
+                &effective_body_json,
             )
             .await?;
         if image_candidate_count > 0 {
@@ -108,7 +123,7 @@ pub(crate) async fn build_local_openai_chat_stream_attempt_source<'a>(
             state,
             parts,
             trace_id,
-            body_json,
+            body_json: effective_body_json,
             input,
             candidates,
         },
@@ -158,7 +173,7 @@ impl LocalOpenAiChatStreamAttemptSource<'_> {
             self.state,
             self.parts,
             self.trace_id,
-            self.body_json,
+            &self.body_json,
             &self.input,
             attempt,
             OPENAI_CHAT_STREAM_PLAN_KIND,
@@ -170,7 +185,7 @@ impl LocalOpenAiChatStreamAttemptSource<'_> {
             return Ok(None);
         };
 
-        match build_openai_chat_stream_plan_from_decision(self.parts, self.body_json, payload) {
+        match build_openai_chat_stream_plan_from_decision(self.parts, &self.body_json, payload) {
             Ok(value) => Ok(value),
             Err(err) => {
                 warn!(
@@ -199,7 +214,7 @@ pub(crate) async fn build_local_openai_chat_stream_plan_and_reports(
     let Some(input) = resolve_local_openai_chat_decision_input(
         state, parts, trace_id, decision, body_json, plan_kind, true,
     )
-    .await
+    .await?
     else {
         return Ok(Vec::new());
     };

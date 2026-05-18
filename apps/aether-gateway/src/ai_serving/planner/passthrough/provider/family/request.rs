@@ -125,6 +125,7 @@ pub(crate) async fn resolve_local_same_format_provider_candidate_payload_parts(
             Some(&input.requested_model),
         )
         .await;
+    let effective_headers = input.effective_headers(&parts.headers);
 
     let Some(mut base_provider_request_body) =
         super::super::request::build_same_format_provider_request_body(
@@ -133,7 +134,7 @@ pub(crate) async fn resolve_local_same_format_provider_candidate_payload_parts(
             &prepared.mapped_model,
             spec,
             prepared.transport.endpoint.body_rules.as_ref(),
-            Some(&parts.headers),
+            Some(effective_headers),
             prepared.upstream_is_stream,
             prepared.force_body_stream_field,
             prepared.kiro_auth.as_ref(),
@@ -279,7 +280,7 @@ pub(crate) async fn resolve_local_same_format_provider_candidate_payload_parts(
         .unwrap_or_default();
     let Some(provider_request_headers) =
         build_same_format_provider_headers(SameFormatProviderHeadersInput {
-            headers: &parts.headers,
+            headers: effective_headers,
             provider_request_body: &provider_request_body,
             original_request_body: body_json,
             header_rules: prepared.transport.endpoint.header_rules.as_ref(),
