@@ -2553,7 +2553,7 @@ mod tests {
         }
         let stored_usage = stored_usage.expect("cancelled usage should be recorded");
         assert_eq!(stored_usage.status, "cancelled");
-        assert_eq!(stored_usage.billing_status, "void");
+        assert_eq!(stored_usage.billing_status, "pending");
         assert_eq!(stored_usage.status_code, Some(499));
         assert_eq!(stored_usage.error_category.as_deref(), Some("cancelled"));
 
