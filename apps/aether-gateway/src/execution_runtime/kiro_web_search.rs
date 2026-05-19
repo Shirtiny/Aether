@@ -14,6 +14,11 @@ use serde_json::{json, Value};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
+use crate::execution_runtime::kiro_cache::{
+    billed_input_tokens, build_kiro_prompt_cache_profile, estimate_kiro_prompt_input_tokens,
+    kiro_prompt_cache_tracker, kiro_simulated_cache_enabled_from_provider_config,
+    KiroPromptCacheProfile, KiroPromptCacheUsage,
+};
 use crate::execution_runtime::ndjson::encode_stream_frame_ndjson;
 use crate::execution_runtime::transport::{
     DirectSyncExecutionRuntime, ExecutionRuntimeTransportError,
@@ -34,6 +39,7 @@ struct KiroWebSearchRequest {
     query: String,
     model: String,
     input_tokens: u64,
+    cache_profile: Option<KiroPromptCacheProfile>,
 }
 
 #[derive(Debug, Serialize)]
@@ -153,12 +159,25 @@ pub(crate) async fn maybe_execute_kiro_web_search_stream(
     }
 
     let search_results = parse_mcp_search_results(&mcp_execution.result);
+    let cache_usage = if kiro_simulated_cache_enabled(state, plan).await {
+        request
+            .cache_profile
+            .as_ref()
+            .map(|profile| {
+                kiro_prompt_cache_tracker()
+                    .compute_and_update(kiro_cache_credential_id(plan), profile)
+            })
+            .unwrap_or_default()
+    } else {
+        KiroPromptCacheUsage::default()
+    };
     let sse_body = build_web_search_sse_body(
         request.model.as_str(),
         request.query.as_str(),
         tool_use_id.as_str(),
         search_results,
         request.input_tokens,
+        cache_usage,
     )
     .map_err(ExecutionRuntimeTransportError::BodyEncode)?;
     let mut synthetic_context = synthetic_report_context(report_context, mcp_execution.url);
@@ -170,6 +189,40 @@ pub(crate) async fn maybe_execute_kiro_web_search_stream(
         frame_stream: sse_frame_stream(Bytes::from(sse_body)),
         report_context: synthetic_context,
     }))
+}
+
+async fn kiro_simulated_cache_enabled(state: &AppState, plan: &ExecutionPlan) -> bool {
+    if !plan
+        .provider_name
+        .as_deref()
+        .is_some_and(|provider_name| provider_name.eq_ignore_ascii_case("Kiro"))
+    {
+        return false;
+    }
+
+    match state
+        .read_provider_catalog_providers_by_ids(std::slice::from_ref(&plan.provider_id))
+        .await
+    {
+        Ok(providers) => providers
+            .iter()
+            .find(|provider| provider.id == plan.provider_id)
+            .filter(|provider| provider.provider_type.eq_ignore_ascii_case("kiro"))
+            .is_some_and(|provider| {
+                kiro_simulated_cache_enabled_from_provider_config(provider.config.as_ref())
+            }),
+        Err(err) => {
+            warn!(
+                event_name = "kiro_simulated_cache_config_read_failed",
+                log_type = "event",
+                request_id = %plan.request_id,
+                provider_id = %plan.provider_id,
+                error = ?err,
+                "failed to read Kiro simulated cache provider config; defaulting disabled"
+            );
+            false
+        }
+    }
 }
 
 fn execute_result_body_bytes(result: &ExecutionResult) -> Vec<u8> {
@@ -740,10 +793,12 @@ fn detect_kiro_web_search_request(
                 .or(plan.model_name.as_deref())
                 .unwrap_or("claude")
                 .to_string();
+            let input_tokens = estimate_input_tokens(original);
             return Some(KiroWebSearchRequest {
                 query,
                 model,
-                input_tokens: estimate_input_tokens(original),
+                input_tokens,
+                cache_profile: build_kiro_prompt_cache_profile(original, input_tokens),
             });
         }
     }
@@ -791,6 +846,7 @@ fn detect_kiro_web_search_from_envelope(plan: &ExecutionPlan) -> Option<KiroWebS
         query,
         model,
         input_tokens: estimate_input_tokens(body),
+        cache_profile: None,
     })
 }
 
@@ -823,8 +879,14 @@ fn has_only_builtin_web_search_tool(body: &Value) -> bool {
 }
 
 fn extract_search_query_from_claude_request(body: &Value) -> Option<String> {
-    let first_message = body.get("messages")?.as_array()?.first()?;
-    let text = extract_text_content(first_message.get("content")?)?;
+    let messages = body.get("messages")?.as_array()?;
+    let last_user_message = messages.iter().rev().find(|message| {
+        message
+            .get("role")
+            .and_then(Value::as_str)
+            .is_some_and(|role| role.eq_ignore_ascii_case("user"))
+    })?;
+    let text = extract_text_content(last_user_message.get("content")?)?;
     strip_search_query_prefix(text.as_str())
 }
 
@@ -855,10 +917,7 @@ fn strip_search_query_prefix(text: &str) -> Option<String> {
 }
 
 fn estimate_input_tokens(body: &Value) -> u64 {
-    let size = serde_json::to_string(body)
-        .map(|body| body.len() as u64)
-        .unwrap_or_default();
-    (size / 4).max(1)
+    estimate_kiro_prompt_input_tokens(body)
 }
 
 fn create_mcp_request(query: &str) -> (String, McpRequest) {
@@ -929,14 +988,26 @@ fn execution_result_body_json(result: &ExecutionResult) -> Option<Value> {
     serde_json::from_slice(&bytes).ok()
 }
 
+fn kiro_cache_credential_id(plan: &ExecutionPlan) -> String {
+    format!("{}:{}:{}", plan.provider_id, plan.endpoint_id, plan.key_id)
+}
+
 fn build_web_search_sse_body(
     model: &str,
     query: &str,
     tool_use_id: &str,
     search_results: Option<WebSearchResults>,
     input_tokens: u64,
+    cache_usage: KiroPromptCacheUsage,
 ) -> Result<Vec<u8>, serde_json::Error> {
-    let events = build_web_search_events(model, query, tool_use_id, search_results, input_tokens);
+    let events = build_web_search_events(
+        model,
+        query,
+        tool_use_id,
+        search_results,
+        input_tokens,
+        cache_usage,
+    );
     crate::ai_serving::api::encode_kiro_sse_events(events)
 }
 
@@ -946,7 +1017,9 @@ fn build_web_search_events(
     tool_use_id: &str,
     search_results: Option<WebSearchResults>,
     input_tokens: u64,
+    cache_usage: KiroPromptCacheUsage,
 ) -> Vec<Value> {
+    let billed_input = billed_input_tokens(input_tokens, cache_usage);
     let message_id = format!("msg_{}", &Uuid::new_v4().simple().to_string()[..24]);
     let mut events = vec![
         json!({
@@ -960,10 +1033,10 @@ fn build_web_search_events(
                 "stop_reason": Value::Null,
                 "stop_sequence": Value::Null,
                 "usage": {
-                    "input_tokens": input_tokens,
+                    "input_tokens": billed_input,
                     "output_tokens": 0,
-                    "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0
+                    "cache_creation_input_tokens": cache_usage.cache_creation_input_tokens,
+                    "cache_read_input_tokens": cache_usage.cache_read_input_tokens
                 }
             }
         }),
@@ -1046,8 +1119,10 @@ fn build_web_search_events(
                 "stop_sequence": Value::Null
             },
             "usage": {
-                "input_tokens": input_tokens,
+                "input_tokens": billed_input,
                 "output_tokens": estimate_text_tokens(summary.as_str()),
+                "cache_creation_input_tokens": cache_usage.cache_creation_input_tokens,
+                "cache_read_input_tokens": cache_usage.cache_read_input_tokens,
                 "server_tool_use": {
                     "web_search_requests": 1
                 }
@@ -1178,7 +1253,7 @@ mod tests {
 
     use super::{
         build_mcp_headers_from_plan, build_web_search_sse_body, detect_kiro_web_search_request,
-        parse_mcp_search_results, strip_search_query_prefix,
+        parse_mcp_search_results, strip_search_query_prefix, KiroPromptCacheUsage,
     };
 
     fn sample_plan(body: serde_json::Value) -> ExecutionPlan {
@@ -1234,13 +1309,26 @@ mod tests {
             "client_api_format": "claude:messages",
             "original_request_body": {
                 "model": "claude-haiku-4-5-20251001",
-                "messages": [{
-                    "role": "user",
-                    "content": [{
-                        "type": "text",
-                        "text": "Perform a web search for the query: Shanghai weather today"
-                    }]
-                }],
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [{
+                            "type": "text",
+                            "text": "Perform a web search for the query: Old query"
+                        }]
+                    },
+                    {
+                        "role": "assistant",
+                        "content": "Earlier answer"
+                    },
+                    {
+                        "role": "user",
+                        "content": [{
+                            "type": "text",
+                            "text": "Perform a web search for the query: Shanghai weather today"
+                        }]
+                    }
+                ],
                 "tools": [{
                     "type": "web_search_20250305",
                     "name": "web_search",
@@ -1389,11 +1477,33 @@ mod tests {
             "srvtoolu_123",
             None,
             12,
+            KiroPromptCacheUsage::default(),
         )
         .expect("sse should encode");
         let text = String::from_utf8(sse).expect("sse should be utf8");
         assert!(text.contains("\"type\":\"server_tool_use\""));
         assert!(text.contains("\"type\":\"web_search_tool_result\""));
         assert!(text.contains("\"web_search_requests\":1"));
+    }
+
+    #[test]
+    fn web_search_sse_includes_cache_usage_in_start_and_delta() {
+        let sse = build_web_search_sse_body(
+            "claude-sonnet-4.6",
+            "Shanghai weather",
+            "srvtoolu_123",
+            None,
+            30,
+            KiroPromptCacheUsage {
+                cache_creation_input_tokens: 7,
+                cache_read_input_tokens: 9,
+            },
+        )
+        .expect("sse should encode");
+        let text = String::from_utf8(sse).expect("sse should be utf8");
+
+        assert_eq!(text.matches("\"cache_creation_input_tokens\":7").count(), 2);
+        assert_eq!(text.matches("\"cache_read_input_tokens\":9").count(), 2);
+        assert_eq!(text.matches("\"input_tokens\":14").count(), 2);
     }
 }

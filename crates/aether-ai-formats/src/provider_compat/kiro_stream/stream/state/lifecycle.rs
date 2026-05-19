@@ -5,6 +5,7 @@ use crate::formats::shared::model_directives::model_directive_display_model_from
 use crate::formats::shared::AiSurfaceFinalizeError;
 use crate::provider_compat::kiro_stream::{
     build_kiro_initial_sse_events, build_kiro_stream_error_sse_events, encode_kiro_sse_events,
+    KiroStreamCacheUsage,
 };
 
 use super::super::{EventStreamDecoder, KiroClaudeStreamState, KiroToClaudeCliStreamState};
@@ -97,10 +98,26 @@ impl KiroClaudeStreamState {
             .and_then(Value::as_u64)
             .map(|value| value as usize)
             .unwrap_or(0);
+        let cache_creation_input_tokens = report_context
+            .get("cache_creation_input_tokens")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize)
+            .unwrap_or(0);
+        let cache_read_input_tokens = report_context
+            .get("cache_read_input_tokens")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize)
+            .unwrap_or(0);
+        let cache_usage = (cache_creation_input_tokens > 0 || cache_read_input_tokens > 0)
+            .then_some(KiroStreamCacheUsage {
+                cache_creation_input_tokens,
+                cache_read_input_tokens,
+            });
         Self {
             model,
             thinking_enabled,
             estimated_input_tokens,
+            cache_usage,
             message_id: format!("msg_{}", Uuid::new_v4().simple()),
             ..Self::default()
         }
@@ -111,6 +128,7 @@ impl KiroClaudeStreamState {
             &self.message_id,
             &self.model,
             self.estimated_input_tokens,
+            self.cache_usage,
         );
         let mut events = events;
         if !self.thinking_enabled {

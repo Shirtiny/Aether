@@ -275,6 +275,22 @@
           />
         </div>
 
+        <div
+          v-if="form.provider_type === 'kiro'"
+          class="flex items-center justify-between p-3 border rounded-lg bg-muted/50"
+        >
+          <div class="space-y-0.5">
+            <span class="text-sm font-medium">模拟缓存模式</span>
+            <p class="text-xs text-muted-foreground leading-relaxed">
+              启用后仅对 Kiro 请求模拟 prompt cache 读写计量。
+            </p>
+          </div>
+          <Switch
+            :model-value="form.kiro_simulated_cache_enabled"
+            @update:model-value="(v: boolean) => form.kiro_simulated_cache_enabled = v"
+          />
+        </div>
+
         <div class="flex items-center justify-between gap-4 p-3 border rounded-lg bg-muted/50">
           <div class="space-y-0.5">
             <span class="text-sm font-medium">敏感信息保护</span>
@@ -383,6 +399,8 @@ const form = ref({
   request_timeout: undefined as number | undefined,
   // 号池模式
   pool_mode_enabled: false,
+  // Kiro 专属配置
+  kiro_simulated_cache_enabled: false,
 })
 
 // 重置表单
@@ -409,6 +427,8 @@ function resetForm() {
     request_timeout: undefined,
     // 号池模式
     pool_mode_enabled: false,
+    // Kiro 专属配置
+    kiro_simulated_cache_enabled: false,
   }
 }
 
@@ -439,6 +459,8 @@ function loadProviderData() {
     request_timeout: props.provider.request_timeout ?? undefined,
     // 号池模式
     pool_mode_enabled: poolAdvanced !== null,
+    // Kiro 专属配置
+    kiro_simulated_cache_enabled: props.provider.kiro_simulated_cache_enabled ?? false,
   }
 }
 
@@ -456,6 +478,9 @@ const { isEditMode, handleDialogUpdate, handleCancel } = useFormDialog({
 watch(() => form.value.provider_type, () => {
   if (!isEditMode.value) {
     form.value.pool_mode_enabled = false
+  }
+  if (form.value.provider_type !== 'kiro') {
+    form.value.kiro_simulated_cache_enabled = false
   }
 })
 
@@ -506,6 +531,15 @@ const handleSubmit = async () => {
       pool_advanced: form.value.pool_mode_enabled
         ? (currentPoolAdvanced ?? {})
         : null,
+      ...(form.value.provider_type === 'kiro'
+        ? {
+            config: {
+              kiro: {
+                simulated_cache_enabled: form.value.kiro_simulated_cache_enabled,
+              },
+            },
+          }
+        : {}),
     }
 
     if (isEditMode.value && props.provider) {

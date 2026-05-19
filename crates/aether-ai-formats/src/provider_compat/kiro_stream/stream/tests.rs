@@ -113,6 +113,84 @@ fn kiro_stream_rewriter_restores_model_directive_display_model() {
 }
 
 #[test]
+fn kiro_stream_rewriter_emits_cache_usage_from_report_context() {
+    let report_context = json!({
+        "provider_api_format": "claude:messages",
+        "client_api_format": "claude:messages",
+        "envelope_name": "kiro:generateAssistantResponse",
+        "mapped_model": "claude-sonnet-4.5",
+        "input_tokens": 100,
+        "cache_creation_input_tokens": 25,
+        "cache_read_input_tokens": 40
+    });
+    let mut rewriter = KiroToClaudeCliStreamState::new(&report_context);
+    let first = rewriter
+        .push_chunk(
+            &report_context,
+            &encode_event_frame(
+                "event",
+                Some("assistantResponseEvent"),
+                &json!({"content": "Hello"}),
+            ),
+        )
+        .expect("rewrite should succeed");
+    let rest = rewriter
+        .finish(&report_context)
+        .expect("finish should succeed");
+    let text = String::from_utf8([first, rest].concat()).expect("utf8 should decode");
+
+    assert_eq!(text.matches("\"input_tokens\":35").count(), 2);
+    assert_eq!(
+        text.matches("\"cache_creation_input_tokens\":25").count(),
+        2
+    );
+    assert_eq!(text.matches("\"cache_read_input_tokens\":40").count(), 2);
+}
+
+#[test]
+fn kiro_stream_rewriter_keeps_estimated_input_when_context_usage_is_cache_only() {
+    let report_context = json!({
+        "provider_api_format": "claude:messages",
+        "client_api_format": "claude:messages",
+        "envelope_name": "kiro:generateAssistantResponse",
+        "mapped_model": "claude-sonnet-4.5",
+        "input_tokens": 24_344,
+        "cache_creation_input_tokens": 293,
+        "cache_read_input_tokens": 23_935
+    });
+    let mut rewriter = KiroToClaudeCliStreamState::new(&report_context);
+    let chunk = [
+        encode_event_frame(
+            "event",
+            Some("assistantResponseEvent"),
+            &json!({"content": "Hello"}),
+        ),
+        encode_event_frame(
+            "event",
+            Some("contextUsageEvent"),
+            &json!({"contextUsagePercentage": 12.114}),
+        ),
+    ]
+    .concat();
+
+    let first = rewriter
+        .push_chunk(&report_context, &chunk)
+        .expect("rewrite should succeed");
+    let rest = rewriter
+        .finish(&report_context)
+        .expect("finish should succeed");
+    let text = String::from_utf8([first, rest].concat()).expect("utf8 should decode");
+
+    assert_eq!(text.matches("\"input_tokens\":116").count(), 2);
+    assert!(!text.contains("\"input_tokens\":0"));
+    assert_eq!(
+        text.matches("\"cache_creation_input_tokens\":293").count(),
+        2
+    );
+    assert_eq!(text.matches("\"cache_read_input_tokens\":23935").count(), 2);
+}
+
+#[test]
 fn kiro_stream_rewriter_converts_tool_use_to_claude_events() {
     let report_context = kiro_report_context(false);
     let mut rewriter = KiroToClaudeCliStreamState::new(&report_context);

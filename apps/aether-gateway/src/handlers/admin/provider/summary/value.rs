@@ -132,6 +132,12 @@ pub(crate) fn build_admin_provider_summary_value(
         .and_then(|cfg| cfg.get("architecture_id"))
         .and_then(serde_json::Value::as_str)
         .map(ToOwned::to_owned);
+    let kiro_simulated_cache_enabled = config
+        .and_then(|cfg| cfg.get("kiro"))
+        .and_then(serde_json::Value::as_object)
+        .and_then(|cfg| cfg.get("simulated_cache_enabled"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
     let billing_type = quota_snapshot
         .map(|quota| quota.billing_type.clone())
         .or_else(|| provider.billing_type.clone());
@@ -190,6 +196,7 @@ pub(crate) fn build_admin_provider_summary_value(
         "endpoint_health_details": endpoint_health_details,
         "ops_configured": ops_configured,
         "ops_architecture_id": ops_architecture_id,
+        "kiro_simulated_cache_enabled": kiro_simulated_cache_enabled,
         "created_at": endpoint_timestamp_or_now(provider.created_at_unix_ms, now_unix_secs),
         "updated_at": endpoint_timestamp_or_now(provider.updated_at_unix_secs, now_unix_secs),
     })

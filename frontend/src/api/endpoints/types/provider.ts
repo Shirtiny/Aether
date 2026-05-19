@@ -684,6 +684,7 @@ export interface ProviderWithEndpointsSummary {
   failover_rules?: FailoverRulesConfig | null
   ops_configured: boolean  // 是否配置了扩展操作（余额监控等）
   ops_architecture_id?: string  // 扩展操作使用的架构 ID（如 cubence, anyrouter）
+  kiro_simulated_cache_enabled?: boolean
   created_at: string
   updated_at: string
 }

@@ -24,6 +24,8 @@ INSERT INTO "usage" (
   input_tokens,
   output_tokens,
   total_tokens,
+  input_output_total_tokens,
+  input_context_tokens,
   cache_creation_input_tokens,
   cache_creation_input_tokens_5m,
   cache_creation_input_tokens_1h,
@@ -87,7 +89,28 @@ INSERT INTO "usage" (
   ),
   COALESCE($22, 0),
   COALESCE($23, 0),
-  COALESCE($24, COALESCE($22, 0) + COALESCE($23, 0)),
+  COALESCE(
+    $24,
+    COALESCE($22, 0)
+      + COALESCE($23, 0)
+      + COALESCE(
+        NULLIF(COALESCE($25, 0), 0),
+        COALESCE($26, 0) + COALESCE($27, 0),
+        0
+      )
+      + COALESCE($28, 0)
+  ),
+  COALESCE($22, 0) + COALESCE($23, 0),
+  COALESCE(
+    COALESCE($22, 0)
+      + COALESCE(
+        NULLIF(COALESCE($25, 0), 0),
+        COALESCE($26, 0) + COALESCE($27, 0),
+        0
+      )
+      + COALESCE($28, 0),
+    0
+  ),
   COALESCE($25, 0),
   COALESCE($26, 0),
   COALESCE($27, 0),
@@ -148,6 +171,8 @@ DO UPDATE SET
   input_tokens = CASE WHEN "usage".billing_status = 'pending' AND EXCLUDED.status IN ('completed', 'failed', 'cancelled') THEN GREATEST("usage".input_tokens, EXCLUDED.input_tokens) ELSE "usage".input_tokens END,
   output_tokens = CASE WHEN "usage".billing_status = 'pending' AND EXCLUDED.status IN ('completed', 'failed', 'cancelled') THEN GREATEST("usage".output_tokens, EXCLUDED.output_tokens) ELSE "usage".output_tokens END,
   total_tokens = CASE WHEN "usage".billing_status = 'pending' AND EXCLUDED.status IN ('completed', 'failed', 'cancelled') THEN GREATEST("usage".total_tokens, EXCLUDED.total_tokens) ELSE "usage".total_tokens END,
+  input_output_total_tokens = CASE WHEN "usage".billing_status = 'pending' AND EXCLUDED.status IN ('completed', 'failed', 'cancelled') THEN GREATEST("usage".input_output_total_tokens, EXCLUDED.input_output_total_tokens) ELSE "usage".input_output_total_tokens END,
+  input_context_tokens = CASE WHEN "usage".billing_status = 'pending' AND EXCLUDED.status IN ('completed', 'failed', 'cancelled') THEN GREATEST("usage".input_context_tokens, EXCLUDED.input_context_tokens) ELSE "usage".input_context_tokens END,
   cache_creation_input_tokens = CASE WHEN "usage".billing_status = 'pending' AND EXCLUDED.status IN ('completed', 'failed', 'cancelled') THEN GREATEST("usage".cache_creation_input_tokens, EXCLUDED.cache_creation_input_tokens) ELSE "usage".cache_creation_input_tokens END,
   cache_creation_input_tokens_5m = CASE WHEN "usage".billing_status = 'pending' AND EXCLUDED.status IN ('completed', 'failed', 'cancelled') THEN GREATEST("usage".cache_creation_input_tokens_5m, EXCLUDED.cache_creation_input_tokens_5m) ELSE "usage".cache_creation_input_tokens_5m END,
   cache_creation_input_tokens_1h = CASE WHEN "usage".billing_status = 'pending' AND EXCLUDED.status IN ('completed', 'failed', 'cancelled') THEN GREATEST("usage".cache_creation_input_tokens_1h, EXCLUDED.cache_creation_input_tokens_1h) ELSE "usage".cache_creation_input_tokens_1h END,
