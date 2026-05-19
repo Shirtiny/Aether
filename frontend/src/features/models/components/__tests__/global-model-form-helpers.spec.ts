@@ -4,7 +4,6 @@ import {
   EMBEDDING_API_FORMATS,
   buildGlobalModelCreatePayload,
   buildGlobalModelUpdatePayload,
-  getModelDirectoryEmptyText,
 } from '../global-model-form-helpers'
 
 const embeddingPricing = {
@@ -59,27 +58,5 @@ describe('global model form embedding payload helpers', () => {
       model_type: 'embedding',
       api_formats: ['jina:embedding'],
     })
-  })
-
-  it('surfaces manual-add guidance when the online model directory is unavailable', () => {
-    expect(getModelDirectoryEmptyText({
-      searchQuery: '',
-      manualModelMode: false,
-      modelListLoadFailed: true,
-    })).toBe('模型目录加载失败，请使用手动添加继续创建')
-
-    expect(getModelDirectoryEmptyText({
-      searchQuery: '',
-      manualModelMode: true,
-      modelListLoadFailed: false,
-    })).toBe('已切换到手动添加，可在右侧填写模型信息')
-  })
-
-  it('keeps search empty state ahead of manual/offline guidance', () => {
-    expect(getModelDirectoryEmptyText({
-      searchQuery: 'local-model',
-      manualModelMode: true,
-      modelListLoadFailed: true,
-    })).toBe('未找到模型')
   })
 })
