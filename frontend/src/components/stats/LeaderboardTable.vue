@@ -1,26 +1,28 @@
 <template>
   <TableCard :title="title">
     <template #actions>
-      <Select
-        v-if="showMetricSelect"
-        :model-value="metric"
-        @update:model-value="emitMetric"
-      >
-        <SelectTrigger class="h-8 text-xs w-28">
-          <SelectValue placeholder="指标" />
-        </SelectTrigger>
-        <SelectContent>
-          <SelectItem value="requests">
-            请求数
-          </SelectItem>
-          <SelectItem value="tokens">
-            Tokens
-          </SelectItem>
-          <SelectItem value="cost">
-            成本
-          </SelectItem>
-        </SelectContent>
-      </Select>
+      <slot name="actions">
+        <Select
+          v-if="showMetricSelect"
+          :model-value="metric"
+          @update:model-value="emitMetric"
+        >
+          <SelectTrigger class="h-8 text-xs w-28">
+            <SelectValue placeholder="指标" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="requests">
+              请求数
+            </SelectItem>
+            <SelectItem value="tokens">
+              Tokens
+            </SelectItem>
+            <SelectItem value="cost">
+              成本
+            </SelectItem>
+          </SelectContent>
+        </Select>
+      </slot>
     </template>
 
     <div
@@ -77,6 +79,8 @@
         </TableRow>
       </TableBody>
     </Table>
+
+    <slot name="pagination" />
   </TableCard>
 </template>
 

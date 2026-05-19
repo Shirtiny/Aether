@@ -7,23 +7,12 @@
         <SelectValue placeholder="选择时间段" />
       </SelectTrigger>
       <SelectContent :searchable="false">
-        <SelectItem value="today">
-          今天
-        </SelectItem>
-        <SelectItem value="yesterday">
-          昨天
-        </SelectItem>
-        <SelectItem value="last7days">
-          最近7天
-        </SelectItem>
-        <SelectItem value="last30days">
-          最近30天
-        </SelectItem>
-        <SelectItem value="last90days">
-          最近90天
-        </SelectItem>
-        <SelectItem value="custom">
-          自定义
+        <SelectItem
+          v-for="preset in activePresetOptions"
+          :key="preset"
+          :value="preset"
+        >
+          {{ presetLabels[preset] }}
         </SelectItem>
       </SelectContent>
     </Select>
@@ -85,27 +74,51 @@ import {
 } from '@/components/ui'
 import type { DateRangeParams } from '@/features/usage/types'
 
-const props = defineProps<{
+const selectablePresets = ['today', 'yesterday', 'last7days', 'last30days', 'last90days', 'custom'] as const
+type SelectablePreset = typeof selectablePresets[number]
+
+const presetLabels: Record<SelectablePreset, string> = {
+  today: '今天',
+  yesterday: '昨天',
+  last7days: '最近7天',
+  last30days: '最近30天',
+  last90days: '最近90天',
+  custom: '自定义'
+}
+
+const props = withDefaults(defineProps<{
   modelValue: DateRangeParams
   showGranularity?: boolean
   allowHourly?: boolean
-}>()
+  presetOptions?: SelectablePreset[]
+}>(), {
+  presetOptions: () => ['today', 'yesterday', 'last7days', 'last30days', 'last90days', 'custom']
+})
 
 const emit = defineEmits<{
   'update:modelValue': [value: DateRangeParams]
 }>()
 
-const selectablePresets = ['today', 'yesterday', 'last7days', 'last30days', 'last90days', 'custom'] as const
-type SelectablePreset = typeof selectablePresets[number]
+const activePresetOptions = computed<SelectablePreset[]>(() => {
+  const unique = new Set(props.presetOptions)
+  const filtered = selectablePresets.filter((preset) => unique.has(preset))
+  return filtered.length > 0 ? filtered : [...selectablePresets]
+})
+
+function defaultPreset(): SelectablePreset {
+  const options = activePresetOptions.value
+  if (options.includes('last7days')) return 'last7days'
+  return options[0] ?? 'last7days'
+}
 
 function normalizePreset(value: DateRangeParams): SelectablePreset {
-  if (value.preset && selectablePresets.includes(value.preset as SelectablePreset)) {
+  if (value.preset && activePresetOptions.value.includes(value.preset as SelectablePreset)) {
     return value.preset as SelectablePreset
   }
-  if (!value.preset && (value.start_date || value.end_date)) {
+  if (!value.preset && (value.start_date || value.end_date) && activePresetOptions.value.includes('custom')) {
     return 'custom'
   }
-  return 'last7days'
+  return defaultPreset()
 }
 
 const selectedPreset = ref<SelectablePreset>(normalizePreset(props.modelValue))
@@ -167,6 +180,12 @@ watch(() => props.modelValue, (value) => {
   // 同步更新 lastEmittedValue，避免外部设置值后触发重复 emit
   lastEmittedValue = getValueKey(value)
 }, { deep: true })
+
+watch(activePresetOptions, () => {
+  if (!activePresetOptions.value.includes(selectedPreset.value)) {
+    selectedPreset.value = normalizePreset(props.modelValue)
+  }
+})
 
 watch([selectedPreset, startDate, endDate, selectedGranularity], () => {
   if (!allowHourly.value || !canUseHourly.value) {
