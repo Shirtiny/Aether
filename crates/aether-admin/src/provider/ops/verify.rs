@@ -379,18 +379,9 @@ pub fn admin_provider_ops_verify_headers(
         }
         "new_api" => {
             for (name, value) in [
-                (
-                    "User-Agent",
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.7339.249 Electron/38.7.0 Safari/537.36",
-                ),
+                ("User-Agent", "cc-switch/1.0"),
+                ("Content-Type", "application/json"),
                 ("Accept", "application/json"),
-                ("Accept-Language", "zh-CN"),
-                ("sec-ch-ua", "\"Not=A?Brand\";v=\"24\", \"Chromium\";v=\"140\""),
-                ("sec-ch-ua-mobile", "?0"),
-                ("sec-ch-ua-platform", "\"macOS\""),
-                ("Sec-Fetch-Site", "cross-site"),
-                ("Sec-Fetch-Mode", "cors"),
-                ("Sec-Fetch-Dest", "empty"),
             ] {
                 insert_header(&mut headers, name, value)?;
             }

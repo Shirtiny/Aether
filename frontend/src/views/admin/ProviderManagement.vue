@@ -295,6 +295,7 @@
   <ProviderAuthDialog
     v-model:open="opsConfigDialogOpen"
     :provider-id="opsConfigProviderId"
+    :provider-name="opsConfigProviderName"
     :provider-website="opsConfigProviderWebsite"
     @saved="handleOpsConfigSaved"
   />
@@ -325,6 +326,7 @@ import { useProviderBalance } from '@/features/providers/composables/useProvider
 import {
   getProvidersSummary,
   getProvider,
+  getProviderEndpoints,
   deleteProvider,
   getProviderDeleteTask,
   updateProvider,
@@ -517,6 +519,7 @@ const {
 // 扩展操作配置对话框
 const opsConfigDialogOpen = ref(false)
 const opsConfigProviderId = ref('')
+const opsConfigProviderName = ref('')
 const opsConfigProviderWebsite = ref('')
 
 // 内联编辑备注
@@ -707,10 +710,21 @@ async function openEditProviderDialog(provider: ProviderWithEndpointsSummary) {
 }
 
 // 打开扩展操作配置对话框
-function openOpsConfigDialog(provider: ProviderWithEndpointsSummary) {
+async function openOpsConfigDialog(provider: ProviderWithEndpointsSummary) {
   opsConfigProviderId.value = provider.id
+  opsConfigProviderName.value = provider.name
   opsConfigProviderWebsite.value = provider.website || ''
   opsConfigDialogOpen.value = true
+  if (!opsConfigProviderWebsite.value) {
+    try {
+      const endpoints = await getProviderEndpoints(provider.id)
+      if (opsConfigProviderId.value !== provider.id || opsConfigProviderWebsite.value) return
+      const endpoint = endpoints.find(item => item.is_active) || endpoints[0]
+      opsConfigProviderWebsite.value = endpoint?.base_url || ''
+    } catch {
+      // 保持空地址，弹窗内仍可手动填写。
+    }
+  }
 }
 
 // 扩展操作配置保存回调

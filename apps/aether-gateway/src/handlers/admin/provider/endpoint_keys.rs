@@ -1,3 +1,4 @@
+mod balance;
 mod mutations;
 mod quota;
 mod reads;
@@ -15,6 +16,10 @@ pub(crate) async fn maybe_build_local_admin_endpoints_keys_response(
     request_body: Option<&Bytes>,
 ) -> Result<Option<Response<Body>>, GatewayError> {
     if let Some(response) = reads::maybe_handle(state, request_context, request_body).await? {
+        return Ok(Some(response));
+    }
+
+    if let Some(response) = balance::maybe_handle(state, request_context, request_body).await? {
         return Ok(Some(response));
     }
 
