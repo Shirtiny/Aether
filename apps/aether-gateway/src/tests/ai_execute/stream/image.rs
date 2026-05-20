@@ -1102,7 +1102,10 @@ async fn gateway_routes_openai_responses_stream_image_intent_to_openai_image_pla
     );
     assert_eq!(seen_plan.client_api_format, "openai:responses");
     assert_eq!(seen_plan.provider_api_format, "openai:image");
-    assert_eq!(seen_plan.url, "https://images.example.com/v1/responses");
+    assert_eq!(
+        seen_plan.url,
+        "https://images.example.com/v1/images/generations"
+    );
     assert!(seen_plan.plan_stream);
     assert_eq!(seen_plan.auth_header, "Bearer sk-upstream-image-bridge");
     assert_eq!(seen_plan.body_json["stream"], true);

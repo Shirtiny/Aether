@@ -356,6 +356,7 @@ pub fn build_openai_chat_usage_chunk(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn build_openai_chat_usage_chunk_with_cache(
     id: &str,
     model: &str,

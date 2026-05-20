@@ -1191,10 +1191,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        build_chatgpt_web_image_request_body, build_openai_image_provider_request_body,
-        is_openai_image_stream_request, normalize_openai_image_request,
-        normalize_openai_image_request_with_options, openai_image_operation_from_path,
-        OpenAiImageNormalizeOptions, OpenAiImageOperation,
+        build_chatgpt_web_image_request_body, build_openai_image_api_provider_request_body,
+        build_openai_image_provider_request_body, is_openai_image_stream_request,
+        normalize_openai_image_request, normalize_openai_image_request_with_options,
+        openai_image_operation_from_path, OpenAiImageNormalizeOptions, OpenAiImageOperation,
     };
     use crate::formats::openai::image::spec::{resolve_stream_spec, resolve_sync_spec};
     use crate::formats::openai::responses::codex::{

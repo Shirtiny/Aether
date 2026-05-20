@@ -1516,12 +1516,11 @@ fn provider_query_standard_execution_response_body(
     provider_api_format: &str,
     result: &aether_contracts::ExecutionResult,
 ) -> Option<Value> {
-    let body = provider_query_execution_json_body(result)
-        .or_else(|| {
-            provider_query_decode_execution_body(result).and_then(|body| {
-                provider_query_aggregate_standard_stream_sync_response(provider_api_format, &body)
-            })
-        })?;
+    let body = provider_query_execution_json_body(result).or_else(|| {
+        provider_query_decode_execution_body(result).and_then(|body| {
+            provider_query_aggregate_standard_stream_sync_response(provider_api_format, &body)
+        })
+    })?;
     if result.status_code < 400
         && provider_query_normalize_api_format_alias(provider_api_format)
             == "gemini:generate_content"

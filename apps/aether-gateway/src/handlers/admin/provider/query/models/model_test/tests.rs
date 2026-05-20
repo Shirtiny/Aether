@@ -100,9 +100,8 @@ fn provider_query_execution_json_body_decodes_stream_encoded_json_response() {
             "url": "https://example.test/image.png"
         }]
     });
-    let encoded_body = base64::engine::general_purpose::STANDARD.encode(
-        serde_json::to_vec(&body).expect("test body should serialize"),
-    );
+    let encoded_body = base64::engine::general_purpose::STANDARD
+        .encode(serde_json::to_vec(&body).expect("test body should serialize"));
     let result = aether_contracts::ExecutionResult {
         request_id: "request-1".to_string(),
         candidate_id: None,
@@ -119,7 +118,10 @@ fn provider_query_execution_json_body_decodes_stream_encoded_json_response() {
         error: None,
     };
 
-    assert_eq!(provider_query_execution_json_body(&result), Some(body.clone()));
+    assert_eq!(
+        provider_query_execution_json_body(&result),
+        Some(body.clone())
+    );
     assert_eq!(
         provider_query_standard_execution_response_body("openai:image", &result),
         Some(body)

@@ -1338,13 +1338,14 @@ mod tests {
         let output = utf8(outcome.sse_body);
         assert!(output.contains("event: message_start"));
         assert!(output.contains("event: message_stop"));
+        assert!(output.contains("\"stop_reason\":\"end_turn\""));
         assert!(!output.contains("status_code"));
         assert_eq!(
             outcome
                 .terminal_summary
                 .as_ref()
                 .and_then(|summary| summary.finish_reason.as_deref()),
-            Some("end_turn")
+            Some("stop")
         );
     }
 
