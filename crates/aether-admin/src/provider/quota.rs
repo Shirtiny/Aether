@@ -38,6 +38,32 @@ fn oauth_reason_has_tag(reason: Option<&str>, tag: &str) -> bool {
         })
 }
 
+fn oauth_refresh_failure_is_terminal(reason: Option<&str>) -> bool {
+    reason
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some_and(|reason| {
+            reason
+                .lines()
+                .map(str::trim)
+                .filter(|line| line.starts_with(OAUTH_REFRESH_FAILED_PREFIX))
+                .any(|line| {
+                    let lowered = line.to_ascii_lowercase();
+                    lowered.contains("invalid_grant")
+                        || lowered.contains("invalid_refresh_token")
+                        || lowered.contains("refresh_token_expired")
+                        || lowered.contains("could not validate your refresh token")
+                        || lowered.contains("refresh_token 无效")
+                        || lowered.contains("已过期或已撤销")
+                        || lowered.contains("已被使用并轮换")
+                        || (lowered.contains("refresh token")
+                            && ["expired", "revoked", "invalid", "reused"]
+                                .iter()
+                                .any(|keyword| lowered.contains(keyword)))
+                })
+        })
+}
+
 fn oauth_access_token_expired(key: &StoredProviderCatalogKey, now_unix_secs: u64) -> bool {
     let now_unix_secs = if now_unix_secs == 0 {
         std::time::SystemTime::now()
@@ -55,6 +81,7 @@ fn oauth_access_token_expired(key: &StoredProviderCatalogKey, now_unix_secs: u64
 pub fn should_auto_remove_oauth_invalid_key(
     key: &StoredProviderCatalogKey,
     candidate_reason: Option<&str>,
+    access_token_invalid_proven: bool,
     now_unix_secs: u64,
 ) -> bool {
     if should_auto_remove_structured_reason(candidate_reason)
@@ -71,8 +98,13 @@ pub fn should_auto_remove_oauth_invalid_key(
     if !refresh_token_failed {
         return false;
     }
+    if !oauth_refresh_failure_is_terminal(candidate_reason)
+        && !oauth_refresh_failure_is_terminal(key.oauth_invalid_reason.as_deref())
+    {
+        return false;
+    }
 
-    oauth_reason_has_tag(candidate_reason, OAUTH_EXPIRED_PREFIX)
+    access_token_invalid_proven
         || oauth_reason_has_tag(key.oauth_invalid_reason.as_deref(), OAUTH_EXPIRED_PREFIX)
         || oauth_access_token_expired(key, now_unix_secs)
 }
@@ -1243,13 +1275,15 @@ mod tests {
         )
         .expect("key should build");
         key.expires_at_unix_secs = Some(1_000);
-        key.oauth_invalid_reason = Some(format!("{OAUTH_REFRESH_FAILED_PREFIX}Token 续期失败"));
+        key.oauth_invalid_reason = Some(format!(
+            "{OAUTH_REFRESH_FAILED_PREFIX}Token 续期失败 (401): refresh_token 无效、已过期或已撤销，请重新登录授权"
+        ));
 
         assert!(!super::should_auto_remove_oauth_invalid_key(
-            &key, None, 999
+            &key, None, false, 999
         ));
         assert!(super::should_auto_remove_oauth_invalid_key(
-            &key, None, 1_000
+            &key, None, false, 1_000
         ));
     }
 
@@ -1265,12 +1299,79 @@ mod tests {
         )
         .expect("key should build");
         key.expires_at_unix_secs = Some(2_000);
-        key.oauth_invalid_reason = Some(format!("{OAUTH_REFRESH_FAILED_PREFIX}Token 续期失败"));
+        key.oauth_invalid_reason = Some(format!(
+            "{OAUTH_REFRESH_FAILED_PREFIX}Token 续期失败 (401): refresh_token 无效、已过期或已撤销，请重新登录授权"
+        ));
 
         assert!(super::should_auto_remove_oauth_invalid_key(
+            &key, None, true, 1_000,
+        ));
+    }
+
+    #[test]
+    fn auto_remove_existing_oauth_expired_after_terminal_refresh_failure() {
+        let mut key = StoredProviderCatalogKey::new(
+            "key-1".to_string(),
+            "provider-1".to_string(),
+            "key-1".to_string(),
+            "oauth".to_string(),
+            None,
+            true,
+        )
+        .expect("key should build");
+        key.expires_at_unix_secs = Some(2_000);
+        key.oauth_invalid_reason = Some(format!(
+            "{OAUTH_EXPIRED_PREFIX}access token invalid\n{OAUTH_REFRESH_FAILED_PREFIX}Token 续期失败 (401): refresh_token 无效、已过期或已撤销，请重新登录授权"
+        ));
+
+        assert!(super::should_auto_remove_oauth_invalid_key(
+            &key, None, false, 1_000,
+        ));
+    }
+
+    #[test]
+    fn candidate_oauth_expired_is_not_auto_remove_proof_by_itself() {
+        let mut key = StoredProviderCatalogKey::new(
+            "key-1".to_string(),
+            "provider-1".to_string(),
+            "key-1".to_string(),
+            "oauth".to_string(),
+            None,
+            true,
+        )
+        .expect("key should build");
+        key.expires_at_unix_secs = Some(2_000);
+        key.oauth_invalid_reason = Some(format!(
+            "{OAUTH_REFRESH_FAILED_PREFIX}Token 续期失败 (401): refresh_token 无效、已过期或已撤销，请重新登录授权"
+        ));
+
+        assert!(!super::should_auto_remove_oauth_invalid_key(
             &key,
             Some("[OAUTH_EXPIRED] access token invalid"),
+            false,
             1_000,
+        ));
+    }
+
+    #[test]
+    fn oauth_token_invalid_is_not_auto_remove_proof_by_itself() {
+        let mut key = StoredProviderCatalogKey::new(
+            "key-1".to_string(),
+            "provider-1".to_string(),
+            "key-1".to_string(),
+            "oauth".to_string(),
+            None,
+            true,
+        )
+        .expect("key should build");
+        key.expires_at_unix_secs = Some(1_000);
+        key.oauth_invalid_reason = Some("oauth_token_invalid".to_string());
+
+        assert!(!super::should_auto_remove_oauth_invalid_key(
+            &key,
+            Some("oauth_token_invalid"),
+            false,
+            1_001,
         ));
     }
 
@@ -1289,7 +1390,26 @@ mod tests {
         key.oauth_invalid_reason = Some(format!("{OAUTH_EXPIRED_PREFIX}session expired"));
 
         assert!(!super::should_auto_remove_oauth_invalid_key(
-            &key, None, 1_001
+            &key, None, false, 1_001
+        ));
+    }
+
+    #[test]
+    fn does_not_auto_remove_non_terminal_refresh_failure() {
+        let mut key = StoredProviderCatalogKey::new(
+            "key-1".to_string(),
+            "provider-1".to_string(),
+            "key-1".to_string(),
+            "oauth".to_string(),
+            None,
+            true,
+        )
+        .expect("key should build");
+        key.expires_at_unix_secs = Some(1_000);
+        key.oauth_invalid_reason = Some(format!("{OAUTH_REFRESH_FAILED_PREFIX}Token 续期失败"));
+
+        assert!(!super::should_auto_remove_oauth_invalid_key(
+            &key, None, true, 1_001
         ));
     }
 

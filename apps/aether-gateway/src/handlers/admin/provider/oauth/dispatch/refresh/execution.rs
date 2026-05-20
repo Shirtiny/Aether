@@ -1,7 +1,10 @@
 use super::super::super::errors::{
     merge_provider_oauth_refresh_failure_reason, normalize_provider_oauth_refresh_error_message,
 };
-use super::super::super::quota::shared::persist_provider_quota_refresh_state;
+use super::super::super::quota::shared::{
+    persist_provider_quota_refresh_state, provider_auto_remove_banned_keys,
+    should_auto_remove_oauth_invalid_key,
+};
 use super::super::super::runtime::refresh_provider_oauth_account_state_after_update;
 use super::helpers::{self, RefreshDispatch, RefreshRequestContext, RefreshSuccessContext};
 use super::response;
@@ -76,6 +79,50 @@ pub(super) async fn execute_admin_provider_oauth_refresh(
                         None,
                     )
                     .await?;
+                    if provider_auto_remove_banned_keys(provider.config.as_ref()) {
+                        let now_unix_secs = helpers::unix_now_secs();
+                        let latest_key = state
+                            .read_provider_catalog_keys_by_ids(std::slice::from_ref(&key_id))
+                            .await?
+                            .into_iter()
+                            .next();
+                        if latest_key.as_ref().is_some_and(|latest_key| {
+                            should_auto_remove_oauth_invalid_key(
+                                latest_key,
+                                None,
+                                false,
+                                now_unix_secs,
+                            )
+                        }) {
+                            state
+                                .clear_admin_provider_pool_cooldown(&provider.id, &key_id)
+                                .await;
+                            state
+                                .reset_admin_provider_pool_cost(&provider.id, &key_id)
+                                .await;
+                            if state.delete_provider_catalog_key(&key_id).await? {
+                                let deleted_key_ids = [key_id.clone()];
+                                state
+                                    .cleanup_deleted_provider_catalog_refs(
+                                        &provider.id,
+                                        &[],
+                                        &deleted_key_ids,
+                                    )
+                                    .await?;
+                                tracing::info!(
+                                    trace_id = %trace_id,
+                                    key_id = %key_id,
+                                    provider_id = %provider.id,
+                                    provider_type = %provider_type,
+                                    event_name = "auto_removed_oauth_refresh_failed",
+                                    "gateway manual provider oauth refresh auto-removed unusable key"
+                                );
+                                return Ok(RefreshDispatch::Respond(
+                                    response::oauth_refresh_auto_removed_response(&error_reason),
+                                ));
+                            }
+                        }
+                    }
                 }
             }
             return Ok(RefreshDispatch::Respond(
