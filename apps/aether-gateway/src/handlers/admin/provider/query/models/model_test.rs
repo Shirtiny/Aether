@@ -1486,6 +1486,17 @@ fn provider_query_decode_execution_body(
         .and_then(|value| base64::engine::general_purpose::STANDARD.decode(value).ok())
 }
 
+fn provider_query_execution_json_body(result: &aether_contracts::ExecutionResult) -> Option<Value> {
+    result
+        .body
+        .as_ref()
+        .and_then(|body| body.json_body.clone())
+        .or_else(|| {
+            provider_query_decode_execution_body(result)
+                .and_then(|body| serde_json::from_slice::<Value>(&body).ok())
+        })
+}
+
 fn provider_query_aggregate_standard_stream_sync_response(
     provider_api_format: &str,
     body: &[u8],
@@ -1505,10 +1516,7 @@ fn provider_query_standard_execution_response_body(
     provider_api_format: &str,
     result: &aether_contracts::ExecutionResult,
 ) -> Option<Value> {
-    let body = result
-        .body
-        .as_ref()
-        .and_then(|body| body.json_body.clone())
+    let body = provider_query_execution_json_body(result)
         .or_else(|| {
             provider_query_decode_execution_body(result).and_then(|body| {
                 provider_query_aggregate_standard_stream_sync_response(provider_api_format, &body)
@@ -1527,10 +1535,8 @@ fn provider_query_standard_execution_response_body(
 fn provider_query_extract_error_message(
     result: &aether_contracts::ExecutionResult,
 ) -> Option<String> {
-    result
-        .body
+    provider_query_execution_json_body(result)
         .as_ref()
-        .and_then(|body| body.json_body.as_ref())
         .and_then(Value::as_object)
         .and_then(|value| {
             value
@@ -1589,7 +1595,7 @@ async fn provider_query_finalize_kiro_result(
         })),
         status_code: result.status_code,
         headers: result.headers.clone(),
-        body_json: result.body.as_ref().and_then(|body| body.json_body.clone()),
+        body_json: provider_query_execution_json_body(result),
         client_body_json: None,
         body_base64: result
             .body
@@ -1879,7 +1885,7 @@ async fn provider_query_finalize_openai_image_result(
         })),
         status_code: result.status_code,
         headers: result.headers.clone(),
-        body_json: result.body.as_ref().and_then(|body| body.json_body.clone()),
+        body_json: provider_query_execution_json_body(result),
         client_body_json: None,
         body_base64: result
             .body
@@ -2177,9 +2183,9 @@ async fn provider_query_execute_openai_image_test_candidate(
             &result,
         )
         .await?
-        .or_else(|| result.body.as_ref().and_then(|body| body.json_body.clone()))
+        .or_else(|| provider_query_execution_json_body(&result))
     } else {
-        result.body.as_ref().and_then(|body| body.json_body.clone())
+        provider_query_execution_json_body(&result)
     };
     let did_fail = result.status_code >= 400;
     let error_message = if did_fail {

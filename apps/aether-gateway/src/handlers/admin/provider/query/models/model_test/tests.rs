@@ -91,6 +91,42 @@ fn provider_query_test_request_body_defaults_missing_model() {
 }
 
 #[test]
+fn provider_query_execution_json_body_decodes_stream_encoded_json_response() {
+    use base64::Engine as _;
+
+    let body = json!({
+        "created": 1,
+        "data": [{
+            "url": "https://example.test/image.png"
+        }]
+    });
+    let encoded_body = base64::engine::general_purpose::STANDARD.encode(
+        serde_json::to_vec(&body).expect("test body should serialize"),
+    );
+    let result = aether_contracts::ExecutionResult {
+        request_id: "request-1".to_string(),
+        candidate_id: None,
+        status_code: 200,
+        headers: std::collections::BTreeMap::from([(
+            "content-type".to_string(),
+            "application/json".to_string(),
+        )]),
+        body: Some(aether_contracts::ResponseBody {
+            json_body: None,
+            body_bytes_b64: Some(encoded_body),
+        }),
+        telemetry: None,
+        error: None,
+    };
+
+    assert_eq!(provider_query_execution_json_body(&result), Some(body.clone()));
+    assert_eq!(
+        provider_query_standard_execution_response_body("openai:image", &result),
+        Some(body)
+    );
+}
+
+#[test]
 fn provider_query_test_request_body_fills_empty_conversation() {
     let payload = json!({
         "request_body": {
