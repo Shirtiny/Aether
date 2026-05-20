@@ -1146,6 +1146,12 @@ pub fn maybe_build_openai_image_sync_finalize_product(
         return Ok(None);
     }
     if let Some(provider_body_json) = body_json {
+        if openai_image_response_has_standard_data(provider_body_json) {
+            return Ok(Some(OpenAiImageSyncFinalizeProduct {
+                client_body_json: provider_body_json.clone(),
+                provider_body_json: provider_body_json.clone(),
+            }));
+        }
         if provider_body_json.get("output").is_some() && provider_body_json.get("data").is_none() {
             let Some(client_body_json) = crate::formats::shared::image_bridge::build_openai_image_response_from_response_stream_sync_body(
                 provider_body_json,
@@ -1277,6 +1283,25 @@ pub fn maybe_build_openai_image_sync_finalize_product(
         client_body_json,
         provider_body_json,
     }))
+}
+
+fn openai_image_response_has_standard_data(body_json: &Value) -> bool {
+    body_json
+        .get("data")
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items.iter().any(|item| {
+                item.as_object().is_some_and(|object| {
+                    ["b64_json", "url"].iter().any(|field| {
+                        object
+                            .get(*field)
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .is_some_and(|value| !value.is_empty())
+                    })
+                })
+            })
+        })
 }
 
 #[cfg(test)]
@@ -1486,5 +1511,36 @@ mod tests {
             product.provider_body_json["output"][0]["revised_prompt"],
             "revised history prompt"
         );
+    }
+
+    #[test]
+    fn sync_finalize_accepts_standard_openai_image_response() {
+        let provider_body = json!({
+            "created": 1779273523,
+            "data": [{
+                "b64_json": "aGVsbG8=",
+                "revised_prompt": "draw a small cat"
+            }]
+        });
+        let product = maybe_build_openai_image_sync_finalize_product(
+            "openai_image_sync_finalize",
+            200,
+            Some(&json!({
+                "client_api_format": "openai:image",
+                "provider_api_format": "openai:image",
+                "image_request": {
+                    "operation": "generate",
+                    "response_format": "b64_json"
+                }
+            })),
+            Some(&provider_body),
+            None,
+        )
+        .expect("standard image response should finalize")
+        .expect("standard image response should match");
+
+        assert_eq!(product.client_body_json["created"], 1779273523);
+        assert_eq!(product.client_body_json["data"][0]["b64_json"], "aGVsbG8=");
+        assert_eq!(product.provider_body_json, provider_body);
     }
 }
