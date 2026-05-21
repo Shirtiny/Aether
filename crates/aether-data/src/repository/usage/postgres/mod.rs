@@ -1690,10 +1690,25 @@ SET status = 'completed',
 WHERE request_id = $1
 "#;
 
+const SELECT_LATEST_FAILED_CANDIDATE_FOR_STALE_REQUESTS_SQL: &str = r#"
+SELECT DISTINCT ON (request_id)
+  request_id,
+  status_code,
+  error_message
+FROM request_candidates
+WHERE request_id = ANY($1)
+  AND status IN ('failed', 'cancelled')
+ORDER BY request_id,
+         COALESCE(finished_at, started_at, created_at) DESC,
+         retry_index DESC,
+         candidate_index DESC,
+         created_at DESC
+"#;
+
 const UPDATE_FAILED_STALE_USAGE_SQL: &str = r#"
 UPDATE usage
 SET status = 'failed',
-    status_code = 504,
+    status_code = $3,
     error_message = $2
 WHERE request_id = $1
 "#;
@@ -1702,7 +1717,7 @@ const UPDATE_FAILED_VOID_STALE_USAGE_SQL: &str = r#"
 WITH updated_usage AS (
     UPDATE usage
     SET status = 'failed',
-        status_code = 504,
+        status_code = $4,
         error_message = $2,
         billing_status = 'void',
         finalized_at = $3,
@@ -8292,17 +8307,44 @@ ORDER BY "usage".user_id ASC
                 .iter()
                 .map(|row| row.request_id.clone())
                 .collect::<Vec<_>>();
-            let completed_request_ids = if request_ids.is_empty() {
-                Vec::new()
+            let (completed_request_ids, failed_candidate_info) = if request_ids.is_empty() {
+                (Vec::new(), std::collections::HashMap::new())
             } else {
-                sqlx::query(SELECT_COMPLETED_PENDING_REQUEST_IDS_SQL)
-                    .bind(request_ids)
+                let completed = sqlx::query(SELECT_COMPLETED_PENDING_REQUEST_IDS_SQL)
+                    .bind(&request_ids)
                     .fetch_all(&mut *tx)
                     .await
                     .map_postgres_err()?
                     .iter()
                     .map(|row| row.try_get("request_id").map_postgres_err())
-                    .collect::<Result<Vec<String>, DataLayerError>>()?
+                    .collect::<Result<Vec<String>, DataLayerError>>()?;
+                let failed_rows =
+                    sqlx::query(SELECT_LATEST_FAILED_CANDIDATE_FOR_STALE_REQUESTS_SQL)
+                        .bind(&request_ids)
+                        .fetch_all(&mut *tx)
+                        .await
+                        .map_postgres_err()?;
+                let mut failed_map = std::collections::HashMap::new();
+                for row in failed_rows {
+                    let request_id: String = row.try_get("request_id").map_postgres_err()?;
+                    let status_code = row
+                        .try_get::<Option<i32>, _>("status_code")
+                        .map_postgres_err()?
+                        .and_then(|value| u16::try_from(value).ok());
+                    let error_message = row
+                        .try_get::<Option<String>, _>("error_message")
+                        .map_postgres_err()?
+                        .map(|value| value.trim().to_string())
+                        .filter(|value| !value.is_empty());
+                    failed_map.insert(
+                        request_id,
+                        FailedCandidateCleanupInfo {
+                            status_code,
+                            error_message,
+                        },
+                    );
+                }
+                (completed, failed_map)
             };
 
             for row in stale_rows {
@@ -8322,12 +8364,16 @@ ORDER BY "usage".user_id ASC
                     continue;
                 }
 
-                let error_message = stale_pending_error_message(&row.status, timeout_minutes);
+                let candidate_info = failed_candidate_info.get(&row.request_id);
+                let (status_code, error_message) =
+                    resolve_stale_pending_failure(candidate_info, &row.status, timeout_minutes);
+                let status_code_i32 = i32::from(status_code);
                 if row.billing_status == "pending" {
                     sqlx::query(UPDATE_FAILED_VOID_STALE_USAGE_SQL)
                         .bind(&row.request_id)
                         .bind(&error_message)
                         .bind(now)
+                        .bind(status_code_i32)
                         .execute(&mut *tx)
                         .await
                         .map_postgres_err()?;
@@ -8335,6 +8381,7 @@ ORDER BY "usage".user_id ASC
                     sqlx::query(UPDATE_FAILED_STALE_USAGE_SQL)
                         .bind(&row.request_id)
                         .bind(&error_message)
+                        .bind(status_code_i32)
                         .execute(&mut *tx)
                         .await
                         .map_postgres_err()?;
@@ -8785,8 +8832,29 @@ struct StalePendingUsageRow {
     billing_status: String,
 }
 
+struct FailedCandidateCleanupInfo {
+    status_code: Option<u16>,
+    error_message: Option<String>,
+}
+
 fn stale_pending_error_message(status: &str, timeout_minutes: u64) -> String {
     format!("请求超时: 状态 '{status}' 超过 {timeout_minutes} 分钟未完成")
+}
+
+fn resolve_stale_pending_failure(
+    candidate: Option<&FailedCandidateCleanupInfo>,
+    status: &str,
+    timeout_minutes: u64,
+) -> (u16, String) {
+    match candidate {
+        Some(info) => (
+            info.status_code.unwrap_or(502),
+            info.error_message
+                .clone()
+                .unwrap_or_else(|| stale_pending_error_message(status, timeout_minutes)),
+        ),
+        None => (504, stale_pending_error_message(status, timeout_minutes)),
+    }
 }
 
 async fn find_usage_by_request_id_in_tx(

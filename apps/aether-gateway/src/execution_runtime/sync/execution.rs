@@ -3,6 +3,7 @@ use std::io::Error as IoError;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use aether_ai_serving::UPSTREAM_IS_STREAM_KEY;
 use aether_contracts::{
     ExecutionError, ExecutionErrorKind, ExecutionPhase, ExecutionPlan, ExecutionResult,
     ExecutionTelemetry,
@@ -1034,7 +1035,7 @@ fn resolve_openai_image_sync_total_timeout_ms(plan: &ExecutionPlan) -> u64 {
 
 fn report_context_upstream_is_stream(report_context: Option<&Value>) -> bool {
     report_context
-        .and_then(|value| value.get("upstream_is_stream"))
+        .and_then(|value| value.get(UPSTREAM_IS_STREAM_KEY))
         .and_then(Value::as_bool)
         .unwrap_or(false)
 }

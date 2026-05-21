@@ -826,6 +826,14 @@ fn usage_sql_clears_stale_failure_fields_for_non_failed_status_updates() {
 }
 
 #[test]
+fn stale_cleanup_failed_candidate_sql_orders_by_effective_timestamp() {
+    let sql = super::SELECT_LATEST_FAILED_CANDIDATE_FOR_STALE_REQUESTS_SQL;
+    assert!(sql.contains("COALESCE(finished_at, started_at, created_at) DESC"));
+    assert!(!sql.contains("finished_at DESC NULLS LAST"));
+    assert!(!sql.contains("started_at DESC NULLS LAST"));
+}
+
+#[test]
 fn usage_sql_does_not_allow_streaming_to_regress_back_to_pending() {
     assert!(super::UPSERT_SQL.contains(
             "WHEN \"usage\".status = 'streaming' AND EXCLUDED.status = 'pending' THEN \"usage\".status_code"

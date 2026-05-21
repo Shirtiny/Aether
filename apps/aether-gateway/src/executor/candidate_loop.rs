@@ -1,5 +1,6 @@
 use aether_ai_serving::{
     run_ai_attempt_loop, AiAttemptLoopOutcome, AiAttemptLoopPort, AiExecutionAttempt,
+    UPSTREAM_IS_STREAM_KEY,
 };
 use aether_data_contracts::repository::candidates::RequestCandidateStatus;
 use aether_scheduler_core::{
@@ -471,11 +472,24 @@ fn should_skip_unused_persistence_from_metadata(
     metadata.candidate_group_id.is_some() && metadata.pool_key_index.is_some()
 }
 
-fn resolve_stream_candidate_watchdog_timeout(plan: &aether_contracts::ExecutionPlan) -> Duration {
+fn resolve_stream_candidate_watchdog_timeout(
+    plan: &aether_contracts::ExecutionPlan,
+    report_context: Option<&serde_json::Value>,
+) -> Duration {
+    let upstream_is_stream = report_context
+        .and_then(|context| context.get(UPSTREAM_IS_STREAM_KEY))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
     let timeout_ms = plan
         .timeouts
         .as_ref()
-        .and_then(|timeouts| timeouts.first_byte_ms.or(timeouts.total_ms))
+        .and_then(|timeouts| {
+            if upstream_is_stream {
+                timeouts.first_byte_ms.or(timeouts.total_ms)
+            } else {
+                timeouts.total_ms.or(timeouts.first_byte_ms)
+            }
+        })
         .unwrap_or(DEFAULT_STREAM_CANDIDATE_WATCHDOG_TIMEOUT_MS)
         .max(1);
     Duration::from_millis(timeout_ms)
@@ -493,7 +507,7 @@ where
     Fut:
         std::future::Future<Output = Result<Option<Response<Body>>, GatewayError>> + Send + 'static,
 {
-    let timeout_duration = resolve_stream_candidate_watchdog_timeout(plan);
+    let timeout_duration = resolve_stream_candidate_watchdog_timeout(plan, report_context);
     let candidate_started_unix_ms = current_unix_ms();
     let mut join_handle = tokio::spawn(execute());
     match timeout(timeout_duration, &mut join_handle).await {
@@ -655,24 +669,71 @@ mod tests {
 
     #[test]
     fn stream_candidate_watchdog_prefers_first_byte_timeout() {
-        let timeout =
-            resolve_stream_candidate_watchdog_timeout(&test_plan(Some(ExecutionTimeouts {
+        let report_context = json!({"upstream_is_stream": true});
+        let timeout = resolve_stream_candidate_watchdog_timeout(
+            &test_plan(Some(ExecutionTimeouts {
                 first_byte_ms: Some(12_345),
                 total_ms: Some(90_000),
                 ..ExecutionTimeouts::default()
-            })));
+            })),
+            Some(&report_context),
+        );
 
         assert_eq!(timeout, Duration::from_millis(12_345));
     }
 
     #[test]
     fn stream_candidate_watchdog_uses_default_when_timeouts_missing() {
-        let timeout = resolve_stream_candidate_watchdog_timeout(&test_plan(None));
+        let timeout = resolve_stream_candidate_watchdog_timeout(&test_plan(None), None);
 
         assert_eq!(
             timeout,
             Duration::from_millis(DEFAULT_STREAM_CANDIDATE_WATCHDOG_TIMEOUT_MS)
         );
+    }
+
+    #[test]
+    fn stream_candidate_watchdog_prefers_total_timeout_when_upstream_non_stream() {
+        let report_context = json!({"upstream_is_stream": false});
+        let timeout = resolve_stream_candidate_watchdog_timeout(
+            &test_plan(Some(ExecutionTimeouts {
+                first_byte_ms: Some(300_000),
+                total_ms: Some(599_000),
+                ..ExecutionTimeouts::default()
+            })),
+            Some(&report_context),
+        );
+
+        assert_eq!(timeout, Duration::from_millis(599_000));
+    }
+
+    #[test]
+    fn stream_candidate_watchdog_falls_back_to_first_byte_when_upstream_non_stream_lacks_total() {
+        let report_context = json!({"upstream_is_stream": false});
+        let timeout = resolve_stream_candidate_watchdog_timeout(
+            &test_plan(Some(ExecutionTimeouts {
+                first_byte_ms: Some(300_000),
+                ..ExecutionTimeouts::default()
+            })),
+            Some(&report_context),
+        );
+
+        assert_eq!(timeout, Duration::from_millis(300_000));
+    }
+
+    #[test]
+    fn stream_candidate_watchdog_defaults_to_streaming_when_flag_missing() {
+        let report_context = json!({});
+        let timeout = resolve_stream_candidate_watchdog_timeout(
+            &test_plan(Some(ExecutionTimeouts {
+                first_byte_ms: Some(12_345),
+                total_ms: Some(90_000),
+                ..ExecutionTimeouts::default()
+            })),
+            Some(&report_context),
+        );
+
+        assert_eq!(timeout, Duration::from_millis(12_345));
     }
 
     #[test]

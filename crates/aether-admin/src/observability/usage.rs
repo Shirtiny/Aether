@@ -1,5 +1,6 @@
 use crate::observability::stats::{aggregate_usage_stats, parse_bounded_u32, round_to};
 use aether_ai_formats::api::request_path_implies_stream_request;
+use aether_ai_formats::UPSTREAM_IS_STREAM_KEY;
 use aether_billing::{
     normalize_input_tokens_for_billing, normalize_total_input_context_for_cache_hit_rate,
 };
@@ -1052,7 +1053,7 @@ fn admin_usage_upstream_is_stream(item: &StoredRequestUsageAudit) -> bool {
     item.request_metadata
         .as_ref()
         .and_then(Value::as_object)
-        .and_then(|metadata| metadata.get("upstream_is_stream"))
+        .and_then(|metadata| metadata.get(UPSTREAM_IS_STREAM_KEY))
         .and_then(Value::as_bool)
         .or_else(|| admin_usage_headers_stream_flag(item.response_headers.as_ref()))
         .or_else(|| admin_usage_infer_upstream_stream_from_captured_bodies(item))
@@ -1256,7 +1257,10 @@ pub fn admin_usage_record_json(
         .as_object_mut()
         .expect("admin usage record payload should be an object");
     object.insert("is_stream".to_string(), json!(item.is_stream));
-    object.insert("upstream_is_stream".to_string(), json!(upstream_is_stream));
+    object.insert(
+        UPSTREAM_IS_STREAM_KEY.to_string(),
+        json!(upstream_is_stream),
+    );
     object.insert(
         "client_requested_stream".to_string(),
         json!(client_is_stream),

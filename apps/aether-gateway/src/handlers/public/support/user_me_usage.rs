@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use aether_ai_serving::UPSTREAM_IS_STREAM_KEY;
 use aether_billing::{
     normalize_input_tokens_for_billing, normalize_total_input_context_for_cache_hit_rate,
 };
@@ -314,7 +315,7 @@ fn users_me_usage_upstream_is_stream(item: &StoredRequestUsageAudit) -> bool {
     item.request_metadata
         .as_ref()
         .and_then(serde_json::Value::as_object)
-        .and_then(|metadata| metadata.get("upstream_is_stream"))
+        .and_then(|metadata| metadata.get(UPSTREAM_IS_STREAM_KEY))
         .and_then(serde_json::Value::as_bool)
         .or_else(|| users_me_usage_headers_stream_flag(item.response_headers.as_ref()))
         .or_else(|| users_me_usage_infer_upstream_stream_from_captured_bodies(item))

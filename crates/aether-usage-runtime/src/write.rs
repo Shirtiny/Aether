@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use aether_ai_formats::UPSTREAM_IS_STREAM_KEY;
 use aether_contracts::{ExecutionPlan, ExecutionTelemetry};
 use aether_data_contracts::repository::usage::{UpsertUsageRecord, UsageBodyCaptureState};
 use aether_data_contracts::DataLayerError;
@@ -719,7 +720,7 @@ pub fn build_sync_terminal_usage_payload_seed(
         .report_context
         .as_ref()
         .and_then(Value::as_object)
-        .and_then(|context| context.get("upstream_is_stream"))
+        .and_then(|context| context.get(UPSTREAM_IS_STREAM_KEY))
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let provider_response_full = if upstream_is_stream && payload.body_base64.is_some() {
@@ -1632,9 +1633,9 @@ fn build_runtime_request_metadata_seed_from_parts(
             Value::Bool(client_requested_stream),
         );
     }
-    if let Some(upstream_is_stream) = context_bool(context, "upstream_is_stream") {
+    if let Some(upstream_is_stream) = context_bool(context, UPSTREAM_IS_STREAM_KEY) {
         metadata.insert(
-            "upstream_is_stream".to_string(),
+            UPSTREAM_IS_STREAM_KEY.to_string(),
             Value::Bool(upstream_is_stream),
         );
     }
