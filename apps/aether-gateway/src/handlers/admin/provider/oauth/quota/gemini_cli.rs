@@ -66,7 +66,7 @@ pub(crate) async fn refresh_gemini_cli_provider_quota_locally(
     let mut auto_removed_count = 0usize;
 
     for key in keys {
-        let transport = match state
+        let mut transport = match state
             .read_provider_transport_snapshot(&provider.id, &endpoint.id, &key.id)
             .await?
         {
@@ -102,14 +102,27 @@ pub(crate) async fn refresh_gemini_cli_provider_quota_locally(
             }
         };
 
-        let Some(project_id) = crate::provider_transport::resolve_gemini_cli_project_id(&transport)
-        else {
+        let project_id = match crate::provider_transport::resolve_gemini_cli_project_id(&transport)
+        {
+            Some(project_id) => Some(project_id),
+            None => state
+                .app()
+                .hydrate_gemini_cli_project_metadata_for_transport(&transport)
+                .await
+                .and_then(|hydrated| {
+                    let project_id =
+                        crate::provider_transport::resolve_gemini_cli_project_id(&hydrated);
+                    transport = hydrated;
+                    project_id
+                }),
+        };
+        let Some(project_id) = project_id else {
             failed_count += 1;
             results.push(json!({
                 "key_id": key.id,
                 "key_name": key.name,
                 "status": "error",
-                "message": "缺少 Gemini CLI project_id，请先刷新模型或在 auth_config/upstream_metadata 中写入 project_id",
+                "message": "缺少 Gemini CLI project_id，loadCodeAssist 未返回可用项目信息",
             }));
             continue;
         };

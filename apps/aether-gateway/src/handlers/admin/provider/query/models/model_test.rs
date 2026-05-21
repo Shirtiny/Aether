@@ -2639,7 +2639,7 @@ async fn provider_query_execute_standard_test_candidate(
     route_path: &str,
     trace_id: &str,
 ) -> Result<ProviderQueryExecutionOutcome, GatewayError> {
-    let Some(transport) = state
+    let Some(mut transport) = state
         .read_provider_transport_snapshot(&provider.id, &candidate.endpoint.id, &candidate.key.id)
         .await?
     else {
@@ -2839,8 +2839,21 @@ async fn provider_query_execute_standard_test_candidate(
     if crate::provider_transport::is_gemini_cli_provider_transport(&transport)
         && normalized_provider_api_format == "gemini:generate_content"
     {
-        let Some(project_id) = crate::provider_transport::resolve_gemini_cli_project_id(&transport)
-        else {
+        let project_id = match crate::provider_transport::resolve_gemini_cli_project_id(&transport)
+        {
+            Some(project_id) => Some(project_id),
+            None => state
+                .app()
+                .hydrate_gemini_cli_project_metadata_for_transport(&transport)
+                .await
+                .and_then(|hydrated| {
+                    let project_id =
+                        crate::provider_transport::resolve_gemini_cli_project_id(&hydrated);
+                    transport = hydrated;
+                    project_id
+                }),
+        };
+        let Some(project_id) = project_id else {
             return Ok(provider_query_skipped_execution_outcome(
                 provider_request_body,
                 "Gemini CLI project_id is unavailable for v1internal request",
