@@ -1273,7 +1273,7 @@ async fn gateway_executes_gemini_cli_sync_via_local_decision_gate_after_oauth_re
     );
     assert_eq!(
         seen_execution_runtime_request.url,
-        "https://cloudcode-pa.googleapis.com/v1internal:generateContent"
+        "https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse"
     );
     assert!(seen_execution_runtime_request.has_model_field);
     assert_eq!(
