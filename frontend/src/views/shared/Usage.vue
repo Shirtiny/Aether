@@ -547,6 +547,15 @@ async function pollActiveRequests() {
             ? update.provider_key_name
             : undefined
         }
+        if ('client_family' in update) {
+          record.client_family = typeof update.client_family === 'string' ? update.client_family : null
+        }
+        if ('client_ip' in update) {
+          record.client_ip = typeof update.client_ip === 'string' ? update.client_ip : null
+        }
+        if ('user_agent' in update) {
+          record.user_agent = typeof update.user_agent === 'string' ? update.user_agent : null
+        }
       }
     }
 

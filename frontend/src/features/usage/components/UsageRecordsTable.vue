@@ -889,6 +889,7 @@ import {
 } from '../utils/status'
 import { useRowClick } from '@/composables/useRowClick'
 import { formatApiFormat } from '@/api/endpoints/types/api-format'
+import { formatClientFamily } from '@/features/usage/utils/clientFamily'
 import type { DateRangeParams, UsageRecord } from '../types'
 import { MultiSelect, TimeRangePicker } from '@/components/common'
 import type { MultiSelectOption } from '@/components/common/MultiSelect.vue'
@@ -1111,19 +1112,6 @@ const providerFilterOptions = computed<FilterOption[]>(() => [
     label: provider,
   })),
 ])
-
-function formatClientFamily(value: string | null | undefined): string {
-  const normalized = value?.trim().toLowerCase()
-  if (!normalized) return '-'
-  if (normalized === 'codex') return 'Codex'
-  if (normalized === 'codex_vscode') return 'Codex VS Code'
-  if (normalized === 'claude_code') return 'Claude Code'
-  if (normalized === 'opencode') return 'OpenCode'
-  if (normalized === 'gemini_cli') return 'Gemini CLI'
-  if (normalized === 'openai_js_sdk') return 'OpenAI JS SDK'
-  if (normalized === 'generic') return '通用客户端'
-  return value?.trim() || '-'
-}
 
 const clientFamilyFilterOptions = computed<FilterOption[]>(() => {
   const families = new Set<string>(props.availableClientFamilies)
