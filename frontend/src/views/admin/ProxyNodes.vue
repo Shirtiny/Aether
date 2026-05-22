@@ -999,6 +999,7 @@ import {
 
 import { Search, Trash2, Plus, SquarePen, Activity, Loader2, Settings, History, ChevronDown, ChevronRight, Terminal, Copy, CheckCircle } from 'lucide-vue-next'
 import { parseApiError } from '@/utils/errorParser'
+import { formatCompactNumber } from '@/utils/format'
 import { formatRegion } from '@/utils/region'
 import HardwareTooltip from './components/HardwareTooltip.vue'
 import ProxyNodeDataPanel from './components/ProxyNodeDataPanel.vue'
@@ -1567,9 +1568,7 @@ function statusTitle(node: ProxyNode) {
 }
 
 function formatNumber(n: number) {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`
-  return String(n)
+  return formatCompactNumber(n, { fractionDigits: 1 })
 }
 
 function formatTime(iso: string | null) {

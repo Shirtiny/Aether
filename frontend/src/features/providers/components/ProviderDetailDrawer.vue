@@ -1440,6 +1440,7 @@ import {
 } from '../utils/quotaAutoRefreshCooldown'
 import { getOAuthOrgBadge } from '@/utils/oauthIdentity'
 import { getOAuthRefreshFeedback } from '@/utils/oauthRefreshFeedback'
+import { formatCompactNumber } from '@/utils/format'
 import {
   canEditOAuthCredential,
   canExportOAuthCredential,
@@ -2633,13 +2634,10 @@ const formatKiroUpdatedAt = formatUpdatedAt
 // 格式化 Kiro 使用量（带单位）
 function formatKiroUsage(value: number | undefined): string {
   if (value === undefined || value === null) return '-'
-  if (value >= 1000000) {
-    return `${(value / 1000000).toFixed(1)}M`
-  }
-  if (value >= 1000) {
-    return `${(value / 1000).toFixed(1)}K`
-  }
-  return value.toFixed(1)
+  const normalized = Number(value)
+  if (!Number.isFinite(normalized)) return '-'
+  if (normalized >= 1000) return formatCompactNumber(normalized, { fractionDigits: 1 })
+  return normalized.toFixed(1)
 }
 
 // 格式化 Kiro 重置时间

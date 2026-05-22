@@ -794,7 +794,7 @@ import { AlertTriangle, Check, Columns2, RefreshCw, X, Monitor, Server, MessageS
 import { dashboardApi, type RequestDetail, type RequestErrorDomain } from '@/api/dashboard'
 import type { ImageProgress, RequestTrace } from '@/api/requestTrace'
 import { formatApiFormat } from '@/api/endpoints/types/api-format'
-import { formatShortRequestId } from '@/utils/format'
+import { formatCompactNumber, formatShortRequestId, formatTokens } from '@/utils/format'
 import { log } from '@/utils/logger'
 import { getEffectiveInputTokens } from '../token-normalization'
 import {
@@ -2274,12 +2274,7 @@ function getTaskTypeLabel(taskType: string): string {
 }
 
 function formatNumber(num: number): string {
-  if (num >= 1_000_000) {
-    return `${(num / 1_000_000).toFixed(1)  }M`
-  } else if (num >= 1_000) {
-    return `${(num / 1_000).toFixed(1)  }K`
-  }
-  return num.toLocaleString()
+  return formatTokens(num)
 }
 
 function parseImageSizePixels(size: string | null): number | null {
@@ -2301,13 +2296,7 @@ function formatImagePriceBucket(bucket: string): string {
 }
 
 function formatPixels(value: number): string {
-  if (value >= 1_000_000) {
-    return `${(value / 1_000_000).toFixed(value % 1_000_000 === 0 ? 0 : 2)}M px`
-  }
-  if (value >= 1_000) {
-    return `${(value / 1_000).toFixed(0)}K px`
-  }
-  return `${value} px`
+  return `${formatCompactNumber(value)} px`
 }
 
 // 格式化响应时间，自动选择合适的单位

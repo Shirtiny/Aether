@@ -1,3 +1,5 @@
+import { formatCompactNumber } from '@/utils/format'
+
 export function walletStatusLabel(status: string | null | undefined): string {
   const labels: Record<string, string> = {
     active: '正常',
@@ -41,13 +43,8 @@ export function dailyUsageCategoryLabel(isToday = false): string {
 
 export function formatTokenCount(value: number | null | undefined): string {
   const amount = Number(value ?? 0)
-  if (amount >= 1_000_000) {
-    return `${(amount / 1_000_000).toFixed(amount >= 10_000_000 ? 0 : 1)}M`
-  }
-  if (amount >= 1_000) {
-    return `${(amount / 1_000).toFixed(amount >= 10_000 ? 0 : 1)}K`
-  }
-  return `${Math.round(amount)}`
+  if (!Number.isFinite(amount) || amount <= 0) return '0'
+  return formatCompactNumber(Math.round(amount), { fractionDigits: 1 })
 }
 
 export function walletTransactionReasonLabel(reasonCode: string | null | undefined): string {
