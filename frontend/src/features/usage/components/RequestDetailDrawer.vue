@@ -537,9 +537,9 @@
               <!-- 请求链路追踪卡片 -->
               <div>
                 <HorizontalRequestTimeline
-                  v-if="showTimeline && (detail.request_id || detail.id)"
+                  v-if="showTimeline && traceTimelineRequestId"
                   ref="timelineRef"
-                  :request-id="detail.request_id || detail.id"
+                  :request-id="traceTimelineRequestId"
                   :override-status-code="detail.status_code"
                   :request-status="detail.status"
                   :request-api-format="detail.api_format || null"
@@ -996,6 +996,17 @@ function getNestedString(record: JsonRecord | null, ...path: string[]): string |
   return typeof value === 'string' && value.trim() ? value.trim() : null
 }
 
+function getCaseInsensitiveString(record: JsonRecord | null, key: string): string | null {
+  if (!record) return null
+  const normalizedKey = key.toLowerCase()
+  for (const [name, value] of Object.entries(record)) {
+    if (name.toLowerCase() === normalizedKey && typeof value === 'string' && value.trim()) {
+      return value.trim()
+    }
+  }
+  return null
+}
+
 function normalizeCacheTtlPricing(value: unknown): CacheTTLPriceEntry[] {
   if (!Array.isArray(value)) return []
   return value
@@ -1094,6 +1105,19 @@ const traceRequestMetadata = computed<Record<string, unknown> | null>(() => {
   if (!meta || typeof meta !== 'object' || Array.isArray(meta)) return null
   return meta as Record<string, unknown>
 })
+
+const traceRecord = computed<Record<string, unknown> | null>(() =>
+  asRecord(detail.value?.trace ?? null),
+)
+
+const traceTimelineRequestId = computed(() =>
+  getNestedString(traceRecord.value, 'trace_id')
+  ?? getNestedString(traceRequestMetadata.value, 'trace_id')
+  ?? getCaseInsensitiveString(asRecord(detail.value?.request_headers ?? null), 'x-trace-id')
+  ?? detail.value?.request_id
+  ?? detail.value?.id
+  ?? null,
+)
 
 const metadataPanelData = computed<Record<string, unknown> | null>(() => {
   if (!detail.value) return null

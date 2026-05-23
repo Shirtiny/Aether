@@ -82,6 +82,133 @@ async fn admin_monitoring_trace_request_returns_local_payload() {
 }
 
 #[tokio::test]
+async fn admin_monitoring_trace_request_resolves_usage_id_to_header_trace_id() {
+    let request_candidates = Arc::new(InMemoryRequestCandidateRepository::seed(vec![
+        sample_candidate(
+            "cand-used",
+            "trace-1",
+            0,
+            RequestCandidateStatus::Success,
+            Some(101),
+            Some(33),
+            Some(200),
+        ),
+    ]));
+    let provider_catalog = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![sample_provider()],
+        vec![sample_endpoint()],
+        vec![sample_key()],
+    ));
+    let mut usage = sample_usage(
+        "usage-request-1",
+        "provider-1",
+        "OpenAI",
+        40,
+        0.02,
+        "completed",
+        Some(200),
+        100,
+    );
+    usage.id = "usage-row-1".to_string();
+    usage.candidate_id = Some("cand-used".to_string());
+    usage.request_headers = Some(json!({
+        "x-trace-id": "trace-1"
+    }));
+    let usage_repository = Arc::new(InMemoryUsageReadRepository::seed(vec![usage]));
+    let data_state =
+        crate::data::GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
+            request_candidates,
+            usage_repository,
+        )
+        .with_provider_catalog_reader(provider_catalog);
+    let state = AppState::new()
+        .expect("state should build")
+        .with_data_state_for_tests(data_state);
+    let context = request_context(
+        http::Method::GET,
+        "/api/admin/monitoring/trace/usage-row-1?attempted_only=true",
+    );
+
+    let response = local_monitoring_response(&state, &context)
+        .await
+        .expect("handler should not error")
+        .expect("route should be handled locally");
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body should read");
+    let payload: serde_json::Value = serde_json::from_slice(&body).expect("json body should parse");
+    assert_eq!(payload["request_id"], json!("trace-1"));
+    assert_eq!(payload["candidates"][0]["id"], json!("cand-used"));
+    assert_eq!(
+        payload["candidates"][0]["extra_data"]["first_byte_time_ms"],
+        json!(30)
+    );
+}
+
+#[tokio::test]
+async fn admin_monitoring_trace_request_resolves_usage_request_id_to_metadata_trace_id() {
+    let request_candidates = Arc::new(InMemoryRequestCandidateRepository::seed(vec![
+        sample_candidate(
+            "cand-used",
+            "trace-2",
+            0,
+            RequestCandidateStatus::Success,
+            Some(101),
+            Some(33),
+            Some(200),
+        ),
+    ]));
+    let provider_catalog = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![sample_provider()],
+        vec![sample_endpoint()],
+        vec![sample_key()],
+    ));
+    let mut usage = sample_usage(
+        "usage-request-2",
+        "provider-1",
+        "OpenAI",
+        40,
+        0.02,
+        "completed",
+        Some(200),
+        100,
+    );
+    usage.candidate_id = Some("cand-used".to_string());
+    usage.request_metadata = Some(json!({
+        "trace_id": "trace-2"
+    }));
+    let usage_repository = Arc::new(InMemoryUsageReadRepository::seed(vec![usage]));
+    let data_state =
+        crate::data::GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
+            request_candidates,
+            usage_repository,
+        )
+        .with_provider_catalog_reader(provider_catalog);
+    let state = AppState::new()
+        .expect("state should build")
+        .with_data_state_for_tests(data_state);
+    let context = request_context(
+        http::Method::GET,
+        "/api/admin/monitoring/trace/usage-request-2",
+    );
+
+    let response = local_monitoring_response(&state, &context)
+        .await
+        .expect("handler should not error")
+        .expect("route should be handled locally");
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body should read");
+    let payload: serde_json::Value = serde_json::from_slice(&body).expect("json body should parse");
+    assert_eq!(payload["request_id"], json!("trace-2"));
+    assert_eq!(payload["candidates"][0]["id"], json!("cand-used"));
+}
+
+#[tokio::test]
 async fn admin_monitoring_trace_request_returns_oauth_account_label_from_auth_config() {
     let request_candidates = Arc::new(InMemoryRequestCandidateRepository::seed(vec![
         sample_candidate(

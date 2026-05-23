@@ -385,7 +385,7 @@ fn resolve_admin_monitoring_usage_candidate_id(
     trace: &DecisionTrace,
     usage: &StoredRequestUsageAudit,
 ) -> Option<String> {
-    if usage.request_id.trim() != trace.request_id {
+    if !admin_monitoring_usage_matches_trace(usage, trace.request_id.as_str()) {
         return None;
     }
 
@@ -411,6 +411,43 @@ fn resolve_admin_monitoring_usage_candidate_id(
             )
         })
         .map(|item| item.candidate.id.clone())
+}
+
+fn admin_monitoring_usage_matches_trace(
+    usage: &StoredRequestUsageAudit,
+    trace_request_id: &str,
+) -> bool {
+    let trace_request_id = trace_request_id.trim();
+    if trace_request_id.is_empty() {
+        return false;
+    }
+    usage.request_id.trim() == trace_request_id
+        || usage
+            .trace_id()
+            .is_some_and(|value| value.trim() == trace_request_id)
+        || admin_monitoring_headers_contain_trace_id(
+            usage.request_headers.as_ref(),
+            trace_request_id,
+        )
+        || admin_monitoring_headers_contain_trace_id(
+            usage.provider_request_headers.as_ref(),
+            trace_request_id,
+        )
+}
+
+fn admin_monitoring_headers_contain_trace_id(
+    headers: Option<&Value>,
+    trace_request_id: &str,
+) -> bool {
+    headers.and_then(Value::as_object).is_some_and(|object| {
+        object.iter().any(|(key, value)| {
+            key.eq_ignore_ascii_case("x-trace-id")
+                && value
+                    .as_str()
+                    .map(str::trim)
+                    .is_some_and(|value| value == trace_request_id)
+        })
+    })
 }
 
 fn admin_monitoring_candidate_status_rank(status: RequestCandidateStatus) -> u8 {

@@ -797,7 +797,6 @@ pub(super) fn classify_public_support_route(
     } else if method == http::Method::GET
         && (has_single_segment_after_prefix(normalized_path, "/install/")
             || has_single_segment_after_prefix(normalized_path, "/install-tunnel/")
-            || has_single_segment_after_prefix(normalized_path, "/install-proxy/")
             || has_single_segment_after_prefix(normalized_path, "/i/"))
     {
         Some(classified(

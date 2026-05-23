@@ -90,7 +90,6 @@ fn frontend_path_bypasses_static(path: &str) -> bool {
         || path.starts_with("/.well-known/")
         || path.starts_with("/install/")
         || path.starts_with("/install-tunnel/")
-        || path.starts_with("/install-proxy/")
         || path.starts_with("/i/")
 }
 
