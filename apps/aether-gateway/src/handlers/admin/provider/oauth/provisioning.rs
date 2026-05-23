@@ -204,7 +204,6 @@ pub(crate) async fn update_existing_provider_oauth_catalog_key(
     updated.encrypted_api_key = Some(encrypted_api_key);
     updated.encrypted_auth_config = Some(encrypted_auth_config);
     updated.api_formats = provider_oauth_catalog_key_api_formats(provider_type, api_formats);
-    updated.is_active = true;
     updated.expires_at_unix_secs = expires_at_unix_secs;
     updated.oauth_invalid_at_unix_secs = None;
     updated.oauth_invalid_reason = None;

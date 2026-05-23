@@ -645,6 +645,19 @@ mod tests {
     }
 
     #[test]
+    fn oauth_expired_state_is_not_auto_removed() {
+        let state = resolve_pool_account_state(
+            Some("codex"),
+            None,
+            Some("[OAUTH_EXPIRED] token invalidated"),
+        );
+
+        assert!(state.blocked);
+        assert_eq!(state.code.as_deref(), Some("oauth_token_invalid"));
+        assert!(!should_auto_remove_account_state(&state));
+    }
+
+    #[test]
     fn account_snapshot_detects_account_block_and_verification() {
         let snapshot = resolve_account_status_snapshot(
             Some("codex"),

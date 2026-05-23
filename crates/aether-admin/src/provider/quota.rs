@@ -199,7 +199,7 @@ pub fn quota_refresh_success_invalid_state(
         .as_deref()
         .map(str::trim)
         .unwrap_or_default();
-    if current_reason.starts_with(OAUTH_REFRESH_FAILED_PREFIX) {
+    if current_reason.starts_with(OAUTH_ACCOUNT_BLOCK_PREFIX) {
         return (
             key.oauth_invalid_at_unix_secs,
             (!current_reason.is_empty()).then_some(current_reason.to_string()),
@@ -1454,6 +1454,7 @@ mod tests {
         parse_chatgpt_web_conversation_init_response, parse_codex_backend_me_response,
         parse_codex_wham_usage_response, parse_windsurf_model_configs_response,
         parse_windsurf_rate_limit_response, parse_windsurf_user_status_response,
+        quota_refresh_success_invalid_state, should_auto_remove_structured_reason,
         OAUTH_ACCOUNT_BLOCK_PREFIX, OAUTH_EXPIRED_PREFIX, OAUTH_REFRESH_FAILED_PREFIX,
         OAUTH_REQUEST_FAILED_PREFIX,
     };
@@ -1574,6 +1575,13 @@ mod tests {
                 ))
             )
         );
+    }
+
+    #[test]
+    fn auto_remove_structured_reason_keeps_oauth_expired_token_invalid() {
+        assert!(!should_auto_remove_structured_reason(Some(
+            "[OAUTH_EXPIRED] token invalidated"
+        )));
     }
 
     #[test]
@@ -1724,6 +1732,32 @@ mod tests {
         assert!(!super::should_auto_remove_oauth_invalid_key(
             &key, None, true, 1_001
         ));
+    }
+
+    #[test]
+    fn quota_refresh_success_clears_refresh_failed_marker() {
+        let mut key = StoredProviderCatalogKey::new(
+            "key-1".to_string(),
+            "provider-1".to_string(),
+            "key-1".to_string(),
+            "oauth".to_string(),
+            None,
+            true,
+        )
+        .expect("key should build");
+        key.oauth_invalid_reason = Some("[REFRESH_FAILED] Token 续期失败".to_string());
+
+        assert_eq!(quota_refresh_success_invalid_state(&key), (None, None));
+    }
+
+    #[test]
+    fn auto_remove_structured_reason_keeps_request_and_refresh_failures() {
+        assert!(!should_auto_remove_structured_reason(Some(
+            "[REQUEST_FAILED] 账号状态检查失败"
+        )));
+        assert!(!should_auto_remove_structured_reason(Some(
+            "[REFRESH_FAILED] Token 续期失败 (401): refresh_token 已失效"
+        )));
     }
 
     #[test]

@@ -1227,6 +1227,24 @@ async fn perform_pool_quota_probe_for_provider(
     now_ts: u64,
 ) -> Result<PoolQuotaProbeRunSummary, GatewayError> {
     let mut summary = PoolQuotaProbeRunSummary::empty();
+    let provider_short_id = provider.id.chars().take(8).collect::<String>();
+
+    if aether_admin::provider::quota::provider_auto_remove_banned_keys(provider.config.as_ref()) {
+        let auto_removed = admin_state
+            .cleanup_known_banned_provider_catalog_keys(provider)
+            .await?;
+        if auto_removed > 0 {
+            summary.auto_removed += auto_removed;
+            info!(
+                event_name = "auto_removed_hard_banned",
+                provider_id = %provider_short_id,
+                provider_type,
+                auto_removed,
+                "gateway pool quota probe auto-cleaned known abnormal provider keys"
+            );
+        }
+    }
+
     let Some(endpoint) = endpoint_for_probe_with_reconcile(
         state,
         admin_state,
@@ -1308,7 +1326,6 @@ async fn perform_pool_quota_probe_for_provider(
         record_score_probe_in_progress_for_key(state, &provider.id, key_id, now_ts).await;
     }
 
-    let provider_short_id = provider.id.chars().take(8).collect::<String>();
     let probe_concurrency = pool_config.probe_concurrency.clamp(1, 64) as usize;
     let probe_concurrency = probe_concurrency.min(config.global_concurrency).max(1);
     let probe_results = stream::iter(keys.into_iter().map(|key| {

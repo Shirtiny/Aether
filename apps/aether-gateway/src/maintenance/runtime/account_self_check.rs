@@ -98,6 +98,10 @@ enum AccountSelfCheckOutcome {
         status_code: Option<u16>,
         message: String,
     },
+    AutoRemoved {
+        status_code: Option<u16>,
+        message: String,
+    },
     Failed {
         status_code: Option<u16>,
         message: String,
@@ -112,6 +116,7 @@ impl AccountSelfCheckOutcome {
         match self {
             Self::Success { .. } => "success",
             Self::Blocked { .. } => "blocked",
+            Self::AutoRemoved { .. } => "auto_removed",
             Self::Failed { .. } => "failed",
             Self::Skipped { .. } => "skipped",
         }
@@ -121,6 +126,7 @@ impl AccountSelfCheckOutcome {
         match self {
             Self::Success { status_code, .. }
             | Self::Blocked { status_code, .. }
+            | Self::AutoRemoved { status_code, .. }
             | Self::Failed { status_code, .. } => *status_code,
             Self::Skipped { .. } => None,
         }
@@ -130,6 +136,7 @@ impl AccountSelfCheckOutcome {
         match self {
             Self::Success { message, .. } => message.as_deref(),
             Self::Blocked { message, .. }
+            | Self::AutoRemoved { message, .. }
             | Self::Failed { message, .. }
             | Self::Skipped { message, .. } => Some(message.as_str()),
         }
@@ -392,11 +399,21 @@ fn quota_payload_result_for_key(key_id: &str, payload: Option<Value>) -> Account
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned);
+    let auto_removed = item
+        .get("auto_removed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
 
     if status == "success" {
         return AccountSelfCheckOutcome::Success {
             status_code,
             message,
+        };
+    }
+    if auto_removed {
+        return AccountSelfCheckOutcome::AutoRemoved {
+            status_code,
+            message: message.unwrap_or_else(|| "已自动删除".to_string()),
         };
     }
     if quota_result_status_is_blocked(&status, status_code, message.as_deref()) {
@@ -499,6 +516,11 @@ async fn record_score_probe_result_for_key(
             Some(PoolMemberHardState::Banned),
             PoolMemberProbeStatus::Failed,
         ),
+        AccountSelfCheckOutcome::AutoRemoved { .. } => (
+            false,
+            Some(PoolMemberHardState::Banned),
+            PoolMemberProbeStatus::Failed,
+        ),
         AccountSelfCheckOutcome::Failed { .. } => (
             false,
             Some(PoolMemberHardState::Cooldown),
@@ -564,6 +586,9 @@ fn update_summary_from_outcome(
         }
         AccountSelfCheckOutcome::Blocked { .. } => {
             summary.blocked = summary.blocked.saturating_add(1);
+        }
+        AccountSelfCheckOutcome::AutoRemoved { .. } => {
+            summary.auto_removed = summary.auto_removed.saturating_add(1);
         }
         AccountSelfCheckOutcome::Failed { .. } => {
             summary.failed = summary.failed.saturating_add(1);

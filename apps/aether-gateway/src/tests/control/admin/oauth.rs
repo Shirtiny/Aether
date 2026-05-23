@@ -6144,10 +6144,10 @@ async fn gateway_auto_removes_manual_oauth_refresh_failure_after_access_token_ex
                     StatusCode::UNAUTHORIZED,
                     Json(json!({
                         "error": {
-                            "message": "Your refresh token has already been used to generate a new access token. Please try signing in again.",
+                            "message": "Could not validate your refresh token. Please try signing in again.",
                             "type": "invalid_request_error",
                             "param": serde_json::Value::Null,
-                            "code": "refresh_token_reused"
+                            "code": "refresh_token_expired"
                         }
                     })),
                 )
@@ -6178,19 +6178,18 @@ async fn gateway_auto_removes_manual_oauth_refresh_failure_after_access_token_ex
         "openai:responses",
         "https://chatgpt.com/backend-api/codex",
     );
-
     let mut key = sample_key(
         "key-codex-oauth-refresh-expired",
         "provider-codex",
         "openai:responses",
-        "stale-codex-access-token",
+        "expired-codex-access-token",
     );
     key.auth_type = "oauth".to_string();
     key.expires_at_unix_secs = Some(1);
     key.encrypted_auth_config = Some(
         encrypt_python_fernet_plaintext(
             DEVELOPMENT_ENCRYPTION_KEY,
-            r#"{"provider_type":"codex","refresh_token":"used-refresh-token","email":"alice@example.com","account_id":"acct-codex-123","plan_type":"plus","expires_at":1}"#,
+            r#"{"provider_type":"codex","refresh_token":"expired-refresh-token","email":"alice@example.com","account_id":"acct-codex-123","plan_type":"plus","expires_at":1}"#,
         )
         .expect("auth config ciphertext should build"),
     );
@@ -6200,7 +6199,6 @@ async fn gateway_auto_removes_manual_oauth_refresh_failure_after_access_token_ex
         vec![endpoint],
         vec![key],
     ));
-
     let (token_url, token_handle) = start_server(token_server).await;
     let oauth_refresh =
         crate::provider_transport::LocalOAuthRefreshCoordinator::with_adapters_for_tests(vec![
@@ -6240,6 +6238,7 @@ async fn gateway_auto_removes_manual_oauth_refresh_failure_after_access_token_ex
         .await
         .expect("refresh payload should parse");
     assert_eq!(refresh_payload["status"], json!("auto_removed"));
+    assert_eq!(refresh_payload["message"], json!("已自动删除"));
     assert_eq!(*token_hits.lock().expect("mutex should lock"), 1);
 
     let keys = provider_catalog_repository
