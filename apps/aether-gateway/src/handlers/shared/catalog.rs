@@ -13,6 +13,7 @@ use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKe
 use aether_provider_pool::{
     grok_pool_tier_from_quota_bucket, grok_supported_quota_windows_for_tier,
 };
+use aether_scheduler_core::provider_key_circuit_payload_is_active_open_at;
 use serde_json::{json, Map, Value};
 use std::borrow::Cow;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1779,6 +1780,39 @@ pub(crate) fn provider_key_health_summary(
     bool,
     serde_json::Map<String, serde_json::Value>,
 ) {
+    provider_key_health_summary_with_circuit_predicate(key, |value| {
+        value
+            .get("open")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    })
+}
+
+pub(crate) fn provider_key_health_summary_at(
+    key: &StoredProviderCatalogKey,
+    now_unix_secs: u64,
+) -> (
+    f64,
+    i64,
+    Option<String>,
+    bool,
+    serde_json::Map<String, serde_json::Value>,
+) {
+    provider_key_health_summary_with_circuit_predicate(key, |value| {
+        provider_key_circuit_payload_is_active_open_at(value, now_unix_secs)
+    })
+}
+
+fn provider_key_health_summary_with_circuit_predicate(
+    key: &StoredProviderCatalogKey,
+    circuit_is_open: impl Fn(&serde_json::Value) -> bool,
+) -> (
+    f64,
+    i64,
+    Option<String>,
+    bool,
+    serde_json::Map<String, serde_json::Value>,
+) {
     let health_by_format = key
         .health_by_format
         .as_ref()
@@ -1820,12 +1854,7 @@ pub(crate) fn provider_key_health_summary(
         }
     }
 
-    let any_circuit_open = circuit_by_format.values().any(|value| {
-        value
-            .get("open")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-    });
+    let any_circuit_open = circuit_by_format.values().any(circuit_is_open);
 
     (
         if health_by_format.is_empty() {
@@ -1974,15 +2003,10 @@ pub(crate) fn build_admin_provider_key_response(
         last_failure_at,
         circuit_breaker_open,
         circuit_by_format,
-    ) = provider_key_health_summary(key);
+    ) = provider_key_health_summary_at(key, now_unix_secs);
     let circuit_sample = circuit_by_format
         .values()
-        .find(|value| {
-            value
-                .get("open")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false)
-        })
+        .find(|value| provider_key_circuit_payload_is_active_open_at(value, now_unix_secs))
         .or_else(|| circuit_by_format.values().next());
     let is_adaptive = key.rpm_limit.is_none();
     let effective_limit = if is_adaptive {

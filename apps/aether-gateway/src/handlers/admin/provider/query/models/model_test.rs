@@ -68,6 +68,7 @@ use aether_model_fetch::{
     aggregate_models_for_cache, fetch_models_from_transports, json_string_list,
     preset_models_for_provider, selected_models_fetch_endpoints,
 };
+use aether_scheduler_core::provider_key_circuit_payload_is_active_open_at;
 use axum::{
     body::{to_bytes, Body},
     http::{self, HeaderMap, HeaderName, HeaderValue},
@@ -920,6 +921,7 @@ fn provider_query_test_key_sort_key(
     provider_type: &str,
     key: &StoredProviderCatalogKey,
     endpoint_api_format: &str,
+    now_unix_secs: u64,
 ) -> (u8, u8, i32, u64, i32) {
     let quota_exhausted =
         admin_provider_pool_pure::admin_pool_key_account_quota_exhausted(key, provider_type);
@@ -928,10 +930,7 @@ fn provider_query_test_key_sort_key(
         .as_ref()
         .and_then(Value::as_object)
         .and_then(|value| value.get(endpoint_api_format))
-        .and_then(Value::as_object)
-        .and_then(|value| value.get("open"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+        .is_some_and(|value| provider_key_circuit_payload_is_active_open_at(value, now_unix_secs));
     let health_score = key
         .health_by_format
         .as_ref()
@@ -1390,6 +1389,7 @@ async fn provider_query_build_kiro_test_candidates(
             provider_query_key_supports_endpoint(key, &provider.provider_type, &endpoint.api_format)
         })
         .collect::<Vec<_>>();
+    let now_unix_secs = current_unix_ms() / 1000;
 
     let candidates = if test_mode.eq_ignore_ascii_case("pool") {
         if let Some(pool_config) =
@@ -1411,6 +1411,7 @@ async fn provider_query_build_kiro_test_candidates(
                     provider.provider_type.as_str(),
                     key,
                     &endpoint.api_format,
+                    now_unix_secs,
                 )
             });
             keys.into_iter()
@@ -1428,6 +1429,7 @@ async fn provider_query_build_kiro_test_candidates(
                 provider.provider_type.as_str(),
                 key,
                 &endpoint.api_format,
+                now_unix_secs,
             )
         });
         keys.into_iter()
