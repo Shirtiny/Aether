@@ -346,7 +346,7 @@ async fn gateway_handles_admin_key_health_locally_with_trusted_admin_principal()
                     Some(json!({"openai:chat": {
                         "open": true,
                         "open_at": "2026-03-26T12:01:00+00:00",
-                        "next_probe_at": "2026-03-26T12:05:00+00:00",
+                        "next_probe_at": "2099-03-26T12:05:00+00:00",
                         "half_open_until": null,
                         "half_open_successes": 1,
                         "half_open_failures": 0
@@ -399,7 +399,7 @@ async fn gateway_handles_admin_key_health_locally_with_trusted_admin_principal()
         payload["circuit_breaker_open_at"],
         "2026-03-26T12:01:00+00:00"
     );
-    assert_eq!(payload["next_probe_at"], "2026-03-26T12:05:00+00:00");
+    assert_eq!(payload["next_probe_at"], "2099-03-26T12:05:00+00:00");
     assert_eq!(payload["half_open_successes"], 1);
     assert_eq!(payload["half_open_failures"], 0);
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
@@ -442,7 +442,7 @@ async fn gateway_recovers_admin_key_health_locally_with_trusted_admin_principal(
                     Some(json!({"openai:chat": {
                         "open": true,
                         "open_at": "2026-03-26T12:01:00+00:00",
-                        "next_probe_at": "2026-03-26T12:05:00+00:00",
+                        "next_probe_at": "2099-03-26T12:05:00+00:00",
                         "half_open_until": null,
                         "half_open_successes": 0,
                         "half_open_failures": 1

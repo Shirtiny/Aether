@@ -1237,7 +1237,8 @@ async fn admin_monitoring_circuit_history_returns_local_payload() {
                 "openai:chat": {
                     "open": true,
                     "open_at": "2026-03-30T12:00:00+00:00",
-                    "next_probe_at": "2026-03-30T12:05:00+00:00",
+                    "next_probe_at": "2099-03-30T12:05:00+00:00",
+                    "recovery_seconds": 300,
                     "reason": "错误率过高"
                 }
             })),
