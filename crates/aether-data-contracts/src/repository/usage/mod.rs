@@ -1,6 +1,7 @@
 mod types;
 
 pub use types::{
+    extract_provider_reasoning_effort_from_body, extract_provider_service_tier_from_body,
     parse_usage_body_ref, usage_body_ref, usage_request_metadata_client_family,
     ApiKeyLastUsedDelta, ManagementTokenCounterDelta, PendingUsageCleanupSummary,
     ProviderApiKeyWindowUsageRequest, ProxyNodeCounterDelta, StoredProviderApiKeyUsageSummary,
@@ -27,5 +28,6 @@ pub use types::{
     UsageLeaderboardQuery, UsageMonitoringErrorCountQuery, UsageMonitoringErrorListQuery,
     UsagePerformancePercentilesQuery, UsageProviderPerformanceQuery, UsageReadRepository,
     UsageRepository, UsageSettledCostSummaryQuery, UsageTimeSeriesGranularity,
-    UsageTimeSeriesQuery, UsageWriteRepository,
+    UsageTimeSeriesQuery, UsageWriteRepository, PROVIDER_REASONING_EFFORT_METADATA_KEY,
+    PROVIDER_SERVICE_TIER_METADATA_KEY,
 };

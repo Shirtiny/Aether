@@ -532,6 +532,16 @@ async function pollActiveRequests() {
         if ('target_model' in update && (typeof update.target_model === 'string' || update.target_model === null)) {
           record.target_model = update.target_model
         }
+        if ('reasoning_effort' in update) {
+          record.reasoning_effort = typeof update.reasoning_effort === 'string'
+            ? update.reasoning_effort
+            : null
+        }
+        if ('service_tier' in update) {
+          record.service_tier = typeof update.service_tier === 'string'
+            ? update.service_tier
+            : null
+        }
         // 管理员接口返回额外字段
         // 只有当返回的 provider 不是 pending/unknown/unknow 时才更新，避免覆盖已有的正确值
         if ('provider' in update && typeof update.provider === 'string') {

@@ -278,6 +278,20 @@ describe('UsageRecordsTable', () => {
     expect(root.textContent).toContain('gpt-5')
   })
 
+  it('shows reasoning effort next to the model name', () => {
+    const root = mountUsageRecordsTable([buildRecord({ reasoning_effort: 'xhigh' })])
+
+    expect(root.textContent).toContain('gpt-5')
+    expect(root.textContent).toContain('xhigh')
+  })
+
+  it('shows fast badge for priority service tier', () => {
+    const root = mountUsageRecordsTable([buildRecord({ service_tier: 'priority' })])
+
+    expect(root.textContent).toContain('gpt-5')
+    expect(root.textContent).toContain('fast')
+  })
+
   it('offers embedding API formats in the usage record filter', () => {
     const root = mountUsageRecordsTable([buildRecord({ api_format: 'openai:chat' })])
 
