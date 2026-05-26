@@ -1222,6 +1222,12 @@ fn admin_usage_active_request_json(
     if let Some(target_model) = item.target_model.as_ref() {
         value["target_model"] = json!(target_model);
     }
+    if let Some(reasoning_effort) = item.provider_reasoning_effort() {
+        value["reasoning_effort"] = json!(reasoning_effort);
+    }
+    if let Some(service_tier) = item.provider_service_tier() {
+        value["service_tier"] = json!(service_tier);
+    }
     if let Some(image_progress) = image_progress {
         value["image_progress"] = image_progress.clone();
     }
@@ -1335,6 +1341,12 @@ pub fn admin_usage_record_json(
         "request_path_and_query",
         admin_usage_metadata_string(item, "request_path_and_query"),
     );
+    if let Some(reasoning_effort) = item.provider_reasoning_effort() {
+        object.insert("reasoning_effort".to_string(), json!(reasoning_effort));
+    }
+    if let Some(service_tier) = item.provider_service_tier() {
+        object.insert("service_tier".to_string(), json!(service_tier));
+    }
     payload
 }
 
@@ -2652,6 +2664,32 @@ mod tests {
         );
 
         assert_eq!(record["client_family"], "codex");
+    }
+
+    #[test]
+    fn admin_usage_record_includes_provider_reasoning_effort() {
+        let item = StoredRequestUsageAudit {
+            provider_request_body: Some(json!({
+                "reasoning": { "effort": "xhigh" },
+                "service_tier": "priority"
+            })),
+            ..sample_usage("completed", Some(200), None)
+        };
+
+        let record = admin_usage_record_json(
+            &item,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            false,
+            false,
+            None,
+        );
+        let active = admin_usage_active_request_json(&item, None, None, None);
+
+        assert_eq!(record["reasoning_effort"], "xhigh");
+        assert_eq!(active["reasoning_effort"], "xhigh");
+        assert_eq!(record["service_tier"], "priority");
+        assert_eq!(active["service_tier"], "priority");
     }
 
     #[test]

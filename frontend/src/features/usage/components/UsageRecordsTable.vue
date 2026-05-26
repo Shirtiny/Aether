@@ -187,7 +187,25 @@
         <!-- 第一行：模型 + 费用 -->
         <div class="flex items-center justify-between gap-2">
           <div class="min-w-0 flex-1">
-            <span class="text-sm font-medium truncate block">{{ record.model }}</span>
+            <div class="flex min-w-0 items-center gap-1">
+              <span class="text-sm font-medium truncate">{{ record.model }}</span>
+              <Badge
+                v-if="getReasoningEffort(record)"
+                variant="outline"
+                class="h-4 rounded-full border-primary/30 bg-primary/5 px-1.5 text-[10px] leading-4 text-primary flex-shrink-0"
+                :title="getReasoningEffortTitle(record)"
+              >
+                {{ getReasoningEffort(record) }}
+              </Badge>
+              <Badge
+                v-if="getFastBadge(record)"
+                variant="outline"
+                class="h-4 rounded-full border-emerald-500/30 bg-emerald-500/10 px-1.5 text-[10px] leading-4 text-emerald-600 dark:text-emerald-400 flex-shrink-0"
+                :title="getFastBadgeTitle(record)"
+              >
+                fast
+              </Badge>
+            </div>
             <span
               v-if="getActualModel(record)"
               class="text-[11px] text-muted-foreground truncate block"
@@ -556,8 +574,24 @@
               v-if="getActualModel(record)"
               class="flex flex-col text-xs gap-0.5"
             >
-              <div class="flex items-center gap-1 truncate">
+              <div class="flex min-w-0 items-center gap-1">
                 <span class="truncate">{{ record.model }}</span>
+                <Badge
+                  v-if="getReasoningEffort(record)"
+                  variant="outline"
+                  class="h-4 rounded-full border-primary/30 bg-primary/5 px-1.5 text-[10px] leading-4 text-primary flex-shrink-0"
+                  :title="getReasoningEffortTitle(record)"
+                >
+                  {{ getReasoningEffort(record) }}
+                </Badge>
+                <Badge
+                  v-if="getFastBadge(record)"
+                  variant="outline"
+                  class="h-4 rounded-full border-emerald-500/30 bg-emerald-500/10 px-1.5 text-[10px] leading-4 text-emerald-600 dark:text-emerald-400 flex-shrink-0"
+                  :title="getFastBadgeTitle(record)"
+                >
+                  fast
+                </Badge>
                 <svg
                   xmlns="http://www.w3.org/2000/svg"
                   viewBox="0 0 20 20"
@@ -575,8 +609,26 @@
             </div>
             <span
               v-else
-              class="truncate block"
-            >{{ record.model }}</span>
+              class="flex min-w-0 items-center gap-1"
+            >
+              <span class="truncate">{{ record.model }}</span>
+              <Badge
+                v-if="getReasoningEffort(record)"
+                variant="outline"
+                class="h-4 rounded-full border-primary/30 bg-primary/5 px-1.5 text-[10px] leading-4 text-primary flex-shrink-0"
+                :title="getReasoningEffortTitle(record)"
+              >
+                {{ getReasoningEffort(record) }}
+              </Badge>
+              <Badge
+                v-if="getFastBadge(record)"
+                variant="outline"
+                class="h-4 rounded-full border-emerald-500/30 bg-emerald-500/10 px-1.5 text-[10px] leading-4 text-emerald-600 dark:text-emerald-400 flex-shrink-0"
+                :title="getFastBadgeTitle(record)"
+              >
+                fast
+              </Badge>
+            </span>
           </TableCell>
           <TableCell
             v-if="isAdmin && isColumnVisible('provider')"
@@ -1302,12 +1354,39 @@ function getActualModel(record: UsageRecord): string | null {
   return null
 }
 
+function getReasoningEffort(record: UsageRecord): string | null {
+  const effort = record.reasoning_effort?.trim()
+  return effort || null
+}
+
+function getReasoningEffortTitle(record: UsageRecord): string {
+  const effort = getReasoningEffort(record)
+  return effort ? `Reasoning: ${effort}` : ''
+}
+
+function getServiceTier(record: UsageRecord): string | null {
+  const serviceTier = record.service_tier?.trim().toLowerCase()
+  return serviceTier || null
+}
+
+function getFastBadge(record: UsageRecord): boolean {
+  return getServiceTier(record) === 'priority'
+}
+
+function getFastBadgeTitle(record: UsageRecord): string {
+  const serviceTier = getServiceTier(record)
+  return serviceTier ? `Service tier: ${serviceTier}` : ''
+}
+
 // 获取模型列的 tooltip
 function getModelTooltip(record: UsageRecord): string {
   const actualModel = getActualModel(record)
+  const reasoningEffort = getReasoningEffort(record)
+  const fastSuffix = getFastBadge(record) ? '\nService tier: priority' : ''
+  const suffix = `${reasoningEffort ? `\nReasoning: ${reasoningEffort}` : ''}${fastSuffix}`
   if (actualModel) {
-    return `${record.model} -> ${actualModel}`
+    return `${record.model} -> ${actualModel}${suffix}`
   }
-  return record.model
+  return `${record.model}${suffix}`
 }
 </script>

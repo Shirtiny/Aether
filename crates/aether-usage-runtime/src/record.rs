@@ -1,7 +1,9 @@
 use aether_data_contracts::repository::usage::UpsertUsageRecord;
 use aether_data_contracts::DataLayerError;
 
-use crate::request_metadata::sanitize_usage_request_metadata;
+use crate::request_metadata::{
+    attach_provider_request_body_metadata, sanitize_usage_request_metadata,
+};
 use crate::{UsageEvent, UsageEventType};
 
 fn metadata_string(metadata: Option<&serde_json::Value>, key: &str) -> Option<String> {
@@ -29,7 +31,11 @@ pub fn build_upsert_usage_record_from_event(
     event: &UsageEvent,
 ) -> Result<UpsertUsageRecord, DataLayerError> {
     let (status, billing_status) = lifecycle_status_and_billing(event.event_type);
-    let data = event.data.clone();
+    let mut data = event.data.clone();
+    data.request_metadata = attach_provider_request_body_metadata(
+        data.request_metadata,
+        data.provider_request_body.as_ref(),
+    );
     let now_unix_secs = event.timestamp_ms / 1_000;
 
     Ok(UpsertUsageRecord {
@@ -169,6 +175,10 @@ mod tests {
                 output_tokens: Some(20),
                 total_tokens: Some(30),
                 status_code: Some(200),
+                provider_request_body: Some(serde_json::json!({
+                    "reasoning": { "effort": "max" },
+                    "service_tier": "priority"
+                })),
                 ..UsageEventData::default()
             },
         })
@@ -178,6 +188,22 @@ mod tests {
         assert_eq!(record.status, "completed");
         assert_eq!(record.billing_status, "pending");
         assert_eq!(record.total_tokens, Some(30));
+        assert_eq!(
+            record
+                .request_metadata
+                .as_ref()
+                .and_then(|value| value.get("provider_reasoning_effort"))
+                .and_then(serde_json::Value::as_str),
+            Some("max")
+        );
+        assert_eq!(
+            record
+                .request_metadata
+                .as_ref()
+                .and_then(|value| value.get("provider_service_tier"))
+                .and_then(serde_json::Value::as_str),
+            Some("priority")
+        );
         assert_eq!(record.finalized_at_unix_secs, Some(1_700_000_000));
     }
 

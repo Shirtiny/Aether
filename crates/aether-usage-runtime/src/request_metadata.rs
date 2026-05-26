@@ -3,6 +3,10 @@ use aether_ai_formats::api::{
 };
 use aether_ai_formats::UPSTREAM_IS_STREAM_KEY;
 use aether_contracts::ExecutionPlan;
+use aether_data_contracts::repository::usage::{
+    extract_provider_reasoning_effort_from_body, extract_provider_service_tier_from_body,
+    PROVIDER_REASONING_EFFORT_METADATA_KEY, PROVIDER_SERVICE_TIER_METADATA_KEY,
+};
 use serde_json::{json, Map, Value};
 
 const MAX_USAGE_REQUEST_METADATA_DEPTH: usize = 32;
@@ -69,6 +73,34 @@ pub(crate) fn sanitize_usage_request_metadata_ref(value: Option<&Value>) -> Opti
     (!filtered.is_empty()).then_some(Value::Object(filtered))
 }
 
+pub(crate) fn attach_provider_request_body_metadata(
+    metadata: Option<Value>,
+    provider_request_body: Option<&Value>,
+) -> Option<Value> {
+    let reasoning_effort = extract_provider_reasoning_effort_from_body(provider_request_body);
+    let service_tier = extract_provider_service_tier_from_body(provider_request_body);
+    if reasoning_effort.is_none() && service_tier.is_none() {
+        return metadata;
+    }
+    let mut object = match metadata {
+        Some(Value::Object(object)) => object,
+        _ => Map::new(),
+    };
+    if let Some(reasoning_effort) = reasoning_effort {
+        object.insert(
+            PROVIDER_REASONING_EFFORT_METADATA_KEY.to_string(),
+            Value::String(reasoning_effort),
+        );
+    }
+    if let Some(service_tier) = service_tier {
+        object.insert(
+            PROVIDER_SERVICE_TIER_METADATA_KEY.to_string(),
+            Value::String(service_tier),
+        );
+    }
+    Some(Value::Object(object))
+}
+
 fn copy_allowed_metadata_fields(source: &Map<String, Value>, target: &mut Map<String, Value>) {
     copy_non_empty_string(source, target, "trace_id");
     copy_non_empty_string(source, target, "client_ip");
@@ -81,6 +113,8 @@ fn copy_allowed_metadata_fields(source: &Map<String, Value>, target: &mut Map<St
     copy_non_empty_string(source, target, "request_path");
     copy_non_empty_string(source, target, "request_query_string");
     copy_non_empty_string(source, target, "request_path_and_query");
+    copy_non_empty_string(source, target, PROVIDER_REASONING_EFFORT_METADATA_KEY);
+    copy_non_empty_string(source, target, PROVIDER_SERVICE_TIER_METADATA_KEY);
     copy_number(source, target, "provider_request_body_base64_bytes");
     copy_number(source, target, "provider_response_body_base64_bytes");
     copy_number(source, target, "client_response_body_base64_bytes");
@@ -121,6 +155,8 @@ fn move_allowed_metadata_fields(mut source: Map<String, Value>, target: &mut Map
     remove_non_empty_string(&mut source, target, "request_path");
     remove_non_empty_string(&mut source, target, "request_query_string");
     remove_non_empty_string(&mut source, target, "request_path_and_query");
+    remove_non_empty_string(&mut source, target, PROVIDER_REASONING_EFFORT_METADATA_KEY);
+    remove_non_empty_string(&mut source, target, PROVIDER_SERVICE_TIER_METADATA_KEY);
     remove_number(&mut source, target, "provider_request_body_base64_bytes");
     remove_number(&mut source, target, "provider_response_body_base64_bytes");
     remove_number(&mut source, target, "client_response_body_base64_bytes");

@@ -523,7 +523,9 @@ export function useUsageData(options: UseUsageDataOptions) {
           api_key_name: existing.api_key_name || record.api_key_name,
           provider_key_name: existing.provider_key_name || record.provider_key_name,
           rate_multiplier: existing.rate_multiplier ?? record.rate_multiplier,
-          target_model: existing.target_model || record.target_model
+          target_model: existing.target_model || record.target_model,
+          reasoning_effort: existing.reasoning_effort || record.reasoning_effort,
+          service_tier: existing.service_tier || record.service_tier
         }
       }
 

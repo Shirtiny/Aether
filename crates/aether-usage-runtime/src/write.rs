@@ -13,9 +13,9 @@ use crate::body_capture::{
     RuntimeBodyCaptureMetadataInput,
 };
 use crate::request_metadata::{
-    build_usage_request_metadata_seed, merge_usage_request_metadata,
-    merge_usage_request_metadata_owned, sanitize_usage_request_metadata,
-    sanitize_usage_request_metadata_ref,
+    attach_provider_request_body_metadata, build_usage_request_metadata_seed,
+    merge_usage_request_metadata, merge_usage_request_metadata_owned,
+    sanitize_usage_request_metadata, sanitize_usage_request_metadata_ref,
 };
 use crate::{
     map_usage_from_response, stream_capture_terminal_state, GatewayStreamReportRequest,
@@ -559,6 +559,8 @@ fn build_terminal_usage_event_from_seed_impl(
     } else {
         merge_usage_request_metadata(request_metadata, audit_payload)
     };
+    let request_metadata =
+        attach_provider_request_body_metadata(request_metadata, provider_request.as_ref());
 
     let mut data = UsageEventData {
         user_id,
