@@ -219,7 +219,7 @@ impl LocalOpenAiResponsesSyncAttemptSource<'_> {
             attempt,
             self.spec,
         )
-        .await
+        .await?
         else {
             return Ok(None);
         };
@@ -257,7 +257,7 @@ impl LocalOpenAiResponsesStreamAttemptSource<'_> {
             attempt,
             self.spec,
         )
-        .await
+        .await?
         else {
             return Ok(None);
         };
@@ -325,7 +325,7 @@ pub(super) async fn build_local_sync_plan_and_reports(
         let Some(payload) = maybe_build_local_openai_responses_decision_payload_for_candidate(
             state, parts, trace_id, body_json, &input, attempt, spec,
         )
-        .await
+        .await?
         else {
             continue;
         };
@@ -397,7 +397,7 @@ pub(super) async fn build_local_stream_plan_and_reports(
         let Some(payload) = maybe_build_local_openai_responses_decision_payload_for_candidate(
             state, parts, trace_id, body_json, &input, attempt, spec,
         )
-        .await
+        .await?
         else {
             continue;
         };

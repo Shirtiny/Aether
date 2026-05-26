@@ -1,7 +1,5 @@
-use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
@@ -13,6 +11,9 @@ use crate::ai_serving::planner::candidate_resolution::EligibleLocalExecutionCand
 use crate::ai_serving::planner::common::{
     endpoint_config_forces_body_stream_field, enforce_provider_body_stream_policy,
     request_requires_body_stream_field, OPENAI_CHAT_STREAM_PLAN_KIND,
+};
+use crate::ai_serving::planner::redaction::{
+    request_identity_response_encoding_when_redacted, resolve_provider_chat_pii_redaction,
 };
 use crate::ai_serving::planner::standard::{
     apply_codex_openai_responses_special_headers, build_cross_format_openai_chat_request_body,
@@ -36,13 +37,7 @@ use crate::ai_serving::{
     LocalResolvedOAuthRequestAuth,
 };
 use crate::ai_serving::{ConversionMode, ExecutionStrategy};
-use crate::privacy::{
-    build_redaction_session_config, read_chat_pii_redaction_runtime_config,
-    try_mask_chat_request_json_with_cache_options, MaskChatRequestOptions, RedactionMaskError,
-    RedactionSessionSlot, RedisRedactionMappingCache,
-};
 use crate::{AppState, GatewayError};
-use tracing::warn;
 
 use super::support::{
     mark_skipped_local_openai_chat_candidate,
@@ -64,99 +59,6 @@ pub(crate) struct LocalOpenAiChatCandidatePayloadParts {
     pub(super) envelope_name: Option<&'static str>,
     pub(super) transport: Arc<GatewayProviderTransportSnapshot>,
     pub(super) request_redacted: bool,
-}
-
-fn request_identity_response_encoding_when_redacted(
-    headers: &mut BTreeMap<String, String>,
-    redacted: bool,
-) {
-    if redacted {
-        headers.insert("accept-encoding".to_string(), "identity".to_string());
-    }
-}
-
-struct ProviderChatRequestRedaction<'a> {
-    body_json: Cow<'a, Value>,
-    redacted: bool,
-}
-
-impl<'a> ProviderChatRequestRedaction<'a> {
-    fn disabled(body_json: &'a Value, _parts: &http::request::Parts) -> Self {
-        Self {
-            body_json: Cow::Borrowed(body_json),
-            redacted: false,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct ChatPiiRedactionFeatureSettings {
-    enabled: Option<bool>,
-    inject_model_instruction: Option<bool>,
-}
-
-impl ChatPiiRedactionFeatureSettings {
-    fn merge_from_value(&mut self, value: Option<&Value>) {
-        let Some(settings) = value
-            .and_then(Value::as_object)
-            .and_then(|features| features.get("chat_pii_redaction"))
-            .and_then(Value::as_object)
-        else {
-            return;
-        };
-        if let Some(enabled) = settings.get("enabled").and_then(Value::as_bool) {
-            self.enabled = Some(enabled);
-        }
-        if let Some(inject_model_instruction) = settings
-            .get("inject_model_instruction")
-            .and_then(Value::as_bool)
-        {
-            self.inject_model_instruction = Some(inject_model_instruction);
-        }
-    }
-
-    fn effective_enabled(self) -> bool {
-        self.enabled.unwrap_or(false)
-    }
-
-    fn effective_inject_model_instruction(self) -> bool {
-        self.inject_model_instruction.unwrap_or(true)
-    }
-}
-
-async fn resolve_chat_pii_redaction_feature_settings(
-    state: &AppState,
-    input: &LocalOpenAiChatDecisionInput,
-) -> Result<ChatPiiRedactionFeatureSettings, GatewayError> {
-    let user_settings = state
-        .read_user_feature_settings(&input.auth_context.user_id)
-        .await
-        .map_err(|err| {
-            warn!(
-                error = ?err,
-                "gateway failed to read user chat pii redaction feature settings"
-            );
-            GatewayError::Internal("chat pii redaction setup failed".to_string())
-        })?;
-    let key_settings = state
-        .read_auth_api_key_feature_settings(
-            &input.auth_context.user_id,
-            &input.auth_context.api_key_id,
-            input.auth_context.api_key_is_standalone,
-        )
-        .await
-        .map_err(|err| {
-            warn!(
-                error = ?err,
-                "gateway failed to read api key chat pii redaction feature settings"
-            );
-            GatewayError::Internal("chat pii redaction setup failed".to_string())
-        })?;
-
-    let mut settings = ChatPiiRedactionFeatureSettings::default();
-    settings.merge_from_value(user_settings.as_ref());
-    settings.merge_from_value(key_settings.as_ref());
-    Ok(settings)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -186,9 +88,15 @@ pub(crate) async fn resolve_local_openai_chat_candidate_payload_parts(
             Some(&input.requested_model),
         )
         .await;
-    let redaction =
-        resolve_provider_chat_request_redaction(state, parts, body_json, input, candidate_id)
-            .await?;
+    let redaction = resolve_provider_chat_pii_redaction(
+        state,
+        parts,
+        body_json,
+        &input.auth_context,
+        "openai:chat",
+        candidate_id,
+    )
+    .await?;
     let body_json = redaction.body_json.as_ref();
 
     if provider_api_format == "openai:chat" {
@@ -776,88 +684,4 @@ async fn build_kiro_openai_chat_cross_format_payload_parts(
         transport: Arc::clone(transport),
         request_redacted,
     })
-}
-
-async fn resolve_provider_chat_request_redaction<'a>(
-    state: &AppState,
-    parts: &http::request::Parts,
-    body_json: &'a Value,
-    input: &LocalOpenAiChatDecisionInput,
-    candidate_id: &str,
-) -> Result<ProviderChatRequestRedaction<'a>, GatewayError> {
-    if parts.uri.path() != "/v1/chat/completions" {
-        return Ok(ProviderChatRequestRedaction::disabled(body_json, parts));
-    }
-    let Some(slot) = parts.extensions.get::<RedactionSessionSlot>() else {
-        return Ok(ProviderChatRequestRedaction::disabled(body_json, parts));
-    };
-    let runtime_config = read_chat_pii_redaction_runtime_config(state)
-        .await
-        .map_err(|err| {
-            warn!(
-                error = ?err,
-                "gateway failed to read chat pii redaction runtime config"
-            );
-            GatewayError::Internal("chat pii redaction setup failed".to_string())
-        })?;
-    if !runtime_config.enabled {
-        return Ok(ProviderChatRequestRedaction::disabled(body_json, parts));
-    }
-    let feature_settings = resolve_chat_pii_redaction_feature_settings(state, input).await?;
-    if !feature_settings.effective_enabled() {
-        return Ok(ProviderChatRequestRedaction::disabled(body_json, parts));
-    }
-    let Some(hmac_key) = state.encryption_key().map(str::as_bytes).map(Vec::from) else {
-        warn!("gateway chat pii redaction is enabled but encryption key is unavailable");
-        return Err(GatewayError::Internal(
-            "chat pii redaction setup failed".to_string(),
-        ));
-    };
-    let body_bytes = serde_json::to_vec(body_json).map_err(|err| {
-        warn!(
-            error = ?err,
-            "gateway failed to serialize provider chat pii redaction body"
-        );
-        GatewayError::Internal("chat pii redaction setup failed".to_string())
-    })?;
-    let now_unix_secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let cache = RedisRedactionMappingCache::new(state.runtime_state.as_ref());
-    let masked = try_mask_chat_request_json_with_cache_options(
-        &body_bytes,
-        build_redaction_session_config(hmac_key, &runtime_config, now_unix_secs),
-        MaskChatRequestOptions::runtime(feature_settings.effective_inject_model_instruction()),
-        Some(&cache),
-    )
-    .await
-    .map_err(redaction_mask_error_to_gateway_error)?;
-    if !masked.redacted {
-        return Ok(ProviderChatRequestRedaction {
-            body_json: Cow::Borrowed(body_json),
-            redacted: false,
-        });
-    }
-    let masked_body_json = serde_json::from_slice::<Value>(&masked.body).map_err(|err| {
-        warn!(
-            error = ?err,
-            "gateway failed to decode redacted provider chat pii body"
-        );
-        GatewayError::Internal("chat pii redaction setup failed".to_string())
-    })?;
-    slot.put_for_candidate(candidate_id, masked.session);
-    Ok(ProviderChatRequestRedaction {
-        body_json: Cow::Owned(masked_body_json),
-        redacted: true,
-    })
-}
-
-fn redaction_mask_error_to_gateway_error(error: RedactionMaskError) -> GatewayError {
-    match error {
-        RedactionMaskError::Limit(limit) => GatewayError::Client {
-            status: limit.client_status(),
-            message: limit.safe_message().to_string(),
-        },
-    }
 }

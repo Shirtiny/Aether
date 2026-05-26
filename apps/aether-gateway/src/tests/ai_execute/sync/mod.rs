@@ -28,3 +28,4 @@ mod claude;
 mod cli;
 mod gemini;
 mod image;
+mod pii_redaction_formats;

@@ -249,7 +249,7 @@ impl LocalSameFormatProviderSyncAttemptSource<'_> {
             attempt,
             self.spec,
         )
-        .await
+        .await?
         else {
             return Ok(None);
         };
@@ -287,7 +287,7 @@ impl LocalSameFormatProviderStreamAttemptSource<'_> {
             attempt,
             self.spec,
         )
-        .await
+        .await?
         else {
             return Ok(None);
         };
@@ -365,7 +365,7 @@ pub(crate) async fn build_local_sync_plan_and_reports(
         let Some(payload) = maybe_build_local_same_format_provider_decision_payload_for_candidate(
             state, parts, trace_id, body_json, &input, attempt, spec,
         )
-        .await
+        .await?
         else {
             continue;
         };
@@ -450,7 +450,7 @@ pub(crate) async fn build_local_stream_plan_and_reports(
         let Some(payload) = maybe_build_local_same_format_provider_decision_payload_for_candidate(
             state, parts, trace_id, body_json, &input, attempt, spec,
         )
-        .await
+        .await?
         else {
             continue;
         };

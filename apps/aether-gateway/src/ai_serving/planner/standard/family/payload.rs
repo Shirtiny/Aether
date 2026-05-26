@@ -24,7 +24,7 @@ use crate::ai_serving::{
 };
 use crate::{
     append_execution_contract_fields_to_value, append_local_failover_policy_to_value,
-    AiExecutionDecision, AppState,
+    AiExecutionDecision, AppState, GatewayError,
 };
 
 use super::request::resolve_local_standard_candidate_payload_parts;
@@ -38,7 +38,7 @@ pub(super) async fn maybe_build_local_standard_decision_payload_for_candidate(
     input: &LocalStandardDecisionInput,
     attempt: LocalStandardCandidateAttempt,
     spec: LocalStandardSpec,
-) -> Option<AiExecutionDecision> {
+) -> Result<Option<AiExecutionDecision>, GatewayError> {
     let spec_metadata = local_standard_spec_metadata(spec);
     if api_format_alias_matches(
         &attempt.eligible.provider_api_format,
@@ -70,10 +70,18 @@ pub(super) async fn maybe_build_local_standard_decision_payload_for_candidate(
         ..
     } = &attempt;
     let candidate = &eligible.candidate;
-    let resolved = resolve_local_standard_candidate_payload_parts(
+    let Some(resolved) = resolve_local_standard_candidate_payload_parts(
         state, parts, trace_id, body_json, input, &attempt, spec,
     )
-    .await?;
+    .await?
+    else {
+        return Ok(None);
+    };
+    let original_request_body_json = if resolved.request_redacted {
+        Some(&resolved.provider_request_body)
+    } else {
+        Some(body_json)
+    };
     let proxy = state
         .resolve_transport_proxy_snapshot_with_tunnel_affinity(&resolved.transport)
         .await;
@@ -124,7 +132,7 @@ pub(super) async fn maybe_build_local_standard_decision_payload_for_candidate(
                 request_path: Some(parts.uri.path()),
                 request_query_string: parts.uri.query(),
                 request_origin: Some(crate::ai_serving::request_origin_from_parts(parts)),
-                original_request_body_json: Some(body_json),
+                original_request_body_json,
                 original_request_body_base64: None,
                 client_session_affinity: input.client_session_affinity.as_ref(),
                 scheduler_affinity_epoch: eligible.orchestration.scheduler_affinity_epoch,
@@ -157,9 +165,10 @@ pub(super) async fn maybe_build_local_standard_decision_payload_for_candidate(
         upstream_is_stream,
         envelope_name: _,
         transport,
+        request_redacted: _,
     } = resolved;
 
-    Some(build_ai_execution_decision_response(
+    Ok(Some(build_ai_execution_decision_response(
         AiExecutionDecisionResponseParts {
             decision_is_stream: spec_metadata.require_streaming,
             decision_kind: spec_metadata.decision_kind.to_string(),
@@ -193,7 +202,7 @@ pub(super) async fn maybe_build_local_standard_decision_payload_for_candidate(
             report_context: Some(report_context),
             auth_context: input.auth_context.clone(),
         },
-    ))
+    )))
 }
 
 pub(super) async fn mark_skipped_local_standard_candidate(
@@ -512,6 +521,7 @@ mod tests {
             claude_stream_spec(),
         )
         .await
+        .expect("same-format candidate should not error")
         .expect("same-format candidate should build a standard-family payload");
 
         assert_eq!(payload.endpoint_id.as_deref(), Some("endpoint-claude"));
@@ -547,6 +557,7 @@ mod tests {
             claude_stream_spec(),
         )
         .await
+        .expect("cross-format candidate should not error")
         .expect("cross-format candidate should still build after the same-format candidate");
 
         assert_eq!(

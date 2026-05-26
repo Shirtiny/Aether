@@ -15,7 +15,7 @@ use crate::ai_serving::transport::{
 };
 use crate::{
     append_execution_contract_fields_to_value, append_local_failover_policy_to_value,
-    AiExecutionDecision, AppState,
+    AiExecutionDecision, AppState, GatewayError,
 };
 
 use super::request::resolve_local_openai_responses_candidate_payload_parts;
@@ -30,7 +30,7 @@ pub(crate) async fn maybe_build_local_openai_responses_decision_payload_for_cand
     input: &LocalOpenAiResponsesDecisionInput,
     attempt: LocalOpenAiResponsesCandidateAttempt,
     spec: LocalOpenAiResponsesSpec,
-) -> Option<AiExecutionDecision> {
+) -> Result<Option<AiExecutionDecision>, GatewayError> {
     let spec_metadata = local_openai_responses_spec_metadata(spec);
     let attempt_identity = attempt.attempt_identity();
     let LocalOpenAiResponsesCandidateAttempt {
@@ -39,7 +39,7 @@ pub(crate) async fn maybe_build_local_openai_responses_decision_payload_for_cand
         candidate_id,
         ..
     } = attempt;
-    let resolved = resolve_local_openai_responses_candidate_payload_parts(
+    let Some(resolved) = resolve_local_openai_responses_candidate_payload_parts(
         state,
         parts,
         trace_id,
@@ -50,8 +50,16 @@ pub(crate) async fn maybe_build_local_openai_responses_decision_payload_for_cand
         &candidate_id,
         spec,
     )
-    .await?;
+    .await?
+    else {
+        return Ok(None);
+    };
     let candidate = &eligible.candidate;
+    let original_request_body_json = if resolved.request_redacted {
+        Some(&resolved.provider_request_body)
+    } else {
+        Some(body_json)
+    };
 
     let prompt_cache_key = resolved
         .provider_request_body
@@ -109,7 +117,7 @@ pub(crate) async fn maybe_build_local_openai_responses_decision_payload_for_cand
                 request_path: Some(parts.uri.path()),
                 request_query_string: parts.uri.query(),
                 request_origin: Some(crate::ai_serving::request_origin_from_parts(parts)),
-                original_request_body_json: Some(body_json),
+                original_request_body_json,
                 original_request_body_base64: None,
                 client_session_affinity: input.client_session_affinity.as_ref(),
                 scheduler_affinity_epoch: eligible.orchestration.scheduler_affinity_epoch,
@@ -170,9 +178,10 @@ pub(crate) async fn maybe_build_local_openai_responses_decision_payload_for_cand
         envelope_name: _,
         upstream_is_stream,
         transport,
+        request_redacted: _,
     } = resolved;
 
-    Some(build_ai_execution_decision_response(
+    Ok(Some(build_ai_execution_decision_response(
         AiExecutionDecisionResponseParts {
             decision_is_stream: spec_metadata.require_streaming,
             decision_kind: spec_metadata.decision_kind.to_string(),
@@ -206,5 +215,5 @@ pub(crate) async fn maybe_build_local_openai_responses_decision_payload_for_cand
             report_context: Some(report_context),
             auth_context: input.auth_context.clone(),
         },
-    ))
+    )))
 }

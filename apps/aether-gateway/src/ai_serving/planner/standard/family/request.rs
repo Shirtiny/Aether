@@ -11,6 +11,9 @@ use crate::ai_serving::planner::common::{
     endpoint_config_forces_body_stream_field, enforce_provider_body_stream_policy,
     request_requires_body_stream_field, resolve_upstream_is_stream_for_provider,
 };
+use crate::ai_serving::planner::redaction::{
+    request_identity_response_encoding_when_redacted, resolve_provider_chat_pii_redaction,
+};
 use crate::ai_serving::planner::spec_metadata::local_standard_spec_metadata;
 use crate::ai_serving::planner::standard::{
     apply_codex_openai_responses_special_headers, request_body_build_failure_extra_data,
@@ -30,7 +33,7 @@ use crate::ai_serving::{
     build_openai_image_request_body_from_gemini_image_request, gemini_request_is_image_generation,
     CandidateFailureDiagnostic, GatewayProviderTransportSnapshot, LocalResolvedOAuthRequestAuth,
 };
-use crate::AppState;
+use crate::{AppState, GatewayError};
 
 use super::payload::{
     mark_skipped_local_standard_candidate, mark_skipped_local_standard_candidate_with_extra_data,
@@ -49,6 +52,7 @@ pub(crate) struct LocalStandardCandidatePayloadParts {
     pub(super) upstream_is_stream: bool,
     pub(super) envelope_name: Option<&'static str>,
     pub(super) transport: Arc<GatewayProviderTransportSnapshot>,
+    pub(super) request_redacted: bool,
 }
 
 pub(crate) async fn resolve_local_standard_candidate_payload_parts(
@@ -59,7 +63,7 @@ pub(crate) async fn resolve_local_standard_candidate_payload_parts(
     input: &LocalStandardDecisionInput,
     attempt: &LocalStandardCandidateAttempt,
     spec: LocalStandardSpec,
-) -> Option<LocalStandardCandidatePayloadParts> {
+) -> Result<Option<LocalStandardCandidatePayloadParts>, GatewayError> {
     let spec_metadata = local_standard_spec_metadata(spec);
     let planner_state = crate::ai_serving::PlannerAppState::new(state);
     let candidate = &attempt.eligible.candidate;
@@ -69,16 +73,18 @@ pub(crate) async fn resolve_local_standard_candidate_payload_parts(
         && provider_api_format == "openai:image"
         && gemini_request_is_image_generation(body_json)
     {
-        return resolve_local_gemini_image_to_openai_image_candidate_payload_parts(
-            state, parts, trace_id, body_json, input, attempt,
-        )
-        .await;
+        return Ok(
+            resolve_local_gemini_image_to_openai_image_candidate_payload_parts(
+                state, parts, trace_id, body_json, input, attempt,
+            )
+            .await,
+        );
     }
     let is_kiro_claude_cli = is_kiro_claude_messages_transport(transport, provider_api_format);
     let Some(conversion_kind) =
         crate::ai_serving::request_conversion_kind(spec_metadata.api_format, provider_api_format)
     else {
-        return None;
+        return Ok(None);
     };
 
     if let Some(skip_reason) = crate::ai_serving::request_conversion_transport_unsupported_reason(
@@ -95,7 +101,7 @@ pub(crate) async fn resolve_local_standard_candidate_payload_parts(
             skip_reason,
         )
         .await;
-        return None;
+        return Ok(None);
     }
 
     let oauth_context = OauthPreparationContext {
@@ -123,7 +129,7 @@ pub(crate) async fn resolve_local_standard_candidate_payload_parts(
                     "transport_auth_unavailable",
                 )
                 .await;
-                return None;
+                return Ok(None);
             }
         }
     } else {
@@ -148,7 +154,7 @@ pub(crate) async fn resolve_local_standard_candidate_payload_parts(
                     skip_reason,
                 )
                 .await;
-                return None;
+                return Ok(None);
             }
         }
     } else {
@@ -173,7 +179,7 @@ pub(crate) async fn resolve_local_standard_candidate_payload_parts(
                     skip_reason,
                 )
                 .await;
-                return None;
+                return Ok(None);
             }
         }
     };
@@ -194,6 +200,16 @@ pub(crate) async fn resolve_local_standard_candidate_payload_parts(
             Some(&input.requested_model),
         )
         .await;
+    let redaction = resolve_provider_chat_pii_redaction(
+        state,
+        parts,
+        body_json,
+        &input.auth_context,
+        spec_metadata.api_format,
+        &attempt.candidate_id,
+    )
+    .await?;
+    let body_json = redaction.body_json.as_ref();
     let mut provider_request_body =
         match crate::ai_serving::planner::standard::build_standard_request_body_with_model_directives_and_request_headers(
             body_json,
@@ -229,7 +245,7 @@ pub(crate) async fn resolve_local_standard_candidate_payload_parts(
                     ),
                 )
                 .await;
-                return None;
+                return Ok(None);
             }
         };
     enforce_provider_body_stream_policy(
@@ -261,7 +277,7 @@ pub(crate) async fn resolve_local_standard_candidate_payload_parts(
     }
 
     if let Some(kiro_auth) = kiro_auth.as_ref() {
-        return build_kiro_cross_format_payload_parts(
+        return Ok(build_kiro_cross_format_payload_parts(
             state,
             parts,
             trace_id,
@@ -276,8 +292,9 @@ pub(crate) async fn resolve_local_standard_candidate_payload_parts(
             provider_request_body,
             upstream_is_stream,
             kiro_auth,
+            redaction.redacted,
         )
-        .await;
+        .await);
     }
 
     let upstream_url = match crate::ai_serving::planner::standard::build_standard_upstream_url(
@@ -304,7 +321,7 @@ pub(crate) async fn resolve_local_standard_candidate_payload_parts(
                 ),
             )
             .await;
-            return None;
+            return Ok(None);
         }
     };
     let Some(resolved_headers) =
@@ -337,7 +354,7 @@ pub(crate) async fn resolve_local_standard_candidate_payload_parts(
             ),
         )
         .await;
-        return None;
+        return Ok(None);
     };
     let mut provider_request_headers = resolved_headers.headers;
     apply_codex_openai_responses_special_headers(
@@ -349,8 +366,12 @@ pub(crate) async fn resolve_local_standard_candidate_payload_parts(
         Some(trace_id),
         transport.key.decrypted_auth_config.as_deref(),
     );
+    request_identity_response_encoding_when_redacted(
+        &mut provider_request_headers,
+        redaction.redacted,
+    );
 
-    Some(LocalStandardCandidatePayloadParts {
+    Ok(Some(LocalStandardCandidatePayloadParts {
         auth_header: resolved_headers.auth_header,
         auth_value: resolved_headers.auth_value,
         mapped_model: prepared_candidate.mapped_model,
@@ -361,7 +382,8 @@ pub(crate) async fn resolve_local_standard_candidate_payload_parts(
         upstream_is_stream,
         envelope_name: None,
         transport: Arc::clone(transport),
-    })
+        request_redacted: redaction.redacted,
+    }))
 }
 
 async fn resolve_local_gemini_image_to_openai_image_candidate_payload_parts(
@@ -496,6 +518,7 @@ async fn resolve_local_gemini_image_to_openai_image_candidate_payload_parts(
         upstream_is_stream,
         envelope_name: None,
         transport: Arc::clone(transport),
+        request_redacted: false,
     })
 }
 
@@ -515,6 +538,7 @@ async fn build_kiro_cross_format_payload_parts(
     claude_request_body: Value,
     upstream_is_stream: bool,
     kiro_auth: &KiroRequestAuth,
+    request_redacted: bool,
 ) -> Option<LocalStandardCandidatePayloadParts> {
     let candidate = &attempt.eligible.candidate;
     let provider_request_body = match build_kiro_provider_request_body(
@@ -572,7 +596,7 @@ async fn build_kiro_cross_format_payload_parts(
             return None;
         }
     };
-    let provider_request_headers = match build_kiro_provider_headers(KiroProviderHeadersInput {
+    let mut provider_request_headers = match build_kiro_provider_headers(KiroProviderHeadersInput {
         headers: &parts.headers,
         provider_request_body: &provider_request_body,
         original_request_body: original_body_json,
@@ -602,6 +626,10 @@ async fn build_kiro_cross_format_payload_parts(
             return None;
         }
     };
+    request_identity_response_encoding_when_redacted(
+        &mut provider_request_headers,
+        request_redacted,
+    );
 
     Some(LocalStandardCandidatePayloadParts {
         auth_header,
@@ -614,5 +642,6 @@ async fn build_kiro_cross_format_payload_parts(
         upstream_is_stream,
         envelope_name: Some(KIRO_ENVELOPE_NAME),
         transport: Arc::clone(transport),
+        request_redacted,
     })
 }

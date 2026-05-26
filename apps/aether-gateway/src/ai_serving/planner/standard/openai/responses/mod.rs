@@ -117,7 +117,7 @@ pub(crate) async fn maybe_build_sync_local_openai_responses_decision_payload(
         if let Some(payload) = maybe_build_local_openai_responses_decision_payload_for_candidate(
             state, parts, trace_id, body_json, &input, attempt, spec,
         )
-        .await
+        .await?
         {
             return Ok(Some(payload));
         }
@@ -155,7 +155,7 @@ pub(crate) async fn maybe_build_stream_local_openai_responses_decision_payload(
         if let Some(payload) = maybe_build_local_openai_responses_decision_payload_for_candidate(
             state, parts, trace_id, body_json, &input, attempt, spec,
         )
-        .await
+        .await?
         {
             return Ok(Some(payload));
         }

@@ -233,7 +233,7 @@ impl LocalStandardSyncAttemptSource<'_> {
             attempt,
             self.spec,
         )
-        .await
+        .await?
         else {
             return Ok(None);
         };
@@ -270,7 +270,7 @@ impl LocalStandardStreamAttemptSource<'_> {
             attempt,
             self.spec,
         )
-        .await
+        .await?
         else {
             return Ok(None);
         };
@@ -331,7 +331,7 @@ pub(crate) async fn maybe_build_sync_via_standard_family_payload(
         if let Some(payload) = maybe_build_local_standard_decision_payload_for_candidate(
             state, parts, trace_id, body_json, &input, attempt, spec,
         )
-        .await
+        .await?
         {
             return Ok(Some(payload));
         }
@@ -380,7 +380,7 @@ pub(crate) async fn maybe_build_stream_via_standard_family_payload(
         if let Some(payload) = maybe_build_local_standard_decision_payload_for_candidate(
             state, parts, trace_id, body_json, &input, attempt, spec,
         )
-        .await
+        .await?
         {
             return Ok(Some(payload));
         }
@@ -438,7 +438,7 @@ pub(crate) async fn build_local_sync_plan_and_reports(
         let Some(payload) = maybe_build_local_standard_decision_payload_for_candidate(
             state, parts, trace_id, body_json, &input, attempt, spec,
         )
-        .await
+        .await?
         else {
             continue;
         };
@@ -512,7 +512,7 @@ pub(crate) async fn build_local_stream_plan_and_reports(
         let Some(payload) = maybe_build_local_standard_decision_payload_for_candidate(
             state, parts, trace_id, body_json, &input, attempt, spec,
         )
-        .await
+        .await?
         else {
             continue;
         };

@@ -22,7 +22,7 @@ use crate::ai_serving::transport::{
 };
 use crate::{
     append_execution_contract_fields_to_value, append_local_failover_policy_to_value,
-    AiExecutionDecision, AppState,
+    AiExecutionDecision, AppState, GatewayError,
 };
 use aether_scheduler_core::SchedulerMinimalCandidateSelectionCandidate;
 
@@ -40,7 +40,7 @@ pub(crate) async fn maybe_build_local_same_format_provider_decision_payload_for_
     input: &LocalSameFormatProviderDecisionInput,
     attempt: LocalSameFormatProviderCandidateAttempt,
     spec: LocalSameFormatProviderSpec,
-) -> Option<AiExecutionDecision> {
+) -> Result<Option<AiExecutionDecision>, GatewayError> {
     let spec_metadata = local_same_format_provider_spec_metadata(spec);
     let LocalSameFormatProviderCandidateAttempt {
         eligible,
@@ -51,10 +51,18 @@ pub(crate) async fn maybe_build_local_same_format_provider_decision_payload_for_
     let candidate = &eligible.candidate;
     let (execution_strategy, conversion_mode) =
         ai_local_execution_contract_for_formats(spec_metadata.api_format, spec_metadata.api_format);
-    let resolved = resolve_local_same_format_provider_candidate_payload_parts(
+    let Some(resolved) = resolve_local_same_format_provider_candidate_payload_parts(
         state, parts, trace_id, body_json, input, &attempt, spec,
     )
-    .await?;
+    .await?
+    else {
+        return Ok(None);
+    };
+    let original_request_body_json = if resolved.request_redacted {
+        Some(&resolved.provider_request_body)
+    } else {
+        Some(body_json)
+    };
 
     let prompt_cache_key = resolved
         .provider_request_body
@@ -116,7 +124,7 @@ pub(crate) async fn maybe_build_local_same_format_provider_decision_payload_for_
                 request_path: Some(parts.uri.path()),
                 request_query_string: parts.uri.query(),
                 request_origin: Some(crate::ai_serving::request_origin_from_parts(parts)),
-                original_request_body_json: Some(body_json),
+                original_request_body_json,
                 original_request_body_base64: None,
                 client_session_affinity: input.client_session_affinity.as_ref(),
                 scheduler_affinity_epoch: eligible.orchestration.scheduler_affinity_epoch,
@@ -149,9 +157,10 @@ pub(crate) async fn maybe_build_local_same_format_provider_decision_payload_for_
         upstream_url,
         provider_request_headers,
         provider_request_body,
+        request_redacted: _,
     } = resolved;
 
-    Some(build_ai_execution_decision_response(
+    Ok(Some(build_ai_execution_decision_response(
         AiExecutionDecisionResponseParts {
             decision_is_stream: spec_metadata.require_streaming,
             decision_kind: spec_metadata.decision_kind.to_string(),
@@ -185,7 +194,7 @@ pub(crate) async fn maybe_build_local_same_format_provider_decision_payload_for_
             report_context: Some(report_context),
             auth_context: input.auth_context.clone(),
         },
-    ))
+    )))
 }
 
 pub(super) async fn mark_skipped_local_same_format_provider_candidate(
