@@ -100,6 +100,7 @@
       :total-records="effectiveTotalRecords"
       :page-size-options="pageSizeOptions"
       :auto-refresh="globalAutoRefresh"
+      :display-now-ms="calibratedDisplayNowMs"
       @update:time-range="handleTimeRangeChange"
       @update:filter-search="handleFilterSearchChange"
       @update:filter-user="handleFilterUserChange"
@@ -247,6 +248,8 @@ const {
   availableProviders,
   loadStats,
   loadRecords,
+  serverClockOffsetMs,
+  hasServerClockOffset,
   updateServerClockOffset
 } = useUsageData({ isAdminPage })
 
@@ -435,8 +438,10 @@ const AUTO_REFRESH_INTERVAL = 1000 // 1秒刷新一次（用于活跃请求）
 const ACTIVE_DISCOVERY_HOT_INTERVAL = 1000 // 有活跃请求时 1 秒扫描一次
 const ACTIVE_DISCOVERY_IDLE_INTERVAL = 5000 // 空闲时降频，避免后台持续刷日志
 const GLOBAL_AUTO_REFRESH_INTERVAL = 3000 // 3秒刷新一次（全局自动刷新）
+const ACTIVE_ELAPSED_DISPLAY_INTERVAL = 250 // 共享显示时钟，避免每行单独动画
 const globalAutoRefresh = ref(false) // 全局自动刷新开关（默认关闭）
 const isPageVisible = ref(typeof document === 'undefined' ? true : !document.hidden)
+const displayNowMs = ref(Date.now())
 
 // 轮询活跃请求状态（轻量级，只更新状态变化的记录）
 
@@ -719,8 +724,10 @@ function handleVisibilityChange() {
     stopAutoRefresh()
     stopActiveDiscovery()
     stopGlobalAutoRefresh()
+    stopActiveElapsedDisplayTimer()
     return
   }
+  syncActiveElapsedDisplayTimer()
   if (hasActiveRequests.value) {
     startAutoRefresh()
   }
@@ -737,6 +744,7 @@ onUnmounted(() => {
   stopAutoRefresh()
   stopActiveDiscovery()
   stopGlobalAutoRefresh()
+  stopActiveElapsedDisplayTimer()
 })
 
 // 用户页面的前端分页（后端一次性返回所有记录，前端分页+筛选）
@@ -759,6 +767,51 @@ const effectiveTotalRecords = computed(() => {
 
 // 显示的记录
 const displayRecords = computed(() => paginatedRecords.value)
+
+const hasVisibleActiveRecords = computed(() => {
+  return displayRecords.value.some((record) => {
+    const displayStatus = resolveDisplayRequestStatus(record)
+    return displayStatus === 'pending' || displayStatus === 'streaming'
+  })
+})
+
+const calibratedDisplayNowMs = computed(() => {
+  return hasServerClockOffset.value
+    ? displayNowMs.value + serverClockOffsetMs.value
+    : displayNowMs.value
+})
+
+let activeElapsedDisplayTimer: ReturnType<typeof setInterval> | null = null
+
+function tickActiveElapsedDisplay() {
+  displayNowMs.value = Date.now()
+}
+
+function startActiveElapsedDisplayTimer() {
+  if (activeElapsedDisplayTimer) return
+  if (!isPageVisible.value || !hasVisibleActiveRecords.value) return
+  tickActiveElapsedDisplay()
+  activeElapsedDisplayTimer = setInterval(tickActiveElapsedDisplay, ACTIVE_ELAPSED_DISPLAY_INTERVAL)
+}
+
+function stopActiveElapsedDisplayTimer() {
+  if (activeElapsedDisplayTimer) {
+    clearInterval(activeElapsedDisplayTimer)
+    activeElapsedDisplayTimer = null
+  }
+}
+
+function syncActiveElapsedDisplayTimer() {
+  if (isPageVisible.value && hasVisibleActiveRecords.value) {
+    startActiveElapsedDisplayTimer()
+  } else {
+    stopActiveElapsedDisplayTimer()
+  }
+}
+
+watch(hasVisibleActiveRecords, () => {
+  syncActiveElapsedDisplayTimer()
+}, { immediate: true })
 
 const availableClientFamilies = computed(() => {
   const families = new Set<string>()

@@ -324,6 +324,7 @@
                 :created-at="record.created_at"
                 :status="getDisplayStatus(record)"
                 :response-time-ms="record.response_time_ms ?? null"
+                :display-now-ms="displayNowMs ?? null"
               />
             </span>
             <span
@@ -940,6 +941,7 @@
                   :created-at="record.created_at"
                   :status="getDisplayStatus(record)"
                   :response-time-ms="record.response_time_ms ?? null"
+                  :display-now-ms="displayNowMs ?? null"
                 />
               </span>
             </div>
@@ -1114,6 +1116,7 @@ const props = defineProps<{
   pageSizeOptions: number[]
   // 自动刷新
   autoRefresh: boolean
+  displayNowMs?: number | null
 }>()
 
 const emit = defineEmits<{

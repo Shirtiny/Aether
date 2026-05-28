@@ -3,25 +3,24 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onUnmounted, ref, watch } from 'vue'
+import { computed } from 'vue'
 
 const props = withDefaults(defineProps<{
   createdAt?: string | null
   status?: string | null
   responseTimeMs?: number | null
+  displayNowMs?: number | null
   precision?: number
 }>(), {
   createdAt: null,
   status: null,
   responseTimeMs: null,
+  displayNowMs: null,
   precision: 2,
 })
 
-const now = ref(Date.now())
 const precision = computed(() => Math.max(0, props.precision))
 const isActive = computed(() => props.status === 'pending' || props.status === 'streaming')
-
-let rafId: number | null = null
 
 function parseCreatedAtMs(value: string | null | undefined): number {
   if (!value) return Number.NaN
@@ -29,35 +28,6 @@ function parseCreatedAtMs(value: string | null | undefined): number {
   const normalized = /(?:Z|[+-]\d{2}:\d{2})$/i.test(value) ? value : `${value}Z`
   return new Date(normalized).getTime()
 }
-
-function stopRaf() {
-  if (rafId == null) return
-  cancelAnimationFrame(rafId)
-  rafId = null
-}
-
-function tick() {
-  now.value = Date.now()
-  rafId = requestAnimationFrame(tick)
-}
-
-function startRaf() {
-  stopRaf()
-  now.value = Date.now()
-  rafId = requestAnimationFrame(tick)
-}
-
-watch(isActive, (active) => {
-  if (active) {
-    startRaf()
-  } else {
-    stopRaf()
-  }
-}, { immediate: true })
-
-onUnmounted(() => {
-  stopRaf()
-})
 
 const displayText = computed(() => {
   if (!isActive.value) {
@@ -70,7 +40,11 @@ const displayText = computed(() => {
   const createdAtMs = parseCreatedAtMs(props.createdAt)
   if (Number.isNaN(createdAtMs)) return '-'
 
-  const elapsedMs = Math.max(0, now.value - createdAtMs)
+  // 活跃请求里的 response_time_ms 可能只是首字或中间值；终态才使用后端最终耗时。
+  const nowMs = typeof props.displayNowMs === 'number' && Number.isFinite(props.displayNowMs)
+    ? props.displayNowMs
+    : Date.now()
+  const elapsedMs = Math.max(0, nowMs - createdAtMs)
   return `${(elapsedMs / 1000).toFixed(precision.value)}s`
 })
 </script>
