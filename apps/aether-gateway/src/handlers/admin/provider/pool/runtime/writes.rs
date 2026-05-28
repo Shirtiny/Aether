@@ -646,7 +646,7 @@ mod tests {
             account_self_check_interval_minutes: 60,
             account_self_check_concurrency: 4,
             score_top_n: 128,
-            score_fallback_scan_limit: 1024,
+            score_fallback_scan_limit: 4096,
             score_rules: aether_pool_core::PoolMemberScoreRules::default(),
             stream_timeout_threshold: 3,
             stream_timeout_window_seconds: 1800,

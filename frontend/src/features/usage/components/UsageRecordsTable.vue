@@ -354,35 +354,107 @@
       :class="[desktopTableMinWidthClass]"
     >
       <colgroup v-if="isAdmin">
-        <col v-if="isColumnVisible('time')" class="w-[8%]">
-        <col v-if="isColumnVisible('user')" class="w-[12%]">
-        <col v-if="isColumnVisible('model')" class="w-[14%]">
-        <col v-if="isColumnVisible('provider')" class="w-[16%]">
-        <col v-if="isColumnVisible('api_format')" class="w-[15%]">
-        <col v-if="isColumnVisible('status')" class="w-[10%]">
-        <col v-if="isColumnVisible('tokens')" class="w-[10%]">
-        <col v-if="isColumnVisible('cost')" class="w-[6%]">
-        <col v-if="isColumnVisible('performance')" class="w-[9%]">
-        <col v-if="isColumnVisible('client_family')" class="w-[12%]">
-        <col v-if="isColumnVisible('client_ip')" class="w-[10%]">
-        <col v-if="isColumnVisible('user_agent')" class="w-[13%]">
+        <col
+          v-if="isColumnVisible('time')"
+          class="w-[8%]"
+        >
+        <col
+          v-if="isColumnVisible('user')"
+          class="w-[12%]"
+        >
+        <col
+          v-if="isColumnVisible('model')"
+          class="w-[14%]"
+        >
+        <col
+          v-if="isColumnVisible('provider')"
+          class="w-[16%]"
+        >
+        <col
+          v-if="isColumnVisible('api_format')"
+          class="w-[15%]"
+        >
+        <col
+          v-if="isColumnVisible('status')"
+          class="w-[10%]"
+        >
+        <col
+          v-if="isColumnVisible('tokens')"
+          class="w-[10%]"
+        >
+        <col
+          v-if="isColumnVisible('cost')"
+          class="w-[6%]"
+        >
+        <col
+          v-if="isColumnVisible('performance')"
+          class="w-[9%]"
+        >
+        <col
+          v-if="isColumnVisible('client_family')"
+          class="w-[12%]"
+        >
+        <col
+          v-if="isColumnVisible('client_ip')"
+          class="w-[10%]"
+        >
+        <col
+          v-if="isColumnVisible('user_agent')"
+          class="w-[13%]"
+        >
       </colgroup>
       <colgroup v-else>
-        <col v-if="isColumnVisible('time')" class="w-[9%]">
-        <col v-if="isColumnVisible('key')" class="w-[17%]">
-        <col v-if="isColumnVisible('model')" class="w-[22%]">
-        <col v-if="isColumnVisible('api_format')" class="w-[14%]">
-        <col v-if="isColumnVisible('status')" class="w-[10%]">
-        <col v-if="isColumnVisible('tokens')" class="w-[11%]">
-        <col v-if="isColumnVisible('cost')" class="w-[7%]">
-        <col v-if="isColumnVisible('performance')" class="w-[10%]">
-        <col v-if="isColumnVisible('client_family')" class="w-[12%]">
-        <col v-if="isColumnVisible('client_ip')" class="w-[10%]">
-        <col v-if="isColumnVisible('user_agent')" class="w-[13%]">
+        <col
+          v-if="isColumnVisible('time')"
+          class="w-[9%]"
+        >
+        <col
+          v-if="isColumnVisible('key')"
+          class="w-[17%]"
+        >
+        <col
+          v-if="isColumnVisible('model')"
+          class="w-[22%]"
+        >
+        <col
+          v-if="isColumnVisible('api_format')"
+          class="w-[14%]"
+        >
+        <col
+          v-if="isColumnVisible('status')"
+          class="w-[10%]"
+        >
+        <col
+          v-if="isColumnVisible('tokens')"
+          class="w-[11%]"
+        >
+        <col
+          v-if="isColumnVisible('cost')"
+          class="w-[7%]"
+        >
+        <col
+          v-if="isColumnVisible('performance')"
+          class="w-[10%]"
+        >
+        <col
+          v-if="isColumnVisible('client_family')"
+          class="w-[12%]"
+        >
+        <col
+          v-if="isColumnVisible('client_ip')"
+          class="w-[10%]"
+        >
+        <col
+          v-if="isColumnVisible('user_agent')"
+          class="w-[13%]"
+        >
       </colgroup>
       <TableHeader>
         <TableRow class="border-b border-border/60 hover:bg-transparent">
-          <TableHead v-if="isColumnVisible('time')" class="h-12 font-semibold w-[8%]">
+          <TableHead
+            v-if="isColumnVisible('time')"
+            class="h-12 font-semibold w-[8%]"
+          >
             时间
           </TableHead>
           <SortableTableHead
@@ -489,13 +561,22 @@
               />
             </template>
           </SortableTableHead>
-          <TableHead v-if="isColumnVisible('tokens')" class="h-12 font-semibold w-[10%] text-center">
+          <TableHead
+            v-if="isColumnVisible('tokens')"
+            class="h-12 font-semibold w-[10%] text-center"
+          >
             Tokens
           </TableHead>
-          <TableHead v-if="isColumnVisible('cost')" class="h-12 font-semibold w-[6%] text-right">
+          <TableHead
+            v-if="isColumnVisible('cost')"
+            class="h-12 font-semibold w-[6%] text-right"
+          >
             费用
           </TableHead>
-          <TableHead v-if="isColumnVisible('performance')" class="h-12 font-semibold w-[9%] text-right">
+          <TableHead
+            v-if="isColumnVisible('performance')"
+            class="h-12 font-semibold w-[9%] text-right"
+          >
             <div class="flex flex-col items-end text-xs gap-0.5">
               <span class="whitespace-nowrap">首字/总耗时</span>
               <span class="text-muted-foreground font-normal">输出速度</span>
@@ -520,10 +601,16 @@
               />
             </template>
           </SortableTableHead>
-          <TableHead v-if="isColumnVisible('client_ip')" class="h-12 font-semibold w-[10%]">
+          <TableHead
+            v-if="isColumnVisible('client_ip')"
+            class="h-12 font-semibold w-[10%]"
+          >
             IP 地址
           </TableHead>
-          <TableHead v-if="isColumnVisible('user_agent')" class="h-12 font-semibold w-[13%]">
+          <TableHead
+            v-if="isColumnVisible('user_agent')"
+            class="h-12 font-semibold w-[13%]"
+          >
             User-Agent
           </TableHead>
         </TableRow>
@@ -545,7 +632,10 @@
           @mousedown="handleRowMouseDown($event, record.id)"
           @click="handleRowClick($event, record.id)"
         >
-          <TableCell v-if="isColumnVisible('time')" class="py-4 w-[8%] align-top">
+          <TableCell
+            v-if="isColumnVisible('time')"
+            class="py-4 w-[8%] align-top"
+          >
             <div class="flex flex-col gap-0.5 leading-tight">
               <span class="text-xs text-foreground tabular-nums whitespace-nowrap">
                 {{ formatRecordTime(record.created_at) }}
@@ -728,7 +818,10 @@
               class="text-muted-foreground text-xs"
             >-</span>
           </TableCell>
-          <TableCell v-if="isColumnVisible('status')" class="text-center py-4 w-[10%]">
+          <TableCell
+            v-if="isColumnVisible('status')"
+            class="text-center py-4 w-[10%]"
+          >
             <!-- 优先显示请求状态 -->
             <Badge
               v-if="isUsageRecordFailed(record)"
@@ -779,7 +872,10 @@
               {{ getStreamModeLabel(record) }}
             </Badge>
           </TableCell>
-          <TableCell v-if="isColumnVisible('tokens')" class="py-4 w-[10%]">
+          <TableCell
+            v-if="isColumnVisible('tokens')"
+            class="py-4 w-[10%]"
+          >
             <div class="grid w-full min-w-0 grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] gap-x-1 text-xs leading-tight tabular-nums">
               <span class="justify-self-end whitespace-nowrap text-right">
                 {{ formatTokens(getRecordEffectiveInputTokens(record)) }}
@@ -813,7 +909,10 @@
               </span>
             </div>
           </TableCell>
-          <TableCell v-if="isColumnVisible('cost')" class="text-right py-4 w-[6%]">
+          <TableCell
+            v-if="isColumnVisible('cost')"
+            class="text-right py-4 w-[6%]"
+          >
             <div class="flex flex-col items-end text-xs gap-0.5">
               <span class="text-primary font-medium">{{ formatCurrency(record.cost || 0) }}</span>
               <span
@@ -824,7 +923,10 @@
               </span>
             </div>
           </TableCell>
-          <TableCell v-if="isColumnVisible('performance')" class="text-right py-4 w-[9%]">
+          <TableCell
+            v-if="isColumnVisible('performance')"
+            class="text-right py-4 w-[9%]"
+          >
             <!-- pending/streaming 状态：首字与动态总耗时保留在同一行 -->
             <div
               v-if="getDisplayStatus(record) === 'pending' || getDisplayStatus(record) === 'streaming'"
@@ -986,45 +1088,6 @@ interface UsageRecordColumnOption {
   userOnly?: boolean
 }
 
-const USAGE_RECORD_COLUMN_OPTIONS: UsageRecordColumnOption[] = [
-  { id: 'time', label: '时间' },
-  { id: 'user', label: '用户', adminOnly: true },
-  { id: 'key', label: '密钥', userOnly: true },
-  { id: 'model', label: '模型' },
-  { id: 'provider', label: '提供商', adminOnly: true },
-  { id: 'api_format', label: 'API格式' },
-  { id: 'status', label: '类型/状态' },
-  { id: 'tokens', label: 'Tokens' },
-  { id: 'cost', label: '费用' },
-  { id: 'performance', label: '耗时/速度' },
-  { id: 'client_family', label: '客户端类型' },
-  { id: 'client_ip', label: 'IP 地址' },
-  { id: 'user_agent', label: 'User-Agent' },
-]
-
-const DEFAULT_ADMIN_COLUMNS: UsageRecordColumnId[] = [
-  'time',
-  'user',
-  'model',
-  'provider',
-  'api_format',
-  'status',
-  'tokens',
-  'cost',
-  'performance',
-]
-
-const DEFAULT_USER_COLUMNS: UsageRecordColumnId[] = [
-  'time',
-  'key',
-  'model',
-  'api_format',
-  'status',
-  'tokens',
-  'cost',
-  'performance',
-]
-
 const props = defineProps<{
   records: UsageRecord[]
   isAdmin: boolean
@@ -1069,6 +1132,45 @@ const emit = defineEmits<{
   'showDetail': [id: string]
   'prefetchDetail': [id: string]
 }>()
+
+const USAGE_RECORD_COLUMN_OPTIONS: UsageRecordColumnOption[] = [
+  { id: 'time', label: '时间' },
+  { id: 'user', label: '用户', adminOnly: true },
+  { id: 'key', label: '密钥', userOnly: true },
+  { id: 'model', label: '模型' },
+  { id: 'provider', label: '提供商', adminOnly: true },
+  { id: 'api_format', label: 'API格式' },
+  { id: 'status', label: '类型/状态' },
+  { id: 'tokens', label: 'Tokens' },
+  { id: 'cost', label: '费用' },
+  { id: 'performance', label: '耗时/速度' },
+  { id: 'client_family', label: '客户端类型' },
+  { id: 'client_ip', label: 'IP 地址' },
+  { id: 'user_agent', label: 'User-Agent' },
+]
+
+const DEFAULT_ADMIN_COLUMNS: UsageRecordColumnId[] = [
+  'time',
+  'user',
+  'model',
+  'provider',
+  'api_format',
+  'status',
+  'tokens',
+  'cost',
+  'performance',
+]
+
+const DEFAULT_USER_COLUMNS: UsageRecordColumnId[] = [
+  'time',
+  'key',
+  'model',
+  'api_format',
+  'status',
+  'tokens',
+  'cost',
+  'performance',
+]
 
 // 使用统一 API 格式枚举，避免使用记录筛选项和系统格式列表漂移。
 const availableApiFormats = API_FORMAT_ORDER.map((value) => ({

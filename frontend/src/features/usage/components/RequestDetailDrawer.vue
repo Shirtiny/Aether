@@ -776,14 +776,6 @@ import {
 
 type RequestStateStatus = 'pending' | 'streaming' | 'completed' | 'failed' | 'cancelled'
 
-const REQUEST_STATE_STATUSES = new Set<RequestStateStatus>([
-  'pending',
-  'streaming',
-  'completed',
-  'failed',
-  'cancelled',
-])
-
 const props = defineProps<{
   isOpen: boolean
   requestId: string | null
@@ -801,6 +793,14 @@ const emit = defineEmits<{
     errorMessage?: string | null
   }]
 }>()
+
+const REQUEST_STATE_STATUSES = new Set<RequestStateStatus>([
+  'pending',
+  'streaming',
+  'completed',
+  'failed',
+  'cancelled',
+])
 
 const loading = ref(false)
 const error = ref<string | null>(null)

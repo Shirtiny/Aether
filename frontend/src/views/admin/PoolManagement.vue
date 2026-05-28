@@ -1155,12 +1155,12 @@
                   >
                     <div class="flex items-center justify-between text-[10px] leading-none">
                       <span class="text-muted-foreground font-medium shrink-0">{{ getQuotaProgressLabel(item.label) }}</span>
-                        <span
-                          v-if="getQuotaProgressResetDisplayText(item)"
-                          data-testid="pool-quota-reset-text"
-                          class="text-muted-foreground/80 tabular-nums truncate"
-                          :title="getQuotaProgressResetDisplayText(item)"
-                        >{{ getQuotaProgressResetDisplayText(item) }}</span>
+                      <span
+                        v-if="getQuotaProgressResetDisplayText(item)"
+                        data-testid="pool-quota-reset-text"
+                        class="text-muted-foreground/80 tabular-nums truncate"
+                        :title="getQuotaProgressResetDisplayText(item)"
+                      >{{ getQuotaProgressResetDisplayText(item) }}</span>
                     </div>
                     <div class="flex items-center gap-1.5">
                       <div class="relative flex-1 h-1.5 rounded-full bg-border overflow-hidden">
