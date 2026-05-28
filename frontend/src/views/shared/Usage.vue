@@ -148,6 +148,8 @@ import {
   IntervalTimelineCard
 } from '@/features/usage/components'
 import {
+  provideActiveElapsedDisplayClock,
+  useActiveElapsedDisplayClock,
   useUsageData,
   getDateRangeFromPeriod
 } from '@/features/usage/composables'
@@ -246,7 +248,10 @@ const {
   availableModels,
   availableProviders,
   loadStats,
-  loadRecords
+  loadRecords,
+  serverClockOffsetMs,
+  hasServerClockOffset,
+  updateServerClockOffset
 } = useUsageData({ isAdminPage })
 
 // 热力图状态
@@ -434,6 +439,7 @@ const AUTO_REFRESH_INTERVAL = 1000 // 1秒刷新一次（用于活跃请求）
 const ACTIVE_DISCOVERY_HOT_INTERVAL = 1000 // 有活跃请求时 1 秒扫描一次
 const ACTIVE_DISCOVERY_IDLE_INTERVAL = 5000 // 空闲时降频，避免后台持续刷日志
 const GLOBAL_AUTO_REFRESH_INTERVAL = 3000 // 3秒刷新一次（全局自动刷新）
+const ACTIVE_ELAPSED_DISPLAY_INTERVAL = 250 // 共享显示时钟，避免每行单独动画
 const globalAutoRefresh = ref(false) // 全局自动刷新开关（默认关闭）
 const isPageVisible = ref(typeof document === 'undefined' ? true : !document.hidden)
 
@@ -445,10 +451,14 @@ const discoveredActiveRequestIds = new Set<string>()
 
 async function loadActiveRequestUpdates(ids?: string[]) {
   if (isAdminPage.value) {
-    return usageApi.getActiveRequests(ids, timeRange.value)
+    const result = await usageApi.getActiveRequests(ids, timeRange.value)
+    updateServerClockOffset(result.server_timing)
+    return result
   }
   const idsParam = ids?.length ? ids.join(',') : undefined
-  return meApi.getActiveRequests(idsParam)
+  const result = await meApi.getActiveRequests(idsParam)
+  updateServerClockOffset(result.server_timing)
+  return result
 }
 
 async function pollActiveRequests() {
@@ -714,8 +724,10 @@ function handleVisibilityChange() {
     stopAutoRefresh()
     stopActiveDiscovery()
     stopGlobalAutoRefresh()
+    stopActiveElapsedDisplayTimer()
     return
   }
+  syncActiveElapsedDisplayTimer()
   if (hasActiveRequests.value) {
     startAutoRefresh()
   }
@@ -732,6 +744,7 @@ onUnmounted(() => {
   stopAutoRefresh()
   stopActiveDiscovery()
   stopGlobalAutoRefresh()
+  stopActiveElapsedDisplayClock()
 })
 
 // 用户页面的前端分页（后端一次性返回所有记录，前端分页+筛选）
@@ -754,6 +767,21 @@ const effectiveTotalRecords = computed(() => {
 
 // 显示的记录
 const displayRecords = computed(() => paginatedRecords.value)
+
+const {
+  calibratedDisplayNowMs,
+  stopActiveElapsedDisplayTimer,
+  syncActiveElapsedDisplayTimer,
+  stopActiveElapsedDisplayClock,
+} = useActiveElapsedDisplayClock({
+  records: displayRecords,
+  isPageVisible,
+  serverClockOffsetMs,
+  hasServerClockOffset,
+  resolveStatus: resolveDisplayRequestStatus,
+  intervalMs: ACTIVE_ELAPSED_DISPLAY_INTERVAL,
+})
+provideActiveElapsedDisplayClock(calibratedDisplayNowMs)
 
 const availableClientFamilies = computed(() => {
   const families = new Set<string>()
