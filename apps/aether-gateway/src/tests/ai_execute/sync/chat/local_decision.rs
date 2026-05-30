@@ -10,8 +10,13 @@ use super::{
     EXECUTION_PATH_EXECUTION_RUNTIME_SYNC, EXECUTION_PATH_HEADER, TRACE_ID_HEADER,
 };
 
-#[tokio::test]
-async fn proxy_pii_redaction_local_openai_chat_runtime_masks_headers_and_restores_sync_response() {
+large_stack_async_test!(
+    proxy_pii_redaction_local_openai_chat_runtime_masks_headers_and_restores_sync_response,
+    proxy_pii_redaction_local_openai_chat_runtime_masks_headers_and_restores_sync_response_impl
+);
+
+async fn proxy_pii_redaction_local_openai_chat_runtime_masks_headers_and_restores_sync_response_impl(
+) {
     #[derive(Debug, Clone)]
     struct SeenProviderRequest {
         body: serde_json::Value,
@@ -377,13 +382,10 @@ async fn proxy_pii_redaction_local_openai_chat_runtime_masks_headers_and_restore
     provider_handle.abort();
 }
 
-#[test]
-fn gateway_executes_openai_chat_sync_via_local_decision_gate_without_execution_runtime_override() {
-    run_async_test_on_large_stack(
-        "gateway_executes_openai_chat_sync_via_local_decision_gate_without_execution_runtime_override",
-        gateway_executes_openai_chat_sync_via_local_decision_gate_without_execution_runtime_override_impl(),
-    );
-}
+large_stack_async_test!(
+    gateway_executes_openai_chat_sync_via_local_decision_gate_without_execution_runtime_override,
+    gateway_executes_openai_chat_sync_via_local_decision_gate_without_execution_runtime_override_impl
+);
 
 async fn gateway_executes_openai_chat_sync_via_local_decision_gate_without_execution_runtime_override_impl(
 ) {
@@ -766,8 +768,13 @@ async fn gateway_executes_openai_chat_sync_via_local_decision_gate_without_execu
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_executes_openai_chat_sync_with_regex_model_mapping_in_execution_runtime_request() {
+large_stack_async_test!(
+    gateway_executes_openai_chat_sync_with_regex_model_mapping_in_execution_runtime_request,
+    gateway_executes_openai_chat_sync_with_regex_model_mapping_in_execution_runtime_request_impl
+);
+
+async fn gateway_executes_openai_chat_sync_with_regex_model_mapping_in_execution_runtime_request_impl(
+) {
     #[derive(Debug, Clone)]
     struct SeenExecutionRuntimeSyncRequest {
         model: String,
@@ -1045,8 +1052,12 @@ async fn gateway_executes_openai_chat_sync_with_regex_model_mapping_in_execution
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_executes_openai_chat_sync_via_local_cross_format_gemini_candidate_without_external_control_config(
+large_stack_async_test!(
+    gateway_executes_openai_chat_sync_via_local_cross_format_gemini_candidate_without_external_control_config,
+    gateway_executes_openai_chat_sync_via_local_cross_format_gemini_candidate_without_external_control_config_impl
+);
+
+async fn gateway_executes_openai_chat_sync_via_local_cross_format_gemini_candidate_without_external_control_config_impl(
 ) {
     #[derive(Debug, Clone)]
     struct SeenExecutionRuntimeSyncRequest {
@@ -1613,8 +1624,12 @@ async fn gateway_executes_openai_chat_sync_via_local_cross_format_gemini_candida
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_returns_openai_chat_error_for_local_cross_format_claude_cli_sync_failure() {
+large_stack_async_test!(
+    gateway_returns_openai_chat_error_for_local_cross_format_claude_cli_sync_failure,
+    gateway_returns_openai_chat_error_for_local_cross_format_claude_cli_sync_failure_impl
+);
+
+async fn gateway_returns_openai_chat_error_for_local_cross_format_claude_cli_sync_failure_impl() {
     #[derive(Debug, Clone)]
     struct SeenExecutionRuntimeSyncRequest {
         trace_id: String,
@@ -2011,8 +2026,12 @@ async fn gateway_returns_openai_chat_error_for_local_cross_format_claude_cli_syn
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_returns_openai_chat_error_for_local_cross_format_gemini_cli_sync_failure() {
+large_stack_async_test!(
+    gateway_returns_openai_chat_error_for_local_cross_format_gemini_cli_sync_failure,
+    gateway_returns_openai_chat_error_for_local_cross_format_gemini_cli_sync_failure_impl
+);
+
+async fn gateway_returns_openai_chat_error_for_local_cross_format_gemini_cli_sync_failure_impl() {
     #[derive(Debug, Clone)]
     struct SeenExecutionRuntimeSyncRequest {
         trace_id: String,
@@ -2438,8 +2457,12 @@ async fn gateway_returns_openai_chat_error_for_local_cross_format_gemini_cli_syn
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_returns_openai_chat_error_for_local_cross_format_claude_sync_failure() {
+large_stack_async_test!(
+    gateway_returns_openai_chat_error_for_local_cross_format_claude_sync_failure,
+    gateway_returns_openai_chat_error_for_local_cross_format_claude_sync_failure_impl
+);
+
+async fn gateway_returns_openai_chat_error_for_local_cross_format_claude_sync_failure_impl() {
     #[derive(Debug, Clone)]
     struct SeenExecutionRuntimeSyncRequest {
         trace_id: String,
@@ -2839,8 +2862,12 @@ async fn gateway_returns_openai_chat_error_for_local_cross_format_claude_sync_fa
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_returns_openai_chat_error_for_local_cross_format_gemini_sync_failure() {
+large_stack_async_test!(
+    gateway_returns_openai_chat_error_for_local_cross_format_gemini_sync_failure,
+    gateway_returns_openai_chat_error_for_local_cross_format_gemini_sync_failure_impl
+);
+
+async fn gateway_returns_openai_chat_error_for_local_cross_format_gemini_sync_failure_impl() {
     #[derive(Debug, Clone)]
     struct SeenExecutionRuntimeSyncRequest {
         trace_id: String,
@@ -3279,8 +3306,12 @@ async fn gateway_returns_openai_chat_error_for_local_cross_format_gemini_sync_fa
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_executes_openai_chat_sync_with_custom_path_via_local_decision_gate_with_local_sync_decision(
+large_stack_async_test!(
+    gateway_executes_openai_chat_sync_with_custom_path_via_local_decision_gate_with_local_sync_decision,
+    gateway_executes_openai_chat_sync_with_custom_path_via_local_decision_gate_with_local_sync_decision_impl
+);
+
+async fn gateway_executes_openai_chat_sync_with_custom_path_via_local_decision_gate_with_local_sync_decision_impl(
 ) {
     #[derive(Debug, Clone)]
     struct SeenExecutionRuntimeSyncRequest {

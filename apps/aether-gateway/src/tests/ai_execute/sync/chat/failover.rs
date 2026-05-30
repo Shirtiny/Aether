@@ -12,13 +12,10 @@ use super::{
     TRACE_ID_HEADER,
 };
 
-#[test]
-fn gateway_skips_unsupported_local_openai_chat_sync_candidate_before_trying_next_one() {
-    run_async_test_on_large_stack(
-        "gateway_skips_unsupported_local_openai_chat_sync_candidate_before_trying_next_one",
-        gateway_skips_unsupported_local_openai_chat_sync_candidate_before_trying_next_one_impl(),
-    );
-}
+large_stack_async_test!(
+    gateway_skips_unsupported_local_openai_chat_sync_candidate_before_trying_next_one,
+    gateway_skips_unsupported_local_openai_chat_sync_candidate_before_trying_next_one_impl
+);
 
 async fn gateway_skips_unsupported_local_openai_chat_sync_candidate_before_trying_next_one_impl() {
     #[derive(Debug, Clone)]
@@ -428,8 +425,12 @@ async fn gateway_skips_unsupported_local_openai_chat_sync_candidate_before_tryin
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_surfaces_local_execution_runtime_miss_reason_when_all_openai_chat_candidates_are_skipped(
+large_stack_async_test!(
+    gateway_surfaces_local_execution_runtime_miss_reason_when_all_openai_chat_candidates_are_skipped,
+    gateway_surfaces_local_execution_runtime_miss_reason_when_all_openai_chat_candidates_are_skipped_impl
+);
+
+async fn gateway_surfaces_local_execution_runtime_miss_reason_when_all_openai_chat_candidates_are_skipped_impl(
 ) {
     fn hash_api_key(value: &str) -> String {
         let mut hasher = Sha256::new();
@@ -686,8 +687,12 @@ async fn gateway_surfaces_local_execution_runtime_miss_reason_when_all_openai_ch
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_retries_next_local_openai_chat_sync_candidate_after_auth_failure() {
+large_stack_async_test!(
+    gateway_retries_next_local_openai_chat_sync_candidate_after_auth_failure,
+    gateway_retries_next_local_openai_chat_sync_candidate_after_auth_failure_impl
+);
+
+async fn gateway_retries_next_local_openai_chat_sync_candidate_after_auth_failure_impl() {
     #[derive(Debug, Clone)]
     struct SeenExecutionRuntimeSyncRequest {
         trace_id: String,

@@ -30,6 +30,15 @@ where
     }
 }
 
+macro_rules! large_stack_async_test {
+    ($test_name:ident, $impl_name:ident) => {
+        #[test]
+        fn $test_name() {
+            run_async_test_on_large_stack(stringify!($test_name), $impl_name());
+        }
+    };
+}
+
 use crate::constants::{
     CONTROL_EXECUTED_HEADER, CONTROL_EXECUTE_FALLBACK_HEADER, DEPENDENCY_REASON_HEADER,
     EXECUTION_PATH_EXECUTION_RUNTIME_STREAM, EXECUTION_PATH_EXECUTION_RUNTIME_SYNC,
