@@ -351,8 +351,19 @@ async fn gateway_handles_cors_preflight_without_proxying_upstream() {
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_adds_cors_headers_to_proxied_responses() {
+#[test]
+fn gateway_adds_cors_headers_to_proxied_responses() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_stack_size(16 * 1024 * 1024)
+        .enable_all()
+        .build()
+        .expect("runtime should build");
+
+    runtime.block_on(gateway_adds_cors_headers_to_proxied_responses_inner());
+}
+
+async fn gateway_adds_cors_headers_to_proxied_responses_inner() {
     let execution_runtime_hits = Arc::new(Mutex::new(0usize));
     let execution_runtime_hits_clone = Arc::clone(&execution_runtime_hits);
     let execution_runtime = Router::new().route(
