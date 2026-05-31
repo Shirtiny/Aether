@@ -8,7 +8,6 @@ use sha2::{Digest, Sha256};
 const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(300);
 const ONE_HOUR_CACHE_TTL: Duration = Duration::from_secs(3600);
 const MAX_ENTRIES: usize = 2048;
-const PREFIX_LOOKBACK_LIMIT: usize = 10;
 const TOKENS_PER_TOOL: u64 = 150;
 const TOKENS_PER_MESSAGE: u64 = 4;
 const INLINE_IMAGE_DATA_TOKEN_PLACEHOLDER: &str = "[inline-image-data]";
@@ -21,6 +20,7 @@ pub(crate) struct KiroPromptCacheProfile {
     total_input_tokens: u64,
     min_cacheable_tokens: u64,
     breakpoints: Vec<KiroPromptCacheBreakpoint>,
+    match_candidates: Vec<KiroPromptCacheCandidate>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,7 +57,7 @@ struct PendingBlock {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PrefixCandidate {
+struct KiroPromptCacheCandidate {
     fingerprint: [u8; 32],
     cumulative_tokens: u64,
 }
@@ -92,7 +92,7 @@ pub(crate) fn build_kiro_prompt_cache_profile(
     let mut active_ttl: Option<Duration> = None;
     let mut breakpoints = Vec::new();
     let mut seen_fingerprints = std::collections::BTreeSet::<[u8; 32]>::new();
-    let mut lookback_candidates = Vec::new();
+    let mut match_candidates = Vec::new();
 
     for block in flattened {
         cumulative_tokens = cumulative_tokens.saturating_add(block.tokens);
@@ -105,12 +105,6 @@ pub(crate) fn build_kiro_prompt_cache_profile(
         prefix_hasher.update(fingerprint);
 
         if let Some(ttl) = block.breakpoint_ttl {
-            push_lookback_breakpoints(
-                &mut breakpoints,
-                &mut seen_fingerprints,
-                &lookback_candidates,
-                ttl,
-            );
             active_ttl = Some(ttl);
             push_breakpoint(
                 &mut breakpoints,
@@ -131,7 +125,7 @@ pub(crate) fn build_kiro_prompt_cache_profile(
                 );
             }
         }
-        push_prefix_candidate(&mut lookback_candidates, fingerprint, cumulative_tokens);
+        push_match_candidate(&mut match_candidates, fingerprint, cumulative_tokens);
     }
 
     let min_cacheable_tokens = minimum_cacheable_tokens_for_model(model);
@@ -139,10 +133,19 @@ pub(crate) fn build_kiro_prompt_cache_profile(
         .into_iter()
         .filter(|breakpoint| breakpoint.cumulative_tokens >= min_cacheable_tokens)
         .collect::<Vec<_>>();
-    (!cacheable_breakpoints.is_empty()).then_some(KiroPromptCacheProfile {
+    let last_cacheable_tokens = cacheable_breakpoints.last()?.cumulative_tokens;
+    let match_candidates = match_candidates
+        .into_iter()
+        .filter(|candidate| {
+            candidate.cumulative_tokens >= min_cacheable_tokens
+                && candidate.cumulative_tokens <= last_cacheable_tokens
+        })
+        .collect();
+    Some(KiroPromptCacheProfile {
         total_input_tokens,
         min_cacheable_tokens,
         breakpoints: cacheable_breakpoints,
+        match_candidates,
     })
 }
 
@@ -269,35 +272,15 @@ fn push_breakpoint(
     }
 }
 
-fn push_lookback_breakpoints(
-    breakpoints: &mut Vec<KiroPromptCacheBreakpoint>,
-    seen_fingerprints: &mut std::collections::BTreeSet<[u8; 32]>,
-    candidates: &[PrefixCandidate],
-    ttl: Duration,
-) {
-    for candidate in candidates {
-        push_breakpoint(
-            breakpoints,
-            seen_fingerprints,
-            candidate.fingerprint,
-            candidate.cumulative_tokens,
-            ttl,
-        );
-    }
-}
-
-fn push_prefix_candidate(
-    candidates: &mut Vec<PrefixCandidate>,
+fn push_match_candidate(
+    candidates: &mut Vec<KiroPromptCacheCandidate>,
     fingerprint: [u8; 32],
     cumulative_tokens: u64,
 ) {
-    candidates.push(PrefixCandidate {
+    candidates.push(KiroPromptCacheCandidate {
         fingerprint,
         cumulative_tokens,
     });
-    if candidates.len() > PREFIX_LOOKBACK_LIMIT {
-        candidates.remove(0);
-    }
 }
 
 fn flatten_cacheable_blocks(request_body: &Value) -> Vec<PendingBlock> {
@@ -634,20 +617,15 @@ impl KiroPromptCacheTracker {
         };
 
         let mut matched_tokens = 0;
-        for breakpoint in profile
-            .breakpoints
-            .iter()
-            .rev()
-            .take(PREFIX_LOOKBACK_LIMIT.saturating_add(1))
-        {
-            let key = (credential_id.clone(), breakpoint.fingerprint);
+        for candidate in profile.match_candidates.iter().rev() {
+            let key = (credential_id.clone(), candidate.fingerprint);
             let Some(entry) = entries.get(&key) else {
                 continue;
             };
             if entry.expires_at > now {
                 matched_tokens = entry
                     .token_count
-                    .min(breakpoint.cumulative_tokens)
+                    .min(candidate.cumulative_tokens)
                     .min(profile.total_input_tokens);
                 break;
             }
@@ -844,6 +822,66 @@ mod tests {
                     }]
                 }
             ]
+        });
+        let first_profile =
+            build_kiro_prompt_cache_profile(&first, estimate_kiro_prompt_input_tokens(&first))
+                .expect("first request should be cacheable");
+        let second_profile =
+            build_kiro_prompt_cache_profile(&second, estimate_kiro_prompt_input_tokens(&second))
+                .expect("second request should be cacheable");
+        let tracker = KiroPromptCacheTracker::default();
+        let start = Instant::now();
+
+        let created = tracker.compute_and_update_at("cred".to_string(), &first_profile, start);
+        assert!(created.cache_creation_input_tokens > 0);
+        assert_eq!(created.cache_read_input_tokens, 0);
+
+        let hit = tracker.compute_and_update_at(
+            "cred".to_string(),
+            &second_profile,
+            start + Duration::from_secs(60),
+        );
+        assert!(hit.cache_read_input_tokens > 0);
+        assert!(hit.cache_creation_input_tokens > 0);
+    }
+
+    #[test]
+    fn tracker_reads_cached_prefix_beyond_tail_lookback_window() {
+        let first = serde_json::json!({
+            "model": "claude-sonnet-4.6",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": long_text("shared first turn"),
+                    "cache_control": {"type": "ephemeral"}
+                }]
+            }]
+        });
+        let mut second_messages = vec![serde_json::json!({
+            "role": "user",
+            "content": [{
+                "type": "text",
+                "text": long_text("shared first turn")
+            }]
+        })];
+        for index in 0..12 {
+            second_messages.push(serde_json::json!({
+                "role": if index % 2 == 0 { "assistant" } else { "user" },
+                "content": format!("intermediate turn {index}")
+            }));
+        }
+        second_messages.push(serde_json::json!({
+            "role": "user",
+            "content": [{
+                "type": "text",
+                "text": long_text("new tail turn"),
+                "cache_control": {"type": "ephemeral"}
+            }]
+        }));
+        let second = serde_json::json!({
+            "model": "claude-sonnet-4.6",
+            "messages": second_messages
         });
         let first_profile =
             build_kiro_prompt_cache_profile(&first, estimate_kiro_prompt_input_tokens(&first))

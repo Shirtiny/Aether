@@ -4218,6 +4218,119 @@ mod tests {
     }
 
     #[test]
+    fn kiro_stream_summary_reads_cached_prefix_beyond_tail_lookback_window() {
+        let first_request_body = json!({
+            "model": "claude-sonnet-4.6",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": "shared first turn ".repeat(600),
+                    "cache_control": {"type": "ephemeral"}
+                }]
+            }]
+        });
+        let mut second_messages = vec![json!({
+            "role": "user",
+            "content": [{
+                "type": "text",
+                "text": "shared first turn ".repeat(600)
+            }]
+        })];
+        for index in 0..12 {
+            second_messages.push(json!({
+                "role": if index % 2 == 0 { "assistant" } else { "user" },
+                "content": format!("intermediate stream turn {index}")
+            }));
+        }
+        second_messages.push(json!({
+            "role": "user",
+            "content": [{
+                "type": "text",
+                "text": "new tail turn ".repeat(600),
+                "cache_control": {"type": "ephemeral"}
+            }]
+        }));
+        let second_request_body = json!({
+            "model": "claude-sonnet-4.6",
+            "messages": second_messages
+        });
+        let plan = ExecutionPlan {
+            request_id: "req-kiro-cache-stream-long-tail".into(),
+            candidate_id: Some("cand-kiro-cache-stream-long-tail".into()),
+            provider_name: Some("Kiro".into()),
+            provider_id: "provider-kiro-cache-stream-long-tail".into(),
+            endpoint_id: "endpoint-kiro-cache-stream-long-tail".into(),
+            key_id: "key-kiro-cache-stream-long-tail".into(),
+            method: "POST".into(),
+            url: "https://q.us-east-1.amazonaws.com/generateAssistantResponse?beta=true".into(),
+            headers: BTreeMap::new(),
+            content_type: Some("application/json".into()),
+            content_encoding: None,
+            body: RequestBody::from_json(json!({"conversationState": {}})),
+            stream: true,
+            client_api_format: "claude:messages".into(),
+            provider_api_format: "claude:messages".into(),
+            model_name: Some("claude-sonnet-4.6".into()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        };
+        let first_report_context = json!({
+            "original_request_body": first_request_body,
+            "kiro_simulated_cache_enabled": true,
+        });
+        let second_report_context = json!({
+            "original_request_body": second_request_body,
+            "kiro_simulated_cache_enabled": true,
+        });
+
+        let mut first_summary = Some(ExecutionStreamTerminalSummary {
+            standardized_usage: Some(StandardizedUsage {
+                input_tokens: 4_000,
+                output_tokens: 17,
+                ..StandardizedUsage::new()
+            }),
+            ..ExecutionStreamTerminalSummary::default()
+        });
+        maybe_apply_kiro_prompt_cache_usage_to_stream_summary(
+            &plan,
+            Some(&first_report_context),
+            &mut first_summary,
+        );
+        let first_usage = first_summary
+            .as_ref()
+            .and_then(|summary| summary.standardized_usage.as_ref())
+            .expect("first usage should exist");
+        assert!(first_usage.cache_creation_tokens > 0);
+        assert_eq!(first_usage.cache_read_tokens, 0);
+
+        let mut second_summary = Some(ExecutionStreamTerminalSummary {
+            standardized_usage: Some(StandardizedUsage {
+                input_tokens: 8_000,
+                output_tokens: 19,
+                ..StandardizedUsage::new()
+            }),
+            ..ExecutionStreamTerminalSummary::default()
+        });
+        maybe_apply_kiro_prompt_cache_usage_to_stream_summary(
+            &plan,
+            Some(&second_report_context),
+            &mut second_summary,
+        );
+        let second_usage = second_summary
+            .as_ref()
+            .and_then(|summary| summary.standardized_usage.as_ref())
+            .expect("second usage should exist");
+        assert!(
+            second_usage.cache_read_tokens > 0,
+            "stream summary should reuse the far earlier cached prefix"
+        );
+        assert!(second_usage.cache_creation_tokens > 0);
+        assert_eq!(second_usage.output_tokens, 19);
+    }
+
+    #[test]
     fn kiro_stream_summary_seeds_input_tokens_without_cache_control() {
         let request_body = json!({
             "model": "claude-opus-4-7",
