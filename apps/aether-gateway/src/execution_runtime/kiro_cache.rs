@@ -359,11 +359,17 @@ fn flatten_cacheable_blocks(request_body: &Value) -> Vec<PendingBlock> {
                 .get("role")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
+            let message_breakpoint_ttl = extract_cache_ttl(message);
             match message.get("content") {
                 Some(Value::Array(items)) => {
                     let last_block_index = items.len().saturating_sub(1);
                     for (block_index, item) in items.iter().enumerate() {
-                        let breakpoint_ttl = extract_cache_ttl(item);
+                        let breakpoint_ttl =
+                            extract_cache_ttl(item).or(if block_index == last_block_index {
+                                message_breakpoint_ttl
+                            } else {
+                                None
+                            });
                         let mut normalized = item.clone();
                         strip_cache_control(&mut normalized);
                         let value = canonicalize_json(serde_json::json!({
@@ -392,7 +398,7 @@ fn flatten_cacheable_blocks(request_body: &Value) -> Vec<PendingBlock> {
                     blocks.push(PendingBlock {
                         tokens: count_text_tokens(text),
                         value,
-                        breakpoint_ttl: None,
+                        breakpoint_ttl: message_breakpoint_ttl,
                         is_message_end: true,
                     });
                 }
@@ -407,7 +413,7 @@ fn flatten_cacheable_blocks(request_body: &Value) -> Vec<PendingBlock> {
                     blocks.push(PendingBlock {
                         tokens: count_message_content_tokens(other),
                         value,
-                        breakpoint_ttl: None,
+                        breakpoint_ttl: message_breakpoint_ttl,
                         is_message_end: true,
                     });
                 }
@@ -619,10 +625,11 @@ impl KiroPromptCacheTracker {
         let mut matched_tokens = 0;
         for candidate in profile.match_candidates.iter().rev() {
             let key = (credential_id.clone(), candidate.fingerprint);
-            let Some(entry) = entries.get(&key) else {
+            let Some(entry) = entries.get_mut(&key) else {
                 continue;
             };
             if entry.expires_at > now {
+                entry.expires_at = entry.expires_at.max(now + entry.ttl);
                 matched_tokens = entry
                     .token_count
                     .min(candidate.cumulative_tokens)
@@ -642,6 +649,7 @@ impl KiroPromptCacheTracker {
                 Some(existing) => {
                     existing.token_count = existing.token_count.max(breakpoint.cumulative_tokens);
                     existing.ttl = existing.ttl.max(breakpoint.ttl);
+                    existing.expires_at = existing.expires_at.max(now + existing.ttl);
                 }
                 None => {
                     self.evict_to_capacity(&mut entries);
@@ -734,7 +742,7 @@ mod tests {
     }
 
     #[test]
-    fn tracker_supports_prefix_hits_without_extending_expiry() {
+    fn tracker_refreshes_cached_prefix_ttl_on_read() {
         let base = serde_json::json!({
             "model": "claude-sonnet-4.6",
             "system": [{
@@ -777,13 +785,13 @@ mod tests {
         );
         assert!(hit.cache_read_input_tokens > 0);
 
-        let expired = tracker.compute_and_update_at(
+        let refreshed = tracker.compute_and_update_at(
             "cred".to_string(),
             &base_profile,
             start + Duration::from_secs(301),
         );
-        assert!(expired.cache_creation_input_tokens > 0);
-        assert_eq!(expired.cache_read_input_tokens, 0);
+        assert_eq!(refreshed.cache_creation_input_tokens, 0);
+        assert!(refreshed.cache_read_input_tokens > 0);
     }
 
     #[test]
@@ -903,6 +911,26 @@ mod tests {
         );
         assert!(hit.cache_read_input_tokens > 0);
         assert!(hit.cache_creation_input_tokens > 0);
+    }
+
+    #[test]
+    fn profile_reads_message_level_cache_control() {
+        let request = serde_json::json!({
+            "model": "claude-sonnet-4.6",
+            "messages": [{
+                "role": "system",
+                "content": long_text("message level cached system"),
+                "cache_control": {"type": "ephemeral"}
+            }]
+        });
+
+        let profile =
+            build_kiro_prompt_cache_profile(&request, estimate_kiro_prompt_input_tokens(&request))
+                .expect("message-level cache_control should create a cache profile");
+        let tracker = KiroPromptCacheTracker::default();
+        let usage = tracker.compute_and_update("cred".to_string(), &profile);
+
+        assert!(usage.cache_creation_input_tokens > 0);
     }
 
     #[test]
