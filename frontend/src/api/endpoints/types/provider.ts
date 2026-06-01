@@ -569,6 +569,9 @@ export interface EndpointStatusMonitor {
   failed_count: number
   skipped_count: number
   success_rate: number
+  avg_latency_ms?: number | null
+  avg_first_byte_ms?: number | null
+  avg_tps?: number | null
   provider_count: number
   key_count: number
   last_event_at?: string | null
@@ -601,6 +604,9 @@ export interface PublicEndpointStatusMonitor {
   failed_count: number
   skipped_count: number
   success_rate: number
+  avg_latency_ms?: number | null
+  avg_first_byte_ms?: number | null
+  avg_tps?: number | null
   last_event_at?: string | null
   events: PublicHealthEvent[]
   timeline?: string[]

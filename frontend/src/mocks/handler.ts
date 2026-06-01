@@ -168,11 +168,17 @@ const MOCK_ENDPOINT_STATUS = {
       failed_count: 30,
       skipped_count: 10,
       success_rate: 0.984,
+      avg_latency_ms: 920,
+      avg_first_byte_ms: 148,
+      avg_tps: 92.4,
       provider_count: 2,
       key_count: 4,
       last_event_at: new Date().toISOString(),
       // 98.4% 成功率：successRate=0.984, failRate=0.012, skipRate=0.004
-      events: generateHealthEvents(80, 0.984, 0.012, 0.004, 900, 500)
+      events: generateHealthEvents(80, 0.984, 0.012, 0.004, 900, 500),
+      timeline: generateHealthTimeline(0.9, 0.06, 60),
+      time_range_start: new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString(),
+      time_range_end: new Date().toISOString()
     },
     {
       api_format: 'claude:messages',
@@ -182,11 +188,17 @@ const MOCK_ENDPOINT_STATUS = {
       failed_count: 85,
       skipped_count: 25,
       success_rate: 0.942,
+      avg_latency_ms: 1280,
+      avg_first_byte_ms: 232,
+      avg_tps: 71.5,
       provider_count: 5,
       key_count: 9,
       last_event_at: new Date().toISOString(),
       // 94.2% 成功率：successRate=0.942, failRate=0.045, skipRate=0.013
-      events: generateHealthEvents(120, 0.942, 0.045, 0.013, 1200, 800)
+      events: generateHealthEvents(120, 0.942, 0.045, 0.013, 1200, 800),
+      timeline: generateHealthTimeline(0.78, 0.14, 60),
+      time_range_start: new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString(),
+      time_range_end: new Date().toISOString()
     },
     {
       api_format: 'gemini:generate_content',
@@ -196,11 +208,17 @@ const MOCK_ENDPOINT_STATUS = {
       failed_count: 0,
       skipped_count: 0,
       success_rate: 1.0,
+      avg_latency_ms: 410,
+      avg_first_byte_ms: 92,
+      avg_tps: 118.2,
       provider_count: 3,
       key_count: 3,
       last_event_at: new Date().toISOString(),
       // 100% 成功率：全部成功
-      events: generateHealthEvents(45, 1.0, 0, 0, 400, 200)
+      events: generateHealthEvents(45, 1.0, 0, 0, 400, 200),
+      timeline: generateHealthTimeline(0.96, 0.02, 60),
+      time_range_start: new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString(),
+      time_range_end: new Date().toISOString()
     },
     {
       api_format: 'gemini:generate_content',
@@ -210,11 +228,17 @@ const MOCK_ENDPOINT_STATUS = {
       failed_count: 4,
       skipped_count: 2,
       success_rate: 0.987,
+      avg_latency_ms: 520,
+      avg_first_byte_ms: 110,
+      avg_tps: 102.7,
       provider_count: 3,
       key_count: 3,
       last_event_at: new Date().toISOString(),
       // 98.7% 成功率：successRate=0.987, failRate=0.009, skipRate=0.004
-      events: generateHealthEvents(25, 0.987, 0.009, 0.004, 500, 300)
+      events: generateHealthEvents(25, 0.987, 0.009, 0.004, 500, 300),
+      timeline: generateHealthTimeline(0.9, 0.06, 60),
+      time_range_start: new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString(),
+      time_range_end: new Date().toISOString()
     },
     {
       api_format: 'openai:chat',
@@ -224,11 +248,17 @@ const MOCK_ENDPOINT_STATUS = {
       failed_count: 35,
       skipped_count: 5,
       success_rate: 0.974,
+      avg_latency_ms: 760,
+      avg_first_byte_ms: 138,
+      avg_tps: 88.9,
       provider_count: 1,
       key_count: 2,
       last_event_at: new Date().toISOString(),
       // 97.4% 成功率：successRate=0.974, failRate=0.022, skipRate=0.004
-      events: generateHealthEvents(60, 0.974, 0.022, 0.004, 700, 400)
+      events: generateHealthEvents(60, 0.974, 0.022, 0.004, 700, 400),
+      timeline: generateHealthTimeline(0.86, 0.09, 60),
+      time_range_start: new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString(),
+      time_range_end: new Date().toISOString()
     },
     {
       api_format: 'openai:responses',
@@ -238,11 +268,17 @@ const MOCK_ENDPOINT_STATUS = {
       failed_count: 100,
       skipped_count: 40,
       success_rate: 0.940,
+      avg_latency_ms: 980,
+      avg_first_byte_ms: 185,
+      avg_tps: 64.3,
       provider_count: 4,
       key_count: 5,
       last_event_at: new Date().toISOString(),
       // 94.0% 成功率：successRate=0.940, failRate=0.043, skipRate=0.017
-      events: generateHealthEvents(100, 0.940, 0.043, 0.017, 800, 600)
+      events: generateHealthEvents(100, 0.940, 0.043, 0.017, 800, 600),
+      timeline: generateHealthTimeline(0.76, 0.14, 60),
+      time_range_start: new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString(),
+      time_range_end: new Date().toISOString()
     },
     {
       api_format: 'openai:embedding',
@@ -252,10 +288,16 @@ const MOCK_ENDPOINT_STATUS = {
       failed_count: 6,
       skipped_count: 2,
       success_rate: 0.987,
+      avg_latency_ms: 330,
+      avg_first_byte_ms: 72,
+      avg_tps: 0,
       provider_count: 1,
       key_count: 1,
       last_event_at: new Date().toISOString(),
-      events: generateHealthEvents(40, 0.987, 0.01, 0.003, 320, 140)
+      events: generateHealthEvents(40, 0.987, 0.01, 0.003, 320, 140),
+      timeline: generateHealthTimeline(0.92, 0.05, 60),
+      time_range_start: new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString(),
+      time_range_end: new Date().toISOString()
     }
   ]
 }
@@ -1573,8 +1615,14 @@ const mockHandlers: Record<string, (config: AxiosRequestConfig) => Promise<Axios
         failed_count: f.failed_count,
         skipped_count: f.skipped_count,
         success_rate: f.success_rate,
+        avg_latency_ms: f.avg_latency_ms,
+        avg_first_byte_ms: f.avg_first_byte_ms,
+        avg_tps: f.avg_tps,
         last_event_at: f.last_event_at,
-        events: f.events.slice(0, 10)
+        events: f.events.slice(0, 10),
+        timeline: f.timeline,
+        time_range_start: f.time_range_start,
+        time_range_end: f.time_range_end
       }))
     })
   },

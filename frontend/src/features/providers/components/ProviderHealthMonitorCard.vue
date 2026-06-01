@@ -3,47 +3,13 @@
     variant="default"
     class="overflow-hidden"
   >
-    <div class="px-6 py-3.5 border-b border-border/60">
-      <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <div>
-          <h3 class="text-base font-semibold">
-            {{ title }}
-          </h3>
-          <p class="mt-1 text-xs text-muted-foreground">
-            仅展示活跃提供商，展开后查看该提供商下的模型健康明细
-          </p>
-        </div>
-        <div class="flex items-center gap-3">
-          <Label class="text-xs text-muted-foreground">回溯时间：</Label>
-          <Select v-model="lookbackHours">
-            <SelectTrigger class="w-28 h-8 text-xs border-border/60">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="1">
-                1 小时
-              </SelectItem>
-              <SelectItem value="6">
-                6 小时
-              </SelectItem>
-              <SelectItem value="12">
-                12 小时
-              </SelectItem>
-              <SelectItem value="24">
-                24 小时
-              </SelectItem>
-              <SelectItem value="48">
-                48 小时
-              </SelectItem>
-            </SelectContent>
-          </Select>
-          <RefreshButton
-            :loading="loading"
-            @click="refreshData"
-          />
-        </div>
-      </div>
-    </div>
+    <HealthMonitorHeader
+      v-model:lookback-hours="lookbackHours"
+      :title="title"
+      description="仅展示活跃提供商，展开后查看该提供商下的模型健康明细"
+      :loading="loading"
+      @refresh="refreshData"
+    />
 
     <div class="p-6">
       <div
@@ -109,25 +75,14 @@
                 </div>
               </div>
 
-              <div class="grid w-full grid-cols-2 gap-2 sm:grid-cols-4 lg:max-w-2xl">
-                <MetricBox
-                  label="平均耗时"
-                  :value="formatMs(provider.avg_latency_ms)"
-                />
-                <MetricBox
-                  label="平均TTFB"
-                  :value="formatMs(provider.avg_first_byte_ms)"
-                />
-                <MetricBox
-                  label="平均速度"
-                  :value="formatTps(provider.avg_tps)"
-                />
-                <MetricBox
-                  label="可用率"
-                  :value="formatAvailability(provider)"
-                  :value-class="getAvailabilityClass(provider)"
-                />
-              </div>
+              <HealthMetricGrid
+                class="lg:max-w-2xl"
+                :avg-latency-ms="provider.avg_latency_ms"
+                :avg-first-byte-ms="provider.avg_first_byte_ms"
+                :avg-tps="provider.avg_tps"
+                :total-attempts="provider.total_attempts"
+                :success-rate="provider.success_rate"
+              />
             </button>
           </CollapsibleTrigger>
 
@@ -165,25 +120,14 @@
                   </Badge>
                 </div>
 
-                <div class="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-4">
-                  <MetricBox
-                    label="平均耗时"
-                    :value="formatMs(model.avg_latency_ms)"
-                  />
-                  <MetricBox
-                    label="平均TTFB"
-                    :value="formatMs(model.avg_first_byte_ms)"
-                  />
-                  <MetricBox
-                    label="平均速度"
-                    :value="formatTps(model.avg_tps)"
-                  />
-                  <MetricBox
-                    label="可用率"
-                    :value="formatAvailability(model)"
-                    :value-class="getAvailabilityClass(model)"
-                  />
-                </div>
+                <HealthMetricGrid
+                  class="mt-4"
+                  :avg-latency-ms="model.avg_latency_ms"
+                  :avg-first-byte-ms="model.avg_first_byte_ms"
+                  :avg-tps="model.avg_tps"
+                  :total-attempts="model.total_attempts"
+                  :success-rate="model.success_rate"
+                />
 
                 <div class="mt-4 flex items-center justify-between gap-3 text-[11px] uppercase tracking-wide text-muted-foreground">
                   <span>History (60pts)</span>
@@ -192,38 +136,16 @@
                   </span>
                 </div>
 
-                <div class="mt-2 w-full space-y-1">
-                  <div class="flex h-6 w-full items-center gap-px">
-                    <TooltipProvider
-                      v-for="(segment, index) in timelineSegments(model)"
-                      :key="`${provider.provider_id}-${model.model}-${index}`"
-                      :delay-duration="100"
-                    >
-                      <Tooltip>
-                      <TooltipTrigger as-child>
-                        <div
-                          class="h-full flex-1 cursor-pointer rounded-sm transition-all duration-150 hover:scale-y-110 hover:brightness-110"
-                          :class="getTimelineColor(segment)"
-                        />
-                      </TooltipTrigger>
-                      <TooltipContent
-                        side="top"
-                        :side-offset="8"
-                        class="max-w-xs"
-                      >
-                        <div class="text-xs whitespace-pre-line">
-                          {{ buildTimelineTooltip(model, segment, index) }}
-                        </div>
-                      </TooltipContent>
-                      </Tooltip>
-                    </TooltipProvider>
-                  </div>
-
-                  <div class="flex items-center justify-between text-[10px] text-muted-foreground">
-                    <span>{{ formatTimestamp(model.time_range_start) }}</span>
-                    <span>{{ formatTimestamp(model.time_range_end || generatedAt) }}</span>
-                  </div>
-                </div>
+                <HealthStatusTimeline
+                  class="mt-2"
+                  :timeline="model.timeline"
+                  :time-range-start="model.time_range_start"
+                  :time-range-end="model.time_range_end"
+                  :generated-at="generatedAt"
+                  :lookback-hours="parseInt(lookbackHours)"
+                  entity-label="模型"
+                  :entity-name="model.model"
+                />
               </div>
             </div>
           </CollapsibleContent>
@@ -234,41 +156,25 @@
 </template>
 
 <script setup lang="ts">
-import { defineComponent, h, ref, onMounted, watch } from 'vue'
+import { ref, onMounted, watch } from 'vue'
 import { Bot, ChevronRight, Loader2, Server } from 'lucide-vue-next'
 import Card from '@/components/ui/card.vue'
 import Badge from '@/components/ui/badge.vue'
-import Label from '@/components/ui/label.vue'
-import Select from '@/components/ui/select.vue'
-import SelectTrigger from '@/components/ui/select-trigger.vue'
-import SelectValue from '@/components/ui/select-value.vue'
-import SelectContent from '@/components/ui/select-content.vue'
-import SelectItem from '@/components/ui/select-item.vue'
-import RefreshButton from '@/components/ui/refresh-button.vue'
 import Collapsible from '@/components/ui/collapsible.vue'
 import CollapsibleTrigger from '@/components/ui/collapsible-trigger.vue'
 import CollapsibleContent from '@/components/ui/collapsible-content.vue'
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
+import HealthMetricGrid from './HealthMetricGrid.vue'
+import HealthMonitorHeader from './HealthMonitorHeader.vue'
+import HealthStatusTimeline from './HealthStatusTimeline.vue'
 import { getProviderStatusMonitor } from '@/api/endpoints/health'
-import type { ModelStatusMonitor, ProviderStatusMonitor } from '@/api/endpoints/types'
+import type { ProviderStatusMonitor } from '@/api/endpoints/types'
 import { useToast } from '@/composables/useToast'
 import { parseApiError } from '@/utils/errorParser'
-
-type HealthMonitorItem = Pick<ProviderStatusMonitor | ModelStatusMonitor, 'total_attempts' | 'success_rate'>
-
-const MetricBox = defineComponent({
-  props: {
-    label: { type: String, required: true },
-    value: { type: String, required: true },
-    valueClass: { type: String, default: '' }
-  },
-  setup(props) {
-    return () => h('div', { class: 'rounded-lg border border-border/40 bg-muted/20 px-3 py-2' }, [
-      h('div', { class: 'text-[11px] leading-tight text-muted-foreground' }, props.label),
-      h('div', { class: ['mt-1 text-sm font-semibold tabular-nums', props.valueClass] }, props.value)
-    ])
-  }
-})
+import {
+  formatCompactNumber,
+  getHealthBadgeVariant,
+  getHealthLabel
+} from './health-monitor-utils'
 
 const props = withDefaults(defineProps<{
   title?: string
@@ -323,124 +229,9 @@ function ensureExpandedProviderState() {
   expandedProviders.value = next
 }
 
-function getHealthLabel(item: HealthMonitorItem) {
-  if (item.total_attempts <= 0) return '暂无请求'
-  if (item.success_rate >= 0.95) return '正常'
-  if (item.success_rate >= 0.8) return '波动'
-  return '异常'
-}
-
-function getHealthBadgeVariant(item: HealthMonitorItem): 'default' | 'secondary' | 'destructive' | 'outline' | 'success' | 'warning' | 'dark' {
-  if (item.total_attempts <= 0) return 'outline'
-  if (item.success_rate >= 0.95) return 'success'
-  if (item.success_rate >= 0.8) return 'warning'
-  return 'destructive'
-}
-
-function getSuccessRateClass(rate: number) {
-  if (rate >= 0.95) return 'text-green-600 dark:text-green-400'
-  if (rate >= 0.8) return 'text-amber-600 dark:text-amber-400'
-  return 'text-red-600 dark:text-red-400'
-}
-
-function getAvailabilityClass(item: HealthMonitorItem) {
-  if (item.total_attempts <= 0) return ''
-  return getSuccessRateClass(item.success_rate)
-}
-
 function getProviderMetaText(provider: ProviderStatusMonitor) {
   const attempts = `${formatCompactNumber(provider.total_attempts)} 次请求`
   return `${provider.model_count} 个模型 / ${attempts}`
-}
-
-function formatMs(value?: number | null) {
-  if (typeof value !== 'number' || Number.isNaN(value)) return '-'
-  const absValue = Math.abs(value)
-  if (absValue < 1000) return `${Math.round(value)} ms`
-  if (absValue < 60_000) return `${formatDurationNumber(value / 1000)} s`
-  return `${formatDurationNumber(value / 60_000)} min`
-}
-
-function formatDurationNumber(value: number) {
-  return new Intl.NumberFormat('zh-CN', {
-    maximumFractionDigits: Math.abs(value) < 10 ? 2 : 1
-  }).format(value)
-}
-
-function formatPercent(value: number) {
-  if (typeof value !== 'number' || Number.isNaN(value)) return '-'
-  return `${(value * 100).toFixed(2)}%`
-}
-
-function formatAvailability(item: HealthMonitorItem) {
-  if (item.total_attempts <= 0) return '-'
-  return formatPercent(item.success_rate)
-}
-
-function formatTps(value?: number | null) {
-  if (typeof value !== 'number' || Number.isNaN(value)) return '-'
-  return `${new Intl.NumberFormat('zh-CN', {
-    maximumFractionDigits: value < 10 ? 2 : value < 100 ? 1 : 0
-  }).format(value)} tps`
-}
-
-function formatCompactNumber(value: number) {
-  return new Intl.NumberFormat('zh-CN', { notation: 'compact', maximumFractionDigits: 1 }).format(value)
-}
-
-function timelineSegments(item: ModelStatusMonitor | ProviderStatusMonitor) {
-  const timeline = Array.isArray(item.timeline) ? item.timeline : []
-  if (timeline.length > 0) return timeline
-  return Array.from({ length: 60 }, () => 'unknown')
-}
-
-function getTimelineColor(status: string) {
-  switch (status) {
-    case 'healthy':
-      return 'bg-green-500/80 dark:bg-green-400/90'
-    case 'warning':
-      return 'bg-amber-400/80 dark:bg-amber-300/80'
-    case 'unhealthy':
-      return 'bg-red-500/80 dark:bg-red-400/90'
-    default:
-      return 'bg-gray-300 dark:bg-gray-600'
-  }
-}
-
-function getTimelineLabel(status: string) {
-  switch (status) {
-    case 'healthy':
-      return '健康'
-    case 'warning':
-      return '波动'
-    case 'unhealthy':
-      return '异常'
-    default:
-      return '无请求'
-  }
-}
-
-function buildTimelineTooltip(model: ModelStatusMonitor, status: string, index: number) {
-  const segmentCount = timelineSegments(model).length
-  const startMs = model.time_range_start ? new Date(model.time_range_start).getTime() : Date.now() - parseInt(lookbackHours.value) * 60 * 60 * 1000
-  const endMs = model.time_range_end ? new Date(model.time_range_end).getTime() : Date.now()
-  const interval = Math.max(endMs - startMs, 1) / segmentCount
-  const cellStart = new Date(startMs + index * interval).toISOString()
-  const cellEnd = new Date(startMs + (index + 1) * interval).toISOString()
-  return `${formatTimestamp(cellStart)} - ${formatTimestamp(cellEnd)}\n模型：${model.model}\n状态：${getTimelineLabel(status)}`
-}
-
-function formatTimestamp(timestamp?: string | null) {
-  if (!timestamp) return '未知时间'
-  const date = new Date(timestamp)
-  if (Number.isNaN(date.getTime())) return '未知时间'
-  return date.toLocaleString('zh-CN', {
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit'
-  })
 }
 
 watch(lookbackHours, () => {

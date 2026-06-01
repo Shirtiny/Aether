@@ -800,7 +800,7 @@ async fn gateway_handles_admin_health_status_locally_with_trusted_admin_principa
             .as_array()
             .expect("timeline should be an array")
             .len(),
-        100
+        60
     );
     assert!(formats[0]["time_range_start"].is_string());
     assert!(formats[0]["time_range_end"].is_string());

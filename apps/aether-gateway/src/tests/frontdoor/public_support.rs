@@ -1282,7 +1282,7 @@ async fn gateway_handles_public_health_api_formats_without_proxying_upstream() {
     assert_eq!(formats[0]["total_attempts"], 1);
     assert_eq!(formats[0]["success_rate"], 1.0);
     assert_eq!(formats[0]["events"].as_array().map(Vec::len), Some(1));
-    assert_eq!(formats[0]["timeline"].as_array().map(Vec::len), Some(100));
+    assert_eq!(formats[0]["timeline"].as_array().map(Vec::len), Some(60));
     assert_eq!(formats[1]["api_format"], "openai:chat");
     assert_eq!(formats[1]["api_path"], "/v1/chat/completions");
     assert_eq!(formats[1]["total_attempts"], 3);
@@ -1291,7 +1291,7 @@ async fn gateway_handles_public_health_api_formats_without_proxying_upstream() {
     assert_eq!(formats[1]["skipped_count"], 1);
     assert_eq!(formats[1]["success_rate"], 0.5);
     assert_eq!(formats[1]["events"].as_array().map(Vec::len), Some(3));
-    assert_eq!(formats[1]["timeline"].as_array().map(Vec::len), Some(100));
+    assert_eq!(formats[1]["timeline"].as_array().map(Vec::len), Some(60));
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();
@@ -5186,12 +5186,12 @@ async fn gateway_handles_users_me_endpoint_status_locally_without_proxying_upstr
     assert_eq!(items[0]["api_format"], "claude:messages");
     assert_eq!(items[0]["display_name"], "Claude Messages");
     assert_eq!(items[0]["health_score"], 1.0);
-    assert_eq!(items[0]["timeline"].as_array().map(Vec::len), Some(100));
+    assert_eq!(items[0]["timeline"].as_array().map(Vec::len), Some(60));
     assert!(items[0].get("total_endpoints").is_none());
     assert_eq!(items[1]["api_format"], "openai:chat");
     assert_eq!(items[1]["display_name"], "OpenAI Chat");
     assert_eq!(items[1]["health_score"], 0.5);
-    assert_eq!(items[1]["timeline"].as_array().map(Vec::len), Some(100));
+    assert_eq!(items[1]["timeline"].as_array().map(Vec::len), Some(60));
     assert!(items[1].get("total_keys").is_none());
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 

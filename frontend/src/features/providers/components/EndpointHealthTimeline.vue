@@ -1,6 +1,18 @@
 <template>
-  <div class="w-full space-y-1">
-    <!-- 时间线 -->
+  <HealthStatusTimeline
+    v-if="hasStatusTimeline"
+    :timeline="monitor?.timeline"
+    :time-range-start="monitor?.time_range_start"
+    :time-range-end="monitor?.time_range_end"
+    :lookback-hours="lookbackHours"
+    :fallback-segments="segmentCount ?? GRID_COUNT"
+    entity-label="端点"
+    :entity-name="monitor?.api_format"
+  />
+  <div
+    v-else
+    class="w-full space-y-1"
+  >
     <div class="flex items-center gap-px h-6 w-full">
       <TooltipProvider
         v-for="(segment, index) in segments"
@@ -26,7 +38,6 @@
         </Tooltip>
       </TooltipProvider>
     </div>
-    <!-- 时间标签 -->
     <div class="flex items-center justify-between text-[10px] text-muted-foreground">
       <span>{{ earliestTime }}</span>
       <span>{{ latestTime }}</span>
@@ -38,6 +49,8 @@
 import { computed } from 'vue'
 import type { EndpointStatusMonitor, EndpointHealthEvent, PublicEndpointStatusMonitor, PublicHealthEvent } from '@/api/endpoints'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
+import HealthStatusTimeline from './HealthStatusTimeline.vue'
+import { formatTimestamp } from './health-monitor-utils'
 
 // 组件同时支持管理员端和用户端的监控数据类型
 // - EndpointStatusMonitor: 管理员端，包含 provider_count, key_count 等敏感信息
@@ -49,24 +62,15 @@ const props = defineProps<{
 }>()
 
 // 固定格子数量，将实际事件按时间均匀分布到格子中
-const GRID_COUNT = 100
+const GRID_COUNT = 60
+
+const hasStatusTimeline = computed(() =>
+  Array.isArray(props.monitor?.timeline) && (props.monitor?.timeline?.length ?? 0) > 0
+)
 
 const segments = computed(() => {
   const gridCount = props.segmentCount ?? GRID_COUNT
   const lookbackHours = props.lookbackHours ?? 6
-  const usageTimeline = Array.isArray(props.monitor?.timeline)
-    ? props.monitor?.timeline ?? []
-    : []
-
-  if (usageTimeline.length > 0) {
-    return buildUsageTimelineSegments(
-      usageTimeline,
-      props.monitor?.time_range_start ?? null,
-      props.monitor?.time_range_end ?? null,
-      lookbackHours
-    )
-  }
-
   const events = props.monitor?.events ?? []
 
   // 无数据时显示空白格子
@@ -183,18 +187,6 @@ function getStatusText(status: string) {
   }
 }
 
-function formatTimestamp(timestamp?: string | null) {
-  if (!timestamp) return '未知时间'
-  const date = new Date(timestamp)
-  return date.toLocaleString('zh-CN', {
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit'
-  })
-}
-
 // 计算时间范围显示
 const earliestTime = computed(() => {
   const explicitStart =
@@ -212,55 +204,4 @@ const latestTime = computed(() => {
   return formatTimestamp(new Date().toISOString())
 })
 
-function buildUsageTimelineSegments(
-  statuses: string[],
-  timeRangeStart: string | null,
-  timeRangeEnd: string | null,
-  lookbackHours: number
-) {
-  const gridCount = statuses.length
-  const endTime = timeRangeEnd ? new Date(timeRangeEnd).getTime() : Date.now()
-  const startTime = timeRangeStart
-    ? new Date(timeRangeStart).getTime()
-    : endTime - lookbackHours * 60 * 60 * 1000
-  const safeRange = Math.max(endTime - startTime, 1)
-  const interval = safeRange / gridCount
-
-  return statuses.map((status, index) => {
-    const cellStart = new Date(startTime + index * interval)
-    const cellEnd = new Date(startTime + (index + 1) * interval)
-    return {
-      color: getHealthTimelineColor(status),
-      tooltip: `${formatTimestamp(cellStart.toISOString())} - ${formatTimestamp(
-        cellEnd.toISOString()
-      )}\n状态：${getHealthTimelineLabel(status)}`
-    }
-  })
-}
-
-function getHealthTimelineColor(status: string) {
-  switch (status) {
-    case 'healthy':
-      return 'bg-green-500/80 dark:bg-green-400/90'
-    case 'warning':
-      return 'bg-amber-400/80 dark:bg-amber-300/80'
-    case 'unhealthy':
-      return 'bg-red-500/80 dark:bg-red-400/90'
-    default:
-      return 'bg-gray-300 dark:bg-gray-600'
-  }
-}
-
-function getHealthTimelineLabel(status: string) {
-  switch (status) {
-    case 'healthy':
-      return '健康'
-    case 'warning':
-      return '警告'
-    case 'unhealthy':
-      return '异常'
-    default:
-      return '未知'
-  }
-}
 </script>

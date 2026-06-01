@@ -104,6 +104,7 @@ pub(crate) struct ModelHealthMonitorOptions {
     pub(crate) include_provider_count: bool,
 }
 
+const API_FORMAT_HEALTH_TIMELINE_SEGMENTS: u32 = 60;
 const MODEL_HEALTH_TIMELINE_SEGMENTS: u32 = 60;
 
 pub(crate) fn provider_key_api_formats(key: &StoredProviderCatalogKey) -> Vec<String> {
@@ -328,6 +329,27 @@ pub(crate) async fn build_api_format_health_monitor_payload(
         .map(|duration| duration.as_secs())
         .unwrap_or_default();
     let since_unix_secs = now_unix_secs.saturating_sub(lookback_hours * 3600);
+    let usage_data_available = state.has_usage_data_reader();
+    let usage_breakdown_by_format = if usage_data_available {
+        state
+            .summarize_usage_breakdown(&UsageBreakdownSummaryQuery {
+                created_from_unix_secs: since_unix_secs,
+                created_until_unix_secs: now_unix_secs,
+                user_id: None,
+                provider_name: None,
+                exclude_status_codes: vec![USER_CANCELLED_STATUS_CODE],
+                group_by: UsageBreakdownGroupBy::ApiFormat,
+            })
+            .await
+            .ok()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|row| !row.group_key.trim().is_empty())
+            .map(|row| (row.group_key.clone(), row))
+            .collect::<BTreeMap<_, _>>()
+    } else {
+        BTreeMap::new()
+    };
 
     let providers = state
         .list_provider_catalog_providers(true)
@@ -430,7 +452,7 @@ pub(crate) async fn build_api_format_health_monitor_payload(
             &all_endpoint_ids,
             since_unix_secs,
             now_unix_secs,
-            100,
+            API_FORMAT_HEALTH_TIMELINE_SEGMENTS,
         )
         .await
         .ok()
@@ -497,6 +519,31 @@ pub(crate) async fn build_api_format_health_monitor_payload(
                 .or(candidate.started_at_unix_ms)
                 .or(Some(candidate.created_at_unix_ms))
         });
+        let avg_latency_ms = usage_breakdown_by_format
+            .get(&api_format)
+            .and_then(model_health_average_latency_ms)
+            .or_else(|| request_candidate_average_latency_ms(&attempts));
+        let avg_tps = usage_breakdown_by_format
+            .get(&api_format)
+            .and_then(model_health_average_tps);
+        let usage_events = if usage_data_available {
+            state
+                .list_usage_audits(&UsageAuditListQuery {
+                    created_from_unix_secs: Some(since_unix_secs),
+                    created_until_unix_secs: Some(now_unix_secs),
+                    api_format: Some(api_format.clone()),
+                    exclude_status_codes: vec![USER_CANCELLED_STATUS_CODE],
+                    limit: Some(per_format_limit),
+                    newest_first: true,
+                    ..UsageAuditListQuery::default()
+                })
+                .await
+                .ok()
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let avg_first_byte_ms = model_health_average_first_byte_ms(&usage_events);
         let events = attempts
             .into_iter()
             .filter_map(|candidate| {
@@ -518,7 +565,7 @@ pub(crate) async fn build_api_format_health_monitor_payload(
             .get(&api_format)
             .unwrap_or(&empty_timeline);
         let (timeline, time_range_start, time_range_end) =
-            build_public_health_timeline(timeline_source, 100);
+            build_public_health_timeline(timeline_source, API_FORMAT_HEALTH_TIMELINE_SEGMENTS);
 
         let mut format_payload = json!({
             "api_format": api_format.clone(),
@@ -527,6 +574,9 @@ pub(crate) async fn build_api_format_health_monitor_payload(
             "failed_count": failed_count,
             "skipped_count": skipped_count,
             "success_rate": success_rate,
+            "avg_latency_ms": avg_latency_ms,
+            "avg_first_byte_ms": avg_first_byte_ms,
+            "avg_tps": avg_tps,
             "last_event_at": last_event_at.and_then(unix_ms_to_rfc3339),
             "events": events,
             "timeline": timeline,
@@ -938,6 +988,22 @@ fn model_health_payload_from_row(
         model_payload["provider_count"] = json!(provider_count);
     }
     model_payload
+}
+
+fn request_candidate_average_latency_ms(candidates: &[StoredRequestCandidate]) -> Option<f64> {
+    let mut sum = 0u64;
+    let mut count = 0u64;
+    for candidate in candidates {
+        if let Some(latency_ms) = candidate.latency_ms {
+            sum = sum.saturating_add(latency_ms);
+            count = count.saturating_add(1);
+        }
+    }
+    if count == 0 {
+        None
+    } else {
+        Some(sum as f64 / count as f64)
+    }
 }
 
 fn model_health_average_latency_ms(row: &StoredUsageBreakdownSummaryRow) -> Option<f64> {

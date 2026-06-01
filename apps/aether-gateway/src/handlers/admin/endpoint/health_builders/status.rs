@@ -11,6 +11,8 @@ use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+const ENDPOINT_HEALTH_TIMELINE_SEGMENTS: u32 = 60;
+
 pub(crate) async fn build_admin_endpoint_health_status_payload(
     state: &AdminAppState<'_>,
     lookback_hours: u64,
@@ -124,7 +126,7 @@ pub(crate) async fn build_admin_endpoint_health_status_payload(
             &all_endpoint_ids,
             since_unix_secs,
             now_unix_secs,
-            100,
+            ENDPOINT_HEALTH_TIMELINE_SEGMENTS,
         )
         .await
         .ok()
@@ -171,7 +173,7 @@ pub(crate) async fn build_admin_endpoint_health_status_payload(
             let empty_timeline = BTreeMap::new();
             let timeline_source = timeline_by_format.get(&api_format).unwrap_or(&empty_timeline);
             let (timeline, time_range_start, time_range_end) =
-                build_public_health_timeline(timeline_source, 100);
+                build_public_health_timeline(timeline_source, ENDPOINT_HEALTH_TIMELINE_SEGMENTS);
             let healthy_count = timeline.iter().filter(|status| **status == "healthy").count();
             let warning_count = timeline.iter().filter(|status| **status == "warning").count();
             let unhealthy_count = timeline.iter().filter(|status| **status == "unhealthy").count();
