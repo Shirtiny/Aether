@@ -109,7 +109,7 @@
                 </div>
               </div>
 
-              <div class="grid w-full grid-cols-4 gap-2 lg:max-w-2xl">
+              <div class="grid w-full grid-cols-2 gap-2 sm:grid-cols-4 lg:max-w-2xl">
                 <MetricBox
                   label="平均耗时"
                   :value="formatMs(provider.avg_latency_ms)"
@@ -124,8 +124,8 @@
                 />
                 <MetricBox
                   label="可用率"
-                  :value="formatPercent(provider.success_rate)"
-                  :value-class="getSuccessRateClass(provider.success_rate)"
+                  :value="formatAvailability(provider)"
+                  :value-class="getAvailabilityClass(provider)"
                 />
               </div>
             </button>
@@ -165,7 +165,7 @@
                   </Badge>
                 </div>
 
-                <div class="mt-4 grid grid-cols-4 gap-2">
+                <div class="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-4">
                   <MetricBox
                     label="平均耗时"
                     :value="formatMs(model.avg_latency_ms)"
@@ -180,8 +180,8 @@
                   />
                   <MetricBox
                     label="可用率"
-                    :value="formatPercent(model.success_rate)"
-                    :value-class="getSuccessRateClass(model.success_rate)"
+                    :value="formatAvailability(model)"
+                    :value-class="getAvailabilityClass(model)"
                   />
                 </div>
 
@@ -192,15 +192,17 @@
                   </span>
                 </div>
 
-                <TooltipProvider :delay-duration="100">
-                  <div class="mt-2 flex h-7 w-full items-center gap-px">
-                    <Tooltip
+                <div class="mt-2 w-full space-y-1">
+                  <div class="flex h-6 w-full items-center gap-px">
+                    <TooltipProvider
                       v-for="(segment, index) in timelineSegments(model)"
                       :key="`${provider.provider_id}-${model.model}-${index}`"
+                      :delay-duration="100"
                     >
+                      <Tooltip>
                       <TooltipTrigger as-child>
                         <div
-                          class="h-full flex-1 rounded-[2px] transition-all duration-150 hover:scale-y-110 hover:brightness-110"
+                          class="h-full flex-1 cursor-pointer rounded-sm transition-all duration-150 hover:scale-y-110 hover:brightness-110"
                           :class="getTimelineColor(segment)"
                         />
                       </TooltipTrigger>
@@ -213,13 +215,14 @@
                           {{ buildTimelineTooltip(model, segment, index) }}
                         </div>
                       </TooltipContent>
-                    </Tooltip>
+                      </Tooltip>
+                    </TooltipProvider>
                   </div>
-                </TooltipProvider>
 
-                <div class="mt-2 flex items-center justify-between text-[10px] text-muted-foreground">
-                  <span>{{ formatTimestamp(model.time_range_start) }}</span>
-                  <span>{{ formatTimestamp(model.time_range_end || generatedAt) }}</span>
+                  <div class="flex items-center justify-between text-[10px] text-muted-foreground">
+                    <span>{{ formatTimestamp(model.time_range_start) }}</span>
+                    <span>{{ formatTimestamp(model.time_range_end || generatedAt) }}</span>
+                  </div>
                 </div>
               </div>
             </div>
@@ -340,6 +343,11 @@ function getSuccessRateClass(rate: number) {
   return 'text-red-600 dark:text-red-400'
 }
 
+function getAvailabilityClass(item: HealthMonitorItem) {
+  if (item.total_attempts <= 0) return ''
+  return getSuccessRateClass(item.success_rate)
+}
+
 function getProviderMetaText(provider: ProviderStatusMonitor) {
   const attempts = `${formatCompactNumber(provider.total_attempts)} 次请求`
   return `${provider.model_count} 个模型 / ${attempts}`
@@ -364,6 +372,11 @@ function formatPercent(value: number) {
   return `${(value * 100).toFixed(2)}%`
 }
 
+function formatAvailability(item: HealthMonitorItem) {
+  if (item.total_attempts <= 0) return '-'
+  return formatPercent(item.success_rate)
+}
+
 function formatTps(value?: number | null) {
   if (typeof value !== 'number' || Number.isNaN(value)) return '-'
   return `${new Intl.NumberFormat('zh-CN', {
@@ -384,11 +397,11 @@ function timelineSegments(item: ModelStatusMonitor | ProviderStatusMonitor) {
 function getTimelineColor(status: string) {
   switch (status) {
     case 'healthy':
-      return 'bg-green-500/85 dark:bg-green-400/90'
+      return 'bg-green-500/80 dark:bg-green-400/90'
     case 'warning':
-      return 'bg-amber-400/85 dark:bg-amber-300/85'
+      return 'bg-amber-400/80 dark:bg-amber-300/80'
     case 'unhealthy':
-      return 'bg-red-500/85 dark:bg-red-400/90'
+      return 'bg-red-500/80 dark:bg-red-400/90'
     default:
       return 'bg-gray-300 dark:bg-gray-600'
   }

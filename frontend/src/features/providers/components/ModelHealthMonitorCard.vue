@@ -74,7 +74,7 @@
             </Badge>
           </div>
 
-          <div class="mt-4 grid grid-cols-4 gap-2">
+          <div class="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-4">
             <div
               class="rounded-lg border border-border/40 bg-muted/20 px-3 py-2"
             >
@@ -141,15 +141,17 @@
             </span>
           </div>
 
-          <TooltipProvider :delay-duration="100">
-            <div class="mt-2 flex h-7 w-full items-center gap-px">
-              <Tooltip
+          <div class="mt-2 w-full space-y-1">
+            <div class="flex h-6 w-full items-center gap-px">
+              <TooltipProvider
                 v-for="(segment, index) in timelineSegments(monitor)"
                 :key="`${monitor.model}-${index}`"
+                :delay-duration="100"
               >
+                <Tooltip>
                 <TooltipTrigger as-child>
                   <div
-                    class="h-full flex-1 rounded-[2px] transition-all duration-150 hover:scale-y-110 hover:brightness-110"
+                    class="h-full flex-1 cursor-pointer rounded-sm transition-all duration-150 hover:scale-y-110 hover:brightness-110"
                     :class="getTimelineColor(segment)"
                   />
                 </TooltipTrigger>
@@ -158,17 +160,16 @@
                     {{ buildTimelineTooltip(monitor, segment, index) }}
                   </div>
                 </TooltipContent>
-              </Tooltip>
+                </Tooltip>
+              </TooltipProvider>
             </div>
-          </TooltipProvider>
 
-          <div
-            class="mt-2 flex items-center justify-between text-[10px] text-muted-foreground"
-          >
-            <span>{{ formatTimestamp(monitor.time_range_start) }}</span>
-            <span>{{
-              formatTimestamp(monitor.time_range_end || generatedAt)
-            }}</span>
+            <div class="flex items-center justify-between text-[10px] text-muted-foreground">
+              <span>{{ formatTimestamp(monitor.time_range_start) }}</span>
+              <span>{{
+                formatTimestamp(monitor.time_range_end || generatedAt)
+              }}</span>
+            </div>
           </div>
         </div>
       </div>
@@ -332,11 +333,11 @@ function timelineSegments(monitor: ModelStatusMonitor) {
 function getTimelineColor(status: string) {
   switch (status) {
     case "healthy":
-      return "bg-green-500/85 dark:bg-green-400/90";
+      return "bg-green-500/80 dark:bg-green-400/90";
     case "warning":
-      return "bg-amber-400/85 dark:bg-amber-300/85";
+      return "bg-amber-400/80 dark:bg-amber-300/80";
     case "unhealthy":
-      return "bg-red-500/85 dark:bg-red-400/90";
+      return "bg-red-500/80 dark:bg-red-400/90";
     default:
       return "bg-gray-300 dark:bg-gray-600";
   }
