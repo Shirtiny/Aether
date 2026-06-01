@@ -88,6 +88,16 @@
               :lookback-hours="parseInt(lookbackHours)"
             />
           </div>
+
+          <div class="mt-4 flex justify-end">
+            <Button
+              variant="outline"
+              size="sm"
+              @click="openDetails(monitor)"
+            >
+              查看详情
+            </Button>
+          </div>
         </div>
       </div>
     </div>
@@ -99,18 +109,21 @@ import { computed, ref, onMounted, watch } from 'vue'
 import { Activity, Loader2 } from 'lucide-vue-next'
 import Card from '@/components/ui/card.vue'
 import Badge from '@/components/ui/badge.vue'
+import Button from '@/components/ui/button.vue'
 import HealthMetricGrid from './HealthMetricGrid.vue'
 import HealthMonitorHeader from './HealthMonitorHeader.vue'
 import EndpointHealthTimeline from './EndpointHealthTimeline.vue'
 import { getEndpointStatusMonitor, getPublicEndpointStatusMonitor } from '@/api/endpoints/health'
 import type { EndpointStatusMonitor, PublicEndpointStatusMonitor } from '@/api/endpoints/types'
+import type { HealthMonitorDetailTarget, HealthMonitorSectionSummary } from './health-monitor-utils'
 import { useToast } from '@/composables/useToast'
 import { parseApiError } from '@/utils/errorParser'
 import { formatApiFormat } from '@/api/endpoints/types/api-format'
 import {
   formatCompactNumber,
   getHealthBadgeVariant,
-  getHealthLabel
+  getHealthLabel,
+  summarizeHealthMonitorItems
 } from './health-monitor-utils'
 
 type EndpointMonitor = EndpointStatusMonitor | PublicEndpointStatusMonitor
@@ -124,6 +137,11 @@ const props = withDefaults(defineProps<{
   isAdmin: false,
   showProviderInfo: false
 })
+
+const emit = defineEmits<{
+  viewDetails: [target: HealthMonitorDetailTarget]
+  summaryUpdated: [summary: HealthMonitorSectionSummary]
+}>()
 
 const { error: showError } = useToast()
 
@@ -148,6 +166,7 @@ async function loadMonitors() {
       const data = await getPublicEndpointStatusMonitor(params)
       monitors.value = data.formats || []
     }
+    emitSummary()
   } catch (err: unknown) {
     showError(parseApiError(err, '加载健康监控数据失败'), '错误')
   } finally {
@@ -173,6 +192,42 @@ function getEndpointMetaText(monitor: EndpointMonitor) {
     return `${monitor.api_path} / ${attempts}`
   }
   return attempts
+}
+
+function openDetails(monitor: EndpointMonitor) {
+  emit('viewDetails', {
+    lookbackHours: parseInt(lookbackHours.value),
+    source: {
+      kind: 'endpoint',
+      value: monitor.api_format,
+      title: formatApiFormat(monitor.api_format),
+      metaText: getEndpointDetailMetaText(monitor),
+      totalAttempts: monitor.total_attempts,
+      successCount: monitor.success_count,
+      failedCount: monitor.failed_count,
+      successRate: monitor.success_rate,
+      avgLatencyMs: monitor.avg_latency_ms,
+      avgFirstByteMs: monitor.avg_first_byte_ms,
+      avgTps: monitor.avg_tps,
+      timeline: monitor.timeline || null,
+      timeRangeStart: monitor.time_range_start || null,
+      timeRangeEnd: monitor.time_range_end || null
+    }
+  })
+}
+
+function getEndpointDetailMetaText(monitor: EndpointMonitor) {
+  if (props.showProviderInfo && hasProviderInfo(monitor)) {
+    return `${monitor.provider_count} 个提供商 / ${monitor.key_count} 个密钥`
+  }
+  if (hasApiPath(monitor)) {
+    return monitor.api_path
+  }
+  return null
+}
+
+function emitSummary() {
+  emit('summaryUpdated', summarizeHealthMonitorItems(visibleMonitors.value))
 }
 
 function hasProviderInfo(monitor: EndpointMonitor): monitor is EndpointStatusMonitor {

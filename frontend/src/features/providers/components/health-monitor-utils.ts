@@ -7,9 +7,72 @@ export type HealthBadgeVariant =
   | 'warning'
   | 'dark'
 
+export type HealthMonitorSourceKind = 'endpoint' | 'model' | 'provider'
+
+export interface HealthMonitorDetailSource {
+  kind: HealthMonitorSourceKind
+  value: string
+  title: string
+  metaText?: string | null
+  totalAttempts: number
+  successCount: number
+  failedCount: number
+  successRate: number
+  avgLatencyMs?: number | null
+  avgFirstByteMs?: number | null
+  avgTps?: number | null
+  timeline?: string[] | null
+  timeRangeStart?: string | null
+  timeRangeEnd?: string | null
+}
+
+export interface HealthMonitorDetailTarget {
+  source: HealthMonitorDetailSource
+  lookbackHours: number
+}
+
 export interface HealthMonitorAvailability {
   total_attempts: number
   success_rate: number
+}
+
+export interface HealthMonitorSectionSummary {
+  total: number
+  healthy: number
+  warning: number
+  unhealthy: number
+  empty: number
+  attempts: number
+}
+
+export function summarizeHealthMonitorItems(
+  items: HealthMonitorAvailability[]
+): HealthMonitorSectionSummary {
+  return items.reduce<HealthMonitorSectionSummary>((summary, item) => {
+    summary.total += 1
+    summary.attempts += item.total_attempts
+    if (item.total_attempts <= 0) {
+      summary.empty += 1
+    } else if (item.success_rate >= 0.95) {
+      summary.healthy += 1
+    } else if (item.success_rate >= 0.8) {
+      summary.warning += 1
+    } else {
+      summary.unhealthy += 1
+    }
+    return summary
+  }, createEmptyHealthMonitorSectionSummary())
+}
+
+export function createEmptyHealthMonitorSectionSummary(): HealthMonitorSectionSummary {
+  return {
+    total: 0,
+    healthy: 0,
+    warning: 0,
+    unhealthy: 0,
+    empty: 0,
+    attempts: 0
+  }
 }
 
 export function getHealthLabel(

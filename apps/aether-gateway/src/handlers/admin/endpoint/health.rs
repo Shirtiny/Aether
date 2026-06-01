@@ -1,7 +1,9 @@
 use super::extractors::{admin_health_key_id, admin_recover_key_id};
 use crate::handlers::admin::request::{AdminAppState, AdminRequestContext};
 use crate::handlers::admin::shared::query_param_value;
-use crate::handlers::public::{ApiFormatHealthMonitorOptions, ModelHealthMonitorOptions};
+use crate::handlers::public::{
+    ApiFormatHealthMonitorOptions, HealthMonitorRelationDimension, ModelHealthMonitorOptions,
+};
 use crate::GatewayError;
 use axum::{
     body::Body,
@@ -18,6 +20,14 @@ fn build_admin_endpoint_health_data_unavailable_response() -> Response<Body> {
     (
         http::StatusCode::SERVICE_UNAVAILABLE,
         Json(json!({ "detail": ADMIN_ENDPOINT_HEALTH_DATA_UNAVAILABLE_DETAIL })),
+    )
+        .into_response()
+}
+
+fn build_admin_endpoint_health_bad_request_response(detail: &str) -> Response<Body> {
+    (
+        http::StatusCode::BAD_REQUEST,
+        Json(json!({ "detail": detail })),
     )
         .into_response()
 }
@@ -223,6 +233,55 @@ pub(super) async fn maybe_build_local_admin_endpoints_health_response(
                 provider_limit,
                 per_provider_model_limit,
                 per_model_event_limit,
+            )
+            .await
+        else {
+            return Ok(Some(build_admin_endpoint_health_data_unavailable_response()));
+        };
+        return Ok(Some(Json(payload).into_response()));
+    }
+
+    if decision.route_family.as_deref() == Some("endpoints_health")
+        && decision.route_kind.as_deref() == Some("health_related")
+        && request_context.path() == "/api/admin/endpoints/health/related"
+    {
+        if !state.has_usage_data_reader() {
+            return Ok(Some(build_admin_endpoint_health_data_unavailable_response()));
+        }
+        let Some(dimension) = query_param_value(request_context.query_string(), "dimension")
+            .and_then(|value| HealthMonitorRelationDimension::parse(&value))
+        else {
+            return Ok(Some(build_admin_endpoint_health_bad_request_response(
+                "dimension 必须是 endpoint、model 或 provider",
+            )));
+        };
+        let Some(value) = query_param_value(request_context.query_string(), "value")
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(Some(build_admin_endpoint_health_bad_request_response(
+                "value 不能为空",
+            )));
+        };
+        let lookback_hours = query_param_value(request_context.query_string(), "lookback_hours")
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| (1..=72).contains(value))
+            .unwrap_or(6);
+        let related_limit = query_param_value(request_context.query_string(), "related_limit")
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| (1..=50).contains(value))
+            .unwrap_or(8);
+        let per_item_limit = query_param_value(request_context.query_string(), "per_item_limit")
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| (10..=200).contains(value))
+            .unwrap_or(100);
+        let Some(payload) = state
+            .build_related_health_monitor_payload(
+                lookback_hours,
+                dimension,
+                &value,
+                related_limit,
+                per_item_limit,
             )
             .await
         else {

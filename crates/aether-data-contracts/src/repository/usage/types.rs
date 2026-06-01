@@ -988,6 +988,8 @@ pub struct UsageBreakdownSummaryQuery {
     pub created_until_unix_secs: u64,
     pub user_id: Option<String>,
     pub provider_name: Option<String>,
+    pub model: Option<String>,
+    pub api_format: Option<String>,
     pub exclude_status_codes: Vec<u16>,
     pub group_by: UsageBreakdownGroupBy,
 }

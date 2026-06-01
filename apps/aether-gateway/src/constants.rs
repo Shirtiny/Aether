@@ -94,6 +94,7 @@ pub(crate) const RUST_FRONTDOOR_OWNED_ROUTE_PATTERNS: &[&str] = &[
     "/api/public/global-models",
     "/api/public/health/api-formats",
     "/api/public/health/models",
+    "/api/public/health/related",
     "/api/oauth/providers",
     "/api/oauth/{provider_type}/authorize",
     "/api/oauth/{provider_type}/callback",

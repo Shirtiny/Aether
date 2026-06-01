@@ -4841,6 +4841,18 @@ WITH filtered_usage AS (
                 .push("\"usage\".provider_name = ")
                 .push_bind(provider_name.to_string());
         }
+        if let Some(model) = query.model.as_deref() {
+            builder.push(if has_where { " AND " } else { " WHERE " });
+            builder
+                .push("\"usage\".model = ")
+                .push_bind(model.to_string());
+        }
+        if let Some(api_format) = query.api_format.as_deref() {
+            builder.push(if has_where { " AND " } else { " WHERE " });
+            builder
+                .push("\"usage\".api_format = ")
+                .push_bind(api_format.to_string());
+        }
         push_postgres_usage_excluded_status_codes(
             &mut builder,
             &mut has_where,
@@ -4944,6 +4956,12 @@ ORDER BY request_count DESC, group_key ASC
         if query.provider_name.is_some() {
             return self.summarize_usage_breakdown_raw(query).await;
         }
+        if query.model.is_some() {
+            return self.summarize_usage_breakdown_raw(query).await;
+        }
+        if query.api_format.is_some() {
+            return self.summarize_usage_breakdown_raw(query).await;
+        }
         let Some(user_id) = query.user_id.as_deref() else {
             return self.summarize_usage_breakdown_raw(query).await;
         };
@@ -4966,6 +4984,8 @@ ORDER BY request_count DESC, group_key ASC
                     created_until_unix_secs: dashboard_utc_to_unix_secs(raw_end),
                     user_id: Some(user_id.to_string()),
                     provider_name: None,
+                    model: None,
+                    api_format: None,
                     exclude_status_codes: query.exclude_status_codes.clone(),
                     group_by: query.group_by,
                 })
@@ -4990,6 +5010,8 @@ ORDER BY request_count DESC, group_key ASC
                     created_until_unix_secs: dashboard_utc_to_unix_secs(raw_end),
                     user_id: Some(user_id.to_string()),
                     provider_name: None,
+                    model: None,
+                    api_format: None,
                     exclude_status_codes: query.exclude_status_codes.clone(),
                     group_by: query.group_by,
                 })

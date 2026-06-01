@@ -848,6 +848,8 @@ pub(super) async fn handle_users_me_usage_get(
                 created_until_unix_secs,
                 user_id: Some(auth.user.id.clone()),
                 provider_name: None,
+                model: None,
+                api_format: None,
                 exclude_status_codes: Vec::new(),
                 group_by: UsageBreakdownGroupBy::Model,
             })
@@ -869,6 +871,8 @@ pub(super) async fn handle_users_me_usage_get(
                     created_until_unix_secs,
                     user_id: Some(auth.user.id.clone()),
                     provider_name: None,
+                    model: None,
+                    api_format: None,
                     exclude_status_codes: Vec::new(),
                     group_by: UsageBreakdownGroupBy::Provider,
                 })
@@ -890,6 +894,8 @@ pub(super) async fn handle_users_me_usage_get(
                 created_until_unix_secs,
                 user_id: Some(auth.user.id.clone()),
                 provider_name: None,
+                model: None,
+                api_format: None,
                 exclude_status_codes: Vec::new(),
                 group_by: UsageBreakdownGroupBy::ApiFormat,
             })

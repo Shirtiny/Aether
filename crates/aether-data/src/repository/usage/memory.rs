@@ -552,6 +552,16 @@ fn usage_matches_breakdown_summary_query(
             return false;
         }
     }
+    if let Some(model) = query.model.as_deref() {
+        if item.model != model {
+            return false;
+        }
+    }
+    if let Some(api_format) = query.api_format.as_deref() {
+        if item.api_format.as_deref() != Some(api_format) {
+            return false;
+        }
+    }
     if item
         .status_code
         .is_some_and(|status_code| query.exclude_status_codes.contains(&status_code))

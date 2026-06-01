@@ -458,6 +458,104 @@ const MOCK_PROVIDER_HEALTH_STATUS = {
   ]
 }
 
+function mockApiFormatDisplayName(apiFormat: string) {
+  const labels: Record<string, string> = {
+    'claude:messages': 'Claude Messages',
+    'gemini:generate_content': 'Gemini Generate Content',
+    'openai:chat': 'OpenAI Chat',
+    'openai:embedding': 'OpenAI Embedding'
+  }
+  return labels[apiFormat] || apiFormat
+}
+
+function relatedEndpointMonitor(format: typeof MOCK_ENDPOINT_STATUS.formats[number]) {
+  return {
+    kind: 'endpoint',
+    key: format.api_format,
+    display_name: mockApiFormatDisplayName(format.api_format),
+    meta_text: format.api_path,
+    total_attempts: format.total_attempts,
+    success_count: format.success_count,
+    failed_count: format.failed_count,
+    success_rate: format.success_rate,
+    avg_latency_ms: format.avg_latency_ms,
+    avg_first_byte_ms: format.avg_first_byte_ms,
+    avg_tps: format.avg_tps,
+    last_event_at: format.last_event_at,
+    timeline: format.timeline,
+    time_range_start: format.time_range_start,
+    time_range_end: format.time_range_end
+  }
+}
+
+function relatedModelMonitor(model: typeof MOCK_MODEL_STATUS.models[number]) {
+  return {
+    kind: 'model',
+    key: model.model,
+    display_name: model.display_name || model.model,
+    meta_text: model.provider_count ? `${model.provider_count} 个提供商` : null,
+    total_attempts: model.total_attempts,
+    success_count: model.success_count,
+    failed_count: model.failed_count,
+    success_rate: model.success_rate,
+    avg_latency_ms: model.avg_latency_ms,
+    avg_first_byte_ms: model.avg_first_byte_ms,
+    avg_tps: model.avg_tps,
+    last_event_at: model.last_event_at,
+    timeline: model.timeline,
+    time_range_start: model.time_range_start,
+    time_range_end: model.time_range_end
+  }
+}
+
+function relatedProviderMonitor(provider: typeof MOCK_PROVIDER_HEALTH_STATUS.providers[number]) {
+  return {
+    kind: 'provider',
+    key: provider.provider_name,
+    display_name: provider.provider_name,
+    meta_text: provider.provider_type || 'custom',
+    total_attempts: provider.total_attempts,
+    success_count: provider.success_count,
+    failed_count: provider.failed_count,
+    success_rate: provider.success_rate,
+    avg_latency_ms: provider.avg_latency_ms,
+    avg_first_byte_ms: provider.avg_first_byte_ms,
+    avg_tps: provider.avg_tps,
+    last_event_at: provider.last_event_at,
+    timeline: provider.timeline,
+    time_range_start: provider.time_range_start,
+    time_range_end: provider.time_range_end
+  }
+}
+
+function uniqueMockEndpointFormats() {
+  const seen = new Set<string>()
+  return MOCK_ENDPOINT_STATUS.formats.filter(format => {
+    if (seen.has(format.api_format)) return false
+    seen.add(format.api_format)
+    return true
+  })
+}
+
+function buildMockRelatedHealthResponse(config: AxiosRequestConfig, includeProviders: boolean) {
+  const dimension = String(config.params?.dimension || 'endpoint')
+  const value = String(config.params?.value || '')
+  const endpoints = uniqueMockEndpointFormats().slice(0, 3).map(relatedEndpointMonitor)
+  const models = MOCK_MODEL_STATUS.models.slice(0, 3).map(relatedModelMonitor)
+  const providers = includeProviders
+    ? MOCK_PROVIDER_HEALTH_STATUS.providers.slice(0, 3).map(relatedProviderMonitor)
+    : []
+
+  return {
+    generated_at: new Date().toISOString(),
+    dimension,
+    value,
+    related_endpoints: dimension === 'endpoint' ? [] : endpoints,
+    related_models: dimension === 'model' ? [] : models,
+    related_providers: dimension === 'provider' ? [] : providers
+  }
+}
+
 // 生成活跃热力图数据（最近365天）
 function generateActivityHeatmap() {
   const days: Array<{
@@ -1258,6 +1356,12 @@ const mockHandlers: Record<string, (config: AxiosRequestConfig) => Promise<Axios
     return createMockResponse(MOCK_PROVIDER_HEALTH_STATUS)
   },
 
+  'GET /api/admin/endpoints/health/related': async (config) => {
+    await delay()
+    requireAdmin()
+    return createMockResponse(buildMockRelatedHealthResponse(config, true))
+  },
+
   'GET /api/admin/endpoints/keys': async () => {
     await delay()
     requireAdmin()
@@ -1648,6 +1752,11 @@ const mockHandlers: Record<string, (config: AxiosRequestConfig) => Promise<Axios
         time_range_end: model.time_range_end
       }))
     })
+  },
+
+  'GET /api/public/health/related': async (config) => {
+    await delay()
+    return createMockResponse(buildMockRelatedHealthResponse(config, false))
   }
 }
 

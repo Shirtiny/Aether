@@ -2490,6 +2490,18 @@ FROM "usage"
             "provider_name",
             query.provider_name.as_deref(),
         );
+        push_sqlite_usage_optional_text_filter(
+            &mut builder,
+            &mut has_where,
+            "model",
+            query.model.as_deref(),
+        );
+        push_sqlite_usage_optional_text_filter(
+            &mut builder,
+            &mut has_where,
+            "api_format",
+            query.api_format.as_deref(),
+        );
         push_sqlite_usage_excluded_status_codes(
             &mut builder,
             &mut has_where,

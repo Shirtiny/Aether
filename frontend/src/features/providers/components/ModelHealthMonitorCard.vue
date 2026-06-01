@@ -79,6 +79,16 @@
             entity-label="模型"
             :entity-name="monitor.model"
           />
+
+          <div class="mt-4 flex justify-end">
+            <Button
+              variant="outline"
+              size="sm"
+              @click="openDetails(monitor)"
+            >
+              查看详情
+            </Button>
+          </div>
         </div>
       </div>
     </div>
@@ -90,6 +100,7 @@ import { ref, onMounted, watch } from "vue";
 import { Bot, Loader2 } from "lucide-vue-next";
 import Card from "@/components/ui/card.vue";
 import Badge from "@/components/ui/badge.vue";
+import Button from "@/components/ui/button.vue";
 import HealthMetricGrid from "./HealthMetricGrid.vue";
 import HealthMonitorHeader from "./HealthMonitorHeader.vue";
 import HealthStatusTimeline from "./HealthStatusTimeline.vue";
@@ -100,10 +111,15 @@ import {
 import type { ModelStatusMonitor } from "@/api/endpoints/types";
 import { useToast } from "@/composables/useToast";
 import { parseApiError } from "@/utils/errorParser";
+import type {
+  HealthMonitorDetailTarget,
+  HealthMonitorSectionSummary,
+} from "./health-monitor-utils";
 import {
   formatCompactNumber,
   getHealthBadgeVariant,
   getHealthLabel,
+  summarizeHealthMonitorItems,
 } from "./health-monitor-utils";
 
 const props = withDefaults(
@@ -118,6 +134,11 @@ const props = withDefaults(
     showProviderInfo: false,
   },
 );
+
+const emit = defineEmits<{
+  viewDetails: [target: HealthMonitorDetailTarget];
+  summaryUpdated: [summary: HealthMonitorSectionSummary];
+}>();
 
 const { error: showError } = useToast();
 
@@ -141,6 +162,7 @@ async function loadMonitors() {
       : await getPublicModelStatusMonitor(params);
     monitors.value = data.models || [];
     generatedAt.value = data.generated_at || null;
+    emitSummary();
   } catch (err: unknown) {
     showError(parseApiError(err, "加载模型健康监控数据失败"), "错误");
   } finally {
@@ -163,6 +185,39 @@ function getModelMetaText(monitor: ModelStatusMonitor) {
     return `${monitor.provider_count} 个提供商 / ${attempts}`;
   }
   return attempts;
+}
+
+function openDetails(monitor: ModelStatusMonitor) {
+  emit("viewDetails", {
+    lookbackHours: parseInt(lookbackHours.value),
+    source: {
+      kind: "model",
+      value: monitor.model,
+      title: monitor.display_name || monitor.model,
+      metaText: getModelDetailMetaText(monitor),
+      totalAttempts: monitor.total_attempts,
+      successCount: monitor.success_count,
+      failedCount: monitor.failed_count,
+      successRate: monitor.success_rate,
+      avgLatencyMs: monitor.avg_latency_ms,
+      avgFirstByteMs: monitor.avg_first_byte_ms,
+      avgTps: monitor.avg_tps,
+      timeline: monitor.timeline || null,
+      timeRangeStart: monitor.time_range_start || null,
+      timeRangeEnd: monitor.time_range_end || null,
+    },
+  });
+}
+
+function getModelDetailMetaText(monitor: ModelStatusMonitor) {
+  if (props.showProviderInfo && typeof monitor.provider_count === "number") {
+    return `${monitor.provider_count} 个提供商`;
+  }
+  return null;
+}
+
+function emitSummary() {
+  emit("summaryUpdated", summarizeHealthMonitorItems(monitors.value));
 }
 
 watch(lookbackHours, () => {

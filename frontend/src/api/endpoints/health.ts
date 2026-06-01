@@ -5,7 +5,9 @@ import type {
   EndpointStatusMonitorResponse,
   PublicEndpointStatusMonitorResponse,
   ModelStatusMonitorResponse,
-  ProviderStatusMonitorResponse
+  ProviderStatusMonitorResponse,
+  HealthRelatedMonitorResponse,
+  HealthMonitorRelatedDimension
 } from './types'
 
 /**
@@ -132,6 +134,32 @@ export async function getProviderStatusMonitor(params?: {
   per_model_limit?: number
 }): Promise<ProviderStatusMonitorResponse> {
   const response = await client.get('/api/admin/endpoints/health/providers', {
+    params
+  })
+  return response.data
+}
+
+export async function getHealthRelatedMonitor(params: {
+  dimension: HealthMonitorRelatedDimension
+  value: string
+  lookback_hours?: number
+  related_limit?: number
+  per_item_limit?: number
+}): Promise<HealthRelatedMonitorResponse> {
+  const response = await client.get('/api/admin/endpoints/health/related', {
+    params
+  })
+  return response.data
+}
+
+export async function getPublicHealthRelatedMonitor(params: {
+  dimension: Exclude<HealthMonitorRelatedDimension, 'provider'>
+  value: string
+  lookback_hours?: number
+  related_limit?: number
+  per_item_limit?: number
+}): Promise<HealthRelatedMonitorResponse> {
+  const response = await client.get('/api/public/health/related', {
     params
   })
   return response.data

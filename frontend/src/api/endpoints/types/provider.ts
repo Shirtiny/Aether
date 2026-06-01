@@ -676,6 +676,35 @@ export interface ProviderStatusMonitorResponse {
   providers: ProviderStatusMonitor[]
 }
 
+export type HealthMonitorRelatedDimension = 'endpoint' | 'model' | 'provider'
+
+export interface HealthRelatedMonitor {
+  kind: HealthMonitorRelatedDimension
+  key: string
+  display_name: string
+  meta_text?: string | null
+  total_attempts: number
+  success_count: number
+  failed_count: number
+  success_rate: number
+  avg_latency_ms?: number | null
+  avg_first_byte_ms?: number | null
+  avg_tps?: number | null
+  last_event_at?: string | null
+  timeline?: string[]
+  time_range_start?: string | null
+  time_range_end?: string | null
+}
+
+export interface HealthRelatedMonitorResponse {
+  generated_at: string
+  dimension: HealthMonitorRelatedDimension
+  value: string
+  related_endpoints: HealthRelatedMonitor[]
+  related_models: HealthRelatedMonitor[]
+  related_providers: HealthRelatedMonitor[]
+}
+
 export type ProviderType = 'custom' | 'claude_code' | 'codex' | 'chatgpt_web' | 'gemini_cli' | 'antigravity' | 'kiro' | 'grok' | 'windsurf' | 'vertex_ai'
 
 export interface ClaudeCodeAdvancedConfig {
