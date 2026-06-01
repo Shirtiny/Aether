@@ -341,14 +341,16 @@
         <!-- 第三行：用户 + 提供商 -->
         <div
           v-if="isAdmin"
-          class="mt-1 flex min-w-0 items-center text-[10px] leading-3.5 text-muted-foreground"
+          class="mt-1 flex min-w-0 items-center gap-1.5 text-[10px] leading-3.5 text-muted-foreground"
         >
           <span
-            class="min-w-0 flex-1 truncate"
+            class="min-w-0 truncate"
             :title="formatRecordUserProviderLine(record)"
           >
-            {{ formatRecordUserProviderLine(record) }}
+            {{ formatRecordUserSegment(record) }}
           </span>
+          <span class="shrink-0 text-muted-foreground/40">·</span>
+          <span class="min-w-0 truncate">{{ formatRecordProviderSegment(record) }}</span>
         </div>
 
         <!-- 第四行：性能指标 -->
@@ -1405,10 +1407,15 @@ function getRecordUserName(record: UsageRecord): string {
 }
 
 function formatRecordUserProviderLine(record: UsageRecord): string {
-  const userKeyName = record.api_key?.name || '-'
-  const providerName = record.provider || '-'
-  const providerKeyName = record.provider_key_name || '-'
-  return `${getRecordUserName(record)} / ${userKeyName} · ${providerName} / ${providerKeyName}`
+  return `${formatRecordUserSegment(record)} · ${formatRecordProviderSegment(record)}`
+}
+
+function formatRecordUserSegment(record: UsageRecord): string {
+  return `${getRecordUserName(record)} / ${record.api_key?.name || '-'}`
+}
+
+function formatRecordProviderSegment(record: UsageRecord): string {
+  return `${record.provider || '-'} / ${record.provider_key_name || '-'}`
 }
 
 watch(() => props.filterSearch, (value) => {
