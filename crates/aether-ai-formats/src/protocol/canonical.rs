@@ -1338,6 +1338,23 @@ pub(crate) fn openai_message_content_blocks(
         let reasoning_blocks = openai_reasoning_blocks(message);
         if !reasoning_blocks.is_empty() {
             blocks.splice(0..0, reasoning_blocks);
+        } else if let Some(reasoning_content) = message
+            .get("reasoning_content")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            let mut extensions = BTreeMap::new();
+            canonical_extension_object_mut(&mut extensions, "openai")
+                .insert("omit_reasoning_parts".to_string(), Value::Bool(true));
+            blocks.insert(
+                0,
+                CanonicalContentBlock::Thinking {
+                    text: reasoning_content.to_string(),
+                    signature: None,
+                    encrypted_content: None,
+                    extensions,
+                },
+            );
         }
     }
     let mut saw_tool_calls = false;
@@ -1505,6 +1522,7 @@ pub(crate) fn openai_responses_input_to_canonical_messages(
         Value::Array(items) => {
             let mut messages = Vec::new();
             let mut next_generated_tool_call_index = 0usize;
+            let mut pending_reasoning: Option<String> = None;
             for item in items {
                 if let Some(text) = item.as_str() {
                     if !text.trim().is_empty() {
@@ -1517,9 +1535,13 @@ pub(crate) fn openai_responses_input_to_canonical_messages(
                             extensions: BTreeMap::new(),
                         });
                     }
+                    pending_reasoning = None;
                     continue;
                 }
-                let item_object = item.as_object()?;
+                let Some(item_object) = item.as_object() else {
+                    pending_reasoning = None;
+                    continue;
+                };
                 let item_type = item_object
                     .get("type")
                     .and_then(Value::as_str)
@@ -1527,6 +1549,12 @@ pub(crate) fn openai_responses_input_to_canonical_messages(
                     .trim()
                     .to_ascii_lowercase();
                 match item_type.as_str() {
+                    "reasoning" => {
+                        let reasoning = openai_responses_reasoning_text(item_object);
+                        if !reasoning.is_empty() {
+                            pending_reasoning = Some(reasoning);
+                        }
+                    }
                     "message" => {
                         let role = openai_role_to_canonical(
                             item_object
@@ -1549,11 +1577,13 @@ pub(crate) fn openai_responses_input_to_canonical_messages(
                                     ),
                                 });
                             }
+                            pending_reasoning = None;
                             continue;
                         }
+                        let is_assistant = role == CanonicalRole::Assistant;
                         messages.push(CanonicalMessage {
                             role,
-                            content: openai_responses_content_to_blocks(
+                            content: openai_responses_chat_safe_content_to_blocks(
                                 item_object.get("content"),
                             )?,
                             extensions: openai_responses_extensions(
@@ -1561,13 +1591,17 @@ pub(crate) fn openai_responses_input_to_canonical_messages(
                                 &["type", "role", "content"],
                             ),
                         });
+                        if !is_assistant {
+                            pending_reasoning = None;
+                        }
                     }
                     "function_call" => {
                         let name = item_object
                             .get("name")
                             .and_then(Value::as_str)
                             .map(str::trim)
-                            .filter(|value| !value.is_empty())?;
+                            .unwrap_or_default()
+                            .to_string();
                         let id = item_object
                             .get("call_id")
                             .or_else(|| item_object.get("id"))
@@ -1581,52 +1615,20 @@ pub(crate) fn openai_responses_input_to_canonical_messages(
                                 next_generated_tool_call_index += 1;
                                 generated
                             });
-                        messages.push(CanonicalMessage {
-                            role: CanonicalRole::Assistant,
-                            content: vec![CanonicalContentBlock::ToolUse {
-                                id,
-                                name: name.to_string(),
-                                input: parse_jsonish_value(item_object.get("arguments")),
-                                extensions: openai_responses_extensions(
-                                    item_object,
-                                    &["type", "call_id", "id", "name", "arguments"],
-                                ),
-                            }],
-                            extensions: BTreeMap::new(),
-                        });
-                    }
-                    "web_search_call" => {
-                        let id = item_object
-                            .get("id")
-                            .and_then(Value::as_str)
-                            .map(str::trim)
-                            .filter(|value| !value.is_empty())
-                            .map(ToOwned::to_owned)
-                            .unwrap_or_else(|| {
-                                let generated =
-                                    format!("call_auto_{next_generated_tool_call_index}");
-                                next_generated_tool_call_index += 1;
-                                generated
-                            });
-                        let query = item_object
-                            .get("action")
-                            .and_then(Value::as_object)
-                            .and_then(|action| action.get("query"))
-                            .and_then(Value::as_str)
-                            .unwrap_or_default();
-                        messages.push(CanonicalMessage {
-                            role: CanonicalRole::Assistant,
-                            content: vec![CanonicalContentBlock::ToolUse {
-                                id,
-                                name: "web_search".to_string(),
-                                input: json!({ "query": query }),
-                                extensions: openai_responses_extensions(
-                                    item_object,
-                                    &["type", "id", "status", "action"],
-                                ),
-                            }],
-                            extensions: BTreeMap::new(),
-                        });
+                        let tool_use = CanonicalContentBlock::ToolUse {
+                            id,
+                            name,
+                            input: parse_jsonish_value(item_object.get("arguments")),
+                            extensions: openai_responses_extensions(
+                                item_object,
+                                &["type", "call_id", "id", "name", "arguments"],
+                            ),
+                        };
+                        append_openai_responses_tool_use(
+                            &mut messages,
+                            tool_use,
+                            &mut pending_reasoning,
+                        );
                     }
                     "function_call_output" => {
                         let id = item_object
@@ -1675,22 +1677,113 @@ pub(crate) fn openai_responses_input_to_canonical_messages(
                             }],
                             extensions: BTreeMap::new(),
                         });
+                        pending_reasoning = None;
                     }
-                    _ => messages.push(CanonicalMessage {
-                        role: CanonicalRole::Unknown,
-                        content: vec![CanonicalContentBlock::Unknown {
-                            raw_type: item_type,
-                            payload: item.clone(),
-                            extensions: BTreeMap::new(),
-                        }],
-                        extensions: BTreeMap::new(),
-                    }),
+                    _ => {
+                        pending_reasoning = None;
+                    }
                 }
             }
             Some(messages)
         }
         _ => None,
     }
+}
+
+fn append_openai_responses_tool_use(
+    messages: &mut Vec<CanonicalMessage>,
+    tool_use: CanonicalContentBlock,
+    pending_reasoning: &mut Option<String>,
+) {
+    let reasoning = pending_reasoning.take().filter(|value| !value.is_empty());
+    if let Some(last_message) = messages.last_mut() {
+        if last_message.role == CanonicalRole::Assistant {
+            if let Some(reasoning) = reasoning {
+                prepend_openai_responses_reasoning_block(last_message, reasoning);
+            }
+            last_message.content.push(tool_use);
+            return;
+        }
+    }
+
+    let mut content = Vec::new();
+    if let Some(reasoning) = reasoning {
+        content.push(openai_responses_reasoning_block(reasoning));
+    }
+    content.push(tool_use);
+    messages.push(CanonicalMessage {
+        role: CanonicalRole::Assistant,
+        content,
+        extensions: BTreeMap::new(),
+    });
+}
+
+fn prepend_openai_responses_reasoning_block(message: &mut CanonicalMessage, reasoning: String) {
+    if message
+        .content
+        .iter()
+        .any(|block| matches!(block, CanonicalContentBlock::Thinking { .. }))
+    {
+        return;
+    }
+    message
+        .content
+        .insert(0, openai_responses_reasoning_block(reasoning));
+}
+
+fn openai_responses_reasoning_block(text: String) -> CanonicalContentBlock {
+    let mut extensions = BTreeMap::new();
+    canonical_extension_object_mut(&mut extensions, "openai")
+        .insert("omit_reasoning_parts".to_string(), Value::Bool(true));
+    CanonicalContentBlock::Thinking {
+        text,
+        signature: None,
+        encrypted_content: None,
+        extensions,
+    }
+}
+
+fn openai_responses_reasoning_text(item_object: &Map<String, Value>) -> String {
+    let mut parts = openai_responses_reasoning_text_parts(item_object.get("summary"));
+    if parts.is_empty() {
+        parts = openai_responses_reasoning_text_parts(item_object.get("content"));
+    }
+    parts.join("\n")
+}
+
+fn openai_responses_reasoning_text_parts(raw: Option<&Value>) -> Vec<String> {
+    let Some(raw) = raw else {
+        return Vec::new();
+    };
+    match raw {
+        Value::Array(items) => items
+            .iter()
+            .filter_map(openai_responses_reasoning_text_part)
+            .collect(),
+        other => openai_responses_reasoning_text_part(other)
+            .into_iter()
+            .collect(),
+    }
+}
+
+fn openai_responses_reasoning_text_part(raw: &Value) -> Option<String> {
+    if let Some(text) = raw.as_str() {
+        return (!text.is_empty()).then(|| text.to_string());
+    }
+    let raw_object = raw.as_object()?;
+    let text = raw_object.get("text").and_then(Value::as_str)?;
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+fn openai_responses_chat_safe_content_to_blocks(
+    content: Option<&Value>,
+) -> Option<Vec<CanonicalContentBlock>> {
+    Some(
+        openai_responses_content_to_blocks(content)?
+            .into_iter()
+            .filter(|block| !matches!(block, CanonicalContentBlock::Unknown { .. }))
+            .collect(),
+    )
 }
 
 pub(crate) fn openai_responses_content_to_blocks(
@@ -2453,7 +2546,7 @@ fn canonical_tool_result_to_openai_chat(block: &CanonicalContentBlock) -> Value 
     Value::Object(output)
 }
 
-fn is_claude_tool_result(extensions: &BTreeMap<String, Value>) -> bool {
+pub(crate) fn is_claude_tool_result(extensions: &BTreeMap<String, Value>) -> bool {
     extensions
         .get(AETHER_EXTENSION_NAMESPACE)
         .and_then(|value| value.get("source"))
@@ -2861,6 +2954,9 @@ pub(crate) fn flush_openai_responses_message_item(
 pub(crate) fn openai_content_value_from_parts(parts: Vec<Value>, tool_only: bool) -> Value {
     if parts.is_empty() && tool_only {
         return Value::Null;
+    }
+    if parts.is_empty() {
+        return Value::String(String::new());
     }
     if parts.len() == 1 {
         if let Some(text) = parts[0]
@@ -5566,6 +5662,41 @@ mod tests {
         assert_eq!(rebuilt["messages"], request["messages"]);
         assert_eq!(rebuilt["stop"], Value::Array(vec![json!("x"), json!("y")]));
         assert_eq!(rebuilt["n"], 2);
+    }
+
+    #[test]
+    fn openai_chat_request_adapter_preserves_reasoning_content_for_responses() {
+        let request = json!({
+            "model": "gpt-5",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "reasoning_content": "internal plan",
+                    "content": "final answer"
+                }
+            ]
+        });
+
+        let canonical = from_openai_chat_to_canonical_request(&request).expect("canonical request");
+        assert!(matches!(
+            canonical.messages[1].content.first(),
+            Some(CanonicalContentBlock::Thinking { text, .. }) if text == "internal plan"
+        ));
+
+        let rebuilt = canonical_to_openai_responses_request(&canonical, "gpt-5-upstream", false)
+            .expect("openai responses request");
+        let parts = rebuilt["input"][1]["content"]
+            .as_array()
+            .expect("content parts");
+
+        assert_eq!(parts[0]["type"], "output_text");
+        assert!(parts[0]["text"]
+            .as_str()
+            .expect("reasoning text")
+            .contains("<thinking>internal plan</thinking>"));
+        assert_eq!(parts[1]["type"], "output_text");
+        assert_eq!(parts[1]["text"], "final answer");
     }
 
     #[test]

@@ -1,11 +1,13 @@
+use std::collections::BTreeMap;
+
 use serde_json::{json, Map, Value};
 
 use crate::{
     formats::context::FormatContext,
     formats::openai::shared::map_thinking_budget_to_openai_reasoning_effort,
     protocol::canonical::{
-        canonical_response_format_to_openai, canonicalize_tool_arguments, media_data_or_url,
-        namespace_extension_object, openai_content_text, openai_extensions,
+        canonical_response_format_to_openai, canonicalize_tool_arguments, is_claude_tool_result,
+        media_data_or_url, namespace_extension_object, openai_content_text, openai_extensions,
         openai_response_format_to_canonical, openai_responses_extension,
         openai_responses_generation_config, openai_responses_input_to_canonical_messages,
         openai_responses_tool_choice_to_canonical, openai_responses_tools_to_canonical,
@@ -223,6 +225,7 @@ fn canonical_messages_to_responses_input(canonical: &CanonicalRequest) -> Option
             CanonicalRole::System | CanonicalRole::Developer => continue,
         };
         let mut content = Vec::new();
+        let mut saw_tool_item = false;
         for block in &message.content {
             match block {
                 CanonicalContentBlock::ToolUse {
@@ -232,6 +235,7 @@ fn canonical_messages_to_responses_input(canonical: &CanonicalRequest) -> Option
                     ..
                 } => {
                     flush_responses_message(&mut input, role, &mut content);
+                    saw_tool_item = true;
                     input.push(json!({
                         "type": "function_call",
                         "call_id": id,
@@ -243,22 +247,62 @@ fn canonical_messages_to_responses_input(canonical: &CanonicalRequest) -> Option
                     tool_use_id,
                     output,
                     content_text,
+                    extensions,
                     ..
                 } => {
                     flush_responses_message(&mut input, role, &mut content);
+                    saw_tool_item = true;
+                    let (tool_output, extra_user_content) = responses_tool_result_payload(
+                        output.as_ref(),
+                        content_text.as_deref(),
+                        extensions,
+                    );
                     input.push(json!({
                         "type": "function_call_output",
                         "call_id": tool_use_id,
-                        "output": responses_tool_result_output(output.as_ref(), content_text.as_deref()),
+                        "output": tool_output,
                     }));
+                    if !extra_user_content.is_empty() {
+                        input.push(json!({
+                            "type": "message",
+                            "role": "user",
+                            "content": extra_user_content,
+                        }));
+                    }
                 }
-                CanonicalContentBlock::Thinking { .. } => {}
+                CanonicalContentBlock::Thinking { text, .. } => {
+                    if role == "assistant" && !text.trim().is_empty() {
+                        content.push(json!({
+                            "type": "output_text",
+                            "text": format!("<thinking>{text}</thinking>"),
+                        }));
+                    }
+                }
                 other => {
                     if let Some(part) = canonical_block_to_responses_input_part(other, role) {
                         content.push(part);
                     }
                 }
             }
+        }
+        if content.is_empty() && !saw_tool_item {
+            if role == "assistant" {
+                input.push(json!({
+                    "type": "message",
+                    "role": role,
+                    "content": [{
+                        "type": "output_text",
+                        "text": "",
+                    }],
+                }));
+            } else {
+                input.push(json!({
+                    "type": "message",
+                    "role": role,
+                    "content": "",
+                }));
+            }
+            continue;
         }
         flush_responses_message(&mut input, role, &mut content);
     }
@@ -535,13 +579,169 @@ fn canonical_tool_choice_to_responses(choice: &CanonicalToolChoice) -> Value {
     }
 }
 
+fn responses_tool_result_payload(
+    output: Option<&Value>,
+    content_text: Option<&str>,
+    extensions: &BTreeMap<String, Value>,
+) -> (Value, Vec<Value>) {
+    if is_claude_tool_result(extensions) {
+        if let Some(Value::Array(parts)) = output {
+            return claude_tool_result_parts_to_responses_payload(parts);
+        }
+    }
+    (
+        responses_tool_result_output(output, content_text),
+        Vec::new(),
+    )
+}
+
 fn responses_tool_result_output(output: Option<&Value>, content_text: Option<&str>) -> Value {
-    match output {
-        Some(Value::String(text)) => Value::String(text.clone()),
-        Some(value) => serde_json::to_string(value)
-            .map(Value::String)
-            .unwrap_or_else(|_| Value::String(String::new())),
-        None => Value::String(content_text.unwrap_or_default().to_string()),
+    let text = match output {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Null) => String::new(),
+        Some(value) => serde_json::to_string(value).unwrap_or_default(),
+        None => content_text.unwrap_or_default().to_string(),
+    };
+    Value::String(non_empty_responses_tool_output(&text))
+}
+
+fn claude_tool_result_parts_to_responses_payload(parts: &[Value]) -> (Value, Vec<Value>) {
+    let mut output_texts = Vec::new();
+    let mut extra_user_content = Vec::new();
+
+    for part in parts {
+        let Some(part_object) = part.as_object() else {
+            output_texts.push("[Claude tool_result non-text content omitted]".to_string());
+            continue;
+        };
+        match part_object
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+        {
+            "text" => {
+                if let Some(text) = part_object.get("text").and_then(Value::as_str) {
+                    if !text.is_empty() {
+                        output_texts.push(text.to_string());
+                    }
+                }
+            }
+            "image" => {
+                if let Some(part) = claude_image_block_to_responses_input_part(part_object) {
+                    extra_user_content.push(part);
+                } else {
+                    output_texts.push(claude_tool_result_media_summary("image", part_object));
+                }
+            }
+            "document" | "file" => {
+                if let Some(part) = claude_document_block_to_responses_input_part(part_object) {
+                    extra_user_content.push(part);
+                } else {
+                    output_texts.push(claude_tool_result_media_summary("document", part_object));
+                }
+            }
+            "" => output_texts.push("[Claude tool_result object content omitted]".to_string()),
+            raw_type => {
+                output_texts.push(format!("[Claude tool_result {raw_type} content omitted]"))
+            }
+        }
+    }
+
+    (
+        Value::String(non_empty_responses_tool_output(&output_texts.join("\n\n"))),
+        extra_user_content,
+    )
+}
+
+fn claude_image_block_to_responses_input_part(block: &Map<String, Value>) -> Option<Value> {
+    let source = block.get("source")?.as_object()?;
+    match source
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+    {
+        "base64" => {
+            let media_type = claude_source_media_type(source).unwrap_or("image/png");
+            let data = claude_source_str(source, "data")?;
+            Some(json!({
+                "type": "input_image",
+                "image_url": format!("data:{media_type};base64,{data}"),
+            }))
+        }
+        "url" => {
+            let url = claude_source_str(source, "url")?;
+            Some(json!({
+                "type": "input_image",
+                "image_url": url,
+            }))
+        }
+        _ => None,
+    }
+}
+
+fn claude_document_block_to_responses_input_part(block: &Map<String, Value>) -> Option<Value> {
+    let source = block.get("source")?.as_object()?;
+    let file_data = match source
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+    {
+        "base64" => {
+            let media_type = claude_source_media_type(source).unwrap_or("application/octet-stream");
+            let data = claude_source_str(source, "data")?;
+            format!("data:{media_type};base64,{data}")
+        }
+        "url" => claude_source_str(source, "url")?.to_string(),
+        _ => return None,
+    };
+
+    let mut part = Map::new();
+    part.insert("type".to_string(), Value::String("input_file".to_string()));
+    part.insert("file_data".to_string(), Value::String(file_data));
+    if let Some(filename) = block
+        .get("title")
+        .or_else(|| block.get("name"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        part.insert("filename".to_string(), Value::String(filename.to_string()));
+    }
+    Some(Value::Object(part))
+}
+
+fn claude_tool_result_media_summary(kind: &str, block: &Map<String, Value>) -> String {
+    let media_type = block
+        .get("source")
+        .and_then(Value::as_object)
+        .and_then(claude_source_media_type);
+    match media_type {
+        Some(media_type) if !media_type.trim().is_empty() => {
+            format!("[Claude tool_result {kind} content omitted: {media_type}]")
+        }
+        _ => format!("[Claude tool_result {kind} content omitted]"),
+    }
+}
+
+fn claude_source_media_type(source: &Map<String, Value>) -> Option<&str> {
+    source
+        .get("media_type")
+        .or_else(|| source.get("mime_type"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn claude_source_str<'a>(source: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
+    source
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn non_empty_responses_tool_output(text: &str) -> String {
+    if text.is_empty() {
+        "(empty)".to_string()
+    } else {
+        text.to_string()
     }
 }
 
@@ -590,5 +790,63 @@ mod tests {
             .expect("hint text")
             .to_ascii_lowercase()
             .contains("json"));
+    }
+
+    #[test]
+    fn responses_request_preserves_empty_chat_messages() {
+        let request = CanonicalRequest {
+            model: "gpt-5.5".to_string(),
+            messages: vec![
+                CanonicalMessage {
+                    role: CanonicalRole::User,
+                    content: vec![CanonicalContentBlock::Text {
+                        text: String::new(),
+                        extensions: Default::default(),
+                    }],
+                    extensions: Default::default(),
+                },
+                CanonicalMessage {
+                    role: CanonicalRole::Assistant,
+                    content: Vec::new(),
+                    extensions: Default::default(),
+                },
+            ],
+            ..CanonicalRequest::default()
+        };
+
+        let body = to_raw(&request, "gpt-5.5", false, false).expect("responses body");
+
+        assert_eq!(body["input"][0]["role"], "user");
+        assert_eq!(body["input"][0]["content"], "");
+        assert_eq!(body["input"][1]["role"], "assistant");
+        assert_eq!(body["input"][1]["content"][0]["type"], "output_text");
+        assert_eq!(body["input"][1]["content"][0]["text"], "");
+    }
+
+    #[test]
+    fn responses_request_uses_empty_marker_for_empty_tool_output() {
+        let request = CanonicalRequest {
+            model: "gpt-5.5".to_string(),
+            messages: vec![CanonicalMessage {
+                role: CanonicalRole::Tool,
+                content: vec![CanonicalContentBlock::ToolResult {
+                    tool_use_id: "call_empty".to_string(),
+                    name: None,
+                    output: Some(json!("")),
+                    content_text: None,
+                    is_error: false,
+                    extensions: Default::default(),
+                }],
+                extensions: Default::default(),
+            }],
+            ..CanonicalRequest::default()
+        };
+
+        let body = to_raw(&request, "gpt-5.5", false, false).expect("responses body");
+
+        assert_eq!(body["input"].as_array().expect("input").len(), 1);
+        assert_eq!(body["input"][0]["type"], "function_call_output");
+        assert_eq!(body["input"][0]["call_id"], "call_empty");
+        assert_eq!(body["input"][0]["output"], "(empty)");
     }
 }

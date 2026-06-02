@@ -159,6 +159,8 @@ fn request_context(mapped_model: &str, upstream_is_stream: bool) -> FormatContex
 mod tests {
     use serde_json::{json, Value};
 
+    use crate::formats::{context::FormatContext, registry};
+
     use super::{
         convert_openai_chat_request_to_claude_request,
         convert_openai_chat_request_to_openai_responses_request,
@@ -219,9 +221,10 @@ mod tests {
 
     #[test]
     fn responses_request_normalizer_keeps_tool_history_chat_safe() {
-        let call_id = "call_weather_123";
-        let tool_output = json!({
-            "toolCallId": call_id,
+        let call_id_one = "call_weather_123";
+        let call_id_two = "call_lookup_456";
+        let tool_output_one = json!({
+            "toolCallId": call_id_one,
             "input": {"city": "Hangzhou"},
             "output": {
                 "content": [{"type": "text", "text": "sunny"}],
@@ -231,21 +234,44 @@ mod tests {
         let body = json!({
             "model": "glm-5.1",
             "input": [
+                "weather now",
                 {
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": "weather now"}]
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "thinking first"}]
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": "planning"
                 },
                 {
                     "type": "function_call",
-                    "call_id": call_id,
-                    "id": call_id,
+                    "call_id": call_id_one,
+                    "id": call_id_one,
                     "name": "mcp__mapsWeather",
                     "arguments": "{\"city\":\"Hangzhou\"}"
                 },
                 {
+                    "type": "web_search_call",
+                    "id": "ignored_web_search",
+                    "action": {"query": "should be skipped"}
+                },
+                {
+                    "type": "function_call",
+                    "call_id": call_id_two,
+                    "id": call_id_two,
+                    "name": "mcp__lookupData",
+                    "arguments": "{\"query\":\"museum\"}"
+                },
+                {
                     "type": "function_call_output",
-                    "call_id": call_id,
-                    "output": tool_output.to_string()
+                    "call_id": call_id_one,
+                    "output": tool_output_one.to_string()
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": call_id_two,
+                    "output": "done-2"
                 }
             ]
         });
@@ -254,25 +280,57 @@ mod tests {
             .expect("openai chat request");
         let messages = converted["messages"].as_array().expect("messages");
 
-        assert_eq!(messages.len(), 3);
+        assert_eq!(messages.len(), 4);
         assert_eq!(messages[0]["role"], "user");
         assert_eq!(messages[0]["content"], "weather now");
         assert_eq!(messages[1]["role"], "assistant");
-        assert!(messages[1]["content"].is_null());
-        assert_eq!(messages[1]["tool_calls"][0]["id"], call_id);
+        assert_eq!(messages[1]["reasoning_content"], "thinking first");
+        assert_eq!(messages[1]["content"], "planning");
+        assert_eq!(messages[1]["tool_calls"].as_array().unwrap().len(), 2);
+        assert_eq!(messages[1]["tool_calls"][0]["id"], call_id_one);
         assert_eq!(
             messages[1]["tool_calls"][0]["function"]["name"],
             "mcp__mapsWeather"
         );
+        assert_eq!(messages[1]["tool_calls"][1]["id"], call_id_two);
+        assert_eq!(
+            messages[1]["tool_calls"][1]["function"]["name"],
+            "mcp__lookupData"
+        );
         assert_eq!(messages[2]["role"], "tool");
-        assert_eq!(messages[2]["tool_call_id"], call_id);
+        assert_eq!(messages[2]["tool_call_id"], call_id_one);
         let content = messages[2]["content"]
             .as_str()
             .expect("tool result content should stay a string");
         assert_eq!(
             serde_json::from_str::<Value>(content).expect("tool output json"),
-            tool_output
+            tool_output_one
         );
+        assert_eq!(messages[3]["role"], "tool");
+        assert_eq!(messages[3]["tool_call_id"], call_id_two);
+        assert_eq!(messages[3]["content"], "done-2");
+    }
+
+    #[test]
+    fn responses_request_normalizer_emits_empty_message_content_as_empty_string() {
+        let body = json!({
+            "model": "glm-5.1",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": null
+                }
+            ]
+        });
+
+        let converted = normalize_openai_responses_request_to_openai_chat_request(&body)
+            .expect("openai chat request");
+        let messages = converted["messages"].as_array().expect("messages");
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[0]["content"], "");
     }
 
     #[test]
@@ -608,5 +666,68 @@ mod tests {
         let block_content_json = Value::Array(block_content.clone()).to_string();
         assert!(!block_content_json.contains("\"source\""));
         assert!(!block_content_json.contains("document body"));
+    }
+
+    #[test]
+    fn claude_request_to_responses_splits_tool_result_media_from_output() {
+        let body = json!({
+            "model": "claude-sonnet",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Describe the file"
+                },
+                {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_read",
+                        "name": "Read",
+                        "input": {"file_path": "/tmp/photo.png"}
+                    }]
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_read",
+                        "content": [
+                            {"type": "text", "text": "File metadata: 800x600 PNG"},
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/png",
+                                    "data": "AAAA"
+                                }
+                            }
+                        ]
+                    }]
+                }
+            ],
+            "max_tokens": 128,
+        });
+
+        let converted = registry::convert_request(
+            "claude:messages",
+            "openai:responses",
+            &body,
+            &FormatContext::default(),
+        )
+        .expect("responses request");
+        let input = converted["input"].as_array().expect("responses input");
+
+        assert_eq!(input.len(), 4);
+        assert_eq!(input[1]["type"], "function_call");
+        assert_eq!(input[1]["call_id"], "toolu_read");
+        assert_eq!(input[2]["type"], "function_call_output");
+        assert_eq!(input[2]["call_id"], "toolu_read");
+        assert_eq!(input[2]["output"], "File metadata: 800x600 PNG");
+        assert_eq!(input[3]["role"], "user");
+        assert_eq!(input[3]["content"][0]["type"], "input_image");
+        assert_eq!(
+            input[3]["content"][0]["image_url"],
+            "data:image/png;base64,AAAA"
+        );
     }
 }
