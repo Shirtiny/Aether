@@ -25,6 +25,79 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const USER_CANCELLED_STATUS_CODE: u16 = 499;
 
+#[derive(Clone, Copy, Debug, Default)]
+struct HealthTimelineMetricBucket {
+    total_count: u64,
+    success_count: u64,
+    failed_count: u64,
+    latency_sum_ms: u64,
+    latency_samples: u64,
+    first_byte_sum_ms: u64,
+    first_byte_samples: u64,
+    output_tokens: u64,
+    response_time_sum_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct HealthTimelineDetailCounts {
+    status: &'static str,
+    total_attempts: u64,
+    success_count: u64,
+    failed_count: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct HealthTimelineWindow {
+    since_unix_secs: u64,
+    until_unix_secs: u64,
+    segments: u32,
+}
+
+impl HealthTimelineMetricBucket {
+    fn add_usage_event(&mut self, event: &StoredRequestUsageAudit) {
+        self.total_count = self.total_count.saturating_add(1);
+        if model_health_event_success(event) {
+            self.success_count = self.success_count.saturating_add(1);
+        } else {
+            self.failed_count = self.failed_count.saturating_add(1);
+        }
+        if let Some(response_time_ms) = event.response_time_ms {
+            self.latency_sum_ms = self.latency_sum_ms.saturating_add(response_time_ms);
+            self.latency_samples = self.latency_samples.saturating_add(1);
+            self.response_time_sum_ms = self.response_time_sum_ms.saturating_add(response_time_ms);
+        }
+        if let Some(first_byte_time_ms) = event.first_byte_time_ms {
+            self.first_byte_sum_ms = self.first_byte_sum_ms.saturating_add(first_byte_time_ms);
+            self.first_byte_samples = self.first_byte_samples.saturating_add(1);
+        }
+        self.output_tokens = self.output_tokens.saturating_add(event.output_tokens);
+    }
+
+    fn avg_latency_ms(self) -> Option<f64> {
+        if self.latency_samples == 0 {
+            None
+        } else {
+            Some(self.latency_sum_ms as f64 / self.latency_samples as f64)
+        }
+    }
+
+    fn avg_first_byte_ms(self) -> Option<f64> {
+        if self.first_byte_samples == 0 {
+            None
+        } else {
+            Some(self.first_byte_sum_ms as f64 / self.first_byte_samples as f64)
+        }
+    }
+
+    fn avg_tps(self) -> Option<f64> {
+        if self.output_tokens == 0 || self.response_time_sum_ms == 0 {
+            None
+        } else {
+            Some(self.output_tokens as f64 / (self.response_time_sum_ms as f64 / 1000.0))
+        }
+    }
+}
+
 pub(crate) fn request_candidate_status_label(status: RequestCandidateStatus) -> &'static str {
     match status {
         RequestCandidateStatus::Available => "available",
@@ -568,6 +641,13 @@ pub(crate) async fn build_api_format_health_monitor_payload(
             .unwrap_or(&empty_timeline);
         let (timeline, time_range_start, time_range_end) =
             build_public_health_timeline(timeline_source, API_FORMAT_HEALTH_TIMELINE_SEGMENTS);
+        let timeline_details = build_public_health_timeline_details(
+            timeline_source,
+            since_unix_secs,
+            now_unix_secs,
+            API_FORMAT_HEALTH_TIMELINE_SEGMENTS,
+            &usage_events,
+        );
 
         let mut format_payload = json!({
             "api_format": api_format.clone(),
@@ -582,6 +662,7 @@ pub(crate) async fn build_api_format_health_monitor_payload(
             "last_event_at": last_event_at.and_then(unix_ms_to_rfc3339),
             "events": events,
             "timeline": timeline,
+            "timeline_details": timeline_details,
             "time_range_start": time_range_start.and_then(unix_ms_to_rfc3339),
             "time_range_end": time_range_end.map(|ms| unix_ms_to_rfc3339(ms)).unwrap_or_else(|| unix_secs_to_rfc3339(now_unix_secs)),
         });
@@ -667,6 +748,12 @@ pub(crate) async fn build_model_health_monitor_payload(
             now_unix_secs,
             MODEL_HEALTH_TIMELINE_SEGMENTS,
         );
+        let timeline_details = build_usage_health_timeline_details(
+            &events,
+            since_unix_secs,
+            now_unix_secs,
+            MODEL_HEALTH_TIMELINE_SEGMENTS,
+        );
         let provider_count = model_health_provider_count(&events);
         let first_byte_average = model_health_average_first_byte_ms(&events);
         let last_event_at = events
@@ -702,6 +789,7 @@ pub(crate) async fn build_model_health_monitor_payload(
             "last_event_at": last_event_at,
             "events": event_payload,
             "timeline": timeline,
+            "timeline_details": timeline_details,
             "time_range_start": unix_secs_to_rfc3339(time_range_start),
             "time_range_end": unix_secs_to_rfc3339(time_range_end),
         });
@@ -1184,6 +1272,12 @@ fn related_health_item_payload(
         now_unix_secs,
         MODEL_HEALTH_TIMELINE_SEGMENTS,
     );
+    let timeline_details = build_usage_health_timeline_details(
+        events,
+        since_unix_secs,
+        now_unix_secs,
+        MODEL_HEALTH_TIMELINE_SEGMENTS,
+    );
     let total_attempts = row.request_count;
     let success_count = row.success_count.min(total_attempts);
     let failed_count = total_attempts.saturating_sub(success_count);
@@ -1210,6 +1304,7 @@ fn related_health_item_payload(
         "avg_tps": model_health_average_tps(row),
         "last_event_at": last_event_at,
         "timeline": timeline,
+        "timeline_details": timeline_details,
         "time_range_start": unix_secs_to_rfc3339(time_range_start),
         "time_range_end": unix_secs_to_rfc3339(time_range_end),
     })
@@ -1357,6 +1452,12 @@ async fn build_provider_health_payload(
         now_unix_secs,
         MODEL_HEALTH_TIMELINE_SEGMENTS,
     );
+    let timeline_details = build_usage_health_timeline_details(
+        &provider_events,
+        since_unix_secs,
+        now_unix_secs,
+        MODEL_HEALTH_TIMELINE_SEGMENTS,
+    );
     let last_event_at = provider_events
         .iter()
         .max_by_key(|event| event.created_at_unix_ms)
@@ -1377,6 +1478,7 @@ async fn build_provider_health_payload(
         "model_count": model_breakdown.len(),
         "last_event_at": last_event_at,
         "timeline": timeline,
+        "timeline_details": timeline_details,
         "time_range_start": unix_secs_to_rfc3339(time_range_start),
         "time_range_end": unix_secs_to_rfc3339(time_range_end),
         "models": models,
@@ -1417,6 +1519,12 @@ fn model_health_payload_from_row(
         now_unix_secs,
         MODEL_HEALTH_TIMELINE_SEGMENTS,
     );
+    let timeline_details = build_usage_health_timeline_details(
+        events,
+        since_unix_secs,
+        now_unix_secs,
+        MODEL_HEALTH_TIMELINE_SEGMENTS,
+    );
     let last_event_at = events
         .first()
         .and_then(|item| unix_secs_to_rfc3339(item.created_at_unix_ms));
@@ -1448,6 +1556,7 @@ fn model_health_payload_from_row(
         "last_event_at": last_event_at,
         "events": event_payload,
         "timeline": timeline,
+        "timeline_details": timeline_details,
         "time_range_start": unix_secs_to_rfc3339(time_range_start),
         "time_range_end": unix_secs_to_rfc3339(time_range_end),
     });
@@ -1548,6 +1657,203 @@ fn model_health_event_success(event: &StoredRequestUsageAudit) -> bool {
             .is_empty()
 }
 
+fn health_timeline_status(success_count: u64, failed_count: u64) -> &'static str {
+    let actual_completed = success_count.saturating_add(failed_count);
+    if actual_completed == 0 {
+        return "unknown";
+    }
+    let success_rate = success_count as f64 / actual_completed as f64;
+    if success_rate >= 0.95 {
+        "healthy"
+    } else if success_rate >= 0.7 {
+        "warning"
+    } else {
+        "unhealthy"
+    }
+}
+
+fn health_timeline_success_rate(success_count: u64, failed_count: u64) -> Option<f64> {
+    let actual_completed = success_count.saturating_add(failed_count);
+    if actual_completed == 0 {
+        None
+    } else {
+        Some(success_count as f64 / actual_completed as f64)
+    }
+}
+
+fn health_timeline_segment_index(
+    timestamp_unix_secs: u64,
+    since_unix_secs: u64,
+    until_unix_secs: u64,
+    segments: u32,
+) -> Option<usize> {
+    if segments == 0
+        || timestamp_unix_secs < since_unix_secs
+        || timestamp_unix_secs > until_unix_secs
+    {
+        return None;
+    }
+    let safe_range = until_unix_secs.saturating_sub(since_unix_secs).max(1);
+    let offset = timestamp_unix_secs.saturating_sub(since_unix_secs);
+    let mut segment_idx = ((offset as u128 * segments as u128) / safe_range as u128) as usize;
+    if segment_idx >= segments as usize {
+        segment_idx = segments.saturating_sub(1) as usize;
+    }
+    Some(segment_idx)
+}
+
+fn health_timeline_segment_bounds(
+    since_unix_secs: u64,
+    until_unix_secs: u64,
+    segments: u32,
+    segment_idx: u32,
+) -> (u64, u64) {
+    let segment_count = segments.max(1);
+    let safe_range = until_unix_secs.saturating_sub(since_unix_secs).max(1);
+    let start_offset =
+        (safe_range as u128 * u128::from(segment_idx) / u128::from(segment_count)) as u64;
+    let end_offset = (safe_range as u128 * u128::from(segment_idx.saturating_add(1))
+        / u128::from(segment_count)) as u64;
+    let start = since_unix_secs.saturating_add(start_offset);
+    let end = if segment_idx.saturating_add(1) >= segment_count {
+        until_unix_secs
+    } else {
+        since_unix_secs.saturating_add(end_offset)
+    };
+    (start, end.max(start))
+}
+
+fn aggregate_usage_timeline_metrics(
+    events: &[StoredRequestUsageAudit],
+    since_unix_secs: u64,
+    until_unix_secs: u64,
+    segments: u32,
+) -> Vec<HealthTimelineMetricBucket> {
+    let mut buckets = (0..segments)
+        .map(|_| HealthTimelineMetricBucket::default())
+        .collect::<Vec<_>>();
+    for event in events {
+        let Some(segment_idx) = health_timeline_segment_index(
+            event.created_at_unix_ms,
+            since_unix_secs,
+            until_unix_secs,
+            segments,
+        ) else {
+            continue;
+        };
+        if let Some(bucket) = buckets.get_mut(segment_idx) {
+            bucket.add_usage_event(event);
+        }
+    }
+    buckets
+}
+
+fn health_timeline_detail_payload(
+    segment_idx: u32,
+    counts: HealthTimelineDetailCounts,
+    metrics: HealthTimelineMetricBucket,
+    window: HealthTimelineWindow,
+) -> serde_json::Value {
+    let (range_start, range_end) = health_timeline_segment_bounds(
+        window.since_unix_secs,
+        window.until_unix_secs,
+        window.segments,
+        segment_idx,
+    );
+    json!({
+        "segment_index": segment_idx,
+        "status": counts.status,
+        "time_range_start": unix_secs_to_rfc3339(range_start),
+        "time_range_end": unix_secs_to_rfc3339(range_end),
+        "total_attempts": counts.total_attempts,
+        "success_count": counts.success_count,
+        "failed_count": counts.failed_count,
+        "success_rate": health_timeline_success_rate(counts.success_count, counts.failed_count),
+        "avg_latency_ms": metrics.avg_latency_ms(),
+        "avg_first_byte_ms": metrics.avg_first_byte_ms(),
+        "avg_tps": metrics.avg_tps(),
+    })
+}
+
+pub(crate) fn build_public_health_timeline_details(
+    buckets_by_segment: &BTreeMap<u32, PublicHealthTimelineBucket>,
+    since_unix_secs: u64,
+    until_unix_secs: u64,
+    segments: u32,
+    usage_events: &[StoredRequestUsageAudit],
+) -> Vec<serde_json::Value> {
+    let usage_metrics =
+        aggregate_usage_timeline_metrics(usage_events, since_unix_secs, until_unix_secs, segments);
+    let window = HealthTimelineWindow {
+        since_unix_secs,
+        until_unix_secs,
+        segments,
+    };
+    (0..segments)
+        .map(|segment_idx| {
+            let count_bucket = buckets_by_segment.get(&segment_idx);
+            let metrics = usage_metrics
+                .get(segment_idx as usize)
+                .copied()
+                .unwrap_or_default();
+            let total_attempts = count_bucket
+                .map(|bucket| bucket.total_count)
+                .unwrap_or(metrics.total_count);
+            let success_count = count_bucket
+                .map(|bucket| bucket.success_count)
+                .unwrap_or(metrics.success_count);
+            let failed_count = count_bucket
+                .map(|bucket| bucket.failed_count)
+                .unwrap_or(metrics.failed_count);
+            let status = health_timeline_status(success_count, failed_count);
+            health_timeline_detail_payload(
+                segment_idx,
+                HealthTimelineDetailCounts {
+                    status,
+                    total_attempts,
+                    success_count,
+                    failed_count,
+                },
+                metrics,
+                window,
+            )
+        })
+        .collect()
+}
+
+fn build_usage_health_timeline_details(
+    events: &[StoredRequestUsageAudit],
+    since_unix_secs: u64,
+    until_unix_secs: u64,
+    segments: u32,
+) -> Vec<serde_json::Value> {
+    let usage_metrics =
+        aggregate_usage_timeline_metrics(events, since_unix_secs, until_unix_secs, segments);
+    let window = HealthTimelineWindow {
+        since_unix_secs,
+        until_unix_secs,
+        segments,
+    };
+    usage_metrics
+        .into_iter()
+        .enumerate()
+        .map(|(index, metrics)| {
+            let status = health_timeline_status(metrics.success_count, metrics.failed_count);
+            health_timeline_detail_payload(
+                index as u32,
+                HealthTimelineDetailCounts {
+                    status,
+                    total_attempts: metrics.total_count,
+                    success_count: metrics.success_count,
+                    failed_count: metrics.failed_count,
+                },
+                metrics,
+                window,
+            )
+        })
+        .collect()
+}
+
 fn build_model_health_timeline(
     events: &[StoredRequestUsageAudit],
     since_unix_secs: u64,
@@ -1583,20 +1889,7 @@ fn build_model_health_timeline(
 
     let timeline = buckets
         .into_iter()
-        .map(|bucket| {
-            let total = bucket.success_count.saturating_add(bucket.failed_count);
-            if total == 0 {
-                return "unknown";
-            }
-            let success_rate = bucket.success_count as f64 / total as f64;
-            if success_rate >= 0.95 {
-                "healthy"
-            } else if success_rate >= 0.7 {
-                "warning"
-            } else {
-                "unhealthy"
-            }
-        })
+        .map(|bucket| health_timeline_status(bucket.success_count, bucket.failed_count))
         .collect::<Vec<_>>();
 
     (timeline, since_unix_secs, until_unix_secs)

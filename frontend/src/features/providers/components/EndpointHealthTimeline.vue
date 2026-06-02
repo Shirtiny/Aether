@@ -2,6 +2,7 @@
   <HealthStatusTimeline
     v-if="hasStatusTimeline"
     :timeline="monitor?.timeline"
+    :timeline-details="monitor?.timeline_details"
     :time-range-start="monitor?.time_range_start"
     :time-range-end="monitor?.time_range_end"
     :lookback-hours="lookbackHours"
@@ -21,8 +22,10 @@
       >
         <Tooltip>
           <TooltipTrigger as-child>
-            <div
-              class="flex-1 h-full rounded-sm transition-all duration-150 cursor-pointer hover:scale-y-110 hover:brightness-110"
+            <button
+              type="button"
+              :title="segment.tooltip"
+              class="h-full flex-1 cursor-pointer rounded-sm border-0 p-0 transition-all duration-150 hover:scale-y-110 hover:brightness-110 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary"
               :class="segment.color"
             />
           </TooltipTrigger>
@@ -50,7 +53,7 @@ import { computed } from 'vue'
 import type { EndpointStatusMonitor, EndpointHealthEvent, PublicEndpointStatusMonitor, PublicHealthEvent } from '@/api/endpoints'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import HealthStatusTimeline from './HealthStatusTimeline.vue'
-import { formatTimestamp } from './health-monitor-utils'
+import { formatTimestamp, formatTimelineTooltip } from './health-monitor-utils'
 
 // 组件同时支持管理员端和用户端的监控数据类型
 // - EndpointStatusMonitor: 管理员端，包含 provider_count, key_count 等敏感信息
@@ -72,21 +75,24 @@ const segments = computed(() => {
   const gridCount = props.segmentCount ?? GRID_COUNT
   const lookbackHours = props.lookbackHours ?? 6
   const events = props.monitor?.events ?? []
-
-  // 无数据时显示空白格子
-  if (events.length === 0) {
-    return Array.from({ length: gridCount }, () => ({
-      color: 'bg-gray-300 dark:bg-gray-600',
-      tooltip: '暂无请求记录'
-    }))
-  }
-
-  // 计算时间范围：使用 UTC 时间戳避免时区问题
   const nowUtc = Date.now()
   const startTimeUtc = nowUtc - lookbackHours * 60 * 60 * 1000
   const timeRange = lookbackHours * 60 * 60 * 1000
   const timePerGrid = timeRange / gridCount
 
+  // 无数据时显示空白格子
+  if (events.length === 0) {
+    return Array.from({ length: gridCount }, (_, index) => {
+      const cellStartTime = new Date(startTimeUtc + index * timePerGrid)
+      const cellEndTime = new Date(startTimeUtc + (index + 1) * timePerGrid)
+      return {
+        color: 'bg-gray-300 dark:bg-gray-600',
+        tooltip: buildSegmentTooltip('unknown', cellStartTime, cellEndTime, [])
+      }
+    })
+  }
+
+  // 计算时间范围：使用 UTC 时间戳避免时区问题
   const gridEvents: Array<Array<EndpointHealthEvent | PublicHealthEvent>> = Array.from({ length: gridCount }, () => [])
 
   for (const event of events) {
@@ -107,7 +113,7 @@ const segments = computed(() => {
     if (cellEvents.length === 0) {
       result.push({
         color: 'bg-gray-300 dark:bg-gray-600',
-        tooltip: `${formatTimestamp(cellStartTime.toISOString())} - ${formatTimestamp(cellEndTime.toISOString())}\n暂无请求记录`
+        tooltip: buildSegmentTooltip('unknown', cellStartTime, cellEndTime, [])
       })
       continue
     }
@@ -115,7 +121,12 @@ const segments = computed(() => {
     if (cellEvents.length === 1) {
       result.push({
         color: getStatusColor(cellEvents[0].status),
-        tooltip: buildTooltip(cellEvents[0])
+        tooltip: buildSegmentTooltip(
+          getTimelineStatusFromEvents(cellEvents),
+          cellStartTime,
+          cellEndTime,
+          cellEvents
+        )
       })
       continue
     }
@@ -138,11 +149,15 @@ const segments = computed(() => {
       color = 'bg-gray-300 dark:bg-gray-600'
     }
 
-    const firstTime = formatTimestamp(cellEvents[0]?.timestamp)
-    const lastTime = formatTimestamp(cellEvents[cellEvents.length - 1]?.timestamp)
-    const tooltip = `${firstTime} - ${lastTime}\n共 ${total} 次请求\n成功: ${successCount}, 失败: ${failedCount}, 跳过: ${skippedCount}`
-
-    result.push({ color, tooltip })
+    result.push({
+      color,
+      tooltip: buildSegmentTooltip(
+        getTimelineStatusFromEvents(cellEvents),
+        cellStartTime,
+        cellEndTime,
+        cellEvents
+      )
+    })
   }
 
   return result
@@ -163,30 +178,6 @@ function getStatusColor(status: string) {
   }
 }
 
-function buildTooltip(event: EndpointHealthEvent | PublicHealthEvent) {
-  const time = formatTimestamp(event.timestamp)
-  const statusText = getStatusText(event.status)
-  const latency = event.latency_ms ? ` • ${event.latency_ms}ms` : ''
-  const code = event.status_code ? ` • ${event.status_code}` : ''
-  const error = event.error_type ? ` • ${event.error_type}` : ''
-  return `${time} ${statusText}${latency}${code}${error}`
-}
-
-function getStatusText(status: string) {
-  switch (status) {
-    case 'success':
-      return '成功'
-    case 'failed':
-      return '失败'
-    case 'skipped':
-      return '跳过'
-    case 'started':
-      return '执行中'
-    default:
-      return '未知'
-  }
-}
-
 // 计算时间范围显示
 const earliestTime = computed(() => {
   const explicitStart =
@@ -203,5 +194,52 @@ const latestTime = computed(() => {
   if (explicitEnd) return formatTimestamp(explicitEnd)
   return formatTimestamp(new Date().toISOString())
 })
+
+function buildSegmentTooltip(
+  status: string,
+  cellStartTime: Date,
+  cellEndTime: Date,
+  cellEvents: Array<EndpointHealthEvent | PublicHealthEvent>
+) {
+  const successCount = cellEvents.filter(event => event.status === 'success').length
+  const failedCount = cellEvents.filter(event => event.status === 'failed').length
+  const completedCount = successCount + failedCount
+  const latencyValues = cellEvents
+    .map(event => event.latency_ms)
+    .filter((value): value is number => typeof value === 'number' && !Number.isNaN(value))
+  const avgLatencyMs = latencyValues.length > 0
+    ? latencyValues.reduce((sum, value) => sum + value, 0) / latencyValues.length
+    : null
+
+  return formatTimelineTooltip({
+    status,
+    timeRangeStart: cellStartTime.toISOString(),
+    timeRangeEnd: cellEndTime.toISOString(),
+    metrics: {
+      total_attempts: cellEvents.length,
+      success_count: successCount,
+      failed_count: failedCount,
+      success_rate: completedCount > 0 ? successCount / completedCount : null,
+      avg_latency_ms: avgLatencyMs,
+      avg_first_byte_ms: null,
+      avg_tps: null
+    },
+    entityLabel: '端点',
+    entityName: props.monitor?.api_format
+  })
+}
+
+function getTimelineStatusFromEvents(
+  cellEvents: Array<EndpointHealthEvent | PublicHealthEvent>
+) {
+  const successCount = cellEvents.filter(event => event.status === 'success').length
+  const failedCount = cellEvents.filter(event => event.status === 'failed').length
+  const completedCount = successCount + failedCount
+  if (completedCount === 0) return 'unknown'
+  const successRate = successCount / completedCount
+  if (successRate >= 0.95) return 'healthy'
+  if (successRate >= 0.7) return 'warning'
+  return 'unhealthy'
+}
 
 </script>

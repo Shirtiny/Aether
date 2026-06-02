@@ -562,6 +562,20 @@ export interface EndpointHealthEvent {
   error_message?: string | null
 }
 
+export interface HealthTimelineDetail {
+  segment_index?: number
+  status?: string
+  time_range_start?: string | null
+  time_range_end?: string | null
+  total_attempts?: number | null
+  success_count?: number | null
+  failed_count?: number | null
+  success_rate?: number | null
+  avg_latency_ms?: number | null
+  avg_first_byte_ms?: number | null
+  avg_tps?: number | null
+}
+
 export interface EndpointStatusMonitor {
   api_format: string
   total_attempts: number
@@ -577,6 +591,7 @@ export interface EndpointStatusMonitor {
   last_event_at?: string | null
   events: EndpointHealthEvent[]
   timeline?: string[]
+  timeline_details?: HealthTimelineDetail[]
   time_range_start?: string | null
   time_range_end?: string | null
 }
@@ -610,6 +625,7 @@ export interface PublicEndpointStatusMonitor {
   last_event_at?: string | null
   events: PublicHealthEvent[]
   timeline?: string[]
+  timeline_details?: HealthTimelineDetail[]
   time_range_start?: string | null
   time_range_end?: string | null
 }
@@ -642,6 +658,7 @@ export interface ModelStatusMonitor {
   last_event_at?: string | null
   events: ModelHealthEvent[]
   timeline?: string[]
+  timeline_details?: HealthTimelineDetail[]
   time_range_start?: string | null
   time_range_end?: string | null
 }
@@ -666,6 +683,7 @@ export interface ProviderStatusMonitor {
   model_count: number
   last_event_at?: string | null
   timeline?: string[]
+  timeline_details?: HealthTimelineDetail[]
   time_range_start?: string | null
   time_range_end?: string | null
   models: ModelStatusMonitor[]
@@ -692,6 +710,7 @@ export interface HealthRelatedMonitor {
   avg_tps?: number | null
   last_event_at?: string | null
   timeline?: string[]
+  timeline_details?: HealthTimelineDetail[]
   time_range_start?: string | null
   time_range_end?: string | null
 }

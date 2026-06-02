@@ -153,6 +153,77 @@ function generateHealthTimeline(
   })
 }
 
+function generateHealthTimelineDetails(
+  timeline: string[],
+  avgLatencyMs: number | null,
+  avgFirstByteMs: number | null,
+  avgTps: number | null,
+  rangeStart = Date.now() - 6 * 60 * 60 * 1000,
+  rangeEnd = Date.now()
+) {
+  const safeRange = Math.max(rangeEnd - rangeStart, 1)
+  const interval = safeRange / Math.max(timeline.length, 1)
+  return timeline.map((status, index) => {
+    const totalAttempts = status === 'unknown' ? 0 : 3 + (index % 6)
+    const successRate = status === 'healthy'
+      ? 0.98
+      : status === 'warning'
+        ? 0.84
+        : status === 'unhealthy'
+          ? 0.42
+          : null
+    const successCount = successRate == null ? 0 : Math.round(totalAttempts * successRate)
+    const failedCount = successRate == null ? 0 : Math.max(totalAttempts - successCount, 0)
+    const latencyFactor = status === 'warning' ? 1.25 : status === 'unhealthy' ? 1.7 : 1
+    return {
+      segment_index: index,
+      status,
+      time_range_start: new Date(rangeStart + index * interval).toISOString(),
+      time_range_end: new Date(rangeStart + (index + 1) * interval).toISOString(),
+      total_attempts: totalAttempts,
+      success_count: successCount,
+      failed_count: failedCount,
+      success_rate: successRate,
+      avg_latency_ms: avgLatencyMs == null || totalAttempts === 0
+        ? null
+        : Math.round(avgLatencyMs * latencyFactor),
+      avg_first_byte_ms: avgFirstByteMs == null || totalAttempts === 0
+        ? null
+        : Math.round(avgFirstByteMs * latencyFactor),
+      avg_tps: avgTps == null || totalAttempts === 0
+        ? null
+        : Number((avgTps / latencyFactor).toFixed(1))
+    }
+  })
+}
+
+function withHealthTimelineDetails<T extends {
+  timeline?: string[]
+  time_range_start?: string
+  time_range_end?: string
+  avg_latency_ms?: number | null
+  avg_first_byte_ms?: number | null
+  avg_tps?: number | null
+}>(item: T) {
+  const rangeStart = item.time_range_start
+    ? new Date(item.time_range_start).getTime()
+    : Date.now() - 6 * 60 * 60 * 1000
+  const rangeEnd = item.time_range_end
+    ? new Date(item.time_range_end).getTime()
+    : Date.now()
+  return {
+    ...item,
+    timeline_details: generateHealthTimelineDetails(
+      item.timeline || [],
+      item.avg_latency_ms ?? null,
+      item.avg_first_byte_ms ?? null,
+      item.avg_tps ?? null,
+      rangeStart,
+      rangeEnd
+    )
+  }
+}
+
 // Mock 端点健康数据
 // 注意：success_rate 使用 0-1 之间的小数，前端会乘以 100 显示为百分比
 // 事件的成功/失败/跳过比例必须与 success_rate 保持一致
@@ -469,6 +540,7 @@ function mockApiFormatDisplayName(apiFormat: string) {
 }
 
 function relatedEndpointMonitor(format: typeof MOCK_ENDPOINT_STATUS.formats[number]) {
+  const detailed = withHealthTimelineDetails(format)
   return {
     kind: 'endpoint',
     key: format.api_format,
@@ -483,12 +555,14 @@ function relatedEndpointMonitor(format: typeof MOCK_ENDPOINT_STATUS.formats[numb
     avg_tps: format.avg_tps,
     last_event_at: format.last_event_at,
     timeline: format.timeline,
+    timeline_details: detailed.timeline_details,
     time_range_start: format.time_range_start,
     time_range_end: format.time_range_end
   }
 }
 
 function relatedModelMonitor(model: typeof MOCK_MODEL_STATUS.models[number]) {
+  const detailed = withHealthTimelineDetails(model)
   return {
     kind: 'model',
     key: model.model,
@@ -503,12 +577,14 @@ function relatedModelMonitor(model: typeof MOCK_MODEL_STATUS.models[number]) {
     avg_tps: model.avg_tps,
     last_event_at: model.last_event_at,
     timeline: model.timeline,
+    timeline_details: detailed.timeline_details,
     time_range_start: model.time_range_start,
     time_range_end: model.time_range_end
   }
 }
 
 function relatedProviderMonitor(provider: typeof MOCK_PROVIDER_HEALTH_STATUS.providers[number]) {
+  const detailed = withHealthTimelineDetails(provider)
   return {
     kind: 'provider',
     key: provider.provider_name,
@@ -523,6 +599,7 @@ function relatedProviderMonitor(provider: typeof MOCK_PROVIDER_HEALTH_STATUS.pro
     avg_tps: provider.avg_tps,
     last_event_at: provider.last_event_at,
     timeline: provider.timeline,
+    timeline_details: detailed.timeline_details,
     time_range_start: provider.time_range_start,
     time_range_end: provider.time_range_end
   }
@@ -1341,19 +1418,31 @@ const mockHandlers: Record<string, (config: AxiosRequestConfig) => Promise<Axios
   'GET /api/admin/endpoints/health/api-formats': async () => {
     await delay()
     requireAdmin()
-    return createMockResponse(MOCK_ENDPOINT_STATUS)
+    return createMockResponse({
+      ...MOCK_ENDPOINT_STATUS,
+      formats: MOCK_ENDPOINT_STATUS.formats.map(withHealthTimelineDetails)
+    })
   },
 
   'GET /api/admin/endpoints/health/models': async () => {
     await delay()
     requireAdmin()
-    return createMockResponse(MOCK_MODEL_STATUS)
+    return createMockResponse({
+      ...MOCK_MODEL_STATUS,
+      models: MOCK_MODEL_STATUS.models.map(withHealthTimelineDetails)
+    })
   },
 
   'GET /api/admin/endpoints/health/providers': async () => {
     await delay()
     requireAdmin()
-    return createMockResponse(MOCK_PROVIDER_HEALTH_STATUS)
+    return createMockResponse({
+      ...MOCK_PROVIDER_HEALTH_STATUS,
+      providers: MOCK_PROVIDER_HEALTH_STATUS.providers.map(provider => ({
+        ...withHealthTimelineDetails(provider),
+        models: provider.models.map(withHealthTimelineDetails)
+      }))
+    })
   },
 
   'GET /api/admin/endpoints/health/related': async (config) => {
@@ -1725,6 +1814,7 @@ const mockHandlers: Record<string, (config: AxiosRequestConfig) => Promise<Axios
         last_event_at: f.last_event_at,
         events: f.events.slice(0, 10),
         timeline: f.timeline,
+        timeline_details: withHealthTimelineDetails(f).timeline_details,
         time_range_start: f.time_range_start,
         time_range_end: f.time_range_end
       }))
@@ -1748,6 +1838,7 @@ const mockHandlers: Record<string, (config: AxiosRequestConfig) => Promise<Axios
         last_event_at: model.last_event_at,
         events: model.events.slice(0, 10),
         timeline: model.timeline,
+        timeline_details: withHealthTimelineDetails(model).timeline_details,
         time_range_start: model.time_range_start,
         time_range_end: model.time_range_end
       }))

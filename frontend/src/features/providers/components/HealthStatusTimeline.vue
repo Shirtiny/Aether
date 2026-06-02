@@ -8,8 +8,10 @@
       >
         <Tooltip>
           <TooltipTrigger as-child>
-            <div
-              class="h-full flex-1 cursor-pointer rounded-sm transition-all duration-150 hover:scale-y-110 hover:brightness-110"
+            <button
+              type="button"
+              :title="segment.tooltip"
+              class="h-full flex-1 cursor-pointer rounded-sm border-0 p-0 transition-all duration-150 hover:scale-y-110 hover:brightness-110 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary"
               :class="getTimelineColor(segment.status)"
             />
           </TooltipTrigger>
@@ -38,12 +40,14 @@ import { computed } from 'vue'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import {
   formatTimestamp,
+  formatTimelineTooltip,
   getTimelineColor,
-  getTimelineLabel
+  type HealthTimelineTooltipMetrics
 } from './health-monitor-utils'
 
 const props = withDefaults(defineProps<{
   timeline?: string[] | null
+  timelineDetails?: HealthTimelineTooltipMetrics[] | null
   timeRangeStart?: string | null
   timeRangeEnd?: string | null
   generatedAt?: string | null
@@ -96,17 +100,29 @@ const segments = computed(() => {
   return segmentStatuses.map((status, index) => {
     const cellStart = new Date(startMs.value + index * interval).toISOString()
     const cellEnd = new Date(startMs.value + (index + 1) * interval).toISOString()
+    const detail = props.timelineDetails?.[index] ?? null
+    const timeRangeStart = detail?.time_range_start || cellStart
+    const timeRangeEnd = detail?.time_range_end || cellEnd
     return {
       status,
-      tooltip: buildTooltip(status, cellStart, cellEnd)
+      tooltip: buildTooltip(status, timeRangeStart, timeRangeEnd, detail)
     }
   })
 })
 
-function buildTooltip(status: string, cellStart: string, cellEnd: string) {
-  const entity = props.entityLabel && props.entityName
-    ? `\n${props.entityLabel}：${props.entityName}`
-    : ''
-  return `${formatTimestamp(cellStart)} - ${formatTimestamp(cellEnd)}${entity}\n状态：${getTimelineLabel(status)}`
+function buildTooltip(
+  status: string,
+  cellStart: string,
+  cellEnd: string,
+  detail: HealthTimelineTooltipMetrics | null
+) {
+  return formatTimelineTooltip({
+    status,
+    timeRangeStart: cellStart,
+    timeRangeEnd: cellEnd,
+    metrics: detail,
+    entityLabel: props.entityLabel,
+    entityName: props.entityName
+  })
 }
 </script>

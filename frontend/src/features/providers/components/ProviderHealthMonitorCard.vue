@@ -79,6 +79,7 @@
           <HealthStatusTimeline
             class="mt-2"
             :timeline="provider.timeline"
+            :timeline-details="provider.timeline_details"
             :time-range-start="provider.time_range_start"
             :time-range-end="provider.time_range_end"
             :generated-at="generatedAt"
@@ -192,6 +193,7 @@ function openDetails(provider: ProviderStatusMonitor) {
       avgFirstByteMs: provider.avg_first_byte_ms,
       avgTps: provider.avg_tps,
       timeline: provider.timeline || null,
+      timelineDetails: provider.timeline_details || null,
       timeRangeStart: provider.time_range_start || null,
       timeRangeEnd: provider.time_range_end || null
     }

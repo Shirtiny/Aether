@@ -177,6 +177,7 @@ const sourceMonitor = computed<HealthRelatedMonitor | null>(() => {
     avg_first_byte_ms: source.avgFirstByteMs,
     avg_tps: source.avgTps,
     timeline: source.timeline || undefined,
+    timeline_details: source.timelineDetails || undefined,
     time_range_start: source.timeRangeStart || null,
     time_range_end: source.timeRangeEnd || null
   }
@@ -281,6 +282,7 @@ function buildSourceFromRelatedMonitor(monitor: HealthRelatedMonitor): HealthMon
     avgFirstByteMs: monitor.avg_first_byte_ms,
     avgTps: monitor.avg_tps,
     timeline: monitor.timeline || null,
+    timelineDetails: monitor.timeline_details || null,
     timeRangeStart: monitor.time_range_start || null,
     timeRangeEnd: monitor.time_range_end || null
   }

@@ -210,6 +210,7 @@ function openDetails(monitor: EndpointMonitor) {
       avgFirstByteMs: monitor.avg_first_byte_ms,
       avgTps: monitor.avg_tps,
       timeline: monitor.timeline || null,
+      timelineDetails: monitor.timeline_details || null,
       timeRangeStart: monitor.time_range_start || null,
       timeRangeEnd: monitor.time_range_end || null
     }

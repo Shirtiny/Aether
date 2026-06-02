@@ -49,6 +49,7 @@
     <HealthStatusTimeline
       class="mt-2"
       :timeline="monitor.timeline"
+      :timeline-details="monitor.timeline_details"
       :time-range-start="monitor.time_range_start"
       :time-range-end="monitor.time_range_end"
       :generated-at="generatedAt"

@@ -22,6 +22,7 @@ export interface HealthMonitorDetailSource {
   avgFirstByteMs?: number | null
   avgTps?: number | null
   timeline?: string[] | null
+  timelineDetails?: HealthTimelineTooltipMetrics[] | null
   timeRangeStart?: string | null
   timeRangeEnd?: string | null
 }
@@ -34,6 +35,18 @@ export interface HealthMonitorDetailTarget {
 export interface HealthMonitorAvailability {
   total_attempts: number
   success_rate: number
+}
+
+export interface HealthTimelineTooltipMetrics {
+  time_range_start?: string | null
+  time_range_end?: string | null
+  total_attempts?: number | null
+  success_count?: number | null
+  failed_count?: number | null
+  success_rate?: number | null
+  avg_latency_ms?: number | null
+  avg_first_byte_ms?: number | null
+  avg_tps?: number | null
 }
 
 export interface HealthMonitorSectionSummary {
@@ -134,6 +147,69 @@ export function formatTps(value?: number | null) {
   return `${new Intl.NumberFormat('zh-CN', {
     maximumFractionDigits: value < 10 ? 2 : value < 100 ? 1 : 0
   }).format(value)} tps`
+}
+
+export function formatFullTimestamp(timestamp?: string | null) {
+  if (!timestamp) return '未知时间'
+  const date = new Date(timestamp)
+  if (Number.isNaN(date.getTime())) return '未知时间'
+  const pad = (value: number) => value.toString().padStart(2, '0')
+  return [
+    `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`,
+    `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+  ].join(' ')
+}
+
+export function formatTimelineTooltip(input: {
+  status: string
+  timeRangeStart: string
+  timeRangeEnd: string
+  metrics?: HealthTimelineTooltipMetrics | null
+  entityLabel?: string
+  entityName?: string | null
+}) {
+  const metrics = input.metrics
+  const lines = [
+    `总请求/成功/失败/可用率/状态：${formatTimelineRequestBreakdown(metrics, input.status)}`,
+    `平均耗时/TTFB/速度：${formatTimelineAverageMetrics(metrics)}`,
+    `时间范围：${formatFullTimestamp(input.timeRangeStart)} - ${formatFullTimestamp(input.timeRangeEnd)}`
+  ]
+  if (input.entityLabel && input.entityName) {
+    lines.push(`${input.entityLabel}：${input.entityName}`)
+  }
+  return lines.join('\n')
+}
+
+function formatTimelineAverageMetrics(metrics?: HealthTimelineTooltipMetrics | null) {
+  return [
+    formatMs(metrics?.avg_latency_ms),
+    formatMs(metrics?.avg_first_byte_ms),
+    formatTps(metrics?.avg_tps)
+  ].join('/')
+}
+
+function formatTimelineRequestBreakdown(
+  metrics: HealthTimelineTooltipMetrics | null | undefined,
+  status: string
+) {
+  if (!metrics) return '-'
+  const total = formatTimelineCount(metrics.total_attempts)
+  const success = formatTimelineCount(metrics.success_count)
+  const failed = formatTimelineCount(metrics.failed_count)
+  const availability = formatTimelineMetricAvailability(metrics)
+  return `${total}/${success}/${failed}/${availability}/${getTimelineLabel(status)}`
+}
+
+function formatTimelineCount(value?: number | null) {
+  if (typeof value !== 'number' || Number.isNaN(value)) return '-'
+  return `${new Intl.NumberFormat('zh-CN').format(value)} 次`
+}
+
+function formatTimelineMetricAvailability(metrics?: HealthTimelineTooltipMetrics | null) {
+  if (!metrics) return '-'
+  if (typeof metrics.total_attempts === 'number' && metrics.total_attempts <= 0) return '-'
+  if (typeof metrics.success_rate !== 'number' || Number.isNaN(metrics.success_rate)) return '-'
+  return formatPercent(metrics.success_rate)
 }
 
 export function formatCompactNumber(value: number) {
