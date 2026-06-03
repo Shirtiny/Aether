@@ -13,7 +13,7 @@ Statuses:
 - `lossy-blocked`: conversion fails closed.
 - `invalid-enum`: conversion fails closed because a provider enum value is not valid for the target mapping.
 
-Full schema field coverage is tracked in `docs/api/format-field-coverage-matrix.md`. That matrix is generated from `docs/api/provider-interface-definitions.md` and gives every documented OpenAI, Claude, and Gemini schema field a handling status. “Handled” means mapped, same-format/native preserved, extension-preserved, blocked with a structured error, or explicitly marked outside the canonical conversion surface.
+Full schema field coverage is tracked in `docs/api/format-field-coverage-matrix.md`. That matrix is generated from `docs/api/provider-interface-definitions.md` by `python3 docs/api/generate_format_field_coverage.py` and gives every documented OpenAI, Claude, and Gemini schema field a handling status. “Handled” means mapped, same-format/native preserved, extension-preserved, blocked with a structured error, or explicitly marked outside the canonical conversion surface.
 
 ## Implemented Boundary Changes
 

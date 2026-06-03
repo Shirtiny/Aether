@@ -4,6 +4,8 @@ Last generated: 2026-06-03
 
 This file is generated from `docs/api/provider-interface-definitions.md` and gives every documented schema field an explicit handling status. “处理到” here means the field is either mapped, preserved in same-format paths, rejected with a structured fail-closed error, or explicitly outside the current conversion surface. It does not mean every field can be cross-format converted.
 
+Regenerate with: `python3 docs/api/generate_format_field_coverage.py`.
+
 Statuses used in this matrix: `native`, `mapped`, `mapped/lossy-blocked`, `extension-preserved`, `unsupported`, `invalid-enum`, `lossy-blocked`, `not-in-conversion-surface`.
 
 | Provider | Schema | Field | Required | Type | Surface | Same-Format Runtime | Canonical Roundtrip | Cross-Format | Notes |
