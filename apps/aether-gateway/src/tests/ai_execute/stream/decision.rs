@@ -348,7 +348,7 @@ async fn gateway_executes_openai_chat_stream_via_local_decision_gate_without_exe
     let (upstream_url, upstream_handle) = start_server(upstream).await;
     let (provider_url, provider_handle) = start_server(provider).await;
     let mut primary_endpoint = sample_provider_catalog_endpoint();
-    primary_endpoint.base_url = provider_url.clone();
+    primary_endpoint.base_url = format!("{provider_url}/v1");
     backup_endpoint.base_url = "http://127.0.0.1:9".to_string();
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
         vec![sample_provider_catalog_provider(), backup_provider],
@@ -884,15 +884,15 @@ async fn gateway_executes_openai_chat_stream_via_local_openai_responses_cross_fo
     );
     assert_eq!(
         seen_execution_runtime_request.prompt_cache_key,
-        "b6741389-8b9e-5c00-bef6-fbce92aee45a"
+        "bc749eb7-a9e2-5793-8d14-abd659c700b0"
     );
     assert_eq!(
         seen_execution_runtime_request.session_id,
-        "9fa08f4f14ccba13"
+        "d1e9b802644e1f52"
     );
     assert_eq!(
         seen_execution_runtime_request.conversation_id,
-        "9fa08f4f14ccba13"
+        "d1e9b802644e1f52"
     );
     assert_eq!(
         seen_execution_runtime_request.instructions,
@@ -2300,7 +2300,7 @@ async fn gateway_retries_next_local_openai_chat_stream_candidate_after_retryable
     );
     assert_eq!(
         seen_execution_runtime_requests[0].url,
-        "https://api.openai.primary.example/v1/chat/completions"
+        "https://api.openai.primary.example/chat/completions"
     );
     assert_eq!(
         seen_execution_runtime_requests[0].authorization,
@@ -2308,7 +2308,7 @@ async fn gateway_retries_next_local_openai_chat_stream_candidate_after_retryable
     );
     assert_eq!(
         seen_execution_runtime_requests[1].url,
-        "https://api.openai.backup.example/v1/chat/completions"
+        "https://api.openai.backup.example/chat/completions"
     );
     assert_eq!(
         seen_execution_runtime_requests[1].model,

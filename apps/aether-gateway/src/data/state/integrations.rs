@@ -12,7 +12,9 @@ use aether_data_contracts::repository::provider_catalog::{
     StoredProviderCatalogEndpoint, StoredProviderCatalogKey, StoredProviderCatalogProvider,
 };
 use aether_data_contracts::repository::settlement::{StoredUsageSettlement, UsageSettlementInput};
-use aether_data_contracts::repository::usage::{StoredRequestUsageAudit, UpsertUsageRecord};
+use aether_data_contracts::repository::usage::{
+    ProxyNodeCounterDelta, StoredRequestUsageAudit, UpsertUsageRecord,
+};
 use aether_data_contracts::repository::video_tasks::{StoredVideoTask, VideoTaskLookupKey};
 use aether_runtime_state::RuntimeQueueStore;
 use aether_usage_runtime::{
@@ -284,6 +286,21 @@ impl aether_usage_runtime::ManualProxyNodeCounter for GatewayDataState {
         failed_delta: i64,
         latency_ms: Option<i64>,
     ) -> Result<(), DataLayerError> {
+        if let Some(repository) = &self.usage_writer {
+            let enqueued = repository
+                .enqueue_proxy_node_counter_delta(ProxyNodeCounterDelta {
+                    node_id: node_id.to_string(),
+                    total_requests_delta: total_delta,
+                    failed_requests_delta: failed_delta,
+                    dns_failures_delta: 0,
+                    stream_errors_delta: 0,
+                })
+                .await?;
+            if enqueued {
+                return Ok(());
+            }
+        }
+
         match &self.proxy_node_writer {
             Some(repository) => {
                 repository

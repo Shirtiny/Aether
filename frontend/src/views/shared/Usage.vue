@@ -50,15 +50,15 @@
       >
         <UsageModelTable
           :data="enhancedModelStats"
-        :is-admin="authStore.canAccessAdmin"
+          :is-admin="authStore.canAccessAdmin"
         />
         <UsageProviderTable
           :data="providerStats"
-        :is-admin="authStore.canAccessAdmin"
+          :is-admin="authStore.canAccessAdmin"
         />
         <UsageApiFormatTable
           :data="apiFormatStats"
-        :is-admin="authStore.canAccessAdmin"
+          :is-admin="authStore.canAccessAdmin"
         />
       </div>
       <!-- 用户：模型 + API格式（2列） -->
@@ -68,7 +68,7 @@
       >
         <UsageModelTable
           :data="enhancedModelStats"
-        :is-admin="authStore.canAccessAdmin"
+          :is-admin="authStore.canAccessAdmin"
         />
         <UsageApiFormatTable
           :data="apiFormatStats"
@@ -81,7 +81,7 @@
     <UsageRecordsTable
       :records="displayRecords"
       :is-admin="isAdminPage"
-        :show-actual-cost="authStore.canAccessAdmin"
+      :show-actual-cost="authStore.canAccessAdmin"
       :loading="isLoadingRecords"
       :time-range="timeRange"
       :filter-search="filterSearch"
@@ -90,14 +90,17 @@
       :filter-provider="filterProvider"
       :filter-api-format="filterApiFormat"
       :filter-status="filterStatus"
+      :filter-client-family="filterClientFamily"
       :available-users="availableUsers"
       :available-models="availableModels"
       :available-providers="availableProviders"
+      :available-client-families="availableClientFamilies"
       :current-page="currentPage"
       :page-size="pageSize"
       :total-records="effectiveTotalRecords"
       :page-size-options="pageSizeOptions"
       :auto-refresh="globalAutoRefresh"
+      :hide-unknown-records="hideUnknownRecords"
       @update:time-range="handleTimeRangeChange"
       @update:filter-search="handleFilterSearchChange"
       @update:filter-user="handleFilterUserChange"
@@ -105,10 +108,12 @@
       @update:filter-provider="handleFilterProviderChange"
       @update:filter-api-format="handleFilterApiFormatChange"
       @update:filter-status="handleFilterStatusChange"
+      @update:filter-client-family="handleFilterClientFamilyChange"
       @update:current-page="handlePageChange"
       @update:page-size="handlePageSizeChange"
       @update:auto-refresh="handleAutoRefreshChange"
-      @refresh="refreshData"
+      @update:hide-unknown-records="handleHideUnknownRecordsChange"
+      @refresh="handleManualRefresh"
       @prefetch-detail="prefetchRequestDetail"
       @show-detail="showRequestDetail"
     />
@@ -153,9 +158,10 @@ import {
   hasUsageFallback,
   isUsageRecordFailed,
   isUsageUpstreamStream,
+  normalizeRequestStatus,
   resolveDisplayRequestStatus,
 } from '@/features/usage/utils/status'
-import type { DateRangeParams, FilterStatusValue, RequestStatus } from '@/features/usage/types'
+import type { DateRangeParams, FilterStatusValue, RequestStatus, UsageRecord } from '@/features/usage/types'
 import type { UserOption } from '@/features/usage/components/UsageRecordsTable.vue'
 import { log } from '@/utils/logger'
 import type { ActivityHeatmap } from '@/types/activity'
@@ -170,6 +176,7 @@ const isAdminPage = computed(() => route.path.startsWith('/admin'))
 
 // 用量分析面板折叠状态（默认展开，持久化到 localStorage）
 const statsExpanded = useLocalStorage('usage-stats-expanded', true)
+const hideUnknownRecords = useLocalStorage('usage-hide-unknown-records', false)
 
 // 时间范围选择
 const timeRange = ref<DateRangeParams>(
@@ -226,6 +233,7 @@ const filterModel = ref('__all__')
 const filterProvider = ref('__all__')
 const filterApiFormat = ref('__all__')
 const filterStatus = ref<FilterStatusValue>('__all__')
+const filterClientFamily = ref('__all__')
 
 // 用户列表（仅管理员页面使用）
 const availableUsers = ref<UserOption[]>([])
@@ -285,7 +293,7 @@ async function loadAdminUsers() {
   }
 }
 
-async function refreshAdminAnalytics(options: { force?: boolean } = {}) {
+async function refreshAdminAnalytics(options: { force?: boolean; preserveOnFailure?: boolean } = {}) {
   if (!isAdminPage.value) return
   if (!options.force && !isPageVisible.value) return
 
@@ -296,13 +304,19 @@ async function refreshAdminAnalytics(options: { force?: boolean } = {}) {
   if (!options.force && adminAnalyticsRefreshInFlight) {
     return adminAnalyticsRefreshInFlight
   }
+  if (!options.force) {
+    lastAdminAnalyticsRefreshAt = now
+  }
 
   const refreshGeneration = ++adminAnalyticsRefreshGeneration
   const refreshPromise = (async () => {
     let hasSuccessfulRefresh = false
 
     try {
-      const hadFailure = await loadStats(timeRange.value)
+      const hadFailure = await loadStats(getCurrentStatsFilters(), {
+        force: options.force,
+        preserveOnFailure: options.preserveOnFailure,
+      })
       if (refreshGeneration !== adminAnalyticsRefreshGeneration) {
         return
       }
@@ -333,11 +347,40 @@ async function refreshAdminAnalytics(options: { force?: boolean } = {}) {
   }
 }
 
-// 用户页面需要前端筛选
-const filteredRecords = computed(() => {
-  if (!isAdminPage.value) {
-    let records = [...currentRecords.value]
+function getCurrentStatsFilters() {
+  const filters = getCurrentFilters()
+  return {
+    ...timeRange.value,
+    user_id: filters.user_id,
+    model: filters.model,
+    provider: filters.provider,
+  }
+}
 
+async function refreshAdminAnalyticsForSelectionChange() {
+  if (!isAdminPage.value) return
+  await refreshAdminAnalytics({ force: true, preserveOnFailure: false })
+}
+
+function isUnknownUsageLabel(value: unknown): boolean {
+  if (typeof value !== 'string') return false
+  const normalized = value.trim().toLowerCase()
+  return normalized === 'unknown' || normalized === 'unknow'
+}
+
+function hasUnknownModelOrProvider(record: UsageRecord): boolean {
+  if (isUnknownUsageLabel(record.model)) return true
+  if (isUnknownUsageLabel(record.provider)) return true
+  return false
+}
+
+// 用户页面需要前端筛选；隐藏 unknown 的开关对管理员当前页也生效。
+const filteredRecords = computed(() => {
+  let records = hideUnknownRecords.value
+    ? currentRecords.value.filter(record => !hasUnknownModelOrProvider(record))
+    : [...currentRecords.value]
+
+  if (!isAdminPage.value) {
     if (filterModel.value !== '__all__') {
       records = records.filter(record => record.model === filterModel.value)
     }
@@ -372,12 +415,18 @@ const filteredRecords = computed(() => {
         records = records.filter(record => record.status === 'cancelled')
       } else if (filterStatus.value === 'has_fallback') {
         records = records.filter(record => hasUsageFallback(record))
+      } else if (filterStatus.value === 'has_retry') {
+        records = records.filter(record => record.has_retry === true)
       }
+    }
+
+    if (filterClientFamily.value !== '__all__') {
+      records = records.filter(record => record.client_family === filterClientFamily.value)
     }
 
     return records
   }
-  return currentRecords.value
+  return records
 })
 
 // 获取活跃请求的 ID 列表
@@ -500,6 +549,16 @@ async function pollActiveRequests() {
         if ('target_model' in update && (typeof update.target_model === 'string' || update.target_model === null)) {
           record.target_model = update.target_model
         }
+        if ('reasoning_effort' in update) {
+          record.reasoning_effort = typeof update.reasoning_effort === 'string'
+            ? update.reasoning_effort
+            : null
+        }
+        if ('service_tier' in update) {
+          record.service_tier = typeof update.service_tier === 'string'
+            ? update.service_tier
+            : null
+        }
         // 管理员接口返回额外字段
         // 只有当返回的 provider 不是 pending/unknown/unknow 时才更新，避免覆盖已有的正确值
         if ('provider' in update && typeof update.provider === 'string') {
@@ -515,6 +574,15 @@ async function pollActiveRequests() {
           record.provider_key_name = typeof update.provider_key_name === 'string'
             ? update.provider_key_name
             : undefined
+        }
+        if ('client_family' in update) {
+          record.client_family = typeof update.client_family === 'string' ? update.client_family : null
+        }
+        if ('client_ip' in update) {
+          record.client_ip = typeof update.client_ip === 'string' ? update.client_ip : null
+        }
+        if ('user_agent' in update) {
+          record.user_agent = typeof update.user_agent === 'string' ? update.user_agent : null
         }
       }
     }
@@ -657,6 +725,14 @@ function handleAutoRefreshChange(value: boolean) {
   }
 }
 
+async function handleHideUnknownRecordsChange(value: boolean) {
+  hideUnknownRecords.value = value
+  currentPage.value = 1
+  if (isAdminPage.value) {
+    await loadRecords({ page: 1, pageSize: pageSize.value }, getCurrentFilters(), timeRange.value)
+  }
+}
+
 function handleVisibilityChange() {
   isPageVisible.value = !document.hidden
   if (!isPageVisible.value) {
@@ -690,7 +766,7 @@ const paginatedRecords = computed(() => {
     const end = start + pageSize.value
     return filteredRecords.value.slice(start, end)
   }
-  return currentRecords.value
+  return filteredRecords.value
 })
 
 // 用户页面使用前端筛选后的总数，管理员页面使用后端返回的总数
@@ -703,6 +779,15 @@ const effectiveTotalRecords = computed(() => {
 
 // 显示的记录
 const displayRecords = computed(() => paginatedRecords.value)
+
+const availableClientFamilies = computed(() => {
+  const families = new Set<string>()
+  currentRecords.value.forEach((record) => {
+    const family = record.client_family?.trim()
+    if (family) families.add(family)
+  })
+  return Array.from(families).sort()
+})
 
 
 // 详情弹窗状态
@@ -721,7 +806,7 @@ onMounted(async () => {
       timeRange.value
     )
     void (async () => {
-      await refreshAdminAnalytics({ force: true })
+      await refreshAdminAnalytics({ force: true, preserveOnFailure: false })
       await loadHeatmapData()
       await loadAdminUsers()
     })()
@@ -753,7 +838,7 @@ async function handleTimeRangeChange(value: DateRangeParams) {
   currentPage.value = 1 // 重置到第一页
   if (isAdminPage.value) {
     await loadRecords({ page: 1, pageSize: pageSize.value }, getCurrentFilters(), timeRange.value)
-    await refreshAdminAnalytics({ force: true })
+    await refreshAdminAnalyticsForSelectionChange()
     return
   }
   await loadStats(timeRange.value)
@@ -787,7 +872,9 @@ function getCurrentFilters() {
     model: filterModel.value !== '__all__' ? filterModel.value : undefined,
     provider: filterProvider.value !== '__all__' ? filterProvider.value : undefined,
     api_format: filterApiFormat.value !== '__all__' ? filterApiFormat.value : undefined,
-    status: filterStatus.value !== '__all__' ? filterStatus.value : undefined
+    status: filterStatus.value !== '__all__' ? filterStatus.value : undefined,
+    client_family: filterClientFamily.value !== '__all__' ? filterClientFamily.value : undefined,
+    hideUnknownRecords: hideUnknownRecords.value || undefined
   }
 }
 
@@ -809,6 +896,7 @@ async function handleFilterUserChange(value: string) {
 
   if (isAdminPage.value) {
     await loadRecords({ page: 1, pageSize: pageSize.value }, getCurrentFilters(), timeRange.value)
+    await refreshAdminAnalyticsForSelectionChange()
   }
 }
 
@@ -818,6 +906,7 @@ async function handleFilterModelChange(value: string) {
 
   if (isAdminPage.value) {
     await loadRecords({ page: 1, pageSize: pageSize.value }, getCurrentFilters(), timeRange.value)
+    await refreshAdminAnalyticsForSelectionChange()
   }
 }
 
@@ -827,6 +916,7 @@ async function handleFilterProviderChange(value: string) {
 
   if (isAdminPage.value) {
     await loadRecords({ page: 1, pageSize: pageSize.value }, getCurrentFilters(), timeRange.value)
+    await refreshAdminAnalyticsForSelectionChange()
   }
 }
 
@@ -848,6 +938,15 @@ async function handleFilterStatusChange(value: string) {
   }
 }
 
+async function handleFilterClientFamilyChange(value: string) {
+  filterClientFamily.value = value
+  currentPage.value = 1
+
+  if (isAdminPage.value) {
+    await loadRecords({ page: 1, pageSize: pageSize.value }, getCurrentFilters(), timeRange.value)
+  }
+}
+
 // 刷新数据
 async function refreshData() {
   if (!isPageVisible.value) return
@@ -860,8 +959,6 @@ async function refreshData() {
         getCurrentFilters(),
         timeRange.value
       )
-      // 热力图反映长期活跃分布，不跟随自动刷新链路一起重载。
-      void refreshAdminAnalytics()
       return
     }
 
@@ -874,6 +971,11 @@ async function refreshData() {
   } finally {
     refreshInFlight = null
   }
+}
+
+async function handleManualRefresh() {
+  if (!isPageVisible.value) return
+  await refreshData()
 }
 
 // 显示请求详情
@@ -909,6 +1011,8 @@ function handleDetailRequestState(update: {
   const record = currentRecords.value.find(record => record.id === update.id)
   if (!record) return
 
+  const nextStatus = resolveDetailUpdateStatus(update)
+
   const statusPriority: Record<RequestStatus, number> = {
     pending: 0,
     streaming: 1,
@@ -916,11 +1020,11 @@ function handleDetailRequestState(update: {
     failed: 2,
     cancelled: 2,
   }
-  if (update.status) {
+  if (nextStatus) {
     const currentRank = record.status ? statusPriority[record.status] : 0
-    const nextRank = statusPriority[update.status]
+    const nextRank = statusPriority[nextStatus]
     if (nextRank >= currentRank) {
-      record.status = update.status
+      record.status = nextStatus
     }
   }
   if ('statusCode' in update) {
@@ -938,6 +1042,24 @@ function handleDetailRequestState(update: {
   if ('errorMessage' in update) {
     record.error_message = update.errorMessage ?? undefined
   }
+}
+
+function resolveDetailUpdateStatus(update: {
+  status?: RequestStatus
+  statusCode?: number | null
+  imageProgress?: ImageProgress | null
+  errorMessage?: string | null
+}): RequestStatus | undefined {
+  const status = normalizeRequestStatus(update.status)
+  const hasFailureSignal =
+    (typeof update.statusCode === 'number' && update.statusCode >= 400) ||
+    (typeof update.errorMessage === 'string' && update.errorMessage.trim().length > 0) ||
+    update.imageProgress?.phase === 'failed'
+
+  if ((status == null || status === 'pending' || status === 'streaming') && hasFailureSignal) {
+    return 'failed'
+  }
+  return status
 }
 
 function prefetchRequestDetail(id: string) {

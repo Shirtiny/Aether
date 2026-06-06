@@ -2,7 +2,8 @@ use aether_contracts::{ExecutionPlan, ExecutionResult};
 use serde_json::Value;
 
 use crate::orchestration::{
-    resolve_local_failover_analysis_for_attempt, LocalFailoverAnalysis, LocalFailoverDecision,
+    resolve_local_failover_analysis_for_attempt, LocalFailoverAnalysis,
+    LocalFailoverClassification, LocalFailoverDecision,
 };
 use crate::AppState;
 
@@ -11,6 +12,16 @@ fn sync_plan_kind_disables_local_candidate_failover(plan_kind: &str) -> bool {
         plan_kind,
         "openai_video_delete_sync" | "openai_video_cancel_sync" | "gemini_video_cancel_sync"
     )
+}
+
+fn openai_image_success_disables_local_success_failover(
+    plan: &ExecutionPlan,
+    status_code: u16,
+) -> bool {
+    status_code == 200
+        && plan
+            .provider_api_format
+            .eq_ignore_ascii_case("openai:image")
 }
 
 pub(crate) async fn should_retry_next_local_candidate_sync(
@@ -46,6 +57,19 @@ pub(crate) async fn analyze_local_candidate_failover_sync(
 ) -> LocalFailoverAnalysis {
     if sync_plan_kind_disables_local_candidate_failover(plan_kind) {
         return LocalFailoverAnalysis::use_default();
+    }
+
+    if openai_image_success_disables_local_success_failover(plan, result.status_code) {
+        return LocalFailoverAnalysis::use_default();
+    }
+
+    if let Some(error) = result.error.as_ref() {
+        if !error.retryable && !error.failover_recommended {
+            return LocalFailoverAnalysis {
+                classification: LocalFailoverClassification::StopExecutionError,
+                decision: LocalFailoverDecision::StopLocalFailover,
+            };
+        }
     }
 
     resolve_local_failover_analysis_for_attempt(
@@ -218,6 +242,10 @@ pub(crate) async fn resolve_local_candidate_failover_analysis_stream(
     status_code: u16,
     response_text: Option<&str>,
 ) -> LocalFailoverAnalysis {
+    if openai_image_success_disables_local_success_failover(plan, status_code) {
+        return LocalFailoverAnalysis::use_default();
+    }
+
     resolve_local_failover_analysis_for_attempt(
         state,
         plan,
@@ -326,14 +354,14 @@ pub(crate) fn resolve_core_stream_direct_finalize_report_kind(plan_kind: &str) -
 mod tests {
     use std::collections::BTreeSet;
 
-    use aether_contracts::ExecutionResult;
+    use aether_contracts::{ExecutionError, ExecutionErrorKind, ExecutionPhase, ExecutionResult};
     use aether_data::repository::provider_catalog::InMemoryProviderCatalogReadRepository;
     use aether_data_contracts::repository::provider_catalog::{
         StoredProviderCatalogEndpoint, StoredProviderCatalogKey, StoredProviderCatalogProvider,
     };
 
     use super::{
-        resolve_core_stream_error_finalize_report_kind,
+        analyze_local_candidate_failover_sync, resolve_core_stream_error_finalize_report_kind,
         resolve_core_sync_error_finalize_report_kind, should_fallback_to_control_stream,
         should_fallback_to_control_sync, should_retry_next_local_candidate_stream,
         should_retry_next_local_candidate_sync, should_stop_local_candidate_failover_stream,
@@ -608,6 +636,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sync_failover_honors_non_retryable_execution_error() {
+        let result = ExecutionResult {
+            request_id: "req-1".to_string(),
+            candidate_id: None,
+            status_code: 502,
+            headers: Default::default(),
+            body: None,
+            telemetry: None,
+            error: Some(ExecutionError {
+                kind: ExecutionErrorKind::Upstream5xx,
+                phase: ExecutionPhase::Finalize,
+                message: "provider returned HTTP 200 without visible model output".to_string(),
+                upstream_status: Some(200),
+                retryable: false,
+                failover_recommended: false,
+            }),
+        };
+        let local_report_context = serde_json::json!({
+            "candidate_index": 0,
+            "retry_index": 0,
+        });
+        let state = build_state_with_provider_config(None);
+        let plan = sample_plan();
+
+        let analysis = analyze_local_candidate_failover_sync(
+            &state,
+            &plan,
+            "openai_chat_sync",
+            Some(&local_report_context),
+            &result,
+            Some("provider returned HTTP 200 without visible model output"),
+        )
+        .await;
+
+        assert_eq!(
+            analysis.decision,
+            crate::orchestration::LocalFailoverDecision::StopLocalFailover
+        );
+        assert!(
+            !should_retry_next_local_candidate_sync(
+                &state,
+                &plan,
+                "openai_chat_sync",
+                Some(&local_report_context),
+                &result,
+                Some("provider returned HTTP 200 without visible model output"),
+            )
+            .await
+        );
+        assert!(
+            should_stop_local_candidate_failover_sync(
+                &state,
+                &plan,
+                "openai_chat_sync",
+                Some(&local_report_context),
+                &result,
+                Some("provider returned HTTP 200 without visible model output"),
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
     async fn sync_retry_next_candidate_skips_video_follow_up_plan_kinds() {
         let result = ExecutionResult {
             request_id: "req-1".to_string(),
@@ -753,6 +844,75 @@ mod tests {
                 Some("{\"error\":{\"message\":\"invalid auth token\"}}"),
             )
             .await
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_success_failover_does_not_retry_openai_image_success() {
+        let local_report_context = serde_json::json!({
+            "candidate_index": 0,
+            "retry_index": 0,
+        });
+        let state = build_state_with_provider_config(Some(serde_json::json!({
+            "failover_rules": {
+                "success_failover_patterns": [
+                    {"pattern": ".*"}
+                ]
+            }
+        })));
+        let mut plan = sample_plan();
+        plan.provider_api_format = "openai:image".to_string();
+
+        assert!(
+            !should_retry_next_local_candidate_stream(
+                &state,
+                &plan,
+                "openai_image_stream",
+                Some(&local_report_context),
+                200,
+                Some("{\"data\":[{\"b64_json\":\"aGVsbG8=\"}]}"),
+            )
+            .await,
+            "successful OpenAI image responses should not be retried by success failover rules"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_success_failover_does_not_retry_openai_image_success() {
+        let local_report_context = serde_json::json!({
+            "candidate_index": 0,
+            "retry_index": 0,
+        });
+        let state = build_state_with_provider_config(Some(serde_json::json!({
+            "failover_rules": {
+                "success_failover_patterns": [
+                    {"pattern": ".*"}
+                ]
+            }
+        })));
+        let mut plan = sample_plan();
+        plan.provider_api_format = "openai:image".to_string();
+        let result = ExecutionResult {
+            request_id: "req-1".to_string(),
+            candidate_id: None,
+            status_code: 200,
+            headers: Default::default(),
+            body: None,
+            telemetry: None,
+            error: None,
+        };
+
+        assert!(
+            !should_retry_next_local_candidate_sync(
+                &state,
+                &plan,
+                "openai_image_sync",
+                Some(&local_report_context),
+                &result,
+                Some("{\"data\":[{\"b64_json\":\"aGVsbG8=\"}]}")
+            )
+            .await,
+            "successful OpenAI image responses should not be retried by success failover rules"
         );
     }
 

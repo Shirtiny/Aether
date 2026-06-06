@@ -2,7 +2,7 @@ use crate::handlers::admin::provider::shared::payloads::AdminProviderKeyCreateRe
 use crate::handlers::admin::provider::write::normalize::{
     normalize_allow_auth_channel_mismatch_formats, normalize_api_format_json_object_keys,
     normalize_api_format_list, normalize_auth_type, normalize_auth_type_by_format,
-    validate_vertex_api_formats,
+    normalize_max_probe_interval_minutes, validate_vertex_api_formats,
 };
 use crate::handlers::admin::request::AdminAppState;
 use crate::handlers::admin::shared::{
@@ -181,7 +181,8 @@ pub(crate) async fn build_admin_create_provider_key_record(
     key.rpm_limit = payload.rpm_limit;
     key.concurrent_limit = normalize_optional_api_key_concurrent_limit(payload.concurrent_limit)?;
     key.cache_ttl_minutes = payload.cache_ttl_minutes.unwrap_or(5);
-    key.max_probe_interval_minutes = payload.max_probe_interval_minutes.unwrap_or(32);
+    key.max_probe_interval_minutes =
+        normalize_max_probe_interval_minutes(payload.max_probe_interval_minutes.unwrap_or(32))?;
     key.request_count = Some(0);
     key.success_count = Some(0);
     key.error_count = Some(0);

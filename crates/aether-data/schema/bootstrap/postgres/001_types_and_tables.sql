@@ -131,6 +131,7 @@ CREATE TABLE IF NOT EXISTS public.announcements (
     author_id character varying(36),
     is_active boolean DEFAULT true,
     is_pinned boolean DEFAULT false,
+    requires_ack boolean DEFAULT false NOT NULL,
     start_time timestamp with time zone,
     end_time timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
@@ -168,13 +169,14 @@ CREATE TABLE IF NOT EXISTS public.api_keys (
     name character varying(100),
     key_prefix character varying(64),
     status character varying(64) DEFAULT 'active'::character varying NOT NULL,
-    total_requests integer DEFAULT 0,
+    total_requests bigint DEFAULT 0,
     total_tokens bigint DEFAULT '0'::bigint NOT NULL,
     total_cost_usd numeric(20,8) DEFAULT '0'::double precision,
     is_standalone boolean DEFAULT false NOT NULL,
     allowed_providers json,
     allowed_api_formats json,
     allowed_models json,
+    ip_rules jsonb,
     rate_limit integer DEFAULT 100,
     concurrent_limit integer,
     force_capabilities json,
@@ -288,7 +290,7 @@ CREATE TABLE IF NOT EXISTS public.global_models (
     default_tiered_pricing json,
     supported_capabilities json,
     is_active boolean DEFAULT true NOT NULL,
-    usage_count integer DEFAULT 0 NOT NULL,
+    usage_count bigint DEFAULT 0 NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     config jsonb,
@@ -359,7 +361,7 @@ CREATE TABLE IF NOT EXISTS public.management_tokens (
     expires_at timestamp with time zone,
     last_used_at timestamp with time zone,
     last_used_ip character varying(45),
-    usage_count integer DEFAULT 0 NOT NULL,
+    usage_count bigint DEFAULT 0 NOT NULL,
     is_active boolean DEFAULT true NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
@@ -415,6 +417,7 @@ CREATE TABLE IF NOT EXISTS public.oauth_providers (
     frontend_callback_url character varying(500) NOT NULL,
     attribute_mapping json,
     extra_config json,
+    icon_url character varying(500),
     is_enabled boolean DEFAULT false NOT NULL,
     created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
     updated_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
@@ -585,10 +588,10 @@ CREATE TABLE IF NOT EXISTS public.provider_api_keys (
     last_probe_increase_at timestamp with time zone,
     cache_ttl_minutes integer DEFAULT 5 NOT NULL,
     max_probe_interval_minutes integer DEFAULT 32 NOT NULL,
-    request_count integer DEFAULT 0,
-    success_count integer DEFAULT 0,
-    error_count integer DEFAULT 0,
-    total_response_time_ms integer DEFAULT 0,
+    request_count bigint DEFAULT 0,
+    success_count bigint DEFAULT 0,
+    error_count bigint DEFAULT 0,
+    total_response_time_ms bigint DEFAULT 0,
     last_used_at timestamp with time zone,
     last_error_at timestamp with time zone,
     last_error_msg text,
@@ -856,7 +859,7 @@ CREATE TABLE IF NOT EXISTS public.refund_requests (
 
 CREATE TABLE IF NOT EXISTS public.request_candidates (
     id character varying(36) NOT NULL,
-    request_id character varying(100) NOT NULL,
+    request_id character varying(128) NOT NULL,
     user_id character varying(36),
     api_key_id character varying(36),
     candidate_index integer NOT NULL,
@@ -1264,6 +1267,39 @@ CREATE TABLE IF NOT EXISTS public.usage (
 
 
 --
+-- Name: usage_counter_deltas; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE IF NOT EXISTS public.usage_counter_deltas (
+    id character varying(36) NOT NULL,
+    request_id character varying(128) NOT NULL,
+    kind character varying(64) NOT NULL,
+    target_id text NOT NULL,
+    request_count_delta bigint DEFAULT 0 NOT NULL,
+    total_requests_delta bigint DEFAULT 0 NOT NULL,
+    success_count_delta bigint DEFAULT 0 NOT NULL,
+    error_count_delta bigint DEFAULT 0 NOT NULL,
+    dns_failures_delta bigint DEFAULT 0 NOT NULL,
+    stream_errors_delta bigint DEFAULT 0 NOT NULL,
+    total_tokens_delta bigint DEFAULT 0 NOT NULL,
+    total_cost_usd_delta double precision DEFAULT 0 NOT NULL,
+    total_response_time_ms_delta bigint DEFAULT 0 NOT NULL,
+    last_used_at_unix_secs bigint,
+    last_used_ip text,
+    candidate_last_used_at_unix_secs bigint,
+    removed_last_used_at_unix_secs bigint,
+    usage_created_at_unix_secs bigint,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    processed_at timestamp with time zone,
+    CONSTRAINT usage_counter_deltas_pkey PRIMARY KEY (id),
+    CONSTRAINT usage_counter_deltas_kind_check CHECK (
+        kind IN ('api_key', 'provider_api_key', 'model', 'provider_monthly', 'proxy_node', 'management_token', 'api_key_last_used')
+    )
+);
+
+
+
+--
 -- Name: user_model_usage_counts; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -1379,7 +1415,68 @@ CREATE TABLE IF NOT EXISTS public.users (
     email_verified boolean NOT NULL,
     rate_limit integer,
     rate_limit_mode text DEFAULT 'system'::text NOT NULL,
+    privacy_policy_accepted_version character varying(64),
+    privacy_policy_accepted_at timestamp with time zone,
     metadata json
+);
+
+
+
+--
+-- Name: user_invite_codes; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE IF NOT EXISTS public.user_invite_codes (
+    user_id character varying(64) NOT NULL,
+    invite_code character varying(64) NOT NULL,
+    active boolean DEFAULT true NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+
+--
+-- Name: user_referrals; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE IF NOT EXISTS public.user_referrals (
+    id character varying(64) NOT NULL,
+    inviter_user_id character varying(64) NOT NULL,
+    invitee_user_id character varying(64) NOT NULL,
+    invite_code_snapshot character varying(64) NOT NULL,
+    source_json jsonb,
+    first_paid_order_id character varying(64),
+    first_paid_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+
+--
+-- Name: referral_rewards; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE IF NOT EXISTS public.referral_rewards (
+    id character varying(64) NOT NULL,
+    referral_id character varying(64) NOT NULL,
+    inviter_user_id character varying(64) NOT NULL,
+    invitee_user_id character varying(64) NOT NULL,
+    reward_type character varying(32) NOT NULL,
+    trigger_point character varying(64) NOT NULL,
+    source_order_id character varying(64),
+    idempotency_key character varying(128) NOT NULL,
+    amount_usd numeric(20,8) NOT NULL,
+    status character varying(32) DEFAULT 'pending'::character varying NOT NULL,
+    wallet_transaction_id character varying(64),
+    reversed_amount_usd numeric(20,8) DEFAULT 0 NOT NULL,
+    pending_reversal_amount_usd numeric(20,8) DEFAULT 0 NOT NULL,
+    failure_reason text,
+    admin_operator_id character varying(64),
+    admin_note text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
 );
 
 

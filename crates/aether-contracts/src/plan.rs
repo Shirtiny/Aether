@@ -63,6 +63,7 @@ pub struct ProxySnapshot {
 
 pub const TRANSPORT_BACKEND_REQWEST_RUSTLS: &str = "reqwest_rustls";
 pub const TRANSPORT_BACKEND_HYPER_RUSTLS: &str = "hyper_rustls";
+pub const TRANSPORT_BACKEND_BROWSER_WREQ: &str = "browser_wreq";
 pub const TRANSPORT_HTTP_MODE_AUTO: &str = "auto";
 pub const TRANSPORT_HTTP_MODE_HTTP1_ONLY: &str = "http1_only";
 pub const TRANSPORT_POOL_SCOPE_KEY: &str = "key";

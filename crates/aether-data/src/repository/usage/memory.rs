@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::RwLock;
 
+use aether_ai_formats::UPSTREAM_IS_STREAM_KEY;
 use aether_data_contracts::repository::usage::{
     parse_usage_body_ref, usage_body_ref, StoredUsageAuditAggregation, StoredUsageAuditSummary,
     StoredUsageBreakdownSummaryRow, StoredUsageCacheAffinityHitSummary,
@@ -29,11 +30,12 @@ use serde_json::Value;
 use super::{
     api_key_usage_contribution, provider_api_key_usage_contribution,
     strip_deprecated_usage_display_fields, usage_can_recover_terminal_failure,
-    ApiKeyUsageContribution, ApiKeyUsageDelta, ProviderApiKeyUsageContribution,
-    ProviderApiKeyUsageDelta, ProviderApiKeyWindowUsageRequest, StoredProviderApiKeyUsageSummary,
-    StoredProviderApiKeyWindowUsageSummary, StoredProviderUsageSummary, StoredProviderUsageWindow,
-    StoredRequestUsageAudit, StoredUsageDailySummary, UpsertUsageRecord, UsageAuditListQuery,
-    UsageDailyHeatmapQuery, UsageReadRepository, UsageWriteRepository,
+    usage_request_metadata_client_family, ApiKeyUsageContribution, ApiKeyUsageDelta,
+    ProviderApiKeyUsageContribution, ProviderApiKeyUsageDelta, ProviderApiKeyWindowUsageRequest,
+    StoredProviderApiKeyUsageSummary, StoredProviderApiKeyWindowUsageSummary,
+    StoredProviderUsageSummary, StoredProviderUsageWindow, StoredRequestUsageAudit,
+    StoredUsageDailySummary, UpsertUsageRecord, UsageAuditListQuery, UsageDailyHeatmapQuery,
+    UsageReadRepository, UsageWriteRepository,
 };
 use crate::repository::auth::InMemoryAuthApiKeySnapshotRepository;
 use crate::repository::provider_catalog::InMemoryProviderCatalogReadRepository;
@@ -56,6 +58,7 @@ impl InMemoryUsageReadRepository {
         let mut by_request_id = BTreeMap::new();
         for mut item in items {
             hydrate_legacy_body_refs(&mut item);
+            hydrate_client_family(&mut item);
             by_request_id.insert(item.request_id.clone(), item);
         }
         Self {
@@ -75,6 +78,7 @@ impl InMemoryUsageReadRepository {
         let mut detached_bodies = BTreeMap::new();
         for mut item in items {
             hydrate_legacy_body_refs(&mut item);
+            hydrate_client_family(&mut item);
             let request_id = item.request_id.clone();
             if let Some(body_ref) = detach_usage_body(
                 &request_id,
@@ -155,6 +159,13 @@ fn usage_status_is_finalized(status: &str) -> bool {
 
 fn usage_status_is_lifecycle(status: &str) -> bool {
     matches!(status, "pending" | "streaming")
+}
+
+fn merge_usage_timing(existing: Option<u64>, incoming: Option<u64>) -> Option<u64> {
+    match incoming {
+        Some(0) | None => existing.or(incoming),
+        Some(value) => Some(value),
+    }
 }
 
 fn accumulate_provider_api_key_usage_contribution(
@@ -521,6 +532,11 @@ fn usage_matches_breakdown_summary_query(
     }
     if let Some(user_id) = query.user_id.as_deref() {
         if item.user_id.as_deref() != Some(user_id) {
+            return false;
+        }
+    }
+    if let Some(provider_name) = query.provider_name.as_deref() {
+        if item.provider_name != provider_name {
             return false;
         }
     }
@@ -949,7 +965,7 @@ fn usage_output_tps_uses_generation_time(item: &StoredRequestUsageAudit) -> bool
     item.request_metadata
         .as_ref()
         .and_then(Value::as_object)
-        .and_then(|metadata| metadata.get("upstream_is_stream"))
+        .and_then(|metadata| metadata.get(UPSTREAM_IS_STREAM_KEY))
         .and_then(Value::as_bool)
         .unwrap_or(item.is_stream)
 }
@@ -978,6 +994,30 @@ fn usage_provider_display_name(item: &StoredRequestUsageAudit) -> Option<String>
     } else {
         Some(provider_name.to_string())
     }
+}
+
+fn usage_provider_id(item: &StoredRequestUsageAudit) -> Option<String> {
+    let provider_id = item.provider_id.as_deref()?.trim();
+    if provider_id.is_empty() || usage_reserved_provider_label(provider_id) {
+        None
+    } else {
+        Some(provider_id.to_string())
+    }
+}
+
+fn usage_provider_aggregation_identity(
+    item: &StoredRequestUsageAudit,
+) -> Option<(String, Option<String>, String)> {
+    let display_name = usage_provider_display_name(item);
+    if let Some(provider_id) = usage_provider_id(item) {
+        return Some((provider_id, display_name, "provider_id".to_string()));
+    }
+    let display_name = display_name?;
+    Some((
+        display_name.clone(),
+        Some(display_name),
+        "legacy_name".to_string(),
+    ))
 }
 
 #[async_trait]
@@ -1164,14 +1204,14 @@ impl UsageReadRepository for InMemoryUsageReadRepository {
                 || item.created_at_unix_ms >= query.created_until_unix_secs
                 || matches!(item.status.as_str(), "pending" | "streaming")
                 || (query.exclude_reserved_provider_labels
-                    && usage_provider_display_name(item).is_none())
+                    && usage_provider_aggregation_identity(item).is_none())
             {
                 continue;
             }
 
-            let provider_display_name =
+            let provider_identity =
                 if matches!(query.group_by, UsageAuditAggregationGroupBy::Provider) {
-                    match usage_provider_display_name(item) {
+                    match usage_provider_aggregation_identity(item) {
                         Some(value) => Some(value),
                         None => continue,
                     }
@@ -1181,19 +1221,11 @@ impl UsageReadRepository for InMemoryUsageReadRepository {
 
             let group_key = match query.group_by {
                 UsageAuditAggregationGroupBy::Model => item.model.clone(),
-                UsageAuditAggregationGroupBy::Provider => {
-                    let display_name = provider_display_name
-                        .as_deref()
-                        .expect("provider display name is set for provider aggregation");
-                    item.provider_id
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|provider_id| {
-                            !provider_id.is_empty() && !usage_reserved_provider_label(provider_id)
-                        })
-                        .unwrap_or(display_name)
-                        .to_string()
-                }
+                UsageAuditAggregationGroupBy::Provider => provider_identity
+                    .as_ref()
+                    .expect("provider identity is set for provider aggregation")
+                    .0
+                    .clone(),
                 UsageAuditAggregationGroupBy::ApiFormat => item
                     .api_format
                     .clone()
@@ -1208,7 +1240,17 @@ impl UsageReadRepository for InMemoryUsageReadRepository {
                 && (bucket.display_name.is_none()
                     || bucket.display_name.as_deref() == Some("Unknown"))
             {
-                bucket.display_name = provider_display_name;
+                bucket.display_name = provider_identity
+                    .as_ref()
+                    .and_then(|(_, display_name, _)| display_name.clone());
+            }
+            if matches!(query.group_by, UsageAuditAggregationGroupBy::Provider)
+                && (bucket.secondary_name.is_none()
+                    || bucket.secondary_name.as_deref() == Some("legacy_name"))
+            {
+                bucket.secondary_name = provider_identity
+                    .as_ref()
+                    .map(|(_, _, identity_source)| identity_source.clone());
             }
             bucket.request_count = bucket.request_count.saturating_add(1);
             bucket.total_tokens = bucket.total_tokens.saturating_add(item.total_tokens);
@@ -1378,6 +1420,11 @@ impl UsageReadRepository for InMemoryUsageReadRepository {
             }
             if let Some(user_id) = query.user_id.as_deref() {
                 if item.user_id.as_deref() != Some(user_id) {
+                    continue;
+                }
+            }
+            if let Some(api_key_id) = query.api_key_id.as_deref() {
+                if item.api_key_id.as_deref() != Some(api_key_id) {
                     continue;
                 }
             }
@@ -2546,6 +2593,13 @@ fn hydrate_legacy_body_refs(item: &mut StoredRequestUsageAudit) {
     }
 }
 
+fn hydrate_client_family(item: &mut StoredRequestUsageAudit) {
+    if item.client_family.is_none() {
+        item.client_family = usage_request_metadata_client_family(item.request_metadata.as_ref())
+            .map(ToOwned::to_owned);
+    }
+}
+
 fn persisted_usage_body_ref(
     incoming_ref: Option<&str>,
     incoming_body: Option<&Value>,
@@ -2739,8 +2793,18 @@ impl UsageWriteRepository for InMemoryUsageReadRepository {
             status_code: usage.status_code,
             error_message: usage.error_message,
             error_category: usage.error_category,
-            response_time_ms: usage.response_time_ms,
-            first_byte_time_ms: usage.first_byte_time_ms,
+            response_time_ms: merge_usage_timing(
+                existing
+                    .as_ref()
+                    .and_then(|existing| existing.response_time_ms),
+                usage.response_time_ms,
+            ),
+            first_byte_time_ms: merge_usage_timing(
+                existing
+                    .as_ref()
+                    .and_then(|existing| existing.first_byte_time_ms),
+                usage.first_byte_time_ms,
+            ),
             status: usage.status,
             billing_status: usage.billing_status,
             request_headers: usage.request_headers.or_else(|| {
@@ -2851,6 +2915,13 @@ impl UsageWriteRepository for InMemoryUsageReadRepository {
                     })
                 },
             ),
+            client_family: usage_request_metadata_client_family(request_metadata.as_ref())
+                .map(ToOwned::to_owned)
+                .or_else(|| {
+                    existing
+                        .as_ref()
+                        .and_then(|existing| existing.client_family.clone())
+                }),
             request_metadata,
             created_at_unix_ms,
             updated_at_unix_secs: usage.updated_at_unix_secs,
@@ -3132,6 +3203,12 @@ mod tests {
 
     #[tokio::test]
     async fn provider_aggregation_skips_unknown_provider_labels() {
+        let valid_provider = sample_usage("req-valid-provider", 300);
+
+        let mut legacy_provider = sample_usage("req-legacy-provider", 250);
+        legacy_provider.provider_id = None;
+        legacy_provider.provider_name = "Legacy Provider".to_string();
+
         let mut unknown = sample_usage("req-unknown-provider", 100);
         unknown.provider_id = None;
         unknown.provider_name = "unknown".to_string();
@@ -3141,7 +3218,8 @@ mod tests {
         typo_unknown.provider_name = "unknow".to_string();
 
         let repository = InMemoryUsageReadRepository::seed(vec![
-            sample_usage("req-valid-provider", 300),
+            valid_provider,
+            legacy_provider,
             unknown,
             typo_unknown,
         ]);
@@ -3157,9 +3235,29 @@ mod tests {
             .await
             .expect("aggregation should succeed");
 
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].group_key, "provider-1");
-        assert_eq!(rows[0].display_name.as_deref(), Some("OpenAI"));
+        assert_eq!(rows.len(), 2);
+        let provider_id_row = rows
+            .iter()
+            .find(|row| row.group_key == "provider-1")
+            .expect("provider_id row should be present");
+        assert_eq!(provider_id_row.display_name.as_deref(), Some("OpenAI"));
+        assert_eq!(
+            provider_id_row.secondary_name.as_deref(),
+            Some("provider_id")
+        );
+
+        let legacy_name_row = rows
+            .iter()
+            .find(|row| row.group_key == "Legacy Provider")
+            .expect("legacy provider name row should be present");
+        assert_eq!(
+            legacy_name_row.display_name.as_deref(),
+            Some("Legacy Provider")
+        );
+        assert_eq!(
+            legacy_name_row.secondary_name.as_deref(),
+            Some("legacy_name")
+        );
     }
 
     #[tokio::test]
@@ -3176,11 +3274,15 @@ mod tests {
         pending_provider.provider_id = None;
         pending_provider.provider_name = "pending".to_string();
 
+        let mut id_only_provider = sample_usage("req-id-only-provider", 350);
+        id_only_provider.provider_name = "unknown".to_string();
+
         let repository = InMemoryUsageReadRepository::seed(vec![
             sample_usage("req-valid-provider", 400),
             unknown,
             typo_unknown,
             pending_provider,
+            id_only_provider,
         ]);
 
         let model_rows = repository
@@ -3195,7 +3297,7 @@ mod tests {
             .expect("model aggregation should succeed");
         assert_eq!(model_rows.len(), 1);
         assert_eq!(model_rows[0].group_key, "gpt-4.1");
-        assert_eq!(model_rows[0].request_count, 1);
+        assert_eq!(model_rows[0].request_count, 2);
 
         let api_format_rows = repository
             .aggregate_usage_audits(&UsageAuditAggregationQuery {
@@ -3209,7 +3311,7 @@ mod tests {
             .expect("api format aggregation should succeed");
         assert_eq!(api_format_rows.len(), 1);
         assert_eq!(api_format_rows[0].group_key, "openai:chat");
-        assert_eq!(api_format_rows[0].request_count, 1);
+        assert_eq!(api_format_rows[0].request_count, 2);
     }
 
     #[tokio::test]
@@ -3741,6 +3843,39 @@ mod tests {
         assert_eq!(stored.response_time_ms, Some(45));
         assert_eq!(stored.target_model.as_deref(), Some("gpt-5-upstream"));
         assert_eq!(stored.total_tokens, 12);
+    }
+
+    #[tokio::test]
+    async fn streaming_refresh_without_timing_does_not_clear_stream_timing() {
+        let repository = InMemoryUsageReadRepository::default();
+        let mut first = sample_upsert_usage_record("req-streaming-refresh");
+        first.is_stream = Some(true);
+        first.status = "streaming".to_string();
+        first.status_code = Some(200);
+        first.response_time_ms = Some(45);
+        first.first_byte_time_ms = Some(12);
+        repository
+            .upsert(first)
+            .await
+            .expect("streaming usage should upsert");
+
+        let mut refresh = sample_upsert_usage_record("req-streaming-refresh");
+        refresh.is_stream = Some(true);
+        refresh.status = "streaming".to_string();
+        refresh.status_code = Some(200);
+        repository
+            .upsert(refresh)
+            .await
+            .expect("streaming refresh should upsert");
+
+        let stored = repository
+            .find_by_request_id("req-streaming-refresh")
+            .await
+            .expect("usage lookup should succeed")
+            .expect("usage should exist");
+        assert_eq!(stored.status, "streaming");
+        assert_eq!(stored.response_time_ms, Some(45));
+        assert_eq!(stored.first_byte_time_ms, Some(12));
     }
 
     #[tokio::test]
@@ -4399,6 +4534,7 @@ mod tests {
             provider_endpoint_kind: Some("chat".to_string()),
             has_format_conversion: false,
             is_stream: false,
+            client_family: None,
             input_tokens: 10,
             output_tokens: 20,
             total_tokens: 30,

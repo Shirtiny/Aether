@@ -25,6 +25,7 @@ pub(crate) fn models_api_format(request_context: &GatewayPublicRequestContext) -
         "jina:embedding" => Some("jina:embedding"),
         "jina:rerank" => Some("jina:rerank"),
         "doubao:embedding" => Some("doubao:embedding"),
+        "aliyun:multimodal_embedding" => Some("aliyun:multimodal_embedding"),
         _ => None,
     }
 }
@@ -43,6 +44,7 @@ const MODELS_EMBEDDING_QUERY_API_FORMATS: &[&str] = &[
     "jina:embedding",
     "gemini:embedding",
     "doubao:embedding",
+    "aliyun:multimodal_embedding",
 ];
 const MODELS_RERANK_QUERY_API_FORMATS: &[&str] = &["openai:rerank", "jina:rerank"];
 
@@ -54,9 +56,11 @@ pub(super) fn models_query_api_formats(api_format: &str) -> &'static [&'static s
         | "claude:messages"
         | "gemini:generate_content" => MODELS_CROSS_FORMAT_QUERY_API_FORMATS,
         "openai:image" => &["openai:image"],
-        "openai:embedding" | "jina:embedding" | "gemini:embedding" | "doubao:embedding" => {
-            MODELS_EMBEDDING_QUERY_API_FORMATS
-        }
+        "openai:embedding"
+        | "jina:embedding"
+        | "gemini:embedding"
+        | "doubao:embedding"
+        | "aliyun:multimodal_embedding" => MODELS_EMBEDDING_QUERY_API_FORMATS,
         "openai:rerank" | "jina:rerank" => MODELS_RERANK_QUERY_API_FORMATS,
         _ => &[],
     }

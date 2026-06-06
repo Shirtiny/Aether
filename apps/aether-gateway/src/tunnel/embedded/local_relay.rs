@@ -24,6 +24,8 @@ use super::AppState;
 
 pub const TUNNEL_ERROR_HEADER: &str = "x-aether-tunnel-error";
 const MAX_RELAY_META_LEN: usize = 256 * 1024;
+const MIN_RELAY_TIMEOUT_MS: u64 = 1;
+const MAX_RELAY_TIMEOUT_MS: u64 = 300_000;
 
 struct StreamGuard {
     hub: std::sync::Arc<super::hub::HubRouter>,
@@ -86,13 +88,18 @@ pub(crate) async fn open_direct_relay_stream(
     let stream = state
         .hub
         .open_local_stream(node_id, &meta)
+        .await
         .map_err(|error| format!("connect: {error}"))?;
-    if let Err(error) = state.hub.push_local_request_body(stream.id, body, true) {
+    if let Err(error) = state
+        .hub
+        .push_local_request_body(stream.id, body, true)
+        .await
+    {
         state.hub.cancel_local_stream(stream.id, &error);
         return Err(format!("connect: {error}"));
     }
 
-    let wait_timeout = Duration::from_secs(meta.timeout.clamp(5, 300));
+    let wait_timeout = relay_header_timeout(&meta);
     let response_head = match stream.wait_headers(wait_timeout).await {
         Ok(response) => response,
         Err(error) => {
@@ -146,6 +153,18 @@ fn map_request_admission_error(error: super::RequestAdmissionError) -> String {
             aether_runtime_state::RuntimeSemaphoreError::InvalidConfiguration(_),
         ) => "overloaded: hub relay distributed gate invalid".to_string(),
     }
+}
+
+fn relay_header_timeout(meta: &protocol::RequestMeta) -> Duration {
+    let timeout_ms = if meta.stream {
+        meta.stream_first_byte_timeout_ms
+            .unwrap_or_else(|| meta.timeout.saturating_mul(1_000))
+    } else {
+        meta.request_timeout_ms
+            .or(meta.stream_first_byte_timeout_ms)
+            .unwrap_or_else(|| meta.timeout.saturating_mul(1_000))
+    };
+    Duration::from_millis(timeout_ms.clamp(MIN_RELAY_TIMEOUT_MS, MAX_RELAY_TIMEOUT_MS))
 }
 
 pub async fn relay_request(
@@ -245,7 +264,7 @@ pub async fn relay_request(
                 continue;
             };
 
-            let opened_stream = match state.hub.open_local_stream(&node_id, &parsed_meta) {
+            let opened_stream = match state.hub.open_local_stream(&node_id, &parsed_meta).await {
                 Ok(stream) => stream,
                 Err(error) => {
                     return release_permit_response(
@@ -257,10 +276,10 @@ pub async fn relay_request(
 
             if envelope_buf.len() > body_offset {
                 let first_body_chunk = Bytes::copy_from_slice(&envelope_buf[body_offset..]);
-                if let Err(error) =
-                    state
-                        .hub
-                        .push_local_request_body(opened_stream.id, first_body_chunk, false)
+                if let Err(error) = state
+                    .hub
+                    .push_local_request_body(opened_stream.id, first_body_chunk, false)
+                    .await
                 {
                     state.hub.cancel_local_stream(opened_stream.id, &error);
                     return release_permit_response(
@@ -282,6 +301,7 @@ pub async fn relay_request(
         if let Err(error) = state
             .hub
             .push_local_request_body(active_stream.id, chunk, false)
+            .await
         {
             state.hub.cancel_local_stream(active_stream.id, &error);
             return release_permit_response(
@@ -308,6 +328,7 @@ pub async fn relay_request(
     if let Err(error) = state
         .hub
         .push_local_request_body(stream.id, Bytes::new(), true)
+        .await
     {
         state.hub.cancel_local_stream(stream.id, &error);
         return release_permit_response(
@@ -322,7 +343,7 @@ pub async fn relay_request(
         finished: false,
     };
 
-    let wait_timeout = Duration::from_secs(meta.timeout.clamp(5, 300));
+    let wait_timeout = relay_header_timeout(&meta);
     let response_head = match stream.wait_headers(wait_timeout).await {
         Ok(response) => response,
         Err(error) => {
@@ -467,7 +488,10 @@ fn tunnel_error_response(status: StatusCode, kind: &str, message: &str) -> Respo
 mod tests {
     use super::super::hub::ProxyConn;
     use super::super::{protocol, AppState, ConnConfig, ControlPlaneClient};
-    use super::{relay_request, Body, Request, SocketAddr, StatusCode, TUNNEL_ERROR_HEADER};
+    use super::{
+        relay_header_timeout, relay_request, Body, Request, SocketAddr, StatusCode,
+        TUNNEL_ERROR_HEADER,
+    };
     use crate::data::GatewayDataState;
     use crate::maintenance::start_proxy_upgrade_rollout;
     use aether_contracts::tunnel::TUNNEL_RELAY_FORWARDED_BY_HEADER;
@@ -495,6 +519,27 @@ mod tests {
             },
             128,
         )
+    }
+
+    #[test]
+    fn relay_header_timeout_ignores_request_timeout_for_stream_requests() {
+        let meta = protocol::RequestMeta {
+            provider_id: None,
+            endpoint_id: None,
+            key_id: None,
+            method: "GET".to_string(),
+            url: "https://example.com/stream".to_string(),
+            headers: HashMap::new(),
+            stream: true,
+            request_timeout_ms: Some(90_000),
+            stream_first_byte_timeout_ms: None,
+            timeout: 7,
+            follow_redirects: None,
+            http1_only: false,
+            transport_profile: None,
+        };
+
+        assert_eq!(relay_header_timeout(&meta), Duration::from_secs(7));
     }
 
     fn sample_connected_proxy_node(node_id: &str) -> StoredProxyNode {
@@ -629,6 +674,7 @@ mod tests {
             proxy_tx,
             proxy_close_tx,
             16,
+            2,
         )));
 
         let meta = protocol::RequestMeta {
@@ -638,6 +684,9 @@ mod tests {
             method: "GET".to_string(),
             url: "https://example.com/health".to_string(),
             headers: HashMap::new(),
+            stream: false,
+            request_timeout_ms: None,
+            stream_first_byte_timeout_ms: None,
             timeout: 30,
             follow_redirects: None,
             http1_only: false,
@@ -743,6 +792,7 @@ mod tests {
             proxy_tx,
             proxy_close_tx,
             16,
+            2,
         )));
 
         let meta = protocol::RequestMeta {
@@ -752,6 +802,9 @@ mod tests {
             method: "GET".to_string(),
             url: "https://example.com/headers".to_string(),
             headers: HashMap::new(),
+            stream: false,
+            request_timeout_ms: None,
+            stream_first_byte_timeout_ms: None,
             timeout: 30,
             follow_redirects: None,
             http1_only: false,

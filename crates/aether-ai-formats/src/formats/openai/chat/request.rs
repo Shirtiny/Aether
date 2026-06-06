@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 use crate::{
     formats::context::FormatContext,
@@ -194,6 +194,7 @@ pub fn to_raw(canonical: &CanonicalRequest) -> Value {
                     .and_then(|value| value.get("effort"))
                     .and_then(Value::as_str)
             })
+            .and_then(openai_chat_reasoning_effort)
         {
             output.insert(
                 "reasoning_effort".to_string(),
@@ -206,17 +207,42 @@ pub fn to_raw(canonical: &CanonicalRequest) -> Value {
         "openai",
         &output,
     ));
-    output.extend(namespace_extension_object(
+    output.extend(chat_compatible_openai_responses_extension_object(
         &canonical.extensions,
         OPENAI_RESPONSES_EXTENSION_NAMESPACE,
         &output,
     ));
-    output.extend(namespace_extension_object(
+    output.extend(chat_compatible_openai_responses_extension_object(
         &canonical.extensions,
         OPENAI_RESPONSES_LEGACY_EXTENSION_NAMESPACE,
         &output,
     ));
     Value::Object(output)
+}
+
+fn openai_chat_reasoning_effort(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "low" => Some("low"),
+        "medium" => Some("medium"),
+        "high" | "xhigh" | "max" => Some("high"),
+        _ => None,
+    }
+}
+
+fn chat_compatible_openai_responses_extension_object(
+    extensions: &std::collections::BTreeMap<String, Value>,
+    namespace: &str,
+    existing: &Map<String, Value>,
+) -> Map<String, Value> {
+    namespace_extension_object(extensions, namespace, existing)
+        .into_iter()
+        .filter(|(key, _)| {
+            matches!(
+                key.as_str(),
+                "verbosity" | "service_tier" | "prompt_cache_key" | "safety_identifier" | "user"
+            )
+        })
+        .collect()
 }
 
 fn force_stream_options(body: &mut Value, upstream_is_stream: bool) {

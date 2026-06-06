@@ -18,9 +18,20 @@ export interface PricingTier {
   cache_ttl_pricing?: CacheTTLPricing[]
 }
 
+export type ImageOutputQuality = 'low' | 'medium' | 'high'
+
+export interface ImageOutputPriceRange {
+  up_to_pixels: number | null
+  prices: Partial<Record<ImageOutputQuality, number>>
+  label?: string | null
+}
+
 /** 阶梯计费配置 */
 export interface TieredPricingConfig {
   tiers: PricingTier[]
+  image_output_prices?: Record<string, Record<string, number>> | null
+  image_output_price_default?: number | null
+  image_output_price_ranges?: ImageOutputPriceRange[] | null
 }
 
 export interface Model {
@@ -59,6 +70,7 @@ export interface Model {
   global_model_display_name?: string
   // 有效配置（合并 Model 和 GlobalModel 的 config）
   effective_config?: Record<string, unknown> | null
+  model_test_capabilities?: ModelTestCapabilities | null
 }
 
 export interface ModelCreate {
@@ -100,6 +112,17 @@ export interface ModelCapabilities {
   supports_streaming: boolean
   supports_embedding: boolean
   [key: string]: boolean
+}
+
+export interface OpenAiImageModelTestCapability {
+  max_generation_count?: number | null
+  supports_generation?: boolean | null
+  supports_edit?: boolean | null
+}
+
+export interface ModelTestCapabilities {
+  'openai:image'?: OpenAiImageModelTestCapability | null
+  [apiFormat: string]: OpenAiImageModelTestCapability | Record<string, unknown> | null | undefined
 }
 
 export interface ProviderModelPriceInfo {
@@ -248,6 +271,7 @@ export interface UpstreamModel {
   owned_by?: string
   display_name?: string
   api_formats: string[]  // 该模型支持的所有 API 格式（后端保证返回数组）
+  model_test_capabilities?: ModelTestCapabilities | null
 }
 
 /**

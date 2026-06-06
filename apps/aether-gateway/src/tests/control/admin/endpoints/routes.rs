@@ -149,6 +149,277 @@ async fn gateway_handles_admin_provider_endpoints_locally_with_trusted_admin_pri
 }
 
 #[tokio::test]
+async fn gateway_counts_fixed_provider_oauth_keys_for_inherited_endpoint_formats() {
+    let mut codex_provider = sample_provider("provider-codex", "codex", 10);
+    codex_provider.provider_type = "codex".to_string();
+    let mut chatgpt_web_provider = sample_provider("provider-chatgpt-web", "chatgpt_web", 20);
+    chatgpt_web_provider.provider_type = "chatgpt_web".to_string();
+
+    let mut codex_key = sample_key(
+        "key-codex-oauth",
+        "provider-codex",
+        "openai:responses:compact",
+        "oauth-token",
+    );
+    codex_key.auth_type = "oauth".to_string();
+    codex_key.api_formats = Some(json!(["legacy:mismatch"]));
+
+    let mut chatgpt_web_key = sample_key(
+        "key-chatgpt-web-oauth",
+        "provider-chatgpt-web",
+        "openai:image",
+        "oauth-token",
+    );
+    chatgpt_web_key.auth_type = "oauth".to_string();
+    chatgpt_web_key.api_formats = Some(json!(["legacy:mismatch"]));
+
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![codex_provider, chatgpt_web_provider],
+        vec![
+            sample_endpoint(
+                "endpoint-codex-compact",
+                "provider-codex",
+                "openai:responses:compact",
+                "https://chatgpt.com/backend-api/codex",
+            ),
+            sample_endpoint(
+                "endpoint-codex-image",
+                "provider-codex",
+                "openai:image",
+                "https://chatgpt.com/backend-api/codex",
+            ),
+            sample_endpoint(
+                "endpoint-chatgpt-web-image",
+                "provider-chatgpt-web",
+                "openai:image",
+                "https://chatgpt.com",
+            ),
+        ],
+        vec![codex_key, chatgpt_web_key],
+    ));
+
+    let gateway = build_router_with_state(
+        AppState::new()
+            .expect("gateway should build")
+            .with_data_state_for_tests(GatewayDataState::with_provider_catalog_reader_for_tests(
+                provider_catalog_repository,
+            )),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let client = reqwest::Client::new();
+    let codex_response = client
+        .get(format!(
+            "{gateway_url}/api/admin/endpoints/providers/provider-codex/endpoints?skip=0&limit=50"
+        ))
+        .header(GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .send()
+        .await
+        .expect("request should succeed");
+    assert_eq!(codex_response.status(), StatusCode::OK);
+    let codex_payload: serde_json::Value = codex_response.json().await.expect("json should parse");
+    let codex_items = codex_payload
+        .as_array()
+        .expect("payload should be an array");
+    for api_format in ["openai:responses:compact", "openai:image"] {
+        let endpoint = codex_items
+            .iter()
+            .find(|item| item["api_format"] == api_format)
+            .expect("endpoint should exist");
+        assert_eq!(endpoint["total_keys"], 1);
+        assert_eq!(endpoint["active_keys"], 1);
+    }
+
+    let chatgpt_web_response = client
+        .get(format!(
+            "{gateway_url}/api/admin/endpoints/providers/provider-chatgpt-web/endpoints?skip=0&limit=50"
+        ))
+        .header(GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .send()
+        .await
+        .expect("request should succeed");
+    assert_eq!(chatgpt_web_response.status(), StatusCode::OK);
+    let chatgpt_web_payload: serde_json::Value = chatgpt_web_response
+        .json()
+        .await
+        .expect("json should parse");
+    let chatgpt_web_items = chatgpt_web_payload
+        .as_array()
+        .expect("payload should be an array");
+    let chatgpt_web_image = chatgpt_web_items
+        .iter()
+        .find(|item| item["api_format"] == "openai:image")
+        .expect("image endpoint should exist");
+    assert_eq!(chatgpt_web_image["total_keys"], 1);
+    assert_eq!(chatgpt_web_image["active_keys"], 1);
+
+    gateway_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_counts_keys_with_null_api_formats_for_each_fixed_provider_endpoint() {
+    let upstream_hits = Arc::new(Mutex::new(0usize));
+    let upstream_hits_clone = Arc::clone(&upstream_hits);
+    let upstream = Router::new().route(
+        "/api/admin/endpoints/providers/provider-codex/endpoints",
+        any(move |_request: Request| {
+            let upstream_hits_inner = Arc::clone(&upstream_hits_clone);
+            async move {
+                *upstream_hits_inner.lock().expect("mutex should lock") += 1;
+                (StatusCode::OK, Body::from("unexpected upstream hit"))
+            }
+        }),
+    );
+
+    let mut inherited_key = sample_key(
+        "key-codex-oauth",
+        "provider-codex",
+        "openai:responses",
+        "codex-token",
+    );
+    inherited_key.auth_type = "oauth".to_string();
+    inherited_key.api_formats = None;
+
+    let mut provider = sample_provider("provider-codex", "codex", 10);
+    provider.provider_type = "codex".to_string();
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        vec![
+            sample_endpoint(
+                "endpoint-codex-responses",
+                "provider-codex",
+                "openai:responses",
+                "https://chatgpt.com/backend-api/codex",
+            )
+            .with_timestamps(Some(1_711_000_000), Some(1_711_000_100)),
+            sample_endpoint(
+                "endpoint-codex-image",
+                "provider-codex",
+                "openai:image",
+                "https://chatgpt.com/backend-api/codex",
+            )
+            .with_timestamps(Some(1_710_000_000), Some(1_710_000_100)),
+        ],
+        vec![inherited_key],
+    ));
+
+    let (_, upstream_handle) = start_server(upstream).await;
+    let gateway = build_router_with_state(
+        AppState::new()
+            .expect("gateway should build")
+            .with_data_state_for_tests(GatewayDataState::with_provider_catalog_reader_for_tests(
+                provider_catalog_repository,
+            )),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = reqwest::Client::new()
+        .get(format!(
+            "{gateway_url}/api/admin/endpoints/providers/provider-codex/endpoints?skip=0&limit=50"
+        ))
+        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    let items = payload.as_array().expect("payload should be an array");
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0]["api_format"], "openai:responses");
+    assert_eq!(items[0]["total_keys"], 1);
+    assert_eq!(items[0]["active_keys"], 1);
+    assert_eq!(items[1]["api_format"], "openai:image");
+    assert_eq!(items[1]["total_keys"], 1);
+    assert_eq!(items[1]["active_keys"], 1);
+    assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
+
+    gateway_handle.abort();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_counts_inherited_windsurf_key_formats_for_admin_provider_endpoints() {
+    let upstream_hits = Arc::new(Mutex::new(0usize));
+    let upstream_hits_clone = Arc::clone(&upstream_hits);
+    let upstream = Router::new().route(
+        "/api/admin/endpoints/providers/provider-windsurf/endpoints",
+        any(move |_request: Request| {
+            let upstream_hits_inner = Arc::clone(&upstream_hits_clone);
+            async move {
+                *upstream_hits_inner.lock().expect("mutex should lock") += 1;
+                (StatusCode::OK, Body::from("unexpected upstream hit"))
+            }
+        }),
+    );
+
+    let mut key = sample_key(
+        "key-windsurf-a",
+        "provider-windsurf",
+        "openai:chat",
+        "oauth-secret",
+    );
+    key.auth_type = "oauth".to_string();
+    key.api_formats = None;
+
+    let mut provider = sample_provider("provider-windsurf", "windsurf", 10);
+    provider.provider_type = "windsurf".to_string();
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        vec![sample_endpoint(
+            "endpoint-windsurf-chat",
+            "provider-windsurf",
+            "openai:chat",
+            "https://server.codeium.com",
+        )],
+        vec![key],
+    ));
+
+    let (_, upstream_handle) = start_server(upstream).await;
+    let gateway = build_router_with_state(
+        AppState::new()
+            .expect("gateway should build")
+            .with_data_state_for_tests(GatewayDataState::with_provider_catalog_reader_for_tests(
+                provider_catalog_repository,
+            )),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = reqwest::Client::new()
+        .get(format!(
+            "{gateway_url}/api/admin/endpoints/providers/provider-windsurf/endpoints?skip=0&limit=50"
+        ))
+        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    let items = payload.as_array().expect("payload should be an array");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["id"], "endpoint-windsurf-chat");
+    assert_eq!(items[0]["total_keys"], 1);
+    assert_eq!(items[0]["active_keys"], 1);
+    assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
+
+    gateway_handle.abort();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
 async fn gateway_returns_service_unavailable_for_admin_provider_endpoint_create_when_catalog_writer_unavailable(
 ) {
     let upstream_hits = Arc::new(Mutex::new(0usize));

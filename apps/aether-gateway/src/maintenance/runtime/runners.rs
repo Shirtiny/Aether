@@ -1,5 +1,6 @@
 use aether_data_contracts::DataLayerError;
 use serde_json::json;
+use std::sync::Arc;
 use std::time::Instant;
 use tracing::{info, warn};
 
@@ -11,11 +12,12 @@ use super::{
     cleanup_expired_gemini_file_mappings_once, cleanup_proxy_node_metrics_once,
     cleanup_request_candidates_once, cleanup_stale_pending_requests_once,
     cleanup_stale_proxy_nodes_once, collect_proxy_upgrade_rollout_probes, now_unix_secs,
-    perform_db_maintenance_once, perform_provider_checkin_once, perform_stats_aggregation_once,
-    perform_stats_hourly_aggregation_once, perform_usage_cleanup_once,
-    perform_usage_cleanup_once_with_override, perform_wallet_daily_usage_aggregation_once,
-    record_completed_cleanup_run, record_failed_cleanup_run, record_proxy_upgrade_traffic_success,
-    summarize_database_pool,
+    perform_db_maintenance_once, perform_manual_usage_cleanup_once, perform_provider_checkin_once,
+    perform_stats_aggregation_once, perform_stats_hourly_aggregation_once,
+    perform_usage_cleanup_once, perform_wallet_daily_usage_aggregation_once,
+    record_admin_cleanup_run, record_completed_cleanup_run, record_failed_cleanup_run,
+    record_proxy_upgrade_traffic_success, summarize_database_pool, AdminCleanupRunRecord,
+    ManualUsageCleanupOptions,
 };
 
 pub(super) async fn run_audit_cleanup_once(data: &GatewayDataState) -> Result<(), DataLayerError> {
@@ -299,15 +301,14 @@ pub(super) async fn run_usage_cleanup_once(data: &GatewayDataState) -> Result<()
     Ok(())
 }
 
-pub(crate) async fn run_manual_usage_cleanup_once(
-    data: &GatewayDataState,
-    override_older_than_days: Option<u32>,
+pub(crate) async fn start_manual_usage_cleanup_task(
+    data: Arc<GatewayDataState>,
+    options: ManualUsageCleanupOptions,
     actor_user_id: Option<String>,
-) -> Result<aether_data_contracts::repository::usage::UsageCleanupSummary, ManualUsageCleanupError>
-{
+) -> Result<AdminCleanupRunRecord, ManualUsageCleanupError> {
     use super::{list_admin_cleanup_run_records, USAGE_CLEANUP_KIND};
 
-    let existing = list_admin_cleanup_run_records(data)
+    let existing = list_admin_cleanup_run_records(&data)
         .await
         .map_err(ManualUsageCleanupError::DataLayer)?;
     if existing
@@ -318,10 +319,42 @@ pub(crate) async fn run_manual_usage_cleanup_once(
     }
 
     let started_at_unix_secs = now_unix_secs();
+    let record = AdminCleanupRunRecord {
+        id: uuid::Uuid::new_v4().to_string(),
+        kind: USAGE_CLEANUP_KIND.to_string(),
+        trigger: "manual".to_string(),
+        status: "processing".to_string(),
+        message: manual_usage_cleanup_start_message(options),
+        started_at_unix_secs,
+        completed_at_unix_secs: None,
+        duration_ms: None,
+        summary: manual_usage_cleanup_progress_summary(options, 0, None, actor_user_id.as_deref()),
+        error: None,
+    };
+    record_admin_cleanup_run(&data, record.clone())
+        .await
+        .map_err(ManualUsageCleanupError::DataLayer)?;
+
+    tokio::spawn(run_manual_usage_cleanup_task(
+        data,
+        record.clone(),
+        options,
+        actor_user_id,
+    ));
+    Ok(record)
+}
+
+pub(crate) async fn run_manual_usage_cleanup_once(
+    data: &GatewayDataState,
+    options: ManualUsageCleanupOptions,
+    actor_user_id: Option<String>,
+) -> Result<aether_data_contracts::repository::usage::UsageCleanupSummary, ManualUsageCleanupError>
+{
+    use super::USAGE_CLEANUP_KIND;
+
     let started_at = Instant::now();
-    let override_duration =
-        override_older_than_days.map(|days| chrono::Duration::days(i64::from(days)));
-    let summary = match perform_usage_cleanup_once_with_override(data, override_duration).await {
+    let started_at_unix_secs = now_unix_secs();
+    let summary = match perform_manual_usage_cleanup_once(data, options).await {
         Ok(summary) => summary,
         Err(err) => {
             record_failed_cleanup_run(
@@ -336,17 +369,8 @@ pub(crate) async fn run_manual_usage_cleanup_once(
             return Err(ManualUsageCleanupError::DataLayer(err));
         }
     };
-    let total = summary
-        .body_externalized
-        .saturating_add(summary.legacy_body_refs_migrated)
-        .saturating_add(summary.body_cleaned)
-        .saturating_add(summary.header_cleaned)
-        .saturating_add(summary.keys_cleaned)
-        .saturating_add(summary.records_deleted);
-    let message = match override_older_than_days {
-        Some(days) => format!("请求记录手动清理完成，清理 {days} 天前的记录，影响 {total} 项"),
-        None => format!("请求记录手动清理完成（按当前策略），影响 {total} 项"),
-    };
+    let total = usage_cleanup_total(summary);
+    let message = manual_usage_cleanup_completed_message(options, total);
     record_completed_cleanup_run(
         data,
         USAGE_CLEANUP_KIND,
@@ -360,7 +384,9 @@ pub(crate) async fn run_manual_usage_cleanup_once(
             "header_cleaned": summary.header_cleaned,
             "keys_cleaned": summary.keys_cleaned,
             "records_deleted": summary.records_deleted,
-            "requested_older_than_days": override_older_than_days,
+            "mode": options.mode.as_str(),
+            "requested_older_than_days": options.requested_older_than_days,
+            "targets": options.targets,
             "actor_user_id": actor_user_id,
         }),
         message,
@@ -371,12 +397,161 @@ pub(crate) async fn run_manual_usage_cleanup_once(
         log_type = "ops",
         worker = "usage_cleanup",
         trigger = "manual",
-        requested_older_than_days = override_older_than_days,
+        mode = options.mode.as_str(),
+        requested_older_than_days = options.requested_older_than_days,
         actor_user_id = actor_user_id.as_deref(),
         total_affected = total,
         "gateway finished manual usage cleanup"
     );
     Ok(summary)
+}
+
+async fn run_manual_usage_cleanup_task(
+    data: Arc<GatewayDataState>,
+    initial_record: AdminCleanupRunRecord,
+    options: ManualUsageCleanupOptions,
+    actor_user_id: Option<String>,
+) {
+    let started_at = Instant::now();
+    match perform_manual_usage_cleanup_once(&data, options).await {
+        Ok(summary) => {
+            let total = usage_cleanup_total(summary);
+            let record = AdminCleanupRunRecord {
+                id: initial_record.id,
+                kind: initial_record.kind,
+                trigger: initial_record.trigger,
+                status: "completed".to_string(),
+                message: manual_usage_cleanup_completed_message(options, total),
+                started_at_unix_secs: initial_record.started_at_unix_secs,
+                completed_at_unix_secs: Some(now_unix_secs()),
+                duration_ms: Some(
+                    started_at
+                        .elapsed()
+                        .as_millis()
+                        .try_into()
+                        .unwrap_or(u64::MAX),
+                ),
+                summary: manual_usage_cleanup_progress_summary(
+                    options,
+                    100,
+                    Some(summary),
+                    actor_user_id.as_deref(),
+                ),
+                error: None,
+            };
+            if let Err(err) = record_admin_cleanup_run(&data, record).await {
+                warn!(error = %err, "failed to record manual usage cleanup completion");
+            }
+            info!(
+                event_name = "usage_cleanup_manual_completed",
+                log_type = "ops",
+                worker = "usage_cleanup",
+                trigger = "manual",
+                mode = options.mode.as_str(),
+                requested_older_than_days = options.requested_older_than_days,
+                actor_user_id = actor_user_id.as_deref(),
+                total_affected = total,
+                "gateway finished manual usage cleanup task"
+            );
+        }
+        Err(err) => {
+            let record = AdminCleanupRunRecord {
+                id: initial_record.id,
+                kind: initial_record.kind,
+                trigger: initial_record.trigger,
+                status: "failed".to_string(),
+                message: "请求记录手动清理失败".to_string(),
+                started_at_unix_secs: initial_record.started_at_unix_secs,
+                completed_at_unix_secs: Some(now_unix_secs()),
+                duration_ms: Some(
+                    started_at
+                        .elapsed()
+                        .as_millis()
+                        .try_into()
+                        .unwrap_or(u64::MAX),
+                ),
+                summary: manual_usage_cleanup_progress_summary(
+                    options,
+                    100,
+                    None,
+                    actor_user_id.as_deref(),
+                ),
+                error: Some(err.to_string()),
+            };
+            if let Err(record_err) = record_admin_cleanup_run(&data, record).await {
+                warn!(error = %record_err, "failed to record manual usage cleanup failure");
+            }
+            warn!(error = %err, "manual usage cleanup task failed");
+        }
+    }
+}
+
+fn usage_cleanup_total(
+    summary: aether_data_contracts::repository::usage::UsageCleanupSummary,
+) -> usize {
+    summary
+        .body_externalized
+        .saturating_add(summary.legacy_body_refs_migrated)
+        .saturating_add(summary.body_cleaned)
+        .saturating_add(summary.header_cleaned)
+        .saturating_add(summary.keys_cleaned)
+        .saturating_add(summary.records_deleted)
+}
+
+fn manual_usage_cleanup_start_message(options: ManualUsageCleanupOptions) -> String {
+    match options.mode {
+        super::ManualUsageCleanupMode::BeforeNow => {
+            "请求记录手动清理已开始，清理当前时刻之前的已选请求体".to_string()
+        }
+        super::ManualUsageCleanupMode::OlderThanDays => format!(
+            "请求记录手动清理已开始，清理 {} 天前的已选内容",
+            options.requested_older_than_days.unwrap_or_default()
+        ),
+        super::ManualUsageCleanupMode::Policy => {
+            "请求记录手动清理已开始，按当前策略清理已选内容".to_string()
+        }
+    }
+}
+
+fn manual_usage_cleanup_completed_message(
+    options: ManualUsageCleanupOptions,
+    total: usize,
+) -> String {
+    match options.mode {
+        super::ManualUsageCleanupMode::BeforeNow => {
+            format!("请求记录手动清理完成，已清理当前时刻之前的已选请求体，影响 {total} 项")
+        }
+        super::ManualUsageCleanupMode::OlderThanDays => format!(
+            "请求记录手动清理完成，清理 {} 天前的已选内容，影响 {total} 项",
+            options.requested_older_than_days.unwrap_or_default()
+        ),
+        super::ManualUsageCleanupMode::Policy => {
+            format!("请求记录手动清理完成（按当前策略），影响 {total} 项")
+        }
+    }
+}
+
+fn manual_usage_cleanup_progress_summary(
+    options: ManualUsageCleanupOptions,
+    progress_percent: u8,
+    summary: Option<aether_data_contracts::repository::usage::UsageCleanupSummary>,
+    actor_user_id: Option<&str>,
+) -> serde_json::Value {
+    let summary = summary.unwrap_or_default();
+    json!({
+        "mode": options.mode.as_str(),
+        "requested_older_than_days": options.requested_older_than_days,
+        "targets": options.targets,
+        "progress_percent": progress_percent,
+        "body_externalized": summary.body_externalized,
+        "legacy_body_refs_migrated": summary.legacy_body_refs_migrated,
+        "body_cleaned": summary.body_cleaned,
+        "header_cleaned": summary.header_cleaned,
+        "keys_cleaned": summary.keys_cleaned,
+        "records_deleted": summary.records_deleted,
+        "total": usage_cleanup_total(summary),
+        "actor_user_id": actor_user_id,
+    })
 }
 
 #[derive(Debug)]

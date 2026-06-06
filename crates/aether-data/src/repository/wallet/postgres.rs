@@ -577,6 +577,41 @@ WHERE user_id = $1
 LIMIT 1
 "#;
 
+const FIND_PENDING_PLAN_PURCHASE_ORDER_BY_USER_SQL: &str = r#"
+SELECT
+  id,
+  order_no,
+  wallet_id,
+  user_id,
+  CAST(amount_usd AS DOUBLE PRECISION) AS amount_usd,
+  CAST(pay_amount AS DOUBLE PRECISION) AS pay_amount,
+  pay_currency,
+  CAST(exchange_rate AS DOUBLE PRECISION) AS exchange_rate,
+  CAST(refunded_amount_usd AS DOUBLE PRECISION) AS refunded_amount_usd,
+  CAST(refundable_amount_usd AS DOUBLE PRECISION) AS refundable_amount_usd,
+  payment_method,
+  payment_provider,
+  payment_channel,
+  order_kind,
+  product_id,
+  product_snapshot,
+  gateway_order_id,
+  gateway_response,
+  status,
+  CAST(EXTRACT(EPOCH FROM created_at) AS BIGINT) AS created_at_unix_ms,
+  CAST(EXTRACT(EPOCH FROM paid_at) AS BIGINT) AS paid_at_unix_secs,
+  CAST(EXTRACT(EPOCH FROM credited_at) AS BIGINT) AS credited_at_unix_secs,
+  CAST(EXTRACT(EPOCH FROM expires_at) AS BIGINT) AS expires_at_unix_secs
+FROM payment_orders
+WHERE user_id = $1
+  AND product_id = $2
+  AND order_kind = 'plan_purchase'
+  AND status = 'pending'
+  AND expires_at > NOW()
+ORDER BY created_at DESC
+LIMIT 1
+"#;
+
 const FIND_WALLET_REFUND_SQL: &str = r#"
 SELECT
   id,
@@ -1106,6 +1141,20 @@ impl WalletReadRepository for SqlxWalletRepository {
         let row = sqlx::query(FIND_WALLET_PAYMENT_ORDER_BY_USER_SQL)
             .bind(user_id)
             .bind(order_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_postgres_err()?;
+        row.as_ref().map(map_admin_payment_order_row).transpose()
+    }
+
+    async fn find_pending_plan_purchase_order_by_user_id(
+        &self,
+        user_id: &str,
+        product_id: &str,
+    ) -> Result<Option<StoredAdminPaymentOrder>, DataLayerError> {
+        let row = sqlx::query(FIND_PENDING_PLAN_PURCHASE_ORDER_BY_USER_SQL)
+            .bind(user_id)
+            .bind(product_id)
             .fetch_optional(&self.pool)
             .await
             .map_postgres_err()?;

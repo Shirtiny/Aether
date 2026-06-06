@@ -249,7 +249,7 @@
             @update:model-value="(v) => form.concurrent_limit = parseNullableNumberInput(v, { min: 0 })"
           />
           <p class="text-xs text-muted-foreground mt-0.5">
-            同一时间允许使用该 Key 的最大请求数，留空或 0 表示不限制
+            留空或 0 表示不限制
           </p>
         </div>
         <div>
@@ -288,25 +288,6 @@
           <p class="text-xs text-muted-foreground mt-0.5">
             分钟，0-32
           </p>
-        </div>
-      </div>
-
-      <!-- 能力标签 -->
-      <div v-if="availableCapabilities.length > 0">
-        <Label class="text-xs mb-1.5 block">能力标签</Label>
-        <div class="flex flex-wrap gap-1.5">
-          <button
-            v-for="cap in availableCapabilities"
-            :key="cap.name"
-            type="button"
-            class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md border text-sm transition-colors"
-            :class="form.capabilities[cap.name]
-              ? 'bg-primary/10 border-primary/50 text-primary'
-              : 'bg-card border-border hover:bg-muted/50 text-muted-foreground'"
-            @click="form.capabilities[cap.name] = !form.capabilities[cap.name]"
-          >
-            {{ cap.display_name }}
-          </button>
         </div>
       </div>
 
@@ -376,7 +357,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, watch } from 'vue'
+import { ref, computed, watch } from 'vue'
 import {
   Dialog,
   Button,
@@ -394,17 +375,14 @@ import { useToast } from '@/composables/useToast'
 import { useFormDialog } from '@/composables/useFormDialog'
 import { parseApiError } from '@/utils/errorParser'
 import { parseNumberInput, parseNullableNumberInput } from '@/utils/form'
-import { log } from '@/utils/logger'
 import JsonImportInput from '@/components/common/JsonImportInput.vue'
 import {
   addProviderKey,
   updateProviderKey,
-  getAllCapabilities,
   sortApiFormats,
   type EndpointAPIKey,
   type EndpointAPIKeyUpdate,
   type ProviderEndpoint,
-  type CapabilityDefinition,
   type ProviderType
 } from '@/api/endpoints'
 import { formatApiFormat, normalizeApiFormatAlias, formatSupportsAuthOverride } from '@/api/endpoints/types/api-format'
@@ -467,10 +445,10 @@ function getAuthTypeOptions(providerType: ProviderType | null): AuthTypeOption[]
 
 function getVertexAllowedFormatsByAuth(authType: ProviderKeyFormAuthType): Set<string> {
   if (authType === 'api_key') {
-    return new Set(['gemini:generate_content'])
+    return new Set(['gemini:generate_content', 'gemini:embedding'])
   }
   if (authType === 'service_account') {
-    return new Set(['gemini:generate_content', 'claude:messages'])
+    return new Set(['gemini:generate_content', 'gemini:embedding', 'claude:messages'])
   }
   return new Set()
 }
@@ -710,9 +688,6 @@ const authTypeSelectId = computed(() => `auth-type-${formNonce.value}`)
 const keyNameFieldName = computed(() => `key-name-field-${formNonce.value}`)
 const apiKeyFieldName = computed(() => `api-key-field-${formNonce.value}`)
 
-// 可用的能力列表
-const availableCapabilities = ref<CapabilityDefinition[]>([])
-
 // 新增密钥时默认不自动开启上游模型获取
 const defaultAutoFetchModels = computed(() => false)
 
@@ -732,7 +707,6 @@ const form = ref({
   max_probe_interval_minutes: 32,
   note: '',
   is_active: true,
-  capabilities: {} as Record<string, boolean>,
   auto_fetch_models: false,
   model_include_patterns_text: '',  // 包含规则文本（逗号分隔）
   model_exclude_patterns_text: ''   // 排除规则文本（逗号分隔）
@@ -789,19 +763,6 @@ watch(
   { deep: true, immediate: true }
 )
 
-// 加载能力列表
-async function loadCapabilities() {
-  try {
-    availableCapabilities.value = await getAllCapabilities()
-  } catch (err) {
-    log.error('Failed to load capabilities:', err)
-  }
-}
-
-onMounted(() => {
-  loadCapabilities()
-})
-
 // API 格式切换
 function toggleApiFormat(format: string) {
   const index = form.value.api_formats.indexOf(format)
@@ -840,7 +801,6 @@ function resetForm() {
     max_probe_interval_minutes: 32,
     note: '',
     is_active: true,
-    capabilities: {},
     auto_fetch_models: defaultAutoFetchModels.value,
     model_include_patterns_text: '',
     model_exclude_patterns_text: ''
@@ -892,7 +852,6 @@ function loadKeyData() {
     max_probe_interval_minutes: props.editingKey.max_probe_interval_minutes ?? 32,
     note: props.editingKey.note || '',
     is_active: props.editingKey.is_active,
-    capabilities: { ...(props.editingKey.capabilities || {}) },
     auto_fetch_models: props.editingKey.auto_fetch_models ?? false,
     model_include_patterns_text: (props.editingKey.model_include_patterns || []).join(', '),
     model_exclude_patterns_text: (props.editingKey.model_exclude_patterns || []).join(', ')
@@ -979,15 +938,6 @@ async function handleSave() {
     return
   }
 
-  // 过滤出有效的能力配置（只包含值为 true 的）
-  const activeCapabilities: Record<string, boolean> = {}
-  for (const [key, value] of Object.entries(form.value.capabilities)) {
-    if (value) {
-      activeCapabilities[key] = true
-    }
-  }
-  const capabilitiesData = Object.keys(activeCapabilities).length > 0 ? activeCapabilities : null
-
   saving.value = true
   try {
     // 准备 rate_multipliers 数据：只保留已选中格式的倍率配置
@@ -1025,7 +975,6 @@ async function handleSave() {
         max_probe_interval_minutes: form.value.max_probe_interval_minutes,
         note: form.value.note,
         is_active: form.value.is_active,
-        capabilities: capabilitiesData,
         allowed_models: shouldClearAllowedModels ? null : undefined,
         auto_fetch_models: form.value.auto_fetch_models,
         model_include_patterns: parsePatternText(form.value.model_include_patterns_text),
@@ -1059,7 +1008,6 @@ async function handleSave() {
         cache_ttl_minutes: form.value.cache_ttl_minutes,
         max_probe_interval_minutes: form.value.max_probe_interval_minutes,
         note: form.value.note,
-        capabilities: capabilitiesData || undefined,
         auto_fetch_models: form.value.auto_fetch_models,
         model_include_patterns: parsePatternText(form.value.model_include_patterns_text),
         model_exclude_patterns: parsePatternText(form.value.model_exclude_patterns_text)

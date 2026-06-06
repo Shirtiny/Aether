@@ -1,5 +1,6 @@
 use aether_ai_formats::formats::matrix::{
-    request_conversion_kind, request_conversion_requires_enable_flag, RequestConversionKind,
+    api_data_format_id, request_conversion_kind, request_conversion_requires_enable_flag,
+    RequestConversionKind,
 };
 use aether_ai_formats::normalize_api_format_alias;
 
@@ -18,6 +19,11 @@ use crate::vertex::{
     is_vertex_api_key_transport_context, is_vertex_transport_context,
     local_vertex_gemini_transport_unsupported_reason_with_network,
     resolve_local_vertex_api_key_query_auth, VERTEX_API_KEY_QUERY_PARAM,
+};
+use crate::windsurf::{
+    is_windsurf_provider_transport,
+    local_windsurf_request_transport_unsupported_reason_with_network,
+    resolve_windsurf_cascade_auth,
 };
 use crate::GatewayProviderTransportSnapshot;
 
@@ -39,7 +45,14 @@ pub fn request_conversion_enabled_for_transport(
     if client_api_format == provider_api_format {
         return true;
     }
-    if request_conversion_kind(client_api_format.as_str(), provider_api_format.as_str()).is_none() {
+    let conversion_kind =
+        request_conversion_kind(client_api_format.as_str(), provider_api_format.as_str());
+    if conversion_kind.is_none()
+        && !same_data_format_transport_pair(
+            client_api_format.as_str(),
+            provider_api_format.as_str(),
+        )
+    {
         return false;
     }
     if !request_conversion_requires_enable_flag(
@@ -62,7 +75,14 @@ pub fn request_pair_allowed_for_transport(
     if client_api_format == provider_api_format {
         return true;
     }
-    if request_conversion_kind(client_api_format.as_str(), provider_api_format.as_str()).is_none() {
+    let conversion_kind =
+        request_conversion_kind(client_api_format.as_str(), provider_api_format.as_str());
+    if conversion_kind.is_none()
+        && !same_data_format_transport_pair(
+            client_api_format.as_str(),
+            provider_api_format.as_str(),
+        )
+    {
         return false;
     }
     if is_kiro_claude_messages_transport(transport, &provider_api_format) {
@@ -80,6 +100,19 @@ pub fn request_pair_allowed_for_transport(
     )
 }
 
+fn same_data_format_transport_pair(client_api_format: &str, provider_api_format: &str) -> bool {
+    if aether_ai_formats::api_format_alias_matches(client_api_format, provider_api_format) {
+        return false;
+    }
+    matches!(
+        (
+            api_data_format_id(client_api_format),
+            api_data_format_id(provider_api_format)
+        ),
+        (Some("embedding"), Some("embedding")) | (Some("rerank"), Some("rerank"))
+    )
+}
+
 pub fn request_conversion_transport_supported(
     transport: &GatewayProviderTransportSnapshot,
     kind: RequestConversionKind,
@@ -93,6 +126,11 @@ pub fn request_conversion_transport_unsupported_reason(
 ) -> Option<&'static str> {
     if is_kiro_claude_messages_transport(transport, &transport.endpoint.api_format) {
         return local_kiro_request_transport_unsupported_reason_with_network(transport);
+    }
+    if is_windsurf_provider_transport(transport)
+        && normalize_api_format_alias(&transport.endpoint.api_format) == "openai:chat"
+    {
+        return local_windsurf_request_transport_unsupported_reason_with_network(transport);
     }
 
     match normalize_api_format_alias(&transport.endpoint.api_format).as_str() {
@@ -117,15 +155,80 @@ pub fn request_conversion_transport_unsupported_reason(
     }
 }
 
+pub fn request_pair_transport_unsupported_reason(
+    transport: &GatewayProviderTransportSnapshot,
+    client_api_format: &str,
+    provider_api_format: &str,
+) -> Option<&'static str> {
+    let client_api_format = normalize_api_format_alias(client_api_format);
+    let provider_api_format = normalize_api_format_alias(provider_api_format);
+
+    if let Some(kind) =
+        request_conversion_kind(client_api_format.as_str(), provider_api_format.as_str())
+    {
+        return request_conversion_transport_unsupported_reason(transport, kind);
+    }
+
+    if !same_data_format_transport_pair(client_api_format.as_str(), provider_api_format.as_str()) {
+        return Some("transport_api_format_unsupported");
+    }
+
+    match provider_api_format.as_str() {
+        "gemini:embedding" => {
+            if is_vertex_transport_context(transport) {
+                local_vertex_gemini_transport_unsupported_reason_with_network(transport)
+            } else {
+                local_gemini_transport_unsupported_reason_with_network(
+                    transport,
+                    "gemini:embedding",
+                )
+            }
+        }
+        "openai:embedding"
+        | "jina:embedding"
+        | "doubao:embedding"
+        | "aliyun:multimodal_embedding"
+        | "openai:rerank"
+        | "jina:rerank" => local_standard_transport_unsupported_reason_with_network(
+            transport,
+            provider_api_format.as_str(),
+        ),
+        _ => Some("transport_api_format_unsupported"),
+    }
+}
+
 pub fn request_conversion_direct_auth(
     transport: &GatewayProviderTransportSnapshot,
     _kind: RequestConversionKind,
 ) -> Option<(String, String)> {
-    match normalize_api_format_alias(&transport.endpoint.api_format).as_str() {
-        "openai:chat" | "openai:responses" | "openai:responses:compact" => {
-            resolve_local_openai_bearer_auth(transport)
+    request_direct_auth_for_provider_format(transport, transport.endpoint.api_format.as_str())
+}
+
+pub fn request_pair_direct_auth(
+    transport: &GatewayProviderTransportSnapshot,
+    provider_api_format: &str,
+) -> Option<(String, String)> {
+    request_direct_auth_for_provider_format(transport, provider_api_format)
+}
+
+fn request_direct_auth_for_provider_format(
+    transport: &GatewayProviderTransportSnapshot,
+    provider_api_format: &str,
+) -> Option<(String, String)> {
+    match normalize_api_format_alias(provider_api_format).as_str() {
+        "openai:chat" if is_windsurf_provider_transport(transport) => {
+            resolve_windsurf_cascade_auth(transport)
         }
-        "gemini:generate_content" => {
+        "openai:chat"
+        | "openai:responses"
+        | "openai:responses:compact"
+        | "openai:embedding"
+        | "jina:embedding"
+        | "doubao:embedding"
+        | "aliyun:multimodal_embedding"
+        | "openai:rerank"
+        | "jina:rerank" => resolve_local_openai_bearer_auth(transport),
+        "gemini:generate_content" | "gemini:embedding" => {
             if is_vertex_api_key_transport_context(transport) {
                 resolve_local_vertex_api_key_query_auth(transport)
                     .map(|auth| (VERTEX_API_KEY_QUERY_PARAM.to_string(), auth.value))
@@ -338,7 +441,7 @@ mod tests {
         candidate_common_transport_skip_reason, candidate_transport_pair_skip_reason,
         request_conversion_direct_auth, request_conversion_enabled_for_transport,
         request_conversion_transport_supported, request_pair_allowed_for_transport,
-        CandidateTransportPolicyFacts,
+        request_pair_direct_auth, CandidateTransportPolicyFacts,
     };
     use aether_ai_formats::formats::matrix::RequestConversionKind;
     use serde_json::json;
@@ -409,6 +512,7 @@ mod tests {
                 expires_at_unix_secs: None,
                 proxy: None,
                 fingerprint: None,
+                upstream_metadata: None,
                 decrypted_api_key: "secret".to_string(),
                 decrypted_auth_config: None,
             },
@@ -509,6 +613,21 @@ mod tests {
     }
 
     #[test]
+    fn vertex_gemini_embedding_transport_supports_openai_embedding_conversion() {
+        let transport = transport_snapshot("vertex_ai", "gemini:embedding", "api_key", true, None);
+
+        assert!(request_pair_allowed_for_transport(
+            &transport,
+            "openai:embedding",
+            "gemini:embedding"
+        ));
+        assert_eq!(
+            request_pair_direct_auth(&transport, "gemini:embedding"),
+            Some(("key".to_string(), "secret".to_string()))
+        );
+    }
+
+    #[test]
     fn kiro_claude_messages_transport_supports_cross_format_conversion_via_envelope() {
         let transport = transport_snapshot("kiro", "claude:messages", "bearer", true, None);
 
@@ -521,6 +640,35 @@ mod tests {
             &transport,
             RequestConversionKind::ToClaudeStandard
         ));
+    }
+
+    #[test]
+    fn windsurf_openai_chat_anchor_supports_cross_format_conversion_via_cascade() {
+        let mut transport = transport_snapshot("windsurf", "openai:chat", "oauth", true, None);
+        transport.key.decrypted_api_key = "devin-session-token$abc".to_string();
+        transport.key.decrypted_auth_config = Some(r#"{"provider_type":"windsurf"}"#.to_string());
+
+        assert!(request_pair_allowed_for_transport(
+            &transport,
+            "claude:messages",
+            "openai:chat"
+        ));
+        assert!(request_pair_allowed_for_transport(
+            &transport,
+            "openai:responses",
+            "openai:chat"
+        ));
+        assert!(request_conversion_transport_supported(
+            &transport,
+            RequestConversionKind::ToOpenAIChat
+        ));
+        assert_eq!(
+            request_conversion_direct_auth(&transport, RequestConversionKind::ToOpenAIChat),
+            Some((
+                "authorization".to_string(),
+                "Bearer devin-session-token$abc".to_string()
+            ))
+        );
     }
 
     #[test]

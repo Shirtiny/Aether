@@ -395,7 +395,7 @@ const emit = defineEmits<{
   saved: []
 }>()
 
-const { success, error: showError } = useToast()
+const { success, error: showError, warning: showWarning } = useToast()
 const { confirmWarning } = useConfirm()
 const { fetchModels: fetchCachedModels } = useUpstreamModelsCache()
 
@@ -691,6 +691,9 @@ async function fetchUpstreamModels(forceRefresh = false) {
       // 获取上游模型后，从自定义模型列表中移除已变成已知的模型
       const upstreamIds = new Set(result.models.map((m: UpstreamModel) => m.id))
       allCustomModels.value = allCustomModels.value.filter(m => !upstreamIds.has(m))
+      if (result.warning) {
+        showWarning(result.warning, '部分格式获取失败')
+      }
     } else if (result.error) {
       showError(result.error, '获取上游模型失败')
     }

@@ -65,13 +65,29 @@ fn compare_load_balance_base(
         .cmp(&right.capability_priority)
         .then_with(|| compare_cross_format_demotion(left, right))
         .then_with(|| compare_demoted_format_preference(left, right))
+        .then_with(|| compare_load_balance_distribution_slot(left, right, context))
+        .then_with(|| compare_conversion_priority_slot(left, right, context.priority_mode))
+        .then_with(|| compare_load_balance_distribution_tiebreakers(left, right, context))
         .then_with(|| compare_format_preference(left, right))
-        .then_with(|| compare_load_balance_distribution(left, right, context))
         .then_with(|| compare_candidate_identity_for_ranking(left, right))
         .then(left.original_index.cmp(&right.original_index))
 }
 
-fn compare_load_balance_distribution(
+fn compare_conversion_priority_slot(
+    left: &SchedulerRankableCandidate,
+    right: &SchedulerRankableCandidate,
+    priority_mode: crate::SchedulerPriorityMode,
+) -> Ordering {
+    if left.demote_cross_format || right.demote_cross_format {
+        return Ordering::Equal;
+    }
+    if left.format_preference.0 == 0 && right.format_preference.0 == 0 {
+        return Ordering::Equal;
+    }
+    compare_candidate_priority_slot(left, right, priority_mode)
+}
+
+fn compare_load_balance_distribution_slot(
     left: &SchedulerRankableCandidate,
     right: &SchedulerRankableCandidate,
     context: SchedulerRankingContext,
@@ -79,20 +95,26 @@ fn compare_load_balance_distribution(
     match context.priority_mode {
         crate::SchedulerPriorityMode::Provider => {
             compare_seeded_provider_hash(left, right, context.load_balance_seed)
-                .then_with(|| {
-                    if left.provider_id == right.provider_id {
-                        left.key_internal_priority.cmp(&right.key_internal_priority)
-                    } else {
-                        Ordering::Equal
-                    }
-                })
-                .then_with(|| {
-                    compare_seeded_candidate_hash(left, right, context.load_balance_seed, "key")
-                })
         }
         crate::SchedulerPriorityMode::GlobalKey => {
             compare_seeded_candidate_hash(left, right, context.load_balance_seed, "global-key")
         }
+    }
+}
+
+fn compare_load_balance_distribution_tiebreakers(
+    left: &SchedulerRankableCandidate,
+    right: &SchedulerRankableCandidate,
+    context: SchedulerRankingContext,
+) -> Ordering {
+    match context.priority_mode {
+        crate::SchedulerPriorityMode::Provider => if left.provider_id == right.provider_id {
+            left.key_internal_priority.cmp(&right.key_internal_priority)
+        } else {
+            Ordering::Equal
+        }
+        .then_with(|| compare_seeded_candidate_hash(left, right, context.load_balance_seed, "key")),
+        crate::SchedulerPriorityMode::GlobalKey => Ordering::Equal,
     }
 }
 

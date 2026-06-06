@@ -127,7 +127,8 @@ CREATE TABLE IF NOT EXISTS provider_api_keys (
     `created_at` BIGINT NOT NULL,
     `updated_at` BIGINT NOT NULL,
     PRIMARY KEY (`id`),
-    KEY provider_api_keys_provider_id_idx (`provider_id`)
+    KEY provider_api_keys_provider_id_idx (`provider_id`),
+    KEY idx_provider_api_keys_provider_default_sort (`provider_id`, `internal_priority`, `name`, `id`)
 );
 
 CREATE TABLE IF NOT EXISTS pool_member_scores (
@@ -286,6 +287,7 @@ CREATE TABLE IF NOT EXISTS video_tasks (
     UNIQUE KEY video_tasks_request_id_key (`request_id`),
     KEY video_tasks_external_id_idx (`external_task_id`),
     KEY video_tasks_next_poll_idx (`next_poll_at`),
+    KEY video_tasks_due_poll_idx (`status`, `next_poll_at`, `updated_at`),
     KEY video_tasks_user_status_idx (`user_id`, `status`),
     KEY video_tasks_api_key_id_idx (`api_key_id`),
     KEY video_tasks_provider_id_idx (`provider_id`),
@@ -381,5 +383,47 @@ CREATE TABLE IF NOT EXISTS global_models (
     `updated_at` BIGINT NOT NULL,
     PRIMARY KEY (`id`),
     UNIQUE KEY global_models_name_key (`name`)
+);
+
+CREATE TABLE IF NOT EXISTS routing_groups (
+    `id` VARCHAR(64) NOT NULL,
+    `name` VARCHAR(255) NOT NULL,
+    `description` LONGTEXT,
+    `enabled` TINYINT(1) NOT NULL DEFAULT 1,
+    `is_system_default` TINYINT(1) NOT NULL DEFAULT 0,
+    `config_json` JSON NOT NULL,
+    `version` BIGINT NOT NULL DEFAULT 1,
+    `created_at` BIGINT NOT NULL,
+    `updated_at` BIGINT NOT NULL,
+    `published_at` BIGINT,
+    PRIMARY KEY (`id`),
+    UNIQUE KEY routing_groups_name_key (`name`),
+    KEY routing_groups_system_default_idx (`is_system_default`, `enabled`)
+);
+
+CREATE TABLE IF NOT EXISTS routing_group_bindings (
+    `id` VARCHAR(64) NOT NULL,
+    `group_id` VARCHAR(64) NOT NULL,
+    `subject_type` VARCHAR(32) NOT NULL,
+    `subject_id` VARCHAR(64) NOT NULL,
+    `is_default` TINYINT(1) NOT NULL DEFAULT 0,
+    `allow_explicit_select` TINYINT(1) NOT NULL DEFAULT 1,
+    `created_at` BIGINT NOT NULL,
+    `updated_at` BIGINT NOT NULL,
+    PRIMARY KEY (`id`),
+    KEY routing_group_bindings_group_id_idx (`group_id`),
+    KEY routing_group_bindings_subject_idx (`subject_type`, `subject_id`)
+);
+
+CREATE TABLE IF NOT EXISTS routing_group_versions (
+    `id` VARCHAR(64) NOT NULL,
+    `group_id` VARCHAR(64) NOT NULL,
+    `version` BIGINT NOT NULL,
+    `config_json` JSON NOT NULL,
+    `created_at` BIGINT NOT NULL,
+    `created_by` VARCHAR(64),
+    PRIMARY KEY (`id`),
+    UNIQUE KEY routing_group_versions_group_version_key (`group_id`, `version`),
+    KEY routing_group_versions_group_id_idx (`group_id`)
 );
 

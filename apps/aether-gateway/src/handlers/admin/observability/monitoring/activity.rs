@@ -6,6 +6,7 @@ use super::route_filters::{
 };
 use crate::constants::INTERNAL_GATEWAY_PATH_PREFIXES;
 use crate::handlers::admin::request::{AdminAppState, AdminRequestContext};
+use crate::handlers::admin::shared::build_admin_usage_counter_health_payload;
 use crate::GatewayError;
 use aether_admin::observability::monitoring::{
     admin_monitoring_bad_request_response, admin_monitoring_user_behavior_user_id_from_path,
@@ -189,6 +190,13 @@ pub(super) async fn build_admin_monitoring_system_status_response(
     )
     .unwrap_or(usize::MAX);
     let tunnel = state.tunnel.stats();
+    let usage_counter_snapshot = state
+        .data
+        .read_usage_counter_health()
+        .await
+        .map_err(|err| GatewayError::Internal(err.to_string()))?;
+    let usage_counter =
+        build_admin_usage_counter_health_payload(&usage_counter_snapshot, now_unix_secs);
 
     Ok(build_admin_monitoring_system_status_payload_response(
         now,
@@ -206,5 +214,6 @@ pub(super) async fn build_admin_monitoring_system_status_response(
         tunnel.active_streams,
         INTERNAL_GATEWAY_PATH_PREFIXES,
         recent_errors,
+        usage_counter,
     ))
 }

@@ -52,17 +52,12 @@
                 <SelectValue placeholder="状态" />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="all">
-                  全部
-                </SelectItem>
-                <SelectItem value="active">
-                  可调度
-                </SelectItem>
-                <SelectItem value="cooldown">
-                  冷却中
-                </SelectItem>
-                <SelectItem value="inactive">
-                  禁用
+                <SelectItem
+                  v-for="item in poolKeyStatusFilterOptions"
+                  :key="`mobile-${item.value}`"
+                  :value="item.value"
+                >
+                  {{ item.label }}
                 </SelectItem>
               </SelectContent>
             </Select>
@@ -573,7 +568,7 @@
                         <Copy class="w-2.5 h-2.5" />
                       </Button>
                       <span class="font-mono">
-                        {{ getProviderMaskedSecretLabel(key) }}
+                        {{ getProviderMaskedSecretLabel(key, selectedProviderType) }}
                       </span>
                       <template v-if="keyUiStateMap[key.key_id]?.showOAuthRefreshControl">
                         <Button
@@ -603,7 +598,7 @@
                         </span>
                       </template>
                       <Badge
-                        v-if="key.oauth_plan_type"
+                        v-if="keyUiStateMap[key.key_id]?.planLabel"
                         variant="outline"
                         class="text-[9px] px-1 py-0 h-4 shrink-0"
                         :class="keyUiStateMap[key.key_id]?.planClass || ''"
@@ -637,10 +632,11 @@
                       <div class="flex items-center justify-between text-[10px] leading-none">
                         <span class="text-muted-foreground font-medium shrink-0">{{ getQuotaProgressLabel(item.label) }}</span>
                         <span
-                          v-if="getQuotaProgressDisplayText(item)"
+                          v-if="getQuotaProgressResetDisplayText(item)"
+                          data-testid="pool-quota-reset-text"
                           class="text-muted-foreground/80 tabular-nums truncate"
-                          :title="item.detail"
-                        >{{ getQuotaProgressDisplayText(item) }}</span>
+                          :title="getQuotaProgressResetDisplayText(item)"
+                        >{{ getQuotaProgressResetDisplayText(item) }}</span>
                       </div>
                       <div class="flex items-center gap-1.5">
                         <div class="relative flex-1 h-1.5 rounded-full bg-border overflow-hidden">
@@ -651,17 +647,24 @@
                           />
                         </div>
                         <span
+                          data-testid="pool-quota-meter-text"
                           class="shrink-0 text-[10px] font-medium tabular-nums leading-none"
                           :class="getQuotaRemainingClassByRemaining(item.remainingPercent)"
-                        >{{ item.remainingPercent.toFixed(1) }}%</span>
+                        >{{ getQuotaProgressMeterDisplayText(item) }}</span>
                       </div>
+                    </div>
+                    <div
+                      v-if="keyUiStateMap[key.key_id]?.accountQuotaText"
+                      class="text-[10px] leading-none text-muted-foreground tabular-nums"
+                    >
+                      {{ keyUiStateMap[key.key_id]?.accountQuotaText }}
                     </div>
                   </div>
                   <span
-                    v-else-if="keyUiStateMap[key.key_id]?.quotaFallbackText"
+                    v-else-if="keyUiStateMap[key.key_id]?.accountQuotaText || keyUiStateMap[key.key_id]?.quotaFallbackText"
                     :class="keyUiStateMap[key.key_id]?.quotaTextClass || ''"
                   >
-                    {{ keyUiStateMap[key.key_id]?.quotaFallbackText }}
+                    {{ keyUiStateMap[key.key_id]?.accountQuotaText || keyUiStateMap[key.key_id]?.quotaFallbackText }}
                   </span>
                   <span
                     v-else
@@ -1154,10 +1157,11 @@
                     <div class="flex items-center justify-between text-[10px] leading-none">
                       <span class="text-muted-foreground font-medium shrink-0">{{ getQuotaProgressLabel(item.label) }}</span>
                       <span
-                        v-if="getQuotaProgressDisplayText(item)"
+                        v-if="getQuotaProgressResetDisplayText(item)"
+                        data-testid="pool-quota-reset-text"
                         class="text-muted-foreground/80 tabular-nums truncate"
-                        :title="item.detail"
-                      >{{ getQuotaProgressDisplayText(item) }}</span>
+                        :title="getQuotaProgressResetDisplayText(item)"
+                      >{{ getQuotaProgressResetDisplayText(item) }}</span>
                     </div>
                     <div class="flex items-center gap-1.5">
                       <div class="relative flex-1 h-1.5 rounded-full bg-border overflow-hidden">
@@ -1168,17 +1172,24 @@
                         />
                       </div>
                       <span
+                        data-testid="pool-quota-meter-text"
                         class="shrink-0 text-[10px] font-medium tabular-nums leading-none"
                         :class="getQuotaRemainingClassByRemaining(item.remainingPercent)"
-                      >{{ item.remainingPercent.toFixed(1) }}%</span>
+                      >{{ getQuotaProgressMeterDisplayText(item) }}</span>
                     </div>
+                  </div>
+                  <div
+                    v-if="keyUiStateMap[key.key_id]?.accountQuotaText"
+                    class="text-[10px] leading-none text-muted-foreground tabular-nums"
+                  >
+                    {{ keyUiStateMap[key.key_id]?.accountQuotaText }}
                   </div>
                 </div>
                 <div
-                  v-else-if="keyUiStateMap[key.key_id]?.quotaFallbackText"
+                  v-else-if="keyUiStateMap[key.key_id]?.accountQuotaText || keyUiStateMap[key.key_id]?.quotaFallbackText"
                   :class="keyUiStateMap[key.key_id]?.quotaTextClass || ''"
                 >
-                  {{ keyUiStateMap[key.key_id]?.quotaFallbackText }}
+                  {{ keyUiStateMap[key.key_id]?.accountQuotaText || keyUiStateMap[key.key_id]?.quotaFallbackText }}
                 </div>
                 <div
                   v-else
@@ -1618,6 +1629,7 @@ import {
   getOAuthStatusTitle as resolveOAuthStatusTitle,
 } from '@/utils/providerKeyStatus'
 import {
+  getGeminiCliAccountCreditsText,
   getLegacyAccountQuotaText,
   getQuotaDisplayText,
 } from '@/utils/providerKeyQuota'
@@ -1678,9 +1690,21 @@ const showDemandMetricsDialog = ref(false)
 const providerDemandMetricSamples = ref<PoolDemandMetricSample[]>([])
 const poolKeyStatusFilterOptions: Array<{ value: PoolManagementViewState['status'], label: string }> = [
   { value: 'all', label: '全部状态' },
-  { value: 'active', label: '可调度' },
+  { value: 'available', label: '可用' },
   { value: 'cooldown', label: '冷却中' },
-  { value: 'inactive', label: '禁用' },
+  { value: 'inactive', label: '已禁用' },
+  { value: 'invalid', label: '已失效' },
+  { value: 'expired', label: '已过期' },
+  { value: 'account_banned', label: '账号封禁' },
+  { value: 'quota_exhausted', label: '额度耗尽' },
+  { value: 'account_forbidden', label: '访问受限' },
+  { value: 'account_disabled', label: '账号停用' },
+  { value: 'workspace_deactivated', label: '工作区停用' },
+  { value: 'account_verification', label: '需要验证' },
+  { value: 'account_quarantined', label: '账号隔离' },
+  { value: 'account_blocked', label: '账号异常' },
+  { value: 'rate_limited', label: '速率受限' },
+  { value: 'cost_exhausted', label: '超限' },
 ]
 const poolScoreHardStateOptions = [
   { value: 'all', label: '全部状态' },
@@ -2072,7 +2096,9 @@ const showAccountQuotaColumn = computed(() => {
   return selectedProviderType.value === 'codex'
     || selectedProviderType.value === 'gemini_cli'
     || selectedProviderType.value === 'kiro'
+    || selectedProviderType.value === 'windsurf'
     || selectedProviderType.value === 'antigravity'
+    || selectedProviderType.value === 'grok'
     || selectedProviderType.value === 'chatgpt_web'
 })
 
@@ -2324,6 +2350,7 @@ interface QuotaProgressItem {
   resetAtSeconds?: number | null
   resetSeconds?: number | null
   updatedAtSeconds?: number | null
+  allowDynamicReset?: boolean
 }
 
 interface PoolCodexCycleStatsRow {
@@ -2353,6 +2380,7 @@ type PoolKeyUiState = {
   canRefreshToken: boolean
   planLabel: string
   planClass: string
+  accountQuotaText: string | null
   quotaFallbackText: string | null
   quotaTextClass: string
   importedAtRelative: string
@@ -2376,9 +2404,11 @@ const keyUiStateMap = computed<Record<string, PoolKeyUiState>>(() => {
   for (const key of keyPage.value.keys) {
     const visibleOAuthState = getVisibleOAuthState(key)
     const oauthOrgBadge = getOAuthOrgBadge(key)
+    const accountQuotaText = getAccountQuotaText(key)
     const quotaFallbackText = getQuotaFallbackText(key)
+    const planType = resolvePoolKeyPlanType(key)
     const canRefreshToken = canRefreshOAuthCredential(key)
-    const showOAuthRefreshControl = shouldShowOAuthRefreshControl(key)
+    const showOAuthRefreshControl = shouldShowOAuthRefreshControl(key, selectedProviderType.value)
 
     map[key.key_id] = {
       rowClass: getRowClass(key),
@@ -2391,10 +2421,13 @@ const keyUiStateMap = computed<Record<string, PoolKeyUiState>>(() => {
       oauthRefreshButtonTitle: showOAuthRefreshControl ? getOAuthRefreshButtonTitle(key) : '',
       showOAuthRefreshControl,
       canRefreshToken,
-      planLabel: key.oauth_plan_type ? formatOAuthPlanType(key.oauth_plan_type) : '',
-      planClass: key.oauth_plan_type ? getOAuthPlanTypeClass(key.oauth_plan_type) : '',
+      planLabel: planType ? formatOAuthPlanType(planType) : '',
+      planClass: planType ? getOAuthPlanTypeClass(planType) : '',
+      accountQuotaText,
       quotaFallbackText,
-      quotaTextClass: quotaFallbackText ? getQuotaTextClass(quotaFallbackText) : '',
+      quotaTextClass: accountQuotaText || quotaFallbackText
+        ? getQuotaTextClass(accountQuotaText || quotaFallbackText || '')
+        : '',
       importedAtRelative: formatPoolKeyImportedAt(key),
       lastUsedRelative: key.last_used_at ? formatRelativeTime(key.last_used_at) : '-',
       statsDisplay: buildPoolStatsDisplay(key, selectedProviderType.value, poolStatsMode.value),
@@ -2469,7 +2502,10 @@ function getPoolKeyAccountStatsMetrics(key: PoolKeyDetail): PoolStatsMetric[] {
 const quotaRefreshSupported = computed(() => {
   return selectedProviderType.value === 'codex'
     || selectedProviderType.value === 'kiro'
+    || selectedProviderType.value === 'gemini_cli'
+    || selectedProviderType.value === 'windsurf'
     || selectedProviderType.value === 'antigravity'
+    || selectedProviderType.value === 'grok'
     || selectedProviderType.value === 'chatgpt_web'
 })
 
@@ -2589,7 +2625,12 @@ async function refreshCurrentPageQuotaInBackground(
 
     if (!options.silent) {
       const skippedText = skippedCount > 0 ? `，冷却跳过 ${skippedCount}` : ''
-      success(`当前页额度刷新完成：成功 ${successCount}，失败 ${failedCount}${skippedText}`)
+      const firstFailureMessage = result.results.find(item => item.status !== 'success')?.message?.trim()
+      if (successCount === 0 && failedCount > 0 && firstFailureMessage) {
+        showError(`当前页额度刷新失败：${firstFailureMessage}${skippedText}`)
+      } else {
+        success(`当前页额度刷新完成：成功 ${successCount}，失败 ${failedCount}${skippedText}`)
+      }
     }
     return true
   } catch (err) {
@@ -2633,7 +2674,7 @@ async function loadKeys(options: { cacheTtlMs?: number } = {}) {
   const page = currentPage.value
   const pageSizeValue = pageSize.value
   const search = searchQuery.value || undefined
-  const status = statusFilter.value as 'all' | 'active' | 'cooldown' | 'inactive'
+  const status = statusFilter.value
   const sortByValue = sortBy.value || undefined
   keysLoading.value = true
   try {
@@ -2714,7 +2755,7 @@ function toEndpointApiKey(key: PoolKeyDetail): EndpointAPIKey {
     id: key.key_id,
     provider_id: selectedProviderId.value || '',
     api_formats: key.api_formats || [],
-    api_key_masked: getProviderMaskedSecretLabel(key),
+    api_key_masked: getProviderMaskedSecretLabel(key, selectedProviderType.value),
     auth_type: normalizeAuthTypeForEdit(key),
     auth_type_by_format: key.auth_type_by_format ?? null,
     credential_kind: key.credential_kind ?? null,
@@ -3393,6 +3434,7 @@ function getVisibleSchedulingReasons(key: PoolKeyDetail) {
 
 function getSchedulingStatus(key: PoolKeyDetail): 'available' | 'degraded' | 'blocked' {
   if (getAccountAlertLabel(key)) return 'blocked'
+  if (getBlockingOAuthStatusLabel(key)) return 'blocked'
 
   const status = key.scheduling_status
   if (
@@ -3438,9 +3480,23 @@ function getOAuthStatusBadgeLabel(status: ReturnType<typeof getVisibleOAuthState
   return '有效'
 }
 
+function getBlockingOAuthStatusLabel(key: PoolKeyDetail): string | null {
+  const oauthState = getVisibleOAuthState(key)
+  if (!oauthState?.isInvalid && !oauthState?.isExpired) return null
+  return getOAuthStatusBadgeLabel(oauthState)
+}
+
+function isPoolKeyCostExhausted(key: PoolKeyDetail): boolean {
+  return key.cost_limit != null
+    && key.cost_limit > 0
+    && key.cost_window_usage >= key.cost_limit
+}
+
 function getSchedulingBadgeLabel(key: PoolKeyDetail): string {
   const accountAlert = getAccountAlertLabel(key)
   if (accountAlert) return compactPoolStatusLabel(accountAlert) || accountAlert
+  const oauthAlert = getBlockingOAuthStatusLabel(key)
+  if (oauthAlert) return oauthAlert
 
   const rawLabel = String(key.scheduling_label || '').trim()
   if (
@@ -3448,24 +3504,28 @@ function getSchedulingBadgeLabel(key: PoolKeyDetail): string {
     && !isHealthDerivedSchedulingReason(key.scheduling_reason)
     && !isHealthDerivedSchedulingLabel(rawLabel)
   ) {
+    if ((rawLabel === '可用' || key.scheduling_reason === 'available') && isPoolKeyCostExhausted(key)) {
+      return '超限'
+    }
     if (rawLabel === '禁用' || rawLabel === '停用') return '禁用'
     return compactPoolStatusLabel(rawLabel) || rawLabel
   }
 
-  if (!key.is_active) return '禁用'
+  if (!key.is_active) return '已禁用'
   if (key.cooldown_reason) return '冷却中'
-  if (key.cost_limit != null && key.cost_limit > 0 && key.cost_window_usage >= key.cost_limit) return '超限'
   return '可用'
 }
 
 function getSchedulingBadgeVariant(key: PoolKeyDetail): PoolStatusVariant {
   if (getAccountAlertLabel(key)) return 'destructive'
+  if (getBlockingOAuthStatusLabel(key)) return 'destructive'
 
   const reason = getVisibleSchedulingReason(key)
   if (reason === 'manual_disabled' || reason === 'inactive') return 'secondary'
   if (reason === 'account_blocked' || reason === 'account_quota_exhausted' || reason === 'cost_exhausted') return 'destructive'
   if (reason === 'cooldown') return 'warning'
   if (reason === 'cost_soft' || reason === 'cost') return 'warning'
+  if (isPoolKeyCostExhausted(key)) return 'destructive'
   if (reason === 'available') return 'default'
   if (!reason && !key.is_active) return 'secondary'
 
@@ -3478,6 +3538,7 @@ function getSchedulingBadgeVariant(key: PoolKeyDetail): PoolStatusVariant {
 function getSchedulingTitle(key: PoolKeyDetail): string {
   const accountAlertTitle = getAccountAlertTitle(key)
   if (accountAlertTitle) return accountAlertTitle
+  if (getBlockingOAuthStatusLabel(key)) return getOAuthStatusTitle(key)
 
   const reasons = getVisibleSchedulingReasons(key)
   if (reasons.length > 0) {
@@ -3492,6 +3553,7 @@ function getSchedulingTitle(key: PoolKeyDetail): string {
     const ttl = key.cooldown_ttl_seconds ? ` (${formatTTL(key.cooldown_ttl_seconds)})` : ''
     return `${formatCooldownReason(key.cooldown_reason)}${ttl}`
   }
+  if (isPoolKeyCostExhausted(key)) return '超限'
   return getSchedulingBadgeLabel(key)
 }
 
@@ -3524,6 +3586,7 @@ function getMobileTagItems(key: PoolKeyDetail): PoolMobileTagItem[] {
   const accountAlert = getAccountAlertLabel(key)
   const oauthState = getVisibleOAuthState(key)
   const orgBadge = getOAuthOrgBadge(key)
+  const planType = resolvePoolKeyPlanType(key)
 
   return buildPoolMobileTagItems({
     accountStatusLabel: compactPoolStatusLabel(accountAlert),
@@ -3532,7 +3595,7 @@ function getMobileTagItems(key: PoolKeyDetail): PoolMobileTagItem[] {
     oauthStatusTone: getMobileOAuthTone(key),
     priorityLabel: `P${key.internal_priority ?? 50}`,
     authLabel: getAuthTypeChipLabel(key),
-    planLabel: key.oauth_plan_type ? formatOAuthPlanType(key.oauth_plan_type) : null,
+    planLabel: planType ? formatOAuthPlanType(planType) : null,
     orgLabel: orgBadge?.label ?? null,
     proxyLabel: key.proxy?.node_id ? '独立代理' : null,
   })
@@ -3565,6 +3628,9 @@ function formatOAuthPlanType(planType: string): string {
     ultra: 'Ultra',
     'pro+': 'Pro+',
     power: 'Power',
+    basic: 'Basic',
+    super: 'Super',
+    heavy: 'Heavy',
   }
   return labelMap[planType.toLowerCase()] || planType
 }
@@ -3580,6 +3646,9 @@ function getOAuthPlanTypeClass(planType: string): string {
     ultra: 'border-amber-500/50 text-amber-600 dark:text-amber-400',
     'pro+': 'border-purple-500/50 text-purple-600 dark:text-purple-400',
     power: 'border-amber-500/50 text-amber-600 dark:text-amber-400',
+    basic: 'border-primary/50 text-primary',
+    super: 'border-green-500/50 text-green-600 dark:text-green-400',
+    heavy: 'border-amber-500/50 text-amber-600 dark:text-amber-400',
   }
   return classes[planType.toLowerCase()] || ''
 }
@@ -3603,11 +3672,15 @@ function getQuotaAlertSnapshotState(key: PoolKeyDetail): { label: string, title:
   if (!quota) return null
 
   const code = String(quota.code || '').trim().toLowerCase()
-  if (code !== 'banned' && code !== 'forbidden') return null
+  if (!['banned', 'forbidden', 'quarantined', 'rate_limited', 'exhausted'].includes(code)) return null
 
   let label = String(quota.label || '').trim()
   if (!label) {
-    label = code === 'banned' ? '账号封禁' : '访问受限'
+    if (code === 'banned') label = '账号封禁'
+    else if (code === 'forbidden') label = '访问受限'
+    else if (code === 'quarantined') label = '账号隔离'
+    else if (code === 'rate_limited') label = '速率受限'
+    else label = '额度耗尽'
   } else if (label === '账号已封禁' || label === '封禁') {
     label = '账号封禁'
   }
@@ -3664,6 +3737,7 @@ function normalizeQuotaLabel(label: string): string {
 }
 
 function getQuotaProgressLabel(label: string): string {
+  if (label === '日') return '日'
   if (label === '5H') return '5H'
   if (label === '周') return '周'
   if (label === 'Spark5H') return 'Spark5H'
@@ -3674,7 +3748,8 @@ function getQuotaProgressLabel(label: string): string {
 }
 
 function getQuotaProgressCountdown(item: QuotaProgressItem) {
-  if (!['5H', '周', 'Spark5H', 'Spark周'].includes(item.label)) return null
+  const staticResetLabels = ['日', '5H', '周', 'Spark5H', 'Spark周', 'Auto', 'Fast', 'Expert', 'Heavy', 'Grok 4.3', '生图']
+  if (!item.allowDynamicReset && !staticResetLabels.includes(item.label)) return null
   if (item.resetAtSeconds == null && item.resetSeconds == null) return null
   return getCodexResetCountdown(
     item.resetAtSeconds,
@@ -3704,28 +3779,47 @@ function shouldHideQuotaProgressDetailText(text: string | null | undefined): boo
   return (text ?? '').trim().includes('已重置')
 }
 
-function getQuotaProgressDisplayText(item: QuotaProgressItem): string {
+function getQuotaProgressResetDisplayText(item: QuotaProgressItem): string {
   const countdownText = getQuotaProgressCountdownText(item)
   if (countdownText) return formatCompactQuotaCountdownText(countdownText)
+  return ''
+}
+
+function getQuotaProgressMeterDisplayText(item: QuotaProgressItem): string {
   const detail = item.detail?.trim() || ''
-  return shouldHideQuotaProgressDetailText(detail) ? '' : detail
+  if (!shouldHideQuotaProgressDetailText(detail) && detail) return detail
+  return `${item.remainingPercent.toFixed(1)}%`
 }
 
 function getQuotaFallbackText(key: PoolKeyDetail): string | null {
   return getQuotaDisplayText(key, selectedProviderType.value)
 }
 
+function getAccountQuotaText(key: PoolKeyDetail): string | null {
+  return getGeminiCliAccountCreditsText(key, selectedProviderType.value)
+}
+
 
 
 function getQuotaLabelOrder(label: string): number {
-  if (label === '5H') return 0
-  if (label === '周') return 1
-  if (label === 'Spark5H') return 2
-  if (label === 'Spark周') return 3
-  if (label === '剩余') return 4
-  if (label === '最低') return 5
-  if (label === '生图') return 6
-  return 10
+  if (label === 'Auto') return 0
+  if (label === 'Fast') return 1
+  if (label === 'Expert') return 2
+  if (label === 'Heavy') return 3
+  if (label === 'Grok 4.3') return 4
+  if (label === '日') return 5
+  if (label === '5H') return 6
+  if (label === '周') return 7
+  if (label === 'Spark5H') return 8
+  if (label === 'Spark周') return 9
+  if (label === 'Prompt') return 10
+  if (label === 'Flex') return 11
+  if (label === '剩余') return 12
+  if (label === '最低') return 13
+  if (label === '生图') return 14
+  if (label === '速率') return 15
+  if (label === '模型') return 16
+  return 20
 }
 
 function clampPercent(value: number): number {
@@ -3768,6 +3862,14 @@ function getCodexQuotaSnapshot(key: PoolKeyDetail): QuotaStatusSnapshot | null {
 
 function getQuotaSnapshotUpdatedAtSeconds(quota: QuotaStatusSnapshot | null | undefined): number | null {
   return normalizeUnixSeconds(quota?.updated_at ?? quota?.observed_at ?? null)
+}
+
+function getQuotaSnapshotResetAtSeconds(quota: QuotaStatusSnapshot | null | undefined): number | null {
+  return normalizeUnixSeconds(quota?.reset_at ?? null)
+}
+
+function getQuotaSnapshotResetSeconds(quota: QuotaStatusSnapshot | null | undefined): number | null {
+  return normalizeRemainingSeconds(quota?.reset_seconds ?? null)
 }
 
 function getQuotaSnapshotWindow(
@@ -3830,6 +3932,53 @@ function formatQuotaValue(value: number | null | undefined): string {
   return normalized.toFixed(1)
 }
 
+function getQuotaWindowValueText(window: QuotaWindowSnapshot | null | undefined): string | undefined {
+  if (!window || typeof window.limit_value !== 'number' || window.limit_value <= 0) return undefined
+  if (typeof window.remaining_value === 'number') {
+    return `${formatQuotaValue(window.remaining_value)}/${formatQuotaValue(window.limit_value)}`
+  }
+  if (typeof window.used_value === 'number') {
+    return `${formatQuotaValue(Math.max(window.limit_value - window.used_value, 0))}/${formatQuotaValue(window.limit_value)}`
+  }
+  return undefined
+}
+
+function resolvePoolKeyPlanType(key: PoolKeyDetail): string | null {
+  const direct = key.oauth_plan_type?.trim()
+  if (direct) return direct
+  const quota = getQuotaSnapshot(key)
+  const quotaPlan = quota?.plan_type?.trim()
+  if (quotaPlan) return quotaPlan
+  const quotaPoolTier = quota?.pool_tier?.trim()
+  return quotaPoolTier || null
+}
+
+const GROK_QUOTA_MODE_LABELS: Record<string, string> = {
+  quota_auto: 'Auto',
+  auto: 'Auto',
+  quota_fast: 'Fast',
+  fast: 'Fast',
+  quota_expert: 'Expert',
+  expert: 'Expert',
+  quota_heavy: 'Heavy',
+  heavy: 'Heavy',
+  quota_grok_4_3: 'Grok 4.3',
+  'grok-420-computer-use-sa': 'Grok 4.3',
+}
+
+function getGrokQuotaWindowLabel(window: QuotaWindowSnapshot): string {
+  const code = String(window.code || '').trim().replace(/^model:/i, '')
+  const label = String(window.label || window.model || code).trim()
+  const normalized = (label || code).toLowerCase()
+  return GROK_QUOTA_MODE_LABELS[normalized] || GROK_QUOTA_MODE_LABELS[code.toLowerCase()] || label || code || '模式'
+}
+
+function getGeminiCliQuotaWindowLabel(window: QuotaWindowSnapshot): string {
+  const code = String(window.code || '').trim().replace(/^model:/i, '')
+  const label = String(window.label || window.model || code).trim()
+  return label || code || '模型'
+}
+
 function buildQuotaProgressItemsFromSnapshot(key: PoolKeyDetail): QuotaProgressItem[] {
   const quota = getQuotaSnapshot(key)
   if (!quota) return []
@@ -3838,6 +3987,8 @@ function buildQuotaProgressItemsFromSnapshot(key: PoolKeyDetail): QuotaProgressI
 
   if (providerType === 'codex') {
     const items: QuotaProgressItem[] = []
+    const quotaResetAtSeconds = getQuotaSnapshotResetAtSeconds(quota)
+    const quotaResetSeconds = getQuotaSnapshotResetSeconds(quota)
     for (const [label, code] of [
       ['5H', '5h'],
       ['周', 'weekly'],
@@ -3850,8 +4001,8 @@ function buildQuotaProgressItemsFromSnapshot(key: PoolKeyDetail): QuotaProgressI
       items.push({
         label,
         remainingPercent,
-        resetAtSeconds: normalizeUnixSeconds(window?.reset_at ?? null),
-        resetSeconds: normalizeRemainingSeconds(window?.reset_seconds ?? null),
+        resetAtSeconds: normalizeUnixSeconds(window?.reset_at ?? quotaResetAtSeconds ?? null),
+        resetSeconds: normalizeRemainingSeconds(window?.reset_seconds ?? quotaResetSeconds ?? null),
         updatedAtSeconds: getQuotaSnapshotUpdatedAtSeconds(quota),
       })
     }
@@ -3859,6 +4010,8 @@ function buildQuotaProgressItemsFromSnapshot(key: PoolKeyDetail): QuotaProgressI
   }
 
   if (providerType === 'kiro') {
+    const quotaResetAtSeconds = getQuotaSnapshotResetAtSeconds(quota)
+    const quotaResetSeconds = getQuotaSnapshotResetSeconds(quota)
     const window = getQuotaSnapshotWindow(quota, 'usage')
       ?? getQuotaSnapshotWindowsByScope(quota, 'account')[0]
       ?? null
@@ -3873,10 +4026,98 @@ function buildQuotaProgressItemsFromSnapshot(key: PoolKeyDetail): QuotaProgressI
       label: '剩余',
       remainingPercent,
       detail,
-      resetAtSeconds: normalizeUnixSeconds(window?.reset_at ?? null),
-      resetSeconds: normalizeRemainingSeconds(window?.reset_seconds ?? null),
+      resetAtSeconds: normalizeUnixSeconds(window?.reset_at ?? quotaResetAtSeconds ?? null),
+      resetSeconds: normalizeRemainingSeconds(window?.reset_seconds ?? quotaResetSeconds ?? null),
       updatedAtSeconds: getQuotaSnapshotUpdatedAtSeconds(quota),
     }]
+  }
+
+  if (providerType === 'grok') {
+    const quotaResetAtSeconds = getQuotaSnapshotResetAtSeconds(quota)
+    const quotaResetSeconds = getQuotaSnapshotResetSeconds(quota)
+    const modelWindows = getQuotaSnapshotWindowsByScope(quota, 'model')
+    if (modelWindows.length > 0) {
+      return modelWindows
+        .map((window): QuotaProgressItem | null => {
+          const remainingPercent = getQuotaWindowRemainingPercent(window)
+          if (remainingPercent == null) return null
+          return {
+            label: getGrokQuotaWindowLabel(window),
+            remainingPercent,
+            detail: getQuotaWindowValueText(window),
+            resetAtSeconds: normalizeUnixSeconds(window?.reset_at ?? quotaResetAtSeconds ?? null),
+            resetSeconds: normalizeRemainingSeconds(window?.reset_seconds ?? quotaResetSeconds ?? null),
+            updatedAtSeconds: getQuotaSnapshotUpdatedAtSeconds(quota),
+          }
+        })
+        .filter((item): item is QuotaProgressItem => item != null)
+    }
+
+    const window = getQuotaSnapshotWindow(quota, 'usage')
+      ?? getQuotaSnapshotWindowsByScope(quota, 'account')[0]
+      ?? null
+    const remainingPercent = getQuotaWindowRemainingPercent(window)
+    if (remainingPercent == null) return []
+
+    return [{
+      label: '剩余',
+      remainingPercent,
+      detail: getQuotaWindowValueText(window),
+      resetAtSeconds: normalizeUnixSeconds(window?.reset_at ?? quotaResetAtSeconds ?? null),
+      resetSeconds: normalizeRemainingSeconds(window?.reset_seconds ?? quotaResetSeconds ?? null),
+      updatedAtSeconds: getQuotaSnapshotUpdatedAtSeconds(quota),
+    }]
+  }
+
+  if (providerType === 'windsurf') {
+    const items: QuotaProgressItem[] = []
+    for (const [label, code] of [
+      ['日', 'daily'],
+      ['周', 'weekly'],
+      ['Prompt', 'prompt'],
+      ['Flex', 'flex'],
+    ] as const) {
+      const window = getQuotaSnapshotWindow(quota, code)
+      const remainingPercent = getQuotaWindowRemainingPercent(window)
+      if (remainingPercent == null) continue
+      const detail = typeof window?.used_value === 'number' && typeof window?.limit_value === 'number'
+        ? `${formatQuotaValue(window.used_value)}/${formatQuotaValue(window.limit_value)}`
+        : typeof window?.remaining_value === 'number' && typeof window?.limit_value === 'number'
+          ? `剩余 ${formatQuotaValue(window.remaining_value)}/${formatQuotaValue(window.limit_value)}`
+          : undefined
+      items.push({
+        label,
+        remainingPercent,
+        detail,
+        resetAtSeconds: normalizeUnixSeconds(window?.reset_at ?? null),
+        resetSeconds: normalizeRemainingSeconds(window?.reset_seconds ?? null),
+        updatedAtSeconds: getQuotaSnapshotUpdatedAtSeconds(quota),
+      })
+    }
+
+    const rateLimitWindow = getQuotaSnapshotWindow(quota, 'rate_limit')
+    if (rateLimitWindow) {
+      items.push({
+        label: '速率',
+        remainingPercent: rateLimitWindow.is_exhausted ? 0 : 100,
+        resetAtSeconds: normalizeUnixSeconds(rateLimitWindow.reset_at ?? null),
+        resetSeconds: normalizeRemainingSeconds(rateLimitWindow.reset_seconds ?? null),
+        updatedAtSeconds: getQuotaSnapshotUpdatedAtSeconds(quota),
+      })
+    }
+
+    if (typeof quota.allowed_models_count === 'number' && Number.isFinite(quota.allowed_models_count)) {
+      items.push({
+        label: '模型',
+        remainingPercent: 100,
+        detail: `${quota.allowed_models_count} 个`,
+        resetAtSeconds: null,
+        resetSeconds: null,
+        updatedAtSeconds: getQuotaSnapshotUpdatedAtSeconds(quota),
+      })
+    }
+
+    return items
   }
 
   if (providerType === 'antigravity') {
@@ -3902,19 +4143,24 @@ function buildQuotaProgressItemsFromSnapshot(key: PoolKeyDetail): QuotaProgressI
     const windows = getQuotaSnapshotWindowsByScope(quota, 'model')
     if (windows.length === 0) return []
 
-    const remainingPercents = windows
-      .map(getQuotaWindowRemainingPercent)
-      .filter((value): value is number => value != null)
-    if (remainingPercents.length === 0) return []
-
-    return [{
-      label: '最低',
-      remainingPercent: Math.min(...remainingPercents),
-      detail: `${windows.length} 模型`,
-      resetAtSeconds: null,
-      resetSeconds: null,
-      updatedAtSeconds: getQuotaSnapshotUpdatedAtSeconds(quota),
-    }]
+    const quotaResetAtSeconds = getQuotaSnapshotResetAtSeconds(quota)
+    const quotaResetSeconds = getQuotaSnapshotResetSeconds(quota)
+    return windows
+      .map((window): QuotaProgressItem | null => {
+        const remainingPercent = getQuotaWindowRemainingPercent(window)
+          ?? (window?.is_exhausted === true ? 0 : null)
+        if (remainingPercent == null) return null
+        return {
+          label: getGeminiCliQuotaWindowLabel(window),
+          remainingPercent,
+          detail: getQuotaWindowValueText(window),
+          resetAtSeconds: normalizeUnixSeconds(window?.reset_at ?? quotaResetAtSeconds ?? null),
+          resetSeconds: normalizeRemainingSeconds(window?.reset_seconds ?? quotaResetSeconds ?? null),
+          updatedAtSeconds: getQuotaSnapshotUpdatedAtSeconds(quota),
+          allowDynamicReset: true,
+        }
+      })
+      .filter((item): item is QuotaProgressItem => item != null)
   }
 
   if (providerType === 'chatgpt_web') {
@@ -3927,10 +4173,10 @@ function buildQuotaProgressItemsFromSnapshot(key: PoolKeyDetail): QuotaProgressI
     const remainingValue = typeof window?.remaining_value === 'number' ? window.remaining_value : null
     const limitValue = typeof window?.limit_value === 'number' ? window.limit_value : null
     const usedValue = typeof window?.used_value === 'number' ? window.used_value : null
-    const detail = usedValue != null && limitValue != null
-      ? `${formatQuotaValue(usedValue)}/${formatQuotaValue(limitValue)}`
-      : remainingValue != null && limitValue != null
-        ? `${formatQuotaValue(Math.max(limitValue - remainingValue, 0))}/${formatQuotaValue(limitValue)}`
+    const detail = remainingValue != null && limitValue != null
+      ? `${formatQuotaValue(remainingValue)}/${formatQuotaValue(limitValue)}`
+      : usedValue != null && limitValue != null
+        ? `${formatQuotaValue(Math.max(limitValue - usedValue, 0))}/${formatQuotaValue(limitValue)}`
         : remainingValue != null
           ? `剩余 ${formatQuotaValue(remainingValue)}`
           : undefined
@@ -4073,29 +4319,6 @@ function getQuotaTextClass(quotaText: string): string {
     return 'text-[11px] text-destructive leading-4'
   }
   return 'text-[11px] text-foreground/90 leading-4'
-}
-
-function formatStatInteger(value: number | null | undefined): string {
-  const n = Number(value ?? 0)
-  if (!Number.isFinite(n) || n <= 0) return '0'
-  return Math.round(n).toLocaleString('en-US')
-}
-
-function formatTokenCount(value: number | null | undefined): string {
-  const n = Number(value ?? 0)
-  if (!Number.isFinite(n) || n <= 0) return '0'
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`
-  return String(Math.round(n))
-}
-
-function formatStatUsd(value: number | string | null | undefined): string {
-  const n = Number(value ?? 0)
-  if (!Number.isFinite(n) || n <= 0) return '$0.00'
-  if (n < 0.01) return `$${n.toFixed(4)}`
-  if (n < 1) return `$${n.toFixed(3)}`
-  if (n < 1000) return `$${n.toFixed(2)}`
-  return `$${n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
 }
 
 function formatPoolScore(value: number | null | undefined): string {

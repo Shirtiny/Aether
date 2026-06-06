@@ -34,6 +34,7 @@ export function useProviderFilters(
     { value: 'jina:embedding', label: 'Jina Embedding' },
     { value: 'jina:rerank', label: 'Jina Rerank' },
     { value: 'doubao:embedding', label: 'Doubao Embedding' },
+    { value: 'aliyun:multimodal_embedding', label: 'Aliyun Multimodal Embedding' },
   ]
 
   const modelFilters = computed<FilterOption[]>(() => {

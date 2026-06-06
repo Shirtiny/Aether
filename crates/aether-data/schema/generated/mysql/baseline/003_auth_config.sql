@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS oauth_providers (
     `frontend_callback_url` VARCHAR(500) NOT NULL,
     `attribute_mapping` JSON,
     `extra_config` JSON,
+    `icon_url` VARCHAR(500),
     `is_enabled` TINYINT(1) NOT NULL DEFAULT 0,
     `created_at` BIGINT NOT NULL,
     `updated_at` BIGINT NOT NULL,

@@ -33,6 +33,18 @@ impl AppState {
             .map_err(|err| GatewayError::Internal(err.to_string()))
     }
 
+    pub(crate) async fn list_required_unread_active_announcements(
+        &self,
+        user_id: &str,
+        now_unix_secs: u64,
+        limit: usize,
+    ) -> Result<Vec<aether_data::repository::announcements::StoredAnnouncement>, GatewayError> {
+        self.data
+            .list_required_unread_active_announcements(user_id, now_unix_secs, limit)
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))
+    }
+
     pub(crate) async fn create_announcement(
         &self,
         record: aether_data::repository::announcements::CreateAnnouncementRecord,

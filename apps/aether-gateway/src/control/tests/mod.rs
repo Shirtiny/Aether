@@ -86,6 +86,7 @@ mod admin_provider_query;
 mod admin_provider_strategy;
 mod admin_providers_models;
 mod admin_proxy_nodes;
+mod admin_routing;
 mod admin_security;
 mod admin_stats;
 mod admin_usage;

@@ -288,7 +288,8 @@
     <ManualCleanupConfirmDialog
       :open="manualCleanupDialogOpen"
       @update:open="manualCleanupDialogOpen = $event"
-      @confirm="handleManualCleanupConfirm"
+      @running-change="manualCleanupRunning = $event"
+      @completed="handleManualCleanupCompleted"
     />
 
     <div
@@ -402,7 +403,7 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref } from 'vue'
 import { RefreshCw, Trash2 } from 'lucide-vue-next'
-import { adminApi, type CleanupRunRecord, type ManualUsageCleanupResponse } from '@/api/admin'
+import { adminApi, type CleanupRunRecord } from '@/api/admin'
 import Button from '@/components/ui/button.vue'
 import Input from '@/components/ui/input.vue'
 import Label from '@/components/ui/label.vue'
@@ -410,7 +411,6 @@ import Switch from '@/components/ui/switch.vue'
 import { CardSection } from '@/components/layout'
 import ManualCleanupConfirmDialog from './ManualCleanupConfirmDialog.vue'
 import { useToast } from '@/composables/useToast'
-import { parseApiError } from '@/utils/errorParser'
 
 defineProps<{
   enableAutoCleanup: boolean
@@ -459,52 +459,18 @@ function openManualCleanupDialog() {
   manualCleanupDialogOpen.value = true
 }
 
-async function handleManualCleanupConfirm(olderThanDays: number | undefined) {
-  manualCleanupRunning.value = true
-  try {
-    const response = await adminApi.runManualUsageCleanup(
-      typeof olderThanDays === 'number' ? { older_than_days: olderThanDays } : {},
-    )
-    if ('detail' in response && response.detail === 'usage_cleanup_already_running') {
-      manualCleanupResult.value = {
-        title: '已有一次清理正在进行中',
-        description: response.message,
-      }
-      toast.warning(response.message)
-    } else {
-      const completed = response as ManualUsageCleanupResponse
-      manualCleanupResult.value = {
-        title: completed.message,
-        description: summarizeManualCleanup(completed),
-      }
-      toast.success(completed.message)
-    }
-    manualCleanupDialogOpen.value = false
-  } catch (error) {
-    const message = parseApiError(error).message
-    manualCleanupResult.value = {
-      title: '请求记录清理失败',
-      description: message,
-    }
-    toast.error(message)
-  } finally {
-    manualCleanupRunning.value = false
-    void loadCleanupRuns()
+function handleManualCleanupCompleted(task: CleanupRunRecord) {
+  manualCleanupRunning.value = false
+  manualCleanupResult.value = {
+    title: task.message,
+    description: cleanupSummaryText(task.summary),
   }
-}
-
-function summarizeManualCleanup(response: ManualUsageCleanupResponse): string {
-  const { summary } = response
-  const parts: string[] = []
-  if (summary.records_deleted > 0) parts.push(`删除整条记录 ${summary.records_deleted}`)
-  if (summary.body_externalized > 0) parts.push(`压缩 body ${summary.body_externalized}`)
-  if (summary.body_cleaned > 0) parts.push(`清除过期 body ${summary.body_cleaned}`)
-  if (summary.header_cleaned > 0) parts.push(`清除 headers ${summary.header_cleaned}`)
-  if (summary.legacy_body_refs_migrated > 0) {
-    parts.push(`迁移遗留引用 ${summary.legacy_body_refs_migrated}`)
+  if (task.status === 'failed') {
+    toast.error(task.error || task.message)
+  } else {
+    toast.success(task.message)
   }
-  if (summary.keys_cleaned > 0) parts.push(`回收 Key ${summary.keys_cleaned}`)
-  return parts.length > 0 ? parts.join(' / ') : '无数据变更'
+  void loadCleanupRuns()
 }
 
 async function loadCleanupRuns() {
@@ -568,7 +534,7 @@ function cleanupSummaryText(summary: Record<string, unknown>): string {
 
 function summaryLabel(key: string): string {
   const labels: Record<string, string> = {
-    body_externalized: '压缩',
+    body_externalized: '详细体',
     legacy_body_refs_migrated: '迁移',
     body_cleaned: '清体',
     header_cleaned: '清头',

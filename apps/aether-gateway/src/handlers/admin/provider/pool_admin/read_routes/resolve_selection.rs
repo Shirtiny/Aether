@@ -3,7 +3,7 @@ use super::{
     AdminPoolResolveSelectionRequest, ADMIN_POOL_PROVIDER_CATALOG_READER_UNAVAILABLE_DETAIL,
 };
 use crate::handlers::admin::request::{AdminAppState, AdminRequestContext};
-use crate::provider_key_auth::provider_key_auth_semantics;
+use crate::provider_key_auth::{provider_key_auth_semantics, provider_key_can_refresh_oauth};
 use crate::GatewayError;
 use aether_admin::provider::pool as admin_provider_pool_pure;
 use axum::{
@@ -94,6 +94,7 @@ pub(super) async fn build_admin_pool_resolve_selection_response(
         .iter()
         .map(|key| {
             let auth_semantics = provider_key_auth_semantics(key, &provider_type);
+            let auth_config = state.parse_catalog_auth_config_json(key);
             json!({
                 "key_id": key.id,
                 "key_name": key.name,
@@ -102,7 +103,7 @@ pub(super) async fn build_admin_pool_resolve_selection_response(
                 "credential_kind": auth_semantics.credential_kind().as_str(),
                 "runtime_auth_kind": auth_semantics.runtime_auth_kind().as_str(),
                 "oauth_managed": auth_semantics.oauth_managed(),
-                "can_refresh_oauth": auth_semantics.can_refresh_oauth(),
+                "can_refresh_oauth": provider_key_can_refresh_oauth(auth_semantics, auth_config.as_ref()),
                 "can_export_oauth": auth_semantics.can_export_oauth(),
                 "can_edit_oauth": auth_semantics.can_edit_oauth(),
             })

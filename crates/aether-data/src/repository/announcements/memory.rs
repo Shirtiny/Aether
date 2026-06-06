@@ -135,6 +135,48 @@ impl AnnouncementReadRepository for InMemoryAnnouncementReadRepository {
 
         Ok(total)
     }
+
+    async fn list_required_unread_active_announcements(
+        &self,
+        user_id: &str,
+        now_unix_secs: u64,
+        limit: usize,
+    ) -> Result<Vec<StoredAnnouncement>, DataLayerError> {
+        let announcements = self
+            .announcements
+            .read()
+            .expect("announcement repository lock");
+        let reads = self
+            .announcement_reads
+            .read()
+            .expect("announcement reads repository lock");
+
+        let mut items = announcements
+            .iter()
+            .filter(|announcement| {
+                announcement.requires_ack
+                    && announcement.is_active
+                    && announcement
+                        .start_time_unix_secs
+                        .is_none_or(|value| value <= now_unix_secs)
+                    && announcement
+                        .end_time_unix_secs
+                        .is_none_or(|value| value >= now_unix_secs)
+                    && !reads.contains(&(user_id.to_string(), announcement.id.clone()))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        items.sort_by(|left, right| {
+            right
+                .is_pinned
+                .cmp(&left.is_pinned)
+                .then_with(|| right.priority.cmp(&left.priority))
+                .then_with(|| right.created_at_unix_ms.cmp(&left.created_at_unix_ms))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        items.truncate(limit);
+        Ok(items)
+    }
 }
 
 #[async_trait]
@@ -153,6 +195,7 @@ impl AnnouncementWriteRepository for InMemoryAnnouncementReadRepository {
             record.priority,
             true,
             record.is_pinned,
+            record.requires_ack,
             Some(record.author_id),
             None,
             record.start_time_unix_secs.map(|value| value as i64),
@@ -200,6 +243,9 @@ impl AnnouncementWriteRepository for InMemoryAnnouncementReadRepository {
         }
         if let Some(is_pinned) = record.is_pinned {
             announcement.is_pinned = is_pinned;
+        }
+        if let Some(requires_ack) = record.requires_ack {
+            announcement.requires_ack = requires_ack;
         }
         if let Some(start_time_unix_secs) = record.start_time_unix_secs {
             announcement.start_time_unix_secs = Some(start_time_unix_secs);
@@ -261,6 +307,7 @@ mod tests {
             10,
             true,
             true,
+            false,
             Some("admin-1".to_string()),
             Some("admin".to_string()),
             None,
@@ -291,6 +338,7 @@ mod tests {
                 kind: "maintenance".to_string(),
                 priority: 10,
                 is_pinned: true,
+                requires_ack: false,
                 author_id: "admin-1".to_string(),
                 start_time_unix_secs: None,
                 end_time_unix_secs: None,
@@ -308,6 +356,7 @@ mod tests {
                 priority: Some(99),
                 is_active: Some(false),
                 is_pinned: Some(false),
+                requires_ack: Some(true),
                 start_time_unix_secs: None,
                 end_time_unix_secs: None,
             })
@@ -337,6 +386,7 @@ mod tests {
                     10,
                     true,
                     true,
+                    false,
                     Some("admin-1".to_string()),
                     Some("admin".to_string()),
                     None,
@@ -352,6 +402,7 @@ mod tests {
                     "info".to_string(),
                     5,
                     true,
+                    false,
                     false,
                     Some("admin-1".to_string()),
                     Some("admin".to_string()),

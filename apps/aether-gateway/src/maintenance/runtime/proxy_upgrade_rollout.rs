@@ -956,7 +956,8 @@ fn resolve_rollout_probe_config(
 fn normalize_rollout_version(version: &str) -> String {
     version
         .trim()
-        .strip_prefix("proxy-v")
+        .strip_prefix("tunnel-v")
+        .or_else(|| version.trim().strip_prefix("proxy-v"))
         .unwrap_or(version.trim())
         .to_ascii_lowercase()
 }

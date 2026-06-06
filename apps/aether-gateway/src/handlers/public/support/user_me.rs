@@ -1,8 +1,9 @@
 use super::{
-    auth_password_policy_level, build_auth_error_response, build_auth_wallet_summary_payload,
-    decrypt_catalog_secret_with_fallbacks, encrypt_catalog_secret_with_fallbacks, handle_auth_me,
+    auth_password_policy_level, base_url_from_request, build_auth_error_response,
+    build_auth_wallet_summary_payload, decrypt_catalog_secret_with_fallbacks,
+    encrypt_catalog_secret_with_fallbacks, handle_auth_me,
     handle_users_me_api_key_install_session_create, query_param_optional_bool, query_param_value,
-    resolve_authenticated_local_user, unix_secs_to_rfc3339,
+    resolve_authenticated_local_user, sanitize_public_model_config_for_user, unix_secs_to_rfc3339,
     users_me_api_key_install_sessions_path_matches, validate_auth_register_password, AppState,
     AuthenticatedLocalUserContext, GatewayPublicRequestContext, PUBLIC_CAPABILITY_DEFINITIONS,
 };
@@ -31,6 +32,9 @@ use user_me_catalog::*;
 #[path = "user_me_preferences.rs"]
 mod user_me_preferences;
 use user_me_preferences::*;
+#[path = "user_me_referral.rs"]
+mod user_me_referral;
+use user_me_referral::*;
 #[path = "user_me_profile.rs"]
 mod user_me_profile;
 use user_me_profile::*;

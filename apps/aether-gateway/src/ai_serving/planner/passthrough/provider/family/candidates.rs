@@ -13,6 +13,7 @@ use crate::ai_serving::planner::candidate_metadata::{
 use crate::ai_serving::planner::candidate_resolution::SkippedLocalExecutionCandidate;
 use crate::ai_serving::planner::common::extract_requested_model_from_request;
 use crate::ai_serving::planner::decision_input::{
+    attach_routing_policy_to_local_requested_model_input,
     build_local_requested_model_decision_input, resolve_local_authenticated_decision_input,
 };
 use crate::ai_serving::planner::materialization_policy::{
@@ -39,19 +40,21 @@ pub(crate) async fn resolve_local_same_format_provider_decision_input(
     decision: &GatewayControlDecision,
     body_json: &serde_json::Value,
     spec: LocalSameFormatProviderSpec,
-) -> Option<LocalSameFormatProviderDecisionInput> {
+) -> Result<Option<LocalSameFormatProviderDecisionInput>, GatewayError> {
     let spec_metadata = local_same_format_provider_spec_metadata(spec);
     let Some(auth_context) = resolve_local_decision_execution_runtime_auth_context(decision) else {
-        return None;
+        return Ok(None);
     };
 
-    let requested_model = extract_requested_model_from_request(
+    let Some(requested_model) = extract_requested_model_from_request(
         parts,
         body_json,
         spec_metadata
             .requested_model_family
             .expect("same-format provider specs should declare requested-model family"),
-    )?;
+    ) else {
+        return Ok(None);
+    };
 
     let resolved_input = match resolve_local_authenticated_decision_input(
         state,
@@ -62,7 +65,7 @@ pub(crate) async fn resolve_local_same_format_provider_decision_input(
     .await
     {
         Ok(Some(resolved_input)) => resolved_input,
-        Ok(None) => return None,
+        Ok(None) => return Ok(None),
         Err(err) => {
             warn!(
                 trace_id = %trace_id,
@@ -70,14 +73,31 @@ pub(crate) async fn resolve_local_same_format_provider_decision_input(
                 error = ?err,
                 "gateway local same-format decision auth snapshot read failed"
             );
-            return None;
+            return Err(err);
         }
     };
 
     let mut input = build_local_requested_model_decision_input(resolved_input, requested_model);
     input.request_auth_channel = decision.request_auth_channel.clone();
     input.client_session_affinity = client_session_affinity_from_parts(parts, Some(body_json));
-    Some(input)
+    if let Err(err) = attach_routing_policy_to_local_requested_model_input(
+        state,
+        parts,
+        &mut input,
+        body_json,
+        spec_metadata.api_format,
+    )
+    .await
+    {
+        warn!(
+            trace_id = %trace_id,
+            api_format = spec_metadata.api_format,
+            error = ?err,
+            "gateway local same-format decision routing profile resolution failed"
+        );
+        return Err(err);
+    }
+    Ok(Some(input))
 }
 
 pub(crate) async fn materialize_local_same_format_provider_candidate_attempts(
@@ -114,6 +134,7 @@ pub(crate) async fn materialize_local_same_format_provider_candidate_attempts(
         Some(&input.auth_snapshot),
         input.client_session_affinity.as_ref(),
         input.required_capabilities.as_ref(),
+        input.routing_policy.as_ref(),
         sticky_session_token.as_deref(),
         input.request_auth_channel.as_deref(),
         persistence_policy,
@@ -211,6 +232,7 @@ pub(crate) async fn build_local_same_format_provider_candidate_attempt_source<'a
         Some(&input.auth_snapshot),
         input.client_session_affinity.as_ref(),
         input.required_capabilities.as_ref(),
+        input.routing_policy.as_ref(),
         sticky_session_token.as_deref(),
         input.request_auth_channel.as_deref(),
         persistence_policy,

@@ -39,6 +39,18 @@ pub trait AiRuntimeMissDiagnosticPort: Send + Sync {
     fn runtime_miss_diagnostic_has_candidate_signal(&self, trace_id: &str) -> bool;
 }
 
+pub const AUTH_API_KEY_CONCURRENCY_LIMIT_SKIP_REASON: &str =
+    "auth_api_key_concurrency_limit_reached";
+pub const LEGACY_API_KEY_CONCURRENCY_LIMIT_SKIP_REASON: &str = "api_key_concurrency_limit_reached";
+
+fn auth_api_key_concurrency_skip_count<Diagnostic>(diagnostic: &Diagnostic) -> usize
+where
+    Diagnostic: AiRuntimeMissDiagnosticFields,
+{
+    diagnostic.skip_reason_count(AUTH_API_KEY_CONCURRENCY_LIMIT_SKIP_REASON)
+        + diagnostic.skip_reason_count(LEGACY_API_KEY_CONCURRENCY_LIMIT_SKIP_REASON)
+}
+
 pub trait AiRuntimeMissDiagnosticFields {
     fn set_reason(&mut self, reason: String);
     fn set_candidate_count(&mut self, candidate_count: usize);
@@ -75,9 +87,9 @@ pub fn apply_ai_runtime_candidate_terminal_plan_reason_to_diagnostic<Diagnostic>
         "candidate_list_empty".to_string()
     } else if skipped_candidate_count >= candidate_count
         && diagnostic.skip_reason_len() == 1
-        && diagnostic.skip_reason_count("api_key_concurrency_limit_reached") > 0
+        && auth_api_key_concurrency_skip_count(diagnostic) > 0
     {
-        "api_key_concurrency_limit_reached".to_string()
+        AUTH_API_KEY_CONCURRENCY_LIMIT_SKIP_REASON.to_string()
     } else if skipped_candidate_count >= candidate_count {
         "all_candidates_skipped".to_string()
     } else {
@@ -439,11 +451,11 @@ mod tests {
 
         record_ai_runtime_candidate_skip_reason_on_diagnostic(
             &mut diagnostic,
-            "api_key_concurrency_limit_reached",
+            AUTH_API_KEY_CONCURRENCY_LIMIT_SKIP_REASON,
         );
         record_ai_runtime_candidate_skip_reason_on_diagnostic(
             &mut diagnostic,
-            "api_key_concurrency_limit_reached",
+            AUTH_API_KEY_CONCURRENCY_LIMIT_SKIP_REASON,
         );
         apply_ai_runtime_candidate_terminal_plan_reason_to_diagnostic(
             &mut diagnostic,
@@ -456,7 +468,10 @@ mod tests {
             &mut diagnostic,
             "no_local_sync_plans",
         );
-        assert_eq!(diagnostic.reason, "api_key_concurrency_limit_reached");
+        assert_eq!(
+            diagnostic.reason,
+            AUTH_API_KEY_CONCURRENCY_LIMIT_SKIP_REASON
+        );
 
         record_ai_runtime_candidate_skip_reason_on_diagnostic(&mut diagnostic, "transport_missing");
         apply_ai_runtime_candidate_terminal_plan_reason_to_diagnostic(

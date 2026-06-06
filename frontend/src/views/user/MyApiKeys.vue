@@ -114,6 +114,9 @@
                   <div class="text-xs text-muted-foreground mt-0.5">
                     创建于 {{ formatDate(apiKey.created_at) }}
                   </div>
+                  <div class="text-xs text-muted-foreground mt-0.5 truncate">
+                    IP 限制：{{ formatIpRules(apiKey.ip_rules) }}
+                  </div>
                 </div>
               </TableCell>
 
@@ -191,6 +194,16 @@
               <!-- 操作按钮 -->
               <TableCell class="py-4">
                 <div class="flex justify-center gap-1">
+                  <Button
+                    :data-testid="`ccswitch-open-${apiKey.id}`"
+                    variant="ghost"
+                    size="icon"
+                    class="h-8 w-8"
+                    title="导入到 CC Switch"
+                    @click="openCcSwitchImportDialog(apiKey)"
+                  >
+                    <Download class="h-4 w-4" />
+                  </Button>
                   <Button
                     variant="ghost"
                     size="icon"
@@ -283,6 +296,16 @@
               </div>
               <div class="flex items-center gap-0.5 flex-shrink-0">
                 <Button
+                  :data-testid="`ccswitch-open-mobile-${apiKey.id}`"
+                  variant="ghost"
+                  size="icon"
+                  class="h-7 w-7"
+                  title="导入到 CC Switch"
+                  @click="openCcSwitchImportDialog(apiKey)"
+                >
+                  <Download class="h-3.5 w-3.5" />
+                </Button>
+                <Button
                   variant="ghost"
                   size="icon"
                   class="h-7 w-7"
@@ -354,6 +377,9 @@
                 <span class="text-muted-foreground">
                   {{ formatRateLimitSimple(apiKey.rate_limit) }}
                 </span>
+              </div>
+              <div class="text-xs text-muted-foreground truncate">
+                IP 限制：{{ formatIpRules(apiKey.ip_rules) }}
               </div>
             </div>
           </div>
@@ -448,6 +474,23 @@
           />
           <p class="text-xs text-muted-foreground">
             {{ editingApiKey ? '留空表示保持当前值，填 0 表示不限并发' : '留空表示不限并发，填 0 也表示不限并发' }}
+          </p>
+        </div>
+
+        <div class="space-y-2">
+          <Label
+            for="key-ip-rules"
+            class="text-sm font-semibold"
+          >IP 限制</Label>
+          <Input
+            id="key-ip-rules"
+            v-model="newKeyIpRulesText"
+            placeholder="例如：203.0.113.10, 10.0.0.0/24, !10.0.0.13"
+            class="h-11 border-border/60"
+            autocomplete="off"
+          />
+          <p class="text-xs text-muted-foreground">
+            留空表示不限制；支持 IP、CIDR、IPv4 通配符、*，用 ! 前缀拒绝，多个规则用英文逗号分隔
           </p>
         </div>
 
@@ -571,10 +614,168 @@
 
       <template #footer>
         <Button
+          data-testid="ccswitch-open-created-key"
+          variant="outline"
+          class="h-10 px-5 gap-2"
+          :disabled="!createdApiKey || !newKeyValue"
+          @click="openCcSwitchImportDialogForCreatedKey"
+        >
+          <Download class="h-4 w-4" />
+          导入 CC Switch
+        </Button>
+        <Button
           class="h-10 px-5"
           @click="closeCreatedKeyDialog"
         >
           确定
+        </Button>
+      </template>
+    </Dialog>
+
+    <!-- 导入 CC Switch 对话框 -->
+    <Dialog
+      v-model="showCcSwitchDialog"
+      size="lg"
+    >
+      <template #header>
+        <div class="border-b border-border px-6 py-4">
+          <div class="flex items-center gap-3">
+            <div class="flex h-9 w-9 items-center justify-center rounded-lg bg-primary/10 flex-shrink-0">
+              <Download class="h-5 w-5 text-primary" />
+            </div>
+            <div class="flex-1 min-w-0">
+              <h3 class="text-lg font-semibold text-foreground leading-tight">
+                导入到 CC Switch
+              </h3>
+              <p class="text-xs text-muted-foreground truncate">
+                当前密钥：{{ selectedCcSwitchApiKey?.name || '未选择' }}
+              </p>
+            </div>
+          </div>
+        </div>
+      </template>
+
+      <div class="space-y-5">
+        <div class="rounded-lg border border-border/60 bg-muted/30 p-3 text-xs text-muted-foreground">
+          选择目标客户端和模型 ID。点击导入后浏览器会请求打开 CC Switch，本页面不会展示或保存包含 API Key 的链接。
+        </div>
+
+        <div class="space-y-2">
+          <Label class="text-sm font-semibold">目标客户端</Label>
+          <div class="grid grid-cols-2 sm:grid-cols-3 gap-2">
+            <Button
+              v-for="option in ccSwitchTargetOptions"
+              :key="option.value"
+              :data-testid="`ccswitch-target-${option.value}`"
+              :variant="ccSwitchTargetApp === option.value ? 'default' : 'outline'"
+              class="justify-start h-auto py-3"
+              @click="selectCcSwitchTarget(option.value)"
+            >
+              {{ option.label }}
+            </Button>
+          </div>
+        </div>
+
+        <div class="space-y-2">
+          <Label
+            for="ccswitch-provider-name"
+            class="text-sm font-semibold"
+          >站点名称</Label>
+          <Input
+            id="ccswitch-provider-name"
+            :model-value="ccSwitchProviderName"
+            class="h-11 border-border/60"
+            autocomplete="off"
+            data-testid="ccswitch-provider-name"
+            @update:model-value="updateCcSwitchProviderName"
+          />
+        </div>
+
+        <div class="space-y-3">
+          <Label class="text-sm font-semibold">
+            {{ ccSwitchTargetApp === 'claude' ? '模型 ID 选择' : '模型 ID' }}
+          </Label>
+
+          <div class="space-y-3">
+            <div
+              v-for="field in ccSwitchModelFields"
+              :key="field.key"
+              class="space-y-1.5"
+            >
+              <Label
+                :for="`ccswitch-model-${field.key}`"
+                class="text-xs font-medium text-muted-foreground"
+              >
+                {{ field.label }}
+              </Label>
+              <Select
+                v-model="ccSwitchModelIds[field.key]"
+                :disabled="!ccSwitchHasModelOptions"
+              >
+                <SelectTrigger
+                  :id="`ccswitch-model-${field.key}`"
+                  :data-testid="`ccswitch-model-select-${field.key}`"
+                  class="h-11 rounded-2xl border-border/60 bg-card/80 font-mono text-xs"
+                >
+                  <SelectValue placeholder="选择模型 ID" />
+                </SelectTrigger>
+                <SelectContent
+                  class="max-w-[min(26rem,calc(100vw-4rem))] max-h-[22rem]"
+                  search-placeholder="搜索模型 ID..."
+                  :search-threshold="4"
+                >
+                  <SelectItem
+                    v-for="model in ccSwitchModelOptions"
+                    :key="model"
+                    :value="model"
+                    :text-value="model"
+                    class="font-mono"
+                  >
+                    {{ model }}
+                  </SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+
+          <p class="text-xs text-muted-foreground">
+            {{ ccSwitchModelHelpText }}
+          </p>
+          <p
+            v-if="!ccSwitchPreparing && !ccSwitchHasModelOptions"
+            class="text-xs text-destructive"
+          >
+            暂无可用模型，请联系管理员配置可用模型后再导入。
+          </p>
+        </div>
+
+        <div
+          v-if="ccSwitchPreparing"
+          class="text-xs text-muted-foreground"
+        >
+          正在加载导入配置...
+        </div>
+      </div>
+
+      <template #footer>
+        <Button
+          variant="outline"
+          class="h-10 px-5"
+          @click="showCcSwitchDialog = false"
+        >
+          关闭
+        </Button>
+        <Button
+          data-testid="ccswitch-confirm"
+          class="h-10 px-5 shadow-lg shadow-primary/20"
+          :disabled="ccSwitchConfirmDisabled"
+          @click="confirmCcSwitchImport"
+        >
+          <Loader2
+            v-if="ccSwitchLoading"
+            class="animate-spin h-4 w-4 mr-2"
+          />
+          {{ ccSwitchLoading ? '准备中...' : '导入到 CC Switch' }}
         </Button>
       </template>
     </Dialog>
@@ -711,7 +912,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, onBeforeUnmount, computed, watch } from 'vue'
+import { ref, onMounted, onBeforeUnmount, computed, watch, reactive } from 'vue'
 import { meApi, type ApiKey, type InstallSessionTargetSystem, type InstallTargetCli, type ApiKeyInstallSession } from '@/api/me'
 import Card from '@/components/ui/card.vue'
 import Button from '@/components/ui/button.vue'
@@ -719,7 +920,15 @@ import Input from '@/components/ui/input.vue'
 import Label from '@/components/ui/label.vue'
 import Badge from '@/components/ui/badge.vue'
 import Switch from '@/components/ui/switch.vue'
-import { Dialog, Pagination } from '@/components/ui'
+import {
+  Dialog,
+  Pagination,
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui'
 import { LoadingState, AlertDialog, EmptyState } from '@/components/common'
 import {
   Table,
@@ -730,7 +939,7 @@ import {
   TableRow
 } from '@/components/ui'
 import RefreshButton from '@/components/ui/refresh-button.vue'
-import { Plus, Key, Copy, Trash2, Loader2, Activity, CheckCircle, Power, SquarePen, Terminal } from 'lucide-vue-next'
+import { Plus, Key, Copy, Trash2, Loader2, Activity, CheckCircle, Power, SquarePen, Terminal, Download } from 'lucide-vue-next'
 import { useToast } from '@/composables/useToast'
 import { log } from '@/utils/logger'
 import { parseApiError } from '@/utils/errorParser'
@@ -742,6 +951,13 @@ import {
   mergeChatPiiRedactionFeatureSettings,
   readChatPiiRedactionFeatureSettings,
 } from '@/utils/featureSettings'
+import {
+  CC_SWITCH_TARGET_OPTIONS,
+  buildCcSwitchProviderImportUrl,
+  defaultCcSwitchProviderName,
+  type CcSwitchModelIds,
+  type CcSwitchTargetApp,
+} from '@/features/api-keys/utils/ccswitchImport'
 
 const { success, error: showError } = useToast()
 
@@ -756,6 +972,14 @@ const installSystemOptions: Array<{ value: InstallSessionTargetSystem; label: st
   { value: 'linux', label: 'Linux' },
   { value: 'windows', label: 'Windows' }
 ]
+
+const ccSwitchTargetOptions = CC_SWITCH_TARGET_OPTIONS
+type CcSwitchModelFieldKey = keyof Required<CcSwitchModelIds>
+
+interface CcSwitchModelField {
+  key: CcSwitchModelFieldKey
+  label: string
+}
 
 const apiKeys = ref<ApiKey[]>([])
 const loading = ref(false)
@@ -775,14 +999,17 @@ const showCreateDialog = ref(false)
 const showKeyDialog = ref(false)
 const showDeleteDialog = ref(false)
 const showInstallDialog = ref(false)
+const showCcSwitchDialog = ref(false)
 
 const newKeyName = ref('')
 const newKeyRateLimit = ref<number | undefined>(undefined)
 const newKeyConcurrentLimit = ref<number | undefined>(undefined)
+const newKeyIpRulesText = ref('')
 const keyRedactionMode = ref<'inherit' | 'custom'>('inherit')
 const newKeyRedactionEnabled = ref(false)
 const newKeyRedactionInjectNotice = ref(true)
 const newKeyValue = ref('')
+const createdApiKey = ref<ApiKey | null>(null)
 const keyToDelete = ref<ApiKey | null>(null)
 const editingApiKey = ref<ApiKey | null>(null)
 const selectedInstallApiKey = ref<ApiKey | null>(null)
@@ -793,6 +1020,22 @@ const installSession = ref<ApiKeyInstallSession | null>(null)
 const installLoading = ref(false)
 const installCopied = ref(false)
 let installCopiedResetTimer: ReturnType<typeof setTimeout> | null = null
+const selectedCcSwitchApiKey = ref<ApiKey | null>(null)
+const ccSwitchPlainApiKey = ref('')
+const ccSwitchTargetApp = ref<CcSwitchTargetApp>('claude')
+const ccSwitchProviderName = ref('')
+const ccSwitchProviderNameDirty = ref(false)
+const ccSwitchSiteName = ref('Aether')
+const ccSwitchModelIds = reactive<Record<CcSwitchModelFieldKey, string>>({
+  default: '',
+  haiku: '',
+  sonnet: '',
+  opus: '',
+})
+const ccSwitchBaseUrl = ref('')
+const ccSwitchAvailableModels = ref<string[]>([])
+const ccSwitchPreparing = ref(false)
+const ccSwitchLoading = ref(false)
 
 const installCommand = computed(() => {
   if (!installSession.value) return ''
@@ -807,6 +1050,42 @@ const installCommandHint = computed(() => {
   }
   return 'macOS / Linux 请在 sh 兼容终端中执行。install code 使用后立即失效，如需再次执行请重新生成。'
 })
+
+const ccSwitchModelOptions = computed(() => ccSwitchAvailableModels.value)
+const ccSwitchHasModelOptions = computed(() => ccSwitchModelOptions.value.length > 0)
+const ccSwitchConfirmDisabled = computed(() =>
+  ccSwitchLoading.value || ccSwitchPreparing.value || !ccSwitchHasModelOptions.value,
+)
+const ccSwitchModelFields = computed<CcSwitchModelField[]>(() => {
+  if (ccSwitchTargetApp.value === 'claude') {
+    return [
+      {
+        key: 'haiku',
+        label: 'Haiku 模型 ID',
+      },
+      {
+        key: 'sonnet',
+        label: 'Sonnet 模型 ID',
+      },
+      {
+        key: 'opus',
+        label: 'Opus 模型 ID',
+      },
+    ]
+  }
+
+  return [
+    {
+      key: 'default',
+      label: '默认模型 ID',
+    },
+  ]
+})
+const ccSwitchModelHelpText = computed(() =>
+  ccSwitchTargetApp.value === 'claude'
+    ? 'Claude Code 会分别写入 Haiku、Sonnet、Opus，Sonnet 同时作为默认模型；模型多时可在下拉中搜索并滚动选择。'
+    : '从 Aether 可用模型中选择，模型多时可在下拉中搜索并滚动选择。',
+)
 
 onMounted(() => {
   installSystem.value = detectCurrentSystem()
@@ -867,6 +1146,7 @@ function openEditApiKeyDialog(apiKey: ApiKey) {
   newKeyName.value = apiKey.name || ''
   newKeyRateLimit.value = apiKey.rate_limit ?? undefined
   newKeyConcurrentLimit.value = apiKey.concurrent_limit ?? undefined
+  newKeyIpRulesText.value = apiKey.ip_rules?.join(', ') ?? ''
   keyRedactionMode.value = hasRedactionFeature ? 'custom' : 'inherit'
   newKeyRedactionEnabled.value = redactionFeature.enabled
   newKeyRedactionInjectNotice.value = redactionFeature.inject_model_instruction
@@ -875,9 +1155,11 @@ function openEditApiKeyDialog(apiKey: ApiKey) {
 
 function openCreateApiKeyDialog() {
   editingApiKey.value = null
+  createdApiKey.value = null
   newKeyName.value = ''
   newKeyRateLimit.value = undefined
   newKeyConcurrentLimit.value = undefined
+  newKeyIpRulesText.value = ''
   keyRedactionMode.value = 'inherit'
   newKeyRedactionEnabled.value = false
   newKeyRedactionInjectNotice.value = true
@@ -942,10 +1224,210 @@ async function copyInstallCommand() {
   }, 2000)
 }
 
+function uniqueModelNames(models: Array<{ name?: string | null; display_name?: string | null }>): string[] {
+  const names = new Set<string>()
+  for (const model of models) {
+    const name = String(model.name || '').trim()
+    if (name) names.add(name)
+  }
+  return Array.from(names)
+}
+
+function findRecommendedModel(
+  models: string[],
+  predicate: (model: string) => boolean,
+): string | undefined {
+  return models.find(model => predicate(model.toLowerCase()))
+}
+
+function recommendedDefaultCcSwitchModel(targetApp: CcSwitchTargetApp, models: string[]): string {
+  const findModel = (predicate: (model: string) => boolean) =>
+    findRecommendedModel(models, predicate)
+
+  if (targetApp === 'claude') {
+    return findModel(model => model.includes('claude') && model.includes('sonnet'))
+      || findModel(model => model.includes('claude'))
+      || findModel(model => model.startsWith('gpt') || model.includes('gpt-'))
+      || models[0]
+      || ''
+  }
+
+  if (targetApp === 'gemini') {
+    return findModel(model => model.includes('gemini')) || models[0] || ''
+  }
+
+  return findModel(model => model.startsWith('gpt') || model.includes('gpt-'))
+    || models[0]
+    || ''
+}
+
+function recommendedCcSwitchModelIds(targetApp: CcSwitchTargetApp, models: string[]): Record<CcSwitchModelFieldKey, string> {
+  const defaultModel = recommendedDefaultCcSwitchModel(targetApp, models)
+
+  if (targetApp !== 'claude') {
+    return {
+      default: defaultModel,
+      haiku: '',
+      sonnet: '',
+      opus: '',
+    }
+  }
+
+  const gptFallback = findRecommendedModel(
+    models,
+    model => model.startsWith('gpt') || model.includes('gpt-'),
+  ) || defaultModel
+  const sonnet = findRecommendedModel(
+    models,
+    model => model.includes('sonnet'),
+  ) || findRecommendedModel(
+    models,
+    model => model.includes('claude'),
+  ) || gptFallback
+
+  return {
+    default: sonnet,
+    haiku: findRecommendedModel(models, model => model.includes('haiku')) || gptFallback,
+    sonnet,
+    opus: findRecommendedModel(models, model => model.includes('opus')) || sonnet,
+  }
+}
+
+function applyRecommendedCcSwitchModelIds(targetApp: CcSwitchTargetApp) {
+  const recommended = recommendedCcSwitchModelIds(targetApp, ccSwitchAvailableModels.value)
+  for (const field of ccSwitchModelFields.value) {
+    ccSwitchModelIds[field.key] = recommended[field.key]
+  }
+}
+
+function updateCcSwitchProviderName(value: string) {
+  ccSwitchProviderName.value = value
+  ccSwitchProviderNameDirty.value = true
+}
+
+function selectedCcSwitchModelIds(): CcSwitchModelIds {
+  if (ccSwitchTargetApp.value === 'claude') {
+    return {
+      default: ccSwitchModelIds.sonnet.trim(),
+      haiku: ccSwitchModelIds.haiku.trim(),
+      sonnet: ccSwitchModelIds.sonnet.trim(),
+      opus: ccSwitchModelIds.opus.trim(),
+    }
+  }
+
+  return {
+    default: ccSwitchModelIds.default.trim(),
+  }
+}
+
+async function prepareCcSwitchDialog() {
+  ccSwitchPreparing.value = true
+  try {
+    const [clientConfig, modelsResponse] = await Promise.all([
+      meApi.getClientConfig(),
+      meApi.getAvailableModels({ limit: 1000 }),
+    ])
+    ccSwitchBaseUrl.value = clientConfig.base_url
+    ccSwitchSiteName.value = clientConfig.site_name?.trim() || 'Aether'
+    if (!ccSwitchProviderNameDirty.value) {
+      ccSwitchProviderName.value = defaultCcSwitchProviderName(ccSwitchSiteName.value)
+    }
+    ccSwitchAvailableModels.value = uniqueModelNames(modelsResponse.models || [])
+    applyRecommendedCcSwitchModelIds(ccSwitchTargetApp.value)
+  } catch (error) {
+    log.error('加载 CC Switch 导入配置失败:', error)
+    showError(parseApiError(error, '加载 CC Switch 导入配置失败'))
+  } finally {
+    ccSwitchPreparing.value = false
+  }
+}
+
+async function openCcSwitchImportDialog(apiKey: ApiKey, plainApiKey = '') {
+  selectedCcSwitchApiKey.value = apiKey
+  ccSwitchPlainApiKey.value = plainApiKey
+  ccSwitchTargetApp.value = 'claude'
+  ccSwitchProviderNameDirty.value = false
+  ccSwitchProviderName.value = defaultCcSwitchProviderName(ccSwitchSiteName.value)
+  ccSwitchBaseUrl.value = ''
+  ccSwitchAvailableModels.value = []
+  for (const key of Object.keys(ccSwitchModelIds) as CcSwitchModelFieldKey[]) {
+    ccSwitchModelIds[key] = ''
+  }
+  showCcSwitchDialog.value = true
+  await prepareCcSwitchDialog()
+}
+
+async function openCcSwitchImportDialogForCreatedKey() {
+  if (!createdApiKey.value || !newKeyValue.value) return
+  pendingFirstInstallApiKey.value = null
+  showKeyDialog.value = false
+  await openCcSwitchImportDialog(createdApiKey.value, newKeyValue.value)
+}
+
+function selectCcSwitchTarget(value: CcSwitchTargetApp) {
+  ccSwitchTargetApp.value = value
+  applyRecommendedCcSwitchModelIds(value)
+}
+
+function isMissingFullApiKeyError(message: string): boolean {
+  return message.includes('没有存储完整密钥信息') || message.includes('缺少完整密钥')
+}
+
+async function confirmCcSwitchImport() {
+  if (!selectedCcSwitchApiKey.value) return
+
+  if (!ccSwitchHasModelOptions.value) {
+    showError('暂无可用模型，请联系管理员配置可用模型后再导入')
+    return
+  }
+
+  const missingModelField = ccSwitchModelFields.value.find(field => !ccSwitchModelIds[field.key].trim())
+  if (missingModelField) {
+    showError(`请填写${missingModelField.label}`)
+    return
+  }
+
+  ccSwitchLoading.value = true
+  try {
+    const apiKey = ccSwitchPlainApiKey.value
+      || (await meApi.getFullApiKey(selectedCcSwitchApiKey.value.id)).key
+    const baseUrl = ccSwitchBaseUrl.value || (await meApi.getClientConfig()).base_url
+    const importUrl = buildCcSwitchProviderImportUrl({
+      targetApp: ccSwitchTargetApp.value,
+      baseUrl,
+      apiKey,
+      apiKeyName: selectedCcSwitchApiKey.value.name,
+      siteName: ccSwitchSiteName.value,
+      modelIds: selectedCcSwitchModelIds(),
+      providerName: ccSwitchProviderName.value,
+    })
+
+    if (importUrl.length > 8000) {
+      showError('CC Switch 导入链接过长，请减少模型配置后重试')
+      return
+    }
+
+    window.location.href = importUrl
+    success('如果浏览器询问是否打开 CC Switch，请选择允许')
+    showCcSwitchDialog.value = false
+  } catch (error) {
+    log.error('生成 CC Switch 导入链接失败:', error)
+    const message = parseApiError(error, '生成 CC Switch 导入链接失败')
+    showError(
+      isMissingFullApiKeyError(message)
+        ? '该密钥缺少完整密钥信息，请重新创建 API Key'
+        : message,
+    )
+  } finally {
+    ccSwitchLoading.value = false
+  }
+}
+
 function closeCreatedKeyDialog() {
   showKeyDialog.value = false
   const pending = pendingFirstInstallApiKey.value
   pendingFirstInstallApiKey.value = null
+  createdApiKey.value = null
   if (pending) {
     void openInstallDialog(pending)
   }
@@ -954,9 +1436,13 @@ function closeCreatedKeyDialog() {
 function closeApiKeyDialog() {
   showCreateDialog.value = false
   editingApiKey.value = null
+  if (!showKeyDialog.value) {
+    createdApiKey.value = null
+  }
   newKeyName.value = ''
   newKeyRateLimit.value = undefined
   newKeyConcurrentLimit.value = undefined
+  newKeyIpRulesText.value = ''
   keyRedactionMode.value = 'inherit'
   newKeyRedactionEnabled.value = false
   newKeyRedactionInjectNotice.value = true
@@ -970,12 +1456,14 @@ async function saveApiKey() {
 
   creating.value = true
   try {
+    const ipRules = parseIpRulesInput(newKeyIpRulesText.value)
     const isCreatingFirstApiKey = !editingApiKey.value && apiKeys.value.length === 0
     if (editingApiKey.value) {
       await meApi.updateApiKey(editingApiKey.value.id, {
         name: newKeyName.value,
         rate_limit: newKeyRateLimit.value ?? 0,
         concurrent_limit: newKeyConcurrentLimit.value,
+        ip_rules: ipRules,
         feature_settings: keyRedactionMode.value === 'custom'
           ? mergeChatPiiRedactionFeatureSettings(editingApiKey.value.feature_settings, {
                 enabled: newKeyRedactionEnabled.value,
@@ -989,6 +1477,7 @@ async function saveApiKey() {
         name: newKeyName.value,
         rate_limit: newKeyRateLimit.value ?? 0,
         concurrent_limit: newKeyConcurrentLimit.value,
+        ip_rules: ipRules,
         ...(keyRedactionMode.value === 'custom'
           ? {
               feature_settings: mergeChatPiiRedactionFeatureSettings(null, {
@@ -999,6 +1488,7 @@ async function saveApiKey() {
           : {}),
       })
       newKeyValue.value = newKey.key || ''
+      createdApiKey.value = newKey
       if (isCreatingFirstApiKey) {
         pendingFirstInstallApiKey.value = newKey
       }
@@ -1116,6 +1606,18 @@ function formatConcurrentLimitSimple(concurrentLimit?: number | null): string {
     return '不限并发'
   }
   return `${concurrentLimit} 并发`
+}
+
+function formatIpRules(ipRules?: string[] | null): string {
+  return ipRules && ipRules.length > 0 ? ipRules.join(', ') : '不限制'
+}
+
+function parseIpRulesInput(value: string): string[] | null {
+  const items = value
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean)
+  return items.length > 0 ? items : null
 }
 
 function formatDate(dateString?: string | null): string {

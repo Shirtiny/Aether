@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use sqlx::{sqlite::SqliteRow, Row};
+use sqlx::{sqlite::SqliteRow, QueryBuilder, Row, Sqlite};
 
 use super::types::{
     OAuthProviderReadRepository, OAuthProviderWriteRepository, StoredOAuthProviderConfig,
@@ -8,6 +8,7 @@ use super::types::{
 use crate::driver::sqlite::SqlitePool;
 use crate::error::SqlResultExt;
 use crate::DataLayerError;
+use aether_data_query::{push_eq, push_limit, WhereClause};
 
 #[derive(Debug, Clone)]
 pub struct SqliteOAuthProviderRepository {
@@ -23,8 +24,17 @@ impl SqliteOAuthProviderRepository {
         &self,
         provider_type: &str,
     ) -> Result<Option<StoredOAuthProviderConfig>, DataLayerError> {
-        let row = sqlx::query(GET_OAUTH_PROVIDER_CONFIG_SQL)
-            .bind(provider_type)
+        let mut builder = QueryBuilder::<Sqlite>::new(OAUTH_PROVIDER_COLUMNS);
+        let mut where_clause = WhereClause::new();
+        push_eq(
+            &mut builder,
+            &mut where_clause,
+            "provider_type",
+            provider_type.to_string(),
+        );
+        push_limit(&mut builder, 1);
+        let row = builder
+            .build()
             .fetch_optional(&self.pool)
             .await
             .map_sql_err()?;
@@ -32,7 +42,7 @@ impl SqliteOAuthProviderRepository {
     }
 }
 
-const LIST_OAUTH_PROVIDER_CONFIGS_SQL: &str = r#"
+const OAUTH_PROVIDER_COLUMNS: &str = r#"
 SELECT
   provider_type,
   display_name,
@@ -46,33 +56,11 @@ SELECT
   frontend_callback_url,
   attribute_mapping,
   extra_config,
+  icon_url,
   is_enabled,
   created_at AS created_at_unix_ms,
   updated_at AS updated_at_unix_secs
 FROM oauth_providers
-ORDER BY provider_type ASC
-"#;
-
-const GET_OAUTH_PROVIDER_CONFIG_SQL: &str = r#"
-SELECT
-  provider_type,
-  display_name,
-  client_id,
-  client_secret_encrypted,
-  authorization_url_override,
-  token_url_override,
-  userinfo_url_override,
-  scopes,
-  redirect_uri,
-  frontend_callback_url,
-  attribute_mapping,
-  extra_config,
-  is_enabled,
-  created_at AS created_at_unix_ms,
-  updated_at AS updated_at_unix_secs
-FROM oauth_providers
-WHERE provider_type = ?
-LIMIT 1
 "#;
 
 const COUNT_LOCKED_USERS_IF_PROVIDER_DISABLED_SQL: &str = r#"
@@ -117,10 +105,9 @@ impl OAuthProviderReadRepository for SqliteOAuthProviderRepository {
     async fn list_oauth_provider_configs(
         &self,
     ) -> Result<Vec<StoredOAuthProviderConfig>, DataLayerError> {
-        let rows = sqlx::query(LIST_OAUTH_PROVIDER_CONFIGS_SQL)
-            .fetch_all(&self.pool)
-            .await
-            .map_sql_err()?;
+        let mut builder = QueryBuilder::<Sqlite>::new(OAUTH_PROVIDER_COLUMNS);
+        builder.push(" ORDER BY provider_type ASC");
+        let rows = builder.build().fetch_all(&self.pool).await.map_sql_err()?;
         rows.iter().map(map_oauth_provider_row).collect()
     }
 
@@ -176,13 +163,14 @@ INSERT INTO oauth_providers (
   frontend_callback_url,
   attribute_mapping,
   extra_config,
+  icon_url,
   is_enabled,
   created_at,
   updated_at
 ) VALUES (
   ?, ?, ?,
   CASE ? WHEN 'set' THEN ? WHEN 'clear' THEN NULL ELSE NULL END,
-  ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+  ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
 )
 ON CONFLICT(provider_type) DO UPDATE SET
   display_name = excluded.display_name,
@@ -200,6 +188,7 @@ ON CONFLICT(provider_type) DO UPDATE SET
   frontend_callback_url = excluded.frontend_callback_url,
   attribute_mapping = excluded.attribute_mapping,
   extra_config = excluded.extra_config,
+  icon_url = excluded.icon_url,
   is_enabled = excluded.is_enabled,
   updated_at = excluded.updated_at
 "#,
@@ -217,6 +206,7 @@ ON CONFLICT(provider_type) DO UPDATE SET
         .bind(&record.frontend_callback_url)
         .bind(json_to_string(record.attribute_mapping.as_ref())?)
         .bind(json_to_string(record.extra_config.as_ref())?)
+        .bind(record.icon_url.as_deref())
         .bind(record.is_enabled)
         .bind(now as i64)
         .bind(now as i64)
@@ -364,6 +354,7 @@ fn map_oauth_provider_row(row: &SqliteRow) -> Result<StoredOAuthProviderConfig, 
             row.try_get("extra_config").map_sql_err()?,
             "oauth_providers.extra_config",
         )?,
+        row.try_get("icon_url").map_sql_err()?,
         row.try_get("is_enabled").map_sql_err()?,
     )
     .with_timestamps(
@@ -395,6 +386,7 @@ mod tests {
             frontend_callback_url: "https://frontend.example.com/auth/callback".to_string(),
             attribute_mapping: Some(serde_json::json!({"email": "email"})),
             extra_config: Some(serde_json::json!({"team": true})),
+            icon_url: None,
             is_enabled: true,
         }
     }

@@ -100,6 +100,7 @@ impl OAuthProviderWriteRepository for InMemoryOAuthProviderRepository {
             record.scopes.clone(),
             record.attribute_mapping.clone(),
             record.extra_config.clone(),
+            record.icon_url.clone(),
             record.is_enabled,
         )
         .with_timestamps(created_at, now);
@@ -150,6 +151,7 @@ mod tests {
             frontend_callback_url: "https://frontend.example.com/auth/callback".to_string(),
             attribute_mapping: Some(serde_json::json!({"email": "email"})),
             extra_config: Some(serde_json::json!({"team": true})),
+            icon_url: None,
             is_enabled: true,
         }
     }

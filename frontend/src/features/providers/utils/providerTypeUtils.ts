@@ -11,6 +11,8 @@ const oauthAccountProviderTypes = new Set([
   'gemini_cli',
   'antigravity',
   'kiro',
+  'grok',
+  'windsurf',
 ])
 
 export const isOAuthAccountProviderType = (providerType?: string | null): boolean =>

@@ -18,6 +18,18 @@ const routes: RouteRecordRaw[] = [
     component: () => importWithRetry(() => import('@/views/public/Home.vue')),
     meta: { requiresAuth: false }
   },
+  {
+    path: '/register',
+    name: 'RegisterEntry',
+    component: () => importWithRetry(() => import('@/views/public/Home.vue')),
+    meta: { requiresAuth: false }
+  },
+  {
+    path: '/privacy-policy',
+    name: 'PrivacyPolicy',
+    component: () => importWithRetry(() => import('@/views/public/PrivacyPolicy.vue')),
+    meta: { requiresAuth: false }
+  },
 
   {
     path: '/guide',
@@ -133,6 +145,11 @@ const routes: RouteRecordRaw[] = [
         component: () => importWithRetry(() => import('@/views/user/BillingPlans.vue'))
       },
       {
+        path: 'referral',
+        name: 'ReferralCenter',
+        component: () => importWithRetry(() => import('@/views/user/ReferralCenter.vue'))
+      },
+      {
         path: 'models',
         name: 'ModelCatalog',
         component: () => importWithRetry(() => import('@/views/user/ModelCatalog.vue'))
@@ -180,6 +197,11 @@ const routes: RouteRecordRaw[] = [
         component: () => importWithRetry(() => import('@/views/admin/BillingPlansManagement.vue'))
       },
       {
+        path: 'referrals',
+        name: 'ReferralManagement',
+        component: () => importWithRetry(() => import('@/views/admin/ReferralManagement.vue'))
+      },
+      {
         path: 'management-tokens',
         name: 'AdminManagementTokens',
         component: () => importWithRetry(() => import('@/views/user/ManagementTokens.vue')),
@@ -199,6 +221,11 @@ const routes: RouteRecordRaw[] = [
         path: 'models',
         name: 'ModelManagement',
         component: () => importWithRetry(() => import('@/views/admin/ModelManagement.vue'))
+      },
+      {
+        path: 'routing',
+        name: 'RoutingProfiles',
+        component: () => importWithRetry(() => import('@/views/admin/RoutingProfiles.vue'))
       },
       {
         path: 'health-monitor',
@@ -246,6 +273,42 @@ const routes: RouteRecordRaw[] = [
         name: 'ChatPiiRedactionModule',
         component: () => importWithRetry(() => import('@/views/admin/modules/ChatPiiRedaction.vue')),
         meta: { module: 'chat_pii_redaction' }
+      },
+      {
+        path: 'modules/s3-backup',
+        name: 'S3BackupSettings',
+        component: () => importWithRetry(() => import('@/views/admin/modules/S3BackupSettings.vue')),
+        meta: { module: 's3_backup' }
+      },
+      {
+        path: 'modules/important-notification',
+        redirect: '/admin/notification-service'
+      },
+      {
+        path: 'notification-service',
+        name: 'ImportantNotificationModule',
+        component: () => importWithRetry(() => import('@/views/admin/modules/ImportantNotification.vue')),
+        meta: { module: 'important_notification' }
+      },
+      {
+        path: 'server-chan',
+        redirect: '/admin/modules/server-chan'
+      },
+      {
+        path: 'modules/server-chan',
+        name: 'ServerChanSettings',
+        component: () => importWithRetry(() => import('@/views/admin/modules/ServerChanSettings.vue')),
+        meta: { module: 'server_chan_push' }
+      },
+      {
+        path: 'bark',
+        redirect: '/admin/modules/bark'
+      },
+      {
+        path: 'modules/bark',
+        name: 'BarkSettings',
+        component: () => importWithRetry(() => import('@/views/admin/modules/BarkSettings.vue')),
+        meta: { module: 'bark_push' }
       },
       {
         path: 'email',

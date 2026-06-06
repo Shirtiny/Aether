@@ -138,6 +138,11 @@ const PERMISSION_GROUPS: &[PermissionGroup] = &[
         assignable: true,
     },
     PermissionGroup {
+        scope: "routing_profiles",
+        label: "调度分组",
+        assignable: true,
+    },
+    PermissionGroup {
         scope: "security",
         label: "安全",
         assignable: true,
@@ -446,6 +451,9 @@ fn permission_key(scope: &str, access: &str) -> &'static str {
         ("proxy_nodes", "read") => "admin:proxy_nodes:read",
         ("proxy_nodes", "write") => "admin:proxy_nodes:write",
         ("proxy_nodes", "admin") => "admin:proxy_nodes:admin",
+        ("routing_profiles", "read") => "admin:routing_profiles:read",
+        ("routing_profiles", "write") => "admin:routing_profiles:write",
+        ("routing_profiles", "admin") => "admin:routing_profiles:admin",
         ("security", "read") => "admin:security:read",
         ("security", "write") => "admin:security:write",
         ("security", "admin") => "admin:security:admin",

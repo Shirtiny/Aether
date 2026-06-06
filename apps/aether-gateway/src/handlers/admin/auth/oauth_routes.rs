@@ -16,7 +16,7 @@ use axum::{
 use serde_json::json;
 use std::time::Duration;
 
-const ADMIN_OAUTH_TEST_TIMEOUT_SECS: u64 = 5;
+const ADMIN_OAUTH_TEST_TIMEOUT_SECS: u64 = 10;
 const LINUXDO_AUTHORIZATION_URL: &str = "https://connect.linux.do/oauth2/authorize";
 const LINUXDO_TOKEN_URL: &str = "https://connect.linux.do/oauth2/token";
 
@@ -54,10 +54,7 @@ async fn admin_oauth_endpoint_reachable(client: &reqwest::Client, url: &str) -> 
         .send()
         .await
     {
-        Ok(response) => {
-            let status = response.status();
-            status != reqwest::StatusCode::NOT_FOUND && status.as_u16() < 500
-        }
+        Ok(response) => response.status().as_u16() < 500,
         Err(_) => false,
     }
 }
@@ -120,10 +117,16 @@ async fn build_admin_oauth_test_payload(
         }));
     };
 
-    let client = reqwest::Client::builder()
+    let proxy_snapshot = state.app().resolve_system_proxy_snapshot().await;
+    let mut client_builder = reqwest::Client::builder()
         .timeout(Duration::from_secs(ADMIN_OAUTH_TEST_TIMEOUT_SECS))
-        .redirect(reqwest::redirect::Policy::limited(3))
-        .build();
+        .redirect(reqwest::redirect::Policy::limited(3));
+    if let Some(proxy_url) = proxy_snapshot.as_ref().and_then(|p| p.url.as_deref()) {
+        if let Ok(proxy) = reqwest::Proxy::all(proxy_url) {
+            client_builder = client_builder.proxy(proxy);
+        }
+    }
+    let client = client_builder.build();
     let Ok(client) = client else {
         return Ok(json!({
             "authorization_url_reachable": false,

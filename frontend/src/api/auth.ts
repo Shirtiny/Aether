@@ -69,6 +69,9 @@ export interface RegisterRequest {
   username: string
   password: string
   turnstile_token?: string
+  invite_code?: string
+  privacy_policy_accepted?: boolean
+  privacy_policy_version?: string
 }
 
 export interface RegisterResponse {
@@ -86,6 +89,14 @@ export interface RegistrationSettingsResponse {
   turnstile_enabled?: boolean
   turnstile_site_key?: string | null
   turnstile_required_actions?: string[]
+  privacy_policy?: RegistrationPrivacyPolicySettings
+}
+
+export interface RegistrationPrivacyPolicySettings {
+  enabled: boolean
+  format: 'markdown' | 'html'
+  content: string
+  version: string
 }
 
 export interface AuthSettingsResponse {
@@ -153,7 +164,7 @@ export const authApi = {
   },
 
   async refreshToken(): Promise<LoginResponse> {
-    const response = await apiClient.post<LoginResponse>('/api/auth/refresh', {})
+    const response = await apiClient.post<LoginResponse>('/api/auth/refresh')
     apiClient.setToken(response.data.access_token)
     return response.data
   },

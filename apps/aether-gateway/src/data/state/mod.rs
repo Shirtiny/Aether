@@ -119,24 +119,35 @@ use aether_data_contracts::repository::pool_scores::{
 };
 use aether_data_contracts::repository::provider_catalog::{
     ProviderCatalogKeyListQuery, ProviderCatalogReadRepository, ProviderCatalogWriteRepository,
-    StoredProviderCatalogEndpoint, StoredProviderCatalogKey, StoredProviderCatalogKeyPage,
+    StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
+    StoredProviderCatalogKeyMaintenanceSummary, StoredProviderCatalogKeyPage,
     StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
 };
 use aether_data_contracts::repository::quota::{
     ProviderQuotaReadRepository, ProviderQuotaWriteRepository, StoredProviderQuotaSnapshot,
 };
+use aether_data_contracts::repository::routing_profiles::{
+    RoutingGroupReadRepository, RoutingGroupWriteRepository,
+};
 use aether_data_contracts::repository::settlement::{
     SettlementWriteRepository, StoredUsageSettlement, UsageSettlementInput,
 };
 use aether_data_contracts::repository::usage::{
-    PendingUsageCleanupSummary, StoredProviderUsageSummary, StoredRequestUsageAudit,
-    UpsertUsageRecord, UsageReadRepository, UsageWriteRepository,
+    ApiKeyLastUsedDelta, ManagementTokenCounterDelta, PendingUsageCleanupSummary,
+    ProxyNodeCounterDelta, StoredProviderUsageSummary, StoredRequestUsageAudit, UpsertUsageRecord,
+    UsageReadRepository, UsageWriteRepository,
 };
 use aether_data_contracts::repository::video_tasks::{
     StoredVideoTask, UpsertVideoTask, VideoTaskLookupKey, VideoTaskModelCount,
     VideoTaskQueryFilter, VideoTaskReadRepository, VideoTaskStatusCount, VideoTaskWriteRepository,
 };
 use aether_runtime_state::RuntimeQueueStore;
+
+pub(crate) use self::referrals::{
+    ReferralAdminStats, ReferralMutationStatus, ReferralRelationshipListQuery,
+    ReferralRelationshipRecord, ReferralRewardConfig, ReferralRewardListQuery,
+    ReferralRewardRecord, ReferralUserDashboard,
+};
 
 #[derive(Clone, Default)]
 pub(crate) struct GatewayDataState {
@@ -170,6 +181,8 @@ pub(crate) struct GatewayDataState {
     pool_score_writer: Option<Arc<dyn PoolMemberScoreWriteRepository>>,
     provider_quota_reader: Option<Arc<dyn ProviderQuotaReadRepository>>,
     provider_quota_writer: Option<Arc<dyn ProviderQuotaWriteRepository>>,
+    routing_group_reader: Option<Arc<dyn RoutingGroupReadRepository>>,
+    routing_group_writer: Option<Arc<dyn RoutingGroupWriteRepository>>,
     usage_reader: Option<Arc<dyn UsageReadRepository>>,
     usage_writer: Option<Arc<dyn UsageWriteRepository>>,
     user_reader: Option<Arc<dyn UserReadRepository>>,
@@ -279,6 +292,14 @@ impl fmt::Debug for GatewayDataState {
                 "has_provider_quota_writer",
                 &self.provider_quota_writer.is_some(),
             )
+            .field(
+                "has_routing_group_reader",
+                &self.routing_group_reader.is_some(),
+            )
+            .field(
+                "has_routing_group_writer",
+                &self.routing_group_writer.is_some(),
+            )
             .field("has_usage_reader", &self.usage_reader.is_some())
             .field("has_usage_writer", &self.usage_writer.is_some())
             .field("has_user_preferences", &self.user_preferences.is_some())
@@ -297,11 +318,15 @@ impl fmt::Debug for GatewayDataState {
 }
 
 mod auth;
+mod candidate_cache;
 mod catalog;
 mod core;
 mod integrations;
 mod models;
 mod pool_scores;
+mod provider_catalog_cache;
+mod referrals;
+mod routing_profiles;
 mod runtime;
 #[cfg(test)]
 mod testing;

@@ -37,12 +37,17 @@ use super::{
 use aether_data_contracts::repository::usage::{
     PendingUsageCleanupSummary, ProviderApiKeyWindowUsageRequest,
     StoredProviderApiKeyWindowUsageSummary, StoredUsageDailySummary, UsageAuditListQuery,
-    UsageCleanupSummary, UsageCleanupWindow, UsageDailyHeatmapQuery,
+    UsageCleanupExecutionMode, UsageCleanupSummary, UsageCleanupTargets, UsageCleanupWindow,
+    UsageCounterFlushSummary, UsageCounterHealthSnapshot, UsageDailyHeatmapQuery,
 };
 use aether_runtime_state::RuntimeQueueStore;
 use aether_video_tasks_core::read_data_backed_video_task_response;
+use std::time::{Duration, Instant};
 
 impl GatewayDataState {
+    const MAINTENANCE_POOL_IDLE_RESERVE: usize = 1;
+    const MAINTENANCE_POOL_PRESSURE_MAX_DEFER: Duration = Duration::from_secs(30);
+
     pub(crate) async fn run_database_maintenance(
         &self,
         table_names: &[&str],
@@ -109,6 +114,47 @@ impl GatewayDataState {
         self.backends
             .as_ref()
             .and_then(|backends| backends.database_pool_summary())
+    }
+
+    pub(crate) fn database_pool_under_maintenance_pressure(&self) -> bool {
+        self.database_pool_summary()
+            .as_ref()
+            .is_some_and(Self::database_pool_summary_under_maintenance_pressure)
+    }
+
+    pub(crate) fn database_pool_summary_under_maintenance_pressure(
+        summary: &aether_data::DatabasePoolSummary,
+    ) -> bool {
+        summary.checked_out > 0 && summary.idle <= Self::MAINTENANCE_POOL_IDLE_RESERVE
+    }
+
+    pub(crate) fn should_defer_maintenance_for_database_pool_pressure(
+        &self,
+        deferred_since: &mut Option<Instant>,
+    ) -> bool {
+        Self::should_defer_maintenance_for_pool_pressure_state(
+            self.database_pool_under_maintenance_pressure(),
+            deferred_since,
+        )
+    }
+
+    pub(crate) fn should_defer_maintenance_for_pool_pressure_state(
+        pool_under_pressure: bool,
+        deferred_since: &mut Option<Instant>,
+    ) -> bool {
+        if !pool_under_pressure {
+            *deferred_since = None;
+            return false;
+        }
+
+        let now = Instant::now();
+        let since = deferred_since.get_or_insert(now);
+        if now.duration_since(*since) >= Self::MAINTENANCE_POOL_PRESSURE_MAX_DEFER {
+            *deferred_since = None;
+            return false;
+        }
+
+        true
     }
 
     pub(crate) async fn aggregate_wallet_daily_usage(
@@ -258,6 +304,22 @@ impl GatewayDataState {
                     .await
             }
             None => Ok(0),
+        }
+    }
+
+    pub(crate) async fn list_required_unread_active_announcements(
+        &self,
+        user_id: &str,
+        now_unix_secs: u64,
+        limit: usize,
+    ) -> Result<Vec<StoredAnnouncement>, DataLayerError> {
+        match &self.announcement_reader {
+            Some(repository) => {
+                repository
+                    .list_required_unread_active_announcements(user_id, now_unix_secs, limit)
+                    .await
+            }
+            None => Ok(Vec::new()),
         }
     }
 
@@ -653,6 +715,21 @@ impl GatewayDataState {
         }
     }
 
+    pub(crate) async fn find_pending_plan_purchase_order_by_user_id(
+        &self,
+        user_id: &str,
+        product_id: &str,
+    ) -> Result<Option<StoredAdminPaymentOrder>, DataLayerError> {
+        match &self.wallet_reader {
+            Some(repository) => {
+                repository
+                    .find_pending_plan_purchase_order_by_user_id(user_id, product_id)
+                    .await
+            }
+            None => Ok(None),
+        }
+    }
+
     pub(crate) async fn find_wallet_refund(
         &self,
         wallet_id: &str,
@@ -953,6 +1030,31 @@ impl GatewayDataState {
         }
     }
 
+    pub(crate) async fn flush_usage_counter_deltas(
+        &self,
+        batch_size: usize,
+    ) -> Result<UsageCounterFlushSummary, DataLayerError> {
+        match &self.usage_writer {
+            Some(repository) => repository.flush_usage_counter_deltas(batch_size).await,
+            None => Ok(UsageCounterFlushSummary::default()),
+        }
+    }
+
+    pub(crate) async fn cleanup_processed_usage_counter_deltas(
+        &self,
+        cutoff_unix_secs: u64,
+        batch_size: usize,
+    ) -> Result<usize, DataLayerError> {
+        match &self.usage_writer {
+            Some(repository) => {
+                repository
+                    .cleanup_processed_usage_counter_deltas(cutoff_unix_secs, batch_size)
+                    .await
+            }
+            None => Ok(0),
+        }
+    }
+
     pub(crate) async fn cleanup_stale_pending_requests(
         &self,
         cutoff_unix_secs: u64,
@@ -980,11 +1082,13 @@ impl GatewayDataState {
         window: &UsageCleanupWindow,
         batch_size: usize,
         auto_delete_expired_keys: bool,
+        targets: UsageCleanupTargets,
+        mode: UsageCleanupExecutionMode,
     ) -> Result<UsageCleanupSummary, DataLayerError> {
         match &self.usage_writer {
             Some(repository) => {
                 repository
-                    .cleanup_usage(window, batch_size, auto_delete_expired_keys)
+                    .cleanup_usage(window, batch_size, auto_delete_expired_keys, targets, mode)
                     .await
             }
             None => Ok(UsageCleanupSummary::default()),
@@ -994,10 +1098,16 @@ impl GatewayDataState {
     pub(crate) async fn preview_usage_cleanup(
         &self,
         window: &UsageCleanupWindow,
+        targets: UsageCleanupTargets,
+        mode: UsageCleanupExecutionMode,
     ) -> Result<aether_data_contracts::repository::usage::UsageCleanupPreviewCounts, DataLayerError>
     {
         match &self.usage_writer {
-            Some(repository) => repository.preview_usage_cleanup(window).await,
+            Some(repository) => {
+                repository
+                    .preview_usage_cleanup(window, targets, mode)
+                    .await
+            }
             None => {
                 Ok(aether_data_contracts::repository::usage::UsageCleanupPreviewCounts::default())
             }
@@ -1107,6 +1217,15 @@ impl GatewayDataState {
             None => {
                 Ok(aether_data_contracts::repository::usage::StoredUsageAuditSummary::default())
             }
+        }
+    }
+
+    pub(crate) async fn read_usage_counter_health(
+        &self,
+    ) -> Result<UsageCounterHealthSnapshot, DataLayerError> {
+        match &self.usage_reader {
+            Some(repository) => repository.read_usage_counter_health().await,
+            None => Ok(UsageCounterHealthSnapshot::default()),
         }
     }
 
@@ -1450,6 +1569,16 @@ impl GatewayDataState {
         match &self.user_reader {
             Some(repository) => repository.list_export_users_page(query).await,
             None => Ok(Vec::new()),
+        }
+    }
+
+    pub(crate) async fn count_export_users(
+        &self,
+        query: &aether_data::repository::users::UserExportListQuery,
+    ) -> Result<u64, DataLayerError> {
+        match &self.user_reader {
+            Some(repository) => repository.count_export_users(query).await,
+            None => Ok(0),
         }
     }
 

@@ -349,7 +349,13 @@ async fn gateway_executes_gemini_chat_sync_via_local_decision_gate_with_local_sy
                     },
                     "body": {
                         "json_body": {
-                            "candidates": [],
+                            "candidates": [{
+                                "content": {
+                                    "role": "model",
+                                    "parts": [{"text": "Hello from Gemini"}]
+                                },
+                                "finishReason": "STOP"
+                            }],
                             "usageMetadata": {
                                 "promptTokenCount": 1,
                                 "candidatesTokenCount": 2,

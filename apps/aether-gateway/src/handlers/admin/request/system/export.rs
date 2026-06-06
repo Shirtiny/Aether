@@ -40,6 +40,7 @@ impl<'a> AdminAppState<'a> {
             .map(|model| AdminSystemConfigGlobalModel {
                 name: model.name.clone(),
                 display_name: model.display_name.clone(),
+                usage_count: Some(model.usage_count),
                 default_price_per_request: model.default_price_per_request,
                 default_tiered_pricing: model.default_tiered_pricing.clone(),
                 supported_capabilities: model.supported_capabilities.as_ref().and_then(|value| {
@@ -169,6 +170,13 @@ impl<'a> AdminAppState<'a> {
     ) -> Result<serde_json::Value, GatewayError> {
         let users = self.list_non_admin_export_users().await?;
         let user_ids = users.iter().map(|user| user.id.clone()).collect::<Vec<_>>();
+        let user_usage_totals = self
+            .app
+            .summarize_usage_totals_by_user_ids(&user_ids)
+            .await?
+            .into_iter()
+            .map(|totals| (totals.user_id.clone(), totals))
+            .collect::<BTreeMap<_, _>>();
         let user_wallets = self.list_wallet_snapshots_by_user_ids(&user_ids).await?;
         let user_api_keys = self
             .list_auth_api_key_export_records_by_user_ids(&user_ids)
@@ -185,6 +193,7 @@ impl<'a> AdminAppState<'a> {
         let standalone_wallets = self
             .list_wallet_snapshots_by_api_key_ids(&standalone_api_key_ids)
             .await?;
+        let usage_aggregates = self.export_admin_system_usage_aggregates().await?;
 
         let wallets_by_user_id = user_wallets
             .into_iter()
@@ -260,8 +269,10 @@ impl<'a> AdminAppState<'a> {
                         self.build_admin_system_users_export_api_key_payload(key, None, true)
                     })
                     .collect::<Vec<_>>();
+                let usage_totals = user_usage_totals.get(&user.id);
 
                 json!({
+                    "id": user.id.clone(),
                     "email": user.email.clone(),
                     "email_verified": user.email_verified,
                     "username": user.username.clone(),
@@ -284,6 +295,12 @@ impl<'a> AdminAppState<'a> {
                         .unwrap_or(false),
                     "wallet": wallet_payload,
                     "is_active": user.is_active,
+                    "request_count": usage_totals
+                        .map(|totals| totals.request_count)
+                        .unwrap_or(0),
+                    "total_tokens": usage_totals
+                        .map(|totals| totals.total_tokens)
+                        .unwrap_or(0),
                     "api_keys": api_keys_payload,
                 })
             })
@@ -306,6 +323,7 @@ impl<'a> AdminAppState<'a> {
             "user_groups": user_groups_data,
             "users": users_data,
             "standalone_keys": standalone_keys_data,
+            "usage_aggregates": usage_aggregates,
         }))
     }
 
@@ -330,6 +348,7 @@ impl<'a> AdminAppState<'a> {
         include_is_standalone: bool,
     ) -> serde_json::Value {
         let mut payload = serde_json::Map::from_iter([
+            ("api_key_id".to_string(), json!(key.api_key_id.clone())),
             ("key_hash".to_string(), json!(key.key_hash.clone())),
             ("name".to_string(), json!(key.name.clone())),
             (
@@ -344,6 +363,7 @@ impl<'a> AdminAppState<'a> {
                 "allowed_models".to_string(),
                 json!(key.allowed_models.clone()),
             ),
+            ("ip_rules".to_string(), json!(key.ip_rules.clone())),
             ("rate_limit".to_string(), json!(key.rate_limit)),
             ("concurrent_limit".to_string(), json!(key.concurrent_limit)),
             (

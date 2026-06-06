@@ -440,7 +440,21 @@ pub fn admin_provider_ops_verify_headers(
                 )?;
             }
         }
-        "nekocode" | "done_hub" => {
+        "nekocode" => {
+            if let Some(session_cookie) = credentials
+                .get("session_cookie")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+            {
+                insert_header(
+                    &mut headers,
+                    "Cookie",
+                    &admin_provider_ops_session_cookie_header(session_cookie),
+                )?;
+            }
+        }
+        "done_hub" => {
+            insert_header(&mut headers, "User-Agent", ADMIN_PROVIDER_OPS_USER_AGENT)?;
             if let Some(session_cookie) = credentials
                 .get("session_cookie")
                 .and_then(Value::as_str)
@@ -797,27 +811,29 @@ pub fn admin_provider_ops_sub2api_verify_payload(
         }
     }
 
+    let username_or_email = admin_provider_ops_sub2api_non_empty_string(user_data, "username")
+        .or_else(|| admin_provider_ops_sub2api_non_empty_string(user_data, "email"));
     admin_provider_ops_verify_success(
         admin_provider_ops_verify_user_payload(
-            user_data
-                .get("username")
-                .or_else(|| user_data.get("email"))
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned),
-            user_data
-                .get("username")
-                .or_else(|| user_data.get("email"))
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned),
-            user_data
-                .get("email")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned),
+            username_or_email.clone(),
+            username_or_email,
+            admin_provider_ops_sub2api_non_empty_string(user_data, "email"),
             Some(balance + points),
             Some(extra),
         ),
         updated_credentials,
     )
+}
+
+fn admin_provider_ops_sub2api_non_empty_string(
+    map: &Map<String, Value>,
+    key: &str,
+) -> Option<String> {
+    map.get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 #[cfg(test)]
@@ -914,6 +930,28 @@ mod tests {
     }
 
     #[test]
+    fn sub2api_verify_payload_falls_back_to_email_when_username_is_null() {
+        let payload = admin_provider_ops_sub2api_verify_payload(
+            StatusCode::OK,
+            &json!({
+                "code": 0,
+                "data": {
+                    "username": null,
+                    "email": "user@example.com",
+                    "balance": 2.0,
+                    "points": 0.0
+                }
+            }),
+            None,
+        );
+
+        assert_eq!(payload["success"], json!(true));
+        assert_eq!(payload["data"]["username"], json!("user@example.com"));
+        assert_eq!(payload["data"]["display_name"], json!("user@example.com"));
+        assert_eq!(payload["data"]["email"], json!("user@example.com"));
+    }
+
+    #[test]
     fn anyrouter_verify_payload_uses_cookie_auth_messages_and_usage_fields() {
         let payload = admin_provider_ops_anyrouter_verify_payload(
             StatusCode::OK,
@@ -980,6 +1018,12 @@ mod tests {
         assert_eq!(
             headers.get(COOKIE).and_then(|value| value.to_str().ok()),
             Some("session=abc")
+        );
+        assert_eq!(
+            headers
+                .get(USER_AGENT)
+                .and_then(|value| value.to_str().ok()),
+            Some(ADMIN_PROVIDER_OPS_USER_AGENT)
         );
     }
 

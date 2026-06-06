@@ -21,7 +21,8 @@ use crate::constants::{
     EXECUTION_PATH_EXECUTION_RUNTIME_STREAM, EXECUTION_PATH_EXECUTION_RUNTIME_SYNC,
     EXECUTION_PATH_LOCAL_AI_PUBLIC, EXECUTION_PATH_LOCAL_API_KEY_CONCURRENCY_LIMITED,
     EXECUTION_PATH_LOCAL_AUTH_DENIED, EXECUTION_PATH_LOCAL_EXECUTION_LOOP_DETECTED,
-    EXECUTION_PATH_LOCAL_EXECUTION_RUNTIME_MISS, EXECUTION_PATH_LOCAL_OVERLOADED,
+    EXECUTION_PATH_LOCAL_EXECUTION_PLANNING_TIMEOUT, EXECUTION_PATH_LOCAL_EXECUTION_RUNTIME_MISS,
+    EXECUTION_PATH_LOCAL_INVALID_REQUEST, EXECUTION_PATH_LOCAL_OVERLOADED,
     EXECUTION_PATH_LOCAL_PROXY_PASSTHROUGH_REMOVED, EXECUTION_PATH_LOCAL_RATE_LIMITED,
     EXECUTION_PATH_LOCAL_ROUTE_NOT_FOUND, EXECUTION_PATH_PUBLIC_PROXY_PASSTHROUGH,
     EXECUTION_RUNTIME_LOOP_GUARD_HEADER, FORWARDED_FOR_HEADER, FORWARDED_HOST_HEADER,
@@ -45,15 +46,19 @@ use crate::frontdoor_loop_guard::{
     frontdoor_self_loop_public_ai_path, request_has_execution_runtime_loop_guard,
 };
 use crate::handlers::shared::{
-    build_admin_proxy_auth_required_response, build_unhandled_admin_proxy_response,
-    local_proxy_route_requires_buffered_body, request_enables_control_execute,
+    build_admin_proxy_auth_required_response, build_unhandled_admin_proxy_response, ip_rules_allow,
+    json_ip_rules_allow, local_proxy_route_requires_buffered_body, request_enables_control_execute,
     should_strip_forwarded_provider_credential_header, should_strip_forwarded_trusted_admin_header,
 };
 use crate::headers::{
     extract_or_generate_trace_id, request_origin_from_headers_and_remote_addr,
-    should_skip_request_header,
+    should_skip_request_header, RequestBodyNormalizationError,
 };
 use crate::router::RequestAdmissionError;
+use crate::scheduler::candidate::{
+    is_auth_api_key_concurrency_limit_skip_reason, AUTH_API_KEY_CONCURRENCY_LIMIT_SKIP_REASON,
+    LEGACY_API_KEY_CONCURRENCY_LIMIT_SKIP_REASON,
+};
 use crate::scheduler::config::{read_scheduler_ordering_config, SchedulerSchedulingMode};
 use crate::{
     AppState, FrontdoorUserRpmOutcome, GatewayError, GatewayFallbackMetricKind,
@@ -64,7 +69,11 @@ use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{self, header::HeaderName, header::HeaderValue, Response};
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, time::Instant};
+use std::{
+    collections::BTreeMap,
+    error::Error as StdError,
+    time::{Duration, Instant},
+};
 use tracing::{debug, info, warn};
 
 const OPENAI_CHAT_LOCAL_EXECUTION_RUNTIME_MISS_DETAIL: &str =
@@ -87,10 +96,275 @@ const LOCAL_PROXY_PASSTHROUGH_REMOVED_DETAIL: &str =
 const LOCAL_EXECUTION_LOOP_DETECTED_DETAIL: &str =
     "Gateway detected an execution runtime request loop back into the local frontdoor";
 const AUTH_API_KEY_CONCURRENCY_LIMIT_REACHED_DETAIL: &str =
-    "当前 API Key 并发请求数已达上限，请稍后重试";
+    "当前调用方 API Key 并发请求数已达上限，请稍后重试";
+const REQUEST_BODY_READ_TIMEOUT_DETAIL: &str =
+    "Request body read timed out before the gateway could route the request";
+const REQUEST_BODY_READ_FAILED_DETAIL: &str = "Failed to read request body";
+const LOCAL_EXECUTION_PLANNING_TIMEOUT_DETAIL: &str =
+    "当前 AI 请求在本地执行规划阶段超时，请稍后重试";
 const EXECUTION_PATH_TUNNEL_AFFINITY_FORWARD: &str = "tunnel_affinity_forward";
 const MANAGEMENT_TOKEN_PREFIX: &str = "ae-";
 const LEGACY_MANAGEMENT_TOKEN_PREFIX: &str = "ae_";
+
+#[derive(Debug, Clone, Copy)]
+struct RequestBodyBufferPolicy {
+    max_bytes: u64,
+    read_timeout: Duration,
+}
+
+impl RequestBodyBufferPolicy {
+    fn from_state(state: &AppState) -> Self {
+        Self {
+            max_bytes: crate::headers::max_request_body_bytes(),
+            read_timeout: state.frontdoor_runtime_guards.request_body_read_timeout,
+        }
+    }
+
+    #[cfg(test)]
+    fn for_tests(max_bytes: u64, read_timeout: Duration) -> Self {
+        Self {
+            max_bytes,
+            read_timeout,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum RequestBodyBufferError {
+    Normalization(RequestBodyNormalizationError),
+    TooLarge { limit_bytes: u64 },
+    Timeout { timeout_ms: u64 },
+    ReadFailed { message: String },
+}
+
+impl RequestBodyBufferError {
+    fn http_status(&self) -> http::StatusCode {
+        match self {
+            Self::Normalization(error) => error.http_status(),
+            Self::TooLarge { .. } => http::StatusCode::PAYLOAD_TOO_LARGE,
+            Self::Timeout { .. } => http::StatusCode::REQUEST_TIMEOUT,
+            Self::ReadFailed { .. } => http::StatusCode::BAD_REQUEST,
+        }
+    }
+
+    fn client_message(&self) -> String {
+        match self {
+            Self::Normalization(error) => error.client_message(),
+            Self::TooLarge { limit_bytes } => format!("Request body exceeds {limit_bytes} bytes"),
+            Self::Timeout { .. } => REQUEST_BODY_READ_TIMEOUT_DETAIL.to_string(),
+            Self::ReadFailed { .. } => REQUEST_BODY_READ_FAILED_DETAIL.to_string(),
+        }
+    }
+
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::Normalization(error) => match error {
+                RequestBodyNormalizationError::UnsupportedContentEncoding(_) => {
+                    "unsupported_content_encoding"
+                }
+                RequestBodyNormalizationError::DecodeFailed { .. } => "decode_failed",
+                RequestBodyNormalizationError::DecompressedBodyTooLarge { .. } => {
+                    "decompressed_body_too_large"
+                }
+                RequestBodyNormalizationError::RequestBodyTooLarge { .. } => {
+                    "request_body_too_large"
+                }
+            },
+            Self::TooLarge { .. } => "request_body_too_large",
+            Self::Timeout { .. } => "request_body_read_timeout",
+            Self::ReadFailed { .. } => "request_body_read_failed",
+        }
+    }
+}
+
+async fn buffer_and_normalize_request_body(
+    request_body: &mut Option<Body>,
+    headers: &mut http::HeaderMap,
+    body_owner_expectation: &'static str,
+    trace_id: &str,
+    method: &http::Method,
+    path_and_query: &str,
+    phase: &'static str,
+    policy: RequestBodyBufferPolicy,
+) -> Result<Bytes, RequestBodyBufferError> {
+    if let Err(err) =
+        crate::headers::check_request_content_length_with_limit(headers, policy.max_bytes)
+    {
+        return Err(RequestBodyBufferError::Normalization(err));
+    }
+
+    let read_started_at = Instant::now();
+    let timeout_ms = policy.read_timeout.as_millis() as u64;
+    info!(
+        event_name = "frontdoor_request_body_buffer_started",
+        log_type = "event",
+        trace_id,
+        method = %method,
+        path = %path_and_query,
+        phase,
+        max_body_bytes = policy.max_bytes,
+        timeout_ms,
+        "gateway started buffering request body"
+    );
+
+    let body_limit = usize::try_from(policy.max_bytes).unwrap_or(usize::MAX);
+    let body = match tokio::time::timeout(
+        policy.read_timeout,
+        to_bytes(
+            request_body.take().expect(body_owner_expectation),
+            body_limit,
+        ),
+    )
+    .await
+    {
+        Ok(Ok(body)) => body,
+        Ok(Err(err)) if request_body_collection_exceeded_limit(&err) => {
+            return Err(RequestBodyBufferError::TooLarge {
+                limit_bytes: policy.max_bytes,
+            });
+        }
+        Ok(Err(err)) => {
+            return Err(RequestBodyBufferError::ReadFailed {
+                message: err.to_string(),
+            });
+        }
+        Err(_) => {
+            return Err(RequestBodyBufferError::Timeout { timeout_ms });
+        }
+    };
+
+    let normalized = crate::headers::normalize_request_body_headers_and_bytes_with_limit(
+        headers,
+        body,
+        policy.max_bytes,
+    )
+    .map_err(RequestBodyBufferError::Normalization)?;
+    info!(
+        event_name = "frontdoor_request_body_buffer_completed",
+        log_type = "event",
+        trace_id,
+        method = %method,
+        path = %path_and_query,
+        phase,
+        body_bytes = normalized.len(),
+        elapsed_ms = read_started_at.elapsed().as_millis() as u64,
+        "gateway completed request body buffering"
+    );
+    Ok(normalized)
+}
+
+fn request_body_collection_exceeded_limit(error: &(dyn StdError + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if error.to_string().contains("length limit exceeded") {
+            return true;
+        }
+        current = error.source();
+    }
+    false
+}
+
+fn build_request_body_buffer_error_response(
+    trace_id: &str,
+    request_context: &GatewayPublicRequestContext,
+    error: &RequestBodyBufferError,
+) -> Result<Response<Body>, GatewayError> {
+    warn!(
+        event_name = "frontdoor_request_body_buffer_failed",
+        log_type = "ops",
+        trace_id,
+        method = %request_context.request_method,
+        path = %request_context.request_path_and_query(),
+        status_code = error.http_status().as_u16(),
+        reason = error.reason(),
+        detail = %error.client_message(),
+        read_error = match error {
+            RequestBodyBufferError::ReadFailed { message } => message.as_str(),
+            _ => "",
+        },
+        "gateway rejected request body before local execution planning"
+    );
+    build_local_http_error_response(
+        trace_id,
+        request_context.control_decision.as_ref(),
+        error.http_status(),
+        error.client_message().as_str(),
+    )
+}
+
+fn finalize_request_body_buffer_rejection(
+    state: &AppState,
+    request_context: &GatewayPublicRequestContext,
+    remote_addr: &std::net::SocketAddr,
+    started_at: &std::time::Instant,
+    trace_id: &str,
+    request_permit: Option<aether_runtime::AdmissionPermit>,
+    error: &RequestBodyBufferError,
+) -> Result<Response<Body>, GatewayError> {
+    let response = build_request_body_buffer_error_response(trace_id, request_context, error)?;
+    Ok(finalize_gateway_response_with_context(
+        state,
+        response,
+        remote_addr,
+        request_context,
+        EXECUTION_PATH_LOCAL_INVALID_REQUEST,
+        started_at,
+        request_permit,
+    ))
+}
+
+fn local_execution_planning_timeout_parts(error: &GatewayError) -> Option<(&'static str, u64)> {
+    match error {
+        GatewayError::LocalExecutionPlanningTimeout {
+            phase, timeout_ms, ..
+        } => Some((*phase, *timeout_ms)),
+        _ => None,
+    }
+}
+
+fn finalize_local_execution_planning_timeout(
+    state: &AppState,
+    request_context: &GatewayPublicRequestContext,
+    remote_addr: &std::net::SocketAddr,
+    started_at: &std::time::Instant,
+    trace_id: &str,
+    request_permit: Option<aether_runtime::AdmissionPermit>,
+    control_decision: Option<&GatewayControlDecision>,
+    phase: &'static str,
+    timeout_ms: u64,
+) -> Result<Response<Body>, GatewayError> {
+    warn!(
+        event_name = "frontdoor_local_execution_planning_timeout",
+        log_type = "ops",
+        trace_id,
+        method = %request_context.request_method,
+        path = %request_context.request_path_and_query(),
+        route_family = control_decision
+            .and_then(|decision| decision.route_family.as_deref())
+            .unwrap_or("-"),
+        route_kind = control_decision
+            .and_then(|decision| decision.route_kind.as_deref())
+            .unwrap_or("-"),
+        phase,
+        timeout_ms,
+        "gateway failed local execution before a candidate could be selected"
+    );
+    let response = build_local_http_error_response(
+        trace_id,
+        control_decision,
+        http::StatusCode::GATEWAY_TIMEOUT,
+        LOCAL_EXECUTION_PLANNING_TIMEOUT_DETAIL,
+    )?;
+    Ok(finalize_gateway_response_with_context(
+        state,
+        response,
+        remote_addr,
+        request_context,
+        EXECUTION_PATH_LOCAL_EXECUTION_PLANNING_TIMEOUT,
+        started_at,
+        request_permit,
+    ))
+}
 
 fn local_execution_outcome_label(outcome: &LocalExecutionRequestOutcome) -> &'static str {
     match outcome {
@@ -133,57 +407,11 @@ fn hash_management_token(value: &str) -> String {
 }
 
 fn remote_ip_allowed(allowed_ips: Option<&serde_json::Value>, remote_ip: std::net::IpAddr) -> bool {
-    let Some(allowed_ips) = allowed_ips else {
-        return true;
-    };
-    if allowed_ips.is_null() {
-        return true;
-    }
-    let Some(items) = allowed_ips.as_array() else {
-        return false;
-    };
-    if items.is_empty() {
-        return false;
-    }
-    items
-        .iter()
-        .filter_map(serde_json::Value::as_str)
-        .any(|value| ip_or_cidr_matches(value, remote_ip))
+    json_ip_rules_allow(allowed_ips, remote_ip)
 }
 
-fn ip_or_cidr_matches(pattern: &str, remote_ip: std::net::IpAddr) -> bool {
-    let pattern = pattern.trim();
-    if pattern.is_empty() {
-        return false;
-    }
-    if let Ok(ip) = pattern.parse::<std::net::IpAddr>() {
-        return ip == remote_ip;
-    }
-    let Some((network, prefix)) = pattern.split_once('/') else {
-        return false;
-    };
-    let Ok(prefix) = prefix.trim().parse::<u8>() else {
-        return false;
-    };
-    match (network.trim().parse::<std::net::IpAddr>(), remote_ip) {
-        (Ok(std::net::IpAddr::V4(network)), std::net::IpAddr::V4(remote)) if prefix <= 32 => {
-            let mask = if prefix == 0 {
-                0
-            } else {
-                u32::MAX << (32 - prefix)
-            };
-            (u32::from(network) & mask) == (u32::from(remote) & mask)
-        }
-        (Ok(std::net::IpAddr::V6(network)), std::net::IpAddr::V6(remote)) if prefix <= 128 => {
-            let mask = if prefix == 0 {
-                0
-            } else {
-                u128::MAX << (128 - prefix)
-            };
-            (u128::from(network) & mask) == (u128::from(remote) & mask)
-        }
-        _ => false,
-    }
+fn api_key_remote_ip_allowed(ip_rules: Option<&[String]>, remote_ip: std::net::IpAddr) -> bool {
+    ip_rules_allow(ip_rules, remote_ip)
 }
 
 async fn maybe_promote_management_token_admin_principal(
@@ -330,8 +558,11 @@ async fn maybe_forward_public_request_to_tunnel_owner(
     ) else {
         return Ok(None);
     };
-    let body_json =
-        buffered_body.and_then(|body| serde_json::from_slice::<serde_json::Value>(body).ok());
+    let body_json = buffered_body.and_then(|body| {
+        let body =
+            crate::headers::decoded_request_body_bytes(&parts.headers, body.as_ref()).ok()?;
+        serde_json::from_slice::<serde_json::Value>(body.as_ref()).ok()
+    });
     let client_session_affinity =
         crate::client_session_affinity::client_session_affinity_from_parts(
             parts,
@@ -461,6 +692,7 @@ async fn maybe_forward_public_request_to_tunnel_owner(
 
     let mut response = build_sync_aware_affinity_forward_response(
         request_context,
+        &parts.headers,
         buffered_body,
         decision,
         upstream_response,
@@ -720,6 +952,7 @@ fn build_stream_sse_proxy_response(
 
 async fn build_sync_aware_affinity_forward_response(
     request_context: &GatewayPublicRequestContext,
+    request_headers: &http::HeaderMap,
     buffered_body: Option<&Bytes>,
     decision: &GatewayControlDecision,
     upstream_response: reqwest::Response,
@@ -727,7 +960,7 @@ async fn build_sync_aware_affinity_forward_response(
     let Some(buffered_body) = buffered_body else {
         return build_client_response(upstream_response, &request_context.trace_id, Some(decision));
     };
-    let stream_request = request_wants_stream(request_context, buffered_body);
+    let stream_request = request_wants_stream(request_context, request_headers, buffered_body);
     let upstream_is_sse = upstream_response_is_sse(upstream_response.headers());
     if (!stream_request && !upstream_is_sse) || (stream_request && upstream_is_sse) {
         return build_client_response(upstream_response, &request_context.trace_id, Some(decision));
@@ -917,6 +1150,31 @@ pub(crate) async fn proxy_request(
         &mut request_context,
     )
     .await?;
+    if let Some(auth_context) = request_context
+        .control_decision
+        .as_ref()
+        .and_then(|decision| decision.auth_context.as_ref())
+    {
+        if !api_key_remote_ip_allowed(auth_context.ip_rules.as_deref(), remote_addr.ip()) {
+            let rejection = crate::control::GatewayLocalAuthRejection::IpNotAllowed {
+                remote_ip: remote_addr.ip().to_string(),
+            };
+            let response = build_local_auth_rejection_response(
+                &trace_id,
+                request_context.control_decision.as_ref(),
+                &rejection,
+            )?;
+            return Ok(finalize_gateway_response_with_context(
+                &state,
+                response,
+                &remote_addr,
+                &request_context,
+                EXECUTION_PATH_LOCAL_AUTH_DENIED,
+                &started_at,
+                request_permit.take(),
+            ));
+        }
+    }
     let request_context_ms = request_context_started_at.elapsed().as_millis() as u64;
     if request_context
         .control_decision
@@ -943,16 +1201,32 @@ pub(crate) async fn proxy_request(
     }
     let mut request_body = Some(body);
     let local_proxy_body = if local_proxy_route_requires_buffered_body(&request_context) {
-        Some(
-            to_bytes(
-                request_body
-                    .take()
-                    .expect("local proxy body buffering should own request body"),
-                usize::MAX,
-            )
-            .await
-            .map_err(|err| GatewayError::Internal(err.to_string()))?,
+        let body_buffer_policy = RequestBodyBufferPolicy::from_state(&state);
+        let body = buffer_and_normalize_request_body(
+            &mut request_body,
+            &mut parts.headers,
+            "local proxy body buffering should own request body",
+            &trace_id,
+            &parts.method,
+            &request_context.request_path_and_query(),
+            "local_proxy",
+            body_buffer_policy,
         )
+        .await;
+        match body {
+            Ok(body) => Some(body),
+            Err(err) => {
+                return finalize_request_body_buffer_rejection(
+                    &state,
+                    &request_context,
+                    &remote_addr,
+                    &started_at,
+                    &trace_id,
+                    request_permit.take(),
+                    &err,
+                );
+            }
+        }
     } else {
         None
     };
@@ -1113,16 +1387,32 @@ pub(crate) async fn proxy_request(
         && request_enables_control_execute(&parts.headers);
 
     let buffered_body = if should_buffer_body {
-        Some(
-            to_bytes(
-                request_body
-                    .take()
-                    .expect("buffered auth/execution runtime path should own request body"),
-                usize::MAX,
-            )
-            .await
-            .map_err(|err| GatewayError::Internal(err.to_string()))?,
+        let body_buffer_policy = RequestBodyBufferPolicy::from_state(&state);
+        let body = buffer_and_normalize_request_body(
+            &mut request_body,
+            &mut parts.headers,
+            "buffered auth/execution runtime path should own request body",
+            &trace_id,
+            &parts.method,
+            &request_context.request_path_and_query(),
+            "auth_execution",
+            body_buffer_policy,
         )
+        .await;
+        match body {
+            Ok(body) => Some(body),
+            Err(err) => {
+                return finalize_request_body_buffer_rejection(
+                    &state,
+                    &request_context,
+                    &remote_addr,
+                    &started_at,
+                    &trace_id,
+                    request_permit.take(),
+                    &err,
+                );
+            }
+        }
     } else {
         None
     };
@@ -1264,17 +1554,37 @@ pub(crate) async fn proxy_request(
         let buffered_body = buffered_body
             .as_ref()
             .expect("execution runtime/control auth gate should have buffered request body");
-        let stream_request = request_wants_stream(&request_context, buffered_body);
+        let stream_request = request_wants_stream(&request_context, &parts.headers, buffered_body);
         let mut local_execution_exhaustion = None;
         if stream_request {
-            let stream_outcome = maybe_execute_stream_request(
+            let stream_outcome = match maybe_execute_stream_request(
                 &state,
                 &parts,
                 buffered_body,
                 &trace_id,
                 control_decision,
             )
-            .await?;
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    if let Some((phase, timeout_ms)) = local_execution_planning_timeout_parts(&err)
+                    {
+                        return finalize_local_execution_planning_timeout(
+                            &state,
+                            &request_context,
+                            &remote_addr,
+                            &started_at,
+                            &trace_id,
+                            request_permit.take(),
+                            control_decision,
+                            phase,
+                            timeout_ms,
+                        );
+                    }
+                    return Err(err);
+                }
+            };
             debug!(
                 event_name = "proxy_stream_local_execute_outcome",
                 log_type = "debug",
@@ -1312,9 +1622,34 @@ pub(crate) async fn proxy_request(
                 LocalExecutionRequestOutcome::NoPath => {}
             }
         }
-        match maybe_execute_sync_request(&state, &parts, buffered_body, &trace_id, control_decision)
-            .await?
+        let sync_outcome = match maybe_execute_sync_request(
+            &state,
+            &parts,
+            buffered_body,
+            &trace_id,
+            control_decision,
+        )
+        .await
         {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                if let Some((phase, timeout_ms)) = local_execution_planning_timeout_parts(&err) {
+                    return finalize_local_execution_planning_timeout(
+                        &state,
+                        &request_context,
+                        &remote_addr,
+                        &started_at,
+                        &trace_id,
+                        request_permit.take(),
+                        control_decision,
+                        phase,
+                        timeout_ms,
+                    );
+                }
+                return Err(err);
+            }
+        };
+        match sync_outcome {
             LocalExecutionRequestOutcome::Responded(execution_runtime_response) => {
                 let execution_runtime_response = restore_redacted_sync_execution_response(
                     execution_runtime_response,
@@ -1338,15 +1673,35 @@ pub(crate) async fn proxy_request(
             LocalExecutionRequestOutcome::NoPath => {}
         }
         if parts.method != http::Method::POST {
-            match maybe_execute_stream_request(
+            let stream_outcome = match maybe_execute_stream_request(
                 &state,
                 &parts,
                 buffered_body,
                 &trace_id,
                 control_decision,
             )
-            .await?
+            .await
             {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    if let Some((phase, timeout_ms)) = local_execution_planning_timeout_parts(&err)
+                    {
+                        return finalize_local_execution_planning_timeout(
+                            &state,
+                            &request_context,
+                            &remote_addr,
+                            &started_at,
+                            &trace_id,
+                            request_permit.take(),
+                            control_decision,
+                            phase,
+                            timeout_ms,
+                        );
+                    }
+                    return Err(err);
+                }
+            };
+            match stream_outcome {
                 LocalExecutionRequestOutcome::Responded(execution_runtime_response) => {
                     let execution_runtime_response = restore_redacted_stream_execution_response(
                         execution_runtime_response,
@@ -1439,7 +1794,9 @@ pub(crate) async fn proxy_request(
         let auth_api_key_concurrency_limited = diagnostic_is_auth_api_key_concurrency_limited(
             local_execution_runtime_miss_diagnostic.as_ref(),
         ) || local_execution_runtime_miss_context
-            .all_candidates_skipped_for_reason("api_key_concurrency_limit_reached");
+            .all_candidates_skipped_for_reason(AUTH_API_KEY_CONCURRENCY_LIMIT_SKIP_REASON)
+            || local_execution_runtime_miss_context
+                .all_candidates_skipped_for_reason(LEGACY_API_KEY_CONCURRENCY_LIMIT_SKIP_REASON);
         let local_execution_runtime_miss_detail = local_execution_runtime_miss_detail(
             control_decision,
             local_execution_runtime_miss_diagnostic.as_ref(),
@@ -1566,7 +1923,7 @@ pub(crate) async fn proxy_request(
             .map(ToOwned::to_owned)
             .or_else(|| {
                 auth_api_key_concurrency_limited
-                    .then_some("api_key_concurrency_limit_reached".to_string())
+                    .then_some(AUTH_API_KEY_CONCURRENCY_LIMIT_SKIP_REASON.to_string())
             });
         if let Some(reason) = local_execution_runtime_miss_reason {
             response.headers_mut().insert(
@@ -1741,9 +2098,9 @@ fn local_execution_runtime_miss_all_candidates_skipped_detail(
         (_, Some(summary), Some(model)) => format!(
             "支持模型 {model} 的候选提供商全部不可用：{summary}（原因代码: all_candidates_skipped）"
         ),
-        (_, Some(summary), None) => format!(
-            "候选提供商全部不可用：{summary}（原因代码: all_candidates_skipped）"
-        ),
+        (_, Some(summary), None) => {
+            format!("候选提供商全部不可用：{summary}（原因代码: all_candidates_skipped）")
+        }
         (count, None, Some(model)) if count > 0 => format!(
             "找到 {count} 个支持模型 {model} 的候选提供商，但都不满足本次{request_mode}请求要求（原因代码: all_candidates_skipped）"
         ),
@@ -1791,7 +2148,9 @@ fn local_execution_runtime_miss_skip_reasons_summary(
 
 fn local_execution_runtime_miss_skip_reason_label(reason: &str) -> &str {
     match reason {
-        "api_key_concurrency_limit_reached" => "API Key 并发已达上限",
+        "auth_api_key_concurrency_limit_reached" | "api_key_concurrency_limit_reached" => {
+            "调用方 API Key 并发已达上限"
+        }
         "auth_channel_mismatch" => "认证通道不匹配",
         "auth_snapshot_missing" => "API Key 本地执行配置缺失",
         "endpoint_api_format_changed" => "端点 API 格式已变更",
@@ -1801,11 +2160,14 @@ fn local_execution_runtime_miss_skip_reason_label(reason: &str) -> &str {
         "key_inactive" => "API Key 未启用",
         "key_model_disabled" => "API Key 未允许该模型",
         "mapped_model_missing" => "模型映射缺失",
+        "pool_active_probe_sealed" => "池内账号未进入主动探测热池",
         "pool_cooldown" => "池内账号处于冷却中",
         "pool_cost_limit_reached" => "池内账号成本额度已用尽",
         "pool_group_exhausted" => "池化提供商没有可调度账号",
         "pool_key_lease_busy" => "池内账号正被其他请求占用",
+        "provider_concurrency_limit_reached" => "上游提供商并发已达上限",
         "provider_inactive" => "提供商未启用",
+        "provider_key_concurrency_limit_reached" => "上游账号并发已达上限",
         "provider_request_body_missing" => "无法构建上游请求体",
         "provider_request_body_build_failed" => "上游请求体转换失败",
         "transport_api_format_mismatch" => "传输层 API 格式不匹配",
@@ -1865,15 +2227,12 @@ fn diagnostic_is_auth_api_key_concurrency_limited(
     let Some(diagnostic) = diagnostic else {
         return false;
     };
-    diagnostic.reason == "api_key_concurrency_limit_reached"
+    is_auth_api_key_concurrency_limit_skip_reason(diagnostic.reason.as_str())
         || (diagnostic.reason == "all_candidates_skipped"
             && diagnostic.skip_reasons.len() == 1
-            && diagnostic
-                .skip_reasons
-                .get("api_key_concurrency_limit_reached")
-                .copied()
-                .unwrap_or(0)
-                > 0)
+            && diagnostic.skip_reasons.iter().any(|(reason, count)| {
+                is_auth_api_key_concurrency_limit_skip_reason(reason.as_str()) && *count > 0
+            }))
 }
 
 fn local_execution_runtime_miss_route_detail(
@@ -1908,14 +2267,46 @@ fn local_execution_runtime_miss_route_detail(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::{
+        api_key_remote_ip_allowed, buffer_and_normalize_request_body,
         diagnostic_is_auth_api_key_concurrency_limited, local_execution_runtime_miss_detail,
         restore_redacted_stream_execution_response, restore_redacted_sync_execution_response,
-        GatewayControlDecision, LocalExecutionRuntimeMissDiagnostic,
+        GatewayControlDecision, LocalExecutionRuntimeMissDiagnostic, RequestBodyBufferError,
+        RequestBodyBufferPolicy,
     };
-    use axum::body::{to_bytes, Body};
-    use axum::http::{header, Response};
+    use axum::body::{to_bytes, Body, Bytes};
+    use axum::http::{header, HeaderMap, Method, Response};
     use serde_json::json;
+
+    #[test]
+    fn api_key_remote_ip_allows_unrestricted_keys() {
+        let remote_ip = "203.0.113.10".parse().expect("valid ip");
+        assert!(api_key_remote_ip_allowed(None, remote_ip));
+    }
+
+    #[test]
+    fn api_key_remote_ip_applies_ip_rules() {
+        let ip_rules = vec![
+            "198.51.100.1".to_string(),
+            "203.0.113.*".to_string(),
+            "!203.0.113.13".to_string(),
+        ];
+
+        assert!(api_key_remote_ip_allowed(
+            Some(&ip_rules),
+            "198.51.100.1".parse().expect("valid ip"),
+        ));
+        assert!(api_key_remote_ip_allowed(
+            Some(&ip_rules),
+            "203.0.113.42".parse().expect("valid ip"),
+        ));
+        assert!(!api_key_remote_ip_allowed(
+            Some(&ip_rules),
+            "203.0.113.13".parse().expect("valid ip"),
+        ));
+    }
 
     fn redaction_slot_for_email() -> (crate::privacy::RedactionSessionSlot, String) {
         let masked = crate::privacy::mask_chat_request_json(
@@ -2014,6 +2405,58 @@ mod tests {
         assert!(!message.contains(&sentinel));
     }
 
+    #[tokio::test]
+    async fn request_body_buffer_rejects_chunked_body_when_limit_is_exceeded() {
+        let mut body = Some(Body::from(Bytes::from_static(b"abcdef")));
+        let mut headers = HeaderMap::new();
+
+        let err = buffer_and_normalize_request_body(
+            &mut body,
+            &mut headers,
+            "test owns body",
+            "trace-body-large",
+            &Method::POST,
+            "/v1/responses",
+            "test",
+            RequestBodyBufferPolicy::for_tests(5, Duration::from_secs(1)),
+        )
+        .await
+        .expect_err("body exceeding the ingress limit should fail");
+
+        assert!(matches!(
+            err,
+            RequestBodyBufferError::TooLarge { limit_bytes: 5 }
+        ));
+    }
+
+    #[tokio::test]
+    async fn request_body_buffer_times_out_instead_of_waiting_forever() {
+        let stream = async_stream::stream! {
+            yield Ok::<Bytes, std::io::Error>(Bytes::from_static(b"{"));
+            std::future::pending::<()>().await;
+        };
+        let mut body = Some(Body::from_stream(stream));
+        let mut headers = HeaderMap::new();
+
+        let err = buffer_and_normalize_request_body(
+            &mut body,
+            &mut headers,
+            "test owns body",
+            "trace-body-timeout",
+            &Method::POST,
+            "/v1/responses",
+            "test",
+            RequestBodyBufferPolicy::for_tests(1024, Duration::from_millis(5)),
+        )
+        .await
+        .expect_err("body buffering should time out");
+
+        assert!(matches!(
+            err,
+            RequestBodyBufferError::Timeout { timeout_ms: 5 }
+        ));
+    }
+
     #[test]
     fn runtime_miss_detail_returns_model_specific_stream_message_when_candidates_are_unavailable() {
         let decision = GatewayControlDecision::synthetic(
@@ -2078,7 +2521,7 @@ mod tests {
         let diagnostic = LocalExecutionRuntimeMissDiagnostic {
             reason: "all_candidates_skipped".to_string(),
             skip_reasons: std::collections::BTreeMap::from([(
-                "api_key_concurrency_limit_reached".to_string(),
+                "auth_api_key_concurrency_limit_reached".to_string(),
                 1,
             )]),
             requested_model: Some("gpt-5.4".to_string()),
@@ -2090,7 +2533,7 @@ mod tests {
 
         assert_eq!(
             detail.as_deref(),
-            Some("当前 API Key 并发请求数已达上限，请稍后重试")
+            Some("当前调用方 API Key 并发请求数已达上限，请稍后重试")
         );
         assert!(diagnostic_is_auth_api_key_concurrency_limited(Some(
             &diagnostic
@@ -2121,7 +2564,7 @@ mod tests {
 
         assert_eq!(
             detail.as_deref(),
-            Some("当前 API Key 并发请求数已达上限，请稍后重试")
+            Some("当前调用方 API Key 并发请求数已达上限，请稍后重试")
         );
     }
 }

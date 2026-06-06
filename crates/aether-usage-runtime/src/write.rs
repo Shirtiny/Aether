@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use aether_ai_formats::UPSTREAM_IS_STREAM_KEY;
 use aether_contracts::{ExecutionPlan, ExecutionTelemetry};
 use aether_data_contracts::repository::usage::{UpsertUsageRecord, UsageBodyCaptureState};
 use aether_data_contracts::DataLayerError;
@@ -12,13 +13,16 @@ use crate::body_capture::{
     RuntimeBodyCaptureMetadataInput,
 };
 use crate::request_metadata::{
-    build_usage_request_metadata_seed, merge_usage_request_metadata,
-    merge_usage_request_metadata_owned, sanitize_usage_request_metadata,
-    sanitize_usage_request_metadata_ref,
+    attach_provider_request_body_metadata, build_usage_request_metadata_seed,
+    merge_usage_request_metadata, merge_usage_request_metadata_owned,
+    sanitize_usage_request_metadata, sanitize_usage_request_metadata_ref,
 };
 use crate::{
-    map_usage_from_response, GatewayStreamReportRequest, GatewaySyncReportRequest,
-    StandardizedUsage, UsageEvent, UsageEventData, UsageEventType,
+    map_usage_from_response, stream_capture_terminal_state, GatewayStreamReportRequest,
+    GatewaySyncReportRequest, StandardizedUsage, StreamCapturedTerminalState, UsageEvent,
+    UsageEventData, UsageEventType, STREAM_MISSING_TERMINAL_EVENT_CATEGORY,
+    STREAM_MISSING_TERMINAL_EVENT_MESSAGE, STREAM_TERMINAL_ERROR_CATEGORY,
+    STREAM_TERMINAL_ERROR_MESSAGE,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,6 +146,7 @@ pub struct SyncTerminalUsagePayloadSeed {
     pub provider_response_body_state: Option<UsageBodyCaptureState>,
     pub client_response: Option<Value>,
     pub client_response_body_state: Option<UsageBodyCaptureState>,
+    pub standardized_usage: Option<StandardizedUsage>,
     pub capture_metadata: Option<Value>,
 }
 
@@ -158,6 +163,8 @@ pub struct StreamTerminalUsagePayloadSeed {
     pub client_response: Option<Value>,
     pub client_response_body_state: Option<UsageBodyCaptureState>,
     pub standardized_usage: Option<StandardizedUsage>,
+    pub observed_stream_finish: Option<bool>,
+    pub terminal_error_message: Option<String>,
     pub capture_metadata: Option<Value>,
 }
 
@@ -183,6 +190,8 @@ pub struct TerminalUsageSeed {
     pub has_format_conversion: bool,
     pub is_stream: bool,
     pub status_code: u16,
+    pub terminal_error_message: Option<String>,
+    pub terminal_failure_category: Option<String>,
     pub response_time_ms: Option<u64>,
     pub first_byte_time_ms: Option<u64>,
     pub request_headers: Option<Value>,
@@ -243,7 +252,8 @@ pub fn build_lifecycle_usage_seed(
     let model = context_string(context, "model")
         .or_else(|| non_empty_str(plan.model_name.as_deref()))
         .unwrap_or_else(|| "unknown".to_string());
-    let request_type = infer_request_type(api_format.as_deref());
+    let request_type =
+        infer_request_type_from_contracts(api_format.as_deref(), endpoint_api_format.as_deref());
     let api_family = api_format
         .as_deref()
         .and_then(infer_api_family)
@@ -505,6 +515,8 @@ fn build_terminal_usage_event_from_seed_impl(
         has_format_conversion,
         is_stream,
         status_code,
+        terminal_error_message,
+        terminal_failure_category,
         response_time_ms,
         first_byte_time_ms,
         request_headers,
@@ -529,7 +541,8 @@ fn build_terminal_usage_event_from_seed_impl(
     };
     let routing = merge_routing_seed_with_metadata_owned(routing, request_metadata.as_ref());
     let body_refs = merge_body_refs_seed_with_metadata_owned(body_refs, request_metadata.as_ref());
-    let error_message = resolve_error_message(status_code, provider_response.as_ref(), None)
+    let error_message = terminal_error_message
+        .or_else(|| resolve_error_message(status_code, provider_response.as_ref(), None))
         .or_else(|| resolve_error_message(status_code, client_response.as_ref(), None));
     let api_family = infer_api_family(&client_contract).map(ToOwned::to_owned);
     let endpoint_kind = infer_endpoint_kind(&client_contract).map(ToOwned::to_owned);
@@ -547,6 +560,8 @@ fn build_terminal_usage_event_from_seed_impl(
     } else {
         merge_usage_request_metadata(request_metadata, audit_payload)
     };
+    let request_metadata =
+        attach_provider_request_body_metadata(request_metadata, provider_request.as_ref());
 
     let mut data = UsageEventData {
         user_id,
@@ -572,7 +587,12 @@ fn build_terminal_usage_event_from_seed_impl(
         is_stream: Some(is_stream),
         status_code: Some(status_code),
         error_message,
-        error_category: resolve_error_category(status_code, event_type),
+        error_category: resolve_error_category(
+            status_code,
+            event_type,
+            is_stream,
+            terminal_failure_category.as_deref(),
+        ),
         response_time_ms,
         first_byte_time_ms,
         request_headers,
@@ -618,6 +638,10 @@ fn build_terminal_usage_event_from_seed_impl(
         }
     }
 
+    if matches!(event_type, UsageEventType::Completed) {
+        apply_completed_image_usage_estimate(&mut data);
+    }
+
     let data = if trusted_request_metadata {
         sanitize_usage_event_capture_fields_trusted(data)
     } else {
@@ -641,7 +665,10 @@ pub fn build_terminal_usage_context_seed(
         .or_else(|| context_string(context, "provider_api_format"))
         .or_else(|| non_empty_str(Some(plan.provider_api_format.as_str())))
         .unwrap_or_default();
-    let request_type = infer_request_type(Some(client_contract.as_str()));
+    let request_type = infer_request_type_from_contracts(
+        Some(client_contract.as_str()),
+        Some(provider_contract.as_str()),
+    );
     let has_format_conversion = resolve_has_format_conversion(
         context,
         client_contract.as_str(),
@@ -706,10 +733,13 @@ pub fn build_sync_terminal_usage_payload_seed(
         .report_context
         .as_ref()
         .and_then(Value::as_object)
-        .and_then(|context| context.get("upstream_is_stream"))
+        .and_then(|context| context.get(UPSTREAM_IS_STREAM_KEY))
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let provider_response_full = if upstream_is_stream && payload.body_base64.is_some() {
+    let provider_response_full = if upstream_is_stream
+        && payload.body_base64.is_some()
+        && !body_json_has_terminal_error(payload.body_json.as_ref())
+    {
         decode_body_for_storage(payload.body_base64.as_deref())
             .or_else(|| payload.body_json.as_ref().cloned())
     } else {
@@ -737,6 +767,7 @@ pub fn build_sync_terminal_usage_payload_seed(
         .or_else(|| headers_to_json(&payload.headers));
     let client_response_headers = context_usage_value(context, "client_response_headers")
         .or_else(|| headers_to_json(&payload.headers));
+    let standardized_usage = kiro_simulated_cache_standardized_usage_from_context(context);
     SyncTerminalUsagePayloadSeed {
         report_kind: payload.report_kind.clone(),
         status_code: payload.status_code,
@@ -751,6 +782,7 @@ pub fn build_sync_terminal_usage_payload_seed(
         provider_response_body_state,
         client_response,
         client_response_body_state,
+        standardized_usage,
         capture_metadata: build_payload_body_capture_metadata(
             payload.body_base64.as_deref(),
             None,
@@ -760,6 +792,12 @@ pub fn build_sync_terminal_usage_payload_seed(
     }
 }
 
+fn body_json_has_terminal_error(body_json: Option<&Value>) -> bool {
+    body_json
+        .and_then(|value| value.get("error"))
+        .is_some_and(|error| !error.is_null())
+}
+
 pub fn build_stream_terminal_usage_payload_seed(
     payload: &GatewayStreamReportRequest,
 ) -> StreamTerminalUsagePayloadSeed {
@@ -767,6 +805,16 @@ pub fn build_stream_terminal_usage_payload_seed(
     let provider_response_headers = context_usage_value(context, "provider_response_headers")
         .or_else(|| headers_to_json(&payload.headers));
     let client_response_headers = headers_to_json(&payload.headers);
+    let observed_stream_finish = payload
+        .terminal_summary
+        .as_ref()
+        .map(|summary| summary.observed_finish);
+    let terminal_error_message = payload
+        .terminal_summary
+        .as_ref()
+        .and_then(|summary| summary.parser_error.clone())
+        .map(|message| message.trim().to_string())
+        .filter(|message| !message.is_empty());
     StreamTerminalUsagePayloadSeed {
         report_kind: payload.report_kind.clone(),
         status_code: payload.status_code,
@@ -785,6 +833,8 @@ pub fn build_stream_terminal_usage_payload_seed(
             .terminal_summary
             .as_ref()
             .and_then(|summary| summary.standardized_usage.clone()),
+        observed_stream_finish,
+        terminal_error_message,
         capture_metadata: build_payload_body_capture_metadata(
             payload.provider_body_base64.as_deref(),
             payload.client_body_base64.as_deref(),
@@ -809,11 +859,14 @@ pub fn build_sync_terminal_usage_seed(
         provider_response_body_state,
         client_response,
         client_response_body_state,
+        standardized_usage,
         capture_metadata,
     } = payload_seed;
-    let standardized_usage = provider_response_full
+    let derived_standardized_usage = provider_response_full
         .as_ref()
         .map(|response| map_usage_from_response(response, context_seed.provider_contract.as_str()));
+    let standardized_usage =
+        merge_standardized_usage_with_context_cache(standardized_usage, derived_standardized_usage);
     let terminal_state = infer_sync_terminal_state(
         report_kind.as_str(),
         status_code,
@@ -841,6 +894,8 @@ pub fn build_sync_terminal_usage_seed(
         has_format_conversion: context_seed.has_format_conversion,
         is_stream: context_seed.is_stream,
         status_code,
+        terminal_error_message: None,
+        terminal_failure_category: None,
         response_time_ms,
         first_byte_time_ms,
         request_headers: context_seed.request_headers,
@@ -865,6 +920,25 @@ pub fn build_sync_terminal_usage_seed(
     }
 }
 
+fn merge_standardized_usage_with_context_cache(
+    context_usage: Option<StandardizedUsage>,
+    derived_usage: Option<StandardizedUsage>,
+) -> Option<StandardizedUsage> {
+    let Some(context_usage) = context_usage else {
+        return derived_usage;
+    };
+
+    let mut usage = derived_usage.unwrap_or_default();
+    usage.input_tokens = context_usage.input_tokens;
+    if context_usage.cache_creation_tokens > 0 {
+        usage.cache_creation_tokens = context_usage.cache_creation_tokens;
+    }
+    if context_usage.cache_read_tokens > 0 {
+        usage.cache_read_tokens = context_usage.cache_read_tokens;
+    }
+    Some(usage)
+}
+
 pub fn build_stream_terminal_usage_seed(
     context_seed: TerminalUsageContextSeed,
     payload_seed: StreamTerminalUsagePayloadSeed,
@@ -879,9 +953,11 @@ pub fn build_stream_terminal_usage_seed(
         client_response_headers,
         provider_response_full,
         provider_response_body_state,
-        client_response,
-        client_response_body_state,
+        mut client_response,
+        mut client_response_body_state,
         standardized_usage,
+        observed_stream_finish,
+        terminal_error_message,
         capture_metadata,
     } = payload_seed;
     let standardized_usage = standardized_usage.or_else(|| {
@@ -889,7 +965,86 @@ pub fn build_stream_terminal_usage_seed(
             map_usage_from_response(response, context_seed.provider_contract.as_str())
         })
     });
-    let terminal_state = infer_stream_terminal_state(report_kind.as_str(), status_code, cancelled);
+    let captured_terminal_state = captured_stream_terminal_state(
+        report_kind.as_str(),
+        context_seed.client_contract.as_str(),
+        context_seed.provider_contract.as_str(),
+        provider_response_full.as_ref(),
+        provider_response_body_state,
+        client_response.as_ref(),
+        client_response_body_state,
+    );
+    let requires_observed_terminal_event = stream_usage_requires_observed_terminal_event(
+        report_kind.as_str(),
+        context_seed.client_contract.as_str(),
+        context_seed.provider_contract.as_str(),
+    );
+    let empty_required_capture_missing_terminal = stream_empty_required_captures_missing_terminal(
+        report_kind.as_str(),
+        context_seed.client_contract.as_str(),
+        context_seed.provider_contract.as_str(),
+        provider_response_full.as_ref(),
+        provider_response_body_state,
+        client_response.as_ref(),
+        client_response_body_state,
+    );
+    let observed_stream_finish = observed_stream_finish
+        .or_else(|| {
+            captured_terminal_state.map(|state| state != StreamCapturedTerminalState::Missing)
+        })
+        .or_else(|| empty_required_capture_missing_terminal.then_some(false));
+    let missing_observed_finish = matches!(observed_stream_finish, Some(false))
+        && (requires_observed_terminal_event
+            || !standardized_usage
+                .as_ref()
+                .is_some_and(StandardizedUsage::has_token_signal));
+    let captured_terminal_failure = matches!(
+        captured_terminal_state,
+        Some(StreamCapturedTerminalState::Failed)
+    );
+    let terminal_error_message = terminal_error_message
+        .or_else(|| {
+            provider_response_full
+                .as_ref()
+                .and_then(extract_explicit_error_message_from_json)
+        })
+        .or_else(|| {
+            client_response
+                .as_ref()
+                .and_then(extract_explicit_error_message_from_json)
+        })
+        .or_else(|| captured_terminal_failure.then(|| STREAM_TERMINAL_ERROR_MESSAGE.to_string()));
+    let terminal_failure_category = if terminal_error_message.is_some() {
+        Some(STREAM_TERMINAL_ERROR_CATEGORY.to_string())
+    } else if missing_observed_finish {
+        Some(STREAM_MISSING_TERMINAL_EVENT_CATEGORY.to_string())
+    } else {
+        None
+    };
+    let terminal_error_message = terminal_error_message.or_else(|| {
+        missing_observed_finish.then(|| STREAM_MISSING_TERMINAL_EVENT_MESSAGE.to_string())
+    });
+    if client_response.is_none() {
+        if let (Some(message), Some(category)) = (
+            terminal_error_message.as_deref(),
+            terminal_failure_category.as_deref(),
+        ) {
+            client_response = Some(build_stream_terminal_error_client_response(
+                category,
+                message,
+                status_code,
+                provider_response_full.as_ref(),
+            ));
+            client_response_body_state = Some(UsageBodyCaptureState::Inline);
+        }
+    }
+    let terminal_state = infer_stream_terminal_state(
+        report_kind.as_str(),
+        status_code,
+        cancelled,
+        missing_observed_finish,
+        terminal_error_message.is_some(),
+    );
 
     TerminalUsageSeed {
         terminal_state,
@@ -912,6 +1067,8 @@ pub fn build_stream_terminal_usage_seed(
         has_format_conversion: context_seed.has_format_conversion,
         is_stream: context_seed.is_stream,
         status_code,
+        terminal_error_message,
+        terminal_failure_category,
         response_time_ms,
         first_byte_time_ms,
         request_headers: context_seed.request_headers,
@@ -958,14 +1115,164 @@ fn infer_stream_terminal_state(
     report_kind: &str,
     status_code: u16,
     cancelled: bool,
+    missing_observed_finish: bool,
+    terminal_error: bool,
 ) -> UsageTerminalState {
     if cancelled || status_code == 499 || report_kind.contains("cancel") {
         UsageTerminalState::Cancelled
-    } else if !(200..300).contains(&status_code) {
+    } else if !(200..300).contains(&status_code) || missing_observed_finish || terminal_error {
         UsageTerminalState::Failed
     } else {
         UsageTerminalState::Completed
     }
+}
+
+fn captured_stream_terminal_state(
+    report_kind: &str,
+    client_contract: &str,
+    provider_contract: &str,
+    provider_response: Option<&Value>,
+    provider_response_body_state: Option<UsageBodyCaptureState>,
+    client_response: Option<&Value>,
+    client_response_body_state: Option<UsageBodyCaptureState>,
+) -> Option<StreamCapturedTerminalState> {
+    let report_kind_requires_terminal_event =
+        stream_report_kind_requires_observed_terminal_event(report_kind);
+    let provider_contract_requires_terminal_event =
+        is_openai_responses_family_format_alias(provider_contract);
+    let client_contract_requires_terminal_event =
+        is_openai_responses_family_format_alias(client_contract);
+    let fallback_requires_terminal_event = report_kind_requires_terminal_event
+        && !provider_contract_requires_terminal_event
+        && !client_contract_requires_terminal_event;
+
+    combine_stream_capture_terminal_states(
+        (provider_contract_requires_terminal_event || fallback_requires_terminal_event)
+            .then(|| {
+                captured_stream_terminal_state_from_body(
+                    provider_response,
+                    provider_response_body_state,
+                )
+            })
+            .flatten(),
+        (client_contract_requires_terminal_event || fallback_requires_terminal_event)
+            .then(|| {
+                captured_stream_terminal_state_from_body(
+                    client_response,
+                    client_response_body_state,
+                )
+            })
+            .flatten(),
+    )
+}
+
+fn captured_stream_terminal_state_from_body(
+    response: Option<&Value>,
+    body_state: Option<UsageBodyCaptureState>,
+) -> Option<StreamCapturedTerminalState> {
+    let state = response.and_then(stream_capture_terminal_state);
+    match state {
+        Some(StreamCapturedTerminalState::Missing)
+            if !stream_body_capture_can_prove_missing_terminal(body_state) =>
+        {
+            None
+        }
+        other => other,
+    }
+}
+
+fn stream_body_capture_can_prove_missing_terminal(
+    body_state: Option<UsageBodyCaptureState>,
+) -> bool {
+    matches!(
+        body_state,
+        None | Some(UsageBodyCaptureState::Inline) | Some(UsageBodyCaptureState::None)
+    )
+}
+
+fn combine_stream_capture_terminal_states(
+    current: Option<StreamCapturedTerminalState>,
+    next: Option<StreamCapturedTerminalState>,
+) -> Option<StreamCapturedTerminalState> {
+    match (current, next) {
+        (Some(StreamCapturedTerminalState::Failed), _)
+        | (_, Some(StreamCapturedTerminalState::Failed)) => {
+            Some(StreamCapturedTerminalState::Failed)
+        }
+        (Some(StreamCapturedTerminalState::Missing), _)
+        | (_, Some(StreamCapturedTerminalState::Missing)) => {
+            Some(StreamCapturedTerminalState::Missing)
+        }
+        (Some(StreamCapturedTerminalState::Completed), _)
+        | (_, Some(StreamCapturedTerminalState::Completed)) => {
+            Some(StreamCapturedTerminalState::Completed)
+        }
+        (None, None) => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stream_empty_required_captures_missing_terminal(
+    report_kind: &str,
+    client_contract: &str,
+    provider_contract: &str,
+    provider_response: Option<&Value>,
+    provider_response_body_state: Option<UsageBodyCaptureState>,
+    client_response: Option<&Value>,
+    client_response_body_state: Option<UsageBodyCaptureState>,
+) -> bool {
+    let report_kind_requires_terminal_event =
+        stream_report_kind_requires_observed_terminal_event(report_kind);
+    let provider_contract_requires_terminal_event =
+        is_openai_responses_family_format_alias(provider_contract);
+    let client_contract_requires_terminal_event =
+        is_openai_responses_family_format_alias(client_contract);
+    let fallback_requires_terminal_event = report_kind_requires_terminal_event
+        && !provider_contract_requires_terminal_event
+        && !client_contract_requires_terminal_event;
+    let provider_requires_terminal =
+        provider_contract_requires_terminal_event || fallback_requires_terminal_event;
+    let client_requires_terminal =
+        client_contract_requires_terminal_event || fallback_requires_terminal_event;
+
+    let mut has_required_capture = false;
+    let mut all_required_captures_empty = true;
+
+    if provider_requires_terminal {
+        has_required_capture = true;
+        all_required_captures_empty &= provider_response.is_none()
+            && provider_response_body_state == Some(UsageBodyCaptureState::None);
+    }
+
+    if client_requires_terminal {
+        has_required_capture = true;
+        all_required_captures_empty &= client_response.is_none()
+            && client_response_body_state == Some(UsageBodyCaptureState::None);
+    }
+
+    has_required_capture && all_required_captures_empty
+}
+
+fn stream_report_kind_requires_observed_terminal_event(report_kind: &str) -> bool {
+    let report_kind = report_kind.trim().to_ascii_lowercase();
+    report_kind.starts_with("openai_responses_")
+        || report_kind.starts_with("openai_compact_")
+        || report_kind.starts_with("openai_cli_")
+}
+
+fn stream_usage_requires_observed_terminal_event(
+    report_kind: &str,
+    client_contract: &str,
+    provider_contract: &str,
+) -> bool {
+    stream_report_kind_requires_observed_terminal_event(report_kind)
+        || is_openai_responses_family_format_alias(client_contract)
+        || is_openai_responses_family_format_alias(provider_contract)
+}
+
+fn is_openai_responses_family_format_alias(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase().replace('_', ":");
+    aether_ai_formats::is_openai_responses_family_format(normalized.as_str())
 }
 
 fn resolve_has_format_conversion(
@@ -1233,7 +1540,10 @@ fn build_usage_event_data_seed_with_detail(
     let provider_name = context_string(context, "provider_name")
         .or_else(|| non_empty_str(plan.provider_name.as_deref()))
         .unwrap_or_else(|| "unknown".to_string());
-    let request_type = Some(infer_request_type(api_format.as_deref()));
+    let request_type = Some(infer_request_type_from_contracts(
+        api_format.as_deref(),
+        endpoint_api_format.as_deref(),
+    ));
     let api_family = api_format
         .as_deref()
         .and_then(infer_api_family)
@@ -1475,6 +1785,31 @@ fn context_body_value(context: Option<&Map<String, Value>>, key: &str) -> Option
     }
 }
 
+fn kiro_simulated_cache_standardized_usage_from_context(
+    context: Option<&Map<String, Value>>,
+) -> Option<StandardizedUsage> {
+    let enabled = context_bool(context, "kiro_simulated_cache_enabled").unwrap_or(false);
+    if !enabled {
+        return None;
+    }
+
+    let input_tokens = context_u64(context, "input_tokens")?;
+    let cache_creation_tokens = context_u64(context, "cache_creation_input_tokens").unwrap_or(0);
+    let cache_read_tokens = context_u64(context, "cache_read_input_tokens").unwrap_or(0);
+    if cache_creation_tokens == 0 && cache_read_tokens == 0 {
+        return None;
+    }
+
+    let billed_input_tokens = input_tokens
+        .saturating_sub(cache_creation_tokens)
+        .saturating_sub(cache_read_tokens);
+    let mut usage = StandardizedUsage::new();
+    usage.input_tokens = billed_input_tokens as i64;
+    usage.cache_creation_tokens = cache_creation_tokens as i64;
+    usage.cache_read_tokens = cache_read_tokens as i64;
+    Some(usage)
+}
+
 fn context_has_inline_body(context: Option<&Map<String, Value>>, key: &str) -> bool {
     matches!(context_value_ref(context, key), Some(value) if !value.is_null())
 }
@@ -1577,9 +1912,9 @@ fn build_runtime_request_metadata_seed_from_parts(
             Value::Bool(client_requested_stream),
         );
     }
-    if let Some(upstream_is_stream) = context_bool(context, "upstream_is_stream") {
+    if let Some(upstream_is_stream) = context_bool(context, UPSTREAM_IS_STREAM_KEY) {
         metadata.insert(
-            "upstream_is_stream".to_string(),
+            UPSTREAM_IS_STREAM_KEY.to_string(),
             Value::Bool(upstream_is_stream),
         );
     }
@@ -1724,7 +2059,7 @@ fn clone_usage_capture_value(value: Option<&Value>) -> Option<Value> {
 }
 
 fn clone_usage_body_value(value: Option<&Value>) -> Option<Value> {
-    value.cloned()
+    value.cloned().map(mask_sensitive_body_fields)
 }
 
 fn sanitize_usage_event_capture_fields(mut data: UsageEventData) -> UsageEventData {
@@ -1854,6 +2189,19 @@ fn infer_request_type(api_format: Option<&str>) -> String {
     }
 }
 
+fn infer_request_type_from_contracts(
+    client_api_format: Option<&str>,
+    provider_api_format: Option<&str>,
+) -> String {
+    if matches!(
+        infer_endpoint_kind(provider_api_format.unwrap_or_default()),
+        Some("image")
+    ) {
+        return "image".to_string();
+    }
+    infer_request_type(client_api_format)
+}
+
 fn infer_api_family(api_format: &str) -> Option<&str> {
     api_format.split_once(':').map(|(family, _)| family)
 }
@@ -1887,13 +2235,63 @@ fn apply_standardized_usage_seed(usage: &StandardizedUsage, data: &mut UsageEven
     if total_tokens > 0 {
         data.total_tokens = Some(total_tokens);
     }
+    apply_standardized_usage_dimensions_seed(usage, data);
+}
+
+fn apply_standardized_usage_dimensions_seed(usage: &StandardizedUsage, data: &mut UsageEventData) {
+    if usage.dimensions.is_empty() && usage.request_count <= 0 {
+        return;
+    }
+
+    let mut dimensions = usage
+        .dimensions
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<Map<String, Value>>();
+    if usage.request_count > 0 {
+        dimensions
+            .entry("request_count".to_string())
+            .or_insert_with(|| json!(usage.request_count));
+    }
+    if dimensions.is_empty() {
+        return;
+    }
+
+    let mut metadata = match data.request_metadata.take() {
+        Some(Value::Object(object)) => object,
+        _ => Map::new(),
+    };
+    let mut existing_dimensions = match metadata.remove("dimensions") {
+        Some(Value::Object(object)) => object,
+        _ => Map::new(),
+    };
+    for (key, value) in dimensions {
+        existing_dimensions.insert(key, value);
+    }
+    metadata.insert("dimensions".to_string(), Value::Object(existing_dimensions));
+    data.request_metadata = Some(Value::Object(metadata));
 }
 
 fn standardized_usage_total_tokens(usage: &StandardizedUsage) -> u64 {
+    if let Some(total_tokens) = standardized_usage_explicit_total_tokens(usage) {
+        return total_tokens;
+    }
+
     positive_usage_component(usage.input_tokens)
         .saturating_add(positive_usage_component(usage.output_tokens))
-        .saturating_add(positive_usage_component(usage.cache_creation_tokens))
-        .saturating_add(positive_usage_component(usage.cache_read_tokens))
+        .saturating_add(positive_usage_component(usage.reasoning_tokens))
+}
+
+fn standardized_usage_explicit_total_tokens(usage: &StandardizedUsage) -> Option<u64> {
+    usage
+        .dimensions
+        .get("total_tokens")
+        .and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_i64().and_then(|v| u64::try_from(v).ok()))
+        })
+        .filter(|value| *value > 0)
 }
 
 fn positive_usage_component(value: i64) -> u64 {
@@ -1979,13 +2377,119 @@ fn mask_sensitive_headers_in_json_value(value: Option<Value>) -> Option<Value> {
     Some(value)
 }
 
-fn resolve_error_category(status_code: u16, event_type: UsageEventType) -> Option<String> {
+fn mask_sensitive_body_fields(mut value: Value) -> Value {
+    mask_sensitive_body_fields_in_place(&mut value);
+    value
+}
+
+fn mask_sensitive_body_fields_in_place(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            for (key, value) in object.iter_mut() {
+                if is_sensitive_body_key(key) {
+                    let replacement = if value.is_null() {
+                        Value::Null
+                    } else if let Some(text) = value.as_str() {
+                        Value::String(mask_sensitive_header_value(text))
+                    } else {
+                        Value::String(mask_sensitive_header_value(&value.to_string()))
+                    };
+                    *value = replacement;
+                } else {
+                    mask_sensitive_body_fields_in_place(value);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                mask_sensitive_body_fields_in_place(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_sensitive_body_key(key: &str) -> bool {
+    let normalized = key
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    normalized.contains("token")
+        || normalized.contains("apikey")
+        || normalized.contains("password")
+        || normalized.contains("authorization")
+        || normalized.contains("secret")
+        || normalized == "cookie"
+}
+
+fn resolve_error_category(
+    status_code: u16,
+    event_type: UsageEventType,
+    is_stream: bool,
+    terminal_failure_category: Option<&str>,
+) -> Option<String> {
     match event_type {
         UsageEventType::Cancelled => Some("cancelled".to_string()),
         UsageEventType::Failed if status_code >= 500 => Some("server_error".to_string()),
         UsageEventType::Failed if status_code >= 400 => Some("client_error".to_string()),
         UsageEventType::Failed if status_code >= 300 => Some("redirect".to_string()),
+        UsageEventType::Failed if (200..300).contains(&status_code) => terminal_failure_category
+            .map(ToOwned::to_owned)
+            .or_else(|| is_stream.then(|| "stream_terminal_error".to_string()))
+            .or_else(|| Some("non_success_status".to_string())),
         UsageEventType::Failed => Some("non_success_status".to_string()),
+        _ => None,
+    }
+}
+
+fn build_stream_terminal_error_client_response(
+    category: &str,
+    message: &str,
+    status_code: u16,
+    provider_response: Option<&Value>,
+) -> Value {
+    let mut error = provider_response
+        .and_then(extract_error_object_from_json)
+        .unwrap_or_default();
+    error
+        .entry("type".to_string())
+        .or_insert_with(|| Value::String(category.to_string()));
+    error
+        .entry("message".to_string())
+        .or_insert_with(|| Value::String(message.to_string()));
+    error
+        .entry("upstream_status".to_string())
+        .or_insert_with(|| Value::from(status_code));
+
+    json!({ "error": Value::Object(error) })
+}
+
+fn extract_error_object_from_json(value: &Value) -> Option<Map<String, Value>> {
+    value
+        .get("error")
+        .and_then(value_to_error_object)
+        .or_else(|| {
+            value
+                .get("response")
+                .and_then(|response| response.get("error"))
+                .and_then(value_to_error_object)
+        })
+        .or_else(|| {
+            value
+                .get("chunks")
+                .and_then(Value::as_array)
+                .and_then(|chunks| chunks.iter().find_map(extract_error_object_from_json))
+        })
+}
+
+fn value_to_error_object(value: &Value) -> Option<Map<String, Value>> {
+    match value {
+        Value::Object(object) => Some(object.clone()),
+        Value::String(message) if !message.trim().is_empty() => Some(Map::from_iter([(
+            "message".to_string(),
+            Value::String(message.trim().to_string()),
+        )])),
         _ => None,
     }
 }
@@ -2017,6 +2521,31 @@ fn extract_explicit_error_message_from_json(value: &Value) -> Option<String> {
         .and_then(|error| error.get("message"))
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
+        .or_else(|| {
+            value
+                .get("response")
+                .and_then(|response| response.get("error"))
+                .and_then(|error| error.get("message"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .or_else(|| {
+            value
+                .get("response")
+                .and_then(|response| response.get("incomplete_details"))
+                .and_then(|details| details.get("reason"))
+                .and_then(Value::as_str)
+                .map(|reason| format!("Response incomplete: {reason}"))
+        })
+        .or_else(|| extract_stream_error_message_from_chunks(value))
+}
+
+fn extract_stream_error_message_from_chunks(value: &Value) -> Option<String> {
+    value
+        .get("chunks")
+        .and_then(Value::as_array)?
+        .iter()
+        .find_map(extract_explicit_error_message_from_json)
 }
 
 fn extract_generic_error_message_from_json(value: &Value) -> Option<String> {
@@ -2033,6 +2562,11 @@ fn decode_body_for_storage(body_base64: Option<&str>) -> Option<Value> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(body_base64)
         .ok()?;
+    if let Some(error_body) =
+        aether_ai_formats::api::extract_provider_private_stream_error_body(None, &bytes)
+    {
+        return Some(error_body);
+    }
     if let Ok(json_body) = serde_json::from_slice::<Value>(&bytes) {
         return Some(json_body);
     }
@@ -2174,12 +2708,337 @@ fn extract_token_counts_from_value(value: &Value) -> Option<(u64, u64, u64)> {
     }
 }
 
+fn apply_completed_image_usage_estimate(data: &mut UsageEventData) {
+    if !usage_event_data_is_image(data) {
+        return;
+    }
+    apply_completed_image_dimensions(data);
+    if data
+        .response_body
+        .as_ref()
+        .and_then(extract_token_counts_from_value)
+        .is_some()
+    {
+        return;
+    }
+    let request_usage = data
+        .provider_request_body
+        .as_ref()
+        .or(data.request_body.as_ref())
+        .and_then(estimate_request_usage);
+
+    if positive_tokens(data.input_tokens) == 0 {
+        if let Some(usage) = request_usage.as_ref() {
+            data.input_tokens = Some(usage.input_tokens);
+        }
+    }
+    apply_request_cache_usage_estimate(data, request_usage.as_ref());
+    if positive_tokens(data.total_tokens) == 0 {
+        let total_tokens =
+            positive_tokens(data.input_tokens).saturating_add(positive_tokens(data.output_tokens));
+        if total_tokens > 0 {
+            data.total_tokens = Some(total_tokens);
+        }
+    }
+}
+
+fn apply_completed_image_dimensions(data: &mut UsageEventData) {
+    let image_count = usage_dimension_i64(data.request_metadata.as_ref(), "image_count")
+        .or_else(|| image_response_count(data.response_body.as_ref()))
+        .or_else(|| image_request_count(data.provider_request_body.as_ref()))
+        .or_else(|| image_request_count(data.request_body.as_ref()));
+
+    if let Some(image_count) = image_count.filter(|value| *value > 0) {
+        set_usage_dimension_if_absent(data, "image_count", json!(image_count));
+    }
+
+    for (dimension, request_key) in [
+        ("image_size", "size"),
+        ("image_quality", "quality"),
+        ("image_output_format", "output_format"),
+    ] {
+        if usage_dimension_string(data.request_metadata.as_ref(), dimension).is_some() {
+            continue;
+        }
+        if let Some(value) = image_request_string(data.provider_request_body.as_ref(), request_key)
+            .or_else(|| image_request_string(data.request_body.as_ref(), request_key))
+        {
+            set_usage_dimension_if_absent(data, dimension, json!(value));
+        }
+    }
+}
+
+fn usage_dimension_i64(metadata: Option<&Value>, key: &str) -> Option<i64> {
+    metadata
+        .and_then(Value::as_object)
+        .and_then(|object| object.get("dimensions"))
+        .and_then(Value::as_object)
+        .and_then(|object| object.get(key))
+        .and_then(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_u64().and_then(|number| i64::try_from(number).ok()))
+        })
+}
+
+fn usage_dimension_string(metadata: Option<&Value>, key: &str) -> Option<String> {
+    metadata
+        .and_then(Value::as_object)
+        .and_then(|object| object.get("dimensions"))
+        .and_then(Value::as_object)
+        .and_then(|object| object.get(key))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn set_usage_dimension_if_absent(data: &mut UsageEventData, key: &str, value: Value) {
+    let mut metadata = match data.request_metadata.take() {
+        Some(Value::Object(object)) => object,
+        _ => Map::new(),
+    };
+    let mut dimensions = match metadata.remove("dimensions") {
+        Some(Value::Object(object)) => object,
+        _ => Map::new(),
+    };
+    dimensions.entry(key.to_string()).or_insert(value);
+    metadata.insert("dimensions".to_string(), Value::Object(dimensions));
+    data.request_metadata = Some(Value::Object(metadata));
+}
+
+fn image_response_count(value: Option<&Value>) -> Option<i64> {
+    let value = value?;
+    value
+        .get("data")
+        .and_then(Value::as_array)
+        .map(|items| items.len() as i64)
+        .filter(|count| *count > 0)
+        .or_else(|| image_result_count(value.get("result")))
+}
+
+fn image_result_count(value: Option<&Value>) -> Option<i64> {
+    match value? {
+        Value::Array(items) => Some(items.len() as i64).filter(|count| *count > 0),
+        Value::Object(object) if !object.is_empty() => Some(1),
+        Value::String(text) if !text.trim().is_empty() => Some(1),
+        _ => None,
+    }
+}
+
+fn image_request_count(value: Option<&Value>) -> Option<i64> {
+    value
+        .and_then(|value| value.get("n"))
+        .and_then(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_u64().and_then(|number| i64::try_from(number).ok()))
+        })
+        .filter(|count| *count > 0)
+}
+
+fn image_request_string(value: Option<&Value>, key: &str) -> Option<String> {
+    value
+        .and_then(|value| value.get(key))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn usage_event_data_is_image(data: &UsageEventData) -> bool {
+    data.request_type
+        .as_deref()
+        .is_some_and(|value| value.eq_ignore_ascii_case("image"))
+        || data
+            .endpoint_kind
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case("image"))
+        || data
+            .provider_endpoint_kind
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case("image"))
+        || data
+            .endpoint_api_format
+            .as_deref()
+            .and_then(infer_endpoint_kind)
+            .is_some_and(|value| value.eq_ignore_ascii_case("image"))
+        || data
+            .api_format
+            .as_deref()
+            .and_then(infer_endpoint_kind)
+            .is_some_and(|value| value.eq_ignore_ascii_case("image"))
+}
+
+fn apply_request_cache_usage_estimate(
+    data: &mut UsageEventData,
+    request_usage: Option<&EstimatedRequestUsage>,
+) {
+    let Some(request_usage) = request_usage else {
+        return;
+    };
+    if positive_tokens(data.cache_read_input_tokens) == 0 && request_usage.cache_read_tokens > 0 {
+        data.cache_read_input_tokens = Some(request_usage.cache_read_tokens);
+    }
+    if positive_tokens(data.cache_creation_input_tokens) == 0
+        && request_usage.cache_creation_tokens > 0
+    {
+        data.cache_creation_input_tokens = Some(request_usage.cache_creation_tokens);
+    }
+    if positive_tokens(data.cache_creation_ephemeral_5m_input_tokens) == 0
+        && request_usage.cache_creation_ephemeral_5m_tokens > 0
+    {
+        data.cache_creation_ephemeral_5m_input_tokens =
+            Some(request_usage.cache_creation_ephemeral_5m_tokens);
+    }
+    if positive_tokens(data.cache_creation_ephemeral_1h_input_tokens) == 0
+        && request_usage.cache_creation_ephemeral_1h_tokens > 0
+    {
+        data.cache_creation_ephemeral_1h_input_tokens =
+            Some(request_usage.cache_creation_ephemeral_1h_tokens);
+    }
+}
+
+fn positive_tokens(value: Option<u64>) -> u64 {
+    value.unwrap_or_default()
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct EstimatedRequestUsage {
+    input_tokens: u64,
+    cache_read_tokens: u64,
+    cache_creation_tokens: u64,
+    cache_creation_ephemeral_5m_tokens: u64,
+    cache_creation_ephemeral_1h_tokens: u64,
+}
+
+fn estimate_request_usage(value: &Value) -> Option<EstimatedRequestUsage> {
+    let preferred_total = match value {
+        Value::Object(object) => [
+            "instructions",
+            "input",
+            "messages",
+            "prompt",
+            "contents",
+            "system",
+            "tools",
+        ]
+        .into_iter()
+        .filter_map(|field| object.get(field))
+        .map(estimate_json_tokens)
+        .fold(0u64, u64::saturating_add),
+        _ => 0,
+    };
+    let total = if preferred_total > 0 {
+        preferred_total
+    } else {
+        estimate_json_tokens(value)
+    };
+    if total == 0 {
+        return None;
+    }
+
+    let mut usage = EstimatedRequestUsage {
+        input_tokens: total,
+        ..EstimatedRequestUsage::default()
+    };
+    apply_explicit_request_cache_usage(value, &mut usage);
+    Some(usage)
+}
+
+fn apply_explicit_request_cache_usage(value: &Value, usage: &mut EstimatedRequestUsage) {
+    usage.cache_read_tokens = first_positive_u64_path(
+        value,
+        &[
+            &["cache_read_input_tokens"],
+            &["cache_read_tokens"],
+            &["input_tokens_details", "cached_tokens"],
+            &["prompt_tokens_details", "cached_tokens"],
+        ],
+    )
+    .unwrap_or_default();
+    usage.cache_creation_tokens = first_positive_u64_path(
+        value,
+        &[
+            &["cache_creation_input_tokens"],
+            &["cache_creation_tokens"],
+            &["input_tokens_details", "cached_creation_tokens"],
+            &["prompt_tokens_details", "cached_creation_tokens"],
+        ],
+    )
+    .unwrap_or_default();
+    usage.cache_creation_ephemeral_5m_tokens = first_positive_u64_path(
+        value,
+        &[
+            &["cache_creation", "ephemeral_5m_input_tokens"],
+            &["cache_creation_ephemeral_5m_input_tokens"],
+        ],
+    )
+    .unwrap_or_default();
+    usage.cache_creation_ephemeral_1h_tokens = first_positive_u64_path(
+        value,
+        &[
+            &["cache_creation", "ephemeral_1h_input_tokens"],
+            &["cache_creation_ephemeral_1h_input_tokens"],
+        ],
+    )
+    .unwrap_or_default();
+    if usage.cache_creation_tokens == 0 {
+        usage.cache_creation_tokens = usage
+            .cache_creation_ephemeral_5m_tokens
+            .saturating_add(usage.cache_creation_ephemeral_1h_tokens);
+    }
+}
+
+fn first_positive_u64_path(value: &Value, paths: &[&[&str]]) -> Option<u64> {
+    paths
+        .iter()
+        .find_map(|path| value_at_path(value, path).and_then(value_as_positive_u64))
+}
+
+fn value_at_path<'a>(mut value: &'a Value, path: &[&str]) -> Option<&'a Value> {
+    for segment in path {
+        value = value.get(*segment)?;
+    }
+    Some(value)
+}
+
+fn value_as_positive_u64(value: &Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_i64().and_then(|number| u64::try_from(number).ok()))
+        .filter(|value| *value > 0)
+}
+
+fn estimate_json_tokens(value: &Value) -> u64 {
+    match value {
+        Value::String(text) => estimate_text_tokens(text),
+        Value::Array(items) => items
+            .iter()
+            .map(estimate_json_tokens)
+            .fold(0u64, u64::saturating_add),
+        Value::Object(object) => object
+            .iter()
+            .map(|(key, value)| {
+                estimate_text_tokens(key).saturating_add(estimate_json_tokens(value))
+            })
+            .fold(0u64, u64::saturating_add),
+        Value::Null => 0,
+        _ => 1,
+    }
+}
+
+fn estimate_text_tokens(text: &str) -> u64 {
+    let chars = text.chars().count() as u64;
+    if chars == 0 {
+        0
+    } else {
+        chars.div_ceil(4).max(1)
+    }
+}
+
 fn extract_token_counts_from_json(value: &Value) -> Option<(u64, u64, u64)> {
     if let Some(usage) = value.get("usage").and_then(Value::as_object) {
-        let usage_details = usage
-            .get("input_tokens_details")
-            .or_else(|| usage.get("prompt_tokens_details"))
-            .and_then(Value::as_object);
         let input = usage
             .get("input_tokens")
             .or_else(|| usage.get("prompt_tokens"))
@@ -2190,20 +3049,22 @@ fn extract_token_counts_from_json(value: &Value) -> Option<(u64, u64, u64)> {
             .or_else(|| usage.get("completion_tokens"))
             .and_then(Value::as_u64)
             .unwrap_or_default();
-        let raw_total = usage
+        let reasoning = usage
+            .get("reasoning_tokens")
+            .and_then(Value::as_u64)
+            .or_else(|| {
+                usage
+                    .get("output_tokens_details")
+                    .or_else(|| usage.get("completion_tokens_details"))
+                    .and_then(Value::as_object)
+                    .and_then(|details| details.get("reasoning_tokens"))
+                    .and_then(Value::as_u64)
+            })
+            .unwrap_or_default();
+        let total = usage
             .get("total_tokens")
             .and_then(Value::as_u64)
-            .unwrap_or(input + output);
-        let cache_creation = extract_cache_creation_tokens_from_usage_object(usage, usage_details);
-        let cache_read = extract_cache_read_tokens_from_usage_object(usage, usage_details);
-        let total = if cache_creation > 0 || cache_read > 0 {
-            input
-                .saturating_add(output)
-                .saturating_add(cache_creation)
-                .saturating_add(cache_read)
-        } else {
-            raw_total
-        };
+            .unwrap_or_else(|| input.saturating_add(output).saturating_add(reasoning));
         return Some((input, output, total));
     }
 
@@ -2236,59 +3097,6 @@ fn extract_token_counts_from_json(value: &Value) -> Option<(u64, u64, u64)> {
     None
 }
 
-fn extract_cache_creation_tokens_from_usage_object(
-    usage: &serde_json::Map<String, Value>,
-    usage_details: Option<&serde_json::Map<String, Value>>,
-) -> u64 {
-    let direct = usage
-        .get("cache_creation_input_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or_default();
-    if direct > 0 {
-        return direct;
-    }
-
-    let breakdown = usage
-        .get("cache_creation")
-        .and_then(Value::as_object)
-        .map(|cache_creation| {
-            cache_creation
-                .get("ephemeral_5m_input_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or_default()
-                .saturating_add(
-                    cache_creation
-                        .get("ephemeral_1h_input_tokens")
-                        .and_then(Value::as_u64)
-                        .unwrap_or_default(),
-                )
-        })
-        .unwrap_or_default();
-    if breakdown > 0 {
-        return breakdown;
-    }
-
-    usage_details
-        .and_then(|details| details.get("cached_creation_tokens"))
-        .and_then(Value::as_u64)
-        .unwrap_or_default()
-}
-
-fn extract_cache_read_tokens_from_usage_object(
-    usage: &serde_json::Map<String, Value>,
-    usage_details: Option<&serde_json::Map<String, Value>>,
-) -> u64 {
-    usage
-        .get("cache_read_input_tokens")
-        .and_then(Value::as_u64)
-        .or_else(|| {
-            usage_details
-                .and_then(|details| details.get("cached_tokens"))
-                .and_then(Value::as_u64)
-        })
-        .unwrap_or_default()
-}
-
 fn empty_to_none(value: Option<String>) -> Option<String> {
     value.and_then(trim_owned_non_empty_string)
 }
@@ -2300,12 +3108,12 @@ mod tests {
         build_stream_terminal_usage_event, build_streaming_usage_record,
         build_sync_terminal_usage_event, build_sync_terminal_usage_payload_seed,
         build_sync_terminal_usage_seed, build_terminal_usage_context_seed,
-        build_terminal_usage_event_from_seed, build_usage_event_data_seed,
+        build_terminal_usage_event_from_seed, build_usage_event_data_seed, decode_body_for_storage,
         extract_token_counts_from_json, extract_token_counts_from_value, headers_to_json,
-        mask_header_value, mask_sensitive_headers_in_json_value, parse_sse_body_for_storage,
-        resolve_error_message, trim_owned_non_empty_string, LifecycleUsageSeed, TerminalUsageSeed,
-        UsageBodyRefsSeed, UsageBodyStatesSeed, UsageRoutingSeed, UsageTerminalState,
-        MAX_USAGE_CAPTURE_BYTES, MAX_USAGE_CAPTURE_DEPTH,
+        mask_header_value, mask_sensitive_body_fields, mask_sensitive_headers_in_json_value,
+        parse_sse_body_for_storage, resolve_error_message, trim_owned_non_empty_string,
+        LifecycleUsageSeed, TerminalUsageSeed, UsageBodyRefsSeed, UsageBodyStatesSeed,
+        UsageRoutingSeed, UsageTerminalState, MAX_USAGE_CAPTURE_BYTES, MAX_USAGE_CAPTURE_DEPTH,
     };
     use crate::{
         build_upsert_usage_record_from_event, GatewayStreamReportRequest, GatewaySyncReportRequest,
@@ -2348,7 +3156,7 @@ mod tests {
         }))
         .expect("tokens should exist");
 
-        assert_eq!(tokens, (3, 5, 11));
+        assert_eq!(tokens, (3, 5, 8));
     }
 
     #[test]
@@ -2366,7 +3174,7 @@ mod tests {
         }))
         .expect("tokens should exist");
 
-        assert_eq!(tokens, (3, 5, 11));
+        assert_eq!(tokens, (3, 5, 8));
     }
 
     #[test]
@@ -2381,7 +3189,7 @@ mod tests {
         }))
         .expect("tokens should exist");
 
-        assert_eq!(tokens, (6, 20, 41883));
+        assert_eq!(tokens, (6, 20, 26));
     }
 
     #[test]
@@ -2429,7 +3237,7 @@ mod tests {
         }))
         .expect("tokens should exist");
 
-        assert_eq!(tokens, (9, 4, 20));
+        assert_eq!(tokens, (9, 4, 13));
     }
 
     #[test]
@@ -2529,6 +3337,9 @@ mod tests {
         assert!(record.request_body.is_none());
         assert!(record.provider_request_headers.is_none());
         assert!(record.provider_request_body.is_none());
+        assert_eq!(record.provider_id.as_deref(), Some("provider-1"));
+        assert_eq!(record.provider_endpoint_id.as_deref(), Some("endpoint-1"));
+        assert_eq!(record.provider_api_key_id.as_deref(), Some("key-1"));
         assert_eq!(record.candidate_id.as_deref(), Some("cand-pending-usage-1"));
         assert_eq!(record.candidate_index, Some(0));
         assert_eq!(record.key_name.as_deref(), Some("codex-upstream"));
@@ -2708,6 +3519,114 @@ mod tests {
     }
 
     #[test]
+    fn usage_body_capture_redacts_nested_provider_secrets() {
+        let masked = mask_sensitive_body_fields(json!({
+            "metadata": {
+                "apiKey": "devin-session-token$secret-value",
+                "nested": {
+                    "sessionToken": "session-token-secret"
+                }
+            },
+            "password": "plain-password",
+            "messages": [{"content": "safe text"}]
+        }));
+
+        assert_ne!(
+            masked.pointer("/metadata/apiKey").and_then(Value::as_str),
+            Some("devin-session-token$secret-value")
+        );
+        assert_ne!(
+            masked
+                .pointer("/metadata/nested/sessionToken")
+                .and_then(Value::as_str),
+            Some("session-token-secret")
+        );
+        assert_ne!(
+            masked.get("password").and_then(Value::as_str),
+            Some("plain-password")
+        );
+        assert_eq!(
+            masked
+                .pointer("/messages/0/content")
+                .and_then(Value::as_str),
+            Some("safe text")
+        );
+    }
+
+    #[test]
+    fn sync_terminal_usage_redacts_provider_request_body_secrets_from_context() {
+        let plan = ExecutionPlan {
+            request_id: "req-sync-redact-provider-request-1".to_string(),
+            candidate_id: Some("cand-sync-redact-provider-request-1".to_string()),
+            provider_name: Some("Windsurf".to_string()),
+            provider_id: "provider-windsurf".to_string(),
+            endpoint_id: "endpoint-windsurf".to_string(),
+            key_id: "key-windsurf".to_string(),
+            method: "POST".to_string(),
+            url: "https://server.codeium.com/exa.api_server_pb.ApiServerService/GetChatMessage"
+                .to_string(),
+            headers: BTreeMap::new(),
+            content_type: Some("application/json".to_string()),
+            content_encoding: None,
+            body: RequestBody::from_json(json!({"model": "windsurf-model"})),
+            stream: false,
+            client_api_format: "openai:chat".to_string(),
+            provider_api_format: "openai:chat".to_string(),
+            model_name: Some("windsurf-model".to_string()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        };
+        let payload = GatewaySyncReportRequest {
+            trace_id: "trace-sync-redact-provider-request-1".to_string(),
+            report_kind: "openai_chat_sync_success".to_string(),
+            report_context: Some(json!({
+                "client_api_format": "openai:chat",
+                "provider_api_format": "openai:chat",
+                "provider_request_body": {
+                    "metadata": {
+                        "apiKey": "devin-session-token$abc",
+                        "sessionToken": "session-token-secret"
+                    },
+                    "message": "safe prompt"
+                }
+            })),
+            status_code: 200,
+            headers: BTreeMap::new(),
+            body_json: Some(json!({"id": "resp_1", "choices": []})),
+            client_body_json: None,
+            body_base64: None,
+            telemetry: None,
+        };
+
+        let event =
+            build_sync_terminal_usage_event(&plan, payload.report_context.as_ref(), &payload)
+                .expect("terminal usage should build");
+        let provider_request = event
+            .data
+            .provider_request_body
+            .as_ref()
+            .expect("provider request body should be captured");
+
+        assert_ne!(
+            provider_request
+                .pointer("/metadata/apiKey")
+                .and_then(Value::as_str),
+            Some("devin-session-token$abc")
+        );
+        assert_ne!(
+            provider_request
+                .pointer("/metadata/sessionToken")
+                .and_then(Value::as_str),
+            Some("session-token-secret")
+        );
+        assert_eq!(
+            provider_request.pointer("/message").and_then(Value::as_str),
+            Some("safe prompt")
+        );
+    }
+
+    #[test]
     fn builds_stream_terminal_usage_from_provider_body_and_preserves_client_body() {
         let plan = ExecutionPlan {
             request_id: "req-stream-usage-1".to_string(),
@@ -2800,6 +3719,262 @@ mod tests {
                 }
             }))
         );
+    }
+
+    #[test]
+    fn cancelled_stream_usage_does_not_estimate_tokens_from_request_or_partial_response() {
+        let plan = ExecutionPlan {
+            request_id: "req-stream-cancelled-estimated-usage-1".to_string(),
+            candidate_id: Some("cand-stream-cancelled-estimated-usage-1".to_string()),
+            provider_name: Some("OpenAI".to_string()),
+            provider_id: "provider-1".to_string(),
+            endpoint_id: "endpoint-1".to_string(),
+            key_id: "key-1".to_string(),
+            method: "POST".to_string(),
+            url: "https://example.com/v1/responses".to_string(),
+            headers: BTreeMap::new(),
+            content_type: Some("application/json".to_string()),
+            content_encoding: None,
+            body: RequestBody::from_json(json!({
+                "model": "gpt-5.4",
+                "input": "Write a short greeting for a usage test",
+                "stream": true
+            })),
+            stream: true,
+            client_api_format: "openai:responses".to_string(),
+            provider_api_format: "openai:responses".to_string(),
+            model_name: Some("gpt-5.4".to_string()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        };
+        let sse_body = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_cancel_123\",\"model\":\"gpt-5.4\"}}\n\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello there friend\"}\n\n"
+        );
+        let payload = GatewayStreamReportRequest {
+            trace_id: "trace-stream-cancelled-estimated-usage-1".to_string(),
+            report_kind: "openai_responses_stream_cancelled".to_string(),
+            report_context: Some(json!({
+                "client_api_format": "openai:responses",
+                "provider_api_format": "openai:responses",
+                "provider_request_body": {
+                    "model": "gpt-5.4",
+                    "input": "Write a short greeting for a usage test",
+                    "stream": true
+                }
+            })),
+            status_code: 499,
+            headers: BTreeMap::new(),
+            provider_body_base64: Some(base64::engine::general_purpose::STANDARD.encode(sse_body)),
+            provider_body_state: Some(UsageBodyCaptureState::Inline),
+            client_body_base64: None,
+            client_body_state: Some(UsageBodyCaptureState::None),
+            terminal_summary: None,
+            telemetry: None,
+        };
+
+        let event =
+            build_stream_terminal_usage_event(&plan, payload.report_context.as_ref(), &payload)
+                .expect("usage event should build");
+
+        assert_eq!(event.event_type, UsageEventType::Cancelled);
+        assert_eq!(event.data.input_tokens, None);
+        assert_eq!(event.data.output_tokens, None);
+        assert_eq!(event.data.total_tokens, None);
+        assert_eq!(event.data.cache_read_input_tokens, None);
+    }
+
+    #[test]
+    fn cancelled_stream_usage_does_not_infer_cache_or_token_estimates_from_prompt_cache_key() {
+        let request_body = json!({
+            "model": "gpt-5.4",
+            "input": "Use the cached project context and answer briefly",
+            "prompt_cache_key": "prompt-session-1",
+            "stream": true
+        });
+        let plan = ExecutionPlan {
+            request_id: "req-stream-cancelled-cache-estimated-usage-1".to_string(),
+            candidate_id: Some("cand-stream-cancelled-cache-estimated-usage-1".to_string()),
+            provider_name: Some("OpenAI".to_string()),
+            provider_id: "provider-1".to_string(),
+            endpoint_id: "endpoint-1".to_string(),
+            key_id: "key-1".to_string(),
+            method: "POST".to_string(),
+            url: "https://example.com/v1/responses".to_string(),
+            headers: BTreeMap::new(),
+            content_type: Some("application/json".to_string()),
+            content_encoding: None,
+            body: RequestBody::from_json(request_body.clone()),
+            stream: true,
+            client_api_format: "openai:responses".to_string(),
+            provider_api_format: "openai:responses".to_string(),
+            model_name: Some("gpt-5.4".to_string()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        };
+        let payload = GatewayStreamReportRequest {
+            trace_id: "trace-stream-cancelled-cache-estimated-usage-1".to_string(),
+            report_kind: "openai_responses_stream_cancelled".to_string(),
+            report_context: Some(json!({
+                "client_api_format": "openai:responses",
+                "provider_api_format": "openai:responses",
+                "provider_request_body": request_body
+            })),
+            status_code: 499,
+            headers: BTreeMap::new(),
+            provider_body_base64: Some(base64::engine::general_purpose::STANDARD.encode(
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"cached answer\"}\n\n",
+            )),
+            provider_body_state: Some(UsageBodyCaptureState::Inline),
+            client_body_base64: None,
+            client_body_state: Some(UsageBodyCaptureState::None),
+            terminal_summary: None,
+            telemetry: None,
+        };
+
+        let event =
+            build_stream_terminal_usage_event(&plan, payload.report_context.as_ref(), &payload)
+                .expect("usage event should build");
+
+        assert_eq!(event.event_type, UsageEventType::Cancelled);
+        assert_eq!(event.data.input_tokens, None);
+        assert_eq!(event.data.output_tokens, None);
+        assert_eq!(event.data.total_tokens, None);
+        assert_eq!(event.data.cache_read_input_tokens, None);
+    }
+
+    #[test]
+    fn cancelled_stream_usage_preserves_terminal_summary_usage() {
+        let plan = ExecutionPlan {
+            request_id: "req-stream-cancelled-summary-usage-1".to_string(),
+            candidate_id: Some("cand-stream-cancelled-summary-usage-1".to_string()),
+            provider_name: Some("OpenAI".to_string()),
+            provider_id: "provider-1".to_string(),
+            endpoint_id: "endpoint-1".to_string(),
+            key_id: "key-1".to_string(),
+            method: "POST".to_string(),
+            url: "https://example.com/v1/responses".to_string(),
+            headers: BTreeMap::new(),
+            content_type: Some("application/json".to_string()),
+            content_encoding: None,
+            body: RequestBody::from_json(json!({
+                "model": "gpt-5.4",
+                "input": "This cancelled request has terminal upstream usage",
+                "stream": true
+            })),
+            stream: true,
+            client_api_format: "openai:responses".to_string(),
+            provider_api_format: "openai:responses".to_string(),
+            model_name: Some("gpt-5.4".to_string()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        };
+        let mut standardized_usage = StandardizedUsage::new();
+        standardized_usage.input_tokens = 13;
+        standardized_usage.output_tokens = 21;
+        standardized_usage.cache_creation_tokens = 2;
+        standardized_usage.cache_read_tokens = 3;
+        let payload = GatewayStreamReportRequest {
+            trace_id: "trace-stream-cancelled-summary-usage-1".to_string(),
+            report_kind: "openai_responses_stream_cancelled".to_string(),
+            report_context: Some(json!({
+                "client_api_format": "openai:responses",
+                "provider_api_format": "openai:responses"
+            })),
+            status_code: 499,
+            headers: BTreeMap::new(),
+            provider_body_base64: None,
+            provider_body_state: Some(UsageBodyCaptureState::None),
+            client_body_base64: None,
+            client_body_state: Some(UsageBodyCaptureState::None),
+            terminal_summary: Some(ExecutionStreamTerminalSummary {
+                standardized_usage: Some(standardized_usage),
+                finish_reason: None,
+                response_id: Some("resp_cancel_summary_1".to_string()),
+                model: Some("gpt-5.4".to_string()),
+                observed_finish: true,
+                unknown_event_count: 0,
+                parser_error: None,
+            }),
+            telemetry: None,
+        };
+
+        let event =
+            build_stream_terminal_usage_event(&plan, payload.report_context.as_ref(), &payload)
+                .expect("usage event should build");
+
+        assert_eq!(event.event_type, UsageEventType::Cancelled);
+        assert_eq!(event.data.input_tokens, Some(13));
+        assert_eq!(event.data.output_tokens, Some(21));
+        assert_eq!(event.data.total_tokens, Some(34));
+        assert_eq!(event.data.cache_creation_input_tokens, Some(2));
+        assert_eq!(event.data.cache_read_input_tokens, Some(3));
+    }
+
+    #[test]
+    fn failed_stream_usage_does_not_estimate_partial_response_tokens() {
+        let plan = ExecutionPlan {
+            request_id: "req-stream-failed-estimated-usage-1".to_string(),
+            candidate_id: Some("cand-stream-failed-estimated-usage-1".to_string()),
+            provider_name: Some("OpenAI".to_string()),
+            provider_id: "provider-1".to_string(),
+            endpoint_id: "endpoint-1".to_string(),
+            key_id: "key-1".to_string(),
+            method: "POST".to_string(),
+            url: "https://example.com/v1/responses".to_string(),
+            headers: BTreeMap::new(),
+            content_type: Some("application/json".to_string()),
+            content_encoding: None,
+            body: RequestBody::from_json(json!({
+                "model": "gpt-5.4",
+                "input": "This failed request should not be billed",
+                "stream": true
+            })),
+            stream: true,
+            client_api_format: "openai:responses".to_string(),
+            provider_api_format: "openai:responses".to_string(),
+            model_name: Some("gpt-5.4".to_string()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        };
+        let payload = GatewayStreamReportRequest {
+            trace_id: "trace-stream-failed-estimated-usage-1".to_string(),
+            report_kind: "openai_responses_stream_failed".to_string(),
+            report_context: Some(json!({
+                "client_api_format": "openai:responses",
+                "provider_api_format": "openai:responses",
+                "provider_request_body": {
+                    "model": "gpt-5.4",
+                    "input": "This failed request should not be billed",
+                    "stream": true
+                }
+            })),
+            status_code: 500,
+            headers: BTreeMap::new(),
+            provider_body_base64: Some(base64::engine::general_purpose::STANDARD.encode(
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial text\"}\n\n",
+            )),
+            provider_body_state: Some(UsageBodyCaptureState::Inline),
+            client_body_base64: None,
+            client_body_state: Some(UsageBodyCaptureState::None),
+            terminal_summary: None,
+            telemetry: None,
+        };
+
+        let event =
+            build_stream_terminal_usage_event(&plan, payload.report_context.as_ref(), &payload)
+                .expect("usage event should build");
+
+        assert_eq!(event.event_type, UsageEventType::Failed);
+        assert_eq!(event.data.input_tokens, None);
+        assert_eq!(event.data.output_tokens, None);
+        assert_eq!(event.data.total_tokens, None);
     }
 
     #[test]
@@ -2941,11 +4116,610 @@ mod tests {
 
         assert_eq!(event.data.input_tokens, Some(13));
         assert_eq!(event.data.output_tokens, Some(21));
-        assert_eq!(event.data.total_tokens, Some(39));
+        assert_eq!(event.data.total_tokens, Some(34));
         assert_eq!(event.data.cache_creation_input_tokens, Some(2));
         assert_eq!(event.data.cache_read_input_tokens, Some(3));
         assert!(event.data.response_body.is_none());
         assert!(event.data.client_response_body.is_none());
+    }
+
+    #[test]
+    fn stream_terminal_usage_marks_missing_observed_finish_as_failed() {
+        let plan = ExecutionPlan {
+            request_id: "req-stream-missing-finish-1".to_string(),
+            candidate_id: Some("cand-stream-missing-finish-1".to_string()),
+            provider_name: Some("OpenAI".to_string()),
+            provider_id: "provider-1".to_string(),
+            endpoint_id: "endpoint-1".to_string(),
+            key_id: "key-1".to_string(),
+            method: "POST".to_string(),
+            url: "https://example.com/v1/responses".to_string(),
+            headers: BTreeMap::new(),
+            content_type: None,
+            content_encoding: None,
+            body: RequestBody {
+                json_body: None,
+                body_bytes_b64: None,
+                body_ref: None,
+            },
+            stream: true,
+            client_api_format: "openai:responses".to_string(),
+            provider_api_format: "openai:responses".to_string(),
+            model_name: Some("gpt-5.5".to_string()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        };
+        let payload = GatewayStreamReportRequest {
+            trace_id: "trace-stream-missing-finish-1".to_string(),
+            report_kind: "openai_responses_stream_success".to_string(),
+            report_context: Some(json!({
+                "client_api_format": "openai:responses",
+                "provider_api_format": "openai:responses"
+            })),
+            status_code: 200,
+            headers: BTreeMap::new(),
+            provider_body_base64: None,
+            provider_body_state: Some(UsageBodyCaptureState::None),
+            client_body_base64: None,
+            client_body_state: Some(UsageBodyCaptureState::None),
+            terminal_summary: Some(ExecutionStreamTerminalSummary {
+                response_id: Some("resp_missing_finish".to_string()),
+                model: Some("gpt-5.5".to_string()),
+                observed_finish: false,
+                ..ExecutionStreamTerminalSummary::default()
+            }),
+            telemetry: None,
+        };
+
+        let event =
+            build_stream_terminal_usage_event(&plan, payload.report_context.as_ref(), &payload)
+                .expect("usage event should build");
+
+        assert_eq!(event.event_type, UsageEventType::Failed);
+        assert_eq!(event.data.status_code, Some(200));
+        assert_eq!(
+            event.data.error_category.as_deref(),
+            Some("stream_missing_terminal_event")
+        );
+        assert_eq!(
+            event.data.error_message.as_deref(),
+            Some("execution runtime stream ended before provider terminal event")
+        );
+        assert_eq!(event.data.input_tokens, None);
+        assert_eq!(event.data.output_tokens, None);
+    }
+
+    #[test]
+    fn stream_terminal_usage_marks_empty_openai_responses_capture_as_missing_terminal() {
+        let plan = ExecutionPlan {
+            request_id: "req-stream-empty-capture-1".to_string(),
+            candidate_id: Some("cand-stream-empty-capture-1".to_string()),
+            provider_name: Some("OpenAI".to_string()),
+            provider_id: "provider-1".to_string(),
+            endpoint_id: "endpoint-1".to_string(),
+            key_id: "key-1".to_string(),
+            method: "POST".to_string(),
+            url: "https://example.com/v1/responses".to_string(),
+            headers: BTreeMap::new(),
+            content_type: None,
+            content_encoding: None,
+            body: RequestBody {
+                json_body: None,
+                body_bytes_b64: None,
+                body_ref: None,
+            },
+            stream: true,
+            client_api_format: "openai:responses".to_string(),
+            provider_api_format: "openai:responses".to_string(),
+            model_name: Some("gpt-5.5".to_string()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        };
+        let payload = GatewayStreamReportRequest {
+            trace_id: "trace-stream-empty-capture-1".to_string(),
+            report_kind: "openai_responses_stream_success".to_string(),
+            report_context: Some(json!({
+                "client_api_format": "openai:responses",
+                "provider_api_format": "openai:responses"
+            })),
+            status_code: 200,
+            headers: BTreeMap::new(),
+            provider_body_base64: None,
+            provider_body_state: Some(UsageBodyCaptureState::None),
+            client_body_base64: None,
+            client_body_state: Some(UsageBodyCaptureState::None),
+            terminal_summary: None,
+            telemetry: None,
+        };
+
+        let event =
+            build_stream_terminal_usage_event(&plan, payload.report_context.as_ref(), &payload)
+                .expect("usage event should build");
+
+        assert_eq!(event.event_type, UsageEventType::Failed);
+        assert_eq!(event.data.status_code, Some(200));
+        assert_eq!(
+            event.data.error_category.as_deref(),
+            Some("stream_missing_terminal_event")
+        );
+        assert_eq!(
+            event.data.error_message.as_deref(),
+            Some("execution runtime stream ended before provider terminal event")
+        );
+        assert_eq!(
+            event
+                .data
+                .client_response_body
+                .as_ref()
+                .and_then(|body| body.get("error"))
+                .and_then(|error| error.get("type"))
+                .and_then(Value::as_str),
+            Some("stream_missing_terminal_event")
+        );
+        assert_eq!(
+            event.data.client_response_body_state,
+            Some(UsageBodyCaptureState::Inline)
+        );
+    }
+
+    #[test]
+    fn stream_terminal_usage_marks_missing_captured_openai_responses_terminal_as_failed() {
+        let plan = ExecutionPlan {
+            request_id: "req-stream-missing-captured-finish-1".to_string(),
+            candidate_id: Some("cand-stream-missing-captured-finish-1".to_string()),
+            provider_name: Some("OpenAI".to_string()),
+            provider_id: "provider-1".to_string(),
+            endpoint_id: "endpoint-1".to_string(),
+            key_id: "key-1".to_string(),
+            method: "POST".to_string(),
+            url: "https://example.com/v1/responses".to_string(),
+            headers: BTreeMap::new(),
+            content_type: None,
+            content_encoding: None,
+            body: RequestBody {
+                json_body: None,
+                body_bytes_b64: None,
+                body_ref: None,
+            },
+            stream: true,
+            client_api_format: "openai:responses".to_string(),
+            provider_api_format: "openai:responses".to_string(),
+            model_name: Some("gpt-5.5".to_string()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        };
+        let provider_sse = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\"}\n\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n"
+        );
+        let payload = GatewayStreamReportRequest {
+            trace_id: "trace-stream-missing-captured-finish-1".to_string(),
+            report_kind: "openai_responses_stream_success".to_string(),
+            report_context: Some(json!({
+                "client_api_format": "openai:responses",
+                "provider_api_format": "openai:responses"
+            })),
+            status_code: 200,
+            headers: BTreeMap::from([(
+                "content-type".to_string(),
+                "text/event-stream".to_string(),
+            )]),
+            provider_body_base64: Some(
+                base64::engine::general_purpose::STANDARD.encode(provider_sse.as_bytes()),
+            ),
+            provider_body_state: Some(UsageBodyCaptureState::Inline),
+            client_body_base64: None,
+            client_body_state: Some(UsageBodyCaptureState::None),
+            terminal_summary: None,
+            telemetry: None,
+        };
+
+        let event =
+            build_stream_terminal_usage_event(&plan, payload.report_context.as_ref(), &payload)
+                .expect("usage event should build");
+
+        assert_eq!(event.event_type, UsageEventType::Failed);
+        assert_eq!(event.data.status_code, Some(200));
+        assert_eq!(
+            event.data.error_category.as_deref(),
+            Some("stream_missing_terminal_event")
+        );
+        assert_eq!(
+            event.data.error_message.as_deref(),
+            Some("execution runtime stream ended before provider terminal event")
+        );
+    }
+
+    #[test]
+    fn stream_terminal_usage_ignores_missing_terminal_from_truncated_capture() {
+        let plan = ExecutionPlan {
+            request_id: "req-stream-truncated-captured-finish-1".to_string(),
+            candidate_id: Some("cand-stream-truncated-captured-finish-1".to_string()),
+            provider_name: Some("OpenAI".to_string()),
+            provider_id: "provider-1".to_string(),
+            endpoint_id: "endpoint-1".to_string(),
+            key_id: "key-1".to_string(),
+            method: "POST".to_string(),
+            url: "https://example.com/v1/responses".to_string(),
+            headers: BTreeMap::new(),
+            content_type: None,
+            content_encoding: None,
+            body: RequestBody {
+                json_body: None,
+                body_bytes_b64: None,
+                body_ref: None,
+            },
+            stream: true,
+            client_api_format: "openai:responses".to_string(),
+            provider_api_format: "openai:responses".to_string(),
+            model_name: Some("gpt-5.5".to_string()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        };
+        let provider_sse = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\"}\n\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n"
+        );
+        let payload = GatewayStreamReportRequest {
+            trace_id: "trace-stream-truncated-captured-finish-1".to_string(),
+            report_kind: "openai_responses_stream_success".to_string(),
+            report_context: Some(json!({
+                "client_api_format": "openai:responses",
+                "provider_api_format": "openai:responses"
+            })),
+            status_code: 200,
+            headers: BTreeMap::from([(
+                "content-type".to_string(),
+                "text/event-stream".to_string(),
+            )]),
+            provider_body_base64: Some(
+                base64::engine::general_purpose::STANDARD.encode(provider_sse.as_bytes()),
+            ),
+            provider_body_state: Some(UsageBodyCaptureState::Truncated),
+            client_body_base64: None,
+            client_body_state: Some(UsageBodyCaptureState::None),
+            terminal_summary: None,
+            telemetry: None,
+        };
+
+        let event =
+            build_stream_terminal_usage_event(&plan, payload.report_context.as_ref(), &payload)
+                .expect("usage event should build");
+
+        assert_eq!(event.event_type, UsageEventType::Completed);
+        assert_eq!(event.data.status_code, Some(200));
+        assert_eq!(event.data.error_category, None);
+        assert_eq!(event.data.error_message, None);
+    }
+
+    #[test]
+    fn stream_terminal_usage_marks_http_200_response_failed_as_stream_terminal_error() {
+        let plan = ExecutionPlan {
+            request_id: "req-stream-response-failed-1".to_string(),
+            candidate_id: Some("cand-stream-response-failed-1".to_string()),
+            provider_name: Some("OpenAI".to_string()),
+            provider_id: "provider-1".to_string(),
+            endpoint_id: "endpoint-1".to_string(),
+            key_id: "key-1".to_string(),
+            method: "POST".to_string(),
+            url: "https://example.com/v1/responses".to_string(),
+            headers: BTreeMap::new(),
+            content_type: None,
+            content_encoding: None,
+            body: RequestBody {
+                json_body: None,
+                body_bytes_b64: None,
+                body_ref: None,
+            },
+            stream: true,
+            client_api_format: "openai:responses".to_string(),
+            provider_api_format: "openai:responses".to_string(),
+            model_name: Some("gpt-5.5".to_string()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        };
+        let message = "This content was flagged for possible cybersecurity risk";
+        let provider_sse = format!(
+            concat!(
+                "event: response.failed\n",
+                "data: {{\"type\":\"response.failed\",\"response\":{{\"status\":\"failed\",\"error\":{{\"message\":\"{}\",\"code\":\"cyber_policy\"}}}}}}\n\n"
+            ),
+            message
+        );
+        let payload = GatewayStreamReportRequest {
+            trace_id: "trace-stream-response-failed-1".to_string(),
+            report_kind: "openai_responses_stream_success".to_string(),
+            report_context: Some(json!({
+                "client_api_format": "openai:responses",
+                "provider_api_format": "openai:responses"
+            })),
+            status_code: 200,
+            headers: BTreeMap::from([(
+                "content-type".to_string(),
+                "text/event-stream".to_string(),
+            )]),
+            provider_body_base64: Some(
+                base64::engine::general_purpose::STANDARD.encode(provider_sse),
+            ),
+            provider_body_state: Some(UsageBodyCaptureState::Inline),
+            client_body_base64: None,
+            client_body_state: Some(UsageBodyCaptureState::None),
+            terminal_summary: Some(ExecutionStreamTerminalSummary {
+                response_id: Some("resp_failed".to_string()),
+                model: Some("gpt-5.5".to_string()),
+                observed_finish: true,
+                parser_error: Some(message.to_string()),
+                ..ExecutionStreamTerminalSummary::default()
+            }),
+            telemetry: None,
+        };
+
+        let event =
+            build_stream_terminal_usage_event(&plan, payload.report_context.as_ref(), &payload)
+                .expect("usage event should build");
+
+        assert_eq!(event.event_type, UsageEventType::Failed);
+        assert_eq!(event.data.status_code, Some(200));
+        assert_eq!(event.data.error_message.as_deref(), Some(message));
+        assert_eq!(
+            event.data.error_category.as_deref(),
+            Some("stream_terminal_error")
+        );
+        assert_eq!(
+            event
+                .data
+                .client_response_body
+                .as_ref()
+                .and_then(|body| body.get("error"))
+                .and_then(|error| error.get("code"))
+                .and_then(Value::as_str),
+            Some("cyber_policy")
+        );
+        assert_eq!(
+            event
+                .data
+                .client_response_body
+                .as_ref()
+                .and_then(|body| body.get("error"))
+                .and_then(|error| error.get("type"))
+                .and_then(Value::as_str),
+            Some("stream_terminal_error")
+        );
+    }
+
+    #[test]
+    fn completed_image_usage_estimates_request_tokens_when_provider_usage_is_missing() {
+        let plan = ExecutionPlan {
+            request_id: "req-image-completed-estimate-1".to_string(),
+            candidate_id: Some("cand-image-completed-estimate-1".to_string()),
+            provider_name: Some("OpenAI".to_string()),
+            provider_id: "provider-1".to_string(),
+            endpoint_id: "endpoint-1".to_string(),
+            key_id: "key-1".to_string(),
+            method: "POST".to_string(),
+            url: "https://example.com/v1/images/generations".to_string(),
+            headers: BTreeMap::new(),
+            content_type: Some("application/json".to_string()),
+            content_encoding: None,
+            body: RequestBody::from_json(json!({
+                "model": "gpt-image-2",
+                "prompt": "draw a small red cube on a clean desk",
+                "size": "1024x1024",
+                "quality": "medium"
+            })),
+            stream: true,
+            client_api_format: "openai:chat".to_string(),
+            provider_api_format: "openai:image".to_string(),
+            model_name: Some("gpt-image-2".to_string()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        };
+        let mut standardized_usage = StandardizedUsage::new();
+        standardized_usage.request_count = 1;
+        standardized_usage
+            .dimensions
+            .insert("image_count".to_string(), json!(1));
+        standardized_usage
+            .dimensions
+            .insert("image_size".to_string(), json!("1024x1024"));
+        standardized_usage
+            .dimensions
+            .insert("image_quality".to_string(), json!("medium"));
+        let payload = GatewayStreamReportRequest {
+            trace_id: "trace-image-completed-estimate-1".to_string(),
+            report_kind: "openai_chat_stream_success".to_string(),
+            report_context: Some(json!({
+                "client_api_format": "openai:chat",
+                "provider_api_format": "openai:image",
+                "image_request": {
+                    "size": "1024x1024",
+                    "quality": "medium"
+                }
+            })),
+            status_code: 200,
+            headers: BTreeMap::new(),
+            provider_body_base64: None,
+            provider_body_state: Some(UsageBodyCaptureState::None),
+            client_body_base64: None,
+            client_body_state: Some(UsageBodyCaptureState::None),
+            terminal_summary: Some(ExecutionStreamTerminalSummary {
+                standardized_usage: Some(standardized_usage),
+                finish_reason: Some("stop".to_string()),
+                response_id: Some("resp_image_estimate_1".to_string()),
+                model: Some("gpt-image-2".to_string()),
+                observed_finish: true,
+                unknown_event_count: 0,
+                parser_error: None,
+            }),
+            telemetry: None,
+        };
+
+        let event =
+            build_stream_terminal_usage_event(&plan, payload.report_context.as_ref(), &payload)
+                .expect("usage event should build");
+
+        assert_eq!(event.event_type, UsageEventType::Completed);
+        assert!(event.data.input_tokens.unwrap_or_default() > 0);
+        assert_eq!(event.data.output_tokens.unwrap_or_default(), 0);
+        assert_eq!(event.data.total_tokens, event.data.input_tokens);
+        assert_eq!(
+            event
+                .data
+                .request_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("dimensions"))
+                .and_then(|dimensions| dimensions.get("image_count"))
+                .and_then(Value::as_i64),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn sync_completed_openai_image_usage_infers_image_dimensions_from_response() {
+        let request_body = json!({
+            "model": "gpt-image-2",
+            "prompt": "draw a small red cube on a clean desk",
+            "size": "1024x1024",
+            "quality": "medium",
+            "output_format": "png"
+        });
+        let plan = ExecutionPlan {
+            request_id: "req-image-sync-completed-dimensions-1".to_string(),
+            candidate_id: Some("cand-image-sync-completed-dimensions-1".to_string()),
+            provider_name: Some("OpenAI".to_string()),
+            provider_id: "provider-1".to_string(),
+            endpoint_id: "endpoint-1".to_string(),
+            key_id: "key-1".to_string(),
+            method: "POST".to_string(),
+            url: "https://example.com/v1/images/generations".to_string(),
+            headers: BTreeMap::new(),
+            content_type: Some("application/json".to_string()),
+            content_encoding: None,
+            body: RequestBody::from_json(request_body.clone()),
+            stream: false,
+            client_api_format: "openai:image".to_string(),
+            provider_api_format: "openai:image".to_string(),
+            model_name: Some("gpt-image-2".to_string()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        };
+        let payload = GatewaySyncReportRequest {
+            trace_id: "trace-image-sync-completed-dimensions-1".to_string(),
+            report_kind: "openai_image_sync_success".to_string(),
+            report_context: Some(json!({
+                "client_api_format": "openai:image",
+                "provider_api_format": "openai:image",
+                "provider_request_body": request_body
+            })),
+            status_code: 200,
+            headers: BTreeMap::new(),
+            body_json: Some(json!({
+                "created": 1_700_000_000,
+                "data": [{ "b64_json": "abc" }]
+            })),
+            client_body_json: None,
+            body_base64: None,
+            telemetry: None,
+        };
+
+        let event =
+            build_sync_terminal_usage_event(&plan, payload.report_context.as_ref(), &payload)
+                .expect("usage event should build");
+
+        let dimensions = event
+            .data
+            .request_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("dimensions"))
+            .expect("dimensions should exist");
+        assert_eq!(event.event_type, UsageEventType::Completed);
+        assert!(event.data.input_tokens.unwrap_or_default() > 0);
+        assert_eq!(dimensions.get("image_count"), Some(&json!(1)));
+        assert_eq!(dimensions.get("image_size"), Some(&json!("1024x1024")));
+        assert_eq!(dimensions.get("image_quality"), Some(&json!("medium")));
+        assert_eq!(dimensions.get("image_output_format"), Some(&json!("png")));
+    }
+
+    #[test]
+    fn sync_completed_openai_image_usage_preserves_native_usage_with_image_count() {
+        let request_body = json!({
+            "model": "gpt-image-2",
+            "prompt": "draw a small red cube on a clean desk",
+            "size": "1024x1024",
+            "quality": "medium"
+        });
+        let plan = ExecutionPlan {
+            request_id: "req-image-sync-native-usage-1".to_string(),
+            candidate_id: Some("cand-image-sync-native-usage-1".to_string()),
+            provider_name: Some("OpenAI".to_string()),
+            provider_id: "provider-1".to_string(),
+            endpoint_id: "endpoint-1".to_string(),
+            key_id: "key-1".to_string(),
+            method: "POST".to_string(),
+            url: "https://example.com/v1/images/generations".to_string(),
+            headers: BTreeMap::new(),
+            content_type: Some("application/json".to_string()),
+            content_encoding: None,
+            body: RequestBody::from_json(request_body.clone()),
+            stream: false,
+            client_api_format: "openai:image".to_string(),
+            provider_api_format: "openai:image".to_string(),
+            model_name: Some("gpt-image-2".to_string()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        };
+        let payload = GatewaySyncReportRequest {
+            trace_id: "trace-image-sync-native-usage-1".to_string(),
+            report_kind: "openai_image_sync_success".to_string(),
+            report_context: Some(json!({
+                "client_api_format": "openai:image",
+                "provider_api_format": "openai:image",
+                "provider_request_body": request_body
+            })),
+            status_code: 200,
+            headers: BTreeMap::new(),
+            body_json: Some(json!({
+                "usage": {
+                    "input_tokens": 11,
+                    "output_tokens": 22,
+                    "total_tokens": 33
+                },
+                "data": [{ "b64_json": "abc" }]
+            })),
+            client_body_json: None,
+            body_base64: None,
+            telemetry: None,
+        };
+
+        let event =
+            build_sync_terminal_usage_event(&plan, payload.report_context.as_ref(), &payload)
+                .expect("usage event should build");
+
+        assert_eq!(event.event_type, UsageEventType::Completed);
+        assert_eq!(event.data.input_tokens, Some(11));
+        assert_eq!(event.data.output_tokens, Some(22));
+        assert_eq!(event.data.total_tokens, Some(33));
+        assert_eq!(
+            event
+                .data
+                .request_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("dimensions"))
+                .and_then(|dimensions| dimensions.get("image_count")),
+            Some(&json!(1))
+        );
     }
 
     #[test]
@@ -3113,7 +4887,7 @@ mod tests {
 
         assert_eq!(event.data.input_tokens, Some(3));
         assert_eq!(event.data.output_tokens, Some(5));
-        assert_eq!(event.data.total_tokens, Some(11));
+        assert_eq!(event.data.total_tokens, Some(8));
         assert_eq!(event.data.cache_creation_input_tokens, Some(1));
         assert_eq!(event.data.cache_read_input_tokens, Some(2));
         assert_eq!(
@@ -3394,6 +5168,87 @@ mod tests {
     }
 
     #[test]
+    fn sync_terminal_usage_prefers_error_body_over_partial_upstream_stream_body() {
+        let partial_sse_body = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_partial_123\",\"object\":\"response\",\"model\":\"gpt-5.5\",\"status\":\"in_progress\",\"output\":[]}}\n\n",
+            "event: response.output_item.added\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"name\":\"exec_command\"}}\n\n",
+            "event: response.function_call_arguments.delta\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"{\\\"cmd\\\":\"}\n\n",
+        );
+        let plan = ExecutionPlan {
+            request_id: "req-sync-upstream-stream-error-1".to_string(),
+            candidate_id: Some("cand-sync-upstream-stream-error-1".to_string()),
+            provider_name: Some("OpenAI".to_string()),
+            provider_id: "provider-1".to_string(),
+            endpoint_id: "endpoint-1".to_string(),
+            key_id: "key-1".to_string(),
+            method: "POST".to_string(),
+            url: "https://example.com/v1/responses".to_string(),
+            headers: BTreeMap::new(),
+            content_type: None,
+            content_encoding: None,
+            body: RequestBody {
+                json_body: None,
+                body_bytes_b64: None,
+                body_ref: None,
+            },
+            stream: false,
+            client_api_format: "claude:messages".to_string(),
+            provider_api_format: "openai:responses".to_string(),
+            model_name: Some("gpt-5.5".to_string()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        };
+        let payload = GatewaySyncReportRequest {
+            trace_id: "trace-sync-upstream-stream-error-1".to_string(),
+            report_kind: "openai_responses_sync_error".to_string(),
+            report_context: Some(json!({
+                "client_api_format": "claude:messages",
+                "provider_api_format": "openai:responses",
+                "upstream_is_stream": true,
+                "needs_conversion": true
+            })),
+            status_code: 200,
+            headers: BTreeMap::from([(
+                "content-type".to_string(),
+                "text/event-stream".to_string(),
+            )]),
+            body_json: Some(json!({
+                "error": {
+                    "type": "internal",
+                    "message": "error decoding response body: stream error received"
+                }
+            })),
+            client_body_json: None,
+            body_base64: Some(base64::engine::general_purpose::STANDARD.encode(partial_sse_body)),
+            telemetry: None,
+        };
+
+        let event =
+            build_sync_terminal_usage_event(&plan, payload.report_context.as_ref(), &payload)
+                .expect("usage event should build");
+
+        assert_eq!(event.event_type, UsageEventType::Failed);
+        assert_eq!(event.data.status_code, Some(200));
+        assert_eq!(
+            event.data.error_message.as_deref(),
+            Some("error decoding response body: stream error received")
+        );
+        assert_eq!(
+            event
+                .data
+                .response_body
+                .as_ref()
+                .and_then(|value| value.pointer("/error/type"))
+                .and_then(Value::as_str),
+            Some("internal")
+        );
+    }
+
+    #[test]
     fn sync_terminal_seed_path_matches_legacy_wrapper_event() {
         let plan = ExecutionPlan {
             request_id: "req-sync-seed-match-1".to_string(),
@@ -3664,7 +5519,7 @@ mod tests {
 
         assert_eq!(event.data.input_tokens, Some(3));
         assert_eq!(event.data.output_tokens, Some(5));
-        assert_eq!(event.data.total_tokens, Some(11));
+        assert_eq!(event.data.total_tokens, Some(8));
         assert_eq!(event.data.cache_creation_input_tokens, Some(1));
         assert_eq!(event.data.cache_read_input_tokens, Some(2));
         assert_eq!(
@@ -3736,6 +5591,64 @@ mod tests {
                 "input": [{"role": "user", "content": "provider-side compiled body"}],
             }))
         );
+    }
+
+    #[test]
+    fn sync_terminal_usage_applies_kiro_simulated_cache_context() {
+        let plan = ExecutionPlan {
+            request_id: "req-sync-kiro-cache-context-1".to_string(),
+            candidate_id: Some("cand-sync-kiro-cache-context-1".to_string()),
+            provider_name: Some("Kiro".to_string()),
+            provider_id: "provider-kiro-1".to_string(),
+            endpoint_id: "endpoint-kiro-1".to_string(),
+            key_id: "key-kiro-1".to_string(),
+            method: "POST".to_string(),
+            url: "https://kiro.example/generateAssistantResponse".to_string(),
+            headers: BTreeMap::new(),
+            content_type: Some("application/json".to_string()),
+            content_encoding: None,
+            body: RequestBody::from_json(json!({
+                "model": "claude-sonnet-4",
+                "messages": [{"role": "user", "content": "hello kiro"}],
+            })),
+            stream: false,
+            client_api_format: "claude:messages".to_string(),
+            provider_api_format: "claude:messages".to_string(),
+            model_name: Some("claude-sonnet-4".to_string()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        };
+        let payload = GatewaySyncReportRequest {
+            trace_id: "trace-sync-kiro-cache-context-1".to_string(),
+            report_kind: "claude_cli_sync_success".to_string(),
+            report_context: Some(json!({
+                "client_api_format": "claude:messages",
+                "provider_api_format": "claude:messages",
+                "provider_name": "Kiro",
+                "model": "claude-sonnet-4",
+                "input_tokens": 1800,
+                "kiro_simulated_cache_enabled": true,
+                "cache_creation_input_tokens": 1200,
+                "cache_read_input_tokens": 300,
+            })),
+            status_code: 200,
+            headers: BTreeMap::new(),
+            body_json: Some(json!({"id": "kiro-sync-response-1"})),
+            client_body_json: None,
+            body_base64: None,
+            telemetry: None,
+        };
+
+        let event =
+            build_sync_terminal_usage_event(&plan, payload.report_context.as_ref(), &payload)
+                .expect("usage event should build");
+
+        assert_eq!(event.event_type, UsageEventType::Completed);
+        assert_eq!(event.data.input_tokens, Some(300));
+        assert_eq!(event.data.cache_creation_input_tokens, Some(1200));
+        assert_eq!(event.data.cache_read_input_tokens, Some(300));
+        assert_eq!(event.data.total_tokens, Some(300));
     }
 
     #[test]
@@ -3831,6 +5744,8 @@ mod tests {
                 ..UsageRoutingSeed::default()
             },
             status_code: 200,
+            terminal_error_message: None,
+            terminal_failure_category: None,
             response_time_ms: Some(123),
             first_byte_time_ms: Some(45),
             request_headers: Some(json!({
@@ -4161,6 +6076,27 @@ mod tests {
     }
 
     #[test]
+    fn decode_body_for_storage_extracts_connect_json_error_frames() {
+        let payload = br#"{"error":{"code":"resource_exhausted","message":"quota exhausted"}}"#;
+        let mut framed = Vec::new();
+        framed.push(2);
+        framed.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        framed.extend_from_slice(payload);
+        let body_base64 = base64::engine::general_purpose::STANDARD.encode(framed);
+
+        assert_eq!(
+            decode_body_for_storage(Some(body_base64.as_str())),
+            Some(json!({
+                "error": {
+                    "code": "resource_exhausted",
+                    "message": "quota exhausted",
+                    "type": "resource_exhausted"
+                }
+            }))
+        );
+    }
+
+    #[test]
     fn parse_sse_body_for_storage_handles_crlf_and_cr_line_endings() {
         let sse_body = concat!(
             "data: {\"id\":\"chunk-1\"}\r\n",
@@ -4202,7 +6138,7 @@ mod tests {
 
         assert_eq!(
             extract_token_counts_from_value(&Value::String(sse_body.to_string())),
-            Some((3, 5, 11)),
+            Some((3, 5, 8)),
         );
     }
 }

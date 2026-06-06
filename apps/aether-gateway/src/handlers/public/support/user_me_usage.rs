@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use aether_ai_serving::UPSTREAM_IS_STREAM_KEY;
 use aether_billing::{
     normalize_input_tokens_for_billing, normalize_total_input_context_for_cache_hit_rate,
 };
@@ -314,11 +315,128 @@ fn users_me_usage_upstream_is_stream(item: &StoredRequestUsageAudit) -> bool {
     item.request_metadata
         .as_ref()
         .and_then(serde_json::Value::as_object)
-        .and_then(|metadata| metadata.get("upstream_is_stream"))
+        .and_then(|metadata| metadata.get(UPSTREAM_IS_STREAM_KEY))
         .and_then(serde_json::Value::as_bool)
         .or_else(|| users_me_usage_headers_stream_flag(item.response_headers.as_ref()))
         .or_else(|| users_me_usage_infer_upstream_stream_from_captured_bodies(item))
         .unwrap_or(item.is_stream)
+}
+
+fn users_me_usage_metadata_string<'a>(
+    item: &'a StoredRequestUsageAudit,
+    key: &str,
+) -> Option<&'a str> {
+    item.request_metadata
+        .as_ref()
+        .and_then(serde_json::Value::as_object)
+        .and_then(|metadata| metadata.get(key))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn infer_client_family_from_user_agent(user_agent: &str) -> Option<&'static str> {
+    let normalized = user_agent.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return None;
+    }
+    if normalized.starts_with("codex_vscode") {
+        return Some("codex_vscode");
+    }
+    if normalized.starts_with("codex") {
+        return Some("codex");
+    }
+    if normalized.contains("claude-code") || normalized.contains("claude_code") {
+        return Some("claude_code");
+    }
+    if normalized.contains("opencode") {
+        return Some("opencode");
+    }
+    if normalized.contains("geminicli") || normalized.contains("gemini-cli") {
+        return Some("gemini_cli");
+    }
+    if normalized.contains("qwencode") {
+        return Some("qwen_code");
+    }
+    if normalized.contains("roo-code") || normalized.contains("roocode") {
+        return Some("roo_code");
+    }
+    if normalized.contains("kilo-code") || normalized.contains("kilocode") {
+        return Some("kilocode");
+    }
+    if normalized.contains("cherrystudio") || normalized.contains("cherry-studio") {
+        return Some("cherrystudio");
+    }
+    if normalized.contains("openui-agent-manager") || normalized.contains("openui") {
+        return Some("openui");
+    }
+    if normalized.contains("cursor") {
+        return Some("cursor");
+    }
+    if normalized.contains("windsurf") {
+        return Some("windsurf");
+    }
+    if normalized.contains("continue") {
+        return Some("continue");
+    }
+    if normalized.contains("cline") {
+        return Some("cline");
+    }
+    if normalized.contains("aider") {
+        return Some("aider");
+    }
+    if normalized.contains("langchain") {
+        return Some("langchain");
+    }
+    if normalized.contains("llamaindex") || normalized.contains("llama-index") {
+        return Some("llamaindex");
+    }
+    if normalized.starts_with("openai/js") {
+        return Some("openai_js_sdk");
+    }
+    if normalized.starts_with("openai/python") {
+        return Some("openai_python_sdk");
+    }
+    if normalized.starts_with("anthropic/js") || normalized.contains("anthropic-sdk-typescript") {
+        return Some("anthropic_js_sdk");
+    }
+    if normalized.starts_with("anthropic/python") || normalized.contains("anthropic-sdk-python") {
+        return Some("anthropic_python_sdk");
+    }
+    if normalized.contains("/js ") || normalized.contains("/python ") {
+        return Some("sdk");
+    }
+    Some("unknown")
+}
+
+fn users_me_usage_client_family(item: &StoredRequestUsageAudit) -> Option<&str> {
+    item.client_family
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            item.request_metadata
+                .as_ref()
+                .and_then(serde_json::Value::as_object)
+                .and_then(|metadata| {
+                    metadata
+                        .get("client_session_affinity")
+                        .and_then(serde_json::Value::as_object)
+                        .and_then(|affinity| affinity.get("client_family"))
+                        .and_then(serde_json::Value::as_str)
+                        .or_else(|| {
+                            metadata
+                                .get("client_family")
+                                .and_then(serde_json::Value::as_str)
+                        })
+                })
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
+        .or_else(|| {
+            users_me_usage_metadata_string(item, "user_agent")
+                .and_then(infer_client_family_from_user_agent)
+        })
 }
 
 fn build_users_me_usage_record_payload(
@@ -353,6 +471,11 @@ fn build_users_me_usage_record_payload(
         "upstream_is_stream": upstream_is_stream,
         "client_requested_stream": client_is_stream,
         "client_is_stream": client_is_stream,
+        "client_family": users_me_usage_client_family(item),
+        "client_ip": users_me_usage_metadata_string(item, "client_ip"),
+        "user_agent": users_me_usage_metadata_string(item, "user_agent"),
+        "request_path": users_me_usage_metadata_string(item, "request_path"),
+        "request_path_and_query": users_me_usage_metadata_string(item, "request_path_and_query"),
         "status": item.status,
         "has_fallback": item.has_fallback(),
         "created_at": unix_secs_to_rfc3339(item.created_at_unix_ms),
@@ -375,6 +498,12 @@ fn build_users_me_usage_record_payload(
 
     if item.target_model.is_some() {
         payload["target_model"] = json!(item.target_model.clone());
+    }
+    if let Some(reasoning_effort) = item.provider_reasoning_effort() {
+        payload["reasoning_effort"] = json!(reasoning_effort);
+    }
+    if let Some(service_tier) = item.provider_service_tier() {
+        payload["service_tier"] = json!(service_tier);
     }
     if include_actual_cost {
         payload["actual_cost"] = json!(round_to(item.actual_total_cost_usd, 6));
@@ -411,6 +540,9 @@ fn build_users_me_usage_active_payload(item: &StoredRequestUsageAudit) -> serde_
         "client_requested_stream": client_is_stream,
         "client_is_stream": client_is_stream,
         "has_format_conversion": item.has_format_conversion,
+        "client_family": users_me_usage_client_family(item),
+        "client_ip": users_me_usage_metadata_string(item, "client_ip"),
+        "user_agent": users_me_usage_metadata_string(item, "user_agent"),
         "target_model": item.target_model,
         "has_fallback": item.has_fallback(),
     });
@@ -431,6 +563,12 @@ fn build_users_me_usage_active_payload(item: &StoredRequestUsageAudit) -> serde_
             .as_object_mut()
             .expect("object")
             .remove("target_model");
+    }
+    if let Some(reasoning_effort) = item.provider_reasoning_effort() {
+        payload["reasoning_effort"] = json!(reasoning_effort);
+    }
+    if let Some(service_tier) = item.provider_service_tier() {
+        payload["service_tier"] = json!(service_tier);
     }
     payload
 }
@@ -709,6 +847,7 @@ pub(super) async fn handle_users_me_usage_get(
                 created_from_unix_secs,
                 created_until_unix_secs,
                 user_id: Some(auth.user.id.clone()),
+                provider_name: None,
                 group_by: UsageBreakdownGroupBy::Model,
             })
             .await
@@ -722,29 +861,33 @@ pub(super) async fn handle_users_me_usage_get(
                 );
             }
         };
-        summary_by_provider = match state
-            .summarize_usage_breakdown(&UsageBreakdownSummaryQuery {
-                created_from_unix_secs,
-                created_until_unix_secs,
-                user_id: Some(auth.user.id.clone()),
-                group_by: UsageBreakdownGroupBy::Provider,
-            })
-            .await
-        {
-            Ok(value) => value,
-            Err(err) => {
-                return build_auth_error_response(
-                    http::StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("user usage provider breakdown lookup failed: {err:?}"),
-                    false,
-                );
-            }
-        };
+        if include_actual_cost {
+            summary_by_provider = match state
+                .summarize_usage_breakdown(&UsageBreakdownSummaryQuery {
+                    created_from_unix_secs,
+                    created_until_unix_secs,
+                    user_id: Some(auth.user.id.clone()),
+                    provider_name: None,
+                    group_by: UsageBreakdownGroupBy::Provider,
+                })
+                .await
+            {
+                Ok(value) => value,
+                Err(err) => {
+                    return build_auth_error_response(
+                        http::StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("user usage provider breakdown lookup failed: {err:?}"),
+                        false,
+                    );
+                }
+            };
+        }
         summary_by_api_format = match state
             .summarize_usage_breakdown(&UsageBreakdownSummaryQuery {
                 created_from_unix_secs,
                 created_until_unix_secs,
                 user_id: Some(auth.user.id.clone()),
+                provider_name: None,
                 group_by: UsageBreakdownGroupBy::ApiFormat,
             })
             .await
@@ -936,7 +1079,6 @@ pub(super) async fn handle_users_me_usage_get(
         "avg_response_time": avg_response_time,
         "billing": build_auth_wallet_summary_payload(wallet.as_ref()),
         "summary_by_model": build_users_me_usage_summary_by_model(&summary_by_model, include_actual_cost),
-        "summary_by_provider": build_users_me_usage_summary_by_provider(&summary_by_provider),
         "summary_by_api_format": build_users_me_usage_summary_by_api_format(&summary_by_api_format),
         "pagination": {
             "total": total_record_count,
@@ -948,6 +1090,9 @@ pub(super) async fn handle_users_me_usage_get(
     });
     if include_actual_cost {
         payload["total_actual_cost"] = json!(total_actual_cost);
+        payload["summary_by_provider"] = json!(build_users_me_usage_summary_by_provider(
+            &summary_by_provider
+        ));
     }
     Json(payload).into_response()
 }
@@ -1362,6 +1507,41 @@ mod tests {
         assert_eq!(active_payload["upstream_is_stream"], true);
         assert_eq!(active_payload["client_requested_stream"], false);
         assert_eq!(active_payload["client_is_stream"], false);
+    }
+
+    #[test]
+    fn user_usage_payload_infers_client_family_from_user_agent() {
+        let item = StoredRequestUsageAudit {
+            request_metadata: Some(json!({
+                "client_ip": "192.168.0.28",
+                "user_agent": "codex_vscode/0.131.0-alpha.9 (Windows 10.0.26200; x86_64)"
+            })),
+            ..sample_usage("completed")
+        };
+
+        let record_payload =
+            build_users_me_usage_record_payload(&item, false, &BTreeMap::new(), false);
+        let active_payload = build_users_me_usage_active_payload(&item);
+
+        assert_eq!(record_payload["client_family"], "codex_vscode");
+        assert_eq!(record_payload["client_ip"], "192.168.0.28");
+        assert_eq!(active_payload["client_family"], "codex_vscode");
+        assert_eq!(active_payload["client_ip"], "192.168.0.28");
+    }
+
+    #[test]
+    fn user_usage_payload_labels_openai_js_user_agent_as_sdk() {
+        let item = StoredRequestUsageAudit {
+            request_metadata: Some(json!({
+                "user_agent": "OpenAI/JS 6.34.0"
+            })),
+            ..sample_usage("completed")
+        };
+
+        let record_payload =
+            build_users_me_usage_record_payload(&item, false, &BTreeMap::new(), false);
+
+        assert_eq!(record_payload["client_family"], "openai_js_sdk");
     }
 
     #[test]

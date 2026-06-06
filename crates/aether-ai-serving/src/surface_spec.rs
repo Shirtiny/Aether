@@ -149,7 +149,8 @@ pub fn extract_ai_requested_model_from_request_path(
 ) -> Option<String> {
     match family {
         AiRequestedModelFamily::Standard => extract_ai_standard_requested_model(body_json),
-        AiRequestedModelFamily::Gemini => extract_ai_gemini_model_from_path(request_path),
+        AiRequestedModelFamily::Gemini => extract_ai_gemini_model_from_path(request_path)
+            .or_else(|| extract_ai_standard_requested_model(body_json)),
     }
 }
 
@@ -232,5 +233,16 @@ mod tests {
             .as_deref(),
             Some("gemini-2.5-pro")
         );
+    }
+
+    #[test]
+    fn gemini_requested_model_parser_uses_body_model_when_path_has_no_model() {
+        let requested_model = extract_ai_requested_model_from_request_path(
+            "/v1internal:streamGenerateContent",
+            &serde_json::json!({ "model": " gemini-cli " }),
+            AiRequestedModelFamily::Gemini,
+        );
+
+        assert_eq!(requested_model.as_deref(), Some("gemini-cli"));
     }
 }

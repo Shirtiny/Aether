@@ -185,6 +185,7 @@ jobs:
       - name: Build
         env:
           AETHER_VERSION: ${{ needs.preflight.outputs.version_tag }}
+          AETHER_BUILD_TYPE: release
           CARGO_TERM_COLOR: always
         shell: bash
         run: |
@@ -332,8 +333,10 @@ jobs:
           set -euo pipefail
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             VERSION="${GITHUB_REF_NAME}"
+            SOURCE_REF="${GITHUB_REF_NAME}"
           else
             VERSION="snapshot-${GITHUB_SHA::7}"
+            SOURCE_REF="${GITHUB_SHA}"
           fi
 
           mkdir -p package release-assets
@@ -347,9 +350,14 @@ jobs:
 
               install -m 0755 "artifacts/aether-gateway-${platform}-${arch}/aether-gateway" "${root}/bin/aether-gateway"
               cp -R artifacts/frontend-dist/. "${root}/frontend/"
-              sed "s/^VERSION=\"\${AETHER_VERSION:-}\"/VERSION=\"\${AETHER_VERSION:-${VERSION}}\"/" install.sh > "${root}/install.sh"
+              sed \
+                -e "s/^SOURCE_REF=\"\${AETHER_SOURCE_REF:-main}\"/SOURCE_REF=\"\${AETHER_SOURCE_REF:-${SOURCE_REF}}\"/" \
+                -e "s/^VERSION=\"\${AETHER_VERSION:-}\"/VERSION=\"\${AETHER_VERSION:-${VERSION}}\"/" \
+                install.sh > "${root}/install.sh"
               chmod 0755 "${root}/install.sh"
+              install -m 0755 update.sh "${root}/update.sh"
               install -m 0644 docker-compose.yml "${root}/docker-compose.yml"
+              install -m 0644 docker-compose.single-node.yml "${root}/docker-compose.single-node.yml"
               install -m 0644 .env.example "${root}/.env.example"
               install -m 0755 generate_keys.sh "${root}/generate_keys.sh"
               install -m 0644 README.md "${root}/README.md"
@@ -359,7 +367,10 @@ jobs:
             done
           done
 
-          sed "s/^VERSION=\"\${AETHER_VERSION:-}\"/VERSION=\"\${AETHER_VERSION:-${VERSION}}\"/" install.sh > release-assets/install.sh
+          sed \
+            -e "s/^SOURCE_REF=\"\${AETHER_SOURCE_REF:-main}\"/SOURCE_REF=\"\${AETHER_SOURCE_REF:-${SOURCE_REF}}\"/" \
+            -e "s/^VERSION=\"\${AETHER_VERSION:-}\"/VERSION=\"\${AETHER_VERSION:-${VERSION}}\"/" \
+            install.sh > release-assets/install.sh
           chmod +x release-assets/install.sh
           (cd release-assets && sha256sum *.tar.gz > SHA256SUMS)
 

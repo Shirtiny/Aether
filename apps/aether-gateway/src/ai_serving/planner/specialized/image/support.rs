@@ -13,6 +13,7 @@ use crate::ai_serving::planner::candidate_metadata::{
 use crate::ai_serving::planner::candidate_resolution::SkippedLocalExecutionCandidate;
 use crate::ai_serving::planner::candidate_source::auth_snapshot_allows_cross_format_candidate;
 use crate::ai_serving::planner::decision_input::{
+    attach_routing_policy_to_local_requested_model_input,
     build_local_requested_model_decision_input, resolve_local_authenticated_decision_input,
 };
 use crate::ai_serving::planner::materialization_policy::{
@@ -42,12 +43,16 @@ pub(super) async fn resolve_local_openai_image_decision_input(
     body_base64: Option<&str>,
     trace_id: &str,
     decision: &GatewayControlDecision,
-) -> Option<LocalOpenAiImageDecisionInput> {
+) -> Result<Option<LocalOpenAiImageDecisionInput>, GatewayError> {
     let Some(auth_context) = resolve_local_openai_image_auth_context(decision) else {
-        return None;
+        return Ok(None);
     };
 
-    let requested_model = resolve_requested_image_model_for_request(parts, body_json, body_base64)?;
+    let Some(requested_model) =
+        resolve_requested_image_model_for_request(parts, body_json, body_base64)
+    else {
+        return Ok(None);
+    };
 
     let resolved_input = match resolve_local_authenticated_decision_input(
         state,
@@ -58,21 +63,37 @@ pub(super) async fn resolve_local_openai_image_decision_input(
     .await
     {
         Ok(Some(resolved_input)) => resolved_input,
-        Ok(None) => return None,
+        Ok(None) => return Ok(None),
         Err(err) => {
             warn!(
                 trace_id = %trace_id,
                 error = ?err,
                 "gateway local openai image decision auth snapshot read failed"
             );
-            return None;
+            return Err(err);
         }
     };
 
     let mut input = build_local_requested_model_decision_input(resolved_input, requested_model);
     input.request_auth_channel = decision.request_auth_channel.clone();
     input.client_session_affinity = client_session_affinity_from_parts(parts, Some(body_json));
-    Some(input)
+    if let Err(err) = attach_routing_policy_to_local_requested_model_input(
+        state,
+        parts,
+        &mut input,
+        body_json,
+        "openai:image",
+    )
+    .await
+    {
+        warn!(
+            trace_id = %trace_id,
+            error = ?err,
+            "gateway local openai image decision routing profile resolution failed"
+        );
+        return Err(err);
+    }
+    Ok(Some(input))
 }
 
 fn resolve_local_openai_image_auth_context(
@@ -229,6 +250,7 @@ pub(super) async fn build_local_openai_image_candidate_attempt_source<'a>(
         Some(&input.auth_snapshot),
         input.client_session_affinity.as_ref(),
         input.required_capabilities.as_ref(),
+        input.routing_policy.as_ref(),
         sticky_session_token.as_deref(),
         input.request_auth_channel.as_deref(),
         persistence_policy,
@@ -305,6 +327,7 @@ async fn materialize_local_openai_image_candidate_attempts(
         Some(&input.auth_snapshot),
         input.client_session_affinity.as_ref(),
         input.required_capabilities.as_ref(),
+        input.routing_policy.as_ref(),
         sticky_session_token.as_deref(),
         input.request_auth_channel.as_deref(),
         persistence_policy,

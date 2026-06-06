@@ -7,6 +7,8 @@ use axum::{
 };
 use serde_json::json;
 
+const PUBLIC_MODELS_OWNER: &str = "aether";
+
 pub(crate) fn build_models_auth_error_response(api_format: &str) -> Response<Body> {
     match api_format {
         "claude:messages" => (
@@ -109,7 +111,7 @@ pub(super) fn build_openai_models_list_response(
                 "id": row.global_model_name,
                 "object": "model",
                 "created": 0,
-                "owned_by": row.provider_name,
+                "owned_by": PUBLIC_MODELS_OWNER,
             })
         }).collect::<Vec<_>>(),
     }))
@@ -123,7 +125,7 @@ pub(super) fn build_openai_model_detail_response(
         "id": row.global_model_name,
         "object": "model",
         "created": 0,
-        "owned_by": row.provider_name,
+        "owned_by": PUBLIC_MODELS_OWNER,
     }))
     .into_response()
 }

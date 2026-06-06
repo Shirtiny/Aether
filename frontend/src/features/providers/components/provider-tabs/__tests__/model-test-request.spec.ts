@@ -3,12 +3,15 @@ import { describe, expect, it } from 'vitest'
 import {
   buildDefaultModelTestRequestBody,
   buildExactModelMappingTestRequest,
+  extractModelTestImagePreviews,
   extractModelTestResponsePreview,
   formatModelTestDiagnostic,
+  getOpenAiImageModelTestMaxGenerationCount,
   isModelTestableEndpoint,
   isModelTestableApiFormat,
   listModelTestMappedModelOptions,
   normalizeModelTestMappedModelSelection,
+  selectPreferredModelTestEndpoint,
   setModelTestRequestBodyModel,
   syncModelTestRequestBodyDraft,
 } from '../model-test-request'
@@ -29,6 +32,21 @@ describe('buildDefaultModelTestRequestBody', () => {
     })
     expect(body.messages).toBeUndefined()
     expect(body.stream).toBeUndefined()
+  })
+
+  it('uses multimodal input and qwen3-vl defaults for Aliyun embedding tests', () => {
+    const body = JSON.parse(buildDefaultModelTestRequestBody('qwen3-vl-embedding', 'aliyun:multimodal_embedding'))
+
+    expect(body).toEqual({
+      model: 'qwen3-vl-embedding',
+      input: [
+        { text: 'White running shoes, lightweight and breathable.' },
+        { image: 'https://dashscope.oss-cn-beijing.aliyuncs.com/images/256_1.png' },
+      ],
+      parameters: {
+        enable_fusion: true,
+      },
+    })
   })
 
   it.each([
@@ -53,6 +71,41 @@ describe('buildDefaultModelTestRequestBody', () => {
     expect(body.messages).toEqual([{ role: 'user', content: 'Hello! This is a test message.' }])
     expect(body.stream).toBe(true)
     expect(body.input).toBeUndefined()
+  })
+
+  it('uses image prompt payloads for OpenAI image test requests', () => {
+    const body = JSON.parse(buildDefaultModelTestRequestBody('gpt-image-2', 'openai:image'))
+
+    expect(body).toEqual({
+      model: 'gpt-image-2',
+      prompt: 'Hello! This is a test message.',
+      n: 1,
+      size: '1024x1024',
+      stream: true,
+    })
+    expect(body.messages).toBeUndefined()
+  })
+
+  it('uses image generation tools for image models on OpenAI Responses endpoints', () => {
+    const body = JSON.parse(buildDefaultModelTestRequestBody(
+      'gpt-image-2',
+      'openai:responses',
+      {
+        effective_supports_image_generation: true,
+      },
+    ))
+
+    expect(body.model).toBe('gpt-image-2')
+    expect(body.input).toBe('Hello! This is a test message.')
+    expect(body.tools).toEqual([
+      {
+        type: 'image_generation',
+        size: '1024x1024',
+        output_format: 'png',
+      },
+    ])
+    expect(body.tool_choice).toEqual({ type: 'image_generation' })
+    expect(body.messages).toBeUndefined()
   })
 
   it('lists endpoint-scoped provider model mappings in test selection order', () => {
@@ -202,12 +255,84 @@ describe('isModelTestableApiFormat', () => {
   it.each([
     'openai:chat',
     'openai:responses',
+    'openai:responses:compact',
+    'openai:image',
     'claude:messages',
     'gemini:generate_content',
+    'openai:image',
     'openai:embedding',
     'jina:rerank',
   ])('allows synchronous model-test endpoint formats: %s', (apiFormat) => {
     expect(isModelTestableApiFormat(apiFormat)).toBe(true)
+  })
+})
+
+describe('selectPreferredModelTestEndpoint', () => {
+  it('prefers openai image endpoints for image generation models', () => {
+    const chatEndpoint = { id: 'chat', api_format: 'openai:chat', is_active: true }
+    const imageEndpoint = { id: 'image', api_format: 'openai:image', is_active: true }
+
+    expect(selectPreferredModelTestEndpoint({
+      effective_supports_image_generation: true,
+    }, [chatEndpoint, imageEndpoint])).toBe(imageEndpoint)
+  })
+
+  it('prefers openai image endpoints from model-test capability metadata', () => {
+    const chatEndpoint = { id: 'chat', api_format: 'openai:chat', is_active: true }
+    const imageEndpoint = { id: 'image', api_format: 'openai:image', is_active: true }
+
+    expect(selectPreferredModelTestEndpoint({
+      effective_supports_image_generation: false,
+      model_test_capabilities: {
+        'openai:image': {
+          supports_generation: true,
+          max_generation_count: 4,
+        },
+      },
+    }, [chatEndpoint, imageEndpoint])).toBe(imageEndpoint)
+  })
+
+  it('does not treat edit-only image capability as generation support', () => {
+    const chatEndpoint = { id: 'chat', api_format: 'openai:chat', is_active: true }
+    const imageEndpoint = { id: 'image', api_format: 'openai:image', is_active: true }
+
+    expect(selectPreferredModelTestEndpoint({
+      effective_supports_image_generation: true,
+      model_test_capabilities: {
+        'openai:image': {
+          supports_generation: false,
+          supports_edit: true,
+          max_generation_count: 4,
+        },
+      },
+    }, [chatEndpoint, imageEndpoint])).toBe(chatEndpoint)
+  })
+
+  it('keeps the existing endpoint order for non-image models', () => {
+    const chatEndpoint = { id: 'chat', api_format: 'openai:chat', is_active: true }
+    const imageEndpoint = { id: 'image', api_format: 'openai:image', is_active: true }
+
+    expect(selectPreferredModelTestEndpoint({
+      effective_supports_image_generation: false,
+    }, [chatEndpoint, imageEndpoint])).toBe(chatEndpoint)
+  })
+})
+
+describe('getOpenAiImageModelTestMaxGenerationCount', () => {
+  it('reads image generation count from backend capability metadata', () => {
+    expect(getOpenAiImageModelTestMaxGenerationCount({
+      model_test_capabilities: {
+        'openai:image': {
+          max_generation_count: 4,
+        },
+      },
+    })).toBe(4)
+  })
+
+  it('returns null when backend capability metadata is absent', () => {
+    expect(getOpenAiImageModelTestMaxGenerationCount({
+      effective_supports_image_generation: true,
+    })).toBeNull()
   })
 })
 
@@ -242,9 +367,31 @@ describe('isModelTestableEndpoint', () => {
       is_active: true,
     }, keys)).toBe(true)
   })
+
+  it('lets fixed provider OAuth keys inherit testable endpoint formats', () => {
+    const keys = [{
+      api_formats: ['legacy:mismatch'],
+      auth_type: 'oauth',
+      is_active: true,
+    }]
+
+    expect(isModelTestableEndpoint({
+      api_format: 'openai:image',
+      is_active: true,
+    }, keys, 'chatgpt_web')).toBe(true)
+    expect(isModelTestableEndpoint({
+      api_format: 'openai:image',
+      is_active: true,
+    }, keys, 'custom')).toBe(false)
+  })
 })
 
 describe('formatModelTestDiagnostic', () => {
+  it('maps model permission skips to an actionable label', () => {
+    expect(formatModelTestDiagnostic('key_model_not_allowed'))
+      .toBe('Key 未允许当前模型，已跳过')
+  })
+
   it('maps pool account blocked scheduler code to an actionable label', () => {
     expect(formatModelTestDiagnostic('pool_account_blocked')).toBe('账号已失效，需重新授权')
   })
@@ -339,6 +486,161 @@ describe('extractModelTestResponsePreview', () => {
         { index: 1, relevance_score: 0.5 },
       ],
     })).toBe('Rerank 结果：2 条')
+  })
+
+  it('extracts image URLs from OpenAI image responses', () => {
+    expect(extractModelTestResponsePreview({
+      data: [
+        {
+          url: 'https://example.com/generated.png',
+          revised_prompt: 'A generated image',
+        },
+      ],
+    })).toBe('图片：https://example.com/generated.png')
+  })
+
+  it('extracts renderable URL image previews from OpenAI image responses', () => {
+    expect(extractModelTestImagePreviews({
+      data: [
+        {
+          url: 'https://example.com/generated.png',
+          revised_prompt: 'A generated image',
+        },
+      ],
+    })).toEqual([
+      {
+        src: 'https://example.com/generated.png',
+        label: '图片 1',
+        source: 'url',
+      },
+    ])
+  })
+
+  it('summarizes base64 image responses without dumping the image payload', () => {
+    expect(extractModelTestResponsePreview({
+      data: [
+        {
+          b64_json: 'aGVsbG8=',
+        },
+      ],
+    })).toBe('图片：base64')
+  })
+
+  it('extracts renderable base64 image previews from OpenAI image responses', () => {
+    expect(extractModelTestImagePreviews({
+      data: [
+        {
+          b64_json: 'aGVsbG8=',
+          mime_type: 'image/jpeg',
+        },
+      ],
+    })).toEqual([
+      {
+        src: 'data:image/jpeg;base64,aGVsbG8=',
+        label: '图片 1',
+        source: 'base64',
+      },
+    ])
+  })
+
+  it('accepts root-relative URLs in OpenAI image responses', () => {
+    expect(extractModelTestImagePreviews({
+      data: [
+        {
+          url: '/v1/files/image?id=2af14311-a0cb-4bbf-ae20-d1fcf44e0479',
+        },
+      ],
+    })).toEqual([
+      {
+        src: '/v1/files/image?id=2af14311-a0cb-4bbf-ae20-d1fcf44e0479',
+        label: '图片 1',
+        source: 'url',
+      },
+    ])
+  })
+
+  it('parses stringified JSON image responses', () => {
+    expect(extractModelTestImagePreviews(JSON.stringify({
+      data: [
+        {
+          url: 'https://example.com/generated.png',
+        },
+      ],
+    }))).toEqual([
+      {
+        src: 'https://example.com/generated.png',
+        label: '图片 1',
+        source: 'url',
+      },
+    ])
+  })
+
+  it('parses stringified JSON base64 image responses', () => {
+    expect(extractModelTestImagePreviews(JSON.stringify({
+      data: [
+        {
+          b64_json: 'aGVsbG8=',
+          mime_type: 'image/jpeg',
+        },
+      ],
+    }))).toEqual([
+      {
+        src: 'data:image/jpeg;base64,aGVsbG8=',
+        label: '图片 1',
+        source: 'base64',
+      },
+    ])
+  })
+
+  it('extracts image previews from nested response image urls', () => {
+    expect(extractModelTestImagePreviews({
+      output: [
+        {
+          content: [
+            {
+              type: 'output_image',
+              image_url: {
+                url: 'https://example.com/generated.png',
+              },
+            },
+          ],
+        },
+      ],
+    })).toEqual([
+      {
+        src: 'https://example.com/generated.png',
+        label: '图片 1',
+        source: 'url',
+      },
+    ])
+  })
+
+  it('extracts image previews from OpenAI Responses image_generation_call results', () => {
+    expect(extractModelTestResponsePreview({
+      output: [
+        {
+          type: 'image_generation_call',
+          output_format: 'png',
+          result: 'aGVsbG8=',
+        },
+      ],
+    })).toBe('图片：base64')
+
+    expect(extractModelTestImagePreviews({
+      output: [
+        {
+          type: 'image_generation_call',
+          output_format: 'png',
+          result: 'aGVsbG8=',
+        },
+      ],
+    })).toEqual([
+      {
+        src: 'data:image/png;base64,aGVsbG8=',
+        label: '图片 1',
+        source: 'base64',
+      },
+    ])
   })
 
   it('falls back to response model when no text payload exists', () => {

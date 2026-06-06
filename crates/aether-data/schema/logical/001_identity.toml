@@ -114,6 +114,17 @@ length = 32
 default = "system"
 
 [[table.users.columns]]
+name = "privacy_policy_accepted_version"
+type = "text"
+length = 64
+nullable = true
+
+[[table.users.columns]]
+name = "privacy_policy_accepted_at"
+type = "timestamp"
+nullable = true
+
+[[table.users.columns]]
 name = "metadata"
 type = "json"
 nullable = true
@@ -319,6 +330,11 @@ nullable = true
 
 [[table.api_keys.columns]]
 name = "allowed_api_formats"
+type = "json"
+nullable = true
+
+[[table.api_keys.columns]]
+name = "ip_rules"
 type = "json"
 nullable = true
 
@@ -536,6 +552,11 @@ default = true
 
 [[table.announcements.columns]]
 name = "is_pinned"
+type = "bool"
+default = false
+
+[[table.announcements.columns]]
+name = "requires_ack"
 type = "bool"
 default = false
 

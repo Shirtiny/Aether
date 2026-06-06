@@ -2,8 +2,9 @@ use async_trait::async_trait;
 use sqlx::{mysql::MySqlRow, Row};
 
 use super::{
-    finite_wallet_available_usd, plan_finite_wallet_debit, SettlementWriteRepository,
-    StoredUsageSettlement, UsageSettlementInput, SETTLEMENT_EPSILON_USD,
+    finite_wallet_available_usd, plan_finite_wallet_debit,
+    settlement_billing_status_for_usage_status, SettlementWriteRepository, StoredUsageSettlement,
+    UsageSettlementInput, SETTLEMENT_EPSILON_USD,
 };
 use crate::driver::mysql::MysqlPool;
 use crate::error::SqlResultExt;
@@ -206,6 +207,7 @@ async fn consume_daily_quota_mysql(
     request_id: &str,
     total_cost_usd: f64,
     wallet_available_usd: Option<f64>,
+    wallet_can_overdraft: bool,
     now_unix_secs: i64,
 ) -> Result<DailyQuotaDebitResult, DataLayerError> {
     if total_cost_usd <= 0.0 {
@@ -279,6 +281,7 @@ WHERE user_entitlement_id = ?
         });
     }
     if allow_wallet_overage
+        && !wallet_can_overdraft
         && wallet_available_usd.is_some_and(|available| {
             total_remaining + available + SETTLEMENT_EPSILON_USD < total_cost_usd
         })
@@ -364,11 +367,8 @@ impl SettlementWriteRepository for MysqlSettlementRepository {
             return Ok(Some(settlement));
         }
 
-        let mut final_billing_status = if input.status == "completed" {
-            "settled".to_string()
-        } else {
-            "void".to_string()
-        };
+        let mut final_billing_status =
+            settlement_billing_status_for_usage_status(&input.status).to_string();
         let mut settlement = StoredUsageSettlement {
             request_id: input.request_id.clone(),
             wallet_id: None,
@@ -450,6 +450,7 @@ FOR UPDATE
                 None
             };
 
+            let wallet_can_overdraft = wallet_row.is_some();
             let wallet_available_usd = match wallet_row.as_ref() {
                 Some(row) => {
                     let limit_mode: String = row.try_get("limit_mode").map_sql_err()?;
@@ -464,6 +465,19 @@ FOR UPDATE
                 }
                 None => Some(0.0),
             };
+            if let Some(row) = wallet_row.as_ref() {
+                let wallet_id: String = row.try_get("id").map_sql_err()?;
+                let before_recharge: f64 = row.try_get("balance").map_sql_err()?;
+                let before_gift: f64 = row.try_get("gift_balance").map_sql_err()?;
+                let before_total = before_recharge + before_gift;
+                settlement.wallet_id = Some(wallet_id);
+                settlement.wallet_balance_before = Some(before_total);
+                settlement.wallet_balance_after = Some(before_total);
+                settlement.wallet_recharge_balance_before = Some(before_recharge);
+                settlement.wallet_recharge_balance_after = Some(before_recharge);
+                settlement.wallet_gift_balance_before = Some(before_gift);
+                settlement.wallet_gift_balance_after = Some(before_gift);
+            }
 
             let wallet_debit_cost_usd = if !api_key_is_standalone {
                 if let Some(user_id) = input.user_id.as_deref().filter(|value| !value.is_empty()) {
@@ -473,6 +487,7 @@ FOR UPDATE
                         &input.request_id,
                         input.total_cost_usd,
                         wallet_available_usd,
+                        wallet_can_overdraft,
                         updated_at,
                     )
                     .await?;
@@ -533,14 +548,8 @@ FOR UPDATE
                             before_gift,
                             wallet_debit_cost_usd,
                         );
-                        if debit_plan.covered_usd() + SETTLEMENT_EPSILON_USD < wallet_debit_cost_usd
-                        {
-                            final_billing_status = "insufficient_quota".to_string();
-                            settlement.billing_status = final_billing_status.clone();
-                        } else {
-                            after_recharge = before_recharge - debit_plan.recharge_deduction;
-                            after_gift = before_gift - debit_plan.gift_deduction;
-                        }
+                        (after_recharge, after_gift) =
+                            debit_plan.after_balances(before_recharge, before_gift);
                     }
                     if final_billing_status == "settled" {
                         sqlx::query(

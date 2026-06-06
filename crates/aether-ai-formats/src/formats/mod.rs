@@ -1,3 +1,4 @@
+pub mod aliyun;
 pub mod claude;
 pub mod context;
 pub mod conversion;

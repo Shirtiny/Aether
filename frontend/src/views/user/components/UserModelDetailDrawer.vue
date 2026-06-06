@@ -335,6 +335,7 @@ import TableBody from '@/components/ui/table-body.vue'
 import TableRow from '@/components/ui/table-row.vue'
 import TableHead from '@/components/ui/table-head.vue'
 import TableCell from '@/components/ui/table-cell.vue'
+import { formatTokens } from '@/utils/format'
 
 import type { PublicGlobalModel } from '@/api/public-models'
 import type { TieredPricingConfig, PricingTier } from '@/api/endpoints/types'
@@ -373,12 +374,7 @@ function getTierCount(tieredPricing: TieredPricingConfig | undefined | null): nu
 
 function formatTierLimit(limit: number | null | undefined): string {
   if (limit == null) return ''
-  if (limit >= 1000000) {
-    return `${(limit / 1000000).toFixed(1)}M`
-  } else if (limit >= 1000) {
-    return `${(limit / 1000).toFixed(0)}K`
-  }
-  return limit.toString()
+  return formatTokens(limit)
 }
 
 function get1hCachePrice(tier: PricingTier): string {
@@ -399,7 +395,10 @@ function supportsEmbedding(model: PublicGlobalModel): boolean {
     || model.supported_capabilities?.includes('embedding') === true
     || model.config?.embedding === true
     || model.config?.model_type === 'embedding'
-    || (Array.isArray(model.config?.api_formats) && model.config.api_formats.some((format) => String(format).endsWith(':embedding')))
+    || (Array.isArray(model.config?.api_formats) && model.config.api_formats.some((format) => {
+      const value = String(format).trim().toLowerCase()
+      return value.endsWith(':embedding') || value === 'aliyun:multimodal_embedding'
+    }))
 }
 
 // 添加 ESC 键监听

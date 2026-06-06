@@ -63,6 +63,13 @@ fn select_provider_oauth_runtime_endpoint(
                 .trim()
                 .eq_ignore_ascii_case("openai:image")
         }),
+        "grok" => matching_endpoint(endpoints, include_inactive, |endpoint| {
+            endpoint
+                .api_format
+                .trim()
+                .eq_ignore_ascii_case("openai:chat")
+        })
+        .or_else(|| matching_endpoint(endpoints, include_inactive, |_| true)),
         "antigravity" => matching_endpoint(endpoints, include_inactive, |endpoint| {
             endpoint
                 .api_format

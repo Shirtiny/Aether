@@ -296,6 +296,14 @@ pub struct StoredProviderCatalogKey {
     pub circuit_breaker_by_format: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredProviderCatalogKeyMaintenanceSummary {
+    pub id: String,
+    pub provider_id: String,
+    pub is_active: bool,
+    pub upstream_metadata: Option<serde_json::Value>,
+}
+
 impl StoredProviderCatalogKey {
     pub fn new(
         id: String,
@@ -572,6 +580,8 @@ impl StoredProviderCatalogKeyStats {
 
 #[async_trait]
 pub trait ProviderCatalogReadRepository: Send + Sync {
+    fn clear_local_cache(&self) {}
+
     async fn list_providers(
         &self,
         active_only: bool,
@@ -606,6 +616,11 @@ pub trait ProviderCatalogReadRepository: Send + Sync {
         &self,
         provider_ids: &[String],
     ) -> Result<Vec<StoredProviderCatalogKey>, crate::DataLayerError>;
+
+    async fn list_key_maintenance_summaries_by_provider_ids(
+        &self,
+        provider_ids: &[String],
+    ) -> Result<Vec<StoredProviderCatalogKeyMaintenanceSummary>, crate::DataLayerError>;
 
     async fn list_keys_page(
         &self,

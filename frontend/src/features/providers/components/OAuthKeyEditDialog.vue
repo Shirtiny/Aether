@@ -88,7 +88,7 @@
             @update:model-value="(v) => form.concurrent_limit = parseNullableNumberInput(v, { min: 0 })"
           />
           <p class="text-xs text-muted-foreground mt-0.5">
-            同一时间允许使用该 Key 的最大请求数，留空或 0 表示不限制
+            留空或 0 表示不限制
           </p>
         </div>
         <div>

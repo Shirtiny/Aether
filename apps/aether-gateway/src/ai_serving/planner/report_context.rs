@@ -82,6 +82,18 @@ pub(crate) fn build_local_execution_report_context(
         .client_session_affinity
         .and_then(client_session_affinity_report_context_value)
     {
+        if let Some(client_family) = value
+            .as_object()
+            .and_then(|object| object.get("client_family"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|client_family| !client_family.is_empty())
+        {
+            extra_fields.insert(
+                "client_family".to_string(),
+                Value::String(client_family.to_ascii_lowercase()),
+            );
+        }
         extra_fields.insert(
             CLIENT_SESSION_AFFINITY_REPORT_CONTEXT_FIELD.to_string(),
             value,
@@ -184,6 +196,21 @@ pub(crate) fn insert_provider_stream_event_api_format(
     provider_type: &str,
 ) {
     insert_ai_provider_stream_event_api_format(extra_fields, provider_type);
+}
+
+pub(crate) fn insert_native_client_envelope_name(
+    extra_fields: &mut Map<String, Value>,
+    envelope_name: &str,
+    request_path: &str,
+) {
+    if envelope_name.eq_ignore_ascii_case("antigravity:v1internal")
+        && request_path == "/v1internal:streamGenerateContent"
+    {
+        extra_fields.insert(
+            "client_envelope_name".to_string(),
+            Value::String(envelope_name.to_string()),
+        );
+    }
 }
 
 fn merge_incoming_tls_fingerprint(extra_fields: &mut Map<String, Value>, incoming_tls: Value) {

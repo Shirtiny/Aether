@@ -452,7 +452,10 @@ async fn gateway_executes_gemini_cli_stream_via_local_decision_gate_after_oauth_
     struct SeenExecutionRuntimeStreamRequest {
         trace_id: String,
         url: String,
-        has_model_field: bool,
+        project: String,
+        outer_model: String,
+        user_prompt_id: String,
+        inner_model_present: bool,
         accept: String,
         authorization: String,
         exact_temperature: f64,
@@ -574,7 +577,7 @@ async fn gateway_executes_gemini_cli_stream_via_local_decision_gate_after_oauth_
         )
         .expect("endpoint should build")
         .with_transport_fields(
-            "https://generativelanguage.googleapis.com".to_string(),
+            "https://cloudcode-pa.googleapis.com".to_string(),
             Some(serde_json::json!([
                 {"action":"set","key":"x-endpoint-tag","value":"gemini-cli-oauth-local"}
             ])),
@@ -584,7 +587,7 @@ async fn gateway_executes_gemini_cli_stream_via_local_decision_gate_after_oauth_
                 {"action":"drop","path":"toolConfig"}
             ])),
             Some(2),
-            Some("/custom/v1beta/models/gemini-cli-upstream:streamGenerateContent".to_string()),
+            None,
             None,
             None,
             None,
@@ -595,7 +598,7 @@ async fn gateway_executes_gemini_cli_stream_via_local_decision_gate_after_oauth_
     fn sample_provider_catalog_key() -> StoredProviderCatalogKey {
         let encrypted_auth_config = encrypt_python_fernet_plaintext(
             DEVELOPMENT_ENCRYPTION_KEY,
-            r#"{"provider_type":"gemini_cli","refresh_token":"rt-gemini-cli-stream-local-123"}"#,
+            r#"{"provider_type":"gemini_cli","refresh_token":"rt-gemini-cli-stream-local-123","project_id":"gemini-cli-project-1"}"#,
         )
         .expect("auth config should encrypt");
         StoredProviderCatalogKey::new(
@@ -730,11 +733,33 @@ async fn gateway_executes_gemini_cli_stream_via_local_decision_gate_after_oauth_
                             .and_then(|value| value.as_str())
                             .unwrap_or_default()
                             .to_string(),
-                        has_model_field: payload
+                        outer_model: payload
                             .get("body")
                             .and_then(|value| value.get("json_body"))
                             .and_then(|value| value.get("model"))
+                            .and_then(|value| value.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        user_prompt_id: payload
+                            .get("body")
+                            .and_then(|value| value.get("json_body"))
+                            .and_then(|value| value.get("user_prompt_id"))
+                            .and_then(|value| value.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        inner_model_present: payload
+                            .get("body")
+                            .and_then(|value| value.get("json_body"))
+                            .and_then(|value| value.get("request"))
+                            .and_then(|value| value.get("model"))
                             .is_some(),
+                        project: payload
+                            .get("body")
+                            .and_then(|value| value.get("json_body"))
+                            .and_then(|value| value.get("project"))
+                            .and_then(|value| value.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
                         accept: payload
                             .get("headers")
                             .and_then(|value| value.get("accept"))
@@ -750,6 +775,7 @@ async fn gateway_executes_gemini_cli_stream_via_local_decision_gate_after_oauth_
                         exact_temperature: payload
                             .get("body")
                             .and_then(|value| value.get("json_body"))
+                            .and_then(|value| value.get("request"))
                             .and_then(|value| value.get("generationConfig"))
                             .and_then(|value| value.get("temperature"))
                             .and_then(|value| value.as_f64())
@@ -763,6 +789,7 @@ async fn gateway_executes_gemini_cli_stream_via_local_decision_gate_after_oauth_
                         metadata_mode: payload
                             .get("body")
                             .and_then(|value| value.get("json_body"))
+                            .and_then(|value| value.get("request"))
                             .and_then(|value| value.get("metadata"))
                             .and_then(|value| value.get("mode"))
                             .and_then(|value| value.as_str())
@@ -771,6 +798,7 @@ async fn gateway_executes_gemini_cli_stream_via_local_decision_gate_after_oauth_
                         metadata_source: payload
                             .get("body")
                             .and_then(|value| value.get("json_body"))
+                            .and_then(|value| value.get("request"))
                             .and_then(|value| value.get("metadata"))
                             .and_then(|value| value.get("source"))
                             .and_then(|value| value.as_str())
@@ -779,6 +807,7 @@ async fn gateway_executes_gemini_cli_stream_via_local_decision_gate_after_oauth_
                         tool_config_present: payload
                             .get("body")
                             .and_then(|value| value.get("json_body"))
+                            .and_then(|value| value.get("request"))
                             .and_then(|value| value.get("toolConfig"))
                             .is_some(),
                         proxy_node_id: payload
@@ -795,7 +824,7 @@ async fn gateway_executes_gemini_cli_stream_via_local_decision_gate_after_oauth_
                     });
                 let frames = concat!(
                     "{\"type\":\"headers\",\"payload\":{\"kind\":\"headers\",\"status_code\":200,\"headers\":{\"content-type\":\"text/event-stream\"}}}\n",
-                    "{\"type\":\"data\",\"payload\":{\"kind\":\"data\",\"text\":\"data: {\\\"candidates\\\":[]}\\n\\n\"}}\n",
+                    "{\"type\":\"data\",\"payload\":{\"kind\":\"data\",\"text\":\"data: {\\\"response\\\":{\\\"candidates\\\":[]},\\\"remainingCredits\\\":42,\\\"consumedCredits\\\":1,\\\"traceId\\\":\\\"trace-upstream-1\\\"}\\n\\n\"}}\n",
                     "{\"type\":\"telemetry\",\"payload\":{\"kind\":\"telemetry\",\"telemetry\":{\"elapsed_ms\":34,\"upstream_bytes\":26}}}\n",
                     "{\"type\":\"eof\",\"payload\":{\"kind\":\"eof\"}}\n"
                 );
@@ -909,9 +938,21 @@ async fn gateway_executes_gemini_cli_stream_via_local_decision_gate_after_oauth_
     );
     assert_eq!(
         seen_execution_runtime_request.url,
-        "https://generativelanguage.googleapis.com/custom/v1beta/models/gemini-cli-upstream:streamGenerateContent?alt=sse"
+        "https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse"
     );
-    assert!(!seen_execution_runtime_request.has_model_field);
+    assert_eq!(
+        seen_execution_runtime_request.project,
+        "gemini-cli-project-1"
+    );
+    assert_eq!(
+        seen_execution_runtime_request.outer_model,
+        "gemini-cli-upstream"
+    );
+    assert_eq!(
+        seen_execution_runtime_request.user_prompt_id,
+        "trace-gemini-cli-oauth-local-stream-123"
+    );
+    assert!(!seen_execution_runtime_request.inner_model_present);
     assert_eq!(seen_execution_runtime_request.accept, "text/event-stream");
     assert_eq!(
         seen_execution_runtime_request.authorization,
@@ -1441,7 +1482,7 @@ async fn gateway_executes_antigravity_gemini_cli_stream_via_local_decision_gate_
             false,
             Some(serde_json::json!(["gemini", "antigravity"])),
             Some(serde_json::json!(["gemini:generate_content"])),
-            Some(serde_json::json!(["gemini-cli"])),
+            Some(serde_json::json!(["gemini-cli", "gemini-3.1-flash-lite"])),
             api_key_id.to_string(),
             Some("default".to_string()),
             true,
@@ -1452,12 +1493,23 @@ async fn gateway_executes_antigravity_gemini_cli_stream_via_local_decision_gate_
             Some(4_102_444_800),
             Some(serde_json::json!(["gemini", "antigravity"])),
             Some(serde_json::json!(["gemini:generate_content"])),
-            Some(serde_json::json!(["gemini-cli"])),
+            Some(serde_json::json!(["gemini-cli", "gemini-3.1-flash-lite"])),
         )
         .expect("auth snapshot should build")
     }
 
     fn sample_candidate_row() -> StoredMinimalCandidateSelectionRow {
+        sample_candidate_row_for("gemini-cli", "1")
+    }
+
+    fn sample_native_antigravity_candidate_row() -> StoredMinimalCandidateSelectionRow {
+        sample_candidate_row_for("gemini-3.1-flash-lite", "native-1")
+    }
+
+    fn sample_candidate_row_for(
+        global_model_name: &str,
+        row_suffix: &str,
+    ) -> StoredMinimalCandidateSelectionRow {
         StoredMinimalCandidateSelectionRow {
             provider_id: "provider-antigravity-cli-oauth-stream-local-1".to_string(),
             provider_name: "antigravity".to_string(),
@@ -1478,9 +1530,11 @@ async fn gateway_executes_antigravity_gemini_cli_stream_via_local_decision_gate_
             key_capabilities: None,
             key_internal_priority: 5,
             key_global_priority_by_format: Some(serde_json::json!({"gemini:generate_content": 1})),
-            model_id: "model-antigravity-cli-oauth-stream-local-1".to_string(),
-            global_model_id: "global-model-antigravity-cli-oauth-stream-local-1".to_string(),
-            global_model_name: "gemini-cli".to_string(),
+            model_id: format!("model-antigravity-cli-oauth-stream-local-{row_suffix}"),
+            global_model_id: format!(
+                "global-model-antigravity-cli-oauth-stream-local-{row_suffix}"
+            ),
+            global_model_name: global_model_name.to_string(),
             global_model_mappings: None,
             global_model_supports_streaming: Some(true),
             model_provider_model_name: "claude-sonnet-4-5".to_string(),
@@ -1800,6 +1854,7 @@ async fn gateway_executes_antigravity_gemini_cli_stream_via_local_decision_gate_
     let candidate_selection_repository =
         Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(vec![
             sample_candidate_row(),
+            sample_native_antigravity_candidate_row(),
         ]));
     let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
@@ -1818,17 +1873,26 @@ async fn gateway_executes_antigravity_gemini_cli_stream_via_local_decision_gate_
                     .with_token_url_for_tests("antigravity", format!("{refresh_url}/oauth/token")),
             ),
         ]);
-    let gateway_state = build_state_with_execution_runtime_override(execution_runtime_url.clone())
-    .with_data_state_for_tests(
+    let data_state =
         crate::data::GatewayDataState::with_auth_candidate_selection_provider_catalog_and_request_candidate_repository_for_tests(
             auth_repository,
             candidate_selection_repository,
             provider_catalog_repository,
             Arc::clone(&request_candidate_repository),
             DEVELOPMENT_ENCRYPTION_KEY,
-        ),
-    )
-    .with_oauth_refresh_coordinator_for_tests(oauth_refresh);
+        )
+        .with_system_config_values_for_tests([(
+            crate::constants::ANTIGRAVITY_BEARER_BRIDGE_CONFIG_KEY.to_string(),
+            json!({
+                "enabled": true,
+                "auth_user_id": "user-antigravity-cli-oauth-stream-local-1",
+                "auth_api_key_id": "api-key-antigravity-cli-oauth-stream-local-1",
+                "allow_unverified_google_bearer": true
+            }),
+        )]);
+    let gateway_state = build_state_with_execution_runtime_override(execution_runtime_url.clone())
+        .with_data_state_for_tests(data_state)
+        .with_oauth_refresh_coordinator_for_tests(oauth_refresh);
     let gateway = build_router_with_state(gateway_state);
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
@@ -1949,6 +2013,380 @@ async fn gateway_executes_antigravity_gemini_cli_stream_via_local_decision_gate_
         .expect("request candidate trace should read");
     assert_eq!(stored_candidates.len(), 1);
     assert_eq!(stored_candidates[0].status, RequestCandidateStatus::Success);
+
+    *seen_execution_runtime.lock().expect("mutex should lock") = None;
+    let inbound_response = reqwest::Client::new()
+        .post(format!(
+            "{gateway_url}/v1internal:streamGenerateContent?alt=sse"
+        ))
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .header("authorization", "Bearer google-antigravity-access-token")
+        .header("x-api-key", client_api_key)
+        .header("user-agent", "antigravity/cli/1.0.2 linux/arm64")
+        .header(
+            TRACE_ID_HEADER,
+            "trace-antigravity-v1internal-inbound-stream-456",
+        )
+        .json(&json!({
+            "project": "client-side-project-should-not-leak",
+            "requestId": "client-v1internal-request-456",
+            "model": "gemini-cli",
+            "userAgent": "antigravity",
+            "requestType": "checkpoint",
+            "request": {
+                "contents": [{
+                    "role": "user",
+                    "parts": [{"text": "checkpoint context"}]
+                }],
+                "generationConfig": {
+                    "temperature": 0.4,
+                    "thinkingConfig": {
+                        "includeThoughts": true
+                    }
+                },
+                "toolConfig": {
+                    "functionCallingConfig": {
+                        "mode": "NONE"
+                    }
+                }
+            }
+        }))
+        .send()
+        .await
+        .expect("inbound antigravity request should succeed");
+
+    let inbound_status = inbound_response.status();
+    let inbound_miss_reason = inbound_response
+        .headers()
+        .get(crate::constants::LOCAL_EXECUTION_RUNTIME_MISS_REASON_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("-")
+        .to_string();
+    let inbound_response_body = inbound_response.text().await.expect("body should read");
+    assert_eq!(
+        inbound_status,
+        StatusCode::OK,
+        "unexpected inbound antigravity response body: {inbound_response_body}; miss_reason={inbound_miss_reason}"
+    );
+    let inbound_response_text = strip_sse_keepalive_comments(&inbound_response_body);
+    let inbound_payload = inbound_response_text
+        .trim()
+        .strip_prefix("data: ")
+        .expect("response should start with sse data prefix");
+    let inbound_response_json: serde_json::Value =
+        serde_json::from_str(inbound_payload).expect("stream payload should parse");
+    assert_eq!(
+        inbound_response_json["responseId"],
+        "resp_antigravity_cli_local_stream_123"
+    );
+    assert_eq!(
+        inbound_response_json["response"]["candidates"][0]["content"]["parts"][0]["text"],
+        "Hello Antigravity Stream"
+    );
+
+    let seen_inbound_execution_runtime_request = seen_execution_runtime
+        .lock()
+        .expect("mutex should lock")
+        .clone()
+        .expect("inbound execution runtime stream should be captured");
+    assert_eq!(
+        seen_inbound_execution_runtime_request.trace_id,
+        "trace-antigravity-v1internal-inbound-stream-456"
+    );
+    assert_eq!(
+        seen_inbound_execution_runtime_request.url,
+        "https://antigravity.googleapis.com/v1internal:streamGenerateContent?alt=sse"
+    );
+    assert_eq!(
+        seen_inbound_execution_runtime_request.authorization,
+        "Bearer refreshed-antigravity-cli-stream-access-token"
+    );
+    assert_eq!(
+        seen_inbound_execution_runtime_request.project,
+        "project-antigravity-stream-local-1"
+    );
+    assert_eq!(
+        seen_inbound_execution_runtime_request.request_id,
+        "client-v1internal-request-456"
+    );
+    assert_eq!(
+        seen_inbound_execution_runtime_request.model,
+        "claude-sonnet-4-5"
+    );
+    assert_eq!(
+        seen_inbound_execution_runtime_request.user_agent,
+        "antigravity"
+    );
+    assert_eq!(
+        seen_inbound_execution_runtime_request.request_type,
+        "checkpoint"
+    );
+    assert_eq!(seen_inbound_execution_runtime_request.contents_len, 1);
+    assert!((seen_inbound_execution_runtime_request.exact_temperature - 0.4).abs() < f64::EPSILON);
+    assert!(!seen_inbound_execution_runtime_request.request_has_model);
+
+    *seen_execution_runtime.lock().expect("mutex should lock") = None;
+    let bearer_only_response = reqwest::Client::new()
+        .post(format!(
+            "{gateway_url}/v1internal:streamGenerateContent?alt=sse"
+        ))
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .header("authorization", "Bearer google-antigravity-access-token")
+        .header("user-agent", "antigravity/cli/1.0.2 linux/arm64")
+        .header(
+            TRACE_ID_HEADER,
+            "trace-antigravity-v1internal-bearer-only-stream-789",
+        )
+        .json(&json!({
+            "project": "client-side-project-should-not-leak",
+            "requestId": "client-v1internal-request-789",
+            "model": "gemini-cli",
+            "userAgent": "antigravity",
+            "requestType": "agent",
+            "request": {
+                "contents": [{
+                    "role": "user",
+                    "parts": [{"text": "bearer-only request"}]
+                }],
+                "generationConfig": {
+                    "temperature": 0.5,
+                    "thinkingConfig": {
+                        "includeThoughts": true
+                    }
+                },
+                "toolConfig": {
+                    "functionCallingConfig": {
+                        "mode": "NONE"
+                    }
+                }
+            }
+        }))
+        .send()
+        .await
+        .expect("bearer-only antigravity request should succeed");
+
+    let bearer_only_status = bearer_only_response.status();
+    let bearer_only_miss_reason = bearer_only_response
+        .headers()
+        .get(crate::constants::LOCAL_EXECUTION_RUNTIME_MISS_REASON_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("-")
+        .to_string();
+    let bearer_only_response_body = bearer_only_response.text().await.expect("body should read");
+    assert_eq!(
+        bearer_only_status,
+        StatusCode::OK,
+        "unexpected bearer-only antigravity response body: {bearer_only_response_body}; miss_reason={bearer_only_miss_reason}"
+    );
+    let bearer_only_response_text = strip_sse_keepalive_comments(&bearer_only_response_body);
+    let bearer_only_payload = bearer_only_response_text
+        .trim()
+        .strip_prefix("data: ")
+        .expect("response should start with sse data prefix");
+    let bearer_only_response_json: serde_json::Value =
+        serde_json::from_str(bearer_only_payload).expect("stream payload should parse");
+    assert_eq!(
+        bearer_only_response_json["responseId"],
+        "resp_antigravity_cli_local_stream_123"
+    );
+    assert_eq!(
+        bearer_only_response_json["response"]["candidates"][0]["content"]["parts"][0]["text"],
+        "Hello Antigravity Stream"
+    );
+
+    let seen_bearer_only_execution_runtime_request = seen_execution_runtime
+        .lock()
+        .expect("mutex should lock")
+        .clone()
+        .expect("bearer-only inbound execution runtime stream should be captured");
+    assert_eq!(
+        seen_bearer_only_execution_runtime_request.trace_id,
+        "trace-antigravity-v1internal-bearer-only-stream-789"
+    );
+    assert_eq!(
+        seen_bearer_only_execution_runtime_request.url,
+        "https://antigravity.googleapis.com/v1internal:streamGenerateContent?alt=sse"
+    );
+    assert_eq!(
+        seen_bearer_only_execution_runtime_request.authorization,
+        "Bearer refreshed-antigravity-cli-stream-access-token"
+    );
+    assert_eq!(
+        seen_bearer_only_execution_runtime_request.request_id,
+        "client-v1internal-request-789"
+    );
+    assert_eq!(
+        seen_bearer_only_execution_runtime_request.request_type,
+        "agent"
+    );
+    assert_eq!(seen_bearer_only_execution_runtime_request.contents_len, 1);
+    assert!(
+        (seen_bearer_only_execution_runtime_request.exact_temperature - 0.5).abs() < f64::EPSILON
+    );
+    assert!(!seen_bearer_only_execution_runtime_request.request_has_model);
+
+    *seen_execution_runtime.lock().expect("mutex should lock") = None;
+    let native_model_response = reqwest::Client::new()
+        .post(format!(
+            "{gateway_url}/v1internal:streamGenerateContent?alt=sse"
+        ))
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .header("authorization", "Bearer google-antigravity-access-token")
+        .header("user-agent", "antigravity/cli/1.0.2 linux/arm64")
+        .header(
+            TRACE_ID_HEADER,
+            "trace-antigravity-v1internal-native-model-stream-790",
+        )
+        .json(&json!({
+            "project": "client-side-project-should-not-leak",
+            "requestId": "client-v1internal-request-790",
+            "model": "gemini-3.1-flash-lite",
+            "userAgent": "antigravity",
+            "requestType": "agent",
+            "request": {
+                "contents": [{
+                    "role": "user",
+                    "parts": [{"text": "native antigravity model request"}]
+                }],
+                "generationConfig": {
+                    "temperature": 0.6,
+                    "thinkingConfig": {
+                        "includeThoughts": true
+                    }
+                },
+                "toolConfig": {
+                    "functionCallingConfig": {
+                        "mode": "NONE"
+                    }
+                }
+            }
+        }))
+        .send()
+        .await
+        .expect("native-model antigravity request should succeed");
+
+    let native_model_status = native_model_response.status();
+    let native_model_miss_reason = native_model_response
+        .headers()
+        .get(crate::constants::LOCAL_EXECUTION_RUNTIME_MISS_REASON_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("-")
+        .to_string();
+    let native_model_response_body = native_model_response
+        .text()
+        .await
+        .expect("body should read");
+    assert_eq!(
+        native_model_status,
+        StatusCode::OK,
+        "unexpected native-model antigravity response body: {native_model_response_body}; miss_reason={native_model_miss_reason}"
+    );
+    let native_model_response_text = strip_sse_keepalive_comments(&native_model_response_body);
+    let native_model_payload = native_model_response_text
+        .trim()
+        .strip_prefix("data: ")
+        .expect("response should start with sse data prefix");
+    let native_model_response_json: serde_json::Value =
+        serde_json::from_str(native_model_payload).expect("stream payload should parse");
+    assert_eq!(
+        native_model_response_json["responseId"],
+        "resp_antigravity_cli_local_stream_123"
+    );
+    assert_eq!(
+        native_model_response_json["response"]["candidates"][0]["content"]["parts"][0]["text"],
+        "Hello Antigravity Stream"
+    );
+
+    let seen_native_model_execution_runtime_request = seen_execution_runtime
+        .lock()
+        .expect("mutex should lock")
+        .clone()
+        .expect("native-model inbound execution runtime stream should be captured");
+    assert_eq!(
+        seen_native_model_execution_runtime_request.trace_id,
+        "trace-antigravity-v1internal-native-model-stream-790"
+    );
+    assert_eq!(
+        seen_native_model_execution_runtime_request.url,
+        "https://antigravity.googleapis.com/v1internal:streamGenerateContent?alt=sse"
+    );
+    assert_eq!(
+        seen_native_model_execution_runtime_request.authorization,
+        "Bearer refreshed-antigravity-cli-stream-access-token"
+    );
+    assert_eq!(
+        seen_native_model_execution_runtime_request.model,
+        "claude-sonnet-4-5"
+    );
+    assert_eq!(
+        seen_native_model_execution_runtime_request.request_id,
+        "client-v1internal-request-790"
+    );
+    assert!(
+        (seen_native_model_execution_runtime_request.exact_temperature - 0.6).abs() < f64::EPSILON
+    );
+    assert!(!seen_native_model_execution_runtime_request.request_has_model);
+
+    if std::env::var("AETHER_REAL_AGY_CLI_SMOKE").ok().as_deref() == Some("1") {
+        *seen_execution_runtime.lock().expect("mutex should lock") = None;
+        let log_path = std::env::var("AETHER_REAL_AGY_CLI_LOG")
+            .unwrap_or_else(|_| "/tmp/aether-real-agy-cli-smoke.log".to_string());
+        let workdir = std::env::var("AETHER_REAL_AGY_CLI_WORKDIR")
+            .unwrap_or_else(|_| "/tmp/aether-real-agy-cli-work".to_string());
+        std::fs::create_dir_all(&workdir).expect("agy smoke workdir should create");
+        let gateway_url_for_agy = gateway_url.clone();
+        let log_path_for_agy = log_path.clone();
+        let workdir_for_agy = workdir.clone();
+        let output = tokio::task::spawn_blocking(move || {
+            std::process::Command::new("agy")
+                .arg("--log-file")
+                .arg(&log_path_for_agy)
+                .arg("-p")
+                .arg("Reply with AETHER_CLOSED_LOOP_OK only.")
+                .arg("--print-timeout")
+                .arg("45s")
+                .env("AGY_CLI_DISABLE_AUTO_UPDATE", "true")
+                .env("CLOUD_CODE_URL", &gateway_url_for_agy)
+                .current_dir(&workdir_for_agy)
+                .output()
+        })
+        .await
+        .expect("agy smoke blocking task should join")
+        .expect("agy smoke process should spawn");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let agy_log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        let seen_agy_execution_runtime_snapshot = seen_execution_runtime
+            .lock()
+            .expect("mutex should lock")
+            .clone();
+        assert!(
+            output.status.success(),
+            "agy smoke failed: status={:?}\nseen_execution_runtime={seen_agy_execution_runtime_snapshot:?}\nstdout={stdout}\nstderr={stderr}\nlog={agy_log}",
+            output.status
+        );
+        assert!(
+            stdout.contains("Hello Antigravity Stream")
+                || stdout.contains("AETHER_CLOSED_LOOP_OK"),
+            "agy smoke stdout did not contain the local runtime response: stdout={stdout}\nstderr={stderr}\nlog={agy_log}"
+        );
+        let seen_agy_execution_runtime_request = seen_agy_execution_runtime_snapshot
+            .expect("real agy smoke should reach execution runtime");
+        assert_eq!(
+            seen_agy_execution_runtime_request.url,
+            "https://antigravity.googleapis.com/v1internal:streamGenerateContent?alt=sse"
+        );
+    }
+
+    let inbound_stored_candidates = request_candidate_repository
+        .list_by_request_id("trace-antigravity-v1internal-inbound-stream-456")
+        .await
+        .expect("inbound request candidate trace should read");
+    assert_eq!(inbound_stored_candidates.len(), 1);
+    assert_eq!(
+        inbound_stored_candidates[0].status,
+        RequestCandidateStatus::Success
+    );
 
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     assert!(

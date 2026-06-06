@@ -31,7 +31,7 @@ pub(super) async fn maybe_handle(
                     .into_response(),
             ));
         };
-        let Some(_provider) = state
+        let Some(provider) = state
             .read_provider_catalog_providers_by_ids(std::slice::from_ref(&provider_id))
             .await?
             .into_iter()
@@ -90,8 +90,12 @@ pub(super) async fn maybe_handle(
                         .ok()
                         .map(|duration| duration.as_secs())
                         .unwrap_or(0);
-                    Json(build_admin_provider_model_response(&created, now_unix_secs))
-                        .into_response()
+                    Json(build_admin_provider_model_response(
+                        &provider,
+                        &created,
+                        now_unix_secs,
+                    ))
+                    .into_response()
                 }
                 None => (
                     http::StatusCode::INTERNAL_SERVER_ERROR,

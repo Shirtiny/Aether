@@ -8,12 +8,10 @@ use aether_data::driver::postgres::{
     PostgresPoolConfig, PostgresTransactionOptions,
 };
 use aether_data::{DataLayerError, PostgresBackend};
-use aether_runtime_state::{
-    RedisClientConfig, RedisClientFactory, RedisLockRunner, RedisLockRunnerConfig,
-};
+use aether_runtime_state::{RedisClientConfig, RedisLockRunner, RedisLockRunnerConfig};
 use aether_testkit::{
-    init_test_runtime_for, reserve_local_port, ManagedPostgresServer, ManagedRedisServer,
-    TunnelHarness, TunnelHarnessConfig,
+    init_test_runtime_for, reserve_local_port, BenchmarkRuntimeSampler, BenchmarkRuntimeSnapshot,
+    ManagedPostgresServer, ManagedRedisServer, TunnelHarness, TunnelHarnessConfig,
 };
 use futures_util::{FutureExt, StreamExt};
 use serde::Serialize;
@@ -89,9 +87,11 @@ struct RecoverySummary {
     recovered_after_restart_ms: Option<u64>,
     p50_ms: u64,
     p95_ms: u64,
+    p99_ms: u64,
     max_ms: u64,
     mean_ms: u64,
     phase_counts: PhaseCounts,
+    runtime: BenchmarkRuntimeSnapshot,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -101,6 +101,7 @@ struct PostgresSlowQueryRecoveryReport {
     recovery_claim_succeeded: bool,
     recovery_claim_latency_ms: u64,
     recovery_claimed_items: usize,
+    runtime: BenchmarkRuntimeSnapshot,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -143,10 +144,14 @@ impl RecoveryCollector {
         }
     }
 
-    async fn summarize(&self, recovered_after_restart_ms: Option<u64>) -> RecoverySummary {
+    async fn summarize(
+        &self,
+        recovered_after_restart_ms: Option<u64>,
+        runtime: BenchmarkRuntimeSnapshot,
+    ) -> RecoverySummary {
         let mut latencies = self.latencies_ms.lock().await.clone();
         latencies.sort_unstable();
-        let (p50_ms, p95_ms, max_ms, mean_ms) = summarize_latencies(&latencies);
+        let (p50_ms, p95_ms, p99_ms, max_ms, mean_ms) = summarize_latencies(&latencies);
         let phase_counts = self.phase_counts.lock().await.clone();
         RecoverySummary {
             total_attempts: self.successful_attempts.load(Ordering::Acquire)
@@ -156,9 +161,11 @@ impl RecoveryCollector {
             recovered_after_restart_ms,
             p50_ms,
             p95_ms,
+            p99_ms,
             max_ms,
             mean_ms,
             phase_counts,
+            runtime,
         }
     }
 }
@@ -236,21 +243,21 @@ async fn benchmark_redis_restart_recovery(
     redis_server: Arc<Mutex<ManagedRedisServer>>,
     config: &FailureRecoveryBaselineConfig,
 ) -> Result<RecoverySummary, Box<dyn std::error::Error>> {
+    let mut runtime_sampler = BenchmarkRuntimeSampler::new();
     let redis_url = redis_server.lock().await.redis_url().to_string();
-    let factory = RedisClientFactory::new(RedisClientConfig {
+    let redis_config = RedisClientConfig {
         url: redis_url,
         key_prefix: Some(format!("aether-failure-recovery-{}", std::process::id())),
-    })?;
-    let client = factory.connect_lazy()?;
-    let keyspace = factory.config().keyspace();
-    let runner = RedisLockRunner::new(
-        client,
-        keyspace.clone(),
+    };
+    let keyspace = redis_config.keyspace();
+    let runner = RedisLockRunner::from_config(
+        redis_config,
         RedisLockRunnerConfig {
             command_timeout_ms: Some(250),
             default_ttl_ms: 1_000,
         },
-    )?;
+    )
+    .await?;
     let collector = Arc::new(RecoveryCollector::default());
     let next_attempt = Arc::new(AtomicUsize::new(0));
     let phase = Arc::new(AtomicUsize::new(0));
@@ -334,7 +341,10 @@ async fn benchmark_redis_restart_recovery(
         .map_err(std::io::Error::other)?;
 
     Ok(collector
-        .summarize(load_optional_atomic_u64(&recovered_after_restart_ms))
+        .summarize(
+            load_optional_atomic_u64(&recovered_after_restart_ms),
+            runtime_sampler.snapshot(),
+        )
         .await)
 }
 
@@ -342,6 +352,7 @@ async fn benchmark_postgres_slow_query_recovery(
     postgres_url: &str,
     config: &FailureRecoveryBaselineConfig,
 ) -> Result<PostgresSlowQueryRecoveryReport, Box<dyn std::error::Error>> {
+    let mut runtime_sampler = BenchmarkRuntimeSampler::new();
     let backend = PostgresBackend::from_config(PostgresPoolConfig {
         database_url: postgres_url.to_string(),
         min_connections: 1,
@@ -410,6 +421,7 @@ async fn benchmark_postgres_slow_query_recovery(
         recovery_claim_succeeded: !claimed_ids.is_empty(),
         recovery_claim_latency_ms,
         recovery_claimed_items: claimed_ids.len(),
+        runtime: runtime_sampler.snapshot(),
     })
 }
 
@@ -444,6 +456,7 @@ async fn bootstrap_failure_recovery_lease_table(
 async fn benchmark_tunnel_restart_recovery(
     config: &FailureRecoveryBaselineConfig,
 ) -> Result<RecoverySummary, Box<dyn std::error::Error>> {
+    let mut runtime_sampler = BenchmarkRuntimeSampler::new();
     let port = reserve_local_port()?;
     let tunnel_config = TunnelHarnessConfig::default();
     let initial_tunnel = TunnelHarness::start_on_port(tunnel_config.clone(), port).await?;
@@ -501,6 +514,12 @@ async fn benchmark_tunnel_restart_recovery(
                         .map_err(|err| format!("failed to build x-node-id header: {err}"))?,
                 );
                 request.headers_mut().insert(
+                    aether_contracts::tunnel::TUNNEL_PROTOCOL_VERSION_HEADER,
+                    aether_contracts::tunnel::CURRENT_TUNNEL_PROTOCOL_VERSION_STR
+                        .parse()
+                        .expect("protocol version header value should be valid"),
+                );
+                request.headers_mut().insert(
                     "x-node-name",
                     format!("recovery-node-{worker_index}-{current}")
                         .parse()
@@ -556,7 +575,10 @@ async fn benchmark_tunnel_restart_recovery(
         .map_err(std::io::Error::other)?;
 
     Ok(collector
-        .summarize(load_optional_atomic_u64(&recovered_after_restart_ms))
+        .summarize(
+            load_optional_atomic_u64(&recovered_after_restart_ms),
+            runtime_sampler.snapshot(),
+        )
         .await)
 }
 
@@ -596,15 +618,16 @@ fn load_optional_atomic_u64(value: &AtomicU64) -> Option<u64> {
     }
 }
 
-fn summarize_latencies(latencies: &[u64]) -> (u64, u64, u64, u64) {
+fn summarize_latencies(latencies: &[u64]) -> (u64, u64, u64, u64, u64) {
     if latencies.is_empty() {
-        return (0, 0, 0, 0);
+        return (0, 0, 0, 0, 0);
     }
     let max_ms = *latencies.last().unwrap_or(&0);
     let mean_ms = latencies.iter().sum::<u64>() / latencies.len() as u64;
     let p50_ms = percentile(latencies, 50);
     let p95_ms = percentile(latencies, 95);
-    (p50_ms, p95_ms, max_ms, mean_ms)
+    let p99_ms = percentile(latencies, 99);
+    (p50_ms, p95_ms, p99_ms, max_ms, mean_ms)
 }
 
 fn percentile(latencies: &[u64], percentile: u8) -> u64 {

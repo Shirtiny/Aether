@@ -642,6 +642,46 @@ pub struct UserExportListQuery {
     pub is_active: Option<bool>,
     pub search: Option<String>,
     pub group_id: Option<String>,
+    pub sort_by: UserExportSortBy,
+    pub sort_order: UserExportSortOrder,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UserExportSortBy {
+    #[default]
+    Id,
+    CreatedAt,
+}
+
+impl UserExportSortBy {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "created_at" => Some(Self::CreatedAt),
+            "id" => Some(Self::Id),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UserExportSortOrder {
+    #[default]
+    Asc,
+    Desc,
+}
+
+impl UserExportSortOrder {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "asc" => Some(Self::Asc),
+            "desc" => Some(Self::Desc),
+            _ => None,
+        }
+    }
+
+    pub fn is_desc(self) -> bool {
+        matches!(self, Self::Desc)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -668,6 +708,11 @@ pub trait UserReadRepository: Send + Sync {
         &self,
         query: &UserExportListQuery,
     ) -> Result<Vec<StoredUserExportRow>, crate::DataLayerError>;
+
+    async fn count_export_users(
+        &self,
+        query: &UserExportListQuery,
+    ) -> Result<u64, crate::DataLayerError>;
 
     async fn summarize_export_users(&self) -> Result<UserExportSummary, crate::DataLayerError>;
 

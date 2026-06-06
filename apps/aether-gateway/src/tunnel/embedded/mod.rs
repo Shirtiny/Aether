@@ -17,6 +17,8 @@ use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Json};
 use axum::routing::{get, post};
 use axum::Router;
+use base64::Engine as _;
+use dashmap::DashMap;
 use tracing::warn;
 
 use crate::{data::GatewayDataState, middleware};
@@ -34,6 +36,7 @@ pub struct AppState {
     data: Arc<GatewayDataState>,
     request_gate: Option<Arc<ConcurrencyGate>>,
     distributed_request_gate: Option<Arc<RuntimeSemaphore>>,
+    secure_tunnel_keys: Arc<DashMap<String, String>>,
 }
 
 #[derive(Debug)]
@@ -55,7 +58,46 @@ impl AppState {
             data: Arc::new(GatewayDataState::disabled()),
             request_gate: None,
             distributed_request_gate: None,
+            secure_tunnel_keys: Arc::new(DashMap::new()),
         }
+    }
+
+    pub(crate) fn register_secure_tunnel_key(
+        &self,
+        node_id: impl Into<String>,
+        key: impl Into<String>,
+    ) {
+        self.secure_tunnel_keys.insert(node_id.into(), key.into());
+    }
+
+    pub(crate) fn secure_tunnel_key(&self, node_id: &str) -> Option<String> {
+        self.secure_tunnel_keys
+            .get(node_id)
+            .map(|entry| entry.value().clone())
+    }
+
+    async fn secure_tunnel_key_for_node(&self, node_id: &str) -> Option<String> {
+        if let Some(key) = self.secure_tunnel_key(node_id) {
+            return Some(key);
+        }
+        let key = self
+            .data
+            .find_proxy_node(node_id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|node| {
+                node.proxy_metadata.and_then(|metadata| {
+                    metadata
+                        .pointer("/tunnel_security/encryption_key")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string)
+                })
+            });
+        if let Some(key) = key.as_ref() {
+            self.register_secure_tunnel_key(node_id.to_string(), key.clone());
+        }
+        key
     }
 
     pub(crate) fn with_data(mut self, data: Arc<GatewayDataState>) -> Self {
@@ -203,19 +245,51 @@ pub async fn ws_proxy(
         .trim()
         .to_string();
 
-    let node_name = headers
-        .get("x-node-name")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or(&node_id)
-        .trim()
-        .to_string();
+    let node_name = resolve_proxy_node_name(&headers, &node_id);
 
     let max_streams = resolve_proxy_max_streams(&headers, state.max_streams);
+    let protocol_version = resolve_proxy_protocol_version(&headers);
+    let tunnel_security = headers
+        .get(aether_contracts::tunnel_security::TUNNEL_SECURITY_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let security_session = headers
+        .get(aether_contracts::tunnel_security::TUNNEL_SECURITY_SESSION_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
 
     if node_id.is_empty() {
         warn!("proxy connection rejected: missing X-Node-ID header");
         return axum::http::StatusCode::BAD_REQUEST.into_response();
     }
+    let stored_security_key = state.secure_tunnel_key_for_node(&node_id).await;
+    let (security_key, security_session) = match tunnel_security.as_deref() {
+        Some(aether_contracts::tunnel_security::TUNNEL_SECURITY_NON_TLS_REQUIRED) => {
+            match stored_security_key {
+                Some(key) => {
+                    let Some(session) = security_session else {
+                        warn!(node_id = %node_id, "secure tunnel requested without a security session");
+                        return axum::http::StatusCode::BAD_REQUEST.into_response();
+                    };
+                    (Some(key), session)
+                }
+                None => {
+                    warn!(node_id = %node_id, "secure tunnel requested but no PSK is registered");
+                    return axum::http::StatusCode::UNAUTHORIZED.into_response();
+                }
+            }
+        }
+        Some(_) => return axum::http::StatusCode::BAD_REQUEST.into_response(),
+        None if stored_security_key.is_some() => {
+            warn!(node_id = %node_id, "proxy connection rejected: stored secure tunnel key requires encrypted frames");
+            return axum::http::StatusCode::UNAUTHORIZED.into_response();
+        }
+        None => (None, String::new()),
+    };
 
     let request_permit = match state.try_acquire_request_permit().await {
         Ok(permit) => permit,
@@ -251,6 +325,9 @@ pub async fn ws_proxy(
                     node_id,
                     node_name,
                     max_streams,
+                    protocol_version,
+                    security_key,
+                    security_session,
                     state.proxy_conn_cfg,
                 )
                 .await
@@ -268,11 +345,49 @@ fn resolve_proxy_max_streams(headers: &HeaderMap, fallback: usize) -> usize {
         .clamp(1, 2048)
 }
 
+fn resolve_proxy_node_name(headers: &HeaderMap, node_id: &str) -> String {
+    if let Some(decoded) = headers
+        .get(aether_contracts::tunnel::TUNNEL_NODE_NAME_B64_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(value.trim())
+                .ok()
+        })
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty() && value.chars().count() <= 100)
+    {
+        return decoded;
+    }
+
+    headers
+        .get("x-node-name")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(node_id)
+        .to_string()
+}
+
+fn resolve_proxy_protocol_version(headers: &HeaderMap) -> u8 {
+    headers
+        .get(aether_contracts::tunnel::TUNNEL_PROTOCOL_VERSION_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u8>().ok())
+        .filter(|value| *value >= 1)
+        .map(|value| value.min(aether_contracts::tunnel::CURRENT_TUNNEL_PROTOCOL_VERSION))
+        .unwrap_or(1)
+}
+
 #[cfg(test)]
 mod tests {
     use axum::http::{HeaderMap, HeaderValue};
+    use base64::Engine as _;
 
-    use super::resolve_proxy_max_streams;
+    use super::{
+        resolve_proxy_max_streams, resolve_proxy_node_name, resolve_proxy_protocol_version,
+    };
 
     #[test]
     fn proxy_max_streams_honors_small_advertised_capacity() {
@@ -288,5 +403,53 @@ mod tests {
         headers.insert("x-tunnel-max-streams", HeaderValue::from_static("9999"));
 
         assert_eq!(resolve_proxy_max_streams(&headers, 128), 2048);
+    }
+
+    #[test]
+    fn proxy_protocol_version_defaults_to_v1_when_header_missing() {
+        let headers = HeaderMap::new();
+        assert_eq!(resolve_proxy_protocol_version(&headers), 1);
+    }
+
+    #[test]
+    fn proxy_protocol_version_reads_advertised_version() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            aether_contracts::tunnel::TUNNEL_PROTOCOL_VERSION_HEADER,
+            HeaderValue::from_static("2"),
+        );
+
+        assert_eq!(resolve_proxy_protocol_version(&headers), 2);
+    }
+
+    #[test]
+    fn proxy_node_name_reads_legacy_ascii_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-node-name", HeaderValue::from_static("edge-1"));
+
+        assert_eq!(resolve_proxy_node_name(&headers, "node-1"), "edge-1");
+    }
+
+    #[test]
+    fn proxy_node_name_decodes_base64_header() {
+        let mut headers = HeaderMap::new();
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("日本节点");
+        headers.insert(
+            aether_contracts::tunnel::TUNNEL_NODE_NAME_B64_HEADER,
+            HeaderValue::from_str(&encoded).expect("encoded header value should parse"),
+        );
+
+        assert_eq!(resolve_proxy_node_name(&headers, "node-1"), "日本节点");
+    }
+
+    #[test]
+    fn proxy_node_name_falls_back_to_node_id_for_invalid_base64() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            aether_contracts::tunnel::TUNNEL_NODE_NAME_B64_HEADER,
+            HeaderValue::from_static("not valid"),
+        );
+
+        assert_eq!(resolve_proxy_node_name(&headers, "node-1"), "node-1");
     }
 }

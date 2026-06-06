@@ -16,18 +16,21 @@ pub use crate::contracts::{
     GEMINI_CHAT_SYNC_SUCCESS_REPORT_KIND, GEMINI_CLI_STREAM_PLAN_KIND,
     GEMINI_CLI_STREAM_SUCCESS_REPORT_KIND, GEMINI_CLI_SYNC_ERROR_REPORT_KIND,
     GEMINI_CLI_SYNC_FINALIZE_REPORT_KIND, GEMINI_CLI_SYNC_PLAN_KIND,
-    GEMINI_CLI_SYNC_SUCCESS_REPORT_KIND, GEMINI_FILES_DELETE_PLAN_KIND,
+    GEMINI_CLI_SYNC_SUCCESS_REPORT_KIND, GEMINI_EMBEDDING_SYNC_PLAN_KIND,
+    GEMINI_EMBEDDING_SYNC_SUCCESS_REPORT_KIND, GEMINI_FILES_DELETE_PLAN_KIND,
     GEMINI_FILES_DOWNLOAD_PLAN_KIND, GEMINI_FILES_GET_PLAN_KIND, GEMINI_FILES_LIST_PLAN_KIND,
     GEMINI_FILES_UPLOAD_PLAN_KIND, GEMINI_VIDEO_CANCEL_SYNC_PLAN_KIND,
     GEMINI_VIDEO_CREATE_SYNC_FINALIZE_REPORT_KIND, GEMINI_VIDEO_CREATE_SYNC_PLAN_KIND,
     OPENAI_CHAT_STREAM_PLAN_KIND, OPENAI_CHAT_STREAM_SUCCESS_REPORT_KIND,
     OPENAI_CHAT_SYNC_ERROR_REPORT_KIND, OPENAI_CHAT_SYNC_FINALIZE_REPORT_KIND,
     OPENAI_CHAT_SYNC_PLAN_KIND, OPENAI_CHAT_SYNC_SUCCESS_REPORT_KIND,
-    OPENAI_EMBEDDING_SYNC_PLAN_KIND, OPENAI_IMAGE_STREAM_PLAN_KIND,
-    OPENAI_IMAGE_STREAM_SUCCESS_REPORT_KIND, OPENAI_IMAGE_SYNC_ERROR_REPORT_KIND,
-    OPENAI_IMAGE_SYNC_FINALIZE_REPORT_KIND, OPENAI_IMAGE_SYNC_PLAN_KIND,
-    OPENAI_IMAGE_SYNC_SUCCESS_REPORT_KIND, OPENAI_RERANK_SYNC_PLAN_KIND,
-    OPENAI_RESPONSES_COMPACT_STREAM_PLAN_KIND, OPENAI_RESPONSES_COMPACT_STREAM_SUCCESS_REPORT_KIND,
+    OPENAI_EMBEDDING_SYNC_ERROR_REPORT_KIND, OPENAI_EMBEDDING_SYNC_FINALIZE_REPORT_KIND,
+    OPENAI_EMBEDDING_SYNC_PLAN_KIND, OPENAI_EMBEDDING_SYNC_SUCCESS_REPORT_KIND,
+    OPENAI_IMAGE_STREAM_PLAN_KIND, OPENAI_IMAGE_STREAM_SUCCESS_REPORT_KIND,
+    OPENAI_IMAGE_SYNC_ERROR_REPORT_KIND, OPENAI_IMAGE_SYNC_FINALIZE_REPORT_KIND,
+    OPENAI_IMAGE_SYNC_PLAN_KIND, OPENAI_IMAGE_SYNC_SUCCESS_REPORT_KIND,
+    OPENAI_RERANK_SYNC_PLAN_KIND, OPENAI_RESPONSES_COMPACT_STREAM_PLAN_KIND,
+    OPENAI_RESPONSES_COMPACT_STREAM_SUCCESS_REPORT_KIND,
     OPENAI_RESPONSES_COMPACT_SYNC_ERROR_REPORT_KIND,
     OPENAI_RESPONSES_COMPACT_SYNC_FINALIZE_REPORT_KIND, OPENAI_RESPONSES_COMPACT_SYNC_PLAN_KIND,
     OPENAI_RESPONSES_COMPACT_SYNC_SUCCESS_REPORT_KIND, OPENAI_RESPONSES_STREAM_PLAN_KIND,
@@ -74,7 +77,7 @@ pub use crate::formats::shared::model_directives::{
     apply_model_directive_overrides_from_request, claude_model_uses_adaptive_effort,
     extract_gemini_model_from_path, gemini_model_uses_thinking_level, model_directive_base_model,
     normalize_model_directive_model, parse_model_directive, ModelDirective, ModelOverride,
-    ReasoningEffort,
+    ReasoningEffort, ServiceTier,
 };
 pub use crate::formats::shared::passthrough::{
     resolve_stream_spec as resolve_local_same_format_stream_spec,
@@ -139,18 +142,22 @@ pub use crate::formats::{
         resolve_stream_spec as resolve_gemini_stream_spec,
         resolve_sync_spec as resolve_gemini_sync_spec,
     },
-    openai::responses::{
-        codex::{
-            apply_codex_openai_responses_chat_body_edits,
-            apply_codex_openai_responses_special_body_edits,
-            apply_codex_openai_responses_special_headers,
-            apply_openai_responses_compact_special_body_edits, CODEX_OPENAI_IMAGE_DEFAULT_MODEL,
-            CODEX_OPENAI_IMAGE_DEFAULT_OUTPUT_FORMAT, CODEX_OPENAI_IMAGE_DEFAULT_VARIATION_MODEL,
-            CODEX_OPENAI_IMAGE_DEFAULT_VARIATION_PROMPT, CODEX_OPENAI_IMAGE_INTERNAL_MODEL,
-        },
-        spec::{
-            resolve_stream_spec as resolve_openai_responses_stream_spec,
-            resolve_sync_spec as resolve_openai_responses_sync_spec, LocalOpenAiResponsesSpec,
+    openai::{
+        embedding::spec::resolve_sync_spec as resolve_openai_embedding_sync_spec,
+        responses::{
+            codex::{
+                apply_codex_openai_responses_chat_body_edits,
+                apply_codex_openai_responses_special_body_edits,
+                apply_codex_openai_responses_special_headers,
+                apply_openai_responses_compact_special_body_edits,
+                CODEX_OPENAI_IMAGE_DEFAULT_MODEL, CODEX_OPENAI_IMAGE_DEFAULT_OUTPUT_FORMAT,
+                CODEX_OPENAI_IMAGE_DEFAULT_VARIATION_MODEL,
+                CODEX_OPENAI_IMAGE_DEFAULT_VARIATION_PROMPT, CODEX_OPENAI_IMAGE_INTERNAL_MODEL,
+            },
+            spec::{
+                resolve_stream_spec as resolve_openai_responses_stream_spec,
+                resolve_sync_spec as resolve_openai_responses_sync_spec, LocalOpenAiResponsesSpec,
+            },
         },
     },
     shared::{
@@ -168,6 +175,7 @@ pub use crate::formats::{
             build_local_openai_chat_request_body_with_model_directives,
             build_local_openai_responses_request_body,
             build_local_openai_responses_request_body_with_model_directives,
+            is_claude_messages_shaped_body_on_openai_chat_endpoint,
         },
     },
 };
@@ -178,11 +186,13 @@ pub use crate::formats::{
     },
     openai::image::{
         request::{
-            build_chatgpt_web_image_request_body, build_openai_image_provider_request_body,
-            default_model_for_openai_image_operation, is_openai_image_stream_request,
-            normalize_openai_image_request, openai_image_operation_from_path,
+            build_chatgpt_web_image_request_body, build_openai_image_api_provider_request_body,
+            build_openai_image_provider_request_body, default_model_for_openai_image_operation,
+            is_openai_image_stream_request, normalize_openai_image_request,
+            normalize_openai_image_request_with_options, openai_image_operation_from_path,
             resolve_requested_openai_image_model_for_request, ChatGptWebImageRequestError,
-            NormalizedOpenAiImageRequest, OpenAiImageOperation, OpenAiImageResponseFormat,
+            NormalizedOpenAiImageRequest, OpenAiImageNormalizeOptions, OpenAiImageOperation,
+            OpenAiImageResponseFormat,
         },
         spec::{
             resolve_stream_spec as resolve_local_image_stream_spec,
@@ -202,10 +212,10 @@ pub use crate::provider_compat::kiro_stream::{
     KiroToClaudeCliStreamState, KIRO_MAX_THINKING_BUFFER,
 };
 pub use crate::provider_compat::private_envelope::{
-    maybe_build_provider_private_stream_normalizer, normalize_provider_private_report_context,
-    normalize_provider_private_response_value, provider_private_response_allows_sync_finalize,
-    stream_body_contains_error_event, transform_provider_private_stream_line,
-    ProviderPrivateStreamNormalizer,
+    extract_provider_private_stream_error_body, maybe_build_provider_private_stream_normalizer,
+    normalize_provider_private_report_context, normalize_provider_private_response_value,
+    provider_private_response_allows_sync_finalize, stream_body_contains_error_event,
+    transform_provider_private_stream_line, ProviderPrivateStreamNormalizer,
 };
 pub use crate::provider_compat::surfaces::{
     provider_adaptation_allows_sync_finalize_envelope, provider_adaptation_anchor_api_format,

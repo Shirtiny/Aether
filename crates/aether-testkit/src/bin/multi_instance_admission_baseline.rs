@@ -8,10 +8,11 @@ use aether_runtime_state::{
     RedisClientConfig, RuntimeSemaphore, RuntimeSemaphoreConfig, RuntimeState,
 };
 use aether_testkit::{
-    init_test_runtime_for, run_multi_url_http_load_probe, ExecutionRuntimeHarness,
-    ExecutionRuntimeHarnessConfig, GatewayHarness, GatewayHarnessConfig, HttpLoadProbeConfig,
-    HttpLoadProbeResponseMode, ManagedRedisServer, MultiUrlHttpLoadProbeResult, SpawnedServer,
-    TunnelHarness, TunnelHarnessConfig,
+    init_test_runtime_for, run_multi_url_http_load_probe, BenchmarkRuntimeSampler,
+    BenchmarkRuntimeSnapshot, ExecutionRuntimeHarness, ExecutionRuntimeHarnessConfig,
+    GatewayHarness, GatewayHarnessConfig, HttpLoadProbeConfig, HttpLoadProbeResponseMode,
+    ManagedRedisServer, MultiUrlHttpLoadProbeResult, SpawnedServer, TunnelHarness,
+    TunnelHarnessConfig,
 };
 use axum::body::to_bytes;
 use axum::extract::Request;
@@ -85,9 +86,11 @@ struct WebSocketAdmissionProbeResult {
     successful_attempts: usize,
     p50_ms: u64,
     p95_ms: u64,
+    p99_ms: u64,
     max_ms: u64,
     mean_ms: u64,
     status_counts: BTreeMap<u16, usize>,
+    runtime: BenchmarkRuntimeSnapshot,
 }
 
 #[tokio::main]
@@ -443,6 +446,7 @@ async fn run_tunnel_proxy_connection_probe(
     if urls.is_empty() {
         return Err("tunnel proxy connection probe requires at least one target url".to_string());
     }
+    let mut runtime_sampler = BenchmarkRuntimeSampler::new();
     let next_attempt = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let latencies_ms = Arc::new(tokio::sync::Mutex::new(Vec::with_capacity(
         config.tunnel_attempts,
@@ -488,6 +492,12 @@ async fn run_tunnel_proxy_connection_probe(
                     format!("baseline-node-{worker_index}-{current}")
                         .parse()
                         .map_err(|err| format!("failed to build x-node-id header: {err}"))?,
+                );
+                request.headers_mut().insert(
+                    aether_contracts::tunnel::TUNNEL_PROTOCOL_VERSION_HEADER,
+                    aether_contracts::tunnel::CURRENT_TUNNEL_PROTOCOL_VERSION_STR
+                        .parse()
+                        .expect("protocol version header value should be valid"),
                 );
                 request.headers_mut().insert(
                     "x-node-name",
@@ -557,7 +567,7 @@ async fn run_tunnel_proxy_connection_probe(
 
     let mut latencies = latencies_ms.lock().await.clone();
     latencies.sort_unstable();
-    let (p50_ms, p95_ms, max_ms, mean_ms) = summarize_latencies(&latencies);
+    let (p50_ms, p95_ms, p99_ms, max_ms, mean_ms) = summarize_latencies(&latencies);
 
     let target_attempt_counts = target_attempt_counts.lock().await.clone();
     let status_counts = status_counts.lock().await.clone();
@@ -572,21 +582,24 @@ async fn run_tunnel_proxy_connection_probe(
         successful_attempts: successful_attempts.load(std::sync::atomic::Ordering::Acquire),
         p50_ms,
         p95_ms,
+        p99_ms,
         max_ms,
         mean_ms,
         status_counts,
+        runtime: runtime_sampler.snapshot(),
     })
 }
 
-fn summarize_latencies(latencies: &[u64]) -> (u64, u64, u64, u64) {
+fn summarize_latencies(latencies: &[u64]) -> (u64, u64, u64, u64, u64) {
     if latencies.is_empty() {
-        return (0, 0, 0, 0);
+        return (0, 0, 0, 0, 0);
     }
     let max_ms = *latencies.last().unwrap_or(&0);
     let mean_ms = latencies.iter().sum::<u64>() / latencies.len() as u64;
     let p50_ms = percentile(latencies, 50);
     let p95_ms = percentile(latencies, 95);
-    (p50_ms, p95_ms, max_ms, mean_ms)
+    let p99_ms = percentile(latencies, 99);
+    (p50_ms, p95_ms, p99_ms, max_ms, mean_ms)
 }
 
 fn percentile(latencies: &[u64], percentile: u8) -> u64 {

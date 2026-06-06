@@ -71,6 +71,7 @@ SELECT
     OR COALESCE(gm.config->'api_formats' @> '["jina:embedding"]'::jsonb, FALSE)
     OR COALESCE(gm.config->'api_formats' @> '["gemini:embedding"]'::jsonb, FALSE)
     OR COALESCE(gm.config->'api_formats' @> '["doubao:embedding"]'::jsonb, FALSE)
+    OR COALESCE(gm.config->'api_formats' @> '["aliyun:multimodal_embedding"]'::jsonb, FALSE)
     OR LOWER(COALESCE(m.config->>'embedding', 'false')) = 'true'
     OR LOWER(COALESCE(m.config->>'model_type', '')) = 'embedding'
     OR LOWER(COALESCE(m.config->>'type', '')) = 'embedding'
@@ -80,6 +81,7 @@ SELECT
     OR COALESCE(m.config::jsonb->'api_formats' @> '["jina:embedding"]'::jsonb, FALSE)
     OR COALESCE(m.config::jsonb->'api_formats' @> '["gemini:embedding"]'::jsonb, FALSE)
     OR COALESCE(m.config::jsonb->'api_formats' @> '["doubao:embedding"]'::jsonb, FALSE)
+    OR COALESCE(m.config::jsonb->'api_formats' @> '["aliyun:multimodal_embedding"]'::jsonb, FALSE)
   ) AS supports_embedding,
   m.is_active
 FROM models m
@@ -664,6 +666,8 @@ RETURNING id
         &self,
         record: &CreateAdminGlobalModelRecord,
     ) -> Result<Option<StoredAdminGlobalModel>, DataLayerError> {
+        let usage_count =
+            optional_admin_global_model_usage_count_i64(record.usage_count)?.unwrap_or_default();
         let inserted = sqlx::query(
             r#"
 INSERT INTO global_models (
@@ -690,7 +694,7 @@ RETURNING id
         .bind(record.default_price_per_request)
         .bind(record.default_tiered_pricing.clone())
         .bind(record.supported_capabilities.clone())
-        .bind(0_i32)
+        .bind(usage_count)
         .bind(record.config.clone())
         .fetch_optional(&self.pool)
         .await
@@ -707,6 +711,7 @@ RETURNING id
         &self,
         record: &UpdateAdminGlobalModelRecord,
     ) -> Result<Option<StoredAdminGlobalModel>, DataLayerError> {
+        let usage_count = optional_admin_global_model_usage_count_i64(record.usage_count)?;
         let updated = sqlx::query(
             r#"
 UPDATE global_models
@@ -717,6 +722,7 @@ SET
   default_tiered_pricing = $5,
   supported_capabilities = $6,
   config = $7,
+  usage_count = COALESCE($8, usage_count),
   updated_at = NOW()
 WHERE id = $1
 RETURNING id
@@ -729,6 +735,7 @@ RETURNING id
         .bind(record.default_tiered_pricing.clone())
         .bind(record.supported_capabilities.clone())
         .bind(record.config.clone())
+        .bind(usage_count)
         .fetch_optional(&self.pool)
         .await
         .map_postgres_err()?;
@@ -1201,6 +1208,20 @@ fn map_provider_active_global_model_row(
         row.try_get("provider_id").map_postgres_err()?,
         row.try_get("global_model_id").map_postgres_err()?,
     )
+}
+
+fn optional_admin_global_model_usage_count_i64(
+    value: Option<u64>,
+) -> Result<Option<i64>, DataLayerError> {
+    value
+        .map(|value| {
+            i64::try_from(value).map_err(|_| {
+                DataLayerError::InvalidInput(
+                    "global_models.usage_count exceeds i64 range".to_string(),
+                )
+            })
+        })
+        .transpose()
 }
 
 #[cfg(test)]

@@ -102,6 +102,47 @@ describe('useUsageData', () => {
     expect(totalRecords.value).toBe(1)
   })
 
+  it('keeps locally resolved failure fields when a stale active record refreshes', async () => {
+    const isAdminPage = ref(true)
+    const { loadRecords, currentRecords } = useUsageData({ isAdminPage })
+    const dateRange = { preset: 'today', tz_offset_minutes: 0 }
+
+    getAllUsageRecordsMock.mockResolvedValueOnce({
+      records: [buildUsageRecord({
+        status: 'failed',
+        status_code: 524,
+        error_message: 'error code: 524',
+        response_time_ms: 125_000,
+      })],
+      total: 1,
+      limit: 20,
+      offset: 0,
+    })
+
+    await loadRecords({ page: 1, pageSize: 20 }, undefined, dateRange)
+
+    getAllUsageRecordsMock.mockResolvedValueOnce({
+      records: [buildUsageRecord({
+        status: 'pending',
+        status_code: undefined,
+        error_message: undefined,
+        response_time_ms: null,
+      })],
+      total: 1,
+      limit: 20,
+      offset: 0,
+    })
+
+    await loadRecords({ page: 1, pageSize: 20 }, undefined, dateRange)
+
+    expect(currentRecords.value[0]).toMatchObject({
+      status: 'failed',
+      status_code: 524,
+      error_message: 'error code: 524',
+      response_time_ms: 125_000,
+    })
+  })
+
   it('continues loading admin breakdowns when the summary request fails', async () => {
     const isAdminPage = ref(true)
     const {
@@ -129,6 +170,9 @@ describe('useUsageData', () => {
     ])
     getUsageByProviderMock.mockResolvedValueOnce([
       {
+        provider_id: 'provider-openai',
+        provider_key: 'provider-openai',
+        provider_identity_source: 'provider_id',
         provider: 'OpenAI',
         request_count: 3,
         total_tokens: 300,
@@ -159,6 +203,11 @@ describe('useUsageData', () => {
     })
     expect(modelStats.value).toHaveLength(1)
     expect(providerStats.value).toHaveLength(1)
+    expect(providerStats.value[0]).toMatchObject({
+      providerId: 'provider-openai',
+      providerKey: 'provider-openai',
+      providerIdentitySource: 'provider_id',
+    })
     expect(apiFormatStats.value).toHaveLength(1)
     expect(availableModels.value).toEqual(['gpt-5'])
     expect(availableProviders.value).toEqual(['OpenAI'])
@@ -217,6 +266,53 @@ describe('useUsageData', () => {
     await loadStats(dateRange)
 
     expect(providerStats.value.map(item => item.provider)).toEqual(['OpenAI'])
+    expect(availableProviders.value).toEqual(['OpenAI'])
+  })
+
+  it('keeps previous admin provider stats when a background refresh fails', async () => {
+    const isAdminPage = ref(true)
+    const { loadStats, providerStats, availableProviders } = useUsageData({ isAdminPage })
+    const dateRange = { preset: 'last7days', tz_offset_minutes: 0 }
+
+    getUsageStatsMock.mockResolvedValueOnce({
+      total_requests: 3,
+      total_tokens: 300,
+      total_cost: 1,
+      avg_response_time: 0,
+    })
+    getUsageByProviderMock.mockResolvedValueOnce([
+      {
+        provider: 'OpenAI',
+        request_count: 3,
+        total_tokens: 300,
+        total_cost: 1.23,
+        actual_cost: 1.5,
+        avg_response_time_ms: 1250,
+        success_rate: 100,
+      },
+    ])
+
+    await loadStats(dateRange)
+
+    getUsageStatsMock.mockResolvedValueOnce({
+      total_requests: 4,
+      total_tokens: 400,
+      total_cost: 2,
+      avg_response_time: 0,
+    })
+    getUsageByProviderMock.mockRejectedValueOnce({
+      response: { status: 500 },
+      message: 'provider aggregation failed',
+    })
+
+    const hadFailure = await loadStats(dateRange, { preserveOnFailure: true })
+
+    expect(hadFailure).toBe(true)
+    expect(providerStats.value).toHaveLength(1)
+    expect(providerStats.value[0]).toMatchObject({
+      provider: 'OpenAI',
+      requests: 3,
+    })
     expect(availableProviders.value).toEqual(['OpenAI'])
   })
 })

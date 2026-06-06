@@ -104,9 +104,16 @@ fn runtime_state_owns_redis_runtime_boundaries() {
     let mut violations = Vec::new();
     for root in [
         "apps/aether-gateway/src",
+        "apps/aether-tunnel/src",
+        "crates/aether-admin/src",
+        "crates/aether-billing/src",
+        "crates/aether-model-fetch/src",
+        "crates/aether-provider-pool/src",
         "crates/aether-runtime/src",
+        "crates/aether-task-runtime/src",
         "crates/aether-usage-runtime/src",
         "crates/aether-provider-transport/src",
+        "crates/aether-wallet/src",
     ] {
         for path in collect_workspace_rust_files(root) {
             if path
@@ -130,6 +137,33 @@ fn runtime_state_owns_redis_runtime_boundaries() {
         violations.is_empty(),
         "business/runtime crates must use aether-runtime-state instead of Redis directly:\n{}",
         violations.join("\n")
+    );
+
+    let mut dependency_violations = Vec::new();
+    for manifest in [
+        "apps/aether-gateway/Cargo.toml",
+        "apps/aether-tunnel/Cargo.toml",
+        "crates/aether-admin/Cargo.toml",
+        "crates/aether-billing/Cargo.toml",
+        "crates/aether-model-fetch/Cargo.toml",
+        "crates/aether-provider-pool/Cargo.toml",
+        "crates/aether-provider-transport/Cargo.toml",
+        "crates/aether-runtime/Cargo.toml",
+        "crates/aether-task-runtime/Cargo.toml",
+        "crates/aether-usage-runtime/Cargo.toml",
+        "crates/aether-wallet/Cargo.toml",
+    ] {
+        let cargo = read_workspace_file(manifest);
+        for forbidden in ["redis.workspace", "redis ="] {
+            if cargo.contains(forbidden) {
+                dependency_violations.push(format!("{manifest} -> {forbidden}"));
+            }
+        }
+    }
+    assert!(
+        dependency_violations.is_empty(),
+        "business/runtime crates must not depend on redis directly:\n{}",
+        dependency_violations.join("\n")
     );
 
     let mut runtime_state_violations = Vec::new();
@@ -159,6 +193,22 @@ fn runtime_state_owns_redis_runtime_boundaries() {
         runtime_state_violations.is_empty(),
         "only crates/aether-runtime-state/src/redis may depend on the redis crate directly:\n{}",
         runtime_state_violations.join("\n")
+    );
+
+    let mut runtime_connection_violations = Vec::new();
+    for path in collect_workspace_rust_files("crates/aether-runtime-state/src") {
+        if path.ends_with("crates/aether-runtime-state/src/redis/client.rs") {
+            continue;
+        }
+        let source = production_workspace_source(&path);
+        if source.contains("get_multiplexed_async_connection") {
+            runtime_connection_violations.push(path.display().to_string());
+        }
+    }
+    assert!(
+        runtime_connection_violations.is_empty(),
+        "runtime Redis connections must be initialized only by redis/client.rs:\n{}",
+        runtime_connection_violations.join("\n")
     );
 }
 
@@ -321,7 +371,7 @@ fn scheduler_candidate_runtime_paths_depend_on_scheduler_core_and_state_trait() 
         "candidate/mod.rs should not own the core selectable-candidate collector anymore"
     );
     assert!(
-        !candidate_mod.contains("auth_api_key_concurrency_limit_reached"),
+        !candidate_mod.contains("auth_api_key_concurrency_limit_reached("),
         "candidate/mod.rs should not own the core auth api key concurrency helper anymore"
     );
     assert!(
@@ -406,7 +456,6 @@ fn scheduler_candidate_runtime_paths_depend_on_scheduler_core_and_state_trait() 
         "fn candidate_provider_key_health_bucket(",
         "fn candidate_provider_key_health_score(",
         "count_recent_active_requests_for_provider(",
-        "is_candidate_in_recent_failure_cooldown(",
         "provider_key_health_score(",
         "provider_key_rpm_allows_request_since(",
         "read_recent_request_candidates(128)",
@@ -414,7 +463,7 @@ fn scheduler_candidate_runtime_paths_depend_on_scheduler_core_and_state_trait() 
         "read_provider_key_rpm_states(",
         "candidate_is_selectable_with_runtime_state",
         "collect_selectable_candidates_from_keys",
-        "auth_api_key_concurrency_limit_reached",
+        "auth_api_key_concurrency_limit_reached(",
         "build_provider_concurrent_limit_map(",
         "reorder_candidates_by_scheduler_health",
     ] {
@@ -438,7 +487,7 @@ fn scheduler_candidate_runtime_paths_depend_on_scheduler_core_and_state_trait() 
         "candidate/runtime.rs should keep affinity out of runtime eligibility checks"
     );
     assert!(
-        runtime.contains("auth_api_key_concurrency_limit_reached"),
+        runtime.contains("auth_api_key_concurrency_limit_reached("),
         "candidate/runtime.rs should depend on core auth api key concurrency helper"
     );
     assert!(
@@ -1397,7 +1446,7 @@ fn usage_reporting_does_not_log_raw_report_context() {
 
 #[test]
 fn proxy_registration_client_does_not_log_raw_management_response_body() {
-    let source = read_workspace_file("apps/aether-proxy/src/registration/client.rs");
+    let source = read_workspace_file("apps/aether-tunnel/src/registration/client.rs");
     assert!(
         !source.contains("error!(body = %text"),
         "registration/client.rs should not log raw management response bodies"

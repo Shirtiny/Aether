@@ -23,6 +23,7 @@ aether-oauth.workspace = true
 aether-pool-core.workspace = true
 aether-provider-pool.workspace = true
 aether-provider-transport.workspace = true
+aether-routing-core.workspace = true
 aether-scheduler-core.workspace = true
 aether-runtime.workspace = true
 aether-runtime-state.workspace = true
@@ -30,6 +31,7 @@ aether-task-runtime.workspace = true
 aether-usage-runtime.workspace = true
 aether-video-tasks-core.workspace = true
 aether-wallet.workspace = true
+aes-gcm.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
 axum = { version = "0.8", features = ["ws"] }
@@ -46,14 +48,17 @@ hmac.workspace = true
 http.workspace = true
 ldap3 = { version = "0.11", default-features = false, features = ["sync", "tls-rustls"] }
 md-5 = "0.10"
+object_store.workspace = true
 parking_lot = "0.12"
 regex.workspace = true
 reqwest.workspace = true
+rsa = "0.9.10"
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha1 = "0.10"
-sha2.workspace = true
+sha2 = { workspace = true, features = ["oid"] }
+tar.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
@@ -64,6 +69,9 @@ tracing.workspace = true
 url.workspace = true
 uuid.workspace = true
 webpki-roots.workspace = true
+wreq.workspace = true
+wreq-util.workspace = true
+zstd.workspace = true
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = "0.6"

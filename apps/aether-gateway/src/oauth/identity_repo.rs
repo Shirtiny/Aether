@@ -16,6 +16,8 @@ const LINUXDO_USERINFO_URL: &str = "https://connect.linux.do/api/user";
 pub(crate) struct IdentityOAuthProviderSummary {
     pub(crate) provider_type: String,
     pub(crate) display_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) icon_url: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -77,6 +79,7 @@ pub(crate) async fn list_enabled_identity_oauth_providers(
         .map(|provider| IdentityOAuthProviderSummary {
             provider_type: provider.provider_type,
             display_name: provider.display_name,
+            icon_url: provider.icon_url,
         })
         .collect::<Vec<_>>();
     providers.sort_by(|left, right| left.provider_type.cmp(&right.provider_type));

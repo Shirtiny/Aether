@@ -25,11 +25,11 @@ describe('parseDateLike', () => {
 describe('datetime-local conversion', () => {
   it('formats RFC3339 instants for datetime-local inputs using local clock fields', () => {
     const date = new Date('2026-04-12T15:30:00Z')
-    const expected = [
+    const expected = `${[
       date.getFullYear(),
       padDatePart(date.getMonth() + 1),
       padDatePart(date.getDate()),
-    ].join('-') + `T${padDatePart(date.getHours())}:${padDatePart(date.getMinutes())}`
+    ].join('-')  }T${padDatePart(date.getHours())}:${padDatePart(date.getMinutes())}`
 
     expect(formatDateTimeLocalInput('2026-04-12T15:30:00Z')).toBe(expected)
   })

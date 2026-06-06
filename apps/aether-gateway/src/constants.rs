@@ -26,12 +26,15 @@ pub(crate) const EXECUTION_PATH_EXECUTION_RUNTIME_STREAM: &str = "execution_runt
 pub(crate) const EXECUTION_PATH_CONTROL_EXECUTE_SYNC: &str = "control_execute_sync";
 pub(crate) const EXECUTION_PATH_CONTROL_EXECUTE_STREAM: &str = "control_execute_stream";
 pub(crate) const EXECUTION_PATH_LOCAL_EXECUTION_RUNTIME_MISS: &str = "local_execution_runtime_miss";
+pub(crate) const EXECUTION_PATH_LOCAL_EXECUTION_PLANNING_TIMEOUT: &str =
+    "local_execution_planning_timeout";
 pub(crate) const EXECUTION_PATH_LOCAL_API_KEY_CONCURRENCY_LIMITED: &str =
     "local_api_key_concurrency_limited";
 pub(crate) const API_KEY_CONCURRENCY_WAIT_TIMEOUT_MS: u64 = 150;
 pub(crate) const API_KEY_CONCURRENCY_WAIT_POLL_INTERVAL_MS: u64 = 10;
 pub(crate) const EXECUTION_PATH_LOCAL_AUTH_DENIED: &str = "local_auth_denied";
 pub(crate) const EXECUTION_PATH_LOCAL_RATE_LIMITED: &str = "local_rate_limited";
+pub(crate) const EXECUTION_PATH_LOCAL_INVALID_REQUEST: &str = "local_invalid_request";
 pub(crate) const EXECUTION_PATH_LOCAL_ROUTE_NOT_FOUND: &str = "local_route_not_found";
 pub(crate) const EXECUTION_PATH_LOCAL_OVERLOADED: &str = "local_overloaded";
 pub(crate) const EXECUTION_PATH_DISTRIBUTED_OVERLOADED: &str = "distributed_overloaded";
@@ -62,6 +65,7 @@ pub(crate) const TRUSTED_ADMIN_MANAGEMENT_TOKEN_ID_HEADER: &str =
     "x-aether-admin-management-token-id";
 pub(crate) const TRUSTED_RATE_LIMIT_PREFLIGHT_HEADER: &str = "x-aether-rate-limit-preflight";
 pub(crate) const DEFAULT_USER_GROUP_CONFIG_KEY: &str = "default_user_group_id";
+pub(crate) const ANTIGRAVITY_BEARER_BRIDGE_CONFIG_KEY: &str = "module.antigravity.bearer_bridge";
 pub(crate) const BUILTIN_DEFAULT_USER_GROUP_ID: &str = "00000000-0000-0000-0000-000000000001";
 
 pub(crate) const FRONTDOOR_REPLACEABLE_ROUTE_GROUPS: &[&str] = &["frontdoor_compat_router"];
@@ -89,6 +93,7 @@ pub(crate) const RUST_FRONTDOOR_OWNED_ROUTE_PATTERNS: &[&str] = &[
     "/api/public/stats",
     "/api/public/global-models",
     "/api/public/health/api-formats",
+    "/api/public/health/models",
     "/api/oauth/providers",
     "/api/oauth/{provider_type}/authorize",
     "/api/oauth/{provider_type}/callback",
@@ -115,7 +120,6 @@ pub(crate) const RUST_FRONTDOOR_OWNED_ROUTE_PATTERNS: &[&str] = &[
     "/v1/rerank",
     "/v1/images/generations",
     "/v1/images/edits",
-    "/v1/images/variations",
     "/v1/messages",
     "/v1/messages/count_tokens",
     "/v1/responses",
@@ -134,6 +138,14 @@ pub(crate) const RUST_FRONTDOOR_OWNED_ROUTE_PATTERNS: &[&str] = &[
     "/upload/v1beta/files",
     "/v1beta/files",
     "/v1beta/files/{path...}",
+    "/v1internal:loadCodeAssist",
+    "/v1internal:fetchAvailableModels",
+    "/v1internal:fetchUserInfo",
+    "/v1internal:fetchAdminControls",
+    "/v1internal:setUserSettings",
+    "/v1internal:listExperiments",
+    "/v1internal:recordCodeAssistMetrics",
+    "/v1internal:streamGenerateContent",
     "/",
     "/{*path}",
 ];

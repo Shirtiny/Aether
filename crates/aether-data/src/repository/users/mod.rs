@@ -12,5 +12,6 @@ pub use types::{
     normalize_user_group_name, StoredUserAuthRecord, StoredUserExportRow, StoredUserGroup,
     StoredUserGroupMember, StoredUserGroupMembership, StoredUserOAuthLinkSummary,
     StoredUserPreferenceRecord, StoredUserSessionRecord, StoredUserSummary, UpsertUserGroupRecord,
-    UserExportListQuery, UserExportSummary, UserReadRepository,
+    UserExportListQuery, UserExportSortBy, UserExportSortOrder, UserExportSummary,
+    UserReadRepository,
 };

@@ -3,6 +3,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use aether_data_contracts::repository::provider_catalog::{
     StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
 };
+use aether_provider_transport::provider_types::is_codex_cli_backend_url;
+use aether_provider_transport::url::{
+    build_bigmodel_coding_models_url, build_openai_compatible_models_url,
+    openai_compatible_base_includes_unversioned_api_root,
+};
 use regex::Regex;
 use serde_json::{json, Value};
 
@@ -69,8 +74,10 @@ pub fn build_models_fetch_url(
     let provider_type = provider_type.trim().to_ascii_lowercase();
     let url = if provider_type == "codex" && api_format.starts_with("openai:") {
         build_codex_models_url(base_url)
-    } else if api_format.starts_with("openai:") || api_format.starts_with("claude:") {
+    } else if api_format.starts_with("openai:") {
         build_v1_models_url(base_url)
+    } else if api_format.starts_with("claude:") {
+        build_claude_models_url(base_url)
     } else if api_format.starts_with("gemini:") {
         build_gemini_models_url(base_url)
     } else {
@@ -166,6 +173,107 @@ pub fn parse_models_response_page(
     })
 }
 
+pub fn parse_windsurf_model_configs_response(
+    body: &Value,
+    updated_at_unix_secs: u64,
+) -> Result<(ModelsFetchSuccess, Value), String> {
+    let configs = body
+        .get("clientModelConfigs")
+        .or_else(|| body.get("client_model_configs"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            "windsurf model configs response is missing clientModelConfigs".to_string()
+        })?;
+
+    let mut cached_models = Vec::new();
+    let mut metadata_models = Vec::new();
+    let mut seen = BTreeSet::new();
+    for config in configs {
+        let Some(model_id) =
+            windsurf_model_config_string(config, &["modelUid", "model_uid", "id", "name"])
+        else {
+            continue;
+        };
+        if !seen.insert(model_id.clone()) {
+            continue;
+        }
+
+        let label = windsurf_model_config_string(config, &["label", "displayName", "display_name"]);
+        let provider = windsurf_model_config_string(config, &["provider"]);
+        let supports_images = config
+            .get("supportsImages")
+            .or_else(|| config.get("supports_images"))
+            .and_then(windsurf_json_bool);
+        let credit_multiplier = config
+            .get("creditMultiplier")
+            .or_else(|| config.get("credit_multiplier"))
+            .and_then(windsurf_json_f64);
+
+        let mut model = serde_json::Map::new();
+        model.insert("id".to_string(), json!(model_id.clone()));
+        model.insert("object".to_string(), json!("model"));
+        model.insert("model_uid".to_string(), json!(model_id.clone()));
+        model.insert(
+            "display_name".to_string(),
+            json!(label.as_deref().unwrap_or(model_id.as_str())),
+        );
+        model.insert(
+            "owned_by".to_string(),
+            json!(provider.as_deref().unwrap_or("windsurf")),
+        );
+        model.insert(
+            "api_formats".to_string(),
+            json!(["openai:chat", "openai:responses", "claude:messages"]),
+        );
+        if let Some(supports_images) = supports_images {
+            model.insert("supports_images".to_string(), json!(supports_images));
+        }
+        if let Some(credit_multiplier) = credit_multiplier {
+            model.insert("credit_multiplier".to_string(), json!(credit_multiplier));
+        }
+        cached_models.push(Value::Object(model));
+
+        let mut metadata_model = serde_json::Map::new();
+        metadata_model.insert("model_uid".to_string(), json!(model_id));
+        if let Some(label) = label {
+            metadata_model.insert("label".to_string(), json!(label));
+        }
+        if let Some(provider) = provider {
+            metadata_model.insert("provider".to_string(), json!(provider));
+        }
+        if let Some(supports_images) = supports_images {
+            metadata_model.insert("supports_images".to_string(), json!(supports_images));
+        }
+        if let Some(credit_multiplier) = credit_multiplier {
+            metadata_model.insert("credit_multiplier".to_string(), json!(credit_multiplier));
+        }
+        metadata_models.push(Value::Object(metadata_model));
+    }
+
+    let mut windsurf_metadata = serde_json::Map::new();
+    windsurf_metadata.insert("updated_at".to_string(), json!(updated_at_unix_secs));
+    windsurf_metadata.insert(
+        "allowed_models_count".to_string(),
+        json!(metadata_models.len() as u64),
+    );
+    windsurf_metadata.insert("models".to_string(), Value::Array(metadata_models));
+    if let Some(default_model_uid) = body
+        .get("defaultOverrideModelConfig")
+        .or_else(|| body.get("default_override_model_config"))
+        .and_then(|config| windsurf_model_config_string(config, &["modelUid", "model_uid"]))
+    {
+        windsurf_metadata.insert("default_model_uid".to_string(), json!(default_model_uid));
+    }
+
+    Ok((
+        ModelsFetchSuccess {
+            fetched_model_ids: collect_cached_model_ids(&cached_models),
+            cached_models,
+        },
+        json!({ "windsurf": windsurf_metadata }),
+    ))
+}
+
 pub fn selected_models_fetch_endpoints(
     endpoints: &[StoredProviderCatalogEndpoint],
     key: &StoredProviderCatalogKey,
@@ -229,7 +337,7 @@ pub fn endpoint_supports_rust_models_fetch(api_format: &str) -> bool {
 pub fn provider_type_uses_preset_models(provider_type: &str) -> bool {
     matches!(
         provider_type.trim().to_ascii_lowercase().as_str(),
-        "claude_code" | "gemini_cli"
+        "claude_code" | "gemini_cli" | "grok"
     )
 }
 
@@ -271,6 +379,27 @@ pub fn preset_models_for_provider(provider_type: &str) -> Option<Vec<Value>> {
             preset_model("gpt-5.4-mini", "openai", "GPT-5.4 Mini", "openai:responses"),
             preset_model("gpt-5.3-codex", "openai", "GPT-5.3 Codex", "openai:responses"),
             preset_model("gpt-5.3-codex-spark", "openai", "GPT-5.3 Codex Spark", "openai:responses"),
+        ],
+        "grok" => vec![
+            preset_model("grok-4.20-0309-non-reasoning", "xai", "Grok 4.20 0309 Non-Reasoning", "openai:chat"),
+            preset_model("grok-4.20-0309", "xai", "Grok 4.20 0309", "openai:chat"),
+            preset_model("grok-4.20-0309-reasoning", "xai", "Grok 4.20 0309 Reasoning", "openai:chat"),
+            preset_model("grok-4.20-0309-non-reasoning-super", "xai", "Grok 4.20 0309 Non-Reasoning Super", "openai:chat"),
+            preset_model("grok-4.20-0309-super", "xai", "Grok 4.20 0309 Super", "openai:chat"),
+            preset_model("grok-4.20-0309-reasoning-super", "xai", "Grok 4.20 0309 Reasoning Super", "openai:chat"),
+            preset_model("grok-4.20-0309-non-reasoning-heavy", "xai", "Grok 4.20 0309 Non-Reasoning Heavy", "openai:chat"),
+            preset_model("grok-4.20-0309-heavy", "xai", "Grok 4.20 0309 Heavy", "openai:chat"),
+            preset_model("grok-4.20-0309-reasoning-heavy", "xai", "Grok 4.20 0309 Reasoning Heavy", "openai:chat"),
+            preset_model("grok-4.20-multi-agent-0309", "xai", "Grok 4.20 Multi-Agent 0309", "openai:chat"),
+            preset_model("grok-4.20-auto", "xai", "Grok 4.20 Auto", "openai:chat"),
+            preset_model("grok-4.20-fast", "xai", "Grok 4.20 Fast", "openai:chat"),
+            preset_model("grok-4.20-expert", "xai", "Grok 4.20 Expert", "openai:chat"),
+            preset_model("grok-4.20-heavy", "xai", "Grok 4.20 Heavy", "openai:chat"),
+            preset_model("grok-4.3-beta", "xai", "Grok 4.3 Beta", "openai:chat"),
+            preset_model("grok-imagine-image-lite", "xai", "Grok Imagine Image Lite", "openai:image"),
+            preset_model("grok-imagine-image", "xai", "Grok Imagine Image", "openai:image"),
+            preset_model("grok-imagine-image-pro", "xai", "Grok Imagine Image Pro", "openai:image"),
+            preset_model("grok-imagine-image-edit", "xai", "Grok Imagine Image Edit", "openai:image"),
         ],
         _ => return None,
     };
@@ -374,6 +503,31 @@ pub fn json_string_list(value: Option<&Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn api_format_priority(api_format: &str) -> Option<(usize, usize)> {
+    MODEL_FETCH_FORMAT_PRIORITY
+        .iter()
+        .enumerate()
+        .find_map(|(group_index, group)| {
+            group
+                .iter()
+                .position(|candidate| candidate.eq_ignore_ascii_case(api_format))
+                .map(|format_index| (group_index, format_index))
+        })
+}
+
+fn sorted_api_formats(formats: BTreeSet<String>) -> Vec<String> {
+    let mut formats = formats.into_iter().collect::<Vec<_>>();
+    formats.sort_by(
+        |left, right| match (api_format_priority(left), api_format_priority(right)) {
+            (Some(left_priority), Some(right_priority)) => left_priority.cmp(&right_priority),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => left.cmp(right),
+        },
+    );
+    formats
+}
+
 pub fn aggregate_models_for_cache(models: &[Value]) -> Vec<Value> {
     let mut aggregated = BTreeMap::<String, serde_json::Map<String, Value>>::new();
 
@@ -435,7 +589,7 @@ pub fn aggregate_models_for_cache(models: &[Value]) -> Vec<Value> {
         if let Some(api_format) = legacy_api_format {
             merged_formats.insert(api_format);
         }
-        let merged_formats = merged_formats
+        let merged_formats = sorted_api_formats(merged_formats)
             .into_iter()
             .map(Value::String)
             .collect::<Vec<_>>();
@@ -453,17 +607,48 @@ pub fn aggregate_models_for_cache(models: &[Value]) -> Vec<Value> {
 }
 
 fn build_v1_models_url(base_url: &str) -> Option<String> {
-    let (trimmed_base_url, query) = split_url_query(base_url);
+    build_openai_compatible_models_url(base_url)
+}
+
+fn build_claude_models_url(base_url: &str) -> Option<String> {
+    if let Some(url) = build_deepseek_anthropic_models_url(base_url) {
+        return Some(url);
+    }
+
+    let (trimmed_base_url, base_query) = split_url_query(base_url);
     let trimmed_base_url = trimmed_base_url.trim_end_matches('/');
     if trimmed_base_url.is_empty() {
         return None;
     }
-    let mut url = if trimmed_base_url.ends_with("/v1") {
-        format!("{trimmed_base_url}/models")
+
+    let mut url = if trimmed_base_url.ends_with("/models") {
+        trimmed_base_url.to_string()
     } else {
-        format!("{trimmed_base_url}/v1/models")
+        format!("{trimmed_base_url}/models")
     };
-    if let Some(query) = query.filter(|value| !value.trim().is_empty()) {
+    if let Some(query) = base_query.filter(|value| !value.trim().is_empty()) {
+        url.push('?');
+        url.push_str(query);
+    }
+    Some(url)
+}
+
+pub fn deepseek_anthropic_models_fetch_uses_openai_auth(base_url: &str) -> bool {
+    build_deepseek_anthropic_models_url(base_url).is_some()
+}
+
+fn build_deepseek_anthropic_models_url(base_url: &str) -> Option<String> {
+    let (trimmed_base_url, base_query) = split_url_query(base_url);
+    let trimmed_base_url = trimmed_base_url.trim_end_matches('/');
+    let normalized = trimmed_base_url.to_ascii_lowercase();
+    if normalized != "https://api.deepseek.com/anthropic"
+        && normalized != "https://api.deepseek.com/anthropic/v1"
+    {
+        return None;
+    }
+
+    let mut url = "https://api.deepseek.com/models".to_string();
+    if let Some(query) = base_query.filter(|value| !value.trim().is_empty()) {
         url.push('?');
         url.push_str(query);
     }
@@ -471,10 +656,20 @@ fn build_v1_models_url(base_url: &str) -> Option<String> {
 }
 
 fn build_codex_models_url(base_url: &str) -> Option<String> {
+    if let Some(url) = build_bigmodel_coding_models_url(base_url) {
+        return Some(url);
+    }
+
     let (trimmed_base_url, query) = split_url_query(base_url);
     let trimmed_base_url = trimmed_base_url.trim_end_matches('/');
     if trimmed_base_url.is_empty() {
         return None;
+    }
+    let is_codex_backend = is_codex_cli_backend_url(trimmed_base_url)
+        || trimmed_base_url.ends_with("/codex")
+        || trimmed_base_url.ends_with("/models");
+    if !is_codex_backend && openai_compatible_base_includes_unversioned_api_root(base_url) {
+        return build_openai_compatible_models_url(base_url);
     }
     let mut url = if trimmed_base_url.ends_with("/models") {
         trimmed_base_url.to_string()
@@ -538,6 +733,53 @@ fn model_id_from_openai_like_item(item: &Value) -> Option<String> {
             .filter(|value| !value.is_empty())
             .map(|value| value.trim_start_matches("models/").to_string())
     })
+}
+
+fn windsurf_model_config_string(value: &Value, fields: &[&str]) -> Option<String> {
+    fields.iter().find_map(|field| {
+        value
+            .get(*field)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    })
+}
+
+fn windsurf_json_bool(value: &Value) -> Option<bool> {
+    match value {
+        Value::Bool(value) => Some(*value),
+        Value::String(text) => match text.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" => Some(true),
+            "false" | "0" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn windsurf_json_f64(value: &Value) -> Option<f64> {
+    match value {
+        Value::Number(number) => number.as_f64(),
+        Value::String(text) => text.trim().parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+fn collect_cached_model_ids(models: &[Value]) -> Vec<String> {
+    let mut ids = Vec::new();
+    for model in models {
+        let Some(model_id) = model
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        ids.push(model_id.to_string());
+    }
+    ids
 }
 
 fn split_url_query(base_url: &str) -> (&str, Option<&str>) {
@@ -709,6 +951,20 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_models_for_cache_orders_api_formats_by_canonical_priority() {
+        let aggregated = aggregate_models_for_cache(&[
+            json!({"id":"claude-sonnet-4-6","api_formats":["claude:messages"]}),
+            json!({"id":"claude-sonnet-4-6","api_formats":["openai:responses"]}),
+            json!({"id":"claude-sonnet-4-6","api_formats":["openai:chat"]}),
+        ]);
+        assert_eq!(aggregated.len(), 1);
+        assert_eq!(
+            aggregated[0]["api_formats"],
+            json!(["openai:chat", "openai:responses", "claude:messages"])
+        );
+    }
+
+    #[test]
     fn aggregate_models_for_cache_preserves_legacy_api_format_field() {
         let aggregated = aggregate_models_for_cache(&[json!({
             "id":"gpt-5",
@@ -735,7 +991,7 @@ mod tests {
         assert_eq!(
             build_models_fetch_url("openai", "openai:responses", "https://example.com"),
             Some((
-                "https://example.com/v1/models".to_string(),
+                "https://example.com/models".to_string(),
                 "openai:responses".to_string()
             ))
         );
@@ -753,6 +1009,97 @@ mod tests {
                 "https://chatgpt.com/backend-api/codex/models?client_version=0.128.0-alpha.1"
                     .to_string(),
                 "openai:responses".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn build_models_fetch_url_supports_bigmodel_coding_paas_root() {
+        assert_eq!(
+            build_models_fetch_url(
+                "openai",
+                "openai:chat",
+                "https://open.bigmodel.cn/api/coding/paas/v4"
+            ),
+            Some((
+                "https://open.bigmodel.cn/api/coding/paas/v4/models".to_string(),
+                "openai:chat".to_string()
+            ))
+        );
+        assert_eq!(
+            build_models_fetch_url(
+                "codex",
+                "openai:responses",
+                "https://open.bigmodel.cn/api/coding/paas/v4"
+            ),
+            Some((
+                "https://open.bigmodel.cn/api/coding/paas/v4/models".to_string(),
+                "openai:responses".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn build_models_fetch_url_preserves_unversioned_api_root() {
+        assert_eq!(
+            build_models_fetch_url("openai", "openai:chat", "https://proxy.example.com/api"),
+            Some((
+                "https://proxy.example.com/api/models".to_string(),
+                "openai:chat".to_string()
+            ))
+        );
+        assert_eq!(
+            build_models_fetch_url("openai", "openai:chat", "https://proxy.example.com/openai"),
+            Some((
+                "https://proxy.example.com/openai/models".to_string(),
+                "openai:chat".to_string()
+            ))
+        );
+        assert_eq!(
+            build_models_fetch_url("openai", "openai:chat", "https://proxy.example.com"),
+            Some((
+                "https://proxy.example.com/models".to_string(),
+                "openai:chat".to_string()
+            ))
+        );
+        assert_eq!(
+            build_models_fetch_url("openai", "openai:chat", "https://api.deepseek.com"),
+            Some((
+                "https://api.deepseek.com/models".to_string(),
+                "openai:chat".to_string()
+            ))
+        );
+        assert_eq!(
+            build_models_fetch_url("codex", "openai:responses", "https://proxy.example.com/api"),
+            Some((
+                "https://proxy.example.com/api/models".to_string(),
+                "openai:responses".to_string()
+            ))
+        );
+        assert_eq!(
+            build_models_fetch_url(
+                "anthropic",
+                "claude:messages",
+                "https://proxy.example.com/api"
+            ),
+            Some((
+                "https://proxy.example.com/api/models".to_string(),
+                "claude:messages".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn build_models_fetch_url_uses_deepseek_openai_models_for_anthropic_base() {
+        assert_eq!(
+            build_models_fetch_url(
+                "custom",
+                "claude:messages",
+                "https://api.deepseek.com/anthropic"
+            ),
+            Some((
+                "https://api.deepseek.com/models".to_string(),
+                "claude:messages".to_string()
             ))
         );
     }
@@ -933,5 +1280,43 @@ mod tests {
         assert!(models
             .iter()
             .all(|model| model["api_formats"] == json!(["claude:messages"])));
+    }
+
+    #[test]
+    fn preset_models_cover_grok_non_video_catalog() {
+        let models = preset_models_for_provider("grok").expect("preset models should exist");
+        let model_ids = models
+            .iter()
+            .map(|model| model["id"].as_str().expect("model id"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            model_ids,
+            vec![
+                "grok-4.20-0309-non-reasoning",
+                "grok-4.20-0309",
+                "grok-4.20-0309-reasoning",
+                "grok-4.20-0309-non-reasoning-super",
+                "grok-4.20-0309-super",
+                "grok-4.20-0309-reasoning-super",
+                "grok-4.20-0309-non-reasoning-heavy",
+                "grok-4.20-0309-heavy",
+                "grok-4.20-0309-reasoning-heavy",
+                "grok-4.20-multi-agent-0309",
+                "grok-4.20-auto",
+                "grok-4.20-fast",
+                "grok-4.20-expert",
+                "grok-4.20-heavy",
+                "grok-4.3-beta",
+                "grok-imagine-image-lite",
+                "grok-imagine-image",
+                "grok-imagine-image-pro",
+                "grok-imagine-image-edit",
+            ]
+        );
+        assert!(!model_ids.contains(&"grok-imagine-video"));
+        assert_eq!(models[0]["api_formats"], json!(["openai:chat"]));
+        assert_eq!(models[10]["api_formats"], json!(["openai:chat"]));
+        assert_eq!(models[15]["api_formats"], json!(["openai:image"]));
+        assert_eq!(models[18]["api_formats"], json!(["openai:image"]));
     }
 }

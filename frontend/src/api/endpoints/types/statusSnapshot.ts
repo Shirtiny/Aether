@@ -46,7 +46,12 @@ export interface QuotaWindowSnapshot {
 export interface QuotaCreditsSnapshot {
   has_credits?: boolean | null
   balance?: number | null
+  remaining?: number | null
+  consumed?: number | null
+  total?: number | null
   unlimited?: boolean | null
+  trace_id?: string | null
+  updated_at?: number | null
 }
 
 export interface QuotaStatusSnapshot {
@@ -64,7 +69,10 @@ export interface QuotaStatusSnapshot {
   reset_at?: number | null
   reset_seconds?: number | null
   plan_type?: string | null
+  pool_tier?: string | null
   credits?: QuotaCreditsSnapshot | null
+  allowed_models_count?: number | null
+  rate_limit?: Record<string, unknown> | null
   windows?: QuotaWindowSnapshot[] | null
 }
 

@@ -138,6 +138,12 @@ type = "json"
 nullable = true
 
 [[table.oauth_providers.columns]]
+name = "icon_url"
+type = "text"
+length = 500
+nullable = true
+
+[[table.oauth_providers.columns]]
 name = "is_enabled"
 type = "bool"
 default = false

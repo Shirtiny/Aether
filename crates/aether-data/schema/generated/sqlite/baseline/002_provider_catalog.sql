@@ -125,6 +125,7 @@ CREATE TABLE IF NOT EXISTS provider_api_keys (
     updated_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS provider_api_keys_provider_id_idx ON provider_api_keys (provider_id);
+CREATE INDEX IF NOT EXISTS idx_provider_api_keys_provider_default_sort ON provider_api_keys (provider_id, internal_priority, name, id);
 
 CREATE TABLE IF NOT EXISTS pool_member_scores (
     id TEXT PRIMARY KEY NOT NULL,
@@ -278,6 +279,7 @@ CREATE TABLE IF NOT EXISTS video_tasks (
 );
 CREATE INDEX IF NOT EXISTS video_tasks_external_id_idx ON video_tasks (external_task_id);
 CREATE INDEX IF NOT EXISTS video_tasks_next_poll_idx ON video_tasks (next_poll_at);
+CREATE INDEX IF NOT EXISTS video_tasks_due_poll_idx ON video_tasks (status, next_poll_at, updated_at);
 CREATE INDEX IF NOT EXISTS video_tasks_user_status_idx ON video_tasks (user_id, status);
 CREATE INDEX IF NOT EXISTS video_tasks_api_key_id_idx ON video_tasks (api_key_id);
 CREATE INDEX IF NOT EXISTS video_tasks_provider_id_idx ON video_tasks (provider_id);
@@ -369,4 +371,43 @@ CREATE TABLE IF NOT EXISTS global_models (
     updated_at INTEGER NOT NULL,
     UNIQUE (name)
 );
+
+CREATE TABLE IF NOT EXISTS routing_groups (
+    id TEXT PRIMARY KEY NOT NULL,
+    name TEXT NOT NULL,
+    description TEXT,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    is_system_default INTEGER NOT NULL DEFAULT 0,
+    config_json TEXT NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    published_at INTEGER,
+    UNIQUE (name)
+);
+CREATE INDEX IF NOT EXISTS routing_groups_system_default_idx ON routing_groups (is_system_default, enabled);
+
+CREATE TABLE IF NOT EXISTS routing_group_bindings (
+    id TEXT PRIMARY KEY NOT NULL,
+    group_id TEXT NOT NULL,
+    subject_type TEXT NOT NULL,
+    subject_id TEXT NOT NULL,
+    is_default INTEGER NOT NULL DEFAULT 0,
+    allow_explicit_select INTEGER NOT NULL DEFAULT 1,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS routing_group_bindings_group_id_idx ON routing_group_bindings (group_id);
+CREATE INDEX IF NOT EXISTS routing_group_bindings_subject_idx ON routing_group_bindings (subject_type, subject_id);
+
+CREATE TABLE IF NOT EXISTS routing_group_versions (
+    id TEXT PRIMARY KEY NOT NULL,
+    group_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    config_json TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    created_by TEXT,
+    UNIQUE (group_id, version)
+);
+CREATE INDEX IF NOT EXISTS routing_group_versions_group_id_idx ON routing_group_versions (group_id);
 

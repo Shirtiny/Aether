@@ -20,6 +20,7 @@ SET
       SELECT MAX(created_at)
       FROM "usage"
       WHERE provider_api_key_id = $1
+        AND status NOT IN ('pending', 'streaming')
     )
     ELSE last_used_at
   END

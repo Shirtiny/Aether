@@ -9,9 +9,10 @@ use aether_ai_formats::formats::conversion::response::{
 };
 use aether_ai_formats::formats::registry::{convert_response, FormatContext};
 use aether_ai_formats::{
-    canonical_to_claude_response, canonical_to_gemini_response, canonical_to_openai_chat_response,
-    canonical_to_openai_responses_compact_response, canonical_to_openai_responses_response,
-    from_claude_to_canonical_response, from_gemini_to_canonical_response,
+    canonical_to_claude_response, canonical_to_embedding_response, canonical_to_gemini_response,
+    canonical_to_openai_chat_response, canonical_to_openai_responses_compact_response,
+    canonical_to_openai_responses_response, from_claude_to_canonical_response,
+    from_embedding_to_canonical_response, from_gemini_to_canonical_response,
     from_openai_chat_to_canonical_response, from_openai_responses_to_canonical_response,
     sync_chat_response_conversion_kind, sync_cli_response_conversion_kind,
 };
@@ -20,8 +21,12 @@ use serde_json::{json, Map, Value};
 use super::AiSurfaceFinalizeError;
 use crate::formats::gemini::generate_content::stream::GeminiProviderState;
 use crate::formats::shared::model_directives::model_directive_display_model_from_report_context;
-use crate::formats::shared::response::remove_empty_pages_from_tool_arguments;
+use crate::formats::shared::response::{
+    remove_empty_pages_from_tool_arguments, remove_empty_pages_from_tool_input_value,
+    sanitize_claude_read_tool_inputs,
+};
 use crate::formats::shared::stream_core::common::{
+    content_part_from_openai_image_generation_item, gemini_usage_metadata_from_usage,
     map_openai_finish_reason_to_gemini, parse_json_arguments_value, CanonicalContentPart,
     CanonicalStreamEvent, CanonicalUsage,
 };
@@ -330,6 +335,18 @@ pub fn maybe_build_standard_sync_finalize_product_from_normalized_payload(
         )));
     }
 
+    if let Some(product) = maybe_build_embedding_cross_format_sync_product_from_normalized_payload(
+        report_kind,
+        status_code,
+        report_context,
+        body_json,
+        body_base64,
+    )? {
+        return Ok(Some(StandardSyncFinalizeNormalizedProduct::CrossFormat(
+            product,
+        )));
+    }
+
     Ok(
         maybe_build_standard_cross_format_sync_product_from_normalized_payload(
             report_kind,
@@ -340,6 +357,91 @@ pub fn maybe_build_standard_sync_finalize_product_from_normalized_payload(
         )?
         .map(StandardSyncFinalizeNormalizedProduct::CrossFormat),
     )
+}
+
+pub fn maybe_build_embedding_cross_format_sync_product_from_normalized_payload(
+    report_kind: &str,
+    status_code: u16,
+    report_context: Option<&Value>,
+    body_json: Option<&Value>,
+    body_base64: Option<&str>,
+) -> Result<Option<StandardCrossFormatSyncProduct>, AiSurfaceFinalizeError> {
+    if report_kind != crate::contracts::OPENAI_EMBEDDING_SYNC_FINALIZE_REPORT_KIND
+        || status_code >= 400
+    {
+        return Ok(None);
+    }
+
+    let Some(report_context) = report_context else {
+        return Ok(None);
+    };
+    let provider_api_format = report_context
+        .get("provider_api_format")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let client_api_format = report_context
+        .get("client_api_format")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+
+    if provider_api_format == client_api_format {
+        return Ok(None);
+    }
+
+    let Some(provider_namespace) =
+        embedding_response_namespace_for_api_format(&provider_api_format)
+    else {
+        return Ok(None);
+    };
+    let Some(client_namespace) = embedding_response_namespace_for_api_format(&client_api_format)
+    else {
+        return Ok(None);
+    };
+
+    let provider_body_json = match body_base64 {
+        Some(body_base64) => {
+            let body_bytes = base64::engine::general_purpose::STANDARD.decode(body_base64)?;
+            serde_json::from_slice::<Value>(&body_bytes).ok()
+        }
+        None => body_json.cloned(),
+    };
+    let Some(provider_body_json) =
+        provider_body_json.filter(|value| !is_error_like_sync_body(value))
+    else {
+        return Ok(None);
+    };
+
+    let mut canonical =
+        match from_embedding_to_canonical_response(&provider_body_json, provider_namespace) {
+            Some(canonical) => canonical,
+            None => return Ok(None),
+        };
+    apply_report_context_model_fallback(&mut canonical.model, report_context);
+    let Some(client_body_json) = canonical_to_embedding_response(&canonical, client_namespace)
+    else {
+        return Ok(None);
+    };
+    let client_body_json =
+        client_body_with_report_context_model(client_body_json, report_context, &client_api_format);
+
+    Ok(Some(StandardCrossFormatSyncProduct {
+        client_body_json,
+        provider_body_json,
+    }))
+}
+
+fn embedding_response_namespace_for_api_format(api_format: &str) -> Option<&'static str> {
+    match aether_ai_formats::normalize_api_format_alias(api_format).as_str() {
+        "openai:embedding" => Some("openai"),
+        "jina:embedding" => Some("jina"),
+        "gemini:embedding" => Some("gemini"),
+        "aliyun:multimodal_embedding" => Some("aliyun"),
+        _ => None,
+    }
 }
 
 fn maybe_build_standard_same_format_sync_body(
@@ -383,8 +485,13 @@ fn maybe_build_standard_same_format_sync_body(
         return None;
     }
 
+    let mut body_json = body_json.clone();
+    if expected_api_format == "claude:messages" {
+        sanitize_claude_read_tool_inputs(&mut body_json);
+    }
+
     Some(client_body_with_report_context_model(
-        body_json.clone(),
+        body_json,
         report_context,
         &client_api_format,
     ))
@@ -827,6 +934,9 @@ fn client_body_with_report_context_model(
     };
     match normalize_openai_responses_family_api_format(client_api_format).as_str() {
         "openai:chat" | "openai:responses" | "openai:responses:compact" | "claude:messages" => {
+            object.insert("model".to_string(), Value::String(display_model));
+        }
+        "openai:embedding" | "jina:embedding" => {
             object.insert("model".to_string(), Value::String(display_model));
         }
         "gemini:generate_content" => {
@@ -1310,6 +1420,7 @@ fn standard_same_format_api_format(report_kind: &str) -> Option<&'static str> {
         "openai_chat_sync_finalize" => Some("openai:chat"),
         "claude_chat_sync_finalize" => Some("claude:messages"),
         "gemini_chat_sync_finalize" => Some("gemini:generate_content"),
+        "openai_embedding_sync_finalize" => Some("openai:embedding"),
         "claude_cli_sync_finalize" => Some("claude:messages"),
         "gemini_cli_sync_finalize" => Some("gemini:generate_content"),
         _ => None,
@@ -1577,6 +1688,7 @@ pub fn aggregate_openai_responses_stream_sync_response(body: &[u8]) -> Option<Va
     let mut message_states: BTreeMap<usize, OpenAIResponsesSyncMessageState> = BTreeMap::new();
     let mut reasoning_states: BTreeMap<usize, OpenAIResponsesSyncReasoningState> = BTreeMap::new();
     let mut tool_states: BTreeMap<usize, OpenAIResponsesSyncToolState> = BTreeMap::new();
+    let mut image_items: BTreeMap<usize, Value> = BTreeMap::new();
     let mut item_output_indexes = BTreeMap::<String, usize>::new();
 
     for event in events {
@@ -1610,22 +1722,25 @@ pub fn aggregate_openai_responses_stream_sync_response(body: &[u8]) -> Option<Va
             "response.output_text.delta" | "response.outtext.delta" => {
                 let output_index = openai_responses_event_output_index(event_object).unwrap_or(0);
                 let content_index = openai_responses_event_content_index(event_object);
-                let delta = match event_object.get("delta") {
-                    Some(Value::String(text)) => text.as_str(),
-                    Some(Value::Object(delta)) => delta
-                        .get("text")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default(),
-                    _ => "",
-                };
-                if delta.is_empty() {
-                    continue;
+                match event_object.get("delta") {
+                    Some(Value::String(delta)) => {
+                        append_openai_responses_message_text_delta(
+                            message_states.entry(output_index).or_default(),
+                            content_index,
+                            delta,
+                        );
+                    }
+                    Some(Value::Object(delta)) => {
+                        if let Some(text) = delta.get("text").and_then(Value::as_str) {
+                            merge_openai_responses_message_text_delta_object(
+                                message_states.entry(output_index).or_default(),
+                                content_index,
+                                text,
+                            );
+                        }
+                    }
+                    _ => {}
                 }
-                append_openai_responses_message_text_delta(
-                    message_states.entry(output_index).or_default(),
-                    content_index,
-                    delta,
-                );
             }
             "response.output_text.done" => {
                 let output_index = openai_responses_event_output_index(event_object).unwrap_or(0);
@@ -1734,6 +1849,9 @@ pub fn aggregate_openai_responses_stream_sync_response(body: &[u8]) -> Option<Va
                             item,
                         );
                     }
+                    "image_generation_call" => {
+                        image_items.insert(output_index, Value::Object(item.clone()));
+                    }
                     _ => {}
                 }
             }
@@ -1833,6 +1951,9 @@ pub fn aggregate_openai_responses_stream_sync_response(body: &[u8]) -> Option<Va
                                     item,
                                 );
                             }
+                            "image_generation_call" => {
+                                image_items.insert(output_index, Value::Object(item.clone()));
+                            }
                             _ => {}
                         }
                     }
@@ -1874,6 +1995,7 @@ pub fn aggregate_openai_responses_stream_sync_response(body: &[u8]) -> Option<Va
         .keys()
         .chain(reasoning_states.keys())
         .chain(tool_states.keys())
+        .chain(image_items.keys())
         .copied()
         .collect::<Vec<_>>();
     output_indexes.sort_unstable();
@@ -1896,6 +2018,9 @@ pub fn aggregate_openai_responses_stream_sync_response(body: &[u8]) -> Option<Va
             }
             if let Some(state) = tool_states.remove(&output_index) {
                 output.push(materialize_openai_responses_tool_item(output_index, state));
+            }
+            if let Some(item) = image_items.remove(&output_index) {
+                output.push(item);
             }
         }
         response.insert("output".to_string(), Value::Array(output));
@@ -1985,6 +2110,46 @@ fn append_openai_responses_message_text_delta(
         "text".to_string(),
         Value::String(format!("{current}{delta}")),
     );
+    part.entry("annotations".to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+}
+
+fn merge_openai_responses_message_text_delta_object(
+    state: &mut OpenAIResponsesSyncMessageState,
+    content_index: usize,
+    text: &str,
+) {
+    if text.is_empty() {
+        return;
+    }
+    let part = state
+        .parts
+        .entry(content_index)
+        .or_insert_with(default_openai_responses_output_text_part);
+    let Some(part) = part.as_object_mut() else {
+        return;
+    };
+    if !part
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|value| matches!(value, "output_text" | "text"))
+    {
+        return;
+    }
+    let current = part
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let merged = if text.starts_with(current.as_str()) {
+        text.to_string()
+    } else if current == text || current.starts_with(text) {
+        current
+    } else {
+        format!("{current}{text}")
+    };
+    part.insert("type".to_string(), Value::String("output_text".to_string()));
+    part.insert("text".to_string(), Value::String(merged));
     part.entry("annotations".to_string())
         .or_insert_with(|| Value::Array(Vec::new()));
 }
@@ -2418,8 +2583,20 @@ pub fn aggregate_claude_stream_sync_response(body: &[u8]) -> Option<Value> {
                 }
             }
             "tool_use" => {
+                let tool_name = block
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if let Some(input) = block.get("input") {
+                    let sanitized = remove_empty_pages_from_tool_input_value(&tool_name, input);
+                    if sanitized != *input {
+                        block.insert("input".to_string(), sanitized);
+                    }
+                }
                 if !state.partial_json.is_empty() {
-                    let arguments = remove_empty_pages_from_tool_arguments(&state.partial_json);
+                    let arguments =
+                        remove_empty_pages_from_tool_arguments(&tool_name, &state.partial_json);
                     let input = serde_json::from_str::<Value>(&arguments)
                         .unwrap_or(Value::String(arguments));
                     block.insert("input".to_string(), input);
@@ -2540,6 +2717,11 @@ pub fn aggregate_gemini_stream_sync_response(body: &[u8]) -> Option<Value> {
                 }
                 CanonicalStreamEvent::ContentPart(part) => {
                     parts.push(gemini_sync_part_from_canonical_content_part(part));
+                }
+                CanonicalStreamEvent::ImageGenerationCall { item, .. } => {
+                    if let Some(part) = content_part_from_openai_image_generation_item(&item) {
+                        parts.push(gemini_sync_part_from_canonical_content_part(part));
+                    }
                 }
                 CanonicalStreamEvent::ToolCallStart {
                     index,
@@ -2864,26 +3046,7 @@ fn gemini_sync_part_from_canonical_content_part(part: CanonicalContentPart) -> V
 }
 
 fn gemini_usage_metadata_from_canonical(usage: CanonicalUsage) -> Value {
-    let mut usage_metadata = Map::new();
-    usage_metadata.insert(
-        "promptTokenCount".to_string(),
-        Value::from(usage.input_tokens),
-    );
-    usage_metadata.insert(
-        "candidatesTokenCount".to_string(),
-        Value::from(usage.output_tokens.saturating_sub(usage.reasoning_tokens)),
-    );
-    usage_metadata.insert(
-        "totalTokenCount".to_string(),
-        Value::from(usage.total_tokens),
-    );
-    if usage.reasoning_tokens > 0 {
-        usage_metadata.insert(
-            "thoughtsTokenCount".to_string(),
-            Value::from(usage.reasoning_tokens),
-        );
-    }
-    Value::Object(usage_metadata)
+    gemini_usage_metadata_from_usage(&usage)
 }
 
 fn parse_data_url(value: &str) -> Option<(String, String)> {
@@ -2993,6 +3156,59 @@ mod tests {
                 "file_path": "/tmp/a.txt",
                 "offset": 1,
                 "limit": 20,
+            })
+        );
+    }
+
+    #[test]
+    fn aggregates_claude_stream_removes_empty_pages_from_start_tool_input() {
+        let body = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_123\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-5\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_read\",\"name\":\"Read\",\"input\":{\"file_path\":\"/tmp/a.txt\",\"limit\":20,\"pages\":\"\"}}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+
+        let aggregated =
+            aggregate_claude_stream_sync_response(body.as_bytes()).expect("body should aggregate");
+
+        assert_eq!(
+            aggregated["content"][0]["input"],
+            json!({
+                "file_path": "/tmp/a.txt",
+                "limit": 20,
+            })
+        );
+    }
+
+    #[test]
+    fn aggregates_claude_stream_preserves_empty_pages_for_non_read_tool_input() {
+        let body = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_123\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-5\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_search\",\"name\":\"Search\",\"input\":{}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"query\\\":\\\"\\\",\\\"pages\\\":\\\"\\\"}\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+
+        let aggregated =
+            aggregate_claude_stream_sync_response(body.as_bytes()).expect("body should aggregate");
+
+        assert_eq!(aggregated["content"][0]["type"], "tool_use");
+        assert_eq!(
+            aggregated["content"][0]["input"],
+            json!({
+                "query": "",
+                "pages": "",
             })
         );
     }
@@ -3269,6 +3485,67 @@ mod tests {
     }
 
     #[test]
+    fn same_format_claude_sync_body_sanitizes_read_tool_input() {
+        let report_context = json!({
+            "provider_api_format": "claude:messages",
+            "client_api_format": "claude:messages",
+            "needs_conversion": false,
+        });
+        let provider_body_json = json!({
+            "id": "msg_read",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-sonnet-4-6",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_read",
+                    "name": "Read",
+                    "input": {
+                        "file_path": "/tmp/a.txt",
+                        "limit": 20,
+                        "pages": ""
+                    }
+                },
+                {
+                    "type": "tool_use",
+                    "id": "toolu_search",
+                    "name": "Search",
+                    "input": {
+                        "query": "",
+                        "pages": ""
+                    }
+                }
+            ]
+        });
+
+        let body_json = maybe_build_standard_same_format_sync_body_from_normalized_payload(
+            "claude_chat_sync_finalize",
+            200,
+            Some(&report_context),
+            Some(&provider_body_json),
+            None,
+        )
+        .expect("same-format sync body should succeed")
+        .expect("body should exist");
+
+        assert_eq!(
+            body_json["content"][0]["input"],
+            json!({
+                "file_path": "/tmp/a.txt",
+                "limit": 20,
+            })
+        );
+        assert_eq!(
+            body_json["content"][1]["input"],
+            json!({
+                "query": "",
+                "pages": "",
+            })
+        );
+    }
+
+    #[test]
     fn same_format_sync_response_restores_model_directive_display_model() {
         let report_context = json!({
             "provider_api_format": "openai:responses",
@@ -3465,6 +3742,25 @@ mod tests {
     }
 
     #[test]
+    fn reconstructs_openai_responses_image_generation_call_from_output_item_done() {
+        let body = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_image_123\",\"object\":\"response\",\"model\":\"gpt-5.4-mini\",\"status\":\"in_progress\",\"output\":[]}}\n\n",
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"ig_123\",\"type\":\"image_generation_call\",\"status\":\"completed\",\"output_format\":\"png\",\"result\":\"aGVsbG8=\"}}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_image_123\",\"object\":\"response\",\"model\":\"gpt-5.4-mini\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":2,\"total_tokens\":3}}}\n\n",
+        );
+
+        let result = aggregate_openai_responses_stream_sync_response(body.as_bytes())
+            .expect("openai-responses stream should aggregate into a sync body");
+
+        assert_eq!(result["output"][0]["type"], "image_generation_call");
+        assert_eq!(result["output"][0]["result"], "aGVsbG8=");
+        assert_eq!(result["output"][0]["output_format"], "png");
+    }
+
+    #[test]
     fn reconstructs_openai_responses_multi_part_message_content_order() {
         let body = concat!(
             "event: response.output_item.added\n",
@@ -3483,6 +3779,25 @@ mod tests {
         assert_eq!(result["output"][0]["type"], "message");
         assert_eq!(result["output"][0]["content"][0]["text"], "Hello");
         assert_eq!(result["output"][0]["content"][1]["text"], " world");
+    }
+
+    #[test]
+    fn aggregates_openai_responses_text_snapshot_deltas_without_duplicates() {
+        let body = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":{\"text\":\"Hello\"}}\n\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":{\"text\":\"Hello world\"}}\n\n",
+            "event: response.output_text.done\n",
+            "data: {\"type\":\"response.output_text.done\",\"output_index\":0,\"content_index\":0,\"text\":\"Hello world\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_snapshot_123\",\"object\":\"response\",\"model\":\"gpt-5\",\"status\":\"completed\",\"output\":[]}}\n\n",
+        );
+
+        let result = aggregate_openai_responses_stream_sync_response(body.as_bytes())
+            .expect("openai-responses stream should aggregate into a sync body");
+
+        assert_eq!(result["output"][0]["content"][0]["text"], "Hello world");
     }
 
     #[test]
@@ -3881,6 +4196,9 @@ mod tests {
                 "prompt_tokens": 2,
                 "completion_tokens": 4,
                 "total_tokens": 6,
+                "prompt_tokens_details": {
+                    "cached_tokens": 1
+                },
                 "completion_tokens_details": {
                     "reasoning_tokens": 1
                 }
@@ -3898,6 +4216,9 @@ mod tests {
         )
         .expect("canonical openai chat -> claude");
         assert_eq!(converted_claude, legacy_claude);
+        assert_eq!(converted_claude["usage"]["input_tokens"], 1);
+        assert_eq!(converted_claude["usage"]["cache_read_input_tokens"], 1);
+        assert_eq!(converted_claude["usage"]["output_tokens"], 4);
 
         let legacy_gemini =
             convert_openai_chat_response_to_gemini_chat(&provider_body_json, &report_context)
@@ -4009,6 +4330,9 @@ mod tests {
             converted_claude["content"][3]["content"],
             json!({"ok": true})
         );
+        assert_eq!(converted_claude["usage"]["input_tokens"], 1);
+        assert_eq!(converted_claude["usage"]["cache_read_input_tokens"], 2);
+        assert_eq!(converted_claude["usage"]["output_tokens"], 5);
 
         let converted_gemini = convert_standard_chat_response(
             &provider_body_json,

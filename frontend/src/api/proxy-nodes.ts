@@ -26,10 +26,10 @@ export interface ProxyNode {
   proxy_url?: string
   proxy_username?: string
   proxy_password?: string
-  // 硬件信息（aether-proxy 节点）
+  // 硬件信息（aether-tunnel 节点）
   hardware_info: Record<string, unknown> | null
   estimated_max_concurrency: number | null
-  // 远程配置（aether-proxy 节点）
+  // 远程配置（aether-tunnel 节点）
   remote_config: ProxyNodeRemoteConfig | null
   config_version: number
   registered_by: string | null

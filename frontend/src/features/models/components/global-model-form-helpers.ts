@@ -6,6 +6,7 @@ export const EMBEDDING_API_FORMATS = [
   'gemini:embedding',
   'jina:embedding',
   'doubao:embedding',
+  'aliyun:multimodal_embedding',
 ] as const
 
 export const RERANK_API_FORMATS = [

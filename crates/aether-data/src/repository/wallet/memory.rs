@@ -769,6 +769,41 @@ impl WalletReadRepository for InMemoryWalletRepository {
             .cloned())
     }
 
+    async fn find_pending_plan_purchase_order_by_user_id(
+        &self,
+        user_id: &str,
+        product_id: &str,
+    ) -> Result<Option<StoredAdminPaymentOrder>, DataLayerError> {
+        let now = current_unix_secs();
+        Ok(self
+            .payment_orders_by_id
+            .read()
+            .expect("wallet repo lock")
+            .values()
+            .filter(|order| {
+                order.user_id.as_deref() == Some(user_id)
+                    && order.status == "pending"
+                    && order
+                        .expires_at_unix_secs
+                        .is_some_and(|expires_at| expires_at > now)
+                    && order
+                        .gateway_response
+                        .as_ref()
+                        .is_some_and(|gateway_response| {
+                            gateway_response
+                                .get("order_kind")
+                                .and_then(serde_json::Value::as_str)
+                                == Some("plan_purchase")
+                                && gateway_response
+                                    .get("product_id")
+                                    .and_then(serde_json::Value::as_str)
+                                    == Some(product_id)
+                        })
+            })
+            .max_by_key(|order| order.created_at_unix_ms)
+            .cloned())
+    }
+
     async fn find_wallet_refund(
         &self,
         wallet_id: &str,

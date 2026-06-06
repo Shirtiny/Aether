@@ -28,20 +28,26 @@ mod redeem;
 #[path = "wallet/refunds.rs"]
 mod refunds;
 use self::flow::handle_wallet_flow;
+pub(in crate::handlers::public::support) use self::reads::{
+    build_wallet_balance_payload_for_auth_scope, build_wallet_balance_payload_for_user,
+    build_wallet_live_today_usage_payload_for_api_key,
+    build_wallet_live_today_usage_payload_for_user,
+};
 use self::reads::{
     build_wallet_daily_usage_payload, build_wallet_payload, build_wallet_zero_today_entry,
     handle_wallet_balance, handle_wallet_today_cost, handle_wallet_transactions,
-    parse_wallet_limit, parse_wallet_offset, wallet_fixed_offset, wallet_today_billing_date_string,
+    parse_wallet_limit, parse_wallet_offset, wallet_fixed_offset,
     wallet_transaction_payload_from_record,
 };
-pub(crate) use self::recharge::sanitize_wallet_gateway_response;
+pub(crate) use self::recharge::{direct_gateway_channels, sanitize_wallet_gateway_response};
 use self::recharge::{
     handle_wallet_create_recharge, handle_wallet_recharge_detail, handle_wallet_recharge_list,
     handle_wallet_recharge_options, wallet_recharge_detail_path_matches,
 };
 use self::redeem::handle_wallet_redeem;
 use self::refunds::{
-    handle_wallet_create_refund, handle_wallet_refund_detail, handle_wallet_refunds_list,
+    handle_wallet_create_refund, handle_wallet_refund_detail,
+    handle_wallet_refund_eligible_providers, handle_wallet_refunds_list,
     wallet_refund_detail_path_matches,
 };
 
@@ -58,8 +64,23 @@ const WALLET_SAFE_GATEWAY_RESPONSE_KEYS: &[&str] = &[
     "qr_code",
     "expires_at",
     "pay_amount",
+    "base_pay_amount",
+    "fee_rate",
+    "fee_amount",
     "pay_currency",
     "payment_channel",
+    "code_url",
+    "h5_url",
+    "jsapi",
+    "client_secret",
+    "publishable_key",
+    "intent_id",
+    "payment_method_types",
+    "provider_label",
+    "subject",
+    "callback_url",
+    "return_url",
+    "integration_status",
     "manual_credit",
 ];
 
@@ -135,6 +156,14 @@ pub(super) async fn maybe_build_local_wallet_response(
         && request_context.request_path == "/api/wallet/refunds"
     {
         return Some(handle_wallet_refunds_list(state, request_context, headers).await);
+    }
+
+    if decision.route_kind.as_deref() == Some("refund_eligible_providers")
+        && request_context.request_path == "/api/wallet/refunds/eligible-providers"
+    {
+        return Some(
+            handle_wallet_refund_eligible_providers(state, request_context, headers).await,
+        );
     }
 
     if decision.route_kind.as_deref() == Some("refund_detail")

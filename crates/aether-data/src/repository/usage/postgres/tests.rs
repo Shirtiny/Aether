@@ -235,25 +235,6 @@ fn usage_sql_summarizes_usage_by_provider_api_key_ids_in_database() {
 }
 
 #[test]
-fn usage_sql_materializes_provider_key_window_usage_in_status_snapshot() {
-    assert!(super::APPLY_PROVIDER_API_KEY_CODEX_WINDOW_USAGE_DELTA_SQL
-        .contains("UPDATE provider_api_keys AS keys"));
-    assert!(super::APPLY_PROVIDER_API_KEY_CODEX_WINDOW_USAGE_DELTA_SQL.contains("jsonb_set"));
-    assert!(
-        super::APPLY_PROVIDER_API_KEY_CODEX_WINDOW_USAGE_DELTA_SQL.contains("'{quota,windows}'")
-    );
-    assert!(super::APPLY_PROVIDER_API_KEY_CODEX_WINDOW_USAGE_DELTA_SQL.contains("'usage'"));
-    assert!(
-        super::APPLY_PROVIDER_API_KEY_CODEX_WINDOW_USAGE_DELTA_SQL.contains("WHEN '5h' THEN 300")
-    );
-    assert!(super::APPLY_PROVIDER_API_KEY_CODEX_WINDOW_USAGE_DELTA_SQL
-        .contains("WHEN 'weekly' THEN 10080"));
-    assert!(
-        !super::APPLY_PROVIDER_API_KEY_CODEX_WINDOW_USAGE_DELTA_SQL.contains("usage_billing_facts")
-    );
-}
-
-#[test]
 fn usage_sql_rebuilds_provider_key_window_usage_into_status_snapshot() {
     assert!(super::REBUILD_PROVIDER_API_KEY_CODEX_WINDOW_USAGE_STATS_SQL
         .contains("UPDATE provider_api_keys AS keys"));
@@ -281,17 +262,43 @@ fn usage_sql_serializes_request_id_upserts_before_reading_previous_usage() {
 }
 
 #[test]
+fn usage_sql_moves_shared_counter_updates_behind_outbox() {
+    let source = include_str!("mod.rs");
+    assert!(super::INSERT_USAGE_COUNTER_DELTA_SQL.contains("usage_counter_deltas"));
+    assert!(super::CLAIM_USAGE_COUNTER_DELTAS_SQL.contains("FOR UPDATE SKIP LOCKED"));
+    assert!(super::MARK_USAGE_COUNTER_DELTAS_PROCESSED_SQL.contains("processed_at = NOW()"));
+    assert!(super::TRY_LOCK_USAGE_COUNTER_FLUSH_SQL.contains("pg_try_advisory_xact_lock"));
+    assert!(source.contains("enqueue_api_key_usage_delta_in_tx("));
+    assert!(source.contains("enqueue_provider_api_key_usage_delta_in_tx("));
+    assert!(source.contains("enqueue_model_usage_delta_in_tx("));
+    assert!(source.contains("apply_provider_api_key_main_usage_delta_in_tx("));
+    assert!(source.contains("USAGE_COUNTER_KIND_PROVIDER_MONTHLY"));
+    assert!(source.contains("apply_provider_monthly_usage_delta_in_tx("));
+}
+
+#[test]
+fn usage_sql_exposes_counter_outbox_health() {
+    assert!(super::READ_USAGE_COUNTER_HEALTH_SQL.contains("pending_rows"));
+    assert!(super::READ_USAGE_COUNTER_HEALTH_SQL.contains("oldest_pending_created_at_unix_secs"));
+    assert!(super::READ_USAGE_COUNTER_HEALTH_SQL.contains("latest_processed_at_unix_secs"));
+    assert!(super::READ_PENDING_USAGE_COUNTER_DELTAS_BY_KIND_SQL.contains("GROUP BY kind"));
+}
+
+#[test]
 fn usage_sql_rebuild_matches_online_api_key_usage_semantics() {
-    assert!(super::REBUILD_API_KEY_USAGE_STATS_SQL.contains("COUNT(*)::INTEGER"));
+    assert!(super::REBUILD_API_KEY_USAGE_STATS_SQL.contains("COUNT(*)::BIGINT"));
     assert!(super::REBUILD_API_KEY_USAGE_STATS_SQL.contains("COALESCE("));
     assert!(super::REBUILD_API_KEY_USAGE_STATS_SQL.contains("total_tokens,"));
     assert!(super::REBUILD_API_KEY_USAGE_STATS_SQL
         .contains("COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)"));
     assert!(super::REBUILD_API_KEY_USAGE_STATS_SQL.contains("AND BTRIM(api_key_id) <> ''"));
+    assert!(super::REBUILD_API_KEY_USAGE_STATS_SQL
+        .contains("AND status NOT IN ('pending', 'streaming')"));
 }
 
 #[test]
 fn usage_sql_rebuild_matches_online_provider_key_usage_semantics() {
+    assert!(super::REBUILD_PROVIDER_API_KEY_USAGE_STATS_SQL.contains("COUNT(*)::BIGINT"));
     assert!(super::REBUILD_PROVIDER_API_KEY_USAGE_STATS_SQL
         .contains("NULLIF(BTRIM(error_message), '') IS NULL"));
     assert!(super::REBUILD_PROVIDER_API_KEY_USAGE_STATS_SQL.contains("COALESCE("));
@@ -300,6 +307,10 @@ fn usage_sql_rebuild_matches_online_provider_key_usage_semantics() {
         .contains("COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)"));
     assert!(super::REBUILD_PROVIDER_API_KEY_USAGE_STATS_SQL
         .contains("AND BTRIM(provider_api_key_id) <> ''"));
+    assert!(super::REBUILD_PROVIDER_API_KEY_USAGE_STATS_SQL
+        .contains("WHEN status NOT IN ('pending', 'streaming')"));
+    assert!(super::REBUILD_PROVIDER_API_KEY_USAGE_STATS_SQL
+        .contains("WHEN status IN ('pending', 'streaming') THEN 0"));
 }
 
 #[test]
@@ -428,6 +439,48 @@ fn usage_sql_summarize_usage_daily_heatmap_supports_daily_aggregates() {
 }
 
 #[test]
+fn usage_sql_daily_cutoff_falls_back_to_imported_stats_daily() {
+    let source = include_str!("mod.rs");
+    assert!(source.contains("FROM stats_summary"));
+    assert!(source.contains("SELECT MAX(date) AS latest_date"));
+    assert!(source.contains("FROM stats_daily"));
+    assert!(source.contains("FROM stats_user_daily"));
+    assert!(source.contains("FROM stats_daily_api_key"));
+    assert!(source.contains("value + chrono::Duration::days(1)"));
+}
+
+#[test]
+fn usage_sql_dashboard_daily_breakdown_falls_back_to_daily_totals() {
+    let source = include_str!("mod.rs");
+    assert!(source.contains("list_dashboard_daily_breakdown_from_daily_totals"));
+    assert!(source.contains("'aggregate'::TEXT AS model"));
+    assert!(source.contains("FROM stats_daily"));
+    assert!(source.contains("FROM stats_user_daily"));
+    assert!(source.contains("detailed_dates.contains(&item.date)"));
+    assert!(source.contains("query.tz_offset_minutes != 0"));
+    assert!(source.contains("return self.list_dashboard_daily_breakdown_raw(query).await;"));
+    assert!(!source.contains("aggregate_dates.insert(item.date.clone())"));
+}
+
+#[test]
+fn usage_sql_dashboard_daily_breakdown_keeps_all_local_day_model_provider_rows() {
+    let source = include_str!("mod.rs");
+    let raw_breakdown = source
+        .split("async fn list_dashboard_daily_breakdown_raw")
+        .nth(1)
+        .and_then(|tail| {
+            tail.split("pub async fn list_dashboard_daily_breakdown")
+                .next()
+        })
+        .expect("raw daily breakdown function should be present");
+    assert!(raw_breakdown.contains("GROUP BY date, \"usage\".model, \"usage\".provider_name"));
+    assert!(raw_breakdown.contains("ORDER BY date ASC, total_cost_usd DESC"));
+    assert!(raw_breakdown.contains("(\"usage\".created_at AT TIME ZONE 'UTC')"));
+    assert!(!raw_breakdown.contains("date_trunc('day', \"usage\".created_at +"));
+    assert!(!source.contains("if aggregate_dates.insert(item.date.clone())"));
+}
+
+#[test]
 fn usage_sql_summarize_usage_leaderboard_supports_daily_aggregates() {
     let source = include_str!("mod.rs");
     assert!(source.contains("summarize_usage_leaderboard_from_daily_aggregates"));
@@ -455,8 +508,26 @@ fn usage_sql_aggregate_usage_audits_supports_daily_model_and_provider_aggregates
 #[test]
 fn usage_sql_provider_aggregation_excludes_unknown_provider_labels() {
     let source = include_str!("mod.rs");
+    assert!(source.contains("const USAGE_PROVIDER_IDENTITY_FILTER_SQL"));
+    assert!(source.contains("const USAGE_PROVIDER_IDENTITY_SOURCE_SQL"));
+    assert!(source.contains(r#"BTRIM(COALESCE("usage".provider_id, '')) <> ''"#));
+    assert!(source.contains(r#"BTRIM(COALESCE("usage".provider_name, '')) <> ''"#));
+    assert!(source.contains("LEFT JOIN providers AS provider_by_id"));
+    assert!(source.contains("provider_by_id.id = BTRIM(\"usage\".provider_id)"));
+    assert!(source.contains("COALESCE(\n      provider_by_id.id,\n      CASE"));
+    assert!(
+        source.contains(
+            "ELSE BTRIM(\"usage\".provider_id)\n      END,\n      CASE\n        WHEN BTRIM(COALESCE(\"usage\".provider_name, ''))"
+        )
+    );
+    assert!(source.contains("COALESCE(\n      provider_by_id.name,"));
+    assert!(!source.contains("provider_by_name.name = BTRIM(\"usage\".provider_name)"));
+    assert!(source.contains("{provider_identity_source_expr} AS provider_identity_source"));
+    assert!(source.contains(r#"secondary_name_expr: "provider_identity_source""#));
+    assert!(source
+        .contains("COUNT(*) FILTER (WHERE secondary_name = 'provider_id') > 0 THEN 'provider_id'"));
     assert!(source.contains(
-        r#"lower(BTRIM(COALESCE(\"usage\".provider_name, ''))) NOT IN ('unknown', 'unknow', 'pending')"#
+        "if matches!(query.group_by, UsageAuditAggregationGroupBy::Provider) {\n            return self.aggregate_usage_audits_raw(query).await;"
     ));
     assert!(source.contains("exclude_reserved_provider_labels"));
     assert!(source.contains(
@@ -474,10 +545,41 @@ fn usage_sql_summarize_total_tokens_by_api_key_ids_supports_daily_aggregates() {
 }
 
 #[test]
+fn dashboard_aggregate_schema_mismatch_detector_matches_legacy_schema_failures() {
+    assert!(super::dashboard_aggregate_schema_mismatch_message(
+        "postgres error: error occurred while decoding column \"cutoff_date\": \
+         mismatched types; Rust type `chrono::DateTime<Utc>` (as SQL type `TIMESTAMPTZ`) \
+         is not compatible with SQL type `INT8`"
+    ));
+    assert!(super::dashboard_aggregate_schema_mismatch_message(
+        "postgres error: db error: ERROR: relation \"stats_daily_model_provider\" does not exist"
+    ));
+    assert!(super::dashboard_aggregate_schema_mismatch_message(
+        "postgres error: db error: ERROR: column \"effective_input_tokens\" does not exist"
+    ));
+    assert!(!super::dashboard_aggregate_schema_mismatch_message(
+        "postgres error: db error: ERROR: permission denied for relation stats_daily"
+    ));
+}
+
+#[test]
+fn dashboard_aggregate_reads_fallback_to_raw_on_schema_mismatch() {
+    let source = include_str!("mod.rs");
+    assert!(source.contains("dashboard_should_fallback_to_raw_on_aggregate_error"));
+    assert!(
+        source.contains("Err(err) if dashboard_should_fallback_to_raw_on_aggregate_error(&err)")
+    );
+    assert!(source.contains("return self.list_dashboard_daily_breakdown_raw(query).await;"));
+}
+
+#[test]
 fn usage_sql_summarize_usage_totals_by_user_ids_supports_user_summary_aggregates() {
     let source = include_str!("mod.rs");
     assert!(source.contains("FROM stats_user_summary"));
     assert!(source.contains("all_time_input_tokens"));
+    assert!(source.contains("FROM stats_user_daily"));
+    assert!(source.contains("date < $2"));
+    assert!(source.contains("summary_user_ids.contains(&user_id)"));
 }
 
 #[test]
@@ -493,8 +595,7 @@ fn usage_sql_raw_aggregates_use_canonical_billing_facts() {
         .contains("FROM usage_billing_facts AS \"usage\""));
     assert!(super::SUMMARIZE_USAGE_TOTALS_BY_USER_IDS_SQL
         .contains("FROM usage_billing_facts AS \"usage\""));
-    assert!(!super::APPLY_PROVIDER_API_KEY_CODEX_WINDOW_USAGE_DELTA_SQL
-        .contains("usage_billing_facts AS \"usage\""));
+    assert!(!source.contains("apply_provider_api_key_codex_window_usage_delta_in_tx"));
 }
 
 #[test]
@@ -623,6 +724,16 @@ fn usage_sql_uses_json_null_placeholders_for_usage_payload_columns() {
         super::LIST_USAGE_AUDITS_PREFIX,
         super::LIST_RECENT_USAGE_AUDITS_PREFIX,
     ] {
+        assert!(sql.contains("jsonb_strip_nulls(jsonb_build_object("));
+        assert!(sql.contains("jsonb_typeof(\"usage\".provider_request_body::jsonb)"));
+        assert!(!sql.contains("jsonb_typeof(\"usage\".provider_request_body)"));
+        assert!(sql.contains("'client_ip'"));
+        assert!(sql.contains("request_metadata->>'client_ip'"));
+        assert!(sql.contains("'user_agent'"));
+        assert!(sql.contains("request_metadata->>'user_agent'"));
+        assert!(sql.contains("AS client_family"));
+        assert!(sql.contains("request_metadata->'client_session_affinity'->>'client_family'"));
+        assert!(sql.contains("request_metadata->>'client_family'"));
         assert!(sql.contains("CAST(\"usage\".input_tokens AS INTEGER) AS input_tokens"));
         assert!(sql.contains(
             "usage_settlement_snapshots.billing_input_tokens AS settlement_billing_input_tokens"
@@ -680,6 +791,8 @@ fn usage_sql_upsert_returning_includes_routing_placeholders() {
         super::UPSERT_SQL.contains("NULL::varchar AS settlement_billing_snapshot_schema_version")
     );
     assert!(super::UPSERT_SQL.contains("NULL::double precision AS settlement_input_price_per_1m"));
+    assert!(super::UPSERT_SQL.contains("input_output_total_tokens"));
+    assert!(super::UPSERT_SQL.contains("input_context_tokens"));
 }
 
 #[test]
@@ -692,11 +805,27 @@ fn usage_sql_writes_usage_settlement_pricing_snapshots() {
 }
 
 #[test]
+fn usage_sql_upsert_recovers_missing_provider_links_after_billing_finalizes() {
+    for assignment in [
+        "provider_id = CASE WHEN \"usage\".billing_status = 'pending' OR (\"usage\".provider_id IS NULL AND (\"usage\".provider_endpoint_id IS NULL OR \"usage\".provider_endpoint_id = EXCLUDED.provider_endpoint_id) AND (\"usage\".provider_api_key_id IS NULL OR \"usage\".provider_api_key_id = EXCLUDED.provider_api_key_id)) THEN COALESCE(EXCLUDED.provider_id, \"usage\".provider_id) ELSE \"usage\".provider_id END",
+        "provider_endpoint_id = CASE WHEN \"usage\".billing_status = 'pending' OR (\"usage\".provider_endpoint_id IS NULL AND (\"usage\".provider_id IS NULL OR \"usage\".provider_id = EXCLUDED.provider_id) AND (\"usage\".provider_api_key_id IS NULL OR \"usage\".provider_api_key_id = EXCLUDED.provider_api_key_id)) THEN COALESCE(EXCLUDED.provider_endpoint_id, \"usage\".provider_endpoint_id) ELSE \"usage\".provider_endpoint_id END",
+        "provider_api_key_id = CASE WHEN \"usage\".billing_status = 'pending' OR (\"usage\".provider_api_key_id IS NULL AND (\"usage\".provider_id IS NULL OR \"usage\".provider_id = EXCLUDED.provider_id) AND (\"usage\".provider_endpoint_id IS NULL OR \"usage\".provider_endpoint_id = EXCLUDED.provider_endpoint_id)) THEN COALESCE(EXCLUDED.provider_api_key_id, \"usage\".provider_api_key_id) ELSE \"usage\".provider_api_key_id END",
+    ] {
+        assert!(
+            super::UPSERT_SQL.contains(assignment),
+            "missing provider link recovery assignment: {assignment}"
+        );
+    }
+}
+
+#[test]
 fn usage_sql_updates_usage_mirror_columns_from_terminal_events_only() {
     for assignment in [
         "input_tokens = CASE WHEN \"usage\".billing_status = 'pending' AND EXCLUDED.status IN ('completed', 'failed', 'cancelled') THEN GREATEST(\"usage\".input_tokens, EXCLUDED.input_tokens) ELSE \"usage\".input_tokens END",
         "output_tokens = CASE WHEN \"usage\".billing_status = 'pending' AND EXCLUDED.status IN ('completed', 'failed', 'cancelled') THEN GREATEST(\"usage\".output_tokens, EXCLUDED.output_tokens) ELSE \"usage\".output_tokens END",
         "total_tokens = CASE WHEN \"usage\".billing_status = 'pending' AND EXCLUDED.status IN ('completed', 'failed', 'cancelled') THEN GREATEST(\"usage\".total_tokens, EXCLUDED.total_tokens) ELSE \"usage\".total_tokens END",
+        "input_output_total_tokens = CASE WHEN \"usage\".billing_status = 'pending' AND EXCLUDED.status IN ('completed', 'failed', 'cancelled') THEN GREATEST(\"usage\".input_output_total_tokens, EXCLUDED.input_output_total_tokens) ELSE \"usage\".input_output_total_tokens END",
+        "input_context_tokens = CASE WHEN \"usage\".billing_status = 'pending' AND EXCLUDED.status IN ('completed', 'failed', 'cancelled') THEN GREATEST(\"usage\".input_context_tokens, EXCLUDED.input_context_tokens) ELSE \"usage\".input_context_tokens END",
         "cache_creation_input_tokens = CASE WHEN \"usage\".billing_status = 'pending' AND EXCLUDED.status IN ('completed', 'failed', 'cancelled') THEN GREATEST(\"usage\".cache_creation_input_tokens, EXCLUDED.cache_creation_input_tokens) ELSE \"usage\".cache_creation_input_tokens END",
         "cache_creation_input_tokens_5m = CASE WHEN \"usage\".billing_status = 'pending' AND EXCLUDED.status IN ('completed', 'failed', 'cancelled') THEN GREATEST(\"usage\".cache_creation_input_tokens_5m, EXCLUDED.cache_creation_input_tokens_5m) ELSE \"usage\".cache_creation_input_tokens_5m END",
         "cache_creation_input_tokens_1h = CASE WHEN \"usage\".billing_status = 'pending' AND EXCLUDED.status IN ('completed', 'failed', 'cancelled') THEN GREATEST(\"usage\".cache_creation_input_tokens_1h, EXCLUDED.cache_creation_input_tokens_1h) ELSE \"usage\".cache_creation_input_tokens_1h END",
@@ -771,6 +900,14 @@ fn usage_sql_clears_stale_failure_fields_for_non_failed_status_updates() {
     assert!(super::UPSERT_SQL.contains(
             "WHEN EXCLUDED.status IN ('pending', 'streaming', 'completed', 'cancelled') THEN EXCLUDED.error_category"
         ));
+}
+
+#[test]
+fn stale_cleanup_failed_candidate_sql_orders_by_effective_timestamp() {
+    let sql = super::SELECT_LATEST_FAILED_CANDIDATE_FOR_STALE_REQUESTS_SQL;
+    assert!(sql.contains("COALESCE(finished_at, started_at, created_at) DESC"));
+    assert!(!sql.contains("finished_at DESC NULLS LAST"));
+    assert!(!sql.contains("started_at DESC NULLS LAST"));
 }
 
 #[test]

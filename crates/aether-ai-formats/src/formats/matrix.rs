@@ -42,6 +42,7 @@ const EMBEDDING_CANDIDATE_API_FORMATS: &[&str] = &[
     "gemini:embedding",
     "jina:embedding",
     "doubao:embedding",
+    "aliyun:multimodal_embedding",
 ];
 const RERANK_CANDIDATE_API_FORMATS: &[&str] = &["openai:rerank", "jina:rerank"];
 
@@ -238,7 +239,11 @@ pub fn is_standard_api_format(api_format: &str) -> bool {
 pub fn is_embedding_api_format(api_format: &str) -> bool {
     matches!(
         normalize_api_format_alias(api_format).as_str(),
-        "openai:embedding" | "gemini:embedding" | "jina:embedding" | "doubao:embedding"
+        "openai:embedding"
+            | "gemini:embedding"
+            | "jina:embedding"
+            | "doubao:embedding"
+            | "aliyun:multimodal_embedding"
     )
 }
 
@@ -267,9 +272,11 @@ pub fn api_data_format_id(api_format: &str) -> Option<&'static str> {
         "gemini:generate_content" => Some("gemini"),
         "openai:chat" => Some("openai_chat"),
         "openai:responses" | "openai:responses:compact" => Some("openai_responses"),
-        "openai:embedding" | "gemini:embedding" | "jina:embedding" | "doubao:embedding" => {
-            Some("embedding")
-        }
+        "openai:embedding"
+        | "gemini:embedding"
+        | "jina:embedding"
+        | "doubao:embedding"
+        | "aliyun:multimodal_embedding" => Some("embedding"),
         "openai:rerank" | "jina:rerank" => Some("rerank"),
         _ => None,
     }
@@ -442,6 +449,7 @@ mod tests {
                 "gemini:embedding",
                 "jina:embedding",
                 "doubao:embedding",
+                "aliyun:multimodal_embedding",
             ]
         );
         assert_eq!(
@@ -451,6 +459,7 @@ mod tests {
                 "openai:embedding",
                 "gemini:embedding",
                 "doubao:embedding",
+                "aliyun:multimodal_embedding",
             ]
         );
         assert!(!request_candidate_api_formats("openai:embedding", false).contains(&"openai:chat"));
@@ -479,6 +488,7 @@ mod tests {
                 "openai:embedding",
                 "jina:embedding",
                 "doubao:embedding",
+                "aliyun:multimodal_embedding",
             ]
         );
         assert_eq!(
@@ -488,6 +498,17 @@ mod tests {
                 "openai:embedding",
                 "gemini:embedding",
                 "jina:embedding",
+                "aliyun:multimodal_embedding",
+            ]
+        );
+        assert_eq!(
+            request_candidate_api_formats("aliyun:multimodal_embedding", false),
+            vec![
+                "aliyun:multimodal_embedding",
+                "openai:embedding",
+                "gemini:embedding",
+                "jina:embedding",
+                "doubao:embedding",
             ]
         );
 
@@ -496,6 +517,7 @@ mod tests {
             "gemini:embedding",
             "jina:embedding",
             "doubao:embedding",
+            "aliyun:multimodal_embedding",
         ];
         for client_api_format in embedding_formats {
             for provider_api_format in embedding_formats {
@@ -520,6 +542,7 @@ mod tests {
             "gemini:embedding",
             "jina:embedding",
             "doubao:embedding",
+            "aliyun:multimodal_embedding",
         ];
         let standard_formats = [
             "openai:chat",

@@ -5,6 +5,7 @@ use aether_ai_serving::{
     AiCandidateRankingPort, AiRankableCandidateParts, AiRankingContextConfig,
     AiRankingSchedulingMode,
 };
+use aether_routing_core::{ResolvedRoutingPolicy, RoutingSchedulingMode, RoutingSetPriorityMode};
 use async_trait::async_trait;
 use tracing::warn;
 
@@ -16,12 +17,12 @@ use crate::scheduler::config::{
 };
 use aether_scheduler_core::{
     matches_affinity_target, ClientSessionAffinity, SchedulerAffinityTarget,
-    SchedulerMinimalCandidateSelectionCandidate, SchedulerRankableCandidate,
+    SchedulerMinimalCandidateSelectionCandidate, SchedulerPriorityMode, SchedulerRankableCandidate,
     SchedulerRankingContext, SchedulerRankingOutcome,
 };
 
 use super::candidate_affinity_cache::read_cached_scheduler_affinity_target;
-use super::candidate_resolution::EligibleLocalExecutionCandidate;
+use super::candidate_resolution::{EligibleLocalExecutionCandidate, LocalExecutionCandidateKind};
 use super::candidate_transport_ranking_facts::{
     resolve_cached_transport_ranking_facts, CandidateTransportRankingFacts,
 };
@@ -33,6 +34,7 @@ struct GatewayLocalCandidateRankingPort<'a> {
     client_session_affinity: Option<&'a ClientSessionAffinity>,
     required_capabilities: Option<&'a serde_json::Value>,
     ordering_config: SchedulerOrderingConfig,
+    routing_policy: Option<&'a ResolvedRoutingPolicy>,
 }
 
 #[async_trait]
@@ -89,8 +91,10 @@ impl AiCandidateRankingPort for GatewayLocalCandidateRankingPort<'_> {
             self.ordering_config,
         )
         .await;
+        let routing_overlaid_candidate =
+            routing_overlaid_candidate(self.routing_policy, candidate.kind, &candidate.candidate);
         Ok(build_ai_rankable_candidate(AiRankableCandidateParts {
-            candidate: &candidate.candidate,
+            candidate: &routing_overlaid_candidate,
             original_index,
             normalized_client_api_format,
             provider_api_format: candidate.provider_api_format.as_str(),
@@ -122,8 +126,9 @@ pub(crate) async fn rank_eligible_local_execution_candidates(
     auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
     client_session_affinity: Option<&ClientSessionAffinity>,
     required_capabilities: Option<&serde_json::Value>,
+    routing_policy: Option<&ResolvedRoutingPolicy>,
 ) -> Vec<EligibleLocalExecutionCandidate> {
-    let ordering_config = read_scheduler_ordering_config_or_default(state).await;
+    let ordering_config = scheduler_ordering_config_for_routing_policy(state, routing_policy).await;
     let port = GatewayLocalCandidateRankingPort {
         state,
         requested_model,
@@ -131,6 +136,7 @@ pub(crate) async fn rank_eligible_local_execution_candidates(
         client_session_affinity,
         required_capabilities,
         ordering_config,
+        routing_policy,
     };
 
     match run_ai_candidate_ranking(&port, candidates, normalized_client_api_format).await {
@@ -187,6 +193,58 @@ fn ai_ranking_scheduling_mode(mode: SchedulerSchedulingMode) -> AiRankingSchedul
         SchedulerSchedulingMode::CacheAffinity => AiRankingSchedulingMode::CacheAffinity,
         SchedulerSchedulingMode::LoadBalance => AiRankingSchedulingMode::LoadBalance,
     }
+}
+
+pub(crate) async fn scheduler_ordering_config_for_routing_policy(
+    state: PlannerAppState<'_>,
+    routing_policy: Option<&ResolvedRoutingPolicy>,
+) -> SchedulerOrderingConfig {
+    match routing_policy {
+        Some(policy) => scheduler_ordering_config_from_routing_policy(policy),
+        None => read_scheduler_ordering_config_or_default(state).await,
+    }
+}
+
+fn scheduler_ordering_config_from_routing_policy(
+    policy: &ResolvedRoutingPolicy,
+) -> SchedulerOrderingConfig {
+    SchedulerOrderingConfig {
+        priority_mode: match policy.priority_mode {
+            RoutingSetPriorityMode::Provider => SchedulerPriorityMode::Provider,
+            RoutingSetPriorityMode::GlobalKey => SchedulerPriorityMode::GlobalKey,
+        },
+        scheduling_mode: match policy.scheduling_mode {
+            RoutingSchedulingMode::FixedOrder => SchedulerSchedulingMode::FixedOrder,
+            RoutingSchedulingMode::CacheAffinity => SchedulerSchedulingMode::CacheAffinity,
+            RoutingSchedulingMode::LoadBalance => SchedulerSchedulingMode::LoadBalance,
+        },
+        keep_priority_on_conversion: policy.keep_priority_on_conversion,
+    }
+}
+
+fn routing_overlaid_candidate(
+    routing_policy: Option<&ResolvedRoutingPolicy>,
+    kind: LocalExecutionCandidateKind,
+    candidate: &SchedulerMinimalCandidateSelectionCandidate,
+) -> SchedulerMinimalCandidateSelectionCandidate {
+    let Some(policy) = routing_policy else {
+        return candidate.clone();
+    };
+    let mut overlaid = candidate.clone();
+    overlaid.provider_priority = policy
+        .ranking_overlay
+        .provider_priority_or_unspecified(candidate.provider_id.as_str());
+    let overlaid_key_priority = match kind {
+        LocalExecutionCandidateKind::SingleKey => policy
+            .ranking_overlay
+            .key_priority_or_unspecified(candidate.key_id.as_str()),
+        LocalExecutionCandidateKind::PoolGroup => policy
+            .ranking_overlay
+            .pool_priority_or_unspecified(candidate.provider_id.as_str()),
+    };
+    overlaid.key_internal_priority = overlaid_key_priority;
+    overlaid.key_global_priority_for_format = Some(overlaid_key_priority);
+    overlaid
 }
 
 async fn read_scheduler_ordering_config_or_default(
@@ -302,6 +360,82 @@ mod tests {
             selected_provider_model_name: "gpt-4.1".to_string(),
             mapping_matched_model: None,
         }
+    }
+
+    #[test]
+    fn routing_policy_priorities_do_not_fall_back_to_candidate_priorities() {
+        let mut candidate = sample_candidate("endpoint-1", "key-1");
+        candidate.provider_priority = 7;
+        candidate.key_internal_priority = 3;
+        candidate.key_global_priority_for_format = Some(2);
+        let policy = aether_routing_core::ResolvedRoutingPolicy {
+            group_id: Some("group-1".to_string()),
+            group_version: Some(1),
+            selection_source: "system_default".to_string(),
+            requested_model: "gpt-5".to_string(),
+            resolved_model: "gpt-5".to_string(),
+            priority_mode: aether_routing_core::RoutingSetPriorityMode::Provider,
+            scheduling_mode: aether_routing_core::RoutingSchedulingMode::CacheAffinity,
+            keep_priority_on_conversion: false,
+            ranking_overlay: aether_routing_core::RankingOverlay::default(),
+            mutation_plan: Default::default(),
+            pool_policy_overrides: BTreeMap::new(),
+            matched_rules: Vec::new(),
+        };
+
+        let overlaid = super::routing_overlaid_candidate(
+            Some(&policy),
+            LocalExecutionCandidateKind::SingleKey,
+            &candidate,
+        );
+
+        assert_eq!(
+            overlaid.provider_priority,
+            aether_routing_core::ROUTING_PRIORITY_UNSPECIFIED
+        );
+        assert_eq!(
+            overlaid.key_internal_priority,
+            aether_routing_core::ROUTING_PRIORITY_UNSPECIFIED
+        );
+        assert_eq!(
+            overlaid.key_global_priority_for_format,
+            Some(aether_routing_core::ROUTING_PRIORITY_UNSPECIFIED)
+        );
+    }
+
+    #[test]
+    fn routing_policy_uses_pool_priority_for_pool_group_global_key_slot() {
+        let mut candidate = sample_candidate("endpoint-1", "representative-key");
+        candidate.provider_priority = 7;
+        candidate.key_internal_priority = 3;
+        candidate.key_global_priority_for_format = Some(2);
+        let policy = aether_routing_core::ResolvedRoutingPolicy {
+            group_id: Some("group-1".to_string()),
+            group_version: Some(1),
+            selection_source: "system_default".to_string(),
+            requested_model: "gpt-5".to_string(),
+            resolved_model: "gpt-5".to_string(),
+            priority_mode: aether_routing_core::RoutingSetPriorityMode::GlobalKey,
+            scheduling_mode: aether_routing_core::RoutingSchedulingMode::CacheAffinity,
+            keep_priority_on_conversion: false,
+            ranking_overlay: aether_routing_core::RankingOverlay {
+                pool_priority_overrides: BTreeMap::from([("provider-1".to_string(), 4)]),
+                key_priority_overrides: BTreeMap::from([("representative-key".to_string(), 1)]),
+                ..Default::default()
+            },
+            mutation_plan: Default::default(),
+            pool_policy_overrides: BTreeMap::new(),
+            matched_rules: Vec::new(),
+        };
+
+        let overlaid = super::routing_overlaid_candidate(
+            Some(&policy),
+            LocalExecutionCandidateKind::PoolGroup,
+            &candidate,
+        );
+
+        assert_eq!(overlaid.key_internal_priority, 4);
+        assert_eq!(overlaid.key_global_priority_for_format, Some(4));
     }
 
     fn sample_provider() -> StoredProviderCatalogProvider {
@@ -1062,6 +1196,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
 
@@ -1136,6 +1271,7 @@ mod tests {
             ],
             "openai:chat",
             "gpt-4.1",
+            None,
             None,
             None,
             None,
@@ -1216,6 +1352,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
 
@@ -1277,6 +1414,7 @@ mod tests {
             ],
             "openai:chat",
             "gpt-4.1",
+            None,
             None,
             None,
             None,
@@ -1364,6 +1502,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
 
@@ -1434,6 +1573,7 @@ mod tests {
             "openai:chat",
             "gpt-4.1",
             Some(&auth_snapshot),
+            None,
             None,
             None,
             None,
@@ -1510,6 +1650,7 @@ mod tests {
             ],
             "claude:messages",
             "gpt-4.1",
+            None,
             None,
             None,
             None,
@@ -1606,6 +1747,7 @@ mod tests {
             "claude:messages",
             "gpt-4.1",
             Some(&auth_snapshot),
+            None,
             None,
             None,
             None,
@@ -1713,6 +1855,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
 
@@ -1809,6 +1952,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             aether_ai_serving::AiCandidateResolutionMode::Standard,
         )
         .await;
@@ -1897,6 +2041,7 @@ mod tests {
             "openai:chat",
             Some("gpt-4.1"),
             Some(&auth_snapshot),
+            None,
             None,
             None,
             None,

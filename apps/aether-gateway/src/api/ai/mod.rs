@@ -1,3 +1,4 @@
+mod aliyun;
 mod claude;
 mod doubao;
 mod gemini;

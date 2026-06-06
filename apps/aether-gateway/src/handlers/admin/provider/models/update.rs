@@ -33,6 +33,20 @@ pub(super) async fn maybe_handle(
                     .into_response(),
             ));
         };
+        let Some(provider) = state
+            .read_provider_catalog_providers_by_ids(std::slice::from_ref(&provider_id))
+            .await?
+            .into_iter()
+            .next()
+        else {
+            return Ok(Some(
+                (
+                    http::StatusCode::NOT_FOUND,
+                    Json(json!({ "detail": format!("Provider {provider_id} 不存在") })),
+                )
+                    .into_response(),
+            ));
+        };
         let Some(existing) = state
             .get_admin_provider_model(&provider_id, &model_id)
             .await?
@@ -110,8 +124,12 @@ pub(super) async fn maybe_handle(
                         .ok()
                         .map(|duration| duration.as_secs())
                         .unwrap_or(0);
-                    Json(build_admin_provider_model_response(&updated, now_unix_secs))
-                        .into_response()
+                    Json(build_admin_provider_model_response(
+                        &provider,
+                        &updated,
+                        now_unix_secs,
+                    ))
+                    .into_response()
                 }
                 None => (
                     http::StatusCode::NOT_FOUND,

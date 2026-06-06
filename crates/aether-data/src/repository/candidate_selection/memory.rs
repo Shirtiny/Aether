@@ -316,12 +316,27 @@ fn key_auth_channel_matches(row: &StoredMinimalCandidateSelectionRow, api_format
         "gemini_cli" | "antigravity" => {
             auth_type == "oauth" && api_format == "gemini:generate_content"
         }
+        "grok" => {
+            auth_type == "oauth"
+                && matches!(
+                    api_format.as_str(),
+                    "openai:chat" | "openai:responses" | "claude:messages" | "openai:image"
+                )
+        }
+        "windsurf" => {
+            matches!(auth_type.as_str(), "oauth" | "api_key" | "bearer")
+                && api_format == "openai:chat"
+        }
         "vertex_ai" => {
-            (auth_type == "api_key" && api_format == "gemini:generate_content")
+            (auth_type == "api_key"
+                && matches!(
+                    api_format.as_str(),
+                    "gemini:generate_content" | "gemini:embedding"
+                ))
                 || (matches!(auth_type.as_str(), "service_account" | "vertex_ai")
                     && matches!(
                         api_format.as_str(),
-                        "claude:messages" | "gemini:generate_content"
+                        "claude:messages" | "gemini:generate_content" | "gemini:embedding"
                     ))
         }
         _ => auth_type != "oauth",
@@ -420,6 +435,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn includes_grok_oauth_rows_for_chat_models() {
+        let mut row = sample_row(
+            "provider-grok",
+            "openai:chat",
+            "grok-4.20-0309-non-reasoning",
+            10,
+        );
+        row.provider_type = "grok".to_string();
+        row.provider_name = "grok".to_string();
+        row.key_auth_type = "oauth".to_string();
+        row.key_api_formats = Some(vec![
+            "openai:chat".to_string(),
+            "openai:responses".to_string(),
+            "claude:messages".to_string(),
+            "openai:image".to_string(),
+        ]);
+        let repository = InMemoryMinimalCandidateSelectionReadRepository::seed(vec![row]);
+
+        let rows = repository
+            .list_for_exact_api_format("openai:chat")
+            .await
+            .expect("list should succeed");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].provider_type, "grok");
+        assert_eq!(rows[0].global_model_name, "grok-4.20-0309-non-reasoning");
+    }
+
+    #[tokio::test]
     async fn requested_model_filter_respects_endpoint_scoped_default_mapping() {
         let mut selected = sample_row("provider-1", "openai:chat", "deepseek-v4-pro", 10);
         selected.endpoint_id = "endpoint-openai".to_string();
@@ -514,6 +558,34 @@ mod tests {
                 .map(|row| row.provider_id.as_str())
                 .collect::<Vec<_>>(),
             vec!["chatgpt-web-oauth", "chatgpt-web-bearer"]
+        );
+    }
+
+    #[tokio::test]
+    async fn allows_windsurf_managed_keys_for_openai_chat_only() {
+        let mut oauth = sample_row("windsurf-oauth", "openai:chat", "gpt-5", 10);
+        oauth.provider_type = "windsurf".to_string();
+        oauth.key_auth_type = "oauth".to_string();
+        let mut api_key = sample_row("windsurf-api-key", "openai:chat", "gpt-5", 20);
+        api_key.provider_type = "windsurf".to_string();
+        api_key.key_auth_type = "api_key".to_string();
+        let mut responses = sample_row("windsurf-responses", "openai:responses", "gpt-5", 30);
+        responses.provider_type = "windsurf".to_string();
+        responses.key_auth_type = "oauth".to_string();
+
+        let repository =
+            InMemoryMinimalCandidateSelectionReadRepository::seed(vec![oauth, api_key, responses]);
+
+        let rows = repository
+            .list_for_exact_api_format_and_requested_model("openai:chat", "gpt-5")
+            .await
+            .expect("list should succeed");
+
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.provider_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["windsurf-oauth", "windsurf-api-key"]
         );
     }
 

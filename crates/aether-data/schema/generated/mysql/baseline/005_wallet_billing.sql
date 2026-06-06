@@ -104,6 +104,68 @@ CREATE TABLE IF NOT EXISTS payment_orders (
     KEY idx_payment_orders_product (`product_id`)
 );
 
+CREATE TABLE IF NOT EXISTS user_invite_codes (
+    `user_id` VARCHAR(64) NOT NULL,
+    `invite_code` VARCHAR(64) NOT NULL,
+    `active` TINYINT(1) NOT NULL DEFAULT 1,
+    `created_at` BIGINT NOT NULL,
+    `updated_at` BIGINT NOT NULL,
+    PRIMARY KEY (`user_id`),
+    UNIQUE KEY user_invite_codes_invite_code_key (`invite_code`),
+    CONSTRAINT user_invite_codes_user_id_fkey FOREIGN KEY (`user_id`) REFERENCES users (`id`) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS user_referrals (
+    `id` VARCHAR(64) NOT NULL,
+    `inviter_user_id` VARCHAR(64) NOT NULL,
+    `invitee_user_id` VARCHAR(64) NOT NULL,
+    `invite_code_snapshot` VARCHAR(64) NOT NULL,
+    `source_json` JSON,
+    `first_paid_order_id` VARCHAR(64),
+    `first_paid_at` BIGINT,
+    `created_at` BIGINT NOT NULL,
+    `updated_at` BIGINT NOT NULL,
+    PRIMARY KEY (`id`),
+    UNIQUE KEY user_referrals_invitee_user_id_key (`invitee_user_id`),
+    KEY idx_user_referrals_inviter (`inviter_user_id`, `created_at`),
+    KEY idx_user_referrals_created (`created_at`),
+    KEY idx_user_referrals_invite_code (`invite_code_snapshot`),
+    CONSTRAINT user_referrals_inviter_user_id_fkey FOREIGN KEY (`inviter_user_id`) REFERENCES users (`id`) ON DELETE CASCADE,
+    CONSTRAINT user_referrals_invitee_user_id_fkey FOREIGN KEY (`invitee_user_id`) REFERENCES users (`id`) ON DELETE CASCADE,
+    CONSTRAINT user_referrals_first_paid_order_fkey FOREIGN KEY (`first_paid_order_id`) REFERENCES payment_orders (`id`) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS referral_rewards (
+    `id` VARCHAR(64) NOT NULL,
+    `referral_id` VARCHAR(64) NOT NULL,
+    `inviter_user_id` VARCHAR(64) NOT NULL,
+    `invitee_user_id` VARCHAR(64) NOT NULL,
+    `reward_type` VARCHAR(32) NOT NULL,
+    `trigger_point` VARCHAR(64) NOT NULL,
+    `source_order_id` VARCHAR(64),
+    `idempotency_key` VARCHAR(128) NOT NULL,
+    `amount_usd` DOUBLE NOT NULL,
+    `status` VARCHAR(32) NOT NULL DEFAULT 'pending',
+    `wallet_transaction_id` VARCHAR(64),
+    `reversed_amount_usd` DOUBLE NOT NULL DEFAULT 0,
+    `pending_reversal_amount_usd` DOUBLE NOT NULL DEFAULT 0,
+    `failure_reason` LONGTEXT,
+    `admin_operator_id` VARCHAR(64),
+    `admin_note` LONGTEXT,
+    `created_at` BIGINT NOT NULL,
+    `updated_at` BIGINT NOT NULL,
+    PRIMARY KEY (`id`),
+    UNIQUE KEY referral_rewards_idempotency_key_key (`idempotency_key`),
+    KEY idx_referral_rewards_inviter_status (`inviter_user_id`, `status`, `created_at`),
+    KEY idx_referral_rewards_inviter_created (`inviter_user_id`, `created_at`),
+    KEY idx_referral_rewards_created (`created_at`),
+    KEY idx_referral_rewards_source_order (`source_order_id`),
+    CONSTRAINT referral_rewards_referral_id_fkey FOREIGN KEY (`referral_id`) REFERENCES user_referrals (`id`) ON DELETE CASCADE,
+    CONSTRAINT referral_rewards_inviter_user_id_fkey FOREIGN KEY (`inviter_user_id`) REFERENCES users (`id`) ON DELETE CASCADE,
+    CONSTRAINT referral_rewards_invitee_user_id_fkey FOREIGN KEY (`invitee_user_id`) REFERENCES users (`id`) ON DELETE CASCADE,
+    CONSTRAINT referral_rewards_source_order_fkey FOREIGN KEY (`source_order_id`) REFERENCES payment_orders (`id`) ON DELETE SET NULL
+);
+
 CREATE TABLE IF NOT EXISTS payment_gateway_configs (
     `provider` VARCHAR(64) NOT NULL,
     `enabled` TINYINT(1) NOT NULL DEFAULT 0,
@@ -189,7 +251,8 @@ CREATE TABLE IF NOT EXISTS entitlement_usage_ledgers (
     `created_at` BIGINT NOT NULL,
     PRIMARY KEY (`id`),
     UNIQUE KEY uq_entitlement_usage_request (`user_entitlement_id`, `request_id`),
-    KEY idx_entitlement_usage_user_date (`user_id`, `usage_date`)
+    KEY idx_entitlement_usage_user_date (`user_id`, `usage_date`),
+    KEY idx_entitlement_usage_entitlement_date (`user_entitlement_id`, `usage_date`)
 );
 
 CREATE TABLE IF NOT EXISTS refund_requests (

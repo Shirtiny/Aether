@@ -1,19 +1,21 @@
 use async_trait::async_trait;
-use sqlx::{sqlite::SqliteRow, Row};
+use sqlx::{sqlite::SqliteRow, QueryBuilder, Row, Sqlite};
 
 use super::types::{
     bucket_start_unix_secs, build_tunnel_error_event_detail, build_tunnel_metrics_sample,
     log_reported_tunnel_error_event, normalize_proxy_metadata,
-    reconcile_remote_config_after_heartbeat, ProxyNodeEventQuery, ProxyNodeHeartbeatMutation,
-    ProxyNodeManualCreateMutation, ProxyNodeManualUpdateMutation, ProxyNodeMetricsCleanupSummary,
-    ProxyNodeMetricsStep, ProxyNodeReadRepository, ProxyNodeRegistrationMutation,
-    ProxyNodeRemoteConfigMutation, ProxyNodeTrafficMutation, ProxyNodeTunnelStatusMutation,
-    ProxyNodeWriteRepository, StoredProxyFleetMetricsBucket, StoredProxyNode, StoredProxyNodeEvent,
+    preserve_proxy_metadata_tunnel_security, reconcile_remote_config_after_heartbeat,
+    ProxyNodeEventQuery, ProxyNodeHeartbeatMutation, ProxyNodeManualCreateMutation,
+    ProxyNodeManualUpdateMutation, ProxyNodeMetricsCleanupSummary, ProxyNodeMetricsStep,
+    ProxyNodeReadRepository, ProxyNodeRegistrationMutation, ProxyNodeRemoteConfigMutation,
+    ProxyNodeTrafficMutation, ProxyNodeTunnelStatusMutation, ProxyNodeWriteRepository,
+    StoredProxyFleetMetricsBucket, StoredProxyNode, StoredProxyNodeEvent,
     StoredProxyNodeMetricsBucket, PROXY_NODE_EVENT_TYPE_TUNNEL_ERROR,
 };
 use crate::driver::sqlite::SqlitePool;
 use crate::error::SqlResultExt;
 use crate::DataLayerError;
+use aether_data_query::{push_eq, push_limit, WhereClause};
 
 #[derive(Debug, Clone)]
 pub struct SqliteProxyNodeReadRepository {
@@ -337,13 +339,23 @@ SELECT
 FROM proxy_nodes
 "#;
 
+const PROXY_NODE_EVENT_COLUMNS: &str = r#"
+SELECT
+  id,
+  node_id,
+  event_type,
+  detail,
+  event_metadata,
+  created_at AS created_at_unix_ms
+FROM proxy_node_events
+"#;
+
 #[async_trait]
 impl ProxyNodeReadRepository for SqliteProxyNodeReadRepository {
     async fn list_proxy_nodes(&self) -> Result<Vec<StoredProxyNode>, DataLayerError> {
-        let rows = sqlx::query(&format!("{PROXY_NODE_COLUMNS} ORDER BY name ASC, id ASC"))
-            .fetch_all(&self.pool)
-            .await
-            .map_sql_err()?;
+        let mut builder = QueryBuilder::<Sqlite>::new(PROXY_NODE_COLUMNS);
+        builder.push(" ORDER BY name ASC, id ASC");
+        let rows = builder.build().fetch_all(&self.pool).await.map_sql_err()?;
         rows.iter().map(map_proxy_node_row).collect()
     }
 
@@ -351,8 +363,12 @@ impl ProxyNodeReadRepository for SqliteProxyNodeReadRepository {
         &self,
         node_id: &str,
     ) -> Result<Option<StoredProxyNode>, DataLayerError> {
-        let row = sqlx::query(&format!("{PROXY_NODE_COLUMNS} WHERE id = ? LIMIT 1"))
-            .bind(node_id)
+        let mut builder = QueryBuilder::<Sqlite>::new(PROXY_NODE_COLUMNS);
+        let mut where_clause = WhereClause::new();
+        push_eq(&mut builder, &mut where_clause, "id", node_id.to_string());
+        push_limit(&mut builder, 1);
+        let row = builder
+            .build()
             .fetch_optional(&self.pool)
             .await
             .map_sql_err()?;
@@ -364,26 +380,17 @@ impl ProxyNodeReadRepository for SqliteProxyNodeReadRepository {
         node_id: &str,
         limit: usize,
     ) -> Result<Vec<StoredProxyNodeEvent>, DataLayerError> {
-        let rows = sqlx::query(
-            r#"
-SELECT
-  id,
-  node_id,
-  event_type,
-  detail,
-  event_metadata,
-  created_at AS created_at_unix_ms
-FROM proxy_node_events
-WHERE node_id = ?
-ORDER BY created_at DESC, id DESC
-LIMIT ?
-"#,
-        )
-        .bind(node_id)
-        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
-        .fetch_all(&self.pool)
-        .await
-        .map_sql_err()?;
+        let mut builder = QueryBuilder::<Sqlite>::new(PROXY_NODE_EVENT_COLUMNS);
+        let mut where_clause = WhereClause::new();
+        push_eq(
+            &mut builder,
+            &mut where_clause,
+            "node_id",
+            node_id.to_string(),
+        );
+        builder.push(" ORDER BY created_at DESC, id DESC");
+        push_limit(&mut builder, i64::try_from(limit).unwrap_or(i64::MAX));
+        let rows = builder.build().fetch_all(&self.pool).await.map_sql_err()?;
         rows.iter().map(map_proxy_node_event_row).collect()
     }
 
@@ -392,51 +399,36 @@ LIMIT ?
         node_id: &str,
         query: &ProxyNodeEventQuery,
     ) -> Result<Vec<StoredProxyNodeEvent>, DataLayerError> {
-        let rows = sqlx::query(
-            r#"
-SELECT
-  id,
-  node_id,
-  event_type,
-  detail,
-  event_metadata,
-  created_at AS created_at_unix_ms
-FROM proxy_node_events
-WHERE node_id = ?
-  AND (? IS NULL OR created_at >= ?)
-  AND (? IS NULL OR created_at <= ?)
-  AND (? IS NULL OR LOWER(event_type) = LOWER(?))
-ORDER BY created_at DESC, id DESC
-LIMIT ?
-"#,
-        )
-        .bind(node_id)
-        .bind(
-            query
-                .from_unix_secs
-                .map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
-        )
-        .bind(
-            query
-                .from_unix_secs
-                .map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
-        )
-        .bind(
-            query
-                .to_unix_secs
-                .map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
-        )
-        .bind(
-            query
-                .to_unix_secs
-                .map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
-        )
-        .bind(query.event_type.as_deref())
-        .bind(query.event_type.as_deref())
-        .bind(i64::try_from(query.limit).unwrap_or(i64::MAX))
-        .fetch_all(&self.pool)
-        .await
-        .map_sql_err()?;
+        let mut builder = QueryBuilder::<Sqlite>::new(PROXY_NODE_EVENT_COLUMNS);
+        let mut where_clause = WhereClause::new();
+        push_eq(
+            &mut builder,
+            &mut where_clause,
+            "node_id",
+            node_id.to_string(),
+        );
+        if let Some(from_unix_secs) = query.from_unix_secs {
+            where_clause.push_next(&mut builder);
+            builder
+                .push("created_at >= ")
+                .push_bind(i64::try_from(from_unix_secs).unwrap_or(i64::MAX));
+        }
+        if let Some(to_unix_secs) = query.to_unix_secs {
+            where_clause.push_next(&mut builder);
+            builder
+                .push("created_at <= ")
+                .push_bind(i64::try_from(to_unix_secs).unwrap_or(i64::MAX));
+        }
+        if let Some(event_type) = query.event_type.as_deref() {
+            where_clause.push_next(&mut builder);
+            builder
+                .push("LOWER(event_type) = LOWER(")
+                .push_bind(event_type.to_string())
+                .push(")");
+        }
+        builder.push(" ORDER BY created_at DESC, id DESC");
+        push_limit(&mut builder, i64::try_from(query.limit).unwrap_or(i64::MAX));
+        let rows = builder.build().fetch_all(&self.pool).await.map_sql_err()?;
         rows.iter().map(map_proxy_node_event_row).collect()
     }
 
@@ -755,7 +747,7 @@ WHERE is_manual = 0
         };
         if !node.tunnel_mode {
             return Err(DataLayerError::InvalidInput(
-                "non-tunnel mode is no longer supported, please upgrade aether-proxy to use tunnel mode"
+                "non-tunnel mode is no longer supported, please upgrade aether-tunnel to use tunnel mode"
                     .to_string(),
             ));
         }
@@ -779,10 +771,15 @@ WHERE is_manual = 0
         if let Some(value) = mutation.avg_latency_ms {
             node.avg_latency_ms = Some(value);
         }
-        if let Some(value) = normalize_proxy_metadata(
+        let normalized_proxy_metadata = normalize_proxy_metadata(
             mutation.proxy_metadata.as_ref(),
             mutation.proxy_version.as_deref(),
-        ) {
+        );
+        let normalized_proxy_metadata = preserve_proxy_metadata_tunnel_security(
+            previous_proxy_metadata.as_ref(),
+            normalized_proxy_metadata,
+        );
+        if let Some(value) = normalized_proxy_metadata {
             node.proxy_metadata = Some(value);
         }
         if let Some(value) = mutation.total_requests_delta.filter(|value| *value > 0) {
@@ -1440,7 +1437,7 @@ VALUES ('node-1', 'registered', 'ok', 3)
                 log_level: Some("debug".to_string()),
                 heartbeat_interval: Some(45),
                 scheduling_state: Some(Some("draining".to_string())),
-                upgrade_to: Some(Some("proxy-v2.0.0".to_string())),
+                upgrade_to: Some(Some("tunnel-v2.0.0".to_string())),
             })
             .await
             .expect("remote config should update")
@@ -1573,6 +1570,33 @@ VALUES ('node-1', 'registered', 'ok', 3)
             .apply_heartbeat(&ProxyNodeHeartbeatMutation {
                 node_id: registered.id.clone(),
                 heartbeat_interval: Some(30),
+                active_connections: Some(0),
+                total_requests_delta: None,
+                avg_latency_ms: None,
+                failed_requests_delta: None,
+                dns_failures_delta: None,
+                stream_errors_delta: None,
+                proxy_metadata: Some(json!({
+                    "tunnel_metrics": {
+                        "connect_errors": 0,
+                        "disconnects": 0,
+                        "error_events_total": 0,
+                        "ws_in_bytes": 0,
+                        "ws_out_bytes": 0,
+                        "ws_in_frames": 0,
+                        "ws_out_frames": 0,
+                        "heartbeat_rtt_last_ms": 0
+                    }
+                })),
+                proxy_version: Some("1.0.0".to_string()),
+            })
+            .await
+            .expect("baseline heartbeat should apply")
+            .expect("node should exist");
+        repository
+            .apply_heartbeat(&ProxyNodeHeartbeatMutation {
+                node_id: registered.id.clone(),
+                heartbeat_interval: Some(30),
                 active_connections: Some(5),
                 total_requests_delta: None,
                 avg_latency_ms: None,
@@ -1612,13 +1636,44 @@ VALUES ('node-1', 'registered', 'ok', 3)
             )
             .await
             .expect("metrics should list");
-        assert_eq!(metrics.len(), 1);
-        assert_eq!(metrics[0].samples, 1);
-        assert_eq!(metrics[0].uptime_samples, 1);
-        assert_eq!(metrics[0].active_connections_max, 5);
-        assert_eq!(metrics[0].heartbeat_rtt_ms_sum, 33);
-        assert_eq!(metrics[0].connect_errors_delta, 4);
-        assert_eq!(metrics[0].ws_out_frames_delta, 6);
+        assert!(!metrics.is_empty());
+        assert_eq!(metrics.iter().map(|bucket| bucket.samples).sum::<i64>(), 2);
+        assert_eq!(
+            metrics
+                .iter()
+                .map(|bucket| bucket.uptime_samples)
+                .sum::<i64>(),
+            2
+        );
+        assert_eq!(
+            metrics
+                .iter()
+                .map(|bucket| bucket.active_connections_max)
+                .max()
+                .unwrap_or_default(),
+            5
+        );
+        assert_eq!(
+            metrics
+                .iter()
+                .map(|bucket| bucket.heartbeat_rtt_ms_sum)
+                .sum::<i64>(),
+            33
+        );
+        assert_eq!(
+            metrics
+                .iter()
+                .map(|bucket| bucket.connect_errors_delta)
+                .sum::<i64>(),
+            4
+        );
+        assert_eq!(
+            metrics
+                .iter()
+                .map(|bucket| bucket.ws_out_frames_delta)
+                .sum::<i64>(),
+            6
+        );
 
         let fleet = repository
             .list_proxy_fleet_metrics(
@@ -1629,9 +1684,15 @@ VALUES ('node-1', 'registered', 'ok', 3)
             )
             .await
             .expect("fleet metrics should list");
-        assert_eq!(fleet.len(), 1);
-        assert_eq!(fleet[0].samples, 1);
-        assert_eq!(fleet[0].error_events_delta, 1);
+        assert!(!fleet.is_empty());
+        assert_eq!(fleet.iter().map(|bucket| bucket.samples).sum::<i64>(), 2);
+        assert_eq!(
+            fleet
+                .iter()
+                .map(|bucket| bucket.error_events_delta)
+                .sum::<i64>(),
+            1
+        );
 
         let events = repository
             .list_proxy_node_events_filtered(

@@ -16,6 +16,7 @@ struct KiroClaudeStreamState {
     model: String,
     thinking_enabled: bool,
     estimated_input_tokens: usize,
+    cache_usage: Option<super::KiroStreamCacheUsage>,
     message_id: String,
     output_tokens: usize,
     context_input_tokens: Option<usize>,

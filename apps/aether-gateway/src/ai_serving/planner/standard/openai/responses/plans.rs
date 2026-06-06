@@ -29,7 +29,7 @@ pub(crate) struct LocalOpenAiResponsesSyncAttemptSource<'a> {
     state: &'a AppState,
     parts: &'a http::request::Parts,
     trace_id: &'a str,
-    body_json: &'a serde_json::Value,
+    body_json: serde_json::Value,
     input: LocalOpenAiResponsesDecisionInput,
     spec: LocalOpenAiResponsesSpec,
     candidates: LocalOpenAiResponsesCandidateAttemptSource<'a>,
@@ -39,7 +39,7 @@ pub(crate) struct LocalOpenAiResponsesStreamAttemptSource<'a> {
     state: &'a AppState,
     parts: &'a http::request::Parts,
     trace_id: &'a str,
-    body_json: &'a serde_json::Value,
+    body_json: serde_json::Value,
     input: LocalOpenAiResponsesDecisionInput,
     spec: LocalOpenAiResponsesSpec,
     candidates: LocalOpenAiResponsesCandidateAttemptSource<'a>,
@@ -62,7 +62,7 @@ pub(super) async fn build_local_sync_attempt_source<'a>(
         body_json,
         spec_metadata.decision_kind,
     )
-    .await
+    .await?
     else {
         return Ok(None);
     };
@@ -74,8 +74,13 @@ pub(super) async fn build_local_sync_attempt_source<'a>(
         Some(input.requested_model.as_str()),
         "candidate_evaluation_incomplete",
     );
+    let effective_body_json = input.effective_body_json(body_json).clone();
     let (candidates, candidate_count) = build_local_openai_responses_candidate_attempt_source(
-        state, trace_id, &input, body_json, spec,
+        state,
+        trace_id,
+        &input,
+        &effective_body_json,
+        spec,
     )
     .await?;
     apply_local_runtime_candidate_evaluation_progress(state, trace_id, candidate_count);
@@ -88,7 +93,7 @@ pub(super) async fn build_local_sync_attempt_source<'a>(
             state,
             parts,
             trace_id,
-            body_json,
+            body_json: effective_body_json,
             input,
             spec,
             candidates,
@@ -114,7 +119,7 @@ pub(super) async fn build_local_stream_attempt_source<'a>(
         body_json,
         spec_metadata.decision_kind,
     )
-    .await
+    .await?
     else {
         return Ok(None);
     };
@@ -126,8 +131,13 @@ pub(super) async fn build_local_stream_attempt_source<'a>(
         Some(input.requested_model.as_str()),
         "candidate_evaluation_incomplete",
     );
+    let effective_body_json = input.effective_body_json(body_json).clone();
     let (candidates, candidate_count) = build_local_openai_responses_candidate_attempt_source(
-        state, trace_id, &input, body_json, spec,
+        state,
+        trace_id,
+        &input,
+        &effective_body_json,
+        spec,
     )
     .await?;
     apply_local_runtime_candidate_evaluation_progress(state, trace_id, candidate_count);
@@ -140,7 +150,7 @@ pub(super) async fn build_local_stream_attempt_source<'a>(
             state,
             parts,
             trace_id,
-            body_json,
+            body_json: effective_body_json,
             input,
             spec,
             candidates,
@@ -214,19 +224,19 @@ impl LocalOpenAiResponsesSyncAttemptSource<'_> {
             self.state,
             self.parts,
             self.trace_id,
-            self.body_json,
+            &self.body_json,
             &self.input,
             attempt,
             self.spec,
         )
-        .await
+        .await?
         else {
             return Ok(None);
         };
 
         match build_openai_responses_sync_plan_from_decision(
             self.parts,
-            self.body_json,
+            &self.body_json,
             payload,
             self.spec.compact,
         ) {
@@ -252,19 +262,19 @@ impl LocalOpenAiResponsesStreamAttemptSource<'_> {
             self.state,
             self.parts,
             self.trace_id,
-            self.body_json,
+            &self.body_json,
             &self.input,
             attempt,
             self.spec,
         )
-        .await
+        .await?
         else {
             return Ok(None);
         };
 
         match build_openai_responses_stream_plan_from_decision(
             self.parts,
-            self.body_json,
+            &self.body_json,
             payload,
             self.spec.compact,
         ) {
@@ -298,7 +308,7 @@ pub(super) async fn build_local_sync_plan_and_reports(
         body_json,
         spec_metadata.decision_kind,
     )
-    .await
+    .await?
     else {
         return Ok(Vec::new());
     };
@@ -325,7 +335,7 @@ pub(super) async fn build_local_sync_plan_and_reports(
         let Some(payload) = maybe_build_local_openai_responses_decision_payload_for_candidate(
             state, parts, trace_id, body_json, &input, attempt, spec,
         )
-        .await
+        .await?
         else {
             continue;
         };
@@ -370,7 +380,7 @@ pub(super) async fn build_local_stream_plan_and_reports(
         body_json,
         spec_metadata.decision_kind,
     )
-    .await
+    .await?
     else {
         return Ok(Vec::new());
     };
@@ -397,7 +407,7 @@ pub(super) async fn build_local_stream_plan_and_reports(
         let Some(payload) = maybe_build_local_openai_responses_decision_payload_for_candidate(
             state, parts, trace_id, body_json, &input, attempt, spec,
         )
-        .await
+        .await?
         else {
             continue;
         };

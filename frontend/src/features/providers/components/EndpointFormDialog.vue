@@ -35,7 +35,10 @@
                   停用
                 </Badge>
               </div>
-              <div class="flex items-center gap-1.5">
+              <div
+                v-if="!isEndpointConfigReadOnly"
+                class="flex items-center gap-1.5"
+              >
                 <!-- 格式转换按钮 -->
                 <span
                   class="mr-1"
@@ -144,7 +147,7 @@
                     <Label class="text-xs text-muted-foreground">Base URL</Label>
                     <Input
                       :model-value="getEndpointEditState(endpoint.id)?.url ?? endpoint.base_url"
-                      :placeholder="provider?.website || 'https://api.example.com'"
+                      :placeholder="getEndpointBaseUrlPlaceholder(endpoint.api_format)"
                       :disabled="isFixedProvider"
                       @update:model-value="(v) => updateEndpointField(endpoint.id, 'url', v)"
                     />
@@ -153,15 +156,21 @@
                     <Label class="text-xs text-muted-foreground">自定义路径</Label>
                     <Input
                       :model-value="getDisplayedPath(endpoint)"
-                      :placeholder="getDefaultPath(endpoint.api_format, endpoint.base_url) || '留空使用默认'"
-                      :disabled="isFixedProvider"
+                      :placeholder="getEndpointDefaultPath(endpoint) || '留空使用默认'"
                       @update:model-value="(v) => updateEndpointField(endpoint.id, 'path', v)"
                     />
+                    <p
+                      v-if="getEndpointDefaultPath(endpoint)"
+                      class="text-[10px] text-muted-foreground truncate"
+                      :title="getEndpointDefaultPath(endpoint)"
+                    >
+                      当前默认路径：{{ getEndpointDefaultPath(endpoint) }}
+                    </p>
                   </div>
                 </div>
                 <!-- 保存/撤销按钮（URL/路径有修改时显示） -->
                 <div
-                  v-if="hasUrlChanges(endpoint)"
+                  v-if="!isEndpointConfigReadOnly && hasUrlChanges(endpoint)"
                   class="flex items-center gap-1 shrink-0"
                 >
                   <Button
@@ -187,7 +196,10 @@
               </div>
 
               <!-- 请求/响应规则（请求头、请求体和响应头规则） -->
-              <Collapsible v-model:open="endpointRulesExpanded[endpoint.id]">
+              <Collapsible
+                v-if="!isEndpointConfigReadOnly"
+                v-model:open="endpointRulesExpanded[endpoint.id]"
+              >
                 <div class="flex items-center gap-2">
                   <!-- 有规则时显示可折叠的触发器 -->
                   <CollapsibleTrigger
@@ -953,7 +965,7 @@
                 <Input
                   v-model="newEndpoint.base_url"
                   size="sm"
-                  :placeholder="provider?.website || 'https://api.example.com'"
+                  :placeholder="newEndpointBaseUrlPlaceholder"
                 />
               </div>
               <div class="space-y-1.5">
@@ -963,6 +975,13 @@
                   size="sm"
                   :placeholder="newEndpointDefaultPath || '留空使用默认'"
                 />
+                <p
+                  v-if="newEndpointDefaultPath"
+                  class="text-[10px] text-muted-foreground truncate"
+                  :title="newEndpointDefaultPath"
+                >
+                  当前默认路径：{{ newEndpointDefaultPath }}
+                </p>
               </div>
             </div>
           </div>
@@ -1031,6 +1050,7 @@ import { log } from '@/utils/logger'
 import AlertDialog from '@/components/common/AlertDialog.vue'
 import EndpointConditionEditor from './EndpointConditionEditor.vue'
 import ProxyNodeSelect from './ProxyNodeSelect.vue'
+import { getDefaultEndpointBaseUrl, getDefaultEndpointPath, normalizeEndpointApiFormat } from './endpoint-default-paths'
 import { useProxyNodesStore } from '@/stores/proxy-nodes'
 import {
   createEndpoint,
@@ -1777,6 +1797,10 @@ const isFixedProvider = computed(() => {
   return !!t && t !== 'custom'
 })
 
+const isEndpointConfigReadOnly = computed(() => {
+  return (props.provider?.provider_type || '').trim().toLowerCase() === 'gemini_cli'
+})
+
 // 新端点表单
 const newEndpoint = ref({
   api_format: '',
@@ -1786,6 +1810,8 @@ const newEndpoint = ref({
 
 // API 格式列表
 const apiFormats = ref<Array<{ value: string; label: string; default_path: string }>>([])
+
+const fallbackEndpointBaseUrl = 'https://api.example.com'
 
 // 本地端点列表
 const localEndpoints = ref<ProviderEndpoint[]>([])
@@ -1812,13 +1838,6 @@ function hasDefaultBodyRules(apiFormat: string): boolean {
   const cacheKey = defaultBodyRulesCacheKey(apiFormat)
   if (!defaultBodyRulesLoaded.value[cacheKey]) return false
   return (defaultBodyRulesByFormat.value[cacheKey]?.length || 0) > 0
-}
-
-function normalizeLegacyOpenAIFormatAlias(apiFormat: string): string {
-  switch (apiFormat.trim().toLowerCase()) {
-    default:
-      return apiFormat.trim().toLowerCase()
-  }
 }
 
 async function loadDefaultBodyRulesForFormat(apiFormat: string, force = false): Promise<BodyRule[]> {
@@ -1857,39 +1876,41 @@ async function preloadDefaultBodyRules(endpoints: ProviderEndpoint[]): Promise<v
 // 获取指定 API 格式的默认路径
 function getDefaultPath(apiFormat: string, baseUrl?: string): string {
   const providerType = (props.provider?.provider_type || '').toLowerCase()
-  const normalizedApiFormat = normalizeLegacyOpenAIFormatAlias(apiFormat)
-  if (providerType === 'vertex_ai') {
-    if (normalizedApiFormat === 'gemini:generate_content') {
-      return '/v1/publishers/google/models/{model}:{action}'
-    }
-    if (normalizedApiFormat === 'claude:messages') {
-      return '/v1/projects/{project_id}/locations/{region}/publishers/anthropic/models/{model}:{action}'
-    }
-  }
-
-  const format = apiFormats.value.find(f => f.value === normalizedApiFormat)
-  const defaultPath = format?.default_path || ''
-  // Codex 端点使用 /responses 而非 /v1/responses
-  const isCodex = providerType
-    ? providerType === 'codex'
-    : (!!baseUrl && isCodexUrl(baseUrl))
-  if (normalizedApiFormat === 'openai:responses' && isCodex) {
-    return '/responses'
-  }
-  return defaultPath
+  return getDefaultEndpointPath({
+    apiFormat,
+    providerType,
+    baseUrl,
+    apiFormats: apiFormats.value,
+  })
 }
+
+function getEndpointDefaultPath(endpoint: ProviderEndpoint): string {
+  return getDefaultPath(endpoint.api_format, getEndpointEditState(endpoint.id)?.url ?? endpoint.base_url)
+}
+
+function getEndpointBaseUrlPlaceholder(apiFormat: string): string {
+  const seedBaseUrl = (props.provider?.website || fallbackEndpointBaseUrl).trim()
+  return getDefaultEndpointBaseUrl({
+    apiFormat,
+    baseUrl: seedBaseUrl,
+  }) || seedBaseUrl
+}
+
+function getNewEndpointBaseUrl(): string {
+  const typedBaseUrl = newEndpoint.value.base_url.trim()
+  if (typedBaseUrl) return typedBaseUrl
+  return getDefaultEndpointBaseUrl({
+    apiFormat: newEndpoint.value.api_format,
+    baseUrl: props.provider?.website || '',
+  })
+}
+
+const newEndpointBaseUrlPlaceholder = computed(() => {
+  return getEndpointBaseUrlPlaceholder(newEndpoint.value.api_format)
+})
 
 function getDisplayedPath(endpoint: ProviderEndpoint): string {
-  if (isFixedProvider.value) {
-    return getDefaultPath(endpoint.api_format, endpoint.base_url)
-  }
   return getEndpointEditState(endpoint.id)?.path ?? (endpoint.custom_path || '')
-}
-
-// 判断是否是 Codex OAuth 端点
-function isCodexUrl(baseUrl: string): boolean {
-  const url = baseUrl.replace(/\/+$/, '')
-  return url.includes('/backend-api/codex') || url.endsWith('/codex')
 }
 
 // 读取端点的上游流式策略（endpoint.config.upstream_stream_policy）
@@ -3119,8 +3140,8 @@ function getResponseHeaderValidationErrorForEndpoint(endpointId: string): string
 
 // 新端点选择的格式的默认路径
 const newEndpointDefaultPath = computed(() => {
-  // 使用填写的 base_url 或 provider 的 website 来判断是否是 Codex 端点
-  const baseUrl = newEndpoint.value.base_url || props.provider?.website || ''
+  // 使用填写的 base_url；留空时使用按格式规范化后的 provider website。
+  const baseUrl = getNewEndpointBaseUrl()
   return getDefaultPath(newEndpoint.value.api_format, baseUrl)
 })
 
@@ -3196,6 +3217,8 @@ watch(() => props.endpoints, (endpoints) => {
 
 // 保存端点
 async function saveEndpoint(endpoint: ProviderEndpoint) {
+  if (isEndpointConfigReadOnly.value) return
+
   if (isEndpointRulesJsonMode(endpoint.id) && endpointRulesJsonDirty.value[endpoint.id]) {
     if (!applyEndpointRulesJsonDraft(endpoint.id, { notify: false })) return
   }
@@ -3225,13 +3248,13 @@ async function saveEndpoint(endpoint: ProviderEndpoint) {
 
   savingEndpointId.value = endpoint.id
   try {
-    // 仅提交变更字段，避免 fixed provider 因 base_url/custom_path 被锁定而更新失败
+    // 仅提交变更字段；fixed provider 锁定 base_url，但允许覆盖 custom_path。
     const payload: Record<string, unknown> = {}
 
     if (!isFixedProvider.value) {
       if (state.url !== endpoint.base_url) payload.base_url = state.url
-      if (state.path !== (endpoint.custom_path || '')) payload.custom_path = state.path || null
     }
+    if (state.path !== (endpoint.custom_path || '')) payload.custom_path = state.path || null
 
     if (hasRulesChanges(endpoint)) payload.header_rules = rulesToHeaderRules(state.rules)
     if (hasResponseHeaderRulesChanges(endpoint)) {
@@ -3284,7 +3307,7 @@ function getCurrentUpstreamStreamPolicy(endpoint: ProviderEndpoint): string {
 
 function isUpstreamStreamPolicyLocked(endpoint: ProviderEndpoint): boolean {
   return (props.provider?.provider_type || '').toLowerCase() === 'codex'
-    && normalizeLegacyOpenAIFormatAlias(endpoint.api_format) === 'openai:responses'
+    && normalizeEndpointApiFormat(endpoint.api_format) === 'openai:responses'
 }
 
 // 获取上游流式按钮的样式类
@@ -3362,8 +3385,8 @@ async function handleCycleUpstreamStream(endpoint: ProviderEndpoint) {
 async function handleAddEndpoint() {
   if (!props.provider || !newEndpoint.value.api_format) return
 
-  // 如果没有输入 base_url，使用提供商的 website 作为默认值
-  const baseUrl = newEndpoint.value.base_url || props.provider.website
+  // 如果没有输入 base_url，使用按格式规范化后的提供商 website 作为默认值。
+  const baseUrl = getNewEndpointBaseUrl()
   if (!baseUrl) {
     showError('请输入 Base URL')
     return

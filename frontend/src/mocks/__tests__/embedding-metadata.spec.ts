@@ -20,7 +20,7 @@ describe('embedding mock metadata', () => {
 
   it('includes all embedding API formats as distinct catalog formats', () => {
     const embeddingFormats = MOCK_API_FORMATS.formats
-      .filter(format => format.value.endsWith(':embedding'))
+      .filter(format => format.value.endsWith(':embedding') || format.value.endsWith('_embedding'))
       .map(format => [format.value, format.label])
 
     expect(embeddingFormats).toEqual([
@@ -28,6 +28,7 @@ describe('embedding mock metadata', () => {
       ['gemini:embedding', 'Gemini Embedding'],
       ['jina:embedding', 'Jina Embedding'],
       ['doubao:embedding', 'Doubao Embedding'],
+      ['aliyun:multimodal_embedding', 'Aliyun Multimodal Embedding'],
     ])
   })
 

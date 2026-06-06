@@ -255,6 +255,11 @@ pub(crate) fn admin_proxy_local_requires_buffered_body(
                 | (Some("system_manage"), http::Method::PUT, Some("email_template_set"))
                 | (Some("system_manage"), http::Method::POST, Some("email_template_preview"))
                 | (
+                    Some("system_manage"),
+                    http::Method::POST,
+                    Some("important_notification_test"),
+                )
+                | (
                     Some("provider_models_manage"),
                     http::Method::POST,
                     Some("create_provider_model"),
@@ -300,6 +305,11 @@ pub(crate) fn admin_proxy_local_requires_buffered_body(
                     http::Method::POST,
                     Some("query_models" | "test_model" | "test_model_failover"),
                 )
+                | (Some("routing_profiles_manage"), http::Method::POST, Some("create_group"))
+                | (Some("routing_profiles_manage"), http::Method::PATCH, Some("update_group"))
+                | (Some("routing_profiles_manage"), http::Method::POST, Some("dry_run_group"))
+                | (Some("routing_profiles_manage"), http::Method::POST, Some("create_binding"))
+                | (Some("routing_profiles_manage"), http::Method::PATCH, Some("update_binding"))
                 | (Some("billing_manage"), http::Method::POST, Some("apply_preset"))
                 | (Some("billing_manage"), http::Method::POST, Some("create_rule"))
                 | (Some("billing_manage"), http::Method::PUT, Some("update_rule"))
@@ -308,7 +318,11 @@ pub(crate) fn admin_proxy_local_requires_buffered_body(
                 | (Some("billing_manage"), http::Method::POST, Some("create_plan"))
                 | (Some("billing_manage"), http::Method::PUT, Some("update_plan"))
                 | (Some("billing_manage"), http::Method::PATCH, Some("set_plan_status"))
-                | (Some("payments_manage"), http::Method::PUT, Some("update_epay_gateway"))
+                | (
+                    Some("payments_manage"),
+                    http::Method::PUT,
+                    Some("update_epay_gateway" | "update_payment_gateway"),
+                )
                 | (Some("payments_manage"), http::Method::POST, Some("credit_order"))
                 | (Some("payments_manage"), http::Method::POST, Some("create_redeem_code_batch"))
                 | (Some("payments_manage"), http::Method::POST, Some("delete_redeem_code_batch"))
@@ -478,7 +492,14 @@ pub(crate) fn public_support_local_requires_buffered_body(
                     | (
                         Some("payment_callback"),
                         http::Method::POST,
-                        Some("callback" | "epay_notify" | "epay_return"),
+                        Some(
+                            "callback"
+                                | "epay_notify"
+                                | "epay_return"
+                                | "alipay_notify"
+                                | "wxpay_notify"
+                                | "stripe_webhook",
+                        ),
                     )
             )
         })

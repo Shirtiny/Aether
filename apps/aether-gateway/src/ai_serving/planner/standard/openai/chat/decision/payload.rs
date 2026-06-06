@@ -1,8 +1,9 @@
 use crate::ai_serving::build_request_trace_proxy_value;
 use crate::ai_serving::planner::common::OPENAI_CHAT_STREAM_PLAN_KIND;
+use crate::ai_serving::planner::decision_input::apply_provider_request_routing_policy_to_decision;
 use crate::ai_serving::planner::report_context::{
-    build_local_execution_report_context, insert_provider_stream_event_api_format,
-    LocalExecutionReportContextParts,
+    build_local_execution_report_context, insert_native_client_envelope_name,
+    insert_provider_stream_event_api_format, LocalExecutionReportContextParts,
 };
 use crate::ai_serving::planner::{
     build_ai_execution_decision_response, AiExecutionDecisionResponseParts,
@@ -67,7 +68,10 @@ pub(crate) async fn maybe_build_local_openai_chat_decision_payload_for_candidate
     let proxy = state
         .resolve_transport_proxy_snapshot_with_tunnel_affinity(&resolved.transport)
         .await;
-    let transport_profile = resolve_transport_profile(&resolved.transport);
+    let transport_profile = resolved
+        .transport_profile
+        .clone()
+        .or_else(|| resolve_transport_profile(&resolved.transport));
     let timeouts = resolve_transport_execution_timeouts(&resolved.transport);
     let mut extra_fields = serde_json::Map::new();
     if let Some(proxy_value) =
@@ -80,12 +84,38 @@ pub(crate) async fn maybe_build_local_openai_chat_decision_payload_for_candidate
             "envelope_name".to_string(),
             serde_json::Value::String(envelope_name.to_string()),
         );
+        insert_native_client_envelope_name(&mut extra_fields, envelope_name, parts.uri.path());
     }
     insert_provider_stream_event_api_format(
         &mut extra_fields,
         resolved.transport.provider.provider_type.as_str(),
     );
+    if let Some(image_request_summary) = resolved.image_request_summary.as_ref() {
+        extra_fields.insert("image_request".to_string(), image_request_summary.clone());
+    }
+    if resolved
+        .provider_api_format
+        .eq_ignore_ascii_case("openai:image")
+        && resolved
+            .transport
+            .provider
+            .provider_type
+            .trim()
+            .eq_ignore_ascii_case("chatgpt_web")
+    {
+        extra_fields.insert("chatgpt_web_image".to_string(), serde_json::json!(true));
+        extra_fields.insert(
+            "local_failover_policy".to_string(),
+            serde_json::json!({
+                "stop_status_codes": [400, 401, 403, 429, 500, 502, 503, 504],
+                "error_stop_patterns": [
+                    { "pattern": ".*" }
+                ]
+            }),
+        );
+    }
     let super::request::LocalOpenAiChatCandidatePayloadParts {
+        client_api_format,
         auth_header,
         auth_value,
         mapped_model,
@@ -99,12 +129,15 @@ pub(crate) async fn maybe_build_local_openai_chat_decision_payload_for_candidate
         envelope_name,
         transport,
         request_redacted,
+        transport_profile: _,
+        image_request_summary: _,
     } = resolved;
     let original_request_body_json = if request_redacted {
         Some(&provider_request_body)
     } else {
         Some(body_json)
     };
+    let effective_headers = input.effective_headers(&parts.headers);
     let report_context = append_local_failover_policy_to_value(
         append_execution_contract_fields_to_value(
             build_local_execution_report_context(LocalExecutionReportContextParts {
@@ -122,7 +155,7 @@ pub(crate) async fn maybe_build_local_openai_chat_decision_payload_for_candidate
                 global_model_id: Some(&candidate.global_model_id),
                 global_model_name: Some(&candidate.global_model_name),
                 provider_api_format: &provider_api_format,
-                client_api_format: "openai:chat",
+                client_api_format: &client_api_format,
                 mapped_model: Some(&mapped_model),
                 candidate_group_id: eligible.orchestration.candidate_group_id.as_deref(),
                 pool_key_lease: eligible.orchestration.pool_key_lease.as_ref(),
@@ -132,7 +165,7 @@ pub(crate) async fn maybe_build_local_openai_chat_decision_payload_for_candidate
                 body_rules: transport.endpoint.body_rules.as_ref(),
                 provider_request_method: Some(serde_json::Value::Null),
                 provider_request_headers: Some(&provider_request_headers),
-                original_headers: &parts.headers,
+                original_headers: effective_headers,
                 request_path: Some(parts.uri.path()),
                 request_query_string: parts.uri.query(),
                 request_origin: Some(crate::ai_serving::request_origin_from_parts(parts)),
@@ -154,45 +187,45 @@ pub(crate) async fn maybe_build_local_openai_chat_decision_payload_for_candidate
             }),
             execution_strategy,
             conversion_mode,
-            "openai:chat",
+            client_api_format.as_str(),
             candidate.endpoint_api_format.as_str(),
         ),
         &transport,
     );
 
-    Ok(Some(build_ai_execution_decision_response(
-        AiExecutionDecisionResponseParts {
-            decision_is_stream,
-            decision_kind: decision_kind.to_string(),
-            execution_strategy,
-            conversion_mode,
-            request_id: trace_id.to_string(),
-            candidate_id: candidate_id.clone(),
-            provider_name: transport.provider.name.clone(),
-            provider_id: candidate.provider_id.clone(),
-            endpoint_id: candidate.endpoint_id.clone(),
-            key_id: candidate.key_id.clone(),
-            upstream_base_url: transport.endpoint.base_url.clone(),
-            upstream_url,
-            provider_request_method: None,
-            auth_header: Some(auth_header),
-            auth_value: Some(auth_value),
-            provider_api_format,
-            client_api_format: "openai:chat".to_string(),
-            model_name: input.requested_model.clone(),
-            mapped_model,
-            prompt_cache_key,
-            provider_request_headers,
-            provider_request_body: Some(provider_request_body),
-            provider_request_body_base64: None,
-            content_type: Some("application/json".to_string()),
-            proxy,
-            transport_profile,
-            timeouts,
-            upstream_is_stream,
-            report_kind: Some(report_kind),
-            report_context: Some(report_context),
-            auth_context: input.auth_context.clone(),
-        },
-    )))
+    let mut decision = build_ai_execution_decision_response(AiExecutionDecisionResponseParts {
+        decision_is_stream,
+        decision_kind: decision_kind.to_string(),
+        execution_strategy,
+        conversion_mode,
+        request_id: trace_id.to_string(),
+        candidate_id: candidate_id.clone(),
+        provider_name: transport.provider.name.clone(),
+        provider_id: candidate.provider_id.clone(),
+        endpoint_id: candidate.endpoint_id.clone(),
+        key_id: candidate.key_id.clone(),
+        upstream_base_url: transport.endpoint.base_url.clone(),
+        upstream_url,
+        provider_request_method: None,
+        auth_header: Some(auth_header),
+        auth_value: Some(auth_value),
+        provider_api_format,
+        client_api_format: "openai:chat".to_string(),
+        model_name: input.requested_model.clone(),
+        mapped_model,
+        prompt_cache_key,
+        provider_request_headers,
+        provider_request_body: Some(provider_request_body),
+        provider_request_body_base64: None,
+        content_type: Some("application/json".to_string()),
+        proxy,
+        transport_profile,
+        timeouts,
+        upstream_is_stream,
+        report_kind: Some(report_kind),
+        report_context: Some(report_context),
+        auth_context: input.auth_context.clone(),
+    });
+    apply_provider_request_routing_policy_to_decision(input, &mut decision)?;
+    Ok(Some(decision))
 }

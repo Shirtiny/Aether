@@ -85,7 +85,6 @@ export const guideNavItems: GuideNavItem[] = [
       { name: '请求头/体编辑', hash: '#header-body-edit' },
       { name: '模型映射', hash: '#model-mapping' },
       { name: '正则映射', hash: '#regex-mapping' },
-      { name: '能力标签', hash: '#capabilities' },
       { name: '余额监控', hash: '#balance-monitor' },
       { name: '配置导入/出', hash: '#config-export' },
       { name: '锁定用户密钥', hash: '#lock-key' }

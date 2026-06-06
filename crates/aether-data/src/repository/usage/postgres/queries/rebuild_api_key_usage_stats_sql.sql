@@ -1,7 +1,7 @@
 WITH aggregated AS (
   SELECT
     api_key_id,
-    COUNT(*)::INTEGER AS total_requests,
+    COUNT(*)::BIGINT AS total_requests,
     COALESCE(SUM(
       GREATEST(
         COALESCE(
@@ -16,6 +16,7 @@ WITH aggregated AS (
   FROM usage_billing_facts AS "usage"
   WHERE api_key_id IS NOT NULL
     AND BTRIM(api_key_id) <> ''
+    AND status NOT IN ('pending', 'streaming')
   GROUP BY api_key_id
 )
 UPDATE api_keys

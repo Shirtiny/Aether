@@ -309,6 +309,7 @@ mod tests {
                 provider_quota_blocks_requests: false,
                 account_quota_exhausted: false,
                 oauth_invalid: false,
+                enforce_key_circuit_breaker: true,
                 rpm_reset_at: None,
             },
         ));
@@ -333,6 +334,7 @@ mod tests {
                     provider_quota_blocks_requests: false,
                     account_quota_exhausted: false,
                     oauth_invalid: false,
+                    enforce_key_circuit_breaker: true,
                     rpm_reset_at: None,
                 }),
                 None
@@ -358,6 +360,7 @@ mod tests {
                 provider_quota_blocks_requests: false,
                 account_quota_exhausted: false,
                 oauth_invalid: false,
+                enforce_key_circuit_breaker: true,
                 rpm_reset_at: None,
             }),
             Some("provider_key_concurrency_limit_reached")
@@ -386,6 +389,7 @@ mod tests {
                 provider_quota_blocks_requests: false,
                 account_quota_exhausted: false,
                 oauth_invalid: false,
+                enforce_key_circuit_breaker: true,
                 rpm_reset_at: None,
             }),
             Some("provider_key_concurrency_limit_reached")
@@ -415,6 +419,7 @@ mod tests {
                 provider_quota_blocks_requests: false,
                 account_quota_exhausted: false,
                 oauth_invalid: false,
+                enforce_key_circuit_breaker: true,
                 rpm_reset_at: None,
             }),
             None
@@ -435,6 +440,31 @@ mod tests {
                 provider_quota_blocks_requests: false,
                 account_quota_exhausted: false,
                 oauth_invalid: false,
+                enforce_key_circuit_breaker: true,
+                rpm_reset_at: None,
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn recent_failures_do_not_skip_without_persisted_circuit() {
+        let recent_candidates = vec![
+            stored_candidate("failed", RequestCandidateStatus::Failed, 95_000),
+            stored_candidate("cancelled", RequestCandidateStatus::Cancelled, 99_000),
+        ];
+
+        assert_eq!(
+            candidate_runtime_skip_reason_with_state(CandidateRuntimeSelectabilityInput {
+                candidate: &sample_candidate("1", None),
+                recent_candidates: &recent_candidates,
+                provider_concurrent_limits: &BTreeMap::new(),
+                provider_key_rpm_states: &BTreeMap::new(),
+                now_unix_secs: 100,
+                provider_quota_blocks_requests: false,
+                account_quota_exhausted: false,
+                oauth_invalid: false,
+                enforce_key_circuit_breaker: true,
                 rpm_reset_at: None,
             }),
             None
@@ -458,6 +488,7 @@ mod tests {
                 provider_quota_blocks_requests: false,
                 account_quota_exhausted: false,
                 oauth_invalid: false,
+                enforce_key_circuit_breaker: true,
                 rpm_reset_at: None,
             }),
             Some("key_circuit_open")
@@ -493,6 +524,7 @@ mod tests {
                 provider_quota_blocks_requests: false,
                 account_quota_exhausted: false,
                 oauth_invalid: false,
+                enforce_key_circuit_breaker: true,
                 rpm_reset_at: None,
             }),
             Some("key_rpm_exhausted")
@@ -520,6 +552,7 @@ mod tests {
                 provider_quota_blocks_requests: false,
                 account_quota_exhausted: false,
                 oauth_invalid: false,
+                enforce_key_circuit_breaker: true,
                 rpm_reset_at: None,
             }),
             Some("key_circuit_open")
@@ -534,6 +567,7 @@ mod tests {
                 provider_quota_blocks_requests: false,
                 account_quota_exhausted: false,
                 oauth_invalid: false,
+                enforce_key_circuit_breaker: true,
                 rpm_reset_at: None,
             }),
             None
@@ -554,6 +588,7 @@ mod tests {
                 provider_quota_blocks_requests: false,
                 account_quota_exhausted: false,
                 oauth_invalid: false,
+                enforce_key_circuit_breaker: true,
                 rpm_reset_at: None,
             },
         ));
@@ -567,6 +602,7 @@ mod tests {
                 provider_quota_blocks_requests: true,
                 account_quota_exhausted: false,
                 oauth_invalid: false,
+                enforce_key_circuit_breaker: true,
                 rpm_reset_at: None,
             },
         ));
@@ -584,6 +620,7 @@ mod tests {
                 provider_quota_blocks_requests: false,
                 account_quota_exhausted: true,
                 oauth_invalid: false,
+                enforce_key_circuit_breaker: true,
                 rpm_reset_at: None,
             },
         ));
@@ -601,6 +638,7 @@ mod tests {
                 provider_quota_blocks_requests: false,
                 account_quota_exhausted: false,
                 oauth_invalid: true,
+                enforce_key_circuit_breaker: true,
                 rpm_reset_at: None,
             },
         ));

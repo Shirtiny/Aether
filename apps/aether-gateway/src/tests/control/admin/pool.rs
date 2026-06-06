@@ -1595,7 +1595,7 @@ async fn gateway_ignores_health_signals_in_pool_scheduling_status() {
 
     assert_eq!(keys.len(), 2);
     assert_eq!(keys[0]["key_name"], json!("circuit-open"));
-    assert_eq!(keys[0]["circuit_breaker_open"], json!(true));
+    assert_eq!(keys[0]["circuit_breaker_open"], json!(false));
     assert_eq!(keys[0]["scheduling_status"], json!("available"));
     assert_eq!(keys[0]["scheduling_reason"], json!("available"));
     assert_eq!(keys[0]["scheduling_label"], json!("可用"));
@@ -2083,6 +2083,99 @@ async fn gateway_renders_gemini_cli_account_quota_from_status_snapshot() {
     assert_eq!(keys[0]["scheduling_status"], json!("available"));
     assert_eq!(keys[0]["quota_updated_at"], json!(1_775_553_285u64));
     assert_eq!(keys[0]["account_quota"], json!("Gemini 2.5 Pro 冷却中"));
+}
+
+#[tokio::test]
+async fn gateway_prefers_gemini_cli_account_credits_over_model_quota_text() {
+    let mut provider = sample_provider("provider-gemini-cli", "gemini_cli", 10)
+        .with_transport_fields(
+            true,
+            false,
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(json!({
+                "pool_advanced": {
+                    "enabled": true,
+                    "skip_exhausted_accounts": true
+                }
+            })),
+        );
+    provider.provider_type = "gemini_cli".to_string();
+
+    let mut key = sample_key(
+        "key-gemini-cli-credits",
+        "provider-gemini-cli",
+        "gemini:generate_content",
+        "oauth-placeholder",
+    );
+    key.name = "gemini cli credits".to_string();
+    key.auth_type = "oauth".to_string();
+    key.status_snapshot = Some(json!({
+        "quota": {
+            "version": 2,
+            "provider_type": "gemini_cli",
+            "code": "ok",
+            "freshness": "fresh",
+            "source": "report_effect",
+            "observed_at": 1_775_553_285u64,
+            "exhausted": false,
+            "usage_ratio": 0.25,
+            "updated_at": 1_775_553_285u64,
+            "plan_type": "g1-pro-tier",
+            "credits": {
+                "remaining": 123.5,
+                "consumed": 7.0,
+                "has_credits": true
+            },
+            "windows": [
+                {
+                    "code": "model:gemini-2.5-pro",
+                    "label": "Gemini 2.5 Pro",
+                    "scope": "model",
+                    "unit": "percent",
+                    "model": "gemini-2.5-pro",
+                    "used_ratio": 0.25,
+                    "remaining_ratio": 0.75,
+                    "is_exhausted": false
+                }
+            ]
+        }
+    }));
+
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        Vec::new(),
+        vec![key],
+    ));
+    let state = AppState::new()
+        .expect("gateway should build")
+        .with_data_state_for_tests(GatewayDataState::with_provider_catalog_reader_for_tests(
+            provider_catalog_repository,
+        ));
+
+    let response = local_admin_pool_response(
+        &state,
+        http::Method::GET,
+        "/api/admin/pool/provider-gemini-cli/keys?page=1&page_size=50&status=all",
+        None,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read"),
+    )
+    .expect("json body should parse");
+    let keys = payload["keys"].as_array().expect("keys should be array");
+
+    assert_eq!(keys[0]["scheduling_status"], json!("available"));
+    assert_eq!(keys[0]["account_quota"], json!("AI Credits 剩余 123.5"));
 }
 
 #[tokio::test]
@@ -3433,6 +3526,14 @@ async fn gateway_cleans_up_admin_pool_banned_keys_locally_with_trusted_admin_pri
     );
     banned_key.name = "banned".to_string();
     banned_key.oauth_invalid_reason = Some("account_banned".to_string());
+    let mut oauth_expired_key = sample_key(
+        "key-openai-oauth-expired",
+        "provider-openai",
+        "openai:chat",
+        "sk-oauth-expired",
+    );
+    oauth_expired_key.name = "oauth-expired".to_string();
+    oauth_expired_key.oauth_invalid_reason = Some("[OAUTH_EXPIRED] token invalidated".to_string());
     let mut healthy_key = sample_key(
         "key-openai-healthy",
         "provider-openai",
@@ -3444,7 +3545,7 @@ async fn gateway_cleans_up_admin_pool_banned_keys_locally_with_trusted_admin_pri
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
         vec![provider],
         Vec::new(),
-        vec![banned_key, healthy_key],
+        vec![banned_key, oauth_expired_key, healthy_key],
     ));
 
     let (upstream_url, upstream_handle) = start_server(upstream).await;
@@ -3481,8 +3582,13 @@ async fn gateway_cleans_up_admin_pool_banned_keys_locally_with_trusted_admin_pri
         .list_keys_by_provider_ids(&["provider-openai".to_string()])
         .await
         .expect("remaining keys should load");
-    assert_eq!(remaining_keys.len(), 1);
-    assert_eq!(remaining_keys[0].id, "key-openai-healthy");
+    assert_eq!(remaining_keys.len(), 2);
+    assert!(remaining_keys
+        .iter()
+        .any(|key| key.id == "key-openai-oauth-expired"));
+    assert!(remaining_keys
+        .iter()
+        .any(|key| key.id == "key-openai-healthy"));
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();

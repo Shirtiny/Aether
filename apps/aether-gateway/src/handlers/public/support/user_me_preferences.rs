@@ -75,12 +75,12 @@ fn validate_user_model_capability_settings(
 
 fn build_users_me_preferences_payload(
     preferences: &GatewayUserPreferenceView,
+    expose_provider_details: bool,
 ) -> serde_json::Value {
-    json!({
+    let mut payload = json!({
         "avatar_url": preferences.avatar_url,
         "bio": preferences.bio,
         "default_provider_id": preferences.default_provider_id,
-        "default_provider": preferences.default_provider_name,
         "theme": preferences.theme,
         "language": preferences.language,
         "timezone": preferences.timezone,
@@ -89,7 +89,11 @@ fn build_users_me_preferences_payload(
             "usage_alerts": preferences.usage_alerts,
             "announcements": preferences.announcement_notifications,
         },
-    })
+    });
+    if expose_provider_details {
+        payload["default_provider"] = json!(preferences.default_provider_name);
+    }
+    payload
 }
 
 fn parse_users_me_optional_string_field(
@@ -188,7 +192,11 @@ pub(super) async fn handle_users_me_preferences_get(
         }
     };
 
-    Json(build_users_me_preferences_payload(&preferences)).into_response()
+    Json(build_users_me_preferences_payload(
+        &preferences,
+        auth.user.role.eq_ignore_ascii_case("admin"),
+    ))
+    .into_response()
 }
 
 pub(super) async fn handle_users_me_preferences_put(

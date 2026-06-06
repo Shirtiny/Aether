@@ -3,10 +3,11 @@ use serde_json::{json, Map, Value};
 use crate::{
     formats::context::FormatContext,
     protocol::canonical::{
-        canonical_extension_object_mut, gemini_extensions, gemini_part_to_canonical_block,
-        gemini_stop_reason_to_canonical, gemini_usage_to_canonical, CanonicalContentBlock,
-        CanonicalResponse, CanonicalResponseOutput, CanonicalRole, CanonicalStopReason,
-        CanonicalUsage,
+        canonical_extension_object_mut, canonical_usage_total_input_tokens,
+        canonical_usage_total_tokens_for_inclusive_input, gemini_extensions,
+        gemini_part_to_canonical_block, gemini_stop_reason_to_canonical, gemini_usage_to_canonical,
+        CanonicalContentBlock, CanonicalResponse, CanonicalResponseOutput, CanonicalRole,
+        CanonicalStopReason, CanonicalUsage,
     },
 };
 
@@ -63,8 +64,15 @@ pub fn from_raw(body_json: &Value) -> Option<CanonicalResponse> {
             role: CanonicalRole::Assistant,
             content,
             stop_reason,
-            extensions: Default::default(),
+            extensions: gemini_extensions(
+                candidate_object,
+                &["index", "content", "finishReason", "finish_reason"],
+            ),
         });
+    }
+    outputs.retain(gemini_response_output_has_visible_content);
+    if outputs.is_empty() {
+        return None;
     }
     let content = outputs
         .first()
@@ -108,6 +116,18 @@ pub fn from_raw(body_json: &Value) -> Option<CanonicalResponse> {
     Some(canonical)
 }
 
+fn gemini_response_output_has_visible_content(output: &CanonicalResponseOutput) -> bool {
+    output.content.iter().any(|block| match block {
+        CanonicalContentBlock::Text { text, .. } => !text.trim().is_empty(),
+        CanonicalContentBlock::ToolUse { .. }
+        | CanonicalContentBlock::ToolResult { .. }
+        | CanonicalContentBlock::Image { .. }
+        | CanonicalContentBlock::File { .. }
+        | CanonicalContentBlock::Audio { .. } => true,
+        CanonicalContentBlock::Thinking { .. } | CanonicalContentBlock::Unknown { .. } => false,
+    })
+}
+
 pub fn to_raw(canonical: &CanonicalResponse, report_context: &Value) -> Option<Value> {
     let mut response = canonical_to_gemini_response(canonical, report_context)?;
     if let Some(object) = response.as_object_mut() {
@@ -145,7 +165,7 @@ fn canonical_to_gemini_response(
     let mut candidates = Vec::new();
     for output in outputs {
         let parts = canonical_blocks_to_gemini_parts(&output.content)?;
-        candidates.push(json!({
+        let mut candidate = json!({
             "index": output.index,
             "content": {
                 "role": "model",
@@ -154,7 +174,15 @@ fn canonical_to_gemini_response(
             "finishReason": canonical_stop_reason_to_gemini(
                 output.stop_reason.as_ref().or(canonical.stop_reason.as_ref())
             ),
-        }));
+        });
+        if let Some(candidate_object) = candidate.as_object_mut() {
+            if let Some(gemini) = output.extensions.get("gemini").and_then(Value::as_object) {
+                for (key, value) in gemini {
+                    candidate_object.entry(key.clone()).or_insert(value.clone());
+                }
+            }
+        }
+        candidates.push(candidate);
     }
 
     let mut response = Map::new();
@@ -332,19 +360,26 @@ fn canonical_stop_reason_to_gemini(reason: Option<&CanonicalStopReason>) -> Valu
 }
 
 fn canonical_usage_to_gemini_usage_metadata(usage: &CanonicalUsage) -> Value {
+    let input_tokens = canonical_usage_total_input_tokens(usage);
     let mut out = Map::new();
-    out.insert(
-        "promptTokenCount".to_string(),
-        Value::from(usage.input_tokens),
-    );
+    out.insert("promptTokenCount".to_string(), Value::from(input_tokens));
     out.insert(
         "candidatesTokenCount".to_string(),
         Value::from(usage.output_tokens.saturating_sub(usage.reasoning_tokens)),
     );
     out.insert(
         "totalTokenCount".to_string(),
-        Value::from(usage.total_tokens),
+        Value::from(canonical_usage_total_tokens_for_inclusive_input(
+            usage,
+            input_tokens,
+        )),
     );
+    if usage.cache_read_tokens > 0 {
+        out.insert(
+            "cachedContentTokenCount".to_string(),
+            Value::from(usage.cache_read_tokens),
+        );
+    }
     if usage.reasoning_tokens > 0 {
         out.insert(
             "thoughtsTokenCount".to_string(),
@@ -363,6 +398,7 @@ fn canonical_usage_to_gemini_usage_metadata(usage: &CanonicalUsage) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::CanonicalContentBlock;
 
     #[test]
     fn gemini_response_round_trips_cached_content_usage() {
@@ -392,5 +428,68 @@ mod tests {
         );
         let rebuilt = to_raw(&response, &json!({})).expect("response should rebuild");
         assert_eq!(rebuilt["usageMetadata"]["cachedContentTokenCount"], 5);
+    }
+
+    #[test]
+    fn gemini_response_without_visible_parts_is_not_success() {
+        let body = json!({
+            "candidates": [{
+                "content": {"role": "model"},
+                "finishReason": "MAX_TOKENS"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 8,
+                "candidatesTokenCount": 1,
+                "thoughtsTokenCount": 25,
+                "totalTokenCount": 34
+            },
+            "modelVersion": "gemini-3-flash-preview",
+            "responseId": "resp-empty"
+        });
+
+        assert!(from_raw(&body).is_none());
+    }
+
+    #[test]
+    fn gemini_response_with_only_thought_parts_is_not_success() {
+        let body = json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [{"text": "hidden plan", "thought": true}]
+                },
+                "finishReason": "MAX_TOKENS"
+            }],
+            "modelVersion": "gemini-3-flash-preview",
+            "responseId": "resp-thought-only"
+        });
+
+        assert!(from_raw(&body).is_none());
+    }
+
+    #[test]
+    fn gemini_response_with_function_call_is_visible_output() {
+        let body = json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [{
+                        "functionCall": {
+                            "name": "lookup",
+                            "args": {"query": "weather"}
+                        }
+                    }]
+                },
+                "finishReason": "STOP"
+            }],
+            "modelVersion": "gemini-3-flash-preview",
+            "responseId": "resp-tool"
+        });
+
+        let canonical = from_raw(&body).expect("function call should be visible output");
+        assert!(matches!(
+            canonical.content.first(),
+            Some(CanonicalContentBlock::ToolUse { name, .. }) if name == "lookup"
+        ));
     }
 }

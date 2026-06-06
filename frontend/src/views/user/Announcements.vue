@@ -132,6 +132,13 @@
                 <div class="flex-1 min-w-0">
                   <div class="flex items-center gap-2 mb-1">
                     <span class="text-sm font-medium text-foreground">{{ announcement.title }}</span>
+                    <Badge
+                      v-if="announcement.requires_ack"
+                      variant="outline"
+                      class="text-[10px] px-1.5 py-0"
+                    >
+                      必读
+                    </Badge>
                     <Pin
                       v-if="announcement.is_pinned"
                       class="w-3.5 h-3.5 text-muted-foreground flex-shrink-0"
@@ -240,6 +247,13 @@
                   :class="getIconColor(announcement.type)"
                 />
                 <span class="font-medium text-sm">{{ announcement.title }}</span>
+                <Badge
+                  v-if="announcement.requires_ack"
+                  variant="outline"
+                  class="text-[10px] shrink-0"
+                >
+                  必读
+                </Badge>
                 <Pin
                   v-if="announcement.is_pinned"
                   class="w-3.5 h-3.5 text-muted-foreground shrink-0"
@@ -433,6 +447,18 @@
               class="cursor-pointer text-sm"
             >置顶公告</Label>
           </div>
+          <div class="flex items-center gap-2">
+            <input
+              id="requires-ack"
+              v-model="formData.requires_ack"
+              type="checkbox"
+              class="h-4 w-4 rounded border-gray-300 cursor-pointer"
+            >
+            <Label
+              for="requires-ack"
+              class="cursor-pointer text-sm"
+            >必读确认</Label>
+          </div>
           <div
             v-if="editingAnnouncement"
             class="flex items-center gap-2"
@@ -611,7 +637,8 @@ const formData = ref({
   type: 'info' as 'info' | 'warning' | 'maintenance' | 'important',
   priority: 0,
   is_pinned: false,
-  is_active: true
+  is_active: true,
+  requires_ack: false
 })
 
 onMounted(() => {
@@ -663,7 +690,8 @@ function openCreateDialog() {
     type: 'info',
     priority: 0,
     is_pinned: false,
-    is_active: true
+    is_active: true,
+    requires_ack: false
   }
   dialogOpen.value = true
 }
@@ -676,7 +704,8 @@ function openEditDialog(announcement: Announcement) {
     type: announcement.type,
     priority: announcement.priority,
     is_pinned: announcement.is_pinned,
-    is_active: announcement.is_active
+    is_active: announcement.is_active,
+    requires_ack: !!announcement.requires_ack
   }
   dialogOpen.value = true
 }

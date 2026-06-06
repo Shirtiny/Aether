@@ -27,15 +27,21 @@ impl UsageMapper {
         }
 
         derive_missing_input_tokens(raw_usage, api_format, &mut usage);
+        copy_explicit_total_tokens(raw_usage, api_format, &mut usage);
         usage.normalize_cache_creation_breakdown()
     }
 
     pub fn map_from_response(response: &serde_json::Value, api_format: &str) -> StandardizedUsage {
         let family = api_family(api_format);
-        let Some(usage_value) = resolve_usage_value(response, family.as_str()) else {
-            return StandardizedUsage::new();
+        let mut usage = if let Some(usage_value) = resolve_usage_value(response, family.as_str()) {
+            Self::map(usage_value, api_format, None)
+        } else {
+            StandardizedUsage::new()
         };
-        Self::map(usage_value, api_format, None)
+        if is_openai_image_api(api_format) {
+            apply_openai_image_response_dimensions(response, &mut usage);
+        }
+        usage
     }
 }
 
@@ -57,6 +63,53 @@ fn api_family(api_format: &str) -> String {
         .unwrap_or_default()
         .trim()
         .to_ascii_lowercase()
+}
+
+fn api_kind(api_format: &str) -> String {
+    api_format
+        .split(':')
+        .nth(1)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn is_openai_image_api(api_format: &str) -> bool {
+    api_family(api_format).as_str() == "openai" && api_kind(api_format).as_str() == "image"
+}
+
+fn apply_openai_image_response_dimensions(
+    response: &serde_json::Value,
+    usage: &mut StandardizedUsage,
+) {
+    let image_count = openai_image_response_image_count(response);
+    if image_count <= 0 {
+        return;
+    }
+
+    usage.request_count = image_count;
+    usage
+        .dimensions
+        .insert("image_count".to_string(), serde_json::json!(image_count));
+}
+
+fn openai_image_response_image_count(response: &serde_json::Value) -> i64 {
+    response
+        .get("data")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| items.len() as i64)
+        .filter(|value| *value > 0)
+        .or_else(|| image_result_count(response.get("result")))
+        .unwrap_or(0)
+}
+
+fn image_result_count(value: Option<&serde_json::Value>) -> Option<i64> {
+    match value? {
+        serde_json::Value::Array(items) => Some(items.len() as i64).filter(|count| *count > 0),
+        serde_json::Value::Object(object) if !object.is_empty() => Some(1),
+        serde_json::Value::String(text) if !text.trim().is_empty() => Some(1),
+        _ => None,
+    }
 }
 
 fn base_mapping(api_format: &str) -> BTreeMap<String, String> {
@@ -186,6 +239,22 @@ fn derive_missing_input_tokens(
     let inferred_input_tokens = total_tokens.saturating_sub(output_tokens);
     if inferred_input_tokens > 0 {
         usage.input_tokens = inferred_input_tokens;
+    }
+}
+
+fn copy_explicit_total_tokens(
+    raw_usage: &serde_json::Value,
+    api_format: &str,
+    usage: &mut StandardizedUsage,
+) {
+    let total_tokens = match api_family(api_format).as_str() {
+        "gemini" => numeric_i64(raw_usage.get("totalTokenCount")),
+        _ => numeric_i64(raw_usage.get("total_tokens")),
+    };
+    if let Some(total_tokens) = total_tokens.filter(|value| *value > 0) {
+        usage
+            .dimensions
+            .insert("total_tokens".to_string(), serde_json::json!(total_tokens));
     }
 }
 
@@ -602,5 +671,48 @@ mod tests {
         assert_eq!(usage.input_tokens, 14);
         assert_eq!(usage.output_tokens, 6);
         assert_eq!(usage.cache_read_tokens, 2);
+    }
+
+    #[test]
+    fn maps_openai_image_response_dimensions_without_usage() {
+        let usage = map_usage_from_response(
+            &serde_json::json!({
+                "created": 1_700_000_000,
+                "data": [
+                    { "b64_json": "abc" },
+                    { "url": "https://example.test/image.png" }
+                ]
+            }),
+            "openai:image",
+        );
+
+        assert_eq!(usage.request_count, 2);
+        assert_eq!(
+            usage.dimensions.get("image_count"),
+            Some(&serde_json::json!(2))
+        );
+    }
+
+    #[test]
+    fn maps_openai_image_response_dimensions_with_native_usage() {
+        let usage = map_usage_from_response(
+            &serde_json::json!({
+                "usage": {
+                    "input_tokens": 11,
+                    "output_tokens": 22,
+                    "total_tokens": 33
+                },
+                "data": [{ "b64_json": "abc" }]
+            }),
+            "openai:image",
+        );
+
+        assert_eq!(usage.input_tokens, 11);
+        assert_eq!(usage.output_tokens, 22);
+        assert_eq!(usage.request_count, 1);
+        assert_eq!(
+            usage.dimensions.get("image_count"),
+            Some(&serde_json::json!(1))
+        );
     }
 }

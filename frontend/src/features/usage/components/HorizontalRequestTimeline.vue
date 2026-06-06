@@ -224,13 +224,13 @@
                     </span>
                   </div>
                   <div
-                    v-if="currentAttempt.key_name || currentAttempt.key_id"
+                    v-if="currentAttemptKeyDisplay"
                     class="info-item"
                   >
                     <span class="info-label">{{ isOAuthType(currentAttempt.key_auth_type) ? '账号' : '密钥' }}</span>
                     <span class="info-value info-value-stacked">
                       <span class="key-name">
-                        {{ currentAttempt.key_name || '未知' }}
+                        {{ currentAttemptKeyDisplay }}
                         <span
                           v-if="currentAttempt.key_auth_type && currentAttempt.key_auth_type !== 'api_key'"
                           class="auth-type-tag"
@@ -338,36 +338,6 @@
                         class="text-xs text-muted-foreground"
                       >
                         {{ formatNumber(currentAttempt.extra_data.pool_skip.cost_window_usage) }} tokens
-                      </span>
-                    </span>
-                  </div>
-                  <div
-                    v-if="activeCapabilities.length > 0"
-                    class="info-item"
-                  >
-                    <span class="info-label">请求能力</span>
-                    <span class="info-value">
-                      <span class="capability-tags">
-                        <span
-                          v-for="cap in activeCapabilities"
-                          :key="`required-${cap}`"
-                          class="capability-tag active"
-                        >{{ formatCapabilityLabel(cap) }}</span>
-                      </span>
-                    </span>
-                  </div>
-                  <div
-                    v-if="keyCapabilities.length > 0"
-                    class="info-item"
-                  >
-                    <span class="info-label">Key 能力</span>
-                    <span class="info-value">
-                      <span class="capability-tags">
-                        <span
-                          v-for="cap in keyCapabilities"
-                          :key="`key-${cap}`"
-                          class="capability-tag"
-                        >{{ formatCapabilityLabel(cap) }}</span>
                       </span>
                     </span>
                   </div>
@@ -572,6 +542,7 @@ import { ChevronLeft, ChevronRight, ExternalLink } from 'lucide-vue-next'
 import { requestTraceApi, type RequestTrace, type CandidateRecord, type ImageProgress } from '@/api/requestTrace'
 import { log } from '@/utils/logger'
 import { parseApiError } from '@/utils/errorParser'
+import { formatTokens } from '@/utils/format'
 import { formatApiFormat } from '@/api/endpoints/types/api-format'
 import { useDarkMode } from '@/composables/useDarkMode'
 import { resolveTimelineFinalStatus } from '../utils/status'
@@ -659,7 +630,7 @@ const usageData = computed(() => props.usageData)
 
 // 格式化数字
 const formatNumber = (num: number): string => {
-  return num.toLocaleString('zh-CN')
+  return formatTokens(num)
 }
 
 // 获取最终状态标签
@@ -695,6 +666,7 @@ const { isDark } = useDarkMode()
 const trace = computed(() => props.traceData ?? internalTrace.value)
 const selectedGroupIndex = ref(0)
 const selectedAttemptIndex = ref(0)
+const selectionPinnedByUser = ref(false)
 const hoveredGroupIndex = ref<number | null>(null)
 const traceLoadStarted = ref(false)
 let tracePollTimer: ReturnType<typeof setTimeout> | null = null
@@ -1249,13 +1221,16 @@ const normalizeUpstreamResponseDisplay = (value: unknown): Record<string, unknow
   const body = raw.body
   const bodyRef = readStringField(raw, 'body_ref') ?? readStringField(raw, 'bodyRef')
   const bodyState = readStringField(raw, 'body_state') ?? readStringField(raw, 'bodyState')
+  const meaningfulBodyState = bodyState && bodyState.toLowerCase() !== 'none'
+    ? bodyState
+    : ''
 
   if (
     statusCode == null &&
     !hasRenderableValue(headers) &&
     !hasRenderableValue(body) &&
     !bodyRef &&
-    !bodyState
+    !meaningfulBodyState
   ) {
     return null
   }
@@ -1265,7 +1240,7 @@ const normalizeUpstreamResponseDisplay = (value: unknown): Record<string, unknow
   if (hasRenderableValue(headers)) data.headers = headers
   if (hasRenderableValue(body)) data.body = body
   if (bodyRef) data.body_ref = bodyRef
-  if (bodyState) data.body_state = bodyState
+  if (meaningfulBodyState) data.body_state = meaningfulBodyState
 
   return data
 }
@@ -1371,6 +1346,12 @@ const currentAttemptRequestPathDisplay = computed(() => {
   return ''
 })
 
+const currentAttemptKeyDisplay = computed(() => {
+  const attempt = currentAttempt.value
+  if (!attempt) return ''
+  return attempt.key_account_label || attempt.key_name || attempt.key_id || ''
+})
+
 const currentAttemptKeyFormatsDisplay = computed(() => {
   const attempt = currentAttempt.value
   if (!attempt) return ''
@@ -1382,15 +1363,22 @@ const currentAttemptKeyFormatsDisplay = computed(() => {
     .map(format => formatApiFormat(format))
     .join(' / ')
 })
+const SKIP_REASON_LABELS: Record<string, string> = {
+  auth_api_key_concurrency_limit_reached: '调用方 API Key 并发已达上限',
+  api_key_concurrency_limit_reached: '调用方 API Key 并发已达上限',
+  pool_key_lease_busy: '池内账号正被其他请求占用',
+  provider_concurrency_limit_reached: '上游提供商并发已达上限',
+  provider_key_concurrency_limit_reached: '上游账号并发已达上限',
+  provider_request_body_build_failed: '上游请求体转换失败',
+  provider_request_body_missing: '无法构建上游请求体',
+}
 const currentAttemptSkipReasonDisplay = computed(() => {
   const attempt = currentAttempt.value
   if (!attempt?.skip_reason) return ''
 
-  if (attempt.skip_reason === 'provider_request_body_build_failed') {
-    return '上游请求体转换失败'
-  }
-  if (attempt.skip_reason === 'provider_request_body_missing') {
-    return '无法构建上游请求体'
+  const skipReasonLabel = SKIP_REASON_LABELS[attempt.skip_reason]
+  if (skipReasonLabel) {
+    return skipReasonLabel
   }
 
   if (attempt.skip_reason !== 'transport_unsupported') {
@@ -1489,26 +1477,6 @@ const currentAttemptExtraDataDisplay = computed<Record<string, unknown> | null>(
   return Object.keys(display).length > 0 ? display : null
 })
 
-// 计算当前尝试启用的能力标签（请求需要的能力）
-const activeCapabilities = computed(() => {
-  if (!currentAttempt.value?.required_capabilities) return []
-  const caps = currentAttempt.value.required_capabilities
-  // 只返回值为 true 的能力
-  return Object.entries(caps)
-    .filter(([_, enabled]) => enabled)
-    .map(([key]) => key)
-})
-
-// 计算当前 Key 支持的能力标签
-const keyCapabilities = computed(() => {
-  if (!currentAttempt.value?.key_capabilities) return []
-  const caps = currentAttempt.value.key_capabilities
-  // 只返回值为 true 的能力
-  return Object.entries(caps)
-    .filter(([_, enabled]) => enabled)
-    .map(([key]) => key)
-})
-
 const hasActiveImageProgress = computed(() => {
   return rawTimeline.value.some((candidate) => {
     const progress = normalizeImageProgress(candidate.image_progress)
@@ -1542,20 +1510,6 @@ const formatAuthTypeWithPlan = (authType: string, planType?: string): string => 
   return typeName
 }
 
-// 格式化能力标签显示
-const formatCapabilityLabel = (cap: string): string => {
-  const labels: Record<string, string> = {
-    'cache_1h': '1h缓存',
-    'cache_5min': '5min缓存',
-    'context_1m': '1M上下文',
-    'context_200k': '200K上下文',
-    'extended_thinking': '深度思考',
-    'vision': '视觉',
-    'function_calling': '函数调用',
-  }
-  return labels[cap] || cap
-}
-
 const poolSelectionLabel = (reason: string): string => {
   const labels: Record<string, string> = {
     sticky: '粘性会话',
@@ -1585,10 +1539,111 @@ const isGroupSelected = (group: NodeGroup) => {
   return selectedGroupIndex.value === groupedTimeline.value.findIndex(g => g.id === group.id && g.startIndex === group.startIndex)
 }
 
+const findGroupIndex = (groups: NodeGroup[], group: NodeGroup): number => {
+  return groups.findIndex(g => g.id === group.id && g.startIndex === group.startIndex)
+}
+
+const selectedAttemptFromGroups = (groups: NodeGroup[]): CandidateRecord | null => {
+  const group = groups[selectedGroupIndex.value]
+  if (!group) return null
+  return group.allAttempts[selectedAttemptIndex.value] || null
+}
+
+const groupHasSuccess = (group: NodeGroup): boolean => {
+  return group.allAttempts.some(attempt => getDisplayStatus(attempt) === 'success')
+}
+
+const groupsHaveSuccess = (groups: NodeGroup[]): boolean => {
+  return groups.some(groupHasSuccess)
+}
+
+const groupsHaveLiveCandidate = (groups: NodeGroup[]): boolean => {
+  return groups.some(group => group.allAttempts.some(isLiveCandidate))
+}
+
+const TERMINAL_ATTEMPT_STATUSES = ['failed', 'cancelled', 'stream_interrupted', 'skipped']
+
+const isTerminalResultAttempt = (attempt: CandidateRecord): boolean => {
+  return TERMINAL_ATTEMPT_STATUSES.includes(getDisplayStatus(attempt))
+}
+
+const groupsHaveTerminalResult = (groups: NodeGroup[]): boolean => {
+  return groups.some(group => group.allAttempts.some(isTerminalResultAttempt))
+}
+
+const selectedAttemptMatchesBestSilentState = (groups: NodeGroup[]): boolean => {
+  const attempt = selectedAttemptFromGroups(groups)
+  if (!attempt) return false
+
+  if (groupsHaveSuccess(groups)) {
+    return getDisplayStatus(attempt) === 'success'
+  }
+
+  if (groupsHaveLiveCandidate(groups)) {
+    return isLiveCandidate(attempt)
+  }
+
+  if (groupsHaveTerminalResult(groups)) {
+    return isTerminalResultAttempt(attempt)
+  }
+
+  return true
+}
+
+const selectMostRelevantGroup = (newGroups: NodeGroup[]) => {
+  if (!newGroups || newGroups.length === 0) return
+
+  // 查找成功的组
+  const successIdx = newGroups.findIndex(groupHasSuccess)
+  if (successIdx >= 0) {
+    selectedGroupIndex.value = successIdx
+    // 选中成功的尝试
+    const group = newGroups[successIdx]
+    const attemptIdx = group.allAttempts.findIndex(a => getDisplayStatus(a) === 'success')
+    selectedAttemptIndex.value = attemptIdx >= 0 ? attemptIdx : 0
+    return
+  }
+
+  // 查找正在进行的组
+  const activeIdx = newGroups.findIndex(g => g.allAttempts.some(isLiveCandidate))
+  if (activeIdx >= 0) {
+    selectedGroupIndex.value = activeIdx
+    // 选中正在进行的尝试，而非最后一个
+    const group = newGroups[activeIdx]
+    const attemptIdx = group.allAttempts.findIndex(isLiveCandidate)
+    selectedAttemptIndex.value = attemptIdx >= 0 ? attemptIdx : group.allAttempts.length - 1
+    return
+  }
+
+  // 查找最后一个有效结果的组（有实际执行过的状态：failed/cancelled/stream_interrupted/skipped）
+  // 从后往前找第一个有效状态的组
+  for (let i = newGroups.length - 1; i >= 0; i--) {
+    const group = newGroups[i]
+    if (TERMINAL_ATTEMPT_STATUSES.includes(group.primaryStatus)) {
+      selectedGroupIndex.value = i
+      // 选中最后一个有效状态的尝试（从后往前遍历）
+      let targetIdx = -1
+      for (let j = group.allAttempts.length - 1; j >= 0; j--) {
+        if (isTerminalResultAttempt(group.allAttempts[j])) {
+          targetIdx = j
+          break
+        }
+      }
+      selectedAttemptIndex.value = targetIdx >= 0 ? targetIdx : group.allAttempts.length - 1
+      return
+    }
+  }
+
+  // 都没有有效状态，选择第一个组（避免选到末尾的未执行节点）
+  selectedGroupIndex.value = 0
+  selectedAttemptIndex.value = 0
+}
+
 // 选中一个组
 const selectGroup = (group: NodeGroup) => {
-  const index = groupedTimeline.value.findIndex(g => g.id === group.id && g.startIndex === group.startIndex)
+  const index = findGroupIndex(groupedTimeline.value, group)
   if (index >= 0) {
+    selectionPinnedByUser.value = true
     selectedGroupIndex.value = index
     // 默认选中成功的尝试，或最后一个尝试
     const successIdx = group.allAttempts.findIndex(a => a.status === 'success')
@@ -1598,16 +1653,18 @@ const selectGroup = (group: NodeGroup) => {
 
 // 选中一个组的首次请求
 const selectFirstAttempt = (group: NodeGroup) => {
-  const index = groupedTimeline.value.findIndex(g => g.id === group.id && g.startIndex === group.startIndex)
+  const index = findGroupIndex(groupedTimeline.value, group)
   if (index >= 0) {
+    selectionPinnedByUser.value = true
     selectedGroupIndex.value = index
     selectedAttemptIndex.value = 0
   }
 }
 
 const selectAttemptInGroup = (group: NodeGroup, attemptIndex: number) => {
-  const groupIndex = groupedTimeline.value.findIndex(g => g.id === group.id && g.startIndex === group.startIndex)
+  const groupIndex = findGroupIndex(groupedTimeline.value, group)
   if (groupIndex < 0) return
+  selectionPinnedByUser.value = true
   selectedGroupIndex.value = groupIndex
   selectedAttemptIndex.value = attemptIndex
 }
@@ -1635,6 +1692,7 @@ const formatAttemptDotTitle = (attempt: CandidateRecord): string => {
 const navigateGroup = (direction: number) => {
   const newIndex = selectedGroupIndex.value + direction
   if (newIndex >= 0 && newIndex < groupedTimeline.value.length) {
+    selectionPinnedByUser.value = true
     selectedGroupIndex.value = newIndex
     const group = groupedTimeline.value[newIndex]
     // 默认选中成功的尝试，或最后一个尝试
@@ -1648,6 +1706,7 @@ const navigateAttempt = (direction: number) => {
   if (!group) return
   const newIndex = selectedAttemptIndex.value + direction
   if (newIndex >= 0 && newIndex < group.allAttempts.length) {
+    selectionPinnedByUser.value = true
     selectedAttemptIndex.value = newIndex
   }
 }
@@ -1731,57 +1790,20 @@ const scheduleTracePolling = () => {
 watch(groupedTimeline, (newGroups) => {
   if (!newGroups || newGroups.length === 0) return
 
-  // 静默刷新时不重置选中状态
+  // 静默刷新时保留用户手动选择；未手动选择时跟随成功/进行中的 Key。
   if (isSilentRefresh.value) {
     isSilentRefresh.value = false
-    return
-  }
-
-  // 查找成功的组
-  const successIdx = newGroups.findIndex(g => g.primaryStatus === 'success')
-  if (successIdx >= 0) {
-    selectedGroupIndex.value = successIdx
-    // 选中成功的尝试
-    const group = newGroups[successIdx]
-    const attemptIdx = group.allAttempts.findIndex(a => a.status === 'success')
-    selectedAttemptIndex.value = attemptIdx >= 0 ? attemptIdx : 0
-    return
-  }
-
-  // 查找正在进行的组
-  const activeIdx = newGroups.findIndex(g => g.allAttempts.some(isLiveCandidate))
-  if (activeIdx >= 0) {
-    selectedGroupIndex.value = activeIdx
-    // 选中正在进行的尝试，而非最后一个
-    const group = newGroups[activeIdx]
-    const attemptIdx = group.allAttempts.findIndex(isLiveCandidate)
-    selectedAttemptIndex.value = attemptIdx >= 0 ? attemptIdx : group.allAttempts.length - 1
-    return
-  }
-
-  // 查找最后一个有效结果的组（有实际执行过的状态：failed/cancelled/stream_interrupted/skipped）
-  // 从后往前找第一个有效状态的组
-  const activeStatuses = ['failed', 'cancelled', 'stream_interrupted', 'skipped']
-  for (let i = newGroups.length - 1; i >= 0; i--) {
-    const group = newGroups[i]
-    if (activeStatuses.includes(group.primaryStatus)) {
-      selectedGroupIndex.value = i
-      // 选中最后一个有效状态的尝试（从后往前遍历）
-      let targetIdx = -1
-      for (let j = group.allAttempts.length - 1; j >= 0; j--) {
-        if (activeStatuses.includes(getDisplayStatus(group.allAttempts[j]))) {
-          targetIdx = j
-          break
-        }
-      }
-      selectedAttemptIndex.value = targetIdx >= 0 ? targetIdx : group.allAttempts.length - 1
+    if (selectionPinnedByUser.value && selectedAttemptFromGroups(newGroups)) {
       return
     }
+    if (selectedAttemptMatchesBestSilentState(newGroups)) {
+      return
+    }
+    selectMostRelevantGroup(newGroups)
+    return
   }
 
-  // 都没有有效状态，选择第一个组（避免选到末尾的未执行节点）
-  selectedGroupIndex.value = 0
-  selectedAttemptIndex.value = 0
+  selectMostRelevantGroup(newGroups)
 }, { immediate: true })
 
 // 监听 requestId / 外部 trace 变化
@@ -1790,6 +1812,7 @@ watch(
   () => {
     selectedGroupIndex.value = 0
     selectedAttemptIndex.value = 0
+    selectionPinnedByUser.value = false
     traceLoadStarted.value = false
 
     if (props.traceData) {
@@ -2500,35 +2523,6 @@ function getDisplayStatus(attempt: CandidateRecord | null | undefined): string {
 .pool-skip-type {
   font-weight: 500;
   color: hsl(var(--muted-foreground));
-}
-
-/* 能力标签 */
-.capability-tags {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 0.375rem;
-}
-
-.capability-tag {
-  display: inline-flex;
-  align-items: center;
-  padding: 0.15rem 0.5rem;
-  font-size: 0.7rem;
-  font-weight: 500;
-  color: hsl(var(--muted-foreground));
-  white-space: nowrap;
-  border-radius: 4px;
-  background: transparent;
-  border: 1px dashed hsl(var(--border));
-  transition: all 0.15s ease;
-}
-
-/* 被请求使用的能力（高亮边框） */
-.capability-tag.active {
-  color: hsl(var(--primary));
-  border-color: hsl(var(--primary) / 0.5);
-  background: hsl(var(--primary) / 0.08);
 }
 
 .image-progress-block {

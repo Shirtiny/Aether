@@ -1,8 +1,8 @@
 use std::io::Write;
 
 use aether_data_contracts::repository::usage::{
-    parse_usage_body_ref, usage_body_ref, UsageBodyField, UsageCleanupPreviewCounts,
-    UsageCleanupSummary, UsageCleanupWindow,
+    parse_usage_body_ref, usage_body_ref, UsageBodyField, UsageCleanupExecutionMode,
+    UsageCleanupPreviewCounts, UsageCleanupSummary, UsageCleanupTargets, UsageCleanupWindow,
 };
 use chrono::{DateTime, Utc};
 use flate2::{write::GzEncoder, Compression};
@@ -128,6 +128,64 @@ WHERE created_at < $1
   )
 ORDER BY created_at ASC, id ASC
 LIMIT $3
+"#;
+const SELECT_USAGE_RAW_BODY_BATCH_SQL: &str = r#"
+SELECT id, request_id
+FROM usage
+WHERE created_at < $1
+  AND (
+    request_body IS NOT NULL
+    OR response_body IS NOT NULL
+    OR provider_request_body IS NOT NULL
+    OR client_response_body IS NOT NULL
+  )
+ORDER BY created_at ASC, id ASC
+LIMIT $2
+"#;
+const CLEAR_USAGE_RAW_BODY_FIELDS_SQL: &str = r#"
+UPDATE usage
+SET request_body = NULL,
+    response_body = NULL,
+    provider_request_body = NULL,
+    client_response_body = NULL
+WHERE id = ANY($1)
+"#;
+const SELECT_USAGE_COMPRESSED_BODY_BATCH_SQL: &str = r#"
+SELECT id, request_id
+FROM usage
+WHERE created_at < $1
+  AND (
+    request_body_compressed IS NOT NULL
+    OR response_body_compressed IS NOT NULL
+    OR provider_request_body_compressed IS NOT NULL
+    OR client_response_body_compressed IS NOT NULL
+    OR EXISTS (
+      SELECT 1
+      FROM usage_body_blobs
+      WHERE usage_body_blobs.request_id = usage.request_id
+    )
+    OR EXISTS (
+      SELECT 1
+      FROM usage_http_audits
+      WHERE usage_http_audits.request_id = usage.request_id
+        AND (
+          usage_http_audits.request_body_ref IS NOT NULL
+          OR usage_http_audits.provider_request_body_ref IS NOT NULL
+          OR usage_http_audits.response_body_ref IS NOT NULL
+          OR usage_http_audits.client_response_body_ref IS NOT NULL
+        )
+    )
+  )
+ORDER BY created_at ASC, id ASC
+LIMIT $2
+"#;
+const CLEAR_USAGE_COMPRESSED_BODY_FIELDS_SQL: &str = r#"
+UPDATE usage
+SET request_body_compressed = NULL,
+    response_body_compressed = NULL,
+    provider_request_body_compressed = NULL,
+    client_response_body_compressed = NULL
+WHERE id = ANY($1)
 "#;
 const CLEAR_USAGE_BODY_FIELDS_SQL: &str = r#"
 UPDATE usage
@@ -419,49 +477,99 @@ impl SqlxUsageReadRepository {
         window: &UsageCleanupWindow,
         batch_size: usize,
         auto_delete_expired_keys: bool,
+        targets: UsageCleanupTargets,
+        mode: UsageCleanupExecutionMode,
     ) -> Result<UsageCleanupSummary, DataLayerError> {
-        if batch_size == 0 {
+        if batch_size == 0 || !targets.any_selected() {
             return Ok(UsageCleanupSummary::default());
         }
+        if mode == UsageCleanupExecutionMode::BeforeNowBodyFields {
+            let body_externalized = if targets.detail_body {
+                cleanup_usage_raw_body_fields(&self.pool, window.detail_cutoff, batch_size).await?
+            } else {
+                0
+            };
+            let body_cleaned = if targets.compressed_body {
+                cleanup_usage_compressed_body_fields(
+                    &self.pool,
+                    window.compressed_cutoff,
+                    batch_size,
+                )
+                .await?
+            } else {
+                0
+            };
+            return Ok(UsageCleanupSummary {
+                body_externalized,
+                legacy_body_refs_migrated: 0,
+                body_cleaned,
+                header_cleaned: 0,
+                keys_cleaned: 0,
+                records_deleted: 0,
+            });
+        }
 
-        let records_deleted =
-            delete_old_usage_records(&self.pool, window.log_cutoff, batch_size).await?;
-        let header_cleaned = cleanup_usage_header_fields(
-            &self.pool,
-            window.header_cutoff,
-            batch_size,
-            Some(window.log_cutoff),
-        )
-        .await?;
-        let legacy_body_refs_migrated = migrate_legacy_usage_body_ref_metadata(
-            &self.pool,
-            window.detail_cutoff,
-            batch_size,
-            Some(window.compressed_cutoff),
-        )
-        .await?;
-        let body_cleaned = cleanup_usage_stale_body_fields(
-            &self.pool,
-            window.compressed_cutoff,
-            batch_size,
-            Some(window.log_cutoff),
-        )
-        .await?;
-        let body_externalized = compress_usage_body_fields(
-            &self.pool,
-            window.detail_cutoff,
-            batch_size,
-            Some(window.compressed_cutoff),
-        )
-        .await?;
-        let keys_cleaned =
+        let records_deleted = if targets.records {
+            delete_old_usage_records(&self.pool, window.log_cutoff, batch_size).await?
+        } else {
+            0
+        };
+        let header_cleaned = if targets.headers {
+            cleanup_usage_header_fields(
+                &self.pool,
+                window.header_cutoff,
+                batch_size,
+                targets.records.then_some(window.log_cutoff),
+            )
+            .await?
+        } else {
+            0
+        };
+        let body_cleaned = if targets.compressed_body {
+            cleanup_usage_stale_body_fields(
+                &self.pool,
+                window.compressed_cutoff,
+                batch_size,
+                targets.records.then_some(window.log_cutoff),
+            )
+            .await?
+        } else {
+            0
+        };
+        let detail_body_newer_than = detail_body_newer_than(window, targets);
+        let legacy_body_refs_migrated = if targets.detail_body {
+            migrate_legacy_usage_body_ref_metadata(
+                &self.pool,
+                window.detail_cutoff,
+                batch_size,
+                detail_body_newer_than,
+            )
+            .await?
+        } else {
+            0
+        };
+        let body_externalized = if targets.detail_body {
+            compress_usage_body_fields(
+                &self.pool,
+                window.detail_cutoff,
+                batch_size,
+                detail_body_newer_than,
+            )
+            .await?
+        } else {
+            0
+        };
+        let keys_cleaned = if targets.expired_keys {
             match cleanup_expired_api_keys(&self.pool, auto_delete_expired_keys).await {
                 Ok(count) => count,
                 Err(err) => {
                     warn!(error = %err, "usage cleanup expired api key sweep failed");
                     0
                 }
-            };
+            }
+        } else {
+            0
+        };
 
         Ok(UsageCleanupSummary {
             body_externalized,
@@ -477,43 +585,398 @@ impl SqlxUsageReadRepository {
 pub async fn preview_usage_cleanup_impl(
     pool: &PostgresPool,
     window: &UsageCleanupWindow,
+    targets: UsageCleanupTargets,
+    mode: UsageCleanupExecutionMode,
 ) -> Result<UsageCleanupPreviewCounts, DataLayerError> {
-    let detail: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*)::bigint FROM usage WHERE created_at < $1 AND created_at >= $2",
-    )
-    .bind(window.detail_cutoff)
-    .bind(window.compressed_cutoff)
-    .fetch_one(pool)
-    .await
-    .map_err(postgres_error)?;
-    let compressed: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*)::bigint FROM usage WHERE created_at < $1 AND created_at >= $2",
-    )
-    .bind(window.compressed_cutoff)
-    .bind(window.log_cutoff)
-    .fetch_one(pool)
-    .await
-    .map_err(postgres_error)?;
-    let header: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*)::bigint FROM usage WHERE created_at < $1 AND created_at >= $2",
-    )
-    .bind(window.header_cutoff)
-    .bind(window.log_cutoff)
-    .fetch_one(pool)
-    .await
-    .map_err(postgres_error)?;
-    let log: i64 = sqlx::query_scalar("SELECT COUNT(*)::bigint FROM usage WHERE created_at < $1")
-        .bind(window.log_cutoff)
-        .fetch_one(pool)
-        .await
-        .map_err(postgres_error)?;
+    if mode == UsageCleanupExecutionMode::BeforeNowBodyFields {
+        let detail = if targets.detail_body {
+            count_usage_raw_body_candidates(pool, window.detail_cutoff).await?
+        } else {
+            0
+        };
+        let compressed = if targets.compressed_body {
+            count_usage_compressed_body_candidates(pool, window.compressed_cutoff).await?
+        } else {
+            0
+        };
+        return Ok(UsageCleanupPreviewCounts {
+            detail,
+            compressed,
+            header: 0,
+            log: 0,
+        });
+    }
+
+    let detail = if targets.detail_body {
+        count_usage_detail_body_candidates(
+            pool,
+            window.detail_cutoff,
+            detail_body_newer_than(window, targets),
+        )
+        .await?
+    } else {
+        0
+    };
+    let compressed = if targets.compressed_body {
+        count_usage_stale_body_candidates(
+            pool,
+            window.compressed_cutoff,
+            targets.records.then_some(window.log_cutoff),
+        )
+        .await?
+    } else {
+        0
+    };
+    let header = if targets.headers {
+        count_usage_header_candidates(
+            pool,
+            window.header_cutoff,
+            targets.records.then_some(window.log_cutoff),
+        )
+        .await?
+    } else {
+        0
+    };
+    let log = if targets.records {
+        let log: i64 =
+            sqlx::query_scalar("SELECT COUNT(*)::bigint FROM usage WHERE created_at < $1")
+                .bind(window.log_cutoff)
+                .fetch_one(pool)
+                .await
+                .map_err(postgres_error)?;
+        u64::try_from(log).unwrap_or(0)
+    } else {
+        0
+    };
 
     Ok(UsageCleanupPreviewCounts {
-        detail: u64::try_from(detail).unwrap_or(0),
-        compressed: u64::try_from(compressed).unwrap_or(0),
-        header: u64::try_from(header).unwrap_or(0),
-        log: u64::try_from(log).unwrap_or(0),
+        detail,
+        compressed,
+        header,
+        log,
     })
+}
+
+async fn cleanup_usage_raw_body_fields(
+    pool: &PostgresPool,
+    cutoff_time: DateTime<Utc>,
+    batch_size: usize,
+) -> Result<usize, DataLayerError> {
+    let mut total_cleaned = 0usize;
+    loop {
+        let rows = fetch_usage_body_cleanup_rows(
+            pool,
+            SELECT_USAGE_RAW_BODY_BATCH_SQL,
+            cutoff_time,
+            batch_size,
+        )
+        .await?;
+        if rows.is_empty() {
+            break;
+        }
+        let ids = rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
+        let cleaned = sqlx::query(CLEAR_USAGE_RAW_BODY_FIELDS_SQL)
+            .bind(ids)
+            .execute(pool)
+            .await
+            .map_err(postgres_error)?
+            .rows_affected();
+        let cleaned = usize::try_from(cleaned).unwrap_or(usize::MAX);
+        total_cleaned += cleaned;
+        if cleaned == 0 || cleaned < batch_size {
+            break;
+        }
+    }
+    Ok(total_cleaned)
+}
+
+async fn cleanup_usage_compressed_body_fields(
+    pool: &PostgresPool,
+    cutoff_time: DateTime<Utc>,
+    batch_size: usize,
+) -> Result<usize, DataLayerError> {
+    let mut total_cleaned = 0usize;
+    loop {
+        let rows = fetch_usage_body_cleanup_rows(
+            pool,
+            SELECT_USAGE_COMPRESSED_BODY_BATCH_SQL,
+            cutoff_time,
+            batch_size,
+        )
+        .await?;
+        if rows.is_empty() {
+            break;
+        }
+        let ids = rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
+        let request_ids = rows
+            .iter()
+            .map(|row| row.request_id.clone())
+            .collect::<Vec<_>>();
+
+        let cleaned = sqlx::query(CLEAR_USAGE_COMPRESSED_BODY_FIELDS_SQL)
+            .bind(ids)
+            .execute(pool)
+            .await
+            .map_err(postgres_error)?
+            .rows_affected();
+        sqlx::query(DELETE_USAGE_BODY_BLOBS_SQL)
+            .bind(&request_ids)
+            .execute(pool)
+            .await
+            .map_err(postgres_error)?;
+        sqlx::query(CLEAR_USAGE_HTTP_AUDIT_BODY_REFS_SQL)
+            .bind(&request_ids)
+            .execute(pool)
+            .await
+            .map_err(postgres_error)?;
+        sqlx::query(DELETE_EMPTY_USAGE_HTTP_AUDITS_SQL)
+            .bind(request_ids)
+            .execute(pool)
+            .await
+            .map_err(postgres_error)?;
+        let cleaned = usize::try_from(cleaned).unwrap_or(usize::MAX);
+        total_cleaned += cleaned;
+        if cleaned == 0 || cleaned < batch_size {
+            break;
+        }
+    }
+    Ok(total_cleaned)
+}
+
+async fn fetch_usage_body_cleanup_rows(
+    pool: &PostgresPool,
+    sql: &str,
+    cutoff_time: DateTime<Utc>,
+    batch_size: usize,
+) -> Result<Vec<UsageBodyCleanupRow>, DataLayerError> {
+    let rows = sqlx::query(sql)
+        .bind(cutoff_time)
+        .bind(i64::try_from(batch_size).unwrap_or(i64::MAX))
+        .fetch_all(pool)
+        .await
+        .map_err(postgres_error)?
+        .into_iter()
+        .map(|row| {
+            Ok(UsageBodyCleanupRow {
+                id: row.try_get::<String, _>("id").map_err(postgres_error)?,
+                request_id: row
+                    .try_get::<String, _>("request_id")
+                    .map_err(postgres_error)?,
+            })
+        })
+        .collect::<Result<Vec<_>, DataLayerError>>()?;
+    Ok(rows)
+}
+
+fn detail_body_newer_than(
+    window: &UsageCleanupWindow,
+    targets: UsageCleanupTargets,
+) -> Option<DateTime<Utc>> {
+    [
+        targets.compressed_body.then_some(window.compressed_cutoff),
+        targets.records.then_some(window.log_cutoff),
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+}
+
+async fn count_usage_raw_body_candidates(
+    pool: &PostgresPool,
+    cutoff_time: DateTime<Utc>,
+) -> Result<u64, DataLayerError> {
+    let count: i64 = sqlx::query_scalar(
+        r#"
+SELECT COUNT(*)::bigint
+FROM usage
+WHERE created_at < $1
+  AND (
+    request_body IS NOT NULL
+    OR response_body IS NOT NULL
+    OR provider_request_body IS NOT NULL
+    OR client_response_body IS NOT NULL
+  )
+"#,
+    )
+    .bind(cutoff_time)
+    .fetch_one(pool)
+    .await
+    .map_err(postgres_error)?;
+    Ok(u64::try_from(count).unwrap_or(0))
+}
+
+async fn count_usage_compressed_body_candidates(
+    pool: &PostgresPool,
+    cutoff_time: DateTime<Utc>,
+) -> Result<u64, DataLayerError> {
+    let count: i64 = sqlx::query_scalar(
+        r#"
+SELECT COUNT(*)::bigint
+FROM usage
+WHERE created_at < $1
+  AND (
+    request_body_compressed IS NOT NULL
+    OR response_body_compressed IS NOT NULL
+    OR provider_request_body_compressed IS NOT NULL
+    OR client_response_body_compressed IS NOT NULL
+    OR EXISTS (
+      SELECT 1
+      FROM usage_body_blobs
+      WHERE usage_body_blobs.request_id = usage.request_id
+    )
+    OR EXISTS (
+      SELECT 1
+      FROM usage_http_audits
+      WHERE usage_http_audits.request_id = usage.request_id
+        AND (
+          usage_http_audits.request_body_ref IS NOT NULL
+          OR usage_http_audits.provider_request_body_ref IS NOT NULL
+          OR usage_http_audits.response_body_ref IS NOT NULL
+          OR usage_http_audits.client_response_body_ref IS NOT NULL
+        )
+    )
+  )
+"#,
+    )
+    .bind(cutoff_time)
+    .fetch_one(pool)
+    .await
+    .map_err(postgres_error)?;
+    Ok(u64::try_from(count).unwrap_or(0))
+}
+
+async fn count_usage_detail_body_candidates(
+    pool: &PostgresPool,
+    cutoff_time: DateTime<Utc>,
+    newer_than: Option<DateTime<Utc>>,
+) -> Result<u64, DataLayerError> {
+    if matches!(newer_than, Some(value) if value >= cutoff_time) {
+        return Ok(0);
+    }
+    let count: i64 = sqlx::query_scalar(
+        r#"
+SELECT COUNT(*)::bigint
+FROM usage
+WHERE created_at < $1
+  AND ($2::timestamptz IS NULL OR created_at >= $2)
+  AND (
+    request_body IS NOT NULL
+    OR request_body_compressed IS NOT NULL
+    OR response_body IS NOT NULL
+    OR response_body_compressed IS NOT NULL
+    OR provider_request_body IS NOT NULL
+    OR provider_request_body_compressed IS NOT NULL
+    OR client_response_body IS NOT NULL
+    OR client_response_body_compressed IS NOT NULL
+    OR (
+      request_metadata IS NOT NULL
+      AND (
+        request_metadata::jsonb ? 'request_body_ref'
+        OR request_metadata::jsonb ? 'provider_request_body_ref'
+        OR request_metadata::jsonb ? 'response_body_ref'
+        OR request_metadata::jsonb ? 'client_response_body_ref'
+      )
+    )
+  )
+"#,
+    )
+    .bind(cutoff_time)
+    .bind(newer_than)
+    .fetch_one(pool)
+    .await
+    .map_err(postgres_error)?;
+    Ok(u64::try_from(count).unwrap_or(0))
+}
+
+async fn count_usage_stale_body_candidates(
+    pool: &PostgresPool,
+    cutoff_time: DateTime<Utc>,
+    newer_than: Option<DateTime<Utc>>,
+) -> Result<u64, DataLayerError> {
+    if matches!(newer_than, Some(value) if value >= cutoff_time) {
+        return Ok(0);
+    }
+    let count: i64 = sqlx::query_scalar(
+        r#"
+SELECT COUNT(*)::bigint
+FROM usage
+WHERE created_at < $1
+  AND ($2::timestamptz IS NULL OR created_at >= $2)
+  AND (
+    request_body IS NOT NULL
+    OR response_body IS NOT NULL
+    OR provider_request_body IS NOT NULL
+    OR client_response_body IS NOT NULL
+    OR request_body_compressed IS NOT NULL
+    OR response_body_compressed IS NOT NULL
+    OR provider_request_body_compressed IS NOT NULL
+    OR client_response_body_compressed IS NOT NULL
+    OR EXISTS (
+      SELECT 1
+      FROM usage_body_blobs
+      WHERE usage_body_blobs.request_id = usage.request_id
+    )
+    OR EXISTS (
+      SELECT 1
+      FROM usage_http_audits
+      WHERE usage_http_audits.request_id = usage.request_id
+        AND (
+          usage_http_audits.request_body_ref IS NOT NULL
+          OR usage_http_audits.provider_request_body_ref IS NOT NULL
+          OR usage_http_audits.response_body_ref IS NOT NULL
+          OR usage_http_audits.client_response_body_ref IS NOT NULL
+        )
+    )
+  )
+"#,
+    )
+    .bind(cutoff_time)
+    .bind(newer_than)
+    .fetch_one(pool)
+    .await
+    .map_err(postgres_error)?;
+    Ok(u64::try_from(count).unwrap_or(0))
+}
+
+async fn count_usage_header_candidates(
+    pool: &PostgresPool,
+    cutoff_time: DateTime<Utc>,
+    newer_than: Option<DateTime<Utc>>,
+) -> Result<u64, DataLayerError> {
+    if matches!(newer_than, Some(value) if value >= cutoff_time) {
+        return Ok(0);
+    }
+    let count: i64 = sqlx::query_scalar(
+        r#"
+SELECT COUNT(*)::bigint
+FROM usage
+WHERE created_at < $1
+  AND ($2::timestamptz IS NULL OR created_at >= $2)
+  AND (
+    request_headers IS NOT NULL
+    OR response_headers IS NOT NULL
+    OR provider_request_headers IS NOT NULL
+    OR client_response_headers IS NOT NULL
+    OR EXISTS (
+      SELECT 1
+      FROM usage_http_audits
+      WHERE usage_http_audits.request_id = usage.request_id
+        AND (
+          usage_http_audits.request_headers IS NOT NULL
+          OR usage_http_audits.response_headers IS NOT NULL
+          OR usage_http_audits.provider_request_headers IS NOT NULL
+          OR usage_http_audits.client_response_headers IS NOT NULL
+        )
+    )
+  )
+"#,
+    )
+    .bind(cutoff_time)
+    .bind(newer_than)
+    .fetch_one(pool)
+    .await
+    .map_err(postgres_error)?;
+    Ok(u64::try_from(count).unwrap_or(0))
 }
 
 async fn delete_old_usage_records(

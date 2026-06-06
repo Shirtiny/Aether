@@ -25,6 +25,7 @@ const EMBEDDING_API_FORMATS: &[&str] = &[
     "gemini:embedding",
     "jina:embedding",
     "doubao:embedding",
+    "aliyun:multimodal_embedding",
     "/v1/embeddings",
     "/jina/v1/embeddings",
 ];

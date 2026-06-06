@@ -25,6 +25,8 @@ vi.mock('@/composables/useToast', () => ({
 }))
 
 type TurnstileRenderOptions = {
+  action?: string
+  execution?: string
   callback?: (token: string) => void
   'error-callback'?: () => void
 }
@@ -40,27 +42,37 @@ function flushPromises() {
   return new Promise((resolve) => window.setTimeout(resolve, 0))
 }
 
-function installTurnstileMock(mode: 'success' | 'error'): TurnstileMock {
+function installTurnstileMock(): TurnstileMock & {
+  succeed: (token?: string) => void
+  fail: () => void
+  lastOptions: () => TurnstileRenderOptions | null
+} {
   let renderOptions: TurnstileRenderOptions | null = null
   const turnstile = {
     render: vi.fn((_container: HTMLElement, options: TurnstileRenderOptions) => {
       renderOptions = options
       return 'widget-id'
     }),
-    execute: vi.fn(() => {
-      window.queueMicrotask(() => {
-        if (mode === 'success') {
-          renderOptions?.callback?.('turnstile-token')
-        } else {
-          renderOptions?.['error-callback']?.()
-        }
-      })
-    }),
+    execute: vi.fn(),
     reset: vi.fn(),
     remove: vi.fn(),
+    succeed: (token = 'turnstile-token') => {
+      renderOptions?.callback?.(token)
+    },
+    fail: () => {
+      renderOptions?.['error-callback']?.()
+    },
+    lastOptions: () => renderOptions,
   }
   ;(window as unknown as { turnstile: TurnstileMock }).turnstile = turnstile
   return turnstile
+}
+
+async function settle() {
+  for (let index = 0; index < 4; index += 1) {
+    await Promise.resolve()
+    await nextTick()
+  }
 }
 
 async function mountRegisterDialog() {
@@ -137,38 +149,43 @@ describe('RegisterDialog Turnstile flow', () => {
   })
 
   it('gets a Turnstile token before submitting registration', async () => {
-    const turnstile = installTurnstileMock('success')
+    const turnstile = installTurnstileMock()
     mounted = await mountRegisterDialog()
     await fillRegistrationForm()
-
-    await clickRegister()
+    await settle()
 
     expect(turnstile.render).toHaveBeenCalledWith(
       expect.any(HTMLElement),
       expect.objectContaining({
         sitekey: 'site-public-key',
         action: 'register',
-        execution: 'execute',
       })
     )
-    expect(turnstile.execute).toHaveBeenCalledWith('widget-id')
+    expect(turnstile.lastOptions()?.execution).toBeUndefined()
+    turnstile.succeed('turnstile-token')
+    await settle()
+
+    await clickRegister()
+
+    expect(turnstile.execute).not.toHaveBeenCalled()
     expect(registerMock).toHaveBeenCalledWith({
       username: 'alice',
       password: 'secret123',
       turnstile_token: 'turnstile-token',
     })
-    expect(turnstile.remove).toHaveBeenCalledWith('widget-id')
+    expect(turnstile.reset).toHaveBeenCalledWith('widget-id')
   })
 
   it('resets Turnstile and blocks registration when verification fails', async () => {
-    const turnstile = installTurnstileMock('error')
+    const turnstile = installTurnstileMock()
     mounted = await mountRegisterDialog()
     await fillRegistrationForm()
+    await settle()
 
-    await clickRegister()
+    turnstile.fail()
+    await settle()
 
     expect(registerMock).not.toHaveBeenCalled()
-    expect(toastErrorMock).toHaveBeenCalledWith('人机验证失败，请重试', '验证失败')
-    expect(turnstile.remove).toHaveBeenCalledWith('widget-id')
+    expect(toastErrorMock).toHaveBeenCalledWith('人机验证加载失败，请重试', '人机验证失败')
   })
 })

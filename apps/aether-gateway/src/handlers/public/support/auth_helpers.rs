@@ -26,6 +26,18 @@ pub(crate) async fn build_auth_registration_settings_payload(
     let turnstile_site_key_config = state
         .read_system_config_json_value("turnstile_site_key")
         .await?;
+    let privacy_enabled_config = state
+        .read_system_config_json_value("registration_privacy_policy_enabled")
+        .await?;
+    let privacy_format_config = state
+        .read_system_config_json_value("registration_privacy_policy_format")
+        .await?;
+    let privacy_content_config = state
+        .read_system_config_json_value("registration_privacy_policy_content")
+        .await?;
+    let privacy_version_config = state
+        .read_system_config_json_value("registration_privacy_policy_version")
+        .await?;
 
     let email_configured = smtp_host
         .as_ref()
@@ -48,6 +60,15 @@ pub(crate) async fn build_auth_registration_settings_payload(
     };
     let turnstile_enabled = system_config_bool(turnstile_enabled_config.as_ref(), false);
     let turnstile_site_key = system_config_string(turnstile_site_key_config.as_ref());
+    let privacy_policy_enabled = system_config_bool(privacy_enabled_config.as_ref(), false);
+    let privacy_policy_format = match system_config_string(privacy_format_config.as_ref()) {
+        Some(value) if matches!(value.as_str(), "markdown" | "html") => value,
+        _ => "markdown".to_string(),
+    };
+    let privacy_policy_content =
+        system_config_string(privacy_content_config.as_ref()).unwrap_or_default();
+    let privacy_policy_version =
+        system_config_string(privacy_version_config.as_ref()).unwrap_or_else(|| "1".to_string());
 
     Ok(json!({
         "enable_registration": enable_registration,
@@ -57,6 +78,12 @@ pub(crate) async fn build_auth_registration_settings_payload(
         "turnstile_enabled": turnstile_enabled,
         "turnstile_site_key": turnstile_site_key,
         "turnstile_required_actions": ["send_verification_code", "register"],
+        "privacy_policy": {
+            "enabled": privacy_policy_enabled,
+            "format": privacy_policy_format,
+            "content": privacy_policy_content,
+            "version": privacy_policy_version,
+        },
     }))
 }
 
@@ -94,7 +121,6 @@ pub(super) const AUTH_REFRESH_TOKEN_EXPIRATION_DAYS: i64 = 7;
 pub(super) const AUTH_EMAIL_VERIFICATION_PREFIX: &str = "email:verification:";
 pub(super) const AUTH_EMAIL_VERIFIED_PREFIX: &str = "email:verified:";
 pub(super) const AUTH_EMAIL_VERIFIED_TTL_SECS: u64 = 3600;
-pub(super) const AUTH_SMTP_TIMEOUT_SECS: u64 = 30;
 
 pub(crate) fn build_auth_json_response(
     status: http::StatusCode,

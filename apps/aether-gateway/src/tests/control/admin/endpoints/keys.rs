@@ -5,7 +5,12 @@ use aether_crypto::{
     decrypt_python_fernet_ciphertext, encrypt_python_fernet_plaintext, DEVELOPMENT_ENCRYPTION_KEY,
 };
 use aether_data::repository::provider_catalog::InMemoryProviderCatalogReadRepository;
-use aether_data_contracts::repository::provider_catalog::ProviderCatalogReadRepository;
+use aether_data_contracts::repository::provider_catalog::{
+    ProviderCatalogKeyListQuery, ProviderCatalogReadRepository, StoredProviderCatalogEndpoint,
+    StoredProviderCatalogKey, StoredProviderCatalogKeyMaintenanceSummary,
+    StoredProviderCatalogKeyPage, StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
+};
+use aether_data_contracts::DataLayerError;
 use axum::body::Body;
 use axum::routing::any;
 use axum::{extract::Request, Json, Router};
@@ -21,6 +26,112 @@ use crate::constants::{
     TRUSTED_ADMIN_USER_ROLE_HEADER,
 };
 use crate::data::GatewayDataState;
+
+struct SummaryNullingProviderCatalogReadRepository {
+    inner: InMemoryProviderCatalogReadRepository,
+}
+
+impl SummaryNullingProviderCatalogReadRepository {
+    fn seed(
+        providers: Vec<StoredProviderCatalogProvider>,
+        endpoints: Vec<StoredProviderCatalogEndpoint>,
+        keys: Vec<StoredProviderCatalogKey>,
+    ) -> Self {
+        Self {
+            inner: InMemoryProviderCatalogReadRepository::seed(providers, endpoints, keys),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ProviderCatalogReadRepository for SummaryNullingProviderCatalogReadRepository {
+    async fn list_providers(
+        &self,
+        active_only: bool,
+    ) -> Result<Vec<StoredProviderCatalogProvider>, DataLayerError> {
+        self.inner.list_providers(active_only).await
+    }
+
+    async fn list_providers_by_ids(
+        &self,
+        provider_ids: &[String],
+    ) -> Result<Vec<StoredProviderCatalogProvider>, DataLayerError> {
+        self.inner.list_providers_by_ids(provider_ids).await
+    }
+
+    async fn list_endpoints_by_ids(
+        &self,
+        endpoint_ids: &[String],
+    ) -> Result<Vec<StoredProviderCatalogEndpoint>, DataLayerError> {
+        self.inner.list_endpoints_by_ids(endpoint_ids).await
+    }
+
+    async fn list_endpoints_by_provider_ids(
+        &self,
+        provider_ids: &[String],
+    ) -> Result<Vec<StoredProviderCatalogEndpoint>, DataLayerError> {
+        self.inner
+            .list_endpoints_by_provider_ids(provider_ids)
+            .await
+    }
+
+    async fn list_keys_by_ids(
+        &self,
+        key_ids: &[String],
+    ) -> Result<Vec<StoredProviderCatalogKey>, DataLayerError> {
+        self.inner.list_keys_by_ids(key_ids).await
+    }
+
+    async fn list_keys_by_provider_ids(
+        &self,
+        provider_ids: &[String],
+    ) -> Result<Vec<StoredProviderCatalogKey>, DataLayerError> {
+        self.inner.list_keys_by_provider_ids(provider_ids).await
+    }
+
+    async fn list_key_summaries_by_provider_ids(
+        &self,
+        provider_ids: &[String],
+    ) -> Result<Vec<StoredProviderCatalogKey>, DataLayerError> {
+        let mut keys = self.inner.list_keys_by_provider_ids(provider_ids).await?;
+        for key in &mut keys {
+            key.internal_priority = 50;
+            key.global_priority_by_format = None;
+            key.rate_multipliers = None;
+            key.request_count = None;
+            key.success_count = None;
+            key.error_count = None;
+            key.total_response_time_ms = None;
+            key.circuit_breaker_by_format = None;
+        }
+        Ok(keys)
+    }
+
+    async fn list_key_maintenance_summaries_by_provider_ids(
+        &self,
+        provider_ids: &[String],
+    ) -> Result<Vec<StoredProviderCatalogKeyMaintenanceSummary>, DataLayerError> {
+        self.inner
+            .list_key_maintenance_summaries_by_provider_ids(provider_ids)
+            .await
+    }
+
+    async fn list_keys_page(
+        &self,
+        query: &ProviderCatalogKeyListQuery,
+    ) -> Result<StoredProviderCatalogKeyPage, DataLayerError> {
+        self.inner.list_keys_page(query).await
+    }
+
+    async fn list_key_stats_by_provider_ids(
+        &self,
+        provider_ids: &[String],
+    ) -> Result<Vec<StoredProviderCatalogKeyStats>, DataLayerError> {
+        self.inner
+            .list_key_stats_by_provider_ids(provider_ids)
+            .await
+    }
+}
 
 #[tokio::test]
 async fn gateway_handles_admin_provider_keys_locally_with_trusted_admin_principal() {
@@ -112,6 +223,191 @@ async fn gateway_handles_admin_provider_keys_locally_with_trusted_admin_principa
     assert_eq!(items[0]["note"], "primary key");
     assert_eq!(items[0]["api_key_masked"], "sk-test-a***");
     assert_eq!(items[1]["id"], "key-openai-b");
+    assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
+
+    gateway_handle.abort();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_provider_keys_expose_circuit_breaker_and_recover_clears_it() {
+    let key = sample_key("key-1", "provider-1", "openai:chat", "sk-test-a").with_health_fields(
+        Some(json!({"openai:chat": {
+            "health_score": 0.2,
+            "consecutive_failures": 8,
+            "last_failure_at": "2026-03-26T12:00:00+00:00"
+        }})),
+        Some(json!({"openai:chat": {
+            "open": true,
+            "open_at": "2026-03-26T12:00:00+00:00",
+            "reason": "consecutive_failures_8",
+            "next_probe_at": "2099-03-26T12:01:00+00:00",
+            "next_probe_at_unix_secs": 4078209660u64,
+            "probe_interval_minutes": 1,
+            "max_probe_interval_minutes": 32,
+            "half_open_until": null,
+            "half_open_successes": 0,
+            "half_open_failures": 0
+        }})),
+    );
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![sample_provider("provider-1", "openai", 10)],
+        vec![sample_endpoint(
+            "endpoint-1",
+            "provider-1",
+            "openai:chat",
+            "https://example.com/v1",
+        )],
+        vec![key],
+    ));
+    let gateway_state = AppState::new()
+        .expect("gateway should build")
+        .with_data_state_for_tests(
+            GatewayDataState::with_provider_catalog_repository_for_tests(Arc::clone(
+                &provider_catalog_repository,
+            )),
+        );
+    let gateway = build_router_with_state(gateway_state);
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .get(format!(
+            "{gateway_url}/api/admin/endpoints/providers/provider-1/keys?skip=0&limit=50"
+        ))
+        .header(GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .send()
+        .await
+        .expect("request should succeed");
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(payload[0]["circuit_breaker_open"], true);
+    assert_eq!(
+        payload[0]["circuit_breaker_by_format"]["openai:chat"]["reason"],
+        "consecutive_failures_8"
+    );
+    assert_eq!(
+        payload[0]["circuit_breaker_by_format"]["openai:chat"]["probe_interval_minutes"],
+        1
+    );
+    assert!(
+        payload[0]["circuit_breaker_by_format"]["openai:chat"]["next_probe_at_unix_secs"]
+            .as_u64()
+            .is_some()
+    );
+
+    let recover_response = client
+        .patch(format!(
+            "{gateway_url}/api/admin/endpoints/health/keys/key-1"
+        ))
+        .header(GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .send()
+        .await
+        .expect("recover request should succeed");
+    assert_eq!(recover_response.status(), StatusCode::OK);
+
+    let response = client
+        .get(format!(
+            "{gateway_url}/api/admin/endpoints/providers/provider-1/keys?skip=0&limit=50"
+        ))
+        .header(GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .send()
+        .await
+        .expect("request should succeed");
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(payload[0]["circuit_breaker_open"], false);
+
+    gateway_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_handles_admin_provider_keys_page_locally_with_total() {
+    let upstream_hits = Arc::new(Mutex::new(0usize));
+    let upstream_hits_clone = Arc::clone(&upstream_hits);
+    let upstream = Router::new().route(
+        "/api/admin/endpoints/providers/provider-openai/keys",
+        any(move |_request: Request| {
+            let upstream_hits_inner = Arc::clone(&upstream_hits_clone);
+            async move {
+                *upstream_hits_inner.lock().expect("mutex should lock") += 1;
+                (StatusCode::OK, Body::from("unexpected upstream hit"))
+            }
+        }),
+    );
+
+    let mut key_a = sample_key(
+        "key-openai-a",
+        "provider-openai",
+        "openai:chat",
+        "sk-test-a",
+    );
+    key_a.internal_priority = 10;
+    key_a.created_at_unix_ms = Some(1_711_000_000);
+
+    let mut key_b = sample_key(
+        "key-openai-b",
+        "provider-openai",
+        "openai:chat",
+        "sk-test-b",
+    );
+    key_b.internal_priority = 20;
+    key_b.created_at_unix_ms = Some(1_711_100_000);
+
+    let mut key_c = sample_key(
+        "key-openai-c",
+        "provider-openai",
+        "openai:chat",
+        "sk-test-c",
+    );
+    key_c.internal_priority = 30;
+    key_c.created_at_unix_ms = Some(1_711_200_000);
+
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![sample_provider("provider-openai", "openai", 10)],
+        vec![],
+        vec![key_a, key_b, key_c],
+    ));
+
+    let (_upstream_url, upstream_handle) = start_server(upstream).await;
+    let gateway = build_router_with_state(
+        AppState::new()
+            .expect("gateway should build")
+            .with_data_state_for_tests(GatewayDataState::with_provider_catalog_reader_for_tests(
+                provider_catalog_repository,
+            )),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = reqwest::Client::new()
+        .get(format!(
+            "{gateway_url}/api/admin/endpoints/providers/provider-openai/keys?page=2&page_size=1"
+        ))
+        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(payload["total"], 3);
+    assert_eq!(payload["page"], 2);
+    assert_eq!(payload["page_size"], 1);
+    let items = payload["keys"].as_array().expect("keys should be an array");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["id"], "key-openai-b");
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();
@@ -551,7 +847,7 @@ async fn gateway_fetches_allowed_models_immediately_when_creating_key_with_auto_
             "endpoint-openai-chat",
             "provider-openai",
             "openai:chat",
-            "https://api.openai.example",
+            "https://api.openai.example/v1",
         )],
         vec![],
     ));
@@ -1366,7 +1662,7 @@ async fn gateway_overwrites_allowed_models_immediately_when_enabling_auto_fetch(
             "endpoint-openai-chat",
             "provider-openai",
             "openai:chat",
-            "https://api.openai.example",
+            "https://api.openai.example/v1",
         )],
         vec![key],
     ));
@@ -1474,7 +1770,7 @@ async fn gateway_fetches_allowed_models_immediately_when_enabling_auto_fetch_fro
             "endpoint-openai-chat",
             "provider-openai",
             "openai:chat",
-            "https://api.openai.example",
+            "https://api.openai.example/v1",
         )],
         vec![key],
     ));
@@ -1582,7 +1878,7 @@ async fn gateway_refreshes_allowed_models_when_updating_include_patterns_with_au
             "endpoint-openai-chat",
             "provider-openai",
             "openai:chat",
-            "https://api.openai.example",
+            "https://api.openai.example/v1",
         )],
         vec![key],
     ));
@@ -1686,7 +1982,7 @@ async fn gateway_refreshes_allowed_models_when_updating_exclude_patterns_with_au
             "endpoint-openai-chat",
             "provider-openai",
             "openai:chat",
-            "https://api.openai.example",
+            "https://api.openai.example/v1",
         )],
         vec![key],
     ));
@@ -2010,7 +2306,7 @@ async fn gateway_handles_admin_keys_grouped_by_format_locally_with_trusted_admin
     key_b.created_at_unix_ms = Some(1_711_100_000);
     key_b.updated_at_unix_secs = Some(1_711_100_100);
 
-    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+    let provider_catalog_repository = Arc::new(SummaryNullingProviderCatalogReadRepository::seed(
         vec![
             sample_provider("provider-openai", "openai", 10),
             sample_provider("provider-claude", "claude", 20)
@@ -2067,6 +2363,12 @@ async fn gateway_handles_admin_keys_grouped_by_format_locally_with_trusted_admin
         "https://api.openai.example"
     );
     assert_eq!(payload["openai:chat"][0]["capabilities"], json!(["1h缓存"]));
+    assert_eq!(payload["openai:chat"][0]["format_priority"], 3);
+    assert_eq!(
+        payload["openai:chat"][0]["global_priority_by_format"]["openai:chat"],
+        3
+    );
+    assert_eq!(payload["openai:chat"][0]["internal_priority"], 10);
     assert_eq!(payload["claude:messages"][0]["provider_active"], false);
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 

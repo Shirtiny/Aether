@@ -2,7 +2,7 @@ use crate::handlers::admin::provider::shared::payloads::AdminProviderKeyUpdatePa
 use crate::handlers::admin::provider::write::normalize::{
     normalize_allow_auth_channel_mismatch_formats, normalize_api_format_json_object_keys,
     normalize_api_format_list, normalize_auth_type, normalize_auth_type_by_format,
-    validate_vertex_api_formats,
+    normalize_max_probe_interval_minutes, validate_vertex_api_formats,
 };
 use crate::handlers::admin::request::AdminAppState;
 use crate::handlers::admin::shared::{
@@ -293,7 +293,8 @@ pub(crate) async fn build_admin_update_provider_key_record(
         updated.cache_ttl_minutes = cache_ttl_minutes;
     }
     if let Some(max_probe_interval_minutes) = payload.max_probe_interval_minutes {
-        updated.max_probe_interval_minutes = max_probe_interval_minutes;
+        updated.max_probe_interval_minutes =
+            normalize_max_probe_interval_minutes(max_probe_interval_minutes)?;
     }
     if let Some(is_active) = payload.is_active {
         updated.is_active = is_active;

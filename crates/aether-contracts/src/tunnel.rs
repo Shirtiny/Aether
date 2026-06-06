@@ -8,10 +8,15 @@ use flate2::Compression;
 pub const HEADER_SIZE: usize = 10;
 pub const TUNNEL_RELAY_FORWARDED_BY_HEADER: &str = "x-aether-tunnel-forwarded-by";
 pub const TUNNEL_RELAY_OWNER_INSTANCE_HEADER: &str = "x-aether-tunnel-owner-instance-id";
+pub const TUNNEL_PROTOCOL_VERSION_HEADER: &str = "x-aether-tunnel-protocol-version";
+pub const TUNNEL_NODE_NAME_B64_HEADER: &str = "x-aether-tunnel-node-name-b64";
+pub const CURRENT_TUNNEL_PROTOCOL_VERSION: u8 = 3;
+pub const CURRENT_TUNNEL_PROTOCOL_VERSION_STR: &str = "3";
 
 pub mod flags {
     pub const END_STREAM: u8 = 0x01;
     pub const GZIP_COMPRESSED: u8 = 0x02;
+    pub const ENCRYPTED: u8 = crate::tunnel_security::FLAG_ENCRYPTED;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,6 +33,12 @@ pub enum MsgType {
     GoAway = 0x12,
     HeartbeatData = 0x13,
     HeartbeatAck = 0x14,
+    Hello = 0x15,
+    Settings = 0x16,
+    WindowUpdate = 0x17,
+    ResetStream = 0x18,
+    ConnectionClose = 0x19,
+    LoadReport = 0x1a,
 }
 
 impl MsgType {
@@ -44,6 +55,12 @@ impl MsgType {
             GOAWAY => Some(Self::GoAway),
             HEARTBEAT_DATA => Some(Self::HeartbeatData),
             HEARTBEAT_ACK => Some(Self::HeartbeatAck),
+            HELLO => Some(Self::Hello),
+            SETTINGS => Some(Self::Settings),
+            WINDOW_UPDATE => Some(Self::WindowUpdate),
+            RESET_STREAM => Some(Self::ResetStream),
+            CONNECTION_CLOSE => Some(Self::ConnectionClose),
+            LOAD_REPORT => Some(Self::LoadReport),
             _ => None,
         }
     }
@@ -60,8 +77,15 @@ pub const PONG: u8 = MsgType::Pong as u8;
 pub const GOAWAY: u8 = MsgType::GoAway as u8;
 pub const HEARTBEAT_DATA: u8 = MsgType::HeartbeatData as u8;
 pub const HEARTBEAT_ACK: u8 = MsgType::HeartbeatAck as u8;
+pub const HELLO: u8 = MsgType::Hello as u8;
+pub const SETTINGS: u8 = MsgType::Settings as u8;
+pub const WINDOW_UPDATE: u8 = MsgType::WindowUpdate as u8;
+pub const RESET_STREAM: u8 = MsgType::ResetStream as u8;
+pub const CONNECTION_CLOSE: u8 = MsgType::ConnectionClose as u8;
+pub const LOAD_REPORT: u8 = MsgType::LoadReport as u8;
 pub const FLAG_END_STREAM: u8 = flags::END_STREAM;
 pub const FLAG_GZIP_COMPRESSED: u8 = flags::GZIP_COMPRESSED;
+pub const FLAG_ENCRYPTED: u8 = flags::ENCRYPTED;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameHeader {
@@ -180,6 +204,12 @@ pub struct RequestMeta {
     pub method: String,
     pub url: String,
     pub headers: std::collections::HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stream: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_first_byte_timeout_ms: Option<u64>,
     #[serde(default = "default_timeout", deserialize_with = "deserialize_timeout")]
     pub timeout: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -234,6 +264,54 @@ pub struct ResponseMeta {
     pub headers: Vec<(String, String)>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HelloPayload {
+    pub protocol_version: u8,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replica_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SettingsPayload {
+    pub initial_stream_window_bytes: u32,
+    pub min_window_update_bytes: u32,
+    pub drain_deadline_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WindowUpdatePayload {
+    pub delta_bytes: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ResetStreamPayload {
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GoAwayPayload {
+    pub last_accepted_stream_id: u32,
+    pub drain_deadline_ms: u64,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ConnectionClosePayload {
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LoadReportPayload {
+    pub active_streams: u32,
+    pub queue_depth: u32,
+    pub queue_capacity: u32,
+    pub health_score: u8,
+}
+
 pub fn encode_frame(stream_id: u32, msg_type: u8, flags: u8, payload: &[u8]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(HEADER_SIZE + payload.len());
     buf.extend_from_slice(&stream_id.to_be_bytes());
@@ -248,6 +326,14 @@ pub fn encode_stream_error(stream_id: u32, msg: &str) -> Vec<u8> {
     encode_frame(stream_id, STREAM_ERROR, 0, msg.as_bytes())
 }
 
+pub fn encode_reset_stream(stream_id: u32, reason: &str) -> Vec<u8> {
+    let payload = serde_json::to_vec(&ResetStreamPayload {
+        reason: reason.to_string(),
+    })
+    .expect("reset stream payload should serialize");
+    encode_frame(stream_id, RESET_STREAM, 0, &payload)
+}
+
 pub fn encode_ping() -> Vec<u8> {
     encode_frame(0, PING, 0, &[])
 }
@@ -258,6 +344,51 @@ pub fn encode_pong(payload: &[u8]) -> Vec<u8> {
 
 pub fn encode_goaway() -> Vec<u8> {
     encode_frame(0, GOAWAY, 0, &[])
+}
+
+pub fn encode_goaway_v3(
+    last_accepted_stream_id: u32,
+    drain_deadline_ms: u64,
+    reason: &str,
+) -> Vec<u8> {
+    let payload = serde_json::to_vec(&GoAwayPayload {
+        last_accepted_stream_id,
+        drain_deadline_ms,
+        reason: reason.to_string(),
+    })
+    .expect("goaway payload should serialize");
+    encode_frame(0, GOAWAY, 0, &payload)
+}
+
+pub fn encode_hello(payload: &HelloPayload) -> Vec<u8> {
+    encode_json_control(HELLO, payload)
+}
+
+pub fn encode_settings(payload: &SettingsPayload) -> Vec<u8> {
+    encode_json_control(SETTINGS, payload)
+}
+
+pub fn encode_window_update(stream_id: u32, delta_bytes: u32) -> Vec<u8> {
+    let payload = serde_json::to_vec(&WindowUpdatePayload { delta_bytes })
+        .expect("window update payload should serialize");
+    encode_frame(stream_id, WINDOW_UPDATE, 0, &payload)
+}
+
+pub fn encode_connection_close(reason: &str) -> Vec<u8> {
+    let payload = serde_json::to_vec(&ConnectionClosePayload {
+        reason: reason.to_string(),
+    })
+    .expect("connection close payload should serialize");
+    encode_frame(0, CONNECTION_CLOSE, 0, &payload)
+}
+
+pub fn encode_load_report(payload: &LoadReportPayload) -> Vec<u8> {
+    encode_json_control(LOAD_REPORT, payload)
+}
+
+fn encode_json_control<T: serde::Serialize>(msg_type: u8, payload: &T) -> Vec<u8> {
+    let payload = serde_json::to_vec(payload).expect("tunnel control payload should serialize");
+    encode_frame(0, msg_type, 0, &payload)
 }
 
 #[inline]
@@ -304,6 +435,10 @@ pub fn compress_payload(data: Bytes) -> (Bytes, u8) {
     (data, 0)
 }
 
+pub fn raw_payload(data: Bytes) -> (Bytes, u8) {
+    (data, 0)
+}
+
 const COMPRESS_MIN_SIZE: usize = 512;
 
 fn decompress_gzip(data: &[u8]) -> Result<Bytes, std::io::Error> {
@@ -324,7 +459,13 @@ fn compress_gzip(data: &[u8]) -> Result<Bytes, std::io::Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::{encode_ping, Frame, FrameHeader, MsgType, RequestMeta, FLAG_GZIP_COMPRESSED};
+    use super::{
+        compress_payload, decode_payload, encode_frame, encode_goaway_v3, encode_ping,
+        encode_reset_stream, encode_window_update, raw_payload, Frame, FrameHeader, GoAwayPayload,
+        MsgType, RequestMeta, ResetStreamPayload, WindowUpdatePayload,
+        CURRENT_TUNNEL_PROTOCOL_VERSION, CURRENT_TUNNEL_PROTOCOL_VERSION_STR, FLAG_GZIP_COMPRESSED,
+        REQUEST_HEADERS, TUNNEL_PROTOCOL_VERSION_HEADER,
+    };
     use bytes::Bytes;
 
     #[test]
@@ -357,5 +498,65 @@ mod tests {
         let header = FrameHeader::parse(&encoded).expect("ping header should parse");
         assert_eq!(header.msg_type, MsgType::Ping as u8);
         assert_eq!(header.flags & FLAG_GZIP_COMPRESSED, 0);
+    }
+
+    #[test]
+    fn raw_payload_never_compresses_body_frames() {
+        let body = Bytes::from(vec![b'a'; 4 * 1024]);
+        let (payload, flags) = raw_payload(body.clone());
+
+        assert_eq!(payload, body);
+        assert_eq!(flags & FLAG_GZIP_COMPRESSED, 0);
+    }
+
+    #[test]
+    fn compress_payload_remains_available_for_control_payloads() {
+        let control_payload = Bytes::from(vec![b'a'; 4 * 1024]);
+        let (payload, flags) = compress_payload(control_payload.clone());
+        assert_ne!(flags & FLAG_GZIP_COMPRESSED, 0);
+
+        let encoded = encode_frame(1, REQUEST_HEADERS, flags, &payload);
+        let header = FrameHeader::parse(&encoded).expect("frame should parse");
+        let decoded = decode_payload(&encoded, &header).expect("payload should decode");
+        assert_eq!(decoded, control_payload.to_vec());
+    }
+
+    #[test]
+    fn tunnel_protocol_version_header_defaults_to_v2() {
+        assert_eq!(
+            TUNNEL_PROTOCOL_VERSION_HEADER,
+            "x-aether-tunnel-protocol-version"
+        );
+        assert_eq!(CURRENT_TUNNEL_PROTOCOL_VERSION, 3);
+        assert_eq!(CURRENT_TUNNEL_PROTOCOL_VERSION_STR, "3");
+    }
+
+    #[test]
+    fn v3_control_frames_round_trip_json_payloads() {
+        let reset = encode_reset_stream(9, "request body window exhausted");
+        let reset_header = FrameHeader::parse(&reset).expect("reset header");
+        assert_eq!(reset_header.msg_type, super::RESET_STREAM);
+        let reset_payload = decode_payload(&reset, &reset_header).expect("reset payload");
+        let reset_payload: ResetStreamPayload =
+            serde_json::from_slice(&reset_payload).expect("reset json");
+        assert_eq!(reset_payload.reason, "request body window exhausted");
+
+        let window = encode_window_update(9, 1024 * 1024);
+        let window_header = FrameHeader::parse(&window).expect("window header");
+        assert_eq!(window_header.msg_type, super::WINDOW_UPDATE);
+        let window_payload = decode_payload(&window, &window_header).expect("window payload");
+        let window_payload: WindowUpdatePayload =
+            serde_json::from_slice(&window_payload).expect("window json");
+        assert_eq!(window_payload.delta_bytes, 1024 * 1024);
+
+        let goaway = encode_goaway_v3(42, 30_000, "rolling restart");
+        let goaway_header = FrameHeader::parse(&goaway).expect("goaway header");
+        assert_eq!(goaway_header.msg_type, super::GOAWAY);
+        let goaway_payload = decode_payload(&goaway, &goaway_header).expect("goaway payload");
+        let goaway_payload: GoAwayPayload =
+            serde_json::from_slice(&goaway_payload).expect("goaway json");
+        assert_eq!(goaway_payload.last_accepted_stream_id, 42);
+        assert_eq!(goaway_payload.drain_deadline_ms, 30_000);
+        assert_eq!(goaway_payload.reason, "rolling restart");
     }
 }

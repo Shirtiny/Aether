@@ -4,6 +4,7 @@ import { adminBillingPlansApi, epayGatewayApi } from '@/api/billing'
 import { getProvidersSummary } from '@/api/endpoints/providers'
 import { getPoolOverview, getPoolSchedulingPresets, listPoolKeys } from '@/api/endpoints/pool'
 import { listGlobalModels } from '@/api/global-models'
+import { listRoutingGroups } from '@/api/routing-profiles'
 import { usersApi } from '@/api/users'
 import { log } from '@/utils/logger'
 
@@ -48,6 +49,12 @@ const adminRouteWarmers: Record<string, () => Promise<void>> = {
         { skip: 0, limit: 20 },
         { cacheTtlMs: NAV_DATA_CACHE_TTL_MS },
       ),
+    ])
+  },
+  '/admin/routing': async () => {
+    await Promise.allSettled([
+      import('@/views/admin/RoutingProfiles.vue'),
+      listRoutingGroups(),
     ])
   },
   '/admin/pool': async () => {

@@ -10,7 +10,7 @@
                 黑名单 IP 数量
               </p>
               <h3 class="text-2xl font-bold mt-2">
-                {{ blacklistStats.total || 0 }}
+                {{ blacklistData.total || blacklistStats.total || 0 }}
               </h3>
             </div>
             <div class="h-12 w-12 rounded-full bg-destructive/10 flex items-center justify-center">
@@ -66,7 +66,7 @@
             </Button>
             <RefreshButton
               :loading="loadingBlacklist"
-              @click="loadBlacklistStats"
+              @click="loadBlacklist"
             />
           </div>
         </div>
@@ -85,16 +85,33 @@
       >
         <div
           v-if="!blacklistStats.available"
+          class="mb-4 rounded-lg border border-destructive/20 bg-destructive/5 px-4 py-3 text-sm text-muted-foreground"
+        >
+          <div class="flex items-start gap-3">
+            <AlertCircle class="mt-0.5 h-4 w-4 shrink-0 text-destructive" />
+            <div>
+              <p class="font-medium text-foreground">
+                黑名单状态不可用，列表可能不是最新
+              </p>
+              <p class="mt-1 text-xs">
+                {{ blacklistStats.error }}
+              </p>
+            </div>
+          </div>
+        </div>
+
+        <div
+          v-if="blacklistListError"
           class="text-center py-8 text-muted-foreground"
         >
           <AlertCircle class="w-12 h-12 mx-auto mb-2 opacity-50" />
-          <p>Redis 不可用，无法管理黑名单</p>
+          <p>无法获取黑名单列表</p>
           <p class="text-xs mt-1">
-            {{ blacklistStats.error }}
+            {{ blacklistListError }}
           </p>
         </div>
         <div
-          v-else-if="blacklistStats.total === 0"
+          v-else-if="blacklistData.items.length === 0"
           class="text-center py-8 text-muted-foreground"
         >
           <ShieldX class="w-12 h-12 mx-auto mb-2 opacity-50" />
@@ -102,9 +119,79 @@
         </div>
         <div
           v-else
-          class="text-sm text-muted-foreground"
+          class="space-y-4"
         >
-          当前共有 <span class="font-semibold text-foreground">{{ blacklistStats.total }}</span> 个 IP 在黑名单中
+          <div class="text-sm text-muted-foreground">
+            当前共有 <span class="font-semibold text-foreground">{{ blacklistData.total || blacklistStats.total || 0 }}</span> 个 IP 在黑名单中
+          </div>
+
+          <Table class="hidden sm:table">
+            <TableHeader>
+              <TableRow>
+                <TableHead>IP 地址</TableHead>
+                <TableHead>原因</TableHead>
+                <TableHead>剩余时长</TableHead>
+                <TableHead class="text-right">
+                  操作
+                </TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              <TableRow
+                v-for="entry in blacklistData.items"
+                :key="entry.ip_address"
+              >
+                <TableCell class="font-mono text-sm">
+                  {{ entry.ip_address }}
+                </TableCell>
+                <TableCell class="max-w-[28rem] truncate">
+                  {{ entry.reason }}
+                </TableCell>
+                <TableCell class="whitespace-nowrap">
+                  {{ formatBlacklistTTL(entry.ttl_seconds) }}
+                </TableCell>
+                <TableCell class="text-right">
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    class="h-8 px-3"
+                    @click="handleRemoveFromBlacklist(entry.ip_address)"
+                  >
+                    <Trash2 class="w-4 h-4 mr-1.5" />
+                    移除
+                  </Button>
+                </TableCell>
+              </TableRow>
+            </TableBody>
+          </Table>
+
+          <div class="sm:hidden divide-y divide-border/40">
+            <div
+              v-for="entry in blacklistData.items"
+              :key="entry.ip_address"
+              class="p-4 flex items-start justify-between gap-3"
+            >
+              <div class="min-w-0 space-y-1">
+                <div class="font-mono text-sm break-all">
+                  {{ entry.ip_address }}
+                </div>
+                <div class="text-xs text-muted-foreground leading-5 break-words">
+                  {{ entry.reason }}
+                </div>
+                <div class="text-xs text-muted-foreground">
+                  {{ formatBlacklistTTL(entry.ttl_seconds) }}
+                </div>
+              </div>
+              <Button
+                variant="ghost"
+                size="sm"
+                class="h-8 px-3 shrink-0"
+                @click="handleRemoveFromBlacklist(entry.ip_address)"
+              >
+                <Trash2 class="w-4 h-4" />
+              </Button>
+            </div>
+          </div>
         </div>
       </div>
     </Card>
@@ -213,15 +300,17 @@
 
     <!-- 添加黑名单对话框 -->
     <Dialog v-model:open="showAddBlacklistDialog">
-      <DialogContent class="sm:max-w-md">
-        <DialogHeader>
-          <DialogTitle>添加 IP 到黑名单</DialogTitle>
-          <DialogDescription>
+      <DialogContent class="sm:max-w-md !p-0 overflow-hidden">
+        <DialogHeader class="!px-4 !py-3">
+          <DialogTitle class="!text-base">
+            添加 IP 到黑名单
+          </DialogTitle>
+          <DialogDescription class="!mt-1">
             被加入黑名单的 IP 将无法访问任何接口
           </DialogDescription>
         </DialogHeader>
-        <div class="space-y-4">
-          <div class="space-y-2">
+        <div class="space-y-3 px-4 py-4">
+          <div class="space-y-1.5">
             <label class="text-sm font-medium">IP 地址</label>
             <Input
               v-model="blacklistForm.ip_address"
@@ -229,7 +318,7 @@
               class="font-mono"
             />
           </div>
-          <div class="space-y-2">
+          <div class="space-y-1.5">
             <label class="text-sm font-medium">原因</label>
             <Input
               v-model="blacklistForm.reason"
@@ -237,7 +326,7 @@
               maxlength="200"
             />
           </div>
-          <div class="space-y-2">
+          <div class="space-y-1.5">
             <label class="text-sm font-medium">过期时间（可选）</label>
             <Input
               v-model.number="blacklistForm.ttl"
@@ -250,7 +339,7 @@
             </p>
           </div>
         </div>
-        <DialogFooter>
+        <DialogFooter class="!px-4 !py-3">
           <Button
             variant="ghost"
             @click="showAddBlacklistDialog = false"
@@ -270,27 +359,29 @@
 
     <!-- 添加白名单对话框 -->
     <Dialog v-model:open="showAddWhitelistDialog">
-      <DialogContent class="sm:max-w-md">
-        <DialogHeader>
-          <DialogTitle>添加 IP 到白名单</DialogTitle>
-          <DialogDescription>
+      <DialogContent class="sm:max-w-md !p-0 overflow-hidden">
+        <DialogHeader class="!px-4 !py-3">
+          <DialogTitle class="!text-base">
+            添加 IP 到白名单
+          </DialogTitle>
+          <DialogDescription class="!mt-1">
             白名单中的 IP 不受速率限制
           </DialogDescription>
         </DialogHeader>
-        <div class="space-y-4">
-          <div class="space-y-2">
+        <div class="space-y-3 px-4 py-4">
+          <div class="space-y-1.5">
             <label class="text-sm font-medium">IP 地址或 CIDR</label>
             <Input
               v-model="whitelistForm.ip_address"
               placeholder="例如: 192.168.1.0/24 或 192.168.1.100"
               class="font-mono"
             />
-            <p class="text-xs text-muted-foreground">
+            <p class="text-xs text-muted-foreground leading-5">
               支持单个 IP 或 CIDR 网段格式
             </p>
           </div>
         </div>
-        <DialogFooter>
+        <DialogFooter class="!px-4 !py-3">
           <Button
             variant="ghost"
             @click="showAddWhitelistDialog = false"
@@ -330,7 +421,7 @@ import {
   TableRow,
   RefreshButton
 } from '@/components/ui'
-import { blacklistApi, whitelistApi, type BlacklistStats, type WhitelistResponse } from '@/api/security'
+import { blacklistApi, whitelistApi, type BlacklistStats, type BlacklistResponse, type WhitelistResponse } from '@/api/security'
 import { useToast } from '@/composables/useToast'
 import { useConfirm } from '@/composables/useConfirm'
 import { parseApiError } from '@/utils/errorParser'
@@ -344,6 +435,11 @@ const blacklistStats = ref<BlacklistStats>({
   available: false,
   total: 0
 })
+const blacklistData = ref<BlacklistResponse>({
+  items: [],
+  total: 0
+})
+const blacklistListError = ref<string | null>(null)
 const showAddBlacklistDialog = ref(false)
 const blacklistForm = ref({
   ip_address: '',
@@ -363,14 +459,38 @@ const whitelistForm = ref({
 })
 
 /**
- * 加载黑名单统计
+ * 加载黑名单统计和列表
  */
-async function loadBlacklistStats() {
+async function loadBlacklist() {
   loadingBlacklist.value = true
+  blacklistListError.value = null
   try {
-    blacklistStats.value = await blacklistApi.getStats()
+    const [statsResult, listResult] = await Promise.allSettled([
+      blacklistApi.getStats(),
+      blacklistApi.getList()
+    ])
+
+    if (statsResult.status === 'fulfilled') {
+      blacklistStats.value = statsResult.value
+    } else {
+      blacklistStats.value = {
+        available: false,
+        total: 0,
+        error: parseApiError(statsResult.reason, '无法获取黑名单统计')
+      }
+    }
+
+    if (listResult.status === 'fulfilled') {
+      blacklistData.value = listResult.value
+    } else {
+      blacklistData.value = {
+        items: [],
+        total: 0
+      }
+      blacklistListError.value = parseApiError(listResult.reason, '无法获取黑名单列表')
+    }
   } catch (err: unknown) {
-    error(parseApiError(err, '无法获取黑名单统计'))
+    error(parseApiError(err, '无法获取黑名单数据'))
   } finally {
     loadingBlacklist.value = false
   }
@@ -405,7 +525,7 @@ async function handleAddToBlacklist() {
 
     showAddBlacklistDialog.value = false
     blacklistForm.value = { ip_address: '', reason: '', ttl: undefined }
-    await loadBlacklistStats()
+    await loadBlacklist()
   } catch (err: unknown) {
     error(parseApiError(err, '无法添加 IP 到黑名单'))
   }
@@ -452,8 +572,46 @@ async function handleRemoveFromWhitelist(ip: string) {
   }
 }
 
+/**
+ * 从黑名单移除 IP
+ */
+async function handleRemoveFromBlacklist(ip: string) {
+  const confirmed = await confirmDanger(
+    `确定要从黑名单移除 ${ip} 吗？\n\n此操作无法撤销。`,
+    '移除黑名单'
+  )
+
+  if (!confirmed) return
+
+  try {
+    await blacklistApi.remove(ip)
+
+    success(`IP ${ip} 已从黑名单移除`)
+
+    await loadBlacklist()
+  } catch (err: unknown) {
+    error(parseApiError(err, '无法从黑名单移除 IP'))
+  }
+}
+
+function formatBlacklistTTL(ttlSeconds?: number | null) {
+  if (ttlSeconds == null) return '永久'
+  if (ttlSeconds <= 0) return '即将过期'
+
+  const days = Math.floor(ttlSeconds / 86400)
+  if (days > 0) return `${days} 天`
+
+  const hours = Math.floor(ttlSeconds / 3600)
+  if (hours > 0) return `${hours} 小时`
+
+  const minutes = Math.floor(ttlSeconds / 60)
+  if (minutes > 0) return `${minutes} 分钟`
+
+  return `${ttlSeconds} 秒`
+}
+
 onMounted(() => {
-  loadBlacklistStats()
+  loadBlacklist()
   loadWhitelist()
 })
 </script>

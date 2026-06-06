@@ -4,7 +4,8 @@ use super::keys::{
 };
 use crate::handlers::admin::provider::pool::config::admin_provider_pool_cache_affinity_enabled;
 use crate::handlers::admin::provider::shared::support::{
-    AdminProviderPoolConfig, AdminProviderPoolUnschedulableRule,
+    admin_provider_pool_quota_probe_active_members_key, AdminProviderPoolConfig,
+    AdminProviderPoolUnschedulableRule,
 };
 use aether_runtime_state::RuntimeState;
 use regex::Regex;
@@ -221,7 +222,7 @@ fn first_error_text(
     })
 }
 
-pub(crate) fn admin_provider_pool_key_circuit_breaker_reason(
+pub(crate) fn admin_provider_pool_key_terminal_error_reason(
     status_code: u16,
     error_body: Option<&str>,
 ) -> Option<String> {
@@ -311,6 +312,27 @@ async fn set_pool_cooldown(
             std::time::Duration::from_secs(ttl_seconds.saturating_add(60)),
         )
         .await;
+    spawn_remove_pool_active_probe_member(runtime, provider_id, key_id);
+}
+
+fn spawn_remove_pool_active_probe_member(runtime: &RuntimeState, provider_id: &str, key_id: &str) {
+    let runtime = runtime.clone();
+    let provider_id = provider_id.to_string();
+    let key_id = key_id.to_string();
+    tokio::spawn(async move {
+        if let Err(err) = runtime
+            .set_remove(
+                &admin_provider_pool_quota_probe_active_members_key(&provider_id),
+                &key_id,
+            )
+            .await
+        {
+            warn!(
+                "gateway admin provider pool: failed to remove active probe member for provider {provider_id} key {key_id}: {:?}",
+                err
+            );
+        }
+    });
 }
 
 async fn invalidate_pool_oauth_cache(runtime: &RuntimeState, key_id: &str) {
@@ -423,10 +445,12 @@ pub(crate) async fn record_admin_provider_pool_error(
 
     if status_code == 401 {
         invalidate_pool_oauth_cache(runtime, key_id).await;
+        spawn_remove_pool_active_probe_member(runtime, provider_id, key_id);
         return;
     }
 
     if status_code == 402 {
+        spawn_remove_pool_active_probe_member(runtime, provider_id, key_id);
         return;
     }
 
@@ -435,6 +459,7 @@ pub(crate) async fn record_admin_provider_pool_error(
             .iter()
             .any(|pattern| error_message.contains(pattern))
         {
+            spawn_remove_pool_active_probe_member(runtime, provider_id, key_id);
             return;
         }
         set_pool_cooldown(
@@ -450,7 +475,7 @@ pub(crate) async fn record_admin_provider_pool_error(
 
     if status_code == 400 {
         // Bad Request is usually attributable to the caller payload, not key health.
-        // Account-level 400s are handled by the orchestration circuit-breaker path.
+        // Account-level 400s are handled by orchestration pool-score feedback.
         return;
     }
 
@@ -563,14 +588,14 @@ pub(crate) async fn record_admin_provider_pool_stream_timeout(
 #[cfg(test)]
 mod tests {
     use super::{
-        admin_provider_pool_key_circuit_breaker_reason, parse_google_quota_cooldown_seconds_at,
+        admin_provider_pool_key_terminal_error_reason, parse_google_quota_cooldown_seconds_at,
         record_admin_provider_pool_error, record_admin_provider_pool_stream_timeout,
         record_admin_provider_pool_success,
     };
     use crate::handlers::admin::provider::pool::runtime::reads::read_admin_provider_pool_runtime_state;
     use crate::handlers::admin::provider::shared::support::{
-        AdminProviderPoolConfig, AdminProviderPoolSchedulingPreset,
-        AdminProviderPoolUnschedulableRule,
+        admin_provider_pool_quota_probe_active_members_key, AdminProviderPoolConfig,
+        AdminProviderPoolSchedulingPreset, AdminProviderPoolUnschedulableRule,
     };
     use crate::AppState;
     use aether_runtime_state::{RedisClientConfig, RuntimeState, RuntimeStateConfig};
@@ -621,7 +646,7 @@ mod tests {
             account_self_check_interval_minutes: 60,
             account_self_check_concurrency: 4,
             score_top_n: 128,
-            score_fallback_scan_limit: 1024,
+            score_fallback_scan_limit: 4096,
             score_rules: aether_pool_core::PoolMemberScoreRules::default(),
             stream_timeout_threshold: 3,
             stream_timeout_window_seconds: 1800,
@@ -640,6 +665,24 @@ mod tests {
         AppState::new()
             .expect("app state should build")
             .with_runtime_state(std::sync::Arc::new(runtime_state))
+    }
+
+    async fn wait_for_active_probe_members_empty(runtime: &RuntimeState, set_key: &str) {
+        for _ in 0..20 {
+            let members = runtime
+                .set_members(set_key)
+                .await
+                .expect("active members should read");
+            if members.is_empty() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let members = runtime
+            .set_members(set_key)
+            .await
+            .expect("active members should read");
+        assert!(members.is_empty());
     }
 
     #[test]
@@ -704,9 +747,9 @@ mod tests {
     }
 
     #[test]
-    fn circuit_reason_detects_workspace_deactivated_errors() {
+    fn terminal_error_reason_detects_workspace_deactivated_errors() {
         assert_eq!(
-            admin_provider_pool_key_circuit_breaker_reason(
+            admin_provider_pool_key_terminal_error_reason(
                 402,
                 Some(r#"{"error":{"message":"workspace has been deactivated"}}"#),
             )
@@ -714,7 +757,7 @@ mod tests {
             Some("workspace_deactivated_402:workspace has been deactivated")
         );
         assert_eq!(
-            admin_provider_pool_key_circuit_breaker_reason(
+            admin_provider_pool_key_terminal_error_reason(
                 400,
                 Some(r#"{"error":{"message":"deactivated_workspace"}}"#),
             )
@@ -724,9 +767,9 @@ mod tests {
     }
 
     #[test]
-    fn circuit_reason_detects_account_ban_errors() {
+    fn terminal_error_reason_detects_account_ban_errors() {
         assert_eq!(
-            admin_provider_pool_key_circuit_breaker_reason(
+            admin_provider_pool_key_terminal_error_reason(
                 403,
                 Some(r#"{"error":{"message":"AccountSuspendedException: account suspended"}}"#),
             )
@@ -734,7 +777,7 @@ mod tests {
             Some("forbidden_403")
         );
         assert_eq!(
-            admin_provider_pool_key_circuit_breaker_reason(
+            admin_provider_pool_key_terminal_error_reason(
                 423,
                 Some(r#"{"error":{"message":"account access denied"}}"#),
             )
@@ -911,6 +954,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn error_feedback_removes_active_probe_member_when_key_becomes_unschedulable() {
+        let Some(redis) = start_managed_redis_or_skip().await else {
+            return;
+        };
+        let app = build_runner_app(redis.redis_url(), "pool_runtime_evict_active_probe").await;
+        let runtime = app.runtime_state.as_ref();
+        let pool_config = sample_pool_config();
+        let set_key = admin_provider_pool_quota_probe_active_members_key("provider-1");
+        runtime
+            .set_add(&set_key, "key-2")
+            .await
+            .expect("active member should insert");
+
+        record_admin_provider_pool_error(
+            runtime,
+            "provider-1",
+            "key-2",
+            &pool_config,
+            429,
+            Some(r#"{"error":{"message":"rate limited"}}"#),
+            None,
+        )
+        .await;
+
+        wait_for_active_probe_members_empty(runtime, &set_key).await;
+
+        runtime
+            .set_add(&set_key, "key-402")
+            .await
+            .expect("active member should insert");
+        record_admin_provider_pool_error(
+            runtime,
+            "provider-1",
+            "key-402",
+            &pool_config,
+            402,
+            Some(r#"{"error":{"message":"quota exhausted"}}"#),
+            None,
+        )
+        .await;
+        wait_for_active_probe_members_empty(runtime, &set_key).await;
+    }
+
+    #[tokio::test]
     async fn error_feedback_uses_google_quota_cooldown_when_retry_after_missing() {
         let Some(redis) = start_managed_redis_or_skip().await else {
             return;
@@ -1012,7 +1099,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn severe_account_errors_use_circuit_breaker_instead_of_pool_cooldown() {
+    async fn severe_account_errors_do_not_use_pool_cooldown() {
         let Some(redis) = start_managed_redis_or_skip().await else {
             return;
         };
@@ -1022,7 +1109,7 @@ mod tests {
         let key_ids = vec!["key-account-disabled".to_string()];
 
         assert_eq!(
-            admin_provider_pool_key_circuit_breaker_reason(
+            admin_provider_pool_key_terminal_error_reason(
                 401,
                 Some(r#"{"error":{"message":"account has been deactivated"}}"#),
             )

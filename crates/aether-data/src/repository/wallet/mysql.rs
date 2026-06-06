@@ -536,6 +536,32 @@ WHERE wallet_id = ?
             .await
     }
 
+    async fn find_pending_plan_purchase_order_by_user_id(
+        &self,
+        user_id: &str,
+        product_id: &str,
+    ) -> Result<Option<StoredAdminPaymentOrder>, DataLayerError> {
+        let sql = payment_order_select_sql(
+            r#"
+WHERE user_id = ?
+  AND product_id = ?
+  AND order_kind = 'plan_purchase'
+  AND status = 'pending'
+  AND expires_at > ?
+ORDER BY created_at DESC
+LIMIT 1
+"#,
+        );
+        let row = sqlx::query(&sql)
+            .bind(user_id)
+            .bind(product_id)
+            .bind(current_unix_secs_i64())
+            .fetch_optional(&self.pool)
+            .await
+            .map_sql_err()?;
+        row.as_ref().map(map_payment_order_row).transpose()
+    }
+
     async fn find_wallet_refund(
         &self,
         wallet_id: &str,

@@ -165,6 +165,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn settles_pending_cancelled_usage() {
+        let writer = TestSettlementWriter {
+            has_writer: true,
+            ..Default::default()
+        };
+        let mut usage = sample_usage();
+        usage.status = "cancelled".to_string();
+        usage.status_code = Some(499);
+
+        settle_usage_if_needed(&writer, &usage)
+            .await
+            .expect("settlement should succeed");
+
+        let inputs = writer.inputs.lock().expect("settlement inputs lock");
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].request_id, "req-1");
+        assert_eq!(inputs[0].status, "cancelled");
+        assert_eq!(inputs[0].billing_status, "pending");
+        assert_eq!(inputs[0].total_cost_usd, 1.25);
+        assert_eq!(inputs[0].actual_total_cost_usd, 0.75);
+    }
+
+    #[tokio::test]
     async fn propagates_standalone_key_flag_from_usage_metadata() {
         let writer = TestSettlementWriter {
             has_writer: true,

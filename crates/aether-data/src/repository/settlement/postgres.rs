@@ -2,8 +2,9 @@ use async_trait::async_trait;
 use sqlx::{PgPool, Row};
 
 use super::{
-    finite_wallet_available_usd, plan_finite_wallet_debit, SettlementWriteRepository,
-    StoredUsageSettlement, UsageSettlementInput, SETTLEMENT_EPSILON_USD,
+    finite_wallet_available_usd, plan_finite_wallet_debit,
+    settlement_billing_status_for_usage_status, SettlementWriteRepository, StoredUsageSettlement,
+    UsageSettlementInput, SETTLEMENT_EPSILON_USD,
 };
 use crate::driver::postgres::PostgresTransactionRunner;
 use crate::error::SqlxResultExt;
@@ -125,6 +126,22 @@ DO UPDATE SET
   updated_at = NOW()
 "#;
 
+const ENQUEUE_PROVIDER_MONTHLY_USAGE_DELTA_SQL: &str = r#"
+INSERT INTO usage_counter_deltas (
+  id,
+  request_id,
+  kind,
+  target_id,
+  total_cost_usd_delta
+) VALUES (
+  $1,
+  $2,
+  'provider_monthly',
+  $3,
+  $4
+)
+"#;
+
 #[derive(Debug, Clone)]
 pub struct SqlxSettlementRepository {
     tx_runner: PostgresTransactionRunner,
@@ -187,6 +204,37 @@ where
         .bind(settlement.wallet_gift_balance_after)
         .bind(settlement.provider_monthly_used_usd)
         .bind(settlement.finalized_at_unix_secs.map(|value| value as f64))
+        .execute(executor)
+        .await
+        .map_postgres_err()?;
+    Ok(())
+}
+
+async fn enqueue_provider_monthly_usage_delta<'e, E>(
+    executor: E,
+    request_id: &str,
+    provider_id: &str,
+    total_cost_usd_delta: f64,
+) -> Result<(), DataLayerError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    let request_id = request_id.trim();
+    let provider_id = provider_id.trim();
+    if request_id.is_empty() || provider_id.is_empty() || total_cost_usd_delta == 0.0 {
+        return Ok(());
+    }
+    if !total_cost_usd_delta.is_finite() {
+        return Err(DataLayerError::UnexpectedValue(format!(
+            "provider monthly usage delta is not finite for {provider_id}"
+        )));
+    }
+
+    sqlx::query(ENQUEUE_PROVIDER_MONTHLY_USAGE_DELTA_SQL)
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(request_id)
+        .bind(provider_id)
+        .bind(total_cost_usd_delta)
         .execute(executor)
         .await
         .map_postgres_err()?;
@@ -264,6 +312,7 @@ async fn consume_daily_quota_postgres(
     request_id: &str,
     total_cost_usd: f64,
     wallet_available_usd: Option<f64>,
+    wallet_can_overdraft: bool,
 ) -> Result<DailyQuotaDebitResult, DataLayerError> {
     if total_cost_usd <= 0.0 {
         return Ok(DailyQuotaDebitResult::default());
@@ -331,6 +380,7 @@ WHERE user_entitlement_id = $1
         });
     }
     if allow_wallet_overage
+        && !wallet_can_overdraft
         && wallet_available_usd.is_some_and(|available| {
             total_remaining + available + SETTLEMENT_EPSILON_USD < total_cost_usd
         })
@@ -408,11 +458,8 @@ impl SettlementWriteRepository for SqlxSettlementRepository {
                         return settlement_from_row(&usage_row).map(Some);
                     }
 
-                    let mut final_billing_status = if input.status == "completed" {
-                        "settled".to_string()
-                    } else {
-                        "void".to_string()
-                    };
+                    let mut final_billing_status =
+                        settlement_billing_status_for_usage_status(&input.status).to_string();
                     let finalized_at =
                         i64::try_from(input.finalized_at_unix_secs.unwrap_or_else(|| {
                             std::time::SystemTime::now()
@@ -515,6 +562,7 @@ LIMIT 1
                             None
                         };
 
+                        let wallet_can_overdraft = wallet_row.is_some();
                         let wallet_available_usd = match wallet_row.as_ref() {
                             Some(row) => {
                                 let limit_mode: String =
@@ -530,6 +578,20 @@ LIMIT 1
                             }
                             None => Some(0.0),
                         };
+                        if let Some(row) = wallet_row.as_ref() {
+                            let wallet_id: String = row.try_get("id").map_postgres_err()?;
+                            let before_recharge: f64 = row.try_get("balance").map_postgres_err()?;
+                            let before_gift: f64 =
+                                row.try_get("gift_balance").map_postgres_err()?;
+                            let before_total = before_recharge + before_gift;
+                            settlement.wallet_id = Some(wallet_id);
+                            settlement.wallet_balance_before = Some(before_total);
+                            settlement.wallet_balance_after = Some(before_total);
+                            settlement.wallet_recharge_balance_before = Some(before_recharge);
+                            settlement.wallet_recharge_balance_after = Some(before_recharge);
+                            settlement.wallet_gift_balance_before = Some(before_gift);
+                            settlement.wallet_gift_balance_after = Some(before_gift);
+                        }
 
                         let wallet_debit_cost_usd = if !api_key_is_standalone {
                             if let Some(user_id) =
@@ -541,6 +603,7 @@ LIMIT 1
                                     &input.request_id,
                                     input.total_cost_usd,
                                     wallet_available_usd,
+                                    wallet_can_overdraft,
                                 )
                                 .await?;
                                 if quota.insufficient {
@@ -587,16 +650,8 @@ LIMIT 1
                                         before_gift,
                                         wallet_debit_cost_usd,
                                     );
-                                    if debit_plan.covered_usd() + SETTLEMENT_EPSILON_USD
-                                        < wallet_debit_cost_usd
-                                    {
-                                        final_billing_status = "insufficient_quota".to_string();
-                                        settlement.billing_status = final_billing_status.clone();
-                                    } else {
-                                        after_recharge =
-                                            before_recharge - debit_plan.recharge_deduction;
-                                        after_gift = before_gift - debit_plan.gift_deduction;
-                                    }
+                                    (after_recharge, after_gift) =
+                                        debit_plan.after_balances(before_recharge, before_gift);
                                 }
                                 if final_billing_status == "settled" {
                                     sqlx::query(
@@ -649,23 +704,13 @@ WHERE id = $1
                             .as_deref()
                             .filter(|value| !value.is_empty())
                         {
-                            let quota_row = sqlx::query(
-                                r#"
-UPDATE providers
-SET
-  monthly_used_usd = COALESCE(monthly_used_usd, 0) + $2,
-  updated_at = NOW()
-WHERE id = $1
-RETURNING CAST(monthly_used_usd AS DOUBLE PRECISION) AS monthly_used_usd
-                                "#,
+                            enqueue_provider_monthly_usage_delta(
+                                &mut **tx,
+                                &input.request_id,
+                                provider_id,
+                                input.actual_total_cost_usd,
                             )
-                            .bind(provider_id)
-                            .bind(input.actual_total_cost_usd)
-                            .fetch_optional(&mut **tx)
-                            .await
-                            .map_postgres_err()?;
-                            settlement.provider_monthly_used_usd =
-                                quota_row.and_then(|row| row.try_get("monthly_used_usd").ok());
+                            .await?;
                         }
                     }
 
@@ -716,6 +761,14 @@ mod tests {
     fn settlement_sql_no_longer_dual_writes_wallet_snapshots_to_usage_rows() {
         let source = include_str!("postgres.rs");
         assert!(!source.contains("UPDATE \"usage\"\nSET\n  wallet_id = $2"));
+    }
+
+    #[test]
+    fn settlement_sql_enqueues_provider_monthly_usage_delta() {
+        let source = include_str!("postgres.rs");
+        assert!(super::ENQUEUE_PROVIDER_MONTHLY_USAGE_DELTA_SQL.contains("usage_counter_deltas"));
+        assert!(super::ENQUEUE_PROVIDER_MONTHLY_USAGE_DELTA_SQL.contains("'provider_monthly'"));
+        assert!(!source.contains("UPDATE providers\nSET\n  monthly_used_usd"));
     }
 
     #[test]

@@ -2,6 +2,55 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
+pub const PROVIDER_REASONING_EFFORT_METADATA_KEY: &str = "provider_reasoning_effort";
+pub const PROVIDER_SERVICE_TIER_METADATA_KEY: &str = "provider_service_tier";
+
+pub fn extract_provider_reasoning_effort_from_body(value: Option<&Value>) -> Option<String> {
+    let object = value.and_then(Value::as_object)?;
+    object
+        .get("reasoning_effort")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            object
+                .get("reasoning")
+                .and_then(Value::as_object)
+                .and_then(|reasoning| reasoning.get("effort"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            object
+                .get("output_config")
+                .and_then(Value::as_object)
+                .and_then(|output_config| output_config.get("effort"))
+                .and_then(Value::as_str)
+        })
+        .and_then(normalize_provider_reasoning_effort)
+}
+
+fn normalize_provider_reasoning_effort(value: &str) -> Option<String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.is_empty() || normalized.len() > 64 {
+        return None;
+    }
+    Some(normalized)
+}
+
+pub fn extract_provider_service_tier_from_body(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_object)
+        .and_then(|object| object.get("service_tier"))
+        .and_then(Value::as_str)
+        .and_then(normalize_provider_service_tier)
+}
+
+fn normalize_provider_service_tier(value: &str) -> Option<String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.is_empty() || normalized.len() > 64 {
+        return None;
+    }
+    Some(normalized)
+}
+
 /// Joined usage read model assembled from the accounting row plus the newer audit/snapshot
 /// satellite tables.
 ///
@@ -34,6 +83,8 @@ pub struct StoredRequestUsageAudit {
     pub provider_endpoint_kind: Option<String>,
     pub has_format_conversion: bool,
     pub is_stream: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_family: Option<String>,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub total_tokens: u64,
@@ -211,6 +262,7 @@ impl StoredRequestUsageAudit {
             provider_endpoint_kind,
             has_format_conversion,
             is_stream,
+            client_family: None,
             input_tokens: parse_u64(input_tokens, "usage.input_tokens")?,
             output_tokens: parse_u64(output_tokens, "usage.output_tokens")?,
             total_tokens: parse_u64(total_tokens, "usage.total_tokens")?,
@@ -311,6 +363,10 @@ impl StoredRequestUsageAudit {
             .filter(|value| !value.is_empty())
     }
 
+    pub fn request_metadata_client_family(&self) -> Option<&str> {
+        usage_request_metadata_client_family(self.request_metadata.as_ref())
+    }
+
     fn billing_snapshot_resolved_number(&self, key: &str) -> Option<f64> {
         self.request_metadata_object()
             .and_then(|metadata| metadata.get("billing_snapshot"))
@@ -366,6 +422,36 @@ impl StoredRequestUsageAudit {
 
     pub fn trace_id(&self) -> Option<&str> {
         self.request_metadata_string("trace_id")
+    }
+
+    pub fn provider_reasoning_effort(&self) -> Option<String> {
+        if self
+            .provider_request_body
+            .as_ref()
+            .and_then(Value::as_object)
+            .is_some()
+        {
+            return extract_provider_reasoning_effort_from_body(
+                self.provider_request_body.as_ref(),
+            );
+        }
+
+        self.request_metadata_string(PROVIDER_REASONING_EFFORT_METADATA_KEY)
+            .and_then(normalize_provider_reasoning_effort)
+    }
+
+    pub fn provider_service_tier(&self) -> Option<String> {
+        if self
+            .provider_request_body
+            .as_ref()
+            .and_then(Value::as_object)
+            .is_some()
+        {
+            return extract_provider_service_tier_from_body(self.provider_request_body.as_ref());
+        }
+
+        self.request_metadata_string(PROVIDER_SERVICE_TIER_METADATA_KEY)
+            .and_then(normalize_provider_service_tier)
     }
 
     pub fn body_ref(&self, field: UsageBodyField) -> Option<&str> {
@@ -765,6 +851,7 @@ pub struct UsageSettledCostSummaryQuery {
     pub created_from_unix_secs: u64,
     pub created_until_unix_secs: u64,
     pub user_id: Option<String>,
+    pub api_key_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
@@ -898,6 +985,7 @@ pub struct UsageBreakdownSummaryQuery {
     pub created_from_unix_secs: u64,
     pub created_until_unix_secs: u64,
     pub user_id: Option<String>,
+    pub provider_name: Option<String>,
     pub group_by: UsageBreakdownGroupBy,
 }
 
@@ -1511,6 +1599,12 @@ pub trait UsageReadRepository: Send + Sync {
         &self,
         query: &UsageDailyHeatmapQuery,
     ) -> Result<Vec<StoredUsageDailySummary>, crate::DataLayerError>;
+
+    async fn read_usage_counter_health(
+        &self,
+    ) -> Result<UsageCounterHealthSnapshot, crate::DataLayerError> {
+        Ok(UsageCounterHealthSnapshot::default())
+    }
 }
 
 /// Repository write model for a single usage aggregate.
@@ -1683,21 +1777,66 @@ pub trait UsageWriteRepository: Send + Sync {
         Ok(PendingUsageCleanupSummary::default())
     }
 
+    async fn flush_usage_counter_deltas(
+        &self,
+        batch_size: usize,
+    ) -> Result<UsageCounterFlushSummary, crate::DataLayerError> {
+        let _ = batch_size;
+        Ok(UsageCounterFlushSummary::default())
+    }
+
+    async fn enqueue_proxy_node_counter_delta(
+        &self,
+        delta: ProxyNodeCounterDelta,
+    ) -> Result<bool, crate::DataLayerError> {
+        let _ = delta;
+        Ok(false)
+    }
+
+    async fn enqueue_management_token_counter_delta(
+        &self,
+        delta: ManagementTokenCounterDelta,
+    ) -> Result<bool, crate::DataLayerError> {
+        let _ = delta;
+        Ok(false)
+    }
+
+    async fn enqueue_api_key_last_used_delta(
+        &self,
+        delta: ApiKeyLastUsedDelta,
+    ) -> Result<bool, crate::DataLayerError> {
+        let _ = delta;
+        Ok(false)
+    }
+
+    async fn cleanup_processed_usage_counter_deltas(
+        &self,
+        cutoff_unix_secs: u64,
+        batch_size: usize,
+    ) -> Result<usize, crate::DataLayerError> {
+        let _ = (cutoff_unix_secs, batch_size);
+        Ok(0)
+    }
+
     async fn cleanup_usage(
         &self,
         window: &UsageCleanupWindow,
         batch_size: usize,
         auto_delete_expired_keys: bool,
+        targets: UsageCleanupTargets,
+        mode: UsageCleanupExecutionMode,
     ) -> Result<UsageCleanupSummary, crate::DataLayerError> {
-        let _ = (window, batch_size, auto_delete_expired_keys);
+        let _ = (window, batch_size, auto_delete_expired_keys, targets, mode);
         Ok(UsageCleanupSummary::default())
     }
 
     async fn preview_usage_cleanup(
         &self,
         window: &UsageCleanupWindow,
+        targets: UsageCleanupTargets,
+        mode: UsageCleanupExecutionMode,
     ) -> Result<UsageCleanupPreviewCounts, crate::DataLayerError> {
-        let _ = window;
+        let _ = (window, targets, mode);
         Ok(UsageCleanupPreviewCounts::default())
     }
 }
@@ -1710,6 +1849,80 @@ impl<T> UsageRepository for T where T: UsageReadRepository + UsageWriteRepositor
 pub struct PendingUsageCleanupSummary {
     pub failed: usize,
     pub recovered: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct UsageCounterFlushSummary {
+    pub rows_claimed: usize,
+    pub api_key_targets: usize,
+    pub provider_api_key_targets: usize,
+    pub model_targets: usize,
+    pub provider_monthly_targets: usize,
+    pub proxy_node_targets: usize,
+    pub management_token_targets: usize,
+    pub api_key_last_used_targets: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct UsageCounterHealthSnapshot {
+    pub pending_rows: u64,
+    pub processed_rows: u64,
+    pub oldest_pending_created_at_unix_secs: Option<u64>,
+    pub latest_processed_at_unix_secs: Option<u64>,
+    pub pending_by_kind: std::collections::BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyNodeCounterDelta {
+    pub node_id: String,
+    pub total_requests_delta: i64,
+    pub failed_requests_delta: i64,
+    pub dns_failures_delta: i64,
+    pub stream_errors_delta: i64,
+}
+
+impl ProxyNodeCounterDelta {
+    pub fn is_noop(&self) -> bool {
+        self.node_id.trim().is_empty()
+            || (self.total_requests_delta <= 0
+                && self.failed_requests_delta <= 0
+                && self.dns_failures_delta <= 0
+                && self.stream_errors_delta <= 0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagementTokenCounterDelta {
+    pub token_id: String,
+    pub usage_count_delta: i64,
+    pub last_used_at_unix_secs: Option<u64>,
+    pub last_used_ip: Option<String>,
+}
+
+impl ManagementTokenCounterDelta {
+    pub fn is_noop(&self) -> bool {
+        self.token_id.trim().is_empty()
+            || (self.usage_count_delta <= 0
+                && self.last_used_at_unix_secs.is_none()
+                && self
+                    .last_used_ip
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or("")
+                    .is_empty())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiKeyLastUsedDelta {
+    pub api_key_id: String,
+    pub last_used_at_unix_secs: u64,
+}
+
+impl ApiKeyLastUsedDelta {
+    pub fn is_noop(&self) -> bool {
+        self.api_key_id.trim().is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -1730,12 +1943,76 @@ pub struct UsageCleanupWindow {
     pub log_cutoff: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UsageCleanupTargets {
+    pub detail_body: bool,
+    pub compressed_body: bool,
+    pub headers: bool,
+    pub records: bool,
+    pub expired_keys: bool,
+}
+
+impl UsageCleanupTargets {
+    pub const fn all_policy_targets() -> Self {
+        Self {
+            detail_body: true,
+            compressed_body: true,
+            headers: true,
+            records: true,
+            expired_keys: true,
+        }
+    }
+
+    pub const fn body_targets() -> Self {
+        Self {
+            detail_body: true,
+            compressed_body: true,
+            headers: false,
+            records: false,
+            expired_keys: false,
+        }
+    }
+
+    pub const fn any_selected(self) -> bool {
+        self.detail_body
+            || self.compressed_body
+            || self.headers
+            || self.records
+            || self.expired_keys
+    }
+}
+
+impl Default for UsageCleanupTargets {
+    fn default() -> Self {
+        Self::all_policy_targets()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum UsageCleanupExecutionMode {
+    #[default]
+    Policy,
+    BeforeNowBodyFields,
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UsageCleanupPreviewCounts {
     pub detail: u64,
     pub compressed: u64,
     pub header: u64,
     pub log: u64,
+}
+
+pub fn usage_request_metadata_client_family(value: Option<&Value>) -> Option<&str> {
+    let metadata = value.and_then(Value::as_object)?;
+    metadata
+        .get("client_session_affinity")
+        .and_then(Value::as_object)
+        .and_then(|affinity| affinity.get("client_family"))
+        .and_then(Value::as_str)
+        .or_else(|| metadata.get("client_family").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 fn parse_u64(value: i32, field_name: &str) -> Result<u64, crate::DataLayerError> {
@@ -2141,6 +2418,56 @@ mod tests {
         assert_eq!(result.storage, UsageBodyCaptureStorage::Inline);
         assert_eq!(result.state_label(), "legacy_unknown");
         assert_eq!(result.request_capture_source(), "stored_original");
+    }
+
+    #[test]
+    fn provider_reasoning_effort_prefers_provider_request_body_over_metadata() {
+        let mut usage = sample_usage();
+        usage.provider_request_body = Some(json!({
+            "reasoning": { "effort": "XHigh" },
+            "service_tier": "Priority"
+        }));
+
+        assert_eq!(usage.provider_reasoning_effort().as_deref(), Some("xhigh"));
+        assert_eq!(usage.provider_service_tier().as_deref(), Some("priority"));
+
+        usage.request_metadata = Some(json!({
+            "provider_reasoning_effort": "max",
+            "provider_service_tier": "standard"
+        }));
+
+        assert_eq!(usage.provider_reasoning_effort().as_deref(), Some("xhigh"));
+        assert_eq!(usage.provider_service_tier().as_deref(), Some("priority"));
+
+        usage.provider_request_body = None;
+        assert_eq!(usage.provider_reasoning_effort().as_deref(), Some("max"));
+        assert_eq!(usage.provider_service_tier().as_deref(), Some("standard"));
+
+        usage.request_metadata = None;
+        usage.provider_request_body = Some(json!({
+            "output_config": { "effort": "High" },
+            "service_tier": "priority"
+        }));
+
+        assert_eq!(usage.provider_reasoning_effort().as_deref(), Some("high"));
+        assert_eq!(usage.provider_service_tier().as_deref(), Some("priority"));
+
+        usage.provider_request_body = Some(json!({
+            "reasoning_effort": "medium"
+        }));
+
+        assert_eq!(usage.provider_reasoning_effort().as_deref(), Some("medium"));
+
+        usage.request_metadata = Some(json!({
+            "provider_reasoning_effort": "max",
+            "provider_service_tier": "standard"
+        }));
+        usage.provider_request_body = Some(json!({
+            "model": "gpt-5"
+        }));
+
+        assert_eq!(usage.provider_reasoning_effort(), None);
+        assert_eq!(usage.provider_service_tier(), None);
     }
 
     #[test]

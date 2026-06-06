@@ -11,7 +11,7 @@ import type { UpstreamModel } from '@/api/endpoints/types'
 
 export type { UpstreamModel }
 
-type FetchResult = { models: UpstreamModel[]; error?: string; fromCache?: boolean }
+type FetchResult = { models: UpstreamModel[]; error?: string; warning?: string; fromCache?: boolean }
 
 // 进行中的请求（用于去重并发请求）
 const pendingRequests = new Map<string, Promise<FetchResult>>()
@@ -54,14 +54,14 @@ export function useUpstreamModelsCache() {
         const response = await adminApi.queryProviderModels(providerId, apiKeyId, forceRefresh)
 
         if (response.success && response.data?.models) {
+          const partialWarning = response.data.warning ?? response.data.error
           return {
             models: response.data.models,
-            // 传递部分格式获取失败的 warning（后端 success=true 但仍可能附带 error）
-            error: response.data.error ? parseUpstreamModelError(response.data.error) : undefined,
+            warning: partialWarning ? parseUpstreamModelError(partialWarning) : undefined,
             fromCache: response.data.from_cache
           }
         } else {
-          const rawError = response.data?.error || '获取上游模型失败'
+          const rawError = response.data?.error || response.data?.warning || '获取上游模型失败'
           return { models: [], error: parseUpstreamModelError(rawError) }
         }
       } catch (err: unknown) {

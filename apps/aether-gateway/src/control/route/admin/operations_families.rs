@@ -10,6 +10,56 @@ pub(super) fn classify_admin_operations_family_route(
     if method == http::Method::GET
         && matches!(
             normalized_path,
+            "/api/admin/referrals" | "/api/admin/referrals/"
+        )
+    {
+        Some(classified(
+            "admin_proxy",
+            "referrals_manage",
+            "list_referrals",
+            "admin:billing",
+            false,
+        ))
+    } else if method == http::Method::GET
+        && matches!(
+            normalized_path,
+            "/api/admin/referral-rewards" | "/api/admin/referral-rewards/"
+        )
+    {
+        Some(classified(
+            "admin_proxy",
+            "referrals_manage",
+            "list_referral_rewards",
+            "admin:billing",
+            false,
+        ))
+    } else if method == http::Method::POST
+        && normalized_path.starts_with("/api/admin/referral-rewards/")
+        && normalized_path.ends_with("/retry")
+        && normalized_path.matches('/').count() == 5
+    {
+        Some(classified(
+            "admin_proxy",
+            "referrals_manage",
+            "retry_referral_reward",
+            "admin:billing",
+            false,
+        ))
+    } else if method == http::Method::POST
+        && normalized_path.starts_with("/api/admin/referral-rewards/")
+        && normalized_path.ends_with("/void")
+        && normalized_path.matches('/').count() == 5
+    {
+        Some(classified(
+            "admin_proxy",
+            "referrals_manage",
+            "void_referral_reward",
+            "admin:billing",
+            false,
+        ))
+    } else if method == http::Method::GET
+        && matches!(
+            normalized_path,
             "/api/admin/provider-ops/architectures" | "/api/admin/provider-ops/architectures/"
         )
     {

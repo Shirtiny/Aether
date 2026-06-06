@@ -2,14 +2,18 @@ use super::state::{
     decode_jwt_claims, enrich_admin_provider_oauth_auth_config, json_non_empty_string,
     json_u64_value,
 };
+use crate::handlers::admin::admin_provider_pool_config;
 use crate::handlers::admin::request::AdminAppState;
+use crate::maintenance::ensure_provider_key_pool_scores_for_keys;
 use crate::provider_key_auth::provider_active_api_formats;
 use crate::GatewayError;
 use aether_data_contracts::repository::provider_catalog::{
     StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
 };
-use aether_provider_transport::provider_types::provider_type_is_fixed;
-use serde_json::json;
+use aether_provider_transport::{
+    grok_browser_transport_fingerprint_from_auth_config, provider_types::provider_type_is_fixed,
+};
+use serde_json::{json, Map, Value};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
@@ -92,6 +96,16 @@ pub(crate) fn build_provider_oauth_auth_config_from_token_payload(
     (auth_config, access_token, refresh_token, expires_at)
 }
 
+fn grok_oauth_catalog_key_fingerprint(
+    provider_type: &str,
+    auth_config: &Map<String, Value>,
+) -> Option<Value> {
+    if !provider_type.trim().eq_ignore_ascii_case("grok") {
+        return None;
+    }
+    grok_browser_transport_fingerprint_from_auth_config(auth_config)
+}
+
 pub(crate) async fn create_provider_oauth_catalog_key(
     state: &AdminAppState<'_>,
     provider_id: &str,
@@ -136,7 +150,7 @@ pub(crate) async fn create_provider_oauth_catalog_key(
         None,
         expires_at_unix_secs,
         proxy,
-        None,
+        grok_oauth_catalog_key_fingerprint(provider_type, auth_config),
     )
     .map_err(|err| GatewayError::Internal(err.to_string()))?;
     record.internal_priority = 50;
@@ -156,6 +170,7 @@ pub(crate) async fn create_provider_oauth_catalog_key(
             .app()
             .invalidate_local_oauth_refresh_entry(&key.id)
             .await;
+        seed_provider_oauth_pool_score(state, provider_id, key, now_unix_secs).await;
     }
     Ok(created)
 }
@@ -186,13 +201,16 @@ pub(crate) async fn update_existing_provider_oauth_catalog_key(
         .map(|duration| duration.as_secs())
         .unwrap_or(0);
     let mut updated = existing_key.clone();
+    updated.is_active = true;
     updated.encrypted_api_key = Some(encrypted_api_key);
     updated.encrypted_auth_config = Some(encrypted_auth_config);
     updated.api_formats = provider_oauth_catalog_key_api_formats(provider_type, api_formats);
-    updated.is_active = true;
     updated.expires_at_unix_secs = expires_at_unix_secs;
     updated.oauth_invalid_at_unix_secs = None;
     updated.oauth_invalid_reason = None;
+    if updated.fingerprint.is_none() {
+        updated.fingerprint = grok_oauth_catalog_key_fingerprint(provider_type, auth_config);
+    }
     updated.health_by_format = Some(json!({}));
     updated.circuit_breaker_by_format = Some(json!({}));
     updated.error_count = Some(0);
@@ -206,8 +224,73 @@ pub(crate) async fn update_existing_provider_oauth_catalog_key(
             .app()
             .invalidate_local_oauth_refresh_entry(&key.id)
             .await;
+        seed_provider_oauth_pool_score(state, &existing_key.provider_id, key, now_unix_secs).await;
     }
     Ok(persisted)
+}
+
+async fn seed_provider_oauth_pool_score(
+    state: &AdminAppState<'_>,
+    provider_id: &str,
+    key: &StoredProviderCatalogKey,
+    now_unix_secs: u64,
+) {
+    let provider_id = provider_id.to_string();
+    let provider = match state
+        .read_provider_catalog_providers_by_ids(std::slice::from_ref(&provider_id))
+        .await
+    {
+        Ok(mut providers) => providers.pop(),
+        Err(err) => {
+            tracing::debug!(
+                provider_id = %provider_id,
+                key_id = %key.id,
+                error = ?err,
+                "gateway provider oauth provisioning: failed to read provider for pool score seed"
+            );
+            return;
+        }
+    };
+    let Some(provider) = provider else {
+        return;
+    };
+    let Some(pool_config) = admin_provider_pool_config(&provider) else {
+        return;
+    };
+    let endpoints = match state
+        .list_provider_catalog_endpoints_by_provider_ids(std::slice::from_ref(&provider_id))
+        .await
+    {
+        Ok(endpoints) => endpoints,
+        Err(err) => {
+            tracing::debug!(
+                provider_id = %provider_id,
+                key_id = %key.id,
+                error = ?err,
+                "gateway provider oauth provisioning: failed to read endpoints for pool score seed"
+            );
+            return;
+        }
+    };
+    let score_ensure_budget = (pool_config.score_fallback_scan_limit as usize).clamp(1, 50_000);
+    if let Err(err) = ensure_provider_key_pool_scores_for_keys(
+        state.as_ref(),
+        &provider,
+        &pool_config,
+        &endpoints,
+        std::slice::from_ref(key),
+        now_unix_secs,
+        score_ensure_budget,
+    )
+    .await
+    {
+        tracing::debug!(
+            provider_id = %provider_id,
+            key_id = %key.id,
+            error = ?err,
+            "gateway provider oauth provisioning: failed to seed pool score row"
+        );
+    }
 }
 
 fn provider_oauth_catalog_key_api_formats(
@@ -223,7 +306,9 @@ fn provider_oauth_catalog_key_api_formats(
 
 #[cfg(test)]
 mod tests {
-    use super::provider_oauth_token_payload_expires_at_unix_secs;
+    use super::{
+        grok_oauth_catalog_key_fingerprint, provider_oauth_token_payload_expires_at_unix_secs,
+    };
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use serde_json::json;
 
@@ -272,5 +357,61 @@ mod tests {
             provider_oauth_token_payload_expires_at_unix_secs(&payload, 1_000),
             Some(2_000_000_000)
         );
+    }
+
+    #[test]
+    fn grok_oauth_catalog_key_fingerprint_uses_browser_wreq_profile() {
+        let auth_config = json!({
+            "sso_token": "abc",
+            "browser_profile": "chrome-137",
+        });
+        let auth_config = auth_config.as_object().expect("object");
+
+        let fingerprint = grok_oauth_catalog_key_fingerprint("grok", auth_config)
+            .expect("fingerprint should resolve");
+
+        assert_eq!(
+            fingerprint["transport_profile"]["profile_id"],
+            json!("chrome137")
+        );
+        assert_eq!(
+            fingerprint["transport_profile"]["backend"],
+            json!("browser_wreq")
+        );
+        assert_eq!(
+            fingerprint["transport_profile"]["extra"]["browser_profile"],
+            json!("chrome137")
+        );
+    }
+
+    #[test]
+    fn grok_oauth_catalog_key_fingerprint_infers_profile_from_user_agent() {
+        let auth_config = json!({
+            "sso_token": "abc",
+            "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
+        });
+        let auth_config = auth_config.as_object().expect("object");
+
+        let fingerprint = grok_oauth_catalog_key_fingerprint("grok", auth_config)
+            .expect("fingerprint should resolve");
+
+        assert_eq!(
+            fingerprint["transport_profile"]["profile_id"],
+            json!("chrome137")
+        );
+        assert_eq!(
+            fingerprint["transport_profile"]["extra"]["browser_profile"],
+            json!("chrome137")
+        );
+    }
+
+    #[test]
+    fn grok_oauth_catalog_key_fingerprint_ignores_non_grok_providers() {
+        let auth_config = json!({
+            "browser_profile": "chrome136",
+        });
+        let auth_config = auth_config.as_object().expect("object");
+
+        assert!(grok_oauth_catalog_key_fingerprint("openai", auth_config).is_none());
     }
 }

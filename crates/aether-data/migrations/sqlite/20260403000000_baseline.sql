@@ -300,6 +300,7 @@ CREATE TABLE IF NOT EXISTS provider_api_keys (
     updated_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS provider_api_keys_provider_id_idx ON provider_api_keys (provider_id);
+CREATE INDEX IF NOT EXISTS idx_provider_api_keys_provider_default_sort ON provider_api_keys (provider_id, internal_priority, name, id);
 
 CREATE TABLE IF NOT EXISTS pool_member_scores (
     id TEXT PRIMARY KEY,

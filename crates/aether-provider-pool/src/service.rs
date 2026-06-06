@@ -12,8 +12,9 @@ use crate::presets::normalize_provider_scheduling_presets;
 use crate::provider::{ProviderPoolAdapter, ProviderPoolMemberInput};
 use crate::providers::{
     AntigravityProviderPoolAdapter, ChatGptWebProviderPoolAdapter, CodexProviderPoolAdapter,
-    DefaultProviderPoolAdapter, KiroProviderPoolAdapter, CLAUDE_CODE_PROVIDER_POOL_ADAPTER,
-    GEMINI_CLI_PROVIDER_POOL_ADAPTER, VERTEX_AI_PROVIDER_POOL_ADAPTER,
+    DefaultProviderPoolAdapter, GeminiCliProviderPoolAdapter, GrokProviderPoolAdapter,
+    KiroProviderPoolAdapter, WindsurfProviderPoolAdapter, CLAUDE_CODE_PROVIDER_POOL_ADAPTER,
+    VERTEX_AI_PROVIDER_POOL_ADAPTER,
 };
 
 #[derive(Clone)]
@@ -49,9 +50,11 @@ impl ProviderPoolService {
             .with_adapter(Arc::new(AntigravityProviderPoolAdapter))
             .with_adapter(Arc::new(CLAUDE_CODE_PROVIDER_POOL_ADAPTER))
             .with_adapter(Arc::new(CodexProviderPoolAdapter))
-            .with_adapter(Arc::new(GEMINI_CLI_PROVIDER_POOL_ADAPTER))
+            .with_adapter(Arc::new(GeminiCliProviderPoolAdapter))
+            .with_adapter(Arc::new(GrokProviderPoolAdapter))
             .with_adapter(Arc::new(KiroProviderPoolAdapter))
             .with_adapter(Arc::new(ChatGptWebProviderPoolAdapter))
+            .with_adapter(Arc::new(WindsurfProviderPoolAdapter))
             .with_adapter(Arc::new(VERTEX_AI_PROVIDER_POOL_ADAPTER))
     }
 
@@ -102,20 +105,6 @@ impl ProviderPoolService {
     pub fn quota_refresh_missing_endpoint_message(&self, provider_type: &str) -> String {
         self.adapter(provider_type)
             .quota_refresh_missing_endpoint_message()
-    }
-
-    pub fn supports_account_self_check(&self, provider_type: &str) -> bool {
-        self.adapter(provider_type).supports_account_self_check()
-    }
-
-    pub fn account_self_check_endpoint_for_provider(
-        &self,
-        provider_type: &str,
-        endpoints: &[StoredProviderCatalogEndpoint],
-        include_inactive: bool,
-    ) -> Option<StoredProviderCatalogEndpoint> {
-        self.adapter(provider_type)
-            .account_self_check_endpoint(endpoints, include_inactive)
     }
 
     pub fn normalize_scheduling_presets(

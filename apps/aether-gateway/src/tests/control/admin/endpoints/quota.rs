@@ -8,7 +8,7 @@ use aether_data_contracts::repository::provider_catalog::{
     ProviderCatalogReadRepository, StoredProviderCatalogKey, StoredProviderCatalogProvider,
 };
 use axum::body::{to_bytes, Body};
-use axum::routing::any;
+use axum::routing::{any, post};
 use axum::{extract::Request, Json, Router};
 use http::StatusCode;
 use serde_json::json;
@@ -147,7 +147,7 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_codex_with_trusted_a
         )],
     ));
 
-    let (upstream_url, upstream_handle) = start_server(upstream).await;
+    let (_upstream_url, upstream_handle) = start_server(upstream).await;
     let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
     let gateway = build_router_with_state(
         build_state_with_execution_runtime_override(execution_runtime_url.clone())
@@ -264,6 +264,251 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_codex_with_trusted_a
             .and_then(|value| value.get("secondary_reset_at")),
         Some(&json!(1_900_000_000u64))
     );
+
+    gateway_handle.abort();
+    execution_runtime_handle.abort();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_marks_codex_quota_exhausted_when_wham_usage_returns_payment_required() {
+    let upstream = Router::new().route(
+        "/api/admin/endpoints/providers/provider-codex/refresh-quota",
+        any(move |_request: Request| async move {
+            (StatusCode::OK, Body::from("unexpected upstream hit"))
+        }),
+    );
+
+    let execution_runtime = Router::new().route(
+        "/v1/execute/sync",
+        any(move |request: Request| async move {
+            let plan: aether_contracts::ExecutionPlan = serde_json::from_slice(
+                &to_bytes(request.into_body(), usize::MAX)
+                    .await
+                    .expect("body should read"),
+            )
+            .expect("plan should parse");
+            let result = aether_contracts::ExecutionResult {
+                request_id: plan.request_id,
+                candidate_id: None,
+                status_code: 402,
+                headers: BTreeMap::new(),
+                body: Some(aether_contracts::ResponseBody {
+                    json_body: Some(json!({
+                        "error": {
+                            "message": "payment required"
+                        }
+                    })),
+                    body_bytes_b64: None,
+                }),
+                telemetry: None,
+                error: None,
+            };
+            (StatusCode::OK, Json(result))
+        }),
+    );
+
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![StoredProviderCatalogProvider::new(
+            "provider-codex".to_string(),
+            "codex".to_string(),
+            Some("https://example.com".to_string()),
+            "codex".to_string(),
+        )
+        .expect("provider should build")],
+        vec![sample_endpoint(
+            "endpoint-codex-cli",
+            "provider-codex",
+            "openai:responses",
+            "https://chatgpt.com/backend-api",
+        )],
+        vec![sample_key(
+            "key-codex-a",
+            "provider-codex",
+            "openai:responses",
+            "sk-codex-123",
+        )],
+    ));
+
+    let (_upstream_url, upstream_handle) = start_server(upstream).await;
+    let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
+    let gateway = build_router_with_state(
+        build_state_with_execution_runtime_override(execution_runtime_url.clone())
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(
+                    provider_catalog_repository.clone(),
+                )
+                .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+            ),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{gateway_url}/api/admin/endpoints/providers/provider-codex/refresh-quota"
+        ))
+        .header(GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(payload["success"], 0);
+    assert_eq!(payload["failed"], 1);
+    assert_eq!(payload["results"][0]["status"], "quota_exhausted");
+    assert_eq!(payload["results"][0]["status_code"], 402);
+    assert_eq!(
+        payload["results"][0]["quota_snapshot"]["provider_type"],
+        "codex"
+    );
+    assert_eq!(
+        payload["results"][0]["quota_snapshot"]["exhausted"],
+        json!(true)
+    );
+
+    let reloaded = provider_catalog_repository
+        .list_keys_by_ids(&["key-codex-a".to_string()])
+        .await
+        .expect("keys should read");
+    assert_eq!(reloaded.len(), 1);
+    assert_eq!(reloaded[0].oauth_invalid_at_unix_secs, None);
+    assert_eq!(reloaded[0].oauth_invalid_reason, None);
+    assert_eq!(
+        reloaded[0]
+            .upstream_metadata
+            .as_ref()
+            .and_then(|value| value.get("codex"))
+            .and_then(|value| value.get("primary_used_percent")),
+        Some(&json!(100.0))
+    );
+
+    gateway_handle.abort();
+    execution_runtime_handle.abort();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_retains_codex_key_when_quota_only_reports_oauth_invalid() {
+    let upstream = Router::new().route(
+        "/api/admin/endpoints/providers/provider-codex/refresh-quota",
+        any(move |_request: Request| async move {
+            (StatusCode::OK, Body::from("unexpected upstream hit"))
+        }),
+    );
+
+    let execution_runtime = Router::new().route(
+        "/v1/execute/sync",
+        any(move |request: Request| async move {
+            let plan: aether_contracts::ExecutionPlan = serde_json::from_slice(
+                &to_bytes(request.into_body(), usize::MAX)
+                    .await
+                    .expect("body should read"),
+            )
+            .expect("plan should parse");
+            let result = aether_contracts::ExecutionResult {
+                request_id: plan.request_id,
+                candidate_id: None,
+                status_code: 401,
+                headers: BTreeMap::new(),
+                body: Some(aether_contracts::ResponseBody {
+                    json_body: Some(json!({
+                        "error": {
+                            "message": "session expired"
+                        }
+                    })),
+                    body_bytes_b64: None,
+                }),
+                telemetry: None,
+                error: None,
+            };
+            (StatusCode::OK, Json(result))
+        }),
+    );
+
+    let mut provider = StoredProviderCatalogProvider::new(
+        "provider-codex".to_string(),
+        "codex".to_string(),
+        Some("https://example.com".to_string()),
+        "codex".to_string(),
+    )
+    .expect("provider should build");
+    provider.config = Some(json!({
+        "pool_advanced": {
+            "auto_remove_banned_keys": true
+        }
+    }));
+
+    let mut key = sample_key(
+        "key-codex-expired",
+        "provider-codex",
+        "openai:responses",
+        "stale-access-token",
+    );
+    key.auth_type = "oauth".to_string();
+    key.expires_at_unix_secs = Some(1);
+    key.oauth_invalid_at_unix_secs = Some(1);
+    key.oauth_invalid_reason = Some(
+        "[REFRESH_FAILED] Token 续期失败 (401): refresh_token 无效、已过期或已撤销，请重新登录授权"
+            .to_string(),
+    );
+
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        vec![sample_endpoint(
+            "endpoint-codex-cli",
+            "provider-codex",
+            "openai:responses",
+            "https://chatgpt.com/backend-api",
+        )],
+        vec![key],
+    ));
+
+    let (_upstream_url, upstream_handle) = start_server(upstream).await;
+    let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
+    let gateway = build_router_with_state(
+        build_state_with_execution_runtime_override(execution_runtime_url.clone())
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(
+                    provider_catalog_repository.clone(),
+                )
+                .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+            ),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{gateway_url}/api/admin/endpoints/providers/provider-codex/refresh-quota"
+        ))
+        .header(GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(payload["success"], 0);
+    assert_eq!(payload["failed"], 1);
+    assert_eq!(payload["auto_removed"], 0);
+    assert_eq!(payload["results"][0]["status"], "auth_invalid");
+    assert!(payload["results"][0].get("auto_removed").is_none());
+
+    let reloaded = provider_catalog_repository
+        .list_keys_by_ids(&["key-codex-expired".to_string()])
+        .await
+        .expect("keys should read");
+    assert_eq!(reloaded.len(), 1);
+    assert!(reloaded[0]
+        .oauth_invalid_reason
+        .as_deref()
+        .is_some_and(|reason| reason.starts_with("[OAUTH_EXPIRED]")));
 
     gateway_handle.abort();
     execution_runtime_handle.abort();
@@ -830,6 +1075,159 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_kiro_with_trusted_ad
 }
 
 #[tokio::test]
+async fn gateway_auto_removes_kiro_quota_refresh_after_terminal_oauth_refresh_failure() {
+    let token_hits = Arc::new(Mutex::new(0usize));
+    let token_hits_clone = Arc::clone(&token_hits);
+    let token_server = Router::new().route(
+        "/refreshToken",
+        post(move |_request: Request| {
+            let token_hits_inner = Arc::clone(&token_hits_clone);
+            async move {
+                *token_hits_inner.lock().expect("mutex should lock") += 1;
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({
+                        "message": "refresh token invalid"
+                    })),
+                )
+            }
+        }),
+    );
+    let execution_hits = Arc::new(Mutex::new(0usize));
+    let execution_hits_clone = Arc::clone(&execution_hits);
+    let execution_runtime = Router::new().route(
+        "/v1/execute/sync",
+        any(move |_request: Request| {
+            let execution_hits_inner = Arc::clone(&execution_hits_clone);
+            async move {
+                *execution_hits_inner.lock().expect("mutex should lock") += 1;
+                (
+                    StatusCode::OK,
+                    Body::from("unexpected execution runtime hit"),
+                )
+            }
+        }),
+    );
+
+    let encrypted_auth_config = encrypt_python_fernet_plaintext(
+        DEVELOPMENT_ENCRYPTION_KEY,
+        &json!({
+            "provider_type": "kiro",
+            "auth_method": "social",
+            "refresh_token": "r".repeat(120),
+            "machine_id": "123e4567-e89b-12d3-a456-426614174000",
+            "kiro_version": "1.2.3",
+            "expires_at": 1u64
+        })
+        .to_string(),
+    )
+    .expect("auth config ciphertext should build");
+    let encrypted_api_key =
+        encrypt_python_fernet_plaintext(DEVELOPMENT_ENCRYPTION_KEY, "__placeholder__")
+            .expect("api key ciphertext should build");
+    let mut key = StoredProviderCatalogKey::new(
+        "key-kiro-expired-refresh-failed".to_string(),
+        "provider-kiro-auto-remove".to_string(),
+        "default".to_string(),
+        "oauth".to_string(),
+        None,
+        true,
+    )
+    .expect("key should build")
+    .with_transport_fields(
+        Some(json!(["claude:messages"])),
+        encrypted_api_key,
+        Some(encrypted_auth_config),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("key transport should build");
+    key.expires_at_unix_secs = Some(1);
+
+    let mut provider = StoredProviderCatalogProvider::new(
+        "provider-kiro-auto-remove".to_string(),
+        "kiro".to_string(),
+        Some("https://example.com".to_string()),
+        "kiro".to_string(),
+    )
+    .expect("provider should build");
+    provider.config = Some(json!({
+        "pool_advanced": {
+            "auto_remove_banned_keys": true
+        }
+    }));
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        vec![sample_endpoint(
+            "endpoint-kiro-cli",
+            "provider-kiro-auto-remove",
+            "claude:messages",
+            "https://q.us-west-2.amazonaws.com",
+        )],
+        vec![key],
+    ));
+
+    let (token_url, token_handle) = start_server(token_server).await;
+    let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
+    let oauth_refresh =
+        crate::provider_transport::LocalOAuthRefreshCoordinator::with_adapters_for_tests(vec![
+            Arc::new(
+                crate::provider_transport::kiro::KiroOAuthRefreshAdapter::default()
+                    .with_refresh_base_urls(Some(token_url), None),
+            )
+                as Arc<dyn crate::provider_transport::oauth_refresh::LocalOAuthRefreshAdapter>,
+        ]);
+    let gateway = build_router_with_state(
+        build_state_with_execution_runtime_override(execution_runtime_url.clone())
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(
+                    provider_catalog_repository.clone(),
+                )
+                .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+            )
+            .with_oauth_refresh_coordinator_for_tests(oauth_refresh),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{gateway_url}/api/admin/endpoints/providers/provider-kiro-auto-remove/refresh-quota"
+        ))
+        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(payload["success"], 0);
+    assert_eq!(payload["failed"], 0);
+    assert_eq!(payload["auto_removed"], 1);
+    assert_eq!(payload["total"], 1);
+    assert_eq!(payload["results"][0]["status"], "auto_removed");
+    assert_eq!(payload["results"][0]["auto_removed"], true);
+    assert_eq!(*token_hits.lock().expect("mutex should lock"), 1);
+    assert_eq!(*execution_hits.lock().expect("mutex should lock"), 0);
+
+    let reloaded = provider_catalog_repository
+        .list_keys_by_ids(&["key-kiro-expired-refresh-failed".to_string()])
+        .await
+        .expect("keys should read");
+    assert!(reloaded.is_empty());
+
+    gateway_handle.abort();
+    execution_runtime_handle.abort();
+    token_handle.abort();
+}
+
+#[tokio::test]
 async fn gateway_refresh_kiro_quota_reconciles_missing_fixed_endpoint_before_refresh() {
     let seen_endpoint_id = Arc::new(Mutex::new(None::<String>));
     let seen_endpoint_id_clone = Arc::clone(&seen_endpoint_id);
@@ -961,6 +1359,209 @@ async fn gateway_refresh_kiro_quota_reconciles_missing_fixed_endpoint_before_ref
 }
 
 #[tokio::test]
+async fn gateway_refreshes_admin_provider_quota_locally_for_gemini_cli_with_trusted_admin_principal(
+) {
+    #[derive(Debug, Clone)]
+    struct SeenExecutionRuntimeRequest {
+        url: String,
+        authorization: String,
+        provider_api_format: String,
+        request_body: Option<serde_json::Value>,
+    }
+
+    let upstream_hits = Arc::new(Mutex::new(0usize));
+    let upstream_hits_clone = Arc::clone(&upstream_hits);
+    let upstream = Router::new().route(
+        "/api/admin/endpoints/providers/provider-gemini-cli/refresh-quota",
+        any(move |_request: Request| {
+            let upstream_hits_inner = Arc::clone(&upstream_hits_clone);
+            async move {
+                *upstream_hits_inner.lock().expect("mutex should lock") += 1;
+                (StatusCode::OK, Body::from("unexpected upstream hit"))
+            }
+        }),
+    );
+
+    let seen_execution_runtime = Arc::new(Mutex::new(None::<SeenExecutionRuntimeRequest>));
+    let seen_execution_runtime_clone = Arc::clone(&seen_execution_runtime);
+    let execution_runtime = Router::new().route(
+        "/v1/execute/sync",
+        any(move |request: Request| {
+            let seen_execution_runtime_inner = Arc::clone(&seen_execution_runtime_clone);
+            async move {
+                let plan: aether_contracts::ExecutionPlan = serde_json::from_slice(
+                    &to_bytes(request.into_body(), usize::MAX)
+                        .await
+                        .expect("body should read"),
+                )
+                .expect("plan should parse");
+                *seen_execution_runtime_inner
+                    .lock()
+                    .expect("mutex should lock") = Some(SeenExecutionRuntimeRequest {
+                    url: plan.url.clone(),
+                    authorization: plan
+                        .headers
+                        .get("authorization")
+                        .cloned()
+                        .unwrap_or_default(),
+                    provider_api_format: plan.provider_api_format.clone(),
+                    request_body: plan.body.json_body.clone(),
+                });
+                let result = aether_contracts::ExecutionResult {
+                    request_id: plan.request_id,
+                    candidate_id: None,
+                    status_code: 200,
+                    headers: BTreeMap::new(),
+                    body: Some(aether_contracts::ResponseBody {
+                        json_body: Some(json!({
+                            "buckets": [
+                                {
+                                    "modelId": "gemini-2.5-pro",
+                                    "tokenType": "model",
+                                    "displayName": "Gemini 2.5 Pro",
+                                    "remainingFraction": 0.25,
+                                    "resetTime": "2030-01-01T00:00:00Z",
+                                    "isExhausted": false
+                                },
+                                {
+                                    "modelId": "gemini-2.5-flash",
+                                    "tokenType": "model",
+                                    "displayName": "Gemini 2.5 Flash",
+                                    "quotaInfo": {
+                                        "remainingFraction": 0.0,
+                                        "resetTime": "2030-01-01T01:00:00Z",
+                                        "isExhausted": true
+                                    }
+                                }
+                            ]
+                        })),
+                        body_bytes_b64: None,
+                    }),
+                    telemetry: None,
+                    error: None,
+                };
+                (StatusCode::OK, Json(result))
+            }
+        }),
+    );
+
+    let mut key = sample_key(
+        "key-gemini-cli-quota",
+        "provider-gemini-cli",
+        "gemini:generate_content",
+        "cached-gemini-cli-token",
+    );
+    key.auth_type = "oauth".to_string();
+    key.encrypted_auth_config = Some(
+        encrypt_python_fernet_plaintext(
+            DEVELOPMENT_ENCRYPTION_KEY,
+            r#"{"provider_type":"gemini_cli","project_id":"gemini-cli-project-1"}"#,
+        )
+        .expect("auth config should encrypt"),
+    );
+
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![StoredProviderCatalogProvider::new(
+            "provider-gemini-cli".to_string(),
+            "gemini_cli".to_string(),
+            Some("https://example.com".to_string()),
+            "gemini_cli".to_string(),
+        )
+        .expect("provider should build")],
+        vec![sample_endpoint(
+            "endpoint-gemini-cli-quota",
+            "provider-gemini-cli",
+            "gemini:generate_content",
+            "https://cloudcode-pa.googleapis.com",
+        )],
+        vec![key],
+    ));
+
+    let (_upstream_url, upstream_handle) = start_server(upstream).await;
+    let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
+    let gateway = build_router_with_state(
+        build_state_with_execution_runtime_override(execution_runtime_url.clone())
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(
+                    provider_catalog_repository.clone(),
+                )
+                .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+            ),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{gateway_url}/api/admin/endpoints/providers/provider-gemini-cli/refresh-quota"
+        ))
+        .header(GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(payload["success"], 1);
+    assert_eq!(payload["failed"], 0);
+    assert_eq!(payload["results"][0]["status"], "success");
+    assert_eq!(
+        payload["results"][0]["quota_snapshot"]["provider_type"],
+        "gemini_cli"
+    );
+    assert_eq!(
+        payload["results"][0]["quota_snapshot"]["windows"][0]["model"],
+        "gemini-2.5-pro"
+    );
+
+    let seen_request = seen_execution_runtime
+        .lock()
+        .expect("mutex should lock")
+        .clone()
+        .expect("execution runtime request should be captured");
+    assert_eq!(
+        seen_request.url,
+        "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota"
+    );
+    assert_eq!(seen_request.authorization, "Bearer cached-gemini-cli-token");
+    assert_eq!(
+        seen_request.provider_api_format,
+        "gemini_cli:retrieve_user_quota"
+    );
+    assert_eq!(
+        seen_request.request_body,
+        Some(json!({
+            "project": "gemini-cli-project-1"
+        }))
+    );
+    assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
+
+    let reloaded = provider_catalog_repository
+        .list_keys_by_ids(&["key-gemini-cli-quota".to_string()])
+        .await
+        .expect("keys should read");
+    assert_eq!(reloaded.len(), 1);
+    let upstream_metadata = reloaded[0]
+        .upstream_metadata
+        .as_ref()
+        .expect("upstream metadata should persist");
+    assert_eq!(
+        upstream_metadata["gemini_cli"]["quota_by_model"]["gemini-2.5-pro"]["remaining_fraction"],
+        json!(0.25)
+    );
+    assert_eq!(
+        upstream_metadata["gemini_cli"]["quota_by_model"]["gemini-2.5-flash"]["is_exhausted"],
+        json!(true)
+    );
+
+    gateway_handle.abort();
+    execution_runtime_handle.abort();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
 async fn gateway_refresh_quota_reconciles_unsupported_fixed_provider_endpoints_before_clear_message(
 ) {
     let cases = [
@@ -973,17 +1574,9 @@ async fn gateway_refresh_quota_reconciles_unsupported_fixed_provider_endpoints_b
             "Claude Code 暂不支持自动刷新额度",
         ),
         (
-            "provider-gemini-cli-reconcile",
-            "gemini_cli",
-            1usize,
-            "gemini:generate_content",
-            "https://cloudcode-pa.googleapis.com",
-            "Gemini CLI 暂不支持自动刷新额度",
-        ),
-        (
             "provider-vertex-ai-reconcile",
             "vertex_ai",
-            2usize,
+            3usize,
             "gemini:generate_content",
             "https://aiplatform.googleapis.com",
             "Vertex AI 暂不支持自动刷新额度",

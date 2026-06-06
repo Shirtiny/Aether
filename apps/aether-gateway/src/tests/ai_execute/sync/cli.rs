@@ -26,8 +26,40 @@ use aether_data_contracts::repository::provider_catalog::{
 use base64::Engine as _;
 use sha2::{Digest, Sha256};
 
-#[tokio::test]
-async fn gateway_executes_openai_responses_sync_via_local_decision_gate_with_local_sync_decision() {
+const CLI_SYNC_TEST_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+fn run_cli_sync_test<F, Fut>(test_name: &'static str, make_future: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + 'static,
+{
+    let handle = std::thread::Builder::new()
+        .name(test_name.to_string())
+        .stack_size(CLI_SYNC_TEST_STACK_BYTES)
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build");
+            runtime.block_on(make_future());
+        })
+        .expect("cli sync test thread should spawn");
+
+    if let Err(payload) = handle.join() {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+#[test]
+fn gateway_executes_openai_responses_sync_via_local_decision_gate_with_local_sync_decision() {
+    run_cli_sync_test(
+        "gateway_executes_openai_responses_sync_via_local_decision_gate_with_local_sync_decision",
+        gateway_executes_openai_responses_sync_via_local_decision_gate_with_local_sync_decision_impl,
+    );
+}
+
+async fn gateway_executes_openai_responses_sync_via_local_decision_gate_with_local_sync_decision_impl(
+) {
     #[derive(Debug, Clone)]
     struct SeenExecutionRuntimeSyncRequest {
         trace_id: String,
@@ -546,8 +578,15 @@ async fn gateway_executes_openai_responses_sync_via_local_decision_gate_with_loc
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_waits_for_api_key_concurrency_slot_then_executes_openai_responses_sync() {
+#[test]
+fn gateway_waits_for_api_key_concurrency_slot_then_executes_openai_responses_sync() {
+    run_cli_sync_test(
+        "gateway_waits_for_api_key_concurrency_slot_then_executes_openai_responses_sync",
+        gateway_waits_for_api_key_concurrency_slot_then_executes_openai_responses_sync_impl,
+    );
+}
+
+async fn gateway_waits_for_api_key_concurrency_slot_then_executes_openai_responses_sync_impl() {
     fn hash_api_key(value: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(value.as_bytes());
@@ -929,8 +968,16 @@ async fn gateway_waits_for_api_key_concurrency_slot_then_executes_openai_respons
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_returns_concurrency_limited_after_wait_budget_expires_for_openai_responses_sync() {
+#[test]
+fn gateway_returns_concurrency_limited_after_wait_budget_expires_for_openai_responses_sync() {
+    run_cli_sync_test(
+        "gateway_returns_concurrency_limited_after_wait_budget_expires_for_openai_responses_sync",
+        gateway_returns_concurrency_limited_after_wait_budget_expires_for_openai_responses_sync_impl,
+    );
+}
+
+async fn gateway_returns_concurrency_limited_after_wait_budget_expires_for_openai_responses_sync_impl(
+) {
     fn hash_api_key(value: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(value.as_bytes());
@@ -1249,12 +1296,12 @@ async fn gateway_returns_concurrency_limited_after_wait_budget_expires_for_opena
             .headers()
             .get(LOCAL_EXECUTION_RUNTIME_MISS_REASON_HEADER)
             .and_then(|value| value.to_str().ok()),
-        Some("api_key_concurrency_limit_reached")
+        Some("auth_api_key_concurrency_limit_reached")
     );
     let payload: serde_json::Value = response.json().await.expect("body should parse");
     assert_eq!(
         payload["error"]["message"],
-        serde_json::Value::String("当前 API Key 并发请求数已达上限，请稍后重试".to_string())
+        serde_json::Value::String("当前调用方 API Key 并发请求数已达上限，请稍后重试".to_string())
     );
 
     let stored_candidates = request_candidate_repository
@@ -1265,7 +1312,7 @@ async fn gateway_returns_concurrency_limited_after_wait_budget_expires_for_opena
     assert_eq!(stored_candidates[0].status, RequestCandidateStatus::Skipped);
     assert_eq!(
         stored_candidates[0].skip_reason.as_deref(),
-        Some("api_key_concurrency_limit_reached")
+        Some("auth_api_key_concurrency_limit_reached")
     );
     assert_eq!(
         *execution_runtime_hits.lock().expect("mutex should lock"),
@@ -1278,8 +1325,15 @@ async fn gateway_returns_concurrency_limited_after_wait_budget_expires_for_opena
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_returns_openai_responses_error_for_local_sync_failure() {
+#[test]
+fn gateway_returns_openai_responses_error_for_local_sync_failure() {
+    run_cli_sync_test(
+        "gateway_returns_openai_responses_error_for_local_sync_failure",
+        gateway_returns_openai_responses_error_for_local_sync_failure_impl,
+    );
+}
+
+async fn gateway_returns_openai_responses_error_for_local_sync_failure_impl() {
     fn hash_api_key(value: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(value.as_bytes());
@@ -1571,8 +1625,16 @@ async fn gateway_returns_openai_responses_error_for_local_sync_failure() {
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_returns_openai_responses_error_for_local_cross_format_gemini_sync_failure() {
+#[test]
+fn gateway_returns_openai_responses_error_for_local_cross_format_gemini_cli_sync_failure() {
+    run_cli_sync_test(
+        "gateway_returns_openai_responses_error_for_local_cross_format_gemini_cli_sync_failure",
+        gateway_returns_openai_responses_error_for_local_cross_format_gemini_cli_sync_failure_impl,
+    );
+}
+
+async fn gateway_returns_openai_responses_error_for_local_cross_format_gemini_cli_sync_failure_impl(
+) {
     #[derive(Debug, Clone)]
     struct SeenExecutionRuntimeSyncRequest {
         trace_id: String,
@@ -1580,7 +1642,9 @@ async fn gateway_returns_openai_responses_error_for_local_cross_format_gemini_sy
         authorization: String,
         endpoint_tag: String,
         has_contents: bool,
-        model: String,
+        outer_model: String,
+        user_prompt_id: String,
+        inner_model_present: bool,
     }
 
     fn hash_api_key(value: &str) -> String {
@@ -1598,7 +1662,7 @@ async fn gateway_returns_openai_responses_error_for_local_cross_format_gemini_sy
             "local".to_string(),
             true,
             false,
-            Some(serde_json::json!(["openai", "gemini"])),
+            Some(serde_json::json!(["openai", "gemini", "gemini_cli"])),
             Some(serde_json::json!(["openai:responses"])),
             Some(serde_json::json!(["gpt-5"])),
             api_key_id.to_string(),
@@ -1609,7 +1673,7 @@ async fn gateway_returns_openai_responses_error_for_local_cross_format_gemini_sy
             Some(60),
             Some(5),
             Some(4_102_444_800_i64),
-            Some(serde_json::json!(["openai", "gemini"])),
+            Some(serde_json::json!(["openai", "gemini", "gemini_cli"])),
             Some(serde_json::json!(["openai:responses"])),
             Some(serde_json::json!(["gpt-5"])),
         )
@@ -1619,8 +1683,8 @@ async fn gateway_returns_openai_responses_error_for_local_cross_format_gemini_sy
     fn sample_candidate_row() -> StoredMinimalCandidateSelectionRow {
         StoredMinimalCandidateSelectionRow {
             provider_id: "provider-openai-cli-gemini-local-1".to_string(),
-            provider_name: "gemini".to_string(),
-            provider_type: "custom".to_string(),
+            provider_name: "gemini_cli".to_string(),
+            provider_type: "gemini_cli".to_string(),
             provider_priority: 10,
             provider_is_active: true,
             endpoint_id: "endpoint-openai-cli-gemini-local-1".to_string(),
@@ -1629,8 +1693,8 @@ async fn gateway_returns_openai_responses_error_for_local_cross_format_gemini_sy
             endpoint_kind: Some("cli".to_string()),
             endpoint_is_active: true,
             key_id: "key-openai-cli-gemini-local-1".to_string(),
-            key_name: "prod".to_string(),
-            key_auth_type: "bearer".to_string(),
+            key_name: "oauth".to_string(),
+            key_auth_type: "oauth".to_string(),
             key_is_active: true,
             key_api_formats: Some(vec!["gemini:generate_content".to_string()]),
             key_allowed_models: None,
@@ -1658,9 +1722,9 @@ async fn gateway_returns_openai_responses_error_for_local_cross_format_gemini_sy
     fn sample_provider_catalog_provider() -> StoredProviderCatalogProvider {
         StoredProviderCatalogProvider::new(
             "provider-openai-cli-gemini-local-1".to_string(),
-            "gemini".to_string(),
+            "gemini_cli".to_string(),
             Some("https://example.com".to_string()),
-            "custom".to_string(),
+            "gemini_cli".to_string(),
         )
         .expect("provider should build")
         .with_transport_fields(
@@ -1687,13 +1751,13 @@ async fn gateway_returns_openai_responses_error_for_local_cross_format_gemini_sy
         )
         .expect("endpoint should build")
         .with_transport_fields(
-            "https://generativelanguage.googleapis.com".to_string(),
+            "https://cloudcode-pa.googleapis.com".to_string(),
             Some(serde_json::json!([
                 {"action":"set","key":"x-endpoint-tag","value":"openai-cli-gemini-cross-format"}
             ])),
             None,
             Some(2),
-            Some("/custom/v1beta/models/gemini-cli-upstream:generateContent".to_string()),
+            None,
             None,
             None,
             None,
@@ -1705,8 +1769,8 @@ async fn gateway_returns_openai_responses_error_for_local_cross_format_gemini_sy
         StoredProviderCatalogKey::new(
             "key-openai-cli-gemini-local-1".to_string(),
             "provider-openai-cli-gemini-local-1".to_string(),
-            "prod".to_string(),
-            "bearer".to_string(),
+            "oauth".to_string(),
+            "oauth".to_string(),
             None,
             true,
         )
@@ -1806,15 +1870,29 @@ async fn gateway_returns_openai_responses_error_for_local_cross_format_gemini_sy
                     has_contents: payload
                         .get("body")
                         .and_then(|value| value.get("json_body"))
+                        .and_then(|value| value.get("request"))
                         .and_then(|value| value.get("contents"))
                         .is_some(),
-                    model: payload
+                    outer_model: payload
                         .get("body")
                         .and_then(|value| value.get("json_body"))
                         .and_then(|value| value.get("model"))
                         .and_then(|value| value.as_str())
                         .unwrap_or_default()
                         .to_string(),
+                    user_prompt_id: payload
+                        .get("body")
+                        .and_then(|value| value.get("json_body"))
+                        .and_then(|value| value.get("user_prompt_id"))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    inner_model_present: payload
+                        .get("body")
+                        .and_then(|value| value.get("json_body"))
+                        .and_then(|value| value.get("request"))
+                        .and_then(|value| value.get("model"))
+                        .is_some(),
                 });
                 Json(json!({
                     "request_id": "trace-openai-cli-gemini-local-error-123",
@@ -1917,7 +1995,7 @@ async fn gateway_returns_openai_responses_error_for_local_cross_format_gemini_sy
     );
     assert_eq!(
         seen_execution_runtime_request.url,
-        "https://generativelanguage.googleapis.com/custom/v1beta/models/gemini-cli-upstream:generateContent"
+        "https://cloudcode-pa.googleapis.com/v1internal:generateContent"
     );
     assert_eq!(
         seen_execution_runtime_request.authorization,
@@ -1928,7 +2006,15 @@ async fn gateway_returns_openai_responses_error_for_local_cross_format_gemini_sy
         "openai-cli-gemini-cross-format"
     );
     assert!(seen_execution_runtime_request.has_contents);
-    assert_eq!(seen_execution_runtime_request.model, "gemini-cli-upstream");
+    assert_eq!(
+        seen_execution_runtime_request.outer_model,
+        "gemini-cli-upstream"
+    );
+    assert_eq!(
+        seen_execution_runtime_request.user_prompt_id,
+        "trace-openai-cli-gemini-local-error-123"
+    );
+    assert!(!seen_execution_runtime_request.inner_model_present);
 
     let stored_candidates = request_candidate_repository
         .list_by_request_id("trace-openai-cli-gemini-local-error-123")
@@ -1948,8 +2034,15 @@ async fn gateway_returns_openai_responses_error_for_local_cross_format_gemini_sy
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_returns_openai_responses_error_for_local_cross_format_claude_sync_failure() {
+#[test]
+fn gateway_returns_openai_responses_error_for_local_cross_format_claude_sync_failure() {
+    run_cli_sync_test(
+        "gateway_returns_openai_responses_error_for_local_cross_format_claude_sync_failure",
+        gateway_returns_openai_responses_error_for_local_cross_format_claude_sync_failure_impl,
+    );
+}
+
+async fn gateway_returns_openai_responses_error_for_local_cross_format_claude_sync_failure_impl() {
     #[derive(Debug, Clone)]
     struct SeenExecutionRuntimeSyncRequest {
         trace_id: String,
@@ -2325,8 +2418,16 @@ async fn gateway_returns_openai_responses_error_for_local_cross_format_claude_sy
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_returns_openai_responses_error_for_local_cross_format_claude_chat_sync_failure() {
+#[test]
+fn gateway_returns_openai_responses_error_for_local_cross_format_claude_chat_sync_failure() {
+    run_cli_sync_test(
+        "gateway_returns_openai_responses_error_for_local_cross_format_claude_chat_sync_failure",
+        gateway_returns_openai_responses_error_for_local_cross_format_claude_chat_sync_failure_impl,
+    );
+}
+
+async fn gateway_returns_openai_responses_error_for_local_cross_format_claude_chat_sync_failure_impl(
+) {
     #[derive(Debug, Clone)]
     struct SeenExecutionRuntimeSyncRequest {
         trace_id: String,
@@ -2705,8 +2806,16 @@ async fn gateway_returns_openai_responses_error_for_local_cross_format_claude_ch
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_returns_openai_responses_error_for_local_cross_format_gemini_chat_sync_failure() {
+#[test]
+fn gateway_returns_openai_responses_error_for_local_cross_format_gemini_chat_sync_failure() {
+    run_cli_sync_test(
+        "gateway_returns_openai_responses_error_for_local_cross_format_gemini_chat_sync_failure",
+        gateway_returns_openai_responses_error_for_local_cross_format_gemini_chat_sync_failure_impl,
+    );
+}
+
+async fn gateway_returns_openai_responses_error_for_local_cross_format_gemini_chat_sync_failure_impl(
+) {
     #[derive(Debug, Clone)]
     struct SeenExecutionRuntimeSyncRequest {
         trace_id: String,
@@ -3085,8 +3194,15 @@ async fn gateway_returns_openai_responses_error_for_local_cross_format_gemini_ch
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_executes_codex_cli_sync_via_local_decision_gate_after_oauth_refresh() {
+#[test]
+fn gateway_executes_codex_cli_sync_via_local_decision_gate_after_oauth_refresh() {
+    run_cli_sync_test(
+        "gateway_executes_codex_cli_sync_via_local_decision_gate_after_oauth_refresh",
+        gateway_executes_codex_cli_sync_via_local_decision_gate_after_oauth_refresh_impl,
+    );
+}
+
+async fn gateway_executes_codex_cli_sync_via_local_decision_gate_after_oauth_refresh_impl() {
     #[derive(Debug, Clone)]
     struct SeenExecutionRuntimeSyncRequest {
         trace_id: String,

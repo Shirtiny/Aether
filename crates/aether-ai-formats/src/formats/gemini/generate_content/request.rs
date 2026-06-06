@@ -15,7 +15,7 @@ use crate::{
         apply_gemini_request_extensions, canonical_extension_object_mut,
         canonical_openai_reasoning_effort, extract_gemini_model_from_path,
         gemini_contents_to_canonical_messages, gemini_extensions, gemini_generation_config,
-        gemini_generation_config_extra, gemini_openai_extra_body,
+        gemini_generation_config_extra, gemini_google_search_grounding, gemini_openai_extra_body,
         gemini_response_format_to_canonical, gemini_system_to_canonical_instructions,
         gemini_thinking_to_canonical, gemini_tool_choice_to_canonical, gemini_tools_to_canonical,
         gemini_value_by_case, CanonicalContentBlock, CanonicalMessage, CanonicalRequest,
@@ -81,7 +81,7 @@ pub fn from_raw(body_json: &Value, request_path: &str) -> Option<CanonicalReques
             .get("generationConfig")
             .or_else(|| request.get("generation_config")),
     );
-    let (tools, builtin_tools, web_search_options, raw_tools) =
+    let (tools, builtin_tools, web_search_options, raw_tools, google_search_grounding) =
         gemini_tools_to_canonical(request.get("tools"))?;
     canonical.tools = tools;
     canonical.tool_choice = gemini_tool_choice_to_canonical(
@@ -157,6 +157,13 @@ pub fn from_raw(body_json: &Value, request_path: &str) -> Option<CanonicalReques
     if !builtin_tools.is_empty() {
         canonical_extension_object_mut(&mut canonical.extensions, "gemini")
             .insert("builtin_tools".to_string(), Value::Array(builtin_tools));
+    }
+    if let Some(google_search_grounding) = google_search_grounding {
+        let gemini_extension = canonical_extension_object_mut(&mut canonical.extensions, "gemini");
+        gemini_extension.insert(
+            "grounding".to_string(),
+            json!({ "google_search": google_search_grounding }),
+        );
     }
     if let Some(tool_config) = request
         .get("toolConfig")
@@ -492,6 +499,10 @@ fn canonical_tools_to_gemini(canonical: &CanonicalRequest) -> Option<Value> {
         .get("openai")
         .and_then(Value::as_object)
         .is_some_and(|value| value.contains_key("web_search_options"));
+    let mut google_search_payload = canonical_google_search_output_payload(canonical);
+    if google_search_payload.is_some() {
+        google_search = true;
+    }
     let mut code_execution = false;
     let mut url_context = false;
 
@@ -528,18 +539,9 @@ fn canonical_tools_to_gemini(canonical: &CanonicalRequest) -> Option<Value> {
         }
         declarations.push(canonical_tool_to_gemini_declaration(tool));
     }
-    if code_execution {
-        tools.push(json!({ "codeExecution": {} }));
-    }
-    if google_search {
-        tools.push(json!({ "googleSearch": {} }));
-    }
-    if url_context {
-        tools.push(json!({ "urlContext": {} }));
-    }
-    if !declarations.is_empty() {
-        tools.push(json!({ "functionDeclarations": declarations }));
-    }
+    let mut emitted_google_search = false;
+    let mut emitted_code_execution = false;
+    let mut emitted_url_context = false;
     if let Some(builtin_tools) = canonical
         .extensions
         .get("gemini")
@@ -547,9 +549,122 @@ fn canonical_tools_to_gemini(canonical: &CanonicalRequest) -> Option<Value> {
         .and_then(|value| value.get("builtin_tools"))
         .and_then(Value::as_array)
     {
-        tools.extend(builtin_tools.iter().cloned());
+        for builtin_tool in builtin_tools {
+            let Some(tool_object) = builtin_tool.as_object() else {
+                tools.push(builtin_tool.clone());
+                continue;
+            };
+            let mut emitted_builtin_portion = false;
+            if let Some(grounding) = gemini_google_search_grounding(tool_object) {
+                google_search = true;
+                if google_search_payload.is_none() {
+                    google_search_payload = Some(grounding.output_payload);
+                }
+                if !emitted_google_search {
+                    tools.push(json!({
+                        "googleSearch": google_search_payload.clone().unwrap_or_else(|| json!({}))
+                    }));
+                    emitted_google_search = true;
+                }
+                emitted_builtin_portion = true;
+            }
+            if let Some(tool) =
+                gemini_builtin_tool_by_case(tool_object, "codeExecution", "code_execution")
+            {
+                if !emitted_code_execution {
+                    tools.push(tool);
+                    emitted_code_execution = true;
+                }
+                emitted_builtin_portion = true;
+            }
+            if let Some(tool) =
+                gemini_builtin_tool_by_case(tool_object, "urlContext", "url_context")
+            {
+                if !emitted_url_context {
+                    tools.push(tool);
+                    emitted_url_context = true;
+                }
+                emitted_builtin_portion = true;
+            }
+            if let Some(tool) = gemini_unhandled_builtin_tool_portion(tool_object) {
+                tools.push(tool);
+            } else if !emitted_builtin_portion {
+                tools.push(builtin_tool.clone());
+            }
+        }
+    }
+    if code_execution && !emitted_code_execution {
+        tools.push(json!({ "codeExecution": {} }));
+    }
+    if google_search && !emitted_google_search {
+        tools.push(json!({
+            "googleSearch": google_search_payload.unwrap_or_else(|| json!({}))
+        }));
+    }
+    if url_context && !emitted_url_context {
+        tools.push(json!({ "urlContext": {} }));
+    }
+    if !declarations.is_empty() {
+        tools.push(json!({ "functionDeclarations": declarations }));
     }
     (!tools.is_empty()).then_some(Value::Array(tools))
+}
+
+fn canonical_google_search_output_payload(canonical: &CanonicalRequest) -> Option<Value> {
+    let google_search = canonical
+        .extensions
+        .get("gemini")
+        .and_then(Value::as_object)
+        .and_then(|value| value.get("grounding"))
+        .and_then(Value::as_object)
+        .and_then(|value| value.get("google_search"))
+        .and_then(Value::as_object)?;
+    google_search
+        .get("legacy")
+        .and_then(Value::as_bool)
+        .filter(|legacy| *legacy)
+        .map(|_| json!({}))
+        .or_else(|| google_search.get("payload").cloned())
+}
+
+fn gemini_builtin_tool_by_case(
+    tool_object: &Map<String, Value>,
+    camel: &str,
+    snake: &str,
+) -> Option<Value> {
+    let payload = tool_object
+        .get(camel)
+        .or_else(|| tool_object.get(snake))
+        .map(gemini_builtin_tool_payload)?;
+    Some(json!({ camel: payload }))
+}
+
+fn gemini_builtin_tool_payload(payload: &Value) -> Value {
+    match payload {
+        Value::Null => json!({}),
+        value => value.clone(),
+    }
+}
+
+fn gemini_unhandled_builtin_tool_portion(tool_object: &Map<String, Value>) -> Option<Value> {
+    let builtin = tool_object
+        .iter()
+        .filter(|(key, _)| {
+            !matches!(
+                key.as_str(),
+                "googleSearch"
+                    | "google_search"
+                    | "googleSearchRetrieval"
+                    | "google_search_retrieval"
+                    | "codeExecution"
+                    | "code_execution"
+                    | "urlContext"
+                    | "url_context"
+            )
+        })
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<Map<_, _>>();
+    (!builtin.is_empty()).then_some(Value::Object(builtin))
 }
 
 fn canonical_tool_to_gemini_declaration(tool: &CanonicalToolDefinition) -> Value {

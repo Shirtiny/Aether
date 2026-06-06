@@ -174,10 +174,42 @@ CREATE INDEX IF NOT EXISTS idx_entitlement_usage_user_date ON public.entitlement
 
 
 --
+-- Name: idx_entitlement_usage_entitlement_date; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX IF NOT EXISTS idx_entitlement_usage_entitlement_date ON public.entitlement_usage_ledgers USING btree (user_entitlement_id, usage_date);
+
+
+
+--
 -- Name: idx_provider_api_keys_provider_active; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX IF NOT EXISTS idx_provider_api_keys_provider_active ON public.provider_api_keys USING btree (provider_id, is_active);
+
+
+
+--
+-- Name: idx_provider_api_keys_provider_default_sort; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX IF NOT EXISTS idx_provider_api_keys_provider_default_sort ON public.provider_api_keys USING btree (provider_id, internal_priority, name, id);
+
+
+
+--
+-- Name: idx_provider_api_keys_provider_name_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX IF NOT EXISTS idx_provider_api_keys_provider_name_id ON public.provider_api_keys USING btree (provider_id, name, id);
+
+
+
+--
+-- Name: idx_provider_api_keys_provider_active_priority_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX IF NOT EXISTS idx_provider_api_keys_provider_active_priority_id ON public.provider_api_keys USING btree (provider_id, internal_priority, id) WHERE is_active IS TRUE;
 
 
 
@@ -550,6 +582,30 @@ CREATE INDEX IF NOT EXISTS idx_usage_wallet_finalized ON public.usage USING btre
 
 
 --
+-- Name: ix_usage_counter_deltas_request_kind; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX IF NOT EXISTS ix_usage_counter_deltas_request_kind ON public.usage_counter_deltas USING btree (request_id, kind, target_id);
+
+
+
+--
+-- Name: ix_usage_counter_deltas_processed; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX IF NOT EXISTS ix_usage_counter_deltas_processed ON public.usage_counter_deltas USING btree (processed_at, created_at, id) WHERE processed_at IS NOT NULL;
+
+
+
+--
+-- Name: ix_usage_counter_deltas_unprocessed; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX IF NOT EXISTS ix_usage_counter_deltas_unprocessed ON public.usage_counter_deltas USING btree (created_at, id) WHERE processed_at IS NULL;
+
+
+
+--
 -- Name: idx_user_model_usage_model; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -582,6 +638,62 @@ CREATE INDEX IF NOT EXISTS idx_user_sessions_user_device ON public.user_sessions
 
 
 --
+-- Name: idx_user_referrals_inviter; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX IF NOT EXISTS idx_user_referrals_inviter ON public.user_referrals USING btree (inviter_user_id, created_at DESC);
+
+
+
+--
+-- Name: idx_user_referrals_created; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX IF NOT EXISTS idx_user_referrals_created ON public.user_referrals USING btree (created_at DESC);
+
+
+
+--
+-- Name: idx_user_referrals_invite_code; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX IF NOT EXISTS idx_user_referrals_invite_code ON public.user_referrals USING btree (invite_code_snapshot);
+
+
+
+--
+-- Name: idx_referral_rewards_inviter_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX IF NOT EXISTS idx_referral_rewards_inviter_status ON public.referral_rewards USING btree (inviter_user_id, status, created_at DESC);
+
+
+
+--
+-- Name: idx_referral_rewards_inviter_created; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX IF NOT EXISTS idx_referral_rewards_inviter_created ON public.referral_rewards USING btree (inviter_user_id, created_at DESC);
+
+
+
+--
+-- Name: idx_referral_rewards_created; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX IF NOT EXISTS idx_referral_rewards_created ON public.referral_rewards USING btree (created_at DESC);
+
+
+
+--
+-- Name: idx_referral_rewards_source_order; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX IF NOT EXISTS idx_referral_rewards_source_order ON public.referral_rewards USING btree (source_order_id);
+
+
+
+--
 -- Name: idx_video_tasks_external_id; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -594,6 +706,14 @@ CREATE INDEX IF NOT EXISTS idx_video_tasks_external_id ON public.video_tasks USI
 --
 
 CREATE INDEX IF NOT EXISTS idx_video_tasks_next_poll ON public.video_tasks USING btree (next_poll_at);
+
+
+
+--
+-- Name: idx_video_tasks_due_poll; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX IF NOT EXISTS idx_video_tasks_due_poll ON public.video_tasks USING btree (status, next_poll_at, updated_at) WHERE next_poll_at IS NOT NULL;
 
 
 
@@ -930,6 +1050,14 @@ CREATE INDEX IF NOT EXISTS ix_provider_api_keys_id ON public.provider_api_keys U
 --
 
 CREATE INDEX IF NOT EXISTS pool_member_scores_rank_idx ON public.pool_member_scores USING btree (pool_kind, pool_id, capability, scope_kind, scope_id, hard_state, score DESC);
+
+
+
+--
+-- Name: pool_member_scores_scheduler_account_rank_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX IF NOT EXISTS pool_member_scores_scheduler_account_rank_idx ON public.pool_member_scores USING btree (pool_kind, pool_id, capability, scope_kind, score DESC, last_ranked_at DESC NULLS LAST, member_id, id) WHERE scope_id IS NULL AND hard_state IN ('available', 'unknown');
 
 
 

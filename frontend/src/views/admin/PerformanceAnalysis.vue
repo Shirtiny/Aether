@@ -822,7 +822,6 @@
         </div>
       </Card>
     </div>
-
   </div>
 </template>
 

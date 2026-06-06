@@ -8,6 +8,9 @@ use super::{
     StoredProviderCatalogKey, StoredProviderCatalogProvider, StoredProviderModelMapping,
     DEVELOPMENT_ENCRYPTION_KEY, TRACE_ID_HEADER,
 };
+use aether_data::repository::usage::InMemoryUsageReadRepository;
+use aether_data_contracts::repository::usage::{StoredRequestUsageAudit, UsageReadRepository};
+use aether_usage_runtime::UsageRuntimeConfig;
 
 const KIRO_CLAUDE_CLI_SYNC_TEST_STACK_BYTES: usize = 16 * 1024 * 1024;
 
@@ -30,6 +33,30 @@ where
 
     if let Err(payload) = handle.join() {
         std::panic::resume_unwind(payload);
+    }
+}
+
+async fn wait_for_completed_usage<T>(repository: &T, request_id: &str) -> StoredRequestUsageAudit
+where
+    T: UsageReadRepository + ?Sized,
+{
+    let timeout = std::time::Duration::from_secs(60);
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if let Some(usage) = repository
+            .find_by_request_id(request_id)
+            .await
+            .expect("usage should read")
+        {
+            if usage.status == "completed" {
+                return usage;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "usage {request_id} should complete within {timeout:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 }
 
@@ -194,7 +221,7 @@ async fn gateway_executes_kiro_claude_cli_sync_via_local_provider_catalog_candid
             Some(serde_json::json!({"url":"http://provider-proxy.internal:8080"})),
             Some(20.0),
             None,
-            None,
+            Some(serde_json::json!({"kiro": {"simulated_cache_enabled": true}})),
         )
     }
 
@@ -354,14 +381,15 @@ async fn gateway_executes_kiro_claude_cli_sync_via_local_provider_catalog_candid
                 let raw_body = to_bytes(body, usize::MAX).await.expect("body should read");
                 let payload: serde_json::Value =
                     serde_json::from_slice(&raw_body).expect("execution runtime payload should parse");
+                let trace_id = parts
+                    .headers
+                    .get(TRACE_ID_HEADER)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string();
                 *seen_execution_runtime_inner.lock().expect("mutex should lock") =
                     Some(SeenExecutionRuntimeSyncRequest {
-                        trace_id: parts
-                            .headers
-                            .get(TRACE_ID_HEADER)
-                            .and_then(|value| value.to_str().ok())
-                            .unwrap_or_default()
-                            .to_string(),
+                        trace_id: trace_id.clone(),
                         url: payload
                             .get("url")
                             .and_then(|value| value.as_str())
@@ -453,7 +481,7 @@ async fn gateway_executes_kiro_claude_cli_sync_via_local_provider_catalog_candid
                 .concat();
 
                 Json(json!({
-                    "request_id": "trace-kiro-cli-local-sync-123",
+                    "request_id": trace_id,
                     "status_code": 200,
                     "headers": {
                         "content-type": "application/vnd.amazon.eventstream"
@@ -481,6 +509,7 @@ async fn gateway_executes_kiro_claude_cli_sync_via_local_provider_catalog_candid
             sample_candidate_row(),
         ]));
     let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
+    let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
         vec![sample_provider_catalog_provider()],
         vec![sample_provider_catalog_endpoint()],
@@ -491,34 +520,51 @@ async fn gateway_executes_kiro_claude_cli_sync_via_local_provider_catalog_candid
     let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
     let gateway_state = build_state_with_execution_runtime_override(execution_runtime_url.clone())
     .with_data_state_for_tests(
-        crate::data::GatewayDataState::with_auth_candidate_selection_provider_catalog_and_request_candidate_repository_for_tests(
+        crate::data::GatewayDataState::with_auth_candidate_selection_provider_catalog_request_candidates_and_usage_for_tests(
             auth_repository,
             candidate_selection_repository,
             provider_catalog_repository,
             Arc::clone(&request_candidate_repository),
+            Arc::clone(&usage_repository),
             DEVELOPMENT_ENCRYPTION_KEY,
         ),
-    );
+    )
+    .with_usage_runtime_for_tests(UsageRuntimeConfig {
+        enabled: true,
+        ..UsageRuntimeConfig::default()
+    });
     let gateway = build_router_with_state(gateway_state);
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
-    let response = reqwest::Client::new()
-        .post(format!("{gateway_url}/v1/messages"))
-        .header(http::header::CONTENT_TYPE, "application/json")
-        .header(
-            http::header::AUTHORIZATION,
-            "Bearer sk-client-kiro-cli-local-sync",
-        )
-        .header(TRACE_ID_HEADER, "trace-kiro-cli-local-sync-123")
-        .body(
-            "{\"model\":\"claude-sonnet-4\",\"messages\":[{\"role\":\"user\",\"content\":\"hello kiro\"}],\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":64}}",
-        )
-        .send()
-        .await
-        .expect("request should succeed");
+    async fn send_kiro_request(
+        gateway_url: &str,
+        trace_id: &str,
+        body: String,
+    ) -> (StatusCode, String) {
+        let response = reqwest::Client::new()
+            .post(format!("{gateway_url}/v1/messages"))
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .header(
+                http::header::AUTHORIZATION,
+                "Bearer sk-client-kiro-cli-local-sync",
+            )
+            .header(TRACE_ID_HEADER, trace_id)
+            .body(body)
+            .send()
+            .await
+            .expect("request should succeed");
 
-    let status = response.status();
-    let response_body = response.text().await.expect("body should read");
+        let status = response.status();
+        let response_body = response.text().await.expect("body should read");
+        (status, response_body)
+    }
+
+    let (status, response_body) = send_kiro_request(
+        &gateway_url,
+        "trace-kiro-cli-local-sync-123",
+        "{\"model\":\"claude-sonnet-4\",\"messages\":[{\"role\":\"user\",\"content\":\"hello kiro\"}],\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":64}}".to_string(),
+    )
+    .await;
     assert!(
         status == StatusCode::OK,
         "unexpected status={status} body={response_body} decision_hits={} plan_hits={} public_hits={}",
@@ -597,6 +643,58 @@ async fn gateway_executes_kiro_claude_cli_sync_via_local_provider_catalog_candid
         !*seen_report.lock().expect("mutex should lock"),
         "report-sync should stay local when request candidate persistence is available"
     );
+
+    let cacheable_request_body = serde_json::json!({
+        "model": "claude-sonnet-4",
+        "system": [{
+            "type": "text",
+            "text": format!("sync cacheable prompt {}", "cacheable prompt chunk ".repeat(300)),
+            "cache_control": {"type": "ephemeral"}
+        }],
+        "messages": [{"role": "user", "content": "reuse this Kiro prompt"}]
+    })
+    .to_string();
+    let (first_cache_status, first_cache_body) = send_kiro_request(
+        &gateway_url,
+        "trace-kiro-cli-local-sync-cache-1",
+        cacheable_request_body.clone(),
+    )
+    .await;
+    assert!(
+        first_cache_status == StatusCode::OK,
+        "unexpected first cache status={first_cache_status} body={first_cache_body}"
+    );
+    let first_usage = wait_for_completed_usage(
+        usage_repository.as_ref(),
+        "trace-kiro-cli-local-sync-cache-1",
+    )
+    .await;
+    assert!(
+        first_usage.cache_creation_input_tokens > 0,
+        "first Kiro sync cacheable request should create simulated cache"
+    );
+    assert_eq!(first_usage.cache_read_input_tokens, 0);
+
+    let (second_cache_status, second_cache_body) = send_kiro_request(
+        &gateway_url,
+        "trace-kiro-cli-local-sync-cache-2",
+        cacheable_request_body,
+    )
+    .await;
+    assert!(
+        second_cache_status == StatusCode::OK,
+        "unexpected second cache status={second_cache_status} body={second_cache_body}"
+    );
+    let second_usage = wait_for_completed_usage(
+        usage_repository.as_ref(),
+        "trace-kiro-cli-local-sync-cache-2",
+    )
+    .await;
+    assert!(
+        second_usage.cache_read_input_tokens > 0,
+        "second Kiro sync cacheable request should read simulated cache"
+    );
+    assert_eq!(second_usage.cache_creation_input_tokens, 0);
 
     assert_eq!(*decision_hits.lock().expect("mutex should lock"), 0);
     assert_eq!(*plan_hits.lock().expect("mutex should lock"), 0);

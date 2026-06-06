@@ -13,11 +13,20 @@ use crate::handlers::admin::system::shared::paths::{
 };
 use crate::handlers::admin::system::shared::settings::{
     apply_admin_system_settings_update, build_admin_api_formats_payload,
-    build_admin_system_check_update_payload_from_release, build_admin_system_settings_payload,
-    build_admin_system_stats_payload, current_aether_version, fetch_latest_admin_system_release,
+    build_admin_system_check_update_payload_from_release, build_admin_system_releases_list_payload,
+    build_admin_system_settings_payload, build_admin_system_stats_payload, current_aether_version,
+    fetch_admin_system_releases, fetch_latest_admin_system_release, resolve_update_target,
 };
 use crate::handlers::admin::system::shared::smtp::build_admin_smtp_test_payload;
+use crate::handlers::admin::system::shared::update::{
+    build_admin_system_update_capability_payload, current_self_update_blocker,
+    prepare_admin_system_update_task, read_update_history, read_update_task_status,
+    self_update_supported, start_admin_system_rollback_task, start_admin_system_update_task,
+};
+use crate::important_notification::build_important_notification_test_payload;
+use crate::maintenance::{ManualUsageCleanupMode, ManualUsageCleanupOptions};
 use crate::GatewayError;
+use aether_data_contracts::repository::usage::UsageCleanupTargets;
 use axum::{
     body::{Body, Bytes},
     http,
@@ -26,6 +35,7 @@ use axum::{
 };
 use serde_json::json;
 use std::time::Instant;
+use url::form_urlencoded;
 
 pub(super) async fn maybe_build_local_admin_core_system_response(
     state: &AdminAppState<'_>,
@@ -54,7 +64,8 @@ pub(super) async fn maybe_build_local_admin_core_system_response(
         && request_method == http::Method::GET
         && request_path == "/api/admin/system/check-update"
     {
-        let (latest_release, error) = fetch_latest_admin_system_release().await;
+        let force = query_flag(request_context.query_string(), "force");
+        let (latest_release, error) = fetch_latest_admin_system_release(force).await;
         return Ok(Some(
             Json(build_admin_system_check_update_payload_from_release(
                 latest_release,
@@ -62,6 +73,133 @@ pub(super) async fn maybe_build_local_admin_core_system_response(
             ))
             .into_response(),
         ));
+    }
+
+    if decision.route_kind.as_deref() == Some("releases")
+        && request_method == http::Method::GET
+        && request_path == "/api/admin/system/releases"
+    {
+        let force = query_flag(request_context.query_string(), "force");
+        let (releases, error) = fetch_admin_system_releases(force).await;
+        return Ok(Some(
+            Json(build_admin_system_releases_list_payload(releases, error)).into_response(),
+        ));
+    }
+
+    if decision.route_kind.as_deref() == Some("update_capability")
+        && request_method == http::Method::GET
+        && request_path == "/api/admin/system/update-capability"
+    {
+        return Ok(Some(
+            Json(build_admin_system_update_capability_payload()).into_response(),
+        ));
+    }
+
+    if decision.route_kind.as_deref() == Some("prepare_update")
+        && request_method == http::Method::POST
+        && request_path == "/api/admin/system/prepare-update"
+    {
+        if !self_update_supported() {
+            return Ok(Some(
+                (
+                    http::StatusCode::PRECONDITION_REQUIRED,
+                    Json(json!({ "detail": current_self_update_blocker() })),
+                )
+                    .into_response(),
+            ));
+        }
+
+        let target_version = request_body
+            .filter(|b| !b.is_empty())
+            .and_then(|body| serde_json::from_slice::<serde_json::Value>(body).ok())
+            .and_then(|v| v.get("version").and_then(|v| v.as_str().map(String::from)));
+
+        let (version, tarball_url, sha256sums_url) =
+            match resolve_update_target(target_version).await {
+                Ok(result) => result,
+                Err((status, payload)) => {
+                    return Ok(Some((status, Json(payload)).into_response()));
+                }
+            };
+
+        return Ok(Some(
+            match prepare_admin_system_update_task(version, tarball_url, sha256sums_url).await? {
+                Ok(payload) => attach_admin_audit_response(
+                    Json(payload).into_response(),
+                    "admin_system_update_prepared",
+                    "prepare_system_update",
+                    "system_update",
+                    "global",
+                ),
+                Err((status, payload)) => (status, Json(payload)).into_response(),
+            },
+        ));
+    }
+
+    if decision.route_kind.as_deref() == Some("apply_update")
+        && request_method == http::Method::POST
+        && request_path == "/api/admin/system/apply-update"
+    {
+        let version = request_body
+            .filter(|b| !b.is_empty())
+            .and_then(|body| serde_json::from_slice::<serde_json::Value>(body).ok())
+            .and_then(|v| v.get("version").and_then(|v| v.as_str().map(String::from)));
+
+        return Ok(Some(
+            match start_admin_system_update_task(version).await? {
+                Ok(payload) => attach_admin_audit_response(
+                    Json(payload).into_response(),
+                    "admin_system_update_started",
+                    "apply_system_update",
+                    "system_update",
+                    "global",
+                ),
+                Err((status, payload)) => (status, Json(payload)).into_response(),
+            },
+        ));
+    }
+
+    if decision.route_kind.as_deref() == Some("rollback")
+        && request_method == http::Method::POST
+        && request_path == "/api/admin/system/rollback"
+    {
+        return Ok(Some(match start_admin_system_rollback_task().await? {
+            Ok(payload) => attach_admin_audit_response(
+                Json(payload).into_response(),
+                "admin_system_rollback_started",
+                "rollback_system_update",
+                "system_rollback",
+                "global",
+            ),
+            Err((status, payload)) => (status, Json(payload)).into_response(),
+        }));
+    }
+
+    if decision.route_kind.as_deref() == Some("update_status")
+        && request_method == http::Method::GET
+        && request_path == "/api/admin/system/update-status"
+    {
+        let status = read_update_task_status();
+        return Ok(Some(
+            Json(json!({
+                "phase": status.phase,
+                "error": status.error,
+                "output": status.output,
+                "progress_label": status.progress_label,
+                "downloaded_bytes": status.downloaded_bytes,
+                "total_bytes": status.total_bytes,
+                "progress_percent": status.progress_percent,
+            }))
+            .into_response(),
+        ));
+    }
+
+    if decision.route_kind.as_deref() == Some("update_history")
+        && request_method == http::Method::GET
+        && request_path == "/api/admin/system/update-history"
+    {
+        let entries = read_update_history();
+        return Ok(Some(Json(json!({ "entries": entries })).into_response()));
     }
 
     if decision.route_kind.as_deref() == Some("aws_regions")
@@ -229,12 +367,55 @@ pub(super) async fn maybe_build_local_admin_core_system_response(
         ));
     }
 
+    if decision.route_kind.as_deref() == Some("s3_backup_run")
+        && request_method == http::Method::POST
+        && request_path == "/api/admin/system/backups/s3/run"
+    {
+        return Ok(Some(
+            match crate::backup::task::start_s3_backup_task(
+                state.cloned_app(),
+                "manual",
+                decision
+                    .admin_principal
+                    .as_ref()
+                    .map(|principal| principal.user_id.as_str()),
+            )
+            .await
+            {
+                Ok(task) => attach_admin_audit_response(
+                    Json(json!({
+                        "message": "S3 备份任务已提交",
+                        "task": task,
+                    }))
+                    .into_response(),
+                    "admin_system_s3_backup_task_started",
+                    "run_s3_backup",
+                    "s3_backup",
+                    "global",
+                ),
+                Err(error) => {
+                    (error.status(), Json(json!({ "detail": error.detail() }))).into_response()
+                }
+            },
+        ));
+    }
+
     if decision.route_kind.as_deref() == Some("smtp_test")
         && request_method == http::Method::POST
         && request_path == "/api/admin/system/smtp/test"
     {
         return Ok(Some(
             Json(build_admin_smtp_test_payload(state, request_body).await?).into_response(),
+        ));
+    }
+
+    if decision.route_kind.as_deref() == Some("important_notification_test")
+        && request_method == http::Method::POST
+        && request_path == "/api/admin/system/important-notification/test"
+    {
+        return Ok(Some(
+            Json(build_important_notification_test_payload(state, request_body).await?)
+                .into_response(),
         ));
     }
 
@@ -263,7 +444,7 @@ pub(super) async fn maybe_build_local_admin_core_system_response(
         && request_path == "/api/admin/system/cleanup/usage/manual"
     {
         return Ok(Some(
-            build_manual_usage_cleanup_response(state, request_body).await?,
+            build_manual_usage_cleanup_response(state, request_context, request_body).await?,
         ));
     }
 
@@ -625,50 +806,36 @@ async fn build_admin_system_cleanup_payload(
 
 async fn build_manual_usage_cleanup_response(
     state: &AdminAppState<'_>,
+    request_context: &AdminRequestContext<'_>,
     request_body: Option<&Bytes>,
 ) -> Result<Response<Body>, GatewayError> {
-    let older_than_days = match parse_manual_usage_cleanup_request(request_body) {
+    let options = match parse_manual_usage_cleanup_request(request_body) {
         Ok(value) => value,
         Err(response) => return Ok(response),
     };
+    let actor_user_id = request_context
+        .decision()
+        .and_then(|decision| decision.admin_principal.as_ref())
+        .map(|principal| principal.user_id.clone());
 
-    match crate::maintenance::run_manual_usage_cleanup_once(
-        &state.app().data,
-        older_than_days,
-        None,
+    match crate::maintenance::start_manual_usage_cleanup_task(
+        std::sync::Arc::clone(&state.app().data),
+        options,
+        actor_user_id,
     )
     .await
     {
-        Ok(summary) => {
-            let total = summary
-                .body_externalized
-                .saturating_add(summary.legacy_body_refs_migrated)
-                .saturating_add(summary.body_cleaned)
-                .saturating_add(summary.header_cleaned)
-                .saturating_add(summary.keys_cleaned)
-                .saturating_add(summary.records_deleted);
-            let message = match older_than_days {
-                Some(days) => {
-                    format!("请求记录手动清理完成，清理 {days} 天前的记录，影响 {total} 项")
-                }
-                None => format!("请求记录手动清理完成（按当前策略），影响 {total} 项"),
-            };
+        Ok(task) => {
             let payload = json!({
-                "message": message,
-                "requested_older_than_days": older_than_days,
-                "summary": {
-                    "body_externalized": summary.body_externalized,
-                    "legacy_body_refs_migrated": summary.legacy_body_refs_migrated,
-                    "body_cleaned": summary.body_cleaned,
-                    "header_cleaned": summary.header_cleaned,
-                    "keys_cleaned": summary.keys_cleaned,
-                    "records_deleted": summary.records_deleted,
-                },
-                "total_affected": total,
+                "message": task.message,
+                "mode": options.mode.as_str(),
+                "requested_older_than_days": options.requested_older_than_days,
+                "targets": options.targets,
+                "task": task,
             });
             Ok(attach_admin_audit_response(
                 Json(payload).into_response(),
-                "admin_system_usage_cleanup_completed",
+                "admin_system_usage_cleanup_started",
                 "manual_usage_cleanup",
                 "usage_cleanup",
                 "global",
@@ -696,12 +863,20 @@ async fn build_manual_usage_cleanup_preview_response(
         Ok(value) => value,
         Err(response) => return Ok(response),
     };
-    let preview =
-        crate::maintenance::preview_manual_usage_cleanup(&state.app().data, older_than_days)
-            .await
-            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+    let options = match parse_manual_usage_cleanup_query_options(
+        request_context.query_string(),
+        older_than_days,
+    ) {
+        Ok(value) => value,
+        Err(response) => return Ok(response),
+    };
+    let preview = crate::maintenance::preview_manual_usage_cleanup(&state.app().data, options)
+        .await
+        .map_err(|err| GatewayError::Internal(err.to_string()))?;
     Ok(Json(json!({
+        "mode": preview.mode.as_str(),
         "requested_older_than_days": preview.requested_older_than_days,
+        "targets": preview.targets,
         "effective_cutoffs": {
             "detail": preview.detail_cutoff,
             "compressed": preview.compressed_cutoff,
@@ -720,12 +895,12 @@ async fn build_manual_usage_cleanup_preview_response(
 
 fn parse_manual_usage_cleanup_request(
     request_body: Option<&Bytes>,
-) -> Result<Option<u32>, Response<Body>> {
+) -> Result<ManualUsageCleanupOptions, Response<Body>> {
     let Some(body) = request_body else {
-        return Ok(None);
+        return Ok(ManualUsageCleanupOptions::policy());
     };
     if body.is_empty() {
-        return Ok(None);
+        return Ok(ManualUsageCleanupOptions::policy());
     }
     let parsed: serde_json::Value = match serde_json::from_slice(body) {
         Ok(value) => value,
@@ -738,45 +913,217 @@ fn parse_manual_usage_cleanup_request(
         }
     };
     let Some(object) = parsed.as_object() else {
-        return Ok(None);
+        return Err(bad_manual_cleanup_request("请求体必须为 JSON 对象"));
     };
-    match object.get("older_than_days") {
-        None | Some(serde_json::Value::Null) => Ok(None),
-        Some(value) => value
-            .as_u64()
-            .and_then(|value| u32::try_from(value).ok())
-            .filter(|days| *days >= 1)
-            .map(Some)
-            .ok_or_else(|| {
-                (
-                    http::StatusCode::BAD_REQUEST,
-                    Json(json!({
-                        "detail": "older_than_days 必须为正整数",
-                    })),
-                )
-                    .into_response()
-            }),
+    parse_manual_usage_cleanup_options(
+        object.get("mode").and_then(serde_json::Value::as_str),
+        object.get("older_than_days"),
+        object.get("targets"),
+    )
+}
+
+fn parse_manual_usage_cleanup_query_options(
+    query_string: Option<&str>,
+    older_than_days: Option<u32>,
+) -> Result<ManualUsageCleanupOptions, Response<Body>> {
+    let mode = query_param(query_string, "mode");
+    let targets = query_param(query_string, "targets").map(serde_json::Value::String);
+    let older_value =
+        older_than_days.map(|days| serde_json::Value::Number(serde_json::Number::from(days)));
+    parse_manual_usage_cleanup_options(mode.as_deref(), older_value.as_ref(), targets.as_ref())
+}
+
+fn parse_manual_usage_cleanup_options(
+    raw_mode: Option<&str>,
+    older_than_days: Option<&serde_json::Value>,
+    targets_value: Option<&serde_json::Value>,
+) -> Result<ManualUsageCleanupOptions, Response<Body>> {
+    let (requested_older_than_days, requested_before_now) =
+        parse_manual_cleanup_older_than_days(older_than_days)?;
+    let mode =
+        parse_manual_cleanup_mode(raw_mode, requested_older_than_days, requested_before_now)?;
+
+    if mode == ManualUsageCleanupMode::OlderThanDays && requested_older_than_days.is_none() {
+        return Err(bad_manual_cleanup_request(
+            "older_than_days 模式必须提供正整数天数",
+        ));
+    }
+    if mode == ManualUsageCleanupMode::BeforeNow && requested_older_than_days.is_some() {
+        return Err(bad_manual_cleanup_request(
+            "before_now 模式不能同时提供 older_than_days",
+        ));
+    }
+    if raw_mode.is_some() && requested_before_now && mode != ManualUsageCleanupMode::BeforeNow {
+        return Err(bad_manual_cleanup_request(
+            "older_than_days 为 0 时必须使用 before_now 模式",
+        ));
+    }
+    if raw_mode.is_some()
+        && mode == ManualUsageCleanupMode::Policy
+        && requested_older_than_days.is_some()
+    {
+        return Err(bad_manual_cleanup_request(
+            "policy 模式不能同时提供 older_than_days",
+        ));
+    }
+
+    let targets = parse_manual_cleanup_targets(targets_value, mode)?;
+    if !targets.any_selected() {
+        return Err(bad_manual_cleanup_request("至少选择一个清理范围"));
+    }
+    if mode == ManualUsageCleanupMode::BeforeNow
+        && (targets.headers || targets.records || targets.expired_keys)
+    {
+        return Err(bad_manual_cleanup_request(
+            "清理当前时刻之前只允许选择详细请求体和压缩请求体",
+        ));
+    }
+
+    Ok(ManualUsageCleanupOptions {
+        mode,
+        requested_older_than_days,
+        targets,
+    })
+}
+
+fn parse_manual_cleanup_mode(
+    raw_mode: Option<&str>,
+    requested_older_than_days: Option<u32>,
+    requested_before_now: bool,
+) -> Result<ManualUsageCleanupMode, Response<Body>> {
+    let Some(raw) = raw_mode.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(if requested_before_now {
+            ManualUsageCleanupMode::BeforeNow
+        } else if requested_older_than_days.is_some() {
+            ManualUsageCleanupMode::OlderThanDays
+        } else {
+            ManualUsageCleanupMode::Policy
+        });
+    };
+    match raw {
+        "policy" => Ok(ManualUsageCleanupMode::Policy),
+        "older_than_days" => Ok(ManualUsageCleanupMode::OlderThanDays),
+        "before_now" => Ok(ManualUsageCleanupMode::BeforeNow),
+        _ => Err(bad_manual_cleanup_request(
+            "mode 必须为 policy、older_than_days 或 before_now",
+        )),
     }
 }
 
-fn parse_older_than_days_query(query_string: Option<&str>) -> Result<Option<u32>, Response<Body>> {
-    let Some(query) = query_string.filter(|value| !value.is_empty()) else {
-        return Ok(None);
-    };
-    let value = query
-        .split('&')
-        .filter_map(|pair| pair.split_once('='))
-        .find_map(|(key, value)| {
-            if key == "older_than_days" && !value.is_empty() {
-                Some(value)
-            } else {
-                None
+fn parse_manual_cleanup_older_than_days(
+    value: Option<&serde_json::Value>,
+) -> Result<(Option<u32>, bool), Response<Body>> {
+    match value {
+        None | Some(serde_json::Value::Null) => Ok((None, false)),
+        Some(value) => {
+            let Some(raw) = value.as_u64() else {
+                return Err(bad_manual_cleanup_request("older_than_days 必须为非负整数"));
+            };
+            if raw == 0 {
+                return Ok((None, true));
+            }
+            let days = u32::try_from(raw)
+                .ok()
+                .filter(|days| *days >= 1)
+                .ok_or_else(|| bad_manual_cleanup_request("older_than_days 必须为正整数"))?;
+            Ok((Some(days), false))
+        }
+    }
+}
+
+fn parse_manual_cleanup_targets(
+    value: Option<&serde_json::Value>,
+    mode: ManualUsageCleanupMode,
+) -> Result<UsageCleanupTargets, Response<Body>> {
+    let Some(value) = value else {
+        return Ok(match mode {
+            ManualUsageCleanupMode::BeforeNow => UsageCleanupTargets::body_targets(),
+            ManualUsageCleanupMode::Policy | ManualUsageCleanupMode::OlderThanDays => {
+                UsageCleanupTargets::all_policy_targets()
             }
         });
-    let Some(raw) = value else {
+    };
+    if value.is_null() {
+        return Ok(match mode {
+            ManualUsageCleanupMode::BeforeNow => UsageCleanupTargets::body_targets(),
+            ManualUsageCleanupMode::Policy | ManualUsageCleanupMode::OlderThanDays => {
+                UsageCleanupTargets::all_policy_targets()
+            }
+        });
+    }
+
+    let raw_targets = match value {
+        serde_json::Value::Array(items) => items
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| bad_manual_cleanup_request("targets 必须为字符串数组"))
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        serde_json::Value::String(raw) => raw
+            .split(',')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(str::to_string)
+            .collect(),
+        _ => return Err(bad_manual_cleanup_request("targets 必须为字符串数组")),
+    };
+
+    let mut targets = UsageCleanupTargets {
+        detail_body: false,
+        compressed_body: false,
+        headers: false,
+        records: false,
+        expired_keys: false,
+    };
+    for raw in raw_targets {
+        match raw.as_str() {
+            "detail_body" | "detail" | "raw_body" => targets.detail_body = true,
+            "compressed_body" | "compressed" => targets.compressed_body = true,
+            "headers" | "header" => targets.headers = true,
+            "records" | "log" | "logs" => targets.records = true,
+            "expired_keys" => targets.expired_keys = true,
+            "all" => targets = UsageCleanupTargets::all_policy_targets(),
+            _ => {
+                return Err(bad_manual_cleanup_request(
+                    "targets 只能包含 detail_body、compressed_body、headers、records",
+                ))
+            }
+        }
+    }
+    Ok(targets)
+}
+
+fn bad_manual_cleanup_request(detail: impl Into<String>) -> Response<Body> {
+    (
+        http::StatusCode::BAD_REQUEST,
+        Json(json!({ "detail": detail.into() })),
+    )
+        .into_response()
+}
+
+fn query_param(query_string: Option<&str>, name: &str) -> Option<String> {
+    let query = query_string.filter(|value| !value.is_empty())?;
+    form_urlencoded::parse(query.as_bytes())
+        .find_map(|(key, value)| (key == name && !value.is_empty()).then(|| value.into_owned()))
+}
+
+fn query_flag(query_string: Option<&str>, name: &str) -> bool {
+    query_param(query_string, name).is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+fn parse_older_than_days_query(query_string: Option<&str>) -> Result<Option<u32>, Response<Body>> {
+    let Some(value) = query_param(query_string, "older_than_days") else {
         return Ok(None);
     };
-    raw.parse::<u32>()
+    value
+        .parse::<u32>()
         .ok()
         .filter(|days| *days >= 1)
         .map(Some)
@@ -789,4 +1136,56 @@ fn parse_older_than_days_query(query_string: Option<&str>) -> Result<Option<u32>
             )
                 .into_response()
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manual_cleanup_request_defaults_to_policy_targets() {
+        let options = parse_manual_usage_cleanup_request(None).expect("default request is valid");
+
+        assert_eq!(options.mode, ManualUsageCleanupMode::Policy);
+        assert_eq!(options.requested_older_than_days, None);
+        assert_eq!(options.targets, UsageCleanupTargets::all_policy_targets());
+    }
+
+    #[test]
+    fn manual_cleanup_request_treats_zero_days_as_before_now_body_only() {
+        let body = Bytes::from_static(br#"{"older_than_days":0}"#);
+
+        let options =
+            parse_manual_usage_cleanup_request(Some(&body)).expect("before-now request is valid");
+
+        assert_eq!(options.mode, ManualUsageCleanupMode::BeforeNow);
+        assert_eq!(options.requested_older_than_days, None);
+        assert_eq!(options.targets, UsageCleanupTargets::body_targets());
+    }
+
+    #[test]
+    fn manual_cleanup_request_rejects_before_now_headers() {
+        let body = Bytes::from_static(br#"{"mode":"before_now","targets":["headers"]}"#);
+
+        assert!(parse_manual_usage_cleanup_request(Some(&body)).is_err());
+    }
+
+    #[test]
+    fn manual_cleanup_preview_query_decodes_comma_separated_targets() {
+        let options = parse_manual_usage_cleanup_query_options(
+            Some("mode=before_now&targets=detail_body%2Ccompressed_body"),
+            None,
+        )
+        .expect("encoded targets query is valid");
+
+        assert_eq!(options.mode, ManualUsageCleanupMode::BeforeNow);
+        assert_eq!(options.targets, UsageCleanupTargets::body_targets());
+    }
+
+    #[test]
+    fn manual_cleanup_request_rejects_non_object_body() {
+        let body = Bytes::from_static(br#"[]"#);
+
+        assert!(parse_manual_usage_cleanup_request(Some(&body)).is_err());
+    }
 }

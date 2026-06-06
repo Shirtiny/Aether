@@ -313,11 +313,11 @@ export class OpenAIParser implements ApiFormatParser {
       return createMessage(role, contentBlocks)
     }
 
-    // function_call -> 工具调用
-    if (itemType === 'function_call') {
-      const toolId = String(item.call_id || item.id || '')
-      const toolName = String(item.name || '')
-      const args = String(item.arguments || '{}')
+    // Responses API call item -> 工具调用
+    if (this.isResponsesCallItemType(itemType)) {
+      const toolId = this.responsesCallId(item)
+      const toolName = this.responsesCallName(item)
+      const args = this.responsesCallInput(item)
       return createMessage('assistant', [createToolUseBlock(toolId, toolName, args)])
     }
 
@@ -439,6 +439,14 @@ export class OpenAIParser implements ApiFormatParser {
           if (contentBlocks.length > 0) {
             result.messages.push(createMessage('assistant', contentBlocks))
           }
+        } else if (item && this.isResponsesCallItemType(item.type)) {
+          result.messages.push(createMessage('assistant', [
+            createToolUseBlock(
+              this.responsesCallId(item),
+              this.responsesCallName(item),
+              this.responsesCallInput(item)
+            ),
+          ]))
         }
       }
 
@@ -566,8 +574,39 @@ export class OpenAIParser implements ApiFormatParser {
 
       const textParts: string[] = []
       const toolCalls = new Map<string, { name: string; id: string; args: string[] }>()
-      let currentToolId = ''
-      let currentToolName = ''
+      const outputIndexToToolKey = new Map<number, string>()
+      let currentToolKey = ''
+
+      const ensureToolCall = (
+        key: string,
+        id: string,
+        name: string,
+        initialInput?: string
+      ) => {
+        if (!key) return
+        const existing = toolCalls.get(key)
+        if (existing) {
+          if (id) existing.id = id
+          if (name) existing.name = name
+          if (initialInput) existing.args = [initialInput]
+          return
+        }
+        toolCalls.set(key, {
+          name,
+          id,
+          args: initialInput ? [initialInput] : [],
+        })
+      }
+
+      const resolveToolKey = (chunk: RawObject): string => {
+        const itemId = typeof chunk.item_id === 'string' ? chunk.item_id : ''
+        if (itemId) return itemId
+        const outputIndex = typeof chunk.output_index === 'number' ? chunk.output_index : null
+        if (outputIndex != null) {
+          return outputIndexToToolKey.get(outputIndex) || currentToolKey
+        }
+        return currentToolKey
+      }
 
       for (const rawChunk of chunks) {
         const chunk = rawChunk as RawObject
@@ -596,28 +635,55 @@ export class OpenAIParser implements ApiFormatParser {
           continue
         }
 
-        // 处理函数调用输出项添加: response.output_item.added
-        if (eventType === 'response.output_item.added') {
+        // 处理 Responses call 输出项添加/完成: response.output_item.added / done
+        if (eventType === 'response.output_item.added' || eventType === 'response.output_item.done') {
           const item = chunk.item as RawObject | undefined
-          if (item?.type === 'function_call') {
-            currentToolId = String(item.call_id || item.id || '')
-            currentToolName = String(item.name || '')
-            if (currentToolId && !toolCalls.has(currentToolId)) {
-              toolCalls.set(currentToolId, {
-                name: currentToolName,
-                id: currentToolId,
-                args: [],
-              })
+          if (item && this.isResponsesCallItemType(item.type)) {
+            const itemId = typeof item.id === 'string' ? item.id : ''
+            const toolId = this.responsesCallId(item)
+            const key = itemId || toolId || String(chunk.output_index ?? '')
+            const input = eventType === 'response.output_item.done' && this.responsesCallHasInput(item)
+              ? this.responsesCallInput(item)
+              : ''
+            ensureToolCall(key, toolId, this.responsesCallName(item), input)
+            currentToolKey = key
+            if (typeof chunk.output_index === 'number') {
+              outputIndexToToolKey.set(chunk.output_index, key)
             }
           }
           continue
         }
 
-        // 处理函数调用参数增量: response.function_call_arguments.delta
-        if (eventType === 'response.function_call_arguments.delta') {
+        // 处理已知 call 输入增量
+        if (
+          eventType === 'response.function_call_arguments.delta' ||
+          eventType === 'response.custom_tool_call_input.delta'
+        ) {
           const delta = chunk.delta
-          if (typeof delta === 'string' && currentToolId && toolCalls.has(currentToolId)) {
-            toolCalls.get(currentToolId)?.args.push(delta)
+          const key = resolveToolKey(chunk)
+          if (typeof delta === 'string' && key && toolCalls.has(key)) {
+            toolCalls.get(key)?.args.push(delta)
+          }
+          continue
+        }
+
+        if (eventType === 'response.function_call_arguments.done') {
+          const key = resolveToolKey(chunk)
+          const args = typeof chunk.arguments === 'string'
+            ? chunk.arguments
+            : typeof chunk.delta === 'string'
+              ? chunk.delta
+              : null
+          if (key && toolCalls.has(key) && args != null) {
+            toolCalls.get(key)!.args = [args]
+          }
+          continue
+        }
+
+        if (eventType === 'response.custom_tool_call_input.done') {
+          const key = resolveToolKey(chunk)
+          if (key && toolCalls.has(key) && typeof chunk.input === 'string') {
+            toolCalls.get(key)!.args = [chunk.input]
           }
           continue
         }
@@ -630,17 +696,29 @@ export class OpenAIParser implements ApiFormatParser {
             result.model = response.model
           }
 
-          // 从 output 中提取文本（备用方案）
-          if (textParts.length === 0 && Array.isArray(response?.output)) {
-            for (const rawItem of response.output as unknown[]) {
-              const item = rawItem as RawObject
-              if (item?.type === 'message' && Array.isArray(item?.content)) {
+          // 从 output 中提取文本和工具调用（备用方案）
+          if (Array.isArray(response?.output)) {
+            const output = response.output as unknown[]
+            for (let index = 0; index < output.length; index++) {
+              const item = output[index] as RawObject
+              if (textParts.length === 0 && item?.type === 'message' && Array.isArray(item?.content)) {
                 for (const rawContent of item.content as unknown[]) {
                   const content = rawContent as RawObject
                   if (content?.type === 'output_text' && typeof content?.text === 'string') {
                     textParts.push(content.text)
                   }
                 }
+              } else if (this.isResponsesCallItemType(item.type)) {
+                const itemId = typeof item.id === 'string' ? item.id : ''
+                const toolId = this.responsesCallId(item)
+                // 与流式阶段使用同一套 key 命中同一条工具调用，避免重复渲染
+                const key = itemId || toolId || outputIndexToToolKey.get(index) || String(index)
+                // 仅在最终项确实带有输入时才覆盖，避免用 '{}' 等默认值
+                // 冲掉已通过增量事件收集到的参数
+                const input = this.responsesCallHasInput(item)
+                  ? this.responsesCallInput(item)
+                  : ''
+                ensureToolCall(key, toolId, this.responsesCallName(item), input)
               }
             }
           }
@@ -729,6 +807,49 @@ export class OpenAIParser implements ApiFormatParser {
     if (contentBlocks.length === 0) return null
 
     return createMessage(role, contentBlocks)
+  }
+
+  private isResponsesCallItemType(itemType: unknown): boolean {
+    return typeof itemType === 'string' && itemType.endsWith('_call')
+  }
+
+  private responsesCallId(item: RawObject): string {
+    return String(item.call_id || item.id || '')
+  }
+
+  private responsesCallName(item: RawObject): string {
+    const name = typeof item.name === 'string' ? item.name.trim() : ''
+    if (name) return name
+    return typeof item.type === 'string' ? item.type : 'tool_call'
+  }
+
+  private responsesCallInputCandidate(item: RawObject): unknown {
+    if (item.type === 'function_call') return item.arguments
+    if (item.type === 'custom_tool_call') return item.input
+    for (const key of ['input', 'arguments', 'action', 'query', 'code', 'prompt']) {
+      if (item[key] != null) return item[key]
+    }
+    return undefined
+  }
+
+  private responsesCallInput(item: RawObject): string {
+    const input = this.responsesCallInputCandidate(item)
+    if (typeof input === 'string') return input
+    if (input == null) {
+      if (item.type === 'function_call') return '{}'
+      if (item.type === 'custom_tool_call') return ''
+      return JSON.stringify(item, null, 2)
+    }
+    return JSON.stringify(input, null, 2)
+  }
+
+  private responsesCallHasInput(item: RawObject): boolean {
+    const input = this.responsesCallInputCandidate(item)
+    if (input == null) {
+      return item.type !== 'function_call' && item.type !== 'custom_tool_call'
+    }
+    if (typeof input === 'string') return input.length > 0
+    return true
   }
 
   /**
@@ -887,12 +1008,12 @@ export class OpenAIParser implements ApiFormatParser {
       return createMessageBlock(role, contentBlocks, { roleLabel: this.getRoleLabel(role) })
     }
 
-    // function_call -> 工具调用
-    if (itemType === 'function_call') {
-      const toolName = String(item.name || '工具调用')
-      const args = this.formatJson(item.arguments)
+    // Responses API call item -> 工具调用
+    if (this.isResponsesCallItemType(itemType)) {
+      const toolName = this.responsesCallName(item)
+      const args = this.formatJson(this.responsesCallInput(item))
       return createMessageBlock('assistant', [
-        createToolUseRenderBlock(toolName, args, String(item.call_id || item.id || '')),
+        createToolUseRenderBlock(toolName, args, this.responsesCallId(item)),
       ], { roleLabel: 'Assistant', badges: [createBadgeBlock('工具调用', 'outline')] })
     }
 
@@ -1015,6 +1136,17 @@ export class OpenAIParser implements ApiFormatParser {
               roleLabel: 'Assistant',
             }))
           }
+        } else if (this.isResponsesCallItemType(item.type)) {
+          blocks.push(createMessageBlock('assistant', [
+            createToolUseRenderBlock(
+              this.responsesCallName(item),
+              this.formatJson(this.responsesCallInput(item)),
+              this.responsesCallId(item)
+            ),
+          ], {
+            roleLabel: 'Assistant',
+            badges: [createBadgeBlock('工具调用', 'outline')],
+          }))
         }
       }
 

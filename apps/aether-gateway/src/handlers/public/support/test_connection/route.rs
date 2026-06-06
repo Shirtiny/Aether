@@ -14,6 +14,8 @@ use super::{
     provider_catalog_key_supports_format, query_param_value, AppState, GatewayPublicRequestContext,
 };
 
+const DEFAULT_NON_STREAM_TOTAL_TIMEOUT_MS: u64 = 300_000;
+
 pub(super) async fn maybe_build_local_test_connection_route_response(
     state: &AppState,
     request_context: &GatewayPublicRequestContext,
@@ -169,7 +171,11 @@ pub(super) async fn maybe_build_local_test_connection_route_response(
     }
 
     let mut provider_request_body = match format_value.as_str() {
-        "openai:chat" | "claude:messages" => json!({
+        "openai:chat" => json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "Health check"}],
+        }),
+        "claude:messages" => json!({
             "model": model,
             "messages": [{"role": "user", "content": "Health check"}],
             "max_tokens": 5,
@@ -179,9 +185,6 @@ pub(super) async fn maybe_build_local_test_connection_route_response(
                 "role": "user",
                 "parts": [{"text": "Health check"}],
             }],
-            "generationConfig": {
-                "maxOutputTokens": 5,
-            },
         }),
         _ => return None,
     };
@@ -286,12 +289,10 @@ pub(super) async fn maybe_build_local_test_connection_route_response(
     for (name, value) in &provider_request_headers {
         upstream_request = upstream_request.header(name, value);
     }
-    if let Some(total_ms) =
-        crate::provider_transport::resolve_transport_execution_timeouts(&transport)
-            .and_then(|timeouts| timeouts.total_ms.or(timeouts.first_byte_ms))
-    {
-        upstream_request = upstream_request.timeout(Duration::from_millis(total_ms));
-    }
+    let total_ms = crate::provider_transport::resolve_transport_execution_timeouts(&transport)
+        .and_then(|timeouts| timeouts.total_ms)
+        .unwrap_or(DEFAULT_NON_STREAM_TOTAL_TIMEOUT_MS);
+    upstream_request = upstream_request.timeout(Duration::from_millis(total_ms));
 
     let response = match upstream_request.json(&provider_request_body).send().await {
         Ok(response) => response,
@@ -338,7 +339,7 @@ pub(super) async fn maybe_build_local_test_connection_route_response(
     Some(
         Json(json!({
             "status": "success",
-            "provider": provider.name,
+            "provider_id": provider.id,
             "endpoint_id": endpoint.id,
             "api_format": format_value,
             "timestamp": timestamp,

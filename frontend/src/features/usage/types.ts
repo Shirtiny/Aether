@@ -41,6 +41,9 @@ export interface EnhancedModelStatsItem extends ModelStatsItem {
 
 // 提供商统计
 export interface ProviderStatsItem {
+  providerId?: string | null
+  providerKey?: string
+  providerIdentitySource?: 'provider_id' | 'legacy_name'
   provider: string
   requests: number
   totalTokens: number
@@ -93,6 +96,8 @@ export interface UsageRecord {
   model: string
   target_model?: string | null  // 映射后的目标模型名（若无映射则为空）
   model_version?: string | null  // Provider 返回的实际模型版本（列表轻量字段）
+  reasoning_effort?: string | null  // 从发送给 Provider 的请求体提取的 reasoning 级别
+  service_tier?: string | null  // 从发送给 Provider 的请求体提取的服务层级
   api_format?: string
   endpoint_api_format?: string  // 端点原生格式
   has_format_conversion?: boolean  // 是否发生了格式转换
@@ -106,12 +111,17 @@ export interface UsageRecord {
   total_tokens: number
   cost: number
   actual_cost?: number
-  response_time_ms?: number
-  first_byte_time_ms?: number  // 首字时间 (TTFB)
+  response_time_ms?: number | null
+  first_byte_time_ms?: number | null  // 首字时间 (TTFB)
   is_stream: boolean
   upstream_is_stream?: boolean
   client_requested_stream?: boolean
   client_is_stream?: boolean
+  client_family?: string | null
+  client_ip?: string | null
+  user_agent?: string | null
+  request_path?: string | null
+  request_path_and_query?: string | null
   status_code?: number
   error_message?: string
   status?: RequestStatus  // 请求状态: pending, streaming, completed, failed
@@ -142,7 +152,8 @@ export type FilterStatusValue =
   'active' |
   'failed' |
   'cancelled' |
-  'has_fallback'
+  'has_fallback' |
+  'has_retry'
 
 // 默认统计状态
 export function createDefaultStats(): UsageStatsState {

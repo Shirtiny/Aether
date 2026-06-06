@@ -1,5 +1,6 @@
 use crate::observability::stats::{aggregate_usage_stats, parse_bounded_u32, round_to};
 use aether_ai_formats::api::request_path_implies_stream_request;
+use aether_ai_formats::UPSTREAM_IS_STREAM_KEY;
 use aether_billing::{
     normalize_input_tokens_for_billing, normalize_total_input_context_for_cache_hit_rate,
 };
@@ -467,6 +468,67 @@ fn admin_usage_simplify_all_candidates_skipped_client_error_message(
     }
 
     Some(format!("没有可用提供商支持本次{request_mode}请求"))
+}
+
+fn admin_usage_local_runtime_miss_reason_label(reason: &str) -> &'static str {
+    match reason {
+        "all_candidates_skipped" => "所有候选均被跳过",
+        "candidate_list_empty" => "没有可调度候选",
+        "local_runtime_unavailable" => "本地执行运行时不可用",
+        "provider_transport_unavailable" => "提供商传输不可用",
+        _ => "本地调度未命中",
+    }
+}
+
+fn admin_usage_extract_local_runtime_miss_reason_summary(message: &str) -> Option<String> {
+    let without_reason_code = message
+        .split_once("（原因代码:")
+        .map(|(prefix, _)| prefix)
+        .unwrap_or(message)
+        .trim();
+    let summary = without_reason_code
+        .rsplit_once('：')
+        .or_else(|| without_reason_code.rsplit_once(':'))
+        .map(|(_, suffix)| suffix.trim())?;
+    (!summary.is_empty()).then(|| summary.to_string())
+}
+
+fn admin_usage_scheduling_failure_json(
+    item: &StoredRequestUsageAudit,
+    client_error: &Value,
+) -> Value {
+    if item.routing_execution_path() != Some("local_execution_runtime_miss") {
+        return Value::Null;
+    }
+
+    let reason = item
+        .routing_local_execution_runtime_miss_reason()
+        .unwrap_or("local_execution_runtime_miss");
+    let message = admin_usage_error_domain_message(client_error)
+        .or_else(|| admin_usage_client_error_fallback_message(item))
+        .or_else(|| item.error_message.as_deref().map(str::to_string));
+    let raw_message = item
+        .error_message
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let reason_summary =
+        raw_message.and_then(admin_usage_extract_local_runtime_miss_reason_summary);
+
+    json!({
+        "source": "local_execution_runtime_miss",
+        "reason": reason,
+        "reason_label": admin_usage_local_runtime_miss_reason_label(reason),
+        "title": format!("本地调度失败：{}", admin_usage_local_runtime_miss_reason_label(reason)),
+        "message": message,
+        "reason_summary": reason_summary,
+        "status_code": item.status_code,
+        "no_upstream_attempt": item.candidate_id.is_none()
+            && item.provider_api_key_id.is_none()
+            && item.provider_request_headers.is_none()
+            && item.provider_request_body.is_none()
+            && item.provider_request_body_ref.is_none(),
+    })
 }
 
 fn admin_usage_extract_local_execution_request_mode(message: &str) -> Option<&str> {
@@ -991,11 +1053,124 @@ fn admin_usage_upstream_is_stream(item: &StoredRequestUsageAudit) -> bool {
     item.request_metadata
         .as_ref()
         .and_then(Value::as_object)
-        .and_then(|metadata| metadata.get("upstream_is_stream"))
+        .and_then(|metadata| metadata.get(UPSTREAM_IS_STREAM_KEY))
         .and_then(Value::as_bool)
         .or_else(|| admin_usage_headers_stream_flag(item.response_headers.as_ref()))
         .or_else(|| admin_usage_infer_upstream_stream_from_captured_bodies(item))
         .unwrap_or(item.is_stream)
+}
+
+fn admin_usage_metadata_string<'a>(
+    item: &'a StoredRequestUsageAudit,
+    key: &str,
+) -> Option<&'a str> {
+    item.request_metadata
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|metadata| metadata.get(key))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn infer_client_family_from_user_agent(user_agent: &str) -> Option<&'static str> {
+    let normalized = user_agent.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return None;
+    }
+    if normalized.starts_with("codex_vscode") {
+        return Some("codex_vscode");
+    }
+    if normalized.starts_with("codex") {
+        return Some("codex");
+    }
+    if normalized.contains("claude-code") || normalized.contains("claude_code") {
+        return Some("claude_code");
+    }
+    if normalized.contains("opencode") {
+        return Some("opencode");
+    }
+    if normalized.contains("geminicli") || normalized.contains("gemini-cli") {
+        return Some("gemini_cli");
+    }
+    if normalized.contains("qwencode") {
+        return Some("qwen_code");
+    }
+    if normalized.contains("roo-code") || normalized.contains("roocode") {
+        return Some("roo_code");
+    }
+    if normalized.contains("kilo-code") || normalized.contains("kilocode") {
+        return Some("kilocode");
+    }
+    if normalized.contains("cherrystudio") || normalized.contains("cherry-studio") {
+        return Some("cherrystudio");
+    }
+    if normalized.contains("openui-agent-manager") || normalized.contains("openui") {
+        return Some("openui");
+    }
+    if normalized.contains("cursor") {
+        return Some("cursor");
+    }
+    if normalized.contains("windsurf") {
+        return Some("windsurf");
+    }
+    if normalized.contains("continue") {
+        return Some("continue");
+    }
+    if normalized.contains("cline") {
+        return Some("cline");
+    }
+    if normalized.contains("aider") {
+        return Some("aider");
+    }
+    if normalized.contains("langchain") {
+        return Some("langchain");
+    }
+    if normalized.contains("llamaindex") || normalized.contains("llama-index") {
+        return Some("llamaindex");
+    }
+    if normalized.starts_with("openai/js") {
+        return Some("openai_js_sdk");
+    }
+    if normalized.starts_with("openai/python") {
+        return Some("openai_python_sdk");
+    }
+    if normalized.starts_with("anthropic/js") || normalized.contains("anthropic-sdk-typescript") {
+        return Some("anthropic_js_sdk");
+    }
+    if normalized.starts_with("anthropic/python") || normalized.contains("anthropic-sdk-python") {
+        return Some("anthropic_python_sdk");
+    }
+    if normalized.contains("/js ") || normalized.contains("/python ") {
+        return Some("sdk");
+    }
+    Some("unknown")
+}
+
+pub fn admin_usage_client_family(item: &StoredRequestUsageAudit) -> Option<&str> {
+    item.client_family
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            item.request_metadata
+                .as_ref()
+                .and_then(Value::as_object)
+                .and_then(|metadata| {
+                    metadata
+                        .get("client_session_affinity")
+                        .and_then(Value::as_object)
+                        .and_then(|affinity| affinity.get("client_family"))
+                        .and_then(Value::as_str)
+                        .or_else(|| metadata.get("client_family").and_then(Value::as_str))
+                })
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
+        .or_else(|| {
+            admin_usage_metadata_string(item, "user_agent")
+                .and_then(infer_client_family_from_user_agent)
+        })
 }
 
 fn admin_usage_active_request_json(
@@ -1030,6 +1205,11 @@ fn admin_usage_active_request_json(
         "upstream_is_stream": upstream_is_stream,
         "client_requested_stream": client_is_stream,
         "client_is_stream": client_is_stream,
+        "client_family": admin_usage_client_family(item),
+        "client_ip": admin_usage_metadata_string(item, "client_ip"),
+        "user_agent": admin_usage_metadata_string(item, "user_agent"),
+        "request_path": admin_usage_metadata_string(item, "request_path"),
+        "request_path_and_query": admin_usage_metadata_string(item, "request_path_and_query"),
         "has_fallback": admin_usage_has_fallback(item),
     });
     if let Some(api_format) = item.api_format.as_ref() {
@@ -1041,6 +1221,12 @@ fn admin_usage_active_request_json(
     value["has_format_conversion"] = json!(item.has_format_conversion);
     if let Some(target_model) = item.target_model.as_ref() {
         value["target_model"] = json!(target_model);
+    }
+    if let Some(reasoning_effort) = item.provider_reasoning_effort() {
+        value["reasoning_effort"] = json!(reasoning_effort);
+    }
+    if let Some(service_tier) = item.provider_service_tier() {
+        value["service_tier"] = json!(service_tier);
     }
     if let Some(image_progress) = image_progress {
         value["image_progress"] = image_progress.clone();
@@ -1125,12 +1311,42 @@ pub fn admin_usage_record_json(
         .as_object_mut()
         .expect("admin usage record payload should be an object");
     object.insert("is_stream".to_string(), json!(item.is_stream));
-    object.insert("upstream_is_stream".to_string(), json!(upstream_is_stream));
+    object.insert(
+        UPSTREAM_IS_STREAM_KEY.to_string(),
+        json!(upstream_is_stream),
+    );
     object.insert(
         "client_requested_stream".to_string(),
         json!(client_is_stream),
     );
     object.insert("client_is_stream".to_string(), json!(client_is_stream));
+    maybe_insert_string_field(object, "client_family", admin_usage_client_family(item));
+    maybe_insert_string_field(
+        object,
+        "client_ip",
+        admin_usage_metadata_string(item, "client_ip"),
+    );
+    maybe_insert_string_field(
+        object,
+        "user_agent",
+        admin_usage_metadata_string(item, "user_agent"),
+    );
+    maybe_insert_string_field(
+        object,
+        "request_path",
+        admin_usage_metadata_string(item, "request_path"),
+    );
+    maybe_insert_string_field(
+        object,
+        "request_path_and_query",
+        admin_usage_metadata_string(item, "request_path_and_query"),
+    );
+    if let Some(reasoning_effort) = item.provider_reasoning_effort() {
+        object.insert("reasoning_effort".to_string(), json!(reasoning_effort));
+    }
+    if let Some(service_tier) = item.provider_service_tier() {
+        object.insert("service_tier".to_string(), json!(service_tier));
+    }
     payload
 }
 
@@ -2199,6 +2415,8 @@ pub fn build_admin_usage_detail_payload(
     payload["upstream_error"] = error_domains["upstream_error"].clone();
     payload["client_error"] = error_domains["client_error"].clone();
     payload["failure_summary"] = error_domains["failure_summary"].clone();
+    payload["scheduling_failure"] =
+        admin_usage_scheduling_failure_json(item, &error_domains["client_error"]);
     payload["error_flow"] = error_flow;
     payload["has_request_body"] = json!(admin_usage_has_body_value(
         item,
@@ -2378,6 +2596,100 @@ mod tests {
         assert_eq!(record["upstream_is_stream"], true);
         assert_eq!(record["client_requested_stream"], false);
         assert_eq!(record["client_is_stream"], false);
+    }
+
+    #[test]
+    fn admin_usage_record_infers_client_family_from_user_agent() {
+        let item = StoredRequestUsageAudit {
+            request_metadata: Some(json!({
+                "client_ip": "192.168.0.28",
+                "user_agent": "codex_vscode/0.131.0-alpha.9 (Windows 10.0.26200; x86_64)"
+            })),
+            ..sample_usage("completed", Some(200), None)
+        };
+
+        let record = admin_usage_record_json(
+            &item,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            false,
+            false,
+            None,
+        );
+        let active = admin_usage_active_request_json(&item, None, None, None);
+
+        assert_eq!(record["client_family"], "codex_vscode");
+        assert_eq!(record["client_ip"], "192.168.0.28");
+        assert_eq!(active["client_family"], "codex_vscode");
+    }
+
+    #[test]
+    fn admin_usage_record_labels_openai_js_user_agent_as_sdk() {
+        let item = StoredRequestUsageAudit {
+            request_metadata: Some(json!({
+                "user_agent": "OpenAI/JS 6.34.0"
+            })),
+            ..sample_usage("completed", Some(200), None)
+        };
+
+        let record = admin_usage_record_json(
+            &item,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            false,
+            false,
+            None,
+        );
+
+        assert_eq!(record["client_family"], "openai_js_sdk");
+    }
+
+    #[test]
+    fn admin_usage_record_prefers_typed_client_family() {
+        let item = StoredRequestUsageAudit {
+            client_family: Some("codex".to_string()),
+            request_metadata: Some(json!({
+                "user_agent": "OpenAI/JS 6.34.0"
+            })),
+            ..sample_usage("completed", Some(200), None)
+        };
+
+        let record = admin_usage_record_json(
+            &item,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            false,
+            false,
+            None,
+        );
+
+        assert_eq!(record["client_family"], "codex");
+    }
+
+    #[test]
+    fn admin_usage_record_includes_provider_reasoning_effort() {
+        let item = StoredRequestUsageAudit {
+            provider_request_body: Some(json!({
+                "reasoning": { "effort": "xhigh" },
+                "service_tier": "priority"
+            })),
+            ..sample_usage("completed", Some(200), None)
+        };
+
+        let record = admin_usage_record_json(
+            &item,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            false,
+            false,
+            None,
+        );
+        let active = admin_usage_active_request_json(&item, None, None, None);
+
+        assert_eq!(record["reasoning_effort"], "xhigh");
+        assert_eq!(active["reasoning_effort"], "xhigh");
+        assert_eq!(record["service_tier"], "priority");
+        assert_eq!(active["service_tier"], "priority");
     }
 
     #[test]
@@ -2886,6 +3198,11 @@ mod tests {
     fn detail_payload_simplifies_local_client_error_when_client_body_is_unloaded() {
         let message = "没有可用提供商支持模型 gpt-5.4 的流式请求。请检查模型映射、端点启用状态和 API Key 权限（原因代码: candidate_list_empty）";
         let item = StoredRequestUsageAudit {
+            provider_api_key_id: None,
+            provider_request_headers: None,
+            provider_request_body: None,
+            provider_request_body_ref: None,
+            candidate_id: None,
             execution_path: Some("local_execution_runtime_miss".to_string()),
             local_execution_runtime_miss_reason: Some("candidate_list_empty".to_string()),
             error_category: Some("http_error".to_string()),
@@ -2918,12 +3235,31 @@ mod tests {
             payload["failure_summary"]["message"],
             "没有可用提供商支持模型 gpt-5.4 的流式请求"
         );
+        assert_eq!(
+            payload["scheduling_failure"]["title"],
+            "本地调度失败：没有可调度候选"
+        );
+        assert_eq!(
+            payload["scheduling_failure"]["reason"],
+            "candidate_list_empty"
+        );
+        assert!(payload["scheduling_failure"]["reason_summary"].is_null());
+        assert_eq!(
+            payload["scheduling_failure"]["message"],
+            "没有可用提供商支持模型 gpt-5.4 的流式请求"
+        );
+        assert_eq!(payload["scheduling_failure"]["no_upstream_attempt"], true);
     }
 
     #[test]
     fn detail_payload_simplifies_all_candidates_skipped_when_client_body_is_unloaded() {
         let message = "找到 1 个支持模型 gpt-5.4 的候选提供商，但本次流式请求全部不可用：provider_quota_blocked 2 次（原因代码: all_candidates_skipped）";
         let item = StoredRequestUsageAudit {
+            provider_api_key_id: None,
+            provider_request_headers: None,
+            provider_request_body: None,
+            provider_request_body_ref: None,
+            candidate_id: None,
             execution_path: Some("local_execution_runtime_miss".to_string()),
             local_execution_runtime_miss_reason: Some("all_candidates_skipped".to_string()),
             error_category: Some("http_error".to_string()),
@@ -2956,6 +3292,23 @@ mod tests {
             payload["failure_summary"]["message"],
             "没有可用提供商支持模型 gpt-5.4 的流式请求"
         );
+        assert_eq!(
+            payload["scheduling_failure"]["title"],
+            "本地调度失败：所有候选均被跳过"
+        );
+        assert_eq!(
+            payload["scheduling_failure"]["reason"],
+            "all_candidates_skipped"
+        );
+        assert_eq!(
+            payload["scheduling_failure"]["reason_summary"],
+            "provider_quota_blocked 2 次"
+        );
+        assert_eq!(
+            payload["scheduling_failure"]["message"],
+            "没有可用提供商支持模型 gpt-5.4 的流式请求"
+        );
+        assert_eq!(payload["scheduling_failure"]["no_upstream_attempt"], true);
     }
 
     #[test]

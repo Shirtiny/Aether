@@ -112,6 +112,34 @@ CREATE INDEX IF NOT EXISTS usage_request_id_idx ON public.usage USING btree (req
 CREATE INDEX IF NOT EXISTS usage_user_id_idx ON public.usage USING btree (user_id);
 CREATE INDEX IF NOT EXISTS usage_wallet_id_idx ON public.usage USING btree (wallet_id);
 
+CREATE TABLE IF NOT EXISTS public.usage_counter_deltas (
+    id character varying(36) NOT NULL,
+    request_id character varying(128) NOT NULL,
+    kind character varying(64) NOT NULL,
+    target_id text NOT NULL,
+    request_count_delta bigint DEFAULT 0 NOT NULL,
+    total_requests_delta bigint DEFAULT 0 NOT NULL,
+    success_count_delta bigint DEFAULT 0 NOT NULL,
+    error_count_delta bigint DEFAULT 0 NOT NULL,
+    dns_failures_delta bigint DEFAULT 0 NOT NULL,
+    stream_errors_delta bigint DEFAULT 0 NOT NULL,
+    total_tokens_delta bigint DEFAULT 0 NOT NULL,
+    total_cost_usd_delta double precision DEFAULT 0 NOT NULL,
+    total_response_time_ms_delta bigint DEFAULT 0 NOT NULL,
+    last_used_at_unix_secs bigint,
+    last_used_ip text,
+    candidate_last_used_at_unix_secs bigint,
+    removed_last_used_at_unix_secs bigint,
+    usage_created_at_unix_secs bigint,
+    created_at timestamp with time zone NOT NULL,
+    processed_at timestamp with time zone
+);
+
+ALTER TABLE ONLY public.usage_counter_deltas ADD CONSTRAINT usage_counter_deltas_pkey PRIMARY KEY (id);
+CREATE INDEX IF NOT EXISTS ix_usage_counter_deltas_unprocessed ON public.usage_counter_deltas USING btree (created_at, id);
+CREATE INDEX IF NOT EXISTS ix_usage_counter_deltas_processed ON public.usage_counter_deltas USING btree (processed_at, created_at, id);
+CREATE INDEX IF NOT EXISTS ix_usage_counter_deltas_request_kind ON public.usage_counter_deltas USING btree (request_id, kind, target_id);
+
 CREATE TABLE IF NOT EXISTS public.usage_settlement_snapshots (
     request_id character varying(128) NOT NULL,
     billing_status character varying(64) NOT NULL,

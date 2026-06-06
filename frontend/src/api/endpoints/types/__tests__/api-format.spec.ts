@@ -21,6 +21,8 @@ describe('api format display helpers', () => {
     expect(normalizeApiFormatAlias('JINA_EMBEDDING')).toBe(API_FORMATS.JINA_EMBEDDING)
     expect(normalizeApiFormatAlias('JINA_RERANK')).toBe(API_FORMATS.JINA_RERANK)
     expect(normalizeApiFormatAlias('DOUBAO_EMBEDDING')).toBe(API_FORMATS.DOUBAO_EMBEDDING)
+    expect(normalizeApiFormatAlias('ALIYUN_MULTIMODAL_EMBEDDING')).toBe(API_FORMATS.ALIYUN_MULTIMODAL_EMBEDDING)
+    expect(normalizeApiFormatAlias('dashscope:multimodal_embedding')).toBe(API_FORMATS.ALIYUN_MULTIMODAL_EMBEDDING)
   })
 
   it('formats rerank api format ids distinctly from chat formats', () => {
@@ -35,10 +37,12 @@ describe('api format display helpers', () => {
     expect(formatApiFormat(API_FORMATS.GEMINI_EMBEDDING)).toBe('Gemini Embedding')
     expect(formatApiFormat(API_FORMATS.JINA_EMBEDDING)).toBe('Jina Embedding')
     expect(formatApiFormat(API_FORMATS.DOUBAO_EMBEDDING)).toBe('Doubao Embedding')
+    expect(formatApiFormat(API_FORMATS.ALIYUN_MULTIMODAL_EMBEDDING)).toBe('Aliyun Multimodal Embedding')
     expect(formatApiFormatShort(API_FORMATS.OPENAI_EMBEDDING)).toBe('OE')
     expect(formatApiFormatShort(API_FORMATS.GEMINI_EMBEDDING)).toBe('GE')
     expect(formatApiFormatShort(API_FORMATS.JINA_EMBEDDING)).toBe('JE')
     expect(formatApiFormatShort(API_FORMATS.DOUBAO_EMBEDDING)).toBe('DE')
+    expect(formatApiFormatShort(API_FORMATS.ALIYUN_MULTIMODAL_EMBEDDING)).toBe('AE')
   })
 
   it('does not remap retired api format ids', () => {
@@ -72,6 +76,7 @@ describe('api format display helpers', () => {
       API_FORMATS.GEMINI_EMBEDDING,
       API_FORMATS.JINA_EMBEDDING,
       API_FORMATS.JINA_RERANK,
+      API_FORMATS.ALIYUN_MULTIMODAL_EMBEDDING,
     ])).toEqual([
       API_FORMATS.OPENAI,
       API_FORMATS.OPENAI_RESPONSES,
@@ -81,6 +86,7 @@ describe('api format display helpers', () => {
       API_FORMATS.JINA_EMBEDDING,
       API_FORMATS.JINA_RERANK,
       API_FORMATS.DOUBAO_EMBEDDING,
+      API_FORMATS.ALIYUN_MULTIMODAL_EMBEDDING,
       'openai:compact',
     ])
   })
@@ -104,6 +110,7 @@ describe('api format display helpers', () => {
   it('groups embedding api formats by provider family', () => {
     expect(groupApiFormats([
       API_FORMATS.DOUBAO_EMBEDDING,
+      API_FORMATS.ALIYUN_MULTIMODAL_EMBEDDING,
       API_FORMATS.JINA_RERANK,
       API_FORMATS.JINA_EMBEDDING,
       API_FORMATS.GEMINI_EMBEDDING,
@@ -114,6 +121,7 @@ describe('api format display helpers', () => {
       { family: 'gemini', label: 'Gemini', formats: [API_FORMATS.GEMINI_EMBEDDING] },
       { family: 'jina', label: 'Jina', formats: [API_FORMATS.JINA_EMBEDDING, API_FORMATS.JINA_RERANK] },
       { family: 'doubao', label: 'Doubao', formats: [API_FORMATS.DOUBAO_EMBEDDING] },
+      { family: 'aliyun', label: 'Aliyun', formats: [API_FORMATS.ALIYUN_MULTIMODAL_EMBEDDING] },
     ])
   })
 

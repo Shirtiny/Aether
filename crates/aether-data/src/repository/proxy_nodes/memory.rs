@@ -9,11 +9,12 @@ use uuid::Uuid;
 use super::types::{
     bucket_start_unix_secs, build_tunnel_error_event_detail, build_tunnel_metrics_sample,
     log_reported_tunnel_error_event, normalize_proxy_metadata,
-    reconcile_remote_config_after_heartbeat, ProxyNodeEventQuery, ProxyNodeHeartbeatMutation,
-    ProxyNodeManualCreateMutation, ProxyNodeManualUpdateMutation, ProxyNodeMetricsCleanupSummary,
-    ProxyNodeMetricsStep, ProxyNodeReadRepository, ProxyNodeRegistrationMutation,
-    ProxyNodeRemoteConfigMutation, ProxyNodeTrafficMutation, ProxyNodeTunnelStatusMutation,
-    ProxyNodeWriteRepository, StoredProxyFleetMetricsBucket, StoredProxyNode, StoredProxyNodeEvent,
+    preserve_proxy_metadata_tunnel_security, reconcile_remote_config_after_heartbeat,
+    ProxyNodeEventQuery, ProxyNodeHeartbeatMutation, ProxyNodeManualCreateMutation,
+    ProxyNodeManualUpdateMutation, ProxyNodeMetricsCleanupSummary, ProxyNodeMetricsStep,
+    ProxyNodeReadRepository, ProxyNodeRegistrationMutation, ProxyNodeRemoteConfigMutation,
+    ProxyNodeTrafficMutation, ProxyNodeTunnelStatusMutation, ProxyNodeWriteRepository,
+    StoredProxyFleetMetricsBucket, StoredProxyNode, StoredProxyNodeEvent,
     StoredProxyNodeMetricsBucket, TunnelMetricsSample, PROXY_NODE_EVENT_TYPE_TUNNEL_ERROR,
 };
 use crate::DataLayerError;
@@ -561,7 +562,7 @@ impl ProxyNodeWriteRepository for InMemoryProxyNodeRepository {
             };
             if !node.tunnel_mode {
                 return Err(DataLayerError::InvalidInput(
-                    "non-tunnel mode is no longer supported, please upgrade aether-proxy to use tunnel mode"
+                    "non-tunnel mode is no longer supported, please upgrade aether-tunnel to use tunnel mode"
                         .to_string(),
                 ));
             }
@@ -589,6 +590,10 @@ impl ProxyNodeWriteRepository for InMemoryProxyNodeRepository {
             let normalized_proxy_metadata = normalize_proxy_metadata(
                 mutation.proxy_metadata.as_ref(),
                 mutation.proxy_version.as_deref(),
+            );
+            let normalized_proxy_metadata = preserve_proxy_metadata_tunnel_security(
+                previous_proxy_metadata.as_ref(),
+                normalized_proxy_metadata,
             );
             if let Some(value) = normalized_proxy_metadata {
                 node.proxy_metadata = Some(value);
@@ -1163,7 +1168,7 @@ mod tests {
                 dns_failures_delta: Some(0),
                 stream_errors_delta: Some(0),
                 proxy_metadata: Some(json!({"arch": "arm64"})),
-                proxy_version: Some("proxy-v2.2.0".to_string()),
+                proxy_version: Some("tunnel-v2.2.0".to_string()),
             })
             .await
             .expect("heartbeat should succeed")

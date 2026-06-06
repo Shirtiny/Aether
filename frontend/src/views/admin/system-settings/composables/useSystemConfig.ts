@@ -20,12 +20,23 @@ export interface SystemConfig {
   turnstile_secret_key: string
   turnstile_secret_key_is_set: boolean
   turnstile_allowed_hostnames: string[]
+  referral_enabled: boolean
+  referral_reward_mode: string
+  referral_recharge_percent: number
+  referral_headcount_amount_usd: number
+  referral_headcount_trigger: string
+  registration_privacy_policy_enabled: boolean
+  registration_privacy_policy_format: string
+  registration_privacy_policy_content: string
+  registration_privacy_policy_version: string
   // 独立余额 Key 过期管理
   auto_delete_expired_keys: boolean
   // 格式转换
   enable_format_conversion: boolean
   // 同步生图心跳
   enable_openai_image_sync_heartbeat: boolean
+  // 标准文本非流式心跳
+  enable_standard_text_sync_heartbeat: boolean
   // 请求记录
   request_record_level: string
   max_request_body_size: number
@@ -65,12 +76,23 @@ const CONFIG_KEYS = [
   'turnstile_site_key',
   'turnstile_secret_key',
   'turnstile_allowed_hostnames',
+  'referral_enabled',
+  'referral_reward_mode',
+  'referral_recharge_percent',
+  'referral_headcount_amount_usd',
+  'referral_headcount_trigger',
+  'registration_privacy_policy_enabled',
+  'registration_privacy_policy_format',
+  'registration_privacy_policy_content',
+  'registration_privacy_policy_version',
   // 独立余额 Key 过期管理
   'auto_delete_expired_keys',
   // 格式转换
   'enable_format_conversion',
   // 同步生图心跳
   'enable_openai_image_sync_heartbeat',
+  // 标准文本非流式心跳
+  'enable_standard_text_sync_heartbeat',
   // 请求记录
   'request_record_level',
   'max_request_body_size',
@@ -112,12 +134,23 @@ function createDefaultConfig(): SystemConfig {
     turnstile_secret_key: '',
     turnstile_secret_key_is_set: false,
     turnstile_allowed_hostnames: [],
+    referral_enabled: false,
+    referral_reward_mode: 'percent',
+    referral_recharge_percent: 5,
+    referral_headcount_amount_usd: 0,
+    referral_headcount_trigger: 'registration',
+    registration_privacy_policy_enabled: false,
+    registration_privacy_policy_format: 'markdown',
+    registration_privacy_policy_content: '',
+    registration_privacy_policy_version: '1',
     // 独立余额 Key 过期管理
     auto_delete_expired_keys: false,
     // 格式转换
     enable_format_conversion: false,
     // 同步生图心跳
     enable_openai_image_sync_heartbeat: false,
+    // 标准文本非流式心跳
+    enable_standard_text_sync_heartbeat: false,
     // 请求记录
     request_record_level: 'basic',
     max_request_body_size: 1048576,
@@ -150,6 +183,7 @@ export function useSystemConfig() {
   const systemConfig = ref<SystemConfig>(createDefaultConfig())
   const originalConfig = ref<SystemConfig | null>(null)
   const systemVersion = ref<string>('')
+  const systemConfigLoading = ref(true)
 
   // 各模块 loading 状态
   const siteInfoLoading = ref(false)
@@ -160,6 +194,7 @@ export function useSystemConfig() {
 
   // 变动检测
   const hasSiteInfoChanges = computed(() => {
+    if (systemConfigLoading.value) return false
     if (!originalConfig.value) return false
     return (
       systemConfig.value.site_name !== originalConfig.value.site_name ||
@@ -168,11 +203,13 @@ export function useSystemConfig() {
   })
 
   const hasProxyConfigChanges = computed(() => {
+    if (systemConfigLoading.value) return false
     if (!originalConfig.value) return false
     return systemConfig.value.system_proxy_node_id !== originalConfig.value.system_proxy_node_id
   })
 
   const hasBasicConfigChanges = computed(() => {
+    if (systemConfigLoading.value) return false
     if (!originalConfig.value) return false
     return (
       systemConfig.value.default_user_initial_gift_usd !== originalConfig.value.default_user_initial_gift_usd ||
@@ -184,13 +221,30 @@ export function useSystemConfig() {
       systemConfig.value.turnstile_secret_key.trim() !== '' ||
       JSON.stringify(systemConfig.value.turnstile_allowed_hostnames) !==
       JSON.stringify(originalConfig.value.turnstile_allowed_hostnames) ||
+      systemConfig.value.referral_enabled !== originalConfig.value.referral_enabled ||
+      systemConfig.value.referral_reward_mode !== originalConfig.value.referral_reward_mode ||
+      systemConfig.value.referral_recharge_percent !== originalConfig.value.referral_recharge_percent ||
+      systemConfig.value.referral_headcount_amount_usd !== originalConfig.value.referral_headcount_amount_usd ||
+      systemConfig.value.referral_headcount_trigger !== originalConfig.value.referral_headcount_trigger ||
+      systemConfig.value.registration_privacy_policy_enabled !==
+      originalConfig.value.registration_privacy_policy_enabled ||
+      systemConfig.value.registration_privacy_policy_format !==
+      originalConfig.value.registration_privacy_policy_format ||
+      systemConfig.value.registration_privacy_policy_content !==
+      originalConfig.value.registration_privacy_policy_content ||
+      systemConfig.value.registration_privacy_policy_version !==
+      originalConfig.value.registration_privacy_policy_version ||
       systemConfig.value.auto_delete_expired_keys !== originalConfig.value.auto_delete_expired_keys ||
       systemConfig.value.enable_format_conversion !== originalConfig.value.enable_format_conversion ||
-      systemConfig.value.enable_openai_image_sync_heartbeat !== originalConfig.value.enable_openai_image_sync_heartbeat
+      systemConfig.value.enable_openai_image_sync_heartbeat !==
+      originalConfig.value.enable_openai_image_sync_heartbeat ||
+      systemConfig.value.enable_standard_text_sync_heartbeat !==
+      originalConfig.value.enable_standard_text_sync_heartbeat
     )
   })
 
   const hasLogConfigChanges = computed(() => {
+    if (systemConfigLoading.value) return false
     if (!originalConfig.value) return false
     return (
       systemConfig.value.request_record_level !== originalConfig.value.request_record_level ||
@@ -202,6 +256,7 @@ export function useSystemConfig() {
   })
 
   const hasCleanupConfigChanges = computed(() => {
+    if (systemConfigLoading.value) return false
     if (!originalConfig.value) return false
     return (
       systemConfig.value.detail_log_retention_days !==
@@ -264,26 +319,47 @@ export function useSystemConfig() {
 
   // 加载配置
   async function loadSystemConfig() {
+    systemConfigLoading.value = true
     try {
-      for (const key of CONFIG_KEYS) {
+      const results = await Promise.all(
+        CONFIG_KEYS.map(async (key) => {
+          try {
+            return {
+              key,
+              response: await adminApi.getSystemConfig(key),
+            }
+          } catch {
+            return null
+          }
+        })
+      )
+
+      const nextConfig = createDefaultConfig()
+      for (const result of results) {
+        if (!result) {
+          continue
+        }
+        const { key, response } = result
         try {
-          const response = await adminApi.getSystemConfig(key)
           if (key === 'turnstile_secret_key') {
-            systemConfig.value.turnstile_secret_key = ''
-            systemConfig.value.turnstile_secret_key_is_set = !!response.is_set
+            nextConfig.turnstile_secret_key = ''
+            nextConfig.turnstile_secret_key_is_set = !!response.is_set
             continue
           }
           if (response.value !== null && response.value !== undefined) {
-            ; (systemConfig.value as Record<string, unknown>)[key] = response.value
+            ; (nextConfig as Record<string, unknown>)[key] = response.value
           }
         } catch {
           // 单个配置项加载失败时忽略，使用默认值
         }
       }
-      originalConfig.value = JSON.parse(JSON.stringify(systemConfig.value))
+      systemConfig.value = nextConfig
+      originalConfig.value = JSON.parse(JSON.stringify(nextConfig))
     } catch (err) {
       error('加载系统配置失败')
       log.error('加载系统配置失败:', err)
+    } finally {
+      systemConfigLoading.value = false
     }
   }
 
@@ -387,6 +463,51 @@ export function useSystemConfig() {
           description: 'Cloudflare Turnstile 允许的 hostname 列表',
         },
         {
+          key: 'referral_enabled',
+          value: systemConfig.value.referral_enabled,
+          description: '邀请返利开关',
+        },
+        {
+          key: 'referral_reward_mode',
+          value: systemConfig.value.referral_reward_mode,
+          description: '邀请返利方式',
+        },
+        {
+          key: 'referral_recharge_percent',
+          value: systemConfig.value.referral_recharge_percent,
+          description: '邀请充值比例返利百分比',
+        },
+        {
+          key: 'referral_headcount_amount_usd',
+          value: systemConfig.value.referral_headcount_amount_usd,
+          description: '邀请人头返利金额（美元）',
+        },
+        {
+          key: 'referral_headcount_trigger',
+          value: systemConfig.value.referral_headcount_trigger,
+          description: '邀请人头返利触发时机',
+        },
+        {
+          key: 'registration_privacy_policy_enabled',
+          value: systemConfig.value.registration_privacy_policy_enabled,
+          description: '注册隐私政策确认开关',
+        },
+        {
+          key: 'registration_privacy_policy_format',
+          value: systemConfig.value.registration_privacy_policy_format,
+          description: '注册隐私政策内容格式',
+        },
+        {
+          key: 'registration_privacy_policy_content',
+          value: systemConfig.value.registration_privacy_policy_content,
+          description: '注册隐私政策内容',
+        },
+        {
+          key: 'registration_privacy_policy_version',
+          value: systemConfig.value.registration_privacy_policy_version,
+          description: '注册隐私政策版本',
+        },
+        {
           key: 'auto_delete_expired_keys',
           value: systemConfig.value.auto_delete_expired_keys,
           description: '是否自动删除过期的API Key',
@@ -400,6 +521,11 @@ export function useSystemConfig() {
           key: 'enable_openai_image_sync_heartbeat',
           value: systemConfig.value.enable_openai_image_sync_heartbeat,
           description: '同步生图心跳开关：开启后外层 HTTP 状态固定为 200，上游失败写入响应体',
+        },
+        {
+          key: 'enable_standard_text_sync_heartbeat',
+          value: systemConfig.value.enable_standard_text_sync_heartbeat,
+          description: '标准文本非流式心跳开关：开启后外层 HTTP 状态固定为 200，上游失败写入响应体',
         },
       ]
       const turnstileSecret = systemConfig.value.turnstile_secret_key.trim()
@@ -426,6 +552,21 @@ export function useSystemConfig() {
         originalConfig.value.turnstile_allowed_hostnames = [
           ...systemConfig.value.turnstile_allowed_hostnames,
         ]
+        originalConfig.value.referral_enabled = systemConfig.value.referral_enabled
+        originalConfig.value.referral_reward_mode = systemConfig.value.referral_reward_mode
+        originalConfig.value.referral_recharge_percent = systemConfig.value.referral_recharge_percent
+        originalConfig.value.referral_headcount_amount_usd =
+          systemConfig.value.referral_headcount_amount_usd
+        originalConfig.value.referral_headcount_trigger =
+          systemConfig.value.referral_headcount_trigger
+        originalConfig.value.registration_privacy_policy_enabled =
+          systemConfig.value.registration_privacy_policy_enabled
+        originalConfig.value.registration_privacy_policy_format =
+          systemConfig.value.registration_privacy_policy_format
+        originalConfig.value.registration_privacy_policy_content =
+          systemConfig.value.registration_privacy_policy_content
+        originalConfig.value.registration_privacy_policy_version =
+          systemConfig.value.registration_privacy_policy_version
         if (turnstileSecret) {
           systemConfig.value.turnstile_secret_key = ''
           systemConfig.value.turnstile_secret_key_is_set = true
@@ -438,6 +579,8 @@ export function useSystemConfig() {
           systemConfig.value.enable_format_conversion
         originalConfig.value.enable_openai_image_sync_heartbeat =
           systemConfig.value.enable_openai_image_sync_heartbeat
+        originalConfig.value.enable_standard_text_sync_heartbeat =
+          systemConfig.value.enable_standard_text_sync_heartbeat
       }
       success('基础配置已保存')
     } catch (err) {
@@ -634,6 +777,7 @@ export function useSystemConfig() {
     systemConfig,
     originalConfig,
     systemVersion,
+    systemConfigLoading,
     // loading 状态
     siteInfoLoading,
     proxyConfigLoading,

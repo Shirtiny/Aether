@@ -60,8 +60,14 @@
                   <SelectItem value="gemini_cli">
                     Gemini CLI
                   </SelectItem>
+                  <SelectItem value="grok">
+                    Grok
+                  </SelectItem>
                   <SelectItem value="kiro">
                     Kiro
+                  </SelectItem>
+                  <SelectItem value="windsurf">
+                    Windsurf
                   </SelectItem>
                   <SelectItem value="antigravity">
                     Antigravity
@@ -87,8 +93,14 @@
                   <SelectItem value="gemini_cli">
                     Gemini CLI
                   </SelectItem>
+                  <SelectItem value="grok">
+                    Grok
+                  </SelectItem>
                   <SelectItem value="kiro">
                     Kiro
+                  </SelectItem>
+                  <SelectItem value="windsurf">
+                    Windsurf
                   </SelectItem>
                   <SelectItem value="antigravity">
                     Antigravity
@@ -269,6 +281,22 @@
           />
         </div>
 
+        <div
+          v-if="form.provider_type === 'kiro'"
+          class="flex items-center justify-between p-3 border rounded-lg bg-muted/50"
+        >
+          <div class="space-y-0.5">
+            <span class="text-sm font-medium">模拟缓存模式</span>
+            <p class="text-xs text-muted-foreground leading-relaxed">
+              启用后仅对 Kiro 请求模拟 prompt cache 读写计量。
+            </p>
+          </div>
+          <Switch
+            :model-value="form.kiro_simulated_cache_enabled"
+            @update:model-value="(v: boolean) => form.kiro_simulated_cache_enabled = v"
+          />
+        </div>
+
         <div class="flex items-center justify-between gap-4 p-3 border rounded-lg bg-muted/50">
           <div class="space-y-0.5">
             <span class="text-sm font-medium">敏感信息保护</span>
@@ -320,6 +348,7 @@ import {
   createProvider,
   normalizePoolAdvancedConfig,
   updateProvider,
+  type ProviderType,
   type ProviderWithEndpointsSummary,
 } from '@/api/endpoints'
 import { parseApiError } from '@/utils/errorParser'
@@ -355,7 +384,7 @@ const defaultPriority = computed(() => {
 // 表单数据
 const form = ref({
   name: '',
-  provider_type: 'custom' as 'custom' | 'vertex_ai' | 'claude_code' | 'codex' | 'chatgpt_web' | 'gemini_cli' | 'antigravity' | 'kiro',
+  provider_type: 'custom' as ProviderType,
   description: '',
   website: '',
   // 计费配置
@@ -377,6 +406,8 @@ const form = ref({
   request_timeout: undefined as number | undefined,
   // 号池模式
   pool_mode_enabled: false,
+  // Kiro 专属配置
+  kiro_simulated_cache_enabled: false,
 })
 
 // 重置表单
@@ -403,6 +434,8 @@ function resetForm() {
     request_timeout: undefined,
     // 号池模式
     pool_mode_enabled: false,
+    // Kiro 专属配置
+    kiro_simulated_cache_enabled: false,
   }
 }
 
@@ -433,6 +466,8 @@ function loadProviderData() {
     request_timeout: props.provider.request_timeout ?? undefined,
     // 号池模式
     pool_mode_enabled: poolAdvanced !== null,
+    // Kiro 专属配置
+    kiro_simulated_cache_enabled: props.provider.kiro_simulated_cache_enabled ?? false,
   }
 }
 
@@ -450,6 +485,9 @@ const { isEditMode, handleDialogUpdate, handleCancel } = useFormDialog({
 watch(() => form.value.provider_type, () => {
   if (!isEditMode.value) {
     form.value.pool_mode_enabled = false
+  }
+  if (form.value.provider_type !== 'kiro') {
+    form.value.kiro_simulated_cache_enabled = false
   }
 })
 
@@ -500,6 +538,15 @@ const handleSubmit = async () => {
       pool_advanced: form.value.pool_mode_enabled
         ? (currentPoolAdvanced ?? {})
         : null,
+      ...(form.value.provider_type === 'kiro'
+        ? {
+            config: {
+              kiro: {
+                simulated_cache_enabled: form.value.kiro_simulated_cache_enabled,
+              },
+            },
+          }
+        : {}),
     }
 
     if (isEditMode.value && props.provider) {

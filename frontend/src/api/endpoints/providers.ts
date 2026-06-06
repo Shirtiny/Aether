@@ -5,6 +5,7 @@ import type {
   FailoverRulesConfig,
   PoolAdvancedConfig,
   ProviderConfig,
+  ProviderType,
   ProviderWithEndpointsSummary,
   ProxyConfig,
 } from './types'
@@ -48,6 +49,7 @@ function normalizeProviderSummary(
     ...provider,
     chat_pii_redaction: normalizeChatPiiRedactionProvider(provider.chat_pii_redaction),
     pool_advanced: normalizePoolAdvanced(provider.pool_advanced),
+    kiro_simulated_cache_enabled: provider.kiro_simulated_cache_enabled ?? false,
   }
 }
 
@@ -91,7 +93,7 @@ export async function updateProvider(
   providerId: string,
   data: Partial<{
     name: string
-    provider_type: 'custom' | 'vertex_ai' | 'claude_code' | 'codex' | 'chatgpt_web' | 'gemini_cli' | 'antigravity' | 'kiro'
+    provider_type: ProviderType
     description: string | null
     website: string
     provider_priority: number
@@ -126,7 +128,7 @@ export async function updateProvider(
 export async function createProvider(
   data: {
     name: string
-    provider_type?: 'custom' | 'vertex_ai' | 'claude_code' | 'codex' | 'chatgpt_web' | 'gemini_cli' | 'antigravity' | 'kiro'
+    provider_type?: ProviderType
     description?: string
     website?: string
     billing_type?: 'monthly_quota' | 'pay_as_you_go' | 'free_tier'
@@ -194,6 +196,7 @@ export interface TestModelRequest {
   provider_id: string
   model_name: string
   api_key_id?: string
+  api_key_ids?: string[]
   endpoint_id?: string
   message?: string
   api_format?: string
@@ -247,6 +250,7 @@ export interface TestModelFailoverRequest {
   mode: 'global' | 'direct' | 'pool'
   model_name: string
   failover_models?: string[]
+  api_key_ids?: string[]
   api_format?: string
   endpoint_id?: string
   message?: string

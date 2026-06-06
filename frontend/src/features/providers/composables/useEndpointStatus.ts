@@ -18,6 +18,7 @@ const ENDPOINT_SORT_ORDER = [
   'jina:embedding',
   'jina:rerank',
   'doubao:embedding',
+  'aliyun:multimodal_embedding',
 ]
 
 /**

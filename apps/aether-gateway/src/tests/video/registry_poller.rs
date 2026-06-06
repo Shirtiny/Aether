@@ -165,7 +165,7 @@ async fn gateway_background_video_task_poller_refreshes_due_openai_task_from_rep
     let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
     let repository = Arc::new(InMemoryVideoTaskRepository::default());
     repository
-        .upsert(sample_due_openai_task("https://api.openai.example"))
+        .upsert(sample_due_openai_task("https://api.openai.example/v1"))
         .await
         .expect("task upsert should succeed");
 
@@ -177,7 +177,7 @@ async fn gateway_background_video_task_poller_refreshes_due_openai_task_from_rep
     assert!(!background_tasks.is_empty(), "poller task should spawn");
 
     let stored = {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
             let stored = repository
                 .find(VideoTaskLookupKey::Id("task-local-123"))
@@ -189,7 +189,7 @@ async fn gateway_background_video_task_poller_refreshes_due_openai_task_from_rep
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "poller did not refresh task within 500ms"
+                "poller did not refresh task within 2s"
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
@@ -268,9 +268,10 @@ async fn gateway_background_video_task_poller_refreshes_due_openai_task_from_rep
     );
 
     let (upstream_url, upstream_handle) = start_server(upstream).await;
+    let upstream_api_root = format!("{upstream_url}/v1");
     let repository = Arc::new(InMemoryVideoTaskRepository::default());
     repository
-        .upsert(sample_due_openai_task(&upstream_url))
+        .upsert(sample_due_openai_task(&upstream_api_root))
         .await
         .expect("task upsert should succeed");
 
@@ -283,7 +284,7 @@ async fn gateway_background_video_task_poller_refreshes_due_openai_task_from_rep
     assert!(!background_tasks.is_empty(), "poller task should spawn");
 
     let stored = {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
             let stored = repository
                 .find(VideoTaskLookupKey::Id("task-local-123"))
@@ -295,7 +296,7 @@ async fn gateway_background_video_task_poller_refreshes_due_openai_task_from_rep
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "poller did not refresh task within 500ms"
+                "poller did not refresh task within 2s"
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }

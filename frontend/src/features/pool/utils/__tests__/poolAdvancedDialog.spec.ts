@@ -38,7 +38,7 @@ describe('poolAdvancedDialog', () => {
       {
         key: 'auto_remove_banned_keys',
         label: '异常自动清除',
-        description: '仅在检测到不可恢复的账号异常时自动从号池移除，不处理纯 Token 失效。',
+        description: '检测到不可恢复账号异常，或 RT 与 AT 均失效时自动从号池移除。',
       },
       {
         key: 'skip_exhausted_accounts',

@@ -445,12 +445,27 @@ fn key_auth_channel_matches(row: &CandidateSelectionRow, api_format: &str) -> bo
         "gemini_cli" | "antigravity" => {
             auth_type == "oauth" && api_format == "gemini:generate_content"
         }
+        "grok" => {
+            auth_type == "oauth"
+                && matches!(
+                    api_format.as_str(),
+                    "openai:chat" | "openai:responses" | "claude:messages" | "openai:image"
+                )
+        }
+        "windsurf" => {
+            matches!(auth_type.as_str(), "oauth" | "api_key" | "bearer")
+                && api_format == "openai:chat"
+        }
         "vertex_ai" => {
-            (auth_type == "api_key" && api_format == "gemini:generate_content")
+            (auth_type == "api_key"
+                && matches!(
+                    api_format.as_str(),
+                    "gemini:generate_content" | "gemini:embedding"
+                ))
                 || (matches!(auth_type.as_str(), "service_account" | "vertex_ai")
                     && matches!(
                         api_format.as_str(),
-                        "claude:messages" | "gemini:generate_content"
+                        "claude:messages" | "gemini:generate_content" | "gemini:embedding"
                     ))
         }
         _ => auth_type != "oauth",

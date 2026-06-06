@@ -158,7 +158,6 @@ import { BookOpen } from 'lucide-vue-next'
           <strong class="text-[#262624] dark:text-[#f1ead8] font-medium">熔断探测：</strong><br>
           当同一个提供商Key字连续若干次请求失败后，会进入熔断状态，之后每间N分钟进行探测请求，若请求成功解除熔断后续正常请求，否则按以指数级增长探测时间以待下次探测，最大探测间隔不会增长超过32分钟。
         </li>
-        <li><strong class="text-[#262624] dark:text-[#f1ead8] font-medium">能力标签：</strong>定义该Key可以使用的能力。</li>
         <li>
           <strong class="text-[#262624] dark:text-[#f1ead8] font-medium">自动获取上游模型：</strong><br>
           在上游获取模型端点支持的情况下，从接口自动获取可以用模型列表。且按一定时间自动刷新，不开启则默认任意模型可用，或在后续模型权限中手动添加。

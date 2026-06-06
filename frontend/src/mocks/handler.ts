@@ -22,6 +22,7 @@ import {
   MOCK_PROVIDERS,
   MOCK_GLOBAL_MODELS,
   MOCK_SYSTEM_CONFIGS,
+  MOCK_MODULE_STATUSES,
   MOCK_API_FORMATS
 } from './data'
 
@@ -138,6 +139,20 @@ function generateHealthEvents(
   return events.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime())
 }
 
+function generateHealthTimeline(
+  healthyRate: number,
+  warningRate: number,
+  segments = 60
+) {
+  return Array.from({ length: segments }, () => {
+    const rand = Math.random()
+    if (rand < healthyRate) return 'healthy'
+    if (rand < healthyRate + warningRate) return 'warning'
+    if (rand < 0.96) return 'unknown'
+    return 'unhealthy'
+  })
+}
+
 // Mock 端点健康数据
 // 注意：success_rate 使用 0-1 之间的小数，前端会乘以 100 显示为百分比
 // 事件的成功/失败/跳过比例必须与 success_rate 保持一致
@@ -241,6 +256,154 @@ const MOCK_ENDPOINT_STATUS = {
       key_count: 1,
       last_event_at: new Date().toISOString(),
       events: generateHealthEvents(40, 0.987, 0.01, 0.003, 320, 140)
+    }
+  ]
+}
+
+const MOCK_MODEL_STATUS = {
+  generated_at: new Date().toISOString(),
+  models: [
+    {
+      model: 'gpt-5.5',
+      display_name: 'gpt-5.5',
+      total_attempts: 2021,
+      success_count: 2000,
+      failed_count: 21,
+      success_rate: 0.9896,
+      avg_latency_ms: 1736,
+      avg_first_byte_ms: 176,
+      provider_count: 3,
+      last_event_at: new Date().toISOString(),
+      events: generateHealthEvents(60, 0.989, 0.008, 0.003, 1600, 460),
+      timeline: generateHealthTimeline(0.9, 0.05),
+      time_range_start: new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString(),
+      time_range_end: new Date().toISOString()
+    },
+    {
+      model: 'claude-sonnet-4-5-20250929',
+      display_name: 'Claude Sonnet 4.5',
+      total_attempts: 1684,
+      success_count: 1642,
+      failed_count: 42,
+      success_rate: 0.9751,
+      avg_latency_ms: 1280,
+      avg_first_byte_ms: 221,
+      provider_count: 2,
+      last_event_at: new Date().toISOString(),
+      events: generateHealthEvents(60, 0.975, 0.02, 0.005, 1200, 520),
+      timeline: generateHealthTimeline(0.84, 0.09),
+      time_range_start: new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString(),
+      time_range_end: new Date().toISOString()
+    },
+    {
+      model: 'gemini-3-pro-preview',
+      display_name: 'Gemini 3 Pro Preview',
+      total_attempts: 932,
+      success_count: 887,
+      failed_count: 45,
+      success_rate: 0.9517,
+      avg_latency_ms: 940,
+      avg_first_byte_ms: 184,
+      provider_count: 2,
+      last_event_at: new Date().toISOString(),
+      events: generateHealthEvents(55, 0.952, 0.04, 0.008, 860, 300),
+      timeline: generateHealthTimeline(0.78, 0.14),
+      time_range_start: new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString(),
+      time_range_end: new Date().toISOString()
+    },
+    {
+      model: 'gpt-5.1-codex-mini',
+      display_name: 'gpt-5.1-codex-mini',
+      total_attempts: 418,
+      success_count: 349,
+      failed_count: 69,
+      success_rate: 0.835,
+      avg_latency_ms: 2310,
+      avg_first_byte_ms: 420,
+      provider_count: 1,
+      last_event_at: new Date().toISOString(),
+      events: generateHealthEvents(45, 0.835, 0.145, 0.02, 2200, 780),
+      timeline: generateHealthTimeline(0.58, 0.24),
+      time_range_start: new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString(),
+      time_range_end: new Date().toISOString()
+    }
+  ]
+}
+
+const MOCK_PROVIDER_HEALTH_STATUS = {
+  generated_at: new Date().toISOString(),
+  providers: [
+    {
+      provider_id: 'provider-001',
+      provider_name: 'OpenAI Official',
+      provider_type: 'codex',
+      is_active: true,
+      total_attempts: 2021,
+      success_count: 2000,
+      failed_count: 21,
+      success_rate: 0.9896,
+      avg_latency_ms: 1736,
+      avg_first_byte_ms: 176,
+      model_count: 2,
+      last_event_at: new Date().toISOString(),
+      timeline: generateHealthTimeline(0.9, 0.05),
+      time_range_start: new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString(),
+      time_range_end: new Date().toISOString(),
+      models: [MOCK_MODEL_STATUS.models[0], MOCK_MODEL_STATUS.models[3]]
+    },
+    {
+      provider_id: 'provider-002',
+      provider_name: 'Anthropic Official',
+      provider_type: 'claude_code',
+      is_active: true,
+      total_attempts: 1684,
+      success_count: 1642,
+      failed_count: 42,
+      success_rate: 0.9751,
+      avg_latency_ms: 1280,
+      avg_first_byte_ms: 221,
+      model_count: 1,
+      last_event_at: new Date().toISOString(),
+      timeline: generateHealthTimeline(0.84, 0.09),
+      time_range_start: new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString(),
+      time_range_end: new Date().toISOString(),
+      models: [MOCK_MODEL_STATUS.models[1]]
+    },
+    {
+      provider_id: 'provider-003',
+      provider_name: 'Google AI',
+      provider_type: 'gemini_cli',
+      is_active: true,
+      total_attempts: 932,
+      success_count: 887,
+      failed_count: 45,
+      success_rate: 0.9517,
+      avg_latency_ms: 940,
+      avg_first_byte_ms: 184,
+      model_count: 1,
+      last_event_at: new Date().toISOString(),
+      timeline: generateHealthTimeline(0.78, 0.14),
+      time_range_start: new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString(),
+      time_range_end: new Date().toISOString(),
+      models: [MOCK_MODEL_STATUS.models[2]]
+    },
+    {
+      provider_id: 'provider-004',
+      provider_name: 'AWS Bedrock',
+      provider_type: 'custom',
+      is_active: true,
+      total_attempts: 0,
+      success_count: 0,
+      failed_count: 0,
+      success_rate: 1,
+      avg_latency_ms: null,
+      avg_first_byte_ms: null,
+      model_count: 0,
+      last_event_at: null,
+      timeline: Array.from({ length: 60 }, () => 'unknown'),
+      time_range_start: new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString(),
+      time_range_end: new Date().toISOString(),
+      models: []
     }
   ]
 }
@@ -429,6 +592,102 @@ const MOCK_ALIASES = [
   { id: 'alias-004', source_model: 'gemini-pro', target_global_model_id: 'gm-005', target_global_model_name: 'gemini-3-pro-preview', target_global_model_display_name: 'Gemini 3 Pro Preview', provider_id: null, provider_name: null, scope: 'global', mapping_type: 'alias', is_active: true, created_at: '2024-01-01T00:00:00Z', updated_at: '2024-01-01T00:00:00Z' }
 ]
 
+interface MockRoutingGroup {
+  id: string
+  name: string
+  description: string | null
+  enabled: boolean
+  is_system_default: boolean
+  config_json: Record<string, unknown>
+  version: number
+  created_at: number
+  updated_at: number
+  published_at: number | null
+}
+
+interface MockRoutingGroupVersion {
+  id: string
+  group_id: string
+  version: number
+  config_json: Record<string, unknown>
+  created_at: number
+  created_by: string | null
+}
+
+interface MockRoutingGroupBinding {
+  id: string
+  group_id: string
+  subject_type: 'user' | 'api_key' | 'user_group'
+  subject_id: string
+  is_default: boolean
+  allow_explicit_select: boolean
+  created_at: number
+  updated_at: number
+}
+
+const mockRoutingNow = Math.floor(Date.now() / 1000)
+const MOCK_ROUTING_GROUPS: MockRoutingGroup[] = [
+  {
+    id: 'routing-default',
+    name: '默认调度策略',
+    description: '演示模式默认分组，保持 Provider 优先和缓存亲和',
+    enabled: true,
+    is_system_default: true,
+    config_json: {
+      allowed_models: [],
+      default_policy: {
+        priority_mode: 'provider',
+        scheduling_mode: 'cache_affinity',
+        keep_priority_on_conversion: false,
+      },
+      model_policies: [
+        {
+          model: 'gpt-5.1',
+          allowed_providers: ['provider-002'],
+          allowed_keys: [],
+          provider_priority_overrides: { 'provider-002': 0 },
+          key_priority_overrides: {},
+          pool_policy_overrides: {},
+        },
+      ],
+      rules: [],
+    },
+    version: 1,
+    created_at: mockRoutingNow - 86400,
+    updated_at: mockRoutingNow - 3600,
+    published_at: mockRoutingNow - 3600,
+  },
+]
+
+const MOCK_ROUTING_GROUP_VERSIONS: MockRoutingGroupVersion[] = [
+  {
+    id: 'routing-default-v1',
+    group_id: 'routing-default',
+    version: 1,
+    config_json: MOCK_ROUTING_GROUPS[0].config_json,
+    created_at: MOCK_ROUTING_GROUPS[0].published_at ?? mockRoutingNow,
+    created_by: null,
+  },
+]
+
+const MOCK_ROUTING_GROUP_BINDINGS: MockRoutingGroupBinding[] = []
+
+function cloneMockRoutingGroup(group: MockRoutingGroup): MockRoutingGroup {
+  return JSON.parse(JSON.stringify(group)) as MockRoutingGroup
+}
+
+function cloneMockRoutingVersion(version: MockRoutingGroupVersion): MockRoutingGroupVersion {
+  return JSON.parse(JSON.stringify(version)) as MockRoutingGroupVersion
+}
+
+function unsetOtherMockRoutingDefaults(groupId: string): void {
+  for (const group of MOCK_ROUTING_GROUPS) {
+    if (group.id !== groupId) {
+      group.is_system_default = false
+    }
+  }
+}
+
 function normalizeApiFormat(apiFormat: string): string {
   return apiFormat.toLowerCase().replace(/_/g, ':')
 }
@@ -449,7 +708,6 @@ function getMockEndpointExtras(apiFormat: string) {
       { action: 'regex_replace', path: 'messages[0].content', pattern: '\\s+', replacement: ' ', flags: 'm', condition: { path: 'metadata.source', op: 'eq', value: 'internal' } }
     ]
   } else if (normalizedFormat === 'openai:chat') {
-    extras.custom_path = '/v1/chat/completions'
     extras.header_rules = [
       { action: 'set', key: 'x-client', value: 'demo' }
     ]
@@ -461,13 +719,11 @@ function getMockEndpointExtras(apiFormat: string) {
   } else if (normalizedFormat === 'openai:responses') {
     extras.config = { upstream_stream_policy: 'force_non_stream' }
   } else if (normalizedFormat === 'openai:embedding') {
-    extras.custom_path = '/v1/embeddings'
     extras.config = { route_kind: 'embedding' }
   } else if (normalizedFormat === 'openai:rerank' || normalizedFormat === 'jina:rerank') {
-    extras.custom_path = '/v1/rerank'
     extras.config = { route_kind: 'rerank' }
   } else if (normalizedFormat === 'gemini:generate_content') {
-    extras.custom_path = '/v1beta/models/gemini-3-pro-preview:generateContent'
+    extras.custom_path = '/models/gemini-3-pro-preview:generateContent'
     extras.body_rules = [
       { action: 'drop', path: 'metadata.debug' }
     ]
@@ -486,9 +742,9 @@ const MOCK_ENDPOINT_KEYS = [
 
 // Mock Endpoints
 const MOCK_ENDPOINTS = [
-  { id: 'ep-001', provider_id: 'provider-001', provider_name: 'anthropic', api_format: 'claude:messages', base_url: 'https://api.anthropic.com', max_retries: 2, is_active: true, total_keys: 2, active_keys: 2, created_at: '2024-01-01T00:00:00Z', updated_at: new Date().toISOString(), ...getMockEndpointExtras('claude:messages') },
-  { id: 'ep-002', provider_id: 'provider-002', provider_name: 'openai', api_format: 'openai:chat', base_url: 'https://api.openai.com', max_retries: 2, is_active: true, total_keys: 1, active_keys: 1, created_at: '2024-01-01T00:00:00Z', updated_at: new Date().toISOString(), ...getMockEndpointExtras('openai:chat') },
-  { id: 'ep-003', provider_id: 'provider-003', provider_name: 'google', api_format: 'gemini:generate_content', base_url: 'https://generativelanguage.googleapis.com', max_retries: 2, is_active: true, total_keys: 1, active_keys: 1, created_at: '2024-01-15T00:00:00Z', updated_at: new Date().toISOString(), ...getMockEndpointExtras('gemini:generate_content') }
+  { id: 'ep-001', provider_id: 'provider-001', provider_name: 'anthropic', api_format: 'claude:messages', base_url: 'https://api.anthropic.com/v1', max_retries: 2, is_active: true, total_keys: 2, active_keys: 2, created_at: '2024-01-01T00:00:00Z', updated_at: new Date().toISOString(), ...getMockEndpointExtras('claude:messages') },
+  { id: 'ep-002', provider_id: 'provider-002', provider_name: 'openai', api_format: 'openai:chat', base_url: 'https://api.openai.com/v1', max_retries: 2, is_active: true, total_keys: 1, active_keys: 1, created_at: '2024-01-01T00:00:00Z', updated_at: new Date().toISOString(), ...getMockEndpointExtras('openai:chat') },
+  { id: 'ep-003', provider_id: 'provider-003', provider_name: 'google', api_format: 'gemini:generate_content', base_url: 'https://generativelanguage.googleapis.com/v1beta', max_retries: 2, is_active: true, total_keys: 1, active_keys: 1, created_at: '2024-01-15T00:00:00Z', updated_at: new Date().toISOString(), ...getMockEndpointExtras('gemini:generate_content') }
 ]
 
 // Mock 能力定义
@@ -623,6 +879,17 @@ const mockHandlers: Record<string, (config: AxiosRequestConfig) => Promise<Axios
   'GET /api/users/me/api-keys': async () => {
     await delay()
     return createMockResponse(MOCK_USER_API_KEYS)
+  },
+
+  'GET /api/users/me/client-config': async () => {
+    await delay()
+    const baseUrl = typeof window !== 'undefined'
+      ? window.location.origin
+      : 'https://demo.aether.local'
+    return createMockResponse({
+      base_url: baseUrl,
+      site_name: 'Aether Demo',
+    })
   },
 
   'POST /api/users/me/api-keys': async (config) => {
@@ -929,6 +1196,18 @@ const mockHandlers: Record<string, (config: AxiosRequestConfig) => Promise<Axios
     return createMockResponse(MOCK_ENDPOINT_STATUS)
   },
 
+  'GET /api/admin/endpoints/health/models': async () => {
+    await delay()
+    requireAdmin()
+    return createMockResponse(MOCK_MODEL_STATUS)
+  },
+
+  'GET /api/admin/endpoints/health/providers': async () => {
+    await delay()
+    requireAdmin()
+    return createMockResponse(MOCK_PROVIDER_HEALTH_STATUS)
+  },
+
   'GET /api/admin/endpoints/keys': async () => {
     await delay()
     requireAdmin()
@@ -947,6 +1226,68 @@ const mockHandlers: Record<string, (config: AxiosRequestConfig) => Promise<Axios
     requireAdmin()
     const body = JSON.parse(config.data || '{}')
     return createMockResponse({ ...body, id: `gm-demo-${Date.now()}`, created_at: new Date().toISOString() })
+  },
+
+  // ========== Admin: Routing Profiles ==========
+  'GET /api/admin/routing/groups': async () => {
+    await delay()
+    requireAdmin()
+    return createMockResponse({
+      items: MOCK_ROUTING_GROUPS.map(cloneMockRoutingGroup),
+      total: MOCK_ROUTING_GROUPS.length,
+    })
+  },
+
+  'POST /api/admin/routing/groups': async (config) => {
+    await delay()
+    requireAdmin()
+    const body = JSON.parse(config.data || '{}') as Partial<MockRoutingGroup>
+    const now = Math.floor(Date.now() / 1000)
+    const group: MockRoutingGroup = {
+      id: body.id || `routing-demo-${Date.now()}`,
+      name: body.name || '未命名调度策略',
+      description: body.description ?? null,
+      enabled: body.enabled ?? true,
+      is_system_default: body.is_system_default ?? false,
+      config_json: body.config_json ?? {},
+      version: 1,
+      created_at: now,
+      updated_at: now,
+      published_at: null,
+    }
+    if (group.is_system_default) {
+      unsetOtherMockRoutingDefaults(group.id)
+    }
+    MOCK_ROUTING_GROUPS.unshift(group)
+    return createMockResponse(cloneMockRoutingGroup(group))
+  },
+
+  'GET /api/admin/routing/bindings': async () => {
+    await delay()
+    requireAdmin()
+    return createMockResponse({
+      items: MOCK_ROUTING_GROUP_BINDINGS.map(binding => ({ ...binding })),
+      total: MOCK_ROUTING_GROUP_BINDINGS.length,
+    })
+  },
+
+  'POST /api/admin/routing/bindings': async (config) => {
+    await delay()
+    requireAdmin()
+    const body = JSON.parse(config.data || '{}') as Partial<MockRoutingGroupBinding>
+    const now = Math.floor(Date.now() / 1000)
+    const binding: MockRoutingGroupBinding = {
+      id: body.id || `routing-binding-demo-${Date.now()}`,
+      group_id: body.group_id || 'routing-default',
+      subject_type: body.subject_type || 'api_key',
+      subject_id: body.subject_id || 'demo',
+      is_default: body.is_default ?? false,
+      allow_explicit_select: body.allow_explicit_select ?? false,
+      created_at: now,
+      updated_at: now,
+    }
+    MOCK_ROUTING_GROUP_BINDINGS.unshift(binding)
+    return createMockResponse({ ...binding })
   },
 
   // ========== Admin: Model Mappings / Aliases ==========
@@ -1132,6 +1473,13 @@ const mockHandlers: Record<string, (config: AxiosRequestConfig) => Promise<Axios
     return createMockResponse({ requests: [] })
   },
 
+  // ========== Admin: Modules ==========
+  'GET /api/admin/modules/status': async () => {
+    await delay()
+    requireAdmin()
+    return createMockResponse(MOCK_MODULE_STATUSES)
+  },
+
   // ========== Admin: System ==========
   'GET /api/admin/system/configs': async () => {
     await delay()
@@ -1219,6 +1567,28 @@ const mockHandlers: Record<string, (config: AxiosRequestConfig) => Promise<Axios
         success_rate: f.success_rate,
         last_event_at: f.last_event_at,
         events: f.events.slice(0, 10)
+      }))
+    })
+  },
+
+  'GET /api/public/health/models': async () => {
+    await delay()
+    return createMockResponse({
+      generated_at: new Date().toISOString(),
+      models: MOCK_MODEL_STATUS.models.map(model => ({
+        model: model.model,
+        display_name: model.display_name,
+        total_attempts: model.total_attempts,
+        success_count: model.success_count,
+        failed_count: model.failed_count,
+        success_rate: model.success_rate,
+        avg_latency_ms: model.avg_latency_ms,
+        avg_first_byte_ms: model.avg_first_byte_ms,
+        last_event_at: model.last_event_at,
+        events: model.events.slice(0, 10),
+        timeline: model.timeline,
+        time_range_start: model.time_range_start,
+        time_range_end: model.time_range_end
       }))
     })
   }
@@ -1375,9 +1745,10 @@ function generateMockEndpointsForProvider(providerId: string) {
   return provider.api_formats.map((format, index) => {
     const normalizedFormat = normalizeApiFormat(format)
     const healthDetail = provider.endpoint_health_details.find(h => h.api_format === format)
-    const baseUrl = normalizedFormat.includes('claude') ? 'https://api.anthropic.com' :
-      normalizedFormat.includes('openai') ? 'https://api.openai.com' :
-        'https://generativelanguage.googleapis.com'
+    const baseUrl = normalizedFormat.includes('claude') ? 'https://api.anthropic.com/v1' :
+      normalizedFormat.includes('openai') ? 'https://api.openai.com/v1' :
+        normalizedFormat.includes('jina') ? 'https://api.jina.ai/v1' :
+          'https://generativelanguage.googleapis.com'
     return {
       id: `ep-${providerId}-${index + 1}`,
       provider_id: providerId,
@@ -1456,7 +1827,7 @@ function generateMockModelsForProvider(providerId: string) {
   const hasClaude = provider.api_formats.some(f => f.includes('claude'))
   const hasOpenAI = provider.api_formats.some(f => f.includes('openai'))
   const hasGemini = provider.api_formats.some(f => f.includes('gemini'))
-  const hasEmbedding = provider.api_formats.some(f => f.endsWith(':embedding'))
+  const hasEmbedding = provider.api_formats.some(f => f.endsWith(':embedding') || f === 'aliyun:multimodal_embedding')
   const hasRerank = provider.api_formats.some(f => f.endsWith(':rerank'))
 
   const models: Record<string, unknown>[] = []
@@ -1629,6 +2000,147 @@ function generateMockModelsForProvider(providerId: string) {
 }
 
 // ========== 注册动态路由 ==========
+
+const WRITE_ONLY_SYSTEM_CONFIG_KEYS = new Set([
+  'module.server_chan_push.send_key',
+  'module.bark_push.device_key',
+  'backup_s3_secret_access_key',
+])
+
+function mockSystemConfigValue(key: string) {
+  return MOCK_SYSTEM_CONFIGS.find(item => item.key === key)?.value
+}
+
+function mockS3BackupConfigValidated() {
+  return [
+    'backup_s3_endpoint',
+    'backup_s3_bucket',
+    'backup_s3_access_key_id',
+    'backup_s3_secret_access_key',
+  ].every(key => {
+    const value = mockSystemConfigValue(key)
+    return typeof value === 'string' && value.trim() !== ''
+  })
+}
+
+function refreshMockS3BackupModuleStatus() {
+  const moduleStatus = MOCK_MODULE_STATUSES.s3_backup
+  if (!moduleStatus) return
+  const enabled = mockSystemConfigValue('backup_s3_enabled') === true
+  const configValidated = mockS3BackupConfigValidated()
+  MOCK_MODULE_STATUSES.s3_backup = {
+    ...moduleStatus,
+    enabled,
+    config_validated: configValidated,
+    config_error: configValidated ? null : '请先完成 S3 备份配置',
+    active: moduleStatus.available && enabled && configValidated,
+  }
+}
+
+// 系统配置详情
+registerDynamicRoute('GET', '/api/admin/system/configs/:configKey', async (_config, params) => {
+  await delay()
+  requireAdmin()
+  const key = decodeURIComponent(params.configKey)
+  const entry = MOCK_SYSTEM_CONFIGS.find(item => item.key === key)
+  if (!entry) {
+    throw { response: createMockResponse({ detail: `配置项 '${key}' 不存在` }, 404) }
+  }
+  if (WRITE_ONLY_SYSTEM_CONFIG_KEYS.has(key)) {
+    return createMockResponse({
+      key: entry.key,
+      value: null,
+      description: entry.description,
+      is_set: typeof entry.value === 'string' && entry.value.trim() !== '',
+    })
+  }
+  return createMockResponse({ key: entry.key, value: entry.value, description: entry.description })
+})
+
+// 系统配置更新
+registerDynamicRoute('PUT', '/api/admin/system/configs/:configKey', async (config, params) => {
+  await delay()
+  requireAdmin()
+  const key = decodeURIComponent(params.configKey)
+  const body = JSON.parse(config.data || '{}') as { value?: unknown; description?: string }
+  const index = MOCK_SYSTEM_CONFIGS.findIndex(item => item.key === key)
+  const entry = {
+    key,
+    value: body.value ?? null,
+    description: body.description,
+  }
+  if (index === -1) {
+    MOCK_SYSTEM_CONFIGS.push(entry)
+  } else {
+    MOCK_SYSTEM_CONFIGS[index] = {
+      ...MOCK_SYSTEM_CONFIGS[index],
+      ...entry,
+    }
+  }
+  if (key.startsWith('backup_s3_')) {
+    refreshMockS3BackupModuleStatus()
+  }
+  return createMockResponse(entry)
+})
+
+registerDynamicRoute('POST', '/api/admin/system/backups/s3/run', async () => {
+  await delay()
+  requireAdmin()
+  return createMockResponse({
+    message: 'S3 备份任务已提交',
+    task: {
+      id: `mock-s3-backup-${Date.now()}`,
+      task_key: 'system.s3.backup',
+      status: 'queued',
+      progress_message: 'S3 备份任务已提交',
+    },
+  })
+})
+
+// 模块状态详情
+registerDynamicRoute('GET', '/api/admin/modules/status/:moduleName', async (_config, params) => {
+  await delay()
+  requireAdmin()
+  const moduleStatus = MOCK_MODULE_STATUSES[params.moduleName]
+  if (!moduleStatus) {
+    throw { response: createMockResponse({ detail: '模块不存在' }, 404) }
+  }
+  return createMockResponse(moduleStatus)
+})
+
+// 模块启用状态更新
+registerDynamicRoute('PUT', '/api/admin/modules/status/:moduleName/enabled', async (config, params) => {
+  await delay()
+  requireAdmin()
+  const moduleStatus = MOCK_MODULE_STATUSES[params.moduleName]
+  if (!moduleStatus) {
+    throw { response: createMockResponse({ detail: '模块不存在' }, 404) }
+  }
+  const body = JSON.parse(config.data || '{}') as { enabled?: boolean }
+  const enabled = body.enabled === true
+  if (params.moduleName === 's3_backup') {
+    const index = MOCK_SYSTEM_CONFIGS.findIndex(item => item.key === 'backup_s3_enabled')
+    const entry = {
+      key: 'backup_s3_enabled',
+      value: enabled,
+      description: 'S3 自动备份开关',
+    }
+    if (index === -1) {
+      MOCK_SYSTEM_CONFIGS.push(entry)
+    } else {
+      MOCK_SYSTEM_CONFIGS[index] = { ...MOCK_SYSTEM_CONFIGS[index], ...entry }
+    }
+    refreshMockS3BackupModuleStatus()
+    return createMockResponse(MOCK_MODULE_STATUSES.s3_backup)
+  }
+  const updated = {
+    ...moduleStatus,
+    enabled,
+    active: moduleStatus.available && enabled && moduleStatus.config_validated,
+  }
+  MOCK_MODULE_STATUSES[params.moduleName] = updated
+  return createMockResponse(updated)
+})
 
 // Provider 详情
 registerDynamicRoute('GET', '/api/admin/providers/:providerId/summary', async (_config, params) => {
@@ -2100,6 +2612,181 @@ registerDynamicRoute('POST', '/api/admin/models/global/:modelId/assign-to-provid
     errors: []
   }
   return createMockResponse(result)
+})
+
+registerDynamicRoute('GET', '/api/admin/routing/groups/:groupId', async (_config, params) => {
+  await delay()
+  requireAdmin()
+  const group = MOCK_ROUTING_GROUPS.find(item => item.id === params.groupId)
+  if (!group) {
+    throw { response: createMockResponse({ detail: '调度策略不存在' }, 404) }
+  }
+  return createMockResponse(cloneMockRoutingGroup(group))
+})
+
+registerDynamicRoute('PATCH', '/api/admin/routing/groups/:groupId', async (config, params) => {
+  await delay()
+  requireAdmin()
+  const index = MOCK_ROUTING_GROUPS.findIndex(item => item.id === params.groupId)
+  if (index < 0) {
+    throw { response: createMockResponse({ detail: '调度策略不存在' }, 404) }
+  }
+  const body = JSON.parse(config.data || '{}') as Partial<MockRoutingGroup>
+  const current = MOCK_ROUTING_GROUPS[index]
+  const now = Math.floor(Date.now() / 1000)
+  const updated: MockRoutingGroup = {
+    ...current,
+    ...body,
+    id: current.id,
+    config_json: body.config_json ?? current.config_json,
+    version: body.config_json ? current.version + 1 : (body.version ?? current.version),
+    updated_at: now,
+  }
+  if (updated.is_system_default) {
+    unsetOtherMockRoutingDefaults(updated.id)
+  }
+  MOCK_ROUTING_GROUPS[index] = updated
+  return createMockResponse(cloneMockRoutingGroup(updated))
+})
+
+registerDynamicRoute('DELETE', '/api/admin/routing/groups/:groupId', async (_config, params) => {
+  await delay()
+  requireAdmin()
+  const index = MOCK_ROUTING_GROUPS.findIndex(item => item.id === params.groupId)
+  if (index < 0) {
+    throw { response: createMockResponse({ detail: '调度策略不存在' }, 404) }
+  }
+  MOCK_ROUTING_GROUPS.splice(index, 1)
+  return createMockResponse({ message: '删除成功（演示模式）' })
+})
+
+registerDynamicRoute('POST', '/api/admin/routing/groups/:groupId/publish', async (_config, params) => {
+  await delay()
+  requireAdmin()
+  const group = MOCK_ROUTING_GROUPS.find(item => item.id === params.groupId)
+  if (!group) {
+    throw { response: createMockResponse({ detail: '调度策略不存在' }, 404) }
+  }
+  const now = Math.floor(Date.now() / 1000)
+  group.published_at = now
+  group.updated_at = now
+  MOCK_ROUTING_GROUP_VERSIONS.unshift({
+    id: `${group.id}-v${group.version}-${now}`,
+    group_id: group.id,
+    version: group.version,
+    config_json: group.config_json,
+    created_at: now,
+    created_by: null,
+  })
+  return createMockResponse(cloneMockRoutingGroup(group))
+})
+
+registerDynamicRoute('GET', '/api/admin/routing/groups/:groupId/versions', async (_config, params) => {
+  await delay()
+  requireAdmin()
+  const versions = MOCK_ROUTING_GROUP_VERSIONS
+    .filter(version => version.group_id === params.groupId)
+    .map(cloneMockRoutingVersion)
+  return createMockResponse({ items: versions, total: versions.length })
+})
+
+registerDynamicRoute('POST', '/api/admin/routing/groups/:groupId/dry-run', async (config, params) => {
+  await delay()
+  requireAdmin()
+  const group = MOCK_ROUTING_GROUPS.find(item => item.id === params.groupId)
+  if (!group) {
+    throw { response: createMockResponse({ detail: '调度策略不存在' }, 404) }
+  }
+  const body = JSON.parse(config.data || '{}') as {
+    model?: string
+    resolved_model?: string
+    api_format?: string
+    headers?: Record<string, string>
+    body?: unknown
+  }
+  const model = body.model || 'gpt-5.1'
+  const resolvedModel = body.resolved_model || model
+  const rules = Array.isArray(group.config_json.rules)
+    ? group.config_json.rules as Array<{ id?: unknown; enabled?: unknown }>
+    : []
+  const selectedRules = rules
+    .filter(rule => rule.enabled !== false && typeof rule.id === 'string')
+    .map(rule => String(rule.id))
+  const traceSeed = {
+    group_id: group.id,
+    group_version: group.version,
+    selection_source: 'admin_dry_run',
+    selected_rules: selectedRules,
+    original_model: model,
+    resolved_model: resolvedModel,
+    client_api_format: body.api_format || 'openai:chat',
+    global_candidates: [
+      {
+        candidate_kind: 'provider',
+        provider_id: 'provider-002',
+        endpoint_id: 'ep-002',
+        model_id: resolvedModel,
+        key_id: 'ekey-003',
+        ranking_vector: {
+          provider_priority_before: 0,
+          provider_priority_after: 0,
+          key_priority_before: 0,
+          key_priority_after: 0,
+        },
+        skip_reason: null,
+        selected_order: 0,
+      },
+    ],
+    pool_expansion: [],
+    runtime_facts: {
+      scheduler_mode: 'cache_affinity',
+      priority_mode: 'provider',
+    },
+  }
+  return createMockResponse({
+    group: cloneMockRoutingGroup(group),
+    policy: {
+      selected_rules: selectedRules,
+      ranking_overlay: {},
+    },
+    trace_seed: traceSeed,
+    patch_summary: { body_paths: [], header_names: [], failed_action: null },
+    mutated_body: body.body ?? { model },
+    mutated_headers: body.headers ?? {},
+    candidate_preview: {
+      status: 'policy_only',
+      ranking_overlay: {},
+      note: '演示模式候选预览',
+    },
+  })
+})
+
+registerDynamicRoute('PATCH', '/api/admin/routing/bindings/:bindingId', async (config, params) => {
+  await delay()
+  requireAdmin()
+  const index = MOCK_ROUTING_GROUP_BINDINGS.findIndex(item => item.id === params.bindingId)
+  if (index < 0) {
+    throw { response: createMockResponse({ detail: '调度绑定不存在' }, 404) }
+  }
+  const body = JSON.parse(config.data || '{}') as Partial<MockRoutingGroupBinding>
+  MOCK_ROUTING_GROUP_BINDINGS[index] = {
+    ...MOCK_ROUTING_GROUP_BINDINGS[index],
+    ...body,
+    id: MOCK_ROUTING_GROUP_BINDINGS[index].id,
+    updated_at: Math.floor(Date.now() / 1000),
+  }
+  return createMockResponse({ ...MOCK_ROUTING_GROUP_BINDINGS[index] })
+})
+
+registerDynamicRoute('DELETE', '/api/admin/routing/bindings/:bindingId', async (_config, params) => {
+  await delay()
+  requireAdmin()
+  const index = MOCK_ROUTING_GROUP_BINDINGS.findIndex(item => item.id === params.bindingId)
+  if (index < 0) {
+    throw { response: createMockResponse({ detail: '调度绑定不存在' }, 404) }
+  }
+  MOCK_ROUTING_GROUP_BINDINGS.splice(index, 1)
+  return createMockResponse({ message: '删除成功（演示模式）' })
 })
 
 // Endpoint Health 详情

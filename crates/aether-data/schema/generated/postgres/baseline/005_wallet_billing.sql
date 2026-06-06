@@ -108,6 +108,71 @@ CREATE INDEX IF NOT EXISTS idx_payment_orders_gateway_order_id ON public.payment
 CREATE INDEX IF NOT EXISTS idx_payment_orders_kind_status ON public.payment_orders USING btree (order_kind, status);
 CREATE INDEX IF NOT EXISTS idx_payment_orders_product ON public.payment_orders USING btree (product_id);
 
+CREATE TABLE IF NOT EXISTS public.user_invite_codes (
+    user_id character varying(64) NOT NULL,
+    invite_code character varying(64) NOT NULL,
+    active boolean DEFAULT true NOT NULL,
+    created_at timestamp with time zone NOT NULL,
+    updated_at timestamp with time zone NOT NULL
+);
+
+ALTER TABLE ONLY public.user_invite_codes ADD CONSTRAINT user_invite_codes_pkey PRIMARY KEY (user_id);
+ALTER TABLE ONLY public.user_invite_codes ADD CONSTRAINT user_invite_codes_invite_code_key UNIQUE (invite_code);
+ALTER TABLE ONLY public.user_invite_codes ADD CONSTRAINT user_invite_codes_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+CREATE TABLE IF NOT EXISTS public.user_referrals (
+    id character varying(64) NOT NULL,
+    inviter_user_id character varying(64) NOT NULL,
+    invitee_user_id character varying(64) NOT NULL,
+    invite_code_snapshot character varying(64) NOT NULL,
+    source_json jsonb,
+    first_paid_order_id character varying(64),
+    first_paid_at timestamp with time zone,
+    created_at timestamp with time zone NOT NULL,
+    updated_at timestamp with time zone NOT NULL
+);
+
+ALTER TABLE ONLY public.user_referrals ADD CONSTRAINT user_referrals_pkey PRIMARY KEY (id);
+ALTER TABLE ONLY public.user_referrals ADD CONSTRAINT user_referrals_invitee_user_id_key UNIQUE (invitee_user_id);
+CREATE INDEX IF NOT EXISTS idx_user_referrals_inviter ON public.user_referrals USING btree (inviter_user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_user_referrals_created ON public.user_referrals USING btree (created_at);
+CREATE INDEX IF NOT EXISTS idx_user_referrals_invite_code ON public.user_referrals USING btree (invite_code_snapshot);
+ALTER TABLE ONLY public.user_referrals ADD CONSTRAINT user_referrals_inviter_user_id_fkey FOREIGN KEY (inviter_user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+ALTER TABLE ONLY public.user_referrals ADD CONSTRAINT user_referrals_invitee_user_id_fkey FOREIGN KEY (invitee_user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+ALTER TABLE ONLY public.user_referrals ADD CONSTRAINT user_referrals_first_paid_order_fkey FOREIGN KEY (first_paid_order_id) REFERENCES public.payment_orders(id) ON DELETE SET NULL;
+
+CREATE TABLE IF NOT EXISTS public.referral_rewards (
+    id character varying(64) NOT NULL,
+    referral_id character varying(64) NOT NULL,
+    inviter_user_id character varying(64) NOT NULL,
+    invitee_user_id character varying(64) NOT NULL,
+    reward_type character varying(32) NOT NULL,
+    trigger_point character varying(64) NOT NULL,
+    source_order_id character varying(64),
+    idempotency_key character varying(128) NOT NULL,
+    amount_usd double precision NOT NULL,
+    status character varying(32) DEFAULT 'pending' NOT NULL,
+    wallet_transaction_id character varying(64),
+    reversed_amount_usd double precision DEFAULT 0 NOT NULL,
+    pending_reversal_amount_usd double precision DEFAULT 0 NOT NULL,
+    failure_reason text,
+    admin_operator_id character varying(64),
+    admin_note text,
+    created_at timestamp with time zone NOT NULL,
+    updated_at timestamp with time zone NOT NULL
+);
+
+ALTER TABLE ONLY public.referral_rewards ADD CONSTRAINT referral_rewards_pkey PRIMARY KEY (id);
+ALTER TABLE ONLY public.referral_rewards ADD CONSTRAINT referral_rewards_idempotency_key_key UNIQUE (idempotency_key);
+CREATE INDEX IF NOT EXISTS idx_referral_rewards_inviter_status ON public.referral_rewards USING btree (inviter_user_id, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_referral_rewards_inviter_created ON public.referral_rewards USING btree (inviter_user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_referral_rewards_created ON public.referral_rewards USING btree (created_at);
+CREATE INDEX IF NOT EXISTS idx_referral_rewards_source_order ON public.referral_rewards USING btree (source_order_id);
+ALTER TABLE ONLY public.referral_rewards ADD CONSTRAINT referral_rewards_referral_id_fkey FOREIGN KEY (referral_id) REFERENCES public.user_referrals(id) ON DELETE CASCADE;
+ALTER TABLE ONLY public.referral_rewards ADD CONSTRAINT referral_rewards_inviter_user_id_fkey FOREIGN KEY (inviter_user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+ALTER TABLE ONLY public.referral_rewards ADD CONSTRAINT referral_rewards_invitee_user_id_fkey FOREIGN KEY (invitee_user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+ALTER TABLE ONLY public.referral_rewards ADD CONSTRAINT referral_rewards_source_order_fkey FOREIGN KEY (source_order_id) REFERENCES public.payment_orders(id) ON DELETE SET NULL;
+
 CREATE TABLE IF NOT EXISTS public.payment_gateway_configs (
     provider character varying(64) NOT NULL,
     enabled boolean DEFAULT false NOT NULL,
@@ -200,6 +265,7 @@ CREATE TABLE IF NOT EXISTS public.entitlement_usage_ledgers (
 ALTER TABLE ONLY public.entitlement_usage_ledgers ADD CONSTRAINT entitlement_usage_ledgers_pkey PRIMARY KEY (id);
 ALTER TABLE ONLY public.entitlement_usage_ledgers ADD CONSTRAINT uq_entitlement_usage_request UNIQUE (user_entitlement_id, request_id);
 CREATE INDEX IF NOT EXISTS idx_entitlement_usage_user_date ON public.entitlement_usage_ledgers USING btree (user_id, usage_date);
+CREATE INDEX IF NOT EXISTS idx_entitlement_usage_entitlement_date ON public.entitlement_usage_ledgers USING btree (user_entitlement_id, usage_date);
 
 CREATE TABLE IF NOT EXISTS public.refund_requests (
     id character varying(64) NOT NULL,

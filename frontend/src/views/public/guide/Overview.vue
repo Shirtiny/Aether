@@ -397,7 +397,7 @@ function copyStep(stepId: string, code: string) {
           <h3>1. Aether-Proxy</h3>
           <p>Rust实现, 超小资源占有, 适合性能低的VPS直接使用。</p>
           <a
-            href="https://github.com/Shirtiny/Aether/tree/custom/aether-proxy"
+            href="https://github.com/Shirtiny/Aether/tree/custom/apps/aether-tunnel"
             target="_blank"
             rel="noopener noreferrer"
             class="text-[#cc785c] dark:text-[#d4a27f] hover:underline mt-2 inline-block"

@@ -32,7 +32,13 @@ describe('global model form embedding payload helpers', () => {
         streaming: false,
         embedding: true,
         model_type: 'embedding',
-        api_formats: ['openai:embedding', 'gemini:embedding', 'jina:embedding', 'doubao:embedding'],
+        api_formats: [
+          'openai:embedding',
+          'gemini:embedding',
+          'jina:embedding',
+          'doubao:embedding',
+          'aliyun:multimodal_embedding',
+        ],
       },
     })
   })

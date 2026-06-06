@@ -8,6 +8,7 @@ const EMBEDDING_API_FORMATS: &[&str] = &[
     "jina:embedding",
     "gemini:embedding",
     "doubao:embedding",
+    "aliyun:multimodal_embedding",
 ];
 
 fn unix_secs_to_rfc3339(unix_secs: u64) -> Option<String> {

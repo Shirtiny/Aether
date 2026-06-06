@@ -7,6 +7,8 @@ use http::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Client, Method};
 use tokio::sync::Mutex;
 
+use crate::runtime::{BenchmarkRuntimeSampler, BenchmarkRuntimeSnapshot};
+
 #[derive(Debug, Clone, Copy, Default, serde::Serialize, PartialEq, Eq)]
 pub enum HttpLoadProbeResponseMode {
     #[default]
@@ -66,12 +68,16 @@ pub struct HttpLoadProbeResult {
     pub response_mode: HttpLoadProbeResponseMode,
     pub total_requests: usize,
     pub concurrency: usize,
+    pub duration_ms: u64,
+    pub throughput_rps: u64,
+    pub p99_ms: u64,
     pub completed_requests: usize,
     pub failed_requests: usize,
     pub p50_ms: u64,
     pub p95_ms: u64,
     pub max_ms: u64,
     pub mean_ms: u64,
+    pub runtime: BenchmarkRuntimeSnapshot,
     pub status_counts: BTreeMap<u16, usize>,
 }
 
@@ -83,12 +89,16 @@ pub struct MultiUrlHttpLoadProbeResult {
     pub response_mode: HttpLoadProbeResponseMode,
     pub total_requests: usize,
     pub concurrency: usize,
+    pub duration_ms: u64,
+    pub throughput_rps: u64,
+    pub p99_ms: u64,
     pub completed_requests: usize,
     pub failed_requests: usize,
     pub p50_ms: u64,
     pub p95_ms: u64,
     pub max_ms: u64,
     pub mean_ms: u64,
+    pub runtime: BenchmarkRuntimeSnapshot,
     pub status_counts: BTreeMap<u16, usize>,
 }
 
@@ -108,12 +118,16 @@ pub async fn run_http_load_probe(
             response_mode: result.response_mode,
             total_requests: result.total_requests,
             concurrency: result.concurrency,
+            duration_ms: result.duration_ms,
+            throughput_rps: result.throughput_rps,
+            p99_ms: result.p99_ms,
             completed_requests: result.completed_requests,
             failed_requests: result.failed_requests,
             p50_ms: result.p50_ms,
             p95_ms: result.p95_ms,
             max_ms: result.max_ms,
             mean_ms: result.mean_ms,
+            runtime: result.runtime,
             status_counts: result.status_counts,
         })
 }
@@ -141,6 +155,8 @@ async fn run_http_load_probe_against_urls(
     let request_headers = build_headers(&config.headers)?;
     let request_body = config.body.clone().map(Arc::new);
     let response_mode = config.response_mode;
+    let mut runtime_sampler = BenchmarkRuntimeSampler::new();
+    let started_at = Instant::now();
 
     let next_request = Arc::new(AtomicUsize::new(0));
     let latencies_ms = Arc::new(Mutex::new(Vec::with_capacity(config.total_requests)));
@@ -220,7 +236,13 @@ async fn run_http_load_probe_against_urls(
     let target_request_counts = target_request_counts.lock().await.clone();
     let mut latencies = latencies_ms.lock().await.clone();
     latencies.sort_unstable();
-    let (p50_ms, p95_ms, max_ms, mean_ms) = summarize_latencies(&latencies);
+    let (p50_ms, p95_ms, p99_ms, max_ms, mean_ms) = summarize_latencies(&latencies);
+    let duration_ms = started_at.elapsed().as_millis() as u64;
+    let throughput_rps = if duration_ms == 0 {
+        completed_requests.load(Ordering::Acquire) as u64
+    } else {
+        ((completed_requests.load(Ordering::Acquire) as u64) * 1_000) / duration_ms.max(1)
+    };
 
     Ok(MultiUrlHttpLoadProbeResult {
         target_urls: urls.to_vec(),
@@ -229,12 +251,16 @@ async fn run_http_load_probe_against_urls(
         response_mode: config.response_mode,
         total_requests: config.total_requests,
         concurrency: config.concurrency,
+        duration_ms,
+        throughput_rps,
+        p99_ms,
         completed_requests: completed_requests.load(Ordering::Acquire),
         failed_requests: failed_requests.load(Ordering::Acquire),
         p50_ms,
         p95_ms,
         max_ms,
         mean_ms,
+        runtime: runtime_sampler.snapshot(),
         status_counts,
     })
 }
@@ -251,16 +277,17 @@ fn build_headers(headers: &BTreeMap<String, String>) -> Result<HeaderMap, String
     Ok(result)
 }
 
-fn summarize_latencies(latencies: &[u64]) -> (u64, u64, u64, u64) {
+fn summarize_latencies(latencies: &[u64]) -> (u64, u64, u64, u64, u64) {
     if latencies.is_empty() {
-        return (0, 0, 0, 0);
+        return (0, 0, 0, 0, 0);
     }
 
     let max_ms = *latencies.last().unwrap_or(&0);
     let mean_ms = latencies.iter().sum::<u64>() / latencies.len() as u64;
     let p50_ms = percentile(latencies, 50);
     let p95_ms = percentile(latencies, 95);
-    (p50_ms, p95_ms, max_ms, mean_ms)
+    let p99_ms = percentile(latencies, 99);
+    (p50_ms, p95_ms, p99_ms, max_ms, mean_ms)
 }
 
 fn percentile(latencies: &[u64], percentile: u8) -> u64 {
@@ -311,10 +338,11 @@ mod tests {
 
     #[test]
     fn summarizes_latency_distribution() {
-        let (p50_ms, p95_ms, max_ms, mean_ms) =
+        let (p50_ms, p95_ms, p99_ms, max_ms, mean_ms) =
             summarize_latencies(&[10, 20, 30, 40, 50, 60, 70, 80, 90, 100]);
         assert_eq!(p50_ms, 60);
         assert_eq!(p95_ms, 100);
+        assert_eq!(p99_ms, 100);
         assert_eq!(max_ms, 100);
         assert_eq!(mean_ms, 55);
     }

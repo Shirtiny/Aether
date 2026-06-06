@@ -29,7 +29,7 @@ pub(crate) struct LocalStandardSyncAttemptSource<'a> {
     state: &'a AppState,
     parts: &'a http::request::Parts,
     trace_id: &'a str,
-    body_json: &'a serde_json::Value,
+    body_json: serde_json::Value,
     input: LocalStandardDecisionInput,
     spec: LocalStandardSpec,
     requested_model_family: RequestedModelFamily,
@@ -40,7 +40,7 @@ pub(crate) struct LocalStandardStreamAttemptSource<'a> {
     state: &'a AppState,
     parts: &'a http::request::Parts,
     trace_id: &'a str,
-    body_json: &'a serde_json::Value,
+    body_json: serde_json::Value,
     input: LocalStandardDecisionInput,
     spec: LocalStandardSpec,
     requested_model_family: RequestedModelFamily,
@@ -61,7 +61,7 @@ pub(crate) async fn build_local_sync_attempt_source<'a>(
         .expect("standard spec metadata should include requested-model family");
     let Some(input) =
         resolve_local_standard_decision_input(state, parts, trace_id, decision, body_json, spec)
-            .await
+            .await?
     else {
         set_local_runtime_miss_diagnostic_reason(
             state,
@@ -82,9 +82,15 @@ pub(crate) async fn build_local_sync_attempt_source<'a>(
         Some(input.requested_model.as_str()),
         "candidate_evaluation_incomplete",
     );
-    let (candidates, candidate_count) =
-        build_local_standard_candidate_attempt_source(state, trace_id, &input, body_json, spec)
-            .await?;
+    let effective_body_json = input.effective_body_json(body_json).clone();
+    let (candidates, candidate_count) = build_local_standard_candidate_attempt_source(
+        state,
+        trace_id,
+        &input,
+        &effective_body_json,
+        spec,
+    )
+    .await?;
     apply_local_runtime_candidate_evaluation_progress(state, trace_id, candidate_count);
     if candidate_count == 0 {
         return Ok(None);
@@ -95,7 +101,7 @@ pub(crate) async fn build_local_sync_attempt_source<'a>(
             state,
             parts,
             trace_id,
-            body_json,
+            body_json: effective_body_json,
             input,
             spec,
             requested_model_family,
@@ -119,7 +125,7 @@ pub(crate) async fn build_local_stream_attempt_source<'a>(
         .expect("standard spec metadata should include requested-model family");
     let Some(input) =
         resolve_local_standard_decision_input(state, parts, trace_id, decision, body_json, spec)
-            .await
+            .await?
     else {
         set_local_runtime_miss_diagnostic_reason(
             state,
@@ -140,9 +146,15 @@ pub(crate) async fn build_local_stream_attempt_source<'a>(
         Some(input.requested_model.as_str()),
         "candidate_evaluation_incomplete",
     );
-    let (candidates, candidate_count) =
-        build_local_standard_candidate_attempt_source(state, trace_id, &input, body_json, spec)
-            .await?;
+    let effective_body_json = input.effective_body_json(body_json).clone();
+    let (candidates, candidate_count) = build_local_standard_candidate_attempt_source(
+        state,
+        trace_id,
+        &input,
+        &effective_body_json,
+        spec,
+    )
+    .await?;
     apply_local_runtime_candidate_evaluation_progress(state, trace_id, candidate_count);
     if candidate_count == 0 {
         return Ok(None);
@@ -153,7 +165,7 @@ pub(crate) async fn build_local_stream_attempt_source<'a>(
             state,
             parts,
             trace_id,
-            body_json,
+            body_json: effective_body_json,
             input,
             spec,
             requested_model_family,
@@ -228,19 +240,19 @@ impl LocalStandardSyncAttemptSource<'_> {
             self.state,
             self.parts,
             self.trace_id,
-            self.body_json,
+            &self.body_json,
             &self.input,
             attempt,
             self.spec,
         )
-        .await
+        .await?
         else {
             return Ok(None);
         };
         match build_sync_plan_from_requested_model_family(
             self.requested_model_family,
             self.parts,
-            self.body_json,
+            &self.body_json,
             payload,
         ) {
             Ok(value) => Ok(value),
@@ -265,19 +277,19 @@ impl LocalStandardStreamAttemptSource<'_> {
             self.state,
             self.parts,
             self.trace_id,
-            self.body_json,
+            &self.body_json,
             &self.input,
             attempt,
             self.spec,
         )
-        .await
+        .await?
         else {
             return Ok(None);
         };
         match build_stream_plan_from_requested_model_family(
             self.requested_model_family,
             self.parts,
-            self.body_json,
+            &self.body_json,
             payload,
         ) {
             Ok(value) => Ok(value),
@@ -309,7 +321,7 @@ pub(crate) async fn maybe_build_sync_via_standard_family_payload(
 
     let Some(input) =
         resolve_local_standard_decision_input(state, parts, trace_id, decision, body_json, spec)
-            .await
+            .await?
     else {
         return Ok(None);
     };
@@ -322,6 +334,7 @@ pub(crate) async fn maybe_build_sync_via_standard_family_payload(
         Some(input.requested_model.as_str()),
         "candidate_evaluation_incomplete",
     );
+    let body_json = input.effective_body_json(body_json);
     let (mut source, candidate_count) =
         build_local_standard_candidate_attempt_source(state, trace_id, &input, body_json, spec)
             .await?;
@@ -331,7 +344,7 @@ pub(crate) async fn maybe_build_sync_via_standard_family_payload(
         if let Some(payload) = maybe_build_local_standard_decision_payload_for_candidate(
             state, parts, trace_id, body_json, &input, attempt, spec,
         )
-        .await
+        .await?
         {
             return Ok(Some(payload));
         }
@@ -358,7 +371,7 @@ pub(crate) async fn maybe_build_stream_via_standard_family_payload(
 
     let Some(input) =
         resolve_local_standard_decision_input(state, parts, trace_id, decision, body_json, spec)
-            .await
+            .await?
     else {
         return Ok(None);
     };
@@ -371,6 +384,7 @@ pub(crate) async fn maybe_build_stream_via_standard_family_payload(
         Some(input.requested_model.as_str()),
         "candidate_evaluation_incomplete",
     );
+    let body_json = input.effective_body_json(body_json);
     let (mut source, candidate_count) =
         build_local_standard_candidate_attempt_source(state, trace_id, &input, body_json, spec)
             .await?;
@@ -380,7 +394,7 @@ pub(crate) async fn maybe_build_stream_via_standard_family_payload(
         if let Some(payload) = maybe_build_local_standard_decision_payload_for_candidate(
             state, parts, trace_id, body_json, &input, attempt, spec,
         )
-        .await
+        .await?
         {
             return Ok(Some(payload));
         }
@@ -405,7 +419,7 @@ pub(crate) async fn build_local_sync_plan_and_reports(
         .expect("standard spec metadata should include requested-model family");
     let Some(input) =
         resolve_local_standard_decision_input(state, parts, trace_id, decision, body_json, spec)
-            .await
+            .await?
     else {
         set_local_runtime_miss_diagnostic_reason(
             state,
@@ -426,6 +440,7 @@ pub(crate) async fn build_local_sync_plan_and_reports(
         Some(input.requested_model.as_str()),
         "candidate_evaluation_incomplete",
     );
+    let body_json = input.effective_body_json(body_json);
     let (mut source, candidate_count) =
         build_local_standard_candidate_attempt_source(state, trace_id, &input, body_json, spec)
             .await?;
@@ -438,7 +453,7 @@ pub(crate) async fn build_local_sync_plan_and_reports(
         let Some(payload) = maybe_build_local_standard_decision_payload_for_candidate(
             state, parts, trace_id, body_json, &input, attempt, spec,
         )
-        .await
+        .await?
         else {
             continue;
         };
@@ -479,7 +494,7 @@ pub(crate) async fn build_local_stream_plan_and_reports(
         .expect("standard spec metadata should include requested-model family");
     let Some(input) =
         resolve_local_standard_decision_input(state, parts, trace_id, decision, body_json, spec)
-            .await
+            .await?
     else {
         set_local_runtime_miss_diagnostic_reason(
             state,
@@ -500,6 +515,7 @@ pub(crate) async fn build_local_stream_plan_and_reports(
         Some(input.requested_model.as_str()),
         "candidate_evaluation_incomplete",
     );
+    let body_json = input.effective_body_json(body_json);
     let (mut source, candidate_count) =
         build_local_standard_candidate_attempt_source(state, trace_id, &input, body_json, spec)
             .await?;
@@ -512,7 +528,7 @@ pub(crate) async fn build_local_stream_plan_and_reports(
         let Some(payload) = maybe_build_local_standard_decision_payload_for_candidate(
             state, parts, trace_id, body_json, &input, attempt, spec,
         )
-        .await
+        .await?
         else {
             continue;
         };

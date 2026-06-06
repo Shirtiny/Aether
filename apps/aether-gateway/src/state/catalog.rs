@@ -284,20 +284,30 @@ impl AppState {
         &self,
         record: &global_models::UpsertAdminProviderModelRecord,
     ) -> Result<Option<global_models::StoredAdminProviderModel>, GatewayError> {
-        self.data
+        let created = self
+            .data
             .create_admin_provider_model(record)
             .await
-            .map_err(|err| GatewayError::Internal(err.to_string()))
+            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+        if created.is_some() {
+            self.invalidate_provider_routing_caches();
+        }
+        Ok(created)
     }
 
     pub(crate) async fn update_admin_provider_model(
         &self,
         record: &global_models::UpsertAdminProviderModelRecord,
     ) -> Result<Option<global_models::StoredAdminProviderModel>, GatewayError> {
-        self.data
+        let updated = self
+            .data
             .update_admin_provider_model(record)
             .await
-            .map_err(|err| GatewayError::Internal(err.to_string()))
+            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+        if updated.is_some() {
+            self.invalidate_provider_routing_caches();
+        }
+        Ok(updated)
     }
 
     pub(crate) async fn delete_admin_provider_model(
@@ -305,40 +315,60 @@ impl AppState {
         provider_id: &str,
         model_id: &str,
     ) -> Result<bool, GatewayError> {
-        self.data
+        let deleted = self
+            .data
             .delete_admin_provider_model(provider_id, model_id)
             .await
-            .map_err(|err| GatewayError::Internal(err.to_string()))
+            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+        if deleted {
+            self.invalidate_provider_routing_caches();
+        }
+        Ok(deleted)
     }
 
     pub(crate) async fn create_admin_global_model(
         &self,
         record: &global_models::CreateAdminGlobalModelRecord,
     ) -> Result<Option<global_models::StoredAdminGlobalModel>, GatewayError> {
-        self.data
+        let created = self
+            .data
             .create_admin_global_model(record)
             .await
-            .map_err(|err| GatewayError::Internal(err.to_string()))
+            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+        if created.is_some() {
+            self.invalidate_provider_routing_caches();
+        }
+        Ok(created)
     }
 
     pub(crate) async fn update_admin_global_model(
         &self,
         record: &global_models::UpdateAdminGlobalModelRecord,
     ) -> Result<Option<global_models::StoredAdminGlobalModel>, GatewayError> {
-        self.data
+        let updated = self
+            .data
             .update_admin_global_model(record)
             .await
-            .map_err(|err| GatewayError::Internal(err.to_string()))
+            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+        if updated.is_some() {
+            self.invalidate_provider_routing_caches();
+        }
+        Ok(updated)
     }
 
     pub(crate) async fn delete_admin_global_model(
         &self,
         global_model_id: &str,
     ) -> Result<bool, GatewayError> {
-        self.data
+        let deleted = self
+            .data
             .delete_admin_global_model(global_model_id)
             .await
-            .map_err(|err| GatewayError::Internal(err.to_string()))
+            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+        if deleted {
+            self.invalidate_provider_routing_caches();
+        }
+        Ok(deleted)
     }
 
     pub(crate) async fn list_provider_model_stats(
@@ -425,6 +455,17 @@ impl AppState {
     ) -> Result<Vec<provider_catalog::StoredProviderCatalogKey>, GatewayError> {
         self.data
             .list_provider_catalog_key_summaries_by_provider_ids(provider_ids)
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))
+    }
+
+    pub(crate) async fn list_provider_catalog_key_maintenance_summaries_by_provider_ids(
+        &self,
+        provider_ids: &[String],
+    ) -> Result<Vec<provider_catalog::StoredProviderCatalogKeyMaintenanceSummary>, GatewayError>
+    {
+        self.data
+            .list_provider_catalog_key_maintenance_summaries_by_provider_ids(provider_ids)
             .await
             .map_err(|err| GatewayError::Internal(err.to_string()))
     }
@@ -611,6 +652,21 @@ impl AppState {
             .map_err(|err| GatewayError::Internal(err.to_string()))?;
         if updated.is_some() {
             self.invalidate_provider_routing_caches();
+        }
+        Ok(updated)
+    }
+
+    pub(crate) async fn update_provider_catalog_key_runtime_state(
+        &self,
+        key: &provider_catalog::StoredProviderCatalogKey,
+    ) -> Result<Option<provider_catalog::StoredProviderCatalogKey>, GatewayError> {
+        let updated = self
+            .data
+            .update_provider_catalog_key(key)
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+        if updated.is_some() {
+            self.invalidate_provider_health_routing_caches();
         }
         Ok(updated)
     }
@@ -806,7 +862,7 @@ impl AppState {
             .await
             .map_err(|err| GatewayError::Internal(err.to_string()))?;
         if updated {
-            self.invalidate_provider_routing_caches();
+            self.invalidate_provider_health_routing_caches();
         }
         Ok(updated)
     }
@@ -814,13 +870,30 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
     use std::time::Duration;
 
-    use aether_data::repository::provider_catalog::InMemoryProviderCatalogReadRepository;
+    use aether_data::repository::{
+        global_models::InMemoryGlobalModelReadRepository,
+        provider_catalog::InMemoryProviderCatalogReadRepository,
+    };
+    use aether_data::DataLayerError;
+    use aether_data_contracts::repository::candidate_selection::{
+        MinimalCandidateSelectionReadRepository, StoredMinimalCandidateSelectionRow,
+        StoredPoolKeyCandidateRowsByKeyIdsQuery, StoredPoolKeyCandidateRowsQuery,
+        StoredRequestedModelCandidateRowsQuery,
+    };
+    use aether_data_contracts::repository::global_models::{
+        CreateAdminGlobalModelRecord, StoredAdminGlobalModel, UpdateAdminGlobalModelRecord,
+        UpsertAdminProviderModelRecord,
+    };
     use aether_data_contracts::repository::provider_catalog::{
         StoredProviderCatalogEndpoint, StoredProviderCatalogKey, StoredProviderCatalogProvider,
     };
+    use async_trait::async_trait;
 
     use crate::cache::SchedulerAffinityTarget;
     use crate::data::GatewayDataState;
@@ -869,6 +942,195 @@ mod tests {
             true,
         )
         .expect("key should build")
+    }
+
+    fn sample_admin_global_model() -> StoredAdminGlobalModel {
+        StoredAdminGlobalModel::new(
+            "global-1".to_string(),
+            "gpt-5".to_string(),
+            "GPT 5".to_string(),
+            true,
+            None,
+            None,
+            None,
+            None,
+            0,
+            0,
+            0,
+            Some(1_711_000_000),
+            Some(1_711_000_000),
+        )
+        .expect("global model should build")
+    }
+
+    fn sample_provider_model_record(
+        id: &str,
+        global_model_id: &str,
+        is_active: bool,
+    ) -> UpsertAdminProviderModelRecord {
+        UpsertAdminProviderModelRecord::new(
+            id.to_string(),
+            "provider-1".to_string(),
+            global_model_id.to_string(),
+            "gpt-5-upstream".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(true),
+            None,
+            None,
+            is_active,
+            true,
+            None,
+        )
+        .expect("provider model record should build")
+    }
+
+    #[derive(Debug, Default)]
+    struct ClearCountingCandidateSelectionReadRepository {
+        clear_count: AtomicUsize,
+    }
+
+    impl ClearCountingCandidateSelectionReadRepository {
+        fn clear_count(&self) -> usize {
+            self.clear_count.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl MinimalCandidateSelectionReadRepository for ClearCountingCandidateSelectionReadRepository {
+        fn clear_local_cache(&self) {
+            self.clear_count.fetch_add(1, Ordering::SeqCst);
+        }
+
+        async fn list_for_exact_api_format(
+            &self,
+            _api_format: &str,
+        ) -> Result<Vec<StoredMinimalCandidateSelectionRow>, DataLayerError> {
+            Ok(Vec::new())
+        }
+
+        async fn list_for_exact_api_format_and_global_model(
+            &self,
+            _api_format: &str,
+            _global_model_name: &str,
+        ) -> Result<Vec<StoredMinimalCandidateSelectionRow>, DataLayerError> {
+            Ok(Vec::new())
+        }
+
+        async fn list_for_exact_api_format_and_requested_model(
+            &self,
+            _api_format: &str,
+            _requested_model_name: &str,
+        ) -> Result<Vec<StoredMinimalCandidateSelectionRow>, DataLayerError> {
+            Ok(Vec::new())
+        }
+
+        async fn list_for_exact_api_format_and_requested_model_page(
+            &self,
+            _query: &StoredRequestedModelCandidateRowsQuery,
+        ) -> Result<Vec<StoredMinimalCandidateSelectionRow>, DataLayerError> {
+            Ok(Vec::new())
+        }
+
+        async fn list_pool_key_rows_for_group(
+            &self,
+            _query: &StoredPoolKeyCandidateRowsQuery,
+        ) -> Result<Vec<StoredMinimalCandidateSelectionRow>, DataLayerError> {
+            Ok(Vec::new())
+        }
+
+        async fn list_pool_key_rows_for_group_key_ids(
+            &self,
+            _query: &StoredPoolKeyCandidateRowsByKeyIdsQuery,
+        ) -> Result<Vec<StoredMinimalCandidateSelectionRow>, DataLayerError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_model_writes_invalidate_candidate_selection_cache() {
+        let candidate_repository =
+            Arc::new(ClearCountingCandidateSelectionReadRepository::default());
+        let global_model_repository = Arc::new(
+            InMemoryGlobalModelReadRepository::seed(Vec::new())
+                .with_admin_global_models(vec![sample_admin_global_model()]),
+        );
+        let state = AppState::new()
+            .expect("app state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_minimal_candidate_selection_reader_for_tests(
+                    candidate_repository.clone(),
+                )
+                .with_global_model_repository_for_tests(global_model_repository),
+            );
+
+        assert_eq!(candidate_repository.clear_count(), 0);
+
+        let provider_model = sample_provider_model_record("model-1", "global-1", true);
+        state
+            .create_admin_provider_model(&provider_model)
+            .await
+            .expect("provider model create should succeed")
+            .expect("provider model should create");
+        assert_eq!(candidate_repository.clear_count(), 1);
+
+        let disabled_provider_model = sample_provider_model_record("model-1", "global-1", false);
+        state
+            .update_admin_provider_model(&disabled_provider_model)
+            .await
+            .expect("provider model update should succeed")
+            .expect("provider model should update");
+        assert_eq!(candidate_repository.clear_count(), 2);
+
+        assert!(state
+            .delete_admin_provider_model("provider-1", "model-1")
+            .await
+            .expect("provider model delete should succeed"));
+        assert_eq!(candidate_repository.clear_count(), 3);
+
+        let created_global_model = CreateAdminGlobalModelRecord::new(
+            "global-2".to_string(),
+            "gpt-4.1".to_string(),
+            "GPT 4.1".to_string(),
+            true,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("global model create record should build");
+        state
+            .create_admin_global_model(&created_global_model)
+            .await
+            .expect("global model create should succeed")
+            .expect("global model should create");
+        assert_eq!(candidate_repository.clear_count(), 4);
+
+        let disabled_global_model = UpdateAdminGlobalModelRecord::new(
+            "global-1".to_string(),
+            "GPT 5".to_string(),
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("global model update record should build");
+        state
+            .update_admin_global_model(&disabled_global_model)
+            .await
+            .expect("global model update should succeed")
+            .expect("global model should update");
+        assert_eq!(candidate_repository.clear_count(), 5);
+
+        assert!(state
+            .delete_admin_global_model("global-2")
+            .await
+            .expect("global model delete should succeed"));
+        assert_eq!(candidate_repository.clear_count(), 6);
     }
 
     #[tokio::test]
@@ -929,5 +1191,48 @@ mod tests {
             .expect("provider transport should read after update")
             .expect("provider transport should exist after update");
         assert!(snapshot.provider.keep_priority_on_conversion);
+    }
+
+    #[tokio::test]
+    async fn provider_catalog_health_update_keeps_scheduler_affinity_cache() {
+        let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![sample_provider()],
+            vec![sample_endpoint()],
+            vec![sample_key()],
+        ));
+        let state = AppState::new()
+            .expect("app state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(repository)
+                    .with_encryption_key_for_tests("test-encryption-key"),
+            );
+
+        let cache_key = "scheduler_affinity:api-key-1:openai:chat:gpt-5";
+        let ttl = Duration::from_secs(300);
+        let target = SchedulerAffinityTarget {
+            provider_id: "provider-1".to_string(),
+            endpoint_id: "endpoint-1".to_string(),
+            key_id: "key-1".to_string(),
+        };
+        state.remember_scheduler_affinity_target(cache_key, target.clone(), ttl, 128);
+        let initial_epoch = state.scheduler_affinity_epoch();
+
+        let health_by_format = serde_json::json!({
+            "openai:chat": {
+                "last_success_at_unix_secs": 1,
+                "consecutive_failures": 0
+            }
+        });
+        let updated = state
+            .update_provider_catalog_key_health_state("key-1", true, Some(&health_by_format), None)
+            .await
+            .expect("key health update should succeed");
+
+        assert!(updated);
+        assert_eq!(state.scheduler_affinity_epoch(), initial_epoch);
+        assert_eq!(
+            state.read_scheduler_affinity_target(cache_key, ttl),
+            Some(target)
+        );
     }
 }

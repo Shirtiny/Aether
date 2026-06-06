@@ -1,4 +1,6 @@
 use aether_data::{DataBackends, DataLayerError, DatabaseDriver};
+use aether_data_contracts::repository::candidate_selection::MinimalCandidateSelectionReadRepository;
+use aether_data_contracts::repository::provider_catalog::ProviderCatalogReadRepository;
 use aether_runtime_state::RuntimeQueueStore;
 use std::sync::Arc;
 
@@ -49,6 +51,8 @@ impl GatewayDataState {
                 pool_score_writer: None,
                 provider_quota_reader: None,
                 provider_quota_writer: None,
+                routing_group_reader: None,
+                routing_group_writer: None,
                 usage_reader: None,
                 usage_writer: None,
                 user_reader: None,
@@ -82,16 +86,32 @@ impl GatewayDataState {
         let gemini_file_mapping_reader = backends.read().gemini_file_mappings();
         let global_model_reader = backends.read().global_models();
         let global_model_writer = backends.write().global_models();
-        let minimal_candidate_selection_reader = backends.read().minimal_candidate_selection();
+        let minimal_candidate_selection_reader =
+            backends
+                .read()
+                .minimal_candidate_selection()
+                .map(|repository| {
+                    Arc::new(
+                        super::candidate_cache::CachedMinimalCandidateSelectionReadRepository::new(
+                            repository,
+                        ),
+                    ) as Arc<dyn MinimalCandidateSelectionReadRepository>
+                });
         let request_candidate_reader = backends.read().request_candidates();
         let request_candidate_writer = backends.write().request_candidates();
         let gemini_file_mapping_writer = backends.write().gemini_file_mappings();
-        let provider_catalog_reader = backends.read().provider_catalog();
+        let provider_catalog_reader = backends.read().provider_catalog().map(|repository| {
+            Arc::new(
+                super::provider_catalog_cache::CachedProviderCatalogReadRepository::new(repository),
+            ) as Arc<dyn ProviderCatalogReadRepository>
+        });
         let provider_catalog_writer = backends.write().provider_catalog();
         let pool_score_reader = backends.read().pool_scores();
         let pool_score_writer = backends.write().pool_scores();
         let provider_quota_reader = backends.read().provider_quotas();
         let provider_quota_writer = backends.write().provider_quotas();
+        let routing_group_reader = backends.read().routing_groups();
+        let routing_group_writer = backends.write().routing_groups();
         let usage_reader = backends.read().usage();
         let usage_writer = backends.write().usage();
         let user_reader = backends.read().users();
@@ -133,6 +153,8 @@ impl GatewayDataState {
             pool_score_writer,
             provider_quota_reader,
             provider_quota_writer,
+            routing_group_reader,
+            routing_group_writer,
             usage_reader,
             usage_writer,
             user_reader,
@@ -253,12 +275,32 @@ impl GatewayDataState {
         self.minimal_candidate_selection_reader.is_some()
     }
 
+    pub(crate) fn clear_minimal_candidate_selection_cache(&self) {
+        if let Some(repository) = &self.minimal_candidate_selection_reader {
+            repository.clear_local_cache();
+        }
+    }
+
+    pub(crate) fn clear_provider_catalog_cache(&self) {
+        if let Some(repository) = &self.provider_catalog_reader {
+            repository.clear_local_cache();
+        }
+    }
+
     pub(crate) fn has_request_candidate_reader(&self) -> bool {
         self.request_candidate_reader.is_some()
     }
 
     pub(crate) fn has_request_candidate_writer(&self) -> bool {
         self.request_candidate_writer.is_some()
+    }
+
+    pub(crate) fn has_routing_group_reader(&self) -> bool {
+        self.routing_group_reader.is_some()
+    }
+
+    pub(crate) fn has_routing_group_writer(&self) -> bool {
+        self.routing_group_writer.is_some()
     }
 
     pub(crate) fn has_provider_catalog_reader(&self) -> bool {
@@ -313,6 +355,10 @@ impl GatewayDataState {
 
     pub(crate) fn has_usage_writer(&self) -> bool {
         self.usage_writer.is_some()
+    }
+
+    pub(crate) fn has_usage_counter_flush_backend(&self) -> bool {
+        self.has_usage_writer() && self.database_driver() == Some(DatabaseDriver::Postgres)
     }
 
     pub(crate) fn has_usage_worker_queue(&self) -> bool {
@@ -473,6 +519,45 @@ impl GatewayDataState {
         match self.backends.as_ref() {
             Some(backends) => backends.purge_admin_system_data(target).await,
             None => Ok(aether_data::repository::system::AdminSystemPurgeSummary::default()),
+        }
+    }
+
+    pub(crate) async fn export_admin_system_usage_aggregates(
+        &self,
+    ) -> Result<aether_data::repository::system::AdminSystemUsageAggregateSnapshot, DataLayerError>
+    {
+        match self.backends.as_ref() {
+            Some(backends) => backends.export_admin_system_usage_aggregates().await,
+            None => {
+                Ok(aether_data::repository::system::AdminSystemUsageAggregateSnapshot::default())
+            }
+        }
+    }
+
+    pub(crate) async fn import_admin_system_usage_aggregates(
+        &self,
+        snapshot: &aether_data::repository::system::AdminSystemUsageAggregateSnapshot,
+        user_id_map: &std::collections::BTreeMap<String, String>,
+        api_key_id_map: &std::collections::BTreeMap<String, String>,
+        mode: aether_data::repository::system::AdminSystemUsageAggregateImportMode,
+    ) -> Result<
+        aether_data::repository::system::AdminSystemUsageAggregateImportSummary,
+        DataLayerError,
+    > {
+        match self.backends.as_ref() {
+            Some(backends) => {
+                backends
+                    .import_admin_system_usage_aggregates(
+                        snapshot,
+                        user_id_map,
+                        api_key_id_map,
+                        mode,
+                    )
+                    .await
+            }
+            None => Ok(
+                aether_data::repository::system::AdminSystemUsageAggregateImportSummary::default(),
+            ),
         }
     }
 

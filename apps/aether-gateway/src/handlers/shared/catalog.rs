@@ -1,7 +1,7 @@
 use crate::handlers::shared::{json_string_list, unix_secs_to_rfc3339};
 use crate::provider_key_auth::{
-    provider_key_auth_semantics, provider_key_configured_api_formats,
-    provider_key_inherits_provider_api_formats,
+    provider_key_auth_semantics, provider_key_can_refresh_oauth,
+    provider_key_configured_api_formats, provider_key_inherits_provider_api_formats,
 };
 use crate::AppState;
 use aether_admin::provider::quota as admin_provider_quota_pure;
@@ -10,6 +10,10 @@ use aether_admin::provider::status as admin_provider_status_pure;
 use aether_crypto::DEVELOPMENT_ENCRYPTION_KEY;
 use aether_crypto::{decrypt_python_fernet_ciphertext, encrypt_python_fernet_plaintext};
 use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey;
+use aether_provider_pool::{
+    grok_pool_tier_from_quota_bucket, grok_supported_quota_windows_for_tier,
+};
+use aether_scheduler_core::provider_key_circuit_payload_is_active_open_at;
 use serde_json::{json, Map, Value};
 use std::borrow::Cow;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -435,25 +439,51 @@ fn chatgpt_web_image_quota_limit(
     metadata: &Map<String, Value>,
     remaining: Option<f64>,
 ) -> Option<f64> {
+    let explicit_limit = metadata
+        .get("image_quota_total")
+        .and_then(admin_provider_quota_pure::coerce_json_f64)
+        .filter(|value| *value > 0.0);
     let plan_type = metadata
         .get("plan_type")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(|value| value.to_ascii_lowercase());
-    if plan_type.as_deref() == Some("free") {
-        return Some(25.0);
-    }
-
-    let explicit_limit = metadata
-        .get("image_quota_total")
-        .and_then(admin_provider_quota_pure::coerce_json_f64)
-        .filter(|value| *value > 0.0);
+    let limit_source = metadata
+        .get("image_quota_limit_source")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
     if let Some(limit) = explicit_limit {
-        return Some(limit);
+        if !chatgpt_web_image_quota_limit_is_legacy_free_default(
+            limit,
+            limit_source,
+            plan_type.as_deref(),
+            remaining,
+        ) {
+            return Some(limit);
+        }
     }
 
     remaining.filter(|value| *value > 0.0)
+}
+
+fn chatgpt_web_image_quota_limit_is_legacy_free_default(
+    limit: f64,
+    limit_source: Option<&str>,
+    plan_type: Option<&str>,
+    remaining: Option<f64>,
+) -> bool {
+    let plan_type_is_free = plan_type
+        .map(str::trim)
+        .is_some_and(|value| value.eq_ignore_ascii_case("free"));
+    if !plan_type_is_free || limit_source.is_some() {
+        return false;
+    }
+    if (limit - 25.0).abs() > f64::EPSILON {
+        return false;
+    }
+    remaining.is_none_or(|value| value < limit)
 }
 
 fn model_quota_window_snapshot(
@@ -461,6 +491,24 @@ fn model_quota_window_snapshot(
     item: &Map<String, Value>,
     observed_at_unix_secs: Option<u64>,
 ) -> Option<Value> {
+    let remaining_value = item
+        .get("remaining")
+        .or_else(|| item.get("remaining_value"))
+        .and_then(admin_provider_quota_pure::coerce_json_f64);
+    let limit_value = item
+        .get("total")
+        .or_else(|| item.get("limit_value"))
+        .and_then(admin_provider_quota_pure::coerce_json_f64)
+        .filter(|value| *value > 0.0);
+    let used_value = item
+        .get("used")
+        .or_else(|| item.get("used_value"))
+        .and_then(admin_provider_quota_pure::coerce_json_f64)
+        .or_else(|| {
+            remaining_value
+                .zip(limit_value)
+                .map(|(remaining, limit)| (limit - remaining).max(0.0))
+        });
     let used_ratio = item
         .get("used_percent")
         .and_then(admin_provider_quota_pure::coerce_json_f64)
@@ -489,6 +537,8 @@ fn model_quota_window_snapshot(
         && reset_at.is_none()
         && reset_seconds.is_none()
         && is_exhausted.is_none()
+        && remaining_value.is_none()
+        && limit_value.is_none()
     {
         return None;
     }
@@ -507,10 +557,73 @@ fn model_quota_window_snapshot(
     window.insert("model".to_string(), json!(model_name));
     window.insert("used_ratio".to_string(), json!(used_ratio));
     window.insert("remaining_ratio".to_string(), json!(remaining_ratio));
+    window.insert("used_value".to_string(), json!(used_value));
+    window.insert("remaining_value".to_string(), json!(remaining_value));
+    window.insert("limit_value".to_string(), json!(limit_value));
     window.insert("reset_at".to_string(), json!(reset_at));
     window.insert("reset_seconds".to_string(), json!(reset_seconds));
     window.insert("is_exhausted".to_string(), json!(is_exhausted));
     Some(Value::Object(window))
+}
+
+fn provider_quota_metadata_string(
+    metadata: &Map<String, Value>,
+    fields: &[&str],
+) -> Option<String> {
+    fields.iter().find_map(|field| {
+        metadata
+            .get(*field)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    })
+}
+
+fn provider_quota_metadata_value_by_path<'a>(
+    metadata: &'a Map<String, Value>,
+    path: &[&str],
+) -> Option<&'a Value> {
+    let (first, rest) = path.split_first()?;
+    let mut current = metadata.get(*first)?;
+    for segment in rest {
+        current = current.as_object()?.get(*segment)?;
+    }
+    Some(current)
+}
+
+fn provider_quota_metadata_number_by_paths(
+    metadata: &Map<String, Value>,
+    paths: &[&[&str]],
+) -> Option<f64> {
+    paths.iter().find_map(|path| {
+        provider_quota_metadata_value_by_path(metadata, path)
+            .and_then(admin_provider_quota_pure::coerce_json_f64)
+            .filter(|value| value.is_finite())
+    })
+}
+
+fn provider_quota_metadata_bool_by_paths(
+    metadata: &Map<String, Value>,
+    paths: &[&[&str]],
+) -> Option<bool> {
+    paths.iter().find_map(|path| {
+        provider_quota_metadata_value_by_path(metadata, path)
+            .and_then(admin_provider_quota_pure::coerce_json_bool)
+    })
+}
+
+fn provider_quota_metadata_string_by_paths(
+    metadata: &Map<String, Value>,
+    paths: &[&[&str]],
+) -> Option<String> {
+    paths.iter().find_map(|path| {
+        provider_quota_metadata_value_by_path(metadata, path)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    })
 }
 
 fn quota_windows_usage_ratio(windows: &[Value]) -> Option<f64> {
@@ -1046,6 +1159,278 @@ fn build_chatgpt_web_quota_status_snapshot(
     }))
 }
 
+fn windsurf_percent_quota_window_snapshot(
+    metadata: &Map<String, Value>,
+    code: &str,
+    label: &str,
+    remaining_percent_key: &str,
+    reset_at_key: &str,
+    observed_at_unix_secs: Option<u64>,
+) -> Option<Value> {
+    let remaining_percent = metadata
+        .get(remaining_percent_key)
+        .and_then(admin_provider_quota_pure::coerce_json_f64);
+    let reset_at = provider_quota_timestamp_unix_secs(metadata.get(reset_at_key));
+    if remaining_percent.is_none() && reset_at.is_none() {
+        return None;
+    }
+
+    let remaining_ratio = remaining_percent.map(|value| (value / 100.0).clamp(0.0, 1.0));
+    let used_ratio = remaining_ratio.map(|value| (1.0 - value).clamp(0.0, 1.0));
+    let reset_seconds = quota_window_reset_seconds(observed_at_unix_secs, reset_at);
+
+    Some(json!({
+        "code": code,
+        "label": label,
+        "scope": "account",
+        "unit": "percent",
+        "used_ratio": used_ratio,
+        "remaining_ratio": remaining_ratio,
+        "reset_at": reset_at,
+        "reset_seconds": reset_seconds,
+        "is_exhausted": remaining_ratio.map(|value| value <= 1e-6),
+    }))
+}
+
+fn windsurf_count_quota_window_snapshot(
+    metadata: &Map<String, Value>,
+    code: &str,
+    label: &str,
+    used_key: &str,
+    limit_key: &str,
+    remaining_key: &str,
+) -> Option<Value> {
+    let used = metadata
+        .get(used_key)
+        .and_then(admin_provider_quota_pure::coerce_json_f64);
+    let limit = metadata
+        .get(limit_key)
+        .and_then(admin_provider_quota_pure::coerce_json_f64);
+    let remaining = metadata
+        .get(remaining_key)
+        .and_then(admin_provider_quota_pure::coerce_json_f64)
+        .or_else(|| limit.zip(used).map(|(limit, used)| (limit - used).max(0.0)));
+    if used.is_none() && limit.is_none() && remaining.is_none() {
+        return None;
+    }
+
+    let used_ratio = used
+        .zip(limit)
+        .and_then(|(used, limit)| (limit > 0.0).then_some((used / limit).clamp(0.0, 1.0)));
+    let remaining_ratio = remaining.zip(limit).and_then(|(remaining, limit)| {
+        (limit > 0.0).then_some((remaining / limit).clamp(0.0, 1.0))
+    });
+
+    Some(json!({
+        "code": code,
+        "label": label,
+        "scope": "account",
+        "unit": "count",
+        "used_ratio": used_ratio,
+        "remaining_ratio": remaining_ratio,
+        "used_value": used,
+        "remaining_value": remaining,
+        "limit_value": limit,
+        "is_exhausted": remaining.is_some_and(|value| value <= 0.0),
+    }))
+}
+
+fn build_windsurf_quota_status_snapshot(
+    upstream_metadata: Option<&Value>,
+    source: &str,
+) -> Option<Value> {
+    let metadata = provider_quota_metadata_bucket(upstream_metadata, "windsurf")?;
+    let observed_at_unix_secs = provider_quota_timestamp_unix_secs(metadata.get("updated_at"));
+    let plan_type = metadata
+        .get("plan_name")
+        .or_else(|| metadata.get("plan_type"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let rate_limit = metadata
+        .get("rate_limit")
+        .cloned()
+        .filter(|value| !value.is_null());
+    let last_error = metadata
+        .get("last_error")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let banned = metadata
+        .get("banned")
+        .or_else(|| metadata.get("is_banned"))
+        .and_then(admin_provider_quota_pure::coerce_json_bool)
+        == Some(true);
+    let quarantined = metadata
+        .get("quarantined")
+        .or_else(|| metadata.get("is_quarantined"))
+        .and_then(admin_provider_quota_pure::coerce_json_bool)
+        == Some(true);
+
+    let mut windows = [
+        windsurf_percent_quota_window_snapshot(
+            metadata,
+            "daily",
+            "日",
+            "daily_remaining_percent",
+            "daily_reset_at",
+            observed_at_unix_secs,
+        ),
+        windsurf_percent_quota_window_snapshot(
+            metadata,
+            "weekly",
+            "周",
+            "weekly_remaining_percent",
+            "weekly_reset_at",
+            observed_at_unix_secs,
+        ),
+        windsurf_count_quota_window_snapshot(
+            metadata,
+            "prompt",
+            "Prompt",
+            "prompt_used",
+            "prompt_limit",
+            "prompt_remaining",
+        ),
+        windsurf_count_quota_window_snapshot(
+            metadata,
+            "flex",
+            "Flex",
+            "flex_used",
+            "flex_limit",
+            "flex_remaining",
+        ),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+
+    let mut rate_limit_cooling = false;
+    let mut rate_limit_reset_seconds = None;
+    let mut rate_limit_reason = None::<String>;
+    if let Some(rate_limit) = rate_limit.as_ref() {
+        if let Some(rate_limit_object) = rate_limit.as_object() {
+            let retry_after_ms = rate_limit_object
+                .get("retry_after_ms")
+                .or_else(|| rate_limit_object.get("retryAfterMs"))
+                .and_then(admin_provider_quota_pure::coerce_json_u64)
+                .filter(|value| *value > 0);
+            if let Some(retry_after_ms) = retry_after_ms {
+                rate_limit_cooling = true;
+                rate_limit_reset_seconds = Some(retry_after_ms.saturating_add(999) / 1000);
+                rate_limit_reason = rate_limit_object
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned);
+                windows.push(json!({
+                    "code": "rate_limit",
+                    "label": "速率",
+                    "scope": "account",
+                    "unit": "count",
+                    "is_exhausted": false,
+                    "reset_seconds": rate_limit_reset_seconds,
+                }));
+            }
+        }
+    }
+
+    let allowed_models_count = metadata
+        .get("allowed_models_count")
+        .or_else(|| metadata.get("models_count"))
+        .and_then(admin_provider_quota_pure::coerce_json_u64);
+
+    if windows.is_empty()
+        && plan_type.is_none()
+        && observed_at_unix_secs.is_none()
+        && rate_limit.is_none()
+        && allowed_models_count.is_none()
+        && !banned
+        && !quarantined
+    {
+        return None;
+    }
+
+    let usage_ratio = quota_windows_usage_ratio(&windows);
+    let reset_seconds = if rate_limit_cooling {
+        rate_limit_reset_seconds.or_else(|| quota_windows_min_reset_seconds(&windows))
+    } else {
+        quota_windows_min_reset_seconds(&windows)
+    };
+    let reset_at = if rate_limit_cooling {
+        None
+    } else {
+        quota_windows_min_reset_at(&windows)
+    };
+    let exhausted_by_window = windows.iter().filter_map(Value::as_object).any(|window| {
+        window
+            .get("code")
+            .and_then(Value::as_str)
+            .is_some_and(|code| {
+                code.eq_ignore_ascii_case("daily") || code.eq_ignore_ascii_case("weekly")
+            })
+            && window
+                .get("is_exhausted")
+                .and_then(admin_provider_quota_pure::coerce_json_bool)
+                .unwrap_or(false)
+    });
+    let exhausted = banned || quarantined || exhausted_by_window;
+    let (code, label, reason) = if banned {
+        (
+            "banned",
+            Some("账号已封禁"),
+            last_error
+                .clone()
+                .or_else(|| Some("账号被 Windsurf 标记为不可用".to_string())),
+        )
+    } else if quarantined {
+        (
+            "quarantined",
+            Some("账号隔离中"),
+            last_error
+                .clone()
+                .or_else(|| Some("账号处于隔离状态".to_string())),
+        )
+    } else if rate_limit_cooling {
+        (
+            "cooldown",
+            Some("冷却中"),
+            last_error.clone().or(rate_limit_reason),
+        )
+    } else if exhausted {
+        (
+            "exhausted",
+            Some("额度耗尽"),
+            Some("额度窗口已耗尽".to_string()),
+        )
+    } else {
+        ("ok", None, last_error)
+    };
+
+    Some(json!({
+        "version": 2,
+        "provider_type": "windsurf",
+        "code": code,
+        "label": label,
+        "reason": reason,
+        "freshness": "fresh",
+        "source": source,
+        "observed_at": observed_at_unix_secs,
+        "exhausted": exhausted,
+        "usage_ratio": usage_ratio,
+        "updated_at": observed_at_unix_secs,
+        "reset_at": reset_at,
+        "reset_seconds": reset_seconds,
+        "plan_type": plan_type,
+        "allowed_models_count": allowed_models_count,
+        "rate_limit": rate_limit.unwrap_or(Value::Null),
+        "windows": windows,
+    }))
+}
+
 fn build_antigravity_quota_status_snapshot(
     upstream_metadata: Option<&Value>,
     source: &str,
@@ -1126,12 +1511,210 @@ fn build_antigravity_quota_status_snapshot(
     }))
 }
 
+fn build_grok_quota_status_snapshot(
+    upstream_metadata: Option<&Value>,
+    source: &str,
+) -> Option<Value> {
+    let metadata = provider_quota_metadata_bucket(upstream_metadata, "grok")?;
+    let observed_at_unix_secs = provider_quota_timestamp_unix_secs(metadata.get("updated_at"));
+    let inferred_pool_tier = grok_pool_tier_from_quota_bucket(metadata);
+    let pool_tier = provider_quota_metadata_string(metadata, &["pool_tier", "tier"])
+        .or_else(|| inferred_pool_tier.map(ToOwned::to_owned));
+    let plan_type = provider_quota_metadata_string(metadata, &["plan_type", "plan"])
+        .or_else(|| pool_tier.clone());
+    let supported_windows = grok_supported_quota_windows_for_tier(pool_tier.as_deref());
+    let windows = provider_quota_model_bucket(metadata)
+        .map(|models| {
+            models
+                .iter()
+                .filter_map(|(model_name, item)| {
+                    if !supported_windows
+                        .iter()
+                        .any(|(quota_key, _)| *quota_key == model_name.as_str())
+                    {
+                        return None;
+                    }
+                    model_quota_window_snapshot(
+                        model_name,
+                        item.as_object()?,
+                        observed_at_unix_secs,
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    if windows.is_empty() && observed_at_unix_secs.is_none() {
+        return None;
+    }
+
+    let usage_ratio = quota_windows_usage_ratio(&windows);
+    let reset_seconds = quota_windows_min_reset_seconds(&windows);
+    let reset_at = quota_windows_min_reset_at(&windows);
+    let exhausted = quota_windows_all_exhausted(&windows);
+
+    Some(json!({
+        "version": 2,
+        "provider_type": "grok",
+        "code": if exhausted { "exhausted" } else { "ok" },
+        "label": if exhausted { Some("额度耗尽") } else { None::<&str> },
+        "reason": if exhausted {
+            Some("所有 Grok 模式额度已耗尽")
+        } else {
+            None::<&str>
+        },
+        "freshness": "fresh",
+        "source": source,
+        "observed_at": observed_at_unix_secs,
+        "exhausted": exhausted,
+        "usage_ratio": usage_ratio,
+        "updated_at": observed_at_unix_secs,
+        "reset_at": reset_at,
+        "reset_seconds": reset_seconds,
+        "plan_type": plan_type,
+        "pool_tier": pool_tier,
+        "windows": windows,
+    }))
+}
+
+fn gemini_cli_plan_type(metadata: &Map<String, Value>) -> Option<String> {
+    provider_quota_metadata_string(metadata, &["plan_type", "tier", "plan"]).or_else(|| {
+        provider_quota_metadata_string_by_paths(
+            metadata,
+            &[
+                &["paidTier", "id"],
+                &["paidTier", "tierType"],
+                &["paidTier", "name"],
+                &["currentTier", "id"],
+                &["currentTier", "tierType"],
+                &["currentTier", "name"],
+            ],
+        )
+    })
+}
+
+fn gemini_cli_credits_status_snapshot(metadata: &Map<String, Value>) -> Option<Value> {
+    let remaining = provider_quota_metadata_number_by_paths(
+        metadata,
+        &[
+            &["credits", "remaining"],
+            &["credits", "remainingCredits"],
+            &["credits", "available"],
+            &["credits", "availableCredits"],
+            &["credits", "balance"],
+            &["remainingCredits"],
+            &["availableCredits"],
+            &["paidTier", "remainingCredits"],
+            &["paidTier", "availableCredits"],
+            &["currentTier", "remainingCredits"],
+            &["currentTier", "availableCredits"],
+        ],
+    );
+    let balance = provider_quota_metadata_number_by_paths(
+        metadata,
+        &[
+            &["credits", "balance"],
+            &["credits", "remaining"],
+            &["credits", "available"],
+            &["paidTier", "availableCredits"],
+            &["currentTier", "availableCredits"],
+            &["availableCredits"],
+            &["remainingCredits"],
+        ],
+    )
+    .or(remaining);
+    let consumed = provider_quota_metadata_number_by_paths(
+        metadata,
+        &[
+            &["credits", "consumed"],
+            &["credits", "consumedCredits"],
+            &["consumedCredits"],
+            &["paidTier", "consumedCredits"],
+            &["currentTier", "consumedCredits"],
+        ],
+    );
+    let total = provider_quota_metadata_number_by_paths(
+        metadata,
+        &[
+            &["credits", "total"],
+            &["credits", "totalCredits"],
+            &["totalCredits"],
+            &["paidTier", "totalCredits"],
+            &["currentTier", "totalCredits"],
+        ],
+    );
+    let unlimited = provider_quota_metadata_bool_by_paths(
+        metadata,
+        &[
+            &["credits", "unlimited"],
+            &["credits_unlimited"],
+            &["paidTier", "unlimited"],
+            &["currentTier", "unlimited"],
+        ],
+    );
+    let explicit_has_credits = provider_quota_metadata_bool_by_paths(
+        metadata,
+        &[
+            &["credits", "has_credits"],
+            &["has_credits"],
+            &["paidTier", "hasCredits"],
+            &["currentTier", "hasCredits"],
+        ],
+    );
+    let trace_id = provider_quota_metadata_string_by_paths(
+        metadata,
+        &[
+            &["credits", "trace_id"],
+            &["credits", "traceId"],
+            &["trace_id"],
+            &["traceId"],
+        ],
+    );
+    let updated_at = provider_quota_metadata_value_by_path(metadata, &["credits", "updated_at"])
+        .or_else(|| provider_quota_metadata_value_by_path(metadata, &["credits", "updatedAt"]))
+        .or_else(|| metadata.get("updated_at"))
+        .and_then(|value| provider_quota_timestamp_unix_secs(Some(value)));
+
+    if remaining.is_none()
+        && balance.is_none()
+        && consumed.is_none()
+        && total.is_none()
+        && unlimited.is_none()
+        && explicit_has_credits.is_none()
+        && trace_id.is_none()
+    {
+        return None;
+    }
+
+    let has_credits = explicit_has_credits
+        .or_else(|| unlimited.filter(|value| *value))
+        .or_else(|| remaining.or(balance).map(|value| value > 0.0));
+    let mut credits = Map::new();
+    credits.insert("has_credits".to_string(), json!(has_credits));
+    credits.insert("balance".to_string(), json!(balance));
+    credits.insert("remaining".to_string(), json!(remaining.or(balance)));
+    credits.insert("consumed".to_string(), json!(consumed));
+    credits.insert("total".to_string(), json!(total));
+    credits.insert("unlimited".to_string(), json!(unlimited));
+    credits.insert("trace_id".to_string(), json!(trace_id));
+    credits.insert("updated_at".to_string(), json!(updated_at));
+    Some(Value::Object(credits))
+}
+
 fn build_gemini_cli_quota_status_snapshot(
     upstream_metadata: Option<&Value>,
     source: &str,
 ) -> Option<Value> {
     let metadata = provider_quota_metadata_bucket(upstream_metadata, "gemini_cli")?;
-    let observed_at_unix_secs = provider_quota_timestamp_unix_secs(metadata.get("updated_at"));
+    let credits = gemini_cli_credits_status_snapshot(metadata);
+    let plan_type = gemini_cli_plan_type(metadata);
+    let observed_at_unix_secs = provider_quota_timestamp_unix_secs(metadata.get("updated_at"))
+        .or_else(|| {
+            credits
+                .as_ref()
+                .and_then(|value| value.get("updated_at"))
+                .and_then(|value| provider_quota_timestamp_unix_secs(Some(value)))
+        });
     let windows = provider_quota_model_bucket(metadata)
         .map(|models| {
             models
@@ -1147,7 +1730,11 @@ fn build_gemini_cli_quota_status_snapshot(
         })
         .unwrap_or_default();
 
-    if windows.is_empty() && observed_at_unix_secs.is_none() {
+    if windows.is_empty()
+        && observed_at_unix_secs.is_none()
+        && credits.is_none()
+        && plan_type.is_none()
+    {
         return None;
     }
 
@@ -1211,7 +1798,8 @@ fn build_gemini_cli_quota_status_snapshot(
         "updated_at": observed_at_unix_secs,
         "reset_at": reset_at,
         "reset_seconds": reset_seconds,
-        "plan_type": serde_json::Value::Null,
+        "plan_type": plan_type,
+        "credits": credits,
         "windows": windows,
     }))
 }
@@ -1227,7 +1815,9 @@ pub(crate) fn sync_provider_key_quota_status_snapshot(
         "codex" => build_codex_quota_status_snapshot(upstream_metadata, source),
         "kiro" => build_kiro_quota_status_snapshot(upstream_metadata, source),
         "chatgpt_web" => build_chatgpt_web_quota_status_snapshot(upstream_metadata, source),
+        "windsurf" => build_windsurf_quota_status_snapshot(upstream_metadata, source),
         "antigravity" => build_antigravity_quota_status_snapshot(upstream_metadata, source),
+        "grok" => build_grok_quota_status_snapshot(upstream_metadata, source),
         "gemini_cli" => build_gemini_cli_quota_status_snapshot(upstream_metadata, source),
         _ => None,
     }?;
@@ -1262,6 +1852,12 @@ fn quota_snapshot_has_materialized_data(
         return false;
     }
 
+    if normalized_provider_type == "windsurf"
+        && windsurf_quota_snapshot_has_stale_cooldown(quota_snapshot)
+    {
+        return false;
+    }
+
     if quota_snapshot
         .get("windows")
         .and_then(Value::as_array)
@@ -1285,6 +1881,61 @@ fn quota_snapshot_has_materialized_data(
                 && !code.eq_ignore_ascii_case("unknown")
                 && !code.eq_ignore_ascii_case("ok")
         })
+}
+
+fn windsurf_quota_snapshot_has_stale_cooldown(quota_snapshot: &Map<String, Value>) -> bool {
+    let code = quota_snapshot
+        .get("code")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    if !code.eq_ignore_ascii_case("cooldown") {
+        return false;
+    }
+
+    let rate_limit = quota_snapshot.get("rate_limit").and_then(Value::as_object);
+    let retry_after_ms = rate_limit
+        .and_then(|rate_limit| {
+            rate_limit
+                .get("retry_after_ms")
+                .or_else(|| rate_limit.get("retryAfterMs"))
+                .and_then(admin_provider_quota_pure::coerce_json_u64)
+        })
+        .unwrap_or(0);
+    if retry_after_ms > 0 {
+        return false;
+    }
+
+    let has_positive_rate_limit_reset = quota_snapshot
+        .get("windows")
+        .and_then(Value::as_array)
+        .is_some_and(|windows| {
+            windows.iter().filter_map(Value::as_object).any(|window| {
+                window
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .is_some_and(|code| code.eq_ignore_ascii_case("rate_limit"))
+                    && window
+                        .get("reset_seconds")
+                        .or_else(|| window.get("reset_at"))
+                        .and_then(admin_provider_quota_pure::coerce_json_u64)
+                        .is_some_and(|value| value > 0)
+            })
+        });
+    if has_positive_rate_limit_reset {
+        return false;
+    }
+
+    let exhausted = quota_snapshot
+        .get("exhausted")
+        .and_then(admin_provider_quota_pure::coerce_json_bool)
+        .unwrap_or(false);
+    let has_capacity = rate_limit
+        .and_then(|rate_limit| rate_limit.get("has_capacity"))
+        .and_then(admin_provider_quota_pure::coerce_json_bool)
+        .unwrap_or(false);
+
+    has_capacity || !exhausted
 }
 
 pub(crate) fn provider_key_status_snapshot_payload(
@@ -1338,6 +1989,39 @@ pub(crate) fn provider_key_health_summary(
     bool,
     serde_json::Map<String, serde_json::Value>,
 ) {
+    provider_key_health_summary_with_circuit_predicate(key, |value| {
+        value
+            .get("open")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    })
+}
+
+pub(crate) fn provider_key_health_summary_at(
+    key: &StoredProviderCatalogKey,
+    now_unix_secs: u64,
+) -> (
+    f64,
+    i64,
+    Option<String>,
+    bool,
+    serde_json::Map<String, serde_json::Value>,
+) {
+    provider_key_health_summary_with_circuit_predicate(key, |value| {
+        provider_key_circuit_payload_is_active_open_at(value, now_unix_secs)
+    })
+}
+
+fn provider_key_health_summary_with_circuit_predicate(
+    key: &StoredProviderCatalogKey,
+    circuit_is_open: impl Fn(&serde_json::Value) -> bool,
+) -> (
+    f64,
+    i64,
+    Option<String>,
+    bool,
+    serde_json::Map<String, serde_json::Value>,
+) {
     let health_by_format = key
         .health_by_format
         .as_ref()
@@ -1379,12 +2063,7 @@ pub(crate) fn provider_key_health_summary(
         }
     }
 
-    let any_circuit_open = circuit_by_format.values().any(|value| {
-        value
-            .get("open")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-    });
+    let any_circuit_open = circuit_by_format.values().any(circuit_is_open);
 
     (
         if health_by_format.is_empty() {
@@ -1533,15 +2212,10 @@ pub(crate) fn build_admin_provider_key_response(
         last_failure_at,
         circuit_breaker_open,
         circuit_by_format,
-    ) = provider_key_health_summary(key);
+    ) = provider_key_health_summary_at(key, now_unix_secs);
     let circuit_sample = circuit_by_format
         .values()
-        .find(|value| {
-            value
-                .get("open")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false)
-        })
+        .find(|value| provider_key_circuit_payload_is_active_open_at(value, now_unix_secs))
         .or_else(|| circuit_by_format.values().next());
     let is_adaptive = key.rpm_limit.is_none();
     let effective_limit = if is_adaptive {
@@ -1590,7 +2264,10 @@ pub(crate) fn build_admin_provider_key_response(
     );
     payload.insert(
         "can_refresh_oauth".to_string(),
-        json!(auth_semantics.can_refresh_oauth()),
+        json!(provider_key_can_refresh_oauth(
+            auth_semantics,
+            auth_config.as_ref()
+        )),
     );
     payload.insert(
         "can_export_oauth".to_string(),
@@ -2091,12 +2768,419 @@ mod tests {
         assert_eq!(quota.get("code"), Some(&json!("ok")));
         assert_eq!(quota.get("plan_type"), Some(&json!("free")));
         assert_eq!(quota.get("reset_at"), Some(&json!(1_778_157_172u64)));
-        assert_eq!(quota.get("usage_ratio"), Some(&json!(0.04)));
+        assert_eq!(quota.get("usage_ratio"), Some(&json!(0.0)));
         assert_eq!(window.get("code"), Some(&json!("image_gen")));
         assert_eq!(window.get("remaining_value"), Some(&json!(24.0)));
-        assert_eq!(window.get("limit_value"), Some(&json!(25.0)));
-        assert_eq!(window.get("used_value"), Some(&json!(1.0)));
-        assert_eq!(window.get("remaining_ratio"), Some(&json!(0.96)));
+        assert_eq!(window.get("limit_value"), Some(&json!(24.0)));
+        assert_eq!(window.get("used_value"), Some(&json!(0.0)));
+        assert_eq!(window.get("remaining_ratio"), Some(&json!(1.0)));
+    }
+
+    #[test]
+    fn provider_key_status_snapshot_payload_ignores_chatgpt_web_legacy_free_25_limit() {
+        let mut key = sample_catalog_key();
+        key.upstream_metadata = Some(json!({
+            "chatgpt_web": {
+                "updated_at": 1_778_067_246u64,
+                "plan_type": "free",
+                "image_quota_remaining": 19.0,
+                "image_quota_total": 25.0
+            }
+        }));
+
+        let payload = provider_key_status_snapshot_payload(&key, "chatgpt_web");
+        let window = payload
+            .get("quota")
+            .and_then(Value::as_object)
+            .and_then(|quota| quota.get("windows"))
+            .and_then(Value::as_array)
+            .and_then(|windows| windows.first())
+            .and_then(Value::as_object)
+            .expect("image quota window should exist");
+
+        assert_eq!(window.get("remaining_value"), Some(&json!(19.0)));
+        assert_eq!(window.get("limit_value"), Some(&json!(19.0)));
+        assert_eq!(window.get("used_value"), Some(&json!(0.0)));
+    }
+
+    #[test]
+    fn provider_key_status_snapshot_payload_backfills_grok_model_quota() {
+        let mut key = sample_catalog_key();
+        key.upstream_metadata = Some(json!({
+            "grok": {
+                "updated_at": 1_778_067_246u64,
+                "pool_tier": "heavy",
+                "plan_type": "heavy",
+                "quota_by_model": {
+                    "quota_auto": {
+                        "display_name": "auto",
+                        "remaining_fraction": 0.4,
+                        "used_percent": 60.0,
+                        "remaining": 60.0,
+                        "total": 150.0,
+                        "reset_at": 1_778_157_172u64,
+                        "is_exhausted": false
+                    },
+                    "quota_heavy": {
+                        "display_name": "heavy",
+                        "remaining_fraction": 0.0,
+                        "used_percent": 100.0,
+                        "reset_at": 1_778_157_172u64,
+                        "is_exhausted": true
+                    }
+                }
+            }
+        }));
+
+        let payload = provider_key_status_snapshot_payload(&key, "grok");
+        let quota = payload
+            .get("quota")
+            .and_then(Value::as_object)
+            .expect("quota snapshot should be object");
+        let windows = quota
+            .get("windows")
+            .and_then(Value::as_array)
+            .expect("grok quota windows should exist");
+
+        assert_eq!(quota.get("provider_type"), Some(&json!("grok")));
+        assert_eq!(quota.get("code"), Some(&json!("ok")));
+        assert_eq!(quota.get("plan_type"), Some(&json!("heavy")));
+        assert_eq!(quota.get("pool_tier"), Some(&json!("heavy")));
+        assert_eq!(quota.get("exhausted"), Some(&json!(false)));
+        assert_eq!(quota.get("usage_ratio"), Some(&json!(1.0)));
+        assert_eq!(quota.get("reset_at"), Some(&json!(1_778_157_172u64)));
+        assert_eq!(windows.len(), 2);
+        assert!(windows.iter().any(|window| {
+            window
+                .get("code")
+                .and_then(Value::as_str)
+                .is_some_and(|code| code == "model:quota_auto")
+        }));
+        let auto = windows
+            .iter()
+            .filter_map(Value::as_object)
+            .find(|window| window.get("code") == Some(&json!("model:quota_auto")))
+            .expect("auto quota window should exist");
+        assert_eq!(auto.get("remaining_value"), Some(&json!(60.0)));
+        assert_eq!(auto.get("limit_value"), Some(&json!(150.0)));
+        assert_eq!(auto.get("used_value"), Some(&json!(90.0)));
+    }
+
+    #[test]
+    fn provider_key_status_snapshot_payload_backfills_gemini_cli_account_credits() {
+        let mut key = sample_catalog_key();
+        key.upstream_metadata = Some(json!({
+            "gemini_cli": {
+                "updated_at": 1_778_067_246u64,
+                "plan_type": "g1-pro-tier",
+                "paidTier": {
+                    "availableCredits": 123.5,
+                    "consumedCredits": 7.0,
+                    "totalCredits": 200.0
+                },
+                "quota_by_model": {
+                    "gemini-2.5-pro": {
+                        "display_name": "Gemini 2.5 Pro",
+                        "remaining_fraction": 0.75,
+                        "is_exhausted": false
+                    }
+                }
+            }
+        }));
+
+        let payload = provider_key_status_snapshot_payload(&key, "gemini_cli");
+        let quota = payload
+            .get("quota")
+            .and_then(Value::as_object)
+            .expect("quota snapshot should be object");
+        let credits = quota
+            .get("credits")
+            .and_then(Value::as_object)
+            .expect("credits snapshot should exist");
+        let windows = quota
+            .get("windows")
+            .and_then(Value::as_array)
+            .expect("Gemini CLI model windows should exist");
+
+        assert_eq!(quota.get("provider_type"), Some(&json!("gemini_cli")));
+        assert_eq!(quota.get("code"), Some(&json!("ok")));
+        assert_eq!(quota.get("plan_type"), Some(&json!("g1-pro-tier")));
+        assert_eq!(quota.get("updated_at"), Some(&json!(1_778_067_246u64)));
+        assert_eq!(credits.get("remaining"), Some(&json!(123.5)));
+        assert_eq!(credits.get("balance"), Some(&json!(123.5)));
+        assert_eq!(credits.get("consumed"), Some(&json!(7.0)));
+        assert_eq!(credits.get("total"), Some(&json!(200.0)));
+        assert_eq!(credits.get("has_credits"), Some(&json!(true)));
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].get("remaining_ratio"), Some(&json!(0.75)));
+    }
+
+    #[test]
+    fn provider_key_status_snapshot_payload_backfills_windsurf_daily_and_weekly_quota() {
+        let mut key = sample_catalog_key();
+        key.upstream_metadata = Some(json!({
+            "windsurf": {
+                "updated_at": 1_778_067_246u64,
+                "plan_name": "Pro",
+                "daily_remaining_percent": 40.0,
+                "weekly_remaining_percent": 65.0,
+                "daily_reset_at": 1_778_100_000u64,
+                "weekly_reset_at": 1_778_600_000u64,
+                "prompt_used": 12.0,
+                "prompt_limit": 100.0,
+                "prompt_remaining": 88.0,
+                "flex_used": 3.0,
+                "flex_limit": 10.0,
+                "flex_remaining": 7.0,
+                "allowed_models_count": 82
+            }
+        }));
+
+        let payload = provider_key_status_snapshot_payload(&key, "windsurf");
+        let quota = payload
+            .get("quota")
+            .and_then(Value::as_object)
+            .expect("quota snapshot should be object");
+        let windows = quota
+            .get("windows")
+            .and_then(Value::as_array)
+            .expect("windsurf quota windows should exist");
+        let daily = windows
+            .iter()
+            .filter_map(Value::as_object)
+            .find(|window| window.get("code") == Some(&json!("daily")))
+            .expect("daily quota window should exist");
+        let weekly = windows
+            .iter()
+            .filter_map(Value::as_object)
+            .find(|window| window.get("code") == Some(&json!("weekly")))
+            .expect("weekly quota window should exist");
+
+        assert_eq!(quota.get("provider_type"), Some(&json!("windsurf")));
+        assert_eq!(quota.get("code"), Some(&json!("ok")));
+        assert_eq!(quota.get("plan_type"), Some(&json!("Pro")));
+        assert_eq!(quota.get("usage_ratio"), Some(&json!(0.6)));
+        assert_eq!(quota.get("reset_at"), Some(&json!(1_778_100_000u64)));
+        assert_eq!(daily.get("remaining_ratio"), Some(&json!(0.4)));
+        assert_eq!(daily.get("used_ratio"), Some(&json!(0.6)));
+        assert_eq!(daily.get("reset_seconds"), Some(&json!(32_754u64)));
+        assert_eq!(weekly.get("remaining_ratio"), Some(&json!(0.65)));
+        assert_eq!(weekly.get("used_ratio"), Some(&json!(0.35)));
+        assert_eq!(weekly.get("reset_seconds"), Some(&json!(532_754u64)));
+        assert_eq!(quota.get("allowed_models_count"), Some(&json!(82)));
+    }
+
+    #[test]
+    fn provider_key_status_snapshot_payload_treats_windsurf_rate_limit_as_cooldown() {
+        let mut key = sample_catalog_key();
+        key.upstream_metadata = Some(json!({
+            "windsurf": {
+                "updated_at": 1_778_067_246u64,
+                "daily_remaining_percent": 80.0,
+                "rate_limit": {
+                    "limited": true,
+                    "retry_after_ms": 60_001u64,
+                    "message": "slow down"
+                },
+                "last_error": "slow down"
+            }
+        }));
+
+        let payload = provider_key_status_snapshot_payload(&key, "windsurf");
+        let quota = payload
+            .get("quota")
+            .and_then(Value::as_object)
+            .expect("quota snapshot should be object");
+        let rate_window = quota
+            .get("windows")
+            .and_then(Value::as_array)
+            .and_then(|windows| {
+                windows
+                    .iter()
+                    .filter_map(Value::as_object)
+                    .find(|window| window.get("code") == Some(&json!("rate_limit")))
+            })
+            .expect("rate limit window should exist");
+
+        assert_eq!(quota.get("code"), Some(&json!("cooldown")));
+        assert_eq!(quota.get("exhausted"), Some(&json!(false)));
+        assert_eq!(quota.get("reset_seconds"), Some(&json!(61u64)));
+        assert_eq!(rate_window.get("is_exhausted"), Some(&json!(false)));
+        assert_eq!(rate_window.get("reset_seconds"), Some(&json!(61u64)));
+    }
+
+    #[test]
+    fn provider_key_status_snapshot_payload_keeps_windsurf_capacity_probe_without_retry_after_ok() {
+        let mut key = sample_catalog_key();
+        key.upstream_metadata = Some(json!({
+            "windsurf": {
+                "updated_at": 1_778_067_246u64,
+                "daily_remaining_percent": 100.0,
+                "weekly_remaining_percent": 100.0,
+                "rate_limit": {
+                    "limited": true,
+                    "has_capacity": false,
+                    "messages_remaining": 0.0,
+                    "max_messages": 100.0
+                }
+            }
+        }));
+
+        let payload = provider_key_status_snapshot_payload(&key, "windsurf");
+        let quota = payload
+            .get("quota")
+            .and_then(Value::as_object)
+            .expect("quota snapshot should be object");
+        let has_rate_limit_window =
+            quota
+                .get("windows")
+                .and_then(Value::as_array)
+                .is_some_and(|windows| {
+                    windows
+                        .iter()
+                        .filter_map(Value::as_object)
+                        .any(|window| window.get("code") == Some(&json!("rate_limit")))
+                });
+
+        assert_eq!(quota.get("code"), Some(&json!("ok")));
+        assert_eq!(quota.get("label"), Some(&Value::Null));
+        assert_eq!(quota.get("exhausted"), Some(&json!(false)));
+        assert_eq!(
+            payload.pointer("/quota/rate_limit/limited"),
+            Some(&json!(true))
+        );
+        assert!(!has_rate_limit_window);
+    }
+
+    #[test]
+    fn provider_key_status_snapshot_payload_refreshes_stale_windsurf_cooldown_when_probe_has_capacity(
+    ) {
+        let mut key = sample_catalog_key();
+        key.status_snapshot = Some(json!({
+            "quota": {
+                "version": 2,
+                "provider_type": "windsurf",
+                "code": "cooldown",
+                "label": "冷却中",
+                "exhausted": false,
+                "windows": [
+                    {
+                        "code": "daily",
+                        "unit": "percent",
+                        "label": "日",
+                        "scope": "account",
+                        "remaining_ratio": 0.99,
+                        "is_exhausted": false
+                    },
+                    {
+                        "code": "rate_limit",
+                        "unit": "count",
+                        "label": "速率",
+                        "scope": "account",
+                        "is_exhausted": false,
+                        "reset_seconds": null
+                    }
+                ],
+                "rate_limit": {
+                    "limited": true,
+                    "has_capacity": true,
+                    "messages_remaining": -1,
+                    "max_messages": -1
+                }
+            }
+        }));
+        key.upstream_metadata = Some(json!({
+            "windsurf": {
+                "updated_at": 1_778_067_246u64,
+                "daily_remaining_percent": 99.0,
+                "weekly_remaining_percent": 100.0,
+                "allowed_models_count": 118,
+                "rate_limit": {
+                    "limited": true,
+                    "has_capacity": true,
+                    "messages_remaining": -1,
+                    "max_messages": -1
+                }
+            }
+        }));
+
+        let payload = provider_key_status_snapshot_payload(&key, "windsurf");
+        let quota = payload
+            .get("quota")
+            .and_then(Value::as_object)
+            .expect("quota snapshot should be object");
+        let has_rate_limit_window =
+            quota
+                .get("windows")
+                .and_then(Value::as_array)
+                .is_some_and(|windows| {
+                    windows
+                        .iter()
+                        .filter_map(Value::as_object)
+                        .any(|window| window.get("code") == Some(&json!("rate_limit")))
+                });
+
+        assert_eq!(quota.get("code"), Some(&json!("ok")));
+        assert_eq!(quota.get("label"), Some(&Value::Null));
+        assert_eq!(quota.get("allowed_models_count"), Some(&json!(118u64)));
+        assert!(!has_rate_limit_window);
+    }
+
+    #[test]
+    fn provider_key_status_snapshot_payload_marks_windsurf_banned_and_quarantined_blocking() {
+        let mut banned_key = sample_catalog_key();
+        banned_key.upstream_metadata = Some(json!({
+            "windsurf": {
+                "updated_at": 1_778_067_246u64,
+                "banned": true,
+                "reason": "forbidden"
+            }
+        }));
+        let banned_payload = provider_key_status_snapshot_payload(&banned_key, "windsurf");
+
+        assert_eq!(
+            banned_payload.pointer("/quota/code"),
+            Some(&json!("banned"))
+        );
+        assert_eq!(
+            banned_payload.pointer("/quota/exhausted"),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            banned_payload.pointer("/account/code"),
+            Some(&json!("account_banned"))
+        );
+        assert_eq!(
+            banned_payload.pointer("/account/blocked"),
+            Some(&json!(true))
+        );
+
+        let mut quarantined_key = sample_catalog_key();
+        quarantined_key.upstream_metadata = Some(json!({
+            "windsurf": {
+                "updated_at": 1_778_067_246u64,
+                "quarantined": true
+            }
+        }));
+        let quarantined_payload =
+            provider_key_status_snapshot_payload(&quarantined_key, "windsurf");
+
+        assert_eq!(
+            quarantined_payload.pointer("/quota/code"),
+            Some(&json!("quarantined"))
+        );
+        assert_eq!(
+            quarantined_payload.pointer("/quota/exhausted"),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            quarantined_payload.pointer("/account/code"),
+            Some(&json!("account_quarantined"))
+        );
+        assert_eq!(
+            quarantined_payload.pointer("/account/blocked"),
+            Some(&json!(true))
+        );
     }
 
     #[test]

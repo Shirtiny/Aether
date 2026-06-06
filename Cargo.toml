@@ -1,12 +1,14 @@
 [workspace]
 members = [
-    "apps/aether-proxy",
+    "apps/aether-tunnel",
     "crates/aether-ai-formats",
     "crates/aether-admin",
     "crates/aether-ai-serving",
     "crates/aether-pool-core",
     "crates/aether-provider-pool",
+    "crates/aether-routing-core",
     "crates/aether-data-contracts",
+    "crates/aether-data-query",
     "crates/aether-data-schema",
     "crates/aether-dispatch-core",
     "crates/aether-cache",
@@ -41,7 +43,9 @@ aether-ai-formats = { path = "crates/aether-ai-formats" }
 aether-ai-serving = { path = "crates/aether-ai-serving" }
 aether-pool-core = { path = "crates/aether-pool-core" }
 aether-provider-pool = { path = "crates/aether-provider-pool" }
+aether-routing-core = { path = "crates/aether-routing-core" }
 aether-data-contracts = { path = "crates/aether-data-contracts" }
+aether-data-query = { path = "crates/aether-data-query" }
 aether-data-schema = { path = "crates/aether-data-schema" }
 aether-dispatch-core = { path = "crates/aether-dispatch-core" }
 aether-cache = { path = "crates/aether-cache" }
@@ -63,6 +67,7 @@ aether-http = { path = "crates/aether-http" }
 aether-runtime = { path = "crates/aether-runtime" }
 aether-testkit = { path = "crates/aether-testkit" }
 aes = "0.8"
+aes-gcm = "0.10"
 async-stream = "0.3"
 async-trait = "0.1"
 axum = "0.8"
@@ -76,9 +81,10 @@ flate2 = "1"
 futures-util = "0.3"
 hmac = "0.12"
 http = "1"
+object_store = { version = "0.12", default-features = false, features = ["aws"] }
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "http2", "socks"] }
-redis = { version = "0.28", default-features = false, features = ["tokio-comp", "script", "streams"] }
+redis = { version = "0.28", default-features = false, features = ["tokio-comp", "script", "streams", "connection-manager"] }
 regex = "1"
 rustls = { version = "0.23", features = ["ring"] }
 semver = "1"
@@ -86,6 +92,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 serde_path_to_error = "0.1"
 sha2 = "0.10"
+tar = "0.4"
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "mysql", "sqlite", "runtime-tokio-rustls", "chrono"] }
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
@@ -94,7 +101,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["serde", "v4", "v5"] }
 webpki-roots = "0.26"
+wreq = { version = "6.0.0-rc.28", default-features = false, features = ["json", "stream", "socks", "webpki-roots", "ws"] }
+wreq-util = "3.0.0-rc.10"
 url = "2"
+zstd = "0.13"
 
 [profile.dev]
 # Keep file/line information for backtraces while avoiding full debug info

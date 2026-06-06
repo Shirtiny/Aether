@@ -13,6 +13,7 @@ const EMBEDDING_API_FORMATS: &[&str] = &[
     "jina:embedding",
     "gemini:embedding",
     "doubao:embedding",
+    "aliyun:multimodal_embedding",
 ];
 
 fn json_value_contains_string(value: &serde_json::Value, expected: &str) -> bool {

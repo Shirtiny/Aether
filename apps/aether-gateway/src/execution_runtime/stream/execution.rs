@@ -7,8 +7,8 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use aether_contracts::{
-    ExecutionPlan, ExecutionStreamTerminalSummary, ExecutionTelemetry, StreamFrame,
-    StreamFramePayload,
+    ExecutionPlan, ExecutionStreamTerminalSummary, ExecutionTelemetry, StandardizedUsage,
+    StreamFrame, StreamFramePayload,
 };
 use aether_data_contracts::repository::candidates::RequestCandidateStatus;
 use aether_data_contracts::repository::usage::UsageBodyCaptureState;
@@ -17,7 +17,7 @@ use aether_scheduler_core::{
 };
 use aether_usage_runtime::{
     build_lifecycle_usage_seed, build_stream_terminal_usage_payload_seed,
-    build_sync_terminal_usage_payload_seed, build_terminal_usage_context_seed,
+    build_sync_terminal_usage_payload_seed, build_terminal_usage_context_seed, LifecycleUsageSeed,
     UsageBodyCapturePolicy, UsageRequestRecordLevel, UsageRuntimeAccess,
     DEFAULT_USAGE_RESPONSE_BODY_CAPTURE_LIMIT_BYTES,
 };
@@ -44,14 +44,16 @@ use super::error::{
 #[path = "execution_failures.rs"]
 mod execution_failures;
 use self::execution_failures::{
-    build_stream_failure_from_execution_error, build_stream_failure_report,
+    build_stream_failure_from_execution_error, build_stream_failure_from_provider_error_body,
+    build_stream_failure_report, handle_prefetch_provider_private_stream_error,
     handle_prefetch_stream_failure, submit_midstream_stream_failure, StreamFailureReport,
 };
 use crate::ai_serving::api::{
-    maybe_bridge_standard_sync_json_to_stream, maybe_build_provider_private_stream_normalizer,
-    maybe_build_stream_response_rewriter, normalize_provider_private_report_context,
-    StreamingStandardTerminalObserver,
+    extract_provider_private_stream_error_body, maybe_bridge_standard_sync_json_to_stream,
+    maybe_build_provider_private_stream_normalizer, maybe_build_stream_response_rewriter,
+    normalize_provider_private_report_context, StreamingStandardTerminalObserver,
 };
+use crate::ai_serving::is_openai_responses_family_format;
 use crate::api::response::{
     attach_control_metadata_headers, build_client_response, build_client_response_from_parts,
 };
@@ -60,19 +62,28 @@ use crate::constants::{CONTROL_CANDIDATE_ID_HEADER, CONTROL_REQUEST_ID_HEADER};
 use crate::control::GatewayControlDecision;
 use crate::execution_runtime::build_direct_execution_frame_stream;
 use crate::execution_runtime::chatgpt_web_image::maybe_execute_chatgpt_web_image_stream;
+use crate::execution_runtime::grok::maybe_execute_grok_stream;
+use crate::execution_runtime::kiro_cache::{
+    billed_input_tokens as kiro_billed_input_tokens, build_kiro_prompt_cache_profile,
+    compute_kiro_prompt_cache_usage, estimate_kiro_prompt_input_tokens,
+    kiro_simulated_cache_enabled_from_provider_config,
+    kiro_simulated_cache_enabled_from_report_context, KiroPromptCacheUsage,
+    KIRO_SIMULATED_CACHE_ENABLED_CONTEXT_FIELD,
+};
 use crate::execution_runtime::kiro_web_search::maybe_execute_kiro_web_search_stream;
 use crate::execution_runtime::oauth_retry::refresh_oauth_plan_auth_for_retry;
 #[cfg(test)]
 use crate::execution_runtime::remote_compat::post_stream_plan_to_remote_execution_runtime;
 use crate::execution_runtime::submission::{
-    resolve_core_error_background_report_kind, strip_utf8_bom_and_ws,
-    submit_local_core_error_or_sync_finalize,
+    resolve_core_error_background_report_kind, resolve_local_sync_error_status_code,
+    strip_utf8_bom_and_ws, submit_local_core_error_or_sync_finalize,
 };
 use crate::execution_runtime::transport::{
     execute_stream_plan_via_local_tunnel, record_manual_proxy_request_failure,
     record_manual_proxy_request_success, record_manual_proxy_stream_error,
     DirectSyncExecutionRuntime, DirectUpstreamStreamExecution, ExecutionRuntimeTransportError,
 };
+use crate::execution_runtime::windsurf::maybe_execute_windsurf_stream;
 use crate::execution_runtime::{
     apply_endpoint_response_header_rules, attach_provider_response_headers_to_report_context,
     local_failover_response_text, resolve_core_stream_direct_finalize_report_kind,
@@ -105,10 +116,11 @@ use crate::{
 const OPENAI_IMAGE_STREAM_PLAN_KIND: &str = "openai_image_stream";
 const SSE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const SSE_KEEPALIVE_BYTES: &[u8] = b": aether-keepalive\n\n";
+const SSE_CONTROL_FILTER_MAX_BUFFER_BYTES: usize = 1024 * 1024;
+const SSE_TERMINAL_DETECTOR_MAX_LINE_BYTES: usize = 1024 * 1024;
 const STREAM_IDLE_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const STREAM_IDLE_LOG_INTERVAL_MS: u64 = 60_000;
 const REWRITTEN_STREAM_PREFETCH_TIMEOUT: Duration = Duration::from_millis(750);
-const OPENAI_IMAGE_STREAM_DEFAULT_TOTAL_TIMEOUT_MS: u64 = 900_000;
 
 fn record_sync_terminal_usage(
     state: &AppState,
@@ -310,6 +322,278 @@ fn build_stream_usage_payload(
     }
 }
 
+fn seed_kiro_report_context_input_tokens(plan: &ExecutionPlan, report_context: &mut Option<Value>) {
+    if !plan
+        .provider_name
+        .as_deref()
+        .is_some_and(|provider_name| provider_name.eq_ignore_ascii_case("Kiro"))
+    {
+        return;
+    }
+
+    let Some(context) = report_context.as_mut().and_then(Value::as_object_mut) else {
+        return;
+    };
+    if context
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .is_some_and(|input_tokens| input_tokens > 0)
+    {
+        return;
+    }
+
+    let Some(original_request_body) = context.get("original_request_body").cloned() else {
+        return;
+    };
+    let estimated_input_tokens = estimate_kiro_prompt_input_tokens(&original_request_body);
+    context.insert(
+        "input_tokens".to_string(),
+        Value::from(estimated_input_tokens),
+    );
+}
+
+async fn seed_kiro_simulated_cache_enabled(
+    state: &AppState,
+    plan: &ExecutionPlan,
+    report_context: &mut Option<Value>,
+) {
+    if !plan
+        .provider_name
+        .as_deref()
+        .is_some_and(|provider_name| provider_name.eq_ignore_ascii_case("Kiro"))
+    {
+        return;
+    }
+
+    let enabled = match state
+        .read_provider_catalog_providers_by_ids(std::slice::from_ref(&plan.provider_id))
+        .await
+    {
+        Ok(providers) => providers
+            .iter()
+            .find(|provider| provider.id == plan.provider_id)
+            .filter(|provider| provider.provider_type.eq_ignore_ascii_case("kiro"))
+            .is_some_and(|provider| {
+                kiro_simulated_cache_enabled_from_provider_config(provider.config.as_ref())
+            }),
+        Err(err) => {
+            warn!(
+                event_name = "kiro_simulated_cache_config_read_failed",
+                log_type = "event",
+                request_id = %plan.request_id,
+                provider_id = %plan.provider_id,
+                error = ?err,
+                "failed to read Kiro simulated cache provider config; defaulting disabled"
+            );
+            false
+        }
+    };
+
+    let Some(context) = report_context.as_mut().and_then(Value::as_object_mut) else {
+        return;
+    };
+    if enabled {
+        context.insert(
+            KIRO_SIMULATED_CACHE_ENABLED_CONTEXT_FIELD.to_string(),
+            Value::Bool(true),
+        );
+    } else {
+        context.remove(KIRO_SIMULATED_CACHE_ENABLED_CONTEXT_FIELD);
+    }
+}
+
+async fn seed_kiro_report_context_prompt_cache_usage(
+    state: &AppState,
+    plan: &ExecutionPlan,
+    report_context: &mut Option<Value>,
+) {
+    if !plan
+        .provider_name
+        .as_deref()
+        .is_some_and(|provider_name| provider_name.eq_ignore_ascii_case("Kiro"))
+    {
+        return;
+    }
+
+    let simulated_cache_enabled =
+        kiro_simulated_cache_enabled_from_report_context(report_context.as_ref());
+    let Some(context) = report_context.as_mut().and_then(Value::as_object_mut) else {
+        return;
+    };
+    if context
+        .get("kiro_web_search_mcp")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return;
+    }
+    if !simulated_cache_enabled {
+        return;
+    }
+    if kiro_cache_usage_from_context_object(context).is_some() {
+        return;
+    }
+
+    let Some(original_request_body) = context.get("original_request_body").cloned() else {
+        return;
+    };
+    let input_tokens = context
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| {
+            let estimated = estimate_kiro_prompt_input_tokens(&original_request_body);
+            context.insert("input_tokens".to_string(), Value::from(estimated));
+            estimated
+        });
+    let Some(profile) = build_kiro_prompt_cache_profile(&original_request_body, input_tokens)
+    else {
+        return;
+    };
+
+    let cache_usage = compute_kiro_prompt_cache_usage(
+        state.runtime_state(),
+        kiro_stream_cache_credential_id(plan),
+        &profile,
+    )
+    .await;
+    if cache_usage.cache_creation_input_tokens == 0 && cache_usage.cache_read_input_tokens == 0 {
+        return;
+    }
+    context.insert(
+        "cache_creation_input_tokens".to_string(),
+        Value::from(cache_usage.cache_creation_input_tokens),
+    );
+    context.insert(
+        "cache_read_input_tokens".to_string(),
+        Value::from(cache_usage.cache_read_input_tokens),
+    );
+}
+
+fn kiro_stream_cache_credential_id(plan: &ExecutionPlan) -> String {
+    format!("{}:{}:{}", plan.provider_id, plan.endpoint_id, plan.key_id)
+}
+
+fn kiro_cache_usage_from_context_object(
+    context: &serde_json::Map<String, Value>,
+) -> Option<KiroPromptCacheUsage> {
+    let cache_creation_input_tokens = context
+        .get("cache_creation_input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cache_read_input_tokens = context
+        .get("cache_read_input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    (cache_creation_input_tokens > 0 || cache_read_input_tokens > 0).then_some(
+        KiroPromptCacheUsage {
+            cache_creation_input_tokens,
+            cache_read_input_tokens,
+        },
+    )
+}
+
+fn kiro_cache_usage_from_report_context(report_context: &Value) -> Option<KiroPromptCacheUsage> {
+    report_context
+        .as_object()
+        .and_then(kiro_cache_usage_from_context_object)
+}
+
+async fn maybe_apply_kiro_prompt_cache_usage_to_stream_summary(
+    state: &AppState,
+    plan: &ExecutionPlan,
+    report_context: Option<&Value>,
+    summary: &mut Option<ExecutionStreamTerminalSummary>,
+) {
+    if !plan
+        .provider_name
+        .as_deref()
+        .is_some_and(|provider_name| provider_name.eq_ignore_ascii_case("Kiro"))
+    {
+        return;
+    }
+
+    let Some(report_context) = report_context else {
+        return;
+    };
+    let Some(original_request_body) = report_context.get("original_request_body") else {
+        return;
+    };
+    let simulated_cache_enabled =
+        kiro_simulated_cache_enabled_from_report_context(Some(report_context));
+
+    let summary = summary.get_or_insert_with(ExecutionStreamTerminalSummary::default);
+    let usage = summary
+        .standardized_usage
+        .get_or_insert_with(StandardizedUsage::new);
+    let estimated_input_tokens = report_context
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| {
+            let estimated_input_tokens = estimate_kiro_prompt_input_tokens(original_request_body);
+            if estimated_input_tokens > 0 {
+                estimated_input_tokens
+            } else {
+                usage.input_tokens.max(0) as u64
+            }
+        });
+
+    if !simulated_cache_enabled {
+        usage.cache_creation_tokens = 0;
+        usage.cache_read_tokens = 0;
+        if usage.input_tokens <= 0 {
+            usage.input_tokens = estimated_input_tokens as i64;
+        }
+        return;
+    }
+
+    if let Some(cache_usage) = kiro_cache_usage_from_report_context(report_context) {
+        usage.input_tokens = kiro_billed_input_tokens(estimated_input_tokens, cache_usage) as i64;
+        usage.cache_creation_tokens = cache_usage.cache_creation_input_tokens as i64;
+        usage.cache_read_tokens = cache_usage.cache_read_input_tokens as i64;
+        return;
+    }
+
+    if usage.cache_creation_tokens > 0 || usage.cache_read_tokens > 0 {
+        if usage.input_tokens <= 0 {
+            usage.input_tokens = kiro_billed_input_tokens(
+                estimated_input_tokens,
+                KiroPromptCacheUsage {
+                    cache_creation_input_tokens: usage.cache_creation_tokens.max(0) as u64,
+                    cache_read_input_tokens: usage.cache_read_tokens.max(0) as u64,
+                },
+            ) as i64;
+        }
+        return;
+    }
+
+    if usage.input_tokens <= 0 {
+        usage.input_tokens = estimated_input_tokens as i64;
+    }
+
+    let Some(profile) =
+        build_kiro_prompt_cache_profile(original_request_body, estimated_input_tokens)
+    else {
+        return;
+    };
+
+    let cache_usage = compute_kiro_prompt_cache_usage(
+        state.runtime_state(),
+        kiro_stream_cache_credential_id(plan),
+        &profile,
+    )
+    .await;
+    if cache_usage.cache_creation_input_tokens == 0 && cache_usage.cache_read_input_tokens == 0 {
+        return;
+    }
+
+    let billed_input_tokens = kiro_billed_input_tokens(estimated_input_tokens, cache_usage);
+    usage.input_tokens = billed_input_tokens as i64;
+    usage.cache_creation_tokens = cache_usage.cache_creation_input_tokens as i64;
+    usage.cache_read_tokens = cache_usage.cache_read_input_tokens as i64;
+}
+
 fn append_stream_capture_bytes(
     buffer: &mut Vec<u8>,
     chunk: &[u8],
@@ -429,6 +713,84 @@ fn should_replace_stream_usage(
     observed.is_more_complete_than(current)
 }
 
+fn stream_terminal_summary_missing_observed_finish(
+    summary: Option<&ExecutionStreamTerminalSummary>,
+) -> bool {
+    summary.is_some_and(|summary| {
+        !summary.observed_finish
+            && !summary
+                .standardized_usage
+                .as_ref()
+                .is_some_and(StandardizedUsage::has_token_signal)
+    })
+}
+
+fn stream_report_context_format_field<'a>(
+    report_context: Option<&'a Value>,
+    field: &str,
+) -> Option<&'a str> {
+    report_context
+        .and_then(Value::as_object)
+        .and_then(|object| object.get(field))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn stream_requires_observed_terminal_event(
+    provider_api_format: &str,
+    report_context: Option<&Value>,
+) -> bool {
+    is_openai_responses_family_format(provider_api_format)
+        || [
+            "provider_stream_event_api_format",
+            "provider_stream_api_format",
+            "provider_api_format",
+        ]
+        .into_iter()
+        .filter_map(|field| stream_report_context_format_field(report_context, field))
+        .any(is_openai_responses_family_format)
+}
+
+fn stream_terminal_summary_missing_observed_finish_with_requirement(
+    summary: Option<&ExecutionStreamTerminalSummary>,
+    requires_observed_terminal_event: bool,
+) -> bool {
+    if !requires_observed_terminal_event {
+        return stream_terminal_summary_missing_observed_finish(summary);
+    }
+
+    summary.is_some_and(|summary| !summary.observed_finish)
+}
+
+fn ensure_stream_terminal_summary_for_missing_observed_finish(
+    summary: &mut Option<ExecutionStreamTerminalSummary>,
+    requires_observed_terminal_event: bool,
+) {
+    if !requires_observed_terminal_event {
+        return;
+    }
+
+    let summary = summary.get_or_insert_with(ExecutionStreamTerminalSummary::default);
+    if !summary.observed_finish && summary.parser_error.is_none() {
+        summary.parser_error =
+            Some("execution runtime stream ended before provider terminal event".to_string());
+    }
+}
+
+fn stream_terminal_summary_represents_failure_with_requirement(
+    summary: Option<&ExecutionStreamTerminalSummary>,
+    requires_observed_terminal_event: bool,
+) -> bool {
+    summary.is_some_and(|summary| {
+        summary.parser_error.is_some()
+            || stream_terminal_summary_missing_observed_finish_with_requirement(
+                Some(summary),
+                requires_observed_terminal_event,
+            )
+    })
+}
+
 async fn execute_in_process_stream(
     state: &AppState,
     plan: &ExecutionPlan,
@@ -525,6 +887,110 @@ pub(crate) async fn execute_execution_runtime_stream(
         key_id.as_str(),
     )
     .await;
+    match maybe_execute_grok_stream(&plan, report_context.as_ref()).await {
+        Ok(Some(grok_stream)) => {
+            return execute_stream_from_frame_stream(
+                state,
+                plan,
+                trace_id,
+                decision,
+                plan_kind,
+                report_kind,
+                grok_stream.report_context.or(report_context),
+                candidate_started_unix_secs,
+                stream_started_at,
+                grok_stream.frame_stream,
+                provider_pool_in_flight_guard.take(),
+            )
+            .await;
+        }
+        Ok(None) => {}
+        Err(err) => {
+            info!(
+                event_name = "grok_execution_unavailable",
+                log_type = "ops",
+                trace_id = %trace_id,
+                request_id = %plan_request_id_for_log,
+                candidate_id = ?plan.candidate_id,
+                provider_name = provider_name.as_str(),
+                endpoint_id = %endpoint_id,
+                key_id = %key_id,
+                model_name = model_name.as_str(),
+                candidate_index = candidate_index.as_str(),
+                error = %err,
+                "gateway Grok stream execution unavailable"
+            );
+            let terminal_unix_secs = current_request_candidate_unix_ms();
+            record_local_request_candidate_status(
+                state,
+                &plan,
+                report_context.as_ref(),
+                SchedulerRequestCandidateStatusUpdate {
+                    status: RequestCandidateStatus::Failed,
+                    status_code: None,
+                    error_type: Some("grok_execution_unavailable".to_string()),
+                    error_message: Some(format!("{err:?}")),
+                    latency_ms: None,
+                    started_at_unix_ms: Some(candidate_started_unix_secs),
+                    finished_at_unix_ms: Some(terminal_unix_secs),
+                },
+            )
+            .await;
+            return Ok(None);
+        }
+    }
+    match maybe_execute_windsurf_stream(state, &plan, report_context.as_ref()).await {
+        Ok(Some(windsurf_stream)) => {
+            return execute_stream_from_frame_stream(
+                state,
+                plan,
+                trace_id,
+                decision,
+                plan_kind,
+                report_kind,
+                windsurf_stream.report_context.or(report_context),
+                candidate_started_unix_secs,
+                stream_started_at,
+                windsurf_stream.frame_stream,
+                provider_pool_in_flight_guard.take(),
+            )
+            .await;
+        }
+        Ok(None) => {}
+        Err(err) => {
+            info!(
+                event_name = "windsurf_native_execution_unavailable",
+                log_type = "ops",
+                trace_id = %trace_id,
+                request_id = %plan_request_id_for_log,
+                candidate_id = ?plan.candidate_id,
+                provider_name = provider_name.as_str(),
+                endpoint_id = %endpoint_id,
+                key_id = %key_id,
+                model_name = model_name.as_str(),
+                candidate_index = candidate_index.as_str(),
+                error = %err,
+                "gateway native Windsurf stream execution unavailable"
+            );
+            let terminal_unix_secs = current_request_candidate_unix_ms();
+            record_local_request_candidate_status(
+                state,
+                &plan,
+                report_context.as_ref(),
+                SchedulerRequestCandidateStatusUpdate {
+                    status: RequestCandidateStatus::Failed,
+                    status_code: None,
+                    error_type: Some("windsurf_native_execution_unavailable".to_string()),
+                    error_message: Some(err.to_string()),
+                    latency_ms: None,
+                    started_at_unix_ms: Some(candidate_started_unix_secs),
+                    finished_at_unix_ms: Some(terminal_unix_secs),
+                },
+            )
+            .await;
+            return Ok(None);
+        }
+    }
     match maybe_execute_kiro_web_search_stream(state, &plan, report_context.as_ref()).await {
         Ok(Some(kiro_web_search)) => {
             return execute_stream_from_frame_stream(
@@ -873,13 +1339,13 @@ fn encode_terminal_sse_error_event(failure: &StreamFailureReport) -> Result<Byte
     let payload = failure
         .to_json_string()
         .map_err(|err| IoError::other(err.to_string()))?;
-    let mut event = String::from("event: aether.error\n");
+    let mut event = String::new();
     for line in payload.lines() {
         event.push_str("data: ");
         event.push_str(line);
         event.push('\n');
     }
-    event.push('\n');
+    event.push_str("\ndata: [DONE]\n\n");
     Ok(Bytes::from(event))
 }
 
@@ -929,37 +1395,36 @@ fn encode_openai_image_failed_event(
     Ok(Bytes::from(event))
 }
 
-fn resolve_openai_image_stream_total_timeout_ms(
-    plan_kind: &str,
-    plan: &ExecutionPlan,
-) -> Option<u64> {
-    if plan_kind != OPENAI_IMAGE_STREAM_PLAN_KIND {
-        return None;
-    }
-    Some(
-        plan.timeouts
-            .as_ref()
-            .and_then(|timeouts| timeouts.total_ms)
-            .unwrap_or(OPENAI_IMAGE_STREAM_DEFAULT_TOTAL_TIMEOUT_MS)
-            .max(1),
-    )
-}
-
 fn should_limit_direct_finalize_prefetch(plan_kind: &str, has_local_stream_rewriter: bool) -> bool {
     plan_kind == OPENAI_IMAGE_STREAM_PLAN_KIND || has_local_stream_rewriter
+}
+
+fn client_format_allows_proxy_generated_sse_control_blocks(plan: &ExecutionPlan) -> bool {
+    // OpenAI-compatible clients commonly parse every client-visible SSE event as
+    // an OpenAI JSON payload or [DONE]. Keep the downstream wire format strict:
+    // do not inject proxy-generated comments, pings, or keepalives for openai:*.
+    !plan
+        .client_api_format
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("openai:")
 }
 
 fn build_sse_body_stream(
     prefetched_chunks_for_body: Vec<Bytes>,
     mut rx: mpsc::Receiver<Result<Bytes, IoError>>,
+    filter_control_blocks: bool,
     emit_keepalive: bool,
     keepalive_interval: Duration,
 ) -> impl futures_util::Stream<Item = Result<Bytes, IoError>> + Send + 'static {
     stream! {
+        let mut upstream_control_filter = filter_control_blocks.then(SseControlBlockFilter::default);
         let mut sent_prefetched_chunk = false;
         for chunk in prefetched_chunks_for_body {
-            sent_prefetched_chunk = true;
-            yield Ok(chunk);
+            if let Some(chunk) = filter_upstream_sse_control_chunk(&mut upstream_control_filter, chunk) {
+                sent_prefetched_chunk = true;
+                yield Ok(chunk);
+            }
         }
 
         if emit_keepalive {
@@ -976,32 +1441,314 @@ fn build_sse_body_stream(
                         let Some(item) = item else {
                             break;
                         };
-                        yield item;
+                        match item {
+                            Ok(chunk) => {
+                                if let Some(chunk) = filter_upstream_sse_control_chunk(&mut upstream_control_filter, chunk) {
+                                    yield Ok(chunk);
+                                }
+                            }
+                            Err(err) => yield Err(err),
+                        }
                     }
                     _ = keepalive.tick() => {
                         yield Ok(Bytes::from_static(SSE_KEEPALIVE_BYTES));
                     }
                 }
             }
+            if let Some(chunk) = flush_upstream_sse_control_filter(&mut upstream_control_filter) {
+                yield Ok(chunk);
+            }
         } else {
             while let Some(item) = rx.recv().await {
-                yield item;
+                match item {
+                    Ok(chunk) => {
+                        if let Some(chunk) = filter_upstream_sse_control_chunk(&mut upstream_control_filter, chunk) {
+                            yield Ok(chunk);
+                        }
+                    }
+                    Err(err) => yield Err(err),
+                }
+            }
+            if let Some(chunk) = flush_upstream_sse_control_filter(&mut upstream_control_filter) {
+                yield Ok(chunk);
             }
         }
     }
 }
 
-async fn next_stream_frame<R>(
-    buffered_frames: &mut VecDeque<StreamFrame>,
+#[derive(Default)]
+struct SseControlBlockFilter {
+    buffered: Vec<u8>,
+    emitted_len: usize,
+    passthrough_current_block: bool,
+}
+
+impl SseControlBlockFilter {
+    fn push_chunk(&mut self, chunk: &[u8]) -> Vec<u8> {
+        if chunk.is_empty() {
+            return Vec::new();
+        }
+
+        self.buffered.extend_from_slice(chunk);
+        let mut output = Vec::new();
+        while let Some((block_end, separator_len)) = find_sse_block_boundary(&self.buffered) {
+            let block_len = block_end + separator_len;
+            let block = self.buffered.drain(..block_len).collect::<Vec<_>>();
+            if self.passthrough_current_block {
+                let emitted_len = self.emitted_len.min(block.len());
+                output.extend_from_slice(&block[emitted_len..]);
+            } else if sse_block_has_data_line(&block) {
+                output.extend_from_slice(&block);
+            }
+            self.emitted_len = 0;
+            self.passthrough_current_block = false;
+        }
+
+        if self.passthrough_current_block {
+            if self.buffered.len() > self.emitted_len {
+                output.extend_from_slice(&self.buffered[self.emitted_len..]);
+                self.emitted_len = self.buffered.len();
+            }
+        } else if sse_buffer_has_data_line(&self.buffered) {
+            self.passthrough_current_block = true;
+            output.extend_from_slice(&self.buffered);
+            self.emitted_len = self.buffered.len();
+        }
+
+        if self.buffered.len() > SSE_CONTROL_FILTER_MAX_BUFFER_BYTES {
+            let buffered = std::mem::take(&mut self.buffered);
+            if self.passthrough_current_block {
+                let emitted_len = self.emitted_len.min(buffered.len());
+                output.extend_from_slice(&buffered[emitted_len..]);
+            } else {
+                output.extend(buffered);
+            }
+            self.emitted_len = 0;
+            self.passthrough_current_block = false;
+        }
+
+        output
+    }
+
+    fn finish(&mut self) -> Vec<u8> {
+        if self.buffered.is_empty() {
+            return Vec::new();
+        }
+
+        let block = std::mem::take(&mut self.buffered);
+        let emitted_len = self.emitted_len.min(block.len());
+        let passthrough_current_block = self.passthrough_current_block;
+        self.emitted_len = 0;
+        self.passthrough_current_block = false;
+        if passthrough_current_block {
+            block[emitted_len..].to_vec()
+        } else if sse_block_has_data_line(&block) {
+            block
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+fn filter_upstream_sse_control_chunk(
+    filter: &mut Option<SseControlBlockFilter>,
+    chunk: Bytes,
+) -> Option<Bytes> {
+    let Some(filter) = filter.as_mut() else {
+        return Some(chunk);
+    };
+
+    let filtered = filter.push_chunk(chunk.as_ref());
+    (!filtered.is_empty()).then(|| Bytes::from(filtered))
+}
+
+fn flush_upstream_sse_control_filter(filter: &mut Option<SseControlBlockFilter>) -> Option<Bytes> {
+    let filtered = filter.as_mut()?.finish();
+    (!filtered.is_empty()).then(|| Bytes::from(filtered))
+}
+
+fn find_sse_block_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
+    let lf = buffer
+        .windows(2)
+        .position(|window| window == b"\n\n")
+        .map(|index| (index, 2));
+    let crlf = buffer
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|index| (index, 4));
+
+    match (lf, crlf) {
+        (Some(lf), Some(crlf)) => Some(if lf.0 <= crlf.0 { lf } else { crlf }),
+        (Some(lf), None) => Some(lf),
+        (None, Some(crlf)) => Some(crlf),
+        (None, None) => None,
+    }
+}
+
+fn sse_block_has_data_line(block: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(block) else {
+        return true;
+    };
+
+    text.lines()
+        .any(|line| line.trim_start().starts_with("data:"))
+}
+
+fn sse_buffer_has_data_line(buffer: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(buffer) else {
+        return true;
+    };
+
+    text.lines()
+        .any(|line| line.trim_start().starts_with("data:"))
+}
+
+#[derive(Default)]
+struct ClientVisibleStreamCompletionTracker {
+    line_buffer: Vec<u8>,
+    event_type: Option<String>,
+    data_payload: String,
+    has_data_payload: bool,
+    skip_next_lf: bool,
+    completed: bool,
+}
+
+impl ClientVisibleStreamCompletionTracker {
+    fn observe_chunk(&mut self, chunk: &[u8]) -> bool {
+        if self.completed {
+            return true;
+        }
+        if chunk.is_empty() {
+            return false;
+        }
+
+        for byte in chunk {
+            if self.skip_next_lf {
+                self.skip_next_lf = false;
+                if *byte == b'\n' {
+                    continue;
+                }
+            }
+
+            match *byte {
+                b'\n' => self.finish_line(),
+                b'\r' => {
+                    self.finish_line();
+                    self.skip_next_lf = true;
+                }
+                _ => {
+                    self.line_buffer.push(*byte);
+                    if self.line_buffer.len() > SSE_TERMINAL_DETECTOR_MAX_LINE_BYTES {
+                        self.line_buffer.clear();
+                    }
+                }
+            }
+
+            if self.completed {
+                break;
+            }
+        }
+
+        self.completed
+    }
+
+    fn finish_line(&mut self) {
+        let line = std::mem::take(&mut self.line_buffer);
+        let Ok(line) = std::str::from_utf8(&line) else {
+            self.reset_current_event();
+            return;
+        };
+        let line = line.trim();
+
+        if line.is_empty() {
+            self.completed = self.current_event_is_terminal();
+            self.reset_current_event();
+            return;
+        }
+
+        if let Some(event_type) = line.strip_prefix("event:").map(str::trim) {
+            self.event_type = Some(event_type.to_string());
+            return;
+        }
+
+        if let Some(data) = line.strip_prefix("data:").map(str::trim) {
+            if data.is_empty() {
+                return;
+            }
+            if self.has_data_payload {
+                self.data_payload.push('\n');
+            }
+            self.data_payload.push_str(data);
+            self.has_data_payload = true;
+        }
+    }
+
+    fn current_event_is_terminal(&self) -> bool {
+        self.event_type
+            .as_deref()
+            .is_some_and(is_terminal_sse_event_type)
+            || (self.has_data_payload && sse_data_payload_is_terminal(&self.data_payload))
+    }
+
+    fn reset_current_event(&mut self) {
+        self.event_type = None;
+        self.data_payload.clear();
+        self.has_data_payload = false;
+    }
+}
+
+fn is_terminal_sse_event_type(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        "message_stop" | "response.completed" | "response.failed" | "response.incomplete" | "error"
+    )
+}
+
+fn sse_data_payload_is_terminal(data: &str) -> bool {
+    data == "[DONE]"
+        || serde_json::from_str::<serde_json::Value>(data).is_ok_and(|value| {
+            value
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(is_terminal_sse_event_type)
+        })
+}
+
+fn stream_chunk_contains_sse_done(chunk: &[u8]) -> bool {
+    let mut tracker = ClientVisibleStreamCompletionTracker::default();
+    tracker.observe_chunk(chunk)
+}
+
+struct ObservedStreamFrame {
+    frame: StreamFrame,
+    observed_at: Instant,
+}
+
+async fn read_next_observed_stream_frame<R>(
     lines: &mut FramedRead<R, LinesCodec>,
-) -> Result<Option<StreamFrame>, GatewayError>
+) -> Result<Option<ObservedStreamFrame>, GatewayError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    Ok(read_next_frame(lines)
+        .await?
+        .map(|frame| ObservedStreamFrame {
+            frame,
+            observed_at: Instant::now(),
+        }))
+}
+
+async fn next_stream_frame<R>(
+    buffered_frames: &mut VecDeque<ObservedStreamFrame>,
+    lines: &mut FramedRead<R, LinesCodec>,
+) -> Result<Option<ObservedStreamFrame>, GatewayError>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
     if let Some(frame) = buffered_frames.pop_front() {
         return Ok(Some(frame));
     }
-    read_next_frame(lines).await
+    read_next_observed_stream_frame(lines).await
 }
 
 fn should_refresh_stream_usage_telemetry(
@@ -1015,6 +1762,113 @@ fn should_refresh_stream_usage_telemetry(
 
     (next_ttfb.is_some() && next_ttfb != previous_ttfb)
         || (next_elapsed.is_some() && next_elapsed != previous_elapsed)
+}
+
+fn stream_elapsed_ms_since(started_at: Instant) -> u64 {
+    started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn stream_elapsed_ms_at(started_at: Instant, observed_at: Instant) -> u64 {
+    observed_at
+        .saturating_duration_since(started_at)
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+fn first_stream_event_telemetry(
+    stream_started_at: Instant,
+    event_observed_at: Instant,
+    upstream_telemetry: Option<&ExecutionTelemetry>,
+) -> ExecutionTelemetry {
+    let elapsed_ms = stream_elapsed_ms_at(stream_started_at, event_observed_at);
+    ExecutionTelemetry {
+        ttfb_ms: Some(elapsed_ms),
+        elapsed_ms: Some(elapsed_ms),
+        upstream_bytes: upstream_telemetry.and_then(|telemetry| telemetry.upstream_bytes),
+    }
+}
+
+fn maybe_capture_first_stream_event_telemetry(
+    stream_started_at: Instant,
+    event_observed_at: Instant,
+    upstream_telemetry: Option<&ExecutionTelemetry>,
+    usage_stream_telemetry: &mut Option<ExecutionTelemetry>,
+) -> bool {
+    if usage_stream_telemetry
+        .as_ref()
+        .and_then(|telemetry| telemetry.ttfb_ms)
+        .is_some()
+    {
+        return false;
+    }
+
+    *usage_stream_telemetry = Some(first_stream_event_telemetry(
+        stream_started_at,
+        event_observed_at,
+        upstream_telemetry,
+    ));
+    true
+}
+
+fn usage_refresh_telemetry(
+    upstream_telemetry: &ExecutionTelemetry,
+    usage_stream_telemetry: Option<&ExecutionTelemetry>,
+) -> ExecutionTelemetry {
+    ExecutionTelemetry {
+        ttfb_ms: usage_stream_telemetry.and_then(|telemetry| telemetry.ttfb_ms),
+        elapsed_ms: upstream_telemetry.elapsed_ms,
+        upstream_bytes: upstream_telemetry.upstream_bytes,
+    }
+}
+
+fn maybe_record_first_stream_event_started(
+    state: &AppState,
+    lifecycle_seed: &LifecycleUsageSeed,
+    status_code: u16,
+    stream_started_at: Instant,
+    event_observed_at: Instant,
+    upstream_telemetry: Option<&ExecutionTelemetry>,
+    usage_stream_telemetry: &mut Option<ExecutionTelemetry>,
+) {
+    if !maybe_capture_first_stream_event_telemetry(
+        stream_started_at,
+        event_observed_at,
+        upstream_telemetry,
+        usage_stream_telemetry,
+    ) {
+        return;
+    }
+    let Some(telemetry) = usage_stream_telemetry.as_ref() else {
+        return;
+    };
+    state.usage_runtime.record_stream_started(
+        state.data.as_ref(),
+        lifecycle_seed,
+        status_code,
+        Some(telemetry),
+    );
+}
+
+fn build_terminal_stream_telemetry(
+    stream_started_at: Instant,
+    telemetry: Option<&ExecutionTelemetry>,
+    usage_stream_telemetry: Option<&ExecutionTelemetry>,
+    upstream_bytes: u64,
+) -> ExecutionTelemetry {
+    let current_elapsed_ms = stream_elapsed_ms_since(stream_started_at);
+    let ttfb_ms = usage_stream_telemetry.and_then(|telemetry| telemetry.ttfb_ms);
+    let prior_elapsed_ms = telemetry
+        .and_then(|telemetry| telemetry.elapsed_ms)
+        .or_else(|| usage_stream_telemetry.and_then(|telemetry| telemetry.elapsed_ms))
+        .unwrap_or(0);
+    let elapsed_ms = current_elapsed_ms
+        .max(prior_elapsed_ms)
+        .max(ttfb_ms.unwrap_or(0));
+    ExecutionTelemetry {
+        ttfb_ms,
+        elapsed_ms: Some(elapsed_ms),
+        upstream_bytes: Some(upstream_bytes),
+    }
 }
 
 fn should_skip_direct_finalize_prefetch(
@@ -1066,14 +1920,14 @@ fn should_probe_success_failover_before_stream(headers: &BTreeMap<String, String
 }
 
 async fn probe_local_stream_success_failover_text<R>(
-    buffered_frames: &mut VecDeque<StreamFrame>,
+    buffered_frames: &mut VecDeque<ObservedStreamFrame>,
     lines: &mut FramedRead<R, LinesCodec>,
 ) -> Result<Option<String>, GatewayError>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    while let Some(frame) = read_next_frame(lines).await? {
-        let probe_text = match &frame.payload {
+    while let Some(observed_frame) = read_next_observed_stream_frame(lines).await? {
+        let probe_text = match &observed_frame.frame.payload {
             StreamFramePayload::Data { chunk_b64, text } => {
                 match decode_stream_data_chunk(chunk_b64.as_deref(), text.as_deref()) {
                     Ok(chunk) if !chunk.is_empty() => {
@@ -1085,7 +1939,7 @@ where
             StreamFramePayload::Error { .. } | StreamFramePayload::Eof { .. } => None,
             StreamFramePayload::Headers { .. } | StreamFramePayload::Telemetry { .. } => None,
         };
-        buffered_frames.push_back(frame);
+        buffered_frames.push_back(observed_frame);
         if probe_text.is_some() {
             return Ok(probe_text);
         }
@@ -1134,8 +1988,15 @@ async fn execute_stream_from_frame_stream(
             "execution runtime stream must start with headers frame".to_string(),
         ));
     };
-    let report_context =
+    let mut report_context =
         attach_provider_response_headers_to_report_context(report_context, &headers);
+    if status_code == 200 {
+        seed_kiro_simulated_cache_enabled(state, &plan, &mut report_context).await;
+        if kiro_simulated_cache_enabled_from_report_context(report_context.as_ref()) {
+            seed_kiro_report_context_input_tokens(&plan, &mut report_context);
+        }
+        seed_kiro_report_context_prompt_cache_usage(state, &plan, &mut report_context).await;
+    }
     let mut buffered_frames = VecDeque::new();
     let mut stream_terminal_summary: Option<ExecutionStreamTerminalSummary> = None;
     if status_code == 200 && should_probe_success_failover_before_stream(&headers) {
@@ -1192,24 +2053,46 @@ async fn execute_stream_from_frame_stream(
 
     if !(200..300).contains(&status_code) {
         let provider_error_body = collect_error_body(&mut lines).await?;
-        let synthetic_body_json =
-            should_synthesize_non_success_stream_error_body(status_code, &provider_error_body)
-                .then(|| build_synthetic_non_success_stream_error_body(status_code, &headers));
-        let (provider_body_json, provider_body_base64) =
-            decode_stream_error_body(&headers, &provider_error_body);
-        let client_status_code = stream_client_error_status_code_for_upstream_status(status_code);
-        let wrapped_binary_body_json = wrap_non_json_binary_stream_error_for_client(
-            plan_kind,
-            &headers,
+        let private_error_body_json = extract_provider_private_stream_error_body(
+            report_context.as_ref(),
             &provider_error_body,
-        )?;
-        let (client_body_json, client_error_body) =
+        );
+        let provider_private_error_decoded = private_error_body_json.is_some();
+        let synthetic_body_json = (!provider_private_error_decoded
+            && should_synthesize_non_success_stream_error_body(status_code, &provider_error_body))
+        .then(|| build_synthetic_non_success_stream_error_body(status_code, &headers));
+        let (provider_body_json, provider_body_base64) =
+            if let Some(error_body_json) = private_error_body_json {
+                (Some(error_body_json), None)
+            } else {
+                decode_stream_error_body(&headers, &provider_error_body)
+            };
+        let client_status_code = stream_client_error_status_code_for_upstream_status(status_code);
+        let wrapped_binary_body_json = if provider_private_error_decoded {
+            None
+        } else {
+            wrap_non_json_binary_stream_error_for_client(plan_kind, &headers, &provider_error_body)?
+        };
+        let (client_body_json, client_error_body, payload_client_body_json) =
             if let Some(body_json) = synthetic_body_json.or(wrapped_binary_body_json) {
                 let body_bytes = serde_json::to_vec(&body_json)
                     .map_err(|err| GatewayError::Internal(err.to_string()))?;
-                (Some(body_json), body_bytes)
+                (Some(body_json.clone()), body_bytes, Some(body_json))
+            } else if provider_private_error_decoded {
+                let body_json = provider_body_json.clone().ok_or_else(|| {
+                    GatewayError::Internal(
+                        "decoded provider private stream error body is missing".to_string(),
+                    )
+                })?;
+                let body_bytes = serde_json::to_vec(&body_json)
+                    .map_err(|err| GatewayError::Internal(err.to_string()))?;
+                (Some(body_json), body_bytes, None)
             } else {
-                (provider_body_json.clone(), provider_error_body.clone())
+                (
+                    provider_body_json.clone(),
+                    provider_error_body.clone(),
+                    provider_body_json.clone(),
+                )
             };
         let error_response_text =
             local_failover_response_text(client_body_json.as_ref(), &client_error_body, None);
@@ -1396,6 +2279,11 @@ async fn execute_stream_from_frame_stream(
         } else {
             headers.clone()
         };
+        if provider_private_error_decoded {
+            client_headers.remove("content-encoding");
+            client_headers.remove("content-length");
+            client_headers.insert("content-type".to_string(), "application/json".to_string());
+        }
         apply_endpoint_response_header_rules(
             state,
             &plan,
@@ -1427,7 +2315,7 @@ async fn execute_stream_from_frame_stream(
             provider_body_json,
             provider_body_base64,
             client_headers,
-            client_body_json,
+            payload_client_body_json,
             None,
         );
         record_sync_terminal_usage(state, &plan, payload.report_context.as_ref(), &payload);
@@ -1501,6 +2389,7 @@ async fn execute_stream_from_frame_stream(
     let mut prefetched_body = Vec::new();
     let mut prefetched_inspection_body = Vec::new();
     let mut prefetched_telemetry: Option<ExecutionTelemetry> = None;
+    let mut prefetched_usage_telemetry: Option<ExecutionTelemetry> = None;
     let mut reached_eof = false;
     let mut sync_json_stream_bridge_active = false;
     if skip_direct_finalize_prefetch {
@@ -1560,7 +2449,7 @@ async fn execute_stream_from_frame_stream(
             } else {
                 next_stream_frame(&mut buffered_frames, &mut lines).await
             };
-            let Some(frame) = (match next_frame_result {
+            let Some(observed_frame) = (match next_frame_result {
                 Ok(frame) => frame,
                 Err(err) => {
                     let failure = build_stream_failure_report(
@@ -1578,7 +2467,7 @@ async fn execute_stream_from_frame_stream(
                         candidate_id,
                         report_kind,
                         headers,
-                        prefetched_telemetry,
+                        prefetched_usage_telemetry.clone(),
                         &provider_prefetched_body,
                         failure,
                     )
@@ -1588,8 +2477,15 @@ async fn execute_stream_from_frame_stream(
                 reached_eof = true;
                 break;
             };
-            match frame.payload {
+            let frame_observed_at = observed_frame.observed_at;
+            match observed_frame.frame.payload {
                 StreamFramePayload::Data { chunk_b64, text } => {
+                    maybe_capture_first_stream_event_telemetry(
+                        stream_started_at,
+                        frame_observed_at,
+                        prefetched_telemetry.as_ref(),
+                        &mut prefetched_usage_telemetry,
+                    );
                     let chunk =
                         match decode_stream_data_chunk(chunk_b64.as_deref(), text.as_deref()) {
                             Ok(chunk) => chunk,
@@ -1611,7 +2507,7 @@ async fn execute_stream_from_frame_stream(
                                     candidate_id,
                                     report_kind,
                                     headers,
-                                    prefetched_telemetry,
+                                    prefetched_usage_telemetry.clone(),
                                     &prefetched_body,
                                     failure,
                                 )
@@ -1625,6 +2521,30 @@ async fn execute_stream_from_frame_stream(
 
                     provider_prefetched_body.extend_from_slice(&chunk);
                     prefetched_inspection_body.extend_from_slice(&chunk);
+
+                    if let Some(error_body_json) = extract_provider_private_stream_error_body(
+                        report_context.as_ref(),
+                        &prefetched_inspection_body,
+                    ) {
+                        let error_status_code =
+                            resolve_local_sync_error_status_code(status_code, &error_body_json);
+                        return handle_prefetch_provider_private_stream_error(
+                            state,
+                            trace_id,
+                            decision,
+                            &plan,
+                            report_context,
+                            request_id,
+                            candidate_id,
+                            report_kind,
+                            headers,
+                            prefetched_usage_telemetry.clone(),
+                            &provider_prefetched_body,
+                            error_status_code,
+                            error_body_json,
+                        )
+                        .await;
+                    }
 
                     let inspection = inspect_prefetched_stream_body(
                         &upstream_headers,
@@ -1656,7 +2576,7 @@ async fn execute_stream_from_frame_stream(
                                 headers,
                                 Some(body_json),
                                 None,
-                                prefetched_telemetry,
+                                prefetched_usage_telemetry.clone(),
                             );
                             record_sync_terminal_usage(
                                 state,
@@ -1722,7 +2642,7 @@ async fn execute_stream_from_frame_stream(
                                         candidate_id,
                                         report_kind,
                                         headers,
-                                        prefetched_telemetry,
+                                        prefetched_usage_telemetry.clone(),
                                         &provider_prefetched_body,
                                         failure,
                                     )
@@ -1755,7 +2675,7 @@ async fn execute_stream_from_frame_stream(
                                     candidate_id,
                                     report_kind,
                                     headers,
-                                    prefetched_telemetry,
+                                    prefetched_usage_telemetry.clone(),
                                     &provider_prefetched_body,
                                     failure,
                                 )
@@ -1786,7 +2706,7 @@ async fn execute_stream_from_frame_stream(
                                     candidate_id,
                                     report_kind,
                                     headers,
-                                    prefetched_telemetry,
+                                    prefetched_usage_telemetry.clone(),
                                     &provider_prefetched_body,
                                     failure,
                                 )
@@ -1837,7 +2757,7 @@ async fn execute_stream_from_frame_stream(
                         candidate_id,
                         report_kind,
                         headers,
-                        prefetched_telemetry,
+                        prefetched_usage_telemetry.clone(),
                         &provider_prefetched_body,
                         build_stream_failure_from_execution_error(&error),
                     )
@@ -1850,11 +2770,16 @@ async fn execute_stream_from_frame_stream(
     drop(private_stream_normalizer);
     drop(local_stream_rewriter);
 
+    let initial_usage_telemetry = prefetched_usage_telemetry.clone().or_else(|| {
+        prefetched_telemetry
+            .as_ref()
+            .map(|telemetry| usage_refresh_telemetry(telemetry, None))
+    });
     state.usage_runtime.record_stream_started(
         state.data.as_ref(),
         &lifecycle_seed,
         status_code,
-        prefetched_telemetry.as_ref(),
+        initial_usage_telemetry.as_ref(),
     );
     if let Some(snapshot) = request_candidate_status_snapshot {
         let state_bg = state.clone();
@@ -1904,8 +2829,9 @@ async fn execute_stream_from_frame_stream(
     let candidate_id_for_report = candidate_id.clone();
     let candidate_index_for_report = candidate_index.clone();
     let is_openai_image_stream_for_report = plan_kind == OPENAI_IMAGE_STREAM_PLAN_KIND;
-    let openai_image_stream_total_timeout_ms =
-        resolve_openai_image_stream_total_timeout_ms(plan_kind, &plan);
+    let response_headers_are_sse = response_headers_indicate_sse(&headers);
+    let emit_proxy_generated_sse_control_blocks =
+        response_headers_are_sse && client_format_allows_proxy_generated_sse_control_blocks(&plan);
     let plan_for_report = plan;
     let emit_passthrough_sse_terminal_error = skip_direct_finalize_prefetch
         && response_headers_indicate_sse(&upstream_headers)
@@ -1981,7 +2907,10 @@ async fn execute_stream_from_frame_stream(
             max_stream_body_buffer_bytes,
             &mut client_body_truncated,
         );
-        let mut usage_stream_telemetry: Option<ExecutionTelemetry> = initial_telemetry.clone();
+        let mut client_stream_completion_tracker = ClientVisibleStreamCompletionTracker::default();
+        let mut client_visible_stream_completed =
+            client_stream_completion_tracker.observe_chunk(&prefetched_body_for_report);
+        let mut usage_stream_telemetry: Option<ExecutionTelemetry> = initial_usage_telemetry;
         let mut telemetry: Option<ExecutionTelemetry> = initial_telemetry;
         let reached_eof = initial_reached_eof;
         let mut downstream_dropped = false;
@@ -2163,65 +3092,14 @@ async fn execute_stream_from_frame_stream(
         }
 
         if terminal_failure.is_none() && !reached_eof {
-            let mut image_stream_total_timeout = openai_image_stream_total_timeout_ms
-                .map(|timeout_ms| Box::pin(tokio::time::sleep(Duration::from_millis(timeout_ms))));
             loop {
-                let next_frame_result = if let Some(timeout_sleep) =
-                    image_stream_total_timeout.as_mut()
-                {
-                    tokio::select! {
-                        result = next_stream_frame(&mut buffered_frames, &mut lines) => result,
-                        _ = timeout_sleep.as_mut() => {
-                            let timeout_ms = openai_image_stream_total_timeout_ms
-                                .unwrap_or(OPENAI_IMAGE_STREAM_DEFAULT_TOTAL_TIMEOUT_MS);
-                            let elapsed_ms = stream_started_at_for_report
-                                .elapsed()
-                                .as_millis()
-                                .min(u128::from(u64::MAX)) as u64;
-                            warn!(
-                                event_name = "openai_image_stream_total_timeout",
-                                log_type = "ops",
-                                trace_id = %trace_id_owned,
-                                request_id = %request_id_for_report_log,
-                                candidate_id = ?candidate_id_for_report.as_deref(),
-                                candidate_index = candidate_index_for_report.as_str(),
-                                plan_kind = plan_kind_for_report.as_str(),
-                                provider_name = plan_for_report.provider_name.as_deref().unwrap_or("-"),
-                                endpoint_id = %plan_for_report.endpoint_id,
-                                key_id = %plan_for_report.key_id,
-                                model_name = plan_for_report.model_name.as_deref().unwrap_or("-"),
-                                elapsed_ms,
-                                timeout_ms,
-                                provider_bytes = provider_stream_bytes.load(Ordering::Relaxed),
-                                client_bytes = client_stream_bytes.load(Ordering::Relaxed),
-                                last_upstream_frame_elapsed_ms = last_upstream_frame_elapsed_ms.load(Ordering::Relaxed),
-                                last_client_chunk_elapsed_ms = last_client_chunk_elapsed_ms.load(Ordering::Relaxed),
-                                "gateway OpenAI image stream exceeded total timeout"
-                            );
-                            telemetry = Some(ExecutionTelemetry {
-                                ttfb_ms: telemetry
-                                    .as_ref()
-                                    .and_then(|telemetry| telemetry.ttfb_ms)
-                                    .or_else(|| {
-                                        usage_stream_telemetry
-                                            .as_ref()
-                                            .and_then(|telemetry| telemetry.ttfb_ms)
-                                    }),
-                                elapsed_ms: Some(elapsed_ms),
-                                upstream_bytes: Some(provider_stream_bytes.load(Ordering::Relaxed)),
-                            });
-                            terminal_failure = Some(build_stream_failure_report(
-                                "image_stream_total_timeout",
-                                format!(
-                                    "OpenAI image stream exceeded total timeout of {timeout_ms}ms"
-                                ),
-                                504,
-                            ));
-                            break;
-                        }
+                let next_frame_result = tokio::select! {
+                    biased;
+                    _ = tx.closed(), if client_visible_stream_completed => {
+                        downstream_dropped = true;
+                        break;
                     }
-                } else {
-                    next_stream_frame(&mut buffered_frames, &mut lines).await
+                    result = next_stream_frame(&mut buffered_frames, &mut lines) => result,
                 };
                 let next_frame = match next_frame_result {
                     Ok(frame) => frame,
@@ -2243,16 +3121,27 @@ async fn execute_stream_from_frame_stream(
                         break;
                     }
                 };
-                let Some(frame) = next_frame else {
+                let Some(observed_frame) = next_frame else {
+                    if tx.is_closed() {
+                        downstream_dropped = true;
+                    }
                     break;
                 };
-                let frame_elapsed_ms = stream_started_at_for_report
-                    .elapsed()
-                    .as_millis()
-                    .min(u128::from(u64::MAX)) as u64;
+                let frame_observed_at = observed_frame.observed_at;
+                let frame_elapsed_ms =
+                    stream_elapsed_ms_at(stream_started_at_for_report, frame_observed_at);
                 last_upstream_frame_elapsed_ms.store(frame_elapsed_ms, Ordering::Relaxed);
-                match frame.payload {
+                match observed_frame.frame.payload {
                     StreamFramePayload::Data { chunk_b64, text } => {
+                        maybe_record_first_stream_event_started(
+                            &state_for_report,
+                            &lifecycle_seed_for_report,
+                            status_code,
+                            stream_started_at_for_report,
+                            frame_observed_at,
+                            telemetry.as_ref(),
+                            &mut usage_stream_telemetry,
+                        );
                         if sync_json_stream_bridge_active_for_report {
                             continue;
                         }
@@ -2320,6 +3209,11 @@ async fn execute_stream_from_frame_stream(
                         } else {
                             chunk
                         };
+                        let provider_private_error_body_json =
+                            extract_provider_private_stream_error_body(
+                                stream_usage_report_context.as_ref(),
+                                &normalized_chunk,
+                            );
                         if let (Some(observer), Some(report_context)) = (
                             stream_usage_observer.as_mut(),
                             stream_usage_report_context.as_ref(),
@@ -2358,33 +3252,19 @@ async fn execute_stream_from_frame_stream(
                         };
 
                         if rewritten_chunk.is_empty() {
+                            if let Some(error_body_json) = provider_private_error_body_json {
+                                let error_status_code = resolve_local_sync_error_status_code(
+                                    status_code,
+                                    &error_body_json,
+                                );
+                                terminal_failure =
+                                    Some(build_stream_failure_from_provider_error_body(
+                                        error_status_code,
+                                        &error_body_json,
+                                    ));
+                                break;
+                            }
                             continue;
-                        }
-
-                        if usage_stream_telemetry
-                            .as_ref()
-                            .and_then(|telemetry| telemetry.ttfb_ms)
-                            .is_none()
-                        {
-                            let first_data_elapsed_ms = stream_started_at_for_report
-                                .elapsed()
-                                .as_millis()
-                                .min(u128::from(u64::MAX))
-                                as u64;
-                            let first_data_telemetry = ExecutionTelemetry {
-                                ttfb_ms: Some(first_data_elapsed_ms),
-                                elapsed_ms: Some(first_data_elapsed_ms),
-                                upstream_bytes: telemetry
-                                    .as_ref()
-                                    .and_then(|telemetry| telemetry.upstream_bytes),
-                            };
-                            state_for_report.usage_runtime.record_stream_started(
-                                state_for_report.data.as_ref(),
-                                &lifecycle_seed_for_report,
-                                status_code,
-                                Some(&first_data_telemetry),
-                            );
-                            usage_stream_telemetry = Some(first_data_telemetry);
                         }
 
                         append_stream_capture_bytes(
@@ -2395,18 +3275,23 @@ async fn execute_stream_from_frame_stream(
                         );
                         let rewritten_chunk_len =
                             u64::try_from(rewritten_chunk.len()).unwrap_or(u64::MAX);
-                        if tx.send(Ok(Bytes::from(rewritten_chunk))).await.is_err() {
+                        if downstream_dropped {
+                            continue;
+                        }
+                        let rewritten_chunk = Bytes::from(rewritten_chunk);
+                        if tx.send(Ok(rewritten_chunk.clone())).await.is_err() {
                             warn!(
                                 event_name = "stream_execution_downstream_disconnected",
                                 log_type = "ops",
                                 trace_id = %trace_id_owned,
                                 request_id = %request_id_for_report_log,
                                 candidate_id = ?candidate_id_for_report.as_deref(),
-                                "gateway stream downstream dropped; stopping execution runtime stream forwarding"
+                                "gateway stream downstream dropped; continuing to drain execution runtime stream"
                             );
                             downstream_dropped = true;
-                            break;
                         } else {
+                            client_visible_stream_completed |= client_stream_completion_tracker
+                                .observe_chunk(rewritten_chunk.as_ref());
                             client_stream_bytes.fetch_add(rewritten_chunk_len, Ordering::Relaxed);
                             last_client_chunk_elapsed_ms.store(
                                 stream_started_at_for_report
@@ -2417,22 +3302,35 @@ async fn execute_stream_from_frame_stream(
                                 Ordering::Relaxed,
                             );
                         }
+                        if let Some(error_body_json) = provider_private_error_body_json {
+                            let error_status_code =
+                                resolve_local_sync_error_status_code(status_code, &error_body_json);
+                            terminal_failure = Some(build_stream_failure_from_provider_error_body(
+                                error_status_code,
+                                &error_body_json,
+                            ));
+                            break;
+                        }
                     }
                     StreamFramePayload::Telemetry {
                         telemetry: frame_telemetry,
                     } => {
+                        let usage_frame_telemetry = usage_refresh_telemetry(
+                            &frame_telemetry,
+                            usage_stream_telemetry.as_ref(),
+                        );
                         let should_refresh_stream_usage = should_refresh_stream_usage_telemetry(
                             usage_stream_telemetry.as_ref(),
-                            &frame_telemetry,
+                            &usage_frame_telemetry,
                         );
                         if should_refresh_stream_usage {
                             state_for_report.usage_runtime.record_stream_started(
                                 state_for_report.data.as_ref(),
                                 &lifecycle_seed_for_report,
                                 status_code,
-                                Some(&frame_telemetry),
+                                Some(&usage_frame_telemetry),
                             );
-                            usage_stream_telemetry = Some(frame_telemetry.clone());
+                            usage_stream_telemetry = Some(usage_frame_telemetry);
                         }
                         telemetry = Some(frame_telemetry);
                     }
@@ -2462,28 +3360,40 @@ async fn execute_stream_from_frame_stream(
 
         if downstream_dropped {
             debug!(
-                event_name = "execution_runtime_stream_flush_skipped",
+                event_name = "execution_runtime_stream_client_flush_skipped",
                 log_type = "debug",
                 debug_context = "redacted",
                 stream_status = "downstream_disconnected",
                 trace_id = %trace_id_owned,
-                "gateway skipped local stream flush after downstream disconnect"
+                "gateway skipped client stream flush after downstream disconnect"
             );
-        } else {
-            if let Some(normalizer) = private_stream_normalizer.as_mut() {
-                match normalizer.finish() {
-                    Ok(normalized_chunk) if !normalized_chunk.is_empty() => {
-                        if let (Some(observer), Some(report_context)) = (
-                            stream_usage_observer.as_mut(),
+        }
+        // Buffered stream state is partial after a terminal failure; normal
+        // finish paths may synthesize successful terminal events.
+        let should_finish_stream_rewriters = terminal_failure.is_none();
+        if let Some(normalizer) = private_stream_normalizer
+            .as_mut()
+            .filter(|_| should_finish_stream_rewriters)
+        {
+            match normalizer.finish() {
+                Ok(normalized_chunk) if !normalized_chunk.is_empty() => {
+                    let provider_private_error_body_json =
+                        extract_provider_private_stream_error_body(
                             stream_usage_report_context.as_ref(),
-                        ) {
-                            observe_stream_usage_bytes(
-                                observer,
-                                report_context,
-                                &mut stream_usage_observer_buffered,
-                                &normalized_chunk,
-                            );
-                        }
+                            &normalized_chunk,
+                        );
+                    if let (Some(observer), Some(report_context)) = (
+                        stream_usage_observer.as_mut(),
+                        stream_usage_report_context.as_ref(),
+                    ) {
+                        observe_stream_usage_bytes(
+                            observer,
+                            report_context,
+                            &mut stream_usage_observer_buffered,
+                            &normalized_chunk,
+                        );
+                    }
+                    if !downstream_dropped {
                         let rewritten_chunk = if let Some(rewriter) = local_stream_rewriter.as_mut()
                         {
                             match rewriter.push_chunk(&normalized_chunk) {
@@ -2498,13 +3408,12 @@ async fn execute_stream_from_frame_stream(
                                         error = ?err,
                                         "gateway failed to rewrite normalized private stream chunk during flush"
                                     );
-                                    terminal_failure.get_or_insert_with(|| {
-                                        build_stream_failure_report(
-                                            "execution_runtime_stream_rewrite_flush_error",
-                                            format!("failed to rewrite normalized private stream chunk during flush: {err:?}"),
-                                            502,
-                                        )
-                                    });
+                                    let failure = build_stream_failure_report(
+                                        "execution_runtime_stream_rewrite_flush_error",
+                                        format!("failed to rewrite normalized private stream chunk during flush: {err:?}"),
+                                        502,
+                                    );
+                                    terminal_failure.get_or_insert(failure);
                                     Vec::new()
                                 }
                             }
@@ -2520,7 +3429,8 @@ async fn execute_stream_from_frame_stream(
                             );
                             let rewritten_chunk_len =
                                 u64::try_from(rewritten_chunk.len()).unwrap_or(u64::MAX);
-                            if tx.send(Ok(Bytes::from(rewritten_chunk))).await.is_err() {
+                            let rewritten_chunk = Bytes::from(rewritten_chunk);
+                            if tx.send(Ok(rewritten_chunk.clone())).await.is_err() {
                                 warn!(
                                     event_name = "stream_execution_downstream_flush_disconnected",
                                     log_type = "ops",
@@ -2531,6 +3441,8 @@ async fn execute_stream_from_frame_stream(
                                 );
                                 downstream_dropped = true;
                             } else {
+                                client_visible_stream_completed |= client_stream_completion_tracker
+                                    .observe_chunk(rewritten_chunk.as_ref());
                                 client_stream_bytes
                                     .fetch_add(rewritten_chunk_len, Ordering::Relaxed);
                                 last_client_chunk_elapsed_ms.store(
@@ -2543,81 +3455,94 @@ async fn execute_stream_from_frame_stream(
                                 );
                             }
                         }
+                        if let Some(error_body_json) = provider_private_error_body_json {
+                            let error_status_code =
+                                resolve_local_sync_error_status_code(status_code, &error_body_json);
+                            terminal_failure.get_or_insert_with(|| {
+                                build_stream_failure_from_provider_error_body(
+                                    error_status_code,
+                                    &error_body_json,
+                                )
+                            });
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    warn!(
+                        event_name = "stream_execution_normalization_flush_failed",
+                        log_type = "ops",
+                        trace_id = %trace_id_owned,
+                        request_id = %request_id_for_report_log,
+                        candidate_id = ?candidate_id_for_report.as_deref(),
+                        error = ?err,
+                        "gateway failed to flush private stream normalization"
+                    );
+                    terminal_failure.get_or_insert_with(|| {
+                        build_stream_failure_report(
+                            "execution_runtime_stream_rewrite_flush_error",
+                            format!("failed to flush private stream normalization: {err:?}"),
+                            502,
+                        )
+                    });
+                }
+            }
+        }
+        if !downstream_dropped && terminal_failure.is_none() {
+            if let Some(rewriter) = local_stream_rewriter.as_mut() {
+                match rewriter.finish() {
+                    Ok(flushed_chunk) if !flushed_chunk.is_empty() => {
+                        append_stream_capture_bytes(
+                            &mut buffered_body,
+                            &flushed_chunk,
+                            max_stream_body_buffer_bytes,
+                            &mut client_body_truncated,
+                        );
+                        let flushed_chunk_len =
+                            u64::try_from(flushed_chunk.len()).unwrap_or(u64::MAX);
+                        let flushed_chunk = Bytes::from(flushed_chunk);
+                        if tx.send(Ok(flushed_chunk.clone())).await.is_err() {
+                            warn!(
+                                event_name = "stream_execution_downstream_rewrite_flush_disconnected",
+                                log_type = "ops",
+                                trace_id = %trace_id_owned,
+                                request_id = %request_id_for_report_log,
+                            candidate_id = ?candidate_id_for_report.as_deref(),
+                            "gateway stream downstream dropped while flushing local stream rewrite"
+                            );
+                            downstream_dropped = true;
+                        } else {
+                            client_visible_stream_completed |= client_stream_completion_tracker
+                                .observe_chunk(flushed_chunk.as_ref());
+                            client_stream_bytes.fetch_add(flushed_chunk_len, Ordering::Relaxed);
+                            last_client_chunk_elapsed_ms.store(
+                                stream_started_at_for_report
+                                    .elapsed()
+                                    .as_millis()
+                                    .min(u128::from(u64::MAX))
+                                    as u64,
+                                Ordering::Relaxed,
+                            );
+                        }
                     }
                     Ok(_) => {}
                     Err(err) => {
                         warn!(
-                            event_name = "stream_execution_normalization_flush_failed",
+                            event_name = "stream_execution_rewrite_flush_failed",
                             log_type = "ops",
                             trace_id = %trace_id_owned,
                             request_id = %request_id_for_report_log,
                             candidate_id = ?candidate_id_for_report.as_deref(),
                             error = ?err,
-                            "gateway failed to flush private stream normalization"
+                            "gateway failed to flush local stream rewrite"
                         );
                         terminal_failure.get_or_insert_with(|| {
                             build_stream_failure_report(
                                 "execution_runtime_stream_rewrite_flush_error",
-                                format!("failed to flush private stream normalization: {err:?}"),
+                                format!("failed to flush local stream rewrite: {err:?}"),
                                 502,
                             )
                         });
-                    }
-                }
-            }
-            if !downstream_dropped {
-                if let Some(rewriter) = local_stream_rewriter.as_mut() {
-                    match rewriter.finish() {
-                        Ok(flushed_chunk) if !flushed_chunk.is_empty() => {
-                            append_stream_capture_bytes(
-                                &mut buffered_body,
-                                &flushed_chunk,
-                                max_stream_body_buffer_bytes,
-                                &mut client_body_truncated,
-                            );
-                            let flushed_chunk_len =
-                                u64::try_from(flushed_chunk.len()).unwrap_or(u64::MAX);
-                            if tx.send(Ok(Bytes::from(flushed_chunk))).await.is_err() {
-                                warn!(
-                                    event_name = "stream_execution_downstream_rewrite_flush_disconnected",
-                                    log_type = "ops",
-                                    trace_id = %trace_id_owned,
-                                    request_id = %request_id_for_report_log,
-                                candidate_id = ?candidate_id_for_report.as_deref(),
-                                "gateway stream downstream dropped while flushing local stream rewrite"
-                                );
-                                downstream_dropped = true;
-                            } else {
-                                client_stream_bytes.fetch_add(flushed_chunk_len, Ordering::Relaxed);
-                                last_client_chunk_elapsed_ms.store(
-                                    stream_started_at_for_report
-                                        .elapsed()
-                                        .as_millis()
-                                        .min(u128::from(u64::MAX))
-                                        as u64,
-                                    Ordering::Relaxed,
-                                );
-                            }
-                        }
-                        Ok(_) => {}
-                        Err(err) => {
-                            warn!(
-                                event_name = "stream_execution_rewrite_flush_failed",
-                                log_type = "ops",
-                                trace_id = %trace_id_owned,
-                                request_id = %request_id_for_report_log,
-                                candidate_id = ?candidate_id_for_report.as_deref(),
-                                error = ?err,
-                                "gateway failed to flush local stream rewrite"
-                            );
-                            terminal_failure.get_or_insert_with(|| {
-                                build_stream_failure_report(
-                                    "execution_runtime_stream_rewrite_flush_error",
-                                    format!("failed to flush local stream rewrite: {err:?}"),
-                                    502,
-                                )
-                            });
-                        }
                     }
                 }
             }
@@ -2697,6 +3622,18 @@ async fn execute_stream_from_frame_stream(
             ),
         );
 
+        if downstream_dropped && client_visible_stream_completed && terminal_failure.is_none() {
+            debug!(
+                event_name = "execution_runtime_stream_downstream_closed_after_done",
+                log_type = "debug",
+                trace_id = %trace_id_owned,
+                request_id = %request_id_for_report_log,
+                candidate_id = ?candidate_id_for_report.as_deref(),
+                "gateway treats downstream close after client-visible SSE DONE as completed"
+            );
+            downstream_dropped = false;
+        }
+
         if downstream_dropped {
             debug!(
                 event_name = "execution_runtime_stream_report_skipped",
@@ -2707,6 +3644,12 @@ async fn execute_stream_from_frame_stream(
                 trace_id = %trace_id_owned,
                 "gateway skipped stream report because downstream disconnected before completion"
             );
+            let terminal_telemetry = Some(build_terminal_stream_telemetry(
+                stream_started_at_for_report,
+                telemetry.as_ref(),
+                usage_stream_telemetry.as_ref(),
+                provider_stream_bytes.load(Ordering::Relaxed),
+            ));
             let usage_payload = build_stream_usage_payload(
                 trace_id_owned,
                 report_kind_owned.unwrap_or_default(),
@@ -2718,7 +3661,7 @@ async fn execute_stream_from_frame_stream(
                 &buffered_body,
                 client_body_truncated,
                 stream_terminal_summary,
-                telemetry,
+                terminal_telemetry,
             );
             record_stream_terminal_usage(
                 &state_for_report,
@@ -2750,6 +3693,12 @@ async fn execute_stream_from_frame_stream(
 
         if let Some(failure) = terminal_failure {
             record_manual_proxy_stream_error(&state_for_report, &plan_for_report).await;
+            let terminal_telemetry = Some(build_terminal_stream_telemetry(
+                stream_started_at_for_report,
+                telemetry.as_ref(),
+                usage_stream_telemetry.as_ref(),
+                provider_stream_bytes.load(Ordering::Relaxed),
+            ));
             submit_midstream_stream_failure(
                 &state_for_report,
                 &trace_id_owned,
@@ -2757,7 +3706,7 @@ async fn execute_stream_from_frame_stream(
                 direct_stream_finalize_kind_owned.as_deref(),
                 report_context_owned,
                 headers_for_report,
-                telemetry,
+                terminal_telemetry,
                 &provider_buffered_body,
                 candidate_started_unix_secs_for_report,
                 failure,
@@ -2766,7 +3715,46 @@ async fn execute_stream_from_frame_stream(
             return;
         }
 
+        maybe_apply_kiro_prompt_cache_usage_to_stream_summary(
+            &state_for_report,
+            &plan_for_report,
+            report_context_owned.as_ref(),
+            &mut stream_terminal_summary,
+        )
+        .await;
+        let requires_observed_terminal_event = stream_requires_observed_terminal_event(
+            plan_for_report.provider_api_format.as_str(),
+            stream_usage_report_context.as_ref(),
+        );
+        ensure_stream_terminal_summary_for_missing_observed_finish(
+            &mut stream_terminal_summary,
+            requires_observed_terminal_event,
+        );
+        let missing_observed_finish =
+            stream_terminal_summary_missing_observed_finish_with_requirement(
+                stream_terminal_summary.as_ref(),
+                requires_observed_terminal_event,
+            );
+
         let should_submit_report = report_kind_owned.is_some();
+        let terminal_telemetry = Some(build_terminal_stream_telemetry(
+            stream_started_at_for_report,
+            telemetry.as_ref(),
+            usage_stream_telemetry.as_ref(),
+            provider_stream_bytes.load(Ordering::Relaxed),
+        ));
+        let stream_failed = stream_terminal_summary_represents_failure_with_requirement(
+            stream_terminal_summary.as_ref(),
+            requires_observed_terminal_event,
+        );
+        let stream_terminal_error_message = stream_terminal_summary
+            .as_ref()
+            .and_then(|summary| summary.parser_error.clone())
+            .or_else(|| {
+                missing_observed_finish.then(|| {
+                    "execution runtime stream ended before provider terminal event".to_string()
+                })
+            });
         let usage_payload = build_stream_usage_payload(
             trace_id_owned.clone(),
             report_kind_owned.unwrap_or_default(),
@@ -2778,37 +3766,50 @@ async fn execute_stream_from_frame_stream(
             &buffered_body,
             client_body_truncated,
             stream_terminal_summary,
-            telemetry,
+            terminal_telemetry,
         );
-        apply_local_execution_effect(
-            &state_for_report,
-            LocalExecutionEffectContext {
-                plan: &plan_for_report,
-                report_context: usage_payload.report_context.as_ref(),
-            },
-            LocalExecutionEffect::HealthSuccess(LocalHealthSuccessEffect),
-        )
-        .await;
-        apply_local_execution_effect(
-            &state_for_report,
-            LocalExecutionEffectContext {
-                plan: &plan_for_report,
-                report_context: usage_payload.report_context.as_ref(),
-            },
-            LocalExecutionEffect::AdaptiveSuccess(LocalAdaptiveSuccessEffect),
-        )
-        .await;
-        apply_local_execution_effect(
-            &state_for_report,
-            LocalExecutionEffectContext {
-                plan: &plan_for_report,
-                report_context: usage_payload.report_context.as_ref(),
-            },
-            LocalExecutionEffect::PoolSuccessStream {
-                payload: &usage_payload,
-            },
-        )
-        .await;
+        if stream_failed {
+            warn!(
+                event_name = "execution_runtime_stream_missing_terminal_event",
+                log_type = "ops",
+                trace_id = %trace_id_owned,
+                request_id = %request_id_for_report_log,
+                candidate_id = ?candidate_id_for_report.as_deref(),
+                status_code,
+                error_message = stream_terminal_error_message.as_deref().unwrap_or_default(),
+                "gateway stream ended with a failed terminal state"
+            );
+        } else {
+            apply_local_execution_effect(
+                &state_for_report,
+                LocalExecutionEffectContext {
+                    plan: &plan_for_report,
+                    report_context: usage_payload.report_context.as_ref(),
+                },
+                LocalExecutionEffect::HealthSuccess(LocalHealthSuccessEffect),
+            )
+            .await;
+            apply_local_execution_effect(
+                &state_for_report,
+                LocalExecutionEffectContext {
+                    plan: &plan_for_report,
+                    report_context: usage_payload.report_context.as_ref(),
+                },
+                LocalExecutionEffect::AdaptiveSuccess(LocalAdaptiveSuccessEffect),
+            )
+            .await;
+            apply_local_execution_effect(
+                &state_for_report,
+                LocalExecutionEffectContext {
+                    plan: &plan_for_report,
+                    report_context: usage_payload.report_context.as_ref(),
+                },
+                LocalExecutionEffect::PoolSuccessStream {
+                    payload: &usage_payload,
+                },
+            )
+            .await;
+        }
         record_stream_terminal_usage(
             &state_for_report,
             &plan_for_report,
@@ -2821,10 +3822,24 @@ async fn execute_stream_from_frame_stream(
             &plan_for_report,
             usage_payload.report_context.as_ref(),
             SchedulerRequestCandidateStatusUpdate {
-                status: RequestCandidateStatus::Success,
+                status: if stream_failed {
+                    RequestCandidateStatus::Failed
+                } else {
+                    RequestCandidateStatus::Success
+                },
                 status_code: Some(status_code),
-                error_type: None,
-                error_message: None,
+                error_type: if stream_failed {
+                    if missing_observed_finish {
+                        Some("stream_missing_terminal_event".to_string())
+                    } else {
+                        Some("stream_terminal_error".to_string())
+                    }
+                } else {
+                    None
+                },
+                error_message: stream_failed
+                    .then_some(stream_terminal_error_message)
+                    .flatten(),
                 latency_ms: usage_payload
                     .telemetry
                     .as_ref()
@@ -2864,14 +3879,14 @@ async fn execute_stream_from_frame_stream(
         );
     }
 
-    let emit_sse_keepalive = response_headers_indicate_sse(&headers);
-    if emit_sse_keepalive {
+    if response_headers_are_sse {
         headers.remove("content-length");
     }
     let body_stream = build_sse_body_stream(
         prefetched_chunks_for_body,
         rx,
-        emit_sse_keepalive,
+        response_headers_are_sse,
+        emit_proxy_generated_sse_control_blocks,
         SSE_KEEPALIVE_INTERVAL,
     );
 
@@ -2901,12 +3916,15 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use aether_contracts::{
-        ExecutionPlan, ExecutionStreamTerminalSummary, ExecutionTimeouts, RequestBody,
-        StandardizedUsage,
+        ExecutionError, ExecutionErrorKind, ExecutionPhase, ExecutionPlan,
+        ExecutionStreamTerminalSummary, ExecutionTimeouts, RequestBody, StandardizedUsage,
+        StreamFrame, StreamFramePayload, StreamFrameType,
     };
     use aether_data::repository::candidates::InMemoryRequestCandidateRepository;
     use aether_data::repository::usage::InMemoryUsageReadRepository;
-    use aether_data_contracts::repository::candidates::RequestCandidateReadRepository;
+    use aether_data_contracts::repository::candidates::{
+        RequestCandidateReadRepository, RequestCandidateStatus,
+    };
     use aether_data_contracts::repository::usage::UsageReadRepository;
     use aether_usage_runtime::UsageRuntimeConfig;
     use async_stream::stream;
@@ -2915,14 +3933,22 @@ mod tests {
     use axum::extract::Request;
     use axum::routing::any;
     use axum::{http::header, http::HeaderValue, Router};
+    use base64::Engine as _;
     use futures_util::StreamExt as _;
     use serde_json::{json, Value};
     use tokio::sync::{mpsc, watch, Notify};
 
     use super::{
-        build_sse_body_stream, execute_execution_runtime_stream, execute_stream_from_frame_stream,
-        merge_stream_terminal_summary, should_limit_direct_finalize_prefetch,
-        should_probe_success_failover_before_stream, should_skip_direct_finalize_prefetch,
+        build_sse_body_stream, client_format_allows_proxy_generated_sse_control_blocks,
+        ensure_stream_terminal_summary_for_missing_observed_finish,
+        execute_execution_runtime_stream, execute_stream_from_frame_stream,
+        maybe_apply_kiro_prompt_cache_usage_to_stream_summary, merge_stream_terminal_summary,
+        should_limit_direct_finalize_prefetch, should_probe_success_failover_before_stream,
+        should_skip_direct_finalize_prefetch, stream_chunk_contains_sse_done,
+        stream_requires_observed_terminal_event, stream_terminal_summary_missing_observed_finish,
+        stream_terminal_summary_missing_observed_finish_with_requirement,
+        stream_terminal_summary_represents_failure_with_requirement,
+        ClientVisibleStreamCompletionTracker,
     };
     use crate::control::GatewayControlDecision;
     use crate::tunnel::{tunnel_protocol, TunnelProxyConn};
@@ -2939,6 +3965,41 @@ mod tests {
         .with_execution_runtime_candidate(true)
     }
 
+    fn test_state() -> AppState {
+        AppState::new().expect("gateway state should build")
+    }
+
+    #[test]
+    fn detects_client_visible_sse_terminal_events() {
+        assert!(stream_chunk_contains_sse_done(b"data: [DONE]\n\n"));
+        assert!(stream_chunk_contains_sse_done(
+            b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+        ));
+        assert!(stream_chunk_contains_sse_done(
+            b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{}}\n\n"
+        ));
+        assert!(stream_chunk_contains_sse_done(
+            b"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\"}}\n\n"
+        ));
+        assert!(!stream_chunk_contains_sse_done(
+            b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\"}\n\n"
+        ));
+    }
+
+    #[test]
+    fn detects_client_visible_sse_terminal_events_across_chunks() {
+        let mut tracker = ClientVisibleStreamCompletionTracker::default();
+        assert!(!tracker.observe_chunk(b"data: [DO"));
+        assert!(!tracker.observe_chunk(b"NE]\n"));
+        assert!(tracker.observe_chunk(b"\n"));
+
+        let mut tracker = ClientVisibleStreamCompletionTracker::default();
+        assert!(!tracker.observe_chunk(b"event: response.comp"));
+        assert!(!tracker.observe_chunk(b"leted\r\n"));
+        assert!(tracker
+            .observe_chunk(b"data: {\"type\":\"response.completed\",\"response\":{}}\r\n\r\n"));
+    }
+
     fn tunnel_proxy_snapshot(base_url: String) -> aether_contracts::ProxySnapshot {
         aether_contracts::ProxySnapshot {
             enabled: Some(true),
@@ -2948,6 +4009,20 @@ mod tests {
             url: None,
             extra: Some(json!({"tunnel_base_url": base_url})),
         }
+    }
+
+    fn connect_json_frame(flags: u8, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(5 + payload.len());
+        out.push(flags);
+        out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn ndjson_frame(frame: StreamFrame) -> Bytes {
+        let mut bytes = serde_json::to_vec(&frame).expect("stream frame should serialize");
+        bytes.push(b'\n');
+        Bytes::from(bytes)
     }
 
     #[test]
@@ -2984,6 +4059,823 @@ mod tests {
         assert_eq!(merged.response_id.as_deref(), Some("resp_123"));
         assert!(merged.observed_finish);
         assert_eq!(merged.unknown_event_count, 3);
+    }
+
+    #[test]
+    fn detects_missing_observed_finish_only_without_usage_signal() {
+        assert!(stream_terminal_summary_missing_observed_finish(Some(
+            &ExecutionStreamTerminalSummary {
+                response_id: Some("resp_missing_finish".to_string()),
+                model: Some("gpt-5.5".to_string()),
+                observed_finish: false,
+                ..ExecutionStreamTerminalSummary::default()
+            }
+        )));
+
+        let mut usage = StandardizedUsage::new();
+        usage.output_tokens = 12;
+        assert!(!stream_terminal_summary_missing_observed_finish(Some(
+            &ExecutionStreamTerminalSummary {
+                standardized_usage: Some(usage),
+                observed_finish: false,
+                ..ExecutionStreamTerminalSummary::default()
+            }
+        )));
+        assert!(!stream_terminal_summary_missing_observed_finish(Some(
+            &ExecutionStreamTerminalSummary {
+                observed_finish: true,
+                ..ExecutionStreamTerminalSummary::default()
+            }
+        )));
+        assert!(!stream_terminal_summary_missing_observed_finish(None));
+    }
+
+    #[test]
+    fn requires_terminal_event_for_openai_responses_streams() {
+        assert!(stream_requires_observed_terminal_event(
+            "openai:responses",
+            None
+        ));
+        assert!(stream_requires_observed_terminal_event(
+            "openai:responses:compact",
+            None
+        ));
+        assert!(!stream_requires_observed_terminal_event(
+            "openai:chat",
+            None
+        ));
+        assert!(stream_requires_observed_terminal_event(
+            "openai:chat",
+            Some(&json!({
+                "provider_stream_event_api_format": "openai:responses"
+            }))
+        ));
+    }
+
+    #[test]
+    fn synthesizes_missing_terminal_summary_for_openai_responses_empty_stream() {
+        let mut summary = None;
+        ensure_stream_terminal_summary_for_missing_observed_finish(&mut summary, true);
+
+        let summary = summary.expect("summary should be synthesized");
+        assert!(!summary.observed_finish);
+        assert_eq!(
+            summary.parser_error.as_deref(),
+            Some("execution runtime stream ended before provider terminal event")
+        );
+        assert!(
+            stream_terminal_summary_missing_observed_finish_with_requirement(Some(&summary), true)
+        );
+        assert!(stream_terminal_summary_represents_failure_with_requirement(
+            Some(&summary),
+            true
+        ));
+    }
+
+    #[test]
+    fn terminal_required_stream_fails_even_with_usage_without_finish() {
+        let mut usage = StandardizedUsage::new();
+        usage.output_tokens = 12;
+        let mut summary = Some(ExecutionStreamTerminalSummary {
+            standardized_usage: Some(usage),
+            observed_finish: false,
+            ..ExecutionStreamTerminalSummary::default()
+        });
+
+        ensure_stream_terminal_summary_for_missing_observed_finish(&mut summary, true);
+        let summary = summary.as_ref().expect("summary should remain present");
+        assert!(
+            stream_terminal_summary_missing_observed_finish_with_requirement(Some(summary), true)
+        );
+        assert!(stream_terminal_summary_represents_failure_with_requirement(
+            Some(summary),
+            true
+        ));
+    }
+
+    #[tokio::test]
+    async fn kiro_stream_summary_applies_prompt_cache_usage_from_original_request() {
+        let request_body = json!({
+            "model": "claude-opus-4-7",
+            "system": [
+                {
+                    "type": "text",
+                    "text": "cacheable system ".repeat(600),
+                    "cache_control": {"type": "ephemeral"}
+                }
+            ],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "cacheable prompt ".repeat(1200),
+                            "cache_control": {"type": "ephemeral"}
+                        }
+                    ]
+                }
+            ]
+        });
+        let report_context = json!({
+            "original_request_body": request_body,
+            "kiro_simulated_cache_enabled": true,
+        });
+        let plan = ExecutionPlan {
+            request_id: "req-kiro-cache-stream".into(),
+            candidate_id: Some("cand-kiro-cache-stream".into()),
+            provider_name: Some("Kiro".into()),
+            provider_id: "provider-kiro-cache-stream".into(),
+            endpoint_id: "endpoint-kiro-cache-stream".into(),
+            key_id: "key-kiro-cache-stream".into(),
+            method: "POST".into(),
+            url: "https://q.us-east-1.amazonaws.com/generateAssistantResponse?beta=true".into(),
+            headers: BTreeMap::new(),
+            content_type: Some("application/json".into()),
+            content_encoding: None,
+            body: RequestBody::from_json(json!({"conversationState": {}})),
+            stream: true,
+            client_api_format: "claude:messages".into(),
+            provider_api_format: "claude:messages".into(),
+            model_name: Some("claude-opus-4-7".into()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        };
+        let state = test_state();
+
+        let mut first_summary = Some(ExecutionStreamTerminalSummary {
+            standardized_usage: Some(StandardizedUsage {
+                input_tokens: 6_000,
+                output_tokens: 17,
+                ..StandardizedUsage::new()
+            }),
+            ..ExecutionStreamTerminalSummary::default()
+        });
+        maybe_apply_kiro_prompt_cache_usage_to_stream_summary(
+            &state,
+            &plan,
+            Some(&report_context),
+            &mut first_summary,
+        )
+        .await;
+        let first_usage = first_summary
+            .as_ref()
+            .and_then(|summary| summary.standardized_usage.as_ref())
+            .expect("first usage should exist");
+        assert!(first_usage.cache_creation_tokens > 0);
+        assert_eq!(first_usage.cache_read_tokens, 0);
+
+        let mut second_summary = Some(ExecutionStreamTerminalSummary {
+            standardized_usage: Some(StandardizedUsage {
+                input_tokens: 6_000,
+                output_tokens: 19,
+                ..StandardizedUsage::new()
+            }),
+            ..ExecutionStreamTerminalSummary::default()
+        });
+        maybe_apply_kiro_prompt_cache_usage_to_stream_summary(
+            &state,
+            &plan,
+            Some(&report_context),
+            &mut second_summary,
+        )
+        .await;
+        let second_usage = second_summary
+            .as_ref()
+            .and_then(|summary| summary.standardized_usage.as_ref())
+            .expect("second usage should exist");
+        assert!(second_usage.cache_read_tokens > 0);
+        assert_eq!(second_usage.cache_creation_tokens, 0);
+        assert!(second_usage.input_tokens < 6_000);
+        assert_eq!(second_usage.output_tokens, 19);
+    }
+
+    #[tokio::test]
+    async fn kiro_stream_summary_reads_cached_prefix_within_prompt_cache_lookback_window() {
+        let first_request_body = json!({
+            "model": "claude-sonnet-4.6",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": "shared first turn ".repeat(600),
+                    "cache_control": {"type": "ephemeral"}
+                }]
+            }]
+        });
+        let mut second_messages = vec![json!({
+            "role": "user",
+            "content": [{
+                "type": "text",
+                "text": "shared first turn ".repeat(600)
+            }]
+        })];
+        for index in 0..12 {
+            second_messages.push(json!({
+                "role": if index % 2 == 0 { "assistant" } else { "user" },
+                "content": format!("intermediate stream turn {index}")
+            }));
+        }
+        second_messages.push(json!({
+            "role": "user",
+            "content": [{
+                "type": "text",
+                "text": "new tail turn ".repeat(600),
+                "cache_control": {"type": "ephemeral"}
+            }]
+        }));
+        let second_request_body = json!({
+            "model": "claude-sonnet-4.6",
+            "messages": second_messages
+        });
+        let plan = ExecutionPlan {
+            request_id: "req-kiro-cache-stream-long-tail".into(),
+            candidate_id: Some("cand-kiro-cache-stream-long-tail".into()),
+            provider_name: Some("Kiro".into()),
+            provider_id: "provider-kiro-cache-stream-long-tail".into(),
+            endpoint_id: "endpoint-kiro-cache-stream-long-tail".into(),
+            key_id: "key-kiro-cache-stream-long-tail".into(),
+            method: "POST".into(),
+            url: "https://q.us-east-1.amazonaws.com/generateAssistantResponse?beta=true".into(),
+            headers: BTreeMap::new(),
+            content_type: Some("application/json".into()),
+            content_encoding: None,
+            body: RequestBody::from_json(json!({"conversationState": {}})),
+            stream: true,
+            client_api_format: "claude:messages".into(),
+            provider_api_format: "claude:messages".into(),
+            model_name: Some("claude-sonnet-4.6".into()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        };
+        let first_report_context = json!({
+            "original_request_body": first_request_body,
+            "kiro_simulated_cache_enabled": true,
+        });
+        let second_report_context = json!({
+            "original_request_body": second_request_body,
+            "kiro_simulated_cache_enabled": true,
+        });
+        let state = test_state();
+
+        let mut first_summary = Some(ExecutionStreamTerminalSummary {
+            standardized_usage: Some(StandardizedUsage {
+                input_tokens: 4_000,
+                output_tokens: 17,
+                ..StandardizedUsage::new()
+            }),
+            ..ExecutionStreamTerminalSummary::default()
+        });
+        maybe_apply_kiro_prompt_cache_usage_to_stream_summary(
+            &state,
+            &plan,
+            Some(&first_report_context),
+            &mut first_summary,
+        )
+        .await;
+        let first_usage = first_summary
+            .as_ref()
+            .and_then(|summary| summary.standardized_usage.as_ref())
+            .expect("first usage should exist");
+        assert!(first_usage.cache_creation_tokens > 0);
+        assert_eq!(first_usage.cache_read_tokens, 0);
+
+        let mut second_summary = Some(ExecutionStreamTerminalSummary {
+            standardized_usage: Some(StandardizedUsage {
+                input_tokens: 8_000,
+                output_tokens: 19,
+                ..StandardizedUsage::new()
+            }),
+            ..ExecutionStreamTerminalSummary::default()
+        });
+        maybe_apply_kiro_prompt_cache_usage_to_stream_summary(
+            &state,
+            &plan,
+            Some(&second_report_context),
+            &mut second_summary,
+        )
+        .await;
+        let second_usage = second_summary
+            .as_ref()
+            .and_then(|summary| summary.standardized_usage.as_ref())
+            .expect("second usage should exist");
+        assert!(
+            second_usage.cache_read_tokens > 0,
+            "stream summary should reuse the far earlier cached prefix"
+        );
+        assert!(second_usage.cache_creation_tokens > 0);
+        assert_eq!(second_usage.output_tokens, 19);
+    }
+
+    #[tokio::test]
+    async fn kiro_stream_summary_seeds_input_tokens_without_cache_control() {
+        let request_body = json!({
+            "model": "claude-opus-4-7",
+            "system": [
+                {
+                    "type": "text",
+                    "text": "non cacheable system ".repeat(400)
+                }
+            ],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "non cacheable prompt ".repeat(800)
+                        }
+                    ]
+                }
+            ]
+        });
+        let report_context = json!({
+            "original_request_body": request_body,
+            "kiro_simulated_cache_enabled": true,
+        });
+        let plan = ExecutionPlan {
+            request_id: "req-kiro-non-cache".into(),
+            candidate_id: Some("cand-kiro-non-cache".into()),
+            provider_name: Some("Kiro".into()),
+            provider_id: "provider-kiro-non-cache".into(),
+            endpoint_id: "endpoint-kiro-non-cache".into(),
+            key_id: "key-kiro-non-cache".into(),
+            method: "POST".into(),
+            url: "https://q.us-east-1.amazonaws.com/generateAssistantResponse?beta=true".into(),
+            headers: BTreeMap::new(),
+            content_type: Some("application/json".into()),
+            content_encoding: None,
+            body: RequestBody::from_json(json!({"conversationState": {}})),
+            stream: true,
+            client_api_format: "claude:messages".into(),
+            provider_api_format: "claude:messages".into(),
+            model_name: Some("claude-opus-4-7".into()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        };
+        let state = test_state();
+
+        let mut summary = Some(ExecutionStreamTerminalSummary {
+            standardized_usage: Some(StandardizedUsage {
+                input_tokens: 0,
+                output_tokens: 13,
+                ..StandardizedUsage::new()
+            }),
+            ..ExecutionStreamTerminalSummary::default()
+        });
+
+        maybe_apply_kiro_prompt_cache_usage_to_stream_summary(
+            &state,
+            &plan,
+            Some(&report_context),
+            &mut summary,
+        )
+        .await;
+
+        let usage = summary
+            .as_ref()
+            .and_then(|summary| summary.standardized_usage.as_ref())
+            .expect("usage should exist");
+
+        assert!(usage.input_tokens > 0);
+        assert_eq!(usage.cache_creation_tokens, 0);
+        assert_eq!(usage.cache_read_tokens, 0);
+        assert_eq!(usage.output_tokens, 13);
+    }
+
+    #[tokio::test]
+    async fn kiro_stream_summary_bills_existing_cache_usage_when_input_is_zero() {
+        let request_body = json!({
+            "model": "claude-opus-4-7",
+            "system": [
+                {
+                    "type": "text",
+                    "text": "cached system ".repeat(800)
+                }
+            ],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "cached prompt ".repeat(1400)
+                        }
+                    ]
+                }
+            ]
+        });
+        let report_context = json!({
+            "original_request_body": request_body,
+            "kiro_simulated_cache_enabled": true,
+        });
+        let plan = ExecutionPlan {
+            request_id: "req-kiro-existing-cache".into(),
+            candidate_id: Some("cand-kiro-existing-cache".into()),
+            provider_name: Some("Kiro".into()),
+            provider_id: "provider-kiro-existing-cache".into(),
+            endpoint_id: "endpoint-kiro-existing-cache".into(),
+            key_id: "key-kiro-existing-cache".into(),
+            method: "POST".into(),
+            url: "https://q.us-east-1.amazonaws.com/generateAssistantResponse?beta=true".into(),
+            headers: BTreeMap::new(),
+            content_type: Some("application/json".into()),
+            content_encoding: None,
+            body: RequestBody::from_json(json!({"conversationState": {}})),
+            stream: true,
+            client_api_format: "claude:messages".into(),
+            provider_api_format: "claude:messages".into(),
+            model_name: Some("claude-opus-4-7".into()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        };
+        let state = test_state();
+
+        let mut summary = Some(ExecutionStreamTerminalSummary {
+            standardized_usage: Some(StandardizedUsage {
+                input_tokens: 0,
+                output_tokens: 23,
+                cache_read_tokens: 200,
+                ..StandardizedUsage::new()
+            }),
+            ..ExecutionStreamTerminalSummary::default()
+        });
+
+        maybe_apply_kiro_prompt_cache_usage_to_stream_summary(
+            &state,
+            &plan,
+            Some(&report_context),
+            &mut summary,
+        )
+        .await;
+
+        let usage = summary
+            .as_ref()
+            .and_then(|summary| summary.standardized_usage.as_ref())
+            .expect("usage should exist");
+
+        assert!(usage.input_tokens > 0);
+        assert_eq!(usage.cache_read_tokens, 200);
+        assert_eq!(usage.cache_creation_tokens, 0);
+        assert_eq!(usage.output_tokens, 23);
+    }
+
+    #[tokio::test]
+    async fn kiro_stream_summary_clears_cache_usage_when_simulated_cache_disabled() {
+        let request_body = json!({
+            "model": "claude-opus-4-7",
+            "system": [
+                {
+                    "type": "text",
+                    "text": "disabled cache summary system ".repeat(800),
+                    "cache_control": {"type": "ephemeral"}
+                }
+            ],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "disabled cache summary prompt ".repeat(1400),
+                            "cache_control": {"type": "ephemeral"}
+                        }
+                    ]
+                }
+            ]
+        });
+        let report_context = json!({
+            "original_request_body": request_body,
+        });
+        let plan = ExecutionPlan {
+            request_id: "req-kiro-summary-cache-disabled".into(),
+            candidate_id: Some("cand-kiro-summary-cache-disabled".into()),
+            provider_name: Some("Kiro".into()),
+            provider_id: "provider-kiro-summary-cache-disabled".into(),
+            endpoint_id: "endpoint-kiro-summary-cache-disabled".into(),
+            key_id: "key-kiro-summary-cache-disabled".into(),
+            method: "POST".into(),
+            url: "https://q.us-east-1.amazonaws.com/generateAssistantResponse?beta=true".into(),
+            headers: BTreeMap::new(),
+            content_type: Some("application/json".into()),
+            content_encoding: None,
+            body: RequestBody::from_json(json!({"conversationState": {}})),
+            stream: true,
+            client_api_format: "claude:messages".into(),
+            provider_api_format: "claude:messages".into(),
+            model_name: Some("claude-opus-4-7".into()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        };
+        let state = test_state();
+
+        let mut summary = Some(ExecutionStreamTerminalSummary {
+            standardized_usage: Some(StandardizedUsage {
+                input_tokens: 0,
+                output_tokens: 23,
+                cache_creation_tokens: 500,
+                cache_read_tokens: 700,
+                ..StandardizedUsage::new()
+            }),
+            ..ExecutionStreamTerminalSummary::default()
+        });
+
+        maybe_apply_kiro_prompt_cache_usage_to_stream_summary(
+            &state,
+            &plan,
+            Some(&report_context),
+            &mut summary,
+        )
+        .await;
+
+        let usage = summary
+            .as_ref()
+            .and_then(|summary| summary.standardized_usage.as_ref())
+            .expect("usage should exist");
+
+        assert!(usage.input_tokens > 0);
+        assert_eq!(usage.cache_creation_tokens, 0);
+        assert_eq!(usage.cache_read_tokens, 0);
+        assert_eq!(usage.output_tokens, 23);
+    }
+
+    #[tokio::test]
+    async fn kiro_stream_summary_does_not_subtract_cache_from_already_billed_input() {
+        let request_body = json!({
+            "model": "claude-opus-4-7",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "cached history ".repeat(400),
+                            "cache_control": {"type": "ephemeral"}
+                        },
+                        {
+                            "type": "text",
+                            "text": "new user turn"
+                        }
+                    ]
+                }
+            ]
+        });
+        let report_context = json!({
+            "original_request_body": request_body,
+            "input_tokens": 24_770,
+            "cache_creation_input_tokens": 175,
+            "cache_read_input_tokens": 24_463,
+            "kiro_simulated_cache_enabled": true
+        });
+        let plan = ExecutionPlan {
+            request_id: "req-kiro-billed-input".into(),
+            candidate_id: Some("cand-kiro-billed-input".into()),
+            provider_name: Some("Kiro".into()),
+            provider_id: "provider-kiro-billed-input".into(),
+            endpoint_id: "endpoint-kiro-billed-input".into(),
+            key_id: "key-kiro-billed-input".into(),
+            method: "POST".into(),
+            url: "https://q.us-east-1.amazonaws.com/generateAssistantResponse?beta=true".into(),
+            headers: BTreeMap::new(),
+            content_type: Some("application/json".into()),
+            content_encoding: None,
+            body: RequestBody::from_json(json!({"conversationState": {}})),
+            stream: true,
+            client_api_format: "claude:messages".into(),
+            provider_api_format: "claude:messages".into(),
+            model_name: Some("claude-opus-4-7".into()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        };
+        let state = test_state();
+
+        let mut summary = Some(ExecutionStreamTerminalSummary {
+            standardized_usage: Some(StandardizedUsage {
+                input_tokens: 132,
+                output_tokens: 167,
+                cache_creation_tokens: 175,
+                cache_read_tokens: 24_463,
+                ..StandardizedUsage::new()
+            }),
+            ..ExecutionStreamTerminalSummary::default()
+        });
+
+        maybe_apply_kiro_prompt_cache_usage_to_stream_summary(
+            &state,
+            &plan,
+            Some(&report_context),
+            &mut summary,
+        )
+        .await;
+
+        let usage = summary
+            .as_ref()
+            .and_then(|summary| summary.standardized_usage.as_ref())
+            .expect("usage should exist");
+
+        assert_eq!(usage.input_tokens, 132);
+        assert_eq!(usage.cache_creation_tokens, 175);
+        assert_eq!(usage.cache_read_tokens, 24_463);
+        assert_eq!(usage.output_tokens, 167);
+    }
+
+    #[tokio::test]
+    async fn kiro_report_context_seeds_input_tokens_from_original_request_body() {
+        let request_body = json!({
+            "model": "claude-opus-4-7",
+            "system": [
+                {
+                    "type": "text",
+                    "text": "seeded system ".repeat(600)
+                }
+            ],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "seeded prompt ".repeat(1200)
+                        }
+                    ]
+                }
+            ]
+        });
+        let plan = ExecutionPlan {
+            request_id: "req-kiro-seed".into(),
+            candidate_id: Some("cand-kiro-seed".into()),
+            provider_name: Some("Kiro".into()),
+            provider_id: "provider-kiro-seed".into(),
+            endpoint_id: "endpoint-kiro-seed".into(),
+            key_id: "key-kiro-seed".into(),
+            method: "POST".into(),
+            url: "https://q.us-east-1.amazonaws.com/generateAssistantResponse?beta=true".into(),
+            headers: BTreeMap::new(),
+            content_type: Some("application/json".into()),
+            content_encoding: None,
+            body: RequestBody::from_json(json!({"conversationState": {}})),
+            stream: true,
+            client_api_format: "claude:messages".into(),
+            provider_api_format: "claude:messages".into(),
+            model_name: Some("claude-opus-4-7".into()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        };
+        let mut report_context = Some(json!({
+            "original_request_body": request_body,
+            "kiro_simulated_cache_enabled": true,
+        }));
+
+        super::seed_kiro_report_context_input_tokens(&plan, &mut report_context);
+
+        let input_tokens = report_context
+            .as_ref()
+            .and_then(|context| context.get("input_tokens"))
+            .and_then(Value::as_u64)
+            .expect("kiro input tokens should be seeded");
+        assert!(input_tokens > 0);
+    }
+
+    #[tokio::test]
+    async fn kiro_report_context_seeds_prompt_cache_usage_before_stream_rewrite() {
+        let request_body = json!({
+            "model": "claude-opus-4-7",
+            "system": [
+                {
+                    "type": "text",
+                    "text": "cache seed system ".repeat(600),
+                    "cache_control": {"type": "ephemeral"}
+                }
+            ],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "cache seed prompt ".repeat(1200),
+                            "cache_control": {"type": "ephemeral"}
+                        }
+                    ]
+                }
+            ]
+        });
+        let plan = ExecutionPlan {
+            request_id: "req-kiro-cache-seed".into(),
+            candidate_id: Some("cand-kiro-cache-seed".into()),
+            provider_name: Some("Kiro".into()),
+            provider_id: "provider-kiro-cache-seed".into(),
+            endpoint_id: "endpoint-kiro-cache-seed".into(),
+            key_id: "key-kiro-cache-seed".into(),
+            method: "POST".into(),
+            url: "https://q.us-east-1.amazonaws.com/generateAssistantResponse?beta=true".into(),
+            headers: BTreeMap::new(),
+            content_type: Some("application/json".into()),
+            content_encoding: None,
+            body: RequestBody::from_json(json!({"conversationState": {}})),
+            stream: true,
+            client_api_format: "claude:messages".into(),
+            provider_api_format: "claude:messages".into(),
+            model_name: Some("claude-opus-4-7".into()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        };
+        let mut report_context = Some(json!({
+            "original_request_body": request_body,
+            "kiro_simulated_cache_enabled": true,
+        }));
+        let state = AppState::new().expect("gateway state should build");
+
+        super::seed_kiro_report_context_input_tokens(&plan, &mut report_context);
+        super::seed_kiro_report_context_prompt_cache_usage(&state, &plan, &mut report_context)
+            .await;
+
+        let context = report_context.as_ref().expect("context should exist");
+        assert!(context
+            .get("input_tokens")
+            .and_then(Value::as_u64)
+            .is_some_and(|value| value > 0));
+        assert!(context
+            .get("cache_creation_input_tokens")
+            .and_then(Value::as_u64)
+            .is_some_and(|value| value > 0));
+        assert_eq!(
+            context
+                .get("cache_read_input_tokens")
+                .and_then(Value::as_u64),
+            Some(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn kiro_report_context_skips_prompt_cache_usage_when_disabled() {
+        let request_body = json!({
+            "model": "claude-opus-4-7",
+            "system": [
+                {
+                    "type": "text",
+                    "text": "disabled cache system ".repeat(600),
+                    "cache_control": {"type": "ephemeral"}
+                }
+            ],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "disabled cache prompt ".repeat(1200),
+                            "cache_control": {"type": "ephemeral"}
+                        }
+                    ]
+                }
+            ]
+        });
+        let plan = ExecutionPlan {
+            request_id: "req-kiro-cache-disabled".into(),
+            candidate_id: Some("cand-kiro-cache-disabled".into()),
+            provider_name: Some("Kiro".into()),
+            provider_id: "provider-kiro-cache-disabled".into(),
+            endpoint_id: "endpoint-kiro-cache-disabled".into(),
+            key_id: "key-kiro-cache-disabled".into(),
+            method: "POST".into(),
+            url: "https://q.us-east-1.amazonaws.com/generateAssistantResponse?beta=true".into(),
+            headers: BTreeMap::new(),
+            content_type: Some("application/json".into()),
+            content_encoding: None,
+            body: RequestBody::from_json(json!({"conversationState": {}})),
+            stream: true,
+            client_api_format: "claude:messages".into(),
+            provider_api_format: "claude:messages".into(),
+            model_name: Some("claude-opus-4-7".into()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        };
+        let mut report_context = Some(json!({
+            "original_request_body": request_body,
+        }));
+        let state = AppState::new().expect("gateway state should build");
+
+        super::seed_kiro_report_context_input_tokens(&plan, &mut report_context);
+        super::seed_kiro_report_context_prompt_cache_usage(&state, &plan, &mut report_context)
+            .await;
+
+        let context = report_context.as_ref().expect("context should exist");
+        assert!(context
+            .get("input_tokens")
+            .and_then(Value::as_u64)
+            .is_some_and(|value| value > 0));
+        assert_eq!(context.get("cache_creation_input_tokens"), None);
+        assert_eq!(context.get("cache_read_input_tokens"), None);
     }
 
     #[test]
@@ -3063,12 +4955,50 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn openai_client_formats_disallow_proxy_generated_sse_control_blocks() {
+        let mut plan = ExecutionPlan {
+            request_id: "req-openai-keepalive".into(),
+            candidate_id: Some("cand-openai-keepalive".into()),
+            provider_name: Some("openai".into()),
+            provider_id: "prov-1".into(),
+            endpoint_id: "ep-1".into(),
+            key_id: "key-1".into(),
+            method: "POST".into(),
+            url: "https://example.com/v1/chat/completions".into(),
+            headers: BTreeMap::new(),
+            content_type: Some("application/json".into()),
+            content_encoding: None,
+            body: RequestBody::from_json(json!({"stream": true})),
+            stream: true,
+            client_api_format: "openai:chat".into(),
+            provider_api_format: "openai:chat".into(),
+            model_name: Some("gpt-5.4".into()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        };
+
+        assert!(!client_format_allows_proxy_generated_sse_control_blocks(
+            &plan
+        ));
+        plan.client_api_format = "openai:responses".into();
+        assert!(!client_format_allows_proxy_generated_sse_control_blocks(
+            &plan
+        ));
+        plan.client_api_format = "claude:messages".into();
+        assert!(client_format_allows_proxy_generated_sse_control_blocks(
+            &plan
+        ));
+    }
+
     #[tokio::test]
     async fn sse_body_stream_emits_initial_and_periodic_keepalive_without_business_chunks() {
         let (_tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(1);
         let mut body_stream = Box::pin(build_sse_body_stream(
             Vec::new(),
             rx,
+            true,
             true,
             Duration::from_millis(10),
         ));
@@ -3089,7 +5019,322 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn openai_image_stream_total_timeout_emits_image_failed_event() {
+    async fn sse_body_stream_filters_control_blocks_without_synthetic_keepalive() {
+        let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(1);
+        let mut body_stream = Box::pin(build_sse_body_stream(
+            vec![Bytes::from_static(b": upstream-keepalive\n\n")],
+            rx,
+            true,
+            false,
+            Duration::from_millis(10),
+        ));
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), body_stream.next())
+                .await
+                .is_err(),
+            "control-only prefetched blocks should not produce client-visible chunks"
+        );
+
+        tx.send(Ok(Bytes::from_static(
+            b"data: {\"id\":\"chatcmpl-no-keepalive\"}\n\n",
+        )))
+        .await
+        .expect("business chunk should send");
+        let chunk = tokio::time::timeout(Duration::from_millis(50), body_stream.next())
+            .await
+            .expect("business chunk should arrive")
+            .expect("stream should yield business chunk")
+            .expect("business chunk should be ok");
+        assert_eq!(
+            chunk.as_ref(),
+            b"data: {\"id\":\"chatcmpl-no-keepalive\"}\n\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_body_stream_drops_upstream_control_only_blocks() {
+        let (_tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(1);
+        let mut body_stream = Box::pin(build_sse_body_stream(
+            vec![
+                Bytes::from_static(b": upstream-keepalive\n\n"),
+                Bytes::from_static(b"event: ping\nid: 1\nretry: 1000\n\n"),
+                Bytes::from_static(
+                    b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
+                ),
+            ],
+            rx,
+            true,
+            true,
+            Duration::from_secs(60),
+        ));
+
+        let chunk = tokio::time::timeout(Duration::from_millis(50), body_stream.next())
+            .await
+            .expect("business chunk should arrive")
+            .expect("stream should yield business chunk")
+            .expect("business chunk should be ok");
+        let text = std::str::from_utf8(chunk.as_ref()).expect("chunk should be utf8");
+        assert!(text.contains("event: response.output_text.delta"));
+        assert!(text.contains("data: {\"type\":\"response.output_text.delta\""));
+        assert!(!text.contains("upstream-keepalive"));
+        assert!(!text.contains("event: ping"));
+        assert!(!text.contains("retry: 1000"));
+    }
+
+    #[tokio::test]
+    async fn sse_body_stream_filters_control_blocks_across_chunk_boundaries() {
+        let (_tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(1);
+        let mut body_stream = Box::pin(build_sse_body_stream(
+            vec![
+                Bytes::from_static(b": upstream-keepalive\n"),
+                Bytes::from_static(b"\n"),
+                Bytes::from_static(b"event: response.created\n"),
+                Bytes::from_static(b"data: {\"type\":\"response.created\"}\n\n"),
+            ],
+            rx,
+            true,
+            true,
+            Duration::from_secs(60),
+        ));
+
+        let chunk = tokio::time::timeout(Duration::from_millis(50), body_stream.next())
+            .await
+            .expect("business chunk should arrive")
+            .expect("stream should yield business chunk")
+            .expect("business chunk should be ok");
+        let text = std::str::from_utf8(chunk.as_ref()).expect("chunk should be utf8");
+        assert_eq!(
+            text,
+            "event: response.created\ndata: {\"type\":\"response.created\"}\n\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_body_stream_forwards_data_line_before_block_boundary() {
+        let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(4);
+        let mut body_stream = Box::pin(build_sse_body_stream(
+            Vec::new(),
+            rx,
+            true,
+            true,
+            Duration::from_secs(60),
+        ));
+
+        let keepalive = tokio::time::timeout(Duration::from_millis(50), body_stream.next())
+            .await
+            .expect("initial keepalive should be immediate")
+            .expect("stream should yield initial keepalive")
+            .expect("initial keepalive should be ok");
+        assert_eq!(keepalive.as_ref(), b": aether-keepalive\n\n");
+
+        tx.send(Ok(Bytes::from_static(
+            b"event: response.output_text.delta\n",
+        )))
+        .await
+        .expect("event line should send");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), body_stream.next())
+                .await
+                .is_err(),
+            "event-only partial block should remain buffered"
+        );
+
+        tx.send(Ok(Bytes::from_static(
+            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n",
+        )))
+        .await
+        .expect("data line should send");
+        let data_chunk = tokio::time::timeout(Duration::from_millis(50), body_stream.next())
+            .await
+            .expect("data-bearing block should stream before terminator")
+            .expect("stream should yield data-bearing block")
+            .expect("data-bearing block should be ok");
+        assert_eq!(
+            data_chunk.as_ref(),
+            b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n"
+        );
+
+        tx.send(Ok(Bytes::from_static(b"\n")))
+            .await
+            .expect("terminator should send");
+        let terminator = tokio::time::timeout(Duration::from_millis(50), body_stream.next())
+            .await
+            .expect("terminator should stream")
+            .expect("stream should yield terminator")
+            .expect("terminator should be ok");
+        assert_eq!(terminator.as_ref(), b"\n");
+    }
+
+    #[tokio::test]
+    async fn sse_body_stream_uses_local_keepalive_when_prefetched_blocks_are_control_only() {
+        let (_tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(1);
+        let mut body_stream = Box::pin(build_sse_body_stream(
+            vec![Bytes::from_static(b": upstream-keepalive\n\n")],
+            rx,
+            true,
+            true,
+            Duration::from_secs(60),
+        ));
+
+        let first = tokio::time::timeout(Duration::from_millis(50), body_stream.next())
+            .await
+            .expect("local keepalive should arrive")
+            .expect("stream should yield local keepalive")
+            .expect("local keepalive should be ok");
+        assert_eq!(first.as_ref(), b": aether-keepalive\n\n");
+    }
+
+    #[tokio::test]
+    async fn execute_stream_from_frame_stream_does_not_finalize_rewritten_tool_call_after_midstream_error(
+    ) {
+        let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
+        let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
+        let state = AppState::new()
+            .expect("app state should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
+                    Arc::clone(&request_candidate_repository),
+                    Arc::clone(&usage_repository),
+                ),
+            )
+            .with_usage_runtime_for_tests(UsageRuntimeConfig {
+                enabled: true,
+                ..UsageRuntimeConfig::default()
+            });
+        let plan = ExecutionPlan {
+            request_id: "req-responses-tool-midstream-error".into(),
+            candidate_id: Some("cand-responses-tool-midstream-error".into()),
+            provider_name: Some("openai".into()),
+            provider_id: "provider-openai-responses".into(),
+            endpoint_id: "endpoint-openai-responses".into(),
+            key_id: "key-openai-responses".into(),
+            method: "POST".into(),
+            url: "https://api.openai.com/v1/responses".into(),
+            headers: BTreeMap::from([
+                ("content-type".into(), "application/json".into()),
+                ("accept".into(), "text/event-stream".into()),
+            ]),
+            content_type: Some("application/json".into()),
+            content_encoding: None,
+            body: RequestBody::from_json(json!({
+                "model": "gpt-5.5",
+                "input": [],
+                "stream": true
+            })),
+            stream: true,
+            client_api_format: "claude:messages".into(),
+            provider_api_format: "openai:responses".into(),
+            model_name: Some("gpt-5.5".into()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        };
+        let upstream_chunk = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_midstream_error\",\"model\":\"gpt-5.5\",\"status\":\"in_progress\"}}\n\n",
+            "event: response.output_item.added\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"lookup\",\"arguments\":\"\",\"status\":\"in_progress\"}}\n\n",
+            "event: response.function_call_arguments.delta\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"item_id\":\"fc_1\",\"call_id\":\"call_1\",\"delta\":\"{\\\"query\\\":\\\"abc\"}\n\n"
+        );
+        let frame_stream = stream! {
+            yield Ok::<Bytes, std::io::Error>(ndjson_frame(StreamFrame {
+                frame_type: StreamFrameType::Headers,
+                payload: StreamFramePayload::Headers {
+                    status_code: 200,
+                    headers: BTreeMap::from([(
+                        "content-type".to_string(),
+                        "text/event-stream".to_string(),
+                    )]),
+                },
+            }));
+            yield Ok::<Bytes, std::io::Error>(ndjson_frame(StreamFrame {
+                frame_type: StreamFrameType::Data,
+                payload: StreamFramePayload::Data {
+                    chunk_b64: None,
+                    text: Some(upstream_chunk.to_string()),
+                },
+            }));
+            yield Ok::<Bytes, std::io::Error>(ndjson_frame(StreamFrame {
+                frame_type: StreamFrameType::Error,
+                payload: StreamFramePayload::Error {
+                    error: ExecutionError {
+                        kind: ExecutionErrorKind::Internal,
+                        phase: ExecutionPhase::StreamRead,
+                        message: "error reading a body from connection: stream error received: unexpected internal error encountered".to_string(),
+                        upstream_status: Some(200),
+                        retryable: false,
+                        failover_recommended: false,
+                    },
+                },
+            }));
+        }
+        .boxed();
+
+        let response = execute_stream_from_frame_stream(
+            &state,
+            plan,
+            "trace-responses-tool-midstream-error",
+            &test_decision(),
+            "openai_responses_stream",
+            Some("openai_responses_stream_success".to_string()),
+            Some(json!({
+                "request_id": "req-responses-tool-midstream-error",
+                "candidate_id": "cand-responses-tool-midstream-error",
+                "candidate_index": 0,
+                "retry_index": 0,
+                "provider_api_format": "openai:responses",
+                "client_api_format": "claude:messages",
+                "needs_conversion": true,
+            })),
+            crate::clock::current_unix_ms(),
+            Instant::now(),
+            frame_stream,
+            None,
+        )
+        .await
+        .expect("execution should succeed")
+        .expect("execution should return a client response");
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should read");
+        let body_text = String::from_utf8(body.to_vec()).expect("body should be utf8");
+        assert!(body_text.contains("event: content_block_start"));
+        assert!(body_text.contains("event: content_block_delta"));
+        assert!(body_text.contains("\"type\":\"tool_use\""));
+        assert!(!body_text.contains("event: content_block_stop"));
+        assert!(!body_text.contains("event: message_delta"));
+        assert!(!body_text.contains("event: message_stop"));
+        assert!(!body_text.contains("\"stop_reason\":\"tool_use\""));
+        assert!(body_text.contains("\"error\""));
+        assert!(body_text.contains("unexpected internal error encountered"));
+        assert!(body_text.contains("data: [DONE]"));
+
+        let candidates = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let candidates = request_candidate_repository
+                    .list_by_request_id("req-responses-tool-midstream-error")
+                    .await
+                    .expect("request candidates should read");
+                if candidates
+                    .first()
+                    .is_some_and(|candidate| candidate.status == RequestCandidateStatus::Failed)
+                {
+                    break candidates;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("candidate should be marked failed");
+        assert_eq!(candidates[0].status_code, Some(200));
+        assert_eq!(candidates[0].error_type.as_deref(), Some("internal"));
+    }
+
+    #[tokio::test]
+    async fn openai_image_stream_ignores_plan_total_timeout() {
         let state = AppState::new().expect("app state should build");
         let plan = ExecutionPlan {
             request_id: "req-image-stream-timeout".into(),
@@ -3161,17 +5406,729 @@ mod tests {
         .expect("execution should succeed")
         .expect("execution should return a client response");
 
-        let body = tokio::time::timeout(
-            Duration::from_secs(2),
-            to_bytes(response.into_body(), usize::MAX),
+        let mut body_stream = response.into_body().into_data_stream();
+        let next_chunk = tokio::time::timeout(Duration::from_millis(100), body_stream.next()).await;
+        assert!(
+            next_chunk.is_err(),
+            "stream total_ms must not synthesize a keepalive, image failure, or close the response body"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_stream_from_frame_stream_treats_windsurf_connect_trailer_error_as_failure() {
+        let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
+        let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
+        let state = AppState::new()
+            .expect("app state should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
+                    Arc::clone(&request_candidate_repository),
+                    Arc::clone(&usage_repository),
+                ),
+            )
+            .with_usage_runtime_for_tests(UsageRuntimeConfig {
+                enabled: true,
+                ..UsageRuntimeConfig::default()
+            });
+        let plan = ExecutionPlan {
+            request_id: "req-windsurf-connect-error".into(),
+            candidate_id: Some("cand-windsurf-connect-error".into()),
+            provider_name: Some("windsurf".into()),
+            provider_id: "provider-windsurf".into(),
+            endpoint_id: "endpoint-windsurf-chat".into(),
+            key_id: "key-windsurf".into(),
+            method: "POST".into(),
+            url: "https://server.codeium.com/exa.api_server_pb.ApiServerService/GetChatMessage?beta=true".into(),
+            headers: BTreeMap::from([
+                ("content-type".into(), "application/connect+json".into()),
+                ("accept".into(), "application/connect+json".into()),
+            ]),
+            content_type: Some("application/connect+json".into()),
+            content_encoding: None,
+            body: RequestBody::from_json(json!({
+                "model": "claude-sonnet-4",
+                "messages": [],
+                "stream": true
+            })),
+            stream: true,
+            client_api_format: "claude:messages".into(),
+            provider_api_format: "openai:chat".into(),
+            model_name: Some("claude-sonnet-4".into()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        };
+        let trailer_error = connect_json_frame(
+            2,
+            br#"{"error":{"code":"resource_exhausted","message":"an internal error occurred"}}"#,
+        );
+        let trailer_error_b64 = base64::engine::general_purpose::STANDARD.encode(trailer_error);
+        let frame = format!(
+            "{{\"type\":\"data\",\"payload\":{{\"kind\":\"data\",\"chunk_b64\":\"{trailer_error_b64}\"}}}}\n"
+        );
+        let frame_stream = stream! {
+            yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                b"{\"type\":\"headers\",\"payload\":{\"kind\":\"headers\",\"status_code\":200,\"headers\":{\"content-type\":\"application/connect+json\"}}}\n",
+            ));
+            yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
+            yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                b"{\"type\":\"eof\",\"payload\":{\"kind\":\"eof\"}}\n",
+            ));
+        }
+        .boxed();
+
+        let response = execute_stream_from_frame_stream(
+            &state,
+            plan,
+            "trace-windsurf-connect-error",
+            &test_decision(),
+            "claude_chat_stream",
+            Some("claude_chat_stream_success".to_string()),
+            Some(json!({
+                "request_id": "req-windsurf-connect-error",
+                "candidate_id": "cand-windsurf-connect-error",
+                "candidate_index": 0,
+                "retry_index": 0,
+                "provider_api_format": "openai:chat",
+                "client_api_format": "claude:messages",
+                "needs_conversion": true,
+                "has_envelope": true,
+                "envelope_name": "windsurf:GetChatMessage",
+                "local_failover_policy": {
+                    "stop_status_codes": [429]
+                }
+            })),
+            crate::clock::current_unix_ms(),
+            Instant::now(),
+            frame_stream,
+            None,
         )
         .await
-        .expect("timeout failure should close the response body")
-        .expect("response body should read");
-        let text = String::from_utf8(body.to_vec()).expect("response body should be utf8");
-        assert!(text.contains(": aether-keepalive\n\n"));
-        assert!(text.contains("event: image_generation.failed"));
-        assert!(text.contains("\"type\":\"image_stream_total_timeout\""));
+        .expect("execution should succeed")
+        .expect("execution should return a client response");
+
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should read");
+        let body_json: Value =
+            serde_json::from_slice(&body).expect("response body should decode as json");
+        assert_eq!(status.as_u16(), 429);
+        assert_eq!(body_json["type"], json!("error"));
+        assert_eq!(body_json["error"]["type"], json!("rate_limit_error"));
+        assert_eq!(body_json["error"]["code"], json!("resource_exhausted"));
+        assert_eq!(
+            body_json["error"]["message"],
+            json!("an internal error occurred")
+        );
+
+        let candidates = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let candidates = request_candidate_repository
+                    .list_by_request_id("req-windsurf-connect-error")
+                    .await
+                    .expect("request candidates should read");
+                if candidates
+                    .first()
+                    .is_some_and(|candidate| candidate.status == RequestCandidateStatus::Failed)
+                {
+                    break candidates;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("candidate should be marked failed");
+        assert_eq!(candidates[0].status_code, Some(429));
+        assert_eq!(
+            candidates[0].error_type.as_deref(),
+            Some("resource_exhausted")
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_stream_from_frame_stream_decodes_non_success_windsurf_connect_error_body() {
+        let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
+        let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
+        let state = AppState::new()
+            .expect("app state should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
+                    Arc::clone(&request_candidate_repository),
+                    Arc::clone(&usage_repository),
+                ),
+            )
+            .with_usage_runtime_for_tests(UsageRuntimeConfig {
+                enabled: true,
+                ..UsageRuntimeConfig::default()
+            });
+        let plan = ExecutionPlan {
+            request_id: "req-windsurf-connect-429".into(),
+            candidate_id: Some("cand-windsurf-connect-429".into()),
+            provider_name: Some("windsurf".into()),
+            provider_id: "provider-windsurf".into(),
+            endpoint_id: "endpoint-windsurf-chat".into(),
+            key_id: "key-windsurf".into(),
+            method: "POST".into(),
+            url: "https://server.codeium.com/exa.api_server_pb.ApiServerService/GetChatMessage?beta=true".into(),
+            headers: BTreeMap::from([
+                ("content-type".into(), "application/connect+json".into()),
+                ("accept".into(), "application/connect+json".into()),
+            ]),
+            content_type: Some("application/connect+json".into()),
+            content_encoding: None,
+            body: RequestBody::from_json(json!({
+                "model": "claude-sonnet-4",
+                "messages": [],
+                "stream": true
+            })),
+            stream: true,
+            client_api_format: "claude:messages".into(),
+            provider_api_format: "openai:chat".into(),
+            model_name: Some("claude-sonnet-4".into()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        };
+        let connect_error = connect_json_frame(
+            2,
+            br#"{"error":{"code":"resource_exhausted","message":"quota exhausted"}}"#,
+        );
+        let connect_error_b64 = base64::engine::general_purpose::STANDARD.encode(connect_error);
+        let frame_stream = stream! {
+            yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                b"{\"type\":\"headers\",\"payload\":{\"kind\":\"headers\",\"status_code\":429,\"headers\":{\"content-type\":\"application/connect+json\"}}}\n",
+            ));
+            yield Ok::<Bytes, std::io::Error>(Bytes::from(format!(
+                "{{\"type\":\"data\",\"payload\":{{\"kind\":\"data\",\"chunk_b64\":\"{connect_error_b64}\"}}}}\n"
+            )));
+            yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                b"{\"type\":\"eof\",\"payload\":{\"kind\":\"eof\"}}\n",
+            ));
+        }
+        .boxed();
+
+        let response = execute_stream_from_frame_stream(
+            &state,
+            plan,
+            "trace-windsurf-connect-429",
+            &test_decision(),
+            "claude_chat_stream",
+            Some("claude_chat_stream_success".to_string()),
+            Some(json!({
+                "request_id": "req-windsurf-connect-429",
+                "candidate_id": "cand-windsurf-connect-429",
+                "candidate_index": 0,
+                "retry_index": 0,
+                "provider_api_format": "openai:chat",
+                "client_api_format": "claude:messages",
+                "needs_conversion": true,
+                "has_envelope": true,
+                "envelope_name": "windsurf:GetChatMessage",
+                "local_failover_policy": {
+                    "stop_status_codes": [429]
+                }
+            })),
+            crate::clock::current_unix_ms(),
+            Instant::now(),
+            frame_stream,
+            None,
+        )
+        .await
+        .expect("execution should succeed")
+        .expect("execution should return a client response");
+
+        assert_eq!(response.status().as_u16(), 429);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should read");
+        let body_json: Value =
+            serde_json::from_slice(&body).expect("response body should decode as json");
+        assert_eq!(body_json["type"], json!("error"));
+        assert_eq!(body_json["error"]["type"], json!("rate_limit_error"));
+        assert_eq!(body_json["error"]["code"], json!("resource_exhausted"));
+        assert_eq!(body_json["error"]["message"], json!("quota exhausted"));
+
+        let record = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(usage) = usage_repository
+                    .find_by_request_id("req-windsurf-connect-429")
+                    .await
+                    .expect("usage should read")
+                    .filter(|usage| usage.status == "failed")
+                {
+                    break usage;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("usage should be written");
+        assert_eq!(record.status_code, Some(429));
+        assert_eq!(
+            record
+                .response_body
+                .as_ref()
+                .and_then(|body| body.get("error"))
+                .and_then(|error| error.get("code")),
+            Some(&json!("resource_exhausted"))
+        );
+        assert!(record.response_body_ref.is_none());
+    }
+
+    #[tokio::test]
+    async fn execute_stream_from_frame_stream_drains_upstream_when_client_drops_body() {
+        let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
+        let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
+        let state = AppState::new()
+            .expect("app state should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
+                    Arc::clone(&request_candidate_repository),
+                    Arc::clone(&usage_repository),
+                ),
+            )
+            .with_usage_runtime_for_tests(UsageRuntimeConfig {
+                enabled: true,
+                ..UsageRuntimeConfig::default()
+            });
+        let plan = ExecutionPlan {
+            request_id: "req-client-drop-cancels-upstream".into(),
+            candidate_id: Some("cand-client-drop-cancels-upstream".into()),
+            provider_name: Some("openai".into()),
+            provider_id: "prov-1".into(),
+            endpoint_id: "ep-1".into(),
+            key_id: "key-1".into(),
+            method: "POST".into(),
+            url: "https://example.com/v1/chat/completions".into(),
+            headers: BTreeMap::from([
+                ("content-type".into(), "application/json".into()),
+                ("accept".into(), "text/event-stream".into()),
+            ]),
+            content_type: Some("application/json".into()),
+            content_encoding: None,
+            body: RequestBody::from_json(json!({
+                "model": "gpt-5.4",
+                "messages": [],
+                "stream": true
+            })),
+            stream: true,
+            client_api_format: "openai:chat".into(),
+            provider_api_format: "openai:chat".into(),
+            model_name: Some("gpt-5.4".into()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        };
+        let release_terminal = Arc::new(Notify::new());
+        let terminal_frame_drained = Arc::new(Notify::new());
+        let release_terminal_for_stream = Arc::clone(&release_terminal);
+        let terminal_frame_drained_for_stream = Arc::clone(&terminal_frame_drained);
+        let frame_stream = stream! {
+            yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                b"{\"type\":\"headers\",\"payload\":{\"kind\":\"headers\",\"status_code\":200,\"headers\":{\"content-type\":\"text/event-stream\"}}}\n",
+            ));
+            yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                b"{\"type\":\"data\",\"payload\":{\"kind\":\"data\",\"text\":\"data: {\\\"id\\\":\\\"first\\\",\\\"choices\\\":[{\\\"index\\\":0,\\\"delta\\\":{\\\"content\\\":\\\"hello\\\"}}]}\\n\\n\"}}\n",
+            ));
+            release_terminal_for_stream.notified().await;
+            yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                b"{\"type\":\"data\",\"payload\":{\"kind\":\"data\",\"text\":\"data: {\\\"id\\\":\\\"terminal\\\",\\\"object\\\":\\\"chat.completion.chunk\\\",\\\"model\\\":\\\"gpt-5.4\\\",\\\"choices\\\":[{\\\"index\\\":0,\\\"delta\\\":{},\\\"finish_reason\\\":\\\"stop\\\"}],\\\"usage\\\":{\\\"prompt_tokens\\\":7,\\\"completion_tokens\\\":11,\\\"total_tokens\\\":18}}\\n\\ndata: [DONE]\\n\\n\"}}\n",
+            ));
+            terminal_frame_drained_for_stream.notify_one();
+        }
+        .boxed();
+
+        let response = execute_stream_from_frame_stream(
+            &state,
+            plan,
+            "trace-client-drop-cancels-upstream",
+            &test_decision(),
+            "openai_chat_stream",
+            None,
+            Some(json!({
+                "request_id": "req-client-drop-cancels-upstream",
+                "candidate_id": "cand-client-drop-cancels-upstream",
+                "candidate_index": 0,
+                "retry_index": 0,
+                "provider_api_format": "openai:chat",
+                "client_api_format": "openai:chat"
+            })),
+            crate::clock::current_unix_ms(),
+            Instant::now(),
+            frame_stream,
+            None,
+        )
+        .await
+        .expect("execution should succeed")
+        .expect("execution should return a client response");
+
+        let mut body_stream = response.into_body().into_data_stream();
+        let first = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let chunk = body_stream
+                    .next()
+                    .await
+                    .expect("body should yield first chunk")
+                    .expect("first chunk should be ok");
+                if chunk.as_ref() != b": aether-keepalive\n\n" {
+                    break chunk;
+                }
+            }
+        })
+        .await
+        .expect("first business chunk should arrive");
+        assert_eq!(
+            first.as_ref(),
+            b"data: {\"id\":\"first\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"}}]}\n\n"
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        drop(body_stream);
+        release_terminal.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(1), terminal_frame_drained.notified())
+            .await
+            .expect("upstream frame stream should be drained after client disconnect");
+        let candidates = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let candidates = request_candidate_repository
+                    .list_by_request_id("req-client-drop-cancels-upstream")
+                    .await
+                    .expect("request candidates should read");
+                if candidates
+                    .first()
+                    .is_some_and(|candidate| candidate.status == RequestCandidateStatus::Cancelled)
+                {
+                    break candidates;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("candidate should be marked cancelled");
+        assert_eq!(candidates[0].status_code, Some(499));
+        assert_eq!(
+            candidates[0].error_type.as_deref(),
+            Some("downstream_disconnect")
+        );
+
+        let stored_usage = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let usage = usage_repository
+                    .find_by_request_id("req-client-drop-cancels-upstream")
+                    .await
+                    .expect("usage should read");
+                if usage
+                    .as_ref()
+                    .is_some_and(|usage| usage.status == "cancelled")
+                {
+                    break usage.expect("cancelled usage should exist");
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("usage should be marked cancelled");
+        assert_eq!(stored_usage.billing_status, "pending");
+        assert_eq!(stored_usage.status_code, Some(499));
+        assert_eq!(stored_usage.input_tokens, 7);
+        assert_eq!(stored_usage.output_tokens, 11);
+        assert_eq!(stored_usage.total_tokens, 18);
+        let first_byte_time_ms = stored_usage
+            .first_byte_time_ms
+            .expect("cancelled stream should retain first byte time");
+        let response_time_ms = stored_usage
+            .response_time_ms
+            .expect("cancelled stream should record terminal duration");
+        assert!(
+            response_time_ms > first_byte_time_ms,
+            "terminal duration should include time after the first byte"
+        );
+    }
+
+    #[tokio::test]
+    async fn split_done_then_downstream_close_is_recorded_success() {
+        let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
+        let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
+        let state = AppState::new()
+            .expect("app state should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
+                    Arc::clone(&request_candidate_repository),
+                    Arc::clone(&usage_repository),
+                ),
+            )
+            .with_usage_runtime_for_tests(UsageRuntimeConfig {
+                enabled: true,
+                ..UsageRuntimeConfig::default()
+            });
+        let plan = ExecutionPlan {
+            request_id: "req-split-done-close-success".into(),
+            candidate_id: Some("cand-split-done-close-success".into()),
+            provider_name: Some("openai".into()),
+            provider_id: "prov-1".into(),
+            endpoint_id: "ep-1".into(),
+            key_id: "key-1".into(),
+            method: "POST".into(),
+            url: "https://example.com/v1/chat/completions".into(),
+            headers: BTreeMap::from([
+                ("content-type".into(), "application/json".into()),
+                ("accept".into(), "text/event-stream".into()),
+            ]),
+            content_type: Some("application/json".into()),
+            content_encoding: None,
+            body: RequestBody::from_json(json!({
+                "model": "gpt-5.4",
+                "messages": [],
+                "stream": true
+            })),
+            stream: true,
+            client_api_format: "openai:chat".into(),
+            provider_api_format: "openai:chat".into(),
+            model_name: Some("gpt-5.4".into()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        };
+        let release_eof = Arc::new(Notify::new());
+        let release_eof_for_stream = Arc::clone(&release_eof);
+        let frame_stream = stream! {
+            yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                b"{\"type\":\"headers\",\"payload\":{\"kind\":\"headers\",\"status_code\":200,\"headers\":{\"content-type\":\"text/event-stream\"}}}\n",
+            ));
+            yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                b"{\"type\":\"data\",\"payload\":{\"kind\":\"data\",\"text\":\"data: {\\\"id\\\":\\\"first\\\",\\\"object\\\":\\\"chat.completion.chunk\\\",\\\"model\\\":\\\"gpt-5.4\\\",\\\"choices\\\":[{\\\"index\\\":0,\\\"delta\\\":{\\\"content\\\":\\\"hi\\\"},\\\"finish_reason\\\":null}]}\\n\\n\"}}\n",
+            ));
+            yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                b"{\"type\":\"data\",\"payload\":{\"kind\":\"data\",\"text\":\"data: {\\\"id\\\":\\\"terminal\\\",\\\"object\\\":\\\"chat.completion.chunk\\\",\\\"model\\\":\\\"gpt-5.4\\\",\\\"choices\\\":[{\\\"index\\\":0,\\\"delta\\\":{},\\\"finish_reason\\\":\\\"stop\\\"}],\\\"usage\\\":{\\\"prompt_tokens\\\":7,\\\"completion_tokens\\\":11,\\\"total_tokens\\\":18}}\\n\\n\"}}\n",
+            ));
+            yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                b"{\"type\":\"data\",\"payload\":{\"kind\":\"data\",\"text\":\"data: [DO\"}}\n",
+            ));
+            yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                b"{\"type\":\"data\",\"payload\":{\"kind\":\"data\",\"text\":\"NE]\\n\\n\"}}\n",
+            ));
+            release_eof_for_stream.notified().await;
+        }
+        .boxed();
+
+        let response = execute_stream_from_frame_stream(
+            &state,
+            plan,
+            "trace-split-done-close-success",
+            &test_decision(),
+            "openai_chat_stream",
+            None,
+            Some(json!({
+                "request_id": "req-split-done-close-success",
+                "candidate_id": "cand-split-done-close-success",
+                "candidate_index": 0,
+                "retry_index": 0,
+                "provider_api_format": "openai:chat",
+                "client_api_format": "openai:chat"
+            })),
+            crate::clock::current_unix_ms(),
+            Instant::now(),
+            frame_stream,
+            None,
+        )
+        .await
+        .expect("execution should succeed")
+        .expect("execution should return a client response");
+
+        let mut body_stream = response.into_body().into_data_stream();
+        let mut body = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !String::from_utf8_lossy(&body).contains("data: [DONE]") {
+                let chunk = body_stream
+                    .next()
+                    .await
+                    .expect("body should yield until done")
+                    .expect("chunk should be ok");
+                body.extend_from_slice(&chunk);
+            }
+        })
+        .await
+        .expect("final DONE should arrive");
+        drop(body_stream);
+        release_eof.notify_one();
+
+        let candidates = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let candidates = request_candidate_repository
+                    .list_by_request_id("req-split-done-close-success")
+                    .await
+                    .expect("request candidates should read");
+                if candidates
+                    .first()
+                    .is_some_and(|candidate| candidate.status == RequestCandidateStatus::Success)
+                {
+                    break candidates;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("candidate should be marked success");
+        assert_eq!(candidates[0].status_code, Some(200));
+
+        let stored_usage = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let usage = usage_repository
+                    .find_by_request_id("req-split-done-close-success")
+                    .await
+                    .expect("usage should read");
+                if usage
+                    .as_ref()
+                    .is_some_and(|usage| usage.status == "completed")
+                {
+                    break usage.expect("completed usage should exist");
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("usage should be marked completed");
+        assert_eq!(stored_usage.status_code, Some(200));
+        assert_eq!(stored_usage.input_tokens, 7);
+        assert_eq!(stored_usage.output_tokens, 11);
+        assert_eq!(stored_usage.total_tokens, 18);
+    }
+
+    #[tokio::test]
+    async fn image_stream_downstream_close_after_done_is_recorded_success() {
+        let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
+        let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
+        let state = AppState::new()
+            .expect("app state should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
+                    Arc::clone(&request_candidate_repository),
+                    Arc::clone(&usage_repository),
+                ),
+            )
+            .with_usage_runtime_for_tests(UsageRuntimeConfig {
+                enabled: true,
+                ..UsageRuntimeConfig::default()
+            });
+        let plan = ExecutionPlan {
+            request_id: "req-image-done-close-success".into(),
+            candidate_id: Some("cand-image-done-close-success".into()),
+            provider_name: Some("openai".into()),
+            provider_id: "prov-1".into(),
+            endpoint_id: "ep-1".into(),
+            key_id: "key-1".into(),
+            method: "POST".into(),
+            url: "https://example.com/v1/images/generations".into(),
+            headers: BTreeMap::from([("accept".into(), "text/event-stream".into())]),
+            content_type: Some("application/json".into()),
+            content_encoding: None,
+            body: RequestBody::from_json(json!({
+                "model": "gpt-image-2",
+                "prompt": "draw a small image",
+                "stream": true
+            })),
+            stream: true,
+            client_api_format: "openai:chat".into(),
+            provider_api_format: "openai:image".into(),
+            model_name: Some("gpt-image-2".into()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        };
+        let frame_stream = stream! {
+            yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                b"{\"type\":\"headers\",\"payload\":{\"kind\":\"headers\",\"status_code\":200,\"headers\":{\"content-type\":\"text/event-stream\"}}}\n",
+            ));
+            yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                b"{\"type\":\"data\",\"payload\":{\"kind\":\"data\",\"text\":\"event: response.output_item.done\\ndata: {\\\"type\\\":\\\"response.output_item.done\\\",\\\"output_index\\\":0,\\\"item\\\":{\\\"id\\\":\\\"ig_1\\\",\\\"type\\\":\\\"image_generation_call\\\",\\\"result\\\":\\\"aGVsbG8=\\\"}}\\n\\nevent: response.completed\\ndata: {\\\"type\\\":\\\"response.completed\\\",\\\"response\\\":{\\\"id\\\":\\\"resp_1\\\",\\\"model\\\":\\\"gpt-image-2\\\",\\\"status\\\":\\\"completed\\\",\\\"usage\\\":null}}\\n\\n\"}}\n",
+            ));
+            std::future::pending::<()>().await;
+        }
+        .boxed();
+
+        let response = execute_stream_from_frame_stream(
+            &state,
+            plan,
+            "trace-image-done-close-success",
+            &test_decision(),
+            "openai_chat_stream",
+            Some("openai_chat_stream_success".to_string()),
+            Some(json!({
+                "request_id": "req-image-done-close-success",
+                "candidate_id": "cand-image-done-close-success",
+                "candidate_index": 0,
+                "retry_index": 0,
+                "provider_api_format": "openai:image",
+                "client_api_format": "openai:chat",
+                "image_request": {
+                    "size": "1024x1024",
+                    "quality": "medium"
+                }
+            })),
+            crate::clock::current_unix_ms(),
+            Instant::now(),
+            frame_stream,
+            None,
+        )
+        .await
+        .expect("execution should succeed")
+        .expect("execution should return a client response");
+
+        let mut body_stream = response.into_body().into_data_stream();
+        let mut body = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !String::from_utf8_lossy(&body).contains("data: [DONE]") {
+                let chunk = body_stream
+                    .next()
+                    .await
+                    .expect("body should yield until done")
+                    .expect("chunk should be ok");
+                body.extend_from_slice(&chunk);
+            }
+        })
+        .await
+        .expect("final DONE should arrive");
+        drop(body_stream);
+
+        let candidates = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let candidates = request_candidate_repository
+                    .list_by_request_id("req-image-done-close-success")
+                    .await
+                    .expect("request candidates should read");
+                if candidates
+                    .first()
+                    .is_some_and(|candidate| candidate.status == RequestCandidateStatus::Success)
+                {
+                    break candidates;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("candidate should be marked success");
+        assert_eq!(candidates[0].status_code, Some(200));
+
+        let stored_usage = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let usage = usage_repository
+                    .find_by_request_id("req-image-done-close-success")
+                    .await
+                    .expect("usage should read");
+                if usage
+                    .as_ref()
+                    .is_some_and(|usage| usage.status == "completed")
+                {
+                    break usage.expect("completed usage should exist");
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("usage should be marked completed");
+        assert_eq!(stored_usage.status_code, Some(200));
+        assert!(stored_usage.total_tokens > 0);
     }
 
     #[tokio::test]
@@ -3296,7 +6253,7 @@ mod tests {
         .expect("execution should return a client response");
 
         first_data_seen.notified().await;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         let live_usage = loop {
             let usage = usage_repository
                 .find_by_request_id("req-live-stream-first-data")
@@ -3323,6 +6280,172 @@ mod tests {
             .expect("response body should read");
         let text = String::from_utf8(body.to_vec()).expect("response body should be utf8");
         assert!(text.contains("response.output_text.delta"));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn execute_execution_runtime_stream_records_first_stream_event_before_visible_text() {
+        let listener = crate::test_support::bind_loopback_listener()
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("local addr should resolve");
+        let first_event_seen = Arc::new(Notify::new());
+        let release_text = Arc::new(Notify::new());
+        let text_seen = Arc::new(Notify::new());
+        let release_terminal = Arc::new(Notify::new());
+        let first_event_seen_for_route = Arc::clone(&first_event_seen);
+        let release_text_for_route = Arc::clone(&release_text);
+        let text_seen_for_route = Arc::clone(&text_seen);
+        let release_terminal_for_route = Arc::clone(&release_terminal);
+        let server = tokio::spawn(async move {
+            let app = Router::new().route(
+                "/v1/execute/stream",
+                any(move |_request: Request| {
+                    let first_event_seen = Arc::clone(&first_event_seen_for_route);
+                    let release_text = Arc::clone(&release_text_for_route);
+                    let text_seen = Arc::clone(&text_seen_for_route);
+                    let release_terminal = Arc::clone(&release_terminal_for_route);
+                    async move {
+                        let frames = stream! {
+                            yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                                b"{\"type\":\"headers\",\"payload\":{\"kind\":\"headers\",\"status_code\":200,\"headers\":{\"content-type\":\"text/event-stream\"}}}\n",
+                            ));
+                            yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                                b"{\"type\":\"data\",\"payload\":{\"kind\":\"data\",\"text\":\"\"}}\n",
+                            ));
+                            yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                                b"{\"type\":\"telemetry\",\"payload\":{\"kind\":\"telemetry\",\"telemetry\":{\"ttfb_ms\":11,\"elapsed_ms\":12}}}\n",
+                            ));
+                            first_event_seen.notify_one();
+                            release_text.notified().await;
+                            yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                                b"{\"type\":\"data\",\"payload\":{\"kind\":\"data\",\"text\":\"data: {\\\"choices\\\":[{\\\"delta\\\":{\\\"content\\\":\\\"hello\\\"}}]}\\n\\n\"}}\n",
+                            ));
+                            text_seen.notify_one();
+                            release_terminal.notified().await;
+                            yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                                b"{\"type\":\"telemetry\",\"payload\":{\"kind\":\"telemetry\",\"telemetry\":{\"elapsed_ms\":50}}}\n",
+                            ));
+                            yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                                b"{\"type\":\"eof\",\"payload\":{\"kind\":\"eof\"}}\n",
+                            ));
+                        };
+                        let mut response = axum::http::Response::new(Body::from_stream(frames));
+                        response.headers_mut().insert(
+                            header::CONTENT_TYPE,
+                            HeaderValue::from_static("application/x-ndjson"),
+                        );
+                        response
+                    }
+                }),
+            );
+            axum::serve(listener, app)
+                .await
+                .expect("server should start");
+        });
+
+        let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
+        let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
+        let state = AppState::new()
+            .expect("app state should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
+                    Arc::clone(&request_candidate_repository),
+                    Arc::clone(&usage_repository),
+                ),
+            )
+            .with_usage_runtime_for_tests(UsageRuntimeConfig {
+                enabled: true,
+                ..UsageRuntimeConfig::default()
+            })
+            .with_execution_runtime_override_base_url(format!("http://{addr}"));
+        let plan = ExecutionPlan {
+            request_id: "req-live-stream-first-event".into(),
+            candidate_id: Some("cand-live-stream-first-event".into()),
+            provider_name: Some("openai".into()),
+            provider_id: "prov-1".into(),
+            endpoint_id: "ep-1".into(),
+            key_id: "key-1".into(),
+            method: "POST".into(),
+            url: "https://api.openai.com/v1/chat/completions".into(),
+            headers: BTreeMap::from([
+                ("content-type".into(), "application/json".into()),
+                ("accept".into(), "text/event-stream".into()),
+            ]),
+            content_type: Some("application/json".into()),
+            content_encoding: None,
+            body: RequestBody::from_json(json!({
+                "model": "gpt-5.4",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": true
+            })),
+            stream: true,
+            client_api_format: "openai:chat".into(),
+            provider_api_format: "openai:chat".into(),
+            model_name: Some("gpt-5.4".into()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: Some(ExecutionTimeouts {
+                connect_ms: Some(5_000),
+                total_ms: Some(5_000),
+                ..ExecutionTimeouts::default()
+            }),
+        };
+        let decision = GatewayControlDecision::synthetic(
+            "/v1/chat/completions",
+            Some("ai_public".to_string()),
+            Some("openai".to_string()),
+            Some("chat".to_string()),
+            Some("openai:chat".to_string()),
+        )
+        .with_execution_runtime_candidate(true);
+
+        let response = execute_execution_runtime_stream(
+            &state,
+            plan,
+            "trace-live-stream-first-event",
+            &decision,
+            "openai_chat_stream",
+            None,
+            Some(json!({
+                "provider_api_format": "openai:chat",
+                "client_api_format": "openai:chat",
+            })),
+        )
+        .await
+        .expect("execution should succeed")
+        .expect("execution should return a client response");
+
+        first_event_seen.notified().await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        let first_event_usage = loop {
+            let usage = usage_repository
+                .find_by_request_id("req-live-stream-first-event")
+                .await
+                .expect("usage should read");
+            if usage.as_ref().is_some_and(|usage| {
+                usage.status == "streaming" && usage.first_byte_time_ms.is_some()
+            }) {
+                break usage.expect("streaming usage should exist");
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "usage should record first byte on the first upstream stream event"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert!(first_event_usage.first_byte_time_ms.is_some());
+
+        release_text.notify_one();
+        text_seen.notified().await;
+
+        release_terminal.notify_one();
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should read");
+        let text = String::from_utf8(body.to_vec()).expect("response body should be utf8");
+        assert!(text.contains("\"content\":\"hello\""));
 
         server.abort();
     }
@@ -3768,6 +6891,7 @@ mod tests {
             proxy_tx,
             proxy_close_tx,
             16,
+            2,
         )));
 
         let plan = ExecutionPlan {
@@ -3897,6 +7021,7 @@ mod tests {
             proxy_tx,
             proxy_close_tx,
             16,
+            2,
         )));
 
         let plan = ExecutionPlan {
@@ -4019,8 +7144,9 @@ mod tests {
 
         let body = body_task.await.expect("body task should complete");
         assert!(body.contains("data: hello\n\n"));
-        assert!(body.contains("event: aether.error\n"));
+        assert!(body.contains("data: {\"error\":"));
         assert!(body.contains(original_error));
+        assert!(body.contains("data: [DONE]\n\n"));
         assert!(
             !body.contains("unexpected EOF during chunk size line"),
             "same-format SSE path should surface the original terminal error event"

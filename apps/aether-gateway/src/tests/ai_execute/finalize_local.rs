@@ -24,8 +24,39 @@ use aether_data_contracts::repository::provider_catalog::{
 };
 use sha2::{Digest, Sha256};
 
-#[tokio::test]
-async fn gateway_executes_openai_chat_sync_upstream_stream_via_local_finalize_response() {
+const OPENAI_CHAT_FINALIZE_TEST_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+fn run_openai_chat_finalize_test<F, Fut>(test_name: &'static str, make_future: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + 'static,
+{
+    let handle = std::thread::Builder::new()
+        .name(test_name.to_string())
+        .stack_size(OPENAI_CHAT_FINALIZE_TEST_STACK_BYTES)
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build");
+            runtime.block_on(make_future());
+        })
+        .expect("openai chat finalize test thread should spawn");
+
+    if let Err(payload) = handle.join() {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+#[test]
+fn gateway_executes_openai_chat_sync_upstream_stream_via_local_finalize_response() {
+    run_openai_chat_finalize_test(
+        "gateway_executes_openai_chat_sync_upstream_stream_via_local_finalize_response",
+        gateway_executes_openai_chat_sync_upstream_stream_via_local_finalize_response_impl,
+    );
+}
+
+async fn gateway_executes_openai_chat_sync_upstream_stream_via_local_finalize_response_impl() {
     use base64::Engine as _;
 
     #[derive(Debug, Clone)]
@@ -365,7 +396,7 @@ async fn gateway_executes_openai_chat_sync_upstream_stream_via_local_finalize_re
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
         vec![sample_provider_catalog_provider()],
         vec![sample_provider_catalog_endpoint(
-            "https://api.openai.example",
+            "https://api.openai.example/v1",
         )],
         vec![sample_provider_catalog_key()],
     ));
@@ -521,8 +552,16 @@ async fn gateway_executes_openai_chat_sync_upstream_stream_via_local_finalize_re
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_executes_openai_chat_cross_format_upstream_stream_via_local_finalize_response() {
+#[test]
+fn gateway_executes_openai_chat_cross_format_upstream_stream_via_local_finalize_response() {
+    run_openai_chat_finalize_test(
+        "gateway_executes_openai_chat_cross_format_upstream_stream_via_local_finalize_response",
+        gateway_executes_openai_chat_cross_format_upstream_stream_via_local_finalize_response_impl,
+    );
+}
+
+async fn gateway_executes_openai_chat_cross_format_upstream_stream_via_local_finalize_response_impl(
+) {
     use base64::Engine as _;
     #[derive(Debug, Clone)]
     struct SeenRemoteExecutionRuntimeRequest {
@@ -955,8 +994,16 @@ async fn gateway_executes_openai_chat_cross_format_upstream_stream_via_local_fin
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_executes_openai_chat_cross_format_tool_use_upstream_stream_via_local_finalize_response(
+#[test]
+fn gateway_executes_openai_chat_cross_format_tool_use_upstream_stream_via_local_finalize_response()
+{
+    run_openai_chat_finalize_test(
+        "gateway_executes_openai_chat_cross_format_tool_use_upstream_stream_via_local_finalize_response",
+        gateway_executes_openai_chat_cross_format_tool_use_upstream_stream_via_local_finalize_response_impl,
+    );
+}
+
+async fn gateway_executes_openai_chat_cross_format_tool_use_upstream_stream_via_local_finalize_response_impl(
 ) {
     use base64::Engine as _;
 
@@ -1782,8 +1829,15 @@ async fn gateway_skips_openai_chat_antigravity_cross_format_sync_candidate_as_tr
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_executes_openai_chat_cross_format_claude_upstream_sync_via_local_finalize_response(
+#[test]
+fn gateway_executes_openai_chat_cross_format_claude_upstream_sync_via_local_finalize_response() {
+    run_openai_chat_finalize_test(
+        "gateway_executes_openai_chat_cross_format_claude_upstream_sync_via_local_finalize_response",
+        gateway_executes_openai_chat_cross_format_claude_upstream_sync_via_local_finalize_response_impl,
+    );
+}
+
+async fn gateway_executes_openai_chat_cross_format_claude_upstream_sync_via_local_finalize_response_impl(
 ) {
     fn hash_api_key(value: &str) -> String {
         let mut hasher = Sha256::new();
@@ -2134,8 +2188,15 @@ async fn gateway_executes_openai_chat_cross_format_claude_upstream_sync_via_loca
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_executes_openai_chat_cross_format_gemini_upstream_sync_via_local_finalize_response(
+#[test]
+fn gateway_executes_openai_chat_cross_format_gemini_upstream_sync_via_local_finalize_response() {
+    run_openai_chat_finalize_test(
+        "gateway_executes_openai_chat_cross_format_gemini_upstream_sync_via_local_finalize_response",
+        gateway_executes_openai_chat_cross_format_gemini_upstream_sync_via_local_finalize_response_impl,
+    );
+}
+
+async fn gateway_executes_openai_chat_cross_format_gemini_upstream_sync_via_local_finalize_response_impl(
 ) {
     fn hash_api_key(value: &str) -> String {
         let mut hasher = Sha256::new();

@@ -4,11 +4,12 @@ use sqlx::{mysql::MySqlRow, Row};
 use super::types::{
     bucket_start_unix_secs, build_tunnel_error_event_detail, build_tunnel_metrics_sample,
     log_reported_tunnel_error_event, normalize_proxy_metadata,
-    reconcile_remote_config_after_heartbeat, ProxyNodeEventQuery, ProxyNodeHeartbeatMutation,
-    ProxyNodeManualCreateMutation, ProxyNodeManualUpdateMutation, ProxyNodeMetricsCleanupSummary,
-    ProxyNodeMetricsStep, ProxyNodeReadRepository, ProxyNodeRegistrationMutation,
-    ProxyNodeRemoteConfigMutation, ProxyNodeTrafficMutation, ProxyNodeTunnelStatusMutation,
-    ProxyNodeWriteRepository, StoredProxyFleetMetricsBucket, StoredProxyNode, StoredProxyNodeEvent,
+    preserve_proxy_metadata_tunnel_security, reconcile_remote_config_after_heartbeat,
+    ProxyNodeEventQuery, ProxyNodeHeartbeatMutation, ProxyNodeManualCreateMutation,
+    ProxyNodeManualUpdateMutation, ProxyNodeMetricsCleanupSummary, ProxyNodeMetricsStep,
+    ProxyNodeReadRepository, ProxyNodeRegistrationMutation, ProxyNodeRemoteConfigMutation,
+    ProxyNodeTrafficMutation, ProxyNodeTunnelStatusMutation, ProxyNodeWriteRepository,
+    StoredProxyFleetMetricsBucket, StoredProxyNode, StoredProxyNodeEvent,
     StoredProxyNodeMetricsBucket, PROXY_NODE_EVENT_TYPE_TUNNEL_ERROR,
 };
 use crate::driver::mysql::MysqlPool;
@@ -755,7 +756,7 @@ WHERE is_manual = 0
         };
         if !node.tunnel_mode {
             return Err(DataLayerError::InvalidInput(
-                "non-tunnel mode is no longer supported, please upgrade aether-proxy to use tunnel mode"
+                "non-tunnel mode is no longer supported, please upgrade aether-tunnel to use tunnel mode"
                     .to_string(),
             ));
         }
@@ -779,10 +780,15 @@ WHERE is_manual = 0
         if let Some(value) = mutation.avg_latency_ms {
             node.avg_latency_ms = Some(value);
         }
-        if let Some(value) = normalize_proxy_metadata(
+        let normalized_proxy_metadata = normalize_proxy_metadata(
             mutation.proxy_metadata.as_ref(),
             mutation.proxy_version.as_deref(),
-        ) {
+        );
+        let normalized_proxy_metadata = preserve_proxy_metadata_tunnel_security(
+            previous_proxy_metadata.as_ref(),
+            normalized_proxy_metadata,
+        );
+        if let Some(value) = normalized_proxy_metadata {
             node.proxy_metadata = Some(value);
         }
         if let Some(value) = mutation.total_requests_delta.filter(|value| *value > 0) {

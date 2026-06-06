@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS oauth_providers (
     frontend_callback_url TEXT NOT NULL,
     attribute_mapping TEXT,
     extra_config TEXT,
+    icon_url TEXT,
     is_enabled INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL

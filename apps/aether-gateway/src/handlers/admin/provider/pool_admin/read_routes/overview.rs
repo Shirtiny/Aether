@@ -19,6 +19,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use futures_util::future::join_all;
 use serde_json::{json, Value};
 
 pub(super) async fn build_admin_pool_overview_response(
@@ -67,47 +68,66 @@ pub(super) async fn build_admin_pool_overview_response(
         .collect::<BTreeMap<_, _>>();
 
     let probe_config = PoolQuotaProbeWorkerConfig::from_env();
-    let mut runtime_metrics_by_provider = BTreeMap::new();
-    for (provider, pool_config) in &pool_enabled_providers {
-        let active_keys = key_stats_by_provider
-            .get(&provider.id)
-            .map(|item| item.active_keys as usize)
-            .unwrap_or(0);
-        let hot_count = if pool_config.probing_enabled {
-            state
-                .runtime_state()
-                .set_len(&admin_provider_pool_quota_probe_active_members_key(
-                    &provider.id,
-                ))
-                .await
-                .unwrap_or(0)
-        } else {
-            0
-        };
-        let demand_snapshot = read_provider_pool_demand_snapshot(
-            state.runtime_state(),
-            &provider.id,
-            active_keys,
-            probe_config.max_keys_per_provider,
-        )
-        .await;
-        let burst_pending = pool_config.probing_enabled
-            && provider_pool_burst_pending(state.runtime_state(), &provider.id).await;
-        runtime_metrics_by_provider.insert(
-            provider.id.clone(),
-            json!({
-                "provider_hot_count": hot_count,
-                "provider_desired_hot": if pool_config.probing_enabled {
-                    demand_snapshot.desired_hot
-                } else {
-                    0
-                },
-                "provider_in_flight": demand_snapshot.in_flight,
-                "provider_ema_in_flight": demand_snapshot.ema_in_flight,
-                "provider_burst_pending": burst_pending,
-            }),
-        );
-    }
+    let runtime_metrics_by_provider = join_all(pool_enabled_providers.iter().map(
+        |(provider, pool_config)| {
+            let provider_id = provider.id.clone();
+            let probing_enabled = pool_config.probing_enabled;
+            let active_keys = key_stats_by_provider
+                .get(&provider.id)
+                .map(|item| item.active_keys as usize)
+                .unwrap_or(0);
+            let max_keys_per_provider = probe_config.max_keys_per_provider;
+
+            async move {
+                let hot_count_future = async {
+                    if probing_enabled {
+                        state
+                            .runtime_state()
+                            .set_len(&admin_provider_pool_quota_probe_active_members_key(
+                                &provider_id,
+                            ))
+                            .await
+                            .unwrap_or(0)
+                    } else {
+                        0
+                    }
+                };
+                let demand_snapshot_future = read_provider_pool_demand_snapshot(
+                    state.runtime_state(),
+                    &provider_id,
+                    active_keys,
+                    max_keys_per_provider,
+                );
+                let burst_pending_future = async {
+                    probing_enabled
+                        && provider_pool_burst_pending(state.runtime_state(), &provider_id).await
+                };
+                let (hot_count, demand_snapshot, burst_pending) = tokio::join!(
+                    hot_count_future,
+                    demand_snapshot_future,
+                    burst_pending_future
+                );
+
+                (
+                    provider_id,
+                    json!({
+                        "provider_hot_count": hot_count,
+                        "provider_desired_hot": if probing_enabled {
+                            demand_snapshot.desired_hot
+                        } else {
+                            0
+                        },
+                        "provider_in_flight": demand_snapshot.in_flight,
+                        "provider_ema_in_flight": demand_snapshot.ema_in_flight,
+                        "provider_burst_pending": burst_pending,
+                    }),
+                )
+            }
+        },
+    ))
+    .await
+    .into_iter()
+    .collect::<BTreeMap<_, _>>();
 
     let providers = pool_enabled_providers
         .into_iter()

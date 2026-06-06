@@ -273,6 +273,8 @@ async fn gateway_handles_admin_monitoring_system_status_locally_with_trusted_adm
     assert_eq!(payload["tunnel"]["nodes"], json!(0));
     assert_eq!(payload["tunnel"]["active_streams"], json!(0));
     assert_eq!(payload["recent_errors"], json!(1));
+    assert_eq!(payload["usage_counter"]["status"], json!("idle"));
+    assert_eq!(payload["usage_counter"]["outbox_pending_rows"], json!(0));
     assert!(payload["timestamp"].as_str().is_some());
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
@@ -2038,7 +2040,8 @@ async fn gateway_handles_admin_monitoring_resilience_circuit_history_locally_wit
                 "openai:chat": {
                     "open": true,
                     "open_at": "2026-03-30T12:00:00+00:00",
-                    "next_probe_at": "2026-03-30T12:05:00+00:00",
+                    "next_probe_at": "2099-03-30T12:05:00+00:00",
+                    "recovery_seconds": 300,
                     "reason": "错误率过高"
                 }
             })),

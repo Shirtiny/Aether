@@ -14,6 +14,7 @@ use axum::{
     Json,
 };
 use serde_json::json;
+use std::collections::BTreeSet;
 
 #[derive(Debug, serde::Deserialize)]
 struct AdminUserGroupPayload {
@@ -209,14 +210,18 @@ pub(in super::super) async fn build_admin_replace_user_group_members_response(
     if state.find_user_group_by_id(&group_id).await?.is_none() {
         return Ok(not_found("用户分组不存在"));
     }
-    if read_default_user_group_id(state).await?.as_deref() == Some(group_id.as_str()) {
-        return Ok(bad_request_owned("默认用户组成员由系统维护".to_string()));
-    }
     let payload = match parse_members_payload(request_body) {
         Ok(value) => value,
         Err(detail) => return Ok(bad_request_owned(detail)),
     };
     let user_ids = normalize_ids(payload.user_ids);
+    if read_default_user_group_id(state).await?.as_deref() == Some(group_id.as_str()) {
+        if let Some(response) =
+            validate_default_group_member_replacement(state, &group_id, &user_ids).await?
+        {
+            return Ok(response);
+        }
+    }
     let known_users = state.resolve_auth_user_summaries_by_ids(&user_ids).await?;
     if known_users.len() != user_ids.len() {
         return Ok(bad_request_owned("成员包含不存在的用户".to_string()));
@@ -243,6 +248,52 @@ pub(in super::super) async fn build_admin_replace_user_group_members_response(
         "user_group",
         &group_id,
     ))
+}
+
+async fn validate_default_group_member_replacement(
+    state: &AdminAppState<'_>,
+    group_id: &str,
+    next_user_ids: &[String],
+) -> Result<Option<Response<Body>>, GatewayError> {
+    let next_user_ids = next_user_ids.iter().cloned().collect::<BTreeSet<String>>();
+    let removed_user_ids = state
+        .list_user_group_members(group_id)
+        .await?
+        .into_iter()
+        .filter(|member| !next_user_ids.contains(&member.user_id))
+        .map(|member| member.user_id)
+        .collect::<Vec<_>>();
+    if removed_user_ids.is_empty() {
+        return Ok(None);
+    }
+
+    let summaries = state
+        .resolve_auth_user_summaries_by_ids(&removed_user_ids)
+        .await?;
+    let users_with_other_groups = state
+        .list_user_group_memberships_by_user_ids(&removed_user_ids)
+        .await?
+        .into_iter()
+        .filter(|membership| membership.group_id != group_id)
+        .map(|membership| membership.user_id)
+        .collect::<BTreeSet<_>>();
+
+    for user_id in removed_user_ids {
+        let Some(summary) = summaries.get(&user_id) else {
+            continue;
+        };
+        if crate::roles::can_access_admin_console(&summary.role) {
+            continue;
+        }
+        if !users_with_other_groups.contains(&user_id) {
+            return Ok(Some(bad_request_owned(format!(
+                "用户 {} 移出默认组后将不属于任何用户组",
+                summary.username
+            ))));
+        }
+    }
+
+    Ok(None)
 }
 
 pub(in super::super) async fn build_admin_set_default_user_group_response(

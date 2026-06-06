@@ -63,7 +63,7 @@
             <!-- eslint-disable vue/no-v-html -->
             <span
               class="oauth-icon"
-              v-html="getOAuthIcon(oauthProviders[0].provider_type)"
+              v-html="getOAuthIcon(oauthProviders[0].provider_type, oauthProviders[0].icon_url)"
             />
             <!-- eslint-enable vue/no-v-html -->
             <span>使用 {{ oauthProviders[0].display_name }} 登录</span>
@@ -88,7 +88,7 @@
               <!-- eslint-disable vue/no-v-html -->
               <span
                 class="oauth-icon-lg"
-                v-html="getOAuthIcon(p.provider_type)"
+                v-html="getOAuthIcon(p.provider_type, p.icon_url)"
               />
               <!-- eslint-enable vue/no-v-html -->
             </button>
@@ -131,13 +131,19 @@
 
       <!-- 登录表单 -->
       <form
+        ref="loginFormEl"
+        name="login"
+        action="/api/auth/login"
+        method="post"
         class="space-y-4"
+        autocomplete="on"
+        data-form-type="login"
         @submit.prevent="handleLogin"
       >
         <div class="space-y-1.5">
           <div class="flex items-center justify-between">
             <Label
-              for="login-email"
+              for="username"
               class="text-sm"
             >
               {{ emailLabel }}
@@ -160,29 +166,35 @@
             </button>
           </div>
           <Input
-            id="login-email"
+            id="username"
             v-model="form.email"
             type="text"
+            name="username"
             required
             placeholder="用户名或邮箱"
-            autocomplete="off"
+            autocomplete="username"
+            autocapitalize="none"
+            spellcheck="false"
+            :disable-autofill="false"
           />
         </div>
 
         <div class="space-y-1.5">
           <Label
-            for="login-password"
+            for="password"
             class="text-sm"
           >
             密码
           </Label>
           <Input
-            id="login-password"
+            id="password"
             v-model="form.password"
             type="password"
+            name="password"
             required
             placeholder="输入密码"
-            autocomplete="off"
+            autocomplete="current-password"
+            :disable-autofill="false"
           />
         </div>
 
@@ -229,6 +241,7 @@
     :password-policy-level="passwordPolicyLevel"
     :turnstile-enabled="turnstileEnabled"
     :turnstile-site-key="turnstileSiteKey"
+    :privacy-policy="privacyPolicy"
     @success="handleRegisterSuccess"
     @switch-to-login="handleSwitchToLogin"
   />
@@ -236,7 +249,7 @@
 
 <script setup lang="ts">
 import { ref, watch, computed, onMounted } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { Dialog } from '@/components/ui'
 import Button from '@/components/ui/button.vue'
 import Input from '@/components/ui/input.vue'
@@ -247,11 +260,12 @@ import { useSiteInfo } from '@/composables/useSiteInfo'
 import { normalizePasswordPolicyLevel, type PasswordPolicyLevel } from '@/utils/passwordPolicy'
 import { isDemoMode, DEMO_ACCOUNTS } from '@/config/demo'
 import RegisterDialog from './RegisterDialog.vue'
-import { authApi } from '@/api/auth'
+import { authApi, type RegistrationPrivacyPolicySettings } from '@/api/auth'
 import { oauthApi, type OAuthProviderInfo } from '@/api/oauth'
 import { getClientDeviceId } from '@/utils/deviceId'
 import { getApiUrl } from '@/utils/url'
 import { getOAuthIcon } from '@/utils/oauth-icons'
+import { navigateAfterLogin } from '@/features/auth/utils/loginRedirect'
 
 const props = defineProps<{
   modelValue: boolean
@@ -262,6 +276,7 @@ const emit = defineEmits<{
 }>()
 
 const router = useRouter()
+const route = useRoute()
 const authStore = useAuthStore()
 const { success: showSuccess, warning: showWarning, error: showError } = useToast()
 const { siteName } = useSiteInfo()
@@ -272,9 +287,15 @@ const showRegisterDialog = ref(false)
 const requireEmailVerification = ref(false)
 const emailConfigured = ref(true) // 邮箱服务是否已配置
 const passwordPolicyLevel = ref<PasswordPolicyLevel>('weak')
-const allowRegistration = ref(false) // 由系统配置控制，默认关闭
 const turnstileEnabled = ref(false)
 const turnstileSiteKey = ref<string | null>(null)
+const allowRegistration = ref(false) // 由系统配置控制，默认关闭
+const privacyPolicy = ref<RegistrationPrivacyPolicySettings>({
+  enabled: false,
+  format: 'markdown',
+  content: '',
+  version: ''
+})
 
 // LDAP authentication settings
 const PREFERRED_AUTH_TYPE_KEY = 'aether_preferred_auth_type'
@@ -288,6 +309,7 @@ const ldapEnabled = ref(false)
 const ldapExclusive = ref(false)
 
 const oauthProviders = ref<OAuthProviderInfo[]>([])
+const loginFormEl = ref<HTMLFormElement | null>(null)
 
 // 保存用户的认证类型偏好
 watch(authType, (newType) => {
@@ -328,28 +350,59 @@ function fillDemoAccount(type: 'admin' | 'user') {
   form.value.password = account.password
 }
 
-async function handleLogin() {
-  if (!form.value.email || !form.value.password) {
+async function handleLogin(event?: Event) {
+  const { email, password } = readCurrentLoginCredentials(event)
+
+  if (!email || !password) {
     showWarning('请输入邮箱和密码')
     return
   }
 
-  const success = await authStore.login(form.value.email, form.value.password, authType.value)
+  const success = await authStore.login(email, password, authType.value)
   if (success) {
+    const targetPath = consumeStoredRedirectPath() ?? (authStore.canAccessAdmin ? '/admin/dashboard' : '/dashboard')
+
+    await navigateAfterLogin(router, targetPath)
+
     showSuccess('登录成功，正在跳转...')
 
     // 关闭对话框
     isOpen.value = false
-
-    // 延迟一下让用户看到成功消息
-    setTimeout(() => {
-      // 根据用户角色跳转到不同的仪表盘
-      const targetPath = authStore.canAccessAdmin ? '/admin/dashboard' : '/dashboard'
-      router.push(targetPath)
-    }, 1000)
   } else {
     showError(authStore.error || '登录失败，请检查邮箱和密码')
   }
+}
+
+function readCurrentLoginCredentials(event?: Event): { email: string; password: string } {
+  const formElement = event?.currentTarget instanceof HTMLFormElement
+    ? event.currentTarget
+    : loginFormEl.value
+
+  const emailInput = formElement?.elements.namedItem('username')
+  const passwordInput = formElement?.elements.namedItem('password')
+
+  const email = emailInput instanceof HTMLInputElement
+    ? emailInput.value.trim()
+    : form.value.email.trim()
+  const password = passwordInput instanceof HTMLInputElement
+    ? passwordInput.value
+    : form.value.password
+
+  form.value.email = email
+  form.value.password = password
+
+  return { email, password }
+}
+
+function consumeStoredRedirectPath(): string | null {
+  const redirectPath = sessionStorage.getItem('redirectPath')
+  if (redirectPath) {
+    sessionStorage.removeItem('redirectPath')
+  }
+  if (!redirectPath || redirectPath === '/' || !redirectPath.startsWith('/') || redirectPath.startsWith('//')) {
+    return null
+  }
+  return redirectPath
 }
 
 function handleOAuthLogin(providerType: string) {
@@ -394,6 +447,12 @@ onMounted(async () => {
     passwordPolicyLevel.value = normalizePasswordPolicyLevel(regSettings.password_policy_level)
     turnstileEnabled.value = !!regSettings.turnstile_enabled
     turnstileSiteKey.value = regSettings.turnstile_site_key || null
+    privacyPolicy.value = regSettings.privacy_policy ?? {
+      enabled: false,
+      format: 'markdown',
+      content: '',
+      version: ''
+    }
 
     localEnabled.value = authSettings.local_enabled
     ldapEnabled.value = authSettings.ldap_enabled
@@ -413,6 +472,10 @@ onMounted(async () => {
     }
 
     oauthProviders.value = providers
+    if (allowRegistration.value && (route.path === '/register' || typeof route.query.invite === 'string')) {
+      isOpen.value = false
+      showRegisterDialog.value = true
+    }
   } catch {
     // If获取失败，保持默认：关闭注册 & 关闭邮箱验证 & 使用本地认证
     allowRegistration.value = false
@@ -421,6 +484,12 @@ onMounted(async () => {
     passwordPolicyLevel.value = 'weak'
     turnstileEnabled.value = false
     turnstileSiteKey.value = null
+    privacyPolicy.value = {
+      enabled: false,
+      format: 'markdown',
+      content: '',
+      version: ''
+    }
     localEnabled.value = true
     ldapEnabled.value = false
     ldapExclusive.value = false

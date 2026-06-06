@@ -404,33 +404,10 @@ impl GeminiClientEmitter {
             Value::Array(vec![Value::Object(candidate)]),
         );
         if let Some(usage) = usage {
-            let visible_output_tokens = usage.output_tokens.saturating_sub(usage.reasoning_tokens);
-            let mut usage_metadata = Map::new();
-            usage_metadata.insert(
-                "promptTokenCount".to_string(),
-                Value::from(usage.input_tokens),
+            response.insert(
+                "usageMetadata".to_string(),
+                gemini_usage_metadata_from_usage(&usage),
             );
-            usage_metadata.insert(
-                "candidatesTokenCount".to_string(),
-                Value::from(visible_output_tokens),
-            );
-            usage_metadata.insert(
-                "totalTokenCount".to_string(),
-                Value::from(usage.total_tokens),
-            );
-            if usage.reasoning_tokens > 0 {
-                usage_metadata.insert(
-                    "thoughtsTokenCount".to_string(),
-                    Value::from(usage.reasoning_tokens),
-                );
-            }
-            if usage.cache_read_tokens > 0 {
-                usage_metadata.insert(
-                    "cachedContentTokenCount".to_string(),
-                    Value::from(usage.cache_read_tokens),
-                );
-            }
-            response.insert("usageMetadata".to_string(), Value::Object(usage_metadata));
         }
         encode_json_sse(None, &Value::Object(response))
     }
@@ -491,6 +468,16 @@ impl GeminiClientEmitter {
                 None,
                 None,
             ),
+            CanonicalStreamEvent::ImageGenerationCall { item, .. } => {
+                let Some(part) = content_part_from_openai_image_generation_item(&item) else {
+                    return Ok(Vec::new());
+                };
+                self.emit_candidate(
+                    vec![gemini_part_from_canonical_content_part(part)],
+                    None,
+                    None,
+                )
+            }
             CanonicalStreamEvent::ToolCallStart {
                 index,
                 call_id,
@@ -886,11 +873,11 @@ mod tests {
                         }
                     }],
                     "usageMetadata": {
-                        "promptTokenCount": 1,
+                        "promptTokenCount": 5,
+                        "cachedContentTokenCount": 4,
                         "candidatesTokenCount": 2,
                         "thoughtsTokenCount": 4,
-                        "cachedContentTokenCount": 5,
-                        "totalTokenCount": 7
+                        "totalTokenCount": 11
                     }
                 })),
             )
@@ -918,11 +905,12 @@ mod tests {
             frame.event,
             CanonicalStreamEvent::Finish {
                 usage: Some(CanonicalUsage {
-                    input_tokens: 1,
+                    input_tokens: 5,
+                    input_tokens_include_cache: true,
                     output_tokens: 6,
+                    cache_read_tokens: 4,
                     reasoning_tokens: 4,
-                    cache_read_tokens: 5,
-                    total_tokens: 7,
+                    total_tokens: 11,
                     ..
                 }),
                 ..
@@ -1009,9 +997,12 @@ mod tests {
         let sse = String::from_utf8(bytes).expect("sse should be utf8");
         assert!(sse.contains("\"thought\":true"));
         assert!(sse.contains("\"thoughtSignature\":\"sig_123\""));
+        assert!(sse.contains("\"promptTokenCount\":6"));
         assert!(sse.contains("\"thoughtsTokenCount\":1"));
         assert!(sse.contains("\"cachedContentTokenCount\":5"));
         assert!(sse.contains("\"candidatesTokenCount\":2"));
+        assert!(sse.contains("\"cachedContentTokenCount\":5"));
+        assert!(sse.contains("\"totalTokenCount\":9"));
         assert!(sse.contains("\"finishReason\":\"STOP\""));
     }
 

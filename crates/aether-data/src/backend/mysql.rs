@@ -50,6 +50,9 @@ use crate::repository::proxy_nodes::{
 use crate::repository::quota::{
     MysqlProviderQuotaRepository, ProviderQuotaReadRepository, ProviderQuotaWriteRepository,
 };
+use crate::repository::routing_profiles::{
+    MysqlRoutingGroupRepository, RoutingGroupReadRepository, RoutingGroupWriteRepository,
+};
 use crate::repository::settlement::{MysqlSettlementRepository, SettlementWriteRepository};
 use crate::repository::usage::{
     MysqlUsageReadRepository, MysqlUsageWriteRepository, UsageReadRepository, UsageWriteRepository,
@@ -193,6 +196,14 @@ impl MysqlBackend {
 
     pub fn pool_score_write_repository(&self) -> Arc<dyn PoolMemberScoreWriteRepository> {
         Arc::new(MysqlPoolMemberScoreRepository::new(self.pool_clone()))
+    }
+
+    pub fn routing_group_read_repository(&self) -> Arc<dyn RoutingGroupReadRepository> {
+        Arc::new(MysqlRoutingGroupRepository::new(self.pool_clone()))
+    }
+
+    pub fn routing_group_write_repository(&self) -> Arc<dyn RoutingGroupWriteRepository> {
+        Arc::new(MysqlRoutingGroupRepository::new(self.pool_clone()))
     }
 
     pub fn proxy_node_read_repository(&self) -> Arc<dyn ProxyNodeReadRepository> {

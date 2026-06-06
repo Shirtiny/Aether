@@ -438,6 +438,275 @@ columns = ["order_kind", "status"]
 name = "idx_payment_orders_product"
 columns = ["product_id"]
 
+[table.user_invite_codes]
+domain = "wallet_billing"
+order = 42
+primary_key = ["user_id"]
+
+[[table.user_invite_codes.columns]]
+name = "user_id"
+type = "text_id"
+length = 64
+
+[[table.user_invite_codes.columns]]
+name = "invite_code"
+type = "text"
+length = 64
+
+[[table.user_invite_codes.columns]]
+name = "active"
+type = "bool"
+default = true
+
+[[table.user_invite_codes.columns]]
+name = "created_at"
+type = "timestamp"
+
+[[table.user_invite_codes.columns]]
+name = "updated_at"
+type = "timestamp"
+
+[[table.user_invite_codes.uniques]]
+name = "user_invite_codes_invite_code_key"
+columns = ["invite_code"]
+
+[[table.user_invite_codes.foreign_keys]]
+name = "user_invite_codes_user_id_fkey"
+columns = ["user_id"]
+references_table = "users"
+references_columns = ["id"]
+on_delete = "cascade"
+
+[table.user_referrals]
+domain = "wallet_billing"
+order = 43
+primary_key = ["id"]
+
+[[table.user_referrals.columns]]
+name = "id"
+type = "text_id"
+length = 64
+
+[[table.user_referrals.columns]]
+name = "inviter_user_id"
+type = "text_id"
+length = 64
+
+[[table.user_referrals.columns]]
+name = "invitee_user_id"
+type = "text_id"
+length = 64
+
+[[table.user_referrals.columns]]
+name = "invite_code_snapshot"
+type = "text"
+length = 64
+
+[[table.user_referrals.columns]]
+name = "source_json"
+type = "json"
+nullable = true
+
+[[table.user_referrals.columns]]
+name = "first_paid_order_id"
+type = "text_id"
+length = 64
+nullable = true
+
+[[table.user_referrals.columns]]
+name = "first_paid_at"
+type = "timestamp"
+nullable = true
+
+[[table.user_referrals.columns]]
+name = "created_at"
+type = "timestamp"
+
+[[table.user_referrals.columns]]
+name = "updated_at"
+type = "timestamp"
+
+[[table.user_referrals.uniques]]
+name = "user_referrals_invitee_user_id_key"
+columns = ["invitee_user_id"]
+
+[[table.user_referrals.indexes]]
+name = "idx_user_referrals_inviter"
+columns = ["inviter_user_id", "created_at"]
+
+[[table.user_referrals.indexes]]
+name = "idx_user_referrals_created"
+columns = ["created_at"]
+
+[[table.user_referrals.indexes]]
+name = "idx_user_referrals_invite_code"
+columns = ["invite_code_snapshot"]
+
+[[table.user_referrals.foreign_keys]]
+name = "user_referrals_inviter_user_id_fkey"
+columns = ["inviter_user_id"]
+references_table = "users"
+references_columns = ["id"]
+on_delete = "cascade"
+
+[[table.user_referrals.foreign_keys]]
+name = "user_referrals_invitee_user_id_fkey"
+columns = ["invitee_user_id"]
+references_table = "users"
+references_columns = ["id"]
+on_delete = "cascade"
+
+[[table.user_referrals.foreign_keys]]
+name = "user_referrals_first_paid_order_fkey"
+columns = ["first_paid_order_id"]
+references_table = "payment_orders"
+references_columns = ["id"]
+on_delete = "set_null"
+
+[table.referral_rewards]
+domain = "wallet_billing"
+order = 44
+primary_key = ["id"]
+
+[[table.referral_rewards.columns]]
+name = "id"
+type = "text_id"
+length = 64
+
+[[table.referral_rewards.columns]]
+name = "referral_id"
+type = "text_id"
+length = 64
+
+[[table.referral_rewards.columns]]
+name = "inviter_user_id"
+type = "text_id"
+length = 64
+
+[[table.referral_rewards.columns]]
+name = "invitee_user_id"
+type = "text_id"
+length = 64
+
+[[table.referral_rewards.columns]]
+name = "reward_type"
+type = "text"
+length = 32
+
+[[table.referral_rewards.columns]]
+name = "trigger_point"
+type = "text"
+length = 64
+
+[[table.referral_rewards.columns]]
+name = "source_order_id"
+type = "text_id"
+length = 64
+nullable = true
+
+[[table.referral_rewards.columns]]
+name = "idempotency_key"
+type = "text"
+length = 128
+
+[[table.referral_rewards.columns]]
+name = "amount_usd"
+type = "float64"
+
+[[table.referral_rewards.columns]]
+name = "status"
+type = "text"
+length = 32
+default = "pending"
+
+[[table.referral_rewards.columns]]
+name = "wallet_transaction_id"
+type = "text_id"
+length = 64
+nullable = true
+
+[[table.referral_rewards.columns]]
+name = "reversed_amount_usd"
+type = "float64"
+default = 0
+
+[[table.referral_rewards.columns]]
+name = "pending_reversal_amount_usd"
+type = "float64"
+default = 0
+
+[[table.referral_rewards.columns]]
+name = "failure_reason"
+type = "long_text"
+nullable = true
+
+[[table.referral_rewards.columns]]
+name = "admin_operator_id"
+type = "text_id"
+length = 64
+nullable = true
+
+[[table.referral_rewards.columns]]
+name = "admin_note"
+type = "long_text"
+nullable = true
+
+[[table.referral_rewards.columns]]
+name = "created_at"
+type = "timestamp"
+
+[[table.referral_rewards.columns]]
+name = "updated_at"
+type = "timestamp"
+
+[[table.referral_rewards.uniques]]
+name = "referral_rewards_idempotency_key_key"
+columns = ["idempotency_key"]
+
+[[table.referral_rewards.indexes]]
+name = "idx_referral_rewards_inviter_status"
+columns = ["inviter_user_id", "status", "created_at"]
+
+[[table.referral_rewards.indexes]]
+name = "idx_referral_rewards_inviter_created"
+columns = ["inviter_user_id", "created_at"]
+
+[[table.referral_rewards.indexes]]
+name = "idx_referral_rewards_created"
+columns = ["created_at"]
+
+[[table.referral_rewards.indexes]]
+name = "idx_referral_rewards_source_order"
+columns = ["source_order_id"]
+
+[[table.referral_rewards.foreign_keys]]
+name = "referral_rewards_referral_id_fkey"
+columns = ["referral_id"]
+references_table = "user_referrals"
+references_columns = ["id"]
+on_delete = "cascade"
+
+[[table.referral_rewards.foreign_keys]]
+name = "referral_rewards_inviter_user_id_fkey"
+columns = ["inviter_user_id"]
+references_table = "users"
+references_columns = ["id"]
+on_delete = "cascade"
+
+[[table.referral_rewards.foreign_keys]]
+name = "referral_rewards_invitee_user_id_fkey"
+columns = ["invitee_user_id"]
+references_table = "users"
+references_columns = ["id"]
+on_delete = "cascade"
+
+[[table.referral_rewards.foreign_keys]]
+name = "referral_rewards_source_order_fkey"
+columns = ["source_order_id"]
+references_table = "payment_orders"
+references_columns = ["id"]
+on_delete = "set_null"
+
 [table.payment_gateway_configs]
 domain = "wallet_billing"
 order = 45
@@ -769,6 +1038,10 @@ columns = ["user_entitlement_id", "request_id"]
 [[table.entitlement_usage_ledgers.indexes]]
 name = "idx_entitlement_usage_user_date"
 columns = ["user_id", "usage_date"]
+
+[[table.entitlement_usage_ledgers.indexes]]
+name = "idx_entitlement_usage_entitlement_date"
+columns = ["user_entitlement_id", "usage_date"]
 
 [[table.payment_callbacks.indexes]]
 name = "idx_payment_callbacks_order"

@@ -64,6 +64,14 @@ impl<'a> AdminAppState<'a> {
         self.app.has_global_model_data_writer()
     }
 
+    pub(crate) fn has_routing_group_data_reader(&self) -> bool {
+        self.app.has_routing_group_data_reader()
+    }
+
+    pub(crate) fn has_routing_group_data_writer(&self) -> bool {
+        self.app.has_routing_group_data_writer()
+    }
+
     pub(crate) fn has_usage_data_reader(&self) -> bool {
         self.app.has_usage_data_reader()
     }

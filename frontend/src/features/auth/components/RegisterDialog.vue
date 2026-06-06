@@ -55,6 +55,21 @@
           />
         </div>
 
+        <div
+          v-if="turnstileRequired"
+          class="space-y-2"
+        >
+          <Label>人机验证 <span class="text-destructive">*</span></Label>
+          <TurnstileWidget
+            ref="turnstileWidgetRef"
+            v-model="turnstileToken"
+            :site-key="turnstileSiteKey"
+            :action="currentTurnstileAction"
+            :disabled="isLoading || isSendingCode"
+            @error="handleTurnstileError"
+          />
+        </div>
+
         <!-- Verification Code Section (仅当需要邮箱验证时显示) -->
         <div
           v-if="emailConfigured && requireEmailVerification"
@@ -197,11 +212,45 @@
           </p>
         </div>
 
-        <TurnstileWidget
-          v-if="turnstileRequired && turnstileSiteKey"
-          ref="turnstileWidgetRef"
-          :site-key="turnstileSiteKey"
-        />
+        <div
+          v-if="inviteCode"
+          class="rounded-lg border border-primary/20 bg-primary/5 px-3 py-2 text-xs text-muted-foreground"
+        >
+          已识别邀请码 <span class="font-mono font-semibold text-foreground">{{ inviteCode }}</span>
+        </div>
+
+        <div
+          v-if="privacyPolicyEnabled"
+          class="rounded-lg border border-border bg-muted/30 p-3"
+        >
+          <label class="flex items-start gap-2 text-sm">
+            <Checkbox
+              :checked="privacyAccepted"
+              class="mt-0.5"
+              @update:checked="privacyAccepted = !!$event"
+            />
+            <span class="leading-6">
+              我已阅读并同意
+              <button
+                type="button"
+                class="font-medium text-primary underline-offset-4 hover:underline"
+                @click="privacyDialogOpen = true"
+              >
+                隐私政策
+              </button>
+              <RouterLink
+                to="/privacy-policy"
+                target="_blank"
+                class="ml-1 text-xs text-muted-foreground underline-offset-4 hover:text-foreground hover:underline"
+              >
+                新窗口打开
+              </RouterLink>
+            </span>
+          </label>
+          <p class="mt-2 text-xs text-muted-foreground">
+            当前版本：{{ privacyPolicyVersion }}
+          </p>
+        </div>
       </form>
 
       <!-- 登录链接 -->
@@ -236,13 +285,37 @@
       </Button>
     </template>
   </Dialog>
+
+  <Dialog
+    v-model="privacyDialogOpen"
+    size="2xl"
+    title="隐私政策"
+  >
+    <!-- eslint-disable vue/no-v-html -->
+    <div
+      class="prose prose-sm dark:prose-invert max-h-[60vh] max-w-none overflow-y-auto"
+      v-html="renderedPrivacyPolicy"
+    />
+    <!-- eslint-enable vue/no-v-html -->
+    <template #footer>
+      <Button
+        type="button"
+        @click="privacyDialogOpen = false"
+      >
+        我知道了
+      </Button>
+    </template>
+  </Dialog>
 </template>
 
 <script setup lang="ts">
 import { ref, computed, watch, onUnmounted, nextTick } from 'vue'
-import { authApi } from '@/api/auth'
+import { RouterLink } from 'vue-router'
+import { marked } from 'marked'
+import { authApi, type RegisterRequest, type RegistrationPrivacyPolicySettings } from '@/api/auth'
 import { useToast } from '@/composables/useToast'
 import { parseApiError } from '@/utils/errorParser'
+import { sanitizeHtml, sanitizeMarkdown } from '@/utils/sanitize'
 import {
   getPasswordPolicyHint,
   getPasswordPolicyPlaceholder,
@@ -251,9 +324,29 @@ import {
 } from '@/utils/passwordPolicy'
 import { Dialog } from '@/components/ui'
 import Button from '@/components/ui/button.vue'
+import Checkbox from '@/components/ui/checkbox.vue'
 import Input from '@/components/ui/input.vue'
 import Label from '@/components/ui/label.vue'
 import TurnstileWidget from './TurnstileWidget.vue'
+
+const props = withDefaults(defineProps<Props>(), {
+  open: false,
+  requireEmailVerification: false,
+  emailConfigured: true,
+  passwordPolicyLevel: 'weak',
+  turnstileEnabled: false,
+  turnstileSiteKey: null,
+  privacyPolicy: () => ({
+    enabled: false,
+    format: 'markdown',
+    content: '',
+    version: ''
+  })
+})
+
+const emit = defineEmits<Emits>()
+
+const INVITE_CODE_STORAGE_KEY = 'aether_invite_code'
 
 interface Props {
   open?: boolean
@@ -262,6 +355,7 @@ interface Props {
   passwordPolicyLevel?: PasswordPolicyLevel
   turnstileEnabled?: boolean
   turnstileSiteKey?: string | null
+  privacyPolicy?: RegistrationPrivacyPolicySettings
 }
 
 interface Emits {
@@ -270,16 +364,6 @@ interface Emits {
   (e: 'switchToLogin'): void
 }
 
-const props = withDefaults(defineProps<Props>(), {
-  open: false,
-  requireEmailVerification: false,
-  emailConfigured: true,
-  passwordPolicyLevel: 'weak',
-  turnstileEnabled: false,
-  turnstileSiteKey: null
-})
-
-const emit = defineEmits<Emits>()
 const { success, error: showError } = useToast()
 
 // Form nonce for password fields (prevent autofill)
@@ -392,32 +476,79 @@ const codeSentAt = ref<number | null>(null)
 const cooldownSeconds = ref(0)
 const expireMinutes = ref(5)
 const cooldownTimer = ref<number | null>(null)
+type TurnstileAction = 'send_verification_code' | 'register'
+const turnstileToken = ref('')
 const turnstileWidgetRef = ref<InstanceType<typeof TurnstileWidget> | null>(null)
-const turnstileAction = ref<'send_verification_code' | 'register' | null>(null)
-const turnstileRequired = computed(() => !!props.turnstileEnabled && !!props.turnstileSiteKey)
+
+const turnstileSiteKey = computed(() => props.turnstileSiteKey || '')
+const turnstileRequired = computed(() => !!props.turnstileEnabled && !!turnstileSiteKey.value)
+const currentTurnstileAction = computed<TurnstileAction>(() =>
+  props.requireEmailVerification && !emailVerified.value
+    ? 'send_verification_code'
+    : 'register'
+)
+
+const resetTurnstile = () => {
+  turnstileToken.value = ''
+  turnstileWidgetRef.value?.reset()
+}
+
+const handleTurnstileError = (message: string) => {
+  showError(message, '人机验证失败')
+}
+
+const inviteCode = ref<string | null>(null)
+const privacyAccepted = ref(false)
+const privacyDialogOpen = ref(false)
+const privacyPolicyEnabled = computed(() => !!props.privacyPolicy?.enabled)
+const privacyPolicyVersion = computed(() => props.privacyPolicy?.version || '1')
+const renderedPrivacyPolicy = computed(() => {
+  const policy = props.privacyPolicy
+  if (!policy?.content) return '<p>暂无隐私政策内容</p>'
+  if (policy.format === 'html') {
+    return sanitizeHtml(policy.content)
+  }
+  const rawHtml = marked(policy.content) as string
+  return sanitizeMarkdown(rawHtml)
+})
+
+function loadInviteCode(): string | null {
+  if (typeof window === 'undefined') return null
+  const fromQuery = new URLSearchParams(window.location.search).get('invite')
+  const normalized = (fromQuery || localStorage.getItem(INVITE_CODE_STORAGE_KEY) || '')
+    .trim()
+    .toUpperCase()
+  if (!normalized) return null
+  localStorage.setItem(INVITE_CODE_STORAGE_KEY, normalized)
+  return normalized
+}
 
 // Send code cooldown timer
 const canSendCode = computed(() => {
   if (!formData.value.email) return false
   if (cooldownSeconds.value > 0) return false
+  if (
+    turnstileRequired.value &&
+    currentTurnstileAction.value === 'send_verification_code' &&
+    !turnstileToken.value
+  ) return false
   return true
 })
 
 const sendCodeButtonText = computed(() => {
-  if (isSendingCode.value) {
-    return turnstileAction.value === 'send_verification_code' ? '验证中...' : '发送中...'
-  }
+  if (isSendingCode.value) return '发送中...'
   if (emailVerified.value) return '验证成功'
   if (cooldownSeconds.value > 0) return `${cooldownSeconds.value}秒后重试`
+  if (
+    turnstileRequired.value &&
+    currentTurnstileAction.value === 'send_verification_code' &&
+    !turnstileToken.value
+  ) return '请先完成人机验证'
   if (codeSentAt.value) return '重新发送验证码'
   return '发送验证码'
 })
 
-const sendCodeLoadingText = computed(() =>
-  turnstileAction.value === 'send_verification_code'
-    ? '正在进行人机验证...'
-    : '正在发送验证码...'
-)
+const sendCodeLoadingText = computed(() => '正在发送验证码...')
 
 // 用户名验证
 const usernameRegex = /^[a-zA-Z0-9_.-]+$/
@@ -454,12 +585,24 @@ const canSubmit = computed(() => {
     }
   }
 
+  if (
+    turnstileRequired.value &&
+    currentTurnstileAction.value === 'register' &&
+    !turnstileToken.value
+  ) {
+    return false
+  }
+
   // Check password match
   if (formData.value.password !== formData.value.confirmPassword) {
     return false
   }
 
   if (passwordError.value) {
+    return false
+  }
+
+  if (privacyPolicyEnabled.value && !privacyAccepted.value) {
     return false
   }
 
@@ -508,6 +651,7 @@ watch(
         cooldownTimer.value = null
       }
       codeDigits.value = ['', '', '', '', '', '']
+      resetTurnstile()
     }
 
     // 清除之前的定时器
@@ -525,6 +669,10 @@ watch(
     }, 500)
   }
 )
+
+watch(currentTurnstileAction, () => {
+  resetTurnstile()
+})
 
 // Reset form when dialog opens
 watch(isOpen, (newValue) => {
@@ -575,6 +723,9 @@ const resetForm = () => {
   isSendingCode.value = false
   codeSentAt.value = null
   cooldownSeconds.value = 0
+  inviteCode.value = loadInviteCode()
+  privacyAccepted.value = false
+  privacyDialogOpen.value = false
 
   // Reset password field nonce
   formNonce.value = createFormNonce()
@@ -588,24 +739,6 @@ const resetForm = () => {
   // Clear verification code inputs
   codeDigits.value = ['', '', '', '', '', '']
   resetTurnstile()
-}
-
-const resetTurnstile = () => {
-  turnstileAction.value = null
-  turnstileWidgetRef.value?.reset()
-}
-
-const executeTurnstile = async (action: 'send_verification_code' | 'register') => {
-  if (!turnstileRequired.value) return undefined
-  turnstileAction.value = action
-  try {
-    return await turnstileWidgetRef.value?.execute(action)
-  } catch {
-    showError('人机验证失败，请重试', '验证失败')
-    return null
-  } finally {
-    turnstileAction.value = null
-  }
 }
 
 const handleSendCode = async () => {
@@ -624,16 +757,13 @@ const handleSendCode = async () => {
   isSendingCode.value = true
 
   try {
-    const turnstileToken = await executeTurnstile('send_verification_code')
-    if (turnstileRequired.value && !turnstileToken) {
-      return
-    }
     const response = await authApi.sendVerificationCode(
       formData.value.email,
-      turnstileToken || undefined
+      turnstileRequired.value ? turnstileToken.value : undefined
     )
 
     if (response.success) {
+      resetTurnstile()
       codeSentAt.value = Date.now()
       if (response.expire_minutes) {
         expireMinutes.value = response.expire_minutes
@@ -649,9 +779,11 @@ const handleSendCode = async () => {
         codeInputRefs.value[0]?.focus()
       })
     } else {
+      resetTurnstile()
       showError(response.message || '请稍后重试', '发送失败')
     }
   } catch (error: unknown) {
+    resetTurnstile()
     showError(parseApiError(error, '网络错误，请重试'), '发送失败')
   } finally {
     isSendingCode.value = false
@@ -708,23 +840,26 @@ const handleSubmit = async () => {
     showError('请先完成邮箱验证')
     return
   }
+  if (
+    turnstileRequired.value &&
+    currentTurnstileAction.value === 'register' &&
+    !turnstileToken.value
+  ) {
+    showError('请先完成人机验证')
+    return
+  }
+
+  if (privacyPolicyEnabled.value && !privacyAccepted.value) {
+    showError('请先阅读并同意隐私政策')
+    return
+  }
 
   isLoading.value = true
-  loadingText.value = turnstileRequired.value ? '验证中...' : '注册中...'
+  loadingText.value = '注册中...'
 
   try {
-    const turnstileToken = await executeTurnstile('register')
-    if (turnstileRequired.value && !turnstileToken) {
-      return
-    }
-    loadingText.value = '注册中...'
     // 构建请求数据：邮箱可选
-    const registerData: {
-      email?: string
-      username: string
-      password: string
-      turnstile_token?: string
-    } = {
+    const registerData: RegisterRequest = {
       username: formData.value.username,
       password: formData.value.password
     }
@@ -732,8 +867,15 @@ const handleSubmit = async () => {
     if (formData.value.email && formData.value.email.trim()) {
       registerData.email = formData.value.email
     }
-    if (turnstileToken) {
-      registerData.turnstile_token = turnstileToken
+    if (turnstileRequired.value && currentTurnstileAction.value === 'register') {
+      registerData.turnstile_token = turnstileToken.value
+    }
+    if (inviteCode.value) {
+      registerData.invite_code = inviteCode.value
+    }
+    if (privacyPolicyEnabled.value) {
+      registerData.privacy_policy_accepted = privacyAccepted.value
+      registerData.privacy_policy_version = privacyPolicyVersion.value
     }
 
     const response = await authApi.register(registerData)
@@ -743,6 +885,7 @@ const handleSubmit = async () => {
     emit('success')
     isOpen.value = false
   } catch (error: unknown) {
+    resetTurnstile()
     showError(parseApiError(error, '注册失败，请重试'), '注册失败')
   } finally {
     isLoading.value = false

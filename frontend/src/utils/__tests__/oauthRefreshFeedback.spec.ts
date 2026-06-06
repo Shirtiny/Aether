@@ -82,4 +82,16 @@ describe('oauthRefreshFeedback', () => {
       message: 'Token 刷新成功，已重新检查额度/账号状态',
     })
   })
+
+  it('includes the recheck failure detail after a successful token refresh', () => {
+    expect(
+      getOAuthRefreshFeedback({
+        accountStateRecheckAttempted: true,
+        accountStateRecheckError: 'wham/usage API 返回状态码 401',
+      }),
+    ).toEqual({
+      tone: 'warning',
+      message: 'Token 刷新成功，但额度/账号状态复检失败：wham/usage API 返回状态码 401',
+    })
+  })
 })

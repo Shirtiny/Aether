@@ -16,15 +16,47 @@ use crate::{AppState, GatewayError};
 use super::super::GatewayControlDecision;
 use super::credentials::{
     build_auth_context_cache_key, current_unix_secs, extract_request_credentials,
-    extract_trusted_admin_headers,
+    extract_trusted_admin_headers, hash_api_key,
 };
 use super::gate::GatewayLocalAuthRejection;
 use super::principal::derive_principal_candidate;
-use super::types::{GatewayPrincipalCandidate, GatewayTrustedAuthHeaders};
+use super::types::{
+    GatewayCredentialCarrier, GatewayPrincipalCandidate, GatewayTrustedAuthHeaders,
+};
 use crate::headers::header_value_str;
 
 const AUTH_CONTEXT_CACHE_TTL: Duration = Duration::from_secs(60);
 const AUTH_CONTEXT_CACHE_MAX_ENTRIES: usize = 256;
+
+#[derive(Debug, Clone, Deserialize)]
+struct AntigravityBearerBridgeConfig {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    auth_user_id: String,
+    #[serde(default)]
+    auth_api_key_id: String,
+    #[serde(default)]
+    bearer_sha256_allowlist: Vec<String>,
+    #[serde(default)]
+    allow_unverified_google_bearer: bool,
+}
+
+impl AntigravityBearerBridgeConfig {
+    fn bearer_validation_mode(&self, raw_bearer: &str) -> Option<&'static str> {
+        if !self.bearer_sha256_allowlist.is_empty() {
+            let bearer_hash = hash_api_key(raw_bearer);
+            return self
+                .bearer_sha256_allowlist
+                .iter()
+                .any(|allowed| allowed.trim().eq_ignore_ascii_case(&bearer_hash))
+                .then_some("sha256_allowlist");
+        }
+
+        self.allow_unverified_google_bearer
+            .then_some("explicit_unverified")
+    }
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct GatewayControlAuthContext {
@@ -48,6 +80,8 @@ pub(crate) struct GatewayControlAuthContext {
     pub(crate) local_rejection: Option<GatewayLocalAuthRejection>,
     #[serde(skip)]
     pub(crate) allowed_models: Option<Vec<String>>,
+    #[serde(skip)]
+    pub(crate) ip_rules: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -206,6 +240,9 @@ fn log_local_auth_rejection(trace_id: &str, decision: &GatewayControlDecision) {
         }
         GatewayLocalAuthRejection::ModelNotAllowed { model } => {
             ("model_not_allowed", model.clone())
+        }
+        GatewayLocalAuthRejection::IpNotAllowed { remote_ip } => {
+            ("ip_not_allowed", remote_ip.clone())
         }
     };
     info!(
@@ -433,7 +470,14 @@ pub(crate) async fn resolve_execution_runtime_auth_context(
     let _ = trace_id;
 
     if let Some(auth_context) = decision.auth_context.clone() {
-        return Ok(Some(auth_context));
+        return Ok(Some(
+            refresh_execution_runtime_auth_context(
+                state,
+                auth_context,
+                decision.auth_endpoint_signature.as_deref(),
+            )
+            .await?,
+        ));
     }
 
     let Some(auth_endpoint_signature) = decision.auth_endpoint_signature.as_deref() else {
@@ -445,7 +489,14 @@ pub(crate) async fn resolve_execution_runtime_auth_context(
     };
 
     if let Some(auth_context) = get_cached_auth_context(state, &cache_key) {
-        return Ok(Some(auth_context));
+        let refreshed = refresh_execution_runtime_auth_context(
+            state,
+            auth_context,
+            Some(auth_endpoint_signature),
+        )
+        .await?;
+        put_cached_auth_context(state, cache_key, refreshed.clone());
+        return Ok(Some(refreshed));
     }
 
     if let Some(auth_context) =
@@ -459,6 +510,56 @@ pub(crate) async fn resolve_execution_runtime_auth_context(
     }
 
     Ok(None)
+}
+
+pub(crate) async fn refresh_execution_runtime_auth_context(
+    state: &AppState,
+    auth_context: GatewayControlAuthContext,
+    auth_endpoint_signature: Option<&str>,
+) -> Result<GatewayControlAuthContext, GatewayError> {
+    if auth_context.local_rejection.is_some() || !auth_context.access_allowed {
+        return Ok(auth_context);
+    }
+    let Some(auth_endpoint_signature) = auth_endpoint_signature
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(auth_context);
+    };
+    if !state.has_auth_api_key_reader()
+        || auth_context.user_id.trim().is_empty()
+        || auth_context.api_key_id.trim().is_empty()
+    {
+        return Ok(auth_context);
+    }
+
+    let snapshot = state
+        .data
+        .read_auth_api_key_snapshot(
+            &auth_context.user_id,
+            &auth_context.api_key_id,
+            current_unix_secs(),
+        )
+        .await
+        .map_err(|err| GatewayError::Internal(err.to_string()))?;
+    let Some(snapshot) = snapshot else {
+        let mut denied = auth_context;
+        denied.access_allowed = false;
+        denied.local_rejection = Some(GatewayLocalAuthRejection::InvalidApiKey);
+        denied.balance_remaining = None;
+        return Ok(denied);
+    };
+
+    let wallet_access = resolve_wallet_auth_gate(state, &snapshot).await?;
+    Ok(build_data_backed_auth_context(
+        state,
+        snapshot,
+        auth_endpoint_signature,
+        Some(true),
+        auth_context.balance_remaining,
+        wallet_access,
+    )
+    .await)
 }
 
 fn put_cached_auth_context(
@@ -517,6 +618,7 @@ pub(super) async fn resolve_data_backed_auth_context(
                     admin_bypass_limits: false,
                     local_rejection: Some(GatewayLocalAuthRejection::InvalidApiKey),
                     allowed_models: None,
+                    ip_rules: None,
                 }));
             };
 
@@ -537,12 +639,115 @@ pub(super) async fn resolve_data_backed_auth_context(
                 .await,
             ))
         }
-        Some(
-            GatewayPrincipalCandidate::DeferredBearerToken { .. }
-            | GatewayPrincipalCandidate::DeferredCookieHeader { .. },
-        ) => Ok(None),
+        Some(GatewayPrincipalCandidate::DeferredBearerToken { raw, carrier }) => {
+            if let Some(auth_context) = resolve_antigravity_bearer_bridge_auth_context(
+                state,
+                signature,
+                raw.as_str(),
+                carrier,
+                now_unix_secs,
+            )
+            .await?
+            {
+                return Ok(Some(auth_context));
+            }
+            Ok(None)
+        }
+        Some(GatewayPrincipalCandidate::DeferredCookieHeader { .. }) => Ok(None),
         None => Ok(None),
     }
+}
+
+async fn resolve_antigravity_bearer_bridge_auth_context(
+    state: &AppState,
+    auth_endpoint_signature: &str,
+    raw_bearer: &str,
+    carrier: GatewayCredentialCarrier,
+    now_unix_secs: u64,
+) -> Result<Option<GatewayControlAuthContext>, GatewayError> {
+    if carrier != GatewayCredentialCarrier::AuthorizationBearer
+        || !auth_endpoint_signature
+            .trim()
+            .eq_ignore_ascii_case("antigravity:v1internal")
+    {
+        return Ok(None);
+    }
+
+    let Some(config_value) = state
+        .read_system_config_json_value(crate::constants::ANTIGRAVITY_BEARER_BRIDGE_CONFIG_KEY)
+        .await?
+    else {
+        return Ok(None);
+    };
+    if config_value.is_null() {
+        return Ok(None);
+    }
+    let config: AntigravityBearerBridgeConfig =
+        serde_json::from_value(config_value).map_err(|err| {
+            GatewayError::Internal(format!(
+                "{} invalid: {err}",
+                crate::constants::ANTIGRAVITY_BEARER_BRIDGE_CONFIG_KEY
+            ))
+        })?;
+    if !config.enabled {
+        return Ok(None);
+    }
+    let Some(validation_mode) = config.bearer_validation_mode(raw_bearer) else {
+        return Ok(None);
+    };
+    let user_id = config.auth_user_id.trim();
+    let api_key_id = config.auth_api_key_id.trim();
+    if user_id.is_empty() || api_key_id.is_empty() {
+        return Err(GatewayError::Internal(format!(
+            "{} requires auth_user_id and auth_api_key_id",
+            crate::constants::ANTIGRAVITY_BEARER_BRIDGE_CONFIG_KEY
+        )));
+    }
+
+    let snapshot = state
+        .data
+        .read_auth_api_key_snapshot(user_id, api_key_id, now_unix_secs)
+        .await
+        .map_err(|err| GatewayError::Internal(err.to_string()))?;
+    let Some(snapshot) = snapshot else {
+        return Ok(Some(GatewayControlAuthContext {
+            user_id: user_id.to_string(),
+            api_key_id: api_key_id.to_string(),
+            username: None,
+            api_key_name: None,
+            balance_remaining: None,
+            access_allowed: false,
+            user_rate_limit: None,
+            api_key_rate_limit: None,
+            api_key_is_standalone: false,
+            admin_bypass_limits: false,
+            local_rejection: Some(GatewayLocalAuthRejection::InvalidApiKey),
+            allowed_models: None,
+            ip_rules: None,
+        }));
+    };
+
+    let wallet_access = resolve_wallet_auth_gate(state, &snapshot).await?;
+    let auth_context = build_data_backed_auth_context(
+        state,
+        snapshot,
+        auth_endpoint_signature,
+        None,
+        None,
+        wallet_access,
+    )
+    .await;
+    info!(
+        event_name = "antigravity_bearer_bridge_auth_context_resolved",
+        log_type = "event",
+        validation_mode,
+        user_id = auth_context.user_id.as_str(),
+        api_key_id = auth_context.api_key_id.as_str(),
+        access_allowed = auth_context.access_allowed,
+        has_local_rejection = auth_context.local_rejection.is_some(),
+        "resolved Antigravity bearer bridge auth context"
+    );
+    Ok(Some(auth_context))
 }
 
 async fn resolve_trusted_auth_context(
@@ -574,6 +779,7 @@ async fn resolve_trusted_auth_context(
             admin_bypass_limits: false,
             local_rejection: Some(GatewayLocalAuthRejection::InvalidApiKey),
             allowed_models: None,
+            ip_rules: None,
         }));
     };
 
@@ -609,7 +815,7 @@ async fn build_data_backed_auth_context(
             .api_key_expires_at_unix_secs
             .is_some_and(|expires_at| expires_at < current_unix_secs());
     let locked_api_key = snapshot.api_key_is_locked && !snapshot.api_key_is_standalone;
-    let access_allowed = header_access_allowed
+    let key_access_allowed = header_access_allowed
         .map(|value| value && snapshot.currently_usable)
         .unwrap_or(snapshot.currently_usable);
     let wallet_remaining = wallet_access
@@ -620,8 +826,9 @@ async fn build_data_backed_auth_context(
         .map(|(provider, _)| provider)
         .unwrap_or(auth_endpoint_signature)
         .trim();
-    let requested_provider_allowed =
-        auth_snapshot_allows_requested_provider(state, &snapshot, auth_endpoint_signature).await;
+    let identity_only = auth_gate_identity_only(auth_endpoint_signature);
+    let requested_provider_allowed = identity_only
+        || auth_snapshot_allows_requested_provider(state, &snapshot, auth_endpoint_signature).await;
     let local_rejection = if invalid_api_key {
         Some(GatewayLocalAuthRejection::InvalidApiKey)
     } else if locked_api_key {
@@ -639,9 +846,15 @@ async fn build_data_backed_auth_context(
         Some(GatewayLocalAuthRejection::ProviderNotAllowed {
             provider: requested_provider.to_string(),
         })
-    } else if snapshot
-        .effective_allowed_api_formats()
-        .is_some_and(|allowed| !contains_api_format_or_alias(allowed, auth_endpoint_signature))
+    } else if !identity_only
+        && snapshot
+            .effective_allowed_api_formats()
+            .is_some_and(|allowed| {
+                !contains_api_format_or_alias(
+                    allowed,
+                    auth_gate_api_format(auth_endpoint_signature).as_str(),
+                )
+            })
     {
         Some(GatewayLocalAuthRejection::ApiFormatNotAllowed {
             api_format: auth_endpoint_signature.to_string(),
@@ -656,7 +869,7 @@ async fn build_data_backed_auth_context(
         user_id: snapshot.user_id,
         api_key_id: snapshot.api_key_id,
         balance_remaining: wallet_remaining.or(balance_remaining),
-        access_allowed,
+        access_allowed: key_access_allowed && local_rejection.is_none(),
         user_rate_limit: snapshot.user_rate_limit,
         api_key_rate_limit: snapshot.api_key_rate_limit,
         api_key_is_standalone: snapshot.api_key_is_standalone,
@@ -664,6 +877,7 @@ async fn build_data_backed_auth_context(
             && !snapshot.api_key_is_standalone,
         local_rejection,
         allowed_models,
+        ip_rules: snapshot.api_key_ip_rules,
     }
 }
 
@@ -673,6 +887,22 @@ fn contains_api_format_or_alias(items: &[String], target: &str) -> bool {
 
 fn normalize_api_format_alias(value: &str) -> String {
     crate::ai_serving::normalize_api_format_alias(value)
+}
+
+fn auth_gate_api_format(auth_endpoint_signature: &str) -> String {
+    let normalized = normalize_api_format_alias(auth_endpoint_signature);
+    if normalized == "antigravity:v1internal" {
+        "gemini:generate_content".to_string()
+    } else {
+        normalized
+    }
+}
+
+fn auth_gate_identity_only(auth_endpoint_signature: &str) -> bool {
+    matches!(
+        auth_endpoint_signature.trim().to_ascii_lowercase().as_str(),
+        "aether:ccswitch_usage"
+    )
 }
 
 fn api_format_matches(left: &str, right: &str) -> bool {
@@ -835,13 +1065,20 @@ mod tests {
         InMemoryAuthApiKeySnapshotRepository, StoredAuthApiKeySnapshot,
     };
     use aether_data::repository::provider_catalog::InMemoryProviderCatalogReadRepository;
+    use aether_data::repository::wallet::{
+        InMemoryWalletRepository, StoredWalletSnapshot, WalletReadRepository,
+    };
     use aether_data_contracts::repository::provider_catalog::{
         StoredProviderCatalogEndpoint, StoredProviderCatalogProvider,
     };
     use axum::http::{HeaderMap, Uri};
 
-    use super::{resolve_data_backed_auth_context, GatewayLocalAuthRejection};
+    use super::{
+        resolve_data_backed_auth_context, resolve_execution_runtime_auth_context,
+        GatewayLocalAuthRejection,
+    };
     use crate::control::auth::credentials::hash_api_key;
+    use crate::control::GatewayControlDecision;
     use crate::data::GatewayDataState;
     use crate::AppState;
 
@@ -947,6 +1184,154 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn data_backed_auth_context_marks_wallet_denial_as_not_allowed() {
+        let api_key = "sk-test-empty-wallet";
+        let auth_repository = Arc::new(InMemoryAuthApiKeySnapshotRepository::seed(vec![(
+            Some(hash_api_key(api_key)),
+            sample_snapshot("key-empty-wallet", "user-empty-wallet"),
+        )]));
+        let wallet_repository = Arc::new(InMemoryWalletRepository::seed(vec![
+            StoredWalletSnapshot::new(
+                "wallet-empty".to_string(),
+                Some("user-empty-wallet".to_string()),
+                None,
+                0.0,
+                0.0,
+                "finite".to_string(),
+                "USD".to_string(),
+                "active".to_string(),
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                100,
+            )
+            .expect("wallet should build"),
+        ]));
+        let data =
+            GatewayDataState::with_auth_and_wallet_for_tests(auth_repository, wallet_repository);
+        let state = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(data);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            format!("Bearer {api_key}").parse().unwrap(),
+        );
+
+        let auth_context = resolve_data_backed_auth_context(
+            &state,
+            &headers,
+            &uri("/v1/chat/completions"),
+            Some("openai:chat"),
+        )
+        .await
+        .expect("resolution should succeed")
+        .expect("auth context should exist");
+
+        assert_eq!(
+            auth_context.local_rejection,
+            Some(GatewayLocalAuthRejection::BalanceDenied {
+                remaining: Some(0.0),
+            })
+        );
+        assert!(!auth_context.access_allowed);
+    }
+
+    #[tokio::test]
+    async fn execution_runtime_auth_context_revalidates_cached_wallet_state() {
+        let api_key = "sk-test-runtime-wallet-cache";
+        let auth_repository = Arc::new(InMemoryAuthApiKeySnapshotRepository::seed(vec![(
+            Some(hash_api_key(api_key)),
+            sample_snapshot("key-runtime-wallet-cache", "user-runtime-wallet-cache"),
+        )]));
+        let wallet_repository = Arc::new(InMemoryWalletRepository::seed(vec![
+            StoredWalletSnapshot::new(
+                "wallet-runtime-cache".to_string(),
+                Some("user-runtime-wallet-cache".to_string()),
+                None,
+                10.0,
+                0.0,
+                "finite".to_string(),
+                "USD".to_string(),
+                "active".to_string(),
+                10.0,
+                0.0,
+                0.0,
+                0.0,
+                100,
+            )
+            .expect("wallet should build"),
+        ]));
+        let data = GatewayDataState::with_auth_and_wallet_for_tests(
+            auth_repository,
+            Arc::clone(&wallet_repository),
+        );
+        let state = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(data);
+        let decision = GatewayControlDecision::synthetic(
+            "/v1/chat/completions",
+            Some("ai_public".to_string()),
+            Some("openai".to_string()),
+            Some("chat".to_string()),
+            Some("openai:chat".to_string()),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", api_key.parse().unwrap());
+
+        let first = resolve_execution_runtime_auth_context(
+            &state,
+            &decision,
+            &headers,
+            &uri("/v1/chat/completions"),
+            "trace-runtime-wallet-cache",
+        )
+        .await
+        .expect("resolution should succeed")
+        .expect("auth context should exist");
+        assert!(first.access_allowed);
+
+        wallet_repository
+            .update_auth_user_wallet_snapshot(
+                "user-runtime-wallet-cache",
+                0.0,
+                0.0,
+                "finite",
+                "USD",
+                "active",
+                10.0,
+                10.0,
+                0.0,
+                0.0,
+                Some(101),
+            )
+            .await
+            .expect("wallet update should succeed")
+            .expect("wallet should exist");
+
+        let second = resolve_execution_runtime_auth_context(
+            &state,
+            &decision,
+            &headers,
+            &uri("/v1/chat/completions"),
+            "trace-runtime-wallet-cache",
+        )
+        .await
+        .expect("resolution should succeed")
+        .expect("auth context should exist");
+
+        assert_eq!(
+            second.local_rejection,
+            Some(GatewayLocalAuthRejection::BalanceDenied {
+                remaining: Some(0.0),
+            })
+        );
+        assert!(!second.access_allowed);
+    }
+
+    #[tokio::test]
     async fn data_backed_auth_context_allows_provider_id_for_matching_provider_type() {
         let api_key = "sk-test-provider-id";
         let mut snapshot = sample_snapshot("key-2", "user-2");
@@ -1026,6 +1411,58 @@ mod tests {
             &headers,
             &uri("/v1/messages"),
             Some("claude:messages"),
+        )
+        .await
+        .expect("resolution should succeed")
+        .expect("auth context should exist");
+
+        assert_eq!(auth_context.local_rejection, None);
+    }
+
+    #[tokio::test]
+    async fn data_backed_auth_context_allows_antigravity_v1internal_for_gemini_generate_content_keys(
+    ) {
+        let api_key = "sk-test-antigravity-v1internal";
+        let mut snapshot = sample_snapshot("key-ant-v1internal", "user-ant-v1internal");
+        snapshot.user_allowed_providers = Some(vec!["antigravity".to_string()]);
+        snapshot.api_key_allowed_providers = Some(vec!["antigravity".to_string()]);
+        snapshot.user_allowed_api_formats = Some(vec!["gemini:generate_content".to_string()]);
+        snapshot.api_key_allowed_api_formats = Some(vec!["gemini:generate_content".to_string()]);
+        let repository = Arc::new(InMemoryAuthApiKeySnapshotRepository::seed(vec![(
+            Some(hash_api_key(api_key)),
+            snapshot,
+        )]));
+        let provider_catalog = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![sample_provider(
+                "provider-antigravity-1",
+                "Antigravity",
+                "antigravity",
+            )],
+            vec![sample_endpoint(
+                "endpoint-antigravity-1",
+                "provider-antigravity-1",
+                "gemini:generate_content",
+            )],
+            Vec::new(),
+        ));
+        let data = GatewayDataState::with_auth_api_key_reader_for_tests(repository)
+            .with_provider_catalog_reader(provider_catalog);
+        let state = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(data);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", api_key.parse().unwrap());
+        headers.insert(
+            http::header::AUTHORIZATION,
+            "Bearer google-oauth-access-token".parse().unwrap(),
+        );
+
+        let auth_context = resolve_data_backed_auth_context(
+            &state,
+            &headers,
+            &uri("/v1internal:streamGenerateContent?alt=sse"),
+            Some("antigravity:v1internal"),
         )
         .await
         .expect("resolution should succeed")

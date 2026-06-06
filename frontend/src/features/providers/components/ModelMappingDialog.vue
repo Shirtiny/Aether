@@ -322,7 +322,7 @@ const emit = defineEmits<{
   'saved': []
 }>()
 
-const { error: showError, success: showSuccess } = useToast()
+const { error: showError, success: showSuccess, warning: showWarning } = useToast()
 const { fetchModels: fetchCachedModels } = useUpstreamModelsCache()
 
 type EndpointOption = {
@@ -563,6 +563,9 @@ async function fetchUpstreamModels() {
       const customFromSelected = selectedNames.value.filter(name => !upstreamIds.has(name))
       const mergedCustom = new Set([...allCustomNames.value, ...customFromSelected])
       allCustomNames.value = Array.from(mergedCustom).filter(name => !upstreamIds.has(name))
+    }
+    if (result.warning) {
+      showWarning(result.warning, '部分格式获取失败')
     }
     if (result.error) {
       showError(result.error, '获取上游模型失败')

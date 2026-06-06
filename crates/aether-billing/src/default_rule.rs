@@ -23,14 +23,28 @@ impl DefaultBillingRuleGenerator {
         pricing: &BillingModelPricingSnapshot,
         task_type: &str,
     ) -> Option<VirtualBillingRule> {
+        let pricing_config = pricing.effective_tiered_pricing();
         let tiers = pricing
             .effective_tiered_pricing()
             .and_then(|value| value.get("tiers"))
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
+        let explicit_image_output_price_default =
+            explicit_image_output_price_default(pricing_config);
+        let image_output_price_default = explicit_image_output_price_default.unwrap_or(0.0);
+        let has_image_output_matrix = explicit_image_output_price_entries(pricing_config)
+            .is_some_and(|entries| !entries.is_empty());
+        let has_image_output_ranges = explicit_image_output_price_ranges(pricing_config)
+            .is_some_and(|ranges| !ranges.is_empty());
+        let has_image_output_pricing = has_image_output_matrix
+            || has_image_output_ranges
+            || explicit_image_output_price_default.is_some();
 
-        if tiers.is_empty() && pricing.effective_price_per_request().is_none() {
+        if tiers.is_empty()
+            && pricing.effective_price_per_request().is_none()
+            && !has_image_output_pricing
+        {
             return None;
         }
 
@@ -63,6 +77,10 @@ impl DefaultBillingRuleGenerator {
             json!(base_cache_read_price),
         );
         variables.insert("price_per_request".to_string(), json!(base_request_price));
+        variables.insert(
+            "image_output_price_per_image".to_string(),
+            json!(image_output_price_default),
+        );
 
         let mut dimension_mappings = BTreeMap::new();
         for (name, key, default) in [
@@ -86,6 +104,14 @@ impl DefaultBillingRuleGenerator {
             ),
             ("cache_read_tokens", "cache_read_tokens", json!(0)),
             ("request_count", "request_count", json!(1)),
+            ("image_count", "image_count", json!(0)),
+            ("image_count_unmetered", "image_count_unmetered", json!(0)),
+            ("image_price_key", "image_price_key", json!("default")),
+            (
+                "image_output_price_per_image",
+                "image_output_price_per_image",
+                json!(image_output_price_default),
+            ),
         ] {
             dimension_mappings.insert(
                 name.to_string(),
@@ -120,6 +146,10 @@ impl DefaultBillingRuleGenerator {
             (
                 "cache_read_cost",
                 "cache_read_tokens * cache_read_price_per_1m / 1000000",
+            ),
+            (
+                "image_output_cost",
+                "image_count_unmetered * image_output_price_per_image",
             ),
             ("request_cost", "request_count * price_per_request"),
         ] {
@@ -209,7 +239,7 @@ impl DefaultBillingRuleGenerator {
             id: "__default__".to_string(),
             name: format!("Default rule for {}", pricing.global_model_name),
             task_type: normalize_task_type(task_type).to_string(),
-            expression: "input_cost + output_cost + cache_creation_uncategorized_cost + cache_creation_ephemeral_5m_cost + cache_creation_ephemeral_1h_cost + cache_read_cost + request_cost".to_string(),
+            expression: "input_cost + output_cost + cache_creation_uncategorized_cost + cache_creation_ephemeral_5m_cost + cache_creation_ephemeral_1h_cost + cache_read_cost + image_output_cost + request_cost".to_string(),
             variables,
             dimension_mappings,
             scope: "default".to_string(),
@@ -266,4 +296,202 @@ fn build_tier_entries(
             Value::Object(value)
         })
         .collect()
+}
+
+pub(crate) fn explicit_image_output_price_entries(
+    pricing_config: Option<&Value>,
+) -> Option<BTreeMap<String, Value>> {
+    let pricing_config = pricing_config?;
+    let mut entries = BTreeMap::new();
+    for key in [
+        "image_output_prices",
+        "image_output_price_per_image",
+        "image_output_price_matrix",
+        "image_prices",
+    ] {
+        if let Some(value) = pricing_config.get(key) {
+            collect_image_output_price_entries(value, &mut entries);
+        }
+    }
+    Some(entries)
+}
+
+pub(crate) fn explicit_image_output_price_ranges(
+    pricing_config: Option<&Value>,
+) -> Option<Vec<Value>> {
+    let pricing_config = pricing_config?;
+    let Some(value) = pricing_config.get("image_output_price_ranges") else {
+        return Some(Vec::new());
+    };
+
+    let mut ranges = Vec::new();
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                let Some(object) = item.as_object() else {
+                    continue;
+                };
+                let mut range = serde_json::Map::new();
+                if let Some(up_to_pixels) = object
+                    .get("up_to_pixels")
+                    .or_else(|| object.get("up_to"))
+                    .or_else(|| object.get("max_pixels"))
+                {
+                    range.insert("up_to_pixels".to_string(), up_to_pixels.clone());
+                }
+                if let Some(label) = object.get("label").cloned() {
+                    range.insert("label".to_string(), label);
+                }
+                if let Some(prices) = object.get("prices") {
+                    range.insert("prices".to_string(), prices.clone());
+                } else {
+                    let mut prices = serde_json::Map::new();
+                    for quality in ["low", "medium", "high"] {
+                        if let Some(price) = object.get(quality).and_then(Value::as_f64) {
+                            prices.insert(quality.to_string(), json!(price));
+                        }
+                    }
+                    if prices.is_empty() {
+                        if let Some(price) = object
+                            .get("price_per_image")
+                            .or_else(|| object.get("price"))
+                            .or_else(|| object.get("value"))
+                            .and_then(Value::as_f64)
+                        {
+                            prices.insert("default".to_string(), json!(price));
+                        }
+                    }
+                    if !prices.is_empty() {
+                        range.insert("prices".to_string(), Value::Object(prices));
+                    }
+                }
+                if !range.is_empty() {
+                    ranges.push(Value::Object(range));
+                }
+            }
+        }
+        Value::Object(object) => {
+            for (key, item) in object {
+                let Some(entry) = item.as_object() else {
+                    continue;
+                };
+                let mut range = serde_json::Map::new();
+                if let Some(up_to_pixels) = entry
+                    .get("up_to_pixels")
+                    .or_else(|| entry.get("up_to"))
+                    .or_else(|| entry.get("max_pixels"))
+                {
+                    range.insert("up_to_pixels".to_string(), up_to_pixels.clone());
+                } else if let Ok(parsed) = key.parse::<u64>() {
+                    range.insert("up_to_pixels".to_string(), json!(parsed));
+                }
+                if let Some(label) = entry.get("label").cloned() {
+                    range.insert("label".to_string(), label);
+                }
+                if let Some(prices) = entry.get("prices") {
+                    range.insert("prices".to_string(), prices.clone());
+                }
+                if !range.is_empty() {
+                    ranges.push(Value::Object(range));
+                }
+            }
+        }
+        _ => {}
+    }
+
+    Some(ranges)
+}
+
+pub(crate) fn explicit_image_output_price_default(pricing_config: Option<&Value>) -> Option<f64> {
+    let pricing_config = pricing_config?;
+    pricing_config
+        .get("image_output_price_default")
+        .or_else(|| pricing_config.get("image_price_default"))
+        .or_else(|| {
+            pricing_config
+                .get("image_output_prices")
+                .and_then(|value| value.get("default"))
+        })
+        .and_then(Value::as_f64)
+}
+
+fn collect_image_output_price_entries(value: &Value, entries: &mut BTreeMap<String, Value>) {
+    if let Some(object) = value.as_object() {
+        for (key, value) in object {
+            if key.eq_ignore_ascii_case("default") {
+                continue;
+            }
+            if let Some(price) = value.as_f64() {
+                entries.insert(normalize_image_price_key(key), json!(price));
+                continue;
+            }
+            let Some(nested) = value.as_object() else {
+                continue;
+            };
+            let key_is_quality = matches_quality_key(key);
+            for (nested_key, nested_value) in nested {
+                let Some(price) = nested_value.as_f64() else {
+                    continue;
+                };
+                let (size, quality) = if key_is_quality {
+                    (nested_key.as_str(), key.as_str())
+                } else {
+                    (key.as_str(), nested_key.as_str())
+                };
+                entries.insert(image_price_key(size, quality), json!(price));
+            }
+        }
+        return;
+    }
+
+    if let Some(items) = value.as_array() {
+        for item in items.iter().filter_map(Value::as_object) {
+            let Some(size) = item.get("size").and_then(Value::as_str) else {
+                continue;
+            };
+            let quality = item
+                .get("quality")
+                .and_then(Value::as_str)
+                .unwrap_or("medium");
+            let Some(price) = item
+                .get("price_per_image")
+                .or_else(|| item.get("price"))
+                .or_else(|| item.get("cost"))
+                .and_then(Value::as_f64)
+            else {
+                continue;
+            };
+            entries.insert(image_price_key(size, quality), json!(price));
+        }
+    }
+}
+
+fn normalize_image_price_key(value: &str) -> String {
+    if let Some((size, quality)) = value.split_once(':').or_else(|| value.split_once('|')) {
+        return image_price_key(size, quality);
+    }
+    value.trim().to_ascii_lowercase().replace(' ', "")
+}
+
+fn image_price_key(size: &str, quality: &str) -> String {
+    format!(
+        "{}:{}",
+        normalize_image_size(size),
+        normalize_image_quality(quality)
+    )
+}
+
+fn normalize_image_size(value: &str) -> String {
+    value.trim().to_ascii_lowercase().replace(' ', "")
+}
+
+fn normalize_image_quality(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+fn matches_quality_key(value: &str) -> bool {
+    matches!(
+        normalize_image_quality(value).as_str(),
+        "low" | "medium" | "high"
+    )
 }

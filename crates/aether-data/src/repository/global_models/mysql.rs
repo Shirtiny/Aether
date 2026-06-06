@@ -336,6 +336,8 @@ WHERE provider_id = ?
         record: &CreateAdminGlobalModelRecord,
     ) -> Result<Option<StoredAdminGlobalModel>, DataLayerError> {
         let now = current_unix_secs();
+        let usage_count =
+            optional_admin_global_model_usage_count_i64(record.usage_count)?.unwrap_or_default();
         sqlx::query(
             r#"
 INSERT INTO global_models (
@@ -351,7 +353,7 @@ INSERT INTO global_models (
   created_at,
   updated_at
 )
-VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 "#,
         )
         .bind(&record.id)
@@ -367,6 +369,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
             &record.supported_capabilities,
             "global_models.supported_capabilities",
         )?)
+        .bind(usage_count)
         .bind(optional_json_to_string(
             &record.config,
             "global_models.config",
@@ -385,6 +388,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
         record: &UpdateAdminGlobalModelRecord,
     ) -> Result<Option<StoredAdminGlobalModel>, DataLayerError> {
         let now = current_unix_secs();
+        let usage_count = optional_admin_global_model_usage_count_i64(record.usage_count)?;
         let updated = sqlx::query(
             r#"
 UPDATE global_models
@@ -395,6 +399,7 @@ SET
   default_tiered_pricing = ?,
   supported_capabilities = ?,
   config = ?,
+  usage_count = COALESCE(?, usage_count),
   updated_at = ?
 WHERE id = ?
 "#,
@@ -414,6 +419,7 @@ WHERE id = ?
             &record.config,
             "global_models.config",
         )?)
+        .bind(usage_count)
         .bind(now as i64)
         .bind(&record.id)
         .execute(&self.pool)
@@ -878,6 +884,20 @@ fn map_active_global_model_row(
         row.try_get("provider_id").map_sql_err()?,
         row.try_get("global_model_id").map_sql_err()?,
     )
+}
+
+fn optional_admin_global_model_usage_count_i64(
+    value: Option<u64>,
+) -> Result<Option<i64>, DataLayerError> {
+    value
+        .map(|value| {
+            i64::try_from(value).map_err(|_| {
+                DataLayerError::InvalidInput(
+                    "global_models.usage_count exceeds i64 range".to_string(),
+                )
+            })
+        })
+        .transpose()
 }
 
 #[cfg(test)]

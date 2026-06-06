@@ -18,6 +18,7 @@ SELECT
   a.priority,
   a.is_active,
   a.is_pinned,
+  a.requires_ack,
   a.author_id,
   u.username AS author_username,
   a.start_time AS start_time_unix_secs,
@@ -144,6 +145,39 @@ WHERE a.is_active = 1
         .map_sql_err()?;
         Ok(row.try_get::<i64, _>("total").map_sql_err()?.max(0) as u64)
     }
+
+    async fn list_required_unread_active_announcements(
+        &self,
+        user_id: &str,
+        now_unix_secs: u64,
+        limit: usize,
+    ) -> Result<Vec<StoredAnnouncement>, DataLayerError> {
+        let rows = sqlx::query(&format!(
+            r#"
+{ANNOUNCEMENT_SELECT}
+WHERE a.is_active = 1
+  AND a.requires_ack = 1
+  AND (a.start_time IS NULL OR a.start_time <= ?)
+  AND (a.end_time IS NULL OR a.end_time >= ?)
+  AND NOT EXISTS (
+    SELECT 1
+    FROM announcement_reads r
+    WHERE r.user_id = ?
+      AND r.announcement_id = a.id
+  )
+ORDER BY a.is_pinned DESC, a.priority DESC, a.created_at DESC, a.id ASC
+LIMIT ?
+"#
+        ))
+        .bind(now_unix_secs as i64)
+        .bind(now_unix_secs as i64)
+        .bind(user_id)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_sql_err()?;
+        rows.iter().map(map_announcement_row).collect()
+    }
 }
 
 #[async_trait]
@@ -159,9 +193,9 @@ impl AnnouncementWriteRepository for MysqlAnnouncementRepository {
             r#"
 INSERT INTO announcements (
   id, title, content, `type`, priority, author_id, is_active, is_pinned,
-  start_time, end_time, created_at, updated_at
+  requires_ack, start_time, end_time, created_at, updated_at
 )
-VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
+VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
 "#,
         )
         .bind(&id)
@@ -171,6 +205,7 @@ VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
         .bind(record.priority)
         .bind(record.author_id)
         .bind(record.is_pinned)
+        .bind(record.requires_ack)
         .bind(optional_i64_from_u64(
             record.start_time_unix_secs,
             "announcements.start_time",
@@ -204,6 +239,7 @@ SET title = COALESCE(?, title),
     priority = COALESCE(?, priority),
     is_active = COALESCE(?, is_active),
     is_pinned = COALESCE(?, is_pinned),
+    requires_ack = COALESCE(?, requires_ack),
     start_time = COALESCE(?, start_time),
     end_time = COALESCE(?, end_time),
     updated_at = ?
@@ -216,6 +252,7 @@ WHERE id = ?
         .bind(record.priority)
         .bind(record.is_active)
         .bind(record.is_pinned)
+        .bind(record.requires_ack)
         .bind(optional_i64_from_u64(
             record.start_time_unix_secs,
             "announcements.start_time",
@@ -303,6 +340,7 @@ fn map_announcement_row(row: &MySqlRow) -> Result<StoredAnnouncement, DataLayerE
         row.try_get("priority").map_sql_err()?,
         row.try_get("is_active").map_sql_err()?,
         row.try_get("is_pinned").map_sql_err()?,
+        row.try_get("requires_ack").map_sql_err()?,
         row.try_get("author_id").map_sql_err()?,
         row.try_get("author_username").map_sql_err()?,
         row.try_get("start_time_unix_secs").map_sql_err()?,

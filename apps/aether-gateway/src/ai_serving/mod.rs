@@ -13,6 +13,7 @@ use crate::{usage::GatewaySyncReportRequest, AppState, GatewayError};
 pub(crate) use self::adaptation::{
     maybe_build_provider_private_stream_normalizer, ProviderPrivateStreamNormalizer,
 };
+pub(crate) use self::api::gemini_generate_content_response_has_visible_output;
 pub(crate) use self::finalize::common::LocalCoreSyncFinalizeOutcome;
 pub(crate) use self::finalize::internal::{
     maybe_bridge_standard_sync_json_to_stream, maybe_build_stream_response_rewriter,
@@ -64,7 +65,8 @@ pub(crate) use self::transport::{
     candidate_common_transport_skip_reason, candidate_transport_pair_skip_reason,
     request_conversion_direct_auth, request_conversion_enabled_for_transport,
     request_conversion_transport_supported, request_conversion_transport_unsupported_reason,
-    request_pair_allowed_for_transport, CandidateTransportPolicyFacts,
+    request_pair_allowed_for_transport, request_pair_direct_auth,
+    request_pair_transport_unsupported_reason, CandidateTransportPolicyFacts,
 };
 pub(crate) use crate::control::GatewayControlDecision;
 pub(crate) use crate::execution_runtime::{ConversionMode, ExecutionStrategy};
@@ -97,6 +99,28 @@ pub(crate) fn build_provider_transport_request_url(
     )
 }
 
+pub(crate) fn build_provider_transport_request_url_for_request_body(
+    transport: &GatewayProviderTransportSnapshot,
+    provider_api_format: &str,
+    mapped_model: Option<&str>,
+    upstream_is_stream: bool,
+    request_query: Option<&str>,
+    kiro_api_region: Option<&str>,
+    provider_request_body: Option<&serde_json::Value>,
+) -> Option<String> {
+    self::transport::build_transport_request_url_for_request_body(
+        transport,
+        self::transport::TransportRequestUrlParams {
+            provider_api_format,
+            mapped_model,
+            upstream_is_stream,
+            request_query,
+            kiro_api_region,
+        },
+        provider_request_body,
+    )
+}
+
 pub(crate) async fn resolve_execution_runtime_auth_context(
     state: &AppState,
     decision: &GatewayControlDecision,
@@ -124,6 +148,13 @@ pub(crate) fn request_origin_from_parts(parts: &http::request::Parts) -> Request
 
 pub(crate) fn is_json_request(headers: &http::HeaderMap) -> bool {
     crate::headers::is_json_request(headers)
+}
+
+pub(crate) fn decoded_request_body_bytes<'a>(
+    headers: &http::HeaderMap,
+    body_bytes: &'a [u8],
+) -> Result<std::borrow::Cow<'a, [u8]>, crate::headers::RequestBodyNormalizationError> {
+    crate::headers::decoded_request_body_bytes(headers, body_bytes)
 }
 
 pub(crate) fn tls_fingerprint_from_headers(headers: &http::HeaderMap) -> Option<serde_json::Value> {
@@ -157,7 +188,9 @@ pub(crate) fn resolve_local_decision_execution_runtime_auth_context(
     decision: &GatewayControlDecision,
 ) -> Option<ExecutionRuntimeAuthContext> {
     resolve_decision_execution_runtime_auth_context(decision).filter(|auth_context| {
-        !auth_context.user_id.trim().is_empty() && !auth_context.api_key_id.trim().is_empty()
+        auth_context.access_allowed
+            && !auth_context.user_id.trim().is_empty()
+            && !auth_context.api_key_id.trim().is_empty()
     })
 }
 

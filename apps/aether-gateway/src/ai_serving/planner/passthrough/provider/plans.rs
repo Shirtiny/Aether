@@ -31,7 +31,7 @@ pub(crate) struct LocalSameFormatProviderSyncAttemptSource<'a> {
     state: &'a AppState,
     parts: &'a http::request::Parts,
     trace_id: &'a str,
-    body_json: &'a serde_json::Value,
+    body_json: serde_json::Value,
     input: LocalSameFormatProviderDecisionInput,
     spec: LocalSameFormatProviderSpec,
     requested_model_family: RequestedModelFamily,
@@ -42,7 +42,7 @@ pub(crate) struct LocalSameFormatProviderStreamAttemptSource<'a> {
     state: &'a AppState,
     parts: &'a http::request::Parts,
     trace_id: &'a str,
-    body_json: &'a serde_json::Value,
+    body_json: serde_json::Value,
     input: LocalSameFormatProviderDecisionInput,
     spec: LocalSameFormatProviderSpec,
     requested_model_family: RequestedModelFamily,
@@ -64,7 +64,7 @@ pub(crate) async fn build_local_sync_attempt_source<'a>(
     let Some(input) = resolve_local_same_format_provider_decision_input(
         state, parts, trace_id, decision, body_json, spec,
     )
-    .await
+    .await?
     else {
         set_local_runtime_miss_diagnostic_reason(
             state,
@@ -85,8 +85,13 @@ pub(crate) async fn build_local_sync_attempt_source<'a>(
         Some(input.requested_model.as_str()),
         "candidate_evaluation_incomplete",
     );
+    let effective_body_json = input.effective_body_json(body_json).clone();
     let (candidates, candidate_count) = build_local_same_format_provider_candidate_attempt_source(
-        state, trace_id, &input, body_json, spec,
+        state,
+        trace_id,
+        &input,
+        &effective_body_json,
+        spec,
     )
     .await?;
     apply_local_runtime_candidate_evaluation_progress_preserving_candidate_signal(
@@ -103,7 +108,7 @@ pub(crate) async fn build_local_sync_attempt_source<'a>(
             state,
             parts,
             trace_id,
-            body_json,
+            body_json: effective_body_json,
             input,
             spec,
             requested_model_family,
@@ -128,7 +133,7 @@ pub(crate) async fn build_local_stream_attempt_source<'a>(
     let Some(input) = resolve_local_same_format_provider_decision_input(
         state, parts, trace_id, decision, body_json, spec,
     )
-    .await
+    .await?
     else {
         set_local_runtime_miss_diagnostic_reason(
             state,
@@ -149,8 +154,13 @@ pub(crate) async fn build_local_stream_attempt_source<'a>(
         Some(input.requested_model.as_str()),
         "candidate_evaluation_incomplete",
     );
+    let effective_body_json = input.effective_body_json(body_json).clone();
     let (candidates, candidate_count) = build_local_same_format_provider_candidate_attempt_source(
-        state, trace_id, &input, body_json, spec,
+        state,
+        trace_id,
+        &input,
+        &effective_body_json,
+        spec,
     )
     .await?;
     apply_local_runtime_candidate_evaluation_progress_preserving_candidate_signal(
@@ -167,7 +177,7 @@ pub(crate) async fn build_local_stream_attempt_source<'a>(
             state,
             parts,
             trace_id,
-            body_json,
+            body_json: effective_body_json,
             input,
             spec,
             requested_model_family,
@@ -244,12 +254,12 @@ impl LocalSameFormatProviderSyncAttemptSource<'_> {
             self.state,
             self.parts,
             self.trace_id,
-            self.body_json,
+            &self.body_json,
             &self.input,
             attempt,
             self.spec,
         )
-        .await
+        .await?
         else {
             return Ok(None);
         };
@@ -257,7 +267,7 @@ impl LocalSameFormatProviderSyncAttemptSource<'_> {
         match build_sync_plan_from_requested_model_family(
             self.requested_model_family,
             self.parts,
-            self.body_json,
+            &self.body_json,
             payload,
         ) {
             Ok(value) => Ok(value),
@@ -282,12 +292,12 @@ impl LocalSameFormatProviderStreamAttemptSource<'_> {
             self.state,
             self.parts,
             self.trace_id,
-            self.body_json,
+            &self.body_json,
             &self.input,
             attempt,
             self.spec,
         )
-        .await
+        .await?
         else {
             return Ok(None);
         };
@@ -295,7 +305,7 @@ impl LocalSameFormatProviderStreamAttemptSource<'_> {
         match build_stream_plan_from_requested_model_family(
             self.requested_model_family,
             self.parts,
-            self.body_json,
+            &self.body_json,
             payload,
         ) {
             Ok(value) => Ok(value),
@@ -326,7 +336,7 @@ pub(crate) async fn build_local_sync_plan_and_reports(
     let Some(input) = resolve_local_same_format_provider_decision_input(
         state, parts, trace_id, decision, body_json, spec,
     )
-    .await
+    .await?
     else {
         set_local_runtime_miss_diagnostic_reason(
             state,
@@ -347,6 +357,7 @@ pub(crate) async fn build_local_sync_plan_and_reports(
         Some(input.requested_model.as_str()),
         "candidate_evaluation_incomplete",
     );
+    let body_json = input.effective_body_json(body_json);
     let (mut source, candidate_count) = build_local_same_format_provider_candidate_attempt_source(
         state, trace_id, &input, body_json, spec,
     )
@@ -365,7 +376,7 @@ pub(crate) async fn build_local_sync_plan_and_reports(
         let Some(payload) = maybe_build_local_same_format_provider_decision_payload_for_candidate(
             state, parts, trace_id, body_json, &input, attempt, spec,
         )
-        .await
+        .await?
         else {
             continue;
         };
@@ -411,7 +422,7 @@ pub(crate) async fn build_local_stream_plan_and_reports(
     let Some(input) = resolve_local_same_format_provider_decision_input(
         state, parts, trace_id, decision, body_json, spec,
     )
-    .await
+    .await?
     else {
         set_local_runtime_miss_diagnostic_reason(
             state,
@@ -432,6 +443,7 @@ pub(crate) async fn build_local_stream_plan_and_reports(
         Some(input.requested_model.as_str()),
         "candidate_evaluation_incomplete",
     );
+    let body_json = input.effective_body_json(body_json);
     let (mut source, candidate_count) = build_local_same_format_provider_candidate_attempt_source(
         state, trace_id, &input, body_json, spec,
     )
@@ -450,7 +462,7 @@ pub(crate) async fn build_local_stream_plan_and_reports(
         let Some(payload) = maybe_build_local_same_format_provider_decision_payload_for_candidate(
             state, parts, trace_id, body_json, &input, attempt, spec,
         )
-        .await
+        .await?
         else {
             continue;
         };

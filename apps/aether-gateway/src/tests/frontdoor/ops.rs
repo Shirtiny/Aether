@@ -115,6 +115,9 @@ async fn gateway_exposes_frontdoor_manifest_without_proxying_upstream() {
         .any(|value| value == "/api/public/health/api-formats"));
     assert!(owned_routes
         .iter()
+        .any(|value| value == "/api/public/health/models"));
+    assert!(owned_routes
+        .iter()
         .any(|value| value == "/api/modules/auth-status"));
     assert!(owned_routes
         .iter()
@@ -168,6 +171,15 @@ async fn gateway_exposes_frontdoor_manifest_without_proxying_upstream() {
     assert!(owned_routes
         .iter()
         .any(|value| value == "/v1beta/files/{path...}"));
+    assert!(owned_routes
+        .iter()
+        .any(|value| value == "/v1internal:loadCodeAssist"));
+    assert!(owned_routes
+        .iter()
+        .any(|value| value == "/v1internal:fetchAvailableModels"));
+    assert!(owned_routes
+        .iter()
+        .any(|value| value == "/v1internal:streamGenerateContent"));
     assert_eq!(
         payload["rust_frontdoor"]["internal_gateway"]["status"],
         "rust_native_control_plane"
@@ -339,8 +351,19 @@ async fn gateway_handles_cors_preflight_without_proxying_upstream() {
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_adds_cors_headers_to_proxied_responses() {
+#[test]
+fn gateway_adds_cors_headers_to_proxied_responses() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_stack_size(16 * 1024 * 1024)
+        .enable_all()
+        .build()
+        .expect("runtime should build");
+
+    runtime.block_on(gateway_adds_cors_headers_to_proxied_responses_inner());
+}
+
+async fn gateway_adds_cors_headers_to_proxied_responses_inner() {
     let execution_runtime_hits = Arc::new(Mutex::new(0usize));
     let execution_runtime_hits_clone = Arc::clone(&execution_runtime_hits);
     let execution_runtime = Router::new().route(

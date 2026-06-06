@@ -28,6 +28,8 @@ pub(crate) struct AdminOAuthProviderUpsertRequest {
     #[serde(default)]
     pub(super) extra_config: Option<serde_json::Value>,
     #[serde(default)]
+    pub(super) icon_url: Option<String>,
+    #[serde(default)]
     pub(super) is_enabled: bool,
     #[serde(default)]
     pub(super) force: bool,
@@ -70,6 +72,7 @@ pub(super) fn build_admin_oauth_provider_payload(
         "frontend_callback_url": provider.frontend_callback_url,
         "attribute_mapping": provider.attribute_mapping,
         "extra_config": provider.extra_config,
+        "icon_url": provider.icon_url,
         "is_enabled": provider.is_enabled,
     })
 }
@@ -364,6 +367,10 @@ pub(super) fn build_admin_oauth_upsert_record(
         frontend_callback_url: frontend_callback_url.to_string(),
         attribute_mapping: payload.attribute_mapping,
         extra_config: payload.extra_config,
+        icon_url: payload.icon_url.and_then(|value| {
+            let value = value.trim().to_string();
+            (!value.is_empty()).then_some(value)
+        }),
         is_enabled: payload.is_enabled,
     })
 }

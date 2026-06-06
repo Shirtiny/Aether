@@ -20,6 +20,13 @@ function normalizeText(value: unknown): string | null {
   return text || null
 }
 
+function formatRecheckError(value: string): string {
+  const collapsed = value.replace(/\s+/g, ' ').trim()
+  const maxLength = 180
+  if (collapsed.length <= maxLength) return collapsed
+  return `${collapsed.slice(0, maxLength - 3).trimEnd()}...`
+}
+
 export function resolveOAuthAccountBlockDisplay(
   snapshot: ProviderKeyStatusCarrier,
 ): OAuthAccountBlockDisplay {
@@ -45,7 +52,7 @@ export function getOAuthRefreshFeedback(
     if (recheckError) {
       return {
         tone: 'warning',
-        message: 'Token 刷新成功，但额度/账号状态复检失败',
+        message: `Token 刷新成功，但额度/账号状态复检失败：${formatRecheckError(recheckError)}`,
       }
     }
     if (blockedLabel) {

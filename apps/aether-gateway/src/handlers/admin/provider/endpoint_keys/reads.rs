@@ -12,6 +12,38 @@ use axum::{
 };
 use serde_json::json;
 
+fn parse_provider_keys_page_param(raw: Option<String>) -> Result<usize, String> {
+    match raw {
+        None => Ok(1),
+        Some(value) => {
+            let parsed = value
+                .parse::<usize>()
+                .map_err(|_| "page must be an integer between 1 and 10000".to_string())?;
+            if (1..=10_000).contains(&parsed) {
+                Ok(parsed)
+            } else {
+                Err("page must be an integer between 1 and 10000".to_string())
+            }
+        }
+    }
+}
+
+fn parse_provider_keys_page_size_param(raw: Option<String>) -> Result<usize, String> {
+    match raw {
+        None => Ok(20),
+        Some(value) => {
+            let parsed = value
+                .parse::<usize>()
+                .map_err(|_| "page_size must be an integer between 1 and 1000".to_string())?;
+            if (1..=1000).contains(&parsed) {
+                Ok(parsed)
+            } else {
+                Err("page_size must be an integer between 1 and 1000".to_string())
+            }
+        }
+    }
+}
+
 pub(super) async fn maybe_handle(
     state: &AdminAppState<'_>,
     request_context: &AdminRequestContext<'_>,
@@ -141,6 +173,47 @@ pub(super) async fn maybe_handle(
                     .into_response(),
             ));
         };
+        let page_param = query_param_value(request_context.query_string(), "page");
+        let page_size_param = query_param_value(request_context.query_string(), "page_size");
+        if page_param.is_some() || page_size_param.is_some() {
+            let page = match parse_provider_keys_page_param(page_param) {
+                Ok(value) => value,
+                Err(detail) => {
+                    return Ok(Some(
+                        (
+                            http::StatusCode::BAD_REQUEST,
+                            Json(json!({ "detail": detail })),
+                        )
+                            .into_response(),
+                    ));
+                }
+            };
+            let page_size = match parse_provider_keys_page_size_param(page_size_param) {
+                Ok(value) => value,
+                Err(detail) => {
+                    return Ok(Some(
+                        (
+                            http::StatusCode::BAD_REQUEST,
+                            Json(json!({ "detail": detail })),
+                        )
+                            .into_response(),
+                    ));
+                }
+            };
+            return Ok(Some(
+                match state
+                    .build_admin_provider_keys_page_payload(&provider_id, page, page_size)
+                    .await
+                {
+                    Some(payload) => Json(payload).into_response(),
+                    None => (
+                        http::StatusCode::NOT_FOUND,
+                        Json(json!({ "detail": format!("Provider {provider_id} 不存在") })),
+                    )
+                        .into_response(),
+                },
+            ));
+        }
         let skip = query_param_value(request_context.query_string(), "skip")
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(0);

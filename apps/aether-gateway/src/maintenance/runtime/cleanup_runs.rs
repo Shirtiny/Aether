@@ -489,7 +489,7 @@ fn request_body_cleanup_record(
     }
 }
 
-async fn record_cleanup_run(
+pub(crate) async fn record_admin_cleanup_run(
     data: &GatewayDataState,
     record: AdminCleanupRunRecord,
 ) -> Result<(), DataLayerError> {
@@ -507,6 +507,13 @@ async fn record_cleanup_run(
     )
     .await?;
     Ok(())
+}
+
+async fn record_cleanup_run(
+    data: &GatewayDataState,
+    record: AdminCleanupRunRecord,
+) -> Result<(), DataLayerError> {
+    record_admin_cleanup_run(data, record).await
 }
 
 fn parse_cleanup_run_records(value: Value) -> Vec<AdminCleanupRunRecord> {

@@ -2705,6 +2705,14 @@ CREATE INDEX IF NOT EXISTS idx_provider_api_keys_provider_active ON public.provi
 
 
 --
+-- Name: idx_provider_api_keys_provider_default_sort; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX IF NOT EXISTS idx_provider_api_keys_provider_default_sort ON public.provider_api_keys USING btree (provider_id, internal_priority, name, id);
+
+
+
+--
 -- Name: idx_provider_api_keys_provider_created_at_desc; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -4411,21 +4419,6 @@ END $mig$;
 DO $mig$ BEGIN
   ALTER TABLE ONLY public.usage
     ADD CONSTRAINT usage_provider_endpoint_id_fkey FOREIGN KEY (provider_endpoint_id) REFERENCES public.provider_endpoints(id) ON DELETE SET NULL;
-EXCEPTION
-  WHEN duplicate_object THEN NULL;
-  WHEN duplicate_table THEN NULL;
-  WHEN invalid_table_definition THEN NULL;
-END $mig$;
-
-
-
---
--- Name: usage usage_provider_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-DO $mig$ BEGIN
-  ALTER TABLE ONLY public.usage
-    ADD CONSTRAINT usage_provider_id_fkey FOREIGN KEY (provider_id) REFERENCES public.providers(id) ON DELETE SET NULL;
 EXCEPTION
   WHEN duplicate_object THEN NULL;
   WHEN duplicate_table THEN NULL;

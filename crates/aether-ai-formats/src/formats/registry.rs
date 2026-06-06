@@ -1,6 +1,7 @@
 use serde_json::Value;
 
 use crate::formats::{
+    aliyun,
     claude::messages as claude_messages,
     doubao,
     gemini::{self, generate_content as gemini_generate_content},
@@ -29,7 +30,9 @@ pub fn parse_request(
         FormatId::JinaEmbedding => jina::embedding::request::from(body, ctx),
         FormatId::OpenAiRerank => openai::rerank::request::from(body, ctx),
         FormatId::JinaRerank => jina::rerank::request::from(body, ctx),
-        FormatId::GeminiEmbedding | FormatId::DoubaoEmbedding => None,
+        FormatId::GeminiEmbedding
+        | FormatId::DoubaoEmbedding
+        | FormatId::AliyunMultimodalEmbedding => None,
     }
     .ok_or_else(|| FormatError::RequestParseFailed {
         format: source.as_str().to_string(),
@@ -62,6 +65,7 @@ pub fn emit_request(
         FormatId::JinaRerank => jina::rerank::request::to(&request, ctx),
         FormatId::GeminiEmbedding => gemini::embedding::request::to(&request, ctx),
         FormatId::DoubaoEmbedding => doubao::embedding::request::to(&request, ctx),
+        FormatId::AliyunMultimodalEmbedding => aliyun::embedding::request::to(&request, ctx),
     }
     .ok_or_else(|| FormatError::RequestEmitFailed {
         format: target.as_str().to_string(),
@@ -96,7 +100,8 @@ pub fn parse_response(
         | FormatId::OpenAiRerank
         | FormatId::JinaRerank
         | FormatId::GeminiEmbedding
-        | FormatId::DoubaoEmbedding => None,
+        | FormatId::DoubaoEmbedding
+        | FormatId::AliyunMultimodalEmbedding => None,
     }
     .ok_or_else(|| FormatError::ResponseParseFailed {
         format: source.as_str().to_string(),
@@ -120,7 +125,8 @@ pub fn emit_response(
         | FormatId::OpenAiRerank
         | FormatId::JinaRerank
         | FormatId::GeminiEmbedding
-        | FormatId::DoubaoEmbedding => None,
+        | FormatId::DoubaoEmbedding
+        | FormatId::AliyunMultimodalEmbedding => None,
     }
     .ok_or_else(|| FormatError::ResponseEmitFailed {
         format: target.as_str().to_string(),
@@ -228,11 +234,16 @@ mod tests {
             &FormatContext::default().with_mapped_model("gemini-embedding-001"),
         )
         .expect("gemini embedding conversion should succeed");
-        assert_eq!(gemini["model"], "gemini-embedding-001");
+        assert!(gemini.get("model").is_none());
+        assert_eq!(
+            gemini["requests"][0]["model"],
+            "models/gemini-embedding-001"
+        );
         assert_eq!(
             gemini["requests"][0]["content"]["parts"][0]["text"],
             "alpha"
         );
+        assert_eq!(gemini["requests"][0]["outputDimensionality"], 2);
         assert!(gemini.get("messages").is_none());
 
         let doubao = convert_request(
@@ -245,6 +256,119 @@ mod tests {
         assert_eq!(doubao["model"], "doubao-embedding-text-240515");
         assert_eq!(doubao["input"], json!(["alpha", "beta"]));
         assert!(doubao.get("messages").is_none());
+    }
+
+    #[test]
+    fn converts_openai_embedding_to_aliyun_multimodal_payload_shape() {
+        let body = json!({
+            "model": "text-embedding-3-small",
+            "input": [
+                {"text": "white running shoes"},
+                {"image": "https://example.com/shoe.png"},
+                {"multi_images": ["https://example.com/a.png", "https://example.com/b.png"]}
+            ],
+            "dimensions": 1024,
+            "parameters": {
+                "enable_fusion": true,
+                "res_level": 2,
+                "max_video_frames": 64
+            }
+        });
+
+        let converted = convert_request(
+            "openai:embedding",
+            "aliyun:multimodal_embedding",
+            &body,
+            &FormatContext::default().with_mapped_model("qwen3-vl-embedding"),
+        )
+        .expect("aliyun multimodal embedding conversion should succeed");
+
+        assert_eq!(converted["model"], "qwen3-vl-embedding");
+        assert_eq!(converted["input"]["contents"], body["input"]);
+        assert_eq!(converted["parameters"]["dimension"], 1024);
+        assert_eq!(converted["parameters"]["enable_fusion"], true);
+        assert_eq!(converted["parameters"]["res_level"], 2);
+        assert_eq!(converted["parameters"]["max_video_frames"], 64);
+        assert!(converted.get("messages").is_none());
+    }
+
+    #[test]
+    fn aliyun_embedding_conversion_rejects_token_arrays() {
+        let body = json!({
+            "model": "text-embedding-3-small",
+            "input": [1, 2, 3]
+        });
+
+        assert!(convert_request(
+            "openai:embedding",
+            "aliyun:multimodal_embedding",
+            &body,
+            &FormatContext::default().with_mapped_model("qwen3-vl-embedding"),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn multimodal_embedding_conversion_is_aliyun_only() {
+        let body = json!({
+            "model": "qwen3-vl-embedding",
+            "input": [
+                {"text": "white running shoes"},
+                {"image": "https://example.com/shoe.png"}
+            ]
+        });
+        let ctx = FormatContext::default().with_mapped_model("qwen3-vl-embedding");
+
+        assert!(convert_request("openai:embedding", "openai:embedding", &body, &ctx).is_err());
+        assert!(convert_request("openai:embedding", "jina:embedding", &body, &ctx).is_err());
+        assert!(convert_request("openai:embedding", "gemini:embedding", &body, &ctx).is_err());
+        assert!(convert_request("openai:embedding", "doubao:embedding", &body, &ctx).is_err());
+        assert!(convert_request(
+            "openai:embedding",
+            "aliyun:multimodal_embedding",
+            &body,
+            &ctx
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn parses_aliyun_embedding_response_to_openai_shape() {
+        let body = json!({
+            "output": {
+                "embeddings": [
+                    {
+                        "index": 0,
+                        "embedding": [0.1, 0.2, 0.3],
+                        "type": "fused"
+                    }
+                ]
+            },
+            "usage": {
+                "input_tokens": 432,
+                "input_tokens_details": {
+                    "image_tokens": 402,
+                    "text_tokens": 30
+                },
+                "output_tokens": 1,
+                "total_tokens": 433
+            },
+            "request_id": "aliyun-request-1"
+        });
+
+        let canonical =
+            crate::protocol::canonical::from_embedding_to_canonical_response(&body, "aliyun")
+                .expect("aliyun embedding response should parse");
+        let emitted =
+            crate::protocol::canonical::canonical_to_embedding_response(&canonical, "openai")
+                .expect("openai embedding response should emit");
+
+        assert_eq!(emitted["request_id"], "aliyun-request-1");
+        assert_eq!(emitted["data"][0]["embedding"], json!([0.1, 0.2, 0.3]));
+        assert_eq!(emitted["data"][0]["type"], "fused");
+        assert_eq!(emitted["usage"]["prompt_tokens"], 432);
+        assert_eq!(emitted["usage"]["completion_tokens"], 1);
+        assert_eq!(emitted["usage"]["total_tokens"], 433);
     }
 
     #[test]

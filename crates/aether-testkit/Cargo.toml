@@ -9,6 +9,7 @@ description = "Shared integration test helpers for Aether Rust services"
 [dependencies]
 async-stream.workspace = true
 aether-data.workspace = true
+aether-data-contracts.workspace = true
 aether-contracts.workspace = true
 aether-gateway.workspace = true
 aether-http.workspace = true
@@ -22,5 +23,7 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
+libc = "0.2"
+sysinfo = "0.32"
 tokio.workspace = true
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }

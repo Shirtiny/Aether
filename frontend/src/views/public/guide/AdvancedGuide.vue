@@ -80,52 +80,39 @@ import { Settings } from 'lucide-vue-next'
     </section>
 
     <div class="grid grid-cols-1 md:grid-cols-2 gap-8 mt-12 pt-8 border-t border-[#e5e4df] dark:border-[rgba(227,224,211,0.12)]">
-      <!-- 6. 能力标签 -->
-      <section
-        id="capabilities"
-        class="scroll-mt-24 lg:scroll-mt-20"
-      >
-        <h3 class="mt-0 text-xl text-[#262624] dark:text-[#f1ead8]">
-          6. 能力标签
-        </h3>
-        <p class="text-sm text-[#666663] dark:text-[#a3a094] mt-2">
-          为特定的 Key 或模型添加自定义标签（如 Vision, Function Calling, Long Context），通过标签约束路由，只选择具备该能力的可用通道。
-        </p>
-      </section>
-
-      <!-- 7. 余额监控 -->
+      <!-- 6. 余额监控 -->
       <section
         id="balance-monitor"
         class="scroll-mt-24 lg:scroll-mt-20"
       >
         <h3 class="mt-0 text-xl text-[#262624] dark:text-[#f1ead8]">
-          7. 余额监控
+          6. 余额监控
         </h3>
         <p class="text-sm text-[#666663] dark:text-[#a3a094] mt-2">
           针对各大提供商的官方接口或常见聚合平台，自动抓取并记录剩余额度，在余额低于阈值时触发报警或禁用策略。
         </p>
       </section>
 
-      <!-- 8. 配置导入/出 -->
+      <!-- 7. 配置导入/出 -->
       <section
         id="config-export"
         class="scroll-mt-24 lg:scroll-mt-20"
       >
         <h3 class="mt-0 text-xl text-[#262624] dark:text-[#f1ead8]">
-          8. 配置导入/出
+          7. 配置导入/出
         </h3>
         <p class="text-sm text-[#666663] dark:text-[#a3a094] mt-2">
           支持将统一模型配置、提供商端点及网关路由策略一键导出为 JSON，并在其他部署实例中迁移导入。
         </p>
       </section>
 
-      <!-- 9. 锁定用户密钥 -->
+      <!-- 8. 锁定用户密钥 -->
       <section
         id="lock-key"
         class="scroll-mt-24 lg:scroll-mt-20"
       >
         <h3 class="mt-0 text-xl text-[#262624] dark:text-[#f1ead8]">
-          9. 锁定用户密钥
+          8. 锁定用户密钥
         </h3>
         <p class="text-sm text-[#666663] dark:text-[#a3a094] mt-2">
           若监控发现恶意使用、异常调用或高频报错，管理员可以临时或永久锁定特定密钥，以阻断攻击源头。

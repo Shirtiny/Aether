@@ -46,6 +46,7 @@ SELECT
   frontend_callback_url,
   attribute_mapping,
   extra_config,
+  icon_url,
   is_enabled,
   created_at AS created_at_unix_ms,
   updated_at AS updated_at_unix_secs
@@ -67,6 +68,7 @@ SELECT
   frontend_callback_url,
   attribute_mapping,
   extra_config,
+  icon_url,
   is_enabled,
   created_at AS created_at_unix_ms,
   updated_at AS updated_at_unix_secs
@@ -176,13 +178,14 @@ INSERT INTO oauth_providers (
   frontend_callback_url,
   attribute_mapping,
   extra_config,
+  icon_url,
   is_enabled,
   created_at,
   updated_at
 ) VALUES (
   ?, ?, ?,
   CASE ? WHEN 'set' THEN ? WHEN 'clear' THEN NULL ELSE NULL END,
-  ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+  ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
 )
 ON DUPLICATE KEY UPDATE
   display_name = VALUES(display_name),
@@ -200,6 +203,7 @@ ON DUPLICATE KEY UPDATE
   frontend_callback_url = VALUES(frontend_callback_url),
   attribute_mapping = VALUES(attribute_mapping),
   extra_config = VALUES(extra_config),
+  icon_url = VALUES(icon_url),
   is_enabled = VALUES(is_enabled),
   updated_at = VALUES(updated_at)
 "#,
@@ -217,6 +221,7 @@ ON DUPLICATE KEY UPDATE
         .bind(&record.frontend_callback_url)
         .bind(json_to_string(record.attribute_mapping.as_ref())?)
         .bind(json_to_string(record.extra_config.as_ref())?)
+        .bind(record.icon_url.as_deref())
         .bind(record.is_enabled)
         .bind(now as i64)
         .bind(now as i64)
@@ -361,6 +366,7 @@ fn map_oauth_provider_row(row: &MySqlRow) -> Result<StoredOAuthProviderConfig, D
             row.try_get("extra_config").map_sql_err()?,
             "oauth_providers.extra_config",
         )?,
+        row.try_get("icon_url").map_sql_err()?,
         row.try_get("is_enabled").map_sql_err()?,
     )
     .with_timestamps(

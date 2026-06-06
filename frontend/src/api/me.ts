@@ -30,7 +30,7 @@ export interface UserPreferences {
   avatar_url?: string
   bio?: string
   default_provider_id?: string // UUID
-  default_provider?: Record<string, unknown>
+  default_provider?: Record<string, unknown> | string | null // 仅管理员可见
   theme: string
   language: string
   timezone?: string
@@ -52,8 +52,10 @@ export interface ProviderConfig {
 // 使用记录接口
 export interface UsageRecordDetail {
   id: string
-  provider: string
+  provider?: string // 仅管理员可见
   model: string
+  reasoning_effort?: string | null
+  service_tier?: string | null
   input_tokens: number
   effective_input_tokens?: number
   output_tokens: number
@@ -61,11 +63,17 @@ export interface UsageRecordDetail {
   cost: number  // 官方费率
   actual_cost?: number  // 倍率消耗（仅管理员可见）
   rate_multiplier?: number  // 成本倍率（仅管理员可见）
-  response_time_ms?: number
+  response_time_ms?: number | null
+  first_byte_time_ms?: number | null
   is_stream: boolean
   upstream_is_stream?: boolean
   client_requested_stream?: boolean
   client_is_stream?: boolean
+  client_family?: string | null
+  client_ip?: string | null
+  user_agent?: string | null
+  request_path?: string | null
+  request_path_and_query?: string | null
   created_at: string
   cache_creation_input_tokens?: number
   cache_creation_ephemeral_5m_input_tokens?: number
@@ -169,6 +177,7 @@ export interface ApiKey {
   total_cost_usd?: number
   rate_limit?: number | null
   concurrent_limit?: number | null
+  ip_rules?: string[] | null
   allowed_providers?: ProviderConfig[]
   force_capabilities?: Record<string, boolean> | null  // 强制能力配置
   feature_settings?: FeatureSettingsMap | null
@@ -188,6 +197,11 @@ export interface ApiKeyInstallSession {
   target_system_label: string
   unix_command: string
   powershell_command: string
+}
+
+export interface UserClientConfig {
+  base_url: string
+  site_name?: string
 }
 
 // 不再需要 ProviderBinding 接口
@@ -248,7 +262,7 @@ export const meApi = {
     return response.data
   },
 
-  async createApiKey(data: { name: string; rate_limit?: number | null; concurrent_limit?: number | null; feature_settings?: FeatureSettingsMap | null }): Promise<ApiKey> {
+  async createApiKey(data: { name: string; rate_limit?: number | null; concurrent_limit?: number | null; ip_rules?: string[] | null; feature_settings?: FeatureSettingsMap | null }): Promise<ApiKey> {
     const response = await apiClient.post<ApiKey>('/api/users/me/api-keys', data)
     return response.data
   },
@@ -269,6 +283,11 @@ export const meApi = {
     return response.data
   },
 
+  async getClientConfig(): Promise<UserClientConfig> {
+    const response = await apiClient.get<UserClientConfig>('/api/users/me/client-config')
+    return response.data
+  },
+
   async deleteApiKey(keyId: string): Promise<{ message: string }> {
     const response = await apiClient.delete(`/api/users/me/api-keys/${keyId}`)
     return response.data
@@ -281,7 +300,7 @@ export const meApi = {
 
   async updateApiKey(
     keyId: string,
-    data: { name?: string; rate_limit?: number | null; concurrent_limit?: number | null; feature_settings?: FeatureSettingsMap | null | undefined }
+    data: { name?: string; rate_limit?: number | null; concurrent_limit?: number | null; ip_rules?: string[] | null; feature_settings?: FeatureSettingsMap | null | undefined }
   ): Promise<ApiKey & { message: string }> {
     const response = await apiClient.put<ApiKey & { message: string }>(
       `/api/users/me/api-keys/${keyId}`,
@@ -344,6 +363,8 @@ export const meApi = {
       has_format_conversion?: boolean | null
       has_fallback?: boolean | null
       target_model?: string | null
+      reasoning_effort?: string | null
+      service_tier?: string | null
     }>
   }> {
     const params = ids ? { ids } : {}

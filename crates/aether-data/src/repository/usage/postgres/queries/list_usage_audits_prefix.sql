@@ -93,6 +93,10 @@ SELECT
   "usage".first_byte_time_ms,
   "usage".status,
   COALESCE(usage_settlement_snapshots.billing_status, "usage".billing_status) AS billing_status,
+  COALESCE(
+    NULLIF(BTRIM("usage".request_metadata->'client_session_affinity'->>'client_family'), ''),
+    NULLIF(BTRIM("usage".request_metadata->>'client_family'), '')
+  ) AS client_family,
   NULL::json AS request_headers,
   NULL::json AS request_body,
   NULL::bytea AS request_body_compressed,
@@ -106,9 +110,47 @@ SELECT
   NULL::json AS client_response_body,
   NULL::bytea AS client_response_body_compressed,
   CASE
-    WHEN ("usage".request_metadata->>'client_requested_stream') IN ('true', 'false')
+    WHEN NULLIF(BTRIM("usage".request_metadata->>'client_ip'), '') IS NOT NULL
+      OR NULLIF(BTRIM("usage".request_metadata->>'user_agent'), '') IS NOT NULL
+      OR NULLIF(BTRIM("usage".request_metadata->>'request_path'), '') IS NOT NULL
+      OR NULLIF(BTRIM("usage".request_metadata->>'request_path_and_query'), '') IS NOT NULL
+      OR CASE
+        WHEN jsonb_typeof("usage".provider_request_body::jsonb) = 'object' THEN COALESCE(
+          NULLIF(BTRIM("usage".provider_request_body->>'reasoning_effort'), ''),
+          NULLIF(BTRIM("usage".provider_request_body->'reasoning'->>'effort'), ''),
+          NULLIF(BTRIM("usage".provider_request_body->'output_config'->>'effort'), '')
+        )
+        ELSE NULLIF(BTRIM("usage".request_metadata->>'provider_reasoning_effort'), '')
+      END IS NOT NULL
+      OR CASE
+        WHEN jsonb_typeof("usage".provider_request_body::jsonb) = 'object' THEN NULLIF(BTRIM("usage".provider_request_body->>'service_tier'), '')
+        ELSE NULLIF(BTRIM("usage".request_metadata->>'provider_service_tier'), '')
+      END IS NOT NULL
+      OR ("usage".request_metadata->>'client_requested_stream') IN ('true', 'false')
       OR ("usage".request_metadata->>'upstream_is_stream') IN ('true', 'false')
-      THEN jsonb_build_object(
+      THEN jsonb_strip_nulls(jsonb_build_object(
+        'client_ip',
+        NULLIF(BTRIM("usage".request_metadata->>'client_ip'), ''),
+        'user_agent',
+        NULLIF(BTRIM("usage".request_metadata->>'user_agent'), ''),
+        'request_path',
+        NULLIF(BTRIM("usage".request_metadata->>'request_path'), ''),
+        'request_path_and_query',
+        NULLIF(BTRIM("usage".request_metadata->>'request_path_and_query'), ''),
+        'provider_reasoning_effort',
+        CASE
+          WHEN jsonb_typeof("usage".provider_request_body::jsonb) = 'object' THEN COALESCE(
+            NULLIF(BTRIM("usage".provider_request_body->>'reasoning_effort'), ''),
+            NULLIF(BTRIM("usage".provider_request_body->'reasoning'->>'effort'), ''),
+            NULLIF(BTRIM("usage".provider_request_body->'output_config'->>'effort'), '')
+          )
+          ELSE NULLIF(BTRIM("usage".request_metadata->>'provider_reasoning_effort'), '')
+        END,
+        'provider_service_tier',
+        CASE
+          WHEN jsonb_typeof("usage".provider_request_body::jsonb) = 'object' THEN NULLIF(BTRIM("usage".provider_request_body->>'service_tier'), '')
+          ELSE NULLIF(BTRIM("usage".request_metadata->>'provider_service_tier'), '')
+        END,
         'client_requested_stream',
         CASE
           WHEN ("usage".request_metadata->>'client_requested_stream') IN ('true', 'false')
@@ -121,7 +163,7 @@ SELECT
             THEN ("usage".request_metadata->>'upstream_is_stream')::boolean
           ELSE NULL
         END
-      )::json
+      ))::json
     ELSE NULL::json
   END AS request_metadata,
   NULL::varchar AS http_request_body_ref,

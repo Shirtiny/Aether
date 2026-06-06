@@ -81,6 +81,28 @@ pub(super) fn normalize_single_import_tokens(
     (refresh_token, access_token)
 }
 
+pub(super) fn normalize_provider_import_tokens(
+    provider_type: &str,
+    refresh_token: Option<&str>,
+    access_token: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    let provider_type = provider_type.trim().to_ascii_lowercase();
+    let refresh_token = refresh_token
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let access_token = access_token
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+
+    if provider_type == "grok" {
+        return (None, access_token.or(refresh_token));
+    }
+
+    normalize_single_import_tokens(refresh_token.as_deref(), access_token.as_deref())
+}
+
 pub(super) fn import_tokens_from_raw_token(token: &str) -> (Option<String>, Option<String>) {
     if looks_like_access_token(token) {
         (None, Some(token.trim().to_string()))
@@ -98,7 +120,7 @@ pub(super) fn decode_access_token_expires_at(access_token: &str) -> Option<u64> 
 pub(super) fn provider_type_supports_access_token_import(provider_type: &str) -> bool {
     matches!(
         provider_type.trim().to_ascii_lowercase().as_str(),
-        "codex" | "chatgpt_web"
+        "codex" | "chatgpt_web" | "grok"
     )
 }
 
@@ -121,6 +143,11 @@ pub(super) fn build_provider_access_token_import_auth_config(
         .filter(|value| !value.is_empty());
     if let Some(refresh_token) = refresh_token {
         auth_config.insert("refresh_token".to_string(), json!(refresh_token));
+    }
+
+    if provider_type.trim().eq_ignore_ascii_case("grok") {
+        auth_config.insert("sso_token".to_string(), json!(access_token));
+        auth_config.insert("auth_method".to_string(), json!("sso_token"));
     }
 
     auth_config.insert(
@@ -149,7 +176,7 @@ pub(super) fn build_provider_access_token_import_auth_config(
 mod tests {
     use super::{
         build_provider_access_token_import_auth_config, decode_access_token_expires_at,
-        looks_like_access_token, normalize_single_import_tokens,
+        looks_like_access_token, normalize_provider_import_tokens, normalize_single_import_tokens,
     };
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use serde_json::json;
@@ -248,6 +275,36 @@ mod tests {
         assert_eq!(
             auth_config.get("access_token_import_temporary"),
             Some(&json!(true))
+        );
+    }
+
+    #[test]
+    fn normalize_grok_import_treats_opaque_session_as_access_token() {
+        let (refresh_token, access_token) =
+            normalize_provider_import_tokens("grok", Some("sso_session_token"), None);
+        assert!(refresh_token.is_none());
+        assert_eq!(access_token.as_deref(), Some("sso_session_token"));
+    }
+
+    #[test]
+    fn builds_grok_auth_config_from_session_token() {
+        let (auth_config, expires_at) = build_provider_access_token_import_auth_config(
+            "grok",
+            "sso_session_token",
+            None,
+            Some(2_200_000_000),
+            None,
+        );
+
+        assert_eq!(expires_at, Some(2_200_000_000));
+        assert_eq!(
+            auth_config.get("sso_token"),
+            Some(&json!("sso_session_token"))
+        );
+        assert_eq!(auth_config.get("auth_method"), Some(&json!("sso_token")));
+        assert_eq!(
+            auth_config.get("expires_at"),
+            Some(&json!(2_200_000_000u64))
         );
     }
 }

@@ -436,6 +436,7 @@ pub(super) fn sample_oauth_provider_config(provider_type: &str) -> StoredOAuthPr
         Some(vec!["openid".to_string()]),
         Some(json!({"email": "email"})),
         Some(json!({"team": true})),
+        None,
         true,
     )
 }

@@ -99,6 +99,33 @@
         </div>
       </div>
 
+      <div
+        v-if="showKeySelector"
+        class="space-y-2"
+      >
+        <div class="flex items-center justify-between gap-3">
+          <div class="text-sm font-medium text-foreground">
+            测试 Key
+          </div>
+          <div class="text-xs text-muted-foreground">
+            {{ keySelectionStatus }}
+          </div>
+        </div>
+        <MultiSelect
+          :model-value="selectedKeyIds"
+          :options="keyOptions"
+          :placeholder="keySelectorPlaceholder"
+          search-placeholder="搜索 Key"
+          empty-text="暂无可选 Key"
+          no-results-text="未找到匹配 Key"
+          trigger-class="h-9 min-h-9 rounded-md border-border/60 text-xs"
+          dropdown-min-width="24rem"
+          :search-threshold="0"
+          :disabled="keyOptionsLoading && keyOptions.length === 0"
+          @update:model-value="emit('update:selectedKeyIds', $event)"
+        />
+      </div>
+
       <div class="grid gap-4 lg:grid-cols-2 lg:items-start">
         <div class="space-y-2">
           <div class="flex items-center justify-between gap-3">
@@ -444,7 +471,27 @@
               {{ attempt.key_name || maskKey(attempt.key_id) }}
             </div>
             <div
-              v-if="attemptDetail(attempt) !== '-'"
+              v-if="attemptImagePreviews(attempt).length > 0"
+              class="mt-2 flex flex-wrap gap-2"
+            >
+              <button
+                v-for="(preview, imageIndex) in attemptImagePreviews(attempt).slice(0, 3)"
+                :key="`${preview.src}-${imageIndex}`"
+                type="button"
+                class="h-16 w-16 overflow-hidden rounded-md border border-border/60 bg-muted/30 transition-colors hover:border-primary/60"
+                :title="preview.label"
+                @click.stop="openImagePreview(preview)"
+              >
+                <img
+                  :src="preview.src"
+                  :alt="preview.label"
+                  class="h-full w-full object-contain"
+                  loading="lazy"
+                >
+              </button>
+            </div>
+            <div
+              v-else-if="attemptDetail(attempt) !== '-'"
               class="mt-1 break-all text-muted-foreground"
             >
               {{ attemptDetail(attempt) }}
@@ -519,6 +566,33 @@
               </td>
               <td class="px-3 py-2 text-muted-foreground">
                 <div
+                  v-if="attemptImagePreviews(attempt).length > 0"
+                  class="flex flex-wrap gap-2"
+                >
+                  <button
+                    v-for="(preview, imageIndex) in attemptImagePreviews(attempt).slice(0, 4)"
+                    :key="`${preview.src}-${imageIndex}`"
+                    type="button"
+                    class="h-14 w-14 overflow-hidden rounded-md border border-border/60 bg-muted/30 transition-colors hover:border-primary/60 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary/70"
+                    :title="preview.label"
+                    @click.stop="openImagePreview(preview)"
+                  >
+                    <img
+                      :src="preview.src"
+                      :alt="preview.label"
+                      class="h-full w-full object-contain"
+                      loading="lazy"
+                    >
+                  </button>
+                  <span
+                    v-if="attemptImagePreviews(attempt).length > 4"
+                    class="flex h-14 items-center rounded-md border border-border/60 px-2 text-xs text-muted-foreground"
+                  >
+                    +{{ attemptImagePreviews(attempt).length - 4 }}
+                  </span>
+                </div>
+                <div
+                  v-else
                   class="line-clamp-2 break-all"
                   :title="attemptDetail(attempt)"
                 >
@@ -673,6 +747,39 @@
       </Button>
     </template>
   </Dialog>
+
+  <Dialog
+    :open="Boolean(activeImagePreview)"
+    size="6xl"
+    :z-index="120"
+    @update:open="(val: boolean) => { if (!val) activeImagePreview = null }"
+  >
+    <template #header>
+      <div class="border-b border-border px-6 py-4">
+        <div class="text-lg font-semibold text-foreground leading-tight">
+          {{ activeImagePreview?.label || '图片预览' }}
+        </div>
+      </div>
+    </template>
+
+    <div class="flex max-h-[76vh] items-center justify-center overflow-auto rounded-md bg-muted/20 p-3">
+      <img
+        v-if="activeImagePreview"
+        :src="activeImagePreview.src"
+        :alt="activeImagePreview.label"
+        class="max-h-[72vh] max-w-full rounded-md object-contain"
+      >
+    </div>
+
+    <template #footer>
+      <Button
+        variant="outline"
+        @click="activeImagePreview = null"
+      >
+        关闭
+      </Button>
+    </template>
+  </Dialog>
 </template>
 
 <script setup lang="ts">
@@ -692,13 +799,20 @@ import {
 } from '@/components/ui'
 import Button from '@/components/ui/button.vue'
 import Textarea from '@/components/ui/textarea.vue'
+import MultiSelect from '@/components/common/MultiSelect.vue'
 import { formatApiFormat } from '@/api/endpoints/types/api-format'
 import type { TestAttemptDetail, TestCandidateSummary, TestModelFailoverResponse } from '@/api/endpoints/providers'
 import type { CandidateRecord, RequestTrace } from '@/api/requestTrace'
+import type { MultiSelectOption } from '@/components/common/MultiSelect.vue'
 import JsonContent from '@/features/usage/components/RequestDetailDrawer/JsonContent.vue'
 import { useClipboard } from '@/composables/useClipboard'
 import { useDarkMode } from '@/composables/useDarkMode'
-import { extractModelTestResponsePreview, formatModelTestDiagnostic } from './model-test-request'
+import {
+  extractModelTestImagePreviews,
+  extractModelTestResponsePreview,
+  formatModelTestDiagnostic,
+} from './model-test-request'
+import type { ModelTestImagePreview } from './model-test-request'
 
 type TestEndpointOption = {
   id: string
@@ -711,6 +825,8 @@ type TestModelMappingOption = {
   name: string
   priority?: number
 }
+
+type TestKeyOption = MultiSelectOption
 
 const props = defineProps<{
   open: boolean
@@ -733,6 +849,9 @@ const props = defineProps<{
   modelMappingAvailable?: boolean
   modelMappingOptions?: TestModelMappingOption[]
   selectedModelMapping?: string | null
+  keyOptions?: TestKeyOption[]
+  selectedKeyIds?: string[]
+  keyOptionsLoading?: boolean
   startDisabled?: boolean
 }>()
 
@@ -742,15 +861,30 @@ const emit = defineEmits<{
   start: []
   selectEndpoint: [endpointId: string]
   selectModelMapping: [modelName: string]
+  'update:selectedKeyIds': [value: string[]]
   'update:requestHeadersDraft': [value: string]
   'update:requestBodyDraft': [value: string]
 }>()
 
 const endpoints = computed(() => props.endpoints ?? [])
 const modelMappingOptions = computed(() => props.modelMappingOptions ?? [])
+const keyOptions = computed(() => props.keyOptions ?? [])
+const selectedKeyIds = computed(() => props.selectedKeyIds ?? [])
+const keyOptionsLoading = computed(() => props.keyOptionsLoading === true)
 const modelMappingAvailable = computed(
   () => props.modelMappingAvailable === true && modelMappingOptions.value.length > 0,
 )
+const showKeySelector = computed(() => (
+  keyOptionsLoading.value || keyOptions.value.length > 0 || selectedKeyIds.value.length > 0
+))
+const keySelectorPlaceholder = computed(() => (
+  keyOptionsLoading.value && keyOptions.value.length === 0 ? '正在加载 Key' : '默认调度（不指定 Key）'
+))
+const keySelectionStatus = computed(() => {
+  if (selectedKeyIds.value.length > 0) return `已选 ${selectedKeyIds.value.length}`
+  if (keyOptionsLoading.value) return '加载中'
+  return '默认'
+})
 const requestedModelName = computed(() => props.requestedModelName?.trim() || '')
 const selectedModelMapping = computed(() => props.selectedModelMapping?.trim() || '')
 const selectedModelMappingValue = computed(() => (
@@ -816,14 +950,21 @@ const inspectionTab = ref<'request-headers' | 'request-body' | 'response-headers
 const selectedInspectionKey = ref<string | null>(null)
 const inspectionExpandDepth = ref(0)
 const inspectionCopiedStates = ref<Record<string, boolean>>({})
+const activeImagePreview = ref<ModelTestImagePreview | null>(null)
 
 watch(() => props.result, () => {
   showAllAttempts.value = false
-  inspectionTab.value = 'request-body'
   inspectionExpandDepth.value = 0
   inspectionCopiedStates.value = {}
-  const defaultAttempt = inspectableAttempts.value[0] ?? resultAttempts.value[0] ?? null
+  const defaultAttempt = resultImageAttempt.value
+    ?? resultAttempts.value.find(attempt => attempt.status === 'success')
+    ?? inspectableAttempts.value[0]
+    ?? resultAttempts.value[0]
+    ?? null
   selectedInspectionKey.value = defaultAttempt ? inspectionKey(defaultAttempt) : null
+  inspectionTab.value = defaultAttempt && attemptImagePreviews(defaultAttempt).length > 0
+    ? 'response-body'
+    : 'request-body'
 })
 
 const shouldCollapseAttempts = computed(() => resultAttempts.value.length > 20)
@@ -1129,6 +1270,12 @@ const selectedInspectionAttempt = computed(() => {
   return inspectableAttempts.value[0] ?? resultAttempts.value[0] ?? null
 })
 
+const resultImageAttempt = computed(() => {
+  return resultAttempts.value.find(attempt => attempt.status === 'success' && attemptImagePreviews(attempt).length > 0)
+    ?? resultAttempts.value.find(attempt => attemptImagePreviews(attempt).length > 0)
+    ?? null
+})
+
 const resultWinningTitle = computed(() => {
   const summary = resultSummary.value
   const keyName = summary.winning_key_name || summary.winning_key_id
@@ -1238,6 +1385,7 @@ function formatAuthType(authType: string): string {
   if (lowered === 'codex') return 'Codex OAuth'
   if (lowered === 'antigravity') return 'Antigravity OAuth'
   if (lowered === 'kiro') return 'Kiro OAuth'
+  if (lowered === 'grok') return 'Grok OAuth'
   return authType
 }
 
@@ -1295,13 +1443,21 @@ function attemptDetail(attempt: TestAttemptDetail): string {
   return '-'
 }
 
+function attemptImagePreviews(attempt: TestAttemptDetail): ModelTestImagePreview[] {
+  return extractModelTestImagePreviews(attempt.response_body)
+}
+
+function openImagePreview(preview: ModelTestImagePreview) {
+  activeImagePreview.value = preview
+}
+
 function inspectionKey(attempt: TestAttemptDetail): string {
   return `${attempt.candidate_index}:${attempt.retry_index ?? 0}:${attempt.key_id}`
 }
 
 function selectInspectionAttempt(attempt: TestAttemptDetail) {
   selectedInspectionKey.value = inspectionKey(attempt)
-  inspectionTab.value = 'request-body'
+  inspectionTab.value = attemptImagePreviews(attempt).length > 0 ? 'response-body' : 'request-body'
 }
 
 function hasDebugData(attempt: TestAttemptDetail): boolean {

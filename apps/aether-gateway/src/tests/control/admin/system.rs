@@ -36,6 +36,8 @@ use crate::constants::{
 };
 use crate::data::GatewayDataState;
 
+static SYSTEM_UPDATE_TEST_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[tokio::test]
 async fn gateway_handles_admin_system_version_locally_with_trusted_admin_principal() {
     let upstream_hits = Arc::new(Mutex::new(0usize));
@@ -156,6 +158,269 @@ async fn gateway_handles_admin_system_check_update_locally_with_bearer_admin_ses
 
     gateway_handle.abort();
     upstream_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_handles_admin_system_update_capability_locally() {
+    let _lock = SYSTEM_UPDATE_TEST_MUTEX.lock().await;
+    let upstream_hits = Arc::new(Mutex::new(0usize));
+    let upstream_hits_clone = Arc::clone(&upstream_hits);
+    let upstream = Router::new().route(
+        "/api/admin/system/update-capability",
+        any(move |_request: Request| {
+            let upstream_hits_inner = Arc::clone(&upstream_hits_clone);
+            async move {
+                *upstream_hits_inner.lock().expect("mutex should lock") += 1;
+                (StatusCode::OK, Body::from("unexpected upstream hit"))
+            }
+        }),
+    );
+
+    let (upstream_url, upstream_handle) = start_server(upstream).await;
+    let gateway = build_router_with_state(AppState::new().expect("gateway should build"));
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = reqwest::Client::new()
+        .get(format!("{gateway_url}/api/admin/system/update-capability"))
+        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert!(payload["supported"].is_boolean());
+    assert!(payload["build_type"].is_string());
+    assert!(payload["task_status"].is_string());
+    assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
+
+    gateway_handle.abort();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_prepares_admin_system_update_locally() {
+    let _lock = SYSTEM_UPDATE_TEST_MUTEX.lock().await;
+    let upstream_hits = Arc::new(Mutex::new(0usize));
+    let upstream_hits_clone = Arc::clone(&upstream_hits);
+    let upstream = Router::new().route(
+        "/api/admin/system/prepare-update",
+        any(move |_request: Request| {
+            let upstream_hits_inner = Arc::clone(&upstream_hits_clone);
+            async move {
+                *upstream_hits_inner.lock().expect("mutex should lock") += 1;
+                (StatusCode::OK, Body::from("unexpected upstream hit"))
+            }
+        }),
+    );
+
+    let (upstream_url, upstream_handle) = start_server(upstream).await;
+    let gateway = build_router_with_state(AppState::new().expect("gateway should build"));
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/api/admin/system/prepare-update"))
+        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert!(payload["detail"].is_string());
+    assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
+
+    gateway_handle.abort();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_rejects_admin_system_apply_update_without_prepared_version() {
+    let _lock = SYSTEM_UPDATE_TEST_MUTEX.lock().await;
+    let upstream_hits = Arc::new(Mutex::new(0usize));
+    let upstream_hits_clone = Arc::clone(&upstream_hits);
+    let upstream = Router::new().route(
+        "/api/admin/system/apply-update",
+        any(move |_request: Request| {
+            let upstream_hits_inner = Arc::clone(&upstream_hits_clone);
+            async move {
+                *upstream_hits_inner.lock().expect("mutex should lock") += 1;
+                (StatusCode::OK, Body::from("unexpected upstream hit"))
+            }
+        }),
+    );
+
+    let (upstream_url, upstream_handle) = start_server(upstream).await;
+    let gateway = build_router_with_state(AppState::new().expect("gateway should build"));
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/api/admin/system/apply-update"))
+        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert!(payload["detail"].is_string());
+    assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
+
+    gateway_handle.abort();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_rejects_admin_system_rollback_without_previous_release() {
+    let _lock = SYSTEM_UPDATE_TEST_MUTEX.lock().await;
+    let upstream_hits = Arc::new(Mutex::new(0usize));
+    let upstream_hits_clone = Arc::clone(&upstream_hits);
+    let upstream = Router::new().route(
+        "/api/admin/system/rollback",
+        any(move |_request: Request| {
+            let upstream_hits_inner = Arc::clone(&upstream_hits_clone);
+            async move {
+                *upstream_hits_inner.lock().expect("mutex should lock") += 1;
+                (StatusCode::OK, Body::from("unexpected upstream hit"))
+            }
+        }),
+    );
+
+    let (upstream_url, upstream_handle) = start_server(upstream).await;
+    let gateway = build_router_with_state(AppState::new().expect("gateway should build"));
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/api/admin/system/rollback"))
+        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::PRECONDITION_REQUIRED);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert!(payload["detail"].is_string());
+    assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
+
+    gateway_handle.abort();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_handles_admin_system_releases_locally() {
+    let upstream_hits = Arc::new(Mutex::new(0usize));
+    let upstream_hits_clone = Arc::clone(&upstream_hits);
+    let upstream = Router::new().route(
+        "/api/admin/system/releases",
+        any(move |_request: Request| {
+            let upstream_hits_inner = Arc::clone(&upstream_hits_clone);
+            async move {
+                *upstream_hits_inner.lock().expect("mutex should lock") += 1;
+                (StatusCode::OK, Body::from("unexpected upstream hit"))
+            }
+        }),
+    );
+
+    let (upstream_url, upstream_handle) = start_server(upstream).await;
+    let gateway = build_router_with_state(AppState::new().expect("gateway should build"));
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = reqwest::Client::new()
+        .get(format!("{gateway_url}/api/admin/system/releases"))
+        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert!(payload["current_version"]
+        .as_str()
+        .is_some_and(|value| !value.is_empty()));
+    assert!(payload["releases"].is_array());
+    assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
+
+    gateway_handle.abort();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_rejects_admin_system_apply_update_with_nonexistent_version() {
+    let _lock = SYSTEM_UPDATE_TEST_MUTEX.lock().await;
+    let upstream_hits = Arc::new(Mutex::new(0usize));
+    let upstream_hits_clone = Arc::clone(&upstream_hits);
+    let upstream = Router::new().route(
+        "/api/admin/system/apply-update",
+        any(move |_request: Request| {
+            let upstream_hits_inner = Arc::clone(&upstream_hits_clone);
+            async move {
+                *upstream_hits_inner.lock().expect("mutex should lock") += 1;
+                (StatusCode::OK, Body::from("unexpected upstream hit"))
+            }
+        }),
+    );
+
+    let (upstream_url, upstream_handle) = start_server(upstream).await;
+    let gateway = build_router_with_state(AppState::new().expect("gateway should build"));
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/api/admin/system/apply-update"))
+        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .header("content-type", "application/json")
+        .body(r#"{"version":"v99.99.99"}"#)
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert!(payload["detail"].is_string());
+    assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
+
+    gateway_handle.abort();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_handles_admin_system_update_status_locally() {
+    let _lock = SYSTEM_UPDATE_TEST_MUTEX.lock().await;
+    let gateway = build_router_with_state(AppState::new().expect("gateway should build"));
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = reqwest::Client::new()
+        .get(format!("{gateway_url}/api/admin/system/update-status"))
+        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert!(payload["phase"].is_string());
+
+    gateway_handle.abort();
 }
 
 #[tokio::test]
@@ -296,6 +561,8 @@ async fn gateway_handles_admin_system_stats_locally_with_trusted_admin_principal
     assert_eq!(payload["providers"]["active"], json!(1));
     assert_eq!(payload["api_keys"], json!(0));
     assert_eq!(payload["requests"], json!(0));
+    assert_eq!(payload["usage_counter"]["status"], json!("idle"));
+    assert_eq!(payload["usage_counter"]["outbox_pending_rows"], json!(0));
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();
@@ -468,11 +735,11 @@ async fn gateway_handles_admin_system_config_export_locally_with_trusted_admin_p
     ));
     let global_model_repository = Arc::new(
         InMemoryGlobalModelReadRepository::seed(Vec::<StoredPublicGlobalModel>::new())
-            .with_admin_global_models(vec![sample_admin_global_model(
-                "global-gpt-5",
-                "gpt-5",
-                "GPT 5",
-            )])
+            .with_admin_global_models(vec![{
+                let mut model = sample_admin_global_model("global-gpt-5", "gpt-5", "GPT 5");
+                model.usage_count = 7;
+                model
+            }])
             .with_admin_provider_models(vec![sample_admin_provider_model(
                 "model-gpt-5",
                 &provider_id,
@@ -535,9 +802,10 @@ async fn gateway_handles_admin_system_config_export_locally_with_trusted_admin_p
 
     assert_eq!(response.status(), StatusCode::OK);
     let payload: serde_json::Value = response.json().await.expect("json body should parse");
-    assert_eq!(payload["version"], "2.2");
+    assert_eq!(payload["version"], "2.3");
     assert!(payload["exported_at"].as_str().is_some());
     assert_eq!(payload["global_models"][0]["name"], "gpt-5");
+    assert_eq!(payload["global_models"][0]["usage_count"], json!(7));
     assert_eq!(payload["providers"][0]["name"], "openai");
     assert_eq!(
         payload["providers"][0]["config"]["provider_ops"]["connector"]["credentials"]
@@ -758,7 +1026,7 @@ async fn gateway_handles_admin_system_users_export_locally_with_trusted_admin_pr
 
     assert_eq!(response.status(), StatusCode::OK);
     let payload: serde_json::Value = response.json().await.expect("json body should parse");
-    assert_eq!(payload["version"], "1.4");
+    assert_eq!(payload["version"], "1.5");
     assert!(payload["exported_at"].as_str().is_some());
     assert_eq!(payload["user_groups"][0]["name"], "Restricted GPT");
     assert!(payload["user_groups"][0].get("priority").is_none());
@@ -776,6 +1044,9 @@ async fn gateway_handles_admin_system_users_export_locally_with_trusted_admin_pr
         payload["users"][0]["group_names"],
         json!(["Restricted GPT"])
     );
+    assert_eq!(payload["users"][0]["id"], json!("user-1"));
+    assert_eq!(payload["users"][0]["request_count"], json!(0));
+    assert_eq!(payload["users"][0]["total_tokens"], json!(0));
     assert_eq!(payload["users"][0]["wallet"]["balance"], json!(12.5));
     assert_eq!(
         payload["users"][0]["wallet"]["recharge_balance"],
@@ -797,6 +1068,10 @@ async fn gateway_handles_admin_system_users_export_locally_with_trusted_admin_pr
         json!(false)
     );
     assert_eq!(
+        payload["users"][0]["api_keys"][0]["api_key_id"],
+        json!("key-user-1")
+    );
+    assert_eq!(
         payload["users"][0]["api_keys"][0]["total_tokens"],
         json!(420)
     );
@@ -804,12 +1079,22 @@ async fn gateway_handles_admin_system_users_export_locally_with_trusted_admin_pr
         payload["standalone_keys"][0]["key"],
         json!("ak-standalone-live-1")
     );
+    assert_eq!(
+        payload["standalone_keys"][0]["api_key_id"],
+        json!("key-standalone-1")
+    );
     assert_eq!(payload["standalone_keys"][0]["total_tokens"], json!(84));
     assert_eq!(
         payload["standalone_keys"][0]["wallet"]["unlimited"],
         json!(true)
     );
     assert_eq!(payload["standalone_keys"][0].get("is_standalone"), None,);
+    assert_eq!(payload["usage_aggregates"]["stats_daily"], json!([]));
+    assert_eq!(payload["usage_aggregates"]["stats_user_daily"], json!([]));
+    assert_eq!(
+        payload["usage_aggregates"]["stats_daily_api_key"],
+        json!([])
+    );
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();
@@ -1152,6 +1437,14 @@ async fn gateway_handles_admin_system_api_formats_locally_with_trusted_admin_pri
         .expect("formats should be an array");
     assert_eq!(formats[0]["value"], "openai:chat");
     assert_eq!(formats[0]["default_path"], "/v1/chat/completions");
+    let gemini_embedding = formats
+        .iter()
+        .find(|item| item["value"] == "gemini:embedding")
+        .expect("gemini embedding format should exist");
+    assert_eq!(
+        gemini_embedding["default_path"],
+        "/v1beta/models/{model}:{action}"
+    );
     assert!(formats
         .iter()
         .any(|item| item["value"] == "openai:embedding"));
@@ -1159,6 +1452,14 @@ async fn gateway_handles_admin_system_api_formats_locally_with_trusted_admin_pri
     assert!(formats.iter().any(|item| item["value"] == "jina:embedding"));
     assert!(formats.iter().any(|item| item["value"] == "jina:rerank"));
     assert!(formats.iter().any(|item| item["value"] == "gemini:video"));
+    let aliyun_embedding = formats
+        .iter()
+        .find(|item| item["value"] == "aliyun:multimodal_embedding")
+        .expect("aliyun multimodal embedding format should exist");
+    assert_eq!(
+        aliyun_embedding["default_path"],
+        "/api/v1/services/embeddings/multimodal-embedding/multimodal-embedding"
+    );
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();

@@ -6,6 +6,8 @@ pub(super) mod features;
 mod model;
 pub(super) mod observability;
 pub(super) mod provider;
+mod referrals;
+mod routing;
 mod system;
 mod users;
 
@@ -27,8 +29,7 @@ pub(crate) use self::provider::oauth::provisioning::{
 };
 pub(crate) use self::provider::oauth::quota::dispatch::refresh_provider_pool_quota_locally;
 pub(crate) use self::provider::oauth::quota::shared::{
-    persist_provider_quota_refresh_state, provider_account_self_check_endpoint_for_provider,
-    provider_quota_refresh_endpoint_for_provider, provider_type_supports_account_self_check,
+    persist_provider_quota_refresh_state, provider_quota_refresh_endpoint_for_provider,
     provider_type_supports_quota_refresh,
 };
 pub(crate) use self::provider::oauth::runtime::{
@@ -36,6 +37,7 @@ pub(crate) use self::provider::oauth::runtime::{
     refresh_provider_oauth_account_state_after_update,
 };
 pub(crate) use self::provider::ops::providers::actions::admin_provider_ops_local_action_response;
+pub(crate) use self::provider::ops::providers::store_admin_provider_ops_balance_cache;
 pub(crate) use self::provider::pool::config::admin_provider_pool_config;
 pub(crate) use self::provider::pool_admin::maybe_build_local_admin_pool_response;
 pub(crate) use self::provider::shared::payloads::{

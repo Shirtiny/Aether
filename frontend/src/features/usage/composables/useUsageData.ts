@@ -13,9 +13,15 @@ import type {
 import { createDefaultStats } from '../types'
 import { log } from '@/utils/logger'
 import { getErrorStatus } from '@/types/api-error'
+import { isUsageProviderVisible, normalizeUsageProviderStats } from '../utils/providerStats'
 
 export interface UseUsageDataOptions {
   isAdminPage: Ref<boolean>
+}
+
+export interface LoadStatsOptions {
+  force?: boolean
+  preserveOnFailure?: boolean
 }
 
 export interface PaginationParams {
@@ -30,11 +36,8 @@ export interface FilterParams {
   provider?: string
   api_format?: string
   status?: string
-}
-
-function isUsageProviderVisible(provider: string | undefined | null): provider is string {
-  const normalized = provider?.trim().toLowerCase()
-  return !!normalized && !['unknown', 'unknow', 'pending'].includes(normalized)
+  client_family?: string
+  hideUnknownRecords?: boolean
 }
 
 export function useUsageData(options: UseUsageDataOptions) {
@@ -75,7 +78,7 @@ export function useUsageData(options: UseUsageDataOptions) {
   })
 
   // 加载统计数据（不加载记录）
-  async function loadStats(dateRange?: DateRangeParams): Promise<boolean> {
+  async function loadStats(dateRange?: DateRangeParams, options: LoadStatsOptions = {}): Promise<boolean> {
     const requestId = ++loadStatsRequestId
     isLoadingStats.value = true
     currentDateRange.value = dateRange
@@ -83,14 +86,17 @@ export function useUsageData(options: UseUsageDataOptions) {
     try {
       if (isAdminPage.value) {
         // 管理员页面顺序加载统计数据，避免刷新使用记录时瞬时打满后端 worker。
-        stats.value = createDefaultStats()
-        modelStats.value = []
-        providerStats.value = []
-        apiFormatStats.value = []
-        availableModels.value = []
-        availableProviders.value = []
+        if (!options.preserveOnFailure) {
+          stats.value = createDefaultStats()
+          modelStats.value = []
+          providerStats.value = []
+          apiFormatStats.value = []
+          availableModels.value = []
+          availableProviders.value = []
+        }
 
         let hadFailure = false
+        const requestOptions = options.force ? { skipCache: true } : undefined
         const markFailure = (error: unknown) => {
           hadFailure = true
           if (getErrorStatus(error) !== 403) {
@@ -99,7 +105,7 @@ export function useUsageData(options: UseUsageDataOptions) {
         }
 
         try {
-          const statsData = await usageApi.getUsageStats(dateRange)
+          const statsData = await usageApi.getUsageStats(dateRange, requestOptions)
           if (requestId !== loadStatsRequestId) {
             return true
           }
@@ -126,7 +132,7 @@ export function useUsageData(options: UseUsageDataOptions) {
         }
 
         try {
-          const modelData = await usageApi.getUsageByModel(dateRange)
+          const modelData = await usageApi.getUsageByModel(dateRange, requestOptions)
           if (requestId !== loadStatsRequestId) {
             return true
           }
@@ -157,31 +163,13 @@ export function useUsageData(options: UseUsageDataOptions) {
         }
 
         try {
-          const providerData = await usageApi.getUsageByProvider(dateRange)
+          const providerData = await usageApi.getUsageByProvider(dateRange, requestOptions)
           if (requestId !== loadStatsRequestId) {
             return true
           }
 
-          const visibleProviderData = providerData.filter(item => isUsageProviderVisible(item.provider))
-          providerStats.value = visibleProviderData.map(item => ({
-            provider: item.provider,
-            requests: item.request_count,
-            totalTokens: item.total_tokens || 0,
-            effectiveInputTokens: item.effective_input_tokens || 0,
-            totalInputContext: item.total_input_context || 0,
-            outputTokens: item.output_tokens || 0,
-            cacheReadTokens: item.cache_read_tokens || 0,
-            cacheCreationTokens: item.cache_creation_tokens || 0,
-            cacheHitRate: item.cache_hit_rate || 0,
-            totalCost: item.total_cost,
-            actualCost: item.actual_cost,
-            successRate: item.success_rate,
-            avgResponseTime: item.avg_response_time_ms > 0
-              ? `${(item.avg_response_time_ms / 1000).toFixed(2)}s`
-              : '-'
-          }))
-
-          availableProviders.value = visibleProviderData.map(item => item.provider).sort()
+          providerStats.value = normalizeUsageProviderStats(providerData)
+          availableProviders.value = providerStats.value.map(item => item.provider).sort()
         } catch (error) {
           if (requestId !== loadStatsRequestId) {
             return true
@@ -190,7 +178,7 @@ export function useUsageData(options: UseUsageDataOptions) {
         }
 
         try {
-          const apiFormatData = await usageApi.getUsageByApiFormat(dateRange)
+          const apiFormatData = await usageApi.getUsageByApiFormat(dateRange, requestOptions)
           if (requestId !== loadStatsRequestId) {
             return true
           }
@@ -311,9 +299,9 @@ export function useUsageData(options: UseUsageDataOptions) {
       if (getErrorStatus(error) !== 403) {
         log.error('加载统计数据失败:', error)
       }
-      stats.value = createDefaultStats()
-      modelStats.value = []
       if (!isAdminPage.value) {
+        stats.value = createDefaultStats()
+        modelStats.value = []
         // 用户页的 records 依赖 stats 一起加载；管理员页的 records 是独立分页，不应被统计失败清空。
         currentRecords.value = []
         totalRecords.value = 0
@@ -371,6 +359,12 @@ export function useUsageData(options: UseUsageDataOptions) {
         if (filters?.status) {
           params.status = filters.status
         }
+        if (filters?.client_family) {
+          params.client_family = filters.client_family
+        }
+        if (filters?.hideUnknownRecords) {
+          params.hide_unknown = true
+        }
 
         const response = await usageApi.getAllUsageRecords(params)
         if (requestId !== loadRecordsRequestId) {
@@ -401,6 +395,25 @@ export function useUsageData(options: UseUsageDataOptions) {
         isLoadingRecords.value = false
       }
     }
+  }
+
+  function mergePositiveDurationMs(
+    existingValue: number | null | undefined,
+    nextValue: number | null | undefined
+  ): number | null | undefined {
+    const existingIsPositive = typeof existingValue === 'number' && Number.isFinite(existingValue) && existingValue > 0
+    const nextIsPositive = typeof nextValue === 'number' && Number.isFinite(nextValue) && nextValue > 0
+
+    if (existingIsPositive && nextIsPositive) {
+      return Math.max(existingValue, nextValue)
+    }
+    if (existingIsPositive) {
+      return existingValue
+    }
+    if (nextIsPositive) {
+      return nextValue
+    }
+    return existingValue ?? nextValue
   }
 
   function mergeRecordStatus(
@@ -498,8 +511,11 @@ export function useUsageData(options: UseUsageDataOptions) {
           cache_read_input_tokens: existing.cache_read_input_tokens ?? record.cache_read_input_tokens,
           cost: existing.cost || record.cost,
           actual_cost: existing.actual_cost ?? record.actual_cost,
-          response_time_ms: existing.response_time_ms ?? record.response_time_ms,
-          first_byte_time_ms: existing.first_byte_time_ms ?? record.first_byte_time_ms,
+          response_time_ms: mergePositiveDurationMs(existing.response_time_ms, record.response_time_ms),
+          first_byte_time_ms: mergePositiveDurationMs(existing.first_byte_time_ms, record.first_byte_time_ms),
+          status_code: existing.status_code ?? record.status_code,
+          error_message: existing.error_message ?? record.error_message,
+          image_progress: existing.image_progress ?? record.image_progress,
           is_stream: upstreamIsStream,
           upstream_is_stream: upstreamIsStream,
           client_requested_stream: clientRequestedStream,
@@ -511,7 +527,9 @@ export function useUsageData(options: UseUsageDataOptions) {
           api_key_name: existing.api_key_name || record.api_key_name,
           provider_key_name: existing.provider_key_name || record.provider_key_name,
           rate_multiplier: existing.rate_multiplier ?? record.rate_multiplier,
-          target_model: existing.target_model || record.target_model
+          target_model: existing.target_model || record.target_model,
+          reasoning_effort: existing.reasoning_effort || record.reasoning_effort,
+          service_tier: existing.service_tier || record.service_tier
         }
       }
 

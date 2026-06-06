@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aether_data_contracts::repository::pool_scores::{
-    GetPoolMemberScoresByIdsQuery, ListPoolMemberProbeCandidatesQuery, PoolMemberHardState,
+    ListPoolMemberProbeCandidatesQuery, ListPoolMemberScoresQuery, PoolMemberHardState,
     PoolMemberIdentity, PoolMemberProbeAttempt, PoolMemberProbeResult, PoolMemberProbeStatus,
     StoredPoolMemberScore, POOL_KIND_PROVIDER_KEY_POOL,
 };
@@ -22,7 +22,6 @@ use crate::admin_api::{
 };
 use crate::{AppState, GatewayError};
 
-use crate::ai_serving::provider_key_pool_score_id;
 use crate::ai_serving::provider_key_pool_score_scope;
 use crate::handlers::shared::provider_pool::{
     admin_provider_pool_quota_probe_active_members_key, AdminProviderPoolConfig,
@@ -37,7 +36,8 @@ use super::pool_score_rebuild::ensure_provider_key_pool_scores_for_keys;
 const POOL_QUOTA_PROBE_REDIS_PREFIX: &str = "ap:quota_probe:last";
 const POOL_QUOTA_PROBE_DEFAULT_SCAN_INTERVAL_SECONDS: u64 = 60;
 const POOL_QUOTA_PROBE_MIN_SCAN_INTERVAL_SECONDS: u64 = 15;
-const POOL_QUOTA_PROBE_DEFAULT_MAX_KEYS_PER_PROVIDER: usize = 50;
+const POOL_QUOTA_PROBE_UNLIMITED_MAX_KEYS_PER_PROVIDER: usize = usize::MAX;
+const POOL_QUOTA_PROBE_PROVIDER_SCORE_READ_LIMIT: usize = 100_000;
 const POOL_QUOTA_PROBE_DEFAULT_GLOBAL_CONCURRENCY: usize = 16;
 const POOL_QUOTA_PROBE_PROVIDER_LOCK_TTL_MS: u64 = 30_000;
 const POOL_QUOTA_PROBE_BURST_TRIGGER_LOCK_TTL_MS: u64 = 30_000;
@@ -106,7 +106,7 @@ impl PoolQuotaProbeWorkerConfig {
         .max(POOL_QUOTA_PROBE_MIN_SCAN_INTERVAL_SECONDS);
         let max_keys_per_provider = env_usize(
             "POOL_QUOTA_PROBE_MAX_KEYS_PER_PROVIDER",
-            POOL_QUOTA_PROBE_DEFAULT_MAX_KEYS_PER_PROVIDER,
+            POOL_QUOTA_PROBE_UNLIMITED_MAX_KEYS_PER_PROVIDER,
         );
         let global_concurrency = env_usize(
             "POOL_QUOTA_PROBE_GLOBAL_CONCURRENCY",
@@ -386,21 +386,25 @@ async fn load_provider_key_account_scores(
         return BTreeMap::new();
     }
     let scope = provider_key_pool_score_scope();
-    let score_ids = key_ids
-        .iter()
-        .map(|key_id| {
-            let identity =
-                PoolMemberIdentity::provider_api_key(provider_id.to_string(), key_id.clone());
-            provider_key_pool_score_id(&identity, &scope)
-        })
-        .collect::<Vec<_>>();
+    let key_ids = key_ids.iter().map(String::as_str).collect::<BTreeSet<_>>();
     match state
         .data
-        .get_pool_member_scores_by_ids(&GetPoolMemberScoresByIdsQuery { ids: score_ids })
+        .list_pool_member_scores(&ListPoolMemberScoresQuery {
+            pool_kind: POOL_KIND_PROVIDER_KEY_POOL.to_string(),
+            pool_id: provider_id.to_string(),
+            capability: Some(scope.capability),
+            scope_kind: Some(scope.scope_kind),
+            scope_id: scope.scope_id,
+            hard_states: Vec::new(),
+            probe_statuses: None,
+            offset: 0,
+            limit: POOL_QUOTA_PROBE_PROVIDER_SCORE_READ_LIMIT,
+        })
         .await
     {
         Ok(scores) => scores
             .into_iter()
+            .filter(|score| key_ids.contains(score.member_id.as_str()))
             .map(|score| (score.member_id.clone(), score))
             .collect(),
         Err(err) => {
@@ -849,13 +853,15 @@ async fn select_keys_for_provider(
     }
 
     let result = async {
-        let keys = state
-            .list_provider_catalog_keys_by_provider_ids(std::slice::from_ref(&provider.id))
+        let summaries = state
+            .list_provider_catalog_key_maintenance_summaries_by_provider_ids(std::slice::from_ref(
+                &provider.id,
+            ))
             .await?
             .into_iter()
-            .filter(|key| key.is_active)
+            .filter(|summary| summary.is_active)
             .collect::<Vec<_>>();
-        if keys.is_empty() {
+        if summaries.is_empty() {
             return Ok(PoolQuotaProbeSelectionOutcome::Empty);
         }
 
@@ -864,7 +870,7 @@ async fn select_keys_for_provider(
                 sample_provider_pool_demand(
                     runtime,
                     &provider.id,
-                    keys.len(),
+                    summaries.len(),
                     config.max_keys_per_provider,
                 )
                 .await
@@ -873,14 +879,14 @@ async fn select_keys_for_provider(
                 read_provider_pool_demand_snapshot(
                     runtime,
                     &provider.id,
-                    keys.len(),
+                    summaries.len(),
                     config.max_keys_per_provider,
                 )
                 .await
             }
         };
         let target_active_count = pool_quota_probe_target_count_for_mode(
-            keys.len(),
+            summaries.len(),
             pool_config,
             demand_snapshot.desired_hot,
             config,
@@ -894,7 +900,10 @@ async fn select_keys_for_provider(
             return Ok(PoolQuotaProbeSelectionOutcome::Empty);
         }
 
-        let key_ids = keys.iter().map(|key| key.id.clone()).collect::<Vec<_>>();
+        let key_ids = summaries
+            .iter()
+            .map(|summary| summary.id.clone())
+            .collect::<Vec<_>>();
         let scores_by_key = load_provider_key_account_scores(state, &provider.id, &key_ids).await;
         let mut active_member_ids =
             load_pruned_active_probe_member_ids(runtime, &provider.id, &key_ids, &scores_by_key)
@@ -965,7 +974,9 @@ async fn select_keys_for_provider(
         )
         .await;
 
-        let mut keys_by_id = keys
+        let mut keys_by_id = state
+            .list_provider_catalog_keys_by_ids(&selected_ids)
+            .await?
             .into_iter()
             .map(|key| (key.id.clone(), key))
             .collect::<BTreeMap<_, _>>();
@@ -1227,6 +1238,24 @@ async fn perform_pool_quota_probe_for_provider(
     now_ts: u64,
 ) -> Result<PoolQuotaProbeRunSummary, GatewayError> {
     let mut summary = PoolQuotaProbeRunSummary::empty();
+    let provider_short_id = provider.id.chars().take(8).collect::<String>();
+
+    if aether_admin::provider::quota::provider_auto_remove_banned_keys(provider.config.as_ref()) {
+        let auto_removed = admin_state
+            .cleanup_known_banned_provider_catalog_keys(provider)
+            .await?;
+        if auto_removed > 0 {
+            summary.auto_removed += auto_removed;
+            info!(
+                event_name = "auto_removed_hard_banned",
+                provider_id = %provider_short_id,
+                provider_type,
+                auto_removed,
+                "gateway pool quota probe auto-cleaned known abnormal provider keys"
+            );
+        }
+    }
+
     let Some(endpoint) = endpoint_for_probe_with_reconcile(
         state,
         admin_state,
@@ -1308,7 +1337,6 @@ async fn perform_pool_quota_probe_for_provider(
         record_score_probe_in_progress_for_key(state, &provider.id, key_id, now_ts).await;
     }
 
-    let provider_short_id = provider.id.chars().take(8).collect::<String>();
     let probe_concurrency = pool_config.probe_concurrency.clamp(1, 64) as usize;
     let probe_concurrency = probe_concurrency.min(config.global_concurrency).max(1);
     let probe_results = stream::iter(keys.into_iter().map(|key| {

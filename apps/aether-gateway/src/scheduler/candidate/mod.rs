@@ -32,7 +32,9 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 pub(crate) use self::selection::{
-    SchedulerSkippedCandidate, API_KEY_CONCURRENCY_LIMIT_SKIP_REASON,
+    is_auth_api_key_concurrency_limit_skip_reason, SchedulerSkippedCandidate,
+    API_KEY_CONCURRENCY_LIMIT_SKIP_REASON, AUTH_API_KEY_CONCURRENCY_LIMIT_SKIP_REASON,
+    LEGACY_API_KEY_CONCURRENCY_LIMIT_SKIP_REASON,
 };
 
 use crate::data::auth::GatewayAuthApiKeySnapshot;

@@ -1,17 +1,22 @@
 use super::{
     any, build_router_with_state, build_state_with_execution_runtime_override,
-    encrypt_python_fernet_plaintext, json, start_server, to_bytes, AppState, Arc, Body, Digest,
-    InMemoryAuthApiKeySnapshotRepository, InMemoryMinimalCandidateSelectionReadRepository,
-    InMemoryProviderCatalogReadRepository, InMemoryRequestCandidateRepository, Json, Mutex,
-    Request, RequestCandidateReadRepository, RequestCandidateStatus, Router, Sha256, StatusCode,
-    StoredAuthApiKeySnapshot, StoredMinimalCandidateSelectionRow, StoredProviderCatalogEndpoint,
-    StoredProviderCatalogKey, StoredProviderCatalogProvider, StoredProviderModelMapping,
-    DEVELOPMENT_ENCRYPTION_KEY, EXECUTION_PATH_EXECUTION_RUNTIME_SYNC, EXECUTION_PATH_HEADER,
-    TRACE_ID_HEADER,
+    encrypt_python_fernet_plaintext, json, run_async_test_on_large_stack, start_server, to_bytes,
+    AppState, Arc, Body, Digest, InMemoryAuthApiKeySnapshotRepository,
+    InMemoryMinimalCandidateSelectionReadRepository, InMemoryProviderCatalogReadRepository,
+    InMemoryRequestCandidateRepository, Json, Mutex, Request, RequestCandidateReadRepository,
+    RequestCandidateStatus, Router, Sha256, StatusCode, StoredAuthApiKeySnapshot,
+    StoredMinimalCandidateSelectionRow, StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
+    StoredProviderCatalogProvider, StoredProviderModelMapping, DEVELOPMENT_ENCRYPTION_KEY,
+    EXECUTION_PATH_EXECUTION_RUNTIME_SYNC, EXECUTION_PATH_HEADER, TRACE_ID_HEADER,
 };
 
-#[tokio::test]
-async fn proxy_pii_redaction_local_openai_chat_runtime_masks_headers_and_restores_sync_response() {
+large_stack_async_test!(
+    proxy_pii_redaction_local_openai_chat_runtime_masks_headers_and_restores_sync_response,
+    proxy_pii_redaction_local_openai_chat_runtime_masks_headers_and_restores_sync_response_impl
+);
+
+async fn proxy_pii_redaction_local_openai_chat_runtime_masks_headers_and_restores_sync_response_impl(
+) {
     #[derive(Debug, Clone)]
     struct SeenProviderRequest {
         body: serde_json::Value,
@@ -233,7 +238,7 @@ async fn proxy_pii_redaction_local_openai_chat_runtime_masks_headers_and_restore
     let seen_provider_request = Arc::new(Mutex::new(None::<SeenProviderRequest>));
     let seen_provider_request_clone = Arc::clone(&seen_provider_request);
     let provider_app = Router::new().route(
-        "/v1/chat/completions",
+        "/chat/completions",
         any(move |request: Request| {
             let seen_provider_request_inner = Arc::clone(&seen_provider_request_clone);
             async move {
@@ -377,8 +382,12 @@ async fn proxy_pii_redaction_local_openai_chat_runtime_masks_headers_and_restore
     provider_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_executes_openai_chat_sync_via_local_decision_gate_without_execution_runtime_override(
+large_stack_async_test!(
+    gateway_executes_openai_chat_sync_via_local_decision_gate_without_execution_runtime_override,
+    gateway_executes_openai_chat_sync_via_local_decision_gate_without_execution_runtime_override_impl
+);
+
+async fn gateway_executes_openai_chat_sync_via_local_decision_gate_without_execution_runtime_override_impl(
 ) {
     #[derive(Debug, Clone)]
     struct SeenUpstreamSyncRequest {
@@ -491,7 +500,7 @@ async fn gateway_executes_openai_chat_sync_via_local_decision_gate_without_execu
         )
         .expect("endpoint should build")
         .with_transport_fields(
-            "https://api.openai.example".to_string(),
+            "https://api.openai.example/v1".to_string(),
             None,
             None,
             Some(2),
@@ -669,7 +678,7 @@ async fn gateway_executes_openai_chat_sync_via_local_decision_gate_without_execu
     let (upstream_url, upstream_handle) = start_server(upstream).await;
     let (provider_url, provider_handle) = start_server(provider).await;
     let mut primary_endpoint = sample_provider_catalog_endpoint();
-    primary_endpoint.base_url = provider_url.clone();
+    primary_endpoint.base_url = format!("{provider_url}/v1");
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
         vec![sample_provider_catalog_provider(), backup_provider],
         {
@@ -759,8 +768,13 @@ async fn gateway_executes_openai_chat_sync_via_local_decision_gate_without_execu
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_executes_openai_chat_sync_with_regex_model_mapping_in_execution_runtime_request() {
+large_stack_async_test!(
+    gateway_executes_openai_chat_sync_with_regex_model_mapping_in_execution_runtime_request,
+    gateway_executes_openai_chat_sync_with_regex_model_mapping_in_execution_runtime_request_impl
+);
+
+async fn gateway_executes_openai_chat_sync_with_regex_model_mapping_in_execution_runtime_request_impl(
+) {
     #[derive(Debug, Clone)]
     struct SeenExecutionRuntimeSyncRequest {
         model: String,
@@ -871,7 +885,7 @@ async fn gateway_executes_openai_chat_sync_with_regex_model_mapping_in_execution
         )
         .expect("endpoint should build")
         .with_transport_fields(
-            "https://api.openai.example".to_string(),
+            "https://api.openai.example/v1".to_string(),
             None,
             None,
             Some(2),
@@ -1038,8 +1052,12 @@ async fn gateway_executes_openai_chat_sync_with_regex_model_mapping_in_execution
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_executes_openai_chat_sync_via_local_cross_format_gemini_candidate_without_external_control_config(
+large_stack_async_test!(
+    gateway_executes_openai_chat_sync_via_local_cross_format_gemini_candidate_without_external_control_config,
+    gateway_executes_openai_chat_sync_via_local_cross_format_gemini_candidate_without_external_control_config_impl
+);
+
+async fn gateway_executes_openai_chat_sync_via_local_cross_format_gemini_candidate_without_external_control_config_impl(
 ) {
     #[derive(Debug, Clone)]
     struct SeenExecutionRuntimeSyncRequest {
@@ -1606,8 +1624,12 @@ async fn gateway_executes_openai_chat_sync_via_local_cross_format_gemini_candida
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_returns_openai_chat_error_for_local_cross_format_claude_cli_sync_failure() {
+large_stack_async_test!(
+    gateway_returns_openai_chat_error_for_local_cross_format_claude_cli_sync_failure,
+    gateway_returns_openai_chat_error_for_local_cross_format_claude_cli_sync_failure_impl
+);
+
+async fn gateway_returns_openai_chat_error_for_local_cross_format_claude_cli_sync_failure_impl() {
     #[derive(Debug, Clone)]
     struct SeenExecutionRuntimeSyncRequest {
         trace_id: String,
@@ -2004,13 +2026,19 @@ async fn gateway_returns_openai_chat_error_for_local_cross_format_claude_cli_syn
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_returns_openai_chat_error_for_local_cross_format_gemini_cli_sync_failure() {
+large_stack_async_test!(
+    gateway_returns_openai_chat_error_for_local_cross_format_gemini_cli_sync_failure,
+    gateway_returns_openai_chat_error_for_local_cross_format_gemini_cli_sync_failure_impl
+);
+
+async fn gateway_returns_openai_chat_error_for_local_cross_format_gemini_cli_sync_failure_impl() {
     #[derive(Debug, Clone)]
     struct SeenExecutionRuntimeSyncRequest {
         trace_id: String,
         url: String,
-        model: String,
+        outer_model: String,
+        user_prompt_id: String,
+        inner_model_present: bool,
         auth_header_value: String,
         endpoint_tag: String,
         has_contents: bool,
@@ -2031,7 +2059,7 @@ async fn gateway_returns_openai_chat_error_for_local_cross_format_gemini_cli_syn
             "local".to_string(),
             true,
             false,
-            Some(serde_json::json!(["openai", "gemini"])),
+            Some(serde_json::json!(["openai", "gemini", "gemini_cli"])),
             Some(serde_json::json!(["openai:chat"])),
             Some(serde_json::json!(["gpt-5"])),
             api_key_id.to_string(),
@@ -2042,7 +2070,7 @@ async fn gateway_returns_openai_chat_error_for_local_cross_format_gemini_cli_syn
             Some(60),
             Some(5),
             Some(4_102_444_800),
-            Some(serde_json::json!(["openai", "gemini"])),
+            Some(serde_json::json!(["openai", "gemini", "gemini_cli"])),
             Some(serde_json::json!(["openai:chat"])),
             Some(serde_json::json!(["gpt-5"])),
         )
@@ -2052,8 +2080,8 @@ async fn gateway_returns_openai_chat_error_for_local_cross_format_gemini_cli_syn
     fn sample_candidate_row() -> StoredMinimalCandidateSelectionRow {
         StoredMinimalCandidateSelectionRow {
             provider_id: "provider-openai-chat-gemini-cli-local-1".to_string(),
-            provider_name: "gemini".to_string(),
-            provider_type: "custom".to_string(),
+            provider_name: "gemini_cli".to_string(),
+            provider_type: "gemini_cli".to_string(),
             provider_priority: 10,
             provider_is_active: true,
             endpoint_id: "endpoint-openai-chat-gemini-cli-local-1".to_string(),
@@ -2062,8 +2090,8 @@ async fn gateway_returns_openai_chat_error_for_local_cross_format_gemini_cli_syn
             endpoint_kind: Some("cli".to_string()),
             endpoint_is_active: true,
             key_id: "key-openai-chat-gemini-cli-local-1".to_string(),
-            key_name: "prod".to_string(),
-            key_auth_type: "bearer".to_string(),
+            key_name: "oauth".to_string(),
+            key_auth_type: "oauth".to_string(),
             key_is_active: true,
             key_api_formats: Some(vec!["gemini:generate_content".to_string()]),
             key_allowed_models: None,
@@ -2091,9 +2119,9 @@ async fn gateway_returns_openai_chat_error_for_local_cross_format_gemini_cli_syn
     fn sample_provider_catalog_provider() -> StoredProviderCatalogProvider {
         StoredProviderCatalogProvider::new(
             "provider-openai-chat-gemini-cli-local-1".to_string(),
-            "gemini".to_string(),
+            "gemini_cli".to_string(),
             Some("https://example.com".to_string()),
-            "custom".to_string(),
+            "gemini_cli".to_string(),
         )
         .expect("provider should build")
         .with_transport_fields(
@@ -2120,13 +2148,13 @@ async fn gateway_returns_openai_chat_error_for_local_cross_format_gemini_cli_syn
         )
         .expect("endpoint should build")
         .with_transport_fields(
-            "https://generativelanguage.googleapis.com".to_string(),
+            "https://cloudcode-pa.googleapis.com".to_string(),
             Some(serde_json::json!([
                 {"action":"set","key":"x-endpoint-tag","value":"openai-chat-gemini-cli-cross-format"}
             ])),
             None,
             Some(2),
-            Some("/custom/v1beta/models/gemini-cli-upstream:generateContent".to_string()),
+            None,
             None,
             None,
             None,
@@ -2138,8 +2166,8 @@ async fn gateway_returns_openai_chat_error_for_local_cross_format_gemini_cli_syn
         StoredProviderCatalogKey::new(
             "key-openai-chat-gemini-cli-local-1".to_string(),
             "provider-openai-chat-gemini-cli-local-1".to_string(),
-            "prod".to_string(),
-            "bearer".to_string(),
+            "oauth".to_string(),
+            "oauth".to_string(),
             None,
             true,
         )
@@ -2241,13 +2269,26 @@ async fn gateway_returns_openai_chat_error_for_local_cross_format_gemini_cli_syn
                         .and_then(|value| value.as_str())
                         .unwrap_or_default()
                         .to_string(),
-                    model: payload
+                    outer_model: payload
                         .get("body")
                         .and_then(|value| value.get("json_body"))
                         .and_then(|value| value.get("model"))
                         .and_then(|value| value.as_str())
                         .unwrap_or_default()
                         .to_string(),
+                    user_prompt_id: payload
+                        .get("body")
+                        .and_then(|value| value.get("json_body"))
+                        .and_then(|value| value.get("user_prompt_id"))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    inner_model_present: payload
+                        .get("body")
+                        .and_then(|value| value.get("json_body"))
+                        .and_then(|value| value.get("request"))
+                        .and_then(|value| value.get("model"))
+                        .is_some(),
                     auth_header_value: payload
                         .get("headers")
                         .and_then(|value| value.get("authorization"))
@@ -2263,6 +2304,7 @@ async fn gateway_returns_openai_chat_error_for_local_cross_format_gemini_cli_syn
                     has_contents: payload
                         .get("body")
                         .and_then(|value| value.get("json_body"))
+                        .and_then(|value| value.get("request"))
                         .and_then(|value| value.get("contents"))
                         .is_some(),
                 });
@@ -2336,15 +2378,20 @@ async fn gateway_returns_openai_chat_error_for_local_cross_format_gemini_cli_syn
         .await
         .expect("request should succeed");
 
-    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let response_status = response.status();
+    let execution_path = response
+        .headers()
+        .get(EXECUTION_PATH_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let response_body = response.text().await.expect("body should read");
     assert_eq!(
-        response
-            .headers()
-            .get(EXECUTION_PATH_HEADER)
-            .and_then(|value| value.to_str().ok()),
+        execution_path.as_deref(),
         Some(EXECUTION_PATH_EXECUTION_RUNTIME_SYNC)
     );
-    let response_json: serde_json::Value = response.json().await.expect("body should parse");
+    assert_eq!(response_status, StatusCode::TOO_MANY_REQUESTS);
+    let response_json: serde_json::Value =
+        serde_json::from_str(&response_body).expect("body should parse");
     assert_eq!(
         response_json,
         json!({
@@ -2367,9 +2414,17 @@ async fn gateway_returns_openai_chat_error_for_local_cross_format_gemini_cli_syn
     );
     assert_eq!(
         seen_execution_runtime_request.url,
-        "https://generativelanguage.googleapis.com/custom/v1beta/models/gemini-cli-upstream:generateContent"
+        "https://cloudcode-pa.googleapis.com/v1internal:generateContent"
     );
-    assert_eq!(seen_execution_runtime_request.model, "gemini-cli-upstream");
+    assert_eq!(
+        seen_execution_runtime_request.outer_model,
+        "gemini-cli-upstream"
+    );
+    assert_eq!(
+        seen_execution_runtime_request.user_prompt_id,
+        "trace-openai-chat-gemini-cli-local-error-123"
+    );
+    assert!(!seen_execution_runtime_request.inner_model_present);
     assert_eq!(
         seen_execution_runtime_request.auth_header_value,
         "Bearer sk-upstream-openai-chat-gemini-cli"
@@ -2402,8 +2457,12 @@ async fn gateway_returns_openai_chat_error_for_local_cross_format_gemini_cli_syn
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_returns_openai_chat_error_for_local_cross_format_claude_sync_failure() {
+large_stack_async_test!(
+    gateway_returns_openai_chat_error_for_local_cross_format_claude_sync_failure,
+    gateway_returns_openai_chat_error_for_local_cross_format_claude_sync_failure_impl
+);
+
+async fn gateway_returns_openai_chat_error_for_local_cross_format_claude_sync_failure_impl() {
     #[derive(Debug, Clone)]
     struct SeenExecutionRuntimeSyncRequest {
         trace_id: String,
@@ -2803,8 +2862,12 @@ async fn gateway_returns_openai_chat_error_for_local_cross_format_claude_sync_fa
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_returns_openai_chat_error_for_local_cross_format_gemini_sync_failure() {
+large_stack_async_test!(
+    gateway_returns_openai_chat_error_for_local_cross_format_gemini_sync_failure,
+    gateway_returns_openai_chat_error_for_local_cross_format_gemini_sync_failure_impl
+);
+
+async fn gateway_returns_openai_chat_error_for_local_cross_format_gemini_sync_failure_impl() {
     #[derive(Debug, Clone)]
     struct SeenExecutionRuntimeSyncRequest {
         trace_id: String,
@@ -3243,8 +3306,12 @@ async fn gateway_returns_openai_chat_error_for_local_cross_format_gemini_sync_fa
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_executes_openai_chat_sync_with_custom_path_via_local_decision_gate_with_local_sync_decision(
+large_stack_async_test!(
+    gateway_executes_openai_chat_sync_with_custom_path_via_local_decision_gate_with_local_sync_decision,
+    gateway_executes_openai_chat_sync_with_custom_path_via_local_decision_gate_with_local_sync_decision_impl
+);
+
+async fn gateway_executes_openai_chat_sync_with_custom_path_via_local_decision_gate_with_local_sync_decision_impl(
 ) {
     #[derive(Debug, Clone)]
     struct SeenExecutionRuntimeSyncRequest {

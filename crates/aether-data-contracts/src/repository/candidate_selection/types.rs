@@ -108,6 +108,8 @@ fn api_format_matches(left: &str, right: &str) -> bool {
 
 #[async_trait]
 pub trait MinimalCandidateSelectionReadRepository: Send + Sync {
+    fn clear_local_cache(&self) {}
+
     async fn list_for_exact_api_format(
         &self,
         api_format: &str,

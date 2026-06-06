@@ -156,6 +156,7 @@ pub(super) fn classify_public_support_route(
                 | "/api/public/stats"
                 | "/api/public/global-models"
                 | "/api/public/health/api-formats"
+                | "/api/public/health/models"
         )
     {
         let route_kind = match normalized_path {
@@ -166,6 +167,7 @@ pub(super) fn classify_public_support_route(
             "/api/public/stats" => "stats",
             "/api/public/global-models" => "global_models",
             "/api/public/health/api-formats" => "health_api_formats",
+            "/api/public/health/models" => "health_models",
             _ => "site_info",
         };
         Some(classified(
@@ -279,6 +281,20 @@ pub(super) fn classify_public_support_route(
             "user:announcements",
             false,
         ))
+    } else if method == http::Method::GET
+        && matches!(
+            normalized_path,
+            "/api/announcements/users/me/required-unread"
+                | "/api/announcements/users/me/required-unread/"
+        )
+    {
+        Some(classified(
+            "public_support",
+            "announcement_user",
+            "required_unread",
+            "user:announcements",
+            false,
+        ))
     } else if method == http::Method::POST
         && matches!(
             normalized_path,
@@ -318,6 +334,7 @@ pub(super) fn classify_public_support_route(
                 | "/api/wallet/recharge"
                 | "/api/wallet/recharge/options"
                 | "/api/wallet/refunds"
+                | "/api/wallet/refunds/eligible-providers"
         )
     {
         let route_kind = match normalized_path {
@@ -328,6 +345,7 @@ pub(super) fn classify_public_support_route(
             "/api/wallet/recharge" => "list_recharge_orders",
             "/api/wallet/recharge/options" => "recharge_options",
             "/api/wallet/refunds" => "list_refunds",
+            "/api/wallet/refunds/eligible-providers" => "refund_eligible_providers",
             _ => "balance",
         };
         Some(classified(
@@ -425,6 +443,45 @@ pub(super) fn classify_public_support_route(
     } else if matches!(method, &http::Method::GET | &http::Method::POST)
         && matches!(
             normalized_path,
+            "/api/payment/alipay/notify" | "/api/payment/alipay/notify/"
+        )
+    {
+        Some(classified(
+            "public_support",
+            "payment_callback",
+            "alipay_notify",
+            "public:payment",
+            false,
+        ))
+    } else if method == http::Method::POST
+        && matches!(
+            normalized_path,
+            "/api/payment/wxpay/notify" | "/api/payment/wxpay/notify/"
+        )
+    {
+        Some(classified(
+            "public_support",
+            "payment_callback",
+            "wxpay_notify",
+            "public:payment",
+            false,
+        ))
+    } else if method == http::Method::POST
+        && matches!(
+            normalized_path,
+            "/api/payment/stripe/webhook" | "/api/payment/stripe/webhook/"
+        )
+    {
+        Some(classified(
+            "public_support",
+            "payment_callback",
+            "stripe_webhook",
+            "public:payment",
+            false,
+        ))
+    } else if matches!(method, &http::Method::GET | &http::Method::POST)
+        && matches!(
+            normalized_path,
             "/api/payment/epay/notify" | "/api/payment/epay/notify/"
         )
     {
@@ -451,6 +508,19 @@ pub(super) fn classify_public_support_route(
     } else if method == http::Method::GET
         && matches!(
             normalized_path,
+            "/api/ccswitch/usage" | "/api/ccswitch/usage/"
+        )
+    {
+        Some(classified(
+            "public_support",
+            "ccswitch",
+            "usage",
+            "aether:ccswitch_usage",
+            false,
+        ))
+    } else if method == http::Method::GET
+        && matches!(
+            normalized_path,
             "/api/users/me"
                 | "/api/users/me/sessions"
                 | "/api/users/me/api-keys"
@@ -460,8 +530,10 @@ pub(super) fn classify_public_support_route(
                 | "/api/users/me/usage/heatmap"
                 | "/api/users/me/providers"
                 | "/api/users/me/available-models"
+                | "/api/users/me/client-config"
                 | "/api/users/me/endpoint-status"
                 | "/api/users/me/preferences"
+                | "/api/users/me/referral"
                 | "/api/users/me/model-capabilities"
         )
     {
@@ -475,8 +547,10 @@ pub(super) fn classify_public_support_route(
             "/api/users/me/usage/heatmap" => "usage_heatmap",
             "/api/users/me/providers" => "providers",
             "/api/users/me/available-models" => "available_models",
+            "/api/users/me/client-config" => "client_config",
             "/api/users/me/endpoint-status" => "endpoint_status",
             "/api/users/me/preferences" => "preferences",
+            "/api/users/me/referral" => "referral",
             "/api/users/me/model-capabilities" => "model_capabilities",
             _ => "detail",
         };
@@ -739,7 +813,7 @@ pub(super) fn classify_public_support_route(
         ))
     } else if method == http::Method::GET
         && (has_single_segment_after_prefix(normalized_path, "/install/")
-            || has_single_segment_after_prefix(normalized_path, "/install-proxy/")
+            || has_single_segment_after_prefix(normalized_path, "/install-tunnel/")
             || has_single_segment_after_prefix(normalized_path, "/i/"))
     {
         Some(classified(

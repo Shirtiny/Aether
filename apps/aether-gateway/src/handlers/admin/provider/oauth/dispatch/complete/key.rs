@@ -1,7 +1,9 @@
 use super::super::super::errors::build_internal_control_error_response;
 use super::super::super::provisioning::provider_oauth_token_payload_expires_at_unix_secs;
-use super::super::super::quota::codex::refresh_codex_provider_quota_locally;
-use super::super::super::runtime::resolve_provider_oauth_runtime_endpoints;
+use super::super::super::runtime::{
+    resolve_provider_oauth_runtime_endpoints,
+    spawn_provider_oauth_account_state_refresh_after_update,
+};
 use super::super::super::state::{
     admin_provider_oauth_template, enrich_admin_provider_oauth_auth_config,
     is_fixed_provider_type_for_provider_oauth, json_non_empty_string,
@@ -219,50 +221,20 @@ pub(super) async fn handle_admin_provider_oauth_complete_key(
         ));
     }
 
-    let mut account_state_recheck_attempted = false;
-    let mut account_state_recheck_error = None::<String>;
-    if provider_type == "codex" {
-        if let Some(endpoint) = runtime_endpoint {
-            let refreshed_key = state
-                .read_provider_catalog_keys_by_ids(std::slice::from_ref(&key_id))
-                .await?
-                .into_iter()
-                .next()
-                .unwrap_or_else(|| key.clone());
-            if let Some(result) = refresh_codex_provider_quota_locally(
-                state,
-                &provider,
-                &endpoint,
-                vec![refreshed_key],
-                request_proxy.clone(),
-            )
-            .await?
-            {
-                account_state_recheck_attempted = true;
-                let success = result
-                    .get("success")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0);
-                if success == 0 {
-                    account_state_recheck_error = result
-                        .get("results")
-                        .and_then(serde_json::Value::as_array)
-                        .and_then(|results| results.first())
-                        .and_then(|value| value.get("message"))
-                        .and_then(serde_json::Value::as_str)
-                        .map(ToOwned::to_owned);
-                }
-            }
-        }
-    }
+    spawn_provider_oauth_account_state_refresh_after_update(
+        state.cloned_app(),
+        provider.clone(),
+        key_id.clone(),
+        request_proxy.clone(),
+    );
 
     Ok(Json(json!({
         "provider_type": provider_type,
         "expires_at": expires_at,
         "has_refresh_token": refresh_token.is_some(),
         "email": auth_config.get("email").cloned().unwrap_or(serde_json::Value::Null),
-        "account_state_recheck_attempted": account_state_recheck_attempted,
-        "account_state_recheck_error": account_state_recheck_error,
+        "account_state_recheck_attempted": false,
+        "account_state_recheck_error": serde_json::Value::Null,
     }))
     .into_response())
 }

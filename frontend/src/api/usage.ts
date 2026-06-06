@@ -4,6 +4,8 @@ import type { ActivityHeatmap } from '@/types/activity'
 import type { ImageProgress } from './requestTrace'
 
 const ACTIVITY_HEATMAP_CACHE_TTL_MS = 30 * 60 * 1000
+const USAGE_ANALYTICS_CACHE_TTL_MS = 30 * 1000
+const USAGE_ANALYTICS_REQUEST_TIMEOUT_MS = 120 * 1000
 
 export interface UsageRecord {
   id: string // UUID
@@ -12,6 +14,8 @@ export interface UsageRecord {
   provider_id?: string // UUID
   provider_name?: string
   model: string
+  reasoning_effort?: string | null
+  service_tier?: string | null
   input_tokens: number
   effective_input_tokens?: number
   output_tokens: number
@@ -24,6 +28,11 @@ export interface UsageRecord {
   response_time?: number
   created_at: string
   has_fallback?: boolean // 🆕 是否发生了 fallback
+  client_family?: string | null
+  client_ip?: string | null
+  user_agent?: string | null
+  request_path?: string | null
+  request_path_and_query?: string | null
 }
 
 export interface UsageStats {
@@ -64,7 +73,9 @@ export interface UsageByUser {
 }
 
 export interface UsageByProvider {
-  provider_id: string
+  provider_id?: string | null
+  provider_key?: string
+  provider_identity_source?: 'provider_id' | 'legacy_name'
   provider: string
   request_count: number
   total_tokens: number
@@ -100,14 +111,186 @@ export interface UsageFilters {
   user_id?: string // UUID
   provider_id?: string // UUID
   model?: string
+  search?: string
   start_date?: string
   end_date?: string
   preset?: string
   granularity?: 'hour' | 'day' | 'week' | 'month'
   timezone?: string
   tz_offset_minutes?: number
+  client_family?: string
   page?: number
   page_size?: number
+}
+
+export interface UsageRequestOptions {
+  skipCache?: boolean
+}
+
+type UsageListResponse = {
+  records?: unknown
+  pagination?: {
+    total?: unknown
+    limit?: unknown
+    offset?: unknown
+  }
+  total?: unknown
+  limit?: unknown
+  offset?: unknown
+}
+
+function assertPositiveInteger(value: number, field: string): number {
+  if (!Number.isInteger(value) || value < 1) {
+    throw new Error(`${field} must be a positive integer`)
+  }
+  return value
+}
+
+function assertNonNegativeInteger(value: number, field: string): number {
+  if (!Number.isInteger(value) || value < 0) {
+    throw new Error(`${field} must be a non-negative integer`)
+  }
+  return value
+}
+
+function assertNumber(value: unknown, field: string): number {
+  if (typeof value !== 'number' || Number.isNaN(value)) {
+    throw new Error(`Usage response is missing numeric ${field}`)
+  }
+  return value
+}
+
+function assertUsageRecords(value: unknown): UsageRecord[] {
+  if (!Array.isArray(value)) {
+    throw new Error('Usage response is missing records array')
+  }
+  return value as UsageRecord[]
+}
+
+function compactParams(params: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(params).filter(([, value]) => value !== undefined && value !== null && value !== '')
+  )
+}
+
+function offsetPaginationFromPage(filters?: Pick<UsageFilters, 'page' | 'page_size'>): {
+  page: number
+  pageSize: number | undefined
+  offset: number | undefined
+} {
+  const page = assertPositiveInteger(filters?.page ?? 1, 'page')
+  if (filters?.page_size === undefined) {
+    return { page, pageSize: undefined, offset: undefined }
+  }
+
+  const pageSize = assertPositiveInteger(filters.page_size, 'page_size')
+  return {
+    page,
+    pageSize,
+    offset: assertNonNegativeInteger((page - 1) * pageSize, 'offset'),
+  }
+}
+
+function normalizeUsageRecordPage(
+  payload: UsageListResponse,
+  requested: { page: number; pageSize?: number; offset?: number }
+): {
+  records: UsageRecord[]
+  total: number
+  page: number
+  page_size: number
+} {
+  const records = assertUsageRecords(payload.records)
+  const pagination = payload.pagination
+  const total = assertNumber(pagination?.total ?? payload.total, 'pagination.total')
+  const limit = assertPositiveInteger(
+    assertNumber(pagination?.limit ?? payload.limit, 'pagination.limit'),
+    'pagination.limit'
+  )
+  const offset = assertNonNegativeInteger(
+    assertNumber(pagination?.offset ?? payload.offset, 'pagination.offset'),
+    'pagination.offset'
+  )
+  const resolvedPage = requested.pageSize !== undefined
+    ? requested.page
+    : Math.floor(offset / limit) + 1
+
+  return {
+    records,
+    total,
+    page: resolvedPage,
+    page_size: limit,
+  }
+}
+
+function buildCurrentUserUsageParams(filters?: UsageFilters): {
+  params: Record<string, unknown>
+  pagination: { page: number; pageSize?: number; offset?: number }
+} {
+  if (filters?.user_id || filters?.provider_id || filters?.model || filters?.granularity) {
+    throw new Error('getUsageRecords only supports current-user usage filters; use admin usage APIs for user/model/provider filters')
+  }
+
+  const pagination = offsetPaginationFromPage(filters)
+  return {
+    pagination,
+    params: compactParams({
+      start_date: filters?.start_date,
+      end_date: filters?.end_date,
+      preset: filters?.preset,
+      timezone: filters?.timezone,
+      tz_offset_minutes: filters?.tz_offset_minutes,
+      search: filters?.search,
+      limit: pagination.pageSize,
+      offset: pagination.offset,
+    }),
+  }
+}
+
+function buildAdminUsageRecordParams(userId: string, filters?: UsageFilters): {
+  params: Record<string, unknown>
+} {
+  if (!userId.trim()) {
+    throw new Error('getUserUsage requires a non-empty user id')
+  }
+  if (filters?.provider_id || filters?.granularity) {
+    throw new Error('getUserUsage does not support provider_id or granularity filters')
+  }
+
+  const pagination = offsetPaginationFromPage(filters)
+  return {
+    params: compactParams({
+      user_id: userId,
+      start_date: filters?.start_date,
+      end_date: filters?.end_date,
+      preset: filters?.preset,
+      timezone: filters?.timezone,
+      tz_offset_minutes: filters?.tz_offset_minutes,
+      search: filters?.search,
+      model: filters?.model,
+      limit: pagination.pageSize,
+      offset: pagination.offset,
+    }),
+  }
+}
+
+function buildAdminUsageStatsParams(userId: string, filters?: UsageFilters): Record<string, unknown> {
+  if (!userId.trim()) {
+    throw new Error('getUserUsage requires a non-empty user id')
+  }
+  if (filters?.provider_id || filters?.granularity) {
+    throw new Error('getUserUsage stats does not support provider_id or granularity filters')
+  }
+
+  return compactParams({
+    user_id: userId,
+    start_date: filters?.start_date,
+    end_date: filters?.end_date,
+    preset: filters?.preset,
+    timezone: filters?.timezone,
+    tz_offset_minutes: filters?.tz_offset_minutes,
+    model: filters?.model,
+  })
 }
 
 function normalizeActivityHeatmapResponse(payload: unknown): ActivityHeatmap {
@@ -184,20 +367,24 @@ export const usageApi = {
     page: number
     page_size: number
   }> {
-    const response = await apiClient.get('/api/usage', { params: filters })
-    return response.data
+    const { params, pagination } = buildCurrentUserUsageParams(filters)
+    const response = await apiClient.get<UsageListResponse>('/api/users/me/usage', { params })
+    return normalizeUsageRecordPage(response.data, pagination)
   },
 
-  async getUsageStats(filters?: UsageFilters): Promise<UsageStats> {
+  async getUsageStats(filters?: UsageFilters, options?: UsageRequestOptions): Promise<UsageStats> {
     // 为统计数据添加30秒缓存
-    const cacheKey = `usage-stats-${JSON.stringify(filters || {})}`
+    const cacheKey = `usage-stats-${JSON.stringify(filters || {})}${options?.skipCache ? ':fresh' : ''}`
     return cachedRequest(
       cacheKey,
       async () => {
-        const response = await apiClient.get<UsageStats>('/api/admin/usage/stats', { params: filters })
+        const response = await apiClient.get<UsageStats>('/api/admin/usage/stats', {
+          params: filters,
+          timeout: USAGE_ANALYTICS_REQUEST_TIMEOUT_MS,
+        })
         return response.data
       },
-      30000 // 30秒缓存
+      options?.skipCache ? 0 : USAGE_ANALYTICS_CACHE_TTL_MS
     )
   },
 
@@ -208,52 +395,67 @@ export const usageApi = {
    */
   async getUsageAggregation<T = UsageByModel[] | UsageByUser[] | UsageByProvider[] | UsageByApiFormat[]>(
     groupBy: 'model' | 'user' | 'provider' | 'api_format',
-    filters?: UsageFilters & { limit?: number }
+    filters?: UsageFilters & { limit?: number },
+    options?: UsageRequestOptions
   ): Promise<T> {
-    const cacheKey = `usage-aggregation-${groupBy}-${JSON.stringify(filters || {})}`
+    const cacheKey = `usage-aggregation-${groupBy}-${JSON.stringify(filters || {})}${options?.skipCache ? ':fresh' : ''}`
     return cachedRequest(
       cacheKey,
       async () => {
         const response = await apiClient.get<T>('/api/admin/usage/aggregation/stats', {
-          params: { group_by: groupBy, ...filters }
+          params: { group_by: groupBy, ...filters },
+          timeout: USAGE_ANALYTICS_REQUEST_TIMEOUT_MS,
         })
         return response.data
       },
-      30000 // 30秒缓存
+      options?.skipCache ? 0 : USAGE_ANALYTICS_CACHE_TTL_MS
     )
   },
 
   // Shorthand methods using getUsageAggregation
-  async getUsageByModel(filters?: UsageFilters & { limit?: number }): Promise<UsageByModel[]> {
-    return this.getUsageAggregation<UsageByModel[]>('model', filters)
+  async getUsageByModel(
+    filters?: UsageFilters & { limit?: number },
+    options?: UsageRequestOptions
+  ): Promise<UsageByModel[]> {
+    return this.getUsageAggregation<UsageByModel[]>('model', filters, options)
   },
 
-  async getUsageByUser(filters?: UsageFilters & { limit?: number }): Promise<UsageByUser[]> {
-    return this.getUsageAggregation<UsageByUser[]>('user', filters)
+  async getUsageByUser(
+    filters?: UsageFilters & { limit?: number },
+    options?: UsageRequestOptions
+  ): Promise<UsageByUser[]> {
+    return this.getUsageAggregation<UsageByUser[]>('user', filters, options)
   },
 
-  async getUsageByProvider(filters?: UsageFilters & { limit?: number }): Promise<UsageByProvider[]> {
-    return this.getUsageAggregation<UsageByProvider[]>('provider', filters)
+  async getUsageByProvider(
+    filters?: UsageFilters & { limit?: number },
+    options?: UsageRequestOptions
+  ): Promise<UsageByProvider[]> {
+    return this.getUsageAggregation<UsageByProvider[]>('provider', filters, options)
   },
 
-  async getUsageByApiFormat(filters?: UsageFilters & { limit?: number }): Promise<UsageByApiFormat[]> {
-    return this.getUsageAggregation<UsageByApiFormat[]>('api_format', filters)
+  async getUsageByApiFormat(
+    filters?: UsageFilters & { limit?: number },
+    options?: UsageRequestOptions
+  ): Promise<UsageByApiFormat[]> {
+    return this.getUsageAggregation<UsageByApiFormat[]>('api_format', filters, options)
   },
 
   async getUserUsage(userId: string, filters?: UsageFilters): Promise<{
     records: UsageRecord[]
     stats: UsageStats
   }> {
-    const response = await apiClient.get(`/api/users/${userId}/usage`, { params: filters })
-    return response.data
-  },
+    const statsParams = buildAdminUsageStatsParams(userId, filters)
+    const { params: recordParams } = buildAdminUsageRecordParams(userId, filters)
+    const [statsResponse, recordsResponse] = await Promise.all([
+      apiClient.get<UsageStats>('/api/admin/usage/stats', { params: statsParams }),
+      apiClient.get<UsageListResponse>('/api/admin/usage/records', { params: recordParams }),
+    ])
 
-  async exportUsage(format: 'csv' | 'json', filters?: UsageFilters): Promise<Blob> {
-    const response = await apiClient.get('/api/usage/export', {
-      params: { ...filters, format },
-      responseType: 'blob'
-    })
-    return response.data
+    return {
+      records: assertUsageRecords(recordsResponse.data.records),
+      stats: statsResponse.data,
+    }
   },
 
   async getAllUsageRecords(params?: {
@@ -270,6 +472,7 @@ export const usageApi = {
     provider?: string
     api_format?: string  // API 格式筛选（如 openai:chat, claude:messages）
     status?: string // 'stream' | 'standard' | 'error'
+    hide_unknown?: boolean
     limit?: number
     offset?: number
   }): Promise<{
@@ -322,6 +525,8 @@ export const usageApi = {
       has_format_conversion?: boolean | null
       has_fallback?: boolean | null
       target_model?: string | null
+      reasoning_effort?: string | null
+      service_tier?: string | null
       image_progress?: ImageProgress | null
     }>
   }> {

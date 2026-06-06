@@ -24,6 +24,8 @@ INSERT INTO "usage" (
   input_tokens,
   output_tokens,
   total_tokens,
+  input_output_total_tokens,
+  input_context_tokens,
   cache_creation_input_tokens,
   cache_creation_input_tokens_5m,
   cache_creation_input_tokens_1h,
@@ -87,7 +89,28 @@ INSERT INTO "usage" (
   ),
   COALESCE($22, 0),
   COALESCE($23, 0),
-  COALESCE($24, COALESCE($22, 0) + COALESCE($23, 0)),
+  COALESCE(
+    $24,
+    COALESCE($22, 0)
+      + COALESCE($23, 0)
+      + COALESCE(
+        NULLIF(COALESCE($25, 0), 0),
+        COALESCE($26, 0) + COALESCE($27, 0),
+        0
+      )
+      + COALESCE($28, 0)
+  ),
+  COALESCE($22, 0) + COALESCE($23, 0),
+  COALESCE(
+    COALESCE($22, 0)
+      + COALESCE(
+        NULLIF(COALESCE($25, 0), 0),
+        COALESCE($26, 0) + COALESCE($27, 0),
+        0
+      )
+      + COALESCE($28, 0),
+    0
+  ),
   COALESCE($25, 0),
   COALESCE($26, 0),
   COALESCE($27, 0),
@@ -132,9 +155,9 @@ DO UPDATE SET
   provider_name = CASE WHEN "usage".billing_status = 'pending' THEN COALESCE(EXCLUDED.provider_name, "usage".provider_name) ELSE "usage".provider_name END,
   model = CASE WHEN "usage".billing_status = 'pending' THEN COALESCE(EXCLUDED.model, "usage".model) ELSE "usage".model END,
   target_model = CASE WHEN "usage".billing_status = 'pending' THEN COALESCE(EXCLUDED.target_model, "usage".target_model) ELSE "usage".target_model END,
-  provider_id = CASE WHEN "usage".billing_status = 'pending' THEN COALESCE(EXCLUDED.provider_id, "usage".provider_id) ELSE "usage".provider_id END,
-  provider_endpoint_id = CASE WHEN "usage".billing_status = 'pending' THEN COALESCE(EXCLUDED.provider_endpoint_id, "usage".provider_endpoint_id) ELSE "usage".provider_endpoint_id END,
-  provider_api_key_id = CASE WHEN "usage".billing_status = 'pending' THEN COALESCE(EXCLUDED.provider_api_key_id, "usage".provider_api_key_id) ELSE "usage".provider_api_key_id END,
+  provider_id = CASE WHEN "usage".billing_status = 'pending' OR ("usage".provider_id IS NULL AND ("usage".provider_endpoint_id IS NULL OR "usage".provider_endpoint_id = EXCLUDED.provider_endpoint_id) AND ("usage".provider_api_key_id IS NULL OR "usage".provider_api_key_id = EXCLUDED.provider_api_key_id)) THEN COALESCE(EXCLUDED.provider_id, "usage".provider_id) ELSE "usage".provider_id END,
+  provider_endpoint_id = CASE WHEN "usage".billing_status = 'pending' OR ("usage".provider_endpoint_id IS NULL AND ("usage".provider_id IS NULL OR "usage".provider_id = EXCLUDED.provider_id) AND ("usage".provider_api_key_id IS NULL OR "usage".provider_api_key_id = EXCLUDED.provider_api_key_id)) THEN COALESCE(EXCLUDED.provider_endpoint_id, "usage".provider_endpoint_id) ELSE "usage".provider_endpoint_id END,
+  provider_api_key_id = CASE WHEN "usage".billing_status = 'pending' OR ("usage".provider_api_key_id IS NULL AND ("usage".provider_id IS NULL OR "usage".provider_id = EXCLUDED.provider_id) AND ("usage".provider_endpoint_id IS NULL OR "usage".provider_endpoint_id = EXCLUDED.provider_endpoint_id)) THEN COALESCE(EXCLUDED.provider_api_key_id, "usage".provider_api_key_id) ELSE "usage".provider_api_key_id END,
   request_type = CASE WHEN "usage".billing_status = 'pending' THEN COALESCE(EXCLUDED.request_type, "usage".request_type) ELSE "usage".request_type END,
   api_format = CASE WHEN "usage".billing_status = 'pending' THEN COALESCE(EXCLUDED.api_format, "usage".api_format) ELSE "usage".api_format END,
   api_family = CASE WHEN "usage".billing_status = 'pending' THEN COALESCE(EXCLUDED.api_family, "usage".api_family) ELSE "usage".api_family END,
@@ -148,6 +171,8 @@ DO UPDATE SET
   input_tokens = CASE WHEN "usage".billing_status = 'pending' AND EXCLUDED.status IN ('completed', 'failed', 'cancelled') THEN GREATEST("usage".input_tokens, EXCLUDED.input_tokens) ELSE "usage".input_tokens END,
   output_tokens = CASE WHEN "usage".billing_status = 'pending' AND EXCLUDED.status IN ('completed', 'failed', 'cancelled') THEN GREATEST("usage".output_tokens, EXCLUDED.output_tokens) ELSE "usage".output_tokens END,
   total_tokens = CASE WHEN "usage".billing_status = 'pending' AND EXCLUDED.status IN ('completed', 'failed', 'cancelled') THEN GREATEST("usage".total_tokens, EXCLUDED.total_tokens) ELSE "usage".total_tokens END,
+  input_output_total_tokens = CASE WHEN "usage".billing_status = 'pending' AND EXCLUDED.status IN ('completed', 'failed', 'cancelled') THEN GREATEST("usage".input_output_total_tokens, EXCLUDED.input_output_total_tokens) ELSE "usage".input_output_total_tokens END,
+  input_context_tokens = CASE WHEN "usage".billing_status = 'pending' AND EXCLUDED.status IN ('completed', 'failed', 'cancelled') THEN GREATEST("usage".input_context_tokens, EXCLUDED.input_context_tokens) ELSE "usage".input_context_tokens END,
   cache_creation_input_tokens = CASE WHEN "usage".billing_status = 'pending' AND EXCLUDED.status IN ('completed', 'failed', 'cancelled') THEN GREATEST("usage".cache_creation_input_tokens, EXCLUDED.cache_creation_input_tokens) ELSE "usage".cache_creation_input_tokens END,
   cache_creation_input_tokens_5m = CASE WHEN "usage".billing_status = 'pending' AND EXCLUDED.status IN ('completed', 'failed', 'cancelled') THEN GREATEST("usage".cache_creation_input_tokens_5m, EXCLUDED.cache_creation_input_tokens_5m) ELSE "usage".cache_creation_input_tokens_5m END,
   cache_creation_input_tokens_1h = CASE WHEN "usage".billing_status = 'pending' AND EXCLUDED.status IN ('completed', 'failed', 'cancelled') THEN GREATEST("usage".cache_creation_input_tokens_1h, EXCLUDED.cache_creation_input_tokens_1h) ELSE "usage".cache_creation_input_tokens_1h END,
@@ -158,23 +183,35 @@ DO UPDATE SET
   total_cost_usd = CASE WHEN "usage".billing_status = 'pending' AND EXCLUDED.status IN ('completed', 'failed', 'cancelled') THEN GREATEST("usage".total_cost_usd, EXCLUDED.total_cost_usd) ELSE "usage".total_cost_usd END,
   actual_total_cost_usd = CASE WHEN "usage".billing_status = 'pending' AND EXCLUDED.status IN ('completed', 'failed', 'cancelled') THEN GREATEST("usage".actual_total_cost_usd, EXCLUDED.actual_total_cost_usd) ELSE "usage".actual_total_cost_usd END,
   status_code = CASE WHEN "usage".billing_status = 'pending' THEN CASE
+    WHEN "usage".status IN ('completed', 'failed', 'cancelled') AND EXCLUDED.status IN ('pending', 'streaming') THEN "usage".status_code
     WHEN "usage".status = 'streaming' AND EXCLUDED.status = 'pending' THEN "usage".status_code
     WHEN EXCLUDED.status IN ('pending', 'streaming', 'completed', 'cancelled') AND EXCLUDED.status_code IS NULL THEN NULL
     ELSE COALESCE(EXCLUDED.status_code, "usage".status_code)
   END ELSE "usage".status_code END,
   error_message = CASE WHEN "usage".billing_status = 'pending' THEN CASE
+    WHEN "usage".status IN ('completed', 'failed', 'cancelled') AND EXCLUDED.status IN ('pending', 'streaming') THEN "usage".error_message
     WHEN "usage".status = 'streaming' AND EXCLUDED.status = 'pending' THEN "usage".error_message
     WHEN EXCLUDED.status IN ('pending', 'streaming', 'completed', 'cancelled') THEN EXCLUDED.error_message
     ELSE COALESCE(EXCLUDED.error_message, "usage".error_message)
   END ELSE "usage".error_message END,
   error_category = CASE WHEN "usage".billing_status = 'pending' THEN CASE
+    WHEN "usage".status IN ('completed', 'failed', 'cancelled') AND EXCLUDED.status IN ('pending', 'streaming') THEN "usage".error_category
     WHEN "usage".status = 'streaming' AND EXCLUDED.status = 'pending' THEN "usage".error_category
     WHEN EXCLUDED.status IN ('pending', 'streaming', 'completed', 'cancelled') THEN EXCLUDED.error_category
     ELSE COALESCE(EXCLUDED.error_category, "usage".error_category)
   END ELSE "usage".error_category END,
-  response_time_ms = CASE WHEN "usage".billing_status = 'pending' THEN COALESCE(EXCLUDED.response_time_ms, "usage".response_time_ms) ELSE "usage".response_time_ms END,
-  first_byte_time_ms = CASE WHEN "usage".billing_status = 'pending' THEN COALESCE(EXCLUDED.first_byte_time_ms, "usage".first_byte_time_ms) ELSE "usage".first_byte_time_ms END,
+  response_time_ms = CASE WHEN "usage".billing_status = 'pending' THEN CASE
+    WHEN "usage".status IN ('completed', 'failed', 'cancelled') AND EXCLUDED.status IN ('pending', 'streaming') THEN "usage".response_time_ms
+    WHEN EXCLUDED.response_time_ms IS NULL OR EXCLUDED.response_time_ms = 0 THEN COALESCE("usage".response_time_ms, EXCLUDED.response_time_ms)
+    ELSE EXCLUDED.response_time_ms
+  END ELSE "usage".response_time_ms END,
+  first_byte_time_ms = CASE WHEN "usage".billing_status = 'pending' THEN CASE
+    WHEN "usage".status IN ('completed', 'failed', 'cancelled') AND EXCLUDED.status IN ('pending', 'streaming') THEN "usage".first_byte_time_ms
+    WHEN EXCLUDED.first_byte_time_ms IS NULL OR EXCLUDED.first_byte_time_ms = 0 THEN COALESCE("usage".first_byte_time_ms, EXCLUDED.first_byte_time_ms)
+    ELSE EXCLUDED.first_byte_time_ms
+  END ELSE "usage".first_byte_time_ms END,
   status = CASE WHEN "usage".billing_status = 'pending' THEN CASE
+    WHEN "usage".status IN ('completed', 'failed', 'cancelled') AND EXCLUDED.status IN ('pending', 'streaming') THEN "usage".status
     WHEN "usage".status = 'streaming' AND EXCLUDED.status = 'pending' THEN "usage".status
     ELSE EXCLUDED.status
   END ELSE "usage".status END,

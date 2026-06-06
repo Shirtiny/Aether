@@ -963,6 +963,8 @@ async fn gateway_handles_admin_stats_provider_performance_locally_with_trusted_a
     assert_eq!(payload["summary"]["p99_response_time_ms"], 1000);
     assert_eq!(payload["summary"]["response_time_sample_count"], 11);
     assert_eq!(payload["summary"]["slow_request_count"], 0);
+    assert_eq!(payload["usage_counter"]["status"], json!("idle"));
+    assert_eq!(payload["usage_counter"]["outbox_pending_rows"], json!(0));
 
     assert_eq!(payload["providers"].as_array().map(Vec::len), Some(2));
     assert_eq!(payload["providers"][0]["provider_id"], "provider-1");
@@ -1038,6 +1040,8 @@ async fn gateway_returns_empty_admin_stats_provider_performance_without_usage_re
     );
     assert_eq!(payload["providers"].as_array().map(Vec::len), Some(0));
     assert_eq!(payload["timeline"].as_array().map(Vec::len), Some(0));
+    assert_eq!(payload["usage_counter"]["status"], json!("idle"));
+    assert_eq!(payload["usage_counter"]["outbox_pending_rows"], json!(0));
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();

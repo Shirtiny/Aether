@@ -9,6 +9,7 @@ pub enum FormatFamily {
     Gemini,
     Jina,
     Doubao,
+    Aliyun,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -30,6 +31,7 @@ pub enum FormatId {
     JinaEmbedding,
     JinaRerank,
     DoubaoEmbedding,
+    AliyunMultimodalEmbedding,
 }
 
 impl FormatId {
@@ -52,6 +54,7 @@ impl FormatId {
             Self::GeminiGenerateContent | Self::GeminiEmbedding => FormatFamily::Gemini,
             Self::JinaEmbedding | Self::JinaRerank => FormatFamily::Jina,
             Self::DoubaoEmbedding => FormatFamily::Doubao,
+            Self::AliyunMultimodalEmbedding => FormatFamily::Aliyun,
         }
     }
 
@@ -75,6 +78,7 @@ impl FormatId {
             Self::JinaEmbedding => "jina:embedding",
             Self::JinaRerank => "jina:rerank",
             Self::DoubaoEmbedding => "doubao:embedding",
+            Self::AliyunMultimodalEmbedding => "aliyun:multimodal_embedding",
         }
     }
 }
@@ -103,13 +107,22 @@ impl FromStr for FormatId {
             "jina:embedding" | "/jina/v1/embeddings" => Ok(Self::JinaEmbedding),
             "jina:rerank" | "/jina/v1/rerank" => Ok(Self::JinaRerank),
             "doubao:embedding" => Ok(Self::DoubaoEmbedding),
+            "aliyun:multimodal_embedding"
+            | "aliyun_embedding"
+            | "aliyun_multimodal_embedding"
+            | "dashscope:multimodal_embedding"
+            | "dashscope_embedding"
+            | "dashscope_multimodal_embedding" => Ok(Self::AliyunMultimodalEmbedding),
             _ => Err(()),
         }
     }
 }
 
 pub fn normalize_api_format_alias(value: &str) -> String {
-    value.trim().to_ascii_lowercase()
+    let normalized = value.trim().to_ascii_lowercase();
+    FormatId::parse(&normalized)
+        .map(|format| format.as_str().to_string())
+        .unwrap_or(normalized)
 }
 
 pub fn api_format_alias_matches(left: &str, right: &str) -> bool {
@@ -117,7 +130,13 @@ pub fn api_format_alias_matches(left: &str, right: &str) -> bool {
 }
 
 pub fn api_format_storage_aliases(value: &str) -> Vec<String> {
-    vec![normalize_api_format_alias(value)]
+    match FormatId::parse(value).map(FormatId::canonical) {
+        Some(FormatId::AliyunMultimodalEmbedding) => vec![
+            "aliyun:multimodal_embedding".to_string(),
+            "dashscope:multimodal_embedding".to_string(),
+        ],
+        _ => vec![normalize_api_format_alias(value)],
+    }
 }
 
 pub fn is_openai_responses_format(value: &str) -> bool {
@@ -185,6 +204,18 @@ mod tests {
             FormatId::parse("doubao:embedding"),
             Some(FormatId::DoubaoEmbedding)
         );
+        assert_eq!(
+            FormatId::parse("aliyun:multimodal_embedding").map(|format| format.to_string()),
+            Some("aliyun:multimodal_embedding".to_string())
+        );
+        assert_eq!(
+            FormatId::parse("dashscope:multimodal_embedding").map(|format| format.to_string()),
+            Some("aliyun:multimodal_embedding".to_string())
+        );
+        assert_eq!(
+            FormatId::parse("dashscope_embedding").map(|format| format.to_string()),
+            Some("aliyun:multimodal_embedding".to_string())
+        );
         assert_eq!(FormatId::OpenAiEmbedding.to_string(), "openai:embedding");
     }
 
@@ -197,6 +228,7 @@ mod tests {
             (FormatId::GeminiEmbedding, FormatFamily::Gemini),
             (FormatId::JinaEmbedding, FormatFamily::Jina),
             (FormatId::DoubaoEmbedding, FormatFamily::Doubao),
+            (FormatId::AliyunMultimodalEmbedding, FormatFamily::Aliyun),
         ] {
             assert_eq!(format.family(), family);
             assert_eq!(format.profile(), FormatProfile::Default);
@@ -275,6 +307,10 @@ mod tests {
             "gemini:generate_content"
         ));
         assert!(!api_format_alias_matches("openai:cli", "openai:responses"));
+        assert_eq!(
+            normalize_api_format_alias("openai:compact"),
+            "openai:compact"
+        );
     }
 
     #[test]
@@ -310,6 +346,13 @@ mod tests {
         assert_eq!(
             api_format_storage_aliases("doubao:embedding"),
             vec!["doubao:embedding".to_string()]
+        );
+        assert_eq!(
+            api_format_storage_aliases("dashscope:multimodal_embedding"),
+            vec![
+                "aliyun:multimodal_embedding".to_string(),
+                "dashscope:multimodal_embedding".to_string(),
+            ]
         );
     }
 

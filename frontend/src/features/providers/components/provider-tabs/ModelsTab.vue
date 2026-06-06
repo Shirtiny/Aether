@@ -232,12 +232,16 @@
     :model-mapping-available="testModelMappingAvailable"
     :model-mapping-options="testModelMappingOptions"
     :selected-model-mapping="selectedTestMappedModelName"
+    :key-options="testKeyOptions"
+    :selected-key-ids="selectedTestKeyIds"
+    :key-options-loading="loadingModelTestKeys"
     :start-disabled="!selectedTestEndpoint || !!testRequestHeadersError || !!testRequestBodyError"
     @close="handleTestDialogClose"
     @back="handleTestDialogBack"
     @start="handleStartPendingTest"
     @select-endpoint="handleSelectTestEndpoint"
     @select-model-mapping="handleSelectModelMapping"
+    @update:selected-key-ids="handleSelectTestKeyIds"
     @update:request-headers-draft="testRequestHeadersDraft = $event"
     @update:request-body-draft="testRequestBodyDraft = $event"
   />
@@ -257,7 +261,7 @@ import {
   type Model,
   type ProviderEndpoint,
 } from '@/api/endpoints'
-import { type EndpointAPIKey } from '@/api/endpoints/keys'
+import { getProviderKeys, type EndpointAPIKey } from '@/api/endpoints/keys'
 import { updateModel } from '@/api/endpoints/models'
 import { parseApiError } from '@/utils/errorParser'
 import { formatApiFormat } from '@/api/endpoints/types/api-format'
@@ -266,11 +270,14 @@ import ModelTestDialog from './ModelTestDialog.vue'
 import {
   buildDefaultModelTestRequestHeaders,
   buildDefaultModelTestRequestBody,
+  isModelTestableApiFormat,
   isModelTestableEndpoint,
   listModelTestMappedModelOptions,
+  modelTestKeySupportsEndpoint,
   normalizeModelTestMappedModelSelection,
   parseModelTestRequestHeadersDraft,
   parseModelTestRequestBodyDraft,
+  selectPreferredModelTestEndpoint,
   syncModelTestRequestBodyDraft,
 } from './model-test-request'
 
@@ -305,9 +312,21 @@ const testRequestHeadersResetValue = ref('')
 const testRequestBodyDraft = ref('')
 const testRequestBodyResetValue = ref('')
 const selectedTestMappedModelName = ref<string | null>(null)
+const selectedTestKeyIds = ref<string[]>([])
+const modelTestProviderKeys = ref<EndpointAPIKey[]>([])
+const modelTestKeysLoadedProviderId = ref<string | null>(null)
+const loadingModelTestKeys = ref(false)
 const isPoolManagedProvider = computed(() => Boolean(props.provider.pool_advanced))
 const activeEndpoints = computed(() => (props.endpoints ?? [])
-  .filter(endpoint => isModelTestableEndpoint(endpoint, props.providerKeys ?? [])))
+  .filter(endpoint => {
+    if (typeof endpoint.active_keys === 'number') {
+      return endpoint.is_active !== false
+        && isModelTestableApiFormat(endpoint.api_format)
+        && (endpoint.active_keys > 0
+          || isModelTestableEndpoint(endpoint, props.providerKeys ?? [], props.provider.provider_type))
+    }
+    return isModelTestableEndpoint(endpoint, props.providerKeys ?? [], props.provider.provider_type)
+  }))
 const parsedTestRequestHeaders = computed(() => parseModelTestRequestHeadersDraft(testRequestHeadersDraft.value))
 const testRequestHeadersError = computed(() => parsedTestRequestHeaders.value.error)
 const parsedTestRequestBody = computed(() => parseModelTestRequestBodyDraft(testRequestBodyDraft.value))
@@ -326,6 +345,32 @@ const mappedTestModelName = computed(() => {
     : null
 })
 const testModelMappingAvailable = computed(() => testModelMappingOptions.value.length > 0)
+const providerKeysForModelTest = computed(() => (
+  modelTestKeysLoadedProviderId.value === props.provider.id
+    ? modelTestProviderKeys.value
+    : props.providerKeys ?? []
+))
+const testKeyOptions = computed(() => {
+  const endpoint = selectedTestEndpoint.value
+  if (!endpoint) return []
+
+  const seen = new Set<string>()
+  return [...providerKeysForModelTest.value]
+    .filter((key) => {
+      if (seen.has(key.id)) return false
+      seen.add(key.id)
+      return modelTestKeySupportsEndpoint(key, endpoint, props.provider.provider_type)
+    })
+    .sort((left, right) => {
+      const priority = left.internal_priority - right.internal_priority
+      if (priority !== 0) return priority
+      return formatTestKeyOptionLabel(left).localeCompare(formatTestKeyOptionLabel(right))
+    })
+    .map(key => ({
+      value: key.id,
+      label: formatTestKeyOptionLabel(key),
+    }))
+})
 const effectiveTestRequestModelName = computed(() => (
   mappedTestModelName.value || pendingRequestedModelName.value
 ))
@@ -496,6 +541,7 @@ function handleTestDialogClose() {
   pendingTestModel.value = null
   selectedTestEndpoint.value = null
   selectedTestMappedModelName.value = null
+  selectedTestKeyIds.value = []
   testRequestHeadersDraft.value = ''
   testRequestHeadersResetValue.value = ''
   testRequestBodyDraft.value = ''
@@ -514,6 +560,7 @@ function handleSelectTestEndpoint(endpointId: string) {
   selectedTestEndpoint.value = endpoint
   syncSelectedTestModelMapping()
   resetTestRequestBodyForSelectedEndpoint()
+  pruneSelectedTestKeyIds()
 }
 
 function handleSelectModelMapping(modelName: string) {
@@ -522,6 +569,10 @@ function handleSelectModelMapping(modelName: string) {
     modelName,
   )
   syncTestRequestBodyModel()
+}
+
+function handleSelectTestKeyIds(ids: string[]) {
+  selectedTestKeyIds.value = normalizeSelectedTestKeyIds(ids)
 }
 
 async function handleStartPendingTest() {
@@ -547,6 +598,7 @@ async function handleStartPendingTest() {
   }
 
   selectedTestEndpoint.value = endpoint
+  pruneSelectedTestKeyIds()
   const model = pendingTestModel.value
   const modelName = model.global_model_name || model.provider_model_name
   const endpointPrefix = `[${formatApiFormat(endpoint.api_format)}] `
@@ -557,6 +609,7 @@ async function handleStartPendingTest() {
     apiFormat: endpoint.api_format,
     endpointId: endpoint.id,
     endpointBaseUrl: endpoint.base_url,
+    apiKeyIds: selectedTestKeyIds.value,
     applyModelMapping: Boolean(mappedTestModelName.value),
     mappedModelName: mappedTestModelName.value ?? undefined,
     requestHeaders,
@@ -578,18 +631,63 @@ async function testModelConnection(model: Model) {
   }
 
   pendingTestModel.value = model
-  selectedTestEndpoint.value = activeEndpoints.value[0] ?? null
+  selectedTestEndpoint.value = selectPreferredModelTestEndpoint(model, activeEndpoints.value)
   const requestedModelName = getModelTestRequestedModelName(model)
   selectedTestMappedModelName.value = null
+  selectedTestKeyIds.value = []
   testRequestHeadersResetValue.value = buildDefaultModelTestRequestHeaders()
   testRequestHeadersDraft.value = testRequestHeadersResetValue.value
   testRequestBodyResetValue.value = buildDefaultModelTestRequestBody(
     requestedModelName,
     selectedTestEndpoint.value?.api_format,
+    model,
   )
   testRequestBodyDraft.value = testRequestBodyResetValue.value
   modelTest.testResult.value = null
   modelTest.dialogOpen.value = true
+  void ensureModelTestKeysLoaded()
+}
+
+function normalizeSelectedTestKeyIds(ids: string[]): string[] {
+  const allowed = new Set(testKeyOptions.value.map(option => option.value))
+  const selected = ids
+    .map(id => id.trim())
+    .filter(id => id && allowed.has(id))
+  return [...new Set(selected)]
+}
+
+function pruneSelectedTestKeyIds() {
+  if (selectedTestKeyIds.value.length === 0) return
+  selectedTestKeyIds.value = normalizeSelectedTestKeyIds(selectedTestKeyIds.value)
+}
+
+async function ensureModelTestKeysLoaded() {
+  if (modelTestKeysLoadedProviderId.value === props.provider.id || loadingModelTestKeys.value) {
+    return
+  }
+
+  loadingModelTestKeys.value = true
+  try {
+    modelTestProviderKeys.value = await getProviderKeys(props.provider.id)
+    modelTestKeysLoadedProviderId.value = props.provider.id
+    pruneSelectedTestKeyIds()
+  } catch (err: unknown) {
+    showError(parseApiError(err, '加载测试 Key 失败'), '错误')
+  } finally {
+    loadingModelTestKeys.value = false
+  }
+}
+
+function formatTestKeyOptionLabel(key: EndpointAPIKey): string {
+  const name = key.name?.trim()
+  const masked = key.api_key_masked?.trim()
+  const authType = key.auth_type?.trim()
+  const primary = name || masked || key.id
+  const suffix = [
+    masked && masked !== primary ? masked : '',
+    authType || '',
+  ].filter(Boolean)
+  return suffix.length > 0 ? `${primary} · ${suffix.join(' · ')}` : primary
 }
 
 function getModelTestRequestedModelName(model: Model | null): string {
@@ -611,7 +709,11 @@ function syncTestRequestBodyModel() {
   if (!modelName) return
 
   const resetDraft = testRequestBodyResetValue.value
-    || buildDefaultModelTestRequestBody(modelName, selectedTestEndpoint.value?.api_format)
+    || buildDefaultModelTestRequestBody(
+      modelName,
+      selectedTestEndpoint.value?.api_format,
+      pendingTestModel.value,
+    )
   const next = syncModelTestRequestBodyDraft(
     testRequestBodyDraft.value,
     testRequestBodyResetValue.value,
@@ -629,6 +731,7 @@ function resetTestRequestBodyForSelectedEndpoint() {
   const nextResetValue = buildDefaultModelTestRequestBody(
     modelName,
     selectedTestEndpoint.value?.api_format,
+    pendingTestModel.value,
   )
   const next = syncModelTestRequestBodyDraft(
     testRequestBodyDraft.value,
@@ -643,6 +746,17 @@ function resetTestRequestBodyForSelectedEndpoint() {
 watch(
   [effectiveTestRequestModelName, () => selectedTestEndpoint.value?.api_format],
   () => syncTestRequestBodyModel(),
+)
+
+watch(testKeyOptions, () => pruneSelectedTestKeyIds())
+
+watch(
+  () => props.provider.id,
+  () => {
+    modelTestProviderKeys.value = []
+    modelTestKeysLoadedProviderId.value = null
+    selectedTestKeyIds.value = []
+  },
 )
 
 // 暴露给父组件

@@ -23,7 +23,9 @@
         <div>API 端点</div>
         <div>推理程度</div>
         <div>映射参数</div>
-        <div class="md:text-right">状态</div>
+        <div class="md:text-right">
+          状态
+        </div>
       </div>
       <div class="divide-y">
         <div

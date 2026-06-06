@@ -8,12 +8,14 @@ use crate::formats::openai::chat::stream::{
     OpenAIChatClientEmitter, OpenAIChatProviderState, OpenAIResponsesClientEmitter,
     OpenAIResponsesProviderState,
 };
+use crate::formats::openai::image::stream::OpenAiImageStreamTerminalState;
 use crate::formats::shared::error_body::{
     build_core_error_body_for_client_format, LocalCoreSyncErrorKind,
 };
 use crate::formats::shared::sse::encode_json_sse;
 use crate::formats::shared::stream_core::common::{
-    decode_json_data_line, CanonicalStreamEvent, CanonicalStreamFrame, CanonicalUsage,
+    decode_json_data_line, openai_stream_terminal_error_body, openai_stream_terminal_error_message,
+    CanonicalStreamEvent, CanonicalStreamFrame, CanonicalUsage,
 };
 use crate::formats::shared::AiSurfaceFinalizeError;
 
@@ -97,7 +99,7 @@ impl StreamingStandardFormatMatrix {
 
 #[derive(Default)]
 pub struct StreamingStandardTerminalObserver {
-    provider: Option<ProviderStreamParser>,
+    provider: Option<TerminalStreamParser>,
     latest_summary: Option<ExecutionStreamTerminalSummary>,
 }
 
@@ -111,8 +113,17 @@ impl StreamingStandardTerminalObserver {
         let Some(provider) = self.provider.as_mut() else {
             return Ok(());
         };
-        let frames = provider.push_line(report_context, line)?;
-        self.observe_frames(frames);
+        match provider {
+            TerminalStreamParser::Standard(provider) => {
+                let frames = provider.push_line(report_context, line)?;
+                self.observe_frames(frames);
+            }
+            TerminalStreamParser::OpenAIImage(provider) => {
+                if let Some(summary) = provider.push_line(report_context, line)? {
+                    self.latest_summary = Some(summary);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -124,8 +135,17 @@ impl StreamingStandardTerminalObserver {
         let Some(provider) = self.provider.as_mut() else {
             return Ok(self.latest_summary.clone());
         };
-        let frames = provider.finish(report_context)?;
-        self.observe_frames(frames);
+        match provider {
+            TerminalStreamParser::Standard(provider) => {
+                let frames = provider.finish(report_context)?;
+                self.observe_frames(frames);
+            }
+            TerminalStreamParser::OpenAIImage(provider) => {
+                if let Some(summary) = provider.finish(report_context)? {
+                    self.latest_summary = Some(summary);
+                }
+            }
+        }
         Ok(self.latest_summary.clone())
     }
 
@@ -153,7 +173,7 @@ impl StreamingStandardTerminalObserver {
             return;
         }
         let provider_api_format = provider_api_format_for_context(report_context);
-        self.provider = ProviderStreamParser::for_api_format(provider_api_format.as_str());
+        self.provider = TerminalStreamParser::for_api_format(provider_api_format.as_str());
     }
 
     fn observe_frames(&mut self, frames: Vec<CanonicalStreamFrame>) {
@@ -178,6 +198,14 @@ impl StreamingStandardTerminalObserver {
             summary.model = Some(model);
         }
         match event {
+            CanonicalStreamEvent::UnknownEvent(payload)
+                if openai_stream_terminal_error_body(&payload).is_some() =>
+            {
+                summary.unknown_event_count = summary.unknown_event_count.saturating_add(1);
+                summary.observed_finish = true;
+                summary.finish_reason = Some("error".to_string());
+                summary.parser_error = openai_stream_terminal_error_message(&payload);
+            }
             CanonicalStreamEvent::UnknownEvent(_) => {
                 summary.unknown_event_count = summary.unknown_event_count.saturating_add(1);
             }
@@ -191,6 +219,23 @@ impl StreamingStandardTerminalObserver {
             }
             _ => {}
         }
+    }
+}
+
+enum TerminalStreamParser {
+    Standard(ProviderStreamParser),
+    OpenAIImage(OpenAiImageStreamTerminalState),
+}
+
+impl TerminalStreamParser {
+    fn for_api_format(provider_api_format: &str) -> Option<Self> {
+        if provider_api_format
+            .trim()
+            .eq_ignore_ascii_case("openai:image")
+        {
+            return Some(Self::OpenAIImage(OpenAiImageStreamTerminalState::default()));
+        }
+        ProviderStreamParser::for_api_format(provider_api_format).map(Self::Standard)
     }
 }
 
@@ -215,7 +260,8 @@ impl ProviderStreamParser {
             | FormatId::GeminiEmbedding
             | FormatId::JinaEmbedding
             | FormatId::JinaRerank
-            | FormatId::DoubaoEmbedding => return None,
+            | FormatId::DoubaoEmbedding
+            | FormatId::AliyunMultimodalEmbedding => return None,
         })
     }
 
@@ -305,7 +351,8 @@ impl ClientStreamEmitter {
             | FormatId::GeminiEmbedding
             | FormatId::JinaEmbedding
             | FormatId::JinaRerank
-            | FormatId::DoubaoEmbedding => return None,
+            | FormatId::DoubaoEmbedding
+            | FormatId::AliyunMultimodalEmbedding => return None,
         })
     }
 
@@ -369,12 +416,14 @@ fn parse_provider_error(
         | FormatId::GeminiEmbedding
         | FormatId::JinaEmbedding
         | FormatId::JinaRerank
-        | FormatId::DoubaoEmbedding => None,
+        | FormatId::DoubaoEmbedding
+        | FormatId::AliyunMultimodalEmbedding => None,
     }
 }
 
 fn parse_openai_error(payload: &Value) -> Option<(String, Option<String>, LocalCoreSyncErrorKind)> {
-    let error = payload.get("error")?.as_object()?;
+    let error_body = openai_stream_terminal_error_body(payload)?;
+    let error = error_body.get("error")?.as_object()?;
     let message = error.get("message").and_then(Value::as_str)?.to_string();
     let code = error
         .get("code")
@@ -525,6 +574,83 @@ mod tests {
                 .expect("finish should succeed")
                 .is_empty());
         }
+    }
+
+    #[test]
+    fn transforms_openai_responses_text_snapshot_deltas_to_openai_chat_without_duplicates() {
+        let report_context = report_context("openai:responses", "openai:chat");
+        let mut matrix = StreamingStandardFormatMatrix::default();
+        let mut output = Vec::new();
+
+        for line in [
+            data_line(json!({
+                "type": "response.output_text.delta",
+                "response_id": "resp_snapshot_delta",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": {
+                    "text": "Hello",
+                }
+            })),
+            data_line(json!({
+                "type": "response.output_text.delta",
+                "response_id": "resp_snapshot_delta",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": {
+                    "text": "Hello world",
+                }
+            })),
+            data_line(json!({
+                "type": "response.output_text.done",
+                "response_id": "resp_snapshot_delta",
+                "output_index": 0,
+                "content_index": 0,
+                "text": "Hello world",
+            })),
+            data_line(json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_snapshot_delta",
+                    "object": "response",
+                    "model": "gpt-5.4",
+                    "status": "completed",
+                    "output": [{
+                        "type": "message",
+                        "id": "msg_snapshot_delta",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [{
+                            "type": "output_text",
+                            "text": "Hello world",
+                            "annotations": [],
+                        }]
+                    }],
+                }
+            })),
+        ] {
+            output.extend(
+                matrix
+                    .transform_line(&report_context, line)
+                    .expect("responses stream line should convert"),
+            );
+        }
+
+        let sse = String::from_utf8(output).expect("sse should be utf8");
+        let content = sse
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|payload| serde_json::from_str::<Value>(payload).ok())
+            .filter_map(|value| {
+                value
+                    .pointer("/choices/0/delta/content")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            })
+            .collect::<String>();
+
+        assert_eq!(content, "Hello world");
+        assert!(!sse.contains("HelloHello"));
     }
 
     #[test]
@@ -935,5 +1061,122 @@ mod tests {
         assert_eq!(summary.model.as_deref(), Some("gpt-5.4"));
         assert_eq!(summary.unknown_event_count, 1);
         assert!(!summary.observed_finish);
+    }
+
+    #[test]
+    fn terminal_observer_marks_openai_responses_failed_event_as_terminal_error() {
+        let mut report_context = report_context("openai:chat", "openai:responses");
+        report_context["provider_stream_event_api_format"] = json!("openai:responses");
+        let mut observer = StreamingStandardTerminalObserver::default();
+
+        observer
+            .push_line(
+                &report_context,
+                data_line(json!({
+                    "type": "response.failed",
+                    "response": {
+                        "id": "resp_failed_123",
+                        "model": "gpt-5.4",
+                        "status": "failed",
+                        "error": {
+                            "message": "policy failure",
+                            "type": "invalid_request_error",
+                            "code": "cyber_policy"
+                        }
+                    }
+                })),
+            )
+            .expect("failed event should be observed");
+
+        let summary = observer
+            .latest_summary()
+            .cloned()
+            .expect("summary should exist");
+        assert!(summary.observed_finish);
+        assert_eq!(summary.finish_reason.as_deref(), Some("error"));
+        assert_eq!(summary.parser_error.as_deref(), Some("policy failure"));
+        assert_eq!(summary.unknown_event_count, 1);
+    }
+
+    #[test]
+    fn terminal_observer_tracks_openai_image_stream_usage() {
+        let mut report_context = report_context("openai:image", "openai:chat");
+        report_context["image_request"] = json!({
+            "size": "1024x1024",
+            "quality": "medium",
+            "output_format": "png",
+        });
+        let mut observer = StreamingStandardTerminalObserver::default();
+
+        observer
+            .push_line(
+                &report_context,
+                data_line(json!({
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": {
+                        "id": "ig_123",
+                        "type": "image_generation_call",
+                        "result": "aGVsbG8=",
+                    },
+                })),
+            )
+            .expect("image output item should parse");
+        observer
+            .push_line(&report_context, b"\n".to_vec())
+            .expect("image output event should flush");
+        observer
+            .push_line(
+                &report_context,
+                data_line(json!({
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_image_123",
+                        "model": "gpt-image-2",
+                        "output": [],
+                        "tool_usage": {
+                            "image_gen": {
+                                "input_tokens": 40,
+                                "output_tokens": 60,
+                                "total_tokens": 100,
+                            },
+                        },
+                    },
+                })),
+            )
+            .expect("image completed should parse");
+        observer
+            .push_line(&report_context, b"\n".to_vec())
+            .expect("image completed event should flush");
+
+        let summary = observer
+            .finish(&report_context)
+            .expect("image summary should finish")
+            .expect("summary should exist");
+        let usage = summary
+            .standardized_usage
+            .expect("standardized usage should exist");
+
+        assert_eq!(summary.response_id.as_deref(), Some("resp_image_123"));
+        assert_eq!(summary.model.as_deref(), Some("gpt-image-2"));
+        assert_eq!(summary.finish_reason.as_deref(), Some("stop"));
+        assert!(summary.observed_finish);
+        assert_eq!(usage.input_tokens, 40);
+        assert_eq!(usage.output_tokens, 60);
+        assert_eq!(usage.request_count, 1);
+        assert_eq!(usage.dimensions.get("image_count"), Some(&json!(1)));
+        assert_eq!(usage.dimensions.get("total_tokens"), Some(&json!(100)));
+        assert_eq!(
+            usage.dimensions.get("image_size"),
+            Some(&json!("1024x1024"))
+        );
+        assert_eq!(
+            usage.dimensions.get("image_output_format"),
+            Some(&json!("png"))
+        );
+        assert_eq!(
+            usage.dimensions.get("image_quality"),
+            Some(&json!("medium"))
+        );
     }
 }

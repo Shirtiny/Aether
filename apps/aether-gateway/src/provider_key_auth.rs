@@ -4,6 +4,7 @@ use aether_data_contracts::repository::provider_catalog::{
 use aether_provider_transport::provider_types::{
     fixed_provider_key_inherits_api_formats, provider_type_is_fixed,
 };
+use serde_json::{Map, Value};
 use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +50,7 @@ pub(crate) struct ProviderKeyAuthSemantics {
     credential_kind: ProviderKeyCredentialKind,
     runtime_auth_kind: ProviderKeyRuntimeAuthKind,
     oauth_managed: bool,
+    can_refresh_oauth: bool,
 }
 
 impl ProviderKeyAuthSemantics {
@@ -65,7 +67,7 @@ impl ProviderKeyAuthSemantics {
     }
 
     pub(crate) const fn can_refresh_oauth(self) -> bool {
-        self.oauth_managed
+        self.can_refresh_oauth
     }
 
     pub(crate) const fn can_export_oauth(self) -> bool {
@@ -79,6 +81,18 @@ impl ProviderKeyAuthSemantics {
     pub(crate) const fn can_show_oauth_metadata(self) -> bool {
         self.oauth_managed
     }
+}
+
+pub(crate) fn provider_key_can_refresh_oauth(
+    auth_semantics: ProviderKeyAuthSemantics,
+    auth_config: Option<&Map<String, Value>>,
+) -> bool {
+    auth_semantics.can_refresh_oauth()
+        && auth_config
+            .and_then(|config| config.get("refresh_token"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
 }
 
 fn normalized_auth_type(key: &StoredProviderCatalogKey) -> String {
@@ -102,8 +116,18 @@ fn key_has_auth_type_overrides(key: &StoredProviderCatalogKey) -> bool {
 fn provider_uses_bearer_oauth_runtime(provider_type: &str) -> bool {
     matches!(
         provider_type.trim().to_ascii_lowercase().as_str(),
-        "claude_code" | "codex" | "chatgpt_web" | "gemini_cli" | "antigravity" | "kiro"
+        "claude_code"
+            | "codex"
+            | "chatgpt_web"
+            | "gemini_cli"
+            | "antigravity"
+            | "kiro"
+            | "windsurf"
     )
+}
+
+fn provider_uses_grok_session_runtime(provider_type: &str) -> bool {
+    provider_type.trim().eq_ignore_ascii_case("grok")
 }
 
 fn provider_key_is_legacy_kiro_oauth_session(
@@ -122,7 +146,8 @@ pub(crate) fn provider_key_auth_semantics(
 ) -> ProviderKeyAuthSemantics {
     let auth_type = normalized_auth_type(key);
     let oauth_managed = auth_type == "oauth"
-        || provider_key_is_legacy_kiro_oauth_session(key, provider_type, &auth_type);
+        || provider_key_is_legacy_kiro_oauth_session(key, provider_type, &auth_type)
+        || (provider_uses_grok_session_runtime(provider_type) && key_has_auth_config(key));
     let credential_kind = if oauth_managed {
         ProviderKeyCredentialKind::OAuthSession
     } else if matches!(auth_type.as_str(), "service_account" | "vertex_ai") {
@@ -135,6 +160,8 @@ pub(crate) fn provider_key_auth_semantics(
         ProviderKeyCredentialKind::OAuthSession => {
             if provider_uses_bearer_oauth_runtime(provider_type) {
                 ProviderKeyRuntimeAuthKind::Bearer
+            } else if provider_uses_grok_session_runtime(provider_type) {
+                ProviderKeyRuntimeAuthKind::Unknown
             } else {
                 ProviderKeyRuntimeAuthKind::Unknown
             }
@@ -153,10 +180,12 @@ pub(crate) fn provider_key_auth_semantics(
         }
     };
 
+    let provider_type_normalized = provider_type.trim().to_ascii_lowercase();
     ProviderKeyAuthSemantics {
         credential_kind,
         runtime_auth_kind,
         oauth_managed,
+        can_refresh_oauth: oauth_managed && provider_type_normalized != "windsurf",
     }
 }
 
@@ -226,7 +255,7 @@ pub(crate) fn provider_key_effective_api_formats(
 #[cfg(test)]
 mod tests {
     use super::{
-        provider_active_api_formats, provider_key_auth_semantics,
+        provider_active_api_formats, provider_key_auth_semantics, provider_key_can_refresh_oauth,
         provider_key_configured_api_formats, provider_key_effective_api_formats,
         provider_key_inherits_provider_api_formats, ProviderKeyCredentialKind,
         ProviderKeyRuntimeAuthKind,
@@ -291,6 +320,61 @@ mod tests {
             semantics.runtime_auth_kind(),
             ProviderKeyRuntimeAuthKind::Bearer
         );
+    }
+
+    #[test]
+    fn recognizes_grok_oauth_session_as_managed_without_bearer_runtime() {
+        let mut key = sample_key("oauth");
+        key.encrypted_auth_config = Some(r#"{"sso_token":"abc"}"#.to_string());
+
+        let semantics = provider_key_auth_semantics(&key, "grok");
+        assert!(semantics.oauth_managed());
+        assert_eq!(
+            semantics.credential_kind(),
+            ProviderKeyCredentialKind::OAuthSession
+        );
+        assert_eq!(
+            semantics.runtime_auth_kind(),
+            ProviderKeyRuntimeAuthKind::Unknown
+        );
+    }
+
+    #[test]
+    fn recognizes_windsurf_oauth_as_bearer_runtime() {
+        let semantics = provider_key_auth_semantics(&sample_key("oauth"), "windsurf");
+
+        assert!(semantics.oauth_managed());
+        assert!(!semantics.can_refresh_oauth());
+        assert_eq!(
+            semantics.credential_kind(),
+            ProviderKeyCredentialKind::OAuthSession
+        );
+        assert_eq!(
+            semantics.runtime_auth_kind(),
+            ProviderKeyRuntimeAuthKind::Bearer
+        );
+    }
+
+    #[test]
+    fn refresh_capability_requires_stored_refresh_token() {
+        let semantics = provider_key_auth_semantics(&sample_key("oauth"), "codex");
+
+        assert!(!provider_key_can_refresh_oauth(
+            semantics,
+            json!({
+                "access_token": "access-token",
+                "access_token_import_temporary": true
+            })
+            .as_object()
+        ));
+        assert!(!provider_key_can_refresh_oauth(
+            semantics,
+            json!({ "refresh_token": "   " }).as_object()
+        ));
+        assert!(provider_key_can_refresh_oauth(
+            semantics,
+            json!({ "refresh_token": "refresh-token" }).as_object()
+        ));
     }
 
     #[test]

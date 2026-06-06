@@ -8,10 +8,12 @@ use aether_data_contracts::repository::provider_catalog::{
     StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
 };
 use aether_scheduler_core::{
-    is_provider_key_circuit_open, matches_model_mapping, provider_key_health_score,
+    is_provider_key_circuit_open_at, matches_model_mapping,
+    provider_key_circuit_payload_is_active_open_at, provider_key_health_score,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 pub(crate) async fn build_admin_global_model_routing_payload(
@@ -86,6 +88,10 @@ pub(crate) async fn build_admin_global_model_routing_payload(
         .flatten()
         .and_then(|value| value.as_bool())
         .unwrap_or(false);
+    let now_unix_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
 
     let global_model_mappings = global_model
         .config
@@ -107,6 +113,13 @@ pub(crate) async fn build_admin_global_model_routing_payload(
         let Some(provider) = providers.get(&model.provider_id) else {
             continue;
         };
+        let provider_model_mapping_names =
+            provider_model_mapping_names_for_routing(model.provider_model_mappings.as_ref());
+        let key_match_model_names = key_match_model_names_for_routing(
+            &global_model.name,
+            &model.provider_model_name,
+            &provider_model_mapping_names,
+        );
         let mut endpoint_payloads = Vec::new();
         let mut active_endpoints = 0usize;
         for endpoint in endpoints_by_provider
@@ -132,7 +145,7 @@ pub(crate) async fn build_admin_global_model_routing_payload(
                 .filter(|key| {
                     key_allowed_models_match_global_model_for_routing(
                         key.allowed_models.as_ref(),
-                        &global_model.name,
+                        &key_match_model_names,
                         &global_model_mappings,
                     )
                 })
@@ -156,9 +169,11 @@ pub(crate) async fn build_admin_global_model_routing_payload(
                             entries
                                 .iter()
                                 .filter_map(|(api_format, value)| {
-                                    value.get("open")
-                                        .and_then(serde_json::Value::as_bool)
-                                        .filter(|is_open| *is_open)
+                                    provider_key_circuit_payload_is_active_open_at(
+                                        value,
+                                        now_unix_secs,
+                                    )
+                                    .then_some(())
                                         .map(|_| api_format.clone())
                                 })
                                 .collect::<Vec<_>>()
@@ -181,7 +196,7 @@ pub(crate) async fn build_admin_global_model_routing_payload(
                         "effective_rpm": effective_rpm,
                         "allowed_models": allowed_models,
                         "health_score": provider_key_health_score(key, &endpoint.api_format),
-                        "circuit_breaker_open": is_provider_key_circuit_open(key, &endpoint.api_format),
+                        "circuit_breaker_open": is_provider_key_circuit_open_at(key, &endpoint.api_format, now_unix_secs),
                         "circuit_breaker_formats": circuit_breaker_formats,
                         "next_probe_at": next_probe_at,
                     });
@@ -313,7 +328,7 @@ pub(crate) async fn build_admin_global_model_routing_payload(
 
 fn key_allowed_models_match_global_model_for_routing(
     raw_allowed_models: Option<&serde_json::Value>,
-    global_model_name: &str,
+    model_names: &[String],
     global_model_mappings: &[String],
 ) -> bool {
     // 兼容 Python 预览逻辑：None/[] 视为“不限制”，在链路预览中保留该 Key。
@@ -322,14 +337,16 @@ fn key_allowed_models_match_global_model_for_routing(
         return true;
     }
 
-    if allowed_models
-        .iter()
-        .any(|value| value == global_model_name)
-    {
-        return true;
-    }
-
-    for allowed_model in &allowed_models {
+    for allowed_model in allowed_models.iter().map(String::as_str).map(str::trim) {
+        if allowed_model.is_empty() {
+            continue;
+        }
+        if model_names
+            .iter()
+            .any(|model_name| model_name.eq_ignore_ascii_case(allowed_model))
+        {
+            return true;
+        }
         for pattern in global_model_mappings {
             if matches_model_mapping(pattern, allowed_model) {
                 return true;
@@ -338,6 +355,54 @@ fn key_allowed_models_match_global_model_for_routing(
     }
 
     false
+}
+
+fn provider_model_mapping_names_for_routing(
+    raw_mappings: Option<&serde_json::Value>,
+) -> Vec<String> {
+    raw_mappings
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    item.as_str()
+                        .or_else(|| item.get("name").and_then(serde_json::Value::as_str))
+                })
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn key_match_model_names_for_routing(
+    global_model_name: &str,
+    provider_model_name: &str,
+    provider_model_mapping_names: &[String],
+) -> Vec<String> {
+    let mut names = Vec::new();
+    push_unique_model_name(&mut names, global_model_name);
+    push_unique_model_name(&mut names, provider_model_name);
+    for mapping_name in provider_model_mapping_names {
+        push_unique_model_name(&mut names, mapping_name);
+    }
+    names
+}
+
+fn push_unique_model_name(names: &mut Vec<String>, value: &str) {
+    let value = value.trim();
+    if value.is_empty() {
+        return;
+    }
+    if names
+        .iter()
+        .any(|existing| existing.eq_ignore_ascii_case(value))
+    {
+        return;
+    }
+    names.push(value.to_string());
 }
 
 pub(crate) async fn build_admin_assign_global_model_to_providers_payload(

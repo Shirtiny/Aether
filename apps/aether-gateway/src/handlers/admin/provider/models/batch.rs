@@ -32,7 +32,7 @@ pub(super) async fn maybe_handle(
                     .into_response(),
             ));
         };
-        let Some(_provider) = state
+        let Some(provider) = state
             .read_provider_catalog_providers_by_ids(std::slice::from_ref(&provider_id))
             .await?
             .into_iter()
@@ -129,7 +129,9 @@ pub(super) async fn maybe_handle(
             Json(serde_json::Value::Array(
                 created
                     .iter()
-                    .map(|model| build_admin_provider_model_response(model, now_unix_secs))
+                    .map(|model| {
+                        build_admin_provider_model_response(&provider, model, now_unix_secs)
+                    })
                     .collect(),
             ))
             .into_response(),

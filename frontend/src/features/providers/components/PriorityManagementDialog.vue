@@ -858,6 +858,7 @@ const PROVIDER_TYPE_LABELS: Record<string, string> = {
   gemini_cli: 'Gemini CLI',
   antigravity: 'Antigravity',
   kiro: 'Kiro',
+  grok: 'Grok',
 }
 
 function formatProviderType(type?: string): string {

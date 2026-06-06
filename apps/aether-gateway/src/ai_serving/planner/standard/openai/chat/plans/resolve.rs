@@ -4,11 +4,12 @@ use super::super::{GatewayControlDecision, LocalOpenAiChatDecisionInput};
 use super::diagnostic::set_local_openai_chat_miss_diagnostic;
 use crate::ai_serving::planner::common::extract_standard_requested_model;
 use crate::ai_serving::planner::decision_input::{
+    attach_routing_policy_to_local_requested_model_input,
     build_local_requested_model_decision_input, resolve_local_authenticated_decision_input,
 };
 use crate::ai_serving::resolve_local_decision_execution_runtime_auth_context;
 use crate::client_session_affinity::client_session_affinity_from_parts;
-use crate::AppState;
+use crate::{AppState, GatewayError};
 
 pub(crate) async fn resolve_local_openai_chat_decision_input(
     state: &AppState,
@@ -18,7 +19,7 @@ pub(crate) async fn resolve_local_openai_chat_decision_input(
     body_json: &serde_json::Value,
     plan_kind: &str,
     record_miss_diagnostic: bool,
-) -> Option<LocalOpenAiChatDecisionInput> {
+) -> Result<Option<LocalOpenAiChatDecisionInput>, GatewayError> {
     let Some(auth_context) = resolve_local_decision_execution_runtime_auth_context(decision) else {
         warn!(
             trace_id = %trace_id,
@@ -37,7 +38,7 @@ pub(crate) async fn resolve_local_openai_chat_decision_input(
                 "missing_auth_context",
             );
         }
-        return None;
+        return Ok(None);
     };
 
     let Some(requested_model) = extract_standard_requested_model(body_json) else {
@@ -55,7 +56,7 @@ pub(crate) async fn resolve_local_openai_chat_decision_input(
                 "missing_requested_model",
             );
         }
-        return None;
+        return Ok(None);
     };
 
     let resolved_input = match resolve_local_authenticated_decision_input(
@@ -84,7 +85,7 @@ pub(crate) async fn resolve_local_openai_chat_decision_input(
                     "auth_snapshot_missing",
                 );
             }
-            return None;
+            return Ok(None);
         }
         Err(err) => {
             warn!(
@@ -102,12 +103,28 @@ pub(crate) async fn resolve_local_openai_chat_decision_input(
                     "auth_snapshot_read_failed",
                 );
             }
-            return None;
+            return Err(err);
         }
     };
 
     let mut input = build_local_requested_model_decision_input(resolved_input, requested_model);
     input.request_auth_channel = decision.request_auth_channel.clone();
     input.client_session_affinity = client_session_affinity_from_parts(parts, Some(body_json));
-    Some(input)
+    if let Err(err) = attach_routing_policy_to_local_requested_model_input(
+        state,
+        parts,
+        &mut input,
+        body_json,
+        "openai:chat",
+    )
+    .await
+    {
+        warn!(
+            trace_id = %trace_id,
+            error = ?err,
+            "gateway local openai chat decision routing profile resolution failed"
+        );
+        return Err(err);
+    }
+    Ok(Some(input))
 }

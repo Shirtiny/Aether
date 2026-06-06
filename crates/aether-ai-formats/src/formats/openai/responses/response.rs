@@ -89,10 +89,34 @@ pub fn to_raw(canonical: &CanonicalResponse, report_context: &Value, _compact: b
     for block in &canonical.content {
         match block {
             CanonicalContentBlock::Text { .. }
-            | CanonicalContentBlock::Image { .. }
             | CanonicalContentBlock::File { .. }
             | CanonicalContentBlock::Audio { .. } => {
                 if let Some(part) = canonical_content_block_to_openai_responses_part(block) {
+                    message_content.push(part);
+                }
+            }
+            CanonicalContentBlock::Image {
+                data,
+                url,
+                media_type,
+                extensions,
+                ..
+            } => {
+                if image_block_is_generation_call(extensions) {
+                    flush_openai_responses_message_item(
+                        &mut output,
+                        &mut message_content,
+                        &response_id,
+                        &mut message_index,
+                    );
+                    output.push(openai_responses_image_generation_call_item(
+                        &response_id,
+                        output.len(),
+                        data,
+                        url,
+                        media_type,
+                    ));
+                } else if let Some(part) = canonical_content_block_to_openai_responses_part(block) {
                     message_content.push(part);
                 }
             }
@@ -142,13 +166,25 @@ pub fn to_raw(canonical: &CanonicalResponse, report_context: &Value, _compact: b
                     &response_id,
                     &mut message_index,
                 );
-                output.push(json!({
-                    "type": "function_call",
-                    "id": id,
-                    "call_id": id,
-                    "name": name,
-                    "arguments": canonicalize_tool_arguments(input),
-                }));
+                if is_responses_web_search_tool(name) {
+                    output.push(json!({
+                        "type": "web_search_call",
+                        "id": id,
+                        "status": "completed",
+                        "action": {
+                            "type": "search",
+                            "query": web_search_query_from_value(input),
+                        },
+                    }));
+                } else {
+                    output.push(json!({
+                        "type": "function_call",
+                        "id": id,
+                        "call_id": id,
+                        "name": name,
+                        "arguments": canonicalize_tool_arguments(input),
+                    }));
+                }
             }
             CanonicalContentBlock::ToolResult {
                 tool_use_id,
@@ -247,4 +283,127 @@ pub fn to_raw(canonical: &CanonicalResponse, report_context: &Value, _compact: b
         &response,
     ));
     Value::Object(response)
+}
+
+fn image_block_is_generation_call(extensions: &BTreeMap<String, Value>) -> bool {
+    extensions
+        .get(OPENAI_RESPONSES_EXTENSION_NAMESPACE)
+        .or_else(|| extensions.get(OPENAI_RESPONSES_LEGACY_EXTENSION_NAMESPACE))
+        .and_then(|value| value.get("item_type"))
+        .and_then(Value::as_str)
+        .is_some_and(|value| value == "image_generation_call")
+}
+
+fn openai_responses_image_generation_call_item(
+    response_id: &str,
+    index: usize,
+    data: &Option<String>,
+    url: &Option<String>,
+    media_type: &Option<String>,
+) -> Value {
+    let mut item = Map::new();
+    item.insert(
+        "id".to_string(),
+        Value::String(format!("{response_id}_ig_{index}")),
+    );
+    item.insert(
+        "type".to_string(),
+        Value::String("image_generation_call".to_string()),
+    );
+    item.insert("status".to_string(), Value::String("completed".to_string()));
+    item.insert("action".to_string(), Value::String("generate".to_string()));
+    item.insert(
+        "output_format".to_string(),
+        Value::String(openai_responses_output_format_from_mime_type(
+            media_type.as_deref().unwrap_or("image/png"),
+        )),
+    );
+    if let Some(data) = data.as_ref().filter(|value| !value.trim().is_empty()) {
+        item.insert("result".to_string(), Value::String(data.clone()));
+    } else if let Some(url) = url.as_ref().filter(|value| !value.trim().is_empty()) {
+        item.insert("url".to_string(), Value::String(url.clone()));
+    } else {
+        item.insert("result".to_string(), Value::String(String::new()));
+    }
+    Value::Object(item)
+}
+
+fn openai_responses_output_format_from_mime_type(mime_type: &str) -> String {
+    match mime_type.trim().to_ascii_lowercase().as_str() {
+        "image/jpeg" | "image/jpg" => "jpeg",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        _ => "png",
+    }
+    .to_string()
+}
+
+fn is_responses_web_search_tool(name: &str) -> bool {
+    matches!(name, "web_search" | "web_search_preview")
+}
+
+fn web_search_query_from_value(input: &Value) -> String {
+    input
+        .get("query")
+        .and_then(Value::as_str)
+        .or_else(|| input.as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn responses_response_builder_emits_web_search_call_for_web_search_tool_use() {
+        let response = CanonicalResponse {
+            id: "resp_test".to_string(),
+            model: "gpt-5-5-low".to_string(),
+            content: vec![CanonicalContentBlock::ToolUse {
+                id: "call_ws_1".to_string(),
+                name: "web_search".to_string(),
+                input: json!({"query": "today tech"}),
+                extensions: BTreeMap::new(),
+            }],
+            outputs: Vec::new(),
+            stop_reason: Some(CanonicalStopReason::ToolUse),
+            usage: None,
+            extensions: BTreeMap::new(),
+        };
+
+        let body = to_raw(&response, &json!({}), false);
+
+        assert_eq!(body["output"][0]["type"], "web_search_call");
+        assert_eq!(body["output"][0]["id"], "call_ws_1");
+        assert_eq!(body["output"][0]["status"], "completed");
+        assert_eq!(body["output"][0]["action"]["type"], "search");
+        assert_eq!(body["output"][0]["action"]["query"], "today tech");
+    }
+
+    #[test]
+    fn responses_response_parser_reads_web_search_call_as_tool_use() {
+        let body = json!({
+            "id": "resp_test",
+            "model": "gpt-5-5-low",
+            "status": "incomplete",
+            "output": [{
+                "type": "web_search_call",
+                "id": "call_ws_1",
+                "status": "completed",
+                "action": {"type": "search", "query": "today tech"}
+            }]
+        });
+
+        let canonical = from_raw(&body).expect("response should parse");
+
+        assert!(
+            matches!(canonical.content.first(), Some(CanonicalContentBlock::ToolUse {
+            id,
+            name,
+            input,
+            ..
+        }) if id == "call_ws_1" && name == "web_search" && input["query"] == "today tech")
+        );
+    }
 }

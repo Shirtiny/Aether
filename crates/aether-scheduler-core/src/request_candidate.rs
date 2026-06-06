@@ -36,6 +36,7 @@ pub struct SchedulerRequestCandidateReportContext {
     pub priority_slot: Option<i32>,
     pub promoted_by: Option<String>,
     pub demoted_by: Option<String>,
+    pub routing_trace: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -83,6 +84,7 @@ struct ReportCandidateExtraDataInput {
     priority_slot: Option<i32>,
     promoted_by: Option<String>,
     demoted_by: Option<String>,
+    routing_trace: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -180,6 +182,10 @@ pub fn parse_request_candidate_report_context(
         priority_slot: i32_field(report_context, "priority_slot"),
         promoted_by: string_field(report_context, "promoted_by"),
         demoted_by: string_field(report_context, "demoted_by"),
+        routing_trace: report_context
+            .get("routing_trace")
+            .cloned()
+            .filter(|value| !value.is_null()),
     })
 }
 
@@ -221,6 +227,7 @@ pub fn resolve_report_request_candidate_slot(
         priority_slot,
         promoted_by,
         demoted_by,
+        routing_trace,
     } = metadata;
     let request_id = request_id?;
     let synthesized_extra_data = build_report_candidate_extra_data(ReportCandidateExtraDataInput {
@@ -245,6 +252,7 @@ pub fn resolve_report_request_candidate_slot(
         priority_slot,
         promoted_by,
         demoted_by,
+        routing_trace,
     });
     let created_at_unix_ms = matched_candidate
         .as_ref()
@@ -368,6 +376,7 @@ pub fn build_execution_request_candidate_seed(
             priority_slot: metadata.priority_slot,
             promoted_by: metadata.promoted_by,
             demoted_by: metadata.demoted_by,
+            routing_trace: metadata.routing_trace,
         })
     });
     append_seed_extra_data_from_report_context(&mut extra_data, &context);
@@ -453,42 +462,32 @@ pub fn build_local_request_candidate_status_record(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())?;
-    let metadata = parse_request_candidate_report_context(report_context)?;
-    let candidate_index = metadata.candidate_index?;
-    let extra_data = build_report_candidate_extra_data(ReportCandidateExtraDataInput {
-        client_api_format: metadata.client_api_format.clone(),
-        provider_api_format: metadata.provider_api_format.clone(),
-        request_path: metadata.request_path.clone(),
-        request_query_string: metadata.request_query_string.clone(),
-        request_path_and_query: metadata.request_path_and_query.clone(),
-        upstream_url: metadata.upstream_url.clone(),
-        mapped_model: metadata.mapped_model.clone(),
-        key_name: metadata.key_name.clone(),
-        header_rules: metadata.header_rules.clone(),
-        body_rules: metadata.body_rules.clone(),
-        upstream_response: metadata.upstream_response.clone(),
-        proxy: metadata.proxy.clone(),
-        error_flow: metadata.error_flow.clone(),
-        candidate_group_id: metadata.candidate_group_id.clone(),
-        pool_key_index: metadata.pool_key_index,
-        ranking_mode: metadata.ranking_mode.clone(),
-        priority_mode: metadata.priority_mode.clone(),
-        ranking_index: metadata.ranking_index,
-        priority_slot: metadata.priority_slot,
-        promoted_by: metadata.promoted_by.clone(),
-        demoted_by: metadata.demoted_by.clone(),
-    });
+    let metadata = parse_request_candidate_report_context(report_context);
+    let candidate_index = metadata
+        .as_ref()
+        .and_then(|metadata| metadata.candidate_index)
+        .unwrap_or(0);
+    let retry_index = metadata
+        .as_ref()
+        .map(|metadata| metadata.retry_index)
+        .unwrap_or(0);
+    let extra_data = build_local_request_candidate_extra_data(plan, metadata.as_ref());
+    let extra_data = mark_request_candidate_stream_completed_if_success(status, extra_data);
     let created_at_unix_ms = started_at_unix_ms.or(finished_at_unix_ms);
 
     Some(UpsertRequestCandidateRecord {
         id: candidate_id.to_string(),
         request_id: plan.request_id.clone(),
-        user_id: metadata.user_id,
-        api_key_id: metadata.api_key_id,
+        user_id: metadata
+            .as_ref()
+            .and_then(|metadata| metadata.user_id.clone()),
+        api_key_id: metadata
+            .as_ref()
+            .and_then(|metadata| metadata.api_key_id.clone()),
         username: None,
         api_key_name: None,
         candidate_index,
-        retry_index: metadata.retry_index,
+        retry_index,
         provider_id: Some(plan.provider_id.clone()),
         endpoint_id: Some(plan.endpoint_id.clone()),
         key_id: Some(plan.key_id.clone()),
@@ -505,6 +504,45 @@ pub fn build_local_request_candidate_status_record(
         created_at_unix_ms,
         started_at_unix_ms,
         finished_at_unix_ms,
+    })
+}
+
+fn build_local_request_candidate_extra_data(
+    plan: &ExecutionPlan,
+    metadata: Option<&SchedulerRequestCandidateReportContext>,
+) -> Option<Value> {
+    build_report_candidate_extra_data(ReportCandidateExtraDataInput {
+        client_api_format: metadata
+            .and_then(|metadata| metadata.client_api_format.clone())
+            .or_else(|| non_empty_string(plan.client_api_format.as_str())),
+        provider_api_format: metadata
+            .and_then(|metadata| metadata.provider_api_format.clone())
+            .or_else(|| non_empty_string(plan.provider_api_format.as_str())),
+        request_path: metadata.and_then(|metadata| metadata.request_path.clone()),
+        request_query_string: metadata.and_then(|metadata| metadata.request_query_string.clone()),
+        request_path_and_query: metadata
+            .and_then(|metadata| metadata.request_path_and_query.clone()),
+        upstream_url: metadata
+            .and_then(|metadata| metadata.upstream_url.clone())
+            .or_else(|| non_empty_string(plan.url.as_str())),
+        mapped_model: metadata
+            .and_then(|metadata| metadata.mapped_model.clone())
+            .or_else(|| plan.model_name.as_deref().and_then(non_empty_string)),
+        key_name: metadata.and_then(|metadata| metadata.key_name.clone()),
+        header_rules: metadata.and_then(|metadata| metadata.header_rules.clone()),
+        body_rules: metadata.and_then(|metadata| metadata.body_rules.clone()),
+        upstream_response: metadata.and_then(|metadata| metadata.upstream_response.clone()),
+        proxy: metadata.and_then(|metadata| metadata.proxy.clone()),
+        error_flow: metadata.and_then(|metadata| metadata.error_flow.clone()),
+        candidate_group_id: metadata.and_then(|metadata| metadata.candidate_group_id.clone()),
+        pool_key_index: metadata.and_then(|metadata| metadata.pool_key_index),
+        ranking_mode: metadata.and_then(|metadata| metadata.ranking_mode.clone()),
+        priority_mode: metadata.and_then(|metadata| metadata.priority_mode.clone()),
+        ranking_index: metadata.and_then(|metadata| metadata.ranking_index),
+        priority_slot: metadata.and_then(|metadata| metadata.priority_slot),
+        promoted_by: metadata.and_then(|metadata| metadata.promoted_by.clone()),
+        demoted_by: metadata.and_then(|metadata| metadata.demoted_by.clone()),
+        routing_trace: metadata.and_then(|metadata| metadata.routing_trace.clone()),
     })
 }
 
@@ -558,7 +596,7 @@ pub fn build_report_request_candidate_status_record(
         error_message,
         latency_ms,
         concurrent_requests: None,
-        extra_data: slot.extra_data,
+        extra_data: mark_request_candidate_stream_completed_if_success(status, slot.extra_data),
         required_capabilities: None,
         created_at_unix_ms: Some(created_at_unix_ms),
         started_at_unix_ms,
@@ -624,6 +662,11 @@ fn string_field_from_object(object: &Map<String, Value>, key: &str) -> Option<St
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn non_empty_string(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 fn u32_field(value: &Value, key: &str) -> Option<u32> {
@@ -717,6 +760,7 @@ fn build_report_candidate_extra_data(input: ReportCandidateExtraDataInput) -> Op
         priority_slot,
         promoted_by,
         demoted_by,
+        routing_trace,
     } = input;
     let mut extra_data = Map::with_capacity(8);
     extra_data.insert("gateway_execution_runtime".to_string(), Value::Bool(true));
@@ -812,7 +856,27 @@ fn build_report_candidate_extra_data(input: ReportCandidateExtraDataInput) -> Op
     if let Some(demoted_by) = demoted_by {
         extra_data.insert("demoted_by".to_string(), Value::String(demoted_by));
     }
+    if let Some(routing_trace) = routing_trace {
+        extra_data.insert("routing_trace".to_string(), routing_trace);
+    }
     (!extra_data.is_empty()).then_some(Value::Object(extra_data))
+}
+
+fn mark_request_candidate_stream_completed_if_success(
+    status: RequestCandidateStatus,
+    extra_data: Option<Value>,
+) -> Option<Value> {
+    if status != RequestCandidateStatus::Success {
+        return extra_data;
+    }
+
+    let mut object = match extra_data {
+        Some(Value::Object(object)) => object,
+        Some(other) => return Some(other),
+        None => Map::new(),
+    };
+    object.insert("stream_completed".to_string(), Value::Bool(true));
+    Some(Value::Object(object))
 }
 
 fn merge_request_candidate_extra_data(
@@ -1138,7 +1202,15 @@ mod tests {
                     "ranking_index": 2,
                     "priority_slot": 7,
                     "promoted_by": "cached_affinity",
-                    "demoted_by": "cross_format"
+                    "demoted_by": "cross_format",
+                    "routing_trace": {
+                        "group_id": "routing-group-1",
+                        "pool_expansion": [{
+                            "pool_group_id": "pool-1",
+                            "key_id": "key-1",
+                            "selected_order": 0
+                        }]
+                    }
                 })),
                 status_update: SchedulerRequestCandidateStatusUpdate {
                     status: RequestCandidateStatus::Failed,
@@ -1228,6 +1300,60 @@ mod tests {
                 .and_then(|value| value.get("demoted_by")),
             Some(&json!("cross_format"))
         );
+        assert_eq!(
+            record
+                .extra_data
+                .as_ref()
+                .and_then(|value| value.get("routing_trace"))
+                .and_then(|value| value.get("group_id")),
+            Some(&json!("routing-group-1"))
+        );
+    }
+
+    #[test]
+    fn builds_local_request_candidate_status_record_without_report_context() {
+        let mut plan = sample_plan();
+        plan.candidate_id = Some("cand-plan-only".to_string());
+
+        let record =
+            build_local_request_candidate_status_record(LocalRequestCandidateStatusRecordInput {
+                plan: &plan,
+                report_context: None,
+                status_update: SchedulerRequestCandidateStatusUpdate {
+                    status: RequestCandidateStatus::Failed,
+                    status_code: Some(401),
+                    error_type: Some("Unauthorized".to_string()),
+                    error_message: Some("oauth refresh failed".to_string()),
+                    latency_ms: Some(12),
+                    started_at_unix_ms: Some(1_000),
+                    finished_at_unix_ms: Some(1_012),
+                },
+            })
+            .expect("record should build from plan fields");
+
+        assert_eq!(record.id, "cand-plan-only");
+        assert_eq!(record.request_id, "req-1");
+        assert_eq!(record.candidate_index, 0);
+        assert_eq!(record.retry_index, 0);
+        assert_eq!(record.provider_id.as_deref(), Some("provider-1"));
+        assert_eq!(record.endpoint_id.as_deref(), Some("endpoint-1"));
+        assert_eq!(record.key_id.as_deref(), Some("key-1"));
+        assert_eq!(record.status, RequestCandidateStatus::Failed);
+        assert_eq!(record.status_code, Some(401));
+        assert_eq!(
+            record
+                .extra_data
+                .as_ref()
+                .and_then(|value| value.get("client_api_format")),
+            Some(&json!("openai:chat"))
+        );
+        assert_eq!(
+            record
+                .extra_data
+                .as_ref()
+                .and_then(|value| value.get("upstream_url")),
+            Some(&json!("https://example.com/v1/chat/completions"))
+        );
     }
 
     #[test]
@@ -1265,6 +1391,53 @@ mod tests {
         assert_eq!(record.finished_at_unix_ms, Some(123));
         assert_eq!(record.created_at_unix_ms, Some(123));
         assert_eq!(record.status, RequestCandidateStatus::Success);
+        assert_eq!(
+            record
+                .extra_data
+                .as_ref()
+                .and_then(|value| value.get("stream_completed")),
+            Some(&json!(true))
+        );
+    }
+
+    #[test]
+    fn local_success_status_marks_stream_completed_for_pending_cleanup_recovery() {
+        let mut plan = sample_plan();
+        plan.candidate_id = Some("cand-1".to_string());
+        let report_context = json!({
+            "request_id": "req-1",
+            "candidate_id": "cand-1",
+            "candidate_index": 0,
+            "retry_index": 0,
+            "user_id": "user-1",
+            "api_key_id": "api-key-1",
+            "client_api_format": "openai:responses",
+            "provider_api_format": "openai:responses",
+        });
+
+        let record =
+            build_local_request_candidate_status_record(LocalRequestCandidateStatusRecordInput {
+                plan: &plan,
+                report_context: Some(&report_context),
+                status_update: SchedulerRequestCandidateStatusUpdate {
+                    status: RequestCandidateStatus::Success,
+                    status_code: Some(200),
+                    error_type: None,
+                    error_message: None,
+                    latency_ms: Some(25),
+                    started_at_unix_ms: Some(1_000),
+                    finished_at_unix_ms: Some(1_025),
+                },
+            })
+            .expect("success status record should build");
+
+        assert_eq!(
+            record
+                .extra_data
+                .as_ref()
+                .and_then(|value| value.get("stream_completed")),
+            Some(&json!(true))
+        );
     }
 
     #[test]

@@ -370,9 +370,11 @@ import { normalizeApiFormatAlias } from '@/api/endpoints/types/api-format'
 import {
   buildDefaultModelTestRequestHeaders,
   buildDefaultModelTestRequestBody,
+  isModelTestableApiFormat,
   isModelTestableEndpoint,
   parseModelTestRequestHeadersDraft,
   parseModelTestRequestBodyDraft,
+  selectPreferredModelTestEndpoint,
   syncModelTestRequestBodyDraft,
 } from './model-test-request'
 
@@ -427,6 +429,7 @@ const deletingGroup = ref<AliasGroup | null>(null)
 const testingMapping = ref<string | null>(null)
 const pendingMappingKey = ref<string | null>(null)
 const testingModelName = ref<string | null>(null)
+const testingSourceModel = ref<Model | null>(null)
 const preselectedModelId = ref<string | null>(null)
 const selectedTestEndpoint = ref<ProviderEndpoint | null>(null)
 const testRequestHeadersDraft = ref('')
@@ -436,7 +439,15 @@ const testRequestBodyResetValue = ref('')
 const mappingTestEndpoints = ref<ProviderEndpoint[] | null>(null)
 const providerKeysState = computed(() => props.providerKeys ?? [])
 const activeEndpoints = computed(() => (props.endpoints ?? [])
-  .filter(endpoint => isModelTestableEndpoint(endpoint, providerKeysState.value)))
+  .filter(endpoint => {
+    if (typeof endpoint.active_keys === 'number') {
+      return endpoint.is_active !== false
+        && isModelTestableApiFormat(endpoint.api_format)
+        && (endpoint.active_keys > 0
+          || isModelTestableEndpoint(endpoint, providerKeysState.value, props.provider.provider_type))
+    }
+    return isModelTestableEndpoint(endpoint, providerKeysState.value, props.provider.provider_type)
+  }))
 const selectableTestEndpoints = computed(() => mappingTestEndpoints.value ?? activeEndpoints.value)
 const parsedTestRequestHeaders = computed(() => parseModelTestRequestHeadersDraft(testRequestHeadersDraft.value))
 const testRequestHeadersError = computed(() => parsedTestRequestHeaders.value.error)
@@ -448,9 +459,9 @@ const isLoading = computed(() => Boolean(props.loading) || localLoading.value)
 const models = computed(() => props.models ?? [])
 const aliasMappingPreview = computed(() => props.mappingPreview ?? null)
 
-// 是否有 key 配置了自动获取上游模型
+// 后端分页下当前页不一定包含 auto_fetch key；有活跃 key 时允许弹窗尝试拉取上游模型。
 const hasAutoFetchKey = computed(() => {
-  return providerKeysState.value.some(k => k.auto_fetch_models)
+  return providerKeysState.value.some(k => k.auto_fetch_models) || props.provider.active_keys > 0
 })
 
 // 展开状态
@@ -707,6 +718,7 @@ function handleTestDialogClose() {
   modelTest.resetState()
   pendingMappingKey.value = null
   testingModelName.value = null
+  testingSourceModel.value = null
   testingMapping.value = null
   selectedTestEndpoint.value = null
   mappingTestEndpoints.value = null
@@ -729,8 +741,25 @@ function handleSelectTestEndpoint(endpointId: string) {
   syncMappingTestRequestBody()
 }
 
+function findMappingTestModel(modelName: string): Model | null {
+  const normalized = modelName.trim()
+  if (!normalized) return null
+
+  return models.value.find(model => (
+    model.provider_model_name === normalized
+    || model.global_model_name === normalized
+    || model.global_model_display_name === normalized
+    || (model.provider_model_mappings ?? []).some(alias => alias.name === normalized)
+  )) ?? null
+}
+
 // 测试映射（直连测试，带故障转移和实时进度）
-function runMappingTest(testingKey: string, modelName: string, endpointsOverride?: ProviderEndpoint[]) {
+function runMappingTest(
+  testingKey: string,
+  modelName: string,
+  endpointsOverride?: ProviderEndpoint[],
+  sourceModel?: Model | null,
+) {
   const endpoints = endpointsOverride ?? activeEndpoints.value
   if (endpoints.length === 0) {
     showError('暂无可用于测试的活跃端点')
@@ -741,8 +770,12 @@ function runMappingTest(testingKey: string, modelName: string, endpointsOverride
   modelTest.dialogOpen.value = true
   testingMapping.value = null
   testingModelName.value = modelName
+  testingSourceModel.value = sourceModel ?? findMappingTestModel(modelName)
   mappingTestEndpoints.value = endpointsOverride ?? null
-  selectedTestEndpoint.value = endpoints[0] ?? null
+  selectedTestEndpoint.value = selectPreferredModelTestEndpoint(
+    testingSourceModel.value,
+    endpoints,
+  )
   testRequestHeadersResetValue.value = buildDefaultModelTestRequestHeaders()
   testRequestHeadersDraft.value = testRequestHeadersResetValue.value
   resetMappingTestRequestBody()
@@ -754,6 +787,7 @@ function resetMappingTestRequestBody() {
   testRequestBodyResetValue.value = buildDefaultModelTestRequestBody(
     testingModelName.value,
     selectedTestEndpoint.value?.api_format,
+    testingSourceModel.value,
   )
   testRequestBodyDraft.value = testRequestBodyResetValue.value
 }
@@ -764,6 +798,7 @@ function syncMappingTestRequestBody() {
   const nextResetValue = buildDefaultModelTestRequestBody(
     testingModelName.value,
     selectedTestEndpoint.value?.api_format,
+    testingSourceModel.value,
   )
   const next = syncModelTestRequestBodyDraft(
     testRequestBodyDraft.value,
@@ -831,7 +866,7 @@ function scopedMappingEndpoints(item: CombinedMapping): ProviderEndpoint[] {
 
 // 测试精确映射
 function testMapping(item: CombinedMapping, mapping: MappingItem) {
-  runMappingTest(`${item.key}-${mapping.name}`, mapping.name, scopedMappingEndpoints(item))
+  runMappingTest(`${item.key}-${mapping.name}`, mapping.name, scopedMappingEndpoints(item), item.group?.model)
 }
 
 // 测试正则映射

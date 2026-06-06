@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Map, Value};
 
@@ -29,6 +29,7 @@ struct OpenAIResponsesProviderToolState {
     call_id: String,
     name: String,
     arguments: String,
+    emitted_arguments_len: usize,
     started_emitted: bool,
 }
 
@@ -44,12 +45,13 @@ pub struct OpenAIResponsesProviderState {
     model: Option<String>,
     started: bool,
     finished: bool,
-    text: String,
+    text_parts: BTreeMap<String, String>,
     reasoning: String,
     reasoning_parts: BTreeMap<usize, String>,
     tool_calls: BTreeMap<usize, OpenAIResponsesProviderToolState>,
     tool_results: BTreeMap<usize, OpenAIResponsesProviderToolResultState>,
     tool_index_by_key: BTreeMap<String, usize>,
+    image_item_keys: BTreeSet<String>,
     last_tool_index: Option<usize>,
 }
 
@@ -418,24 +420,87 @@ impl OpenAIResponsesProviderState {
         index
     }
 
+    fn text_part_key_from_event(value: &Value) -> String {
+        let item_key = value
+            .get("output_index")
+            .and_then(Value::as_u64)
+            .map(|value| format!("output:{value}"))
+            .or_else(|| {
+                value
+                    .get("item_id")
+                    .or_else(|| value.get("id"))
+                    .and_then(Value::as_str)
+                    .map(|value| format!("item:{value}"))
+            })
+            .unwrap_or_else(|| "output:default".to_string());
+        let content_index = value
+            .get("content_index")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        format!("{item_key}:content:{content_index}")
+    }
+
+    fn text_part_key_from_message_item(
+        output_index: Option<usize>,
+        item: &Map<String, Value>,
+        content_index: usize,
+    ) -> String {
+        let item_key = output_index
+            .map(|value| format!("output:{value}"))
+            .or_else(|| {
+                item.get("id")
+                    .and_then(Value::as_str)
+                    .map(|value| format!("item:{value}"))
+            })
+            .unwrap_or_else(|| "output:default".to_string());
+        format!("{item_key}:content:{content_index}")
+    }
+
+    fn emit_text_delta(
+        &mut self,
+        report_context: &Value,
+        out: &mut Vec<CanonicalStreamFrame>,
+        key: String,
+        text: &str,
+    ) {
+        if text.is_empty() {
+            return;
+        }
+        self.text_parts.entry(key).or_default().push_str(text);
+        self.ensure_started(report_context, out);
+        let (id, model) = self.identity(report_context);
+        out.push(CanonicalStreamFrame {
+            id,
+            model,
+            event: CanonicalStreamEvent::TextDelta(text.to_string()),
+        });
+    }
+
     fn emit_missing_text(
         &mut self,
         report_context: &Value,
         out: &mut Vec<CanonicalStreamFrame>,
+        key: String,
         text: &str,
     ) {
-        let missing = if text.starts_with(&self.text) {
-            text[self.text.len()..].to_string()
-        } else if self.text == text {
-            String::new()
-        } else {
-            text.to_string()
+        let missing = {
+            let current = self.text_parts.entry(key).or_default();
+            let missing = if text.starts_with(current.as_str()) {
+                text[current.len()..].to_string()
+            } else if current.as_str() == text || current.starts_with(text) {
+                String::new()
+            } else {
+                text.to_string()
+            };
+            if !missing.is_empty() {
+                current.push_str(&missing);
+            }
+            missing
         };
         if missing.is_empty() {
             return;
         }
         self.ensure_started(report_context, out);
-        self.text.push_str(&missing);
         let (id, model) = self.identity(report_context);
         out.push(CanonicalStreamFrame {
             id,
@@ -509,6 +574,74 @@ impl OpenAIResponsesProviderState {
         });
     }
 
+    fn emit_ready_tool_call(
+        &mut self,
+        report_context: &Value,
+        out: &mut Vec<CanonicalStreamFrame>,
+        index: usize,
+    ) {
+        let (id, model) = self.identity(report_context);
+        let Some(state) = self.tool_calls.get_mut(&index) else {
+            return;
+        };
+        if state.name.is_empty() {
+            return;
+        }
+        if !state.started_emitted {
+            out.push(CanonicalStreamFrame {
+                id: id.clone(),
+                model: model.clone(),
+                event: CanonicalStreamEvent::ToolCallStart {
+                    index,
+                    call_id: if state.call_id.is_empty() {
+                        build_generated_tool_call_id(index)
+                    } else {
+                        state.call_id.clone()
+                    },
+                    name: state.name.clone(),
+                },
+            });
+            state.started_emitted = true;
+        }
+        if state.emitted_arguments_len > state.arguments.len() {
+            state.emitted_arguments_len = 0;
+        }
+        let pending = state
+            .arguments
+            .get(state.emitted_arguments_len..)
+            .unwrap_or_default()
+            .to_string();
+        if pending.is_empty() {
+            return;
+        }
+        state.emitted_arguments_len = state.arguments.len();
+        out.push(CanonicalStreamFrame {
+            id,
+            model,
+            event: CanonicalStreamEvent::ToolCallArgumentsDelta {
+                index,
+                arguments: pending,
+            },
+        });
+    }
+
+    fn merge_tool_call_arguments(state: &mut OpenAIResponsesProviderToolState, arguments: &str) {
+        if arguments.is_empty() {
+            return;
+        }
+        if arguments.starts_with(&state.arguments) {
+            state
+                .arguments
+                .push_str(&arguments[state.arguments.len()..]);
+        } else if state.arguments != arguments {
+            if state.emitted_arguments_len == 0 {
+                state.arguments = arguments.to_string();
+            } else {
+                state.arguments.push_str(arguments);
+            }
+        }
+    }
+
     fn emit_tool_call_item(
         &mut self,
         report_context: &Value,
@@ -526,7 +659,6 @@ impl OpenAIResponsesProviderState {
             .and_then(Value::as_str)
             .map(ToOwned::to_owned);
         let index = self.tool_index_for_key(key, output_index);
-        let (id, model) = self.identity(report_context);
         let state = self.tool_calls.entry(index).or_default();
         state.call_id = item
             .get("call_id")
@@ -539,50 +671,13 @@ impl OpenAIResponsesProviderState {
             .and_then(Value::as_str)
             .unwrap_or(state.name.as_str())
             .to_string();
-        if !state.started_emitted {
-            out.push(CanonicalStreamFrame {
-                id: id.clone(),
-                model: model.clone(),
-                event: CanonicalStreamEvent::ToolCallStart {
-                    index,
-                    call_id: if state.call_id.is_empty() {
-                        build_generated_tool_call_id(index)
-                    } else {
-                        state.call_id.clone()
-                    },
-                    name: if state.name.is_empty() {
-                        "unknown".to_string()
-                    } else {
-                        state.name.clone()
-                    },
-                },
-            });
-            state.started_emitted = true;
-        }
         let completed_arguments = item
             .get("arguments")
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        let missing = if completed_arguments.starts_with(&state.arguments) {
-            completed_arguments[state.arguments.len()..].to_string()
-        } else if state.arguments == completed_arguments {
-            String::new()
-        } else {
-            completed_arguments.clone()
-        };
-        if missing.is_empty() {
-            return;
-        }
-        state.arguments.push_str(&missing);
-        out.push(CanonicalStreamFrame {
-            id,
-            model,
-            event: CanonicalStreamEvent::ToolCallArgumentsDelta {
-                index,
-                arguments: missing,
-            },
-        });
+        Self::merge_tool_call_arguments(state, &completed_arguments);
+        self.emit_ready_tool_call(report_context, out, index);
     }
 
     fn emit_missing_tool_result(
@@ -663,28 +758,33 @@ impl OpenAIResponsesProviderState {
         report_context: &Value,
         out: &mut Vec<CanonicalStreamFrame>,
         item: &Map<String, Value>,
+        output_index: Option<usize>,
     ) {
         if item.get("type").and_then(Value::as_str) != Some("message") {
             return;
         }
-        let mut completed_text = String::new();
-        for raw_content in item
+        for (content_index, raw_content) in item
             .get("content")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
+            .enumerate()
         {
             let Some(content) = raw_content.as_object() else {
                 continue;
             };
             if content.get("type").and_then(Value::as_str) == Some("output_text") {
                 if let Some(text) = content.get("text").and_then(Value::as_str) {
-                    completed_text.push_str(text);
+                    if !text.is_empty() {
+                        let key = Self::text_part_key_from_message_item(
+                            output_index,
+                            item,
+                            content_index,
+                        );
+                        self.emit_missing_text(report_context, out, key, text);
+                    }
                 }
             }
-        }
-        if !completed_text.is_empty() {
-            self.emit_missing_text(report_context, out, &completed_text);
         }
     }
 
@@ -718,6 +818,55 @@ impl OpenAIResponsesProviderState {
         }
     }
 
+    fn emit_image_generation_item(
+        &mut self,
+        report_context: &Value,
+        out: &mut Vec<CanonicalStreamFrame>,
+        item: &Map<String, Value>,
+        output_index: Option<usize>,
+        final_item: bool,
+    ) {
+        if item.get("type").and_then(Value::as_str) != Some("image_generation_call") {
+            return;
+        }
+        if !final_item
+            && !item
+                .get("status")
+                .and_then(Value::as_str)
+                .is_some_and(|value| value.eq_ignore_ascii_case("completed"))
+        {
+            return;
+        }
+        let has_image_payload = item
+            .get("result")
+            .or_else(|| item.get("url"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty());
+        if !has_image_payload {
+            return;
+        }
+        let index = output_index.unwrap_or(self.image_item_keys.len());
+        let key = item
+            .get("id")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| format!("image_generation_call:{index}"));
+        if !self.image_item_keys.insert(key) {
+            return;
+        }
+        self.ensure_started(report_context, out);
+        let (id, model) = self.identity(report_context);
+        out.push(CanonicalStreamFrame {
+            id,
+            model,
+            event: CanonicalStreamEvent::ImageGenerationCall {
+                index,
+                item: Value::Object(item.clone()),
+            },
+        });
+    }
+
     pub fn push_line(
         &mut self,
         report_context: &Value,
@@ -748,33 +897,26 @@ impl OpenAIResponsesProviderState {
             "response.created" | "response.in_progress" => {
                 self.ensure_started(report_context, &mut out);
             }
-            "response.output_text.delta" | "response.outtext.delta" => {
-                let piece = match value.get("delta") {
-                    Some(Value::String(text)) => text.clone(),
-                    Some(Value::Object(delta)) => delta
-                        .get("text")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                    _ => String::new(),
-                };
-                if !piece.is_empty() {
-                    self.ensure_started(report_context, &mut out);
-                    self.text.push_str(&piece);
-                    let (id, model) = self.identity(report_context);
-                    out.push(CanonicalStreamFrame {
-                        id,
-                        model,
-                        event: CanonicalStreamEvent::TextDelta(piece),
-                    });
+            "response.output_text.delta" | "response.outtext.delta" => match value.get("delta") {
+                Some(Value::String(piece)) if !piece.is_empty() => {
+                    let key = Self::text_part_key_from_event(&value);
+                    self.emit_text_delta(report_context, &mut out, key, piece);
                 }
-            }
+                Some(Value::Object(delta)) => {
+                    if let Some(text) = delta.get("text").and_then(Value::as_str) {
+                        let key = Self::text_part_key_from_event(&value);
+                        self.emit_missing_text(report_context, &mut out, key, text);
+                    }
+                }
+                _ => {}
+            },
             "response.content_part.added" | "response.content_part.done" => {
                 if let Some(part) = value.get("part").and_then(Value::as_object) {
                     if part.get("type").and_then(Value::as_str) == Some("output_text") {
                         if let Some(text) = part.get("text").and_then(Value::as_str) {
                             if !text.is_empty() {
-                                self.emit_missing_text(report_context, &mut out, text);
+                                let key = Self::text_part_key_from_event(&value);
+                                self.emit_missing_text(report_context, &mut out, key, text);
                             }
                         }
                     }
@@ -812,7 +954,8 @@ impl OpenAIResponsesProviderState {
                     })
                     .unwrap_or_default();
                 if !text.is_empty() {
-                    self.emit_missing_text(report_context, &mut out, text);
+                    let key = Self::text_part_key_from_event(&value);
+                    self.emit_missing_text(report_context, &mut out, key, text);
                 }
             }
             "response.reasoning_summary_text.delta" => {
@@ -889,10 +1032,19 @@ impl OpenAIResponsesProviderState {
                         self.emit_tool_result_item(report_context, &mut out, item, output_index);
                     }
                     "message" => {
-                        self.emit_message_item(report_context, &mut out, item);
+                        self.emit_message_item(report_context, &mut out, item, output_index);
                     }
                     "reasoning" => {
                         self.ensure_started(report_context, &mut out);
+                    }
+                    "image_generation_call" => {
+                        self.emit_image_generation_item(
+                            report_context,
+                            &mut out,
+                            item,
+                            output_index,
+                            false,
+                        );
                     }
                     _ => {
                         out.push(self.unknown_frame(report_context, Value::Object(item.clone())));
@@ -919,44 +1071,22 @@ impl OpenAIResponsesProviderState {
                     .and_then(Value::as_u64)
                     .map(|value| value as usize);
                 let index = self.tool_index_for_key(key, output_index);
-                let (id, model) = self.identity(report_context);
                 let state = self.tool_calls.entry(index).or_default();
-                state.call_id = value
-                    .get("item_id")
-                    .or_else(|| value.get("call_id"))
+                if let Some(call_id) = value
+                    .get("call_id")
                     .or_else(|| value.get("id"))
                     .and_then(Value::as_str)
-                    .unwrap_or(state.call_id.as_str())
-                    .to_string();
-                if !state.started_emitted {
-                    out.push(CanonicalStreamFrame {
-                        id: id.clone(),
-                        model: model.clone(),
-                        event: CanonicalStreamEvent::ToolCallStart {
-                            index,
-                            call_id: if state.call_id.is_empty() {
-                                build_generated_tool_call_id(index)
-                            } else {
-                                state.call_id.clone()
-                            },
-                            name: if state.name.is_empty() {
-                                "unknown".to_string()
-                            } else {
-                                state.name.clone()
-                            },
-                        },
-                    });
-                    state.started_emitted = true;
+                {
+                    state.call_id = call_id.to_string();
+                } else if state.call_id.is_empty() {
+                    state.call_id = value
+                        .get("item_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
                 }
                 state.arguments.push_str(delta);
-                out.push(CanonicalStreamFrame {
-                    id,
-                    model,
-                    event: CanonicalStreamEvent::ToolCallArgumentsDelta {
-                        index,
-                        arguments: delta.to_string(),
-                    },
-                });
+                self.emit_ready_tool_call(report_context, &mut out, index);
             }
             "response.function_call_arguments.done" => {
                 let arguments = value
@@ -970,9 +1100,6 @@ impl OpenAIResponsesProviderState {
                             .and_then(Value::as_str)
                     })
                     .unwrap_or_default();
-                if arguments.is_empty() {
-                    return Ok(out);
-                }
                 self.ensure_started(report_context, &mut out);
                 let key = value
                     .get("item_id")
@@ -993,11 +1120,9 @@ impl OpenAIResponsesProviderState {
                     .and_then(Value::as_u64)
                     .map(|value| value as usize);
                 let index = self.tool_index_for_key(key, output_index);
-                let (id, model) = self.identity(report_context);
                 let state = self.tool_calls.entry(index).or_default();
                 state.call_id = value
-                    .get("item_id")
-                    .or_else(|| value.get("call_id"))
+                    .get("call_id")
                     .or_else(|| value.get("id"))
                     .and_then(Value::as_str)
                     .or_else(|| {
@@ -1007,46 +1132,23 @@ impl OpenAIResponsesProviderState {
                             .and_then(|item| item.get("call_id").or_else(|| item.get("id")))
                             .and_then(Value::as_str)
                     })
+                    .or_else(|| value.get("item_id").and_then(Value::as_str))
                     .unwrap_or(state.call_id.as_str())
                     .to_string();
-                if !state.started_emitted {
-                    out.push(CanonicalStreamFrame {
-                        id: id.clone(),
-                        model: model.clone(),
-                        event: CanonicalStreamEvent::ToolCallStart {
-                            index,
-                            call_id: if state.call_id.is_empty() {
-                                build_generated_tool_call_id(index)
-                            } else {
-                                state.call_id.clone()
-                            },
-                            name: if state.name.is_empty() {
-                                "unknown".to_string()
-                            } else {
-                                state.name.clone()
-                            },
-                        },
-                    });
-                    state.started_emitted = true;
-                }
-                let missing = if arguments.starts_with(&state.arguments) {
-                    arguments[state.arguments.len()..].to_string()
-                } else if state.arguments == arguments {
-                    String::new()
-                } else {
-                    arguments.to_string()
-                };
-                if !missing.is_empty() {
-                    state.arguments.push_str(&missing);
-                    out.push(CanonicalStreamFrame {
-                        id,
-                        model,
-                        event: CanonicalStreamEvent::ToolCallArgumentsDelta {
-                            index,
-                            arguments: missing,
-                        },
-                    });
-                }
+                state.name = value
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .or_else(|| {
+                        value
+                            .get("item")
+                            .and_then(Value::as_object)
+                            .and_then(|item| item.get("name"))
+                            .and_then(Value::as_str)
+                    })
+                    .unwrap_or(state.name.as_str())
+                    .to_string();
+                Self::merge_tool_call_arguments(state, arguments);
+                self.emit_ready_tool_call(report_context, &mut out, index);
             }
             "response.function_call_output.delta" | "response.function_call_output.done" => {
                 let tool_use_id = value
@@ -1102,15 +1204,41 @@ impl OpenAIResponsesProviderState {
                         self.emit_tool_result_item(report_context, &mut out, item, output_index);
                     }
                     "message" => {
-                        self.emit_message_item(report_context, &mut out, item);
+                        self.emit_message_item(report_context, &mut out, item, output_index);
                     }
                     "reasoning" => {
                         self.emit_reasoning_item(report_context, &mut out, item);
+                    }
+                    "image_generation_call" => {
+                        self.emit_image_generation_item(
+                            report_context,
+                            &mut out,
+                            item,
+                            output_index,
+                            true,
+                        );
                     }
                     _ => {
                         out.push(self.unknown_frame(report_context, Value::Object(item.clone())));
                     }
                 }
+            }
+            event_type if openai_stream_payload_is_terminal_error(&value) => {
+                self.finished = true;
+                let mut payload = value.clone();
+                if event_type != "response.failed"
+                    && event_type != "response.incomplete"
+                    && event_type != "error"
+                {
+                    payload = openai_stream_terminal_error_body(&value).unwrap_or(payload);
+                    if let Some(object) = payload.as_object_mut() {
+                        object.insert(
+                            "type".to_string(),
+                            Value::String("response.failed".to_string()),
+                        );
+                    }
+                }
+                out.push(self.unknown_frame(report_context, payload));
             }
             "response.completed" => {
                 let Some(response) = value.get("response").and_then(Value::as_object) else {
@@ -1131,7 +1259,12 @@ impl OpenAIResponsesProviderState {
                     };
                     match item.get("type").and_then(Value::as_str).unwrap_or_default() {
                         "message" => {
-                            self.emit_message_item(report_context, &mut out, item);
+                            self.emit_message_item(
+                                report_context,
+                                &mut out,
+                                item,
+                                Some(output_index),
+                            );
                         }
                         "function_call" => {
                             self.emit_tool_call_item(
@@ -1151,6 +1284,15 @@ impl OpenAIResponsesProviderState {
                         }
                         "reasoning" => {
                             self.emit_reasoning_item(report_context, &mut out, item);
+                        }
+                        "image_generation_call" => {
+                            self.emit_image_generation_item(
+                                report_context,
+                                &mut out,
+                                item,
+                                Some(output_index),
+                                true,
+                            );
                         }
                         _ => {
                             out.push(
@@ -1214,6 +1356,8 @@ pub struct OpenAIChatClientEmitter {
     model: Option<String>,
     started: bool,
     finished: bool,
+    next_tool_call_index: usize,
+    tool_call_index_by_canonical: BTreeMap<usize, usize>,
 }
 
 #[derive(Clone, Default)]
@@ -1222,6 +1366,7 @@ struct OpenAIResponsesClientToolState {
     name: String,
     arguments: String,
     output_index: Option<usize>,
+    web_search: bool,
 }
 
 #[derive(Clone, Default)]
@@ -1231,6 +1376,23 @@ struct OpenAIResponsesClientToolResultState {
     content: String,
     output_index: Option<usize>,
     item_started: bool,
+}
+
+fn is_responses_web_search_tool(name: &str) -> bool {
+    matches!(name, "web_search" | "web_search_preview")
+}
+
+fn web_search_query_from_arguments(arguments: &str) -> String {
+    serde_json::from_str::<Value>(arguments)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("query")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+                .or_else(|| value.as_str().map(ToOwned::to_owned))
+        })
+        .unwrap_or_default()
 }
 
 #[derive(Default)]
@@ -1255,6 +1417,7 @@ pub struct OpenAIResponsesClientEmitter {
     reasoning_summary_parts: Vec<String>,
     tool_calls: BTreeMap<usize, OpenAIResponsesClientToolState>,
     tool_results: BTreeMap<usize, OpenAIResponsesClientToolResultState>,
+    image_generation_items: BTreeMap<usize, Value>,
 }
 
 impl OpenAIChatClientEmitter {
@@ -1277,6 +1440,17 @@ impl OpenAIChatClientEmitter {
                 self.model.as_deref().unwrap_or("unknown"),
             ),
         )
+    }
+
+    fn chat_tool_call_index(&mut self, canonical_index: usize) -> usize {
+        if let Some(index) = self.tool_call_index_by_canonical.get(&canonical_index) {
+            return *index;
+        }
+        let index = self.next_tool_call_index;
+        self.next_tool_call_index += 1;
+        self.tool_call_index_by_canonical
+            .insert(canonical_index, index);
+        index
     }
 
     pub fn emit(&mut self, frame: CanonicalStreamFrame) -> Result<Vec<u8>, AiSurfaceFinalizeError> {
@@ -1361,12 +1535,33 @@ impl OpenAIChatClientEmitter {
                 )?);
                 Ok(out)
             }
+            CanonicalStreamEvent::ImageGenerationCall { item, .. } => {
+                let Some(part) = content_part_from_openai_image_generation_item(&item) else {
+                    return Ok(Vec::new());
+                };
+                let placeholder = openai_stream_placeholder_for_content_part(&part);
+                let mut out = self.ensure_started()?;
+                out.extend(encode_json_sse(
+                    None,
+                    &build_openai_chat_chunk(
+                        self.response_id
+                            .as_deref()
+                            .unwrap_or("chatcmpl-local-stream"),
+                        self.model.as_deref().unwrap_or("unknown"),
+                        placeholder,
+                        None,
+                        None,
+                    ),
+                )?);
+                Ok(out)
+            }
             CanonicalStreamEvent::ToolCallStart {
                 index,
                 call_id,
                 name,
             } => {
                 let mut out = self.ensure_started()?;
+                let chat_index = self.chat_tool_call_index(index);
                 out.extend(encode_json_sse(
                     None,
                     &build_openai_chat_chunk(
@@ -1376,7 +1571,7 @@ impl OpenAIChatClientEmitter {
                         self.model.as_deref().unwrap_or("unknown"),
                         String::new(),
                         Some(vec![json!({
-                            "index": index,
+                            "index": chat_index,
                             "id": call_id,
                             "type": "function",
                             "function": {
@@ -1391,6 +1586,7 @@ impl OpenAIChatClientEmitter {
             }
             CanonicalStreamEvent::ToolCallArgumentsDelta { index, arguments } => {
                 let mut out = self.ensure_started()?;
+                let chat_index = self.chat_tool_call_index(index);
                 out.extend(encode_json_sse(
                     None,
                     &json!({
@@ -1403,7 +1599,7 @@ impl OpenAIChatClientEmitter {
                             "index": 0,
                             "delta": {
                                 "tool_calls": [{
-                                    "index": index,
+                                    "index": chat_index,
                                     "function": {
                                         "arguments": arguments,
                                     }
@@ -1446,6 +1642,13 @@ impl OpenAIChatClientEmitter {
                 )?);
                 Ok(out)
             }
+            CanonicalStreamEvent::UnknownEvent(payload)
+                if openai_stream_terminal_error_body(&payload).is_some() =>
+            {
+                self.finished = true;
+                let error_body = openai_stream_terminal_error_body(&payload).unwrap_or(payload);
+                encode_json_sse(None, &error_body)
+            }
             CanonicalStreamEvent::UnknownEvent(_) => Ok(Vec::new()),
             CanonicalStreamEvent::Finish {
                 finish_reason,
@@ -1468,17 +1671,12 @@ impl OpenAIChatClientEmitter {
                 if let Some(usage) = usage {
                     out.extend(encode_json_sse(
                         None,
-                        &build_openai_chat_usage_chunk(
+                        &build_openai_chat_usage_chunk_from_usage(
                             self.response_id
                                 .as_deref()
                                 .unwrap_or("chatcmpl-local-stream"),
                             self.model.as_deref().unwrap_or("unknown"),
-                            usage.input_tokens,
-                            usage.output_tokens,
-                            usage.total_tokens,
-                            usage.reasoning_tokens,
-                            usage.cache_read_tokens,
-                            usage.cache_creation_tokens,
+                            &usage,
                         ),
                     )?);
                 }
@@ -1653,6 +1851,11 @@ impl OpenAIResponsesClientEmitter {
         let output_index = self.allocate_output_index();
         self.tool_results.entry(index).or_default().output_index = Some(output_index);
         output_index
+    }
+
+    fn ensure_image_generation_output_index(&mut self, index: usize) -> usize {
+        self.next_output_index = self.next_output_index.max(index.saturating_add(1));
+        index
     }
 
     fn ensure_reasoning_item_started(&mut self) -> Result<Vec<u8>, AiSurfaceFinalizeError> {
@@ -1887,6 +2090,26 @@ impl OpenAIResponsesClientEmitter {
             } else {
                 state.name.clone()
             };
+            if state.web_search {
+                out.extend(self.encode_response_event(
+                    "response.output_item.done",
+                    json!({
+                        "type": "response.output_item.done",
+                        "response_id": self.response_id(),
+                        "output_index": output_index,
+                        "item": {
+                            "type": "web_search_call",
+                            "id": item_id,
+                            "status": "completed",
+                            "action": {
+                                "type": "search",
+                                "query": web_search_query_from_arguments(&state.arguments),
+                            },
+                        }
+                    }),
+                )?);
+                continue;
+            }
             out.extend(self.encode_response_event(
                 "response.function_call_arguments.done",
                 json!({
@@ -1958,6 +2181,42 @@ impl OpenAIResponsesClientEmitter {
         Ok(out)
     }
 
+    fn emit_image_generation_call_item(
+        &mut self,
+        index: usize,
+        item: Value,
+    ) -> Result<Vec<u8>, AiSurfaceFinalizeError> {
+        let mut out = self.ensure_started()?;
+        let output_index = self.ensure_image_generation_output_index(index);
+        let mut item = item.as_object().cloned().unwrap_or_default();
+        item.insert(
+            "type".to_string(),
+            Value::String("image_generation_call".to_string()),
+        );
+        if !item.contains_key("id") {
+            item.insert(
+                "id".to_string(),
+                Value::String(format!("{}_ig_{}", self.response_id(), output_index)),
+            );
+        }
+        if !item.contains_key("status") {
+            item.insert("status".to_string(), Value::String("completed".to_string()));
+        }
+        let item = Value::Object(item);
+        self.image_generation_items
+            .insert(output_index, item.clone());
+        out.extend(self.encode_response_event(
+            "response.output_item.done",
+            json!({
+                "type": "response.output_item.done",
+                "response_id": self.response_id(),
+                "output_index": output_index,
+                "item": item,
+            }),
+        )?);
+        Ok(out)
+    }
+
     fn completed_response(&self, usage: CanonicalUsage) -> Value {
         let mut ordered_output = Vec::new();
         let summary = if self.reasoning_summary_parts.is_empty() {
@@ -2009,20 +2268,32 @@ impl OpenAIResponsesClientEmitter {
         }
         for (index, state) in &self.tool_calls {
             if let Some(output_index) = state.output_index {
+                let item_id = if state.call_id.is_empty() {
+                    build_generated_tool_call_id(*index)
+                } else {
+                    state.call_id.clone()
+                };
+                if state.web_search {
+                    ordered_output.push((
+                        output_index,
+                        json!({
+                            "type": "web_search_call",
+                            "id": item_id,
+                            "status": "completed",
+                            "action": {
+                                "type": "search",
+                                "query": web_search_query_from_arguments(&state.arguments),
+                            },
+                        }),
+                    ));
+                    continue;
+                }
                 ordered_output.push((
                     output_index,
                     json!({
                         "type": "function_call",
-                        "id": if state.call_id.is_empty() {
-                            build_generated_tool_call_id(*index)
-                        } else {
-                            state.call_id.clone()
-                        },
-                        "call_id": if state.call_id.is_empty() {
-                            build_generated_tool_call_id(*index)
-                        } else {
-                            state.call_id.clone()
-                        },
+                        "id": item_id.clone(),
+                        "call_id": item_id,
                         "name": if state.name.is_empty() {
                             "unknown".to_string()
                         } else {
@@ -2060,40 +2331,10 @@ impl OpenAIResponsesClientEmitter {
                 ordered_output.push((output_index, Value::Object(item)));
             }
         }
+        for (output_index, item) in &self.image_generation_items {
+            ordered_output.push((*output_index, item.clone()));
+        }
         ordered_output.sort_by_key(|(output_index, _)| *output_index);
-
-        let mut usage_payload = Map::new();
-        usage_payload.insert("input_tokens".to_string(), Value::from(usage.input_tokens));
-        usage_payload.insert(
-            "output_tokens".to_string(),
-            Value::from(usage.output_tokens),
-        );
-        usage_payload.insert("total_tokens".to_string(), Value::from(usage.total_tokens));
-        if usage.cache_read_tokens > 0 || usage.cache_creation_tokens > 0 {
-            let mut input_tokens_details = Map::new();
-            if usage.cache_read_tokens > 0 {
-                input_tokens_details.insert(
-                    "cached_tokens".to_string(),
-                    Value::from(usage.cache_read_tokens),
-                );
-            }
-            if usage.cache_creation_tokens > 0 {
-                input_tokens_details.insert(
-                    "cached_creation_tokens".to_string(),
-                    Value::from(usage.cache_creation_tokens),
-                );
-            }
-            usage_payload.insert(
-                "input_tokens_details".to_string(),
-                Value::Object(input_tokens_details),
-            );
-        }
-        if usage.reasoning_tokens > 0 {
-            usage_payload.insert(
-                "output_tokens_details".to_string(),
-                json!({ "reasoning_tokens": usage.reasoning_tokens }),
-            );
-        }
 
         json!({
             "id": self.response_id(),
@@ -2104,7 +2345,7 @@ impl OpenAIResponsesClientEmitter {
                 .into_iter()
                 .map(|(_, item)| item)
                 .collect::<Vec<_>>(),
-            "usage": usage_payload,
+            "usage": openai_responses_usage_from_usage(&usage),
         })
     }
 
@@ -2204,6 +2445,9 @@ impl OpenAIResponsesClientEmitter {
                 )?);
                 Ok(out)
             }
+            CanonicalStreamEvent::ImageGenerationCall { index, item } => {
+                self.emit_image_generation_call_item(index, item)
+            }
             CanonicalStreamEvent::ToolCallStart {
                 index,
                 call_id,
@@ -2215,22 +2459,36 @@ impl OpenAIResponsesClientEmitter {
                 let state = self.tool_calls.entry(index).or_default();
                 state.call_id = call_id.clone();
                 state.name = name.clone();
+                state.web_search = is_responses_web_search_tool(&name);
                 let emitted_call_id = state.call_id.clone();
                 let emitted_name = state.name.clone();
+                let item = if state.web_search {
+                    json!({
+                        "type": "web_search_call",
+                        "id": emitted_call_id,
+                        "status": "in_progress",
+                        "action": {
+                            "type": "search",
+                            "query": "",
+                        },
+                    })
+                } else {
+                    json!({
+                        "type": "function_call",
+                        "id": call_id,
+                        "call_id": emitted_call_id,
+                        "name": emitted_name,
+                        "arguments": "",
+                        "status": "in_progress",
+                    })
+                };
                 out.extend(self.encode_response_event(
                     "response.output_item.added",
                     json!({
                         "type": "response.output_item.added",
                         "response_id": response_id,
                         "output_index": output_index,
-                        "item": {
-                            "type": "function_call",
-                            "id": call_id,
-                            "call_id": emitted_call_id,
-                            "name": emitted_name,
-                            "arguments": "",
-                            "status": "in_progress",
-                        }
+                        "item": item
                     }),
                 )?);
                 Ok(out)
@@ -2241,6 +2499,9 @@ impl OpenAIResponsesClientEmitter {
                 let response_id = self.response_id().to_string();
                 let state = self.tool_calls.entry(index).or_default();
                 state.arguments.push_str(&arguments);
+                if state.web_search {
+                    return Ok(out);
+                }
                 let item_id = if state.call_id.is_empty() {
                     build_generated_tool_call_id(index)
                 } else {
@@ -2334,6 +2595,29 @@ impl OpenAIResponsesClientEmitter {
                 }
                 Ok(out)
             }
+            CanonicalStreamEvent::UnknownEvent(payload)
+                if openai_stream_terminal_error_body(&payload).is_some() =>
+            {
+                self.finished = true;
+                let raw_event = payload.get("type").and_then(Value::as_str);
+                let event = raw_event
+                    .filter(|event| {
+                        matches!(*event, "response.failed" | "response.incomplete" | "error")
+                    })
+                    .unwrap_or("response.failed")
+                    .to_string();
+                let mut payload = if raw_event == Some(event.as_str()) {
+                    payload
+                } else {
+                    openai_stream_terminal_error_body(&payload).unwrap_or(payload)
+                };
+                if payload.get("type").is_none() {
+                    if let Some(object) = payload.as_object_mut() {
+                        object.insert("type".to_string(), Value::String(event.clone()));
+                    }
+                }
+                self.encode_response_event(event.as_str(), payload)
+            }
             CanonicalStreamEvent::UnknownEvent(_) => Ok(Vec::new()),
             CanonicalStreamEvent::Finish { usage, .. } => {
                 if self.finished {
@@ -2425,6 +2709,7 @@ fn openai_tool_result_content_from_value(value: Option<&Value>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::formats::claude::messages::stream::ClaudeClientEmitter;
 
     fn data_line(value: Value) -> Vec<u8> {
         format!("data: {}\n", value).into_bytes()
@@ -2479,6 +2764,27 @@ mod tests {
             parts.push((summary_index, text.to_string()));
         }
         parts
+    }
+
+    fn openai_chat_tool_call_indices(sse: &str) -> Vec<u64> {
+        let mut indices = Vec::new();
+        for payload in sse.lines().filter_map(|line| line.strip_prefix("data: ")) {
+            let Ok(value) = serde_json::from_str::<Value>(payload) else {
+                continue;
+            };
+            let Some(tool_calls) = value
+                .pointer("/choices/0/delta/tool_calls")
+                .and_then(Value::as_array)
+            else {
+                continue;
+            };
+            for tool_call in tool_calls {
+                if let Some(index) = tool_call.get("index").and_then(Value::as_u64) {
+                    indices.push(index);
+                }
+            }
+        }
+        indices
     }
 
     #[test]
@@ -2540,6 +2846,40 @@ mod tests {
     }
 
     #[test]
+    fn openai_responses_provider_state_treats_failed_event_as_terminal() {
+        let mut state = OpenAIResponsesProviderState::default();
+        let report_context = json!({});
+        let frames = state
+            .push_line(
+                &report_context,
+                data_line(json!({
+                    "type": "response.failed",
+                    "response": {
+                        "id": "resp_failed_123",
+                        "model": "gpt-5.4",
+                        "status": "failed",
+                        "error": {
+                            "message": "policy failure",
+                            "type": "invalid_request_error",
+                            "code": "cyber_policy"
+                        }
+                    }
+                })),
+            )
+            .expect("failed response event should parse");
+
+        assert!(frames.iter().any(|frame| matches!(
+            frame.event,
+            CanonicalStreamEvent::UnknownEvent(ref payload)
+                if payload.get("type").and_then(Value::as_str) == Some("response.failed")
+        )));
+        assert!(state
+            .finish(&report_context)
+            .expect("terminal failure should not synthesize completion")
+            .is_empty());
+    }
+
+    #[test]
     fn openai_usage_derives_missing_input_tokens_from_total() {
         let usage = canonical_usage_from_openai_usage(Some(&json!({
             "output_tokens": 177,
@@ -2554,6 +2894,7 @@ mod tests {
         .expect("usage should parse");
 
         assert_eq!(usage.input_tokens, 20_435);
+        assert!(usage.input_tokens_include_cache);
         assert_eq!(usage.output_tokens, 177);
         assert_eq!(usage.cache_read_tokens, 19_840);
         assert_eq!(usage.reasoning_tokens, 7);
@@ -2706,6 +3047,41 @@ mod tests {
     }
 
     #[test]
+    fn openai_responses_client_emitter_forwards_failed_unknown_event() {
+        let mut emitter = OpenAIResponsesClientEmitter::default();
+        let bytes = emitter
+            .emit(CanonicalStreamFrame {
+                id: "resp_failed_123".to_string(),
+                model: "gpt-5.4".to_string(),
+                event: CanonicalStreamEvent::UnknownEvent(json!({
+                    "type": "response.failed",
+                    "response": {
+                        "id": "resp_failed_123",
+                        "model": "gpt-5.4",
+                        "status": "failed",
+                        "error": {
+                            "message": "policy failure",
+                            "type": "invalid_request_error",
+                            "code": "cyber_policy"
+                        }
+                    }
+                })),
+            })
+            .expect("failed response event should encode");
+        let mut all = bytes;
+        all.extend(
+            emitter
+                .finish()
+                .expect("failed stream should not synthesize completion"),
+        );
+
+        let sse = String::from_utf8(all).expect("sse should be utf8");
+        assert!(sse.contains("event: response.failed\n"));
+        assert!(sse.contains("\"message\":\"policy failure\""));
+        assert!(!sse.contains("event: response.completed\n"));
+    }
+
+    #[test]
     fn openai_responses_client_emitter_keeps_text_item_id_stable_after_text_started() {
         let mut emitter = OpenAIResponsesClientEmitter::default();
         let mut bytes = emitter
@@ -2851,6 +3227,266 @@ mod tests {
     }
 
     #[test]
+    fn openai_responses_provider_state_does_not_duplicate_text_snapshot_deltas() {
+        let mut state = OpenAIResponsesProviderState::default();
+        let report_context = json!({});
+        let mut frames = Vec::new();
+
+        for event in [
+            json!({
+                "type": "response.output_text.delta",
+                "response_id": "resp_snapshot_delta",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": {
+                    "text": "Hello",
+                }
+            }),
+            json!({
+                "type": "response.output_text.delta",
+                "response_id": "resp_snapshot_delta",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": {
+                    "text": "Hello world",
+                }
+            }),
+            json!({
+                "type": "response.output_text.delta",
+                "response_id": "resp_snapshot_delta",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": {
+                    "text": "Hello",
+                }
+            }),
+            json!({
+                "type": "response.output_text.done",
+                "response_id": "resp_snapshot_delta",
+                "output_index": 0,
+                "content_index": 0,
+                "text": "Hello world",
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_snapshot_delta",
+                    "object": "response",
+                    "model": "gpt-5.4",
+                    "status": "completed",
+                    "output": [{
+                        "type": "message",
+                        "id": "msg_snapshot_delta",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [{
+                            "type": "output_text",
+                            "text": "Hello world",
+                            "annotations": [],
+                        }]
+                    }],
+                }
+            }),
+        ] {
+            frames.extend(
+                state
+                    .push_line(&report_context, data_line(event))
+                    .expect("responses text event should parse"),
+            );
+        }
+
+        let text = frames
+            .iter()
+            .filter_map(|frame| match &frame.event {
+                CanonicalStreamEvent::TextDelta(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(text, "Hello world");
+    }
+
+    #[test]
+    fn openai_responses_provider_state_dedupes_text_snapshots_per_output_item() {
+        let mut state = OpenAIResponsesProviderState::default();
+        let report_context = json!({});
+        let mut frames = Vec::new();
+
+        for event in [
+            json!({
+                "type": "response.output_text.delta",
+                "response_id": "resp_multi_message",
+                "output_index": 0,
+                "item_id": "msg_1",
+                "content_index": 0,
+                "delta": "First message.",
+            }),
+            json!({
+                "type": "response.output_text.done",
+                "response_id": "resp_multi_message",
+                "output_index": 0,
+                "item_id": "msg_1",
+                "content_index": 0,
+                "text": "First message.",
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "response_id": "resp_multi_message",
+                "output_index": 0,
+                "item": {
+                    "type": "message",
+                    "id": "msg_1",
+                    "status": "completed",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "First message.",
+                    }],
+                },
+            }),
+            json!({
+                "type": "response.output_text.delta",
+                "response_id": "resp_multi_message",
+                "output_index": 1,
+                "item_id": "msg_2",
+                "content_index": 0,
+                "delta": "Second message.",
+            }),
+            json!({
+                "type": "response.output_text.done",
+                "response_id": "resp_multi_message",
+                "output_index": 1,
+                "item_id": "msg_2",
+                "content_index": 0,
+                "text": "Second message.",
+            }),
+            json!({
+                "type": "response.content_part.done",
+                "response_id": "resp_multi_message",
+                "output_index": 1,
+                "item_id": "msg_2",
+                "content_index": 0,
+                "part": {
+                    "type": "output_text",
+                    "text": "Second message.",
+                },
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "response_id": "resp_multi_message",
+                "output_index": 1,
+                "item": {
+                    "type": "message",
+                    "id": "msg_2",
+                    "status": "completed",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "Second message.",
+                    }],
+                },
+            }),
+        ] {
+            frames.extend(
+                state
+                    .push_line(&report_context, data_line(event))
+                    .expect("responses text event should parse"),
+            );
+        }
+
+        let text = frames
+            .iter()
+            .filter_map(|frame| match &frame.event {
+                CanonicalStreamEvent::TextDelta(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(text, "First message.Second message.");
+    }
+
+    #[test]
+    fn openai_responses_provider_state_delays_arguments_until_tool_name_is_known() {
+        let mut state = OpenAIResponsesProviderState::default();
+        let report_context = json!({});
+        let arguments = r#"{"file_path":"D:/projects/UIAutoTest/docs/prd/msr.md","offset":0,"limit":2000,"pages":""}"#;
+        let mut frames = Vec::new();
+
+        let delta_frames = state
+            .push_line(
+                &report_context,
+                data_line(json!({
+                    "type": "response.function_call_arguments.delta",
+                    "response_id": "resp_read_123",
+                    "output_index": 0,
+                    "item_id": "fc_read_123",
+                    "delta": arguments,
+                })),
+            )
+            .expect("arguments delta should parse");
+
+        assert!(matches!(
+            delta_frames.first().map(|frame| &frame.event),
+            Some(CanonicalStreamEvent::Start)
+        ));
+        assert!(!delta_frames.iter().any(|frame| matches!(
+            frame.event,
+            CanonicalStreamEvent::ToolCallStart { .. }
+                | CanonicalStreamEvent::ToolCallArgumentsDelta { .. }
+        )));
+        frames.extend(delta_frames);
+
+        frames.extend(
+            state
+                .push_line(
+                    &report_context,
+                    data_line(json!({
+                        "type": "response.function_call_arguments.done",
+                        "response_id": "resp_read_123",
+                        "output_index": 0,
+                        "item_id": "fc_read_123",
+                        "item": {
+                            "type": "function_call",
+                            "id": "fc_read_123",
+                            "call_id": "call_read_123",
+                            "name": "Read",
+                            "arguments": arguments,
+                        }
+                    })),
+                )
+                .expect("arguments done should parse"),
+        );
+
+        assert!(frames.iter().any(|frame| matches!(
+            frame.event,
+            CanonicalStreamEvent::ToolCallStart {
+                ref call_id,
+                ref name,
+                ..
+            } if call_id == "call_read_123" && name == "Read"
+        )));
+        assert!(frames.iter().any(|frame| matches!(
+            frame.event,
+            CanonicalStreamEvent::ToolCallArgumentsDelta {
+                ref arguments,
+                ..
+            } if arguments.contains(r#""pages":"""#)
+        )));
+
+        let mut emitter = ClaudeClientEmitter::default();
+        let mut bytes = Vec::new();
+        for frame in frames {
+            bytes.extend(emitter.emit(frame).expect("claude frame should encode"));
+        }
+        bytes.extend(
+            emitter
+                .finish()
+                .expect("claude stream finish should encode"),
+        );
+        let sse = String::from_utf8(bytes).expect("claude sse should be utf8");
+
+        assert!(sse.contains("\"name\":\"Read\""));
+        assert!(sse.contains("\\\"limit\\\":2000"));
+        assert!(!sse.contains("\\\"pages\\\":\\\"\\\""));
+    }
+
+    #[test]
     fn openai_responses_provider_state_parses_function_call_output_as_tool_result() {
         let mut state = OpenAIResponsesProviderState::default();
         let report_context = json!({});
@@ -2898,6 +3534,134 @@ mod tests {
     }
 
     #[test]
+    fn openai_responses_provider_state_preserves_image_generation_calls() {
+        let mut state = OpenAIResponsesProviderState::default();
+        let report_context = json!({});
+        let frames = state
+            .push_line(
+                &report_context,
+                data_line(json!({
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_img_123",
+                        "model": "gpt-image-2",
+                        "output": [{
+                            "id": "ig_123",
+                            "type": "image_generation_call",
+                            "status": "completed",
+                            "output_format": "png",
+                            "result": "aGVsbG8="
+                        }],
+                        "usage": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3}
+                    }
+                })),
+            )
+            .expect("completed event should parse");
+
+        assert!(frames.iter().any(|frame| matches!(
+            frame.event,
+            CanonicalStreamEvent::ImageGenerationCall {
+                index: 0,
+                ref item,
+            } if item["type"] == json!("image_generation_call")
+                && item["result"] == json!("aGVsbG8=")
+        )));
+    }
+
+    #[test]
+    fn openai_responses_provider_state_waits_for_final_image_generation_item() {
+        let mut state = OpenAIResponsesProviderState::default();
+        let report_context = json!({});
+
+        let added_frames = state
+            .push_line(
+                &report_context,
+                data_line(json!({
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": {
+                        "id": "ig_123",
+                        "type": "image_generation_call",
+                        "status": "generating",
+                        "output_format": "png",
+                        "result": "early"
+                    }
+                })),
+            )
+            .expect("added event should parse");
+
+        assert!(!added_frames.iter().any(|frame| matches!(
+            frame.event,
+            CanonicalStreamEvent::ImageGenerationCall { .. }
+        )));
+
+        let done_frames = state
+            .push_line(
+                &report_context,
+                data_line(json!({
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": {
+                        "id": "ig_123",
+                        "type": "image_generation_call",
+                        "status": "completed",
+                        "output_format": "png",
+                        "result": "final"
+                    }
+                })),
+            )
+            .expect("done event should parse");
+
+        assert!(done_frames.iter().any(|frame| matches!(
+            frame.event,
+            CanonicalStreamEvent::ImageGenerationCall {
+                index: 0,
+                ref item,
+            } if item["status"] == json!("completed") && item["result"] == json!("final")
+        )));
+    }
+
+    #[test]
+    fn openai_responses_client_emitter_emits_image_generation_call_events() {
+        let mut emitter = OpenAIResponsesClientEmitter::default();
+        let mut bytes = emitter
+            .emit(CanonicalStreamFrame {
+                id: "resp_img_123".to_string(),
+                model: "gpt-image-2".to_string(),
+                event: CanonicalStreamEvent::ImageGenerationCall {
+                    index: 0,
+                    item: json!({
+                        "id": "ig_123",
+                        "type": "image_generation_call",
+                        "status": "completed",
+                        "output_format": "png",
+                        "result": "aGVsbG8="
+                    }),
+                },
+            })
+            .expect("image event should encode");
+        bytes.extend(
+            emitter
+                .emit(CanonicalStreamFrame {
+                    id: "resp_img_123".to_string(),
+                    model: "gpt-image-2".to_string(),
+                    event: CanonicalStreamEvent::Finish {
+                        finish_reason: Some("stop".to_string()),
+                        usage: None,
+                    },
+                })
+                .expect("finish should encode"),
+        );
+
+        let sse = String::from_utf8(bytes).expect("sse should be utf8");
+        assert!(sse.contains("event: response.output_item.done\n"));
+        assert!(sse.contains("\"type\":\"image_generation_call\""));
+        assert!(sse.contains("\"result\":\"aGVsbG8=\""));
+        assert!(sse.contains("\"output\":["));
+        assert!(sse.contains("\"id\":\"ig_123\""));
+    }
+
+    #[test]
     fn openai_responses_client_emitter_emits_function_call_output_events() {
         let mut emitter = OpenAIResponsesClientEmitter::default();
         let mut bytes = emitter
@@ -2930,6 +3694,56 @@ mod tests {
         assert!(sse.contains("\"type\":\"function_call_output\""));
         assert!(sse.contains("\"call_id\":\"call_123\""));
         assert!(sse.contains("\"output\":\"{\\\"ok\\\":true}\""));
+    }
+
+    #[test]
+    fn openai_responses_client_emitter_emits_web_search_call_item() {
+        let mut emitter = OpenAIResponsesClientEmitter::default();
+        let mut bytes = emitter
+            .emit(CanonicalStreamFrame {
+                id: "resp_123".to_string(),
+                model: "gpt-5-5-low".to_string(),
+                event: CanonicalStreamEvent::ToolCallStart {
+                    index: 0,
+                    call_id: "call_ws_1".to_string(),
+                    name: "web_search".to_string(),
+                },
+            })
+            .expect("tool start should encode");
+        bytes.extend(
+            emitter
+                .emit(CanonicalStreamFrame {
+                    id: "resp_123".to_string(),
+                    model: "gpt-5-5-low".to_string(),
+                    event: CanonicalStreamEvent::ToolCallArgumentsDelta {
+                        index: 0,
+                        arguments: r#"{"query":"today tech"}"#.to_string(),
+                    },
+                })
+                .expect("arguments should encode"),
+        );
+        bytes.extend(
+            emitter
+                .emit(CanonicalStreamFrame {
+                    id: "resp_123".to_string(),
+                    model: "gpt-5-5-low".to_string(),
+                    event: CanonicalStreamEvent::Finish {
+                        finish_reason: Some("tool_calls".to_string()),
+                        usage: None,
+                    },
+                })
+                .expect("finish should encode"),
+        );
+
+        let sse = String::from_utf8(bytes).expect("sse should be utf8");
+        assert!(sse.contains("event: response.output_item.added\n"));
+        assert!(sse.contains(r#""type":"web_search_call""#));
+        assert!(sse.contains(r#""status":"in_progress""#));
+        assert!(sse.contains(r#""query":"""#));
+        assert!(sse.contains(r#""type":"search""#));
+        assert!(sse.contains("event: response.output_item.done\n"));
+        assert!(sse.contains(r#""query":"today tech""#));
+        assert!(!sse.contains("response.function_call_arguments.delta"));
     }
 
     #[test]
@@ -3016,6 +3830,50 @@ mod tests {
     }
 
     #[test]
+    fn openai_chat_client_emitter_normalizes_sparse_tool_call_indices() {
+        let mut emitter = OpenAIChatClientEmitter::default();
+        let mut bytes = Vec::new();
+
+        for event in [
+            CanonicalStreamEvent::ToolCallStart {
+                index: 1,
+                call_id: "call_first".to_string(),
+                name: "first_tool".to_string(),
+            },
+            CanonicalStreamEvent::ToolCallArgumentsDelta {
+                index: 1,
+                arguments: "{\"first\":".to_string(),
+            },
+            CanonicalStreamEvent::ToolCallStart {
+                index: 3,
+                call_id: "call_second".to_string(),
+                name: "second_tool".to_string(),
+            },
+            CanonicalStreamEvent::ToolCallArgumentsDelta {
+                index: 3,
+                arguments: "{\"second\":true}".to_string(),
+            },
+            CanonicalStreamEvent::ToolCallArgumentsDelta {
+                index: 1,
+                arguments: "true}".to_string(),
+            },
+        ] {
+            bytes.extend(
+                emitter
+                    .emit(CanonicalStreamFrame {
+                        id: "chatcmpl_sparse".to_string(),
+                        model: "claude-opus-4-6".to_string(),
+                        event,
+                    })
+                    .expect("tool event should encode"),
+            );
+        }
+
+        let sse = String::from_utf8(bytes).expect("sse should be utf8");
+        assert_eq!(openai_chat_tool_call_indices(&sse), vec![0, 0, 1, 1, 0]);
+    }
+
+    #[test]
     fn openai_chat_client_emitter_emits_usage_only_final_chunk() {
         let mut emitter = OpenAIChatClientEmitter::default();
         let mut bytes = emitter
@@ -3043,11 +3901,12 @@ mod tests {
                         finish_reason: Some("stop".to_string()),
                         usage: Some(CanonicalUsage {
                             input_tokens: 1,
+                            input_tokens_include_cache: true,
                             output_tokens: 2,
                             total_tokens: 3,
+                            cache_creation_tokens: 5,
+                            cache_read_tokens: 4,
                             reasoning_tokens: 1,
-                            cache_read_tokens: 5,
-                            cache_creation_tokens: 7,
                             ..CanonicalUsage::default()
                         }),
                     },
@@ -3061,8 +3920,8 @@ mod tests {
         assert!(sse.contains("\"prompt_tokens\":1"));
         assert!(sse.contains("\"completion_tokens\":2"));
         assert!(sse.contains("\"prompt_tokens_details\":"));
-        assert!(sse.contains("\"cached_tokens\":5"));
-        assert!(sse.contains("\"cached_creation_tokens\":7"));
+        assert!(sse.contains("\"cached_tokens\":4"));
+        assert!(sse.contains("\"cached_creation_tokens\":5"));
         assert!(sse.contains("\"completion_tokens_details\":{\"reasoning_tokens\":1}"));
         assert!(sse.contains("\"total_tokens\":3"));
         assert!(sse.contains("data: [DONE]\n\n"));
@@ -3171,9 +4030,9 @@ mod tests {
                             input_tokens: 1,
                             output_tokens: 2,
                             total_tokens: 3,
+                            cache_creation_tokens: 5,
+                            cache_read_tokens: 4,
                             reasoning_tokens: 1,
-                            cache_read_tokens: 5,
-                            cache_creation_tokens: 7,
                             ..CanonicalUsage::default()
                         }),
                     },
@@ -3185,8 +4044,8 @@ mod tests {
         assert!(sse.contains("\"type\":\"reasoning\""));
         assert!(sse.contains("\"text\":\"because\""));
         assert!(sse.contains("\"input_tokens_details\":"));
-        assert!(sse.contains("\"cached_tokens\":5"));
-        assert!(sse.contains("\"cached_creation_tokens\":7"));
+        assert!(sse.contains("\"cached_tokens\":4"));
+        assert!(sse.contains("\"cached_creation_tokens\":5"));
         assert!(sse.contains("\"output_tokens_details\":{\"reasoning_tokens\":1}"));
     }
 

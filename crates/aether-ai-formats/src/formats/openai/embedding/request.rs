@@ -50,6 +50,10 @@ pub(crate) fn from_namespace(body_json: &Value, namespace: &str) -> Option<Canon
             .get("user")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
+        parameters: request
+            .get("parameters")
+            .and_then(Value::as_object)
+            .cloned(),
         extensions: namespace_extensions(
             namespace,
             request,
@@ -60,6 +64,7 @@ pub(crate) fn from_namespace(body_json: &Value, namespace: &str) -> Option<Canon
                 "dimensions",
                 "task",
                 "user",
+                "parameters",
             ],
         ),
     };
@@ -81,6 +86,9 @@ pub(crate) fn to_openai_like(
     if embedding.input.is_empty() {
         return None;
     }
+    if matches!(&embedding.input, CanonicalEmbeddingInput::Multimodal(_)) {
+        return None;
+    }
     let mut output = Map::new();
     output.insert(
         "model".to_string(),
@@ -98,6 +106,9 @@ pub(crate) fn to_openai_like(
     }
     if let Some(value) = &embedding.user {
         output.insert("user".to_string(), Value::String(value.clone()));
+    }
+    if let Some(value) = &embedding.parameters {
+        output.insert("parameters".to_string(), Value::Object(value.clone()));
     }
     if let Some(task) = embedding
         .task

@@ -14,15 +14,23 @@ use serde_json::json;
 
 use super::{
     build_admin_endpoint_health_status_payload, build_auth_error_response, query_param_value,
-    resolve_authenticated_local_user, AppState, GatewayPublicRequestContext,
-    USERS_ME_AVAILABLE_MODELS_FETCH_LIMIT,
+    resolve_authenticated_local_user, sanitize_public_model_config_for_user, AppState,
+    GatewayPublicRequestContext, USERS_ME_AVAILABLE_MODELS_FETCH_LIMIT,
 };
 
 const USERS_ME_MODEL_CATALOG_UNAVAILABLE_DETAIL: &str = "用户模型目录暂不可用";
 const USERS_ME_PROVIDER_CATALOG_UNAVAILABLE_DETAIL: &str = "用户提供商目录暂不可用";
 const USERS_ME_ENDPOINT_STATUS_UNAVAILABLE_DETAIL: &str = "用户端点健康数据暂不可用";
 
-fn build_users_me_available_model_payload(model: StoredPublicGlobalModel) -> serde_json::Value {
+fn build_users_me_available_model_payload(
+    model: StoredPublicGlobalModel,
+    hide_mapping_config: bool,
+) -> serde_json::Value {
+    let config = if hide_mapping_config {
+        sanitize_public_model_config_for_user(model.config)
+    } else {
+        model.config
+    };
     json!({
         "id": model.id,
         "name": model.name,
@@ -31,7 +39,7 @@ fn build_users_me_available_model_payload(model: StoredPublicGlobalModel) -> ser
         "default_price_per_request": model.default_price_per_request,
         "default_tiered_pricing": model.default_tiered_pricing,
         "supported_capabilities": model.supported_capabilities,
-        "config": model.config,
+        "config": config,
         "usage_count": model.usage_count,
     })
 }
@@ -49,35 +57,27 @@ fn parse_users_me_available_models_query(query: Option<&str>) -> (usize, usize, 
 }
 
 fn users_me_allowed_provider_names(
-    user: &aether_data::repository::users::StoredUserAuthRecord,
+    allowed_providers: Option<&[String]>,
 ) -> Option<BTreeSet<String>> {
-    if user.role.eq_ignore_ascii_case("admin") {
-        return None;
-    }
-
-    user.allowed_providers
-        .as_ref()
-        .map(|providers| {
-            providers
-                .iter()
-                .map(|value| value.trim().to_ascii_lowercase())
-                .filter(|value| !value.is_empty())
-                .collect::<BTreeSet<_>>()
-        })
-        .filter(|providers| !providers.is_empty())
+    allowed_providers.map(|providers| {
+        providers
+            .iter()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty())
+            .collect::<BTreeSet<_>>()
+    })
 }
 
 async fn resolve_users_me_allowed_global_model_ids(
     state: &AppState,
-    user: &aether_data::repository::users::StoredUserAuthRecord,
+    allowed_providers: Option<&[String]>,
 ) -> Result<Option<BTreeSet<String>>, Response<Body>> {
-    let Some(allowed_providers) = user
-        .allowed_providers
-        .as_ref()
-        .filter(|providers| !providers.is_empty())
-    else {
+    let Some(allowed_providers) = allowed_providers else {
         return Ok(None);
     };
+    if allowed_providers.is_empty() {
+        return Ok(Some(BTreeSet::new()));
+    }
 
     if !state.has_provider_catalog_data_reader() {
         return Err(build_auth_error_response(
@@ -155,10 +155,35 @@ pub(super) async fn handle_users_me_available_models(
     let (skip, limit, search) =
         parse_users_me_available_models_query(request_context.request_query_string.as_deref());
 
+    let effective_policies = if auth.user.role.eq_ignore_ascii_case("admin") {
+        None
+    } else {
+        match state
+            .data
+            .resolve_user_effective_list_policies(&auth.user)
+            .await
+        {
+            Ok(value) => Some(value),
+            Err(err) => {
+                return build_auth_error_response(
+                    http::StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("user policy lookup failed: {err:?}"),
+                    false,
+                )
+            }
+        }
+    };
     let provider_model_ids = if auth.user.role.eq_ignore_ascii_case("admin") {
         None
     } else {
-        match resolve_users_me_allowed_global_model_ids(state, &auth.user).await {
+        match resolve_users_me_allowed_global_model_ids(
+            state,
+            effective_policies
+                .as_ref()
+                .and_then(|policies| policies.allowed_providers.as_deref()),
+        )
+        .await
+        {
             Ok(value) => value,
             Err(response) => return response,
         }
@@ -166,9 +191,9 @@ pub(super) async fn handle_users_me_available_models(
     let allowed_models: Option<BTreeSet<String>> = if auth.user.role.eq_ignore_ascii_case("admin") {
         None
     } else {
-        auth.user
-            .allowed_models
+        effective_policies
             .as_ref()
+            .and_then(|policies| policies.allowed_models.as_ref())
             .map(|models: &Vec<String>| {
                 models
                     .iter()
@@ -176,8 +201,17 @@ pub(super) async fn handle_users_me_available_models(
                     .filter(|value: &String| !value.is_empty())
                     .collect::<BTreeSet<_>>()
             })
-            .filter(|models: &BTreeSet<String>| !models.is_empty())
     };
+
+    let hide_mapping_config = !auth.user.role.eq_ignore_ascii_case("admin");
+
+    let allowed_models: Option<BTreeSet<String>> = allowed_models.map(|models| {
+        models
+            .into_iter()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty())
+            .collect::<BTreeSet<_>>()
+    });
 
     let page = if provider_model_ids.is_none() && allowed_models.is_none() {
         match state
@@ -247,7 +281,7 @@ pub(super) async fn handle_users_me_available_models(
         "models": page
             .items
             .into_iter()
-            .map(build_users_me_available_model_payload)
+            .map(|model| build_users_me_available_model_payload(model, hide_mapping_config))
             .collect::<Vec<_>>(),
         "total": page.total,
     }))
@@ -271,7 +305,26 @@ pub(super) async fn handle_users_me_providers_get(
         Ok(value) => value,
         Err(response) => return response,
     };
-    let allowed_provider_names = users_me_allowed_provider_names(&auth.user);
+    let expose_provider_details = auth.user.role.eq_ignore_ascii_case("admin");
+    let allowed_provider_names = if expose_provider_details {
+        None
+    } else {
+        let effective_policies = match state
+            .data
+            .resolve_user_effective_list_policies(&auth.user)
+            .await
+        {
+            Ok(value) => value,
+            Err(err) => {
+                return build_auth_error_response(
+                    http::StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("user policy lookup failed: {err:?}"),
+                    false,
+                )
+            }
+        };
+        users_me_allowed_provider_names(effective_policies.allowed_providers.as_deref())
+    };
 
     let mut providers = match state.list_provider_catalog_providers(true).await {
         Ok(value) => value,
@@ -315,15 +368,18 @@ pub(super) async fn handle_users_me_providers_get(
     };
     let mut endpoints_by_provider = BTreeMap::<String, Vec<serde_json::Value>>::new();
     for endpoint in endpoints {
+        let mut endpoint_payload = json!({
+            "id": endpoint.id,
+            "api_format": endpoint.api_format,
+            "is_active": endpoint.is_active,
+        });
+        if expose_provider_details {
+            endpoint_payload["base_url"] = json!(endpoint.base_url);
+        }
         endpoints_by_provider
             .entry(endpoint.provider_id)
             .or_default()
-            .push(json!({
-                "id": endpoint.id,
-                "api_format": endpoint.api_format,
-                "base_url": endpoint.base_url,
-                "is_active": endpoint.is_active,
-            }));
+            .push(endpoint_payload);
     }
 
     let mut models_by_provider = BTreeMap::<String, Vec<serde_json::Value>>::new();
@@ -375,20 +431,23 @@ pub(super) async fn handle_users_me_providers_get(
             .into_iter()
             .map(|provider| {
                 let provider_id = provider.id.clone();
-                let description = provider
-                    .config
-                    .as_ref()
-                    .and_then(|value| value.get("description"))
-                    .and_then(serde_json::Value::as_str)
-                    .map(ToOwned::to_owned);
-                json!({
+                let mut payload = json!({
                     "id": provider_id.clone(),
-                    "name": provider.name,
-                    "description": description,
                     "provider_priority": provider.provider_priority,
                     "endpoints": endpoints_by_provider.remove(&provider_id).unwrap_or_default(),
                     "models": models_by_provider.remove(&provider_id).unwrap_or_default(),
-                })
+                });
+                if expose_provider_details {
+                    let description = provider
+                        .config
+                        .as_ref()
+                        .and_then(|value| value.get("description"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(ToOwned::to_owned);
+                    payload["name"] = json!(provider.name);
+                    payload["description"] = json!(description);
+                }
+                payload
             })
             .collect::<Vec<_>>(),
     )

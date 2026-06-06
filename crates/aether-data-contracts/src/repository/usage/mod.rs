@@ -1,8 +1,10 @@
 mod types;
 
 pub use types::{
-    parse_usage_body_ref, usage_body_ref, PendingUsageCleanupSummary,
-    ProviderApiKeyWindowUsageRequest, StoredProviderApiKeyUsageSummary,
+    extract_provider_reasoning_effort_from_body, extract_provider_service_tier_from_body,
+    parse_usage_body_ref, usage_body_ref, usage_request_metadata_client_family,
+    ApiKeyLastUsedDelta, ManagementTokenCounterDelta, PendingUsageCleanupSummary,
+    ProviderApiKeyWindowUsageRequest, ProxyNodeCounterDelta, StoredProviderApiKeyUsageSummary,
     StoredProviderApiKeyWindowUsageSummary, StoredProviderUsageSummary, StoredProviderUsageWindow,
     StoredRequestUsageAudit, StoredUsageAuditAggregation, StoredUsageAuditSummary,
     StoredUsageBreakdownSummaryRow, StoredUsageCacheAffinityHitSummary,
@@ -18,12 +20,14 @@ pub use types::{
     UsageAuditListQuery, UsageAuditSummaryQuery, UsageBodyCaptureResult, UsageBodyCaptureState,
     UsageBodyCaptureStorage, UsageBodyField, UsageBreakdownGroupBy, UsageBreakdownSummaryQuery,
     UsageCacheAffinityHitSummaryQuery, UsageCacheAffinityIntervalGroupBy,
-    UsageCacheAffinityIntervalQuery, UsageCacheHitSummaryQuery, UsageCleanupPreviewCounts,
-    UsageCleanupSummary, UsageCleanupWindow, UsageCostSavingsSummaryQuery, UsageDailyHeatmapQuery,
-    UsageDashboardDailyBreakdownQuery, UsageDashboardProviderCountsQuery,
+    UsageCacheAffinityIntervalQuery, UsageCacheHitSummaryQuery, UsageCleanupExecutionMode,
+    UsageCleanupPreviewCounts, UsageCleanupSummary, UsageCleanupTargets, UsageCleanupWindow,
+    UsageCostSavingsSummaryQuery, UsageCounterFlushSummary, UsageCounterHealthSnapshot,
+    UsageDailyHeatmapQuery, UsageDashboardDailyBreakdownQuery, UsageDashboardProviderCountsQuery,
     UsageDashboardSummaryQuery, UsageErrorDistributionQuery, UsageLeaderboardGroupBy,
     UsageLeaderboardQuery, UsageMonitoringErrorCountQuery, UsageMonitoringErrorListQuery,
     UsagePerformancePercentilesQuery, UsageProviderPerformanceQuery, UsageReadRepository,
     UsageRepository, UsageSettledCostSummaryQuery, UsageTimeSeriesGranularity,
-    UsageTimeSeriesQuery, UsageWriteRepository,
+    UsageTimeSeriesQuery, UsageWriteRepository, PROVIDER_REASONING_EFFORT_METADATA_KEY,
+    PROVIDER_SERVICE_TIER_METADATA_KEY,
 };

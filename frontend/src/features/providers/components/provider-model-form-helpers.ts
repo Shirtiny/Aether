@@ -7,6 +7,11 @@ interface EmbeddingMetadataCarrier {
   config?: Record<string, unknown> | null
 }
 
+function isEmbeddingApiFormat(format: unknown): boolean {
+  const value = String(format).trim().toLowerCase()
+  return value.endsWith(':embedding') || value === 'aliyun:multimodal_embedding'
+}
+
 export interface ProviderModelCreatePayloadInput {
   globalModelId: string
   providerModelName: string
@@ -45,7 +50,7 @@ export function modelSupportsEmbedding(model: EmbeddingMetadataCarrier | null | 
   return supportedCapabilities?.includes('embedding') === true
     || config.embedding === true
     || config.model_type === 'embedding'
-    || (Array.isArray(config.api_formats) && config.api_formats.some((format) => String(format).endsWith(':embedding')))
+    || (Array.isArray(config.api_formats) && config.api_formats.some(isEmbeddingApiFormat))
 }
 
 export function buildProviderModelCreatePayload(input: ProviderModelCreatePayloadInput): ModelCreate {

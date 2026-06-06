@@ -1,18 +1,23 @@
 use super::{
     any, build_router_with_state, build_state_with_execution_runtime_override,
-    encrypt_python_fernet_plaintext, json, start_server, to_bytes, Arc, Body, Digest,
-    InMemoryAuthApiKeySnapshotRepository, InMemoryMinimalCandidateSelectionReadRepository,
-    InMemoryProviderCatalogReadRepository, InMemoryRequestCandidateRepository, Json, Mutex,
-    Request, RequestCandidateReadRepository, RequestCandidateStatus, Router, Sha256, StatusCode,
-    StoredAuthApiKeySnapshot, StoredMinimalCandidateSelectionRow, StoredProviderCatalogEndpoint,
-    StoredProviderCatalogKey, StoredProviderCatalogProvider, StoredProviderModelMapping,
-    DEVELOPMENT_ENCRYPTION_KEY, EXECUTION_PATH_EXECUTION_RUNTIME_SYNC, EXECUTION_PATH_HEADER,
+    encrypt_python_fernet_plaintext, json, run_async_test_on_large_stack, start_server, to_bytes,
+    Arc, Body, Digest, InMemoryAuthApiKeySnapshotRepository,
+    InMemoryMinimalCandidateSelectionReadRepository, InMemoryProviderCatalogReadRepository,
+    InMemoryRequestCandidateRepository, Json, Mutex, Request, RequestCandidateReadRepository,
+    RequestCandidateStatus, Router, Sha256, StatusCode, StoredAuthApiKeySnapshot,
+    StoredMinimalCandidateSelectionRow, StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
+    StoredProviderCatalogProvider, StoredProviderModelMapping, DEVELOPMENT_ENCRYPTION_KEY,
+    EXECUTION_PATH_EXECUTION_RUNTIME_SYNC, EXECUTION_PATH_HEADER,
     EXECUTION_PATH_LOCAL_EXECUTION_RUNTIME_MISS, LOCAL_EXECUTION_RUNTIME_MISS_REASON_HEADER,
     TRACE_ID_HEADER,
 };
 
-#[tokio::test]
-async fn gateway_skips_unsupported_local_openai_chat_sync_candidate_before_trying_next_one() {
+large_stack_async_test!(
+    gateway_skips_unsupported_local_openai_chat_sync_candidate_before_trying_next_one,
+    gateway_skips_unsupported_local_openai_chat_sync_candidate_before_trying_next_one_impl
+);
+
+async fn gateway_skips_unsupported_local_openai_chat_sync_candidate_before_trying_next_one_impl() {
     #[derive(Debug, Clone)]
     struct SeenExecutionRuntimeSyncRequest {
         trace_id: String,
@@ -378,7 +383,7 @@ async fn gateway_skips_unsupported_local_openai_chat_sync_candidate_before_tryin
     );
     assert_eq!(
         seen_execution_runtime_request.url,
-        "https://api.openai.backup.example/v1/chat/completions"
+        "https://api.openai.backup.example/chat/completions"
     );
     assert_eq!(
         seen_execution_runtime_request.model,
@@ -420,8 +425,12 @@ async fn gateway_skips_unsupported_local_openai_chat_sync_candidate_before_tryin
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_surfaces_local_execution_runtime_miss_reason_when_all_openai_chat_candidates_are_skipped(
+large_stack_async_test!(
+    gateway_surfaces_local_execution_runtime_miss_reason_when_all_openai_chat_candidates_are_skipped,
+    gateway_surfaces_local_execution_runtime_miss_reason_when_all_openai_chat_candidates_are_skipped_impl
+);
+
+async fn gateway_surfaces_local_execution_runtime_miss_reason_when_all_openai_chat_candidates_are_skipped_impl(
 ) {
     fn hash_api_key(value: &str) -> String {
         let mut hasher = Sha256::new();
@@ -678,8 +687,12 @@ async fn gateway_surfaces_local_execution_runtime_miss_reason_when_all_openai_ch
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_retries_next_local_openai_chat_sync_candidate_after_auth_failure() {
+large_stack_async_test!(
+    gateway_retries_next_local_openai_chat_sync_candidate_after_auth_failure,
+    gateway_retries_next_local_openai_chat_sync_candidate_after_auth_failure_impl
+);
+
+async fn gateway_retries_next_local_openai_chat_sync_candidate_after_auth_failure_impl() {
     #[derive(Debug, Clone)]
     struct SeenExecutionRuntimeSyncRequest {
         trace_id: String,
@@ -1115,7 +1128,7 @@ async fn gateway_retries_next_local_openai_chat_sync_candidate_after_auth_failur
     );
     assert_eq!(
         seen_execution_runtime_requests[0].url,
-        "https://api.openai.primary.example/v1/chat/completions"
+        "https://api.openai.primary.example/chat/completions"
     );
     assert_eq!(
         seen_execution_runtime_requests[0].authorization,
@@ -1123,7 +1136,7 @@ async fn gateway_retries_next_local_openai_chat_sync_candidate_after_auth_failur
     );
     assert_eq!(
         seen_execution_runtime_requests[1].url,
-        "https://api.openai.backup.example/v1/chat/completions"
+        "https://api.openai.backup.example/chat/completions"
     );
     assert_eq!(
         seen_execution_runtime_requests[1].model,

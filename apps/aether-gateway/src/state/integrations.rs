@@ -13,15 +13,16 @@ use aether_data_contracts::repository::provider_catalog::{
 };
 use aether_data_contracts::repository::quota::StoredProviderQuotaSnapshot;
 use aether_model_fetch::{
-    aggregate_models_for_cache, model_fetch_interval_minutes, ModelFetchAssociationStore,
-    ModelFetchTransportRuntime,
+    aggregate_models_for_cache, fetch_models_from_transports, merge_upstream_metadata,
+    model_fetch_interval_minutes, ModelFetchAssociationStore, ModelFetchTransportRuntime,
 };
 use aether_scheduler_core::SchedulerAffinityTarget;
 use async_trait::async_trait;
 use serde_json::Value;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use super::{AppState, GatewayError};
+use crate::clock::current_unix_secs;
 use crate::model_fetch::ModelFetchRuntimeState;
 use crate::provider_transport::{GatewayProviderTransportSnapshot, LocalResolvedOAuthRequestAuth};
 use crate::request_candidate_runtime::{
@@ -30,6 +31,63 @@ use crate::request_candidate_runtime::{
 };
 use crate::scheduler::state::SchedulerRuntimeState;
 use crate::{execution_runtime, provider_transport};
+
+impl AppState {
+    pub(crate) async fn hydrate_gemini_cli_project_metadata_for_transport(
+        &self,
+        transport: &GatewayProviderTransportSnapshot,
+    ) -> Option<GatewayProviderTransportSnapshot> {
+        if !provider_transport::is_gemini_cli_provider_transport(transport) {
+            return None;
+        }
+        if provider_transport::resolve_gemini_cli_project_id(transport).is_some() {
+            return Some(transport.clone());
+        }
+
+        let outcome =
+            match fetch_models_from_transports(self, std::slice::from_ref(transport)).await {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    warn!(
+                        provider_id = %transport.provider.id,
+                        endpoint_id = %transport.endpoint.id,
+                        key_id = %transport.key.id,
+                        error = %err,
+                        "gemini_cli project metadata hydration failed"
+                    );
+                    return None;
+                }
+            };
+        let upstream_metadata = outcome.upstream_metadata.as_ref()?;
+        let merged_metadata =
+            merge_upstream_metadata(transport.key.upstream_metadata.as_ref(), upstream_metadata);
+
+        let mut hydrated = transport.clone();
+        hydrated.key.upstream_metadata = Some(merged_metadata.clone());
+        if provider_transport::resolve_gemini_cli_project_id(&hydrated).is_none() {
+            return None;
+        }
+
+        if let Err(err) = self
+            .update_provider_catalog_key_upstream_metadata(
+                &transport.key.id,
+                Some(&merged_metadata),
+                Some(current_unix_secs()),
+            )
+            .await
+        {
+            warn!(
+                provider_id = %transport.provider.id,
+                endpoint_id = %transport.endpoint.id,
+                key_id = %transport.key.id,
+                error = ?err,
+                "gemini_cli project metadata hydration could not persist metadata"
+            );
+        }
+
+        Some(hydrated)
+    }
+}
 
 #[async_trait]
 impl provider_transport::TransportTunnelAffinityLookup for AppState {
@@ -60,12 +118,7 @@ impl provider_transport::VideoTaskTransportSnapshotLookup for AppState {
     ) -> Result<Option<GatewayProviderTransportSnapshot>, String> {
         self.read_provider_transport_snapshot(provider_id, endpoint_id, key_id)
             .await
-            .map_err(|err| match err {
-                GatewayError::UpstreamUnavailable { message, .. }
-                | GatewayError::ControlUnavailable { message, .. }
-                | GatewayError::Client { message, .. }
-                | GatewayError::Internal(message) => message,
-            })
+            .map_err(GatewayError::into_message)
     }
 }
 
@@ -77,12 +130,7 @@ impl ModelFetchTransportRuntime for AppState {
     ) -> Result<Option<LocalResolvedOAuthRequestAuth>, String> {
         AppState::resolve_local_oauth_request_auth(self, transport)
             .await
-            .map_err(|err| match err {
-                GatewayError::UpstreamUnavailable { message, .. }
-                | GatewayError::ControlUnavailable { message, .. }
-                | GatewayError::Client { message, .. }
-                | GatewayError::Internal(message) => message,
-            })
+            .map_err(GatewayError::into_message)
     }
 
     async fn resolve_model_fetch_proxy(
@@ -99,12 +147,7 @@ impl ModelFetchTransportRuntime for AppState {
     ) -> Result<ExecutionResult, String> {
         execution_runtime::execute_execution_runtime_sync_plan(self, None, plan)
             .await
-            .map_err(|err| match err {
-                GatewayError::UpstreamUnavailable { message, .. }
-                | GatewayError::ControlUnavailable { message, .. }
-                | GatewayError::Client { message, .. }
-                | GatewayError::Internal(message) => message,
-            })
+            .map_err(GatewayError::into_message)
     }
 }
 

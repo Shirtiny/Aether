@@ -94,6 +94,7 @@ async fn gateway_handles_admin_provider_models_locally_with_trusted_admin_princi
     assert_eq!(items[0]["effective_input_price"], 3.0);
     assert_eq!(items[0]["effective_output_price"], 15.0);
     assert_eq!(items[0]["effective_supports_streaming"], true);
+    assert!(items[0]["model_test_capabilities"]["openai:image"].is_null());
     assert_eq!(items[0]["created_at"], "2024-03-21T05:46:40Z");
     assert_eq!(items[0]["updated_at"], "2024-03-21T05:48:20Z");
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);

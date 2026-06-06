@@ -19,7 +19,7 @@ use tracing::warn;
 use super::{
     local_failover_error_message, project_local_adaptive_rate_limit,
     project_local_adaptive_success, project_local_failure_health, project_local_key_circuit_closed,
-    project_local_key_circuit_open, project_local_success_health, LocalFailoverClassification,
+    project_local_key_circuit_failure, project_local_success_health, LocalFailoverClassification,
 };
 use crate::ai_serving::extract_pool_sticky_session_token;
 use crate::client_session_affinity::{
@@ -28,7 +28,7 @@ use crate::client_session_affinity::{
 use crate::clock::current_unix_secs;
 use crate::handlers::shared::provider_pool::admin_provider_pool_config_from_config_value;
 use crate::handlers::shared::provider_pool::{
-    admin_provider_pool_key_circuit_breaker_reason, record_admin_provider_pool_error,
+    admin_provider_pool_key_terminal_error_reason, record_admin_provider_pool_error,
     record_admin_provider_pool_stream_timeout, record_admin_provider_pool_success,
     release_admin_provider_pool_key_lease, AdminProviderPoolConfig,
 };
@@ -242,6 +242,35 @@ fn local_scheduler_affinity_target(plan: &ExecutionPlan) -> Option<SchedulerAffi
     })
 }
 
+async fn local_execution_plan_uses_pool(state: &AppState, plan: &ExecutionPlan) -> bool {
+    let Ok(Some(transport)) = state
+        .read_provider_transport_snapshot(&plan.provider_id, &plan.endpoint_id, &plan.key_id)
+        .await
+    else {
+        return false;
+    };
+
+    admin_provider_pool_config_from_config_value(transport.provider.config.as_ref()).is_some()
+}
+
+async fn local_scheduler_affinity_matches_failed_target(
+    state: &AppState,
+    plan: &ExecutionPlan,
+    cached_target: &SchedulerAffinityTarget,
+    failed_target: &SchedulerAffinityTarget,
+) -> bool {
+    if cached_target == failed_target {
+        return true;
+    }
+    if cached_target.provider_id != failed_target.provider_id
+        || cached_target.endpoint_id != failed_target.endpoint_id
+    {
+        return false;
+    }
+
+    local_execution_plan_uses_pool(state, plan).await
+}
+
 async fn scheduler_cache_affinity_enabled(state: &AppState) -> bool {
     match read_scheduler_ordering_config(state).await {
         Ok(config) => config.scheduling_mode == SchedulerSchedulingMode::CacheAffinity,
@@ -359,7 +388,24 @@ async fn record_attempt_failure_effect(
     }
 
     if let Some(cache_key) = local_scheduler_affinity_cache_key(context.report_context) {
-        let _ = state.remove_scheduler_affinity_cache_entry(&cache_key);
+        let Some(failed_target) = local_scheduler_affinity_target(context.plan) else {
+            return;
+        };
+        let Some(cached_target) =
+            state.read_scheduler_affinity_target(&cache_key, SCHEDULER_AFFINITY_TTL)
+        else {
+            return;
+        };
+        if local_scheduler_affinity_matches_failed_target(
+            state,
+            context.plan,
+            &cached_target,
+            &failed_target,
+        )
+        .await
+        {
+            let _ = state.remove_scheduler_affinity_cache_entry(&cache_key);
+        }
     }
 }
 
@@ -447,7 +493,10 @@ async fn record_adaptive_rate_limit_effect(
     updated_key.status_snapshot = Some(projection.status_snapshot);
     updated_key.updated_at_unix_secs = Some(observed_at_unix_secs);
 
-    if let Err(err) = state.update_provider_catalog_key(&updated_key).await {
+    if let Err(err) = state
+        .update_provider_catalog_key_runtime_state(&updated_key)
+        .await
+    {
         warn!(
             "gateway orchestration effects: failed to persist adaptive rate-limit projection for provider {} endpoint {} key {}: {:?}",
             context.plan.provider_id, context.plan.endpoint_id, context.plan.key_id, err
@@ -495,7 +544,10 @@ async fn record_adaptive_success_effect(
     updated_key.status_snapshot = Some(projection.status_snapshot);
     updated_key.updated_at_unix_secs = Some(observed_at_unix_secs);
 
-    if let Err(err) = state.update_provider_catalog_key(&updated_key).await {
+    if let Err(err) = state
+        .update_provider_catalog_key_runtime_state(&updated_key)
+        .await
+    {
         warn!(
             "gateway orchestration effects: failed to persist adaptive success projection for provider {} endpoint {} key {}: {:?}",
             context.plan.provider_id, context.plan.endpoint_id, context.plan.key_id, err
@@ -521,21 +573,47 @@ async fn record_health_failure_effect(
     else {
         return;
     };
+    let is_pool_provider = local_execution_plan_uses_pool(state, context.plan).await;
+    let observed_at_unix_secs = current_unix_secs();
     let Some(health_by_format) = project_local_failure_health(
         current_key.health_by_format.as_ref(),
         api_format,
         effect.classification,
         effect.status_code,
-        current_unix_secs(),
+        observed_at_unix_secs,
     ) else {
         return;
     };
+    let consecutive_failures = health_by_format
+        .get(api_format)
+        .and_then(|value| value.get("consecutive_failures"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let circuit_breaker_update_owned = if is_pool_provider {
+        None
+    } else {
+        project_local_key_circuit_failure(
+            current_key.circuit_breaker_by_format.as_ref(),
+            api_format,
+            observed_at_unix_secs,
+            consecutive_failures,
+            current_key.max_probe_interval_minutes,
+        )
+    };
+    let circuit_breaker_update = if is_pool_provider {
+        None
+    } else {
+        circuit_breaker_update_owned
+            .as_ref()
+            .or(current_key.circuit_breaker_by_format.as_ref())
+    };
 
     if let Err(err) = state
-        .update_provider_catalog_key_format_health(
+        .update_provider_catalog_key_health_state(
             &context.plan.key_id,
-            api_format,
-            &health_by_format,
+            current_key.is_active,
+            Some(&health_by_format),
+            circuit_breaker_update,
         )
         .await
     {
@@ -566,18 +644,35 @@ async fn record_health_success_effect(
     else {
         return;
     };
+    let is_pool_provider = local_execution_plan_uses_pool(state, context.plan).await;
     let Some(health_by_format) =
         project_local_success_health(current_key.health_by_format.as_ref(), api_format)
     else {
         return;
     };
-    let circuit_breaker_by_format = current_key
-        .circuit_breaker_by_format
-        .as_ref()
-        .and_then(|current| project_local_key_circuit_closed(Some(current), api_format));
-    let circuit_breaker_update = circuit_breaker_by_format
-        .as_ref()
-        .or(current_key.circuit_breaker_by_format.as_ref());
+    let circuit_breaker_update_owned = if is_pool_provider {
+        None
+    } else {
+        current_key
+            .circuit_breaker_by_format
+            .as_ref()
+            .and_then(|current| project_local_key_circuit_closed(Some(current), api_format))
+    };
+    if current_key.health_by_format.as_ref() == Some(&health_by_format)
+        && ((is_pool_provider && current_key.circuit_breaker_by_format.is_none())
+            || (!is_pool_provider
+                && circuit_breaker_update_owned.as_ref()
+                    == current_key.circuit_breaker_by_format.as_ref()))
+    {
+        return;
+    }
+    let circuit_breaker_update = if is_pool_provider {
+        None
+    } else {
+        circuit_breaker_update_owned
+            .as_ref()
+            .or(current_key.circuit_breaker_by_format.as_ref())
+    };
 
     if let Err(err) = state
         .update_provider_catalog_key_health_state(
@@ -636,9 +731,9 @@ async fn record_pool_error_effect(
     context: LocalExecutionEffectContext<'_>,
     effect: LocalPoolErrorEffect<'_>,
 ) {
-    let circuit_reason =
-        admin_provider_pool_key_circuit_breaker_reason(effect.status_code, effect.error_body);
-    if circuit_reason.is_none()
+    let terminal_error_reason =
+        admin_provider_pool_key_terminal_error_reason(effect.status_code, effect.error_body);
+    if terminal_error_reason.is_none()
         && !local_candidate_failure_should_record_pool_error(
             effect.classification,
             effect.status_code,
@@ -651,10 +746,7 @@ async fn record_pool_error_effect(
         return;
     };
 
-    if let Some(reason) = circuit_reason {
-        open_pool_key_circuit_breaker(state, context, &reason).await;
-    }
-
+    clear_pool_key_circuit_breaker(state, context).await;
     record_admin_provider_pool_error(
         state.runtime_state.as_ref(),
         &context.plan.provider_id,
@@ -682,16 +774,10 @@ async fn record_pool_error_effect(
     .await;
 }
 
-async fn open_pool_key_circuit_breaker(
+async fn clear_pool_key_circuit_breaker(
     state: &AppState,
     context: LocalExecutionEffectContext<'_>,
-    reason: &str,
 ) {
-    let api_format = context.plan.provider_api_format.trim();
-    if api_format.is_empty() {
-        return;
-    }
-
     let Some(current_key) = state
         .read_provider_catalog_keys_by_ids(std::slice::from_ref(&context.plan.key_id))
         .await
@@ -700,26 +786,21 @@ async fn open_pool_key_circuit_breaker(
     else {
         return;
     };
-    let Some(circuit_breaker_by_format) = project_local_key_circuit_open(
-        current_key.circuit_breaker_by_format.as_ref(),
-        api_format,
-        reason,
-        current_unix_secs(),
-    ) else {
+    if current_key.circuit_breaker_by_format.is_none() {
         return;
-    };
+    }
 
     if let Err(err) = state
         .update_provider_catalog_key_health_state(
             &context.plan.key_id,
             current_key.is_active,
             current_key.health_by_format.as_ref(),
-            Some(&circuit_breaker_by_format),
+            None,
         )
         .await
     {
         warn!(
-            "gateway orchestration effects: failed to open pool key circuit for provider {} endpoint {} key {}: {:?}",
+            "gateway orchestration effects: failed to clear pool key circuit for provider {} endpoint {} key {}: {:?}",
             context.plan.provider_id, context.plan.endpoint_id, context.plan.key_id, err
         );
     }
@@ -821,7 +902,8 @@ fn local_candidate_failure_should_invalidate_affinity(
         LocalFailoverClassification::UseDefault | LocalFailoverClassification::StopStatusCode => {
             status_code >= 500
         }
-        LocalFailoverClassification::StopErrorPattern => false,
+        LocalFailoverClassification::StopErrorPattern
+        | LocalFailoverClassification::StopExecutionError => false,
     }
 }
 
@@ -907,6 +989,10 @@ fn pool_score_hard_state_for_status(
     status_code: u16,
     error_body: Option<&str>,
 ) -> Option<PoolMemberHardState> {
+    if let Some(reason) = admin_provider_pool_key_terminal_error_reason(status_code, error_body) {
+        return Some(pool_score_hard_state_for_terminal_error_reason(&reason));
+    }
+
     match status_code {
         401 | 403 => Some(PoolMemberHardState::AuthInvalid),
         402 => Some(PoolMemberHardState::QuotaExhausted),
@@ -926,6 +1012,16 @@ fn pool_score_hard_state_for_status(
                 None
             }
         }
+    }
+}
+
+fn pool_score_hard_state_for_terminal_error_reason(reason: &str) -> PoolMemberHardState {
+    if reason.starts_with("payment_required_") {
+        PoolMemberHardState::QuotaExhausted
+    } else if reason.starts_with("forbidden_") {
+        PoolMemberHardState::AuthInvalid
+    } else {
+        PoolMemberHardState::Banned
     }
 }
 
@@ -951,6 +1047,7 @@ mod tests {
     use aether_data_contracts::repository::candidates::{
         RequestCandidateStatus, StoredRequestCandidate,
     };
+    use aether_data_contracts::repository::pool_scores::PoolMemberHardState;
     use aether_data_contracts::repository::provider_catalog::{
         StoredProviderCatalogEndpoint, StoredProviderCatalogKey, StoredProviderCatalogProvider,
     };
@@ -959,9 +1056,10 @@ mod tests {
 
     use super::{
         apply_local_execution_effect, local_candidate_failure_should_record_pool_error,
-        LocalAdaptiveRateLimitEffect, LocalAdaptiveSuccessEffect, LocalAttemptFailureEffect,
-        LocalExecutionEffect, LocalExecutionEffectContext, LocalHealthFailureEffect,
-        LocalHealthSuccessEffect, LocalOAuthInvalidationEffect, LocalPoolErrorEffect,
+        pool_score_hard_state_for_status, LocalAdaptiveRateLimitEffect, LocalAdaptiveSuccessEffect,
+        LocalAttemptFailureEffect, LocalExecutionEffect, LocalExecutionEffectContext,
+        LocalHealthFailureEffect, LocalHealthSuccessEffect, LocalOAuthInvalidationEffect,
+        LocalPoolErrorEffect,
     };
     use crate::data::{GatewayDataConfig, GatewayDataState};
     use crate::orchestration::LocalFailoverClassification;
@@ -1184,6 +1282,20 @@ mod tests {
         .expect("provider should build")
     }
 
+    fn sample_pool_health_provider() -> StoredProviderCatalogProvider {
+        sample_health_provider().with_transport_fields(
+            true,
+            false,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(json!({"pool_advanced": {}})),
+        )
+    }
+
     fn sample_health_endpoint() -> StoredProviderCatalogEndpoint {
         StoredProviderCatalogEndpoint::new(
             "ep-1".to_string(),
@@ -1235,6 +1347,20 @@ mod tests {
     fn health_state() -> AppState {
         let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
             vec![sample_health_provider()],
+            vec![sample_health_endpoint()],
+            vec![sample_health_key()],
+        ));
+        AppState::new()
+            .expect("gateway state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(repository)
+                    .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+            )
+    }
+
+    fn pool_health_state() -> AppState {
+        let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![sample_pool_health_provider()],
             vec![sample_health_endpoint()],
             vec![sample_health_key()],
         ));
@@ -1410,6 +1536,137 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn attempt_failure_keeps_scheduler_affinity_for_non_affinity_candidate() {
+        let state = AppState::new().expect("gateway state should build");
+        let plan = sample_plan();
+        let report_context = json!({
+            "api_key_id": "api-key-1",
+            "client_api_format": "openai:chat",
+            "model": "gpt-5",
+        });
+        let cache_key =
+            build_scheduler_affinity_cache_key_for_api_key_id("api-key-1", "openai:chat", "gpt-5")
+                .expect("scheduler affinity cache key should build");
+        let affinity_target = SchedulerAffinityTarget {
+            provider_id: "prov-2".to_string(),
+            endpoint_id: "ep-2".to_string(),
+            key_id: "key-2".to_string(),
+        };
+
+        state.remember_scheduler_affinity_target(
+            &cache_key,
+            affinity_target.clone(),
+            SCHEDULER_AFFINITY_TTL,
+            16,
+        );
+
+        apply_local_execution_effect(
+            &state,
+            LocalExecutionEffectContext {
+                plan: &plan,
+                report_context: Some(&report_context),
+            },
+            LocalExecutionEffect::AttemptFailure(LocalAttemptFailureEffect {
+                status_code: 524,
+                classification: LocalFailoverClassification::RetryUpstreamFailure,
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            state.read_scheduler_affinity_target(cache_key.as_str(), SCHEDULER_AFFINITY_TTL),
+            Some(affinity_target)
+        );
+    }
+
+    #[tokio::test]
+    async fn attempt_failure_keeps_scheduler_affinity_for_non_pool_sibling_key() {
+        let state = health_state();
+        let plan = sample_plan();
+        let report_context = json!({
+            "api_key_id": "api-key-1",
+            "client_api_format": "openai:chat",
+            "model": "gpt-5",
+        });
+        let cache_key =
+            build_scheduler_affinity_cache_key_for_api_key_id("api-key-1", "openai:chat", "gpt-5")
+                .expect("scheduler affinity cache key should build");
+        let affinity_target = SchedulerAffinityTarget {
+            provider_id: "prov-1".to_string(),
+            endpoint_id: "ep-1".to_string(),
+            key_id: "key-2".to_string(),
+        };
+
+        state.remember_scheduler_affinity_target(
+            &cache_key,
+            affinity_target.clone(),
+            SCHEDULER_AFFINITY_TTL,
+            16,
+        );
+
+        apply_local_execution_effect(
+            &state,
+            LocalExecutionEffectContext {
+                plan: &plan,
+                report_context: Some(&report_context),
+            },
+            LocalExecutionEffect::AttemptFailure(LocalAttemptFailureEffect {
+                status_code: 524,
+                classification: LocalFailoverClassification::RetryUpstreamFailure,
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            state.read_scheduler_affinity_target(cache_key.as_str(), SCHEDULER_AFFINITY_TTL),
+            Some(affinity_target)
+        );
+    }
+
+    #[tokio::test]
+    async fn attempt_failure_invalidates_scheduler_affinity_for_same_pool_candidate() {
+        let state = pool_health_state();
+        let plan = sample_plan();
+        let report_context = json!({
+            "api_key_id": "api-key-1",
+            "client_api_format": "openai:chat",
+            "model": "gpt-5",
+        });
+        let cache_key =
+            build_scheduler_affinity_cache_key_for_api_key_id("api-key-1", "openai:chat", "gpt-5")
+                .expect("scheduler affinity cache key should build");
+
+        state.remember_scheduler_affinity_target(
+            &cache_key,
+            SchedulerAffinityTarget {
+                provider_id: "prov-1".to_string(),
+                endpoint_id: "ep-1".to_string(),
+                key_id: "key-2".to_string(),
+            },
+            SCHEDULER_AFFINITY_TTL,
+            16,
+        );
+
+        apply_local_execution_effect(
+            &state,
+            LocalExecutionEffectContext {
+                plan: &plan,
+                report_context: Some(&report_context),
+            },
+            LocalExecutionEffect::AttemptFailure(LocalAttemptFailureEffect {
+                status_code: 524,
+                classification: LocalFailoverClassification::RetryUpstreamFailure,
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            state.read_scheduler_affinity_target(cache_key.as_str(), SCHEDULER_AFFINITY_TTL),
+            None
+        );
+    }
+
+    #[tokio::test]
     async fn attempt_failure_keeps_scheduler_affinity_for_non_failure_status() {
         let state = AppState::new().expect("gateway state should build");
         let plan = sample_plan();
@@ -1496,6 +1753,39 @@ mod tests {
     #[tokio::test]
     async fn success_remembers_scheduler_affinity_cache_for_final_candidate() {
         let state = AppState::new().expect("gateway state should build");
+        let plan = sample_plan();
+        let report_context = json!({
+            "api_key_id": "api-key-1",
+            "client_api_format": "openai:chat",
+            "model": "gpt-5",
+        });
+        let cache_key =
+            build_scheduler_affinity_cache_key_for_api_key_id("api-key-1", "openai:chat", "gpt-5")
+                .expect("scheduler affinity cache key should build");
+
+        apply_local_execution_effect(
+            &state,
+            LocalExecutionEffectContext {
+                plan: &plan,
+                report_context: Some(&report_context),
+            },
+            LocalExecutionEffect::HealthSuccess(LocalHealthSuccessEffect),
+        )
+        .await;
+
+        assert_eq!(
+            state.read_scheduler_affinity_target(cache_key.as_str(), SCHEDULER_AFFINITY_TTL),
+            Some(SchedulerAffinityTarget {
+                provider_id: "prov-1".to_string(),
+                endpoint_id: "ep-1".to_string(),
+                key_id: "key-1".to_string(),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn health_success_keeps_scheduler_affinity_after_health_state_update() {
+        let state = health_state();
         let plan = sample_plan();
         let report_context = json!({
             "api_key_id": "api-key-1",
@@ -1674,13 +1964,46 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn terminal_pool_account_errors_project_pool_hard_state() {
+        assert_eq!(
+            pool_score_hard_state_for_status(
+                400,
+                Some(r#"{"error":{"message":"deactivated_workspace"}}"#),
+            ),
+            Some(PoolMemberHardState::Banned)
+        );
+        assert_eq!(
+            pool_score_hard_state_for_status(
+                402,
+                Some(r#"{"error":{"message":"payment required"}}"#),
+            ),
+            Some(PoolMemberHardState::QuotaExhausted)
+        );
+    }
+
     #[tokio::test]
-    async fn pool_account_error_opens_key_circuit() {
+    async fn pool_account_error_does_not_open_key_circuit() {
         let Some(redis) = start_managed_redis_or_skip().await else {
             return;
         };
         let state = codex_state_with_redis(redis.redis_url(), "orchestration_pool_circuit");
         let plan = sample_codex_plan();
+        let legacy_circuit = json!({
+            "openai:responses": {
+                "open": true,
+                "reason": "legacy"
+            }
+        });
+        state
+            .update_provider_catalog_key_health_state(
+                &plan.key_id,
+                true,
+                None,
+                Some(&legacy_circuit),
+            )
+            .await
+            .expect("legacy circuit should seed");
 
         apply_local_execution_effect(
             &state,
@@ -1704,15 +2027,7 @@ mod tests {
             .into_iter()
             .next()
             .expect("stored key should exist");
-        let circuit = stored_key
-            .circuit_breaker_by_format
-            .as_ref()
-            .and_then(|value| value.get("openai:responses"))
-            .expect("format circuit should be stored");
-        assert_eq!(circuit["open"], json!(true));
-        assert_eq!(circuit["reason"], json!("account_deactivated_401"));
-        assert!(circuit["next_probe_at"].is_string());
-        assert!(circuit["next_probe_at_unix_secs"].as_u64().is_some());
+        assert_eq!(stored_key.circuit_breaker_by_format, None);
     }
 
     #[tokio::test]
@@ -1831,6 +2146,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn health_failure_opens_circuit_after_eight_consecutive_failures() {
+        let state = health_state();
+        let plan = sample_plan();
+
+        for _ in 0..8 {
+            apply_local_execution_effect(
+                &state,
+                LocalExecutionEffectContext {
+                    plan: &plan,
+                    report_context: None,
+                },
+                LocalExecutionEffect::HealthFailure(LocalHealthFailureEffect {
+                    status_code: 503,
+                    classification: LocalFailoverClassification::RetryUpstreamFailure,
+                }),
+            )
+            .await;
+        }
+
+        let stored_key = state
+            .read_provider_catalog_keys_by_ids(std::slice::from_ref(&plan.key_id))
+            .await
+            .expect("provider catalog keys should load")
+            .into_iter()
+            .next()
+            .expect("stored key should exist");
+        let circuit = stored_key
+            .circuit_breaker_by_format
+            .as_ref()
+            .and_then(|value| value.get("openai:chat"))
+            .expect("format circuit should be stored");
+        assert_eq!(circuit["open"], json!(true));
+        assert_eq!(circuit["reason"], json!("consecutive_failures_8"));
+        assert_eq!(circuit["probe_interval_minutes"], json!(1));
+        assert!(circuit["next_probe_at_unix_secs"].as_u64().is_some());
+        assert_eq!(
+            circuit["request_results_window"]
+                .as_array()
+                .map(Vec::len)
+                .unwrap_or_default(),
+            8
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_health_failure_does_not_open_key_circuit_after_eight_consecutive_failures() {
+        let state = pool_health_state();
+        let plan = sample_plan();
+
+        for _ in 0..8 {
+            apply_local_execution_effect(
+                &state,
+                LocalExecutionEffectContext {
+                    plan: &plan,
+                    report_context: None,
+                },
+                LocalExecutionEffect::HealthFailure(LocalHealthFailureEffect {
+                    status_code: 503,
+                    classification: LocalFailoverClassification::RetryUpstreamFailure,
+                }),
+            )
+            .await;
+        }
+
+        let stored_key = state
+            .read_provider_catalog_keys_by_ids(std::slice::from_ref(&plan.key_id))
+            .await
+            .expect("provider catalog keys should load")
+            .into_iter()
+            .next()
+            .expect("stored key should exist");
+        assert_eq!(stored_key.circuit_breaker_by_format, None);
+        assert_eq!(
+            stored_key
+                .health_by_format
+                .as_ref()
+                .and_then(|value| value.get("openai:chat"))
+                .and_then(|value| value.get("consecutive_failures"))
+                .and_then(Value::as_u64),
+            Some(8)
+        );
+    }
+
+    #[tokio::test]
     async fn health_success_projection_resets_key_health_for_format() {
         let state = health_state();
         let plan = sample_plan();
@@ -1920,6 +2319,21 @@ mod tests {
     async fn adaptive_rate_limit_effect_updates_adaptive_key_observation() {
         let state = adaptive_state();
         let plan = sample_plan();
+        let cache_key =
+            build_scheduler_affinity_cache_key_for_api_key_id("api-key-1", "openai:chat", "gpt-5")
+                .expect("scheduler affinity cache key should build");
+        let target = SchedulerAffinityTarget {
+            provider_id: plan.provider_id.clone(),
+            endpoint_id: plan.endpoint_id.clone(),
+            key_id: plan.key_id.clone(),
+        };
+        state.remember_scheduler_affinity_target(
+            &cache_key,
+            target.clone(),
+            SCHEDULER_AFFINITY_TTL,
+            16,
+        );
+        let initial_epoch = state.scheduler_affinity_epoch();
 
         apply_local_execution_effect(
             &state,
@@ -1982,6 +2396,11 @@ mod tests {
                 .as_ref()
                 .and_then(|value| value.get("enforcement_active")),
             Some(&json!(false))
+        );
+        assert_eq!(state.scheduler_affinity_epoch(), initial_epoch);
+        assert_eq!(
+            state.read_scheduler_affinity_target(cache_key.as_str(), SCHEDULER_AFFINITY_TTL),
+            Some(target)
         );
     }
 
@@ -2113,6 +2532,21 @@ mod tests {
             .expect("request candidate should build")],
         );
         let plan = sample_plan();
+        let cache_key =
+            build_scheduler_affinity_cache_key_for_api_key_id("api-key-1", "openai:chat", "gpt-5")
+                .expect("scheduler affinity cache key should build");
+        let target = SchedulerAffinityTarget {
+            provider_id: plan.provider_id.clone(),
+            endpoint_id: plan.endpoint_id.clone(),
+            key_id: plan.key_id.clone(),
+        };
+        state.remember_scheduler_affinity_target(
+            &cache_key,
+            target.clone(),
+            SCHEDULER_AFFINITY_TTL,
+            16,
+        );
+        let initial_epoch = state.scheduler_affinity_epoch();
 
         apply_local_execution_effect(
             &state,
@@ -2143,6 +2577,11 @@ mod tests {
                 .and_then(|record| record.get("reason"))
                 .and_then(Value::as_str),
             Some("high_utilization")
+        );
+        assert_eq!(state.scheduler_affinity_epoch(), initial_epoch);
+        assert_eq!(
+            state.read_scheduler_affinity_target(cache_key.as_str(), SCHEDULER_AFFINITY_TTL),
+            Some(target)
         );
     }
 }

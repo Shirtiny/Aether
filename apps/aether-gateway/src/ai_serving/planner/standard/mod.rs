@@ -8,12 +8,16 @@ use crate::{AiExecutionDecision, AppState, GatewayError};
 
 mod claude;
 mod codex;
+mod deepseek;
 mod family;
 mod gemini;
 mod normalize;
 mod openai;
 
-pub(crate) use self::codex::apply_codex_openai_responses_special_headers;
+pub(crate) use self::codex::{
+    apply_codex_openai_responses_special_body_edits, apply_codex_openai_responses_special_headers,
+};
+pub(crate) use self::deepseek::{apply_deepseek_tool_call_thinking_compat, is_deepseek_provider};
 pub(crate) use self::family::{
     build_local_stream_attempt_source, build_local_stream_plan_and_reports,
     build_local_sync_attempt_source, build_local_sync_plan_and_reports,
@@ -38,6 +42,7 @@ pub(crate) use self::openai::{
     map_openai_reasoning_effort_to_gemini_budget, maybe_build_stream_local_decision_payload,
     maybe_build_stream_local_openai_responses_decision_payload,
     maybe_build_sync_local_decision_payload,
+    maybe_build_sync_local_openai_embedding_decision_payload,
     maybe_build_sync_local_openai_responses_decision_payload, parse_openai_stop_sequences,
     resolve_openai_chat_max_tokens, set_local_openai_chat_execution_exhausted_diagnostic,
     value_as_u64,
@@ -66,14 +71,16 @@ pub(crate) fn build_standard_upstream_url(
     mapped_model: &str,
     provider_api_format: &str,
     upstream_is_stream: bool,
+    provider_request_body: Option<&serde_json::Value>,
 ) -> Option<String> {
-    crate::ai_serving::build_provider_transport_request_url(
+    crate::ai_serving::build_provider_transport_request_url_for_request_body(
         transport,
         provider_api_format,
         Some(mapped_model),
         upstream_is_stream,
         parts.uri.query(),
         None,
+        provider_request_body,
     )
 }
 
@@ -85,6 +92,14 @@ pub(crate) async fn maybe_build_sync_local_standard_decision_payload(
     body_json: &serde_json::Value,
     plan_kind: &str,
 ) -> Result<Option<AiExecutionDecision>, GatewayError> {
+    if let Some(payload) = self::openai::maybe_build_sync_local_openai_embedding_decision_payload(
+        state, parts, trace_id, decision, body_json, plan_kind,
+    )
+    .await?
+    {
+        return Ok(Some(payload));
+    }
+
     if let Some(payload) = self::claude::maybe_build_sync_local_claude_decision_payload(
         state, parts, trace_id, decision, body_json, plan_kind,
     )

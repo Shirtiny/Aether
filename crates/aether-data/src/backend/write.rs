@@ -15,6 +15,7 @@ use crate::repository::pool_scores::PoolMemberScoreWriteRepository;
 use crate::repository::provider_catalog::ProviderCatalogWriteRepository;
 use crate::repository::proxy_nodes::ProxyNodeWriteRepository;
 use crate::repository::quota::ProviderQuotaWriteRepository;
+use crate::repository::routing_profiles::RoutingGroupWriteRepository;
 use crate::repository::settlement::SettlementWriteRepository;
 use crate::repository::usage::UsageWriteRepository;
 use crate::repository::video_tasks::VideoTaskWriteRepository;
@@ -35,6 +36,7 @@ pub struct DataWriteRepositories {
     proxy_nodes: Option<Arc<dyn ProxyNodeWriteRepository>>,
     provider_catalog: Option<Arc<dyn ProviderCatalogWriteRepository>>,
     provider_quotas: Option<Arc<dyn ProviderQuotaWriteRepository>>,
+    routing_groups: Option<Arc<dyn RoutingGroupWriteRepository>>,
     settlement: Option<Arc<dyn SettlementWriteRepository>>,
     usage: Option<Arc<dyn UsageWriteRepository>>,
     video_tasks: Option<Arc<dyn VideoTaskWriteRepository>>,
@@ -60,6 +62,7 @@ impl fmt::Debug for DataWriteRepositories {
             .field("has_proxy_nodes", &self.proxy_nodes.is_some())
             .field("has_provider_catalog", &self.provider_catalog.is_some())
             .field("has_provider_quotas", &self.provider_quotas.is_some())
+            .field("has_routing_groups", &self.routing_groups.is_some())
             .field("has_settlement", &self.settlement.is_some())
             .field("has_usage", &self.usage.is_some())
             .field("has_video_tasks", &self.video_tasks.is_some())
@@ -127,6 +130,10 @@ impl DataWriteRepositories {
                 .map(PostgresBackend::provider_quota_write_repository)
                 .or_else(|| mysql.map(MysqlBackend::provider_quota_write_repository))
                 .or_else(|| sqlite.map(SqliteBackend::provider_quota_write_repository)),
+            routing_groups: postgres
+                .map(PostgresBackend::routing_group_write_repository)
+                .or_else(|| mysql.map(MysqlBackend::routing_group_write_repository))
+                .or_else(|| sqlite.map(SqliteBackend::routing_group_write_repository)),
             settlement: postgres
                 .map(PostgresBackend::settlement_write_repository)
                 .or_else(|| mysql.map(MysqlBackend::settlement_write_repository))
@@ -203,6 +210,10 @@ impl DataWriteRepositories {
         self.provider_quotas.clone()
     }
 
+    pub fn routing_groups(&self) -> Option<Arc<dyn RoutingGroupWriteRepository>> {
+        self.routing_groups.clone()
+    }
+
     pub fn provider_catalog(&self) -> Option<Arc<dyn ProviderCatalogWriteRepository>> {
         self.provider_catalog.clone()
     }
@@ -233,6 +244,7 @@ impl DataWriteRepositories {
             || self.proxy_nodes.is_some()
             || self.provider_catalog.is_some()
             || self.provider_quotas.is_some()
+            || self.routing_groups.is_some()
             || self.settlement.is_some()
             || self.usage.is_some()
             || self.video_tasks.is_some()

@@ -1429,10 +1429,10 @@ fn ai_serving_planner_separates_local_candidate_resolution_from_ranking() {
         "with_builtin_adapters",
         "AntigravityProviderPoolAdapter",
         "CodexProviderPoolAdapter",
+        "GeminiCliProviderPoolAdapter",
         "KiroProviderPoolAdapter",
         "ChatGptWebProviderPoolAdapter",
         "CLAUDE_CODE_PROVIDER_POOL_ADAPTER",
-        "GEMINI_CLI_PROVIDER_POOL_ADAPTER",
         "VERTEX_AI_PROVIDER_POOL_ADAPTER",
         "provider_types_for_capability",
         "supports_quota_refresh",
@@ -1455,6 +1455,7 @@ fn ai_serving_planner_separates_local_candidate_resolution_from_ranking() {
         "pub mod unsupported;",
         "pub mod antigravity;",
         "pub mod codex;",
+        "pub mod gemini_cli;",
         "pub mod kiro;",
         "pub mod chatgpt_web;",
     ] {
@@ -1481,6 +1482,14 @@ fn ai_serving_planner_separates_local_candidate_resolution_from_ranking() {
             ],
         ),
         (
+            "crates/aether-provider-pool/src/providers/gemini_cli.rs",
+            vec![
+                "GeminiCliProviderPoolAdapter",
+                "build_gemini_cli_pool_quota_request",
+                "GEMINI_CLI_RETRIEVE_USER_QUOTA_PATH",
+            ],
+        ),
+        (
             "crates/aether-provider-pool/src/providers/kiro.rs",
             vec!["KiroProviderPoolAdapter", "quota_exhausted_from_bucket"],
         ),
@@ -1499,7 +1508,6 @@ fn ai_serving_planner_separates_local_candidate_resolution_from_ranking() {
             vec![
                 "UnsupportedQuotaProviderPoolAdapter",
                 "CLAUDE_CODE_PROVIDER_POOL_ADAPTER",
-                "GEMINI_CLI_PROVIDER_POOL_ADAPTER",
                 "VERTEX_AI_PROVIDER_POOL_ADAPTER",
             ],
         ),
@@ -3400,7 +3408,7 @@ fn ai_serving_decision_inputs_share_authenticated_input_helper() {
         ),
         (
             "apps/aether-gateway/src/ai_serving/planner/specialized/files/support.rs",
-            "LocalAuthenticatedDecisionInput as LocalGeminiFilesDecisionInput",
+            "LocalRequestedModelDecisionInput as LocalGeminiFilesDecisionInput",
         ),
     ] {
         let source = read_workspace_file(path);
@@ -3433,7 +3441,7 @@ fn ai_serving_decision_inputs_share_authenticated_input_helper() {
         ),
         (
             "apps/aether-gateway/src/ai_serving/planner/specialized/files/support.rs",
-            "build_local_authenticated_decision_input(",
+            "build_local_requested_model_decision_input(",
         ),
     ] {
         let source = read_workspace_file(path);

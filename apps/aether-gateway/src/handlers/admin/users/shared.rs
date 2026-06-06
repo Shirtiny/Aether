@@ -1,5 +1,6 @@
 use super::ADMIN_USERS_DATA_UNAVAILABLE_DETAIL;
 use crate::handlers::admin::shared::AdminTypedObjectPatch;
+use crate::handlers::shared::{deserialize_optional_string_list_patch, normalize_ip_rules};
 use axum::{
     body::Body,
     http,
@@ -19,6 +20,8 @@ pub(super) struct AdminCreateUserApiKeyRequest {
     pub(super) allowed_api_formats: Option<Vec<String>>,
     #[serde(default)]
     pub(super) allowed_models: Option<Vec<String>>,
+    #[serde(default, alias = "allowed_ips")]
+    pub(super) ip_rules: Option<Vec<String>>,
     #[serde(default)]
     pub(super) rate_limit: Option<i32>,
     #[serde(default)]
@@ -49,6 +52,12 @@ pub(super) struct AdminUpdateUserApiKeyRequest {
     pub(super) concurrent_limit: Option<i32>,
     #[serde(default)]
     pub(super) feature_settings: Option<Option<Value>>,
+    #[serde(
+        default,
+        alias = "allowed_ips",
+        deserialize_with = "deserialize_optional_string_list_patch"
+    )]
+    pub(super) ip_rules: Option<Option<Vec<String>>>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -269,6 +278,9 @@ pub(crate) fn normalize_admin_user_api_formats(
         if item.is_empty() {
             return Err("allowed_api_formats 不能为空".to_string());
         }
+        if !looks_like_admin_api_format_signature(item) {
+            return Err(format!("allowed_api_formats 格式无效: {item}"));
+        }
         let Some(normalized_item) = crate::api::ai::normalize_admin_endpoint_signature(item) else {
             return Err(format!("allowed_api_formats 格式无效: {item}"));
         };
@@ -278,6 +290,18 @@ pub(crate) fn normalize_admin_user_api_formats(
         }
     }
     Ok(Some(normalized))
+}
+
+fn looks_like_admin_api_format_signature(value: &str) -> bool {
+    value
+        .split_once(':')
+        .is_some_and(|(family, kind)| !family.trim().is_empty() && !kind.trim().is_empty())
+}
+
+pub(crate) fn normalize_admin_user_ip_rules(
+    value: Option<Vec<String>>,
+) -> Result<Option<Vec<String>>, String> {
+    normalize_ip_rules(value)
 }
 
 pub(crate) fn normalize_admin_list_policy_mode(value: &str) -> Result<String, String> {
@@ -338,7 +362,8 @@ pub(super) fn format_optional_datetime_iso8601(
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_admin_user_api_formats;
+    use super::{normalize_admin_user_api_formats, AdminUpdateUserApiKeyRequest};
+    use serde_json::json;
 
     #[test]
     fn admin_user_api_formats_accept_current_canonical_signatures() {
@@ -374,5 +399,32 @@ mod tests {
                 "{unsupported} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn admin_update_api_key_distinguishes_missing_null_and_present_ip_rules() {
+        let missing = serde_json::from_value::<AdminUpdateUserApiKeyRequest>(json!({
+            "name": "unchanged-ip-rules",
+        }))
+        .expect("missing ip_rules should deserialize");
+        assert_eq!(missing.ip_rules, None);
+
+        let cleared = serde_json::from_value::<AdminUpdateUserApiKeyRequest>(json!({
+            "ip_rules": null,
+        }))
+        .expect("null ip_rules should deserialize");
+        assert_eq!(cleared.ip_rules, Some(None));
+
+        let updated = serde_json::from_value::<AdminUpdateUserApiKeyRequest>(json!({
+            "ip_rules": ["203.0.113.10", "10.0.0.0/24"],
+        }))
+        .expect("present ip_rules should deserialize");
+        assert_eq!(
+            updated.ip_rules,
+            Some(Some(vec![
+                "203.0.113.10".to_string(),
+                "10.0.0.0/24".to_string(),
+            ])),
+        );
     }
 }

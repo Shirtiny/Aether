@@ -8,6 +8,7 @@ export interface Announcement {
   priority: number
   is_pinned: boolean
   is_active: boolean
+  requires_ack: boolean
   author: {
     id: string // UUID
     username: string
@@ -31,6 +32,7 @@ export interface CreateAnnouncementRequest {
   type?: 'info' | 'warning' | 'maintenance' | 'important'
   priority?: number
   is_pinned?: boolean
+  requires_ack?: boolean
   start_time?: string
   end_time?: string
 }
@@ -42,6 +44,7 @@ export interface UpdateAnnouncementRequest {
   priority?: number
   is_active?: boolean
   is_pinned?: boolean
+  requires_ack?: boolean
   start_time?: string
   end_time?: string
 }
@@ -85,6 +88,11 @@ export const announcementApi = {
   // 获取未读公告数量
   async getUnreadCount(): Promise<{ unread_count: number }> {
     const response = await apiClient.get('/api/announcements/users/me/unread-count')
+    return response.data
+  },
+
+  async getRequiredUnreadAnnouncements(): Promise<AnnouncementListResponse> {
+    const response = await apiClient.get('/api/announcements/users/me/required-unread')
     return response.data
   },
 

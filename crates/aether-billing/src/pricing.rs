@@ -24,7 +24,7 @@ impl BillingModelPricingSnapshot {
     pub fn effective_tiered_pricing(&self) -> Option<&Value> {
         self.model_tiered_pricing
             .as_ref()
-            .filter(|value| has_tiered_pricing_tiers(value))
+            .filter(|value| has_pricing_data(value))
             .or(self.default_tiered_pricing.as_ref())
     }
 
@@ -37,7 +37,7 @@ impl BillingModelPricingSnapshot {
         if self
             .model_tiered_pricing
             .as_ref()
-            .is_some_and(has_tiered_pricing_tiers)
+            .is_some_and(has_pricing_data)
             || self.model_price_per_request.is_some()
         {
             "provider_override"
@@ -75,11 +75,29 @@ impl BillingModelPricingSnapshot {
     }
 }
 
-fn has_tiered_pricing_tiers(value: &Value) -> bool {
+fn has_pricing_data(value: &Value) -> bool {
     value
         .get("tiers")
         .and_then(Value::as_array)
         .is_some_and(|tiers| !tiers.is_empty())
+        || value
+            .get("image_output_price_default")
+            .and_then(Value::as_f64)
+            .is_some()
+        || [
+            "image_output_prices",
+            "image_output_price_ranges",
+            "image_output_price_per_image",
+            "image_output_price_matrix",
+            "image_prices",
+        ]
+        .iter()
+        .any(|key| value.get(key).is_some_and(value_has_entries))
+}
+
+fn value_has_entries(value: &Value) -> bool {
+    value.as_object().is_some_and(|object| !object.is_empty())
+        || value.as_array().is_some_and(|items| !items.is_empty())
 }
 
 #[cfg(test)]
@@ -147,6 +165,10 @@ pub struct BillingUsageInput {
     pub cache_creation_ephemeral_5m_tokens: i64,
     pub cache_creation_ephemeral_1h_tokens: i64,
     pub cache_read_tokens: i64,
+    pub image_count: i64,
+    pub image_size: Option<String>,
+    pub image_quality: Option<String>,
+    pub image_output_format: Option<String>,
     pub cache_ttl_minutes: Option<i64>,
 }
 
@@ -162,6 +184,10 @@ impl BillingUsageInput {
             cache_creation_ephemeral_5m_tokens: 0,
             cache_creation_ephemeral_1h_tokens: 0,
             cache_read_tokens: 0,
+            image_count: 0,
+            image_size: None,
+            image_quality: None,
+            image_output_format: None,
             cache_ttl_minutes: None,
         }
     }

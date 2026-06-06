@@ -2,9 +2,10 @@ use serde_json::json;
 use tracing::debug;
 
 use crate::ai_serving::build_request_trace_proxy_value;
+use crate::ai_serving::planner::decision_input::apply_provider_request_routing_policy_to_decision;
 use crate::ai_serving::planner::report_context::{
-    build_local_execution_report_context, insert_provider_stream_event_api_format,
-    LocalExecutionReportContextParts,
+    build_local_execution_report_context, insert_native_client_envelope_name,
+    insert_provider_stream_event_api_format, LocalExecutionReportContextParts,
 };
 use crate::ai_serving::planner::spec_metadata::local_openai_responses_spec_metadata;
 use crate::ai_serving::planner::{
@@ -15,7 +16,7 @@ use crate::ai_serving::transport::{
 };
 use crate::{
     append_execution_contract_fields_to_value, append_local_failover_policy_to_value,
-    AiExecutionDecision, AppState,
+    AiExecutionDecision, AppState, GatewayError,
 };
 
 use super::request::resolve_local_openai_responses_candidate_payload_parts;
@@ -30,7 +31,7 @@ pub(crate) async fn maybe_build_local_openai_responses_decision_payload_for_cand
     input: &LocalOpenAiResponsesDecisionInput,
     attempt: LocalOpenAiResponsesCandidateAttempt,
     spec: LocalOpenAiResponsesSpec,
-) -> Option<AiExecutionDecision> {
+) -> Result<Option<AiExecutionDecision>, GatewayError> {
     let spec_metadata = local_openai_responses_spec_metadata(spec);
     let attempt_identity = attempt.attempt_identity();
     let LocalOpenAiResponsesCandidateAttempt {
@@ -39,7 +40,7 @@ pub(crate) async fn maybe_build_local_openai_responses_decision_payload_for_cand
         candidate_id,
         ..
     } = attempt;
-    let resolved = resolve_local_openai_responses_candidate_payload_parts(
+    let Some(resolved) = resolve_local_openai_responses_candidate_payload_parts(
         state,
         parts,
         trace_id,
@@ -50,8 +51,16 @@ pub(crate) async fn maybe_build_local_openai_responses_decision_payload_for_cand
         &candidate_id,
         spec,
     )
-    .await?;
+    .await?
+    else {
+        return Ok(None);
+    };
     let candidate = &eligible.candidate;
+    let original_request_body_json = if resolved.request_redacted {
+        Some(&resolved.provider_request_body)
+    } else {
+        Some(body_json)
+    };
 
     let prompt_cache_key = resolved
         .provider_request_body
@@ -63,7 +72,10 @@ pub(crate) async fn maybe_build_local_openai_responses_decision_payload_for_cand
     let proxy = state
         .resolve_transport_proxy_snapshot_with_tunnel_affinity(&resolved.transport)
         .await;
-    let transport_profile = resolve_transport_profile(&resolved.transport);
+    let transport_profile = resolved
+        .transport_profile
+        .clone()
+        .or_else(|| resolve_transport_profile(&resolved.transport));
     let timeouts = resolve_transport_execution_timeouts(&resolved.transport);
     let mut extra_fields = serde_json::Map::new();
     if let Some(proxy_value) =
@@ -73,11 +85,37 @@ pub(crate) async fn maybe_build_local_openai_responses_decision_payload_for_cand
     }
     if let Some(envelope_name) = resolved.envelope_name {
         extra_fields.insert("envelope_name".to_string(), json!(envelope_name));
+        insert_native_client_envelope_name(&mut extra_fields, envelope_name, parts.uri.path());
+    }
+    if let Some(image_request_summary) = resolved.image_request_summary.as_ref() {
+        extra_fields.insert("image_request".to_string(), image_request_summary.clone());
+    }
+    if resolved
+        .provider_api_format
+        .eq_ignore_ascii_case("openai:image")
+        && resolved
+            .transport
+            .provider
+            .provider_type
+            .trim()
+            .eq_ignore_ascii_case("chatgpt_web")
+    {
+        extra_fields.insert("chatgpt_web_image".to_string(), json!(true));
+        extra_fields.insert(
+            "local_failover_policy".to_string(),
+            json!({
+                "stop_status_codes": [400, 401, 403, 429, 500, 502, 503, 504],
+                "error_stop_patterns": [
+                    { "pattern": ".*" }
+                ]
+            }),
+        );
     }
     insert_provider_stream_event_api_format(
         &mut extra_fields,
         resolved.transport.provider.provider_type.as_str(),
     );
+    let effective_headers = input.effective_headers(&parts.headers);
     let report_context = append_local_failover_policy_to_value(
         append_execution_contract_fields_to_value(
             build_local_execution_report_context(LocalExecutionReportContextParts {
@@ -105,11 +143,11 @@ pub(crate) async fn maybe_build_local_openai_responses_decision_payload_for_cand
                 body_rules: resolved.transport.endpoint.body_rules.as_ref(),
                 provider_request_method: Some(serde_json::Value::Null),
                 provider_request_headers: Some(&resolved.provider_request_headers),
-                original_headers: &parts.headers,
+                original_headers: effective_headers,
                 request_path: Some(parts.uri.path()),
                 request_query_string: parts.uri.query(),
                 request_origin: Some(crate::ai_serving::request_origin_from_parts(parts)),
-                original_request_body_json: Some(body_json),
+                original_request_body_json,
                 original_request_body_base64: None,
                 client_session_affinity: input.client_session_affinity.as_ref(),
                 scheduler_affinity_epoch: eligible.orchestration.scheduler_affinity_epoch,
@@ -170,41 +208,44 @@ pub(crate) async fn maybe_build_local_openai_responses_decision_payload_for_cand
         envelope_name: _,
         upstream_is_stream,
         transport,
+        transport_profile: _,
+        image_request_summary: _,
+        request_redacted: _,
     } = resolved;
 
-    Some(build_ai_execution_decision_response(
-        AiExecutionDecisionResponseParts {
-            decision_is_stream: spec_metadata.require_streaming,
-            decision_kind: spec_metadata.decision_kind.to_string(),
-            execution_strategy,
-            conversion_mode,
-            request_id: trace_id.to_string(),
-            candidate_id: candidate_id.clone(),
-            provider_name: transport.provider.name.clone(),
-            provider_id: candidate.provider_id.clone(),
-            endpoint_id: candidate.endpoint_id.clone(),
-            key_id: candidate.key_id.clone(),
-            upstream_base_url: transport.endpoint.base_url.clone(),
-            upstream_url,
-            provider_request_method: None,
-            auth_header: Some(auth_header),
-            auth_value: Some(auth_value),
-            provider_api_format,
-            client_api_format: spec_metadata.api_format.to_string(),
-            model_name: input.requested_model.clone(),
-            mapped_model,
-            prompt_cache_key,
-            provider_request_headers,
-            provider_request_body: Some(provider_request_body),
-            provider_request_body_base64: None,
-            content_type: Some("application/json".to_string()),
-            proxy,
-            transport_profile,
-            timeouts,
-            upstream_is_stream,
-            report_kind: spec_metadata.report_kind.map(ToOwned::to_owned),
-            report_context: Some(report_context),
-            auth_context: input.auth_context.clone(),
-        },
-    ))
+    let mut decision = build_ai_execution_decision_response(AiExecutionDecisionResponseParts {
+        decision_is_stream: spec_metadata.require_streaming,
+        decision_kind: spec_metadata.decision_kind.to_string(),
+        execution_strategy,
+        conversion_mode,
+        request_id: trace_id.to_string(),
+        candidate_id: candidate_id.clone(),
+        provider_name: transport.provider.name.clone(),
+        provider_id: candidate.provider_id.clone(),
+        endpoint_id: candidate.endpoint_id.clone(),
+        key_id: candidate.key_id.clone(),
+        upstream_base_url: transport.endpoint.base_url.clone(),
+        upstream_url,
+        provider_request_method: None,
+        auth_header: Some(auth_header),
+        auth_value: Some(auth_value),
+        provider_api_format,
+        client_api_format: spec_metadata.api_format.to_string(),
+        model_name: input.requested_model.clone(),
+        mapped_model,
+        prompt_cache_key,
+        provider_request_headers,
+        provider_request_body: Some(provider_request_body),
+        provider_request_body_base64: None,
+        content_type: Some("application/json".to_string()),
+        proxy,
+        transport_profile,
+        timeouts,
+        upstream_is_stream,
+        report_kind: spec_metadata.report_kind.map(ToOwned::to_owned),
+        report_context: Some(report_context),
+        auth_context: input.auth_context.clone(),
+    });
+    apply_provider_request_routing_policy_to_decision(input, &mut decision)?;
+    Ok(Some(decision))
 }

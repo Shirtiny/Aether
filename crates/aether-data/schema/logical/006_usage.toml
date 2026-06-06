@@ -554,6 +554,121 @@ columns = ["user_id"]
 name = "usage_wallet_id_idx"
 columns = ["wallet_id"]
 
+[table.usage_counter_deltas]
+domain = "usage"
+order = 15
+primary_key = ["id"]
+
+[[table.usage_counter_deltas.columns]]
+name = "id"
+type = "text"
+length = 36
+
+[[table.usage_counter_deltas.columns]]
+name = "request_id"
+type = "text"
+length = 128
+
+[[table.usage_counter_deltas.columns]]
+name = "kind"
+type = "text"
+length = 64
+
+[[table.usage_counter_deltas.columns]]
+name = "target_id"
+type = "text"
+
+[[table.usage_counter_deltas.columns]]
+name = "request_count_delta"
+type = "int64"
+default = 0
+
+[[table.usage_counter_deltas.columns]]
+name = "total_requests_delta"
+type = "int64"
+default = 0
+
+[[table.usage_counter_deltas.columns]]
+name = "success_count_delta"
+type = "int64"
+default = 0
+
+[[table.usage_counter_deltas.columns]]
+name = "error_count_delta"
+type = "int64"
+default = 0
+
+[[table.usage_counter_deltas.columns]]
+name = "dns_failures_delta"
+type = "int64"
+default = 0
+
+[[table.usage_counter_deltas.columns]]
+name = "stream_errors_delta"
+type = "int64"
+default = 0
+
+[[table.usage_counter_deltas.columns]]
+name = "total_tokens_delta"
+type = "int64"
+default = 0
+
+[[table.usage_counter_deltas.columns]]
+name = "total_cost_usd_delta"
+type = "float64"
+default = 0
+
+[[table.usage_counter_deltas.columns]]
+name = "total_response_time_ms_delta"
+type = "int64"
+default = 0
+
+[[table.usage_counter_deltas.columns]]
+name = "last_used_at_unix_secs"
+type = "unix_seconds"
+nullable = true
+
+[[table.usage_counter_deltas.columns]]
+name = "last_used_ip"
+type = "text"
+nullable = true
+
+[[table.usage_counter_deltas.columns]]
+name = "candidate_last_used_at_unix_secs"
+type = "unix_seconds"
+nullable = true
+
+[[table.usage_counter_deltas.columns]]
+name = "removed_last_used_at_unix_secs"
+type = "unix_seconds"
+nullable = true
+
+[[table.usage_counter_deltas.columns]]
+name = "usage_created_at_unix_secs"
+type = "unix_seconds"
+nullable = true
+
+[[table.usage_counter_deltas.columns]]
+name = "created_at"
+type = "timestamp"
+
+[[table.usage_counter_deltas.columns]]
+name = "processed_at"
+type = "timestamp"
+nullable = true
+
+[[table.usage_counter_deltas.indexes]]
+name = "ix_usage_counter_deltas_unprocessed"
+columns = ["created_at", "id"]
+
+[[table.usage_counter_deltas.indexes]]
+name = "ix_usage_counter_deltas_processed"
+columns = ["processed_at", "created_at", "id"]
+
+[[table.usage_counter_deltas.indexes]]
+name = "ix_usage_counter_deltas_request_kind"
+columns = ["request_id", "kind", "target_id"]
+
 [table.usage_settlement_snapshots]
 domain = "usage"
 order = 20

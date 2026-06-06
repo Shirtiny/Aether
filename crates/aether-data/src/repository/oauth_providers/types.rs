@@ -14,6 +14,7 @@ pub struct StoredOAuthProviderConfig {
     pub frontend_callback_url: String,
     pub attribute_mapping: Option<serde_json::Value>,
     pub extra_config: Option<serde_json::Value>,
+    pub icon_url: Option<String>,
     pub is_enabled: bool,
     pub created_at_unix_ms: Option<u64>,
     pub updated_at_unix_secs: Option<u64>,
@@ -66,6 +67,7 @@ impl StoredOAuthProviderConfig {
             frontend_callback_url,
             attribute_mapping: None,
             extra_config: None,
+            icon_url: None,
             is_enabled: false,
             created_at_unix_ms: None,
             updated_at_unix_secs: None,
@@ -82,6 +84,7 @@ impl StoredOAuthProviderConfig {
         scopes: Option<Vec<String>>,
         attribute_mapping: Option<serde_json::Value>,
         extra_config: Option<serde_json::Value>,
+        icon_url: Option<String>,
         is_enabled: bool,
     ) -> Self {
         self.client_secret_encrypted = client_secret_encrypted;
@@ -91,6 +94,7 @@ impl StoredOAuthProviderConfig {
         self.scopes = scopes;
         self.attribute_mapping = attribute_mapping;
         self.extra_config = extra_config;
+        self.icon_url = icon_url;
         self.is_enabled = is_enabled;
         self
     }
@@ -145,6 +149,7 @@ pub struct UpsertOAuthProviderConfigRecord {
     pub frontend_callback_url: String,
     pub attribute_mapping: Option<serde_json::Value>,
     pub extra_config: Option<serde_json::Value>,
+    pub icon_url: Option<String>,
     pub is_enabled: bool,
 }
 

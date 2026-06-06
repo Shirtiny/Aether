@@ -40,7 +40,7 @@ pub(super) async fn admin_provider_ops_sub2api_balance_payload(
                     "query_balance",
                     message,
                     None,
-                )
+                );
             }
         };
 

@@ -9,6 +9,7 @@ pub struct StoredAnnouncement {
     pub priority: i32,
     pub is_active: bool,
     pub is_pinned: bool,
+    pub requires_ack: bool,
     pub author_id: Option<String>,
     pub author_username: Option<String>,
     pub start_time_unix_secs: Option<u64>,
@@ -27,6 +28,7 @@ impl StoredAnnouncement {
         priority: i32,
         is_active: bool,
         is_pinned: bool,
+        requires_ack: bool,
         author_id: Option<String>,
         author_username: Option<String>,
         start_time_unix_secs: Option<i64>,
@@ -63,6 +65,7 @@ impl StoredAnnouncement {
             priority,
             is_active,
             is_pinned,
+            requires_ack,
             author_id,
             author_username,
             start_time_unix_secs: start_time_unix_secs
@@ -117,6 +120,13 @@ pub trait AnnouncementReadRepository: Send + Sync {
         user_id: &str,
         now_unix_secs: u64,
     ) -> Result<u64, crate::DataLayerError>;
+
+    async fn list_required_unread_active_announcements(
+        &self,
+        user_id: &str,
+        now_unix_secs: u64,
+        limit: usize,
+    ) -> Result<Vec<StoredAnnouncement>, crate::DataLayerError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -126,6 +136,7 @@ pub struct CreateAnnouncementRecord {
     pub kind: String,
     pub priority: i32,
     pub is_pinned: bool,
+    pub requires_ack: bool,
     pub author_id: String,
     pub start_time_unix_secs: Option<u64>,
     pub end_time_unix_secs: Option<u64>,
@@ -166,6 +177,7 @@ pub struct UpdateAnnouncementRecord {
     pub priority: Option<i32>,
     pub is_active: Option<bool>,
     pub is_pinned: Option<bool>,
+    pub requires_ack: Option<bool>,
     pub start_time_unix_secs: Option<u64>,
     pub end_time_unix_secs: Option<u64>,
 }

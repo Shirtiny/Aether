@@ -1,6 +1,7 @@
 use axum::body::Bytes;
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
+use std::collections::BTreeSet;
 
 pub(crate) fn parse_admin_provider_query_body(
     request_body: Option<&Bytes>,
@@ -34,6 +35,47 @@ pub(crate) fn provider_query_extract_api_key_id(payload: &serde_json::Value) -> 
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn provider_query_insert_api_key_id(ids: &mut BTreeSet<String>, value: &str) {
+    let value = value.trim();
+    if !value.is_empty() {
+        ids.insert(value.to_string());
+    }
+}
+
+pub(crate) fn provider_query_extract_api_key_ids(
+    payload: &serde_json::Value,
+) -> Option<BTreeSet<String>> {
+    let mut ids = BTreeSet::new();
+
+    if let Some(value) = payload
+        .get("api_key_ids")
+        .or_else(|| payload.get("provider_key_ids"))
+        .or_else(|| payload.get("key_ids"))
+    {
+        match value {
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    if let Some(value) = item.as_str() {
+                        provider_query_insert_api_key_id(&mut ids, value);
+                    }
+                }
+            }
+            serde_json::Value::String(value) => {
+                for item in value.split(',') {
+                    provider_query_insert_api_key_id(&mut ids, item);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(api_key_id) = provider_query_extract_api_key_id(payload) {
+        ids.insert(api_key_id);
+    }
+
+    (!ids.is_empty()).then_some(ids)
 }
 
 pub(crate) fn provider_query_extract_force_refresh(payload: &serde_json::Value) -> bool {

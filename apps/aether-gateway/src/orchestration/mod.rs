@@ -34,8 +34,8 @@ pub(crate) use self::effects::{
     LocalPoolErrorEffect,
 };
 pub(crate) use self::health::{
-    project_local_failure_health, project_local_key_circuit_closed, project_local_key_circuit_open,
-    project_local_success_health,
+    project_local_failure_health, project_local_key_circuit_closed,
+    project_local_key_circuit_failure, project_local_success_health,
 };
 pub(crate) use self::policy::{
     append_local_failover_policy_to_value, local_failover_policy_from_report_context,
@@ -92,7 +92,9 @@ pub(crate) fn build_local_error_flow_metadata(
 ) -> Value {
     let safe_to_expose = matches!(
         analysis.classification,
-        LocalFailoverClassification::StopStatusCode | LocalFailoverClassification::StopErrorPattern
+        LocalFailoverClassification::StopStatusCode
+            | LocalFailoverClassification::StopErrorPattern
+            | LocalFailoverClassification::StopExecutionError
     );
     let propagation = match analysis.decision {
         LocalFailoverDecision::RetryNextCandidate => "suppressed",

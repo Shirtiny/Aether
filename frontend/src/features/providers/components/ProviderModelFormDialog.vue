@@ -28,7 +28,10 @@
             {{ manualGlobalModelMode ? '选择已有模型' : '手动添加' }}
           </Button>
         </div>
-        <div v-if="!manualGlobalModelMode" class="space-y-2">
+        <div
+          v-if="!manualGlobalModelMode"
+          class="space-y-2"
+        >
           <Select
             :model-value="form.global_model_id"
             :disabled="loadingGlobalModels"
@@ -48,10 +51,16 @@
             </SelectContent>
           </Select>
         </div>
-        <div v-else class="rounded-lg border border-border/60 bg-muted/20 p-3 space-y-3">
+        <div
+          v-else
+          class="rounded-lg border border-border/60 bg-muted/20 p-3 space-y-3"
+        >
           <div class="grid grid-cols-2 gap-3">
             <div class="space-y-1.5">
-              <Label for="manual-global-model-name" class="text-xs">模型ID *</Label>
+              <Label
+                for="manual-global-model-name"
+                class="text-xs"
+              >模型ID *</Label>
               <Input
                 id="manual-global-model-name"
                 v-model="form.manual_global_model_name"
@@ -60,7 +69,10 @@
               />
             </div>
             <div class="space-y-1.5">
-              <Label for="manual-global-model-display-name" class="text-xs">显示名称</Label>
+              <Label
+                for="manual-global-model-display-name"
+                class="text-xs"
+              >显示名称</Label>
               <Input
                 id="manual-global-model-display-name"
                 v-model="form.manual_global_model_display_name"
@@ -79,7 +91,10 @@
           没有可选择的本地全局模型。可以切换到“手动添加”继续保存。
         </p>
         <div class="space-y-1.5">
-          <Label for="provider-model-name" class="text-xs">Provider 模型名 *</Label>
+          <Label
+            for="provider-model-name"
+            class="text-xs"
+          >Provider 模型名 *</Label>
           <Input
             id="provider-model-name"
             v-model="form.provider_model_name"
@@ -126,6 +141,24 @@
         </div>
       </div>
 
+      <div class="rounded-lg border border-border/60 bg-muted/20 px-3 py-2">
+        <div class="flex items-start gap-2">
+          <Checkbox
+            :checked="isImageGenerationEnabled"
+            class="mt-0.5"
+            @update:checked="setImageGenerationEnabled"
+          />
+          <div class="space-y-1">
+            <div class="text-sm font-medium">
+              图片模型
+            </div>
+            <p class="text-xs text-muted-foreground">
+              启用图片输出计费，并展开尺寸 × 质量矩阵价格。
+            </p>
+          </div>
+        </div>
+      </div>
+
       <!-- 价格配置 -->
       <div class="space-y-4">
         <h4 class="font-semibold text-sm border-b pb-2">
@@ -135,6 +168,7 @@
           ref="tieredPricingEditorRef"
           v-model="tieredPricing"
           :show-cache1h="showCache1h"
+          :show-image-pricing="isImageGenerationEnabled"
         />
 
         <!-- 按次计费 -->
@@ -281,6 +315,7 @@ import {
   SelectContent,
   SelectItem,
   Badge,
+  Checkbox,
 } from '@/components/ui'
 import { useToast } from '@/composables/useToast'
 import { parseNumberInput, sortResolutionEntries } from '@/utils/form'
@@ -322,9 +357,27 @@ const selectedGlobalModel = computed(() => {
 })
 
 const selectedGlobalModelSupportsEmbedding = computed(() => modelSupportsEmbedding(selectedGlobalModel.value))
+const selectedGlobalModelSupportsImageGeneration = computed(() => modelSupportsImageGeneration(selectedGlobalModel.value))
 const editingModelSupportsEmbedding = computed(() => {
   return props.editingModel?.effective_supports_embedding === true
     || modelSupportsEmbedding(props.editingModel)
+})
+const editingModelSupportsImageGeneration = computed(() => {
+  return props.editingModel?.effective_supports_image_generation === true
+    || modelSupportsImageGeneration(props.editingModel)
+})
+
+const isImageGenerationEnabled = computed(() => {
+  if (imageGenerationExplicitOverride.value !== null) {
+    return imageGenerationExplicitOverride.value
+  }
+  if (form.value.supports_image_generation !== undefined) {
+    return form.value.supports_image_generation === true
+  }
+  const supportsImageGeneration = isEditing.value
+    ? editingModelSupportsImageGeneration.value
+    : selectedGlobalModelSupportsImageGeneration.value
+  return supportsImageGeneration || tieredPricingHasImageOutputPricing(tieredPricing.value)
 })
 
 // 1h 缓存定价始终显示
@@ -388,6 +441,7 @@ const form = ref({
   supports_image_generation: undefined as boolean | undefined,
   is_active: true
 })
+const imageGenerationExplicitOverride = ref<boolean | null>(null)
 
 const canSubmitCreate = computed(() => {
   if (isEditing.value) return true
@@ -404,6 +458,7 @@ watch(() => props.open, async (newOpen) => {
       // 编辑模式：填充表单
       // 使用有效配置（合并全局模型的默认值）供用户查看和编辑
       const effectiveConfig = props.editingModel.effective_config || props.editingModel.config || {}
+      const supportsImageGeneration = modelSupportsImageGeneration(props.editingModel)
       form.value = {
         global_model_id: props.editingModel.global_model_id || '',
         provider_model_name: props.editingModel.provider_model_name || '',
@@ -416,7 +471,7 @@ watch(() => props.open, async (newOpen) => {
         supports_function_calling: props.editingModel.supports_function_calling ?? undefined,
         supports_streaming: props.editingModel.supports_streaming ?? undefined,
         supports_extended_thinking: props.editingModel.supports_extended_thinking ?? undefined,
-        supports_image_generation: props.editingModel.supports_image_generation ?? undefined,
+        supports_image_generation: supportsImageGeneration ? true : props.editingModel.supports_image_generation ?? undefined,
         is_active: props.editingModel.is_active
       }
       // 从有效配置中加载视频费用
@@ -467,6 +522,7 @@ watch(tieredPricing, (newValue) => {
 
 // 重置表单
 function resetForm() {
+  imageGenerationExplicitOverride.value = null
   form.value = {
     global_model_id: '',
     provider_model_name: '',
@@ -491,9 +547,64 @@ function resetForm() {
 }
 
 function handleGlobalModelSelect(value: string) {
+  imageGenerationExplicitOverride.value = null
+  form.value.supports_image_generation = undefined
   form.value.global_model_id = value
   const selectedModel = availableGlobalModels.value.find(model => model.id === value)
   form.value.provider_model_name = selectedModel?.name || form.value.provider_model_name
+}
+
+function modelSupportsImageGeneration(model: {
+  supported_capabilities?: string[] | null
+  supports_image_generation?: boolean | null
+  effective_supports_image_generation?: boolean | null
+  default_tiered_pricing?: TieredPricingConfig | null
+  tiered_pricing?: TieredPricingConfig | null
+  effective_tiered_pricing?: TieredPricingConfig | null
+  config?: Record<string, unknown> | null
+} | null | undefined): boolean {
+  if (!model) return false
+  if (model.effective_supports_image_generation === true) return true
+  if (model.supports_image_generation === true) return true
+  const config = model.config || {}
+  return model.supported_capabilities?.includes('image_generation') === true
+    || config.image_generation === true
+    || config.model_type === 'image'
+    || (Array.isArray(config.api_formats) && config.api_formats.some((format) => String(format).endsWith(':image')))
+    || tieredPricingHasImageOutputPricing(model.default_tiered_pricing)
+    || tieredPricingHasImageOutputPricing(model.tiered_pricing)
+    || tieredPricingHasImageOutputPricing(model.effective_tiered_pricing)
+}
+
+function tieredPricingHasImageOutputPricing(pricing: TieredPricingConfig | null | undefined): boolean {
+  if (!pricing) return false
+  if (toFinitePrice(pricing.image_output_price_default) !== null) return true
+  if (Object.values(pricing.image_output_prices || {}).some((prices) => {
+    if (!prices || typeof prices !== 'object') return false
+    return Object.values(prices).some((price) => toFinitePrice(price) !== null)
+  })) return true
+  return (pricing.image_output_price_ranges || []).some((range) => {
+    if (!range || typeof range !== 'object') return false
+    const prices = range.prices && typeof range.prices === 'object'
+      ? range.prices
+      : range as Record<string, unknown>
+    return Object.values(prices).some((price) => toFinitePrice(price) !== null)
+  })
+}
+
+function toFinitePrice(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Number(value)
+    return Number.isFinite(parsed) ? parsed : null
+  }
+  return null
+}
+
+function setImageGenerationEnabled(value: boolean | 'indeterminate') {
+  const enabled = value === true
+  imageGenerationExplicitOverride.value = enabled
+  form.value.supports_image_generation = enabled
 }
 
 function syncManualProviderName(value: string | number) {
@@ -708,8 +819,9 @@ async function handleSubmit() {
   submitting.value = true
   try {
     // 获取包含自动计算缓存价格的最终数据
-    const finalTiers = tieredPricingEditorRef.value?.getFinalTiers()
-    const finalTieredPricing = finalTiers ? { tiers: finalTiers } : tieredPricing.value
+    const finalTieredPricing = tieredPricingEditorRef.value?.getFinalPricing() ?? tieredPricing.value
+    const supportsImageGeneration = isImageGenerationEnabled.value
+      || tieredPricingHasImageOutputPricing(finalTieredPricing)
 
     // Apply billing (video) pricing into config.
     applyVideoPricingToConfig(form.value.config)
@@ -728,7 +840,7 @@ async function handleSubmit() {
         supportsFunctionCalling: form.value.supports_function_calling,
         supportsStreaming: form.value.supports_streaming,
         supportsExtendedThinking: form.value.supports_extended_thinking,
-        supportsImageGeneration: form.value.supports_image_generation,
+        supportsImageGeneration,
         isActive: form.value.is_active
       }))
       showSuccess('模型配置已更新')
@@ -753,7 +865,7 @@ async function handleSubmit() {
         supportsFunctionCalling: form.value.supports_function_calling,
         supportsStreaming: form.value.supports_streaming,
         supportsExtendedThinking: form.value.supports_extended_thinking,
-        supportsImageGeneration: form.value.supports_image_generation,
+        supportsImageGeneration,
         isActive: form.value.is_active
       }))
       showSuccess('模型已添加')

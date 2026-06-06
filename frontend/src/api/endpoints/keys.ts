@@ -109,6 +109,31 @@ export async function batchDeleteEndpointKeys(ids: string[]): Promise<BatchDelet
 /**
  * 获取 Provider 的所有 Keys
  */
+export interface ProviderKeysPageResponse {
+  total: number
+  page: number
+  page_size: number
+  keys: EndpointAPIKey[]
+}
+
+export interface ProviderKeysPageQuery {
+  page?: number
+  page_size?: number
+}
+
+export async function getProviderKeysPage(
+  providerId: string,
+  params: ProviderKeysPageQuery = {},
+): Promise<ProviderKeysPageResponse> {
+  const page = params.page ?? 1
+  const pageSize = params.page_size ?? 20
+  const response = await client.get<ProviderKeysPageResponse>(
+    `/api/admin/endpoints/providers/${providerId}/keys`,
+    { params: { page, page_size: pageSize } },
+  )
+  return response.data
+}
+
 export async function getProviderKeys(providerId: string): Promise<EndpointAPIKey[]> {
   // 后端默认 limit=100，这里主动分页拉取，避免账号数 >100 时前端被截断
   const pageSize = 1000

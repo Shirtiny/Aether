@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS public.oauth_providers (
     frontend_callback_url character varying(500) NOT NULL,
     attribute_mapping jsonb,
     extra_config jsonb,
+    icon_url character varying(500),
     is_enabled boolean DEFAULT false NOT NULL,
     created_at bigint NOT NULL,
     updated_at bigint NOT NULL

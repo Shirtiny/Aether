@@ -136,10 +136,11 @@ pub(crate) async fn maybe_build_sync_local_decision_payload(
     let Some(input) = resolve_local_openai_chat_decision_input(
         state, parts, trace_id, decision, body_json, plan_kind, false,
     )
-    .await
+    .await?
     else {
         return Ok(None);
     };
+    let body_json = input.effective_body_json(body_json);
 
     let (mut source, _) = build_lazy_local_openai_chat_candidate_attempt_source(
         state, trace_id, &input, body_json, false,
@@ -187,10 +188,11 @@ pub(crate) async fn maybe_build_stream_local_decision_payload(
     let Some(input) = resolve_local_openai_chat_decision_input(
         state, parts, trace_id, decision, body_json, plan_kind, false,
     )
-    .await
+    .await?
     else {
         return Ok(None);
     };
+    let body_json = input.effective_body_json(body_json);
 
     let (mut source, _) = build_lazy_local_openai_chat_candidate_attempt_source(
         state, trace_id, &input, body_json, true,

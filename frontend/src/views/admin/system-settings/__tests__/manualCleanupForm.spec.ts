@@ -1,8 +1,11 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  allowedTargetsForMode,
+  defaultManualCleanupTargets,
   MANUAL_USAGE_CLEANUP_CONFIRM_PHRASE,
   isConfirmPhraseMatched,
+  normalizeManualCleanupTargets,
   normalizeConfirmPhraseInput,
   normalizeOlderThanDaysInput,
 } from '../manualCleanupForm'
@@ -59,6 +62,36 @@ describe('manualCleanupForm', () => {
 
     it('returns null for non-numeric strings', () => {
       expect(normalizeOlderThanDaysInput('abc')).toBeNull()
+    })
+  })
+
+  describe('cleanup targets', () => {
+    it('keeps all ranges available for policy cleanup', () => {
+      expect(allowedTargetsForMode('policy')).toEqual([
+        'detail_body',
+        'compressed_body',
+        'headers',
+        'records',
+      ])
+      expect(defaultManualCleanupTargets('older_than_days')).toEqual([
+        'detail_body',
+        'compressed_body',
+        'headers',
+        'records',
+      ])
+    })
+
+    it('limits before-now cleanup to body targets', () => {
+      expect(allowedTargetsForMode('before_now')).toEqual([
+        'detail_body',
+        'compressed_body',
+      ])
+      expect(normalizeManualCleanupTargets('before_now', [
+        'detail_body',
+        'headers',
+        'compressed_body',
+        'records',
+      ])).toEqual(['detail_body', 'compressed_body'])
     })
   })
 })

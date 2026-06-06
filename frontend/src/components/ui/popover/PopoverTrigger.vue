@@ -2,16 +2,16 @@
 import { PopoverTrigger } from 'radix-vue'
 import { useAttrs } from 'vue'
 
-defineOptions({
-  inheritAttrs: false,
-})
-
 withDefaults(defineProps<{
   asChild?: boolean
   as?: string
 }>(), {
   asChild: false,
   as: 'button',
+})
+
+defineOptions({
+  inheritAttrs: false,
 })
 
 const attrs = useAttrs()

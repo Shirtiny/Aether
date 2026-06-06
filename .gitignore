@@ -1,6 +1,8 @@
 # Created by https://www.toptal.com/developers/gitignore/api/python
 # Edit at https://www.toptal.com/developers/gitignore?templates=python
 
+*.rsa
+
 # AI Assistant Configuration
 .codex/
 .claude/
@@ -244,4 +246,4 @@ src/_version.py
 # Analysis folder (third-party code for reference)
 analysis/
 new-api/
-apps/aether-proxy/aether-proxy.toml
+apps/aether-tunnel/aether-tunnel.toml

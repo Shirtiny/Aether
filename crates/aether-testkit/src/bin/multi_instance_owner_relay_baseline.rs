@@ -253,6 +253,9 @@ fn relay_envelope() -> Vec<u8> {
             "content-type".to_string(),
             "application/json".to_string(),
         )]),
+        stream: false,
+        request_timeout_ms: None,
+        stream_first_byte_timeout_ms: None,
         timeout: 30,
         follow_redirects: None,
         http1_only: false,
@@ -284,6 +287,12 @@ async fn connect_protocol_peer(
     request
         .headers_mut()
         .insert("x-node-id", http::HeaderValue::from_static(NODE_ID));
+    request.headers_mut().insert(
+        aether_contracts::tunnel::TUNNEL_PROTOCOL_VERSION_HEADER,
+        http::HeaderValue::from_static(
+            aether_contracts::tunnel::CURRENT_TUNNEL_PROTOCOL_VERSION_STR,
+        ),
+    );
     request.headers_mut().insert(
         "x-node-name",
         http::HeaderValue::from_static("proxy-owner-relay-baseline"),

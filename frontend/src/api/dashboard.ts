@@ -142,6 +142,17 @@ export interface RequestErrorFlow {
   summary_source?: string | null
 }
 
+export interface RequestSchedulingFailure {
+  source?: string | null
+  reason?: string | null
+  reason_label?: string | null
+  title?: string | null
+  message?: string | null
+  reason_summary?: string | null
+  status_code?: number | null
+  no_upstream_attempt?: boolean | null
+}
+
 export interface RequestDetail {
   id: string // UUID
   request_id: string
@@ -185,6 +196,7 @@ export interface RequestDetail {
   total_cost?: number
   cache_creation_cost?: number
   cache_read_cost?: number
+  image_output_cost?: number
   request_cost?: number  // 按次计费费用
   // Historical pricing fields (per 1M tokens)
   input_price_per_1m?: number
@@ -206,6 +218,7 @@ export interface RequestDetail {
   failure_summary?: RequestErrorDomain | null
   errors?: RequestErrorDomains | null
   error_flow?: RequestErrorFlow | null
+  scheduling_failure?: RequestSchedulingFailure | null
   response_time_ms: number
   first_byte_time_ms?: number | null
   created_at: string
@@ -366,7 +379,7 @@ export interface TimeRangeParams {
 export const dashboardApi = {
   // 获取仪表盘统计数据
   async getStats(params?: TimeRangeParams): Promise<DashboardStatsResponse> {
-    const cacheKey = buildCacheKey('dashboard:stats', params)
+    const cacheKey = buildCacheKey('dashboard:stats', params as Record<string, unknown> | undefined)
     return cachedRequest(
       cacheKey,
       async () => {
@@ -427,7 +440,7 @@ export const dashboardApi = {
 
   // 获取每日统计数据
   async getDailyStats(params?: TimeRangeParams & { days?: number }): Promise<DailyStatsResponse> {
-    const cacheKey = buildCacheKey('dashboard:daily-stats', params)
+    const cacheKey = buildCacheKey('dashboard:daily-stats', params as Record<string, unknown> | undefined)
     return cachedRequest(
       cacheKey,
       async () => {

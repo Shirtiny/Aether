@@ -41,12 +41,19 @@
             :class="selectedType === '__new__' ? 'bg-primary/10 text-primary' : 'text-foreground hover:bg-muted'"
             @click="selectNewConfig()"
           >
-            <div class="w-7 h-7 rounded-md flex items-center justify-center text-xs font-semibold shrink-0"
+            <div
+              class="w-7 h-7 rounded-md flex items-center justify-center text-xs font-semibold shrink-0"
               :class="selectedType === '__new__' ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground'"
-            >+</div>
+            >
+              +
+            </div>
             <div class="flex-1 min-w-0 text-left">
-              <div class="truncate font-medium text-sm">新配置</div>
-              <div class="text-[10px] text-muted-foreground">未保存</div>
+              <div class="truncate font-medium text-sm">
+                新配置
+              </div>
+              <div class="text-[10px] text-muted-foreground">
+                未保存
+              </div>
             </div>
           </button>
 
@@ -70,10 +77,12 @@
                 src="https://cdn.linux.do/uploads/default/optimized/3X/9/d/9dd49731091ce8656243f3c2b6e5d5e5a7e3e3e3_2_32x32.png"
                 class="absolute inset-0 w-full h-full object-cover"
                 @error="($event.target as HTMLImageElement).remove()"
-              />
+              >
             </div>
             <div class="flex-1 min-w-0 text-left">
-              <div class="truncate font-medium text-sm">{{ item.display_name }}</div>
+              <div class="truncate font-medium text-sm">
+                {{ item.display_name }}
+              </div>
               <div class="text-[10px] text-muted-foreground">
                 {{ item.configured ? (item.is_enabled ? '已启用' : '已禁用') : '未配置' }}
               </div>
@@ -96,262 +105,273 @@
 
       <!-- 右侧内容区 -->
       <div class="flex-1 min-w-0">
+        <!-- 配置表单 -->
+        <CardSection
+          v-if="selectedType"
+          :title="selectedType === '__new__' ? '新建配置' : (selectedTypeMeta?.display_name || selectedType)"
+          :description="selectedType === '__new__' ? '填写后点击保存' : (configs[selectedType]?.is_enabled ? '已启用' : '已禁用')"
+        >
+          <template #actions>
+            <div class="flex gap-2">
+              <Button
+                size="sm"
+                variant="outline"
+                :disabled="saving || testing"
+                @click="handleTest"
+              >
+                {{ testing ? '测试中...' : '测试' }}
+              </Button>
+              <Button
+                size="sm"
+                :disabled="saving"
+                @click="handleSave"
+              >
+                {{ saving ? '保存中...' : '保存' }}
+              </Button>
+            </div>
+          </template>
 
-      <!-- 配置表单 -->
-      <CardSection
-        v-if="selectedType"
-        :title="selectedType === '__new__' ? '新建配置' : (selectedTypeMeta?.display_name || selectedType)"
-        :description="selectedType === '__new__' ? '填写后点击保存' : (configs[selectedType]?.is_enabled ? '已启用' : '已禁用')"
-      >
-        <template #actions>
-          <div class="flex gap-2">
-            <Button
-              size="sm"
-              variant="outline"
-              :disabled="saving || testing"
-              @click="handleTest"
+          <div class="space-y-6">
+            <!-- 新建时的 Display Name -->
+            <div
+              v-if="selectedType === '__new__'"
+              class="grid grid-cols-1 md:grid-cols-2 gap-4"
             >
-              {{ testing ? '测试中...' : '测试' }}
-            </Button>
-            <Button
-              size="sm"
-              :disabled="saving"
-              @click="handleSave"
-            >
-              {{ saving ? '保存中...' : '保存' }}
-            </Button>
-          </div>
-        </template>
-
-        <div class="space-y-6">
-          <!-- 新建时的 Display Name -->
-          <div
-            v-if="selectedType === '__new__'"
-            class="grid grid-cols-1 md:grid-cols-2 gap-4"
-          >
-            <div>
-              <Label class="block text-sm font-medium">显示名称</Label>
-              <Input
-                v-model="form.new_display_name"
-                class="mt-1"
-                placeholder="例如：My OIDC Provider"
-                autocomplete="off"
-              />
-            </div>
-            <div>
-              <Label class="block text-sm font-medium">配置标识</Label>
-              <Input
-                v-model="form.new_provider_type"
-                class="mt-1"
-                placeholder="custom_oidc_work"
-                autocomplete="off"
-                @blur="normalizeNewProviderType"
-              />
-            </div>
-          </div>
-
-          <!-- 凭证配置 -->
-          <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <div>
-              <Label class="block text-sm font-medium">Client ID</Label>
-              <Input
-                v-model="form.client_id"
-                class="mt-1"
-                placeholder="client_id"
-                autocomplete="off"
-              />
-            </div>
-            <div>
-              <Label class="block text-sm font-medium">Client Secret</Label>
-              <Input
-                v-model="form.client_secret"
-                masked
-                class="mt-1"
-                :placeholder="hasSecret ? '已设置（留空保持不变）' : '请输入 secret'"
-              />
-            </div>
-          </div>
-
-          <!-- 回调地址 -->
-          <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <div>
-              <Label class="block text-sm font-medium">Redirect URI（后端回调）</Label>
-              <Input
-                v-model="form.redirect_uri"
-                class="mt-1"
-                placeholder="http://localhost:8084/api/oauth/xxx/callback"
-                autocomplete="off"
-              />
-            </div>
-            <div>
-              <Label class="block text-sm font-medium">前端回调页</Label>
-              <Input
-                v-model="form.frontend_callback_url"
-                class="mt-1"
-                placeholder="http://localhost:5173/auth/callback"
-                autocomplete="off"
-              />
-            </div>
-          </div>
-
-          <!-- custom_oidc 必填端点 -->
-          <div
-            v-if="isSelectedCustomProvider"
-            class="grid grid-cols-1 md:grid-cols-3 gap-4"
-          >
-            <div>
-              <Label class="block text-sm font-medium">Authorization URL</Label>
-              <Input
-                v-model="form.authorization_url_override"
-                class="mt-1"
-                placeholder="https://example.com/oauth/authorize"
-                autocomplete="off"
-              />
-            </div>
-            <div>
-              <Label class="block text-sm font-medium">Token URL</Label>
-              <Input
-                v-model="form.token_url_override"
-                class="mt-1"
-                placeholder="https://example.com/oauth/token"
-                autocomplete="off"
-              />
-            </div>
-            <div>
-              <Label class="block text-sm font-medium">Userinfo URL</Label>
-              <Input
-                v-model="form.userinfo_url_override"
-                class="mt-1"
-                placeholder="https://example.com/api/user"
-                autocomplete="off"
-              />
-            </div>
-          </div>
-
-          <!-- 高级选项（折叠） -->
-          <details class="group">
-            <summary class="cursor-pointer text-sm font-medium text-muted-foreground hover:text-foreground transition-colors">
-              高级选项
-            </summary>
-            <div class="mt-4 space-y-4 pl-4 border-l-2 border-border">
               <div>
-                <Label class="block text-sm font-medium">Scopes</Label>
+                <Label class="block text-sm font-medium">显示名称</Label>
                 <Input
-                  v-model="form.scopes_input"
+                  v-model="form.new_display_name"
                   class="mt-1"
-                  :placeholder="selectedTypeMeta?.default_scopes?.join(' ') || '留空使用默认值'"
+                  placeholder="例如：My OIDC Provider"
                   autocomplete="off"
                 />
-                <p class="mt-1 text-xs text-muted-foreground">
-                  空格/逗号分隔；留空使用默认值
-                </p>
               </div>
-
-              <!-- linuxdo 的可选端点覆盖 -->
-              <div
-                v-if="!isSelectedCustomProvider"
-                class="grid grid-cols-1 md:grid-cols-3 gap-4"
-              >
-                <div>
-                  <Label class="block text-sm font-medium">Authorization URL</Label>
-                  <Input
-                    v-model="form.authorization_url_override"
-                    class="mt-1"
-                    :placeholder="selectedTypeMeta?.default_authorization_url || '默认'"
-                    autocomplete="off"
-                  />
-                </div>
-                <div>
-                  <Label class="block text-sm font-medium">Token URL</Label>
-                  <Input
-                    v-model="form.token_url_override"
-                    class="mt-1"
-                    :placeholder="selectedTypeMeta?.default_token_url || '默认'"
-                    autocomplete="off"
-                  />
-                </div>
-                <div>
-                  <Label class="block text-sm font-medium">Userinfo URL</Label>
-                  <Input
-                    v-model="form.userinfo_url_override"
-                    class="mt-1"
-                    :placeholder="selectedTypeMeta?.default_userinfo_url || '默认'"
-                    autocomplete="off"
-                  />
-                </div>
+              <div>
+                <Label class="block text-sm font-medium">配置标识</Label>
+                <Input
+                  v-model="form.new_provider_type"
+                  class="mt-1"
+                  placeholder="custom_oidc_work"
+                  autocomplete="off"
+                  @blur="normalizeNewProviderType"
+                />
               </div>
+            </div>
 
-              <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <!-- 凭证配置 -->
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div>
+                <Label class="block text-sm font-medium">Client ID</Label>
+                <Input
+                  v-model="form.client_id"
+                  class="mt-1"
+                  placeholder="client_id"
+                  autocomplete="off"
+                />
+              </div>
+              <div>
+                <Label class="block text-sm font-medium">Client Secret</Label>
+                <Input
+                  v-model="form.client_secret"
+                  masked
+                  class="mt-1"
+                  :placeholder="hasSecret ? '已设置（留空保持不变）' : '请输入 secret'"
+                />
+              </div>
+            </div>
+
+            <!-- 回调地址 -->
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div>
+                <Label class="block text-sm font-medium">Redirect URI（后端回调）</Label>
+                <Input
+                  v-model="form.redirect_uri"
+                  class="mt-1"
+                  placeholder="http://localhost:8084/api/oauth/xxx/callback"
+                  autocomplete="off"
+                />
+              </div>
+              <div>
+                <Label class="block text-sm font-medium">前端回调页</Label>
+                <Input
+                  v-model="form.frontend_callback_url"
+                  class="mt-1"
+                  placeholder="http://localhost:5173/auth/callback"
+                  autocomplete="off"
+                />
+              </div>
+            </div>
+
+            <!-- custom_oidc 必填端点 -->
+            <div
+              v-if="isSelectedCustomProvider"
+              class="grid grid-cols-1 md:grid-cols-3 gap-4"
+            >
+              <div>
+                <Label class="block text-sm font-medium">Authorization URL</Label>
+                <Input
+                  v-model="form.authorization_url_override"
+                  class="mt-1"
+                  placeholder="https://example.com/oauth/authorize"
+                  autocomplete="off"
+                />
+              </div>
+              <div>
+                <Label class="block text-sm font-medium">Token URL</Label>
+                <Input
+                  v-model="form.token_url_override"
+                  class="mt-1"
+                  placeholder="https://example.com/oauth/token"
+                  autocomplete="off"
+                />
+              </div>
+              <div>
+                <Label class="block text-sm font-medium">Userinfo URL</Label>
+                <Input
+                  v-model="form.userinfo_url_override"
+                  class="mt-1"
+                  placeholder="https://example.com/api/user"
+                  autocomplete="off"
+                />
+              </div>
+            </div>
+
+            <!-- 图标 URL -->
+            <div>
+              <Label class="block text-sm font-medium">图标 URL</Label>
+              <Input
+                v-model="form.icon_url"
+                class="mt-1"
+                placeholder="https://example.com/icon.svg"
+                autocomplete="off"
+              />
+              <p class="mt-1 text-xs text-muted-foreground">
+                登录页显示的 Provider 图标，留空使用默认图标
+              </p>
+            </div>
+
+            <!-- 高级选项（折叠） -->
+            <details class="group">
+              <summary class="cursor-pointer text-sm font-medium text-muted-foreground hover:text-foreground transition-colors">
+                高级选项
+              </summary>
+              <div class="mt-4 space-y-4 pl-4 border-l-2 border-border">
                 <div>
-                  <Label class="block text-sm font-medium">Attribute Mapping</Label>
-                  <Textarea
-                    v-model="form.attribute_mapping_json"
-                    class="mt-1 font-mono text-xs"
-                    rows="3"
-                    placeholder="{&quot;id&quot;: &quot;user_id&quot;, &quot;username&quot;: &quot;login&quot;}"
+                  <Label class="block text-sm font-medium">Scopes</Label>
+                  <Input
+                    v-model="form.scopes_input"
+                    class="mt-1"
+                    :placeholder="selectedTypeMeta?.default_scopes?.join(' ') || '留空使用默认值'"
+                    autocomplete="off"
                   />
-                </div>
-                <div>
-                  <Label class="block text-sm font-medium">
-                    {{ isSelectedCustomProvider ? 'Allowed Domains / Extra Config' : 'Extra Config' }}
-                  </Label>
-                  <Textarea
-                    v-model="form.extra_config_json"
-                    class="mt-1 font-mono text-xs"
-                    rows="3"
-                    :placeholder="extraConfigPlaceholder"
-                  />
-                  <p
-                    v-if="isSelectedCustomProvider"
-                    class="mt-1 text-xs text-muted-foreground"
-                  >
-                    自定义 OIDC 必填；填写 Authorization / Token / Userinfo URL 所属域名。
+                  <p class="mt-1 text-xs text-muted-foreground">
+                    空格/逗号分隔；留空使用默认值
                   </p>
                 </div>
-              </div>
-            </div>
-          </details>
-        </div>
 
-        <!-- 测试结果 -->
-        <div
-          v-if="lastTestResult"
-          class="mt-6 rounded-lg border border-border p-4 text-sm"
-        >
-          <div class="font-medium mb-2">
-            测试结果
+                <!-- linuxdo 的可选端点覆盖 -->
+                <div
+                  v-if="!isSelectedCustomProvider"
+                  class="grid grid-cols-1 md:grid-cols-3 gap-4"
+                >
+                  <div>
+                    <Label class="block text-sm font-medium">Authorization URL</Label>
+                    <Input
+                      v-model="form.authorization_url_override"
+                      class="mt-1"
+                      :placeholder="selectedTypeMeta?.default_authorization_url || '默认'"
+                      autocomplete="off"
+                    />
+                  </div>
+                  <div>
+                    <Label class="block text-sm font-medium">Token URL</Label>
+                    <Input
+                      v-model="form.token_url_override"
+                      class="mt-1"
+                      :placeholder="selectedTypeMeta?.default_token_url || '默认'"
+                      autocomplete="off"
+                    />
+                  </div>
+                  <div>
+                    <Label class="block text-sm font-medium">Userinfo URL</Label>
+                    <Input
+                      v-model="form.userinfo_url_override"
+                      class="mt-1"
+                      :placeholder="selectedTypeMeta?.default_userinfo_url || '默认'"
+                      autocomplete="off"
+                    />
+                  </div>
+                </div>
+
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <div>
+                    <Label class="block text-sm font-medium">Attribute Mapping</Label>
+                    <Textarea
+                      v-model="form.attribute_mapping_json"
+                      class="mt-1 font-mono text-xs"
+                      rows="3"
+                      placeholder="{&quot;id&quot;: &quot;user_id&quot;, &quot;username&quot;: &quot;login&quot;}"
+                    />
+                  </div>
+                  <div>
+                    <Label class="block text-sm font-medium">
+                      {{ isSelectedCustomProvider ? 'Allowed Domains / Extra Config' : 'Extra Config' }}
+                    </Label>
+                    <Textarea
+                      v-model="form.extra_config_json"
+                      class="mt-1 font-mono text-xs"
+                      rows="3"
+                      :placeholder="extraConfigPlaceholder"
+                    />
+                    <p
+                      v-if="isSelectedCustomProvider"
+                      class="mt-1 text-xs text-muted-foreground"
+                    >
+                      自定义 OIDC 必填；填写 Authorization / Token / Userinfo URL 所属域名。
+                    </p>
+                  </div>
+                </div>
+              </div>
+            </details>
           </div>
-          <div class="flex flex-wrap gap-4 text-xs">
-            <div class="flex items-center gap-2">
-              <span
-                class="w-2 h-2 rounded-full"
-                :class="lastTestResult.authorization_url_reachable ? 'bg-green-500' : 'bg-red-500'"
-              />
-              <span class="text-muted-foreground">Authorization URL</span>
+          <div
+            v-if="lastTestResult"
+            class="mt-6 rounded-lg border border-border p-4 text-sm"
+          >
+            <div class="font-medium mb-2">
+              测试结果
             </div>
-            <div class="flex items-center gap-2">
+            <div class="flex flex-wrap gap-4 text-xs">
+              <div class="flex items-center gap-2">
+                <span
+                  class="w-2 h-2 rounded-full"
+                  :class="lastTestResult.authorization_url_reachable ? 'bg-green-500' : 'bg-red-500'"
+                />
+                <span class="text-muted-foreground">Authorization URL</span>
+              </div>
+              <div class="flex items-center gap-2">
+                <span
+                  class="w-2 h-2 rounded-full"
+                  :class="lastTestResult.token_url_reachable ? 'bg-green-500' : 'bg-red-500'"
+                />
+                <span class="text-muted-foreground">Token URL</span>
+              </div>
+              <div class="flex items-center gap-2">
+                <span
+                  class="w-2 h-2 rounded-full"
+                  :class="lastTestResult.secret_status === 'likely_valid' ? 'bg-green-500' : lastTestResult.secret_status === 'invalid' ? 'bg-red-500' : 'bg-yellow-500'"
+                />
+                <span class="text-muted-foreground">Secret: {{ lastTestResult.secret_status }}</span>
+              </div>
               <span
-                class="w-2 h-2 rounded-full"
-                :class="lastTestResult.token_url_reachable ? 'bg-green-500' : 'bg-red-500'"
-              />
-              <span class="text-muted-foreground">Token URL</span>
+                v-if="lastTestResult.details"
+                class="text-muted-foreground"
+              >
+                {{ lastTestResult.details }}
+              </span>
             </div>
-            <div class="flex items-center gap-2">
-              <span
-                class="w-2 h-2 rounded-full"
-                :class="lastTestResult.secret_status === 'likely_valid' ? 'bg-green-500' : lastTestResult.secret_status === 'invalid' ? 'bg-red-500' : 'bg-yellow-500'"
-              />
-              <span class="text-muted-foreground">Secret: {{ lastTestResult.secret_status }}</span>
-            </div>
-            <span
-              v-if="lastTestResult.details"
-              class="text-muted-foreground"
-            >
-              {{ lastTestResult.details }}
-            </span>
           </div>
-        </div>
-      </CardSection>
+        </CardSection>
       </div>
     </div>
   </PageContainer>
@@ -394,6 +414,7 @@ interface OAuthConfigForm {
   frontend_callback_url: string
   attribute_mapping_json: string
   extra_config_json: string
+  icon_url: string
   new_provider_type: string
   new_display_name: string
 }
@@ -415,6 +436,7 @@ const form = ref<OAuthConfigForm>({
   frontend_callback_url: '',
   attribute_mapping_json: '',
   extra_config_json: '',
+  icon_url: '',
   new_provider_type: '',
   new_display_name: '',
 })
@@ -581,6 +603,7 @@ function handleClickAdd() {
     frontend_callback_url: defaultFrontendCallbackUrl(),
     attribute_mapping_json: '',
     extra_config_json: '',
+    icon_url: '',
     new_provider_type: providerType,
     new_display_name: '',
   }
@@ -625,6 +648,7 @@ function syncFormFromSelected() {
     frontend_callback_url: cfg?.frontend_callback_url || defaultFrontendCallbackUrl(),
     attribute_mapping_json: cfg?.attribute_mapping ? JSON.stringify(cfg.attribute_mapping, null, 2) : '',
     extra_config_json: cfg?.extra_config ? JSON.stringify(cfg.extra_config, null, 2) : '',
+    icon_url: cfg?.icon_url || '',
     new_provider_type: '',
     new_display_name: '',
   }
@@ -650,6 +674,7 @@ async function toggleProviderEnabled(providerType: string, enabled: boolean, for
       frontend_callback_url: cfg.frontend_callback_url,
       attribute_mapping: cfg.attribute_mapping || null,
       extra_config: cfg.extra_config || null,
+      icon_url: cfg.icon_url || null,
       is_enabled: enabled,
       force,
     }
@@ -724,6 +749,7 @@ async function handleSave() {
       frontend_callback_url: form.value.frontend_callback_url.trim(),
       attribute_mapping: parseJsonOrNull(form.value.attribute_mapping_json),
       extra_config: parseJsonOrNull(form.value.extra_config_json),
+      icon_url: form.value.icon_url.trim() || null,
       is_enabled: existingConfig?.is_enabled || false,
     }
 

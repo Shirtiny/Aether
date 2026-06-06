@@ -12,6 +12,20 @@ const CODEX_DEFAULT_INSTRUCTIONS: &str = "";
 const CODEX_DEFAULT_REASONING_EFFORT: &str = "medium";
 const CODEX_DEFAULT_REASONING_SUMMARY: &str = "auto";
 const CODEX_REASONING_ENCRYPTED_CONTENT_INCLUDE: &str = "reasoning.encrypted_content";
+const CODEX_OPENAI_RESPONSES_UNSUPPORTED_BODY_FIELDS: &[&str] = &[
+    "max_output_tokens",
+    "max_completion_tokens",
+    "temperature",
+    "top_p",
+    "frequency_penalty",
+    "presence_penalty",
+    "user",
+    "metadata",
+    "prompt_cache_retention",
+    "safety_identifier",
+    "stream_options",
+    "previous_response_id",
+];
 const CODEX_DEFAULT_USER_AGENT: &str =
     "codex-tui/0.122.0 (Mac OS 15.2.0; arm64) vscode/2.6.11 (codex-tui; 0.122.0)";
 const CODEX_DEFAULT_ORIGINATOR: &str = "codex-tui";
@@ -42,6 +56,29 @@ fn is_openai_image_request(provider_api_format: &str) -> bool {
     provider_api_format
         .trim()
         .eq_ignore_ascii_case("openai:image")
+}
+
+/// Returns true only when `tool_choice` *explicitly* targets image_generation,
+/// matching either the `"image_generation"` string form or the
+/// `{"type":"image_generation"}` object form.
+///
+/// Intentionally does NOT inspect the `tools` array: tools merely advertise
+/// what is available, while only `tool_choice` expresses the caller's
+/// selection. Treating "image_generation present in tools" as a trigger
+/// caused codex CLI requests (which list image_generation alongside ~20
+/// other tools under `tool_choice: "auto"`) to be incorrectly rewritten
+/// into image-generation-only requests, leading to upstream 400s.
+fn codex_openai_responses_tool_choice_references_image_generation(
+    body_object: &serde_json::Map<String, Value>,
+) -> bool {
+    match body_object.get("tool_choice") {
+        Some(Value::String(name)) => name.trim().eq_ignore_ascii_case("image_generation"),
+        Some(Value::Object(choice)) => choice
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("image_generation")),
+        _ => false,
+    }
 }
 
 fn apply_codex_openai_image_tool_overrides(body_object: &mut serde_json::Map<String, Value>) {
@@ -142,14 +179,25 @@ fn inject_codex_default_variation_prompt(body_object: &mut serde_json::Map<Strin
     );
 }
 
-fn build_stable_codex_prompt_cache_key(user_api_key_id: &str) -> Option<String> {
-    let normalized = user_api_key_id.trim();
+fn build_stable_codex_prompt_cache_key_from_seed(kind: &str, seed: &str) -> Option<String> {
+    let normalized = seed.trim();
     if normalized.is_empty() {
         return None;
     }
 
+    let normalized_kind = kind
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '-')
+        .collect::<String>();
+    let normalized_kind = if normalized_kind.is_empty() {
+        "seed".to_string()
+    } else {
+        normalized_kind
+    };
     let namespace = format!(
-        "aether:codex:prompt-cache:{CODEX_PROMPT_CACHE_NAMESPACE_VERSION}:user:{normalized}"
+        "aether:codex:prompt-cache:{CODEX_PROMPT_CACHE_NAMESPACE_VERSION}:{normalized_kind}:{normalized}"
     );
     let mut hasher = Sha1::new();
     hasher.update(UUID_NAMESPACE_OID_BYTES);
@@ -161,6 +209,283 @@ fn build_stable_codex_prompt_cache_key(user_api_key_id: &str) -> Option<String> 
     bytes[6] = (bytes[6] & 0x0f) | 0x50;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     Some(Uuid::from_bytes(bytes).to_string())
+}
+
+fn build_stable_codex_prompt_cache_key(user_api_key_id: &str) -> Option<String> {
+    build_stable_codex_prompt_cache_key_from_seed("user", user_api_key_id)
+}
+
+fn extract_codex_prompt_cache_session_seed(provider_request_body: &Value) -> Option<String> {
+    fn non_empty_str(value: Option<&Value>) -> Option<&str> {
+        value
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    }
+
+    fn session_seed_from_metadata(metadata: &Value) -> Option<String> {
+        let object = metadata.as_object()?;
+        non_empty_str(object.get("session_id"))
+            .or_else(|| non_empty_str(object.get("sessionId")))
+            .or_else(|| non_empty_str(object.get("conversation_id")))
+            .or_else(|| non_empty_str(object.get("conversationId")))
+            .map(|value| format!("metadata:{value}"))
+            .or_else(|| {
+                let user_id = non_empty_str(object.get("user_id"))?;
+                serde_json::from_str::<Value>(user_id)
+                    .ok()
+                    .and_then(|decoded| {
+                        non_empty_str(decoded.get("session_id"))
+                            .or_else(|| non_empty_str(decoded.get("sessionId")))
+                            .or_else(|| non_empty_str(decoded.get("conversation_id")))
+                            .or_else(|| non_empty_str(decoded.get("conversationId")))
+                            .map(|value| format!("metadata.user_id:{value}"))
+                    })
+            })
+    }
+
+    let object = provider_request_body.as_object()?;
+    non_empty_str(object.get("session_id"))
+        .or_else(|| non_empty_str(object.get("sessionId")))
+        .or_else(|| non_empty_str(object.get("conversation_id")))
+        .or_else(|| non_empty_str(object.get("conversationId")))
+        .map(|value| format!("body:{value}"))
+        .or_else(|| object.get("metadata").and_then(session_seed_from_metadata))
+}
+
+fn sha256_hex(input: &[u8]) -> String {
+    let digest = Sha256::digest(input);
+    let mut output = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(&mut output, "{byte:02x}");
+    }
+    output
+}
+
+fn stable_json_digest(value: &Value) -> Option<String> {
+    serde_json::to_vec(value)
+        .ok()
+        .map(|serialized| sha256_hex(&serialized))
+}
+
+fn compact_prompt_cache_text(value: &str) -> Option<Value> {
+    const MAX_PROMPT_CACHE_TEXT_CHARS: usize = 4096;
+    let normalized = value.trim();
+    if normalized.is_empty() {
+        return None;
+    }
+    let mut text = normalized
+        .chars()
+        .take(MAX_PROMPT_CACHE_TEXT_CHARS)
+        .collect::<String>();
+    if normalized.chars().count() > MAX_PROMPT_CACHE_TEXT_CHARS {
+        text.push_str("...");
+    }
+    Some(Value::String(text))
+}
+
+fn compact_prompt_cache_anchor(value: &Value) -> Value {
+    match value {
+        Value::String(text) => compact_prompt_cache_text(text).unwrap_or(Value::Null),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .take(16)
+                .map(compact_prompt_cache_anchor)
+                .filter(|value| !value.is_null())
+                .collect(),
+        ),
+        Value::Object(object) => {
+            let mut compacted = serde_json::Map::new();
+            for key in [
+                "type",
+                "role",
+                "id",
+                "name",
+                "description",
+                "text",
+                "input_text",
+                "output_text",
+                "content",
+                "call_id",
+                "arguments",
+                "output",
+                "parameters",
+                "strict",
+                "function",
+                "effort",
+                "summary",
+            ] {
+                let Some(value) = object.get(key) else {
+                    continue;
+                };
+                let value = compact_prompt_cache_anchor(value);
+                if !value.is_null() {
+                    compacted.insert(key.to_string(), value);
+                }
+            }
+            Value::Object(compacted)
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => value.clone(),
+    }
+}
+
+fn compact_prompt_cache_json_anchor(value: &Value) -> Value {
+    match value {
+        Value::String(text) => compact_prompt_cache_text(text).unwrap_or(Value::Null),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .take(16)
+                .map(compact_prompt_cache_json_anchor)
+                .filter(|value| !value.is_null())
+                .collect(),
+        ),
+        Value::Object(object) => {
+            let mut compacted = serde_json::Map::new();
+            let mut keys = object.keys().collect::<Vec<_>>();
+            keys.sort();
+            for key in keys {
+                if key == "cache_control" {
+                    continue;
+                }
+                let Some(value) = object.get(key) else {
+                    continue;
+                };
+                let value = compact_prompt_cache_json_anchor(value);
+                if !value.is_null() {
+                    compacted.insert(key.clone(), value);
+                }
+            }
+            Value::Object(compacted)
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => value.clone(),
+    }
+}
+
+fn collect_codex_prompt_cache_control_anchors(value: &Value, anchors: &mut Vec<Value>) {
+    const MAX_PROMPT_CACHE_CONTROL_ANCHORS: usize = 16;
+    if anchors.len() >= MAX_PROMPT_CACHE_CONTROL_ANCHORS {
+        return;
+    }
+
+    match value {
+        Value::Object(object) => {
+            if object.contains_key("cache_control") {
+                let mut anchor = object.clone();
+                anchor.remove("cache_control");
+                let anchor = compact_prompt_cache_anchor(&Value::Object(anchor));
+                if !anchor.is_null() {
+                    anchors.push(anchor);
+                }
+            }
+            for child in object.values() {
+                if anchors.len() >= MAX_PROMPT_CACHE_CONTROL_ANCHORS {
+                    break;
+                }
+                collect_codex_prompt_cache_control_anchors(child, anchors);
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                if anchors.len() >= MAX_PROMPT_CACHE_CONTROL_ANCHORS {
+                    break;
+                }
+                collect_codex_prompt_cache_control_anchors(child, anchors);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn strip_codex_cache_control_fields(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            object.remove("cache_control");
+            for child in object.values_mut() {
+                strip_codex_cache_control_fields(child);
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                strip_codex_cache_control_fields(child);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn extract_codex_prompt_cache_control_seed(provider_request_body: &Value) -> Option<String> {
+    let mut anchors = Vec::new();
+    collect_codex_prompt_cache_control_anchors(provider_request_body, &mut anchors);
+    if anchors.is_empty() {
+        return None;
+    }
+
+    let seed = json!({
+        "model": provider_request_body.get("model"),
+        "anchors": anchors,
+    });
+    stable_json_digest(&seed).map(|digest| format!("cache_control:{digest}"))
+}
+
+fn first_responses_input_anchor(input: &Value) -> Option<Value> {
+    let items = input.as_array()?;
+    let first_user_message = items.iter().find(|item| {
+        item.get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value == "message")
+            && item
+                .get("role")
+                .and_then(Value::as_str)
+                .is_some_and(|value| value == "user")
+    });
+    let first_item = first_user_message.or_else(|| items.first())?;
+    let anchor = compact_prompt_cache_anchor(first_item);
+    (!anchor.is_null()).then_some(anchor)
+}
+
+fn extract_codex_stable_request_prompt_cache_seed(
+    provider_request_body: &Value,
+    user_api_key_id: Option<&str>,
+) -> Option<String> {
+    let object = provider_request_body.as_object()?;
+    let mut seed = serde_json::Map::new();
+
+    for key in [
+        "model",
+        "instructions",
+        "reasoning",
+        "tools",
+        "tool_choice",
+        "parallel_tool_calls",
+    ] {
+        if let Some(value) = object.get(key).filter(|value| !value.is_null()) {
+            let value = if key == "tools" {
+                compact_prompt_cache_json_anchor(value)
+            } else {
+                compact_prompt_cache_anchor(value)
+            };
+            seed.insert(key.to_string(), value);
+        }
+    }
+    if let Some(input_anchor) = object.get("input").and_then(first_responses_input_anchor) {
+        seed.insert("first_input".to_string(), input_anchor);
+    }
+    if let Some(user_api_key_id) = user_api_key_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        seed.insert(
+            "api_key_id".to_string(),
+            Value::String(user_api_key_id.to_string()),
+        );
+    }
+
+    if seed.len() < 2 {
+        return None;
+    }
+    stable_json_digest(&Value::Object(seed)).map(|digest| format!("stable_request:{digest}"))
 }
 
 fn build_short_codex_header_id(seed: &str) -> Option<String> {
@@ -238,31 +563,47 @@ fn maybe_insert_default_codex_header(
     provider_request_headers.insert(header_name.to_string(), header_value.to_string());
 }
 
-fn maybe_inject_codex_prompt_cache_key(
-    provider_request_body: &mut Value,
+fn codex_prompt_cache_key_to_insert(
+    provider_request_body: &Value,
     provider_type: &str,
     provider_api_format: &str,
     user_api_key_id: Option<&str>,
-) {
+) -> Option<String> {
     if !is_codex_openai_responses_request(provider_type, provider_api_format) {
-        return;
+        return None;
     }
 
-    let Some(body_object) = provider_request_body.as_object_mut() else {
-        return;
-    };
-
-    let existing = body_object
+    let existing = provider_request_body
         .get("prompt_cache_key")
         .and_then(Value::as_str)
         .map(str::trim)
         .unwrap_or_default();
     if !existing.is_empty() {
-        return;
+        return None;
     }
 
-    let Some(prompt_cache_key) = user_api_key_id.and_then(build_stable_codex_prompt_cache_key)
-    else {
+    extract_codex_prompt_cache_session_seed(provider_request_body)
+        .and_then(|seed| build_stable_codex_prompt_cache_key_from_seed("session", &seed))
+        .or_else(|| {
+            extract_codex_prompt_cache_control_seed(provider_request_body)
+                .and_then(|seed| build_stable_codex_prompt_cache_key_from_seed("anchor", &seed))
+        })
+        .or_else(|| {
+            extract_codex_stable_request_prompt_cache_seed(provider_request_body, user_api_key_id)
+                .and_then(|seed| build_stable_codex_prompt_cache_key_from_seed("request", &seed))
+        })
+        .or_else(|| user_api_key_id.and_then(build_stable_codex_prompt_cache_key))
+}
+
+fn insert_codex_prompt_cache_key(
+    provider_request_body: &mut Value,
+    prompt_cache_key: Option<String>,
+) {
+    let Some(prompt_cache_key) = prompt_cache_key else {
+        return;
+    };
+
+    let Some(body_object) = provider_request_body.as_object_mut() else {
         return;
     };
 
@@ -352,6 +693,51 @@ fn ensure_codex_chat_reasoning_defaults(
         .or_insert_with(|| json!(CODEX_DEFAULT_REASONING_SUMMARY));
 }
 
+fn codex_tool_type_rejects_top_level_name(tool_type: &str) -> bool {
+    let normalized = tool_type.trim().to_ascii_lowercase();
+    !normalized.is_empty()
+        && normalized != "function"
+        && normalized != "custom"
+        && normalized != "namespace"
+}
+
+fn strip_codex_hosted_tool_names_for_backend(body_object: &mut serde_json::Map<String, Value>) {
+    let Some(tools) = body_object.get_mut("tools").and_then(Value::as_array_mut) else {
+        return;
+    };
+
+    for tool in tools {
+        let Some(tool_object) = tool.as_object_mut() else {
+            continue;
+        };
+        if tool_object
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(codex_tool_type_rejects_top_level_name)
+        {
+            tool_object.remove("name");
+        }
+    }
+}
+
+fn strip_codex_hosted_tool_choice_name_for_backend(
+    body_object: &mut serde_json::Map<String, Value>,
+) {
+    let Some(tool_choice_object) = body_object
+        .get_mut("tool_choice")
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    if tool_choice_object
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(codex_tool_type_rejects_top_level_name)
+    {
+        tool_choice_object.remove("name");
+    }
+}
+
 pub fn apply_codex_openai_responses_special_body_edits(
     provider_request_body: &mut Value,
     provider_type: &str,
@@ -363,21 +749,21 @@ pub fn apply_codex_openai_responses_special_body_edits(
         return;
     }
 
+    let prompt_cache_key = codex_prompt_cache_key_to_insert(
+        provider_request_body,
+        provider_type,
+        provider_api_format,
+        user_api_key_id,
+    );
+
     let Some(body_object) = provider_request_body.as_object_mut() else {
         return;
     };
 
-    if !body_rules_handle_path(body_rules, "max_output_tokens") {
-        body_object.remove("max_output_tokens");
-    }
-    if !body_rules_handle_path(body_rules, "temperature") {
-        body_object.remove("temperature");
-    }
-    if !body_rules_handle_path(body_rules, "top_p") {
-        body_object.remove("top_p");
-    }
-    if !body_rules_handle_path(body_rules, "metadata") {
-        body_object.remove("metadata");
+    for field in CODEX_OPENAI_RESPONSES_UNSUPPORTED_BODY_FIELDS {
+        if !body_rules_handle_path(body_rules, field) {
+            body_object.remove(*field);
+        }
     }
     if is_openai_responses_compact_request(provider_api_format) {
         body_object.remove("store");
@@ -397,7 +783,11 @@ pub fn apply_codex_openai_responses_special_body_edits(
     {
         body_object.insert("instructions".to_string(), json!(""));
     }
-    if is_openai_image_request(provider_api_format) {
+    strip_codex_hosted_tool_names_for_backend(body_object);
+    strip_codex_hosted_tool_choice_name_for_backend(body_object);
+    if is_openai_image_request(provider_api_format)
+        || codex_openai_responses_tool_choice_references_image_generation(body_object)
+    {
         body_object.insert(
             "model".to_string(),
             json!(CODEX_OPENAI_IMAGE_INTERNAL_MODEL),
@@ -407,12 +797,8 @@ pub fn apply_codex_openai_responses_special_body_edits(
         inject_codex_default_variation_prompt(body_object);
     }
 
-    maybe_inject_codex_prompt_cache_key(
-        provider_request_body,
-        provider_type,
-        provider_api_format,
-        user_api_key_id,
-    );
+    strip_codex_cache_control_fields(provider_request_body);
+    insert_codex_prompt_cache_key(provider_request_body, prompt_cache_key);
 }
 
 pub fn apply_codex_openai_responses_chat_body_edits(
@@ -437,6 +823,9 @@ pub fn apply_codex_openai_responses_chat_body_edits(
         return;
     };
     ensure_codex_chat_reasoning_defaults(body_object, provider_api_format, body_rules);
+    if let Some(prompt_cache_key) = body_object.remove("prompt_cache_key") {
+        body_object.insert("prompt_cache_key".to_string(), prompt_cache_key);
+    }
 }
 
 pub fn apply_codex_openai_responses_special_headers(
@@ -517,6 +906,7 @@ mod tests {
         apply_codex_openai_responses_chat_body_edits,
         apply_codex_openai_responses_special_body_edits,
         apply_openai_responses_compact_special_body_edits, CODEX_OPENAI_IMAGE_INTERNAL_MODEL,
+        CODEX_OPENAI_RESPONSES_UNSUPPORTED_BODY_FIELDS,
     };
     use serde_json::json;
 
@@ -593,6 +983,368 @@ mod tests {
             ])
         );
         assert_eq!(provider_request_body["parallel_tool_calls"], json!(false));
+    }
+
+    #[test]
+    fn codex_responses_body_edits_preserve_function_tools_for_codex_backend() {
+        let mut provider_request_body = json!({
+            "input": [],
+            "model": "gpt-5.4",
+            "tools": [{
+                "type": "function",
+                "name": "lookup_account",
+                "description": "Lookup an account by id.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "account_id": {
+                            "type": "string"
+                        }
+                    },
+                    "required": ["account_id"],
+                    "additionalProperties": false
+                },
+                "strict": true
+            }],
+            "tool_choice": {
+                "type": "function",
+                "name": "lookup_account"
+            }
+        });
+
+        apply_codex_openai_responses_special_body_edits(
+            &mut provider_request_body,
+            "codex",
+            "openai:responses",
+            None,
+            None,
+        );
+
+        assert_eq!(
+            provider_request_body["tools"][0]["name"],
+            json!("lookup_account")
+        );
+        assert_eq!(
+            provider_request_body["tools"][0]["parameters"]["properties"]["account_id"]["type"],
+            json!("string")
+        );
+        assert_eq!(
+            provider_request_body["tool_choice"]["name"],
+            json!("lookup_account")
+        );
+        assert!(provider_request_body["tools"][0].get("function").is_none());
+    }
+
+    #[test]
+    fn codex_responses_body_edits_strip_sub2api_unsupported_fields() {
+        let mut provider_request_body = json!({
+            "input": [{"role": "user", "content": "hello"}],
+            "model": "gpt-5.4",
+            "max_output_tokens": 1024,
+            "max_completion_tokens": 1024,
+            "temperature": 0.2,
+            "top_p": 0.8,
+            "frequency_penalty": 0.1,
+            "presence_penalty": 0.1,
+            "user": "user-123",
+            "metadata": {"client": "cursor"},
+            "prompt_cache_retention": "24h",
+            "safety_identifier": "safe-user-123",
+            "stream_options": {"include_usage": true},
+            "previous_response_id": "resp_123"
+        });
+
+        apply_codex_openai_responses_special_body_edits(
+            &mut provider_request_body,
+            "codex",
+            "openai:responses",
+            None,
+            None,
+        );
+
+        for field in CODEX_OPENAI_RESPONSES_UNSUPPORTED_BODY_FIELDS {
+            assert!(
+                provider_request_body.get(*field).is_none(),
+                "{field} must be stripped"
+            );
+        }
+        assert_eq!(provider_request_body["input"][0]["content"], json!("hello"));
+    }
+
+    #[test]
+    fn codex_responses_body_edits_strip_name_from_hosted_web_search_tool() {
+        let mut provider_request_body = json!({
+            "input": [],
+            "model": "gpt-5.4",
+            "tools": [{
+                "type": "web_search",
+                "name": "web_search"
+            }],
+            "tool_choice": {
+                "type": "web_search",
+                "name": "web_search"
+            }
+        });
+
+        apply_codex_openai_responses_special_body_edits(
+            &mut provider_request_body,
+            "codex",
+            "openai:responses",
+            None,
+            None,
+        );
+
+        assert!(provider_request_body["tools"][0].get("name").is_none());
+        assert!(provider_request_body["tool_choice"].get("name").is_none());
+        assert_eq!(
+            provider_request_body["tool_choice"]["type"],
+            json!("web_search")
+        );
+    }
+
+    #[test]
+    fn codex_responses_body_edits_derive_prompt_cache_key_from_session_metadata() {
+        let mut body_a = json!({
+            "input": [{"role": "user", "content": "hello"}],
+            "model": "gpt-5.4",
+            "metadata": {
+                "user_id": "{\"session_id\":\"session-a\",\"device_id\":\"device-a\"}"
+            }
+        });
+        let mut body_b = json!({
+            "input": [{"role": "user", "content": "hello again"}],
+            "model": "gpt-5.4",
+            "metadata": {
+                "user_id": "{\"session_id\":\"session-a\",\"device_id\":\"device-b\"}"
+            }
+        });
+        let mut body_c = json!({
+            "input": [{"role": "user", "content": "hello"}],
+            "model": "gpt-5.4",
+            "metadata": {"session_id": "session-b"}
+        });
+
+        apply_codex_openai_responses_special_body_edits(
+            &mut body_a,
+            "codex",
+            "openai:responses",
+            None,
+            Some("key-123"),
+        );
+        apply_codex_openai_responses_special_body_edits(
+            &mut body_b,
+            "codex",
+            "openai:responses",
+            None,
+            Some("different-key"),
+        );
+        apply_codex_openai_responses_special_body_edits(
+            &mut body_c,
+            "codex",
+            "openai:responses",
+            None,
+            Some("key-123"),
+        );
+
+        assert_eq!(body_a["prompt_cache_key"], body_b["prompt_cache_key"]);
+        assert_ne!(body_a["prompt_cache_key"], body_c["prompt_cache_key"]);
+        assert!(body_a.get("metadata").is_none());
+        assert!(body_b.get("metadata").is_none());
+        assert!(body_c.get("metadata").is_none());
+    }
+
+    #[test]
+    fn codex_responses_body_edits_derive_prompt_cache_key_from_cache_control_anchor() {
+        let mut body_a = json!({
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": "stable project brief",
+                    "cache_control": {"type": "ephemeral"}
+                }]
+            }, {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "new turn A"}]
+            }],
+            "model": "gpt-5.4"
+        });
+        let mut body_b = json!({
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": "stable project brief",
+                    "cache_control": {"type": "ephemeral"}
+                }]
+            }, {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "new turn B"}]
+            }],
+            "model": "gpt-5.4"
+        });
+        let mut body_c = json!({
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": "different project brief",
+                    "cache_control": {"type": "ephemeral"}
+                }]
+            }],
+            "model": "gpt-5.4"
+        });
+
+        apply_codex_openai_responses_special_body_edits(
+            &mut body_a,
+            "codex",
+            "openai:responses",
+            None,
+            Some("key-a"),
+        );
+        apply_codex_openai_responses_special_body_edits(
+            &mut body_b,
+            "codex",
+            "openai:responses",
+            None,
+            Some("key-b"),
+        );
+        apply_codex_openai_responses_special_body_edits(
+            &mut body_c,
+            "codex",
+            "openai:responses",
+            None,
+            Some("key-a"),
+        );
+
+        assert_eq!(body_a["prompt_cache_key"], body_b["prompt_cache_key"]);
+        assert_ne!(body_a["prompt_cache_key"], body_c["prompt_cache_key"]);
+        assert!(!body_a.to_string().contains("\"cache_control\""));
+        assert!(!body_b.to_string().contains("\"cache_control\""));
+        assert!(!body_c.to_string().contains("\"cache_control\""));
+    }
+
+    #[test]
+    fn codex_responses_body_edits_strip_developer_cache_control_before_upstream() {
+        let mut provider_request_body = json!({
+            "input": [{
+                "type": "message",
+                "role": "developer",
+                "content": [{
+                    "type": "input_text",
+                    "text": "stable system brief",
+                    "cache_control": {"type": "ephemeral"}
+                }]
+            }, {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "new turn"}]
+            }],
+            "model": "gpt-5.4"
+        });
+
+        apply_codex_openai_responses_special_body_edits(
+            &mut provider_request_body,
+            "codex",
+            "openai:responses",
+            None,
+            Some("key-a"),
+        );
+
+        assert!(provider_request_body
+            .get("prompt_cache_key")
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| !value.trim().is_empty()));
+        assert!(!provider_request_body
+            .to_string()
+            .contains("\"cache_control\""));
+        assert_eq!(
+            provider_request_body["input"][0]["content"][0]["text"],
+            json!("stable system brief")
+        );
+    }
+
+    #[test]
+    fn codex_responses_body_edits_derive_prompt_cache_key_from_stable_request_anchor() {
+        let mut body_a = json!({
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "open workspace"}]
+            }, {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "new turn A"}]
+            }],
+            "model": "gpt-5.4",
+            "instructions": "Be concise.",
+            "tools": [{
+                "type": "function",
+                "name": "shell",
+                "parameters": {"type": "object", "properties": {}}
+            }],
+            "reasoning": {"effort": "medium"}
+        });
+        let mut body_b = json!({
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "open workspace"}]
+            }, {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "new turn B"}]
+            }],
+            "model": "gpt-5.4",
+            "instructions": "Be concise.",
+            "tools": [{
+                "type": "function",
+                "name": "shell",
+                "parameters": {"type": "object", "properties": {}}
+            }],
+            "reasoning": {"effort": "medium"}
+        });
+        let mut body_c = json!({
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "open another workspace"}]
+            }],
+            "model": "gpt-5.4",
+            "instructions": "Be concise.",
+            "tools": [{"type": "function", "name": "shell"}],
+            "reasoning": {"effort": "medium"}
+        });
+
+        apply_codex_openai_responses_special_body_edits(
+            &mut body_a,
+            "codex",
+            "openai:responses",
+            None,
+            Some("key-a"),
+        );
+        apply_codex_openai_responses_special_body_edits(
+            &mut body_b,
+            "codex",
+            "openai:responses",
+            None,
+            Some("key-a"),
+        );
+        apply_codex_openai_responses_special_body_edits(
+            &mut body_c,
+            "codex",
+            "openai:responses",
+            None,
+            Some("key-a"),
+        );
+
+        assert_eq!(body_a["prompt_cache_key"], body_b["prompt_cache_key"]);
+        assert_ne!(body_a["prompt_cache_key"], body_c["prompt_cache_key"]);
     }
 
     #[test]
@@ -709,6 +1461,165 @@ mod tests {
         assert_eq!(
             provider_request_body["tool_choice"]["type"],
             json!("image_generation")
+        );
+    }
+
+    #[test]
+    fn codex_responses_image_tool_edits_force_internal_model_and_tool_defaults() {
+        let mut provider_request_body = json!({
+            "model": "gpt-image-2",
+            "input": "generate image",
+            "tools": [{
+                "type": "image_generation"
+            }],
+            "tool_choice": {"type": "image_generation"}
+        });
+
+        apply_codex_openai_responses_special_body_edits(
+            &mut provider_request_body,
+            "codex",
+            "openai:responses",
+            None,
+            None,
+        );
+
+        assert_eq!(
+            provider_request_body["model"],
+            json!(CODEX_OPENAI_IMAGE_INTERNAL_MODEL)
+        );
+        assert_eq!(provider_request_body["stream"], json!(true));
+        assert_eq!(
+            provider_request_body["tools"][0]["type"],
+            json!("image_generation")
+        );
+        assert_eq!(
+            provider_request_body["tool_choice"]["type"],
+            json!("image_generation")
+        );
+    }
+
+    #[test]
+    fn codex_responses_image_tool_edits_triggered_by_string_tool_choice() {
+        let mut provider_request_body = json!({
+            "model": "gpt-image-2",
+            "input": "generate image",
+            "tools": [{"type": "image_generation"}],
+            "tool_choice": "image_generation"
+        });
+
+        apply_codex_openai_responses_special_body_edits(
+            &mut provider_request_body,
+            "codex",
+            "openai:responses",
+            None,
+            None,
+        );
+
+        assert_eq!(
+            provider_request_body["model"],
+            json!(CODEX_OPENAI_IMAGE_INTERNAL_MODEL)
+        );
+        assert_eq!(
+            provider_request_body["tool_choice"]["type"],
+            json!("image_generation")
+        );
+    }
+
+    #[test]
+    fn codex_responses_image_tool_edits_skipped_when_tool_choice_is_auto() {
+        let original_model = "gpt-5.5";
+        let mut provider_request_body = json!({
+            "model": original_model,
+            "input": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {"type": "function", "name": "shell"},
+                {"type": "image_generation"},
+                {"type": "web_search"}
+            ],
+            "tool_choice": "auto"
+        });
+
+        apply_codex_openai_responses_special_body_edits(
+            &mut provider_request_body,
+            "codex",
+            "openai:responses",
+            None,
+            None,
+        );
+
+        assert_eq!(provider_request_body["model"], json!(original_model));
+        assert_eq!(provider_request_body["tool_choice"], json!("auto"));
+        assert_eq!(
+            provider_request_body["tools"]
+                .as_array()
+                .map(Vec::len)
+                .unwrap_or_default(),
+            3,
+            "tools array should be preserved when tool_choice is auto"
+        );
+    }
+
+    #[test]
+    fn codex_responses_image_tool_edits_skipped_when_tool_choice_absent() {
+        let original_model = "gpt-5.5";
+        let mut provider_request_body = json!({
+            "model": original_model,
+            "input": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "image_generation"}]
+        });
+
+        apply_codex_openai_responses_special_body_edits(
+            &mut provider_request_body,
+            "codex",
+            "openai:responses",
+            None,
+            None,
+        );
+
+        assert_eq!(provider_request_body["model"], json!(original_model));
+        assert!(
+            provider_request_body.get("tool_choice").is_none(),
+            "tool_choice should not be injected when caller did not set it"
+        );
+        assert_eq!(
+            provider_request_body["tools"][0]["type"],
+            json!("image_generation")
+        );
+        assert_eq!(
+            provider_request_body["tools"]
+                .as_array()
+                .map(Vec::len)
+                .unwrap_or_default(),
+            1,
+            "tools array should be preserved verbatim when tool_choice is absent"
+        );
+    }
+
+    #[test]
+    fn codex_responses_image_tool_edits_skipped_when_tool_choice_targets_other_tool() {
+        let original_model = "gpt-5.5";
+        let mut provider_request_body = json!({
+            "model": original_model,
+            "input": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {"type": "function", "name": "shell"},
+                {"type": "image_generation"}
+            ],
+            "tool_choice": {"type": "function", "name": "shell"}
+        });
+
+        apply_codex_openai_responses_special_body_edits(
+            &mut provider_request_body,
+            "codex",
+            "openai:responses",
+            None,
+            None,
+        );
+
+        assert_eq!(provider_request_body["model"], json!(original_model));
+        assert_eq!(
+            provider_request_body["tool_choice"],
+            json!({"type": "function", "name": "shell"})
         );
     }
 

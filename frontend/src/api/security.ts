@@ -9,6 +9,17 @@ export interface IPBlacklistEntry {
   ttl?: number
 }
 
+export interface BlacklistListEntry {
+  ip_address: string
+  reason: string
+  ttl_seconds?: number | null
+}
+
+export interface BlacklistResponse {
+  items: BlacklistListEntry[]
+  total: number
+}
+
 export interface IPWhitelistEntry {
   ip_address: string
 }
@@ -49,6 +60,14 @@ export const blacklistApi = {
    */
   async getStats(): Promise<BlacklistStats> {
     const response = await apiClient.get('/api/admin/security/ip/blacklist/stats')
+    return response.data
+  },
+
+  /**
+   * 获取黑名单列表
+   */
+  async getList(): Promise<BlacklistResponse> {
+    const response = await apiClient.get('/api/admin/security/ip/blacklist')
     return response.data
   }
 }

@@ -249,9 +249,10 @@ async fn admin_monitoring_resilience_status_returns_local_payload() {
     let recommendations = payload["recommendations"]
         .as_array()
         .expect("recommendations should be array");
-    assert!(recommendations.iter().any(|item| item
-        .as_str()
-        .is_some_and(|value| value.contains("prod-key"))));
+    assert!(recommendations.iter().any(|item| {
+        item.as_str()
+            .is_some_and(|value| value.contains("prod-key"))
+    }));
     assert!(payload["timestamp"].as_str().is_some());
 }
 

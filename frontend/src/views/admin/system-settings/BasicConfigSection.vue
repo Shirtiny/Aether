@@ -172,6 +172,27 @@
         </div>
       </div>
 
+      <div class="flex items-center h-full">
+        <div class="flex items-center space-x-2">
+          <Checkbox
+            id="enable-standard-text-sync-heartbeat"
+            :checked="enableStandardTextSyncHeartbeat"
+            @update:checked="$emit('update:enableStandardTextSyncHeartbeat', $event)"
+          />
+          <div>
+            <Label
+              for="enable-standard-text-sync-heartbeat"
+              class="cursor-pointer"
+            >
+              标准文本非流式心跳
+            </Label>
+            <p class="text-xs text-muted-foreground">
+              开启后标准文本非流式接口外层 HTTP 状态固定为 200，上游失败需读取响应体 error.upstream_status
+            </p>
+          </div>
+        </div>
+      </div>
+
       <div class="md:col-span-2 grid grid-cols-1 md:grid-cols-2 gap-4 border-t pt-5">
         <div class="flex items-center h-full">
           <div class="flex items-center space-x-2">
@@ -262,6 +283,203 @@
           </p>
         </div>
       </div>
+
+      <div class="md:col-span-2 grid grid-cols-1 md:grid-cols-2 gap-4 border-t pt-5">
+        <div class="flex items-center h-full">
+          <div class="flex items-center space-x-2">
+            <Checkbox
+              id="referral-enabled"
+              :checked="referralEnabled"
+              @update:checked="$emit('update:referralEnabled', $event)"
+            />
+            <div>
+              <Label
+                for="referral-enabled"
+                class="cursor-pointer"
+              >
+                邀请返利
+              </Label>
+              <p class="text-xs text-muted-foreground">
+                开启后可按充值比例、人头或两者同时发放赠款返利
+              </p>
+            </div>
+          </div>
+        </div>
+
+        <div>
+          <Label
+            for="referral-reward-mode"
+            class="block text-sm font-medium mb-2"
+          >
+            返利方式
+          </Label>
+          <Select
+            :model-value="referralRewardMode"
+            @update:model-value="$emit('update:referralRewardMode', $event)"
+          >
+            <SelectTrigger id="referral-reward-mode">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="percent">
+                按充值比例
+              </SelectItem>
+              <SelectItem value="headcount">
+                按邀请人头
+              </SelectItem>
+              <SelectItem value="both">
+                两者同时启用
+              </SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+
+        <div>
+          <Label
+            for="referral-recharge-percent"
+            class="block text-sm font-medium"
+          >
+            充值返利比例 (%)
+          </Label>
+          <Input
+            id="referral-recharge-percent"
+            :model-value="referralRechargePercent"
+            type="number"
+            min="0"
+            step="0.01"
+            class="mt-1"
+            @update:model-value="$emit('update:referralRechargePercent', Number($event))"
+          />
+        </div>
+
+        <div>
+          <Label
+            for="referral-headcount-amount"
+            class="block text-sm font-medium"
+          >
+            人头返利金额 (美元)
+          </Label>
+          <Input
+            id="referral-headcount-amount"
+            :model-value="referralHeadcountAmountUsd"
+            type="number"
+            min="0"
+            step="0.01"
+            class="mt-1"
+            @update:model-value="$emit('update:referralHeadcountAmountUsd', Number($event))"
+          />
+        </div>
+
+        <div>
+          <Label
+            for="referral-headcount-trigger"
+            class="block text-sm font-medium mb-2"
+          >
+            人头返利触发时机
+          </Label>
+          <Select
+            :model-value="referralHeadcountTrigger"
+            @update:model-value="$emit('update:referralHeadcountTrigger', $event)"
+          >
+            <SelectTrigger id="referral-headcount-trigger">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="registration">
+                注册成功
+              </SelectItem>
+              <SelectItem value="email_verified">
+                邮箱验证完成
+              </SelectItem>
+              <SelectItem value="first_paid_order">
+                首笔真实支付完成
+              </SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+      </div>
+
+      <div class="md:col-span-2 grid grid-cols-1 md:grid-cols-2 gap-4 border-t pt-5">
+        <div class="flex items-center h-full">
+          <div class="flex items-center space-x-2">
+            <Checkbox
+              id="privacy-policy-enabled"
+              :checked="registrationPrivacyPolicyEnabled"
+              @update:checked="$emit('update:registrationPrivacyPolicyEnabled', $event)"
+            />
+            <div>
+              <Label
+                for="privacy-policy-enabled"
+                class="cursor-pointer"
+              >
+                注册隐私政策确认
+              </Label>
+              <p class="text-xs text-muted-foreground">
+                开启后注册时必须确认当前版本
+              </p>
+            </div>
+          </div>
+        </div>
+
+        <div>
+          <Label
+            for="privacy-policy-version"
+            class="block text-sm font-medium"
+          >
+            隐私政策版本
+          </Label>
+          <Input
+            id="privacy-policy-version"
+            :model-value="registrationPrivacyPolicyVersion"
+            type="text"
+            placeholder="2026-05-16"
+            class="mt-1"
+            @update:model-value="$emit('update:registrationPrivacyPolicyVersion', String($event || '').trim())"
+          />
+        </div>
+
+        <div>
+          <Label
+            for="privacy-policy-format"
+            class="block text-sm font-medium mb-2"
+          >
+            隐私政策格式
+          </Label>
+          <Select
+            :model-value="registrationPrivacyPolicyFormat"
+            @update:model-value="$emit('update:registrationPrivacyPolicyFormat', $event)"
+          >
+            <SelectTrigger id="privacy-policy-format">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="markdown">
+                Markdown
+              </SelectItem>
+              <SelectItem value="html">
+                HTML
+              </SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+
+        <div class="md:col-span-2">
+          <Label
+            for="privacy-policy-content"
+            class="block text-sm font-medium"
+          >
+            隐私政策内容
+          </Label>
+          <Textarea
+            id="privacy-policy-content"
+            :model-value="registrationPrivacyPolicyContent"
+            rows="8"
+            class="mt-1"
+            placeholder="填写 Markdown 或 HTML 内容"
+            @update:model-value="$emit('update:registrationPrivacyPolicyContent', $event)"
+          />
+        </div>
+      </div>
     </div>
   </CardSection>
 </template>
@@ -270,6 +488,7 @@
 import Button from '@/components/ui/button.vue'
 import Input from '@/components/ui/input.vue'
 import Label from '@/components/ui/label.vue'
+import Textarea from '@/components/ui/textarea.vue'
 import Checkbox from '@/components/ui/checkbox.vue'
 import Select from '@/components/ui/select.vue'
 import SelectTrigger from '@/components/ui/select-trigger.vue'
@@ -288,9 +507,19 @@ defineProps<{
   turnstileSecretKey: string
   turnstileSecretConfigured: boolean
   turnstileAllowedHostnamesStr: string
+  referralEnabled: boolean
+  referralRewardMode: string
+  referralRechargePercent: number
+  referralHeadcountAmountUsd: number
+  referralHeadcountTrigger: string
+  registrationPrivacyPolicyEnabled: boolean
+  registrationPrivacyPolicyFormat: string
+  registrationPrivacyPolicyContent: string
+  registrationPrivacyPolicyVersion: string
   autoDeleteExpiredKeys: boolean
   enableFormatConversion: boolean
   enableOpenaiImageSyncHeartbeat: boolean
+  enableStandardTextSyncHeartbeat: boolean
   loading: boolean
   hasChanges: boolean
 }>()
@@ -306,8 +535,18 @@ defineEmits<{
   'update:turnstileSecretKey': [value: string]
   'update:turnstileAllowedHostnamesStr': [value: string]
   clearTurnstileSecret: []
+  'update:referralEnabled': [value: boolean]
+  'update:referralRewardMode': [value: string]
+  'update:referralRechargePercent': [value: number]
+  'update:referralHeadcountAmountUsd': [value: number]
+  'update:referralHeadcountTrigger': [value: string]
+  'update:registrationPrivacyPolicyEnabled': [value: boolean]
+  'update:registrationPrivacyPolicyFormat': [value: string]
+  'update:registrationPrivacyPolicyContent': [value: string]
+  'update:registrationPrivacyPolicyVersion': [value: string]
   'update:autoDeleteExpiredKeys': [value: boolean]
   'update:enableFormatConversion': [value: boolean]
   'update:enableOpenaiImageSyncHeartbeat': [value: boolean]
+  'update:enableStandardTextSyncHeartbeat': [value: boolean]
 }>()
 </script>

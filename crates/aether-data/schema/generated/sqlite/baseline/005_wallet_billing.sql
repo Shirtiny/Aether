@@ -100,6 +100,65 @@ CREATE INDEX IF NOT EXISTS idx_payment_orders_gateway_order_id ON payment_orders
 CREATE INDEX IF NOT EXISTS idx_payment_orders_kind_status ON payment_orders (order_kind, status);
 CREATE INDEX IF NOT EXISTS idx_payment_orders_product ON payment_orders (product_id);
 
+CREATE TABLE IF NOT EXISTS user_invite_codes (
+    user_id TEXT PRIMARY KEY NOT NULL,
+    invite_code TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE (invite_code),
+    CONSTRAINT user_invite_codes_user_id_fkey FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS user_referrals (
+    id TEXT PRIMARY KEY NOT NULL,
+    inviter_user_id TEXT NOT NULL,
+    invitee_user_id TEXT NOT NULL,
+    invite_code_snapshot TEXT NOT NULL,
+    source_json TEXT,
+    first_paid_order_id TEXT,
+    first_paid_at INTEGER,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE (invitee_user_id),
+    CONSTRAINT user_referrals_inviter_user_id_fkey FOREIGN KEY (inviter_user_id) REFERENCES users (id) ON DELETE CASCADE,
+    CONSTRAINT user_referrals_invitee_user_id_fkey FOREIGN KEY (invitee_user_id) REFERENCES users (id) ON DELETE CASCADE,
+    CONSTRAINT user_referrals_first_paid_order_fkey FOREIGN KEY (first_paid_order_id) REFERENCES payment_orders (id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_user_referrals_inviter ON user_referrals (inviter_user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_user_referrals_created ON user_referrals (created_at);
+CREATE INDEX IF NOT EXISTS idx_user_referrals_invite_code ON user_referrals (invite_code_snapshot);
+
+CREATE TABLE IF NOT EXISTS referral_rewards (
+    id TEXT PRIMARY KEY NOT NULL,
+    referral_id TEXT NOT NULL,
+    inviter_user_id TEXT NOT NULL,
+    invitee_user_id TEXT NOT NULL,
+    reward_type TEXT NOT NULL,
+    trigger_point TEXT NOT NULL,
+    source_order_id TEXT,
+    idempotency_key TEXT NOT NULL,
+    amount_usd REAL NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    wallet_transaction_id TEXT,
+    reversed_amount_usd REAL NOT NULL DEFAULT 0,
+    pending_reversal_amount_usd REAL NOT NULL DEFAULT 0,
+    failure_reason TEXT,
+    admin_operator_id TEXT,
+    admin_note TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE (idempotency_key),
+    CONSTRAINT referral_rewards_referral_id_fkey FOREIGN KEY (referral_id) REFERENCES user_referrals (id) ON DELETE CASCADE,
+    CONSTRAINT referral_rewards_inviter_user_id_fkey FOREIGN KEY (inviter_user_id) REFERENCES users (id) ON DELETE CASCADE,
+    CONSTRAINT referral_rewards_invitee_user_id_fkey FOREIGN KEY (invitee_user_id) REFERENCES users (id) ON DELETE CASCADE,
+    CONSTRAINT referral_rewards_source_order_fkey FOREIGN KEY (source_order_id) REFERENCES payment_orders (id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_referral_rewards_inviter_status ON referral_rewards (inviter_user_id, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_referral_rewards_inviter_created ON referral_rewards (inviter_user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_referral_rewards_created ON referral_rewards (created_at);
+CREATE INDEX IF NOT EXISTS idx_referral_rewards_source_order ON referral_rewards (source_order_id);
+
 CREATE TABLE IF NOT EXISTS payment_gateway_configs (
     provider TEXT PRIMARY KEY NOT NULL,
     enabled INTEGER NOT NULL DEFAULT 0,
@@ -182,6 +241,7 @@ CREATE TABLE IF NOT EXISTS entitlement_usage_ledgers (
     UNIQUE (user_entitlement_id, request_id)
 );
 CREATE INDEX IF NOT EXISTS idx_entitlement_usage_user_date ON entitlement_usage_ledgers (user_id, usage_date);
+CREATE INDEX IF NOT EXISTS idx_entitlement_usage_entitlement_date ON entitlement_usage_ledgers (user_entitlement_id, usage_date);
 
 CREATE TABLE IF NOT EXISTS refund_requests (
     id TEXT PRIMARY KEY NOT NULL,

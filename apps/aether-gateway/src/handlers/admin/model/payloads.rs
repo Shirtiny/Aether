@@ -6,6 +6,7 @@ const EMBEDDING_API_FORMATS: &[&str] = &[
     "jina:embedding",
     "gemini:embedding",
     "doubao:embedding",
+    "aliyun:multimodal_embedding",
 ];
 
 pub(crate) fn model_tiered_pricing_first_tier_value(

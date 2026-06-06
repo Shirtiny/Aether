@@ -784,7 +784,9 @@ function targetFormatsForEndpoint(
   provider: RoutingProviderInfo,
   endpoint: RoutingEndpointInfo
 ): string[] {
-  return STANDARD_ROUTING_API_FORMATS.filter(format =>
+  const endpointFormat = normalizeLegacyOpenAIFormatAlias(endpoint.api_format)
+  const candidateFormats = Array.from(new Set([...STANDARD_ROUTING_API_FORMATS, endpointFormat]))
+  return candidateFormats.filter(format =>
     endpointSupportsClientFormat(provider, endpoint, format, endpoint.api_format)
   )
 }

@@ -577,7 +577,7 @@ impl GlobalModelWriteRepository for InMemoryGlobalModelReadRepository {
             record.config.clone(),
             0,
             0,
-            0,
+            record.usage_count.unwrap_or(0),
             Some(1_711_000_000),
             Some(1_711_000_000),
         )?;
@@ -606,6 +606,9 @@ impl GlobalModelWriteRepository for InMemoryGlobalModelReadRepository {
             existing.default_tiered_pricing = record.default_tiered_pricing.clone();
             existing.supported_capabilities = record.supported_capabilities.clone();
             existing.config = record.config.clone();
+            if let Some(usage_count) = record.usage_count {
+                existing.usage_count = usage_count;
+            }
             existing.updated_at_unix_secs = Some(1_711_000_100);
         }
         self.get_admin_global_model_by_id(&record.id).await

@@ -15,7 +15,7 @@ use aether_data_contracts::repository::usage::StoredRequestUsageAudit;
 use axum::body::Body;
 use axum::routing::{any, delete, get, patch, post, put};
 use axum::{extract::Request, Router};
-use chrono::Utc;
+use chrono::{TimeZone, Utc};
 use http::StatusCode;
 use serde_json::json;
 
@@ -38,6 +38,16 @@ fn sample_admin_user_with_role(
     email: &str,
     username: &str,
 ) -> StoredUserAuthRecord {
+    sample_admin_user_with_role_and_created_at(user_id, role, email, username, Utc::now())
+}
+
+fn sample_admin_user_with_role_and_created_at(
+    user_id: &str,
+    role: &str,
+    email: &str,
+    username: &str,
+    created_at: chrono::DateTime<Utc>,
+) -> StoredUserAuthRecord {
     StoredUserAuthRecord::new(
         user_id.to_string(),
         Some(email.to_string()),
@@ -51,7 +61,7 @@ fn sample_admin_user_with_role(
         Some(json!(["gpt-4.1"])),
         true,
         false,
-        Some(Utc::now()),
+        Some(created_at),
         Some(Utc::now()),
     )
     .expect("user should build")
@@ -207,6 +217,113 @@ fn sample_admin_api_key_snapshot(user_id: &str, api_key_id: &str) -> StoredAuthA
 }
 
 #[tokio::test]
+async fn gateway_sorts_admin_users_by_created_at() {
+    let oldest = Utc
+        .with_ymd_and_hms(2026, 1, 10, 0, 0, 0)
+        .single()
+        .expect("valid timestamp");
+    let middle = Utc
+        .with_ymd_and_hms(2026, 2, 10, 0, 0, 0)
+        .single()
+        .expect("valid timestamp");
+    let newest = Utc
+        .with_ymd_and_hms(2026, 3, 10, 0, 0, 0)
+        .single()
+        .expect("valid timestamp");
+
+    let user_repository = Arc::new(
+        InMemoryUserReadRepository::seed_auth_users(vec![
+            sample_admin_user_with_role_and_created_at(
+                "user-old",
+                "user",
+                "old@example.com",
+                "old",
+                oldest,
+            ),
+            sample_admin_user_with_role_and_created_at(
+                "user-middle",
+                "user",
+                "middle@example.com",
+                "middle",
+                middle,
+            ),
+            sample_admin_user_with_role_and_created_at(
+                "user-new",
+                "user",
+                "new@example.com",
+                "new",
+                newest,
+            ),
+        ])
+        .with_export_users(vec![
+            sample_admin_export_user_with("user", true, "user-old", "old@example.com", "old"),
+            sample_admin_export_user_with(
+                "user",
+                true,
+                "user-middle",
+                "middle@example.com",
+                "middle",
+            ),
+            sample_admin_export_user_with("user", true, "user-new", "new@example.com", "new"),
+        ]),
+    );
+
+    let gateway = build_router_with_state(
+        AppState::new()
+            .expect("gateway should build")
+            .with_data_state_for_tests(GatewayDataState::with_user_reader_for_tests(
+                user_repository,
+            )),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+    let client = reqwest::Client::new();
+
+    let desc_response = client
+        .get(format!(
+            "{gateway_url}/api/admin/users?skip=0&limit=10&sort_by=created_at&sort_order=desc"
+        ))
+        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .send()
+        .await
+        .expect("request should succeed");
+    assert_eq!(desc_response.status(), StatusCode::OK);
+    let desc_payload: serde_json::Value = desc_response.json().await.expect("json should parse");
+    let desc_ids = desc_payload["items"]
+        .as_array()
+        .expect("items should be array")
+        .iter()
+        .map(|item| item["id"].as_str().expect("id should be string"))
+        .collect::<Vec<_>>();
+    assert_eq!(desc_ids, vec!["user-new", "user-middle", "user-old"]);
+
+    let asc_response = client
+        .get(format!(
+            "{gateway_url}/api/admin/users?skip=0&limit=10&sort_by=created_at&sort_order=asc"
+        ))
+        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .send()
+        .await
+        .expect("request should succeed");
+    assert_eq!(asc_response.status(), StatusCode::OK);
+    let asc_payload: serde_json::Value = asc_response.json().await.expect("json should parse");
+    let asc_ids = asc_payload["items"]
+        .as_array()
+        .expect("items should be array")
+        .iter()
+        .map(|item| item["id"].as_str().expect("id should be string"))
+        .collect::<Vec<_>>();
+    assert_eq!(asc_ids, vec!["user-old", "user-middle", "user-new"]);
+
+    gateway_handle.abort();
+}
+
+#[tokio::test]
 async fn gateway_handles_admin_users_root_locally_with_trusted_admin_principal() {
     let upstream_hits = Arc::new(Mutex::new(0usize));
     let upstream_hits_clone = Arc::clone(&upstream_hits);
@@ -300,7 +417,11 @@ async fn gateway_handles_admin_users_root_locally_with_trusted_admin_principal()
 
     assert_eq!(response.status(), StatusCode::OK);
     let payload: serde_json::Value = response.json().await.expect("json body should parse");
-    let items = payload.as_array().expect("list payload should be array");
+    assert_eq!(payload["total"], 1);
+    assert_eq!(payload["skip"], 0);
+    assert_eq!(payload["limit"], 20);
+    assert_eq!(payload["has_more"], false);
+    let items = payload["items"].as_array().expect("items should be array");
     assert_eq!(items.len(), 1);
     assert_eq!(items[0]["id"], "user-1");
     assert_eq!(items[0]["email"], "alice@example.com");
@@ -332,9 +453,10 @@ async fn gateway_handles_admin_users_root_locally_with_trusted_admin_principal()
         .json()
         .await
         .expect("search json body should parse");
-    let search_items = search_payload
+    assert_eq!(search_payload["total"], 1);
+    let search_items = search_payload["items"]
         .as_array()
-        .expect("search list payload should be array");
+        .expect("search items should be array");
     assert_eq!(search_items.len(), 1);
     assert_eq!(search_items[0]["id"], "user-3");
     assert_eq!(search_items[0]["email"], "carol@example.com");
@@ -355,9 +477,10 @@ async fn gateway_handles_admin_users_root_locally_with_trusted_admin_principal()
         .json()
         .await
         .expect("id search json body should parse");
-    let id_search_items = id_search_payload
+    assert_eq!(id_search_payload["total"], 1);
+    let id_search_items = id_search_payload["items"]
         .as_array()
-        .expect("id search list payload should be array");
+        .expect("id search items should be array");
     assert_eq!(id_search_items.len(), 1);
     assert_eq!(id_search_items[0]["id"], "user-3");
 
@@ -377,9 +500,11 @@ async fn gateway_handles_admin_users_root_locally_with_trusted_admin_principal()
         .json()
         .await
         .expect("limited search json body should parse");
-    let limited_search_items = limited_search_payload
+    assert_eq!(limited_search_payload["total"], 3);
+    assert_eq!(limited_search_payload["has_more"], true);
+    let limited_search_items = limited_search_payload["items"]
         .as_array()
-        .expect("limited search list payload should be array");
+        .expect("limited search items should be array");
     assert_eq!(limited_search_items.len(), 2);
 
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
@@ -562,6 +687,121 @@ async fn gateway_allows_default_user_group_access_policy_updates() {
     assert_eq!(update_payload["rate_limit"], 25);
 
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
+
+    gateway_handle.abort();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_allows_removing_default_group_members_when_other_group_remains() {
+    let upstream = Router::new().fallback(any(|_request: Request| async {
+        (StatusCode::OK, Body::from("unexpected upstream hit"))
+    }));
+
+    let user_repository = Arc::new(
+        InMemoryUserReadRepository::seed_auth_users(vec![
+            sample_admin_user_with_role("admin-1", "admin", "admin@example.com", "admin"),
+            sample_admin_user_with_role("user-2", "user", "bob@example.com", "bob"),
+            sample_admin_user_with_role("user-3", "user", "carol@example.com", "carol"),
+        ])
+        .with_export_users(vec![
+            sample_admin_export_user_with("admin", true, "admin-1", "admin@example.com", "admin"),
+            sample_admin_export_user_with("user", true, "user-2", "bob@example.com", "bob"),
+            sample_admin_export_user_with("user", true, "user-3", "carol@example.com", "carol"),
+        ]),
+    );
+    let default_group = user_repository
+        .create_user_group(UpsertUserGroupRecord {
+            name: "Default".to_string(),
+            description: None,
+            priority: 0,
+            allowed_providers: None,
+            allowed_providers_mode: "unrestricted".to_string(),
+            allowed_api_formats: None,
+            allowed_api_formats_mode: "unrestricted".to_string(),
+            allowed_models: None,
+            allowed_models_mode: "unrestricted".to_string(),
+            rate_limit: None,
+            rate_limit_mode: "system".to_string(),
+        })
+        .await
+        .expect("default group should create")
+        .expect("default group should exist");
+    let team_group = user_repository
+        .create_user_group(UpsertUserGroupRecord {
+            name: "Team".to_string(),
+            description: None,
+            priority: 0,
+            allowed_providers: None,
+            allowed_providers_mode: "unrestricted".to_string(),
+            allowed_api_formats: None,
+            allowed_api_formats_mode: "unrestricted".to_string(),
+            allowed_models: None,
+            allowed_models_mode: "unrestricted".to_string(),
+            rate_limit: None,
+            rate_limit_mode: "system".to_string(),
+        })
+        .await
+        .expect("team group should create")
+        .expect("team group should exist");
+    user_repository
+        .add_user_to_group(&team_group.id, "user-2")
+        .await
+        .expect("team membership should create");
+
+    let (upstream_url, upstream_handle) = start_server(upstream).await;
+    let gateway = build_router_with_state(
+        AppState::new()
+            .expect("gateway should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_user_reader_for_tests(user_repository.clone())
+                    .with_system_config_values_for_tests(vec![(
+                        crate::constants::DEFAULT_USER_GROUP_CONFIG_KEY.to_string(),
+                        json!(default_group.id),
+                    )]),
+            ),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+    let client = reqwest::Client::new();
+
+    user_repository
+        .add_user_to_group(&default_group.id, "user-2")
+        .await
+        .expect("default membership should create");
+    user_repository
+        .add_user_to_group(&default_group.id, "user-3")
+        .await
+        .expect("default membership should create");
+
+    let remove_user_with_other_group = client
+        .put(format!(
+            "{gateway_url}/api/admin/user-groups/{}/members",
+            default_group.id
+        ))
+        .header(GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&json!({ "user_ids": ["user-3"] }))
+        .send()
+        .await
+        .expect("request should succeed");
+    assert_eq!(remove_user_with_other_group.status(), StatusCode::OK);
+
+    let reject_groupless_user = client
+        .put(format!(
+            "{gateway_url}/api/admin/user-groups/{}/members",
+            default_group.id
+        ))
+        .header(GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&json!({ "user_ids": [] }))
+        .send()
+        .await
+        .expect("request should succeed");
+    assert_eq!(reject_groupless_user.status(), StatusCode::BAD_REQUEST);
 
     gateway_handle.abort();
     upstream_handle.abort();
@@ -942,7 +1182,8 @@ async fn gateway_handles_admin_users_root_locally_with_bearer_admin_session() {
 
     assert_eq!(response.status(), StatusCode::OK);
     let payload: serde_json::Value = response.json().await.expect("json body should parse");
-    let items = payload.as_array().expect("list payload should be array");
+    assert_eq!(payload["total"], 1);
+    let items = payload["items"].as_array().expect("items should be array");
     assert_eq!(items.len(), 1);
     assert_eq!(items[0]["id"], "user-1");
     assert_eq!(items[0]["email"], "alice@example.com");
@@ -1568,6 +1809,83 @@ async fn gateway_returns_conflict_for_admin_lock_user_api_key_when_writer_unavai
         payload["detail"],
         "当前为只读模式，无法锁定或解锁用户 API Key"
     );
+    assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
+
+    gateway_handle.abort();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_allows_admin_update_user_to_clear_explicit_groups() {
+    let upstream_hits = Arc::new(Mutex::new(0usize));
+    let upstream_hits_clone = Arc::clone(&upstream_hits);
+    let upstream = Router::new().fallback(any(move |_request: Request| {
+        let upstream_hits_inner = Arc::clone(&upstream_hits_clone);
+        async move {
+            *upstream_hits_inner.lock().expect("mutex should lock") += 1;
+            (StatusCode::OK, Body::from("unexpected upstream hit"))
+        }
+    }));
+
+    let user_repository = Arc::new(
+        InMemoryUserReadRepository::seed_auth_users(vec![sample_admin_user("user-1")])
+            .with_export_users(vec![sample_admin_export_user("user-1")]),
+    );
+    let default_group = user_repository
+        .create_user_group(UpsertUserGroupRecord {
+            name: "GPT Adapt".to_string(),
+            description: None,
+            priority: 0,
+            allowed_providers: None,
+            allowed_providers_mode: "unrestricted".to_string(),
+            allowed_api_formats: None,
+            allowed_api_formats_mode: "unrestricted".to_string(),
+            allowed_models: None,
+            allowed_models_mode: "unrestricted".to_string(),
+            rate_limit: None,
+            rate_limit_mode: "system".to_string(),
+        })
+        .await
+        .expect("default group should create")
+        .expect("default group should exist");
+    user_repository
+        .add_user_to_group(&default_group.id, "user-1")
+        .await
+        .expect("default membership should create");
+
+    let (upstream_url, upstream_handle) = start_server(upstream).await;
+    let gateway = build_router_with_state(
+        AppState::new()
+            .expect("gateway should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_user_reader_for_tests(user_repository.clone())
+                    .with_system_config_values_for_tests(vec![(
+                        crate::constants::DEFAULT_USER_GROUP_CONFIG_KEY.to_string(),
+                        json!(default_group.id),
+                    )]),
+            ),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = reqwest::Client::new()
+        .put(format!("{gateway_url}/api/admin/users/user-1"))
+        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&json!({ "group_ids": [] }))
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(payload["groups"], json!([]));
+    assert!(user_repository
+        .list_user_groups_for_user("user-1")
+        .await
+        .expect("memberships should load")
+        .is_empty());
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();

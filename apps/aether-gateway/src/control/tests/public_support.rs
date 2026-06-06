@@ -317,6 +317,11 @@ fn classifies_wallet_routes_as_public_support_route() {
             "/api/wallet/refunds?limit=20",
             "list_refunds",
         ),
+        (
+            http::Method::GET,
+            "/api/wallet/refunds/eligible-providers",
+            "refund_eligible_providers",
+        ),
         (http::Method::POST, "/api/wallet/refunds", "create_refund"),
         (
             http::Method::GET,
@@ -456,6 +461,23 @@ fn classifies_users_me_routes_as_public_support_route() {
         );
         assert!(!decision.is_execution_runtime_candidate());
     }
+}
+
+#[test]
+fn classifies_ccswitch_usage_as_api_key_public_support_route() {
+    let headers = headers(&[]);
+    let uri: Uri = "/api/ccswitch/usage".parse().expect("uri should parse");
+    let decision =
+        classify_control_route(&http::Method::GET, &uri, &headers).expect("route should classify");
+
+    assert_eq!(decision.route_class.as_deref(), Some("public_support"));
+    assert_eq!(decision.route_family.as_deref(), Some("ccswitch"));
+    assert_eq!(decision.route_kind.as_deref(), Some("usage"));
+    assert_eq!(
+        decision.auth_endpoint_signature.as_deref(),
+        Some("aether:ccswitch_usage")
+    );
+    assert!(!decision.is_execution_runtime_candidate());
 }
 
 #[test]
@@ -709,6 +731,25 @@ fn classifies_public_catalog_health_api_formats_as_public_support_route() {
     assert_eq!(decision.route_class.as_deref(), Some("public_support"));
     assert_eq!(decision.route_family.as_deref(), Some("public_catalog"));
     assert_eq!(decision.route_kind.as_deref(), Some("health_api_formats"));
+    assert_eq!(
+        decision.auth_endpoint_signature.as_deref(),
+        Some("public:catalog")
+    );
+    assert!(!decision.is_execution_runtime_candidate());
+}
+
+#[test]
+fn classifies_public_catalog_health_models_as_public_support_route() {
+    let headers = headers(&[]);
+    let uri: Uri = "/api/public/health/models?lookback_hours=12"
+        .parse()
+        .expect("uri should parse");
+    let decision =
+        classify_control_route(&http::Method::GET, &uri, &headers).expect("route should classify");
+
+    assert_eq!(decision.route_class.as_deref(), Some("public_support"));
+    assert_eq!(decision.route_family.as_deref(), Some("public_catalog"));
+    assert_eq!(decision.route_kind.as_deref(), Some("health_models"));
     assert_eq!(
         decision.auth_endpoint_signature.as_deref(),
         Some("public:catalog")

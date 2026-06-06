@@ -13,7 +13,7 @@ use super::super::{build_unhandled_public_support_response, resolve_authenticate
 use super::announcements_shared::{
     announcements_bad_request_response, announcements_internal_detail,
     announcements_internal_error_response, announcements_not_found_response,
-    read_status_announcement_id_from_path,
+    build_public_announcement_payload, read_status_announcement_id_from_path,
 };
 
 #[derive(Debug, serde::Deserialize)]
@@ -74,6 +74,37 @@ pub(crate) async fn maybe_build_local_announcement_user_response(
                 }
             };
             Some(Json(json!({ "unread_count": unread_count })).into_response())
+        }
+        Some("required_unread")
+            if request_context.request_method == http::Method::GET
+                && matches!(
+                    request_context.request_path.as_str(),
+                    "/api/announcements/users/me/required-unread"
+                        | "/api/announcements/users/me/required-unread/"
+                ) =>
+        {
+            let items = match state
+                .list_required_unread_active_announcements(&auth.user.id, now_unix_secs, 20)
+                .await
+            {
+                Ok(value) => value,
+                Err(err) => {
+                    return Some(announcements_internal_error_response(
+                        announcements_internal_detail(err),
+                    ))
+                }
+            };
+            let payload_items = items
+                .iter()
+                .map(build_public_announcement_payload)
+                .collect::<Vec<_>>();
+            Some(
+                Json(json!({
+                    "items": payload_items,
+                    "total": payload_items.len(),
+                }))
+                .into_response(),
+            )
         }
         Some("read_all")
             if request_context.request_method == http::Method::POST

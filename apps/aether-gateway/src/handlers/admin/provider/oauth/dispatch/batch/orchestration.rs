@@ -60,7 +60,10 @@ pub(in super::super) async fn handle_admin_provider_oauth_batch_import(
             "该 Provider 不是固定类型，无法使用 provider-oauth",
         ));
     }
-    if provider_type != "kiro" && admin_provider_oauth_template(&provider_type).is_none() {
+    if provider_type != "kiro"
+        && provider_type != "windsurf"
+        && admin_provider_oauth_template(&provider_type).is_none()
+    {
         return Ok(build_admin_provider_oauth_backend_unavailable_response());
     }
 

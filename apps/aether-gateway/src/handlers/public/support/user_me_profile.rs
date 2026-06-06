@@ -7,11 +7,14 @@ use axum::{
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::handlers::shared::{deserialize_optional_json_patch, normalize_feature_settings};
+use crate::handlers::shared::{
+    deserialize_optional_json_patch, normalize_user_self_feature_settings_update,
+};
 
 use super::{
-    auth_password_policy_level, build_auth_error_response, resolve_authenticated_local_user,
-    validate_auth_register_password, AppState, GatewayPublicRequestContext,
+    auth_password_policy_level, base_url_from_request, build_auth_error_response,
+    resolve_authenticated_local_user, validate_auth_register_password, AppState,
+    GatewayPublicRequestContext,
 };
 
 const USERS_ME_PROFILE_STORAGE_UNAVAILABLE_DETAIL: &str = "用户资料存储暂不可用";
@@ -36,6 +39,30 @@ struct UsersMeChangePasswordRequest {
 
 fn normalize_users_me_optional_non_empty_string(value: Option<String>) -> Option<String> {
     value.filter(|value| !value.is_empty())
+}
+
+pub(super) async fn handle_users_me_client_config_get(
+    state: &AppState,
+    request_context: &GatewayPublicRequestContext,
+    headers: &http::HeaderMap,
+) -> Response<Body> {
+    if let Err(response) = resolve_authenticated_local_user(state, request_context, headers).await {
+        return response;
+    }
+
+    let site_name = state
+        .read_system_config_json_value("site_name")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .unwrap_or_else(|| "Aether".to_string());
+
+    Json(json!({
+        "base_url": base_url_from_request(headers, request_context),
+        "site_name": site_name,
+    }))
+    .into_response()
 }
 
 pub(super) async fn handle_users_me_detail_put(
@@ -65,12 +92,24 @@ pub(super) async fn handle_users_me_detail_put(
     let email = normalize_users_me_optional_non_empty_string(payload.email);
     let username = normalize_users_me_optional_non_empty_string(payload.username);
     let feature_settings = match payload.feature_settings {
-        Some(value) => match normalize_feature_settings(value) {
-            Ok(value) => Some(value),
-            Err(detail) => {
-                return build_auth_error_response(http::StatusCode::BAD_REQUEST, detail, false);
+        Some(value) => {
+            let current = match state.read_user_feature_settings(&auth.user.id).await {
+                Ok(value) => value,
+                Err(err) => {
+                    return build_auth_error_response(
+                        http::StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("user feature settings lookup failed: {err:?}"),
+                        false,
+                    )
+                }
+            };
+            match normalize_user_self_feature_settings_update(value, current) {
+                Ok(value) => Some(value),
+                Err(detail) => {
+                    return build_auth_error_response(http::StatusCode::BAD_REQUEST, detail, false);
+                }
             }
-        },
+        }
         None => None,
     };
 

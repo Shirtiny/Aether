@@ -3,6 +3,7 @@ import apiClient from './client'
 export interface OAuthProviderInfo {
   provider_type: string
   display_name: string
+  icon_url?: string | null
 }
 
 export interface OAuthProvidersResponse {
@@ -46,6 +47,7 @@ export interface OAuthProviderAdminConfig {
   frontend_callback_url: string
   attribute_mapping?: Record<string, unknown> | null
   extra_config?: Record<string, unknown> | null
+  icon_url?: string | null
   is_enabled: boolean
 }
 
@@ -61,6 +63,7 @@ export interface OAuthProviderUpsertRequest {
   frontend_callback_url: string
   attribute_mapping?: Record<string, unknown> | null
   extra_config?: Record<string, unknown> | null
+  icon_url?: string | null
   is_enabled: boolean
   force?: boolean
 }

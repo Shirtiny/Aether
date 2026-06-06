@@ -152,12 +152,7 @@ pub(in super::super) async fn build_admin_update_user_response(
     };
     let effective_role = role.as_deref().unwrap_or(existing_user.role.as_str());
     let group_ids = if field_presence.contains("group_ids") {
-        let requested_group_ids = normalize_admin_user_group_ids(payload.group_ids);
-        Some(
-            state
-                .include_default_user_group_ids_for_role(&requested_group_ids, effective_role)
-                .await?,
-        )
+        Some(normalize_admin_user_group_ids(payload.group_ids))
     } else if role.is_some() {
         let requested_group_ids = state
             .list_user_groups_for_user(&user_id)

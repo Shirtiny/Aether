@@ -6,6 +6,7 @@ mod load;
 mod metrics;
 mod postgres;
 mod redis;
+mod runtime;
 mod server;
 mod tracing;
 mod tunnel;
@@ -24,6 +25,7 @@ pub use metrics::{
 };
 pub use postgres::{prepare_aether_postgres_schema, ManagedPostgresServer};
 pub use redis::ManagedRedisServer;
+pub use runtime::{BenchmarkRuntimeSampler, BenchmarkRuntimeSnapshot};
 pub use server::{reserve_local_port, SpawnedServer};
 pub use tracing::{init_test_runtime, init_test_runtime_for, test_runtime_config};
 pub use tunnel::{TunnelHarness, TunnelHarnessConfig};

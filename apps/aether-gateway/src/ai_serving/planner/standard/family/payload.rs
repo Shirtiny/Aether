@@ -3,12 +3,14 @@ use crate::ai_serving::planner::candidate_materialization::{
     mark_skipped_local_execution_candidate, mark_skipped_local_execution_candidate_with_extra_data,
     mark_skipped_local_execution_candidate_with_failure_diagnostic,
 };
+use crate::ai_serving::planner::decision_input::apply_provider_request_routing_policy_to_decision;
 use crate::ai_serving::planner::materialization_policy::{
     build_local_candidate_persistence_policy, LocalCandidatePersistencePolicyKind,
 };
 use crate::ai_serving::planner::passthrough::maybe_build_local_same_format_provider_decision_payload_for_candidate;
 use crate::ai_serving::planner::report_context::{
-    build_local_execution_report_context, LocalExecutionReportContextParts,
+    build_local_execution_report_context, insert_native_client_envelope_name,
+    LocalExecutionReportContextParts,
 };
 use crate::ai_serving::planner::spec_metadata::local_standard_spec_metadata;
 use crate::ai_serving::planner::CandidateFailureDiagnostic;
@@ -24,7 +26,7 @@ use crate::ai_serving::{
 };
 use crate::{
     append_execution_contract_fields_to_value, append_local_failover_policy_to_value,
-    AiExecutionDecision, AppState,
+    AiExecutionDecision, AppState, GatewayError,
 };
 
 use super::request::resolve_local_standard_candidate_payload_parts;
@@ -38,7 +40,7 @@ pub(super) async fn maybe_build_local_standard_decision_payload_for_candidate(
     input: &LocalStandardDecisionInput,
     attempt: LocalStandardCandidateAttempt,
     spec: LocalStandardSpec,
-) -> Option<AiExecutionDecision> {
+) -> Result<Option<AiExecutionDecision>, GatewayError> {
     let spec_metadata = local_standard_spec_metadata(spec);
     if api_format_alias_matches(
         &attempt.eligible.provider_api_format,
@@ -70,10 +72,18 @@ pub(super) async fn maybe_build_local_standard_decision_payload_for_candidate(
         ..
     } = &attempt;
     let candidate = &eligible.candidate;
-    let resolved = resolve_local_standard_candidate_payload_parts(
+    let Some(resolved) = resolve_local_standard_candidate_payload_parts(
         state, parts, trace_id, body_json, input, &attempt, spec,
     )
-    .await?;
+    .await?
+    else {
+        return Ok(None);
+    };
+    let original_request_body_json = if resolved.request_redacted {
+        Some(&resolved.provider_request_body)
+    } else {
+        Some(body_json)
+    };
     let proxy = state
         .resolve_transport_proxy_snapshot_with_tunnel_affinity(&resolved.transport)
         .await;
@@ -88,11 +98,13 @@ pub(super) async fn maybe_build_local_standard_decision_payload_for_candidate(
             "envelope_name".to_string(),
             serde_json::Value::String(envelope_name.to_string()),
         );
+        insert_native_client_envelope_name(&mut extra_fields, envelope_name, parts.uri.path());
     }
     let (execution_strategy, conversion_mode) = ai_local_execution_contract_for_formats(
         spec_metadata.api_format,
         resolved.provider_api_format.as_str(),
     );
+    let effective_headers = input.effective_headers(&parts.headers);
     let report_context = append_local_failover_policy_to_value(
         append_execution_contract_fields_to_value(
             build_local_execution_report_context(LocalExecutionReportContextParts {
@@ -120,11 +132,11 @@ pub(super) async fn maybe_build_local_standard_decision_payload_for_candidate(
                 body_rules: resolved.transport.endpoint.body_rules.as_ref(),
                 provider_request_method: Some(serde_json::Value::Null),
                 provider_request_headers: Some(&resolved.provider_request_headers),
-                original_headers: &parts.headers,
+                original_headers: effective_headers,
                 request_path: Some(parts.uri.path()),
                 request_query_string: parts.uri.query(),
                 request_origin: Some(crate::ai_serving::request_origin_from_parts(parts)),
-                original_request_body_json: Some(body_json),
+                original_request_body_json,
                 original_request_body_base64: None,
                 client_session_affinity: input.client_session_affinity.as_ref(),
                 scheduler_affinity_epoch: eligible.orchestration.scheduler_affinity_epoch,
@@ -144,7 +156,10 @@ pub(super) async fn maybe_build_local_standard_decision_payload_for_candidate(
         ),
         &resolved.transport,
     );
-    let transport_profile = resolve_transport_profile(&resolved.transport);
+    let transport_profile = resolved
+        .transport_profile
+        .clone()
+        .or_else(|| resolve_transport_profile(&resolved.transport));
     let timeouts = resolve_transport_execution_timeouts(&resolved.transport);
     let super::request::LocalStandardCandidatePayloadParts {
         auth_header,
@@ -157,43 +172,45 @@ pub(super) async fn maybe_build_local_standard_decision_payload_for_candidate(
         upstream_is_stream,
         envelope_name: _,
         transport,
+        transport_profile: _,
+        request_redacted: _,
     } = resolved;
 
-    Some(build_ai_execution_decision_response(
-        AiExecutionDecisionResponseParts {
-            decision_is_stream: spec_metadata.require_streaming,
-            decision_kind: spec_metadata.decision_kind.to_string(),
-            execution_strategy,
-            conversion_mode,
-            request_id: trace_id.to_string(),
-            candidate_id: candidate_id.to_string(),
-            provider_name: candidate.provider_name.clone(),
-            provider_id: candidate.provider_id.clone(),
-            endpoint_id: candidate.endpoint_id.clone(),
-            key_id: candidate.key_id.clone(),
-            upstream_base_url: transport.endpoint.base_url.clone(),
-            upstream_url,
-            provider_request_method: None,
-            auth_header: Some(auth_header),
-            auth_value: Some(auth_value),
-            provider_api_format,
-            client_api_format: spec_metadata.api_format.to_string(),
-            model_name: input.requested_model.clone(),
-            mapped_model,
-            prompt_cache_key: None,
-            provider_request_headers,
-            provider_request_body: Some(provider_request_body),
-            provider_request_body_base64: None,
-            content_type: Some("application/json".to_string()),
-            proxy,
-            transport_profile,
-            timeouts,
-            upstream_is_stream,
-            report_kind: spec_metadata.report_kind.map(ToOwned::to_owned),
-            report_context: Some(report_context),
-            auth_context: input.auth_context.clone(),
-        },
-    ))
+    let mut decision = build_ai_execution_decision_response(AiExecutionDecisionResponseParts {
+        decision_is_stream: spec_metadata.require_streaming,
+        decision_kind: spec_metadata.decision_kind.to_string(),
+        execution_strategy,
+        conversion_mode,
+        request_id: trace_id.to_string(),
+        candidate_id: candidate_id.to_string(),
+        provider_name: candidate.provider_name.clone(),
+        provider_id: candidate.provider_id.clone(),
+        endpoint_id: candidate.endpoint_id.clone(),
+        key_id: candidate.key_id.clone(),
+        upstream_base_url: transport.endpoint.base_url.clone(),
+        upstream_url,
+        provider_request_method: None,
+        auth_header: Some(auth_header),
+        auth_value: Some(auth_value),
+        provider_api_format,
+        client_api_format: spec_metadata.api_format.to_string(),
+        model_name: input.requested_model.clone(),
+        mapped_model,
+        prompt_cache_key: None,
+        provider_request_headers,
+        provider_request_body: Some(provider_request_body),
+        provider_request_body_base64: None,
+        content_type: Some("application/json".to_string()),
+        proxy,
+        transport_profile,
+        timeouts,
+        upstream_is_stream,
+        report_kind: spec_metadata.report_kind.map(ToOwned::to_owned),
+        report_context: Some(report_context),
+        auth_context: input.auth_context.clone(),
+    });
+    apply_provider_request_routing_policy_to_decision(input, &mut decision)?;
+    Ok(Some(decision))
 }
 
 pub(super) async fn mark_skipped_local_standard_candidate(
@@ -327,6 +344,7 @@ mod tests {
             api_key_allowed_providers: None,
             api_key_allowed_api_formats: None,
             api_key_allowed_models: None,
+            api_key_ip_rules: None,
             currently_usable: true,
         }
     }
@@ -347,6 +365,9 @@ mod tests {
             required_capabilities: None,
             request_auth_channel: None,
             client_session_affinity: None,
+            routing_policy: None,
+            routing_trace_seed: None,
+            routing_context: None,
         }
     }
 
@@ -418,6 +439,7 @@ mod tests {
                 expires_at_unix_secs: None,
                 proxy: None,
                 fingerprint: None,
+                upstream_metadata: None,
                 decrypted_api_key: "sk-upstream".to_string(),
                 decrypted_auth_config: None,
             },
@@ -473,6 +495,46 @@ mod tests {
         }
     }
 
+    fn sample_gemini_cli_attempt(candidate_index: u32) -> LocalExecutionCandidateAttempt {
+        let mut transport = sample_transport("gemini:generate_content", "endpoint-gemini-cli");
+        transport.provider.provider_type = "gemini_cli".to_string();
+        transport.provider.name = "gemini".to_string();
+        transport.endpoint.base_url = "https://cloudcode-pa.googleapis.com".to_string();
+        transport.endpoint.custom_path = Some("/v1internal:{action}".to_string());
+        transport.endpoint.endpoint_kind = Some("generate_content".to_string());
+        transport.key.auth_type = "bearer".to_string();
+        transport.key.api_formats = Some(vec!["gemini:generate_content".to_string()]);
+        transport.key.global_priority_by_format = Some(json!({
+            "gemini:generate_content": 1,
+        }));
+        transport.key.upstream_metadata = Some(json!({
+            "gemini_cli": {
+                "project_id": "test-project"
+            }
+        }));
+
+        let mut candidate = sample_candidate("gemini:generate_content", "endpoint-gemini-cli");
+        candidate.provider_name = "gemini".to_string();
+        candidate.provider_type = "gemini_cli".to_string();
+        candidate.key_auth_type = "bearer".to_string();
+        candidate.selected_provider_model_name = "gemini-2.5-pro".to_string();
+        candidate.global_model_name = "gemini-2.5-pro".to_string();
+
+        LocalExecutionCandidateAttempt {
+            eligible: EligibleLocalExecutionCandidate {
+                kind: LocalExecutionCandidateKind::SingleKey,
+                candidate,
+                transport: Arc::new(transport),
+                provider_api_format: "gemini:generate_content".to_string(),
+                orchestration: LocalExecutionCandidateMetadata::default(),
+                ranking: None,
+            },
+            candidate_index,
+            retry_index: 0,
+            candidate_id: format!("candidate-{candidate_index}"),
+        }
+    }
+
     fn claude_stream_spec() -> LocalStandardSpec {
         LocalStandardSpec {
             api_format: "claude:messages",
@@ -512,6 +574,7 @@ mod tests {
             claude_stream_spec(),
         )
         .await
+        .expect("same-format candidate should not fail routing mutation")
         .expect("same-format candidate should build a standard-family payload");
 
         assert_eq!(payload.endpoint_id.as_deref(), Some("endpoint-claude"));
@@ -547,6 +610,7 @@ mod tests {
             claude_stream_spec(),
         )
         .await
+        .expect("cross-format candidate should not fail routing mutation")
         .expect("cross-format candidate should still build after the same-format candidate");
 
         assert_eq!(
@@ -560,6 +624,92 @@ mod tests {
         assert_eq!(
             cross_format_payload.conversion_mode.as_deref(),
             Some("bidirectional")
+        );
+    }
+
+    #[tokio::test]
+    async fn standard_family_wraps_gemini_cli_cross_format_body_in_v1internal_envelope() {
+        let state = crate::AppState::new().expect("state should build");
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(())
+            .expect("request should build");
+        let (parts, _) = request.into_parts();
+        let body_json = json!({
+            "model": "gemini-2.5-pro",
+            "messages": [{"role": "user", "content": "hello"}],
+            "temperature": 0.2,
+            "stream": true
+        });
+        let mut input = sample_input();
+        input.requested_model = "gemini-2.5-pro".to_string();
+        let spec = LocalStandardSpec {
+            api_format: "openai:chat",
+            decision_kind: "openai_chat_stream",
+            report_kind: "openai_chat_stream_success",
+            family: LocalStandardSourceFamily::Standard,
+            mode: LocalStandardSourceMode::Chat,
+            require_streaming: true,
+        };
+
+        let payload = maybe_build_local_standard_decision_payload_for_candidate(
+            &state,
+            &parts,
+            "trace-gemini-cli-cross-format",
+            &body_json,
+            &input,
+            sample_gemini_cli_attempt(0),
+            spec,
+        )
+        .await
+        .expect("cross-format candidate should not fail routing mutation")
+        .expect("gemini_cli candidate should build a payload");
+
+        assert_eq!(
+            payload.upstream_url.as_deref(),
+            Some("https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse")
+        );
+        assert_eq!(
+            payload.execution_strategy.as_deref(),
+            Some("local_cross_format")
+        );
+        assert_eq!(
+            payload.provider_api_format.as_deref(),
+            Some("gemini:generate_content")
+        );
+        assert_eq!(
+            payload
+                .provider_request_headers
+                .get("user-agent")
+                .map(String::as_str),
+            Some(crate::ai_serving::transport::GEMINI_CLI_USER_AGENT)
+        );
+
+        let provider_body = payload
+            .provider_request_body
+            .as_ref()
+            .expect("provider request body should be present");
+        assert_eq!(provider_body["model"], "gemini-2.5-pro");
+        assert_eq!(provider_body["project"], "test-project");
+        assert_eq!(
+            provider_body["user_prompt_id"],
+            "trace-gemini-cli-cross-format"
+        );
+        assert!(provider_body.get("contents").is_none());
+        assert!(provider_body.get("generationConfig").is_none());
+        assert!(provider_body["request"].get("contents").is_some());
+
+        let report_context = payload
+            .report_context
+            .as_ref()
+            .expect("report context should be present");
+        assert_eq!(
+            report_context
+                .get("envelope_name")
+                .and_then(|value| value.as_str()),
+            Some(crate::ai_serving::transport::GEMINI_CLI_V1INTERNAL_ENVELOPE_NAME)
         );
     }
 }

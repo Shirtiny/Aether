@@ -13,9 +13,15 @@ use crate::provider_pool_demand::{
     provider_pool_burst_pending, read_provider_pool_demand_snapshot,
 };
 use aether_runtime_state::{DataLayerError, RuntimeState};
+use futures_util::future::join_all;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::warn;
+use tracing::{info, warn};
+
+const DEFAULT_POOL_RUNTIME_WINDOW_METRIC_KEY_LIMIT: usize = 512;
+const MAX_POOL_RUNTIME_WINDOW_METRIC_KEY_LIMIT: usize = 10_000;
+const POOL_RUNTIME_WINDOW_METRIC_KEY_LIMIT_ENV: &str =
+    "AETHER_GATEWAY_ADMIN_POOL_RUNTIME_WINDOW_METRIC_KEY_LIMIT";
 
 fn current_unix_secs() -> u64 {
     SystemTime::now()
@@ -28,19 +34,34 @@ fn should_load_active_probe_members(pool_config: &AdminProviderPoolConfig) -> bo
     pool_config.probing_enabled
 }
 
+fn pool_runtime_window_metric_key_limit() -> usize {
+    std::env::var(POOL_RUNTIME_WINDOW_METRIC_KEY_LIMIT_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_POOL_RUNTIME_WINDOW_METRIC_KEY_LIMIT)
+        .clamp(1, MAX_POOL_RUNTIME_WINDOW_METRIC_KEY_LIMIT)
+}
+
+fn bounded_runtime_window_metric_key_ids(key_ids: &[String], limit: usize) -> &[String] {
+    let end = key_ids.len().min(limit.max(1));
+    &key_ids[..end]
+}
+
 pub(crate) async fn read_admin_provider_pool_cooldown_counts(
     runtime: &RuntimeState,
     provider_ids: &[String],
 ) -> BTreeMap<String, usize> {
-    let mut counts = BTreeMap::new();
-    for provider_id in provider_ids {
+    join_all(provider_ids.iter().map(|provider_id| async move {
         let count = runtime
             .set_len(&pool_cooldown_index_key(provider_id))
             .await
             .unwrap_or(0);
-        counts.insert(provider_id.clone(), count);
-    }
-    counts
+        (provider_id.clone(), count)
+    }))
+    .await
+    .into_iter()
+    .collect()
 }
 
 pub(crate) async fn read_admin_provider_pool_runtime_state(
@@ -52,8 +73,21 @@ pub(crate) async fn read_admin_provider_pool_runtime_state(
 ) -> AdminProviderPoolRuntimeState {
     let mut state = AdminProviderPoolRuntimeState::default();
     let cooldown_keys = pool_cooldown_keys(provider_id, key_ids);
-    let cost_keys = pool_cost_keys(provider_id, key_ids);
-    let latency_keys = pool_latency_keys(provider_id, key_ids);
+    let metric_key_limit = pool_runtime_window_metric_key_limit();
+    let metric_key_ids = bounded_runtime_window_metric_key_ids(key_ids, metric_key_limit);
+    if metric_key_ids.len() < key_ids.len() {
+        info!(
+            event_name = "admin_pool_runtime_window_metrics_truncated",
+            log_type = "event",
+            provider_id,
+            total_key_count = key_ids.len(),
+            scanned_key_count = metric_key_ids.len(),
+            metric_key_limit,
+            "gateway limited admin pool runtime cost/latency window reads"
+        );
+    }
+    let cost_keys = pool_cost_keys(provider_id, metric_key_ids);
+    let latency_keys = pool_latency_keys(provider_id, metric_key_ids);
     let sticky_sessions_enabled = pool_config.sticky_session_ttl_seconds > 0
         && admin_provider_pool_cache_affinity_enabled(pool_config);
 
@@ -170,11 +204,15 @@ pub(crate) async fn read_admin_provider_pool_runtime_state(
     }
 
     let now = current_unix_secs();
-    for (key_id, cost_key) in key_ids.iter().zip(cost_keys) {
-        let window_start = now.saturating_sub(pool_config.cost_window_seconds) as f64;
-        let total = runtime
-            .score_range_by_min(&cost_key, window_start)
-            .await
+    let cost_window_start = now.saturating_sub(pool_config.cost_window_seconds) as f64;
+    let cost_results = join_all(
+        cost_keys
+            .iter()
+            .map(|cost_key| runtime.score_range_by_min(cost_key, cost_window_start)),
+    )
+    .await;
+    for (key_id, members) in metric_key_ids.iter().zip(cost_results) {
+        let total = members
             .unwrap_or_default()
             .iter()
             .map(|member| parse_pool_cost_member(member))
@@ -184,11 +222,15 @@ pub(crate) async fn read_admin_provider_pool_runtime_state(
         }
     }
 
-    for (key_id, latency_key) in key_ids.iter().zip(latency_keys) {
-        let window_start = now.saturating_sub(pool_config.latency_window_seconds) as f64;
-        let samples = runtime
-            .score_range_by_min(&latency_key, window_start)
-            .await
+    let latency_window_start = now.saturating_sub(pool_config.latency_window_seconds) as f64;
+    let latency_results = join_all(
+        latency_keys
+            .iter()
+            .map(|latency_key| runtime.score_range_by_min(latency_key, latency_window_start)),
+    )
+    .await;
+    for (key_id, members) in metric_key_ids.iter().zip(latency_results) {
+        let samples = members
             .unwrap_or_default()
             .iter()
             .map(|member| parse_pool_latency_member(member))
@@ -254,4 +296,31 @@ pub(crate) async fn read_admin_provider_pool_key_cooldown_reason(
     runtime
         .kv_get(&pool_cooldown_key(provider_id, key_id))
         .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bounded_runtime_window_metric_key_ids;
+
+    #[test]
+    fn runtime_window_metric_key_ids_are_bounded() {
+        let key_ids = vec![
+            "key-1".to_string(),
+            "key-2".to_string(),
+            "key-3".to_string(),
+        ];
+
+        let bounded = bounded_runtime_window_metric_key_ids(&key_ids, 2);
+
+        assert_eq!(bounded, &key_ids[..2]);
+    }
+
+    #[test]
+    fn runtime_window_metric_key_ids_keep_at_least_one_key() {
+        let key_ids = vec!["key-1".to_string(), "key-2".to_string()];
+
+        let bounded = bounded_runtime_window_metric_key_ids(&key_ids, 0);
+
+        assert_eq!(bounded, &key_ids[..1]);
+    }
 }

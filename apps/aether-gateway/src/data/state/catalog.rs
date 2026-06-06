@@ -1,10 +1,11 @@
 use super::{
-    DataLayerError, GatewayDataState, GeminiFileMappingListQuery, GeminiFileMappingStats,
-    ProviderCatalogKeyListQuery, PublicHealthStatusCount, PublicHealthTimelineBucket,
-    StoredGeminiFileMapping, StoredGeminiFileMappingListPage, StoredProviderCatalogEndpoint,
-    StoredProviderCatalogKey, StoredProviderCatalogKeyPage, StoredProviderCatalogKeyStats,
-    StoredProviderCatalogProvider, StoredRequestCandidate, UpsertGeminiFileMappingRecord,
-    UpsertRequestCandidateRecord,
+    ApiKeyLastUsedDelta, DataLayerError, GatewayDataState, GeminiFileMappingListQuery,
+    GeminiFileMappingStats, ProviderCatalogKeyListQuery, PublicHealthStatusCount,
+    PublicHealthTimelineBucket, StoredGeminiFileMapping, StoredGeminiFileMappingListPage,
+    StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
+    StoredProviderCatalogKeyMaintenanceSummary, StoredProviderCatalogKeyPage,
+    StoredProviderCatalogKeyStats, StoredProviderCatalogProvider, StoredRequestCandidate,
+    UpsertGeminiFileMappingRecord, UpsertRequestCandidateRecord,
 };
 
 impl GatewayDataState {
@@ -121,6 +122,18 @@ impl GatewayDataState {
         &self,
         api_key_id: &str,
     ) -> Result<bool, DataLayerError> {
+        if let Some(repository) = &self.usage_writer {
+            let enqueued = repository
+                .enqueue_api_key_last_used_delta(ApiKeyLastUsedDelta {
+                    api_key_id: api_key_id.to_string(),
+                    last_used_at_unix_secs: chrono::Utc::now().timestamp().max(0) as u64,
+                })
+                .await?;
+            if enqueued {
+                return Ok(true);
+            }
+        }
+
         match &self.auth_api_key_writer {
             Some(repository) => repository.touch_last_used_at(api_key_id).await,
             None => Ok(false),
@@ -273,6 +286,20 @@ impl GatewayDataState {
         }
     }
 
+    pub(crate) async fn list_provider_catalog_key_maintenance_summaries_by_provider_ids(
+        &self,
+        provider_ids: &[String],
+    ) -> Result<Vec<StoredProviderCatalogKeyMaintenanceSummary>, DataLayerError> {
+        match &self.provider_catalog_reader {
+            Some(repository) => {
+                repository
+                    .list_key_maintenance_summaries_by_provider_ids(provider_ids)
+                    .await
+            }
+            None => Ok(Vec::new()),
+        }
+    }
+
     pub(crate) async fn list_provider_catalog_key_page(
         &self,
         query: &ProviderCatalogKeyListQuery,
@@ -307,7 +334,7 @@ impl GatewayDataState {
         encrypted_auth_config: Option<&str>,
         expires_at_unix_secs: Option<u64>,
     ) -> Result<bool, DataLayerError> {
-        match &self.provider_catalog_writer {
+        let updated = match &self.provider_catalog_writer {
             Some(repository) => {
                 repository
                     .update_key_oauth_credentials(
@@ -319,17 +346,25 @@ impl GatewayDataState {
                     .await
             }
             None => Ok(false),
+        }?;
+        if updated {
+            self.clear_provider_catalog_cache();
         }
+        Ok(updated)
     }
 
     pub(crate) async fn create_provider_catalog_key(
         &self,
         key: &StoredProviderCatalogKey,
     ) -> Result<Option<StoredProviderCatalogKey>, DataLayerError> {
-        match &self.provider_catalog_writer {
+        let created = match &self.provider_catalog_writer {
             Some(repository) => repository.create_key(key).await.map(Some),
             None => Ok(None),
+        }?;
+        if created.is_some() {
+            self.clear_provider_catalog_cache();
         }
+        Ok(created)
     }
 
     pub(crate) async fn create_provider_catalog_provider(
@@ -337,33 +372,45 @@ impl GatewayDataState {
         provider: &StoredProviderCatalogProvider,
         shift_existing_priorities_from: Option<i32>,
     ) -> Result<Option<StoredProviderCatalogProvider>, DataLayerError> {
-        match &self.provider_catalog_writer {
+        let created = match &self.provider_catalog_writer {
             Some(repository) => repository
                 .create_provider(provider, shift_existing_priorities_from)
                 .await
                 .map(Some),
             None => Ok(None),
+        }?;
+        if created.is_some() {
+            self.clear_provider_catalog_cache();
         }
+        Ok(created)
     }
 
     pub(crate) async fn update_provider_catalog_provider(
         &self,
         provider: &StoredProviderCatalogProvider,
     ) -> Result<Option<StoredProviderCatalogProvider>, DataLayerError> {
-        match &self.provider_catalog_writer {
+        let updated = match &self.provider_catalog_writer {
             Some(repository) => repository.update_provider(provider).await.map(Some),
             None => Ok(None),
+        }?;
+        if updated.is_some() {
+            self.clear_provider_catalog_cache();
         }
+        Ok(updated)
     }
 
     pub(crate) async fn delete_provider_catalog_provider(
         &self,
         provider_id: &str,
     ) -> Result<bool, DataLayerError> {
-        match &self.provider_catalog_writer {
+        let deleted = match &self.provider_catalog_writer {
             Some(repository) => repository.delete_provider(provider_id).await,
             None => Ok(false),
+        }?;
+        if deleted {
+            self.clear_provider_catalog_cache();
         }
+        Ok(deleted)
     }
 
     pub(crate) async fn cleanup_deleted_provider_catalog_refs(
@@ -372,54 +419,74 @@ impl GatewayDataState {
         endpoint_ids: &[String],
         key_ids: &[String],
     ) -> Result<(), DataLayerError> {
-        match &self.provider_catalog_writer {
+        let cleaned = match &self.provider_catalog_writer {
             Some(repository) => {
                 repository
                     .cleanup_deleted_provider_refs(provider_id, endpoint_ids, key_ids)
                     .await
             }
             None => Ok(()),
+        };
+        if !endpoint_ids.is_empty() || !key_ids.is_empty() {
+            self.clear_provider_catalog_cache();
         }
+        cleaned
     }
 
     pub(crate) async fn create_provider_catalog_endpoint(
         &self,
         endpoint: &StoredProviderCatalogEndpoint,
     ) -> Result<Option<StoredProviderCatalogEndpoint>, DataLayerError> {
-        match &self.provider_catalog_writer {
+        let created = match &self.provider_catalog_writer {
             Some(repository) => repository.create_endpoint(endpoint).await.map(Some),
             None => Ok(None),
+        }?;
+        if created.is_some() {
+            self.clear_provider_catalog_cache();
         }
+        Ok(created)
     }
 
     pub(crate) async fn update_provider_catalog_endpoint(
         &self,
         endpoint: &StoredProviderCatalogEndpoint,
     ) -> Result<Option<StoredProviderCatalogEndpoint>, DataLayerError> {
-        match &self.provider_catalog_writer {
+        let updated = match &self.provider_catalog_writer {
             Some(repository) => repository.update_endpoint(endpoint).await.map(Some),
             None => Ok(None),
+        }?;
+        if updated.is_some() {
+            self.clear_provider_catalog_cache();
         }
+        Ok(updated)
     }
 
     pub(crate) async fn delete_provider_catalog_endpoint(
         &self,
         endpoint_id: &str,
     ) -> Result<bool, DataLayerError> {
-        match &self.provider_catalog_writer {
+        let deleted = match &self.provider_catalog_writer {
             Some(repository) => repository.delete_endpoint(endpoint_id).await,
             None => Ok(false),
+        }?;
+        if deleted {
+            self.clear_provider_catalog_cache();
         }
+        Ok(deleted)
     }
 
     pub(crate) async fn update_provider_catalog_key(
         &self,
         key: &StoredProviderCatalogKey,
     ) -> Result<Option<StoredProviderCatalogKey>, DataLayerError> {
-        match &self.provider_catalog_writer {
+        let updated = match &self.provider_catalog_writer {
             Some(repository) => repository.update_key(key).await.map(Some),
             None => Ok(None),
+        }?;
+        if updated.is_some() {
+            self.clear_provider_catalog_cache();
         }
+        Ok(updated)
     }
 
     pub(crate) async fn update_provider_catalog_key_upstream_metadata(
@@ -428,34 +495,46 @@ impl GatewayDataState {
         upstream_metadata: Option<&serde_json::Value>,
         updated_at_unix_secs: Option<u64>,
     ) -> Result<bool, DataLayerError> {
-        match &self.provider_catalog_writer {
+        let updated = match &self.provider_catalog_writer {
             Some(repository) => {
                 repository
                     .update_key_upstream_metadata(key_id, upstream_metadata, updated_at_unix_secs)
                     .await
             }
             None => Ok(false),
+        }?;
+        if updated {
+            self.clear_provider_catalog_cache();
         }
+        Ok(updated)
     }
 
     pub(crate) async fn delete_provider_catalog_key(
         &self,
         key_id: &str,
     ) -> Result<bool, DataLayerError> {
-        match &self.provider_catalog_writer {
+        let deleted = match &self.provider_catalog_writer {
             Some(repository) => repository.delete_key(key_id).await,
             None => Ok(false),
+        }?;
+        if deleted {
+            self.clear_provider_catalog_cache();
         }
+        Ok(deleted)
     }
 
     pub(crate) async fn clear_provider_catalog_key_oauth_invalid_marker(
         &self,
         key_id: &str,
     ) -> Result<bool, DataLayerError> {
-        match &self.provider_catalog_writer {
+        let updated = match &self.provider_catalog_writer {
             Some(repository) => repository.clear_key_oauth_invalid_marker(key_id).await,
             None => Ok(false),
+        }?;
+        if updated {
+            self.clear_provider_catalog_cache();
         }
+        Ok(updated)
     }
 
     pub(crate) async fn update_provider_catalog_key_health_state(
@@ -465,7 +544,7 @@ impl GatewayDataState {
         health_by_format: Option<&serde_json::Value>,
         circuit_breaker_by_format: Option<&serde_json::Value>,
     ) -> Result<bool, DataLayerError> {
-        match &self.provider_catalog_writer {
+        let updated = match &self.provider_catalog_writer {
             Some(repository) => {
                 repository
                     .update_key_health_state(
@@ -477,6 +556,10 @@ impl GatewayDataState {
                     .await
             }
             None => Ok(false),
+        }?;
+        if updated {
+            self.clear_provider_catalog_cache();
         }
+        Ok(updated)
     }
 }

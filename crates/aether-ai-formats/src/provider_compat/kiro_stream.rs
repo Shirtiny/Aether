@@ -9,6 +9,18 @@ pub const KIRO_MAX_THINKING_BUFFER: usize = 1024 * 1024;
 
 const KIRO_QUOTE_CHARS: &str = "`\"'\\#!@$%^&*()-_=+[]{};:<>,.?/";
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KiroStreamCacheUsage {
+    pub cache_creation_input_tokens: usize,
+    pub cache_read_input_tokens: usize,
+}
+
+impl KiroStreamCacheUsage {
+    fn has_cache_tokens(self) -> bool {
+        self.cache_creation_input_tokens > 0 || self.cache_read_input_tokens > 0
+    }
+}
+
 pub fn encode_kiro_sse_events(events: Vec<Value>) -> Result<Vec<u8>, serde_json::Error> {
     let mut output = Vec::new();
     for event in events {
@@ -30,7 +42,9 @@ pub fn build_kiro_initial_sse_events(
     message_id: &str,
     model: &str,
     estimated_input_tokens: usize,
+    cache_usage: Option<KiroStreamCacheUsage>,
 ) -> Vec<Value> {
+    let usage = build_kiro_usage_payload(estimated_input_tokens, 1, cache_usage);
     vec![json!({
         "type": "message_start",
         "message": {
@@ -41,10 +55,7 @@ pub fn build_kiro_initial_sse_events(
             "model": model,
             "stop_reason": Value::Null,
             "stop_sequence": Value::Null,
-            "usage": {
-                "input_tokens": estimated_input_tokens as u64,
-                "output_tokens": 1,
-            },
+            "usage": usage,
         }
     })]
 }
@@ -63,7 +74,9 @@ pub fn build_kiro_final_message_sse_events(
     stop_reason: &str,
     input_tokens: usize,
     output_tokens: usize,
+    cache_usage: Option<KiroStreamCacheUsage>,
 ) -> Vec<Value> {
+    let usage = build_kiro_usage_payload(input_tokens, output_tokens, cache_usage);
     vec![
         json!({
             "type": "message_delta",
@@ -71,13 +84,35 @@ pub fn build_kiro_final_message_sse_events(
                 "stop_reason": stop_reason,
                 "stop_sequence": Value::Null,
             },
-            "usage": {
-                "input_tokens": input_tokens as u64,
-                "output_tokens": output_tokens as u64,
-            }
+            "usage": usage
         }),
         json!({"type": "message_stop"}),
     ]
+}
+
+fn build_kiro_usage_payload(
+    input_tokens: usize,
+    output_tokens: usize,
+    cache_usage: Option<KiroStreamCacheUsage>,
+) -> Value {
+    let billed_input_tokens = cache_usage
+        .filter(|usage| usage.has_cache_tokens())
+        .map(|usage| {
+            input_tokens
+                .saturating_sub(usage.cache_creation_input_tokens)
+                .saturating_sub(usage.cache_read_input_tokens)
+        })
+        .unwrap_or(input_tokens);
+    let mut usage = json!({
+        "input_tokens": billed_input_tokens as u64,
+        "output_tokens": output_tokens as u64,
+    });
+    if let Some(cache_usage) = cache_usage.filter(|usage| usage.has_cache_tokens()) {
+        usage["cache_creation_input_tokens"] =
+            json!(cache_usage.cache_creation_input_tokens as u64);
+        usage["cache_read_input_tokens"] = json!(cache_usage.cache_read_input_tokens as u64);
+    }
+    usage
 }
 
 pub fn calculate_kiro_context_input_tokens(percentage: f64) -> usize {

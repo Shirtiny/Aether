@@ -32,6 +32,7 @@ struct AdminAnnouncementCreateRequest {
     kind: String,
     priority: Option<i32>,
     is_pinned: Option<bool>,
+    requires_ack: Option<bool>,
     start_time: Option<String>,
     end_time: Option<String>,
 }
@@ -45,6 +46,7 @@ struct AdminAnnouncementUpdateRequest {
     priority: Option<i32>,
     is_active: Option<bool>,
     is_pinned: Option<bool>,
+    requires_ack: Option<bool>,
     start_time: Option<String>,
     end_time: Option<String>,
 }
@@ -168,6 +170,7 @@ fn build_create_record(
         kind: payload.kind,
         priority: payload.priority.unwrap_or(0),
         is_pinned: payload.is_pinned.unwrap_or(false),
+        requires_ack: payload.requires_ack.unwrap_or(false),
         author_id: operator_id,
         start_time_unix_secs: parse_optional_rfc3339_unix_secs(
             payload.start_time.as_deref(),
@@ -194,6 +197,7 @@ fn build_update_record(
         priority: payload.priority,
         is_active: payload.is_active,
         is_pinned: payload.is_pinned,
+        requires_ack: payload.requires_ack,
         start_time_unix_secs: parse_optional_rfc3339_unix_secs(
             payload.start_time.as_deref(),
             "start_time",

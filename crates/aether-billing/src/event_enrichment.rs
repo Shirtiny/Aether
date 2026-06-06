@@ -35,7 +35,10 @@ pub async fn enrich_usage_event_with_billing(
     data: &dyn BillingModelContextLookup,
     event: &mut UsageEvent,
 ) -> Result<(), DataLayerError> {
-    if !matches!(event.event_type, UsageEventType::Completed) {
+    if !matches!(
+        event.event_type,
+        UsageEventType::Completed | UsageEventType::Cancelled
+    ) {
         event.data.total_cost_usd = Some(0.0);
         event.data.actual_total_cost_usd = Some(0.0);
         return Ok(());
@@ -122,24 +125,37 @@ fn calculate_billing_computation(
     pricing: &BillingModelPricingSnapshot,
     event: &UsageEvent,
 ) -> Result<BillingComputation, DataLayerError> {
+    let failed =
+        event.data.status_code.unwrap_or_default() >= 400 || event.data.error_message.is_some();
+    let is_image_usage = usage_event_is_image_usage(&event.data);
+    let image_count = if failed {
+        0
+    } else {
+        usage_event_image_count(&event.data).unwrap_or(0)
+    };
+    let request_count = if failed {
+        0
+    } else if is_image_usage && image_count > 0 {
+        image_count
+    } else {
+        1
+    };
     let input = BillingUsageInput {
-        task_type: event
-            .data
-            .request_type
-            .clone()
-            .unwrap_or_else(|| "chat".to_string()),
+        task_type: if is_image_usage {
+            "image".to_string()
+        } else {
+            event
+                .data
+                .request_type
+                .clone()
+                .unwrap_or_else(|| "chat".to_string())
+        },
         api_format: event
             .data
             .endpoint_api_format
             .clone()
             .or_else(|| event.data.api_format.clone()),
-        request_count: if event.data.status_code.unwrap_or_default() >= 400
-            || event.data.error_message.is_some()
-        {
-            0
-        } else {
-            1
-        },
+        request_count,
         input_tokens: event.data.input_tokens.unwrap_or_default() as i64,
         output_tokens: event.data.output_tokens.unwrap_or_default() as i64,
         cache_creation_tokens: event.data.cache_creation_input_tokens.unwrap_or_default() as i64,
@@ -152,6 +168,10 @@ fn calculate_billing_computation(
             .cache_creation_ephemeral_1h_input_tokens
             .unwrap_or_default() as i64,
         cache_read_tokens: event.data.cache_read_input_tokens.unwrap_or_default() as i64,
+        image_count,
+        image_size: usage_event_dimension_string(&event.data, "image_size"),
+        image_quality: usage_event_dimension_string(&event.data, "image_quality"),
+        image_output_format: usage_event_dimension_string(&event.data, "image_output_format"),
         cache_ttl_minutes: pricing.provider_api_key_cache_ttl_minutes,
     };
 
@@ -160,6 +180,82 @@ fn calculate_billing_computation(
         .map_err(|err| {
             DataLayerError::UnexpectedValue(format!("billing calculation failed: {err}"))
         })
+}
+
+fn usage_event_is_image_usage(data: &aether_usage_runtime::UsageEventData) -> bool {
+    data.request_type
+        .as_deref()
+        .is_some_and(|value| value.eq_ignore_ascii_case("image"))
+        || api_format_endpoint_kind(data.endpoint_api_format.as_deref()) == Some("image")
+        || api_format_endpoint_kind(data.api_format.as_deref()) == Some("image")
+        || usage_event_image_count(data).is_some_and(|value| value > 0)
+}
+
+fn usage_event_image_count(data: &aether_usage_runtime::UsageEventData) -> Option<i64> {
+    metadata_dimension_i64(data.request_metadata.as_ref(), "dimensions", "image_count")
+        .or_else(|| {
+            metadata_dimension_i64(
+                data.request_metadata.as_ref(),
+                "billing_dimensions",
+                "image_count",
+            )
+        })
+        .filter(|value| *value > 0)
+}
+
+fn usage_event_dimension_string(
+    data: &aether_usage_runtime::UsageEventData,
+    dimension_key: &str,
+) -> Option<String> {
+    metadata_dimension_string(data.request_metadata.as_ref(), "dimensions", dimension_key).or_else(
+        || {
+            metadata_dimension_string(
+                data.request_metadata.as_ref(),
+                "billing_dimensions",
+                dimension_key,
+            )
+        },
+    )
+}
+
+fn metadata_dimension_string(
+    metadata: Option<&Value>,
+    bag_key: &str,
+    dimension_key: &str,
+) -> Option<String> {
+    metadata
+        .and_then(Value::as_object)
+        .and_then(|object| object.get(bag_key))
+        .and_then(Value::as_object)
+        .and_then(|object| object.get(dimension_key))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn metadata_dimension_i64(
+    metadata: Option<&Value>,
+    bag_key: &str,
+    dimension_key: &str,
+) -> Option<i64> {
+    metadata
+        .and_then(Value::as_object)
+        .and_then(|object| object.get(bag_key))
+        .and_then(Value::as_object)
+        .and_then(|object| object.get(dimension_key))
+        .and_then(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_u64().and_then(|number| i64::try_from(number).ok()))
+        })
+}
+
+fn api_format_endpoint_kind(api_format: Option<&str>) -> Option<&str> {
+    api_format
+        .and_then(|value| value.split_once(':').map(|(_, kind)| kind))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 fn apply_billing_computation(
@@ -376,6 +472,307 @@ mod tests {
                 .and_then(Value::as_str),
             Some("complete")
         );
+    }
+
+    #[tokio::test]
+    async fn image_usage_uses_image_count_for_request_cost() {
+        let lookup = TestLookup {
+            name_context: Some(
+                StoredBillingModelContext::new(
+                    "provider-1".to_string(),
+                    Some("pay_as_you_go".to_string()),
+                    Some("key-1".to_string()),
+                    None,
+                    None,
+                    "global-image-1".to_string(),
+                    "gpt-image-2".to_string(),
+                    None,
+                    Some(0.02),
+                    None,
+                    Some("model-image-1".to_string()),
+                    Some("gpt-image-2".to_string()),
+                    None,
+                    None,
+                    None,
+                )
+                .expect("billing context should build"),
+            ),
+            model_id_context: None,
+        };
+        let mut event = UsageEvent::new(
+            UsageEventType::Completed,
+            "req-image-billing-1",
+            UsageEventData {
+                provider_name: "OpenAI Image".to_string(),
+                model: "gpt-image-2".to_string(),
+                provider_id: Some("provider-1".to_string()),
+                provider_api_key_id: Some("key-1".to_string()),
+                request_type: Some("chat".to_string()),
+                api_format: Some("openai:chat".to_string()),
+                endpoint_api_format: Some("openai:image".to_string()),
+                request_metadata: Some(json!({
+                    "dimensions": {
+                        "image_count": 3
+                    }
+                })),
+                status_code: Some(200),
+                ..UsageEventData::default()
+            },
+        );
+
+        enrich_usage_event_with_billing(&lookup, &mut event)
+            .await
+            .expect("billing should succeed");
+
+        assert_eq!(event.data.total_cost_usd, Some(0.06));
+        assert_eq!(event.data.actual_total_cost_usd, Some(0.06));
+        assert_eq!(
+            event
+                .data
+                .request_metadata
+                .as_ref()
+                .and_then(|value| value.get("billing_dimensions"))
+                .and_then(|value| value.get("request_count"))
+                .and_then(Value::as_i64),
+            Some(3)
+        );
+        assert_eq!(
+            event
+                .data
+                .request_metadata
+                .as_ref()
+                .and_then(|value| value.get("billing_dimensions"))
+                .and_then(|value| value.get("image_count"))
+                .and_then(Value::as_i64),
+            Some(3)
+        );
+        assert_eq!(
+            event
+                .data
+                .request_metadata
+                .as_ref()
+                .and_then(|value| value.get("billing_dimensions"))
+                .and_then(|value| value.get("effective_task_type"))
+                .and_then(Value::as_str),
+            Some("image")
+        );
+    }
+
+    #[tokio::test]
+    async fn image_usage_uses_configured_output_price_matrix() {
+        let lookup = TestLookup {
+            name_context: Some(
+                StoredBillingModelContext::new(
+                    "provider-1".to_string(),
+                    Some("pay_as_you_go".to_string()),
+                    Some("key-1".to_string()),
+                    None,
+                    None,
+                    "global-image-1".to_string(),
+                    "gpt-image-2".to_string(),
+                    None,
+                    None,
+                    Some(json!({
+                        "tiers": [{
+                            "up_to": null,
+                            "input_price_per_1m": 5.0,
+                            "output_price_per_1m": 30.0,
+                            "cache_read_price_per_1m": 1.25
+                        }],
+                        "image_output_price_default": 0.01,
+                        "image_output_prices": {
+                            "1024x1024": {"low": 0.006, "medium": 0.053, "high": 0.211},
+                            "1536x1024": {"low": 0.005, "medium": 0.041, "high": 0.165},
+                            "1024x1536": {"low": 0.005, "medium": 0.041, "high": 0.165}
+                        }
+                    })),
+                    Some("model-image-1".to_string()),
+                    Some("gpt-image-2".to_string()),
+                    None,
+                    None,
+                    None,
+                )
+                .expect("billing context should build"),
+            ),
+            model_id_context: None,
+        };
+        let mut event = UsageEvent::new(
+            UsageEventType::Completed,
+            "req-image-billing-matrix-1",
+            UsageEventData {
+                provider_name: "OpenAI Image".to_string(),
+                model: "gpt-image-2".to_string(),
+                provider_id: Some("provider-1".to_string()),
+                provider_api_key_id: Some("key-1".to_string()),
+                request_type: Some("chat".to_string()),
+                api_format: Some("openai:chat".to_string()),
+                endpoint_api_format: Some("openai:image".to_string()),
+                request_metadata: Some(json!({
+                    "dimensions": {
+                        "image_count": 2,
+                        "image_size": "1536x1024",
+                        "image_quality": "medium",
+                        "image_output_format": "png"
+                    }
+                })),
+                status_code: Some(200),
+                ..UsageEventData::default()
+            },
+        );
+
+        enrich_usage_event_with_billing(&lookup, &mut event)
+            .await
+            .expect("billing should succeed");
+
+        assert_eq!(event.data.total_cost_usd, Some(0.082));
+        assert_eq!(event.data.actual_total_cost_usd, Some(0.082));
+        let metadata = event.data.request_metadata.as_ref().expect("metadata");
+        assert_eq!(
+            metadata
+                .get("billing_dimensions")
+                .and_then(|value| value.get("image_price_key"))
+                .and_then(Value::as_str),
+            Some("1536x1024:medium")
+        );
+        assert_eq!(
+            metadata
+                .get("billing_snapshot")
+                .and_then(|value| value.get("resolved_variables"))
+                .and_then(|value| value.get("image_output_price_per_image"))
+                .and_then(Value::as_f64),
+            Some(0.041)
+        );
+        assert_eq!(
+            metadata
+                .get("billing_snapshot")
+                .and_then(|value| value.get("cost_breakdown"))
+                .and_then(|value| value.get("image_output_cost"))
+                .and_then(Value::as_f64),
+            Some(0.082)
+        );
+    }
+
+    #[tokio::test]
+    async fn enriches_cancelled_usage_event_with_billing_snapshot() {
+        let lookup = TestLookup {
+            name_context: Some(
+                StoredBillingModelContext::new(
+                    "provider-1".to_string(),
+                    Some("pay_as_you_go".to_string()),
+                    Some("key-1".to_string()),
+                    Some(json!({"openai:responses": 0.5})),
+                    Some(60),
+                    "global-model-1".to_string(),
+                    "gpt-5".to_string(),
+                    None,
+                    Some(0.02),
+                    Some(json!({"tiers":[{"up_to":null,"input_price_per_1m":3.0,"output_price_per_1m":15.0,"cache_creation_price_per_1m":3.75,"cache_read_price_per_1m":0.30}]})),
+                    Some("model-1".to_string()),
+                    Some("gpt-5-upstream".to_string()),
+                    None,
+                    None,
+                    None,
+                )
+                .expect("billing context should build"),
+            ),
+            model_id_context: None,
+        };
+        let mut event = UsageEvent::new(
+            UsageEventType::Cancelled,
+            "req-billing-cancelled-1",
+            UsageEventData {
+                provider_name: "OpenAI".to_string(),
+                model: "gpt-5".to_string(),
+                provider_id: Some("provider-1".to_string()),
+                provider_api_key_id: Some("key-1".to_string()),
+                request_type: Some("chat".to_string()),
+                api_format: Some("openai:responses".to_string()),
+                endpoint_api_format: Some("openai:responses".to_string()),
+                input_tokens: Some(1_000),
+                output_tokens: Some(500),
+                cache_read_input_tokens: Some(100),
+                status_code: Some(499),
+                ..UsageEventData::default()
+            },
+        );
+
+        enrich_usage_event_with_billing(&lookup, &mut event)
+            .await
+            .expect("billing should succeed");
+
+        assert!(event.data.total_cost_usd.unwrap_or_default() > 0.0);
+        assert!(event.data.actual_total_cost_usd.unwrap_or_default() > 0.0);
+        assert_eq!(
+            event
+                .data
+                .request_metadata
+                .as_ref()
+                .and_then(|value| value.get("billing_snapshot"))
+                .and_then(|value| value.get("status"))
+                .and_then(Value::as_str),
+            Some("complete")
+        );
+        assert_eq!(
+            event
+                .data
+                .request_metadata
+                .as_ref()
+                .and_then(|value| value.get("billing_dimensions"))
+                .and_then(|value| value.get("request_count"))
+                .and_then(Value::as_i64),
+            Some(0)
+        );
+        assert_eq!(
+            event
+                .data
+                .request_metadata
+                .as_ref()
+                .and_then(|value| value.get("billing_dimensions"))
+                .and_then(|value| value.get("input_tokens"))
+                .and_then(Value::as_i64),
+            Some(900)
+        );
+        assert_eq!(
+            event
+                .data
+                .request_metadata
+                .as_ref()
+                .and_then(|value| value.get("billing_dimensions"))
+                .and_then(|value| value.get("cache_read_tokens"))
+                .and_then(Value::as_i64),
+            Some(100)
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_usage_event_remains_unbilled() {
+        let lookup = TestLookup {
+            name_context: None,
+            model_id_context: None,
+        };
+        let mut event = UsageEvent::new(
+            UsageEventType::Failed,
+            "req-billing-failed-1",
+            UsageEventData {
+                provider_name: "OpenAI".to_string(),
+                model: "gpt-5".to_string(),
+                provider_id: Some("provider-1".to_string()),
+                provider_api_key_id: Some("key-1".to_string()),
+                request_type: Some("chat".to_string()),
+                input_tokens: Some(1_000),
+                output_tokens: Some(500),
+                status_code: Some(500),
+                ..UsageEventData::default()
+            },
+        );
+
+        enrich_usage_event_with_billing(&lookup, &mut event)
+            .await
+            .expect("billing should succeed");
+
+        assert_eq!(event.data.total_cost_usd, Some(0.0));
+        assert_eq!(event.data.actual_total_cost_usd, Some(0.0));
+        assert!(event.data.request_metadata.is_none());
     }
 
     #[tokio::test]

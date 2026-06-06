@@ -52,6 +52,9 @@ use crate::repository::proxy_nodes::{
 use crate::repository::quota::{
     ProviderQuotaReadRepository, ProviderQuotaWriteRepository, SqlxProviderQuotaRepository,
 };
+use crate::repository::routing_profiles::{
+    PostgresRoutingGroupRepository, RoutingGroupReadRepository, RoutingGroupWriteRepository,
+};
 use crate::repository::settlement::{SettlementWriteRepository, SqlxSettlementRepository};
 use crate::repository::usage::{
     SqlxUsageReadRepository, UsageReadRepository, UsageWriteRepository,
@@ -204,6 +207,14 @@ impl PostgresBackend {
 
     pub fn pool_score_write_repository(&self) -> Arc<dyn PoolMemberScoreWriteRepository> {
         Arc::new(PostgresPoolMemberScoreRepository::new(self.pool_clone()))
+    }
+
+    pub fn routing_group_read_repository(&self) -> Arc<dyn RoutingGroupReadRepository> {
+        Arc::new(PostgresRoutingGroupRepository::new(self.pool_clone()))
+    }
+
+    pub fn routing_group_write_repository(&self) -> Arc<dyn RoutingGroupWriteRepository> {
+        Arc::new(PostgresRoutingGroupRepository::new(self.pool_clone()))
     }
 
     pub fn provider_quota_read_repository(&self) -> Arc<dyn ProviderQuotaReadRepository> {

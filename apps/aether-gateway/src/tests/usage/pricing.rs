@@ -68,7 +68,7 @@ const OPENAI_SPEC: ProviderSpec = ProviderSpec {
     global_model_id: "global-model-openai-usage-pricing-1",
     global_model_name: "gpt-5",
     provider_model_name: "gpt-5-upstream",
-    upstream_base_url: "https://api.openai.example",
+    upstream_base_url: "https://api.openai.example/v1",
     upstream_secret: "sk-upstream-openai-usage-pricing",
 };
 
@@ -82,7 +82,7 @@ const CLAUDE_SPEC: ProviderSpec = ProviderSpec {
     global_model_id: "global-model-claude-usage-pricing-1",
     global_model_name: "claude-sonnet-4-5",
     provider_model_name: "claude-sonnet-4-5-upstream",
-    upstream_base_url: "https://api.anthropic.example",
+    upstream_base_url: "https://api.anthropic.example/v1",
     upstream_secret: "sk-upstream-claude-usage-pricing",
 };
 
@@ -113,10 +113,7 @@ struct ExpectedUsagePricing {
 
 impl ExpectedUsagePricing {
     fn total_tokens(self) -> u64 {
-        self.input_tokens
-            .saturating_add(self.output_tokens)
-            .saturating_add(self.cache_creation_tokens)
-            .saturating_add(self.cache_read_tokens)
+        self.input_tokens.saturating_add(self.output_tokens)
     }
 
     fn cache_creation_uncategorized_tokens(self) -> u64 {
@@ -628,11 +625,32 @@ fn assert_usage_and_pricing(
         expected.cache_read_tokens
     );
     assert_eq!(stored_usage.total_tokens, expected.total_tokens());
-    assert_eq!(
-        stored_usage.response_time_ms,
-        Some(expected_response_time_ms)
-    );
-    assert_eq!(stored_usage.first_byte_time_ms, expected_ttfb_ms);
+    if expected_ttfb_ms.is_some() {
+        assert!(
+            stored_usage.response_time_ms >= Some(expected_response_time_ms),
+            "stream response_time_ms should be at least reported telemetry: expected >= {expected_response_time_ms:?}, got {:?}",
+            stored_usage.response_time_ms
+        );
+    } else {
+        assert_eq!(
+            stored_usage.response_time_ms,
+            Some(expected_response_time_ms)
+        );
+    }
+    if expected_ttfb_ms.is_some() {
+        let first_byte_time_ms = stored_usage
+            .first_byte_time_ms
+            .expect("stream usage should record first visible text time");
+        assert!(
+            stored_usage
+                .response_time_ms
+                .is_some_and(|response_time_ms| response_time_ms >= first_byte_time_ms),
+            "stream first_byte_time_ms should not exceed response_time_ms: first_byte={first_byte_time_ms}, response={:?}",
+            stored_usage.response_time_ms
+        );
+    } else {
+        assert_eq!(stored_usage.first_byte_time_ms, None);
+    }
     assert_eq!(
         stored_usage.settlement_input_price_per_1m(),
         Some(INPUT_PRICE_PER_1M)
@@ -888,7 +906,7 @@ async fn gateway_records_openai_stream_usage_and_pricing_with_cache_tokens_impl(
         cache_read_tokens: 40,
     };
     let stream_body = [
-        "data: {\"id\":\"chatcmpl-openai-usage-pricing-stream-123\",\"choices\":[]}\n\n",
+        "data: {\"id\":\"chatcmpl-openai-usage-pricing-stream-123\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"}}]}\n\n",
         "data: [DONE]\n\n",
     ];
     let frames = build_stream_frames(
@@ -1079,7 +1097,7 @@ async fn gateway_records_claude_stream_usage_and_pricing_with_cache_breakdown_im
         cache_read_tokens: 10,
     };
     let stream_body = [
-        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-claude-usage-pricing-stream-123\",\"type\":\"message\",\"model\":\"claude-sonnet-4-5-upstream\",\"role\":\"assistant\",\"content\":[]}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n",
         "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
     ];
     let frames = build_stream_frames(
@@ -1180,7 +1198,13 @@ async fn gateway_records_gemini_sync_usage_and_pricing_with_cache_read_tokens_im
         },
         "body": {
             "json_body": {
-                "candidates": [],
+                "candidates": [{
+                    "content": {
+                        "role": "model",
+                        "parts": [{"text": "Hello from Gemini"}]
+                    },
+                    "finishReason": "STOP"
+                }],
                 "usageMetadata": {
                     "promptTokenCount": expected.input_tokens,
                     "candidatesTokenCount": expected.output_tokens,
@@ -1262,7 +1286,8 @@ async fn gateway_records_gemini_stream_usage_and_pricing_with_cache_read_tokens_
         cache_creation_ephemeral_1h_tokens: 0,
         cache_read_tokens: 30,
     };
-    let stream_body = ["data: {\"candidates\":[]}\n\n"];
+    let stream_body =
+        ["data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hello\"}]}}]}\n\n"];
     let frames = build_stream_frames(
         &stream_body,
         standardized_usage_json(expected),

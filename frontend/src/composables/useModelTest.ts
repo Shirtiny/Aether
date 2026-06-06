@@ -20,6 +20,7 @@ export interface StartTestParams {
   endpointId?: string
   endpointBaseUrl?: string
   message?: string
+  apiKeyIds?: string[]
   applyModelMapping?: boolean
   mappedModelName?: string
   requestHeaders?: Record<string, unknown>
@@ -150,13 +151,17 @@ export function useModelTest(options: UseModelTestOptions) {
     reqId: string,
     signal?: AbortSignal,
   ): Promise<TestModelFailoverResponse> {
+    const message = normalizedMessage(params.message)
+    const apiKeyIds = normalizedApiKeyIds(params.apiKeyIds)
+
     return normalizeDirectTestResult(params, await testModel({
       provider_id: providerId(),
       model_name: params.modelName,
       mode: params.mode,
       api_format: params.apiFormat,
       endpoint_id: params.endpointId,
-      ...(normalizedMessage(params.message) ? { message: normalizedMessage(params.message) } : {}),
+      ...(apiKeyIds ? { api_key_ids: apiKeyIds } : {}),
+      ...(message ? { message } : {}),
       ...(typeof params.applyModelMapping === 'boolean' ? { apply_model_mapping: params.applyModelMapping } : {}),
       ...(params.mappedModelName ? { mapped_model_name: params.mappedModelName } : {}),
       ...(params.requestHeaders ? { request_headers: params.requestHeaders } : {}),
@@ -171,6 +176,13 @@ export function useModelTest(options: UseModelTestOptions) {
     return typeof message === 'string' && message.trim()
       ? message.trim()
       : undefined
+  }
+
+  function normalizedApiKeyIds(apiKeyIds?: string[]): string[] | undefined {
+    const ids = Array.isArray(apiKeyIds)
+      ? apiKeyIds.map(item => item.trim()).filter(Boolean)
+      : []
+    return ids.length > 0 ? [...new Set(ids)] : undefined
   }
 
   async function pollTestTrace(reqId: string, token: number) {
@@ -249,6 +261,7 @@ export function useModelTest(options: UseModelTestOptions) {
 
     try {
       const message = normalizedMessage(params.message)
+      const apiKeyIds = normalizedApiKeyIds(params.apiKeyIds)
 
       let result = params.mode === 'direct'
         ? await runDirectTest(params, reqId, abortController.signal)
@@ -257,6 +270,7 @@ export function useModelTest(options: UseModelTestOptions) {
           mode: params.mode,
           model_name: params.modelName,
           failover_models: [params.modelName],
+          ...(apiKeyIds ? { api_key_ids: apiKeyIds } : {}),
           api_format: params.apiFormat,
           endpoint_id: params.endpointId,
           ...(message ? { message } : {}),

@@ -8,6 +8,9 @@ const PLAN_TYPE_LABELS: Record<string, string> = {
   'pro+': 'Pro+',
   power: 'Power',
   ultra: 'Ultra',
+  basic: 'Basic',
+  super: 'Super',
+  heavy: 'Heavy',
 }
 
 const PLAN_TYPE_CLASS_NAMES: Record<string, string> = {
@@ -20,6 +23,9 @@ const PLAN_TYPE_CLASS_NAMES: Record<string, string> = {
   ultra: 'border-amber-500/50 text-amber-600 dark:text-amber-400',
   'pro+': 'border-purple-500/50 text-purple-600 dark:text-purple-400',
   power: 'border-amber-500/50 text-amber-600 dark:text-amber-400',
+  basic: 'border-primary/50 text-primary',
+  super: 'border-green-500/50 text-green-600 dark:text-green-400',
+  heavy: 'border-amber-500/50 text-amber-600 dark:text-amber-400',
 }
 
 export function normalizeOAuthPlanType(planType?: string | null): string | null {

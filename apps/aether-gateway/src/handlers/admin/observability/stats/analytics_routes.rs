@@ -1,7 +1,9 @@
 use super::range::{build_comparison_range, parse_bounded_u32};
 use super::resolve_admin_usage_time_range;
 use crate::handlers::admin::request::{AdminAppState, AdminRequestContext};
-use crate::handlers::admin::shared::{query_param_optional_bool, query_param_value};
+use crate::handlers::admin::shared::{
+    build_admin_usage_counter_health_payload, query_param_optional_bool, query_param_value,
+};
 use crate::GatewayError;
 use aether_admin::observability::stats::{
     admin_stats_bad_request_response, admin_stats_comparison_empty_response,
@@ -20,6 +22,22 @@ use aether_data_contracts::repository::usage::{
     UsageProviderPerformanceQuery, UsageTimeSeriesGranularity, UsageTimeSeriesQuery,
 };
 use axum::{body::Body, http, response::Response};
+
+async fn build_usage_counter_health_payload(
+    state: &AdminAppState<'_>,
+) -> Result<serde_json::Value, GatewayError> {
+    let now_unix_secs = chrono::Utc::now().timestamp().max(0) as u64;
+    let snapshot = state
+        .as_ref()
+        .data
+        .read_usage_counter_health()
+        .await
+        .map_err(|err| GatewayError::Internal(err.to_string()))?;
+    Ok(build_admin_usage_counter_health_payload(
+        &snapshot,
+        now_unix_secs,
+    ))
+}
 
 fn usage_summary_to_admin_stats_aggregate(
     summary: &aether_data_contracts::repository::usage::StoredUsageAuditSummary,
@@ -211,13 +229,18 @@ pub(super) async fn maybe_build_local_admin_stats_analytics_response(
                 Ok(value) => u64::from(value.unwrap_or(10_000)),
                 Err(detail) => return Ok(Some(admin_stats_bad_request_response(detail))),
             };
+        let usage_counter = build_usage_counter_health_payload(state).await?;
         if !state.has_usage_data_reader() {
-            return Ok(Some(admin_stats_provider_performance_empty_response()));
+            return Ok(Some(admin_stats_provider_performance_empty_response(
+                usage_counter,
+            )));
         }
 
         let Some((created_from_unix_secs, created_until_unix_secs)) = time_range.to_unix_bounds()
         else {
-            return Ok(Some(admin_stats_provider_performance_empty_response()));
+            return Ok(Some(admin_stats_provider_performance_empty_response(
+                usage_counter,
+            )));
         };
         let performance = state
             .summarize_usage_provider_performance(&UsageProviderPerformanceQuery {
@@ -240,6 +263,7 @@ pub(super) async fn maybe_build_local_admin_stats_analytics_response(
             .await?;
         return Ok(Some(build_admin_stats_provider_performance_response(
             &performance,
+            usage_counter,
         )));
     }
 

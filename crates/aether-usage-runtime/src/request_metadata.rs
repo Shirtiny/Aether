@@ -1,7 +1,12 @@
 use aether_ai_formats::api::{
     sanitize_request_path, sanitize_request_path_and_query, sanitize_request_query_string,
 };
+use aether_ai_formats::UPSTREAM_IS_STREAM_KEY;
 use aether_contracts::ExecutionPlan;
+use aether_data_contracts::repository::usage::{
+    extract_provider_reasoning_effort_from_body, extract_provider_service_tier_from_body,
+    PROVIDER_REASONING_EFFORT_METADATA_KEY, PROVIDER_SERVICE_TIER_METADATA_KEY,
+};
 use serde_json::{json, Map, Value};
 
 const MAX_USAGE_REQUEST_METADATA_DEPTH: usize = 32;
@@ -68,16 +73,53 @@ pub(crate) fn sanitize_usage_request_metadata_ref(value: Option<&Value>) -> Opti
     (!filtered.is_empty()).then_some(Value::Object(filtered))
 }
 
+pub(crate) fn attach_provider_request_body_metadata(
+    metadata: Option<Value>,
+    provider_request_body: Option<&Value>,
+) -> Option<Value> {
+    let provider_body_is_object = provider_request_body.and_then(Value::as_object).is_some();
+    let reasoning_effort = extract_provider_reasoning_effort_from_body(provider_request_body);
+    let service_tier = extract_provider_service_tier_from_body(provider_request_body);
+    if !provider_body_is_object && reasoning_effort.is_none() && service_tier.is_none() {
+        return metadata;
+    }
+    let mut object = match metadata {
+        Some(Value::Object(object)) => object,
+        _ => Map::new(),
+    };
+    if provider_body_is_object {
+        object.remove(PROVIDER_REASONING_EFFORT_METADATA_KEY);
+        object.remove(PROVIDER_SERVICE_TIER_METADATA_KEY);
+    }
+    if let Some(reasoning_effort) = reasoning_effort {
+        object.insert(
+            PROVIDER_REASONING_EFFORT_METADATA_KEY.to_string(),
+            Value::String(reasoning_effort),
+        );
+    }
+    if let Some(service_tier) = service_tier {
+        object.insert(
+            PROVIDER_SERVICE_TIER_METADATA_KEY.to_string(),
+            Value::String(service_tier),
+        );
+    }
+    (!object.is_empty()).then_some(Value::Object(object))
+}
+
 fn copy_allowed_metadata_fields(source: &Map<String, Value>, target: &mut Map<String, Value>) {
     copy_non_empty_string(source, target, "trace_id");
     copy_non_empty_string(source, target, "client_ip");
     copy_non_empty_string(source, target, "user_agent");
+    copy_non_empty_string(source, target, "client_family");
     copy_bool(source, target, "client_requested_stream");
-    copy_bool(source, target, "upstream_is_stream");
+    copy_bool(source, target, UPSTREAM_IS_STREAM_KEY);
+    copy_non_null_value(source, target, "client_session_affinity");
     copy_bool(source, target, "api_key_is_standalone");
     copy_non_empty_string(source, target, "request_path");
     copy_non_empty_string(source, target, "request_query_string");
     copy_non_empty_string(source, target, "request_path_and_query");
+    copy_non_empty_string(source, target, PROVIDER_REASONING_EFFORT_METADATA_KEY);
+    copy_non_empty_string(source, target, PROVIDER_SERVICE_TIER_METADATA_KEY);
     copy_number(source, target, "provider_request_body_base64_bytes");
     copy_number(source, target, "provider_response_body_base64_bytes");
     copy_number(source, target, "client_response_body_base64_bytes");
@@ -110,12 +152,16 @@ fn move_allowed_metadata_fields(mut source: Map<String, Value>, target: &mut Map
     remove_non_empty_string(&mut source, target, "trace_id");
     remove_non_empty_string(&mut source, target, "client_ip");
     remove_non_empty_string(&mut source, target, "user_agent");
+    remove_non_empty_string(&mut source, target, "client_family");
     remove_bool(&mut source, target, "client_requested_stream");
-    remove_bool(&mut source, target, "upstream_is_stream");
+    remove_bool(&mut source, target, UPSTREAM_IS_STREAM_KEY);
+    remove_non_null_value(&mut source, target, "client_session_affinity");
     remove_bool(&mut source, target, "api_key_is_standalone");
     remove_non_empty_string(&mut source, target, "request_path");
     remove_non_empty_string(&mut source, target, "request_query_string");
     remove_non_empty_string(&mut source, target, "request_path_and_query");
+    remove_non_empty_string(&mut source, target, PROVIDER_REASONING_EFFORT_METADATA_KEY);
+    remove_non_empty_string(&mut source, target, PROVIDER_SERVICE_TIER_METADATA_KEY);
     remove_number(&mut source, target, "provider_request_body_base64_bytes");
     remove_number(&mut source, target, "provider_response_body_base64_bytes");
     remove_number(&mut source, target, "client_response_body_base64_bytes");
@@ -397,10 +443,11 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        build_usage_request_metadata_seed, merge_usage_request_metadata,
-        merge_usage_request_metadata_owned, sanitize_usage_request_metadata,
-        sanitize_usage_request_metadata_ref, MAX_USAGE_REQUEST_METADATA_BYTES,
-        MAX_USAGE_REQUEST_METADATA_DEPTH, MAX_USAGE_REQUEST_METADATA_NODES,
+        attach_provider_request_body_metadata, build_usage_request_metadata_seed,
+        merge_usage_request_metadata, merge_usage_request_metadata_owned,
+        sanitize_usage_request_metadata, sanitize_usage_request_metadata_ref,
+        MAX_USAGE_REQUEST_METADATA_BYTES, MAX_USAGE_REQUEST_METADATA_DEPTH,
+        MAX_USAGE_REQUEST_METADATA_NODES,
     };
 
     fn sample_plan() -> ExecutionPlan {
@@ -635,6 +682,49 @@ mod tests {
         );
 
         assert_eq!(metadata, None);
+    }
+
+    #[test]
+    fn provider_request_body_metadata_uses_final_provider_body_as_source_of_truth() {
+        let metadata = Some(json!({
+            "trace_id": "trace-1",
+            "provider_reasoning_effort": "high",
+            "provider_service_tier": "priority"
+        }));
+
+        let updated = attach_provider_request_body_metadata(
+            metadata.clone(),
+            Some(&json!({
+                "model": "gpt-5",
+                "reasoning": { "effort": "low" },
+                "service_tier": "standard"
+            })),
+        )
+        .expect("metadata should remain");
+
+        assert_eq!(
+            updated,
+            json!({
+                "trace_id": "trace-1",
+                "provider_reasoning_effort": "low",
+                "provider_service_tier": "standard"
+            })
+        );
+
+        let cleared = attach_provider_request_body_metadata(
+            metadata,
+            Some(&json!({
+                "model": "gpt-5"
+            })),
+        )
+        .expect("metadata should retain unrelated fields");
+
+        assert_eq!(
+            cleared,
+            json!({
+                "trace_id": "trace-1"
+            })
+        );
     }
 
     #[test]

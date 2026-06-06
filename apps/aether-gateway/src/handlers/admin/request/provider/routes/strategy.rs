@@ -84,7 +84,7 @@ impl<'a> AdminAppState<'a> {
                                 Json(json!({ "detail": "请求数据验证失败" })),
                             )
                                 .into_response(),
-                        ))
+                        ));
                     }
                 };
 

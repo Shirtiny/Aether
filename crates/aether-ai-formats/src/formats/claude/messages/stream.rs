@@ -410,6 +410,7 @@ enum ClaudeOpenBlock {
 struct ClaudeClientToolState {
     call_id: String,
     name: String,
+    buffered_arguments: String,
 }
 
 #[derive(Default)]
@@ -460,18 +461,47 @@ impl ClaudeClientEmitter {
         let Some(open_block) = self.open_block.take() else {
             return Ok(Vec::new());
         };
+        let mut out = Vec::new();
         let block_index = match open_block {
             ClaudeOpenBlock::Text { block_index } => block_index,
             ClaudeOpenBlock::Thinking { block_index } => block_index,
-            ClaudeOpenBlock::Tool { block_index, .. } => block_index,
+            ClaudeOpenBlock::Tool {
+                tool_index,
+                block_index,
+            } => {
+                if let Some(state) = self.tool_states.get_mut(&tool_index) {
+                    if state.name == "Read" && !state.buffered_arguments.is_empty() {
+                        let arguments = remove_empty_pages_from_tool_arguments(
+                            &state.name,
+                            &state.buffered_arguments,
+                        );
+                        state.buffered_arguments.clear();
+                        if !arguments.is_empty() {
+                            out.extend(encode_json_sse(
+                                Some("content_block_delta"),
+                                &json!({
+                                    "type": "content_block_delta",
+                                    "index": block_index,
+                                    "delta": {
+                                        "type": "input_json_delta",
+                                        "partial_json": arguments,
+                                    }
+                                }),
+                            )?);
+                        }
+                    }
+                }
+                block_index
+            }
         };
-        encode_json_sse(
+        out.extend(encode_json_sse(
             Some("content_block_stop"),
             &json!({
                 "type": "content_block_stop",
                 "index": block_index,
             }),
-        )
+        )?);
+        Ok(out)
     }
 
     fn ensure_text_block(&mut self) -> Result<Vec<u8>, AiSurfaceFinalizeError> {
@@ -669,6 +699,12 @@ impl ClaudeClientEmitter {
                 Ok(out)
             }
             CanonicalStreamEvent::ContentPart(part) => self.emit_content_part(part),
+            CanonicalStreamEvent::ImageGenerationCall { item, .. } => {
+                let Some(part) = content_part_from_openai_image_generation_item(&item) else {
+                    return Ok(Vec::new());
+                };
+                self.emit_content_part(part)
+            }
             CanonicalStreamEvent::ToolCallStart {
                 index,
                 call_id,
@@ -682,23 +718,33 @@ impl ClaudeClientEmitter {
                 Ok(out)
             }
             CanonicalStreamEvent::ToolCallArgumentsDelta { index, arguments } => {
-                let arguments = remove_empty_pages_from_tool_arguments(&arguments);
+                let (call_id, name) = {
+                    let state = self.tool_states.entry(index).or_default();
+                    let call_id = if state.call_id.is_empty() {
+                        format!("tool_{index}")
+                    } else {
+                        state.call_id.clone()
+                    };
+                    let name = if state.name.is_empty() {
+                        "unknown".to_string()
+                    } else {
+                        state.name.clone()
+                    };
+                    (call_id, name)
+                };
                 if arguments.is_empty() {
                     return Ok(Vec::new());
                 }
                 let mut out = self.ensure_started()?;
-                let state = self.tool_states.entry(index).or_default();
-                let call_id = if state.call_id.is_empty() {
-                    format!("tool_{index}")
-                } else {
-                    state.call_id.clone()
-                };
-                let name = if state.name.is_empty() {
-                    "unknown".to_string()
-                } else {
-                    state.name.clone()
-                };
                 out.extend(self.ensure_tool_block(index, &call_id, &name)?);
+                if name == "Read" {
+                    self.tool_states
+                        .entry(index)
+                        .or_default()
+                        .buffered_arguments
+                        .push_str(&arguments);
+                    return Ok(out);
+                }
                 let block_index = match self.open_block {
                     Some(ClaudeOpenBlock::Tool { block_index, .. }) => block_index,
                     _ => return Ok(out),
@@ -747,44 +793,7 @@ impl ClaudeClientEmitter {
                     }),
                 );
                 let usage = usage.unwrap_or_default();
-                let mut usage_payload = Map::new();
-                usage_payload.insert("input_tokens".to_string(), Value::from(usage.input_tokens));
-                usage_payload.insert(
-                    "output_tokens".to_string(),
-                    Value::from(usage.output_tokens),
-                );
-                if usage.cache_read_tokens > 0 {
-                    usage_payload.insert(
-                        "cache_read_input_tokens".to_string(),
-                        Value::from(usage.cache_read_tokens),
-                    );
-                }
-                if usage.cache_creation_tokens > 0 {
-                    usage_payload.insert(
-                        "cache_creation_input_tokens".to_string(),
-                        Value::from(usage.cache_creation_tokens),
-                    );
-                }
-                if usage.cache_creation_ephemeral_5m_tokens > 0
-                    || usage.cache_creation_ephemeral_1h_tokens > 0
-                {
-                    let mut cache_creation = Map::new();
-                    if usage.cache_creation_ephemeral_5m_tokens > 0 {
-                        cache_creation.insert(
-                            "ephemeral_5m_input_tokens".to_string(),
-                            Value::from(usage.cache_creation_ephemeral_5m_tokens),
-                        );
-                    }
-                    if usage.cache_creation_ephemeral_1h_tokens > 0 {
-                        cache_creation.insert(
-                            "ephemeral_1h_input_tokens".to_string(),
-                            Value::from(usage.cache_creation_ephemeral_1h_tokens),
-                        );
-                    }
-                    usage_payload
-                        .insert("cache_creation".to_string(), Value::Object(cache_creation));
-                }
-                payload.insert("usage".to_string(), Value::Object(usage_payload));
+                payload.insert("usage".to_string(), claude_usage_from_usage(&usage));
                 out.extend(encode_json_sse(
                     Some("message_delta"),
                     &Value::Object(payload),
@@ -919,6 +928,7 @@ impl ClaudeClientEmitter {
 }
 
 fn merge_claude_usage(mut current: CanonicalUsage, next: CanonicalUsage) -> CanonicalUsage {
+    current.input_tokens_include_cache |= next.input_tokens_include_cache;
     if next.input_tokens > 0 {
         current.input_tokens = next.input_tokens;
     }
@@ -940,11 +950,15 @@ fn merge_claude_usage(mut current: CanonicalUsage, next: CanonicalUsage) -> Cano
     if next.reasoning_tokens > 0 {
         current.reasoning_tokens = next.reasoning_tokens;
     }
-    current.total_tokens = current
-        .input_tokens
-        .saturating_add(current.output_tokens)
-        .saturating_add(current.cache_creation_tokens)
+    let cache_input_tokens = current
+        .cache_creation_tokens
         .saturating_add(current.cache_read_tokens);
+    let input_tokens = if current.input_tokens_include_cache {
+        current.input_tokens
+    } else {
+        current.input_tokens.saturating_add(cache_input_tokens)
+    };
+    current.total_tokens = input_tokens.saturating_add(current.output_tokens);
     current
 }
 
@@ -1196,6 +1210,23 @@ mod tests {
     }
 
     #[test]
+    fn merge_claude_usage_preserves_inclusive_input_semantics() {
+        let merged = super::merge_claude_usage(
+            CanonicalUsage::default(),
+            CanonicalUsage {
+                input_tokens: 110_161,
+                input_tokens_include_cache: true,
+                output_tokens: 691,
+                cache_read_tokens: 107_008,
+                ..CanonicalUsage::default()
+            },
+        );
+
+        assert!(merged.input_tokens_include_cache);
+        assert_eq!(merged.total_tokens, 110_852);
+    }
+
+    #[test]
     fn claude_client_emitter_preserves_tool_identity_and_emits_thinking_blocks() {
         let mut emitter = ClaudeClientEmitter::default();
         let mut bytes = emitter
@@ -1261,7 +1292,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_client_emitter_removes_empty_pages_from_tool_arguments() {
+    fn claude_client_emitter_removes_empty_pages_from_read_tool_arguments() {
         let mut emitter = ClaudeClientEmitter::default();
         let mut bytes = emitter
             .emit(CanonicalStreamFrame {
@@ -1288,9 +1319,58 @@ mod tests {
                 .expect("tool delta should encode"),
         );
 
+        let pending_sse = String::from_utf8(bytes.clone()).expect("sse should be utf8");
+        assert!(!pending_sse.contains("\\\"pages\\\":\\\"\\\""));
+
+        bytes.extend(
+            emitter
+                .emit(CanonicalStreamFrame {
+                    id: "msg_123".to_string(),
+                    model: "claude-sonnet-4-5".to_string(),
+                    event: CanonicalStreamEvent::Finish {
+                        finish_reason: Some("tool_calls".to_string()),
+                        usage: None,
+                    },
+                })
+                .expect("finish should close read tool block"),
+        );
+
         let sse = String::from_utf8(bytes).expect("sse should be utf8");
         assert!(sse.contains("\"partial_json\":\"{\\\"file_path\\\":\\\"/tmp/a.txt\\\",\\\"offset\\\":1,\\\"limit\\\":20}\""));
         assert!(!sse.contains("\\\"pages\\\":\\\"\\\""));
+    }
+
+    #[test]
+    fn claude_client_emitter_preserves_empty_pages_for_other_tool_arguments() {
+        let mut emitter = ClaudeClientEmitter::default();
+        let mut bytes = emitter
+            .emit(CanonicalStreamFrame {
+                id: "msg_123".to_string(),
+                model: "claude-sonnet-4-5".to_string(),
+                event: CanonicalStreamEvent::ToolCallStart {
+                    index: 0,
+                    call_id: "toolu_search".to_string(),
+                    name: "Search".to_string(),
+                },
+            })
+            .expect("tool start should encode");
+        bytes.extend(
+            emitter
+                .emit(CanonicalStreamFrame {
+                    id: "msg_123".to_string(),
+                    model: "claude-sonnet-4-5".to_string(),
+                    event: CanonicalStreamEvent::ToolCallArgumentsDelta {
+                        index: 0,
+                        arguments: r#"{"query":"","pages":""}"#.to_string(),
+                    },
+                })
+                .expect("tool delta should encode"),
+        );
+
+        let sse = String::from_utf8(bytes).expect("sse should be utf8");
+        assert!(
+            sse.contains("\"partial_json\":\"{\\\"query\\\":\\\"\\\",\\\"pages\\\":\\\"\\\"}\"")
+        );
     }
 
     #[test]
@@ -1330,18 +1410,47 @@ mod tests {
                         cache_creation_ephemeral_5m_tokens: 13,
                         cache_creation_ephemeral_1h_tokens: 17,
                         cache_read_tokens: 19,
-                        ..Default::default()
+                        ..CanonicalUsage::default()
                     }),
                 },
             })
             .expect("finish should encode");
 
         let sse = String::from_utf8(bytes).expect("sse should be utf8");
+        assert!(sse.contains("\"input_tokens\":5"));
         assert!(sse.contains("\"cache_read_input_tokens\":19"));
         assert!(sse.contains("\"cache_creation_input_tokens\":11"));
         assert!(sse.contains("\"cache_creation\":{"));
         assert!(sse.contains("\"ephemeral_5m_input_tokens\":13"));
         assert!(sse.contains("\"ephemeral_1h_input_tokens\":17"));
+    }
+
+    #[test]
+    fn claude_client_emitter_subtracts_cache_when_input_tokens_include_cache() {
+        let mut emitter = ClaudeClientEmitter::default();
+        let bytes = emitter
+            .emit(CanonicalStreamFrame {
+                id: "msg_cache".to_string(),
+                model: "claude-sonnet-4-5".to_string(),
+                event: CanonicalStreamEvent::Finish {
+                    finish_reason: Some("stop".to_string()),
+                    usage: Some(CanonicalUsage {
+                        input_tokens: 110_161,
+                        input_tokens_include_cache: true,
+                        output_tokens: 691,
+                        total_tokens: 110_852,
+                        cache_read_tokens: 107_008,
+                        reasoning_tokens: 516,
+                        ..CanonicalUsage::default()
+                    }),
+                },
+            })
+            .expect("finish should encode");
+
+        let sse = String::from_utf8(bytes).expect("sse should be utf8");
+        assert!(sse.contains("\"input_tokens\":3153"));
+        assert!(sse.contains("\"cache_read_input_tokens\":107008"));
+        assert!(sse.contains("\"output_tokens\":691"));
     }
 
     #[test]

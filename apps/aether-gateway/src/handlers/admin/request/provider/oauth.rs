@@ -18,8 +18,7 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use url::Url;
 
-const KIRO_IDC_AMZ_USER_AGENT: &str =
-    "aws-sdk-js/3.738.0 ua/2.1 os/other lang/js md/browser#unknown_unknown api/sso-oidc#3.738.0 m/E KiroIDE";
+const KIRO_IDC_AMZ_USER_AGENT: &str = "aws-sdk-js/3.738.0 ua/2.1 os/other lang/js md/browser#unknown_unknown api/sso-oidc#3.738.0 m/E KiroIDE";
 const ADMIN_PROVIDER_OAUTH_TIMEOUT_MS: u64 = 30_000;
 const ADMIN_PROVIDER_OAUTH_PROXY_TIMEOUT_MS: u64 = 60_000;
 
@@ -663,10 +662,5 @@ fn admin_provider_oauth_decode_response_bytes(
 }
 
 fn admin_provider_oauth_gateway_error_message(error: GatewayError) -> String {
-    match error {
-        GatewayError::UpstreamUnavailable { message, .. }
-        | GatewayError::ControlUnavailable { message, .. }
-        | GatewayError::Client { message, .. }
-        | GatewayError::Internal(message) => message,
-    }
+    error.into_message()
 }

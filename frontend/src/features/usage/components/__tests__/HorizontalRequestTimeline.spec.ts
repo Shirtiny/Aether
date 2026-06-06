@@ -4,6 +4,14 @@ import { createApp, defineComponent, h, nextTick, type App } from 'vue'
 import type { CandidateRecord, RequestTrace } from '@/api/requestTrace'
 import HorizontalRequestTimeline from '../HorizontalRequestTimeline.vue'
 
+const requestTraceApiMock = vi.hoisted(() => ({
+  getRequestTrace: vi.fn(),
+}))
+
+vi.mock('@/api/requestTrace', () => ({
+  requestTraceApi: requestTraceApiMock,
+}))
+
 vi.mock('@/components/ui/card.vue', async () => {
   const { defineComponent, h } = await import('vue')
   return {
@@ -75,6 +83,7 @@ vi.mock('lucide-vue-next', async () => {
 })
 
 const mountedApps: Array<{ app: App, root: HTMLElement }> = []
+type TimelineExpose = { refresh: () => Promise<void> | undefined }
 
 function buildCandidate(overrides: Partial<CandidateRecord> = {}): CandidateRecord {
   return {
@@ -105,6 +114,13 @@ function buildTrace(candidates: CandidateRecord[]): RequestTrace {
   }
 }
 
+async function flushPendingUpdates() {
+  await Promise.resolve()
+  await nextTick()
+  await Promise.resolve()
+  await nextTick()
+}
+
 function mountTimeline(
   traceData: RequestTrace,
   extraProps: Record<string, unknown> = {},
@@ -121,7 +137,39 @@ function mountTimeline(
   return root
 }
 
+function mountTimelineFromApi(
+  requestId: string,
+  extraProps: Record<string, unknown> = {},
+) {
+  const root = document.createElement('div')
+  document.body.appendChild(root)
+  let timeline: TimelineExpose | null = null
+  const Host = defineComponent({
+    setup() {
+      return () => h(HorizontalRequestTimeline, {
+        ref: (value: unknown) => {
+          timeline = value as TimelineExpose | null
+        },
+        requestId,
+        ...extraProps,
+      })
+    },
+  })
+  const app = createApp(Host)
+  app.mount(root)
+  mountedApps.push({ app, root })
+  return {
+    root,
+    refresh: async () => {
+      await timeline?.refresh()
+      await flushPendingUpdates()
+    },
+  }
+}
+
 afterEach(() => {
+  requestTraceApiMock.getRequestTrace.mockReset()
+  vi.useRealTimers()
   for (const { app, root } of mountedApps.splice(0)) {
     app.unmount()
     root.remove()
@@ -255,6 +303,46 @@ describe('HorizontalRequestTimeline', () => {
     const nodeDots = [...root.querySelectorAll<HTMLElement>('.node-dot')]
     expect(nodeDots[0].classList.contains('status-available')).toBe(true)
     expect(nodeDots[2].classList.contains('status-pending')).toBe(true)
+  })
+
+  it('keeps successful runtime pool key visible when only pool_key_index is recorded', async () => {
+    const trace = buildTrace([
+      buildCandidate({
+        id: 'pool-skipped',
+        provider_id: 'provider-pool',
+        provider_name: 'CodexFree2',
+        key_id: 'pool-group',
+        key_name: 'CodexFree2',
+        candidate_index: 0,
+        status: 'skipped',
+        started_at: undefined,
+        finished_at: undefined,
+        extra_data: { pool_group_id: 'provider-pool' },
+      }),
+      buildCandidate({
+        id: 'pool-success',
+        provider_id: 'provider-pool',
+        provider_name: 'CodexFree2',
+        key_id: 'key-success',
+        key_name: 'Success Key',
+        candidate_index: 1,
+        status: 'success',
+        extra_data: { pool_key_index: 0 },
+      }),
+    ])
+
+    const root = mountTimeline(trace)
+    await nextTick()
+
+    const labels = [...root.querySelectorAll<HTMLElement>('.node-label')]
+      .map(label => label.textContent?.trim())
+    expect(labels).toEqual(['CodexFree2'])
+    expect(root.querySelector<HTMLElement>('.node-dot')?.classList.contains('status-success'))
+      .toBe(true)
+    expect([...root.querySelectorAll<HTMLButtonElement>('.sub-dot')]
+      .map(dot => dot.getAttribute('title'))).toEqual([
+      '#1 · Success Key · 成功',
+    ])
   })
 
   it('uses candidate terminal status for node colors instead of overriding with HTTP code', async () => {
@@ -480,5 +568,116 @@ describe('HorizontalRequestTimeline', () => {
     expect(root.textContent).not.toContain('none')
     expect(root.textContent).not.toContain('不再重试')
     expect(root.textContent).not.toContain('该错误被标记为敏感上游错误')
+  })
+
+  it('keeps the failure message when upstream response only records an empty body state', async () => {
+    const trace = buildTrace([
+      buildCandidate({
+        id: 'cand-empty-body-state',
+        provider_id: 'provider-empty-body-state',
+        provider_name: 'Provider Empty Body State',
+        key_id: 'key-empty-body-state',
+        key_name: 'Empty Body State Key',
+        candidate_index: 0,
+        status: 'failed',
+        error_type: 'stream_missing_terminal_event',
+        error_message: 'execution runtime stream ended before provider terminal event',
+        extra_data: {
+          upstream_response: {
+            body_state: 'none',
+          },
+        },
+      }),
+    ])
+
+    const root = mountTimeline(trace)
+    await nextTick()
+
+    expect(root.textContent).toContain('错误信息')
+    expect(root.textContent).toContain('execution runtime stream ended before provider terminal event')
+    expect(root.querySelector('.error-block .error-json')).toBeNull()
+    expect(root.textContent).not.toContain('"body_state":"none"')
+  })
+
+  it('falls back to key id while an active candidate is missing key name', async () => {
+    const trace = buildTrace([
+      buildCandidate({
+        id: 'cand-active-key-id',
+        provider_id: 'provider-active',
+        provider_name: 'Provider Active',
+        key_id: 'key-active-id',
+        key_name: undefined,
+        candidate_index: 0,
+        status: 'pending',
+        finished_at: undefined,
+      }),
+    ])
+    trace.final_status = 'pending'
+
+    const root = mountTimeline(trace)
+    await nextTick()
+
+    const detailText = root.querySelector('.detail-panel')?.textContent ?? ''
+    expect(detailText).toContain('key-active-id')
+    expect(detailText).not.toContain('未知')
+  })
+
+  it('follows the active key when silent polling updates the trace', async () => {
+    const initialTrace = buildTrace([
+      buildCandidate({
+        id: 'cand-available-a',
+        provider_id: 'provider-a',
+        provider_name: 'Provider A',
+        key_id: 'key-a',
+        key_name: 'Available Key',
+        candidate_index: 0,
+        status: 'available',
+        started_at: undefined,
+        finished_at: undefined,
+      }),
+      buildCandidate({
+        id: 'cand-available-b',
+        provider_id: 'provider-b',
+        provider_name: 'Provider B',
+        key_id: 'key-b',
+        key_name: 'Streaming Key',
+        candidate_index: 1,
+        status: 'available',
+        started_at: undefined,
+        finished_at: undefined,
+      }),
+    ])
+    initialTrace.final_status = 'pending'
+
+    const activeTrace = buildTrace([
+      initialTrace.candidates[0],
+      buildCandidate({
+        id: 'cand-streaming-b',
+        provider_id: 'provider-b',
+        provider_name: 'Provider B',
+        key_id: 'key-b',
+        key_name: 'Streaming Key',
+        candidate_index: 1,
+        status: 'pending',
+        started_at: '2026-05-06T12:00:02.000Z',
+        finished_at: undefined,
+      }),
+    ])
+    activeTrace.final_status = 'streaming'
+
+    requestTraceApiMock.getRequestTrace.mockResolvedValueOnce(initialTrace)
+    const { root, refresh } = mountTimelineFromApi('req-1', {
+      requestStatus: 'streaming',
+    })
+    await flushPendingUpdates()
+
+    expect(root.querySelector('.detail-panel')?.textContent).toContain('Available Key')
+
+    requestTraceApiMock.getRequestTrace.mockResolvedValueOnce(activeTrace)
+    await refresh()
+
+    const detailText = root.querySelector('.detail-panel')?.textContent ?? ''
+    expect(detailText).toContain('Streaming Key')
+    expect(detailText).toContain('进行中')
   })
 })

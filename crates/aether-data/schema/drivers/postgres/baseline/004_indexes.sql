@@ -126,6 +126,14 @@ CREATE INDEX IF NOT EXISTS idx_provider_api_keys_provider_active ON public.provi
 
 
 --
+-- Name: idx_provider_api_keys_provider_default_sort; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX IF NOT EXISTS idx_provider_api_keys_provider_default_sort ON public.provider_api_keys USING btree (provider_id, internal_priority, name, id);
+
+
+
+--
 -- Name: idx_provider_api_keys_provider_created_at_desc; Type: INDEX; Schema: public; Owner: -
 --
 

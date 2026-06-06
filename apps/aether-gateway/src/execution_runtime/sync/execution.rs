@@ -3,7 +3,11 @@ use std::io::Error as IoError;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use aether_contracts::{ExecutionPlan, ExecutionResult, ExecutionTelemetry};
+use aether_ai_serving::UPSTREAM_IS_STREAM_KEY;
+use aether_contracts::{
+    ExecutionError, ExecutionErrorKind, ExecutionPhase, ExecutionPlan, ExecutionResult,
+    ExecutionTelemetry,
+};
 use aether_data_contracts::repository::candidates::RequestCandidateStatus;
 use aether_scheduler_core::{
     execution_error_details, parse_request_candidate_report_context,
@@ -11,13 +15,12 @@ use aether_scheduler_core::{
 };
 use aether_usage_runtime::{
     build_lifecycle_usage_seed, build_sync_terminal_usage_payload_seed,
-    build_terminal_usage_context_seed,
+    build_terminal_usage_context_seed, build_usage_event_data_seed, UsageEvent, UsageEventType,
 };
 use async_stream::stream;
 use axum::body::{to_bytes, Body, Bytes};
 use axum::http::header::{CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE};
 use axum::http::{HeaderName, HeaderValue, Response, StatusCode};
-use base64::Engine as _;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
@@ -26,7 +29,8 @@ use tokio::time::MissedTickBehavior;
 use tracing::{debug, warn};
 
 use crate::ai_serving::api::{
-    implicit_sync_finalize_report_kind, maybe_build_sync_finalize_outcome,
+    build_core_error_body_for_client_format, extract_provider_private_stream_error_body,
+    implicit_sync_finalize_report_kind, maybe_build_sync_finalize_outcome, LocalCoreSyncErrorKind,
     LocalCoreSyncFinalizeOutcome,
 };
 use crate::api::response::{
@@ -36,15 +40,26 @@ use crate::api::response::{
 use crate::clock::current_unix_ms as current_request_candidate_unix_ms;
 use crate::control::GatewayControlDecision;
 use crate::execution_runtime::chatgpt_web_image::maybe_execute_chatgpt_web_image_sync;
+use crate::execution_runtime::grok::maybe_execute_grok_sync;
+use crate::execution_runtime::kiro_cache::{
+    build_kiro_prompt_cache_profile, compute_kiro_prompt_cache_usage,
+    estimate_kiro_prompt_input_tokens, kiro_simulated_cache_enabled_from_provider_config,
+    kiro_simulated_cache_enabled_from_report_context, KiroPromptCacheUsage,
+    KIRO_SIMULATED_CACHE_ENABLED_CONTEXT_FIELD,
+};
 use crate::execution_runtime::oauth_retry::refresh_oauth_plan_auth_for_retry;
 #[cfg(test)]
 use crate::execution_runtime::remote_compat::post_sync_plan_to_remote_execution_runtime;
-use crate::execution_runtime::submission::submit_local_core_error_or_sync_finalize;
+use crate::execution_runtime::submission::{
+    resolve_local_sync_error_status_code, submit_local_core_error_or_sync_finalize,
+};
 use crate::execution_runtime::transport::{
-    build_request_body, collect_response_headers, decode_response_body_bytes,
-    response_body_is_json, send_request, DirectSyncExecutionRuntime,
+    build_execution_response_body, build_request_body, collect_response_headers,
+    decode_response_body_bytes, format_upstream_request_error, format_wreq_upstream_request_error,
+    response_body_is_json, send_request, DirectHttpResponse, DirectSyncExecutionRuntime,
     ExecutionRuntimeTransportError,
 };
+use crate::execution_runtime::windsurf::maybe_execute_windsurf_sync;
 use crate::execution_runtime::{
     analyze_local_candidate_failover_sync, apply_endpoint_response_header_rules,
     attach_provider_response_headers_to_report_context, local_failover_response_text,
@@ -96,6 +111,158 @@ struct SyncExecutionFailure {
     latency_ms: Option<u64>,
 }
 
+struct SyncAttemptTerminalGuard {
+    state: AppState,
+    plan: ExecutionPlan,
+    report_context: Option<Value>,
+    candidate_started_unix_ms: u64,
+    armed: bool,
+}
+
+impl SyncAttemptTerminalGuard {
+    fn new(
+        state: &AppState,
+        plan: &ExecutionPlan,
+        report_context: Option<Value>,
+        candidate_started_unix_ms: u64,
+    ) -> Self {
+        Self {
+            state: state.clone(),
+            plan: plan.clone(),
+            report_context,
+            candidate_started_unix_ms,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    async fn fail_and_disarm(&mut self, error: &GatewayError) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        record_sync_attempt_forced_terminal_state(
+            self.state.clone(),
+            self.plan.clone(),
+            self.report_context.clone(),
+            self.candidate_started_unix_ms,
+            UsageEventType::Failed,
+            RequestCandidateStatus::Failed,
+            StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+            "local_sync_attempt_aborted",
+            format!("Local sync attempt failed before terminal finalization: {error:?}"),
+        )
+        .await;
+    }
+}
+
+impl Drop for SyncAttemptTerminalGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        let state = self.state.clone();
+        let plan = self.plan.clone();
+        let report_context = self.report_context.clone();
+        let candidate_started_unix_ms = self.candidate_started_unix_ms;
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                record_sync_attempt_forced_terminal_state(
+                    state,
+                    plan,
+                    report_context,
+                    candidate_started_unix_ms,
+                    UsageEventType::Cancelled,
+                    RequestCandidateStatus::Cancelled,
+                    499,
+                    "local_sync_attempt_cancelled",
+                    "Local sync attempt was dropped before terminal finalization, usually because the client disconnected or the request task was cancelled.",
+                )
+                .await;
+            });
+        } else {
+            warn!(
+                event_name = "local_sync_attempt_terminal_guard_no_runtime",
+                log_type = "ops",
+                request_id = %short_request_id(self.plan.request_id.as_str()),
+                candidate_id = ?self.plan.candidate_id,
+                "gateway could not finalize dropped local sync attempt because no Tokio runtime is available"
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn record_sync_attempt_forced_terminal_state(
+    state: AppState,
+    plan: ExecutionPlan,
+    report_context: Option<Value>,
+    candidate_started_unix_ms: u64,
+    usage_event_type: UsageEventType,
+    candidate_status: RequestCandidateStatus,
+    status_code: u16,
+    error_type: &'static str,
+    error_message: impl Into<String>,
+) {
+    let error_message = error_message.into();
+    let terminal_unix_ms = current_request_candidate_unix_ms();
+    let latency_ms = terminal_unix_ms.saturating_sub(candidate_started_unix_ms);
+    record_local_request_candidate_status(
+        &state,
+        &plan,
+        report_context.as_ref(),
+        SchedulerRequestCandidateStatusUpdate {
+            status: candidate_status,
+            status_code: Some(status_code),
+            error_type: Some(error_type.to_string()),
+            error_message: Some(error_message.clone()),
+            latency_ms: Some(latency_ms),
+            started_at_unix_ms: Some(candidate_started_unix_ms),
+            finished_at_unix_ms: Some(terminal_unix_ms),
+        },
+    )
+    .await;
+
+    if !state.usage_runtime.is_enabled() {
+        return;
+    }
+
+    let mut usage_data = build_usage_event_data_seed(&plan, report_context.as_ref());
+    usage_data.status_code = Some(status_code);
+    usage_data.error_message = Some(error_message.clone());
+    usage_data.error_category = Some(
+        match usage_event_type {
+            UsageEventType::Cancelled => "cancelled",
+            _ => "server_error",
+        }
+        .to_string(),
+    );
+    usage_data.response_time_ms = Some(latency_ms);
+    let error_body = json!({
+        "error": {
+            "type": error_type,
+            "message": error_message,
+            "code": status_code
+        }
+    });
+    usage_data.response_headers = Some(json!({"content-type": "application/json"}));
+    usage_data.response_body = Some(error_body.clone());
+    usage_data.client_response_headers = Some(json!({"content-type": "application/json"}));
+    usage_data.client_response_body = Some(error_body);
+
+    state
+        .usage_runtime
+        .record_terminal_event_direct(
+            state.data.as_ref(),
+            UsageEvent::new(usage_event_type, plan.request_id.clone(), usage_data),
+        )
+        .await;
+}
+
 impl SyncExecutionFailure {
     fn from_transport(err: ExecutionRuntimeTransportError) -> Self {
         Self {
@@ -134,6 +301,17 @@ fn record_sync_terminal_usage(
     state
         .usage_runtime
         .record_sync_terminal(state.data.as_ref(), context_seed, payload_seed);
+}
+
+fn record_sync_terminal_usage_and_disarm_guard(
+    state: &AppState,
+    plan: &ExecutionPlan,
+    report_context: Option<&serde_json::Value>,
+    payload: &GatewaySyncReportRequest,
+    terminal_guard: &mut SyncAttemptTerminalGuard,
+) {
+    record_sync_terminal_usage(state, plan, report_context, payload);
+    terminal_guard.disarm();
 }
 
 fn with_sync_error_trace_context(
@@ -181,6 +359,276 @@ fn build_sync_report_payload(
         body_base64,
         telemetry,
     }
+}
+
+fn seed_kiro_sync_report_context_input_tokens(
+    plan: &ExecutionPlan,
+    report_context: &mut Option<Value>,
+) {
+    if !plan
+        .provider_name
+        .as_deref()
+        .is_some_and(|provider_name| provider_name.eq_ignore_ascii_case("Kiro"))
+    {
+        return;
+    }
+
+    let Some(context) = report_context.as_mut().and_then(Value::as_object_mut) else {
+        return;
+    };
+    if context
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .is_some_and(|input_tokens| input_tokens > 0)
+    {
+        return;
+    }
+
+    let Some(original_request_body) = context.get("original_request_body").cloned() else {
+        return;
+    };
+    let estimated_input_tokens = estimate_kiro_prompt_input_tokens(&original_request_body);
+    context.insert(
+        "input_tokens".to_string(),
+        Value::from(estimated_input_tokens),
+    );
+}
+
+async fn seed_kiro_sync_simulated_cache_enabled(
+    state: &AppState,
+    plan: &ExecutionPlan,
+    report_context: &mut Option<Value>,
+) {
+    if !plan
+        .provider_name
+        .as_deref()
+        .is_some_and(|provider_name| provider_name.eq_ignore_ascii_case("Kiro"))
+    {
+        return;
+    }
+
+    let enabled = match state
+        .read_provider_catalog_providers_by_ids(std::slice::from_ref(&plan.provider_id))
+        .await
+    {
+        Ok(providers) => providers
+            .iter()
+            .find(|provider| provider.id == plan.provider_id)
+            .filter(|provider| provider.provider_type.eq_ignore_ascii_case("kiro"))
+            .is_some_and(|provider| {
+                kiro_simulated_cache_enabled_from_provider_config(provider.config.as_ref())
+            }),
+        Err(err) => {
+            warn!(
+                event_name = "kiro_simulated_cache_config_read_failed",
+                log_type = "event",
+                request_id = %plan.request_id,
+                provider_id = %plan.provider_id,
+                error = ?err,
+                "failed to read Kiro simulated cache provider config; defaulting disabled"
+            );
+            false
+        }
+    };
+
+    let Some(context) = report_context.as_mut().and_then(Value::as_object_mut) else {
+        return;
+    };
+    if enabled {
+        context.insert(
+            KIRO_SIMULATED_CACHE_ENABLED_CONTEXT_FIELD.to_string(),
+            Value::Bool(true),
+        );
+    } else {
+        context.remove(KIRO_SIMULATED_CACHE_ENABLED_CONTEXT_FIELD);
+    }
+}
+
+async fn seed_kiro_sync_report_context_prompt_cache_usage(
+    state: &AppState,
+    plan: &ExecutionPlan,
+    report_context: &mut Option<Value>,
+) {
+    if !plan
+        .provider_name
+        .as_deref()
+        .is_some_and(|provider_name| provider_name.eq_ignore_ascii_case("Kiro"))
+    {
+        return;
+    }
+
+    let simulated_cache_enabled =
+        kiro_simulated_cache_enabled_from_report_context(report_context.as_ref());
+    let Some(context) = report_context.as_mut().and_then(Value::as_object_mut) else {
+        return;
+    };
+    if context
+        .get("kiro_web_search_mcp")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return;
+    }
+    if !simulated_cache_enabled {
+        return;
+    }
+    if kiro_cache_usage_from_context_object(context).is_some() {
+        return;
+    }
+
+    let Some(original_request_body) = context.get("original_request_body").cloned() else {
+        return;
+    };
+    let input_tokens = context
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| {
+            let estimated = estimate_kiro_prompt_input_tokens(&original_request_body);
+            context.insert("input_tokens".to_string(), Value::from(estimated));
+            estimated
+        });
+    let Some(profile) = build_kiro_prompt_cache_profile(&original_request_body, input_tokens)
+    else {
+        return;
+    };
+
+    let cache_usage = compute_kiro_prompt_cache_usage(
+        state.runtime_state(),
+        kiro_sync_cache_credential_id(plan),
+        &profile,
+    )
+    .await;
+    if cache_usage.cache_creation_input_tokens == 0 && cache_usage.cache_read_input_tokens == 0 {
+        return;
+    }
+    context.insert(
+        "cache_creation_input_tokens".to_string(),
+        Value::from(cache_usage.cache_creation_input_tokens),
+    );
+    context.insert(
+        "cache_read_input_tokens".to_string(),
+        Value::from(cache_usage.cache_read_input_tokens),
+    );
+}
+
+fn kiro_sync_cache_credential_id(plan: &ExecutionPlan) -> String {
+    format!("{}:{}:{}", plan.provider_id, plan.endpoint_id, plan.key_id)
+}
+
+fn kiro_cache_usage_from_context_object(
+    context: &serde_json::Map<String, Value>,
+) -> Option<KiroPromptCacheUsage> {
+    let cache_creation_input_tokens = context
+        .get("cache_creation_input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cache_read_input_tokens = context
+        .get("cache_read_input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    (cache_creation_input_tokens > 0 || cache_read_input_tokens > 0).then_some(
+        KiroPromptCacheUsage {
+            cache_creation_input_tokens,
+            cache_read_input_tokens,
+        },
+    )
+}
+
+fn invalid_gemini_provider_success_message(
+    plan: &ExecutionPlan,
+    report_context: Option<&Value>,
+    status_code: u16,
+    body_json: Option<&Value>,
+) -> Option<&'static str> {
+    if status_code >= 400 {
+        return None;
+    }
+    let provider_api_format = report_context
+        .and_then(|value| value.get("provider_api_format"))
+        .and_then(Value::as_str)
+        .unwrap_or(plan.provider_api_format.as_str());
+    if crate::ai_serving::normalize_api_format_alias(provider_api_format)
+        != "gemini:generate_content"
+    {
+        return None;
+    }
+    let body_json = body_json?;
+    if body_json
+        .as_object()
+        .is_some_and(|object| object.get("error").is_some_and(|error| !error.is_null()))
+    {
+        return None;
+    }
+    let normalized_body_json = report_context
+        .filter(|context| {
+            context
+                .get("has_envelope")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        })
+        .and_then(|context| {
+            crate::ai_serving::normalize_provider_private_response_value(body_json.clone(), context)
+        });
+    let body_json = normalized_body_json.as_ref().unwrap_or(body_json);
+    if crate::ai_serving::gemini_generate_content_response_has_visible_output(body_json) {
+        return None;
+    }
+    Some("Provider returned HTTP 200 but the Gemini response did not contain visible model output; refusing to finalize it as a successful response.")
+}
+
+fn build_invalid_provider_success_body(
+    plan: &ExecutionPlan,
+    report_context: Option<&Value>,
+    message: &str,
+) -> Option<Value> {
+    let client_api_format = report_context
+        .and_then(|value| value.get("client_api_format"))
+        .and_then(Value::as_str)
+        .unwrap_or(plan.client_api_format.as_str());
+    build_core_error_body_for_client_format(
+        client_api_format,
+        message,
+        Some("invalid_provider_success_response"),
+        LocalCoreSyncErrorKind::ServerError,
+    )
+}
+
+fn provider_private_error_details(body_json: &Value) -> (Option<String>, Option<String>) {
+    let body_object = body_json.as_object();
+    let error_object = body_object
+        .and_then(|object| object.get("error"))
+        .and_then(Value::as_object);
+    let error_type =
+        first_non_empty_error_text(error_object, body_object, &["type", "code", "status"]);
+    let error_message = first_non_empty_error_text(
+        error_object,
+        body_object,
+        &["message", "detail", "reason", "status", "type", "code"],
+    );
+    (error_type, error_message)
+}
+
+fn first_non_empty_error_text(
+    error_object: Option<&serde_json::Map<String, Value>>,
+    body_object: Option<&serde_json::Map<String, Value>>,
+    keys: &[&str],
+) -> Option<String> {
+    for object in [error_object, body_object].into_iter().flatten() {
+        for key in keys {
+            let Some(value) = object.get(*key) else {
+                continue;
+            };
+            match value {
+                Value::String(text) if !text.trim().is_empty() => {
+                    return Some(text.trim().to_string());
+                }
+                Value::Number(number) => return Some(number.to_string()),
+                _ => {}
+            }
+        }
+    }
+    None
 }
 
 #[derive(Debug, Clone)]
@@ -573,6 +1021,12 @@ async fn execute_direct_sync_runtime_candidate(
     candidate_index: &str,
     progress_snapshot: Option<Arc<Mutex<OpenAiImageSyncProgressSnapshot>>>,
 ) -> Result<ExecutionResult, SyncExecutionFailure> {
+    if let Some(result) = maybe_execute_windsurf_sync(state, plan, report_context)
+        .await
+        .map_err(SyncExecutionFailure::from_transport)?
+    {
+        return Ok(result);
+    }
     if !should_track_openai_image_sync_upstream_sse(plan_kind, plan, report_context) {
         return DirectSyncExecutionRuntime::new()
             .execute_sync(plan)
@@ -682,23 +1136,46 @@ async fn execute_openai_image_sync_upstream_sse_candidate(
         .await
         .map_err(SyncExecutionFailure::from_transport)?;
     let ttfb_ms = started_at.elapsed().as_millis() as u64;
-    let status_code = response.status().as_u16();
-    let headers = collect_response_headers(response.headers());
+    let status_code = response.status_code();
+    let headers = response.headers();
     progress.record_response_started(status_code, ttfb_ms).await;
 
-    let mut upstream_stream = response.bytes_stream();
     let mut body_bytes = Vec::new();
-    while let Some(chunk) = upstream_stream.next().await {
-        let chunk = chunk.map_err(|err| {
-            SyncExecutionFailure::from_transport(ExecutionRuntimeTransportError::UpstreamRequest(
-                crate::execution_runtime::transport::format_upstream_request_error(&err),
-            ))
-        })?;
-        let elapsed_ms = started_at.elapsed().as_millis() as u64;
-        progress
-            .observe_chunk(&chunk, status_code, elapsed_ms)
-            .await;
-        body_bytes.extend_from_slice(&chunk);
+    match response {
+        DirectHttpResponse::Reqwest(response) => {
+            let mut upstream_stream = response.bytes_stream();
+            while let Some(chunk) = upstream_stream.next().await {
+                let chunk = chunk.map_err(|err| {
+                    SyncExecutionFailure::from_transport(
+                        ExecutionRuntimeTransportError::UpstreamRequest(
+                            format_upstream_request_error(&err),
+                        ),
+                    )
+                })?;
+                let elapsed_ms = started_at.elapsed().as_millis() as u64;
+                progress
+                    .observe_chunk(&chunk, status_code, elapsed_ms)
+                    .await;
+                body_bytes.extend_from_slice(&chunk);
+            }
+        }
+        DirectHttpResponse::BrowserWreq(response) => {
+            let mut upstream_stream = response.bytes_stream();
+            while let Some(chunk) = upstream_stream.next().await {
+                let chunk = chunk.map_err(|err| {
+                    SyncExecutionFailure::from_transport(
+                        ExecutionRuntimeTransportError::UpstreamRequest(
+                            format_wreq_upstream_request_error(&err),
+                        ),
+                    )
+                })?;
+                let elapsed_ms = started_at.elapsed().as_millis() as u64;
+                progress
+                    .observe_chunk(&chunk, status_code, elapsed_ms)
+                    .await;
+                body_bytes.extend_from_slice(&chunk);
+            }
+        }
     }
 
     let decoded_body_bytes =
@@ -707,27 +1184,9 @@ async fn execute_openai_image_sync_upstream_sse_candidate(
     let upstream_bytes = body_bytes.len() as u64;
     progress.finish(status_code, elapsed_ms).await;
 
-    let body = if body_bytes.is_empty() {
-        None
-    } else if plan.stream {
-        Some(aether_contracts::ResponseBody {
-            json_body: None,
-            body_bytes_b64: Some(base64::engine::general_purpose::STANDARD.encode(&body_bytes)),
-        })
-    } else if response_body_is_json(&headers, &decoded_body_bytes) {
-        let body_json: Value = serde_json::from_slice(&decoded_body_bytes)
-            .map_err(ExecutionRuntimeTransportError::InvalidJson)
+    let body =
+        build_execution_response_body(&headers, &body_bytes, &decoded_body_bytes, plan.stream)
             .map_err(SyncExecutionFailure::from_transport)?;
-        Some(aether_contracts::ResponseBody {
-            json_body: Some(body_json),
-            body_bytes_b64: None,
-        })
-    } else {
-        Some(aether_contracts::ResponseBody {
-            json_body: None,
-            body_bytes_b64: Some(base64::engine::general_purpose::STANDARD.encode(&body_bytes)),
-        })
-    };
 
     Ok(ExecutionResult {
         request_id: plan.request_id.clone(),
@@ -767,7 +1226,7 @@ fn resolve_openai_image_sync_total_timeout_ms(plan: &ExecutionPlan) -> u64 {
 
 fn report_context_upstream_is_stream(report_context: Option<&Value>) -> bool {
     report_context
-        .and_then(|value| value.get("upstream_is_stream"))
+        .and_then(|value| value.get(UPSTREAM_IS_STREAM_KEY))
         .and_then(Value::as_bool)
         .unwrap_or(false)
 }
@@ -903,10 +1362,16 @@ fn build_json_whitespace_heartbeat_stream(
     }
 }
 
-pub(crate) fn build_openai_image_sync_json_whitespace_heartbeat_stream(
+pub(crate) fn build_sync_json_whitespace_heartbeat_stream(
     rx: mpsc::Receiver<Result<Bytes, IoError>>,
 ) -> impl futures_util::Stream<Item = Result<Bytes, IoError>> + Send + 'static {
     build_json_whitespace_heartbeat_stream(rx, OPENAI_IMAGE_SYNC_JSON_HEARTBEAT_INTERVAL, None)
+}
+
+pub(crate) fn build_openai_image_sync_json_whitespace_heartbeat_stream(
+    rx: mpsc::Receiver<Result<Bytes, IoError>>,
+) -> impl futures_util::Stream<Item = Result<Bytes, IoError>> + Send + 'static {
+    build_sync_json_whitespace_heartbeat_stream(rx)
 }
 
 async fn openai_image_sync_json_heartbeat_final_bytes(
@@ -1067,6 +1532,13 @@ async fn execute_execution_runtime_sync_impl(
         },
     )
     .await;
+    let mut terminal_guard = SyncAttemptTerminalGuard::new(
+        state,
+        &plan,
+        report_context.clone(),
+        candidate_started_unix_secs,
+    );
+    let result = (async {
     let _provider_pool_in_flight_guard = acquire_provider_pool_in_flight_guard(
         state.runtime_state.clone(),
         &plan.provider_id,
@@ -1077,64 +1549,106 @@ async fn execute_execution_runtime_sync_impl(
     .await;
     #[cfg(not(test))]
     let mut result = {
-        match maybe_execute_chatgpt_web_image_sync(state, &plan, report_context.as_ref()).await {
+        match maybe_execute_grok_sync(&plan, report_context.as_ref()).await {
             Ok(Some(result)) => result,
-            Ok(None) => match execute_direct_sync_runtime_candidate(
-                state,
-                &plan,
-                report_context.as_ref(),
-                trace_id,
-                plan_kind,
-                plan_request_id_for_log.as_str(),
-                plan_candidate_id.as_deref(),
-                provider_name.as_str(),
-                endpoint_id.as_str(),
-                key_id.as_str(),
-                model_name.as_str(),
-                candidate_index.as_str(),
-                progress_snapshot.clone(),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(err) => {
-                    warn!(
-                        event_name = "sync_execution_runtime_unavailable",
-                        log_type = "ops",
-                        trace_id = %trace_id,
-                        request_id = %plan_request_id_for_log,
-                        candidate_id = ?plan_candidate_id,
-                        provider_name,
-                        endpoint_id,
-                        key_id,
-                        model_name,
-                        candidate_index = candidate_index.as_str(),
-                        error_type = err.error_type,
-                        error = %err.message,
-                        "gateway in-process sync execution unavailable"
-                    );
-                    let terminal_unix_secs = current_request_candidate_unix_ms();
-                    record_local_request_candidate_status(
+            Ok(None) => {
+                match maybe_execute_chatgpt_web_image_sync(state, &plan, report_context.as_ref())
+                    .await
+                {
+                    Ok(Some(result)) => result,
+                    Ok(None) => match execute_direct_sync_runtime_candidate(
                         state,
                         &plan,
                         report_context.as_ref(),
-                        SchedulerRequestCandidateStatusUpdate {
-                            status: RequestCandidateStatus::Failed,
-                            status_code: err.status_code,
-                            error_type: Some(err.error_type.to_string()),
-                            error_message: Some(err.message),
-                            latency_ms: err.latency_ms,
-                            started_at_unix_ms: Some(candidate_started_unix_secs),
-                            finished_at_unix_ms: Some(terminal_unix_secs),
-                        },
+                        trace_id,
+                        plan_kind,
+                        plan_request_id_for_log.as_str(),
+                        plan_candidate_id.as_deref(),
+                        provider_name.as_str(),
+                        endpoint_id.as_str(),
+                        key_id.as_str(),
+                        model_name.as_str(),
+                        candidate_index.as_str(),
+                        progress_snapshot.clone(),
                     )
-                    .await;
-                    return Ok(None);
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(err) => {
+                            warn!(
+                                event_name = "sync_execution_runtime_unavailable",
+                                log_type = "ops",
+                                trace_id = %trace_id,
+                                request_id = %plan_request_id_for_log,
+                                candidate_id = ?plan_candidate_id,
+                                provider_name,
+                                endpoint_id,
+                                key_id,
+                                model_name,
+                                candidate_index = candidate_index.as_str(),
+                                error_type = err.error_type,
+                                error = %err.message,
+                                "gateway in-process sync execution unavailable"
+                            );
+                            let terminal_unix_secs = current_request_candidate_unix_ms();
+                            record_local_request_candidate_status(
+                                state,
+                                &plan,
+                                report_context.as_ref(),
+                                SchedulerRequestCandidateStatusUpdate {
+                                    status: RequestCandidateStatus::Failed,
+                                    status_code: err.status_code,
+                                    error_type: Some(err.error_type.to_string()),
+                                    error_message: Some(err.message),
+                                    latency_ms: err.latency_ms,
+                                    started_at_unix_ms: Some(candidate_started_unix_secs),
+                                    finished_at_unix_ms: Some(terminal_unix_secs),
+                                },
+                            )
+                            .await;
+                            return Ok(None);
+                        }
+                    },
+                    Err(err) => {
+                        warn!(
+                            event_name = "chatgpt_web_image_execution_unavailable",
+                            log_type = "ops",
+                            trace_id = %trace_id,
+                            request_id = %plan_request_id_for_log,
+                            candidate_id = ?plan_candidate_id,
+                            provider_name,
+                            endpoint_id,
+                            key_id,
+                            model_name,
+                            candidate_index = candidate_index.as_str(),
+                            error = %err,
+                            "gateway ChatGPT-Web image execution unavailable"
+                        );
+                        let terminal_unix_secs = current_request_candidate_unix_ms();
+                        record_local_request_candidate_status(
+                            state,
+                            &plan,
+                            report_context.as_ref(),
+                            SchedulerRequestCandidateStatusUpdate {
+                                status: RequestCandidateStatus::Failed,
+                                status_code: None,
+                                error_type: Some(
+                                    "chatgpt_web_image_execution_unavailable".to_string(),
+                                ),
+                                error_message: Some(err.to_string()),
+                                latency_ms: None,
+                                started_at_unix_ms: Some(candidate_started_unix_secs),
+                                finished_at_unix_ms: Some(terminal_unix_secs),
+                            },
+                        )
+                        .await;
+                        return Ok(None);
+                    }
                 }
-            },
+            }
             Err(err) => {
                 warn!(
-                    event_name = "chatgpt_web_image_execution_unavailable",
+                    event_name = "grok_execution_unavailable",
                     log_type = "ops",
                     trace_id = %trace_id,
                     request_id = %plan_request_id_for_log,
@@ -1145,7 +1659,7 @@ async fn execute_execution_runtime_sync_impl(
                     model_name,
                     candidate_index = candidate_index.as_str(),
                     error = %err,
-                    "gateway ChatGPT-Web image execution unavailable"
+                    "gateway Grok execution unavailable"
                 );
                 let terminal_unix_secs = current_request_candidate_unix_ms();
                 record_local_request_candidate_status(
@@ -1155,7 +1669,7 @@ async fn execute_execution_runtime_sync_impl(
                     SchedulerRequestCandidateStatusUpdate {
                         status: RequestCandidateStatus::Failed,
                         status_code: None,
-                        error_type: Some("chatgpt_web_image_execution_unavailable".to_string()),
+                        error_type: Some("grok_execution_unavailable".to_string()),
                         error_message: Some(err.to_string()),
                         latency_ms: None,
                         started_at_unix_ms: Some(candidate_started_unix_secs),
@@ -1212,30 +1726,72 @@ async fn execute_execution_runtime_sync_impl(
             .trim()
             .is_empty()
         {
-            match maybe_execute_chatgpt_web_image_sync(state, &plan, report_context.as_ref()).await
-            {
+            match maybe_execute_grok_sync(&plan, report_context.as_ref()).await {
                 Ok(Some(result)) => result,
-                Ok(None) => match execute_direct_sync_runtime_candidate(
+                Ok(None) => match maybe_execute_chatgpt_web_image_sync(
                     state,
                     &plan,
                     report_context.as_ref(),
-                    trace_id,
-                    plan_kind,
-                    plan_request_id_for_log.as_str(),
-                    plan_candidate_id.as_deref(),
-                    provider_name.as_str(),
-                    endpoint_id.as_str(),
-                    key_id.as_str(),
-                    model_name.as_str(),
-                    candidate_index.as_str(),
-                    progress_snapshot.clone(),
                 )
                 .await
                 {
-                    Ok(result) => result,
+                    Ok(Some(result)) => result,
+                    Ok(None) => match execute_direct_sync_runtime_candidate(
+                        state,
+                        &plan,
+                        report_context.as_ref(),
+                        trace_id,
+                        plan_kind,
+                        plan_request_id_for_log.as_str(),
+                        plan_candidate_id.as_deref(),
+                        provider_name.as_str(),
+                        endpoint_id.as_str(),
+                        key_id.as_str(),
+                        model_name.as_str(),
+                        candidate_index.as_str(),
+                        progress_snapshot.clone(),
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(err) => {
+                            warn!(
+                                event_name = "sync_execution_runtime_unavailable",
+                                log_type = "ops",
+                                trace_id = %trace_id,
+                                request_id = %plan_request_id_for_log,
+                                candidate_id = ?plan_candidate_id,
+                                provider_name,
+                                endpoint_id,
+                                key_id,
+                                model_name,
+                                candidate_index = candidate_index.as_str(),
+                                error_type = err.error_type,
+                                error = %err.message,
+                                "gateway in-process sync execution unavailable"
+                            );
+                            let terminal_unix_secs = current_request_candidate_unix_ms();
+                            record_local_request_candidate_status(
+                                state,
+                                &plan,
+                                report_context.as_ref(),
+                                SchedulerRequestCandidateStatusUpdate {
+                                    status: RequestCandidateStatus::Failed,
+                                    status_code: err.status_code,
+                                    error_type: Some(err.error_type.to_string()),
+                                    error_message: Some(err.message),
+                                    latency_ms: err.latency_ms,
+                                    started_at_unix_ms: Some(candidate_started_unix_secs),
+                                    finished_at_unix_ms: Some(terminal_unix_secs),
+                                },
+                            )
+                            .await;
+                            return Ok(None);
+                        }
+                    },
                     Err(err) => {
                         warn!(
-                            event_name = "sync_execution_runtime_unavailable",
+                            event_name = "chatgpt_web_image_execution_unavailable",
                             log_type = "ops",
                             trace_id = %trace_id,
                             request_id = %plan_request_id_for_log,
@@ -1245,9 +1801,8 @@ async fn execute_execution_runtime_sync_impl(
                             key_id,
                             model_name,
                             candidate_index = candidate_index.as_str(),
-                            error_type = err.error_type,
-                            error = %err.message,
-                            "gateway in-process sync execution unavailable"
+                            error = %err,
+                            "gateway ChatGPT-Web image execution unavailable"
                         );
                         let terminal_unix_secs = current_request_candidate_unix_ms();
                         record_local_request_candidate_status(
@@ -1256,10 +1811,12 @@ async fn execute_execution_runtime_sync_impl(
                             report_context.as_ref(),
                             SchedulerRequestCandidateStatusUpdate {
                                 status: RequestCandidateStatus::Failed,
-                                status_code: err.status_code,
-                                error_type: Some(err.error_type.to_string()),
-                                error_message: Some(err.message),
-                                latency_ms: err.latency_ms,
+                                status_code: None,
+                                error_type: Some(
+                                    "chatgpt_web_image_execution_unavailable".to_string(),
+                                ),
+                                error_message: Some(err.to_string()),
+                                latency_ms: None,
                                 started_at_unix_ms: Some(candidate_started_unix_secs),
                                 finished_at_unix_ms: Some(terminal_unix_secs),
                             },
@@ -1270,7 +1827,7 @@ async fn execute_execution_runtime_sync_impl(
                 },
                 Err(err) => {
                     warn!(
-                        event_name = "chatgpt_web_image_execution_unavailable",
+                        event_name = "grok_execution_unavailable",
                         log_type = "ops",
                         trace_id = %trace_id,
                         request_id = %plan_request_id_for_log,
@@ -1281,7 +1838,7 @@ async fn execute_execution_runtime_sync_impl(
                         model_name,
                         candidate_index = candidate_index.as_str(),
                         error = %err,
-                        "gateway ChatGPT-Web image execution unavailable"
+                        "gateway Grok execution unavailable"
                     );
                     let terminal_unix_secs = current_request_candidate_unix_ms();
                     record_local_request_candidate_status(
@@ -1291,7 +1848,7 @@ async fn execute_execution_runtime_sync_impl(
                         SchedulerRequestCandidateStatusUpdate {
                             status: RequestCandidateStatus::Failed,
                             status_code: None,
-                            error_type: Some("chatgpt_web_image_execution_unavailable".to_string()),
+                            error_type: Some("grok_execution_unavailable".to_string()),
                             error_message: Some(err.to_string()),
                             latency_ms: None,
                             started_at_unix_ms: Some(candidate_started_unix_secs),
@@ -1337,19 +1894,50 @@ async fn execute_execution_runtime_sync_impl(
         local_failover_response_text,
         local_failover_analysis,
     ) = loop {
-        let result_body_json = result
-            .body
-            .as_ref()
-            .and_then(|body| body.json_body.as_ref());
-        let (result_error_type, result_error_message) =
-            execution_error_details(result.error.as_ref(), result_body_json);
         let result_latency_ms = result
             .telemetry
             .as_ref()
             .and_then(|telemetry| telemetry.elapsed_ms);
         let mut headers = std::mem::take(&mut result.headers);
-        let (body_bytes, body_json, body_base64) =
+        let (body_bytes, mut body_json, body_base64) =
             decode_execution_result_body(result.body.take(), &mut headers)?;
+        if let Some(message) = invalid_gemini_provider_success_message(
+            &plan,
+            report_context.as_ref(),
+            result.status_code,
+            body_json.as_ref(),
+        ) {
+            result.status_code = StatusCode::BAD_GATEWAY.as_u16();
+            result.error = Some(ExecutionError {
+                kind: ExecutionErrorKind::Upstream5xx,
+                phase: ExecutionPhase::Finalize,
+                message: message.to_string(),
+                upstream_status: Some(StatusCode::OK.as_u16()),
+                retryable: false,
+                failover_recommended: false,
+            });
+            if let Some(error_body) =
+                build_invalid_provider_success_body(&plan, report_context.as_ref(), message)
+            {
+                body_json = Some(error_body);
+                headers.insert("content-type".to_string(), "application/json".to_string());
+            }
+        }
+        let (mut result_error_type, mut result_error_message) =
+            execution_error_details(result.error.as_ref(), body_json.as_ref());
+        if result.status_code < 400 && body_json.is_none() {
+            if let Some(error_body_json) =
+                extract_provider_private_stream_error_body(report_context.as_ref(), &body_bytes)
+            {
+                result.status_code =
+                    resolve_local_sync_error_status_code(result.status_code, &error_body_json);
+                let (private_error_type, private_error_message) =
+                    provider_private_error_details(&error_body_json);
+                result_error_type = private_error_type.or(result_error_type);
+                result_error_message = private_error_message.or(result_error_message);
+                body_json = Some(error_body_json);
+            }
+        }
         let local_failover_response_text = local_failover_response_text(
             body_json.as_ref(),
             &body_bytes,
@@ -1532,8 +2120,15 @@ async fn execute_execution_runtime_sync_impl(
     }
     let status_code = result.status_code;
     let has_body_bytes = body_base64.is_some();
-    let report_context =
+    let mut report_context =
         attach_provider_response_headers_to_report_context(report_context, &headers);
+    if (200..300).contains(&status_code) {
+        seed_kiro_sync_simulated_cache_enabled(state, &plan, &mut report_context).await;
+        if kiro_simulated_cache_enabled_from_report_context(report_context.as_ref()) {
+            seed_kiro_sync_report_context_input_tokens(&plan, &mut report_context);
+        }
+        seed_kiro_sync_report_context_prompt_cache_usage(state, &plan, &mut report_context).await;
+    }
     let mut client_headers = headers.clone();
     apply_endpoint_response_header_rules(state, &plan, &mut client_headers, body_json.as_ref())
         .await?;
@@ -1658,11 +2253,12 @@ async fn execute_execution_runtime_sync_impl(
             usage_payload,
         )
         .await;
-        record_sync_terminal_usage(
+        record_sync_terminal_usage_and_disarm_guard(
             state,
             &plan,
             implicit_finalize.payload.report_context.as_ref(),
             usage_payload,
+            &mut terminal_guard,
         );
         if let Some(report_payload) = implicit_finalize.outcome.background_report {
             spawn_sync_report(state.clone(), report_payload);
@@ -1710,11 +2306,12 @@ async fn execute_execution_runtime_sync_impl(
                 )
                 .await;
             }
-            record_sync_terminal_usage(
+            record_sync_terminal_usage_and_disarm_guard(
                 state,
                 &plan,
                 payload.report_context.as_ref(),
                 usage_payload,
+                &mut terminal_guard,
             );
             if let Some(report_payload) = outcome.background_report {
                 spawn_sync_report(state.clone(), report_payload);
@@ -1755,11 +2352,12 @@ async fn execute_execution_runtime_sync_impl(
                     &report_payload,
                 )
                 .await;
-                record_sync_terminal_usage(
+                record_sync_terminal_usage_and_disarm_guard(
                     state,
                     &plan,
                     original_report_context.as_ref(),
                     &report_payload,
+                    &mut terminal_guard,
                 );
                 if let Some(snapshot) = local_task_snapshot {
                     let _ = state.upsert_video_task_snapshot(&snapshot).await?;
@@ -1788,7 +2386,13 @@ async fn execute_execution_runtime_sync_impl(
                 resolve_local_sync_success_background_report_kind(payload.report_kind.as_str());
             apply_sync_success_effects(state, &plan, payload.report_context.as_ref(), &payload)
                 .await;
-            record_sync_terminal_usage(state, &plan, payload.report_context.as_ref(), &payload);
+            record_sync_terminal_usage_and_disarm_guard(
+                state,
+                &plan,
+                payload.report_context.as_ref(),
+                &payload,
+                &mut terminal_guard,
+            );
             state
                 .video_tasks
                 .apply_finalize_mutation(request_path, payload.report_kind.as_str());
@@ -1828,7 +2432,13 @@ async fn execute_execution_runtime_sync_impl(
             if let Some(error_report_kind) = background_error_report_kind {
                 payload.report_kind = error_report_kind.to_string();
             }
-            record_sync_terminal_usage(state, &plan, payload.report_context.as_ref(), &payload);
+            record_sync_terminal_usage_and_disarm_guard(
+                state,
+                &plan,
+                payload.report_context.as_ref(),
+                &payload,
+                &mut terminal_guard,
+            );
             if background_error_report_kind.is_some() {
                 spawn_sync_report(state.clone(), payload);
             } else {
@@ -1848,7 +2458,13 @@ async fn execute_execution_runtime_sync_impl(
                 candidate_id,
             )?));
         }
-        record_sync_terminal_usage(state, &plan, payload.report_context.as_ref(), &payload);
+        record_sync_terminal_usage_and_disarm_guard(
+            state,
+            &plan,
+            payload.report_context.as_ref(),
+            &payload,
+            &mut terminal_guard,
+        );
         let response =
             submit_local_core_error_or_sync_finalize(state, trace_id, decision, payload).await?;
         return Ok(Some(attach_control_metadata_headers(
@@ -1877,11 +2493,12 @@ async fn execute_execution_runtime_sync_impl(
         )
         .await;
     }
-    record_sync_terminal_usage(
+    record_sync_terminal_usage_and_disarm_guard(
         state,
         &plan,
         usage_payload.report_context.as_ref(),
         &usage_payload,
+        &mut terminal_guard,
     );
     let response = attach_control_metadata_headers(
         build_client_response_from_parts(
@@ -1899,6 +2516,14 @@ async fn execute_execution_runtime_sync_impl(
     }
 
     Ok(Some(response))
+    })
+    .await;
+    if let Err(error) = result.as_ref() {
+        terminal_guard.fail_and_disarm(error).await;
+    } else {
+        terminal_guard.disarm();
+    }
+    result
 }
 
 #[allow(clippy::too_many_arguments)] // mirrors sync execution context
@@ -2030,9 +2655,15 @@ async fn execute_sync_via_remote_execution_runtime(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aether_data::repository::candidates::InMemoryRequestCandidateRepository;
+    use aether_data::repository::usage::InMemoryUsageReadRepository;
+    use aether_data_contracts::repository::candidates::RequestCandidateReadRepository;
+    use aether_data_contracts::repository::usage::UsageReadRepository;
+    use aether_usage_runtime::UsageRuntimeConfig;
     use futures_util::{pin_mut, StreamExt as _};
     use serde_json::json;
     use std::collections::BTreeMap;
+    use std::sync::Arc;
 
     fn test_openai_image_plan(stream: bool) -> ExecutionPlan {
         ExecutionPlan {
@@ -2056,6 +2687,270 @@ mod tests {
             transport_profile: None,
             timeouts: None,
         }
+    }
+
+    fn test_gemini_chat_plan() -> ExecutionPlan {
+        let mut plan = test_openai_image_plan(false);
+        plan.client_api_format = "openai:chat".to_string();
+        plan.provider_api_format = "gemini:generate_content".to_string();
+        plan.model_name = Some("gemini-3-flash-preview".to_string());
+        plan
+    }
+
+    fn test_kiro_sync_plan() -> ExecutionPlan {
+        ExecutionPlan {
+            request_id: "req-kiro-sync-cache-1".to_string(),
+            candidate_id: Some("candidate-kiro-sync-cache-1".to_string()),
+            provider_name: Some("Kiro".to_string()),
+            provider_id: "provider-kiro-sync-1".to_string(),
+            endpoint_id: "endpoint-kiro-sync-1".to_string(),
+            key_id: "key-kiro-sync-1".to_string(),
+            method: "POST".to_string(),
+            url: "https://kiro.example/generateAssistantResponse".to_string(),
+            headers: BTreeMap::new(),
+            content_type: Some("application/json".to_string()),
+            content_encoding: None,
+            body: aether_contracts::RequestBody::from_json(json!({
+                "model": "claude-sonnet-4",
+                "messages": [{"role": "user", "content": "hello kiro"}],
+            })),
+            stream: false,
+            client_api_format: "claude:messages".to_string(),
+            provider_api_format: "claude:messages".to_string(),
+            model_name: Some("claude-sonnet-4".to_string()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        }
+    }
+
+    fn test_kiro_sync_cacheable_request_body() -> serde_json::Value {
+        json!({
+            "model": "claude-sonnet-4",
+            "system": [{
+                "type": "text",
+                "text": format!("sync cacheable prompt {}", "cacheable prompt chunk ".repeat(300)),
+                "cache_control": {"type": "ephemeral"}
+            }],
+            "messages": [{"role": "user", "content": "reuse this Kiro prompt"}]
+        })
+    }
+
+    #[test]
+    fn invalid_gemini_provider_success_uses_plan_format_when_context_is_missing() {
+        let plan = test_gemini_chat_plan();
+        let body = json!({
+            "candidates": [{
+                "content": {"role": "model"},
+                "finishReason": "MAX_TOKENS"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 8,
+                "candidatesTokenCount": 1,
+                "thoughtsTokenCount": 25,
+                "totalTokenCount": 34
+            }
+        });
+
+        let message = invalid_gemini_provider_success_message(
+            &plan,
+            None,
+            StatusCode::OK.as_u16(),
+            Some(&body),
+        )
+        .expect("empty Gemini 200 response should be rejected from plan format");
+
+        assert!(message.contains("visible model output"));
+    }
+
+    #[test]
+    fn invalid_gemini_provider_success_unwraps_gemini_cli_v1internal_envelope() {
+        let plan = test_gemini_chat_plan();
+        let report_context = json!({
+            "has_envelope": true,
+            "envelope_name": "gemini_cli:v1internal",
+            "provider_api_format": "gemini:generate_content",
+        });
+        let body = json!({
+            "response": {
+                "candidates": [{
+                    "content": {
+                        "role": "model",
+                        "parts": [{"text": "Hello from Gemini CLI"}]
+                    },
+                    "finishReason": "STOP"
+                }]
+            },
+            "remainingCredits": 41,
+            "consumedCredits": 1,
+            "traceId": "trace-upstream-sync-1"
+        });
+
+        let message = invalid_gemini_provider_success_message(
+            &plan,
+            Some(&report_context),
+            StatusCode::OK.as_u16(),
+            Some(&body),
+        );
+
+        assert!(message.is_none());
+    }
+
+    #[tokio::test]
+    async fn sync_attempt_terminal_guard_marks_dropped_pending_attempt_cancelled() {
+        let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
+        let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
+        let state = AppState::new()
+            .expect("gateway state should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
+                    Arc::clone(&request_candidate_repository),
+                    Arc::clone(&usage_repository),
+                ),
+            )
+            .with_usage_runtime_for_tests(UsageRuntimeConfig {
+                enabled: true,
+                ..UsageRuntimeConfig::default()
+            });
+        let mut plan = test_openai_image_plan(false);
+        plan.request_id = "sync-cancel-guard-request".to_string();
+        plan.candidate_id = None;
+        let mut report_context = Some(json!({
+            "candidate_index": 0,
+            "retry_index": 0,
+            "user_id": "user-cancel",
+            "api_key_id": "api-key-cancel",
+            "client_api_format": "openai:image",
+            "provider_api_format": "openai:image",
+            "request_path": "/v1/images/generations",
+            "request_path_and_query": "/v1/images/generations",
+            "upstream_url": "https://example.test/v1/images/generations",
+            "mapped_model": "gpt-image-2",
+        }));
+
+        ensure_execution_request_candidate_slot(&state, &mut plan, &mut report_context).await;
+        let started_at = current_request_candidate_unix_ms();
+        state.usage_runtime.record_pending(
+            state.data.as_ref(),
+            build_lifecycle_usage_seed(&plan, report_context.as_ref()),
+        );
+        record_local_request_candidate_status(
+            &state,
+            &plan,
+            report_context.as_ref(),
+            SchedulerRequestCandidateStatusUpdate {
+                status: RequestCandidateStatus::Pending,
+                status_code: None,
+                error_type: None,
+                error_message: None,
+                latency_ms: None,
+                started_at_unix_ms: Some(started_at),
+                finished_at_unix_ms: None,
+            },
+        )
+        .await;
+
+        {
+            let _guard =
+                SyncAttemptTerminalGuard::new(&state, &plan, report_context.clone(), started_at);
+        }
+
+        let mut stored_usage = None;
+        for _ in 0..50 {
+            if let Some(usage) = usage_repository
+                .find_by_request_id("sync-cancel-guard-request")
+                .await
+                .expect("usage should read")
+            {
+                if usage.status == "cancelled" {
+                    stored_usage = Some(usage);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let stored_usage = stored_usage.expect("cancelled usage should be recorded");
+        assert_eq!(stored_usage.status, "cancelled");
+        assert_eq!(stored_usage.billing_status, "pending");
+        assert_eq!(stored_usage.status_code, Some(499));
+        assert_eq!(stored_usage.error_category.as_deref(), Some("cancelled"));
+
+        let stored_candidates = request_candidate_repository
+            .list_by_request_id("sync-cancel-guard-request")
+            .await
+            .expect("request candidates should read");
+        assert_eq!(stored_candidates.len(), 1);
+        assert_eq!(
+            stored_candidates[0].status,
+            RequestCandidateStatus::Cancelled
+        );
+        assert_eq!(stored_candidates[0].status_code, Some(499));
+        assert_eq!(
+            stored_candidates[0].error_type.as_deref(),
+            Some("local_sync_attempt_cancelled")
+        );
+    }
+
+    #[test]
+    fn kiro_sync_report_context_seeds_input_tokens_from_original_request_body() {
+        let plan = test_kiro_sync_plan();
+        let mut report_context = Some(json!({
+            "original_request_body": test_kiro_sync_cacheable_request_body(),
+        }));
+
+        seed_kiro_sync_report_context_input_tokens(&plan, &mut report_context);
+
+        assert!(report_context
+            .as_ref()
+            .and_then(|value| value.get("input_tokens"))
+            .and_then(Value::as_u64)
+            .is_some_and(|tokens| tokens > 0));
+    }
+
+    #[tokio::test]
+    async fn kiro_sync_report_context_applies_prompt_cache_usage_from_tracker() {
+        let state = AppState::new().expect("gateway state should build");
+        let plan = test_kiro_sync_plan();
+
+        let mut first_report_context = Some(json!({
+            "original_request_body": test_kiro_sync_cacheable_request_body(),
+            "kiro_simulated_cache_enabled": true,
+        }));
+        seed_kiro_sync_report_context_input_tokens(&plan, &mut first_report_context);
+        seed_kiro_sync_report_context_prompt_cache_usage(&state, &plan, &mut first_report_context)
+            .await;
+        let first_creation = first_report_context
+            .as_ref()
+            .and_then(|value| value.get("cache_creation_input_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        let first_read = first_report_context
+            .as_ref()
+            .and_then(|value| value.get("cache_read_input_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        assert!(first_creation > 0);
+        assert_eq!(first_read, 0);
+
+        let mut second_report_context = Some(json!({
+            "original_request_body": test_kiro_sync_cacheable_request_body(),
+            "kiro_simulated_cache_enabled": true,
+        }));
+        seed_kiro_sync_report_context_input_tokens(&plan, &mut second_report_context);
+        seed_kiro_sync_report_context_prompt_cache_usage(&state, &plan, &mut second_report_context)
+            .await;
+        let second_creation = second_report_context
+            .as_ref()
+            .and_then(|value| value.get("cache_creation_input_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        let second_read = second_report_context
+            .as_ref()
+            .and_then(|value| value.get("cache_read_input_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        assert_eq!(second_creation, 0);
+        assert!(second_read > 0);
     }
 
     #[tokio::test]

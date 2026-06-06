@@ -83,13 +83,16 @@ impl KiroClaudeStreamState {
             }
             .to_string()
         });
-        let input_tokens = self
-            .context_input_tokens
-            .unwrap_or(self.estimated_input_tokens) as u64;
+        let input_tokens = if self.estimated_input_tokens > 0 {
+            self.estimated_input_tokens
+        } else {
+            self.context_input_tokens.unwrap_or_default()
+        };
         encode_kiro_sse_events(build_kiro_final_message_sse_events(
             &stop_reason,
-            input_tokens as usize,
+            input_tokens,
             self.output_tokens,
+            self.cache_usage,
         ))
         .map_err(AiSurfaceFinalizeError::from)
     }

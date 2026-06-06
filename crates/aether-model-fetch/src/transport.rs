@@ -14,6 +14,7 @@ use aether_provider_transport::kiro::{
     resolve_local_kiro_request_auth,
 };
 use aether_provider_transport::vertex::resolve_local_vertex_api_key_query_auth;
+use aether_provider_transport::windsurf::resolve_windsurf_cascade_auth;
 use aether_provider_transport::{
     apply_local_header_rules, resolve_transport_execution_timeouts, resolve_transport_profile,
     GatewayProviderTransportSnapshot, LocalResolvedOAuthRequestAuth,
@@ -21,7 +22,7 @@ use aether_provider_transport::{
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use crate::build_models_fetch_url;
+use crate::{build_models_fetch_url, deepseek_anthropic_models_fetch_uses_openai_auth};
 
 const OPENAI_RESPONSES_USER_AGENT: &str = "openai-codex/1.0";
 const CLAUDE_CLI_USER_AGENT: &str = "claude-code/1.0.1";
@@ -30,6 +31,10 @@ const CLAUDE_VERSION_HEADER: &str = "2023-06-01";
 const ANTIGRAVITY_FETCH_PROVIDER_API_FORMAT: &str = "antigravity:fetch_available_models";
 const GEMINI_CLI_LOAD_CODE_ASSIST_PROVIDER_API_FORMAT: &str = "gemini_cli:load_code_assist";
 const KIRO_LIST_AVAILABLE_MODELS_PROVIDER_API_FORMAT: &str = "kiro:list_available_models";
+const WINDSURF_MODEL_CONFIGS_PROVIDER_API_FORMAT: &str = "windsurf:model_configs";
+const WINDSURF_MODEL_CONFIGS_PATH: &str =
+    "/exa.api_server_pb.ApiServerService/GetCascadeModelConfigs";
+const WINDSURF_IDE_VERSION: &str = "1.9600.41";
 
 const BROWSER_FINGERPRINT_HEADERS: &[(&str, &str)] = &[
     (
@@ -93,19 +98,29 @@ pub async fn build_standard_models_fetch_execution_plan(
     let provider_type = transport.provider.provider_type.trim().to_ascii_lowercase();
     let is_codex_openai_models_fetch =
         provider_type == "codex" && api_format.starts_with("openai:");
+    let is_deepseek_anthropic_models_fetch = api_format.starts_with("claude:")
+        && deepseek_anthropic_models_fetch_uses_openai_auth(&transport.endpoint.base_url);
     let mut headers = standard_models_fetch_headers(&api_format, &provider_type);
     if is_codex_openai_models_fetch {
+        headers.insert("accept".to_string(), "application/json".to_string());
+    }
+    if is_deepseek_anthropic_models_fetch {
+        headers.remove("anthropic-version");
         headers.insert("accept".to_string(), "application/json".to_string());
     }
     let mut protected_headers = Vec::<String>::new();
 
     if api_format.starts_with("openai:") || api_format.starts_with("claude:") {
-        let (auth_header_name, auth_header_value) =
-            resolve_standard_header_auth(runtime, transport)
+        let resolved_auth = if is_deepseek_anthropic_models_fetch {
+            resolve_oauth_header_auth(runtime, transport)
                 .await?
-                .ok_or_else(|| {
-                    "Rust models fetch auth resolution is not supported for this key".to_string()
-                })?;
+                .or_else(|| resolve_local_openai_bearer_auth(transport))
+        } else {
+            resolve_standard_header_auth(runtime, transport).await?
+        };
+        let (auth_header_name, auth_header_value) = resolved_auth.ok_or_else(|| {
+            "Rust models fetch auth resolution is not supported for this key".to_string()
+        })?;
         insert_non_empty_auth_header(
             &mut headers,
             &mut protected_headers,
@@ -290,6 +305,60 @@ pub async fn build_kiro_list_available_models_plan(
             client_api_format: "claude:messages".to_string(),
             provider_api_format: KIRO_LIST_AVAILABLE_MODELS_PROVIDER_API_FORMAT.to_string(),
             model_name: Some("ListAvailableModels".to_string()),
+        },
+    )
+    .await
+}
+
+pub async fn build_windsurf_model_configs_execution_plan(
+    runtime: &(impl ModelFetchTransportRuntime + ?Sized),
+    transport: &GatewayProviderTransportSnapshot,
+) -> Result<ExecutionPlan, String> {
+    let (_, auth_value) = resolve_windsurf_cascade_auth(transport)
+        .or_else(|| resolve_local_openai_bearer_auth(transport))
+        .ok_or_else(|| "Windsurf models fetch requires apiKey/sessionToken".to_string())?;
+    let api_key = auth_secret_from_header_value(&auth_value);
+    if api_key.is_empty() {
+        return Err("Windsurf models fetch requires apiKey/sessionToken".to_string());
+    }
+
+    let headers = BTreeMap::from([
+        ("content-type".to_string(), "application/json".to_string()),
+        ("accept".to_string(), "application/json".to_string()),
+        ("connect-protocol-version".to_string(), "1".to_string()),
+        (
+            "user-agent".to_string(),
+            format!("windsurf/{WINDSURF_IDE_VERSION}"),
+        ),
+    ]);
+    let headers = apply_fetch_header_rules(transport, headers, &[])?;
+    let url = format!(
+        "{}{}",
+        transport.endpoint.base_url.trim_end_matches('/'),
+        WINDSURF_MODEL_CONFIGS_PATH
+    );
+
+    build_execution_plan(
+        runtime,
+        transport,
+        ModelFetchExecutionPlanRequest {
+            method: "POST".to_string(),
+            url,
+            headers,
+            content_type: Some("application/json".to_string()),
+            body: RequestBody::from_json(json!({
+                "metadata": {
+                    "apiKey": api_key,
+                    "ideName": "windsurf",
+                    "ideVersion": WINDSURF_IDE_VERSION,
+                    "extensionName": "windsurf",
+                    "extensionVersion": WINDSURF_IDE_VERSION,
+                    "locale": "en",
+                }
+            })),
+            client_api_format: "openai:chat".to_string(),
+            provider_api_format: WINDSURF_MODEL_CONFIGS_PROVIDER_API_FORMAT.to_string(),
+            model_name: Some("GetCascadeModelConfigs".to_string()),
         },
     )
     .await
@@ -531,7 +600,9 @@ fn build_standard_models_fetch_url(
     )
     .ok_or_else(|| "Rust models fetch does not support this provider format yet".to_string())?;
 
-    if api_format.starts_with("claude:") {
+    if api_format.starts_with("claude:")
+        && !deepseek_anthropic_models_fetch_uses_openai_auth(&transport.endpoint.base_url)
+    {
         url = append_query_param(url, "limit", "100");
         if let Some(after_id) = after_id.map(str::trim).filter(|value| !value.is_empty()) {
             url = append_query_param(url, "after_id", after_id);
@@ -584,6 +655,16 @@ fn insert_non_empty_auth_header(
 
     protected_headers.push(name.to_string());
     headers.insert(name.to_string(), value.to_string());
+}
+
+fn auth_secret_from_header_value(auth_value: &str) -> String {
+    auth_value
+        .trim()
+        .strip_prefix("Bearer ")
+        .or_else(|| auth_value.trim().strip_prefix("bearer "))
+        .unwrap_or_else(|| auth_value.trim())
+        .trim()
+        .to_string()
 }
 
 #[cfg(test)]
@@ -687,6 +768,7 @@ mod tests {
                 expires_at_unix_secs: None,
                 proxy: None,
                 fingerprint: None,
+                upstream_metadata: None,
                 decrypted_api_key: "secret".to_string(),
                 decrypted_auth_config: Some(
                     r#"{"project_id":"project-1","client_version":"1.2.3","session_id":"sess-1"}"#
@@ -708,7 +790,7 @@ mod tests {
             .await
             .expect("plan");
 
-        assert_eq!(plan.url, "https://example.com/v1/models");
+        assert_eq!(plan.url, "https://example.com/models");
         assert_eq!(
             plan.headers.get("user-agent").map(String::as_str),
             Some("openai-codex/1.0")
@@ -731,7 +813,50 @@ mod tests {
             .await
             .expect("plan");
 
-        assert_eq!(plan.url, "https://example.com/v1/models");
+        assert_eq!(plan.url, "https://example.com/models");
+        assert_eq!(
+            plan.headers.get("authorization").map(String::as_str),
+            Some("Bearer secret")
+        );
+    }
+
+    #[tokio::test]
+    async fn builds_bigmodel_coding_models_fetch_plan() {
+        let runtime = TestRuntime {
+            oauth_auth: None,
+            proxy: None,
+        };
+        let mut transport = sample_transport("openai", "openai:chat", "api_key");
+        transport.endpoint.base_url = "https://open.bigmodel.cn/api/coding/paas/v4".to_string();
+        transport.key.decrypted_auth_config = None;
+        let plan = build_models_fetch_execution_plan(&runtime, &transport)
+            .await
+            .expect("plan");
+
+        assert_eq!(
+            plan.url,
+            "https://open.bigmodel.cn/api/coding/paas/v4/models"
+        );
+        assert_eq!(
+            plan.headers.get("authorization").map(String::as_str),
+            Some("Bearer secret")
+        );
+    }
+
+    #[tokio::test]
+    async fn builds_unversioned_api_root_models_fetch_plan() {
+        let runtime = TestRuntime {
+            oauth_auth: None,
+            proxy: None,
+        };
+        let mut transport = sample_transport("openai", "openai:chat", "api_key");
+        transport.endpoint.base_url = "https://proxy.example.com/api".to_string();
+        transport.key.decrypted_auth_config = None;
+        let plan = build_models_fetch_execution_plan(&runtime, &transport)
+            .await
+            .expect("plan");
+
+        assert_eq!(plan.url, "https://proxy.example.com/api/models");
         assert_eq!(
             plan.headers.get("authorization").map(String::as_str),
             Some("Bearer secret")
@@ -790,7 +915,7 @@ mod tests {
 
         assert_eq!(
             plan.url,
-            "https://example.com/v1/models?limit=100&after_id=cursor-1"
+            "https://example.com/models?limit=100&after_id=cursor-1"
         );
         assert_eq!(
             plan.headers.get("anthropic-version").map(String::as_str),
@@ -800,6 +925,28 @@ mod tests {
             plan.headers.get("x-api-key").map(String::as_str),
             Some("secret")
         );
+    }
+
+    #[tokio::test]
+    async fn builds_deepseek_anthropic_models_fetch_plan_with_openai_models_endpoint() {
+        let runtime = TestRuntime {
+            oauth_auth: None,
+            proxy: None,
+        };
+        let mut transport = sample_transport("custom", "claude:messages", "api_key");
+        transport.endpoint.base_url = "https://api.deepseek.com/anthropic".to_string();
+        transport.key.decrypted_auth_config = None;
+        let plan = build_models_fetch_execution_plan(&runtime, &transport)
+            .await
+            .expect("plan");
+
+        assert_eq!(plan.url, "https://api.deepseek.com/models");
+        assert_eq!(
+            plan.headers.get("authorization").map(String::as_str),
+            Some("Bearer secret")
+        );
+        assert!(!plan.headers.contains_key("x-api-key"));
+        assert!(!plan.headers.contains_key("anthropic-version"));
     }
 
     #[tokio::test]

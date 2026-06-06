@@ -7,6 +7,40 @@ use super::{
     StoredAuthApiKeyExportRecord, StoredAuthApiKeySnapshot, StoredUserAuthRecord,
     StoredUserExportRow, Utc,
 };
+use aether_data_contracts::repository::billing::{
+    BillingReadRepository, StoredBillingModelContext, UserDailyQuotaAvailabilityRecord,
+};
+use aether_data_contracts::DataLayerError;
+
+#[derive(Debug)]
+struct StaticDailyQuotaBillingRepository {
+    user_id: String,
+    quota: UserDailyQuotaAvailabilityRecord,
+}
+
+#[async_trait::async_trait]
+impl BillingReadRepository for StaticDailyQuotaBillingRepository {
+    async fn find_model_context(
+        &self,
+        provider_id: &str,
+        provider_api_key_id: Option<&str>,
+        global_model_name: &str,
+    ) -> Result<Option<StoredBillingModelContext>, DataLayerError> {
+        let _ = (provider_id, provider_api_key_id, global_model_name);
+        Ok(None)
+    }
+
+    async fn find_user_daily_quota_availability(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<UserDailyQuotaAvailabilityRecord>, DataLayerError> {
+        if user_id == self.user_id {
+            Ok(Some(self.quota.clone()))
+        } else {
+            Ok(None)
+        }
+    }
+}
 
 fn stable_dashboard_now() -> chrono::DateTime<Utc> {
     Utc::now()
@@ -167,6 +201,93 @@ async fn gateway_handles_dashboard_stats_locally_without_proxying_upstream() {
     assert_eq!(payload["token_breakdown"]["cache_read"], 30);
     assert_eq!(payload["monthly_cost"], json!(2.5));
     assert_eq!(payload["stats"].as_array().map(Vec::len), Some(4));
+    assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
+
+    gateway_handle.abort();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_dashboard_stats_user_wallet_card_uses_wallet_center_balance_breakdown() {
+    let now = stable_dashboard_now();
+    let user = sample_auth_user(now);
+    let access_token = build_test_auth_token(
+        "access",
+        serde_json::Map::from_iter([
+            ("user_id".to_string(), json!(user.id)),
+            ("role".to_string(), json!(user.role)),
+            (
+                "created_at".to_string(),
+                json!(user.created_at.map(|value| value.to_rfc3339())),
+            ),
+            ("session_id".to_string(), json!("session-dashboard-wallet")),
+        ]),
+        chrono::Utc::now() + chrono::Duration::hours(1),
+    );
+    let session = sample_auth_session(
+        "user-auth-1",
+        "session-dashboard-wallet",
+        "device-dashboard-wallet",
+        "refresh-dashboard-wallet",
+        now,
+    );
+    let usage_repository = Arc::new(InMemoryUsageReadRepository::seed(vec![]));
+    let user_repository = Arc::new(InMemoryUserReadRepository::seed_auth_users(vec![
+        user.clone()
+    ]));
+    let mut wallet = sample_auth_wallet("user-auth-1", now);
+    wallet.balance = 7.0;
+    wallet.gift_balance = 3.0;
+    let wallet_repository = Arc::new(InMemoryWalletRepository::seed(vec![wallet]));
+    let billing_repository: Arc<dyn BillingReadRepository> =
+        Arc::new(StaticDailyQuotaBillingRepository {
+            user_id: "user-auth-1".to_string(),
+            quota: UserDailyQuotaAvailabilityRecord {
+                has_active_daily_quota: true,
+                total_quota_usd: 120.0,
+                used_usd: 20.0,
+                remaining_usd: 100.0,
+                allow_wallet_overage: true,
+            },
+        });
+    let auth_repository = Arc::new(InMemoryAuthApiKeySnapshotRepository::seed(Vec::<(
+        Option<String>,
+        StoredAuthApiKeySnapshot,
+    )>::new()));
+
+    let (gateway_url, upstream_hits, gateway_handle, upstream_handle) =
+        start_auth_gateway_with_builder(|| {
+            let data_state = GatewayDataState::with_usage_billing_and_wallet_for_tests(
+                usage_repository,
+                Arc::clone(&billing_repository),
+                wallet_repository,
+            )
+            .with_user_reader(user_repository)
+            .with_auth_api_key_reader(auth_repository);
+            AppState::new()
+                .expect("gateway should build")
+                .with_data_state_for_tests(data_state)
+                .with_auth_sessions_for_tests([session])
+        })
+        .await;
+
+    let response = reqwest::Client::new()
+        .get(format!("{gateway_url}/api/dashboard/stats?days=30"))
+        .header("authorization", format!("Bearer {access_token}"))
+        .header("x-client-device-id", "device-dashboard-wallet")
+        .header("user-agent", "AetherTest/1.0")
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(payload["stats"][2]["name"], "钱包余额");
+    assert_eq!(payload["stats"][2]["value"], "$110.00");
+    assert_eq!(
+        payload["stats"][2]["subValue"],
+        "套餐额度 $100.00 · 钱包余额 $10.00"
+    );
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();
@@ -608,6 +729,16 @@ async fn gateway_handles_dashboard_daily_stats_locally_without_proxying_upstream
         now - chrono::Duration::hours(2),
     );
     today_claude_usage.total_tokens = 160;
+    let mut today_bailian_usage = sample_user_usage_audit(
+        "usage-dashboard-daily-4",
+        "req-dashboard-daily-4",
+        "user-auth-4",
+        "qwen3.6-27b",
+        "bailian",
+        "completed",
+        now - chrono::Duration::hours(3),
+    );
+    today_bailian_usage.total_tokens = 160;
     let mut prior_usage = sample_user_usage_audit(
         "usage-dashboard-daily-3",
         "req-dashboard-daily-3",
@@ -621,6 +752,7 @@ async fn gateway_handles_dashboard_daily_stats_locally_without_proxying_upstream
     let usage_repository = Arc::new(InMemoryUsageReadRepository::seed(vec![
         today_openai_usage,
         today_claude_usage,
+        today_bailian_usage,
         prior_usage,
     ]));
 
@@ -668,30 +800,41 @@ async fn gateway_handles_dashboard_daily_stats_locally_without_proxying_upstream
     assert_eq!(daily_stats[0]["requests"], 1);
     assert_eq!(daily_stats[0]["unique_providers"], 1);
     assert_eq!(daily_stats[1]["date"], json!(now.date_naive().to_string()));
-    assert_eq!(daily_stats[1]["requests"], 2);
-    assert_eq!(daily_stats[1]["tokens"], 320);
-    assert_eq!(daily_stats[1]["unique_models"], 2);
-    assert_eq!(daily_stats[1]["unique_providers"], 2);
+    assert_eq!(daily_stats[1]["requests"], 3);
+    assert_eq!(daily_stats[1]["tokens"], 480);
+    assert_eq!(daily_stats[1]["unique_models"], 3);
+    assert_eq!(daily_stats[1]["unique_providers"], 3);
+    let today_model_breakdown = daily_stats[1]["model_breakdown"]
+        .as_array()
+        .expect("today model breakdown should be an array");
+    assert_eq!(today_model_breakdown.len(), 3);
+    let today_models = today_model_breakdown
+        .iter()
+        .filter_map(|item| item["model"].as_str())
+        .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(
-        daily_stats[1]["model_breakdown"].as_array().map(Vec::len),
-        Some(2)
+        today_models,
+        std::collections::BTreeSet::from(["claude-3-7", "gpt-5", "qwen3.6-27b"])
     );
 
     let model_summary = payload["model_summary"]
         .as_array()
         .expect("model summary should exist");
-    assert_eq!(model_summary.len(), 2);
+    assert_eq!(model_summary.len(), 3);
     assert_eq!(model_summary[0]["model"], "gpt-5");
     assert_eq!(model_summary[0]["requests"], 2);
 
     let provider_summary = payload["provider_summary"]
         .as_array()
         .expect("provider summary should exist");
-    assert_eq!(provider_summary.len(), 2);
-    assert_eq!(provider_summary[0]["provider"], "openai");
-    assert_eq!(provider_summary[0]["requests"], 2);
-    assert_eq!(provider_summary[1]["provider"], "claude");
-    assert_eq!(provider_summary[1]["requests"], 1);
+    assert_eq!(provider_summary.len(), 3);
+    let provider_requests = provider_summary
+        .iter()
+        .filter_map(|item| Some((item["provider"].as_str()?, item["requests"].as_u64()?)))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(provider_requests.get("openai"), Some(&2));
+    assert_eq!(provider_requests.get("claude"), Some(&1));
+    assert_eq!(provider_requests.get("bailian"), Some(&1));
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();
@@ -1071,16 +1214,9 @@ async fn gateway_handles_dashboard_provider_status_locally_without_proxying_upst
         .await
         .expect("request should succeed");
 
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
     let payload: serde_json::Value = response.json().await.expect("json body should parse");
-    let providers = payload["providers"].as_array().expect("array");
-    assert_eq!(providers.len(), 3);
-    assert_eq!(providers[0]["name"], "openai");
-    assert_eq!(providers[0]["requests"], 2);
-    assert_eq!(providers[1]["name"], "claude");
-    assert_eq!(providers[1]["requests"], 1);
-    assert_eq!(providers[2]["name"], "gemini");
-    assert_eq!(providers[2]["requests"], 0);
+    assert_eq!(payload["detail"], "仅管理员可查看供应商状态");
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();

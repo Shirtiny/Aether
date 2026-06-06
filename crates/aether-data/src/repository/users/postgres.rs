@@ -6,8 +6,8 @@ use super::types::{
     normalize_user_group_name, LdapAuthUserProvisioningOutcome, StoredUserAuthRecord,
     StoredUserExportRow, StoredUserGroup, StoredUserGroupMember, StoredUserGroupMembership,
     StoredUserOAuthLinkSummary, StoredUserPreferenceRecord, StoredUserSessionRecord,
-    StoredUserSummary, UpsertUserGroupRecord, UserExportListQuery, UserExportSummary,
-    UserReadRepository,
+    StoredUserSummary, UpsertUserGroupRecord, UserExportListQuery, UserExportSortBy,
+    UserExportSummary, UserReadRepository,
 };
 use crate::{error::SqlxResultExt, DataLayerError};
 
@@ -336,8 +336,11 @@ SELECT
   users.role::text AS role,
   users.auth_source::text AS auth_source,
   users.allowed_providers,
+  users.allowed_providers_mode,
   users.allowed_api_formats,
+  users.allowed_api_formats_mode,
   users.allowed_models,
+  users.allowed_models_mode,
   users.is_active,
   users.is_deleted,
   users.created_at,
@@ -353,7 +356,7 @@ const TOUCH_OAUTH_LINK_SQL: &str = r#"
 UPDATE user_oauth_links
 SET provider_username = COALESCE($3, provider_username),
     provider_email = COALESCE($4, provider_email),
-    extra_data = COALESCE($5, extra_data),
+    extra_data = COALESCE($5::json, extra_data),
     last_login_at = $6
 WHERE provider_type = $1
   AND provider_user_id = $2
@@ -998,8 +1001,24 @@ WHERE user_group_members.user_id IN (
                 .push(")");
         }
 
+        match query.sort_by {
+            UserExportSortBy::CreatedAt => {
+                builder
+                    .push(" ORDER BY created_at ")
+                    .push(if query.sort_order.is_desc() {
+                        "DESC"
+                    } else {
+                        "ASC"
+                    })
+                    .push(", id ASC");
+            }
+            UserExportSortBy::Id => {
+                builder.push(" ORDER BY id ASC");
+            }
+        }
+
         builder
-            .push(" ORDER BY id ASC OFFSET ")
+            .push(" OFFSET ")
             .push_bind(i64::try_from(query.skip).map_err(|_| {
                 DataLayerError::InvalidInput(format!("invalid user export skip: {}", query.skip))
             })?)
@@ -1010,6 +1029,57 @@ WHERE user_group_members.user_id IN (
 
         let query = builder.build();
         collect_query_rows(query.fetch(&self.pool), map_user_export_row).await
+    }
+
+    pub async fn count_export_users(
+        &self,
+        query: &UserExportListQuery,
+    ) -> Result<u64, DataLayerError> {
+        let mut builder =
+            QueryBuilder::<Postgres>::new("SELECT COUNT(*)::BIGINT AS total FROM users");
+        builder.push(" WHERE is_deleted IS FALSE");
+
+        if let Some(role) = query.role.as_deref() {
+            builder
+                .push(" AND LOWER(role::text) = ")
+                .push_bind(role.trim().to_ascii_lowercase());
+        }
+        if let Some(is_active) = query.is_active {
+            builder.push(" AND is_active = ").push_bind(is_active);
+        }
+        if let Some(group_id) = query
+            .group_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            builder.push(" AND id IN (SELECT user_id FROM user_group_members WHERE group_id = ");
+            builder.push_bind(group_id);
+            builder.push(")");
+        }
+        if let Some(search) = query
+            .search
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let pattern = format!("%{}%", search.to_ascii_lowercase());
+            builder
+                .push(" AND (LOWER(id) LIKE ")
+                .push_bind(pattern.clone())
+                .push(" OR LOWER(username) LIKE ")
+                .push_bind(pattern.clone())
+                .push(" OR LOWER(COALESCE(email, '')) LIKE ")
+                .push_bind(pattern)
+                .push(")");
+        }
+
+        let row = builder
+            .build()
+            .fetch_one(&self.pool)
+            .await
+            .map_postgres_err()?;
+        Ok(row.try_get::<i64, _>("total").map_postgres_err()?.max(0) as u64)
     }
 
     pub async fn summarize_export_users(&self) -> Result<UserExportSummary, DataLayerError> {
@@ -2301,6 +2371,10 @@ impl UserReadRepository for SqlxUserReadRepository {
         query: &UserExportListQuery,
     ) -> Result<Vec<StoredUserExportRow>, DataLayerError> {
         self.list_export_users_page(query).await
+    }
+
+    async fn count_export_users(&self, query: &UserExportListQuery) -> Result<u64, DataLayerError> {
+        self.count_export_users(query).await
     }
 
     async fn summarize_export_users(&self) -> Result<UserExportSummary, DataLayerError> {

@@ -7,7 +7,7 @@
     persistent
     @update:model-value="emit('update:modelValue', $event)"
   >
-    <div class="space-y-4">
+    <div class="max-h-[calc(100dvh-13rem)] space-y-4 overflow-y-auto overscroll-contain pr-1 sm:max-h-[min(72vh,44rem)] sm:pr-2">
       <div class="space-y-3 rounded-lg border bg-muted/20 px-3 py-2.5">
         <div class="flex items-center justify-between gap-2">
           <span class="text-xs font-medium text-foreground">快捷多选</span>
@@ -98,7 +98,7 @@
 
       <div class="grid gap-4 lg:grid-cols-[minmax(0,1fr)_19rem]">
         <div class="min-w-0 space-y-3">
-          <div class="max-h-[420px] overflow-y-auto rounded-lg border">
+          <div class="rounded-lg border lg:max-h-[420px] lg:overflow-y-auto">
             <div
               v-if="loading"
               class="py-10 text-center text-sm text-muted-foreground"

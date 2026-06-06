@@ -511,7 +511,7 @@
                   <span>用户: {{ selectedTask.username }}</span>
                 </template>
                 <span class="opacity-40">|</span>
-                  <span>{{ displayTaskSource(selectedTask) }}</span>
+                <span>{{ displayTaskSource(selectedTask) }}</span>
               </div>
               <!-- 进度条 -->
               <div

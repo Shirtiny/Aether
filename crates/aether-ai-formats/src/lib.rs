@@ -25,11 +25,11 @@ pub use formats::shared::model_directives::{
     apply_model_directive_overrides_from_request, claude_model_uses_adaptive_effort,
     extract_gemini_model_from_path, gemini_model_uses_thinking_level, model_directive_base_model,
     normalize_model_directive_model, parse_model_directive, ModelDirective, ModelOverride,
-    ReasoningEffort,
+    ReasoningEffort, ServiceTier,
 };
 pub use formats::shared::request::{
     endpoint_config_forces_upstream_stream_policy, enforce_request_body_stream_field,
-    resolve_upstream_is_stream_from_endpoint_config,
+    resolve_upstream_is_stream_from_endpoint_config, UPSTREAM_IS_STREAM_KEY,
 };
 pub use protocol::canonical::{
     canonical_request_unknown_block_count, canonical_response_unknown_block_count,
@@ -43,9 +43,9 @@ pub use protocol::canonical::{
     from_gemini_to_canonical_response, from_openai_chat_to_canonical_request,
     from_openai_chat_to_canonical_response, from_openai_responses_to_canonical_request,
     from_openai_responses_to_canonical_response, CanonicalContentBlock, CanonicalEmbedding,
-    CanonicalEmbeddingInput, CanonicalEmbeddingRequest, CanonicalEmbeddingResponse,
-    CanonicalGenerationConfig, CanonicalInstruction, CanonicalMessage, CanonicalRequest,
-    CanonicalResponse, CanonicalResponseFormat, CanonicalResponseOutput, CanonicalRole,
-    CanonicalStopReason, CanonicalStreamEvent, CanonicalStreamFrame, CanonicalThinkingConfig,
-    CanonicalToolChoice, CanonicalToolDefinition, CanonicalUsage,
+    CanonicalEmbeddingContent, CanonicalEmbeddingInput, CanonicalEmbeddingRequest,
+    CanonicalEmbeddingResponse, CanonicalGenerationConfig, CanonicalInstruction, CanonicalMessage,
+    CanonicalRequest, CanonicalResponse, CanonicalResponseFormat, CanonicalResponseOutput,
+    CanonicalRole, CanonicalStopReason, CanonicalStreamEvent, CanonicalStreamFrame,
+    CanonicalThinkingConfig, CanonicalToolChoice, CanonicalToolDefinition, CanonicalUsage,
 };

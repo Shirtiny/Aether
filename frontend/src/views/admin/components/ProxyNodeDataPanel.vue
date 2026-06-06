@@ -234,6 +234,7 @@
 import { computed } from 'vue'
 import { AlertTriangle, Loader2, RefreshCw } from 'lucide-vue-next'
 import { Badge, Button } from '@/components/ui'
+import { formatCompactNumber } from '@/utils/format'
 import type {
   ProxyNode,
   ProxyNodeEvent,
@@ -456,9 +457,7 @@ function formatTunnelNumber(key: string) {
 
 function formatNumber(value: number) {
   if (!Number.isFinite(value)) return '-'
-  if (Math.abs(value) >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`
-  if (Math.abs(value) >= 1_000) return `${(value / 1_000).toFixed(1)}K`
-  return String(Math.round(value))
+  return formatCompactNumber(Math.round(value), { fractionDigits: 1 })
 }
 
 function formatOptionalNumber(value: number | null) {
@@ -684,7 +683,7 @@ function tunnelErrorAction(category: string) {
     case 'ws_write_error': return '检查 gateway 是否重启、负载均衡/NAT/防火墙是否重置长连接，并确认 proxy 是否已自动重连。'
     case 'ws_ping_error': return '检查中间代理是否清理空闲 WebSocket，或对端是否提前关闭连接。'
     case 'ws_read_error': return '对照同一时间的 gateway 日志和网络监控，确认是否存在链路中断。'
-    case 'tunnel_connect_error': return '检查 Aether 地址、DNS、TLS、管理 token，以及 AETHER_PROXY_AETHER_PROXY_URL 配置。'
+    case 'tunnel_connect_error': return '检查 Aether 地址、DNS、TLS、管理 token，以及 AETHER_TUNNEL_AETHER_OUTBOUND_PROXY_URL 配置。'
     case 'frame_decode_error': return '检查 proxy/gateway 版本兼容性，确认中间层没有改写 WebSocket 二进制帧。'
     case 'stream_dispatch_timeout': return '检查 proxy CPU/内存、并发上限和上游 provider 慢请求。'
     case 'heartbeat_ack_empty':

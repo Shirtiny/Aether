@@ -80,7 +80,7 @@ headers; changes there should come only from `compose_schema.sh generate`.
 | Auth config | `auth_modules`, `oauth_providers`, `ldap_configs` | `repository/auth_modules`, `repository/oauth_providers`, `repository/users` | Good candidate for generated CRUD. |
 | Proxy nodes | `proxy_nodes`, `proxy_node_events` | `repository/proxy_nodes` | Good candidate for generated CRUD plus handwritten heartbeat update. |
 | Wallet/billing | `wallets`, `wallet_transactions`, `wallet_daily_usage_ledgers`, `payment_orders`, `payment_callbacks`, `refund_requests`, `redeem_code_batches`, `redeem_codes`, `billing_rules`, `dimension_collectors` | `repository/wallet`, `repository/billing`, `repository/settlement` | Keep settlement/ledger math explicit; generate table definitions and simple reads. |
-| Usage/audit | `usage`, `usage_body_blobs`, `usage_http_audits`, `usage_routing_snapshots`, `usage_settlement_snapshots`, `request_candidates`, `audit_logs` | `repository/usage`, `repository/candidates`, `repository/audit` | Keep core write/audit queries handwritten. |
+| Usage/audit | `usage`, `usage_counter_deltas`, `usage_body_blobs`, `usage_http_audits`, `usage_routing_snapshots`, `usage_settlement_snapshots`, `request_candidates`, `audit_logs` | `repository/usage`, `repository/candidates`, `repository/audit` | Keep core write/audit queries handwritten. |
 | Runtime tasks | `video_tasks`, `gemini_file_mappings`, `announcements`, `announcement_reads` | `repository/video_tasks`, `repository/gemini_file_mappings`, `repository/announcements` | Good candidate for generated CRUD except polling claim logic. |
 | Stats | `stats_*`, `schema_backfills` | backend aggregation modules | Keep aggregation SQL per-driver; generate table/index definitions only. |
 | System | `system_configs` | `repository/system` through backend dispatch | Good candidate for generated CRUD. |
@@ -105,3 +105,12 @@ as explicit generated/override fragments.
    plan if it must move across databases.
 6. If a baseline fragment changes, run `compose_schema.sh compose` before tests
    so the executable SQL artifact is regenerated from the source manifest.
+
+## Performance Notes
+
+- Shared hot counters must use `bigint` and be updated by durable outbox flush
+  workers, not request transactions.
+- `usage_counter_deltas` is append-only until processed; processed rows are
+  retained briefly for audit/replay and then batch-deleted by maintenance.
+- Candidate selection joins stay handwritten but are protected in the gateway by
+  a short TTL, single-flight cache invalidated by provider/routing writes.

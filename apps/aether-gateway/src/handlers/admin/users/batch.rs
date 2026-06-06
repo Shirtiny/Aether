@@ -417,6 +417,7 @@ async fn resolve_admin_user_selection(
                     group_id: filters
                         .as_ref()
                         .and_then(|filters| filters.group_id.clone()),
+                    ..Default::default()
                 })
                 .await
                 .map_err(|_| "用户数据不可用".to_string())?

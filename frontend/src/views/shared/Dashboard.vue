@@ -789,7 +789,8 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, computed, onBeforeUnmount, nextTick, watch } from 'vue'
+import { ref, onMounted, computed, onBeforeUnmount, nextTick, watch, markRaw } from 'vue'
+import type { Component } from 'vue'
 import { useAuthStore } from '@/stores/auth'
 import { dashboardApi, type DashboardStat, type DailyStat, type ProviderSummary } from '@/api/dashboard'
 import { getDateRangeFromPeriod } from '@/features/usage/composables'
@@ -837,6 +838,10 @@ import { sanitizeMarkdown } from '@/utils/sanitize'
 import type { ChartData, ChartOptions, ChartDataset, TooltipItem } from 'chart.js'
 
 const authStore = useAuthStore()
+
+type DashboardStatCard = Omit<DashboardStat, 'icon'> & {
+  icon: Component
+}
 
 const statsPanelRef = ref<HTMLElement | null>(null)
 const announcementsHeight = ref<number | null>(null)
@@ -941,7 +946,7 @@ const getStatIconColor = (_index: number): string => {
 }
 
 // 统计数据
-const stats = ref<DashboardStat[]>([])
+const stats = ref<DashboardStatCard[]>([])
 const todayStats = ref<{
   requests: number
   tokens: number
@@ -1006,7 +1011,7 @@ const loadingAnnouncements = ref(false)
 const selectedAnnouncement = ref<Announcement | null>(null)
 const detailDialogOpen = ref(false)
 
-const iconMap: Record<string, unknown> = {
+const iconMap: Record<string, Component> = {
   Users, Activity, TrendingUp, DollarSign, Key, Hash, Zap, Database
 }
 
@@ -1328,7 +1333,7 @@ async function loadDashboardData() {
     })
     stats.value = statsData.stats.map(stat => ({
       ...stat,
-      icon: iconMap[stat.icon] || Activity
+      icon: markRaw(iconMap[stat.icon] || Activity)
     }))
     if (statsData.today) todayStats.value = statsData.today
     if (isAdmin.value) {

@@ -15,10 +15,12 @@ use crate::ai_serving::planner::candidate_metadata::{
     LocalExecutionCandidateMetadataParts,
 };
 use crate::ai_serving::planner::candidate_source::{
+    preselect_local_execution_candidates_for_api_formats_with_serving,
     preselect_local_execution_candidates_with_serving, LocalCandidatePreselectionKeyMode,
 };
 use crate::ai_serving::planner::common::extract_standard_requested_model;
 use crate::ai_serving::planner::decision_input::{
+    attach_routing_policy_to_local_requested_model_input,
     build_local_requested_model_decision_input, resolve_local_authenticated_decision_input,
 };
 use crate::ai_serving::planner::materialization_policy::{
@@ -35,6 +37,7 @@ use crate::ai_serving::{
 use crate::client_session_affinity::client_session_affinity_from_parts;
 use crate::{AppState, GatewayError};
 
+use super::super::super::openai_request_is_image_generation_intent;
 use super::LocalOpenAiResponsesSpec;
 
 pub(crate) use crate::ai_serving::planner::candidate_materialization::LocalExecutionCandidateAttempt as LocalOpenAiResponsesCandidateAttempt;
@@ -48,7 +51,7 @@ pub(crate) async fn resolve_local_openai_responses_decision_input(
     decision: &GatewayControlDecision,
     body_json: &serde_json::Value,
     plan_kind: &str,
-) -> Option<LocalOpenAiResponsesDecisionInput> {
+) -> Result<Option<LocalOpenAiResponsesDecisionInput>, GatewayError> {
     let Some(auth_context) = resolve_local_decision_execution_runtime_auth_context(decision) else {
         warn!(
             trace_id = %trace_id,
@@ -65,7 +68,7 @@ pub(crate) async fn resolve_local_openai_responses_decision_input(
             extract_standard_requested_model(body_json).as_deref(),
             "missing_auth_context",
         );
-        return None;
+        return Ok(None);
     };
 
     let Some(requested_model) = extract_standard_requested_model(body_json) else {
@@ -81,7 +84,7 @@ pub(crate) async fn resolve_local_openai_responses_decision_input(
             None,
             "missing_requested_model",
         );
-        return None;
+        return Ok(None);
     };
 
     let resolved_input = match resolve_local_authenticated_decision_input(
@@ -108,7 +111,7 @@ pub(crate) async fn resolve_local_openai_responses_decision_input(
                 Some(requested_model.as_str()),
                 "auth_snapshot_missing",
             );
-            return None;
+            return Ok(None);
         }
         Err(err) => {
             warn!(
@@ -124,14 +127,30 @@ pub(crate) async fn resolve_local_openai_responses_decision_input(
                 Some(requested_model.as_str()),
                 "auth_snapshot_read_failed",
             );
-            return None;
+            return Err(err);
         }
     };
 
     let mut input = build_local_requested_model_decision_input(resolved_input, requested_model);
     input.request_auth_channel = decision.request_auth_channel.clone();
     input.client_session_affinity = client_session_affinity_from_parts(parts, Some(body_json));
-    Some(input)
+    if let Err(err) = attach_routing_policy_to_local_requested_model_input(
+        state,
+        parts,
+        &mut input,
+        body_json,
+        "openai:responses",
+    )
+    .await
+    {
+        warn!(
+            trace_id = %trace_id,
+            error = ?err,
+            "gateway local openai responses decision routing profile resolution failed"
+        );
+        return Err(err);
+    }
+    Ok(Some(input))
 }
 
 pub(crate) async fn materialize_local_openai_responses_candidate_attempts(
@@ -157,6 +176,7 @@ pub(crate) async fn materialize_local_openai_responses_candidate_attempts(
         spec_metadata.require_streaming,
         input.required_capabilities.as_ref(),
         &input.auth_snapshot,
+        input.routing_policy.as_ref(),
         input.client_session_affinity.as_ref(),
         true,
         LocalCandidatePreselectionKeyMode::ProviderEndpointKeyModelAndApiFormat,
@@ -170,6 +190,7 @@ pub(crate) async fn materialize_local_openai_responses_candidate_attempts(
         Some(&input.auth_snapshot),
         input.client_session_affinity.as_ref(),
         input.required_capabilities.as_ref(),
+        input.routing_policy.as_ref(),
         sticky_session_token.as_deref(),
         input.request_auth_channel.as_deref(),
         persistence_policy,
@@ -246,6 +267,16 @@ pub(crate) async fn build_local_openai_responses_candidate_attempt_source<'a>(
         input.required_capabilities.as_ref(),
         LocalCandidatePersistencePolicyKind::OpenAiResponsesDecision,
     );
+    if openai_request_is_image_generation_intent(&input.requested_model, body_json) {
+        let (image_candidates, image_candidate_count) =
+            build_local_openai_responses_image_candidate_attempt_source(
+                state, trace_id, input, body_json, spec,
+            )
+            .await?;
+        if image_candidate_count > 0 {
+            return Ok((image_candidates, image_candidate_count));
+        }
+    }
     Ok(
         build_lazy_requested_model_execution_candidate_attempt_source_with_serving(
             planner_state,
@@ -256,6 +287,7 @@ pub(crate) async fn build_local_openai_responses_candidate_attempt_source<'a>(
             &input.auth_snapshot,
             input.client_session_affinity.as_ref(),
             input.required_capabilities.as_ref(),
+            input.routing_policy.as_ref(),
             sticky_session_token.as_deref(),
             input.request_auth_channel.as_deref(),
             persistence_policy,
@@ -313,6 +345,104 @@ pub(crate) async fn build_local_openai_responses_candidate_attempt_source<'a>(
         )
         .await,
     )
+}
+
+pub(crate) async fn build_local_openai_responses_image_candidate_attempt_source<'a>(
+    state: &'a AppState,
+    trace_id: &str,
+    input: &LocalOpenAiResponsesDecisionInput,
+    body_json: &serde_json::Value,
+    spec: LocalOpenAiResponsesSpec,
+) -> Result<(LocalOpenAiResponsesCandidateAttemptSource<'a>, usize), GatewayError> {
+    let spec_metadata = local_openai_responses_spec_metadata(spec);
+    let planner_state = PlannerAppState::new(state);
+    let sticky_session_token = extract_pool_sticky_session_token(body_json);
+    let auth_context: &ExecutionRuntimeAuthContext = &input.auth_context;
+    let persistence_policy = build_local_candidate_persistence_policy(
+        auth_context,
+        input.required_capabilities.as_ref(),
+        LocalCandidatePersistencePolicyKind::OpenAiResponsesDecision,
+    );
+    let preselection = preselect_local_execution_candidates_for_api_formats_with_serving(
+        planner_state,
+        spec_metadata.api_format,
+        &input.requested_model,
+        false,
+        input.required_capabilities.as_ref(),
+        &input.auth_snapshot,
+        input.routing_policy.as_ref(),
+        input.client_session_affinity.as_ref(),
+        true,
+        LocalCandidatePreselectionKeyMode::ProviderEndpointKeyModelAndApiFormat,
+        vec!["openai:image".to_string()],
+    )
+    .await?;
+
+    Ok(build_local_execution_candidate_attempt_source_with_serving(
+        planner_state,
+        trace_id,
+        spec_metadata.api_format,
+        Some(&input.requested_model),
+        Some(&input.auth_snapshot),
+        input.client_session_affinity.as_ref(),
+        input.required_capabilities.as_ref(),
+        input.routing_policy.as_ref(),
+        sticky_session_token.as_deref(),
+        input.request_auth_channel.as_deref(),
+        persistence_policy,
+        preselection.candidates,
+        preselection.skipped_candidates,
+        LocalCandidateResolutionMode::WithoutTransportPairGate,
+        move |eligible| {
+            let provider_api_format = eligible.provider_api_format.clone();
+            let (execution_strategy, conversion_mode) = ai_local_execution_contract_for_formats(
+                spec_metadata.api_format,
+                &provider_api_format,
+            );
+            Some(build_local_execution_candidate_contract_metadata(
+                LocalExecutionCandidateMetadataParts {
+                    eligible,
+                    provider_api_format: provider_api_format.as_str(),
+                    client_api_format: spec_metadata.api_format,
+                    extra_fields: serde_json::Map::new(),
+                },
+                execution_strategy,
+                conversion_mode,
+                eligible.candidate.endpoint_api_format.as_str(),
+            ))
+        },
+        move |mut skipped_candidate| {
+            let provider_api_format = skipped_candidate
+                .transport
+                .as_ref()
+                .map(|transport| transport.endpoint.api_format.trim().to_ascii_lowercase())
+                .unwrap_or_else(|| {
+                    skipped_candidate
+                        .candidate
+                        .endpoint_api_format
+                        .trim()
+                        .to_ascii_lowercase()
+                });
+            let (execution_strategy, conversion_mode) = ai_local_execution_contract_for_formats(
+                spec_metadata.api_format,
+                &provider_api_format,
+            );
+            skipped_candidate.extra_data = Some(
+                build_local_execution_candidate_contract_metadata_for_candidate(
+                    &skipped_candidate.candidate,
+                    skipped_candidate.transport_ref(),
+                    provider_api_format.as_str(),
+                    spec_metadata.api_format,
+                    serde_json::Map::new(),
+                    execution_strategy,
+                    conversion_mode,
+                    provider_api_format.as_str(),
+                ),
+            );
+            skipped_candidate
+        },
+    )
+    .await)
 }
 
 pub(crate) async fn mark_skipped_local_openai_responses_candidate(

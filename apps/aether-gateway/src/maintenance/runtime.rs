@@ -26,6 +26,8 @@ mod pool_quota_probe;
 mod pool_score_rebuild;
 #[path = "runtime/provider_checkin.rs"]
 mod provider_checkin;
+#[path = "runtime/provider_quota_alert.rs"]
+mod provider_quota_alert;
 #[path = "runtime/proxy_node_metrics_cleanup.rs"]
 mod proxy_node_metrics_cleanup;
 #[path = "runtime/proxy_node_staleness.rs"]
@@ -47,6 +49,8 @@ mod stats_hourly;
 mod tests;
 #[path = "runtime/usage_cleanup.rs"]
 mod usage_cleanup;
+#[path = "runtime/usage_counter_flush.rs"]
+mod usage_counter_flush;
 #[path = "runtime/wallet_daily_usage.rs"]
 mod wallet_daily_usage;
 #[path = "runtime/workers.rs"]
@@ -61,9 +65,9 @@ pub(crate) use aether_data_contracts::repository::usage::{
 };
 use audit_cleanup::*;
 pub(crate) use cleanup_runs::{
-    list_admin_cleanup_run_records, record_completed_cleanup_run, record_failed_cleanup_run,
-    start_admin_request_body_cleanup_task, start_admin_system_purge_task, AdminCleanupRunRecord,
-    AdminCleanupTaskKind, USAGE_CLEANUP_KIND,
+    list_admin_cleanup_run_records, record_admin_cleanup_run, record_completed_cleanup_run,
+    record_failed_cleanup_run, start_admin_request_body_cleanup_task,
+    start_admin_system_purge_task, AdminCleanupRunRecord, AdminCleanupTaskKind, USAGE_CLEANUP_KIND,
 };
 use config::*;
 use db_maintenance::*;
@@ -83,6 +87,9 @@ pub(crate) use pool_score_rebuild::{
     PoolScoreRebuildRunSummary, PoolScoreRebuildWorkerConfig,
 };
 pub(crate) use provider_checkin::{perform_provider_checkin_once, ProviderCheckinRunSummary};
+pub(crate) use provider_quota_alert::{
+    perform_provider_quota_alert_once, ProviderQuotaAlertRunSummary,
+};
 use proxy_node_metrics_cleanup::*;
 use proxy_node_staleness::*;
 use proxy_upgrade_rollout::*;
@@ -98,12 +105,17 @@ pub(crate) use proxy_upgrade_rollout::{
 };
 use request_candidate_cleanup::*;
 use runners::*;
-pub(crate) use runners::{run_manual_usage_cleanup_once, ManualUsageCleanupError};
+pub(crate) use runners::{
+    run_manual_usage_cleanup_once, start_manual_usage_cleanup_task, ManualUsageCleanupError,
+};
 use schedule::*;
 use stats_daily::*;
 use stats_hourly::*;
-pub(crate) use usage_cleanup::preview_manual_usage_cleanup;
 use usage_cleanup::*;
+pub(crate) use usage_cleanup::{
+    preview_manual_usage_cleanup, ManualUsageCleanupMode, ManualUsageCleanupOptions,
+};
+use usage_counter_flush::*;
 use wallet_daily_usage::*;
 pub(crate) use workers::*;
 
@@ -124,7 +136,15 @@ const PROXY_NODE_STALE_MIN_GRACE_SECS: u64 = 15;
 const PROXY_NODE_STALE_MISSED_HEARTBEATS: u64 = 3;
 const POOL_MONITOR_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const OAUTH_TOKEN_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+const USAGE_COUNTER_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
+const USAGE_COUNTER_FLUSH_BATCH_SIZE: usize = 1_000;
+const USAGE_COUNTER_FLUSH_CATCH_UP_BURST_LIMIT: usize = 20;
+const USAGE_COUNTER_DELTA_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
+const USAGE_COUNTER_DELTA_CLEANUP_BATCH_SIZE: usize = 5_000;
+const USAGE_COUNTER_DELTA_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
 const PROVIDER_CHECKIN_CONCURRENCY: usize = 3;
+const PROVIDER_QUOTA_ALERT_CONCURRENCY: usize = 3;
+const PROVIDER_QUOTA_ALERT_INTERVAL: Duration = Duration::from_secs(5);
 const PROVIDER_CHECKIN_DEFAULT_TIME: &str = "01:05";
 const REQUEST_CANDIDATE_CLEANUP_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const STATS_DAILY_AGGREGATION_HOUR: u32 = 0;

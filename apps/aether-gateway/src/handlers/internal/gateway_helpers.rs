@@ -354,12 +354,7 @@ pub(crate) async fn maybe_build_internal_finalize_video_response(
 }
 
 pub(crate) fn gateway_error_message(error: GatewayError) -> String {
-    match error {
-        GatewayError::UpstreamUnavailable { message, .. }
-        | GatewayError::ControlUnavailable { message, .. }
-        | GatewayError::Client { message, .. }
-        | GatewayError::Internal(message) => message,
-    }
+    error.into_message()
 }
 
 pub(crate) fn build_internal_tunnel_heartbeat_ack(
@@ -407,10 +402,16 @@ pub(crate) fn parse_internal_tunnel_heartbeat_request(
         .is_some_and(|value| !(5..=600).contains(&value))
         || payload.active_connections.is_some_and(|value| value < 0)
         || payload.total_requests.is_some_and(|value| value < 0)
+        || payload.window_total_requests.is_some_and(|value| value < 0)
         || payload.avg_latency_ms.is_some_and(|value| value < 0.0)
         || payload.failed_requests.is_some_and(|value| value < 0)
+        || payload
+            .window_failed_requests
+            .is_some_and(|value| value < 0)
         || payload.dns_failures.is_some_and(|value| value < 0)
+        || payload.window_dns_failures.is_some_and(|value| value < 0)
         || payload.stream_errors.is_some_and(|value| value < 0)
+        || payload.window_stream_errors.is_some_and(|value| value < 0)
         || payload
             .proxy_version
             .as_deref()

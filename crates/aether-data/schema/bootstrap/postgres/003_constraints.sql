@@ -1228,6 +1228,96 @@ END $mig$;
 
 
 --
+-- Name: user_invite_codes user_invite_codes_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+DO $mig$ BEGIN
+  ALTER TABLE ONLY public.user_invite_codes
+    ADD CONSTRAINT user_invite_codes_pkey PRIMARY KEY (user_id);
+EXCEPTION
+  WHEN duplicate_object THEN NULL;
+  WHEN duplicate_table THEN NULL;
+  WHEN invalid_table_definition THEN NULL;
+END $mig$;
+
+
+
+--
+-- Name: user_invite_codes user_invite_codes_invite_code_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+DO $mig$ BEGIN
+  ALTER TABLE ONLY public.user_invite_codes
+    ADD CONSTRAINT user_invite_codes_invite_code_key UNIQUE (invite_code);
+EXCEPTION
+  WHEN duplicate_object THEN NULL;
+  WHEN duplicate_table THEN NULL;
+  WHEN invalid_table_definition THEN NULL;
+END $mig$;
+
+
+
+--
+-- Name: user_referrals user_referrals_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+DO $mig$ BEGIN
+  ALTER TABLE ONLY public.user_referrals
+    ADD CONSTRAINT user_referrals_pkey PRIMARY KEY (id);
+EXCEPTION
+  WHEN duplicate_object THEN NULL;
+  WHEN duplicate_table THEN NULL;
+  WHEN invalid_table_definition THEN NULL;
+END $mig$;
+
+
+
+--
+-- Name: user_referrals user_referrals_invitee_user_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+DO $mig$ BEGIN
+  ALTER TABLE ONLY public.user_referrals
+    ADD CONSTRAINT user_referrals_invitee_user_id_key UNIQUE (invitee_user_id);
+EXCEPTION
+  WHEN duplicate_object THEN NULL;
+  WHEN duplicate_table THEN NULL;
+  WHEN invalid_table_definition THEN NULL;
+END $mig$;
+
+
+
+--
+-- Name: referral_rewards referral_rewards_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+DO $mig$ BEGIN
+  ALTER TABLE ONLY public.referral_rewards
+    ADD CONSTRAINT referral_rewards_pkey PRIMARY KEY (id);
+EXCEPTION
+  WHEN duplicate_object THEN NULL;
+  WHEN duplicate_table THEN NULL;
+  WHEN invalid_table_definition THEN NULL;
+END $mig$;
+
+
+
+--
+-- Name: referral_rewards referral_rewards_idempotency_key_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+DO $mig$ BEGIN
+  ALTER TABLE ONLY public.referral_rewards
+    ADD CONSTRAINT referral_rewards_idempotency_key_key UNIQUE (idempotency_key);
+EXCEPTION
+  WHEN duplicate_object THEN NULL;
+  WHEN duplicate_table THEN NULL;
+  WHEN invalid_table_definition THEN NULL;
+END $mig$;
+
+
+
+--
 -- Name: user_plan_entitlements user_plan_entitlements_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 

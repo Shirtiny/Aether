@@ -1,7 +1,7 @@
 use axum::routing::{any, post};
 use axum::Router;
 
-use super::{claude, doubao, gemini, jina, openai};
+use super::{aliyun, claude, doubao, gemini, jina, openai};
 use crate::{handlers::proxy::proxy_request, state::AppState};
 
 // Router registration patterns live here so AI public ingress has a single mount registry.
@@ -17,7 +17,14 @@ const AI_POST_ROUTE_PATTERNS: &[&str] = &[
     "/v1/responses/compact",
     "/v1/images/generations",
     "/v1/images/edits",
-    "/v1/images/variations",
+    "/v1internal:loadCodeAssist",
+    "/v1internal:fetchAvailableModels",
+    "/v1internal:fetchUserInfo",
+    "/v1internal:fetchAdminControls",
+    "/v1internal:setUserSettings",
+    "/v1internal:listExperiments",
+    "/v1internal:recordCodeAssistMetrics",
+    "/v1internal:streamGenerateContent",
 ];
 
 const AI_ANY_ROUTE_PATTERNS: &[&str] = &[
@@ -49,6 +56,7 @@ pub(crate) fn public_api_format_local_path(api_format: &str) -> &'static str {
         .or_else(|| gemini::local_path(&normalized))
         .or_else(|| jina::local_path(&normalized))
         .or_else(|| doubao::local_path(&normalized))
+        .or_else(|| aliyun::local_path(&normalized))
         .unwrap_or("/")
 }
 
@@ -59,6 +67,7 @@ pub(crate) fn normalize_admin_endpoint_signature(api_format: &str) -> Option<&'s
         .or_else(|| gemini::normalized_signature(&normalized))
         .or_else(|| jina::normalized_signature(&normalized))
         .or_else(|| doubao::normalized_signature(&normalized))
+        .or_else(|| aliyun::normalized_signature(&normalized))
 }
 
 pub(crate) fn admin_endpoint_signature_parts(
@@ -86,9 +95,20 @@ mod tests {
     fn supports_data_api_endpoint_signatures_and_public_paths() {
         for (api_format, family, kind, path) in [
             ("openai:embedding", "openai", "embedding", "/v1/embeddings"),
-            ("gemini:embedding", "gemini", "embedding", "/v1/embeddings"),
+            (
+                "gemini:embedding",
+                "gemini",
+                "embedding",
+                "/v1beta/models/{model}:{action}",
+            ),
             ("jina:embedding", "jina", "embedding", "/v1/embeddings"),
             ("doubao:embedding", "doubao", "embedding", "/v1/embeddings"),
+            (
+                "aliyun:multimodal_embedding",
+                "aliyun",
+                "multimodal_embedding",
+                "/api/v1/services/embeddings/multimodal-embedding/multimodal-embedding",
+            ),
             ("openai:rerank", "openai", "rerank", "/v1/rerank"),
             ("jina:rerank", "jina", "rerank", "/v1/rerank"),
         ] {

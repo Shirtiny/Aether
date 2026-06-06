@@ -205,7 +205,7 @@ pub(crate) async fn build_admin_update_provider_record(
         updated.stream_first_byte_timeout_secs = match payload.stream_first_byte_timeout {
             Some(value) if (1.0..=300.0).contains(&value) => Some(value),
             Some(_) => {
-                return Err("stream_first_byte_timeout 必须是 1 到 300 之间的数字".to_string())
+                return Err("stream_first_byte_timeout 必须是 1 到 300 之间的数字".to_string());
             }
             None => None,
         };

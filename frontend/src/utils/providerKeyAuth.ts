@@ -1,4 +1,5 @@
 export interface ProviderKeyAuthCarrier {
+  provider_type?: string | null
   auth_type?: string | null
   credential_kind?: string | null
   runtime_auth_kind?: string | null
@@ -13,6 +14,14 @@ function normalizeText(value: unknown): string | null {
   if (typeof value !== 'string') return null
   const text = value.trim().toLowerCase()
   return text || null
+}
+
+function resolveProviderType(input: ProviderKeyAuthCarrier, providerType?: string | null): string | null {
+  return normalizeText(providerType) ?? normalizeText(input.provider_type)
+}
+
+function isGrokSessionCredential(input: ProviderKeyAuthCarrier, providerType?: string | null): boolean {
+  return resolveProviderType(input, providerType) === 'grok' && isOAuthManagedCredential(input)
 }
 
 export function getProviderCredentialKind(
@@ -78,8 +87,12 @@ export function canRefreshOAuthCredential(input: ProviderKeyAuthCarrier): boolea
   return isOAuthManagedCredential(input)
 }
 
-export function shouldShowOAuthRefreshControl(input: ProviderKeyAuthCarrier): boolean {
-  return isOAuthManagedCredential(input)
+export function shouldShowOAuthRefreshControl(
+  input: ProviderKeyAuthCarrier,
+  providerType?: string | null,
+): boolean {
+  if (isGrokSessionCredential(input, providerType)) return false
+  return canRefreshOAuthCredential(input)
 }
 
 export function canExportOAuthCredential(input: ProviderKeyAuthCarrier): boolean {
@@ -103,7 +116,11 @@ export function getProviderAuthLabel(input: ProviderKeyAuthCarrier): string {
   return getProviderRuntimeAuthKind(input) === 'bearer' ? 'Bearer' : 'API Key'
 }
 
-export function getProviderMaskedSecretLabel(input: ProviderKeyAuthCarrier): string {
+export function getProviderMaskedSecretLabel(
+  input: ProviderKeyAuthCarrier,
+  providerType?: string | null,
+): string {
+  if (isGrokSessionCredential(input, providerType)) return '[Session Cookie]'
   if (isOAuthManagedCredential(input)) return '[OAuth Token]'
   if (isServiceAccountCredential(input)) return '[Service Account]'
   if (getProviderRuntimeAuthKind(input) === 'mixed') return '[Key]'

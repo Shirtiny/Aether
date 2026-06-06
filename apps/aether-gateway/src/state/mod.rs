@@ -11,6 +11,7 @@ mod cors;
 mod integrations;
 mod oauth;
 mod proxy;
+mod routing_profiles;
 mod runtime;
 #[cfg(test)]
 mod testing;
@@ -26,6 +27,7 @@ pub(crate) use self::admin_types::{
     UserDailyQuotaAvailabilityRecord, UserPlanEntitlementRecord,
 };
 pub use self::app::AppState;
+pub(crate) use self::app::FrontdoorRuntimeGuardConfig;
 pub(crate) use self::cache::{
     CachedProviderTransportSnapshot, AUTH_API_KEY_LAST_USED_MAX_ENTRIES,
     AUTH_API_KEY_LAST_USED_TTL, PROVIDER_TRANSPORT_SNAPSHOT_CACHE_MAX_ENTRIES,

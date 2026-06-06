@@ -35,6 +35,7 @@ describe('model catalog embedding helpers', () => {
     expect(supportsEmbedding(model({ config: { embedding: true } }))).toBe(true)
     expect(supportsEmbedding(model({ config: { model_type: 'embedding' } }))).toBe(true)
     expect(supportsEmbedding(model({ config: { api_formats: ['jina:embedding'] } }))).toBe(true)
+    expect(supportsEmbedding(model({ config: { api_formats: ['aliyun:multimodal_embedding'] } }))).toBe(true)
     expect(supportsEmbedding(model({ config: { api_formats: ['openai:chat'] } }))).toBe(false)
   })
 

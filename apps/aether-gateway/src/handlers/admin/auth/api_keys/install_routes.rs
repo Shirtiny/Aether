@@ -38,7 +38,7 @@ pub(super) async fn build_admin_create_api_key_install_session_response(
         Err(_) => {
             return Ok(build_admin_api_keys_bad_request_response(
                 "请求数据验证失败",
-            ))
+            ));
         }
     };
 

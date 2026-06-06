@@ -28,12 +28,12 @@ use super::{
     spawn_stats_hourly_aggregation_worker, spawn_usage_cleanup_worker,
     spawn_wallet_daily_usage_aggregation_worker, start_proxy_upgrade_rollout,
     stats_aggregation_target_day, stats_hourly_aggregation_target_hour, summarize_database_pool,
-    usage_cleanup_settings, usage_cleanup_window, usage_cleanup_window_with_override,
-    wallet_daily_usage_aggregation_target, AppState, DbMaintenanceRunSummary,
-    FailedPendingUsageRow, GatewayDataState, ProxyNodeMetricsCleanupSettings,
-    ProxyUpgradeRolloutProbeConfig, StalePendingUsageRow, UsageCleanupSettings, USAGE_CLEANUP_HOUR,
-    USAGE_CLEANUP_MINUTE, WALLET_DAILY_USAGE_AGGREGATION_HOUR,
-    WALLET_DAILY_USAGE_AGGREGATION_MINUTE,
+    usage_cleanup_settings, usage_cleanup_window, usage_cleanup_window_for_mode,
+    usage_cleanup_window_with_override, wallet_daily_usage_aggregation_target, AppState,
+    DbMaintenanceRunSummary, FailedPendingUsageRow, GatewayDataState, ManualUsageCleanupMode,
+    ProxyNodeMetricsCleanupSettings, ProxyUpgradeRolloutProbeConfig, StalePendingUsageRow,
+    UsageCleanupSettings, USAGE_CLEANUP_HOUR, USAGE_CLEANUP_MINUTE,
+    WALLET_DAILY_USAGE_AGGREGATION_HOUR, WALLET_DAILY_USAGE_AGGREGATION_MINUTE,
 };
 
 #[tokio::test]
@@ -253,7 +253,7 @@ async fn proxy_upgrade_rollout_advances_next_wave_after_version_health_confirmat
             dns_failures_delta: Some(0),
             stream_errors_delta: Some(0),
             proxy_metadata: Some(json!({"version": "2.0.0"})),
-            proxy_version: Some("proxy-v2.0.0".to_string()),
+            proxy_version: Some("tunnel-v2.0.0".to_string()),
         })
         .await
         .expect("heartbeat should succeed");
@@ -475,6 +475,7 @@ async fn proxy_upgrade_rollout_active_probe_advances_next_wave_after_version_con
             proxy_tx,
             proxy_close_tx,
             16,
+            2,
         )));
 
     let responder_hub = tunnel_state.hub.clone();
@@ -984,6 +985,29 @@ fn usage_cleanup_window_with_override_is_always_non_aggressive() {
 
     let passthrough = usage_cleanup_window_with_override(now_utc, settings, None);
     assert_eq!(passthrough, policy);
+}
+
+#[test]
+fn usage_cleanup_before_now_window_uses_current_timestamp_only() {
+    let now_utc = "2026-03-18T03:00:00Z"
+        .parse::<DateTime<Utc>>()
+        .expect("timestamp should parse");
+    let settings = UsageCleanupSettings {
+        detail_retention_days: 7,
+        compressed_retention_days: 30,
+        header_retention_days: 90,
+        log_retention_days: 365,
+        batch_size: 123,
+        auto_delete_expired_keys: false,
+    };
+
+    let window =
+        usage_cleanup_window_for_mode(now_utc, settings, ManualUsageCleanupMode::BeforeNow, None);
+
+    assert_eq!(window.detail_cutoff, now_utc);
+    assert_eq!(window.compressed_cutoff, now_utc);
+    assert_eq!(window.header_cutoff, now_utc);
+    assert_eq!(window.log_cutoff, now_utc);
 }
 
 #[tokio::test]

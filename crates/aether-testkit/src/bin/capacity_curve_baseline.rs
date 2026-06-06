@@ -7,9 +7,9 @@ use aether_contracts::{ExecutionPlan, ExecutionTimeouts, RequestBody};
 use aether_gateway::tunnel_protocol as protocol;
 use aether_testkit::{
     fetch_prometheus_samples, find_metric_value_u64, init_test_runtime_for, run_http_load_probe,
-    ExecutionRuntimeHarness, ExecutionRuntimeHarnessConfig, GatewayHarness, GatewayHarnessConfig,
-    HttpLoadProbeConfig, HttpLoadProbeResponseMode, HttpLoadProbeResult, SpawnedServer,
-    TunnelHarness, TunnelHarnessConfig,
+    BenchmarkRuntimeSnapshot, ExecutionRuntimeHarness, ExecutionRuntimeHarnessConfig,
+    GatewayHarness, GatewayHarnessConfig, HttpLoadProbeConfig, HttpLoadProbeResponseMode,
+    HttpLoadProbeResult, SpawnedServer, TunnelHarness, TunnelHarnessConfig,
 };
 use axum::body::{to_bytes, Body, Bytes};
 use axum::http::StatusCode;
@@ -84,9 +84,11 @@ struct CapacityCurvePointResult {
     throughput_rps: u64,
     p50_ms: u64,
     p95_ms: u64,
+    p99_ms: u64,
     max_ms: u64,
     mean_ms: u64,
     metrics: GateMetricSnapshot,
+    runtime: BenchmarkRuntimeSnapshot,
 }
 
 #[derive(Debug, Serialize)]
@@ -387,9 +389,11 @@ fn capacity_point(
         throughput_rps,
         p50_ms: result.p50_ms,
         p95_ms: result.p95_ms,
+        p99_ms: result.p99_ms,
         max_ms: result.max_ms,
         mean_ms: result.mean_ms,
         metrics,
+        runtime: result.runtime,
     }
 }
 
@@ -605,6 +609,9 @@ fn relay_envelope() -> Vec<u8> {
             "content-type".to_string(),
             "application/json".to_string(),
         )]),
+        stream: false,
+        request_timeout_ms: None,
+        stream_first_byte_timeout_ms: None,
         timeout: 30,
         follow_redirects: None,
         http1_only: false,
@@ -637,6 +644,12 @@ async fn connect_protocol_peer(
         .headers_mut()
         .insert("x-node-id", http::HeaderValue::from_static("node-baseline"));
     request.headers_mut().insert(
+        aether_contracts::tunnel::TUNNEL_PROTOCOL_VERSION_HEADER,
+        http::HeaderValue::from_static(
+            aether_contracts::tunnel::CURRENT_TUNNEL_PROTOCOL_VERSION_STR,
+        ),
+    );
+    request.headers_mut().insert(
         "x-node-name",
         http::HeaderValue::from_static("proxy-baseline"),
     );
@@ -647,6 +660,29 @@ async fn connect_protocol_peer(
 
     let (socket, _response) = tokio_tungstenite::connect_async(request).await?;
     let (mut sink, mut stream) = socket.split();
+    sink.send(Message::Binary(
+        protocol::encode_hello(&protocol::HelloPayload {
+            protocol_version: aether_contracts::tunnel::CURRENT_TUNNEL_PROTOCOL_VERSION,
+            capabilities: vec![
+                "flow-control".to_string(),
+                "reset-stream".to_string(),
+                "graceful-drain".to_string(),
+            ],
+            session_id: Some("capacity-curve-session".to_string()),
+            replica_id: Some("capacity-curve-replica".to_string()),
+        })
+        .into(),
+    ))
+    .await?;
+    sink.send(Message::Binary(
+        protocol::encode_settings(&protocol::SettingsPayload {
+            initial_stream_window_bytes: 4 * 1024 * 1024,
+            min_window_update_bytes: 1024 * 1024,
+            drain_deadline_ms: 30_000,
+        })
+        .into(),
+    ))
+    .await?;
     Ok(tokio::spawn(async move {
         while let Some(message) = stream.next().await {
             let Ok(message) = message else {
@@ -694,7 +730,17 @@ where
             let payload = protocol::decode_payload(&data, &header).unwrap_or_default();
             let _ = serde_json::from_slice::<protocol::RequestMeta>(&payload);
         }
-        protocol::REQUEST_BODY if header.flags & protocol::FLAG_END_STREAM != 0 => {
+        protocol::REQUEST_BODY => {
+            let payload = protocol::decode_payload(&data, &header).unwrap_or_default();
+            if !payload.is_empty() {
+                sink.send(Message::Binary(
+                    protocol::encode_window_update(header.stream_id, payload.len() as u32).into(),
+                ))
+                .await?;
+            }
+            if header.flags & protocol::FLAG_END_STREAM == 0 {
+                return Ok(());
+            }
             tokio::time::sleep(hold).await;
             let response_meta = protocol::ResponseMeta {
                 status: 200,

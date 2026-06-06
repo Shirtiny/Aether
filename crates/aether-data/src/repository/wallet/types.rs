@@ -927,6 +927,12 @@ pub trait WalletReadRepository: Send + Sync {
         order_id: &str,
     ) -> Result<Option<StoredAdminPaymentOrder>, crate::DataLayerError>;
 
+    async fn find_pending_plan_purchase_order_by_user_id(
+        &self,
+        user_id: &str,
+        product_id: &str,
+    ) -> Result<Option<StoredAdminPaymentOrder>, crate::DataLayerError>;
+
     async fn find_wallet_refund(
         &self,
         wallet_id: &str,

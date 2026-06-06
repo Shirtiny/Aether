@@ -1,3 +1,4 @@
+use super::super::support_wallet::build_wallet_balance_payload_for_user;
 use super::{
     build_auth_error_response, query_param_value, resolve_authenticated_local_user, AppState,
     GatewayError, GatewayPublicRequestContext,
@@ -159,25 +160,59 @@ fn dashboard_format_token_compact(value: u64) -> String {
         return dashboard_format_integer(value);
     }
 
-    if value < 1_000_000 {
-        let thousands = value as f64 / 1_000.0;
-        if thousands >= 100.0 {
-            return format!("{}K", thousands.round() as u64);
+    const UNITS: &[(u64, &str)] = &[
+        (1_000_000_000_000, "T"),
+        (1_000_000_000, "B"),
+        (1_000_000, "M"),
+        (1_000, "K"),
+    ];
+
+    for (divisor, suffix) in UNITS {
+        if value < *divisor {
+            continue;
         }
-        let decimals = if thousands >= 10.0 { 1 } else { 2 };
-        return format!("{}K", dashboard_trimmed_decimal(thousands, decimals));
+        let scaled = value as f64 / *divisor as f64;
+        if scaled >= 100.0 {
+            return format!("{}{}", scaled.round() as u64, suffix);
+        }
+        let decimals = if scaled >= 10.0 { 1 } else { 2 };
+        return format!("{}{}", dashboard_trimmed_decimal(scaled, decimals), suffix);
     }
 
-    let millions = value as f64 / 1_000_000.0;
-    if millions >= 100.0 {
-        return format!("{}M", millions.round() as u64);
-    }
-    let decimals = if millions >= 10.0 { 1 } else { 2 };
-    format!("{}M", dashboard_trimmed_decimal(millions, decimals))
+    dashboard_format_integer(value)
 }
 
 fn dashboard_format_usd(value: f64) -> String {
     format!("${:.2}", dashboard_round_f64(value, 2))
+}
+
+fn dashboard_json_f64(value: Option<&serde_json::Value>) -> f64 {
+    value.and_then(serde_json::Value::as_f64).unwrap_or(0.0)
+}
+
+fn dashboard_wallet_card_value_and_subvalue(
+    wallet_payload: &serde_json::Value,
+) -> (String, String) {
+    let unlimited = wallet_payload
+        .get("unlimited")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if unlimited {
+        return ("无限额度".to_string(), "无限额度".to_string());
+    }
+
+    let package_balance = dashboard_json_f64(wallet_payload.get("package_balance")).max(0.0);
+    let wallet_balance = dashboard_json_f64(wallet_payload.get("wallet_balance")).max(0.0);
+    let total_available =
+        dashboard_json_f64(wallet_payload.get("total_available_balance")).max(0.0);
+    (
+        dashboard_format_usd(total_available),
+        format!(
+            "套餐额度 {} · 钱包余额 {}",
+            dashboard_format_usd(package_balance),
+            dashboard_format_usd(wallet_balance)
+        ),
+    )
 }
 
 fn dashboard_format_percentage(value: f64) -> String {
@@ -1050,26 +1085,10 @@ pub(super) async fn handle_dashboard_stats_get(
     } else {
         None
     };
-    let wallet_value = wallet
-        .as_ref()
-        .map(|wallet| {
-            if wallet.limit_mode.eq_ignore_ascii_case("unlimited") {
-                "无限制".to_string()
-            } else {
-                dashboard_format_usd(wallet.balance)
-            }
-        })
-        .unwrap_or_else(|| dashboard_format_usd(0.0));
-    let wallet_sub_value = wallet
-        .as_ref()
-        .map(|wallet| {
-            if wallet.limit_mode.eq_ignore_ascii_case("unlimited") {
-                "无限额度".to_string()
-            } else {
-                format!("赠款 {}", dashboard_format_usd(wallet.gift_balance))
-            }
-        })
-        .unwrap_or_else(|| "暂无钱包".to_string());
+    let wallet_payload =
+        build_wallet_balance_payload_for_user(state, &auth.user.id, wallet.as_ref()).await;
+    let (wallet_value, wallet_sub_value) =
+        dashboard_wallet_card_value_and_subvalue(&wallet_payload);
     let payload = json!({
         "stats": [
             {
@@ -1305,6 +1324,19 @@ pub(super) async fn handle_dashboard_provider_status_get(
     request_context: &GatewayPublicRequestContext,
     headers: &http::HeaderMap,
 ) -> Response<Body> {
+    let auth = match resolve_authenticated_local_user(state, request_context, headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+
+    if !dashboard_role_is_admin(&auth.user.role) {
+        return build_auth_error_response(
+            http::StatusCode::FORBIDDEN,
+            "仅管理员可查看供应商状态",
+            false,
+        );
+    }
+
     if !state.has_usage_data_reader() {
         return dashboard_backend_unavailable_response("Usage data backend unavailable");
     }
@@ -1312,16 +1344,7 @@ pub(super) async fn handle_dashboard_provider_status_get(
         return dashboard_backend_unavailable_response("Provider catalog backend unavailable");
     }
 
-    let auth = match resolve_authenticated_local_user(state, request_context, headers).await {
-        Ok(value) => value,
-        Err(response) => return response,
-    };
-
-    let cache_identity = if dashboard_role_is_admin(&auth.user.role) {
-        "admin"
-    } else {
-        auth.user.id.as_str()
-    };
+    let cache_identity = "admin";
     let cache_key = format!("provider:{cache_identity}");
     let cache_ttl = std::time::Duration::from_secs(20);
 
@@ -1398,11 +1421,7 @@ pub(super) async fn handle_dashboard_provider_status_get(
                     .cmp(right["name"].as_str().unwrap_or_default())
             })
     });
-    let limit = if dashboard_role_is_admin(&auth.user.role) {
-        10
-    } else {
-        5
-    };
+    let limit = 10;
     if entries.len() > limit {
         entries.truncate(limit);
     }
@@ -1485,4 +1504,18 @@ fn dashboard_format_time_hhmm(unix_secs: u64) -> Option<String> {
     let timestamp = i64::try_from(unix_secs).ok()?;
     let datetime = chrono::DateTime::<chrono::Utc>::from_timestamp(timestamp, 0)?;
     Some(datetime.format("%H:%M").to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dashboard_format_token_compact;
+
+    #[test]
+    fn dashboard_format_token_compact_promotes_above_millions() {
+        assert_eq!(dashboard_format_token_compact(999), "999");
+        assert_eq!(dashboard_format_token_compact(1_250), "1.25K");
+        assert_eq!(dashboard_format_token_compact(12_500_000), "12.5M");
+        assert_eq!(dashboard_format_token_compact(1_250_000_000), "1.25B");
+        assert_eq!(dashboard_format_token_compact(12_500_000_000_000), "12.5T");
+    }
 }

@@ -57,7 +57,7 @@ pub(super) async fn handle_admin_provider_ops_action(
                     Err(_) => {
                         return Ok(Some(bad_request_detail_response(
                             "请求体必须是合法的 JSON 对象",
-                        )))
+                        )));
                     }
                 };
                 let payload =
@@ -67,7 +67,7 @@ pub(super) async fn handle_admin_provider_ops_action(
                         Err(_) => {
                             return Ok(Some(bad_request_detail_response(
                                 "请求体必须是合法的 JSON 对象",
-                            )))
+                            )));
                         }
                     };
                 payload.config

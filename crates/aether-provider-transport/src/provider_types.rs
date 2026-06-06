@@ -47,6 +47,7 @@ pub enum ProviderApiFormatInheritance {
     None,
     OAuth,
     OAuthOrBearer,
+    OAuthOrServiceAccount,
     OAuthOrConfiguredBearer,
 }
 
@@ -61,6 +62,9 @@ impl ProviderApiFormatInheritance {
             Self::None => false,
             Self::OAuth => auth_type == "oauth",
             Self::OAuthOrBearer => auth_type == "oauth" || auth_type == "bearer",
+            Self::OAuthOrServiceAccount => {
+                auth_type == "oauth" || auth_type == "service_account" || auth_type == "vertex_ai"
+            }
             Self::OAuthOrConfiguredBearer => {
                 auth_type == "oauth"
                     || auth_type == "bearer"
@@ -80,6 +84,7 @@ pub enum ProviderLocalEmbeddingSupport {
     Gemini,
     Jina,
     Doubao,
+    Aliyun,
 }
 
 impl ProviderLocalEmbeddingSupport {
@@ -95,11 +100,13 @@ impl ProviderLocalEmbeddingSupport {
                     | "jina:embedding"
                     | "jina:rerank"
                     | "doubao:embedding"
+                    | "aliyun:multimodal_embedding"
             ),
             Self::OpenAi => matches!(api_format.as_str(), "openai:embedding" | "openai:rerank"),
             Self::Gemini => api_format == "gemini:embedding",
             Self::Jina => matches!(api_format.as_str(), "jina:embedding" | "jina:rerank"),
             Self::Doubao => api_format == "doubao:embedding",
+            Self::Aliyun => api_format == "aliyun:multimodal_embedding",
         }
     }
 }
@@ -161,6 +168,11 @@ const FORCE_STREAM_ENDPOINT_CONFIG_DEFAULTS: &[FixedProviderEndpointConfigDefaul
         key: "upstream_stream_policy",
         value: FixedProviderEndpointConfigValue::String("force_stream"),
     }];
+const AUTO_STREAM_ENDPOINT_CONFIG_DEFAULTS: &[FixedProviderEndpointConfigDefault] =
+    &[FixedProviderEndpointConfigDefault {
+        key: "upstream_stream_policy",
+        value: FixedProviderEndpointConfigValue::String("auto"),
+    }];
 
 const STANDARD_RUNTIME_POLICY: ProviderRuntimePolicy = ProviderRuntimePolicy::standard();
 const CUSTOM_RUNTIME_POLICY: ProviderRuntimePolicy = ProviderRuntimePolicy {
@@ -181,6 +193,10 @@ const JINA_RUNTIME_POLICY: ProviderRuntimePolicy = ProviderRuntimePolicy {
 };
 const DOUBAO_RUNTIME_POLICY: ProviderRuntimePolicy = ProviderRuntimePolicy {
     local_embedding_support: ProviderLocalEmbeddingSupport::Doubao,
+    ..STANDARD_RUNTIME_POLICY
+};
+const ALIYUN_RUNTIME_POLICY: ProviderRuntimePolicy = ProviderRuntimePolicy {
+    local_embedding_support: ProviderLocalEmbeddingSupport::Aliyun,
     ..STANDARD_RUNTIME_POLICY
 };
 
@@ -221,6 +237,26 @@ const GEMINI_CLI_RUNTIME_POLICY: ProviderRuntimePolicy = ProviderRuntimePolicy {
 };
 const VERTEX_AI_RUNTIME_POLICY: ProviderRuntimePolicy = ProviderRuntimePolicy {
     fixed_provider: true,
+    api_format_inheritance: ProviderApiFormatInheritance::OAuthOrServiceAccount,
+    enable_format_conversion_by_default: true,
+    supports_model_fetch: false,
+    supports_local_openai_chat_transport: false,
+    supports_local_same_format_transport: false,
+    local_embedding_support: ProviderLocalEmbeddingSupport::Gemini,
+    ..STANDARD_RUNTIME_POLICY
+};
+const ANTIGRAVITY_RUNTIME_POLICY: ProviderRuntimePolicy = ProviderRuntimePolicy {
+    fixed_provider: true,
+    api_format_inheritance: ProviderApiFormatInheritance::OAuth,
+    enable_format_conversion_by_default: true,
+    oauth_is_bearer_like: true,
+    supports_model_fetch: false,
+    supports_local_openai_chat_transport: false,
+    supports_local_same_format_transport: false,
+    ..STANDARD_RUNTIME_POLICY
+};
+const GROK_RUNTIME_POLICY: ProviderRuntimePolicy = ProviderRuntimePolicy {
+    fixed_provider: true,
     api_format_inheritance: ProviderApiFormatInheritance::OAuth,
     enable_format_conversion_by_default: true,
     supports_model_fetch: false,
@@ -228,9 +264,10 @@ const VERTEX_AI_RUNTIME_POLICY: ProviderRuntimePolicy = ProviderRuntimePolicy {
     supports_local_same_format_transport: false,
     ..STANDARD_RUNTIME_POLICY
 };
-const ANTIGRAVITY_RUNTIME_POLICY: ProviderRuntimePolicy = ProviderRuntimePolicy {
+
+const WINDSURF_RUNTIME_POLICY: ProviderRuntimePolicy = ProviderRuntimePolicy {
     fixed_provider: true,
-    api_format_inheritance: ProviderApiFormatInheritance::OAuth,
+    api_format_inheritance: ProviderApiFormatInheritance::OAuthOrBearer,
     enable_format_conversion_by_default: true,
     oauth_is_bearer_like: true,
     supports_model_fetch: false,
@@ -307,13 +344,13 @@ const KIRO_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProviderTemplat
 
 const GEMINI_CLI_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProviderTemplate {
     provider_type: "gemini_cli",
-    version: 1,
+    version: 3,
     base_url: "https://cloudcode-pa.googleapis.com",
     endpoints: &[FixedProviderEndpointTemplate {
         item_key: "gemini:generate_content",
         api_format: "gemini:generate_content",
-        custom_path: None,
-        config_defaults: EMPTY_ENDPOINT_CONFIG_DEFAULTS,
+        custom_path: Some("/v1internal:{action}"),
+        config_defaults: AUTO_STREAM_ENDPOINT_CONFIG_DEFAULTS,
     }],
     runtime_policy: GEMINI_CLI_RUNTIME_POLICY,
 };
@@ -326,6 +363,12 @@ const VERTEX_AI_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProviderTe
         FixedProviderEndpointTemplate {
             item_key: "gemini:generate_content",
             api_format: "gemini:generate_content",
+            custom_path: None,
+            config_defaults: EMPTY_ENDPOINT_CONFIG_DEFAULTS,
+        },
+        FixedProviderEndpointTemplate {
+            item_key: "gemini:embedding",
+            api_format: "gemini:embedding",
             custom_path: None,
             config_defaults: EMPTY_ENDPOINT_CONFIG_DEFAULTS,
         },
@@ -350,6 +393,52 @@ const ANTIGRAVITY_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProvider
         config_defaults: EMPTY_ENDPOINT_CONFIG_DEFAULTS,
     }],
     runtime_policy: ANTIGRAVITY_RUNTIME_POLICY,
+};
+
+const GROK_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProviderTemplate {
+    provider_type: "grok",
+    version: 1,
+    base_url: "https://grok.com",
+    endpoints: &[
+        FixedProviderEndpointTemplate {
+            item_key: "openai:chat",
+            api_format: "openai:chat",
+            custom_path: None,
+            config_defaults: EMPTY_ENDPOINT_CONFIG_DEFAULTS,
+        },
+        FixedProviderEndpointTemplate {
+            item_key: "openai:responses",
+            api_format: "openai:responses",
+            custom_path: None,
+            config_defaults: EMPTY_ENDPOINT_CONFIG_DEFAULTS,
+        },
+        FixedProviderEndpointTemplate {
+            item_key: "claude:messages",
+            api_format: "claude:messages",
+            custom_path: None,
+            config_defaults: EMPTY_ENDPOINT_CONFIG_DEFAULTS,
+        },
+        FixedProviderEndpointTemplate {
+            item_key: "openai:image",
+            api_format: "openai:image",
+            custom_path: None,
+            config_defaults: EMPTY_ENDPOINT_CONFIG_DEFAULTS,
+        },
+    ],
+    runtime_policy: GROK_RUNTIME_POLICY,
+};
+
+const WINDSURF_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProviderTemplate {
+    provider_type: "windsurf",
+    version: 1,
+    base_url: "https://server.codeium.com",
+    endpoints: &[FixedProviderEndpointTemplate {
+        item_key: "openai:chat",
+        api_format: "openai:chat",
+        custom_path: None,
+        config_defaults: EMPTY_ENDPOINT_CONFIG_DEFAULTS,
+    }],
+    runtime_policy: WINDSURF_RUNTIME_POLICY,
 };
 
 pub fn provider_type_is_fixed(provider_type: &str) -> bool {
@@ -388,6 +477,7 @@ pub fn provider_runtime_policy(provider_type: &str) -> ProviderRuntimePolicy {
         "gemini" | "google" => GEMINI_RUNTIME_POLICY,
         "jina" => JINA_RUNTIME_POLICY,
         "doubao" | "volcengine" => DOUBAO_RUNTIME_POLICY,
+        "aliyun" | "dashscope" => ALIYUN_RUNTIME_POLICY,
         _ => STANDARD_RUNTIME_POLICY,
     }
 }
@@ -398,9 +488,11 @@ pub fn fixed_provider_template(provider_type: &str) -> Option<&'static FixedProv
         "codex" => Some(&CODEX_FIXED_PROVIDER_TEMPLATE),
         "chatgpt_web" => Some(&CHATGPT_WEB_FIXED_PROVIDER_TEMPLATE),
         "kiro" => Some(&KIRO_FIXED_PROVIDER_TEMPLATE),
+        "grok" => Some(&GROK_FIXED_PROVIDER_TEMPLATE),
         "gemini_cli" => Some(&GEMINI_CLI_FIXED_PROVIDER_TEMPLATE),
         "vertex_ai" => Some(&VERTEX_AI_FIXED_PROVIDER_TEMPLATE),
         "antigravity" => Some(&ANTIGRAVITY_FIXED_PROVIDER_TEMPLATE),
+        "windsurf" => Some(&WINDSURF_FIXED_PROVIDER_TEMPLATE),
         _ => None,
     }
 }
@@ -511,6 +603,17 @@ pub fn provider_type_admin_oauth_template(provider_type: &str) -> Option<Provide
             redirect_uri: "http://localhost:51121/oauth2callback",
             use_pkce: true,
         }),
+        "windsurf" => Some(ProviderOAuthTemplate {
+            provider_type: "windsurf",
+            display_name: "Windsurf",
+            authorize_url: "https://windsurf.com/windsurf/signin",
+            token_url: "https://register.windsurf.com/exa.seat_management_pb.SeatManagementService/RegisterUser",
+            client_id: "3GUryQ7ldAeKEuD2obYnppsnmj58eP5u",
+            client_secret: "",
+            scopes: &[],
+            redirect_uri: "show-auth-token",
+            use_pkce: false,
+        }),
         _ => None,
     }
 }
@@ -521,16 +624,18 @@ pub const ADMIN_PROVIDER_OAUTH_TEMPLATE_TYPES: &[&str] = &[
     "chatgpt_web",
     "gemini_cli",
     "antigravity",
+    "windsurf",
 ];
 
 #[cfg(test)]
 mod tests {
     use super::{
         fixed_provider_endpoint_template_by_api_format, fixed_provider_key_inherits_api_formats,
-        fixed_provider_template, provider_runtime_policy,
+        fixed_provider_template, provider_runtime_policy, provider_type_admin_oauth_template,
         provider_type_allows_auth_channel_mismatch_by_default, provider_type_oauth_is_bearer_like,
         provider_type_supports_local_embedding_transport,
         provider_type_supports_local_same_format_transport, FixedProviderEndpointConfigValue,
+        ADMIN_PROVIDER_OAUTH_TEMPLATE_TYPES,
     };
 
     #[test]
@@ -599,6 +704,94 @@ mod tests {
     }
 
     #[test]
+    fn grok_fixed_provider_template_exposes_chat_responses_messages_and_image() {
+        let template = fixed_provider_template("grok").expect("grok template should exist");
+        assert_eq!(template.base_url, "https://grok.com");
+        assert_eq!(template.version, 1);
+        assert_eq!(
+            template
+                .endpoints
+                .iter()
+                .map(|item| item.api_format)
+                .collect::<Vec<_>>(),
+            vec![
+                "openai:chat",
+                "openai:responses",
+                "claude:messages",
+                "openai:image"
+            ]
+        );
+        assert!(!template.runtime_policy.supports_model_fetch);
+        assert!(!template.runtime_policy.supports_local_openai_chat_transport);
+        assert!(!template.runtime_policy.supports_local_same_format_transport);
+    }
+
+    #[test]
+    fn gemini_cli_fixed_provider_template_uses_v1internal_endpoint_path() {
+        let template =
+            fixed_provider_template("gemini_cli").expect("gemini_cli template should exist");
+        assert_eq!(template.base_url, "https://cloudcode-pa.googleapis.com");
+        assert_eq!(template.version, 3);
+
+        let endpoint =
+            fixed_provider_endpoint_template_by_api_format("gemini_cli", "gemini:generate_content")
+                .expect("gemini_cli generateContent endpoint should exist");
+        assert_eq!(endpoint.custom_path, Some("/v1internal:{action}"));
+        assert_eq!(
+            endpoint
+                .config_defaults
+                .iter()
+                .map(|item| (item.key, item.value))
+                .collect::<Vec<_>>(),
+            vec![(
+                "upstream_stream_policy",
+                FixedProviderEndpointConfigValue::String("auto")
+            )]
+        );
+    }
+
+    #[test]
+    fn windsurf_fixed_provider_template_exposes_openai_chat() {
+        let template = fixed_provider_template("windsurf").expect("windsurf template should exist");
+        assert_eq!(template.provider_type, "windsurf");
+        assert_eq!(template.base_url, "https://server.codeium.com");
+        assert_eq!(template.version, 1);
+        assert_eq!(
+            template
+                .endpoints
+                .iter()
+                .map(|item| item.api_format)
+                .collect::<Vec<_>>(),
+            vec!["openai:chat"]
+        );
+        assert!(
+            fixed_provider_endpoint_template_by_api_format("windsurf", "openai:chat").is_some()
+        );
+
+        let policy = provider_runtime_policy("windsurf");
+        assert!(policy.fixed_provider);
+        assert!(policy.enable_format_conversion_by_default);
+        assert!(policy.oauth_is_bearer_like);
+        assert!(!policy.supports_model_fetch);
+        assert!(!policy.supports_local_same_format_transport);
+    }
+
+    #[test]
+    fn windsurf_admin_oauth_template_is_advertised() {
+        let template =
+            provider_type_admin_oauth_template("windsurf").expect("windsurf oauth template");
+
+        assert_eq!(template.provider_type, "windsurf");
+        assert_eq!(template.display_name, "Windsurf");
+        assert_eq!(
+            template.authorize_url,
+            "https://windsurf.com/windsurf/signin"
+        );
+        assert_eq!(template.redirect_uri, "show-auth-token");
+        assert!(ADMIN_PROVIDER_OAUTH_TEMPLATE_TYPES.contains(&"windsurf"));
+    }
+
+    #[test]
     fn fixed_provider_key_inheritance_keeps_oauth_and_kiro_configured_bearer_keys_open() {
         assert!(fixed_provider_key_inherits_api_formats(
             "codex", "oauth", None
@@ -612,6 +805,11 @@ mod tests {
             "kiro",
             "bearer",
             Some("{}")
+        ));
+        assert!(fixed_provider_key_inherits_api_formats(
+            "vertex_ai",
+            "service_account",
+            None
         ));
         assert!(!fixed_provider_key_inherits_api_formats(
             "kiro", "bearer", None
@@ -681,9 +879,12 @@ mod tests {
             ("custom", "openai:embedding"),
             ("gemini", "gemini:embedding"),
             ("google", "gemini:embedding"),
+            ("vertex_ai", "gemini:embedding"),
             ("jina", "jina:embedding"),
             ("doubao", "doubao:embedding"),
             ("volcengine", "doubao:embedding"),
+            ("aliyun", "aliyun:multimodal_embedding"),
+            ("dashscope", "aliyun:multimodal_embedding"),
         ] {
             assert!(
                 provider_type_supports_local_embedding_transport(provider_type, api_format),
@@ -694,8 +895,11 @@ mod tests {
         for (provider_type, api_format) in [
             ("openai", "gemini:embedding"),
             ("gemini", "openai:embedding"),
+            ("vertex_ai", "openai:embedding"),
             ("jina", "doubao:embedding"),
             ("doubao", "jina:embedding"),
+            ("aliyun", "openai:embedding"),
+            ("openai", "aliyun:multimodal_embedding"),
             ("claude_code", "openai:embedding"),
             ("openai", "openai:chat"),
         ] {
@@ -709,5 +913,29 @@ mod tests {
             " Google ",
             "GEMINI:EMBEDDING"
         ));
+    }
+
+    #[test]
+    fn vertex_fixed_provider_template_includes_gemini_embedding_endpoint() {
+        let template =
+            fixed_provider_template("vertex_ai").expect("vertex_ai template should exist");
+
+        assert_eq!(
+            template
+                .endpoints
+                .iter()
+                .map(|item| item.api_format)
+                .collect::<Vec<_>>(),
+            vec![
+                "gemini:generate_content",
+                "gemini:embedding",
+                "claude:messages",
+            ]
+        );
+
+        assert!(
+            fixed_provider_endpoint_template_by_api_format("vertex_ai", "gemini:embedding")
+                .is_some()
+        );
     }
 }

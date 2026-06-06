@@ -1,6 +1,6 @@
 /// Proxy-side WebSocket connection handler
 ///
-/// Handles the lifecycle of a single aether-proxy connection:
+/// Handles the lifecycle of a single aether-tunnel connection:
 /// accept -> authenticate (headers) -> read loop -> cleanup
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,6 +13,8 @@ use tracing::{debug, info, warn};
 
 use super::hub::{ConnConfig, HubRouter, ProxyConn, SendStatus};
 use super::protocol;
+use aether_contracts::tunnel::Frame;
+use aether_contracts::tunnel_security::{SecureFrameCodec, TunnelSecurityRole};
 
 /// Maximum single frame size: 64 MB
 const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
@@ -23,6 +25,9 @@ pub async fn handle_proxy_connection(
     node_id: String,
     node_name: String,
     max_streams: usize,
+    protocol_version: u8,
+    security_key: Option<String>,
+    security_session: String,
     cfg: ConnConfig,
 ) {
     let conn_id = hub.alloc_conn_id();
@@ -30,6 +35,18 @@ pub async fn handle_proxy_connection(
 
     let (tx, mut rx) = bounded_queue::<Message>(cfg.outbound_queue_capacity);
     let (close_tx, mut close_rx) = watch::channel(false);
+    let security = match security_key.as_deref() {
+        Some(key) => {
+            match SecureFrameCodec::new(key, &security_session, TunnelSecurityRole::Server) {
+                Ok(codec) => Some(Arc::new(codec)),
+                Err(error) => {
+                    warn!(conn_id, node_id = %node_id, error = %error, "secure tunnel codec initialization failed");
+                    return;
+                }
+            }
+        }
+        None => None,
+    };
 
     let conn = Arc::new(ProxyConn::new(
         conn_id,
@@ -38,12 +55,14 @@ pub async fn handle_proxy_connection(
         tx,
         close_tx,
         max_streams,
+        protocol_version,
     ));
 
     hub.register_proxy(conn.clone());
 
     let writer_conn_id = conn_id;
     let writer_conn = conn.clone();
+    let writer_security = security.clone();
     let writer = tokio::spawn(async move {
         let mut frames_sent: u64 = 0;
         loop {
@@ -55,12 +74,22 @@ pub async fn handle_proxy_connection(
                             Message::Binary(b) => b.len(),
                             _ => 0,
                         };
+                        let send_started_at = std::time::Instant::now();
+                        let msg = match encrypt_message(msg, writer_security.as_deref()) {
+                            Ok(msg) => msg,
+                            Err(error) => {
+                                warn!(conn_id = writer_conn_id, error = %error, "failed to encrypt outbound proxy frame");
+                                break;
+                            }
+                        };
                         let send_result = tokio::time::timeout(
                             Duration::from_secs(15),
                             ws_tx.send(msg),
                         ).await;
                         match send_result {
-                            Ok(Ok(())) => {}
+                            Ok(Ok(())) => {
+                                writer_conn.record_write_latency(send_started_at.elapsed());
+                            }
                             Ok(Err(e)) => {
                                 let snapshot = writer_conn.outbound.snapshot();
                                 warn!(
@@ -153,7 +182,9 @@ pub async fn handle_proxy_connection(
         loop {
             tokio::time::sleep(ping_interval).await;
             let ping = protocol::encode_ping();
-            let status = ping_conn.send(Message::Binary(ping.into()));
+            let status = ping_conn
+                .send_wait(Message::Binary(ping.into()), Duration::from_millis(250))
+                .await;
             if !matches!(status, SendStatus::Queued) {
                 let snapshot = ping_conn.outbound.snapshot();
                 match status {
@@ -189,7 +220,7 @@ pub async fn handle_proxy_connection(
     let reader_hub = hub.clone();
     let reader_conn = conn.clone();
     let reader = tokio::spawn(async move {
-        run_proxy_reader(ws_rx, reader_hub, reader_conn, cfg.idle_timeout).await;
+        run_proxy_reader(ws_rx, reader_hub, reader_conn, cfg.idle_timeout, security).await;
     });
 
     let _ = reader.await;
@@ -218,6 +249,7 @@ async fn run_proxy_reader(
     hub: Arc<HubRouter>,
     conn: Arc<ProxyConn>,
     idle_timeout: Duration,
+    security: Option<Arc<SecureFrameCodec>>,
 ) {
     let idle_enabled = !idle_timeout.is_zero();
     let mut oversized_count = 0u32;
@@ -240,7 +272,14 @@ async fn run_proxy_reader(
         match msg {
             Some(Ok(Message::Binary(data))) => {
                 frames_received += 1;
-                let mut data = data.to_vec();
+                let mut data = match decrypt_message(data, security.as_deref()) {
+                    Ok(data) => data,
+                    Err(error) => {
+                        warn!(conn_id = conn.id, error = %error, "failed to decrypt secure proxy frame");
+                        conn.request_close();
+                        break;
+                    }
+                };
                 if data.len() > MAX_FRAME_SIZE {
                     oversized_count += 1;
                     warn!(
@@ -288,4 +327,34 @@ async fn run_proxy_reader(
             _ => {}
         }
     }
+}
+
+fn encrypt_message(
+    msg: Message,
+    security: Option<&SecureFrameCodec>,
+) -> Result<Message, aether_contracts::tunnel_security::TunnelSecurityError> {
+    let Some(codec) = security else {
+        return Ok(msg);
+    };
+    match msg {
+        Message::Binary(data) => {
+            let frame = Frame::decode(bytes::Bytes::from(data.to_vec()))
+                .map_err(|_| aether_contracts::tunnel_security::TunnelSecurityError::Encrypt)?;
+            Ok(Message::Binary(codec.encrypt_frame(frame)?))
+        }
+        other => Ok(other),
+    }
+}
+
+fn decrypt_message(
+    data: bytes::Bytes,
+    security: Option<&SecureFrameCodec>,
+) -> Result<Vec<u8>, aether_contracts::tunnel_security::TunnelSecurityError> {
+    let Some(codec) = security else {
+        return Ok(data.to_vec());
+    };
+    let frame = Frame::decode(data)
+        .map_err(|_| aether_contracts::tunnel_security::TunnelSecurityError::Decrypt)?;
+    let frame = codec.decrypt_frame(frame)?;
+    Ok(frame.encode().to_vec())
 }
