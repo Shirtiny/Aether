@@ -297,7 +297,9 @@ fn active_probe_member_is_unschedulable_for_request(
     }) {
         return true;
     }
-    key_context.is_some_and(|context| context.account_blocked || context.quota_exhausted)
+    key_context.is_some_and(|context| {
+        context.account_blocked || (pool_config.skip_exhausted_accounts && context.quota_exhausted)
+    })
 }
 
 async fn expand_pool_group_candidate(
@@ -2154,6 +2156,53 @@ mod tests {
             .expect("runtime should exist")
             .active_probe_member_ids
             .is_empty());
+    }
+
+    #[test]
+    fn pool_scheduler_keeps_exhausted_active_probe_member_when_overage_allowed() {
+        let provider_config = Some(json!({
+            "pool_advanced": {
+                "probing_enabled": true,
+                "skip_exhausted_accounts": false
+            }
+        }));
+        let key_hot = sample_eligible_candidate(
+            "provider-pool",
+            "endpoint-1",
+            "key-hot",
+            10,
+            provider_config,
+        );
+        let mut runtime_by_provider = BTreeMap::from([(
+            "provider-pool".to_string(),
+            AdminProviderPoolRuntimeState {
+                active_probe_member_ids: BTreeSet::from(["key-hot".to_string()]),
+                provider_desired_hot: 1,
+                ..AdminProviderPoolRuntimeState::default()
+            },
+        )]);
+        let key_context_by_id = BTreeMap::from([(
+            "key-hot".to_string(),
+            PoolCatalogKeyContext {
+                quota_exhausted: true,
+                ..PoolCatalogKeyContext::default()
+            },
+        )]);
+
+        let evicted = prune_unschedulable_active_probe_members_for_request(
+            &mut runtime_by_provider,
+            &[key_hot],
+            &key_context_by_id,
+        );
+
+        assert!(evicted.is_empty());
+        assert_eq!(
+            runtime_by_provider
+                .get("provider-pool")
+                .expect("runtime should exist")
+                .active_probe_member_ids,
+            BTreeSet::from(["key-hot".to_string()])
+        );
     }
 
     #[tokio::test]

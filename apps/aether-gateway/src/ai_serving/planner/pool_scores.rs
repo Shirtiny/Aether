@@ -16,6 +16,7 @@ pub(crate) fn build_provider_key_pool_score_upsert(
     existing: Option<&aether_data_contracts::repository::pool_scores::StoredPoolMemberScore>,
     now_unix_secs: u64,
     score_rules: PoolMemberScoreRules,
+    skip_exhausted_accounts: bool,
 ) -> UpsertPoolMemberScore {
     let identity = PoolMemberIdentity::provider_api_key(key.provider_id.clone(), key.id.clone());
     let scope = provider_key_pool_score_scope();
@@ -26,6 +27,7 @@ pub(crate) fn build_provider_key_pool_score_upsert(
         scope.clone(),
         existing,
         now_unix_secs,
+        skip_exhausted_accounts,
     );
     let output = score_pool_member_with_rules(&input, score_rules);
     UpsertPoolMemberScore {
@@ -88,6 +90,7 @@ fn provider_key_score_input(
     scope: PoolScoreScope,
     existing: Option<&aether_data_contracts::repository::pool_scores::StoredPoolMemberScore>,
     now_unix_secs: u64,
+    skip_exhausted_accounts: bool,
 ) -> PoolMemberScoreInput {
     let status_snapshot = provider_key_status_snapshot_payload(key, provider_type);
     let quota_snapshot = status_snapshot
@@ -116,10 +119,11 @@ fn provider_key_score_input(
             .and_then(|quota| quota.get("usage_ratio"))
             .and_then(json_f64)
             .map(|value| value.clamp(0.0, 1.0)),
-        quota_exhausted: quota_snapshot
-            .and_then(|quota| quota.get("exhausted"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
+        quota_exhausted: skip_exhausted_accounts
+            && quota_snapshot
+                .and_then(|quota| quota.get("exhausted"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         account_blocked: account_snapshot
             .and_then(|account| account.get("blocked"))
             .and_then(Value::as_bool)
@@ -204,6 +208,7 @@ mod tests {
             None,
             now_unix_secs,
             PoolMemberScoreRules::default(),
+            true,
         );
 
         assert_eq!(score.hard_state, PoolMemberHardState::Available);
@@ -220,8 +225,46 @@ mod tests {
             None,
             now_unix_secs,
             PoolMemberScoreRules::default(),
+            true,
         );
 
         assert_eq!(score.hard_state, PoolMemberHardState::Available);
+    }
+
+    #[test]
+    fn exhausted_quota_is_not_hard_state_when_pool_allows_overage() {
+        let now_unix_secs = 1_000;
+        let mut key = StoredProviderCatalogKey::new(
+            "key-kiro-overage".to_string(),
+            "provider-kiro".to_string(),
+            "kiro overage".to_string(),
+            "oauth".to_string(),
+            None,
+            true,
+        )
+        .expect("sample key should be valid");
+        key.status_snapshot = Some(json!({
+            "quota": {
+                "provider_type": "kiro",
+                "code": "exhausted",
+                "exhausted": true,
+                "usage_ratio": 1.0
+            }
+        }));
+
+        let score = build_provider_key_pool_score_upsert(
+            &key,
+            "kiro",
+            None,
+            now_unix_secs,
+            PoolMemberScoreRules::default(),
+            false,
+        );
+
+        assert_eq!(score.hard_state, PoolMemberHardState::Unknown);
+        assert_eq!(
+            score.score_reason["factors"]["quota_remaining"],
+            serde_json::json!(0.0)
+        );
     }
 }
