@@ -1976,36 +1976,44 @@ fn resolve_effective_list_policy(
         &aether_data::repository::users::StoredUserGroup,
     ) -> (&str, Option<Vec<String>>),
 ) -> Option<Vec<String>> {
-    let group_policy = union_group_list_policies(groups, group_field);
+    let group_policy = intersect_group_list_policies(groups, group_field);
     let user_policy = list_restriction_from_mode(user_mode, user_values);
     intersect_list_policies(group_policy, user_policy)
 }
 
-fn union_group_list_policies(
+fn intersect_group_list_policies(
     groups: &[aether_data::repository::users::StoredUserGroup],
     group_field: impl Fn(
         &aether_data::repository::users::StoredUserGroup,
     ) -> (&str, Option<Vec<String>>),
 ) -> Option<Vec<String>> {
+    let mut effective: Option<Vec<String>> = None;
     let mut saw_restrictive_group = false;
-    let mut values = std::collections::BTreeSet::new();
 
     for group in groups {
         let (mode, group_values) = group_field(group);
         match mode {
-            "unrestricted" => return None,
+            "unrestricted" => continue,
             "specific" => {
                 saw_restrictive_group = true;
-                values.extend(group_values.unwrap_or_default());
+                let values = group_values.unwrap_or_default();
+                effective = Some(match effective {
+                    None => values,
+                    Some(existing) => intersect_string_lists(existing, values),
+                });
             }
             "deny_all" => {
                 saw_restrictive_group = true;
+                effective = Some(match effective {
+                    None => Vec::new(),
+                    Some(existing) => intersect_string_lists(existing, Vec::new()),
+                });
             }
             _ => {}
         }
     }
 
-    saw_restrictive_group.then(|| values.into_iter().collect())
+    if saw_restrictive_group { effective } else { None }
 }
 
 fn list_restriction_from_mode(mode: &str, values: Option<Vec<String>>) -> Option<Vec<String>> {
@@ -2022,7 +2030,7 @@ fn resolve_effective_rate_limit_policy(
     groups: &[aether_data::repository::users::StoredUserGroup],
 ) -> Option<i32> {
     let group_policy = groups.iter().fold(None, |effective, group| {
-        union_rate_limit_policies(
+        intersect_rate_limit_policies(
             effective,
             rate_limit_restriction_from_mode(&group.rate_limit_mode, group.rate_limit),
         )
@@ -2075,6 +2083,13 @@ fn intersect_list_policies(
     }
 }
 
+fn intersect_string_lists(left: Vec<String>, right: Vec<String>) -> Vec<String> {
+    let right_values = right.into_iter().collect::<std::collections::BTreeSet<_>>();
+    left.into_iter()
+        .filter(|value| right_values.contains(value))
+        .collect()
+}
+
 fn intersect_rate_limit_policies(
     left: Option<RateLimitRestriction>,
     right: Option<RateLimitRestriction>,
@@ -2091,22 +2106,6 @@ fn intersect_rate_limit_policies(
         }
         (Some(RateLimitRestriction::Limited(left)), Some(RateLimitRestriction::Limited(right))) => {
             Some(RateLimitRestriction::Limited(left.min(right)))
-        }
-    }
-}
-
-fn union_rate_limit_policies(
-    left: Option<RateLimitRestriction>,
-    right: Option<RateLimitRestriction>,
-) -> Option<RateLimitRestriction> {
-    match (left, right) {
-        (None, None) => None,
-        (Some(value), None) | (None, Some(value)) => Some(value),
-        (Some(RateLimitRestriction::Unlimited), _) | (_, Some(RateLimitRestriction::Unlimited)) => {
-            Some(RateLimitRestriction::Unlimited)
-        }
-        (Some(RateLimitRestriction::Limited(left)), Some(RateLimitRestriction::Limited(right))) => {
-            Some(RateLimitRestriction::Limited(left.max(right)))
         }
     }
 }
@@ -2266,7 +2265,7 @@ mod tests {
     }
 
     #[test]
-    fn list_policy_unions_multiple_group_restrictions_legacy_case() {
+    fn list_policy_intersects_multiple_group_restrictions() {
         let groups = vec![
             sample_group(
                 "team-a",
@@ -2290,18 +2289,11 @@ mod tests {
             (&group.allowed_models_mode, group.allowed_models.clone())
         });
 
-        assert_eq!(
-            policy,
-            Some(vec![
-                "gemini-2.5-pro".to_string(),
-                "gpt-4.1".to_string(),
-                "gpt-5".to_string()
-            ])
-        );
+        assert_eq!(policy, Some(vec!["gpt-4.1".to_string()]));
     }
 
     #[test]
-    fn list_policy_unions_multiple_group_restrictions() {
+    fn unrestricted_group_does_not_expand_other_group_restrictions() {
         let groups = vec![
             sample_group(
                 "team-a",
@@ -2325,14 +2317,7 @@ mod tests {
             (&group.allowed_models_mode, group.allowed_models.clone())
         });
 
-        assert_eq!(
-            policy,
-            Some(vec![
-                "gemini-2.5-pro".to_string(),
-                "gpt-4.1".to_string(),
-                "gpt-5".to_string()
-            ])
-        );
+        assert_eq!(policy, Some(vec!["gpt-5".to_string()]));
     }
 
     #[test]
@@ -2404,12 +2389,12 @@ mod tests {
 
         assert_eq!(
             resolve_effective_rate_limit_policy(Some(120), "custom", &groups),
-            Some(100)
+            Some(30)
         );
     }
 
     #[test]
-    fn rate_limit_unlimited_group_overrides_limited_groups() {
+    fn rate_limit_intersects_unlimited_and_limited_groups() {
         let groups = vec![
             sample_group("default", 10, None, "unrestricted", Some(30), "custom"),
             sample_group("tier-2", 20, None, "unrestricted", Some(0), "custom"),
@@ -2417,7 +2402,7 @@ mod tests {
 
         assert_eq!(
             resolve_effective_rate_limit_policy(None, "system", &groups),
-            Some(0)
+            Some(30)
         );
     }
 
@@ -2436,6 +2421,34 @@ mod tests {
             resolve_effective_rate_limit_policy(Some(60), "custom", &groups),
             Some(60)
         );
+    }
+
+    #[test]
+    fn list_policy_deny_all_wins_when_groups_conflict() {
+        let groups = vec![
+            sample_group(
+                "deny",
+                10,
+                Some(vec![]),
+                "deny_all",
+                None,
+                "system",
+            ),
+            sample_group(
+                "restricted",
+                20,
+                Some(vec!["gpt-5"]),
+                "specific",
+                None,
+                "system",
+            ),
+        ];
+
+        let policy = resolve_effective_list_policy(None, "unrestricted", &groups, |group| {
+            (&group.allowed_models_mode, group.allowed_models.clone())
+        });
+
+        assert_eq!(policy, Some(Vec::<String>::new()));
     }
 
     #[test]
