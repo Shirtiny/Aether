@@ -172,6 +172,9 @@ fn aggregates_openai_responses_stream_completed_event_to_final_response() {
 
     let result = aggregate_openai_responses_stream_sync_response(body.as_bytes())
         .expect("result should exist");
+    let created_at = result["created_at"]
+        .as_i64()
+        .expect("created_at should be a unix timestamp");
 
     assert_eq!(
         result,
@@ -180,6 +183,9 @@ fn aggregates_openai_responses_stream_completed_event_to_final_response() {
             "object": "response",
             "model": "gpt-5",
             "status": "completed",
+            "created_at": created_at,
+            "completed_at": created_at,
+            "output_text": "Hello",
             "output": [{
                 "type": "message",
                 "id": "resp_123_msg",
@@ -215,6 +221,9 @@ fn aggregates_openai_responses_stream_tool_call_events_to_final_response() {
 
     let result = aggregate_openai_responses_stream_sync_response(body.as_bytes())
         .expect("result should exist");
+    let created_at = result["created_at"]
+        .as_i64()
+        .expect("created_at should be a unix timestamp");
 
     assert_eq!(
         result,
@@ -223,6 +232,9 @@ fn aggregates_openai_responses_stream_tool_call_events_to_final_response() {
             "object": "response",
             "model": "gpt-5",
             "status": "completed",
+            "created_at": created_at,
+            "completed_at": created_at,
+            "output_text": "",
             "output": [{
                 "type": "function_call",
                 "id": "call_123",
@@ -811,6 +823,9 @@ fn converts_claude_cli_response_to_openai_responses_response() {
         }),
     )
     .expect("result should exist");
+    let created_at = result["created_at"]
+        .as_i64()
+        .expect("created_at should be a unix timestamp");
 
     assert_eq!(
         result,
@@ -819,6 +834,9 @@ fn converts_claude_cli_response_to_openai_responses_response() {
             "object": "response",
             "status": "completed",
             "model": "claude-code-upstream",
+            "created_at": created_at,
+            "completed_at": created_at,
+            "output_text": "Hello Claude CLI",
             "output": [{
                 "type": "message",
                 "id": "msg_cli_123_msg",
@@ -868,6 +886,9 @@ fn converts_claude_cli_tool_use_to_openai_responses_function_call() {
         }),
     )
     .expect("result should exist");
+    let created_at = result["created_at"]
+        .as_i64()
+        .expect("created_at should be a unix timestamp");
 
     assert_eq!(
         result,
@@ -876,6 +897,9 @@ fn converts_claude_cli_tool_use_to_openai_responses_function_call() {
             "object": "response",
             "status": "completed",
             "model": "claude-code-upstream",
+            "created_at": created_at,
+            "completed_at": created_at,
+            "output_text": "Running tool.",
             "output": [
                 {
                     "type": "message",
@@ -933,6 +957,9 @@ fn converts_gemini_cli_response_to_openai_responses_response() {
         }),
     )
     .expect("result should exist");
+    let created_at = result["created_at"]
+        .as_i64()
+        .expect("created_at should be a unix timestamp");
 
     assert_eq!(
         result,
@@ -941,6 +968,9 @@ fn converts_gemini_cli_response_to_openai_responses_response() {
             "object": "response",
             "status": "completed",
             "model": "gemini-cli-upstream",
+            "created_at": created_at,
+            "completed_at": created_at,
+            "output_text": "Hello Gemini CLI",
             "output": [{
                 "type": "message",
                 "id": "resp_cli_123_msg",
@@ -995,6 +1025,9 @@ fn converts_gemini_cli_function_call_to_openai_responses_function_call() {
         }),
     )
     .expect("result should exist");
+    let created_at = result["created_at"]
+        .as_i64()
+        .expect("created_at should be a unix timestamp");
 
     assert_eq!(
         result,
@@ -1003,6 +1036,9 @@ fn converts_gemini_cli_function_call_to_openai_responses_function_call() {
             "object": "response",
             "status": "completed",
             "model": "gemini-cli-upstream",
+            "created_at": created_at,
+            "completed_at": created_at,
+            "output_text": "Need a tool.",
             "output": [
                 {
                     "type": "message",

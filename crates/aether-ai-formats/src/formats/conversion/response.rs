@@ -6,7 +6,10 @@
 
 use serde_json::{json, Value};
 
-use crate::formats::{context::FormatContext, registry};
+use crate::formats::{
+    context::FormatContext,
+    openai::responses::response::ensure_modern_openai_responses_response_fields, registry,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenAiResponsesResponseUsage {
@@ -218,7 +221,7 @@ pub fn build_openai_responses_response_with_content(
         }));
     }
     output.extend(function_calls);
-    json!({
+    let mut response = json!({
         "id": response_id,
         "object": "response",
         "status": "completed",
@@ -229,7 +232,11 @@ pub fn build_openai_responses_response_with_content(
             "output_tokens": usage.output_tokens,
             "total_tokens": usage.total_tokens,
         }
-    })
+    });
+    if let Some(response_object) = response.as_object_mut() {
+        ensure_modern_openai_responses_response_fields(response_object);
+    }
+    response
 }
 
 fn response_context(report_context: &Value) -> FormatContext {
@@ -273,6 +280,26 @@ mod tests {
 
         assert_eq!(converted["object"], "response");
         assert_eq!(converted["output"][0]["type"], "message");
+        assert_eq!(converted["output_text"], "hello");
+        assert!(converted["created_at"].as_i64().is_some());
+        assert!(converted["completed_at"].as_i64().is_some());
+    }
+
+    #[test]
+    fn manual_responses_response_builder_emits_modern_fields() {
+        let response = super::build_openai_responses_response(
+            "resp_manual_123",
+            "gpt-5",
+            "Hello manual",
+            Vec::new(),
+            1,
+            2,
+            3,
+        );
+
+        assert_eq!(response["output_text"], "Hello manual");
+        assert!(response["created_at"].as_i64().is_some());
+        assert!(response["completed_at"].as_i64().is_some());
     }
 
     #[test]

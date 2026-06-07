@@ -150,6 +150,10 @@ pub fn build_standard_request_body_with_model_directives_and_request_headers(
         &mut provider_request_body,
         provider_api_format,
     );
+    strip_openai_responses_input_content_cache_control(
+        &mut provider_request_body,
+        provider_api_format,
+    );
     let require_body_stream_field = body_json
         .as_object()
         .is_some_and(|object| object.contains_key("stream"))
@@ -246,7 +250,59 @@ pub fn build_standard_request_body_from_canonical_with_model_directives(
             None,
         );
     }
+    strip_openai_responses_input_content_cache_control(
+        &mut provider_request_body,
+        provider_api_format,
+    );
     Some(provider_request_body)
+}
+
+fn strip_openai_responses_input_content_cache_control(
+    provider_request_body: &mut Value,
+    provider_api_format: &str,
+) {
+    if !matches!(
+        aether_ai_formats::normalize_api_format_alias(provider_api_format).as_str(),
+        "openai:responses" | "openai:responses:compact"
+    ) {
+        return;
+    }
+    let Some(input) = provider_request_body.get_mut("input") else {
+        return;
+    };
+    strip_responses_input_items_content_cache_control(input);
+}
+
+fn strip_responses_input_items_content_cache_control(value: &mut Value) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                strip_responses_input_items_content_cache_control(item);
+            }
+        }
+        Value::Object(item) => {
+            if let Some(content) = item.get_mut("content") {
+                strip_responses_content_cache_control(content);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn strip_responses_content_cache_control(content: &mut Value) {
+    match content {
+        Value::Array(parts) => {
+            for part in parts {
+                if let Some(part) = part.as_object_mut() {
+                    part.remove("cache_control");
+                }
+            }
+        }
+        Value::Object(part) => {
+            part.remove("cache_control");
+        }
+        _ => {}
+    }
 }
 
 pub fn normalize_standard_request_to_openai_chat_request(
@@ -1234,6 +1290,98 @@ mod tests {
                 "{client_api_format} -> openai:responses should keep or inject instructions"
             );
         }
+    }
+
+    #[test]
+    fn standard_openai_responses_strips_content_cache_control_after_body_rules() {
+        let request = json!({
+            "model": "gpt-5.1",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hello"}]
+            }],
+            "prompt_cache_key": "cache_123"
+        });
+        let body_rules = json!([
+            {
+                "action": "set",
+                "path": "input[0].content[0].cache_control",
+                "value": {"type": "ephemeral"}
+            }
+        ]);
+
+        let converted = build_standard_request_body(
+            &request,
+            "openai:responses",
+            "gpt-5.1",
+            "openai",
+            "openai:responses",
+            "/v1/responses",
+            false,
+            Some(&body_rules),
+            None,
+        )
+        .expect("responses request should build");
+
+        assert_eq!(converted["prompt_cache_key"], "cache_123");
+        assert!(!converted["input"].to_string().contains("cache_control"));
+    }
+
+    #[test]
+    fn standard_codex_responses_derives_prompt_cache_key_before_stripping_cache_control() {
+        fn claude_request(user_text: &str) -> Value {
+            json!({
+                "model": "claude-sonnet",
+                "system": [{
+                    "type": "text",
+                    "text": "stable system brief",
+                    "cache_control": {"type": "ephemeral"}
+                }],
+                "messages": [{
+                    "role": "user",
+                    "content": [{"type": "text", "text": user_text}]
+                }],
+                "max_tokens": 128
+            })
+        }
+
+        let body_a = claude_request("new turn A");
+        let body_b = claude_request("new turn B");
+        let converted_a = build_standard_request_body(
+            &body_a,
+            "claude:messages",
+            "gpt-5.4",
+            "codex",
+            "openai:responses",
+            "/v1/messages",
+            true,
+            None,
+            Some("key-a"),
+        )
+        .expect("claude to codex responses request should build");
+        let converted_b = build_standard_request_body(
+            &body_b,
+            "claude:messages",
+            "gpt-5.4",
+            "codex",
+            "openai:responses",
+            "/v1/messages",
+            true,
+            None,
+            Some("key-a"),
+        )
+        .expect("claude to codex responses request should build");
+
+        assert!(converted_a["prompt_cache_key"]
+            .as_str()
+            .is_some_and(|value| !value.trim().is_empty()));
+        assert_eq!(
+            converted_a["prompt_cache_key"],
+            converted_b["prompt_cache_key"]
+        );
+        assert!(!converted_a.to_string().contains("cache_control"));
+        assert!(!converted_b.to_string().contains("cache_control"));
     }
 
     #[test]

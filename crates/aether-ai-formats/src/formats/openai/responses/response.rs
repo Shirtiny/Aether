@@ -1,4 +1,7 @@
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use serde_json::{json, Map, Value};
 
@@ -318,7 +321,84 @@ pub fn to_raw(canonical: &CanonicalResponse, report_context: &Value, _compact: b
     );
     legacy_extension_fields.remove("raw_status");
     response.extend(legacy_extension_fields);
+    ensure_modern_openai_responses_response_fields(&mut response);
     Value::Object(response)
+}
+
+pub(crate) fn ensure_modern_openai_responses_response_fields(
+    response: &mut Map<String, Value>,
+) -> bool {
+    let mut changed = false;
+    if !response
+        .get("output")
+        .is_some_and(|value| matches!(value, Value::Array(_)))
+    {
+        response.insert("output".to_string(), Value::Array(Vec::new()));
+        changed = true;
+    }
+    if !response.contains_key("created_at") {
+        let created_at = response
+            .get("created")
+            .and_then(openai_responses_timestamp_value)
+            .unwrap_or_else(openai_responses_current_timestamp);
+        response.insert("created_at".to_string(), Value::from(created_at));
+        changed = true;
+    }
+    if response
+        .get("status")
+        .and_then(Value::as_str)
+        .is_none_or(|status| status == "completed")
+        && !response.contains_key("completed_at")
+    {
+        let completed_at = response
+            .get("created_at")
+            .and_then(openai_responses_timestamp_value)
+            .unwrap_or_else(openai_responses_current_timestamp);
+        response.insert("completed_at".to_string(), Value::from(completed_at));
+        changed = true;
+    }
+    if !response.contains_key("output_text") {
+        let output_text = openai_responses_output_text_from_output(response.get("output"));
+        response.insert("output_text".to_string(), Value::String(output_text));
+        changed = true;
+    }
+    changed
+}
+
+pub(crate) fn openai_responses_output_text_from_output(output: Option<&Value>) -> String {
+    output
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_object)
+        .flat_map(|item| {
+            item.get("content")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .filter_map(|part| {
+            let part = part.as_object()?;
+            matches!(
+                part.get("type").and_then(Value::as_str),
+                Some("output_text" | "text")
+            )
+            .then(|| part.get("text").and_then(Value::as_str).unwrap_or_default())
+        })
+        .collect::<String>()
+}
+
+pub(crate) fn openai_responses_current_timestamp() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default()
+}
+
+fn openai_responses_timestamp_value(value: &Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))
 }
 
 fn image_block_is_generation_call(extensions: &BTreeMap<String, Value>) -> bool {
@@ -415,6 +495,42 @@ mod tests {
         assert_eq!(body["output"][0]["status"], "completed");
         assert_eq!(body["output"][0]["action"]["type"], "search");
         assert_eq!(body["output"][0]["action"]["query"], "today tech");
+        assert_eq!(body["output_text"], "");
+        assert!(body["created_at"].as_i64().is_some());
+        assert!(body["completed_at"].as_i64().is_some());
+    }
+
+    #[test]
+    fn responses_response_builder_emits_modern_output_text_and_preserves_source_fields() {
+        let mut extensions = BTreeMap::new();
+        extensions.insert(
+            OPENAI_RESPONSES_EXTENSION_NAMESPACE.to_string(),
+            json!({
+                "created_at": 111,
+                "completed_at": 222,
+                "output_text": "source text",
+                "conversation": {"id": "conv_123"}
+            }),
+        );
+        let response = CanonicalResponse {
+            id: "resp_text".to_string(),
+            model: "gpt-5".to_string(),
+            content: vec![CanonicalContentBlock::Text {
+                text: "generated text".to_string(),
+                extensions: BTreeMap::new(),
+            }],
+            outputs: Vec::new(),
+            stop_reason: Some(CanonicalStopReason::EndTurn),
+            usage: None,
+            extensions,
+        };
+
+        let body = to_raw(&response, &json!({}), false);
+
+        assert_eq!(body["output_text"], "source text");
+        assert_eq!(body["created_at"], 111);
+        assert_eq!(body["completed_at"], 222);
+        assert_eq!(body["conversation"]["id"], "conv_123");
     }
 
     #[test]

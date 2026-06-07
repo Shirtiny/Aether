@@ -2,6 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Map, Value};
 
+use crate::formats::openai::responses::response::{
+    ensure_modern_openai_responses_response_fields, openai_responses_current_timestamp,
+};
 use crate::formats::shared::response::build_generated_tool_call_id;
 use crate::formats::shared::sse::{encode_done_sse, encode_json_sse};
 use crate::formats::shared::stream_core::common::*;
@@ -958,7 +961,34 @@ impl OpenAIResponsesProviderState {
                     self.emit_missing_text(report_context, &mut out, key, text);
                 }
             }
-            "response.reasoning_summary_text.delta" => {
+            "response.refusal.delta" => {
+                let piece = value
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if !piece.is_empty() {
+                    let key = Self::text_part_key_from_event(&value);
+                    self.emit_text_delta(report_context, &mut out, key, piece);
+                }
+            }
+            "response.refusal.done" => {
+                let refusal = value
+                    .get("refusal")
+                    .and_then(Value::as_str)
+                    .or_else(|| {
+                        value
+                            .get("part")
+                            .and_then(Value::as_object)
+                            .and_then(|part| part.get("refusal"))
+                            .and_then(Value::as_str)
+                    })
+                    .unwrap_or_default();
+                if !refusal.is_empty() {
+                    let key = Self::text_part_key_from_event(&value);
+                    self.emit_missing_text(report_context, &mut out, key, refusal);
+                }
+            }
+            "response.reasoning_text.delta" | "response.reasoning_summary_text.delta" => {
                 let piece = value
                     .get("delta")
                     .and_then(Value::as_str)
@@ -983,7 +1013,7 @@ impl OpenAIResponsesProviderState {
                     });
                 }
             }
-            "response.reasoning_summary_text.done" => {
+            "response.reasoning_text.done" | "response.reasoning_summary_text.done" => {
                 let text = value
                     .get("text")
                     .and_then(Value::as_str)
@@ -1240,7 +1270,7 @@ impl OpenAIResponsesProviderState {
                 }
                 out.push(self.unknown_frame(report_context, payload));
             }
-            "response.completed" => {
+            "response.completed" | "response.done" => {
                 let Some(response) = value.get("response").and_then(Value::as_object) else {
                     return Ok(out);
                 };
@@ -1399,6 +1429,7 @@ fn web_search_query_from_arguments(arguments: &str) -> String {
 pub struct OpenAIResponsesClientEmitter {
     response_id: Option<String>,
     model: Option<String>,
+    created_at: Option<i64>,
     message_item_id: Option<String>,
     reasoning_item_id: Option<String>,
     started: bool,
@@ -1744,13 +1775,28 @@ impl OpenAIResponsesClientEmitter {
     }
 
     fn in_progress_response(&self) -> Value {
-        json!({
+        let mut response = json!({
             "id": self.response_id(),
             "object": "response",
             "model": self.model(),
             "status": "in_progress",
             "output": [],
-        })
+        });
+        if let (Some(created_at), Some(response_object)) =
+            (self.created_at, response.as_object_mut())
+        {
+            response_object.insert("created_at".to_string(), Value::from(created_at));
+        }
+        response
+    }
+
+    fn ensure_created_at(&mut self) -> i64 {
+        if let Some(created_at) = self.created_at {
+            return created_at;
+        }
+        let created_at = openai_responses_current_timestamp();
+        self.created_at = Some(created_at);
+        created_at
     }
 
     fn allocate_output_index(&mut self) -> usize {
@@ -1787,6 +1833,7 @@ impl OpenAIResponsesClientEmitter {
         if self.started {
             return Ok(Vec::new());
         }
+        self.ensure_created_at();
         self.started = true;
         let mut out = self.encode_response_event(
             "response.created",
@@ -2118,6 +2165,7 @@ impl OpenAIResponsesClientEmitter {
                     "output_index": output_index,
                     "item_id": item_id.clone(),
                     "call_id": item_id.clone(),
+                    "name": name,
                     "arguments": state.arguments.as_str(),
                 }),
             )?);
@@ -2354,6 +2402,12 @@ impl OpenAIResponsesClientEmitter {
         });
         if let Some(reason) = incomplete_reason {
             response["incomplete_details"] = json!({ "reason": reason });
+        }
+        if let Some(response_object) = response.as_object_mut() {
+            if let Some(created_at) = self.created_at {
+                response_object.insert("created_at".to_string(), Value::from(created_at));
+            }
+            ensure_modern_openai_responses_response_fields(response_object);
         }
         response
     }
@@ -3074,6 +3128,9 @@ mod tests {
         assert!(sse.contains("\"response_id\":\"resp_stream_123\""));
         assert!(sse.contains("\"item_id\":\"resp_stream_123_msg\""));
         assert!(sse.contains("\"text\":\"Hello\""));
+        assert!(sse.contains("\"output_text\":\"Hello\""));
+        assert!(sse.contains("\"created_at\":"));
+        assert!(sse.contains("\"completed_at\":"));
         assert_eq!(response_sequence_numbers(&sse), (1..=9).collect::<Vec<_>>());
     }
 
@@ -3254,6 +3311,53 @@ mod tests {
                     ..
                 }),
             } if reason == "tool_calls"
+        )));
+    }
+
+    #[test]
+    fn openai_responses_provider_state_accepts_refusal_events() {
+        let mut state = OpenAIResponsesProviderState::default();
+        let report_context = json!({});
+        let mut frames = Vec::new();
+
+        frames.extend(
+            state
+                .push_line(
+                    &report_context,
+                    data_line(json!({
+                        "type": "response.refusal.delta",
+                        "response_id": "resp_refusal_123",
+                        "output_index": 0,
+                        "item_id": "msg_refusal_123",
+                        "content_index": 0,
+                        "delta": "I can't",
+                    })),
+                )
+                .expect("refusal delta should parse"),
+        );
+        frames.extend(
+            state
+                .push_line(
+                    &report_context,
+                    data_line(json!({
+                        "type": "response.refusal.done",
+                        "response_id": "resp_refusal_123",
+                        "output_index": 0,
+                        "item_id": "msg_refusal_123",
+                        "content_index": 0,
+                        "refusal": "I can't help with that.",
+                    })),
+                )
+                .expect("refusal done should parse"),
+        );
+
+        assert!(frames.iter().any(|frame| matches!(
+            &frame.event,
+            CanonicalStreamEvent::TextDelta(text) if text == "I can't"
+        )));
+        assert!(frames.iter().any(|frame| matches!(
+            &frame.event,
+            CanonicalStreamEvent::TextDelta(text) if text == " help with that."
         )));
     }
 

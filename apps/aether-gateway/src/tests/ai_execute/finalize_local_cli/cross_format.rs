@@ -389,6 +389,9 @@ async fn gateway_executes_openai_responses_cross_format_upstream_stream_via_loca
     assert_eq!(response_status, StatusCode::OK);
     let response_json: serde_json::Value =
         serde_json::from_str(&response_body).expect("body should parse");
+    let created_at = response_json["created_at"]
+        .as_i64()
+        .expect("created_at should be a unix timestamp");
     assert_eq!(
         response_json,
         json!({
@@ -396,6 +399,9 @@ async fn gateway_executes_openai_responses_cross_format_upstream_stream_via_loca
             "object": "response",
             "status": "completed",
             "model": "gemini-2.5-pro-upstream",
+            "created_at": created_at,
+            "completed_at": created_at,
+            "output_text": "Hello Gemini CLI",
             "output": [{
                 "type": "message",
                 "id": "upstream-cli-stream-123_msg",
@@ -842,6 +848,9 @@ async fn gateway_executes_openai_responses_cross_format_function_call_upstream_s
 
     assert_eq!(response.status(), StatusCode::OK);
     let response_json: serde_json::Value = response.json().await.expect("body should parse");
+    let created_at = response_json["created_at"]
+        .as_i64()
+        .expect("created_at should be a unix timestamp");
     assert_eq!(
         response_json,
         json!({
@@ -849,6 +858,9 @@ async fn gateway_executes_openai_responses_cross_format_function_call_upstream_s
             "object": "response",
             "status": "completed",
             "model": "gemini-2.5-pro-upstream",
+            "created_at": created_at,
+            "completed_at": created_at,
+            "output_text": "Need a tool.",
             "output": [
                 {
                     "type": "message",
@@ -1412,6 +1424,9 @@ async fn gateway_executes_openai_responses_antigravity_cross_format_upstream_str
 
     assert_eq!(response.status(), StatusCode::OK);
     let response_json: serde_json::Value = response.json().await.expect("body should parse");
+    let created_at = response_json["created_at"]
+        .as_i64()
+        .expect("created_at should be a unix timestamp");
     assert_eq!(
         response_json,
         json!({
@@ -1419,6 +1434,9 @@ async fn gateway_executes_openai_responses_antigravity_cross_format_upstream_str
             "object": "response",
             "status": "completed",
             "model": "claude-sonnet-4-5",
+            "created_at": created_at,
+            "completed_at": created_at,
+            "output_text": "Hello Antigravity",
             "output": [{
                 "type": "message",
                 "id": "resp-local-stream_msg",

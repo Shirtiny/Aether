@@ -815,6 +815,34 @@ mod tests {
     }
 
     #[test]
+    fn openai_responses_request_normalizer_strips_content_cache_control() {
+        let body = json!({
+            "model": "gpt-5.1",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": "stable project brief",
+                    "cache_control": {"type": "ephemeral"}
+                }]
+            }],
+            "prompt_cache_key": "cache_123"
+        });
+
+        let converted = registry::convert_request(
+            "openai:responses",
+            "openai:responses",
+            &body,
+            &FormatContext::default(),
+        )
+        .expect("responses request");
+
+        assert_eq!(converted["prompt_cache_key"], "cache_123");
+        assert!(!converted["input"].to_string().contains("cache_control"));
+    }
+
+    #[test]
     fn claude_output_config_effort_controls_responses_reasoning() {
         let body = json!({
             "model": "claude-sonnet",

@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use serde_json::{json, Map, Value};
 
 use crate::formats::openai::image::stream::{OpenAiImageChatStreamState, OpenAiImageStreamState};
+use crate::formats::openai::responses::response::ensure_modern_openai_responses_response_fields;
 use crate::formats::shared::model_directives::model_directive_display_model_from_report_context;
 use crate::formats::shared::response::{
     remove_empty_pages_from_tool_arguments, remove_empty_pages_from_tool_input_value,
@@ -20,6 +21,7 @@ use crate::provider_compat::surfaces::{
 pub enum FinalizeStreamRewriteMode {
     EnvelopeUnwrap,
     ModelDirectiveDisplay,
+    OpenAiResponsesCompat,
     OpenAiImage,
     OpenAiImageToOpenAiChat,
     ClaudeReadToolSanitize,
@@ -91,6 +93,11 @@ pub fn resolve_finalize_stream_rewrite_mode(
         // Parsing→rebuilding only adds overhead and may lose information
         // (encrypted_content, original item IDs, etc.).
         if is_same_format_family(provider_api_format.as_str(), client_api_format.as_str()) {
+            if is_openai_responses_family(provider_api_format.as_str())
+                && is_openai_responses_family(client_api_format.as_str())
+            {
+                return Some(FinalizeStreamRewriteMode::OpenAiResponsesCompat);
+            }
             if provider_api_format == "claude:messages" && client_api_format == "claude:messages" {
                 return Some(FinalizeStreamRewriteMode::ClaudeReadToolSanitize);
             }
@@ -128,6 +135,12 @@ pub fn resolve_finalize_stream_rewrite_mode(
         return Some(FinalizeStreamRewriteMode::ClaudeReadToolSanitize);
     }
 
+    if provider_api_format == client_api_format
+        && is_openai_responses_family(provider_api_format.as_str())
+    {
+        return Some(FinalizeStreamRewriteMode::OpenAiResponsesCompat);
+    }
+
     (provider_api_format == client_api_format
         && provider_adaptation_should_unwrap_stream_envelope(
             envelope_name.as_str(),
@@ -159,6 +172,7 @@ fn client_consumes_same_private_stream_envelope(
 enum AiSurfaceStreamRewriteState {
     EnvelopeUnwrap,
     ModelDirectiveDisplay,
+    OpenAiResponsesCompat,
     OpenAiImage(Box<OpenAiImageStreamState>),
     OpenAiImageToOpenAiChat(Box<OpenAiImageChatStreamState>),
     ClaudeReadToolSanitize(Box<ClaudeReadToolStreamSanitizer>),
@@ -184,6 +198,9 @@ pub fn maybe_build_ai_surface_stream_rewriter<'a>(
         FinalizeStreamRewriteMode::EnvelopeUnwrap => AiSurfaceStreamRewriteState::EnvelopeUnwrap,
         FinalizeStreamRewriteMode::ModelDirectiveDisplay => {
             AiSurfaceStreamRewriteState::ModelDirectiveDisplay
+        }
+        FinalizeStreamRewriteMode::OpenAiResponsesCompat => {
+            AiSurfaceStreamRewriteState::OpenAiResponsesCompat
         }
         FinalizeStreamRewriteMode::OpenAiImage => {
             AiSurfaceStreamRewriteState::OpenAiImage(Box::<OpenAiImageStreamState>::default())
@@ -240,6 +257,7 @@ impl AiSurfaceStreamRewriter<'_> {
             }
             AiSurfaceStreamRewriteState::EnvelopeUnwrap
             | AiSurfaceStreamRewriteState::ModelDirectiveDisplay
+            | AiSurfaceStreamRewriteState::OpenAiResponsesCompat
             | AiSurfaceStreamRewriteState::Standard(_) => {
                 self.buffered.extend_from_slice(chunk);
                 let mut output = Vec::new();
@@ -275,6 +293,7 @@ impl AiSurfaceStreamRewriter<'_> {
             }
             AiSurfaceStreamRewriteState::EnvelopeUnwrap
             | AiSurfaceStreamRewriteState::ModelDirectiveDisplay
+            | AiSurfaceStreamRewriteState::OpenAiResponsesCompat
             | AiSurfaceStreamRewriteState::Standard(_) => {
                 if self.buffered.is_empty() {
                     if let AiSurfaceStreamRewriteState::Standard(state) = &mut self.state {
@@ -301,6 +320,9 @@ impl AiSurfaceStreamRewriter<'_> {
             }
             AiSurfaceStreamRewriteState::ModelDirectiveDisplay => {
                 rewrite_model_directive_stream_line(self.report_context, line)
+            }
+            AiSurfaceStreamRewriteState::OpenAiResponsesCompat => {
+                rewrite_openai_responses_compat_stream_line(self.report_context, line)
             }
             AiSurfaceStreamRewriteState::Standard(state) => {
                 transform_standard_line(state, self.report_context, line)
@@ -602,6 +624,50 @@ fn rewrite_model_directive_stream_line(
         Err(_) => return Ok(line),
     };
     if !rewrite_stream_payload_model(&mut value, &display_model) {
+        return Ok(line);
+    }
+    let mut output = Vec::new();
+    output.extend_from_slice(b"data: ");
+    output.extend(serde_json::to_vec(&value)?);
+    output.extend_from_slice(trailing.as_bytes());
+    Ok(output)
+}
+
+fn rewrite_openai_responses_compat_stream_line(
+    report_context: &Value,
+    line: Vec<u8>,
+) -> Result<Vec<u8>, AiSurfaceFinalizeError> {
+    let text = match std::str::from_utf8(&line) {
+        Ok(text) => text,
+        Err(_) => return Ok(line),
+    };
+    let trimmed_line_end = text.trim_end_matches(['\r', '\n']);
+    let trailing = &text[trimmed_line_end.len()..];
+    let Some((prefix, payload)) = trimmed_line_end.split_once(':') else {
+        return Ok(line);
+    };
+    if prefix.trim() != "data" {
+        return Ok(line);
+    }
+    let payload = payload.trim_start();
+    if payload.is_empty() || payload == "[DONE]" {
+        return Ok(line);
+    }
+    let mut value = match serde_json::from_str::<Value>(payload) {
+        Ok(value) => value,
+        Err(_) => return Ok(line),
+    };
+    let mut changed = rewrite_stream_payload_model_from_context(report_context, &mut value);
+    let event_type = value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if matches!(event_type, "response.completed" | "response.done") {
+        if let Some(response) = value.get_mut("response").and_then(Value::as_object_mut) {
+            changed |= ensure_modern_openai_responses_response_fields(response);
+        }
+    }
+    if !changed {
         return Ok(line);
     }
     let mut output = Vec::new();
@@ -975,16 +1041,35 @@ data: {\"type\":\"response.output_item.added\",\"response_id\":\"resp_123\",\"ou
     }
 
     #[test]
-    fn same_family_responses_without_display_model_passes_through_verbatim() {
-        // When provider and client are both OpenAI Responses family but
-        // there is no display model override, the rewriter returns None
-        // (complete passthrough, no interception at all).
+    fn same_family_responses_without_display_model_runs_terminal_compat_only() {
         let report_context = json!({
             "provider_api_format": "openai:responses",
             "client_api_format": "openai:responses:compact",
             "needs_conversion": true,
         });
-        assert!(maybe_build_ai_surface_stream_rewriter(Some(&report_context)).is_none());
+        let mut rewriter = maybe_build_ai_surface_stream_rewriter(Some(&report_context))
+            .expect("responses compat rewriter should exist");
+        let mut output = rewriter
+            .push_chunk(
+                b"event: response.output_item.added\n\
+data: {\"type\":\"response.output_item.added\",\"response_id\":\"resp_123\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_abc\",\"encrypted_content\":\"EWxvY2tlZA==\"}}\n\n",
+            )
+            .expect("non-terminal event should pass through");
+        output.extend(
+            rewriter
+                .push_chunk(
+                    b"event: response.completed\n\
+data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_123\",\"object\":\"response\",\"model\":\"gpt-5\",\"status\":\"completed\"}}\n\n",
+                )
+                .expect("terminal event should be normalized"),
+        );
+        let output = String::from_utf8(output).expect("output should be utf8");
+
+        assert!(output.contains("\"encrypted_content\":\"EWxvY2tlZA==\""));
+        assert!(output.contains("event: response.completed"));
+        assert!(output.contains("\"output\":[]"));
+        assert!(output.contains("\"output_text\":\"\""));
+        assert!(output.contains("\"completed_at\":"));
     }
 
     #[test]

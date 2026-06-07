@@ -7,6 +7,7 @@ use aether_ai_formats::formats::conversion::response::{
     convert_openai_chat_response_to_openai_responses,
     convert_openai_responses_response_to_openai_chat,
 };
+use aether_ai_formats::formats::openai::responses::response::ensure_modern_openai_responses_response_fields;
 use aether_ai_formats::formats::registry::{convert_response, FormatContext, FormatError};
 use aether_ai_formats::{
     canonical_to_claude_response, canonical_to_embedding_response, canonical_to_gemini_response,
@@ -1854,6 +1855,50 @@ pub fn aggregate_openai_responses_stream_sync_response(body: &[u8]) -> Option<Va
                     part,
                 );
             }
+            "response.output_text.annotation.added" => {
+                let output_index = openai_responses_event_output_index(event_object).unwrap_or(0);
+                let content_index = openai_responses_event_content_index(event_object);
+                merge_openai_responses_message_text_annotation(
+                    message_states.entry(output_index).or_default(),
+                    content_index,
+                    event_object,
+                );
+            }
+            "response.refusal.delta" => {
+                let output_index = openai_responses_event_output_index(event_object).unwrap_or(0);
+                let content_index = openai_responses_event_content_index(event_object);
+                let delta = event_object
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                append_openai_responses_message_refusal_delta(
+                    message_states.entry(output_index).or_default(),
+                    content_index,
+                    delta,
+                );
+            }
+            "response.refusal.done" => {
+                let output_index = openai_responses_event_output_index(event_object).unwrap_or(0);
+                let content_index = openai_responses_event_content_index(event_object);
+                let part = event_object.get("part").and_then(Value::as_object);
+                let refusal = event_object
+                    .get("refusal")
+                    .and_then(Value::as_str)
+                    .or_else(|| {
+                        event_object
+                            .get("part")
+                            .and_then(Value::as_object)
+                            .and_then(|part| part.get("refusal"))
+                            .and_then(Value::as_str)
+                    })
+                    .unwrap_or_default();
+                merge_openai_responses_message_refusal_part(
+                    message_states.entry(output_index).or_default(),
+                    content_index,
+                    refusal,
+                    part,
+                );
+            }
             "response.content_part.added" | "response.content_part.done" => {
                 let Some(part) = event_object.get("part").and_then(Value::as_object) else {
                     continue;
@@ -1866,7 +1911,7 @@ pub fn aggregate_openai_responses_stream_sync_response(body: &[u8]) -> Option<Va
                     part,
                 );
             }
-            "response.reasoning_summary_text.delta" => {
+            "response.reasoning_text.delta" | "response.reasoning_summary_text.delta" => {
                 let output_index = openai_responses_event_output_index(event_object).unwrap_or(0);
                 let delta = event_object
                     .get("delta")
@@ -1881,7 +1926,7 @@ pub fn aggregate_openai_responses_stream_sync_response(body: &[u8]) -> Option<Va
                     .summary_text
                     .push_str(delta);
             }
-            "response.reasoning_summary_text.done" => {
+            "response.reasoning_text.done" | "response.reasoning_summary_text.done" => {
                 let output_index = openai_responses_event_output_index(event_object).unwrap_or(0);
                 let text = event_object
                     .get("text")
@@ -2007,7 +2052,7 @@ pub fn aggregate_openai_responses_stream_sync_response(body: &[u8]) -> Option<Va
                     output_index,
                 );
             }
-            "response.completed" => {
+            "response.completed" | "response.done" => {
                 response_object = event_object
                     .get("response")
                     .and_then(Value::as_object)
@@ -2078,6 +2123,7 @@ pub fn aggregate_openai_responses_stream_sync_response(body: &[u8]) -> Option<Va
         .and_then(Value::as_array)
         .is_some_and(|output| !output.is_empty())
     {
+        ensure_modern_openai_responses_response_fields(&mut response);
         return Some(Value::Object(response));
     }
 
@@ -2115,6 +2161,8 @@ pub fn aggregate_openai_responses_stream_sync_response(body: &[u8]) -> Option<Va
         }
         response.insert("output".to_string(), Value::Array(output));
     }
+
+    ensure_modern_openai_responses_response_fields(&mut response);
 
     Some(Value::Object(response))
 }
@@ -2168,6 +2216,13 @@ fn default_openai_responses_output_text_part() -> Value {
         "type": "output_text",
         "text": "",
         "annotations": [],
+    })
+}
+
+fn default_openai_responses_refusal_part() -> Value {
+    json!({
+        "type": "refusal",
+        "refusal": "",
     })
 }
 
@@ -2280,6 +2335,115 @@ fn merge_openai_responses_message_text_part(
         .or_insert_with(|| Value::Array(Vec::new()));
 }
 
+fn append_openai_responses_message_refusal_delta(
+    state: &mut OpenAIResponsesSyncMessageState,
+    content_index: usize,
+    delta: &str,
+) {
+    if delta.is_empty() {
+        return;
+    }
+    let part = state
+        .parts
+        .entry(content_index)
+        .or_insert_with(default_openai_responses_refusal_part);
+    let Some(part) = part.as_object_mut() else {
+        return;
+    };
+    if part.get("type").and_then(Value::as_str) != Some("refusal") {
+        return;
+    }
+    let current = part
+        .get("refusal")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    part.insert("type".to_string(), Value::String("refusal".to_string()));
+    part.insert(
+        "refusal".to_string(),
+        Value::String(format!("{current}{delta}")),
+    );
+}
+
+fn merge_openai_responses_message_refusal_part(
+    state: &mut OpenAIResponsesSyncMessageState,
+    content_index: usize,
+    refusal: &str,
+    template_part: Option<&Map<String, Value>>,
+) {
+    if refusal.is_empty() && template_part.is_none() {
+        return;
+    }
+    let part = state.parts.entry(content_index).or_insert_with(|| {
+        template_part
+            .map(|part| Value::Object(part.clone()))
+            .unwrap_or_else(default_openai_responses_refusal_part)
+    });
+    let Some(part) = part.as_object_mut() else {
+        return;
+    };
+    if let Some(template_part) = template_part {
+        for (key, value) in template_part {
+            if key != "refusal" {
+                part.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    part.insert("type".to_string(), Value::String("refusal".to_string()));
+    let mut current = part
+        .get("refusal")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    reconcile_openai_responses_authoritative_text(&mut current, refusal);
+    part.insert("refusal".to_string(), Value::String(current));
+}
+
+fn merge_openai_responses_message_text_annotation(
+    state: &mut OpenAIResponsesSyncMessageState,
+    content_index: usize,
+    event: &Map<String, Value>,
+) {
+    let Some(annotation) = event.get("annotation") else {
+        return;
+    };
+    let annotation_index = event
+        .get("annotation_index")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize);
+    let part = state
+        .parts
+        .entry(content_index)
+        .or_insert_with(default_openai_responses_output_text_part);
+    let Some(part) = part.as_object_mut() else {
+        return;
+    };
+    if !part
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|value| matches!(value, "output_text" | "text"))
+    {
+        return;
+    }
+    part.insert("type".to_string(), Value::String("output_text".to_string()));
+    part.entry("text".to_string())
+        .or_insert_with(|| Value::String(String::new()));
+    let annotations = part
+        .entry("annotations".to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let Some(annotations) = annotations.as_array_mut() else {
+        return;
+    };
+    if let Some(annotation_index) = annotation_index {
+        if annotations.len() <= annotation_index {
+            annotations.resize(annotation_index + 1, Value::Null);
+        }
+        annotations[annotation_index] = annotation.clone();
+    } else {
+        annotations.push(annotation.clone());
+    }
+}
+
 fn merge_openai_responses_message_part(
     state: &mut OpenAIResponsesSyncMessageState,
     content_index: usize,
@@ -2292,6 +2456,12 @@ fn merge_openai_responses_message_part(
     {
         let text = part.get("text").and_then(Value::as_str).unwrap_or_default();
         merge_openai_responses_message_text_part(state, content_index, text, Some(part));
+    } else if part.get("type").and_then(Value::as_str) == Some("refusal") {
+        let refusal = part
+            .get("refusal")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        merge_openai_responses_message_refusal_part(state, content_index, refusal, Some(part));
     } else {
         state
             .parts
@@ -3892,6 +4062,9 @@ mod tests {
         assert_eq!(body_json.get("id"), Some(&json!("resp_123")));
         assert_eq!(body_json.get("status"), Some(&json!("completed")));
         assert_eq!(body_json["output"][0]["content"][0]["text"], json!("Hello"));
+        assert_eq!(body_json["output_text"], "Hello");
+        assert!(body_json["created_at"].as_i64().is_some());
+        assert!(body_json["completed_at"].as_i64().is_some());
     }
 
     #[test]
@@ -4020,6 +4193,58 @@ mod tests {
     }
 
     #[test]
+    fn aggregates_official_refusal_stream_events() {
+        let body = concat!(
+            "event: response.output_item.added\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_refusal_123\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}\n\n",
+            "event: response.content_part.added\n",
+            "data: {\"type\":\"response.content_part.added\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"refusal\",\"refusal\":\"\"}}\n\n",
+            "event: response.refusal.delta\n",
+            "data: {\"type\":\"response.refusal.delta\",\"output_index\":0,\"content_index\":0,\"item_id\":\"msg_refusal_123\",\"delta\":\"I can't\"}\n\n",
+            "event: response.refusal.done\n",
+            "data: {\"type\":\"response.refusal.done\",\"output_index\":0,\"content_index\":0,\"item_id\":\"msg_refusal_123\",\"refusal\":\"I can't help with that.\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_refusal_123\",\"object\":\"response\",\"model\":\"gpt-5\",\"status\":\"completed\",\"output\":[]}}\n\n",
+        );
+
+        let result = aggregate_openai_responses_stream_sync_response(body.as_bytes())
+            .expect("openai-responses refusal stream should aggregate into a sync body");
+
+        assert_eq!(result["output"][0]["content"][0]["type"], "refusal");
+        assert_eq!(
+            result["output"][0]["content"][0]["refusal"],
+            "I can't help with that."
+        );
+        assert_eq!(result["output_text"], "");
+    }
+
+    #[test]
+    fn aggregates_official_output_text_annotation_added_event() {
+        let body = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"Hello annotated\"}\n\n",
+            "event: response.output_text.annotation.added\n",
+            "data: {\"type\":\"response.output_text.annotation.added\",\"output_index\":0,\"content_index\":0,\"annotation_index\":0,\"annotation\":{\"type\":\"text_annotation\",\"text\":\"annotated\",\"start\":6,\"end\":15}}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_annotation_added_123\",\"object\":\"response\",\"model\":\"gpt-5\",\"status\":\"completed\",\"output\":[]}}\n\n",
+        );
+
+        let result = aggregate_openai_responses_stream_sync_response(body.as_bytes())
+            .expect("openai-responses annotation stream should aggregate into a sync body");
+
+        assert_eq!(result["output"][0]["content"][0]["text"], "Hello annotated");
+        assert_eq!(
+            result["output"][0]["content"][0]["annotations"][0]["type"],
+            "text_annotation"
+        );
+        assert_eq!(
+            result["output"][0]["content"][0]["annotations"][0]["start"],
+            6
+        );
+        assert_eq!(result["output_text"], "Hello annotated");
+    }
+
+    #[test]
     fn authoritative_output_text_done_preserves_annotations() {
         let body = concat!(
             "event: response.output_text.delta\n",
@@ -4062,6 +4287,27 @@ mod tests {
         assert_eq!(result["output"][0]["call_id"], "call_done_weather");
         assert_eq!(result["output"][0]["name"], "get_weather");
         assert_eq!(result["output"][0]["arguments"], r#"{"location": "Tokyo"}"#);
+    }
+
+    #[test]
+    fn aggregates_modern_reasoning_text_and_response_done_alias() {
+        let body = concat!(
+            "event: response.reasoning_text.delta\n",
+            "data: {\"type\":\"response.reasoning_text.delta\",\"output_index\":0,\"delta\":\"Need\"}\n\n",
+            "event: response.reasoning_text.done\n",
+            "data: {\"type\":\"response.reasoning_text.done\",\"output_index\":0,\"text\":\"Need care\"}\n\n",
+            "event: response.done\n",
+            "data: {\"type\":\"response.done\",\"response\":{\"id\":\"resp_done_alias_123\",\"object\":\"response\",\"model\":\"gpt-5\",\"status\":\"completed\"}}\n\n",
+        );
+
+        let result = aggregate_openai_responses_stream_sync_response(body.as_bytes())
+            .expect("modern response.done stream should aggregate");
+
+        assert_eq!(result["output"][0]["type"], "reasoning");
+        assert_eq!(result["output"][0]["summary"][0]["text"], "Need care");
+        assert!(result["output"].as_array().is_some());
+        assert_eq!(result["output_text"], "");
+        assert!(result["completed_at"].as_i64().is_some());
     }
 
     #[test]

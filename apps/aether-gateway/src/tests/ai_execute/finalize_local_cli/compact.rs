@@ -389,6 +389,9 @@ async fn gateway_executes_openai_responses_compact_openai_family_upstream_stream
 
     assert_eq!(response.status(), StatusCode::OK);
     let response_json: serde_json::Value = response.json().await.expect("body should parse");
+    let created_at = response_json["created_at"]
+        .as_i64()
+        .expect("created_at should be a unix timestamp");
     assert_eq!(
         response_json,
         json!({
@@ -396,6 +399,9 @@ async fn gateway_executes_openai_responses_compact_openai_family_upstream_stream
             "object": "response",
             "model": "gpt-5",
             "status": "completed",
+            "created_at": created_at,
+            "completed_at": created_at,
+            "output_text": "Hello Compact",
             "output": [{
                 "type": "message",
                 "id": "resp_compact_openai_family_123_msg",

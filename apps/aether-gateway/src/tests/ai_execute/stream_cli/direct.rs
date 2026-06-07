@@ -468,9 +468,38 @@ async fn gateway_executes_codex_cli_stream_via_local_decision_gate_after_oauth_r
         .expect("request should succeed");
 
     assert_eq!(response.status(), StatusCode::OK);
+    let response_body =
+        strip_sse_keepalive_comments(&response.text().await.expect("body should read"));
+    let data_line = response_body
+        .lines()
+        .find_map(|line| line.strip_prefix("data: "))
+        .expect("completed event data should exist");
+    let completed_event: serde_json::Value =
+        serde_json::from_str(data_line).expect("completed event should parse");
+    let created_at = completed_event["response"]["created_at"]
+        .as_i64()
+        .expect("created_at should be a unix timestamp");
+
     assert_eq!(
-        strip_sse_keepalive_comments(&response.text().await.expect("body should read")),
-        "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_codex_cli_stream_local_123\",\"object\":\"response\",\"model\":\"gpt-5.4\",\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2,\"total_tokens\":3}}}\n\n"
+        completed_event,
+        json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_codex_cli_stream_local_123",
+                "object": "response",
+                "model": "gpt-5.4",
+                "status": "completed",
+                "usage": {
+                    "input_tokens": 1,
+                    "output_tokens": 2,
+                    "total_tokens": 3
+                },
+                "output": [],
+                "created_at": created_at,
+                "completed_at": created_at,
+                "output_text": ""
+            }
+        })
     );
 
     let seen_refresh_request = seen_refresh
