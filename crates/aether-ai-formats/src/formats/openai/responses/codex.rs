@@ -613,6 +613,36 @@ fn insert_codex_prompt_cache_key(
     );
 }
 
+fn openai_responses_cache_control_prompt_cache_key_to_insert(
+    provider_request_body: &Value,
+) -> Option<String> {
+    let existing = provider_request_body
+        .get("prompt_cache_key")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    if !existing.is_empty() {
+        return None;
+    }
+
+    extract_codex_prompt_cache_control_seed(provider_request_body)
+        .and_then(|seed| build_stable_codex_prompt_cache_key_from_seed("anchor", &seed))
+}
+
+pub fn apply_openai_responses_cache_control_bridge(
+    provider_request_body: &mut Value,
+    provider_api_format: &str,
+) {
+    if !aether_ai_formats::is_openai_responses_family_format(provider_api_format) {
+        return;
+    }
+
+    let prompt_cache_key =
+        openai_responses_cache_control_prompt_cache_key_to_insert(provider_request_body);
+    strip_codex_cache_control_fields(provider_request_body);
+    insert_codex_prompt_cache_key(provider_request_body, prompt_cache_key);
+}
+
 pub fn apply_openai_responses_compact_special_body_edits(
     provider_request_body: &mut Value,
     provider_api_format: &str,
@@ -905,6 +935,7 @@ mod tests {
     use super::{
         apply_codex_openai_responses_chat_body_edits,
         apply_codex_openai_responses_special_body_edits,
+        apply_openai_responses_cache_control_bridge,
         apply_openai_responses_compact_special_body_edits, CODEX_OPENAI_IMAGE_INTERNAL_MODEL,
         CODEX_OPENAI_RESPONSES_UNSUPPORTED_BODY_FIELDS,
     };
@@ -1227,6 +1258,50 @@ mod tests {
         assert!(!body_a.to_string().contains("\"cache_control\""));
         assert!(!body_b.to_string().contains("\"cache_control\""));
         assert!(!body_c.to_string().contains("\"cache_control\""));
+    }
+
+    #[test]
+    fn openai_responses_cache_control_bridge_strips_without_codex_defaults() {
+        let mut body_a = json!({
+            "input": [{
+                "type": "message",
+                "role": "developer",
+                "content": [{
+                    "type": "input_text",
+                    "text": "stable system brief",
+                    "cache_control": {"type": "ephemeral"}
+                }]
+            }, {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "turn A"}]
+            }],
+            "model": "gpt-5.5"
+        });
+        let mut body_b = json!({
+            "input": [{
+                "type": "message",
+                "role": "developer",
+                "content": [{
+                    "type": "input_text",
+                    "text": "stable system brief",
+                    "cache_control": {"type": "ephemeral"}
+                }]
+            }, {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "turn B"}]
+            }],
+            "model": "gpt-5.5"
+        });
+
+        apply_openai_responses_cache_control_bridge(&mut body_a, "openai:responses");
+        apply_openai_responses_cache_control_bridge(&mut body_b, "openai:responses");
+
+        assert_eq!(body_a["prompt_cache_key"], body_b["prompt_cache_key"]);
+        assert!(!body_a.to_string().contains("\"cache_control\""));
+        assert!(body_a.get("include").is_none());
+        assert!(body_a.get("instructions").is_none());
     }
 
     #[test]

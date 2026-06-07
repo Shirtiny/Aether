@@ -15,7 +15,7 @@ use crate::formats::shared::model_directives::apply_model_directive_overrides_fr
 
 use crate::formats::openai::responses::codex::{
     apply_codex_openai_responses_chat_body_edits, apply_codex_openai_responses_special_body_edits,
-    apply_openai_responses_compact_special_body_edits,
+    apply_openai_responses_cache_control_bridge, apply_openai_responses_compact_special_body_edits,
 };
 use crate::formats::shared::standard_normalize::{
     build_local_openai_chat_request_body_with_model_directives,
@@ -114,6 +114,13 @@ pub fn build_standard_request_body_with_model_directives_and_request_headers(
             mapped_model,
             body_json,
             Some(request_path),
+        );
+    }
+
+    if !provider_type.trim().eq_ignore_ascii_case("codex") {
+        apply_openai_responses_cache_control_bridge(
+            &mut provider_request_body,
+            provider_api_format,
         );
     }
 
@@ -549,6 +556,48 @@ mod tests {
         );
         assert_eq!(converted["tool_choice"]["type"], "auto");
         assert_eq!(converted["stream"], true);
+    }
+
+    #[test]
+    fn standard_custom_responses_bridges_cache_control_before_body_rules() {
+        let request = json!({
+            "model": "claude-sonnet",
+            "system": [{
+                "type": "text",
+                "text": "stable project brief",
+                "cache_control": {"type": "ephemeral"}
+            }],
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 128,
+            "stream": true
+        });
+        let body_rules = json!([
+            {"action": "drop", "path": "input[*].content[*].cache_control"}
+        ]);
+
+        let converted = build_standard_request_body(
+            &request,
+            "claude:messages",
+            "gpt-5.5",
+            "custom",
+            "openai:responses",
+            "/v1/messages",
+            true,
+            Some(&body_rules),
+            Some("key-a"),
+        )
+        .expect("custom responses request should build");
+
+        assert!(converted
+            .get("prompt_cache_key")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty()));
+        assert!(!converted.to_string().contains("\"cache_control\""));
+        assert_eq!(converted["input"][0]["role"], "developer");
+        assert_eq!(
+            converted["input"][0]["content"][0]["text"],
+            "stable project brief"
+        );
     }
 
     #[test]
