@@ -107,6 +107,11 @@ pub(crate) async fn maybe_build_local_same_format_provider_decision_payload_for_
             json!(crate::ai_serving::transport::GEMINI_CLI_V1INTERNAL_ENVELOPE_NAME),
         );
     }
+    if !resolved.compatibility_edits.is_empty() {
+        if let Ok(value) = serde_json::to_value(&resolved.compatibility_edits) {
+            extra_fields.insert("request_body_compatibility_edits".to_string(), value);
+        }
+    }
     let provider_api_format = resolved.provider_api_format.clone();
     let effective_headers = input.effective_headers(&parts.headers);
     let report_context = append_local_failover_policy_to_value(
@@ -175,6 +180,7 @@ pub(crate) async fn maybe_build_local_same_format_provider_decision_payload_for_
         provider_request_headers,
         provider_request_body,
         transport_profile: _,
+        compatibility_edits: _,
         request_redacted: _,
     } = resolved;
 
