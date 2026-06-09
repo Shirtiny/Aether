@@ -10,7 +10,6 @@ use crate::event::UsageEvent;
 use crate::runtime::{UsageBodyCapturePolicy, UsageRequestRecordLevel};
 
 const TRUNCATED_BODY_STRING_SUFFIX: &str = "...[truncated]";
-const LARGE_JSON_STRING_CAPTURE_PREFIX_BYTES: usize = 256;
 
 #[derive(Debug)]
 struct LimitedUsageBodyCapture {
@@ -337,18 +336,13 @@ fn limit_usage_body_capture_value(
 
     let truncated_value = match value {
         Value::String(text) => Value::String(truncate_usage_body_string(&text, limit)),
-        other => {
-            let value_kind = usage_value_kind(&other);
-            compact_usage_body_json_value_for_limit(other, limit).unwrap_or_else(|| {
-                json!({
-                    "truncated": true,
-                    "reason": "body_capture_limit_exceeded",
-                    "max_bytes": limit,
-                    "source_bytes": source_len,
-                    "value_kind": value_kind,
-                })
-            })
-        }
+        other => json!({
+            "truncated": true,
+            "reason": "body_capture_limit_exceeded",
+            "max_bytes": limit,
+            "source_bytes": source_len,
+            "value_kind": usage_value_kind(&other),
+        }),
     };
     let stored_bytes = json_serialized_len(&truncated_value);
     LimitedUsageBodyCapture {
@@ -358,51 +352,6 @@ fn limit_usage_body_capture_value(
         truncated: true,
         reason: Some("body_capture_limit_exceeded"),
     }
-}
-
-fn compact_usage_body_json_value_for_limit(value: Value, max_bytes: usize) -> Option<Value> {
-    let mut changed = false;
-    let compacted = compact_large_usage_body_strings(value, &mut changed);
-    if !changed {
-        return None;
-    }
-    json_serialized_len(&compacted)
-        .is_some_and(|bytes| bytes <= max_bytes as u64)
-        .then_some(compacted)
-}
-
-fn compact_large_usage_body_strings(value: Value, changed: &mut bool) -> Value {
-    match value {
-        Value::String(text) => compact_large_usage_body_string(text, changed),
-        Value::Array(values) => Value::Array(
-            values
-                .into_iter()
-                .map(|value| compact_large_usage_body_strings(value, changed))
-                .collect(),
-        ),
-        Value::Object(object) => Value::Object(
-            object
-                .into_iter()
-                .map(|(key, value)| (key, compact_large_usage_body_strings(value, changed)))
-                .collect(),
-        ),
-        other => other,
-    }
-}
-
-fn compact_large_usage_body_string(text: String, changed: &mut bool) -> Value {
-    let Some(source_bytes) = json_serialized_len(&text) else {
-        return Value::String(text);
-    };
-    if source_bytes <= LARGE_JSON_STRING_CAPTURE_PREFIX_BYTES as u64 {
-        return Value::String(text);
-    }
-
-    *changed = true;
-    Value::String(truncate_usage_body_string(
-        &text,
-        LARGE_JSON_STRING_CAPTURE_PREFIX_BYTES,
-    ))
 }
 
 fn truncate_usage_body_string(value: &str, max_bytes: usize) -> String {
@@ -763,8 +712,8 @@ fn usage_value_kind(value: &Value) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_plan_body_capture_metadata, limit_usage_body_capture_value,
-        sync_usage_body_ref_metadata, trim_owned_non_empty_string, truncate_usage_body_string,
+        build_plan_body_capture_metadata, sync_usage_body_ref_metadata,
+        trim_owned_non_empty_string, truncate_usage_body_string,
         upsert_body_capture_metadata_value_entry,
     };
     use aether_data_contracts::repository::usage::UsageBodyCaptureState;
@@ -876,56 +825,5 @@ mod tests {
         assert!(serde_json::to_vec(&truncated)
             .ok()
             .is_some_and(|bytes| bytes.len() <= limit));
-    }
-
-    #[test]
-    fn body_capture_limit_preserves_image_response_shape_when_b64_is_large() {
-        let response = serde_json::json!({
-            "created": 1_779_273_523,
-            "data": [{
-                "b64_json": "a".repeat(8 * 1024),
-                "revised_prompt": "draw a small city"
-            }],
-            "usage": {
-                "input_tokens": 1,
-                "output_tokens": 2,
-                "total_tokens": 3
-            }
-        });
-
-        let limited = limit_usage_body_capture_value(response, Some(2048));
-
-        assert!(limited.truncated);
-        assert!(limited.stored_bytes.is_some_and(|bytes| bytes <= 2048));
-        assert_eq!(limited.value["created"], 1_779_273_523);
-        assert_eq!(limited.value["usage"]["total_tokens"], 3);
-        assert_eq!(
-            limited.value["data"][0]["revised_prompt"],
-            "draw a small city"
-        );
-        assert!(limited.value["data"][0]["b64_json"]
-            .as_str()
-            .is_some_and(|value| value.ends_with("...[truncated]")));
-    }
-
-    #[test]
-    fn body_capture_limit_preserves_image_request_shape_when_input_image_is_large() {
-        let request = serde_json::json!({
-            "model": "upstream-image-model",
-            "prompt": "edit this image",
-            "image": "data:image/png;base64,".to_string() + &"a".repeat(8 * 1024),
-            "size": "1024x1024"
-        });
-
-        let limited = limit_usage_body_capture_value(request, Some(2048));
-
-        assert!(limited.truncated);
-        assert!(limited.stored_bytes.is_some_and(|bytes| bytes <= 2048));
-        assert_eq!(limited.value["model"], "upstream-image-model");
-        assert_eq!(limited.value["prompt"], "edit this image");
-        assert_eq!(limited.value["size"], "1024x1024");
-        assert!(limited.value["image"]
-            .as_str()
-            .is_some_and(|value| value.ends_with("...[truncated]")));
     }
 }
