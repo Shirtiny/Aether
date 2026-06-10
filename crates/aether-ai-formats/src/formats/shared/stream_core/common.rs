@@ -110,26 +110,27 @@ pub fn canonical_usage_from_openai_usage(value: Option<&Value>) -> Option<Canoni
 }
 
 pub fn openai_stream_payload_is_terminal_error(payload: &Value) -> bool {
+    let response = payload.get("response").and_then(Value::as_object);
+    if payload.get("error").is_some()
+        || response
+            .and_then(|response| response.get("error"))
+            .is_some()
+    {
+        return true;
+    }
+
     let event_type = payload
         .get("type")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    if payload.get("error").is_some() {
-        return true;
-    }
-    if matches!(
-        event_type,
-        "error" | "response.failed" | "response.incomplete"
-    ) {
+    if matches!(event_type, "error" | "response.failed") {
         return true;
     }
 
-    payload
-        .get("response")
-        .and_then(Value::as_object)
+    response
         .and_then(|response| response.get("status"))
         .and_then(Value::as_str)
-        .is_some_and(|status| matches!(status, "failed" | "incomplete"))
+        .is_some_and(|status| status == "failed")
 }
 
 pub fn openai_stream_terminal_error_body(payload: &Value) -> Option<Value> {

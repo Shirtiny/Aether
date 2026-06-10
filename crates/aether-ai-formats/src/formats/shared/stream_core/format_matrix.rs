@@ -984,6 +984,180 @@ mod tests {
     }
 
     #[test]
+    fn transforms_openai_responses_known_sidecar_events_without_unsupported_errors() {
+        let report_context = report_context("openai:responses", "claude:messages");
+        let mut matrix = StreamingStandardFormatMatrix::default();
+        let mut output = Vec::new();
+
+        for line in [
+            data_line(json!({
+                "type": "response.created",
+                "response": {
+                    "id": "resp_sidecar_123",
+                    "model": "gpt-5.4",
+                    "status": "in_progress",
+                    "output": [],
+                },
+            })),
+            data_line(json!({
+                "type": "response.output_item.added",
+                "response_id": "resp_sidecar_123",
+                "output_index": 0,
+                "item": {
+                    "type": "web_search_call",
+                    "id": "ws_123",
+                    "status": "in_progress",
+                    "action": {"type": "search", "query": "aether format conversion"},
+                },
+            })),
+            data_line(json!({
+                "type": "response.web_search_call.searching",
+                "item_id": "ws_123",
+                "output_index": 0,
+            })),
+            data_line(json!({
+                "type": "response.output_text.annotation.added",
+                "response_id": "resp_sidecar_123",
+                "output_index": 1,
+                "content_index": 0,
+                "annotation_index": 0,
+                "annotation": {"type": "url_citation", "url": "https://example.invalid"},
+            })),
+            data_line(json!({
+                "type": "response.output_text.delta",
+                "response_id": "resp_sidecar_123",
+                "output_index": 1,
+                "content_index": 0,
+                "delta": "sidecar ok",
+            })),
+            data_line(json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_sidecar_123",
+                    "object": "response",
+                    "model": "gpt-5.4",
+                    "status": "completed",
+                    "output": [],
+                    "usage": {
+                        "input_tokens": 1,
+                        "output_tokens": 2,
+                        "total_tokens": 3,
+                    },
+                },
+            })),
+        ] {
+            output.extend(
+                matrix
+                    .transform_line(&report_context, line)
+                    .expect("known responses sidecar event should convert or be ignored"),
+            );
+        }
+
+        let sse = String::from_utf8(output).expect("sse should be utf8");
+        assert!(!sse.contains("unsupported_stream_event"), "{sse}");
+        assert!(!sse.contains("Unsupported provider stream event"), "{sse}");
+        assert!(sse.contains("sidecar ok"), "{sse}");
+        assert!(sse.contains("event: message_stop"), "{sse}");
+    }
+
+    #[test]
+    fn transforms_openai_responses_incomplete_max_tokens_as_normal_finish() {
+        let report_context = report_context("openai:responses", "claude:messages");
+        let mut matrix = StreamingStandardFormatMatrix::default();
+        let output = matrix
+            .transform_line(
+                &report_context,
+                data_line(json!({
+                    "type": "response.incomplete",
+                    "response": {
+                        "id": "resp_incomplete_123",
+                        "object": "response",
+                        "model": "gpt-5.4",
+                        "status": "incomplete",
+                        "incomplete_details": {
+                            "reason": "max_output_tokens",
+                        },
+                        "output": [{
+                            "type": "message",
+                            "id": "msg_incomplete_123",
+                            "role": "assistant",
+                            "status": "incomplete",
+                            "content": [{
+                                "type": "output_text",
+                                "text": "partial answer",
+                            }],
+                        }],
+                        "usage": {
+                            "input_tokens": 10,
+                            "output_tokens": 20,
+                            "total_tokens": 30,
+                        },
+                    },
+                })),
+            )
+            .expect("incomplete max token response should convert as length finish");
+
+        let sse = String::from_utf8(output).expect("sse should be utf8");
+        assert!(!sse.contains("Response incomplete"), "{sse}");
+        assert!(!sse.contains("unsupported_stream_event"), "{sse}");
+        assert!(sse.contains("partial answer"), "{sse}");
+        assert!(sse.contains("\"stop_reason\":\"max_tokens\""), "{sse}");
+        assert!(matrix
+            .finish(&report_context)
+            .expect("finish should be terminated")
+            .is_empty());
+    }
+
+    #[test]
+    fn transforms_openai_responses_local_shell_call_to_claude_tool_use() {
+        let report_context = report_context("openai:responses", "claude:messages");
+        let mut matrix = StreamingStandardFormatMatrix::default();
+        let mut output = Vec::new();
+
+        for line in [
+            data_line(json!({
+                "type": "response.output_item.done",
+                "response_id": "resp_shell_123",
+                "output_index": 0,
+                "item": {
+                    "type": "local_shell_call",
+                    "id": "lsc_123",
+                    "call_id": "call_shell_123",
+                    "status": "completed",
+                    "action": {
+                        "type": "exec",
+                        "command": ["pwd"],
+                        "env": {},
+                    },
+                },
+            })),
+            data_line(json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_shell_123",
+                    "object": "response",
+                    "model": "gpt-5.4",
+                    "status": "completed",
+                    "output": [],
+                },
+            })),
+        ] {
+            output.extend(
+                matrix
+                    .transform_line(&report_context, line)
+                    .expect("local shell call should convert to a generic tool use"),
+            );
+        }
+
+        let sse = String::from_utf8(output).expect("sse should be utf8");
+        assert!(!sse.contains("unsupported_stream_event"), "{sse}");
+        assert!(sse.contains("\"type\":\"tool_use\""), "{sse}");
+        assert!(sse.contains("\"name\":\"local_shell\""), "{sse}");
+        assert!(sse.contains("\\\"command\\\":[\\\"pwd\\\"]"), "{sse}");
+        assert!(sse.contains("\"stop_reason\":\"tool_use\""), "{sse}");
+    }
+
+    #[test]
     fn transforms_unknown_stream_finish_reasons_to_visible_client_errors() {
         let cases = [
             (
@@ -1450,6 +1624,45 @@ mod tests {
         assert_eq!(summary.finish_reason.as_deref(), Some("error"));
         assert_eq!(summary.parser_error.as_deref(), Some("policy failure"));
         assert_eq!(summary.unknown_event_count, 1);
+    }
+
+    #[test]
+    fn terminal_observer_marks_openai_responses_incomplete_as_length_finish() {
+        let mut report_context = report_context("openai:chat", "openai:responses");
+        report_context["provider_stream_event_api_format"] = json!("openai:responses");
+        let mut observer = StreamingStandardTerminalObserver::default();
+
+        observer
+            .push_line(
+                &report_context,
+                data_line(json!({
+                    "type": "response.incomplete",
+                    "response": {
+                        "id": "resp_incomplete_123",
+                        "model": "gpt-5.4",
+                        "status": "incomplete",
+                        "incomplete_details": {
+                            "reason": "max_output_tokens",
+                        },
+                        "output": [],
+                        "usage": {
+                            "input_tokens": 10,
+                            "output_tokens": 20,
+                            "total_tokens": 30,
+                        },
+                    },
+                })),
+            )
+            .expect("incomplete event should be observed as terminal finish");
+
+        let summary = observer
+            .latest_summary()
+            .cloned()
+            .expect("summary should exist");
+        assert!(summary.observed_finish);
+        assert_eq!(summary.finish_reason.as_deref(), Some("length"));
+        assert_eq!(summary.parser_error, None);
+        assert_eq!(summary.unknown_event_count, 0);
     }
 
     #[test]
