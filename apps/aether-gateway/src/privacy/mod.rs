@@ -998,7 +998,7 @@ fn default_chat_pii_redaction_rule_configs() -> Vec<ChatPiiRedactionRuleConfig> 
             id: "api_key".to_string(),
             name: "API Key".to_string(),
             pattern:
-                r"\b(?:sk-(?:proj-)?[A-Za-z0-9_-]{20,}|sk-ant-[A-Za-z0-9_-]{20,}|(?:gh[pousr]_[A-Za-z0-9_]{30,}|github_pat_[A-Za-z0-9_]{30,})|xox[baprs]-[A-Za-z0-9-]{20,}|(?:AKIA|ASIA)[0-9A-Z]{16}|[A-Za-z0-9_-]{32,})\b"
+                r"\b(?:sk-(?:proj-)?[A-Za-z0-9_-]{20,}|sk-ant-[A-Za-z0-9_-]{20,}|(?:gh[pousr]_[A-Za-z0-9_]{30,}|github_pat_[A-Za-z0-9_]{30,})|xox[baprs]-[A-Za-z0-9-]{20,}|(?:AKIA|ASIA)[0-9A-Z]{16})\b"
                     .to_string(),
             enabled: true,
             features: ChatPiiRedactionRuleFeatures {
@@ -3624,6 +3624,19 @@ fn is_valid_jwt_like(value: &str) -> bool {
         })
 }
 
+fn regex_matches_full(regex: &Regex, value: &str) -> bool {
+    regex
+        .find(value)
+        .is_some_and(|matched| matched.start() == 0 && matched.end() == value.len())
+}
+
+fn is_valid_openai_key(value: &str) -> bool {
+    regex_matches_full(&OPENAI_KEY_REGEX, value)
+        && !value
+            .get(..7)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("sk-ant-"))
+}
+
 fn is_strict_high_entropy_token(value: &str) -> bool {
     if value.len() < 32 || looks_like_existing_sentinel(value) {
         return false;
@@ -3733,11 +3746,11 @@ fn redaction_candidate_is_valid(kind: RedactionKind, value: &str) -> bool {
         RedactionKind::PaymentCard => is_valid_payment_card(value),
         RedactionKind::Ipv4 => value.parse::<Ipv4Addr>().is_ok(),
         RedactionKind::Ipv6 => value.parse::<Ipv6Addr>().is_ok(),
-        RedactionKind::OpenAiKey
-        | RedactionKind::AnthropicKey
-        | RedactionKind::GitHubToken
-        | RedactionKind::SlackToken
-        | RedactionKind::AwsKey => true,
+        RedactionKind::OpenAiKey => is_valid_openai_key(value),
+        RedactionKind::AnthropicKey => regex_matches_full(&ANTHROPIC_KEY_REGEX, value),
+        RedactionKind::GitHubToken => regex_matches_full(&GITHUB_TOKEN_REGEX, value),
+        RedactionKind::SlackToken => regex_matches_full(&SLACK_TOKEN_REGEX, value),
+        RedactionKind::AwsKey => regex_matches_full(&AWS_KEY_REGEX, value),
         RedactionKind::BearerToken => is_valid_bearer_token(value),
         RedactionKind::Jwt => is_valid_jwt_like(value),
         RedactionKind::AccessToken => is_valid_named_token(value),
@@ -4237,6 +4250,7 @@ mod tests {
             "Order AETHER-20240502-123456 date 2026-05-02 decimal 12345.67890 ",
             "short ids 123456 9876543210 invalid card 4111111111111112 ",
             "short sk word sk-test low entropy aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ",
+            "typescript identifier WorkOrderProcessingAnalysisDialogStore ",
             "name Alice Zhang address 北京市朝阳区建国路88号"
         );
         let mut session = session_at(600);
@@ -4245,6 +4259,69 @@ mod tests {
         assert_eq!(redacted.text, input);
         assert!(redacted.matches.is_empty());
         assert_eq!(session.mapping_count(), 0);
+    }
+
+    #[test]
+    fn pii_redaction_default_runtime_rules_do_not_mask_long_code_identifiers() {
+        let request = json!({
+            "model": "gpt-5",
+            "messages": [{
+                "role": "user",
+                "content": "Please edit WorkOrderProcessingAnalysisDialogStore without renaming it."
+            }]
+        });
+
+        let masked = mask_chat_request_json_with_options(
+            &serde_json::to_vec(&request).expect("request should serialize"),
+            build_redaction_session_config(
+                b"redaction-test-key".to_vec(),
+                &ChatPiiRedactionRuntimeConfig::default(),
+                600,
+            ),
+            MaskChatRequestOptions::runtime(true),
+        );
+
+        assert!(!masked.redacted);
+        assert_eq!(masked.body, serde_json::to_vec(&request).unwrap());
+        assert_eq!(masked.session.mapping_count(), 0);
+    }
+
+    #[test]
+    fn pii_redaction_default_runtime_rules_still_mask_real_api_keys() {
+        let key = "sk-proj-AbCdEfGhIjKlMnOpQrStUvWxYz123456";
+        let request = json!({
+            "model": "gpt-5",
+            "messages": [{
+                "role": "user",
+                "content": format!("Use {key} for the request.")
+            }]
+        });
+
+        let masked = mask_chat_request_json_with_options(
+            &serde_json::to_vec(&request).expect("request should serialize"),
+            build_redaction_session_config(
+                b"redaction-test-key".to_vec(),
+                &ChatPiiRedactionRuntimeConfig::default(),
+                600,
+            ),
+            MaskChatRequestOptions::runtime(false),
+        );
+        let masked_json: serde_json::Value =
+            serde_json::from_slice(&masked.body).expect("masked body should parse");
+        let content = masked_json["messages"][0]["content"]
+            .as_str()
+            .expect("content should be text");
+
+        assert!(masked.redacted);
+        assert!(!content.contains(key));
+        assert!(content.contains("<AETHER:API_KEY:"));
+        assert_eq!(masked.session.mapping_count(), 1);
+        assert_eq!(
+            masked.session.restore_text(content).text,
+            request["messages"][0]["content"]
+                .as_str()
+                .expect("original content should be text")
+        );
     }
 
     #[test]
