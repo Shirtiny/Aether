@@ -21,6 +21,29 @@ pub fn convert_claude_messages_to_conversation_state(
     if messages.is_empty() {
         return None;
     }
+    let mut conversation_messages = Vec::with_capacity(messages.len());
+    let mut system_text_parts = Vec::new();
+    let top_level_system_text = system_to_text(request_body.get("system"));
+    if !top_level_system_text.is_empty() {
+        system_text_parts.push(top_level_system_text);
+    }
+    for raw_message in messages {
+        let Some(message) = raw_message.as_object() else {
+            conversation_messages.push(raw_message);
+            continue;
+        };
+        if message.get("role").and_then(Value::as_str) == Some("system") {
+            let text = system_message_to_text(message);
+            if !text.is_empty() {
+                system_text_parts.push(text);
+            }
+            continue;
+        }
+        conversation_messages.push(raw_message);
+    }
+    if conversation_messages.is_empty() {
+        return None;
+    }
 
     let conversation_id = request_body
         .get("metadata")
@@ -37,7 +60,7 @@ pub fn convert_claude_messages_to_conversation_state(
     let thinking_prefix = generate_thinking_prefix(request_body);
 
     let mut history = Vec::new();
-    let system_text = system_to_text(request_body.get("system"));
+    let system_text = system_text_parts.join("\n");
     if !system_text.is_empty() {
         history.push(json!({
             "userInputMessage": {
@@ -53,20 +76,20 @@ pub fn convert_claude_messages_to_conversation_state(
         }));
     }
 
-    let last_is_assistant = messages
+    let last_is_assistant = conversation_messages
         .last()
-        .and_then(Value::as_object)
+        .and_then(|message| message.as_object())
         .and_then(|message| message.get("role"))
         .and_then(Value::as_str)
         .is_some_and(|role| role == "assistant");
     let history_end_index = if last_is_assistant {
-        messages.len()
+        conversation_messages.len()
     } else {
-        messages.len().saturating_sub(1)
+        conversation_messages.len().saturating_sub(1)
     };
 
     let mut user_buffer = Vec::new();
-    for message in &messages[..history_end_index] {
+    for message in &conversation_messages[..history_end_index] {
         let Some(message) = message.as_object() else {
             continue;
         };
@@ -106,7 +129,7 @@ pub fn convert_claude_messages_to_conversation_state(
     let (mut text_content, images, tool_results) = if last_is_assistant {
         ("Continue.".to_string(), Vec::new(), Vec::new())
     } else {
-        let last = messages.last()?.as_object()?;
+        let last = conversation_messages.last()?.as_object()?;
         if last.get("role").and_then(Value::as_str) != Some("user") {
             return None;
         }
@@ -330,6 +353,24 @@ fn system_to_text(system: Option<&Value>) -> String {
             .iter()
             .filter_map(|item| {
                 item.as_object()
+                    .and_then(|item| item.get("text"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+fn system_message_to_text(message: &Map<String, Value>) -> String {
+    match message.get("content") {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| {
+                item.as_object()
+                    .filter(|item| item.get("type").and_then(Value::as_str) == Some("text"))
                     .and_then(|item| item.get("text"))
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned)
@@ -670,7 +711,7 @@ fn convert_assistant_message(message: &Map<String, Value>) -> Option<Value> {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     use super::convert_claude_messages_to_conversation_state;
 
@@ -709,6 +750,105 @@ mod tests {
                 .and_then(|value| value.as_array())
                 .map(Vec::len),
             Some(1)
+        );
+    }
+
+    #[test]
+    fn folds_system_messages_into_instruction_history() {
+        let conversation_state = convert_claude_messages_to_conversation_state(
+            &json!({
+                "system": [{"type": "text", "text": "top level system"}],
+                "messages": [
+                    {"role":"user","content":[{"type":"text","text":"hello"}]},
+                    {"role":"system","content":"late system"}
+                ]
+            }),
+            "claude-opus-4-upstream",
+        )
+        .expect("system messages should not block conversion");
+
+        let first_history_content = conversation_state
+            .get("history")
+            .and_then(Value::as_array)
+            .and_then(|history| history.first())
+            .and_then(|item| item.get("userInputMessage"))
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_str)
+            .expect("system instructions should be written into history");
+        assert!(first_history_content.contains("top level system"));
+        assert!(first_history_content.contains("late system"));
+        assert_eq!(
+            conversation_state
+                .get("currentMessage")
+                .and_then(|value| value.get("userInputMessage"))
+                .and_then(|value| value.get("content"))
+                .and_then(Value::as_str),
+            Some("hello")
+        );
+    }
+
+    #[test]
+    fn rejects_system_only_messages() {
+        let conversation_state = convert_claude_messages_to_conversation_state(
+            &json!({
+                "messages": [
+                    {"role":"system","content":"system only"}
+                ]
+            }),
+            "claude-opus-4-upstream",
+        );
+
+        assert!(conversation_state.is_none());
+    }
+
+    #[test]
+    fn converts_kiro_trace_shape_with_trailing_system_message() {
+        let conversation_state = convert_claude_messages_to_conversation_state(
+            &json!({
+                "model": "claude-opus-4-7",
+                "system": [{"type": "text", "text": "top level system"}],
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "part one"},
+                            {"type": "text", "text": "part two"},
+                            {"type": "text", "text": "part three"}
+                        ]
+                    },
+                    {"role": "system", "content": "late system"}
+                ],
+                "tools": [
+                    {"name": "Read", "description": "read file", "input_schema": {"type": "object"}},
+                    {"name": "Write", "description": "write file", "input_schema": {"type": "object"}}
+                ],
+                "thinking": {"type": "adaptive"},
+                "output_config": {"effort": "high"},
+                "stream": true
+            }),
+            "claude-opus-4-upstream",
+        )
+        .expect("trace-like request should convert");
+
+        assert_eq!(
+            conversation_state
+                .get("currentMessage")
+                .and_then(|value| value.get("userInputMessage"))
+                .and_then(|value| value.get("content"))
+                .and_then(Value::as_str),
+            Some(
+                "<thinking_mode>adaptive</thinking_mode><thinking_effort>high</thinking_effort>\npart onepart twopart three"
+            )
+        );
+        assert_eq!(
+            conversation_state
+                .get("currentMessage")
+                .and_then(|value| value.get("userInputMessage"))
+                .and_then(|value| value.get("userInputMessageContext"))
+                .and_then(|value| value.get("tools"))
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(2)
         );
     }
 }
