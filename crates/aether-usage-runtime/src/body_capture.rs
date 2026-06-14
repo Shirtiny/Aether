@@ -5,9 +5,10 @@ use aether_data_contracts::repository::usage::{
 };
 use serde::Serialize;
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 
 use crate::event::UsageEvent;
-use crate::runtime::{UsageBodyCapturePolicy, UsageRequestRecordLevel};
+use crate::runtime::{UsageBodyCapturePolicy, UsagePromptCapturePolicy, UsageRequestRecordLevel};
 
 const TRUNCATED_BODY_STRING_SUFFIX: &str = "...[truncated]";
 
@@ -126,6 +127,13 @@ impl UsageBodyCaptureEngine {
     }
 
     fn apply_to_payload(self, payload: UsageBodyCapturePayloadMut<'_>) {
+        append_prompt_capture_metadata(
+            payload.request_metadata,
+            self.policy.prompt_capture,
+            payload.request_body.as_ref(),
+            payload.provider_request_body.as_ref(),
+        );
+
         if matches!(self.policy.record_level, UsageRequestRecordLevel::Basic) {
             disable_usage_body_capture_field(
                 UsageBodyField::RequestBody,
@@ -709,6 +717,285 @@ fn usage_value_kind(value: &Value) -> &'static str {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptCaptureRole {
+    System,
+    Developer,
+    User,
+    Tool,
+}
+
+impl PromptCaptureRole {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Developer => "developer",
+            Self::User => "user",
+            Self::Tool => "tool",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CapturedPrompt {
+    source: &'static str,
+    role: PromptCaptureRole,
+    text: String,
+}
+
+fn append_prompt_capture_metadata(
+    metadata: &mut Option<Value>,
+    policy: UsagePromptCapturePolicy,
+    request_body: Option<&Value>,
+    provider_request_body: Option<&Value>,
+) {
+    if !policy.enabled || policy.max_items == 0 {
+        return;
+    }
+
+    let mut prompts = Vec::new();
+    if let Some(body) = request_body {
+        collect_prompt_capture_items("request", body, policy, &mut prompts);
+    }
+    if prompts.len() < policy.max_items {
+        if let Some(body) = provider_request_body {
+            collect_prompt_capture_items("provider_request", body, policy, &mut prompts);
+        }
+    }
+    if prompts.is_empty() {
+        return;
+    }
+
+    prompts.truncate(policy.max_items);
+    let items = prompts
+        .iter()
+        .map(|prompt| prompt_capture_item_value(prompt, policy.preview_chars))
+        .collect::<Vec<_>>();
+    let mut role_counts = Map::new();
+    for prompt in &prompts {
+        let key = prompt.role.as_str().to_string();
+        let next = role_counts
+            .get(&key)
+            .and_then(Value::as_u64)
+            .unwrap_or_default()
+            .saturating_add(1);
+        role_counts.insert(key, json!(next));
+    }
+
+    let mut prompt_capture = Map::with_capacity(4);
+    prompt_capture.insert("version".to_string(), json!(1));
+    prompt_capture.insert("items".to_string(), Value::Array(items));
+    prompt_capture.insert("item_count".to_string(), json!(prompts.len()));
+    prompt_capture.insert("role_counts".to_string(), Value::Object(role_counts));
+
+    let object = metadata
+        .get_or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut();
+    let Some(object) = object else {
+        return;
+    };
+    object.insert("prompt_capture".to_string(), Value::Object(prompt_capture));
+}
+
+fn collect_prompt_capture_items(
+    source: &'static str,
+    value: &Value,
+    policy: UsagePromptCapturePolicy,
+    output: &mut Vec<CapturedPrompt>,
+) {
+    collect_top_level_prompt_fields(source, value, policy, output);
+    collect_message_prompts(source, value, policy, output);
+}
+
+fn collect_top_level_prompt_fields(
+    source: &'static str,
+    value: &Value,
+    policy: UsagePromptCapturePolicy,
+    output: &mut Vec<CapturedPrompt>,
+) {
+    let Some(object) = value.as_object() else {
+        return;
+    };
+    for key in [
+        "instructions",
+        "system",
+        "system_instruction",
+        "systemInstruction",
+    ] {
+        collect_text_values_for_role(
+            source,
+            object.get(key),
+            PromptCaptureRole::System,
+            policy,
+            output,
+        );
+    }
+}
+
+fn collect_message_prompts(
+    source: &'static str,
+    value: &Value,
+    policy: UsagePromptCapturePolicy,
+    output: &mut Vec<CapturedPrompt>,
+) {
+    let Some(object) = value.as_object() else {
+        return;
+    };
+    for key in ["input", "messages", "contents"] {
+        collect_message_array(source, object.get(key), policy, output);
+    }
+}
+
+fn collect_message_array(
+    source: &'static str,
+    value: Option<&Value>,
+    policy: UsagePromptCapturePolicy,
+    output: &mut Vec<CapturedPrompt>,
+) {
+    let Some(Value::Array(items)) = value else {
+        return;
+    };
+    for item in items {
+        let Some(object) = item.as_object() else {
+            continue;
+        };
+        let Some(role) = object
+            .get("role")
+            .and_then(Value::as_str)
+            .and_then(prompt_capture_role_from_str)
+        else {
+            continue;
+        };
+        if !prompt_capture_role_enabled(policy, role) {
+            continue;
+        }
+        for key in ["content", "text", "parts"] {
+            collect_text_values_for_role(source, object.get(key), role, policy, output);
+        }
+    }
+}
+
+fn collect_text_values_for_role(
+    source: &'static str,
+    value: Option<&Value>,
+    role: PromptCaptureRole,
+    policy: UsagePromptCapturePolicy,
+    output: &mut Vec<CapturedPrompt>,
+) {
+    if output.len() >= policy.max_items || !prompt_capture_role_enabled(policy, role) {
+        return;
+    }
+    let Some(value) = value else {
+        return;
+    };
+    match value {
+        Value::String(text) => push_prompt_text(source, role, text, policy, output),
+        Value::Array(items) => {
+            for item in items {
+                if output.len() >= policy.max_items {
+                    return;
+                }
+                collect_text_values_for_role(source, Some(item), role, policy, output);
+            }
+        }
+        Value::Object(object) => {
+            if object
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind.eq_ignore_ascii_case("tool_call"))
+                && !policy.include_tools
+            {
+                return;
+            }
+            for key in ["text", "content", "input"] {
+                if output.len() >= policy.max_items {
+                    return;
+                }
+                collect_text_values_for_role(source, object.get(key), role, policy, output);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn push_prompt_text(
+    source: &'static str,
+    role: PromptCaptureRole,
+    text: &str,
+    policy: UsagePromptCapturePolicy,
+    output: &mut Vec<CapturedPrompt>,
+) {
+    if output.len() >= policy.max_items {
+        return;
+    }
+    let normalized = normalize_prompt_text(text);
+    if normalized.is_empty() {
+        return;
+    }
+    output.push(CapturedPrompt {
+        source,
+        role,
+        text: normalized,
+    });
+}
+
+fn prompt_capture_role_from_str(value: &str) -> Option<PromptCaptureRole> {
+    if value.eq_ignore_ascii_case("system") {
+        Some(PromptCaptureRole::System)
+    } else if value.eq_ignore_ascii_case("developer") {
+        Some(PromptCaptureRole::Developer)
+    } else if value.eq_ignore_ascii_case("user") {
+        Some(PromptCaptureRole::User)
+    } else if value.eq_ignore_ascii_case("tool") || value.eq_ignore_ascii_case("function") {
+        Some(PromptCaptureRole::Tool)
+    } else {
+        None
+    }
+}
+
+fn prompt_capture_role_enabled(policy: UsagePromptCapturePolicy, role: PromptCaptureRole) -> bool {
+    match role {
+        PromptCaptureRole::System => policy.include_system,
+        PromptCaptureRole::Developer => policy.include_developer,
+        PromptCaptureRole::User => policy.include_user,
+        PromptCaptureRole::Tool => policy.include_tools,
+    }
+}
+
+fn prompt_capture_item_value(prompt: &CapturedPrompt, preview_chars: usize) -> Value {
+    let normalized = &prompt.text;
+    let preview = truncate_chars(normalized, preview_chars);
+    json!({
+        "source": prompt.source,
+        "role": prompt.role.as_str(),
+        "sha256": sha256_hex(normalized.as_bytes()),
+        "chars": normalized.chars().count(),
+        "preview": preview,
+        "truncated": preview.chars().count() < normalized.chars().count()
+    })
+}
+
+fn normalize_prompt_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    value.chars().take(max_chars).collect()
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    hex
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -716,9 +1003,12 @@ mod tests {
         trim_owned_non_empty_string, truncate_usage_body_string,
         upsert_body_capture_metadata_value_entry,
     };
-    use aether_data_contracts::repository::usage::UsageBodyCaptureState;
-    use aether_data_contracts::repository::usage::UsageBodyField;
-    use serde_json::{Map, Value};
+    use crate::runtime::{UsageBodyCapturePolicy, UsagePromptCapturePolicy};
+    use crate::{apply_usage_body_capture_policy_to_record, UsageRequestRecordLevel};
+    use aether_data_contracts::repository::usage::{
+        UpsertUsageRecord, UsageBodyCaptureState, UsageBodyField,
+    };
+    use serde_json::{json, Map, Value};
 
     #[test]
     fn build_plan_body_capture_metadata_returns_none_without_base64_body() {
@@ -825,5 +1115,118 @@ mod tests {
         assert!(serde_json::to_vec(&truncated)
             .ok()
             .is_some_and(|bytes| bytes.len() <= limit));
+    }
+
+    #[test]
+    fn prompt_capture_metadata_extracts_prompts_before_basic_body_strip() {
+        let mut record = sample_usage_record();
+        record.request_body = Some(json!({
+            "instructions": "  You are Codex.\nBe concise.  ",
+            "input": [
+                {"role": "developer", "content": [{"type": "text", "text": "Prefer safe changes."}]},
+                {"role": "user", "content": "Please inspect this request."}
+            ]
+        }));
+
+        apply_usage_body_capture_policy_to_record(
+            UsageBodyCapturePolicy {
+                record_level: UsageRequestRecordLevel::Basic,
+                prompt_capture: UsagePromptCapturePolicy {
+                    enabled: true,
+                    preview_chars: 12,
+                    ..UsagePromptCapturePolicy::default()
+                },
+                ..UsageBodyCapturePolicy::default()
+            },
+            &mut record,
+        );
+
+        assert!(record.request_body.is_none());
+        let prompt_capture = record
+            .request_metadata
+            .as_ref()
+            .and_then(|value| value.get("prompt_capture"))
+            .expect("prompt capture metadata should exist");
+        assert_eq!(prompt_capture["item_count"], json!(3));
+        assert_eq!(prompt_capture["role_counts"]["system"], json!(1));
+        assert_eq!(prompt_capture["role_counts"]["developer"], json!(1));
+        assert_eq!(prompt_capture["role_counts"]["user"], json!(1));
+        assert_eq!(prompt_capture["items"][0]["preview"], json!("You are Code"));
+        assert_eq!(prompt_capture["items"][0]["truncated"], json!(true));
+        assert!(prompt_capture["items"][0]["sha256"]
+            .as_str()
+            .is_some_and(|hash| hash.len() == 64));
+    }
+
+    fn sample_usage_record() -> UpsertUsageRecord {
+        UpsertUsageRecord {
+            request_id: "req-prompt-1".to_string(),
+            user_id: Some("user-1".to_string()),
+            api_key_id: None,
+            username: None,
+            api_key_name: None,
+            provider_name: "openai".to_string(),
+            model: "gpt-5".to_string(),
+            target_model: None,
+            provider_id: None,
+            provider_endpoint_id: None,
+            provider_api_key_id: None,
+            request_type: Some("chat".to_string()),
+            api_format: Some("openai:responses".to_string()),
+            api_family: None,
+            endpoint_kind: None,
+            endpoint_api_format: None,
+            provider_api_family: None,
+            provider_endpoint_kind: None,
+            has_format_conversion: None,
+            is_stream: None,
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
+            cache_creation_input_tokens: None,
+            cache_creation_ephemeral_5m_input_tokens: None,
+            cache_creation_ephemeral_1h_input_tokens: None,
+            cache_read_input_tokens: None,
+            cache_creation_cost_usd: None,
+            cache_read_cost_usd: None,
+            output_price_per_1m: None,
+            total_cost_usd: None,
+            actual_total_cost_usd: None,
+            status_code: Some(200),
+            error_message: None,
+            error_category: None,
+            response_time_ms: None,
+            first_byte_time_ms: None,
+            status: "completed".to_string(),
+            billing_status: "void".to_string(),
+            request_headers: None,
+            request_body: None,
+            request_body_ref: None,
+            request_body_state: None,
+            provider_request_headers: None,
+            provider_request_body: None,
+            provider_request_body_ref: None,
+            provider_request_body_state: None,
+            response_headers: None,
+            response_body: None,
+            response_body_ref: None,
+            response_body_state: None,
+            client_response_headers: None,
+            client_response_body: None,
+            client_response_body_ref: None,
+            client_response_body_state: None,
+            candidate_id: None,
+            candidate_index: None,
+            key_name: None,
+            planner_kind: None,
+            route_family: None,
+            route_kind: None,
+            execution_path: None,
+            local_execution_runtime_miss_reason: None,
+            request_metadata: None,
+            finalized_at_unix_secs: None,
+            created_at_unix_ms: None,
+            updated_at_unix_secs: 1,
+        }
     }
 }

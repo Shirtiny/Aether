@@ -31,6 +31,31 @@ pub enum UsageRequestRecordLevel {
     Full,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UsagePromptCapturePolicy {
+    pub enabled: bool,
+    pub include_system: bool,
+    pub include_developer: bool,
+    pub include_user: bool,
+    pub include_tools: bool,
+    pub preview_chars: usize,
+    pub max_items: usize,
+}
+
+impl Default for UsagePromptCapturePolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            include_system: true,
+            include_developer: true,
+            include_user: true,
+            include_tools: false,
+            preview_chars: 512,
+            max_items: 32,
+        }
+    }
+}
+
 pub const DEFAULT_USAGE_REQUEST_BODY_CAPTURE_LIMIT_BYTES: usize = 5 * 1024 * 1024;
 pub const DEFAULT_USAGE_RESPONSE_BODY_CAPTURE_LIMIT_BYTES: usize = 5 * 1024 * 1024;
 
@@ -39,6 +64,7 @@ pub struct UsageBodyCapturePolicy {
     pub record_level: UsageRequestRecordLevel,
     pub max_request_body_bytes: Option<usize>,
     pub max_response_body_bytes: Option<usize>,
+    pub prompt_capture: UsagePromptCapturePolicy,
 }
 
 impl Default for UsageBodyCapturePolicy {
@@ -47,6 +73,7 @@ impl Default for UsageBodyCapturePolicy {
             record_level: UsageRequestRecordLevel::Full,
             max_request_body_bytes: Some(DEFAULT_USAGE_REQUEST_BODY_CAPTURE_LIMIT_BYTES),
             max_response_body_bytes: Some(DEFAULT_USAGE_RESPONSE_BODY_CAPTURE_LIMIT_BYTES),
+            prompt_capture: UsagePromptCapturePolicy::default(),
         }
     }
 }
@@ -66,6 +93,13 @@ pub trait UsageRuntimeAccess:
 
     async fn body_capture_policy(&self) -> Result<UsageBodyCapturePolicy, DataLayerError> {
         Ok(UsageBodyCapturePolicy::default())
+    }
+
+    async fn body_capture_policy_for_user(
+        &self,
+        _user_id: Option<&str>,
+    ) -> Result<UsageBodyCapturePolicy, DataLayerError> {
+        self.body_capture_policy().await
     }
 
     async fn request_record_level(&self) -> Result<UsageRequestRecordLevel, DataLayerError> {
@@ -496,7 +530,10 @@ async fn apply_body_capture_policy_from_data<T>(data: &T, event: &mut UsageEvent
 where
     T: UsageRuntimeAccess,
 {
-    match data.body_capture_policy().await {
+    match data
+        .body_capture_policy_for_user(event.data.user_id.as_deref())
+        .await
+    {
         Ok(policy) => apply_usage_body_capture_policy_to_event(policy, event),
         Err(err) => {
             warn!(
@@ -516,7 +553,10 @@ async fn apply_body_capture_policy_to_record_from_data<T>(data: &T, record: &mut
 where
     T: UsageRuntimeAccess,
 {
-    match data.body_capture_policy().await {
+    match data
+        .body_capture_policy_for_user(record.user_id.as_deref())
+        .await
+    {
         Ok(policy) => apply_usage_body_capture_policy_to_record(policy, record),
         Err(err) => {
             warn!(

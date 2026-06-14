@@ -18,8 +18,8 @@ use aether_data_contracts::repository::usage::{
 use aether_data_contracts::repository::video_tasks::{StoredVideoTask, VideoTaskLookupKey};
 use aether_runtime_state::RuntimeQueueStore;
 use aether_usage_runtime::{
-    UsageBillingEventEnricher, UsageBodyCapturePolicy, UsageEvent, UsageRecordWriter,
-    UsageRequestRecordLevel, UsageRuntimeAccess, UsageSettlementWriter,
+    UsageBillingEventEnricher, UsageBodyCapturePolicy, UsageEvent, UsagePromptCapturePolicy,
+    UsageRecordWriter, UsageRequestRecordLevel, UsageRuntimeAccess, UsageSettlementWriter,
     DEFAULT_USAGE_REQUEST_BODY_CAPTURE_LIMIT_BYTES,
     DEFAULT_USAGE_RESPONSE_BODY_CAPTURE_LIMIT_BYTES,
 };
@@ -35,6 +35,35 @@ const REQUEST_RECORD_LEVEL_KEY: &str = "request_record_level";
 const LEGACY_REQUEST_LOG_LEVEL_KEY: &str = "request_log_level";
 const MAX_REQUEST_BODY_SIZE_KEY: &str = "max_request_body_size";
 const MAX_RESPONSE_BODY_SIZE_KEY: &str = "max_response_body_size";
+const REQUEST_CAPTURE_POLICY_KEY: &str = "request_capture_policy";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestCaptureScopeMode {
+    All,
+    IncludeGroups,
+    ExcludeGroups,
+}
+
+#[derive(Debug, Clone)]
+struct RequestCaptureScope {
+    mode: RequestCaptureScopeMode,
+    group_ids: Vec<String>,
+}
+
+impl Default for RequestCaptureScope {
+    fn default() -> Self {
+        Self {
+            mode: RequestCaptureScopeMode::All,
+            group_ids: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RequestCapturePolicyConfig {
+    scope: RequestCaptureScope,
+    body: UsageBodyCapturePolicy,
+}
 
 fn usage_request_record_level_from_value(value: Option<&Value>) -> UsageRequestRecordLevel {
     let Some(value) = value.and_then(Value::as_str).map(str::trim) else {
@@ -59,6 +88,150 @@ fn usage_body_capture_limit_from_value(value: Option<&Value>, default: usize) ->
         Some(limit) => usize::try_from(limit).ok().filter(|limit| *limit > 0),
         None => Some(default),
     }
+}
+
+fn request_capture_policy_from_values(
+    policy_value: Option<&Value>,
+    record_level_value: Option<&Value>,
+    max_request_body_size_value: Option<&Value>,
+    max_response_body_size_value: Option<&Value>,
+) -> RequestCapturePolicyConfig {
+    let mut body = UsageBodyCapturePolicy {
+        record_level: usage_request_record_level_from_value(record_level_value),
+        max_request_body_bytes: usage_body_capture_limit_from_value(
+            max_request_body_size_value,
+            DEFAULT_USAGE_REQUEST_BODY_CAPTURE_LIMIT_BYTES,
+        ),
+        max_response_body_bytes: usage_body_capture_limit_from_value(
+            max_response_body_size_value,
+            DEFAULT_USAGE_RESPONSE_BODY_CAPTURE_LIMIT_BYTES,
+        ),
+        prompt_capture: UsagePromptCapturePolicy::default(),
+    };
+    let mut scope = RequestCaptureScope::default();
+
+    let Some(policy_object) = policy_value.and_then(Value::as_object) else {
+        return RequestCapturePolicyConfig { scope, body };
+    };
+
+    if let Some(level) = policy_object
+        .get(REQUEST_RECORD_LEVEL_KEY)
+        .or_else(|| policy_object.get(LEGACY_REQUEST_LOG_LEVEL_KEY))
+        .or_else(|| policy_object.get("body_record_level"))
+    {
+        body.record_level = usage_request_record_level_from_value(Some(level));
+    }
+    body.max_request_body_bytes = usage_body_capture_limit_from_value(
+        policy_object
+            .get(MAX_REQUEST_BODY_SIZE_KEY)
+            .or_else(|| policy_object.get("max_request_body_bytes")),
+        body.max_request_body_bytes
+            .unwrap_or(DEFAULT_USAGE_REQUEST_BODY_CAPTURE_LIMIT_BYTES),
+    );
+    body.max_response_body_bytes = usage_body_capture_limit_from_value(
+        policy_object
+            .get(MAX_RESPONSE_BODY_SIZE_KEY)
+            .or_else(|| policy_object.get("max_response_body_bytes")),
+        body.max_response_body_bytes
+            .unwrap_or(DEFAULT_USAGE_RESPONSE_BODY_CAPTURE_LIMIT_BYTES),
+    );
+    body.prompt_capture =
+        usage_prompt_capture_policy_from_value(policy_object.get("prompt_capture"));
+    scope = request_capture_scope_from_value(policy_value);
+
+    RequestCapturePolicyConfig { scope, body }
+}
+
+fn request_capture_scope_from_value(value: Option<&Value>) -> RequestCaptureScope {
+    let Some(object) = value.and_then(Value::as_object) else {
+        return RequestCaptureScope::default();
+    };
+    let scope_object = object.get("scope").and_then(Value::as_object);
+    let mode_value = scope_object
+        .and_then(|scope| scope.get("mode"))
+        .or_else(|| object.get("scope_mode"))
+        .and_then(Value::as_str)
+        .unwrap_or("all");
+    let mode = if mode_value.eq_ignore_ascii_case("include_groups")
+        || mode_value.eq_ignore_ascii_case("include")
+        || mode_value.eq_ignore_ascii_case("only_groups")
+    {
+        RequestCaptureScopeMode::IncludeGroups
+    } else if mode_value.eq_ignore_ascii_case("exclude_groups")
+        || mode_value.eq_ignore_ascii_case("exclude")
+        || mode_value.eq_ignore_ascii_case("except_groups")
+    {
+        RequestCaptureScopeMode::ExcludeGroups
+    } else {
+        RequestCaptureScopeMode::All
+    };
+    let group_ids = string_array_from_value(
+        scope_object
+            .and_then(|scope| scope.get("group_ids"))
+            .or_else(|| object.get("group_ids"))
+            .or_else(|| object.get("user_group_ids")),
+    );
+
+    RequestCaptureScope { mode, group_ids }
+}
+
+fn usage_prompt_capture_policy_from_value(value: Option<&Value>) -> UsagePromptCapturePolicy {
+    let mut policy = UsagePromptCapturePolicy::default();
+    let Some(object) = value.and_then(Value::as_object) else {
+        policy.enabled = value.and_then(Value::as_bool).unwrap_or(false);
+        return policy;
+    };
+    policy.enabled = object
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(policy.enabled);
+    policy.include_system = object
+        .get("include_system")
+        .or_else(|| object.get("system"))
+        .and_then(Value::as_bool)
+        .unwrap_or(policy.include_system);
+    policy.include_developer = object
+        .get("include_developer")
+        .or_else(|| object.get("developer"))
+        .and_then(Value::as_bool)
+        .unwrap_or(policy.include_developer);
+    policy.include_user = object
+        .get("include_user")
+        .or_else(|| object.get("user"))
+        .and_then(Value::as_bool)
+        .unwrap_or(policy.include_user);
+    policy.include_tools = object
+        .get("include_tools")
+        .or_else(|| object.get("tools"))
+        .and_then(Value::as_bool)
+        .unwrap_or(policy.include_tools);
+    policy.preview_chars = usize_from_value(object.get("preview_chars"))
+        .or_else(|| usize_from_value(object.get("max_preview_chars")))
+        .unwrap_or(policy.preview_chars)
+        .min(8_192);
+    policy.max_items = usize_from_value(object.get("max_items"))
+        .unwrap_or(policy.max_items)
+        .min(256);
+    policy
+}
+
+fn usize_from_value(value: Option<&Value>) -> Option<usize> {
+    value
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+}
+
+fn string_array_from_value(value: Option<&Value>) -> Vec<String> {
+    let Some(Value::Array(items)) = value else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 #[async_trait]
@@ -253,27 +426,87 @@ impl UsageRuntimeAccess for GatewayDataState {
     }
 
     async fn body_capture_policy(&self) -> Result<UsageBodyCapturePolicy, DataLayerError> {
+        self.body_capture_policy_for_user(None).await
+    }
+
+    async fn body_capture_policy_for_user(
+        &self,
+        user_id: Option<&str>,
+    ) -> Result<UsageBodyCapturePolicy, DataLayerError> {
         let value = GatewayDataState::find_system_config_value(self, REQUEST_RECORD_LEVEL_KEY)
             .await?
             .or(
                 GatewayDataState::find_system_config_value(self, LEGACY_REQUEST_LOG_LEVEL_KEY)
                     .await?,
             );
+        let request_capture_policy =
+            GatewayDataState::find_system_config_value(self, REQUEST_CAPTURE_POLICY_KEY).await?;
         let max_request_body_size =
             GatewayDataState::find_system_config_value(self, MAX_REQUEST_BODY_SIZE_KEY).await?;
         let max_response_body_size =
             GatewayDataState::find_system_config_value(self, MAX_RESPONSE_BODY_SIZE_KEY).await?;
-        Ok(UsageBodyCapturePolicy {
-            record_level: usage_request_record_level_from_value(value.as_ref()),
-            max_request_body_bytes: usage_body_capture_limit_from_value(
-                max_request_body_size.as_ref(),
-                DEFAULT_USAGE_REQUEST_BODY_CAPTURE_LIMIT_BYTES,
-            ),
-            max_response_body_bytes: usage_body_capture_limit_from_value(
-                max_response_body_size.as_ref(),
-                DEFAULT_USAGE_RESPONSE_BODY_CAPTURE_LIMIT_BYTES,
-            ),
-        })
+        let policy = request_capture_policy_from_values(
+            request_capture_policy.as_ref(),
+            value.as_ref(),
+            max_request_body_size.as_ref(),
+            max_response_body_size.as_ref(),
+        );
+        let Some(config_value) = request_capture_policy.as_ref() else {
+            return Ok(policy.body);
+        };
+        if self
+            .request_capture_scope_matches_user(&policy.scope, user_id)
+            .await?
+        {
+            return Ok(policy.body);
+        }
+
+        let mut out_of_scope = UsageBodyCapturePolicy::default();
+        out_of_scope.record_level = UsageRequestRecordLevel::Basic;
+        if let Some(out_of_scope_value) = config_value
+            .as_object()
+            .and_then(|object| object.get("out_of_scope_record_level"))
+        {
+            out_of_scope.record_level =
+                usage_request_record_level_from_value(Some(out_of_scope_value));
+        }
+        Ok(out_of_scope)
+    }
+}
+
+impl GatewayDataState {
+    async fn request_capture_scope_matches_user(
+        &self,
+        scope: &RequestCaptureScope,
+        user_id: Option<&str>,
+    ) -> Result<bool, DataLayerError> {
+        match scope.mode {
+            RequestCaptureScopeMode::All => Ok(true),
+            RequestCaptureScopeMode::IncludeGroups => {
+                if scope.group_ids.is_empty() {
+                    return Ok(false);
+                }
+                let Some(user_id) = user_id.map(str::trim).filter(|value| !value.is_empty()) else {
+                    return Ok(false);
+                };
+                let groups = GatewayDataState::list_user_groups_for_user(self, user_id).await?;
+                Ok(groups
+                    .iter()
+                    .any(|group| scope.group_ids.iter().any(|id| id == &group.id)))
+            }
+            RequestCaptureScopeMode::ExcludeGroups => {
+                if scope.group_ids.is_empty() {
+                    return Ok(true);
+                }
+                let Some(user_id) = user_id.map(str::trim).filter(|value| !value.is_empty()) else {
+                    return Ok(true);
+                };
+                let groups = GatewayDataState::list_user_groups_for_user(self, user_id).await?;
+                Ok(!groups
+                    .iter()
+                    .any(|group| scope.group_ids.iter().any(|id| id == &group.id)))
+            }
+        }
     }
 }
 
@@ -325,8 +558,13 @@ impl UsageRecordWriter for GatewayDataState {
 #[cfg(test)]
 mod tests {
     use aether_billing::enrich_usage_event_with_billing;
+    use aether_data::repository::users::{
+        InMemoryUserReadRepository, StoredUserAuthRecord, UpsertUserGroupRecord, UserReadRepository,
+    };
     use aether_usage_runtime::UsageRuntimeAccess;
+    use chrono::Utc;
     use serde_json::{json, Value};
+    use std::sync::Arc;
 
     use super::GatewayDataState;
     use crate::usage::{UsageEvent, UsageEventData, UsageEventType, UsageRequestRecordLevel};
@@ -462,5 +700,113 @@ mod tests {
 
         assert_eq!(policy.max_request_body_bytes, None);
         assert_eq!(policy.max_response_body_bytes, None);
+    }
+
+    #[tokio::test]
+    async fn usage_runtime_access_reads_prompt_capture_policy_from_system_config() {
+        let state = GatewayDataState::disabled().with_system_config_values_for_tests([(
+            "request_capture_policy".to_string(),
+            json!({
+                "request_record_level": "basic",
+                "max_request_body_bytes": 2048,
+                "prompt_capture": {
+                    "enabled": true,
+                    "include_system": true,
+                    "include_developer": false,
+                    "include_user": true,
+                    "preview_chars": 120,
+                    "max_items": 8
+                }
+            }),
+        )]);
+
+        let policy = UsageRuntimeAccess::body_capture_policy_for_user(&state, Some("user-1"))
+            .await
+            .expect("request capture policy should read");
+
+        assert_eq!(policy.record_level, UsageRequestRecordLevel::Basic);
+        assert_eq!(policy.max_request_body_bytes, Some(2048));
+        assert!(policy.prompt_capture.enabled);
+        assert!(!policy.prompt_capture.include_developer);
+        assert_eq!(policy.prompt_capture.preview_chars, 120);
+        assert_eq!(policy.prompt_capture.max_items, 8);
+    }
+
+    #[tokio::test]
+    async fn usage_runtime_access_applies_request_capture_policy_to_included_user_group() {
+        let user_repository = Arc::new(InMemoryUserReadRepository::seed_auth_users(vec![
+            sample_auth_user("user-in"),
+            sample_auth_user("user-out"),
+        ]));
+        let group = user_repository
+            .create_user_group(sample_user_group("Prompt Audit"))
+            .await
+            .expect("group create should succeed")
+            .expect("group should exist");
+        user_repository
+            .add_user_to_group(&group.id, "user-in")
+            .await
+            .expect("membership should create");
+
+        let state = GatewayDataState::disabled()
+            .with_user_reader(user_repository)
+            .with_system_config_values_for_tests([(
+                "request_capture_policy".to_string(),
+                json!({
+                    "request_record_level": "full",
+                    "scope": {"mode": "include_groups", "group_ids": [group.id]},
+                    "prompt_capture": {"enabled": true}
+                }),
+            )]);
+
+        let included = UsageRuntimeAccess::body_capture_policy_for_user(&state, Some("user-in"))
+            .await
+            .expect("included policy should read");
+        let excluded = UsageRuntimeAccess::body_capture_policy_for_user(&state, Some("user-out"))
+            .await
+            .expect("excluded policy should read");
+
+        assert_eq!(included.record_level, UsageRequestRecordLevel::Full);
+        assert!(included.prompt_capture.enabled);
+        assert_eq!(excluded.record_level, UsageRequestRecordLevel::Basic);
+        assert!(!excluded.prompt_capture.enabled);
+    }
+
+    fn sample_auth_user(id: &str) -> StoredUserAuthRecord {
+        StoredUserAuthRecord {
+            id: id.to_string(),
+            email: Some(format!("{id}@example.test")),
+            email_verified: true,
+            username: id.to_string(),
+            password_hash: None,
+            role: "user".to_string(),
+            auth_source: "local".to_string(),
+            allowed_providers: None,
+            allowed_providers_mode: "unrestricted".to_string(),
+            allowed_api_formats: None,
+            allowed_api_formats_mode: "unrestricted".to_string(),
+            allowed_models: None,
+            allowed_models_mode: "unrestricted".to_string(),
+            is_active: true,
+            is_deleted: false,
+            created_at: Some(Utc::now()),
+            last_login_at: None,
+        }
+    }
+
+    fn sample_user_group(name: &str) -> UpsertUserGroupRecord {
+        UpsertUserGroupRecord {
+            name: name.to_string(),
+            description: None,
+            priority: 10,
+            allowed_providers: None,
+            allowed_providers_mode: "unrestricted".to_string(),
+            allowed_api_formats: None,
+            allowed_api_formats_mode: "unrestricted".to_string(),
+            allowed_models: None,
+            allowed_models_mode: "unrestricted".to_string(),
+            rate_limit: None,
+            rate_limit_mode: "inherit".to_string(),
+        }
     }
 }
