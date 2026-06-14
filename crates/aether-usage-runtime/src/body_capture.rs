@@ -932,6 +932,9 @@ fn push_prompt_text(
     if normalized.is_empty() {
         return;
     }
+    if output.iter().any(|prompt| prompt.text == normalized) {
+        return;
+    }
     output.push(CapturedPrompt {
         source,
         role,
@@ -1156,6 +1159,53 @@ mod tests {
         assert!(prompt_capture["items"][0]["sha256"]
             .as_str()
             .is_some_and(|hash| hash.len() == 64));
+    }
+
+    #[test]
+    fn prompt_capture_metadata_deduplicates_normalized_prompt_text() {
+        let mut record = sample_usage_record();
+        record.request_body = Some(json!({
+            "input": [
+                {"role": "user", "content": "Repeat this prompt."},
+                {"role": "user", "content": "Unique request prompt."}
+            ]
+        }));
+        record.provider_request_body = Some(json!({
+            "messages": [
+                {"role": "user", "content": " Repeat   this\nprompt. "},
+                {"role": "developer", "content": "Unique provider prompt."}
+            ]
+        }));
+
+        apply_usage_body_capture_policy_to_record(
+            UsageBodyCapturePolicy {
+                prompt_capture: UsagePromptCapturePolicy {
+                    enabled: true,
+                    max_items: 8,
+                    ..UsagePromptCapturePolicy::default()
+                },
+                ..UsageBodyCapturePolicy::default()
+            },
+            &mut record,
+        );
+
+        let prompt_capture = record
+            .request_metadata
+            .as_ref()
+            .and_then(|value| value.get("prompt_capture"))
+            .expect("prompt capture metadata should exist");
+        assert_eq!(prompt_capture["item_count"], json!(3));
+        assert_eq!(prompt_capture["role_counts"]["user"], json!(2));
+        assert_eq!(prompt_capture["role_counts"]["developer"], json!(1));
+        assert_eq!(prompt_capture["items"][0]["preview"], json!("Repeat this prompt."));
+        assert_eq!(
+            prompt_capture["items"][1]["preview"],
+            json!("Unique request prompt.")
+        );
+        assert_eq!(
+            prompt_capture["items"][2]["preview"],
+            json!("Unique provider prompt.")
+        );
     }
 
     fn sample_usage_record() -> UpsertUsageRecord {
