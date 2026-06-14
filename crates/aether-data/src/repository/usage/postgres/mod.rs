@@ -28,7 +28,7 @@ use futures_util::TryStreamExt;
 use serde_json::Map;
 use serde_json::Value;
 use sqlx::{
-    postgres::{PgArguments, PgRow},
+    postgres::{PgArguments, PgConnection, PgRow},
     query::Query,
     PgPool, Postgres, QueryBuilder, Row,
 };
@@ -60,6 +60,38 @@ const MAX_INLINE_USAGE_BODY_BYTES: usize = 0;
 const MAX_SUPPORTED_UNIX_SECS: u64 = 253_402_300_799;
 const FIND_USAGE_BODY_BLOB_BY_REF_SQL: &str =
     r#"SELECT payload_gzip FROM usage_body_blobs WHERE body_ref = $1 LIMIT 1"#;
+const UPSERT_USAGE_PROMPT_CAPTURE_ENTRY_SQL: &str = r#"
+INSERT INTO usage_prompt_capture_entries (
+  sha256,
+  role,
+  chars,
+  preview,
+  truncated,
+  first_seen_at,
+  last_seen_at,
+  seen_count
+) VALUES (
+  $1,
+  $2,
+  $3,
+  $4,
+  $5,
+  NOW(),
+  NOW(),
+  1
+)
+ON CONFLICT (sha256)
+DO UPDATE SET
+  role = COALESCE(NULLIF(EXCLUDED.role, ''), usage_prompt_capture_entries.role),
+  chars = GREATEST(usage_prompt_capture_entries.chars, EXCLUDED.chars),
+  preview = CASE
+    WHEN char_length(usage_prompt_capture_entries.preview) < char_length(EXCLUDED.preview) THEN EXCLUDED.preview
+    ELSE usage_prompt_capture_entries.preview
+  END,
+  truncated = usage_prompt_capture_entries.truncated OR EXCLUDED.truncated,
+  last_seen_at = NOW(),
+  seen_count = usage_prompt_capture_entries.seen_count + 1
+"#;
 const UPSERT_USAGE_BODY_BLOB_SQL: &str = include_str!("queries/upsert_usage_body_blob_sql.sql");
 const DELETE_USAGE_BODY_BLOB_SQL: &str = include_str!("queries/delete_usage_body_blob_sql.sql");
 
@@ -2365,7 +2397,10 @@ ORDER BY request_count DESC, "usage".provider_name ASC
             .map(|row| map_usage_row(row, true))
             .transpose()?;
         match usage {
-            Some(usage) => self.hydrate_usage_body_refs(usage).await.map(Some),
+            Some(usage) => {
+                let usage = self.hydrate_usage_detail_metadata(usage).await?;
+                self.hydrate_usage_body_refs(usage).await.map(Some)
+            }
             None => Ok(None),
         }
     }
@@ -2379,9 +2414,14 @@ ORDER BY request_count DESC, "usage".provider_name ASC
             .fetch_optional(&self.pool)
             .await
             .map_postgres_err()?;
-        row.as_ref()
+        let usage = row
+            .as_ref()
             .map(|row| map_usage_row(row, false))
-            .transpose()
+            .transpose()?;
+        match usage {
+            Some(usage) => self.hydrate_usage_detail_metadata(usage).await.map(Some),
+            None => Ok(None),
+        }
     }
 
     pub async fn list_by_ids(
@@ -2457,6 +2497,15 @@ ORDER BY request_count DESC, "usage".provider_name ASC
                 .resolve_usage_body_ref(&usage, UsageBodyField::ClientResponseBody)
                 .await?;
         }
+        Ok(usage)
+    }
+
+    async fn hydrate_usage_detail_metadata(
+        &self,
+        mut usage: StoredRequestUsageAudit,
+    ) -> Result<StoredRequestUsageAudit, DataLayerError> {
+        usage.request_metadata =
+            hydrate_prompt_capture_metadata(&self.pool, usage.request_metadata).await?;
         Ok(usage)
     }
 
@@ -7953,6 +8002,8 @@ ORDER BY "usage".user_id ASC
                             ),
                         ],
                     );
+                    let (request_metadata_value, prompt_capture_entries) =
+                        prepare_prompt_capture_metadata(request_metadata_value);
                     let http_audit_capture_mode = usage_http_audit_capture_mode(
                         &http_audit_refs,
                         [
@@ -7968,6 +8019,7 @@ ORDER BY "usage".user_id ASC
                         &usage,
                         request_metadata_value.as_ref(),
                     )?;
+                    sync_usage_prompt_capture_entries(&mut **tx, &prompt_capture_entries).await?;
                     let request_metadata_json = json_bind_text(request_metadata_value.as_ref())?;
                     let _row = sqlx::query(UPSERT_SQL)
                         .bind(Uuid::new_v4().to_string())
@@ -10299,6 +10351,188 @@ fn json_bind_text(value: Option<&Value>) -> Result<Option<String>, DataLayerErro
             })
         })
         .transpose()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UsagePromptCaptureEntry {
+    sha256: String,
+    role: String,
+    chars: i32,
+    preview: String,
+    truncated: bool,
+}
+
+fn prepare_prompt_capture_metadata(
+    metadata: Option<Value>,
+) -> (Option<Value>, Vec<UsagePromptCaptureEntry>) {
+    let mut object = match metadata {
+        Some(Value::Object(object)) => object,
+        other => return (other, Vec::new()),
+    };
+    let Some(Value::Object(mut capture)) = object.remove("prompt_capture") else {
+        return (Some(Value::Object(object)), Vec::new());
+    };
+    let Some(Value::Array(items)) = capture.remove("items") else {
+        object.insert("prompt_capture".to_string(), Value::Object(capture));
+        return (Some(Value::Object(object)), Vec::new());
+    };
+
+    let original_items = items.clone();
+    let mut entries = Vec::new();
+    let mut refs = Vec::new();
+    for item in items {
+        let Value::Object(item_object) = item else {
+            continue;
+        };
+        let sha256 = item_object
+            .get("sha256")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| value.len() == 64)
+            .unwrap_or_default();
+        if sha256.is_empty() {
+            continue;
+        }
+        let role = item_object
+            .get("role")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("unknown");
+        let source = item_object
+            .get("source")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("unknown");
+        let chars = item_object
+            .get("chars")
+            .and_then(Value::as_i64)
+            .and_then(|value| i32::try_from(value).ok())
+            .unwrap_or_default()
+            .max(0);
+        let preview = item_object
+            .get("preview")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let truncated = item_object
+            .get("truncated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+        entries.push(UsagePromptCaptureEntry {
+            sha256: sha256.to_string(),
+            role: role.to_string(),
+            chars,
+            preview,
+            truncated,
+        });
+
+        refs.push(serde_json::json!({
+            "source": source,
+            "role": role,
+            "sha256": sha256
+        }));
+    }
+
+    if refs.is_empty() {
+        capture.insert("items".to_string(), Value::Array(original_items));
+        object.insert("prompt_capture".to_string(), Value::Object(capture));
+        return (Some(Value::Object(object)), entries);
+    }
+
+    capture.insert("version".to_string(), serde_json::json!(2));
+    capture.insert("items".to_string(), Value::Array(refs));
+    object.insert("prompt_capture".to_string(), Value::Object(capture));
+    (Some(Value::Object(object)), entries)
+}
+
+async fn sync_usage_prompt_capture_entries(
+    conn: &mut PgConnection,
+    entries: &[UsagePromptCaptureEntry],
+) -> Result<(), DataLayerError> {
+    for entry in entries {
+        sqlx::query(UPSERT_USAGE_PROMPT_CAPTURE_ENTRY_SQL)
+            .bind(&entry.sha256)
+            .bind(&entry.role)
+            .bind(entry.chars)
+            .bind(&entry.preview)
+            .bind(entry.truncated)
+            .execute(&mut *conn)
+            .await
+            .map_postgres_err()?;
+    }
+    Ok(())
+}
+
+async fn hydrate_prompt_capture_metadata(
+    pool: &PgPool,
+    metadata: Option<Value>,
+) -> Result<Option<Value>, DataLayerError> {
+    let Some(Value::Object(mut object)) = metadata else {
+        return Ok(metadata);
+    };
+    let Some(capture) = object
+        .get_mut("prompt_capture")
+        .and_then(Value::as_object_mut)
+    else {
+        return Ok(Some(Value::Object(object)));
+    };
+    if capture.get("version").and_then(Value::as_i64).unwrap_or(1) < 2 {
+        return Ok(Some(Value::Object(object)));
+    }
+    let Some(items) = capture.get_mut("items").and_then(Value::as_array_mut) else {
+        return Ok(Some(Value::Object(object)));
+    };
+    let hashes = items
+        .iter()
+        .filter_map(|item| item.get("sha256").and_then(Value::as_str))
+        .filter(|hash| hash.len() == 64)
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    if hashes.is_empty() {
+        return Ok(Some(Value::Object(object)));
+    }
+
+    let mut rows = sqlx::query(
+        r#"
+SELECT sha256, chars, preview, truncated
+FROM usage_prompt_capture_entries
+WHERE sha256 = ANY($1::TEXT[])
+"#,
+    )
+    .bind(&hashes)
+    .fetch(pool);
+    let mut entries = BTreeMap::new();
+    while let Some(row) = rows.try_next().await.map_postgres_err()? {
+        let sha256: String = row.try_get("sha256").map_postgres_err()?;
+        entries.insert(
+            sha256,
+            (
+                row.try_get::<i32, _>("chars").map_postgres_err()?,
+                row.try_get::<String, _>("preview").map_postgres_err()?,
+                row.try_get::<bool, _>("truncated").map_postgres_err()?,
+            ),
+        );
+    }
+
+    for item in items {
+        let Some(item_object) = item.as_object_mut() else {
+            continue;
+        };
+        let Some(sha256) = item_object.get("sha256").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some((chars, preview, truncated)) = entries.get(sha256) else {
+            continue;
+        };
+        item_object.insert("chars".to_string(), serde_json::json!(chars));
+        item_object.insert("preview".to_string(), Value::String(preview.clone()));
+        item_object.insert("truncated".to_string(), serde_json::json!(truncated));
+    }
+
+    Ok(Some(Value::Object(object)))
 }
 
 fn usage_body_capture_state_bind_text(

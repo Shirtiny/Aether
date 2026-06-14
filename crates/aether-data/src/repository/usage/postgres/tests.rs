@@ -4,12 +4,13 @@ use serde_json::json;
 use super::{
     attach_compressed_body_refs, attach_usage_http_audit_body_refs,
     attach_usage_routing_snapshot_metadata, attach_usage_settlement_pricing_snapshot_metadata,
-    inflate_usage_json_value, prepare_request_metadata_for_body_storage,
+    inflate_usage_json_value, prepare_prompt_capture_metadata,
+    prepare_request_metadata_for_body_storage,
     prepare_usage_body_storage, resolved_read_usage_body_ref, resolved_write_usage_body_ref,
     split_dashboard_daily_aggregate_range, split_dashboard_hourly_aggregate_range, usage_body_ref,
     usage_http_audit_body_refs, usage_http_audit_capture_mode, usage_routing_snapshot_from_usage,
     usage_settlement_pricing_snapshot_from_usage, AggregateRangeSplit, SqlxUsageReadRepository,
-    UsageHttpAuditRefs, UsageRoutingSnapshot, UsageSettlementPricingSnapshot,
+    UsageHttpAuditRefs, UsagePromptCaptureEntry, UsageRoutingSnapshot, UsageSettlementPricingSnapshot,
     MAX_INLINE_USAGE_BODY_BYTES,
 };
 use crate::driver::postgres::{PostgresPoolConfig, PostgresPoolFactory};
@@ -1007,6 +1008,72 @@ fn prepare_request_metadata_for_body_storage_strips_body_ref_compatibility_keys(
         json!({
             "trace_id": "trace-1"
         })
+    );
+}
+
+#[test]
+fn prepare_prompt_capture_metadata_moves_preview_fields_to_entries() {
+    let (metadata, entries) = prepare_prompt_capture_metadata(Some(json!({
+        "trace_id": "trace-1",
+        "prompt_capture": {
+            "version": 1,
+            "item_count": 2,
+            "role_counts": { "system": 1, "user": 1 },
+            "items": [
+                {
+                    "source": "request",
+                    "role": "system",
+                    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "chars": 120,
+                    "preview": "system prompt preview",
+                    "truncated": true
+                },
+                {
+                    "source": "provider_request",
+                    "role": "user",
+                    "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "chars": 12,
+                    "preview": "hello",
+                    "truncated": false
+                }
+            ]
+        }
+    })));
+
+    assert_eq!(entries.len(), 2);
+    assert_eq!(
+        entries[0],
+        UsagePromptCaptureEntry {
+            sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_string(),
+            role: "system".to_string(),
+            chars: 120,
+            preview: "system prompt preview".to_string(),
+            truncated: true,
+        }
+    );
+    assert_eq!(
+        metadata,
+        Some(json!({
+            "trace_id": "trace-1",
+            "prompt_capture": {
+                "version": 2,
+                "item_count": 2,
+                "role_counts": { "system": 1, "user": 1 },
+                "items": [
+                    {
+                        "source": "request",
+                        "role": "system",
+                        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    },
+                    {
+                        "source": "provider_request",
+                        "role": "user",
+                        "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    }
+                ]
+            }
+        }))
     );
 }
 

@@ -108,7 +108,7 @@ services:
     volumes:
       - ./logs:/app/logs
     healthcheck:
-      test: ["CMD", "aether-gateway", "--healthcheck"]
+      test: ["CMD", "/opt/aether/current/bin/aether-gateway", "--healthcheck"]
       interval: 30s
       timeout: 5s
       retries: 3
