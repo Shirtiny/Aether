@@ -269,4 +269,43 @@ mod tests {
             }))
         );
     }
+
+    #[test]
+    fn preserves_prompt_capture_metadata_before_building_upsert_record() {
+        let record = build_upsert_usage_record_from_event(&UsageEvent {
+            event_type: UsageEventType::Completed,
+            request_id: "req-prompt-capture-1".to_string(),
+            timestamp_ms: 1_700_000_000_000,
+            data: UsageEventData {
+                provider_name: "OpenAI".to_string(),
+                model: "gpt-5".to_string(),
+                request_metadata: Some(serde_json::json!({
+                    "prompt_capture": {
+                        "version": 1,
+                        "item_count": 1,
+                        "role_counts": { "user": 1 },
+                        "items": [{
+                            "source": "request",
+                            "role": "user",
+                            "sha256": "abc123",
+                            "chars": 12,
+                            "preview": "hello world",
+                            "truncated": false
+                        }]
+                    }
+                })),
+                ..UsageEventData::default()
+            },
+        })
+        .expect("record should build");
+
+        assert_eq!(
+            record
+                .request_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("prompt_capture"))
+                .and_then(|capture| capture.get("item_count")),
+            Some(&serde_json::json!(1))
+        );
+    }
 }

@@ -865,6 +865,71 @@
                         />
                       </TabsContent>
 
+                      <TabsContent value="prompt-capture">
+                        <div
+                          v-if="promptCapture"
+                          class="space-y-2 p-3"
+                        >
+                          <div class="flex flex-wrap items-center gap-1.5">
+                            <Badge
+                              variant="outline"
+                              class="border-primary/30 bg-background/70 text-[10px]"
+                            >
+                              {{ promptCapture.itemCount }} 条
+                            </Badge>
+                            <Badge
+                              v-for="(count, role) in promptCapture.roleCounts"
+                              :key="role"
+                              variant="outline"
+                              class="border-primary/20 bg-background/70 text-[10px] text-muted-foreground"
+                            >
+                              {{ role }} {{ count }}
+                            </Badge>
+                          </div>
+                          <div
+                            v-for="(item, index) in promptCapture.items"
+                            :key="`${item.source || item.role || 'prompt-tab'}-${index}`"
+                            class="rounded-md border border-border/70 bg-background/80 p-3"
+                          >
+                            <div class="mb-2 flex flex-wrap items-center gap-1.5 text-[11px] text-muted-foreground">
+                              <Badge
+                                v-if="item.role"
+                                variant="secondary"
+                                class="px-1.5 py-0 text-[10px]"
+                              >
+                                {{ item.role }}
+                              </Badge>
+                              <span
+                                v-if="item.source"
+                                class="font-mono"
+                              >{{ item.source }}</span>
+                              <span v-if="item.chars !== null">{{ formatNumber(item.chars) }} chars</span>
+                              <span
+                                v-if="item.sha256"
+                                class="font-mono"
+                                :title="item.sha256"
+                              >sha256: {{ formatShortHash(item.sha256) }}</span>
+                              <Badge
+                                v-if="item.truncated"
+                                variant="outline"
+                                class="px-1.5 py-0 text-[10px]"
+                              >
+                                已截断
+                              </Badge>
+                            </div>
+                            <pre class="max-h-48 overflow-auto whitespace-pre-wrap break-words rounded bg-muted/40 p-2 text-xs leading-5 text-foreground">{{ item.preview || '(空)' }}</pre>
+                          </div>
+                        </div>
+                        <JsonContent
+                          v-else
+                          :data="null"
+                          :view-mode="viewMode"
+                          :expand-depth="currentExpandDepth"
+                          :is-dark="isDark"
+                          empty-message="无提示词摘要"
+                        />
+                      </TabsContent>
+
                       <TabsContent value="metadata">
                         <JsonContent
                           :data="metadataPanelData"
@@ -1308,7 +1373,10 @@ const metadataPanelData = computed<Record<string, unknown> | null>(() => {
 })
 
 const failureNotice = computed(() => resolveRequestFailureNotice(detail.value))
-const promptCapture = computed(() => extractPromptCaptureMetadata(detail.value?.metadata))
+const promptCapture = computed(() =>
+  extractPromptCaptureMetadata(detail.value)
+  ?? extractPromptCaptureMetadata(detail.value?.metadata)
+)
 
 const settlementInfo = computed<JsonRecord | null>(() =>
   asRecord(detail.value?.settlement ?? null),
@@ -1513,6 +1581,8 @@ const activeJsonPanelData = computed(() => {
       return currentResponseHeaderData.value
     case 'response-body':
       return currentResponseBody.value
+    case 'prompt-capture':
+      return promptCapture.value
     case 'metadata':
       return metadataPanelData.value
     default:
@@ -1973,6 +2043,7 @@ const hasTokenCost = computed(() => {
 const tabs = [
   { name: 'request-headers', label: '请求头' },
   { name: 'request-body', label: '请求体' },
+  { name: 'prompt-capture', label: '提示词摘要' },
   { name: 'response-headers', label: '响应头' },
   { name: 'response-body', label: '响应体' },
   { name: 'metadata', label: '元数据' },
@@ -2169,6 +2240,8 @@ const visibleTabs = computed(() => {
         return hasContent(detail.value?.response_headers) || hasContent(detail.value?.client_response_headers)
       case 'response-body':
         return hasResponseBodyAvailable.value
+      case 'prompt-capture':
+        return promptCapture.value !== null
       case 'metadata':
         return hasContent(metadataPanelData.value)
       default:
@@ -2604,6 +2677,9 @@ function copyContent(tabName: string) {
         break
       case 'response-body':
         data = currentResponseBody.value
+        break
+      case 'prompt-capture':
+        data = promptCapture.value
         break
       case 'metadata':
         data = metadataPanelData.value

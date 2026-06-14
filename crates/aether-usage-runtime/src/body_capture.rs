@@ -830,6 +830,15 @@ fn collect_top_level_prompt_fields(
             output,
         );
     }
+    if object.get("input").is_some_and(Value::is_string) {
+        collect_text_values_for_role(
+            source,
+            object.get("input"),
+            PromptCaptureRole::User,
+            policy,
+            output,
+        );
+    }
 }
 
 fn collect_message_prompts(
@@ -1205,6 +1214,38 @@ mod tests {
         assert_eq!(
             prompt_capture["items"][2]["preview"],
             json!("Unique provider prompt.")
+        );
+    }
+
+    #[test]
+    fn prompt_capture_metadata_extracts_openai_responses_string_input() {
+        let mut record = sample_usage_record();
+        record.request_body = Some(json!({
+            "model": "gpt-5",
+            "input": "Summarize this incident."
+        }));
+
+        apply_usage_body_capture_policy_to_record(
+            UsageBodyCapturePolicy {
+                prompt_capture: UsagePromptCapturePolicy {
+                    enabled: true,
+                    ..UsagePromptCapturePolicy::default()
+                },
+                ..UsageBodyCapturePolicy::default()
+            },
+            &mut record,
+        );
+
+        let prompt_capture = record
+            .request_metadata
+            .as_ref()
+            .and_then(|value| value.get("prompt_capture"))
+            .expect("prompt capture metadata should exist");
+        assert_eq!(prompt_capture["item_count"], json!(1));
+        assert_eq!(prompt_capture["role_counts"]["user"], json!(1));
+        assert_eq!(
+            prompt_capture["items"][0]["preview"],
+            json!("Summarize this incident.")
         );
     }
 
