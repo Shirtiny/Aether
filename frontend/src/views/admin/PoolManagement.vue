@@ -3138,10 +3138,10 @@ async function handleRefreshOAuth(key: PoolKeyDetail) {
 async function handleConsumeCodexResetCredit(key: PoolKeyDetail) {
   if (resettingCodexCreditKeyId.value || !canConsumeCodexResetCredit(key)) return
 
-  const balance = getCodexResetCreditBalance(key)
+  const availableCount = getCodexResetCreditsAvailableCount(key)
   const confirmed = await confirm({
     title: '主动重置额度',
-    message: `确定要消耗${balance != null ? ` 1/${balance}` : ' 1'} 次主动重置次数，重置账号 "${key.key_name || key.key_id.slice(0, 8)}" 的 Codex 5H 窗口吗？`,
+    message: `确定要消耗${availableCount != null ? ` 1/${availableCount}` : ' 1'} 次主动重置次数，重置账号 "${key.key_name || key.key_id.slice(0, 8)}" 的 Codex 5H 窗口吗？`,
     confirmText: '重置',
   })
   if (!confirmed) return
@@ -3930,16 +3930,13 @@ function getCodexQuotaSnapshot(key: PoolKeyDetail): QuotaStatusSnapshot | null {
   return getQuotaSnapshotProviderType(key) === 'codex' ? quota : null
 }
 
-function getCodexResetCreditBalance(key: PoolKeyDetail): number | null {
+function getCodexResetCreditsAvailableCount(key: PoolKeyDetail): number | null {
   const quota = getCodexQuotaSnapshot(key)
   if (!quota) return null
   const credits = quota.credits as Record<string, unknown> | undefined
   const candidates = [
-    credits?.balance,
     credits?.available_count,
-    credits?.available,
-    credits?.remaining,
-    (quota as unknown as Record<string, unknown>).reset_credit_balance,
+    (quota as unknown as Record<string, unknown>).reset_credits_available_count,
     (quota as unknown as Record<string, unknown>).reset_credits_remaining,
   ]
   for (const candidate of candidates) {
@@ -3949,40 +3946,23 @@ function getCodexResetCreditBalance(key: PoolKeyDetail): number | null {
   return null
 }
 
-function getCodexResetCreditsHasCredits(key: PoolKeyDetail): boolean | null {
-  const quota = getCodexQuotaSnapshot(key)
-  if (!quota) return null
-  const credits = quota.credits as Record<string, unknown> | undefined
-  const raw = credits?.has_credits ?? (quota as unknown as Record<string, unknown>).has_credits
-  if (typeof raw === 'boolean') return raw
-  if (typeof raw === 'string') {
-    const normalized = raw.trim().toLowerCase()
-    if (normalized === 'true') return true
-    if (normalized === 'false') return false
-  }
-  return null
-}
-
 function shouldShowCodexResetCreditControl(key: PoolKeyDetail): boolean {
-  return selectedProviderType.value === 'codex' && shouldShowOAuthRefreshControl(key, selectedProviderType.value)
+  return selectedProviderType.value === 'codex'
+    && shouldShowOAuthRefreshControl(key, selectedProviderType.value)
+    && getCodexResetCreditsAvailableCount(key) != null
 }
 
 function canConsumeCodexResetCredit(key: PoolKeyDetail): boolean {
   if (!shouldShowCodexResetCreditControl(key)) return false
-  const hasCredits = getCodexResetCreditsHasCredits(key)
-  if (hasCredits === false) return false
-  const balance = getCodexResetCreditBalance(key)
-  if (balance != null) return balance > 0
-  return hasCredits === true
+  const availableCount = getCodexResetCreditsAvailableCount(key)
+  return availableCount != null && availableCount > 0
 }
 
 function getCodexResetCreditTitle(key: PoolKeyDetail): string {
-  const hasCredits = getCodexResetCreditsHasCredits(key)
-  const balance = getCodexResetCreditBalance(key)
-  if (hasCredits === false || balance === 0) return '没有可用的主动重置次数'
-  if (balance != null) return `主动重置 Codex 5H 窗口（剩余 ${balance} 次）`
-  if (hasCredits === true) return '主动重置 Codex 5H 窗口（剩余次数未知）'
-  return '主动重置 Codex 5H 窗口'
+  const availableCount = getCodexResetCreditsAvailableCount(key)
+  if (availableCount === 0) return '没有可用的主动重置次数'
+  if (availableCount != null) return `主动重置 Codex 5H 窗口（剩余 ${availableCount} 次）`
+  return '主动重置次数未知，请先刷新额度'
 }
 
 function getQuotaSnapshotUpdatedAtSeconds(quota: QuotaStatusSnapshot | null | undefined): number | null {

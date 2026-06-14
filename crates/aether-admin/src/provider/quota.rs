@@ -659,6 +659,15 @@ pub fn parse_codex_wham_usage_response(
         }
     }
 
+    if let Some(value) = root
+        .get("rate_limit_reset_credits")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|credits| credits.get("available_count"))
+        .and_then(coerce_json_u64)
+    {
+        result.insert("reset_credits_available_count".to_string(), json!(value));
+    }
+
     if result.is_empty() {
         return None;
     }
@@ -2064,7 +2073,10 @@ mod tests {
                             "reset_at": 1_790_000_000u64
                         }
                     }
-                }]
+                }],
+                "rate_limit_reset_credits": {
+                    "available_count": 3
+                }
             }),
             1_777_000_000,
         )
@@ -2084,6 +2096,10 @@ mod tests {
         assert_eq!(
             parsed.get("spark_secondary_window_minutes"),
             Some(&json!(10_080u64))
+        );
+        assert_eq!(
+            parsed.get("reset_credits_available_count"),
+            Some(&json!(3u64))
         );
     }
 

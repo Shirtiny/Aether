@@ -841,6 +841,9 @@ fn build_codex_quota_status_snapshot(
     let credits_balance = metadata
         .get("credits_balance")
         .and_then(admin_provider_quota_pure::coerce_json_f64);
+    let reset_credits_available_count = metadata
+        .get("reset_credits_available_count")
+        .and_then(admin_provider_quota_pure::coerce_json_u64);
     let credits_unlimited = metadata
         .get("credits_unlimited")
         .and_then(admin_provider_quota_pure::coerce_json_bool);
@@ -871,6 +874,7 @@ fn build_codex_quota_status_snapshot(
         && plan_type.is_none()
         && credits_has_credits.is_none()
         && credits_balance.is_none()
+        && reset_credits_available_count.is_none()
         && credits_unlimited.is_none()
         && observed_at_unix_secs.is_none()
     {
@@ -914,6 +918,9 @@ fn build_codex_quota_status_snapshot(
     }
     if let Some(value) = credits_balance {
         credits.insert("balance".to_string(), json!(value));
+    }
+    if let Some(value) = reset_credits_available_count {
+        credits.insert("available_count".to_string(), json!(value));
     }
     if let Some(value) = credits_unlimited {
         credits.insert("unlimited".to_string(), json!(value));
@@ -2603,7 +2610,8 @@ mod tests {
                 "secondary_used_percent": 12.5,
                 "secondary_reset_at": 1_900_500_000u64,
                 "has_credits": true,
-                "credits_balance": 42.0
+                "credits_balance": 42.0,
+                "reset_credits_available_count": 3u64
             }
         }));
 
@@ -2623,6 +2631,13 @@ mod tests {
                 .and_then(Value::as_object)
                 .and_then(|credits| credits.get("balance")),
             Some(&json!(42.0))
+        );
+        assert_eq!(
+            quota
+                .get("credits")
+                .and_then(Value::as_object)
+                .and_then(|credits| credits.get("available_count")),
+            Some(&json!(3u64))
         );
         assert_eq!(
             quota.get("windows").and_then(Value::as_array).map(Vec::len),
