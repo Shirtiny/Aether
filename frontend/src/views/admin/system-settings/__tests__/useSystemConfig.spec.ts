@@ -54,6 +54,7 @@ describe('useSystemConfig', () => {
     const loadPromise = state.loadSystemConfig()
 
     expect(getSystemConfigMock.mock.calls.map(([key]) => key)).toContain('request_record_level')
+    expect(getSystemConfigMock.mock.calls.map(([key]) => key)).toContain('request_capture_policy')
     expect(getSystemConfigMock.mock.calls.map(([key]) => key)).toContain('proxy_node_metrics_cleanup_batch_size')
     expect(getSystemConfigMock.mock.calls.map(([key]) => key)).toContain('enable_standard_text_sync_heartbeat')
 
@@ -101,5 +102,68 @@ describe('useSystemConfig', () => {
       '标准文本非流式心跳开关：开启后外层 HTTP 状态固定为 200，上游失败写入响应体'
     )
     expect(state.hasBasicConfigChanges.value).toBe(false)
+  })
+
+  it('loads and saves request capture policy with prompt capture and group scope', async () => {
+    getSystemConfigMock.mockImplementation(async (key: string) => ({
+      key,
+      value: key === 'request_capture_policy'
+        ? {
+            request_record_level: 'basic',
+            max_request_body_bytes: 65536,
+            max_response_body_bytes: 0,
+            scope: {
+              mode: 'include_groups',
+              group_ids: ['group-audit'],
+            },
+            prompt_capture: {
+              enabled: true,
+              include_system: true,
+              include_developer: true,
+              include_user: true,
+              include_tools: false,
+              preview_chars: 1000,
+              max_items: 64,
+            },
+          }
+        : undefined,
+      is_set: key === 'request_capture_policy',
+    }))
+    updateSystemConfigMock.mockResolvedValue({})
+
+    const state = useSystemConfig()
+    await state.loadSystemConfig()
+
+    expect(state.systemConfig.value.request_record_level).toBe('basic')
+    expect(state.systemConfig.value.max_request_body_size).toBe(65536)
+    expect(state.systemConfig.value.request_capture_policy.scope.group_ids).toEqual(['group-audit'])
+    expect(state.systemConfig.value.request_capture_policy.prompt_capture.enabled).toBe(true)
+    expect(state.hasLogConfigChanges.value).toBe(false)
+
+    state.systemConfig.value.request_capture_policy.prompt_capture.include_tools = true
+    expect(state.hasLogConfigChanges.value).toBe(true)
+
+    await state.saveLogConfig()
+
+    expect(updateSystemConfigMock).toHaveBeenCalledWith(
+      'request_capture_policy',
+      expect.objectContaining({
+        request_record_level: 'basic',
+        max_request_body_bytes: 65536,
+        max_response_body_bytes: 0,
+        scope: {
+          mode: 'include_groups',
+          group_ids: ['group-audit'],
+        },
+        prompt_capture: expect.objectContaining({
+          enabled: true,
+          include_tools: true,
+          preview_chars: 1000,
+          max_items: 64,
+        }),
+      }),
+      '请求记录与提示词摘要捕获策略'
+    )
+    expect(state.hasLogConfigChanges.value).toBe(false)
   })
 })

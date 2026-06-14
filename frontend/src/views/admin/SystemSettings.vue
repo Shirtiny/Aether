@@ -117,13 +117,16 @@
             :max-request-body-size-k-b="maxRequestBodySizeKB"
             :max-response-body-size-k-b="maxResponseBodySizeKB"
             :sensitive-headers-str="sensitiveHeadersStr"
+            :request-capture-policy="systemConfig.request_capture_policy"
+            :user-groups="requestLogUserGroups"
             :loading="systemConfigLoading || logConfigLoading"
             :has-changes="hasLogConfigChanges"
             @save="saveLogConfig"
-            @update:request-record-level="systemConfig.request_record_level = $event"
+            @update:request-record-level="updateRequestRecordLevel"
             @update:max-request-body-size-k-b="maxRequestBodySizeKB = $event"
             @update:max-response-body-size-k-b="maxResponseBodySizeKB = $event"
             @update:sensitive-headers-str="sensitiveHeadersStr = $event"
+            @update:request-capture-policy="systemConfig.request_capture_policy = $event"
           />
 
           <!-- 请求记录清理策略 -->
@@ -260,6 +263,8 @@
 import { ref, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import { PageHeader, PageContainer } from '@/components/layout'
 import { useProxyNodesStore } from '@/stores/proxy-nodes'
+import { useUsersStore } from '@/stores/users'
+import type { UserGroup } from '@/api/users'
 
 // Composables
 import { useSystemConfig } from './system-settings/composables/useSystemConfig'
@@ -282,6 +287,8 @@ import UsersImportDialog from './system-settings/UsersImportDialog.vue'
 import AggregateImportDialog from './system-settings/AggregateImportDialog.vue'
 
 const proxyNodesStore = useProxyNodesStore()
+const usersStore = useUsersStore()
+const requestLogUserGroups = ref<UserGroup[]>([])
 
 // TOC 目录导航
 const tocItems = [
@@ -412,6 +419,11 @@ const {
   confirmImportAggregate,
 } = useConfigExportImport(systemConfig)
 
+function updateRequestRecordLevel(value: string) {
+  systemConfig.value.request_record_level = value
+  systemConfig.value.request_capture_policy.request_record_level = value
+}
+
 type DataManagementKind = 'config' | 'users' | 'aggregate'
 
 function handleDataExport(kind: DataManagementKind) {
@@ -445,12 +457,22 @@ onMounted(async () => {
     loadSystemConfig(),
     loadSystemVersion(),
     proxyNodesStore.ensureLoaded(),
+    loadRequestLogUserGroups(),
   ])
   // 配置加载完成后初始化定时任务的原始值
   initPreviousValues()
   await nextTick()
   setupScrollSpy()
 })
+
+async function loadRequestLogUserGroups() {
+  try {
+    const response = await usersStore.listUserGroups()
+    requestLogUserGroups.value = response.items
+  } catch {
+    requestLogUserGroups.value = []
+  }
+}
 
 onBeforeUnmount(() => {
   if (observer) {

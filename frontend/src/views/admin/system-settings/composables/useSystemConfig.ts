@@ -42,6 +42,7 @@ export interface SystemConfig {
   max_request_body_size: number
   max_response_body_size: number
   sensitive_headers: string[]
+  request_capture_policy: RequestCapturePolicy
   // 请求记录清理
   enable_auto_cleanup: boolean
   detail_log_retention_days: number
@@ -59,6 +60,27 @@ export interface SystemConfig {
   enable_provider_checkin: boolean
   provider_checkin_time: string
   enable_oauth_token_refresh: boolean
+}
+
+export type RequestCaptureScopeMode = 'all' | 'include_groups' | 'exclude_groups'
+
+export interface RequestCapturePolicy {
+  request_record_level: string
+  max_request_body_bytes: number
+  max_response_body_bytes: number
+  scope: {
+    mode: RequestCaptureScopeMode
+    group_ids: string[]
+  }
+  prompt_capture: {
+    enabled: boolean
+    include_system: boolean
+    include_developer: boolean
+    include_user: boolean
+    include_tools: boolean
+    preview_chars: number
+    max_items: number
+  }
 }
 
 const CONFIG_KEYS = [
@@ -98,6 +120,7 @@ const CONFIG_KEYS = [
   'max_request_body_size',
   'max_response_body_size',
   'sensitive_headers',
+  'request_capture_policy',
   // 请求记录清理
   'enable_auto_cleanup',
   'detail_log_retention_days',
@@ -116,6 +139,145 @@ const CONFIG_KEYS = [
   'provider_checkin_time',
   'enable_oauth_token_refresh',
 ]
+
+function createDefaultRequestCapturePolicy(): RequestCapturePolicy {
+  return {
+    request_record_level: 'basic',
+    max_request_body_bytes: 1048576,
+    max_response_body_bytes: 1048576,
+    scope: {
+      mode: 'all',
+      group_ids: [],
+    },
+    prompt_capture: {
+      enabled: false,
+      include_system: true,
+      include_developer: true,
+      include_user: true,
+      include_tools: false,
+      preview_chars: 512,
+      max_items: 32,
+    },
+  }
+}
+
+function normalizeRequestCapturePolicy(
+  value: unknown,
+  base: Pick<SystemConfig, 'request_record_level' | 'max_request_body_size' | 'max_response_body_size'>
+): RequestCapturePolicy {
+  const defaults = createDefaultRequestCapturePolicy()
+  defaults.request_record_level = base.request_record_level
+  defaults.max_request_body_bytes = base.max_request_body_size
+  defaults.max_response_body_bytes = base.max_response_body_size
+
+  if (!value || typeof value !== 'object') {
+    return defaults
+  }
+  const source = value as Record<string, unknown>
+  const scope = source.scope && typeof source.scope === 'object'
+    ? source.scope as Record<string, unknown>
+    : {}
+  const promptCapture = source.prompt_capture && typeof source.prompt_capture === 'object'
+    ? source.prompt_capture as Record<string, unknown>
+    : {}
+
+  return {
+    request_record_level: stringValue(
+      source.request_record_level ?? source.body_record_level,
+      defaults.request_record_level
+    ),
+    max_request_body_bytes: numberValue(
+      source.max_request_body_bytes ?? source.max_request_body_size,
+      defaults.max_request_body_bytes
+    ),
+    max_response_body_bytes: numberValue(
+      source.max_response_body_bytes ?? source.max_response_body_size,
+      defaults.max_response_body_bytes
+    ),
+    scope: {
+      mode: scopeModeValue(scope.mode ?? source.scope_mode, defaults.scope.mode),
+      group_ids: stringArrayValue(scope.group_ids ?? source.group_ids ?? source.user_group_ids),
+    },
+    prompt_capture: {
+      enabled: booleanValue(promptCapture.enabled, defaults.prompt_capture.enabled),
+      include_system: booleanValue(
+        promptCapture.include_system ?? promptCapture.system,
+        defaults.prompt_capture.include_system
+      ),
+      include_developer: booleanValue(
+        promptCapture.include_developer ?? promptCapture.developer,
+        defaults.prompt_capture.include_developer
+      ),
+      include_user: booleanValue(
+        promptCapture.include_user ?? promptCapture.user,
+        defaults.prompt_capture.include_user
+      ),
+      include_tools: booleanValue(
+        promptCapture.include_tools ?? promptCapture.tools,
+        defaults.prompt_capture.include_tools
+      ),
+      preview_chars: clampNumber(
+        numberValue(
+          promptCapture.preview_chars ?? promptCapture.max_preview_chars,
+          defaults.prompt_capture.preview_chars
+        ),
+        0,
+        8192
+      ),
+      max_items: clampNumber(
+        numberValue(promptCapture.max_items, defaults.prompt_capture.max_items),
+        0,
+        256
+      ),
+    },
+  }
+}
+
+function requestCapturePolicyPayload(config: SystemConfig): RequestCapturePolicy {
+  return {
+    request_record_level: config.request_record_level,
+    max_request_body_bytes: config.max_request_body_size,
+    max_response_body_bytes: config.max_response_body_size,
+    scope: {
+      mode: config.request_capture_policy.scope.mode,
+      group_ids: [...config.request_capture_policy.scope.group_ids],
+    },
+    prompt_capture: {
+      ...config.request_capture_policy.prompt_capture,
+    },
+  }
+}
+
+function stringValue(value: unknown, fallback: string): string {
+  return typeof value === 'string' && value.trim() ? value : fallback
+}
+
+function numberValue(value: unknown, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : fallback
+}
+
+function booleanValue(value: unknown, fallback: boolean): boolean {
+  return typeof value === 'boolean' ? value : fallback
+}
+
+function stringArrayValue(value: unknown): string[] {
+  if (!Array.isArray(value)) return []
+  return value
+    .filter((item): item is string => typeof item === 'string')
+    .map(item => item.trim())
+    .filter(Boolean)
+}
+
+function scopeModeValue(value: unknown, fallback: RequestCaptureScopeMode): RequestCaptureScopeMode {
+  if (value === 'include_groups' || value === 'exclude_groups' || value === 'all') {
+    return value
+  }
+  return fallback
+}
+
+function clampNumber(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value))
+}
 
 function createDefaultConfig(): SystemConfig {
   return {
@@ -156,6 +318,7 @@ function createDefaultConfig(): SystemConfig {
     max_request_body_size: 1048576,
     max_response_body_size: 1048576,
     sensitive_headers: ['authorization', 'x-api-key', 'api-key', 'cookie', 'set-cookie'],
+    request_capture_policy: createDefaultRequestCapturePolicy(),
     // 请求记录清理
     enable_auto_cleanup: true,
     detail_log_retention_days: 7,
@@ -251,7 +414,9 @@ export function useSystemConfig() {
       systemConfig.value.max_request_body_size !== originalConfig.value.max_request_body_size ||
       systemConfig.value.max_response_body_size !== originalConfig.value.max_response_body_size ||
       JSON.stringify(systemConfig.value.sensitive_headers) !==
-      JSON.stringify(originalConfig.value.sensitive_headers)
+      JSON.stringify(originalConfig.value.sensitive_headers) ||
+      JSON.stringify(systemConfig.value.request_capture_policy) !==
+      JSON.stringify(originalConfig.value.request_capture_policy)
     )
   })
 
@@ -286,6 +451,7 @@ export function useSystemConfig() {
     get: () => Math.round(systemConfig.value.max_request_body_size / 1024),
     set: (val: number) => {
       systemConfig.value.max_request_body_size = val * 1024
+      systemConfig.value.request_capture_policy.max_request_body_bytes = val * 1024
     },
   })
 
@@ -293,6 +459,7 @@ export function useSystemConfig() {
     get: () => Math.round(systemConfig.value.max_response_body_size / 1024),
     set: (val: number) => {
       systemConfig.value.max_response_body_size = val * 1024
+      systemConfig.value.request_capture_policy.max_response_body_bytes = val * 1024
     },
   })
 
@@ -353,6 +520,13 @@ export function useSystemConfig() {
           // 单个配置项加载失败时忽略，使用默认值
         }
       }
+      nextConfig.request_capture_policy = normalizeRequestCapturePolicy(
+        nextConfig.request_capture_policy,
+        nextConfig
+      )
+      nextConfig.request_record_level = nextConfig.request_capture_policy.request_record_level
+      nextConfig.max_request_body_size = nextConfig.request_capture_policy.max_request_body_bytes
+      nextConfig.max_response_body_size = nextConfig.request_capture_policy.max_response_body_bytes
       systemConfig.value = nextConfig
       originalConfig.value = JSON.parse(JSON.stringify(nextConfig))
     } catch (err) {
@@ -617,6 +791,12 @@ export function useSystemConfig() {
   async function saveLogConfig() {
     logConfigLoading.value = true
     try {
+      systemConfig.value.request_capture_policy.request_record_level =
+        systemConfig.value.request_record_level
+      systemConfig.value.request_capture_policy.max_request_body_bytes =
+        systemConfig.value.max_request_body_size
+      systemConfig.value.request_capture_policy.max_response_body_bytes =
+        systemConfig.value.max_response_body_size
       const configItems = [
         {
           key: 'request_record_level',
@@ -638,6 +818,11 @@ export function useSystemConfig() {
           value: systemConfig.value.sensitive_headers,
           description: '敏感请求头列表',
         },
+        {
+          key: 'request_capture_policy',
+          value: requestCapturePolicyPayload(systemConfig.value),
+          description: '请求记录与提示词摘要捕获策略',
+        },
       ]
 
       await Promise.all(
@@ -650,6 +835,7 @@ export function useSystemConfig() {
         originalConfig.value.max_request_body_size = systemConfig.value.max_request_body_size
         originalConfig.value.max_response_body_size = systemConfig.value.max_response_body_size
         originalConfig.value.sensitive_headers = [...systemConfig.value.sensitive_headers]
+        originalConfig.value.request_capture_policy = requestCapturePolicyPayload(systemConfig.value)
       }
       success('请求记录配置已保存')
     } catch (err) {
