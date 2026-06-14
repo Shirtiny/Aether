@@ -200,6 +200,73 @@
                 </div>
               </Card>
 
+              <Card
+                v-if="promptCapture"
+                class="border-primary/20 bg-primary/5 shadow-sm"
+              >
+                <div class="p-3 sm:p-4 space-y-3">
+                  <div class="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                    <div class="min-w-0">
+                      <h4 class="text-sm font-semibold text-foreground">
+                        提示词摘要
+                      </h4>
+                      <div class="mt-1 flex flex-wrap items-center gap-1.5">
+                        <Badge
+                          variant="outline"
+                          class="border-primary/30 bg-background/70 text-[10px]"
+                        >
+                          {{ promptCapture.itemCount }} 条
+                        </Badge>
+                        <Badge
+                          v-for="(count, role) in promptCapture.roleCounts"
+                          :key="role"
+                          variant="outline"
+                          class="border-primary/20 bg-background/70 text-[10px] text-muted-foreground"
+                        >
+                          {{ role }} {{ count }}
+                        </Badge>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div class="space-y-2">
+                    <div
+                      v-for="(item, index) in promptCapture.items"
+                      :key="`${item.source || item.role || 'prompt'}-${index}`"
+                      class="rounded-md border border-border/70 bg-background/80 p-3"
+                    >
+                      <div class="mb-2 flex flex-wrap items-center gap-1.5 text-[11px] text-muted-foreground">
+                        <Badge
+                          v-if="item.role"
+                          variant="secondary"
+                          class="px-1.5 py-0 text-[10px]"
+                        >
+                          {{ item.role }}
+                        </Badge>
+                        <span
+                          v-if="item.source"
+                          class="font-mono"
+                        >{{ item.source }}</span>
+                        <span v-if="item.chars !== null">{{ formatNumber(item.chars) }} chars</span>
+                        <span
+                          v-if="item.sha256"
+                          class="font-mono"
+                          :title="item.sha256"
+                        >sha256: {{ formatShortHash(item.sha256) }}</span>
+                        <Badge
+                          v-if="item.truncated"
+                          variant="outline"
+                          class="px-1.5 py-0 text-[10px]"
+                        >
+                          已截断
+                        </Badge>
+                      </div>
+                      <pre class="max-h-48 overflow-auto whitespace-pre-wrap break-words rounded bg-muted/40 p-2 text-xs leading-5 text-foreground">{{ item.preview || '(空)' }}</pre>
+                    </div>
+                  </div>
+                </div>
+              </Card>
+
               <!-- 费用与性能概览 -->
               <Card>
                 <div class="p-3 sm:p-4">
@@ -859,6 +926,7 @@ import {
   resolveUsageStreamLabelSegments,
 } from '../utils/status'
 import { resolveRequestFailureNotice } from '../utils/errorNotice'
+import { extractPromptCaptureMetadata } from '../utils/promptCapture'
 
 // 子组件
 import RequestHeadersContent from './RequestDetailDrawer/RequestHeadersContent.vue'
@@ -1240,6 +1308,7 @@ const metadataPanelData = computed<Record<string, unknown> | null>(() => {
 })
 
 const failureNotice = computed(() => resolveRequestFailureNotice(detail.value))
+const promptCapture = computed(() => extractPromptCaptureMetadata(detail.value?.metadata))
 
 const settlementInfo = computed<JsonRecord | null>(() =>
   asRecord(detail.value?.settlement ?? null),
@@ -1921,6 +1990,10 @@ function hasContent(data: unknown): boolean {
 function toFiniteNumber(value: unknown): number | null {
   const num = Number(value)
   return Number.isFinite(num) ? num : null
+}
+
+function formatShortHash(value: string): string {
+  return value.length > 12 ? `${value.slice(0, 12)}...` : value
 }
 
 function getTierCachePriceForTTL(
