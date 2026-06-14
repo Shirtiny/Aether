@@ -463,8 +463,11 @@ pub fn from_openai_chat_to_canonical_request(body_json: &Value) -> Option<Canoni
     crate::formats::openai::chat::request::from_raw(body_json)
 }
 
-pub fn canonical_to_openai_chat_request(canonical: &CanonicalRequest) -> Value {
-    crate::formats::openai::chat::request::to_raw(canonical)
+pub fn canonical_to_openai_chat_request(canonical: &CanonicalRequest) -> Option<Value> {
+    crate::formats::openai::chat::request::to(
+        canonical,
+        &crate::formats::context::FormatContext::default(),
+    )
 }
 
 pub fn from_openai_responses_to_canonical_request(body_json: &Value) -> Option<CanonicalRequest> {
@@ -2771,16 +2774,16 @@ fn anthropic_tool_result_blocks_to_openai_chat_content(parts: &[Value]) -> Value
     }
 
     let mut has_media_part = false;
-    let converted_parts = parts
-        .iter()
-        .map(|part| {
-            let openai_part = anthropic_tool_result_block_to_openai_chat_part(part);
-            if !openai_chat_part_is_text(&openai_part) {
-                has_media_part = true;
-            }
-            openai_part
-        })
-        .collect::<Vec<_>>();
+    let mut converted_parts = Vec::with_capacity(parts.len());
+    for part in parts {
+        let Some(openai_part) = anthropic_tool_result_block_to_openai_chat_part(part) else {
+            return Value::String(Value::Array(parts.to_vec()).to_string());
+        };
+        if !openai_chat_part_is_text(&openai_part) {
+            has_media_part = true;
+        }
+        converted_parts.push(openai_part);
+    }
 
     if has_media_part {
         Value::Array(converted_parts)
@@ -2801,34 +2804,22 @@ fn anthropic_text_blocks_to_string(parts: &[Value]) -> Option<String> {
     Some(texts.join("\n\n"))
 }
 
-fn anthropic_tool_result_block_to_openai_chat_part(part: &Value) -> Value {
-    let Some(part_object) = part.as_object() else {
-        return openai_text_part("[Claude tool_result non-text content omitted]");
-    };
+fn anthropic_tool_result_block_to_openai_chat_part(part: &Value) -> Option<Value> {
+    let part_object = part.as_object()?;
     match part_object
         .get("type")
         .and_then(Value::as_str)
         .unwrap_or_default()
     {
-        "text" => openai_text_part(
+        "text" => Some(openai_text_part(
             part_object
                 .get("text")
                 .and_then(Value::as_str)
                 .unwrap_or_default(),
-        ),
-        "image" => anthropic_image_block_to_openai_chat_part(part_object).unwrap_or_else(|| {
-            openai_text_part(anthropic_media_block_summary("image", part_object))
-        }),
-        "document" => {
-            anthropic_document_block_to_openai_chat_part(part_object).unwrap_or_else(|| {
-                openai_text_part(anthropic_media_block_summary("document", part_object))
-            })
-        }
-        "file" => anthropic_document_block_to_openai_chat_part(part_object).unwrap_or_else(|| {
-            openai_text_part(anthropic_media_block_summary("file", part_object))
-        }),
-        "" => openai_text_part("[Claude tool_result object content omitted]"),
-        raw_type => openai_text_part(format!("[Claude tool_result {raw_type} content omitted]")),
+        )),
+        "image" => anthropic_image_block_to_openai_chat_part(part_object),
+        "document" | "file" => anthropic_document_block_to_openai_chat_part(part_object),
+        _ => None,
     }
 }
 
@@ -2883,20 +2874,8 @@ fn anthropic_document_block_to_openai_chat_part(block: &Map<String, Value>) -> O
             let url = anthropic_source_str(source, "url")?;
             Some(openai_text_part(format!("[File: {url}]")))
         }
+        "text" => anthropic_source_str(source, "data").map(openai_text_part),
         _ => None,
-    }
-}
-
-fn anthropic_media_block_summary(kind: &str, block: &Map<String, Value>) -> String {
-    let media_type = block
-        .get("source")
-        .and_then(Value::as_object)
-        .and_then(anthropic_source_media_type);
-    match media_type {
-        Some(media_type) if !media_type.trim().is_empty() => {
-            format!("[Claude tool_result {kind} content omitted: {media_type}]")
-        }
-        _ => format!("[Claude tool_result {kind} content omitted]"),
     }
 }
 
@@ -5785,7 +5764,7 @@ mod tests {
         assert_eq!(canonical_unknown_block_count(user_blocks), 1);
         assert_eq!(canonical_request_unknown_block_count(&canonical), 1);
 
-        let rebuilt = canonical_to_openai_chat_request(&canonical);
+        let rebuilt = canonical_to_openai_chat_request(&canonical).expect("openai chat request");
         assert_eq!(rebuilt["model"], "gpt-5");
         assert_eq!(rebuilt["messages"][0]["role"], "system");
         assert_eq!(rebuilt["messages"][1]["role"], "developer");
@@ -5873,7 +5852,7 @@ mod tests {
             "n": 2
         });
         let canonical = from_openai_chat_to_canonical_request(&request).expect("canonical request");
-        let rebuilt = canonical_to_openai_chat_request(&canonical);
+        let rebuilt = canonical_to_openai_chat_request(&canonical).expect("openai chat request");
         assert_eq!(rebuilt["model"], request["model"]);
         assert_eq!(rebuilt["messages"], request["messages"]);
         assert_eq!(rebuilt["stop"], Value::Array(vec![json!("x"), json!("y")]));
@@ -6368,7 +6347,8 @@ mod tests {
             CanonicalContentBlock::ToolUse { ref id, .. } if id == "toolu_auto_0"
         ));
 
-        let openai_chat = canonical_to_openai_chat_request(&canonical);
+        let openai_chat =
+            canonical_to_openai_chat_request(&canonical).expect("openai chat request");
         assert_eq!(
             openai_chat["messages"][2]["reasoning_parts"][0]["signature"],
             "sig_123"
@@ -6386,6 +6366,32 @@ mod tests {
         assert_eq!(rebuilt["tools"][1]["type"], "web_search_20250305");
         assert_eq!(rebuilt["thinking"]["budget_tokens"], 2048);
         assert_eq!(rebuilt["output_config"]["effort"], "medium");
+    }
+
+    #[test]
+    fn canonical_to_openai_chat_request_rejects_unrepresentable_claude_tool_result() {
+        let request = json!({
+            "model": "claude-sonnet",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_read",
+                    "content": [{
+                        "type": "image",
+                        "source": {
+                            "type": "unsupported",
+                            "media_type": "image/png",
+                            "data": "AAAA"
+                        }
+                    }]
+                }]
+            }]
+        });
+
+        let canonical = from_claude_to_canonical_request(&request).expect("canonical request");
+
+        assert!(canonical_to_openai_chat_request(&canonical).is_none());
     }
 
     #[test]

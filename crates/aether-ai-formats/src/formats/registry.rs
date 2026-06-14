@@ -124,6 +124,9 @@ pub fn convert_request(
     body: &Value,
     ctx: &FormatContext,
 ) -> Result<Value, FormatError> {
+    let source = parse_format(source_format)?;
+    let target = parse_format(target_format)?;
+    validate_runtime_request_conversion(source, target, body)?;
     let mut request = parse_request(source_format, body, ctx)?;
     if let Some(mapped_model) = ctx
         .mapped_model
@@ -133,6 +136,43 @@ pub fn convert_request(
         request.model = mapped_model.to_string();
     }
     emit_request_inner(target_format, &request, ctx)
+}
+
+fn validate_runtime_request_conversion(
+    source: FormatId,
+    target: FormatId,
+    body: &Value,
+) -> Result<(), FormatError> {
+    if source == FormatId::ClaudeMessages {
+        match target {
+            FormatId::OpenAiChat
+                if claude_request_contains_unrepresentable_tool_result_content_for_openai_chat(
+                    body,
+                ) =>
+            {
+                return Err(FormatError::LossyConversionBlocked {
+                    source_format: source.as_str().to_string(),
+                    target_format: target.as_str().to_string(),
+                    field: "messages[].content[].tool_result.content".to_string(),
+                    reason: "OpenAI Chat tool messages cannot represent one or more Claude tool_result content blocks".to_string(),
+                });
+            }
+            FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact
+                if claude_request_contains_unrepresentable_tool_result_content_for_openai_responses(
+                    body,
+                ) =>
+            {
+                return Err(FormatError::LossyConversionBlocked {
+                    source_format: source.as_str().to_string(),
+                    target_format: target.as_str().to_string(),
+                    field: "messages[].content[].tool_result.content".to_string(),
+                    reason: "OpenAI Responses function_call_output cannot represent one or more Claude tool_result content blocks".to_string(),
+                });
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 pub fn parse_response(
@@ -2017,6 +2057,54 @@ fn claude_request_contains_tool_result_content_array(body: &Value) -> bool {
                         .and_then(Value::as_str)
                         .is_some_and(|block_type| block_type.eq_ignore_ascii_case("tool_result"))
                         && block.get("content").is_some_and(Value::is_array)
+                })
+            })
+    })
+}
+
+fn claude_request_contains_unrepresentable_tool_result_content_for_openai_chat(
+    body: &Value,
+) -> bool {
+    claude_request_contains_unrepresentable_tool_result_content(body, |parts| {
+        !openai_chat::request::claude_tool_result_parts_are_openai_chat_representable(parts)
+    })
+}
+
+fn claude_request_contains_unrepresentable_tool_result_content_for_openai_responses(
+    body: &Value,
+) -> bool {
+    claude_request_contains_unrepresentable_tool_result_content(body, |parts| {
+        !openai_responses::request::claude_tool_result_parts_are_openai_responses_representable(
+            parts,
+        )
+    })
+}
+
+fn claude_request_contains_unrepresentable_tool_result_content(
+    body: &Value,
+    is_unrepresentable: impl Fn(&[Value]) -> bool,
+) -> bool {
+    let Some(messages) = body
+        .as_object()
+        .and_then(|object| object.get("messages"))
+        .and_then(Value::as_array)
+    else {
+        return false;
+    };
+    messages.iter().any(|message| {
+        message
+            .get("content")
+            .and_then(Value::as_array)
+            .is_some_and(|blocks| {
+                blocks.iter().any(|block| {
+                    block
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .is_some_and(|block_type| block_type.eq_ignore_ascii_case("tool_result"))
+                        && block
+                            .get("content")
+                            .and_then(Value::as_array)
+                            .is_some_and(|parts| is_unrepresentable(parts.as_slice()))
                 })
             })
     })
