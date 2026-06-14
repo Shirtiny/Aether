@@ -30,6 +30,9 @@ fn collect_passthrough_headers(
 
     for (key, value) in extra_headers {
         let normalized_key = key.to_ascii_lowercase();
+        if is_internal_cafecode_identity_header(&normalized_key) {
+            continue;
+        }
         let value = value.trim();
         if value.is_empty() {
             continue;
@@ -62,6 +65,9 @@ fn collect_complete_passthrough_headers(
 
     for (key, value) in extra_headers {
         let normalized_key = key.to_ascii_lowercase();
+        if is_internal_cafecode_identity_header(&normalized_key) {
+            continue;
+        }
         let value = value.trim();
         if value.is_empty() {
             continue;
@@ -70,6 +76,10 @@ fn collect_complete_passthrough_headers(
     }
 
     out
+}
+
+fn is_internal_cafecode_identity_header(name: &str) -> bool {
+    matches!(name, "cafecode-uid" | "cafecode-uname")
 }
 
 pub fn build_passthrough_headers(
@@ -312,7 +322,8 @@ fn bearer_auth_value(secret: &str) -> String {
 mod tests {
     use super::{
         build_claude_passthrough_headers, build_complete_passthrough_headers_with_auth,
-        resolve_local_openai_bearer_auth, resolve_local_standard_auth,
+        build_passthrough_headers_with_auth, resolve_local_openai_bearer_auth,
+        resolve_local_standard_auth,
     };
     use crate::snapshot::{
         GatewayProviderTransportEndpoint, GatewayProviderTransportKey,
@@ -478,6 +489,51 @@ mod tests {
             built.get("x-api-key").map(String::as_str),
             Some("sk-upstream")
         );
+    }
+
+    #[test]
+    fn passthrough_headers_strip_internal_cafecode_identity() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("cafecode-uid", http::HeaderValue::from_static("372"));
+        headers.insert(
+            "cafecode-uname",
+            http::HeaderValue::from_static("xiapeng8618"),
+        );
+        headers.insert("accept", http::HeaderValue::from_static("application/json"));
+        let extra_headers = BTreeMap::from([
+            ("cafecode-uid".to_string(), "override-372".to_string()),
+            ("cafecode-uname".to_string(), "override-name".to_string()),
+        ]);
+
+        let normal = build_passthrough_headers_with_auth(
+            &headers,
+            "authorization",
+            "Bearer upstream",
+            &extra_headers,
+        );
+        let complete = build_complete_passthrough_headers_with_auth(
+            &headers,
+            "authorization",
+            "Bearer upstream",
+            &extra_headers,
+            Some("application/json"),
+        );
+        let claude = build_claude_passthrough_headers(
+            &headers,
+            "x-api-key",
+            "sk-upstream",
+            &extra_headers,
+            Some("application/json"),
+        );
+
+        for built in [&normal, &complete, &claude] {
+            assert_eq!(built.get("cafecode-uid"), None);
+            assert_eq!(built.get("cafecode-uname"), None);
+            assert_eq!(
+                built.get("accept").map(String::as_str),
+                Some("application/json")
+            );
+        }
     }
 
     #[test]

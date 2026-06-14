@@ -127,6 +127,15 @@
               <span>{{ formatApiFormat(detail.api_format) }}</span>
               <span class="hidden opacity-40 sm:inline">|</span>
               <span>用户: {{ detail.user?.username || 'Unknown' }}</span>
+              <template v-if="detail.cafecode_uname || detail.cafecode_uid">
+                <span class="hidden opacity-40 sm:inline">|</span>
+                <span
+                  class="min-w-0 truncate"
+                  :title="cafecodeIdentityTitle"
+                >
+                  Cafecode: {{ detail.cafecode_uname || '-' }} / {{ detail.cafecode_uid || '-' }}
+                </span>
+              </template>
             </div>
           </div>
 
@@ -1208,6 +1217,12 @@ let timelineMountTimer: ReturnType<typeof setTimeout> | null = null
 
 const fullRequestId = computed(() => detail.value?.request_id || detail.value?.id || '-')
 const displayRequestId = computed(() => formatShortRequestId(fullRequestId.value))
+const cafecodeIdentityTitle = computed(() => {
+  const uname = detail.value?.cafecode_uname?.trim()
+  const uid = detail.value?.cafecode_uid?.trim()
+  if (uname && uid) return `${uname}\n${uid}`
+  return uname || uid || ''
+})
 const refreshButtonTitle = computed(() => {
   if (autoRefreshing.value) return '停止自动刷新'
   return isRequestCompleted() ? '刷新' : '开启自动刷新'

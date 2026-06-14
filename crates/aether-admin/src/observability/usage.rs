@@ -178,6 +178,8 @@ pub fn admin_usage_matches_search(
     let haystack = [
         username.as_deref(),
         api_key_name.as_deref(),
+        admin_usage_metadata_string(item, "cafecode_uid"),
+        admin_usage_metadata_string(item, "cafecode_uname"),
         Some(item.model.as_str()),
         Some(item.provider_name.as_str()),
     ];
@@ -1330,6 +1332,16 @@ pub fn admin_usage_record_json(
         object,
         "user_agent",
         admin_usage_metadata_string(item, "user_agent"),
+    );
+    maybe_insert_string_field(
+        object,
+        "cafecode_uid",
+        admin_usage_metadata_string(item, "cafecode_uid"),
+    );
+    maybe_insert_string_field(
+        object,
+        "cafecode_uname",
+        admin_usage_metadata_string(item, "cafecode_uname"),
     );
     maybe_insert_string_field(
         object,
@@ -2621,6 +2633,50 @@ mod tests {
         assert_eq!(record["client_family"], "codex_vscode");
         assert_eq!(record["client_ip"], "192.168.0.28");
         assert_eq!(active["client_family"], "codex_vscode");
+    }
+
+    #[test]
+    fn admin_usage_record_exposes_cafecode_identity() {
+        let item = StoredRequestUsageAudit {
+            request_metadata: Some(json!({
+                "cafecode_uid": "372",
+                "cafecode_uname": "xiapeng8618"
+            })),
+            ..sample_usage("completed", Some(200), None)
+        };
+
+        let record = admin_usage_record_json(
+            &item,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            false,
+            false,
+            None,
+        );
+        let detail = build_admin_usage_detail_payload(
+            &item,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            false,
+            false,
+            None,
+            false,
+            None,
+            &BTreeMap::new(),
+        );
+
+        assert_eq!(record["cafecode_uid"], "372");
+        assert_eq!(record["cafecode_uname"], "xiapeng8618");
+        assert_eq!(detail["cafecode_uid"], "372");
+        assert_eq!(detail["cafecode_uname"], "xiapeng8618");
+        assert!(admin_usage_matches_search(
+            &item,
+            Some("xiapeng"),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            false,
+            false,
+        ));
     }
 
     #[test]

@@ -13,9 +13,10 @@ use crate::body_capture::{
     RuntimeBodyCaptureMetadataInput,
 };
 use crate::request_metadata::{
-    attach_provider_request_body_metadata, build_usage_request_metadata_seed,
-    merge_usage_request_metadata, merge_usage_request_metadata_owned,
-    sanitize_usage_request_metadata, sanitize_usage_request_metadata_ref,
+    attach_cafecode_identity_metadata, attach_provider_request_body_metadata,
+    build_usage_request_metadata_seed, merge_usage_request_metadata,
+    merge_usage_request_metadata_owned, sanitize_usage_request_metadata,
+    sanitize_usage_request_metadata_ref,
 };
 use crate::{
     map_usage_from_response, stream_capture_terminal_state, GatewayStreamReportRequest,
@@ -560,6 +561,8 @@ fn build_terminal_usage_event_from_seed_impl(
     } else {
         merge_usage_request_metadata(request_metadata, audit_payload)
     };
+    let request_metadata =
+        attach_cafecode_identity_metadata(request_metadata, request_headers.as_ref());
     let request_metadata =
         attach_provider_request_body_metadata(request_metadata, provider_request.as_ref());
 
@@ -1905,6 +1908,13 @@ fn build_runtime_request_metadata_seed_from_parts(
     }
     if let Some(user_agent) = context_string(context, "user_agent") {
         metadata.insert("user_agent".to_string(), Value::String(user_agent));
+    }
+    if let Some(headers) = context_value(context, "original_headers") {
+        if let Some(Value::Object(identity)) =
+            attach_cafecode_identity_metadata(None, Some(&headers))
+        {
+            metadata.extend(identity);
+        }
     }
     if let Some(client_requested_stream) = context_bool(context, "client_requested_stream") {
         metadata.insert(
@@ -5950,6 +5960,56 @@ mod tests {
             Some(json!({
                 "payload": "x".repeat(MAX_USAGE_CAPTURE_BYTES + 1)
             }))
+        );
+    }
+
+    #[test]
+    fn usage_event_data_seed_extracts_cafecode_identity_from_original_headers() {
+        let plan = ExecutionPlan {
+            request_id: "req-cafecode-1".to_string(),
+            candidate_id: Some("cand-cafecode-1".to_string()),
+            provider_name: Some("OpenAI".to_string()),
+            provider_id: "provider-1".to_string(),
+            endpoint_id: "endpoint-1".to_string(),
+            key_id: "key-1".to_string(),
+            method: "POST".to_string(),
+            url: "https://example.com/v1/responses".to_string(),
+            headers: BTreeMap::new(),
+            content_type: Some("application/json".to_string()),
+            content_encoding: None,
+            body: RequestBody::from_json(json!({"model": "gpt-5"})),
+            stream: false,
+            client_api_format: "openai:responses".to_string(),
+            provider_api_format: "openai:responses".to_string(),
+            model_name: Some("gpt-5".to_string()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        };
+
+        let data = build_usage_event_data_seed(
+            &plan,
+            Some(&json!({
+                "original_headers": {
+                    "cafecode-uid": "372",
+                    "Cafecode-Uname": "xiapeng8618"
+                }
+            })),
+        );
+
+        assert_eq!(
+            data.request_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("cafecode_uid"))
+                .and_then(serde_json::Value::as_str),
+            Some("372")
+        );
+        assert_eq!(
+            data.request_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("cafecode_uname"))
+                .and_then(serde_json::Value::as_str),
+            Some("xiapeng8618")
         );
     }
 

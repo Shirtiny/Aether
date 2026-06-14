@@ -106,10 +106,54 @@ pub(crate) fn attach_provider_request_body_metadata(
     (!object.is_empty()).then_some(Value::Object(object))
 }
 
+pub(crate) fn attach_cafecode_identity_metadata(
+    metadata: Option<Value>,
+    headers: Option<&Value>,
+) -> Option<Value> {
+    let Some(identity) = extract_cafecode_identity_from_headers(headers) else {
+        return metadata;
+    };
+    let mut object = match metadata {
+        Some(Value::Object(object)) => object,
+        _ => Map::new(),
+    };
+    if let Some(uid) = identity.uid {
+        object.insert("cafecode_uid".to_string(), Value::String(uid));
+    }
+    if let Some(uname) = identity.uname {
+        object.insert("cafecode_uname".to_string(), Value::String(uname));
+    }
+    (!object.is_empty()).then_some(Value::Object(object))
+}
+
+struct CafecodeIdentity {
+    uid: Option<String>,
+    uname: Option<String>,
+}
+
+fn extract_cafecode_identity_from_headers(headers: Option<&Value>) -> Option<CafecodeIdentity> {
+    let object = headers.and_then(Value::as_object)?;
+    let uid = header_string(object, "cafecode-uid");
+    let uname = header_string(object, "cafecode-uname");
+    (uid.is_some() || uname.is_some()).then_some(CafecodeIdentity { uid, uname })
+}
+
+fn header_string(headers: &Map<String, Value>, name: &str) -> Option<String> {
+    headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .and_then(|(_, value)| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(truncate_usage_request_metadata_string)
+}
+
 fn copy_allowed_metadata_fields(source: &Map<String, Value>, target: &mut Map<String, Value>) {
     copy_non_empty_string(source, target, "trace_id");
     copy_non_empty_string(source, target, "client_ip");
     copy_non_empty_string(source, target, "user_agent");
+    copy_non_empty_string(source, target, "cafecode_uid");
+    copy_non_empty_string(source, target, "cafecode_uname");
     copy_non_empty_string(source, target, "client_family");
     copy_bool(source, target, "client_requested_stream");
     copy_bool(source, target, UPSTREAM_IS_STREAM_KEY);
@@ -153,6 +197,8 @@ fn move_allowed_metadata_fields(mut source: Map<String, Value>, target: &mut Map
     remove_non_empty_string(&mut source, target, "trace_id");
     remove_non_empty_string(&mut source, target, "client_ip");
     remove_non_empty_string(&mut source, target, "user_agent");
+    remove_non_empty_string(&mut source, target, "cafecode_uid");
+    remove_non_empty_string(&mut source, target, "cafecode_uname");
     remove_non_empty_string(&mut source, target, "client_family");
     remove_bool(&mut source, target, "client_requested_stream");
     remove_bool(&mut source, target, UPSTREAM_IS_STREAM_KEY);

@@ -222,6 +222,8 @@ export interface RequestDetail {
   response_time_ms: number
   first_byte_time_ms?: number | null
   created_at: string
+  cafecode_uid?: string | null
+  cafecode_uname?: string | null
   request_headers?: Record<string, unknown>
   request_body?: Record<string, unknown>
   provider_request_headers?: Record<string, unknown>

@@ -120,6 +120,8 @@ export interface UsageRecord {
   client_family?: string | null
   client_ip?: string | null
   user_agent?: string | null
+  cafecode_uid?: string | null
+  cafecode_uname?: string | null
   request_path?: string | null
   request_path_and_query?: string | null
   status_code?: number

@@ -394,35 +394,39 @@
         >
         <col
           v-if="isColumnVisible('user')"
-          class="w-[12%]"
+          class="w-[10%]"
+        >
+        <col
+          v-if="isColumnVisible('cafecode')"
+          class="w-[10%]"
         >
         <col
           v-if="isColumnVisible('model')"
-          class="w-[14%]"
+          class="w-[13%]"
         >
         <col
           v-if="isColumnVisible('provider')"
-          class="w-[16%]"
+          class="w-[14%]"
         >
         <col
           v-if="isColumnVisible('api_format')"
-          class="w-[15%]"
+          class="w-[14%]"
         >
         <col
           v-if="isColumnVisible('status')"
-          class="w-[10%]"
+          class="w-[9%]"
         >
         <col
           v-if="isColumnVisible('tokens')"
-          class="w-[10%]"
+          class="w-[9%]"
         >
         <col
           v-if="isColumnVisible('cost')"
-          class="w-[6%]"
+          class="w-[5%]"
         >
         <col
           v-if="isColumnVisible('performance')"
-          class="w-[9%]"
+          class="w-[8%]"
         >
         <col
           v-if="isColumnVisible('client_family')"
@@ -493,7 +497,7 @@
           </TableHead>
           <SortableTableHead
             v-if="isAdmin && isColumnVisible('user')"
-            class="h-12 font-semibold w-[12%]"
+            class="h-12 font-semibold w-[10%]"
             column-key="user"
             :sortable="false"
             :filter-active="filterUser !== '__all__'"
@@ -511,6 +515,12 @@
             </template>
           </SortableTableHead>
           <TableHead
+            v-if="isAdmin && isColumnVisible('cafecode')"
+            class="h-12 font-semibold w-[10%]"
+          >
+            Cafecode
+          </TableHead>
+          <TableHead
             v-if="!isAdmin && isColumnVisible('key')"
             class="h-12 font-semibold w-[17%]"
           >
@@ -519,7 +529,7 @@
           <SortableTableHead
             v-if="isColumnVisible('model')"
             class="h-12 font-semibold"
-            :class="[isAdmin ? 'w-[14%]' : 'w-[22%]']"
+            :class="[isAdmin ? 'w-[13%]' : 'w-[22%]']"
             column-key="model"
             :sortable="false"
             :filter-active="filterModel !== '__all__'"
@@ -538,7 +548,7 @@
           </SortableTableHead>
           <SortableTableHead
             v-if="isAdmin && isColumnVisible('provider')"
-            class="h-12 font-semibold w-[16%]"
+            class="h-12 font-semibold w-[14%]"
             column-key="provider"
             :sortable="false"
             :filter-active="filterProvider !== '__all__'"
@@ -558,7 +568,7 @@
           <SortableTableHead
             v-if="isColumnVisible('api_format')"
             class="h-12 font-semibold"
-            :class="[isAdmin ? 'w-[15%]' : 'w-[14%]']"
+            :class="[isAdmin ? 'w-[14%]' : 'w-[14%]']"
             column-key="api_format"
             :sortable="false"
             :filter-active="filterApiFormat !== '__all__'"
@@ -577,7 +587,7 @@
           </SortableTableHead>
           <SortableTableHead
             v-if="isColumnVisible('status')"
-            class="h-12 font-semibold w-[10%] text-center"
+            class="h-12 font-semibold w-[9%] text-center"
             column-key="status"
             :sortable="false"
             align="center"
@@ -597,19 +607,19 @@
           </SortableTableHead>
           <TableHead
             v-if="isColumnVisible('tokens')"
-            class="h-12 font-semibold w-[10%] text-center"
+            class="h-12 font-semibold w-[9%] text-center"
           >
             Tokens
           </TableHead>
           <TableHead
             v-if="isColumnVisible('cost')"
-            class="h-12 font-semibold w-[6%] text-right"
+            class="h-12 font-semibold w-[5%] text-right"
           >
             费用
           </TableHead>
           <TableHead
             v-if="isColumnVisible('performance')"
-            class="h-12 font-semibold w-[9%] text-right"
+            class="h-12 font-semibold w-[8%] text-right"
           >
             <div class="flex flex-col items-end text-xs gap-0.5">
               <span class="whitespace-nowrap">首字/总耗时</span>
@@ -681,7 +691,7 @@
           </TableCell>
           <TableCell
             v-if="isAdmin && isColumnVisible('user')"
-            class="py-4 w-[12%] truncate"
+            class="py-4 w-[10%] truncate"
             :title="record.username || record.user_email || (record.user_id ? `User ${record.user_id}` : '已删除用户')"
           >
             <div class="flex flex-col text-xs gap-0.5">
@@ -694,6 +704,21 @@
                 :title="record.api_key.name"
               >
                 {{ record.api_key.name }}
+              </span>
+            </div>
+          </TableCell>
+          <TableCell
+            v-if="isAdmin && isColumnVisible('cafecode')"
+            class="py-4 w-[10%] truncate text-xs"
+            :title="getCafecodeTitle(record)"
+          >
+            <div class="flex flex-col gap-0.5">
+              <span class="truncate">{{ record.cafecode_uname || '-' }}</span>
+              <span
+                v-if="record.cafecode_uid"
+                class="truncate text-muted-foreground"
+              >
+                {{ record.cafecode_uid }}
               </span>
             </div>
           </TableCell>
@@ -716,7 +741,7 @@
           <TableCell
             v-if="isColumnVisible('model')"
             class="font-medium py-4"
-            :class="[isAdmin ? 'w-[14%]' : 'w-[22%]']"
+            :class="[isAdmin ? 'w-[13%]' : 'w-[22%]']"
             :title="getModelTooltip(record)"
           >
             <div
@@ -781,7 +806,7 @@
           </TableCell>
           <TableCell
             v-if="isAdmin && isColumnVisible('provider')"
-            class="py-4 w-[16%]"
+            class="py-4 w-[14%]"
           >
             <div class="flex min-w-0 items-center gap-1">
               <div class="flex min-w-0 flex-col text-xs gap-0.5">
@@ -817,7 +842,7 @@
           <TableCell
             v-if="isColumnVisible('api_format')"
             class="py-4"
-            :class="[isAdmin ? 'w-[15%]' : 'w-[14%]']"
+            :class="[isAdmin ? 'w-[14%]' : 'w-[14%]']"
             :title="getApiFormatTooltip(record)"
           >
             <!-- 有格式转换或同族格式差异：两行显示 -->
@@ -854,7 +879,7 @@
           </TableCell>
           <TableCell
             v-if="isColumnVisible('status')"
-            class="text-center py-4 w-[10%]"
+            class="text-center py-4 w-[9%]"
           >
             <!-- 优先显示请求状态 -->
             <Badge
@@ -908,7 +933,7 @@
           </TableCell>
           <TableCell
             v-if="isColumnVisible('tokens')"
-            class="py-4 w-[10%]"
+            class="py-4 w-[9%]"
           >
             <div class="grid w-full min-w-0 grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] gap-x-1 text-xs leading-tight tabular-nums">
               <span class="justify-self-end whitespace-nowrap text-right">
@@ -945,7 +970,7 @@
           </TableCell>
           <TableCell
             v-if="isColumnVisible('cost')"
-            class="text-right py-4 w-[6%]"
+            class="text-right py-4 w-[5%]"
           >
             <div class="flex flex-col items-end text-xs gap-0.5">
               <span class="text-primary font-medium">{{ formatCurrency(record.cost || 0) }}</span>
@@ -959,7 +984,7 @@
           </TableCell>
           <TableCell
             v-if="isColumnVisible('performance')"
-            class="text-right py-4 w-[9%]"
+            class="text-right py-4 w-[8%]"
           >
             <!-- pending/streaming 状态：首字与动态总耗时保留在同一行 -->
             <div
@@ -1103,6 +1128,7 @@ interface FilterOption {
 type UsageRecordColumnId =
   | 'time'
   | 'user'
+  | 'cafecode'
   | 'key'
   | 'model'
   | 'provider'
@@ -1172,6 +1198,7 @@ const emit = defineEmits<{
 const USAGE_RECORD_COLUMN_OPTIONS: UsageRecordColumnOption[] = [
   { id: 'time', label: '时间' },
   { id: 'user', label: '用户', adminOnly: true },
+  { id: 'cafecode', label: 'Cafecode', adminOnly: true },
   { id: 'key', label: '密钥', userOnly: true },
   { id: 'model', label: '模型' },
   { id: 'provider', label: '提供商', adminOnly: true },
@@ -1188,6 +1215,7 @@ const USAGE_RECORD_COLUMN_OPTIONS: UsageRecordColumnOption[] = [
 const DEFAULT_ADMIN_COLUMNS: UsageRecordColumnId[] = [
   'time',
   'user',
+  'cafecode',
   'model',
   'provider',
   'api_format',
@@ -1270,7 +1298,7 @@ const desktopTableMinWidthClass = computed(() => {
   )).length
   if (metadataColumnCount >= 3) return 'min-w-[1520px]'
   if (metadataColumnCount > 0) return 'min-w-[1320px]'
-  return props.isAdmin ? 'min-w-[1120px]' : 'min-w-[960px]'
+  return props.isAdmin ? 'min-w-[1220px]' : 'min-w-[960px]'
 })
 
 const columnSelectOptions = computed<MultiSelectOption[]>(() => roleColumnOptions.value.map(column => ({
@@ -1495,6 +1523,13 @@ function formatUserAgent(value: string | null | undefined): string {
   const userAgent = value?.trim()
   if (!userAgent) return '-'
   return userAgent.length > 48 ? `${userAgent.slice(0, 45)}...` : userAgent
+}
+
+function getCafecodeTitle(record: UsageRecord): string {
+  const uname = record.cafecode_uname?.trim()
+  const uid = record.cafecode_uid?.trim()
+  if (uname && uid) return `${uname}\n${uid}`
+  return uname || uid || '-'
 }
 
 // useDebounceFn 自动处理清理，无需 onUnmounted

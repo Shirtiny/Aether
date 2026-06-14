@@ -18,6 +18,8 @@ pub fn should_skip_request_header(name: &str) -> bool {
             | "x-aether-execution-loop-guard"
             | "x-aether-control-execute-fallback"
             | "x-aether-rate-limit-preflight"
+            | "cafecode-uid"
+            | "cafecode-uname"
             | USAGE_SERVER_NOW_UNIX_MS_HEADER
     )
 }
@@ -136,6 +138,21 @@ mod tests {
             USAGE_SERVER_NOW_UNIX_MS_HEADER,
             "X-Aether-Server-Now-Unix-Ms",
         ] {
+            assert!(should_skip_request_header(h), "should skip {h}");
+            assert!(
+                should_skip_upstream_passthrough_header(h),
+                "should skip passthrough {h}"
+            );
+            assert!(
+                should_skip_upstream_complete_passthrough_header(h),
+                "should skip complete passthrough {h}"
+            );
+        }
+    }
+
+    #[test]
+    fn strips_internal_cafecode_identity_headers_from_provider_requests() {
+        for h in ["cafecode-uid", "cafecode-uname", "Cafecode-Uid"] {
             assert!(should_skip_request_header(h), "should skip {h}");
             assert!(
                 should_skip_upstream_passthrough_header(h),
