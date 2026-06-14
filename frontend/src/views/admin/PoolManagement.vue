@@ -570,47 +570,46 @@
                       <span class="font-mono">
                         {{ getProviderMaskedSecretLabel(key, selectedProviderType) }}
                       </span>
-                      <template v-if="keyUiStateMap[key.key_id]?.showOAuthRefreshControl">
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          class="h-4 w-4 shrink-0"
-                          :disabled="refreshingOAuthKeyId === key.key_id || !keyUiStateMap[key.key_id]?.canRefreshToken"
-                          :title="keyUiStateMap[key.key_id]?.oauthRefreshButtonTitle || ''"
-                          @click.stop="handleRefreshOAuth(key)"
-                        >
-                          <RefreshCw
-                            class="w-2.5 h-2.5"
-                            :class="{ 'animate-spin': refreshingOAuthKeyId === key.key_id }"
-                          />
-                        </Button>
-                        <span
-                          v-if="keyUiStateMap[key.key_id]?.visibleOAuthState"
-                          class="text-[10px]"
-                          :class="{
-                            'text-destructive': keyUiStateMap[key.key_id]?.visibleOAuthState?.isInvalid || keyUiStateMap[key.key_id]?.visibleOAuthState?.isExpired,
-                            'text-warning': keyUiStateMap[key.key_id]?.visibleOAuthState?.isExpiringSoon && !keyUiStateMap[key.key_id]?.visibleOAuthState?.isExpired && !keyUiStateMap[key.key_id]?.visibleOAuthState?.isInvalid,
-                            'text-muted-foreground': !keyUiStateMap[key.key_id]?.visibleOAuthState?.isExpired && !keyUiStateMap[key.key_id]?.visibleOAuthState?.isExpiringSoon && !keyUiStateMap[key.key_id]?.visibleOAuthState?.isInvalid
-                          }"
-                          :title="keyUiStateMap[key.key_id]?.oauthStatusTitle || ''"
-                        >
-                          {{ keyUiStateMap[key.key_id]?.visibleOAuthState?.text }}
-                        </span>
-                        <Button
-                          v-if="keyUiStateMap[key.key_id]?.showCodexResetCreditControl"
-                          variant="ghost"
-                          size="icon"
-                          class="h-4 w-4 shrink-0 text-muted-foreground hover:text-foreground"
-                          :disabled="resettingCodexCreditKeyId === key.key_id || !keyUiStateMap[key.key_id]?.canResetCodexCredit"
-                          :title="keyUiStateMap[key.key_id]?.codexResetCreditTitle || ''"
-                          @click.stop="handleConsumeCodexResetCredit(key)"
-                        >
-                          <RotateCcw
-                            class="w-2.5 h-2.5"
-                            :class="{ 'animate-spin': resettingCodexCreditKeyId === key.key_id }"
-                          />
-                        </Button>
-                      </template>
+                      <Button
+                        v-if="keyUiStateMap[key.key_id]?.showOAuthRefreshControl"
+                        variant="ghost"
+                        size="icon"
+                        class="h-4 w-4 shrink-0"
+                        :disabled="refreshingOAuthKeyId === key.key_id || !keyUiStateMap[key.key_id]?.canRefreshToken"
+                        :title="keyUiStateMap[key.key_id]?.oauthRefreshButtonTitle || ''"
+                        @click.stop="handleRefreshOAuth(key)"
+                      >
+                        <RefreshCw
+                          class="w-2.5 h-2.5"
+                          :class="{ 'animate-spin': refreshingOAuthKeyId === key.key_id }"
+                        />
+                      </Button>
+                      <span
+                        v-if="keyUiStateMap[key.key_id]?.showOAuthRefreshControl && keyUiStateMap[key.key_id]?.visibleOAuthState"
+                        class="text-[10px]"
+                        :class="{
+                          'text-destructive': keyUiStateMap[key.key_id]?.visibleOAuthState?.isInvalid || keyUiStateMap[key.key_id]?.visibleOAuthState?.isExpired,
+                          'text-warning': keyUiStateMap[key.key_id]?.visibleOAuthState?.isExpiringSoon && !keyUiStateMap[key.key_id]?.visibleOAuthState?.isExpired && !keyUiStateMap[key.key_id]?.visibleOAuthState?.isInvalid,
+                          'text-muted-foreground': !keyUiStateMap[key.key_id]?.visibleOAuthState?.isExpired && !keyUiStateMap[key.key_id]?.visibleOAuthState?.isExpiringSoon && !keyUiStateMap[key.key_id]?.visibleOAuthState?.isInvalid
+                        }"
+                        :title="keyUiStateMap[key.key_id]?.oauthStatusTitle || ''"
+                      >
+                        {{ keyUiStateMap[key.key_id]?.visibleOAuthState?.text }}
+                      </span>
+                      <Button
+                        v-if="keyUiStateMap[key.key_id]?.showCodexResetCreditControl"
+                        variant="ghost"
+                        size="icon"
+                        class="h-4 w-4 shrink-0 text-muted-foreground hover:text-foreground"
+                        :disabled="resettingCodexCreditKeyId === key.key_id"
+                        :title="keyUiStateMap[key.key_id]?.codexResetCreditTitle || ''"
+                        @click.stop="handleConsumeCodexResetCredit(key)"
+                      >
+                        <RotateCcw
+                          class="w-2.5 h-2.5"
+                          :class="{ 'animate-spin': resettingCodexCreditKeyId === key.key_id }"
+                        />
+                      </Button>
                       <Badge
                         v-if="keyUiStateMap[key.key_id]?.planLabel"
                         variant="outline"
@@ -1258,7 +1257,7 @@
                     variant="ghost"
                     size="icon"
                     class="h-7 w-7 shrink-0 text-muted-foreground hover:text-foreground"
-                    :disabled="resettingCodexCreditKeyId === key.key_id || !keyUiStateMap[key.key_id]?.canResetCodexCredit"
+                    :disabled="resettingCodexCreditKeyId === key.key_id"
                     :title="keyUiStateMap[key.key_id]?.codexResetCreditTitle || ''"
                     @click.stop="handleConsumeCodexResetCredit(key)"
                   >
@@ -2408,7 +2407,6 @@ type PoolKeyUiState = {
   showOAuthRefreshControl: boolean
   canRefreshToken: boolean
   showCodexResetCreditControl: boolean
-  canResetCodexCredit: boolean
   codexResetCreditTitle: string
   planLabel: string
   planClass: string
@@ -2442,7 +2440,6 @@ const keyUiStateMap = computed<Record<string, PoolKeyUiState>>(() => {
     const canRefreshToken = canRefreshOAuthCredential(key)
     const showOAuthRefreshControl = shouldShowOAuthRefreshControl(key, selectedProviderType.value)
     const showCodexResetCreditControl = shouldShowCodexResetCreditControl(key)
-    const canResetCodexCredit = canConsumeCodexResetCredit(key)
 
     map[key.key_id] = {
       rowClass: getRowClass(key),
@@ -2456,7 +2453,6 @@ const keyUiStateMap = computed<Record<string, PoolKeyUiState>>(() => {
       showOAuthRefreshControl,
       canRefreshToken,
       showCodexResetCreditControl,
-      canResetCodexCredit,
       codexResetCreditTitle: showCodexResetCreditControl ? getCodexResetCreditTitle(key) : '',
       planLabel: planType ? formatOAuthPlanType(planType) : '',
       planClass: planType ? getOAuthPlanTypeClass(planType) : '',
@@ -3136,12 +3132,18 @@ async function handleRefreshOAuth(key: PoolKeyDetail) {
 }
 
 async function handleConsumeCodexResetCredit(key: PoolKeyDetail) {
-  if (resettingCodexCreditKeyId.value || !canConsumeCodexResetCredit(key)) return
+  if (resettingCodexCreditKeyId.value || !shouldShowCodexResetCreditControl(key)) return
 
   const availableCount = getCodexResetCreditsAvailableCount(key)
+  const availableCountText =
+    availableCount == null
+      ? '当前未返回可用次数'
+      : availableCount > 0
+        ? `当前剩余 ${availableCount} 次`
+        : '当前没有可用次数'
   const confirmed = await confirm({
     title: '主动重置额度',
-    message: `确定要消耗${availableCount != null ? ` 1/${availableCount}` : ' 1'} 次主动重置次数，重置账号 "${key.key_name || key.key_id.slice(0, 8)}" 的 Codex 5H 窗口吗？`,
+    message: `确定要重置账号 "${key.key_name || key.key_id.slice(0, 8)}" 的 Codex 5H 窗口吗？${availableCountText}，仍会尝试提交这次请求。`,
     confirmText: '重置',
   })
   if (!confirmed) return
@@ -3948,21 +3950,14 @@ function getCodexResetCreditsAvailableCount(key: PoolKeyDetail): number | null {
 
 function shouldShowCodexResetCreditControl(key: PoolKeyDetail): boolean {
   return selectedProviderType.value === 'codex'
-    && shouldShowOAuthRefreshControl(key, selectedProviderType.value)
-    && getCodexResetCreditsAvailableCount(key) != null
-}
-
-function canConsumeCodexResetCredit(key: PoolKeyDetail): boolean {
-  if (!shouldShowCodexResetCreditControl(key)) return false
-  const availableCount = getCodexResetCreditsAvailableCount(key)
-  return availableCount != null && availableCount > 0
+    && isOAuthManagedCredential(key)
 }
 
 function getCodexResetCreditTitle(key: PoolKeyDetail): string {
   const availableCount = getCodexResetCreditsAvailableCount(key)
-  if (availableCount === 0) return '没有可用的主动重置次数'
+  if (availableCount === 0) return '没有可用次数，仍可点击提交'
   if (availableCount != null) return `主动重置 Codex 5H 窗口（剩余 ${availableCount} 次）`
-  return '主动重置次数未知，请先刷新额度'
+  return '未返回可用次数，仍可点击提交'
 }
 
 function getQuotaSnapshotUpdatedAtSeconds(quota: QuotaStatusSnapshot | null | undefined): number | null {
