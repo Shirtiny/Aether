@@ -2419,7 +2419,10 @@ ORDER BY request_count DESC, "usage".provider_name ASC
             .map(|row| map_usage_row(row, false))
             .transpose()?;
         match usage {
-            Some(usage) => self.hydrate_usage_detail_metadata(usage).await.map(Some),
+            Some(usage) => {
+                let usage = self.hydrate_usage_detail_metadata(usage).await?;
+                self.hydrate_usage_body_refs(usage).await.map(Some)
+            }
             None => Ok(None),
         }
     }
