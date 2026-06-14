@@ -36,6 +36,7 @@ describe('poolMobilePresentation', () => {
         canRefreshToken: true,
         canClearCooldown: true,
         canRecoverHealth: true,
+        canResetCodexCredit: true,
         canResetCycleStats: true,
         canDownloadOrCopy: true,
         hasProxy: true,
@@ -44,6 +45,7 @@ describe('poolMobilePresentation', () => {
       primary: [
         'copy_or_download',
         'refresh_token',
+        'reset_codex_credit',
         'reset_cycle_stats',
         'clear_cooldown',
         'recover_health',

@@ -17,6 +17,10 @@ use crate::quota::{
 use crate::quota_refresh::ProviderPoolQuotaRequestSpec;
 
 pub const CODEX_WHAM_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+pub const CODEX_RESET_CREDIT_URL: &str =
+    "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume";
+const CODEX_RESET_CREDIT_USER_AGENT: &str =
+    "Codex Desktop/0.140.0-alpha.2 (Mac OS 26.5.0; arm64) unknown (Codex Desktop; 26.609.41114)";
 const PLACEHOLDER_API_KEY: &str = "__placeholder__";
 
 #[derive(Debug, Clone, Default)]
@@ -120,6 +124,51 @@ pub fn build_codex_pool_quota_request(
         model_name: Some("codex-wham-usage".to_string()),
         accept_invalid_certs: false,
     })
+}
+
+pub fn build_codex_pool_reset_credit_request(
+    key_id: &str,
+    redeem_request_id: String,
+    resolved_oauth_auth: (String, String),
+    auth_config: Option<&Value>,
+) -> ProviderPoolQuotaRequestSpec {
+    let mut headers = BTreeMap::new();
+    headers.insert("accept".to_string(), "application/json".to_string());
+    headers.insert(
+        "user-agent".to_string(),
+        CODEX_RESET_CREDIT_USER_AGENT.to_string(),
+    );
+    headers.insert(
+        resolved_oauth_auth.0.to_ascii_lowercase(),
+        resolved_oauth_auth.1,
+    );
+
+    let oauth_account_id = auth_config
+        .and_then(|value| value.get("account_id"))
+        .or_else(|| auth_config.and_then(|value| value.get("chatgpt_account_id")))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(account_id) = oauth_account_id {
+        headers.insert("chatgpt-account-id".to_string(), account_id.to_string());
+    }
+
+    ProviderPoolQuotaRequestSpec {
+        request_id: format!("codex-reset-credit:{key_id}"),
+        provider_name: "codex".to_string(),
+        quota_kind: "codex_reset_credit".to_string(),
+        method: "POST".to_string(),
+        url: CODEX_RESET_CREDIT_URL.to_string(),
+        headers,
+        content_type: Some("application/json".to_string()),
+        json_body: Some(serde_json::json!({
+            "redeem_request_id": redeem_request_id,
+        })),
+        client_api_format: "openai:responses".to_string(),
+        provider_api_format: "openai:responses".to_string(),
+        model_name: Some("codex-reset-credit".to_string()),
+        accept_invalid_certs: false,
+    }
 }
 
 fn codex_window_reset_elapsed(bucket: &Map<String, Value>, prefix: &str) -> bool {

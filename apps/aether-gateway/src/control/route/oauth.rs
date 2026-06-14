@@ -201,6 +201,17 @@ pub(super) fn classify_oauth_route(
             false,
         ))
     } else if method == http::Method::POST
+        && normalized_path.starts_with("/api/admin/provider-oauth/keys/")
+        && normalized_path.ends_with("/codex-reset-credit")
+    {
+        Some(classified(
+            "admin_proxy",
+            "provider_oauth_manage",
+            "consume_codex_reset_credit",
+            "admin:provider_oauth",
+            false,
+        ))
+    } else if method == http::Method::POST
         && normalized_path.starts_with("/api/admin/provider-oauth/providers/")
         && normalized_path.ends_with("/complete")
     {

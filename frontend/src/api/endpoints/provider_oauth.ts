@@ -215,6 +215,18 @@ export async function refreshProviderOAuth(keyId: string): Promise<ProviderOAuth
   return resp.data
 }
 
+export interface ProviderOAuthCodexResetCreditResponse {
+  provider_type: string
+  status?: string
+  message?: string
+  status_code?: number
+}
+
+export async function consumeCodexResetCredit(keyId: string): Promise<ProviderOAuthCodexResetCreditResponse> {
+  const resp = await client.post(`/api/admin/provider-oauth/keys/${keyId}/codex-reset-credit`)
+  return resp.data
+}
+
 // Provider-level OAuth (不需要预先创建 key)
 
 export async function startProviderLevelOAuth(providerId: string): Promise<ProviderOAuthStartResponse> {

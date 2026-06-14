@@ -97,6 +97,13 @@ fn classifies_admin_provider_oauth_maintenance_routes_as_admin_proxy_route() {
         ),
         (
             http::Method::POST,
+            "/api/admin/provider-oauth/keys/key-123/codex-reset-credit",
+            "consume_codex_reset_credit",
+            "admin:provider_oauth",
+            "admin:provider_oauth:write",
+        ),
+        (
+            http::Method::POST,
             "/api/admin/provider-oauth/providers/provider-123/complete",
             "complete_provider_oauth",
             "admin:provider_oauth",

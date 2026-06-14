@@ -596,6 +596,20 @@
                         >
                           {{ keyUiStateMap[key.key_id]?.visibleOAuthState?.text }}
                         </span>
+                        <Button
+                          v-if="keyUiStateMap[key.key_id]?.showCodexResetCreditControl"
+                          variant="ghost"
+                          size="icon"
+                          class="h-4 w-4 shrink-0 text-muted-foreground hover:text-foreground"
+                          :disabled="resettingCodexCreditKeyId === key.key_id || !keyUiStateMap[key.key_id]?.canResetCodexCredit"
+                          :title="keyUiStateMap[key.key_id]?.codexResetCreditTitle || ''"
+                          @click.stop="handleConsumeCodexResetCredit(key)"
+                        >
+                          <RotateCcw
+                            class="w-2.5 h-2.5"
+                            :class="{ 'animate-spin': resettingCodexCreditKeyId === key.key_id }"
+                          />
+                        </Button>
                       </template>
                       <Badge
                         v-if="keyUiStateMap[key.key_id]?.planLabel"
@@ -1240,6 +1254,20 @@
                     />
                   </Button>
                   <Button
+                    v-else-if="actionId === 'reset_codex_credit'"
+                    variant="ghost"
+                    size="icon"
+                    class="h-7 w-7 shrink-0 text-muted-foreground hover:text-foreground"
+                    :disabled="resettingCodexCreditKeyId === key.key_id || !keyUiStateMap[key.key_id]?.canResetCodexCredit"
+                    :title="keyUiStateMap[key.key_id]?.codexResetCreditTitle || ''"
+                    @click.stop="handleConsumeCodexResetCredit(key)"
+                  >
+                    <RotateCcw
+                      class="w-3.5 h-3.5"
+                      :class="{ 'animate-spin': resettingCodexCreditKeyId === key.key_id }"
+                    />
+                  </Button>
+                  <Button
                     v-else-if="actionId === 'clear_cooldown'"
                     variant="ghost"
                     size="icon"
@@ -1557,7 +1585,7 @@ import {
   refreshProviderQuota,
   resetProviderKeyCycleStats,
 } from '@/api/endpoints/keys'
-import { refreshProviderOAuth } from '@/api/endpoints/provider_oauth'
+import { consumeCodexResetCredit, refreshProviderOAuth } from '@/api/endpoints/provider_oauth'
 import type {
   PoolOverviewItem,
   PoolKeyDetail,
@@ -2211,6 +2239,7 @@ const poolStatsMode = ref<PoolManagementStatsMode>(restoredViewState.statsMode)
 const hasPoolKeyFilters = computed(() => searchQuery.value.trim().length > 0 || statusFilter.value !== 'all')
 const MANUAL_QUOTA_REFRESH_COOLDOWN_SECONDS = 5 * 60
 const refreshingOAuthKeyId = ref<string | null>(null)
+const resettingCodexCreditKeyId = ref<string | null>(null)
 const resettingCycleKeyId = ref<string | null>(null)
 const savingProxyKeyId = ref<string | null>(null)
 const proxyDesktopPopoverOpenKeyId = ref<string | null>(null)
@@ -2378,6 +2407,9 @@ type PoolKeyUiState = {
   oauthRefreshButtonTitle: string
   showOAuthRefreshControl: boolean
   canRefreshToken: boolean
+  showCodexResetCreditControl: boolean
+  canResetCodexCredit: boolean
+  codexResetCreditTitle: string
   planLabel: string
   planClass: string
   accountQuotaText: string | null
@@ -2409,6 +2441,8 @@ const keyUiStateMap = computed<Record<string, PoolKeyUiState>>(() => {
     const planType = resolvePoolKeyPlanType(key)
     const canRefreshToken = canRefreshOAuthCredential(key)
     const showOAuthRefreshControl = shouldShowOAuthRefreshControl(key, selectedProviderType.value)
+    const showCodexResetCreditControl = shouldShowCodexResetCreditControl(key)
+    const canResetCodexCredit = canConsumeCodexResetCredit(key)
 
     map[key.key_id] = {
       rowClass: getRowClass(key),
@@ -2421,6 +2455,9 @@ const keyUiStateMap = computed<Record<string, PoolKeyUiState>>(() => {
       oauthRefreshButtonTitle: showOAuthRefreshControl ? getOAuthRefreshButtonTitle(key) : '',
       showOAuthRefreshControl,
       canRefreshToken,
+      showCodexResetCreditControl,
+      canResetCodexCredit,
+      codexResetCreditTitle: showCodexResetCreditControl ? getCodexResetCreditTitle(key) : '',
       planLabel: planType ? formatOAuthPlanType(planType) : '',
       planClass: planType ? getOAuthPlanTypeClass(planType) : '',
       accountQuotaText,
@@ -2435,6 +2472,7 @@ const keyUiStateMap = computed<Record<string, PoolKeyUiState>>(() => {
       mobileActionIds: splitPoolMobileActions({
         canDownloadOrCopy: true,
         showRefreshToken: showOAuthRefreshControl,
+        canResetCodexCredit: showCodexResetCreditControl,
         canResetCycleStats: canResetCycleStats(key),
         canClearCooldown: Boolean(key.cooldown_reason),
         hasProxy: true,
@@ -3094,6 +3132,38 @@ async function handleRefreshOAuth(key: PoolKeyDetail) {
     await loadKeys()
   } finally {
     refreshingOAuthKeyId.value = null
+  }
+}
+
+async function handleConsumeCodexResetCredit(key: PoolKeyDetail) {
+  if (resettingCodexCreditKeyId.value || !canConsumeCodexResetCredit(key)) return
+
+  const balance = getCodexResetCreditBalance(key)
+  const confirmed = await confirm({
+    title: '主动重置额度',
+    message: `确定要消耗${balance != null ? ` 1/${balance}` : ' 1'} 次主动重置次数，重置账号 "${key.key_name || key.key_id.slice(0, 8)}" 的 Codex 5H 窗口吗？`,
+    confirmText: '重置',
+  })
+  if (!confirmed) return
+
+  resettingCodexCreditKeyId.value = key.key_id
+  try {
+    const result = await consumeCodexResetCredit(key.key_id)
+    success(result.message || 'Codex 主动重置额度已提交')
+    if (selectedProviderId.value) {
+      try {
+        await refreshProviderQuota(selectedProviderId.value, [key.key_id])
+      } catch (err) {
+        showWarning(parseApiError(err, '主动重置已提交，但刷新额度失败'))
+      }
+    }
+    await loadKeys()
+    refreshOverviewInBackground()
+  } catch (err) {
+    showError(parseApiError(err, '主动重置额度失败'))
+    await loadKeys()
+  } finally {
+    resettingCodexCreditKeyId.value = null
   }
 }
 
@@ -3858,6 +3928,42 @@ function getCodexQuotaSnapshot(key: PoolKeyDetail): QuotaStatusSnapshot | null {
   const quota = getQuotaSnapshot(key)
   if (!quota) return null
   return getQuotaSnapshotProviderType(key) === 'codex' ? quota : null
+}
+
+function getCodexResetCreditBalance(key: PoolKeyDetail): number | null {
+  const quota = getCodexQuotaSnapshot(key)
+  if (!quota) return null
+  const credits = quota.credits as Record<string, unknown> | undefined
+  const candidates = [
+    credits?.balance,
+    credits?.available_count,
+    credits?.available,
+    credits?.remaining,
+    (quota as unknown as Record<string, unknown>).reset_credit_balance,
+    (quota as unknown as Record<string, unknown>).reset_credits_remaining,
+  ]
+  for (const candidate of candidates) {
+    const value = Number(candidate)
+    if (Number.isFinite(value) && value >= 0) return Math.floor(value)
+  }
+  return null
+}
+
+function shouldShowCodexResetCreditControl(key: PoolKeyDetail): boolean {
+  return selectedProviderType.value === 'codex' && shouldShowOAuthRefreshControl(key, selectedProviderType.value)
+}
+
+function canConsumeCodexResetCredit(key: PoolKeyDetail): boolean {
+  if (!shouldShowCodexResetCreditControl(key)) return false
+  const balance = getCodexResetCreditBalance(key)
+  return balance == null || balance > 0
+}
+
+function getCodexResetCreditTitle(key: PoolKeyDetail): string {
+  const balance = getCodexResetCreditBalance(key)
+  if (balance === 0) return '没有可用的主动重置次数'
+  if (balance != null) return `主动重置 Codex 5H 窗口（剩余 ${balance} 次）`
+  return '主动重置 Codex 5H 窗口'
 }
 
 function getQuotaSnapshotUpdatedAtSeconds(quota: QuotaStatusSnapshot | null | undefined): number | null {

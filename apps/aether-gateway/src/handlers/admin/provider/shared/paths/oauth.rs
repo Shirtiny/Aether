@@ -26,6 +26,14 @@ pub(crate) fn admin_provider_oauth_refresh_key_id(request_path: &str) -> Option<
         .map(ToOwned::to_owned)
 }
 
+pub(crate) fn admin_provider_oauth_codex_reset_credit_key_id(request_path: &str) -> Option<String> {
+    request_path
+        .strip_prefix("/api/admin/provider-oauth/keys/")?
+        .strip_suffix("/codex-reset-credit")
+        .filter(|key_id| !key_id.is_empty() && !key_id.contains('/'))
+        .map(ToOwned::to_owned)
+}
+
 pub(crate) fn admin_provider_oauth_complete_provider_id(request_path: &str) -> Option<String> {
     provider_oauth_provider_id_for_suffix(request_path, "/complete")
 }

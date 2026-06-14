@@ -19,6 +19,7 @@ const endpointMocks = vi.hoisted(() => ({
   refreshProviderQuota: vi.fn(),
   resetProviderKeyCycleStats: vi.fn(),
   refreshProviderOAuth: vi.fn(),
+  consumeCodexResetCredit: vi.fn(),
 }))
 
 const routeMocks = vi.hoisted(() => ({
@@ -56,6 +57,7 @@ vi.mock('@/api/endpoints/keys', () => ({
 
 vi.mock('@/api/endpoints/provider_oauth', () => ({
   refreshProviderOAuth: endpointMocks.refreshProviderOAuth,
+  consumeCodexResetCredit: endpointMocks.consumeCodexResetCredit,
 }))
 
 vi.mock('@/api/endpoints', () => ({
@@ -559,11 +561,13 @@ beforeEach(() => {
   endpointMocks.refreshProviderQuota.mockReset()
   endpointMocks.resetProviderKeyCycleStats.mockReset()
   endpointMocks.refreshProviderOAuth.mockReset()
+  endpointMocks.consumeCodexResetCredit.mockReset()
 
   endpointMocks.getPoolSchedulingPresets.mockResolvedValue([])
   endpointMocks.clearPoolCooldown.mockResolvedValue({ message: 'ok' })
   endpointMocks.refreshProviderQuota.mockResolvedValue({ success: 0, failed: 0 })
   endpointMocks.resetProviderKeyCycleStats.mockResolvedValue({ message: '已重置周期统计', reset_at: 123, windows: 2 })
+  endpointMocks.consumeCodexResetCredit.mockResolvedValue({ provider_type: 'codex', message: 'Codex 主动重置额度已提交' })
 })
 
 afterEach(() => {

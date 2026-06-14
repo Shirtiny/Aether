@@ -19,7 +19,10 @@ pub use chatgpt_web::{
     CHATGPT_WEB_DEFAULT_BASE_URL,
 };
 pub use codex::CodexProviderPoolAdapter;
-pub use codex::{build_codex_pool_quota_request, CODEX_WHAM_USAGE_URL};
+pub use codex::{
+    build_codex_pool_quota_request, build_codex_pool_reset_credit_request, CODEX_RESET_CREDIT_URL,
+    CODEX_WHAM_USAGE_URL,
+};
 pub use default::DefaultProviderPoolAdapter;
 pub use gemini_cli::GeminiCliProviderPoolAdapter;
 pub use gemini_cli::{

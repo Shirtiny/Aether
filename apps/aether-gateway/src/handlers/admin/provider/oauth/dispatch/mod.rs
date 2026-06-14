@@ -4,7 +4,8 @@ use super::state::{
 };
 use crate::handlers::admin::provider::shared::paths::{
     admin_provider_oauth_batch_import_provider_id,
-    admin_provider_oauth_batch_import_task_provider_id, admin_provider_oauth_complete_key_id,
+    admin_provider_oauth_batch_import_task_provider_id,
+    admin_provider_oauth_codex_reset_credit_key_id, admin_provider_oauth_complete_key_id,
     admin_provider_oauth_complete_provider_id, admin_provider_oauth_device_authorize_provider_id,
     admin_provider_oauth_import_provider_id, admin_provider_oauth_refresh_key_id,
     admin_provider_oauth_start_key_id, admin_provider_oauth_start_provider_id,
@@ -19,6 +20,7 @@ use axum::{
 };
 
 mod batch;
+mod codex_reset_credit;
 mod complete;
 mod device;
 mod helpers;
@@ -111,6 +113,21 @@ pub(crate) async fn maybe_build_local_admin_provider_oauth_response(
         )));
     }
 
+    if route_kind == Some("consume_codex_reset_credit") && *method == http::Method::POST {
+        let response = codex_reset_credit::handle_admin_provider_oauth_codex_reset_credit(
+            state,
+            request_context,
+        )
+        .await?;
+        return Ok(Some(helpers::attach_admin_provider_oauth_audit_response(
+            response,
+            "admin_provider_oauth_codex_reset_credit_consumed",
+            "consume_codex_reset_credit_for_key",
+            "provider_key",
+            admin_provider_oauth_codex_reset_credit_key_id(request_context.path()),
+        )));
+    }
+
     if route_kind == Some("complete_provider_oauth") && *method == http::Method::POST {
         let response = complete::handle_admin_provider_oauth_complete_provider(
             state,
@@ -197,7 +214,7 @@ pub(crate) async fn maybe_build_local_admin_provider_oauth_response(
 
     if matches!(
         route_kind,
-        Some("refresh_key_oauth" | "import_refresh_token")
+        Some("refresh_key_oauth" | "consume_codex_reset_credit" | "import_refresh_token")
     ) {
         return Ok(Some(
             build_admin_provider_oauth_backend_unavailable_response(),
