@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use aether_admin::observability::usage::admin_usage_is_risk_control;
 use aether_ai_serving::UPSTREAM_IS_STREAM_KEY;
 use aether_billing::{
     normalize_input_tokens_for_billing, normalize_total_input_context_for_cache_hit_rate,
@@ -485,6 +486,7 @@ fn build_users_me_usage_record_payload(
         "cache_read_input_tokens": item.cache_read_input_tokens,
         "status_code": item.status_code,
         "error_message": item.error_message,
+        "is_risk_control": admin_usage_is_risk_control(item),
         "input_price_per_1m": input_price_per_1m,
         "output_price_per_1m": output_price_per_1m,
         "cache_creation_price_per_1m": cache_creation_price_per_1m,
@@ -533,6 +535,7 @@ fn build_users_me_usage_active_payload(item: &StoredRequestUsageAudit) -> serde_
         "first_byte_time_ms": item.first_byte_time_ms,
         "status_code": item.status_code,
         "error_message": item.error_message,
+        "is_risk_control": admin_usage_is_risk_control(item),
         "api_format": item.api_format,
         "endpoint_api_format": item.endpoint_api_format,
         "is_stream": item.is_stream,
@@ -1481,6 +1484,26 @@ mod tests {
         };
 
         assert!(users_me_usage_is_failed(&item));
+    }
+
+    #[test]
+    fn user_usage_payloads_include_backend_risk_control_flag() {
+        let item = StoredRequestUsageAudit {
+            status_code: Some(400),
+            error_message: Some(
+                "This content was flagged for possible cybersecurity risk. Join the Trusted Access for Cyber program: https://chatgpt.com/cyber"
+                    .to_string(),
+            ),
+            error_category: Some("client_error".to_string()),
+            ..sample_usage("failed")
+        };
+
+        let record_payload =
+            build_users_me_usage_record_payload(&item, false, &BTreeMap::new(), false);
+        let active_payload = build_users_me_usage_active_payload(&item);
+
+        assert_eq!(record_payload["is_risk_control"], true);
+        assert_eq!(active_payload["is_risk_control"], true);
     }
 
     #[test]

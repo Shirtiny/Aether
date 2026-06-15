@@ -7,6 +7,7 @@ type RequestStatusLike = RequestStatus | string | null | undefined
 type UsageFailureSignal = {
   status_code?: number | null
   error_message?: string | null
+  is_risk_control?: boolean | null
   image_progress?: {
     phase?: string | null
   } | null
@@ -47,6 +48,10 @@ export function hasUsageRetry(
   record: Pick<UsageRecord, 'has_retry'>
 ): boolean {
   return record.has_retry === true
+}
+
+export function isUsageRecordRiskControl(record: UsageFailureSignal): boolean {
+  return record.is_risk_control === true
 }
 
 export function resolveUsageStreamModes(

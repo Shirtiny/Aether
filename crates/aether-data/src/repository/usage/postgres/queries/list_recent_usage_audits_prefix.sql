@@ -112,6 +112,8 @@ SELECT
   CASE
     WHEN NULLIF(BTRIM("usage".request_metadata->>'client_ip'), '') IS NOT NULL
       OR NULLIF(BTRIM("usage".request_metadata->>'user_agent'), '') IS NOT NULL
+      OR NULLIF(BTRIM("usage".request_metadata->>'cafecode_uid'), '') IS NOT NULL
+      OR NULLIF(BTRIM("usage".request_metadata->>'cafecode_uname'), '') IS NOT NULL
       OR NULLIF(BTRIM("usage".request_metadata->>'request_path'), '') IS NOT NULL
       OR NULLIF(BTRIM("usage".request_metadata->>'request_path_and_query'), '') IS NOT NULL
       OR CASE
@@ -133,6 +135,10 @@ SELECT
         NULLIF(BTRIM("usage".request_metadata->>'client_ip'), ''),
         'user_agent',
         NULLIF(BTRIM("usage".request_metadata->>'user_agent'), ''),
+        'cafecode_uid',
+        NULLIF(BTRIM("usage".request_metadata->>'cafecode_uid'), ''),
+        'cafecode_uname',
+        NULLIF(BTRIM("usage".request_metadata->>'cafecode_uname'), ''),
         'request_path',
         NULLIF(BTRIM("usage".request_metadata->>'request_path'), ''),
         'request_path_and_query',

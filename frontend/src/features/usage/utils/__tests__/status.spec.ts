@@ -5,6 +5,7 @@ import {
   hasUsageFallback,
   hasUsageRetry,
   isUsageRecordFailed,
+  isUsageRecordRiskControl,
   isUsageRecordSuccessful,
   mapRequestStatusToTimelineStatus,
   normalizeRequestStatus,
@@ -170,6 +171,22 @@ describe('usage status helpers', () => {
     expect(hasUsageRetry(buildUsageRecord({ has_retry: true }))).toBe(true)
     expect(hasUsageRetry(buildUsageRecord({ has_retry: false }))).toBe(false)
     expect(hasUsageRetry(buildUsageRecord({ has_retry: undefined }))).toBe(false)
+  })
+
+  it('detects risk control records from the backend flag only', () => {
+    expect(isUsageRecordRiskControl(buildUsageRecord({
+      is_risk_control: true,
+    }))).toBe(true)
+
+    expect(isUsageRecordRiskControl(buildUsageRecord({
+      status_code: 400,
+      error_message: 'This content was flagged for possible cybersecurity risk. Join the Trusted Access for Cyber program: https://chatgpt.com/cyber',
+    }))).toBe(false)
+
+    expect(isUsageRecordRiskControl(buildUsageRecord({
+      status_code: 400,
+      error_message: 'upstream failure',
+    }))).toBe(false)
   })
 
   it('prefers symmetric stream aliases when present', () => {

@@ -3,6 +3,7 @@ import type { UsageRecord, FilterStatusValue } from '../types'
 import {
   hasUsageFallback,
   hasUsageRetry,
+  isUsageRecordRiskControl,
   isUsageRecordFailed,
   isUsageUpstreamStream,
   resolveDisplayRequestStatus,
@@ -86,6 +87,8 @@ export function useUsageFilters(options: UseUsageFiltersOptions) {
         records = records.filter(record => isUsageRecordFailed(record))
       } else if (filterStatus.value === 'cancelled') {
         records = records.filter(record => record.status === 'cancelled')
+      } else if (filterStatus.value === 'risk_control') {
+        records = records.filter(record => isUsageRecordRiskControl(record))
       } else if (filterStatus.value === 'has_fallback') {
         records = records.filter(record => hasUsageFallback(record))
       } else if (filterStatus.value === 'has_retry') {
