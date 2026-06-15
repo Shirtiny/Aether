@@ -21,8 +21,9 @@ pub(crate) use self::finalize::internal::{
     SyncToStreamBridgeOutcome,
 };
 pub(crate) use self::planner::{
-    apply_local_runtime_candidate_terminal_reason, build_gemini_stream_plan_from_decision,
-    build_gemini_sync_plan_from_decision, build_local_gemini_files_stream_attempt_source_for_kind,
+    apply_codex_pool_stable_client_headers, apply_local_runtime_candidate_terminal_reason,
+    build_gemini_stream_plan_from_decision, build_gemini_sync_plan_from_decision,
+    build_local_gemini_files_stream_attempt_source_for_kind,
     build_local_gemini_files_stream_plan_and_reports_for_kind,
     build_local_gemini_files_sync_attempt_source_for_kind,
     build_local_gemini_files_sync_plan_and_reports_for_kind,

@@ -21,8 +21,9 @@ use crate::ai_serving::planner::redaction::{
 };
 use crate::ai_serving::planner::spec_metadata::local_standard_spec_metadata;
 use crate::ai_serving::planner::standard::{
-    apply_codex_openai_responses_special_headers, apply_deepseek_tool_call_thinking_compat,
-    is_deepseek_provider, request_body_build_failure_extra_data,
+    apply_codex_openai_responses_special_headers, apply_codex_pool_stable_client_headers,
+    apply_deepseek_tool_call_thinking_compat, is_deepseek_provider,
+    request_body_build_failure_extra_data,
 };
 use crate::ai_serving::transport::kiro::{
     build_kiro_provider_headers, build_kiro_provider_request_body,
@@ -842,6 +843,7 @@ pub(crate) async fn resolve_local_standard_candidate_payload_parts(
         Some(trace_id),
         transport.key.decrypted_auth_config.as_deref(),
     );
+    apply_codex_pool_stable_client_headers(&mut provider_request_headers, transport);
     request_identity_response_encoding_when_redacted(
         &mut provider_request_headers,
         redaction.redacted,
@@ -992,6 +994,7 @@ async fn build_gemini_cli_cross_format_payload_parts(
         Some(trace_id),
         resolved.transport.key.decrypted_auth_config.as_deref(),
     );
+    apply_codex_pool_stable_client_headers(&mut provider_request_headers, &resolved.transport);
     request_identity_response_encoding_when_redacted(
         &mut provider_request_headers,
         request_redacted,
@@ -1256,6 +1259,7 @@ async fn resolve_local_gemini_image_to_openai_image_candidate_payload_parts(
         Some(trace_id),
         transport.key.decrypted_auth_config.as_deref(),
     );
+    apply_codex_pool_stable_client_headers(&mut provider_request_headers, transport);
 
     Some(LocalStandardCandidatePayloadParts {
         auth_header: prepared_candidate.auth_header,

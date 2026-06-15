@@ -16,6 +16,7 @@ mod openai;
 
 pub(crate) use self::codex::{
     apply_codex_openai_responses_special_body_edits, apply_codex_openai_responses_special_headers,
+    apply_codex_pool_stable_client_headers,
 };
 pub(crate) use self::deepseek::{apply_deepseek_tool_call_thinking_compat, is_deepseek_provider};
 pub(crate) use self::family::{

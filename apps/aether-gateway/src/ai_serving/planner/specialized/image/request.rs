@@ -8,6 +8,7 @@ use crate::ai_serving::planner::candidate_preparation::{
     prepare_header_authenticated_candidate, OauthPreparationContext,
 };
 use crate::ai_serving::planner::spec_metadata::local_openai_image_spec_metadata;
+use crate::ai_serving::planner::standard::apply_codex_pool_stable_client_headers;
 use crate::ai_serving::pure::normalize_openai_image_request_with_options;
 use crate::ai_serving::transport::{
     build_grok_browser_headers, build_grok_upstream_url, build_openai_image_headers,
@@ -248,6 +249,7 @@ pub(super) async fn resolve_local_openai_image_candidate_payload_parts(
             Some(trace_id),
             transport.key.decrypted_auth_config.as_deref(),
         );
+        apply_codex_pool_stable_client_headers(&mut provider_request_headers, transport);
     }
     let requested_model = normalized_request
         .requested_model

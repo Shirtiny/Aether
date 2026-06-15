@@ -707,6 +707,16 @@ export interface PoolScoreRules {
   probe_failure_cooldown_threshold?: number | null
 }
 
+export interface PoolCodexClientHeaderProfile {
+  user_agent: string
+  originator: string
+}
+
+export interface PoolCodexClientHeadersConfig {
+  enabled?: boolean | null
+  profiles?: PoolCodexClientHeaderProfile[] | null
+}
+
 export interface PoolAdvancedConfig {
   global_priority?: number | null
   sticky_session_ttl_seconds?: number | null
@@ -747,6 +757,7 @@ export interface PoolAdvancedConfig {
   account_self_check_interval_minutes?: number | null
   account_self_check_concurrency?: number | null
   auto_remove_banned_keys?: boolean
+  codex_client_headers?: PoolCodexClientHeadersConfig | null
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {

@@ -459,6 +459,94 @@
       </section>
 
       <section
+        v-if="isCodex"
+        class="space-y-4 rounded-2xl border border-border/60 bg-card/70 p-4 sm:p-5"
+      >
+        <div class="space-y-1">
+          <div class="flex flex-wrap items-center gap-2">
+            <h3 class="text-sm font-semibold">
+              Codex 请求头
+            </h3>
+            <span class="rounded-full bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">
+              客户端指纹
+            </span>
+          </div>
+          <p class="text-xs leading-5 text-muted-foreground">
+            为每个号池账号按 Key 稳定选择同一组 User-Agent 和 Originator，降低同一账号在不同客户端间切换的特征漂移。
+          </p>
+        </div>
+
+        <div class="space-y-3 rounded-xl border border-border/60 bg-muted/30 p-4">
+          <div class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+            <div class="space-y-1">
+              <span class="text-sm font-medium">稳定客户端请求头</span>
+              <p class="text-xs leading-5 text-muted-foreground">
+                关闭后沿用客户端传入的 User-Agent 和 Originator。
+              </p>
+            </div>
+            <Switch
+              :model-value="codexHeaderForm.enabled"
+              class="shrink-0"
+              @update:model-value="(v: boolean) => codexHeaderForm.enabled = v"
+            />
+          </div>
+
+          <div
+            v-if="codexHeaderForm.enabled"
+            class="space-y-3"
+          >
+            <div
+              v-for="(profile, index) in codexHeaderForm.profiles"
+              :key="index"
+              class="grid gap-3 rounded-lg border border-border/50 bg-background/60 p-3 lg:grid-cols-[1fr_13rem_auto]"
+            >
+              <div class="space-y-1.5">
+                <Label>User-Agent</Label>
+                <Input
+                  v-model="profile.user_agent"
+                  placeholder="codex-tui/0.139.0 ..."
+                />
+              </div>
+              <div class="space-y-1.5">
+                <Label>Originator</Label>
+                <Input
+                  v-model="profile.originator"
+                  placeholder="codex-tui"
+                />
+              </div>
+              <div class="flex items-end">
+                <Button
+                  type="button"
+                  variant="outline"
+                  class="w-full lg:w-auto"
+                  @click="removeCodexHeaderProfile(index)"
+                >
+                  删除
+                </Button>
+              </div>
+            </div>
+
+            <div class="flex flex-wrap gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                @click="addCodexHeaderProfile"
+              >
+                添加配置
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                @click="resetCodexHeaderProfiles"
+              >
+                使用内置字典
+              </Button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section
         v-if="isClaudeCode"
         class="space-y-4 rounded-2xl border border-border/60 bg-card/70 p-4 sm:p-5"
       >
@@ -656,6 +744,10 @@ const isClaudeCode = computed(() => {
   return (props.providerType || '').trim().toLowerCase() === 'claude_code'
 })
 
+const isCodex = computed(() => {
+  return (props.providerType || '').trim().toLowerCase() === 'codex'
+})
+
 const healthToggleCards = buildPoolHealthToggleCards()
 const cooldownFieldLayout = buildPoolCooldownFieldLayout()
 const costFieldLayout = buildPoolCostFieldLayout()
@@ -693,6 +785,21 @@ const form = ref({
   skip_exhausted_accounts: false,
 })
 
+interface CodexHeaderProfileFormState {
+  user_agent: string
+  originator: string
+}
+
+interface CodexHeaderFormState {
+  enabled: boolean
+  profiles: CodexHeaderProfileFormState[]
+}
+
+const codexHeaderForm = ref<CodexHeaderFormState>({
+  enabled: true,
+  profiles: [],
+})
+
 interface ClaudeFormState {
   session_control_enabled: boolean
   max_sessions: number | undefined
@@ -712,6 +819,32 @@ const claudeForm = ref<ClaudeFormState>({
   cache_ttl_override_target: 'ephemeral',
   cli_only_enabled: false,
 })
+
+function normalizeCodexHeaderProfiles(value: unknown): CodexHeaderProfileFormState[] {
+  if (!Array.isArray(value)) return []
+  return value
+    .map((item) => {
+      if (!item || typeof item !== 'object') return null
+      const record = item as Record<string, unknown>
+      const userAgent = typeof record.user_agent === 'string' ? record.user_agent.trim() : ''
+      const originator = typeof record.originator === 'string' ? record.originator.trim() : ''
+      if (!userAgent || !originator) return null
+      return { user_agent: userAgent, originator }
+    })
+    .filter((item): item is CodexHeaderProfileFormState => item !== null)
+}
+
+function addCodexHeaderProfile(): void {
+  codexHeaderForm.value.profiles.push({ user_agent: '', originator: '' })
+}
+
+function removeCodexHeaderProfile(index: number): void {
+  codexHeaderForm.value.profiles.splice(index, 1)
+}
+
+function resetCodexHeaderProfiles(): void {
+  codexHeaderForm.value.profiles = []
+}
 
 function parseNum(v: string | number): number | undefined {
   if (v === '' || v === null || v === undefined) return undefined
@@ -791,6 +924,12 @@ watch(() => props.modelValue, (open) => {
     skip_exhausted_accounts: cfg?.skip_exhausted_accounts ?? false,
   }
 
+  const codexClientHeaders = cfg?.codex_client_headers
+  codexHeaderForm.value = {
+    enabled: codexClientHeaders?.enabled !== false,
+    profiles: normalizeCodexHeaderProfiles(codexClientHeaders?.profiles),
+  }
+
   const cc = props.currentClaudeConfig
   claudeForm.value = {
     session_control_enabled: cc?.max_sessions !== null,
@@ -865,6 +1004,21 @@ async function handleSave() {
         : undefined,
       auto_remove_banned_keys: form.value.auto_remove_banned_keys,
       skip_exhausted_accounts: form.value.skip_exhausted_accounts,
+    }
+
+    if (isCodex.value) {
+      const profiles = codexHeaderForm.value.profiles
+        .map((profile) => ({
+          user_agent: profile.user_agent.trim(),
+          originator: profile.originator.trim(),
+        }))
+        .filter((profile) => profile.user_agent && profile.originator)
+      poolAdvanced.codex_client_headers = {
+        enabled: codexHeaderForm.value.enabled,
+        profiles: profiles.length > 0 ? profiles : undefined,
+      }
+    } else {
+      delete poolAdvanced.codex_client_headers
     }
 
     const payload: Parameters<typeof updateProvider>[1] = {
