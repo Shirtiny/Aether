@@ -1,6 +1,6 @@
 use crate::observability::stats::{aggregate_usage_stats, parse_bounded_u32, round_to};
-use aether_ai_formats::api::request_path_implies_stream_request;
 use aether_ai_formats::UPSTREAM_IS_STREAM_KEY;
+use aether_ai_formats::api::request_path_implies_stream_request;
 use aether_billing::{
     normalize_input_tokens_for_billing, normalize_total_input_context_for_cache_hit_rate,
 };
@@ -10,12 +10,12 @@ use aether_data_contracts::repository::{
     usage::{StoredRequestUsageAudit, StoredUsageAuditSummary, UsageBodyField},
 };
 use axum::{
+    Json,
     body::Body,
     http,
     response::{IntoResponse, Response},
-    Json,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use url::form_urlencoded;
 
@@ -250,6 +250,43 @@ pub fn admin_usage_is_failed(item: &StoredRequestUsageAudit) -> bool {
     has_failure_signal
 }
 
+fn admin_usage_json_text_matches_risk_control(value: &Value) -> bool {
+    let text = match value {
+        Value::String(text) => text.to_ascii_lowercase(),
+        _ => value.to_string().to_ascii_lowercase(),
+    };
+    text.contains("flagged for possible cybersecurity risk")
+        || text.contains("possible cybersecurity risk")
+        || text.contains("trusted access for cyber")
+        || text.contains("chatgpt.com/cyber")
+}
+
+pub fn admin_usage_is_risk_control(item: &StoredRequestUsageAudit) -> bool {
+    let category_matches = item.error_category.as_deref().is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "client_error" | "client_response" | "http_error" | "bad_request"
+        )
+    });
+    let status_matches = item.status_code == Some(400);
+    let message_matches = item.error_message.as_deref().is_some_and(|value| {
+        let normalized = value.to_ascii_lowercase();
+        normalized.contains("possible cybersecurity risk")
+            || normalized.contains("trusted access for cyber")
+            || normalized.contains("chatgpt.com/cyber")
+    });
+    let body_matches = item
+        .client_response_body
+        .as_ref()
+        .is_some_and(admin_usage_json_text_matches_risk_control)
+        || item
+            .response_body
+            .as_ref()
+            .is_some_and(admin_usage_json_text_matches_risk_control);
+
+    body_matches || (status_matches && category_matches && message_matches)
+}
+
 pub fn admin_usage_has_fallback(item: &StoredRequestUsageAudit) -> bool {
     item.has_fallback()
 }
@@ -268,6 +305,7 @@ pub fn admin_usage_matches_status(item: &StoredRequestUsageAudit, status: Option
         }
         "pending" | "streaming" | "completed" | "cancelled" => item.status == status,
         "failed" => admin_usage_is_failed(item),
+        "risk_control" => admin_usage_is_risk_control(item),
         "active" => matches!(item.status.as_str(), "pending" | "streaming"),
         "has_fallback" => admin_usage_has_fallback(item),
         _ => true,
@@ -1298,6 +1336,7 @@ pub fn admin_usage_record_json(
         "status_code": item.status_code,
         "error_message": item.error_message,
         "status": item.status,
+        "is_risk_control": admin_usage_is_risk_control(item),
         "has_fallback": admin_usage_has_fallback(item),
         "has_retry": false,
         "has_rectified": false,
@@ -2519,10 +2558,11 @@ mod tests {
 
     use super::{
         admin_usage_active_request_json, admin_usage_client_is_stream, admin_usage_has_body_value,
-        admin_usage_has_fallback, admin_usage_is_failed, admin_usage_is_success,
-        admin_usage_matches_search, admin_usage_matches_status, admin_usage_matches_username,
-        admin_usage_record_json, admin_usage_resolve_request_capture_body,
-        admin_usage_total_tokens, admin_usage_upstream_is_stream, build_admin_usage_detail_payload,
+        admin_usage_has_fallback, admin_usage_is_failed, admin_usage_is_risk_control,
+        admin_usage_is_success, admin_usage_matches_search, admin_usage_matches_status,
+        admin_usage_matches_username, admin_usage_record_json,
+        admin_usage_resolve_request_capture_body, admin_usage_total_tokens,
+        admin_usage_upstream_is_stream, build_admin_usage_detail_payload,
     };
     use aether_data_contracts::repository::usage::{StoredRequestUsageAudit, UsageBodyField};
 
@@ -2582,6 +2622,36 @@ mod tests {
         assert!(!admin_usage_is_failed(&item));
         assert!(!admin_usage_matches_status(&item, Some("failed")));
         assert!(admin_usage_matches_status(&item, Some("completed")));
+    }
+
+    #[test]
+    fn risk_control_status_matches_cyber_safety_client_response() {
+        let risk_item = StoredRequestUsageAudit {
+            error_category: Some("client_error".to_string()),
+            client_response_body: Some(json!({
+                "detail": "This content was flagged for possible cybersecurity risk. If this seems wrong, try rephrasing your request. To get authorized for security work, join the Trusted Access for Cyber program: https://chatgpt.com/cyber"
+            })),
+            ..sample_usage("failed", Some(400), None)
+        };
+        let normal_item = StoredRequestUsageAudit {
+            error_category: Some("client_error".to_string()),
+            error_message: Some("missing required field".to_string()),
+            ..sample_usage("failed", Some(400), None)
+        };
+
+        assert!(admin_usage_is_risk_control(&risk_item));
+        assert!(admin_usage_matches_status(&risk_item, Some("risk_control")));
+        assert!(!admin_usage_is_risk_control(&normal_item));
+
+        let record = admin_usage_record_json(
+            &risk_item,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            false,
+            false,
+            None,
+        );
+        assert_eq!(record["is_risk_control"], true);
     }
 
     #[test]
@@ -2796,8 +2866,8 @@ mod tests {
     }
 
     #[test]
-    fn client_requested_stream_defaults_to_non_stream_for_openai_responses_request_body_without_flag(
-    ) {
+    fn client_requested_stream_defaults_to_non_stream_for_openai_responses_request_body_without_flag()
+     {
         let item = StoredRequestUsageAudit {
             is_stream: true,
             api_format: Some("openai:responses".to_string()),

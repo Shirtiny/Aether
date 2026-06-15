@@ -127,6 +127,7 @@ export interface UsageRecord {
   status_code?: number
   error_message?: string
   status?: RequestStatus  // 请求状态: pending, streaming, completed, failed
+  is_risk_control?: boolean
   created_at: string
   has_fallback?: boolean
   has_retry?: boolean
@@ -154,6 +155,7 @@ export type FilterStatusValue =
   'active' |
   'failed' |
   'cancelled' |
+  'risk_control' |
   'has_fallback' |
   'has_retry'
 

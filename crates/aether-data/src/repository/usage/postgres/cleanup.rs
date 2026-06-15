@@ -1,24 +1,45 @@
 use std::io::Write;
 
 use aether_data_contracts::repository::usage::{
-    parse_usage_body_ref, usage_body_ref, UsageBodyField, UsageCleanupExecutionMode,
-    UsageCleanupPreviewCounts, UsageCleanupSummary, UsageCleanupTargets, UsageCleanupWindow,
+    UsageBodyField, UsageCleanupExecutionMode, UsageCleanupPreviewCounts, UsageCleanupSummary,
+    UsageCleanupTargets, UsageCleanupWindow, parse_usage_body_ref, usage_body_ref,
 };
 use chrono::{DateTime, Utc};
-use flate2::{write::GzEncoder, Compression};
+use flate2::{Compression, write::GzEncoder};
 use futures_util::TryStreamExt;
 use serde_json::Value;
 use sqlx::Row;
 use tracing::warn;
 
 use super::SqlxUsageReadRepository;
-use crate::{driver::postgres::PostgresPool, error::postgres_error, DataLayerError};
+use crate::{DataLayerError, driver::postgres::PostgresPool, error::postgres_error};
 
 const DELETE_OLD_USAGE_RECORDS_SQL: &str = r#"
 WITH doomed AS (
     SELECT id
     FROM usage
     WHERE created_at < $1
+      AND NOT (
+        status_code = 400
+        AND COALESCE(error_category, '') IN ('client_error', 'client_response', 'http_error', 'bad_request')
+        AND (
+          COALESCE(error_message, '') ILIKE '%possible cybersecurity risk%'
+          OR COALESCE(error_message, '') ILIKE '%trusted access for cyber%'
+          OR COALESCE(error_message, '') ILIKE '%chatgpt.com/cyber%'
+          OR COALESCE(client_response_body::text, '') ILIKE '%possible cybersecurity risk%'
+          OR COALESCE(client_response_body::text, '') ILIKE '%trusted access for cyber%'
+          OR COALESCE(client_response_body::text, '') ILIKE '%chatgpt.com/cyber%'
+          OR COALESCE(response_body::text, '') ILIKE '%possible cybersecurity risk%'
+          OR COALESCE(response_body::text, '') ILIKE '%trusted access for cyber%'
+          OR COALESCE(response_body::text, '') ILIKE '%chatgpt.com/cyber%'
+          OR EXISTS (
+            SELECT 1
+            FROM usage_body_blobs
+            WHERE usage_body_blobs.request_id = usage.request_id
+              AND usage_body_blobs.body_field IN ('client_response_body', 'response_body')
+          )
+        )
+      )
     ORDER BY created_at ASC, id ASC
     LIMIT $2
 )
@@ -31,6 +52,27 @@ SELECT id, request_id, request_metadata
 FROM usage
 WHERE created_at < $1
   AND ($2::timestamptz IS NULL OR created_at >= $2)
+  AND NOT (
+    status_code = 400
+    AND COALESCE(error_category, '') IN ('client_error', 'client_response', 'http_error', 'bad_request')
+    AND (
+      COALESCE(error_message, '') ILIKE '%possible cybersecurity risk%'
+      OR COALESCE(error_message, '') ILIKE '%trusted access for cyber%'
+      OR COALESCE(error_message, '') ILIKE '%chatgpt.com/cyber%'
+      OR COALESCE(client_response_body::text, '') ILIKE '%possible cybersecurity risk%'
+      OR COALESCE(client_response_body::text, '') ILIKE '%trusted access for cyber%'
+      OR COALESCE(client_response_body::text, '') ILIKE '%chatgpt.com/cyber%'
+      OR COALESCE(response_body::text, '') ILIKE '%possible cybersecurity risk%'
+      OR COALESCE(response_body::text, '') ILIKE '%trusted access for cyber%'
+      OR COALESCE(response_body::text, '') ILIKE '%chatgpt.com/cyber%'
+      OR EXISTS (
+        SELECT 1
+        FROM usage_body_blobs
+        WHERE usage_body_blobs.request_id = usage.request_id
+          AND usage_body_blobs.body_field IN ('client_response_body', 'response_body')
+      )
+    )
+  )
   AND request_metadata IS NOT NULL
   AND (
     request_metadata::jsonb ? 'request_body_ref'
@@ -46,6 +88,27 @@ SELECT id, request_id
 FROM usage
 WHERE created_at < $1
   AND ($2::timestamptz IS NULL OR created_at >= $2)
+  AND NOT (
+    status_code = 400
+    AND COALESCE(error_category, '') IN ('client_error', 'client_response', 'http_error', 'bad_request')
+    AND (
+      COALESCE(error_message, '') ILIKE '%possible cybersecurity risk%'
+      OR COALESCE(error_message, '') ILIKE '%trusted access for cyber%'
+      OR COALESCE(error_message, '') ILIKE '%chatgpt.com/cyber%'
+      OR COALESCE(client_response_body::text, '') ILIKE '%possible cybersecurity risk%'
+      OR COALESCE(client_response_body::text, '') ILIKE '%trusted access for cyber%'
+      OR COALESCE(client_response_body::text, '') ILIKE '%chatgpt.com/cyber%'
+      OR COALESCE(response_body::text, '') ILIKE '%possible cybersecurity risk%'
+      OR COALESCE(response_body::text, '') ILIKE '%trusted access for cyber%'
+      OR COALESCE(response_body::text, '') ILIKE '%chatgpt.com/cyber%'
+      OR EXISTS (
+        SELECT 1
+        FROM usage_body_blobs
+        WHERE usage_body_blobs.request_id = usage.request_id
+          AND usage_body_blobs.body_field IN ('client_response_body', 'response_body')
+      )
+    )
+  )
   AND (
     request_headers IS NOT NULL
     OR response_headers IS NOT NULL
@@ -100,6 +163,27 @@ SELECT id, request_id
 FROM usage
 WHERE created_at < $1
   AND ($2::timestamptz IS NULL OR created_at >= $2)
+  AND NOT (
+    status_code = 400
+    AND COALESCE(error_category, '') IN ('client_error', 'client_response', 'http_error', 'bad_request')
+    AND (
+      COALESCE(error_message, '') ILIKE '%possible cybersecurity risk%'
+      OR COALESCE(error_message, '') ILIKE '%trusted access for cyber%'
+      OR COALESCE(error_message, '') ILIKE '%chatgpt.com/cyber%'
+      OR COALESCE(client_response_body::text, '') ILIKE '%possible cybersecurity risk%'
+      OR COALESCE(client_response_body::text, '') ILIKE '%trusted access for cyber%'
+      OR COALESCE(client_response_body::text, '') ILIKE '%chatgpt.com/cyber%'
+      OR COALESCE(response_body::text, '') ILIKE '%possible cybersecurity risk%'
+      OR COALESCE(response_body::text, '') ILIKE '%trusted access for cyber%'
+      OR COALESCE(response_body::text, '') ILIKE '%chatgpt.com/cyber%'
+      OR EXISTS (
+        SELECT 1
+        FROM usage_body_blobs
+        WHERE usage_body_blobs.request_id = usage.request_id
+          AND usage_body_blobs.body_field IN ('client_response_body', 'response_body')
+      )
+    )
+  )
   AND (
     request_body IS NOT NULL
     OR response_body IS NOT NULL
@@ -133,6 +217,27 @@ const SELECT_USAGE_RAW_BODY_BATCH_SQL: &str = r#"
 SELECT id, request_id
 FROM usage
 WHERE created_at < $1
+  AND NOT (
+    status_code = 400
+    AND COALESCE(error_category, '') IN ('client_error', 'client_response', 'http_error', 'bad_request')
+    AND (
+      COALESCE(error_message, '') ILIKE '%possible cybersecurity risk%'
+      OR COALESCE(error_message, '') ILIKE '%trusted access for cyber%'
+      OR COALESCE(error_message, '') ILIKE '%chatgpt.com/cyber%'
+      OR COALESCE(client_response_body::text, '') ILIKE '%possible cybersecurity risk%'
+      OR COALESCE(client_response_body::text, '') ILIKE '%trusted access for cyber%'
+      OR COALESCE(client_response_body::text, '') ILIKE '%chatgpt.com/cyber%'
+      OR COALESCE(response_body::text, '') ILIKE '%possible cybersecurity risk%'
+      OR COALESCE(response_body::text, '') ILIKE '%trusted access for cyber%'
+      OR COALESCE(response_body::text, '') ILIKE '%chatgpt.com/cyber%'
+      OR EXISTS (
+        SELECT 1
+        FROM usage_body_blobs
+        WHERE usage_body_blobs.request_id = usage.request_id
+          AND usage_body_blobs.body_field IN ('client_response_body', 'response_body')
+      )
+    )
+  )
   AND (
     request_body IS NOT NULL
     OR response_body IS NOT NULL
@@ -154,6 +259,27 @@ const SELECT_USAGE_COMPRESSED_BODY_BATCH_SQL: &str = r#"
 SELECT id, request_id
 FROM usage
 WHERE created_at < $1
+  AND NOT (
+    status_code = 400
+    AND COALESCE(error_category, '') IN ('client_error', 'client_response', 'http_error', 'bad_request')
+    AND (
+      COALESCE(error_message, '') ILIKE '%possible cybersecurity risk%'
+      OR COALESCE(error_message, '') ILIKE '%trusted access for cyber%'
+      OR COALESCE(error_message, '') ILIKE '%chatgpt.com/cyber%'
+      OR COALESCE(client_response_body::text, '') ILIKE '%possible cybersecurity risk%'
+      OR COALESCE(client_response_body::text, '') ILIKE '%trusted access for cyber%'
+      OR COALESCE(client_response_body::text, '') ILIKE '%chatgpt.com/cyber%'
+      OR COALESCE(response_body::text, '') ILIKE '%possible cybersecurity risk%'
+      OR COALESCE(response_body::text, '') ILIKE '%trusted access for cyber%'
+      OR COALESCE(response_body::text, '') ILIKE '%chatgpt.com/cyber%'
+      OR EXISTS (
+        SELECT 1
+        FROM usage_body_blobs
+        WHERE usage_body_blobs.request_id = usage.request_id
+          AND usage_body_blobs.body_field IN ('client_response_body', 'response_body')
+      )
+    )
+  )
   AND (
     request_body_compressed IS NOT NULL
     OR response_body_compressed IS NOT NULL
@@ -219,6 +345,27 @@ SELECT
 FROM usage
 WHERE created_at < $1
   AND ($2::timestamptz IS NULL OR created_at >= $2)
+  AND NOT (
+    status_code = 400
+    AND COALESCE(error_category, '') IN ('client_error', 'client_response', 'http_error', 'bad_request')
+    AND (
+      COALESCE(error_message, '') ILIKE '%possible cybersecurity risk%'
+      OR COALESCE(error_message, '') ILIKE '%trusted access for cyber%'
+      OR COALESCE(error_message, '') ILIKE '%chatgpt.com/cyber%'
+      OR COALESCE(client_response_body::text, '') ILIKE '%possible cybersecurity risk%'
+      OR COALESCE(client_response_body::text, '') ILIKE '%trusted access for cyber%'
+      OR COALESCE(client_response_body::text, '') ILIKE '%chatgpt.com/cyber%'
+      OR COALESCE(response_body::text, '') ILIKE '%possible cybersecurity risk%'
+      OR COALESCE(response_body::text, '') ILIKE '%trusted access for cyber%'
+      OR COALESCE(response_body::text, '') ILIKE '%chatgpt.com/cyber%'
+      OR EXISTS (
+        SELECT 1
+        FROM usage_body_blobs
+        WHERE usage_body_blobs.request_id = usage.request_id
+          AND usage_body_blobs.body_field IN ('client_response_body', 'response_body')
+      )
+    )
+  )
   AND (
     request_body IS NOT NULL
     OR request_body_compressed IS NOT NULL
@@ -638,12 +785,38 @@ pub async fn preview_usage_cleanup_impl(
         0
     };
     let log = if targets.records {
-        let log: i64 =
-            sqlx::query_scalar("SELECT COUNT(*)::bigint FROM usage WHERE created_at < $1")
-                .bind(window.log_cutoff)
-                .fetch_one(pool)
-                .await
-                .map_err(postgres_error)?;
+        let log: i64 = sqlx::query_scalar(
+            r#"
+SELECT COUNT(*)::bigint
+FROM usage
+WHERE created_at < $1
+  AND NOT (
+    status_code = 400
+    AND COALESCE(error_category, '') IN ('client_error', 'client_response', 'http_error', 'bad_request')
+    AND (
+      COALESCE(error_message, '') ILIKE '%possible cybersecurity risk%'
+      OR COALESCE(error_message, '') ILIKE '%trusted access for cyber%'
+      OR COALESCE(error_message, '') ILIKE '%chatgpt.com/cyber%'
+      OR COALESCE(client_response_body::text, '') ILIKE '%possible cybersecurity risk%'
+      OR COALESCE(client_response_body::text, '') ILIKE '%trusted access for cyber%'
+      OR COALESCE(client_response_body::text, '') ILIKE '%chatgpt.com/cyber%'
+      OR COALESCE(response_body::text, '') ILIKE '%possible cybersecurity risk%'
+      OR COALESCE(response_body::text, '') ILIKE '%trusted access for cyber%'
+      OR COALESCE(response_body::text, '') ILIKE '%chatgpt.com/cyber%'
+      OR EXISTS (
+        SELECT 1
+        FROM usage_body_blobs
+        WHERE usage_body_blobs.request_id = usage.request_id
+          AND usage_body_blobs.body_field IN ('client_response_body', 'response_body')
+      )
+    )
+  )
+"#,
+        )
+        .bind(window.log_cutoff)
+        .fetch_one(pool)
+        .await
+        .map_err(postgres_error)?;
         u64::try_from(log).unwrap_or(0)
     } else {
         0
@@ -790,6 +963,27 @@ async fn count_usage_raw_body_candidates(
 SELECT COUNT(*)::bigint
 FROM usage
 WHERE created_at < $1
+  AND NOT (
+    status_code = 400
+    AND COALESCE(error_category, '') IN ('client_error', 'client_response', 'http_error', 'bad_request')
+    AND (
+      COALESCE(error_message, '') ILIKE '%possible cybersecurity risk%'
+      OR COALESCE(error_message, '') ILIKE '%trusted access for cyber%'
+      OR COALESCE(error_message, '') ILIKE '%chatgpt.com/cyber%'
+      OR COALESCE(client_response_body::text, '') ILIKE '%possible cybersecurity risk%'
+      OR COALESCE(client_response_body::text, '') ILIKE '%trusted access for cyber%'
+      OR COALESCE(client_response_body::text, '') ILIKE '%chatgpt.com/cyber%'
+      OR COALESCE(response_body::text, '') ILIKE '%possible cybersecurity risk%'
+      OR COALESCE(response_body::text, '') ILIKE '%trusted access for cyber%'
+      OR COALESCE(response_body::text, '') ILIKE '%chatgpt.com/cyber%'
+      OR EXISTS (
+        SELECT 1
+        FROM usage_body_blobs
+        WHERE usage_body_blobs.request_id = usage.request_id
+          AND usage_body_blobs.body_field IN ('client_response_body', 'response_body')
+      )
+    )
+  )
   AND (
     request_body IS NOT NULL
     OR response_body IS NOT NULL
@@ -814,6 +1008,27 @@ async fn count_usage_compressed_body_candidates(
 SELECT COUNT(*)::bigint
 FROM usage
 WHERE created_at < $1
+  AND NOT (
+    status_code = 400
+    AND COALESCE(error_category, '') IN ('client_error', 'client_response', 'http_error', 'bad_request')
+    AND (
+      COALESCE(error_message, '') ILIKE '%possible cybersecurity risk%'
+      OR COALESCE(error_message, '') ILIKE '%trusted access for cyber%'
+      OR COALESCE(error_message, '') ILIKE '%chatgpt.com/cyber%'
+      OR COALESCE(client_response_body::text, '') ILIKE '%possible cybersecurity risk%'
+      OR COALESCE(client_response_body::text, '') ILIKE '%trusted access for cyber%'
+      OR COALESCE(client_response_body::text, '') ILIKE '%chatgpt.com/cyber%'
+      OR COALESCE(response_body::text, '') ILIKE '%possible cybersecurity risk%'
+      OR COALESCE(response_body::text, '') ILIKE '%trusted access for cyber%'
+      OR COALESCE(response_body::text, '') ILIKE '%chatgpt.com/cyber%'
+      OR EXISTS (
+        SELECT 1
+        FROM usage_body_blobs
+        WHERE usage_body_blobs.request_id = usage.request_id
+          AND usage_body_blobs.body_field IN ('client_response_body', 'response_body')
+      )
+    )
+  )
   AND (
     request_body_compressed IS NOT NULL
     OR response_body_compressed IS NOT NULL
@@ -859,6 +1074,27 @@ SELECT COUNT(*)::bigint
 FROM usage
 WHERE created_at < $1
   AND ($2::timestamptz IS NULL OR created_at >= $2)
+  AND NOT (
+    status_code = 400
+    AND COALESCE(error_category, '') IN ('client_error', 'client_response', 'http_error', 'bad_request')
+    AND (
+      COALESCE(error_message, '') ILIKE '%possible cybersecurity risk%'
+      OR COALESCE(error_message, '') ILIKE '%trusted access for cyber%'
+      OR COALESCE(error_message, '') ILIKE '%chatgpt.com/cyber%'
+      OR COALESCE(client_response_body::text, '') ILIKE '%possible cybersecurity risk%'
+      OR COALESCE(client_response_body::text, '') ILIKE '%trusted access for cyber%'
+      OR COALESCE(client_response_body::text, '') ILIKE '%chatgpt.com/cyber%'
+      OR COALESCE(response_body::text, '') ILIKE '%possible cybersecurity risk%'
+      OR COALESCE(response_body::text, '') ILIKE '%trusted access for cyber%'
+      OR COALESCE(response_body::text, '') ILIKE '%chatgpt.com/cyber%'
+      OR EXISTS (
+        SELECT 1
+        FROM usage_body_blobs
+        WHERE usage_body_blobs.request_id = usage.request_id
+          AND usage_body_blobs.body_field IN ('client_response_body', 'response_body')
+      )
+    )
+  )
   AND (
     request_body IS NOT NULL
     OR request_body_compressed IS NOT NULL
@@ -902,6 +1138,27 @@ SELECT COUNT(*)::bigint
 FROM usage
 WHERE created_at < $1
   AND ($2::timestamptz IS NULL OR created_at >= $2)
+  AND NOT (
+    status_code = 400
+    AND COALESCE(error_category, '') IN ('client_error', 'client_response', 'http_error', 'bad_request')
+    AND (
+      COALESCE(error_message, '') ILIKE '%possible cybersecurity risk%'
+      OR COALESCE(error_message, '') ILIKE '%trusted access for cyber%'
+      OR COALESCE(error_message, '') ILIKE '%chatgpt.com/cyber%'
+      OR COALESCE(client_response_body::text, '') ILIKE '%possible cybersecurity risk%'
+      OR COALESCE(client_response_body::text, '') ILIKE '%trusted access for cyber%'
+      OR COALESCE(client_response_body::text, '') ILIKE '%chatgpt.com/cyber%'
+      OR COALESCE(response_body::text, '') ILIKE '%possible cybersecurity risk%'
+      OR COALESCE(response_body::text, '') ILIKE '%trusted access for cyber%'
+      OR COALESCE(response_body::text, '') ILIKE '%chatgpt.com/cyber%'
+      OR EXISTS (
+        SELECT 1
+        FROM usage_body_blobs
+        WHERE usage_body_blobs.request_id = usage.request_id
+          AND usage_body_blobs.body_field IN ('client_response_body', 'response_body')
+      )
+    )
+  )
   AND (
     request_body IS NOT NULL
     OR response_body IS NOT NULL
@@ -952,6 +1209,27 @@ SELECT COUNT(*)::bigint
 FROM usage
 WHERE created_at < $1
   AND ($2::timestamptz IS NULL OR created_at >= $2)
+  AND NOT (
+    status_code = 400
+    AND COALESCE(error_category, '') IN ('client_error', 'client_response', 'http_error', 'bad_request')
+    AND (
+      COALESCE(error_message, '') ILIKE '%possible cybersecurity risk%'
+      OR COALESCE(error_message, '') ILIKE '%trusted access for cyber%'
+      OR COALESCE(error_message, '') ILIKE '%chatgpt.com/cyber%'
+      OR COALESCE(client_response_body::text, '') ILIKE '%possible cybersecurity risk%'
+      OR COALESCE(client_response_body::text, '') ILIKE '%trusted access for cyber%'
+      OR COALESCE(client_response_body::text, '') ILIKE '%chatgpt.com/cyber%'
+      OR COALESCE(response_body::text, '') ILIKE '%possible cybersecurity risk%'
+      OR COALESCE(response_body::text, '') ILIKE '%trusted access for cyber%'
+      OR COALESCE(response_body::text, '') ILIKE '%chatgpt.com/cyber%'
+      OR EXISTS (
+        SELECT 1
+        FROM usage_body_blobs
+        WHERE usage_body_blobs.request_id = usage.request_id
+          AND usage_body_blobs.body_field IN ('client_response_body', 'response_body')
+      )
+    )
+  )
   AND (
     request_headers IS NOT NULL
     OR response_headers IS NOT NULL
@@ -1541,8 +1819,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        build_usage_body_externalization, compress_usage_json_value,
-        migrate_legacy_body_ref_metadata_plan, UsageBodyCompressionRow,
+        UsageBodyCompressionRow, build_usage_body_externalization, compress_usage_json_value,
+        migrate_legacy_body_ref_metadata_plan,
     };
 
     fn inflate_json(bytes: &[u8]) -> serde_json::Value {
