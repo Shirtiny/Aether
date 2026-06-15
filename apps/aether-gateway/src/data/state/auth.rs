@@ -2013,7 +2013,11 @@ fn intersect_group_list_policies(
         }
     }
 
-    if saw_restrictive_group { effective } else { None }
+    if saw_restrictive_group {
+        effective
+    } else {
+        None
+    }
 }
 
 fn list_restriction_from_mode(mode: &str, values: Option<Vec<String>>) -> Option<Vec<String>> {
@@ -2426,14 +2430,7 @@ mod tests {
     #[test]
     fn list_policy_deny_all_wins_when_groups_conflict() {
         let groups = vec![
-            sample_group(
-                "deny",
-                10,
-                Some(vec![]),
-                "deny_all",
-                None,
-                "system",
-            ),
+            sample_group("deny", 10, Some(vec![]), "deny_all", None, "system"),
             sample_group(
                 "restricted",
                 20,
