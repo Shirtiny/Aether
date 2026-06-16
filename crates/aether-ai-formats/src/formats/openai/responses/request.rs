@@ -497,7 +497,7 @@ fn ensure_json_object_response_input_mentions_json(
         0,
         json!({
             "type": "message",
-            "role": "system",
+            "role": "developer",
             "content": [{
                 "type": "input_text",
                 "text": "Respond with JSON.",
@@ -1056,7 +1056,7 @@ mod tests {
     }
 
     #[test]
-    fn json_object_response_injects_json_hint_into_input_when_only_instructions_have_it() {
+    fn json_object_response_injects_json_hint_as_developer_input_when_only_instructions_have_it() {
         let request = CanonicalRequest {
             model: "gpt-5.5".to_string(),
             system: Some("Please answer in JSON.".to_string()),
@@ -1082,7 +1082,7 @@ mod tests {
         assert_eq!(body["instructions"], json!("Please answer in JSON."));
         let input = body["input"].as_array().expect("input");
         assert_eq!(input.len(), 2);
-        assert_eq!(input[0]["role"], json!("system"));
+        assert_eq!(input[0]["role"], json!("developer"));
         assert!(input[0]["content"][0]["text"]
             .as_str()
             .expect("hint text")
