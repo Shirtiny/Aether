@@ -5848,6 +5848,111 @@ mod tests {
     }
 
     #[test]
+    fn openai_image_sync_terminal_usage_captures_request_and_response_bodies() {
+        let plan = ExecutionPlan {
+            request_id: "req-openai-image-sync-body-1".to_string(),
+            candidate_id: Some("cand-openai-image-sync-body-1".to_string()),
+            provider_name: Some("Upstream Aether".to_string()),
+            provider_id: "provider-aether-1".to_string(),
+            endpoint_id: "endpoint-aether-1".to_string(),
+            key_id: "key-aether-1".to_string(),
+            method: "POST".to_string(),
+            url: "https://upstream-aether.example/v1/images/generations".to_string(),
+            headers: BTreeMap::from([("content-type".to_string(), "application/json".to_string())]),
+            content_type: Some("application/json".to_string()),
+            content_encoding: None,
+            body: RequestBody::from_json(json!({
+                "model": "gpt-image-2-upstream",
+                "prompt": "Draw a red kite",
+                "size": "1024x1024",
+                "n": 1,
+                "response_format": "b64_json"
+            })),
+            stream: false,
+            client_api_format: "openai:image".to_string(),
+            provider_api_format: "openai:image".to_string(),
+            model_name: Some("gpt-image-2".to_string()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        };
+        let payload = GatewaySyncReportRequest {
+            trace_id: "trace-openai-image-sync-body-1".to_string(),
+            report_kind: "openai_image_sync_finalize".to_string(),
+            report_context: Some(json!({
+                "client_api_format": "openai:image",
+                "provider_api_format": "openai:image",
+                "needs_conversion": true,
+                "original_request_body": {
+                    "model": "gpt-image-2",
+                    "prompt": "Draw a red kite",
+                    "size": "1024x1024",
+                    "response_format": "b64_json"
+                },
+                "provider_request_body": {
+                    "model": "gpt-image-2-upstream",
+                    "prompt": "Draw a red kite",
+                    "size": "1024x1024",
+                    "n": 1,
+                    "response_format": "b64_json"
+                }
+            })),
+            status_code: 200,
+            headers: BTreeMap::from([("content-type".to_string(), "application/json".to_string())]),
+            body_json: Some(json!({
+                "created": 1776839946,
+                "data": [{
+                    "b64_json": "aGVsbG8=",
+                    "revised_prompt": "red kite"
+                }],
+                "usage": {
+                    "input_tokens": 11,
+                    "output_tokens": 22,
+                    "total_tokens": 33
+                }
+            })),
+            client_body_json: None,
+            body_base64: None,
+            telemetry: None,
+        };
+
+        let event =
+            build_sync_terminal_usage_event(&plan, payload.report_context.as_ref(), &payload)
+                .expect("usage event should build");
+
+        assert_eq!(
+            event.data.request_body,
+            payload
+                .report_context
+                .as_ref()
+                .and_then(|value| value.get("original_request_body"))
+                .cloned()
+        );
+        assert_eq!(
+            event.data.provider_request_body,
+            payload
+                .report_context
+                .as_ref()
+                .and_then(|value| value.get("provider_request_body"))
+                .cloned()
+        );
+        assert_eq!(event.data.response_body, payload.body_json);
+        assert!(event.data.client_response_body.is_none());
+        assert_eq!(
+            event.data.request_body_state,
+            Some(UsageBodyCaptureState::Inline)
+        );
+        assert_eq!(
+            event.data.provider_request_body_state,
+            Some(UsageBodyCaptureState::Inline)
+        );
+        assert_eq!(
+            event.data.response_body_state,
+            Some(UsageBodyCaptureState::Inline)
+        );
+    }
+
+    #[test]
     fn sync_terminal_usage_applies_kiro_simulated_cache_context() {
         let plan = ExecutionPlan {
             request_id: "req-sync-kiro-cache-context-1".to_string(),

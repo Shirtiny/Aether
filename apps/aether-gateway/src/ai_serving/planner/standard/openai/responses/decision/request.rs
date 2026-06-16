@@ -1123,6 +1123,7 @@ async fn resolve_openai_responses_to_openai_image_payload_parts(
             headers: &parts.headers,
             auth_header: &prepared_candidate.auth_header,
             auth_value: &prepared_candidate.auth_value,
+            accept: "text/event-stream",
             header_rules: transport.endpoint.header_rules.as_ref(),
             provider_request_body: &provider_request_body,
             original_request_body: body_json,

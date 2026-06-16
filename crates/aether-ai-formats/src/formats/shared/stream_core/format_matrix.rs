@@ -716,6 +716,107 @@ mod tests {
     }
 
     #[test]
+    fn ignores_openai_responses_keepalive_events_for_chat_clients() {
+        let report_context = report_context("openai:responses", "openai:chat");
+        let mut matrix = StreamingStandardFormatMatrix::default();
+        let mut output = Vec::new();
+
+        let keepalive = matrix
+            .transform_line(
+                &report_context,
+                data_line(json!({
+                    "type": "keepalive",
+                    "sequence_number": 1,
+                })),
+            )
+            .expect("keepalive should be ignored");
+        assert!(keepalive.is_empty());
+
+        for line in [
+            data_line(json!({
+                "type": "response.output_text.delta",
+                "response_id": "resp_keepalive_123",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": "pong",
+            })),
+            data_line(json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_keepalive_123",
+                    "object": "response",
+                    "model": "gpt-5.4",
+                    "status": "completed",
+                    "output": [],
+                },
+            })),
+        ] {
+            output.extend(
+                matrix
+                    .transform_line(&report_context, line)
+                    .expect("keepalive and text should convert"),
+            );
+        }
+
+        let sse = String::from_utf8(output).expect("sse should be utf8");
+        assert!(!sse.contains("Unsupported provider stream event"), "{sse}");
+        assert!(!sse.contains("unsupported_stream_event"), "{sse}");
+        assert!(sse.contains("pong"), "{sse}");
+        assert!(sse.contains("chat.completion.chunk"), "{sse}");
+    }
+
+    #[test]
+    fn ignores_openai_responses_keepalive_events_for_responses_clients() {
+        let mut report_context = report_context("openai:chat", "openai:responses");
+        report_context["provider_stream_event_api_format"] = json!("openai:responses");
+        let mut matrix = StreamingStandardFormatMatrix::default();
+        let mut output = Vec::new();
+
+        let keepalive = matrix
+            .transform_line(
+                &report_context,
+                data_line(json!({
+                    "type": "keepalive",
+                    "sequence_number": 1,
+                })),
+            )
+            .expect("keepalive should be ignored");
+        assert!(keepalive.is_empty());
+
+        for line in [
+            data_line(json!({
+                "type": "response.output_text.delta",
+                "response_id": "resp_keepalive_456",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": "pong",
+            })),
+            data_line(json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_keepalive_456",
+                    "object": "response",
+                    "model": "gpt-5.4",
+                    "status": "completed",
+                    "output": [],
+                },
+            })),
+        ] {
+            output.extend(
+                matrix
+                    .transform_line(&report_context, line)
+                    .expect("keepalive and text should convert"),
+            );
+        }
+
+        let sse = String::from_utf8(output).expect("sse should be utf8");
+        assert!(!sse.contains("Unsupported provider stream event"), "{sse}");
+        assert!(!sse.contains("unsupported_stream_event"), "{sse}");
+        assert!(sse.contains("pong"), "{sse}");
+        assert!(sse.contains("event: response.output_text.delta"), "{sse}");
+    }
+
+    #[test]
     fn transforms_provider_errors_to_claude_error_events() {
         let cases = [
             (

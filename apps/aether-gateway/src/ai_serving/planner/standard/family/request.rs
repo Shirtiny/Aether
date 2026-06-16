@@ -1230,6 +1230,7 @@ async fn resolve_local_gemini_image_to_openai_image_candidate_payload_parts(
             headers: effective_headers,
             auth_header: &prepared_candidate.auth_header,
             auth_value: &prepared_candidate.auth_value,
+            accept: "text/event-stream",
             header_rules: transport.endpoint.header_rules.as_ref(),
             provider_request_body: &converted.body_json,
             original_request_body: body_json,
