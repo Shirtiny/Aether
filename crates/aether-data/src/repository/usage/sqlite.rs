@@ -480,6 +480,10 @@ OR COALESCE(status_code, 0) >= 400 \
 OR (error_message IS NOT NULL AND TRIM(error_message) <> ''))",
         );
     }
+    if query.risk_control_only {
+        push_sqlite_usage_where(builder, has_where);
+        builder.push("json_extract(request_metadata, '$.is_risk_control') = 1");
+    }
 }
 
 fn push_sqlite_usage_keyword_filters(
@@ -499,6 +503,7 @@ fn push_sqlite_usage_keyword_filters(
             statuses: query.statuses.clone(),
             is_stream: query.is_stream,
             error_only: query.error_only,
+            risk_control_only: query.risk_control_only,
             limit: None,
             offset: None,
             newest_first: query.newest_first,

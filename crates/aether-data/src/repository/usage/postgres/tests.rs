@@ -736,6 +736,8 @@ fn usage_sql_uses_json_null_placeholders_for_usage_payload_columns() {
         assert!(sql.contains("request_metadata->>'cafecode_uid'"));
         assert!(sql.contains("'cafecode_uname'"));
         assert!(sql.contains("request_metadata->>'cafecode_uname'"));
+        assert!(sql.contains("'is_risk_control'"));
+        assert!(sql.contains("request_metadata->>'is_risk_control'"));
         assert!(sql.contains("AS client_family"));
         assert!(sql.contains("request_metadata->'client_session_affinity'->>'client_family'"));
         assert!(sql.contains("request_metadata->>'client_family'"));
@@ -750,6 +752,12 @@ fn usage_sql_uses_json_null_placeholders_for_usage_payload_columns() {
     }
     assert!(!super::LIST_USAGE_AUDITS_PREFIX.contains("NULL::jsonb"));
     assert!(!super::LIST_RECENT_USAGE_AUDITS_PREFIX.contains("NULL::jsonb"));
+}
+
+#[test]
+fn usage_sql_filters_risk_control_flag_in_database() {
+    let source = include_str!("mod.rs");
+    assert!(source.contains(r#"("usage".request_metadata->>'is_risk_control') = 'true'"#));
 }
 
 #[test]

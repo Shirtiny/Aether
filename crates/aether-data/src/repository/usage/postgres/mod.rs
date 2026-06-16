@@ -1234,6 +1234,15 @@ fn push_usage_provider_performance_filters(
     }
 }
 
+fn push_postgres_usage_risk_control_filter(
+    builder: &mut QueryBuilder<'_, Postgres>,
+    has_where: &mut bool,
+) {
+    builder.push(if *has_where { " AND " } else { " WHERE " });
+    *has_where = true;
+    builder.push(r#"("usage".request_metadata->>'is_risk_control') = 'true'"#);
+}
+
 fn decode_usage_time_series_bucket_row(
     row: &PgRow,
 ) -> Result<StoredUsageTimeSeriesBucket, DataLayerError> {
@@ -2581,6 +2590,7 @@ ORDER BY request_count DESC, "usage".provider_name ASC
         }
         if let Some(user_id) = query.user_id.as_deref() {
             builder.push(if has_where { " AND " } else { " WHERE " });
+            has_where = true;
             builder
                 .push("\"usage\".user_id = ")
                 .push_bind(user_id.to_string());
@@ -2625,11 +2635,15 @@ ORDER BY request_count DESC, "usage".provider_name ASC
         }
         if query.error_only {
             builder.push(if has_where { " AND " } else { " WHERE " });
+            has_where = true;
             builder.push(
                 "(\"usage\".status = 'failed' \
 OR COALESCE(\"usage\".status_code, 0) >= 400 \
 OR (\"usage\".error_message IS NOT NULL AND BTRIM(\"usage\".error_message) <> ''))",
             );
+        }
+        if query.risk_control_only {
+            push_postgres_usage_risk_control_filter(&mut builder, &mut has_where);
         }
 
         if query.newest_first {
@@ -2727,6 +2741,9 @@ OR (\"usage\".error_message IS NOT NULL AND BTRIM(\"usage\".error_message) <> ''
 OR COALESCE(\"usage\".status_code, 0) >= 400 \
 OR (\"usage\".error_message IS NOT NULL AND BTRIM(\"usage\".error_message) <> ''))",
             );
+        }
+        if query.risk_control_only {
+            push_postgres_usage_risk_control_filter(&mut builder, &mut has_where);
         }
         for (index, keyword) in query.keywords.iter().enumerate() {
             let keyword = keyword.trim();
@@ -2899,11 +2916,15 @@ OR (\"usage\".error_message IS NOT NULL AND BTRIM(\"usage\".error_message) <> ''
         }
         if query.error_only {
             builder.push(if has_where { " AND " } else { " WHERE " });
+            has_where = true;
             builder.push(
                 "(\"usage\".status = 'failed' \
 OR COALESCE(\"usage\".status_code, 0) >= 400 \
 OR (\"usage\".error_message IS NOT NULL AND BTRIM(\"usage\".error_message) <> ''))",
             );
+        }
+        if query.risk_control_only {
+            push_postgres_usage_risk_control_filter(&mut builder, &mut has_where);
         }
 
         let row = builder
@@ -2991,6 +3012,9 @@ OR (\"usage\".error_message IS NOT NULL AND BTRIM(\"usage\".error_message) <> ''
 OR COALESCE(\"usage\".status_code, 0) >= 400 \
 OR (\"usage\".error_message IS NOT NULL AND BTRIM(\"usage\".error_message) <> ''))",
             );
+        }
+        if query.risk_control_only {
+            push_postgres_usage_risk_control_filter(&mut builder, &mut has_where);
         }
         for (index, keyword) in query.keywords.iter().enumerate() {
             let keyword = keyword.trim();

@@ -280,6 +280,16 @@ fn usage_matches_list_query(item: &StoredRequestUsageAudit, query: &UsageAuditLi
     {
         return false;
     }
+    if query.risk_control_only
+        && !item
+            .request_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("is_risk_control"))
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+    {
+        return false;
+    }
 
     true
 }
@@ -337,6 +347,16 @@ fn usage_matches_keyword_search_query(
             .map(str::trim)
             .unwrap_or_default()
             .is_empty()
+    {
+        return false;
+    }
+    if query.risk_control_only
+        && !item
+            .request_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("is_risk_control"))
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
     {
         return false;
     }

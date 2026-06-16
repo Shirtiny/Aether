@@ -116,6 +116,7 @@ SELECT
       OR NULLIF(BTRIM("usage".request_metadata->>'cafecode_uname'), '') IS NOT NULL
       OR NULLIF(BTRIM("usage".request_metadata->>'request_path'), '') IS NOT NULL
       OR NULLIF(BTRIM("usage".request_metadata->>'request_path_and_query'), '') IS NOT NULL
+      OR ("usage".request_metadata->>'is_risk_control') IN ('true', 'false')
       OR CASE
         WHEN jsonb_typeof("usage".provider_request_body::jsonb) = 'object' THEN COALESCE(
           NULLIF(BTRIM("usage".provider_request_body->>'reasoning_effort'), ''),
@@ -143,6 +144,12 @@ SELECT
         NULLIF(BTRIM("usage".request_metadata->>'request_path'), ''),
         'request_path_and_query',
         NULLIF(BTRIM("usage".request_metadata->>'request_path_and_query'), ''),
+        'is_risk_control',
+        CASE
+          WHEN ("usage".request_metadata->>'is_risk_control') IN ('true', 'false')
+            THEN ("usage".request_metadata->>'is_risk_control')::boolean
+          ELSE NULL
+        END,
         'provider_reasoning_effort',
         CASE
           WHEN jsonb_typeof("usage".provider_request_body::jsonb) = 'object' THEN COALESCE(

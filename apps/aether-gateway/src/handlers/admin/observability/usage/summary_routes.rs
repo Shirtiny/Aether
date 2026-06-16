@@ -1,7 +1,6 @@
 use super::super::stats::resolve_admin_usage_time_range;
 use super::analytics::admin_usage_api_key_names;
 use super::analytics::admin_usage_provider_key_names;
-use super::replay::admin_usage_resolve_body_value;
 use crate::GatewayError;
 use crate::handlers::admin::request::{AdminAppState, AdminRequestContext};
 use crate::handlers::admin::shared::query_param_value;
@@ -19,7 +18,7 @@ use aether_data_contracts::repository::{
     candidates::{RequestCandidateStatus, StoredRequestCandidate},
     usage::{
         StoredRequestUsageAudit, UsageAuditKeywordSearchQuery, UsageAuditListQuery,
-        UsageAuditSummaryQuery, UsageBodyField,
+        UsageAuditSummaryQuery,
     },
 };
 use axum::{
@@ -61,6 +60,7 @@ fn apply_admin_usage_status_filter(query: &mut UsageAuditListQuery, status: Opti
     match status {
         "stream" => query.is_stream = Some(true),
         "standard" => query.is_stream = Some(false),
+        "risk_control" => query.risk_control_only = true,
         "error" | "failed" => query.error_only = true,
         "active" => {
             query.statuses = Some(vec!["pending".to_string(), "streaming".to_string()]);
@@ -83,7 +83,6 @@ fn admin_usage_attempt_status_filter(status: Option<&str>) -> Option<&'static st
     match status?.trim().to_ascii_lowercase().as_str() {
         "has_fallback" => Some("has_fallback"),
         "has_retry" => Some("has_retry"),
-        "risk_control" => Some("risk_control"),
         _ => None,
     }
 }
@@ -265,75 +264,6 @@ fn admin_usage_matches_attempt_status(
         "risk_control" => admin_usage_is_risk_control(item),
         _ => true,
     }
-}
-
-async fn admin_usage_with_risk_control_bodies(
-    state: &AdminAppState<'_>,
-    item: &StoredRequestUsageAudit,
-) -> Result<StoredRequestUsageAudit, GatewayError> {
-    if admin_usage_is_risk_control(item) {
-        return Ok(item.clone());
-    }
-
-    let (response_body, client_response_body) = tokio::try_join!(
-        admin_usage_resolve_body_value(
-            state,
-            item,
-            item.response_body.as_ref(),
-            UsageBodyField::ResponseBody,
-        ),
-        admin_usage_resolve_body_value(
-            state,
-            item,
-            item.client_response_body.as_ref(),
-            UsageBodyField::ClientResponseBody,
-        ),
-    )?;
-    let mut item = item.clone();
-    item.response_body = response_body;
-    item.client_response_body = client_response_body;
-    Ok(item)
-}
-
-async fn hydrate_admin_usage_items_for_risk_control(
-    state: &AdminAppState<'_>,
-    items: Vec<StoredRequestUsageAudit>,
-) -> Result<Vec<StoredRequestUsageAudit>, GatewayError> {
-    if items.is_empty() {
-        return Ok(items);
-    }
-
-    let usage_ids = items.iter().map(|item| item.id.clone()).collect::<Vec<_>>();
-    let full_items_by_id = state
-        .list_request_usage_by_ids(&usage_ids)
-        .await?
-        .into_iter()
-        .map(|item| (item.id.clone(), item))
-        .collect::<BTreeMap<_, _>>();
-
-    Ok(items
-        .into_iter()
-        .map(|item| full_items_by_id.get(&item.id).cloned().unwrap_or(item))
-        .collect())
-}
-
-async fn admin_usage_matches_attempt_status_resolved(
-    state: &AdminAppState<'_>,
-    item: &StoredRequestUsageAudit,
-    status: &str,
-    flags_by_usage_id: &BTreeMap<String, AdminUsageAttemptFlags>,
-    request_candidate_reader_available: bool,
-) -> Result<bool, GatewayError> {
-    if status == "risk_control" {
-        let item = admin_usage_with_risk_control_bodies(state, item).await?;
-        return Ok(admin_usage_is_risk_control(&item));
-    }
-    Ok(admin_usage_matches_attempt_status(
-        item,
-        status,
-        flags_by_usage_id,
-        request_candidate_reader_available,
-    ))
 }
 
 fn admin_usage_matches_client_family(
@@ -560,6 +490,7 @@ fn build_admin_usage_keyword_search_query(
         statuses: base_query.statuses.clone(),
         is_stream: base_query.is_stream,
         error_only: base_query.error_only,
+        risk_control_only: base_query.risk_control_only,
         keywords,
         matched_user_ids_by_keyword: search_context.matched_user_ids_by_keyword,
         auth_user_reader_available,
@@ -788,19 +719,14 @@ pub(super) async fn maybe_build_local_admin_usage_summary_response(
                             || !admin_usage_has_unknown_model_or_provider(item))
                 });
                 if let Some(attempt_status) = attempt_status_filter {
-                    if attempt_status == "risk_control" {
-                        usage = hydrate_admin_usage_items_for_risk_control(state, usage).await?;
-                    }
                     let mut resolved_usage = Vec::with_capacity(usage.len());
                     for item in usage {
-                        if admin_usage_matches_attempt_status_resolved(
-                            state,
+                        if admin_usage_matches_attempt_status(
                             &item,
                             attempt_status,
                             &attempt_flags_by_usage_id,
                             request_candidate_reader_available,
                         )
-                        .await?
                         {
                             resolved_usage.push(item);
                         }

@@ -931,6 +931,7 @@ pub(super) async fn handle_users_me_usage_get(
                 statuses: None,
                 is_stream: None,
                 error_only: false,
+                risk_control_only: false,
                 keywords,
                 matched_user_ids_by_keyword: Vec::new(),
                 auth_user_reader_available: false,
@@ -981,13 +982,14 @@ pub(super) async fn handle_users_me_usage_get(
                     provider_name: None,
                     model: None,
                     api_format: None,
-                    statuses: None,
-                    is_stream: None,
-                    error_only: false,
-                    limit: None,
-                    offset: None,
-                    newest_first: true,
-                })
+                statuses: None,
+                is_stream: None,
+                error_only: false,
+                risk_control_only: false,
+                limit: None,
+                offset: None,
+                newest_first: true,
+            })
                 .await
             {
                 Ok(value) => usize::try_from(value).unwrap_or(usize::MAX),
@@ -1010,6 +1012,7 @@ pub(super) async fn handle_users_me_usage_get(
                     statuses: None,
                     is_stream: None,
                     error_only: false,
+                    risk_control_only: false,
                     limit: Some(limit),
                     offset: Some(offset),
                     newest_first: true,
@@ -1146,6 +1149,7 @@ pub(super) async fn handle_users_me_usage_active_get(
                 statuses: Some(vec!["pending".to_string(), "streaming".to_string()]),
                 is_stream: None,
                 error_only: false,
+                risk_control_only: false,
                 limit: Some(50),
                 offset: None,
                 newest_first: true,
@@ -1489,12 +1493,9 @@ mod tests {
     #[test]
     fn user_usage_payloads_include_backend_risk_control_flag() {
         let item = StoredRequestUsageAudit {
-            status_code: Some(400),
-            error_message: Some(
-                "This content was flagged for possible cybersecurity risk. Join the Trusted Access for Cyber program: https://chatgpt.com/cyber"
-                    .to_string(),
-            ),
-            error_category: Some("client_error".to_string()),
+            request_metadata: Some(json!({
+                "is_risk_control": true
+            })),
             ..sample_usage("failed")
         };
 

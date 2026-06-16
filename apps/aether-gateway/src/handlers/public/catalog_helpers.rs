@@ -595,6 +595,7 @@ pub(crate) async fn build_model_health_monitor_payload(
                 created_from_unix_secs: Some(since_unix_secs),
                 created_until_unix_secs: Some(now_unix_secs),
                 model: Some(row.group_key.clone()),
+                risk_control_only: false,
                 limit: Some(per_model_limit),
                 newest_first: true,
                 ..UsageAuditListQuery::default()
@@ -768,6 +769,7 @@ async fn build_provider_health_payload(
             created_from_unix_secs: Some(since_unix_secs),
             created_until_unix_secs: Some(now_unix_secs),
             provider_name: Some(provider.name.clone()),
+            risk_control_only: false,
             limit: Some(provider_event_limit),
             newest_first: true,
             ..UsageAuditListQuery::default()

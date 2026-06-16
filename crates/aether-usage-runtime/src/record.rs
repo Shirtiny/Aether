@@ -5,6 +5,7 @@ use crate::request_metadata::{
     attach_provider_request_body_metadata, sanitize_usage_request_metadata,
 };
 use crate::{UsageEvent, UsageEventType};
+use serde_json::Value;
 
 fn metadata_string(metadata: Option<&serde_json::Value>, key: &str) -> Option<String> {
     metadata
@@ -27,6 +28,77 @@ fn metadata_u64(metadata: Option<&serde_json::Value>, key: &str) -> Option<u64> 
         })
 }
 
+fn usage_json_text_matches_risk_control(value: &Value) -> bool {
+    let text = match value {
+        Value::String(text) => text.to_ascii_lowercase(),
+        _ => value.to_string().to_ascii_lowercase(),
+    };
+    text.contains("flagged for possible cybersecurity risk")
+        || text.contains("possible cybersecurity risk")
+        || text.contains("trusted access for cyber")
+        || text.contains("chatgpt.com/cyber")
+}
+
+fn usage_text_matches_risk_control(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        let normalized = value.to_ascii_lowercase();
+        normalized.contains("possible cybersecurity risk")
+            || normalized.contains("trusted access for cyber")
+            || normalized.contains("chatgpt.com/cyber")
+    })
+}
+
+fn usage_error_category_allows_risk_control(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "client_error"
+                | "client_response"
+                | "http_error"
+                | "bad_request"
+                | "stream_terminal_error"
+        )
+    })
+}
+
+fn usage_event_matches_risk_control(data: &crate::UsageEventData) -> bool {
+    data.request_metadata
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|metadata| metadata.get("is_risk_control"))
+        .and_then(Value::as_bool)
+        == Some(true)
+        || (data.status_code == Some(400)
+            && usage_error_category_allows_risk_control(data.error_category.as_deref())
+            && usage_text_matches_risk_control(data.error_message.as_deref()))
+        || (usage_error_category_allows_risk_control(data.error_category.as_deref())
+            && usage_text_matches_risk_control(data.error_message.as_deref()))
+        || data
+            .client_response_body
+            .as_ref()
+            .is_some_and(usage_json_text_matches_risk_control)
+        || data
+            .response_body
+            .as_ref()
+            .is_some_and(usage_json_text_matches_risk_control)
+}
+
+fn attach_risk_control_metadata(
+    metadata: Option<Value>,
+    is_risk_control: bool,
+) -> Option<Value> {
+    if !is_risk_control {
+        return metadata;
+    }
+
+    let mut object = match metadata {
+        Some(Value::Object(object)) => object,
+        _ => serde_json::Map::new(),
+    };
+    object.insert("is_risk_control".to_string(), Value::Bool(true));
+    (!object.is_empty()).then_some(Value::Object(object))
+}
+
 pub fn build_upsert_usage_record_from_event(
     event: &UsageEvent,
 ) -> Result<UpsertUsageRecord, DataLayerError> {
@@ -36,6 +108,8 @@ pub fn build_upsert_usage_record_from_event(
         data.request_metadata,
         data.provider_request_body.as_ref(),
     );
+    let is_risk_control = usage_event_matches_risk_control(&data);
+    data.request_metadata = attach_risk_control_metadata(data.request_metadata, is_risk_control);
     let now_unix_secs = event.timestamp_ms / 1_000;
 
     Ok(UpsertUsageRecord {
@@ -237,6 +311,36 @@ mod tests {
         assert_eq!(record.status_code, Some(499));
         assert_eq!(record.response_time_ms, Some(200));
         assert_eq!(record.first_byte_time_ms, Some(50));
+    }
+
+    #[test]
+    fn failed_record_marks_risk_control_in_request_metadata() {
+        let record = build_upsert_usage_record_from_event(&UsageEvent {
+            event_type: UsageEventType::Failed,
+            request_id: "req-risk-control".to_string(),
+            timestamp_ms: 1_700_000_000_000,
+            data: UsageEventData {
+                provider_name: "OpenAI".to_string(),
+                model: "gpt-5".to_string(),
+                status_code: Some(400),
+                error_category: Some("client_error".to_string()),
+                error_message: Some(
+                    "This content was flagged for possible cybersecurity risk. If this seems wrong, try rephrasing your request."
+                        .to_string(),
+                ),
+                ..UsageEventData::default()
+            },
+        })
+        .expect("record should build");
+
+        assert_eq!(
+            record
+                .request_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("is_risk_control"))
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
     }
 
     #[test]

@@ -250,41 +250,14 @@ pub fn admin_usage_is_failed(item: &StoredRequestUsageAudit) -> bool {
     has_failure_signal
 }
 
-fn admin_usage_json_text_matches_risk_control(value: &Value) -> bool {
-    let text = match value {
-        Value::String(text) => text.to_ascii_lowercase(),
-        _ => value.to_string().to_ascii_lowercase(),
-    };
-    text.contains("flagged for possible cybersecurity risk")
-        || text.contains("possible cybersecurity risk")
-        || text.contains("trusted access for cyber")
-        || text.contains("chatgpt.com/cyber")
-}
-
 pub fn admin_usage_is_risk_control(item: &StoredRequestUsageAudit) -> bool {
-    let category_matches = item.error_category.as_deref().is_some_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "client_error" | "client_response" | "http_error" | "bad_request"
-        )
-    });
-    let status_matches = item.status_code == Some(400);
-    let message_matches = item.error_message.as_deref().is_some_and(|value| {
-        let normalized = value.to_ascii_lowercase();
-        normalized.contains("possible cybersecurity risk")
-            || normalized.contains("trusted access for cyber")
-            || normalized.contains("chatgpt.com/cyber")
-    });
-    let body_matches = item
-        .client_response_body
+    item
+        .request_metadata
         .as_ref()
-        .is_some_and(admin_usage_json_text_matches_risk_control)
-        || item
-            .response_body
-            .as_ref()
-            .is_some_and(admin_usage_json_text_matches_risk_control);
-
-    body_matches || (status_matches && category_matches && message_matches)
+        .and_then(Value::as_object)
+        .and_then(|metadata| metadata.get("is_risk_control"))
+        .and_then(Value::as_bool)
+        == Some(true)
 }
 
 pub fn admin_usage_has_fallback(item: &StoredRequestUsageAudit) -> bool {
@@ -2625,33 +2598,16 @@ mod tests {
     }
 
     #[test]
-    fn risk_control_status_matches_cyber_safety_client_response() {
-        let risk_item = StoredRequestUsageAudit {
-            error_category: Some("client_error".to_string()),
-            client_response_body: Some(json!({
-                "detail": "This content was flagged for possible cybersecurity risk. If this seems wrong, try rephrasing your request. To get authorized for security work, join the Trusted Access for Cyber program: https://chatgpt.com/cyber"
+    fn risk_control_status_matches_request_metadata_flag() {
+        let item = StoredRequestUsageAudit {
+            request_metadata: Some(json!({
+                "is_risk_control": true
             })),
-            ..sample_usage("failed", Some(400), None)
-        };
-        let normal_item = StoredRequestUsageAudit {
-            error_category: Some("client_error".to_string()),
-            error_message: Some("missing required field".to_string()),
-            ..sample_usage("failed", Some(400), None)
+            ..sample_usage("completed", Some(200), None)
         };
 
-        assert!(admin_usage_is_risk_control(&risk_item));
-        assert!(admin_usage_matches_status(&risk_item, Some("risk_control")));
-        assert!(!admin_usage_is_risk_control(&normal_item));
-
-        let record = admin_usage_record_json(
-            &risk_item,
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-            false,
-            false,
-            None,
-        );
-        assert_eq!(record["is_risk_control"], true);
+        assert!(admin_usage_is_risk_control(&item));
+        assert!(admin_usage_matches_status(&item, Some("risk_control")));
     }
 
     #[test]
