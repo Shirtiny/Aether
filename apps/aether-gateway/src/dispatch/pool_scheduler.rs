@@ -1123,14 +1123,17 @@ async fn read_pool_catalog_key_contexts_by_id(
 ) -> BTreeMap<String, PoolCatalogKeyContext> {
     let mut key_ids = Vec::new();
     let mut provider_type_by_key_id = BTreeMap::<String, String>::new();
+    let mut codex_quota_basis_by_key_id = BTreeMap::<String, String>::new();
 
     for candidate in candidates {
-        if pool_config_for_candidate(candidate).is_none() {
+        let Some(pool_config) = pool_config_for_candidate(candidate) else {
             continue;
-        }
+        };
         let key_id = candidate.candidate.key_id.clone();
         if let Entry::Vacant(entry) = provider_type_by_key_id.entry(key_id.clone()) {
             entry.insert(candidate.transport.provider.provider_type.clone());
+            codex_quota_basis_by_key_id
+                .insert(key_id.clone(), pool_config.codex_quota_exhaustion_basis.clone());
             key_ids.push(key_id);
         }
     }
@@ -1165,7 +1168,15 @@ async fn read_pool_catalog_key_contexts_by_id(
                 .unwrap_or_default();
             (
                 key.id.clone(),
-                build_pool_catalog_key_context(state, &provider_pool_service, &key, provider_type),
+                build_pool_catalog_key_context(
+                    state,
+                    &provider_pool_service,
+                    &key,
+                    provider_type,
+                    codex_quota_basis_by_key_id
+                        .get(&key.id)
+                        .map(String::as_str),
+                ),
             )
         })
         .collect()
@@ -1176,6 +1187,7 @@ fn build_pool_catalog_key_context(
     provider_pool_service: &ProviderPoolService,
     key: &StoredProviderCatalogKey,
     provider_type: &str,
+    codex_quota_basis: Option<&str>,
 ) -> PoolCatalogKeyContext {
     let (health_score, _, _, _, _) = provider_key_health_summary(key);
     let health_score = key
@@ -1194,8 +1206,12 @@ fn build_pool_catalog_key_context(
         .filter(|value| value.is_finite() && *value >= 0.0);
 
     let auth_config = parse_catalog_auth_config_json(state.app(), key);
-    let mut signals =
-        provider_pool_service.member_signals(provider_type, key, auth_config.as_ref());
+    let mut signals = provider_pool_service.member_signals(
+        provider_type,
+        key,
+        auth_config.as_ref(),
+        codex_quota_basis,
+    );
     signals.account_blocked |= admin_provider_pool_pure::admin_pool_key_is_known_banned(key);
     signals.account_blocked |=
         pool_key_requires_reauth_for_scheduling(key, current_unix_ms().saturating_div(1000));
@@ -1575,6 +1591,7 @@ fn pool_scheduling_config(
             .normalize_scheduling_presets(provider_type, &scheduling_presets),
         lru_enabled: config.lru_enabled,
         skip_exhausted_accounts: config.skip_exhausted_accounts,
+        sticky_session_enabled: config.sticky_session_ttl_seconds > 0,
         cost_limit_per_key_tokens: config.cost_limit_per_key_tokens,
     }
 }
@@ -3709,6 +3726,7 @@ mod tests {
             &ProviderPoolService::with_builtin_adapters(),
             &key,
             "codex",
+            None,
         );
 
         assert_eq!(context.plan_tier.as_deref(), Some("team"));
@@ -3754,6 +3772,7 @@ mod tests {
             &ProviderPoolService::with_builtin_adapters(),
             &key,
             "codex",
+            None,
         );
 
         assert!(!context.quota_exhausted);
@@ -3774,6 +3793,7 @@ mod tests {
             &ProviderPoolService::with_builtin_adapters(),
             &key,
             "codex",
+            None,
         );
 
         assert!(context.quota_exhausted);
@@ -3804,6 +3824,7 @@ mod tests {
             &ProviderPoolService::with_builtin_adapters(),
             &key,
             "antigravity",
+            None,
         );
 
         assert!(context.quota_exhausted);
@@ -3825,6 +3846,7 @@ mod tests {
             &ProviderPoolService::with_builtin_adapters(),
             &key,
             "codex",
+            None,
         );
 
         assert!(context.account_blocked);

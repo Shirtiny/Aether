@@ -5,6 +5,7 @@ import {
   buildPoolHealthToggleCards,
   buildPoolCostFieldLayout,
   buildPoolSecondarySectionLayout,
+  isCodexFiveHourQuotaBasis,
 } from '@/features/pool/utils/poolAdvancedDialog'
 
 describe('poolAdvancedDialog', () => {
@@ -15,6 +16,7 @@ describe('poolAdvancedDialog', () => {
       'account_self_check_enabled',
       'auto_remove_banned_keys',
       'skip_exhausted_accounts',
+      'codex_quota_weekly_basis',
     ])
   })
 
@@ -44,6 +46,11 @@ describe('poolAdvancedDialog', () => {
         key: 'skip_exhausted_accounts',
         label: '跳过额度耗尽账号',
         description: '当 Codex / Kiro 账号额度已耗尽时，直接标记为不可调度并在请求侧跳过。',
+      },
+      {
+        key: 'codex_quota_weekly_basis',
+        label: '周限优先',
+        description: 'Codex 账号按周限判断额度耗尽；关闭后按 5 小时窗口判断。',
       },
     ])
   })
@@ -75,5 +82,13 @@ describe('poolAdvancedDialog', () => {
       ],
       desktopColumnsClass: 'xl:grid-cols-3',
     })
+  })
+
+  it('normalizes legacy codex quota basis values as five hour', () => {
+    expect(isCodexFiveHourQuotaBasis('5h')).toBe(true)
+    expect(isCodexFiveHourQuotaBasis('five_hour')).toBe(true)
+    expect(isCodexFiveHourQuotaBasis('five-hours')).toBe(true)
+    expect(isCodexFiveHourQuotaBasis('weekly')).toBe(false)
+    expect(isCodexFiveHourQuotaBasis(null)).toBe(false)
   })
 })

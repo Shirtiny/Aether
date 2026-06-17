@@ -10,11 +10,20 @@ pub fn provider_pool_key_account_quota_exhausted(
     key: &StoredProviderCatalogKey,
     provider_type: &str,
 ) -> bool {
+    provider_pool_key_account_quota_exhausted_with_basis(key, provider_type, None)
+}
+
+pub fn provider_pool_key_account_quota_exhausted_with_basis(
+    key: &StoredProviderCatalogKey,
+    provider_type: &str,
+    codex_quota_basis: Option<&str>,
+) -> bool {
     let adapter = ProviderPoolService::with_builtin_adapters().adapter(provider_type);
     adapter.quota_exhausted(&ProviderPoolMemberInput {
         provider_type,
         key,
         auth_config: None,
+        codex_quota_basis,
     })
 }
 

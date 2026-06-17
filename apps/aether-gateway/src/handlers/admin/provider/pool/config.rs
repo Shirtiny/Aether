@@ -37,6 +37,30 @@ fn json_f64(value: &Value) -> Option<f64> {
     })
 }
 
+fn parse_codex_quota_exhaustion_basis(pool_advanced: &Map<String, Value>) -> String {
+    if pool_advanced
+        .get("codex_quota_weekly_basis")
+        .and_then(Value::as_bool)
+        == Some(false)
+    {
+        return "five_hour".to_string();
+    }
+
+    match pool_advanced
+        .get("codex_quota_exhaustion_basis")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("5h" | "five_hour" | "five_hours" | "5_hour" | "5_hours") => {
+            "five_hour".to_string()
+        }
+        _ => "weekly".to_string(),
+    }
+}
+
 fn parse_pool_probe_target_percent(pool_advanced: &Map<String, Value>) -> Option<f64> {
     pool_advanced
         .get("probing_target_percent")
@@ -398,6 +422,7 @@ pub(crate) fn admin_provider_pool_config_from_config_value(
             unschedulable_rules: Vec::new(),
             lru_enabled: false,
             skip_exhausted_accounts: false,
+            codex_quota_exhaustion_basis: "weekly".to_string(),
             sticky_session_ttl_seconds: 3600,
             latency_window_seconds: 3600,
             latency_sample_limit: 50,
@@ -434,6 +459,7 @@ pub(crate) fn admin_provider_pool_config_from_config_value(
             .get("skip_exhausted_accounts")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        codex_quota_exhaustion_basis: parse_codex_quota_exhaustion_basis(pool_advanced),
         sticky_session_ttl_seconds: pool_advanced
             .get("sticky_session_ttl_seconds")
             .and_then(json_u64)

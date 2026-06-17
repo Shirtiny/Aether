@@ -369,7 +369,6 @@ pub(crate) async fn record_admin_provider_pool_success(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .filter(|_| pool_config.sticky_session_ttl_seconds > 0)
-        .filter(|_| admin_provider_pool_cache_affinity_enabled(pool_config))
     {
         let _ = runtime
             .kv_set(
@@ -630,6 +629,7 @@ mod tests {
             unschedulable_rules: Vec::new(),
             lru_enabled: true,
             skip_exhausted_accounts: false,
+            codex_quota_exhaustion_basis: "weekly".to_string(),
             sticky_session_ttl_seconds: 120,
             latency_window_seconds: 600,
             latency_sample_limit: 10,

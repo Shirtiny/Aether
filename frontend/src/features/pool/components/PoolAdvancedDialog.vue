@@ -716,6 +716,7 @@ import {
   buildPoolCostFieldLayout,
   buildPoolHealthToggleCards,
   buildPoolSecondarySectionLayout,
+  isCodexFiveHourQuotaBasis,
   type PoolHealthToggleKey,
 } from '@/features/pool/utils/poolAdvancedDialog'
 import type {
@@ -783,6 +784,7 @@ const form = ref({
   account_self_check_concurrency: null as number | null | undefined,
   auto_remove_banned_keys: false,
   skip_exhausted_accounts: false,
+  codex_quota_weekly_basis: true,
 })
 
 interface CodexHeaderProfileFormState {
@@ -864,6 +866,8 @@ function getHealthToggleValue(key: PoolHealthToggleKey): boolean {
       return form.value.auto_remove_banned_keys
     case 'skip_exhausted_accounts':
       return form.value.skip_exhausted_accounts
+    case 'codex_quota_weekly_basis':
+      return form.value.codex_quota_weekly_basis
   }
 }
 
@@ -883,6 +887,9 @@ function updateHealthToggleValue(key: PoolHealthToggleKey, value: boolean): void
       return
     case 'skip_exhausted_accounts':
       form.value.skip_exhausted_accounts = value
+      return
+    case 'codex_quota_weekly_basis':
+      form.value.codex_quota_weekly_basis = value
   }
 }
 
@@ -922,6 +929,7 @@ watch(() => props.modelValue, (open) => {
     account_self_check_concurrency: cfg?.account_self_check_concurrency ?? null,
     auto_remove_banned_keys: cfg?.auto_remove_banned_keys ?? false,
     skip_exhausted_accounts: cfg?.skip_exhausted_accounts ?? false,
+    codex_quota_weekly_basis: cfg?.codex_quota_weekly_basis ?? !isCodexFiveHourQuotaBasis(cfg?.codex_quota_exhaustion_basis),
   }
 
   const codexClientHeaders = cfg?.codex_client_headers
@@ -1004,6 +1012,8 @@ async function handleSave() {
         : undefined,
       auto_remove_banned_keys: form.value.auto_remove_banned_keys,
       skip_exhausted_accounts: form.value.skip_exhausted_accounts,
+      codex_quota_weekly_basis: form.value.codex_quota_weekly_basis,
+      codex_quota_exhaustion_basis: form.value.codex_quota_weekly_basis ? 'weekly' : 'five_hour',
     }
 
     if (isCodex.value) {

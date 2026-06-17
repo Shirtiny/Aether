@@ -99,6 +99,18 @@ pub fn admin_pool_key_account_quota_exhausted(
     aether_provider_pool::provider_pool_key_account_quota_exhausted(key, provider_type)
 }
 
+pub fn admin_pool_key_account_quota_exhausted_with_basis(
+    key: &StoredProviderCatalogKey,
+    provider_type: &str,
+    codex_quota_basis: Option<&str>,
+) -> bool {
+    aether_provider_pool::provider_pool_key_account_quota_exhausted_with_basis(
+        key,
+        provider_type,
+        codex_quota_basis,
+    )
+}
+
 fn admin_pool_has_proxy(key: &StoredProviderCatalogKey) -> bool {
     match key.proxy.as_ref() {
         Some(Value::Object(values)) => !values.is_empty(),

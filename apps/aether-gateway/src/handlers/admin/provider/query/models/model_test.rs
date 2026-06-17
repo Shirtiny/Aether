@@ -999,9 +999,13 @@ fn provider_query_test_key_sort_key(
     key: &StoredProviderCatalogKey,
     endpoint_api_format: &str,
     now_unix_secs: u64,
+    codex_quota_basis: Option<&str>,
 ) -> (u8, u8, i32, u64, i32) {
-    let quota_exhausted =
-        admin_provider_pool_pure::admin_pool_key_account_quota_exhausted(key, provider_type);
+    let quota_exhausted = admin_provider_pool_pure::admin_pool_key_account_quota_exhausted_with_basis(
+        key,
+        provider_type,
+        codex_quota_basis,
+    );
     let circuit_open = key
         .circuit_breaker_by_format
         .as_ref()
@@ -1058,6 +1062,7 @@ fn provider_query_ai_pool_scheduling_config(
             .collect(),
         lru_enabled: config.lru_enabled,
         skip_exhausted_accounts: config.skip_exhausted_accounts,
+        sticky_session_enabled: config.sticky_session_ttl_seconds > 0,
         cost_limit_per_key_tokens: config.cost_limit_per_key_tokens,
     }
 }
@@ -1163,10 +1168,15 @@ fn provider_query_pool_catalog_key_quota_exhausted(
     key: &StoredProviderCatalogKey,
     provider_type: &str,
     quota_snapshot: Option<&Map<String, Value>>,
+    codex_quota_basis: Option<&str>,
 ) -> bool {
     match provider_type.trim().to_ascii_lowercase().as_str() {
         "codex" | "kiro" | "chatgpt_web" => {
-            admin_provider_pool_pure::admin_pool_key_account_quota_exhausted(key, provider_type)
+            admin_provider_pool_pure::admin_pool_key_account_quota_exhausted_with_basis(
+                key,
+                provider_type,
+                codex_quota_basis,
+            )
         }
         _ => quota_snapshot
             .and_then(|quota| quota.get("exhausted"))
@@ -1179,6 +1189,7 @@ fn provider_query_pool_catalog_key_context(
     state: &AdminAppState<'_>,
     key: &StoredProviderCatalogKey,
     provider_type: &str,
+    codex_quota_basis: Option<&str>,
 ) -> AiPoolCatalogKeyContext {
     let status_snapshot = provider_key_status_snapshot_payload(key, provider_type);
     let quota_snapshot = status_snapshot
@@ -1229,6 +1240,7 @@ fn provider_query_pool_catalog_key_context(
             key,
             provider_type,
             quota_snapshot,
+            codex_quota_basis,
         ),
         health_score,
         latency_avg_ms,
@@ -1244,6 +1256,7 @@ async fn provider_query_apply_pool_scheduler_to_test_candidates(
     effective_model: &str,
     keys: Vec<StoredProviderCatalogKey>,
     pool_config: &AdminProviderPoolConfig,
+    codex_quota_basis: Option<&str>,
 ) -> Vec<ProviderQueryTestCandidate> {
     let key_ids = keys.iter().map(|key| key.id.clone()).collect::<Vec<_>>();
     let runtime = if key_ids.is_empty() {
@@ -1263,7 +1276,7 @@ async fn provider_query_apply_pool_scheduler_to_test_candidates(
         provider.id.clone(),
         provider_query_ai_pool_runtime_state(&runtime),
     );
-    let pool_config = provider_query_ai_pool_scheduling_config(pool_config);
+    let ai_pool_config = provider_query_ai_pool_scheduling_config(pool_config);
     let inputs = keys
         .into_iter()
         .map(|key| {
@@ -1283,11 +1296,12 @@ async fn provider_query_apply_pool_scheduler_to_test_candidates(
                     key_id: key.id.clone(),
                     key_internal_priority: key.internal_priority,
                 },
-                pool_config: Some(pool_config.clone()),
+                pool_config: Some(ai_pool_config.clone()),
                 key_context: provider_query_pool_catalog_key_context(
                     state,
                     &key,
                     &provider.provider_type,
+                    codex_quota_basis,
                 ),
                 candidate,
             }
@@ -1476,6 +1490,7 @@ async fn provider_query_build_kiro_test_candidates(
             &candidate.key,
             &endpoint.api_format,
             now_unix_secs,
+            None,
         )
     });
 
@@ -1483,6 +1498,7 @@ async fn provider_query_build_kiro_test_candidates(
         if let Some(pool_config) =
             admin_provider_pool_config_from_config_value(provider.config.as_ref())
         {
+            let codex_quota_basis = pool_config.codex_quota_exhaustion_basis.clone();
             provider_query_apply_pool_scheduler_to_test_candidates(
                 state,
                 provider,
@@ -1491,6 +1507,7 @@ async fn provider_query_build_kiro_test_candidates(
                 &effective_model,
                 keys,
                 &pool_config,
+                Some(codex_quota_basis.as_str()),
             )
             .await
         } else {
@@ -1500,6 +1517,7 @@ async fn provider_query_build_kiro_test_candidates(
                     key,
                     &endpoint.api_format,
                     now_unix_secs,
+                    None,
                 )
             });
             keys.into_iter()
@@ -1512,14 +1530,15 @@ async fn provider_query_build_kiro_test_candidates(
                 .collect::<Vec<_>>()
         }
     } else {
-        keys.sort_by_key(|key| {
-            provider_query_test_key_sort_key(
-                provider.provider_type.as_str(),
-                key,
-                &endpoint.api_format,
-                now_unix_secs,
-            )
-        });
+            keys.sort_by_key(|key| {
+                provider_query_test_key_sort_key(
+                    provider.provider_type.as_str(),
+                    key,
+                    &endpoint.api_format,
+                    now_unix_secs,
+                    None,
+                )
+            });
         keys.into_iter()
             .map(|key| ProviderQueryTestCandidate {
                 endpoint: endpoint.clone(),

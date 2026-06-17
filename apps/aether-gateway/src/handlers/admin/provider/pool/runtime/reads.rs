@@ -88,8 +88,7 @@ pub(crate) async fn read_admin_provider_pool_runtime_state(
     }
     let cost_keys = pool_cost_keys(provider_id, metric_key_ids);
     let latency_keys = pool_latency_keys(provider_id, metric_key_ids);
-    let sticky_sessions_enabled = pool_config.sticky_session_ttl_seconds > 0
-        && admin_provider_pool_cache_affinity_enabled(pool_config);
+    let sticky_sessions_enabled = pool_config.sticky_session_ttl_seconds > 0;
 
     if let Some(sticky_session_token) = sticky_session_token
         .map(str::trim)

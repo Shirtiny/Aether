@@ -48,13 +48,15 @@ impl ProviderPoolAdapter for CodexProviderPoolAdapter {
     }
 
     fn quota_exhausted(&self, input: &ProviderPoolMemberInput<'_>) -> bool {
-        if let Some(exhausted) =
-            provider_pool_quota_snapshot_exhausted_decision(input.key, input.provider_type)
-        {
+        if let Some(exhausted) = codex_quota_exhausted_from_status_snapshot(
+            input.key,
+            input.provider_type,
+            input.codex_quota_basis,
+        ) {
             return exhausted;
         }
         provider_pool_metadata_bucket(input.key.upstream_metadata.as_ref(), input.provider_type)
-            .is_some_and(quota_exhausted_from_bucket)
+            .is_some_and(|bucket| quota_exhausted_from_bucket_with_basis(bucket, input.codex_quota_basis))
     }
 
     fn quota_refresh_endpoint(
@@ -203,8 +205,77 @@ fn codex_window_used_percent_exhausted(bucket: &Map<String, Value>, prefix: &str
 }
 
 pub(crate) fn quota_exhausted_from_bucket(bucket: &Map<String, Value>) -> bool {
+    quota_exhausted_from_bucket_with_basis(bucket, None)
+}
+
+fn normalized_codex_quota_basis(value: Option<&str>) -> &'static str {
+    match value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("5h" | "five_hour" | "five_hours" | "5_hour" | "5_hours") => "5h",
+        _ => "weekly",
+    }
+}
+
+fn codex_quota_exhausted_from_status_snapshot(
+    key: &aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey,
+    provider_type: &str,
+    basis: Option<&str>,
+) -> Option<bool> {
+    if normalized_codex_quota_basis(basis) != "5h" {
+        return provider_pool_quota_snapshot_exhausted_decision(key, provider_type);
+    }
+
+    let quota_snapshot = key
+        .status_snapshot
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|snapshot| snapshot.get("quota"))
+        .and_then(Value::as_object)?;
+    let window = quota_snapshot
+        .get("windows")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(Value::as_object)
+        .find(|window| {
+            window
+                .get("code")
+                .and_then(Value::as_str)
+                .is_some_and(|code| code.trim().eq_ignore_ascii_case("5h"))
+        })?;
+
+    Some(provider_pool_quota_window_active_exhausted(window, quota_snapshot))
+}
+
+fn provider_pool_quota_window_active_exhausted(
+    window: &Map<String, Value>,
+    quota_snapshot: &Map<String, Value>,
+) -> bool {
+    let exhausted = provider_pool_json_bool(window.get("is_exhausted"))
+        .or_else(|| {
+            provider_pool_json_f64(window.get("used_ratio")).map(|value| value >= 1.0 - 1e-6)
+        })
+        .unwrap_or(false);
+    if !exhausted {
+        return false;
+    }
+    let Some(now) = provider_pool_current_unix_secs() else {
+        return true;
+    };
+    let snapshot_observed_at = provider_pool_timestamp_unix_secs(quota_snapshot.get("observed_at"))
+        .or_else(|| provider_pool_timestamp_unix_secs(quota_snapshot.get("updated_at")));
+    !provider_pool_reset_deadline_elapsed(window, snapshot_observed_at, now)
+}
+
+fn quota_exhausted_from_bucket_with_basis(bucket: &Map<String, Value>, basis: Option<&str>) -> bool {
     if provider_pool_json_bool(bucket.get("credits_unlimited")) == Some(true) {
         return false;
+    }
+    if normalized_codex_quota_basis(basis) == "5h" {
+        return codex_window_used_percent_exhausted(bucket, "secondary");
     }
     let has_window_data = provider_pool_json_f64(bucket.get("primary_used_percent")).is_some()
         || provider_pool_json_f64(bucket.get("secondary_used_percent")).is_some();
@@ -213,4 +284,39 @@ pub(crate) fn quota_exhausted_from_bucket(bucket: &Map<String, Value>) -> bool {
     }
     codex_window_used_percent_exhausted(bucket, "primary")
         || codex_window_used_percent_exhausted(bucket, "secondary")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn codex_quota_uses_weekly_basis_by_default() {
+        let bucket = json!({
+            "primary_used_percent": 100.0,
+            "secondary_used_percent": 10.0
+        })
+        .as_object()
+        .cloned()
+        .expect("bucket should be object");
+
+        assert!(quota_exhausted_from_bucket(&bucket));
+        assert!(quota_exhausted_from_bucket_with_basis(&bucket, Some("weekly")));
+        assert!(quota_exhausted_from_bucket_with_basis(&bucket, None));
+    }
+
+    #[test]
+    fn codex_quota_can_follow_five_hour_basis() {
+        let bucket = json!({
+            "primary_used_percent": 100.0,
+            "secondary_used_percent": 10.0
+        })
+        .as_object()
+        .cloned()
+        .expect("bucket should be object");
+
+        assert!(!quota_exhausted_from_bucket_with_basis(&bucket, Some("5h")));
+        assert!(!quota_exhausted_from_bucket_with_basis(&bucket, Some("five_hour")));
+    }
 }

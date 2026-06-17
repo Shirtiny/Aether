@@ -17,6 +17,7 @@ pub(crate) fn build_provider_key_pool_score_upsert(
     now_unix_secs: u64,
     score_rules: PoolMemberScoreRules,
     skip_exhausted_accounts: bool,
+    codex_quota_basis: Option<&str>,
 ) -> UpsertPoolMemberScore {
     let identity = PoolMemberIdentity::provider_api_key(key.provider_id.clone(), key.id.clone());
     let scope = provider_key_pool_score_scope();
@@ -28,6 +29,7 @@ pub(crate) fn build_provider_key_pool_score_upsert(
         existing,
         now_unix_secs,
         skip_exhausted_accounts,
+        codex_quota_basis,
     );
     let output = score_pool_member_with_rules(&input, score_rules);
     UpsertPoolMemberScore {
@@ -91,6 +93,7 @@ fn provider_key_score_input(
     existing: Option<&aether_data_contracts::repository::pool_scores::StoredPoolMemberScore>,
     now_unix_secs: u64,
     skip_exhausted_accounts: bool,
+    codex_quota_basis: Option<&str>,
 ) -> PoolMemberScoreInput {
     let status_snapshot = provider_key_status_snapshot_payload(key, provider_type);
     let quota_snapshot = status_snapshot
@@ -120,10 +123,11 @@ fn provider_key_score_input(
             .and_then(json_f64)
             .map(|value| value.clamp(0.0, 1.0)),
         quota_exhausted: skip_exhausted_accounts
-            && quota_snapshot
-                .and_then(|quota| quota.get("exhausted"))
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
+            && aether_admin::provider::pool::admin_pool_key_account_quota_exhausted_with_basis(
+                key,
+                provider_type,
+                codex_quota_basis,
+            ),
         account_blocked: account_snapshot
             .and_then(|account| account.get("blocked"))
             .and_then(Value::as_bool)
@@ -209,6 +213,7 @@ mod tests {
             now_unix_secs,
             PoolMemberScoreRules::default(),
             true,
+            None,
         );
 
         assert_eq!(score.hard_state, PoolMemberHardState::Available);
@@ -226,6 +231,7 @@ mod tests {
             now_unix_secs,
             PoolMemberScoreRules::default(),
             true,
+            None,
         );
 
         assert_eq!(score.hard_state, PoolMemberHardState::Available);
@@ -259,6 +265,7 @@ mod tests {
             now_unix_secs,
             PoolMemberScoreRules::default(),
             false,
+            None,
         );
 
         assert_eq!(score.hard_state, PoolMemberHardState::Unknown);

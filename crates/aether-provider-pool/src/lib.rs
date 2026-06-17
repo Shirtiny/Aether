@@ -34,7 +34,8 @@ pub use providers::{
     WINDSURF_USER_STATUS_PATH,
 };
 pub use quota::{
-    provider_pool_key_account_quota_exhausted, provider_pool_key_scheduling_label,
+    provider_pool_key_account_quota_exhausted,
+    provider_pool_key_account_quota_exhausted_with_basis, provider_pool_key_scheduling_label,
     provider_pool_member_quota_snapshot, provider_pool_quota_metadata_provider_type,
     provider_pool_quota_metadata_updated_at, provider_pool_quota_snapshot_updated_at,
 };
@@ -427,7 +428,7 @@ mod tests {
             }
         })));
 
-        let signals = service.member_signals("windsurf", &key, None);
+        let signals = service.member_signals("windsurf", &key, None, None);
 
         assert!(!signals.quota_exhausted);
     }
@@ -454,7 +455,7 @@ mod tests {
             }
         }));
 
-        let signals = service.member_signals("windsurf", &key, None);
+        let signals = service.member_signals("windsurf", &key, None, None);
 
         assert!(signals.quota_exhausted);
     }

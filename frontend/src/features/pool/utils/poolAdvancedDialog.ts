@@ -4,6 +4,7 @@ export type PoolHealthToggleKey =
   | 'account_self_check_enabled'
   | 'auto_remove_banned_keys'
   | 'skip_exhausted_accounts'
+  | 'codex_quota_weekly_basis'
 
 export interface PoolHealthToggleCard {
   key: PoolHealthToggleKey
@@ -52,6 +53,11 @@ export function buildPoolHealthToggleCards(): PoolHealthToggleCard[] {
       label: '跳过额度耗尽账号',
       description: '当 Codex / Kiro 账号额度已耗尽时，直接标记为不可调度并在请求侧跳过。',
     },
+    {
+      key: 'codex_quota_weekly_basis',
+      label: '周限优先',
+      description: 'Codex 账号按周限判断额度耗尽；关闭后按 5 小时窗口判断。',
+    },
   ]
 }
 
@@ -82,4 +88,10 @@ export function buildPoolCostFieldLayout(): PoolCostFieldLayout {
     ],
     desktopColumnsClass: 'xl:grid-cols-3',
   }
+}
+
+export function isCodexFiveHourQuotaBasis(value: unknown): boolean {
+  if (typeof value !== 'string') return false
+  const normalized = value.trim().toLowerCase().replace(/[-\s]+/g, '_')
+  return ['5h', 'five_hour', 'five_hours', '5_hour', '5_hours'].includes(normalized)
 }

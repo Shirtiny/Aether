@@ -474,8 +474,14 @@ fn admin_pool_key_visible_status_filter(
     ) {
         return status;
     }
-    if pool_config.is_some_and(|config| config.skip_exhausted_accounts)
-        && admin_provider_pool_pure::admin_pool_key_account_quota_exhausted(key, provider_type)
+    if pool_config
+        .as_ref()
+        .is_some_and(|config| config.skip_exhausted_accounts)
+        && admin_provider_pool_pure::admin_pool_key_account_quota_exhausted_with_basis(
+            key,
+            provider_type,
+            pool_config.map(|config| config.codex_quota_exhaustion_basis.as_str()),
+        )
     {
         return "quota_exhausted";
     }

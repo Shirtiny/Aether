@@ -722,6 +722,8 @@ export interface PoolAdvancedConfig {
   sticky_session_ttl_seconds?: number | null
   load_threshold_percent?: number | null
   skip_exhausted_accounts?: boolean | null
+  codex_quota_weekly_basis?: boolean | null
+  codex_quota_exhaustion_basis?: 'weekly' | 'five_hour' | '5h' | string | null
   // 旧字段（兼容读取）
   lru_enabled?: boolean
   scheduling_mode?: 'lru' | 'multi_score' | null

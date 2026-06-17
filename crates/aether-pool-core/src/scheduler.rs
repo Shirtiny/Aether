@@ -19,6 +19,7 @@ pub struct PoolSchedulingConfig {
     pub scheduling_presets: Vec<PoolSchedulingPreset>,
     pub lru_enabled: bool,
     pub skip_exhausted_accounts: bool,
+    pub sticky_session_enabled: bool,
     pub cost_limit_per_key_tokens: Option<u64>,
 }
 
@@ -269,7 +270,7 @@ fn schedule_pool_group<Candidate>(
         };
     }
 
-    let sticky_candidate = if pool_sticky_enabled(&active_presets) {
+    let sticky_candidate = if pool_config.sticky_session_enabled {
         runtime
             .sticky_bound_key_id
             .as_ref()
@@ -397,12 +398,6 @@ fn build_pool_sort_vectors<Candidate>(
     }
 
     vectors
-}
-
-fn pool_sticky_enabled(presets: &[NormalizedPoolPreset]) -> bool {
-    presets
-        .iter()
-        .any(|preset| preset.preset == "cache_affinity")
 }
 
 fn lru_rank_indices<Candidate>(
@@ -1254,6 +1249,7 @@ mod tests {
             scheduling_presets: Vec::new(),
             lru_enabled: true,
             skip_exhausted_accounts: false,
+            sticky_session_enabled: false,
             cost_limit_per_key_tokens: None,
         });
         PoolCandidateInput {

@@ -148,6 +148,7 @@ pub(crate) async fn ensure_provider_key_pool_scores_for_keys(
                 now_unix_secs,
                 pool_config.score_rules,
                 pool_config.skip_exhausted_accounts,
+                Some(pool_config.codex_quota_exhaustion_basis.as_str()),
             );
             (key, draft.id)
         })
@@ -189,6 +190,7 @@ pub(crate) async fn ensure_provider_key_pool_scores_for_keys(
             now_unix_secs,
             pool_config.score_rules,
             pool_config.skip_exhausted_accounts,
+            Some(pool_config.codex_quota_exhaustion_basis.as_str()),
         );
         if state
             .data
@@ -306,6 +308,7 @@ pub(crate) async fn perform_pool_score_rebuild_once_with_config(
                 now,
                 pool_config.score_rules,
                 pool_config.skip_exhausted_accounts,
+                Some(pool_config.codex_quota_exhaustion_basis.as_str()),
             );
             build_items.push((offset, draft.id));
         }
@@ -353,6 +356,7 @@ pub(crate) async fn perform_pool_score_rebuild_once_with_config(
                 now,
                 pool_config.score_rules,
                 pool_config.skip_exhausted_accounts,
+                Some(pool_config.codex_quota_exhaustion_basis.as_str()),
             );
             if state
                 .data

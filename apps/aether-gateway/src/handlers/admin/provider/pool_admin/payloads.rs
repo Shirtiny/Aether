@@ -1056,7 +1056,13 @@ pub(super) fn build_admin_pool_key_payload(
     let account_quota_exhausted = pool_config
         .as_ref()
         .is_some_and(|config| config.skip_exhausted_accounts)
-        && admin_provider_pool_pure::admin_pool_key_account_quota_exhausted(key, provider_type);
+        && admin_provider_pool_pure::admin_pool_key_account_quota_exhausted_with_basis(
+            key,
+            provider_type,
+            pool_config
+                .as_ref()
+                .map(|config| config.codex_quota_exhaustion_basis.as_str()),
+        );
     let auth_config = state.parse_catalog_auth_config_json(key);
     let oauth_expires_at =
         admin_pool_derive_oauth_expires_at(provider_type, key, auth_config.as_ref());

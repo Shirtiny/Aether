@@ -40,7 +40,15 @@ pub(super) async fn read_candidate_runtime_selection_snapshot(
     let provider_pool_state = read_provider_pool_state_map(state, candidates).await?;
     let provider_skip_exhausted_accounts = provider_pool_state
         .iter()
-        .map(|(provider_id, state)| (provider_id.clone(), state.skip_exhausted_accounts))
+        .map(|(provider_id, state)| {
+            (
+                provider_id.clone(),
+                (
+                    state.skip_exhausted_accounts,
+                    state.codex_quota_exhaustion_basis.clone(),
+                ),
+            )
+        })
         .collect::<BTreeMap<_, _>>();
     let pool_provider_ids = provider_pool_state
         .iter()
@@ -254,10 +262,11 @@ async fn read_provider_quota_block_map(
     Ok(quota_blocks)
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone)]
 struct ProviderPoolState {
     pool_enabled: bool,
     skip_exhausted_accounts: bool,
+    codex_quota_exhaustion_basis: String,
 }
 
 async fn read_provider_pool_state_map(
@@ -289,35 +298,68 @@ async fn read_provider_pool_state_map(
                 .and_then(|value| value.get("skip_exhausted_accounts"))
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
+            let codex_quota_exhaustion_basis = pool_advanced
+                .and_then(serde_json::Value::as_object)
+                .map(parse_runtime_codex_quota_exhaustion_basis)
+                .unwrap_or_else(|| "weekly".to_string());
             (
                 provider.id,
                 ProviderPoolState {
                     pool_enabled: pool_advanced.is_some(),
                     skip_exhausted_accounts,
+                    codex_quota_exhaustion_basis,
                 },
             )
         })
         .collect())
 }
 
+fn parse_runtime_codex_quota_exhaustion_basis(
+    pool_advanced: &serde_json::Map<String, serde_json::Value>,
+) -> String {
+    if pool_advanced
+        .get("codex_quota_weekly_basis")
+        .and_then(serde_json::Value::as_bool)
+        == Some(false)
+    {
+        return "five_hour".to_string();
+    }
+    match pool_advanced
+        .get("codex_quota_exhaustion_basis")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("5h" | "five_hour" | "five_hours" | "5_hour" | "5_hours") => {
+            "five_hour".to_string()
+        }
+        _ => "weekly".to_string(),
+    }
+}
+
 fn read_key_account_quota_exhaustion_map(
     candidates: &[SchedulerMinimalCandidateSelectionCandidate],
     provider_key_rpm_states: &BTreeMap<String, StoredProviderCatalogKey>,
-    provider_skip_exhausted_accounts: &BTreeMap<String, bool>,
+    provider_skip_exhausted_accounts: &BTreeMap<String, (bool, String)>,
 ) -> BTreeMap<String, bool> {
     candidates
         .iter()
         .map(|candidate| {
             let exhausted = provider_skip_exhausted_accounts
                 .get(candidate.provider_id.as_str())
-                .copied()
+                .map(|(skip, _)| *skip)
                 .unwrap_or(false)
                 && provider_key_rpm_states
                     .get(candidate.key_id.as_str())
                     .is_some_and(|key| {
-                        admin_provider_pool_pure::admin_pool_key_account_quota_exhausted(
+                        admin_provider_pool_pure::admin_pool_key_account_quota_exhausted_with_basis(
                             key,
                             candidate.provider_type.as_str(),
+                            provider_skip_exhausted_accounts
+                                .get(candidate.provider_id.as_str())
+                                .map(|(_, basis)| basis.as_str()),
                         )
                     });
             (candidate.key_id.clone(), exhausted)
