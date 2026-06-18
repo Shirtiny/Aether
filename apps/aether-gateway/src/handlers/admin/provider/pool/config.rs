@@ -5,6 +5,7 @@ use aether_pool_core::{PoolMemberScoreRules, PoolMemberScoreWeights};
 use serde_json::{Map, Value};
 
 const POOL_ALLOWED_SCHEDULING_PRESETS: &[&str] = &[
+    "no_weight",
     "lru",
     "cache_affinity",
     "load_balance",
@@ -54,9 +55,7 @@ fn parse_codex_quota_exhaustion_basis(pool_advanced: &Map<String, Value>) -> Str
         .map(str::to_ascii_lowercase)
         .as_deref()
     {
-        Some("5h" | "five_hour" | "five_hours" | "5_hour" | "5_hours") => {
-            "five_hour".to_string()
-        }
+        Some("5h" | "five_hour" | "five_hours" | "5_hour" | "5_hours") => "five_hour".to_string(),
         _ => "weekly".to_string(),
     }
 }
@@ -391,7 +390,7 @@ pub(crate) fn admin_provider_pool_cache_affinity_enabled(
         }
         if matches!(
             preset.as_str(),
-            "lru" | "cache_affinity" | "load_balance" | "single_account"
+            "no_weight" | "lru" | "cache_affinity" | "load_balance" | "single_account"
         ) {
             return preset == "cache_affinity";
         }

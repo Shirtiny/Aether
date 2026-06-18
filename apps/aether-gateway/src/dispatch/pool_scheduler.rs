@@ -1,7 +1,7 @@
-use std::collections::{btree_map::Entry, BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque, btree_map::Entry};
 use std::sync::{
-    atomic::{AtomicU64, Ordering as AtomicOrdering},
     Arc, LazyLock,
+    atomic::{AtomicU64, Ordering as AtomicOrdering},
 };
 
 use aether_admin::provider::pool as admin_provider_pool_pure;
@@ -10,15 +10,15 @@ use aether_data_contracts::repository::candidate_selection::{
     StoredPoolKeyCandidateRowsByKeyIdsQuery, StoredPoolKeyCandidateRowsQuery,
 };
 use aether_data_contracts::repository::pool_scores::{
-    ListRankedPoolMembersQuery, PoolMemberHardState, PoolMemberIdentity,
-    PoolMemberScheduleFeedback, PoolScoreScope, StoredPoolMemberScore, POOL_KIND_PROVIDER_KEY_POOL,
+    ListRankedPoolMembersQuery, POOL_KIND_PROVIDER_KEY_POOL, PoolMemberHardState,
+    PoolMemberIdentity, PoolMemberScheduleFeedback, PoolScoreScope, StoredPoolMemberScore,
 };
 use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey;
 use aether_pool_core::{
-    run_pool_scheduler, PoolCandidateFacts, PoolCandidateInput, PoolCandidateOrchestration,
-    PoolMemberSignals, PoolRuntimeState, PoolSchedulingConfig, PoolSchedulingPreset,
     POOL_ACCOUNT_BLOCKED_SKIP_REASON, POOL_ACCOUNT_EXHAUSTED_SKIP_REASON,
-    POOL_COOLDOWN_SKIP_REASON, POOL_COST_LIMIT_REACHED_SKIP_REASON,
+    POOL_COOLDOWN_SKIP_REASON, POOL_COST_LIMIT_REACHED_SKIP_REASON, PoolCandidateFacts,
+    PoolCandidateInput, PoolCandidateOrchestration, PoolMemberSignals, PoolRuntimeState,
+    PoolSchedulingConfig, PoolSchedulingPreset, run_pool_scheduler,
 };
 use aether_provider_pool::ProviderPoolService;
 use aether_routing_core::{RankingOverlay, ResolvedRoutingPolicy};
@@ -26,21 +26,20 @@ use tokio::sync::Semaphore;
 use tracing::{debug, warn};
 
 use crate::ai_serving::{
-    candidate_auth_channel_skip_reason, candidate_common_transport_skip_reason,
-    provider_key_pool_score_scope, read_candidate_transport_snapshot,
-    record_local_runtime_candidate_skip_reason, CandidateTransportPolicyFacts,
-    EligibleLocalExecutionCandidate, LocalExecutionCandidateKind, PlannerAppState,
-    SkippedLocalExecutionCandidate,
+    CandidateTransportPolicyFacts, EligibleLocalExecutionCandidate, LocalExecutionCandidateKind,
+    PlannerAppState, SkippedLocalExecutionCandidate, candidate_auth_channel_skip_reason,
+    candidate_common_transport_skip_reason, provider_key_pool_score_scope,
+    read_candidate_transport_snapshot, record_local_runtime_candidate_skip_reason,
 };
 use crate::clock::current_unix_ms;
 use crate::handlers::shared::provider_pool::read_admin_provider_pool_runtime_state;
 use crate::handlers::shared::provider_pool::{
-    admin_provider_pool_cache_affinity_enabled, admin_provider_pool_config_from_config_value,
+    AdminProviderPoolConfig, AdminProviderPoolRuntimeState,
+    admin_provider_pool_quota_probe_active_members_key,
+    read_admin_provider_pool_key_cooldown_reason,
 };
 use crate::handlers::shared::provider_pool::{
-    admin_provider_pool_quota_probe_active_members_key,
-    read_admin_provider_pool_key_cooldown_reason, AdminProviderPoolConfig,
-    AdminProviderPoolRuntimeState,
+    admin_provider_pool_cache_affinity_enabled, admin_provider_pool_config_from_config_value,
 };
 use crate::handlers::shared::{parse_catalog_auth_config_json, provider_key_health_summary};
 use crate::maintenance::spawn_pool_quota_probe_replenish_for_request;
@@ -1132,8 +1131,10 @@ async fn read_pool_catalog_key_contexts_by_id(
         let key_id = candidate.candidate.key_id.clone();
         if let Entry::Vacant(entry) = provider_type_by_key_id.entry(key_id.clone()) {
             entry.insert(candidate.transport.provider.provider_type.clone());
-            codex_quota_basis_by_key_id
-                .insert(key_id.clone(), pool_config.codex_quota_exhaustion_basis.clone());
+            codex_quota_basis_by_key_id.insert(
+                key_id.clone(),
+                pool_config.codex_quota_exhaustion_basis.clone(),
+            );
             key_ids.push(key_id);
         }
     }
@@ -1173,9 +1174,7 @@ async fn read_pool_catalog_key_contexts_by_id(
                     &provider_pool_service,
                     &key,
                     provider_type,
-                    codex_quota_basis_by_key_id
-                        .get(&key.id)
-                        .map(String::as_str),
+                    codex_quota_basis_by_key_id.get(&key.id).map(String::as_str),
                 ),
             )
         })
@@ -1525,6 +1524,7 @@ fn pool_key_candidate_order_for_group(
         .map(String::as_str)
     {
         return match distribution_mode {
+            "no_weight" => StoredPoolKeyCandidateOrder::InternalPriority,
             "cache_affinity" => StoredPoolKeyCandidateOrder::CacheAffinity,
             "load_balance" => StoredPoolKeyCandidateOrder::LoadBalance {
                 seed: pool_sort_seed(),
@@ -1540,7 +1540,10 @@ fn pool_key_candidate_order_for_group(
 }
 
 fn pool_distribution_mode_preset(preset: &str) -> bool {
-    matches!(preset, "cache_affinity" | "load_balance" | "single_account")
+    matches!(
+        preset,
+        "no_weight" | "cache_affinity" | "load_balance" | "single_account"
+    )
 }
 
 fn pool_sort_seed() -> String {
@@ -1623,6 +1626,8 @@ fn apply_pool_orchestration(
 #[cfg(test)]
 mod tests {
     use super::{
+        POOL_ACTIVE_PROBE_SEALED_SKIP_REASON, PoolCatalogKeyContext, PoolKeyCursor,
+        ROUTING_PROFILE_DISALLOWED_KEY_SKIP_REASON,
         admin_provider_pool_quota_probe_active_members_key, apply_local_execution_pool_scheduler,
         apply_local_execution_pool_scheduler_with_runtime_map,
         apply_local_execution_pool_scheduler_with_runtime_map_outcome,
@@ -1630,17 +1635,15 @@ mod tests {
         pool_key_requires_reauth_for_scheduling,
         prune_unschedulable_active_probe_members_for_request,
         remove_active_probe_members_for_request, should_trigger_active_probe_burst_for_request,
-        PoolCatalogKeyContext, PoolKeyCursor, POOL_ACTIVE_PROBE_SEALED_SKIP_REASON,
-        ROUTING_PROFILE_DISALLOWED_KEY_SKIP_REASON,
     };
     use crate::ai_serving::{
+        EligibleLocalExecutionCandidate, LocalExecutionCandidateKind, PlannerAppState,
         apply_local_runtime_candidate_terminal_reason, provider_key_pool_score_id,
-        provider_key_pool_score_scope, EligibleLocalExecutionCandidate,
-        LocalExecutionCandidateKind, PlannerAppState,
+        provider_key_pool_score_scope,
     };
     use crate::data::GatewayDataState;
     use crate::handlers::shared::provider_pool::{
-        record_admin_provider_pool_error, AdminProviderPoolRuntimeState,
+        AdminProviderPoolRuntimeState, record_admin_provider_pool_error,
     };
     use crate::orchestration::LocalExecutionCandidateMetadata;
     use crate::{AppState, LocalExecutionRuntimeMissDiagnostic};
@@ -2168,11 +2171,13 @@ mod tests {
             evicted.get("provider-pool"),
             Some(&BTreeSet::from(["key-hot".to_string()]))
         );
-        assert!(runtime_by_provider
-            .get("provider-pool")
-            .expect("runtime should exist")
-            .active_probe_member_ids
-            .is_empty());
+        assert!(
+            runtime_by_provider
+                .get("provider-pool")
+                .expect("runtime should exist")
+                .active_probe_member_ids
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2741,6 +2746,32 @@ mod tests {
             StoredPoolKeyCandidateOrder::LoadBalance { ref seed } if !seed.is_empty()
         ));
 
+        let no_weight_group = sample_eligible_candidate(
+            "provider-pool",
+            "endpoint-1",
+            "pool-group",
+            10,
+            Some(json!({
+                "pool_advanced": {
+                    "scheduling_presets": [
+                        {"preset": "no_weight", "enabled": true},
+                        {"preset": "priority_first", "enabled": true}
+                    ]
+                }
+            })),
+        );
+        let no_weight_cursor = PoolKeyCursor::new(
+            PlannerAppState::new(&app),
+            no_weight_group,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            no_weight_cursor.pool_key_order,
+            StoredPoolKeyCandidateOrder::InternalPriority
+        );
+
         let lru_group = sample_eligible_candidate(
             "provider-pool",
             "endpoint-1",
@@ -2952,9 +2983,11 @@ mod tests {
         assert_eq!(candidate.candidate.key_id, "key-a");
         assert_eq!(candidate.orchestration.pool_key_index, Some(0));
         assert!(candidate.orchestration.pool_key_lease.is_none());
-        assert!(!cursor
-            .skip_reason_counts
-            .contains_key("pool_key_lease_busy"));
+        assert!(
+            !cursor
+                .skip_reason_counts
+                .contains_key("pool_key_lease_busy")
+        );
 
         let group = sample_eligible_candidate(
             "provider-pool",
@@ -3313,8 +3346,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pool_scheduler_skips_invalid_and_exhausted_high_priority_hot_pool_before_fallback_provider(
-    ) {
+    async fn pool_scheduler_skips_invalid_and_exhausted_high_priority_hot_pool_before_fallback_provider()
+     {
         let provider_config = Some(json!({
             "pool_advanced": {
                 "probing_enabled": true,
@@ -3660,9 +3693,11 @@ mod tests {
         assert_eq!(returned_ids.last().map(String::as_str), Some("key-00463"));
         assert_eq!(cursor.scanned_keys, 512);
         assert_eq!(cursor.skip_reason_counts.get("pool_cooldown"), Some(&3));
-        assert!(!cursor
-            .skip_reason_counts
-            .contains_key("pool_key_lease_busy"));
+        assert!(
+            !cursor
+                .skip_reason_counts
+                .contains_key("pool_key_lease_busy")
+        );
         for skipped in ["key-00000", "key-00001", "key-00014"] {
             assert!(
                 !returned_ids.iter().any(|key_id| key_id == skipped),

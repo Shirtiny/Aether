@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::{btree_map::Entry, BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 use std::hash::{Hash, Hasher};
 
 pub const POOL_ACCOUNT_BLOCKED_SKIP_REASON: &str = "pool_account_blocked";
@@ -376,6 +376,7 @@ fn build_pool_sort_vectors<Candidate>(
             "cache_affinity" => cache_affinity_ranks.clone(),
             "priority_first" => priority_first_ranks(items, &lru_ranks),
             "single_account" => single_account_ranks(items),
+            "no_weight" => neutral_rank_indices(items),
             "plus_first" => plan_ranks(items, &lru_ranks, Some("plus_only")),
             "pro_first" => plan_ranks(items, &lru_ranks, Some("pro_only")),
             "free_first" => plan_ranks(items, &lru_ranks, Some("free_only")),
@@ -784,7 +785,9 @@ fn normalize_enabled_pool_preset_entries(
 
 fn pool_preset_mutex_group(preset: &str) -> Option<&'static str> {
     match preset {
-        "lru" | "cache_affinity" | "load_balance" | "single_account" => Some("distribution_mode"),
+        "lru" | "cache_affinity" | "load_balance" | "single_account" | "no_weight" => {
+            Some("distribution_mode")
+        }
         _ => None,
     }
 }
@@ -1117,6 +1120,74 @@ mod tests {
     }
 
     #[test]
+    fn no_weight_distribution_allows_priority_strategy_to_choose_first_key() {
+        let key_low_priority_recent = sample_candidate(
+            "provider-pool",
+            "endpoint-1",
+            "key-low-priority-recent",
+            50,
+            true,
+        )
+        .with_presets(vec![
+            PoolSchedulingPreset {
+                preset: "no_weight".to_string(),
+                enabled: true,
+                mode: None,
+            },
+            PoolSchedulingPreset {
+                preset: "priority_first".to_string(),
+                enabled: true,
+                mode: None,
+            },
+        ]);
+        let key_high_priority_old = sample_candidate(
+            "provider-pool",
+            "endpoint-1",
+            "key-high-priority-old",
+            10,
+            true,
+        )
+        .with_presets(vec![
+            PoolSchedulingPreset {
+                preset: "no_weight".to_string(),
+                enabled: true,
+                mode: None,
+            },
+            PoolSchedulingPreset {
+                preset: "priority_first".to_string(),
+                enabled: true,
+                mode: None,
+            },
+        ]);
+        let runtime_by_provider = BTreeMap::from([(
+            "provider-pool".to_string(),
+            PoolRuntimeState {
+                lru_score_by_key: BTreeMap::from([
+                    ("key-low-priority-recent".to_string(), 200.0),
+                    ("key-high-priority-old".to_string(), 10.0),
+                ]),
+                ..PoolRuntimeState::default()
+            },
+        )]);
+
+        let outcome = run_pool_scheduler(
+            vec![key_low_priority_recent, key_high_priority_old],
+            &runtime_by_provider,
+            "seed",
+        );
+
+        assert!(outcome.skipped_candidates.is_empty());
+        assert_eq!(
+            outcome
+                .candidates
+                .iter()
+                .map(|item| item.candidate.as_str())
+                .collect::<Vec<_>>(),
+            vec!["key-high-priority-old", "key-low-priority-recent"]
+        );
+    }
+
+    #[test]
     fn single_account_distribution_orders_by_priority_then_reverse_lru() {
         let key_priority_old =
             sample_candidate("provider-pool", "endpoint-1", "key-priority-old", 10, true)
@@ -1236,6 +1307,24 @@ mod tests {
         ]);
 
         assert_eq!(presets, ["priority_first"]);
+    }
+
+    #[test]
+    fn normalizes_no_weight_as_mutually_exclusive_distribution_mode() {
+        let presets = normalize_enabled_pool_presets(&[
+            PoolSchedulingPreset {
+                preset: "no_weight".to_string(),
+                enabled: true,
+                mode: None,
+            },
+            PoolSchedulingPreset {
+                preset: "priority_first".to_string(),
+                enabled: true,
+                mode: None,
+            },
+        ]);
+
+        assert_eq!(presets, ["no_weight", "priority_first"]);
     }
 
     fn sample_candidate(

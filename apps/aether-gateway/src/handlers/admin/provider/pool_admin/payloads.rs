@@ -390,6 +390,64 @@ fn admin_pool_prune_expired_codex_window_usage(status_snapshot: &mut serde_json:
     admin_pool_prune_expired_codex_window_usage_at(status_snapshot, admin_pool_current_unix_secs());
 }
 
+fn admin_pool_codex_five_hour_window_active_exhausted(
+    quota_snapshot: &serde_json::Map<String, serde_json::Value>,
+    now_unix_secs: u64,
+) -> Option<bool> {
+    let window = admin_pool_quota_window(quota_snapshot, "5h")?;
+    let exhausted = window
+        .get("is_exhausted")
+        .and_then(admin_provider_quota_pure::coerce_json_bool)
+        .or_else(|| {
+            admin_pool_json_to_f64(window.get("used_ratio")).map(|value| value >= 1.0 - 1e-6)
+        })
+        .unwrap_or(false);
+    if !exhausted {
+        return Some(false);
+    }
+    let reset_seconds =
+        admin_pool_quota_window_reset_seconds(quota_snapshot, window, now_unix_secs);
+    Some(!reset_seconds.is_some_and(|value| value <= 0.0))
+}
+
+fn admin_pool_normalize_codex_quota_snapshot_for_basis(
+    status_snapshot: &mut serde_json::Value,
+    codex_quota_basis: Option<&str>,
+    now_unix_secs: u64,
+) {
+    let basis = codex_quota_basis
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    if !matches!(
+        basis.as_str(),
+        "5h" | "five_hour" | "five_hours" | "5_hour" | "5_hours"
+    ) {
+        return;
+    }
+    let Some(quota_snapshot) = status_snapshot
+        .get("quota")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return;
+    };
+    if admin_pool_codex_five_hour_window_active_exhausted(quota_snapshot, now_unix_secs)
+        != Some(false)
+    {
+        return;
+    }
+    let Some(quota_snapshot) = status_snapshot
+        .get_mut("quota")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    quota_snapshot.insert("code".to_string(), json!("ok"));
+    quota_snapshot.insert("exhausted".to_string(), json!(false));
+    quota_snapshot.insert("label".to_string(), serde_json::Value::Null);
+    quota_snapshot.insert("reason".to_string(), serde_json::Value::Null);
+}
+
 fn admin_pool_apply_codex_window_usage_summaries(
     status_snapshot: &mut serde_json::Value,
     usage_by_code: Option<&BTreeMap<String, StoredProviderApiKeyWindowUsageSummary>>,
@@ -1078,6 +1136,13 @@ pub(super) fn build_admin_pool_key_payload(
             codex_cycle_usage_by_code,
         );
         admin_pool_prune_expired_codex_window_usage_at(&mut status_snapshot, now_unix_secs);
+        admin_pool_normalize_codex_quota_snapshot_for_basis(
+            &mut status_snapshot,
+            pool_config
+                .as_ref()
+                .map(|config| config.codex_quota_exhaustion_basis.as_str()),
+            now_unix_secs,
+        );
     }
     let account_snapshot = status_snapshot
         .get("account")
@@ -1203,10 +1268,12 @@ pub(super) fn build_admin_pool_key_payload(
     payload.insert("oauth_invalid_at".to_string(), json!(oauth_invalid_at));
     payload.insert(
         "oauth_invalid_reason".to_string(),
-        json!(auth_semantics
-            .can_show_oauth_metadata()
-            .then_some(key.oauth_invalid_reason.clone())
-            .flatten()),
+        json!(
+            auth_semantics
+                .can_show_oauth_metadata()
+                .then_some(key.oauth_invalid_reason.clone())
+                .flatten()
+        ),
     );
     payload.insert("oauth_plan_type".to_string(), json!(oauth_plan_type));
     payload.insert("oauth_account_id".to_string(), json!(oauth_account_id));
@@ -1343,17 +1410,21 @@ pub(super) fn build_admin_pool_key_payload(
     );
     payload.insert(
         "cost_window_usage".to_string(),
-        json!(runtime
-            .cost_window_usage_by_key
-            .get(&key.id)
-            .copied()
-            .unwrap_or(0)),
+        json!(
+            runtime
+                .cost_window_usage_by_key
+                .get(&key.id)
+                .copied()
+                .unwrap_or(0)
+        ),
     );
     payload.insert(
         "cost_limit".to_string(),
-        json!(pool_config
-            .as_ref()
-            .map(|config| config.cost_limit_per_key_tokens)),
+        json!(
+            pool_config
+                .as_ref()
+                .map(|config| config.cost_limit_per_key_tokens)
+        ),
     );
     payload.insert(
         "request_count".to_string(),
@@ -1366,11 +1437,13 @@ pub(super) fn build_admin_pool_key_payload(
     );
     payload.insert(
         "sticky_sessions".to_string(),
-        json!(runtime
-            .sticky_sessions_by_key
-            .get(&key.id)
-            .copied()
-            .unwrap_or(0)),
+        json!(
+            runtime
+                .sticky_sessions_by_key
+                .get(&key.id)
+                .copied()
+                .unwrap_or(0)
+        ),
     );
     payload.insert(
         "lru_score".to_string(),

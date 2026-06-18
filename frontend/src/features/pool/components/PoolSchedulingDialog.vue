@@ -7,7 +7,7 @@
     @update:model-value="emit('update:modelValue', $event)"
   >
     <div class="max-h-[calc(100dvh-13rem)] space-y-5 overflow-y-auto overscroll-contain pr-1 sm:max-h-[min(72vh,42rem)] sm:space-y-6 sm:pr-2">
-      <!-- Section 1: 分配模式 (distribution_mode 互斥组, 四选一) -->
+      <!-- Section 1: 分配模式 (distribution_mode 互斥组, 五选一) -->
       <div class="space-y-4 rounded-2xl border border-border/60 bg-card/70 p-4">
         <div class="space-y-1">
           <h3 class="text-sm font-medium">
@@ -260,6 +260,16 @@ const emit = defineEmits<{
 const DISTRIBUTION_GROUP = 'distribution_mode'
 
 const FALLBACK_PRESET_DEFS: PoolPresetMeta[] = [
+  {
+    name: 'no_weight',
+    label: '无权重',
+    description: '基础分配不叠加任何排序权重',
+    mutex_group: DISTRIBUTION_GROUP,
+    evidence_hint: '仅保留策略调度项，不使用 LRU / 优先级 / 负载权重',
+    providers: [],
+    modes: null,
+    default_mode: null,
+  },
   {
     name: 'cache_affinity',
     label: '缓存亲和',

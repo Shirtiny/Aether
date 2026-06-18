@@ -1,18 +1,18 @@
 use super::{
-    admin_pool_provider_id_from_path, admin_provider_pool_config, build_admin_pool_error_response,
-    parse_admin_pool_key_sort, parse_admin_pool_page, parse_admin_pool_page_size,
-    parse_admin_pool_quick_selectors, parse_admin_pool_search, parse_admin_pool_status_filter,
-    pool_payloads, pool_selection, read_admin_provider_pool_runtime_state, AdminPoolKeySort,
+    ADMIN_POOL_PROVIDER_CATALOG_READER_UNAVAILABLE_DETAIL, AdminPoolKeySort,
     AdminPoolKeySortDirection, AdminPoolKeySortField, AdminProviderPoolRuntimeState,
-    ProviderCatalogKeyListOrder, ProviderCatalogKeyListQuery,
-    ADMIN_POOL_PROVIDER_CATALOG_READER_UNAVAILABLE_DETAIL,
+    ProviderCatalogKeyListOrder, ProviderCatalogKeyListQuery, admin_pool_provider_id_from_path,
+    admin_provider_pool_config, build_admin_pool_error_response, parse_admin_pool_key_sort,
+    parse_admin_pool_page, parse_admin_pool_page_size, parse_admin_pool_quick_selectors,
+    parse_admin_pool_search, parse_admin_pool_status_filter, pool_payloads, pool_selection,
+    read_admin_provider_pool_runtime_state,
 };
+use crate::GatewayError;
 use crate::ai_serving::{provider_key_pool_score_id, provider_key_pool_score_scope};
 use crate::handlers::admin::provider::shared::support::AdminProviderPoolConfig;
 use crate::handlers::admin::request::{AdminAppState, AdminRequestContext};
 use crate::handlers::admin::shared::provider_key_status_snapshot_payload;
 use crate::provider_key_auth::provider_key_auth_semantics;
-use crate::GatewayError;
 use aether_admin::provider::pool as admin_provider_pool_pure;
 use aether_data_contracts::repository::pool_scores::{
     GetPoolMemberScoresByIdsQuery, PoolMemberIdentity, StoredPoolMemberScore,
@@ -22,12 +22,12 @@ use aether_data_contracts::repository::usage::{
     ProviderApiKeyWindowUsageRequest, StoredProviderApiKeyWindowUsageSummary,
 };
 use axum::{
+    Json,
     body::Body,
     http,
     response::{IntoResponse, Response},
-    Json,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     cmp::Ordering,
     collections::BTreeMap,
@@ -408,9 +408,27 @@ fn admin_pool_account_status_filter(
 }
 
 fn admin_pool_quota_status_filter(
+    key: &StoredProviderCatalogKey,
+    provider_type: &str,
+    pool_config: Option<&AdminProviderPoolConfig>,
     quota_snapshot: Option<&serde_json::Map<String, Value>>,
 ) -> Option<&'static str> {
     let quota_snapshot = quota_snapshot?;
+    let codex_quota_basis = pool_config.map(|config| config.codex_quota_exhaustion_basis.as_str());
+    if provider_type.trim().eq_ignore_ascii_case("codex")
+        && codex_quota_basis.is_some_and(|basis| admin_pool_codex_quota_basis_is_five_hour(basis))
+        && quota_snapshot
+            .get("code")
+            .and_then(Value::as_str)
+            .is_some_and(|code| code.trim().eq_ignore_ascii_case("exhausted"))
+        && !admin_provider_pool_pure::admin_pool_key_account_quota_exhausted_with_basis(
+            key,
+            provider_type,
+            codex_quota_basis,
+        )
+    {
+        return None;
+    }
     let code = admin_pool_trimmed_string(quota_snapshot.get("code"))
         .unwrap_or_default()
         .to_ascii_lowercase();
@@ -424,6 +442,13 @@ fn admin_pool_quota_status_filter(
             .as_deref()
             .and_then(admin_pool_label_status_filter),
     }
+}
+
+fn admin_pool_codex_quota_basis_is_five_hour(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "5h" | "five_hour" | "five_hours" | "5_hour" | "5_hours"
+    )
 }
 
 fn admin_pool_key_cost_exhausted(
@@ -462,7 +487,9 @@ fn admin_pool_key_visible_status_filter(
     if let Some(status) = admin_pool_account_status_filter(account_snapshot) {
         return status;
     }
-    if let Some(status) = admin_pool_quota_status_filter(quota_snapshot) {
+    if let Some(status) =
+        admin_pool_quota_status_filter(key, provider_type, pool_config, quota_snapshot)
+    {
         return status;
     }
     if let Some(status) = admin_pool_oauth_status_filter(

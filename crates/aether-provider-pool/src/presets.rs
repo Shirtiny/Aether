@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use aether_pool_core::PoolSchedulingPreset;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::capability::ProviderPoolCapability;
 use crate::provider::ProviderPoolAdapter;
@@ -86,6 +86,14 @@ pub fn normalize_provider_scheduling_presets(
 pub fn build_admin_pool_scheduling_presets_payload() -> Value {
     let service = ProviderPoolService::with_builtin_adapters();
     json!([
+        provider_pool_preset_payload(
+            "no_weight",
+            "无权重",
+            "基础分配不叠加 LRU、缓存亲和、单号集中或负载均衡权重",
+            None,
+            "不提供基础排序权重；仅使用启用的策略调度项",
+            &service,
+        ),
         provider_pool_preset_payload(
             "lru",
             "LRU 轮转",
@@ -238,7 +246,9 @@ fn provider_pool_supports_preset(adapter: &dyn ProviderPoolAdapter, preset: &str
 
 fn provider_pool_preset_mutex_group(preset: &str) -> Option<&'static str> {
     match preset {
-        "lru" | "cache_affinity" | "load_balance" | "single_account" => Some("distribution_mode"),
+        "no_weight" | "lru" | "cache_affinity" | "load_balance" | "single_account" => {
+            Some("distribution_mode")
+        }
         _ => None,
     }
 }
