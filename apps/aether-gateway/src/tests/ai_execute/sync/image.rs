@@ -19,7 +19,7 @@ use aether_data_contracts::repository::provider_catalog::{
 use base64::Engine as _;
 use sha2::{Digest, Sha256};
 
-const IMAGE_SYNC_TEST_STACK_BYTES: usize = 16 * 1024 * 1024;
+const IMAGE_SYNC_TEST_STACK_BYTES: usize = 32 * 1024 * 1024;
 
 fn run_image_sync_test<F, Fut>(test_name: &'static str, make_future: F)
 where
@@ -43,8 +43,15 @@ where
     }
 }
 
-#[tokio::test]
-async fn gateway_converts_openai_image_sync_to_gemini_image_provider() {
+#[test]
+fn gateway_converts_openai_image_sync_to_gemini_image_provider() {
+    run_image_sync_test(
+        "gateway_converts_openai_image_sync_to_gemini_image_provider",
+        gateway_converts_openai_image_sync_to_gemini_image_provider_impl,
+    );
+}
+
+async fn gateway_converts_openai_image_sync_to_gemini_image_provider_impl() {
     #[derive(Debug, Clone)]
     struct SeenExecutionRuntimeSyncRequest {
         trace_id: String,
@@ -765,8 +772,15 @@ async fn gateway_converts_gemini_image_sync_to_openai_image_provider_impl() {
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_executes_codex_image_sync_via_local_decision_gate_after_oauth_refresh() {
+#[test]
+fn gateway_executes_codex_image_sync_via_local_decision_gate_after_oauth_refresh() {
+    run_image_sync_test(
+        "gateway_executes_codex_image_sync_via_local_decision_gate_after_oauth_refresh",
+        gateway_executes_codex_image_sync_via_local_decision_gate_after_oauth_refresh_impl,
+    );
+}
+
+async fn gateway_executes_codex_image_sync_via_local_decision_gate_after_oauth_refresh_impl() {
     #[derive(Debug, Clone)]
     struct SeenExecutionRuntimeSyncRequest {
         trace_id: String,
@@ -1271,8 +1285,15 @@ async fn gateway_executes_codex_image_sync_via_local_decision_gate_after_oauth_r
     refresh_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_plans_chatgpt_web_image_sync_with_internal_web_executor_url() {
+#[test]
+fn gateway_plans_chatgpt_web_image_sync_with_internal_web_executor_url() {
+    run_image_sync_test(
+        "gateway_plans_chatgpt_web_image_sync_with_internal_web_executor_url",
+        gateway_plans_chatgpt_web_image_sync_with_internal_web_executor_url_impl,
+    );
+}
+
+async fn gateway_plans_chatgpt_web_image_sync_with_internal_web_executor_url_impl() {
     #[derive(Debug, Clone)]
     struct SeenExecutionRuntimeSyncRequest {
         trace_id: String,

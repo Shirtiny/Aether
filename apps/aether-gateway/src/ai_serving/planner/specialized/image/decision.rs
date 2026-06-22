@@ -118,6 +118,12 @@ pub(super) async fn maybe_build_local_openai_image_decision_payload_for_candidat
             mapped_model: Some(&resolved.mapped_model),
             candidate_group_id: eligible.orchestration.candidate_group_id.as_deref(),
             pool_key_lease: eligible.orchestration.pool_key_lease.as_ref(),
+            pool_sticky_init_owner: eligible.orchestration.pool_sticky_init_owner.as_deref(),
+            pool_sticky_session_token: eligible.orchestration.pool_sticky_session_token.as_deref(),
+            pool_sticky_bound_key_ineligible: eligible
+                .orchestration
+                .pool_sticky_bound_key_ineligible,
+            pool_sticky_bound_key_id: eligible.orchestration.pool_sticky_bound_key_id.as_deref(),
             ranking: eligible.ranking.as_ref(),
             upstream_url: Some(&resolved.upstream_url),
             header_rules: transport.endpoint.header_rules.as_ref(),

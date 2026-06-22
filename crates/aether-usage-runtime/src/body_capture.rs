@@ -1206,7 +1206,10 @@ mod tests {
         assert_eq!(prompt_capture["item_count"], json!(3));
         assert_eq!(prompt_capture["role_counts"]["user"], json!(2));
         assert_eq!(prompt_capture["role_counts"]["developer"], json!(1));
-        assert_eq!(prompt_capture["items"][0]["preview"], json!("Repeat this prompt."));
+        assert_eq!(
+            prompt_capture["items"][0]["preview"],
+            json!("Repeat this prompt.")
+        );
         assert_eq!(
             prompt_capture["items"][1]["preview"],
             json!("Unique request prompt.")

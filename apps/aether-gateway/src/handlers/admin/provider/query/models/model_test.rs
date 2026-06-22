@@ -1001,11 +1001,12 @@ fn provider_query_test_key_sort_key(
     now_unix_secs: u64,
     codex_quota_basis: Option<&str>,
 ) -> (u8, u8, i32, u64, i32) {
-    let quota_exhausted = admin_provider_pool_pure::admin_pool_key_account_quota_exhausted_with_basis(
-        key,
-        provider_type,
-        codex_quota_basis,
-    );
+    let quota_exhausted =
+        admin_provider_pool_pure::admin_pool_key_account_quota_exhausted_with_basis(
+            key,
+            provider_type,
+            codex_quota_basis,
+        );
     let circuit_open = key
         .circuit_breaker_by_format
         .as_ref()
@@ -1530,15 +1531,15 @@ async fn provider_query_build_kiro_test_candidates(
                 .collect::<Vec<_>>()
         }
     } else {
-            keys.sort_by_key(|key| {
-                provider_query_test_key_sort_key(
-                    provider.provider_type.as_str(),
-                    key,
-                    &endpoint.api_format,
-                    now_unix_secs,
-                    None,
-                )
-            });
+        keys.sort_by_key(|key| {
+            provider_query_test_key_sort_key(
+                provider.provider_type.as_str(),
+                key,
+                &endpoint.api_format,
+                now_unix_secs,
+                None,
+            )
+        });
         keys.into_iter()
             .map(|key| ProviderQueryTestCandidate {
                 endpoint: endpoint.clone(),

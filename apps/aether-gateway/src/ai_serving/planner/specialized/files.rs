@@ -5,10 +5,14 @@ mod support;
 use async_trait::async_trait;
 use tracing::warn;
 
-use crate::ai_serving::planner::candidate_materialization::LocalExecutionAttemptSource;
+use crate::ai_serving::planner::candidate_materialization::{
+    local_candidate_attempt_has_sticky_init_owner, release_pool_sticky_init_for_unbuilt_attempt,
+    LocalExecutionAttemptSource,
+};
 use crate::ai_serving::planner::plan_builders::{
     build_passthrough_stream_plan_from_decision, build_passthrough_sync_plan_from_decision,
-    AiStreamAttempt, AiSyncAttempt,
+    stream_attempt_has_sticky_init_owner, sync_attempt_has_sticky_init_owner, AiStreamAttempt,
+    AiSyncAttempt,
 };
 use crate::ai_serving::planner::spec_metadata::local_gemini_files_spec_metadata;
 use crate::ai_serving::GatewayControlDecision;
@@ -176,9 +180,28 @@ pub(crate) async fn build_local_gemini_files_stream_attempt_source_for_kind<'a>(
 impl LocalExecutionAttemptSource<AiSyncAttempt> for LocalGeminiFilesSyncAttemptSource<'_> {
     async fn next_execution_attempt(&mut self) -> Result<Option<AiSyncAttempt>, GatewayError> {
         while let Some(attempt) = self.candidates.next_attempt().await {
-            match self.build_sync_attempt(attempt).await? {
-                Some(attempt) => return Ok(Some(attempt)),
-                None => continue,
+            let cleanup_attempt = attempt.clone();
+            let mut sticky_init_cleanup = attempt.pool_sticky_init_cleanup_guard(self.state);
+            let built_attempt = match self.build_sync_attempt(attempt).await {
+                Ok(value) => value,
+                Err(err) => {
+                    release_pool_sticky_init_for_unbuilt_attempt(self.state, &cleanup_attempt)
+                        .await;
+                    return Err(err);
+                }
+            };
+            match built_attempt {
+                Some(attempt) => {
+                    if let Some(guard) = sticky_init_cleanup.as_mut() {
+                        guard.disarm();
+                    }
+                    return Ok(Some(attempt));
+                }
+                None => {
+                    release_pool_sticky_init_for_unbuilt_attempt(self.state, &cleanup_attempt)
+                        .await;
+                    continue;
+                }
             }
         }
         Ok(None)
@@ -187,8 +210,19 @@ impl LocalExecutionAttemptSource<AiSyncAttempt> for LocalGeminiFilesSyncAttemptS
     async fn drain_execution_attempts(&mut self) -> Result<Vec<AiSyncAttempt>, GatewayError> {
         let mut drained = Vec::new();
         for attempt in self.candidates.drain_static_attempts() {
-            if let Some(attempt) = self.build_sync_attempt(attempt).await? {
-                drained.push(attempt);
+            let cleanup_attempt = attempt.clone();
+            let mut sticky_init_cleanup = attempt.pool_sticky_init_cleanup_guard(self.state);
+            match self.build_sync_attempt(attempt).await {
+                Ok(Some(attempt)) => drained.push(attempt),
+                Ok(None) => {
+                    release_pool_sticky_init_for_unbuilt_attempt(self.state, &cleanup_attempt)
+                        .await;
+                }
+                Err(err) => {
+                    release_pool_sticky_init_for_unbuilt_attempt(self.state, &cleanup_attempt)
+                        .await;
+                    return Err(err);
+                }
             }
         }
         Ok(drained)
@@ -199,9 +233,28 @@ impl LocalExecutionAttemptSource<AiSyncAttempt> for LocalGeminiFilesSyncAttemptS
 impl LocalExecutionAttemptSource<AiStreamAttempt> for LocalGeminiFilesStreamAttemptSource<'_> {
     async fn next_execution_attempt(&mut self) -> Result<Option<AiStreamAttempt>, GatewayError> {
         while let Some(attempt) = self.candidates.next_attempt().await {
-            match self.build_stream_attempt(attempt).await? {
-                Some(attempt) => return Ok(Some(attempt)),
-                None => continue,
+            let cleanup_attempt = attempt.clone();
+            let mut sticky_init_cleanup = attempt.pool_sticky_init_cleanup_guard(self.state);
+            let built_attempt = match self.build_stream_attempt(attempt).await {
+                Ok(value) => value,
+                Err(err) => {
+                    release_pool_sticky_init_for_unbuilt_attempt(self.state, &cleanup_attempt)
+                        .await;
+                    return Err(err);
+                }
+            };
+            match built_attempt {
+                Some(attempt) => {
+                    if let Some(guard) = sticky_init_cleanup.as_mut() {
+                        guard.disarm();
+                    }
+                    return Ok(Some(attempt));
+                }
+                None => {
+                    release_pool_sticky_init_for_unbuilt_attempt(self.state, &cleanup_attempt)
+                        .await;
+                    continue;
+                }
             }
         }
         Ok(None)
@@ -210,8 +263,19 @@ impl LocalExecutionAttemptSource<AiStreamAttempt> for LocalGeminiFilesStreamAtte
     async fn drain_execution_attempts(&mut self) -> Result<Vec<AiStreamAttempt>, GatewayError> {
         let mut drained = Vec::new();
         for attempt in self.candidates.drain_static_attempts() {
-            if let Some(attempt) = self.build_stream_attempt(attempt).await? {
-                drained.push(attempt);
+            let cleanup_attempt = attempt.clone();
+            let mut sticky_init_cleanup = attempt.pool_sticky_init_cleanup_guard(self.state);
+            match self.build_stream_attempt(attempt).await {
+                Ok(Some(attempt)) => drained.push(attempt),
+                Ok(None) => {
+                    release_pool_sticky_init_for_unbuilt_attempt(self.state, &cleanup_attempt)
+                        .await;
+                }
+                Err(err) => {
+                    release_pool_sticky_init_for_unbuilt_attempt(self.state, &cleanup_attempt)
+                        .await;
+                    return Err(err);
+                }
             }
         }
         Ok(drained)
@@ -324,7 +388,8 @@ pub(crate) async fn maybe_build_sync_local_gemini_files_decision_payload(
         build_local_gemini_files_candidate_attempt_source(state, trace_id, &input).await?;
 
     while let Some(attempt) = source.next_attempt().await {
-        if let Some(payload) = maybe_build_local_gemini_files_decision_payload_for_candidate(
+        let cleanup_attempt = attempt.clone();
+        let payload = match maybe_build_local_gemini_files_decision_payload_for_candidate(
             state,
             parts,
             body_json,
@@ -335,10 +400,18 @@ pub(crate) async fn maybe_build_sync_local_gemini_files_decision_payload(
             attempt,
             spec,
         )
-        .await?
+        .await
         {
+            Ok(value) => value,
+            Err(err) => {
+                release_pool_sticky_init_for_unbuilt_attempt(state, &cleanup_attempt).await;
+                return Err(err);
+            }
+        };
+        if let Some(payload) = payload {
             return Ok(Some(payload));
         }
+        release_pool_sticky_init_for_unbuilt_attempt(state, &cleanup_attempt).await;
     }
 
     Ok(None)
@@ -366,7 +439,8 @@ pub(crate) async fn maybe_build_stream_local_gemini_files_decision_payload(
 
     let empty_body_json = serde_json::Value::Null;
     while let Some(attempt) = source.next_attempt().await {
-        if let Some(payload) = maybe_build_local_gemini_files_decision_payload_for_candidate(
+        let cleanup_attempt = attempt.clone();
+        let payload = match maybe_build_local_gemini_files_decision_payload_for_candidate(
             state,
             parts,
             &empty_body_json,
@@ -377,10 +451,18 @@ pub(crate) async fn maybe_build_stream_local_gemini_files_decision_payload(
             attempt,
             spec,
         )
-        .await?
+        .await
         {
+            Ok(value) => value,
+            Err(err) => {
+                release_pool_sticky_init_for_unbuilt_attempt(state, &cleanup_attempt).await;
+                return Err(err);
+            }
+        };
+        if let Some(payload) = payload {
             return Ok(Some(payload));
         }
+        release_pool_sticky_init_for_unbuilt_attempt(state, &cleanup_attempt).await;
     }
 
     Ok(None)
@@ -415,7 +497,9 @@ async fn build_local_sync_plan_and_reports(
 
     let mut plans = Vec::new();
     while let Some(attempt) = source.next_attempt().await {
-        let Some(payload) = maybe_build_local_gemini_files_decision_payload_for_candidate(
+        let sticky_init_attempt = local_candidate_attempt_has_sticky_init_owner(&attempt);
+        let cleanup_attempt = attempt.clone();
+        let payload = match maybe_build_local_gemini_files_decision_payload_for_candidate(
             state,
             parts,
             body_json,
@@ -426,15 +510,35 @@ async fn build_local_sync_plan_and_reports(
             attempt,
             spec,
         )
-        .await?
-        else {
+        .await
+        {
+            Ok(value) => value,
+            Err(err) => {
+                release_pool_sticky_init_for_unbuilt_attempt(state, &cleanup_attempt).await;
+                return Err(err);
+            }
+        };
+        let Some(payload) = payload else {
+            release_pool_sticky_init_for_unbuilt_attempt(state, &cleanup_attempt).await;
             continue;
         };
 
         match build_passthrough_sync_plan_from_decision(parts, payload) {
-            Ok(Some(value)) => plans.push(value),
-            Ok(None) => {}
+            Ok(Some(value)) => {
+                let stop_after_value = sync_attempt_has_sticky_init_owner(&value);
+                if sticky_init_attempt && !stop_after_value {
+                    release_pool_sticky_init_for_unbuilt_attempt(state, &cleanup_attempt).await;
+                }
+                plans.push(value);
+                if stop_after_value {
+                    break;
+                }
+            }
+            Ok(None) => {
+                release_pool_sticky_init_for_unbuilt_attempt(state, &cleanup_attempt).await;
+            }
             Err(err) => {
+                release_pool_sticky_init_for_unbuilt_attempt(state, &cleanup_attempt).await;
                 warn!(
                     trace_id = %trace_id,
                     decision_kind = spec_metadata.decision_kind,
@@ -468,7 +572,9 @@ async fn build_local_stream_plan_and_reports(
     let mut plans = Vec::new();
     let empty_body_json = serde_json::Value::Null;
     while let Some(attempt) = source.next_attempt().await {
-        let Some(payload) = maybe_build_local_gemini_files_decision_payload_for_candidate(
+        let sticky_init_attempt = local_candidate_attempt_has_sticky_init_owner(&attempt);
+        let cleanup_attempt = attempt.clone();
+        let payload = match maybe_build_local_gemini_files_decision_payload_for_candidate(
             state,
             parts,
             &empty_body_json,
@@ -479,15 +585,35 @@ async fn build_local_stream_plan_and_reports(
             attempt,
             spec,
         )
-        .await?
-        else {
+        .await
+        {
+            Ok(value) => value,
+            Err(err) => {
+                release_pool_sticky_init_for_unbuilt_attempt(state, &cleanup_attempt).await;
+                return Err(err);
+            }
+        };
+        let Some(payload) = payload else {
+            release_pool_sticky_init_for_unbuilt_attempt(state, &cleanup_attempt).await;
             continue;
         };
 
         match build_passthrough_stream_plan_from_decision(parts, payload) {
-            Ok(Some(value)) => plans.push(value),
-            Ok(None) => {}
+            Ok(Some(value)) => {
+                let stop_after_value = stream_attempt_has_sticky_init_owner(&value);
+                if sticky_init_attempt && !stop_after_value {
+                    release_pool_sticky_init_for_unbuilt_attempt(state, &cleanup_attempt).await;
+                }
+                plans.push(value);
+                if stop_after_value {
+                    break;
+                }
+            }
+            Ok(None) => {
+                release_pool_sticky_init_for_unbuilt_attempt(state, &cleanup_attempt).await;
+            }
             Err(err) => {
+                release_pool_sticky_init_for_unbuilt_attempt(state, &cleanup_attempt).await;
                 warn!(
                     trace_id = %trace_id,
                     decision_kind = spec_metadata.decision_kind,

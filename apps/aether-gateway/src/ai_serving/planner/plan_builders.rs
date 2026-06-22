@@ -10,6 +10,7 @@ use crate::ai_serving::augment_sync_report_context as augment_sync_report_contex
 pub(crate) use crate::ai_serving::{
     generic_decision_missing_exact_provider_request, AiStreamAttempt, AiSyncAttempt,
 };
+use crate::orchestration::local_execution_candidate_metadata_from_report_context;
 use crate::{AiExecutionDecision, GatewayError};
 
 #[path = "standard/gemini/plan_builders.rs"]
@@ -47,4 +48,16 @@ pub(super) fn augment_sync_report_context(
         provider_request_body,
     )
     .map_err(|err| GatewayError::Internal(err.to_string()))
+}
+
+pub(crate) fn sync_attempt_has_sticky_init_owner(attempt: &AiSyncAttempt) -> bool {
+    local_execution_candidate_metadata_from_report_context(attempt.report_context.as_ref())
+        .pool_sticky_init_owner
+        .is_some()
+}
+
+pub(crate) fn stream_attempt_has_sticky_init_owner(attempt: &AiStreamAttempt) -> bool {
+    local_execution_candidate_metadata_from_report_context(attempt.report_context.as_ref())
+        .pool_sticky_init_owner
+        .is_some()
 }

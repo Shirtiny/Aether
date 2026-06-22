@@ -24,10 +24,21 @@ use std::sync::{Arc, Mutex};
 
 use crate::constants::TRACE_ID_HEADER;
 
-use super::{build_router_with_state, build_state_with_execution_runtime_override, start_server};
+use super::{
+    build_router_with_state, build_state_with_execution_runtime_override, run_video_route_test,
+    start_server,
+};
 
-#[tokio::test]
-async fn gateway_executes_gemini_video_create_via_local_decision_gate_with_local_planning_only() {
+#[test]
+fn gateway_executes_gemini_video_create_via_local_decision_gate_with_local_planning_only() {
+    run_video_route_test(
+        "gateway_executes_gemini_video_create_via_local_decision_gate_with_local_planning_only",
+        gateway_executes_gemini_video_create_via_local_decision_gate_with_local_planning_only_impl,
+    );
+}
+
+async fn gateway_executes_gemini_video_create_via_local_decision_gate_with_local_planning_only_impl(
+) {
     #[derive(Debug, Clone)]
     struct SeenExecutionRuntimeSyncRequest {
         method: String,

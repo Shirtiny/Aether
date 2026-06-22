@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use aether_pool_core::PoolSchedulingPreset;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::capability::ProviderPoolCapability;
 use crate::provider::ProviderPoolAdapter;
@@ -32,7 +32,10 @@ pub fn normalize_provider_scheduling_presets(
         ));
     }
 
-    if !entries.is_empty() {
+    let suppress_default_strategy_presets = entries
+        .iter()
+        .any(|(_, preset)| preset.enabled && preset.preset == "no_weight");
+    if !entries.is_empty() && !suppress_default_strategy_presets {
         for preset in adapter.default_scheduling_presets() {
             let preset_name = preset.preset.trim().to_ascii_lowercase();
             if preset_name.is_empty() || seen.contains(&preset_name) {
@@ -89,15 +92,15 @@ pub fn build_admin_pool_scheduling_presets_payload() -> Value {
         provider_pool_preset_payload(
             "no_weight",
             "无权重",
-            "基础分配不叠加 LRU、缓存亲和、单号集中或负载均衡权重",
+            "基础分配不叠加 LRU、缓存亲和、单号集中或负载均衡权重；会话粘性由 TTL 控制",
             None,
-            "不提供基础排序权重；仅使用启用的策略调度项",
+            "不提供基础排序权重；仅使用启用的策略调度项；TTL 大于 0 时成功后写入会话绑定",
             &service,
         ),
         provider_pool_preset_payload(
             "lru",
             "LRU 轮转",
-            "最久未使用的 Key 优先",
+            "最久未使用的 Key 优先；会话粘性由 TTL 控制",
             None,
             "依据 LRU 时间戳（最近未使用优先）",
             &service,
@@ -105,7 +108,7 @@ pub fn build_admin_pool_scheduling_presets_payload() -> Value {
         provider_pool_preset_payload(
             "cache_affinity",
             "缓存亲和",
-            "优先复用最近使用过的 Key，利用 Prompt Caching",
+            "优先复用最近使用过的 Key，利用 Prompt Caching；会话粘性由 TTL 控制",
             None,
             "依据 LRU 时间戳（最近使用优先，与 LRU 轮转相反）",
             &service,
@@ -145,7 +148,7 @@ pub fn build_admin_pool_scheduling_presets_payload() -> Value {
         provider_pool_preset_payload(
             "load_balance",
             "负载均衡",
-            "随机分散 Key 使用，均匀分摊负载",
+            "随机分散 Key 使用，均匀分摊负载；会话粘性由 TTL 控制",
             None,
             "每次随机分值，实现完全均匀分散",
             &service,
@@ -193,7 +196,7 @@ pub fn build_admin_pool_scheduling_presets_payload() -> Value {
         provider_pool_preset_payload(
             "single_account",
             "单号优先",
-            "集中使用同一账号（反向 LRU）",
+            "集中使用同一账号（反向 LRU）；会话粘性由 TTL 控制",
             None,
             "先按账号优先级（internal_priority），同级再按反向 LRU 集中",
             &service,

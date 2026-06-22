@@ -1,18 +1,18 @@
 use std::io::Write;
 
 use aether_data_contracts::repository::usage::{
-    UsageBodyField, UsageCleanupExecutionMode, UsageCleanupPreviewCounts, UsageCleanupSummary,
-    UsageCleanupTargets, UsageCleanupWindow, parse_usage_body_ref, usage_body_ref,
+    parse_usage_body_ref, usage_body_ref, UsageBodyField, UsageCleanupExecutionMode,
+    UsageCleanupPreviewCounts, UsageCleanupSummary, UsageCleanupTargets, UsageCleanupWindow,
 };
 use chrono::{DateTime, Utc};
-use flate2::{Compression, write::GzEncoder};
+use flate2::{write::GzEncoder, Compression};
 use futures_util::TryStreamExt;
 use serde_json::Value;
 use sqlx::Row;
 use tracing::warn;
 
 use super::SqlxUsageReadRepository;
-use crate::{DataLayerError, driver::postgres::PostgresPool, error::postgres_error};
+use crate::{driver::postgres::PostgresPool, error::postgres_error, DataLayerError};
 
 const DELETE_OLD_USAGE_RECORDS_SQL: &str = r#"
 WITH doomed AS (
@@ -1819,8 +1819,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        UsageBodyCompressionRow, build_usage_body_externalization, compress_usage_json_value,
-        migrate_legacy_body_ref_metadata_plan,
+        build_usage_body_externalization, compress_usage_json_value,
+        migrate_legacy_body_ref_metadata_plan, UsageBodyCompressionRow,
     };
 
     fn inflate_json(bytes: &[u8]) -> serde_json::Value {

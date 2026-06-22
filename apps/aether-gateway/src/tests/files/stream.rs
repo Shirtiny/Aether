@@ -3,7 +3,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 
 use super::{
     any, build_router, build_router_with_state, build_state_with_execution_runtime_override,
-    hash_api_key, json, sample_auth_snapshot, sample_files_candidate_row,
+    hash_api_key, json, run_files_route_test, sample_auth_snapshot, sample_files_candidate_row,
     sample_files_provider_catalog_endpoint, sample_files_provider_catalog_key,
     sample_files_provider_catalog_provider, start_server, to_bytes, Arc, Body, Bytes, HeaderName,
     HeaderValue, InMemoryAuthApiKeySnapshotRepository,
@@ -14,8 +14,16 @@ use super::{
     TRACE_ID_HEADER,
 };
 
-#[tokio::test]
-async fn gateway_executes_gemini_files_download_via_local_decision_gate_with_local_planning_only() {
+#[test]
+fn gateway_executes_gemini_files_download_via_local_decision_gate_with_local_planning_only() {
+    run_files_route_test(
+        "gateway_executes_gemini_files_download_via_local_decision_gate_with_local_planning_only",
+        gateway_executes_gemini_files_download_via_local_decision_gate_with_local_planning_only_impl,
+    );
+}
+
+async fn gateway_executes_gemini_files_download_via_local_decision_gate_with_local_planning_only_impl(
+) {
     #[derive(Debug, Clone)]
     struct SeenExecutionRuntimeStreamRequest {
         method: String,

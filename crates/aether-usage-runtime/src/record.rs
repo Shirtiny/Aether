@@ -83,10 +83,7 @@ fn usage_event_matches_risk_control(data: &crate::UsageEventData) -> bool {
             .is_some_and(usage_json_text_matches_risk_control)
 }
 
-fn attach_risk_control_metadata(
-    metadata: Option<Value>,
-    is_risk_control: bool,
-) -> Option<Value> {
+fn attach_risk_control_metadata(metadata: Option<Value>, is_risk_control: bool) -> Option<Value> {
     if !is_risk_control {
         return metadata;
     }

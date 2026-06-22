@@ -28,6 +28,28 @@ fn hash_api_key(value: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+fn run_lifecycle_large_stack_test<F, Fut>(test_name: &'static str, make_future: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + 'static,
+{
+    let handle = std::thread::Builder::new()
+        .name(test_name.to_string())
+        .stack_size(32 * 1024 * 1024)
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build");
+            runtime.block_on(make_future());
+        })
+        .expect("lifecycle test thread should spawn");
+
+    if let Err(payload) = handle.join() {
+        std::panic::resume_unwind(payload);
+    }
+}
+
 fn sample_local_openai_auth_snapshot(api_key_id: &str, user_id: &str) -> StoredAuthApiKeySnapshot {
     StoredAuthApiKeySnapshot::new(
         user_id.to_string(),
@@ -163,8 +185,15 @@ fn sample_local_openai_key() -> StoredProviderCatalogKey {
     .expect("key transport should build")
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn gateway_completes_sync_response_on_local_execution_runtime_path() {
+#[test]
+fn gateway_completes_sync_response_on_local_execution_runtime_path() {
+    run_lifecycle_large_stack_test(
+        "gateway_completes_sync_response_on_local_execution_runtime_path",
+        gateway_completes_sync_response_on_local_execution_runtime_path_impl,
+    );
+}
+
+async fn gateway_completes_sync_response_on_local_execution_runtime_path_impl() {
     let public_hits = Arc::new(Mutex::new(0usize));
     let public_hits_clone = Arc::clone(&public_hits);
     let upstream = Router::new().route(

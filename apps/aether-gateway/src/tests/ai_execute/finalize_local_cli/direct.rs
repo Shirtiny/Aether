@@ -25,16 +25,16 @@ use aether_data_contracts::repository::provider_catalog::{
 };
 use sha2::{Digest, Sha256};
 
-const KIRO_CLAUDE_CLI_FINALIZE_TEST_STACK_BYTES: usize = 16 * 1024 * 1024;
+const LOCAL_FINALIZE_CLI_TEST_STACK_BYTES: usize = 32 * 1024 * 1024;
 
-fn run_kiro_claude_cli_finalize_test<F, Fut>(test_name: &'static str, make_future: F)
+fn run_local_finalize_cli_test<F, Fut>(test_name: &'static str, make_future: F)
 where
     F: FnOnce() -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()> + 'static,
 {
     let handle = std::thread::Builder::new()
         .name(test_name.to_string())
-        .stack_size(KIRO_CLAUDE_CLI_FINALIZE_TEST_STACK_BYTES)
+        .stack_size(LOCAL_FINALIZE_CLI_TEST_STACK_BYTES)
         .spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -42,15 +42,22 @@ where
                 .expect("test runtime should build");
             runtime.block_on(make_future());
         })
-        .expect("kiro claude cli finalize test thread should spawn");
+        .expect("local finalize cli test thread should spawn");
 
     if let Err(payload) = handle.join() {
         std::panic::resume_unwind(payload);
     }
 }
 
-#[tokio::test]
-async fn gateway_executes_openai_responses_sync_upstream_stream_via_local_finalize_response() {
+#[test]
+fn gateway_executes_openai_responses_sync_upstream_stream_via_local_finalize_response() {
+    run_local_finalize_cli_test(
+        "gateway_executes_openai_responses_sync_upstream_stream_via_local_finalize_response",
+        gateway_executes_openai_responses_sync_upstream_stream_via_local_finalize_response_impl,
+    );
+}
+
+async fn gateway_executes_openai_responses_sync_upstream_stream_via_local_finalize_response_impl() {
     use base64::Engine as _;
 
     #[derive(Debug, Clone)]
@@ -501,7 +508,7 @@ async fn gateway_executes_openai_responses_sync_upstream_stream_via_local_finali
 
 #[test]
 fn gateway_executes_kiro_claude_cli_sync_upstream_stream_via_local_finalize_response() {
-    run_kiro_claude_cli_finalize_test(
+    run_local_finalize_cli_test(
         "gateway_executes_kiro_claude_cli_sync_upstream_stream_via_local_finalize_response",
         gateway_executes_kiro_claude_cli_sync_upstream_stream_via_local_finalize_response_impl,
     );

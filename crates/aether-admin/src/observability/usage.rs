@@ -1,6 +1,6 @@
 use crate::observability::stats::{aggregate_usage_stats, parse_bounded_u32, round_to};
-use aether_ai_formats::UPSTREAM_IS_STREAM_KEY;
 use aether_ai_formats::api::request_path_implies_stream_request;
+use aether_ai_formats::UPSTREAM_IS_STREAM_KEY;
 use aether_billing::{
     normalize_input_tokens_for_billing, normalize_total_input_context_for_cache_hit_rate,
 };
@@ -10,12 +10,12 @@ use aether_data_contracts::repository::{
     usage::{StoredRequestUsageAudit, StoredUsageAuditSummary, UsageBodyField},
 };
 use axum::{
-    Json,
     body::Body,
     http,
     response::{IntoResponse, Response},
+    Json,
 };
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use url::form_urlencoded;
 
@@ -251,8 +251,7 @@ pub fn admin_usage_is_failed(item: &StoredRequestUsageAudit) -> bool {
 }
 
 pub fn admin_usage_is_risk_control(item: &StoredRequestUsageAudit) -> bool {
-    item
-        .request_metadata
+    item.request_metadata
         .as_ref()
         .and_then(Value::as_object)
         .and_then(|metadata| metadata.get("is_risk_control"))
@@ -2822,8 +2821,8 @@ mod tests {
     }
 
     #[test]
-    fn client_requested_stream_defaults_to_non_stream_for_openai_responses_request_body_without_flag()
-     {
+    fn client_requested_stream_defaults_to_non_stream_for_openai_responses_request_body_without_flag(
+    ) {
         let item = StoredRequestUsageAudit {
             is_stream: true,
             api_format: Some("openai:responses".to_string()),

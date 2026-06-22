@@ -16,6 +16,30 @@ use aether_data::repository::usage::InMemoryUsageReadRepository;
 use aether_data::repository::wallet::{InMemoryWalletRepository, StoredWalletSnapshot};
 use base64::Engine as _;
 
+const INTERNAL_GATEWAY_EXECUTE_TEST_STACK_BYTES: usize = 32 * 1024 * 1024;
+
+fn run_internal_gateway_execute_test<F, Fut>(test_name: &'static str, make_future: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + 'static,
+{
+    let handle = std::thread::Builder::new()
+        .name(test_name.to_string())
+        .stack_size(INTERNAL_GATEWAY_EXECUTE_TEST_STACK_BYTES)
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build");
+            runtime.block_on(make_future());
+        })
+        .expect("internal gateway execute test thread should spawn");
+
+    if let Err(payload) = handle.join() {
+        std::panic::resume_unwind(payload);
+    }
+}
+
 #[tokio::test]
 async fn gateway_handles_internal_gateway_resolve_without_proxying_upstream() {
     let upstream_hits = Arc::new(Mutex::new(0usize));
@@ -160,8 +184,15 @@ async fn gateway_returns_internal_gateway_plan_sync_proxy_public_action_without_
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_handles_internal_gateway_execute_sync_locally() {
+#[test]
+fn gateway_handles_internal_gateway_execute_sync_locally() {
+    run_internal_gateway_execute_test(
+        "gateway_handles_internal_gateway_execute_sync_locally",
+        gateway_handles_internal_gateway_execute_sync_locally_impl,
+    );
+}
+
+async fn gateway_handles_internal_gateway_execute_sync_locally_impl() {
     let upstream_hits = Arc::new(Mutex::new(0usize));
     let upstream_hits_clone = Arc::clone(&upstream_hits);
     let fallback_probe = Router::new().route(
@@ -336,8 +367,15 @@ async fn gateway_returns_internal_gateway_execute_stream_proxy_public_action_wit
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_handles_internal_gateway_execute_stream_locally() {
+#[test]
+fn gateway_handles_internal_gateway_execute_stream_locally() {
+    run_internal_gateway_execute_test(
+        "gateway_handles_internal_gateway_execute_stream_locally",
+        gateway_handles_internal_gateway_execute_stream_locally_impl,
+    );
+}
+
+async fn gateway_handles_internal_gateway_execute_stream_locally_impl() {
     let upstream_hits = Arc::new(Mutex::new(0usize));
     let upstream_hits_clone = Arc::clone(&upstream_hits);
     let fallback_probe = Router::new().route(

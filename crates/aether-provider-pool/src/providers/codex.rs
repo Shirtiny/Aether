@@ -56,7 +56,9 @@ impl ProviderPoolAdapter for CodexProviderPoolAdapter {
             return exhausted;
         }
         provider_pool_metadata_bucket(input.key.upstream_metadata.as_ref(), input.provider_type)
-            .is_some_and(|bucket| quota_exhausted_from_bucket_with_basis(bucket, input.codex_quota_basis))
+            .is_some_and(|bucket| {
+                quota_exhausted_from_bucket_with_basis(bucket, input.codex_quota_basis)
+            })
     }
 
     fn quota_refresh_endpoint(
@@ -204,10 +206,6 @@ fn codex_window_used_percent_exhausted(bucket: &Map<String, Value>, prefix: &str
         .is_some_and(|value| value >= 100.0 && !codex_window_reset_elapsed(bucket, prefix))
 }
 
-pub(crate) fn quota_exhausted_from_bucket(bucket: &Map<String, Value>) -> bool {
-    quota_exhausted_from_bucket_with_basis(bucket, None)
-}
-
 fn normalized_codex_quota_basis(value: Option<&str>) -> &'static str {
     match value
         .map(str::trim)
@@ -247,7 +245,10 @@ fn codex_quota_exhausted_from_status_snapshot(
                 .is_some_and(|code| code.trim().eq_ignore_ascii_case("5h"))
         })?;
 
-    Some(provider_pool_quota_window_active_exhausted(window, quota_snapshot))
+    Some(provider_pool_quota_window_active_exhausted(
+        window,
+        quota_snapshot,
+    ))
 }
 
 fn provider_pool_quota_window_active_exhausted(
@@ -270,7 +271,10 @@ fn provider_pool_quota_window_active_exhausted(
     !provider_pool_reset_deadline_elapsed(window, snapshot_observed_at, now)
 }
 
-fn quota_exhausted_from_bucket_with_basis(bucket: &Map<String, Value>, basis: Option<&str>) -> bool {
+fn quota_exhausted_from_bucket_with_basis(
+    bucket: &Map<String, Value>,
+    basis: Option<&str>,
+) -> bool {
     if provider_pool_json_bool(bucket.get("credits_unlimited")) == Some(true) {
         return false;
     }
@@ -301,8 +305,10 @@ mod tests {
         .cloned()
         .expect("bucket should be object");
 
-        assert!(quota_exhausted_from_bucket(&bucket));
-        assert!(quota_exhausted_from_bucket_with_basis(&bucket, Some("weekly")));
+        assert!(quota_exhausted_from_bucket_with_basis(
+            &bucket,
+            Some("weekly")
+        ));
         assert!(quota_exhausted_from_bucket_with_basis(&bucket, None));
     }
 
@@ -317,6 +323,9 @@ mod tests {
         .expect("bucket should be object");
 
         assert!(!quota_exhausted_from_bucket_with_basis(&bucket, Some("5h")));
-        assert!(!quota_exhausted_from_bucket_with_basis(&bucket, Some("five_hour")));
+        assert!(!quota_exhausted_from_bucket_with_basis(
+            &bucket,
+            Some("five_hour")
+        ));
     }
 }

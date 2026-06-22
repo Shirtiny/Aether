@@ -1,3 +1,4 @@
+use crate::ai_serving::planner::candidate_materialization::release_pool_sticky_init_for_unbuilt_attempt;
 use crate::ai_serving::planner::common::extract_requested_model_from_request;
 use crate::ai_serving::planner::runtime_miss::{
     apply_local_runtime_candidate_evaluation_progress_preserving_candidate_signal,
@@ -67,14 +68,22 @@ pub(crate) async fn maybe_build_sync_local_same_format_provider_decision_payload
     );
 
     while let Some(attempt) = source.next_attempt().await {
-        if let Some(payload) =
-            maybe_build_local_same_format_provider_decision_payload_for_candidate(
-                state, parts, trace_id, body_json, &input, attempt, spec,
-            )
-            .await?
+        let cleanup_attempt = attempt.clone();
+        let payload = match maybe_build_local_same_format_provider_decision_payload_for_candidate(
+            state, parts, trace_id, body_json, &input, attempt, spec,
+        )
+        .await
         {
+            Ok(value) => value,
+            Err(err) => {
+                release_pool_sticky_init_for_unbuilt_attempt(state, &cleanup_attempt).await;
+                return Err(err);
+            }
+        };
+        if let Some(payload) = payload {
             return Ok(Some(payload));
         }
+        release_pool_sticky_init_for_unbuilt_attempt(state, &cleanup_attempt).await;
     }
 
     apply_local_runtime_candidate_terminal_reason(state, trace_id, "no_local_sync_plans");
@@ -135,14 +144,22 @@ pub(crate) async fn maybe_build_stream_local_same_format_provider_decision_paylo
     );
 
     while let Some(attempt) = source.next_attempt().await {
-        if let Some(payload) =
-            maybe_build_local_same_format_provider_decision_payload_for_candidate(
-                state, parts, trace_id, body_json, &input, attempt, spec,
-            )
-            .await?
+        let cleanup_attempt = attempt.clone();
+        let payload = match maybe_build_local_same_format_provider_decision_payload_for_candidate(
+            state, parts, trace_id, body_json, &input, attempt, spec,
+        )
+        .await
         {
+            Ok(value) => value,
+            Err(err) => {
+                release_pool_sticky_init_for_unbuilt_attempt(state, &cleanup_attempt).await;
+                return Err(err);
+            }
+        };
+        if let Some(payload) = payload {
             return Ok(Some(payload));
         }
+        release_pool_sticky_init_for_unbuilt_attempt(state, &cleanup_attempt).await;
     }
 
     apply_local_runtime_candidate_terminal_reason(state, trace_id, "no_local_stream_plans");

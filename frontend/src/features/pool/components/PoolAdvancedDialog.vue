@@ -142,11 +142,14 @@
             <Input
               :model-value="form.sticky_session_ttl_seconds ?? ''"
               type="number"
-              min="60"
+              min="0"
               max="86400"
-              placeholder="3600 (留空禁用)"
+              placeholder="3600 (0 或留空禁用)"
               @update:model-value="(v) => form.sticky_session_ttl_seconds = parseNum(v)"
             />
+            <p class="text-xs leading-5 text-muted-foreground">
+              大于 0 时所有分配模式都会启用会话粘性，并在请求成功后绑定该账号；0 或留空关闭。
+            </p>
           </div>
           <div class="space-y-1.5">
             <Label>

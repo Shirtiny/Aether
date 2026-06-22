@@ -2029,7 +2029,7 @@ const poolSchedulingLabel = computed(() => {
   }
 
   const lruEnabled = cfg.scheduling_mode === 'lru' || cfg.lru_enabled === true
-  const stickyTtl = Number(cfg.sticky_session_ttl_seconds ?? 3600)
+  const stickyTtl = Number(cfg.sticky_session_ttl_seconds ?? 0)
   const stickyEnabled = Number.isFinite(stickyTtl) && stickyTtl > 0
 
   if (lruEnabled && stickyEnabled) return 'LRU + 粘性'

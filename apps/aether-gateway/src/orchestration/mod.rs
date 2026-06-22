@@ -19,19 +19,24 @@ pub(crate) use self::adaptive::{
 };
 pub(crate) use self::attempt::{
     attempt_identity_from_report_context, build_local_attempt_identities,
-    insert_pool_key_lease_report_context_fields, local_attempt_slot_count,
+    insert_pool_key_lease_report_context_fields,
+    insert_pool_sticky_bound_key_ineligible_report_context_field,
+    insert_pool_sticky_init_owner_report_context_field,
+    insert_pool_sticky_session_token_report_context_field, local_attempt_slot_count,
     local_execution_candidate_metadata_from_report_context, ExecutionAttemptIdentity,
-    LocalExecutionCandidateMetadata, SCHEDULER_AFFINITY_EPOCH_REPORT_FIELD,
+    LocalExecutionCandidateMetadata, POOL_STICKY_SESSION_TOKEN_REPORT_FIELD,
+    SCHEDULER_AFFINITY_EPOCH_REPORT_FIELD,
 };
 pub(crate) use self::classifier::{
     classify_local_failover, local_failover_error_message, LocalFailoverClassification,
     LocalFailoverInput,
 };
 pub(crate) use self::effects::{
-    apply_local_execution_effect, LocalAdaptiveRateLimitEffect, LocalAdaptiveSuccessEffect,
-    LocalAttemptFailureEffect, LocalExecutionEffect, LocalExecutionEffectContext,
-    LocalHealthFailureEffect, LocalHealthSuccessEffect, LocalOAuthInvalidationEffect,
-    LocalPoolErrorEffect,
+    apply_local_execution_effect, prepare_pool_attempt_started_effect,
+    release_pool_sticky_initialization_for_owner, LocalAdaptiveRateLimitEffect,
+    LocalAdaptiveSuccessEffect, LocalAttemptFailureEffect, LocalExecutionEffect,
+    LocalExecutionEffectContext, LocalHealthFailureEffect, LocalHealthSuccessEffect,
+    LocalOAuthInvalidationEffect, LocalPoolErrorEffect, PoolAttemptStartCleanupGuard,
 };
 pub(crate) use self::health::{
     project_local_failure_health, project_local_key_circuit_closed,

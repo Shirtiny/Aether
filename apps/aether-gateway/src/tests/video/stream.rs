@@ -21,12 +21,19 @@ use std::sync::{Arc, Mutex};
 use crate::constants::{CONTROL_EXECUTED_HEADER, CONTROL_EXECUTE_FALLBACK_HEADER, TRACE_ID_HEADER};
 
 use super::{
-    build_router_with_state, build_state_with_execution_runtime_override, start_server,
-    VideoTaskTruthSourceMode,
+    build_router_with_state, build_state_with_execution_runtime_override, run_video_route_test,
+    start_server, VideoTaskTruthSourceMode,
 };
 
-#[tokio::test]
-async fn gateway_executes_openai_video_content_from_reconstructed_data_task_without_decision_stream(
+#[test]
+fn gateway_executes_openai_video_content_from_reconstructed_data_task_without_decision_stream() {
+    run_video_route_test(
+        "gateway_executes_openai_video_content_from_reconstructed_data_task_without_decision_stream",
+        gateway_executes_openai_video_content_from_reconstructed_data_task_without_decision_stream_impl,
+    );
+}
+
+async fn gateway_executes_openai_video_content_from_reconstructed_data_task_without_decision_stream_impl(
 ) {
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct SeenExecutionRuntimeStreamRequest {

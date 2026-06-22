@@ -31,7 +31,7 @@ where
 {
     let handle = std::thread::Builder::new()
         .name(name.to_string())
-        .stack_size(8 * 1024 * 1024)
+        .stack_size(32 * 1024 * 1024)
         .spawn(move || {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -421,8 +421,15 @@ async fn gateway_truncates_deep_request_echo_for_local_openai_chat_sync_usage_im
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_applies_system_max_request_body_size_to_local_openai_chat_sync_usage() {
+#[test]
+fn gateway_applies_system_max_request_body_size_to_local_openai_chat_sync_usage() {
+    run_async_test_on_large_stack(
+        "gateway_applies_system_max_request_body_size_to_local_openai_chat_sync_usage",
+        gateway_applies_system_max_request_body_size_to_local_openai_chat_sync_usage_impl(),
+    );
+}
+
+async fn gateway_applies_system_max_request_body_size_to_local_openai_chat_sync_usage_impl() {
     let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
     let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
 
@@ -711,8 +718,16 @@ async fn gateway_strips_request_and_response_bodies_when_request_record_level_is
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_records_failed_usage_when_all_local_openai_chat_candidates_exhaust_after_retryable_sync_failure(
+#[test]
+fn gateway_records_failed_usage_when_all_local_openai_chat_candidates_exhaust_after_retryable_sync_failure(
+) {
+    run_async_test_on_large_stack(
+        "gateway_records_failed_usage_when_all_local_openai_chat_candidates_exhaust_after_retryable_sync_failure",
+        gateway_records_failed_usage_when_all_local_openai_chat_candidates_exhaust_after_retryable_sync_failure_impl(),
+    );
+}
+
+async fn gateway_records_failed_usage_when_all_local_openai_chat_candidates_exhaust_after_retryable_sync_failure_impl(
 ) {
     let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
     let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
@@ -854,8 +869,15 @@ async fn gateway_records_failed_usage_when_all_local_openai_chat_candidates_exha
     assert_eq!(stored_candidates[0].status_code, Some(503));
 }
 
-#[tokio::test]
-async fn gateway_records_failed_usage_when_sync_runtime_transport_is_unavailable_without_plan_fallback(
+#[test]
+fn gateway_records_failed_usage_when_sync_runtime_transport_is_unavailable_without_plan_fallback() {
+    run_async_test_on_large_stack(
+        "gateway_records_failed_usage_when_sync_runtime_transport_is_unavailable_without_plan_fallback",
+        gateway_records_failed_usage_when_sync_runtime_transport_is_unavailable_without_plan_fallback_impl(),
+    );
+}
+
+async fn gateway_records_failed_usage_when_sync_runtime_transport_is_unavailable_without_plan_fallback_impl(
 ) {
     let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
     let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
@@ -1166,8 +1188,16 @@ async fn gateway_records_failed_usage_for_claude_runtime_miss_without_execution_
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_handles_local_openai_chat_stream_report_with_local_reporting_when_usage_runtime_enabled(
+#[test]
+fn gateway_handles_local_openai_chat_stream_report_with_local_reporting_when_usage_runtime_enabled()
+{
+    run_async_test_on_large_stack(
+        "gateway_handles_local_openai_chat_stream_report_with_local_reporting_when_usage_runtime_enabled",
+        gateway_handles_local_openai_chat_stream_report_with_local_reporting_when_usage_runtime_enabled_impl(),
+    );
+}
+
+async fn gateway_handles_local_openai_chat_stream_report_with_local_reporting_when_usage_runtime_enabled_impl(
 ) {
     let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
     let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
@@ -1333,8 +1363,15 @@ async fn gateway_handles_local_openai_chat_stream_report_with_local_reporting_wh
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_preserves_stream_usage_when_max_response_body_size_truncates_capture() {
+#[test]
+fn gateway_preserves_stream_usage_when_max_response_body_size_truncates_capture() {
+    run_async_test_on_large_stack(
+        "gateway_preserves_stream_usage_when_max_response_body_size_truncates_capture",
+        gateway_preserves_stream_usage_when_max_response_body_size_truncates_capture_impl(),
+    );
+}
+
+async fn gateway_preserves_stream_usage_when_max_response_body_size_truncates_capture_impl() {
     let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
     let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
 

@@ -1268,12 +1268,10 @@ pub(super) fn build_admin_pool_key_payload(
     payload.insert("oauth_invalid_at".to_string(), json!(oauth_invalid_at));
     payload.insert(
         "oauth_invalid_reason".to_string(),
-        json!(
-            auth_semantics
-                .can_show_oauth_metadata()
-                .then_some(key.oauth_invalid_reason.clone())
-                .flatten()
-        ),
+        json!(auth_semantics
+            .can_show_oauth_metadata()
+            .then_some(key.oauth_invalid_reason.clone())
+            .flatten()),
     );
     payload.insert("oauth_plan_type".to_string(), json!(oauth_plan_type));
     payload.insert("oauth_account_id".to_string(), json!(oauth_account_id));
@@ -1410,21 +1408,17 @@ pub(super) fn build_admin_pool_key_payload(
     );
     payload.insert(
         "cost_window_usage".to_string(),
-        json!(
-            runtime
-                .cost_window_usage_by_key
-                .get(&key.id)
-                .copied()
-                .unwrap_or(0)
-        ),
+        json!(runtime
+            .cost_window_usage_by_key
+            .get(&key.id)
+            .copied()
+            .unwrap_or(0)),
     );
     payload.insert(
         "cost_limit".to_string(),
-        json!(
-            pool_config
-                .as_ref()
-                .map(|config| config.cost_limit_per_key_tokens)
-        ),
+        json!(pool_config
+            .as_ref()
+            .map(|config| config.cost_limit_per_key_tokens)),
     );
     payload.insert(
         "request_count".to_string(),
@@ -1437,13 +1431,11 @@ pub(super) fn build_admin_pool_key_payload(
     );
     payload.insert(
         "sticky_sessions".to_string(),
-        json!(
-            runtime
-                .sticky_sessions_by_key
-                .get(&key.id)
-                .copied()
-                .unwrap_or(0)
-        ),
+        json!(runtime
+            .sticky_sessions_by_key
+            .get(&key.id)
+            .copied()
+            .unwrap_or(0)),
     );
     payload.insert(
         "lru_score".to_string(),

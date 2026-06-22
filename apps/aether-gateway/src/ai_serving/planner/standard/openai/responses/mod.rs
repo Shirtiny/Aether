@@ -1,3 +1,4 @@
+use crate::ai_serving::planner::candidate_materialization::release_pool_sticky_init_for_unbuilt_attempt;
 use crate::ai_serving::planner::plan_builders::{AiStreamAttempt, AiSyncAttempt};
 use crate::ai_serving::GatewayControlDecision;
 use crate::{AiExecutionDecision, AppState, GatewayError};
@@ -115,13 +116,22 @@ pub(crate) async fn maybe_build_sync_local_openai_responses_decision_payload(
     .await?;
 
     while let Some(attempt) = source.next_attempt().await {
-        if let Some(payload) = maybe_build_local_openai_responses_decision_payload_for_candidate(
+        let cleanup_attempt = attempt.clone();
+        let payload = match maybe_build_local_openai_responses_decision_payload_for_candidate(
             state, parts, trace_id, body_json, &input, attempt, spec,
         )
-        .await?
+        .await
         {
+            Ok(value) => value,
+            Err(err) => {
+                release_pool_sticky_init_for_unbuilt_attempt(state, &cleanup_attempt).await;
+                return Err(err);
+            }
+        };
+        if let Some(payload) = payload {
             return Ok(Some(payload));
         }
+        release_pool_sticky_init_for_unbuilt_attempt(state, &cleanup_attempt).await;
     }
 
     Ok(None)
@@ -154,13 +164,22 @@ pub(crate) async fn maybe_build_stream_local_openai_responses_decision_payload(
     .await?;
 
     while let Some(attempt) = source.next_attempt().await {
-        if let Some(payload) = maybe_build_local_openai_responses_decision_payload_for_candidate(
+        let cleanup_attempt = attempt.clone();
+        let payload = match maybe_build_local_openai_responses_decision_payload_for_candidate(
             state, parts, trace_id, body_json, &input, attempt, spec,
         )
-        .await?
+        .await
         {
+            Ok(value) => value,
+            Err(err) => {
+                release_pool_sticky_init_for_unbuilt_attempt(state, &cleanup_attempt).await;
+                return Err(err);
+            }
+        };
+        if let Some(payload) = payload {
             return Ok(Some(payload));
         }
+        release_pool_sticky_init_for_unbuilt_attempt(state, &cleanup_attempt).await;
     }
 
     Ok(None)

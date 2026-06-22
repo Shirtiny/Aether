@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest'
 
-import { moveStrategyItem } from '@/features/pool/utils/poolSchedulingDialog'
+import {
+  hydrateSchedulingPresetList,
+  legacySchedulingPresetIncludesDistributionMode,
+  moveStrategyItem,
+  normalizeMutexSelection,
+} from '@/features/pool/utils/poolSchedulingDialog'
 
 interface TestPresetItem {
   preset: string
@@ -71,5 +76,73 @@ describe('poolSchedulingDialog', () => {
     const moved = moveStrategyItem(original, 1, 1)
 
     expect(moved.map(item => item.preset)).toEqual(original.map(item => item.preset))
+  })
+
+  it('keeps the first enabled mutex item from loaded config order', () => {
+    const normalized = normalizeMutexSelection([
+      { preset: 'cache_affinity', mutexGroup: 'distribution_mode', enabled: true },
+      { preset: 'no_weight', mutexGroup: 'distribution_mode', enabled: true },
+      { preset: 'lru', mutexGroup: 'distribution_mode', enabled: false },
+    ])
+
+    expect(normalized.map(item => [item.preset, item.enabled])).toEqual([
+      ['cache_affinity', true],
+      ['no_weight', false],
+      ['lru', false],
+    ])
+  })
+
+  it('skips non-applicable mutex items when choosing a winner', () => {
+    const normalized = normalizeMutexSelection([
+      { preset: 'cache_affinity', mutexGroup: 'distribution_mode', enabled: true, applicable: false },
+      { preset: 'no_weight', mutexGroup: 'distribution_mode', enabled: true, applicable: true },
+      { preset: 'lru', mutexGroup: 'distribution_mode', enabled: false, applicable: true },
+    ])
+
+    expect(normalized.map(item => [item.preset, item.enabled])).toEqual([
+      ['cache_affinity', false],
+      ['no_weight', true],
+      ['lru', false],
+    ])
+  })
+
+  it('detects explicit legacy distribution presets', () => {
+    expect(legacySchedulingPresetIncludesDistributionMode(['cache_affinity', 'priority_first'])).toBe(true)
+    expect(legacySchedulingPresetIncludesDistributionMode([' no_weight '])).toBe(true)
+    expect(legacySchedulingPresetIncludesDistributionMode(['recent_refresh', 'priority_first'])).toBe(false)
+    expect(legacySchedulingPresetIncludesDistributionMode([null, ''])).toBe(false)
+  })
+
+  it('hydrates legacy non-LRU configs as cache affinity rather than no weight', () => {
+    const hydrated = hydrateSchedulingPresetList({ lru_enabled: false })
+
+    expect(hydrated.find(item => item.preset === 'cache_affinity')?.enabled).toBe(true)
+    expect(hydrated.find(item => item.preset === 'no_weight')?.enabled).toBe(false)
+    expect(hydrated.find(item => item.preset === 'lru')?.enabled).toBe(false)
+  })
+
+  it('hydrates explicit legacy distribution presets without overriding them', () => {
+    for (const preset of ['cache_affinity', 'load_balance', 'single_account'] as const) {
+      const hydrated = hydrateSchedulingPresetList({
+        lru_enabled: false,
+        scheduling_presets: [preset, 'priority_first'],
+      })
+
+      expect(hydrated.find(item => item.preset === preset)?.enabled).toBe(true)
+      expect(hydrated.find(item => item.preset === 'no_weight')?.enabled).toBe(false)
+      expect(hydrated.find(item => item.preset === 'lru')?.enabled).toBe(false)
+      expect(hydrated.find(item => item.preset === 'priority_first')?.enabled).toBe(true)
+    }
+  })
+
+  it('hydrates explicit legacy no-weight presets as no weight', () => {
+    const hydrated = hydrateSchedulingPresetList({
+      lru_enabled: false,
+      scheduling_presets: ['no_weight', 'priority_first'],
+    })
+
+    expect(hydrated.find(item => item.preset === 'no_weight')?.enabled).toBe(true)
+    expect(hydrated.find(item => item.preset === 'cache_affinity')?.enabled).toBe(false)
+    expect(hydrated.find(item => item.preset === 'priority_first')?.enabled).toBe(true)
   })
 })

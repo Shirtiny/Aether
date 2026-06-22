@@ -982,14 +982,14 @@ pub(super) async fn handle_users_me_usage_get(
                     provider_name: None,
                     model: None,
                     api_format: None,
-                statuses: None,
-                is_stream: None,
-                error_only: false,
-                risk_control_only: false,
-                limit: None,
-                offset: None,
-                newest_first: true,
-            })
+                    statuses: None,
+                    is_stream: None,
+                    error_only: false,
+                    risk_control_only: false,
+                    limit: None,
+                    offset: None,
+                    newest_first: true,
+                })
                 .await
             {
                 Ok(value) => usize::try_from(value).unwrap_or(usize::MAX),

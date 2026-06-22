@@ -3688,6 +3688,15 @@ async fn execute_stream_from_frame_stream(
                 },
             )
             .await;
+            apply_local_execution_effect(
+                &state_for_report,
+                LocalExecutionEffectContext {
+                    plan: &plan_for_report,
+                    report_context: usage_payload.report_context.as_ref(),
+                },
+                LocalExecutionEffect::PoolAttemptAborted,
+            )
+            .await;
             return;
         }
 
@@ -3951,6 +3960,13 @@ mod tests {
         ClientVisibleStreamCompletionTracker,
     };
     use crate::control::GatewayControlDecision;
+    use crate::handlers::shared::provider_pool::{
+        admin_provider_pool_config_from_config_value,
+        admin_provider_pool_sticky_session_init_exists,
+        claim_admin_provider_pool_sticky_session_init,
+        clear_admin_provider_pool_sticky_session_prebind_if_owner,
+        prebind_admin_provider_pool_sticky_session,
+    };
     use crate::tunnel::{tunnel_protocol, TunnelProxyConn};
     use crate::AppState;
 
@@ -5271,6 +5287,33 @@ mod tests {
             }));
         }
         .boxed();
+        let pool_config = admin_provider_pool_config_from_config_value(Some(&json!({
+            "pool_advanced": {
+                "sticky_session_ttl_seconds": 120
+            }
+        })))
+        .expect("pool config should parse");
+        assert!(
+            claim_admin_provider_pool_sticky_session_init(
+                state.runtime_state.as_ref(),
+                "prov-1",
+                Some("session-client-drop"),
+                "owner-client-drop",
+                Duration::from_secs(30),
+            )
+            .await
+        );
+        assert!(
+            prebind_admin_provider_pool_sticky_session(
+                state.runtime_state.as_ref(),
+                "prov-1",
+                "key-1",
+                &pool_config,
+                Some("session-client-drop"),
+                Some("owner-client-drop"),
+            )
+            .await
+        );
 
         let response = execute_stream_from_frame_stream(
             &state,
@@ -5752,7 +5795,9 @@ mod tests {
                 "candidate_index": 0,
                 "retry_index": 0,
                 "provider_api_format": "openai:chat",
-                "client_api_format": "openai:chat"
+                "client_api_format": "openai:chat",
+                "pool_sticky_init_owner": "owner-client-drop",
+                "pool_sticky_session_token": "session-client-drop"
             })),
             crate::clock::current_unix_ms(),
             Instant::now(),
@@ -5843,6 +5888,26 @@ mod tests {
         assert!(
             response_time_ms > first_byte_time_ms,
             "terminal duration should include time after the first byte"
+        );
+        assert!(
+            !admin_provider_pool_sticky_session_init_exists(
+                state.runtime_state.as_ref(),
+                "prov-1",
+                Some("session-client-drop"),
+            )
+            .await,
+            "downstream disconnect should release sticky init ownership"
+        );
+        assert!(
+            !clear_admin_provider_pool_sticky_session_prebind_if_owner(
+                state.runtime_state.as_ref(),
+                "prov-1",
+                "key-1",
+                Some("session-client-drop"),
+                Some("owner-client-drop"),
+            )
+            .await,
+            "downstream disconnect should clear provisional sticky prebind marker"
         );
     }
 

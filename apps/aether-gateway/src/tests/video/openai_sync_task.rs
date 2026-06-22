@@ -23,12 +23,20 @@ use std::sync::{Arc, Mutex};
 use crate::constants::{CONTROL_EXECUTED_HEADER, CONTROL_EXECUTE_FALLBACK_HEADER, TRACE_ID_HEADER};
 
 use super::{
-    build_router_with_state, build_state_with_execution_runtime_override, start_server,
-    VideoTaskTruthSourceMode,
+    build_router_with_state, build_state_with_execution_runtime_override, run_video_route_test,
+    start_server, VideoTaskTruthSourceMode,
 };
 
-#[tokio::test]
-async fn gateway_executes_openai_video_delete_via_reconstructed_data_backed_local_follow_up_with_local_follow_up_routing(
+#[test]
+fn gateway_executes_openai_video_delete_via_reconstructed_data_backed_local_follow_up_with_local_follow_up_routing(
+) {
+    run_video_route_test(
+        "gateway_executes_openai_video_delete_via_reconstructed_data_backed_local_follow_up_with_local_follow_up_routing",
+        gateway_executes_openai_video_delete_via_reconstructed_data_backed_local_follow_up_with_local_follow_up_routing_impl,
+    );
+}
+
+async fn gateway_executes_openai_video_delete_via_reconstructed_data_backed_local_follow_up_with_local_follow_up_routing_impl(
 ) {
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct SeenExecutionRuntimeSyncRequest {

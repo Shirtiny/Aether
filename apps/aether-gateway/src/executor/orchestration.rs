@@ -52,6 +52,10 @@ use crate::executor::{
     LocalExecutionExhaustion, LocalExecutionRequestOutcome,
 };
 use crate::handlers::shared::system_config_bool;
+use crate::orchestration::{
+    apply_local_execution_effect, prepare_pool_attempt_started_effect, LocalExecutionEffect,
+    LocalExecutionEffectContext, PoolAttemptStartCleanupGuard,
+};
 use crate::{AiExecutionDecision, AppState, GatewayError};
 
 const ENABLE_OPENAI_IMAGE_SYNC_HEARTBEAT_CONFIG_KEY: &str = "enable_openai_image_sync_heartbeat";
@@ -1048,18 +1052,18 @@ fn standard_text_sync_heartbeat_error_kind(status_code: u16) -> LocalCoreSyncErr
     }
 }
 
-fn build_openai_image_sync_heartbeat_shell_response(
+fn build_openai_image_sync_heartbeat_shell_response<F, Fut>(
     state: AppState,
-    request_path: String,
     trace_id: String,
     decision: GatewayControlDecision,
-    plan_kind: String,
-    attempts: Vec<AiSyncAttempt>,
-) -> Result<Response<Body>, GatewayError> {
-    let request_id = attempts
-        .first()
-        .map(|attempt| attempt.plan.request_id.clone())
-        .filter(|value| !value.trim().is_empty());
+    execute: F,
+) -> Result<Response<Body>, GatewayError>
+where
+    F: FnOnce(AppState, String, GatewayControlDecision, Instant) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<LocalExecutionRequestOutcome, GatewayError>>
+        + Send
+        + 'static,
+{
     let trace_id_for_response = trace_id.clone();
     let decision_for_response = decision.clone();
     let started_at = Instant::now();
@@ -1067,16 +1071,7 @@ fn build_openai_image_sync_heartbeat_shell_response(
 
     tokio::spawn(async move {
         let bytes = openai_image_sync_heartbeat_final_bytes(
-            execute_openai_image_sync_heartbeat_attempts(
-                state,
-                request_path,
-                trace_id,
-                decision,
-                plan_kind,
-                attempts,
-                started_at,
-            )
-            .await,
+            execute(state, trace_id, decision, started_at).await,
         )
         .await;
         let _ = tx.send(Ok(Bytes::from(bytes))).await;
@@ -1106,43 +1101,77 @@ fn build_openai_image_sync_heartbeat_shell_response(
             Ok(())
         },
     )?;
-    attach_control_metadata_headers(response, request_id.as_deref(), None)
+    attach_control_metadata_headers(response, None, None)
 }
 
-async fn execute_openai_image_sync_heartbeat_attempts(
+async fn execute_openai_image_sync_heartbeat_attempts<S>(
     state: AppState,
     request_path: String,
     trace_id: String,
     decision: GatewayControlDecision,
     plan_kind: String,
-    attempts: Vec<AiSyncAttempt>,
+    mut attempt_source: S,
     started_at: Instant,
-) -> Result<LocalExecutionRequestOutcome, GatewayError> {
-    let mut attempts = VecDeque::from(attempts);
+) -> Result<LocalExecutionRequestOutcome, GatewayError>
+where
+    S: LocalExecutionAttemptSource<AiSyncAttempt> + Send,
+{
     let mut last_attempted = None;
 
-    while let Some(attempt) = attempts.pop_front() {
+    while let Some(attempt) = attempt_source.next_execution_attempt().await? {
         let plan = attempt.plan;
         let report_kind = attempt.report_kind;
         let report_context = attempt.report_context;
         last_attempted = Some((plan.clone(), report_context.clone()));
-        match execute_execution_runtime_sync(
+        let context = LocalExecutionEffectContext {
+            plan: &plan,
+            report_context: report_context.as_ref(),
+        };
+        let mut sticky_init_cleanup = PoolAttemptStartCleanupGuard::new(&state, context);
+        if !prepare_pool_attempt_started_effect(&state, context).await {
+            continue;
+        }
+        let result = execute_execution_runtime_sync(
             &state,
             request_path.as_str(),
-            plan,
+            plan.clone(),
             trace_id.as_str(),
             &decision,
             plan_kind.as_str(),
             report_kind,
-            report_context,
+            report_context.clone(),
         )
-        .await?
-        {
+        .await;
+        let response = match result {
+            Ok(response) => response,
+            Err(err) => {
+                apply_local_execution_effect(
+                    &state,
+                    context,
+                    LocalExecutionEffect::PoolAttemptAborted,
+                )
+                .await;
+                return Err(err);
+            }
+        };
+        match response {
             Some(response) => {
-                mark_unused_local_candidates(&state, attempts.into_iter().collect()).await;
+                if let Some(guard) = sticky_init_cleanup.as_mut() {
+                    guard.disarm();
+                }
+                let remaining = attempt_source.drain_execution_attempts().await?;
+                mark_unused_local_candidates(&state, remaining).await;
                 return Ok(LocalExecutionRequestOutcome::responded(response));
             }
-            None => continue,
+            None => {
+                apply_local_execution_effect(
+                    &state,
+                    context,
+                    LocalExecutionEffect::PoolAttemptAborted,
+                )
+                .await;
+                continue;
+            }
         }
     }
 
@@ -1259,34 +1288,64 @@ pub(crate) async fn maybe_execute_sync_via_local_image_decision(
     decision: &GatewayControlDecision,
     plan_kind: &str,
 ) -> Result<LocalExecutionRequestOutcome, GatewayError> {
-    let Some((mut attempt_source, candidate_count)) =
-        build_local_image_sync_attempt_source_for_kind(
-            state,
-            parts,
-            body_json,
-            body_base64,
-            trace_id,
-            decision,
-            plan_kind,
-        )
-        .await?
+    let Some((attempt_source, candidate_count)) = build_local_image_sync_attempt_source_for_kind(
+        state,
+        parts,
+        body_json,
+        body_base64,
+        trace_id,
+        decision,
+        plan_kind,
+    )
+    .await?
     else {
         return Ok(LocalExecutionRequestOutcome::NoPath);
     };
 
     if openai_image_sync_heartbeat_enabled(state).await {
-        let mut attempts = Vec::new();
-        while let Some(attempt) = attempt_source.next_execution_attempt().await? {
-            attempts.push(attempt);
-        }
+        let parts_for_task = parts.clone();
+        let body_json_for_task = body_json.clone();
+        let body_base64_for_task = body_base64.map(str::to_string);
+        let request_path_for_task = parts.uri.path().to_string();
+        let plan_kind_for_task = plan_kind.to_string();
         return Ok(LocalExecutionRequestOutcome::responded(
             build_openai_image_sync_heartbeat_shell_response(
                 state.clone(),
-                parts.uri.path().to_string(),
                 trace_id.to_string(),
                 decision.clone(),
-                plan_kind.to_string(),
-                attempts,
+                move |state, trace_id, decision, started_at| async move {
+                    let build_state = state.clone();
+                    let build_trace_id = trace_id.clone();
+                    let build_decision = decision.clone();
+                    let attempt_source = {
+                        let Some((attempt_source, _candidate_count)) =
+                            build_local_image_sync_attempt_source_for_kind(
+                                &build_state,
+                                &parts_for_task,
+                                &body_json_for_task,
+                                body_base64_for_task.as_deref(),
+                                build_trace_id.as_str(),
+                                &build_decision,
+                                plan_kind_for_task.as_str(),
+                            )
+                            .await?
+                        else {
+                            return Ok(LocalExecutionRequestOutcome::NoPath);
+                        };
+                        attempt_source
+                    };
+
+                    execute_openai_image_sync_heartbeat_attempts(
+                        state,
+                        request_path_for_task,
+                        trace_id,
+                        decision,
+                        plan_kind_for_task,
+                        attempt_source,
+                        started_at,
+                    )
+                    .await
+                },
             )?,
         ));
     }
@@ -1754,7 +1813,7 @@ mod tests {
             "trace-image-heartbeat-retry".to_string(),
             test_openai_image_heartbeat_decision(),
             TEST_OPENAI_IMAGE_SYNC_PLAN_KIND.to_string(),
-            attempts,
+            TestSyncAttemptSource::new(attempts),
             Instant::now(),
         )
         .await

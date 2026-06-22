@@ -159,6 +159,18 @@ pub(crate) async fn maybe_build_local_openai_chat_decision_payload_for_candidate
                 mapped_model: Some(&mapped_model),
                 candidate_group_id: eligible.orchestration.candidate_group_id.as_deref(),
                 pool_key_lease: eligible.orchestration.pool_key_lease.as_ref(),
+                pool_sticky_init_owner: eligible.orchestration.pool_sticky_init_owner.as_deref(),
+                pool_sticky_session_token: eligible
+                    .orchestration
+                    .pool_sticky_session_token
+                    .as_deref(),
+                pool_sticky_bound_key_ineligible: eligible
+                    .orchestration
+                    .pool_sticky_bound_key_ineligible,
+                pool_sticky_bound_key_id: eligible
+                    .orchestration
+                    .pool_sticky_bound_key_id
+                    .as_deref(),
                 ranking: eligible.ranking.as_ref(),
                 upstream_url: Some(&upstream_url),
                 header_rules: transport.endpoint.header_rules.as_ref(),

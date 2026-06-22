@@ -1,4 +1,6 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{LazyLock, Mutex};
 
 use aether_admin::provider::quota as admin_provider_quota_pure;
 use aether_contracts::{ExecutionPlan, ExecutionTelemetry};
@@ -14,6 +16,8 @@ use aether_usage_runtime::{
     GatewayStreamReportRequest, GatewaySyncReportRequest, TerminalUsageOutcome,
 };
 use serde_json::Value;
+use tokio::sync::oneshot;
+use tokio::time::Duration;
 use tracing::warn;
 
 use super::{
@@ -28,11 +32,22 @@ use crate::client_session_affinity::{
 use crate::clock::current_unix_secs;
 use crate::handlers::shared::provider_pool::admin_provider_pool_config_from_config_value;
 use crate::handlers::shared::provider_pool::{
-    admin_provider_pool_key_terminal_error_reason, record_admin_provider_pool_error,
+    admin_provider_pool_key_terminal_error_reason, admin_provider_pool_sticky_session_init_exists,
+    admin_provider_pool_sticky_session_init_owner_matches,
+    claim_admin_provider_pool_sticky_session_init,
+    clear_admin_provider_pool_sticky_session_if_bound_to_key,
+    clear_admin_provider_pool_sticky_session_prebind_if_owner,
+    prebind_admin_provider_pool_sticky_session, read_admin_provider_pool_hot_runtime_state,
+    read_admin_provider_pool_runtime_state, record_admin_provider_pool_error,
     record_admin_provider_pool_stream_timeout, record_admin_provider_pool_success,
-    release_admin_provider_pool_key_lease, AdminProviderPoolConfig,
+    refresh_admin_provider_pool_sticky_session_if_bound_to_key,
+    release_admin_provider_pool_key_lease,
+    release_admin_provider_pool_sticky_session_init_if_owner,
+    renew_admin_provider_pool_sticky_session_init_if_owner, AdminProviderPoolConfig,
 };
-use crate::orchestration::local_execution_candidate_metadata_from_report_context;
+use crate::orchestration::{
+    local_execution_candidate_metadata_from_report_context, LocalExecutionCandidateMetadata,
+};
 use crate::scheduler::affinity::SCHEDULER_AFFINITY_TTL;
 use crate::scheduler::config::{read_scheduler_ordering_config, SchedulerSchedulingMode};
 use crate::AppState;
@@ -96,6 +111,8 @@ pub(crate) enum LocalExecutionEffect<'a> {
     PoolSuccessStream {
         payload: &'a GatewayStreamReportRequest,
     },
+    PoolAttemptStarted,
+    PoolAttemptAborted,
     PoolError(LocalPoolErrorEffect<'a>),
     PoolStreamTimeout,
 }
@@ -107,6 +124,17 @@ struct PoolFeedbackContext {
 
 const ADAPTIVE_RPM_RECENT_CANDIDATE_LIMIT: usize = 512;
 const LOCAL_EXECUTION_SCHEDULER_AFFINITY_MAX_ENTRIES: usize = 10_000;
+const POOL_STICKY_INIT_LOCK_TTL_SECS: u64 = 30;
+const POOL_STICKY_INIT_RENEW_INTERVAL_SECS: u64 = 10;
+
+struct PoolStickyInitRenewerHandle {
+    generation: u64,
+    stop_tx: oneshot::Sender<()>,
+}
+
+static POOL_STICKY_INIT_RENEWER_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static POOL_STICKY_INIT_RENEWERS: LazyLock<Mutex<HashMap<String, PoolStickyInitRenewerHandle>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub(crate) async fn apply_local_execution_effect(
     state: &AppState,
@@ -140,6 +168,11 @@ pub(crate) async fn apply_local_execution_effect(
             record_stream_pool_success_effect(state, context, payload).await;
             release_pool_key_lease_effect(state, context).await;
         }
+        LocalExecutionEffect::PoolAttemptStarted => {}
+        LocalExecutionEffect::PoolAttemptAborted => {
+            record_pool_attempt_aborted_effect(state, context).await;
+            release_pool_key_lease_effect(state, context).await;
+        }
         LocalExecutionEffect::PoolError(effect) => {
             record_pool_error_effect(state, context, effect).await;
             release_pool_key_lease_effect(state, context).await;
@@ -166,6 +199,215 @@ async fn release_pool_key_lease_effect(state: &AppState, context: LocalExecution
             "gateway orchestration effects: failed to release pool key lease"
         );
     }
+}
+
+fn pool_sticky_init_renewer_key(
+    provider_id: &str,
+    key_id: &str,
+    sticky_session_token: Option<&str>,
+    owner: Option<&str>,
+) -> Option<String> {
+    let sticky_session_token = sticky_session_token
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let owner = owner.map(str::trim).filter(|value| !value.is_empty())?;
+    Some(format!(
+        "{provider_id}\n{key_id}\n{sticky_session_token}\n{owner}"
+    ))
+}
+
+fn start_pool_sticky_init_renewer(
+    state: &AppState,
+    context: LocalExecutionEffectContext<'_>,
+    sticky_session_token: Option<&str>,
+) {
+    let metadata = local_execution_candidate_metadata_from_report_context(context.report_context);
+    let Some(renewer_key) = pool_sticky_init_renewer_key(
+        &context.plan.provider_id,
+        &context.plan.key_id,
+        sticky_session_token,
+        metadata.pool_sticky_init_owner.as_deref(),
+    ) else {
+        return;
+    };
+    let (stop_tx, mut stop_rx) = oneshot::channel();
+    let generation = POOL_STICKY_INIT_RENEWER_SEQUENCE.fetch_add(1, AtomicOrdering::Relaxed);
+    if let Ok(mut renewers) = POOL_STICKY_INIT_RENEWERS.lock() {
+        if let Some(previous) = renewers.insert(
+            renewer_key.clone(),
+            PoolStickyInitRenewerHandle {
+                generation,
+                stop_tx,
+            },
+        ) {
+            let _ = previous.stop_tx.send(());
+        }
+    } else {
+        return;
+    }
+
+    let runtime = state.runtime_state.clone();
+    let provider_id = context.plan.provider_id.clone();
+    let owner = metadata.pool_sticky_init_owner;
+    let sticky_session_token = sticky_session_token.map(ToOwned::to_owned);
+    let ttl = Duration::from_secs(POOL_STICKY_INIT_LOCK_TTL_SECS);
+    let renewer_key_for_task = renewer_key.clone();
+    tokio::spawn(async move {
+        let mut interval =
+            tokio::time::interval(Duration::from_secs(POOL_STICKY_INIT_RENEW_INTERVAL_SECS));
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    if !renew_admin_provider_pool_sticky_session_init_if_owner(
+                        runtime.as_ref(),
+                        &provider_id,
+                        sticky_session_token.as_deref(),
+                        owner.as_deref(),
+                        ttl,
+                    )
+                    .await
+                    {
+                        break;
+                    }
+                }
+                _ = &mut stop_rx => break,
+            }
+        }
+        if let Ok(mut renewers) = POOL_STICKY_INIT_RENEWERS.lock() {
+            if renewers
+                .get(&renewer_key_for_task)
+                .is_some_and(|handle| handle.generation == generation)
+            {
+                renewers.remove(&renewer_key_for_task);
+            }
+        }
+    });
+}
+
+fn stop_pool_sticky_init_renewer(
+    context: LocalExecutionEffectContext<'_>,
+    sticky_session_token: Option<&str>,
+) {
+    let metadata = local_execution_candidate_metadata_from_report_context(context.report_context);
+    stop_pool_sticky_init_renewer_for_owner(
+        &context.plan.provider_id,
+        &context.plan.key_id,
+        sticky_session_token,
+        metadata.pool_sticky_init_owner.as_deref(),
+    );
+}
+
+fn stop_pool_sticky_init_renewer_for_owner(
+    provider_id: &str,
+    key_id: &str,
+    sticky_session_token: Option<&str>,
+    owner: Option<&str>,
+) {
+    let Some(renewer_key) =
+        pool_sticky_init_renewer_key(provider_id, key_id, sticky_session_token, owner)
+    else {
+        return;
+    };
+    if let Ok(mut renewers) = POOL_STICKY_INIT_RENEWERS.lock() {
+        if let Some(handle) = renewers.remove(&renewer_key) {
+            let _ = handle.stop_tx.send(());
+        }
+    }
+}
+
+async fn finish_pool_sticky_initialization(
+    state: &AppState,
+    context: LocalExecutionEffectContext<'_>,
+    sticky_session_token: Option<&str>,
+    clear_prebound_sticky: bool,
+) {
+    stop_pool_sticky_init_renewer(context, sticky_session_token);
+    let metadata = local_execution_candidate_metadata_from_report_context(context.report_context);
+    let prebind_marker_cleared = clear_admin_provider_pool_sticky_session_prebind_if_owner(
+        state.runtime_state.as_ref(),
+        &context.plan.provider_id,
+        &context.plan.key_id,
+        sticky_session_token,
+        metadata.pool_sticky_init_owner.as_deref(),
+    )
+    .await;
+    if clear_prebound_sticky && prebind_marker_cleared {
+        clear_admin_provider_pool_sticky_session_if_bound_to_key(
+            state.runtime_state.as_ref(),
+            &context.plan.provider_id,
+            &context.plan.key_id,
+            sticky_session_token,
+        )
+        .await;
+    }
+    release_admin_provider_pool_sticky_session_init_if_owner(
+        state.runtime_state.as_ref(),
+        &context.plan.provider_id,
+        sticky_session_token,
+        metadata.pool_sticky_init_owner.as_deref(),
+    )
+    .await;
+}
+
+async fn cleanup_pool_sticky_initialization_without_feedback_context(
+    state: &AppState,
+    context: LocalExecutionEffectContext<'_>,
+    clear_bound_key: bool,
+) {
+    let metadata = local_execution_candidate_metadata_from_report_context(context.report_context);
+    let owner = metadata
+        .pool_sticky_init_owner
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let sticky_session_token = metadata
+        .pool_sticky_session_token
+        .or_else(|| pool_feedback_sticky_session_token(context.plan, context.report_context));
+    if clear_bound_key {
+        clear_admin_provider_pool_sticky_session_if_bound_to_key(
+            state.runtime_state.as_ref(),
+            &context.plan.provider_id,
+            &context.plan.key_id,
+            sticky_session_token.as_deref(),
+        )
+        .await;
+    }
+    let Some(owner) = owner else {
+        return;
+    };
+    release_pool_sticky_initialization_for_owner(
+        state.runtime_state.as_ref(),
+        &context.plan.provider_id,
+        &context.plan.key_id,
+        sticky_session_token.as_deref(),
+        Some(owner),
+    )
+    .await;
+}
+
+pub(crate) async fn release_pool_sticky_initialization_for_owner(
+    runtime: &aether_runtime_state::RuntimeState,
+    provider_id: &str,
+    key_id: &str,
+    sticky_session_token: Option<&str>,
+    owner: Option<&str>,
+) {
+    stop_pool_sticky_init_renewer_for_owner(provider_id, key_id, sticky_session_token, owner);
+    clear_admin_provider_pool_sticky_session_prebind_if_owner(
+        runtime,
+        provider_id,
+        key_id,
+        sticky_session_token,
+        owner,
+    )
+    .await;
+    release_admin_provider_pool_sticky_session_init_if_owner(
+        runtime,
+        provider_id,
+        sticky_session_token,
+        owner,
+    )
+    .await;
 }
 
 fn report_context_string_field<'a>(
@@ -323,6 +565,16 @@ fn pool_feedback_request_body<'a>(
         .or(plan.body.json_body.as_ref())
 }
 
+fn pool_feedback_sticky_session_token(
+    plan: &ExecutionPlan,
+    report_context: Option<&Value>,
+) -> Option<String> {
+    let metadata = local_execution_candidate_metadata_from_report_context(report_context);
+    metadata.pool_sticky_session_token.or_else(|| {
+        pool_feedback_request_body(plan, report_context).and_then(extract_pool_sticky_session_token)
+    })
+}
+
 async fn resolve_pool_feedback_context(
     state: &AppState,
     context: LocalExecutionEffectContext<'_>,
@@ -349,8 +601,7 @@ async fn resolve_pool_feedback_context(
         return None;
     };
 
-    let sticky_session_token = pool_feedback_request_body(plan, context.report_context)
-        .and_then(extract_pool_sticky_session_token);
+    let sticky_session_token = pool_feedback_sticky_session_token(plan, context.report_context);
 
     Some(PoolFeedbackContext {
         pool_config,
@@ -415,19 +666,31 @@ async fn record_sync_pool_success_effect(
     payload: &GatewaySyncReportRequest,
 ) {
     let Some(pool_context) = resolve_pool_feedback_context(state, context).await else {
+        cleanup_pool_sticky_initialization_without_feedback_context(state, context, false).await;
         return;
     };
 
     let usage_outcome =
         build_sync_terminal_usage_outcome(context.plan, context.report_context, payload);
+    let metadata = local_execution_candidate_metadata_from_report_context(context.report_context);
     record_admin_provider_pool_success(
         state.runtime_state.as_ref(),
         &context.plan.provider_id,
         &context.plan.key_id,
         &pool_context.pool_config,
         pool_context.sticky_session_token.as_deref(),
+        metadata.pool_sticky_init_owner.as_deref(),
+        metadata.pool_sticky_bound_key_ineligible,
+        metadata.pool_sticky_bound_key_id.as_deref(),
         total_tokens_used(&usage_outcome),
         resolve_ttfb_ms(payload.telemetry.as_ref()),
+    )
+    .await;
+    finish_pool_sticky_initialization(
+        state,
+        context,
+        pool_context.sticky_session_token.as_deref(),
+        false,
     )
     .await;
     record_pool_score_schedule_feedback(
@@ -443,6 +706,238 @@ async fn record_sync_pool_success_effect(
         }),
     )
     .await;
+}
+
+pub(crate) async fn prepare_pool_attempt_started_effect(
+    state: &AppState,
+    context: LocalExecutionEffectContext<'_>,
+) -> bool {
+    let Some(pool_context) = resolve_pool_feedback_context(state, context).await else {
+        return true;
+    };
+    if pool_context.pool_config.sticky_session_ttl_seconds == 0 {
+        return true;
+    }
+    if pool_context.sticky_session_token.is_none() {
+        return true;
+    }
+    let metadata = local_execution_candidate_metadata_from_report_context(context.report_context);
+    if let Some(decision) = sticky_binding_decision(state, context, &pool_context, &metadata).await
+    {
+        match decision {
+            StickyBindingDecision::AllowCurrentKey => return true,
+            StickyBindingDecision::RejectCurrentKey => {
+                finish_pool_sticky_initialization(
+                    state,
+                    context,
+                    pool_context.sticky_session_token.as_deref(),
+                    false,
+                )
+                .await;
+                return false;
+            }
+            StickyBindingDecision::NeedsReinitialization => {}
+        }
+    }
+
+    let sticky_init_owner = metadata
+        .pool_sticky_init_owner
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let Some(sticky_init_owner) = sticky_init_owner else {
+        return false;
+    };
+
+    try_claim_pool_sticky_init_for_attempt(state, context, &pool_context, sticky_init_owner).await
+}
+
+pub(crate) struct PoolAttemptStartCleanupGuard {
+    runtime: std::sync::Arc<aether_runtime_state::RuntimeState>,
+    provider_id: String,
+    key_id: String,
+    sticky_session_token: Option<String>,
+    owner: Option<String>,
+    armed: bool,
+}
+
+impl PoolAttemptStartCleanupGuard {
+    pub(crate) fn new(state: &AppState, context: LocalExecutionEffectContext<'_>) -> Option<Self> {
+        let metadata =
+            local_execution_candidate_metadata_from_report_context(context.report_context);
+        let owner = metadata.pool_sticky_init_owner?;
+        let sticky_session_token =
+            pool_feedback_sticky_session_token(context.plan, context.report_context);
+        Some(Self {
+            runtime: std::sync::Arc::clone(&state.runtime_state),
+            provider_id: context.plan.provider_id.clone(),
+            key_id: context.plan.key_id.clone(),
+            sticky_session_token,
+            owner: Some(owner),
+            armed: true,
+        })
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PoolAttemptStartCleanupGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let runtime = std::sync::Arc::clone(&self.runtime);
+        let provider_id = self.provider_id.clone();
+        let key_id = self.key_id.clone();
+        let sticky_session_token = self.sticky_session_token.clone();
+        let owner = self.owner.clone();
+        tokio::spawn(async move {
+            release_pool_sticky_initialization_for_owner(
+                runtime.as_ref(),
+                &provider_id,
+                &key_id,
+                sticky_session_token.as_deref(),
+                owner.as_deref(),
+            )
+            .await;
+        });
+    }
+}
+
+async fn try_claim_pool_sticky_init_for_attempt(
+    state: &AppState,
+    context: LocalExecutionEffectContext<'_>,
+    pool_context: &PoolFeedbackContext,
+    sticky_init_owner: &str,
+) -> bool {
+    let claimed = claim_admin_provider_pool_sticky_session_init(
+        state.runtime_state.as_ref(),
+        &context.plan.provider_id,
+        pool_context.sticky_session_token.as_deref(),
+        sticky_init_owner,
+        Duration::from_secs(POOL_STICKY_INIT_LOCK_TTL_SECS),
+    )
+    .await;
+    if !claimed
+        && !admin_provider_pool_sticky_session_init_owner_matches(
+            state.runtime_state.as_ref(),
+            &context.plan.provider_id,
+            pool_context.sticky_session_token.as_deref(),
+            Some(sticky_init_owner),
+        )
+        .await
+    {
+        return false;
+    }
+    start_pool_sticky_init_renewer(state, context, pool_context.sticky_session_token.as_deref());
+
+    let created = prebind_admin_provider_pool_sticky_session(
+        state.runtime_state.as_ref(),
+        &context.plan.provider_id,
+        &context.plan.key_id,
+        &pool_context.pool_config,
+        pool_context.sticky_session_token.as_deref(),
+        Some(sticky_init_owner),
+    )
+    .await;
+    if created {
+        return true;
+    }
+
+    finish_pool_sticky_initialization(
+        state,
+        context,
+        pool_context.sticky_session_token.as_deref(),
+        false,
+    )
+    .await;
+    sticky_binding_allows_current_key(state, context, pool_context).await
+}
+
+async fn sticky_binding_allows_current_key(
+    state: &AppState,
+    context: LocalExecutionEffectContext<'_>,
+    pool_context: &PoolFeedbackContext,
+) -> bool {
+    let metadata = local_execution_candidate_metadata_from_report_context(context.report_context);
+    sticky_binding_decision(state, context, pool_context, &metadata)
+        .await
+        .is_none_or(|decision| decision == StickyBindingDecision::AllowCurrentKey)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StickyBindingDecision {
+    AllowCurrentKey,
+    RejectCurrentKey,
+    NeedsReinitialization,
+}
+
+async fn sticky_binding_decision(
+    state: &AppState,
+    context: LocalExecutionEffectContext<'_>,
+    pool_context: &PoolFeedbackContext,
+    metadata: &LocalExecutionCandidateMetadata,
+) -> Option<StickyBindingDecision> {
+    let runtime = read_admin_provider_pool_hot_runtime_state(
+        state.runtime_state.as_ref(),
+        &context.plan.provider_id,
+        std::slice::from_ref(&context.plan.key_id),
+        &pool_context.pool_config,
+        pool_context.sticky_session_token.as_deref(),
+        false,
+    )
+    .await;
+    let Some(sticky_key_id) = runtime.sticky_bound_key_id else {
+        return None;
+    };
+    if sticky_key_id == context.plan.key_id {
+        refresh_admin_provider_pool_sticky_session_if_bound_to_key(
+            state.runtime_state.as_ref(),
+            &context.plan.provider_id,
+            &context.plan.key_id,
+            pool_context.sticky_session_token.as_deref(),
+            Duration::from_secs(pool_context.pool_config.sticky_session_ttl_seconds),
+        )
+        .await;
+        return Some(StickyBindingDecision::AllowCurrentKey);
+    }
+    if metadata.pool_sticky_bound_key_ineligible
+        && metadata.pool_sticky_bound_key_id.as_deref() == Some(sticky_key_id.as_str())
+    {
+        return Some(StickyBindingDecision::NeedsReinitialization);
+    }
+    Some(StickyBindingDecision::RejectCurrentKey)
+}
+
+async fn record_pool_attempt_aborted_effect(
+    state: &AppState,
+    context: LocalExecutionEffectContext<'_>,
+) {
+    let metadata = local_execution_candidate_metadata_from_report_context(context.report_context);
+    let sticky_session_token = metadata
+        .pool_sticky_session_token
+        .or_else(|| pool_feedback_sticky_session_token(context.plan, context.report_context));
+    if sticky_session_token.is_none() {
+        return;
+    }
+
+    let has_sticky_init_owner = metadata
+        .pool_sticky_init_owner
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+    if !has_sticky_init_owner {
+        let Some(pool_context) = resolve_pool_feedback_context(state, context).await else {
+            return;
+        };
+        if pool_context.pool_config.sticky_session_ttl_seconds == 0 {
+            return;
+        }
+    }
+
+    finish_pool_sticky_initialization(state, context, sticky_session_token.as_deref(), true).await;
 }
 
 async fn record_adaptive_rate_limit_effect(
@@ -696,19 +1191,31 @@ async fn record_stream_pool_success_effect(
     payload: &GatewayStreamReportRequest,
 ) {
     let Some(pool_context) = resolve_pool_feedback_context(state, context).await else {
+        cleanup_pool_sticky_initialization_without_feedback_context(state, context, false).await;
         return;
     };
 
     let usage_outcome =
         build_stream_terminal_usage_outcome(context.plan, context.report_context, payload);
+    let metadata = local_execution_candidate_metadata_from_report_context(context.report_context);
     record_admin_provider_pool_success(
         state.runtime_state.as_ref(),
         &context.plan.provider_id,
         &context.plan.key_id,
         &pool_context.pool_config,
         pool_context.sticky_session_token.as_deref(),
+        metadata.pool_sticky_init_owner.as_deref(),
+        metadata.pool_sticky_bound_key_ineligible,
+        metadata.pool_sticky_bound_key_id.as_deref(),
         total_tokens_used(&usage_outcome),
         resolve_ttfb_ms(payload.telemetry.as_ref()),
+    )
+    .await;
+    finish_pool_sticky_initialization(
+        state,
+        context,
+        pool_context.sticky_session_token.as_deref(),
+        false,
     )
     .await;
     record_pool_score_schedule_feedback(
@@ -731,21 +1238,65 @@ async fn record_pool_error_effect(
     context: LocalExecutionEffectContext<'_>,
     effect: LocalPoolErrorEffect<'_>,
 ) {
+    let Some(pool_context) = resolve_pool_feedback_context(state, context).await else {
+        let terminal_error_reason =
+            admin_provider_pool_key_terminal_error_reason(effect.status_code, effect.error_body);
+        let should_record_pool_error = terminal_error_reason.is_some()
+            || local_candidate_failure_should_record_pool_error(
+                effect.classification,
+                effect.status_code,
+            );
+        cleanup_pool_sticky_initialization_without_feedback_context(
+            state,
+            context,
+            should_record_pool_error,
+        )
+        .await;
+        return;
+    };
     let terminal_error_reason =
         admin_provider_pool_key_terminal_error_reason(effect.status_code, effect.error_body);
-    if terminal_error_reason.is_none()
-        && !local_candidate_failure_should_record_pool_error(
+    let should_record_pool_error = terminal_error_reason.is_some()
+        || local_candidate_failure_should_record_pool_error(
             effect.classification,
             effect.status_code,
+        );
+    if !should_record_pool_error {
+        let metadata =
+            local_execution_candidate_metadata_from_report_context(context.report_context);
+        record_admin_provider_pool_success(
+            state.runtime_state.as_ref(),
+            &context.plan.provider_id,
+            &context.plan.key_id,
+            &pool_context.pool_config,
+            pool_context.sticky_session_token.as_deref(),
+            metadata.pool_sticky_init_owner.as_deref(),
+            metadata.pool_sticky_bound_key_ineligible,
+            metadata.pool_sticky_bound_key_id.as_deref(),
+            0,
+            None,
         )
-    {
+        .await;
+    }
+    finish_pool_sticky_initialization(
+        state,
+        context,
+        pool_context.sticky_session_token.as_deref(),
+        should_record_pool_error,
+    )
+    .await;
+
+    if !should_record_pool_error {
         return;
     }
 
-    let Some(pool_context) = resolve_pool_feedback_context(state, context).await else {
-        return;
-    };
-
+    clear_admin_provider_pool_sticky_session_if_bound_to_key(
+        state.runtime_state.as_ref(),
+        &context.plan.provider_id,
+        &context.plan.key_id,
+        pool_context.sticky_session_token.as_deref(),
+    )
+    .await;
     clear_pool_key_circuit_breaker(state, context).await;
     record_admin_provider_pool_error(
         state.runtime_state.as_ref(),
@@ -923,8 +1474,23 @@ async fn record_pool_stream_timeout_effect(
     context: LocalExecutionEffectContext<'_>,
 ) {
     let Some(pool_context) = resolve_pool_feedback_context(state, context).await else {
+        cleanup_pool_sticky_initialization_without_feedback_context(state, context, true).await;
         return;
     };
+    finish_pool_sticky_initialization(
+        state,
+        context,
+        pool_context.sticky_session_token.as_deref(),
+        true,
+    )
+    .await;
+    clear_admin_provider_pool_sticky_session_if_bound_to_key(
+        state.runtime_state.as_ref(),
+        &context.plan.provider_id,
+        &context.plan.key_id,
+        pool_context.sticky_session_token.as_deref(),
+    )
+    .await;
 
     record_admin_provider_pool_stream_timeout(
         state.runtime_state.as_ref(),
@@ -1056,12 +1622,22 @@ mod tests {
 
     use super::{
         apply_local_execution_effect, local_candidate_failure_should_record_pool_error,
-        pool_score_hard_state_for_status, LocalAdaptiveRateLimitEffect, LocalAdaptiveSuccessEffect,
-        LocalAttemptFailureEffect, LocalExecutionEffect, LocalExecutionEffectContext,
-        LocalHealthFailureEffect, LocalHealthSuccessEffect, LocalOAuthInvalidationEffect,
-        LocalPoolErrorEffect,
+        pool_score_hard_state_for_status, prepare_pool_attempt_started_effect,
+        LocalAdaptiveRateLimitEffect, LocalAdaptiveSuccessEffect, LocalAttemptFailureEffect,
+        LocalExecutionEffect, LocalExecutionEffectContext, LocalHealthFailureEffect,
+        LocalHealthSuccessEffect, LocalOAuthInvalidationEffect, LocalPoolErrorEffect,
+        PoolAttemptStartCleanupGuard,
     };
     use crate::data::{GatewayDataConfig, GatewayDataState};
+    use crate::handlers::shared::provider_pool::{
+        admin_provider_pool_config_from_config_value,
+        admin_provider_pool_sticky_session_init_exists,
+        claim_admin_provider_pool_sticky_session_init,
+        clear_admin_provider_pool_sticky_session_if_bound_to_key,
+        clear_admin_provider_pool_sticky_session_prebind_if_owner,
+        prebind_admin_provider_pool_sticky_session, read_admin_provider_pool_runtime_state,
+        record_admin_provider_pool_success,
+    };
     use crate::orchestration::LocalFailoverClassification;
     use crate::scheduler::affinity::SCHEDULER_AFFINITY_TTL;
     use crate::AppState;
@@ -1370,6 +1946,1611 @@ mod tests {
                 GatewayDataState::with_provider_catalog_repository_for_tests(repository)
                     .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
             )
+    }
+
+    #[tokio::test]
+    async fn prepare_releases_init_owner_when_existing_sticky_binding_rejects_candidate() {
+        let provider_config = json!({
+            "pool_advanced": {
+                "sticky_session_ttl_seconds": 120
+            }
+        });
+        let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![sample_health_provider().with_transport_fields(
+                true,
+                false,
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(provider_config.clone()),
+            )],
+            vec![sample_health_endpoint()],
+            vec![sample_health_key()],
+        ));
+        let state = AppState::new()
+            .expect("gateway state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(repository)
+                    .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+            );
+        let pool_config = admin_provider_pool_config_from_config_value(Some(&provider_config))
+            .expect("pool config should parse");
+        let mut plan = sample_plan();
+        plan.body = RequestBody::from_json(json!({
+            "model": "gpt-5",
+            "session_id": "session-1"
+        }));
+        let report_context = json!({
+            "pool_sticky_init_owner": "owner-key-1"
+        });
+
+        record_admin_provider_pool_success(
+            state.runtime_state.as_ref(),
+            &plan.provider_id,
+            "key-2",
+            &pool_config,
+            Some("session-1"),
+            None,
+            false,
+            None,
+            0,
+            None,
+        )
+        .await;
+        assert!(
+            claim_admin_provider_pool_sticky_session_init(
+                state.runtime_state.as_ref(),
+                &plan.provider_id,
+                Some("session-1"),
+                "owner-key-1",
+                tokio::time::Duration::from_secs(30),
+            )
+            .await
+        );
+
+        let should_execute = prepare_pool_attempt_started_effect(
+            &state,
+            LocalExecutionEffectContext {
+                plan: &plan,
+                report_context: Some(&report_context),
+            },
+        )
+        .await;
+
+        assert!(!should_execute);
+        assert!(
+            !admin_provider_pool_sticky_session_init_exists(
+                state.runtime_state.as_ref(),
+                &plan.provider_id,
+                Some("session-1"),
+            )
+            .await,
+            "rejected initializer should release its init lock"
+        );
+        let runtime = read_admin_provider_pool_runtime_state(
+            state.runtime_state.as_ref(),
+            &plan.provider_id,
+            &["key-1".to_string(), "key-2".to_string()],
+            &pool_config,
+            Some("session-1"),
+        )
+        .await;
+        assert_eq!(runtime.sticky_bound_key_id.as_deref(), Some("key-2"));
+    }
+
+    #[tokio::test]
+    async fn prepare_rejects_ownerless_sticky_initializer() {
+        let provider_config = json!({
+            "pool_advanced": {
+                "sticky_session_ttl_seconds": 120
+            }
+        });
+        let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![sample_health_provider().with_transport_fields(
+                true,
+                false,
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(provider_config),
+            )],
+            vec![sample_health_endpoint()],
+            vec![sample_health_key()],
+        ));
+        let state = AppState::new()
+            .expect("gateway state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(repository)
+                    .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+            );
+        let mut plan = sample_plan();
+        plan.body = RequestBody::from_json(json!({
+            "model": "gpt-5",
+            "session_id": "session-1"
+        }));
+        let report_context = json!({
+            "pool_sticky_session_token": "session-1",
+            "original_request_body": {
+                "model": "gpt-5",
+                "session_id": "session-1"
+            }
+        });
+
+        assert!(
+            !prepare_pool_attempt_started_effect(
+                &state,
+                LocalExecutionEffectContext {
+                    plan: &plan,
+                    report_context: Some(&report_context),
+                },
+            )
+            .await,
+            "sticky-enabled pool attempts must carry a scheduler-owned init token before first binding"
+        );
+        assert!(
+            !admin_provider_pool_sticky_session_init_exists(
+                state.runtime_state.as_ref(),
+                &plan.provider_id,
+                Some("session-1"),
+            )
+            .await,
+            "ownerless attempts must not create sticky init locks"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_allows_pool_attempt_without_sticky_session_token() {
+        let provider_config = json!({
+            "pool_advanced": {
+                "sticky_session_ttl_seconds": 120
+            }
+        });
+        let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![sample_health_provider().with_transport_fields(
+                true,
+                false,
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(provider_config),
+            )],
+            vec![sample_health_endpoint()],
+            vec![sample_health_key()],
+        ));
+        let state = AppState::new()
+            .expect("gateway state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(repository)
+                    .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+            );
+        let mut plan = sample_plan();
+        plan.body = RequestBody::from_json(json!({
+            "model": "gpt-5"
+        }));
+        let report_context = json!({
+            "original_request_body": {
+                "model": "gpt-5"
+            }
+        });
+
+        assert!(
+            prepare_pool_attempt_started_effect(
+                &state,
+                LocalExecutionEffectContext {
+                    plan: &plan,
+                    report_context: Some(&report_context),
+                },
+            )
+            .await,
+            "sticky TTL alone must not block requests that have no sticky session token"
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_attempt_start_cleanup_guard_releases_init_owner_on_drop() {
+        let state = AppState::new().expect("gateway state should build");
+        let mut plan = sample_plan();
+        plan.body = RequestBody::from_json(json!({
+            "model": "gpt-5",
+            "session_id": "session-1"
+        }));
+        let report_context = json!({
+            "pool_sticky_init_owner": "owner-key-1",
+            "original_request_body": {
+                "model": "gpt-5",
+                "session_id": "session-1"
+            }
+        });
+        assert!(
+            claim_admin_provider_pool_sticky_session_init(
+                state.runtime_state.as_ref(),
+                &plan.provider_id,
+                Some("session-1"),
+                "owner-key-1",
+                tokio::time::Duration::from_secs(30),
+            )
+            .await
+        );
+        let pool_config = admin_provider_pool_config_from_config_value(Some(&json!({
+            "pool_advanced": {
+                "sticky_session_ttl_seconds": 120
+            }
+        })))
+        .expect("pool config should parse");
+        assert!(
+            prebind_admin_provider_pool_sticky_session(
+                state.runtime_state.as_ref(),
+                &plan.provider_id,
+                &plan.key_id,
+                &pool_config,
+                Some("session-1"),
+                Some("owner-key-1"),
+            )
+            .await
+        );
+
+        drop(
+            PoolAttemptStartCleanupGuard::new(
+                &state,
+                LocalExecutionEffectContext {
+                    plan: &plan,
+                    report_context: Some(&report_context),
+                },
+            )
+            .expect("cleanup guard should arm"),
+        );
+
+        for _ in 0..20 {
+            if !admin_provider_pool_sticky_session_init_exists(
+                state.runtime_state.as_ref(),
+                &plan.provider_id,
+                Some("session-1"),
+            )
+            .await
+            {
+                assert!(
+                    !clear_admin_provider_pool_sticky_session_prebind_if_owner(
+                        state.runtime_state.as_ref(),
+                        &plan.provider_id,
+                        &plan.key_id,
+                        Some("session-1"),
+                        Some("owner-key-1"),
+                    )
+                    .await,
+                    "cleanup guard should clear owner-scoped sticky prebind marker"
+                );
+                return;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        }
+        panic!("sticky init owner should be released after start cleanup guard drop");
+    }
+
+    #[tokio::test]
+    async fn pool_attempt_aborted_effect_releases_init_and_prebind() {
+        let state = AppState::new().expect("gateway state should build");
+        let mut plan = sample_plan();
+        plan.body = RequestBody::from_json(json!({
+            "model": "gpt-5",
+            "session_id": "session-1"
+        }));
+        let report_context = json!({
+            "pool_sticky_init_owner": "owner-key-1",
+            "pool_sticky_session_token": "session-1"
+        });
+        assert!(
+            claim_admin_provider_pool_sticky_session_init(
+                state.runtime_state.as_ref(),
+                &plan.provider_id,
+                Some("session-1"),
+                "owner-key-1",
+                tokio::time::Duration::from_secs(30),
+            )
+            .await
+        );
+        let pool_config = admin_provider_pool_config_from_config_value(Some(&json!({
+            "pool_advanced": {
+                "sticky_session_ttl_seconds": 120
+            }
+        })))
+        .expect("pool config should parse");
+        assert!(
+            prebind_admin_provider_pool_sticky_session(
+                state.runtime_state.as_ref(),
+                &plan.provider_id,
+                &plan.key_id,
+                &pool_config,
+                Some("session-1"),
+                Some("owner-key-1"),
+            )
+            .await
+        );
+
+        apply_local_execution_effect(
+            &state,
+            LocalExecutionEffectContext {
+                plan: &plan,
+                report_context: Some(&report_context),
+            },
+            LocalExecutionEffect::PoolAttemptAborted,
+        )
+        .await;
+
+        assert!(
+            !admin_provider_pool_sticky_session_init_exists(
+                state.runtime_state.as_ref(),
+                &plan.provider_id,
+                Some("session-1"),
+            )
+            .await,
+            "abort should release the sticky init owner"
+        );
+        assert!(
+            !clear_admin_provider_pool_sticky_session_prebind_if_owner(
+                state.runtime_state.as_ref(),
+                &plan.provider_id,
+                &plan.key_id,
+                Some("session-1"),
+                Some("owner-key-1"),
+            )
+            .await,
+            "abort should clear the owner-scoped prebind marker"
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_terminal_success_cleans_sticky_init_when_feedback_context_is_missing() {
+        let state = AppState::new().expect("gateway state should build");
+        let mut plan = sample_plan();
+        plan.body = RequestBody::from_json(json!({
+            "model": "gpt-5",
+            "session_id": "session-1"
+        }));
+        let report_context = json!({
+            "pool_sticky_init_owner": "owner-key-1",
+            "pool_sticky_session_token": "session-1"
+        });
+        assert!(
+            claim_admin_provider_pool_sticky_session_init(
+                state.runtime_state.as_ref(),
+                &plan.provider_id,
+                Some("session-1"),
+                "owner-key-1",
+                tokio::time::Duration::from_secs(30),
+            )
+            .await
+        );
+        let pool_config = admin_provider_pool_config_from_config_value(Some(&json!({
+            "pool_advanced": {
+                "sticky_session_ttl_seconds": 120
+            }
+        })))
+        .expect("pool config should parse");
+        assert!(
+            prebind_admin_provider_pool_sticky_session(
+                state.runtime_state.as_ref(),
+                &plan.provider_id,
+                &plan.key_id,
+                &pool_config,
+                Some("session-1"),
+                Some("owner-key-1"),
+            )
+            .await
+        );
+        let payload = aether_usage_runtime::GatewaySyncReportRequest {
+            trace_id: "trace-1".to_string(),
+            report_kind: "sync".to_string(),
+            report_context: Some(report_context.clone()),
+            status_code: 200,
+            headers: BTreeMap::new(),
+            body_json: None,
+            client_body_json: None,
+            body_base64: None,
+            telemetry: None,
+        };
+
+        apply_local_execution_effect(
+            &state,
+            LocalExecutionEffectContext {
+                plan: &plan,
+                report_context: Some(&report_context),
+            },
+            LocalExecutionEffect::PoolSuccessSync { payload: &payload },
+        )
+        .await;
+
+        assert!(
+            !admin_provider_pool_sticky_session_init_exists(
+                state.runtime_state.as_ref(),
+                &plan.provider_id,
+                Some("session-1"),
+            )
+            .await,
+            "terminal success should release sticky init even if pool feedback context is missing"
+        );
+        assert!(
+            !clear_admin_provider_pool_sticky_session_prebind_if_owner(
+                state.runtime_state.as_ref(),
+                &plan.provider_id,
+                &plan.key_id,
+                Some("session-1"),
+                Some("owner-key-1"),
+            )
+            .await,
+            "terminal success should clear owner-scoped prebind even if pool feedback context is missing"
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_terminal_key_error_clears_sticky_when_feedback_context_is_missing() {
+        let state = AppState::new().expect("gateway state should build");
+        let mut plan = sample_plan();
+        plan.body = RequestBody::from_json(json!({
+            "model": "gpt-5",
+            "session_id": "session-1"
+        }));
+        let report_context = json!({
+            "pool_sticky_init_owner": "owner-key-1",
+            "pool_sticky_session_token": "session-1"
+        });
+        let pool_config = admin_provider_pool_config_from_config_value(Some(&json!({
+            "pool_advanced": {
+                "sticky_session_ttl_seconds": 120
+            }
+        })))
+        .expect("pool config should parse");
+        record_admin_provider_pool_success(
+            state.runtime_state.as_ref(),
+            &plan.provider_id,
+            &plan.key_id,
+            &pool_config,
+            Some("session-1"),
+            None,
+            false,
+            None,
+            0,
+            None,
+        )
+        .await;
+        assert!(
+            claim_admin_provider_pool_sticky_session_init(
+                state.runtime_state.as_ref(),
+                &plan.provider_id,
+                Some("session-1"),
+                "owner-key-1",
+                tokio::time::Duration::from_secs(30),
+            )
+            .await
+        );
+        assert!(
+            prebind_admin_provider_pool_sticky_session(
+                state.runtime_state.as_ref(),
+                &plan.provider_id,
+                &plan.key_id,
+                &pool_config,
+                Some("session-1"),
+                Some("owner-key-1"),
+            )
+            .await
+        );
+
+        apply_local_execution_effect(
+            &state,
+            LocalExecutionEffectContext {
+                plan: &plan,
+                report_context: Some(&report_context),
+            },
+            LocalExecutionEffect::PoolError(LocalPoolErrorEffect {
+                status_code: 429,
+                classification: LocalFailoverClassification::RetryStatusCode,
+                headers: &BTreeMap::new(),
+                error_body: None,
+            }),
+        )
+        .await;
+
+        assert!(
+            !admin_provider_pool_sticky_session_init_exists(
+                state.runtime_state.as_ref(),
+                &plan.provider_id,
+                Some("session-1"),
+            )
+            .await,
+            "terminal key error should release sticky init even without pool feedback context"
+        );
+        assert!(
+            !clear_admin_provider_pool_sticky_session_prebind_if_owner(
+                state.runtime_state.as_ref(),
+                &plan.provider_id,
+                &plan.key_id,
+                Some("session-1"),
+                Some("owner-key-1"),
+            )
+            .await,
+            "terminal key error should clear owner-scoped prebind even without pool feedback context"
+        );
+        let runtime = read_admin_provider_pool_runtime_state(
+            state.runtime_state.as_ref(),
+            &plan.provider_id,
+            std::slice::from_ref(&plan.key_id),
+            &pool_config,
+            Some("session-1"),
+        )
+        .await;
+        assert_eq!(runtime.sticky_bound_key_id, None);
+    }
+
+    #[tokio::test]
+    async fn pool_terminal_non_key_error_keeps_sticky_when_feedback_context_is_missing() {
+        let state = AppState::new().expect("gateway state should build");
+        let mut plan = sample_plan();
+        plan.body = RequestBody::from_json(json!({
+            "model": "gpt-5",
+            "session_id": "session-1"
+        }));
+        let report_context = json!({
+            "pool_sticky_init_owner": "owner-key-1",
+            "pool_sticky_session_token": "session-1"
+        });
+        let pool_config = admin_provider_pool_config_from_config_value(Some(&json!({
+            "pool_advanced": {
+                "sticky_session_ttl_seconds": 120
+            }
+        })))
+        .expect("pool config should parse");
+        record_admin_provider_pool_success(
+            state.runtime_state.as_ref(),
+            &plan.provider_id,
+            &plan.key_id,
+            &pool_config,
+            Some("session-1"),
+            None,
+            false,
+            None,
+            0,
+            None,
+        )
+        .await;
+        assert!(
+            claim_admin_provider_pool_sticky_session_init(
+                state.runtime_state.as_ref(),
+                &plan.provider_id,
+                Some("session-1"),
+                "owner-key-1",
+                tokio::time::Duration::from_secs(30),
+            )
+            .await
+        );
+        assert!(
+            prebind_admin_provider_pool_sticky_session(
+                state.runtime_state.as_ref(),
+                &plan.provider_id,
+                &plan.key_id,
+                &pool_config,
+                Some("session-1"),
+                Some("owner-key-1"),
+            )
+            .await
+        );
+
+        apply_local_execution_effect(
+            &state,
+            LocalExecutionEffectContext {
+                plan: &plan,
+                report_context: Some(&report_context),
+            },
+            LocalExecutionEffect::PoolError(LocalPoolErrorEffect {
+                status_code: 400,
+                classification: LocalFailoverClassification::StopErrorPattern,
+                headers: &BTreeMap::new(),
+                error_body: Some(r#"{"error":{"message":"invalid user input"}}"#),
+            }),
+        )
+        .await;
+
+        assert!(
+            !admin_provider_pool_sticky_session_init_exists(
+                state.runtime_state.as_ref(),
+                &plan.provider_id,
+                Some("session-1"),
+            )
+            .await,
+            "terminal non-key error should still release sticky init"
+        );
+        assert!(
+            !clear_admin_provider_pool_sticky_session_prebind_if_owner(
+                state.runtime_state.as_ref(),
+                &plan.provider_id,
+                &plan.key_id,
+                Some("session-1"),
+                Some("owner-key-1"),
+            )
+            .await,
+            "terminal non-key error should clear owner-scoped prebind"
+        );
+        let runtime = read_admin_provider_pool_runtime_state(
+            state.runtime_state.as_ref(),
+            &plan.provider_id,
+            std::slice::from_ref(&plan.key_id),
+            &pool_config,
+            Some("session-1"),
+        )
+        .await;
+        assert_eq!(
+            runtime.sticky_bound_key_id.as_deref(),
+            Some(plan.key_id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_terminal_stream_timeout_clears_sticky_when_feedback_context_is_missing() {
+        let state = AppState::new().expect("gateway state should build");
+        let mut plan = sample_plan();
+        plan.body = RequestBody::from_json(json!({
+            "model": "gpt-5",
+            "session_id": "session-1"
+        }));
+        let report_context = json!({
+            "pool_sticky_init_owner": "owner-key-1",
+            "pool_sticky_session_token": "session-1"
+        });
+        let pool_config = admin_provider_pool_config_from_config_value(Some(&json!({
+            "pool_advanced": {
+                "sticky_session_ttl_seconds": 120
+            }
+        })))
+        .expect("pool config should parse");
+        record_admin_provider_pool_success(
+            state.runtime_state.as_ref(),
+            &plan.provider_id,
+            &plan.key_id,
+            &pool_config,
+            Some("session-1"),
+            None,
+            false,
+            None,
+            0,
+            None,
+        )
+        .await;
+        assert!(
+            claim_admin_provider_pool_sticky_session_init(
+                state.runtime_state.as_ref(),
+                &plan.provider_id,
+                Some("session-1"),
+                "owner-key-1",
+                tokio::time::Duration::from_secs(30),
+            )
+            .await
+        );
+        assert!(
+            prebind_admin_provider_pool_sticky_session(
+                state.runtime_state.as_ref(),
+                &plan.provider_id,
+                &plan.key_id,
+                &pool_config,
+                Some("session-1"),
+                Some("owner-key-1"),
+            )
+            .await
+        );
+
+        apply_local_execution_effect(
+            &state,
+            LocalExecutionEffectContext {
+                plan: &plan,
+                report_context: Some(&report_context),
+            },
+            LocalExecutionEffect::PoolStreamTimeout,
+        )
+        .await;
+
+        assert!(
+            !admin_provider_pool_sticky_session_init_exists(
+                state.runtime_state.as_ref(),
+                &plan.provider_id,
+                Some("session-1"),
+            )
+            .await,
+            "stream timeout should release sticky init even without pool feedback context"
+        );
+        assert!(
+            !clear_admin_provider_pool_sticky_session_prebind_if_owner(
+                state.runtime_state.as_ref(),
+                &plan.provider_id,
+                &plan.key_id,
+                Some("session-1"),
+                Some("owner-key-1"),
+            )
+            .await,
+            "stream timeout should clear owner-scoped prebind even without pool feedback context"
+        );
+        let runtime = read_admin_provider_pool_runtime_state(
+            state.runtime_state.as_ref(),
+            &plan.provider_id,
+            std::slice::from_ref(&plan.key_id),
+            &pool_config,
+            Some("session-1"),
+        )
+        .await;
+        assert_eq!(runtime.sticky_bound_key_id, None);
+    }
+
+    #[tokio::test]
+    async fn pool_attempt_start_cleanup_guard_uses_report_context_sticky_token() {
+        let state = AppState::new().expect("gateway state should build");
+        let mut plan = sample_plan();
+        plan.body = RequestBody::from_json(json!({
+            "model": "gpt-5",
+            "session_id": "different-body-session"
+        }));
+        let report_context = json!({
+            "pool_sticky_init_owner": "owner-key-1",
+            "pool_sticky_session_token": "session-1"
+        });
+        assert!(
+            claim_admin_provider_pool_sticky_session_init(
+                state.runtime_state.as_ref(),
+                &plan.provider_id,
+                Some("session-1"),
+                "owner-key-1",
+                tokio::time::Duration::from_secs(30),
+            )
+            .await
+        );
+        let pool_config = admin_provider_pool_config_from_config_value(Some(&json!({
+            "pool_advanced": {
+                "sticky_session_ttl_seconds": 120
+            }
+        })))
+        .expect("pool config should parse");
+        assert!(
+            prebind_admin_provider_pool_sticky_session(
+                state.runtime_state.as_ref(),
+                &plan.provider_id,
+                &plan.key_id,
+                &pool_config,
+                Some("session-1"),
+                Some("owner-key-1"),
+            )
+            .await
+        );
+
+        drop(
+            PoolAttemptStartCleanupGuard::new(
+                &state,
+                LocalExecutionEffectContext {
+                    plan: &plan,
+                    report_context: Some(&report_context),
+                },
+            )
+            .expect("cleanup guard should arm"),
+        );
+
+        for _ in 0..20 {
+            if !admin_provider_pool_sticky_session_init_exists(
+                state.runtime_state.as_ref(),
+                &plan.provider_id,
+                Some("session-1"),
+            )
+            .await
+            {
+                assert!(
+                    !clear_admin_provider_pool_sticky_session_prebind_if_owner(
+                        state.runtime_state.as_ref(),
+                        &plan.provider_id,
+                        &plan.key_id,
+                        Some("session-1"),
+                        Some("owner-key-1"),
+                    )
+                    .await,
+                    "cleanup guard should clear marker using the report-context token"
+                );
+                assert!(
+                    !admin_provider_pool_sticky_session_init_exists(
+                        state.runtime_state.as_ref(),
+                        &plan.provider_id,
+                        Some("different-body-session"),
+                    )
+                    .await,
+                    "cleanup must not target the body token when report metadata is present"
+                );
+                return;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        }
+        panic!("sticky init owner should be released using report-context token");
+    }
+
+    #[tokio::test]
+    async fn pool_attempt_started_effect_does_not_repeat_sticky_initialization() {
+        let provider_config = json!({
+            "pool_advanced": {
+                "sticky_session_ttl_seconds": 120
+            }
+        });
+        let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![sample_health_provider().with_transport_fields(
+                true,
+                false,
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(provider_config),
+            )],
+            vec![sample_health_endpoint()],
+            vec![sample_health_key()],
+        ));
+        let state = AppState::new()
+            .expect("gateway state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(repository)
+                    .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+            );
+        let mut plan = sample_plan();
+        plan.body = RequestBody::from_json(json!({
+            "model": "gpt-5",
+            "session_id": "session-1"
+        }));
+        let report_context = json!({
+            "pool_sticky_init_owner": "owner-key-1",
+            "original_request_body": {
+                "model": "gpt-5",
+                "session_id": "session-1"
+            }
+        });
+        let context = LocalExecutionEffectContext {
+            plan: &plan,
+            report_context: Some(&report_context),
+        };
+
+        assert!(
+            prepare_pool_attempt_started_effect(&state, context).await,
+            "first sticky initializer should be allowed to start"
+        );
+        apply_local_execution_effect(&state, context, LocalExecutionEffect::PoolAttemptStarted)
+            .await;
+
+        assert!(
+            admin_provider_pool_sticky_session_init_exists(
+                state.runtime_state.as_ref(),
+                &plan.provider_id,
+                Some("session-1"),
+            )
+            .await,
+            "attempt-started feedback must not release an in-flight sticky initializer"
+        );
+        assert!(
+            clear_admin_provider_pool_sticky_session_prebind_if_owner(
+                state.runtime_state.as_ref(),
+                &plan.provider_id,
+                &plan.key_id,
+                Some("session-1"),
+                Some("owner-key-1"),
+            )
+            .await,
+            "attempt-started feedback must not clear the provisional prebind marker"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_pool_attempt_started_effect_is_idempotent_for_same_initializer() {
+        let provider_config = json!({
+            "pool_advanced": {
+                "sticky_session_ttl_seconds": 120
+            }
+        });
+        let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![sample_health_provider().with_transport_fields(
+                true,
+                false,
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(provider_config),
+            )],
+            vec![sample_health_endpoint()],
+            vec![sample_health_key()],
+        ));
+        let state = AppState::new()
+            .expect("gateway state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(repository)
+                    .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+            );
+        let mut plan = sample_plan();
+        plan.body = RequestBody::from_json(json!({
+            "model": "gpt-5",
+            "session_id": "session-1"
+        }));
+        let report_context = json!({
+            "pool_sticky_init_owner": "owner-key-1",
+            "original_request_body": {
+                "model": "gpt-5",
+                "session_id": "session-1"
+            }
+        });
+        let context = LocalExecutionEffectContext {
+            plan: &plan,
+            report_context: Some(&report_context),
+        };
+
+        assert!(prepare_pool_attempt_started_effect(&state, context).await);
+        assert!(
+            prepare_pool_attempt_started_effect(&state, context).await,
+            "same owner/key should be able to repeat prepare without losing initialization"
+        );
+        assert!(
+            admin_provider_pool_sticky_session_init_exists(
+                state.runtime_state.as_ref(),
+                &plan.provider_id,
+                Some("session-1"),
+            )
+            .await
+        );
+        assert!(
+            clear_admin_provider_pool_sticky_session_prebind_if_owner(
+                state.runtime_state.as_ref(),
+                &plan.provider_id,
+                &plan.key_id,
+                Some("session-1"),
+                Some("owner-key-1"),
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_post_sticky_fallback_initializes_only_after_old_binding_clears() {
+        let provider_config = json!({
+            "pool_advanced": {
+                "sticky_session_ttl_seconds": 120
+            }
+        });
+        let pool_config = admin_provider_pool_config_from_config_value(Some(&provider_config))
+            .expect("pool config should parse");
+        let mut key_2 = sample_health_key();
+        key_2.id = "key-2".to_string();
+        key_2.name = "key-2".to_string();
+        let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![sample_health_provider().with_transport_fields(
+                true,
+                false,
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(provider_config),
+            )],
+            vec![sample_health_endpoint()],
+            vec![sample_health_key(), key_2],
+        ));
+        let state = AppState::new()
+            .expect("gateway state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(repository)
+                    .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+            );
+        let mut sticky_plan = sample_plan();
+        sticky_plan.key_id = "key-1".to_string();
+        sticky_plan.body = RequestBody::from_json(json!({
+            "model": "gpt-5",
+            "session_id": "session-1"
+        }));
+        let mut fallback_plan = sticky_plan.clone();
+        fallback_plan.key_id = "key-2".to_string();
+        let fallback_report_context = json!({
+            "pool_sticky_init_owner": "owner-key-2",
+            "original_request_body": {
+                "model": "gpt-5",
+                "session_id": "session-1"
+            }
+        });
+        let fallback_context = LocalExecutionEffectContext {
+            plan: &fallback_plan,
+            report_context: Some(&fallback_report_context),
+        };
+
+        record_admin_provider_pool_success(
+            state.runtime_state.as_ref(),
+            &sticky_plan.provider_id,
+            &sticky_plan.key_id,
+            &pool_config,
+            Some("session-1"),
+            None,
+            false,
+            None,
+            0,
+            None,
+        )
+        .await;
+
+        assert!(
+            !prepare_pool_attempt_started_effect(&state, fallback_context).await,
+            "fallback should not execute while the old sticky binding still owns the session"
+        );
+
+        clear_admin_provider_pool_sticky_session_if_bound_to_key(
+            state.runtime_state.as_ref(),
+            &sticky_plan.provider_id,
+            &sticky_plan.key_id,
+            Some("session-1"),
+        )
+        .await;
+
+        assert!(
+            prepare_pool_attempt_started_effect(&state, fallback_context).await,
+            "fallback should take over sticky initialization once the old binding is gone"
+        );
+        assert!(
+            admin_provider_pool_sticky_session_init_exists(
+                state.runtime_state.as_ref(),
+                &fallback_plan.provider_id,
+                Some("session-1"),
+            )
+            .await
+        );
+        assert!(
+            clear_admin_provider_pool_sticky_session_prebind_if_owner(
+                state.runtime_state.as_ref(),
+                &fallback_plan.provider_id,
+                &fallback_plan.key_id,
+                Some("session-1"),
+                Some("owner-key-2"),
+            )
+            .await,
+            "fallback takeover should create an owner-scoped prebind marker"
+        );
+    }
+
+    #[tokio::test]
+    async fn ineligible_sticky_fallback_initializes_while_old_binding_remains() {
+        let provider_config = json!({
+            "pool_advanced": {
+                "sticky_session_ttl_seconds": 120
+            }
+        });
+        let pool_config = admin_provider_pool_config_from_config_value(Some(&provider_config))
+            .expect("pool config should parse");
+        let mut key_2 = sample_health_key();
+        key_2.id = "key-2".to_string();
+        key_2.name = "key-2".to_string();
+        let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![sample_health_provider().with_transport_fields(
+                true,
+                false,
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(provider_config),
+            )],
+            vec![sample_health_endpoint()],
+            vec![sample_health_key(), key_2],
+        ));
+        let state = AppState::new()
+            .expect("gateway state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(repository)
+                    .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+            );
+        let mut sticky_plan = sample_plan();
+        sticky_plan.key_id = "key-1".to_string();
+        sticky_plan.body = RequestBody::from_json(json!({
+            "model": "gpt-5",
+            "session_id": "session-1"
+        }));
+        let mut fallback_plan = sticky_plan.clone();
+        fallback_plan.key_id = "key-2".to_string();
+        let fallback_report_context = json!({
+            "pool_sticky_init_owner": "owner-key-2",
+            "pool_sticky_bound_key_ineligible": true,
+            "pool_sticky_bound_key_id": "key-1",
+            "original_request_body": {
+                "model": "gpt-5",
+                "session_id": "session-1"
+            }
+        });
+        let fallback_context = LocalExecutionEffectContext {
+            plan: &fallback_plan,
+            report_context: Some(&fallback_report_context),
+        };
+
+        record_admin_provider_pool_success(
+            state.runtime_state.as_ref(),
+            &sticky_plan.provider_id,
+            &sticky_plan.key_id,
+            &pool_config,
+            Some("session-1"),
+            None,
+            false,
+            None,
+            0,
+            None,
+        )
+        .await;
+
+        assert!(
+            prepare_pool_attempt_started_effect(&state, fallback_context).await,
+            "fallback should initialize when the current sticky binding is the key already proven ineligible"
+        );
+        assert!(
+            admin_provider_pool_sticky_session_init_exists(
+                state.runtime_state.as_ref(),
+                &fallback_plan.provider_id,
+                Some("session-1"),
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn ineligible_sticky_fallback_rejects_after_session_rebound_elsewhere() {
+        let provider_config = json!({
+            "pool_advanced": {
+                "sticky_session_ttl_seconds": 120
+            }
+        });
+        let pool_config = admin_provider_pool_config_from_config_value(Some(&provider_config))
+            .expect("pool config should parse");
+        let mut key_2 = sample_health_key();
+        key_2.id = "key-2".to_string();
+        key_2.name = "key-2".to_string();
+        let mut key_3 = sample_health_key();
+        key_3.id = "key-3".to_string();
+        key_3.name = "key-3".to_string();
+        let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![sample_health_provider().with_transport_fields(
+                true,
+                false,
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(provider_config),
+            )],
+            vec![sample_health_endpoint()],
+            vec![sample_health_key(), key_2, key_3],
+        ));
+        let state = AppState::new()
+            .expect("gateway state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(repository)
+                    .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+            );
+        let mut old_sticky_plan = sample_plan();
+        old_sticky_plan.key_id = "key-1".to_string();
+        old_sticky_plan.body = RequestBody::from_json(json!({
+            "model": "gpt-5",
+            "session_id": "session-1"
+        }));
+        let mut rebound_plan = old_sticky_plan.clone();
+        rebound_plan.key_id = "key-3".to_string();
+        let mut stale_fallback_plan = old_sticky_plan.clone();
+        stale_fallback_plan.key_id = "key-2".to_string();
+        let stale_fallback_report_context = json!({
+            "pool_sticky_init_owner": "owner-key-2",
+            "pool_sticky_bound_key_ineligible": true,
+            "pool_sticky_bound_key_id": "key-1",
+            "original_request_body": {
+                "model": "gpt-5",
+                "session_id": "session-1"
+            }
+        });
+        let stale_fallback_context = LocalExecutionEffectContext {
+            plan: &stale_fallback_plan,
+            report_context: Some(&stale_fallback_report_context),
+        };
+
+        record_admin_provider_pool_success(
+            state.runtime_state.as_ref(),
+            &old_sticky_plan.provider_id,
+            &old_sticky_plan.key_id,
+            &pool_config,
+            Some("session-1"),
+            None,
+            false,
+            None,
+            0,
+            None,
+        )
+        .await;
+        record_admin_provider_pool_success(
+            state.runtime_state.as_ref(),
+            &rebound_plan.provider_id,
+            &rebound_plan.key_id,
+            &pool_config,
+            Some("session-1"),
+            None,
+            true,
+            Some("key-1"),
+            0,
+            None,
+        )
+        .await;
+
+        assert!(
+            !prepare_pool_attempt_started_effect(&state, stale_fallback_context).await,
+            "stale fallback should not execute after another key has already rebound the session"
+        );
+        assert!(
+            !admin_provider_pool_sticky_session_init_exists(
+                state.runtime_state.as_ref(),
+                &stale_fallback_plan.provider_id,
+                Some("session-1"),
+            )
+            .await,
+            "rejected stale fallback must not claim sticky initialization"
+        );
+    }
+
+    #[tokio::test]
+    async fn sticky_key_pool_error_allows_deferred_fallback_to_take_over() {
+        let provider_config = json!({
+            "pool_advanced": {
+                "sticky_session_ttl_seconds": 120,
+                "rate_limit_cooldown_seconds": 60
+            }
+        });
+        let pool_config = admin_provider_pool_config_from_config_value(Some(&provider_config))
+            .expect("pool config should parse");
+        let mut key_2 = sample_health_key();
+        key_2.id = "key-2".to_string();
+        key_2.name = "key-2".to_string();
+        let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![sample_health_provider().with_transport_fields(
+                true,
+                false,
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(provider_config),
+            )],
+            vec![sample_health_endpoint()],
+            vec![sample_health_key(), key_2],
+        ));
+        let state = AppState::new()
+            .expect("gateway state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(repository)
+                    .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+            );
+        let mut sticky_plan = sample_plan();
+        sticky_plan.key_id = "key-1".to_string();
+        sticky_plan.body = RequestBody::from_json(json!({
+            "model": "gpt-5",
+            "session_id": "session-1"
+        }));
+        let sticky_report_context = json!({
+            "original_request_body": {
+                "model": "gpt-5",
+                "session_id": "session-1"
+            }
+        });
+        let mut fallback_plan = sticky_plan.clone();
+        fallback_plan.key_id = "key-2".to_string();
+        let fallback_report_context = json!({
+            "pool_sticky_init_owner": "owner-key-2",
+            "original_request_body": {
+                "model": "gpt-5",
+                "session_id": "session-1"
+            }
+        });
+        let fallback_context = LocalExecutionEffectContext {
+            plan: &fallback_plan,
+            report_context: Some(&fallback_report_context),
+        };
+
+        record_admin_provider_pool_success(
+            state.runtime_state.as_ref(),
+            &sticky_plan.provider_id,
+            &sticky_plan.key_id,
+            &pool_config,
+            Some("session-1"),
+            None,
+            false,
+            None,
+            0,
+            None,
+        )
+        .await;
+
+        apply_local_execution_effect(
+            &state,
+            LocalExecutionEffectContext {
+                plan: &sticky_plan,
+                report_context: Some(&sticky_report_context),
+            },
+            LocalExecutionEffect::PoolError(LocalPoolErrorEffect {
+                status_code: 429,
+                classification: LocalFailoverClassification::RetryStatusCode,
+                headers: &BTreeMap::new(),
+                error_body: None,
+            }),
+        )
+        .await;
+
+        let runtime_after_error = read_admin_provider_pool_runtime_state(
+            state.runtime_state.as_ref(),
+            &sticky_plan.provider_id,
+            &["key-1".to_string(), "key-2".to_string()],
+            &pool_config,
+            Some("session-1"),
+        )
+        .await;
+        assert_eq!(runtime_after_error.sticky_bound_key_id, None);
+
+        assert!(
+            prepare_pool_attempt_started_effect(&state, fallback_context).await,
+            "fallback should take over after the failed sticky key clears the binding"
+        );
+        assert!(
+            admin_provider_pool_sticky_session_init_exists(
+                state.runtime_state.as_ref(),
+                &fallback_plan.provider_id,
+                Some("session-1"),
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn sticky_key_stream_timeout_allows_deferred_fallback_to_take_over() {
+        let provider_config = json!({
+            "pool_advanced": {
+                "sticky_session_ttl_seconds": 120,
+                "stream_timeout_threshold": 1,
+                "stream_timeout_cooldown_seconds": 60
+            }
+        });
+        let pool_config = admin_provider_pool_config_from_config_value(Some(&provider_config))
+            .expect("pool config should parse");
+        let mut key_2 = sample_health_key();
+        key_2.id = "key-2".to_string();
+        key_2.name = "key-2".to_string();
+        let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![sample_health_provider().with_transport_fields(
+                true,
+                false,
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(provider_config),
+            )],
+            vec![sample_health_endpoint()],
+            vec![sample_health_key(), key_2],
+        ));
+        let state = AppState::new()
+            .expect("gateway state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(repository)
+                    .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+            );
+        let mut sticky_plan = sample_plan();
+        sticky_plan.key_id = "key-1".to_string();
+        sticky_plan.body = RequestBody::from_json(json!({
+            "model": "gpt-5",
+            "session_id": "session-1"
+        }));
+        let sticky_report_context = json!({
+            "original_request_body": {
+                "model": "gpt-5",
+                "session_id": "session-1"
+            }
+        });
+        let mut fallback_plan = sticky_plan.clone();
+        fallback_plan.key_id = "key-2".to_string();
+        let fallback_report_context = json!({
+            "pool_sticky_init_owner": "owner-key-2",
+            "original_request_body": {
+                "model": "gpt-5",
+                "session_id": "session-1"
+            }
+        });
+        let fallback_context = LocalExecutionEffectContext {
+            plan: &fallback_plan,
+            report_context: Some(&fallback_report_context),
+        };
+
+        record_admin_provider_pool_success(
+            state.runtime_state.as_ref(),
+            &sticky_plan.provider_id,
+            &sticky_plan.key_id,
+            &pool_config,
+            Some("session-1"),
+            None,
+            false,
+            None,
+            0,
+            None,
+        )
+        .await;
+
+        apply_local_execution_effect(
+            &state,
+            LocalExecutionEffectContext {
+                plan: &sticky_plan,
+                report_context: Some(&sticky_report_context),
+            },
+            LocalExecutionEffect::PoolStreamTimeout,
+        )
+        .await;
+
+        let runtime_after_timeout = read_admin_provider_pool_runtime_state(
+            state.runtime_state.as_ref(),
+            &sticky_plan.provider_id,
+            &["key-1".to_string(), "key-2".to_string()],
+            &pool_config,
+            Some("session-1"),
+        )
+        .await;
+        assert_eq!(runtime_after_timeout.sticky_bound_key_id, None);
+
+        assert!(
+            prepare_pool_attempt_started_effect(&state, fallback_context).await,
+            "fallback should take over after stream timeout clears the sticky binding"
+        );
+        assert!(
+            admin_provider_pool_sticky_session_init_exists(
+                state.runtime_state.as_ref(),
+                &fallback_plan.provider_id,
+                Some("session-1"),
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn non_key_pool_error_finalizes_sticky_without_clearing_binding() {
+        let provider_config = json!({
+            "pool_advanced": {
+                "sticky_session_ttl_seconds": 120
+            }
+        });
+        let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![sample_health_provider().with_transport_fields(
+                true,
+                false,
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(provider_config.clone()),
+            )],
+            vec![sample_health_endpoint()],
+            vec![sample_health_key()],
+        ));
+        let state = AppState::new()
+            .expect("gateway state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(repository)
+                    .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+            );
+        let pool_config = admin_provider_pool_config_from_config_value(Some(&provider_config))
+            .expect("pool config should parse");
+        let mut plan = sample_plan();
+        plan.body = RequestBody::from_json(json!({
+            "model": "gpt-5",
+            "session_id": "session-1"
+        }));
+        let report_context = json!({
+            "pool_sticky_init_owner": "owner-key-1"
+        });
+
+        assert!(
+            prepare_pool_attempt_started_effect(
+                &state,
+                LocalExecutionEffectContext {
+                    plan: &plan,
+                    report_context: Some(&report_context),
+                },
+            )
+            .await,
+            "sticky initializer should be allowed to execute"
+        );
+        record_admin_provider_pool_success(
+            state.runtime_state.as_ref(),
+            &plan.provider_id,
+            &plan.key_id,
+            &pool_config,
+            Some("stable-session"),
+            None,
+            false,
+            None,
+            0,
+            None,
+        )
+        .await;
+
+        apply_local_execution_effect(
+            &state,
+            LocalExecutionEffectContext {
+                plan: &plan,
+                report_context: Some(&report_context),
+            },
+            LocalExecutionEffect::PoolError(LocalPoolErrorEffect {
+                status_code: 400,
+                classification: LocalFailoverClassification::StopErrorPattern,
+                headers: &BTreeMap::new(),
+                error_body: Some(r#"{"error":{"message":"invalid user input"}}"#),
+            }),
+        )
+        .await;
+
+        assert!(
+            !clear_admin_provider_pool_sticky_session_prebind_if_owner(
+                state.runtime_state.as_ref(),
+                &plan.provider_id,
+                &plan.key_id,
+                Some("session-1"),
+                Some("owner-key-1"),
+            )
+            .await,
+            "terminal cleanup should clear the owner-scoped sticky prebind marker"
+        );
+        assert!(
+            !admin_provider_pool_sticky_session_init_exists(
+                state.runtime_state.as_ref(),
+                &plan.provider_id,
+                Some("session-1"),
+            )
+            .await,
+            "terminal error path should still release the sticky init lock"
+        );
+        let runtime = read_admin_provider_pool_runtime_state(
+            state.runtime_state.as_ref(),
+            &plan.provider_id,
+            std::slice::from_ref(&plan.key_id),
+            &pool_config,
+            Some("session-1"),
+        )
+        .await;
+        assert_eq!(
+            runtime.sticky_bound_key_id.as_deref(),
+            Some(plan.key_id.as_str())
+        );
+
+        let stable_runtime = read_admin_provider_pool_runtime_state(
+            state.runtime_state.as_ref(),
+            &plan.provider_id,
+            std::slice::from_ref(&plan.key_id),
+            &pool_config,
+            Some("stable-session"),
+        )
+        .await;
+        assert_eq!(
+            stable_runtime.sticky_bound_key_id.as_deref(),
+            Some(plan.key_id.as_str())
+        );
     }
 
     fn health_state_with_key(key: StoredProviderCatalogKey) -> AppState {

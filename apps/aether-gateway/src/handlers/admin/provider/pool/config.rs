@@ -39,12 +39,15 @@ fn json_f64(value: &Value) -> Option<f64> {
 }
 
 fn parse_codex_quota_exhaustion_basis(pool_advanced: &Map<String, Value>) -> String {
-    if pool_advanced
+    if let Some(weekly_basis) = pool_advanced
         .get("codex_quota_weekly_basis")
         .and_then(Value::as_bool)
-        == Some(false)
     {
-        return "five_hour".to_string();
+        return if weekly_basis {
+            "weekly".to_string()
+        } else {
+            "five_hour".to_string()
+        };
     }
 
     match pool_advanced
@@ -251,30 +254,60 @@ fn parse_object_style_pool_scheduling_presets(
     }
 
     if normalized.is_empty() {
-        vec![AdminProviderPoolSchedulingPreset {
-            preset: "lru".to_string(),
-            enabled: true,
-            mode: None,
-        }]
+        default_cache_affinity_scheduling_presets()
     } else {
         normalized
     }
+}
+
+fn default_cache_affinity_scheduling_presets() -> Vec<AdminProviderPoolSchedulingPreset> {
+    vec![AdminProviderPoolSchedulingPreset {
+        preset: "cache_affinity".to_string(),
+        enabled: true,
+        mode: None,
+    }]
+}
+
+fn legacy_string_presets_include_distribution_mode(presets: &[Value]) -> bool {
+    presets.iter().any(|item| {
+        item.as_str()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .is_some_and(|preset| {
+                matches!(
+                    preset.as_str(),
+                    "no_weight" | "lru" | "cache_affinity" | "load_balance" | "single_account"
+                )
+            })
+    })
 }
 
 fn parse_legacy_string_style_pool_scheduling_presets(
     raw_pool_advanced: &Map<String, Value>,
     presets: &[Value],
 ) -> Vec<AdminProviderPoolSchedulingPreset> {
+    let has_distribution_mode = legacy_string_presets_include_distribution_mode(presets);
     let lru_enabled = raw_pool_advanced
         .get("lru_enabled")
         .and_then(Value::as_bool)
-        .unwrap_or(true);
-    let mut normalized = vec![AdminProviderPoolSchedulingPreset {
-        preset: "lru".to_string(),
-        enabled: lru_enabled,
-        mode: None,
-    }];
-    let mut seen = std::collections::BTreeSet::from(["lru".to_string()]);
+        .unwrap_or(!has_distribution_mode);
+    let mut normalized = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    if lru_enabled {
+        normalized.push(AdminProviderPoolSchedulingPreset {
+            preset: "lru".to_string(),
+            enabled: true,
+            mode: None,
+        });
+        seen.insert("lru".to_string());
+    } else if !has_distribution_mode {
+        normalized.push(AdminProviderPoolSchedulingPreset {
+            preset: "cache_affinity".to_string(),
+            enabled: true,
+            mode: None,
+        });
+        seen.insert("cache_affinity".to_string());
+    }
 
     for item in presets {
         let Some(preset) = item
@@ -298,7 +331,11 @@ fn parse_legacy_string_style_pool_scheduling_presets(
         });
     }
 
-    normalized
+    if normalized.is_empty() {
+        default_cache_affinity_scheduling_presets()
+    } else {
+        normalized
+    }
 }
 
 fn parse_pool_scheduling_presets_from_legacy_fields(
@@ -315,11 +352,7 @@ fn parse_pool_scheduling_presets_from_legacy_fields(
             mode: None,
         }]
     } else {
-        vec![AdminProviderPoolSchedulingPreset {
-            preset: "cache_affinity".to_string(),
-            enabled: true,
-            mode: None,
-        }]
+        default_cache_affinity_scheduling_presets()
     }
 }
 
@@ -422,7 +455,7 @@ pub(crate) fn admin_provider_pool_config_from_config_value(
             lru_enabled: false,
             skip_exhausted_accounts: false,
             codex_quota_exhaustion_basis: "weekly".to_string(),
-            sticky_session_ttl_seconds: 3600,
+            sticky_session_ttl_seconds: 0,
             latency_window_seconds: 3600,
             latency_sample_limit: 50,
             cost_window_seconds: 18_000,
@@ -462,7 +495,7 @@ pub(crate) fn admin_provider_pool_config_from_config_value(
         sticky_session_ttl_seconds: pool_advanced
             .get("sticky_session_ttl_seconds")
             .and_then(json_u64)
-            .unwrap_or(3600),
+            .unwrap_or(0),
         latency_window_seconds: pool_advanced
             .get("latency_window_seconds")
             .and_then(json_u64)
@@ -596,6 +629,14 @@ mod tests {
     }
 
     #[test]
+    fn defaults_missing_sticky_session_ttl_to_disabled() {
+        let provider = sample_provider(json!({ "pool_advanced": {} }));
+        let config = admin_provider_pool_config(&provider).expect("pool config should exist");
+
+        assert_eq!(config.sticky_session_ttl_seconds, 0);
+    }
+
+    #[test]
     fn parses_skip_exhausted_accounts_from_pool_advanced() {
         let provider = sample_provider(json!({
             "pool_advanced": {
@@ -705,6 +746,27 @@ mod tests {
     }
 
     #[test]
+    fn codex_quota_weekly_basis_overrides_legacy_basis_string() {
+        let weekly_config = admin_provider_pool_config_from_config_value(Some(&json!({
+            "pool_advanced": {
+                "codex_quota_weekly_basis": true,
+                "codex_quota_exhaustion_basis": "5h"
+            }
+        })))
+        .expect("pool config should parse");
+        assert_eq!(weekly_config.codex_quota_exhaustion_basis, "weekly");
+
+        let five_hour_config = admin_provider_pool_config_from_config_value(Some(&json!({
+            "pool_advanced": {
+                "codex_quota_weekly_basis": false,
+                "codex_quota_exhaustion_basis": "weekly"
+            }
+        })))
+        .expect("pool config should parse");
+        assert_eq!(five_hour_config.codex_quota_exhaustion_basis, "five_hour");
+    }
+
+    #[test]
     fn parses_legacy_pool_score_weights_from_pool_advanced() {
         let config = admin_provider_pool_config_from_config_value(Some(&json!({
             "pool_advanced": {
@@ -745,6 +807,21 @@ mod tests {
     fn defaults_empty_pool_advanced_to_cache_affinity_preset() {
         let config = admin_provider_pool_config_from_config_value(Some(&json!({
             "pool_advanced": {}
+        })))
+        .expect("pool config should parse");
+
+        assert!(!config.lru_enabled);
+        assert_eq!(config.scheduling_presets.len(), 1);
+        assert_eq!(config.scheduling_presets[0].preset, "cache_affinity");
+        assert!(config.scheduling_presets[0].enabled);
+    }
+
+    #[test]
+    fn legacy_non_lru_fields_preserve_cache_affinity_preset() {
+        let config = admin_provider_pool_config_from_config_value(Some(&json!({
+            "pool_advanced": {
+                "lru_enabled": false
+            }
         })))
         .expect("pool config should parse");
 
@@ -799,10 +876,65 @@ mod tests {
 
         assert!(!config.lru_enabled);
         assert_eq!(config.scheduling_presets.len(), 3);
-        assert_eq!(config.scheduling_presets[0].preset, "lru");
-        assert!(!config.scheduling_presets[0].enabled);
+        assert_eq!(config.scheduling_presets[0].preset, "cache_affinity");
+        assert!(config.scheduling_presets[0].enabled);
         assert_eq!(config.scheduling_presets[1].preset, "free_first");
         assert_eq!(config.scheduling_presets[2].preset, "recent_refresh");
+    }
+
+    #[test]
+    fn legacy_string_distribution_presets_do_not_enable_lru_by_default() {
+        let config = admin_provider_pool_config_from_config_value(Some(&json!({
+            "pool_advanced": {
+                "scheduling_presets": [
+                    "cache_affinity",
+                    "priority_first"
+                ]
+            }
+        })))
+        .expect("pool config should parse");
+
+        assert!(!config.lru_enabled);
+        assert_eq!(config.scheduling_presets.len(), 2);
+        assert_eq!(config.scheduling_presets[0].preset, "cache_affinity");
+        assert!(config.scheduling_presets[0].enabled);
+        assert_eq!(config.scheduling_presets[1].preset, "priority_first");
+    }
+
+    #[test]
+    fn legacy_string_distribution_presets_preserve_explicit_distribution_mode() {
+        for distribution_mode in ["load_balance", "single_account", "no_weight"] {
+            let config = admin_provider_pool_config_from_config_value(Some(&json!({
+                "pool_advanced": {
+                    "lru_enabled": false,
+                    "scheduling_presets": [distribution_mode, "priority_first"]
+                }
+            })))
+            .expect("pool config should parse");
+
+            assert!(!config.lru_enabled);
+            assert_eq!(config.scheduling_presets.len(), 2);
+            assert_eq!(config.scheduling_presets[0].preset, distribution_mode);
+            assert!(config.scheduling_presets[0].enabled);
+            assert_eq!(config.scheduling_presets[1].preset, "priority_first");
+        }
+    }
+
+    #[test]
+    fn invalid_object_style_scheduling_presets_fall_back_to_cache_affinity() {
+        let config = admin_provider_pool_config_from_config_value(Some(&json!({
+            "pool_advanced": {
+                "scheduling_presets": [
+                    {"preset": "retired_distribution", "enabled": true}
+                ]
+            }
+        })))
+        .expect("pool config should parse");
+
+        assert!(!config.lru_enabled);
+        assert_eq!(config.scheduling_presets.len(), 1);
+        assert_eq!(config.scheduling_presets[0].preset, "cache_affinity");
+        assert!(config.scheduling_presets[0].enabled);
     }
 
     #[test]
@@ -817,7 +949,7 @@ mod tests {
         .expect("pool config should parse");
 
         assert_eq!(config.scheduling_presets.len(), 1);
-        assert_eq!(config.scheduling_presets[0].preset, "lru");
+        assert_eq!(config.scheduling_presets[0].preset, "cache_affinity");
         assert_eq!(config.scheduling_presets[0].mode, None);
     }
 
@@ -863,5 +995,16 @@ mod tests {
         })))
         .expect("pool config should parse");
         assert!(!admin_provider_pool_cache_affinity_enabled(&load_balance));
+
+        let no_weight = admin_provider_pool_config_from_config_value(Some(&json!({
+            "pool_advanced": {
+                "scheduling_presets": [
+                    {"preset": "no_weight", "enabled": true},
+                    {"preset": "priority_first", "enabled": true}
+                ]
+            }
+        })))
+        .expect("pool config should parse");
+        assert!(!admin_provider_pool_cache_affinity_enabled(&no_weight));
     }
 }

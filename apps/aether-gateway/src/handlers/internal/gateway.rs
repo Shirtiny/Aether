@@ -19,6 +19,10 @@ use crate::execution_runtime::{execute_execution_runtime_stream, execute_executi
 use crate::handlers::shared::{
     InternalGatewayAuthContextRequest, InternalGatewayExecuteRequest, InternalGatewayResolveRequest,
 };
+use crate::orchestration::{
+    apply_local_execution_effect, prepare_pool_attempt_started_effect, LocalExecutionEffect,
+    LocalExecutionEffectContext, PoolAttemptStartCleanupGuard,
+};
 use crate::tunnel::{is_tunnel_heartbeat_path, is_tunnel_node_status_path, TUNNEL_ROUTE_FAMILY};
 use crate::{AppState, GatewayError};
 use aether_data::repository::proxy_nodes::{
@@ -568,23 +572,54 @@ pub(crate) async fn maybe_build_local_internal_proxy_response_impl(
                     let plan_kind = plan_payload.plan_kind.unwrap_or_default();
                     if let Some(plan) = plan_payload.plan {
                         if !plan_kind.trim().is_empty() {
-                            let executed_response = execute_execution_runtime_sync(
+                            let report_context = plan_payload.report_context;
+                            let context = LocalExecutionEffectContext {
+                                plan: &plan,
+                                report_context: report_context.as_ref(),
+                            };
+                            let mut sticky_init_cleanup =
+                                PoolAttemptStartCleanupGuard::new(state, context);
+                            if !prepare_pool_attempt_started_effect(state, context).await {
+                                return Ok(Some(build_internal_gateway_proxy_public_response()));
+                            }
+                            let result = execute_execution_runtime_sync(
                                 state,
                                 parts.uri.path(),
-                                plan,
+                                plan.clone(),
                                 trace_id.as_str(),
                                 &resolved,
                                 plan_kind.as_str(),
                                 plan_payload.report_kind,
-                                plan_payload.report_context,
+                                report_context.clone(),
                             )
-                            .await?;
+                            .await;
+                            let executed_response = match result {
+                                Ok(response) => response,
+                                Err(err) => {
+                                    apply_local_execution_effect(
+                                        state,
+                                        context,
+                                        LocalExecutionEffect::PoolAttemptAborted,
+                                    )
+                                    .await;
+                                    return Err(err);
+                                }
+                            };
                             if let Some(executed_response) = executed_response {
+                                if let Some(guard) = sticky_init_cleanup.as_mut() {
+                                    guard.disarm();
+                                }
                                 return Ok(Some(attach_execution_path_header(
                                     executed_response,
                                     EXECUTION_PATH_EXECUTION_RUNTIME_SYNC,
                                 )));
                             }
+                            apply_local_execution_effect(
+                                state,
+                                context,
+                                LocalExecutionEffect::PoolAttemptAborted,
+                            )
+                            .await;
                         }
                     }
                 }
@@ -648,22 +683,53 @@ pub(crate) async fn maybe_build_local_internal_proxy_response_impl(
                     let plan_kind = plan_payload.plan_kind.unwrap_or_default();
                     if let Some(plan) = plan_payload.plan {
                         if !plan_kind.trim().is_empty() {
-                            let executed_response = execute_execution_runtime_stream(
+                            let report_context = plan_payload.report_context;
+                            let context = LocalExecutionEffectContext {
+                                plan: &plan,
+                                report_context: report_context.as_ref(),
+                            };
+                            let mut sticky_init_cleanup =
+                                PoolAttemptStartCleanupGuard::new(state, context);
+                            if !prepare_pool_attempt_started_effect(state, context).await {
+                                return Ok(Some(build_internal_gateway_proxy_public_response()));
+                            }
+                            let result = execute_execution_runtime_stream(
                                 state,
-                                plan,
+                                plan.clone(),
                                 trace_id.as_str(),
                                 &resolved,
                                 plan_kind.as_str(),
                                 plan_payload.report_kind,
-                                plan_payload.report_context,
+                                report_context.clone(),
                             )
-                            .await?;
+                            .await;
+                            let executed_response = match result {
+                                Ok(response) => response,
+                                Err(err) => {
+                                    apply_local_execution_effect(
+                                        state,
+                                        context,
+                                        LocalExecutionEffect::PoolAttemptAborted,
+                                    )
+                                    .await;
+                                    return Err(err);
+                                }
+                            };
                             if let Some(executed_response) = executed_response {
+                                if let Some(guard) = sticky_init_cleanup.as_mut() {
+                                    guard.disarm();
+                                }
                                 return Ok(Some(attach_execution_path_header(
                                     executed_response,
                                     EXECUTION_PATH_EXECUTION_RUNTIME_STREAM,
                                 )));
                             }
+                            apply_local_execution_effect(
+                                state,
+                                context,
+                                LocalExecutionEffect::PoolAttemptAborted,
+                            )
+                            .await;
                         }
                     }
                 }

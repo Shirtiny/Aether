@@ -77,6 +77,14 @@ pub(crate) struct AdminProviderPoolRuntimeState {
     pub(crate) lru_score_by_key: BTreeMap<String, f64>,
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct AdminProviderPoolHotRuntimeState {
+    pub(crate) sticky_bound_key_id: Option<String>,
+    pub(crate) cooldown_reason_by_key: BTreeMap<String, String>,
+    pub(crate) cooldown_ttl_by_key: BTreeMap<String, u64>,
+    pub(crate) cost_window_usage_by_key: BTreeMap<String, u64>,
+}
+
 pub(crate) fn build_admin_provider_delete_task_payload(
     task: &LocalProviderDeleteTaskState,
 ) -> serde_json::Value {

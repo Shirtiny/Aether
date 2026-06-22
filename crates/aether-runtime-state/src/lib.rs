@@ -340,6 +340,58 @@ impl RuntimeState {
         }
     }
 
+    pub async fn kv_set_if_absent(
+        &self,
+        key: &str,
+        value: impl Into<String> + Send,
+        ttl: Duration,
+    ) -> Result<bool, DataLayerError> {
+        match self.backend.as_ref() {
+            RuntimeStateBackend::Memory(memory) => {
+                Ok(memory.kv_set_if_absent(key, value.into(), ttl).await)
+            }
+            RuntimeStateBackend::Redis(redis) => {
+                redis.runtime.kv_set_if_absent(key, value.into(), ttl).await
+            }
+        }
+    }
+
+    pub async fn kv_set_if_current_absent_or_value_and_guard_value(
+        &self,
+        key: &str,
+        value: impl Into<String> + Send,
+        ttl: Duration,
+        guard_key: &str,
+        guard_value: Option<&str>,
+        alternate_expected_current_value: Option<&str>,
+    ) -> Result<bool, DataLayerError> {
+        match self.backend.as_ref() {
+            RuntimeStateBackend::Memory(memory) => Ok(memory
+                .kv_set_if_current_absent_or_value_and_guard_value(
+                    key,
+                    value.into(),
+                    ttl,
+                    guard_key,
+                    guard_value,
+                    alternate_expected_current_value,
+                )
+                .await),
+            RuntimeStateBackend::Redis(redis) => {
+                redis
+                    .runtime
+                    .kv_set_if_current_absent_or_value_and_guard_value(
+                        key,
+                        value.into(),
+                        ttl,
+                        guard_key,
+                        guard_value,
+                        alternate_expected_current_value,
+                    )
+                    .await
+            }
+        }
+    }
+
     pub async fn kv_get(&self, key: &str) -> Result<Option<String>, DataLayerError> {
         match self.backend.as_ref() {
             RuntimeStateBackend::Memory(memory) => Ok(memory.kv_get(key).await),
@@ -377,6 +429,40 @@ impl RuntimeState {
         match self.backend.as_ref() {
             RuntimeStateBackend::Memory(memory) => Ok(memory.kv_delete(key).await),
             RuntimeStateBackend::Redis(redis) => Ok(redis.kv.del(key).await? > 0),
+        }
+    }
+
+    pub async fn kv_delete_if_value(
+        &self,
+        key: &str,
+        expected_value: &str,
+    ) -> Result<bool, DataLayerError> {
+        match self.backend.as_ref() {
+            RuntimeStateBackend::Memory(memory) => {
+                Ok(memory.kv_delete_if_value(key, expected_value).await)
+            }
+            RuntimeStateBackend::Redis(redis) => {
+                redis.runtime.kv_delete_if_value(key, expected_value).await
+            }
+        }
+    }
+
+    pub async fn kv_expire_if_value(
+        &self,
+        key: &str,
+        expected_value: &str,
+        ttl: Duration,
+    ) -> Result<bool, DataLayerError> {
+        match self.backend.as_ref() {
+            RuntimeStateBackend::Memory(memory) => {
+                Ok(memory.kv_expire_if_value(key, expected_value, ttl).await)
+            }
+            RuntimeStateBackend::Redis(redis) => {
+                redis
+                    .runtime
+                    .kv_expire_if_value(key, expected_value, ttl)
+                    .await
+            }
         }
     }
 
@@ -1701,6 +1787,200 @@ mod tests {
         assert_eq!(
             runtime.kv_get("contract:ttl:set").await.expect("ttl get"),
             None
+        );
+
+        assert!(runtime
+            .kv_set_if_absent("contract:nx", "first", Duration::from_millis(250),)
+            .await
+            .expect("set absent key"));
+        assert!(!runtime
+            .kv_set_if_absent("contract:nx", "second", Duration::from_millis(250),)
+            .await
+            .expect("preserve existing key"));
+        assert_eq!(
+            runtime
+                .kv_get("contract:nx")
+                .await
+                .expect("get nx key")
+                .as_deref(),
+            Some("first")
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            runtime.kv_get("contract:nx").await.expect("expired nx key"),
+            None
+        );
+
+        runtime
+            .kv_set("contract:guard", "owner-a", Some(Duration::from_secs(1)))
+            .await
+            .expect("set guard");
+        assert!(!runtime
+            .kv_set_if_current_absent_or_value_and_guard_value(
+                "contract:guarded",
+                "key-1",
+                Duration::from_secs(1),
+                "contract:guard",
+                Some("owner-b"),
+                None,
+            )
+            .await
+            .expect("reject guard mismatch"));
+        assert!(runtime
+            .kv_set_if_current_absent_or_value_and_guard_value(
+                "contract:guarded",
+                "key-1",
+                Duration::from_secs(1),
+                "contract:guard",
+                Some("owner-a"),
+                None,
+            )
+            .await
+            .expect("accept guard match"));
+        assert!(!runtime
+            .kv_set_if_current_absent_or_value_and_guard_value(
+                "contract:guarded",
+                "key-2",
+                Duration::from_secs(1),
+                "contract:guard",
+                Some("owner-a"),
+                None,
+            )
+            .await
+            .expect("reject current mismatch"));
+        assert_eq!(
+            runtime
+                .kv_get("contract:guarded")
+                .await
+                .expect("get guarded key")
+                .as_deref(),
+            Some("key-1")
+        );
+        assert!(!runtime
+            .kv_set_if_current_absent_or_value_and_guard_value(
+                "contract:guarded-ownerless",
+                "key-1",
+                Duration::from_secs(1),
+                "contract:guard",
+                None,
+                None,
+            )
+            .await
+            .expect("reject ownerless with active guard"));
+        runtime
+            .kv_delete("contract:guard")
+            .await
+            .expect("delete guard");
+        assert!(!runtime
+            .kv_set_if_current_absent_or_value_and_guard_value(
+                "contract:guarded-missing-owner",
+                "key-1",
+                Duration::from_secs(1),
+                "contract:guard",
+                Some("owner-a"),
+                None,
+            )
+            .await
+            .expect("reject owner when guard is missing"));
+        assert!(runtime
+            .kv_set_if_current_absent_or_value_and_guard_value(
+                "contract:guarded-ownerless",
+                "key-1",
+                Duration::from_secs(1),
+                "contract:guard",
+                None,
+                None,
+            )
+            .await
+            .expect("accept ownerless without guard"));
+        assert!(runtime
+            .kv_set_if_current_absent_or_value_and_guard_value(
+                "contract:guarded-ownerless",
+                "key-2",
+                Duration::from_secs(1),
+                "contract:guard",
+                None,
+                Some("key-1"),
+            )
+            .await
+            .expect("accept current overwrite when explicitly allowed"));
+
+        runtime
+            .kv_set(
+                "contract:delete-if-value",
+                "expected",
+                Some(Duration::from_secs(1)),
+            )
+            .await
+            .expect("set delete-if-value key");
+        assert!(!runtime
+            .kv_delete_if_value("contract:delete-if-value", "other")
+            .await
+            .expect("reject delete-if-value mismatch"));
+        assert_eq!(
+            runtime
+                .kv_get("contract:delete-if-value")
+                .await
+                .expect("delete-if-value preserved")
+                .as_deref(),
+            Some("expected")
+        );
+        assert!(runtime
+            .kv_delete_if_value("contract:delete-if-value", "expected")
+            .await
+            .expect("accept delete-if-value match"));
+        assert_eq!(
+            runtime
+                .kv_get("contract:delete-if-value")
+                .await
+                .expect("delete-if-value removed"),
+            None
+        );
+
+        runtime
+            .kv_set(
+                "contract:expire-if-value",
+                "expected",
+                Some(Duration::from_millis(40)),
+            )
+            .await
+            .expect("set expire-if-value key");
+        assert!(!runtime
+            .kv_expire_if_value("contract:expire-if-value", "other", Duration::from_secs(1),)
+            .await
+            .expect("reject expire-if-value mismatch"));
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(
+            runtime
+                .kv_get("contract:expire-if-value")
+                .await
+                .expect("expire-if-value mismatch did not renew"),
+            None
+        );
+        runtime
+            .kv_set(
+                "contract:expire-if-value",
+                "expected",
+                Some(Duration::from_millis(40)),
+            )
+            .await
+            .expect("reset expire-if-value key");
+        assert!(runtime
+            .kv_expire_if_value(
+                "contract:expire-if-value",
+                "expected",
+                Duration::from_secs(1),
+            )
+            .await
+            .expect("accept expire-if-value match"));
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(
+            runtime
+                .kv_get("contract:expire-if-value")
+                .await
+                .expect("expire-if-value renewed")
+                .as_deref(),
+            Some("expected")
         );
 
         runtime

@@ -1,3 +1,4 @@
+use crate::ai_serving::planner::candidate_materialization::release_pool_sticky_init_for_unbuilt_attempt;
 use crate::ai_serving::planner::common::{
     OPENAI_CHAT_STREAM_PLAN_KIND, OPENAI_CHAT_SYNC_PLAN_KIND,
 };
@@ -148,12 +149,13 @@ pub(crate) async fn maybe_build_sync_local_decision_payload(
     .await;
 
     while let Some(attempt) = source.next_attempt().await {
+        let cleanup_attempt = attempt.clone();
         let upstream_is_stream = self::plans::openai_chat_upstream_is_stream_for_candidate(
             &attempt.eligible.transport,
             attempt.eligible.provider_api_format.as_str(),
             false,
         );
-        if let Some(payload) = maybe_build_local_openai_chat_decision_payload_for_candidate(
+        let payload = match maybe_build_local_openai_chat_decision_payload_for_candidate(
             state,
             parts,
             trace_id,
@@ -164,10 +166,18 @@ pub(crate) async fn maybe_build_sync_local_decision_payload(
             "openai_chat_sync_success",
             upstream_is_stream,
         )
-        .await?
+        .await
         {
+            Ok(value) => value,
+            Err(err) => {
+                release_pool_sticky_init_for_unbuilt_attempt(state, &cleanup_attempt).await;
+                return Err(err);
+            }
+        };
+        if let Some(payload) = payload {
             return Ok(Some(payload));
         }
+        release_pool_sticky_init_for_unbuilt_attempt(state, &cleanup_attempt).await;
     }
 
     Ok(None)
@@ -200,12 +210,13 @@ pub(crate) async fn maybe_build_stream_local_decision_payload(
     .await;
 
     while let Some(attempt) = source.next_attempt().await {
+        let cleanup_attempt = attempt.clone();
         let upstream_is_stream = self::plans::openai_chat_upstream_is_stream_for_candidate(
             &attempt.eligible.transport,
             attempt.eligible.provider_api_format.as_str(),
             true,
         );
-        if let Some(payload) = maybe_build_local_openai_chat_decision_payload_for_candidate(
+        let payload = match maybe_build_local_openai_chat_decision_payload_for_candidate(
             state,
             parts,
             trace_id,
@@ -216,10 +227,18 @@ pub(crate) async fn maybe_build_stream_local_decision_payload(
             "openai_chat_stream_success",
             upstream_is_stream,
         )
-        .await?
+        .await
         {
+            Ok(value) => value,
+            Err(err) => {
+                release_pool_sticky_init_for_unbuilt_attempt(state, &cleanup_attempt).await;
+                return Err(err);
+            }
+        };
+        if let Some(payload) = payload {
             return Ok(Some(payload));
         }
+        release_pool_sticky_init_for_unbuilt_attempt(state, &cleanup_attempt).await;
     }
 
     Ok(None)

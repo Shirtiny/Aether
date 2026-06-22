@@ -279,11 +279,12 @@ async fn gateway_handles_admin_pool_scheduling_presets_locally_with_trusted_admi
     assert_eq!(response.status(), StatusCode::OK);
     let payload: serde_json::Value = response.json().await.expect("json body should parse");
     let items = payload.as_array().expect("payload should be an array");
-    assert_eq!(items.len(), 14);
-    assert_eq!(items[0]["name"], "lru");
-    assert_eq!(items[1]["name"], "cache_affinity");
-    assert_eq!(items[8]["name"], "pro_first");
-    assert_eq!(items[13]["name"], "team_first");
+    assert_eq!(items.len(), 15);
+    assert_eq!(items[0]["name"], "no_weight");
+    assert_eq!(items[1]["name"], "lru");
+    assert_eq!(items[2]["name"], "cache_affinity");
+    assert_eq!(items[9]["name"], "pro_first");
+    assert_eq!(items[14]["name"], "team_first");
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();

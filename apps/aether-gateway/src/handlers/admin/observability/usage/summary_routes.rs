@@ -1,17 +1,17 @@
 use super::super::stats::resolve_admin_usage_time_range;
 use super::analytics::admin_usage_api_key_names;
 use super::analytics::admin_usage_provider_key_names;
-use crate::GatewayError;
 use crate::handlers::admin::request::{AdminAppState, AdminRequestContext};
 use crate::handlers::admin::shared::query_param_value;
+use crate::GatewayError;
 use aether_admin::observability::usage::{
-    ADMIN_USAGE_DATA_UNAVAILABLE_DETAIL, admin_usage_bad_request_response,
-    admin_usage_client_family, admin_usage_data_unavailable_response, admin_usage_has_fallback,
-    admin_usage_is_failed, admin_usage_is_risk_control, admin_usage_matches_search,
-    admin_usage_matches_username, admin_usage_parse_ids, admin_usage_parse_limit,
-    admin_usage_parse_offset, admin_usage_provider_key_name, admin_usage_record_json,
+    admin_usage_bad_request_response, admin_usage_client_family,
+    admin_usage_data_unavailable_response, admin_usage_has_fallback, admin_usage_is_failed,
+    admin_usage_is_risk_control, admin_usage_matches_search, admin_usage_matches_username,
+    admin_usage_parse_ids, admin_usage_parse_limit, admin_usage_parse_offset,
+    admin_usage_provider_key_name, admin_usage_record_json,
     build_admin_usage_active_requests_response, build_admin_usage_records_response,
-    build_admin_usage_summary_stats_response_from_summary,
+    build_admin_usage_summary_stats_response_from_summary, ADMIN_USAGE_DATA_UNAVAILABLE_DETAIL,
 };
 use aether_data::repository::users::StoredUserSummary;
 use aether_data_contracts::repository::{
@@ -22,10 +22,10 @@ use aether_data_contracts::repository::{
     },
 };
 use axum::{
-    Json,
     body::Body,
     http,
     response::{IntoResponse, Response},
+    Json,
 };
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
@@ -726,8 +726,7 @@ pub(super) async fn maybe_build_local_admin_usage_summary_response(
                             attempt_status,
                             &attempt_flags_by_usage_id,
                             request_candidate_reader_available,
-                        )
-                        {
+                        ) {
                             resolved_usage.push(item);
                         }
                     }

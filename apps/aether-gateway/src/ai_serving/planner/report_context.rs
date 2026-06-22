@@ -19,7 +19,10 @@ use crate::client_session_affinity::{
     client_session_affinity_report_context_value, CLIENT_SESSION_AFFINITY_REPORT_CONTEXT_FIELD,
 };
 use crate::orchestration::{
-    insert_pool_key_lease_report_context_fields, ExecutionAttemptIdentity,
+    insert_pool_key_lease_report_context_fields,
+    insert_pool_sticky_bound_key_ineligible_report_context_field,
+    insert_pool_sticky_init_owner_report_context_field,
+    insert_pool_sticky_session_token_report_context_field, ExecutionAttemptIdentity,
     SCHEDULER_AFFINITY_EPOCH_REPORT_FIELD,
 };
 
@@ -42,6 +45,10 @@ pub(crate) struct LocalExecutionReportContextParts<'a> {
     pub(crate) mapped_model: Option<&'a str>,
     pub(crate) candidate_group_id: Option<&'a str>,
     pub(crate) pool_key_lease: Option<&'a RuntimeLockLease>,
+    pub(crate) pool_sticky_init_owner: Option<&'a str>,
+    pub(crate) pool_sticky_session_token: Option<&'a str>,
+    pub(crate) pool_sticky_bound_key_ineligible: bool,
+    pub(crate) pool_sticky_bound_key_id: Option<&'a str>,
     pub(crate) ranking: Option<&'a SchedulerRankingOutcome>,
     pub(crate) upstream_url: Option<&'a str>,
     pub(crate) header_rules: Option<&'a Value>,
@@ -105,6 +112,19 @@ pub(crate) fn build_local_execution_report_context(
         merge_incoming_tls_fingerprint(&mut extra_fields, incoming_tls);
     }
     insert_pool_key_lease_report_context_fields(&mut extra_fields, parts.pool_key_lease);
+    insert_pool_sticky_init_owner_report_context_field(
+        &mut extra_fields,
+        parts.pool_sticky_init_owner,
+    );
+    insert_pool_sticky_session_token_report_context_field(
+        &mut extra_fields,
+        parts.pool_sticky_session_token,
+    );
+    insert_pool_sticky_bound_key_ineligible_report_context_field(
+        &mut extra_fields,
+        parts.pool_sticky_bound_key_ineligible,
+        parts.pool_sticky_bound_key_id,
+    );
     if let Some(epoch) = parts.scheduler_affinity_epoch {
         extra_fields.insert(
             SCHEDULER_AFFINITY_EPOCH_REPORT_FIELD.to_string(),
@@ -299,6 +319,10 @@ mod tests {
                 mapped_model: None,
                 candidate_group_id: None,
                 pool_key_lease: None,
+                pool_sticky_init_owner: None,
+                pool_sticky_session_token: Some("session-1"),
+                pool_sticky_bound_key_ineligible: false,
+                pool_sticky_bound_key_id: None,
                 ranking: None,
                 upstream_url: None,
                 header_rules: None,
@@ -338,6 +362,7 @@ mod tests {
                 "session_key": "account=account-1;session=session-1"
             })
         );
+        assert_eq!(report_context["pool_sticky_session_token"], "session-1");
         assert_eq!(report_context["request_path"], "/v1/chat/completions");
         assert_eq!(report_context["request_query_string"], "limit=10");
         assert_eq!(
@@ -380,6 +405,10 @@ mod tests {
                 mapped_model: None,
                 candidate_group_id: None,
                 pool_key_lease: None,
+                pool_sticky_init_owner: None,
+                pool_sticky_session_token: None,
+                pool_sticky_bound_key_ineligible: false,
+                pool_sticky_bound_key_id: None,
                 ranking: None,
                 upstream_url: None,
                 header_rules: None,
@@ -450,6 +479,10 @@ mod tests {
                 mapped_model: None,
                 candidate_group_id: None,
                 pool_key_lease: None,
+                pool_sticky_init_owner: None,
+                pool_sticky_session_token: None,
+                pool_sticky_bound_key_ineligible: false,
+                pool_sticky_bound_key_id: None,
                 ranking: None,
                 upstream_url: None,
                 header_rules: None,

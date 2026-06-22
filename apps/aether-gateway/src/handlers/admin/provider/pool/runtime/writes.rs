@@ -1,6 +1,6 @@
 use super::keys::{
     pool_cooldown_index_key, pool_cooldown_key, pool_cost_key, pool_latency_key, pool_lru_key,
-    pool_sticky_key, pool_stream_timeout_key,
+    pool_sticky_init_key, pool_sticky_key, pool_sticky_prebind_key, pool_stream_timeout_key,
 };
 use crate::handlers::admin::provider::pool::config::admin_provider_pool_cache_affinity_enabled;
 use crate::handlers::admin::provider::shared::support::{
@@ -360,6 +360,9 @@ pub(crate) async fn record_admin_provider_pool_success(
     key_id: &str,
     pool_config: &AdminProviderPoolConfig,
     sticky_session_token: Option<&str>,
+    sticky_init_owner: Option<&str>,
+    sticky_bound_key_ineligible: bool,
+    sticky_bound_key_id: Option<&str>,
     tokens_used: u64,
     ttfb_ms: Option<u64>,
 ) {
@@ -370,15 +373,18 @@ pub(crate) async fn record_admin_provider_pool_success(
         .filter(|value| !value.is_empty())
         .filter(|_| pool_config.sticky_session_ttl_seconds > 0)
     {
-        let _ = runtime
-            .kv_set(
-                &pool_sticky_key(provider_id, sticky_session_token),
-                key_id.to_string(),
-                Some(std::time::Duration::from_secs(
-                    pool_config.sticky_session_ttl_seconds,
-                )),
-            )
-            .await;
+        publish_admin_provider_pool_sticky_session_success(
+            runtime,
+            provider_id,
+            key_id,
+            sticky_session_token,
+            sticky_init_owner,
+            std::time::Duration::from_secs(pool_config.sticky_session_ttl_seconds),
+            sticky_bound_key_ineligible
+                .then_some(sticky_bound_key_id)
+                .flatten(),
+        )
+        .await;
     }
 
     if should_touch_lru(pool_config) {
@@ -425,6 +431,329 @@ pub(crate) async fn record_admin_provider_pool_success(
             )
             .await;
     }
+}
+
+async fn publish_admin_provider_pool_sticky_session_success(
+    runtime: &RuntimeState,
+    provider_id: &str,
+    key_id: &str,
+    sticky_session_token: &str,
+    sticky_init_owner: Option<&str>,
+    ttl: std::time::Duration,
+    sticky_bound_key_id: Option<&str>,
+) {
+    let sticky_key = pool_sticky_key(provider_id, sticky_session_token);
+    let init_key = pool_sticky_init_key(provider_id, sticky_session_token);
+    let sticky_init_owner = sticky_init_owner
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    // When scheduling already proved the old sticky-bound key ineligible,
+    // this expected-current value lets a successful fallback move the session
+    // off that key without overwriting unrelated newer bindings.
+    let expected_previous_key = sticky_bound_key_id;
+    if let Err(err) = runtime
+        .kv_set_if_current_absent_or_value_and_guard_value(
+            &sticky_key,
+            key_id.to_string(),
+            ttl,
+            &init_key,
+            sticky_init_owner,
+            expected_previous_key,
+        )
+        .await
+    {
+        warn!(
+            "gateway admin provider pool: failed to publish sticky session for provider {provider_id} key {key_id}: {:?}",
+            err
+        );
+    }
+}
+
+pub(crate) async fn prebind_admin_provider_pool_sticky_session(
+    runtime: &RuntimeState,
+    provider_id: &str,
+    key_id: &str,
+    pool_config: &AdminProviderPoolConfig,
+    sticky_session_token: Option<&str>,
+    owner: Option<&str>,
+) -> bool {
+    let Some(sticky_session_token) = sticky_session_token
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .filter(|_| pool_config.sticky_session_ttl_seconds > 0)
+    else {
+        return false;
+    };
+    let Some(owner) = owner.map(str::trim).filter(|value| !value.is_empty()) else {
+        return false;
+    };
+
+    let prebind_key = pool_sticky_prebind_key(provider_id, sticky_session_token, owner);
+    let init_key = pool_sticky_init_key(provider_id, sticky_session_token);
+    match runtime
+        .kv_set_if_current_absent_or_value_and_guard_value(
+            &prebind_key,
+            key_id.to_string(),
+            std::time::Duration::from_secs(pool_config.sticky_session_ttl_seconds),
+            &init_key,
+            Some(owner),
+            None,
+        )
+        .await
+    {
+        Ok(bound) => bound,
+        Err(err) => {
+            warn!(
+                "gateway admin provider pool: failed to prebind sticky session marker for provider {provider_id} key {key_id}: {:?}",
+                err
+            );
+            false
+        }
+    }
+}
+
+pub(crate) async fn clear_admin_provider_pool_sticky_session_prebind_if_owner(
+    runtime: &RuntimeState,
+    provider_id: &str,
+    key_id: &str,
+    sticky_session_token: Option<&str>,
+    owner: Option<&str>,
+) -> bool {
+    let Some(sticky_session_token) = sticky_session_token
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+    let Some(owner) = owner.map(str::trim).filter(|value| !value.is_empty()) else {
+        return false;
+    };
+
+    match runtime
+        .kv_delete_if_value(
+            &pool_sticky_prebind_key(provider_id, sticky_session_token, owner),
+            key_id,
+        )
+        .await
+    {
+        Ok(deleted) => deleted,
+        Err(err) => {
+            warn!(
+                "gateway admin provider pool: failed to clear sticky prebind for provider {provider_id} key {key_id}: {:?}",
+                err
+            );
+            false
+        }
+    }
+}
+
+pub(crate) async fn clear_admin_provider_pool_sticky_session_if_bound_to_key(
+    runtime: &RuntimeState,
+    provider_id: &str,
+    key_id: &str,
+    sticky_session_token: Option<&str>,
+) -> bool {
+    let Some(sticky_session_token) = sticky_session_token
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+    let sticky_key = pool_sticky_key(provider_id, sticky_session_token);
+    match runtime.kv_delete_if_value(&sticky_key, key_id).await {
+        Ok(deleted) => deleted,
+        Err(err) => {
+            warn!(
+                "gateway admin provider pool: failed to clear sticky session for provider {provider_id} key {key_id}: {:?}",
+                err
+            );
+            false
+        }
+    }
+}
+
+pub(crate) async fn refresh_admin_provider_pool_sticky_session_if_bound_to_key(
+    runtime: &RuntimeState,
+    provider_id: &str,
+    key_id: &str,
+    sticky_session_token: Option<&str>,
+    ttl: std::time::Duration,
+) -> bool {
+    let Some(sticky_session_token) = sticky_session_token
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+    if ttl.is_zero() {
+        return false;
+    }
+    let sticky_key = pool_sticky_key(provider_id, sticky_session_token);
+    match runtime.kv_expire_if_value(&sticky_key, key_id, ttl).await {
+        Ok(renewed) => renewed,
+        Err(err) => {
+            warn!(
+                "gateway admin provider pool: failed to refresh sticky session for provider {provider_id} key {key_id}: {:?}",
+                err
+            );
+            false
+        }
+    }
+}
+
+pub(crate) async fn claim_admin_provider_pool_sticky_session_init(
+    runtime: &RuntimeState,
+    provider_id: &str,
+    sticky_session_token: Option<&str>,
+    owner: &str,
+    ttl: std::time::Duration,
+) -> bool {
+    let Some(sticky_session_token) = sticky_session_token
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+
+    match runtime
+        .kv_set_if_absent(
+            &pool_sticky_init_key(provider_id, sticky_session_token),
+            owner.to_string(),
+            ttl,
+        )
+        .await
+    {
+        Ok(created) => created,
+        Err(err) => {
+            warn!(
+                "gateway admin provider pool: failed to claim sticky session init for provider {provider_id}: {:?}",
+                err
+            );
+            false
+        }
+    }
+}
+
+pub(crate) async fn admin_provider_pool_sticky_session_init_exists(
+    runtime: &RuntimeState,
+    provider_id: &str,
+    sticky_session_token: Option<&str>,
+) -> bool {
+    let Some(sticky_session_token) = sticky_session_token
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+
+    runtime
+        .kv_exists(&pool_sticky_init_key(provider_id, sticky_session_token))
+        .await
+        .unwrap_or(false)
+}
+
+pub(crate) async fn admin_provider_pool_sticky_session_init_owner_matches(
+    runtime: &RuntimeState,
+    provider_id: &str,
+    sticky_session_token: Option<&str>,
+    owner: Option<&str>,
+) -> bool {
+    let Some(sticky_session_token) = sticky_session_token
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+    let Some(owner) = owner.map(str::trim).filter(|value| !value.is_empty()) else {
+        return false;
+    };
+
+    runtime
+        .kv_get(&pool_sticky_init_key(provider_id, sticky_session_token))
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|current_owner| current_owner == owner)
+}
+
+pub(crate) async fn release_admin_provider_pool_sticky_session_init_if_owner(
+    runtime: &RuntimeState,
+    provider_id: &str,
+    sticky_session_token: Option<&str>,
+    owner: Option<&str>,
+) -> bool {
+    let Some(sticky_session_token) = sticky_session_token
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+    let Some(owner) = owner.map(str::trim).filter(|value| !value.is_empty()) else {
+        return false;
+    };
+
+    let sticky_init_key = pool_sticky_init_key(provider_id, sticky_session_token);
+    match runtime.kv_delete_if_value(&sticky_init_key, owner).await {
+        Ok(deleted) => deleted,
+        Err(err) => {
+            warn!(
+                "gateway admin provider pool: failed to release sticky session init for provider {provider_id}: {:?}",
+                err
+            );
+            false
+        }
+    }
+}
+
+pub(crate) async fn renew_admin_provider_pool_sticky_session_init_if_owner(
+    runtime: &RuntimeState,
+    provider_id: &str,
+    sticky_session_token: Option<&str>,
+    owner: Option<&str>,
+    ttl: std::time::Duration,
+) -> bool {
+    let Some(sticky_session_token) = sticky_session_token
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+    let Some(owner) = owner.map(str::trim).filter(|value| !value.is_empty()) else {
+        return false;
+    };
+
+    let sticky_init_key = pool_sticky_init_key(provider_id, sticky_session_token);
+    match runtime
+        .kv_expire_if_value(&sticky_init_key, owner, ttl)
+        .await
+    {
+        Ok(renewed) => renewed,
+        Err(err) => {
+            warn!(
+                "gateway admin provider pool: failed to renew sticky session init for provider {provider_id}: {:?}",
+                err
+            );
+            false
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn release_admin_provider_pool_sticky_session_init_for_tests(
+    runtime: &RuntimeState,
+    provider_id: &str,
+    sticky_session_token: Option<&str>,
+) {
+    let Some(sticky_session_token) = sticky_session_token
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+
+    let _ = runtime
+        .kv_delete(&pool_sticky_init_key(provider_id, sticky_session_token))
+        .await;
 }
 
 pub(crate) async fn record_admin_provider_pool_error(
@@ -587,11 +916,22 @@ pub(crate) async fn record_admin_provider_pool_stream_timeout(
 #[cfg(test)]
 mod tests {
     use super::{
-        admin_provider_pool_key_terminal_error_reason, parse_google_quota_cooldown_seconds_at,
+        admin_provider_pool_key_terminal_error_reason,
+        admin_provider_pool_sticky_session_init_exists,
+        claim_admin_provider_pool_sticky_session_init,
+        clear_admin_provider_pool_sticky_session_if_bound_to_key,
+        clear_admin_provider_pool_sticky_session_prebind_if_owner,
+        parse_google_quota_cooldown_seconds_at, prebind_admin_provider_pool_sticky_session,
         record_admin_provider_pool_error, record_admin_provider_pool_stream_timeout,
         record_admin_provider_pool_success,
+        refresh_admin_provider_pool_sticky_session_if_bound_to_key,
+        release_admin_provider_pool_sticky_session_init_if_owner,
     };
-    use crate::handlers::admin::provider::pool::runtime::reads::read_admin_provider_pool_runtime_state;
+    use crate::handlers::admin::provider::pool::runtime::keys::pool_sticky_key;
+    use crate::handlers::admin::provider::pool::runtime::reads::{
+        read_admin_provider_pool_runtime_state,
+        read_admin_provider_pool_runtime_state_preserving_sticky_ttl,
+    };
     use crate::handlers::admin::provider::shared::support::{
         admin_provider_pool_quota_probe_active_members_key, AdminProviderPoolConfig,
         AdminProviderPoolSchedulingPreset, AdminProviderPoolUnschedulableRule,
@@ -802,6 +1142,9 @@ mod tests {
             "key-1",
             &pool_config,
             Some("session-1"),
+            None,
+            false,
+            None,
             120,
             Some(80),
         )
@@ -842,6 +1185,9 @@ mod tests {
             "key-1",
             &pool_config,
             Some("session-1"),
+            None,
+            false,
+            None,
             120,
             Some(80),
         )
@@ -864,11 +1210,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn success_feedback_does_not_write_sticky_without_cache_affinity() {
+    async fn success_feedback_writes_sticky_for_any_mode_when_ttl_is_enabled() {
         let Some(redis) = start_managed_redis_or_skip().await else {
             return;
         };
-        let app = build_runner_app(redis.redis_url(), "pool_runtime_no_sticky_load_balance").await;
+        let app = build_runner_app(redis.redis_url(), "pool_runtime_sticky_load_balance").await;
         let runtime = app.runtime_state.as_ref();
         let mut pool_config = sample_pool_config();
         pool_config.scheduling_presets = vec![AdminProviderPoolSchedulingPreset {
@@ -885,6 +1231,9 @@ mod tests {
             "key-1",
             &pool_config,
             Some("session-1"),
+            None,
+            false,
+            None,
             120,
             Some(80),
         )
@@ -899,12 +1248,841 @@ mod tests {
         )
         .await;
 
-        assert_eq!(runtime.total_sticky_sessions, 0);
-        assert_eq!(runtime.sticky_bound_key_id, None);
-        assert_eq!(runtime.sticky_sessions_by_key.get("key-1"), None);
+        assert_eq!(runtime.total_sticky_sessions, 1);
+        assert_eq!(runtime.sticky_bound_key_id.as_deref(), Some("key-1"));
+        assert_eq!(runtime.sticky_sessions_by_key.get("key-1"), Some(&1));
         assert_eq!(runtime.cost_window_usage_by_key.get("key-1"), Some(&120));
         assert_eq!(runtime.latency_avg_ms_by_key.get("key-1"), Some(&80.0));
         assert!(runtime.lru_score_by_key.contains_key("key-1"));
+    }
+
+    #[tokio::test]
+    async fn success_feedback_rebinds_sticky_after_bound_key_is_ineligible() {
+        let Some(redis) = start_managed_redis_or_skip().await else {
+            return;
+        };
+        let app = build_runner_app(redis.redis_url(), "pool_runtime_sticky_rebind").await;
+        let runtime = app.runtime_state.as_ref();
+        let pool_config = sample_pool_config();
+        let key_ids = vec!["key-1".to_string(), "key-2".to_string()];
+
+        record_admin_provider_pool_success(
+            runtime,
+            "provider-1",
+            "key-1",
+            &pool_config,
+            Some("session-1"),
+            None,
+            false,
+            None,
+            0,
+            None,
+        )
+        .await;
+        record_admin_provider_pool_success(
+            runtime,
+            "provider-1",
+            "key-2",
+            &pool_config,
+            Some("session-1"),
+            None,
+            true,
+            Some("key-1"),
+            0,
+            None,
+        )
+        .await;
+
+        let runtime_state = read_admin_provider_pool_runtime_state(
+            runtime,
+            "provider-1",
+            &key_ids,
+            &pool_config,
+            Some("session-1"),
+        )
+        .await;
+
+        assert_eq!(runtime_state.sticky_bound_key_id.as_deref(), Some("key-2"));
+        assert_eq!(runtime_state.sticky_sessions_by_key.get("key-1"), None);
+        assert_eq!(runtime_state.sticky_sessions_by_key.get("key-2"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn success_feedback_rebinds_ineligible_sticky_when_owner_holds_init_lock() {
+        let Some(redis) = start_managed_redis_or_skip().await else {
+            return;
+        };
+        let app = build_runner_app(redis.redis_url(), "pool_runtime_sticky_owner_rebind").await;
+        let runtime = app.runtime_state.as_ref();
+        let pool_config = sample_pool_config();
+        let key_ids = vec!["key-1".to_string(), "key-2".to_string()];
+
+        record_admin_provider_pool_success(
+            runtime,
+            "provider-1",
+            "key-1",
+            &pool_config,
+            Some("session-1"),
+            None,
+            false,
+            None,
+            0,
+            None,
+        )
+        .await;
+        assert!(
+            claim_admin_provider_pool_sticky_session_init(
+                runtime,
+                "provider-1",
+                Some("session-1"),
+                "owner-key-2",
+                std::time::Duration::from_secs(30),
+            )
+            .await
+        );
+        record_admin_provider_pool_success(
+            runtime,
+            "provider-1",
+            "key-2",
+            &pool_config,
+            Some("session-1"),
+            Some("owner-key-2"),
+            true,
+            Some("key-1"),
+            0,
+            None,
+        )
+        .await;
+
+        let runtime_state = read_admin_provider_pool_runtime_state(
+            runtime,
+            "provider-1",
+            &key_ids,
+            &pool_config,
+            Some("session-1"),
+        )
+        .await;
+
+        assert_eq!(runtime_state.sticky_bound_key_id.as_deref(), Some("key-2"));
+        assert_eq!(runtime_state.sticky_sessions_by_key.get("key-1"), None);
+        assert_eq!(runtime_state.sticky_sessions_by_key.get("key-2"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn success_feedback_does_not_rebind_when_sticky_changed_since_scheduling() {
+        let Some(redis) = start_managed_redis_or_skip().await else {
+            return;
+        };
+        let app = build_runner_app(redis.redis_url(), "pool_runtime_sticky_stale_rebind").await;
+        let runtime = app.runtime_state.as_ref();
+        let pool_config = sample_pool_config();
+        let key_ids = vec![
+            "key-1".to_string(),
+            "key-2".to_string(),
+            "key-3".to_string(),
+        ];
+
+        record_admin_provider_pool_success(
+            runtime,
+            "provider-1",
+            "key-1",
+            &pool_config,
+            Some("session-1"),
+            None,
+            false,
+            None,
+            0,
+            None,
+        )
+        .await;
+        record_admin_provider_pool_success(
+            runtime,
+            "provider-1",
+            "key-2",
+            &pool_config,
+            Some("session-1"),
+            None,
+            true,
+            Some("key-1"),
+            0,
+            None,
+        )
+        .await;
+        record_admin_provider_pool_success(
+            runtime,
+            "provider-1",
+            "key-3",
+            &pool_config,
+            Some("session-1"),
+            None,
+            true,
+            Some("key-1"),
+            0,
+            None,
+        )
+        .await;
+
+        let runtime_state = read_admin_provider_pool_runtime_state(
+            runtime,
+            "provider-1",
+            &key_ids,
+            &pool_config,
+            Some("session-1"),
+        )
+        .await;
+
+        assert_eq!(runtime_state.sticky_bound_key_id.as_deref(), Some("key-2"));
+        assert_eq!(runtime_state.sticky_sessions_by_key.get("key-1"), None);
+        assert_eq!(runtime_state.sticky_sessions_by_key.get("key-2"), Some(&1));
+        assert_eq!(runtime_state.sticky_sessions_by_key.get("key-3"), None);
+    }
+
+    #[tokio::test]
+    async fn memory_success_feedback_rebinds_sticky_after_bound_key_is_ineligible() {
+        let app = AppState::new().expect("app state should build");
+        let runtime = app.runtime_state.as_ref();
+        let pool_config = sample_pool_config();
+        let key_ids = vec!["key-1".to_string(), "key-2".to_string()];
+
+        record_admin_provider_pool_success(
+            runtime,
+            "provider-1",
+            "key-1",
+            &pool_config,
+            Some("session-1"),
+            None,
+            false,
+            None,
+            0,
+            None,
+        )
+        .await;
+        record_admin_provider_pool_success(
+            runtime,
+            "provider-1",
+            "key-2",
+            &pool_config,
+            Some("session-1"),
+            None,
+            true,
+            Some("key-1"),
+            0,
+            None,
+        )
+        .await;
+
+        let runtime_state = read_admin_provider_pool_runtime_state(
+            runtime,
+            "provider-1",
+            &key_ids,
+            &pool_config,
+            Some("session-1"),
+        )
+        .await;
+
+        assert_eq!(runtime_state.sticky_bound_key_id.as_deref(), Some("key-2"));
+        assert_eq!(runtime_state.sticky_sessions_by_key.get("key-1"), None);
+        assert_eq!(runtime_state.sticky_sessions_by_key.get("key-2"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn memory_success_feedback_does_not_rebind_without_ineligible_marker() {
+        let app = AppState::new().expect("app state should build");
+        let runtime = app.runtime_state.as_ref();
+        let pool_config = sample_pool_config();
+        let key_ids = vec!["key-1".to_string(), "key-2".to_string()];
+
+        record_admin_provider_pool_success(
+            runtime,
+            "provider-1",
+            "key-1",
+            &pool_config,
+            Some("session-1"),
+            None,
+            false,
+            None,
+            0,
+            None,
+        )
+        .await;
+        record_admin_provider_pool_success(
+            runtime,
+            "provider-1",
+            "key-2",
+            &pool_config,
+            Some("session-1"),
+            None,
+            false,
+            Some("key-1"),
+            0,
+            None,
+        )
+        .await;
+
+        let runtime_state = read_admin_provider_pool_runtime_state(
+            runtime,
+            "provider-1",
+            &key_ids,
+            &pool_config,
+            Some("session-1"),
+        )
+        .await;
+
+        assert_eq!(runtime_state.sticky_bound_key_id.as_deref(), Some("key-1"));
+        assert_eq!(runtime_state.sticky_sessions_by_key.get("key-1"), Some(&1));
+        assert_eq!(runtime_state.sticky_sessions_by_key.get("key-2"), None);
+    }
+
+    #[tokio::test]
+    async fn memory_runtime_read_preserves_sticky_bound_key_when_key_is_cooled_down() {
+        let app = AppState::new().expect("app state should build");
+        let runtime = app.runtime_state.as_ref();
+        let pool_config = sample_pool_config();
+        let key_ids = vec!["key-1".to_string()];
+
+        record_admin_provider_pool_success(
+            runtime,
+            "provider-1",
+            "key-1",
+            &pool_config,
+            Some("session-1"),
+            None,
+            false,
+            None,
+            0,
+            None,
+        )
+        .await;
+        record_admin_provider_pool_error(
+            runtime,
+            "provider-1",
+            "key-1",
+            &pool_config,
+            429,
+            None,
+            None,
+        )
+        .await;
+
+        let runtime_state = read_admin_provider_pool_runtime_state(
+            runtime,
+            "provider-1",
+            &key_ids,
+            &pool_config,
+            Some("session-1"),
+        )
+        .await;
+
+        assert_eq!(runtime_state.sticky_bound_key_id.as_deref(), Some("key-1"));
+        assert_eq!(runtime_state.sticky_sessions_by_key.get("key-1"), Some(&1));
+        assert_eq!(
+            runtime_state
+                .cooldown_reason_by_key
+                .get("key-1")
+                .map(String::as_str),
+            Some("rate_limited_429")
+        );
+    }
+
+    #[tokio::test]
+    async fn preserving_runtime_read_does_not_refresh_sticky_ttl() {
+        let app = AppState::new().expect("app state should build");
+        let runtime = app.runtime_state.as_ref();
+        let pool_config = sample_pool_config();
+        let sticky_key = pool_sticky_key("provider-1", "session-1");
+        runtime
+            .kv_set(
+                &sticky_key,
+                "key-1",
+                Some(std::time::Duration::from_secs(1)),
+            )
+            .await
+            .expect("sticky key should write");
+
+        let runtime_state = read_admin_provider_pool_runtime_state_preserving_sticky_ttl(
+            runtime,
+            "provider-1",
+            &["key-1".to_string()],
+            &pool_config,
+            Some("session-1"),
+        )
+        .await;
+        let ttl_after_preserving_read = runtime
+            .kv_ttl_seconds(&sticky_key)
+            .await
+            .expect("ttl should read")
+            .expect("sticky key should still exist");
+
+        assert_eq!(runtime_state.sticky_bound_key_id.as_deref(), Some("key-1"));
+        assert!(
+            ttl_after_preserving_read <= 1,
+            "preserving read should not extend the sticky ttl"
+        );
+
+        let _ = read_admin_provider_pool_runtime_state(
+            runtime,
+            "provider-1",
+            &["key-1".to_string()],
+            &pool_config,
+            Some("session-1"),
+        )
+        .await;
+        let ttl_after_refreshing_read = runtime
+            .kv_ttl_seconds(&sticky_key)
+            .await
+            .expect("ttl should read")
+            .expect("sticky key should still exist");
+
+        assert!(
+            ttl_after_refreshing_read > ttl_after_preserving_read,
+            "default runtime read should still refresh sticky ttl"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_sticky_session_only_extends_matching_binding() {
+        let app = AppState::new().expect("app state should build");
+        let runtime = app.runtime_state.as_ref();
+        let sticky_key = pool_sticky_key("provider-1", "session-1");
+        runtime
+            .kv_set(
+                &sticky_key,
+                "key-1",
+                Some(std::time::Duration::from_secs(1)),
+            )
+            .await
+            .expect("sticky key should write");
+
+        assert!(
+            !refresh_admin_provider_pool_sticky_session_if_bound_to_key(
+                runtime,
+                "provider-1",
+                "key-2",
+                Some("session-1"),
+                std::time::Duration::from_secs(120),
+            )
+            .await
+        );
+        let ttl_after_wrong_key = runtime
+            .kv_ttl_seconds(&sticky_key)
+            .await
+            .expect("ttl should read")
+            .expect("sticky key should still exist");
+        assert!(
+            ttl_after_wrong_key <= 1,
+            "wrong-key refresh must not extend the sticky ttl"
+        );
+
+        assert!(
+            refresh_admin_provider_pool_sticky_session_if_bound_to_key(
+                runtime,
+                "provider-1",
+                "key-1",
+                Some("session-1"),
+                std::time::Duration::from_secs(120),
+            )
+            .await
+        );
+        let ttl_after_matching_key = runtime
+            .kv_ttl_seconds(&sticky_key)
+            .await
+            .expect("ttl should read")
+            .expect("sticky key should still exist");
+        assert!(
+            ttl_after_matching_key > ttl_after_wrong_key,
+            "matching-key refresh should extend the sticky ttl"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_success_feedback_does_not_rebind_when_sticky_changed_since_scheduling() {
+        let app = AppState::new().expect("app state should build");
+        let runtime = app.runtime_state.as_ref();
+        let pool_config = sample_pool_config();
+        let key_ids = vec![
+            "key-1".to_string(),
+            "key-2".to_string(),
+            "key-3".to_string(),
+        ];
+
+        record_admin_provider_pool_success(
+            runtime,
+            "provider-1",
+            "key-1",
+            &pool_config,
+            Some("session-1"),
+            None,
+            false,
+            None,
+            0,
+            None,
+        )
+        .await;
+        record_admin_provider_pool_success(
+            runtime,
+            "provider-1",
+            "key-2",
+            &pool_config,
+            Some("session-1"),
+            None,
+            true,
+            Some("key-1"),
+            0,
+            None,
+        )
+        .await;
+        record_admin_provider_pool_success(
+            runtime,
+            "provider-1",
+            "key-3",
+            &pool_config,
+            Some("session-1"),
+            None,
+            true,
+            Some("key-1"),
+            0,
+            None,
+        )
+        .await;
+
+        let runtime_state = read_admin_provider_pool_runtime_state(
+            runtime,
+            "provider-1",
+            &key_ids,
+            &pool_config,
+            Some("session-1"),
+        )
+        .await;
+
+        assert_eq!(runtime_state.sticky_bound_key_id.as_deref(), Some("key-2"));
+        assert_eq!(runtime_state.sticky_sessions_by_key.get("key-1"), None);
+        assert_eq!(runtime_state.sticky_sessions_by_key.get("key-2"), Some(&1));
+        assert_eq!(runtime_state.sticky_sessions_by_key.get("key-3"), None);
+    }
+
+    #[tokio::test]
+    async fn memory_success_feedback_rebinds_ineligible_sticky_when_owner_holds_init_lock() {
+        let app = AppState::new().expect("app state should build");
+        let runtime = app.runtime_state.as_ref();
+        let pool_config = sample_pool_config();
+        let key_ids = vec!["key-1".to_string(), "key-2".to_string()];
+
+        record_admin_provider_pool_success(
+            runtime,
+            "provider-1",
+            "key-1",
+            &pool_config,
+            Some("session-1"),
+            None,
+            false,
+            None,
+            0,
+            None,
+        )
+        .await;
+        assert!(
+            claim_admin_provider_pool_sticky_session_init(
+                runtime,
+                "provider-1",
+                Some("session-1"),
+                "owner-key-2",
+                std::time::Duration::from_secs(30),
+            )
+            .await
+        );
+        record_admin_provider_pool_success(
+            runtime,
+            "provider-1",
+            "key-2",
+            &pool_config,
+            Some("session-1"),
+            Some("owner-key-2"),
+            true,
+            Some("key-1"),
+            0,
+            None,
+        )
+        .await;
+
+        let runtime_state = read_admin_provider_pool_runtime_state(
+            runtime,
+            "provider-1",
+            &key_ids,
+            &pool_config,
+            Some("session-1"),
+        )
+        .await;
+
+        assert_eq!(runtime_state.sticky_bound_key_id.as_deref(), Some("key-2"));
+        assert_eq!(runtime_state.sticky_sessions_by_key.get("key-1"), None);
+        assert_eq!(runtime_state.sticky_sessions_by_key.get("key-2"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn prebind_sticky_session_marks_provisional_binding_without_publishing_sticky() {
+        let Some(redis) = start_managed_redis_or_skip().await else {
+            return;
+        };
+        let app = build_runner_app(redis.redis_url(), "pool_runtime_sticky_prebind").await;
+        let runtime = app.runtime_state.as_ref();
+        let pool_config = sample_pool_config();
+        let key_ids = vec!["key-1".to_string(), "key-2".to_string()];
+
+        assert!(
+            claim_admin_provider_pool_sticky_session_init(
+                runtime,
+                "provider-1",
+                Some("session-1"),
+                "owner-1",
+                std::time::Duration::from_secs(30),
+            )
+            .await
+        );
+        assert!(
+            prebind_admin_provider_pool_sticky_session(
+                runtime,
+                "provider-1",
+                "key-1",
+                &pool_config,
+                Some("session-1"),
+                Some("owner-1"),
+            )
+            .await
+        );
+        assert!(
+            !prebind_admin_provider_pool_sticky_session(
+                runtime,
+                "provider-1",
+                "key-2",
+                &pool_config,
+                Some("session-1"),
+                Some("owner-1"),
+            )
+            .await
+        );
+        assert!(
+            clear_admin_provider_pool_sticky_session_prebind_if_owner(
+                runtime,
+                "provider-1",
+                "key-1",
+                Some("session-1"),
+                Some("owner-1"),
+            )
+            .await
+        );
+
+        let runtime_state = read_admin_provider_pool_runtime_state(
+            runtime,
+            "provider-1",
+            &key_ids,
+            &pool_config,
+            Some("session-1"),
+        )
+        .await;
+
+        assert_eq!(runtime_state.sticky_bound_key_id, None);
+        assert_eq!(runtime_state.sticky_sessions_by_key.get("key-1"), None);
+        assert_eq!(runtime_state.sticky_sessions_by_key.get("key-2"), None);
+    }
+
+    #[tokio::test]
+    async fn memory_prebind_sticky_session_is_idempotent_for_same_owner_and_key() {
+        let app = AppState::new().expect("app state should build");
+        let runtime = app.runtime_state.as_ref();
+        let pool_config = sample_pool_config();
+
+        assert!(
+            !prebind_admin_provider_pool_sticky_session(
+                runtime,
+                "provider-1",
+                "key-1",
+                &pool_config,
+                Some("session-1"),
+                Some("owner-1"),
+            )
+            .await,
+            "prebind should require a matching sticky init owner"
+        );
+        assert!(
+            claim_admin_provider_pool_sticky_session_init(
+                runtime,
+                "provider-1",
+                Some("session-1"),
+                "owner-1",
+                std::time::Duration::from_secs(30),
+            )
+            .await
+        );
+        assert!(
+            prebind_admin_provider_pool_sticky_session(
+                runtime,
+                "provider-1",
+                "key-1",
+                &pool_config,
+                Some("session-1"),
+                Some("owner-1"),
+            )
+            .await
+        );
+        assert!(
+            prebind_admin_provider_pool_sticky_session(
+                runtime,
+                "provider-1",
+                "key-1",
+                &pool_config,
+                Some("session-1"),
+                Some("owner-1"),
+            )
+            .await,
+            "prebind should be idempotent for repeated prepare calls by the same owner/key"
+        );
+        assert!(
+            !prebind_admin_provider_pool_sticky_session(
+                runtime,
+                "provider-1",
+                "key-2",
+                &pool_config,
+                Some("session-1"),
+                Some("owner-1"),
+            )
+            .await,
+            "same owner must not switch its provisional prebind to another key"
+        );
+    }
+
+    #[tokio::test]
+    async fn sticky_session_init_lock_claims_once_and_releases() {
+        let Some(redis) = start_managed_redis_or_skip().await else {
+            return;
+        };
+        let app = build_runner_app(redis.redis_url(), "pool_runtime_sticky_init_lock").await;
+        let runtime = app.runtime_state.as_ref();
+
+        assert!(
+            claim_admin_provider_pool_sticky_session_init(
+                runtime,
+                "provider-1",
+                Some("session-1"),
+                "leader-1",
+                std::time::Duration::from_secs(30),
+            )
+            .await
+        );
+        assert!(
+            admin_provider_pool_sticky_session_init_exists(
+                runtime,
+                "provider-1",
+                Some("session-1"),
+            )
+            .await
+        );
+        assert!(
+            !claim_admin_provider_pool_sticky_session_init(
+                runtime,
+                "provider-1",
+                Some("session-1"),
+                "leader-2",
+                std::time::Duration::from_secs(30),
+            )
+            .await
+        );
+
+        assert!(
+            !release_admin_provider_pool_sticky_session_init_if_owner(
+                runtime,
+                "provider-1",
+                Some("session-1"),
+                Some("leader-2"),
+            )
+            .await
+        );
+        assert!(
+            admin_provider_pool_sticky_session_init_exists(
+                runtime,
+                "provider-1",
+                Some("session-1"),
+            )
+            .await
+        );
+        assert!(
+            release_admin_provider_pool_sticky_session_init_if_owner(
+                runtime,
+                "provider-1",
+                Some("session-1"),
+                Some("leader-1"),
+            )
+            .await
+        );
+        assert!(
+            !admin_provider_pool_sticky_session_init_exists(
+                runtime,
+                "provider-1",
+                Some("session-1"),
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_sticky_session_only_removes_matching_bound_key() {
+        let Some(redis) = start_managed_redis_or_skip().await else {
+            return;
+        };
+        let app = build_runner_app(redis.redis_url(), "pool_runtime_sticky_clear_matching").await;
+        let runtime = app.runtime_state.as_ref();
+        let pool_config = sample_pool_config();
+        let key_ids = vec!["key-1".to_string(), "key-2".to_string()];
+
+        record_admin_provider_pool_success(
+            runtime,
+            "provider-1",
+            "key-1",
+            &pool_config,
+            Some("session-1"),
+            None,
+            false,
+            None,
+            0,
+            None,
+        )
+        .await;
+        assert!(
+            !clear_admin_provider_pool_sticky_session_if_bound_to_key(
+                runtime,
+                "provider-1",
+                "key-2",
+                Some("session-1"),
+            )
+            .await
+        );
+        let runtime_state = read_admin_provider_pool_runtime_state(
+            runtime,
+            "provider-1",
+            &key_ids,
+            &pool_config,
+            Some("session-1"),
+        )
+        .await;
+        assert_eq!(runtime_state.sticky_bound_key_id.as_deref(), Some("key-1"));
+
+        assert!(
+            clear_admin_provider_pool_sticky_session_if_bound_to_key(
+                runtime,
+                "provider-1",
+                "key-1",
+                Some("session-1"),
+            )
+            .await
+        );
+        let runtime_state = read_admin_provider_pool_runtime_state(
+            runtime,
+            "provider-1",
+            &key_ids,
+            &pool_config,
+            Some("session-1"),
+        )
+        .await;
+        assert_eq!(runtime_state.sticky_bound_key_id, None);
     }
 
     #[tokio::test]

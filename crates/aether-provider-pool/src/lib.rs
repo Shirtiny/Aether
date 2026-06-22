@@ -537,6 +537,34 @@ mod tests {
     }
 
     #[test]
+    fn no_weight_distribution_suppresses_provider_default_strategy_presets() {
+        let service = ProviderPoolService::with_builtin_adapters();
+        let normalized = service.normalize_scheduling_presets(
+            "codex",
+            &[
+                PoolSchedulingPreset {
+                    preset: "no_weight".to_string(),
+                    enabled: true,
+                    mode: None,
+                },
+                PoolSchedulingPreset {
+                    preset: "priority_first".to_string(),
+                    enabled: true,
+                    mode: None,
+                },
+            ],
+        );
+
+        assert_eq!(
+            normalized
+                .iter()
+                .map(|preset| preset.preset.as_str())
+                .collect::<Vec<_>>(),
+            ["no_weight", "priority_first"]
+        );
+    }
+
+    #[test]
     fn provider_quota_exhaustion_is_adapter_owned() {
         assert!(provider_pool_key_account_quota_exhausted(
             &sample_key(Some(json!({

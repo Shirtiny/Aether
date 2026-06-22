@@ -170,6 +170,89 @@ impl MemoryRuntimeBackend {
         );
     }
 
+    pub(crate) async fn kv_set_if_absent(&self, key: &str, value: String, ttl: Duration) -> bool {
+        let mut kv = self.kv.lock().await;
+        let now = Instant::now();
+        if ttl.is_zero() {
+            kv.remove(key);
+            return false;
+        }
+        prune_kv(&mut kv, now);
+        if kv.contains_key(key) {
+            return false;
+        }
+        while kv.len() >= self.config.max_kv_entries.max(1) {
+            let Some(oldest_key) = kv
+                .iter()
+                .min_by_key(|(_, entry)| entry.inserted_at)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            kv.remove(&oldest_key);
+        }
+        kv.insert(
+            key.to_string(),
+            MemoryKvEntry {
+                value,
+                inserted_at: now,
+                expires_at: Some(now + ttl),
+            },
+        );
+        true
+    }
+
+    pub(crate) async fn kv_set_if_current_absent_or_value_and_guard_value(
+        &self,
+        key: &str,
+        value: String,
+        ttl: Duration,
+        guard_key: &str,
+        guard_value: Option<&str>,
+        alternate_expected_current_value: Option<&str>,
+    ) -> bool {
+        let mut kv = self.kv.lock().await;
+        let now = Instant::now();
+        if ttl.is_zero() {
+            kv.remove(key);
+            return false;
+        }
+        prune_kv(&mut kv, now);
+        if let Some(entry) = kv.get(key) {
+            let current = entry.value.as_str();
+            let current_matches =
+                current == value || alternate_expected_current_value == Some(current);
+            if !current_matches {
+                return false;
+            }
+        }
+        match (kv.get(guard_key), guard_value) {
+            (Some(entry), Some(guard_value)) if entry.value == guard_value => {}
+            (None, None) => {}
+            _ => return false,
+        }
+        while kv.len() >= self.config.max_kv_entries.max(1) && !kv.contains_key(key) {
+            let Some(oldest_key) = kv
+                .iter()
+                .filter(|(entry_key, _)| entry_key.as_str() != guard_key)
+                .min_by_key(|(_, entry)| entry.inserted_at)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            kv.remove(&oldest_key);
+        }
+        kv.insert(
+            key.to_string(),
+            MemoryKvEntry {
+                value,
+                inserted_at: now,
+                expires_at: Some(now + ttl),
+            },
+        );
+        true
+    }
+
     pub(crate) fn kv_set_nowait(&self, key: &str, value: String, ttl: Option<Duration>) -> bool {
         let Ok(mut kv) = self.kv.try_lock() else {
             return false;
@@ -222,6 +305,44 @@ impl MemoryRuntimeBackend {
         let score_deleted = self.scores.lock().await.remove(key).is_some();
         let queue_deleted = self.queues.lock().await.remove(key).is_some();
         kv_deleted || set_deleted || score_deleted || queue_deleted
+    }
+
+    pub(crate) async fn kv_delete_if_value(&self, key: &str, expected_value: &str) -> bool {
+        let mut kv = self.kv.lock().await;
+        let now = Instant::now();
+        let Some(entry) = kv.get(key) else {
+            return false;
+        };
+        if entry.is_expired(now) {
+            kv.remove(key);
+            return false;
+        }
+        if entry.value != expected_value {
+            return false;
+        }
+        kv.remove(key).is_some()
+    }
+
+    pub(crate) async fn kv_expire_if_value(
+        &self,
+        key: &str,
+        expected_value: &str,
+        ttl: Duration,
+    ) -> bool {
+        let mut kv = self.kv.lock().await;
+        let now = Instant::now();
+        let Some(entry) = kv.get_mut(key) else {
+            return false;
+        };
+        if entry.is_expired(now) {
+            kv.remove(key);
+            return false;
+        }
+        if entry.value != expected_value {
+            return false;
+        }
+        entry.expires_at = Some(now + ttl);
+        true
     }
 
     pub(crate) async fn kv_delete_many(&self, keys: &[String]) -> usize {

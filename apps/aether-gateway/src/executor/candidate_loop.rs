@@ -19,6 +19,11 @@ use crate::executor::{build_local_execution_exhaustion, LocalExecutionRequestOut
 use crate::handlers::shared::provider_pool::release_admin_provider_pool_key_lease;
 use crate::log_ids::short_request_id;
 use crate::orchestration::local_execution_candidate_metadata_from_report_context;
+use crate::orchestration::{
+    apply_local_execution_effect, prepare_pool_attempt_started_effect,
+    release_pool_sticky_initialization_for_owner, LocalExecutionEffect,
+    LocalExecutionEffectContext, PoolAttemptStartCleanupGuard,
+};
 use crate::privacy::RedactionExecutionCandidateId;
 use crate::request_candidate_runtime::{
     record_local_request_candidate_status, RequestCandidateRuntimeWriter,
@@ -157,7 +162,17 @@ where
     type Error = GatewayError;
 
     async fn execute_attempt(&self, attempt: &T) -> Result<Option<Self::Response>, Self::Error> {
-        let mut response = execute_execution_runtime_sync(
+        let report_context = attempt.report_context();
+        let context = LocalExecutionEffectContext {
+            plan: attempt.execution_plan(),
+            report_context: report_context.as_ref(),
+        };
+        let mut sticky_init_cleanup = PoolAttemptStartCleanupGuard::new(self.state, context);
+        let should_execute = prepare_pool_attempt_started_effect(self.state, context).await;
+        if !should_execute {
+            return Ok(None);
+        }
+        let result = execute_execution_runtime_sync(
             self.state,
             self.parts.uri.path(),
             attempt.execution_plan().clone(),
@@ -165,10 +180,39 @@ where
             self.decision,
             self.plan_kind,
             attempt.report_kind(),
-            attempt.report_context(),
+            report_context,
         )
-        .await?;
+        .await;
+        let mut response = match result {
+            Ok(response) => response,
+            Err(err) => {
+                apply_local_execution_effect(
+                    self.state,
+                    LocalExecutionEffectContext {
+                        plan: attempt.execution_plan(),
+                        report_context: attempt.report_context().as_ref(),
+                    },
+                    LocalExecutionEffect::PoolAttemptAborted,
+                )
+                .await;
+                return Err(err);
+            }
+        };
+        if response.is_none() {
+            apply_local_execution_effect(
+                self.state,
+                LocalExecutionEffectContext {
+                    plan: attempt.execution_plan(),
+                    report_context: attempt.report_context().as_ref(),
+                },
+                LocalExecutionEffect::PoolAttemptAborted,
+            )
+            .await;
+        }
         if let Some(response) = response.as_mut() {
+            if let Some(guard) = sticky_init_cleanup.as_mut() {
+                guard.disarm();
+            }
             attach_redaction_execution_candidate(
                 response,
                 attempt.execution_plan().candidate_id.as_deref(),
@@ -394,6 +438,15 @@ where
     async fn execute_attempt(&self, attempt: &T) -> Result<Option<Self::Response>, Self::Error> {
         let plan = attempt.execution_plan().clone();
         let report_context = attempt.report_context();
+        let context = LocalExecutionEffectContext {
+            plan: &plan,
+            report_context: report_context.as_ref(),
+        };
+        let mut sticky_init_cleanup = PoolAttemptStartCleanupGuard::new(self.state, context);
+        let should_execute = prepare_pool_attempt_started_effect(self.state, context).await;
+        if !should_execute {
+            return Ok(None);
+        }
         let candidate_index = parse_request_candidate_report_context(report_context.as_ref())
             .and_then(|context| context.candidate_index)
             .map(|value| value.to_string())
@@ -419,7 +472,7 @@ where
         let execution_plan_kind = self.plan_kind.to_string();
         let execution_decision = self.decision.clone();
         let execution_report_kind = attempt.report_kind();
-        let mut response = execute_stream_candidate_with_watchdog(
+        let result = execute_stream_candidate_with_watchdog(
             self.state,
             self.trace_id,
             self.plan_kind,
@@ -438,8 +491,37 @@ where
                 .await
             },
         )
-        .await?;
+        .await;
+        let mut response = match result {
+            Ok(response) => response,
+            Err(err) => {
+                apply_local_execution_effect(
+                    self.state,
+                    LocalExecutionEffectContext {
+                        plan: &watchdog_plan,
+                        report_context: watchdog_report_context.as_ref(),
+                    },
+                    LocalExecutionEffect::PoolAttemptAborted,
+                )
+                .await;
+                return Err(err);
+            }
+        };
+        if response.is_none() {
+            apply_local_execution_effect(
+                self.state,
+                LocalExecutionEffectContext {
+                    plan: &watchdog_plan,
+                    report_context: watchdog_report_context.as_ref(),
+                },
+                LocalExecutionEffect::PoolAttemptAborted,
+            )
+            .await;
+        }
         if let Some(response) = response.as_mut() {
+            if let Some(guard) = sticky_init_cleanup.as_mut() {
+                guard.disarm();
+            }
             attach_redaction_execution_candidate(response, watchdog_plan.candidate_id.as_deref());
         }
         Ok(response)
@@ -483,6 +565,7 @@ where
         let report_context = plan_and_report.report_context();
         let metadata =
             local_execution_candidate_metadata_from_report_context(report_context.as_ref());
+        let plan = plan_and_report.execution_plan();
         if let Some(lease) = metadata.pool_key_lease.as_ref() {
             if let Err(err) =
                 release_admin_provider_pool_key_lease(state.runtime_state.as_ref(), lease).await
@@ -493,12 +576,20 @@ where
                 );
             }
         }
+        release_pool_sticky_initialization_for_owner(
+            state.runtime_state.as_ref(),
+            &plan.provider_id,
+            &plan.key_id,
+            unused_pool_sticky_session_token(plan, report_context.as_ref()).as_deref(),
+            metadata.pool_sticky_init_owner.as_deref(),
+        )
+        .await;
         if should_skip_unused_persistence_from_metadata(&metadata) {
             continue;
         }
         record_local_request_candidate_status(
             state,
-            plan_and_report.execution_plan(),
+            plan,
             report_context.as_ref(),
             SchedulerRequestCandidateStatusUpdate {
                 status: RequestCandidateStatus::Unused,
@@ -512,6 +603,22 @@ where
         )
         .await;
     }
+}
+
+fn unused_pool_sticky_session_token(
+    plan: &aether_contracts::ExecutionPlan,
+    report_context: Option<&serde_json::Value>,
+) -> Option<String> {
+    local_execution_candidate_metadata_from_report_context(report_context)
+        .pool_sticky_session_token
+        .or_else(|| {
+            report_context
+                .and_then(serde_json::Value::as_object)
+                .and_then(|object| object.get("original_request_body"))
+                .filter(|value| !value.is_null())
+                .or(plan.body.json_body.as_ref())
+                .and_then(crate::ai_serving::extract_pool_sticky_session_token)
+        })
 }
 
 fn should_skip_unused_persistence(report_context: Option<&serde_json::Value>) -> bool {
@@ -858,6 +965,23 @@ mod tests {
         assert!(!should_skip_unused_persistence(Some(&json!({
             "candidate_index": 1,
         }))));
+    }
+
+    #[test]
+    fn unused_pool_sticky_session_token_prefers_report_context_metadata() {
+        let plan = test_plan(None);
+        let report_context = json!({
+            "pool_sticky_session_token": "metadata-session",
+            "original_request_body": {
+                "model": "gpt-test",
+                "session_id": "body-session"
+            }
+        });
+
+        assert_eq!(
+            unused_pool_sticky_session_token(&plan, Some(&report_context)).as_deref(),
+            Some("metadata-session")
+        );
     }
 
     #[tokio::test]

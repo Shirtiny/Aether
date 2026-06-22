@@ -6,7 +6,7 @@ use super::keys::{
 use crate::handlers::admin::provider::pool::config::admin_provider_pool_cache_affinity_enabled;
 use crate::handlers::admin::provider::shared::support::{
     admin_provider_pool_quota_probe_active_members_key, AdminProviderPoolConfig,
-    AdminProviderPoolRuntimeState,
+    AdminProviderPoolHotRuntimeState, AdminProviderPoolRuntimeState,
 };
 use crate::maintenance::PoolQuotaProbeWorkerConfig;
 use crate::provider_pool_demand::{
@@ -71,6 +71,65 @@ pub(crate) async fn read_admin_provider_pool_runtime_state(
     pool_config: &AdminProviderPoolConfig,
     sticky_session_token: Option<&str>,
 ) -> AdminProviderPoolRuntimeState {
+    read_admin_provider_pool_runtime_state_inner(
+        runtime,
+        provider_id,
+        key_ids,
+        pool_config,
+        sticky_session_token,
+        true,
+        true,
+    )
+    .await
+}
+
+pub(crate) async fn read_admin_provider_pool_runtime_state_preserving_sticky_ttl(
+    runtime: &RuntimeState,
+    provider_id: &str,
+    key_ids: &[String],
+    pool_config: &AdminProviderPoolConfig,
+    sticky_session_token: Option<&str>,
+) -> AdminProviderPoolRuntimeState {
+    read_admin_provider_pool_runtime_state_inner(
+        runtime,
+        provider_id,
+        key_ids,
+        pool_config,
+        sticky_session_token,
+        false,
+        true,
+    )
+    .await
+}
+
+pub(crate) async fn read_admin_provider_pool_scheduler_runtime_state(
+    runtime: &RuntimeState,
+    provider_id: &str,
+    key_ids: &[String],
+    pool_config: &AdminProviderPoolConfig,
+    sticky_session_token: Option<&str>,
+) -> AdminProviderPoolRuntimeState {
+    read_admin_provider_pool_runtime_state_inner(
+        runtime,
+        provider_id,
+        key_ids,
+        pool_config,
+        sticky_session_token,
+        false,
+        false,
+    )
+    .await
+}
+
+async fn read_admin_provider_pool_runtime_state_inner(
+    runtime: &RuntimeState,
+    provider_id: &str,
+    key_ids: &[String],
+    pool_config: &AdminProviderPoolConfig,
+    sticky_session_token: Option<&str>,
+    refresh_sticky_ttl: bool,
+    load_sticky_distribution: bool,
+) -> AdminProviderPoolRuntimeState {
     let mut state = AdminProviderPoolRuntimeState::default();
     let cooldown_keys = pool_cooldown_keys(provider_id, key_ids);
     let metric_key_limit = pool_runtime_window_metric_key_limit();
@@ -97,32 +156,19 @@ pub(crate) async fn read_admin_provider_pool_runtime_state(
     {
         let sticky_key = pool_sticky_key(provider_id, sticky_session_token);
         if let Ok(Some(bound_key_id)) = runtime.kv_get(&sticky_key).await {
-            let cooldown_key = pool_cooldown_key(provider_id, &bound_key_id);
-            match runtime.kv_exists(&cooldown_key).await {
-                Ok(false) => {
-                    let _ = runtime
-                        .key_expire(
-                            &sticky_key,
-                            std::time::Duration::from_secs(pool_config.sticky_session_ttl_seconds),
-                        )
-                        .await;
-                    state.sticky_bound_key_id = Some(bound_key_id);
-                }
-                Ok(true) => {
-                    let _ = runtime.kv_delete(&sticky_key).await;
-                }
-                Err(err) => {
-                    warn!(
-                        "gateway admin provider pool: failed to validate sticky cooldown for provider {provider_id}: {:?}",
-                        err
-                    );
-                    state.sticky_bound_key_id = Some(bound_key_id);
-                }
+            if refresh_sticky_ttl {
+                let _ = runtime
+                    .key_expire(
+                        &sticky_key,
+                        std::time::Duration::from_secs(pool_config.sticky_session_ttl_seconds),
+                    )
+                    .await;
             }
+            state.sticky_bound_key_id = Some(bound_key_id);
         }
     }
 
-    if sticky_sessions_enabled {
+    if sticky_sessions_enabled && load_sticky_distribution {
         let sticky_keys = runtime
             .scan_keys(&pool_sticky_pattern(provider_id), 200)
             .await
@@ -267,6 +313,86 @@ pub(crate) async fn read_admin_provider_pool_runtime_state(
     state
 }
 
+pub(crate) async fn read_admin_provider_pool_hot_runtime_state(
+    runtime: &RuntimeState,
+    provider_id: &str,
+    key_ids: &[String],
+    pool_config: &AdminProviderPoolConfig,
+    sticky_session_token: Option<&str>,
+    refresh_sticky_ttl: bool,
+) -> AdminProviderPoolHotRuntimeState {
+    let mut state = AdminProviderPoolHotRuntimeState::default();
+    let sticky_sessions_enabled = pool_config.sticky_session_ttl_seconds > 0;
+
+    if let Some(sticky_session_token) = sticky_session_token
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .filter(|_| sticky_sessions_enabled)
+    {
+        let sticky_key = pool_sticky_key(provider_id, sticky_session_token);
+        if let Ok(Some(bound_key_id)) = runtime.kv_get(&sticky_key).await {
+            if refresh_sticky_ttl {
+                let _ = runtime
+                    .key_expire(
+                        &sticky_key,
+                        std::time::Duration::from_secs(pool_config.sticky_session_ttl_seconds),
+                    )
+                    .await;
+            }
+            state.sticky_bound_key_id = Some(bound_key_id);
+        }
+    }
+
+    let cooldown_keys = pool_cooldown_keys(provider_id, key_ids);
+    if !cooldown_keys.is_empty() {
+        let cooldown_reasons = runtime
+            .kv_get_many(&cooldown_keys)
+            .await
+            .unwrap_or_else(|_| vec![None; cooldown_keys.len()]);
+        for (key_id, (cooldown_key, reason)) in key_ids
+            .iter()
+            .zip(cooldown_keys.iter().zip(cooldown_reasons))
+        {
+            if let Some(reason) = reason {
+                state.cooldown_reason_by_key.insert(key_id.clone(), reason);
+                if let Ok(Some(ttl)) = runtime.kv_ttl_seconds(cooldown_key).await {
+                    if let Ok(ttl_seconds) = u64::try_from(ttl) {
+                        if ttl_seconds > 0 {
+                            state
+                                .cooldown_ttl_by_key
+                                .insert(key_id.clone(), ttl_seconds);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if !key_ids.is_empty() && pool_config.cost_window_seconds > 0 {
+        let now = current_unix_secs();
+        let cost_window_start = now.saturating_sub(pool_config.cost_window_seconds) as f64;
+        let cost_keys = pool_cost_keys(provider_id, key_ids);
+        let cost_results = join_all(
+            cost_keys
+                .iter()
+                .map(|cost_key| runtime.score_range_by_min(cost_key, cost_window_start)),
+        )
+        .await;
+        for (key_id, members) in key_ids.iter().zip(cost_results) {
+            let total = members
+                .unwrap_or_default()
+                .iter()
+                .map(|member| parse_pool_cost_member(member))
+                .sum::<u64>();
+            if total > 0 {
+                state.cost_window_usage_by_key.insert(key_id.clone(), total);
+            }
+        }
+    }
+
+    state
+}
+
 pub(crate) async fn read_admin_provider_pool_cooldown_count(
     runtime: &RuntimeState,
     provider_id: &str,
@@ -299,7 +425,16 @@ pub(crate) async fn read_admin_provider_pool_key_cooldown_reason(
 
 #[cfg(test)]
 mod tests {
-    use super::bounded_runtime_window_metric_key_ids;
+    use super::{
+        bounded_runtime_window_metric_key_ids, read_admin_provider_pool_hot_runtime_state,
+        read_admin_provider_pool_runtime_state, read_admin_provider_pool_scheduler_runtime_state,
+    };
+    use crate::handlers::admin::provider::pool::config::admin_provider_pool_config_from_config_value;
+    use crate::handlers::admin::provider::pool::runtime::keys::pool_sticky_key;
+    use crate::handlers::admin::provider::shared::support::AdminProviderPoolConfig;
+    use aether_runtime_state::{MemoryRuntimeStateConfig, RuntimeState};
+    use serde_json::json;
+    use std::time::Duration;
 
     #[test]
     fn runtime_window_metric_key_ids_are_bounded() {
@@ -321,5 +456,96 @@ mod tests {
         let bounded = bounded_runtime_window_metric_key_ids(&key_ids, 0);
 
         assert_eq!(bounded, &key_ids[..1]);
+    }
+
+    fn sticky_pool_config() -> AdminProviderPoolConfig {
+        admin_provider_pool_config_from_config_value(Some(&json!({
+            "pool_advanced": {
+                "sticky_session_ttl_seconds": 120
+            }
+        })))
+        .expect("sticky pool config should parse")
+    }
+
+    async fn seed_sticky_sessions(runtime: &RuntimeState, provider_id: &str) {
+        runtime
+            .kv_set(
+                &pool_sticky_key(provider_id, "current-session"),
+                "key-current",
+                Some(Duration::from_secs(120)),
+            )
+            .await
+            .expect("current sticky session should write");
+        for index in 0..25 {
+            runtime
+                .kv_set(
+                    &pool_sticky_key(provider_id, &format!("other-session-{index}")),
+                    format!("key-other-{}", index % 3),
+                    Some(Duration::from_secs(120)),
+                )
+                .await
+                .expect("other sticky session should write");
+        }
+    }
+
+    #[tokio::test]
+    async fn hot_runtime_read_reads_current_sticky_without_distribution_scan() {
+        let runtime = RuntimeState::memory(MemoryRuntimeStateConfig::default());
+        let pool_config = sticky_pool_config();
+        seed_sticky_sessions(&runtime, "provider-hot").await;
+
+        let state = read_admin_provider_pool_hot_runtime_state(
+            &runtime,
+            "provider-hot",
+            &["key-current".to_string()],
+            &pool_config,
+            Some("current-session"),
+            false,
+        )
+        .await;
+
+        assert_eq!(state.sticky_bound_key_id.as_deref(), Some("key-current"));
+        assert!(state.cooldown_reason_by_key.is_empty());
+        assert!(state.cost_window_usage_by_key.is_empty());
+    }
+
+    #[tokio::test]
+    async fn scheduler_runtime_read_skips_sticky_distribution_scan() {
+        let runtime = RuntimeState::memory(MemoryRuntimeStateConfig::default());
+        let pool_config = sticky_pool_config();
+        seed_sticky_sessions(&runtime, "provider-scheduler").await;
+
+        let state = read_admin_provider_pool_scheduler_runtime_state(
+            &runtime,
+            "provider-scheduler",
+            &["key-current".to_string()],
+            &pool_config,
+            Some("current-session"),
+        )
+        .await;
+
+        assert_eq!(state.sticky_bound_key_id.as_deref(), Some("key-current"));
+        assert_eq!(state.total_sticky_sessions, 0);
+        assert!(state.sticky_sessions_by_key.is_empty());
+    }
+
+    #[tokio::test]
+    async fn admin_runtime_read_keeps_sticky_distribution_scan() {
+        let runtime = RuntimeState::memory(MemoryRuntimeStateConfig::default());
+        let pool_config = sticky_pool_config();
+        seed_sticky_sessions(&runtime, "provider-admin").await;
+
+        let state = read_admin_provider_pool_runtime_state(
+            &runtime,
+            "provider-admin",
+            &["key-current".to_string()],
+            &pool_config,
+            Some("current-session"),
+        )
+        .await;
+
+        assert_eq!(state.sticky_bound_key_id.as_deref(), Some("key-current"));
+        assert_eq!(state.total_sticky_sessions, 26);
+        assert_eq!(state.sticky_sessions_by_key.get("key-current"), Some(&1));
     }
 }

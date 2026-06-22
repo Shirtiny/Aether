@@ -2242,7 +2242,7 @@ mod tests {
     }
 
     #[test]
-    fn list_policy_intersects_unrestricted_group_union_with_user_restriction() {
+    fn list_policy_intersects_group_and_user_restrictions() {
         let groups = vec![
             sample_group("default", 0, None, "unrestricted", None, "system"),
             sample_group(
@@ -2262,10 +2262,7 @@ mod tests {
             |group| (&group.allowed_models_mode, group.allowed_models.clone()),
         );
 
-        assert_eq!(
-            policy,
-            Some(vec!["gpt-4.1".to_string(), "gemini-2.5-pro".to_string()])
-        );
+        assert_eq!(policy, Some(vec!["gpt-4.1".to_string()]));
     }
 
     #[test]
@@ -2300,21 +2297,14 @@ mod tests {
     fn unrestricted_group_does_not_expand_other_group_restrictions() {
         let groups = vec![
             sample_group(
-                "team-a",
+                "restricted",
                 10,
-                Some(vec!["gpt-5", "gpt-4.1"]),
+                Some(vec!["gpt-5"]),
                 "specific",
                 None,
                 "system",
             ),
-            sample_group(
-                "team-b",
-                20,
-                Some(vec!["gpt-4.1", "gemini-2.5-pro"]),
-                "specific",
-                None,
-                "system",
-            ),
+            sample_group("unrestricted", 20, None, "unrestricted", None, "system"),
         ];
 
         let policy = resolve_effective_list_policy(None, "unrestricted", &groups, |group| {
@@ -2325,7 +2315,7 @@ mod tests {
     }
 
     #[test]
-    fn unrestricted_group_makes_group_policy_unrestricted() {
+    fn unrestricted_group_does_not_clear_group_restrictions() {
         let groups = vec![
             sample_group(
                 "restricted",
@@ -2342,11 +2332,11 @@ mod tests {
             (&group.allowed_models_mode, group.allowed_models.clone())
         });
 
-        assert_eq!(policy, None);
+        assert_eq!(policy, Some(vec!["gpt-5".to_string()]));
     }
 
     #[test]
-    fn deny_all_group_does_not_remove_other_group_grants() {
+    fn deny_all_group_removes_other_group_grants() {
         let groups = vec![
             sample_group("deny", 10, None, "deny_all", None, "system"),
             sample_group(
@@ -2363,7 +2353,7 @@ mod tests {
             (&group.allowed_models_mode, group.allowed_models.clone())
         });
 
-        assert_eq!(policy, Some(vec!["gpt-5".to_string()]));
+        assert_eq!(policy, Some(Vec::<String>::new()));
     }
 
     #[test]

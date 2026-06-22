@@ -25,8 +25,27 @@ use aether_data_contracts::repository::provider_catalog::{
 };
 use sha2::{Digest, Sha256};
 
-#[tokio::test]
-async fn gateway_executes_openai_responses_compact_openai_family_upstream_stream_via_local_finalize_response(
+#[test]
+fn gateway_executes_openai_responses_compact_openai_family_upstream_stream_via_local_finalize_response(
+) {
+    std::thread::Builder::new()
+        .name("compact-local-finalize-test".to_string())
+        .stack_size(32 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime should build");
+            runtime.block_on(
+                gateway_executes_openai_responses_compact_openai_family_upstream_stream_via_local_finalize_response_impl(),
+            );
+        })
+        .expect("test thread should spawn")
+        .join()
+        .expect("test thread should complete");
+}
+
+async fn gateway_executes_openai_responses_compact_openai_family_upstream_stream_via_local_finalize_response_impl(
 ) {
     use base64::Engine as _;
 

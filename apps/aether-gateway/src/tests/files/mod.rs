@@ -26,6 +26,30 @@ mod registry_cleanup;
 mod stream;
 mod sync;
 
+const FILES_ROUTE_TEST_STACK_BYTES: usize = 32 * 1024 * 1024;
+
+fn run_files_route_test<F, Fut>(test_name: &'static str, make_future: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + 'static,
+{
+    let handle = std::thread::Builder::new()
+        .name(test_name.to_string())
+        .stack_size(FILES_ROUTE_TEST_STACK_BYTES)
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build");
+            runtime.block_on(make_future());
+        })
+        .expect("files route test thread should spawn");
+
+    if let Err(payload) = handle.join() {
+        std::panic::resume_unwind(payload);
+    }
+}
+
 fn hash_api_key(value: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(value.as_bytes());
@@ -388,8 +412,15 @@ async fn gateway_skips_gemini_files_download_control_sync_without_opt_in_header(
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_executes_gemini_files_get_via_local_decision_gate_with_local_planning_only() {
+#[test]
+fn gateway_executes_gemini_files_get_via_local_decision_gate_with_local_planning_only() {
+    run_files_route_test(
+        "gateway_executes_gemini_files_get_via_local_decision_gate_with_local_planning_only",
+        gateway_executes_gemini_files_get_via_local_decision_gate_with_local_planning_only_impl,
+    );
+}
+
+async fn gateway_executes_gemini_files_get_via_local_decision_gate_with_local_planning_only_impl() {
     #[derive(Debug, Clone)]
     struct SeenExecutionRuntimeSyncRequest {
         method: String,

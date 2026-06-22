@@ -6,6 +6,18 @@ pub(super) fn pool_sticky_key(provider_id: &str, session_token: &str) -> String 
     format!("ap:{provider_id}:sticky:{session_token}")
 }
 
+pub(super) fn pool_sticky_init_key(provider_id: &str, session_token: &str) -> String {
+    format!("ap:{provider_id}:sticky_init:{session_token}")
+}
+
+pub(super) fn pool_sticky_prebind_key(
+    provider_id: &str,
+    session_token: &str,
+    owner: &str,
+) -> String {
+    format!("ap:{provider_id}:sticky_prebind:{session_token}:{owner}")
+}
+
 pub(super) fn pool_lru_key(provider_id: &str) -> String {
     format!("ap:{provider_id}:lru")
 }

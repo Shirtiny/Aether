@@ -317,12 +317,15 @@ async fn read_provider_pool_state_map(
 fn parse_runtime_codex_quota_exhaustion_basis(
     pool_advanced: &serde_json::Map<String, serde_json::Value>,
 ) -> String {
-    if pool_advanced
+    if let Some(weekly_basis) = pool_advanced
         .get("codex_quota_weekly_basis")
         .and_then(serde_json::Value::as_bool)
-        == Some(false)
     {
-        return "five_hour".to_string();
+        return if weekly_basis {
+            "weekly".to_string()
+        } else {
+            "five_hour".to_string()
+        };
     }
     match pool_advanced
         .get("codex_quota_exhaustion_basis")
@@ -332,9 +335,7 @@ fn parse_runtime_codex_quota_exhaustion_basis(
         .map(str::to_ascii_lowercase)
         .as_deref()
     {
-        Some("5h" | "five_hour" | "five_hours" | "5_hour" | "5_hours") => {
-            "five_hour".to_string()
-        }
+        Some("5h" | "five_hour" | "five_hours" | "5_hour" | "5_hours") => "five_hour".to_string(),
         _ => "weekly".to_string(),
     }
 }
@@ -492,4 +493,32 @@ fn read_provider_key_rpm_reset_at_map(
             )
         })
         .collect::<BTreeMap<_, _>>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_runtime_codex_quota_exhaustion_basis;
+    use serde_json::json;
+
+    #[test]
+    fn runtime_codex_quota_weekly_basis_overrides_legacy_basis_string() {
+        let weekly = json!({
+            "codex_quota_weekly_basis": true,
+            "codex_quota_exhaustion_basis": "5h"
+        });
+        let weekly = weekly.as_object().expect("weekly config should be object");
+        assert_eq!(parse_runtime_codex_quota_exhaustion_basis(weekly), "weekly");
+
+        let five_hour = json!({
+            "codex_quota_weekly_basis": false,
+            "codex_quota_exhaustion_basis": "weekly"
+        });
+        let five_hour = five_hour
+            .as_object()
+            .expect("five-hour config should be object");
+        assert_eq!(
+            parse_runtime_codex_quota_exhaustion_basis(five_hour),
+            "five_hour"
+        );
+    }
 }

@@ -1,7 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque, btree_map::Entry};
+use std::collections::{btree_map::Entry, BTreeMap, BTreeSet, VecDeque};
 use std::sync::{
-    Arc, LazyLock,
     atomic::{AtomicU64, Ordering as AtomicOrdering},
+    Arc, LazyLock,
 };
 
 use aether_admin::provider::pool as admin_provider_pool_pure;
@@ -10,36 +10,37 @@ use aether_data_contracts::repository::candidate_selection::{
     StoredPoolKeyCandidateRowsByKeyIdsQuery, StoredPoolKeyCandidateRowsQuery,
 };
 use aether_data_contracts::repository::pool_scores::{
-    ListRankedPoolMembersQuery, POOL_KIND_PROVIDER_KEY_POOL, PoolMemberHardState,
-    PoolMemberIdentity, PoolMemberScheduleFeedback, PoolScoreScope, StoredPoolMemberScore,
+    ListRankedPoolMembersQuery, PoolMemberHardState, PoolMemberIdentity,
+    PoolMemberScheduleFeedback, PoolScoreScope, StoredPoolMemberScore, POOL_KIND_PROVIDER_KEY_POOL,
 };
 use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey;
 use aether_pool_core::{
+    run_pool_scheduler, PoolCandidateFacts, PoolCandidateInput, PoolCandidateOrchestration,
+    PoolMemberSignals, PoolRuntimeState, PoolSchedulingConfig, PoolSchedulingPreset,
     POOL_ACCOUNT_BLOCKED_SKIP_REASON, POOL_ACCOUNT_EXHAUSTED_SKIP_REASON,
-    POOL_COOLDOWN_SKIP_REASON, POOL_COST_LIMIT_REACHED_SKIP_REASON, PoolCandidateFacts,
-    PoolCandidateInput, PoolCandidateOrchestration, PoolMemberSignals, PoolRuntimeState,
-    PoolSchedulingConfig, PoolSchedulingPreset, run_pool_scheduler,
+    POOL_COOLDOWN_SKIP_REASON, POOL_COST_LIMIT_REACHED_SKIP_REASON,
 };
 use aether_provider_pool::ProviderPoolService;
 use aether_routing_core::{RankingOverlay, ResolvedRoutingPolicy};
 use tokio::sync::Semaphore;
+use tokio::time::{sleep, Duration};
 use tracing::{debug, warn};
 
 use crate::ai_serving::{
-    CandidateTransportPolicyFacts, EligibleLocalExecutionCandidate, LocalExecutionCandidateKind,
-    PlannerAppState, SkippedLocalExecutionCandidate, candidate_auth_channel_skip_reason,
-    candidate_common_transport_skip_reason, provider_key_pool_score_scope,
-    read_candidate_transport_snapshot, record_local_runtime_candidate_skip_reason,
+    candidate_auth_channel_skip_reason, candidate_common_transport_skip_reason,
+    provider_key_pool_score_scope, read_candidate_transport_snapshot,
+    record_local_runtime_candidate_skip_reason, CandidateTransportPolicyFacts,
+    EligibleLocalExecutionCandidate, LocalExecutionCandidateKind, PlannerAppState,
+    SkippedLocalExecutionCandidate,
 };
 use crate::clock::current_unix_ms;
-use crate::handlers::shared::provider_pool::read_admin_provider_pool_runtime_state;
+use crate::handlers::shared::provider_pool::admin_provider_pool_config_from_config_value;
 use crate::handlers::shared::provider_pool::{
-    AdminProviderPoolConfig, AdminProviderPoolRuntimeState,
     admin_provider_pool_quota_probe_active_members_key,
-    read_admin_provider_pool_key_cooldown_reason,
-};
-use crate::handlers::shared::provider_pool::{
-    admin_provider_pool_cache_affinity_enabled, admin_provider_pool_config_from_config_value,
+    admin_provider_pool_sticky_session_init_exists, claim_admin_provider_pool_sticky_session_init,
+    read_admin_provider_pool_hot_runtime_state, read_admin_provider_pool_key_cooldown_reason,
+    read_admin_provider_pool_runtime_state, read_admin_provider_pool_scheduler_runtime_state,
+    AdminProviderPoolConfig, AdminProviderPoolRuntimeState,
 };
 use crate::handlers::shared::{parse_catalog_auth_config_json, provider_key_health_summary};
 use crate::maintenance::spawn_pool_quota_probe_replenish_for_request;
@@ -53,8 +54,39 @@ const ROUTING_PROFILE_DISALLOWED_KEY_SKIP_REASON: &str = "routing_profile_disall
 const POOL_SCORE_SCHEDULE_INTEREST_CONCURRENCY: usize = 4;
 const POOL_SCORE_SCHEDULE_INTEREST_MAX_PER_BATCH: usize = 16;
 const POOL_SCORE_SCHEDULE_INTEREST_MIN_INTERVAL_SECS: u64 = 60;
+const POOL_STICKY_INIT_WAIT_INTERVAL_MS: u64 = 25;
+const POOL_STICKY_INIT_LOCK_TTL_SECS: u64 = 30;
 
 type PoolCatalogKeyContext = PoolMemberSignals;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PoolStickyInitState {
+    Unchecked,
+    // A sticky initializer is needed, but the shared lock is only claimed once
+    // a concrete candidate survives request-specific filters.
+    ClaimPending,
+    Leader,
+    Follower,
+    Disabled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PoolStickyInitGate {
+    Proceed,
+    Wait,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueuedPoolCandidateOrigin {
+    Scheduled,
+    StickyHit,
+}
+
+enum StickyCandidateLookup {
+    Missing,
+    Ineligible { bound_key_id: String },
+    Candidate(EligibleLocalExecutionCandidate),
+}
 
 pub(crate) async fn apply_local_execution_pool_scheduler(
     state: PlannerAppState<'_>,
@@ -130,7 +162,7 @@ async fn schedule_pool_page_candidates(
         let runtime = if key_ids.is_empty() {
             AdminProviderPoolRuntimeState::default()
         } else {
-            read_admin_provider_pool_runtime_state(
+            read_admin_provider_pool_scheduler_runtime_state(
                 state.app().runtime_state.as_ref(),
                 provider_id.as_str(),
                 &key_ids,
@@ -321,8 +353,29 @@ async fn expand_pool_group_candidate(
     let mut scheduled = Vec::new();
     let mut skipped = Vec::new();
 
-    while let Some(candidate) = cursor.next_key().await {
+    let planning_timeout = state
+        .app()
+        .frontdoor_runtime_guards
+        .local_execution_planning_timeout;
+    loop {
+        let candidate = match tokio::time::timeout(planning_timeout, cursor.next_key()).await {
+            Ok(Some(candidate)) => candidate,
+            Ok(None) => break,
+            Err(_) => {
+                warn!(
+                    event_name = "local_pool_scheduler_planning_timeout",
+                    log_type = "event",
+                    timeout_ms = planning_timeout.as_millis() as u64,
+                    "gateway pool scheduler timed out while waiting for sticky initialization"
+                );
+                break;
+            }
+        };
+        let stop_after_candidate = candidate_has_sticky_init_owner(&candidate);
         scheduled.push(candidate);
+        if stop_after_candidate {
+            break;
+        }
     }
     skipped.append(&mut cursor.take_skipped_candidates());
 
@@ -330,6 +383,15 @@ async fn expand_pool_group_candidate(
         cursor.log_exhausted();
     }
     (scheduled, skipped)
+}
+
+fn candidate_has_sticky_init_owner(candidate: &EligibleLocalExecutionCandidate) -> bool {
+    candidate
+        .orchestration
+        .pool_sticky_init_owner
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|owner| !owner.is_empty())
 }
 
 pub(crate) struct PoolKeyCursor<'a> {
@@ -356,10 +418,16 @@ pub(crate) struct PoolKeyCursor<'a> {
     sticky_candidate_loaded: bool,
     seen_key_ids: BTreeSet<String>,
     queued_candidates: VecDeque<EligibleLocalExecutionCandidate>,
+    queued_candidate_origins: VecDeque<QueuedPoolCandidateOrigin>,
     skipped_candidates: Vec<SkippedLocalExecutionCandidate>,
     exhausted_logged: bool,
     returned_key_count: u32,
     exhaustion_skip_recorded: bool,
+    sticky_init_state: PoolStickyInitState,
+    sticky_init_owner: Option<String>,
+    sticky_init_claimed: bool,
+    sticky_bound_key_ineligible: bool,
+    sticky_bound_key_id: Option<String>,
 }
 
 impl<'a> PoolKeyCursor<'a> {
@@ -428,10 +496,16 @@ impl<'a> PoolKeyCursor<'a> {
             sticky_candidate_loaded: false,
             seen_key_ids: BTreeSet::new(),
             queued_candidates: VecDeque::new(),
+            queued_candidate_origins: VecDeque::new(),
             skipped_candidates: Vec::new(),
             exhausted_logged: false,
             returned_key_count: 0,
             exhaustion_skip_recorded: false,
+            sticky_init_state: PoolStickyInitState::Unchecked,
+            sticky_init_owner: None,
+            sticky_init_claimed: false,
+            sticky_bound_key_ineligible: false,
+            sticky_bound_key_id: None,
         }
     }
 
@@ -449,16 +523,37 @@ impl<'a> PoolKeyCursor<'a> {
 
     pub(crate) async fn next_key(&mut self) -> Option<EligibleLocalExecutionCandidate> {
         loop {
+            match self.ensure_sticky_session_init_gate().await {
+                PoolStickyInitGate::Proceed => {}
+                PoolStickyInitGate::Wait => {
+                    sleep(Duration::from_millis(POOL_STICKY_INIT_WAIT_INTERVAL_MS)).await;
+                    continue;
+                }
+            }
+
             if let Some(candidate) = self.next_queued_candidate().await {
                 self.returned_key_count = self.returned_key_count.saturating_add(1);
                 return Some(candidate);
             }
+            if self.sticky_init_state == PoolStickyInitState::Follower {
+                continue;
+            }
 
             if !self.sticky_candidate_loaded {
                 self.sticky_candidate_loaded = true;
-                if let Some(candidate) = self.sticky_candidate().await {
-                    self.queued_candidates.push_back(candidate);
-                    continue;
+                match self.sticky_candidate().await {
+                    StickyCandidateLookup::Candidate(candidate) => {
+                        self.push_front_queued_candidate(
+                            candidate,
+                            QueuedPoolCandidateOrigin::StickyHit,
+                        );
+                        continue;
+                    }
+                    StickyCandidateLookup::Ineligible { bound_key_id } => {
+                        self.sticky_bound_key_ineligible = true;
+                        self.sticky_bound_key_id = Some(bound_key_id);
+                    }
+                    StickyCandidateLookup::Missing => {}
                 }
             }
 
@@ -466,6 +561,159 @@ impl<'a> PoolKeyCursor<'a> {
                 return None;
             }
         }
+    }
+
+    async fn ensure_sticky_session_init_gate(&mut self) -> PoolStickyInitGate {
+        match self.sticky_init_state {
+            PoolStickyInitState::Leader | PoolStickyInitState::Disabled => {
+                return PoolStickyInitGate::Proceed;
+            }
+            PoolStickyInitState::ClaimPending => {
+                return PoolStickyInitGate::Proceed;
+            }
+            PoolStickyInitState::Follower => {
+                match self.sticky_candidate().await {
+                    StickyCandidateLookup::Candidate(candidate) => {
+                        self.push_front_queued_candidate(
+                            candidate,
+                            QueuedPoolCandidateOrigin::StickyHit,
+                        );
+                        self.sticky_init_state = PoolStickyInitState::Disabled;
+                        return PoolStickyInitGate::Proceed;
+                    }
+                    StickyCandidateLookup::Ineligible { bound_key_id } => {
+                        self.sticky_bound_key_ineligible = true;
+                        self.sticky_bound_key_id = Some(bound_key_id);
+                    }
+                    StickyCandidateLookup::Missing => {}
+                }
+                if !self.sticky_init_lock_exists().await {
+                    self.sticky_init_state = PoolStickyInitState::Unchecked;
+                    return PoolStickyInitGate::Wait;
+                }
+                return PoolStickyInitGate::Wait;
+            }
+            PoolStickyInitState::Unchecked => {}
+        }
+
+        let Some(pool_config) = pool_config_for_candidate(&self.group) else {
+            self.sticky_init_state = PoolStickyInitState::Disabled;
+            return PoolStickyInitGate::Proceed;
+        };
+        if pool_config.sticky_session_ttl_seconds == 0 || self.sticky_session_token.is_none() {
+            self.sticky_init_state = PoolStickyInitState::Disabled;
+            return PoolStickyInitGate::Proceed;
+        }
+        match self.sticky_candidate().await {
+            StickyCandidateLookup::Candidate(candidate) => {
+                self.push_front_queued_candidate(candidate, QueuedPoolCandidateOrigin::StickyHit);
+                self.sticky_init_state = PoolStickyInitState::Disabled;
+                return PoolStickyInitGate::Proceed;
+            }
+            StickyCandidateLookup::Ineligible { bound_key_id } => {
+                self.sticky_bound_key_ineligible = true;
+                self.sticky_bound_key_id = Some(bound_key_id);
+            }
+            StickyCandidateLookup::Missing => {}
+        }
+
+        if self.sticky_init_lock_exists().await {
+            self.enter_sticky_init_follower();
+            return PoolStickyInitGate::Wait;
+        }
+        self.sticky_init_state = PoolStickyInitState::ClaimPending;
+        self.sticky_init_owner = Some(self.new_sticky_init_owner());
+        self.sticky_init_claimed = false;
+        PoolStickyInitGate::Proceed
+    }
+
+    fn new_sticky_init_owner(&self) -> String {
+        format!(
+            "{}:{}:{}:{}",
+            self.group.candidate.endpoint_id,
+            self.group.candidate.model_id,
+            current_unix_ms(),
+            LOAD_BALANCE_SEQUENCE.fetch_add(1, AtomicOrdering::Relaxed)
+        )
+    }
+
+    fn enter_sticky_init_follower(&mut self) {
+        self.sticky_init_state = PoolStickyInitState::Follower;
+        self.sticky_init_owner = None;
+        self.sticky_init_claimed = false;
+    }
+
+    async fn sticky_init_lock_exists(&self) -> bool {
+        admin_provider_pool_sticky_session_init_exists(
+            self.state.app().runtime_state.as_ref(),
+            self.group.candidate.provider_id.as_str(),
+            self.sticky_session_token.as_deref(),
+        )
+        .await
+    }
+
+    async fn claim_sticky_init_lock(&self, owner: &str) -> bool {
+        claim_admin_provider_pool_sticky_session_init(
+            self.state.app().runtime_state.as_ref(),
+            self.group.candidate.provider_id.as_str(),
+            self.sticky_session_token.as_deref(),
+            owner,
+            Duration::from_secs(POOL_STICKY_INIT_LOCK_TTL_SECS),
+        )
+        .await
+    }
+
+    fn push_front_queued_candidate(
+        &mut self,
+        candidate: EligibleLocalExecutionCandidate,
+        origin: QueuedPoolCandidateOrigin,
+    ) {
+        self.queued_candidates.push_front(candidate);
+        self.queued_candidate_origins.push_front(origin);
+    }
+
+    fn push_back_queued_candidate(
+        &mut self,
+        candidate: EligibleLocalExecutionCandidate,
+        origin: QueuedPoolCandidateOrigin,
+    ) {
+        self.queued_candidates.push_back(candidate);
+        self.queued_candidate_origins.push_back(origin);
+    }
+
+    fn pop_front_queued_candidate(
+        &mut self,
+    ) -> Option<(EligibleLocalExecutionCandidate, QueuedPoolCandidateOrigin)> {
+        let candidate = self.queued_candidates.pop_front()?;
+        let origin = self
+            .queued_candidate_origins
+            .pop_front()
+            .unwrap_or(QueuedPoolCandidateOrigin::Scheduled);
+        Some((candidate, origin))
+    }
+
+    fn mark_sticky_bound_key_ineligible(&mut self, candidate: &EligibleLocalExecutionCandidate) {
+        self.sticky_bound_key_ineligible = true;
+        self.sticky_bound_key_id = Some(candidate.candidate.key_id.clone());
+        if self.sticky_init_state == PoolStickyInitState::Disabled {
+            self.sticky_init_state = PoolStickyInitState::Unchecked;
+            self.sticky_init_owner = None;
+            self.sticky_init_claimed = false;
+        }
+    }
+
+    fn prepare_deferred_sticky_reinitializer(&mut self) {
+        if self.sticky_init_owner.is_some() || self.sticky_session_token.is_none() {
+            return;
+        }
+        let Some(pool_config) = pool_config_for_candidate(&self.group) else {
+            return;
+        };
+        if pool_config.sticky_session_ttl_seconds == 0 {
+            return;
+        }
+        self.sticky_init_owner = Some(self.new_sticky_init_owner());
+        self.sticky_init_claimed = false;
     }
 
     pub(crate) fn take_skipped_candidates(&mut self) -> Vec<SkippedLocalExecutionCandidate> {
@@ -704,22 +952,27 @@ impl<'a> PoolKeyCursor<'a> {
         Some(self.build_page_eligible_candidates(rows).await)
     }
 
-    async fn sticky_candidate(&mut self) -> Option<EligibleLocalExecutionCandidate> {
-        let pool_config = pool_config_for_candidate(&self.group)?;
-        if !admin_provider_pool_cache_affinity_enabled(&pool_config) {
-            return None;
+    async fn sticky_candidate(&mut self) -> StickyCandidateLookup {
+        let Some(pool_config) = pool_config_for_candidate(&self.group) else {
+            return StickyCandidateLookup::Missing;
+        };
+        if pool_config.sticky_session_ttl_seconds == 0 {
+            return StickyCandidateLookup::Missing;
         }
-        let runtime = read_admin_provider_pool_runtime_state(
+        let runtime = read_admin_provider_pool_hot_runtime_state(
             self.state.app().runtime_state.as_ref(),
             self.group.candidate.provider_id.as_str(),
             &[],
             &pool_config,
             self.sticky_session_token.as_deref(),
+            false,
         )
         .await;
-        let sticky_key_id = runtime.sticky_bound_key_id?;
+        let Some(sticky_key_id) = runtime.sticky_bound_key_id else {
+            return StickyCandidateLookup::Missing;
+        };
         if self.seen_key_ids.contains(&sticky_key_id) {
-            return None;
+            return StickyCandidateLookup::Missing;
         }
 
         let key = match self
@@ -728,7 +981,14 @@ impl<'a> PoolKeyCursor<'a> {
             .read_provider_catalog_keys_by_ids(std::slice::from_ref(&sticky_key_id))
             .await
         {
-            Ok(mut keys) => keys.pop()?,
+            Ok(mut keys) => {
+                let Some(key) = keys.pop() else {
+                    return StickyCandidateLookup::Ineligible {
+                        bound_key_id: sticky_key_id,
+                    };
+                };
+                key
+            }
             Err(err) => {
                 warn!(
                     event_name = "pool_group_sticky_key_load_failed",
@@ -740,15 +1000,70 @@ impl<'a> PoolKeyCursor<'a> {
                     error = ?err,
                     "gateway pool scheduler failed to read sticky pool key"
                 );
-                return None;
+                return StickyCandidateLookup::Ineligible {
+                    bound_key_id: sticky_key_id,
+                };
             }
         };
         if key.provider_id != self.group.candidate.provider_id {
-            return None;
+            return StickyCandidateLookup::Ineligible {
+                bound_key_id: sticky_key_id,
+            };
+        }
+
+        let sticky_runtime = read_admin_provider_pool_hot_runtime_state(
+            self.state.app().runtime_state.as_ref(),
+            self.group.candidate.provider_id.as_str(),
+            std::slice::from_ref(&sticky_key_id),
+            &pool_config,
+            self.sticky_session_token.as_deref(),
+            false,
+        )
+        .await;
+        if sticky_runtime
+            .cooldown_reason_by_key
+            .contains_key(&sticky_key_id)
+        {
+            return StickyCandidateLookup::Ineligible {
+                bound_key_id: sticky_key_id,
+            };
+        }
+        if pool_config.cost_limit_per_key_tokens.is_some_and(|limit| {
+            sticky_runtime
+                .cost_window_usage_by_key
+                .get(&sticky_key_id)
+                .copied()
+                .unwrap_or(0)
+                >= limit
+        }) {
+            return StickyCandidateLookup::Ineligible {
+                bound_key_id: sticky_key_id,
+            };
+        }
+
+        let provider_pool_service = ProviderPoolService::with_builtin_adapters();
+        let key_context = build_pool_catalog_key_context(
+            self.state,
+            &provider_pool_service,
+            &key,
+            self.group.transport.provider.provider_type.as_str(),
+            Some(pool_config.codex_quota_exhaustion_basis.as_str()),
+        );
+        if key_context.account_blocked
+            || (pool_config.skip_exhausted_accounts && key_context.quota_exhausted)
+        {
+            return StickyCandidateLookup::Ineligible {
+                bound_key_id: sticky_key_id,
+            };
         }
 
         let candidate = pool_candidate_from_catalog_key(&self.group, key);
-        self.build_eligible_candidate(candidate).await
+        match self.build_eligible_candidate(candidate).await {
+            Some(candidate) => StickyCandidateLookup::Candidate(candidate),
+            None => StickyCandidateLookup::Ineligible {
+                bound_key_id: sticky_key_id,
+            },
+        }
     }
 
     async fn refill_queued_candidates(&mut self) -> bool {
@@ -782,25 +1097,71 @@ impl<'a> PoolKeyCursor<'a> {
             }
 
             scheduled.truncate(refill_target);
-            self.queued_candidates.extend(scheduled.drain(..));
+            for candidate in scheduled.drain(..) {
+                self.push_back_queued_candidate(candidate, QueuedPoolCandidateOrigin::Scheduled);
+            }
             return true;
         }
     }
 
     async fn next_queued_candidate(&mut self) -> Option<EligibleLocalExecutionCandidate> {
-        while let Some(candidate) = self.queued_candidates.pop_front() {
-            let mut candidate = candidate;
+        while let Some(candidate) = self.queued_candidates.front().cloned() {
+            let origin = self
+                .queued_candidate_origins
+                .front()
+                .copied()
+                .unwrap_or(QueuedPoolCandidateOrigin::Scheduled);
             if self.skip_candidate_if_routing_profile_disallowed(&candidate) {
+                if origin == QueuedPoolCandidateOrigin::StickyHit {
+                    self.mark_sticky_bound_key_ineligible(&candidate);
+                }
+                let _ = self.pop_front_queued_candidate();
                 continue;
             }
             if self.skip_candidate_if_runtime_cooldown(&candidate).await {
+                if origin == QueuedPoolCandidateOrigin::StickyHit {
+                    self.mark_sticky_bound_key_ineligible(&candidate);
+                }
+                let _ = self.pop_front_queued_candidate();
                 continue;
             }
+            if matches!(
+                self.sticky_init_state,
+                PoolStickyInitState::ClaimPending | PoolStickyInitState::Leader
+            ) && !self.sticky_init_claimed
+            {
+                let Some(owner) = self.sticky_init_owner.clone() else {
+                    self.sticky_init_state = PoolStickyInitState::Disabled;
+                    continue;
+                };
+                if !self.claim_sticky_init_lock(owner.as_str()).await {
+                    self.enter_sticky_init_follower();
+                    return None;
+                }
+                self.sticky_init_state = PoolStickyInitState::Leader;
+                self.sticky_init_claimed = true;
+            }
+            let Some((mut candidate, origin)) = self.pop_front_queued_candidate() else {
+                continue;
+            };
             if candidate.orchestration.candidate_group_id.is_none() {
                 candidate.orchestration.candidate_group_id =
                     Some(pool_cursor_candidate_group_id(&self.group));
             }
             candidate.orchestration.pool_key_index = Some(self.next_pool_key_index);
+            if origin == QueuedPoolCandidateOrigin::StickyHit {
+                self.prepare_deferred_sticky_reinitializer();
+            } else if candidate.orchestration.pool_sticky_init_owner.is_none() {
+                candidate.orchestration.pool_sticky_init_owner = self.sticky_init_owner.clone();
+            }
+            if candidate.orchestration.pool_sticky_session_token.is_none() {
+                candidate.orchestration.pool_sticky_session_token =
+                    self.sticky_session_token.clone();
+            }
+            if self.sticky_bound_key_ineligible {
+                candidate.orchestration.pool_sticky_bound_key_ineligible = true;
+                candidate.orchestration.pool_sticky_bound_key_id = self.sticky_bound_key_id.clone();
+            }
             self.next_pool_key_index = self.next_pool_key_index.saturating_add(1);
             return Some(candidate);
         }
@@ -1618,6 +1979,10 @@ fn apply_pool_orchestration(
         candidate_group_id: orchestration.candidate_group_id,
         pool_key_index: orchestration.pool_key_index,
         pool_key_lease: None,
+        pool_sticky_init_owner: None,
+        pool_sticky_session_token: None,
+        pool_sticky_bound_key_ineligible: false,
+        pool_sticky_bound_key_id: None,
         scheduler_affinity_epoch,
     };
     candidate
@@ -1626,8 +1991,6 @@ fn apply_pool_orchestration(
 #[cfg(test)]
 mod tests {
     use super::{
-        POOL_ACTIVE_PROBE_SEALED_SKIP_REASON, PoolCatalogKeyContext, PoolKeyCursor,
-        ROUTING_PROFILE_DISALLOWED_KEY_SKIP_REASON,
         admin_provider_pool_quota_probe_active_members_key, apply_local_execution_pool_scheduler,
         apply_local_execution_pool_scheduler_with_runtime_map,
         apply_local_execution_pool_scheduler_with_runtime_map_outcome,
@@ -1635,17 +1998,23 @@ mod tests {
         pool_key_requires_reauth_for_scheduling,
         prune_unschedulable_active_probe_members_for_request,
         remove_active_probe_members_for_request, should_trigger_active_probe_burst_for_request,
+        PoolCatalogKeyContext, PoolKeyCursor, PoolStickyInitGate,
+        POOL_ACTIVE_PROBE_SEALED_SKIP_REASON, ROUTING_PROFILE_DISALLOWED_KEY_SKIP_REASON,
     };
     use crate::ai_serving::{
-        EligibleLocalExecutionCandidate, LocalExecutionCandidateKind, PlannerAppState,
         apply_local_runtime_candidate_terminal_reason, provider_key_pool_score_id,
-        provider_key_pool_score_scope,
+        provider_key_pool_score_scope, EligibleLocalExecutionCandidate,
+        LocalExecutionCandidateKind, PlannerAppState,
     };
     use crate::data::GatewayDataState;
     use crate::handlers::shared::provider_pool::{
-        AdminProviderPoolRuntimeState, record_admin_provider_pool_error,
+        admin_provider_pool_sticky_session_init_exists,
+        claim_admin_provider_pool_sticky_session_init, read_admin_provider_pool_runtime_state,
+        record_admin_provider_pool_error, record_admin_provider_pool_success,
+        release_admin_provider_pool_sticky_session_init_for_tests, AdminProviderPoolRuntimeState,
     };
     use crate::orchestration::LocalExecutionCandidateMetadata;
+    use crate::state::FrontdoorRuntimeGuardConfig;
     use crate::{AppState, LocalExecutionRuntimeMissDiagnostic};
     use aether_data::repository::candidate_selection::InMemoryMinimalCandidateSelectionReadRepository;
     use aether_data::repository::pool_scores::InMemoryPoolMemberScoreRepository;
@@ -1672,6 +2041,7 @@ mod tests {
     use serde_json::json;
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
     use std::sync::Arc;
+    use tokio::time::Duration;
 
     #[test]
     fn pool_scheduler_groups_interleaved_candidates_and_reorders_internal_keys() {
@@ -1818,6 +2188,10 @@ mod tests {
                 ),
                 pool_key_index: Some(0),
                 pool_key_lease: None,
+                pool_sticky_init_owner: None,
+                pool_sticky_session_token: None,
+                pool_sticky_bound_key_ineligible: false,
+                pool_sticky_bound_key_id: None,
                 scheduler_affinity_epoch: None,
             }
         );
@@ -1835,6 +2209,10 @@ mod tests {
                 ),
                 pool_key_index: None,
                 pool_key_lease: None,
+                pool_sticky_init_owner: None,
+                pool_sticky_session_token: None,
+                pool_sticky_bound_key_ineligible: false,
+                pool_sticky_bound_key_id: None,
                 scheduler_affinity_epoch: None,
             }
         );
@@ -1849,6 +2227,7 @@ mod tests {
             10,
             Some(json!({
                 "pool_advanced": {
+                    "sticky_session_ttl_seconds": 120,
                     "scheduling_presets": [{"preset": "cache_affinity", "enabled": true}]
                 }
             })),
@@ -1860,6 +2239,7 @@ mod tests {
             10,
             Some(json!({
                 "pool_advanced": {
+                    "sticky_session_ttl_seconds": 120,
                     "scheduling_presets": [{"preset": "cache_affinity", "enabled": true}]
                 }
             })),
@@ -1895,7 +2275,7 @@ mod tests {
     }
 
     #[test]
-    fn pool_scheduler_ignores_sticky_hit_without_cache_affinity() {
+    fn pool_scheduler_ignores_sticky_hit_without_sticky_ttl() {
         let key_a = sample_eligible_candidate(
             "provider-pool",
             "endpoint-1",
@@ -2171,13 +2551,11 @@ mod tests {
             evicted.get("provider-pool"),
             Some(&BTreeSet::from(["key-hot".to_string()]))
         );
-        assert!(
-            runtime_by_provider
-                .get("provider-pool")
-                .expect("runtime should exist")
-                .active_probe_member_ids
-                .is_empty()
-        );
+        assert!(runtime_by_provider
+            .get("provider-pool")
+            .expect("runtime should exist")
+            .active_probe_member_ids
+            .is_empty());
     }
 
     #[test]
@@ -2948,6 +3326,978 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pool_key_cursor_marks_sticky_hit_ineligible_when_routing_filter_skips_it() {
+        let provider_config = Some(json!({
+            "pool_advanced": {
+                "sticky_session_ttl_seconds": 120,
+                "scheduling_presets": [
+                    {"preset": "no_weight", "enabled": true}
+                ]
+            }
+        }));
+        let (provider, endpoint, keys, rows) = large_pool_fixture(2, provider_config.clone());
+        let app = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_and_minimal_candidate_selection_for_tests(
+                    Arc::new(InMemoryProviderCatalogReadRepository::seed(
+                        vec![provider],
+                        vec![endpoint],
+                        keys,
+                    )),
+                    Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(rows)),
+                )
+                .with_encryption_key_for_tests(aether_crypto::DEVELOPMENT_ENCRYPTION_KEY),
+            );
+        let group = sample_eligible_candidate(
+            "provider-pool",
+            "endpoint-1",
+            "pool-group",
+            10,
+            provider_config.clone(),
+        );
+        let pool_config = pool_config_for_candidate(&group).expect("pool config should parse");
+        record_admin_provider_pool_success(
+            app.runtime_state.as_ref(),
+            "provider-pool",
+            "key-00000",
+            &pool_config,
+            Some("session-1"),
+            None,
+            false,
+            None,
+            0,
+            None,
+        )
+        .await;
+
+        let routing_policy = routing_policy_with_allowed_keys(["key-00001"]);
+        let mut cursor = PoolKeyCursor::new_with_routing_policy(
+            PlannerAppState::new(&app),
+            group,
+            Some("session-1"),
+            None,
+            None,
+            Some(&routing_policy),
+        );
+
+        let candidate = cursor
+            .next_key()
+            .await
+            .expect("cursor should fall back after routing skips sticky-bound key");
+
+        assert_eq!(candidate.candidate.key_id, "key-00001");
+        assert!(
+            candidate
+                .orchestration
+                .pool_sticky_init_owner
+                .as_deref()
+                .is_some_and(|owner| !owner.is_empty()),
+            "fallback reinitialization should hold the shared sticky init lock"
+        );
+        assert!(candidate.orchestration.pool_sticky_bound_key_ineligible);
+        assert_eq!(
+            candidate.orchestration.pool_sticky_bound_key_id.as_deref(),
+            Some("key-00000")
+        );
+        assert_eq!(
+            cursor
+                .skip_reason_counts
+                .get(ROUTING_PROFILE_DISALLOWED_KEY_SKIP_REASON),
+            Some(&1)
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_key_cursor_marks_sticky_hit_ineligible_when_runtime_cooldown_skips_it() {
+        let provider_config = Some(json!({
+            "pool_advanced": {
+                "sticky_session_ttl_seconds": 120,
+                "rate_limit_cooldown_seconds": 300,
+                "scheduling_presets": [
+                    {"preset": "no_weight", "enabled": true}
+                ]
+            }
+        }));
+        let (provider, endpoint, keys, rows) = large_pool_fixture(2, provider_config.clone());
+        let app = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_and_minimal_candidate_selection_for_tests(
+                    Arc::new(InMemoryProviderCatalogReadRepository::seed(
+                        vec![provider],
+                        vec![endpoint],
+                        keys,
+                    )),
+                    Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(rows)),
+                )
+                .with_encryption_key_for_tests(aether_crypto::DEVELOPMENT_ENCRYPTION_KEY),
+            );
+        let group = sample_eligible_candidate(
+            "provider-pool",
+            "endpoint-1",
+            "pool-group",
+            10,
+            provider_config.clone(),
+        );
+        let pool_config = pool_config_for_candidate(&group).expect("pool config should parse");
+        record_admin_provider_pool_success(
+            app.runtime_state.as_ref(),
+            "provider-pool",
+            "key-00000",
+            &pool_config,
+            Some("session-1"),
+            None,
+            false,
+            None,
+            0,
+            None,
+        )
+        .await;
+        record_admin_provider_pool_error(
+            app.runtime_state.as_ref(),
+            "provider-pool",
+            "key-00000",
+            &pool_config,
+            429,
+            None,
+            None,
+        )
+        .await;
+
+        let mut cursor = PoolKeyCursor::new(
+            PlannerAppState::new(&app),
+            group,
+            Some("session-1"),
+            None,
+            None,
+        );
+
+        let candidate = cursor
+            .next_key()
+            .await
+            .expect("cursor should fall back after cooldown skips sticky-bound key");
+
+        assert_eq!(candidate.candidate.key_id, "key-00001");
+        assert!(
+            candidate
+                .orchestration
+                .pool_sticky_init_owner
+                .as_deref()
+                .is_some_and(|owner| !owner.is_empty()),
+            "cooldown fallback reinitialization should hold the shared sticky init lock"
+        );
+        assert!(candidate.orchestration.pool_sticky_bound_key_ineligible);
+        assert_eq!(
+            candidate.orchestration.pool_sticky_bound_key_id.as_deref(),
+            Some("key-00000")
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_key_cursor_claims_sticky_init_lock_before_returning_first_candidate() {
+        let provider_config = Some(json!({
+            "pool_advanced": {
+                "sticky_session_ttl_seconds": 120,
+                "scheduling_presets": [
+                    {"preset": "no_weight", "enabled": true}
+                ]
+            }
+        }));
+        let (provider, endpoint, keys, rows) = large_pool_fixture(2, provider_config.clone());
+        let app = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_and_minimal_candidate_selection_for_tests(
+                    Arc::new(InMemoryProviderCatalogReadRepository::seed(
+                        vec![provider],
+                        vec![endpoint],
+                        keys,
+                    )),
+                    Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(rows)),
+                )
+                .with_encryption_key_for_tests(aether_crypto::DEVELOPMENT_ENCRYPTION_KEY),
+            );
+        let group = sample_eligible_candidate(
+            "provider-pool",
+            "endpoint-1",
+            "pool-group",
+            10,
+            provider_config,
+        );
+
+        let mut leader_cursor = PoolKeyCursor::new(
+            PlannerAppState::new(&app),
+            group.clone(),
+            Some("session-1"),
+            None,
+            None,
+        );
+        let leader_candidate = leader_cursor
+            .next_key()
+            .await
+            .expect("first cursor should return the sticky initializer");
+        assert!(leader_candidate
+            .orchestration
+            .pool_sticky_init_owner
+            .as_deref()
+            .is_some_and(|owner| !owner.is_empty()));
+        assert!(
+            admin_provider_pool_sticky_session_init_exists(
+                app.runtime_state.as_ref(),
+                "provider-pool",
+                Some("session-1"),
+            )
+            .await,
+            "the returned initializer must already hold the shared sticky-init lock"
+        );
+
+        let mut follower_cursor = PoolKeyCursor::new(
+            PlannerAppState::new(&app),
+            group,
+            Some("session-1"),
+            None,
+            None,
+        );
+        let follower_attempt = tokio::time::timeout(
+            Duration::from_millis(super::POOL_STICKY_INIT_WAIT_INTERVAL_MS.saturating_mul(3)),
+            follower_cursor.next_key(),
+        )
+        .await;
+        assert!(
+            follower_attempt.is_err(),
+            "a concurrent cursor must wait instead of returning another initializer"
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_key_cursor_does_not_mark_sticky_bound_key_ineligible_after_returning_it() {
+        let provider_config = Some(json!({
+            "pool_advanced": {
+                "sticky_session_ttl_seconds": 120,
+                "scheduling_presets": [
+                    {"preset": "no_weight", "enabled": true}
+                ]
+            }
+        }));
+        let (provider, endpoint, keys, rows) = large_pool_fixture(2, provider_config.clone());
+        let app = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_and_minimal_candidate_selection_for_tests(
+                    Arc::new(InMemoryProviderCatalogReadRepository::seed(
+                        vec![provider],
+                        vec![endpoint],
+                        keys,
+                    )),
+                    Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(rows)),
+                )
+                .with_encryption_key_for_tests(aether_crypto::DEVELOPMENT_ENCRYPTION_KEY),
+            );
+        let group = sample_eligible_candidate(
+            "provider-pool",
+            "endpoint-1",
+            "pool-group",
+            10,
+            provider_config.clone(),
+        );
+        let pool_config = pool_config_for_candidate(&group).expect("pool config should parse");
+        record_admin_provider_pool_success(
+            app.runtime_state.as_ref(),
+            "provider-pool",
+            "key-00000",
+            &pool_config,
+            Some("session-1"),
+            None,
+            false,
+            None,
+            0,
+            None,
+        )
+        .await;
+
+        let mut cursor = PoolKeyCursor::new(
+            PlannerAppState::new(&app),
+            group,
+            Some("session-1"),
+            None,
+            None,
+        );
+
+        let sticky = cursor
+            .next_key()
+            .await
+            .expect("cursor should return the sticky-bound key first");
+        assert_eq!(sticky.candidate.key_id, "key-00000");
+        assert!(!sticky.orchestration.pool_sticky_bound_key_ineligible);
+
+        let fallback = cursor
+            .next_key()
+            .await
+            .expect("cursor can return another queued key after sticky hit");
+        assert_eq!(fallback.candidate.key_id, "key-00001");
+        assert!(
+            !fallback.orchestration.pool_sticky_bound_key_ineligible,
+            "a later candidate must not treat an already-returned sticky key as ineligible"
+        );
+        assert_eq!(fallback.orchestration.pool_sticky_bound_key_id, None);
+    }
+
+    #[tokio::test]
+    async fn pool_key_cursor_marks_post_sticky_fallback_as_deferred_initializer() {
+        let provider_config = Some(json!({
+            "pool_advanced": {
+                "sticky_session_ttl_seconds": 120,
+                "scheduling_presets": [
+                    {"preset": "no_weight", "enabled": true}
+                ]
+            }
+        }));
+        let (provider, endpoint, keys, rows) = large_pool_fixture(2, provider_config.clone());
+        let app = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_and_minimal_candidate_selection_for_tests(
+                    Arc::new(InMemoryProviderCatalogReadRepository::seed(
+                        vec![provider],
+                        vec![endpoint],
+                        keys,
+                    )),
+                    Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(rows)),
+                )
+                .with_encryption_key_for_tests(aether_crypto::DEVELOPMENT_ENCRYPTION_KEY),
+            );
+        let group = sample_eligible_candidate(
+            "provider-pool",
+            "endpoint-1",
+            "pool-group",
+            10,
+            provider_config.clone(),
+        );
+        let pool_config = pool_config_for_candidate(&group).expect("pool config should parse");
+        record_admin_provider_pool_success(
+            app.runtime_state.as_ref(),
+            "provider-pool",
+            "key-00000",
+            &pool_config,
+            Some("session-1"),
+            None,
+            false,
+            None,
+            0,
+            None,
+        )
+        .await;
+
+        let mut cursor = PoolKeyCursor::new(
+            PlannerAppState::new(&app),
+            group,
+            Some("session-1"),
+            None,
+            None,
+        );
+
+        let sticky = cursor
+            .next_key()
+            .await
+            .expect("cursor should return the sticky-bound key first");
+        assert_eq!(sticky.candidate.key_id, "key-00000");
+        assert_eq!(sticky.orchestration.pool_sticky_init_owner, None);
+
+        let fallback = cursor
+            .next_key()
+            .await
+            .expect("cursor should return a fallback key after sticky hit");
+        assert_eq!(fallback.candidate.key_id, "key-00001");
+        assert!(
+            fallback
+                .orchestration
+                .pool_sticky_init_owner
+                .as_deref()
+                .is_some_and(|owner| !owner.is_empty()),
+            "post-sticky fallback should be able to take over initialization if the sticky key fails"
+        );
+        assert_eq!(
+            fallback.orchestration.pool_sticky_session_token.as_deref(),
+            Some("session-1")
+        );
+        assert!(!fallback.orchestration.pool_sticky_bound_key_ineligible);
+        assert_eq!(fallback.orchestration.pool_sticky_bound_key_id, None);
+        assert!(
+            !admin_provider_pool_sticky_session_init_exists(
+                app.runtime_state.as_ref(),
+                "provider-pool",
+                Some("session-1"),
+            )
+            .await,
+            "deferred fallback initializer must not claim the shared lock during scheduling"
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_key_cursor_does_not_bind_skipped_or_returned_candidates_before_success() {
+        let app = AppState::new().expect("state should build");
+        let provider_config = Some(json!({
+            "pool_advanced": {
+                "sticky_session_ttl_seconds": 120,
+                "scheduling_presets": [
+                    {"preset": "cache_affinity", "enabled": true}
+                ]
+            }
+        }));
+        let group = sample_eligible_candidate(
+            "provider-pool",
+            "endpoint-1",
+            "pool-group",
+            10,
+            provider_config.clone(),
+        );
+        let pool_config = pool_config_for_candidate(&group).expect("pool config should parse");
+        let routing_policy = routing_policy_with_allowed_keys(["key-b"]);
+        let mut cursor = PoolKeyCursor::new_with_routing_policy(
+            PlannerAppState::new(&app),
+            group,
+            Some("session-1"),
+            None,
+            None,
+            Some(&routing_policy),
+        );
+        cursor.queued_candidates = VecDeque::from([
+            sample_eligible_candidate(
+                "provider-pool",
+                "endpoint-1",
+                "key-a",
+                10,
+                provider_config.clone(),
+            ),
+            sample_eligible_candidate("provider-pool", "endpoint-1", "key-b", 10, provider_config),
+        ]);
+
+        let candidate = cursor
+            .next_key()
+            .await
+            .expect("cursor should skip disallowed key and return allowed key");
+        assert_eq!(candidate.candidate.key_id, "key-b");
+
+        let runtime = read_admin_provider_pool_runtime_state(
+            app.runtime_state.as_ref(),
+            "provider-pool",
+            &["key-a".to_string(), "key-b".to_string()],
+            &pool_config,
+            Some("session-1"),
+        )
+        .await;
+        assert_eq!(runtime.sticky_bound_key_id, None);
+        assert_eq!(runtime.sticky_sessions_by_key.get("key-a"), None);
+        assert_eq!(runtime.sticky_sessions_by_key.get("key-b"), None);
+    }
+
+    #[tokio::test]
+    async fn pool_key_cursor_does_not_prebind_returned_key_before_success() {
+        let app = AppState::new().expect("state should build");
+        let provider_config = Some(json!({
+            "pool_advanced": {
+                "sticky_session_ttl_seconds": 120,
+                "scheduling_presets": [
+                    {"preset": "load_balance", "enabled": true}
+                ]
+            }
+        }));
+        let group = sample_eligible_candidate(
+            "provider-pool",
+            "endpoint-1",
+            "pool-group",
+            10,
+            provider_config.clone(),
+        );
+        let pool_config = pool_config_for_candidate(&group).expect("pool config should parse");
+        let mut cursor = PoolKeyCursor::new(
+            PlannerAppState::new(&app),
+            group,
+            Some("session-1"),
+            None,
+            None,
+        );
+        cursor.queued_candidates = VecDeque::from([sample_eligible_candidate(
+            "provider-pool",
+            "endpoint-1",
+            "key-a",
+            10,
+            provider_config,
+        )]);
+
+        let candidate = cursor
+            .next_key()
+            .await
+            .expect("cursor should return queued key");
+        assert_eq!(candidate.candidate.key_id, "key-a");
+        assert!(
+            candidate
+                .orchestration
+                .pool_sticky_init_owner
+                .as_deref()
+                .is_some_and(|owner| !owner.is_empty()),
+            "returned sticky initializer should carry its shared init owner"
+        );
+        assert!(
+            admin_provider_pool_sticky_session_init_exists(
+                app.runtime_state.as_ref(),
+                "provider-pool",
+                Some("session-1"),
+            )
+            .await,
+            "sticky init lock should be claimed before returning the candidate"
+        );
+
+        let runtime = read_admin_provider_pool_runtime_state(
+            app.runtime_state.as_ref(),
+            "provider-pool",
+            &["key-a".to_string()],
+            &pool_config,
+            Some("session-1"),
+        )
+        .await;
+        assert_eq!(runtime.sticky_bound_key_id, None);
+        assert_eq!(runtime.total_sticky_sessions, 0);
+    }
+
+    #[tokio::test]
+    async fn pool_key_cursor_does_not_prebind_when_sticky_ttl_is_zero() {
+        let app = AppState::new().expect("state should build");
+        let provider_config = Some(json!({
+            "pool_advanced": {
+                "sticky_session_ttl_seconds": 0,
+                "scheduling_presets": [
+                    {"preset": "no_weight", "enabled": true}
+                ]
+            }
+        }));
+        let group = sample_eligible_candidate(
+            "provider-pool",
+            "endpoint-1",
+            "pool-group",
+            10,
+            provider_config.clone(),
+        );
+        let pool_config = pool_config_for_candidate(&group).expect("pool config should parse");
+        let mut cursor = PoolKeyCursor::new(
+            PlannerAppState::new(&app),
+            group,
+            Some("session-1"),
+            None,
+            None,
+        );
+        cursor.queued_candidates = VecDeque::from([sample_eligible_candidate(
+            "provider-pool",
+            "endpoint-1",
+            "key-a",
+            10,
+            provider_config,
+        )]);
+
+        let candidate = cursor
+            .next_key()
+            .await
+            .expect("cursor should return queued key");
+        assert_eq!(candidate.candidate.key_id, "key-a");
+
+        let runtime = read_admin_provider_pool_runtime_state(
+            app.runtime_state.as_ref(),
+            "provider-pool",
+            &["key-a".to_string()],
+            &pool_config,
+            Some("session-1"),
+        )
+        .await;
+        assert_eq!(runtime.sticky_bound_key_id, None);
+        assert_eq!(runtime.total_sticky_sessions, 0);
+    }
+
+    #[tokio::test]
+    async fn pool_key_cursor_waits_for_sticky_init_before_returning_queued_key() {
+        let app = AppState::new().expect("state should build");
+        let provider_config = Some(json!({
+            "pool_advanced": {
+                "sticky_session_ttl_seconds": 120,
+                "scheduling_presets": [
+                    {"preset": "no_weight", "enabled": true}
+                ]
+            }
+        }));
+        let group = sample_eligible_candidate(
+            "provider-pool",
+            "endpoint-1",
+            "pool-group",
+            10,
+            provider_config.clone(),
+        );
+        assert!(
+            claim_admin_provider_pool_sticky_session_init(
+                app.runtime_state.as_ref(),
+                "provider-pool",
+                Some("session-1"),
+                "leader",
+                Duration::from_secs(30),
+            )
+            .await
+        );
+        let mut cursor = PoolKeyCursor::new(
+            PlannerAppState::new(&app),
+            group,
+            Some("session-1"),
+            None,
+            None,
+        );
+        cursor.queued_candidates = VecDeque::from([sample_eligible_candidate(
+            "provider-pool",
+            "endpoint-1",
+            "key-b",
+            10,
+            provider_config.clone(),
+        )]);
+
+        let app_for_release = app.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            release_admin_provider_pool_sticky_session_init_for_tests(
+                app_for_release.runtime_state.as_ref(),
+                "provider-pool",
+                Some("session-1"),
+            )
+            .await;
+        });
+
+        let started = tokio::time::Instant::now();
+        let candidate = cursor
+            .next_key()
+            .await
+            .expect("follower should continue after sticky init is released");
+        assert!(
+            started.elapsed() >= Duration::from_millis(50),
+            "follower should not return its queued key while sticky init is pending"
+        );
+        assert_eq!(candidate.candidate.key_id, "key-b");
+        assert_eq!(cursor.returned_key_count, 1);
+        assert!(
+            candidate
+                .orchestration
+                .pool_sticky_init_owner
+                .as_deref()
+                .is_some_and(|owner| owner != "leader" && !owner.is_empty()),
+            "follower should claim a fresh owner after the previous init lock is released"
+        );
+        assert!(
+            admin_provider_pool_sticky_session_init_exists(
+                app.runtime_state.as_ref(),
+                "provider-pool",
+                Some("session-1"),
+            )
+            .await,
+            "returned sticky initializer should already hold the shared init lock"
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_key_cursor_claims_sticky_init_before_returning_first_candidate() {
+        let app = AppState::new().expect("state should build");
+        let provider_config = Some(json!({
+            "pool_advanced": {
+                "sticky_session_ttl_seconds": 120,
+                "scheduling_presets": [
+                    {"preset": "no_weight", "enabled": true}
+                ]
+            }
+        }));
+        let group = sample_eligible_candidate(
+            "provider-pool",
+            "endpoint-1",
+            "pool-group",
+            10,
+            provider_config.clone(),
+        );
+        let mut first_cursor = PoolKeyCursor::new(
+            PlannerAppState::new(&app),
+            group.clone(),
+            Some("session-1"),
+            None,
+            None,
+        );
+        let mut second_cursor = PoolKeyCursor::new(
+            PlannerAppState::new(&app),
+            group,
+            Some("session-1"),
+            None,
+            None,
+        );
+        first_cursor.queued_candidates = VecDeque::from([sample_eligible_candidate(
+            "provider-pool",
+            "endpoint-1",
+            "key-a",
+            10,
+            provider_config.clone(),
+        )]);
+        second_cursor.queued_candidates = VecDeque::from([sample_eligible_candidate(
+            "provider-pool",
+            "endpoint-1",
+            "key-b",
+            10,
+            provider_config,
+        )]);
+
+        let first = first_cursor
+            .next_key()
+            .await
+            .expect("first cursor should return the initializer");
+        assert_eq!(first.candidate.key_id, "key-a");
+        let first_owner = first
+            .orchestration
+            .pool_sticky_init_owner
+            .as_deref()
+            .expect("initializer should carry an owner");
+
+        let second_poll =
+            tokio::time::timeout(Duration::from_millis(40), second_cursor.next_key()).await;
+        assert!(
+            second_poll.is_err(),
+            "second cursor must wait instead of returning a competing initializer"
+        );
+
+        release_admin_provider_pool_sticky_session_init_for_tests(
+            app.runtime_state.as_ref(),
+            "provider-pool",
+            Some("session-1"),
+        )
+        .await;
+        let second = second_cursor
+            .next_key()
+            .await
+            .expect("second cursor should continue after init lock release");
+        assert_eq!(second.candidate.key_id, "key-b");
+        let second_owner = second
+            .orchestration
+            .pool_sticky_init_owner
+            .as_deref()
+            .expect("second initializer should carry an owner");
+        assert_ne!(second_owner, first_owner);
+    }
+
+    #[tokio::test]
+    async fn pool_key_cursor_losing_local_leader_waits_without_dropping_candidate() {
+        let app = AppState::new().expect("state should build");
+        let provider_config = Some(json!({
+            "pool_advanced": {
+                "sticky_session_ttl_seconds": 120,
+                "scheduling_presets": [
+                    {"preset": "no_weight", "enabled": true}
+                ]
+            }
+        }));
+        let group = sample_eligible_candidate(
+            "provider-pool",
+            "endpoint-1",
+            "pool-group",
+            10,
+            provider_config.clone(),
+        );
+        let mut first_cursor = PoolKeyCursor::new(
+            PlannerAppState::new(&app),
+            group.clone(),
+            Some("session-1"),
+            None,
+            None,
+        );
+        let mut second_cursor = PoolKeyCursor::new(
+            PlannerAppState::new(&app),
+            group,
+            Some("session-1"),
+            None,
+            None,
+        );
+        first_cursor.queued_candidates = VecDeque::from([sample_eligible_candidate(
+            "provider-pool",
+            "endpoint-1",
+            "key-a",
+            10,
+            provider_config.clone(),
+        )]);
+        second_cursor.queued_candidates = VecDeque::from([sample_eligible_candidate(
+            "provider-pool",
+            "endpoint-1",
+            "key-b",
+            10,
+            provider_config,
+        )]);
+
+        assert_eq!(
+            first_cursor.ensure_sticky_session_init_gate().await,
+            PoolStickyInitGate::Proceed
+        );
+        assert_eq!(
+            second_cursor.ensure_sticky_session_init_gate().await,
+            PoolStickyInitGate::Proceed
+        );
+
+        let first = first_cursor
+            .next_key()
+            .await
+            .expect("first cursor should win the shared init lock");
+        assert_eq!(first.candidate.key_id, "key-a");
+
+        let second_poll =
+            tokio::time::timeout(Duration::from_millis(40), second_cursor.next_key()).await;
+        assert!(
+            second_poll.is_err(),
+            "losing local leader should wait on the winner instead of returning a fallback"
+        );
+        assert_eq!(second_cursor.queued_candidates.len(), 1);
+        assert_eq!(
+            second_cursor
+                .queued_candidates
+                .front()
+                .map(|candidate| candidate.candidate.key_id.as_str()),
+            Some("key-b")
+        );
+
+        release_admin_provider_pool_sticky_session_init_for_tests(
+            app.runtime_state.as_ref(),
+            "provider-pool",
+            Some("session-1"),
+        )
+        .await;
+        let second = second_cursor
+            .next_key()
+            .await
+            .expect("second cursor should reuse the queued key after the lock is released");
+        assert_eq!(second.candidate.key_id, "key-b");
+    }
+
+    #[tokio::test]
+    async fn static_pool_expansion_stops_after_sticky_initializer() {
+        let provider_config = Some(json!({
+            "pool_advanced": {
+                "sticky_session_ttl_seconds": 120,
+                "scheduling_presets": [
+                    {"preset": "no_weight", "enabled": true}
+                ]
+            }
+        }));
+        let (provider, endpoint, keys, rows) = large_pool_fixture(3, provider_config.clone());
+        let data_state =
+            GatewayDataState::with_provider_catalog_and_minimal_candidate_selection_for_tests(
+                Arc::new(InMemoryProviderCatalogReadRepository::seed(
+                    vec![provider],
+                    vec![endpoint],
+                    keys,
+                )),
+                Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(rows)),
+            )
+            .with_encryption_key_for_tests(aether_crypto::DEVELOPMENT_ENCRYPTION_KEY);
+        let app = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(data_state);
+        let group = sample_eligible_candidate(
+            "provider-pool",
+            "endpoint-1",
+            "pool-group",
+            10,
+            provider_config,
+        );
+
+        let (scheduled, skipped) = apply_local_execution_pool_scheduler(
+            PlannerAppState::new(&app),
+            vec![group],
+            Some("session-1"),
+            Some("gpt-5"),
+            None,
+        )
+        .await;
+
+        assert!(skipped.is_empty());
+        assert_eq!(scheduled.len(), 1);
+        assert!(
+            scheduled[0]
+                .orchestration
+                .pool_sticky_init_owner
+                .as_deref()
+                .is_some_and(|owner| !owner.is_empty()),
+            "the single expanded candidate should own sticky initialization"
+        );
+    }
+
+    #[tokio::test]
+    async fn static_pool_expansion_times_out_waiting_for_sticky_init() {
+        let provider_config = Some(json!({
+            "pool_advanced": {
+                "sticky_session_ttl_seconds": 120,
+                "scheduling_presets": [
+                    {"preset": "no_weight", "enabled": true}
+                ]
+            }
+        }));
+        let (provider, endpoint, keys, rows) = large_pool_fixture(1, provider_config.clone());
+        let data_state =
+            GatewayDataState::with_provider_catalog_and_minimal_candidate_selection_for_tests(
+                Arc::new(InMemoryProviderCatalogReadRepository::seed(
+                    vec![provider],
+                    vec![endpoint],
+                    keys,
+                )),
+                Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(rows)),
+            )
+            .with_encryption_key_for_tests(aether_crypto::DEVELOPMENT_ENCRYPTION_KEY);
+        let app = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(data_state)
+            .with_frontdoor_runtime_guard_config_for_tests(FrontdoorRuntimeGuardConfig::for_tests(
+                Duration::from_secs(30),
+                Duration::from_millis(25),
+            ));
+        assert!(
+            claim_admin_provider_pool_sticky_session_init(
+                app.runtime_state.as_ref(),
+                "provider-pool",
+                Some("session-1"),
+                "leader",
+                Duration::from_secs(30),
+            )
+            .await
+        );
+        let group = sample_eligible_candidate(
+            "provider-pool",
+            "endpoint-1",
+            "pool-group",
+            10,
+            provider_config,
+        );
+
+        let started = tokio::time::Instant::now();
+        let (scheduled, skipped) = apply_local_execution_pool_scheduler(
+            PlannerAppState::new(&app),
+            vec![group],
+            Some("session-1"),
+            Some("gpt-5"),
+            None,
+        )
+        .await;
+
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "static pool expansion should stay inside the planning timeout budget"
+        );
+        assert!(scheduled.is_empty());
+        assert!(skipped.is_empty());
+        assert!(
+            admin_provider_pool_sticky_session_init_exists(
+                app.runtime_state.as_ref(),
+                "provider-pool",
+                Some("session-1"),
+            )
+            .await,
+            "timed-out expansion must not release another request's init lock"
+        );
+    }
+
+    #[tokio::test]
     async fn pool_key_cursor_allows_parallel_requests_to_use_same_healthy_key() {
         let app = AppState::new().expect("state should build");
         let provider_config = Some(json!({ "pool_advanced": { "lru_enabled": true } }));
@@ -2983,11 +4333,9 @@ mod tests {
         assert_eq!(candidate.candidate.key_id, "key-a");
         assert_eq!(candidate.orchestration.pool_key_index, Some(0));
         assert!(candidate.orchestration.pool_key_lease.is_none());
-        assert!(
-            !cursor
-                .skip_reason_counts
-                .contains_key("pool_key_lease_busy")
-        );
+        assert!(!cursor
+            .skip_reason_counts
+            .contains_key("pool_key_lease_busy"));
 
         let group = sample_eligible_candidate(
             "provider-pool",
@@ -3346,8 +4694,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pool_scheduler_skips_invalid_and_exhausted_high_priority_hot_pool_before_fallback_provider()
-     {
+    async fn pool_scheduler_skips_invalid_and_exhausted_high_priority_hot_pool_before_fallback_provider(
+    ) {
         let provider_config = Some(json!({
             "pool_advanced": {
                 "probing_enabled": true,
@@ -3693,11 +5041,9 @@ mod tests {
         assert_eq!(returned_ids.last().map(String::as_str), Some("key-00463"));
         assert_eq!(cursor.scanned_keys, 512);
         assert_eq!(cursor.skip_reason_counts.get("pool_cooldown"), Some(&3));
-        assert!(
-            !cursor
-                .skip_reason_counts
-                .contains_key("pool_key_lease_busy")
-        );
+        assert!(!cursor
+            .skip_reason_counts
+            .contains_key("pool_key_lease_busy"));
         for skipped in ["key-00000", "key-00001", "key-00014"] {
             assert!(
                 !returned_ids.iter().any(|key_id| key_id == skipped),
@@ -3811,6 +5157,53 @@ mod tests {
         );
 
         assert!(!context.quota_exhausted);
+    }
+
+    #[test]
+    fn pool_catalog_context_honors_codex_five_hour_quota_basis() {
+        let mut key = sample_catalog_oauth_key("key-codex-five-hour-capacity");
+        key.status_snapshot = Some(json!({
+            "quota": {
+                "version": 2,
+                "provider_type": "codex",
+                "code": "exhausted",
+                "exhausted": true,
+                "usage_ratio": 1.0,
+                "windows": [
+                    {
+                        "code": "weekly",
+                        "is_exhausted": true,
+                        "used_ratio": 1.0,
+                        "remaining_ratio": 0.0
+                    },
+                    {
+                        "code": "5h",
+                        "is_exhausted": false,
+                        "used_ratio": 0.1,
+                        "remaining_ratio": 0.9
+                    }
+                ]
+            }
+        }));
+
+        let app = app_state_with_catalog_key(key.clone());
+        let weekly_context = build_pool_catalog_key_context(
+            PlannerAppState::new(&app),
+            &ProviderPoolService::with_builtin_adapters(),
+            &key,
+            "codex",
+            Some("weekly"),
+        );
+        let five_hour_context = build_pool_catalog_key_context(
+            PlannerAppState::new(&app),
+            &ProviderPoolService::with_builtin_adapters(),
+            &key,
+            "codex",
+            Some("five_hour"),
+        );
+
+        assert!(weekly_context.quota_exhausted);
+        assert!(!five_hour_context.quota_exhausted);
     }
 
     #[test]

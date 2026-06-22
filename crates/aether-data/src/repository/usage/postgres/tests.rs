@@ -5,13 +5,13 @@ use super::{
     attach_compressed_body_refs, attach_usage_http_audit_body_refs,
     attach_usage_routing_snapshot_metadata, attach_usage_settlement_pricing_snapshot_metadata,
     inflate_usage_json_value, prepare_prompt_capture_metadata,
-    prepare_request_metadata_for_body_storage,
-    prepare_usage_body_storage, resolved_read_usage_body_ref, resolved_write_usage_body_ref,
+    prepare_request_metadata_for_body_storage, prepare_usage_body_storage,
+    resolved_read_usage_body_ref, resolved_write_usage_body_ref,
     split_dashboard_daily_aggregate_range, split_dashboard_hourly_aggregate_range, usage_body_ref,
     usage_http_audit_body_refs, usage_http_audit_capture_mode, usage_routing_snapshot_from_usage,
     usage_settlement_pricing_snapshot_from_usage, AggregateRangeSplit, SqlxUsageReadRepository,
-    UsageHttpAuditRefs, UsagePromptCaptureEntry, UsageRoutingSnapshot, UsageSettlementPricingSnapshot,
-    MAX_INLINE_USAGE_BODY_BYTES,
+    UsageHttpAuditRefs, UsagePromptCaptureEntry, UsageRoutingSnapshot,
+    UsageSettlementPricingSnapshot, MAX_INLINE_USAGE_BODY_BYTES,
 };
 use crate::driver::postgres::{PostgresPoolConfig, PostgresPoolFactory};
 use crate::repository::usage::UpsertUsageRecord;
@@ -1056,8 +1056,7 @@ fn prepare_prompt_capture_metadata_moves_preview_fields_to_entries() {
     assert_eq!(
         entries[0],
         UsagePromptCaptureEntry {
-            sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                .to_string(),
+            sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
             role: "system".to_string(),
             chars: 120,
             preview: "system prompt preview".to_string(),

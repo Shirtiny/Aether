@@ -4,9 +4,12 @@ use super::{
     apply_codex_openai_responses_special_body_edits, apply_codex_openai_responses_special_headers,
     apply_codex_pool_stable_client_headers,
 };
-use crate::ai_serving::GatewayProviderTransportSnapshot;
-use crate::provider_transport::snapshot::{
-    GatewayProviderTransportEndpoint, GatewayProviderTransportKey, GatewayProviderTransportProvider,
+use crate::ai_serving::{
+    transport::snapshot::{
+        GatewayProviderTransportEndpoint, GatewayProviderTransportKey,
+        GatewayProviderTransportProvider,
+    },
+    GatewayProviderTransportSnapshot,
 };
 use http::{HeaderMap, HeaderValue};
 use serde_json::{json, Value};

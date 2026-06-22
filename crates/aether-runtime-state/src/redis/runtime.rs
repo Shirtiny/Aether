@@ -135,6 +135,124 @@ impl RedisRuntimeRunner {
         Ok(())
     }
 
+    pub(crate) async fn kv_set_if_absent(
+        &self,
+        key: &str,
+        value: String,
+        ttl: Duration,
+    ) -> Result<bool, DataLayerError> {
+        let namespaced_key = self.keyspace.key(key);
+        let mut command = cmd("SET");
+        command
+            .arg(namespaced_key)
+            .arg(value)
+            .arg("NX")
+            .arg("PX")
+            .arg(u64::try_from(ttl.as_millis().max(1)).unwrap_or(u64::MAX));
+        let status = self
+            .query::<Option<String>>(
+                RedisConnectionLane::Fast,
+                "runtime kv set if absent",
+                command,
+            )
+            .await?;
+        Ok(status.is_some())
+    }
+
+    pub(crate) async fn kv_set_if_current_absent_or_value_and_guard_value(
+        &self,
+        key: &str,
+        value: String,
+        ttl: Duration,
+        guard_key: &str,
+        guard_value: Option<&str>,
+        alternate_expected_current_value: Option<&str>,
+    ) -> Result<bool, DataLayerError> {
+        let namespaced_key = self.keyspace.key(key);
+        let namespaced_guard_key = self.keyspace.key(guard_key);
+        let ttl_ms = u64::try_from(ttl.as_millis().max(1)).unwrap_or(u64::MAX);
+        let mut connection = self.connections.connection(RedisConnectionLane::Fast);
+        let updated = script(
+            "local current = redis.call('get', KEYS[1]) \
+             if current and current ~= ARGV[1] then \
+                 if ARGV[5] ~= '1' or current ~= ARGV[4] then \
+                     return 0 \
+                 end \
+             end \
+             local guard = redis.call('get', KEYS[2]) \
+             if ARGV[3] == '' and guard then \
+                 return 0 \
+             end \
+             if ARGV[3] ~= '' and guard ~= ARGV[3] then \
+                 return 0 \
+             end \
+             redis.call('psetex', KEYS[1], ARGV[2], ARGV[1]) \
+             return 1",
+        )
+        .key(namespaced_key)
+        .key(namespaced_guard_key)
+        .arg(value)
+        .arg(ttl_ms)
+        .arg(guard_value.unwrap_or(""))
+        .arg(alternate_expected_current_value.unwrap_or(""))
+        .arg(if alternate_expected_current_value.is_some() {
+            "1"
+        } else {
+            "0"
+        })
+        .invoke_async::<i32>(&mut connection)
+        .await
+        .map_redis_err()?;
+        Ok(updated > 0)
+    }
+
+    pub(crate) async fn kv_delete_if_value(
+        &self,
+        key: &str,
+        expected_value: &str,
+    ) -> Result<bool, DataLayerError> {
+        let namespaced_key = self.keyspace.key(key);
+        let mut connection = self.connections.connection(RedisConnectionLane::Fast);
+        let deleted = script(
+            "if redis.call('get', KEYS[1]) == ARGV[1] then \
+                 return redis.call('del', KEYS[1]) \
+             else \
+                 return 0 \
+             end",
+        )
+        .key(namespaced_key)
+        .arg(expected_value)
+        .invoke_async::<i32>(&mut connection)
+        .await
+        .map_redis_err()?;
+        Ok(deleted > 0)
+    }
+
+    pub(crate) async fn kv_expire_if_value(
+        &self,
+        key: &str,
+        expected_value: &str,
+        ttl: Duration,
+    ) -> Result<bool, DataLayerError> {
+        let namespaced_key = self.keyspace.key(key);
+        let ttl_ms = u64::try_from(ttl.as_millis().max(1)).unwrap_or(u64::MAX);
+        let mut connection = self.connections.connection(RedisConnectionLane::Fast);
+        let renewed = script(
+            "if redis.call('get', KEYS[1]) == ARGV[1] then \
+                 return redis.call('pexpire', KEYS[1], ARGV[2]) \
+             else \
+                 return 0 \
+             end",
+        )
+        .key(namespaced_key)
+        .arg(expected_value)
+        .arg(ttl_ms)
+        .invoke_async::<i32>(&mut connection)
+        .await
+        .map_redis_err()?;
+        Ok(renewed > 0)
+    }
+
     pub(crate) async fn kv_get_many(
         &self,
         keys: &[String],
