@@ -1358,6 +1358,14 @@ const mockHandlers: Record<string, (config: AxiosRequestConfig) => Promise<Axios
       })
     }
 
+    if (typeof params.cafecode === 'string' && params.cafecode.trim()) {
+      const keyword = params.cafecode.trim().toLowerCase()
+      records = records.filter(r =>
+        (r.cafecode_uid || '').toLowerCase().includes(keyword) ||
+        (r.cafecode_uname || '').toLowerCase().includes(keyword)
+      )
+    }
+
     return createMockResponse({
       records: records.slice(offset, offset + limit),
       total: records.length,

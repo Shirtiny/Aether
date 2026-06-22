@@ -520,12 +520,40 @@
               />
             </template>
           </SortableTableHead>
-          <TableHead
+          <SortableTableHead
             v-if="isAdmin && isColumnVisible('cafecode')"
             class="h-12 font-semibold w-[10%]"
+            column-key="cafecode"
+            :sortable="false"
+            :filter-active="normalizedFilterCafecode.length > 0"
+            filter-title="筛选 Cafecode"
+            filter-content-class="w-64 p-3 rounded-2xl border-border bg-card text-foreground shadow-2xl backdrop-blur-xl"
           >
             Cafecode
-          </TableHead>
+            <template #filter="{ close }">
+              <div class="space-y-2">
+                <div class="relative">
+                  <Search class="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+                  <Input
+                    v-model="localCafecode"
+                    class="h-8 pl-8 text-xs"
+                    placeholder="用户 ID 或名字"
+                    @keydown.stop
+                    @keyup.enter="close"
+                  />
+                </div>
+                <Button
+                  v-if="normalizedFilterCafecode.length > 0"
+                  type="button"
+                  variant="ghost"
+                  class="h-8 w-full text-xs"
+                  @click="clearCafecodeFilter(close)"
+                >
+                  清除筛选
+                </Button>
+              </div>
+            </template>
+          </SortableTableHead>
           <TableHead
             v-if="!isAdmin && isColumnVisible('key')"
             class="h-12 font-semibold w-[17%]"
@@ -1164,6 +1192,7 @@ const props = defineProps<{
   // 筛选
   filterSearch: string
   filterUser: string
+  filterCafecode: string
   filterModel: string
   filterProvider: string
   filterApiFormat: string
@@ -1187,6 +1216,7 @@ const emit = defineEmits<{
   'update:timeRange': [value: DateRangeParams]
   'update:filterSearch': [value: string]
   'update:filterUser': [value: string]
+  'update:filterCafecode': [value: string]
   'update:filterModel': [value: string]
   'update:filterProvider': [value: string]
   'update:filterApiFormat': [value: string]
@@ -1378,6 +1408,11 @@ const localSearch = ref(props.filterSearch)
 const emitSearchDebounced = useDebounceFn((value: string) => {
   emit('update:filterSearch', value)
 }, 300)
+const localCafecode = ref(props.filterCafecode)
+const normalizedFilterCafecode = computed(() => props.filterCafecode.trim())
+const emitCafecodeDebounced = useDebounceFn((value: string) => {
+  emit('update:filterCafecode', value.trim())
+}, 300)
 
 function getDisplayStatus(record: UsageRecord) {
   return resolveDisplayRequestStatus(record)
@@ -1429,9 +1464,25 @@ watch(() => props.filterSearch, (value) => {
   }
 })
 
+watch(() => props.filterCafecode, (value) => {
+  if (value !== localCafecode.value) {
+    localCafecode.value = value
+  }
+})
+
 watch(localSearch, (value) => {
   emitSearchDebounced(value)
 })
+
+watch(localCafecode, (value) => {
+  emitCafecodeDebounced(value)
+})
+
+function clearCafecodeFilter(close: () => void) {
+  localCafecode.value = ''
+  emit('update:filterCafecode', '')
+  close()
+}
 
 // 使用复用的行点击逻辑
 const { handleMouseDown, shouldTriggerRowClick } = useRowClick()

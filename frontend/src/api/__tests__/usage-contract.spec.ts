@@ -153,4 +153,29 @@ describe('usageApi contract alignment', () => {
       timeout: 120000,
     })
   })
+
+  it('passes Cafecode filter through admin usage records API', async () => {
+    getMock.mockResolvedValueOnce({
+      data: {
+        records: [],
+        total: 0,
+        limit: 10,
+        offset: 0,
+      },
+    })
+
+    await usageApi.getAllUsageRecords({
+      cafecode: '372',
+      limit: 10,
+      offset: 0,
+    })
+
+    expect(getMock).toHaveBeenCalledWith('/api/admin/usage/records', {
+      params: {
+        cafecode: '372',
+        limit: 10,
+        offset: 0,
+      },
+    })
+  })
 })

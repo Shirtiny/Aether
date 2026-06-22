@@ -139,6 +139,7 @@ function mountUsageRecordsTable(records: UsageRecord[], overrides: Record<string
     timeRange: { preset: 'today', tz_offset_minutes: 0 },
     filterSearch: '',
     filterUser: '__all__',
+    filterCafecode: '',
     filterModel: '__all__',
     filterProvider: '__all__',
     filterApiFormat: '__all__',

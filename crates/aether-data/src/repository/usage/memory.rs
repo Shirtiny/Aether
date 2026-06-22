@@ -258,6 +258,14 @@ fn usage_matches_list_query(item: &StoredRequestUsageAudit, query: &UsageAuditLi
             return false;
         }
     }
+    if let Some(cafecode) = query.cafecode.as_deref().map(str::trim) {
+        if !cafecode.is_empty()
+            && !usage_metadata_string_contains(item, "cafecode_uid", cafecode)
+            && !usage_metadata_string_contains(item, "cafecode_uname", cafecode)
+        {
+            return false;
+        }
+    }
     if let Some(statuses) = query.statuses.as_ref() {
         if !statuses.iter().any(|status| status == &item.status) {
             return false;
@@ -305,6 +313,21 @@ fn usage_metadata_bool(item: &StoredRequestUsageAudit, key: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn usage_metadata_string_contains(
+    item: &StoredRequestUsageAudit,
+    key: &str,
+    needle: &str,
+) -> bool {
+    let needle = needle.to_ascii_lowercase();
+    item.request_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get(key))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some_and(|value| value.to_ascii_lowercase().contains(&needle))
+}
+
 fn usage_matches_keyword_search_query(
     item: &StoredRequestUsageAudit,
     query: &UsageAuditKeywordSearchQuery,
@@ -336,6 +359,14 @@ fn usage_matches_keyword_search_query(
     }
     if let Some(api_format) = query.api_format.as_deref() {
         if item.api_format.as_deref() != Some(api_format) {
+            return false;
+        }
+    }
+    if let Some(cafecode) = query.cafecode.as_deref().map(str::trim) {
+        if !cafecode.is_empty()
+            && !usage_metadata_string_contains(item, "cafecode_uid", cafecode)
+            && !usage_metadata_string_contains(item, "cafecode_uname", cafecode)
+        {
             return false;
         }
     }
@@ -4820,6 +4851,41 @@ mod tests {
 
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].request_id, "req-2");
+    }
+
+    #[tokio::test]
+    async fn list_usage_audits_filters_by_cafecode_identity() {
+        let mut first = sample_usage("req-cafecode-1", 1);
+        first.request_metadata = Some(serde_json::json!({
+            "cafecode_uid": "372",
+            "cafecode_uname": "xiapeng8618"
+        }));
+        let mut second = sample_usage("req-cafecode-2", 2);
+        second.request_metadata = Some(serde_json::json!({
+            "cafecode_uid": "481",
+            "cafecode_uname": "another-user"
+        }));
+        let repository = InMemoryUsageReadRepository::seed(vec![first, second]);
+
+        let by_uid = repository
+            .list_usage_audits(&crate::repository::usage::UsageAuditListQuery {
+                cafecode: Some("372".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("list by cafecode uid should succeed");
+        let by_name = repository
+            .list_usage_audits(&crate::repository::usage::UsageAuditListQuery {
+                cafecode: Some("peng".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("list by cafecode name should succeed");
+
+        assert_eq!(by_uid.len(), 1);
+        assert_eq!(by_uid[0].request_id, "req-cafecode-1");
+        assert_eq!(by_name.len(), 1);
+        assert_eq!(by_name[0].request_id, "req-cafecode-1");
     }
 
     #[tokio::test]

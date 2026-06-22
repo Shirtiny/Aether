@@ -31,6 +31,7 @@ export interface PaginationParams {
 
 export interface FilterParams {
   search?: string
+  cafecode?: string
   user_id?: string
   model?: string
   provider?: string
@@ -346,6 +347,9 @@ export function useUsageData(options: UseUsageDataOptions) {
         // 管理员页面：使用管理员 API
         if (filters?.user_id) {
           params.user_id = filters.user_id
+        }
+        if (filters?.cafecode) {
+          params.cafecode = filters.cafecode
         }
         if (filters?.model) {
           params.model = filters.model

@@ -114,6 +114,7 @@ export interface UsageFilters {
   provider_id?: string // UUID
   model?: string
   search?: string
+  cafecode?: string
   start_date?: string
   end_date?: string
   preset?: string
@@ -269,6 +270,7 @@ function buildAdminUsageRecordParams(userId: string, filters?: UsageFilters): {
       timezone: filters?.timezone,
       tz_offset_minutes: filters?.tz_offset_minutes,
       search: filters?.search,
+      cafecode: filters?.cafecode,
       model: filters?.model,
       limit: pagination.pageSize,
       offset: pagination.offset,
@@ -468,6 +470,7 @@ export const usageApi = {
     timezone?: string
     tz_offset_minutes?: number
     search?: string  // 通用搜索：用户名、密钥名、模型名、提供商名
+    cafecode?: string // Cafecode 用户 ID 或用户名
     user_id?: string // UUID
     username?: string
     model?: string

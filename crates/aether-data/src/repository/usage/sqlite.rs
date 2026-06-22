@@ -455,6 +455,20 @@ fn push_sqlite_usage_list_filters(
             .push("api_format = ")
             .push_bind(api_format.to_string());
     }
+    if let Some(cafecode) = query.cafecode.as_deref().map(str::trim) {
+        if !cafecode.is_empty() {
+            let pattern = format!("%{}%", cafecode.to_ascii_lowercase());
+            push_sqlite_usage_where(builder, has_where);
+            builder.push("(");
+            builder
+                .push("LOWER(COALESCE(json_extract(request_metadata, '$.cafecode_uid'), '')) LIKE ")
+                .push_bind(pattern.clone());
+            builder
+                .push(" OR LOWER(COALESCE(json_extract(request_metadata, '$.cafecode_uname'), '')) LIKE ")
+                .push_bind(pattern);
+            builder.push(")");
+        }
+    }
     if let Some(statuses) = query.statuses.as_deref() {
         if !statuses.is_empty() {
             push_sqlite_usage_where(builder, has_where);
@@ -504,6 +518,7 @@ fn push_sqlite_usage_keyword_filters(
             provider_name: query.provider_name.clone(),
             model: query.model.clone(),
             api_format: query.api_format.clone(),
+            cafecode: query.cafecode.clone(),
             statuses: query.statuses.clone(),
             is_stream: query.is_stream,
             error_only: query.error_only,

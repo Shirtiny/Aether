@@ -86,6 +86,7 @@
       :time-range="timeRange"
       :filter-search="filterSearch"
       :filter-user="filterUser"
+      :filter-cafecode="filterCafecode"
       :filter-model="filterModel"
       :filter-provider="filterProvider"
       :filter-api-format="filterApiFormat"
@@ -104,6 +105,7 @@
       @update:time-range="handleTimeRangeChange"
       @update:filter-search="handleFilterSearchChange"
       @update:filter-user="handleFilterUserChange"
+      @update:filter-cafecode="handleFilterCafecodeChange"
       @update:filter-model="handleFilterModelChange"
       @update:filter-provider="handleFilterProviderChange"
       @update:filter-api-format="handleFilterApiFormatChange"
@@ -231,6 +233,7 @@ function formatIntervalTimelineWindow(hours: number): string {
 // 筛选状态
 const filterSearch = ref('')
 const filterUser = ref('__all__')
+const filterCafecode = ref('')
 const filterModel = ref('__all__')
 const filterProvider = ref('__all__')
 const filterApiFormat = ref('__all__')
@@ -874,6 +877,7 @@ async function handlePageSizeChange(size: number) {
 function getCurrentFilters() {
   return {
     search: filterSearch.value.trim() || undefined,
+    cafecode: filterCafecode.value.trim() || undefined,
     user_id: filterUser.value !== '__all__' ? filterUser.value : undefined,
     model: filterModel.value !== '__all__' ? filterModel.value : undefined,
     provider: filterProvider.value !== '__all__' ? filterProvider.value : undefined,
@@ -903,6 +907,15 @@ async function handleFilterUserChange(value: string) {
   if (isAdminPage.value) {
     await loadRecords({ page: 1, pageSize: pageSize.value }, getCurrentFilters(), timeRange.value)
     await refreshAdminAnalyticsForSelectionChange()
+  }
+}
+
+async function handleFilterCafecodeChange(value: string) {
+  filterCafecode.value = value
+  currentPage.value = 1
+
+  if (isAdminPage.value) {
+    await loadRecords({ page: 1, pageSize: pageSize.value }, getCurrentFilters(), timeRange.value)
   }
 }
 
