@@ -864,7 +864,16 @@ fn collect_message_array(
     let Some(Value::Array(items)) = value else {
         return;
     };
-    for item in items {
+    let mut message_groups = Vec::new();
+    let mut selected_texts = output
+        .iter()
+        .map(|prompt| prompt.text.clone())
+        .collect::<Vec<_>>();
+    let mut remaining = policy.max_items.saturating_sub(output.len());
+    if remaining == 0 {
+        return;
+    }
+    for item in items.iter().rev() {
         let Some(object) = item.as_object() else {
             continue;
         };
@@ -878,9 +887,38 @@ fn collect_message_array(
         if !prompt_capture_role_enabled(policy, role) {
             continue;
         }
+        let mut message_prompts = Vec::new();
         for key in ["content", "text", "parts"] {
-            collect_text_values_for_role(source, object.get(key), role, policy, output);
+            collect_text_values_for_role(
+                source,
+                object.get(key),
+                role,
+                policy,
+                &mut message_prompts,
+            );
         }
+        let mut selected_group = Vec::new();
+        for prompt in message_prompts {
+            if selected_texts.iter().any(|text| text == &prompt.text) {
+                continue;
+            }
+            selected_texts.push(prompt.text.clone());
+            selected_group.push(prompt);
+            remaining = remaining.saturating_sub(1);
+            if remaining == 0 {
+                break;
+            }
+        }
+        if selected_group.is_empty() {
+            continue;
+        }
+        message_groups.push(selected_group);
+        if remaining == 0 {
+            break;
+        }
+    }
+    for group in message_groups.into_iter().rev() {
+        output.extend(group);
     }
 }
 
@@ -1250,6 +1288,51 @@ mod tests {
             prompt_capture["items"][0]["preview"],
             json!("Summarize this incident.")
         );
+    }
+
+    #[test]
+    fn prompt_capture_metadata_keeps_recent_messages_when_history_exceeds_limit() {
+        let mut history = (1..=31)
+            .map(|index| json!({"role": "user", "content": format!("old prompt {index}")}))
+            .collect::<Vec<_>>();
+        history.push(json!({"role": "user", "content": "current request prompt"}));
+
+        let mut record = sample_usage_record();
+        record.request_body = Some(json!({
+            "instructions": "system prompt",
+            "input": history
+        }));
+
+        apply_usage_body_capture_policy_to_record(
+            UsageBodyCapturePolicy {
+                prompt_capture: UsagePromptCapturePolicy {
+                    enabled: true,
+                    max_items: 32,
+                    ..UsagePromptCapturePolicy::default()
+                },
+                ..UsageBodyCapturePolicy::default()
+            },
+            &mut record,
+        );
+
+        let prompt_capture = record
+            .request_metadata
+            .as_ref()
+            .and_then(|value| value.get("prompt_capture"))
+            .expect("prompt capture metadata should exist");
+        assert_eq!(prompt_capture["item_count"], json!(32));
+        assert_eq!(prompt_capture["role_counts"]["system"], json!(1));
+        assert_eq!(prompt_capture["role_counts"]["user"], json!(31));
+        assert_eq!(prompt_capture["items"][1]["preview"], json!("old prompt 2"));
+        assert_eq!(
+            prompt_capture["items"][31]["preview"],
+            json!("current request prompt")
+        );
+        assert!(!prompt_capture["items"]
+            .as_array()
+            .expect("items should be an array")
+            .iter()
+            .any(|item| item["preview"] == json!("old prompt 1")));
     }
 
     fn sample_usage_record() -> UpsertUsageRecord {
