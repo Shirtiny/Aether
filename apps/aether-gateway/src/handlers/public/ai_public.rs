@@ -1,18 +1,23 @@
 use crate::async_task::CancelVideoTaskError;
+use crate::constants::EXECUTION_PATH_LOCAL_AI_PUBLIC;
 use crate::control::GatewayControlDecision;
 use crate::control::GatewayPublicRequestContext;
 use crate::image_capabilities::{
     openai_image_gateway_max_generation_count, openai_image_gateway_max_generation_count_for_model,
 };
 use crate::{AppState, GatewayError};
+use aether_ai_formats::UPSTREAM_IS_STREAM_KEY;
 use aether_data_contracts::repository::video_tasks::{
     StoredVideoTask, VideoTaskQueryFilter, VideoTaskStatus,
 };
+use aether_usage_runtime::{UsageEvent, UsageEventData, UsageEventType};
 use axum::body::{Body, Bytes};
-use axum::http::{self, Response};
+use axum::http::{self, HeaderMap, Response};
 use axum::response::IntoResponse;
 use axum::Json;
 use serde_json::{json, Value};
+use std::time::Instant;
+use tracing::warn;
 
 const CLAUDE_COUNT_TOKENS_INVALID_PAYLOAD_DETAIL: &str = "Invalid token count payload";
 const CLAUDE_COUNT_TOKENS_MISSING_BODY_DETAIL: &str = "请求体不能为空";
@@ -52,6 +57,8 @@ const OPENAI_RERANK_TOP_N_DETAIL: &str = "Rerank request top_n must be a positiv
 const OPENAI_RERANK_CHAT_PAYLOAD_DETAIL: &str =
     "Rerank request must use query/documents, not chat messages";
 const OPENAI_RERANK_STREAM_UNSUPPORTED_DETAIL: &str = "Rerank requests do not support streaming";
+const LOCAL_PROBE_RESPONSE_HEADER: &str = "x-aether-local-probe";
+const LOCAL_PROBE_NOTICE_TEXT: &str = "欢迎光临！测活请求过多可能会触发限流，这是一个直接回复。";
 const ANTIGRAVITY_USER_SETTINGS_MISSING_BODY_DETAIL: &str =
     "Antigravity setUserSettings request body is required";
 const ANTIGRAVITY_USER_SETTINGS_INVALID_JSON_DETAIL: &str =
@@ -105,6 +112,15 @@ pub(crate) fn ai_public_local_requires_buffered_body(
                 && ((decision.route_family.as_deref() == Some("claude")
                     && decision.route_kind.as_deref() == Some("count_tokens"))
                     || (decision.route_family.as_deref() == Some("openai")
+                        && matches!(
+                            decision.route_kind.as_deref(),
+                            Some("chat") | Some("responses") | Some("responses:compact")
+                        )
+                        && matches!(
+                            request_context.request_path.as_str(),
+                            "/v1/chat/completions" | "/v1/responses" | "/v1/responses/compact"
+                        ))
+                    || (decision.route_family.as_deref() == Some("openai")
                         && decision.route_kind.as_deref() == Some("embedding")
                         && request_context.request_path == "/v1/embeddings")
                     || (decision.route_family.as_deref() == Some("openai")
@@ -118,7 +134,9 @@ pub(crate) fn ai_public_local_requires_buffered_body(
 pub(crate) async fn maybe_build_local_ai_public_response(
     state: &AppState,
     request_context: &GatewayPublicRequestContext,
+    request_headers: Option<&HeaderMap>,
     request_body: Option<&Bytes>,
+    started_at: Option<&Instant>,
 ) -> Option<Response<Body>> {
     if let Some(response) = maybe_build_local_ai_public_route_guard_response(request_context) {
         return Some(response);
@@ -131,6 +149,18 @@ pub(crate) async fn maybe_build_local_ai_public_response(
 
     if let Some(response) =
         maybe_build_local_openai_request_validation_response(request_context, request_body)
+    {
+        return Some(response);
+    }
+
+    if let Some(response) = maybe_build_local_openai_probe_response(
+        state,
+        request_context,
+        request_headers,
+        request_body,
+        started_at,
+    )
+    .await
     {
         return Some(response);
     }
@@ -865,6 +895,984 @@ fn maybe_build_local_ai_public_route_guard_response(
     None
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalProbeKind {
+    Arithmetic,
+    Ping,
+    Health,
+}
+
+impl LocalProbeKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Arithmetic => "arithmetic",
+            Self::Ping => "ping",
+            Self::Health => "health",
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct LocalProbeAnswer {
+    text: String,
+    kind: LocalProbeKind,
+}
+
+async fn maybe_build_local_openai_probe_response(
+    state: &AppState,
+    request_context: &GatewayPublicRequestContext,
+    request_headers: Option<&HeaderMap>,
+    request_body: Option<&Bytes>,
+    started_at: Option<&Instant>,
+) -> Option<Response<Body>> {
+    let decision = request_context.control_decision.as_ref()?;
+    if decision.route_family.as_deref() != Some("openai")
+        || request_context.request_method != http::Method::POST
+    {
+        return None;
+    }
+
+    let request_body = request_body?;
+    let payload = serde_json::from_slice::<Value>(request_body).ok()?;
+    let probe = match (
+        decision.route_kind.as_deref(),
+        request_context.request_path.as_str(),
+    ) {
+        (
+            Some("responses") | Some("responses:compact"),
+            "/v1/responses" | "/v1/responses/compact",
+        ) => OpenAiLocalProbeRequest::Responses(openai_responses_local_probe_answer(&payload)?),
+        (Some("chat"), "/v1/chat/completions") => {
+            OpenAiLocalProbeRequest::Chat(openai_chat_local_probe_answer(&payload)?)
+        }
+        _ => return None,
+    };
+    let model = payload
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("local-probe");
+    let stream = payload
+        .get("stream")
+        .and_then(value_as_bool)
+        .unwrap_or(false);
+    let answer = probe.answer();
+    record_local_openai_probe_usage(
+        state,
+        request_context,
+        request_headers,
+        Some(request_body),
+        started_at,
+        model,
+        &answer,
+        stream,
+    )
+    .await;
+    Some(match probe {
+        OpenAiLocalProbeRequest::Responses(answer) => build_openai_responses_local_probe_response(
+            request_context,
+            model,
+            &answer.text,
+            answer.kind,
+            stream,
+        ),
+        OpenAiLocalProbeRequest::Chat(answer) => build_openai_chat_local_probe_response(
+            request_context,
+            model,
+            &answer.text,
+            answer.kind,
+            stream,
+        ),
+    })
+}
+
+fn openai_responses_local_probe_answer(payload: &Value) -> Option<LocalProbeAnswer> {
+    let text = extract_openai_responses_last_user_text(payload)?;
+    local_probe_answer_from_text(&text)
+}
+
+fn openai_chat_local_probe_answer(payload: &Value) -> Option<LocalProbeAnswer> {
+    let text = extract_openai_chat_last_user_text(payload)?;
+    local_probe_answer_from_text(&text)
+}
+
+#[derive(Debug)]
+enum OpenAiLocalProbeRequest {
+    Responses(LocalProbeAnswer),
+    Chat(LocalProbeAnswer),
+}
+
+impl OpenAiLocalProbeRequest {
+    fn answer(&self) -> LocalProbeAnswer {
+        match self {
+            Self::Responses(answer) | Self::Chat(answer) => LocalProbeAnswer {
+                text: answer.text.clone(),
+                kind: answer.kind,
+            },
+        }
+    }
+}
+
+fn extract_openai_responses_last_user_text(payload: &Value) -> Option<String> {
+    let input = payload.get("input")?;
+    match input {
+        Value::String(text) => non_empty_trimmed(text),
+        Value::Array(items) => items
+            .iter()
+            .rev()
+            .find_map(openai_responses_input_item_user_text),
+        _ => None,
+    }
+}
+
+fn openai_responses_input_item_user_text(item: &Value) -> Option<String> {
+    match item {
+        Value::String(text) => non_empty_trimmed(text),
+        Value::Object(object) => {
+            if object
+                .get("role")
+                .and_then(Value::as_str)
+                .is_some_and(|role| !role.eq_ignore_ascii_case("user"))
+            {
+                return None;
+            }
+            openai_responses_content_text(object.get("content"))
+                .or_else(|| openai_responses_content_text(object.get("text")))
+        }
+        _ => None,
+    }
+}
+
+fn openai_responses_content_text(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    match value {
+        Value::String(text) => non_empty_trimmed(text),
+        Value::Array(items) => {
+            let text = items
+                .iter()
+                .filter_map(openai_responses_content_part_text)
+                .collect::<Vec<_>>()
+                .join(" ");
+            non_empty_trimmed(&text)
+        }
+        Value::Object(_) => openai_responses_content_part_text(value),
+        _ => None,
+    }
+}
+
+fn openai_responses_content_part_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => non_empty_trimmed(text),
+        Value::Object(object) => object
+            .get("text")
+            .or_else(|| object.get("content"))
+            .and_then(Value::as_str)
+            .and_then(non_empty_trimmed),
+        _ => None,
+    }
+}
+
+fn extract_openai_chat_last_user_text(payload: &Value) -> Option<String> {
+    let messages = payload.get("messages")?.as_array()?;
+    messages
+        .iter()
+        .rev()
+        .find_map(openai_chat_message_user_text)
+}
+
+fn openai_chat_message_user_text(message: &Value) -> Option<String> {
+    let object = message.as_object()?;
+    if object
+        .get("role")
+        .and_then(Value::as_str)
+        .is_some_and(|role| !role.eq_ignore_ascii_case("user"))
+    {
+        return None;
+    }
+    openai_chat_content_text(object.get("content"))
+}
+
+fn openai_chat_content_text(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    match value {
+        Value::String(text) => non_empty_trimmed(text),
+        Value::Array(items) => {
+            let text = items
+                .iter()
+                .filter_map(openai_chat_content_part_text)
+                .collect::<Vec<_>>()
+                .join(" ");
+            non_empty_trimmed(&text)
+        }
+        Value::Object(_) => openai_chat_content_part_text(value),
+        _ => None,
+    }
+}
+
+fn openai_chat_content_part_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => non_empty_trimmed(text),
+        Value::Object(object) => object
+            .get("text")
+            .or_else(|| object.get("content"))
+            .and_then(Value::as_str)
+            .and_then(non_empty_trimmed),
+        _ => None,
+    }
+}
+
+fn local_probe_answer_from_text(text: &str) -> Option<LocalProbeAnswer> {
+    if let Some(text) = arithmetic_probe_answer(text) {
+        return Some(LocalProbeAnswer {
+            text,
+            kind: LocalProbeKind::Arithmetic,
+        });
+    }
+    if ping_probe_wants_pong(text) {
+        return Some(LocalProbeAnswer {
+            text: LOCAL_PROBE_NOTICE_TEXT.to_string(),
+            kind: LocalProbeKind::Ping,
+        });
+    }
+    if health_probe_wants_ok(text) {
+        return Some(LocalProbeAnswer {
+            text: LOCAL_PROBE_NOTICE_TEXT.to_string(),
+            kind: LocalProbeKind::Health,
+        });
+    }
+    None
+}
+
+fn arithmetic_probe_answer(text: &str) -> Option<String> {
+    let normalized = normalize_probe_text(text);
+    let lower = normalized.to_ascii_lowercase();
+    if !lower.starts_with("calculate and respond with only the number")
+        || !lower.contains("nothing else")
+    {
+        return None;
+    }
+    let q_count = lower.match_indices("q:").count();
+    if q_count < 2 {
+        return None;
+    }
+    let question_start = lower.rfind("q:")? + 2;
+    let answer_marker = lower[question_start..].rfind("a:")? + question_start;
+    if !normalized[answer_marker + 2..].trim().is_empty() {
+        return None;
+    }
+    let expression = normalized[question_start..answer_marker].trim();
+    evaluate_simple_integer_expression(expression).map(|value| value.to_string())
+}
+
+fn ping_probe_wants_pong(text: &str) -> bool {
+    let normalized = normalize_probe_text(text);
+    let lower = normalized.to_ascii_lowercase();
+    let compact = compact_probe_text(&lower);
+    if matches!(
+        compact.as_str(),
+        "ping" | "ping?" | "replypong" | "respondpong"
+    ) {
+        return true;
+    }
+    if is_short_probe_text(&normalized) {
+        return matches!(
+            compact.as_str(),
+            "pingpong"
+                | "pingtest"
+                | "ping测试"
+                | "测活ping"
+                | "测试ping"
+                | "请回复pong"
+                | "只回复pong"
+                | "仅回复pong"
+                | "回复pong"
+                | "返回pong"
+                | "respondwithpong"
+                | "replywithpong"
+                | "saypong"
+                | "justpong"
+                | "onlypong"
+        ) || (lower.contains("pong") && contains_reply_only_directive(&lower));
+    }
+    (contains_reply_only_directive(&lower) || contains_probe_word(&lower))
+        && lower.contains("pong")
+        && lower.contains("ping")
+}
+
+fn health_probe_wants_ok(text: &str) -> bool {
+    let normalized = normalize_probe_text(text);
+    let lower = normalized.to_ascii_lowercase();
+    let compact = compact_probe_text(&lower);
+    if is_short_probe_text(&normalized)
+        && matches!(
+            compact.as_str(),
+            "test"
+                | "test?"
+                | "hello"
+                | "hi"
+                | "hi?"
+                | "ok?"
+                | "ok"
+                | "replyok"
+                | "replywithok"
+                | "respondok"
+                | "respondwithok"
+                | "returnok"
+                | "onlyok"
+                | "justok"
+                | "你好"
+                | "您好"
+                | "你是谁"
+                | "你是谁?"
+                | "你是谁？"
+                | "测试"
+                | "测活"
+                | "回复ok"
+                | "返回ok"
+                | "只回复ok"
+                | "仅回复ok"
+                | "只返回ok"
+                | "仅返回ok"
+                | "联通测试"
+                | "连接测试"
+                | "接口测试"
+                | "健康检查"
+                | "healthcheck"
+                | "health"
+                | "alive?"
+                | "online?"
+                | "areyoualive?"
+                | "areyouonline?"
+                | "areyouworking?"
+                | "whoareyou"
+                | "whoareyou?"
+                | "whoareu"
+                | "whoareu?"
+                | "connectiontest"
+                | "connectivitytest"
+        )
+    {
+        return true;
+    }
+    contains_probe_word(&lower)
+        && (contains_reply_only_directive(&lower)
+            || lower.contains("are you alive")
+            || lower.contains("are you online")
+            || lower.contains("are you working")
+            || lower.contains("health check")
+            || lower.contains("connection test")
+            || lower.contains("connectivity test")
+            || lower.contains("测活")
+            || lower.contains("测试连接")
+            || lower.contains("连接测试")
+            || lower.contains("接口测试"))
+}
+
+fn contains_probe_word(lower: &str) -> bool {
+    lower.contains("ping")
+        || lower.contains("pong")
+        || lower.contains("health")
+        || lower.contains("alive")
+        || lower.contains("online")
+        || lower.contains("connect")
+        || lower.contains("test")
+        || lower.contains("测活")
+        || lower.contains("测试")
+        || lower.contains("联通")
+}
+
+fn contains_reply_only_directive(lower: &str) -> bool {
+    lower.contains("only")
+        || lower.contains("nothing else")
+        || lower.contains("respond with")
+        || lower.contains("reply with")
+        || lower.contains("return")
+        || lower.contains("say")
+        || lower.contains("只回复")
+        || lower.contains("仅回复")
+        || lower.contains("只返回")
+        || lower.contains("仅返回")
+        || lower.contains("回复")
+        || lower.contains("返回")
+}
+
+fn is_short_probe_text(text: &str) -> bool {
+    text.chars().count() <= 48
+}
+
+fn compact_probe_text(text: &str) -> String {
+    text.chars()
+        .filter(|ch| !ch.is_whitespace() && !matches!(ch, '.' | ',' | '!' | ':' | ';' | '"' | '\''))
+        .collect()
+}
+
+fn evaluate_simple_integer_expression(expression: &str) -> Option<i64> {
+    let expression = expression
+        .trim()
+        .trim_end_matches('?')
+        .trim()
+        .trim_end_matches('=')
+        .trim();
+    let (op_index, operator) = expression.char_indices().find_map(|(index, ch)| {
+        matches!(ch, '+' | '-' | '*' | 'x' | 'X' | '×' | '/' | '÷').then_some((index, ch))
+    })?;
+    let left = expression[..op_index].trim().parse::<i64>().ok()?;
+    let right_start = op_index + operator.len_utf8();
+    let right = expression[right_start..].trim().parse::<i64>().ok()?;
+    match operator {
+        '+' => left.checked_add(right),
+        '-' => left.checked_sub(right),
+        '*' | 'x' | 'X' | '×' => left.checked_mul(right),
+        '/' | '÷' if right != 0 && left % right == 0 => Some(left / right),
+        _ => None,
+    }
+}
+
+fn normalize_probe_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn non_empty_trimmed(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn build_openai_responses_local_probe_response(
+    request_context: &GatewayPublicRequestContext,
+    model: &str,
+    text: &str,
+    kind: LocalProbeKind,
+    stream: bool,
+) -> Response<Body> {
+    let response_id = local_probe_response_id(&request_context.trace_id);
+    let created_at = chrono::Utc::now().timestamp().max(0);
+    let response = openai_responses_local_probe_payload(&response_id, model, text, created_at);
+    if stream {
+        let body = openai_responses_local_probe_sse_body(&response);
+        return Response::builder()
+            .status(http::StatusCode::OK)
+            .header(http::header::CONTENT_TYPE, "text/event-stream")
+            .header(http::header::CACHE_CONTROL, "no-cache, no-transform")
+            .header("x-accel-buffering", "no")
+            .header(LOCAL_PROBE_RESPONSE_HEADER, kind.as_str())
+            .body(Body::from(body))
+            .expect("local probe stream response should build");
+    }
+
+    Response::builder()
+        .status(http::StatusCode::OK)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .header(LOCAL_PROBE_RESPONSE_HEADER, kind.as_str())
+        .body(Body::from(
+            serde_json::to_vec(&response).expect("local probe JSON should serialize"),
+        ))
+        .expect("local probe JSON response should build")
+}
+
+fn build_openai_chat_local_probe_response(
+    request_context: &GatewayPublicRequestContext,
+    model: &str,
+    text: &str,
+    kind: LocalProbeKind,
+    stream: bool,
+) -> Response<Body> {
+    let response_id = local_probe_chat_response_id(&request_context.trace_id);
+    let created_at = chrono::Utc::now().timestamp().max(0);
+    if stream {
+        let body = openai_chat_local_probe_sse_body(&response_id, model, text, created_at);
+        return Response::builder()
+            .status(http::StatusCode::OK)
+            .header(http::header::CONTENT_TYPE, "text/event-stream")
+            .header(http::header::CACHE_CONTROL, "no-cache, no-transform")
+            .header("x-accel-buffering", "no")
+            .header(LOCAL_PROBE_RESPONSE_HEADER, kind.as_str())
+            .body(Body::from(body))
+            .expect("local chat probe stream response should build");
+    }
+
+    let response = openai_chat_local_probe_payload(&response_id, model, text, created_at);
+    Response::builder()
+        .status(http::StatusCode::OK)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .header(LOCAL_PROBE_RESPONSE_HEADER, kind.as_str())
+        .body(Body::from(
+            serde_json::to_vec(&response).expect("local chat probe JSON should serialize"),
+        ))
+        .expect("local chat probe JSON response should build")
+}
+
+fn openai_chat_local_probe_payload(
+    response_id: &str,
+    model: &str,
+    text: &str,
+    created_at: i64,
+) -> Value {
+    json!({
+        "id": response_id,
+        "object": "chat.completion",
+        "created": created_at,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": text
+            },
+            "finish_reason": "stop"
+        }],
+        "usage": {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0
+        }
+    })
+}
+
+fn openai_chat_local_probe_sse_body(
+    response_id: &str,
+    model: &str,
+    text: &str,
+    created_at: i64,
+) -> Vec<u8> {
+    let events = [
+        json!({
+            "id": response_id,
+            "object": "chat.completion.chunk",
+            "created": created_at,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": {"role": "assistant"},
+                "finish_reason": null
+            }]
+        }),
+        json!({
+            "id": response_id,
+            "object": "chat.completion.chunk",
+            "created": created_at,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": {"content": text},
+                "finish_reason": null
+            }]
+        }),
+        json!({
+            "id": response_id,
+            "object": "chat.completion.chunk",
+            "created": created_at,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": "stop"
+            }]
+        }),
+    ];
+
+    let mut body = String::new();
+    for event in events {
+        body.push_str("data: ");
+        body.push_str(
+            &serde_json::to_string(&event).expect("local chat probe event should serialize"),
+        );
+        body.push_str("\n\n");
+    }
+    body.push_str("data: [DONE]\n\n");
+    body.into_bytes()
+}
+
+fn openai_responses_local_probe_payload(
+    response_id: &str,
+    model: &str,
+    text: &str,
+    created_at: i64,
+) -> Value {
+    let message_id = format!("{response_id}_msg");
+    let message = json!({
+        "id": message_id,
+        "type": "message",
+        "status": "completed",
+        "role": "assistant",
+        "content": [{
+            "type": "output_text",
+            "text": text,
+            "annotations": []
+        }]
+    });
+    json!({
+        "id": response_id,
+        "object": "response",
+        "created_at": created_at,
+        "status": "completed",
+        "model": model,
+        "output": [message],
+        "output_text": text,
+        "usage": {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "input_tokens_details": {
+                "cached_tokens": 0
+            },
+            "output_tokens_details": {
+                "reasoning_tokens": 0
+            }
+        }
+    })
+}
+
+fn openai_responses_local_probe_sse_body(response: &Value) -> Vec<u8> {
+    let response_id = response
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("resp_local_probe");
+    let model = response
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("local-probe");
+    let created_at = response
+        .get("created_at")
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    let output = response
+        .get("output")
+        .and_then(Value::as_array)
+        .and_then(|items| items.first())
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let message_id = output
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("msg_local_probe");
+    let text = response
+        .get("output_text")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let content_part = json!({
+        "type": "output_text",
+        "text": text,
+        "annotations": []
+    });
+    let created = json!({
+        "type": "response.created",
+        "response": {
+            "id": response_id,
+            "object": "response",
+            "created_at": created_at,
+            "status": "in_progress",
+            "model": model,
+            "output": []
+        }
+    });
+    let events = [
+        ("response.created", created),
+        (
+            "response.output_item.added",
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "id": message_id,
+                    "type": "message",
+                    "status": "in_progress",
+                    "role": "assistant",
+                    "content": []
+                }
+            }),
+        ),
+        (
+            "response.content_part.added",
+            json!({
+                "type": "response.content_part.added",
+                "item_id": message_id,
+                "output_index": 0,
+                "content_index": 0,
+                "part": {
+                    "type": "output_text",
+                    "text": "",
+                    "annotations": []
+                }
+            }),
+        ),
+        (
+            "response.output_text.delta",
+            json!({
+                "type": "response.output_text.delta",
+                "item_id": message_id,
+                "output_index": 0,
+                "content_index": 0,
+                "delta": text
+            }),
+        ),
+        (
+            "response.output_text.done",
+            json!({
+                "type": "response.output_text.done",
+                "item_id": message_id,
+                "output_index": 0,
+                "content_index": 0,
+                "text": text
+            }),
+        ),
+        (
+            "response.content_part.done",
+            json!({
+                "type": "response.content_part.done",
+                "item_id": message_id,
+                "output_index": 0,
+                "content_index": 0,
+                "part": content_part
+            }),
+        ),
+        (
+            "response.output_item.done",
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": output
+            }),
+        ),
+        (
+            "response.completed",
+            json!({
+                "type": "response.completed",
+                "response": response
+            }),
+        ),
+    ];
+
+    let mut body = String::new();
+    for (event, data) in events {
+        body.push_str("event: ");
+        body.push_str(event);
+        body.push('\n');
+        body.push_str("data: ");
+        body.push_str(&serde_json::to_string(&data).expect("local probe event should serialize"));
+        body.push_str("\n\n");
+    }
+    body.push_str("data: [DONE]\n\n");
+    body.into_bytes()
+}
+
+async fn record_local_openai_probe_usage(
+    state: &AppState,
+    request_context: &GatewayPublicRequestContext,
+    request_headers: Option<&HeaderMap>,
+    request_body: Option<&Bytes>,
+    started_at: Option<&Instant>,
+    model: &str,
+    answer: &LocalProbeAnswer,
+    stream: bool,
+) {
+    if !state.usage_runtime.is_enabled() {
+        return;
+    }
+    let decision = request_context.control_decision.as_ref();
+    let auth_context = decision.and_then(|value| value.auth_context.as_ref());
+    let api_format = decision
+        .and_then(|value| value.auth_endpoint_signature.as_deref())
+        .or_else(
+            || match decision.and_then(|value| value.route_kind.as_deref()) {
+                Some("chat") => Some("openai:chat"),
+                Some("responses") => Some("openai:responses"),
+                Some("responses:compact") => Some("openai:responses:compact"),
+                _ => None,
+            },
+        )
+        .unwrap_or("openai");
+    let mut metadata = serde_json::Map::new();
+    metadata.insert(
+        "trace_id".to_string(),
+        Value::String(request_context.trace_id.clone()),
+    );
+    metadata.insert("is_ping".to_string(), Value::Bool(true));
+    metadata.insert(
+        "ping_kind".to_string(),
+        Value::String(answer.kind.as_str().to_string()),
+    );
+    metadata.insert(
+        "execution_path".to_string(),
+        Value::String(EXECUTION_PATH_LOCAL_AI_PUBLIC.to_string()),
+    );
+    if let Some(route_family) = decision.and_then(|value| value.route_family.as_deref()) {
+        metadata.insert(
+            "route_family".to_string(),
+            Value::String(route_family.to_string()),
+        );
+    }
+    if let Some(route_kind) = decision.and_then(|value| value.route_kind.as_deref()) {
+        metadata.insert(
+            "route_kind".to_string(),
+            Value::String(route_kind.to_string()),
+        );
+    }
+    metadata.insert(
+        "request_path".to_string(),
+        Value::String(request_context.request_path.clone()),
+    );
+    metadata.insert(
+        "request_path_and_query".to_string(),
+        Value::String(request_context.request_path_and_query()),
+    );
+    metadata.insert("client_requested_stream".to_string(), Value::Bool(stream));
+    metadata.insert(UPSTREAM_IS_STREAM_KEY.to_string(), Value::Bool(false));
+
+    let content_type = if stream {
+        "text/event-stream"
+    } else {
+        "application/json"
+    };
+    let response_headers = json!({
+        "content-type": content_type,
+        LOCAL_PROBE_RESPONSE_HEADER: answer.kind.as_str(),
+    });
+    let request_headers = request_headers.map(local_probe_request_headers_json);
+    let request_body = local_probe_request_body_json(request_body);
+    let data = UsageEventData {
+        user_id: auth_context.map(|value| value.user_id.clone()),
+        api_key_id: auth_context.map(|value| value.api_key_id.clone()),
+        username: auth_context.and_then(|value| value.username.clone()),
+        api_key_name: auth_context.and_then(|value| value.api_key_name.clone()),
+        provider_name: "local".to_string(),
+        model: model.to_string(),
+        request_type: Some("chat".to_string()),
+        api_format: Some(api_format.to_string()),
+        api_family: Some("openai".to_string()),
+        endpoint_kind: local_probe_endpoint_kind(api_format).map(ToOwned::to_owned),
+        endpoint_api_format: Some(api_format.to_string()),
+        provider_api_family: Some("openai".to_string()),
+        provider_endpoint_kind: local_probe_endpoint_kind(api_format).map(ToOwned::to_owned),
+        has_format_conversion: Some(false),
+        is_stream: Some(false),
+        input_tokens: Some(0),
+        output_tokens: Some(0),
+        total_tokens: Some(0),
+        total_cost_usd: Some(0.0),
+        actual_total_cost_usd: Some(0.0),
+        status_code: Some(http::StatusCode::OK.as_u16()),
+        response_time_ms: started_at.map(|value| value.elapsed().as_millis() as u64),
+        first_byte_time_ms: started_at.map(|value| value.elapsed().as_millis() as u64),
+        request_headers,
+        request_body,
+        response_headers: Some(response_headers.clone()),
+        client_response_headers: Some(response_headers),
+        client_response_body: Some(json!({
+            "local_probe": true,
+            "kind": answer.kind.as_str(),
+            "output_text": answer.text
+        })),
+        route_family: decision.and_then(|value| value.route_family.clone()),
+        route_kind: decision.and_then(|value| value.route_kind.clone()),
+        execution_path: Some(EXECUTION_PATH_LOCAL_AI_PUBLIC.to_string()),
+        request_metadata: Some(Value::Object(metadata)),
+        ..UsageEventData::default()
+    };
+
+    state
+        .usage_runtime
+        .record_terminal_event_direct(
+            state.data.as_ref(),
+            UsageEvent::new(
+                UsageEventType::Completed,
+                request_context.trace_id.clone(),
+                data,
+            ),
+        )
+        .await;
+}
+
+fn local_probe_endpoint_kind(api_format: &str) -> Option<&'static str> {
+    let normalized = api_format.trim().to_ascii_lowercase().replace('_', ":");
+    if normalized.contains("responses") {
+        Some("responses")
+    } else if normalized.contains("chat") || normalized == "openai" {
+        Some("chat")
+    } else {
+        None
+    }
+}
+
+fn local_probe_request_headers_json(headers: &HeaderMap) -> Value {
+    let mut headers = crate::headers::collect_control_headers(headers);
+    for (name, value) in headers.iter_mut() {
+        if local_probe_sensitive_header(name) {
+            *value = local_probe_mask_header_value(value);
+        }
+    }
+    serde_json::to_value(headers).unwrap_or_else(|err| {
+        warn!(
+            error = %err,
+            "gateway failed to serialize local probe request headers"
+        );
+        json!({})
+    })
+}
+
+fn local_probe_request_body_json(body: Option<&Bytes>) -> Option<Value> {
+    let body = body?;
+    if body.is_empty() {
+        return Some(json!({}));
+    }
+    serde_json::from_slice::<Value>(body.as_ref()).ok()
+}
+
+fn local_probe_sensitive_header(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "authorization"
+            | "x-api-key"
+            | "api-key"
+            | "x-goog-api-key"
+            | "cookie"
+            | "set-cookie"
+            | "proxy-authorization"
+    )
+}
+
+fn local_probe_mask_header_value(value: &str) -> String {
+    if value.len() <= 8 {
+        return "****".to_string();
+    }
+    let prefix = value.chars().take(4).collect::<String>();
+    let suffix = value
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    format!("{prefix}****{suffix}")
+}
+
+fn local_probe_response_id(trace_id: &str) -> String {
+    let suffix = trace_id
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .take(32)
+        .collect::<String>();
+    if suffix.is_empty() {
+        "resp_local_probe".to_string()
+    } else {
+        format!("resp_local_probe_{suffix}")
+    }
+}
+
+fn local_probe_chat_response_id(trace_id: &str) -> String {
+    let suffix = trace_id
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .take(32)
+        .collect::<String>();
+    if suffix.is_empty() {
+        "chatcmpl_local_probe".to_string()
+    } else {
+        format!("chatcmpl_local_probe_{suffix}")
+    }
+}
+
 fn maybe_build_local_claude_count_tokens_response(
     request_context: &GatewayPublicRequestContext,
     request_body: Option<&Bytes>,
@@ -1538,8 +2546,11 @@ fn estimate_text_tokens(text: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        estimate_claude_count_tokens, parse_openai_image_validation_input, validate_openai_image_n,
-        OpenAiImageOperation,
+        arithmetic_probe_answer, estimate_claude_count_tokens, local_probe_chat_response_id,
+        local_probe_response_id, openai_chat_local_probe_answer, openai_chat_local_probe_sse_body,
+        openai_responses_local_probe_answer, openai_responses_local_probe_payload,
+        openai_responses_local_probe_sse_body, parse_openai_image_validation_input,
+        validate_openai_image_n, LocalProbeKind, OpenAiImageOperation,
     };
     use axum::body::Bytes;
     use serde_json::json;
@@ -1575,6 +2586,186 @@ mod tests {
         });
 
         assert_eq!(estimate_claude_count_tokens(&payload), Err(()));
+    }
+
+    #[test]
+    fn arithmetic_probe_answer_solves_final_question_only() {
+        let prompt = concat!(
+            "Calculate and respond with ONLY the number, nothing else. ",
+            "Q: 3 + 5 = ? A: 8 ",
+            "Q: 12 - 7 = ? A: 5 ",
+            "Q: 17 + 4 = ? A:"
+        );
+
+        assert_eq!(arithmetic_probe_answer(prompt).as_deref(), Some("21"));
+    }
+
+    #[test]
+    fn arithmetic_probe_answer_ignores_ordinary_math_requests() {
+        assert_eq!(arithmetic_probe_answer("what is 17 + 4?"), None);
+        assert_eq!(
+            arithmetic_probe_answer(
+                "Calculate and respond with ONLY the number, nothing else. Q: 17 + 4 = ? A:"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn openai_responses_local_probe_answer_reads_responses_message_input() {
+        let payload = json!({
+            "model": "gpt-5.4-mini",
+            "stream": true,
+            "instructions": "You are GPT.",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": concat!(
+                        "Calculate and respond with ONLY the number, nothing else. ",
+                        "Q: 3 + 5 = ? A: 8 ",
+                        "Q: 12 - 7 = ? A: 5 ",
+                        "Q: 17 + 4 = ? A:"
+                    )
+                }]
+            }]
+        });
+
+        assert_eq!(
+            openai_responses_local_probe_answer(&payload),
+            Some(super::LocalProbeAnswer {
+                text: "21".to_string(),
+                kind: LocalProbeKind::Arithmetic,
+            })
+        );
+    }
+
+    #[test]
+    fn openai_responses_local_probe_answer_reads_string_input() {
+        let payload = json!({
+            "model": "gpt-5.4-mini",
+            "input": concat!(
+                "Calculate and respond with ONLY the number, nothing else. ",
+                "Q: 2 * 3 = ? A: 6 ",
+                "Q: 8 / 4 = ? A: 2 ",
+                "Q: 9 - 5 = ? A:"
+            )
+        });
+
+        assert_eq!(
+            openai_responses_local_probe_answer(&payload),
+            Some(super::LocalProbeAnswer {
+                text: "4".to_string(),
+                kind: LocalProbeKind::Arithmetic,
+            })
+        );
+    }
+
+    #[test]
+    fn local_probe_answer_handles_pong_and_health_prompts() {
+        assert_eq!(
+            super::local_probe_answer_from_text("ping"),
+            Some(super::LocalProbeAnswer {
+                text: super::LOCAL_PROBE_NOTICE_TEXT.to_string(),
+                kind: LocalProbeKind::Ping,
+            })
+        );
+        assert_eq!(
+            super::local_probe_answer_from_text("Are you alive?"),
+            Some(super::LocalProbeAnswer {
+                text: super::LOCAL_PROBE_NOTICE_TEXT.to_string(),
+                kind: LocalProbeKind::Health,
+            })
+        );
+        assert_eq!(
+            super::local_probe_answer_from_text("只回复 pong"),
+            Some(super::LocalProbeAnswer {
+                text: super::LOCAL_PROBE_NOTICE_TEXT.to_string(),
+                kind: LocalProbeKind::Ping,
+            })
+        );
+        assert_eq!(
+            super::local_probe_answer_from_text("你是谁"),
+            Some(super::LocalProbeAnswer {
+                text: super::LOCAL_PROBE_NOTICE_TEXT.to_string(),
+                kind: LocalProbeKind::Health,
+            })
+        );
+        assert_eq!(
+            super::local_probe_answer_from_text("who are you"),
+            Some(super::LocalProbeAnswer {
+                text: super::LOCAL_PROBE_NOTICE_TEXT.to_string(),
+                kind: LocalProbeKind::Health,
+            })
+        );
+        assert_eq!(
+            super::local_probe_answer_from_text("who are u"),
+            Some(super::LocalProbeAnswer {
+                text: super::LOCAL_PROBE_NOTICE_TEXT.to_string(),
+                kind: LocalProbeKind::Health,
+            })
+        );
+    }
+
+    #[test]
+    fn openai_chat_local_probe_answer_reads_chat_message_input() {
+        let payload = json!({
+            "model": "gpt-5.4-mini",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": "ping"
+                }]
+            }]
+        });
+
+        assert_eq!(
+            openai_chat_local_probe_answer(&payload),
+            Some(super::LocalProbeAnswer {
+                text: super::LOCAL_PROBE_NOTICE_TEXT.to_string(),
+                kind: LocalProbeKind::Ping,
+            })
+        );
+    }
+
+    #[test]
+    fn local_probe_sse_contains_completed_response() {
+        let response = openai_responses_local_probe_payload("resp_probe", "gpt-5.4-mini", "21", 1);
+        let body = String::from_utf8(openai_responses_local_probe_sse_body(&response))
+            .expect("sse body should be utf-8");
+
+        assert!(body.contains("event: response.completed"));
+        assert!(body.contains("\"output_text\":\"21\""));
+        assert!(body.ends_with("data: [DONE]\n\n"));
+    }
+
+    #[test]
+    fn local_chat_probe_sse_contains_completion_chunk() {
+        let body = String::from_utf8(openai_chat_local_probe_sse_body(
+            "chatcmpl_probe",
+            "gpt-5.4-mini",
+            super::LOCAL_PROBE_NOTICE_TEXT,
+            1,
+        ))
+        .expect("sse body should be utf-8");
+
+        assert!(body.contains("\"object\":\"chat.completion.chunk\""));
+        assert!(body.contains(super::LOCAL_PROBE_NOTICE_TEXT));
+        assert!(body.ends_with("data: [DONE]\n\n"));
+    }
+
+    #[test]
+    fn local_probe_response_id_uses_trace_suffix() {
+        assert_eq!(
+            local_probe_response_id("24d30b78-08eb-433b-b140-20b2667e6a5f"),
+            "resp_local_probe_24d30b7808eb433bb14020b2667e6a5f"
+        );
+        assert_eq!(
+            local_probe_chat_response_id("24d30b78-08eb-433b-b140-20b2667e6a5f"),
+            "chatcmpl_local_probe_24d30b7808eb433bb14020b2667e6a5f"
+        );
     }
 
     #[test]

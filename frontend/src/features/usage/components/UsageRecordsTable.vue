@@ -167,6 +167,9 @@
             <SelectItem value="risk_control">
               风控
             </SelectItem>
+            <SelectItem value="ping">
+              ping
+            </SelectItem>
             <SelectItem value="cancelled">
               已取消
             </SelectItem>
@@ -1359,6 +1362,7 @@ const statusFilterOptions: FilterOption[] = [
   { value: 'active', label: '活跃' },
   { value: 'failed', label: '失败' },
   { value: 'risk_control', label: '风控' },
+  { value: 'ping', label: 'ping' },
   { value: 'cancelled', label: '已取消' },
   { value: 'has_retry', label: '发生重试' },
   { value: 'has_fallback', label: '发生转移' },

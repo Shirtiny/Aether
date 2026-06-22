@@ -117,6 +117,7 @@ SELECT
       OR NULLIF(BTRIM("usage".request_metadata->>'request_path'), '') IS NOT NULL
       OR NULLIF(BTRIM("usage".request_metadata->>'request_path_and_query'), '') IS NOT NULL
       OR ("usage".request_metadata->>'is_risk_control') IN ('true', 'false')
+      OR ("usage".request_metadata->>'is_ping') IN ('true', 'false')
       OR CASE
         WHEN jsonb_typeof("usage".provider_request_body::jsonb) = 'object' THEN COALESCE(
           NULLIF(BTRIM("usage".provider_request_body->>'reasoning_effort'), ''),
@@ -148,6 +149,12 @@ SELECT
         CASE
           WHEN ("usage".request_metadata->>'is_risk_control') IN ('true', 'false')
             THEN ("usage".request_metadata->>'is_risk_control')::boolean
+          ELSE NULL
+        END,
+        'is_ping',
+        CASE
+          WHEN ("usage".request_metadata->>'is_ping') IN ('true', 'false')
+            THEN ("usage".request_metadata->>'is_ping')::boolean
           ELSE NULL
         END,
         'provider_reasoning_effort',

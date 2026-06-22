@@ -7,9 +7,9 @@ use crate::GatewayError;
 use aether_admin::observability::usage::{
     admin_usage_bad_request_response, admin_usage_client_family,
     admin_usage_data_unavailable_response, admin_usage_has_fallback, admin_usage_is_failed,
-    admin_usage_is_risk_control, admin_usage_matches_search, admin_usage_matches_username,
-    admin_usage_parse_ids, admin_usage_parse_limit, admin_usage_parse_offset,
-    admin_usage_provider_key_name, admin_usage_record_json,
+    admin_usage_is_ping, admin_usage_is_risk_control, admin_usage_matches_search,
+    admin_usage_matches_username, admin_usage_parse_ids, admin_usage_parse_limit,
+    admin_usage_parse_offset, admin_usage_provider_key_name, admin_usage_record_json,
     build_admin_usage_active_requests_response, build_admin_usage_records_response,
     build_admin_usage_summary_stats_response_from_summary, ADMIN_USAGE_DATA_UNAVAILABLE_DETAIL,
 };
@@ -61,6 +61,7 @@ fn apply_admin_usage_status_filter(query: &mut UsageAuditListQuery, status: Opti
         "stream" => query.is_stream = Some(true),
         "standard" => query.is_stream = Some(false),
         "risk_control" => query.risk_control_only = true,
+        "ping" => query.ping_only = true,
         "error" | "failed" => query.error_only = true,
         "active" => {
             query.statuses = Some(vec!["pending".to_string(), "streaming".to_string()]);
@@ -262,6 +263,7 @@ fn admin_usage_matches_attempt_status(
         "has_fallback" => flags.has_fallback,
         "has_retry" => flags.has_retry,
         "risk_control" => admin_usage_is_risk_control(item),
+        "ping" => admin_usage_is_ping(item),
         _ => true,
     }
 }
@@ -491,6 +493,7 @@ fn build_admin_usage_keyword_search_query(
         is_stream: base_query.is_stream,
         error_only: base_query.error_only,
         risk_control_only: base_query.risk_control_only,
+        ping_only: base_query.ping_only,
         keywords,
         matched_user_ids_by_keyword: search_context.matched_user_ids_by_keyword,
         auth_user_reader_available,

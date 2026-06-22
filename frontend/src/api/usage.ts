@@ -29,6 +29,7 @@ export interface UsageRecord {
   created_at: string
   has_fallback?: boolean // 🆕 是否发生了 fallback
   is_risk_control?: boolean
+  is_ping?: boolean
   client_family?: string | null
   client_ip?: string | null
   user_agent?: string | null
@@ -472,7 +473,7 @@ export const usageApi = {
     model?: string
     provider?: string
     api_format?: string  // API 格式筛选（如 openai:chat, claude:messages）
-    status?: string // 'stream' | 'standard' | 'error' | 'risk_control'
+    status?: string // 'stream' | 'standard' | 'error' | 'risk_control' | 'ping'
     hide_unknown?: boolean
     limit?: number
     offset?: number

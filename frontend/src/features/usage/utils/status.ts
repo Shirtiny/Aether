@@ -8,6 +8,7 @@ type UsageFailureSignal = {
   status_code?: number | null
   error_message?: string | null
   is_risk_control?: boolean | null
+  is_ping?: boolean | null
   image_progress?: {
     phase?: string | null
   } | null
@@ -52,6 +53,10 @@ export function hasUsageRetry(
 
 export function isUsageRecordRiskControl(record: UsageFailureSignal): boolean {
   return record.is_risk_control === true
+}
+
+export function isUsageRecordPing(record: UsageFailureSignal): boolean {
+  return record.is_ping === true
 }
 
 export function resolveUsageStreamModes(

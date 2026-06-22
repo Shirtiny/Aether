@@ -158,6 +158,8 @@ fn copy_allowed_metadata_fields(source: &Map<String, Value>, target: &mut Map<St
     copy_bool(source, target, "client_requested_stream");
     copy_bool(source, target, UPSTREAM_IS_STREAM_KEY);
     copy_bool(source, target, "is_risk_control");
+    copy_bool(source, target, "is_ping");
+    copy_non_empty_string(source, target, "ping_kind");
     copy_non_null_value(source, target, "client_session_affinity");
     copy_bool(source, target, "api_key_is_standalone");
     copy_non_empty_string(source, target, "request_path");
@@ -204,6 +206,8 @@ fn move_allowed_metadata_fields(mut source: Map<String, Value>, target: &mut Map
     remove_bool(&mut source, target, "client_requested_stream");
     remove_bool(&mut source, target, UPSTREAM_IS_STREAM_KEY);
     remove_bool(&mut source, target, "is_risk_control");
+    remove_bool(&mut source, target, "is_ping");
+    remove_non_empty_string(&mut source, target, "ping_kind");
     remove_non_null_value(&mut source, target, "client_session_affinity");
     remove_bool(&mut source, target, "api_key_is_standalone");
     remove_non_empty_string(&mut source, target, "request_path");

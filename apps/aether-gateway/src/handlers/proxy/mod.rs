@@ -1517,7 +1517,9 @@ pub(crate) async fn proxy_request(
     if let Some(response) = super::public::maybe_build_local_ai_public_response(
         &state,
         &request_context,
+        Some(&parts.headers),
         buffered_body.as_ref(),
+        Some(&started_at),
     )
     .await
     {

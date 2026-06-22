@@ -259,6 +259,15 @@ pub fn admin_usage_is_risk_control(item: &StoredRequestUsageAudit) -> bool {
         == Some(true)
 }
 
+pub fn admin_usage_is_ping(item: &StoredRequestUsageAudit) -> bool {
+    item.request_metadata
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|metadata| metadata.get("is_ping"))
+        .and_then(Value::as_bool)
+        == Some(true)
+}
+
 pub fn admin_usage_has_fallback(item: &StoredRequestUsageAudit) -> bool {
     item.has_fallback()
 }
@@ -278,6 +287,7 @@ pub fn admin_usage_matches_status(item: &StoredRequestUsageAudit, status: Option
         "pending" | "streaming" | "completed" | "cancelled" => item.status == status,
         "failed" => admin_usage_is_failed(item),
         "risk_control" => admin_usage_is_risk_control(item),
+        "ping" => admin_usage_is_ping(item),
         "active" => matches!(item.status.as_str(), "pending" | "streaming"),
         "has_fallback" => admin_usage_has_fallback(item),
         _ => true,
@@ -1309,6 +1319,7 @@ pub fn admin_usage_record_json(
         "error_message": item.error_message,
         "status": item.status,
         "is_risk_control": admin_usage_is_risk_control(item),
+        "is_ping": admin_usage_is_ping(item),
         "has_fallback": admin_usage_has_fallback(item),
         "has_retry": false,
         "has_rectified": false,
@@ -2530,9 +2541,9 @@ mod tests {
 
     use super::{
         admin_usage_active_request_json, admin_usage_client_is_stream, admin_usage_has_body_value,
-        admin_usage_has_fallback, admin_usage_is_failed, admin_usage_is_risk_control,
-        admin_usage_is_success, admin_usage_matches_search, admin_usage_matches_status,
-        admin_usage_matches_username, admin_usage_record_json,
+        admin_usage_has_fallback, admin_usage_is_failed, admin_usage_is_ping,
+        admin_usage_is_risk_control, admin_usage_is_success, admin_usage_matches_search,
+        admin_usage_matches_status, admin_usage_matches_username, admin_usage_record_json,
         admin_usage_resolve_request_capture_body, admin_usage_total_tokens,
         admin_usage_upstream_is_stream, build_admin_usage_detail_payload,
     };
@@ -2607,6 +2618,19 @@ mod tests {
 
         assert!(admin_usage_is_risk_control(&item));
         assert!(admin_usage_matches_status(&item, Some("risk_control")));
+    }
+
+    #[test]
+    fn ping_status_matches_request_metadata_flag() {
+        let item = StoredRequestUsageAudit {
+            request_metadata: Some(json!({
+                "is_ping": true
+            })),
+            ..sample_usage("completed", Some(200), None)
+        };
+
+        assert!(admin_usage_is_ping(&item));
+        assert!(admin_usage_matches_status(&item, Some("ping")));
     }
 
     #[test]

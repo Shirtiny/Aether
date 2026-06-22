@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use aether_admin::observability::usage::admin_usage_is_risk_control;
+use aether_admin::observability::usage::{admin_usage_is_ping, admin_usage_is_risk_control};
 use aether_ai_serving::UPSTREAM_IS_STREAM_KEY;
 use aether_billing::{
     normalize_input_tokens_for_billing, normalize_total_input_context_for_cache_hit_rate,
@@ -487,6 +487,7 @@ fn build_users_me_usage_record_payload(
         "status_code": item.status_code,
         "error_message": item.error_message,
         "is_risk_control": admin_usage_is_risk_control(item),
+        "is_ping": admin_usage_is_ping(item),
         "input_price_per_1m": input_price_per_1m,
         "output_price_per_1m": output_price_per_1m,
         "cache_creation_price_per_1m": cache_creation_price_per_1m,
@@ -536,6 +537,7 @@ fn build_users_me_usage_active_payload(item: &StoredRequestUsageAudit) -> serde_
         "status_code": item.status_code,
         "error_message": item.error_message,
         "is_risk_control": admin_usage_is_risk_control(item),
+        "is_ping": admin_usage_is_ping(item),
         "api_format": item.api_format,
         "endpoint_api_format": item.endpoint_api_format,
         "is_stream": item.is_stream,
@@ -932,6 +934,7 @@ pub(super) async fn handle_users_me_usage_get(
                 is_stream: None,
                 error_only: false,
                 risk_control_only: false,
+                ping_only: false,
                 keywords,
                 matched_user_ids_by_keyword: Vec::new(),
                 auth_user_reader_available: false,
@@ -986,6 +989,7 @@ pub(super) async fn handle_users_me_usage_get(
                     is_stream: None,
                     error_only: false,
                     risk_control_only: false,
+                    ping_only: false,
                     limit: None,
                     offset: None,
                     newest_first: true,
@@ -1013,6 +1017,7 @@ pub(super) async fn handle_users_me_usage_get(
                     is_stream: None,
                     error_only: false,
                     risk_control_only: false,
+                    ping_only: false,
                     limit: Some(limit),
                     offset: Some(offset),
                     newest_first: true,
@@ -1150,6 +1155,7 @@ pub(super) async fn handle_users_me_usage_active_get(
                 is_stream: None,
                 error_only: false,
                 risk_control_only: false,
+                ping_only: false,
                 limit: Some(50),
                 offset: None,
                 newest_first: true,

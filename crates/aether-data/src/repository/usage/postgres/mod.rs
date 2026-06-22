@@ -1243,6 +1243,12 @@ fn push_postgres_usage_risk_control_filter(
     builder.push(r#"("usage".request_metadata->>'is_risk_control') = 'true'"#);
 }
 
+fn push_postgres_usage_ping_filter(builder: &mut QueryBuilder<'_, Postgres>, has_where: &mut bool) {
+    builder.push(if *has_where { " AND " } else { " WHERE " });
+    *has_where = true;
+    builder.push(r#"("usage".request_metadata->>'is_ping') = 'true'"#);
+}
+
 fn decode_usage_time_series_bucket_row(
     row: &PgRow,
 ) -> Result<StoredUsageTimeSeriesBucket, DataLayerError> {
@@ -2645,6 +2651,9 @@ OR (\"usage\".error_message IS NOT NULL AND BTRIM(\"usage\".error_message) <> ''
         if query.risk_control_only {
             push_postgres_usage_risk_control_filter(&mut builder, &mut has_where);
         }
+        if query.ping_only {
+            push_postgres_usage_ping_filter(&mut builder, &mut has_where);
+        }
 
         if query.newest_first {
             builder.push(" ORDER BY \"usage\".created_at DESC, \"usage\".id ASC");
@@ -2744,6 +2753,9 @@ OR (\"usage\".error_message IS NOT NULL AND BTRIM(\"usage\".error_message) <> ''
         }
         if query.risk_control_only {
             push_postgres_usage_risk_control_filter(&mut builder, &mut has_where);
+        }
+        if query.ping_only {
+            push_postgres_usage_ping_filter(&mut builder, &mut has_where);
         }
         for (index, keyword) in query.keywords.iter().enumerate() {
             let keyword = keyword.trim();
@@ -2926,6 +2938,9 @@ OR (\"usage\".error_message IS NOT NULL AND BTRIM(\"usage\".error_message) <> ''
         if query.risk_control_only {
             push_postgres_usage_risk_control_filter(&mut builder, &mut has_where);
         }
+        if query.ping_only {
+            push_postgres_usage_ping_filter(&mut builder, &mut has_where);
+        }
 
         let row = builder
             .build()
@@ -3015,6 +3030,9 @@ OR (\"usage\".error_message IS NOT NULL AND BTRIM(\"usage\".error_message) <> ''
         }
         if query.risk_control_only {
             push_postgres_usage_risk_control_filter(&mut builder, &mut has_where);
+        }
+        if query.ping_only {
+            push_postgres_usage_ping_filter(&mut builder, &mut has_where);
         }
         for (index, keyword) in query.keywords.iter().enumerate() {
             let keyword = keyword.trim();

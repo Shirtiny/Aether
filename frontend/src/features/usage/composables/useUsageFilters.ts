@@ -3,6 +3,7 @@ import type { UsageRecord, FilterStatusValue } from '../types'
 import {
   hasUsageFallback,
   hasUsageRetry,
+  isUsageRecordPing,
   isUsageRecordRiskControl,
   isUsageRecordFailed,
   isUsageUpstreamStream,
@@ -89,6 +90,8 @@ export function useUsageFilters(options: UseUsageFiltersOptions) {
         records = records.filter(record => record.status === 'cancelled')
       } else if (filterStatus.value === 'risk_control') {
         records = records.filter(record => isUsageRecordRiskControl(record))
+      } else if (filterStatus.value === 'ping') {
+        records = records.filter(record => isUsageRecordPing(record))
       } else if (filterStatus.value === 'has_fallback') {
         records = records.filter(record => hasUsageFallback(record))
       } else if (filterStatus.value === 'has_retry') {

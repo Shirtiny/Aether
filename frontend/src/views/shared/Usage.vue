@@ -156,6 +156,7 @@ import {
 import { reconcileActiveRequestDiscovery } from '@/features/usage/utils/activeRequestDiscovery'
 import {
   hasUsageFallback,
+  isUsageRecordPing,
   isUsageRecordRiskControl,
   isUsageRecordFailed,
   isUsageUpstreamStream,
@@ -416,6 +417,8 @@ const filteredRecords = computed(() => {
         records = records.filter(record => record.status === 'cancelled')
       } else if (filterStatus.value === 'risk_control') {
         records = records.filter(record => isUsageRecordRiskControl(record))
+      } else if (filterStatus.value === 'ping') {
+        records = records.filter(record => isUsageRecordPing(record))
       } else if (filterStatus.value === 'has_fallback') {
         records = records.filter(record => hasUsageFallback(record))
       } else if (filterStatus.value === 'has_retry') {

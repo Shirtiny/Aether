@@ -5,6 +5,7 @@ import {
   hasUsageFallback,
   hasUsageRetry,
   isUsageRecordFailed,
+  isUsageRecordPing,
   isUsageRecordRiskControl,
   isUsageRecordSuccessful,
   mapRequestStatusToTimelineStatus,
@@ -186,6 +187,16 @@ describe('usage status helpers', () => {
     expect(isUsageRecordRiskControl(buildUsageRecord({
       status_code: 400,
       error_message: 'upstream failure',
+    }))).toBe(false)
+  })
+
+  it('detects ping records from the backend flag only', () => {
+    expect(isUsageRecordPing(buildUsageRecord({
+      is_ping: true,
+    }))).toBe(true)
+
+    expect(isUsageRecordPing(buildUsageRecord({
+      is_ping: false,
     }))).toBe(false)
   })
 

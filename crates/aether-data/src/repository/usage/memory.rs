@@ -290,8 +290,19 @@ fn usage_matches_list_query(item: &StoredRequestUsageAudit, query: &UsageAuditLi
     {
         return false;
     }
+    if query.ping_only && !usage_metadata_bool(item, "is_ping") {
+        return false;
+    }
 
     true
+}
+
+fn usage_metadata_bool(item: &StoredRequestUsageAudit, key: &str) -> bool {
+    item.request_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get(key))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
 }
 
 fn usage_matches_keyword_search_query(
@@ -358,6 +369,9 @@ fn usage_matches_keyword_search_query(
             .and_then(|value| value.as_bool())
             .unwrap_or(false)
     {
+        return false;
+    }
+    if query.ping_only && !usage_metadata_bool(item, "is_ping") {
         return false;
     }
 
