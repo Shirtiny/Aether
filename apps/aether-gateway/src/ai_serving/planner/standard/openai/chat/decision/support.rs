@@ -20,7 +20,7 @@ use crate::ai_serving::planner::materialization_policy::{
 };
 use crate::ai_serving::planner::CandidateFailureDiagnostic;
 use crate::ai_serving::{
-    ai_local_execution_contract_for_formats, extract_pool_sticky_session_token,
+    ai_local_execution_contract_for_formats, pool_sticky_session_token_for_request,
     ExecutionRuntimeAuthContext, PlannerAppState,
 };
 use crate::AppState;
@@ -125,7 +125,8 @@ pub(crate) async fn materialize_local_openai_chat_candidate_attempts(
     preselection_skipped: Vec<SkippedLocalExecutionCandidate>,
 ) -> Vec<LocalOpenAiChatCandidateAttempt> {
     let planner_state = PlannerAppState::new(state);
-    let sticky_session_token = extract_pool_sticky_session_token(body_json);
+    let sticky_session_token =
+        pool_sticky_session_token_for_request(body_json, input.client_session_affinity.as_ref());
     let auth_context: &ExecutionRuntimeAuthContext = &input.auth_context;
     let persistence_policy = build_local_candidate_persistence_policy(
         auth_context,
@@ -206,7 +207,8 @@ pub(crate) async fn build_local_openai_chat_candidate_attempt_source<'a>(
     preselection_skipped: Vec<SkippedLocalExecutionCandidate>,
 ) -> (LocalOpenAiChatCandidateAttemptSource<'a>, usize) {
     let planner_state = PlannerAppState::new(state);
-    let sticky_session_token = extract_pool_sticky_session_token(body_json);
+    let sticky_session_token =
+        pool_sticky_session_token_for_request(body_json, input.client_session_affinity.as_ref());
     let auth_context: &ExecutionRuntimeAuthContext = &input.auth_context;
     let persistence_policy = build_local_candidate_persistence_policy(
         auth_context,
@@ -284,7 +286,8 @@ pub(crate) async fn build_lazy_local_openai_chat_candidate_attempt_source<'a>(
     require_streaming: bool,
 ) -> (LocalOpenAiChatCandidateAttemptSource<'a>, usize) {
     let planner_state = PlannerAppState::new(state);
-    let sticky_session_token = extract_pool_sticky_session_token(body_json);
+    let sticky_session_token =
+        pool_sticky_session_token_for_request(body_json, input.client_session_affinity.as_ref());
     let auth_context: &ExecutionRuntimeAuthContext = &input.auth_context;
     let persistence_policy = build_local_candidate_persistence_policy(
         auth_context,

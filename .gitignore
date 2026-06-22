@@ -214,6 +214,11 @@ backups/
 
 # Cloud database configuration (contains sensitive credentials)
 .env.cloud
+/.env.backup*
+
+# Local root-level production database backups
+/backup_*.sql
+/backup_*.sql.gz
 
 # Runtime lock files
 .locks/

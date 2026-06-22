@@ -88,6 +88,20 @@ pub(crate) use aether_ai_serving::{
     CandidateFailureDiagnostic, CandidateFailureDiagnosticKind,
 };
 
+pub(crate) fn pool_sticky_session_token_for_request(
+    body_json: &serde_json::Value,
+    client_session_affinity: Option<&aether_scheduler_core::ClientSessionAffinity>,
+) -> Option<String> {
+    extract_pool_sticky_session_token(body_json).or_else(|| {
+        client_session_affinity?
+            .session_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    })
+}
+
 pub(crate) async fn maybe_build_sync_decision_payload(
     state: &AppState,
     parts: &http::request::Parts,
@@ -107,6 +121,82 @@ pub(crate) async fn maybe_build_sync_decision_payload(
         body_is_empty,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pool_sticky_session_token_for_request;
+    use crate::client_session_affinity::client_session_affinity_from_request;
+    use aether_scheduler_core::ClientSessionAffinity;
+    use http::{HeaderMap, HeaderValue};
+    use serde_json::json;
+
+    #[test]
+    fn pool_sticky_session_token_prefers_body_session() {
+        let body = json!({
+            "session_id": "body-session"
+        });
+        let affinity = ClientSessionAffinity::new(
+            Some("codex".to_string()),
+            Some("session=header-session".to_string()),
+        );
+
+        assert_eq!(
+            pool_sticky_session_token_for_request(&body, Some(&affinity)).as_deref(),
+            Some("body-session")
+        );
+    }
+
+    #[test]
+    fn pool_sticky_session_token_uses_client_affinity_when_body_has_no_session() {
+        let body = json!({
+            "model": "gpt-5.4"
+        });
+        let affinity = ClientSessionAffinity::new(
+            Some("codex".to_string()),
+            Some("session=header-session".to_string()),
+        );
+
+        assert_eq!(
+            pool_sticky_session_token_for_request(&body, Some(&affinity)).as_deref(),
+            Some("session=header-session")
+        );
+    }
+
+    #[test]
+    fn pool_sticky_session_token_uses_codex_header_session_after_affinity_detection() {
+        let body = json!({
+            "model": "gpt-5.4"
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::USER_AGENT,
+            HeaderValue::from_static("Codex Desktop/0.136.0-alpha.2"),
+        );
+        headers.insert("session_id", HeaderValue::from_static("de391a2896c46f3a"));
+
+        let affinity = client_session_affinity_from_request(&headers, Some(&body))
+            .expect("codex header session should build client affinity");
+
+        assert_eq!(
+            pool_sticky_session_token_for_request(&body, Some(&affinity)).as_deref(),
+            Some("session=de391a2896c46f3a")
+        );
+    }
+
+    #[test]
+    fn pool_sticky_session_token_ignores_blank_client_affinity() {
+        let body = json!({
+            "model": "gpt-5.4"
+        });
+        let affinity =
+            ClientSessionAffinity::new(Some("codex".to_string()), Some("  ".to_string()));
+
+        assert_eq!(
+            pool_sticky_session_token_for_request(&body, Some(&affinity)),
+            None
+        );
+    }
 }
 
 pub(crate) async fn maybe_build_stream_decision_payload(

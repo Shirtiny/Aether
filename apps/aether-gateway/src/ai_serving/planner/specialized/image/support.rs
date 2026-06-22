@@ -21,7 +21,7 @@ use crate::ai_serving::planner::materialization_policy::{
 };
 use crate::ai_serving::planner::spec_metadata::local_openai_image_spec_metadata;
 use crate::ai_serving::{
-    extract_pool_sticky_session_token, request_candidate_api_formats,
+    pool_sticky_session_token_for_request, request_candidate_api_formats,
     resolve_local_decision_execution_runtime_auth_context, CandidateFailureDiagnostic,
     ExecutionRuntimeAuthContext, GatewayControlDecision, PlannerAppState,
 };
@@ -235,7 +235,8 @@ pub(super) async fn build_local_openai_image_candidate_attempt_source<'a>(
         }
     }
 
-    let sticky_session_token = extract_pool_sticky_session_token(body_json);
+    let sticky_session_token =
+        pool_sticky_session_token_for_request(body_json, input.client_session_affinity.as_ref());
     let persistence_policy = build_local_candidate_persistence_policy(
         &input.auth_context,
         input.required_capabilities.as_ref(),
@@ -313,7 +314,8 @@ async fn materialize_local_openai_image_candidate_attempts(
     preselection_skipped: Vec<SkippedLocalExecutionCandidate>,
     api_format: &str,
 ) -> Vec<LocalOpenAiImageCandidateAttempt> {
-    let sticky_session_token = extract_pool_sticky_session_token(body_json);
+    let sticky_session_token =
+        pool_sticky_session_token_for_request(body_json, input.client_session_affinity.as_ref());
     let persistence_policy = build_local_candidate_persistence_policy(
         &input.auth_context,
         input.required_capabilities.as_ref(),

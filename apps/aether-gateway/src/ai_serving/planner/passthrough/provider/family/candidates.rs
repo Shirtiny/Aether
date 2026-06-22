@@ -21,7 +21,7 @@ use crate::ai_serving::planner::materialization_policy::{
 };
 use crate::ai_serving::planner::spec_metadata::local_same_format_provider_spec_metadata;
 use crate::ai_serving::{
-    ai_local_execution_contract_for_formats, extract_pool_sticky_session_token,
+    ai_local_execution_contract_for_formats, pool_sticky_session_token_for_request,
     resolve_local_decision_execution_runtime_auth_context, GatewayControlDecision, PlannerAppState,
 };
 use crate::client_session_affinity::client_session_affinity_from_parts;
@@ -109,7 +109,8 @@ pub(crate) async fn materialize_local_same_format_provider_candidate_attempts(
 ) -> Result<(Vec<LocalSameFormatProviderCandidateAttempt>, usize), GatewayError> {
     let spec_metadata = local_same_format_provider_spec_metadata(spec);
     let planner_state = PlannerAppState::new(state);
-    let sticky_session_token = extract_pool_sticky_session_token(body_json);
+    let sticky_session_token =
+        pool_sticky_session_token_for_request(body_json, input.client_session_affinity.as_ref());
     let persistence_policy = build_local_candidate_persistence_policy(
         &input.auth_context,
         input.required_capabilities.as_ref(),
@@ -206,7 +207,8 @@ pub(crate) async fn build_local_same_format_provider_candidate_attempt_source<'a
 ) -> Result<(LocalExecutionCandidateAttemptSource<'a>, usize), GatewayError> {
     let spec_metadata = local_same_format_provider_spec_metadata(spec);
     let planner_state = PlannerAppState::new(state);
-    let sticky_session_token = extract_pool_sticky_session_token(body_json);
+    let sticky_session_token =
+        pool_sticky_session_token_for_request(body_json, input.client_session_affinity.as_ref());
     let persistence_policy = build_local_candidate_persistence_policy(
         &input.auth_context,
         input.required_capabilities.as_ref(),

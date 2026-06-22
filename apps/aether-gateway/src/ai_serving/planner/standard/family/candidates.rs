@@ -24,8 +24,8 @@ use crate::ai_serving::planner::materialization_policy::{
 };
 use crate::ai_serving::planner::spec_metadata::local_standard_spec_metadata;
 use crate::ai_serving::{
-    ai_local_execution_contract_for_formats, extract_pool_sticky_session_token,
-    gemini_request_is_image_generation, resolve_local_decision_execution_runtime_auth_context,
+    ai_local_execution_contract_for_formats, gemini_request_is_image_generation,
+    pool_sticky_session_token_for_request, resolve_local_decision_execution_runtime_auth_context,
     GatewayControlDecision, PlannerAppState,
 };
 use crate::client_session_affinity::client_session_affinity_from_parts;
@@ -111,7 +111,8 @@ pub(super) async fn materialize_local_standard_candidate_attempts(
     let is_gemini_image_bridge = spec_metadata.api_format == "gemini:generate_content"
         && gemini_request_is_image_generation(body_json);
     let planner_state = PlannerAppState::new(state);
-    let sticky_session_token = extract_pool_sticky_session_token(body_json);
+    let sticky_session_token =
+        pool_sticky_session_token_for_request(body_json, input.client_session_affinity.as_ref());
     let persistence_policy = build_local_candidate_persistence_policy(
         &input.auth_context,
         input.required_capabilities.as_ref(),
@@ -223,7 +224,8 @@ pub(super) async fn build_local_standard_candidate_attempt_source<'a>(
 ) -> Result<(LocalExecutionCandidateAttemptSource<'a>, usize), GatewayError> {
     let spec_metadata = local_standard_spec_metadata(spec);
     let planner_state = PlannerAppState::new(state);
-    let sticky_session_token = extract_pool_sticky_session_token(body_json);
+    let sticky_session_token =
+        pool_sticky_session_token_for_request(body_json, input.client_session_affinity.as_ref());
     let persistence_policy = build_local_candidate_persistence_policy(
         &input.auth_context,
         input.required_capabilities.as_ref(),

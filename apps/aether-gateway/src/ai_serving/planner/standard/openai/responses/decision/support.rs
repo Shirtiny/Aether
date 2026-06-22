@@ -30,7 +30,7 @@ use crate::ai_serving::planner::runtime_miss::set_local_runtime_miss_diagnostic_
 use crate::ai_serving::planner::spec_metadata::local_openai_responses_spec_metadata;
 use crate::ai_serving::planner::CandidateFailureDiagnostic;
 use crate::ai_serving::{
-    ai_local_execution_contract_for_formats, extract_pool_sticky_session_token,
+    ai_local_execution_contract_for_formats, pool_sticky_session_token_for_request,
     resolve_local_decision_execution_runtime_auth_context, ExecutionRuntimeAuthContext,
     GatewayControlDecision, PlannerAppState,
 };
@@ -162,7 +162,8 @@ pub(crate) async fn materialize_local_openai_responses_candidate_attempts(
 ) -> Result<(Vec<LocalOpenAiResponsesCandidateAttempt>, usize), GatewayError> {
     let spec_metadata = local_openai_responses_spec_metadata(spec);
     let planner_state = PlannerAppState::new(state);
-    let sticky_session_token = extract_pool_sticky_session_token(body_json);
+    let sticky_session_token =
+        pool_sticky_session_token_for_request(body_json, input.client_session_affinity.as_ref());
     let auth_context: &ExecutionRuntimeAuthContext = &input.auth_context;
     let persistence_policy = build_local_candidate_persistence_policy(
         auth_context,
@@ -260,7 +261,8 @@ pub(crate) async fn build_local_openai_responses_candidate_attempt_source<'a>(
 ) -> Result<(LocalOpenAiResponsesCandidateAttemptSource<'a>, usize), GatewayError> {
     let spec_metadata = local_openai_responses_spec_metadata(spec);
     let planner_state = PlannerAppState::new(state);
-    let sticky_session_token = extract_pool_sticky_session_token(body_json);
+    let sticky_session_token =
+        pool_sticky_session_token_for_request(body_json, input.client_session_affinity.as_ref());
     let auth_context: &ExecutionRuntimeAuthContext = &input.auth_context;
     let persistence_policy = build_local_candidate_persistence_policy(
         auth_context,
@@ -356,7 +358,8 @@ pub(crate) async fn build_local_openai_responses_image_candidate_attempt_source<
 ) -> Result<(LocalOpenAiResponsesCandidateAttemptSource<'a>, usize), GatewayError> {
     let spec_metadata = local_openai_responses_spec_metadata(spec);
     let planner_state = PlannerAppState::new(state);
-    let sticky_session_token = extract_pool_sticky_session_token(body_json);
+    let sticky_session_token =
+        pool_sticky_session_token_for_request(body_json, input.client_session_affinity.as_ref());
     let auth_context: &ExecutionRuntimeAuthContext = &input.auth_context;
     let persistence_policy = build_local_candidate_persistence_policy(
         auth_context,
