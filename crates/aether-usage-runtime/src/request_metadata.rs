@@ -106,7 +106,7 @@ pub(crate) fn attach_provider_request_body_metadata(
     (!object.is_empty()).then_some(Value::Object(object))
 }
 
-pub(crate) fn attach_cafecode_identity_metadata(
+pub fn attach_cafecode_identity_metadata(
     metadata: Option<Value>,
     headers: Option<&Value>,
 ) -> Option<Value> {

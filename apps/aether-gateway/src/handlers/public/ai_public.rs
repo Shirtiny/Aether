@@ -13,7 +13,9 @@ use aether_ai_formats::UPSTREAM_IS_STREAM_KEY;
 use aether_data_contracts::repository::video_tasks::{
     StoredVideoTask, VideoTaskQueryFilter, VideoTaskStatus,
 };
-use aether_usage_runtime::{UsageEvent, UsageEventData, UsageEventType};
+use aether_usage_runtime::{
+    attach_cafecode_identity_metadata, UsageEvent, UsageEventData, UsageEventType,
+};
 use axum::body::{Body, Bytes};
 use axum::http::{self, HeaderMap, Response};
 use axum::response::IntoResponse;
@@ -1614,6 +1616,8 @@ async fn record_local_openai_probe_usage(
         LOCAL_PROBE_RESPONSE_HEADER: answer.kind.as_str(),
     });
     let request_headers = request_headers.map(local_probe_request_headers_json);
+    let request_metadata =
+        attach_cafecode_identity_metadata(Some(Value::Object(metadata)), request_headers.as_ref());
     let request_body = local_probe_request_body_json(request_body);
     let data = UsageEventData {
         user_id: auth_context.map(|value| value.user_id.clone()),
@@ -1651,7 +1655,7 @@ async fn record_local_openai_probe_usage(
         route_family: decision.and_then(|value| value.route_family.clone()),
         route_kind: decision.and_then(|value| value.route_kind.clone()),
         execution_path: Some(EXECUTION_PATH_LOCAL_AI_PUBLIC.to_string()),
-        request_metadata: Some(Value::Object(metadata)),
+        request_metadata,
         ..UsageEventData::default()
     };
 
@@ -2432,10 +2436,11 @@ fn estimate_text_tokens(text: &str) -> u64 {
 mod tests {
     use super::{
         arithmetic_probe_answer, estimate_claude_count_tokens, local_probe_chat_response_id,
-        local_probe_response_id, openai_chat_local_probe_answer, openai_chat_local_probe_sse_body,
-        openai_responses_local_probe_answer, openai_responses_local_probe_payload,
-        openai_responses_local_probe_sse_body, parse_openai_image_validation_input,
-        validate_openai_image_n, LocalProbeKind, OpenAiImageOperation,
+        local_probe_request_headers_json, local_probe_response_id, openai_chat_local_probe_answer,
+        openai_chat_local_probe_sse_body, openai_responses_local_probe_answer,
+        openai_responses_local_probe_payload, openai_responses_local_probe_sse_body,
+        parse_openai_image_validation_input, validate_openai_image_n, LocalProbeKind,
+        OpenAiImageOperation,
     };
     use crate::data::GatewayDataState;
     use crate::local_probe_intercept::{
@@ -2443,6 +2448,7 @@ mod tests {
     };
     use crate::AppState;
     use axum::body::Bytes;
+    use axum::http::{HeaderMap, HeaderValue};
     use serde_json::json;
 
     fn probe_test_state() -> AppState {
@@ -2721,6 +2727,24 @@ mod tests {
             local_probe_chat_response_id("24d30b78-08eb-433b-b140-20b2667e6a5f"),
             "chatcmpl_local_probe_24d30b7808eb433bb14020b2667e6a5f"
         );
+    }
+
+    #[test]
+    fn local_probe_usage_metadata_extracts_cafecode_identity_from_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("cafecode-uid", HeaderValue::from_static("124"));
+        headers.insert("Cafecode-Uname", HeaderValue::from_static("qingteng2025"));
+
+        let request_headers = local_probe_request_headers_json(&headers);
+        let metadata = aether_usage_runtime::attach_cafecode_identity_metadata(
+            Some(json!({ "is_ping": true })),
+            Some(&request_headers),
+        )
+        .expect("cafecode metadata should be present");
+
+        assert_eq!(metadata["cafecode_uid"], "124");
+        assert_eq!(metadata["cafecode_uname"], "qingteng2025");
+        assert_eq!(metadata["is_ping"], true);
     }
 
     #[test]
