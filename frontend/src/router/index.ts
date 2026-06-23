@@ -275,6 +275,12 @@ const routes: RouteRecordRaw[] = [
         meta: { module: 'chat_pii_redaction' }
       },
       {
+        path: 'modules/local-probe-intercept',
+        name: 'LocalProbeInterceptModule',
+        component: () => importWithRetry(() => import('@/views/admin/modules/LocalProbeIntercept.vue')),
+        meta: { module: 'local_probe_intercept' }
+      },
+      {
         path: 'modules/s3-backup',
         name: 'S3BackupSettings',
         component: () => importWithRetry(() => import('@/views/admin/modules/S3BackupSettings.vue')),

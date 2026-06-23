@@ -1158,6 +1158,7 @@ const navigation = computed(() => {
     SlidersHorizontal,
     CreditCard,
     Gift,
+    Activity,
   }
 
   const activeModuleItems = (group: string) =>

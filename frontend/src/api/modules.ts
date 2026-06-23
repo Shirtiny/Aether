@@ -48,6 +48,23 @@ export interface ChatPiiRedactionConfig {
   placeholder_prefix: string
 }
 
+export type LocalProbeInterceptKind = 'ping' | 'health'
+
+export interface LocalProbeInterceptRule {
+  id: string
+  name: string
+  prompt: string
+  response: string
+  kind: LocalProbeInterceptKind
+  enabled: boolean
+  system?: boolean
+}
+
+export interface LocalProbeInterceptConfig {
+  enabled: boolean
+  rules: LocalProbeInterceptRule[]
+}
+
 export const CHAT_PII_REDACTION_DEFAULT_RULES: ChatPiiRedactionRule[] = [
   { id: 'email', name: '邮箱', pattern: '(?i)[A-Z0-9._%+-]{1,64}@[A-Z0-9.-]{1,253}\\.[A-Z]{2,63}', enabled: true, features: { validator: 'email' }, system: true },
   { id: 'cn_phone', name: '手机号', pattern: '(?:\\+?86[- ]?)?(?:1[3-9]\\d[- ]?\\d{4}[- ]?\\d{4}|0\\d{2,3}[- ]\\d{7,8}(?:-\\d{1,6})?)', enabled: true, features: { validator: 'cn_phone' }, system: true },
@@ -63,11 +80,75 @@ export const CHAT_PII_REDACTION_DEFAULT_RULES: ChatPiiRedactionRule[] = [
   { id: 'jwt', name: 'JWT', pattern: '\\b[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}\\b', enabled: true, features: { validator: 'jwt' }, system: true },
 ]
 
+export const LOCAL_PROBE_INTERCEPT_DEFAULT_RULES: LocalProbeInterceptRule[] = [
+  { id: 'ping', name: 'Ping', prompt: 'ping', response: 'pong', kind: 'ping', enabled: true, system: true },
+  { id: 'reply_pong', name: '回复 pong', prompt: '只回复 pong', response: 'pong', kind: 'ping', enabled: true, system: true },
+  { id: 'reply_pong_plain', name: 'Reply pong', prompt: 'reply pong', response: 'pong', kind: 'ping', enabled: true, system: true },
+  { id: 'reply_exactly_pong', name: 'Reply exactly PONG', prompt: 'Reply exactly: PONG', response: 'PONG', kind: 'ping', enabled: true, system: true },
+  { id: 'respond_pong', name: 'Respond pong', prompt: 'respond pong', response: 'pong', kind: 'ping', enabled: true, system: true },
+  { id: 'respond_exactly_pong', name: 'Respond exactly pong', prompt: 'respond exactly pong', response: 'pong', kind: 'ping', enabled: true, system: true },
+  { id: 'reply_with_pong', name: 'Reply with pong', prompt: 'reply with pong', response: 'pong', kind: 'ping', enabled: true, system: true },
+  { id: 'respond_with_pong', name: 'Respond with pong', prompt: 'respond with pong', response: 'pong', kind: 'ping', enabled: true, system: true },
+  { id: 'say_pong', name: 'Say pong', prompt: 'say pong', response: 'pong', kind: 'ping', enabled: true, system: true },
+  { id: 'only_pong', name: 'Only pong', prompt: 'only pong', response: 'pong', kind: 'ping', enabled: true, system: true },
+  { id: 'just_pong', name: 'Just pong', prompt: 'just pong', response: 'pong', kind: 'ping', enabled: true, system: true },
+  { id: 'cn_reply_pong', name: '回复 pong', prompt: '回复 pong', response: 'pong', kind: 'ping', enabled: true, system: true },
+  { id: 'cn_return_pong', name: '返回 pong', prompt: '返回 pong', response: 'pong', kind: 'ping', enabled: true, system: true },
+  { id: 'cn_only_reply_pong', name: '仅回复 pong', prompt: '仅回复 pong', response: 'pong', kind: 'ping', enabled: true, system: true },
+  { id: 'reply_exactly_ok', name: 'Reply exactly OK', prompt: 'Reply exactly: OK', response: 'OK', kind: 'health', enabled: true, system: true },
+  { id: 'ok', name: 'OK', prompt: 'OK', response: 'OK', kind: 'health', enabled: true, system: true },
+  { id: 'say_ok', name: 'Say OK', prompt: 'Say OK', response: 'OK', kind: 'health', enabled: true, system: true },
+  { id: 'only_ok', name: 'Only OK', prompt: 'only OK', response: 'OK', kind: 'health', enabled: true, system: true },
+  { id: 'just_ok', name: 'Just OK', prompt: 'just OK', response: 'OK', kind: 'health', enabled: true, system: true },
+  { id: 'reply_ok', name: 'Reply OK', prompt: 'reply OK', response: 'OK', kind: 'health', enabled: true, system: true },
+  { id: 'reply_with_ok', name: 'Reply with OK', prompt: 'reply with OK', response: 'OK', kind: 'health', enabled: true, system: true },
+  { id: 'respond_ok', name: 'Respond OK', prompt: 'respond OK', response: 'OK', kind: 'health', enabled: true, system: true },
+  { id: 'respond_exactly_ok', name: 'Respond exactly OK', prompt: 'respond exactly OK', response: 'OK', kind: 'health', enabled: true, system: true },
+  { id: 'respond_with_ok', name: 'Respond with OK', prompt: 'respond with OK', response: 'OK', kind: 'health', enabled: true, system: true },
+  { id: 'return_ok', name: 'Return OK', prompt: 'return OK', response: 'OK', kind: 'health', enabled: true, system: true },
+  { id: 'cn_reply_ok', name: '请回复 OK', prompt: '请回复 OK', response: 'OK', kind: 'health', enabled: true, system: true },
+  { id: 'cn_reply_ok_plain', name: '回复 OK', prompt: '回复 OK', response: 'OK', kind: 'health', enabled: true, system: true },
+  { id: 'cn_return_ok_plain', name: '返回 OK', prompt: '返回 OK', response: 'OK', kind: 'health', enabled: true, system: true },
+  { id: 'cn_only_reply_ok_plain', name: '仅回复 OK', prompt: '仅回复 OK', response: 'OK', kind: 'health', enabled: true, system: true },
+  { id: 'cn_only_return_ok_plain', name: '仅返回 OK', prompt: '仅返回 OK', response: 'OK', kind: 'health', enabled: true, system: true },
+  { id: 'cn_return_ok', name: '请返回 OK', prompt: '请返回 OK', response: 'OK', kind: 'health', enabled: true, system: true },
+  { id: 'cn_only_reply_ok', name: '只回复 OK', prompt: '只回复 OK', response: 'OK', kind: 'health', enabled: true, system: true },
+  { id: 'cn_only_return_ok', name: '只返回 OK', prompt: '只返回 OK', response: 'OK', kind: 'health', enabled: true, system: true },
+  { id: 'are_you_alive', name: 'Are you alive', prompt: 'Are you alive?', response: 'Yes.', kind: 'health', enabled: true, system: true },
+  { id: 'alive', name: 'Alive', prompt: 'alive?', response: 'Yes.', kind: 'health', enabled: true, system: true },
+  { id: 'online', name: 'Online', prompt: 'online?', response: 'Yes.', kind: 'health', enabled: true, system: true },
+  { id: 'are_you_online', name: 'Are you online', prompt: 'Are you online?', response: 'Yes.', kind: 'health', enabled: true, system: true },
+  { id: 'are_you_working', name: 'Are you working', prompt: 'Are you working?', response: 'Yes.', kind: 'health', enabled: true, system: true },
+  { id: 'hello', name: 'Hello', prompt: 'hello', response: 'Hello!', kind: 'health', enabled: true, system: true },
+  { id: 'hi', name: 'Hi', prompt: 'hi', response: 'Hello!', kind: 'health', enabled: true, system: true },
+  { id: 'cn_hello_polite', name: '您好', prompt: '您好', response: '你好！', kind: 'health', enabled: true, system: true },
+  { id: 'cn_hello', name: '你好', prompt: '你好', response: '你好！', kind: 'health', enabled: true, system: true },
+  { id: 'who_are_you', name: 'Who are you', prompt: 'who are you', response: "I'm ChatGPT.", kind: 'health', enabled: true, system: true },
+  { id: 'who_are_u', name: 'Who are u', prompt: 'who are u', response: "I'm ChatGPT.", kind: 'health', enabled: true, system: true },
+  { id: 'cn_who_are_you', name: '你是谁', prompt: '你是谁', response: '我是 ChatGPT。', kind: 'health', enabled: true, system: true },
+  { id: 'test', name: 'Test', prompt: 'test', response: 'OK', kind: 'health', enabled: true, system: true },
+  { id: 'cn_test', name: '测试', prompt: '测试', response: 'OK', kind: 'health', enabled: true, system: true },
+  { id: 'cn_health_probe', name: '测活', prompt: '测活', response: 'OK', kind: 'health', enabled: true, system: true },
+  { id: 'cn_connectivity_test', name: '联通测试', prompt: '联通测试', response: 'OK', kind: 'health', enabled: true, system: true },
+  { id: 'cn_connection_test', name: '连接测试', prompt: '连接测试', response: 'OK', kind: 'health', enabled: true, system: true },
+  { id: 'cn_api_test', name: '接口测试', prompt: '接口测试', response: 'OK', kind: 'health', enabled: true, system: true },
+  { id: 'cn_health_check', name: '健康检查', prompt: '健康检查', response: 'OK', kind: 'health', enabled: true, system: true },
+  { id: 'healthcheck', name: 'Health check', prompt: 'healthcheck', response: 'OK', kind: 'health', enabled: true, system: true },
+  { id: 'health', name: 'Health', prompt: 'health', response: 'OK', kind: 'health', enabled: true, system: true },
+  { id: 'connection_test', name: 'Connection test', prompt: 'connection test', response: 'OK', kind: 'health', enabled: true, system: true },
+  { id: 'connectivity_test', name: 'Connectivity test', prompt: 'connectivity test', response: 'OK', kind: 'health', enabled: true, system: true },
+]
+
 const CHAT_PII_REDACTION_CONFIG_KEYS = {
   enabled: 'module.chat_pii_redaction.enabled',
   rules: 'module.chat_pii_redaction.rules',
   cache_ttl_seconds: 'module.chat_pii_redaction.cache_ttl_seconds',
   placeholder_prefix: 'module.chat_pii_redaction.placeholder_prefix',
+} as const
+
+const LOCAL_PROBE_INTERCEPT_CONFIG_KEYS = {
+  enabled: 'module.local_probe_intercept.enabled',
+  rules: 'module.local_probe_intercept.rules',
 } as const
 
 const CHAT_PII_REDACTION_DEFAULT_CONFIG: ChatPiiRedactionConfig = {
@@ -93,6 +174,10 @@ export function normalizeModuleManagementOrder(value: unknown): string[] {
 
 function cloneDefaultChatPiiRedactionRules(): ChatPiiRedactionRule[] {
   return CHAT_PII_REDACTION_DEFAULT_RULES.map(rule => ({ ...rule }))
+}
+
+function cloneDefaultLocalProbeInterceptRules(): LocalProbeInterceptRule[] {
+  return LOCAL_PROBE_INTERCEPT_DEFAULT_RULES.map(rule => ({ ...rule }))
 }
 
 function normalizeChatPiiRedactionRule(value: unknown, index: number): ChatPiiRedactionRule | null {
@@ -158,6 +243,47 @@ function normalizePlaceholderPrefix(value: unknown): string {
   return /^[A-Z0-9_]{1,32}$/.test(normalized)
     ? normalized
     : CHAT_PII_REDACTION_DEFAULT_CONFIG.placeholder_prefix
+}
+
+function normalizeLocalProbeInterceptRule(value: unknown, index: number): LocalProbeInterceptRule | null {
+  if (!value || typeof value !== 'object') return null
+  const item = value as Record<string, unknown>
+  const id = typeof item.id === 'string' && item.id.trim()
+    ? item.id.trim()
+    : `custom_${index + 1}`
+  const name = typeof item.name === 'string' && item.name.trim()
+    ? item.name.trim()
+    : id
+  const prompt = typeof item.prompt === 'string' ? item.prompt : ''
+  const response = typeof item.response === 'string' ? item.response : ''
+  if (!prompt.trim() || !response.trim()) return null
+  const kind: LocalProbeInterceptKind = item.kind === 'ping' ? 'ping' : 'health'
+  return {
+    id,
+    name,
+    prompt,
+    response,
+    kind,
+    enabled: item.enabled !== false,
+    system: item.system === true,
+  }
+}
+
+function normalizeLocalProbeInterceptRules(value: unknown): LocalProbeInterceptRule[] {
+  if (!Array.isArray(value)) return cloneDefaultLocalProbeInterceptRules()
+  return value
+    .map((item, index) => normalizeLocalProbeInterceptRule(item, index))
+    .filter((item): item is LocalProbeInterceptRule => item !== null)
+}
+
+function normalizeLocalProbeInterceptConfig(values: {
+  enabled: unknown
+  rules: unknown
+}): LocalProbeInterceptConfig {
+  return {
+    enabled: values.enabled !== false,
+    rules: normalizeLocalProbeInterceptRules(values.rules),
+  }
 }
 
 async function getSystemConfigValue(key: string): Promise<unknown> {
@@ -260,6 +386,24 @@ export const modulesApi = {
       cache_ttl_seconds: cacheTtlSeconds,
       placeholder_prefix: placeholderPrefix,
     })
+  },
+
+  async getLocalProbeInterceptConfig(): Promise<LocalProbeInterceptConfig> {
+    const [enabled, rules] = await Promise.all([
+      getSystemConfigValue(LOCAL_PROBE_INTERCEPT_CONFIG_KEYS.enabled),
+      getSystemConfigValue(LOCAL_PROBE_INTERCEPT_CONFIG_KEYS.rules),
+    ])
+
+    return normalizeLocalProbeInterceptConfig({ enabled, rules })
+  },
+
+  async updateLocalProbeInterceptConfig(config: LocalProbeInterceptConfig): Promise<LocalProbeInterceptConfig> {
+    const [enabled, rules] = await Promise.all([
+      updateSystemConfigValue(LOCAL_PROBE_INTERCEPT_CONFIG_KEYS.enabled, config.enabled, '测活拦截总开关'),
+      updateSystemConfigValue(LOCAL_PROBE_INTERCEPT_CONFIG_KEYS.rules, config.rules, '测活拦截提示词与回复规则'),
+    ])
+
+    return normalizeLocalProbeInterceptConfig({ enabled, rules })
   },
 
   /**

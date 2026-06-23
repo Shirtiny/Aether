@@ -50,6 +50,7 @@ mod headers;
 mod hooks;
 mod image_capabilities;
 mod important_notification;
+mod local_probe_intercept;
 mod log_ids;
 mod maintenance;
 pub(crate) mod middleware;

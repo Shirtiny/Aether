@@ -5,6 +5,9 @@ use crate::control::GatewayPublicRequestContext;
 use crate::image_capabilities::{
     openai_image_gateway_max_generation_count, openai_image_gateway_max_generation_count_for_model,
 };
+use crate::local_probe_intercept::{
+    local_probe_intercept_answer, local_probe_intercept_enabled, LocalProbeInterceptKind,
+};
 use crate::{AppState, GatewayError};
 use aether_ai_formats::UPSTREAM_IS_STREAM_KEY;
 use aether_data_contracts::repository::video_tasks::{
@@ -58,14 +61,6 @@ const OPENAI_RERANK_CHAT_PAYLOAD_DETAIL: &str =
     "Rerank request must use query/documents, not chat messages";
 const OPENAI_RERANK_STREAM_UNSUPPORTED_DETAIL: &str = "Rerank requests do not support streaming";
 const LOCAL_PROBE_RESPONSE_HEADER: &str = "x-aether-local-probe";
-const LOCAL_PROBE_PONG_TEXT: &str = "pong";
-const LOCAL_PROBE_PONG_UPPER_TEXT: &str = "PONG";
-const LOCAL_PROBE_OK_TEXT: &str = "OK";
-const LOCAL_PROBE_YES_TEXT: &str = "Yes.";
-const LOCAL_PROBE_ENGLISH_GREETING_TEXT: &str = "Hello!";
-const LOCAL_PROBE_CHINESE_GREETING_TEXT: &str = "你好！";
-const LOCAL_PROBE_ENGLISH_IDENTITY_TEXT: &str = "I'm ChatGPT.";
-const LOCAL_PROBE_CHINESE_IDENTITY_TEXT: &str = "我是 ChatGPT。";
 const ANTIGRAVITY_USER_SETTINGS_MISSING_BODY_DETAIL: &str =
     "Antigravity setUserSettings request body is required";
 const ANTIGRAVITY_USER_SETTINGS_INVALID_JSON_DETAIL: &str =
@@ -919,6 +914,15 @@ impl LocalProbeKind {
     }
 }
 
+impl From<LocalProbeInterceptKind> for LocalProbeKind {
+    fn from(kind: LocalProbeInterceptKind) -> Self {
+        match kind {
+            LocalProbeInterceptKind::Ping => Self::Ping,
+            LocalProbeInterceptKind::Health => Self::Health,
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct LocalProbeAnswer {
     text: String,
@@ -938,6 +942,9 @@ async fn maybe_build_local_openai_probe_response(
     {
         return None;
     }
+    if !local_probe_intercept_enabled(state).await.ok()? {
+        return None;
+    }
 
     let request_body = request_body?;
     let payload = serde_json::from_slice::<Value>(request_body).ok()?;
@@ -948,9 +955,11 @@ async fn maybe_build_local_openai_probe_response(
         (
             Some("responses") | Some("responses:compact"),
             "/v1/responses" | "/v1/responses/compact",
-        ) => OpenAiLocalProbeRequest::Responses(openai_responses_local_probe_answer(&payload)?),
+        ) => OpenAiLocalProbeRequest::Responses(
+            openai_responses_local_probe_answer(state, &payload).await?,
+        ),
         (Some("chat"), "/v1/chat/completions") => {
-            OpenAiLocalProbeRequest::Chat(openai_chat_local_probe_answer(&payload)?)
+            OpenAiLocalProbeRequest::Chat(openai_chat_local_probe_answer(state, &payload).await?)
         }
         _ => return None,
     };
@@ -994,14 +1003,26 @@ async fn maybe_build_local_openai_probe_response(
     })
 }
 
-fn openai_responses_local_probe_answer(payload: &Value) -> Option<LocalProbeAnswer> {
+async fn openai_responses_local_probe_answer(
+    state: &AppState,
+    payload: &Value,
+) -> Option<LocalProbeAnswer> {
     let text = extract_openai_responses_last_user_text(payload)?;
-    local_probe_answer_from_text(&text)
+    local_probe_answer_from_text(state, &text)
+        .await
+        .ok()
+        .flatten()
 }
 
-fn openai_chat_local_probe_answer(payload: &Value) -> Option<LocalProbeAnswer> {
+async fn openai_chat_local_probe_answer(
+    state: &AppState,
+    payload: &Value,
+) -> Option<LocalProbeAnswer> {
     let text = extract_openai_chat_last_user_text(payload)?;
-    local_probe_answer_from_text(&text)
+    local_probe_answer_from_text(state, &text)
+        .await
+        .ok()
+        .flatten()
 }
 
 #[derive(Debug)]
@@ -1129,26 +1150,25 @@ fn openai_chat_content_part_text(value: &Value) -> Option<String> {
     }
 }
 
-fn local_probe_answer_from_text(text: &str) -> Option<LocalProbeAnswer> {
+async fn local_probe_answer_from_text(
+    state: &AppState,
+    text: &str,
+) -> Result<Option<LocalProbeAnswer>, GatewayError> {
+    if !local_probe_intercept_enabled(state).await? {
+        return Ok(None);
+    }
     if let Some(text) = arithmetic_probe_answer(text) {
-        return Some(LocalProbeAnswer {
+        return Ok(Some(LocalProbeAnswer {
             text,
             kind: LocalProbeKind::Arithmetic,
-        });
+        }));
     }
-    if let Some(text) = ping_probe_answer(text) {
-        return Some(LocalProbeAnswer {
-            text,
-            kind: LocalProbeKind::Ping,
-        });
-    }
-    if let Some(text) = health_probe_answer(text) {
-        return Some(LocalProbeAnswer {
-            text,
-            kind: LocalProbeKind::Health,
-        });
-    }
-    None
+    Ok(local_probe_intercept_answer(state, text)
+        .await?
+        .map(|answer| LocalProbeAnswer {
+            text: answer.text,
+            kind: answer.kind.into(),
+        }))
 }
 
 fn arithmetic_probe_answer(text: &str) -> Option<String> {
@@ -1170,104 +1190,6 @@ fn arithmetic_probe_answer(text: &str) -> Option<String> {
     }
     let expression = normalized[question_start..answer_marker].trim();
     evaluate_simple_integer_expression(expression).map(|value| value.to_string())
-}
-
-fn ping_probe_answer(text: &str) -> Option<String> {
-    let normalized = normalize_probe_text(text);
-    let lower = normalized.to_ascii_lowercase();
-    let compact = compact_probe_text(&lower);
-    let answer = ping_probe_response_text(&normalized);
-    if matches!(
-        compact.as_str(),
-        "ping" | "ping?" | "replypong" | "replyexactlypong" | "respondpong" | "respondexactlypong"
-    ) {
-        return Some(answer.to_string());
-    }
-    if is_short_probe_text(&normalized) {
-        let matched = matches!(
-            compact.as_str(),
-            "pingpong"
-                | "pingtest"
-                | "ping测试"
-                | "测活ping"
-                | "测试ping"
-                | "请回复pong"
-                | "只回复pong"
-                | "仅回复pong"
-                | "回复pong"
-                | "返回pong"
-                | "respondwithpong"
-                | "replywithpong"
-                | "saypong"
-                | "justpong"
-                | "onlypong"
-        ) || (lower.contains("pong") && contains_reply_only_directive(&lower));
-        if matched {
-            return Some(answer.to_string());
-        }
-    }
-    None
-}
-
-fn ping_probe_response_text(normalized: &str) -> &'static str {
-    if normalized.contains("PONG") {
-        LOCAL_PROBE_PONG_UPPER_TEXT
-    } else {
-        LOCAL_PROBE_PONG_TEXT
-    }
-}
-
-fn health_probe_answer(text: &str) -> Option<String> {
-    let normalized = normalize_probe_text(text);
-    if !is_short_probe_text(&normalized) {
-        return None;
-    }
-    let lower = normalized.to_ascii_lowercase();
-    let compact = compact_probe_text(&lower);
-    let answer = match compact.as_str() {
-        "hello" | "hi" | "hi?" => LOCAL_PROBE_ENGLISH_GREETING_TEXT,
-        "你好" | "您好" => LOCAL_PROBE_CHINESE_GREETING_TEXT,
-        "你是谁" | "你是谁?" | "你是谁？" => LOCAL_PROBE_CHINESE_IDENTITY_TEXT,
-        "whoareyou" | "whoareyou?" | "whoareu" | "whoareu?" => LOCAL_PROBE_ENGLISH_IDENTITY_TEXT,
-        "alive?" | "online?" | "areyoualive?" | "areyouonline?" | "areyouworking?" => {
-            LOCAL_PROBE_YES_TEXT
-        }
-        "test" | "test?" | "ok?" | "ok" | "replyok" | "replyexactlyok" | "replywithok"
-        | "respondok" | "respondexactlyok" | "respondwithok" | "returnok" | "sayok" | "onlyok"
-        | "justok" | "测试" | "测活" | "请回复ok" | "请返回ok" | "回复ok" | "返回ok"
-        | "只回复ok" | "仅回复ok" | "只返回ok" | "仅返回ok" | "联通测试" | "连接测试"
-        | "接口测试" | "健康检查" | "healthcheck" | "health" | "connectiontest"
-        | "connectivitytest" => LOCAL_PROBE_OK_TEXT,
-        _ => return None,
-    };
-    Some(answer.to_string())
-}
-
-fn contains_reply_only_directive(lower: &str) -> bool {
-    lower.contains("only")
-        || lower.contains("nothing else")
-        || lower.contains("reply exactly")
-        || lower.contains("respond exactly")
-        || lower.contains("respond with")
-        || lower.contains("reply with")
-        || lower.contains("return")
-        || lower.contains("say")
-        || lower.contains("只回复")
-        || lower.contains("仅回复")
-        || lower.contains("只返回")
-        || lower.contains("仅返回")
-        || lower.contains("回复")
-        || lower.contains("返回")
-}
-
-fn is_short_probe_text(text: &str) -> bool {
-    text.chars().count() <= 48
-}
-
-fn compact_probe_text(text: &str) -> String {
-    text.chars()
-        .filter(|ch| !ch.is_whitespace() && !matches!(ch, '.' | ',' | '!' | ':' | ';' | '"' | '\''))
-        .collect()
 }
 
 fn evaluate_simple_integer_expression(expression: &str) -> Option<i64> {
@@ -2515,8 +2437,68 @@ mod tests {
         openai_responses_local_probe_sse_body, parse_openai_image_validation_input,
         validate_openai_image_n, LocalProbeKind, OpenAiImageOperation,
     };
+    use crate::data::GatewayDataState;
+    use crate::local_probe_intercept::{
+        LOCAL_PROBE_INTERCEPT_ENABLED_KEY, LOCAL_PROBE_INTERCEPT_RULES_KEY,
+    };
+    use crate::AppState;
     use axum::body::Bytes;
     use serde_json::json;
+
+    fn probe_test_state() -> AppState {
+        AppState::new()
+            .expect("gateway state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::disabled().with_system_config_values_for_tests([
+                    (LOCAL_PROBE_INTERCEPT_ENABLED_KEY.to_string(), json!(true)),
+                    (
+                        LOCAL_PROBE_INTERCEPT_RULES_KEY.to_string(),
+                        json!([
+                            {
+                                "id": "ping",
+                                "name": "Ping",
+                                "prompt": "ping",
+                                "response": "pong",
+                                "kind": "ping",
+                                "enabled": true,
+                                "system": true,
+                            },
+                            {
+                                "id": "reply_ok",
+                                "name": "Reply OK",
+                                "prompt": "Reply exactly: OK",
+                                "response": "OK",
+                                "kind": "health",
+                                "enabled": true,
+                                "system": true,
+                            },
+                        ]),
+                    ),
+                ]),
+            )
+    }
+
+    fn probe_disabled_test_state() -> AppState {
+        AppState::new()
+            .expect("gateway state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::disabled().with_system_config_values_for_tests([(
+                    LOCAL_PROBE_INTERCEPT_ENABLED_KEY.to_string(),
+                    json!(false),
+                )]),
+            )
+    }
+
+    fn probe_default_rules_test_state() -> AppState {
+        AppState::new()
+            .expect("gateway state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::disabled().with_system_config_values_for_tests([(
+                    LOCAL_PROBE_INTERCEPT_ENABLED_KEY.to_string(),
+                    json!(true),
+                )]),
+            )
+    }
 
     #[test]
     fn estimates_claude_count_tokens_from_system_and_messages() {
@@ -2574,8 +2556,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn openai_responses_local_probe_answer_reads_responses_message_input() {
+    #[tokio::test]
+    async fn openai_responses_local_probe_answer_reads_responses_message_input() {
+        let state = probe_test_state();
         let payload = json!({
             "model": "gpt-5.4-mini",
             "stream": true,
@@ -2596,7 +2579,7 @@ mod tests {
         });
 
         assert_eq!(
-            openai_responses_local_probe_answer(&payload),
+            openai_responses_local_probe_answer(&state, &payload).await,
             Some(super::LocalProbeAnswer {
                 text: "21".to_string(),
                 kind: LocalProbeKind::Arithmetic,
@@ -2604,8 +2587,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn openai_responses_local_probe_answer_reads_string_input() {
+    #[tokio::test]
+    async fn openai_responses_local_probe_answer_reads_string_input() {
+        let state = probe_test_state();
         let payload = json!({
             "model": "gpt-5.4-mini",
             "input": concat!(
@@ -2617,7 +2601,7 @@ mod tests {
         });
 
         assert_eq!(
-            openai_responses_local_probe_answer(&payload),
+            openai_responses_local_probe_answer(&state, &payload).await,
             Some(super::LocalProbeAnswer {
                 text: "4".to_string(),
                 kind: LocalProbeKind::Arithmetic,
@@ -2625,112 +2609,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn local_probe_answer_handles_pong_and_health_prompts() {
-        assert_eq!(
-            super::local_probe_answer_from_text("ping"),
-            Some(super::LocalProbeAnswer {
-                text: super::LOCAL_PROBE_PONG_TEXT.to_string(),
-                kind: LocalProbeKind::Ping,
-            })
-        );
-        assert_eq!(
-            super::local_probe_answer_from_text("Are you alive?"),
-            Some(super::LocalProbeAnswer {
-                text: super::LOCAL_PROBE_YES_TEXT.to_string(),
-                kind: LocalProbeKind::Health,
-            })
-        );
-        assert_eq!(
-            super::local_probe_answer_from_text("只回复 pong"),
-            Some(super::LocalProbeAnswer {
-                text: super::LOCAL_PROBE_PONG_TEXT.to_string(),
-                kind: LocalProbeKind::Ping,
-            })
-        );
-        assert_eq!(
-            super::local_probe_answer_from_text("Reply exactly: PONG"),
-            Some(super::LocalProbeAnswer {
-                text: super::LOCAL_PROBE_PONG_UPPER_TEXT.to_string(),
-                kind: LocalProbeKind::Ping,
-            })
-        );
-        assert_eq!(
-            super::local_probe_answer_from_text("你是谁"),
-            Some(super::LocalProbeAnswer {
-                text: super::LOCAL_PROBE_CHINESE_IDENTITY_TEXT.to_string(),
-                kind: LocalProbeKind::Health,
-            })
-        );
-        assert_eq!(
-            super::local_probe_answer_from_text("who are you"),
-            Some(super::LocalProbeAnswer {
-                text: super::LOCAL_PROBE_ENGLISH_IDENTITY_TEXT.to_string(),
-                kind: LocalProbeKind::Health,
-            })
-        );
-        assert_eq!(
-            super::local_probe_answer_from_text("who are u"),
-            Some(super::LocalProbeAnswer {
-                text: super::LOCAL_PROBE_ENGLISH_IDENTITY_TEXT.to_string(),
-                kind: LocalProbeKind::Health,
-            })
-        );
-        assert_eq!(
-            super::local_probe_answer_from_text("Reply exactly: OK"),
-            Some(super::LocalProbeAnswer {
-                text: super::LOCAL_PROBE_OK_TEXT.to_string(),
-                kind: LocalProbeKind::Health,
-            })
-        );
-        assert_eq!(
-            super::local_probe_answer_from_text("Say OK"),
-            Some(super::LocalProbeAnswer {
-                text: super::LOCAL_PROBE_OK_TEXT.to_string(),
-                kind: LocalProbeKind::Health,
-            })
-        );
-        assert_eq!(
-            super::local_probe_answer_from_text("请回复 OK"),
-            Some(super::LocalProbeAnswer {
-                text: super::LOCAL_PROBE_OK_TEXT.to_string(),
-                kind: LocalProbeKind::Health,
-            })
-        );
-        assert_eq!(
-            super::local_probe_answer_from_text("你好"),
-            Some(super::LocalProbeAnswer {
-                text: super::LOCAL_PROBE_CHINESE_GREETING_TEXT.to_string(),
-                kind: LocalProbeKind::Health,
-            })
-        );
-        assert_eq!(
-            super::local_probe_answer_from_text("hello"),
-            Some(super::LocalProbeAnswer {
-                text: super::LOCAL_PROBE_ENGLISH_GREETING_TEXT.to_string(),
-                kind: LocalProbeKind::Health,
-            })
-        );
-        assert_eq!(
-            super::local_probe_answer_from_text(
-                "Please test whether the parser can answer who are you in a paragraph."
-            ),
-            None
-        );
-        assert_eq!(
-            super::local_probe_answer_from_text(
-                "Please explain why a monitor might ask Reply exactly: OK."
-            ),
-            None
-        );
-        assert_eq!(
-            super::local_probe_answer_from_text("请帮我写一个包含“你是谁”的测试用例"),
-            None
-        );
-    }
-
-    #[test]
-    fn openai_chat_local_probe_answer_reads_chat_message_input() {
+    #[tokio::test]
+    async fn openai_chat_local_probe_answer_reads_configured_chat_message_input() {
+        let state = probe_test_state();
         let payload = json!({
             "model": "gpt-5.4-mini",
             "messages": [{
@@ -2743,11 +2624,64 @@ mod tests {
         });
 
         assert_eq!(
-            openai_chat_local_probe_answer(&payload),
+            openai_chat_local_probe_answer(&state, &payload).await,
             Some(super::LocalProbeAnswer {
-                text: super::LOCAL_PROBE_PONG_TEXT.to_string(),
+                text: "pong".to_string(),
                 kind: LocalProbeKind::Ping,
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_chat_local_probe_answer_uses_default_rules_when_rules_config_missing() {
+        let state = probe_default_rules_test_state();
+        let payload = json!({
+            "model": "gpt-5.4-mini",
+            "messages": [{
+                "role": "user",
+                "content": "Reply exactly: OK"
+            }]
+        });
+
+        assert_eq!(
+            openai_chat_local_probe_answer(&state, &payload).await,
+            Some(super::LocalProbeAnswer {
+                text: "OK".to_string(),
+                kind: LocalProbeKind::Health,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_probe_prompt_does_not_match_when_module_disabled() {
+        let state = probe_disabled_test_state();
+        let payload = json!({
+            "model": "gpt-5.4-mini",
+            "messages": [{
+                "role": "user",
+                "content": "ping"
+            }]
+        });
+
+        assert_eq!(openai_chat_local_probe_answer(&state, &payload).await, None);
+    }
+
+    #[tokio::test]
+    async fn arithmetic_probe_answer_does_not_match_when_module_disabled() {
+        let state = probe_disabled_test_state();
+        let payload = json!({
+            "model": "gpt-5.4-mini",
+            "input": concat!(
+                "Calculate and respond with ONLY the number, nothing else. ",
+                "Q: 2 * 3 = ? A: 6 ",
+                "Q: 8 / 4 = ? A: 2 ",
+                "Q: 9 - 5 = ? A:"
+            )
+        });
+
+        assert_eq!(
+            openai_responses_local_probe_answer(&state, &payload).await,
+            None
         );
     }
 
@@ -2767,13 +2701,13 @@ mod tests {
         let body = String::from_utf8(openai_chat_local_probe_sse_body(
             "chatcmpl_probe",
             "gpt-5.4-mini",
-            super::LOCAL_PROBE_PONG_TEXT,
+            "pong",
             1,
         ))
         .expect("sse body should be utf-8");
 
         assert!(body.contains("\"object\":\"chat.completion.chunk\""));
-        assert!(body.contains(super::LOCAL_PROBE_PONG_TEXT));
+        assert!(body.contains("pong"));
         assert!(body.ends_with("data: [DONE]\n\n"));
     }
 

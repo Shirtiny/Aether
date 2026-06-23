@@ -75,6 +75,18 @@ pub(crate) const ADMIN_MODULE_DEFINITIONS: &[AdminModuleDefinition] = &[
         admin_menu_order: 59,
     },
     AdminModuleDefinition {
+        name: "local_probe_intercept",
+        display_name: "测活拦截",
+        description: "拦截已配置的短测活提示词并本地返回对应回复，算术测活内置支持。",
+        category: "security",
+        env_key: "LOCAL_PROBE_INTERCEPT_AVAILABLE",
+        default_available: true,
+        admin_route: Some("/admin/modules/local-probe-intercept"),
+        admin_menu_icon: Some("Activity"),
+        admin_menu_group: Some("system"),
+        admin_menu_order: 59,
+    },
+    AdminModuleDefinition {
         name: "important_notification",
         display_name: "通知服务",
         description: "统一管理通知项、模板和推送服务选择，供后台任务和用户通知使用",
@@ -230,6 +242,12 @@ pub(crate) fn admin_module_enabled_config_key(module: &AdminModuleDefinition) ->
     }
 }
 
+fn admin_module_enabled_default(module: &AdminModuleDefinition) -> bool {
+    admin_system_kernel::admin_system_config_default_value(&admin_module_enabled_config_key(module))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+}
+
 fn admin_module_available(module: &AdminModuleDefinition) -> bool {
     if module.name == "important_notification" {
         let legacy_default =
@@ -357,7 +375,7 @@ pub(crate) async fn build_admin_module_status_payload(
         } else {
             enabled_value
         };
-        system_config_bool(enabled_value.as_ref(), false)
+        system_config_bool(enabled_value.as_ref(), admin_module_enabled_default(module))
     } else {
         false
     };
@@ -400,4 +418,20 @@ pub(crate) async fn build_admin_modules_status_payload(
         );
     }
     Ok(serde_json::Value::Object(payload))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn module_enabled_defaults_follow_system_config_defaults() {
+        let local_probe = admin_module_by_name("local_probe_intercept")
+            .expect("local probe intercept module should be registered");
+        let chat_pii = admin_module_by_name("chat_pii_redaction")
+            .expect("chat pii module should be registered");
+
+        assert!(admin_module_enabled_default(local_probe));
+        assert!(!admin_module_enabled_default(chat_pii));
+    }
 }

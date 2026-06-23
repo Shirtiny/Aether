@@ -66,6 +66,7 @@ export default [
         require: 'readonly',
         exports: 'readonly',
         Buffer: 'readonly',
+        __APP_VERSION__: 'readonly',
         // DOM/SVG 全局类型
         alert: 'readonly',
         confirm: 'readonly',

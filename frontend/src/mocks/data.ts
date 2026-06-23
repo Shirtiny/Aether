@@ -9,7 +9,7 @@ import type { User as AdminUser } from '@/api/users'
 import type { AdminApiKeysResponse } from '@/api/admin'
 import type { Profile, UsageResponse } from '@/api/me'
 import type { ProviderWithEndpointsSummary, GlobalModelResponse } from '@/api/endpoints/types'
-import type { ModuleStatus } from '@/api/modules'
+import { LOCAL_PROBE_INTERCEPT_DEFAULT_RULES, type ModuleStatus } from '@/api/modules'
 
 // ========== 用户数据 ==========
 
@@ -953,6 +953,12 @@ export const MOCK_SYSTEM_CONFIGS: Array<{ key: string; value: unknown; descripti
     ],
     description: '通知服务通知项和模板',
   },
+  { key: 'module.local_probe_intercept.enabled', value: true, description: '测活拦截总开关' },
+  {
+    key: 'module.local_probe_intercept.rules',
+    value: LOCAL_PROBE_INTERCEPT_DEFAULT_RULES.map(rule => ({ ...rule })),
+    description: '测活拦截提示词与回复规则',
+  },
   { key: 'module.server_chan_push.enabled', value: false, description: 'Server 酱推送开关' },
   { key: 'module.server_chan_push.send_key', value: null, description: 'Server 酱 SendKey' },
   { key: 'module.server_chan_push.template', value: '', description: 'Server 酱推送模板' },
@@ -1078,6 +1084,20 @@ const MOCK_MODULE_DEFINITIONS: Array<Omit<ModuleStatus, 'active' | 'health'> & {
     config_error: null,
     admin_route: '/admin/modules/chat-pii-redaction',
     admin_menu_icon: 'ShieldCheck',
+    admin_menu_group: 'system',
+    admin_menu_order: 59,
+  },
+  {
+    name: 'local_probe_intercept',
+    display_name: '测活拦截',
+    description: '拦截已配置的短测活提示词并本地返回对应回复，算术测活内置支持。',
+    category: 'security',
+    available: true,
+    enabled: true,
+    config_validated: true,
+    config_error: null,
+    admin_route: '/admin/modules/local-probe-intercept',
+    admin_menu_icon: 'Activity',
     admin_menu_group: 'system',
     admin_menu_order: 59,
   },

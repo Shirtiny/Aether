@@ -176,6 +176,232 @@ fn chat_pii_redaction_default_rules() -> serde_json::Value {
     ])
 }
 
+fn local_probe_intercept_rule(
+    id: &str,
+    name: &str,
+    prompt: &str,
+    response: &str,
+    kind: &str,
+) -> Value {
+    json!({
+        "id": id,
+        "name": name,
+        "prompt": prompt,
+        "response": response,
+        "kind": kind,
+        "enabled": true,
+        "system": true
+    })
+}
+
+fn local_probe_intercept_default_rules() -> serde_json::Value {
+    let rules = [
+        ("ping", "Ping", "ping", "pong", "ping"),
+        ("reply_pong", "回复 pong", "只回复 pong", "pong", "ping"),
+        (
+            "reply_pong_plain",
+            "Reply pong",
+            "reply pong",
+            "pong",
+            "ping",
+        ),
+        (
+            "reply_exactly_pong",
+            "Reply exactly PONG",
+            "Reply exactly: PONG",
+            "PONG",
+            "ping",
+        ),
+        (
+            "respond_pong",
+            "Respond pong",
+            "respond pong",
+            "pong",
+            "ping",
+        ),
+        (
+            "respond_exactly_pong",
+            "Respond exactly pong",
+            "respond exactly pong",
+            "pong",
+            "ping",
+        ),
+        (
+            "reply_with_pong",
+            "Reply with pong",
+            "reply with pong",
+            "pong",
+            "ping",
+        ),
+        (
+            "respond_with_pong",
+            "Respond with pong",
+            "respond with pong",
+            "pong",
+            "ping",
+        ),
+        ("say_pong", "Say pong", "say pong", "pong", "ping"),
+        ("only_pong", "Only pong", "only pong", "pong", "ping"),
+        ("just_pong", "Just pong", "just pong", "pong", "ping"),
+        ("cn_reply_pong", "回复 pong", "回复 pong", "pong", "ping"),
+        ("cn_return_pong", "返回 pong", "返回 pong", "pong", "ping"),
+        (
+            "cn_only_reply_pong",
+            "仅回复 pong",
+            "仅回复 pong",
+            "pong",
+            "ping",
+        ),
+        (
+            "reply_exactly_ok",
+            "Reply exactly OK",
+            "Reply exactly: OK",
+            "OK",
+            "health",
+        ),
+        ("ok", "OK", "OK", "OK", "health"),
+        ("say_ok", "Say OK", "Say OK", "OK", "health"),
+        ("only_ok", "Only OK", "only OK", "OK", "health"),
+        ("just_ok", "Just OK", "just OK", "OK", "health"),
+        ("reply_ok", "Reply OK", "reply OK", "OK", "health"),
+        ("respond_ok", "Respond OK", "respond OK", "OK", "health"),
+        ("return_ok", "Return OK", "return OK", "OK", "health"),
+        (
+            "reply_with_ok",
+            "Reply with OK",
+            "reply with OK",
+            "OK",
+            "health",
+        ),
+        (
+            "respond_exactly_ok",
+            "Respond exactly OK",
+            "respond exactly OK",
+            "OK",
+            "health",
+        ),
+        (
+            "respond_with_ok",
+            "Respond with OK",
+            "respond with OK",
+            "OK",
+            "health",
+        ),
+        ("cn_reply_ok", "请回复 OK", "请回复 OK", "OK", "health"),
+        ("cn_reply_ok_plain", "回复 OK", "回复 OK", "OK", "health"),
+        ("cn_return_ok_plain", "返回 OK", "返回 OK", "OK", "health"),
+        (
+            "cn_only_reply_ok_plain",
+            "仅回复 OK",
+            "仅回复 OK",
+            "OK",
+            "health",
+        ),
+        (
+            "cn_only_return_ok_plain",
+            "仅返回 OK",
+            "仅返回 OK",
+            "OK",
+            "health",
+        ),
+        ("cn_return_ok", "请返回 OK", "请返回 OK", "OK", "health"),
+        ("cn_only_reply_ok", "只回复 OK", "只回复 OK", "OK", "health"),
+        (
+            "cn_only_return_ok",
+            "只返回 OK",
+            "只返回 OK",
+            "OK",
+            "health",
+        ),
+        (
+            "are_you_alive",
+            "Are you alive",
+            "Are you alive?",
+            "Yes.",
+            "health",
+        ),
+        ("alive", "Alive", "alive?", "Yes.", "health"),
+        ("online", "Online", "online?", "Yes.", "health"),
+        (
+            "are_you_online",
+            "Are you online",
+            "Are you online?",
+            "Yes.",
+            "health",
+        ),
+        (
+            "are_you_working",
+            "Are you working",
+            "Are you working?",
+            "Yes.",
+            "health",
+        ),
+        ("hello", "Hello", "hello", "Hello!", "health"),
+        ("hi", "Hi", "hi", "Hello!", "health"),
+        ("cn_hello_polite", "您好", "您好", "你好！", "health"),
+        ("cn_hello", "你好", "你好", "你好！", "health"),
+        (
+            "who_are_you",
+            "Who are you",
+            "who are you",
+            "I'm ChatGPT.",
+            "health",
+        ),
+        (
+            "who_are_u",
+            "Who are u",
+            "who are u",
+            "I'm ChatGPT.",
+            "health",
+        ),
+        (
+            "cn_who_are_you",
+            "你是谁",
+            "你是谁",
+            "我是 ChatGPT。",
+            "health",
+        ),
+        ("test", "Test", "test", "OK", "health"),
+        ("cn_test", "测试", "测试", "OK", "health"),
+        ("cn_health_probe", "测活", "测活", "OK", "health"),
+        (
+            "cn_connectivity_test",
+            "联通测试",
+            "联通测试",
+            "OK",
+            "health",
+        ),
+        ("cn_connection_test", "连接测试", "连接测试", "OK", "health"),
+        ("cn_api_test", "接口测试", "接口测试", "OK", "health"),
+        ("cn_health_check", "健康检查", "健康检查", "OK", "health"),
+        ("healthcheck", "Health check", "healthcheck", "OK", "health"),
+        ("health", "Health", "health", "OK", "health"),
+        (
+            "connection_test",
+            "Connection test",
+            "connection test",
+            "OK",
+            "health",
+        ),
+        (
+            "connectivity_test",
+            "Connectivity test",
+            "connectivity test",
+            "OK",
+            "health",
+        ),
+    ];
+
+    Value::Array(
+        rules
+            .into_iter()
+            .map(|(id, name, prompt, response, kind)| {
+                local_probe_intercept_rule(id, name, prompt, response, kind)
+            })
+            .collect(),
+    )
+}
+
 fn notification_service_default_items() -> serde_json::Value {
     json!([
         {
@@ -1441,6 +1667,7 @@ pub fn build_admin_module_health(
         "management_tokens"
         | "model_directives"
         | "proxy_nodes"
+        | "local_probe_intercept"
         | "important_notification"
         | "bark_push"
         | "server_chan_push"
@@ -1803,6 +2030,8 @@ pub fn admin_system_config_default_value(key: &str) -> Option<serde_json::Value>
         "smtp_from_email" => Some(serde_json::Value::Null),
         "smtp_from_name" => Some(json!("Aether")),
         "enable_oauth_token_refresh" => Some(json!(true)),
+        "module.local_probe_intercept.enabled" => Some(json!(true)),
+        "module.local_probe_intercept.rules" => Some(local_probe_intercept_default_rules()),
         "module.important_notification.enabled" => Some(json!(false)),
         "module.important_notification.email_enabled" => Some(json!(false)),
         "module.important_notification.email_recipients" => Some(json!("")),
@@ -1924,6 +2153,123 @@ fn normalize_chat_pii_redaction_rules_value(
         }));
     }
     Ok(serde_json::Value::Array(rules))
+}
+
+fn normalize_local_probe_intercept_rules_value(
+    value: serde_json::Value,
+) -> Result<serde_json::Value, ()> {
+    let Some(raw_rules) = value.as_array() else {
+        return Err(());
+    };
+    let mut rules = Vec::with_capacity(raw_rules.len());
+    let mut ids = BTreeSet::new();
+    let mut prompts = BTreeSet::new();
+    for (index, raw_rule) in raw_rules.iter().enumerate() {
+        let Some(raw_rule) = raw_rule.as_object() else {
+            return Err(());
+        };
+        let raw_id = raw_rule
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| format!("custom_{}", index + 1));
+        let id = normalize_local_probe_intercept_rule_id(&raw_id, index);
+        if !ids.insert(id.clone()) {
+            return Err(());
+        }
+        let name = normalize_optional_bounded_string(raw_rule.get("name"), 80)?
+            .unwrap_or_else(|| id.clone());
+        let prompt = normalize_optional_bounded_string(raw_rule.get("prompt"), 512)?.ok_or(())?;
+        let response =
+            normalize_optional_bounded_string(raw_rule.get("response"), 8_000)?.ok_or(())?;
+        let normalized_prompt_key = local_probe_intercept_prompt_key(&prompt);
+        if normalized_prompt_key.is_empty() || !prompts.insert(normalized_prompt_key) {
+            return Err(());
+        }
+        let kind = match raw_rule
+            .get("kind")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("health")
+        {
+            "ping" => "ping",
+            "health" => "health",
+            _ => return Err(()),
+        };
+        let enabled = raw_rule
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let system = raw_rule
+            .get("system")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        rules.push(json!({
+            "id": id,
+            "name": name,
+            "prompt": prompt,
+            "response": response,
+            "kind": kind,
+            "enabled": enabled,
+            "system": system,
+        }));
+    }
+    Ok(Value::Array(rules))
+}
+
+fn normalize_local_probe_intercept_rule_id(raw: &str, index: usize) -> String {
+    let normalized = raw
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let normalized = normalized.trim_matches('_');
+    if normalized.is_empty() {
+        format!("custom_{}", index + 1)
+    } else {
+        normalized.chars().take(64).collect()
+    }
+}
+
+fn local_probe_intercept_prompt_key(prompt: &str) -> String {
+    prompt
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|ch| {
+            !ch.is_whitespace()
+                && !matches!(
+                    ch,
+                    '.' | ','
+                        | '!'
+                        | ':'
+                        | ';'
+                        | '"'
+                        | '\''
+                        | '?'
+                        | '？'
+                        | '。'
+                        | '，'
+                        | '！'
+                        | '：'
+                        | '；'
+                        | '“'
+                        | '”'
+                        | '‘'
+                        | '’'
+                        | '、'
+                )
+        })
+        .collect()
 }
 
 fn normalize_chat_pii_redaction_rule_features(
@@ -2197,6 +2543,7 @@ pub fn parse_admin_system_config_update(
     match normalized_key.as_str() {
         "module.important_notification.enabled"
         | "module.important_notification.email_enabled"
+        | "module.local_probe_intercept.enabled"
         | "module.server_chan_push.enabled"
         | "module.bark_push.enabled" => match value.as_bool() {
             Some(enabled) => value = json!(enabled),
@@ -2231,6 +2578,18 @@ pub fn parse_admin_system_config_update(
                 value = notification_service_default_items();
             } else {
                 value = normalize_notification_service_items_value(value).map_err(|_| {
+                    (
+                        http::StatusCode::BAD_REQUEST,
+                        json!({ "detail": "请求数据验证失败" }),
+                    )
+                })?;
+            }
+        }
+        "module.local_probe_intercept.rules" => {
+            if value.is_null() {
+                value = local_probe_intercept_default_rules();
+            } else {
+                value = normalize_local_probe_intercept_rules_value(value).map_err(|_| {
                     (
                         http::StatusCode::BAD_REQUEST,
                         json!({ "detail": "请求数据验证失败" }),
@@ -3512,6 +3871,111 @@ mod tests {
             r#"{ "value": "api.day.app" }"#.as_bytes(),
         )
         .expect_err("server url without scheme should fail");
+        assert_eq!(err.0, http::StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn local_probe_intercept_config_defaults_are_available() {
+        assert_eq!(
+            admin_system_config_default_value("module.local_probe_intercept.enabled"),
+            Some(json!(true))
+        );
+        let rules = admin_system_config_default_value("module.local_probe_intercept.rules")
+            .expect("local probe rules should have defaults");
+        let rules = rules.as_array().expect("rules should be an array");
+
+        assert!(rules
+            .iter()
+            .any(|rule| rule["prompt"] == json!("Reply exactly: OK")
+                && rule["response"] == json!("OK")));
+        assert!(rules
+            .iter()
+            .any(|rule| rule["prompt"] == json!("ping") && rule["kind"] == json!("ping")));
+    }
+
+    #[test]
+    fn local_probe_intercept_default_rules_have_unique_prompt_keys() {
+        let rules = admin_system_config_default_value("module.local_probe_intercept.rules")
+            .expect("local probe rules should have defaults");
+        let rules = rules.as_array().expect("rules should be an array");
+        let normalized = normalize_local_probe_intercept_rules_value(Value::Array(rules.clone()))
+            .expect("default rules should normalize");
+
+        assert_eq!(
+            normalized.as_array().map(Vec::len),
+            Some(rules.len()),
+            "default rules should not drop entries"
+        );
+    }
+
+    #[test]
+    fn local_probe_intercept_rules_are_normalized() {
+        let update = parse_admin_system_config_update(
+            "module.local_probe_intercept.rules",
+            r#"{
+                "value": [
+                    {
+                        "id": " reply exactly ok ",
+                        "name": " Reply exactly OK ",
+                        "prompt": " Reply exactly: OK ",
+                        "response": " OK ",
+                        "kind": "health",
+                        "enabled": true,
+                        "system": true
+                    },
+                    {
+                        "prompt": " ping ",
+                        "response": " pong ",
+                        "kind": "ping"
+                    }
+                ]
+            }"#
+            .as_bytes(),
+        )
+        .expect("local probe rules should parse");
+
+        assert_eq!(update.normalized_key, "module.local_probe_intercept.rules");
+        assert_eq!(update.value[0]["id"], json!("reply_exactly_ok"));
+        assert_eq!(update.value[0]["prompt"], json!("Reply exactly: OK"));
+        assert_eq!(update.value[0]["response"], json!("OK"));
+        assert_eq!(update.value[0]["kind"], json!("health"));
+        assert_eq!(update.value[1]["id"], json!("custom_2"));
+        assert_eq!(update.value[1]["kind"], json!("ping"));
+        assert_eq!(update.value[1]["enabled"], json!(true));
+        assert_eq!(update.value[1]["system"], json!(false));
+    }
+
+    #[test]
+    fn local_probe_intercept_rejects_duplicate_prompt_keys() {
+        let err = parse_admin_system_config_update(
+            "module.local_probe_intercept.rules",
+            r#"{
+                "value": [
+                    { "id": "a", "prompt": "Reply exactly: OK", "response": "OK" },
+                    { "id": "b", "prompt": " reply exactly ok ", "response": "OK" }
+                ]
+            }"#
+            .as_bytes(),
+        )
+        .expect_err("duplicate normalized prompts should fail");
+
+        assert_eq!(err.0, http::StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn local_probe_intercept_enabled_is_boolean() {
+        let update = parse_admin_system_config_update(
+            "module.local_probe_intercept.enabled",
+            r#"{ "value": true }"#.as_bytes(),
+        )
+        .expect("enabled flag should parse");
+        assert_eq!(update.value, json!(true));
+
+        let err = parse_admin_system_config_update(
+            "module.local_probe_intercept.enabled",
+            r#"{ "value": "true" }"#.as_bytes(),
+        )
+        .expect_err("enabled flag should reject strings");
         assert_eq!(err.0, http::StatusCode::BAD_REQUEST);
     }
 
