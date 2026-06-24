@@ -337,7 +337,16 @@ fn users_me_usage_metadata_string<'a>(
 }
 
 fn users_me_usage_session_id(item: &StoredRequestUsageAudit) -> Option<&str> {
-    users_me_usage_metadata_string(item, "session_id")
+    item.request_metadata
+        .as_ref()
+        .and_then(serde_json::Value::as_object)
+        .and_then(|metadata| metadata.get("client_session_affinity"))
+        .and_then(serde_json::Value::as_object)
+        .and_then(|affinity| affinity.get("session_key"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| users_me_usage_metadata_string(item, "session_id"))
         .or_else(|| users_me_usage_metadata_string(item, "conversation_id"))
 }
 

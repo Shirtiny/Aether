@@ -1279,6 +1279,10 @@ fn push_postgres_usage_session_id_filter(
     *has_where = true;
     builder.push("(");
     builder
+        .push("LOWER(COALESCE(\"usage\".request_metadata#>>'{client_session_affinity,session_key}', '')) LIKE ")
+        .push_bind(pattern.clone());
+    builder.push(" OR ");
+    builder
         .push("LOWER(COALESCE(\"usage\".request_metadata->>'session_id', '')) LIKE ")
         .push_bind(pattern.clone());
     builder

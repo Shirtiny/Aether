@@ -333,8 +333,34 @@ fn usage_metadata_string_contains(
         .is_some_and(|value| value.to_ascii_lowercase().contains(&needle))
 }
 
+fn usage_metadata_nested_string_contains(
+    item: &StoredRequestUsageAudit,
+    path: &[&str],
+    needle: &str,
+) -> bool {
+    let needle = needle.to_ascii_lowercase();
+    let Some(mut current) = item.request_metadata.as_ref() else {
+        return false;
+    };
+    for key in path {
+        let Some(next) = current.get(*key) else {
+            return false;
+        };
+        current = next;
+    }
+    current
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some_and(|value| value.to_ascii_lowercase().contains(&needle))
+}
+
 fn usage_session_id_matches(item: &StoredRequestUsageAudit, needle: &str) -> bool {
-    usage_metadata_string_contains(item, "session_id", needle)
+    usage_metadata_nested_string_contains(
+        item,
+        &["client_session_affinity", "session_key"],
+        needle,
+    ) || usage_metadata_string_contains(item, "session_id", needle)
         || usage_metadata_string_contains(item, "conversation_id", needle)
 }
 
@@ -4913,7 +4939,13 @@ mod tests {
         second.request_metadata = Some(serde_json::json!({
             "conversation_id": "conv-beta-456"
         }));
-        let repository = InMemoryUsageReadRepository::seed(vec![first, second]);
+        let mut third = sample_usage("req-session-3", 3);
+        third.request_metadata = Some(serde_json::json!({
+            "client_session_affinity": {
+                "session_key": "session=gamma-789"
+            }
+        }));
+        let repository = InMemoryUsageReadRepository::seed(vec![first, second, third]);
 
         let by_session = repository
             .list_usage_audits(&crate::repository::usage::UsageAuditListQuery {
@@ -4929,11 +4961,20 @@ mod tests {
             })
             .await
             .expect("list by conversation_id should succeed");
+        let by_affinity = repository
+            .list_usage_audits(&crate::repository::usage::UsageAuditListQuery {
+                session_id: Some("gamma".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("list by client session affinity should succeed");
 
         assert_eq!(by_session.len(), 1);
         assert_eq!(by_session[0].request_id, "req-session-1");
         assert_eq!(by_conversation.len(), 1);
         assert_eq!(by_conversation[0].request_id, "req-session-2");
+        assert_eq!(by_affinity.len(), 1);
+        assert_eq!(by_affinity[0].request_id, "req-session-3");
     }
 
     #[tokio::test]

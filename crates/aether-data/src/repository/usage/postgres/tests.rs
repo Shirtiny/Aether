@@ -739,6 +739,9 @@ fn usage_sql_uses_json_null_placeholders_for_usage_payload_columns() {
         assert!(sql.contains("'is_risk_control'"));
         assert!(sql.contains("request_metadata->>'is_risk_control'"));
         assert!(sql.contains("AS client_family"));
+        assert!(sql.contains("'client_session_affinity'"));
+        assert!(sql.contains("'session_key'"));
+        assert!(sql.contains("request_metadata->'client_session_affinity'->>'session_key'"));
         assert!(sql.contains("request_metadata->'client_session_affinity'->>'client_family'"));
         assert!(sql.contains("request_metadata->>'client_family'"));
         assert!(sql.contains("CAST(\"usage\".input_tokens AS INTEGER) AS input_tokens"));

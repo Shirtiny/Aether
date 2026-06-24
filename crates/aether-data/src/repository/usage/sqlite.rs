@@ -475,6 +475,10 @@ fn push_sqlite_usage_list_filters(
             push_sqlite_usage_where(builder, has_where);
             builder.push("(");
             builder
+                .push("LOWER(COALESCE(json_extract(request_metadata, '$.client_session_affinity.session_key'), '')) LIKE ")
+                .push_bind(pattern.clone());
+            builder.push(" OR ");
+            builder
                 .push("LOWER(COALESCE(json_extract(request_metadata, '$.session_id'), '')) LIKE ")
                 .push_bind(pattern.clone());
             builder

@@ -111,6 +111,8 @@ SELECT
   NULL::bytea AS client_response_body_compressed,
   CASE
     WHEN NULLIF(BTRIM("usage".request_metadata->>'client_ip'), '') IS NOT NULL
+      OR NULLIF(BTRIM("usage".request_metadata->'client_session_affinity'->>'session_key'), '') IS NOT NULL
+      OR NULLIF(BTRIM("usage".request_metadata->'client_session_affinity'->>'client_family'), '') IS NOT NULL
       OR NULLIF(BTRIM("usage".request_metadata->>'user_agent'), '') IS NOT NULL
       OR NULLIF(BTRIM("usage".request_metadata->>'cafecode_uid'), '') IS NOT NULL
       OR NULLIF(BTRIM("usage".request_metadata->>'cafecode_uname'), '') IS NOT NULL
@@ -133,6 +135,18 @@ SELECT
       OR ("usage".request_metadata->>'client_requested_stream') IN ('true', 'false')
       OR ("usage".request_metadata->>'upstream_is_stream') IN ('true', 'false')
       THEN jsonb_strip_nulls(jsonb_build_object(
+        'client_session_affinity',
+        CASE
+          WHEN NULLIF(BTRIM("usage".request_metadata->'client_session_affinity'->>'session_key'), '') IS NOT NULL
+            OR NULLIF(BTRIM("usage".request_metadata->'client_session_affinity'->>'client_family'), '') IS NOT NULL
+          THEN jsonb_strip_nulls(jsonb_build_object(
+            'session_key',
+            NULLIF(BTRIM("usage".request_metadata->'client_session_affinity'->>'session_key'), ''),
+            'client_family',
+            NULLIF(BTRIM("usage".request_metadata->'client_session_affinity'->>'client_family'), '')
+          ))
+          ELSE NULL
+        END,
         'client_ip',
         NULLIF(BTRIM("usage".request_metadata->>'client_ip'), ''),
         'user_agent',
