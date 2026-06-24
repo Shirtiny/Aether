@@ -738,7 +738,8 @@ impl PromptCaptureRole {
 
 #[derive(Debug)]
 struct CapturedPrompt {
-    source: &'static str,
+    source: String,
+    index: Option<usize>,
     role: PromptCaptureRole,
     text: String,
 }
@@ -759,7 +760,13 @@ fn append_prompt_capture_metadata(
     }
     if prompts.len() < policy.max_items {
         if let Some(body) = provider_request_body {
-            collect_prompt_capture_items("provider_request", body, policy, &mut prompts);
+            let mut provider_prompts = Vec::new();
+            collect_prompt_capture_items("provider_request", body, policy, &mut provider_prompts);
+            append_supplemental_prompt_capture_items(
+                &mut prompts,
+                provider_prompts,
+                policy.max_items,
+            );
         }
     }
     if prompts.is_empty() {
@@ -797,8 +804,36 @@ fn append_prompt_capture_metadata(
     object.insert("prompt_capture".to_string(), Value::Object(prompt_capture));
 }
 
+fn append_supplemental_prompt_capture_items(
+    output: &mut Vec<CapturedPrompt>,
+    candidates: Vec<CapturedPrompt>,
+    max_items: usize,
+) {
+    let remaining = max_items.saturating_sub(output.len());
+    if remaining == 0 || candidates.is_empty() {
+        return;
+    }
+
+    let mut selected = Vec::new();
+    for candidate in candidates.into_iter().rev() {
+        if selected.len() >= remaining {
+            break;
+        }
+        if output.iter().any(|prompt| prompt.text == candidate.text)
+            || selected
+                .iter()
+                .any(|prompt: &CapturedPrompt| prompt.text == candidate.text)
+        {
+            continue;
+        }
+        selected.push(candidate);
+    }
+    selected.reverse();
+    output.extend(selected);
+}
+
 fn collect_prompt_capture_items(
-    source: &'static str,
+    source: &str,
     value: &Value,
     policy: UsagePromptCapturePolicy,
     output: &mut Vec<CapturedPrompt>,
@@ -808,7 +843,7 @@ fn collect_prompt_capture_items(
 }
 
 fn collect_top_level_prompt_fields(
-    source: &'static str,
+    source: &str,
     value: &Value,
     policy: UsagePromptCapturePolicy,
     output: &mut Vec<CapturedPrompt>,
@@ -823,26 +858,28 @@ fn collect_top_level_prompt_fields(
         "systemInstruction",
     ] {
         collect_text_values_for_role(
-            source,
+            format!("{source}.{key}"),
             object.get(key),
             PromptCaptureRole::System,
             policy,
             output,
+            None,
         );
     }
     if object.get("input").is_some_and(Value::is_string) {
         collect_text_values_for_role(
-            source,
+            format!("{source}.input"),
             object.get("input"),
             PromptCaptureRole::User,
             policy,
             output,
+            None,
         );
     }
 }
 
 fn collect_message_prompts(
-    source: &'static str,
+    source: &str,
     value: &Value,
     policy: UsagePromptCapturePolicy,
     output: &mut Vec<CapturedPrompt>,
@@ -851,12 +888,13 @@ fn collect_message_prompts(
         return;
     };
     for key in ["input", "messages", "contents"] {
-        collect_message_array(source, object.get(key), policy, output);
+        collect_message_array(source, key, object.get(key), policy, output);
     }
 }
 
 fn collect_message_array(
-    source: &'static str,
+    source: &str,
+    array_key: &str,
     value: Option<&Value>,
     policy: UsagePromptCapturePolicy,
     output: &mut Vec<CapturedPrompt>,
@@ -864,16 +902,7 @@ fn collect_message_array(
     let Some(Value::Array(items)) = value else {
         return;
     };
-    let mut message_groups = Vec::new();
-    let mut selected_texts = output
-        .iter()
-        .map(|prompt| prompt.text.clone())
-        .collect::<Vec<_>>();
-    let mut remaining = policy.max_items.saturating_sub(output.len());
-    if remaining == 0 {
-        return;
-    }
-    for item in items.iter().rev() {
+    for (message_index, item) in items.iter().enumerate() {
         let Some(object) = item.as_object() else {
             continue;
         };
@@ -887,62 +916,45 @@ fn collect_message_array(
         if !prompt_capture_role_enabled(policy, role) {
             continue;
         }
-        let mut message_prompts = Vec::new();
         for key in ["content", "text", "parts"] {
             collect_text_values_for_role(
-                source,
+                format!("{source}.{array_key}[{message_index}].{key}"),
                 object.get(key),
                 role,
                 policy,
-                &mut message_prompts,
+                output,
+                Some(message_index),
             );
         }
-        let mut selected_group = Vec::new();
-        for prompt in message_prompts {
-            if selected_texts.iter().any(|text| text == &prompt.text) {
-                continue;
-            }
-            selected_texts.push(prompt.text.clone());
-            selected_group.push(prompt);
-            remaining = remaining.saturating_sub(1);
-            if remaining == 0 {
-                break;
-            }
-        }
-        if selected_group.is_empty() {
-            continue;
-        }
-        message_groups.push(selected_group);
-        if remaining == 0 {
-            break;
-        }
-    }
-    for group in message_groups.into_iter().rev() {
-        output.extend(group);
     }
 }
 
 fn collect_text_values_for_role(
-    source: &'static str,
+    source: String,
     value: Option<&Value>,
     role: PromptCaptureRole,
     policy: UsagePromptCapturePolicy,
     output: &mut Vec<CapturedPrompt>,
+    index: Option<usize>,
 ) {
-    if output.len() >= policy.max_items || !prompt_capture_role_enabled(policy, role) {
+    if !prompt_capture_role_enabled(policy, role) {
         return;
     }
     let Some(value) = value else {
         return;
     };
     match value {
-        Value::String(text) => push_prompt_text(source, role, text, policy, output),
+        Value::String(text) => push_prompt_text(source, index, role, text, policy, output),
         Value::Array(items) => {
-            for item in items {
-                if output.len() >= policy.max_items {
-                    return;
-                }
-                collect_text_values_for_role(source, Some(item), role, policy, output);
+            for (item_index, item) in items.iter().enumerate() {
+                collect_text_values_for_role(
+                    format!("{source}[{item_index}]"),
+                    Some(item),
+                    role,
+                    policy,
+                    output,
+                    index,
+                );
             }
         }
         Value::Object(object) => {
@@ -955,10 +967,14 @@ fn collect_text_values_for_role(
                 return;
             }
             for key in ["text", "content", "input"] {
-                if output.len() >= policy.max_items {
-                    return;
-                }
-                collect_text_values_for_role(source, object.get(key), role, policy, output);
+                collect_text_values_for_role(
+                    format!("{source}.{key}"),
+                    object.get(key),
+                    role,
+                    policy,
+                    output,
+                    index,
+                );
             }
         }
         _ => {}
@@ -966,24 +982,29 @@ fn collect_text_values_for_role(
 }
 
 fn push_prompt_text(
-    source: &'static str,
+    source: String,
+    index: Option<usize>,
     role: PromptCaptureRole,
     text: &str,
     policy: UsagePromptCapturePolicy,
     output: &mut Vec<CapturedPrompt>,
 ) {
-    if output.len() >= policy.max_items {
+    if policy.max_items == 0 {
         return;
     }
     let normalized = normalize_prompt_text(text);
     if normalized.is_empty() {
         return;
     }
-    if output.iter().any(|prompt| prompt.text == normalized) {
-        return;
+    if let Some(existing_index) = output.iter().position(|prompt| prompt.text == normalized) {
+        output.remove(existing_index);
+    }
+    if output.len() >= policy.max_items {
+        output.remove(0);
     }
     output.push(CapturedPrompt {
         source,
+        index,
         role,
         text: normalized,
     });
@@ -1017,6 +1038,7 @@ fn prompt_capture_item_value(prompt: &CapturedPrompt, preview_chars: usize) -> V
     let preview = truncate_chars(normalized, preview_chars);
     json!({
         "source": prompt.source,
+        "index": prompt.index,
         "role": prompt.role.as_str(),
         "sha256": sha256_hex(normalized.as_bytes()),
         "chars": normalized.chars().count(),
@@ -1202,6 +1224,10 @@ mod tests {
         assert_eq!(prompt_capture["role_counts"]["developer"], json!(1));
         assert_eq!(prompt_capture["role_counts"]["user"], json!(1));
         assert_eq!(prompt_capture["items"][0]["preview"], json!("You are Code"));
+        assert_eq!(
+            prompt_capture["items"][0]["source"],
+            json!("request.instructions")
+        );
         assert_eq!(prompt_capture["items"][0]["truncated"], json!(true));
         assert!(prompt_capture["items"][0]["sha256"]
             .as_str()
@@ -1256,6 +1282,108 @@ mod tests {
             prompt_capture["items"][2]["preview"],
             json!("Unique provider prompt.")
         );
+    }
+
+    #[test]
+    fn prompt_capture_metadata_provider_supplements_without_evicting_request_prompts() {
+        let mut record = sample_usage_record();
+        record.request_body = Some(json!({
+            "input": [
+                {"role": "user", "content": "request prompt 1"},
+                {"role": "user", "content": "request prompt 2"},
+                {"role": "user", "content": "request prompt 3"}
+            ]
+        }));
+        record.provider_request_body = Some(json!({
+            "messages": [
+                {"role": "user", "content": "provider prompt 1"},
+                {"role": "user", "content": "provider prompt 2"}
+            ]
+        }));
+
+        apply_usage_body_capture_policy_to_record(
+            UsageBodyCapturePolicy {
+                prompt_capture: UsagePromptCapturePolicy {
+                    enabled: true,
+                    max_items: 4,
+                    ..UsagePromptCapturePolicy::default()
+                },
+                ..UsageBodyCapturePolicy::default()
+            },
+            &mut record,
+        );
+
+        let prompt_capture = record
+            .request_metadata
+            .as_ref()
+            .and_then(|value| value.get("prompt_capture"))
+            .expect("prompt capture metadata should exist");
+        assert_eq!(prompt_capture["item_count"], json!(4));
+        assert_eq!(
+            prompt_capture["items"][0]["preview"],
+            json!("request prompt 1")
+        );
+        assert_eq!(
+            prompt_capture["items"][1]["preview"],
+            json!("request prompt 2")
+        );
+        assert_eq!(
+            prompt_capture["items"][2]["preview"],
+            json!("request prompt 3")
+        );
+        assert_eq!(
+            prompt_capture["items"][3]["preview"],
+            json!("provider prompt 2")
+        );
+        assert_eq!(
+            prompt_capture["items"][3]["source"],
+            json!("provider_request.messages[1].content")
+        );
+        assert!(!prompt_capture["items"]
+            .as_array()
+            .expect("items should be an array")
+            .iter()
+            .any(|item| item["preview"] == json!("provider prompt 1")));
+    }
+
+    #[test]
+    fn prompt_capture_metadata_prefers_latest_duplicate_message_source() {
+        let mut record = sample_usage_record();
+        record.request_body = Some(json!({
+            "input": [
+                {"role": "user", "content": "Repeat this prompt."},
+                {"role": "user", "content": "Unique request prompt."},
+                {"role": "user", "content": " Repeat   this\nprompt. "}
+            ]
+        }));
+
+        apply_usage_body_capture_policy_to_record(
+            UsageBodyCapturePolicy {
+                prompt_capture: UsagePromptCapturePolicy {
+                    enabled: true,
+                    max_items: 8,
+                    ..UsagePromptCapturePolicy::default()
+                },
+                ..UsageBodyCapturePolicy::default()
+            },
+            &mut record,
+        );
+
+        let prompt_capture = record
+            .request_metadata
+            .as_ref()
+            .and_then(|value| value.get("prompt_capture"))
+            .expect("prompt capture metadata should exist");
+        assert_eq!(prompt_capture["item_count"], json!(2));
+        assert_eq!(
+            prompt_capture["items"][1]["preview"],
+            json!("Repeat this prompt.")
+        );
+        assert_eq!(
+            prompt_capture["items"][1]["source"],
+            json!("request.input[2].content")
+        );
+        assert_eq!(prompt_capture["items"][1]["index"], json!(2));
     }
 
     #[test]
@@ -1321,18 +1449,28 @@ mod tests {
             .and_then(|value| value.get("prompt_capture"))
             .expect("prompt capture metadata should exist");
         assert_eq!(prompt_capture["item_count"], json!(32));
-        assert_eq!(prompt_capture["role_counts"]["system"], json!(1));
-        assert_eq!(prompt_capture["role_counts"]["user"], json!(31));
-        assert_eq!(prompt_capture["items"][1]["preview"], json!("old prompt 2"));
+        assert!(prompt_capture["role_counts"]["system"].is_null());
+        assert_eq!(prompt_capture["role_counts"]["user"], json!(32));
+        assert_eq!(prompt_capture["items"][0]["preview"], json!("old prompt 1"));
+        assert_eq!(
+            prompt_capture["items"][0]["source"],
+            json!("request.input[0].content")
+        );
+        assert_eq!(prompt_capture["items"][0]["index"], json!(0));
         assert_eq!(
             prompt_capture["items"][31]["preview"],
             json!("current request prompt")
         );
+        assert_eq!(
+            prompt_capture["items"][31]["source"],
+            json!("request.input[31].content")
+        );
+        assert_eq!(prompt_capture["items"][31]["index"], json!(31));
         assert!(!prompt_capture["items"]
             .as_array()
             .expect("items should be an array")
             .iter()
-            .any(|item| item["preview"] == json!("old prompt 1")));
+            .any(|item| item["preview"] == json!("system prompt")));
     }
 
     fn sample_usage_record() -> UpsertUsageRecord {

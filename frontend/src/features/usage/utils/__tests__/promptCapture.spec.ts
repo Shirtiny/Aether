@@ -11,11 +11,15 @@ describe('prompt capture metadata', () => {
         items: [
           {
             source: 'messages[0].content',
+            index: 0,
             role: 'system',
             sha256: 'abc',
             chars: 120,
             preview: 'system prompt preview',
             truncated: false,
+            first_seen_at: '2026-06-24T10:00:00Z',
+            last_seen_at: '2026-06-24T10:05:00Z',
+            seen_count: 3,
           },
           {
             source: 'messages[1].content',
@@ -35,19 +39,27 @@ describe('prompt capture metadata', () => {
       items: [
         {
           source: 'messages[0].content',
+          index: 0,
           role: 'system',
           sha256: 'abc',
           chars: 120,
           preview: 'system prompt preview',
           truncated: false,
+          firstSeenAt: '2026-06-24T10:00:00Z',
+          lastSeenAt: '2026-06-24T10:05:00Z',
+          seenCount: 3,
         },
         {
           source: 'messages[1].content',
+          index: null,
           role: 'user',
           sha256: 'def',
           chars: 42,
           preview: 'user prompt preview',
           truncated: true,
+          firstSeenAt: '',
+          lastSeenAt: '',
+          seenCount: null,
         },
       ],
     })
@@ -69,6 +81,7 @@ describe('prompt capture metadata', () => {
 
     expect(capture?.items).toHaveLength(1)
     expect(capture?.items[0]?.preview).toBe('nested prompt')
+    expect(capture?.items[0]?.index).toBeNull()
   })
 
   it('returns null when there are no prompt capture items', () => {

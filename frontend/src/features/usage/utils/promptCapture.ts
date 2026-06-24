@@ -1,10 +1,14 @@
 export interface PromptCaptureItemView {
   source: string
+  index: number | null
   role: string
   sha256: string
   chars: number | null
   preview: string
   truncated: boolean
+  firstSeenAt: string
+  lastSeenAt: string
+  seenCount: number | null
 }
 
 export interface PromptCaptureView {
@@ -61,11 +65,15 @@ function normalizePromptCaptureItem(value: unknown): PromptCaptureItemView | nul
 
   return {
     source,
+    index: asNumber(record.index),
     role,
     sha256,
     chars: asNumber(record.chars),
     preview,
     truncated: asBoolean(record.truncated),
+    firstSeenAt: asString(record.first_seen_at),
+    lastSeenAt: asString(record.last_seen_at),
+    seenCount: asNumber(record.seen_count),
   }
 }
 

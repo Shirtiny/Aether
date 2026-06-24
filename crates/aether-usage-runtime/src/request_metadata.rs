@@ -430,11 +430,13 @@ fn copy_prompt_capture_items(source: &Map<String, Value>, target: &mut Map<Strin
     let Some(items) = source.get("items").and_then(Value::as_array) else {
         return;
     };
-    let items = items
+    let mut items = items
         .iter()
-        .take(MAX_USAGE_PROMPT_CAPTURE_ITEMS)
+        .rev()
         .filter_map(sanitize_prompt_capture_item)
+        .take(MAX_USAGE_PROMPT_CAPTURE_ITEMS)
         .collect::<Vec<_>>();
+    items.reverse();
     if !items.is_empty() {
         target.insert("items".to_string(), Value::Array(items));
     }
@@ -452,6 +454,9 @@ fn sanitize_prompt_capture_item(value: &Value) -> Option<Value> {
     }
     if let Some(sha256) = prompt_capture_string(object, "sha256", 128) {
         item.insert("sha256".to_string(), Value::String(sha256));
+    }
+    if let Some(index) = object.get("index").and_then(prompt_capture_count_value) {
+        item.insert("index".to_string(), serde_json::json!(index));
     }
     if let Some(chars) = object.get("chars").and_then(prompt_capture_count_value) {
         item.insert("chars".to_string(), serde_json::json!(chars));
@@ -551,19 +556,8 @@ fn retain_prompt_capture_items(capture: &mut Value, max_items: usize) {
         items.clear();
         return;
     }
-    if max_items == 1 {
-        items.truncate(1);
-        return;
-    }
-
-    let tail_count = max_items - 1;
-    let tail_start = items.len().saturating_sub(tail_count);
-    let mut retained = Vec::with_capacity(max_items);
-    if let Some(first) = items.first() {
-        retained.push(first.clone());
-    }
-    retained.extend(items.iter().skip(tail_start).cloned());
-    *items = retained;
+    let start = items.len().saturating_sub(max_items);
+    *items = items.split_off(start);
 }
 
 fn prompt_capture_string(
@@ -997,6 +991,7 @@ mod tests {
                     "source": "request",
                     "role": "user",
                     "sha256": "a".repeat(64),
+                    "index": 7,
                     "chars": 40_000,
                     "preview": "x".repeat(16 * 1024),
                     "truncated": true,
@@ -1014,6 +1009,15 @@ mod tests {
             .expect("preview should remain");
 
         assert_eq!(preview.len(), MAX_USAGE_PROMPT_CAPTURE_PREVIEW_BYTES);
+        assert_eq!(
+            metadata
+                .get("prompt_capture")
+                .and_then(|capture| capture.get("items"))
+                .and_then(Value::as_array)
+                .and_then(|items| items.first())
+                .and_then(|item| item.get("index")),
+            Some(&json!(7))
+        );
     }
 
     #[test]
@@ -1021,9 +1025,9 @@ mod tests {
         let metadata = sanitize_usage_request_metadata(Some(json!({
             "prompt_capture": {
                 "version": 1,
-                "item_count": 256,
-                "role_counts": { "user": 256 },
-                "items": (0..256).map(|index| {
+                "item_count": 300,
+                "role_counts": { "user": 300 },
+                "items": (0..300).map(|index| {
                     json!({
                         "source": "request",
                         "role": "user",
@@ -1044,8 +1048,24 @@ mod tests {
             .and_then(Value::as_array)
             .expect("items should remain");
 
-        assert_eq!(capture.get("item_count"), Some(&json!(256)));
+        assert_eq!(capture.get("item_count"), Some(&json!(300)));
         assert!(items.len() < 256);
+        let expected_first = format!("{:064x}", 300 - items.len());
+        let expected_last = format!("{:064x}", 299);
+        assert_eq!(
+            items
+                .first()
+                .and_then(|item| item.get("sha256"))
+                .and_then(Value::as_str),
+            Some(expected_first.as_str())
+        );
+        assert_eq!(
+            items
+                .last()
+                .and_then(|item| item.get("sha256"))
+                .and_then(Value::as_str),
+            Some(expected_last.as_str())
+        );
         assert!(usage_request_metadata_within_limits(capture));
         assert_ne!(
             capture.get("reason"),

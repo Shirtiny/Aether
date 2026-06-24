@@ -10485,6 +10485,10 @@ fn prepare_prompt_capture_metadata(
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .unwrap_or("unknown");
+        let index = item_object
+            .get("index")
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok());
         let chars = item_object
             .get("chars")
             .and_then(Value::as_i64)
@@ -10509,11 +10513,17 @@ fn prepare_prompt_capture_metadata(
             truncated,
         });
 
-        refs.push(serde_json::json!({
+        let mut item_ref = serde_json::json!({
             "source": source,
             "role": role,
             "sha256": sha256
-        }));
+        });
+        if let Some(index) = index {
+            if let Some(item_ref) = item_ref.as_object_mut() {
+                item_ref.insert("index".to_string(), serde_json::json!(index));
+            }
+        }
+        refs.push(item_ref);
     }
 
     if refs.is_empty() {
@@ -10577,7 +10587,7 @@ async fn hydrate_prompt_capture_metadata(
 
     let mut rows = sqlx::query(
         r#"
-SELECT sha256, chars, preview, truncated
+SELECT sha256, chars, preview, truncated, first_seen_at, last_seen_at, seen_count
 FROM usage_prompt_capture_entries
 WHERE sha256 = ANY($1::TEXT[])
 "#,
@@ -10593,6 +10603,11 @@ WHERE sha256 = ANY($1::TEXT[])
                 row.try_get::<i32, _>("chars").map_postgres_err()?,
                 row.try_get::<String, _>("preview").map_postgres_err()?,
                 row.try_get::<bool, _>("truncated").map_postgres_err()?,
+                row.try_get::<chrono::DateTime<chrono::Utc>, _>("first_seen_at")
+                    .map_postgres_err()?,
+                row.try_get::<chrono::DateTime<chrono::Utc>, _>("last_seen_at")
+                    .map_postgres_err()?,
+                row.try_get::<i64, _>("seen_count").map_postgres_err()?,
             ),
         );
     }
@@ -10604,12 +10619,20 @@ WHERE sha256 = ANY($1::TEXT[])
         let Some(sha256) = item_object.get("sha256").and_then(Value::as_str) else {
             continue;
         };
-        let Some((chars, preview, truncated)) = entries.get(sha256) else {
+        let Some((chars, preview, truncated, first_seen_at, last_seen_at, seen_count)) =
+            entries.get(sha256)
+        else {
             continue;
         };
         item_object.insert("chars".to_string(), serde_json::json!(chars));
         item_object.insert("preview".to_string(), Value::String(preview.clone()));
         item_object.insert("truncated".to_string(), serde_json::json!(truncated));
+        item_object.insert(
+            "first_seen_at".to_string(),
+            serde_json::json!(first_seen_at),
+        );
+        item_object.insert("last_seen_at".to_string(), serde_json::json!(last_seen_at));
+        item_object.insert("seen_count".to_string(), serde_json::json!(seen_count));
     }
 
     Ok(Some(Value::Object(object)))

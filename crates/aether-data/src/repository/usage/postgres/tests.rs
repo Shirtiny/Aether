@@ -1036,6 +1036,7 @@ fn prepare_prompt_capture_metadata_moves_preview_fields_to_entries() {
                     "source": "request",
                     "role": "system",
                     "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "index": 0,
                     "chars": 120,
                     "preview": "system prompt preview",
                     "truncated": true
@@ -1075,6 +1076,7 @@ fn prepare_prompt_capture_metadata_moves_preview_fields_to_entries() {
                     {
                         "source": "request",
                         "role": "system",
+                        "index": 0,
                         "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                     },
                     {
@@ -1096,6 +1098,7 @@ fn prepare_prompt_capture_metadata_handles_large_sanitized_prompt_capture() {
                 "source": "request",
                 "role": if index < 2 { "system" } else { "user" },
                 "sha256": format!("{index:064x}"),
+                "index": index,
                 "chars": 20_000,
                 "preview": "prompt preview ".repeat(700),
                 "truncated": true

@@ -845,7 +845,14 @@
                                 v-if="item.source"
                                 class="font-mono"
                               >{{ item.source }}</span>
+                              <span v-if="item.index !== null">#{{ item.index + 1 }}</span>
                               <span v-if="item.chars !== null">{{ formatNumber(item.chars) }} chars</span>
+                              <span
+                                v-if="item.firstSeenAt || item.lastSeenAt"
+                                :title="promptCaptureSeenTitle(item)"
+                              >
+                                {{ promptCaptureSeenLabel(item) }}
+                              </span>
                               <span
                                 v-if="item.sha256"
                                 class="font-mono"
@@ -934,7 +941,7 @@ import {
   resolveUsageStreamLabelSegments,
 } from '../utils/status'
 import { resolveRequestFailureNotice } from '../utils/errorNotice'
-import { extractPromptCaptureMetadata } from '../utils/promptCapture'
+import { extractPromptCaptureMetadata, type PromptCaptureItemView } from '../utils/promptCapture'
 
 // 子组件
 import RequestHeadersContent from './RequestDetailDrawer/RequestHeadersContent.vue'
@@ -2461,6 +2468,23 @@ function formatDateTime(dateStr: string | null | undefined): string {
     minute: '2-digit',
     second: '2-digit'
   })
+}
+
+function promptCaptureSeenLabel(item: PromptCaptureItemView): string {
+  const time = item.lastSeenAt || item.firstSeenAt
+  const label = time ? `全局最近 ${formatDateTime(time)}` : ''
+  if (item.seenCount !== null && item.seenCount > 1) {
+    return label ? `${label} x${item.seenCount}` : `x${item.seenCount}`
+  }
+  return label
+}
+
+function promptCaptureSeenTitle(item: PromptCaptureItemView): string {
+  const parts: string[] = []
+  if (item.firstSeenAt) parts.push(`摘要 hash 首次出现: ${formatDateTime(item.firstSeenAt)}`)
+  if (item.lastSeenAt) parts.push(`摘要 hash 最近出现: ${formatDateTime(item.lastSeenAt)}`)
+  if (item.seenCount !== null) parts.push(`摘要 hash 累计出现: ${formatNumber(item.seenCount)}`)
+  return parts.join('\n')
 }
 
 // 格式化视频/音频时长
