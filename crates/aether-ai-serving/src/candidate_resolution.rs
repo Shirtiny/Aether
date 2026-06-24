@@ -193,20 +193,34 @@ pub fn extract_ai_pool_sticky_session_token(body_json: &serde_json::Value) -> Op
             .filter(|value| !value.is_empty())
     }
 
+    fn session_from_json_string(value: Option<&serde_json::Value>) -> Option<String> {
+        let decoded = serde_json::from_str::<serde_json::Value>(non_empty_str(value)?).ok()?;
+        non_empty_str(decoded.get("session_id"))
+            .or_else(|| non_empty_str(decoded.get("sessionId")))
+            .or_else(|| non_empty_str(decoded.get("conversation_id")))
+            .or_else(|| non_empty_str(decoded.get("conversationId")))
+            .map(ToOwned::to_owned)
+    }
+
     let object = body_json.as_object()?;
 
     non_empty_str(object.get("prompt_cache_key"))
-        .or_else(|| non_empty_str(object.get("conversation_id")))
-        .or_else(|| non_empty_str(object.get("conversationId")))
-        .or_else(|| non_empty_str(object.get("session_id")))
-        .or_else(|| non_empty_str(object.get("sessionId")))
+        .map(ToOwned::to_owned)
+        .or_else(|| non_empty_str(object.get("conversation_id")).map(ToOwned::to_owned))
+        .or_else(|| non_empty_str(object.get("conversationId")).map(ToOwned::to_owned))
+        .or_else(|| non_empty_str(object.get("session_id")).map(ToOwned::to_owned))
+        .or_else(|| non_empty_str(object.get("sessionId")).map(ToOwned::to_owned))
         .or_else(|| {
             object
                 .get("metadata")
                 .and_then(serde_json::Value::as_object)
                 .and_then(|metadata| {
                     non_empty_str(metadata.get("session_id"))
+                        .or_else(|| non_empty_str(metadata.get("sessionId")))
                         .or_else(|| non_empty_str(metadata.get("conversation_id")))
+                        .or_else(|| non_empty_str(metadata.get("conversationId")))
+                        .map(ToOwned::to_owned)
+                        .or_else(|| session_from_json_string(metadata.get("user_id")))
                 })
         })
         .or_else(|| {
@@ -216,9 +230,9 @@ pub fn extract_ai_pool_sticky_session_token(body_json: &serde_json::Value) -> Op
                 .and_then(|state| {
                     non_empty_str(state.get("conversationId"))
                         .or_else(|| non_empty_str(state.get("sessionId")))
+                        .map(ToOwned::to_owned)
                 })
         })
-        .map(ToOwned::to_owned)
 }
 
 #[cfg(test)]
@@ -452,6 +466,16 @@ mod tests {
             }))
             .as_deref(),
             Some("session-d")
+        );
+
+        assert_eq!(
+            extract_ai_pool_sticky_session_token(&json!({
+                "metadata": {
+                    "user_id": "{\"device_id\":\"device-a\",\"session_id\":\"session-e\"}"
+                }
+            }))
+            .as_deref(),
+            Some("session-e")
         );
     }
 }

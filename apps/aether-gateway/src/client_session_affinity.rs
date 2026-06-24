@@ -405,6 +405,10 @@ impl ClientSessionScopeAdapter for ClaudeCodeSessionScopeAdapter {
             request.headers,
             http::header::USER_AGENT.as_str(),
             "claude code",
+        ) || header_contains(
+            request.headers,
+            http::header::USER_AGENT.as_str(),
+            "claude-cli",
         ) || header_value_str(request.headers, "x-claude-code-session-id").is_some()
     }
 
@@ -711,13 +715,26 @@ fn scoped_from_generic_body(
     ))
 }
 
-fn claude_code_session_id_from_body(body: &Value) -> Option<&str> {
-    value_at_path(body, &["metadata", "user_id"]).and_then(|user_id| {
-        user_id
-            .rsplit_once("_session_")
-            .map(|(_, session_id)| session_id.trim())
-            .filter(|value| !value.is_empty())
-    })
+fn claude_code_session_id_from_body(body: &Value) -> Option<String> {
+    let user_id = value_at_path(body, &["metadata", "user_id"])?;
+    user_id
+        .rsplit_once("_session_")
+        .map(|(_, session_id)| session_id.trim())
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            let decoded = serde_json::from_str::<Value>(user_id).ok()?;
+            value_at_paths(
+                &decoded,
+                &[
+                    &["session_id"],
+                    &["sessionId"],
+                    &["conversation_id"],
+                    &["conversationId"],
+                ],
+            )
+            .map(ToOwned::to_owned)
+        })
 }
 
 fn explicit_aether_session_scope(
@@ -951,6 +968,35 @@ mod tests {
         assert_eq!(
             affinity.session_key.as_deref(),
             Some("session=claude-real-session")
+        );
+    }
+
+    #[test]
+    fn claude_cli_adapter_extracts_json_metadata_user_session() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::USER_AGENT,
+            HeaderValue::from_static("claude-cli/2.1.187 (external, cli)"),
+        );
+        let body = json!({
+            "metadata": {
+                "user_id": "{\"device_id\":\"device-a\",\"account_uuid\":\"\",\"session_id\":\"claude-cli-session\"}"
+            }
+        });
+
+        let scope = client_session_scope_from_request(&headers, Some(&body))
+            .expect("session scope should build");
+        let affinity = scope
+            .scheduler_affinity()
+            .expect("scheduler affinity should build");
+
+        assert_eq!(scope.client_family, "claude_code");
+        assert_eq!(scope.source, ClientSessionSignalSource::Body);
+        assert_eq!(scope.session_id, "claude-cli-session");
+        assert_eq!(affinity.client_family.as_deref(), Some("claude_code"));
+        assert_eq!(
+            affinity.session_key.as_deref(),
+            Some("session=claude-cli-session")
         );
     }
 
