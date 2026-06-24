@@ -484,7 +484,7 @@
             <div class="space-y-1">
               <span class="text-sm font-medium">稳定客户端请求头</span>
               <p class="text-xs leading-5 text-muted-foreground">
-                关闭后沿用客户端传入的 User-Agent 和 Originator。
+                未填写自定义配置时使用服务端内置字典；关闭后沿用客户端传入的 User-Agent 和 Originator。
               </p>
             </div>
             <Switch
@@ -498,6 +498,15 @@
             v-if="codexHeaderForm.enabled"
             class="space-y-3"
           >
+            <div class="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-dashed border-border/70 bg-background/50 px-3 py-2">
+              <span class="text-xs text-muted-foreground">
+                当前自定义 {{ codexHeaderForm.profiles.length }} 组；保存空列表时跟随后端内置字典。
+              </span>
+              <span class="text-xs text-muted-foreground">
+                内置模板 {{ defaultCodexHeaderProfilesCount }} 组
+              </span>
+            </div>
+
             <div
               v-for="(profile, index) in codexHeaderForm.profiles"
               :key="index"
@@ -540,9 +549,16 @@
               <Button
                 type="button"
                 variant="outline"
-                @click="resetCodexHeaderProfiles"
+                @click="loadDefaultCodexHeaderProfiles"
               >
-                使用内置字典
+                载入内置模板
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                @click="clearCodexHeaderProfiles"
+              >
+                清空自定义
               </Button>
             </div>
           </div>
@@ -715,6 +731,7 @@ import { useToast } from '@/composables/useToast'
 import { parseApiError } from '@/utils/errorParser'
 import { updateProvider } from '@/api/endpoints'
 import {
+  buildDefaultCodexClientHeaderProfiles,
   buildPoolCooldownFieldLayout,
   buildPoolCostFieldLayout,
   buildPoolHealthToggleCards,
@@ -756,6 +773,7 @@ const healthToggleCards = buildPoolHealthToggleCards()
 const cooldownFieldLayout = buildPoolCooldownFieldLayout()
 const costFieldLayout = buildPoolCostFieldLayout()
 const secondarySectionLayout = buildPoolSecondarySectionLayout()
+const defaultCodexHeaderProfilesCount = buildDefaultCodexClientHeaderProfiles().length
 
 const form = ref({
   global_priority: null as number | null | undefined,
@@ -847,7 +865,11 @@ function removeCodexHeaderProfile(index: number): void {
   codexHeaderForm.value.profiles.splice(index, 1)
 }
 
-function resetCodexHeaderProfiles(): void {
+function loadDefaultCodexHeaderProfiles(): void {
+  codexHeaderForm.value.profiles = buildDefaultCodexClientHeaderProfiles()
+}
+
+function clearCodexHeaderProfiles(): void {
   codexHeaderForm.value.profiles = []
 }
 

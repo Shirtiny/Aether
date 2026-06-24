@@ -73,6 +73,13 @@ fn sample_transport(
     }
 }
 
+fn codex_header_profile_value(user_agent: &str, originator: &str) -> Value {
+    json!({
+        "user_agent": user_agent,
+        "originator": originator,
+    })
+}
+
 #[test]
 fn applies_codex_defaults_when_body_rules_do_not_handle_fields() {
     let mut body = json!({
@@ -363,6 +370,73 @@ fn codex_pool_stable_client_headers_hash_by_account_name() {
     assert_eq!(
         first_headers.get("originator"),
         second_headers.get("originator")
+    );
+}
+
+#[test]
+fn codex_pool_stable_client_headers_keep_existing_choice_when_profiles_are_appended() {
+    let base_profile_values = vec![
+        codex_header_profile_value("codex-tui/0.142.0 stable-a", "codex-tui"),
+        codex_header_profile_value("Codex Desktop/0.142.0 stable-b", "Codex Desktop"),
+    ];
+    let base_profiles = vec![
+        super::CodexClientHeaderProfile {
+            user_agent: "codex-tui/0.142.0 stable-a".to_string(),
+            originator: "codex-tui".to_string(),
+        },
+        super::CodexClientHeaderProfile {
+            user_agent: "Codex Desktop/0.142.0 stable-b".to_string(),
+            originator: "Codex Desktop".to_string(),
+        },
+    ];
+    let selected = &base_profiles[super::stable_index_for_key("account", &base_profiles)];
+    let selected_score = super::stable_profile_score("account", selected);
+    let appended_profile = (0..256)
+        .map(|index| super::CodexClientHeaderProfile {
+            user_agent: format!("codex_cli_rs/0.133.0 appended-{index}"),
+            originator: "codex_cli_rs".to_string(),
+        })
+        .find(|profile| super::stable_profile_score("account", profile) < selected_score)
+        .expect("find appended profile with lower stable score");
+    let mut appended_profile_values = base_profile_values.clone();
+    appended_profile_values.push(codex_header_profile_value(
+        appended_profile.user_agent.as_str(),
+        appended_profile.originator.as_str(),
+    ));
+
+    let transport = sample_transport(
+        "codex",
+        Some(json!({
+            "pool_advanced": {
+                "codex_client_headers": {
+                    "profiles": base_profile_values
+                }
+            }
+        })),
+    );
+    let appended_transport = sample_transport(
+        "codex",
+        Some(json!({
+            "pool_advanced": {
+                "codex_client_headers": {
+                    "profiles": appended_profile_values
+                }
+            }
+        })),
+    );
+    let mut base_headers = BTreeMap::new();
+    let mut appended_headers = BTreeMap::new();
+
+    apply_codex_pool_stable_client_headers(&mut base_headers, &transport);
+    apply_codex_pool_stable_client_headers(&mut appended_headers, &appended_transport);
+
+    assert_eq!(
+        base_headers.get("user-agent"),
+        appended_headers.get("user-agent")
+    );
+    assert_eq!(
+        base_headers.get("originator"),
+        appended_headers.get("originator")
     );
 }
 

@@ -1,3 +1,140 @@
+import type { PoolCodexClientHeaderProfile } from '@/api/endpoints/types/provider'
+
+export const DEFAULT_CODEX_CLIENT_HEADER_PROFILES: readonly PoolCodexClientHeaderProfile[] = [
+  {
+    user_agent: 'codex-tui/0.142.0 (Mac OS 26.4.1; arm64) iTerm.app/3.6.10 (codex-tui; 0.142.0)',
+    originator: 'codex-tui',
+  },
+  {
+    user_agent: 'codex-tui/0.142.0 (Windows 10.0.26200; x86_64) WindowsTerminal (codex-tui; 0.142.0)',
+    originator: 'codex-tui',
+  },
+  {
+    user_agent: 'codex-tui/0.142.0 (Debian 13.0.0; x86_64) xterm-256color (codex-tui; 0.142.0)',
+    originator: 'codex-tui',
+  },
+  {
+    user_agent: 'codex-tui/0.142.0 (Ubuntu 22.4.0; x86_64) WindowsTerminal (codex-tui; 0.142.0)',
+    originator: 'codex-tui',
+  },
+  {
+    user_agent: 'codex-tui/0.142.0 (Ubuntu 24.4.0; x86_64) WindowsTerminal (codex-tui; 0.142.0)',
+    originator: 'codex-tui',
+  },
+  {
+    user_agent: 'codex-tui/0.142.0 (Ubuntu 24.4.0; x86_64) WezTerm/20240203-110809-5046fc22 (codex-tui; 0.142.0)',
+    originator: 'codex-tui',
+  },
+  {
+    user_agent: 'codex-tui/0.142.0 (Mac OS 26.2.0; arm64) xterm-256color (codex-tui; 0.142.0)',
+    originator: 'codex-tui',
+  },
+  {
+    user_agent: 'codex-tui/0.142.0 (Mac OS 15.6.1; arm64) Apple_Terminal (codex-tui; 0.142.0)',
+    originator: 'codex-tui',
+  },
+  {
+    user_agent: 'codex-tui/0.142.0 (Windows 10.0.26200; x86_64) WarpTerminal (codex-tui; 0.142.0)',
+    originator: 'codex-tui',
+  },
+  {
+    user_agent: 'codex-tui/0.142.0 (Mac OS 26.5.1; arm64) ghostty/1.3.1 (codex-tui; 0.142.0)',
+    originator: 'codex-tui',
+  },
+  {
+    user_agent: 'codex-tui/0.141.0 (Debian 13.0.0; x86_64) xterm-256color (codex-tui; 0.141.0)',
+    originator: 'codex-tui',
+  },
+  {
+    user_agent: 'codex-tui/0.141.0 (Mac OS 15.7.5; arm64) iTerm.app/3.6.6 (codex-tui; 0.141.0)',
+    originator: 'codex-tui',
+  },
+  {
+    user_agent: 'codex-tui/0.141.0 (Windows 10.0.26200; x86_64) waveterm (codex-tui; 0.141.0)',
+    originator: 'codex-tui',
+  },
+  {
+    user_agent: 'codex-tui/0.141.0 (Mac OS 26.2.0; arm64) vscode/1.125.0 (codex-tui; 0.141.0)',
+    originator: 'codex-tui',
+  },
+  {
+    user_agent: 'codex-tui/0.134.0 (Mac OS 14.1.0; arm64) iTerm.app/3.6.9 (codex-tui; 0.134.0)',
+    originator: 'codex-tui',
+  },
+  {
+    user_agent: 'Codex Desktop/0.142.0 (Windows 10.0.26200; x86_64) unknown (Codex Desktop; 26.616.71553)',
+    originator: 'Codex Desktop',
+  },
+  {
+    user_agent: 'Codex Desktop/0.142.0 (Windows 10.0.19045; x86_64) unknown (Codex Desktop; 26.616.81150)',
+    originator: 'Codex Desktop',
+  },
+  {
+    user_agent: 'Codex Desktop/0.142.0 (Mac OS 26.5.1; arm64) unknown (Codex Desktop; 26.616.71553)',
+    originator: 'Codex Desktop',
+  },
+  {
+    user_agent: 'Codex Desktop/0.142.0-alpha.6 (Mac OS 26.5.0; arm64) unknown (Codex Desktop; 26.616.51431)',
+    originator: 'Codex Desktop',
+  },
+  {
+    user_agent: 'Codex Desktop/0.142.0 (Windows 10.0.26200; x86_64) unknown (Codex Desktop; 26.616.81150)',
+    originator: 'Codex Desktop',
+  },
+  {
+    user_agent: 'Codex Desktop/0.142.0 (Mac OS 26.5.0; arm64) unknown (Codex Desktop; 26.616.81150)',
+    originator: 'Codex Desktop',
+  },
+  {
+    user_agent: 'Codex Desktop/0.142.0 (Mac OS 14.1.0; arm64) unknown (Codex Desktop; 26.616.81150)',
+    originator: 'Codex Desktop',
+  },
+  {
+    user_agent: 'Codex Desktop/0.142.0 (Mac OS 13.1.0; x86_64) unknown (Codex Desktop; 26.616.81150)',
+    originator: 'Codex Desktop',
+  },
+  {
+    user_agent: 'codex_vscode/0.142.0 (Windows 10.0.19045; x86_64) unknown (VS Code; 26.616.81150)',
+    originator: 'codex_vscode',
+  },
+  {
+    user_agent: 'codex_vscode/0.142.0-alpha.1 (Windows 10.0.22631; x86_64) unknown (Windsurf; 26.616.32156)',
+    originator: 'codex_vscode',
+  },
+  {
+    user_agent: 'codex_vscode/0.142.0 (Windows 10.0.22631; x86_64) unknown (Antigravity IDE; 26.616.71553)',
+    originator: 'codex_vscode',
+  },
+  {
+    user_agent: 'codex_cli_rs/0.93.0 (Windows 10.0.26200; x86_64) vscode/1.108.1',
+    originator: 'codex_cli',
+  },
+  {
+    user_agent: 'codex_cli_rs/0.133.0 (Windows 10.0.26200; x64)',
+    originator: 'codex_cli_rs',
+  },
+  {
+    user_agent: 'codex_cli_rs/0.125.0 (Mac OS 24.6.0; arm64)',
+    originator: 'codex_cli_rs',
+  },
+  {
+    user_agent: 'codex_cli_rs/0.77.0 (Windows 10.0.26100; x86_64) WindowsTerminal',
+    originator: 'codex_cli_rs',
+  },
+  {
+    user_agent: 'codex_exec/0.142.0 (Mac OS 15.7.5; arm64) iTerm.app/3.6.6 (codex_exec; 0.142.0)',
+    originator: 'codex_exec',
+  },
+  {
+    user_agent: 'codex_sdk_ts/0.136.0 (Windows 10.0.19045; x86_64) unknown (codex_exec; 0.136.0)',
+    originator: 'codex_sdk_ts',
+  },
+]
+
+export function buildDefaultCodexClientHeaderProfiles(): PoolCodexClientHeaderProfile[] {
+  return DEFAULT_CODEX_CLIENT_HEADER_PROFILES.map((profile) => ({ ...profile }))
+}
+
 export type PoolHealthToggleKey =
   | 'health_policy_enabled'
   | 'probing_enabled'
