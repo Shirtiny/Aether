@@ -469,6 +469,20 @@ fn push_sqlite_usage_list_filters(
             builder.push(")");
         }
     }
+    if let Some(session_id) = query.session_id.as_deref().map(str::trim) {
+        if !session_id.is_empty() {
+            let pattern = format!("%{}%", session_id.to_ascii_lowercase());
+            push_sqlite_usage_where(builder, has_where);
+            builder.push("(");
+            builder
+                .push("LOWER(COALESCE(json_extract(request_metadata, '$.session_id'), '')) LIKE ")
+                .push_bind(pattern.clone());
+            builder
+                .push(" OR LOWER(COALESCE(json_extract(request_metadata, '$.conversation_id'), '')) LIKE ")
+                .push_bind(pattern);
+            builder.push(")");
+        }
+    }
     if let Some(statuses) = query.statuses.as_deref() {
         if !statuses.is_empty() {
             push_sqlite_usage_where(builder, has_where);
@@ -519,6 +533,7 @@ fn push_sqlite_usage_keyword_filters(
             model: query.model.clone(),
             api_format: query.api_format.clone(),
             cafecode: query.cafecode.clone(),
+            session_id: query.session_id.clone(),
             statuses: query.statuses.clone(),
             is_stream: query.is_stream,
             error_only: query.error_only,

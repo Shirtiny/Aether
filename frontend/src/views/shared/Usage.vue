@@ -87,6 +87,7 @@
       :filter-search="filterSearch"
       :filter-user="filterUser"
       :filter-cafecode="filterCafecode"
+      :filter-session-id="filterSessionId"
       :filter-model="filterModel"
       :filter-provider="filterProvider"
       :filter-api-format="filterApiFormat"
@@ -106,6 +107,7 @@
       @update:filter-search="handleFilterSearchChange"
       @update:filter-user="handleFilterUserChange"
       @update:filter-cafecode="handleFilterCafecodeChange"
+      @update:filter-session-id="handleFilterSessionIdChange"
       @update:filter-model="handleFilterModelChange"
       @update:filter-provider="handleFilterProviderChange"
       @update:filter-api-format="handleFilterApiFormatChange"
@@ -234,6 +236,7 @@ function formatIntervalTimelineWindow(hours: number): string {
 const filterSearch = ref('')
 const filterUser = ref('__all__')
 const filterCafecode = ref('')
+const filterSessionId = ref('')
 const filterModel = ref('__all__')
 const filterProvider = ref('__all__')
 const filterApiFormat = ref('__all__')
@@ -386,6 +389,13 @@ const filteredRecords = computed(() => {
     : [...currentRecords.value]
 
   if (!isAdminPage.value) {
+    const sessionNeedle = filterSessionId.value.trim().toLowerCase()
+    if (sessionNeedle) {
+      records = records.filter(record =>
+        (record.session_id ?? '').trim().toLowerCase().includes(sessionNeedle)
+      )
+    }
+
     if (filterModel.value !== '__all__') {
       records = records.filter(record => record.model === filterModel.value)
     }
@@ -593,6 +603,9 @@ async function pollActiveRequests() {
         if ('user_agent' in update) {
           record.user_agent = typeof update.user_agent === 'string' ? update.user_agent : null
         }
+        if ('session_id' in update) {
+          record.session_id = typeof update.session_id === 'string' ? update.session_id : null
+        }
       }
     }
 
@@ -768,9 +781,13 @@ onUnmounted(() => {
   stopGlobalAutoRefresh()
 })
 
-// 用户页面的前端分页（后端一次性返回所有记录，前端分页+筛选）
+// 用户页面默认使用前端分页；会话 ID 筛选走后端分页，避免只筛当前缓存页。
+const userSessionFilterUsesServerPaging = computed(() =>
+  !isAdminPage.value && filterSessionId.value.trim().length > 0
+)
+
 const paginatedRecords = computed(() => {
-  if (!isAdminPage.value) {
+  if (!isAdminPage.value && !userSessionFilterUsesServerPaging.value) {
     const start = (currentPage.value - 1) * pageSize.value
     const end = start + pageSize.value
     return filteredRecords.value.slice(start, end)
@@ -778,10 +795,12 @@ const paginatedRecords = computed(() => {
   return filteredRecords.value
 })
 
-// 用户页面使用前端筛选后的总数，管理员页面使用后端返回的总数
+// 用户页面通常使用前端筛选后的总数；会话 ID 筛选时使用后端筛选总数。
 const effectiveTotalRecords = computed(() => {
   if (!isAdminPage.value) {
-    return filteredRecords.value.length
+    return userSessionFilterUsesServerPaging.value
+      ? totalRecords.value
+      : filteredRecords.value.length
   }
   return totalRecords.value
 })
@@ -850,6 +869,11 @@ async function handleTimeRangeChange(value: DateRangeParams) {
     await refreshAdminAnalyticsForSelectionChange()
     return
   }
+  if (userSessionFilterUsesServerPaging.value) {
+    await loadStats(timeRange.value)
+    await loadRecords({ page: 1, pageSize: pageSize.value }, getCurrentFilters(), timeRange.value)
+    return
+  }
   await loadStats(timeRange.value)
   // 用户页面：loadStats 已包含记录加载
 }
@@ -859,8 +883,12 @@ async function handlePageChange(page: number) {
   currentPage.value = page
   if (isAdminPage.value) {
     await loadRecords({ page, pageSize: pageSize.value }, getCurrentFilters(), timeRange.value)
+    return
   }
-  // 用户页面使用前端分页，无需重新请求
+  if (userSessionFilterUsesServerPaging.value) {
+    await loadRecords({ page, pageSize: pageSize.value }, getCurrentFilters(), timeRange.value)
+  }
+  // 用户页面默认使用前端分页，无需重新请求
 }
 
 // 处理每页大小变化
@@ -869,8 +897,12 @@ async function handlePageSizeChange(size: number) {
   currentPage.value = 1  // 重置到第一页
   if (isAdminPage.value) {
     await loadRecords({ page: 1, pageSize: size }, getCurrentFilters(), timeRange.value)
+    return
   }
-  // 用户页面使用前端分页，无需重新请求
+  if (userSessionFilterUsesServerPaging.value) {
+    await loadRecords({ page: 1, pageSize: size }, getCurrentFilters(), timeRange.value)
+  }
+  // 用户页面默认使用前端分页，无需重新请求
 }
 
 // 获取当前筛选参数
@@ -878,6 +910,7 @@ function getCurrentFilters() {
   return {
     search: filterSearch.value.trim() || undefined,
     cafecode: filterCafecode.value.trim() || undefined,
+    session_id: filterSessionId.value.trim() || undefined,
     user_id: filterUser.value !== '__all__' ? filterUser.value : undefined,
     model: filterModel.value !== '__all__' ? filterModel.value : undefined,
     provider: filterProvider.value !== '__all__' ? filterProvider.value : undefined,
@@ -895,9 +928,13 @@ async function handleFilterSearchChange(value: string) {
 
   if (isAdminPage.value) {
     await loadRecords({ page: 1, pageSize: pageSize.value }, getCurrentFilters(), timeRange.value)
+    return
+  }
+  if (userSessionFilterUsesServerPaging.value) {
+    await loadRecords({ page: 1, pageSize: pageSize.value }, getCurrentFilters(), timeRange.value)
   }
   // 用户页面：search 需要重新从后端拉取数据（后端支持 search 参数）
-  // 但通过 filteredRecords 做前端过滤已覆盖，无需额外请求
+  // 默认通过 filteredRecords 做前端过滤；会话 ID 筛选开启时使用后端分页。
 }
 
 async function handleFilterUserChange(value: string) {
@@ -916,6 +953,22 @@ async function handleFilterCafecodeChange(value: string) {
 
   if (isAdminPage.value) {
     await loadRecords({ page: 1, pageSize: pageSize.value }, getCurrentFilters(), timeRange.value)
+  }
+}
+
+async function handleFilterSessionIdChange(value: string) {
+  filterSessionId.value = value
+  currentPage.value = 1
+
+  if (isAdminPage.value) {
+    await loadRecords({ page: 1, pageSize: pageSize.value }, getCurrentFilters(), timeRange.value)
+    return
+  }
+
+  if (userSessionFilterUsesServerPaging.value) {
+    await loadRecords({ page: 1, pageSize: pageSize.value }, getCurrentFilters(), timeRange.value)
+  } else {
+    await loadStats(timeRange.value)
   }
 }
 
@@ -973,6 +1026,15 @@ async function refreshData() {
 
   refreshInFlight = (async () => {
     if (isAdminPage.value) {
+      await loadRecords(
+        { page: currentPage.value, pageSize: pageSize.value },
+        getCurrentFilters(),
+        timeRange.value
+      )
+      return
+    }
+
+    if (userSessionFilterUsesServerPaging.value) {
       await loadRecords(
         { page: currentPage.value, pageSize: pageSize.value },
         getCurrentFilters(),

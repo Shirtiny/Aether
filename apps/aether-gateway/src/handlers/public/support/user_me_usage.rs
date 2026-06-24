@@ -336,6 +336,11 @@ fn users_me_usage_metadata_string<'a>(
         .filter(|value| !value.is_empty())
 }
 
+fn users_me_usage_session_id(item: &StoredRequestUsageAudit) -> Option<&str> {
+    users_me_usage_metadata_string(item, "session_id")
+        .or_else(|| users_me_usage_metadata_string(item, "conversation_id"))
+}
+
 fn infer_client_family_from_user_agent(user_agent: &str) -> Option<&'static str> {
     let normalized = user_agent.trim().to_ascii_lowercase();
     if normalized.is_empty() {
@@ -473,6 +478,7 @@ fn build_users_me_usage_record_payload(
         "client_requested_stream": client_is_stream,
         "client_is_stream": client_is_stream,
         "client_family": users_me_usage_client_family(item),
+        "session_id": users_me_usage_session_id(item),
         "client_ip": users_me_usage_metadata_string(item, "client_ip"),
         "user_agent": users_me_usage_metadata_string(item, "user_agent"),
         "request_path": users_me_usage_metadata_string(item, "request_path"),
@@ -546,6 +552,7 @@ fn build_users_me_usage_active_payload(item: &StoredRequestUsageAudit) -> serde_
         "client_is_stream": client_is_stream,
         "has_format_conversion": item.has_format_conversion,
         "client_family": users_me_usage_client_family(item),
+        "session_id": users_me_usage_session_id(item),
         "client_ip": users_me_usage_metadata_string(item, "client_ip"),
         "user_agent": users_me_usage_metadata_string(item, "user_agent"),
         "target_model": item.target_model,
@@ -793,6 +800,7 @@ pub(super) async fn handle_users_me_usage_get(
         Err(detail) => return admin_stats_bad_request_response(detail),
     };
     let search = query_param_value(query, "search");
+    let session_id_filter = query_param_value(query, "session_id");
     let limit = match parse_users_me_usage_limit(query) {
         Ok(value) => value,
         Err(detail) => return admin_stats_bad_request_response(detail),
@@ -931,6 +939,7 @@ pub(super) async fn handle_users_me_usage_get(
                 model: None,
                 api_format: None,
                 cafecode: None,
+                session_id: session_id_filter.clone(),
                 statuses: None,
                 is_stream: None,
                 error_only: false,
@@ -987,6 +996,7 @@ pub(super) async fn handle_users_me_usage_get(
                     model: None,
                     api_format: None,
                     cafecode: None,
+                    session_id: session_id_filter.clone(),
                     statuses: None,
                     is_stream: None,
                     error_only: false,
@@ -1016,6 +1026,7 @@ pub(super) async fn handle_users_me_usage_get(
                     model: None,
                     api_format: None,
                     cafecode: None,
+                    session_id: session_id_filter.clone(),
                     statuses: None,
                     is_stream: None,
                     error_only: false,
@@ -1155,6 +1166,7 @@ pub(super) async fn handle_users_me_usage_active_get(
                 model: None,
                 api_format: None,
                 cafecode: None,
+                session_id: None,
                 statuses: Some(vec!["pending".to_string(), "streaming".to_string()]),
                 is_stream: None,
                 error_only: false,

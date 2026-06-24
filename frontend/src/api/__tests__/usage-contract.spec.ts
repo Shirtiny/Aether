@@ -166,6 +166,7 @@ describe('usageApi contract alignment', () => {
 
     await usageApi.getAllUsageRecords({
       cafecode: '372',
+      session_id: 'sess-1',
       limit: 10,
       offset: 0,
     })
@@ -173,6 +174,7 @@ describe('usageApi contract alignment', () => {
     expect(getMock).toHaveBeenCalledWith('/api/admin/usage/records', {
       params: {
         cafecode: '372',
+        session_id: 'sess-1',
         limit: 10,
         offset: 0,
       },

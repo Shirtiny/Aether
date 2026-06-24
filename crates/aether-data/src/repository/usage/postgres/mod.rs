@@ -1265,6 +1265,28 @@ fn push_postgres_usage_cafecode_filter(
     builder.push(")");
 }
 
+fn push_postgres_usage_session_id_filter(
+    builder: &mut QueryBuilder<'_, Postgres>,
+    has_where: &mut bool,
+    session_id: &str,
+) {
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        return;
+    }
+    let pattern = format!("%{}%", session_id.to_ascii_lowercase());
+    builder.push(if *has_where { " AND " } else { " WHERE " });
+    *has_where = true;
+    builder.push("(");
+    builder
+        .push("LOWER(COALESCE(\"usage\".request_metadata->>'session_id', '')) LIKE ")
+        .push_bind(pattern.clone());
+    builder
+        .push(" OR LOWER(COALESCE(\"usage\".request_metadata->>'conversation_id', '')) LIKE ")
+        .push_bind(pattern);
+    builder.push(")");
+}
+
 fn push_postgres_usage_ping_filter(builder: &mut QueryBuilder<'_, Postgres>, has_where: &mut bool) {
     builder.push(if *has_where { " AND " } else { " WHERE " });
     *has_where = true;
@@ -2647,6 +2669,9 @@ ORDER BY request_count DESC, "usage".provider_name ASC
         if let Some(cafecode) = query.cafecode.as_deref() {
             push_postgres_usage_cafecode_filter(&mut builder, &mut has_where, cafecode);
         }
+        if let Some(session_id) = query.session_id.as_deref() {
+            push_postgres_usage_session_id_filter(&mut builder, &mut has_where, session_id);
+        }
         if let Some(statuses) = query.statuses.as_deref() {
             if !statuses.is_empty() {
                 builder.push(if has_where { " AND " } else { " WHERE " });
@@ -2753,6 +2778,9 @@ OR (\"usage\".error_message IS NOT NULL AND BTRIM(\"usage\".error_message) <> ''
         }
         if let Some(cafecode) = query.cafecode.as_deref() {
             push_postgres_usage_cafecode_filter(&mut builder, &mut has_where, cafecode);
+        }
+        if let Some(session_id) = query.session_id.as_deref() {
+            push_postgres_usage_session_id_filter(&mut builder, &mut has_where, session_id);
         }
         if let Some(statuses) = query.statuses.as_deref() {
             if !statuses.is_empty() {
@@ -2941,6 +2969,9 @@ OR (\"usage\".error_message IS NOT NULL AND BTRIM(\"usage\".error_message) <> ''
         if let Some(cafecode) = query.cafecode.as_deref() {
             push_postgres_usage_cafecode_filter(&mut builder, &mut has_where, cafecode);
         }
+        if let Some(session_id) = query.session_id.as_deref() {
+            push_postgres_usage_session_id_filter(&mut builder, &mut has_where, session_id);
+        }
         if let Some(statuses) = query.statuses.as_deref() {
             if !statuses.is_empty() {
                 builder.push(if has_where { " AND " } else { " WHERE " });
@@ -3036,6 +3067,9 @@ OR (\"usage\".error_message IS NOT NULL AND BTRIM(\"usage\".error_message) <> ''
         }
         if let Some(cafecode) = query.cafecode.as_deref() {
             push_postgres_usage_cafecode_filter(&mut builder, &mut has_where, cafecode);
+        }
+        if let Some(session_id) = query.session_id.as_deref() {
+            push_postgres_usage_session_id_filter(&mut builder, &mut has_where, session_id);
         }
         if let Some(statuses) = query.statuses.as_deref() {
             if !statuses.is_empty() {

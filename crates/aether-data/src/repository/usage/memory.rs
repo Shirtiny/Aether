@@ -266,6 +266,11 @@ fn usage_matches_list_query(item: &StoredRequestUsageAudit, query: &UsageAuditLi
             return false;
         }
     }
+    if let Some(session_id) = query.session_id.as_deref().map(str::trim) {
+        if !session_id.is_empty() && !usage_session_id_matches(item, session_id) {
+            return false;
+        }
+    }
     if let Some(statuses) = query.statuses.as_ref() {
         if !statuses.iter().any(|status| status == &item.status) {
             return false;
@@ -328,6 +333,11 @@ fn usage_metadata_string_contains(
         .is_some_and(|value| value.to_ascii_lowercase().contains(&needle))
 }
 
+fn usage_session_id_matches(item: &StoredRequestUsageAudit, needle: &str) -> bool {
+    usage_metadata_string_contains(item, "session_id", needle)
+        || usage_metadata_string_contains(item, "conversation_id", needle)
+}
+
 fn usage_matches_keyword_search_query(
     item: &StoredRequestUsageAudit,
     query: &UsageAuditKeywordSearchQuery,
@@ -367,6 +377,11 @@ fn usage_matches_keyword_search_query(
             && !usage_metadata_string_contains(item, "cafecode_uid", cafecode)
             && !usage_metadata_string_contains(item, "cafecode_uname", cafecode)
         {
+            return false;
+        }
+    }
+    if let Some(session_id) = query.session_id.as_deref().map(str::trim) {
+        if !session_id.is_empty() && !usage_session_id_matches(item, session_id) {
             return false;
         }
     }
@@ -4886,6 +4901,39 @@ mod tests {
         assert_eq!(by_uid[0].request_id, "req-cafecode-1");
         assert_eq!(by_name.len(), 1);
         assert_eq!(by_name[0].request_id, "req-cafecode-1");
+    }
+
+    #[tokio::test]
+    async fn list_usage_audits_filters_by_session_id_metadata() {
+        let mut first = sample_usage("req-session-1", 1);
+        first.request_metadata = Some(serde_json::json!({
+            "session_id": "sess-alpha-123"
+        }));
+        let mut second = sample_usage("req-session-2", 2);
+        second.request_metadata = Some(serde_json::json!({
+            "conversation_id": "conv-beta-456"
+        }));
+        let repository = InMemoryUsageReadRepository::seed(vec![first, second]);
+
+        let by_session = repository
+            .list_usage_audits(&crate::repository::usage::UsageAuditListQuery {
+                session_id: Some("alpha".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("list by session_id should succeed");
+        let by_conversation = repository
+            .list_usage_audits(&crate::repository::usage::UsageAuditListQuery {
+                session_id: Some("beta".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("list by conversation_id should succeed");
+
+        assert_eq!(by_session.len(), 1);
+        assert_eq!(by_session[0].request_id, "req-session-1");
+        assert_eq!(by_conversation.len(), 1);
+        assert_eq!(by_conversation[0].request_id, "req-session-2");
     }
 
     #[tokio::test]

@@ -115,6 +115,7 @@ export interface UsageFilters {
   model?: string
   search?: string
   cafecode?: string
+  session_id?: string
   start_date?: string
   end_date?: string
   preset?: string
@@ -244,6 +245,7 @@ function buildCurrentUserUsageParams(filters?: UsageFilters): {
       timezone: filters?.timezone,
       tz_offset_minutes: filters?.tz_offset_minutes,
       search: filters?.search,
+      session_id: filters?.session_id,
       limit: pagination.pageSize,
       offset: pagination.offset,
     }),
@@ -271,6 +273,7 @@ function buildAdminUsageRecordParams(userId: string, filters?: UsageFilters): {
       tz_offset_minutes: filters?.tz_offset_minutes,
       search: filters?.search,
       cafecode: filters?.cafecode,
+      session_id: filters?.session_id,
       model: filters?.model,
       limit: pagination.pageSize,
       offset: pagination.offset,
@@ -471,6 +474,7 @@ export const usageApi = {
     tz_offset_minutes?: number
     search?: string  // 通用搜索：用户名、密钥名、模型名、提供商名
     cafecode?: string // Cafecode 用户 ID 或用户名
+    session_id?: string // 客户端会话 ID 或 conversation_id
     user_id?: string // UUID
     username?: string
     model?: string
@@ -521,6 +525,7 @@ export const usageApi = {
       provider?: string | null
       api_key_name?: string | null
       provider_key_name?: string | null
+      session_id?: string | null
       api_format?: string | null
       endpoint_api_format?: string | null
       is_stream?: boolean | null

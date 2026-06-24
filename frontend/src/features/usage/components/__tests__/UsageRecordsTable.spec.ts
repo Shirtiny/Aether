@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, defineComponent, h, type App } from 'vue'
 import UsageRecordsTable from '../UsageRecordsTable.vue'
 import type { UsageRecord } from '../../types'
@@ -140,6 +140,7 @@ function mountUsageRecordsTable(records: UsageRecord[], overrides: Record<string
     filterSearch: '',
     filterUser: '__all__',
     filterCafecode: '',
+    filterSessionId: '',
     filterModel: '__all__',
     filterProvider: '__all__',
     filterApiFormat: '__all__',
@@ -162,6 +163,10 @@ function mountUsageRecordsTable(records: UsageRecord[], overrides: Record<string
   mountedApps.push({ app, root })
   return root
 }
+
+beforeEach(() => {
+  window.localStorage.clear()
+})
 
 afterEach(() => {
   for (const { app, root } of mountedApps.splice(0)) {
@@ -323,5 +328,34 @@ describe('UsageRecordsTable', () => {
 
     expect(root.querySelector('[data-usage-attempt-marker="fallback"]')).not.toBeNull()
     expect(root.querySelector('[data-usage-attempt-marker="retry"]')).not.toBeNull()
+  })
+
+  it('adds the session id column to saved visible column preferences once', () => {
+    window.localStorage.setItem(
+      'usage-records-visible-columns-admin',
+      JSON.stringify(['time', 'user', 'cafecode', 'model'])
+    )
+    window.localStorage.setItem(
+      'usage-records-visible-columns-user',
+      JSON.stringify(['time', 'key', 'model'])
+    )
+    window.localStorage.removeItem('usage-records-visible-columns-session-id-migrated')
+
+    mountUsageRecordsTable([buildRecord({ session_id: 'sess-123' })])
+
+    expect(JSON.parse(window.localStorage.getItem('usage-records-visible-columns-admin') || '[]')).toEqual([
+      'time',
+      'user',
+      'cafecode',
+      'session_id',
+      'model',
+    ])
+    expect(JSON.parse(window.localStorage.getItem('usage-records-visible-columns-user') || '[]')).toEqual([
+      'time',
+      'session_id',
+      'key',
+      'model',
+    ])
+    expect(window.localStorage.getItem('usage-records-visible-columns-session-id-migrated')).toBe('1')
   })
 })

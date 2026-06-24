@@ -73,6 +73,15 @@
           @update:model-value="$emit('update:filterUser', $event)"
         />
 
+        <div class="relative min-w-0">
+          <Search class="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+          <Input
+            v-model="localSessionId"
+            class="h-8 w-full min-w-0 border-border/60 pl-8 text-xs"
+            placeholder="会话 ID"
+          />
+        </div>
+
         <!-- 模型筛选 -->
         <Select
           :model-value="filterModel"
@@ -342,6 +351,13 @@
             <span class="text-muted-foreground/40">·</span>
             <span class="min-w-0 truncate">{{ formatApiFormat(record.api_format) }}</span>
           </template>
+          <template v-if="record.session_id">
+            <span class="text-muted-foreground/40">·</span>
+            <span
+              class="min-w-0 truncate font-mono"
+              :title="record.session_id"
+            >sid {{ record.session_id }}</span>
+          </template>
         </div>
 
         <!-- 第三行：性能指标 -->
@@ -407,6 +423,10 @@
           class="w-[10%]"
         >
         <col
+          v-if="isColumnVisible('session_id')"
+          class="w-[11%]"
+        >
+        <col
           v-if="isColumnVisible('model')"
           class="w-[13%]"
         >
@@ -451,6 +471,10 @@
         <col
           v-if="isColumnVisible('time')"
           class="w-[9%]"
+        >
+        <col
+          v-if="isColumnVisible('session_id')"
+          class="w-[12%]"
         >
         <col
           v-if="isColumnVisible('key')"
@@ -548,6 +572,41 @@
                   variant="ghost"
                   class="h-8 w-full text-xs"
                   @click="clearCafecodeFilter(close)"
+                >
+                  清除筛选
+                </Button>
+              </div>
+            </template>
+          </SortableTableHead>
+          <SortableTableHead
+            v-if="isColumnVisible('session_id')"
+            class="h-12 font-semibold"
+            :class="[isAdmin ? 'w-[11%]' : 'w-[12%]']"
+            column-key="session_id"
+            :sortable="false"
+            :filter-active="normalizedFilterSessionId.length > 0"
+            filter-title="筛选会话 ID"
+            filter-content-class="w-72 p-3 rounded-2xl border-border bg-card text-foreground shadow-2xl backdrop-blur-xl"
+          >
+            会话ID
+            <template #filter="{ close }">
+              <div class="space-y-2">
+                <div class="relative">
+                  <Search class="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+                  <Input
+                    v-model="localSessionId"
+                    class="h-8 pl-8 text-xs"
+                    placeholder="session_id / conversation_id"
+                    @keydown.stop
+                    @keyup.enter="close"
+                  />
+                </div>
+                <Button
+                  v-if="normalizedFilterSessionId.length > 0"
+                  type="button"
+                  variant="ghost"
+                  class="h-8 w-full text-xs"
+                  @click="clearSessionIdFilter(close)"
                 >
                   清除筛选
                 </Button>
@@ -755,6 +814,14 @@
                 {{ record.cafecode_uid }}
               </span>
             </div>
+          </TableCell>
+          <TableCell
+            v-if="isColumnVisible('session_id')"
+            class="py-4 truncate font-mono text-[11px] text-muted-foreground"
+            :class="[isAdmin ? 'w-[11%]' : 'w-[12%]']"
+            :title="record.session_id || '-'"
+          >
+            {{ record.session_id || '-' }}
           </TableCell>
           <!-- 用户页面的密钥列 -->
           <TableCell
@@ -1163,6 +1230,7 @@ type UsageRecordColumnId =
   | 'time'
   | 'user'
   | 'cafecode'
+  | 'session_id'
   | 'key'
   | 'model'
   | 'provider'
@@ -1193,6 +1261,7 @@ const props = defineProps<{
   filterSearch: string
   filterUser: string
   filterCafecode: string
+  filterSessionId: string
   filterModel: string
   filterProvider: string
   filterApiFormat: string
@@ -1217,6 +1286,7 @@ const emit = defineEmits<{
   'update:filterSearch': [value: string]
   'update:filterUser': [value: string]
   'update:filterCafecode': [value: string]
+  'update:filterSessionId': [value: string]
   'update:filterModel': [value: string]
   'update:filterProvider': [value: string]
   'update:filterApiFormat': [value: string]
@@ -1235,6 +1305,7 @@ const USAGE_RECORD_COLUMN_OPTIONS: UsageRecordColumnOption[] = [
   { id: 'time', label: '时间' },
   { id: 'user', label: '用户', adminOnly: true },
   { id: 'cafecode', label: 'Cafecode', adminOnly: true },
+  { id: 'session_id', label: '会话ID' },
   { id: 'key', label: '密钥', userOnly: true },
   { id: 'model', label: '模型' },
   { id: 'provider', label: '提供商', adminOnly: true },
@@ -1252,6 +1323,7 @@ const DEFAULT_ADMIN_COLUMNS: UsageRecordColumnId[] = [
   'time',
   'user',
   'cafecode',
+  'session_id',
   'model',
   'provider',
   'api_format',
@@ -1263,6 +1335,7 @@ const DEFAULT_ADMIN_COLUMNS: UsageRecordColumnId[] = [
 
 const DEFAULT_USER_COLUMNS: UsageRecordColumnId[] = [
   'time',
+  'session_id',
   'key',
   'model',
   'api_format',
@@ -1286,6 +1359,7 @@ const userVisibleColumnIds = useLocalStorage<UsageRecordColumnId[]>(
   'usage-records-visible-columns-user',
   DEFAULT_USER_COLUMNS,
 )
+const COLUMN_MIGRATION_SESSION_ID_KEY = 'usage-records-visible-columns-session-id-migrated'
 
 const roleColumnOptions = computed(() => USAGE_RECORD_COLUMN_OPTIONS.filter((column) => {
   if (column.adminOnly && !props.isAdmin) return false
@@ -1309,6 +1383,32 @@ function sanitizeColumnIds(
   return sanitized.length > 0 ? sanitized : [...fallback]
 }
 
+function withSessionIdColumn(
+  ids: readonly UsageRecordColumnId[],
+  afterColumn: UsageRecordColumnId,
+): UsageRecordColumnId[] {
+  if (ids.includes('session_id')) return [...ids]
+  const next = [...ids]
+  const insertIndex = next.indexOf(afterColumn)
+  if (insertIndex >= 0) {
+    next.splice(insertIndex + 1, 0, 'session_id')
+  } else {
+    next.push('session_id')
+  }
+  return next
+}
+
+function migrateSessionIdColumnVisibility() {
+  if (typeof window === 'undefined') return
+  if (window.localStorage.getItem(COLUMN_MIGRATION_SESSION_ID_KEY) === '1') return
+
+  adminVisibleColumnIds.value = withSessionIdColumn(adminVisibleColumnIds.value, 'cafecode')
+  userVisibleColumnIds.value = withSessionIdColumn(userVisibleColumnIds.value, 'time')
+  window.localStorage.setItem(COLUMN_MIGRATION_SESSION_ID_KEY, '1')
+}
+
+migrateSessionIdColumnVisibility()
+
 const visibleColumnIds = computed<UsageRecordColumnId[]>({
   get: () => sanitizeColumnIds(
     props.isAdmin ? adminVisibleColumnIds.value : userVisibleColumnIds.value,
@@ -1330,7 +1430,8 @@ const desktopTableMinWidthClass = computed(() => {
   const metadataColumnCount = visibleColumnIds.value.filter(column => (
     column === 'client_family' ||
     column === 'client_ip' ||
-    column === 'user_agent'
+    column === 'user_agent' ||
+    column === 'session_id'
   )).length
   if (metadataColumnCount >= 3) return 'min-w-[1520px]'
   if (metadataColumnCount > 0) return 'min-w-[1320px]'
@@ -1413,6 +1514,11 @@ const normalizedFilterCafecode = computed(() => props.filterCafecode.trim())
 const emitCafecodeDebounced = useDebounceFn((value: string) => {
   emit('update:filterCafecode', value.trim())
 }, 300)
+const localSessionId = ref(props.filterSessionId)
+const normalizedFilterSessionId = computed(() => props.filterSessionId.trim())
+const emitSessionIdDebounced = useDebounceFn((value: string) => {
+  emit('update:filterSessionId', value.trim())
+}, 300)
 
 function getDisplayStatus(record: UsageRecord) {
   return resolveDisplayRequestStatus(record)
@@ -1470,6 +1576,12 @@ watch(() => props.filterCafecode, (value) => {
   }
 })
 
+watch(() => props.filterSessionId, (value) => {
+  if (value !== localSessionId.value) {
+    localSessionId.value = value
+  }
+})
+
 watch(localSearch, (value) => {
   emitSearchDebounced(value)
 })
@@ -1478,9 +1590,19 @@ watch(localCafecode, (value) => {
   emitCafecodeDebounced(value)
 })
 
+watch(localSessionId, (value) => {
+  emitSessionIdDebounced(value)
+})
+
 function clearCafecodeFilter(close: () => void) {
   localCafecode.value = ''
   emit('update:filterCafecode', '')
+  close()
+}
+
+function clearSessionIdFilter(close: () => void) {
+  localSessionId.value = ''
+  emit('update:filterSessionId', '')
   close()
 }
 

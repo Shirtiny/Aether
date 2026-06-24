@@ -1195,6 +1195,11 @@ pub fn admin_usage_client_family(item: &StoredRequestUsageAudit) -> Option<&str>
         })
 }
 
+fn admin_usage_session_id(item: &StoredRequestUsageAudit) -> Option<&str> {
+    admin_usage_metadata_string(item, "session_id")
+        .or_else(|| admin_usage_metadata_string(item, "conversation_id"))
+}
+
 fn admin_usage_active_request_json(
     item: &StoredRequestUsageAudit,
     api_key_name: Option<String>,
@@ -1228,6 +1233,7 @@ fn admin_usage_active_request_json(
         "client_requested_stream": client_is_stream,
         "client_is_stream": client_is_stream,
         "client_family": admin_usage_client_family(item),
+        "session_id": admin_usage_session_id(item),
         "client_ip": admin_usage_metadata_string(item, "client_ip"),
         "user_agent": admin_usage_metadata_string(item, "user_agent"),
         "request_path": admin_usage_metadata_string(item, "request_path"),
@@ -1365,6 +1371,7 @@ pub fn admin_usage_record_json(
         "cafecode_uname",
         admin_usage_metadata_string(item, "cafecode_uname"),
     );
+    maybe_insert_string_field(object, "session_id", admin_usage_session_id(item));
     maybe_insert_string_field(
         object,
         "request_path",

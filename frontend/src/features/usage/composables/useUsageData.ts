@@ -32,6 +32,7 @@ export interface PaginationParams {
 export interface FilterParams {
   search?: string
   cafecode?: string
+  session_id?: string
   user_id?: string
   model?: string
   provider?: string
@@ -342,6 +343,9 @@ export function useUsageData(options: UseUsageDataOptions) {
       if (filters?.search?.trim()) {
         params.search = filters.search.trim()
       }
+      if (filters?.session_id?.trim()) {
+        params.session_id = filters.session_id.trim()
+      }
 
       if (isAdminPage.value) {
         // 管理员页面：使用管理员 API
@@ -533,7 +537,8 @@ export function useUsageData(options: UseUsageDataOptions) {
           rate_multiplier: existing.rate_multiplier ?? record.rate_multiplier,
           target_model: existing.target_model || record.target_model,
           reasoning_effort: existing.reasoning_effort || record.reasoning_effort,
-          service_tier: existing.service_tier || record.service_tier
+          service_tier: existing.service_tier || record.service_tier,
+          session_id: existing.session_id || record.session_id
         }
       }
 

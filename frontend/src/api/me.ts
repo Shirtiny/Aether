@@ -328,6 +328,7 @@ export const meApi = {
     timezone?: string
     tz_offset_minutes?: number
     search?: string  // 通用搜索：密钥名、模型名
+    session_id?: string
     limit?: number
     offset?: number
   }): Promise<UsageResponse> {
@@ -354,6 +355,7 @@ export const meApi = {
       first_byte_time_ms: number | null
       status_code?: number | null
       error_message?: string | null
+      session_id?: string | null
       api_format?: string | null
       endpoint_api_format?: string | null
       is_stream?: boolean | null

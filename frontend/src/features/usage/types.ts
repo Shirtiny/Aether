@@ -122,6 +122,7 @@ export interface UsageRecord {
   user_agent?: string | null
   cafecode_uid?: string | null
   cafecode_uname?: string | null
+  session_id?: string | null
   request_path?: string | null
   request_path_and_query?: string | null
   status_code?: number
