@@ -13,6 +13,17 @@ const MAX_USAGE_REQUEST_METADATA_DEPTH: usize = 32;
 const MAX_USAGE_REQUEST_METADATA_NODES: usize = 4_000;
 const MAX_USAGE_REQUEST_METADATA_BYTES: usize = 16 * 1024;
 const MAX_USAGE_REQUEST_METADATA_STRING_BYTES: usize = 1_024;
+const MAX_USAGE_PROMPT_CAPTURE_ROLE_COUNTS: usize = 32;
+const MAX_USAGE_PROMPT_CAPTURE_ITEMS: usize = 256;
+const MAX_USAGE_PROMPT_CAPTURE_PREVIEW_BYTES: usize = 8 * 1024;
+const USAGE_PROMPT_CAPTURE_PREVIEW_BYTE_BUDGETS: [usize; 8] =
+    [4 * 1024, 2 * 1024, 1024, 512, 256, 128, 64, 0];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PromptCaptureText {
+    value: String,
+    truncated: bool,
+}
 
 pub(crate) fn build_usage_request_metadata_seed(
     _plan: &ExecutionPlan,
@@ -171,7 +182,7 @@ fn copy_allowed_metadata_fields(source: &Map<String, Value>, target: &mut Map<St
     copy_number(source, target, "provider_response_body_base64_bytes");
     copy_number(source, target, "client_response_body_base64_bytes");
     copy_number(source, target, "client_response_status_code");
-    copy_non_null_value(source, target, "prompt_capture");
+    copy_prompt_capture(source, target);
     copy_non_null_value(source, target, "billing_snapshot");
     copy_non_empty_string(source, target, "billing_snapshot_schema_version");
     copy_non_empty_string(source, target, "billing_snapshot_status");
@@ -219,7 +230,7 @@ fn move_allowed_metadata_fields(mut source: Map<String, Value>, target: &mut Map
     remove_number(&mut source, target, "provider_response_body_base64_bytes");
     remove_number(&mut source, target, "client_response_body_base64_bytes");
     remove_number(&mut source, target, "client_response_status_code");
-    remove_non_null_value(&mut source, target, "prompt_capture");
+    remove_prompt_capture(&mut source, target);
     remove_non_null_value(&mut source, target, "billing_snapshot");
     remove_non_empty_string(&mut source, target, "billing_snapshot_schema_version");
     remove_non_empty_string(&mut source, target, "billing_snapshot_status");
@@ -342,6 +353,270 @@ fn copy_non_null_value(source: &Map<String, Value>, target: &mut Map<String, Val
     );
 }
 
+fn copy_prompt_capture(source: &Map<String, Value>, target: &mut Map<String, Value>) {
+    let Some(value) = source
+        .get("prompt_capture")
+        .filter(|value| !value.is_null())
+    else {
+        return;
+    };
+    let Some(prompt_capture) = sanitize_prompt_capture_value(value) else {
+        return;
+    };
+    target.insert("prompt_capture".to_string(), prompt_capture);
+}
+
+fn remove_prompt_capture(source: &mut Map<String, Value>, target: &mut Map<String, Value>) {
+    let Some(value) = source
+        .remove("prompt_capture")
+        .filter(|value| !value.is_null())
+    else {
+        return;
+    };
+    let Some(prompt_capture) = sanitize_prompt_capture_value(&value) else {
+        return;
+    };
+    target.insert("prompt_capture".to_string(), prompt_capture);
+}
+
+fn sanitize_prompt_capture_value(value: &Value) -> Option<Value> {
+    let object = value.as_object()?;
+    let mut capture = Map::new();
+
+    copy_prompt_capture_number(object, &mut capture, "version");
+    copy_prompt_capture_number(object, &mut capture, "item_count");
+    copy_prompt_capture_role_counts(object, &mut capture);
+    copy_prompt_capture_items(object, &mut capture);
+
+    if capture.is_empty() {
+        return None;
+    }
+
+    Some(compact_prompt_capture_to_metadata_limits(Value::Object(
+        capture,
+    )))
+}
+
+fn copy_prompt_capture_number(
+    source: &Map<String, Value>,
+    target: &mut Map<String, Value>,
+    key: &str,
+) {
+    let Some(value) = source.get(key).filter(|value| value.is_number()) else {
+        return;
+    };
+    target.insert(key.to_string(), value.clone());
+}
+
+fn copy_prompt_capture_role_counts(source: &Map<String, Value>, target: &mut Map<String, Value>) {
+    let Some(role_counts) = source.get("role_counts").and_then(Value::as_object) else {
+        return;
+    };
+    let counts = role_counts
+        .iter()
+        .take(MAX_USAGE_PROMPT_CAPTURE_ROLE_COUNTS)
+        .filter_map(|(role, count)| {
+            let role = trim_and_truncate_prompt_capture_text(role, 64)?;
+            let count = prompt_capture_count_value(count)?;
+            Some((role, serde_json::json!(count)))
+        })
+        .collect::<Map<_, _>>();
+    if !counts.is_empty() {
+        target.insert("role_counts".to_string(), Value::Object(counts));
+    }
+}
+
+fn copy_prompt_capture_items(source: &Map<String, Value>, target: &mut Map<String, Value>) {
+    let Some(items) = source.get("items").and_then(Value::as_array) else {
+        return;
+    };
+    let items = items
+        .iter()
+        .take(MAX_USAGE_PROMPT_CAPTURE_ITEMS)
+        .filter_map(sanitize_prompt_capture_item)
+        .collect::<Vec<_>>();
+    if !items.is_empty() {
+        target.insert("items".to_string(), Value::Array(items));
+    }
+}
+
+fn sanitize_prompt_capture_item(value: &Value) -> Option<Value> {
+    let object = value.as_object()?;
+    let mut item = Map::new();
+
+    if let Some(source) = prompt_capture_string(object, "source", 128) {
+        item.insert("source".to_string(), Value::String(source));
+    }
+    if let Some(role) = prompt_capture_string(object, "role", 64) {
+        item.insert("role".to_string(), Value::String(role));
+    }
+    if let Some(sha256) = prompt_capture_string(object, "sha256", 128) {
+        item.insert("sha256".to_string(), Value::String(sha256));
+    }
+    if let Some(chars) = object.get("chars").and_then(prompt_capture_count_value) {
+        item.insert("chars".to_string(), serde_json::json!(chars));
+    }
+    let preview_truncated = if let Some(preview) =
+        prompt_capture_text(object, "preview", MAX_USAGE_PROMPT_CAPTURE_PREVIEW_BYTES)
+    {
+        let truncated = preview.truncated;
+        item.insert("preview".to_string(), Value::String(preview.value));
+        truncated
+    } else {
+        false
+    };
+    if let Some(truncated) = object
+        .get("truncated")
+        .and_then(Value::as_bool)
+        .map(|truncated| truncated || preview_truncated)
+        .or_else(|| preview_truncated.then_some(true))
+    {
+        item.insert("truncated".to_string(), Value::Bool(truncated));
+    }
+
+    (!item.is_empty()).then_some(Value::Object(item))
+}
+
+fn compact_prompt_capture_to_metadata_limits(mut capture: Value) -> Value {
+    if usage_request_metadata_within_limits(&capture) {
+        return capture;
+    }
+
+    for max_preview_bytes in USAGE_PROMPT_CAPTURE_PREVIEW_BYTE_BUDGETS {
+        limit_prompt_capture_previews(&mut capture, max_preview_bytes);
+        if usage_request_metadata_within_limits(&capture) {
+            return capture;
+        }
+    }
+
+    truncate_prompt_capture_items_to_fit(&mut capture);
+    capture
+}
+
+fn limit_prompt_capture_previews(capture: &mut Value, max_preview_bytes: usize) {
+    let Some(items) = capture.get_mut("items").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for item in items {
+        let Some(item_object) = item.as_object_mut() else {
+            continue;
+        };
+        let Some(preview) = item_object.get("preview").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(preview) = trim_and_truncate_prompt_capture_preview(preview, max_preview_bytes)
+        else {
+            item_object.remove("preview");
+            continue;
+        };
+        let truncated = preview.truncated;
+        item_object.insert("preview".to_string(), Value::String(preview.value));
+        if truncated {
+            item_object.insert("truncated".to_string(), Value::Bool(true));
+        }
+    }
+}
+
+fn truncate_prompt_capture_items_to_fit(capture: &mut Value) {
+    if usage_request_metadata_within_limits(capture) {
+        return;
+    }
+    let Some(original_len) = capture.get("items").and_then(Value::as_array).map(Vec::len) else {
+        return;
+    };
+
+    let mut low = 0usize;
+    let mut high = original_len;
+    while low < high {
+        let mid = (low + high + 1) / 2;
+        let mut candidate = capture.clone();
+        retain_prompt_capture_items(&mut candidate, mid);
+        if usage_request_metadata_within_limits(&candidate) {
+            low = mid;
+        } else {
+            high = mid.saturating_sub(1);
+        }
+    }
+    retain_prompt_capture_items(capture, low);
+}
+
+fn retain_prompt_capture_items(capture: &mut Value, max_items: usize) {
+    let Some(items) = capture.get_mut("items").and_then(Value::as_array_mut) else {
+        return;
+    };
+    if items.len() <= max_items {
+        return;
+    }
+    if max_items == 0 {
+        items.clear();
+        return;
+    }
+    if max_items == 1 {
+        items.truncate(1);
+        return;
+    }
+
+    let tail_count = max_items - 1;
+    let tail_start = items.len().saturating_sub(tail_count);
+    let mut retained = Vec::with_capacity(max_items);
+    if let Some(first) = items.first() {
+        retained.push(first.clone());
+    }
+    retained.extend(items.iter().skip(tail_start).cloned());
+    *items = retained;
+}
+
+fn prompt_capture_string(
+    source: &Map<String, Value>,
+    key: &str,
+    max_bytes: usize,
+) -> Option<String> {
+    prompt_capture_text(source, key, max_bytes).map(|text| text.value)
+}
+
+fn prompt_capture_text(
+    source: &Map<String, Value>,
+    key: &str,
+    max_bytes: usize,
+) -> Option<PromptCaptureText> {
+    source
+        .get(key)
+        .and_then(Value::as_str)
+        .and_then(|value| trim_and_truncate_prompt_capture_preview(value, max_bytes))
+}
+
+fn trim_and_truncate_prompt_capture_text(value: &str, max_bytes: usize) -> Option<String> {
+    trim_and_truncate_prompt_capture_preview(value, max_bytes)
+        .map(|preview| preview.value)
+        .filter(|value| !value.is_empty())
+}
+
+fn trim_and_truncate_prompt_capture_preview(
+    value: &str,
+    max_bytes: usize,
+) -> Option<PromptCaptureText> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.len() <= max_bytes {
+        return Some(PromptCaptureText {
+            value: trimmed.to_string(),
+            truncated: false,
+        });
+    }
+    Some(PromptCaptureText {
+        value: truncate_string_to_bytes(trimmed, max_bytes),
+        truncated: true,
+    })
+}
+
+fn prompt_capture_count_value(value: &Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_i64().and_then(|number| u64::try_from(number).ok()))
+}
+
 fn remove_non_null_value(
     source: &mut Map<String, Value>,
     target: &mut Map<String, Value>,
@@ -381,20 +656,35 @@ fn truncate_usage_request_metadata_string(value: &str) -> String {
 
     let target_bytes =
         MAX_USAGE_REQUEST_METADATA_STRING_BYTES.saturating_sub(TRUNCATED_SUFFIX.len());
+    let prefix = truncate_string_to_bytes(value, target_bytes);
+    if prefix.is_empty() {
+        return TRUNCATED_SUFFIX.to_string();
+    }
+
+    format!("{prefix}{TRUNCATED_SUFFIX}")
+}
+
+fn truncate_string_to_bytes(value: &str, max_bytes: usize) -> String {
+    if max_bytes == 0 {
+        return String::new();
+    }
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
     let mut end = 0usize;
     for (idx, ch) in value.char_indices() {
         let next = idx + ch.len_utf8();
-        if next > target_bytes {
+        if next > max_bytes {
             break;
         }
         end = next;
     }
 
     if end == 0 {
-        return TRUNCATED_SUFFIX.to_string();
+        return String::new();
     }
 
-    format!("{}{TRUNCATED_SUFFIX}", &value[..end])
+    value[..end].to_string()
 }
 
 fn trim_and_truncate_usage_request_metadata_string_owned(value: String) -> Option<String> {
@@ -500,6 +790,7 @@ mod tests {
         attach_provider_request_body_metadata, build_usage_request_metadata_seed,
         merge_usage_request_metadata, merge_usage_request_metadata_owned,
         sanitize_usage_request_metadata, sanitize_usage_request_metadata_ref,
+        usage_request_metadata_within_limits, MAX_USAGE_PROMPT_CAPTURE_PREVIEW_BYTES,
         MAX_USAGE_REQUEST_METADATA_BYTES, MAX_USAGE_REQUEST_METADATA_DEPTH,
         MAX_USAGE_REQUEST_METADATA_NODES,
     };
@@ -641,6 +932,160 @@ mod tests {
                 "max_bytes": MAX_USAGE_REQUEST_METADATA_BYTES,
                 "value_kind": "object",
             }))
+        );
+    }
+
+    #[test]
+    fn sanitizes_large_prompt_capture_without_dropping_items() {
+        let metadata = sanitize_usage_request_metadata(Some(json!({
+            "prompt_capture": {
+                "version": 1,
+                "item_count": 32,
+                "role_counts": { "system": 2, "user": 30 },
+                "items": (0..32).map(|index| {
+                    json!({
+                        "source": "request",
+                        "role": if index < 2 { "system" } else { "user" },
+                        "sha256": format!("{index:064x}"),
+                        "chars": 16 * 1024,
+                        "preview": "prompt preview ".repeat(700),
+                        "truncated": true,
+                    })
+                }).collect::<Vec<_>>()
+            }
+        })))
+        .expect("metadata should remain");
+        let capture = metadata
+            .get("prompt_capture")
+            .and_then(Value::as_object)
+            .expect("prompt capture should remain an object");
+
+        assert_eq!(capture.get("item_count"), Some(&json!(32)));
+        assert_eq!(
+            capture.get("items").and_then(Value::as_array).map(Vec::len),
+            Some(32)
+        );
+        assert!(usage_request_metadata_within_limits(
+            metadata
+                .get("prompt_capture")
+                .expect("prompt capture should remain")
+        ));
+        assert!(
+            serde_json::to_string(
+                metadata
+                    .get("prompt_capture")
+                    .expect("prompt capture should remain")
+            )
+            .expect("prompt capture should serialize")
+            .len()
+                < MAX_USAGE_REQUEST_METADATA_BYTES
+        );
+        assert_ne!(
+            capture.get("reason"),
+            Some(&json!("usage_request_metadata_limits_exceeded"))
+        );
+    }
+
+    #[test]
+    fn sanitizes_prompt_capture_preview_to_bounded_items() {
+        let metadata = sanitize_usage_request_metadata(Some(json!({
+            "prompt_capture": {
+                "version": 1,
+                "item_count": 1,
+                "role_counts": { "user": 1 },
+                "items": [{
+                    "source": "request",
+                    "role": "user",
+                    "sha256": "a".repeat(64),
+                    "chars": 40_000,
+                    "preview": "x".repeat(16 * 1024),
+                    "truncated": true,
+                }]
+            }
+        })))
+        .expect("metadata should remain");
+        let preview = metadata
+            .get("prompt_capture")
+            .and_then(|capture| capture.get("items"))
+            .and_then(Value::as_array)
+            .and_then(|items| items.first())
+            .and_then(|item| item.get("preview"))
+            .and_then(Value::as_str)
+            .expect("preview should remain");
+
+        assert_eq!(preview.len(), MAX_USAGE_PROMPT_CAPTURE_PREVIEW_BYTES);
+    }
+
+    #[test]
+    fn sanitizes_prompt_capture_truncates_extreme_item_count_to_metadata_limits() {
+        let metadata = sanitize_usage_request_metadata(Some(json!({
+            "prompt_capture": {
+                "version": 1,
+                "item_count": 256,
+                "role_counts": { "user": 256 },
+                "items": (0..256).map(|index| {
+                    json!({
+                        "source": "request",
+                        "role": "user",
+                        "sha256": format!("{index:064x}"),
+                        "chars": 400,
+                        "preview": "",
+                        "truncated": true,
+                    })
+                }).collect::<Vec<_>>()
+            }
+        })))
+        .expect("metadata should remain");
+        let capture = metadata
+            .get("prompt_capture")
+            .expect("prompt capture should remain");
+        let items = capture
+            .get("items")
+            .and_then(Value::as_array)
+            .expect("items should remain");
+
+        assert_eq!(capture.get("item_count"), Some(&json!(256)));
+        assert!(items.len() < 256);
+        assert!(usage_request_metadata_within_limits(capture));
+        assert_ne!(
+            capture.get("reason"),
+            Some(&json!("usage_request_metadata_limits_exceeded"))
+        );
+    }
+
+    #[test]
+    fn sanitizes_prompt_capture_marks_preview_truncated_when_runtime_trims_bytes() {
+        let metadata = sanitize_usage_request_metadata(Some(json!({
+            "prompt_capture": {
+                "version": 1,
+                "item_count": 1,
+                "role_counts": { "user": 1 },
+                "items": [{
+                    "source": "request",
+                    "role": "user",
+                    "sha256": "b".repeat(64),
+                    "chars": 20_000,
+                    "preview": "界".repeat(4_000),
+                    "truncated": false,
+                }]
+            }
+        })))
+        .expect("metadata should remain");
+        let item = metadata
+            .get("prompt_capture")
+            .and_then(|capture| capture.get("items"))
+            .and_then(Value::as_array)
+            .and_then(|items| items.first())
+            .and_then(Value::as_object)
+            .expect("prompt capture item should remain");
+
+        assert_eq!(item.get("truncated"), Some(&json!(true)));
+        assert!(
+            item.get("preview")
+                .and_then(Value::as_str)
+                .expect("preview should remain")
+                .len()
+                <= MAX_USAGE_PROMPT_CAPTURE_PREVIEW_BYTES
         );
     }
 

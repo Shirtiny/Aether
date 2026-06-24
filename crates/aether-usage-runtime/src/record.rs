@@ -409,4 +409,59 @@ mod tests {
             Some(&serde_json::json!(1))
         );
     }
+
+    #[test]
+    fn preserves_large_prompt_capture_metadata_before_building_upsert_record() {
+        let record = build_upsert_usage_record_from_event(&UsageEvent {
+            event_type: UsageEventType::Completed,
+            request_id: "req-prompt-capture-large".to_string(),
+            timestamp_ms: 1_700_000_000_000,
+            data: UsageEventData {
+                provider_name: "OpenAI".to_string(),
+                model: "gpt-5".to_string(),
+                request_metadata: Some(serde_json::json!({
+                    "prompt_capture": {
+                        "version": 1,
+                        "item_count": 32,
+                        "role_counts": { "system": 2, "user": 30 },
+                        "items": (0..32).map(|index| {
+                            serde_json::json!({
+                                "source": "request",
+                                "role": if index < 2 { "system" } else { "user" },
+                                "sha256": format!("{index:064x}"),
+                                "chars": 20_000,
+                                "preview": "prompt preview ".repeat(700),
+                                "truncated": true
+                            })
+                        }).collect::<Vec<_>>()
+                    },
+                    "billing_snapshot": {
+                        "payload": "x".repeat(32 * 1024)
+                    }
+                })),
+                ..UsageEventData::default()
+            },
+        })
+        .expect("record should build");
+
+        let metadata = record.request_metadata.expect("metadata should remain");
+        let capture = metadata
+            .get("prompt_capture")
+            .and_then(serde_json::Value::as_object)
+            .expect("prompt capture should remain");
+        assert_eq!(capture.get("item_count"), Some(&serde_json::json!(32)));
+        assert_eq!(
+            capture
+                .get("items")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(32)
+        );
+        assert_eq!(
+            metadata
+                .get("billing_snapshot")
+                .and_then(|value| value.get("reason")),
+            Some(&serde_json::json!("usage_request_metadata_limits_exceeded"))
+        );
+    }
 }

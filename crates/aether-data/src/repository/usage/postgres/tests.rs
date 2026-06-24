@@ -1,5 +1,5 @@
 use chrono::{TimeZone, Utc};
-use serde_json::json;
+use serde_json::{json, Value};
 
 use super::{
     attach_compressed_body_refs, attach_usage_http_audit_body_refs,
@@ -1086,6 +1086,45 @@ fn prepare_prompt_capture_metadata_moves_preview_fields_to_entries() {
             }
         }))
     );
+}
+
+#[test]
+fn prepare_prompt_capture_metadata_handles_large_sanitized_prompt_capture() {
+    let items = (0..32)
+        .map(|index| {
+            json!({
+                "source": "request",
+                "role": if index < 2 { "system" } else { "user" },
+                "sha256": format!("{index:064x}"),
+                "chars": 20_000,
+                "preview": "prompt preview ".repeat(700),
+                "truncated": true
+            })
+        })
+        .collect::<Vec<_>>();
+    let (metadata, entries) = prepare_prompt_capture_metadata(Some(json!({
+        "prompt_capture": {
+            "version": 1,
+            "item_count": 32,
+            "role_counts": { "system": 2, "user": 30 },
+            "items": items
+        }
+    })));
+
+    assert_eq!(entries.len(), 32);
+    let capture = metadata
+        .as_ref()
+        .and_then(|value| value.get("prompt_capture"))
+        .and_then(Value::as_object)
+        .expect("prompt capture metadata should remain");
+    assert_eq!(capture.get("version"), Some(&json!(2)));
+    assert_eq!(capture.get("item_count"), Some(&json!(32)));
+    let refs = capture
+        .get("items")
+        .and_then(Value::as_array)
+        .expect("hash refs should remain");
+    assert_eq!(refs.len(), 32);
+    assert!(refs.iter().all(|item| item.get("preview").is_none()));
 }
 
 #[test]
