@@ -2377,16 +2377,17 @@ async fn execute_stream_from_frame_stream(
         headers.insert("content-type".to_string(), "text/event-stream".to_string());
     }
     let upstream_content_type = upstream_headers.get("content-type").map(String::as_str);
+    let has_local_stream_rewriter = local_stream_rewriter.is_some();
     let skip_direct_finalize_prefetch = should_skip_direct_finalize_prefetch(
         direct_stream_finalize_kind.as_deref(),
         upstream_content_type,
         plan.provider_api_format.as_str(),
         plan.client_api_format.as_str(),
         private_stream_normalizer.is_some(),
-        local_stream_rewriter.is_some(),
+        has_local_stream_rewriter,
     );
     let limit_direct_finalize_prefetch =
-        should_limit_direct_finalize_prefetch(plan_kind, local_stream_rewriter.is_some());
+        should_limit_direct_finalize_prefetch(plan_kind, has_local_stream_rewriter);
     let mut prefetched_chunks: Vec<Bytes> = Vec::new();
     let mut provider_prefetched_body = Vec::new();
     let mut prefetched_body = Vec::new();
@@ -2424,8 +2425,9 @@ async fn execute_stream_from_frame_stream(
         .filter(|_| !skip_direct_finalize_prefetch)
     {
         loop {
-            let control_prefetch_extension_allowed =
-                !limit_direct_finalize_prefetch && continue_prefetching_control_stream;
+            let control_prefetch_extension_allowed = continue_prefetching_control_stream
+                && (!limit_direct_finalize_prefetch
+                    || (has_local_stream_rewriter && prefetched_body.is_empty()));
             let prefetch_byte_limit = if control_prefetch_extension_allowed {
                 CONTROL_STREAM_PREFETCH_EXTENSION_MAX_BYTES
             } else {
@@ -2450,9 +2452,9 @@ async fn execute_stream_from_frame_stream(
                     || prefetched_inspection_body.len() >= MAX_STREAM_PREFETCH_BYTES);
             if extend_control_prefetch && !logged_control_prefetch_extension {
                 logged_control_prefetch_extension = true;
-                info!(
+                debug!(
                     event_name = "execution_runtime_stream_prefetch_control_extension_started",
-                    log_type = "event",
+                    log_type = "debug",
                     trace_id = %trace_id,
                     request_id = %request_id_for_log,
                     candidate_id = ?candidate_id,
@@ -2470,36 +2472,7 @@ async fn execute_stream_from_frame_stream(
                     "gateway extended control-only stream prefetch before client-visible body"
                 );
             }
-            let next_frame_result = if limit_direct_finalize_prefetch {
-                match tokio::time::timeout(
-                    REWRITTEN_STREAM_PREFETCH_TIMEOUT,
-                    next_stream_frame(&mut buffered_frames, &mut lines),
-                )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(_) => {
-                        prefetch_release_reason = "rewritten_timeout";
-                        debug!(
-                            event_name = "execution_runtime_stream_prefetch_limited",
-                            log_type = "debug",
-                            trace_id = %trace_id,
-                            request_id = %request_id_for_log,
-                            candidate_id = ?candidate_id,
-                            plan_kind,
-                            report_kind,
-                            provider_name,
-                            endpoint_id = %plan.endpoint_id,
-                            key_id = %plan.key_id,
-                            model_name,
-                            candidate_index = candidate_index.as_str(),
-                            timeout_ms = REWRITTEN_STREAM_PREFETCH_TIMEOUT.as_millis() as u64,
-                            "gateway stopped rewritten stream prefetch before client-visible body"
-                        );
-                        break;
-                    }
-                }
-            } else if extend_control_prefetch {
+            let next_frame_result = if extend_control_prefetch {
                 let Some(remaining) = CONTROL_STREAM_PREFETCH_EXTENSION_TIMEOUT
                     .checked_sub(prefetch_started_at.elapsed())
                 else {
@@ -2550,6 +2523,35 @@ async fn execute_stream_from_frame_stream(
                             prefetched_frames = prefetched_chunks.len(),
                             prefetched_bytes = prefetched_inspection_body.len(),
                             "gateway stopped control-only stream prefetch before client-visible body"
+                        );
+                        break;
+                    }
+                }
+            } else if limit_direct_finalize_prefetch {
+                match tokio::time::timeout(
+                    REWRITTEN_STREAM_PREFETCH_TIMEOUT,
+                    next_stream_frame(&mut buffered_frames, &mut lines),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => {
+                        prefetch_release_reason = "rewritten_timeout";
+                        debug!(
+                            event_name = "execution_runtime_stream_prefetch_limited",
+                            log_type = "debug",
+                            trace_id = %trace_id,
+                            request_id = %request_id_for_log,
+                            candidate_id = ?candidate_id,
+                            plan_kind,
+                            report_kind,
+                            provider_name,
+                            endpoint_id = %plan.endpoint_id,
+                            key_id = %plan.key_id,
+                            model_name,
+                            candidate_index = candidate_index.as_str(),
+                            timeout_ms = REWRITTEN_STREAM_PREFETCH_TIMEOUT.as_millis() as u64,
+                            "gateway stopped rewritten stream prefetch before client-visible body"
                         );
                         break;
                     }
@@ -2880,9 +2882,9 @@ async fn execute_stream_from_frame_stream(
         }
     }
     if skip_direct_finalize_prefetch || direct_stream_finalize_kind.is_some() {
-        info!(
+        debug!(
             event_name = "execution_runtime_stream_prefetch_released",
-            log_type = "event",
+            log_type = "debug",
             trace_id = %trace_id,
             request_id = %request_id_for_log,
             candidate_id = ?candidate_id,
@@ -4162,6 +4164,27 @@ mod tests {
         }
     }
 
+    fn test_chat_from_responses_stream_plan(request_id: &str, candidate_id: &str) -> ExecutionPlan {
+        let mut plan = test_responses_stream_plan(request_id, candidate_id);
+        plan.url = "https://sub.g-aisc.com/v1/responses".into();
+        plan.client_api_format = "openai:chat".into();
+        plan.provider_api_format = "openai:responses".into();
+        plan.model_name = Some("gpt-5.4".into());
+        plan
+    }
+
+    fn test_claude_from_responses_stream_plan(
+        request_id: &str,
+        candidate_id: &str,
+    ) -> ExecutionPlan {
+        let mut plan = test_responses_stream_plan(request_id, candidate_id);
+        plan.url = "https://sub.g-aisc.com/v1/responses".into();
+        plan.client_api_format = "claude:messages".into();
+        plan.provider_api_format = "openai:responses".into();
+        plan.model_name = Some("gpt-5.5".into());
+        plan
+    }
+
     fn test_prefetch_report_context(request_id: &str, candidate_id: &str) -> Value {
         json!({
             "request_id": request_id,
@@ -4173,6 +4196,38 @@ mod tests {
             "key_id": "key-g-aisc",
             "provider_api_format": "openai:responses",
             "client_api_format": "openai:responses",
+        })
+    }
+
+    fn test_chat_from_responses_report_context(request_id: &str, candidate_id: &str) -> Value {
+        json!({
+            "request_id": request_id,
+            "candidate_id": candidate_id,
+            "candidate_index": 0,
+            "retry_index": 0,
+            "provider_id": "provider-g-aisc",
+            "endpoint_id": "endpoint-g-aisc",
+            "key_id": "key-g-aisc",
+            "provider_api_format": "openai:responses",
+            "client_api_format": "openai:chat",
+            "needs_conversion": true,
+            "mapped_model": "gpt-5.4",
+        })
+    }
+
+    fn test_claude_from_responses_report_context(request_id: &str, candidate_id: &str) -> Value {
+        json!({
+            "request_id": request_id,
+            "candidate_id": candidate_id,
+            "candidate_index": 0,
+            "retry_index": 0,
+            "provider_id": "provider-g-aisc",
+            "endpoint_id": "endpoint-g-aisc",
+            "key_id": "key-g-aisc",
+            "provider_api_format": "openai:responses",
+            "client_api_format": "claude:messages",
+            "needs_conversion": true,
+            "mapped_model": "gpt-5.5",
         })
     }
 
@@ -4449,6 +4504,226 @@ mod tests {
         assert!(
             usage_repository
                 .find_by_request_id("req-prefetch-response-failed-503")
+                .await
+                .expect("usage should read")
+                .is_none(),
+            "retryable response.failed events must not finalize request usage before a later candidate"
+        );
+    }
+
+    #[tokio::test]
+    async fn prefetch_rewritten_openai_chat_response_failed_after_control_byte_limit_retries_before_finalizing(
+    ) {
+        crate::orchestration::clear_local_report_effect_caches_for_tests();
+
+        let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
+        let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
+        let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![sample_provider_catalog_provider("provider-g-aisc", "codex")],
+            Vec::new(),
+            vec![sample_provider_catalog_key("key-g-aisc", "provider-g-aisc")],
+        ));
+        let state = AppState::new()
+            .expect("app state should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
+                    Arc::clone(&request_candidate_repository),
+                    Arc::clone(&usage_repository),
+                )
+                .attach_provider_catalog_repository_for_tests(Arc::clone(
+                    &provider_catalog_repository,
+                )),
+            )
+            .with_usage_runtime_for_tests(UsageRuntimeConfig {
+                enabled: true,
+                ..UsageRuntimeConfig::default()
+            });
+        let plan = test_chat_from_responses_stream_plan(
+            "req-prefetch-chat-response-failed-503",
+            "cand-prefetch-chat-response-failed-503",
+        );
+        let padding = "x".repeat(crate::execution_runtime::MAX_STREAM_PREFETCH_BYTES + 1);
+        let frame_stream = stream! {
+            yield Ok::<Bytes, std::io::Error>(ndjson_frame(StreamFrame {
+                frame_type: StreamFrameType::Headers,
+                payload: StreamFramePayload::Headers {
+                    status_code: 200,
+                    headers: BTreeMap::from([(
+                        "content-type".to_string(),
+                        "text/event-stream".to_string(),
+                    )]),
+                },
+            }));
+            yield Ok::<Bytes, std::io::Error>(ndjson_frame(StreamFrame {
+                frame_type: StreamFrameType::Data,
+                payload: StreamFramePayload::Data {
+                    chunk_b64: None,
+                    text: Some(format!(
+                        "event: response.output_item.added\n\
+                         data: {{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{{\"type\":\"message\",\"id\":\"msg_control\",\"status\":\"in_progress\",\"role\":\"assistant\",\"content\":[],\"metadata\":{{\"padding\":\"{padding}\"}}}}}}\n\n"
+                    )),
+                },
+            }));
+            yield Ok::<Bytes, std::io::Error>(ndjson_frame(StreamFrame {
+                frame_type: StreamFrameType::Data,
+                payload: StreamFramePayload::Data {
+                    chunk_b64: None,
+                    text: Some(concat!(
+                        "event: response.failed\n",
+                        "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"type\":\"service_unavailable_error\",\"code\":\"503\",\"message\":\"Our servers are currently overloaded. Please try again later.\"}}}\n\n"
+                    ).to_string()),
+                },
+            }));
+        }.boxed();
+
+        let response = execute_stream_from_frame_stream(
+            &state,
+            plan,
+            "trace-prefetch-chat-response-failed-503",
+            &test_decision(),
+            "openai_chat_stream",
+            Some("openai_chat_stream_success".to_string()),
+            Some(test_chat_from_responses_report_context(
+                "req-prefetch-chat-response-failed-503",
+                "cand-prefetch-chat-response-failed-503",
+            )),
+            crate::clock::current_unix_ms(),
+            Instant::now(),
+            frame_stream,
+            None,
+        )
+        .await
+        .expect("stream execution should succeed");
+
+        assert!(
+            response.is_none(),
+            "retryable response.failed events from rewritten streams should let the candidate loop try the next provider"
+        );
+
+        let candidates = request_candidate_repository
+            .list_by_request_id("req-prefetch-chat-response-failed-503")
+            .await
+            .expect("request candidates should read");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].status, RequestCandidateStatus::Failed);
+        assert_eq!(candidates[0].status_code, Some(503));
+        assert_eq!(
+            candidates[0].error_type.as_deref(),
+            Some("service_unavailable_error")
+        );
+        assert!(
+            usage_repository
+                .find_by_request_id("req-prefetch-chat-response-failed-503")
+                .await
+                .expect("usage should read")
+                .is_none(),
+            "retryable response.failed events must not finalize request usage before a later candidate"
+        );
+    }
+
+    #[tokio::test]
+    async fn prefetch_rewritten_claude_messages_response_failed_after_control_byte_limit_retries_before_finalizing(
+    ) {
+        crate::orchestration::clear_local_report_effect_caches_for_tests();
+
+        let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
+        let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
+        let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![sample_provider_catalog_provider("provider-g-aisc", "codex")],
+            Vec::new(),
+            vec![sample_provider_catalog_key("key-g-aisc", "provider-g-aisc")],
+        ));
+        let state = AppState::new()
+            .expect("app state should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
+                    Arc::clone(&request_candidate_repository),
+                    Arc::clone(&usage_repository),
+                )
+                .attach_provider_catalog_repository_for_tests(Arc::clone(
+                    &provider_catalog_repository,
+                )),
+            )
+            .with_usage_runtime_for_tests(UsageRuntimeConfig {
+                enabled: true,
+                ..UsageRuntimeConfig::default()
+            });
+        let plan = test_claude_from_responses_stream_plan(
+            "req-prefetch-claude-response-failed-503",
+            "cand-prefetch-claude-response-failed-503",
+        );
+        let padding = "x".repeat(crate::execution_runtime::MAX_STREAM_PREFETCH_BYTES + 1);
+        let frame_stream = stream! {
+            yield Ok::<Bytes, std::io::Error>(ndjson_frame(StreamFrame {
+                frame_type: StreamFrameType::Headers,
+                payload: StreamFramePayload::Headers {
+                    status_code: 200,
+                    headers: BTreeMap::from([(
+                        "content-type".to_string(),
+                        "text/event-stream".to_string(),
+                    )]),
+                },
+            }));
+            yield Ok::<Bytes, std::io::Error>(ndjson_frame(StreamFrame {
+                frame_type: StreamFrameType::Data,
+                payload: StreamFramePayload::Data {
+                    chunk_b64: None,
+                    text: Some(format!(
+                        "event: response.output_item.added\n\
+                         data: {{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{{\"type\":\"message\",\"id\":\"msg_control\",\"status\":\"in_progress\",\"role\":\"assistant\",\"content\":[],\"metadata\":{{\"padding\":\"{padding}\"}}}}}}\n\n"
+                    )),
+                },
+            }));
+            yield Ok::<Bytes, std::io::Error>(ndjson_frame(StreamFrame {
+                frame_type: StreamFrameType::Data,
+                payload: StreamFramePayload::Data {
+                    chunk_b64: None,
+                    text: Some(concat!(
+                        "event: response.failed\n",
+                        "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"type\":\"service_unavailable_error\",\"code\":\"503\",\"message\":\"Our servers are currently overloaded. Please try again later.\"}}}\n\n"
+                    ).to_string()),
+                },
+            }));
+        }.boxed();
+
+        let response = execute_stream_from_frame_stream(
+            &state,
+            plan,
+            "trace-prefetch-claude-response-failed-503",
+            &test_decision(),
+            "claude_chat_stream",
+            Some("claude_chat_stream_success".to_string()),
+            Some(test_claude_from_responses_report_context(
+                "req-prefetch-claude-response-failed-503",
+                "cand-prefetch-claude-response-failed-503",
+            )),
+            crate::clock::current_unix_ms(),
+            Instant::now(),
+            frame_stream,
+            None,
+        )
+        .await
+        .expect("stream execution should succeed");
+
+        assert!(
+            response.is_none(),
+            "retryable response.failed events from rewritten Claude Messages streams should let the candidate loop try the next provider"
+        );
+
+        let candidates = request_candidate_repository
+            .list_by_request_id("req-prefetch-claude-response-failed-503")
+            .await
+            .expect("request candidates should read");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].status, RequestCandidateStatus::Failed);
+        assert_eq!(candidates[0].status_code, Some(503));
+        assert_eq!(
+            candidates[0].error_type.as_deref(),
+            Some("service_unavailable_error")
+        );
+        assert!(
+            usage_repository
+                .find_by_request_id("req-prefetch-claude-response-failed-503")
                 .await
                 .expect("usage should read")
                 .is_none(),
