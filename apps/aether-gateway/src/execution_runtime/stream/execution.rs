@@ -1890,7 +1890,7 @@ fn should_skip_direct_finalize_prefetch(
         .unwrap_or_default()
         .to_ascii_lowercase();
     if content_type.contains("text/event-stream") {
-        return true;
+        return false;
     }
 
     if has_private_stream_normalizer || has_local_stream_rewriter {
@@ -2569,42 +2569,24 @@ async fn execute_stream_from_frame_stream(
                                 provider_prefetched_body_bytes = provider_prefetched_body.len(),
                                 "gateway detected embedded error while prefetching execution runtime stream"
                             );
-                            let failure = build_stream_failure_from_provider_error_body(
-                                status_code,
-                                &body_json,
-                            );
-                            remember_provider_session_risk_control_block_for_failure(
+                            let error_status_code =
+                                resolve_local_sync_error_status_code(status_code, &body_json);
+                            return handle_prefetch_provider_private_stream_error(
                                 state,
+                                trace_id,
+                                decision,
                                 &plan,
-                                report_context.as_ref(),
-                                &failure,
+                                report_context,
+                                request_id,
+                                candidate_id,
+                                report_kind,
+                                headers,
+                                prefetched_usage_telemetry.clone(),
+                                &provider_prefetched_body,
+                                error_status_code,
+                                body_json,
                             )
                             .await;
-                            let payload = build_stream_sync_payload(
-                                trace_id,
-                                report_kind.clone(),
-                                report_context,
-                                status_code,
-                                headers,
-                                Some(body_json),
-                                None,
-                                prefetched_usage_telemetry.clone(),
-                            );
-                            record_sync_terminal_usage(
-                                state,
-                                &plan,
-                                payload.report_context.as_ref(),
-                                &payload,
-                            );
-                            let response = submit_local_core_error_or_sync_finalize(
-                                state, trace_id, decision, payload,
-                            )
-                            .await?;
-                            return Ok(Some(attach_control_metadata_headers(
-                                response,
-                                Some(request_id),
-                                candidate_id,
-                            )?));
                         }
                         StreamPrefetchInspection::NeedMore => {}
                         StreamPrefetchInspection::NonError => {}
@@ -3968,8 +3950,9 @@ mod tests {
         client_format_allows_proxy_generated_sse_control_blocks,
         ensure_stream_terminal_summary_for_missing_observed_finish,
         execute_execution_runtime_stream, execute_stream_from_frame_stream,
-        handle_prefetch_stream_failure, maybe_apply_kiro_prompt_cache_usage_to_stream_summary,
-        merge_stream_terminal_summary, should_limit_direct_finalize_prefetch,
+        handle_prefetch_provider_private_stream_error, handle_prefetch_stream_failure,
+        maybe_apply_kiro_prompt_cache_usage_to_stream_summary, merge_stream_terminal_summary,
+        resolve_local_sync_error_status_code, should_limit_direct_finalize_prefetch,
         should_probe_success_failover_before_stream, should_skip_direct_finalize_prefetch,
         stream_chunk_contains_sse_done, stream_requires_observed_terminal_event,
         stream_terminal_summary_missing_observed_finish,
@@ -4121,6 +4104,86 @@ mod tests {
                 "1776657828".to_string(),
             ),
         ])
+    }
+
+    #[tokio::test]
+    async fn prefetch_embedded_sse_error_retries_retryable_status_before_finalizing() {
+        crate::orchestration::clear_local_report_effect_caches_for_tests();
+
+        let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
+        let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
+        let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![sample_provider_catalog_provider("provider-g-aisc", "codex")],
+            Vec::new(),
+            vec![sample_provider_catalog_key("key-g-aisc", "provider-g-aisc")],
+        ));
+        let state = AppState::new()
+            .expect("app state should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
+                    Arc::clone(&request_candidate_repository),
+                    Arc::clone(&usage_repository),
+                )
+                .attach_provider_catalog_repository_for_tests(Arc::clone(&provider_catalog_repository)),
+            )
+            .with_usage_runtime_for_tests(UsageRuntimeConfig {
+                enabled: true,
+                ..UsageRuntimeConfig::default()
+            });
+        let plan = test_responses_stream_plan("req-prefetch-sse-503", "cand-prefetch-sse-503");
+        let body_json = json!({
+            "error": {
+                "type": "service_unavailable_error",
+                "message": "Our servers are currently overloaded. Please try again later.",
+                "code": "503"
+            }
+        });
+
+        let response = handle_prefetch_provider_private_stream_error(
+            &state,
+            "trace-prefetch-sse-503",
+            &test_decision(),
+            &plan,
+            Some(test_prefetch_report_context(
+                "req-prefetch-sse-503",
+                "cand-prefetch-sse-503",
+            )),
+            "req-prefetch-sse-503",
+            Some("cand-prefetch-sse-503"),
+            "openai_responses_sync_finalize",
+            BTreeMap::from([("content-type".to_string(), "text/event-stream".to_string())]),
+            None,
+            br#"data: {"error":{"type":"service_unavailable_error","message":"Our servers are currently overloaded. Please try again later.","code":"503"}}"#,
+            resolve_local_sync_error_status_code(200, &body_json),
+            body_json,
+        )
+        .await
+        .expect("prefetch embedded error handling should succeed");
+
+        assert!(
+            response.is_none(),
+            "retryable embedded SSE errors should let the candidate loop try the next provider"
+        );
+
+        let candidates = request_candidate_repository
+            .list_by_request_id("req-prefetch-sse-503")
+            .await
+            .expect("request candidates should read");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].status, RequestCandidateStatus::Failed);
+        assert_eq!(candidates[0].status_code, Some(503));
+        assert_eq!(
+            candidates[0].error_type.as_deref(),
+            Some("service_unavailable_error")
+        );
+        assert!(
+            usage_repository
+                .find_by_request_id("req-prefetch-sse-503")
+                .await
+                .expect("usage should read")
+                .is_none(),
+            "retryable embedded SSE errors must not finalize request usage before a later candidate"
+        );
     }
 
     #[tokio::test]
@@ -5189,8 +5252,8 @@ mod tests {
     }
 
     #[test]
-    fn skips_prefetch_for_same_format_passthrough_event_streams() {
-        assert!(should_skip_direct_finalize_prefetch(
+    fn prefetches_same_format_passthrough_event_streams() {
+        assert!(!should_skip_direct_finalize_prefetch(
             Some("claude_cli_sync_finalize"),
             Some("text/event-stream"),
             "claude:messages",
@@ -5225,8 +5288,8 @@ mod tests {
     }
 
     #[test]
-    fn skips_prefetch_for_event_streams_even_when_cross_format_or_rewritten() {
-        assert!(should_skip_direct_finalize_prefetch(
+    fn prefetches_event_streams_even_when_cross_format_or_rewritten() {
+        assert!(!should_skip_direct_finalize_prefetch(
             Some("claude_cli_sync_finalize"),
             Some("text/event-stream"),
             "openai:chat",

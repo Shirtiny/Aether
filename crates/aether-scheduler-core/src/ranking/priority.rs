@@ -34,3 +34,25 @@ pub(super) fn compare_candidate_priority_slot(
             .then(left.key_internal_priority.cmp(&right.key_internal_priority)),
     }
 }
+
+pub(super) fn compare_fixed_order_priority_slot(
+    left: &SchedulerRankableCandidate,
+    right: &SchedulerRankableCandidate,
+    priority_mode: SchedulerPriorityMode,
+) -> Ordering {
+    match priority_mode {
+        SchedulerPriorityMode::Provider => left
+            .provider_priority
+            .cmp(&right.provider_priority)
+            .then_with(|| {
+                if left.provider_id == right.provider_id {
+                    left.key_internal_priority.cmp(&right.key_internal_priority)
+                } else {
+                    Ordering::Equal
+                }
+            }),
+        SchedulerPriorityMode::GlobalKey => {
+            compare_candidate_priority_slot(left, right, priority_mode)
+        }
+    }
+}

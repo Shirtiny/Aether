@@ -834,7 +834,7 @@ async fn fixed_order_disables_same_priority_affinity_hash_tiebreaker() {
     second.endpoint_id = "endpoint-b".to_string();
     second.key_id = "key-b".to_string();
     second.key_name = "beta".to_string();
-    second.provider_priority = 1;
+    second.provider_priority = 0;
     second.key_internal_priority = 0;
     second.key_global_priority_by_format = Some(json!({"openai:chat": 1}));
 
@@ -868,6 +868,61 @@ async fn fixed_order_disables_same_priority_affinity_hash_tiebreaker() {
     assert_eq!(selection.len(), 2);
     assert_eq!(selection[0].provider_id, "provider-a");
     assert_eq!(selection[1].provider_id, "provider-b");
+}
+
+#[tokio::test]
+async fn fixed_order_provider_priority_tie_does_not_promote_other_provider_key_priority() {
+    let mut channel_98 = sample_row();
+    channel_98.provider_id = "provider-98".to_string();
+    channel_98.provider_name = "98-channel".to_string();
+    channel_98.endpoint_id = "endpoint-98".to_string();
+    channel_98.key_id = "key-98-pro".to_string();
+    channel_98.key_name = "pro".to_string();
+    channel_98.provider_priority = 4;
+    channel_98.key_internal_priority = 50;
+    channel_98.key_global_priority_by_format = Some(json!({"openai:chat": 50}));
+
+    let mut g_aisc = sample_row();
+    g_aisc.provider_id = "provider-g".to_string();
+    g_aisc.provider_name = "G-aisc".to_string();
+    g_aisc.endpoint_id = "endpoint-g".to_string();
+    g_aisc.key_id = "key-g-pro".to_string();
+    g_aisc.key_name = "pro".to_string();
+    g_aisc.provider_priority = 4;
+    g_aisc.key_internal_priority = 10;
+    g_aisc.key_global_priority_by_format = Some(json!({"openai:chat": 10}));
+
+    let candidates = Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(vec![
+        g_aisc, channel_98,
+    ]));
+    let quotas = Arc::new(InMemoryProviderQuotaRepository::seed(vec![]));
+    let state = AppState::new()
+        .expect("state should build")
+        .with_data_state_for_tests(
+            GatewayDataState::with_candidate_selection_and_quota_for_tests(candidates, quotas)
+                .with_system_config_values_for_tests(vec![
+                    ("scheduling_mode".to_string(), json!("fixed_order")),
+                    ("provider_priority_mode".to_string(), json!("provider")),
+                ]),
+        );
+
+    let selection = collect_selectable_candidates(
+        state.data.as_ref(),
+        &state,
+        "openai:chat",
+        "gpt-4.1",
+        false,
+        None,
+        100,
+    )
+    .await
+    .expect("selection should succeed");
+
+    assert_eq!(selection.len(), 2);
+    assert_eq!(selection[0].provider_id, "provider-98");
+    assert_eq!(selection[0].key_id, "key-98-pro");
+    assert_eq!(selection[1].provider_id, "provider-g");
+    assert_eq!(selection[1].key_id, "key-g-pro");
 }
 
 #[tokio::test]

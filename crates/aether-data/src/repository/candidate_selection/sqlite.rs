@@ -640,7 +640,7 @@ fn push_selected_rows_order(builder: &mut QueryBuilder<'_, Sqlite>, order: Selec
         builder.push("global_model_name ASC, ");
     }
     builder.push(
-        "provider_priority ASC, key_internal_priority ASC, provider_id ASC, endpoint_id ASC, key_id ASC, model_id ASC",
+        "provider_priority ASC, provider_name ASC, provider_id ASC, endpoint_id ASC, key_internal_priority ASC, key_id ASC, model_id ASC",
     );
 }
 

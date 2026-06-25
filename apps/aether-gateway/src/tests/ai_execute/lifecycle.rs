@@ -14,6 +14,9 @@ use aether_data::repository::provider_catalog::InMemoryProviderCatalogReadReposi
 use aether_data_contracts::repository::candidate_selection::{
     StoredMinimalCandidateSelectionRow, StoredProviderModelMapping,
 };
+use aether_data_contracts::repository::candidates::{
+    RequestCandidateReadRepository, RequestCandidateStatus,
+};
 use aether_data_contracts::repository::provider_catalog::{
     StoredProviderCatalogEndpoint, StoredProviderCatalogKey, StoredProviderCatalogProvider,
 };
@@ -418,7 +421,7 @@ async fn gateway_stops_execution_runtime_stream_when_client_disconnects() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn gateway_returns_error_body_when_prefetch_detects_embedded_stream_error() {
+async fn gateway_retries_next_candidate_when_prefetch_detects_embedded_stream_error() {
     let public_hits = Arc::new(Mutex::new(0usize));
     let public_hits_clone = Arc::clone(&public_hits);
 
@@ -433,26 +436,42 @@ async fn gateway_returns_error_body_when_prefetch_detects_embedded_stream_error(
         }),
     );
 
+    let execution_runtime_hits = Arc::new(Mutex::new(0usize));
+    let execution_runtime_hits_clone = Arc::clone(&execution_runtime_hits);
     let execution_runtime = Router::new().route(
         "/v1/execute/stream",
-        any(|_request: Request| async move {
-            let body_stream = async_stream::stream! {
-                yield Ok::<Bytes, Infallible>(Bytes::from_static(
-                    b"{\"type\":\"headers\",\"payload\":{\"kind\":\"headers\",\"status_code\":200,\"headers\":{\"content-type\":\"text/event-stream\"}}}\n"
-                ));
-                yield Ok::<Bytes, Infallible>(Bytes::from_static(
-                    b"{\"type\":\"data\",\"payload\":{\"kind\":\"data\",\"text\":\"data: {\\\"error\\\":{\\\"message\\\":\\\"slow down\\\",\\\"type\\\":\\\"rate_limit_error\\\",\\\"code\\\":\\\"rate_limit\\\"}}\\n\\n\"}}\n"
-                ));
-            };
-            let mut response = Response::builder()
-                .status(StatusCode::OK)
-                .body(Body::from_stream(body_stream))
-                .expect("response should build");
-            response.headers_mut().insert(
-                http::header::CONTENT_TYPE,
-                HeaderValue::from_static("application/x-ndjson"),
-            );
-            response
+        any(move |_request: Request| {
+            let execution_runtime_hits_inner = Arc::clone(&execution_runtime_hits_clone);
+            async move {
+                let current_hit = {
+                    let mut hits = execution_runtime_hits_inner
+                        .lock()
+                        .expect("mutex should lock");
+                    *hits += 1;
+                    *hits
+                };
+                let frames = if current_hit == 1 {
+                    concat!(
+                        "{\"type\":\"headers\",\"payload\":{\"kind\":\"headers\",\"status_code\":200,\"headers\":{\"content-type\":\"text/event-stream\"}}}\n",
+                        "{\"type\":\"data\",\"payload\":{\"kind\":\"data\",\"text\":\"data: {\\\"error\\\":{\\\"message\\\":\\\"Our servers are currently overloaded. Please try again later.\\\",\\\"type\\\":\\\"service_unavailable_error\\\",\\\"code\\\":\\\"503\\\"}}\\n\\n\"}}\n",
+                    )
+                } else {
+                    concat!(
+                        "{\"type\":\"headers\",\"payload\":{\"kind\":\"headers\",\"status_code\":200,\"headers\":{\"content-type\":\"text/event-stream\"}}}\n",
+                        "{\"type\":\"data\",\"payload\":{\"kind\":\"data\",\"text\":\"data: {\\\"id\\\":\\\"chatcmpl-backup\\\"}\\n\\n\"}}\n",
+                        "{\"type\":\"data\",\"payload\":{\"kind\":\"data\",\"text\":\"data: [DONE]\\n\\n\"}}\n",
+                    )
+                };
+                let mut response = Response::builder()
+                    .status(StatusCode::OK)
+                    .body(Body::from(frames))
+                    .expect("response should build");
+                response.headers_mut().insert(
+                    http::header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/x-ndjson"),
+                );
+                response
+            }
         }),
     );
 
@@ -465,14 +484,50 @@ async fn gateway_returns_error_body_when_prefetch_detects_embedded_stream_error(
             "user-openai-lifecycle-local-1",
         ),
     )]));
+    let mut backup_candidate_row = sample_local_openai_candidate_row();
+    backup_candidate_row.provider_id = "provider-openai-lifecycle-local-2".to_string();
+    backup_candidate_row.endpoint_id = "endpoint-openai-lifecycle-local-2".to_string();
+    backup_candidate_row.key_id = "key-openai-lifecycle-local-2".to_string();
+    backup_candidate_row.key_name = "backup".to_string();
+    backup_candidate_row.provider_priority = 20;
+    backup_candidate_row.key_internal_priority = 6;
+    backup_candidate_row.key_global_priority_by_format =
+        Some(serde_json::json!({"openai:chat": 2}));
+    backup_candidate_row.model_id = "model-openai-lifecycle-local-2".to_string();
+    backup_candidate_row.global_model_id = "global-model-openai-lifecycle-local-2".to_string();
+    backup_candidate_row.model_provider_model_name = "gpt-5-upstream-backup".to_string();
+    backup_candidate_row.model_provider_model_mappings = Some(vec![StoredProviderModelMapping {
+        name: "gpt-5-upstream-backup".to_string(),
+        priority: 1,
+        api_formats: Some(vec!["openai:chat".to_string()]),
+        endpoint_ids: None,
+    }]);
     let candidate_selection_repository =
         Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(vec![
             sample_local_openai_candidate_row(),
+            backup_candidate_row,
         ]));
+
+    let mut backup_provider = sample_local_openai_provider();
+    backup_provider.id = "provider-openai-lifecycle-local-2".to_string();
+    backup_provider.name = "openai-backup".to_string();
+    let mut backup_endpoint = sample_local_openai_endpoint();
+    backup_endpoint.id = "endpoint-openai-lifecycle-local-2".to_string();
+    backup_endpoint.provider_id = "provider-openai-lifecycle-local-2".to_string();
+    backup_endpoint.base_url = "https://api.openai.backup.example/v1".to_string();
+    let mut backup_key = sample_local_openai_key();
+    backup_key.id = "key-openai-lifecycle-local-2".to_string();
+    backup_key.provider_id = "provider-openai-lifecycle-local-2".to_string();
+    backup_key.name = "backup".to_string();
+    backup_key.encrypted_api_key = Some(
+        encrypt_python_fernet_plaintext(DEVELOPMENT_ENCRYPTION_KEY, "sk-upstream-openai-backup")
+            .expect("api key should encrypt"),
+    );
+    backup_key.global_priority_by_format = Some(serde_json::json!({"openai:chat": 2}));
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
-        vec![sample_local_openai_provider()],
-        vec![sample_local_openai_endpoint()],
-        vec![sample_local_openai_key()],
+        vec![sample_local_openai_provider(), backup_provider],
+        vec![sample_local_openai_endpoint(), backup_endpoint],
+        vec![sample_local_openai_key(), backup_key],
     ));
     let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
     let gateway = build_router_with_state(
@@ -482,7 +537,7 @@ async fn gateway_returns_error_body_when_prefetch_detects_embedded_stream_error(
                     auth_repository,
                     candidate_selection_repository,
                     provider_catalog_repository,
-                    request_candidate_repository,
+                    Arc::clone(&request_candidate_repository),
                     DEVELOPMENT_ENCRYPTION_KEY,
                 ),
             ),
@@ -514,9 +569,27 @@ async fn gateway_returns_error_body_when_prefetch_detects_embedded_stream_error(
         Some("text/event-stream")
     );
     let body_text = response.text().await.expect("response body should read");
-    assert!(body_text.contains("\"rate_limit_error\""));
-    assert!(body_text.contains("\"slow down\""));
+    assert!(body_text.contains("\"chatcmpl-backup\""));
+    assert!(!body_text.contains("\"service_unavailable_error\""));
+    assert_eq!(
+        *execution_runtime_hits.lock().expect("mutex should lock"),
+        2
+    );
     assert_eq!(*public_hits.lock().expect("mutex should lock"), 0);
+    let stored_candidates = request_candidate_repository
+        .list_by_request_id("trace-openai-chat-stream-prefetch-error-123")
+        .await
+        .expect("request candidate trace should read");
+    assert_eq!(stored_candidates.len(), 2);
+    assert_eq!(stored_candidates[0].candidate_index, 0);
+    assert_eq!(stored_candidates[0].status, RequestCandidateStatus::Failed);
+    assert_eq!(stored_candidates[0].status_code, Some(503));
+    assert_eq!(
+        stored_candidates[0].error_type.as_deref(),
+        Some("service_unavailable_error")
+    );
+    assert_eq!(stored_candidates[1].candidate_index, 1);
+    assert_eq!(stored_candidates[1].status, RequestCandidateStatus::Success);
 
     gateway_handle.abort();
     execution_runtime_handle.abort();

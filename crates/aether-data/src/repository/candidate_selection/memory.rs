@@ -52,9 +52,10 @@ impl MinimalCandidateSelectionReadRepository for InMemoryMinimalCandidateSelecti
         rows.sort_by(|left, right| {
             left.provider_priority
                 .cmp(&right.provider_priority)
-                .then(left.key_internal_priority.cmp(&right.key_internal_priority))
+                .then(left.provider_name.cmp(&right.provider_name))
                 .then(left.provider_id.cmp(&right.provider_id))
                 .then(left.endpoint_id.cmp(&right.endpoint_id))
+                .then(left.key_internal_priority.cmp(&right.key_internal_priority))
                 .then(left.key_id.cmp(&right.key_id))
                 .then(left.model_id.cmp(&right.model_id))
         });
@@ -104,9 +105,10 @@ impl MinimalCandidateSelectionReadRepository for InMemoryMinimalCandidateSelecti
             left.global_model_name
                 .cmp(&right.global_model_name)
                 .then(left.provider_priority.cmp(&right.provider_priority))
-                .then(left.key_internal_priority.cmp(&right.key_internal_priority))
+                .then(left.provider_name.cmp(&right.provider_name))
                 .then(left.provider_id.cmp(&right.provider_id))
                 .then(left.endpoint_id.cmp(&right.endpoint_id))
+                .then(left.key_internal_priority.cmp(&right.key_internal_priority))
                 .then(left.key_id.cmp(&right.key_id))
                 .then(left.model_id.cmp(&right.model_id))
         });
@@ -408,6 +410,32 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].provider_id, "provider-1");
         assert_eq!(rows[1].provider_id, "provider-2");
+    }
+
+    #[tokio::test]
+    async fn provider_priority_ties_keep_provider_order_before_key_priority() {
+        let mut channel_98 = sample_row("provider-98", "openai:chat", "gpt-5.5", 4);
+        channel_98.provider_name = "98-channel".to_string();
+        channel_98.key_internal_priority = 50;
+
+        let mut g_aisc = sample_row("provider-g", "openai:chat", "gpt-5.5", 4);
+        g_aisc.provider_name = "G-aisc".to_string();
+        g_aisc.key_internal_priority = 10;
+
+        let repository =
+            InMemoryMinimalCandidateSelectionReadRepository::seed(vec![g_aisc, channel_98]);
+
+        let rows = repository
+            .list_for_exact_api_format_and_global_model("openai:chat", "gpt-5.5")
+            .await
+            .expect("list should succeed");
+
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.provider_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["provider-98", "provider-g"]
+        );
     }
 
     #[tokio::test]

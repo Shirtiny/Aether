@@ -283,9 +283,10 @@ FROM selected_rows
 ORDER BY
   global_model_name ASC,
   provider_priority ASC,
-  key_internal_priority ASC,
+  provider_name ASC,
   provider_id ASC,
   endpoint_id ASC,
+  key_internal_priority ASC,
   key_id ASC,
   model_id ASC
 "#;
@@ -562,9 +563,10 @@ SELECT
 FROM selected_rows
 ORDER BY
   provider_priority ASC,
-  key_internal_priority ASC,
+  provider_name ASC,
   provider_id ASC,
   endpoint_id ASC,
+  key_internal_priority ASC,
   key_id ASC,
   model_id ASC
 "#;

@@ -386,22 +386,16 @@ mod tests {
     }
 
     #[test]
-    fn fixed_order_randomizes_equal_priority_ties_without_crossing_priority_slots() {
-        let first = candidate("first", 0, 0, Some(0));
-        let second = candidate("second", 0, 0, Some(0));
-        let lower_priority = candidate("lower", 10, 0, Some(10));
+    fn fixed_order_keeps_provider_priority_ties_in_original_order() {
+        let mut first = candidate("first", 0, 50, Some(50));
+        first.original_index = 0;
+        let mut second = candidate("second", 0, 10, Some(10));
+        second.original_index = 1;
+        let mut lower_priority = candidate("lower", 10, 0, Some(0));
+        lower_priority.original_index = 2;
 
-        let first_seed_order = ranked_ids(
-            &[first.clone(), second.clone(), lower_priority.clone()],
-            SchedulerRankingContext {
-                priority_mode: SchedulerPriorityMode::Provider,
-                ranking_mode: SchedulerRankingMode::FixedOrder,
-                include_health: false,
-                load_balance_seed: 0,
-            },
-        );
-        let alternate_order = (1..128)
-            .map(|seed| {
+        for seed in [0, 1, 127] {
+            assert_eq!(
                 ranked_ids(
                     &[first.clone(), second.clone(), lower_priority.clone()],
                     SchedulerRankingContext {
@@ -410,13 +404,36 @@ mod tests {
                         include_health: false,
                         load_balance_seed: seed,
                     },
-                )
-            })
-            .find(|order| order[0] != first_seed_order[0])
-            .expect("equal priority tie should vary by seed");
+                ),
+                vec!["provider-first", "provider-second", "provider-lower"]
+            );
+        }
+    }
 
-        assert_eq!(first_seed_order[2], "provider-lower");
-        assert_eq!(alternate_order[2], "provider-lower");
+    #[test]
+    fn fixed_order_provider_mode_uses_key_priority_within_same_provider() {
+        let mut secondary = candidate("secondary", 0, 50, Some(50));
+        secondary.provider_id = "provider-shared".to_string();
+        secondary.key_id = "key-secondary".to_string();
+        secondary.original_index = 0;
+
+        let mut primary = candidate("primary", 0, 10, Some(10));
+        primary.provider_id = "provider-shared".to_string();
+        primary.key_id = "key-primary".to_string();
+        primary.original_index = 1;
+
+        assert_eq!(
+            ranked_keys(
+                &[secondary, primary],
+                SchedulerRankingContext {
+                    priority_mode: SchedulerPriorityMode::Provider,
+                    ranking_mode: SchedulerRankingMode::FixedOrder,
+                    include_health: false,
+                    load_balance_seed: 0,
+                },
+            ),
+            vec!["key-primary", "key-secondary"]
+        );
     }
 
     #[test]

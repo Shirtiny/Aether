@@ -273,9 +273,10 @@ fn sort_rows(
         }
         left.provider_priority
             .cmp(&right.provider_priority)
-            .then(left.key_internal_priority.cmp(&right.key_internal_priority))
+            .then(left.provider_name.cmp(&right.provider_name))
             .then(left.provider_id.cmp(&right.provider_id))
             .then(left.endpoint_id.cmp(&right.endpoint_id))
+            .then(left.key_internal_priority.cmp(&right.key_internal_priority))
             .then(left.key_id.cmp(&right.key_id))
             .then(left.model_id.cmp(&right.model_id))
     });
