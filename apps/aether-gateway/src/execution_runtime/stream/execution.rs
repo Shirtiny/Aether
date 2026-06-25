@@ -4187,6 +4187,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prefetch_openai_response_failed_after_control_event_retries_before_finalizing() {
+        crate::orchestration::clear_local_report_effect_caches_for_tests();
+
+        let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
+        let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
+        let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![sample_provider_catalog_provider("provider-g-aisc", "codex")],
+            Vec::new(),
+            vec![sample_provider_catalog_key("key-g-aisc", "provider-g-aisc")],
+        ));
+        let state = AppState::new()
+            .expect("app state should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
+                    Arc::clone(&request_candidate_repository),
+                    Arc::clone(&usage_repository),
+                )
+                .attach_provider_catalog_repository_for_tests(Arc::clone(&provider_catalog_repository)),
+            )
+            .with_usage_runtime_for_tests(UsageRuntimeConfig {
+                enabled: true,
+                ..UsageRuntimeConfig::default()
+            });
+        let plan = test_responses_stream_plan(
+            "req-prefetch-response-failed-503",
+            "cand-prefetch-response-failed-503",
+        );
+        let frame_stream = stream! {
+            yield Ok::<Bytes, std::io::Error>(ndjson_frame(StreamFrame {
+                frame_type: StreamFrameType::Headers,
+                payload: StreamFramePayload::Headers {
+                    status_code: 200,
+                    headers: BTreeMap::from([(
+                        "content-type".to_string(),
+                        "text/event-stream".to_string(),
+                    )]),
+                },
+            }));
+            yield Ok::<Bytes, std::io::Error>(ndjson_frame(StreamFrame {
+                frame_type: StreamFrameType::Data,
+                payload: StreamFramePayload::Data {
+                    chunk_b64: None,
+                    text: Some(concat!(
+                        "event: response.created\n",
+                        "data: {\"type\":\"response.created\",\"response\":{\"status\":\"in_progress\"}}\n\n"
+                    ).to_string()),
+                },
+            }));
+            yield Ok::<Bytes, std::io::Error>(ndjson_frame(StreamFrame {
+                frame_type: StreamFrameType::Data,
+                payload: StreamFramePayload::Data {
+                    chunk_b64: None,
+                    text: Some(concat!(
+                        "event: response.failed\n",
+                        "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"type\":\"service_unavailable_error\",\"code\":\"503\",\"message\":\"Our servers are currently overloaded. Please try again later.\"}}}\n\n"
+                    ).to_string()),
+                },
+            }));
+        }.boxed();
+
+        let response = execute_stream_from_frame_stream(
+            &state,
+            plan,
+            "trace-prefetch-response-failed-503",
+            &test_decision(),
+            "openai_responses_stream",
+            Some("openai_responses_stream_success".to_string()),
+            Some(test_prefetch_report_context(
+                "req-prefetch-response-failed-503",
+                "cand-prefetch-response-failed-503",
+            )),
+            crate::clock::current_unix_ms(),
+            Instant::now(),
+            frame_stream,
+            None,
+        )
+        .await
+        .expect("stream execution should succeed");
+
+        assert!(
+            response.is_none(),
+            "retryable response.failed events should let the candidate loop try the next provider"
+        );
+
+        let candidates = request_candidate_repository
+            .list_by_request_id("req-prefetch-response-failed-503")
+            .await
+            .expect("request candidates should read");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].status, RequestCandidateStatus::Failed);
+        assert_eq!(candidates[0].status_code, Some(503));
+        assert_eq!(
+            candidates[0].error_type.as_deref(),
+            Some("service_unavailable_error")
+        );
+        assert!(
+            usage_repository
+                .find_by_request_id("req-prefetch-response-failed-503")
+                .await
+                .expect("usage should read")
+                .is_none(),
+            "retryable response.failed events must not finalize request usage before a later candidate"
+        );
+    }
+
+    #[tokio::test]
     async fn prefetch_stream_failure_retries_retryable_status_before_finalizing() {
         crate::orchestration::clear_local_report_effect_caches_for_tests();
 

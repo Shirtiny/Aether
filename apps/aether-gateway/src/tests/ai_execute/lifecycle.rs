@@ -576,10 +576,20 @@ async fn gateway_retries_next_candidate_when_prefetch_detects_embedded_stream_er
         2
     );
     assert_eq!(*public_hits.lock().expect("mutex should lock"), 0);
-    let stored_candidates = request_candidate_repository
-        .list_by_request_id("trace-openai-chat-stream-prefetch-error-123")
-        .await
-        .expect("request candidate trace should read");
+    let stored_candidates = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let candidates = request_candidate_repository
+                .list_by_request_id("trace-openai-chat-stream-prefetch-error-123")
+                .await
+                .expect("request candidate trace should read");
+            if candidates.len() >= 2 && candidates[1].status == RequestCandidateStatus::Success {
+                break candidates;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("backup candidate should reach success");
     assert_eq!(stored_candidates.len(), 2);
     assert_eq!(stored_candidates[0].candidate_index, 0);
     assert_eq!(stored_candidates[0].status, RequestCandidateStatus::Failed);

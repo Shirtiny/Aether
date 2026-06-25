@@ -11,7 +11,8 @@ use tracing::warn;
 use crate::execution_runtime::ndjson::decode_stream_frame_ndjson;
 use crate::execution_runtime::submission::{has_nested_error, strip_utf8_bom_and_ws};
 use crate::GatewayError;
-use crate::{MAX_ERROR_BODY_BYTES, MAX_STREAM_PREFETCH_FRAMES};
+use crate::MAX_ERROR_BODY_BYTES;
+use aether_ai_formats::api::openai_stream_terminal_error_body;
 
 #[derive(Debug)]
 pub(super) enum StreamPrefetchInspection {
@@ -143,8 +144,8 @@ pub(super) fn inspect_prefetched_stream_body(
     let looks_json = content_type.contains("json") || content_type.ends_with("+json");
     if looks_json || stripped.starts_with(b"{") || stripped.starts_with(b"[") {
         if let Ok(json_body) = serde_json::from_slice::<serde_json::Value>(stripped) {
-            return if has_nested_error(&json_body) {
-                StreamPrefetchInspection::EmbeddedError(json_body)
+            return if let Some(error_body) = stream_json_error_body(&json_body) {
+                StreamPrefetchInspection::EmbeddedError(error_body)
             } else {
                 StreamPrefetchInspection::NonError
             };
@@ -152,10 +153,18 @@ pub(super) fn inspect_prefetched_stream_body(
     }
 
     let text = String::from_utf8_lossy(body);
+    let mut current_event_type: Option<String> = None;
     let mut saw_meaningful_line = false;
-    for line in text.lines().take(MAX_STREAM_PREFETCH_FRAMES) {
+    let mut saw_only_control_events = false;
+    let mut saw_incomplete_json_line = false;
+    for line in text.lines() {
         let line = line.trim_matches('\r').trim();
-        if line.is_empty() || line.starts_with(':') || line.starts_with("event:") {
+        if line.is_empty() || line.starts_with(':') {
+            current_event_type = None;
+            continue;
+        }
+        if let Some(event_type) = line.strip_prefix("event:") {
+            current_event_type = Some(event_type.trim().to_string());
             continue;
         }
 
@@ -170,18 +179,40 @@ pub(super) fn inspect_prefetched_stream_body(
         saw_meaningful_line = true;
         match serde_json::from_str::<serde_json::Value>(data_line) {
             Ok(json_body) => {
-                return if has_nested_error(&json_body) {
-                    StreamPrefetchInspection::EmbeddedError(json_body)
-                } else {
-                    StreamPrefetchInspection::NonError
-                };
+                let json_body =
+                    stream_json_body_with_event_type(json_body, current_event_type.as_deref());
+                current_event_type = None;
+                if let Some(error_body) = stream_json_error_body(&json_body) {
+                    return StreamPrefetchInspection::EmbeddedError(error_body);
+                }
+                if stream_json_body_is_prefetch_control(&json_body) {
+                    saw_only_control_events = true;
+                    continue;
+                }
+                return StreamPrefetchInspection::NonError;
             }
             Err(_) => {
                 if data_line.ends_with('}') || data_line.ends_with(']') {
                     return StreamPrefetchInspection::NonError;
                 }
+                if current_event_type
+                    .as_deref()
+                    .is_some_and(is_error_sse_event_type)
+                {
+                    return StreamPrefetchInspection::EmbeddedError(json!({
+                        "error": {
+                            "type": current_event_type.as_deref().unwrap_or("error"),
+                            "message": data_line,
+                        }
+                    }));
+                }
+                saw_incomplete_json_line = true;
             }
         }
+    }
+
+    if saw_incomplete_json_line || saw_only_control_events {
+        return StreamPrefetchInspection::NeedMore;
     }
 
     if saw_meaningful_line {
@@ -189,6 +220,51 @@ pub(super) fn inspect_prefetched_stream_body(
     } else {
         StreamPrefetchInspection::NeedMore
     }
+}
+
+fn stream_json_body_with_event_type(mut value: Value, event_type: Option<&str>) -> Value {
+    let Some(event_type) = event_type else {
+        return value;
+    };
+    let Some(object) = value.as_object_mut() else {
+        return value;
+    };
+    if !object.contains_key("type") {
+        object.insert("type".to_string(), Value::String(event_type.to_string()));
+    }
+    value
+}
+
+fn stream_json_error_body(value: &Value) -> Option<Value> {
+    openai_stream_terminal_error_body(value)
+        .or_else(|| has_nested_error(value).then(|| value.clone()))
+}
+
+fn stream_json_body_is_prefetch_control(value: &Value) -> bool {
+    let event_type = value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if matches!(
+        event_type,
+        "response.created" | "response.in_progress" | "response.queued"
+    ) {
+        return true;
+    }
+
+    value
+        .get("response")
+        .and_then(Value::as_object)
+        .and_then(|response| response.get("status"))
+        .and_then(Value::as_str)
+        .is_some_and(|status| matches!(status, "created" | "in_progress" | "queued"))
+}
+
+fn is_error_sse_event_type(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        "error" | "response.failed" | "response.incomplete"
+    )
 }
 
 pub(super) async fn collect_error_body<R>(
@@ -241,4 +317,51 @@ where
         return Ok(Some(frame));
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{inspect_prefetched_stream_body, StreamPrefetchInspection};
+    use std::collections::BTreeMap;
+
+    fn event_stream_headers() -> BTreeMap<String, String> {
+        BTreeMap::from([("content-type".to_string(), "text/event-stream".to_string())])
+    }
+
+    #[test]
+    fn inspect_prefetched_stream_body_keeps_openai_response_control_events_pending() {
+        let inspection = inspect_prefetched_stream_body(
+            &event_stream_headers(),
+            concat!(
+                "event: response.created\n",
+                "data: {\"type\":\"response.created\",\"response\":{\"status\":\"in_progress\"}}\n\n"
+            )
+            .as_bytes(),
+        );
+
+        assert!(matches!(inspection, StreamPrefetchInspection::NeedMore));
+    }
+
+    #[test]
+    fn inspect_prefetched_stream_body_detects_openai_response_failed_after_control_event() {
+        let inspection = inspect_prefetched_stream_body(
+            &event_stream_headers(),
+            concat!(
+                "event: response.created\n",
+                "data: {\"type\":\"response.created\",\"response\":{\"status\":\"in_progress\"}}\n\n",
+                "event: response.failed\n",
+                "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"503\",\"message\":\"Our servers are currently overloaded. Please try again later.\"}}}\n\n"
+            )
+            .as_bytes(),
+        );
+
+        let StreamPrefetchInspection::EmbeddedError(body) = inspection else {
+            panic!("response.failed should be treated as an embedded error");
+        };
+        assert_eq!(body["error"]["code"], "503");
+        assert_eq!(
+            body["error"]["message"],
+            "Our servers are currently overloaded. Please try again later."
+        );
+    }
 }

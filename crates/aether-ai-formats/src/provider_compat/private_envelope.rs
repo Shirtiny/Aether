@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 
+use crate::formats::shared::stream_core::common::openai_stream_terminal_error_body;
 use crate::formats::shared::AiSurfaceFinalizeError;
 use crate::provider_compat::kiro_stream::KiroToClaudeCliStreamState;
 
@@ -666,10 +667,13 @@ fn extract_stream_error_event_body(body: &[u8]) -> Option<Value> {
         };
         if let Some(event_object) = event.as_object_mut() {
             if !event_object.contains_key("type") {
-                if let Some(event_name) = current_event_type.take() {
+                if let Some(event_name) = current_event_type.clone() {
                     event_object.insert("type".to_string(), Value::String(event_name));
                 }
             }
+        }
+        if let Some(error_body) = openai_stream_terminal_error_body(&event) {
+            return Some(normalize_provider_private_error_body(error_body));
         }
         if event
             .get("type")
@@ -1021,6 +1025,27 @@ mod tests {
 
         assert_eq!(body["error"]["code"], json!("resource_exhausted"));
         assert_eq!(body["error"]["message"], json!("quota exhausted"));
+    }
+
+    #[test]
+    fn extracts_openai_response_failed_stream_event() {
+        let body = extract_provider_private_stream_error_body(
+            None,
+            concat!(
+                "event: response.created\n",
+                "data: {\"type\":\"response.created\",\"response\":{\"status\":\"in_progress\"}}\n\n",
+                "event: response.failed\n",
+                "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"503\",\"message\":\"Our servers are currently overloaded. Please try again later.\"}}}\n\n"
+            )
+            .as_bytes(),
+        )
+        .expect("response.failed should be extracted as an error body");
+
+        assert_eq!(body["error"]["code"], json!("503"));
+        assert_eq!(
+            body["error"]["message"],
+            json!("Our servers are currently overloaded. Please try again later.")
+        );
     }
 
     fn connect_json_frame(flags: u8, payload: &[u8]) -> Vec<u8> {
