@@ -2202,6 +2202,7 @@ fn local_execution_runtime_miss_skip_reason_label(reason: &str) -> &str {
         "pool_cost_limit_reached" => "池内账号成本额度已用尽",
         "pool_group_exhausted" => "池化提供商没有可调度账号",
         "pool_key_lease_busy" => "池内账号正被其他请求占用",
+        "pool_sticky_collateral_avoidance" => "该会话的 sticky 账号已失效，已跳过当前号池",
         "provider_concurrency_limit_reached" => "上游提供商并发已达上限",
         "provider_inactive" => "提供商未启用",
         "provider_key_concurrency_limit_reached" => "上游账号并发已达上限",

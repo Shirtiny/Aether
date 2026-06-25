@@ -39,6 +39,7 @@ struct GatewayLocalCandidatePreselectionPort<'a> {
     auth_snapshot: &'a GatewayAuthApiKeySnapshot,
     routing_policy: Option<&'a ResolvedRoutingPolicy>,
     client_session_affinity: Option<&'a ClientSessionAffinity>,
+    pool_sticky_session_token: Option<&'a str>,
     use_api_format_alias_match: bool,
     key_mode: LocalCandidatePreselectionKeyMode,
     candidate_api_formats: Vec<String>,
@@ -81,6 +82,7 @@ impl AiCandidatePreselectionPort for GatewayLocalCandidatePreselectionPort<'_> {
                 self.required_capabilities,
                 auth_snapshot,
                 self.client_session_affinity,
+                self.pool_sticky_session_token,
                 current_unix_secs(),
             )
             .await?;
@@ -151,6 +153,7 @@ pub(crate) async fn preselect_local_execution_candidates_with_serving(
     auth_snapshot: &GatewayAuthApiKeySnapshot,
     routing_policy: Option<&ResolvedRoutingPolicy>,
     client_session_affinity: Option<&ClientSessionAffinity>,
+    pool_sticky_session_token: Option<&str>,
     use_api_format_alias_match: bool,
     key_mode: LocalCandidatePreselectionKeyMode,
 ) -> Result<
@@ -174,6 +177,7 @@ pub(crate) async fn preselect_local_execution_candidates_with_serving(
         auth_snapshot,
         routing_policy,
         client_session_affinity,
+        pool_sticky_session_token,
         use_api_format_alias_match,
         key_mode,
         candidate_api_formats,
@@ -191,6 +195,7 @@ pub(crate) async fn preselect_local_execution_candidates_for_api_formats_with_se
     auth_snapshot: &GatewayAuthApiKeySnapshot,
     routing_policy: Option<&ResolvedRoutingPolicy>,
     client_session_affinity: Option<&ClientSessionAffinity>,
+    pool_sticky_session_token: Option<&str>,
     use_api_format_alias_match: bool,
     key_mode: LocalCandidatePreselectionKeyMode,
     candidate_api_formats: Vec<String>,
@@ -223,6 +228,7 @@ pub(crate) async fn preselect_local_execution_candidates_for_api_formats_with_se
         auth_snapshot,
         routing_policy,
         client_session_affinity,
+        pool_sticky_session_token,
         use_api_format_alias_match,
         key_mode,
         candidate_api_formats,
@@ -241,6 +247,7 @@ pub(crate) struct LocalCandidatePreselectionPageCursor<'a> {
     auth_snapshot: GatewayAuthApiKeySnapshot,
     routing_policy: Option<ResolvedRoutingPolicy>,
     client_session_affinity: Option<ClientSessionAffinity>,
+    pool_sticky_session_token: Option<String>,
     use_api_format_alias_match: bool,
     key_mode: LocalCandidatePreselectionKeyMode,
     candidate_api_formats: Vec<String>,
@@ -276,6 +283,7 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
         auth_snapshot: &GatewayAuthApiKeySnapshot,
         routing_policy: Option<&ResolvedRoutingPolicy>,
         client_session_affinity: Option<&ClientSessionAffinity>,
+        pool_sticky_session_token: Option<&str>,
         use_api_format_alias_match: bool,
         key_mode: LocalCandidatePreselectionKeyMode,
     ) -> Self {
@@ -314,6 +322,7 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
             auth_snapshot: auth_snapshot.clone(),
             routing_policy: routing_policy.cloned(),
             client_session_affinity: client_session_affinity.cloned(),
+            pool_sticky_session_token: pool_sticky_session_token.map(ToOwned::to_owned),
             use_api_format_alias_match,
             key_mode,
             candidate_api_formats,
@@ -797,6 +806,7 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
                 self.required_capabilities.as_ref(),
                 auth_snapshot,
                 self.client_session_affinity.as_ref(),
+                self.pool_sticky_session_token.as_deref(),
                 current_unix_secs(),
             )
             .await?;
@@ -1220,6 +1230,7 @@ mod tests {
             &auth_snapshot,
             None,
             None,
+            None,
             true,
             LocalCandidatePreselectionKeyMode::ProviderEndpointKeyModelAndApiFormat,
         )
@@ -1275,6 +1286,7 @@ mod tests {
             false,
             None,
             &auth_snapshot,
+            None,
             None,
             None,
             true,
@@ -1347,6 +1359,7 @@ mod tests {
             false,
             None,
             &auth_snapshot,
+            None,
             None,
             None,
             true,

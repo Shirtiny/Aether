@@ -179,6 +179,7 @@ pub(crate) async fn materialize_local_openai_responses_candidate_attempts(
         &input.auth_snapshot,
         input.routing_policy.as_ref(),
         input.client_session_affinity.as_ref(),
+        sticky_session_token.as_deref(),
         true,
         LocalCandidatePreselectionKeyMode::ProviderEndpointKeyModelAndApiFormat,
     )
@@ -375,6 +376,7 @@ pub(crate) async fn build_local_openai_responses_image_candidate_attempt_source<
         &input.auth_snapshot,
         input.routing_policy.as_ref(),
         input.client_session_affinity.as_ref(),
+        sticky_session_token.as_deref(),
         true,
         LocalCandidatePreselectionKeyMode::ProviderEndpointKeyModelAndApiFormat,
         vec!["openai:image".to_string()],

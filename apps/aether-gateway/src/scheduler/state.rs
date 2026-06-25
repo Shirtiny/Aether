@@ -47,6 +47,12 @@ pub(crate) trait SchedulerRuntimeState {
         session_key: &str,
     ) -> Result<bool, GatewayError>;
 
+    async fn provider_session_has_runtime_pool_sticky_collateral_block_if_enabled(
+        &self,
+        provider_id: &str,
+        sticky_session_token: &str,
+    ) -> Result<bool, GatewayError>;
+
     async fn session_has_runtime_risk_control_block(
         &self,
         session_key: &str,

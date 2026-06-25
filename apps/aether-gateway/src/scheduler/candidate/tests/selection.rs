@@ -99,6 +99,7 @@ async fn collect_selectable_candidates(
         None,
         auth_snapshot,
         None,
+        None,
         now_unix_secs,
         false,
     )
@@ -128,6 +129,7 @@ async fn collect_selectable_candidates_with_skip_reasons(
         require_streaming,
         None,
         auth_snapshot,
+        None,
         None,
         now_unix_secs,
         false,
@@ -252,6 +254,20 @@ fn provider_with_risk_control_session_avoidance_mode(
     provider.config = Some(serde_json::json!({
         "risk_control_session_avoidance": {
             "mode": mode
+        }
+    }));
+    provider
+}
+
+fn provider_with_pool_sticky_collateral_avoidance(
+    id: &str,
+    enabled: bool,
+) -> aether_data_contracts::repository::provider_catalog::StoredProviderCatalogProvider {
+    let mut provider = sample_provider(id, None);
+    provider.config = Some(serde_json::json!({
+        "pool_advanced": {
+            "sticky_session_ttl_seconds": 600,
+            "sticky_collateral_avoidance_enabled": enabled
         }
     }));
     provider
@@ -533,6 +549,119 @@ async fn risk_control_session_avoidance_uses_runtime_block_without_history() {
 }
 
 #[tokio::test]
+async fn pool_sticky_collateral_runtime_block_skips_enabled_provider() {
+    let session_key = "session-pool-alpha";
+    let state = risk_control_session_avoidance_state_with_providers(
+        vec![
+            provider_with_pool_sticky_collateral_avoidance("risk-provider-a", true),
+            provider_with_pool_sticky_collateral_avoidance("risk-provider-b", true),
+        ],
+        Vec::new(),
+        Vec::new(),
+    );
+    let remembered = state
+        .remember_provider_pool_sticky_collateral_block_if_enabled("risk-provider-a", session_key)
+        .await
+        .expect("runtime block should be recorded");
+    assert!(remembered);
+    let affinity = ClientSessionAffinity::from_session_key(session_key);
+
+    let selected = select_candidate_with_session_affinity(
+        state.data.as_ref(),
+        &state,
+        "openai:chat",
+        "gpt-4.1",
+        Some(&affinity),
+        200,
+    )
+    .await
+    .expect("selection should succeed")
+    .expect("fallback provider should be selected");
+
+    assert_eq!(selected.provider_id, "risk-provider-b");
+    assert_eq!(selected.key_id, "key-risk-b");
+}
+
+#[tokio::test]
+async fn pool_sticky_collateral_runtime_block_prefers_explicit_sticky_token() {
+    let pool_sticky_session_token = "body-session-pool-alpha";
+    let state = risk_control_session_avoidance_state_with_providers(
+        vec![
+            provider_with_pool_sticky_collateral_avoidance("risk-provider-a", true),
+            provider_with_pool_sticky_collateral_avoidance("risk-provider-b", true),
+        ],
+        Vec::new(),
+        Vec::new(),
+    );
+    let remembered = state
+        .remember_provider_pool_sticky_collateral_block_if_enabled(
+            "risk-provider-a",
+            pool_sticky_session_token,
+        )
+        .await
+        .expect("runtime block should be recorded");
+    assert!(remembered);
+    let affinity = ClientSessionAffinity::from_session_key("client-affinity-session");
+
+    let (selected, skipped) = collect_selectable_candidates_with_skip_reasons_impl(
+        state.data.as_ref(),
+        &state,
+        "openai:chat",
+        "gpt-4.1",
+        false,
+        None,
+        None,
+        Some(&affinity),
+        Some(pool_sticky_session_token),
+        200,
+        false,
+    )
+    .await
+    .expect("selection should succeed");
+
+    assert_eq!(selected.len(), 1);
+    assert_eq!(selected[0].provider_id, "risk-provider-b");
+    assert!(skipped.iter().any(|candidate| {
+        candidate.candidate.provider_id == "risk-provider-a"
+            && candidate.skip_reason == "pool_sticky_collateral_avoidance"
+    }));
+}
+
+#[tokio::test]
+async fn pool_sticky_collateral_runtime_block_respects_disabled_provider_switch() {
+    let session_key = "session-pool-alpha";
+    let state = risk_control_session_avoidance_state_with_providers(
+        vec![
+            provider_with_pool_sticky_collateral_avoidance("risk-provider-a", false),
+            provider_with_pool_sticky_collateral_avoidance("risk-provider-b", true),
+        ],
+        Vec::new(),
+        Vec::new(),
+    );
+    let remembered = state
+        .remember_provider_pool_sticky_collateral_block_if_enabled("risk-provider-a", session_key)
+        .await
+        .expect("runtime block write should not fail");
+    assert!(!remembered);
+    let affinity = ClientSessionAffinity::from_session_key(session_key);
+
+    let selected = select_candidate_with_session_affinity(
+        state.data.as_ref(),
+        &state,
+        "openai:chat",
+        "gpt-4.1",
+        Some(&affinity),
+        200,
+    )
+    .await
+    .expect("selection should succeed")
+    .expect("first provider should remain selectable");
+
+    assert_eq!(selected.provider_id, "risk-provider-a");
+    assert_eq!(selected.key_id, "key-risk-a");
+}
+
+#[tokio::test]
 async fn risk_control_session_block_mode_blocks_all_candidates_from_history() {
     let session_key = "session-risk-alpha";
     let state = risk_control_session_avoidance_state_with_providers(
@@ -637,7 +766,40 @@ async fn risk_control_session_runtime_block_respects_current_provider_mode() {
 }
 
 #[tokio::test]
-async fn risk_control_session_avoidance_treats_legacy_false_as_candidate_mode() {
+async fn risk_control_session_avoidance_ignore_mode_keeps_provider_selectable() {
+    let session_key = "session-risk-alpha";
+    let state = risk_control_session_avoidance_state_with_providers(
+        vec![
+            provider_with_risk_control_session_avoidance_mode("risk-provider-a", "ignore"),
+            provider_with_risk_control_session_avoidance_mode("risk-provider-b", "candidate"),
+        ],
+        Vec::new(),
+        vec![sample_risk_control_usage(
+            "risk-provider-a",
+            session_key,
+            100,
+        )],
+    );
+    let affinity = ClientSessionAffinity::from_session_key(session_key);
+
+    let selected = select_candidate_with_session_affinity(
+        state.data.as_ref(),
+        &state,
+        "openai:chat",
+        "gpt-4.1",
+        Some(&affinity),
+        200,
+    )
+    .await
+    .expect("selection should succeed")
+    .expect("ignore-mode provider should remain selectable");
+
+    assert_eq!(selected.provider_id, "risk-provider-a");
+    assert_eq!(selected.key_id, "key-risk-a");
+}
+
+#[tokio::test]
+async fn risk_control_session_avoidance_treats_legacy_false_as_ignore_mode() {
     let session_key = "session-risk-alpha";
     let state = risk_control_session_avoidance_state(
         false,
@@ -660,10 +822,10 @@ async fn risk_control_session_avoidance_treats_legacy_false_as_candidate_mode() 
     )
     .await
     .expect("selection should succeed")
-    .expect("fallback provider should be selected");
+    .expect("legacy disabled provider should remain selectable");
 
-    assert_eq!(selected.provider_id, "risk-provider-b");
-    assert_eq!(selected.key_id, "key-risk-b");
+    assert_eq!(selected.provider_id, "risk-provider-a");
+    assert_eq!(selected.key_id, "key-risk-a");
 }
 
 #[test]

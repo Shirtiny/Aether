@@ -110,6 +110,8 @@ pub(super) async fn list_local_openai_image_candidate_attempts(
     api_format: &str,
     decision_kind: &str,
 ) -> Option<Vec<LocalOpenAiImageCandidateAttempt>> {
+    let sticky_session_token =
+        pool_sticky_session_token_for_request(body_json, input.client_session_affinity.as_ref());
     let candidate_api_formats = image_candidate_api_formats(api_format);
     let mut attempts = Vec::new();
     for candidate_api_format in candidate_api_formats {
@@ -123,6 +125,7 @@ pub(super) async fn list_local_openai_image_candidate_attempts(
                 input.required_capabilities.as_ref(),
                 matches_client_format.then_some(&input.auth_snapshot),
                 input.client_session_affinity.as_ref(),
+                sticky_session_token.as_deref(),
                 current_unix_secs(),
             )
             .await
@@ -184,6 +187,8 @@ pub(super) async fn build_local_openai_image_candidate_attempt_source<'a>(
     decision_kind: &str,
 ) -> Result<Option<(LocalOpenAiImageCandidateAttemptSource<'a>, usize)>, GatewayError> {
     let planner_state = PlannerAppState::new(state);
+    let sticky_session_token =
+        pool_sticky_session_token_for_request(body_json, input.client_session_affinity.as_ref());
     let mut candidates = Vec::new();
     let mut preselection_skipped = Vec::new();
     for candidate_api_format in image_candidate_api_formats(api_format) {
@@ -196,6 +201,7 @@ pub(super) async fn build_local_openai_image_candidate_attempt_source<'a>(
                 input.required_capabilities.as_ref(),
                 matches_client_format.then_some(&input.auth_snapshot),
                 input.client_session_affinity.as_ref(),
+                sticky_session_token.as_deref(),
                 current_unix_secs(),
             )
             .await

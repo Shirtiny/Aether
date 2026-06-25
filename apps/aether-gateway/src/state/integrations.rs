@@ -380,6 +380,19 @@ impl SchedulerRuntimeState for AppState {
             .await
     }
 
+    async fn provider_session_has_runtime_pool_sticky_collateral_block_if_enabled(
+        &self,
+        provider_id: &str,
+        sticky_session_token: &str,
+    ) -> Result<bool, GatewayError> {
+        AppState::provider_session_has_runtime_pool_sticky_collateral_block_if_enabled(
+            self,
+            provider_id,
+            sticky_session_token,
+        )
+        .await
+    }
+
     async fn session_has_runtime_risk_control_block(
         &self,
         session_key: &str,

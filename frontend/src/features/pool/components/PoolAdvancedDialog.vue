@@ -805,6 +805,7 @@ const form = ref({
   account_self_check_concurrency: null as number | null | undefined,
   auto_remove_banned_keys: false,
   skip_exhausted_accounts: false,
+  sticky_collateral_avoidance_enabled: false,
   codex_quota_weekly_basis: true,
 })
 
@@ -891,6 +892,8 @@ function getHealthToggleValue(key: PoolHealthToggleKey): boolean {
       return form.value.auto_remove_banned_keys
     case 'skip_exhausted_accounts':
       return form.value.skip_exhausted_accounts
+    case 'sticky_collateral_avoidance_enabled':
+      return form.value.sticky_collateral_avoidance_enabled
     case 'codex_quota_weekly_basis':
       return form.value.codex_quota_weekly_basis
   }
@@ -912,6 +915,9 @@ function updateHealthToggleValue(key: PoolHealthToggleKey, value: boolean): void
       return
     case 'skip_exhausted_accounts':
       form.value.skip_exhausted_accounts = value
+      return
+    case 'sticky_collateral_avoidance_enabled':
+      form.value.sticky_collateral_avoidance_enabled = value
       return
     case 'codex_quota_weekly_basis':
       form.value.codex_quota_weekly_basis = value
@@ -954,6 +960,7 @@ watch(() => props.modelValue, (open) => {
     account_self_check_concurrency: cfg?.account_self_check_concurrency ?? null,
     auto_remove_banned_keys: cfg?.auto_remove_banned_keys ?? false,
     skip_exhausted_accounts: cfg?.skip_exhausted_accounts ?? false,
+    sticky_collateral_avoidance_enabled: cfg?.sticky_collateral_avoidance_enabled ?? false,
     codex_quota_weekly_basis: cfg?.codex_quota_weekly_basis ?? !isCodexFiveHourQuotaBasis(cfg?.codex_quota_exhaustion_basis),
   }
 
@@ -1037,6 +1044,7 @@ async function handleSave() {
         : undefined,
       auto_remove_banned_keys: form.value.auto_remove_banned_keys,
       skip_exhausted_accounts: form.value.skip_exhausted_accounts,
+      sticky_collateral_avoidance_enabled: form.value.sticky_collateral_avoidance_enabled,
       codex_quota_weekly_basis: form.value.codex_quota_weekly_basis,
       codex_quota_exhaustion_basis: form.value.codex_quota_weekly_basis ? 'weekly' : 'five_hour',
     }

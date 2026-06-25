@@ -83,6 +83,18 @@ fn parse_pool_probe_target_count(pool_advanced: &Map<String, Value>) -> Option<u
         .map(|value| value.min(100_000))
 }
 
+fn parse_sticky_collateral_avoidance_enabled(pool_advanced: &Map<String, Value>) -> bool {
+    [
+        "sticky_collateral_avoidance_enabled",
+        "pool_sticky_collateral_avoidance_enabled",
+        "sticky_account_collateral_avoidance_enabled",
+        "collateral_avoidance_enabled",
+    ]
+    .into_iter()
+    .find_map(|key| pool_advanced.get(key).and_then(Value::as_bool))
+    .unwrap_or(false)
+}
+
 fn pool_score_weight(object: &Map<String, Value>, names: &[&str], current: f64) -> f64 {
     names
         .iter()
@@ -454,6 +466,7 @@ pub(crate) fn admin_provider_pool_config_from_config_value(
             unschedulable_rules: Vec::new(),
             lru_enabled: false,
             skip_exhausted_accounts: false,
+            sticky_collateral_avoidance_enabled: false,
             codex_quota_exhaustion_basis: "weekly".to_string(),
             sticky_session_ttl_seconds: 0,
             latency_window_seconds: 3600,
@@ -491,6 +504,9 @@ pub(crate) fn admin_provider_pool_config_from_config_value(
             .get("skip_exhausted_accounts")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        sticky_collateral_avoidance_enabled: parse_sticky_collateral_avoidance_enabled(
+            pool_advanced,
+        ),
         codex_quota_exhaustion_basis: parse_codex_quota_exhaustion_basis(pool_advanced),
         sticky_session_ttl_seconds: pool_advanced
             .get("sticky_session_ttl_seconds")
@@ -629,6 +645,14 @@ mod tests {
     }
 
     #[test]
+    fn defaults_sticky_collateral_avoidance_to_false() {
+        let provider = sample_provider(json!({ "pool_advanced": {} }));
+        let config = admin_provider_pool_config(&provider).expect("pool config should exist");
+
+        assert!(!config.sticky_collateral_avoidance_enabled);
+    }
+
+    #[test]
     fn defaults_missing_sticky_session_ttl_to_disabled() {
         let provider = sample_provider(json!({ "pool_advanced": {} }));
         let config = admin_provider_pool_config(&provider).expect("pool config should exist");
@@ -641,6 +665,7 @@ mod tests {
         let provider = sample_provider(json!({
             "pool_advanced": {
                 "skip_exhausted_accounts": true,
+                "sticky_collateral_avoidance_enabled": true,
                 "lru_enabled": true,
                 "sticky_session_ttl_seconds": 600,
                 "latency_window_seconds": 900,
@@ -682,6 +707,7 @@ mod tests {
         let config = admin_provider_pool_config(&provider).expect("pool config should exist");
 
         assert!(config.skip_exhausted_accounts);
+        assert!(config.sticky_collateral_avoidance_enabled);
         assert!(config.lru_enabled);
         assert_eq!(config.sticky_session_ttl_seconds, 600);
         assert_eq!(config.latency_window_seconds, 900);

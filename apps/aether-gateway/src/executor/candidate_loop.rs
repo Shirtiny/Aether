@@ -22,7 +22,9 @@ use crate::clock::current_unix_ms;
 use crate::control::GatewayControlDecision;
 use crate::execution_runtime::{execute_execution_runtime_stream, execute_execution_runtime_sync};
 use crate::executor::{build_local_execution_exhaustion, LocalExecutionRequestOutcome};
-use crate::handlers::shared::provider_pool::release_admin_provider_pool_key_lease;
+use crate::handlers::shared::provider_pool::{
+    admin_provider_pool_key_terminal_error_reason, release_admin_provider_pool_key_lease,
+};
 use crate::log_ids::short_request_id;
 use crate::orchestration::local_execution_candidate_metadata_from_report_context;
 use crate::orchestration::{
@@ -42,6 +44,7 @@ use crate::scheduler::session_risk_control::{
 use crate::{AppState, GatewayError};
 
 const DEFAULT_STREAM_FIRST_BYTE_WATCHDOG_TIMEOUT_MS: u64 = 30_000;
+const POOL_STICKY_COLLATERAL_AVOIDANCE_SKIP_REASON: &str = "pool_sticky_collateral_avoidance";
 
 fn attach_redaction_execution_candidate(response: &mut Response<Body>, candidate_id: Option<&str>) {
     if let Some(candidate_id) = candidate_id
@@ -64,6 +67,17 @@ fn new_provider_session_risk_control_blocks(
 ) -> Arc<tokio::sync::Mutex<ProviderSessionRiskControlLoopBlocks>> {
     Arc::new(tokio::sync::Mutex::new(
         ProviderSessionRiskControlLoopBlocks::default(),
+    ))
+}
+
+#[derive(Debug, Default)]
+struct PoolStickyCollateralLoopBlocks {
+    provider_ids: BTreeSet<String>,
+}
+
+fn new_pool_sticky_collateral_blocks() -> Arc<tokio::sync::Mutex<PoolStickyCollateralLoopBlocks>> {
+    Arc::new(tokio::sync::Mutex::new(
+        PoolStickyCollateralLoopBlocks::default(),
     ))
 }
 
@@ -193,6 +207,223 @@ async fn provider_session_risk_control_skip_reason(
     Some(skip_reason)
 }
 
+async fn remember_pool_sticky_collateral_block_if_enabled(
+    state: &AppState,
+    blocks: &Arc<tokio::sync::Mutex<PoolStickyCollateralLoopBlocks>>,
+    plan: &ExecutionPlan,
+    sticky_session_token: &str,
+) -> bool {
+    match state
+        .remember_provider_pool_sticky_collateral_block_if_enabled(
+            &plan.provider_id,
+            sticky_session_token,
+        )
+        .await
+    {
+        Ok(true) => {
+            let mut blocks = blocks.lock().await;
+            blocks.provider_ids.insert(plan.provider_id.clone());
+            true
+        }
+        Ok(false) => false,
+        Err(err) => {
+            warn!(
+                event_name = "provider_pool_sticky_collateral_block_record_failed",
+                log_type = "ops",
+                request_id = %short_request_id(plan.request_id.as_str()),
+                candidate_id = ?plan.candidate_id,
+                provider_id = %plan.provider_id,
+                error = ?err,
+                "gateway failed to persist provider pool sticky collateral avoidance block"
+            );
+            false
+        }
+    }
+}
+
+async fn pool_sticky_collateral_skip_reason(
+    state: &AppState,
+    blocks: &Arc<tokio::sync::Mutex<PoolStickyCollateralLoopBlocks>>,
+    plan: &ExecutionPlan,
+    report_context: Option<&serde_json::Value>,
+) -> Option<&'static str> {
+    let sticky_session_token = pool_sticky_session_token_for_attempt(plan, report_context);
+    let mut should_skip = {
+        let blocks = blocks.lock().await;
+        blocks.provider_ids.contains(&plan.provider_id)
+    };
+
+    if !should_skip {
+        if let Some(sticky_session_token) = sticky_session_token.as_deref() {
+            match state
+                .provider_session_has_runtime_pool_sticky_collateral_block_if_enabled(
+                    &plan.provider_id,
+                    sticky_session_token,
+                )
+                .await
+            {
+                Ok(true) => {
+                    let mut blocks = blocks.lock().await;
+                    blocks.provider_ids.insert(plan.provider_id.clone());
+                    should_skip = true;
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    warn!(
+                        event_name = "provider_pool_sticky_collateral_block_lookup_failed",
+                        log_type = "ops",
+                        request_id = %short_request_id(plan.request_id.as_str()),
+                        candidate_id = ?plan.candidate_id,
+                        provider_id = %plan.provider_id,
+                        error = ?err,
+                        "gateway failed to read provider pool sticky collateral avoidance block"
+                    );
+                }
+            }
+        }
+    }
+
+    if !should_skip {
+        let metadata = local_execution_candidate_metadata_from_report_context(report_context);
+        if metadata.pool_sticky_bound_key_ineligible {
+            if let Some(sticky_session_token) = sticky_session_token.as_deref() {
+                should_skip = remember_pool_sticky_collateral_block_if_enabled(
+                    state,
+                    blocks,
+                    plan,
+                    sticky_session_token,
+                )
+                .await;
+            }
+        }
+    }
+
+    if !should_skip {
+        return None;
+    }
+
+    record_skipped_local_request_candidate(
+        state,
+        plan,
+        report_context,
+        POOL_STICKY_COLLATERAL_AVOIDANCE_SKIP_REASON,
+        current_unix_ms(),
+    )
+    .await;
+    Some(POOL_STICKY_COLLATERAL_AVOIDANCE_SKIP_REASON)
+}
+
+async fn record_pool_sticky_collateral_block_after_failure_if_needed(
+    state: &AppState,
+    blocks: &Arc<tokio::sync::Mutex<PoolStickyCollateralLoopBlocks>>,
+    plan: &ExecutionPlan,
+    report_context: Option<&serde_json::Value>,
+) {
+    let Some(sticky_session_token) = pool_sticky_session_token_for_attempt(plan, report_context)
+    else {
+        return;
+    };
+    let Some(candidate_id) = plan
+        .candidate_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+    let Some(candidate) = read_request_candidate(state, &plan.request_id, candidate_id).await
+    else {
+        return;
+    };
+    if !candidate_matches_pool_sticky_collateral_failure(&candidate) {
+        return;
+    }
+    remember_pool_sticky_collateral_block_if_enabled(state, blocks, plan, &sticky_session_token)
+        .await;
+}
+
+fn candidate_matches_pool_sticky_collateral_failure(candidate: &StoredRequestCandidate) -> bool {
+    if !matches!(
+        candidate.status,
+        RequestCandidateStatus::Failed | RequestCandidateStatus::Cancelled
+    ) {
+        return false;
+    }
+    let status_code = candidate.status_code.unwrap_or(0);
+    let error_text = candidate_pool_error_text(candidate);
+    pool_sticky_collateral_failure_status_is_account_invalid(status_code, error_text.as_deref())
+}
+
+fn pool_sticky_collateral_failure_status_is_account_invalid(
+    status_code: u16,
+    error_body: Option<&str>,
+) -> bool {
+    if let Some(reason) = admin_provider_pool_key_terminal_error_reason(status_code, error_body) {
+        return !reason.starts_with("payment_required_");
+    }
+    if matches!(status_code, 401 | 403) {
+        return true;
+    }
+    let body = error_body.unwrap_or_default().to_ascii_lowercase();
+    let account_related = body.contains("account")
+        || body.contains("user")
+        || body.contains("workspace")
+        || body.contains("organization");
+    (body.contains("invalid") && body.contains("token"))
+        || body.contains("banned")
+        || body.contains("suspended")
+        || (account_related
+            && (body.contains("blocked")
+                || body.contains("disabled")
+                || body.contains("deactivated")))
+}
+
+fn candidate_pool_error_text(candidate: &StoredRequestCandidate) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(message) = candidate
+        .error_message
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        parts.push(message.to_string());
+    }
+    if let Some(value) = candidate_json_path(candidate.extra_data.as_ref(), &["error_flow"]) {
+        if let Some(text) = request_candidate_json_text(value) {
+            parts.push(text);
+        }
+    }
+    if let Some(value) = candidate_json_path(
+        candidate.extra_data.as_ref(),
+        &["upstream_response", "body"],
+    ) {
+        if let Some(text) = request_candidate_json_text(value) {
+            parts.push(text);
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("\n"))
+}
+
+fn candidate_json_path<'a>(
+    value: Option<&'a serde_json::Value>,
+    path: &[&str],
+) -> Option<&'a serde_json::Value> {
+    let mut current = value?;
+    for field in path {
+        current = current.get(*field)?;
+    }
+    Some(current)
+}
+
+fn request_candidate_json_text(value: &serde_json::Value) -> Option<String> {
+    value
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| serde_json::to_string(value).ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 pub(crate) async fn execute_sync_plan_and_reports<T>(
     state: &AppState,
     parts: &http::request::Parts,
@@ -235,6 +466,7 @@ where
             decision,
             plan_kind,
             provider_session_risk_control_blocks: new_provider_session_risk_control_blocks(),
+            pool_sticky_collateral_blocks: new_pool_sticky_collateral_blocks(),
         };
         match run_ai_attempt_loop(&port, plan_and_reports).await? {
             AiAttemptLoopOutcome::Responded(response) => {
@@ -280,6 +512,7 @@ where
             decision,
             plan_kind,
             provider_session_risk_control_blocks: new_provider_session_risk_control_blocks(),
+            pool_sticky_collateral_blocks: new_pool_sticky_collateral_blocks(),
         };
         run_dynamic_attempt_loop(
             &port,
@@ -304,6 +537,7 @@ struct SyncAttemptLoopPort<'a> {
     plan_kind: &'a str,
     provider_session_risk_control_blocks:
         Arc<tokio::sync::Mutex<ProviderSessionRiskControlLoopBlocks>>,
+    pool_sticky_collateral_blocks: Arc<tokio::sync::Mutex<PoolStickyCollateralLoopBlocks>>,
 }
 
 #[async_trait]
@@ -321,6 +555,35 @@ where
             plan: attempt.execution_plan(),
             report_context: report_context.as_ref(),
         };
+        if let Some(skip_reason) = pool_sticky_collateral_skip_reason(
+            self.state,
+            &self.pool_sticky_collateral_blocks,
+            attempt.execution_plan(),
+            report_context.as_ref(),
+        )
+        .await
+        {
+            apply_local_execution_effect(
+                self.state,
+                context,
+                LocalExecutionEffect::PoolAttemptAborted,
+            )
+            .await;
+            warn!(
+                event_name = "local_sync_candidate_skipped_by_pool_sticky_collateral_avoidance",
+                log_type = "event",
+                trace_id = %self.trace_id,
+                plan_kind = self.plan_kind,
+                request_id = %short_request_id(attempt.execution_plan().request_id.as_str()),
+                candidate_id = ?attempt.execution_plan().candidate_id,
+                provider_id = %attempt.execution_plan().provider_id,
+                endpoint_id = %attempt.execution_plan().endpoint_id,
+                key_id = %attempt.execution_plan().key_id,
+                skip_reason = skip_reason,
+                "gateway skipped local sync candidate after sticky pool collateral avoidance"
+            );
+            return Ok(None);
+        }
         let mut sticky_init_cleanup = PoolAttemptStartCleanupGuard::new(self.state, context);
         let should_execute = prepare_pool_attempt_started_effect(self.state, context).await;
         if !should_execute {
@@ -400,12 +663,26 @@ where
                 attempt.execution_plan(),
             )
             .await;
+            record_pool_sticky_collateral_block_after_failure_if_needed(
+                self.state,
+                &self.pool_sticky_collateral_blocks,
+                attempt.execution_plan(),
+                attempt.report_context().as_ref(),
+            )
+            .await;
         }
         if let Some(response) = response.as_mut() {
             record_provider_session_risk_control_block_if_needed(
                 self.state,
                 &self.provider_session_risk_control_blocks,
                 attempt.execution_plan(),
+            )
+            .await;
+            record_pool_sticky_collateral_block_after_failure_if_needed(
+                self.state,
+                &self.pool_sticky_collateral_blocks,
+                attempt.execution_plan(),
+                attempt.report_context().as_ref(),
             )
             .await;
             if let Some(guard) = sticky_init_cleanup.as_mut() {
@@ -489,6 +766,7 @@ where
             decision,
             plan_kind,
             provider_session_risk_control_blocks: new_provider_session_risk_control_blocks(),
+            pool_sticky_collateral_blocks: new_pool_sticky_collateral_blocks(),
         };
         match run_ai_attempt_loop(&port, plan_and_reports).await? {
             AiAttemptLoopOutcome::Responded(response) => {
@@ -532,6 +810,7 @@ where
             decision,
             plan_kind,
             provider_session_risk_control_blocks: new_provider_session_risk_control_blocks(),
+            pool_sticky_collateral_blocks: new_pool_sticky_collateral_blocks(),
         };
         run_dynamic_attempt_loop(
             &port,
@@ -626,6 +905,7 @@ struct StreamAttemptLoopPort<'a> {
     plan_kind: &'a str,
     provider_session_risk_control_blocks:
         Arc<tokio::sync::Mutex<ProviderSessionRiskControlLoopBlocks>>,
+    pool_sticky_collateral_blocks: Arc<tokio::sync::Mutex<PoolStickyCollateralLoopBlocks>>,
 }
 
 #[async_trait]
@@ -644,6 +924,35 @@ where
             plan: &plan,
             report_context: report_context.as_ref(),
         };
+        if let Some(skip_reason) = pool_sticky_collateral_skip_reason(
+            self.state,
+            &self.pool_sticky_collateral_blocks,
+            &plan,
+            report_context.as_ref(),
+        )
+        .await
+        {
+            apply_local_execution_effect(
+                self.state,
+                context,
+                LocalExecutionEffect::PoolAttemptAborted,
+            )
+            .await;
+            warn!(
+                event_name = "local_stream_candidate_skipped_by_pool_sticky_collateral_avoidance",
+                log_type = "event",
+                trace_id = %self.trace_id,
+                plan_kind = self.plan_kind,
+                request_id = %short_request_id(plan.request_id.as_str()),
+                candidate_id = ?plan.candidate_id,
+                provider_id = %plan.provider_id,
+                endpoint_id = %plan.endpoint_id,
+                key_id = %plan.key_id,
+                skip_reason = skip_reason,
+                "gateway skipped local stream candidate after sticky pool collateral avoidance"
+            );
+            return Ok(None);
+        }
         let mut sticky_init_cleanup = PoolAttemptStartCleanupGuard::new(self.state, context);
         let should_execute = prepare_pool_attempt_started_effect(self.state, context).await;
         if !should_execute {
@@ -757,12 +1066,26 @@ where
                 &watchdog_plan,
             )
             .await;
+            record_pool_sticky_collateral_block_after_failure_if_needed(
+                self.state,
+                &self.pool_sticky_collateral_blocks,
+                &watchdog_plan,
+                watchdog_report_context.as_ref(),
+            )
+            .await;
         }
         if let Some(response) = response.as_mut() {
             record_provider_session_risk_control_block_if_needed(
                 self.state,
                 &self.provider_session_risk_control_blocks,
                 &watchdog_plan,
+            )
+            .await;
+            record_pool_sticky_collateral_block_after_failure_if_needed(
+                self.state,
+                &self.pool_sticky_collateral_blocks,
+                &watchdog_plan,
+                watchdog_report_context.as_ref(),
             )
             .await;
             if let Some(guard) = sticky_init_cleanup.as_mut() {
@@ -826,7 +1149,7 @@ where
             state.runtime_state.as_ref(),
             &plan.provider_id,
             &plan.key_id,
-            unused_pool_sticky_session_token(plan, report_context.as_ref()).as_deref(),
+            pool_sticky_session_token_for_attempt(plan, report_context.as_ref()).as_deref(),
             metadata.pool_sticky_init_owner.as_deref(),
         )
         .await;
@@ -851,7 +1174,7 @@ where
     }
 }
 
-fn unused_pool_sticky_session_token(
+fn pool_sticky_session_token_for_attempt(
     plan: &aether_contracts::ExecutionPlan,
     report_context: Option<&serde_json::Value>,
 ) -> Option<String> {
@@ -1132,6 +1455,41 @@ mod tests {
     }
 
     #[test]
+    fn pool_sticky_collateral_failure_detects_account_invalid_statuses() {
+        assert!(pool_sticky_collateral_failure_status_is_account_invalid(
+            401, None
+        ));
+        assert!(pool_sticky_collateral_failure_status_is_account_invalid(
+            403,
+            Some("forbidden")
+        ));
+        assert!(pool_sticky_collateral_failure_status_is_account_invalid(
+            400,
+            Some("invalid token")
+        ));
+        assert!(pool_sticky_collateral_failure_status_is_account_invalid(
+            400,
+            Some("account suspended")
+        ));
+    }
+
+    #[test]
+    fn pool_sticky_collateral_failure_ignores_quota_and_cooldown_statuses() {
+        assert!(!pool_sticky_collateral_failure_status_is_account_invalid(
+            402,
+            Some("quota exceeded")
+        ));
+        assert!(!pool_sticky_collateral_failure_status_is_account_invalid(
+            429,
+            Some("rate limited")
+        ));
+        assert!(!pool_sticky_collateral_failure_status_is_account_invalid(
+            503,
+            Some("upstream overloaded")
+        ));
+    }
+
+    #[test]
     fn stream_candidate_watchdog_ignores_total_timeout_for_stream_upstream() {
         let report_context = json!({"upstream_is_stream": true});
         let timeout = resolve_stream_candidate_watchdog_timeout(
@@ -1214,7 +1572,7 @@ mod tests {
     }
 
     #[test]
-    fn unused_pool_sticky_session_token_prefers_report_context_metadata() {
+    fn pool_sticky_session_token_for_attempt_prefers_report_context_metadata() {
         let plan = test_plan(None);
         let report_context = json!({
             "pool_sticky_session_token": "metadata-session",
@@ -1225,7 +1583,7 @@ mod tests {
         });
 
         assert_eq!(
-            unused_pool_sticky_session_token(&plan, Some(&report_context)).as_deref(),
+            pool_sticky_session_token_for_attempt(&plan, Some(&report_context)).as_deref(),
             Some("metadata-session")
         );
     }

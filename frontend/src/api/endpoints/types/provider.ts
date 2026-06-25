@@ -180,7 +180,7 @@ export interface ChatPiiRedactionProviderConfig {
   enabled: boolean
 }
 
-export type RiskControlSessionAvoidanceMode = 'candidate' | 'block'
+export type RiskControlSessionAvoidanceMode = 'ignore' | 'candidate' | 'block'
 
 export interface RiskControlSessionAvoidanceProviderConfig {
   mode: RiskControlSessionAvoidanceMode
@@ -729,6 +729,7 @@ export interface PoolAdvancedConfig {
   sticky_session_ttl_seconds?: number | null
   load_threshold_percent?: number | null
   skip_exhausted_accounts?: boolean | null
+  sticky_collateral_avoidance_enabled?: boolean | null
   codex_quota_weekly_basis?: boolean | null
   codex_quota_exhaustion_basis?: 'weekly' | 'five_hour' | '5h' | string | null
   // 旧字段（兼容读取）
@@ -782,15 +783,15 @@ export function normalizeChatPiiRedactionProviderConfig(value: unknown): ChatPii
 
 export function normalizeRiskControlSessionAvoidanceProviderConfig(value: unknown): RiskControlSessionAvoidanceProviderConfig {
   if (!isPlainObject(value)) {
-    return { mode: 'candidate' }
+    return { mode: 'ignore' }
   }
-  if (value.mode === 'block' || value.mode === 'candidate') {
+  if (value.mode === 'ignore' || value.mode === 'block' || value.mode === 'candidate') {
     return { mode: value.mode }
   }
   if (value.enabled === true) {
     return { mode: 'candidate' }
   }
-  return { mode: 'candidate' }
+  return { mode: 'ignore' }
 }
 
 export function normalizePoolAdvancedConfig(value: unknown): PoolAdvancedConfig | null {

@@ -71,7 +71,7 @@ pub(crate) fn provider_session_risk_control_avoidance_mode(
         .and_then(|value| value.get("risk_control_session_avoidance"))
         .and_then(serde_json::Value::as_object)
     else {
-        return ProviderSessionRiskControlAvoidanceMode::Candidate;
+        return ProviderSessionRiskControlAvoidanceMode::Disabled;
     };
 
     if let Some(mode) = object
@@ -82,17 +82,28 @@ pub(crate) fn provider_session_risk_control_avoidance_mode(
         .map(str::to_ascii_lowercase)
     {
         return match mode.as_str() {
+            "ignore" | "ignored" | "disabled" | "disable" | "off" | "none" => {
+                ProviderSessionRiskControlAvoidanceMode::Disabled
+            }
             "candidate" | "candidates" | "fallback" | "fallback_candidate" => {
                 ProviderSessionRiskControlAvoidanceMode::Candidate
             }
             "block" | "blocked" | "deny" | "deny_all" => {
                 ProviderSessionRiskControlAvoidanceMode::Block
             }
-            _ => ProviderSessionRiskControlAvoidanceMode::Candidate,
+            _ => ProviderSessionRiskControlAvoidanceMode::Disabled,
         };
     }
 
-    ProviderSessionRiskControlAvoidanceMode::Candidate
+    if let Some(enabled) = object.get("enabled").and_then(serde_json::Value::as_bool) {
+        if enabled {
+            ProviderSessionRiskControlAvoidanceMode::Candidate
+        } else {
+            ProviderSessionRiskControlAvoidanceMode::Disabled
+        }
+    } else {
+        ProviderSessionRiskControlAvoidanceMode::Disabled
+    }
 }
 
 pub(crate) fn provider_session_risk_control_avoidance_ttl_seconds(
@@ -133,16 +144,16 @@ mod tests {
     };
 
     #[test]
-    fn risk_control_session_avoidance_defaults_to_candidate() {
+    fn risk_control_session_avoidance_defaults_to_disabled() {
         assert_eq!(
             provider_session_risk_control_avoidance_mode(None),
-            ProviderSessionRiskControlAvoidanceMode::Candidate
+            ProviderSessionRiskControlAvoidanceMode::Disabled
         );
         assert_eq!(
             provider_session_risk_control_avoidance_mode(Some(&json!({
                 "risk_control_session_avoidance": {}
             }))),
-            ProviderSessionRiskControlAvoidanceMode::Candidate
+            ProviderSessionRiskControlAvoidanceMode::Disabled
         );
     }
 
@@ -155,6 +166,14 @@ mod tests {
                 }
             }))),
             ProviderSessionRiskControlAvoidanceMode::Candidate
+        );
+        assert_eq!(
+            provider_session_risk_control_avoidance_mode(Some(&json!({
+                "risk_control_session_avoidance": {
+                    "mode": "ignore"
+                }
+            }))),
+            ProviderSessionRiskControlAvoidanceMode::Disabled
         );
         assert_eq!(
             provider_session_risk_control_avoidance_mode(Some(&json!({
@@ -182,7 +201,7 @@ mod tests {
                     "enabled": false
                 }
             }))),
-            ProviderSessionRiskControlAvoidanceMode::Candidate
+            ProviderSessionRiskControlAvoidanceMode::Disabled
         );
     }
 }

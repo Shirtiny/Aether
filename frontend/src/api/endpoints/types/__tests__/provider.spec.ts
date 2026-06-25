@@ -10,6 +10,9 @@ describe('normalizePoolAdvancedConfig', () => {
   it('keeps object payloads, including empty objects', () => {
     expect(normalizePoolAdvancedConfig({})).toEqual({})
     expect(normalizePoolAdvancedConfig({ global_priority: 5 })).toEqual({ global_priority: 5 })
+    expect(normalizePoolAdvancedConfig({ sticky_collateral_avoidance_enabled: true })).toEqual({
+      sticky_collateral_avoidance_enabled: true,
+    })
   })
 
   it('maps legacy boolean payloads to the current object semantics', () => {
@@ -39,16 +42,17 @@ describe('normalizeChatPiiRedactionProviderConfig', () => {
 })
 
 describe('normalizeRiskControlSessionAvoidanceProviderConfig', () => {
-  it('defaults unsupported and empty payloads to candidate mode', () => {
-    expect(normalizeRiskControlSessionAvoidanceProviderConfig(null)).toEqual({ mode: 'candidate' })
-    expect(normalizeRiskControlSessionAvoidanceProviderConfig({})).toEqual({ mode: 'candidate' })
-    expect(normalizeRiskControlSessionAvoidanceProviderConfig({ mode: 'unexpected' })).toEqual({ mode: 'candidate' })
+  it('defaults unsupported and empty payloads to ignore mode', () => {
+    expect(normalizeRiskControlSessionAvoidanceProviderConfig(null)).toEqual({ mode: 'ignore' })
+    expect(normalizeRiskControlSessionAvoidanceProviderConfig({})).toEqual({ mode: 'ignore' })
+    expect(normalizeRiskControlSessionAvoidanceProviderConfig({ mode: 'unexpected' })).toEqual({ mode: 'ignore' })
   })
 
   it('supports select modes and legacy enabled payloads', () => {
+    expect(normalizeRiskControlSessionAvoidanceProviderConfig({ mode: 'ignore' })).toEqual({ mode: 'ignore' })
     expect(normalizeRiskControlSessionAvoidanceProviderConfig({ mode: 'candidate' })).toEqual({ mode: 'candidate' })
     expect(normalizeRiskControlSessionAvoidanceProviderConfig({ mode: 'block' })).toEqual({ mode: 'block' })
     expect(normalizeRiskControlSessionAvoidanceProviderConfig({ enabled: true })).toEqual({ mode: 'candidate' })
-    expect(normalizeRiskControlSessionAvoidanceProviderConfig({ enabled: false })).toEqual({ mode: 'candidate' })
+    expect(normalizeRiskControlSessionAvoidanceProviderConfig({ enabled: false })).toEqual({ mode: 'ignore' })
   })
 })

@@ -141,20 +141,23 @@
                 </div>
                 <div
                   class="flex items-center gap-1.5"
-                  title="候选会跳过当前提供商；阻止会拒绝该会话后续调度"
+                  title="忽略保持默认行为；候选会跳过当前提供商；阻止会拒绝该会话后续调度"
                   @click.stop
                   @mousedown.stop
                   @dragstart.stop
                 >
                   <span class="text-[10px] text-muted-foreground whitespace-nowrap">风控避险</span>
                   <Select
-                    :model-value="provider.risk_control_session_avoidance?.mode ?? 'candidate'"
+                    :model-value="provider.risk_control_session_avoidance?.mode ?? 'ignore'"
                     @update:model-value="(mode: string) => updateProviderRiskControlAvoidance(provider.id, mode)"
                   >
                     <SelectTrigger class="h-7 w-20 text-[11px]">
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
+                      <SelectItem value="ignore">
+                        忽略
+                      </SelectItem>
                       <SelectItem value="candidate">
                         候选
                       </SelectItem>
@@ -710,7 +713,8 @@ function normalizeRequiredPriority(value: unknown, fallback: number): number {
 }
 
 function normalizeRiskControlAvoidanceMode(value: unknown): RiskControlSessionAvoidanceMode {
-  return value === 'block' ? 'block' : 'candidate'
+  if (value === 'candidate' || value === 'block') return value
+  return 'ignore'
 }
 
 function normalizeProvidersForEditing(
@@ -1560,7 +1564,7 @@ async function save() {
       }
 
       const currentRiskAvoidanceMode = normalizeRiskControlAvoidanceMode(provider.risk_control_session_avoidance?.mode)
-      const originalRiskAvoidanceMode = originalProviderRiskAvoidanceById.get(provider.id) ?? 'candidate'
+      const originalRiskAvoidanceMode = originalProviderRiskAvoidanceById.get(provider.id) ?? 'ignore'
       if (currentRiskAvoidanceMode !== originalRiskAvoidanceMode) {
         payload.config = {
           risk_control_session_avoidance: {

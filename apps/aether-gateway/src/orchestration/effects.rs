@@ -1238,6 +1238,11 @@ async fn record_pool_error_effect(
     context: LocalExecutionEffectContext<'_>,
     effect: LocalPoolErrorEffect<'_>,
 ) {
+    let sticky_collateral_account_invalid =
+        pool_sticky_collateral_failure_status_is_account_invalid(
+            effect.status_code,
+            effect.error_body,
+        );
     let Some(pool_context) = resolve_pool_feedback_context(state, context).await else {
         let terminal_error_reason =
             admin_provider_pool_key_terminal_error_reason(effect.status_code, effect.error_body);
@@ -1245,13 +1250,17 @@ async fn record_pool_error_effect(
             || local_candidate_failure_should_record_pool_error(
                 effect.classification,
                 effect.status_code,
-            );
+            )
+            || sticky_collateral_account_invalid;
         cleanup_pool_sticky_initialization_without_feedback_context(
             state,
             context,
             should_record_pool_error,
         )
         .await;
+        if sticky_collateral_account_invalid {
+            remember_pool_sticky_collateral_block_for_context(state, context).await;
+        }
         return;
     };
     let terminal_error_reason =
@@ -1260,7 +1269,8 @@ async fn record_pool_error_effect(
         || local_candidate_failure_should_record_pool_error(
             effect.classification,
             effect.status_code,
-        );
+        )
+        || sticky_collateral_account_invalid;
     if !should_record_pool_error {
         let metadata =
             local_execution_candidate_metadata_from_report_context(context.report_context);
@@ -1290,6 +1300,9 @@ async fn record_pool_error_effect(
         return;
     }
 
+    if sticky_collateral_account_invalid {
+        remember_pool_sticky_collateral_block_for_context(state, context).await;
+    }
     clear_admin_provider_pool_sticky_session_if_bound_to_key(
         state.runtime_state.as_ref(),
         &context.plan.provider_id,
@@ -1323,6 +1336,32 @@ async fn record_pool_error_effect(
         }),
     )
     .await;
+}
+
+async fn remember_pool_sticky_collateral_block_for_context(
+    state: &AppState,
+    context: LocalExecutionEffectContext<'_>,
+) {
+    let Some(sticky_session_token) =
+        pool_feedback_sticky_session_token(context.plan, context.report_context)
+    else {
+        return;
+    };
+    if let Err(err) = state
+        .remember_provider_pool_sticky_collateral_block_if_enabled(
+            &context.plan.provider_id,
+            &sticky_session_token,
+        )
+        .await
+    {
+        warn!(
+            provider_id = %context.plan.provider_id,
+            endpoint_id = %context.plan.endpoint_id,
+            key_id = %context.plan.key_id,
+            error = ?err,
+            "gateway orchestration effects: failed to persist pool sticky collateral avoidance block"
+        );
+    }
 }
 
 async fn clear_pool_key_circuit_breaker(
@@ -1467,6 +1506,30 @@ fn local_candidate_failure_should_record_pool_error(
     }
 
     local_candidate_failure_should_invalidate_affinity(classification, status_code)
+}
+
+fn pool_sticky_collateral_failure_status_is_account_invalid(
+    status_code: u16,
+    error_body: Option<&str>,
+) -> bool {
+    if let Some(reason) = admin_provider_pool_key_terminal_error_reason(status_code, error_body) {
+        return !reason.starts_with("payment_required_");
+    }
+    if matches!(status_code, 401 | 403) {
+        return true;
+    }
+    let body = error_body.unwrap_or_default().to_ascii_lowercase();
+    let account_related = body.contains("account")
+        || body.contains("user")
+        || body.contains("workspace")
+        || body.contains("organization");
+    (body.contains("invalid") && body.contains("token"))
+        || body.contains("banned")
+        || body.contains("suspended")
+        || (account_related
+            && (body.contains("blocked")
+                || body.contains("disabled")
+                || body.contains("deactivated")))
 }
 
 async fn record_pool_stream_timeout_effect(
@@ -1622,11 +1685,11 @@ mod tests {
 
     use super::{
         apply_local_execution_effect, local_candidate_failure_should_record_pool_error,
-        pool_score_hard_state_for_status, prepare_pool_attempt_started_effect,
-        LocalAdaptiveRateLimitEffect, LocalAdaptiveSuccessEffect, LocalAttemptFailureEffect,
-        LocalExecutionEffect, LocalExecutionEffectContext, LocalHealthFailureEffect,
-        LocalHealthSuccessEffect, LocalOAuthInvalidationEffect, LocalPoolErrorEffect,
-        PoolAttemptStartCleanupGuard,
+        pool_score_hard_state_for_status, pool_sticky_collateral_failure_status_is_account_invalid,
+        prepare_pool_attempt_started_effect, LocalAdaptiveRateLimitEffect,
+        LocalAdaptiveSuccessEffect, LocalAttemptFailureEffect, LocalExecutionEffect,
+        LocalExecutionEffectContext, LocalHealthFailureEffect, LocalHealthSuccessEffect,
+        LocalOAuthInvalidationEffect, LocalPoolErrorEffect, PoolAttemptStartCleanupGuard,
     };
     use crate::data::{GatewayDataConfig, GatewayDataState};
     use crate::handlers::shared::provider_pool::{
@@ -3319,6 +3382,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pool_account_invalid_error_records_sticky_collateral_block_when_enabled() {
+        let provider_config = json!({
+            "pool_advanced": {
+                "sticky_session_ttl_seconds": 120,
+                "sticky_collateral_avoidance_enabled": true
+            }
+        });
+        let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![sample_health_provider().with_transport_fields(
+                true,
+                false,
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(provider_config),
+            )],
+            vec![sample_health_endpoint()],
+            vec![sample_health_key()],
+        ));
+        let state = AppState::new()
+            .expect("gateway state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(repository)
+                    .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+            );
+        let mut plan = sample_plan();
+        plan.body = RequestBody::from_json(json!({
+            "model": "gpt-5",
+            "session_id": "session-1"
+        }));
+        let report_context = json!({
+            "original_request_body": {
+                "model": "gpt-5",
+                "session_id": "session-1"
+            }
+        });
+
+        apply_local_execution_effect(
+            &state,
+            LocalExecutionEffectContext {
+                plan: &plan,
+                report_context: Some(&report_context),
+            },
+            LocalExecutionEffect::PoolError(LocalPoolErrorEffect {
+                status_code: 400,
+                classification: LocalFailoverClassification::StopErrorPattern,
+                headers: &BTreeMap::new(),
+                error_body: Some(r#"{"error":{"message":"invalid token"}}"#),
+            }),
+        )
+        .await;
+
+        assert!(
+            state
+                .provider_session_has_runtime_pool_sticky_collateral_block_if_enabled(
+                    &plan.provider_id,
+                    "session-1",
+                )
+                .await
+                .expect("sticky collateral block lookup should succeed"),
+            "account invalid pool errors should block the session from this provider"
+        );
+    }
+
+    #[tokio::test]
     async fn sticky_key_stream_timeout_allows_deferred_fallback_to_take_over() {
         let provider_config = json!({
             "pool_advanced": {
@@ -4142,6 +4273,41 @@ mod tests {
         assert!(local_candidate_failure_should_record_pool_error(
             LocalFailoverClassification::RetryUpstreamFailure,
             429,
+        ));
+    }
+
+    #[test]
+    fn pool_sticky_collateral_failure_detects_account_invalid_statuses() {
+        assert!(pool_sticky_collateral_failure_status_is_account_invalid(
+            401, None
+        ));
+        assert!(pool_sticky_collateral_failure_status_is_account_invalid(
+            403,
+            Some("forbidden")
+        ));
+        assert!(pool_sticky_collateral_failure_status_is_account_invalid(
+            400,
+            Some("invalid token")
+        ));
+        assert!(pool_sticky_collateral_failure_status_is_account_invalid(
+            400,
+            Some("workspace deactivated")
+        ));
+    }
+
+    #[test]
+    fn pool_sticky_collateral_failure_ignores_quota_and_cooldown_statuses() {
+        assert!(!pool_sticky_collateral_failure_status_is_account_invalid(
+            402,
+            Some("quota exceeded")
+        ));
+        assert!(!pool_sticky_collateral_failure_status_is_account_invalid(
+            429,
+            Some("rate limited")
+        ));
+        assert!(!pool_sticky_collateral_failure_status_is_account_invalid(
+            503,
+            Some("upstream overloaded")
         ));
     }
 

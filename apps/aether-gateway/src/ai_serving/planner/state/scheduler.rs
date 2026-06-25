@@ -19,6 +19,7 @@ impl<'a> PlannerAppState<'a> {
         required_capabilities: Option<&serde_json::Value>,
         auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
         client_session_affinity: Option<&ClientSessionAffinity>,
+        pool_sticky_session_token: Option<&str>,
         now_unix_secs: u64,
     ) -> Result<Vec<SchedulerMinimalCandidateSelectionCandidate>, GatewayError> {
         let enable_model_directives =
@@ -37,6 +38,7 @@ impl<'a> PlannerAppState<'a> {
             required_capabilities,
             auth_snapshot,
             client_session_affinity,
+            pool_sticky_session_token,
             now_unix_secs,
             enable_model_directives,
         )
@@ -51,6 +53,7 @@ impl<'a> PlannerAppState<'a> {
         required_capabilities: Option<&serde_json::Value>,
         auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
         client_session_affinity: Option<&ClientSessionAffinity>,
+        pool_sticky_session_token: Option<&str>,
         now_unix_secs: u64,
     ) -> Result<
         (
@@ -81,6 +84,7 @@ impl<'a> PlannerAppState<'a> {
                 required_capabilities,
                 auth_snapshot,
                 client_session_affinity,
+                pool_sticky_session_token,
                 attempt_now_unix_secs,
                 enable_model_directives,
             )
@@ -111,6 +115,7 @@ impl<'a> PlannerAppState<'a> {
         required_capabilities: Option<&serde_json::Value>,
         auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
         client_session_affinity: Option<&ClientSessionAffinity>,
+        pool_sticky_session_token: Option<&str>,
         now_unix_secs: u64,
     ) -> Result<
         (
@@ -127,6 +132,7 @@ impl<'a> PlannerAppState<'a> {
             required_capabilities,
             auth_snapshot,
             client_session_affinity,
+            pool_sticky_session_token,
             now_unix_secs,
         )
         .await

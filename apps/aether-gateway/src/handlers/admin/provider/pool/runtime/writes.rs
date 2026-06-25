@@ -969,6 +969,7 @@ mod tests {
             unschedulable_rules: Vec::new(),
             lru_enabled: true,
             skip_exhausted_accounts: false,
+            sticky_collateral_avoidance_enabled: false,
             codex_quota_exhaustion_basis: "weekly".to_string(),
             sticky_session_ttl_seconds: 120,
             latency_window_seconds: 600,

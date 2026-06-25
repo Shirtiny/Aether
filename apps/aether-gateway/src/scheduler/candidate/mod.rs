@@ -62,6 +62,7 @@ pub(crate) async fn list_selectable_candidates(
     required_capabilities: Option<&serde_json::Value>,
     auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
     client_session_affinity: Option<&ClientSessionAffinity>,
+    pool_sticky_session_token: Option<&str>,
     now_unix_secs: u64,
     enable_model_directives: bool,
 ) -> Result<Vec<SchedulerMinimalCandidateSelectionCandidate>, GatewayError> {
@@ -74,6 +75,7 @@ pub(crate) async fn list_selectable_candidates(
         required_capabilities,
         auth_snapshot,
         client_session_affinity,
+        pool_sticky_session_token,
         now_unix_secs,
         enable_model_directives,
     )
@@ -96,6 +98,7 @@ pub(crate) async fn list_selectable_candidates_with_skip_reasons(
     required_capabilities: Option<&serde_json::Value>,
     auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
     client_session_affinity: Option<&ClientSessionAffinity>,
+    pool_sticky_session_token: Option<&str>,
     now_unix_secs: u64,
     enable_model_directives: bool,
 ) -> Result<
@@ -114,6 +117,7 @@ pub(crate) async fn list_selectable_candidates_with_skip_reasons(
         required_capabilities,
         auth_snapshot,
         client_session_affinity,
+        pool_sticky_session_token,
         now_unix_secs,
         enable_model_directives,
     )
@@ -129,6 +133,7 @@ pub(crate) async fn list_selectable_enumerated_candidates_with_skip_reasons(
     required_capabilities: Option<&serde_json::Value>,
     auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
     client_session_affinity: Option<&ClientSessionAffinity>,
+    pool_sticky_session_token: Option<&str>,
     now_unix_secs: u64,
 ) -> Result<
     (
@@ -148,6 +153,7 @@ pub(crate) async fn list_selectable_enumerated_candidates_with_skip_reasons(
         required_capabilities,
         auth_snapshot,
         client_session_affinity,
+        pool_sticky_session_token,
         now_unix_secs,
         ordering_config,
         priority_affinity_key,
@@ -232,6 +238,7 @@ pub(crate) async fn list_selectable_candidates_for_required_capability_without_r
             required_capabilities.as_ref(),
             auth_snapshot,
             client_session_affinity,
+            None,
             now_unix_secs,
             false,
         )

@@ -28,6 +28,7 @@ pub(crate) async fn list_local_openai_chat_candidates(
         &input.auth_snapshot,
         input.routing_policy.as_ref(),
         input.client_session_affinity.as_ref(),
+        None,
         false,
         LocalCandidatePreselectionKeyMode::ProviderEndpointKeyModel,
     )

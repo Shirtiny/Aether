@@ -18,6 +18,7 @@ use aether_usage_runtime::{usage_json_text_matches_risk_control, usage_text_matc
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::data::auth::GatewayAuthApiKeySnapshot;
+use crate::scheduler::pool_collateral_avoidance::provider_pool_sticky_collateral_avoidance_enabled;
 use crate::scheduler::session_risk_control::provider_session_risk_control_avoidance_mode;
 use crate::GatewayError;
 
@@ -34,6 +35,7 @@ pub(super) struct CandidateRuntimeSelectionSnapshot {
     pub(super) pool_provider_ids: BTreeSet<String>,
     session_risk_control_blocked: bool,
     provider_session_risk_control_blocks: BTreeMap<String, bool>,
+    provider_pool_sticky_collateral_blocks: BTreeMap<String, bool>,
     provider_quota_blocks_requests: BTreeMap<String, bool>,
     key_account_quota_exhausted: BTreeMap<String, bool>,
     key_oauth_invalid: BTreeMap<String, bool>,
@@ -44,6 +46,7 @@ pub(super) async fn read_candidate_runtime_selection_snapshot(
     state: &(impl SchedulerRuntimeState + ?Sized),
     candidates: &[SchedulerMinimalCandidateSelectionCandidate],
     client_session_affinity: Option<&ClientSessionAffinity>,
+    pool_sticky_session_token: Option<&str>,
     now_unix_secs: u64,
 ) -> Result<CandidateRuntimeSelectionSnapshot, GatewayError> {
     let recent_candidates = state.read_recent_request_candidates(128).await?;
@@ -86,6 +89,13 @@ pub(super) async fn read_candidate_runtime_selection_snapshot(
     let provider_session_risk_control =
         read_provider_session_risk_control_block_map(state, &providers, client_session_affinity)
             .await?;
+    let provider_pool_sticky_collateral_blocks = read_provider_pool_sticky_collateral_block_map(
+        state,
+        &providers,
+        client_session_affinity,
+        pool_sticky_session_token,
+    )
+    .await?;
     let provider_key_rpm_reset_ats =
         read_provider_key_rpm_reset_at_map(state, candidates, now_unix_secs);
 
@@ -96,6 +106,7 @@ pub(super) async fn read_candidate_runtime_selection_snapshot(
         pool_provider_ids,
         session_risk_control_blocked: provider_session_risk_control.session_blocked,
         provider_session_risk_control_blocks: provider_session_risk_control.provider_blocks,
+        provider_pool_sticky_collateral_blocks,
         provider_quota_blocks_requests,
         key_account_quota_exhausted,
         key_oauth_invalid,
@@ -139,6 +150,14 @@ pub(super) fn is_candidate_selectable(
     }
     if snapshot
         .provider_session_risk_control_blocks
+        .get(candidate.provider_id.as_str())
+        .copied()
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    if snapshot
+        .provider_pool_sticky_collateral_blocks
         .get(candidate.provider_id.as_str())
         .copied()
         .unwrap_or(false)
@@ -207,6 +226,14 @@ pub(super) fn current_candidate_runtime_skip_reason(
         .unwrap_or(false)
     {
         return Some("provider_session_risk_control_avoidance");
+    }
+    if snapshot
+        .provider_pool_sticky_collateral_blocks
+        .get(candidate.provider_id.as_str())
+        .copied()
+        .unwrap_or(false)
+    {
+        return Some("pool_sticky_collateral_avoidance");
     }
     let rpm_reset_at = (!pool_group)
         .then(|| {
@@ -367,10 +394,13 @@ async fn read_provider_session_risk_control_block_map(
     let Some(session_key) = session_key else {
         return Ok(ProviderSessionRiskControlSnapshot::default());
     };
+    let session_runtime_blocked = providers.iter().any(|provider| {
+        provider_session_risk_control_avoidance_mode(provider.config.as_ref()).blocks_session()
+    }) && state
+        .session_has_runtime_risk_control_block(session_key)
+        .await?;
     let mut snapshot = ProviderSessionRiskControlSnapshot {
-        session_blocked: state
-            .session_has_runtime_risk_control_block(session_key)
-            .await?,
+        session_blocked: session_runtime_blocked,
         provider_blocks: BTreeMap::new(),
     };
     for provider in providers {
@@ -416,6 +446,40 @@ async fn provider_session_has_risk_control_history(
     Ok(candidates
         .iter()
         .any(request_candidate_matches_risk_control))
+}
+
+async fn read_provider_pool_sticky_collateral_block_map(
+    state: &(impl SchedulerRuntimeState + ?Sized),
+    providers: &[StoredProviderCatalogProvider],
+    client_session_affinity: Option<&ClientSessionAffinity>,
+    pool_sticky_session_token: Option<&str>,
+) -> Result<BTreeMap<String, bool>, GatewayError> {
+    let sticky_session_token = pool_sticky_session_token
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            client_session_affinity
+                .and_then(|affinity| affinity.session_key.as_deref())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        });
+    let Some(sticky_session_token) = sticky_session_token else {
+        return Ok(BTreeMap::new());
+    };
+    let mut provider_blocks = BTreeMap::new();
+    for provider in providers {
+        if !provider_pool_sticky_collateral_avoidance_enabled(provider.config.as_ref()) {
+            continue;
+        }
+        let blocked = state
+            .provider_session_has_runtime_pool_sticky_collateral_block_if_enabled(
+                provider.id.as_str(),
+                sticky_session_token,
+            )
+            .await?;
+        provider_blocks.insert(provider.id.clone(), blocked);
+    }
+    Ok(provider_blocks)
 }
 
 fn request_candidate_matches_risk_control(candidate: &StoredRequestCandidate) -> bool {

@@ -396,6 +396,11 @@ describe('formatModelTestDiagnostic', () => {
     expect(formatModelTestDiagnostic('pool_account_blocked')).toBe('账号已失效，需重新授权')
   })
 
+  it('maps pool sticky collateral avoidance skip code to an actionable label', () => {
+    expect(formatModelTestDiagnostic('pool_sticky_collateral_avoidance'))
+      .toBe('该会话的 sticky 账号已失效，已跳过当前号池')
+  })
+
   it('keeps unknown diagnostics unchanged', () => {
     expect(formatModelTestDiagnostic('provider auth is unavailable')).toBe('provider auth is unavailable')
   })

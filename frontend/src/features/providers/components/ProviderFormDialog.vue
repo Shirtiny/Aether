@@ -281,11 +281,27 @@
           />
         </div>
 
+        <div
+          v-if="form.pool_mode_enabled"
+          class="flex items-center justify-between p-3 border rounded-lg bg-muted/50"
+        >
+          <div class="space-y-0.5">
+            <span class="text-sm font-medium">号池连坐避险</span>
+            <p class="text-xs text-muted-foreground leading-relaxed">
+              sticky 账号失效后跳过当前号池
+            </p>
+          </div>
+          <Switch
+            :model-value="form.pool_sticky_collateral_avoidance_enabled"
+            @update:model-value="(v: boolean) => form.pool_sticky_collateral_avoidance_enabled = v"
+          />
+        </div>
+
         <div class="flex items-center justify-between gap-4 p-3 border rounded-lg bg-muted/50">
           <div class="space-y-0.5">
             <span class="text-sm font-medium">风控会话避险</span>
             <p class="text-xs text-muted-foreground leading-relaxed">
-              候选会跳过当前提供商；阻止会拒绝该会话后续调度
+              忽略保持默认行为；候选会跳过当前提供商；阻止会拒绝该会话后续调度
             </p>
           </div>
           <Select v-model="form.risk_control_session_avoidance_mode">
@@ -293,6 +309,9 @@
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
+              <SelectItem value="ignore">
+                忽略
+              </SelectItem>
               <SelectItem value="candidate">
                 候选
               </SelectItem>
@@ -429,7 +448,8 @@ const form = ref({
   request_timeout: undefined as number | undefined,
   // 号池模式
   pool_mode_enabled: false,
-  risk_control_session_avoidance_mode: 'candidate' as RiskControlSessionAvoidanceMode,
+  pool_sticky_collateral_avoidance_enabled: false,
+  risk_control_session_avoidance_mode: 'ignore' as RiskControlSessionAvoidanceMode,
   // Kiro 专属配置
   kiro_simulated_cache_enabled: false,
 })
@@ -458,7 +478,8 @@ function resetForm() {
     request_timeout: undefined,
     // 号池模式
     pool_mode_enabled: false,
-    risk_control_session_avoidance_mode: 'candidate',
+    pool_sticky_collateral_avoidance_enabled: false,
+    risk_control_session_avoidance_mode: 'ignore',
     // Kiro 专属配置
     kiro_simulated_cache_enabled: false,
   }
@@ -491,7 +512,8 @@ function loadProviderData() {
     request_timeout: props.provider.request_timeout ?? undefined,
     // 号池模式
     pool_mode_enabled: poolAdvanced !== null,
-    risk_control_session_avoidance_mode: props.provider.risk_control_session_avoidance?.mode ?? 'candidate',
+    pool_sticky_collateral_avoidance_enabled: poolAdvanced?.sticky_collateral_avoidance_enabled ?? false,
+    risk_control_session_avoidance_mode: props.provider.risk_control_session_avoidance?.mode ?? 'ignore',
     // Kiro 专属配置
     kiro_simulated_cache_enabled: props.provider.kiro_simulated_cache_enabled ?? false,
   }
@@ -544,6 +566,12 @@ const handleSubmit = async () => {
   loading.value = true
   try {
     const currentPoolAdvanced = normalizePoolAdvancedConfig(props.provider?.pool_advanced)
+    const nextPoolAdvanced = form.value.pool_mode_enabled
+      ? {
+          ...(currentPoolAdvanced ?? {}),
+          sticky_collateral_avoidance_enabled: form.value.pool_sticky_collateral_avoidance_enabled,
+        }
+      : null
     const providerConfig = {
       risk_control_session_avoidance: {
         mode: form.value.risk_control_session_avoidance_mode,
@@ -573,9 +601,7 @@ const handleSubmit = async () => {
       // 超时配置（null 表示清除，使用全局配置）
       stream_first_byte_timeout: form.value.stream_first_byte_timeout ?? null,
       request_timeout: form.value.request_timeout ?? null,
-      pool_advanced: form.value.pool_mode_enabled
-        ? (currentPoolAdvanced ?? {})
-        : null,
+      pool_advanced: nextPoolAdvanced,
       config: providerConfig,
     }
 

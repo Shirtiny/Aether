@@ -86,6 +86,7 @@ pub(super) async fn select_minimal_candidate(
         required_capabilities,
         auth_snapshot,
         client_session_affinity,
+        None,
         now_unix_secs,
         ordering_config,
         priority_affinity_key,
@@ -116,6 +117,7 @@ pub(super) async fn collect_selectable_candidates(
     required_capabilities: Option<&serde_json::Value>,
     auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
     client_session_affinity: Option<&ClientSessionAffinity>,
+    pool_sticky_session_token: Option<&str>,
     now_unix_secs: u64,
     enable_model_directives: bool,
 ) -> Result<Vec<SchedulerMinimalCandidateSelectionCandidate>, GatewayError> {
@@ -128,6 +130,7 @@ pub(super) async fn collect_selectable_candidates(
         required_capabilities,
         auth_snapshot,
         client_session_affinity,
+        pool_sticky_session_token,
         now_unix_secs,
         enable_model_directives,
     )
@@ -144,6 +147,7 @@ pub(super) async fn collect_selectable_candidates_with_skip_reasons(
     required_capabilities: Option<&serde_json::Value>,
     auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
     client_session_affinity: Option<&ClientSessionAffinity>,
+    pool_sticky_session_token: Option<&str>,
     now_unix_secs: u64,
     enable_model_directives: bool,
 ) -> Result<
@@ -174,6 +178,7 @@ pub(super) async fn collect_selectable_candidates_with_skip_reasons(
         required_capabilities,
         auth_snapshot,
         client_session_affinity,
+        pool_sticky_session_token,
         now_unix_secs,
         ordering_config,
         priority_affinity_key,
@@ -190,6 +195,7 @@ pub(super) async fn collect_selectable_enumerated_candidates_with_skip_reasons(
     required_capabilities: Option<&serde_json::Value>,
     auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
     client_session_affinity: Option<&ClientSessionAffinity>,
+    pool_sticky_session_token: Option<&str>,
     now_unix_secs: u64,
     ordering_config: crate::scheduler::config::SchedulerOrderingConfig,
     priority_affinity_key: Option<&str>,
@@ -204,6 +210,7 @@ pub(super) async fn collect_selectable_enumerated_candidates_with_skip_reasons(
         runtime_state,
         &candidates,
         client_session_affinity,
+        pool_sticky_session_token,
         now_unix_secs,
     )
     .await?;

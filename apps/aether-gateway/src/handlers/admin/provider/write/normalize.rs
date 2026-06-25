@@ -178,38 +178,39 @@ pub(crate) fn normalize_risk_control_session_avoidance_config(
                 );
             }
 
-            let mode = if let Some(mode) = mode {
-                let mode = mode
-                    .as_str()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(str::to_ascii_lowercase)
-                    .ok_or_else(|| {
-                        "risk_control_session_avoidance.mode 必须是 candidate 或 block".to_string()
-                    })?;
-                match mode.as_str() {
-                    "candidate" | "block" => mode,
-                    _ => {
-                        return Err(
-                            "risk_control_session_avoidance.mode 必须是 candidate 或 block"
+            let mode =
+                if let Some(mode) = mode {
+                    let mode = mode
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_ascii_lowercase)
+                        .ok_or_else(|| {
+                            "risk_control_session_avoidance.mode 必须是 ignore、candidate 或 block"
+                                .to_string()
+                        })?;
+                    match mode.as_str() {
+                        "ignore" | "candidate" | "block" => mode,
+                        _ => return Err(
+                            "risk_control_session_avoidance.mode 必须是 ignore、candidate 或 block"
                                 .to_string(),
-                        )
+                        ),
                     }
-                }
-            } else {
-                let Some(enabled) = enabled else {
-                    return Err(
-                        "risk_control_session_avoidance.mode 必须是 candidate 或 block".to_string(),
-                    );
-                };
-                if enabled.as_bool().ok_or_else(|| {
-                    "risk_control_session_avoidance.enabled 必须是布尔值".to_string()
-                })? {
-                    "candidate".to_string()
                 } else {
-                    return Ok(None);
-                }
-            };
+                    let Some(enabled) = enabled else {
+                        return Err(
+                            "risk_control_session_avoidance.mode 必须是 ignore、candidate 或 block"
+                                .to_string(),
+                        );
+                    };
+                    if enabled.as_bool().ok_or_else(|| {
+                        "risk_control_session_avoidance.enabled 必须是布尔值".to_string()
+                    })? {
+                        "candidate".to_string()
+                    } else {
+                        return Ok(None);
+                    }
+                };
 
             let mut normalized =
                 serde_json::Map::from_iter([("mode".to_string(), serde_json::Value::String(mode))]);
@@ -339,6 +340,13 @@ mod tests {
             })))
             .expect("risk control avoidance should normalize"),
             Some(json!({ "mode": "block", "ttl_seconds": 60 }))
+        );
+        assert_eq!(
+            normalize_risk_control_session_avoidance_config(Some(json!({
+                "mode": "ignore"
+            })))
+            .expect("risk control avoidance should normalize"),
+            Some(json!({ "mode": "ignore" }))
         );
         assert_eq!(
             normalize_risk_control_session_avoidance_config(Some(json!({

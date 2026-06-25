@@ -141,6 +141,7 @@ export type PoolHealthToggleKey =
   | 'account_self_check_enabled'
   | 'auto_remove_banned_keys'
   | 'skip_exhausted_accounts'
+  | 'sticky_collateral_avoidance_enabled'
   | 'codex_quota_weekly_basis'
 
 export interface PoolHealthToggleCard {
@@ -189,6 +190,11 @@ export function buildPoolHealthToggleCards(): PoolHealthToggleCard[] {
       key: 'skip_exhausted_accounts',
       label: '跳过额度耗尽账号',
       description: '当 Codex / Kiro 账号额度已耗尽时，直接标记为不可调度并在请求侧跳过。',
+    },
+    {
+      key: 'sticky_collateral_avoidance_enabled',
+      label: '连坐避险',
+      description: 'sticky 账号失效后跳过当前号池，避免同会话切到池内其他账号。',
     },
     {
       key: 'codex_quota_weekly_basis',

@@ -855,6 +855,7 @@ where
         auth_snapshot,
         routing_policy,
         client_session_affinity,
+        sticky_session_token,
         use_api_format_alias_match,
         key_mode,
     )

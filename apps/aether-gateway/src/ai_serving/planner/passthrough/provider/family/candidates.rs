@@ -124,6 +124,7 @@ pub(crate) async fn materialize_local_same_format_provider_candidate_attempts(
             input.required_capabilities.as_ref(),
             Some(&input.auth_snapshot),
             input.client_session_affinity.as_ref(),
+            sticky_session_token.as_deref(),
             current_unix_secs(),
         )
         .await?;
@@ -222,6 +223,7 @@ pub(crate) async fn build_local_same_format_provider_candidate_attempt_source<'a
             input.required_capabilities.as_ref(),
             Some(&input.auth_snapshot),
             input.client_session_affinity.as_ref(),
+            sticky_session_token.as_deref(),
             current_unix_secs(),
         )
         .await?;

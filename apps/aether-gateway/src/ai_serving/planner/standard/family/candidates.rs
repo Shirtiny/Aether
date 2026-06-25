@@ -127,6 +127,7 @@ pub(super) async fn materialize_local_standard_candidate_attempts(
         &input.auth_snapshot,
         input.routing_policy.as_ref(),
         input.client_session_affinity.as_ref(),
+        sticky_session_token.as_deref(),
         false,
         LocalCandidatePreselectionKeyMode::ProviderEndpointKeyModelAndApiFormat,
     )
@@ -338,6 +339,8 @@ async fn maybe_append_gemini_image_openai_image_preselection(
         return Ok((candidates, skipped_candidates));
     }
 
+    let sticky_session_token =
+        pool_sticky_session_token_for_request(body_json, input.client_session_affinity.as_ref());
     let image_preselection = preselect_local_execution_candidates_for_api_formats_with_serving(
         planner_state,
         spec_metadata.api_format,
@@ -347,6 +350,7 @@ async fn maybe_append_gemini_image_openai_image_preselection(
         &input.auth_snapshot,
         input.routing_policy.as_ref(),
         input.client_session_affinity.as_ref(),
+        sticky_session_token.as_deref(),
         false,
         LocalCandidatePreselectionKeyMode::ProviderEndpointKeyModelAndApiFormat,
         vec!["openai:image".to_string()],
