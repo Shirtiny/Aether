@@ -37,6 +37,7 @@ pub struct SchedulerRequestCandidateReportContext {
     pub promoted_by: Option<String>,
     pub demoted_by: Option<String>,
     pub routing_trace: Option<Value>,
+    pub client_session_affinity: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -85,6 +86,7 @@ struct ReportCandidateExtraDataInput {
     promoted_by: Option<String>,
     demoted_by: Option<String>,
     routing_trace: Option<Value>,
+    client_session_affinity: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -186,6 +188,10 @@ pub fn parse_request_candidate_report_context(
             .get("routing_trace")
             .cloned()
             .filter(|value| !value.is_null()),
+        client_session_affinity: report_context
+            .get("client_session_affinity")
+            .cloned()
+            .filter(|value| !value.is_null()),
     })
 }
 
@@ -228,6 +234,7 @@ pub fn resolve_report_request_candidate_slot(
         promoted_by,
         demoted_by,
         routing_trace,
+        client_session_affinity,
     } = metadata;
     let request_id = request_id?;
     let synthesized_extra_data = build_report_candidate_extra_data(ReportCandidateExtraDataInput {
@@ -253,6 +260,7 @@ pub fn resolve_report_request_candidate_slot(
         promoted_by,
         demoted_by,
         routing_trace,
+        client_session_affinity,
     });
     let created_at_unix_ms = matched_candidate
         .as_ref()
@@ -377,6 +385,7 @@ pub fn build_execution_request_candidate_seed(
             promoted_by: metadata.promoted_by,
             demoted_by: metadata.demoted_by,
             routing_trace: metadata.routing_trace,
+            client_session_affinity: metadata.client_session_affinity,
         })
     });
     append_seed_extra_data_from_report_context(&mut extra_data, &context);
@@ -543,6 +552,8 @@ fn build_local_request_candidate_extra_data(
         promoted_by: metadata.and_then(|metadata| metadata.promoted_by.clone()),
         demoted_by: metadata.and_then(|metadata| metadata.demoted_by.clone()),
         routing_trace: metadata.and_then(|metadata| metadata.routing_trace.clone()),
+        client_session_affinity: metadata
+            .and_then(|metadata| metadata.client_session_affinity.clone()),
     })
 }
 
@@ -761,6 +772,7 @@ fn build_report_candidate_extra_data(input: ReportCandidateExtraDataInput) -> Op
         promoted_by,
         demoted_by,
         routing_trace,
+        client_session_affinity,
     } = input;
     let mut extra_data = Map::with_capacity(8);
     extra_data.insert("gateway_execution_runtime".to_string(), Value::Bool(true));
@@ -858,6 +870,12 @@ fn build_report_candidate_extra_data(input: ReportCandidateExtraDataInput) -> Op
     }
     if let Some(routing_trace) = routing_trace {
         extra_data.insert("routing_trace".to_string(), routing_trace);
+    }
+    if let Some(client_session_affinity) = client_session_affinity {
+        extra_data.insert(
+            "client_session_affinity".to_string(),
+            client_session_affinity,
+        );
     }
     (!extra_data.is_empty()).then_some(Value::Object(extra_data))
 }

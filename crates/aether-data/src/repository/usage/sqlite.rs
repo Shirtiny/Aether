@@ -439,6 +439,12 @@ fn push_sqlite_usage_list_filters(
         push_sqlite_usage_where(builder, has_where);
         builder.push("user_id = ").push_bind(user_id.to_string());
     }
+    if let Some(provider_id) = query.provider_id.as_deref() {
+        push_sqlite_usage_where(builder, has_where);
+        builder
+            .push("provider_id = ")
+            .push_bind(provider_id.to_string());
+    }
     if let Some(provider_name) = query.provider_name.as_deref() {
         push_sqlite_usage_where(builder, has_where);
         builder
@@ -471,18 +477,32 @@ fn push_sqlite_usage_list_filters(
     }
     if let Some(session_id) = query.session_id.as_deref().map(str::trim) {
         if !session_id.is_empty() {
-            let pattern = format!("%{}%", session_id.to_ascii_lowercase());
+            let pattern = if query.session_id_exact {
+                session_id.to_ascii_lowercase()
+            } else {
+                format!("%{}%", session_id.to_ascii_lowercase())
+            };
+            let operator = if query.session_id_exact {
+                " = "
+            } else {
+                " LIKE "
+            };
             push_sqlite_usage_where(builder, has_where);
             builder.push("(");
             builder
-                .push("LOWER(COALESCE(json_extract(request_metadata, '$.client_session_affinity.session_key'), '')) LIKE ")
+                .push("LOWER(COALESCE(json_extract(request_metadata, '$.client_session_affinity.session_key'), ''))")
+                .push(operator)
                 .push_bind(pattern.clone());
             builder.push(" OR ");
             builder
-                .push("LOWER(COALESCE(json_extract(request_metadata, '$.session_id'), '')) LIKE ")
+                .push("LOWER(COALESCE(json_extract(request_metadata, '$.session_id'), ''))")
+                .push(operator)
                 .push_bind(pattern.clone());
             builder
-                .push(" OR LOWER(COALESCE(json_extract(request_metadata, '$.conversation_id'), '')) LIKE ")
+                .push(
+                    " OR LOWER(COALESCE(json_extract(request_metadata, '$.conversation_id'), ''))",
+                )
+                .push(operator)
                 .push_bind(pattern);
             builder.push(")");
         }
@@ -533,11 +553,13 @@ fn push_sqlite_usage_keyword_filters(
             created_from_unix_secs: query.created_from_unix_secs,
             created_until_unix_secs: query.created_until_unix_secs,
             user_id: query.user_id.clone(),
+            provider_id: query.provider_id.clone(),
             provider_name: query.provider_name.clone(),
             model: query.model.clone(),
             api_format: query.api_format.clone(),
             cafecode: query.cafecode.clone(),
             session_id: query.session_id.clone(),
+            session_id_exact: query.session_id_exact,
             statuses: query.statuses.clone(),
             is_stream: query.is_stream,
             error_only: query.error_only,

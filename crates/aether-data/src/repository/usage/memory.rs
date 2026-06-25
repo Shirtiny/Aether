@@ -243,6 +243,11 @@ fn usage_matches_list_query(item: &StoredRequestUsageAudit, query: &UsageAuditLi
             return false;
         }
     }
+    if let Some(provider_id) = query.provider_id.as_deref() {
+        if item.provider_id.as_deref() != Some(provider_id) {
+            return false;
+        }
+    }
     if let Some(provider_name) = query.provider_name.as_deref() {
         if item.provider_name != provider_name {
             return false;
@@ -267,7 +272,9 @@ fn usage_matches_list_query(item: &StoredRequestUsageAudit, query: &UsageAuditLi
         }
     }
     if let Some(session_id) = query.session_id.as_deref().map(str::trim) {
-        if !session_id.is_empty() && !usage_session_id_matches(item, session_id) {
+        if !session_id.is_empty()
+            && !usage_session_id_matches(item, session_id, query.session_id_exact)
+        {
             return false;
         }
     }
@@ -318,11 +325,7 @@ fn usage_metadata_bool(item: &StoredRequestUsageAudit, key: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn usage_metadata_string_contains(
-    item: &StoredRequestUsageAudit,
-    key: &str,
-    needle: &str,
-) -> bool {
+fn usage_metadata_string_contains(item: &StoredRequestUsageAudit, key: &str, needle: &str) -> bool {
     let needle = needle.to_ascii_lowercase();
     item.request_metadata
         .as_ref()
@@ -333,12 +336,13 @@ fn usage_metadata_string_contains(
         .is_some_and(|value| value.to_ascii_lowercase().contains(&needle))
 }
 
-fn usage_metadata_nested_string_contains(
+fn usage_metadata_nested_string_matches(
     item: &StoredRequestUsageAudit,
     path: &[&str],
     needle: &str,
+    exact: bool,
 ) -> bool {
-    let needle = needle.to_ascii_lowercase();
+    let needle = needle.trim().to_ascii_lowercase();
     let Some(mut current) = item.request_metadata.as_ref() else {
         return false;
     };
@@ -352,16 +356,44 @@ fn usage_metadata_nested_string_contains(
         .as_str()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .is_some_and(|value| value.to_ascii_lowercase().contains(&needle))
+        .is_some_and(|value| {
+            let value = value.to_ascii_lowercase();
+            if exact {
+                value == needle
+            } else {
+                value.contains(&needle)
+            }
+        })
 }
 
-fn usage_session_id_matches(item: &StoredRequestUsageAudit, needle: &str) -> bool {
-    usage_metadata_nested_string_contains(
+fn usage_metadata_string_matches(
+    item: &StoredRequestUsageAudit,
+    key: &str,
+    needle: &str,
+    exact: bool,
+) -> bool {
+    if exact {
+        let needle = needle.trim().to_ascii_lowercase();
+        return item
+            .request_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get(key))
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_some_and(|value| value.to_ascii_lowercase() == needle);
+    }
+    usage_metadata_string_contains(item, key, needle)
+}
+
+fn usage_session_id_matches(item: &StoredRequestUsageAudit, needle: &str, exact: bool) -> bool {
+    usage_metadata_nested_string_matches(
         item,
         &["client_session_affinity", "session_key"],
         needle,
-    ) || usage_metadata_string_contains(item, "session_id", needle)
-        || usage_metadata_string_contains(item, "conversation_id", needle)
+        exact,
+    ) || usage_metadata_string_matches(item, "session_id", needle, exact)
+        || usage_metadata_string_matches(item, "conversation_id", needle, exact)
 }
 
 fn usage_matches_keyword_search_query(
@@ -380,6 +412,11 @@ fn usage_matches_keyword_search_query(
     }
     if let Some(user_id) = query.user_id.as_deref() {
         if item.user_id.as_deref() != Some(user_id) {
+            return false;
+        }
+    }
+    if let Some(provider_id) = query.provider_id.as_deref() {
+        if item.provider_id.as_deref() != Some(provider_id) {
             return false;
         }
     }
@@ -407,7 +444,9 @@ fn usage_matches_keyword_search_query(
         }
     }
     if let Some(session_id) = query.session_id.as_deref().map(str::trim) {
-        if !session_id.is_empty() && !usage_session_id_matches(item, session_id) {
+        if !session_id.is_empty()
+            && !usage_session_id_matches(item, session_id, query.session_id_exact)
+        {
             return false;
         }
     }

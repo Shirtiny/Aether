@@ -40,6 +40,17 @@ impl AppState {
             .map_err(|err| GatewayError::Internal(err.to_string()))
     }
 
+    pub(crate) async fn read_request_candidates_by_provider_id_and_client_session_key(
+        &self,
+        provider_id: &str,
+        session_key: &str,
+    ) -> Result<Vec<candidates::StoredRequestCandidate>, GatewayError> {
+        self.data
+            .list_request_candidates_by_provider_id_and_client_session_key(provider_id, session_key)
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))
+    }
+
     pub(crate) async fn summarize_provider_usage_since(
         &self,
         provider_id: &str,
@@ -77,6 +88,18 @@ impl AppState {
     ) -> Result<Vec<usage::StoredRequestUsageAudit>, GatewayError> {
         self.data
             .list_usage_audits(query)
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))
+    }
+
+    pub(crate) async fn provider_session_has_risk_control_usage(
+        &self,
+        provider_id: &str,
+        session_key: &str,
+        since_unix_secs: Option<u64>,
+    ) -> Result<bool, GatewayError> {
+        self.data
+            .provider_session_has_risk_control_usage(provider_id, session_key, since_unix_secs)
             .await
             .map_err(|err| GatewayError::Internal(err.to_string()))
     }

@@ -28,7 +28,7 @@ fn metadata_u64(metadata: Option<&serde_json::Value>, key: &str) -> Option<u64> 
         })
 }
 
-fn usage_json_text_matches_risk_control(value: &Value) -> bool {
+pub fn usage_json_text_matches_risk_control(value: &Value) -> bool {
     let text = match value {
         Value::String(text) => text.to_ascii_lowercase(),
         _ => value.to_string().to_ascii_lowercase(),
@@ -39,7 +39,7 @@ fn usage_json_text_matches_risk_control(value: &Value) -> bool {
         || text.contains("chatgpt.com/cyber")
 }
 
-fn usage_text_matches_risk_control(value: Option<&str>) -> bool {
+pub fn usage_text_matches_risk_control(value: Option<&str>) -> bool {
     value.is_some_and(|value| {
         let normalized = value.to_ascii_lowercase();
         normalized.contains("possible cybersecurity risk")

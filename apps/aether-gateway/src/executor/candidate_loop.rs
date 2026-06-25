@@ -1,13 +1,19 @@
 use aether_ai_serving::{
     run_ai_attempt_loop, AiAttemptLoopOutcome, AiAttemptLoopPort, AiExecutionAttempt,
 };
-use aether_data_contracts::repository::candidates::RequestCandidateStatus;
+use aether_contracts::ExecutionPlan;
+use aether_data_contracts::repository::candidates::{
+    RequestCandidateStatus, StoredRequestCandidate,
+};
 use aether_scheduler_core::{
     parse_request_candidate_report_context, SchedulerRequestCandidateStatusUpdate,
 };
+use aether_usage_runtime::{usage_json_text_matches_risk_control, usage_text_matches_risk_control};
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::Response;
+use std::collections::BTreeSet;
+use std::sync::Arc;
 use tokio::time::{timeout, Duration};
 use tracing::{debug, warn, Instrument};
 
@@ -26,8 +32,10 @@ use crate::orchestration::{
 };
 use crate::privacy::RedactionExecutionCandidateId;
 use crate::request_candidate_runtime::{
-    record_local_request_candidate_status, RequestCandidateRuntimeWriter,
+    record_local_request_candidate_status, record_skipped_local_request_candidate,
+    RequestCandidateRuntimeWriter,
 };
+use crate::scheduler::candidate::provider_session_risk_control_avoidance_enabled;
 use crate::{AppState, GatewayError};
 
 const DEFAULT_STREAM_FIRST_BYTE_WATCHDOG_TIMEOUT_MS: u64 = 30_000;
@@ -41,6 +49,109 @@ fn attach_redaction_execution_candidate(response: &mut Response<Body>, candidate
             .extensions_mut()
             .insert(RedactionExecutionCandidateId::new(candidate_id));
     }
+}
+
+fn new_provider_session_risk_control_blocks() -> Arc<tokio::sync::Mutex<BTreeSet<String>>> {
+    Arc::new(tokio::sync::Mutex::new(BTreeSet::new()))
+}
+
+async fn provider_risk_control_session_avoidance_enabled(
+    state: &AppState,
+    provider_id: &str,
+) -> bool {
+    let provider_ids = [provider_id.to_string()];
+    state
+        .read_provider_catalog_providers_by_ids(&provider_ids)
+        .await
+        .ok()
+        .and_then(|providers| {
+            providers
+                .into_iter()
+                .find(|provider| provider.id == provider_id)
+        })
+        .is_some_and(|provider| {
+            provider_session_risk_control_avoidance_enabled(provider.config.as_ref())
+        })
+}
+
+fn value_matches_risk_control(value: Option<&serde_json::Value>) -> bool {
+    value.is_some_and(usage_json_text_matches_risk_control)
+}
+
+fn candidate_matches_risk_control(candidate: &StoredRequestCandidate) -> bool {
+    usage_text_matches_risk_control(candidate.error_message.as_deref())
+        || value_matches_risk_control(
+            candidate
+                .extra_data
+                .as_ref()
+                .and_then(|value| value.get("upstream_response"))
+                .and_then(|value| value.get("body")),
+        )
+        || value_matches_risk_control(
+            candidate
+                .extra_data
+                .as_ref()
+                .and_then(|value| value.get("error_flow")),
+        )
+}
+
+async fn read_request_candidate(
+    state: &AppState,
+    request_id: &str,
+    candidate_id: &str,
+) -> Option<StoredRequestCandidate> {
+    state
+        .read_request_candidates_by_request_id(request_id)
+        .await
+        .ok()?
+        .into_iter()
+        .find(|candidate| candidate.id == candidate_id)
+}
+
+async fn record_provider_session_risk_control_block_if_needed(
+    state: &AppState,
+    blocks: &Arc<tokio::sync::Mutex<BTreeSet<String>>>,
+    plan: &ExecutionPlan,
+) {
+    let Some(candidate_id) = plan
+        .candidate_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+    let Some(candidate) = read_request_candidate(state, &plan.request_id, candidate_id).await
+    else {
+        return;
+    };
+    if !candidate_matches_risk_control(&candidate) {
+        return;
+    }
+    if !provider_risk_control_session_avoidance_enabled(state, &plan.provider_id).await {
+        return;
+    }
+    blocks.lock().await.insert(plan.provider_id.clone());
+}
+
+async fn provider_session_risk_control_blocked(
+    state: &AppState,
+    blocks: &Arc<tokio::sync::Mutex<BTreeSet<String>>>,
+    plan: &ExecutionPlan,
+    report_context: Option<&serde_json::Value>,
+) -> bool {
+    if !blocks.lock().await.contains(&plan.provider_id) {
+        return false;
+    }
+    record_skipped_local_request_candidate(
+        state,
+        plan,
+        report_context,
+        "provider_session_risk_control_avoidance",
+        current_unix_ms(),
+    )
+    .await;
+    true
 }
 
 pub(crate) async fn execute_sync_plan_and_reports<T>(
@@ -84,6 +195,7 @@ where
             trace_id,
             decision,
             plan_kind,
+            provider_session_risk_control_blocks: new_provider_session_risk_control_blocks(),
         };
         match run_ai_attempt_loop(&port, plan_and_reports).await? {
             AiAttemptLoopOutcome::Responded(response) => {
@@ -128,6 +240,7 @@ where
             trace_id,
             decision,
             plan_kind,
+            provider_session_risk_control_blocks: new_provider_session_risk_control_blocks(),
         };
         run_dynamic_attempt_loop(
             &port,
@@ -150,6 +263,7 @@ struct SyncAttemptLoopPort<'a> {
     trace_id: &'a str,
     decision: &'a GatewayControlDecision,
     plan_kind: &'a str,
+    provider_session_risk_control_blocks: Arc<tokio::sync::Mutex<BTreeSet<String>>>,
 }
 
 #[async_trait]
@@ -170,6 +284,37 @@ where
         let mut sticky_init_cleanup = PoolAttemptStartCleanupGuard::new(self.state, context);
         let should_execute = prepare_pool_attempt_started_effect(self.state, context).await;
         if !should_execute {
+            return Ok(None);
+        }
+        if provider_session_risk_control_blocked(
+            self.state,
+            &self.provider_session_risk_control_blocks,
+            attempt.execution_plan(),
+            report_context.as_ref(),
+        )
+        .await
+        {
+            apply_local_execution_effect(
+                self.state,
+                LocalExecutionEffectContext {
+                    plan: attempt.execution_plan(),
+                    report_context: report_context.as_ref(),
+                },
+                LocalExecutionEffect::PoolAttemptAborted,
+            )
+            .await;
+            warn!(
+                event_name = "local_sync_candidate_skipped_by_provider_session_risk_control",
+                log_type = "event",
+                trace_id = %self.trace_id,
+                plan_kind = self.plan_kind,
+                request_id = %short_request_id(attempt.execution_plan().request_id.as_str()),
+                candidate_id = ?attempt.execution_plan().candidate_id,
+                provider_id = %attempt.execution_plan().provider_id,
+                endpoint_id = %attempt.execution_plan().endpoint_id,
+                key_id = %attempt.execution_plan().key_id,
+                "gateway skipped local sync candidate after same request triggered provider session risk-control avoidance"
+            );
             return Ok(None);
         }
         let result = execute_execution_runtime_sync(
@@ -206,6 +351,12 @@ where
                     report_context: attempt.report_context().as_ref(),
                 },
                 LocalExecutionEffect::PoolAttemptAborted,
+            )
+            .await;
+            record_provider_session_risk_control_block_if_needed(
+                self.state,
+                &self.provider_session_risk_control_blocks,
+                attempt.execution_plan(),
             )
             .await;
         }
@@ -290,6 +441,7 @@ where
             trace_id,
             decision,
             plan_kind,
+            provider_session_risk_control_blocks: new_provider_session_risk_control_blocks(),
         };
         match run_ai_attempt_loop(&port, plan_and_reports).await? {
             AiAttemptLoopOutcome::Responded(response) => {
@@ -332,6 +484,7 @@ where
             trace_id,
             decision,
             plan_kind,
+            provider_session_risk_control_blocks: new_provider_session_risk_control_blocks(),
         };
         run_dynamic_attempt_loop(
             &port,
@@ -424,6 +577,7 @@ struct StreamAttemptLoopPort<'a> {
     trace_id: &'a str,
     decision: &'a GatewayControlDecision,
     plan_kind: &'a str,
+    provider_session_risk_control_blocks: Arc<tokio::sync::Mutex<BTreeSet<String>>>,
 }
 
 #[async_trait]
@@ -445,6 +599,37 @@ where
         let mut sticky_init_cleanup = PoolAttemptStartCleanupGuard::new(self.state, context);
         let should_execute = prepare_pool_attempt_started_effect(self.state, context).await;
         if !should_execute {
+            return Ok(None);
+        }
+        if provider_session_risk_control_blocked(
+            self.state,
+            &self.provider_session_risk_control_blocks,
+            &plan,
+            report_context.as_ref(),
+        )
+        .await
+        {
+            apply_local_execution_effect(
+                self.state,
+                LocalExecutionEffectContext {
+                    plan: &plan,
+                    report_context: report_context.as_ref(),
+                },
+                LocalExecutionEffect::PoolAttemptAborted,
+            )
+            .await;
+            warn!(
+                event_name = "local_stream_candidate_skipped_by_provider_session_risk_control",
+                log_type = "event",
+                trace_id = %self.trace_id,
+                plan_kind = self.plan_kind,
+                request_id = %short_request_id(plan.request_id.as_str()),
+                candidate_id = ?plan.candidate_id,
+                provider_id = %plan.provider_id,
+                endpoint_id = %plan.endpoint_id,
+                key_id = %plan.key_id,
+                "gateway skipped local stream candidate after same request triggered provider session risk-control avoidance"
+            );
             return Ok(None);
         }
         let candidate_index = parse_request_candidate_report_context(report_context.as_ref())
@@ -515,6 +700,12 @@ where
                     report_context: watchdog_report_context.as_ref(),
                 },
                 LocalExecutionEffect::PoolAttemptAborted,
+            )
+            .await;
+            record_provider_session_risk_control_block_if_needed(
+                self.state,
+                &self.provider_session_risk_control_blocks,
+                &watchdog_plan,
             )
             .await;
         }

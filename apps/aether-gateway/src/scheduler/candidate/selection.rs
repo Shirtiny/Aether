@@ -200,9 +200,13 @@ pub(super) async fn collect_selectable_enumerated_candidates_with_skip_reasons(
     ),
     GatewayError,
 > {
-    let runtime_snapshot =
-        read_candidate_runtime_selection_snapshot(runtime_state, &candidates, now_unix_secs)
-            .await?;
+    let runtime_snapshot = read_candidate_runtime_selection_snapshot(
+        runtime_state,
+        &candidates,
+        client_session_affinity,
+        now_unix_secs,
+    )
+    .await?;
     let affinity_cache_key = build_scheduler_affinity_cache_key(
         auth_snapshot,
         api_format,

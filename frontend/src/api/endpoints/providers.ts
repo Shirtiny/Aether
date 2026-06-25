@@ -12,6 +12,7 @@ import type {
 import {
   normalizeChatPiiRedactionProviderConfig as normalizeChatPiiRedactionProvider,
   normalizePoolAdvancedConfig as normalizePoolAdvanced,
+  normalizeRiskControlSessionAvoidanceProviderConfig as normalizeRiskControlSessionAvoidanceProvider,
 } from './types'
 
 interface ProviderRequestOptions {
@@ -48,6 +49,7 @@ function normalizeProviderSummary(
   return {
     ...provider,
     chat_pii_redaction: normalizeChatPiiRedactionProvider(provider.chat_pii_redaction),
+    risk_control_session_avoidance: normalizeRiskControlSessionAvoidanceProvider(provider.risk_control_session_avoidance),
     pool_advanced: normalizePoolAdvanced(provider.pool_advanced),
     kiro_simulated_cache_enabled: provider.kiro_simulated_cache_enabled ?? false,
   }

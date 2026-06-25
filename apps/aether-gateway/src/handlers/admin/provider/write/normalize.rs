@@ -159,6 +159,28 @@ pub(crate) fn normalize_chat_pii_redaction_config(
     }
 }
 
+pub(crate) fn normalize_risk_control_session_avoidance_config(
+    value: Option<serde_json::Value>,
+) -> Result<Option<serde_json::Value>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    match value {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::Object(mut map) => {
+            if map.len() != 1 || !map.contains_key("enabled") {
+                return Err("risk_control_session_avoidance 仅支持 enabled 布尔配置".to_string());
+            }
+            let enabled = map
+                .remove("enabled")
+                .and_then(|value| value.as_bool())
+                .ok_or_else(|| "risk_control_session_avoidance.enabled 必须是布尔值".to_string())?;
+            Ok(Some(serde_json::json!({ "enabled": enabled })))
+        }
+        _ => Err("risk_control_session_avoidance 必须是 JSON 对象".to_string()),
+    }
+}
+
 pub(crate) fn validate_vertex_api_formats(
     provider_type: &str,
     auth_type: &str,

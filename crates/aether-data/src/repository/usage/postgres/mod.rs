@@ -1269,24 +1269,33 @@ fn push_postgres_usage_session_id_filter(
     builder: &mut QueryBuilder<'_, Postgres>,
     has_where: &mut bool,
     session_id: &str,
+    exact: bool,
 ) {
     let session_id = session_id.trim();
     if session_id.is_empty() {
         return;
     }
-    let pattern = format!("%{}%", session_id.to_ascii_lowercase());
+    let pattern = if exact {
+        session_id.to_ascii_lowercase()
+    } else {
+        format!("%{}%", session_id.to_ascii_lowercase())
+    };
+    let operator = if exact { " = " } else { " LIKE " };
     builder.push(if *has_where { " AND " } else { " WHERE " });
     *has_where = true;
     builder.push("(");
     builder
-        .push("LOWER(COALESCE(\"usage\".request_metadata#>>'{client_session_affinity,session_key}', '')) LIKE ")
+        .push("LOWER(COALESCE(\"usage\".request_metadata#>>'{client_session_affinity,session_key}', ''))")
+        .push(operator)
         .push_bind(pattern.clone());
     builder.push(" OR ");
     builder
-        .push("LOWER(COALESCE(\"usage\".request_metadata->>'session_id', '')) LIKE ")
+        .push("LOWER(COALESCE(\"usage\".request_metadata->>'session_id', ''))")
+        .push(operator)
         .push_bind(pattern.clone());
     builder
-        .push(" OR LOWER(COALESCE(\"usage\".request_metadata->>'conversation_id', '')) LIKE ")
+        .push(" OR LOWER(COALESCE(\"usage\".request_metadata->>'conversation_id', ''))")
+        .push(operator)
         .push_bind(pattern);
     builder.push(")");
 }
@@ -2649,6 +2658,13 @@ ORDER BY request_count DESC, "usage".provider_name ASC
                 .push("\"usage\".user_id = ")
                 .push_bind(user_id.to_string());
         }
+        if let Some(provider_id) = query.provider_id.as_deref() {
+            builder.push(if has_where { " AND " } else { " WHERE " });
+            has_where = true;
+            builder
+                .push("\"usage\".provider_id = ")
+                .push_bind(provider_id.to_string());
+        }
         if let Some(provider_name) = query.provider_name.as_deref() {
             builder.push(if has_where { " AND " } else { " WHERE " });
             has_where = true;
@@ -2674,7 +2690,12 @@ ORDER BY request_count DESC, "usage".provider_name ASC
             push_postgres_usage_cafecode_filter(&mut builder, &mut has_where, cafecode);
         }
         if let Some(session_id) = query.session_id.as_deref() {
-            push_postgres_usage_session_id_filter(&mut builder, &mut has_where, session_id);
+            push_postgres_usage_session_id_filter(
+                &mut builder,
+                &mut has_where,
+                session_id,
+                query.session_id_exact,
+            );
         }
         if let Some(statuses) = query.statuses.as_deref() {
             if !statuses.is_empty() {
@@ -2759,6 +2780,13 @@ OR (\"usage\".error_message IS NOT NULL AND BTRIM(\"usage\".error_message) <> ''
                 .push("\"usage\".user_id = ")
                 .push_bind(user_id.to_string());
         }
+        if let Some(provider_id) = query.provider_id.as_deref() {
+            builder.push(if has_where { " AND " } else { " WHERE " });
+            has_where = true;
+            builder
+                .push("\"usage\".provider_id = ")
+                .push_bind(provider_id.to_string());
+        }
         if let Some(provider_name) = query.provider_name.as_deref() {
             builder.push(if has_where { " AND " } else { " WHERE " });
             has_where = true;
@@ -2784,7 +2812,12 @@ OR (\"usage\".error_message IS NOT NULL AND BTRIM(\"usage\".error_message) <> ''
             push_postgres_usage_cafecode_filter(&mut builder, &mut has_where, cafecode);
         }
         if let Some(session_id) = query.session_id.as_deref() {
-            push_postgres_usage_session_id_filter(&mut builder, &mut has_where, session_id);
+            push_postgres_usage_session_id_filter(
+                &mut builder,
+                &mut has_where,
+                session_id,
+                query.session_id_exact,
+            );
         }
         if let Some(statuses) = query.statuses.as_deref() {
             if !statuses.is_empty() {
@@ -2949,6 +2982,13 @@ OR (\"usage\".error_message IS NOT NULL AND BTRIM(\"usage\".error_message) <> ''
                 .push("\"usage\".user_id = ")
                 .push_bind(user_id.to_string());
         }
+        if let Some(provider_id) = query.provider_id.as_deref() {
+            builder.push(if has_where { " AND " } else { " WHERE " });
+            has_where = true;
+            builder
+                .push("\"usage\".provider_id = ")
+                .push_bind(provider_id.to_string());
+        }
         if let Some(provider_name) = query.provider_name.as_deref() {
             builder.push(if has_where { " AND " } else { " WHERE " });
             has_where = true;
@@ -2974,7 +3014,12 @@ OR (\"usage\".error_message IS NOT NULL AND BTRIM(\"usage\".error_message) <> ''
             push_postgres_usage_cafecode_filter(&mut builder, &mut has_where, cafecode);
         }
         if let Some(session_id) = query.session_id.as_deref() {
-            push_postgres_usage_session_id_filter(&mut builder, &mut has_where, session_id);
+            push_postgres_usage_session_id_filter(
+                &mut builder,
+                &mut has_where,
+                session_id,
+                query.session_id_exact,
+            );
         }
         if let Some(statuses) = query.statuses.as_deref() {
             if !statuses.is_empty() {
@@ -3048,6 +3093,13 @@ OR (\"usage\".error_message IS NOT NULL AND BTRIM(\"usage\".error_message) <> ''
                 .push("\"usage\".user_id = ")
                 .push_bind(user_id.to_string());
         }
+        if let Some(provider_id) = query.provider_id.as_deref() {
+            builder.push(if has_where { " AND " } else { " WHERE " });
+            has_where = true;
+            builder
+                .push("\"usage\".provider_id = ")
+                .push_bind(provider_id.to_string());
+        }
         if let Some(provider_name) = query.provider_name.as_deref() {
             builder.push(if has_where { " AND " } else { " WHERE " });
             has_where = true;
@@ -3073,7 +3125,12 @@ OR (\"usage\".error_message IS NOT NULL AND BTRIM(\"usage\".error_message) <> ''
             push_postgres_usage_cafecode_filter(&mut builder, &mut has_where, cafecode);
         }
         if let Some(session_id) = query.session_id.as_deref() {
-            push_postgres_usage_session_id_filter(&mut builder, &mut has_where, session_id);
+            push_postgres_usage_session_id_filter(
+                &mut builder,
+                &mut has_where,
+                session_id,
+                query.session_id_exact,
+            );
         }
         if let Some(statuses) = query.statuses.as_deref() {
             if !statuses.is_empty() {

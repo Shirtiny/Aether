@@ -5,6 +5,7 @@ use aether_data::repository::candidate_selection::InMemoryMinimalCandidateSelect
 use aether_data::repository::candidates::InMemoryRequestCandidateRepository;
 use aether_data::repository::provider_catalog::InMemoryProviderCatalogReadRepository;
 use aether_data::repository::quota::InMemoryProviderQuotaRepository;
+use aether_data::repository::usage::InMemoryUsageReadRepository;
 use aether_data_contracts::repository::candidate_selection::{
     StoredMinimalCandidateSelectionRow, StoredProviderModelMapping,
 };
@@ -13,7 +14,8 @@ use aether_data_contracts::repository::candidates::{
 };
 use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey;
 use aether_data_contracts::repository::quota::StoredProviderQuotaSnapshot;
-use aether_scheduler_core::SchedulerMinimalCandidateSelectionCandidate;
+use aether_data_contracts::repository::usage::StoredRequestUsageAudit;
+use aether_scheduler_core::{ClientSessionAffinity, SchedulerMinimalCandidateSelectionCandidate};
 use serde_json::json;
 
 use crate::cache::SchedulerAffinityTarget;
@@ -49,6 +51,29 @@ async fn select_candidate(
         None,
         auth_snapshot,
         None,
+        now_unix_secs,
+        false,
+    )
+    .await
+}
+
+async fn select_candidate_with_session_affinity(
+    selection_row_source: &(impl MinimalCandidateSelectionRowSource + Sync),
+    runtime_state: &AppState,
+    api_format: &str,
+    global_model_name: &str,
+    client_session_affinity: Option<&ClientSessionAffinity>,
+    now_unix_secs: u64,
+) -> Result<Option<SchedulerMinimalCandidateSelectionCandidate>, GatewayError> {
+    select_candidate_impl(
+        selection_row_source,
+        runtime_state,
+        api_format,
+        global_model_name,
+        false,
+        None,
+        None,
+        client_session_affinity,
         now_unix_secs,
         false,
     )
@@ -203,6 +228,283 @@ fn provider_key_concurrency_state(
                 request_candidates,
             ),
         )
+}
+
+fn provider_with_risk_control_session_avoidance(
+    id: &str,
+    enabled: bool,
+) -> aether_data_contracts::repository::provider_catalog::StoredProviderCatalogProvider {
+    let mut provider = sample_provider(id, None);
+    provider.config = Some(serde_json::json!({
+        "risk_control_session_avoidance": {
+            "enabled": enabled
+        }
+    }));
+    provider
+}
+
+fn sample_risk_control_usage(
+    provider_id: &str,
+    session_key: &str,
+    created_at_unix_secs: i64,
+) -> StoredRequestUsageAudit {
+    let mut usage = StoredRequestUsageAudit::new(
+        format!("usage-{provider_id}"),
+        format!("request-{provider_id}"),
+        Some("user-1".to_string()),
+        Some("api-key-1".to_string()),
+        Some("alice".to_string()),
+        Some("default".to_string()),
+        provider_id.to_string(),
+        "gpt-4.1".to_string(),
+        Some("gpt-4.1".to_string()),
+        Some(provider_id.to_string()),
+        Some(format!("endpoint-{provider_id}")),
+        Some(format!("key-{provider_id}")),
+        Some("chat".to_string()),
+        Some("openai:chat".to_string()),
+        Some("openai".to_string()),
+        Some("chat".to_string()),
+        Some("openai:chat".to_string()),
+        Some("openai".to_string()),
+        Some("chat".to_string()),
+        false,
+        false,
+        1,
+        0,
+        1,
+        0.0,
+        0.0,
+        Some(400),
+        Some("This content was flagged for possible cybersecurity risk".to_string()),
+        Some("client_error".to_string()),
+        Some(100),
+        Some(50),
+        "failed".to_string(),
+        "settled".to_string(),
+        created_at_unix_secs,
+        created_at_unix_secs,
+        Some(created_at_unix_secs),
+    )
+    .expect("usage should build");
+    usage.request_metadata = Some(serde_json::json!({
+        "is_risk_control": true,
+        "client_session_affinity": {
+            "session_key": session_key
+        }
+    }));
+    usage
+}
+
+fn sample_risk_control_candidate(
+    provider_id: &str,
+    session_key: &str,
+    status: RequestCandidateStatus,
+) -> StoredRequestCandidate {
+    StoredRequestCandidate::new(
+        format!("candidate-{provider_id}"),
+        format!("request-{provider_id}"),
+        Some("user-1".to_string()),
+        Some("api-key-1".to_string()),
+        None,
+        None,
+        0,
+        0,
+        Some(provider_id.to_string()),
+        Some(format!("endpoint-{provider_id}")),
+        Some(format!("key-{provider_id}")),
+        status,
+        None,
+        false,
+        Some(400),
+        Some("upstream_error".to_string()),
+        Some("This content was flagged for possible cybersecurity risk".to_string()),
+        Some(100),
+        None,
+        Some(json!({
+            "client_session_affinity": {
+                "session_key": session_key
+            }
+        })),
+        None,
+        100_000,
+        Some(100_000),
+        Some(100_100),
+    )
+    .expect("request candidate should build")
+}
+
+fn risk_control_session_avoidance_state(
+    protected_enabled: bool,
+    request_candidate_items: Vec<StoredRequestCandidate>,
+    usage_items: Vec<StoredRequestUsageAudit>,
+) -> AppState {
+    let candidates = Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(vec![
+        provider_key_concurrency_row(
+            "risk-provider-a",
+            "endpoint-risk-a",
+            "key-risk-a",
+            "alpha",
+            0,
+            0,
+        ),
+        provider_key_concurrency_row(
+            "risk-provider-b",
+            "endpoint-risk-b",
+            "key-risk-b",
+            "beta",
+            1,
+            0,
+        ),
+    ]));
+    let provider_catalog = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![
+            provider_with_risk_control_session_avoidance("risk-provider-a", protected_enabled),
+            provider_with_risk_control_session_avoidance("risk-provider-b", true),
+        ],
+        Vec::new(),
+        vec![
+            sample_key("key-risk-a", "risk-provider-a", Some(10)),
+            sample_key("key-risk-b", "risk-provider-b", Some(10)),
+        ],
+    ));
+    let quotas = Arc::new(InMemoryProviderQuotaRepository::seed(vec![]));
+    let request_candidates = Arc::new(InMemoryRequestCandidateRepository::seed(
+        request_candidate_items,
+    ));
+    let usage_repository = Arc::new(InMemoryUsageReadRepository::seed(usage_items));
+
+    AppState::new()
+        .expect("state should build")
+        .with_data_state_for_tests(
+            GatewayDataState::with_candidate_selection_provider_catalog_quota_request_candidates_and_usage_for_tests(
+                candidates,
+                provider_catalog,
+                quotas,
+                request_candidates,
+                usage_repository,
+            ),
+        )
+}
+
+#[tokio::test]
+async fn risk_control_session_avoidance_uses_failed_candidate_history_without_usage() {
+    let session_key = "session-risk-alpha";
+    let state = risk_control_session_avoidance_state(
+        true,
+        vec![sample_risk_control_candidate(
+            "risk-provider-a",
+            session_key,
+            RequestCandidateStatus::Failed,
+        )],
+        Vec::new(),
+    );
+    let affinity = ClientSessionAffinity::from_session_key(session_key);
+
+    let selected = select_candidate_with_session_affinity(
+        state.data.as_ref(),
+        &state,
+        "openai:chat",
+        "gpt-4.1",
+        Some(&affinity),
+        200,
+    )
+    .await
+    .expect("selection should succeed")
+    .expect("fallback provider should be selected");
+
+    assert_eq!(selected.provider_id, "risk-provider-b");
+    assert_eq!(selected.key_id, "key-risk-b");
+}
+
+#[tokio::test]
+async fn risk_control_session_avoidance_ignores_success_candidate_history() {
+    let session_key = "session-risk-alpha";
+    let state = risk_control_session_avoidance_state(
+        true,
+        vec![sample_risk_control_candidate(
+            "risk-provider-a",
+            session_key,
+            RequestCandidateStatus::Success,
+        )],
+        Vec::new(),
+    );
+    let affinity = ClientSessionAffinity::from_session_key(session_key);
+
+    let selected = select_candidate_with_session_affinity(
+        state.data.as_ref(),
+        &state,
+        "openai:chat",
+        "gpt-4.1",
+        Some(&affinity),
+        200,
+    )
+    .await
+    .expect("selection should succeed")
+    .expect("first provider should remain selectable");
+
+    assert_eq!(selected.provider_id, "risk-provider-a");
+    assert_eq!(selected.key_id, "key-risk-a");
+}
+
+#[tokio::test]
+async fn risk_control_session_avoidance_skips_protected_provider_for_same_session() {
+    let session_key = "session-risk-alpha";
+    let state = risk_control_session_avoidance_state(
+        true,
+        Vec::new(),
+        vec![sample_risk_control_usage(
+            "risk-provider-a",
+            session_key,
+            100,
+        )],
+    );
+    let affinity = ClientSessionAffinity::from_session_key(session_key);
+
+    let selected = select_candidate_with_session_affinity(
+        state.data.as_ref(),
+        &state,
+        "openai:chat",
+        "gpt-4.1",
+        Some(&affinity),
+        200,
+    )
+    .await
+    .expect("selection should succeed")
+    .expect("fallback provider should be selected");
+
+    assert_eq!(selected.provider_id, "risk-provider-b");
+    assert_eq!(selected.key_id, "key-risk-b");
+}
+
+#[tokio::test]
+async fn risk_control_session_avoidance_does_not_skip_when_provider_switch_is_disabled() {
+    let session_key = "session-risk-alpha";
+    let state = risk_control_session_avoidance_state(
+        false,
+        Vec::new(),
+        vec![sample_risk_control_usage(
+            "risk-provider-a",
+            session_key,
+            100,
+        )],
+    );
+    let affinity = ClientSessionAffinity::from_session_key(session_key);
+
+    let selected = select_candidate_with_session_affinity(
+        state.data.as_ref(),
+        &state,
+        "openai:chat",
+        "gpt-4.1",
+        Some(&affinity),
+        200,
+    )
+    .await
+    .expect("selection should succeed")
+    .expect("first provider should remain selectable");
+
+    assert_eq!(selected.provider_id, "risk-provider-a");
+    assert_eq!(selected.key_id, "key-risk-a");
 }
 
 #[test]

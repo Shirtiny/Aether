@@ -279,6 +279,27 @@ impl SqlxRequestCandidateReadRepository {
         collect_query_rows(builder.build().fetch(&self.pool), map_request_candidate_row).await
     }
 
+    pub async fn list_by_provider_id_and_client_session_key(
+        &self,
+        provider_id: &str,
+        session_key: &str,
+    ) -> Result<Vec<StoredRequestCandidate>, DataLayerError> {
+        let mut builder = QueryBuilder::<Postgres>::new(candidate_columns());
+        let mut where_clause = WhereClause::new();
+        push_eq(
+            &mut builder,
+            &mut where_clause,
+            "provider_id",
+            provider_id.to_string(),
+        );
+        where_clause.push_next(&mut builder);
+        builder
+            .push("extra_data#>>'{client_session_affinity,session_key}' = ")
+            .push_bind(session_key.to_string());
+        builder.push(" ORDER BY created_at DESC");
+        collect_query_rows(builder.build().fetch(&self.pool), map_request_candidate_row).await
+    }
+
     pub async fn list_finalized_by_endpoint_ids_since(
         &self,
         endpoint_ids: &[String],
@@ -535,6 +556,14 @@ impl RequestCandidateReadRepository for SqlxRequestCandidateReadRepository {
         limit: usize,
     ) -> Result<Vec<StoredRequestCandidate>, DataLayerError> {
         Self::list_by_provider_id(self, provider_id, limit).await
+    }
+
+    async fn list_by_provider_id_and_client_session_key(
+        &self,
+        provider_id: &str,
+        session_key: &str,
+    ) -> Result<Vec<StoredRequestCandidate>, DataLayerError> {
+        Self::list_by_provider_id_and_client_session_key(self, provider_id, session_key).await
     }
 
     async fn count_finalized_statuses_by_endpoint_ids_since(

@@ -112,6 +112,26 @@ impl RequestCandidateReadRepository for InMemoryRequestCandidateRepository {
         Ok(rows)
     }
 
+    async fn list_by_provider_id_and_client_session_key(
+        &self,
+        provider_id: &str,
+        session_key: &str,
+    ) -> Result<Vec<StoredRequestCandidate>, DataLayerError> {
+        let mut rows = self
+            .by_id
+            .read()
+            .expect("request candidate repository lock")
+            .values()
+            .filter(|row| {
+                row.provider_id.as_deref() == Some(provider_id)
+                    && request_candidate_client_session_key(row).as_deref() == Some(session_key)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        rows.sort_by_key(|entry| std::cmp::Reverse(entry.created_at_unix_ms));
+        Ok(rows)
+    }
+
     async fn list_finalized_by_endpoint_ids_since(
         &self,
         endpoint_ids: &[String],
@@ -288,6 +308,18 @@ impl RequestCandidateReadRepository for InMemoryRequestCandidateRepository {
 
         Ok(buckets.into_values().collect())
     }
+}
+
+fn request_candidate_client_session_key(candidate: &StoredRequestCandidate) -> Option<String> {
+    candidate
+        .extra_data
+        .as_ref()
+        .and_then(|value| value.get("client_session_affinity"))
+        .and_then(|value| value.get("session_key"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 #[async_trait]

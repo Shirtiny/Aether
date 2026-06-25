@@ -281,6 +281,19 @@
           />
         </div>
 
+        <div class="flex items-center justify-between p-3 border rounded-lg bg-muted/50">
+          <div class="space-y-0.5">
+            <span class="text-sm font-medium">风控会话避险</span>
+            <p class="text-xs text-muted-foreground leading-relaxed">
+              会话在该提供商遇到风控后，后续调度跳过该提供商
+            </p>
+          </div>
+          <Switch
+            :model-value="form.risk_control_session_avoidance_enabled"
+            @update:model-value="(v: boolean) => form.risk_control_session_avoidance_enabled = v"
+          />
+        </div>
+
         <div
           v-if="form.provider_type === 'kiro'"
           class="flex items-center justify-between p-3 border rounded-lg bg-muted/50"
@@ -406,6 +419,7 @@ const form = ref({
   request_timeout: undefined as number | undefined,
   // 号池模式
   pool_mode_enabled: false,
+  risk_control_session_avoidance_enabled: false,
   // Kiro 专属配置
   kiro_simulated_cache_enabled: false,
 })
@@ -434,6 +448,7 @@ function resetForm() {
     request_timeout: undefined,
     // 号池模式
     pool_mode_enabled: false,
+    risk_control_session_avoidance_enabled: false,
     // Kiro 专属配置
     kiro_simulated_cache_enabled: false,
   }
@@ -466,6 +481,7 @@ function loadProviderData() {
     request_timeout: props.provider.request_timeout ?? undefined,
     // 号池模式
     pool_mode_enabled: poolAdvanced !== null,
+    risk_control_session_avoidance_enabled: props.provider.risk_control_session_avoidance?.enabled ?? false,
     // Kiro 专属配置
     kiro_simulated_cache_enabled: props.provider.kiro_simulated_cache_enabled ?? false,
   }
@@ -518,6 +534,18 @@ const handleSubmit = async () => {
   loading.value = true
   try {
     const currentPoolAdvanced = normalizePoolAdvancedConfig(props.provider?.pool_advanced)
+    const providerConfig = {
+      risk_control_session_avoidance: {
+        enabled: form.value.risk_control_session_avoidance_enabled,
+      },
+      ...(form.value.provider_type === 'kiro'
+        ? {
+            kiro: {
+              simulated_cache_enabled: form.value.kiro_simulated_cache_enabled,
+            },
+          }
+        : {}),
+    }
     const basePayload = {
       name: form.value.name,
       provider_type: form.value.provider_type,
@@ -538,15 +566,7 @@ const handleSubmit = async () => {
       pool_advanced: form.value.pool_mode_enabled
         ? (currentPoolAdvanced ?? {})
         : null,
-      ...(form.value.provider_type === 'kiro'
-        ? {
-            config: {
-              kiro: {
-                simulated_cache_enabled: form.value.kiro_simulated_cache_enabled,
-              },
-            },
-          }
-        : {}),
+      config: providerConfig,
     }
 
     if (isEditMode.value && props.provider) {

@@ -190,6 +190,7 @@ pub(crate) fn build_admin_provider_summary_value(
         "pool_advanced": config.and_then(|cfg| cfg.get("pool_advanced")).cloned(),
         "failover_rules": config.and_then(|cfg| cfg.get("failover_rules")).cloned(),
         "chat_pii_redaction": config.and_then(|cfg| cfg.get("chat_pii_redaction")).cloned(),
+        "risk_control_session_avoidance": config.and_then(|cfg| cfg.get("risk_control_session_avoidance")).cloned(),
         "total_endpoints": total_endpoints,
         "active_endpoints": active_endpoints,
         "total_keys": total_keys,

@@ -453,6 +453,12 @@ pub trait RequestCandidateReadRepository: Send + Sync {
         limit: usize,
     ) -> Result<Vec<StoredRequestCandidate>, crate::DataLayerError>;
 
+    async fn list_by_provider_id_and_client_session_key(
+        &self,
+        provider_id: &str,
+        session_key: &str,
+    ) -> Result<Vec<StoredRequestCandidate>, crate::DataLayerError>;
+
     async fn list_finalized_by_endpoint_ids_since(
         &self,
         endpoint_ids: &[String],

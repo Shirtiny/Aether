@@ -2184,6 +2184,71 @@ impl GatewayDataState {
     }
 
     #[cfg(test)]
+    pub(crate) fn with_candidate_selection_provider_catalog_quota_request_candidates_and_usage_for_tests<
+        T,
+    >(
+        candidate_selection_repository: Arc<dyn MinimalCandidateSelectionReadRepository>,
+        provider_catalog_repository: Arc<dyn ProviderCatalogReadRepository>,
+        provider_quota_repository: Arc<T>,
+        request_candidate_repository: Arc<dyn RequestCandidateReadRepository>,
+        usage_repository: Arc<dyn UsageReadRepository>,
+    ) -> Self
+    where
+        T: ProviderQuotaRepository + 'static,
+    {
+        let provider_quota_reader: Arc<dyn ProviderQuotaReadRepository> =
+            provider_quota_repository.clone();
+        let provider_quota_writer: Arc<dyn ProviderQuotaWriteRepository> =
+            provider_quota_repository;
+
+        Self {
+            config: GatewayDataConfig::disabled(),
+            backends: None,
+            auth_api_key_reader: None,
+            auth_api_key_writer: None,
+            auth_module_reader: None,
+            auth_module_writer: None,
+            announcement_reader: None,
+            announcement_writer: None,
+            management_token_reader: None,
+            management_token_writer: None,
+            oauth_provider_reader: None,
+            oauth_provider_writer: None,
+            proxy_node_reader: None,
+            proxy_node_writer: None,
+            billing_reader: None,
+            gemini_file_mapping_reader: None,
+            gemini_file_mapping_writer: None,
+            global_model_reader: None,
+            global_model_writer: None,
+            minimal_candidate_selection_reader: Some(candidate_selection_repository),
+            request_candidate_reader: Some(request_candidate_repository),
+            request_candidate_writer: None,
+            provider_catalog_reader: Some(provider_catalog_repository),
+            provider_catalog_writer: None,
+            pool_score_reader: None,
+            pool_score_writer: None,
+            provider_quota_reader: Some(provider_quota_reader),
+            provider_quota_writer: Some(provider_quota_writer),
+            routing_group_reader: None,
+            routing_group_writer: None,
+            usage_reader: Some(usage_repository),
+            usage_writer: None,
+            user_reader: None,
+            user_preferences: None,
+            usage_worker_queue: None,
+            video_task_reader: None,
+            video_task_writer: None,
+            background_task_reader: None,
+            background_task_writer: None,
+            wallet_reader: None,
+            wallet_writer: None,
+            settlement_writer: None,
+            system_config_values: None,
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn with_auth_candidate_selection_provider_catalog_and_request_candidate_repository_for_tests<
         T,
         U,

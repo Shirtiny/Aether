@@ -30,6 +30,21 @@ impl GatewayDataState {
         }
     }
 
+    pub(crate) async fn list_request_candidates_by_provider_id_and_client_session_key(
+        &self,
+        provider_id: &str,
+        session_key: &str,
+    ) -> Result<Vec<StoredRequestCandidate>, DataLayerError> {
+        match &self.request_candidate_reader {
+            Some(repository) => {
+                repository
+                    .list_by_provider_id_and_client_session_key(provider_id, session_key)
+                    .await
+            }
+            None => Ok(Vec::new()),
+        }
+    }
+
     pub(crate) async fn list_recent_request_candidates(
         &self,
         limit: usize,

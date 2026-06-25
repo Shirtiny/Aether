@@ -123,6 +123,22 @@ impl RequestCandidateReadRepository for SqliteRequestCandidateRepository {
         rows.iter().map(map_candidate_row).collect()
     }
 
+    async fn list_by_provider_id_and_client_session_key(
+        &self,
+        provider_id: &str,
+        session_key: &str,
+    ) -> Result<Vec<StoredRequestCandidate>, DataLayerError> {
+        let rows = sqlx::query(&format!(
+            "{CANDIDATE_COLUMNS} WHERE provider_id = ? AND json_extract(extra_data, '$.client_session_affinity.session_key') = ? ORDER BY created_at DESC"
+        ))
+        .bind(provider_id)
+        .bind(session_key)
+        .fetch_all(&self.pool)
+        .await
+        .map_sql_err()?;
+        rows.iter().map(map_candidate_row).collect()
+    }
+
     async fn list_finalized_by_endpoint_ids_since(
         &self,
         endpoint_ids: &[String],

@@ -356,6 +356,34 @@ impl SchedulerRuntimeState for AppState {
         AppState::read_recent_request_candidates(self, limit).await
     }
 
+    async fn provider_session_has_risk_control_usage(
+        &self,
+        provider_id: &str,
+        session_key: &str,
+        since_unix_secs: Option<u64>,
+    ) -> Result<bool, GatewayError> {
+        AppState::provider_session_has_risk_control_usage(
+            self,
+            provider_id,
+            session_key,
+            since_unix_secs,
+        )
+        .await
+    }
+
+    async fn read_request_candidates_by_provider_id_and_client_session_key(
+        &self,
+        provider_id: &str,
+        session_key: &str,
+    ) -> Result<Vec<StoredRequestCandidate>, GatewayError> {
+        AppState::read_request_candidates_by_provider_id_and_client_session_key(
+            self,
+            provider_id,
+            session_key,
+        )
+        .await
+    }
+
     fn provider_key_rpm_reset_at(&self, key_id: &str, now_unix_secs: u64) -> Option<u64> {
         AppState::provider_key_rpm_reset_at(self, key_id, now_unix_secs)
     }

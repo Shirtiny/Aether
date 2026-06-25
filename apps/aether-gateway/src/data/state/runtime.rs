@@ -1164,6 +1164,30 @@ impl GatewayDataState {
         }
     }
 
+    pub(crate) async fn provider_session_has_risk_control_usage(
+        &self,
+        provider_id: &str,
+        session_key: &str,
+        since_unix_secs: Option<u64>,
+    ) -> Result<bool, DataLayerError> {
+        let provider_id = provider_id.trim();
+        let session_key = session_key.trim();
+        if provider_id.is_empty() || session_key.is_empty() {
+            return Ok(false);
+        }
+        let query = UsageAuditListQuery {
+            created_from_unix_secs: since_unix_secs,
+            provider_id: Some(provider_id.to_string()),
+            session_id: Some(session_key.to_string()),
+            session_id_exact: true,
+            risk_control_only: true,
+            limit: Some(1),
+            newest_first: true,
+            ..UsageAuditListQuery::default()
+        };
+        Ok(!self.list_usage_audits(&query).await?.is_empty())
+    }
+
     pub(crate) async fn count_usage_audits(
         &self,
         query: &UsageAuditListQuery,

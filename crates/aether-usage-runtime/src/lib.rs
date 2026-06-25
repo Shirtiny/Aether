@@ -21,7 +21,10 @@ pub use body_capture::{
 pub use config::UsageRuntimeConfig;
 pub use event::{now_ms, UsageEvent, UsageEventData, UsageEventType, USAGE_EVENT_VERSION};
 pub use queue::UsageQueue;
-pub use record::build_upsert_usage_record_from_event;
+pub use record::{
+    build_upsert_usage_record_from_event, usage_json_text_matches_risk_control,
+    usage_text_matches_risk_control,
+};
 pub use report::{
     extract_gemini_file_mapping_entries, gemini_file_mapping_cache_key,
     infer_internal_finalize_signature, is_local_ai_stream_report_kind,
