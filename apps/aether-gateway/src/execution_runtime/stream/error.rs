@@ -251,6 +251,9 @@ fn stream_json_body_is_prefetch_control(value: &Value) -> bool {
     ) {
         return true;
     }
+    if openai_responses_structural_event_is_prefetch_control(value, event_type) {
+        return true;
+    }
 
     value
         .get("response")
@@ -258,6 +261,64 @@ fn stream_json_body_is_prefetch_control(value: &Value) -> bool {
         .and_then(|response| response.get("status"))
         .and_then(Value::as_str)
         .is_some_and(|status| matches!(status, "created" | "in_progress" | "queued"))
+}
+
+fn openai_responses_structural_event_is_prefetch_control(value: &Value, event_type: &str) -> bool {
+    match event_type {
+        "response.output_item.added" => response_output_item_added_is_prefetch_control(value),
+        "response.content_part.added" | "response.reasoning_summary_part.added" => {
+            response_part_added_is_prefetch_control(value)
+        }
+        _ => false,
+    }
+}
+
+fn response_output_item_added_is_prefetch_control(value: &Value) -> bool {
+    let Some(item) = value.get("item").and_then(Value::as_object) else {
+        return false;
+    };
+    match item.get("type").and_then(Value::as_str).unwrap_or_default() {
+        "reasoning" => true,
+        "message" => !message_item_has_visible_content(item),
+        "function_call" => !non_empty_json_string(item.get("arguments")),
+        "image_generation_call" => {
+            !non_empty_json_string(item.get("result"))
+                && !non_empty_json_string(item.get("partial_image_b64"))
+        }
+        _ => false,
+    }
+}
+
+fn response_part_added_is_prefetch_control(value: &Value) -> bool {
+    let Some(part) = value.get("part").and_then(Value::as_object) else {
+        return false;
+    };
+    match part.get("type").and_then(Value::as_str).unwrap_or_default() {
+        "output_text" | "summary_text" => !non_empty_json_string(part.get("text")),
+        _ => false,
+    }
+}
+
+fn message_item_has_visible_content(item: &Map<String, Value>) -> bool {
+    item.get("content")
+        .and_then(Value::as_array)
+        .is_some_and(|content| {
+            content.iter().any(|part| {
+                non_empty_json_string(part.get("text"))
+                    || non_empty_json_string(part.get("refusal"))
+                    || part
+                        .get("annotations")
+                        .and_then(Value::as_array)
+                        .is_some_and(|annotations| !annotations.is_empty())
+            })
+        })
+}
+
+fn non_empty_json_string(value: Option<&Value>) -> bool {
+    value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
 }
 
 fn is_error_sse_event_type(event_type: &str) -> bool {
@@ -363,5 +424,58 @@ mod tests {
             body["error"]["message"],
             "Our servers are currently overloaded. Please try again later."
         );
+    }
+
+    #[test]
+    fn inspect_prefetched_stream_body_keeps_empty_responses_structure_pending() {
+        let inspection = inspect_prefetched_stream_body(
+            &event_stream_headers(),
+            concat!(
+                "event: response.output_item.added\n",
+                "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"status\":\"in_progress\",\"role\":\"assistant\",\"content\":[]}}\n\n",
+                "event: response.content_part.added\n",
+                "data: {\"type\":\"response.content_part.added\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"\",\"annotations\":[]}}\n\n",
+                "event: response.output_item.added\n",
+                "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"reasoning\",\"summary\":[],\"encrypted_content\":\"EWxvY2tlZA==\"}}\n\n"
+            )
+            .as_bytes(),
+        );
+
+        assert!(matches!(inspection, StreamPrefetchInspection::NeedMore));
+    }
+
+    #[test]
+    fn inspect_prefetched_stream_body_detects_failed_after_empty_responses_structure() {
+        let inspection = inspect_prefetched_stream_body(
+            &event_stream_headers(),
+            concat!(
+                "event: response.output_item.added\n",
+                "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"status\":\"in_progress\",\"role\":\"assistant\",\"content\":[]}}\n\n",
+                "event: response.content_part.added\n",
+                "data: {\"type\":\"response.content_part.added\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"\",\"annotations\":[]}}\n\n",
+                "event: response.failed\n",
+                "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"503\",\"message\":\"Our servers are currently overloaded. Please try again later.\"}}}\n\n"
+            )
+            .as_bytes(),
+        );
+
+        assert!(matches!(
+            inspection,
+            StreamPrefetchInspection::EmbeddedError(_)
+        ));
+    }
+
+    #[test]
+    fn inspect_prefetched_stream_body_releases_visible_responses_text() {
+        let inspection = inspect_prefetched_stream_body(
+            &event_stream_headers(),
+            concat!(
+                "event: response.content_part.added\n",
+                "data: {\"type\":\"response.content_part.added\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"Hello\",\"annotations\":[]}}\n\n"
+            )
+            .as_bytes(),
+        );
+
+        assert!(matches!(inspection, StreamPrefetchInspection::NonError));
     }
 }

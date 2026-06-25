@@ -4392,6 +4392,18 @@ mod tests {
                 payload: StreamFramePayload::Data {
                     chunk_b64: None,
                     text: Some(concat!(
+                        "event: response.output_item.added\n",
+                        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"status\":\"in_progress\",\"role\":\"assistant\",\"content\":[]}}\n\n",
+                        "event: response.content_part.added\n",
+                        "data: {\"type\":\"response.content_part.added\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"\",\"annotations\":[]}}\n\n",
+                    ).to_string()),
+                },
+            }));
+            yield Ok::<Bytes, std::io::Error>(ndjson_frame(StreamFrame {
+                frame_type: StreamFrameType::Data,
+                payload: StreamFramePayload::Data {
+                    chunk_b64: None,
+                    text: Some(concat!(
                         "event: response.failed\n",
                         "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"type\":\"service_unavailable_error\",\"code\":\"503\",\"message\":\"Our servers are currently overloaded. Please try again later.\"}}}\n\n"
                     ).to_string()),
