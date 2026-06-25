@@ -46,7 +46,8 @@ mod execution_failures;
 use self::execution_failures::{
     build_stream_failure_from_execution_error, build_stream_failure_from_provider_error_body,
     build_stream_failure_report, handle_prefetch_provider_private_stream_error,
-    handle_prefetch_stream_failure, submit_midstream_stream_failure, StreamFailureReport,
+    handle_prefetch_stream_failure, remember_provider_session_risk_control_block_for_failure,
+    submit_midstream_stream_failure, StreamFailureReport,
 };
 use crate::ai_serving::api::{
     extract_provider_private_stream_error_body, maybe_bridge_standard_sync_json_to_stream,
@@ -2568,6 +2569,17 @@ async fn execute_stream_from_frame_stream(
                                 provider_prefetched_body_bytes = provider_prefetched_body.len(),
                                 "gateway detected embedded error while prefetching execution runtime stream"
                             );
+                            let failure = build_stream_failure_from_provider_error_body(
+                                status_code,
+                                &body_json,
+                            );
+                            remember_provider_session_risk_control_block_for_failure(
+                                state,
+                                &plan,
+                                report_context.as_ref(),
+                                &failure,
+                            )
+                            .await;
                             let payload = build_stream_sync_payload(
                                 trace_id,
                                 report_kind.clone(),

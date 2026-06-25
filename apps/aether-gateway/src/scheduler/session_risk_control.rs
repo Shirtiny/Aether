@@ -1,0 +1,76 @@
+use std::fmt::Write as _;
+
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+
+pub(crate) const DEFAULT_PROVIDER_SESSION_RISK_CONTROL_BLOCK_TTL_SECONDS: u64 = 24 * 60 * 60;
+
+const PROVIDER_SESSION_RISK_CONTROL_BLOCK_KEY_PREFIX: &str =
+    "provider_session_risk_control_avoidance:v1";
+
+pub(crate) fn provider_session_risk_control_block_key(
+    provider_id: &str,
+    session_key: &str,
+) -> Option<String> {
+    let provider_id = provider_id.trim();
+    let session_key = session_key.trim();
+    if provider_id.is_empty() || session_key.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{PROVIDER_SESSION_RISK_CONTROL_BLOCK_KEY_PREFIX}:{}:{}",
+        sha256_hex(provider_id.as_bytes()),
+        sha256_hex(session_key.as_bytes())
+    ))
+}
+
+pub(crate) fn client_session_key_from_metadata(value: Option<&Value>) -> Option<&str> {
+    value
+        .and_then(Value::as_object)
+        .and_then(|object| object.get("client_session_affinity"))
+        .and_then(Value::as_object)
+        .and_then(|object| object.get("session_key"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+pub(crate) fn provider_session_risk_control_avoidance_enabled(
+    config: Option<&serde_json::Value>,
+) -> bool {
+    config
+        .and_then(|value| value.get("risk_control_session_avoidance"))
+        .and_then(serde_json::Value::as_object)
+        .and_then(|object| object.get("enabled"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+pub(crate) fn provider_session_risk_control_avoidance_ttl_seconds(
+    config: Option<&serde_json::Value>,
+) -> u64 {
+    config
+        .and_then(|value| value.get("risk_control_session_avoidance"))
+        .and_then(serde_json::Value::as_object)
+        .and_then(|object| object.get("ttl_seconds"))
+        .and_then(serde_json::Value::as_u64)
+        .filter(|value| *value > 0)
+        .or_else(|| {
+            config
+                .and_then(|value| value.get("pool_advanced"))
+                .and_then(serde_json::Value::as_object)
+                .and_then(|object| object.get("sticky_session_ttl_seconds"))
+                .and_then(serde_json::Value::as_u64)
+                .filter(|value| *value > 0)
+        })
+        .unwrap_or(DEFAULT_PROVIDER_SESSION_RISK_CONTROL_BLOCK_TTL_SECONDS)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut encoded, "{byte:02x}").expect("writing to string should not fail");
+    }
+    encoded
+}

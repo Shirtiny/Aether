@@ -117,19 +117,6 @@
                 </Badge>
               </div>
               <div class="flex items-center gap-3 shrink-0 ml-2">
-                <div
-                  class="flex items-center gap-1.5"
-                  title="开启后，该会话在此提供商遇到风控后会跳过此提供商"
-                >
-                  <span class="text-[10px] text-muted-foreground whitespace-nowrap">风控避险</span>
-                  <Switch
-                    :model-value="provider.risk_control_session_avoidance?.enabled ?? false"
-                    @update:model-value="(enabled: boolean) => updateProviderRiskControlAvoidance(provider.id, enabled)"
-                    @click.stop
-                    @mousedown.stop
-                    @dragstart.stop
-                  />
-                </div>
                 <!-- API 格式标签 (自适应宽度) -->
                 <div class="flex items-center justify-end gap-1">
                   <template v-if="provider.api_formats?.length">
@@ -151,6 +138,19 @@
                   >
                     {{ formatBalanceDisplay(provider.id) }}
                   </span>
+                </div>
+                <div
+                  class="flex items-center gap-1.5"
+                  title="开启后，该会话在此提供商遇到风控后会跳过此提供商"
+                >
+                  <span class="text-[10px] text-muted-foreground whitespace-nowrap">风控避险</span>
+                  <Switch
+                    :model-value="provider.risk_control_session_avoidance?.enabled ?? false"
+                    @update:model-value="(enabled: boolean) => updateProviderRiskControlAvoidance(provider.id, enabled)"
+                    @click.stop
+                    @mousedown.stop
+                    @dragstart.stop
+                  />
                 </div>
               </div>
             </div>

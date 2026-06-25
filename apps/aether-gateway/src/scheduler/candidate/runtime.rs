@@ -18,6 +18,7 @@ use aether_usage_runtime::{usage_json_text_matches_risk_control, usage_text_matc
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::data::auth::GatewayAuthApiKeySnapshot;
+use crate::scheduler::session_risk_control::provider_session_risk_control_avoidance_enabled;
 use crate::GatewayError;
 
 use super::{
@@ -371,6 +372,13 @@ async fn provider_session_has_risk_control_history(
     session_key: &str,
 ) -> Result<bool, GatewayError> {
     if state
+        .provider_session_has_runtime_risk_control_block(provider_id, session_key)
+        .await?
+    {
+        return Ok(true);
+    }
+
+    if state
         .provider_session_has_risk_control_usage(provider_id, session_key, None)
         .await?
     {
@@ -415,17 +423,6 @@ fn request_candidate_json_field_matches_risk_control(
         current = next;
     }
     usage_json_text_matches_risk_control(current)
-}
-
-pub(crate) fn provider_session_risk_control_avoidance_enabled(
-    config: Option<&serde_json::Value>,
-) -> bool {
-    config
-        .and_then(|value| value.get("risk_control_session_avoidance"))
-        .and_then(serde_json::Value::as_object)
-        .and_then(|object| object.get("enabled"))
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
 }
 
 fn parse_runtime_codex_quota_exhaustion_basis(

@@ -39,6 +39,10 @@ use super::super::fallback_metrics::{GatewayFallbackMetricKind, GatewayFallbackR
 use super::super::model_fetch::spawn_model_fetch_worker;
 use super::super::rate_limit::{FrontdoorUserRpmConfig, FrontdoorUserRpmLimiter};
 use super::super::router::RequestAdmissionError;
+use super::super::scheduler::session_risk_control::{
+    provider_session_risk_control_avoidance_enabled,
+    provider_session_risk_control_avoidance_ttl_seconds, provider_session_risk_control_block_key,
+};
 use super::super::{control::GatewayControlDecision, error::GatewayError};
 use super::super::{provider_transport, usage};
 
@@ -1064,6 +1068,46 @@ impl AppState {
             .kv_exists(key)
             .await
             .map_err(|err| GatewayError::Internal(err.to_string()))
+    }
+
+    pub(crate) async fn remember_provider_session_risk_control_block_if_enabled(
+        &self,
+        provider_id: &str,
+        session_key: &str,
+    ) -> Result<bool, GatewayError> {
+        let provider_id = provider_id.trim();
+        let Some(block_key) = provider_session_risk_control_block_key(provider_id, session_key)
+        else {
+            return Ok(false);
+        };
+        let provider_ids = [provider_id.to_string()];
+        let Some(provider) = self
+            .read_provider_catalog_providers_by_ids(&provider_ids)
+            .await?
+            .into_iter()
+            .find(|provider| provider.id == provider_id)
+        else {
+            return Ok(false);
+        };
+        if !provider_session_risk_control_avoidance_enabled(provider.config.as_ref()) {
+            return Ok(false);
+        }
+        let ttl_seconds =
+            provider_session_risk_control_avoidance_ttl_seconds(provider.config.as_ref());
+        self.runtime_kv_setex(&block_key, "1", ttl_seconds).await?;
+        Ok(true)
+    }
+
+    pub(crate) async fn provider_session_has_runtime_risk_control_block(
+        &self,
+        provider_id: &str,
+        session_key: &str,
+    ) -> Result<bool, GatewayError> {
+        let Some(block_key) = provider_session_risk_control_block_key(provider_id, session_key)
+        else {
+            return Ok(false);
+        };
+        self.runtime_kv_exists(&block_key).await
     }
 
     pub(crate) fn remove_scheduler_affinity_cache_entry(&self, cache_key: &str) -> bool {

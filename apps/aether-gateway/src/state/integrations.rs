@@ -371,6 +371,15 @@ impl SchedulerRuntimeState for AppState {
         .await
     }
 
+    async fn provider_session_has_runtime_risk_control_block(
+        &self,
+        provider_id: &str,
+        session_key: &str,
+    ) -> Result<bool, GatewayError> {
+        AppState::provider_session_has_runtime_risk_control_block(self, provider_id, session_key)
+            .await
+    }
+
     async fn read_request_candidates_by_provider_id_and_client_session_key(
         &self,
         provider_id: &str,

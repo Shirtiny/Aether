@@ -478,6 +478,33 @@ async fn risk_control_session_avoidance_skips_protected_provider_for_same_sessio
 }
 
 #[tokio::test]
+async fn risk_control_session_avoidance_uses_runtime_block_without_history() {
+    let session_key = "session-risk-alpha";
+    let state = risk_control_session_avoidance_state(true, Vec::new(), Vec::new());
+    let remembered = state
+        .remember_provider_session_risk_control_block_if_enabled("risk-provider-a", session_key)
+        .await
+        .expect("runtime block should be recorded");
+    assert!(remembered);
+    let affinity = ClientSessionAffinity::from_session_key(session_key);
+
+    let selected = select_candidate_with_session_affinity(
+        state.data.as_ref(),
+        &state,
+        "openai:chat",
+        "gpt-4.1",
+        Some(&affinity),
+        200,
+    )
+    .await
+    .expect("selection should succeed")
+    .expect("fallback provider should be selected");
+
+    assert_eq!(selected.provider_id, "risk-provider-b");
+    assert_eq!(selected.key_id, "key-risk-b");
+}
+
+#[tokio::test]
 async fn risk_control_session_avoidance_does_not_skip_when_provider_switch_is_disabled() {
     let session_key = "session-risk-alpha";
     let state = risk_control_session_avoidance_state(

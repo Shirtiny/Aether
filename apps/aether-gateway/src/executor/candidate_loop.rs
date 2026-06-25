@@ -36,6 +36,7 @@ use crate::request_candidate_runtime::{
     RequestCandidateRuntimeWriter,
 };
 use crate::scheduler::candidate::provider_session_risk_control_avoidance_enabled;
+use crate::scheduler::session_risk_control::client_session_key_from_metadata;
 use crate::{AppState, GatewayError};
 
 const DEFAULT_STREAM_FIRST_BYTE_WATCHDOG_TIMEOUT_MS: u64 = 30_000;
@@ -130,6 +131,22 @@ async fn record_provider_session_risk_control_block_if_needed(
     }
     if !provider_risk_control_session_avoidance_enabled(state, &plan.provider_id).await {
         return;
+    }
+    if let Some(session_key) = client_session_key_from_metadata(candidate.extra_data.as_ref()) {
+        if let Err(err) = state
+            .remember_provider_session_risk_control_block_if_enabled(&plan.provider_id, session_key)
+            .await
+        {
+            warn!(
+                event_name = "provider_session_risk_control_block_record_failed",
+                log_type = "ops",
+                request_id = %short_request_id(plan.request_id.as_str()),
+                candidate_id = ?plan.candidate_id,
+                provider_id = %plan.provider_id,
+                error = ?err,
+                "gateway failed to persist provider session risk-control avoidance block"
+            );
+        }
     }
     blocks.lock().await.insert(plan.provider_id.clone());
 }

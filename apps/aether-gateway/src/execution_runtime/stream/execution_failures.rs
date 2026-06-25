@@ -3,6 +3,7 @@ use aether_data_contracts::repository::candidates::RequestCandidateStatus;
 use aether_scheduler_core::SchedulerRequestCandidateStatusUpdate;
 use aether_usage_runtime::{
     build_sync_terminal_usage_payload_seed, build_terminal_usage_context_seed,
+    usage_text_matches_risk_control,
 };
 use axum::body::Body;
 use axum::http::Response;
@@ -26,6 +27,7 @@ use crate::orchestration::{
     LocalPoolErrorEffect,
 };
 use crate::request_candidate_runtime::record_report_request_candidate_status;
+use crate::scheduler::session_risk_control::client_session_key_from_metadata;
 use crate::usage::submit_sync_report;
 use crate::{usage::GatewaySyncReportRequest, AppState, GatewayError};
 
@@ -344,6 +346,36 @@ async fn record_stream_sync_failure(
     .await;
 }
 
+pub(super) async fn remember_provider_session_risk_control_block_for_failure(
+    state: &AppState,
+    plan: &ExecutionPlan,
+    report_context: Option<&Value>,
+    failure: &StreamFailureReport,
+) {
+    if !usage_text_matches_risk_control(Some(failure.error_message.as_str()))
+        && !usage_text_matches_risk_control(Some(failure.error_type.as_str()))
+    {
+        return;
+    }
+    let Some(session_key) = client_session_key_from_metadata(report_context) else {
+        return;
+    };
+    if let Err(err) = state
+        .remember_provider_session_risk_control_block_if_enabled(&plan.provider_id, session_key)
+        .await
+    {
+        warn!(
+            event_name = "provider_session_risk_control_block_record_failed",
+            log_type = "ops",
+            request_id = %short_request_id(plan.request_id.as_str()),
+            candidate_id = ?plan.candidate_id,
+            provider_id = %plan.provider_id,
+            error = ?err,
+            "gateway failed to persist provider session risk-control avoidance block"
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // internal helper for prefetch error handling
 pub(super) async fn handle_prefetch_provider_private_stream_error(
     state: &AppState,
@@ -360,6 +392,15 @@ pub(super) async fn handle_prefetch_provider_private_stream_error(
     status_code: u16,
     body_json: Value,
 ) -> Result<Option<Response<Body>>, GatewayError> {
+    let failure = build_stream_failure_from_provider_error_body(status_code, &body_json);
+    remember_provider_session_risk_control_block_for_failure(
+        state,
+        plan,
+        report_context.as_ref(),
+        &failure,
+    )
+    .await;
+
     headers.remove("content-encoding");
     headers.remove("content-length");
     headers.insert("content-type".to_string(), "application/json".to_string());
@@ -402,6 +443,14 @@ pub(super) async fn handle_prefetch_stream_failure(
     buffered_body: &[u8],
     failure: StreamFailureReport,
 ) -> Result<Option<Response<Body>>, GatewayError> {
+    remember_provider_session_risk_control_block_for_failure(
+        state,
+        plan,
+        report_context.as_ref(),
+        &failure,
+    )
+    .await;
+
     let payload = build_stream_failure_sync_payload(
         trace_id,
         report_kind.to_string(),
@@ -434,6 +483,14 @@ pub(super) async fn submit_midstream_stream_failure(
     started_at_unix_ms: u64,
     failure: StreamFailureReport,
 ) {
+    remember_provider_session_risk_control_block_for_failure(
+        state,
+        plan,
+        report_context.as_ref(),
+        &failure,
+    )
+    .await;
+
     let Some(report_kind) =
         direct_stream_finalize_kind.and_then(resolve_core_error_background_report_kind)
     else {
