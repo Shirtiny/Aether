@@ -122,6 +122,7 @@ const SSE_TERMINAL_DETECTOR_MAX_LINE_BYTES: usize = 1024 * 1024;
 const STREAM_IDLE_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const STREAM_IDLE_LOG_INTERVAL_MS: u64 = 60_000;
 const REWRITTEN_STREAM_PREFETCH_TIMEOUT: Duration = Duration::from_millis(750);
+const CONTROL_STREAM_PREFETCH_EXTENSION_TIMEOUT: Duration = Duration::from_secs(3);
 
 fn record_sync_terminal_usage(
     state: &AppState,
@@ -2393,6 +2394,8 @@ async fn execute_stream_from_frame_stream(
     let mut prefetched_usage_telemetry: Option<ExecutionTelemetry> = None;
     let mut reached_eof = false;
     let mut sync_json_stream_bridge_active = false;
+    let prefetch_started_at = Instant::now();
+    let mut continue_prefetching_control_stream = false;
     if skip_direct_finalize_prefetch {
         debug!(
             event_name = "execution_runtime_stream_prefetch_skipped",
@@ -2416,9 +2419,18 @@ async fn execute_stream_from_frame_stream(
         .as_ref()
         .filter(|_| !skip_direct_finalize_prefetch)
     {
-        while prefetched_chunks.len() < MAX_STREAM_PREFETCH_FRAMES
-            && prefetched_inspection_body.len() < MAX_STREAM_PREFETCH_BYTES
-        {
+        loop {
+            if prefetched_inspection_body.len() >= MAX_STREAM_PREFETCH_BYTES {
+                break;
+            }
+            if prefetched_chunks.len() >= MAX_STREAM_PREFETCH_FRAMES
+                && !continue_prefetching_control_stream
+            {
+                break;
+            }
+            let extend_control_prefetch = !limit_direct_finalize_prefetch
+                && prefetched_chunks.len() >= MAX_STREAM_PREFETCH_FRAMES
+                && continue_prefetching_control_stream;
             let next_frame_result = if limit_direct_finalize_prefetch {
                 match tokio::time::timeout(
                     REWRITTEN_STREAM_PREFETCH_TIMEOUT,
@@ -2443,6 +2455,59 @@ async fn execute_stream_from_frame_stream(
                             candidate_index = candidate_index.as_str(),
                             timeout_ms = REWRITTEN_STREAM_PREFETCH_TIMEOUT.as_millis() as u64,
                             "gateway stopped rewritten stream prefetch before client-visible body"
+                        );
+                        break;
+                    }
+                }
+            } else if extend_control_prefetch {
+                let Some(remaining) = CONTROL_STREAM_PREFETCH_EXTENSION_TIMEOUT
+                    .checked_sub(prefetch_started_at.elapsed())
+                else {
+                    debug!(
+                        event_name = "execution_runtime_stream_prefetch_control_extension_expired",
+                        log_type = "debug",
+                        trace_id = %trace_id,
+                        request_id = %request_id_for_log,
+                        candidate_id = ?candidate_id,
+                        plan_kind,
+                        report_kind,
+                        provider_name,
+                        endpoint_id = %plan.endpoint_id,
+                        key_id = %plan.key_id,
+                        model_name,
+                        candidate_index = candidate_index.as_str(),
+                        timeout_ms = CONTROL_STREAM_PREFETCH_EXTENSION_TIMEOUT.as_millis() as u64,
+                        prefetched_frames = prefetched_chunks.len(),
+                        prefetched_bytes = prefetched_inspection_body.len(),
+                        "gateway stopped control-only stream prefetch after extension timeout"
+                    );
+                    break;
+                };
+                match tokio::time::timeout(
+                    remaining,
+                    next_stream_frame(&mut buffered_frames, &mut lines),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => {
+                        debug!(
+                            event_name = "execution_runtime_stream_prefetch_control_extension_limited",
+                            log_type = "debug",
+                            trace_id = %trace_id,
+                            request_id = %request_id_for_log,
+                            candidate_id = ?candidate_id,
+                            plan_kind,
+                            report_kind,
+                            provider_name,
+                            endpoint_id = %plan.endpoint_id,
+                            key_id = %plan.key_id,
+                            model_name,
+                            candidate_index = candidate_index.as_str(),
+                            timeout_ms = CONTROL_STREAM_PREFETCH_EXTENSION_TIMEOUT.as_millis() as u64,
+                            prefetched_frames = prefetched_chunks.len(),
+                            prefetched_bytes = prefetched_inspection_body.len(),
+                            "gateway stopped control-only stream prefetch before client-visible body"
                         );
                         break;
                     }
@@ -2588,8 +2653,12 @@ async fn execute_stream_from_frame_stream(
                             )
                             .await;
                         }
-                        StreamPrefetchInspection::NeedMore => {}
-                        StreamPrefetchInspection::NonError => {}
+                        StreamPrefetchInspection::NeedMore => {
+                            continue_prefetching_control_stream = true;
+                        }
+                        StreamPrefetchInspection::NonError => {
+                            continue_prefetching_control_stream = false;
+                        }
                     }
 
                     if !response_headers_indicate_sse(&upstream_headers)
@@ -4225,16 +4294,18 @@ mod tests {
                     )]),
                 },
             }));
-            yield Ok::<Bytes, std::io::Error>(ndjson_frame(StreamFrame {
-                frame_type: StreamFrameType::Data,
-                payload: StreamFramePayload::Data {
-                    chunk_b64: None,
-                    text: Some(concat!(
-                        "event: response.created\n",
-                        "data: {\"type\":\"response.created\",\"response\":{\"status\":\"in_progress\"}}\n\n"
-                    ).to_string()),
-                },
-            }));
+            for index in 0..=crate::execution_runtime::MAX_STREAM_PREFETCH_FRAMES {
+                yield Ok::<Bytes, std::io::Error>(ndjson_frame(StreamFrame {
+                    frame_type: StreamFrameType::Data,
+                    payload: StreamFramePayload::Data {
+                        chunk_b64: None,
+                        text: Some(format!(
+                            "event: response.created\n\
+                             data: {{\"type\":\"response.created\",\"response\":{{\"id\":\"resp_control_{index}\",\"status\":\"in_progress\"}}}}\n\n"
+                        )),
+                    },
+                }));
+            }
             yield Ok::<Bytes, std::io::Error>(ndjson_frame(StreamFrame {
                 frame_type: StreamFrameType::Data,
                 payload: StreamFramePayload::Data {
