@@ -10,7 +10,7 @@ use axum::http::Response;
 use base64::Engine as _;
 use serde::Serialize;
 use serde_json::{Map, Value};
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::api::response::attach_control_metadata_headers;
 use crate::clock::current_unix_ms as current_request_candidate_unix_ms;
@@ -400,12 +400,57 @@ async fn retry_prefetch_stream_failure_if_needed(
     payload: &GatewaySyncReportRequest,
     allow_candidate_retry: bool,
 ) -> bool {
+    let error_type = stream_failure_body_field(payload, "type").unwrap_or("retryable_stream_error");
+    let error_message = stream_failure_body_field(payload, "message").unwrap_or_default();
     if !allow_candidate_retry {
+        info!(
+            event_name = "local_stream_prefetch_retry_decision",
+            log_type = "event",
+            trace_id = %trace_id,
+            request_id = %short_request_id(plan.request_id.as_str()),
+            candidate_id = ?plan.candidate_id,
+            provider_name = plan.provider_name.as_deref().unwrap_or("-"),
+            provider_id = %plan.provider_id,
+            endpoint_id = %plan.endpoint_id,
+            key_id = %plan.key_id,
+            model_name = plan.model_name.as_deref().unwrap_or("-"),
+            status_code = payload.status_code,
+            error_type,
+            error_message,
+            allow_candidate_retry,
+            retry_next_candidate = false,
+            retry_decision = "blocked_by_failure_type",
+            "gateway will not retry prefetch stream failure because failure type is gateway-local"
+        );
         return false;
     }
 
     let (failure_analysis, error_body) =
         resolve_stream_failure_analysis(state, plan, report_context, payload).await;
+    let retry_next_candidate = matches!(
+        failure_analysis.decision,
+        LocalFailoverDecision::RetryNextCandidate
+    );
+    info!(
+        event_name = "local_stream_prefetch_retry_decision",
+        log_type = "event",
+        trace_id = %trace_id,
+        request_id = %short_request_id(plan.request_id.as_str()),
+        candidate_id = ?plan.candidate_id,
+        provider_name = plan.provider_name.as_deref().unwrap_or("-"),
+        provider_id = %plan.provider_id,
+        endpoint_id = %plan.endpoint_id,
+        key_id = %plan.key_id,
+        model_name = plan.model_name.as_deref().unwrap_or("-"),
+        status_code = payload.status_code,
+        error_type,
+        error_message,
+        allow_candidate_retry,
+        retry_next_candidate,
+        failover_decision = ?failure_analysis.decision,
+        failover_classification = failure_analysis.classification.as_str(),
+        "gateway evaluated retryability for prefetch stream failure"
+    );
     if !matches!(
         failure_analysis.decision,
         LocalFailoverDecision::RetryNextCandidate
@@ -423,8 +468,6 @@ async fn retry_prefetch_stream_failure_if_needed(
     )
     .await;
 
-    let error_type = stream_failure_body_field(payload, "type").unwrap_or("retryable_stream_error");
-    let error_message = stream_failure_body_field(payload, "message").unwrap_or_default();
     let terminal_unix_secs = current_request_candidate_unix_ms();
     record_report_request_candidate_status(
         state,
@@ -545,6 +588,24 @@ pub(super) async fn handle_prefetch_provider_private_stream_error(
     body_json: Value,
 ) -> Result<Option<Response<Body>>, GatewayError> {
     let failure = build_stream_failure_from_provider_error_body(status_code, &body_json);
+    info!(
+        event_name = "local_stream_prefetch_provider_error_detected",
+        log_type = "event",
+        trace_id = %trace_id,
+        request_id = %short_request_id(plan.request_id.as_str()),
+        candidate_id = ?plan.candidate_id,
+        provider_name = plan.provider_name.as_deref().unwrap_or("-"),
+        provider_id = %plan.provider_id,
+        endpoint_id = %plan.endpoint_id,
+        key_id = %plan.key_id,
+        model_name = plan.model_name.as_deref().unwrap_or("-"),
+        report_kind,
+        status_code,
+        error_type = failure.error_type.as_str(),
+        error_message = failure.error_message.as_str(),
+        buffered_body_bytes = buffered_body.len(),
+        "gateway detected provider stream error before client-visible response"
+    );
     remember_provider_session_risk_control_block_for_failure(
         state,
         plan,
@@ -617,6 +678,25 @@ pub(super) async fn handle_prefetch_stream_failure(
     .await;
 
     let allow_candidate_retry = failure.allows_prefetch_candidate_retry();
+    info!(
+        event_name = "local_stream_prefetch_failure_detected",
+        log_type = "event",
+        trace_id = %trace_id,
+        request_id = %short_request_id(plan.request_id.as_str()),
+        candidate_id = ?plan.candidate_id,
+        provider_name = plan.provider_name.as_deref().unwrap_or("-"),
+        provider_id = %plan.provider_id,
+        endpoint_id = %plan.endpoint_id,
+        key_id = %plan.key_id,
+        model_name = plan.model_name.as_deref().unwrap_or("-"),
+        report_kind,
+        status_code = failure.status_code,
+        error_type = failure.error_type.as_str(),
+        error_message = failure.error_message.as_str(),
+        allow_candidate_retry,
+        buffered_body_bytes = buffered_body.len(),
+        "gateway detected stream failure before client-visible response"
+    );
     let payload = build_stream_failure_sync_payload(
         trace_id,
         report_kind.to_string(),

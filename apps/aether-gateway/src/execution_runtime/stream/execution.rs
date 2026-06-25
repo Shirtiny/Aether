@@ -2396,7 +2396,10 @@ async fn execute_stream_from_frame_stream(
     let mut sync_json_stream_bridge_active = false;
     let prefetch_started_at = Instant::now();
     let mut continue_prefetching_control_stream = false;
+    let mut logged_control_prefetch_extension = false;
+    let mut prefetch_release_reason = "not_started";
     if skip_direct_finalize_prefetch {
+        prefetch_release_reason = "skipped";
         debug!(
             event_name = "execution_runtime_stream_prefetch_skipped",
             log_type = "debug",
@@ -2421,16 +2424,40 @@ async fn execute_stream_from_frame_stream(
     {
         loop {
             if prefetched_inspection_body.len() >= MAX_STREAM_PREFETCH_BYTES {
+                prefetch_release_reason = "byte_limit";
                 break;
             }
             if prefetched_chunks.len() >= MAX_STREAM_PREFETCH_FRAMES
                 && !continue_prefetching_control_stream
             {
+                prefetch_release_reason = "frame_limit";
                 break;
             }
             let extend_control_prefetch = !limit_direct_finalize_prefetch
                 && prefetched_chunks.len() >= MAX_STREAM_PREFETCH_FRAMES
                 && continue_prefetching_control_stream;
+            if extend_control_prefetch && !logged_control_prefetch_extension {
+                logged_control_prefetch_extension = true;
+                info!(
+                    event_name = "execution_runtime_stream_prefetch_control_extension_started",
+                    log_type = "event",
+                    trace_id = %trace_id,
+                    request_id = %request_id_for_log,
+                    candidate_id = ?candidate_id,
+                    plan_kind,
+                    report_kind,
+                    provider_name,
+                    endpoint_id = %plan.endpoint_id,
+                    key_id = %plan.key_id,
+                    model_name,
+                    candidate_index = candidate_index.as_str(),
+                    status_code,
+                    prefetched_frames = prefetched_chunks.len(),
+                    prefetched_bytes = prefetched_inspection_body.len(),
+                    timeout_ms = CONTROL_STREAM_PREFETCH_EXTENSION_TIMEOUT.as_millis() as u64,
+                    "gateway extended control-only stream prefetch before client-visible body"
+                );
+            }
             let next_frame_result = if limit_direct_finalize_prefetch {
                 match tokio::time::timeout(
                     REWRITTEN_STREAM_PREFETCH_TIMEOUT,
@@ -2440,6 +2467,7 @@ async fn execute_stream_from_frame_stream(
                 {
                     Ok(result) => result,
                     Err(_) => {
+                        prefetch_release_reason = "rewritten_timeout";
                         debug!(
                             event_name = "execution_runtime_stream_prefetch_limited",
                             log_type = "debug",
@@ -2463,6 +2491,7 @@ async fn execute_stream_from_frame_stream(
                 let Some(remaining) = CONTROL_STREAM_PREFETCH_EXTENSION_TIMEOUT
                     .checked_sub(prefetch_started_at.elapsed())
                 else {
+                    prefetch_release_reason = "control_extension_expired";
                     debug!(
                         event_name = "execution_runtime_stream_prefetch_control_extension_expired",
                         log_type = "debug",
@@ -2491,6 +2520,7 @@ async fn execute_stream_from_frame_stream(
                 {
                     Ok(result) => result,
                     Err(_) => {
+                        prefetch_release_reason = "control_extension_limited";
                         debug!(
                             event_name = "execution_runtime_stream_prefetch_control_extension_limited",
                             log_type = "debug",
@@ -2541,6 +2571,7 @@ async fn execute_stream_from_frame_stream(
                 }
             }) else {
                 reached_eof = true;
+                prefetch_release_reason = "eof";
                 break;
             };
             let frame_observed_at = observed_frame.observed_at;
@@ -2618,9 +2649,9 @@ async fn execute_stream_from_frame_stream(
                     );
                     match inspection {
                         StreamPrefetchInspection::EmbeddedError(body_json) => {
-                            debug!(
+                            info!(
                                 event_name = "execution_runtime_stream_prefetch_embedded_error_detected",
-                                log_type = "debug",
+                                log_type = "event",
                                 trace_id = %trace_id,
                                 request_id = %request_id_for_log,
                                 candidate_id = ?candidate_id,
@@ -2631,6 +2662,9 @@ async fn execute_stream_from_frame_stream(
                                 key_id = %plan.key_id,
                                 model_name,
                                 candidate_index = candidate_index.as_str(),
+                                status_code,
+                                prefetched_frames = prefetched_chunks.len(),
+                                prefetched_bytes = prefetched_inspection_body.len(),
                                 provider_prefetched_body_bytes = provider_prefetched_body.len(),
                                 "gateway detected embedded error while prefetching execution runtime stream"
                             );
@@ -2684,6 +2718,7 @@ async fn execute_stream_from_frame_stream(
                                     prefetched_body.extend_from_slice(&outcome.sse_body);
                                     prefetched_chunks.push(Bytes::from(outcome.sse_body));
                                     sync_json_stream_bridge_active = true;
+                                    prefetch_release_reason = "sync_json_bridge";
                                     break;
                                 }
                                 Ok(None) => {}
@@ -2785,6 +2820,7 @@ async fn execute_stream_from_frame_stream(
                     }
 
                     if matches!(inspection, StreamPrefetchInspection::NonError) {
+                        prefetch_release_reason = "non_error_detected";
                         break;
                     }
                 }
@@ -2798,6 +2834,7 @@ async fn execute_stream_from_frame_stream(
                         stream_terminal_summary = summary;
                     }
                     reached_eof = true;
+                    prefetch_release_reason = "eof";
                     break;
                 }
                 StreamFramePayload::Error { error } => {
@@ -2829,6 +2866,33 @@ async fn execute_stream_from_frame_stream(
                 StreamFramePayload::Headers { .. } => {}
             }
         }
+    }
+    if skip_direct_finalize_prefetch || direct_stream_finalize_kind.is_some() {
+        info!(
+            event_name = "execution_runtime_stream_prefetch_released",
+            log_type = "event",
+            trace_id = %trace_id,
+            request_id = %request_id_for_log,
+            candidate_id = ?candidate_id,
+            plan_kind,
+            report_kind = direct_stream_finalize_kind.as_deref().unwrap_or("-"),
+            provider_name,
+            endpoint_id = %plan.endpoint_id,
+            key_id = %plan.key_id,
+            model_name,
+            candidate_index = candidate_index.as_str(),
+            status_code,
+            content_type = upstream_content_type.unwrap_or("-"),
+            prefetch_release_reason,
+            prefetched_frames = prefetched_chunks.len(),
+            prefetched_bytes = prefetched_inspection_body.len(),
+            provider_prefetched_body_bytes = provider_prefetched_body.len(),
+            reached_eof,
+            sync_json_stream_bridge_active,
+            control_prefetch_active_at_release = continue_prefetching_control_stream,
+            control_prefetch_extension_started = logged_control_prefetch_extension,
+            "gateway released prefetched stream data to client"
+        );
     }
     drop(private_stream_normalizer);
     drop(local_stream_rewriter);
