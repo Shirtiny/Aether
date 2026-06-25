@@ -123,6 +123,7 @@ const STREAM_IDLE_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const STREAM_IDLE_LOG_INTERVAL_MS: u64 = 60_000;
 const REWRITTEN_STREAM_PREFETCH_TIMEOUT: Duration = Duration::from_millis(750);
 const CONTROL_STREAM_PREFETCH_EXTENSION_TIMEOUT: Duration = Duration::from_secs(3);
+const CONTROL_STREAM_PREFETCH_EXTENSION_MAX_BYTES: usize = 256 * 1024;
 
 fn record_sync_terminal_usage(
     state: &AppState,
@@ -2423,8 +2424,19 @@ async fn execute_stream_from_frame_stream(
         .filter(|_| !skip_direct_finalize_prefetch)
     {
         loop {
-            if prefetched_inspection_body.len() >= MAX_STREAM_PREFETCH_BYTES {
-                prefetch_release_reason = "byte_limit";
+            let control_prefetch_extension_allowed =
+                !limit_direct_finalize_prefetch && continue_prefetching_control_stream;
+            let prefetch_byte_limit = if control_prefetch_extension_allowed {
+                CONTROL_STREAM_PREFETCH_EXTENSION_MAX_BYTES
+            } else {
+                MAX_STREAM_PREFETCH_BYTES
+            };
+            if prefetched_inspection_body.len() >= prefetch_byte_limit {
+                prefetch_release_reason = if control_prefetch_extension_allowed {
+                    "control_extension_byte_limit"
+                } else {
+                    "byte_limit"
+                };
                 break;
             }
             if prefetched_chunks.len() >= MAX_STREAM_PREFETCH_FRAMES
@@ -2433,9 +2445,9 @@ async fn execute_stream_from_frame_stream(
                 prefetch_release_reason = "frame_limit";
                 break;
             }
-            let extend_control_prefetch = !limit_direct_finalize_prefetch
-                && prefetched_chunks.len() >= MAX_STREAM_PREFETCH_FRAMES
-                && continue_prefetching_control_stream;
+            let extend_control_prefetch = control_prefetch_extension_allowed
+                && (prefetched_chunks.len() >= MAX_STREAM_PREFETCH_FRAMES
+                    || prefetched_inspection_body.len() >= MAX_STREAM_PREFETCH_BYTES);
             if extend_control_prefetch && !logged_control_prefetch_extension {
                 logged_control_prefetch_extension = true;
                 info!(
@@ -4359,13 +4371,18 @@ mod tests {
                 },
             }));
             for index in 0..=crate::execution_runtime::MAX_STREAM_PREFETCH_FRAMES {
+                let padding = if index == 0 {
+                    "x".repeat(crate::execution_runtime::MAX_STREAM_PREFETCH_BYTES + 1)
+                } else {
+                    String::new()
+                };
                 yield Ok::<Bytes, std::io::Error>(ndjson_frame(StreamFrame {
                     frame_type: StreamFrameType::Data,
                     payload: StreamFramePayload::Data {
                         chunk_b64: None,
                         text: Some(format!(
                             "event: response.created\n\
-                             data: {{\"type\":\"response.created\",\"response\":{{\"id\":\"resp_control_{index}\",\"status\":\"in_progress\"}}}}\n\n"
+                             data: {{\"type\":\"response.created\",\"response\":{{\"id\":\"resp_control_{index}\",\"status\":\"in_progress\",\"metadata\":{{\"padding\":\"{padding}\"}}}}}}\n\n"
                         )),
                     },
                 }));
