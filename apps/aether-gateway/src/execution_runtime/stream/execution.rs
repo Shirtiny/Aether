@@ -3942,9 +3942,13 @@ mod tests {
         StreamFrame, StreamFramePayload, StreamFrameType,
     };
     use aether_data::repository::candidates::InMemoryRequestCandidateRepository;
+    use aether_data::repository::provider_catalog::InMemoryProviderCatalogReadRepository;
     use aether_data::repository::usage::InMemoryUsageReadRepository;
     use aether_data_contracts::repository::candidates::{
         RequestCandidateReadRepository, RequestCandidateStatus,
+    };
+    use aether_data_contracts::repository::provider_catalog::{
+        ProviderCatalogReadRepository, StoredProviderCatalogKey, StoredProviderCatalogProvider,
     };
     use aether_data_contracts::repository::usage::UsageReadRepository;
     use aether_usage_runtime::UsageRuntimeConfig;
@@ -3960,13 +3964,15 @@ mod tests {
     use tokio::sync::{mpsc, watch, Notify};
 
     use super::{
-        build_sse_body_stream, client_format_allows_proxy_generated_sse_control_blocks,
+        build_sse_body_stream, build_stream_failure_report,
+        client_format_allows_proxy_generated_sse_control_blocks,
         ensure_stream_terminal_summary_for_missing_observed_finish,
         execute_execution_runtime_stream, execute_stream_from_frame_stream,
-        maybe_apply_kiro_prompt_cache_usage_to_stream_summary, merge_stream_terminal_summary,
-        should_limit_direct_finalize_prefetch, should_probe_success_failover_before_stream,
-        should_skip_direct_finalize_prefetch, stream_chunk_contains_sse_done,
-        stream_requires_observed_terminal_event, stream_terminal_summary_missing_observed_finish,
+        handle_prefetch_stream_failure, maybe_apply_kiro_prompt_cache_usage_to_stream_summary,
+        merge_stream_terminal_summary, should_limit_direct_finalize_prefetch,
+        should_probe_success_failover_before_stream, should_skip_direct_finalize_prefetch,
+        stream_chunk_contains_sse_done, stream_requires_observed_terminal_event,
+        stream_terminal_summary_missing_observed_finish,
         stream_terminal_summary_missing_observed_finish_with_requirement,
         stream_terminal_summary_represents_failure_with_requirement,
         ClientVisibleStreamCompletionTracker,
@@ -3995,6 +4001,282 @@ mod tests {
 
     fn test_state() -> AppState {
         AppState::new().expect("gateway state should build")
+    }
+
+    fn test_responses_stream_plan(request_id: &str, candidate_id: &str) -> ExecutionPlan {
+        ExecutionPlan {
+            request_id: request_id.into(),
+            candidate_id: Some(candidate_id.into()),
+            provider_name: Some("G-aisc".into()),
+            provider_id: "provider-g-aisc".into(),
+            endpoint_id: "endpoint-g-aisc".into(),
+            key_id: "key-g-aisc".into(),
+            method: "POST".into(),
+            url: "https://sub.g-aisc.com/v1/responses".into(),
+            headers: BTreeMap::from([
+                ("content-type".into(), "application/json".into()),
+                ("accept".into(), "text/event-stream".into()),
+            ]),
+            content_type: Some("application/json".into()),
+            content_encoding: None,
+            body: RequestBody::from_json(json!({
+                "model": "gpt-5.5",
+                "input": [],
+                "stream": true
+            })),
+            stream: true,
+            client_api_format: "openai:responses".into(),
+            provider_api_format: "openai:responses".into(),
+            model_name: Some("gpt-5.5".into()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        }
+    }
+
+    fn test_prefetch_report_context(request_id: &str, candidate_id: &str) -> Value {
+        json!({
+            "request_id": request_id,
+            "candidate_id": candidate_id,
+            "candidate_index": 0,
+            "retry_index": 0,
+            "provider_id": "provider-g-aisc",
+            "endpoint_id": "endpoint-g-aisc",
+            "key_id": "key-g-aisc",
+            "provider_api_format": "openai:responses",
+            "client_api_format": "openai:responses",
+        })
+    }
+
+    fn sample_provider_catalog_provider(
+        provider_id: &str,
+        provider_type: &str,
+    ) -> StoredProviderCatalogProvider {
+        StoredProviderCatalogProvider::new(
+            provider_id.to_string(),
+            provider_type.to_string(),
+            None,
+            provider_type.to_string(),
+        )
+        .expect("provider should build")
+    }
+
+    fn sample_provider_catalog_key(key_id: &str, provider_id: &str) -> StoredProviderCatalogKey {
+        StoredProviderCatalogKey::new(
+            key_id.to_string(),
+            provider_id.to_string(),
+            "default".to_string(),
+            "bearer".to_string(),
+            None,
+            true,
+        )
+        .expect("key should build")
+        .with_transport_fields(
+            Some(json!(["openai:responses"])),
+            "sk-codex-test".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("key transport should build")
+    }
+
+    fn sample_codex_paid_headers() -> BTreeMap<String, String> {
+        BTreeMap::from([
+            ("x-codex-plan-type".to_string(), "team".to_string()),
+            (
+                "x-codex-primary-used-percent".to_string(),
+                "100".to_string(),
+            ),
+            (
+                "x-codex-secondary-used-percent".to_string(),
+                "31".to_string(),
+            ),
+            (
+                "x-codex-primary-window-minutes".to_string(),
+                "300".to_string(),
+            ),
+            (
+                "x-codex-secondary-window-minutes".to_string(),
+                "10080".to_string(),
+            ),
+            (
+                "x-codex-primary-reset-after-seconds".to_string(),
+                "15160".to_string(),
+            ),
+            (
+                "x-codex-secondary-reset-after-seconds".to_string(),
+                "524059".to_string(),
+            ),
+            (
+                "x-codex-primary-reset-at".to_string(),
+                "1776148929".to_string(),
+            ),
+            (
+                "x-codex-secondary-reset-at".to_string(),
+                "1776657828".to_string(),
+            ),
+        ])
+    }
+
+    #[tokio::test]
+    async fn prefetch_stream_failure_retries_retryable_status_before_finalizing() {
+        crate::orchestration::clear_local_report_effect_caches_for_tests();
+
+        let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
+        let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
+        let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![sample_provider_catalog_provider("provider-g-aisc", "codex")],
+            Vec::new(),
+            vec![sample_provider_catalog_key("key-g-aisc", "provider-g-aisc")],
+        ));
+        let state = AppState::new()
+            .expect("app state should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
+                    Arc::clone(&request_candidate_repository),
+                    Arc::clone(&usage_repository),
+                )
+                .attach_provider_catalog_repository_for_tests(Arc::clone(&provider_catalog_repository)),
+            )
+            .with_usage_runtime_for_tests(UsageRuntimeConfig {
+                enabled: true,
+                ..UsageRuntimeConfig::default()
+            });
+        let plan = test_responses_stream_plan("req-prefetch-503", "cand-prefetch-503");
+
+        let response = handle_prefetch_stream_failure(
+            &state,
+            "trace-prefetch-503",
+            &test_decision(),
+            &plan,
+            Some(test_prefetch_report_context(
+                "req-prefetch-503",
+                "cand-prefetch-503",
+            )),
+            "req-prefetch-503",
+            Some("cand-prefetch-503"),
+            "openai_responses_sync_finalize",
+            sample_codex_paid_headers(),
+            None,
+            &[],
+            build_stream_failure_report(
+                "service_unavailable_error",
+                "Our servers are currently overloaded. Please try again later.",
+                503,
+            ),
+        )
+        .await
+        .expect("prefetch failure handling should succeed");
+
+        assert!(
+            response.is_none(),
+            "retryable prefetch failures should let the candidate loop try the next provider"
+        );
+
+        let candidates = request_candidate_repository
+            .list_by_request_id("req-prefetch-503")
+            .await
+            .expect("request candidates should read");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].status, RequestCandidateStatus::Failed);
+        assert_eq!(candidates[0].status_code, Some(503));
+        assert_eq!(
+            candidates[0].error_type.as_deref(),
+            Some("service_unavailable_error")
+        );
+        assert!(
+            usage_repository
+                .find_by_request_id("req-prefetch-503")
+                .await
+                .expect("usage should read")
+                .is_none(),
+            "retryable candidate failures must not finalize request usage before a later candidate"
+        );
+
+        let keys = provider_catalog_repository
+            .list_keys_by_ids(&["key-g-aisc".to_string()])
+            .await
+            .expect("provider keys should read");
+        let quota = keys[0]
+            .status_snapshot
+            .as_ref()
+            .and_then(Value::as_object)
+            .and_then(|snapshot| snapshot.get("quota"))
+            .and_then(Value::as_object)
+            .expect("retryable prefetch report should refresh codex quota");
+        assert_eq!(quota.get("provider_type"), Some(&json!("codex")));
+        assert_eq!(quota.get("source"), Some(&json!("response_headers")));
+        assert_eq!(quota.get("code"), Some(&json!("exhausted")));
+    }
+
+    #[tokio::test]
+    async fn prefetch_stream_failure_does_not_retry_gateway_transform_errors() {
+        let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
+        let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
+        let state = AppState::new()
+            .expect("app state should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
+                    Arc::clone(&request_candidate_repository),
+                    Arc::clone(&usage_repository),
+                ),
+            )
+            .with_usage_runtime_for_tests(UsageRuntimeConfig {
+                enabled: true,
+                ..UsageRuntimeConfig::default()
+            });
+        for (request_id, candidate_id, error_type) in [
+            (
+                "req-prefetch-local-rewrite",
+                "cand-prefetch-local-rewrite",
+                "execution_runtime_stream_rewrite_error",
+            ),
+            (
+                "req-prefetch-local-bridge",
+                "cand-prefetch-local-bridge",
+                "execution_runtime_sync_json_stream_bridge_error",
+            ),
+        ] {
+            let plan = test_responses_stream_plan(request_id, candidate_id);
+
+            let response = handle_prefetch_stream_failure(
+                &state,
+                "trace-prefetch-local-transform",
+                &test_decision(),
+                &plan,
+                Some(test_prefetch_report_context(request_id, candidate_id)),
+                request_id,
+                Some(candidate_id),
+                "openai_responses_sync_finalize",
+                BTreeMap::from([("content-type".to_string(), "text/event-stream".to_string())]),
+                None,
+                br#"{"id":"already-started"}"#,
+                build_stream_failure_report(
+                    error_type,
+                    "failed to transform execution runtime stream chunk",
+                    502,
+                ),
+            )
+            .await
+            .expect("prefetch failure handling should succeed")
+            .expect("gateway-side transform failures should not retry another provider");
+
+            assert_eq!(response.status(), axum::http::StatusCode::BAD_GATEWAY);
+
+            let candidates = request_candidate_repository
+                .list_by_request_id(request_id)
+                .await
+                .expect("request candidates should read");
+            assert_eq!(candidates.len(), 1);
+            assert_eq!(candidates[0].status, RequestCandidateStatus::Failed);
+            assert_eq!(candidates[0].status_code, Some(502));
+            assert_eq!(candidates[0].error_type.as_deref(), Some(error_type));
+        }
     }
 
     #[test]

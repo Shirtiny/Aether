@@ -23,8 +23,8 @@ use crate::orchestration::{
     apply_local_execution_effect, resolve_local_failover_analysis_for_attempt,
     trace_upstream_response_body, with_upstream_response_report_context,
     LocalAdaptiveRateLimitEffect, LocalAttemptFailureEffect, LocalExecutionEffect,
-    LocalExecutionEffectContext, LocalHealthFailureEffect, LocalOAuthInvalidationEffect,
-    LocalPoolErrorEffect,
+    LocalExecutionEffectContext, LocalFailoverAnalysis, LocalFailoverDecision,
+    LocalHealthFailureEffect, LocalOAuthInvalidationEffect, LocalPoolErrorEffect,
 };
 use crate::request_candidate_runtime::record_report_request_candidate_status;
 use crate::scheduler::session_risk_control::client_session_key_from_metadata;
@@ -55,6 +55,17 @@ struct StreamFailureBodyFields<'a> {
 }
 
 impl StreamFailureReport {
+    fn allows_prefetch_candidate_retry(&self) -> bool {
+        !matches!(
+            self.error_type.as_str(),
+            "execution_runtime_stream_frame_decode_error"
+                | "execution_runtime_stream_chunk_decode_error"
+                | "execution_runtime_sync_json_stream_bridge_error"
+                | "execution_runtime_stream_rewrite_error"
+                | "execution_runtime_stream_rewrite_flush_error"
+        )
+    }
+
     fn into_body_json(self) -> Value {
         let Self {
             status_code,
@@ -226,19 +237,20 @@ fn stream_failure_body_field<'a>(
         .and_then(Value::as_str)
 }
 
-async fn record_stream_sync_failure(
+fn stream_failure_error_body(payload: &GatewaySyncReportRequest) -> Option<String> {
+    payload
+        .body_json
+        .as_ref()
+        .and_then(|body_json| serde_json::to_string(body_json).ok())
+}
+
+async fn resolve_stream_failure_analysis(
     state: &AppState,
     plan: &ExecutionPlan,
     report_context: Option<&Value>,
     payload: &GatewaySyncReportRequest,
-    started_at_unix_ms: Option<u64>,
-) {
-    let error_type = stream_failure_body_field(payload, "type").unwrap_or("internal");
-    let error_message = stream_failure_body_field(payload, "message").unwrap_or_default();
-    let error_body = payload
-        .body_json
-        .as_ref()
-        .and_then(|body_json| serde_json::to_string(body_json).ok());
+) -> (LocalFailoverAnalysis, Option<String>) {
+    let error_body = stream_failure_error_body(payload);
     let failure_analysis = resolve_local_failover_analysis_for_attempt(
         state,
         plan,
@@ -247,6 +259,18 @@ async fn record_stream_sync_failure(
         error_body.as_deref(),
     )
     .await;
+    (failure_analysis, error_body)
+}
+
+async fn apply_stream_failure_effects(
+    state: &AppState,
+    plan: &ExecutionPlan,
+    report_context: Option<&Value>,
+    payload: &GatewaySyncReportRequest,
+    failure_analysis: LocalFailoverAnalysis,
+    error_body: Option<&str>,
+) {
+    let error_type = stream_failure_body_field(payload, "type").unwrap_or("internal");
     if matches!(error_type, "first_byte_timeout" | "read_timeout") {
         apply_local_execution_effect(
             state,
@@ -303,7 +327,7 @@ async fn record_stream_sync_failure(
         },
         LocalExecutionEffect::OauthInvalidation(LocalOAuthInvalidationEffect {
             status_code: payload.status_code,
-            response_text: error_body.as_deref(),
+            response_text: error_body,
         }),
     )
     .await;
@@ -317,8 +341,30 @@ async fn record_stream_sync_failure(
             status_code: payload.status_code,
             classification: failure_analysis.classification,
             headers: &payload.headers,
-            error_body: error_body.as_deref(),
+            error_body,
         }),
+    )
+    .await;
+}
+
+async fn record_stream_sync_failure(
+    state: &AppState,
+    plan: &ExecutionPlan,
+    report_context: Option<&Value>,
+    payload: &GatewaySyncReportRequest,
+    started_at_unix_ms: Option<u64>,
+) {
+    let error_type = stream_failure_body_field(payload, "type").unwrap_or("internal");
+    let error_message = stream_failure_body_field(payload, "message").unwrap_or_default();
+    let (failure_analysis, error_body) =
+        resolve_stream_failure_analysis(state, plan, report_context, payload).await;
+    apply_stream_failure_effects(
+        state,
+        plan,
+        report_context,
+        payload,
+        failure_analysis,
+        error_body.as_deref(),
     )
     .await;
     let context_seed = build_terminal_usage_context_seed(plan, report_context);
@@ -344,6 +390,112 @@ async fn record_stream_sync_failure(
         },
     )
     .await;
+}
+
+async fn retry_prefetch_stream_failure_if_needed(
+    state: &AppState,
+    trace_id: &str,
+    plan: &ExecutionPlan,
+    report_context: Option<&Value>,
+    payload: &GatewaySyncReportRequest,
+    allow_candidate_retry: bool,
+) -> bool {
+    if !allow_candidate_retry {
+        return false;
+    }
+
+    let (failure_analysis, error_body) =
+        resolve_stream_failure_analysis(state, plan, report_context, payload).await;
+    if !matches!(
+        failure_analysis.decision,
+        LocalFailoverDecision::RetryNextCandidate
+    ) {
+        return false;
+    }
+
+    apply_stream_failure_effects(
+        state,
+        plan,
+        report_context,
+        payload,
+        failure_analysis,
+        error_body.as_deref(),
+    )
+    .await;
+
+    let error_type = stream_failure_body_field(payload, "type").unwrap_or("retryable_stream_error");
+    let error_message = stream_failure_body_field(payload, "message").unwrap_or_default();
+    let terminal_unix_secs = current_request_candidate_unix_ms();
+    record_report_request_candidate_status(
+        state,
+        report_context,
+        SchedulerRequestCandidateStatusUpdate {
+            status: RequestCandidateStatus::Failed,
+            status_code: Some(payload.status_code),
+            error_type: Some(error_type.to_string()),
+            error_message: Some(error_message.to_string()),
+            latency_ms: payload
+                .telemetry
+                .as_ref()
+                .and_then(|telemetry| telemetry.elapsed_ms),
+            started_at_unix_ms: Some(terminal_unix_secs),
+            finished_at_unix_ms: Some(terminal_unix_secs),
+        },
+    )
+    .await;
+
+    submit_prefetch_stream_retry_report_effects(state, trace_id, payload).await;
+
+    warn!(
+        event_name = "local_stream_prefetch_candidate_retry_scheduled",
+        log_type = "event",
+        trace_id = %trace_id,
+        request_id = %short_request_id(plan.request_id.as_str()),
+        candidate_id = ?plan.candidate_id,
+        provider_name = plan.provider_name.as_deref().unwrap_or("-"),
+        provider_id = %plan.provider_id,
+        endpoint_id = %plan.endpoint_id,
+        key_id = %plan.key_id,
+        model_name = plan.model_name.as_deref().unwrap_or("-"),
+        status_code = payload.status_code,
+        error_type,
+        failover_classification = failure_analysis.classification.as_str(),
+        "gateway retrying next local stream candidate after retryable prefetch stream failure"
+    );
+
+    true
+}
+
+async fn submit_prefetch_stream_retry_report_effects(
+    state: &AppState,
+    trace_id: &str,
+    payload: &GatewaySyncReportRequest,
+) {
+    let Some(error_report_kind) =
+        resolve_core_error_background_report_kind(payload.report_kind.as_str())
+    else {
+        warn!(
+            event_name = "local_stream_prefetch_retry_missing_error_report_mapping",
+            log_type = "event",
+            trace_id = %trace_id,
+            report_kind = %payload.report_kind,
+            "gateway could not submit retryable prefetch stream failure report because no background error mapping exists"
+        );
+        return;
+    };
+
+    let mut report_payload = payload.clone();
+    report_payload.report_kind = error_report_kind;
+    if let Err(err) = submit_sync_report(state, report_payload).await {
+        warn!(
+            event_name = "local_stream_prefetch_retry_report_submit_failed",
+            log_type = "ops",
+            trace_id = %trace_id,
+            report_kind = %payload.report_kind,
+            error = ?err,
+            "gateway failed to submit retryable prefetch stream failure report effects"
+        );
+    }
 }
 
 pub(super) async fn remember_provider_session_risk_control_block_for_failure(
@@ -417,6 +569,19 @@ pub(super) async fn handle_prefetch_provider_private_stream_error(
             .then(|| base64::engine::general_purpose::STANDARD.encode(buffered_body)),
         telemetry,
     };
+    if retry_prefetch_stream_failure_if_needed(
+        state,
+        trace_id,
+        plan,
+        payload.report_context.as_ref(),
+        &payload,
+        true,
+    )
+    .await
+    {
+        return Ok(None);
+    }
+
     record_stream_sync_failure(state, plan, payload.report_context.as_ref(), &payload, None).await;
 
     let response =
@@ -451,6 +616,7 @@ pub(super) async fn handle_prefetch_stream_failure(
     )
     .await;
 
+    let allow_candidate_retry = failure.allows_prefetch_candidate_retry();
     let payload = build_stream_failure_sync_payload(
         trace_id,
         report_kind.to_string(),
@@ -460,6 +626,19 @@ pub(super) async fn handle_prefetch_stream_failure(
         buffered_body,
         failure,
     );
+    if retry_prefetch_stream_failure_if_needed(
+        state,
+        trace_id,
+        plan,
+        payload.report_context.as_ref(),
+        &payload,
+        allow_candidate_retry,
+    )
+    .await
+    {
+        return Ok(None);
+    }
+
     record_stream_sync_failure(state, plan, payload.report_context.as_ref(), &payload, None).await;
 
     let response =
