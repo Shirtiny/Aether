@@ -58,6 +58,32 @@
             />
           </div>
         </div>
+        <div class="mt-5 grid gap-4 sm:grid-cols-2 lg:max-w-xl">
+          <label class="space-y-2">
+            <span class="text-sm font-medium text-foreground">最小延迟（ms）</span>
+            <Input
+              :model-value="config.delay_min_ms"
+              type="number"
+              min="0"
+              max="60000"
+              step="1"
+              class="h-9"
+              @update:model-value="(value) => updateDelay('delay_min_ms', value)"
+            />
+          </label>
+          <label class="space-y-2">
+            <span class="text-sm font-medium text-foreground">最大延迟（ms）</span>
+            <Input
+              :model-value="config.delay_max_ms"
+              type="number"
+              min="0"
+              max="60000"
+              step="1"
+              class="h-9"
+              @update:model-value="(value) => updateDelay('delay_max_ms', value)"
+            />
+          </label>
+        </div>
       </section>
 
       <CardSection
@@ -213,12 +239,16 @@ import SelectItem from '@/components/ui/select-item.vue'
 import SelectTrigger from '@/components/ui/select-trigger.vue'
 import SelectValue from '@/components/ui/select-value.vue'
 import {
+  LOCAL_PROBE_INTERCEPT_DEFAULT_DELAY_MAX_MS,
+  LOCAL_PROBE_INTERCEPT_DEFAULT_DELAY_MIN_MS,
+  LOCAL_PROBE_INTERCEPT_MAX_DELAY_MS,
   LOCAL_PROBE_INTERCEPT_DEFAULT_RULES,
   modulesApi,
   type LocalProbeInterceptConfig,
   type LocalProbeInterceptKind,
   type LocalProbeInterceptRule,
 } from '@/api/modules'
+import { parseNumberInput } from '@/utils/form'
 import { useModuleStore } from '@/stores/modules'
 import { useToast } from '@/composables/useToast'
 import { parseApiError } from '@/utils/errorParser'
@@ -227,6 +257,8 @@ import { log } from '@/utils/logger'
 const defaultConfig: LocalProbeInterceptConfig = {
   enabled: true,
   rules: LOCAL_PROBE_INTERCEPT_DEFAULT_RULES.map(rule => ({ ...rule })),
+  delay_min_ms: LOCAL_PROBE_INTERCEPT_DEFAULT_DELAY_MIN_MS,
+  delay_max_ms: LOCAL_PROBE_INTERCEPT_DEFAULT_DELAY_MAX_MS,
 }
 
 const moduleStore = useModuleStore()
@@ -249,7 +281,18 @@ function cloneConfig(value: LocalProbeInterceptConfig): LocalProbeInterceptConfi
   return {
     enabled: value.enabled,
     rules: value.rules.map(rule => ({ ...rule })),
+    delay_min_ms: value.delay_min_ms,
+    delay_max_ms: value.delay_max_ms,
   }
+}
+
+type LocalProbeDelayKey = 'delay_min_ms' | 'delay_max_ms'
+
+function updateDelay(field: LocalProbeDelayKey, value: string | number) {
+  config.value[field] = Math.floor(parseNumberInput(value, {
+    min: 0,
+    max: LOCAL_PROBE_INTERCEPT_MAX_DELAY_MS,
+  }) ?? 0)
 }
 
 function updateRule(index: number, patch: Partial<LocalProbeInterceptRule>) {
@@ -335,6 +378,30 @@ function sanitizeRules(): LocalProbeInterceptRule[] | null {
   return rules
 }
 
+function sanitizeDelayRange(): Pick<LocalProbeInterceptConfig, 'delay_min_ms' | 'delay_max_ms'> | null {
+  const delayMinMs = Math.floor(Number(config.value.delay_min_ms))
+  const delayMaxMs = Math.floor(Number(config.value.delay_max_ms))
+  if (
+    !Number.isFinite(delayMinMs)
+    || !Number.isFinite(delayMaxMs)
+    || delayMinMs < 0
+    || delayMaxMs < 0
+    || delayMinMs > LOCAL_PROBE_INTERCEPT_MAX_DELAY_MS
+    || delayMaxMs > LOCAL_PROBE_INTERCEPT_MAX_DELAY_MS
+  ) {
+    error(`随机延迟必须是 0 到 ${LOCAL_PROBE_INTERCEPT_MAX_DELAY_MS} ms 之间的整数`)
+    return null
+  }
+  if (delayMinMs > delayMaxMs) {
+    error('随机延迟最小值不能大于最大值')
+    return null
+  }
+  return {
+    delay_min_ms: delayMinMs,
+    delay_max_ms: delayMaxMs,
+  }
+}
+
 function normalizeRuleId(raw: string, index: number): string {
   const normalized = raw.trim().replace(/[^A-Za-z0-9_.-]/g, '_').replace(/^_+|_+$/g, '')
   return normalized ? normalized.slice(0, 64) : `custom_${index + 1}`
@@ -360,11 +427,14 @@ async function loadConfig() {
 async function saveConfig() {
   const rules = sanitizeRules()
   if (!rules) return
+  const delayRange = sanitizeDelayRange()
+  if (!delayRange) return
   saving.value = true
   try {
     const saved = await modulesApi.updateLocalProbeInterceptConfig({
       enabled: config.value.enabled,
       rules,
+      ...delayRange,
     })
     config.value = cloneConfig(saved)
     originalConfig.value = cloneConfig(saved)

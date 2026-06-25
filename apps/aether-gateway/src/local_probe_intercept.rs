@@ -1,12 +1,20 @@
 use serde_json::Value;
+use uuid::Uuid;
 
 use crate::handlers::shared::system_config_bool;
 use crate::{AppState, GatewayError};
 
 pub(crate) const LOCAL_PROBE_INTERCEPT_ENABLED_KEY: &str = "module.local_probe_intercept.enabled";
 pub(crate) const LOCAL_PROBE_INTERCEPT_RULES_KEY: &str = "module.local_probe_intercept.rules";
+pub(crate) const LOCAL_PROBE_INTERCEPT_DELAY_MIN_MS_KEY: &str =
+    "module.local_probe_intercept.delay_min_ms";
+pub(crate) const LOCAL_PROBE_INTERCEPT_DELAY_MAX_MS_KEY: &str =
+    "module.local_probe_intercept.delay_max_ms";
 
 const MAX_PROBE_TEXT_CHARS: usize = 512;
+const DEFAULT_DELAY_MIN_MS: u64 = 900;
+const DEFAULT_DELAY_MAX_MS: u64 = 2_000;
+const MAX_DELAY_MS: u64 = 60_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LocalProbeInterceptKind {
@@ -28,6 +36,31 @@ impl LocalProbeInterceptKind {
 pub(crate) struct LocalProbeInterceptAnswer {
     pub(crate) text: String,
     pub(crate) kind: LocalProbeInterceptKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LocalProbeInterceptDelay {
+    pub(crate) min_ms: u64,
+    pub(crate) max_ms: u64,
+}
+
+impl LocalProbeInterceptDelay {
+    fn from_bounds(min_ms: u64, max_ms: u64) -> Self {
+        let min_ms = min_ms.min(MAX_DELAY_MS);
+        let max_ms = max_ms.min(MAX_DELAY_MS);
+        if min_ms <= max_ms {
+            Self { min_ms, max_ms }
+        } else {
+            Self {
+                min_ms: max_ms,
+                max_ms: min_ms,
+            }
+        }
+    }
+
+    pub(crate) fn random_ms(self) -> u64 {
+        random_delay_ms(self.min_ms, self.max_ms)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -52,6 +85,38 @@ pub(crate) async fn local_probe_intercept_enabled(state: &AppState) -> Result<bo
         .read_system_config_json_value(LOCAL_PROBE_INTERCEPT_ENABLED_KEY)
         .await?;
     Ok(system_config_bool(value.as_ref(), true))
+}
+
+pub(crate) async fn local_probe_intercept_delay(
+    state: &AppState,
+) -> Result<LocalProbeInterceptDelay, GatewayError> {
+    let min_ms = read_local_probe_delay_ms(
+        state,
+        LOCAL_PROBE_INTERCEPT_DELAY_MIN_MS_KEY,
+        DEFAULT_DELAY_MIN_MS,
+    )
+    .await?;
+    let max_ms = read_local_probe_delay_ms(
+        state,
+        LOCAL_PROBE_INTERCEPT_DELAY_MAX_MS_KEY,
+        DEFAULT_DELAY_MAX_MS,
+    )
+    .await?;
+
+    Ok(LocalProbeInterceptDelay::from_bounds(min_ms, max_ms))
+}
+
+async fn read_local_probe_delay_ms(
+    state: &AppState,
+    key: &str,
+    default_ms: u64,
+) -> Result<u64, GatewayError> {
+    let value = state.read_system_config_json_value(key).await?;
+    Ok(value
+        .as_ref()
+        .and_then(Value::as_u64)
+        .unwrap_or(default_ms)
+        .min(MAX_DELAY_MS))
 }
 
 async fn load_local_probe_intercept_rules(
@@ -131,6 +196,14 @@ fn normalize_probe_text(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn random_delay_ms(min_ms: u64, max_ms: u64) -> u64 {
+    if min_ms >= max_ms {
+        return min_ms;
+    }
+    let span = max_ms - min_ms + 1;
+    min_ms + (Uuid::new_v4().as_u128() % u128::from(span)) as u64
+}
+
 fn is_ignored_probe_punctuation(ch: char) -> bool {
     matches!(
         ch,
@@ -191,5 +264,32 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn delay_bounds_are_normalized_and_capped() {
+        assert_eq!(
+            LocalProbeInterceptDelay::from_bounds(2_000, 900),
+            LocalProbeInterceptDelay {
+                min_ms: 900,
+                max_ms: 2_000,
+            }
+        );
+        assert_eq!(
+            LocalProbeInterceptDelay::from_bounds(120_000, 90_000),
+            LocalProbeInterceptDelay {
+                min_ms: MAX_DELAY_MS,
+                max_ms: MAX_DELAY_MS,
+            }
+        );
+    }
+
+    #[test]
+    fn random_delay_stays_inside_bounds() {
+        for _ in 0..128 {
+            let delay_ms = random_delay_ms(900, 2_000);
+            assert!((900..=2_000).contains(&delay_ms));
+        }
+        assert_eq!(random_delay_ms(1_234, 1_234), 1_234);
     }
 }

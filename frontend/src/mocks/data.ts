@@ -9,7 +9,12 @@ import type { User as AdminUser } from '@/api/users'
 import type { AdminApiKeysResponse } from '@/api/admin'
 import type { Profile, UsageResponse } from '@/api/me'
 import type { ProviderWithEndpointsSummary, GlobalModelResponse } from '@/api/endpoints/types'
-import { LOCAL_PROBE_INTERCEPT_DEFAULT_RULES, type ModuleStatus } from '@/api/modules'
+import {
+  LOCAL_PROBE_INTERCEPT_DEFAULT_DELAY_MAX_MS,
+  LOCAL_PROBE_INTERCEPT_DEFAULT_DELAY_MIN_MS,
+  LOCAL_PROBE_INTERCEPT_DEFAULT_RULES,
+  type ModuleStatus,
+} from '@/api/modules'
 
 // ========== 用户数据 ==========
 
@@ -958,6 +963,16 @@ export const MOCK_SYSTEM_CONFIGS: Array<{ key: string; value: unknown; descripti
     key: 'module.local_probe_intercept.rules',
     value: LOCAL_PROBE_INTERCEPT_DEFAULT_RULES.map(rule => ({ ...rule })),
     description: '测活拦截提示词与回复规则',
+  },
+  {
+    key: 'module.local_probe_intercept.delay_min_ms',
+    value: LOCAL_PROBE_INTERCEPT_DEFAULT_DELAY_MIN_MS,
+    description: '测活拦截随机延迟最小毫秒数',
+  },
+  {
+    key: 'module.local_probe_intercept.delay_max_ms',
+    value: LOCAL_PROBE_INTERCEPT_DEFAULT_DELAY_MAX_MS,
+    description: '测活拦截随机延迟最大毫秒数',
   },
   { key: 'module.server_chan_push.enabled', value: false, description: 'Server 酱推送开关' },
   { key: 'module.server_chan_push.send_key', value: null, description: 'Server 酱 SendKey' },

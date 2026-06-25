@@ -6,7 +6,8 @@ use crate::image_capabilities::{
     openai_image_gateway_max_generation_count, openai_image_gateway_max_generation_count_for_model,
 };
 use crate::local_probe_intercept::{
-    local_probe_intercept_answer, local_probe_intercept_enabled, LocalProbeInterceptKind,
+    local_probe_intercept_answer, local_probe_intercept_delay, local_probe_intercept_enabled,
+    LocalProbeInterceptKind,
 };
 use crate::{AppState, GatewayError};
 use aether_ai_formats::UPSTREAM_IS_STREAM_KEY;
@@ -21,7 +22,7 @@ use axum::http::{self, HeaderMap, Response};
 use axum::response::IntoResponse;
 use axum::Json;
 use serde_json::{json, Value};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::warn;
 
 const CLAUDE_COUNT_TOKENS_INVALID_PAYLOAD_DETAIL: &str = "Invalid token count payload";
@@ -976,6 +977,14 @@ async fn maybe_build_local_openai_probe_response(
         .and_then(value_as_bool)
         .unwrap_or(false);
     let answer = probe.answer();
+    let delay_ms = local_probe_intercept_delay(state)
+        .await
+        .ok()
+        .map(|delay| delay.random_ms())
+        .unwrap_or(0);
+    if delay_ms > 0 {
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+    }
     record_local_openai_probe_usage(
         state,
         request_context,

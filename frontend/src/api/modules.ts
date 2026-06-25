@@ -63,6 +63,8 @@ export interface LocalProbeInterceptRule {
 export interface LocalProbeInterceptConfig {
   enabled: boolean
   rules: LocalProbeInterceptRule[]
+  delay_min_ms: number
+  delay_max_ms: number
 }
 
 export const CHAT_PII_REDACTION_DEFAULT_RULES: ChatPiiRedactionRule[] = [
@@ -149,7 +151,13 @@ const CHAT_PII_REDACTION_CONFIG_KEYS = {
 const LOCAL_PROBE_INTERCEPT_CONFIG_KEYS = {
   enabled: 'module.local_probe_intercept.enabled',
   rules: 'module.local_probe_intercept.rules',
+  delay_min_ms: 'module.local_probe_intercept.delay_min_ms',
+  delay_max_ms: 'module.local_probe_intercept.delay_max_ms',
 } as const
+
+export const LOCAL_PROBE_INTERCEPT_DEFAULT_DELAY_MIN_MS = 900
+export const LOCAL_PROBE_INTERCEPT_DEFAULT_DELAY_MAX_MS = 2000
+export const LOCAL_PROBE_INTERCEPT_MAX_DELAY_MS = 60000
 
 const CHAT_PII_REDACTION_DEFAULT_CONFIG: ChatPiiRedactionConfig = {
   enabled: false,
@@ -276,13 +284,34 @@ function normalizeLocalProbeInterceptRules(value: unknown): LocalProbeInterceptR
     .filter((item): item is LocalProbeInterceptRule => item !== null)
 }
 
+function normalizeLocalProbeInterceptDelayMs(value: unknown, fallback: number): number {
+  if (value === null || value === undefined || value === '') return fallback
+  const parsed = typeof value === 'number' ? value : Number(value)
+  if (!Number.isInteger(parsed) || parsed < 0 || parsed > LOCAL_PROBE_INTERCEPT_MAX_DELAY_MS) {
+    return fallback
+  }
+  return parsed
+}
+
 function normalizeLocalProbeInterceptConfig(values: {
   enabled: unknown
   rules: unknown
+  delay_min_ms: unknown
+  delay_max_ms: unknown
 }): LocalProbeInterceptConfig {
+  const delayMinMs = normalizeLocalProbeInterceptDelayMs(
+    values.delay_min_ms,
+    LOCAL_PROBE_INTERCEPT_DEFAULT_DELAY_MIN_MS,
+  )
+  const delayMaxMs = normalizeLocalProbeInterceptDelayMs(
+    values.delay_max_ms,
+    LOCAL_PROBE_INTERCEPT_DEFAULT_DELAY_MAX_MS,
+  )
   return {
     enabled: values.enabled !== false,
     rules: normalizeLocalProbeInterceptRules(values.rules),
+    delay_min_ms: Math.min(delayMinMs, delayMaxMs),
+    delay_max_ms: Math.max(delayMinMs, delayMaxMs),
   }
 }
 
@@ -389,21 +418,35 @@ export const modulesApi = {
   },
 
   async getLocalProbeInterceptConfig(): Promise<LocalProbeInterceptConfig> {
-    const [enabled, rules] = await Promise.all([
+    const [enabled, rules, delayMinMs, delayMaxMs] = await Promise.all([
       getSystemConfigValue(LOCAL_PROBE_INTERCEPT_CONFIG_KEYS.enabled),
       getSystemConfigValue(LOCAL_PROBE_INTERCEPT_CONFIG_KEYS.rules),
+      getSystemConfigValue(LOCAL_PROBE_INTERCEPT_CONFIG_KEYS.delay_min_ms),
+      getSystemConfigValue(LOCAL_PROBE_INTERCEPT_CONFIG_KEYS.delay_max_ms),
     ])
 
-    return normalizeLocalProbeInterceptConfig({ enabled, rules })
+    return normalizeLocalProbeInterceptConfig({
+      enabled,
+      rules,
+      delay_min_ms: delayMinMs,
+      delay_max_ms: delayMaxMs,
+    })
   },
 
   async updateLocalProbeInterceptConfig(config: LocalProbeInterceptConfig): Promise<LocalProbeInterceptConfig> {
-    const [enabled, rules] = await Promise.all([
+    const [enabled, rules, delayMinMs, delayMaxMs] = await Promise.all([
       updateSystemConfigValue(LOCAL_PROBE_INTERCEPT_CONFIG_KEYS.enabled, config.enabled, '测活拦截总开关'),
       updateSystemConfigValue(LOCAL_PROBE_INTERCEPT_CONFIG_KEYS.rules, config.rules, '测活拦截提示词与回复规则'),
+      updateSystemConfigValue(LOCAL_PROBE_INTERCEPT_CONFIG_KEYS.delay_min_ms, config.delay_min_ms, '测活拦截随机延迟最小毫秒数'),
+      updateSystemConfigValue(LOCAL_PROBE_INTERCEPT_CONFIG_KEYS.delay_max_ms, config.delay_max_ms, '测活拦截随机延迟最大毫秒数'),
     ])
 
-    return normalizeLocalProbeInterceptConfig({ enabled, rules })
+    return normalizeLocalProbeInterceptConfig({
+      enabled,
+      rules,
+      delay_min_ms: delayMinMs,
+      delay_max_ms: delayMaxMs,
+    })
   },
 
   /**

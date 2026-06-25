@@ -49,6 +49,9 @@ pub const ADMIN_SYSTEM_CONFIG_SUPPORTED_VERSIONS: &[&str] =
 pub const ADMIN_SYSTEM_USERS_EXPORT_VERSION: &str = "1.5";
 pub const ADMIN_SYSTEM_USERS_SUPPORTED_VERSIONS: &[&str] =
     &["1.3", "1.4", ADMIN_SYSTEM_USERS_EXPORT_VERSION];
+const LOCAL_PROBE_INTERCEPT_DEFAULT_DELAY_MIN_MS: u64 = 900;
+const LOCAL_PROBE_INTERCEPT_DEFAULT_DELAY_MAX_MS: u64 = 2_000;
+const LOCAL_PROBE_INTERCEPT_MAX_DELAY_MS: u64 = 60_000;
 pub const ADMIN_SYSTEM_PROVIDER_OPS_SENSITIVE_CREDENTIAL_FIELDS: &[&str] = &[
     "api_key",
     "password",
@@ -2032,6 +2035,12 @@ pub fn admin_system_config_default_value(key: &str) -> Option<serde_json::Value>
         "enable_oauth_token_refresh" => Some(json!(true)),
         "module.local_probe_intercept.enabled" => Some(json!(true)),
         "module.local_probe_intercept.rules" => Some(local_probe_intercept_default_rules()),
+        "module.local_probe_intercept.delay_min_ms" => {
+            Some(json!(LOCAL_PROBE_INTERCEPT_DEFAULT_DELAY_MIN_MS))
+        }
+        "module.local_probe_intercept.delay_max_ms" => {
+            Some(json!(LOCAL_PROBE_INTERCEPT_DEFAULT_DELAY_MAX_MS))
+        }
         "module.important_notification.enabled" => Some(json!(false)),
         "module.important_notification.email_enabled" => Some(json!(false)),
         "module.important_notification.email_recipients" => Some(json!("")),
@@ -2217,6 +2226,18 @@ fn normalize_local_probe_intercept_rules_value(
         }));
     }
     Ok(Value::Array(rules))
+}
+
+fn normalize_local_probe_intercept_delay_ms_value(
+    value: serde_json::Value,
+    default_ms: u64,
+) -> Result<serde_json::Value, ()> {
+    match value.as_u64() {
+        Some(delay_ms) if delay_ms <= LOCAL_PROBE_INTERCEPT_MAX_DELAY_MS => Ok(json!(delay_ms)),
+        Some(_) => Err(()),
+        None if value.is_null() => Ok(json!(default_ms)),
+        None => Err(()),
+    }
 }
 
 fn normalize_local_probe_intercept_rule_id(raw: &str, index: usize) -> String {
@@ -2596,6 +2617,30 @@ pub fn parse_admin_system_config_update(
                     )
                 })?;
             }
+        }
+        "module.local_probe_intercept.delay_min_ms" => {
+            value = normalize_local_probe_intercept_delay_ms_value(
+                value,
+                LOCAL_PROBE_INTERCEPT_DEFAULT_DELAY_MIN_MS,
+            )
+            .map_err(|_| {
+                (
+                    http::StatusCode::BAD_REQUEST,
+                    json!({ "detail": "请求数据验证失败" }),
+                )
+            })?;
+        }
+        "module.local_probe_intercept.delay_max_ms" => {
+            value = normalize_local_probe_intercept_delay_ms_value(
+                value,
+                LOCAL_PROBE_INTERCEPT_DEFAULT_DELAY_MAX_MS,
+            )
+            .map_err(|_| {
+                (
+                    http::StatusCode::BAD_REQUEST,
+                    json!({ "detail": "请求数据验证失败" }),
+                )
+            })?;
         }
         "module.server_chan_push.send_key" => {
             value = normalize_nullable_string_config_value(value).map_err(|_| {
@@ -3880,6 +3925,14 @@ mod tests {
             admin_system_config_default_value("module.local_probe_intercept.enabled"),
             Some(json!(true))
         );
+        assert_eq!(
+            admin_system_config_default_value("module.local_probe_intercept.delay_min_ms"),
+            Some(json!(900))
+        );
+        assert_eq!(
+            admin_system_config_default_value("module.local_probe_intercept.delay_max_ms"),
+            Some(json!(2_000))
+        );
         let rules = admin_system_config_default_value("module.local_probe_intercept.rules")
             .expect("local probe rules should have defaults");
         let rules = rules.as_array().expect("rules should be an array");
@@ -3976,6 +4029,37 @@ mod tests {
             r#"{ "value": "true" }"#.as_bytes(),
         )
         .expect_err("enabled flag should reject strings");
+        assert_eq!(err.0, http::StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn local_probe_intercept_delay_values_are_bounded_milliseconds() {
+        let update = parse_admin_system_config_update(
+            "module.local_probe_intercept.delay_min_ms",
+            r#"{ "value": 900 }"#.as_bytes(),
+        )
+        .expect("delay min should parse");
+        assert_eq!(update.value, json!(900));
+
+        let update = parse_admin_system_config_update(
+            "module.local_probe_intercept.delay_max_ms",
+            r#"{ "value": null }"#.as_bytes(),
+        )
+        .expect("null max delay should use default");
+        assert_eq!(update.value, json!(2_000));
+
+        let err = parse_admin_system_config_update(
+            "module.local_probe_intercept.delay_min_ms",
+            r#"{ "value": "900" }"#.as_bytes(),
+        )
+        .expect_err("delay should reject strings");
+        assert_eq!(err.0, http::StatusCode::BAD_REQUEST);
+
+        let err = parse_admin_system_config_update(
+            "module.local_probe_intercept.delay_max_ms",
+            r#"{ "value": 60001 }"#.as_bytes(),
+        )
+        .expect_err("delay should reject values above the cap");
         assert_eq!(err.0, http::StatusCode::BAD_REQUEST);
     }
 
