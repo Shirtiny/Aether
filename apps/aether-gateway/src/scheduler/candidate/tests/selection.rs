@@ -32,6 +32,7 @@ use super::super::selection::{
     is_exact_all_skipped_by_auth_limit, select_minimal_candidate as select_candidate_impl,
 };
 use super::support::{sample_auth_snapshot, sample_key, sample_provider, sample_row};
+use crate::scheduler::session_risk_control::session_risk_control_block_key;
 
 async fn select_candidate(
     selection_row_source: &(impl MinimalCandidateSelectionRowSource + Sync),
@@ -243,6 +244,19 @@ fn provider_with_risk_control_session_avoidance(
     provider
 }
 
+fn provider_with_risk_control_session_avoidance_mode(
+    id: &str,
+    mode: &str,
+) -> aether_data_contracts::repository::provider_catalog::StoredProviderCatalogProvider {
+    let mut provider = sample_provider(id, None);
+    provider.config = Some(serde_json::json!({
+        "risk_control_session_avoidance": {
+            "mode": mode
+        }
+    }));
+    provider
+}
+
 fn sample_risk_control_usage(
     provider_id: &str,
     session_key: &str,
@@ -339,6 +353,23 @@ fn risk_control_session_avoidance_state(
     request_candidate_items: Vec<StoredRequestCandidate>,
     usage_items: Vec<StoredRequestUsageAudit>,
 ) -> AppState {
+    risk_control_session_avoidance_state_with_providers(
+        vec![
+            provider_with_risk_control_session_avoidance("risk-provider-a", protected_enabled),
+            provider_with_risk_control_session_avoidance("risk-provider-b", true),
+        ],
+        request_candidate_items,
+        usage_items,
+    )
+}
+
+fn risk_control_session_avoidance_state_with_providers(
+    providers: Vec<
+        aether_data_contracts::repository::provider_catalog::StoredProviderCatalogProvider,
+    >,
+    request_candidate_items: Vec<StoredRequestCandidate>,
+    usage_items: Vec<StoredRequestUsageAudit>,
+) -> AppState {
     let candidates = Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(vec![
         provider_key_concurrency_row(
             "risk-provider-a",
@@ -358,10 +389,7 @@ fn risk_control_session_avoidance_state(
         ),
     ]));
     let provider_catalog = Arc::new(InMemoryProviderCatalogReadRepository::seed(
-        vec![
-            provider_with_risk_control_session_avoidance("risk-provider-a", protected_enabled),
-            provider_with_risk_control_session_avoidance("risk-provider-b", true),
-        ],
+        providers,
         Vec::new(),
         vec![
             sample_key("key-risk-a", "risk-provider-a", Some(10)),
@@ -505,7 +533,111 @@ async fn risk_control_session_avoidance_uses_runtime_block_without_history() {
 }
 
 #[tokio::test]
-async fn risk_control_session_avoidance_does_not_skip_when_provider_switch_is_disabled() {
+async fn risk_control_session_block_mode_blocks_all_candidates_from_history() {
+    let session_key = "session-risk-alpha";
+    let state = risk_control_session_avoidance_state_with_providers(
+        vec![
+            provider_with_risk_control_session_avoidance_mode("risk-provider-a", "block"),
+            provider_with_risk_control_session_avoidance_mode("risk-provider-b", "candidate"),
+        ],
+        Vec::new(),
+        vec![sample_risk_control_usage(
+            "risk-provider-a",
+            session_key,
+            100,
+        )],
+    );
+    let affinity = ClientSessionAffinity::from_session_key(session_key);
+
+    let selected = select_candidate_with_session_affinity(
+        state.data.as_ref(),
+        &state,
+        "openai:chat",
+        "gpt-4.1",
+        Some(&affinity),
+        200,
+    )
+    .await
+    .expect("selection should succeed");
+
+    assert!(
+        selected.is_none(),
+        "block mode should make the risk-controlled session ineligible for all candidates"
+    );
+}
+
+#[tokio::test]
+async fn risk_control_session_block_mode_blocks_all_candidates_from_runtime_block() {
+    let session_key = "session-risk-alpha";
+    let state = risk_control_session_avoidance_state_with_providers(
+        vec![
+            provider_with_risk_control_session_avoidance_mode("risk-provider-a", "block"),
+            provider_with_risk_control_session_avoidance_mode("risk-provider-b", "candidate"),
+        ],
+        Vec::new(),
+        Vec::new(),
+    );
+    let remembered = state
+        .remember_provider_session_risk_control_block_if_enabled("risk-provider-a", session_key)
+        .await
+        .expect("runtime block should be recorded");
+    assert!(remembered);
+    let affinity = ClientSessionAffinity::from_session_key(session_key);
+
+    let selected = select_candidate_with_session_affinity(
+        state.data.as_ref(),
+        &state,
+        "openai:chat",
+        "gpt-4.1",
+        Some(&affinity),
+        200,
+    )
+    .await
+    .expect("selection should succeed");
+
+    assert!(
+        selected.is_none(),
+        "runtime session block should make all providers ineligible"
+    );
+}
+
+#[tokio::test]
+async fn risk_control_session_runtime_block_respects_current_provider_mode() {
+    let session_key = "session-risk-alpha";
+    let state = risk_control_session_avoidance_state_with_providers(
+        vec![
+            provider_with_risk_control_session_avoidance_mode("risk-provider-a", "candidate"),
+            provider_with_risk_control_session_avoidance_mode("risk-provider-b", "candidate"),
+        ],
+        Vec::new(),
+        Vec::new(),
+    );
+    let block_key =
+        session_risk_control_block_key(session_key).expect("session block key should build");
+    state
+        .runtime_kv_setex(&block_key, "risk-provider-a", 60)
+        .await
+        .expect("session runtime block should write");
+    let affinity = ClientSessionAffinity::from_session_key(session_key);
+
+    let selected = select_candidate_with_session_affinity(
+        state.data.as_ref(),
+        &state,
+        "openai:chat",
+        "gpt-4.1",
+        Some(&affinity),
+        200,
+    )
+    .await
+    .expect("selection should succeed")
+    .expect("candidate-mode provider should not keep a session-wide block active");
+
+    assert_eq!(selected.provider_id, "risk-provider-a");
+    assert_eq!(selected.key_id, "key-risk-a");
+}
+
+#[tokio::test]
+async fn risk_control_session_avoidance_treats_legacy_false_as_candidate_mode() {
     let session_key = "session-risk-alpha";
     let state = risk_control_session_avoidance_state(
         false,
@@ -528,10 +660,10 @@ async fn risk_control_session_avoidance_does_not_skip_when_provider_switch_is_di
     )
     .await
     .expect("selection should succeed")
-    .expect("first provider should remain selectable");
+    .expect("fallback provider should be selected");
 
-    assert_eq!(selected.provider_id, "risk-provider-a");
-    assert_eq!(selected.key_id, "key-risk-a");
+    assert_eq!(selected.provider_id, "risk-provider-b");
+    assert_eq!(selected.key_id, "key-risk-b");
 }
 
 #[test]

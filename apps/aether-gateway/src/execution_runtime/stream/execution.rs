@@ -75,6 +75,7 @@ use crate::execution_runtime::kiro_web_search::maybe_execute_kiro_web_search_str
 use crate::execution_runtime::oauth_retry::refresh_oauth_plan_auth_for_retry;
 #[cfg(test)]
 use crate::execution_runtime::remote_compat::post_stream_plan_to_remote_execution_runtime;
+use crate::execution_runtime::session_risk_control::should_return_and_record_session_risk_control_block_response;
 use crate::execution_runtime::submission::{
     resolve_core_error_background_report_kind, resolve_local_sync_error_status_code,
     strip_utf8_bom_and_ws, submit_local_core_error_or_sync_finalize,
@@ -2171,6 +2172,18 @@ async fn execute_stream_from_frame_stream(
         )
         .await;
         let failover_decision = failover_analysis.decision;
+        let return_session_risk_control_block_response =
+            should_return_and_record_session_risk_control_block_response(
+                state,
+                &plan,
+                report_context.as_ref(),
+                status_code,
+                &headers,
+                error_response_text.as_deref(),
+                client_body_json.as_ref().or(provider_body_json.as_ref()),
+                &client_error_body,
+            )
+            .await;
         debug!(
             event_name = "execution_runtime_stream_failover_decided",
             log_type = "debug",
@@ -2187,7 +2200,9 @@ async fn execute_stream_from_frame_stream(
             failover_decision = failover_decision.as_str(),
             "gateway resolved execution runtime stream failover decision"
         );
-        if matches!(failover_decision, LocalFailoverDecision::RetryNextCandidate) {
+        if !return_session_risk_control_block_response
+            && matches!(failover_decision, LocalFailoverDecision::RetryNextCandidate)
+        {
             let terminal_unix_secs = current_request_candidate_unix_ms();
             let error_trace_report_context = with_stream_error_trace_context(
                 report_context.as_ref(),
@@ -2233,7 +2248,8 @@ async fn execute_stream_from_frame_stream(
             return Ok(None);
         }
 
-        if !matches!(failover_decision, LocalFailoverDecision::StopLocalFailover)
+        if !return_session_risk_control_block_response
+            && !matches!(failover_decision, LocalFailoverDecision::StopLocalFailover)
             && should_fallback_to_control_stream(
                 plan_kind,
                 status_code,
@@ -2340,7 +2356,7 @@ async fn execute_stream_from_frame_stream(
             },
         )
         .await;
-        if stream_error_finalize_kind.is_some() {
+        if stream_error_finalize_kind.is_some() && !return_session_risk_control_block_response {
             let response =
                 submit_local_core_error_or_sync_finalize(state, trace_id, decision, payload)
                     .await?;

@@ -67,6 +67,7 @@ use crate::{
 use axum::body::{to_bytes, Body, Bytes};
 use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{self, header::HeaderName, header::HeaderValue, Response};
+use base64::Engine as _;
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 use std::{
@@ -1793,6 +1794,15 @@ pub(crate) async fn proxy_request(
             state.take_local_execution_runtime_miss_diagnostic(&trace_id);
         let local_execution_runtime_miss_context =
             build_local_execution_runtime_miss_context(&state, &trace_id, control_decision).await;
+        let session_risk_control_block_response = if let Some(session_key) =
+            local_execution_runtime_miss_context.session_risk_control_blocked_session_key()
+        {
+            state
+                .session_risk_control_block_response(session_key)
+                .await?
+        } else {
+            None
+        };
         let auth_api_key_concurrency_limited = diagnostic_is_auth_api_key_concurrency_limited(
             local_execution_runtime_miss_diagnostic.as_ref(),
         ) || local_execution_runtime_miss_context
@@ -1908,6 +1918,31 @@ pub(crate) async fn proxy_request(
                 Some(buffered_body),
             )
             .await;
+        }
+        if let Some(block_response) = session_risk_control_block_response {
+            let response_body = base64::engine::general_purpose::STANDARD
+                .decode(block_response.body_base64.as_bytes())
+                .map_err(|err| GatewayError::Internal(err.to_string()))?;
+            let mut response = build_client_response_from_parts(
+                block_response.status_code,
+                &block_response.headers,
+                Body::from(response_body),
+                &trace_id,
+                control_decision,
+            )?;
+            response.headers_mut().insert(
+                HeaderName::from_static(LOCAL_EXECUTION_RUNTIME_MISS_REASON_HEADER),
+                HeaderValue::from_static("session_risk_control_blocked"),
+            );
+            return Ok(finalize_gateway_response_with_context(
+                &state,
+                response,
+                &remote_addr,
+                &request_context,
+                local_execution_failure_path,
+                &started_at,
+                request_permit.take(),
+            ));
         }
         let mut response = build_local_http_error_response(
             &trace_id,
@@ -2170,8 +2205,10 @@ fn local_execution_runtime_miss_skip_reason_label(reason: &str) -> &str {
         "provider_concurrency_limit_reached" => "上游提供商并发已达上限",
         "provider_inactive" => "提供商未启用",
         "provider_key_concurrency_limit_reached" => "上游账号并发已达上限",
+        "provider_session_risk_control_avoidance" => "该会话在此提供商已触发风控避险",
         "provider_request_body_missing" => "无法构建上游请求体",
         "provider_request_body_build_failed" => "上游请求体转换失败",
+        "session_risk_control_blocked" => "该会话已触发风控阻止",
         "transport_api_format_mismatch" => "传输层 API 格式不匹配",
         "transport_api_format_unsupported" => "传输层不支持该 API 格式",
         "transport_auth_unavailable" => "上游认证信息不可用",

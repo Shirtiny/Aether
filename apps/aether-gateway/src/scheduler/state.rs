@@ -47,6 +47,11 @@ pub(crate) trait SchedulerRuntimeState {
         session_key: &str,
     ) -> Result<bool, GatewayError>;
 
+    async fn session_has_runtime_risk_control_block(
+        &self,
+        session_key: &str,
+    ) -> Result<bool, GatewayError>;
+
     async fn read_request_candidates_by_provider_id_and_client_session_key(
         &self,
         provider_id: &str,

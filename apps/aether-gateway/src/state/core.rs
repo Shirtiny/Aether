@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -22,7 +22,8 @@ use aether_runtime_state::{
 use aether_scheduler_core::PROVIDER_KEY_RPM_WINDOW_SECS;
 
 use super::{
-    AppState, FrontdoorCorsConfig, FrontdoorRuntimeGuardConfig, LocalExecutionRuntimeMissDiagnostic,
+    AppState, FrontdoorCorsConfig, FrontdoorRuntimeGuardConfig,
+    LocalExecutionRuntimeMissDiagnostic, SessionRiskControlBlockResponse,
 };
 
 use super::super::async_task::{
@@ -40,8 +41,9 @@ use super::super::model_fetch::spawn_model_fetch_worker;
 use super::super::rate_limit::{FrontdoorUserRpmConfig, FrontdoorUserRpmLimiter};
 use super::super::router::RequestAdmissionError;
 use super::super::scheduler::session_risk_control::{
-    provider_session_risk_control_avoidance_enabled,
+    provider_session_risk_control_avoidance_mode,
     provider_session_risk_control_avoidance_ttl_seconds, provider_session_risk_control_block_key,
+    session_risk_control_block_key,
 };
 use super::super::{control::GatewayControlDecision, error::GatewayError};
 use super::super::{provider_transport, usage};
@@ -1089,12 +1091,65 @@ impl AppState {
         else {
             return Ok(false);
         };
-        if !provider_session_risk_control_avoidance_enabled(provider.config.as_ref()) {
+        let mode = provider_session_risk_control_avoidance_mode(provider.config.as_ref());
+        if !mode.is_enabled() {
             return Ok(false);
         }
         let ttl_seconds =
             provider_session_risk_control_avoidance_ttl_seconds(provider.config.as_ref());
         self.runtime_kv_setex(&block_key, "1", ttl_seconds).await?;
+        if mode.blocks_session() {
+            if let Some(session_block_key) = session_risk_control_block_key(session_key) {
+                self.runtime_kv_setex(&session_block_key, provider_id, ttl_seconds)
+                    .await?;
+            }
+        }
+        Ok(true)
+    }
+
+    pub(crate) async fn remember_provider_session_risk_control_block_response_if_enabled(
+        &self,
+        provider_id: &str,
+        session_key: &str,
+        status_code: u16,
+        headers: &BTreeMap<String, String>,
+        body_base64: &str,
+    ) -> Result<bool, GatewayError> {
+        let provider_id = provider_id.trim();
+        let Some(block_key) = provider_session_risk_control_block_key(provider_id, session_key)
+        else {
+            return Ok(false);
+        };
+        let provider_ids = [provider_id.to_string()];
+        let Some(provider) = self
+            .read_provider_catalog_providers_by_ids(&provider_ids)
+            .await?
+            .into_iter()
+            .find(|provider| provider.id == provider_id)
+        else {
+            return Ok(false);
+        };
+        let mode = provider_session_risk_control_avoidance_mode(provider.config.as_ref());
+        if !mode.is_enabled() {
+            return Ok(false);
+        }
+        let ttl_seconds =
+            provider_session_risk_control_avoidance_ttl_seconds(provider.config.as_ref());
+        self.runtime_kv_setex(&block_key, "1", ttl_seconds).await?;
+        if mode.blocks_session() {
+            if let Some(session_block_key) = session_risk_control_block_key(session_key) {
+                let response = SessionRiskControlBlockResponse {
+                    provider_id: provider_id.to_string(),
+                    status_code,
+                    headers: headers.clone(),
+                    body_base64: body_base64.trim().to_string(),
+                };
+                let encoded = serde_json::to_string(&response)
+                    .map_err(|err| GatewayError::Internal(err.to_string()))?;
+                self.runtime_kv_setex(&session_block_key, &encoded, ttl_seconds)
+                    .await?;
+            }
+        }
         Ok(true)
     }
 
@@ -1108,6 +1163,67 @@ impl AppState {
             return Ok(false);
         };
         self.runtime_kv_exists(&block_key).await
+    }
+
+    pub(crate) async fn session_has_runtime_risk_control_block(
+        &self,
+        session_key: &str,
+    ) -> Result<bool, GatewayError> {
+        let Some(block_key) = session_risk_control_block_key(session_key) else {
+            return Ok(false);
+        };
+        let Some(provider_id) = self.runtime_kv_get(&block_key).await? else {
+            return Ok(false);
+        };
+        let Some(provider_id) = session_risk_control_block_provider_id(provider_id.as_str()) else {
+            return Ok(false);
+        };
+        if provider_id == "1" {
+            return Ok(true);
+        }
+        let provider_ids = [provider_id.to_string()];
+        let Some(provider) = self
+            .read_provider_catalog_providers_by_ids(&provider_ids)
+            .await?
+            .into_iter()
+            .find(|provider| provider.id == provider_id)
+        else {
+            return Ok(false);
+        };
+        Ok(provider_session_risk_control_avoidance_mode(provider.config.as_ref()).blocks_session())
+    }
+
+    pub(crate) async fn session_risk_control_block_response(
+        &self,
+        session_key: &str,
+    ) -> Result<Option<SessionRiskControlBlockResponse>, GatewayError> {
+        let Some(block_key) = session_risk_control_block_key(session_key) else {
+            return Ok(None);
+        };
+        let Some(raw) = self.runtime_kv_get(&block_key).await? else {
+            return Ok(None);
+        };
+        let Ok(response) = serde_json::from_str::<SessionRiskControlBlockResponse>(raw.as_str())
+        else {
+            return Ok(None);
+        };
+        if response.provider_id.trim().is_empty() {
+            return Ok(None);
+        }
+        let provider_ids = [response.provider_id.clone()];
+        let Some(provider) = self
+            .read_provider_catalog_providers_by_ids(&provider_ids)
+            .await?
+            .into_iter()
+            .find(|provider| provider.id == response.provider_id)
+        else {
+            return Ok(None);
+        };
+        if !provider_session_risk_control_avoidance_mode(provider.config.as_ref()).blocks_session()
+        {
+            return Ok(None);
+        }
+        Ok(Some(response))
     }
 
     pub(crate) fn remove_scheduler_affinity_cache_entry(&self, cache_key: &str) -> bool {
@@ -1337,6 +1453,17 @@ fn runtime_miss_diagnostic_has_candidate_signal(
     diagnostic.candidate_count.unwrap_or(0) > 0
         || diagnostic.skipped_candidate_count.unwrap_or(0) > 0
         || !diagnostic.skip_reasons.is_empty()
+}
+
+fn session_risk_control_block_provider_id(raw: &str) -> Option<String> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if let Ok(response) = serde_json::from_str::<SessionRiskControlBlockResponse>(value) {
+        return (!response.provider_id.trim().is_empty()).then_some(response.provider_id);
+    }
+    Some(value.to_string())
 }
 
 #[cfg(test)]

@@ -22,6 +22,7 @@ use crate::constants::{
     EXECUTION_PATH_LOCAL_EXECUTION_RUNTIME_MISS, LOCAL_EXECUTION_RUNTIME_MISS_REASON_HEADER,
 };
 use crate::control::GatewayControlDecision;
+use crate::scheduler::session_risk_control::client_session_key_from_metadata;
 use crate::state::LocalExecutionRuntimeMissDiagnostic;
 use crate::AppState;
 
@@ -89,6 +90,15 @@ impl LocalExecutionRuntimeMissContext {
                     .as_deref()
                     .map(str::trim)
                     .is_some_and(|value| value == reason)
+        })
+    }
+
+    pub(crate) fn session_risk_control_blocked_session_key(&self) -> Option<&str> {
+        if !self.all_candidates_skipped_for_reason("session_risk_control_blocked") {
+            return None;
+        }
+        self.candidate_contexts.iter().find_map(|candidate| {
+            client_session_key_from_metadata(candidate.candidate.extra_data.as_ref())
         })
     }
 

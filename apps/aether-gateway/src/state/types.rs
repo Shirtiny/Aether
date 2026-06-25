@@ -1,3 +1,7 @@
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Serialize};
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct LocalProviderDeleteTaskState {
     pub task_id: String,
@@ -30,6 +34,15 @@ pub(crate) struct LocalExecutionRuntimeMissDiagnostic {
     pub(crate) candidate_count: Option<usize>,
     pub(crate) skipped_candidate_count: Option<usize>,
     pub(crate) skip_reasons: std::collections::BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SessionRiskControlBlockResponse {
+    pub(crate) provider_id: String,
+    pub(crate) status_code: u16,
+    #[serde(default)]
+    pub(crate) headers: BTreeMap<String, String>,
+    pub(crate) body_base64: String,
 }
 
 impl LocalExecutionRuntimeMissDiagnostic {

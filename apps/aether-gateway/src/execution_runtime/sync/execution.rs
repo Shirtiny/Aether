@@ -50,6 +50,7 @@ use crate::execution_runtime::kiro_cache::{
 use crate::execution_runtime::oauth_retry::refresh_oauth_plan_auth_for_retry;
 #[cfg(test)]
 use crate::execution_runtime::remote_compat::post_sync_plan_to_remote_execution_runtime;
+use crate::execution_runtime::session_risk_control::should_return_and_record_session_risk_control_block_response;
 use crate::execution_runtime::submission::{
     resolve_local_sync_error_status_code, submit_local_core_error_or_sync_finalize,
 };
@@ -2072,7 +2073,21 @@ async fn execute_execution_runtime_sync_impl(
         )
         .await;
     }
-    if matches!(
+    let return_session_risk_control_block_response =
+        should_return_and_record_session_risk_control_block_response(
+            state,
+            &plan,
+            report_context.as_ref(),
+            result.status_code,
+            &headers,
+            local_failover_response_text.as_deref(),
+            body_json.as_ref(),
+            &body_bytes,
+        )
+        .await;
+
+    if !return_session_risk_control_block_response
+        && matches!(
         local_failover_analysis.decision,
         LocalFailoverDecision::RetryNextCandidate
     ) {
@@ -2150,7 +2165,8 @@ async fn execute_execution_runtime_sync_impl(
     } else {
         None
     };
-    if !matches!(
+    if !return_session_risk_control_block_response
+        && !matches!(
         local_failover_analysis.decision,
         LocalFailoverDecision::StopLocalFailover
     ) && should_fallback_to_control_sync(
@@ -2239,6 +2255,41 @@ async fn execute_execution_runtime_sync_impl(
     let report_context = report_context;
     let body_json = body_json;
     let telemetry = result.telemetry;
+
+    if return_session_risk_control_block_response {
+        let usage_payload = build_sync_report_payload(
+            trace_id,
+            report_kind.unwrap_or_default(),
+            report_context,
+            status_code,
+            client_headers,
+            body_json,
+            body_base64,
+            telemetry,
+        );
+        record_sync_terminal_usage_and_disarm_guard(
+            state,
+            &plan,
+            usage_payload.report_context.as_ref(),
+            &usage_payload,
+            &mut terminal_guard,
+        );
+        let response = attach_control_metadata_headers(
+            build_client_response_from_parts(
+                status_code,
+                &usage_payload.headers,
+                Body::from(body_bytes),
+                trace_id,
+                Some(decision),
+            )?,
+            request_id,
+            candidate_id,
+        )?;
+        if !usage_payload.report_kind.trim().is_empty() {
+            spawn_sync_report(state.clone(), usage_payload);
+        }
+        return Ok(Some(response));
+    }
 
     if let Some(implicit_finalize) = implicit_finalize {
         let usage_payload = implicit_finalize

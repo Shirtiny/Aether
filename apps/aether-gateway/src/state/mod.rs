@@ -37,7 +37,7 @@ pub use self::cors::FrontdoorCorsConfig;
 pub(crate) use self::types::{
     AdminWalletMutationOutcome, GatewayAdminPaymentCallbackView, GatewayUserPreferenceView,
     GatewayUserSessionView, LocalExecutionRuntimeMissDiagnostic, LocalMutationOutcome,
-    LocalProviderDeleteTaskState,
+    LocalProviderDeleteTaskState, SessionRiskControlBlockResponse,
 };
 use super::provider_transport::provider_transport_snapshot_looks_refreshed;
 pub(crate) use super::provider_transport::ProviderTransportSnapshotCacheKey;

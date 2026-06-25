@@ -1369,6 +1369,8 @@ const SKIP_REASON_LABELS: Record<string, string> = {
   pool_key_lease_busy: '池内账号正被其他请求占用',
   provider_concurrency_limit_reached: '上游提供商并发已达上限',
   provider_key_concurrency_limit_reached: '上游账号并发已达上限',
+  provider_session_risk_control_avoidance: '该会话在此提供商已触发风控避险',
+  session_risk_control_blocked: '该会话已触发风控阻止',
   provider_request_body_build_failed: '上游请求体转换失败',
   provider_request_body_missing: '无法构建上游请求体',
 }

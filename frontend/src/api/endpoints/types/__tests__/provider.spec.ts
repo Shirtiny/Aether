@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest'
 
-import { normalizeChatPiiRedactionProviderConfig, normalizePoolAdvancedConfig } from '@/api/endpoints/types'
+import {
+  normalizeChatPiiRedactionProviderConfig,
+  normalizePoolAdvancedConfig,
+  normalizeRiskControlSessionAvoidanceProviderConfig,
+} from '@/api/endpoints/types'
 
 describe('normalizePoolAdvancedConfig', () => {
   it('keeps object payloads, including empty objects', () => {
@@ -31,5 +35,20 @@ describe('normalizeChatPiiRedactionProviderConfig', () => {
   it('passes through enabled state only', () => {
     expect(normalizeChatPiiRedactionProviderConfig({ enabled: true })).toEqual({ enabled: true })
     expect(normalizeChatPiiRedactionProviderConfig({ enabled: false, entities: ['email'] })).toEqual({ enabled: false })
+  })
+})
+
+describe('normalizeRiskControlSessionAvoidanceProviderConfig', () => {
+  it('defaults unsupported and empty payloads to candidate mode', () => {
+    expect(normalizeRiskControlSessionAvoidanceProviderConfig(null)).toEqual({ mode: 'candidate' })
+    expect(normalizeRiskControlSessionAvoidanceProviderConfig({})).toEqual({ mode: 'candidate' })
+    expect(normalizeRiskControlSessionAvoidanceProviderConfig({ mode: 'unexpected' })).toEqual({ mode: 'candidate' })
+  })
+
+  it('supports select modes and legacy enabled payloads', () => {
+    expect(normalizeRiskControlSessionAvoidanceProviderConfig({ mode: 'candidate' })).toEqual({ mode: 'candidate' })
+    expect(normalizeRiskControlSessionAvoidanceProviderConfig({ mode: 'block' })).toEqual({ mode: 'block' })
+    expect(normalizeRiskControlSessionAvoidanceProviderConfig({ enabled: true })).toEqual({ mode: 'candidate' })
+    expect(normalizeRiskControlSessionAvoidanceProviderConfig({ enabled: false })).toEqual({ mode: 'candidate' })
   })
 })

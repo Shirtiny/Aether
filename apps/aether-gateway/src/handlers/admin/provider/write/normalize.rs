@@ -168,14 +168,65 @@ pub(crate) fn normalize_risk_control_session_avoidance_config(
     match value {
         serde_json::Value::Null => Ok(None),
         serde_json::Value::Object(mut map) => {
-            if map.len() != 1 || !map.contains_key("enabled") {
-                return Err("risk_control_session_avoidance 仅支持 enabled 布尔配置".to_string());
+            let ttl_seconds = map.remove("ttl_seconds");
+            let mode = map.remove("mode");
+            let enabled = map.remove("enabled");
+            if !map.is_empty() {
+                return Err(
+                    "risk_control_session_avoidance 仅支持 mode / enabled / ttl_seconds 配置"
+                        .to_string(),
+                );
             }
-            let enabled = map
-                .remove("enabled")
-                .and_then(|value| value.as_bool())
-                .ok_or_else(|| "risk_control_session_avoidance.enabled 必须是布尔值".to_string())?;
-            Ok(Some(serde_json::json!({ "enabled": enabled })))
+
+            let mode = if let Some(mode) = mode {
+                let mode = mode
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_ascii_lowercase)
+                    .ok_or_else(|| {
+                        "risk_control_session_avoidance.mode 必须是 candidate 或 block".to_string()
+                    })?;
+                match mode.as_str() {
+                    "candidate" | "block" => mode,
+                    _ => {
+                        return Err(
+                            "risk_control_session_avoidance.mode 必须是 candidate 或 block"
+                                .to_string(),
+                        )
+                    }
+                }
+            } else {
+                let Some(enabled) = enabled else {
+                    return Err(
+                        "risk_control_session_avoidance.mode 必须是 candidate 或 block".to_string(),
+                    );
+                };
+                if enabled.as_bool().ok_or_else(|| {
+                    "risk_control_session_avoidance.enabled 必须是布尔值".to_string()
+                })? {
+                    "candidate".to_string()
+                } else {
+                    return Ok(None);
+                }
+            };
+
+            let mut normalized =
+                serde_json::Map::from_iter([("mode".to_string(), serde_json::Value::String(mode))]);
+            if let Some(ttl_seconds) = ttl_seconds {
+                let ttl_seconds =
+                    ttl_seconds
+                        .as_u64()
+                        .filter(|value| *value > 0)
+                        .ok_or_else(|| {
+                            "risk_control_session_avoidance.ttl_seconds 必须是正整数".to_string()
+                        })?;
+                normalized.insert(
+                    "ttl_seconds".to_string(),
+                    serde_json::Value::from(ttl_seconds),
+                );
+            }
+            Ok(Some(serde_json::Value::Object(normalized)))
         }
         _ => Err("risk_control_session_avoidance 必须是 JSON 对象".to_string()),
     }
@@ -234,7 +285,8 @@ mod tests {
         normalize_allow_auth_channel_mismatch_formats, normalize_api_format_json_object_keys,
         normalize_api_format_list, normalize_auth_type, normalize_auth_type_by_format,
         normalize_chat_pii_redaction_config, normalize_pool_advanced_config,
-        normalize_provider_type_input, validate_vertex_api_formats,
+        normalize_provider_type_input, normalize_risk_control_session_avoidance_config,
+        validate_vertex_api_formats,
     };
     use serde_json::json;
 
@@ -275,6 +327,39 @@ mod tests {
         assert_eq!(
             normalize_chat_pii_redaction_config(Some(json!({ "enabled": "yes" }))).unwrap_err(),
             "chat_pii_redaction.enabled 必须是布尔值"
+        );
+    }
+
+    #[test]
+    fn normalize_risk_control_session_avoidance_accepts_select_modes() {
+        assert_eq!(
+            normalize_risk_control_session_avoidance_config(Some(json!({
+                "mode": "block",
+                "ttl_seconds": 60
+            })))
+            .expect("risk control avoidance should normalize"),
+            Some(json!({ "mode": "block", "ttl_seconds": 60 }))
+        );
+        assert_eq!(
+            normalize_risk_control_session_avoidance_config(Some(json!({
+                "mode": "candidate"
+            })))
+            .expect("risk control avoidance should normalize"),
+            Some(json!({ "mode": "candidate" }))
+        );
+    }
+
+    #[test]
+    fn normalize_risk_control_session_avoidance_keeps_legacy_enabled_compatible() {
+        assert_eq!(
+            normalize_risk_control_session_avoidance_config(Some(json!({ "enabled": true })))
+                .expect("legacy enabled true should normalize"),
+            Some(json!({ "mode": "candidate" }))
+        );
+        assert_eq!(
+            normalize_risk_control_session_avoidance_config(Some(json!({ "enabled": false })))
+                .expect("legacy enabled false should normalize"),
+            None
         );
     }
 

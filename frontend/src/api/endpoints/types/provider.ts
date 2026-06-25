@@ -180,8 +180,10 @@ export interface ChatPiiRedactionProviderConfig {
   enabled: boolean
 }
 
+export type RiskControlSessionAvoidanceMode = 'candidate' | 'block'
+
 export interface RiskControlSessionAvoidanceProviderConfig {
-  enabled: boolean
+  mode: RiskControlSessionAvoidanceMode
 }
 
 export interface ProviderConfig {
@@ -779,10 +781,16 @@ export function normalizeChatPiiRedactionProviderConfig(value: unknown): ChatPii
 }
 
 export function normalizeRiskControlSessionAvoidanceProviderConfig(value: unknown): RiskControlSessionAvoidanceProviderConfig {
-  if (!isPlainObject(value) || typeof value.enabled !== 'boolean') {
-    return { enabled: false }
+  if (!isPlainObject(value)) {
+    return { mode: 'candidate' }
   }
-  return { enabled: value.enabled }
+  if (value.mode === 'block' || value.mode === 'candidate') {
+    return { mode: value.mode }
+  }
+  if (value.enabled === true) {
+    return { mode: 'candidate' }
+  }
+  return { mode: 'candidate' }
 }
 
 export function normalizePoolAdvancedConfig(value: unknown): PoolAdvancedConfig | null {

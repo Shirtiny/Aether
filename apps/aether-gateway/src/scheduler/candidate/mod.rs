@@ -36,7 +36,6 @@ pub(crate) use self::selection::{
     API_KEY_CONCURRENCY_LIMIT_SKIP_REASON, AUTH_API_KEY_CONCURRENCY_LIMIT_SKIP_REASON,
     LEGACY_API_KEY_CONCURRENCY_LIMIT_SKIP_REASON,
 };
-pub(crate) use crate::scheduler::session_risk_control::provider_session_risk_control_avoidance_enabled;
 
 use crate::data::auth::GatewayAuthApiKeySnapshot;
 use crate::data::candidate_selection::{

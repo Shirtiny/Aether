@@ -35,8 +35,10 @@ use crate::request_candidate_runtime::{
     record_local_request_candidate_status, record_skipped_local_request_candidate,
     RequestCandidateRuntimeWriter,
 };
-use crate::scheduler::candidate::provider_session_risk_control_avoidance_enabled;
-use crate::scheduler::session_risk_control::client_session_key_from_metadata;
+use crate::scheduler::session_risk_control::{
+    client_session_key_from_metadata, provider_session_risk_control_avoidance_mode,
+    ProviderSessionRiskControlAvoidanceMode,
+};
 use crate::{AppState, GatewayError};
 
 const DEFAULT_STREAM_FIRST_BYTE_WATCHDOG_TIMEOUT_MS: u64 = 30_000;
@@ -52,14 +54,23 @@ fn attach_redaction_execution_candidate(response: &mut Response<Body>, candidate
     }
 }
 
-fn new_provider_session_risk_control_blocks() -> Arc<tokio::sync::Mutex<BTreeSet<String>>> {
-    Arc::new(tokio::sync::Mutex::new(BTreeSet::new()))
+#[derive(Debug, Default)]
+struct ProviderSessionRiskControlLoopBlocks {
+    session_blocked: bool,
+    provider_ids: BTreeSet<String>,
 }
 
-async fn provider_risk_control_session_avoidance_enabled(
+fn new_provider_session_risk_control_blocks(
+) -> Arc<tokio::sync::Mutex<ProviderSessionRiskControlLoopBlocks>> {
+    Arc::new(tokio::sync::Mutex::new(
+        ProviderSessionRiskControlLoopBlocks::default(),
+    ))
+}
+
+async fn provider_risk_control_session_avoidance_mode(
     state: &AppState,
     provider_id: &str,
-) -> bool {
+) -> ProviderSessionRiskControlAvoidanceMode {
     let provider_ids = [provider_id.to_string()];
     state
         .read_provider_catalog_providers_by_ids(&provider_ids)
@@ -70,9 +81,8 @@ async fn provider_risk_control_session_avoidance_enabled(
                 .into_iter()
                 .find(|provider| provider.id == provider_id)
         })
-        .is_some_and(|provider| {
-            provider_session_risk_control_avoidance_enabled(provider.config.as_ref())
-        })
+        .map(|provider| provider_session_risk_control_avoidance_mode(provider.config.as_ref()))
+        .unwrap_or(ProviderSessionRiskControlAvoidanceMode::Disabled)
 }
 
 fn value_matches_risk_control(value: Option<&serde_json::Value>) -> bool {
@@ -111,7 +121,7 @@ async fn read_request_candidate(
 
 async fn record_provider_session_risk_control_block_if_needed(
     state: &AppState,
-    blocks: &Arc<tokio::sync::Mutex<BTreeSet<String>>>,
+    blocks: &Arc<tokio::sync::Mutex<ProviderSessionRiskControlLoopBlocks>>,
     plan: &ExecutionPlan,
 ) {
     let Some(candidate_id) = plan
@@ -129,7 +139,8 @@ async fn record_provider_session_risk_control_block_if_needed(
     if !candidate_matches_risk_control(&candidate) {
         return;
     }
-    if !provider_risk_control_session_avoidance_enabled(state, &plan.provider_id).await {
+    let mode = provider_risk_control_session_avoidance_mode(state, &plan.provider_id).await;
+    if !mode.is_enabled() {
         return;
     }
     if let Some(session_key) = client_session_key_from_metadata(candidate.extra_data.as_ref()) {
@@ -148,27 +159,38 @@ async fn record_provider_session_risk_control_block_if_needed(
             );
         }
     }
-    blocks.lock().await.insert(plan.provider_id.clone());
+    let mut blocks = blocks.lock().await;
+    if mode.blocks_session() {
+        blocks.session_blocked = true;
+    }
+    blocks.provider_ids.insert(plan.provider_id.clone());
 }
 
-async fn provider_session_risk_control_blocked(
+async fn provider_session_risk_control_skip_reason(
     state: &AppState,
-    blocks: &Arc<tokio::sync::Mutex<BTreeSet<String>>>,
+    blocks: &Arc<tokio::sync::Mutex<ProviderSessionRiskControlLoopBlocks>>,
     plan: &ExecutionPlan,
     report_context: Option<&serde_json::Value>,
-) -> bool {
-    if !blocks.lock().await.contains(&plan.provider_id) {
-        return false;
-    }
+) -> Option<&'static str> {
+    let skip_reason = {
+        let blocks = blocks.lock().await;
+        if blocks.session_blocked {
+            Some("session_risk_control_blocked")
+        } else if blocks.provider_ids.contains(&plan.provider_id) {
+            Some("provider_session_risk_control_avoidance")
+        } else {
+            None
+        }
+    }?;
     record_skipped_local_request_candidate(
         state,
         plan,
         report_context,
-        "provider_session_risk_control_avoidance",
+        skip_reason,
         current_unix_ms(),
     )
     .await;
-    true
+    Some(skip_reason)
 }
 
 pub(crate) async fn execute_sync_plan_and_reports<T>(
@@ -280,7 +302,8 @@ struct SyncAttemptLoopPort<'a> {
     trace_id: &'a str,
     decision: &'a GatewayControlDecision,
     plan_kind: &'a str,
-    provider_session_risk_control_blocks: Arc<tokio::sync::Mutex<BTreeSet<String>>>,
+    provider_session_risk_control_blocks:
+        Arc<tokio::sync::Mutex<ProviderSessionRiskControlLoopBlocks>>,
 }
 
 #[async_trait]
@@ -303,7 +326,7 @@ where
         if !should_execute {
             return Ok(None);
         }
-        if provider_session_risk_control_blocked(
+        if let Some(skip_reason) = provider_session_risk_control_skip_reason(
             self.state,
             &self.provider_session_risk_control_blocks,
             attempt.execution_plan(),
@@ -330,7 +353,8 @@ where
                 provider_id = %attempt.execution_plan().provider_id,
                 endpoint_id = %attempt.execution_plan().endpoint_id,
                 key_id = %attempt.execution_plan().key_id,
-                "gateway skipped local sync candidate after same request triggered provider session risk-control avoidance"
+                skip_reason = skip_reason,
+                "gateway skipped local sync candidate after same request triggered risk-control avoidance"
             );
             return Ok(None);
         }
@@ -378,6 +402,12 @@ where
             .await;
         }
         if let Some(response) = response.as_mut() {
+            record_provider_session_risk_control_block_if_needed(
+                self.state,
+                &self.provider_session_risk_control_blocks,
+                attempt.execution_plan(),
+            )
+            .await;
             if let Some(guard) = sticky_init_cleanup.as_mut() {
                 guard.disarm();
             }
@@ -594,7 +624,8 @@ struct StreamAttemptLoopPort<'a> {
     trace_id: &'a str,
     decision: &'a GatewayControlDecision,
     plan_kind: &'a str,
-    provider_session_risk_control_blocks: Arc<tokio::sync::Mutex<BTreeSet<String>>>,
+    provider_session_risk_control_blocks:
+        Arc<tokio::sync::Mutex<ProviderSessionRiskControlLoopBlocks>>,
 }
 
 #[async_trait]
@@ -618,7 +649,7 @@ where
         if !should_execute {
             return Ok(None);
         }
-        if provider_session_risk_control_blocked(
+        if let Some(skip_reason) = provider_session_risk_control_skip_reason(
             self.state,
             &self.provider_session_risk_control_blocks,
             &plan,
@@ -645,7 +676,8 @@ where
                 provider_id = %plan.provider_id,
                 endpoint_id = %plan.endpoint_id,
                 key_id = %plan.key_id,
-                "gateway skipped local stream candidate after same request triggered provider session risk-control avoidance"
+                skip_reason = skip_reason,
+                "gateway skipped local stream candidate after same request triggered risk-control avoidance"
             );
             return Ok(None);
         }
@@ -727,6 +759,12 @@ where
             .await;
         }
         if let Some(response) = response.as_mut() {
+            record_provider_session_risk_control_block_if_needed(
+                self.state,
+                &self.provider_session_risk_control_blocks,
+                &watchdog_plan,
+            )
+            .await;
             if let Some(guard) = sticky_init_cleanup.as_mut() {
                 guard.disarm();
             }
