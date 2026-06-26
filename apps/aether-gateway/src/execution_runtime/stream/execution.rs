@@ -741,6 +741,42 @@ fn stream_report_context_format_field<'a>(
         .filter(|value| !value.is_empty())
 }
 
+fn stream_report_context_bool_field(report_context: Option<&Value>, field: &str) -> Option<bool> {
+    report_context
+        .and_then(Value::as_object)
+        .and_then(|object| object.get(field))
+        .and_then(Value::as_bool)
+}
+
+fn stream_error_value<'a>(body: &'a Value, field: &str) -> Option<&'a Value> {
+    body.get("error")
+        .and_then(Value::as_object)
+        .and_then(|error| error.get(field))
+        .or_else(|| {
+            body.get("response")
+                .and_then(Value::as_object)
+                .and_then(|response| response.get("error"))
+                .and_then(Value::as_object)
+                .and_then(|error| error.get(field))
+        })
+}
+
+fn stream_error_field_log_value(body: &Value, field: &str) -> Option<String> {
+    let value = stream_error_value(body, field)?;
+    value
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| matches!(value, Value::Bool(_) | Value::Number(_)).then(|| value.to_string()))
+}
+
+fn stream_error_message_len(body: &Value) -> Option<usize> {
+    stream_error_value(body, "message")
+        .and_then(Value::as_str)
+        .map(str::len)
+}
+
 fn stream_requires_observed_terminal_event(
     provider_api_format: &str,
     report_context: Option<&Value>,
@@ -1692,6 +1728,163 @@ impl ClientVisibleStreamCompletionTracker {
             .as_deref()
             .is_some_and(is_terminal_sse_event_type)
             || (self.has_data_payload && sse_data_payload_is_terminal(&self.data_payload))
+    }
+
+    fn reset_current_event(&mut self) {
+        self.event_type = None;
+        self.data_payload.clear();
+        self.has_data_payload = false;
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct StreamTerminalEventDiagnostics {
+    event_type: Option<String>,
+    payload_type: Option<String>,
+    response_status: Option<String>,
+    error_type: Option<String>,
+    error_code: Option<String>,
+    error_message_len: Option<usize>,
+    incomplete_reason: Option<String>,
+    saw_done_marker: bool,
+}
+
+impl StreamTerminalEventDiagnostics {
+    fn has_signal(&self) -> bool {
+        self.saw_done_marker
+            || self.event_type.is_some()
+            || self.payload_type.is_some()
+            || self.response_status.is_some()
+            || self.error_type.is_some()
+            || self.error_code.is_some()
+            || self.error_message_len.is_some()
+            || self.incomplete_reason.is_some()
+    }
+}
+
+#[derive(Default)]
+struct StreamTerminalEventDiagnosticsTracker {
+    line_buffer: Vec<u8>,
+    event_type: Option<String>,
+    data_payload: String,
+    has_data_payload: bool,
+    skip_next_lf: bool,
+    latest: StreamTerminalEventDiagnostics,
+}
+
+impl StreamTerminalEventDiagnosticsTracker {
+    fn observe_chunk(&mut self, chunk: &[u8]) {
+        if chunk.is_empty() {
+            return;
+        }
+
+        for byte in chunk {
+            if self.skip_next_lf {
+                self.skip_next_lf = false;
+                if *byte == b'\n' {
+                    continue;
+                }
+            }
+
+            match *byte {
+                b'\n' => self.finish_line(),
+                b'\r' => {
+                    self.finish_line();
+                    self.skip_next_lf = true;
+                }
+                _ => {
+                    self.line_buffer.push(*byte);
+                    if self.line_buffer.len() > SSE_TERMINAL_DETECTOR_MAX_LINE_BYTES {
+                        self.line_buffer.clear();
+                    }
+                }
+            }
+        }
+    }
+
+    fn latest(&self) -> Option<&StreamTerminalEventDiagnostics> {
+        self.latest.has_signal().then_some(&self.latest)
+    }
+
+    fn finish_line(&mut self) {
+        let line = std::mem::take(&mut self.line_buffer);
+        let Ok(line) = std::str::from_utf8(&line) else {
+            self.reset_current_event();
+            return;
+        };
+        let line = line.trim();
+
+        if line.is_empty() {
+            self.observe_current_event();
+            self.reset_current_event();
+            return;
+        }
+
+        if let Some(event_type) = line.strip_prefix("event:").map(str::trim) {
+            if !event_type.is_empty() {
+                self.event_type = Some(event_type.to_string());
+            }
+            self.observe_current_event();
+            return;
+        }
+
+        if let Some(data) = line.strip_prefix("data:").map(str::trim) {
+            if data.is_empty() {
+                return;
+            }
+            if self.has_data_payload {
+                self.data_payload.push('\n');
+            }
+            self.data_payload.push_str(data);
+            self.has_data_payload = true;
+            self.observe_current_event();
+        }
+    }
+
+    fn observe_current_event(&mut self) {
+        let event_type = self.event_type.as_deref();
+        if event_type.is_some_and(is_terminal_sse_event_type) && !self.has_data_payload {
+            self.latest.event_type = event_type.map(ToOwned::to_owned);
+            return;
+        }
+
+        if !self.has_data_payload {
+            return;
+        }
+
+        if self.data_payload == "[DONE]" {
+            self.latest.saw_done_marker = true;
+            self.latest.event_type = event_type.map(ToOwned::to_owned);
+            return;
+        }
+
+        let Ok(payload) = serde_json::from_str::<Value>(&self.data_payload) else {
+            return;
+        };
+        let payload_type = payload.get("type").and_then(Value::as_str);
+        let response = payload.get("response").and_then(Value::as_object);
+        let response_status = response
+            .and_then(|response| response.get("status"))
+            .and_then(Value::as_str);
+        let incomplete_reason = response
+            .and_then(|response| response.get("incomplete_details"))
+            .and_then(|details| details.get("reason"))
+            .and_then(Value::as_str);
+        let is_terminal = event_type.is_some_and(is_terminal_sse_event_type)
+            || payload_type.is_some_and(is_terminal_sse_event_type)
+            || response_status
+                .is_some_and(|status| matches!(status, "completed" | "failed" | "incomplete"));
+        if !is_terminal {
+            return;
+        }
+
+        self.latest.event_type = event_type.map(ToOwned::to_owned);
+        self.latest.payload_type = payload_type.map(ToOwned::to_owned);
+        self.latest.response_status = response_status.map(ToOwned::to_owned);
+        self.latest.error_type = stream_error_field_log_value(&payload, "type");
+        self.latest.error_code = stream_error_field_log_value(&payload, "code");
+        self.latest.error_message_len = stream_error_message_len(&payload);
+        self.latest.incomplete_reason = incomplete_reason.map(ToOwned::to_owned);
     }
 
     fn reset_current_event(&mut self) {
@@ -2655,6 +2848,58 @@ async fn execute_stream_from_frame_stream(
                     ) {
                         let error_status_code =
                             resolve_local_sync_error_status_code(status_code, &error_body_json);
+                        let error_type = stream_error_field_log_value(&error_body_json, "type");
+                        let error_code = stream_error_field_log_value(&error_body_json, "code");
+                        let error_message_len = stream_error_message_len(&error_body_json);
+                        info!(
+                            event_name = "execution_runtime_stream_prefetch_provider_private_error_detected",
+                            log_type = "event",
+                            trace_id = %trace_id,
+                            request_id = %request_id_for_log,
+                            candidate_id = ?candidate_id,
+                            plan_kind,
+                            report_kind,
+                            provider_name,
+                            endpoint_id = %plan.endpoint_id,
+                            key_id = %plan.key_id,
+                            model_name,
+                            candidate_index = candidate_index.as_str(),
+                            status_code,
+                            error_status_code,
+                            provider_api_format = plan.provider_api_format.as_str(),
+                            client_api_format = plan.client_api_format.as_str(),
+                            provider_stream_event_api_format = ?stream_report_context_format_field(
+                                report_context.as_ref(),
+                                "provider_stream_event_api_format",
+                            ),
+                            provider_stream_api_format = ?stream_report_context_format_field(
+                                report_context.as_ref(),
+                                "provider_stream_api_format",
+                            ),
+                            client_requested_stream = ?stream_report_context_bool_field(
+                                report_context.as_ref(),
+                                "client_requested_stream",
+                            ),
+                            upstream_is_stream = ?stream_report_context_bool_field(
+                                report_context.as_ref(),
+                                "upstream_is_stream",
+                            ),
+                            needs_conversion = ?stream_report_context_bool_field(
+                                report_context.as_ref(),
+                                "needs_conversion",
+                            ),
+                            has_envelope = ?stream_report_context_bool_field(
+                                report_context.as_ref(),
+                                "has_envelope",
+                            ),
+                            prefetched_frames = prefetched_chunks.len(),
+                            prefetched_bytes = prefetched_inspection_body.len(),
+                            provider_prefetched_body_bytes = provider_prefetched_body.len(),
+                            error_type = ?error_type.as_deref(),
+                            error_code = ?error_code.as_deref(),
+                            error_message_len = ?error_message_len,
+                            "gateway detected provider-private error while prefetching execution runtime stream"
+                        );
                         return handle_prefetch_provider_private_stream_error(
                             state,
                             trace_id,
@@ -2679,6 +2924,11 @@ async fn execute_stream_from_frame_stream(
                     );
                     match inspection {
                         StreamPrefetchInspection::EmbeddedError(body_json) => {
+                            let error_status_code =
+                                resolve_local_sync_error_status_code(status_code, &body_json);
+                            let error_type = stream_error_field_log_value(&body_json, "type");
+                            let error_code = stream_error_field_log_value(&body_json, "code");
+                            let error_message_len = stream_error_message_len(&body_json);
                             info!(
                                 event_name = "execution_runtime_stream_prefetch_embedded_error_detected",
                                 log_type = "event",
@@ -2693,13 +2943,41 @@ async fn execute_stream_from_frame_stream(
                                 model_name,
                                 candidate_index = candidate_index.as_str(),
                                 status_code,
+                                error_status_code,
+                                provider_api_format = plan.provider_api_format.as_str(),
+                                client_api_format = plan.client_api_format.as_str(),
+                                provider_stream_event_api_format = ?stream_report_context_format_field(
+                                    report_context.as_ref(),
+                                    "provider_stream_event_api_format",
+                                ),
+                                provider_stream_api_format = ?stream_report_context_format_field(
+                                    report_context.as_ref(),
+                                    "provider_stream_api_format",
+                                ),
+                                client_requested_stream = ?stream_report_context_bool_field(
+                                    report_context.as_ref(),
+                                    "client_requested_stream",
+                                ),
+                                upstream_is_stream = ?stream_report_context_bool_field(
+                                    report_context.as_ref(),
+                                    "upstream_is_stream",
+                                ),
+                                needs_conversion = ?stream_report_context_bool_field(
+                                    report_context.as_ref(),
+                                    "needs_conversion",
+                                ),
+                                has_envelope = ?stream_report_context_bool_field(
+                                    report_context.as_ref(),
+                                    "has_envelope",
+                                ),
                                 prefetched_frames = prefetched_chunks.len(),
                                 prefetched_bytes = prefetched_inspection_body.len(),
                                 provider_prefetched_body_bytes = provider_prefetched_body.len(),
+                                error_type = ?error_type.as_deref(),
+                                error_code = ?error_code.as_deref(),
+                                error_message_len = ?error_message_len,
                                 "gateway detected embedded error while prefetching execution runtime stream"
                             );
-                            let error_status_code =
-                                resolve_local_sync_error_status_code(status_code, &body_json);
                             return handle_prefetch_provider_private_stream_error(
                                 state,
                                 trace_id,
@@ -3067,6 +3345,8 @@ async fn execute_stream_from_frame_stream(
         let mut client_stream_completion_tracker = ClientVisibleStreamCompletionTracker::default();
         let mut client_visible_stream_completed =
             client_stream_completion_tracker.observe_chunk(&prefetched_body_for_report);
+        let mut provider_terminal_diagnostics_tracker =
+            StreamTerminalEventDiagnosticsTracker::default();
         let mut usage_stream_telemetry: Option<ExecutionTelemetry> = initial_usage_telemetry;
         let mut telemetry: Option<ExecutionTelemetry> = initial_telemetry;
         let reached_eof = initial_reached_eof;
@@ -3213,6 +3493,7 @@ async fn execute_stream_from_frame_stream(
             let replay_chunk = normalized_prefetched_chunk
                 .as_deref()
                 .unwrap_or(provider_prefetched_body_for_report.as_slice());
+            provider_terminal_diagnostics_tracker.observe_chunk(replay_chunk);
             if let (Some(observer), Some(report_context)) = (
                 stream_usage_observer.as_mut(),
                 stream_usage_report_context.as_ref(),
@@ -3366,6 +3647,7 @@ async fn execute_stream_from_frame_stream(
                         } else {
                             chunk
                         };
+                        provider_terminal_diagnostics_tracker.observe_chunk(&normalized_chunk);
                         let provider_private_error_body_json =
                             extract_provider_private_stream_error_body(
                                 stream_usage_report_context.as_ref(),
@@ -3534,6 +3816,7 @@ async fn execute_stream_from_frame_stream(
         {
             match normalizer.finish() {
                 Ok(normalized_chunk) if !normalized_chunk.is_empty() => {
+                    provider_terminal_diagnostics_tracker.observe_chunk(&normalized_chunk);
                     let provider_private_error_body_json =
                         extract_provider_private_stream_error_body(
                             stream_usage_report_context.as_ref(),
@@ -3921,6 +4204,133 @@ async fn execute_stream_from_frame_stream(
                     "execution runtime stream ended before provider terminal event".to_string()
                 })
             });
+        if stream_failed {
+            let diagnostics_report_context = report_context_owned
+                .as_ref()
+                .or(stream_usage_report_context.as_ref());
+            let provider_terminal_diagnostics =
+                provider_terminal_diagnostics_tracker.latest().cloned();
+            let terminal_observed_finish = stream_terminal_summary
+                .as_ref()
+                .map(|summary| summary.observed_finish);
+            let terminal_finish_reason = stream_terminal_summary
+                .as_ref()
+                .and_then(|summary| summary.finish_reason.as_deref());
+            let terminal_response_id = stream_terminal_summary
+                .as_ref()
+                .and_then(|summary| summary.response_id.as_deref());
+            let terminal_model = stream_terminal_summary
+                .as_ref()
+                .and_then(|summary| summary.model.as_deref());
+            let terminal_unknown_event_count = stream_terminal_summary
+                .as_ref()
+                .map(|summary| summary.unknown_event_count);
+            let terminal_usage_has_token_signal =
+                stream_terminal_summary.as_ref().and_then(|summary| {
+                    summary
+                        .standardized_usage
+                        .as_ref()
+                        .map(StandardizedUsage::has_token_signal)
+                });
+            warn!(
+                event_name = "execution_runtime_stream_missing_terminal_event",
+                diagnostic_event = "execution_runtime_stream_terminal_failure",
+                log_type = "ops",
+                trace_id = %trace_id_owned,
+                request_id = %request_id_for_report_log,
+                candidate_id = ?candidate_id_for_report.as_deref(),
+                plan_kind = plan_kind_for_report.as_str(),
+                report_kind = report_kind_owned.as_deref().unwrap_or_default(),
+                provider_name = plan_for_report.provider_name.as_deref().unwrap_or("-"),
+                endpoint_id = %plan_for_report.endpoint_id,
+                key_id = %plan_for_report.key_id,
+                model_name = plan_for_report.model_name.as_deref().unwrap_or("-"),
+                candidate_index = candidate_index_for_report.as_str(),
+                status_code,
+                terminal_failure_kind = if missing_observed_finish {
+                    "missing_observed_finish"
+                } else {
+                    "terminal_error"
+                },
+                error_message = stream_terminal_error_message.as_deref().unwrap_or_default(),
+                error_message_len = stream_terminal_error_message.as_ref().map(String::len).unwrap_or_default(),
+                provider_api_format = plan_for_report.provider_api_format.as_str(),
+                client_api_format = plan_for_report.client_api_format.as_str(),
+                provider_stream_event_api_format = ?stream_report_context_format_field(
+                    diagnostics_report_context,
+                    "provider_stream_event_api_format",
+                ),
+                provider_stream_api_format = ?stream_report_context_format_field(
+                    diagnostics_report_context,
+                    "provider_stream_api_format",
+                ),
+                client_requested_stream = ?stream_report_context_bool_field(
+                    diagnostics_report_context,
+                    "client_requested_stream",
+                ),
+                upstream_is_stream = ?stream_report_context_bool_field(
+                    diagnostics_report_context,
+                    "upstream_is_stream",
+                ),
+                needs_conversion = ?stream_report_context_bool_field(
+                    diagnostics_report_context,
+                    "needs_conversion",
+                ),
+                has_envelope = ?stream_report_context_bool_field(
+                    diagnostics_report_context,
+                    "has_envelope",
+                ),
+                direct_stream_finalize_kind = direct_stream_finalize_kind_owned.as_deref().unwrap_or("-"),
+                sync_json_stream_bridge_active = sync_json_stream_bridge_active_for_report,
+                response_headers_are_sse,
+                emit_proxy_generated_sse_control_blocks,
+                emit_passthrough_sse_terminal_error,
+                requires_observed_terminal_event,
+                missing_observed_finish,
+                reached_eof,
+                client_visible_stream_completed,
+                terminal_observed_finish = ?terminal_observed_finish,
+                terminal_finish_reason = ?terminal_finish_reason,
+                terminal_response_id = ?terminal_response_id,
+                terminal_model = ?terminal_model,
+                terminal_unknown_event_count = ?terminal_unknown_event_count,
+                terminal_usage_has_token_signal = ?terminal_usage_has_token_signal,
+                provider_terminal_event_type = ?provider_terminal_diagnostics
+                    .as_ref()
+                    .and_then(|diagnostics| diagnostics.event_type.as_deref()),
+                provider_terminal_payload_type = ?provider_terminal_diagnostics
+                    .as_ref()
+                    .and_then(|diagnostics| diagnostics.payload_type.as_deref()),
+                provider_terminal_response_status = ?provider_terminal_diagnostics
+                    .as_ref()
+                    .and_then(|diagnostics| diagnostics.response_status.as_deref()),
+                provider_terminal_error_type = ?provider_terminal_diagnostics
+                    .as_ref()
+                    .and_then(|diagnostics| diagnostics.error_type.as_deref()),
+                provider_terminal_error_code = ?provider_terminal_diagnostics
+                    .as_ref()
+                    .and_then(|diagnostics| diagnostics.error_code.as_deref()),
+                provider_terminal_error_message_len = ?provider_terminal_diagnostics
+                    .as_ref()
+                    .and_then(|diagnostics| diagnostics.error_message_len),
+                provider_terminal_incomplete_reason = ?provider_terminal_diagnostics
+                    .as_ref()
+                    .and_then(|diagnostics| diagnostics.incomplete_reason.as_deref()),
+                provider_terminal_saw_done_marker = provider_terminal_diagnostics
+                    .as_ref()
+                    .is_some_and(|diagnostics| diagnostics.saw_done_marker),
+                provider_stream_bytes = provider_stream_bytes.load(Ordering::Relaxed),
+                client_stream_bytes = client_stream_bytes.load(Ordering::Relaxed),
+                provider_captured_body_bytes = provider_buffered_body.len(),
+                client_captured_body_bytes = buffered_body.len(),
+                provider_body_truncated,
+                client_body_truncated,
+                body_capture_limit_bytes = max_stream_body_buffer_bytes,
+                last_upstream_frame_elapsed_ms = last_upstream_frame_elapsed_ms.load(Ordering::Relaxed),
+                last_client_chunk_elapsed_ms = last_client_chunk_elapsed_ms.load(Ordering::Relaxed),
+                "gateway stream ended with a failed terminal state"
+            );
+        }
         let usage_payload = build_stream_usage_payload(
             trace_id_owned.clone(),
             report_kind_owned.unwrap_or_default(),
@@ -3934,18 +4344,7 @@ async fn execute_stream_from_frame_stream(
             stream_terminal_summary,
             terminal_telemetry,
         );
-        if stream_failed {
-            warn!(
-                event_name = "execution_runtime_stream_missing_terminal_event",
-                log_type = "ops",
-                trace_id = %trace_id_owned,
-                request_id = %request_id_for_report_log,
-                candidate_id = ?candidate_id_for_report.as_deref(),
-                status_code,
-                error_message = stream_terminal_error_message.as_deref().unwrap_or_default(),
-                "gateway stream ended with a failed terminal state"
-            );
-        } else {
+        if !stream_failed {
             apply_local_execution_effect(
                 &state_for_report,
                 LocalExecutionEffectContext {
@@ -4121,7 +4520,7 @@ mod tests {
         stream_terminal_summary_missing_observed_finish,
         stream_terminal_summary_missing_observed_finish_with_requirement,
         stream_terminal_summary_represents_failure_with_requirement,
-        ClientVisibleStreamCompletionTracker,
+        ClientVisibleStreamCompletionTracker, StreamTerminalEventDiagnosticsTracker,
     };
     use crate::control::GatewayControlDecision;
     use crate::handlers::shared::provider_pool::{
@@ -4932,6 +5331,39 @@ mod tests {
         assert!(!tracker.observe_chunk(b"leted\r\n"));
         assert!(tracker
             .observe_chunk(b"data: {\"type\":\"response.completed\",\"response\":{}}\r\n\r\n"));
+    }
+
+    #[test]
+    fn tracks_stream_terminal_event_diagnostics_for_response_failed() {
+        let mut tracker = StreamTerminalEventDiagnosticsTracker::default();
+        tracker.observe_chunk(
+            br#"event: response.failed
+data: {"type":"response.failed","response":{"status":"failed","error":{"type":"server_error","code":"upstream_failed","message":"provider failed"}}}
+
+"#,
+        );
+
+        let diagnostics = tracker
+            .latest()
+            .expect("terminal diagnostics should be captured");
+        assert_eq!(diagnostics.event_type.as_deref(), Some("response.failed"));
+        assert_eq!(diagnostics.payload_type.as_deref(), Some("response.failed"));
+        assert_eq!(diagnostics.response_status.as_deref(), Some("failed"));
+        assert_eq!(diagnostics.error_type.as_deref(), Some("server_error"));
+        assert_eq!(diagnostics.error_code.as_deref(), Some("upstream_failed"));
+        assert_eq!(diagnostics.error_message_len, Some("provider failed".len()));
+    }
+
+    #[test]
+    fn tracks_stream_terminal_event_diagnostics_for_done_marker() {
+        let mut tracker = StreamTerminalEventDiagnosticsTracker::default();
+        tracker.observe_chunk(b"data: [DO");
+        tracker.observe_chunk(b"NE]\n\n");
+
+        let diagnostics = tracker
+            .latest()
+            .expect("done diagnostics should be captured");
+        assert!(diagnostics.saw_done_marker);
     }
 
     fn tunnel_proxy_snapshot(base_url: String) -> aether_contracts::ProxySnapshot {
