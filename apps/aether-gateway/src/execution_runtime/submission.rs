@@ -363,6 +363,43 @@ fn resolve_local_sync_provider_api_format(payload: &GatewaySyncReportRequest) ->
         .unwrap_or_else(|| resolve_local_sync_client_api_format(payload))
 }
 
+fn local_sync_report_context_string_field<'a>(
+    payload: &'a GatewaySyncReportRequest,
+    field: &str,
+) -> Option<&'a str> {
+    payload
+        .report_context
+        .as_ref()
+        .and_then(|value| value.get(field))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn local_sync_report_context_bool_field(
+    payload: &GatewaySyncReportRequest,
+    field: &str,
+) -> Option<bool> {
+    payload
+        .report_context
+        .as_ref()
+        .and_then(|value| value.get(field))
+        .and_then(|value| value.as_bool())
+}
+
+fn local_sync_error_text_field(body_json: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    let body_object = body_json.as_object();
+    let error_object = body_object
+        .and_then(|object| object.get("error"))
+        .and_then(|value| value.as_object());
+    first_non_empty_error_text(error_object, body_object, keys)
+}
+
+fn local_sync_error_message_len(body_json: &serde_json::Value) -> Option<usize> {
+    local_sync_error_text_field(body_json, &["message", "detail", "reason"])
+        .map(|value| value.len())
+}
+
 pub(crate) fn resolve_core_error_background_report_kind(report_kind: &str) -> Option<String> {
     core_error_background_report_kind(report_kind).map(ToOwned::to_owned)
 }
@@ -630,6 +667,73 @@ pub(crate) async fn submit_local_core_error_or_sync_finalize(
     };
 
     let response_status = response.status();
+    if !response_status.is_success() {
+        let source_body_json = resolve_local_sync_source_body_json(&payload).ok().flatten();
+        let response_body_json = maybe_resolve_local_sync_response_body_json(&payload)
+            .ok()
+            .flatten();
+        warn!(
+            event_name = "local_sync_finalize_error_response_diagnostics",
+            log_type = "ops",
+            trace_id = %trace_id,
+            report_kind = %payload.report_kind,
+            upstream_status_code = payload.status_code,
+            client_status_code = response_status.as_u16(),
+            client_api_format = %resolve_local_sync_client_api_format(&payload),
+            provider_api_format = %resolve_local_sync_provider_api_format(&payload),
+            provider_stream_event_api_format = ?local_sync_report_context_string_field(
+                &payload,
+                "provider_stream_event_api_format",
+            ),
+            provider_stream_api_format = ?local_sync_report_context_string_field(
+                &payload,
+                "provider_stream_api_format",
+            ),
+            request_id = ?local_sync_report_context_string_field(&payload, "request_id"),
+            candidate_id = ?local_sync_report_context_string_field(&payload, "candidate_id"),
+            model = ?local_sync_report_context_string_field(&payload, "model"),
+            provider_name = ?local_sync_report_context_string_field(&payload, "provider_name"),
+            endpoint_id = ?local_sync_report_context_string_field(&payload, "endpoint_id"),
+            key_id = ?local_sync_report_context_string_field(&payload, "key_id"),
+            client_requested_stream = ?local_sync_report_context_bool_field(
+                &payload,
+                "client_requested_stream",
+            ),
+            upstream_is_stream = ?local_sync_report_context_bool_field(
+                &payload,
+                "upstream_is_stream",
+            ),
+            needs_conversion = ?local_sync_report_context_bool_field(&payload, "needs_conversion"),
+            has_envelope = ?local_sync_report_context_bool_field(&payload, "has_envelope"),
+            source_body_has_error = source_body_json.as_ref().is_some_and(has_nested_error),
+            source_error_type = ?source_body_json.as_ref().and_then(|body| {
+                local_sync_error_text_field(body, &["type", "__type"])
+            }),
+            source_error_code = ?source_body_json.as_ref().and_then(|body| {
+                local_sync_error_text_field(body, &["code", "status"])
+            }),
+            source_error_status = ?source_body_json.as_ref().and_then(|body| {
+                local_sync_error_text_field(body, &["status"])
+            }),
+            source_error_message_len = ?source_body_json
+                .as_ref()
+                .and_then(local_sync_error_message_len),
+            response_body_has_error = response_body_json.as_ref().is_some_and(has_nested_error),
+            response_error_type = ?response_body_json.as_ref().and_then(|body| {
+                local_sync_error_text_field(body, &["type", "__type"])
+            }),
+            response_error_code = ?response_body_json.as_ref().and_then(|body| {
+                local_sync_error_text_field(body, &["code", "status"])
+            }),
+            response_error_message_len = ?response_body_json
+                .as_ref()
+                .and_then(local_sync_error_message_len),
+            body_json_present = source_body_json.is_some(),
+            client_body_json_present = payload.client_body_json.is_some(),
+            body_base64_present = payload.body_base64.is_some(),
+            "gateway local sync finalize built non-success client response"
+        );
+    }
     if response_status.is_success() {
         if let Some(success_report_kind) =
             core_success_background_report_kind(payload.report_kind.as_str())
