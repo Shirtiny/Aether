@@ -264,10 +264,7 @@ fn usage_matches_list_query(item: &StoredRequestUsageAudit, query: &UsageAuditLi
         }
     }
     if let Some(cafecode) = query.cafecode.as_deref().map(str::trim) {
-        if !cafecode.is_empty()
-            && !usage_metadata_string_contains(item, "cafecode_uid", cafecode)
-            && !usage_metadata_string_contains(item, "cafecode_uname", cafecode)
-        {
+        if !usage_cafecode_matches(item, cafecode) {
             return false;
         }
     }
@@ -336,6 +333,26 @@ fn usage_metadata_string_contains(item: &StoredRequestUsageAudit, key: &str, nee
         .is_some_and(|value| value.to_ascii_lowercase().contains(&needle))
 }
 
+fn usage_metadata_string_equals(item: &StoredRequestUsageAudit, key: &str, needle: &str) -> bool {
+    let needle = needle.trim().to_ascii_lowercase();
+    item.request_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get(key))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some_and(|value| value.to_ascii_lowercase() == needle)
+}
+
+fn usage_cafecode_matches(item: &StoredRequestUsageAudit, cafecode: &str) -> bool {
+    let cafecode = cafecode.trim();
+    if cafecode.is_empty() {
+        return true;
+    }
+    usage_metadata_string_equals(item, "cafecode_uid", cafecode)
+        || usage_metadata_string_equals(item, "cafecode_uname", cafecode)
+}
+
 fn usage_metadata_nested_string_matches(
     item: &StoredRequestUsageAudit,
     path: &[&str],
@@ -373,15 +390,7 @@ fn usage_metadata_string_matches(
     exact: bool,
 ) -> bool {
     if exact {
-        let needle = needle.trim().to_ascii_lowercase();
-        return item
-            .request_metadata
-            .as_ref()
-            .and_then(|metadata| metadata.get(key))
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .is_some_and(|value| value.to_ascii_lowercase() == needle);
+        return usage_metadata_string_equals(item, key, needle);
     }
     usage_metadata_string_contains(item, key, needle)
 }
@@ -436,10 +445,7 @@ fn usage_matches_keyword_search_query(
         }
     }
     if let Some(cafecode) = query.cafecode.as_deref().map(str::trim) {
-        if !cafecode.is_empty()
-            && !usage_metadata_string_contains(item, "cafecode_uid", cafecode)
-            && !usage_metadata_string_contains(item, "cafecode_uname", cafecode)
-        {
+        if !usage_cafecode_matches(item, cafecode) {
             return false;
         }
     }
@@ -4937,35 +4943,43 @@ mod tests {
     async fn list_usage_audits_filters_by_cafecode_identity() {
         let mut first = sample_usage("req-cafecode-1", 1);
         first.request_metadata = Some(serde_json::json!({
-            "cafecode_uid": "372",
+            "cafecode_uid": "45",
             "cafecode_uname": "xiapeng8618"
         }));
         let mut second = sample_usage("req-cafecode-2", 2);
         second.request_metadata = Some(serde_json::json!({
-            "cafecode_uid": "481",
+            "cafecode_uid": "145",
             "cafecode_uname": "another-user"
         }));
         let repository = InMemoryUsageReadRepository::seed(vec![first, second]);
 
         let by_uid = repository
             .list_usage_audits(&crate::repository::usage::UsageAuditListQuery {
-                cafecode: Some("372".to_string()),
+                cafecode: Some("45".to_string()),
                 ..Default::default()
             })
             .await
             .expect("list by cafecode uid should succeed");
         let by_name = repository
             .list_usage_audits(&crate::repository::usage::UsageAuditListQuery {
-                cafecode: Some("peng".to_string()),
+                cafecode: Some("xiapeng8618".to_string()),
                 ..Default::default()
             })
             .await
             .expect("list by cafecode name should succeed");
+        let by_partial_name = repository
+            .list_usage_audits(&crate::repository::usage::UsageAuditListQuery {
+                cafecode: Some("peng".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("partial cafecode name lookup should succeed");
 
         assert_eq!(by_uid.len(), 1);
         assert_eq!(by_uid[0].request_id, "req-cafecode-1");
         assert_eq!(by_name.len(), 1);
         assert_eq!(by_name[0].request_id, "req-cafecode-1");
+        assert!(by_partial_name.is_empty());
     }
 
     #[tokio::test]

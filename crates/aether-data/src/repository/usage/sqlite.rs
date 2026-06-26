@@ -463,15 +463,15 @@ fn push_sqlite_usage_list_filters(
     }
     if let Some(cafecode) = query.cafecode.as_deref().map(str::trim) {
         if !cafecode.is_empty() {
-            let pattern = format!("%{}%", cafecode.to_ascii_lowercase());
             push_sqlite_usage_where(builder, has_where);
+            let exact = cafecode.to_ascii_lowercase();
             builder.push("(");
             builder
-                .push("LOWER(COALESCE(json_extract(request_metadata, '$.cafecode_uid'), '')) LIKE ")
-                .push_bind(pattern.clone());
+                .push("LOWER(TRIM(COALESCE(json_extract(request_metadata, '$.cafecode_uid'), ''))) = ")
+                .push_bind(exact.clone());
             builder
-                .push(" OR LOWER(COALESCE(json_extract(request_metadata, '$.cafecode_uname'), '')) LIKE ")
-                .push_bind(pattern);
+                .push(" OR LOWER(TRIM(COALESCE(json_extract(request_metadata, '$.cafecode_uname'), ''))) = ")
+                .push_bind(exact);
             builder.push(")");
         }
     }
@@ -4440,6 +4440,53 @@ mod tests {
         UsageDashboardDailyBreakdownQuery, UsageDashboardSummaryQuery, UsageReadRepository,
         UsageWriteRepository,
     };
+    use sqlx::{QueryBuilder, Sqlite};
+
+    #[test]
+    fn cafecode_filter_uses_exact_identity_match_for_numeric_input() {
+        let mut builder = QueryBuilder::<Sqlite>::new(r#"SELECT * FROM "usage""#);
+        let mut has_where = false;
+
+        super::push_sqlite_usage_list_filters(
+            &mut builder,
+            &UsageAuditListQuery {
+                cafecode: Some("45".to_string()),
+                statuses: Some(vec!["completed".to_string()]),
+                ..UsageAuditListQuery::default()
+            },
+            &mut has_where,
+        );
+
+        let sql = builder.sql();
+        assert!(sql.contains("$.cafecode_uid"));
+        assert!(sql.contains("$.cafecode_uname"));
+        assert!(sql.contains("TRIM"));
+        assert!(sql.contains(" = "));
+        assert!(sql.contains("status IN"));
+        assert!(!sql.contains("LIKE"));
+    }
+
+    #[test]
+    fn cafecode_filter_uses_exact_identity_match_for_non_numeric_input() {
+        let mut builder = QueryBuilder::<Sqlite>::new(r#"SELECT * FROM "usage""#);
+        let mut has_where = false;
+
+        super::push_sqlite_usage_list_filters(
+            &mut builder,
+            &UsageAuditListQuery {
+                cafecode: Some("xiapeng8618".to_string()),
+                ..UsageAuditListQuery::default()
+            },
+            &mut has_where,
+        );
+
+        let sql = builder.sql();
+        assert!(sql.contains("$.cafecode_uid"));
+        assert!(sql.contains("$.cafecode_uname"));
+        assert!(sql.contains("TRIM"));
+        assert!(sql.contains(" = "));
+        assert!(!sql.contains("LIKE"));
+    }
 
     #[tokio::test]
     async fn sqlite_usage_write_repository_upserts_and_rebuilds_stats() {

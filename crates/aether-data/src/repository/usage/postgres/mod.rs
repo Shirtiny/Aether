@@ -1252,16 +1252,16 @@ fn push_postgres_usage_cafecode_filter(
     if cafecode.is_empty() {
         return;
     }
-    let pattern = format!("%{}%", cafecode.to_ascii_lowercase());
     builder.push(if *has_where { " AND " } else { " WHERE " });
     *has_where = true;
+    let exact = cafecode.to_ascii_lowercase();
     builder.push("(");
     builder
-        .push("LOWER(COALESCE(\"usage\".request_metadata->>'cafecode_uid', '')) LIKE ")
-        .push_bind(pattern.clone());
+        .push("LOWER(BTRIM(COALESCE(\"usage\".request_metadata->>'cafecode_uid', ''))) = ")
+        .push_bind(exact.clone());
     builder
-        .push(" OR LOWER(COALESCE(\"usage\".request_metadata->>'cafecode_uname', '')) LIKE ")
-        .push_bind(pattern);
+        .push(" OR LOWER(BTRIM(COALESCE(\"usage\".request_metadata->>'cafecode_uname', ''))) = ")
+        .push_bind(exact);
     builder.push(")");
 }
 

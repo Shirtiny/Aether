@@ -1359,10 +1359,10 @@ const mockHandlers: Record<string, (config: AxiosRequestConfig) => Promise<Axios
     }
 
     if (typeof params.cafecode === 'string' && params.cafecode.trim()) {
-      const keyword = params.cafecode.trim().toLowerCase()
+      const exact = params.cafecode.trim().toLowerCase()
       records = records.filter(r =>
-        (r.cafecode_uid || '').toLowerCase().includes(keyword) ||
-        (r.cafecode_uname || '').toLowerCase().includes(keyword)
+        (r.cafecode_uid || '').trim().toLowerCase() === exact ||
+        (r.cafecode_uname || '').trim().toLowerCase() === exact
       )
     }
 

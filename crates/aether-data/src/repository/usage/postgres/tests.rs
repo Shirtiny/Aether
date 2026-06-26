@@ -1,5 +1,6 @@
 use chrono::{TimeZone, Utc};
 use serde_json::{json, Value};
+use sqlx::{Postgres, QueryBuilder};
 
 use super::{
     attach_compressed_body_refs, attach_usage_http_audit_body_refs,
@@ -16,6 +17,36 @@ use super::{
 use crate::driver::postgres::{PostgresPoolConfig, PostgresPoolFactory};
 use crate::repository::usage::UpsertUsageRecord;
 use aether_data_contracts::repository::usage::UsageBodyField;
+
+#[test]
+fn cafecode_filter_uses_exact_identity_match_for_numeric_input() {
+    let mut builder = QueryBuilder::<Postgres>::new(r#"SELECT * FROM "usage""#);
+    let mut has_where = false;
+
+    super::push_postgres_usage_cafecode_filter(&mut builder, &mut has_where, "45");
+
+    let sql = builder.sql();
+    assert!(sql.contains("request_metadata->>'cafecode_uid'"));
+    assert!(sql.contains("request_metadata->>'cafecode_uname'"));
+    assert!(sql.contains("BTRIM"));
+    assert!(sql.contains(" = "));
+    assert!(!sql.contains("LIKE"));
+}
+
+#[test]
+fn cafecode_filter_uses_exact_identity_match_for_non_numeric_input() {
+    let mut builder = QueryBuilder::<Postgres>::new(r#"SELECT * FROM "usage""#);
+    let mut has_where = false;
+
+    super::push_postgres_usage_cafecode_filter(&mut builder, &mut has_where, "xiapeng8618");
+
+    let sql = builder.sql();
+    assert!(sql.contains("request_metadata->>'cafecode_uid'"));
+    assert!(sql.contains("request_metadata->>'cafecode_uname'"));
+    assert!(sql.contains("BTRIM"));
+    assert!(sql.contains(" = "));
+    assert!(!sql.contains("LIKE"));
+}
 
 #[tokio::test]
 async fn repository_constructs_from_lazy_pool() {
