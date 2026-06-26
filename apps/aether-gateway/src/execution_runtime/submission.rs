@@ -12,7 +12,7 @@ use crate::{usage::GatewaySyncReportRequest, AppState, GatewayError};
 use axum::body::Body;
 use axum::http::{Response, StatusCode};
 use base64::Engine as _;
-use tracing::warn;
+use tracing::{debug, warn};
 
 #[derive(Clone, Debug)]
 struct LocalSyncErrorDetails {
@@ -667,14 +667,14 @@ pub(crate) async fn submit_local_core_error_or_sync_finalize(
     };
 
     let response_status = response.status();
-    if !response_status.is_success() {
+    if !response_status.is_success() && tracing::enabled!(tracing::Level::DEBUG) {
         let source_body_json = resolve_local_sync_source_body_json(&payload).ok().flatten();
         let response_body_json = maybe_resolve_local_sync_response_body_json(&payload)
             .ok()
             .flatten();
-        warn!(
+        debug!(
             event_name = "local_sync_finalize_error_response_diagnostics",
-            log_type = "ops",
+            log_type = "debug",
             trace_id = %trace_id,
             report_kind = %payload.report_kind,
             upstream_status_code = payload.status_code,
