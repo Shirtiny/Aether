@@ -160,6 +160,14 @@ impl PoolScoreReadRepository for PostgresPoolMemberScoreRepository {
             where_clause.push_next(&mut builder);
             builder.push("scope_id IS NULL");
         }
+        if let Some(score_version) = query.score_version {
+            push_eq(
+                &mut builder,
+                &mut where_clause,
+                "score_version",
+                i64_from_u64(score_version, "pool score version")?,
+            );
+        }
         if !query.hard_states.is_empty() {
             let states = query
                 .hard_states

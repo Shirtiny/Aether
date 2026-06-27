@@ -702,7 +702,6 @@ export interface PoolScoreWeights {
   health?: number | null
   probe_freshness?: number | null
   quota_remaining?: number | null
-  latency?: number | null
   cost_lru?: number | null
 }
 
@@ -740,7 +739,6 @@ export interface PoolAdvancedConfig {
   scheduling_presets?: SchedulingPresetItem[] | string[] | null
   scoring_weights?: {
     lru?: number
-    latency?: number
     health?: number
     cost_remaining?: number
   } | null

@@ -1209,15 +1209,6 @@ fn provider_query_pool_catalog_key_context(
         .and_then(Value::as_object)
         .filter(|payload| !payload.is_empty())
         .map(|_| health_score);
-    let latency_avg_ms = key
-        .success_count
-        .filter(|count| *count > 0)
-        .zip(key.total_response_time_ms)
-        .map(|(success_count, total_response_time_ms)| {
-            total_response_time_ms as f64 / f64::from(success_count)
-        })
-        .filter(|value| value.is_finite() && *value >= 0.0);
-
     AiPoolCatalogKeyContext {
         plan_tier: quota_snapshot
             .and_then(|quota| quota.get("plan_type"))
@@ -1244,7 +1235,7 @@ fn provider_query_pool_catalog_key_context(
             codex_quota_basis,
         ),
         health_score,
-        latency_avg_ms,
+        latency_avg_ms: None,
         catalog_lru_score: Some(key.last_used_at_unix_secs.unwrap_or(0) as f64),
     }
 }

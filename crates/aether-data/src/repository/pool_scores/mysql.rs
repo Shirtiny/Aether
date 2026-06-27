@@ -104,6 +104,11 @@ impl PoolScoreReadRepository for MysqlPoolMemberScoreRepository {
         } else {
             builder.push(" AND scope_id IS NULL");
         }
+        if let Some(score_version) = query.score_version {
+            builder
+                .push(" AND score_version = ")
+                .push_bind(i64_from_u64(score_version, "pool score version")?);
+        }
         if !query.hard_states.is_empty() {
             builder.push(" AND hard_state IN (");
             let mut separated = builder.separated(", ");

@@ -371,18 +371,6 @@
             />
           </div>
           <div class="space-y-1.5">
-            <Label>延迟权重</Label>
-            <Input
-              :model-value="form.score_weight_latency ?? ''"
-              type="number"
-              min="0"
-              max="1"
-              step="0.01"
-              placeholder="0.10"
-              @update:model-value="(v) => form.score_weight_latency = parseNum(v)"
-            />
-          </div>
-          <div class="space-y-1.5">
             <Label>成本/LRU 权重</Label>
             <Input
               :model-value="form.score_weight_cost_lru ?? ''"
@@ -792,7 +780,6 @@ const form = ref({
   score_weight_health: null as number | null | undefined,
   score_weight_probe_freshness: null as number | null | undefined,
   score_weight_quota_remaining: null as number | null | undefined,
-  score_weight_latency: null as number | null | undefined,
   score_weight_cost_lru: null as number | null | undefined,
   probe_freshness_ttl_seconds: null as number | null | undefined,
   unschedulable_score_cap: null as number | null | undefined,
@@ -947,7 +934,6 @@ watch(() => props.modelValue, (open) => {
     score_weight_health: scoreWeights?.health ?? null,
     score_weight_probe_freshness: scoreWeights?.probe_freshness ?? null,
     score_weight_quota_remaining: scoreWeights?.quota_remaining ?? null,
-    score_weight_latency: scoreWeights?.latency ?? null,
     score_weight_cost_lru: scoreWeights?.cost_lru ?? null,
     probe_freshness_ttl_seconds: scoreRules?.probe_freshness_ttl_seconds ?? null,
     unschedulable_score_cap: scoreRules?.unschedulable_score_cap ?? null,
@@ -993,7 +979,6 @@ async function handleSave() {
         health: form.value.score_weight_health ?? undefined,
         probe_freshness: form.value.score_weight_probe_freshness ?? undefined,
         quota_remaining: form.value.score_weight_quota_remaining ?? undefined,
-        latency: form.value.score_weight_latency ?? undefined,
         cost_lru: form.value.score_weight_cost_lru ?? undefined,
       },
       probe_freshness_ttl_seconds: form.value.probe_freshness_ttl_seconds ?? undefined,

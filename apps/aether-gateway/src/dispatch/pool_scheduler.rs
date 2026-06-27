@@ -18,7 +18,7 @@ use aether_pool_core::{
     run_pool_scheduler, PoolCandidateFacts, PoolCandidateInput, PoolCandidateOrchestration,
     PoolMemberSignals, PoolRuntimeState, PoolSchedulingConfig, PoolSchedulingPreset,
     POOL_ACCOUNT_BLOCKED_SKIP_REASON, POOL_ACCOUNT_EXHAUSTED_SKIP_REASON,
-    POOL_COOLDOWN_SKIP_REASON, POOL_COST_LIMIT_REACHED_SKIP_REASON,
+    POOL_COOLDOWN_SKIP_REASON, POOL_COST_LIMIT_REACHED_SKIP_REASON, POOL_SCORE_VERSION,
 };
 use aether_provider_pool::ProviderPoolService;
 use aether_routing_core::{RankingOverlay, ResolvedRoutingPolicy};
@@ -898,6 +898,7 @@ impl<'a> PoolKeyCursor<'a> {
             capability: scope.capability.clone(),
             scope_kind: scope.scope_kind.clone(),
             scope_id: scope.scope_id.clone(),
+            score_version: Some(POOL_SCORE_VERSION),
             hard_states: vec![PoolMemberHardState::Available, PoolMemberHardState::Unknown],
             probe_statuses: None,
             offset: 0,
@@ -1596,15 +1597,6 @@ fn build_pool_catalog_key_context(
         .and_then(serde_json::Value::as_object)
         .filter(|payload| !payload.is_empty())
         .map(|_| health_score);
-    let latency_avg_ms = key
-        .success_count
-        .filter(|count| *count > 0)
-        .zip(key.total_response_time_ms)
-        .map(|(success_count, total_response_time_ms)| {
-            total_response_time_ms as f64 / f64::from(success_count)
-        })
-        .filter(|value| value.is_finite() && *value >= 0.0);
-
     let auth_config = parse_catalog_auth_config_json(state.app(), key);
     let mut signals = provider_pool_service.member_signals(
         provider_type,
@@ -1616,7 +1608,6 @@ fn build_pool_catalog_key_context(
     signals.account_blocked |=
         pool_key_requires_reauth_for_scheduling(key, current_unix_ms().saturating_div(1000));
     signals.health_score = health_score;
-    signals.latency_avg_ms = latency_avg_ms;
     signals.catalog_lru_score = Some(key.last_used_at_unix_secs.unwrap_or(0) as f64);
     signals
 }
@@ -2069,7 +2060,7 @@ mod tests {
     use aether_data_contracts::repository::provider_catalog::{
         StoredProviderCatalogEndpoint, StoredProviderCatalogKey, StoredProviderCatalogProvider,
     };
-    use aether_pool_core::PoolSchedulingPreset;
+    use aether_pool_core::{PoolSchedulingPreset, POOL_SCORE_VERSION};
     use aether_provider_pool::ProviderPoolService;
     use aether_provider_transport::snapshot::{
         GatewayProviderTransportEndpoint, GatewayProviderTransportKey,
@@ -5317,8 +5308,6 @@ mod tests {
                 "plan_type": "team"
             }
         }));
-        key.success_count = Some(4);
-        key.total_response_time_ms = Some(200);
         key.last_used_at_unix_secs = Some(1_711_000_123);
 
         let app = AppState::new()
@@ -5342,7 +5331,7 @@ mod tests {
         assert_eq!(context.plan_tier.as_deref(), Some("team"));
         assert_eq!(context.quota_usage_ratio, Some(0.25));
         assert_eq!(context.quota_reset_seconds, Some(3600.0));
-        assert_eq!(context.latency_avg_ms, Some(50.0));
+        assert_eq!(context.latency_avg_ms, None);
         assert_eq!(context.catalog_lru_score, Some(1_711_000_123.0));
     }
 
@@ -5676,7 +5665,7 @@ mod tests {
             scope_id: scope.scope_id,
             score,
             hard_state: PoolMemberHardState::Available,
-            score_version: 1,
+            score_version: POOL_SCORE_VERSION,
             score_reason: json!({}),
             last_ranked_at: Some(1_000),
             last_scheduled_at: None,

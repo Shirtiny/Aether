@@ -115,6 +115,9 @@ impl PoolScoreReadRepository for InMemoryPoolMemberScoreRepository {
                     && score.capability == query.capability
                     && score.scope_kind == query.scope_kind
                     && score.scope_id == query.scope_id
+                    && query
+                        .score_version
+                        .is_none_or(|version| score.score_version == version)
                     && (hard_states.is_empty() || hard_states.contains(&score.hard_state))
                     && probe_statuses
                         .as_ref()
@@ -459,6 +462,7 @@ mod tests {
                 capability: POOL_SCORE_CAPABILITY_API_FORMAT.to_string(),
                 scope_kind: POOL_SCORE_SCOPE_KIND_MODEL.to_string(),
                 scope_id: Some("model-1".to_string()),
+                score_version: None,
                 hard_states: vec![PoolMemberHardState::Available],
                 probe_statuses: None,
                 offset: 0,
@@ -472,6 +476,38 @@ mod tests {
                 .map(|row| row.member_id)
                 .collect::<Vec<_>>(),
             vec!["key-2".to_string(), "key-1".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn ranked_members_can_filter_by_score_version() {
+        let mut stale = score("score-1", "key-1", 0.9);
+        stale.score_version = 1;
+        let mut current = score("score-2", "key-2", 0.2);
+        current.score_version = 2;
+        let repository = InMemoryPoolMemberScoreRepository::seed(vec![stale, current]);
+
+        let rows = repository
+            .list_ranked_pool_members(&ListRankedPoolMembersQuery {
+                pool_kind: POOL_KIND_PROVIDER_KEY_POOL.to_string(),
+                pool_id: "provider-1".to_string(),
+                capability: POOL_SCORE_CAPABILITY_API_FORMAT.to_string(),
+                scope_kind: POOL_SCORE_SCOPE_KIND_MODEL.to_string(),
+                scope_id: Some("model-1".to_string()),
+                score_version: Some(2),
+                hard_states: vec![PoolMemberHardState::Available],
+                probe_statuses: None,
+                offset: 0,
+                limit: 10,
+            })
+            .await
+            .expect("list should succeed");
+
+        assert_eq!(
+            rows.into_iter()
+                .map(|row| row.member_id)
+                .collect::<Vec<_>>(),
+            vec!["key-2".to_string()]
         );
     }
 

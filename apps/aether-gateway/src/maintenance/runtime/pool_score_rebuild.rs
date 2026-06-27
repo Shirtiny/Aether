@@ -5,6 +5,7 @@ use aether_data_contracts::repository::pool_scores::GetPoolMemberScoresByIdsQuer
 use aether_data_contracts::repository::provider_catalog::{
     StoredProviderCatalogEndpoint, StoredProviderCatalogKey, StoredProviderCatalogProvider,
 };
+use aether_pool_core::POOL_SCORE_VERSION;
 use tracing::{debug, info, warn};
 
 use crate::admin_api::admin_provider_pool_config;
@@ -157,7 +158,7 @@ pub(crate) async fn ensure_provider_key_pool_scores_for_keys(
         return Ok(0);
     }
 
-    let existing_score_ids = state
+    let current_score_ids = state
         .data
         .get_pool_member_scores_by_ids(&GetPoolMemberScoresByIdsQuery {
             ids: build_items
@@ -175,12 +176,13 @@ pub(crate) async fn ensure_provider_key_pool_scores_for_keys(
             Vec::new()
         })
         .into_iter()
+        .filter(|score| score.score_version == POOL_SCORE_VERSION)
         .map(|score| score.id)
         .collect::<std::collections::BTreeSet<_>>();
 
     let mut upserted = 0usize;
     for (key, score_id) in &build_items {
-        if existing_score_ids.contains(score_id) {
+        if current_score_ids.contains(score_id) {
             continue;
         }
         let upsert = build_provider_key_pool_score_upsert(

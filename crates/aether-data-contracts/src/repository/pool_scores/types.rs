@@ -219,6 +219,7 @@ pub struct ListRankedPoolMembersQuery {
     pub capability: String,
     pub scope_kind: String,
     pub scope_id: Option<String>,
+    pub score_version: Option<u64>,
     pub hard_states: Vec<PoolMemberHardState>,
     pub probe_statuses: Option<Vec<PoolMemberProbeStatus>>,
     pub offset: usize,

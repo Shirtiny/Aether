@@ -3,7 +3,7 @@ use aether_data_contracts::repository::pool_scores::{
 };
 use serde_json::{json, Value};
 
-pub const POOL_SCORE_VERSION: u64 = 1;
+pub const POOL_SCORE_VERSION: u64 = 2;
 pub const PROBE_FRESHNESS_TTL_SECONDS: u64 = 30 * 60;
 pub const UNSCHEDULABLE_SCORE_CAP: f64 = 0.05;
 pub const PROBE_FAILURE_PENALTY: f64 = 0.05;
@@ -16,7 +16,6 @@ pub struct PoolMemberScoreWeights {
     pub health: f64,
     pub probe_freshness: f64,
     pub quota_remaining: f64,
-    pub latency: f64,
     pub cost_lru: f64,
 }
 
@@ -24,10 +23,9 @@ impl Default for PoolMemberScoreWeights {
     fn default() -> Self {
         Self {
             manual_priority: 0.30,
-            health: 0.20,
-            probe_freshness: 0.15,
+            health: 0.25,
+            probe_freshness: 0.20,
             quota_remaining: 0.15,
-            latency: 0.10,
             cost_lru: 0.10,
         }
     }
@@ -40,14 +38,12 @@ impl PoolMemberScoreWeights {
             health: finite_non_negative(self.health),
             probe_freshness: finite_non_negative(self.probe_freshness),
             quota_remaining: finite_non_negative(self.quota_remaining),
-            latency: finite_non_negative(self.latency),
             cost_lru: finite_non_negative(self.cost_lru),
         };
         let total = sanitized.manual_priority
             + sanitized.health
             + sanitized.probe_freshness
             + sanitized.quota_remaining
-            + sanitized.latency
             + sanitized.cost_lru;
         if total <= f64::EPSILON {
             return sanitized;
@@ -57,7 +53,6 @@ impl PoolMemberScoreWeights {
             health: sanitized.health / total,
             probe_freshness: sanitized.probe_freshness / total,
             quota_remaining: sanitized.quota_remaining / total,
-            latency: sanitized.latency / total,
             cost_lru: sanitized.cost_lru / total,
         }
     }
@@ -68,7 +63,6 @@ impl PoolMemberScoreWeights {
             "health": self.health,
             "probe_freshness": self.probe_freshness,
             "quota_remaining": self.quota_remaining,
-            "latency": self.latency,
             "cost_lru": self.cost_lru
         })
     }
@@ -138,9 +132,7 @@ pub struct PoolMemberScoreInput {
     pub quota_exhausted: bool,
     pub account_blocked: bool,
     pub oauth_invalid_reason: Option<String>,
-    pub success_count: u64,
     pub error_count: u64,
-    pub total_response_time_ms: u64,
     pub total_tokens: u64,
     pub total_cost_usd: f64,
     pub last_used_at: Option<u64>,
@@ -180,14 +172,12 @@ pub fn score_pool_member_with_rules(
         .quota_usage_ratio
         .map(|ratio| 1.0 - ratio.clamp(0.0, 1.0))
         .unwrap_or(0.5);
-    let latency = latency_score(input.success_count, input.total_response_time_ms);
     let cost_lru = cost_lru_score(input.total_cost_usd, input.total_tokens, input.last_used_at);
 
     let weighted_score = manual_priority * weights.manual_priority
         + health * weights.health
         + probe_freshness * weights.probe_freshness
         + quota_remaining * weights.quota_remaining
-        + latency * weights.latency
         + cost_lru * weights.cost_lru;
     let probe_failure_penalty =
         (input.probe_failure_count.min(10) as f64 * rules.probe_failure_penalty).min(0.5);
@@ -210,7 +200,6 @@ pub fn score_pool_member_with_rules(
                 "health": health,
                 "probe_freshness": probe_freshness,
                 "quota_remaining": quota_remaining,
-                "latency": latency,
                 "cost_lru": cost_lru
             },
             "rules": {
@@ -310,20 +299,6 @@ pub fn probe_freshness_score_with_ttl(
     }
 }
 
-fn latency_score(success_count: u64, total_response_time_ms: u64) -> f64 {
-    if success_count == 0 || total_response_time_ms == 0 {
-        return 0.5;
-    }
-    let avg = total_response_time_ms as f64 / success_count as f64;
-    if avg <= 500.0 {
-        1.0
-    } else if avg >= 60_000.0 {
-        0.0
-    } else {
-        1.0 - ((avg - 500.0) / 59_500.0)
-    }
-}
-
 fn cost_lru_score(total_cost_usd: f64, total_tokens: u64, last_used_at: Option<u64>) -> f64 {
     let cost_penalty = if total_cost_usd.is_finite() {
         (total_cost_usd.max(0.0) / 100.0).min(0.5)
@@ -366,9 +341,7 @@ mod tests {
             quota_exhausted: false,
             account_blocked: false,
             oauth_invalid_reason: None,
-            success_count: 10,
             error_count: 0,
-            total_response_time_ms: 2_000,
             total_tokens: 10,
             total_cost_usd: 0.01,
             last_used_at: None,
@@ -417,7 +390,6 @@ mod tests {
                 health: 0.0,
                 probe_freshness: 1.0,
                 quota_remaining: 0.0,
-                latency: 0.0,
                 cost_lru: 0.0,
             },
             probe_freshness_ttl_seconds: 1_000,
@@ -445,7 +417,6 @@ mod tests {
                 health: 2.0,
                 probe_freshness: 0.0,
                 quota_remaining: 0.0,
-                latency: -1.0,
                 cost_lru: f64::NAN,
             },
             probe_freshness_ttl_seconds: 0,
@@ -476,7 +447,6 @@ mod tests {
                 health: 0.0,
                 probe_freshness: 0.0,
                 quota_remaining: 0.0,
-                latency: 0.0,
                 cost_lru: 0.0,
             },
             ..PoolMemberScoreRules::default()
@@ -490,7 +460,6 @@ mod tests {
                 health: 0.0,
                 probe_freshness: 0.0,
                 quota_remaining: 0.0,
-                latency: 0.0,
                 cost_lru: 0.0,
             }
         );

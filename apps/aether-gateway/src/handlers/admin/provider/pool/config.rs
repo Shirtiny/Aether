@@ -131,7 +131,6 @@ fn parse_pool_score_weights(
             &["quota_remaining", "quota", "quota_available"],
             current.quota_remaining,
         ),
-        latency: pool_score_weight(raw_weights, &["latency"], current.latency),
         cost_lru: pool_score_weight(
             raw_weights,
             &["cost_lru", "cost_remaining", "cost", "lru"],
@@ -690,8 +689,7 @@ mod tests {
                         "health": 0.2,
                         "probe_freshness": 0.2,
                         "quota_remaining": 0.1,
-                        "latency": 0.05,
-                        "cost_lru": 0.05
+                        "cost_lru": 0.1
                     },
                     "probe_freshness_ttl_seconds": 1200,
                     "unschedulable_score_cap": 0.03,
@@ -801,7 +799,7 @@ mod tests {
                     "health": 2,
                     "probe": 1,
                     "quota_remaining": 0,
-                    "latency": 0,
+                    "latency": 99,
                     "cost_remaining": 1
                 }
             }
