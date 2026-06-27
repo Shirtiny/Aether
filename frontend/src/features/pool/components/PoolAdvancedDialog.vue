@@ -974,7 +974,6 @@ async function handleSave() {
     const scoreRules = {
       ...(props.currentConfig?.score_rules ?? {}),
       weights: {
-        ...(props.currentConfig?.score_rules?.weights ?? {}),
         manual_priority: form.value.score_weight_manual_priority ?? undefined,
         health: form.value.score_weight_health ?? undefined,
         probe_freshness: form.value.score_weight_probe_freshness ?? undefined,
