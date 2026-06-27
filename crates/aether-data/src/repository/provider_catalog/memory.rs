@@ -11,7 +11,11 @@ use super::{
     StoredProviderCatalogKeyMaintenanceSummary, StoredProviderCatalogKeyPage,
     StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
 };
-use crate::repository::usage::{ProviderApiKeyUsageContribution, ProviderApiKeyUsageDelta};
+use crate::repository::usage::{
+    apply_provider_api_key_total_response_time_ms_delta,
+    clamp_provider_api_key_total_response_time_ms, ProviderApiKeyUsageContribution,
+    ProviderApiKeyUsageDelta,
+};
 use crate::DataLayerError;
 
 #[derive(Debug, Default)]
@@ -75,7 +79,7 @@ impl InMemoryProviderCatalogReadRepository {
         ));
         key.total_tokens = apply_i64_delta_to_u64(key.total_tokens, delta.total_tokens);
         key.total_cost_usd = apply_f64_delta(key.total_cost_usd, delta.total_cost_usd);
-        key.total_response_time_ms = Some(apply_i64_delta_to_u64(
+        key.total_response_time_ms = Some(apply_provider_api_key_total_response_time_ms_delta(
             key.total_response_time_ms.unwrap_or_default(),
             delta.total_response_time_ms,
         ));
@@ -122,8 +126,9 @@ impl InMemoryProviderCatalogReadRepository {
             key.error_count = Some(clamp_i64_to_u32(contribution.error_count));
             key.total_tokens = clamp_i64_to_u64(contribution.total_tokens);
             key.total_cost_usd = contribution.total_cost_usd.max(0.0);
-            key.total_response_time_ms =
-                Some(clamp_i64_to_u64(contribution.total_response_time_ms));
+            key.total_response_time_ms = Some(clamp_provider_api_key_total_response_time_ms(
+                contribution.total_response_time_ms,
+            ));
             key.last_used_at_unix_secs = contribution.last_used_at_unix_secs;
         }
     }

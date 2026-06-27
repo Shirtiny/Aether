@@ -393,6 +393,52 @@ pub use mysql::{MysqlUsageReadRepository, MysqlUsageWriteRepository};
 pub use postgres::SqlxUsageReadRepository;
 pub use sqlite::{SqliteUsageReadRepository, SqliteUsageWriteRepository};
 
+pub(crate) const PROVIDER_API_KEY_TOTAL_RESPONSE_TIME_MS_MAX: i64 = 1_000_000_000;
+pub(crate) const PROVIDER_API_KEY_TOTAL_RESPONSE_TIME_MS_MAX_U64: u64 =
+    PROVIDER_API_KEY_TOTAL_RESPONSE_TIME_MS_MAX as u64;
+pub(crate) const PROVIDER_API_KEY_USAGE_COUNTER_MAX: i64 = u32::MAX as i64;
+
+pub(crate) fn clamp_provider_api_key_usage_counter(value: i64) -> u32 {
+    value.clamp(0, PROVIDER_API_KEY_USAGE_COUNTER_MAX) as u32
+}
+
+pub(crate) fn clamp_provider_api_key_usage_counter_i64(value: i64) -> i64 {
+    value.clamp(0, PROVIDER_API_KEY_USAGE_COUNTER_MAX)
+}
+
+pub(crate) fn apply_provider_api_key_usage_counter_i64_delta(current: i64, delta: i64) -> i64 {
+    current
+        .saturating_add(delta)
+        .clamp(0, PROVIDER_API_KEY_USAGE_COUNTER_MAX)
+}
+
+pub(crate) fn cap_provider_api_key_total_response_time_ms(value: u64) -> u64 {
+    value.min(PROVIDER_API_KEY_TOTAL_RESPONSE_TIME_MS_MAX_U64)
+}
+
+pub(crate) fn clamp_provider_api_key_total_response_time_ms(value: i64) -> u64 {
+    value.clamp(0, PROVIDER_API_KEY_TOTAL_RESPONSE_TIME_MS_MAX) as u64
+}
+
+pub(crate) fn apply_provider_api_key_total_response_time_ms_delta(current: u64, delta: i64) -> u64 {
+    let next = if delta >= 0 {
+        current.saturating_add(delta as u64)
+    } else {
+        current.saturating_sub(delta.unsigned_abs())
+    };
+    cap_provider_api_key_total_response_time_ms(next)
+}
+
+pub(crate) fn apply_provider_api_key_total_response_time_ms_i64_delta(
+    current: i64,
+    delta: i64,
+) -> i64 {
+    current.saturating_add(delta).clamp(
+        -PROVIDER_API_KEY_TOTAL_RESPONSE_TIME_MS_MAX,
+        PROVIDER_API_KEY_TOTAL_RESPONSE_TIME_MS_MAX,
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub(crate) struct ApiKeyUsageContribution {
     pub api_key_id: String,
@@ -674,6 +720,7 @@ pub(crate) fn provider_api_key_usage_contribution(
         total_response_time_ms: if is_success {
             usage
                 .response_time_ms
+                .map(cap_provider_api_key_total_response_time_ms)
                 .and_then(|value| i64::try_from(value).ok())
                 .unwrap_or_default()
         } else {
@@ -738,13 +785,29 @@ fn newer_last_used_at(before: Option<u64>, after: Option<u64>) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        api_key_usage_contribution, incoming_usage_can_recover_terminal_failure,
-        model_usage_contribution, provider_api_key_usage_contribution,
-        provider_api_key_usage_is_error, provider_api_key_usage_is_success,
-        strip_deprecated_usage_display_fields, usage_can_recover_terminal_failure,
-        ApiKeyUsageDelta, ModelUsageDelta, ProviderApiKeyUsageDelta, StoredRequestUsageAudit,
-        UpsertUsageRecord,
+        api_key_usage_contribution, apply_provider_api_key_total_response_time_ms_delta,
+        incoming_usage_can_recover_terminal_failure, model_usage_contribution,
+        provider_api_key_usage_contribution, provider_api_key_usage_is_error,
+        provider_api_key_usage_is_success, strip_deprecated_usage_display_fields,
+        usage_can_recover_terminal_failure, ApiKeyUsageDelta, ModelUsageDelta,
+        ProviderApiKeyUsageDelta, StoredRequestUsageAudit, UpsertUsageRecord,
+        PROVIDER_API_KEY_TOTAL_RESPONSE_TIME_MS_MAX,
     };
+
+    #[test]
+    fn provider_key_total_response_time_delta_is_bounded() {
+        assert_eq!(
+            apply_provider_api_key_total_response_time_ms_delta(
+                (PROVIDER_API_KEY_TOTAL_RESPONSE_TIME_MS_MAX - 10) as u64,
+                50,
+            ),
+            PROVIDER_API_KEY_TOTAL_RESPONSE_TIME_MS_MAX as u64
+        );
+        assert_eq!(
+            apply_provider_api_key_total_response_time_ms_delta(10, -50),
+            0
+        );
+    }
 
     #[test]
     fn strip_deprecated_usage_display_fields_clears_legacy_display_columns() {

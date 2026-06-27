@@ -8,6 +8,10 @@ use super::{
     StoredProviderCatalogKeyMaintenanceSummary, StoredProviderCatalogKeyPage,
     StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
 };
+use crate::repository::usage::{
+    cap_provider_api_key_total_response_time_ms, clamp_provider_api_key_total_response_time_ms,
+    clamp_provider_api_key_usage_counter,
+};
 use crate::{
     error::{postgres_error, SqlxResultExt},
     DataLayerError,
@@ -1316,7 +1320,8 @@ INSERT INTO provider_api_keys (
         .bind(key.success_count.map(i64::from))
         .bind(key.error_count.map(i64::from))
         .bind(optional_i64_from_u64(
-            key.total_response_time_ms,
+            key.total_response_time_ms
+                .map(cap_provider_api_key_total_response_time_ms),
             "provider_api_keys.total_response_time_ms",
         )?)
         .bind(key.last_used_at_unix_secs.map(|value| value as f64))
@@ -2359,15 +2364,8 @@ fn map_key_row(row: &PgRow) -> Result<StoredProviderCatalogKey, DataLayerError> 
             })
         })
         .transpose()?;
-    let request_count = row_get::<Option<i64>>(row, "request_count")?
-        .map(|value| {
-            u32::try_from(value).map_err(|_| {
-                DataLayerError::UnexpectedValue(format!(
-                    "invalid provider_api_keys.request_count: {value}"
-                ))
-            })
-        })
-        .transpose()?;
+    let request_count =
+        row_get::<Option<i64>>(row, "request_count")?.map(clamp_provider_api_key_usage_counter);
     let total_tokens = row_get::<Option<i64>>(row, "total_tokens")?
         .unwrap_or(0)
         .try_into()
@@ -2380,33 +2378,12 @@ fn map_key_row(row: &PgRow) -> Result<StoredProviderCatalogKey, DataLayerError> 
             "invalid provider_api_keys.total_cost_usd".to_string(),
         ));
     }
-    let success_count = row_get::<Option<i64>>(row, "success_count")?
-        .map(|value| {
-            u32::try_from(value).map_err(|_| {
-                DataLayerError::UnexpectedValue(format!(
-                    "invalid provider_api_keys.success_count: {value}"
-                ))
-            })
-        })
-        .transpose()?;
-    let error_count = row_get::<Option<i64>>(row, "error_count")?
-        .map(|value| {
-            u32::try_from(value).map_err(|_| {
-                DataLayerError::UnexpectedValue(format!(
-                    "invalid provider_api_keys.error_count: {value}"
-                ))
-            })
-        })
-        .transpose()?;
+    let success_count =
+        row_get::<Option<i64>>(row, "success_count")?.map(clamp_provider_api_key_usage_counter);
+    let error_count =
+        row_get::<Option<i64>>(row, "error_count")?.map(clamp_provider_api_key_usage_counter);
     let total_response_time_ms = row_get::<Option<i64>>(row, "total_response_time_ms")?
-        .map(|value| {
-            u64::try_from(value).map_err(|_| {
-                DataLayerError::UnexpectedValue(format!(
-                    "invalid provider_api_keys.total_response_time_ms: {value}"
-                ))
-            })
-        })
-        .transpose()?;
+        .map(clamp_provider_api_key_total_response_time_ms);
     let last_probe_increase_at_unix_secs =
         row_get::<Option<i64>>(row, "last_probe_increase_at_unix_secs")?
             .map(|value| {

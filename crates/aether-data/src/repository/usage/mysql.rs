@@ -6,11 +6,13 @@ use async_trait::async_trait;
 use sqlx::{mysql::MySqlRow, MySql, QueryBuilder, Row};
 
 use super::{
-    provider_api_key_usage_is_error, provider_api_key_usage_is_success,
-    strip_deprecated_usage_display_fields, usage_can_recover_terminal_failure,
-    usage_request_metadata_client_family, InMemoryUsageReadRepository, PendingUsageCleanupSummary,
-    StoredRequestUsageAudit, StoredUsageDailySummary, StoredUsageDashboardDailyBreakdownRow,
-    StoredUsageDashboardSummary, StoredUsageUserTotals, UpsertUsageRecord, UsageDailyHeatmapQuery,
+    apply_provider_api_key_total_response_time_ms_i64_delta,
+    apply_provider_api_key_usage_counter_i64_delta, provider_api_key_usage_is_error,
+    provider_api_key_usage_is_success, strip_deprecated_usage_display_fields,
+    usage_can_recover_terminal_failure, usage_request_metadata_client_family,
+    InMemoryUsageReadRepository, PendingUsageCleanupSummary, StoredRequestUsageAudit,
+    StoredUsageDailySummary, StoredUsageDashboardDailyBreakdownRow, StoredUsageDashboardSummary,
+    StoredUsageUserTotals, UpsertUsageRecord, UsageDailyHeatmapQuery,
     UsageDashboardDailyBreakdownQuery, UsageDashboardSummaryQuery, UsageReadRepository,
     UsageWriteRepository,
 };
@@ -861,7 +863,8 @@ WHERE provider_api_key_id IS NOT NULL AND provider_api_key_id <> ''
             let status_code_u16 = status_code.and_then(|value| u16::try_from(value).ok());
             let error_message: Option<String> = row.try_get("error_message").map_sql_err()?;
             let entry = stats.entry(key_id).or_default();
-            entry.request_count += 1;
+            entry.request_count =
+                apply_provider_api_key_usage_counter_i64_delta(entry.request_count, 1);
             let is_success = provider_api_key_usage_is_success(
                 &status,
                 status_code_u16,
@@ -869,20 +872,25 @@ WHERE provider_api_key_id IS NOT NULL AND provider_api_key_id <> ''
             );
             let is_in_flight = matches!(status.as_str(), "pending" | "streaming");
             if is_success {
-                entry.success_count += 1;
+                entry.success_count =
+                    apply_provider_api_key_usage_counter_i64_delta(entry.success_count, 1);
             }
             if provider_api_key_usage_is_error(&status, status_code_u16, error_message.as_deref()) {
-                entry.error_count += 1;
+                entry.error_count =
+                    apply_provider_api_key_usage_counter_i64_delta(entry.error_count, 1);
             }
             if !is_in_flight {
                 entry.total_tokens += row.try_get::<i64, _>("total_tokens").map_sql_err()?;
                 entry.total_cost_usd += row.try_get::<f64, _>("total_cost_usd").map_sql_err()?;
             }
             if is_success {
-                entry.total_response_time_ms += row
-                    .try_get::<Option<i64>, _>("response_time_ms")
-                    .map_sql_err()?
-                    .unwrap_or_default();
+                entry.total_response_time_ms =
+                    apply_provider_api_key_total_response_time_ms_i64_delta(
+                        entry.total_response_time_ms,
+                        row.try_get::<Option<i64>, _>("response_time_ms")
+                            .map_sql_err()?
+                            .unwrap_or_default(),
+                    );
             }
             entry.last_used_at = entry.last_used_at.max(
                 row.try_get::<Option<i64>, _>("updated_at_unix_secs")

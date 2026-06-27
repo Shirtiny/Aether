@@ -9,6 +9,10 @@ use super::{
 };
 use crate::driver::sqlite::{sqlite_optional_real, SqlitePool};
 use crate::error::SqlResultExt;
+use crate::repository::usage::{
+    cap_provider_api_key_total_response_time_ms, clamp_provider_api_key_total_response_time_ms,
+    clamp_provider_api_key_usage_counter,
+};
 use crate::DataLayerError;
 use aether_data_query::{
     push_ci_contains_any, push_eq, push_in, push_limit_offset, push_optional_eq, SqlDialect,
@@ -978,7 +982,8 @@ WHERE id = ?
             .bind(optional_i64_from_u32(key.error_count).unwrap_or(0))
             .bind(
                 optional_i64_from_u64(
-                    key.total_response_time_ms,
+                    key.total_response_time_ms
+                        .map(cap_provider_api_key_total_response_time_ms),
                     "provider_api_keys.total_response_time_ms",
                 )?
                 .unwrap_or(0),
@@ -1942,24 +1947,20 @@ fn map_key_row(row: &SqliteRow) -> Result<StoredProviderCatalogKey, DataLayerErr
                     row.try_get("adjustment_history").map_sql_err()?,
                     "provider_api_keys.adjustment_history",
                 )?,
-                optional_u32(
-                    row.try_get("request_count").map_sql_err()?,
-                    "provider_api_keys.request_count",
-                )?,
-                optional_u32(
-                    row.try_get("success_count").map_sql_err()?,
-                    "provider_api_keys.success_count",
-                )?,
+                row.try_get::<Option<i64>, _>("request_count")
+                    .map_sql_err()?
+                    .map(clamp_provider_api_key_usage_counter),
+                row.try_get::<Option<i64>, _>("success_count")
+                    .map_sql_err()?
+                    .map(clamp_provider_api_key_usage_counter),
             )
             .with_usage_fields(
-                optional_u32(
-                    row.try_get("error_count").map_sql_err()?,
-                    "provider_api_keys.error_count",
-                )?,
-                optional_u64(
-                    row.try_get("total_response_time_ms").map_sql_err()?,
-                    "provider_api_keys.total_response_time_ms",
-                )?,
+                row.try_get::<Option<i64>, _>("error_count")
+                    .map_sql_err()?
+                    .map(clamp_provider_api_key_usage_counter),
+                row.try_get::<Option<i64>, _>("total_response_time_ms")
+                    .map_sql_err()?
+                    .map(clamp_provider_api_key_total_response_time_ms),
             )
             .with_usage_totals(
                 optional_u64(

@@ -37,14 +37,15 @@ use std::io::{Read, Write};
 use uuid::Uuid;
 
 use super::{
-    api_key_usage_contribution, incoming_usage_can_recover_terminal_failure,
-    model_usage_contribution, provider_api_key_usage_contribution,
-    strip_deprecated_usage_display_fields, ApiKeyUsageDelta, ModelUsageDelta,
-    PendingUsageCleanupSummary, ProviderApiKeyUsageDelta, ProviderApiKeyWindowUsageRequest,
-    StoredProviderApiKeyUsageSummary, StoredProviderApiKeyWindowUsageSummary,
-    StoredProviderUsageSummary, StoredRequestUsageAudit, StoredUsageDailySummary,
-    UpsertUsageRecord, UsageAuditListQuery, UsageCounterFlushSummary, UsageCounterHealthSnapshot,
-    UsageDailyHeatmapQuery, UsageReadRepository, UsageWriteRepository,
+    api_key_usage_contribution, apply_provider_api_key_total_response_time_ms_i64_delta,
+    incoming_usage_can_recover_terminal_failure, model_usage_contribution,
+    provider_api_key_usage_contribution, strip_deprecated_usage_display_fields, ApiKeyUsageDelta,
+    ModelUsageDelta, PendingUsageCleanupSummary, ProviderApiKeyUsageDelta,
+    ProviderApiKeyWindowUsageRequest, StoredProviderApiKeyUsageSummary,
+    StoredProviderApiKeyWindowUsageSummary, StoredProviderUsageSummary, StoredRequestUsageAudit,
+    StoredUsageDailySummary, UpsertUsageRecord, UsageAuditListQuery, UsageCounterFlushSummary,
+    UsageCounterHealthSnapshot, UsageDailyHeatmapQuery, UsageReadRepository, UsageWriteRepository,
+    PROVIDER_API_KEY_TOTAL_RESPONSE_TIME_MS_MAX, PROVIDER_API_KEY_USAGE_COUNTER_MAX,
 };
 use crate::driver::postgres::PostgresTransactionRunner;
 use crate::{
@@ -8974,6 +8975,8 @@ ORDER BY "usage".user_id ASC
                         .await
                         .map_postgres_err()?;
                     let rows_affected = sqlx::query(REBUILD_PROVIDER_API_KEY_USAGE_STATS_SQL)
+                        .bind(PROVIDER_API_KEY_TOTAL_RESPONSE_TIME_MS_MAX)
+                        .bind(PROVIDER_API_KEY_USAGE_COUNTER_MAX)
                         .execute(&mut **tx)
                         .await
                         .map_postgres_err()?
@@ -9454,7 +9457,11 @@ impl UsageCounterDeltaAggregates {
                     entry.error_count += row.error_count_delta;
                     entry.total_tokens += row.total_tokens_delta;
                     entry.total_cost_usd += row.total_cost_usd_delta;
-                    entry.total_response_time_ms += row.total_response_time_ms_delta;
+                    entry.total_response_time_ms =
+                        apply_provider_api_key_total_response_time_ms_i64_delta(
+                            entry.total_response_time_ms,
+                            row.total_response_time_ms_delta,
+                        );
                     merge_optional_max(
                         &mut entry.candidate_last_used_at_unix_secs,
                         row.candidate_last_used_at_unix_secs,
@@ -10001,6 +10008,8 @@ async fn apply_provider_api_key_main_usage_delta_in_tx(
                 .removed_last_used_at_unix_secs
                 .map(|value| value as f64),
         )
+        .bind(PROVIDER_API_KEY_TOTAL_RESPONSE_TIME_MS_MAX)
+        .bind(PROVIDER_API_KEY_USAGE_COUNTER_MAX)
         .execute(&mut **tx)
         .await
         .map_postgres_err()?;

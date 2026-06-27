@@ -1,8 +1,8 @@
 WITH aggregated AS (
   SELECT
     provider_api_key_id,
-    COUNT(*)::BIGINT AS request_count,
-    COALESCE(SUM(
+    LEAST(COUNT(*)::BIGINT, $2::bigint) AS request_count,
+    LEAST(COALESCE(SUM(
       CASE
         WHEN status IN ('completed', 'success', 'ok', 'billed', 'settled')
              AND (status_code IS NULL OR status_code < 400)
@@ -10,8 +10,8 @@ WITH aggregated AS (
         THEN 1
         ELSE 0
       END
-    ), 0)::BIGINT AS success_count,
-    COALESCE(SUM(
+    ), 0)::BIGINT, $2::bigint) AS success_count,
+    LEAST(COALESCE(SUM(
       CASE
         WHEN status NOT IN ('pending', 'streaming')
              AND NOT (
@@ -22,7 +22,7 @@ WITH aggregated AS (
         THEN 1
         ELSE 0
       END
-    ), 0)::BIGINT AS error_count,
+    ), 0)::BIGINT, $2::bigint) AS error_count,
     COALESCE(SUM(
       CASE
         WHEN status IN ('pending', 'streaming') THEN 0
@@ -41,7 +41,7 @@ WITH aggregated AS (
         ELSE COALESCE(total_cost_usd, 0)
       END
     ), 0)::NUMERIC(20,8) AS total_cost_usd,
-    COALESCE(SUM(
+    LEAST(COALESCE(SUM(
       CASE
         WHEN status IN ('completed', 'success', 'ok', 'billed', 'settled')
              AND (status_code IS NULL OR status_code < 400)
@@ -50,7 +50,7 @@ WITH aggregated AS (
         THEN GREATEST(response_time_ms, 0)
         ELSE 0
       END
-    ), 0)::BIGINT AS total_response_time_ms,
+    ), 0), $1::numeric)::BIGINT AS total_response_time_ms,
     MAX(created_at) AS last_used_at
   FROM usage_billing_facts AS "usage"
   WHERE provider_api_key_id IS NOT NULL

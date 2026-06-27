@@ -9,6 +9,7 @@ use flate2::read::GzDecoder;
 use sqlx::{sqlite::SqliteRow, QueryBuilder, Row, Sqlite};
 
 use super::{
+    clamp_provider_api_key_total_response_time_ms, clamp_provider_api_key_usage_counter_i64,
     strip_deprecated_usage_display_fields, usage_can_recover_terminal_failure,
     usage_request_metadata_client_family, PendingUsageCleanupSummary,
     ProviderApiKeyWindowUsageRequest, StoredProviderApiKeyUsageSummary,
@@ -3867,15 +3868,21 @@ SET request_count = ?,
 WHERE id = ?
 "#,
             )
-            .bind(row.try_get::<i64, _>("request_count").map_sql_err()?)
-            .bind(row.try_get::<i64, _>("success_count").map_sql_err()?)
-            .bind(row.try_get::<i64, _>("error_count").map_sql_err()?)
+            .bind(clamp_provider_api_key_usage_counter_i64(
+                row.try_get::<i64, _>("request_count").map_sql_err()?,
+            ))
+            .bind(clamp_provider_api_key_usage_counter_i64(
+                row.try_get::<i64, _>("success_count").map_sql_err()?,
+            ))
+            .bind(clamp_provider_api_key_usage_counter_i64(
+                row.try_get::<i64, _>("error_count").map_sql_err()?,
+            ))
             .bind(row.try_get::<i64, _>("total_tokens").map_sql_err()?)
             .bind(sqlite_real(row, "total_cost_usd")?)
-            .bind(
+            .bind(clamp_provider_api_key_total_response_time_ms(
                 row.try_get::<i64, _>("total_response_time_ms")
                     .map_sql_err()?,
-            )
+            ) as i64)
             .bind(
                 row.try_get::<Option<i64>, _>("last_used_at")
                     .map_sql_err()?,
