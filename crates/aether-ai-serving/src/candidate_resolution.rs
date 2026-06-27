@@ -478,4 +478,25 @@ mod tests {
             Some("session-e")
         );
     }
+
+    #[test]
+    fn sticky_session_token_preserves_literal_guardian_session() {
+        assert_eq!(
+            extract_ai_pool_sticky_session_token(&json!({
+                "prompt_cache_key": "guardian:019f06bb-7437-7903-82e0-14fda38efd65"
+            }))
+            .as_deref(),
+            Some("guardian:019f06bb-7437-7903-82e0-14fda38efd65")
+        );
+
+        assert_eq!(
+            extract_ai_pool_sticky_session_token(&json!({
+                "metadata": {
+                    "user_id": "{\"device_id\":\"device-a\",\"session_id\":\"guardian:session-e\"}"
+                }
+            }))
+            .as_deref(),
+            Some("guardian:session-e")
+        );
+    }
 }

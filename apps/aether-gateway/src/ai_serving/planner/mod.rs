@@ -92,13 +92,89 @@ pub(crate) fn pool_sticky_session_token_for_request(
     body_json: &serde_json::Value,
     client_session_affinity: Option<&aether_scheduler_core::ClientSessionAffinity>,
 ) -> Option<String> {
-    extract_pool_sticky_session_token(body_json).or_else(|| {
-        client_session_affinity?
-            .session_key
-            .as_deref()
+    if let Some(token) = extract_pool_sticky_session_token(body_json) {
+        return Some(canonicalize_codex_pool_sticky_session_token(
+            token,
+            client_session_affinity,
+        ));
+    }
+
+    let session_key = client_session_affinity?
+        .session_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    Some(canonicalize_codex_pool_sticky_session_token(
+        session_key.to_string(),
+        client_session_affinity,
+    ))
+}
+
+fn canonicalize_codex_pool_sticky_session_token(
+    token: String,
+    client_session_affinity: Option<&aether_scheduler_core::ClientSessionAffinity>,
+) -> String {
+    let Some(client_session_affinity) = client_session_affinity else {
+        return token;
+    };
+
+    let token = token.trim();
+    if let Some(root_session) = token
+        .strip_prefix("session=guardian:")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if codex_affinity_matches_root_session(client_session_affinity, root_session) {
+            return format!("session={root_session}");
+        }
+        return token.to_string();
+    }
+    if let Some(root_session) = token
+        .strip_prefix("guardian:")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if codex_affinity_matches_root_session(client_session_affinity, root_session) {
+            return root_session.to_string();
+        }
+        return token.to_string();
+    }
+    let Some(root_session) = token.split(';').find_map(|part| {
+        part.trim()
+            .strip_prefix("session=guardian:")
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned)
+    }) else {
+        return token.to_string();
+    };
+    if codex_affinity_matches_root_session(client_session_affinity, root_session) {
+        token.replace(";session=guardian:", ";session=")
+    } else {
+        token.to_string()
+    }
+}
+
+fn codex_affinity_matches_root_session(
+    client_session_affinity: &aether_scheduler_core::ClientSessionAffinity,
+    root_session: &str,
+) -> bool {
+    client_session_affinity
+        .client_family
+        .as_deref()
+        .is_some_and(|client_family| client_family.eq_ignore_ascii_case("codex"))
+        && client_session_affinity
+            .session_key
+            .as_deref()
+            .and_then(session_id_from_affinity_key)
+            .is_some_and(|session_id| session_id == root_session)
+}
+
+fn session_id_from_affinity_key(session_key: &str) -> Option<&str> {
+    session_key.split(';').find_map(|part| {
+        part.trim()
+            .strip_prefix("session=")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
     })
 }
 
@@ -148,6 +224,78 @@ mod tests {
     }
 
     #[test]
+    fn pool_sticky_session_token_preserves_codex_guardian_body_session_without_root_match() {
+        let body = json!({
+            "session_id": "guardian:body-session"
+        });
+        let affinity = ClientSessionAffinity::new(
+            Some("codex".to_string()),
+            Some("session=other-session".to_string()),
+        );
+
+        assert_eq!(
+            pool_sticky_session_token_for_request(&body, Some(&affinity)).as_deref(),
+            Some("guardian:body-session")
+        );
+    }
+
+    #[test]
+    fn pool_sticky_session_token_canonicalizes_body_guardian_session() {
+        let body = json!({
+            "session_id": "guardian:body-session"
+        });
+        let affinity = ClientSessionAffinity::new(
+            Some("codex".to_string()),
+            Some("session=body-session".to_string()),
+        );
+
+        assert_eq!(
+            pool_sticky_session_token_for_request(&body, Some(&affinity)).as_deref(),
+            Some("body-session")
+        );
+    }
+
+    #[test]
+    fn pool_sticky_session_token_canonicalizes_codex_guardian_body_after_affinity_detection() {
+        let body = json!({
+            "prompt_cache_key": "guardian:019f06bb-7437-7903-82e0-14fda38efd65"
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::USER_AGENT,
+            HeaderValue::from_static("codex-tui/0.142.2"),
+        );
+
+        let affinity = client_session_affinity_from_request(&headers, Some(&body))
+            .expect("codex body session should build client affinity");
+
+        assert_eq!(
+            affinity.session_key.as_deref(),
+            Some("session=019f06bb-7437-7903-82e0-14fda38efd65")
+        );
+        assert_eq!(
+            pool_sticky_session_token_for_request(&body, Some(&affinity)).as_deref(),
+            Some("019f06bb-7437-7903-82e0-14fda38efd65")
+        );
+    }
+
+    #[test]
+    fn pool_sticky_session_token_preserves_non_codex_body_guardian_session() {
+        let body = json!({
+            "session_id": "guardian:body-session"
+        });
+        let affinity = ClientSessionAffinity::new(
+            Some("unknown".to_string()),
+            Some("session=header-session".to_string()),
+        );
+
+        assert_eq!(
+            pool_sticky_session_token_for_request(&body, Some(&affinity)).as_deref(),
+            Some("guardian:body-session")
+        );
+    }
+
+    #[test]
     fn pool_sticky_session_token_uses_client_affinity_when_body_has_no_session() {
         let body = json!({
             "model": "gpt-5.4"
@@ -160,6 +308,38 @@ mod tests {
         assert_eq!(
             pool_sticky_session_token_for_request(&body, Some(&affinity)).as_deref(),
             Some("session=header-session")
+        );
+    }
+
+    #[test]
+    fn pool_sticky_session_token_preserves_non_codex_guardian_affinity_fallback() {
+        let body = json!({
+            "model": "gpt-5.4"
+        });
+        let affinity = ClientSessionAffinity::new(
+            Some("unknown".to_string()),
+            Some("session=guardian:header-session".to_string()),
+        );
+
+        assert_eq!(
+            pool_sticky_session_token_for_request(&body, Some(&affinity)).as_deref(),
+            Some("session=guardian:header-session")
+        );
+    }
+
+    #[test]
+    fn pool_sticky_session_token_preserves_codex_guardian_affinity_fallback() {
+        let body = json!({
+            "model": "gpt-5.4"
+        });
+        let affinity = ClientSessionAffinity::new(
+            Some("codex".to_string()),
+            Some("session=guardian:header-session".to_string()),
+        );
+
+        assert_eq!(
+            pool_sticky_session_token_for_request(&body, Some(&affinity)).as_deref(),
+            Some("session=guardian:header-session")
         );
     }
 

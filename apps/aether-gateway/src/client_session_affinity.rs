@@ -45,12 +45,26 @@ impl ClientSessionScope {
         if session_id.is_empty() {
             return None;
         }
+        let session_id = self.codex_guardian_root_session().unwrap_or(session_id);
 
         Some(normalize_session_key(
             self.account_hint.as_deref(),
             session_id,
             self.agent_id.as_deref(),
         ))
+    }
+
+    fn codex_guardian_root_session(&self) -> Option<&str> {
+        if self.source != ClientSessionSignalSource::Body
+            || !self.client_family.eq_ignore_ascii_case("codex")
+        {
+            return None;
+        }
+        self.session_id
+            .trim()
+            .strip_prefix("guardian:")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
     }
 
     pub(crate) fn scheduler_affinity(&self) -> Option<ClientSessionAffinity> {
@@ -902,6 +916,105 @@ mod tests {
         assert_eq!(
             affinity.session_key.as_deref(),
             Some("account=account-1;session=prompt-session-1")
+        );
+    }
+
+    #[test]
+    fn codex_guardian_session_uses_root_session_for_affinity() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::USER_AGENT,
+            HeaderValue::from_static("codex-tui/0.142.2"),
+        );
+        let body = json!({
+            "prompt_cache_key": "guardian:019f06bb-7437-7903-82e0-14fda38efd65"
+        });
+
+        let scope = client_session_scope_from_request(&headers, Some(&body))
+            .expect("session scope should build");
+        let affinity = scope
+            .scheduler_affinity()
+            .expect("scheduler affinity should build");
+
+        assert_eq!(scope.client_family, "codex");
+        assert_eq!(
+            scope.session_id,
+            "guardian:019f06bb-7437-7903-82e0-14fda38efd65"
+        );
+        assert_eq!(
+            affinity.session_key.as_deref(),
+            Some("session=019f06bb-7437-7903-82e0-14fda38efd65")
+        );
+    }
+
+    #[test]
+    fn explicit_aether_guardian_session_is_preserved_for_affinity() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::USER_AGENT,
+            HeaderValue::from_static("codex-tui/0.142.2"),
+        );
+        headers.insert(
+            AETHER_SESSION_ID_HEADER,
+            HeaderValue::from_static("guardian:literal-session"),
+        );
+
+        let scope =
+            client_session_scope_from_request(&headers, None).expect("session scope should build");
+        let affinity = scope
+            .scheduler_affinity()
+            .expect("scheduler affinity should build");
+
+        assert_eq!(scope.client_family, "codex");
+        assert_eq!(
+            scope.source,
+            ClientSessionSignalSource::ExplicitAetherHeader
+        );
+        assert_eq!(
+            affinity.session_key.as_deref(),
+            Some("session=guardian:literal-session")
+        );
+    }
+
+    #[test]
+    fn codex_header_guardian_session_is_preserved_for_affinity() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::USER_AGENT,
+            HeaderValue::from_static("codex-tui/0.142.2"),
+        );
+        headers.insert(
+            "session_id",
+            HeaderValue::from_static("guardian:literal-session"),
+        );
+
+        let scope =
+            client_session_scope_from_request(&headers, None).expect("session scope should build");
+        let affinity = scope
+            .scheduler_affinity()
+            .expect("scheduler affinity should build");
+
+        assert_eq!(scope.client_family, "codex");
+        assert_eq!(scope.source, ClientSessionSignalSource::Header);
+        assert_eq!(
+            affinity.session_key.as_deref(),
+            Some("session=guardian:literal-session")
+        );
+    }
+
+    #[test]
+    fn non_codex_guardian_session_is_preserved_for_affinity() {
+        let body = json!({
+            "prompt_cache_key": "guardian:literal-session"
+        });
+
+        let affinity = client_session_affinity_from_request(&HeaderMap::new(), Some(&body))
+            .expect("affinity should build");
+
+        assert_eq!(affinity.client_family.as_deref(), Some("unknown"));
+        assert_eq!(
+            affinity.session_key.as_deref(),
+            Some("session=guardian:literal-session")
         );
     }
 
