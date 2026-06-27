@@ -1601,7 +1601,7 @@ fn build_pool_catalog_key_context(
         .filter(|count| *count > 0)
         .zip(key.total_response_time_ms)
         .map(|(success_count, total_response_time_ms)| {
-            f64::from(total_response_time_ms) / f64::from(success_count)
+            total_response_time_ms as f64 / f64::from(success_count)
         })
         .filter(|value| value.is_finite() && *value >= 0.0);
 

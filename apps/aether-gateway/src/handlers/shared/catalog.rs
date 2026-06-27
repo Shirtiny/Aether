@@ -2183,7 +2183,7 @@ pub(crate) fn build_admin_provider_key_response(
     let request_count = u64::from(key.request_count.unwrap_or(0));
     let success_count = u64::from(key.success_count.unwrap_or(0));
     let error_count = u64::from(key.error_count.unwrap_or(0));
-    let total_response_time_ms = f64::from(key.total_response_time_ms.unwrap_or(0));
+    let total_response_time_ms = key.total_response_time_ms.unwrap_or(0) as f64;
     let success_rate = if request_count > 0 {
         success_count as f64 / request_count as f64
     } else {

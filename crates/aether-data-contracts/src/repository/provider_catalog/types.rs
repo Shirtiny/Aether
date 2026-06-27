@@ -278,7 +278,7 @@ pub struct StoredProviderCatalogKey {
     pub total_cost_usd: f64,
     pub success_count: Option<u32>,
     pub error_count: Option<u32>,
-    pub total_response_time_ms: Option<u32>,
+    pub total_response_time_ms: Option<u64>,
     pub last_used_at_unix_secs: Option<u64>,
     pub auto_fetch_models: bool,
     pub last_models_fetch_at_unix_secs: Option<u64>,
@@ -444,7 +444,7 @@ impl StoredProviderCatalogKey {
     pub fn with_usage_fields(
         mut self,
         error_count: Option<u32>,
-        total_response_time_ms: Option<u32>,
+        total_response_time_ms: Option<u64>,
     ) -> Self {
         self.error_count = error_count;
         self.total_response_time_ms = total_response_time_ms;

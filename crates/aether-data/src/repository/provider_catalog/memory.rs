@@ -75,7 +75,7 @@ impl InMemoryProviderCatalogReadRepository {
         ));
         key.total_tokens = apply_i64_delta_to_u64(key.total_tokens, delta.total_tokens);
         key.total_cost_usd = apply_f64_delta(key.total_cost_usd, delta.total_cost_usd);
-        key.total_response_time_ms = Some(apply_i64_delta_to_u32(
+        key.total_response_time_ms = Some(apply_i64_delta_to_u64(
             key.total_response_time_ms.unwrap_or_default(),
             delta.total_response_time_ms,
         ));
@@ -123,7 +123,7 @@ impl InMemoryProviderCatalogReadRepository {
             key.total_tokens = clamp_i64_to_u64(contribution.total_tokens);
             key.total_cost_usd = contribution.total_cost_usd.max(0.0);
             key.total_response_time_ms =
-                Some(clamp_i64_to_u32(contribution.total_response_time_ms));
+                Some(clamp_i64_to_u64(contribution.total_response_time_ms));
             key.last_used_at_unix_secs = contribution.last_used_at_unix_secs;
         }
     }

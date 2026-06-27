@@ -552,7 +552,13 @@ WHERE id = ?
             .bind(key.total_cost_usd)
             .bind(optional_i64_from_u32(key.success_count).unwrap_or(0))
             .bind(optional_i64_from_u32(key.error_count).unwrap_or(0))
-            .bind(optional_i64_from_u32(key.total_response_time_ms).unwrap_or(0))
+            .bind(
+                optional_i64_from_u64(
+                    key.total_response_time_ms,
+                    "provider_api_keys.total_response_time_ms",
+                )?
+                .unwrap_or(0),
+            )
             .bind(optional_i64_from_u64(
                 key.last_used_at_unix_secs,
                 "provider_api_keys.last_used_at",
@@ -1484,7 +1490,7 @@ fn map_key_row(row: &MySqlRow) -> Result<StoredProviderCatalogKey, DataLayerErro
                     row.try_get("error_count").map_sql_err()?,
                     "provider_api_keys.error_count",
                 )?,
-                optional_u32(
+                optional_u64(
                     row.try_get("total_response_time_ms").map_sql_err()?,
                     "provider_api_keys.total_response_time_ms",
                 )?,

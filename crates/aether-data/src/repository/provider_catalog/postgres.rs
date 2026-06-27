@@ -1315,7 +1315,10 @@ INSERT INTO provider_api_keys (
         .bind(key.total_cost_usd)
         .bind(key.success_count.map(i64::from))
         .bind(key.error_count.map(i64::from))
-        .bind(key.total_response_time_ms.map(i64::from))
+        .bind(optional_i64_from_u64(
+            key.total_response_time_ms,
+            "provider_api_keys.total_response_time_ms",
+        )?)
         .bind(key.last_used_at_unix_secs.map(|value| value as f64))
         .bind(key.last_models_fetch_at_unix_secs.map(|value| value as f64))
         .bind(&key.last_models_fetch_error)
@@ -2305,6 +2308,19 @@ fn map_key_maintenance_summary_row(
     })
 }
 
+fn optional_i64_from_u64(
+    value: Option<u64>,
+    field_name: &str,
+) -> Result<Option<i64>, DataLayerError> {
+    value
+        .map(|value| {
+            i64::try_from(value).map_err(|_| {
+                DataLayerError::InvalidInput(format!("{field_name} exceeds i64: {value}"))
+            })
+        })
+        .transpose()
+}
+
 fn map_key_row(row: &PgRow) -> Result<StoredProviderCatalogKey, DataLayerError> {
     let rpm_limit = row_get::<Option<i32>>(row, "rpm_limit")?
         .map(|value| {
@@ -2384,7 +2400,7 @@ fn map_key_row(row: &PgRow) -> Result<StoredProviderCatalogKey, DataLayerError> 
         .transpose()?;
     let total_response_time_ms = row_get::<Option<i64>>(row, "total_response_time_ms")?
         .map(|value| {
-            u32::try_from(value).map_err(|_| {
+            u64::try_from(value).map_err(|_| {
                 DataLayerError::UnexpectedValue(format!(
                     "invalid provider_api_keys.total_response_time_ms: {value}"
                 ))
