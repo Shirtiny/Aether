@@ -13,8 +13,8 @@ use super::{
 };
 use crate::repository::usage::{
     apply_provider_api_key_total_response_time_ms_delta,
-    clamp_provider_api_key_total_response_time_ms, ProviderApiKeyUsageContribution,
-    ProviderApiKeyUsageDelta,
+    apply_provider_api_key_usage_counter_delta, clamp_provider_api_key_total_response_time_ms,
+    ProviderApiKeyUsageContribution, ProviderApiKeyUsageDelta,
 };
 use crate::DataLayerError;
 
@@ -65,15 +65,15 @@ impl InMemoryProviderCatalogReadRepository {
             return;
         };
 
-        key.request_count = Some(apply_i64_delta_to_u32(
+        key.request_count = Some(apply_provider_api_key_usage_counter_delta(
             key.request_count.unwrap_or_default(),
             delta.request_count,
         ));
-        key.success_count = Some(apply_i64_delta_to_u32(
+        key.success_count = Some(apply_provider_api_key_usage_counter_delta(
             key.success_count.unwrap_or_default(),
             delta.success_count,
         ));
-        key.error_count = Some(apply_i64_delta_to_u32(
+        key.error_count = Some(apply_provider_api_key_usage_counter_delta(
             key.error_count.unwrap_or_default(),
             delta.error_count,
         ));
@@ -132,10 +132,6 @@ impl InMemoryProviderCatalogReadRepository {
             key.last_used_at_unix_secs = contribution.last_used_at_unix_secs;
         }
     }
-}
-
-fn apply_i64_delta_to_u32(current: u32, delta: i64) -> u32 {
-    clamp_i64_to_u32(i64::from(current).saturating_add(delta))
 }
 
 fn apply_i64_delta_to_u64(current: u64, delta: i64) -> u64 {

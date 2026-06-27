@@ -11,7 +11,7 @@ use crate::driver::mysql::MysqlPool;
 use crate::error::SqlResultExt;
 use crate::repository::usage::{
     cap_provider_api_key_total_response_time_ms, clamp_provider_api_key_total_response_time_ms,
-    clamp_provider_api_key_usage_counter,
+    clamp_provider_api_key_total_tokens, clamp_provider_api_key_usage_counter,
 };
 use crate::DataLayerError;
 
@@ -1497,11 +1497,10 @@ fn map_key_row(row: &MySqlRow) -> Result<StoredProviderCatalogKey, DataLayerErro
                     .map(clamp_provider_api_key_total_response_time_ms),
             )
             .with_usage_totals(
-                optional_u64(
-                    row.try_get("total_tokens").map_sql_err()?,
-                    "provider_api_keys.total_tokens",
-                )?
-                .unwrap_or(0),
+                row.try_get::<Option<i64>, _>("total_tokens")
+                    .map_sql_err()?
+                    .map(clamp_provider_api_key_total_tokens)
+                    .unwrap_or(0),
                 total_cost_usd,
             )
             .with_health_fields(

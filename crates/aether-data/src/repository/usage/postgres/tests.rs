@@ -309,6 +309,45 @@ fn usage_sql_moves_shared_counter_updates_behind_outbox() {
 }
 
 #[test]
+fn usage_counter_delta_aggregation_preserves_net_response_time_delta() {
+    fn provider_key_delta_row(id: &str, response_time_delta: i64) -> super::UsageCounterDeltaRow {
+        super::UsageCounterDeltaRow {
+            id: id.to_string(),
+            kind: super::USAGE_COUNTER_KIND_PROVIDER_API_KEY.to_string(),
+            target_id: "provider-key-1".to_string(),
+            request_count_delta: 0,
+            total_requests_delta: 0,
+            success_count_delta: 0,
+            error_count_delta: 0,
+            dns_failures_delta: 0,
+            stream_errors_delta: 0,
+            total_tokens_delta: 0,
+            total_cost_usd_delta: 0.0,
+            total_response_time_ms_delta: response_time_delta,
+            last_used_at_unix_secs: None,
+            last_used_ip: None,
+            candidate_last_used_at_unix_secs: None,
+            removed_last_used_at_unix_secs: None,
+            usage_created_at_unix_secs: None,
+        }
+    }
+
+    let cap = crate::repository::usage::PROVIDER_API_KEY_TOTAL_RESPONSE_TIME_MS_MAX;
+    let aggregates = super::UsageCounterDeltaAggregates::from_rows(&[
+        provider_key_delta_row("delta-1", cap),
+        provider_key_delta_row("delta-2", cap),
+        provider_key_delta_row("delta-3", -cap),
+    ])
+    .expect("aggregation should succeed");
+
+    let delta = aggregates
+        .provider_api_keys
+        .get("provider-key-1")
+        .expect("provider key aggregate");
+    assert_eq!(delta.total_response_time_ms, cap);
+}
+
+#[test]
 fn usage_sql_exposes_counter_outbox_health() {
     assert!(super::READ_USAGE_COUNTER_HEALTH_SQL.contains("pending_rows"));
     assert!(super::READ_USAGE_COUNTER_HEALTH_SQL.contains("oldest_pending_created_at_unix_secs"));

@@ -7,12 +7,12 @@ use sqlx::{mysql::MySqlRow, MySql, QueryBuilder, Row};
 
 use super::{
     apply_provider_api_key_total_response_time_ms_i64_delta,
-    apply_provider_api_key_usage_counter_i64_delta, provider_api_key_usage_is_error,
-    provider_api_key_usage_is_success, strip_deprecated_usage_display_fields,
-    usage_can_recover_terminal_failure, usage_request_metadata_client_family,
-    InMemoryUsageReadRepository, PendingUsageCleanupSummary, StoredRequestUsageAudit,
-    StoredUsageDailySummary, StoredUsageDashboardDailyBreakdownRow, StoredUsageDashboardSummary,
-    StoredUsageUserTotals, UpsertUsageRecord, UsageDailyHeatmapQuery,
+    apply_provider_api_key_usage_counter_i64_delta, clamp_provider_api_key_total_tokens_i64,
+    provider_api_key_usage_is_error, provider_api_key_usage_is_success,
+    strip_deprecated_usage_display_fields, usage_can_recover_terminal_failure,
+    usage_request_metadata_client_family, InMemoryUsageReadRepository, PendingUsageCleanupSummary,
+    StoredRequestUsageAudit, StoredUsageDailySummary, StoredUsageDashboardDailyBreakdownRow,
+    StoredUsageDashboardSummary, StoredUsageUserTotals, UpsertUsageRecord, UsageDailyHeatmapQuery,
     UsageDashboardDailyBreakdownQuery, UsageDashboardSummaryQuery, UsageReadRepository,
     UsageWriteRepository,
 };
@@ -880,16 +880,24 @@ WHERE provider_api_key_id IS NOT NULL AND provider_api_key_id <> ''
                     apply_provider_api_key_usage_counter_i64_delta(entry.error_count, 1);
             }
             if !is_in_flight {
-                entry.total_tokens += row.try_get::<i64, _>("total_tokens").map_sql_err()?;
+                entry.total_tokens =
+                    entry
+                        .total_tokens
+                        .saturating_add(clamp_provider_api_key_total_tokens_i64(
+                            row.try_get::<i64, _>("total_tokens").map_sql_err()?,
+                        ));
                 entry.total_cost_usd += row.try_get::<f64, _>("total_cost_usd").map_sql_err()?;
             }
             if is_success {
+                let response_time_ms = row
+                    .try_get::<Option<i64>, _>("response_time_ms")
+                    .map_sql_err()?
+                    .unwrap_or_default()
+                    .max(0);
                 entry.total_response_time_ms =
                     apply_provider_api_key_total_response_time_ms_i64_delta(
                         entry.total_response_time_ms,
-                        row.try_get::<Option<i64>, _>("response_time_ms")
-                            .map_sql_err()?
-                            .unwrap_or_default(),
+                        response_time_ms,
                     );
             }
             entry.last_used_at = entry.last_used_at.max(

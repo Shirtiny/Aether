@@ -10,7 +10,7 @@ use super::{
 };
 use crate::repository::usage::{
     cap_provider_api_key_total_response_time_ms, clamp_provider_api_key_total_response_time_ms,
-    clamp_provider_api_key_usage_counter,
+    clamp_provider_api_key_total_tokens, clamp_provider_api_key_usage_counter,
 };
 use crate::{
     error::{postgres_error, SqlxResultExt},
@@ -2367,11 +2367,8 @@ fn map_key_row(row: &PgRow) -> Result<StoredProviderCatalogKey, DataLayerError> 
     let request_count =
         row_get::<Option<i64>>(row, "request_count")?.map(clamp_provider_api_key_usage_counter);
     let total_tokens = row_get::<Option<i64>>(row, "total_tokens")?
-        .unwrap_or(0)
-        .try_into()
-        .map_err(|_| {
-            DataLayerError::UnexpectedValue("invalid provider_api_keys.total_tokens".to_string())
-        })?;
+        .map(clamp_provider_api_key_total_tokens)
+        .unwrap_or(0);
     let total_cost_usd = row_get::<Option<f64>>(row, "total_cost_usd")?.unwrap_or(0.0);
     if !total_cost_usd.is_finite() {
         return Err(DataLayerError::UnexpectedValue(

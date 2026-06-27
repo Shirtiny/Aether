@@ -412,6 +412,21 @@ pub(crate) fn apply_provider_api_key_usage_counter_i64_delta(current: i64, delta
         .clamp(0, PROVIDER_API_KEY_USAGE_COUNTER_MAX)
 }
 
+pub(crate) fn apply_provider_api_key_usage_counter_delta(current: u32, delta: i64) -> u32 {
+    if current == u32::MAX && delta < 0 {
+        return u32::MAX;
+    }
+    clamp_provider_api_key_usage_counter(i64::from(current).saturating_add(delta))
+}
+
+pub(crate) fn clamp_provider_api_key_total_tokens(value: i64) -> u64 {
+    value.max(0) as u64
+}
+
+pub(crate) fn clamp_provider_api_key_total_tokens_i64(value: i64) -> i64 {
+    value.max(0)
+}
+
 pub(crate) fn cap_provider_api_key_total_response_time_ms(value: u64) -> u64 {
     value.min(PROVIDER_API_KEY_TOTAL_RESPONSE_TIME_MS_MAX_U64)
 }
@@ -421,6 +436,9 @@ pub(crate) fn clamp_provider_api_key_total_response_time_ms(value: i64) -> u64 {
 }
 
 pub(crate) fn apply_provider_api_key_total_response_time_ms_delta(current: u64, delta: i64) -> u64 {
+    if current >= PROVIDER_API_KEY_TOTAL_RESPONSE_TIME_MS_MAX_U64 && delta < 0 {
+        return PROVIDER_API_KEY_TOTAL_RESPONSE_TIME_MS_MAX_U64;
+    }
     let next = if delta >= 0 {
         current.saturating_add(delta as u64)
     } else {
@@ -786,6 +804,7 @@ fn newer_last_used_at(before: Option<u64>, after: Option<u64>) -> Option<u64> {
 mod tests {
     use super::{
         api_key_usage_contribution, apply_provider_api_key_total_response_time_ms_delta,
+        apply_provider_api_key_usage_counter_delta, clamp_provider_api_key_total_tokens,
         incoming_usage_can_recover_terminal_failure, model_usage_contribution,
         provider_api_key_usage_contribution, provider_api_key_usage_is_error,
         provider_api_key_usage_is_success, strip_deprecated_usage_display_fields,
@@ -795,7 +814,7 @@ mod tests {
     };
 
     #[test]
-    fn provider_key_total_response_time_delta_is_bounded() {
+    fn provider_key_usage_stat_bounds_are_conservative() {
         assert_eq!(
             apply_provider_api_key_total_response_time_ms_delta(
                 (PROVIDER_API_KEY_TOTAL_RESPONSE_TIME_MS_MAX - 10) as u64,
@@ -807,6 +826,18 @@ mod tests {
             apply_provider_api_key_total_response_time_ms_delta(10, -50),
             0
         );
+        assert_eq!(
+            apply_provider_api_key_total_response_time_ms_delta(
+                PROVIDER_API_KEY_TOTAL_RESPONSE_TIME_MS_MAX as u64,
+                -50,
+            ),
+            PROVIDER_API_KEY_TOTAL_RESPONSE_TIME_MS_MAX as u64
+        );
+        assert_eq!(
+            apply_provider_api_key_usage_counter_delta(u32::MAX, -50),
+            u32::MAX
+        );
+        assert_eq!(clamp_provider_api_key_total_tokens(-50), 0);
     }
 
     #[test]
