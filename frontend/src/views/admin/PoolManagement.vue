@@ -599,23 +599,19 @@
                       <Button
                         v-if="keyUiStateMap[key.key_id]?.showCodexResetCreditControl"
                         variant="ghost"
-                        size="icon"
-                        class="h-4 w-4 shrink-0 text-muted-foreground hover:text-foreground"
+                        size="sm"
+                        class="h-5 shrink-0 gap-1 px-1.5 text-[10px] font-normal tabular-nums text-muted-foreground hover:text-foreground"
                         :disabled="resettingCodexCreditKeyId === key.key_id || !keyUiStateMap[key.key_id]?.canConsumeCodexResetCredit"
                         :title="keyUiStateMap[key.key_id]?.codexResetCreditTitle || ''"
+                        data-testid="pool-codex-reset-credit"
                         @click.stop="handleConsumeCodexResetCredit(key)"
                       >
                         <RotateCcw
                           class="w-2.5 h-2.5"
                           :class="{ 'animate-spin': resettingCodexCreditKeyId === key.key_id }"
                         />
+                        <span>{{ keyUiStateMap[key.key_id]?.codexResetCreditButtonText }}</span>
                       </Button>
-                      <span
-                        v-if="keyUiStateMap[key.key_id]?.showCodexResetCreditControl"
-                        class="text-[10px] leading-none text-muted-foreground tabular-nums"
-                      >
-                        {{ keyUiStateMap[key.key_id]?.codexResetCreditCountText }}
-                      </span>
                       <Badge
                         v-if="keyUiStateMap[key.key_id]?.planLabel"
                         variant="outline"
@@ -1218,12 +1214,23 @@
                 </div>
                 <div
                   v-if="keyUiStateMap[key.key_id]?.showCodexResetCreditControl"
-                  class="mt-2 flex items-center justify-between gap-2 border-t border-border/40 pt-2 text-[10px] leading-none"
+                  class="mt-2 flex items-center justify-end gap-2 border-t border-border/40 pt-2 text-[10px] leading-none"
                 >
-                  <span class="text-muted-foreground">主动重置</span>
-                  <span class="font-medium tabular-nums text-foreground/80">
-                    {{ keyUiStateMap[key.key_id]?.codexResetCreditCountText }}
-                  </span>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    class="h-7 shrink-0 gap-1 px-2 text-[10px] font-medium tabular-nums text-muted-foreground hover:text-foreground"
+                    :disabled="resettingCodexCreditKeyId === key.key_id || !keyUiStateMap[key.key_id]?.canConsumeCodexResetCredit"
+                    :title="keyUiStateMap[key.key_id]?.codexResetCreditTitle || ''"
+                    data-testid="pool-codex-reset-credit"
+                    @click.stop="handleConsumeCodexResetCredit(key)"
+                  >
+                    <RotateCcw
+                      class="w-3 h-3"
+                      :class="{ 'animate-spin': resettingCodexCreditKeyId === key.key_id }"
+                    />
+                    <span>{{ keyUiStateMap[key.key_id]?.codexResetCreditButtonText }}</span>
+                  </Button>
                 </div>
               </div>
 
@@ -1270,16 +1277,18 @@
                   <Button
                     v-else-if="actionId === 'reset_codex_credit'"
                     variant="ghost"
-                    size="icon"
-                    class="h-7 w-7 shrink-0 text-muted-foreground hover:text-foreground"
+                    size="sm"
+                    class="h-7 shrink-0 gap-1 px-2 text-[10px] font-medium tabular-nums text-muted-foreground hover:text-foreground"
                     :disabled="resettingCodexCreditKeyId === key.key_id || !keyUiStateMap[key.key_id]?.canConsumeCodexResetCredit"
                     :title="keyUiStateMap[key.key_id]?.codexResetCreditTitle || ''"
+                    data-testid="pool-codex-reset-credit"
                     @click.stop="handleConsumeCodexResetCredit(key)"
                   >
                     <RotateCcw
-                      class="w-3.5 h-3.5"
+                      class="w-3 h-3"
                       :class="{ 'animate-spin': resettingCodexCreditKeyId === key.key_id }"
                     />
+                    <span>{{ keyUiStateMap[key.key_id]?.codexResetCreditButtonText }}</span>
                   </Button>
                   <Button
                     v-else-if="actionId === 'clear_cooldown'"
@@ -2423,7 +2432,7 @@ type PoolKeyUiState = {
   canRefreshToken: boolean
   showCodexResetCreditControl: boolean
   codexResetCreditTitle: string
-  codexResetCreditCountText: string
+  codexResetCreditButtonText: string
   canConsumeCodexResetCredit: boolean
   planLabel: string
   planClass: string
@@ -2474,8 +2483,8 @@ const keyUiStateMap = computed<Record<string, PoolKeyUiState>>(() => {
       canRefreshToken,
       showCodexResetCreditControl,
       codexResetCreditTitle: showCodexResetCreditControl ? getCodexResetCreditTitle(key) : '',
-      codexResetCreditCountText: showCodexResetCreditControl
-        ? getCodexResetCreditCountText(key)
+      codexResetCreditButtonText: showCodexResetCreditControl
+        ? getCodexResetCreditButtonText(key)
         : '',
       canConsumeCodexResetCredit,
       planLabel: planType ? formatOAuthPlanType(planType) : '',
@@ -2492,7 +2501,7 @@ const keyUiStateMap = computed<Record<string, PoolKeyUiState>>(() => {
       mobileActionIds: splitPoolMobileActions({
         canDownloadOrCopy: true,
         showRefreshToken: showOAuthRefreshControl,
-        canResetCodexCredit: showCodexResetCreditControl,
+        canResetCodexCredit: false,
         canResetCycleStats: canResetCycleStats(key),
         canClearCooldown: Boolean(key.cooldown_reason),
         hasProxy: true,
@@ -3962,12 +3971,14 @@ function getCodexQuotaSnapshot(key: PoolKeyDetail): QuotaStatusSnapshot | null {
 
 function getCodexResetCreditsAvailableCount(key: PoolKeyDetail): number | null {
   const quota = getCodexQuotaSnapshot(key)
-  if (!quota) return null
-  const credits = quota.credits as Record<string, unknown> | undefined
+  const credits = quota?.credits as Record<string, unknown> | undefined
+  const codexMetadata = key.upstream_metadata?.codex as Record<string, unknown> | undefined
   const candidates = [
     credits?.available_count,
-    (quota as unknown as Record<string, unknown>).reset_credits_available_count,
-    (quota as unknown as Record<string, unknown>).reset_credits_remaining,
+    (quota as unknown as Record<string, unknown> | null)?.reset_credits_available_count,
+    (quota as unknown as Record<string, unknown> | null)?.reset_credits_remaining,
+    codexMetadata?.reset_credits_available_count,
+    codexMetadata?.reset_credits_remaining,
   ]
   for (const candidate of candidates) {
     const value = Number(candidate)
@@ -3986,10 +3997,10 @@ function canConsumeCodexResetCredit(key: PoolKeyDetail): boolean {
   return shouldShowCodexResetCreditControl(key) && availableCount != null && availableCount > 0
 }
 
-function getCodexResetCreditCountText(key: PoolKeyDetail): string {
+function getCodexResetCreditButtonText(key: PoolKeyDetail): string {
   const availableCount = getCodexResetCreditsAvailableCount(key)
-  if (availableCount == null) return '主动重置次数：未返回'
-  return `主动重置次数：${availableCount}`
+  if (availableCount == null) return '主动重置(未返回)'
+  return `主动重置(${availableCount}次)`
 }
 
 function getCodexResetCreditTitle(key: PoolKeyDetail): string {

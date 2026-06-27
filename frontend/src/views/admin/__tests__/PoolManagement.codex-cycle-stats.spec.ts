@@ -832,6 +832,30 @@ describe('PoolManagement Codex cycle stats mode', () => {
     expect(endpointMocks.listPoolKeys).toHaveBeenCalledTimes(2)
   })
 
+  it('keeps Codex manual reset count visible from persisted upstream metadata', async () => {
+    const codexKey = createPoolKey('codex', {
+      oauth_managed: true,
+      credential_kind: 'oauth_session',
+      upstream_metadata: {
+        codex: {
+          reset_credits_available_count: 2,
+        },
+      },
+    })
+    endpointMocks.getPoolOverview.mockResolvedValue({ items: [createOverview('codex')] })
+    endpointMocks.listPoolKeys.mockResolvedValue(createKeyPage(codexKey))
+    endpointMocks.getProvider.mockResolvedValue(createProvider('codex'))
+
+    const root = mountPoolManagement()
+    await settle()
+
+    const resetButtons = root.querySelectorAll<HTMLButtonElement>('[data-testid="pool-codex-reset-credit"]')
+    expect(resetButtons.length).toBeGreaterThan(0)
+    expect(root.textContent).toContain('主动重置(2次)')
+    expect(root.textContent).not.toContain('主动重置次数')
+    expect([...resetButtons].some(button => !button.disabled)).toBe(true)
+  })
+
   it('hides the stats mode switch for non-Codex providers and keeps account totals', async () => {
     const openaiKey = createPoolKey('openai', {
       request_count: 12,

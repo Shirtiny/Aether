@@ -334,6 +334,7 @@ export interface CodexUpstreamMetadata {
   secondary_reset_after_seconds?: number  // 5H限额重置剩余秒数（兼容字段）
   secondary_reset_at?: number  // 5H限额重置时间（Unix 时间戳）
   secondary_window_minutes?: number  // 5H限额窗口大小（分钟）
+  reset_credits_available_count?: number  // Codex 主动重置可用次数
   spark_primary_used_percent?: number  // Spark 5H限额窗口使用百分比
   spark_primary_reset_seconds?: number  // Spark 5H限额重置剩余秒数
   spark_primary_reset_after_seconds?: number  // Spark 5H限额重置剩余秒数（兼容字段）
