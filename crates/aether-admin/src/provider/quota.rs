@@ -675,6 +675,53 @@ pub fn parse_codex_wham_usage_response(
     Some(serde_json::Value::Object(result))
 }
 
+fn codex_reset_credit_is_available(value: &serde_json::Value) -> bool {
+    let Some(record) = value.as_object() else {
+        return false;
+    };
+    let reset_type =
+        coerce_json_string(record.get("reset_type").or_else(|| record.get("resetType")));
+    if reset_type.as_deref() != Some("codex_rate_limits") {
+        return false;
+    }
+    let status = coerce_json_string(record.get("status"));
+    status.as_deref() == Some("available")
+}
+
+pub fn parse_codex_rate_limit_reset_credits_response(
+    value: &serde_json::Value,
+    updated_at_unix_secs: u64,
+) -> Option<serde_json::Value> {
+    let root = value.as_object()?;
+    if root.is_empty() {
+        return None;
+    }
+
+    let available_count = root
+        .get("available_count")
+        .or_else(|| root.get("availableCount"))
+        .and_then(coerce_json_u64)
+        .or_else(|| {
+            root.get("credits")
+                .and_then(serde_json::Value::as_array)
+                .map(|credits| {
+                    credits
+                        .iter()
+                        .filter(|credit| codex_reset_credit_is_available(credit))
+                        .count() as u64
+                })
+        });
+
+    let available_count = available_count?;
+    let mut result = serde_json::Map::new();
+    result.insert(
+        "reset_credits_available_count".to_string(),
+        json!(available_count),
+    );
+    result.insert("updated_at".to_string(), json!(updated_at_unix_secs));
+    Some(serde_json::Value::Object(result))
+}
+
 fn codex_json_object<'a>(
     root: &'a serde_json::Map<String, serde_json::Value>,
     keys: &[&str],
@@ -1730,7 +1777,8 @@ mod tests {
     use super::{
         codex_build_invalid_state, codex_runtime_invalid_reason,
         parse_chatgpt_web_conversation_init_response, parse_codex_backend_me_response,
-        parse_codex_wham_usage_response, parse_gemini_cli_retrieve_user_quota_response,
+        parse_codex_rate_limit_reset_credits_response, parse_codex_wham_usage_response,
+        parse_gemini_cli_retrieve_user_quota_response,
         parse_gemini_cli_v1internal_credits_response, parse_windsurf_model_configs_response,
         parse_windsurf_rate_limit_response, parse_windsurf_user_status_response,
         quota_refresh_success_invalid_state, should_auto_remove_structured_reason,
@@ -2101,6 +2149,42 @@ mod tests {
             parsed.get("reset_credits_available_count"),
             Some(&json!(3u64))
         );
+    }
+
+    #[test]
+    fn parses_codex_reset_credits_available_count_from_credit_details() {
+        let parsed = parse_codex_rate_limit_reset_credits_response(
+            &json!({
+                "credits": [
+                    {
+                        "id": "reset-1",
+                        "reset_type": "codex_rate_limits",
+                        "status": "available",
+                        "expires_at": "2026-06-28T00:00:00Z"
+                    },
+                    {
+                        "id": "reset-2",
+                        "reset_type": "codex_rate_limits",
+                        "status": "consumed",
+                        "expires_at": "2026-06-28T00:00:00Z"
+                    },
+                    {
+                        "id": "reset-3",
+                        "reset_type": "other",
+                        "status": "available",
+                        "expires_at": "2026-06-28T00:00:00Z"
+                    }
+                ]
+            }),
+            1_777_000_000,
+        )
+        .expect("codex reset credits should parse");
+
+        assert_eq!(
+            parsed.get("reset_credits_available_count"),
+            Some(&json!(1u64))
+        );
+        assert_eq!(parsed.get("updated_at"), Some(&json!(1_777_000_000u64)));
     }
 
     #[test]

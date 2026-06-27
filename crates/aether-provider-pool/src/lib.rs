@@ -17,8 +17,8 @@ pub use provider::{ProviderPoolAdapter, ProviderPoolMemberInput};
 pub use providers::{
     build_antigravity_pool_quota_request, build_chatgpt_web_pool_quota_request,
     build_codex_pool_quota_request, build_codex_pool_reset_credit_request,
-    build_gemini_cli_pool_quota_request, build_kiro_pool_quota_request,
-    build_windsurf_pool_model_configs_request,
+    build_codex_pool_reset_credits_request, build_gemini_cli_pool_quota_request,
+    build_kiro_pool_quota_request, build_windsurf_pool_model_configs_request,
     build_windsurf_pool_model_configs_request_with_base_url, build_windsurf_pool_quota_request,
     build_windsurf_pool_quota_request_with_base_url, build_windsurf_pool_rate_limit_request,
     build_windsurf_pool_rate_limit_request_with_base_url, enrich_chatgpt_web_quota_metadata,
@@ -28,10 +28,10 @@ pub use providers::{
     DefaultProviderPoolAdapter, GeminiCliProviderPoolAdapter, GrokProviderPoolAdapter,
     KiroPoolQuotaAuthInput, KiroProviderPoolAdapter, UnsupportedQuotaProviderPoolAdapter,
     ANTIGRAVITY_FETCH_AVAILABLE_MODELS_PATH, CHATGPT_WEB_CONVERSATION_INIT_PATH,
-    CHATGPT_WEB_DEFAULT_BASE_URL, CODEX_RESET_CREDIT_URL, CODEX_WHAM_USAGE_URL,
-    GEMINI_CLI_RETRIEVE_USER_QUOTA_PATH, GEMINI_CLI_USER_AGENT, KIRO_USAGE_LIMITS_PATH,
-    KIRO_USAGE_SDK_VERSION, WINDSURF_MODEL_CONFIGS_PATH, WINDSURF_RATE_LIMIT_PATH,
-    WINDSURF_USER_STATUS_PATH,
+    CHATGPT_WEB_DEFAULT_BASE_URL, CODEX_RESET_CREDITS_URL, CODEX_RESET_CREDIT_URL,
+    CODEX_WHAM_USAGE_URL, GEMINI_CLI_RETRIEVE_USER_QUOTA_PATH, GEMINI_CLI_USER_AGENT,
+    KIRO_USAGE_LIMITS_PATH, KIRO_USAGE_SDK_VERSION, WINDSURF_MODEL_CONFIGS_PATH,
+    WINDSURF_RATE_LIMIT_PATH, WINDSURF_USER_STATUS_PATH,
 };
 pub use quota::{
     provider_pool_key_account_quota_exhausted,
@@ -193,6 +193,78 @@ mod tests {
             Some("application/json")
         );
         assert_eq!(spec.model_name.as_deref(), Some("codex-wham-usage"));
+    }
+
+    #[test]
+    fn codex_reset_credits_request_uses_status_endpoint_and_headers() {
+        let spec = build_codex_pool_reset_credits_request(
+            "key-1",
+            ("authorization".to_string(), "Bearer access".to_string()),
+            Some(&json!({
+                "account_id": "acct-1"
+            })),
+        );
+
+        assert_eq!(spec.method, "GET");
+        assert_eq!(
+            spec.url,
+            "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
+        );
+        assert_eq!(
+            spec.headers.get("authorization").map(String::as_str),
+            Some("Bearer access")
+        );
+        assert_eq!(
+            spec.headers.get("chatgpt-account-id").map(String::as_str),
+            Some("acct-1")
+        );
+        assert_eq!(
+            spec.headers.get("openai-beta").map(String::as_str),
+            Some("codex-1")
+        );
+        assert_eq!(
+            spec.headers.get("originator").map(String::as_str),
+            Some("Codex Desktop")
+        );
+        assert_eq!(spec.model_name.as_deref(), Some("codex-reset-credits"));
+    }
+
+    #[test]
+    fn codex_reset_credit_request_uses_consume_endpoint_and_body() {
+        let spec = build_codex_pool_reset_credit_request(
+            "key-1",
+            "redeem-1".to_string(),
+            ("authorization".to_string(), "Bearer access".to_string()),
+            Some(&json!({
+                "chatgpt_account_id": "acct-1"
+            })),
+        );
+
+        assert_eq!(spec.method, "POST");
+        assert_eq!(
+            spec.url,
+            "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume"
+        );
+        assert_eq!(
+            spec.headers.get("authorization").map(String::as_str),
+            Some("Bearer access")
+        );
+        assert_eq!(
+            spec.headers.get("chatgpt-account-id").map(String::as_str),
+            Some("acct-1")
+        );
+        assert_eq!(
+            spec.headers.get("accept").map(String::as_str),
+            Some("application/json")
+        );
+        assert_eq!(spec.content_type.as_deref(), Some("application/json"));
+        assert_eq!(
+            spec.json_body
+                .as_ref()
+                .and_then(|body| body.get("redeem_request_id")),
+            Some(&json!("redeem-1"))
+        );
+        assert_eq!(spec.model_name.as_deref(), Some("codex-reset-credit"));
     }
 
     #[test]

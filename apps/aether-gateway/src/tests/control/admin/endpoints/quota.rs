@@ -271,6 +271,404 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_codex_with_trusted_a
 }
 
 #[tokio::test]
+async fn gateway_refreshes_codex_oauth_reset_credits_into_quota_snapshot() {
+    let execution_plans = Arc::new(Mutex::new(Vec::<aether_contracts::ExecutionPlan>::new()));
+    let execution_plans_clone = Arc::clone(&execution_plans);
+    let execution_runtime = Router::new().route(
+        "/v1/execute/sync",
+        any(move |request: Request| {
+            let execution_plans_inner = Arc::clone(&execution_plans_clone);
+            async move {
+                let plan: aether_contracts::ExecutionPlan = serde_json::from_slice(
+                    &to_bytes(request.into_body(), usize::MAX)
+                        .await
+                        .expect("body should read"),
+                )
+                .expect("plan should parse");
+                execution_plans_inner
+                    .lock()
+                    .expect("mutex should lock")
+                    .push(plan.clone());
+
+                let json_body = if plan.request_id.starts_with("codex-reset-credits:") {
+                    json!({
+                        "credits": [
+                            {
+                                "id": "reset-1",
+                                "reset_type": "codex_rate_limits",
+                                "status": "available",
+                                "expires_at": "2026-06-28T00:00:00Z"
+                            },
+                            {
+                                "id": "reset-2",
+                                "resetType": "codex_rate_limits",
+                                "status": "available",
+                                "expiresAt": "2026-06-29T00:00:00Z"
+                            },
+                            {
+                                "id": "reset-3",
+                                "reset_type": "codex_rate_limits",
+                                "status": "consumed",
+                                "expires_at": "2026-06-30T00:00:00Z"
+                            }
+                        ]
+                    })
+                } else {
+                    assert!(
+                        plan.request_id.starts_with("codex-quota:"),
+                        "unexpected execution plan: {}",
+                        plan.request_id
+                    );
+                    json!({
+                        "plan_type": "plus",
+                        "rate_limit": {
+                            "primary_window": {
+                                "used_percent": 12.5,
+                                "window_minutes": 300
+                            },
+                            "secondary_window": {
+                                "used_percent": 55.0,
+                                "window_minutes": 10080
+                            }
+                        },
+                        "credits": {
+                            "has_credits": true,
+                            "balance": 42.0,
+                            "unlimited": false
+                        }
+                    })
+                };
+
+                let result = aether_contracts::ExecutionResult {
+                    request_id: plan.request_id,
+                    candidate_id: None,
+                    status_code: 200,
+                    headers: BTreeMap::new(),
+                    body: Some(aether_contracts::ResponseBody {
+                        json_body: Some(json_body),
+                        body_bytes_b64: None,
+                    }),
+                    telemetry: None,
+                    error: None,
+                };
+                (StatusCode::OK, Json(result))
+            }
+        }),
+    );
+
+    let mut key = sample_key(
+        "key-codex-oauth",
+        "provider-codex",
+        "openai:responses",
+        "codex-access-token",
+    );
+    key.auth_type = "oauth".to_string();
+    key.encrypted_auth_config = Some(
+        encrypt_python_fernet_plaintext(
+            DEVELOPMENT_ENCRYPTION_KEY,
+            r#"{"account_id":"acct-codex-1"}"#,
+        )
+        .expect("auth config ciphertext should build"),
+    );
+
+    let mut provider = StoredProviderCatalogProvider::new(
+        "provider-codex".to_string(),
+        "codex".to_string(),
+        Some("https://example.com".to_string()),
+        "codex".to_string(),
+    )
+    .expect("provider should build");
+    provider.config = Some(json!({
+        "pool_advanced": {
+            "codex_client_headers": {
+                "profiles": [
+                    {
+                        "user_agent": "codex-reset-test/1.0",
+                        "originator": "codex-reset-test"
+                    }
+                ]
+            }
+        }
+    }));
+
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        vec![sample_endpoint(
+            "endpoint-codex-cli",
+            "provider-codex",
+            "openai:responses",
+            "https://chatgpt.com/backend-api",
+        )],
+        vec![key],
+    ));
+
+    let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
+    let gateway = build_router_with_state(
+        build_state_with_execution_runtime_override(execution_runtime_url.clone())
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(
+                    provider_catalog_repository.clone(),
+                )
+                .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+            ),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{gateway_url}/api/admin/endpoints/providers/provider-codex/refresh-quota"
+        ))
+        .header(GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(payload["success"], 1);
+    assert_eq!(
+        payload["results"][0]["quota_snapshot"]["credits"]["available_count"],
+        json!(2u64)
+    );
+
+    let plans = execution_plans.lock().expect("mutex should lock");
+    assert_eq!(plans.len(), 2);
+    let quota_plan = plans
+        .iter()
+        .find(|plan| plan.request_id.starts_with("codex-quota:"))
+        .expect("quota plan should execute");
+    assert_eq!(quota_plan.url, "https://chatgpt.com/backend-api/wham/usage");
+    assert_eq!(
+        quota_plan.headers.get("authorization").map(String::as_str),
+        Some("Bearer codex-access-token")
+    );
+    assert_eq!(
+        quota_plan.headers.get("user-agent").map(String::as_str),
+        Some("codex-reset-test/1.0")
+    );
+    assert_eq!(
+        quota_plan.headers.get("originator").map(String::as_str),
+        Some("codex-reset-test")
+    );
+
+    let reset_credits_plan = plans
+        .iter()
+        .find(|plan| plan.request_id.starts_with("codex-reset-credits:"))
+        .expect("reset credits plan should execute");
+    assert_eq!(
+        reset_credits_plan.url,
+        "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
+    );
+    assert_eq!(
+        reset_credits_plan
+            .headers
+            .get("openai-beta")
+            .map(String::as_str),
+        Some("codex-1")
+    );
+    assert_eq!(
+        reset_credits_plan
+            .headers
+            .get("originator")
+            .map(String::as_str),
+        Some("codex-reset-test")
+    );
+    assert_eq!(
+        reset_credits_plan
+            .headers
+            .get("user-agent")
+            .map(String::as_str),
+        Some("codex-reset-test/1.0")
+    );
+    assert_eq!(
+        reset_credits_plan
+            .headers
+            .get("chatgpt-account-id")
+            .map(String::as_str),
+        Some("acct-codex-1")
+    );
+
+    let reloaded = provider_catalog_repository
+        .list_keys_by_ids(&["key-codex-oauth".to_string()])
+        .await
+        .expect("keys should read");
+    assert_eq!(
+        reloaded[0]
+            .upstream_metadata
+            .as_ref()
+            .and_then(|value| value.get("codex"))
+            .and_then(|value| value.get("reset_credits_available_count")),
+        Some(&json!(2u64))
+    );
+    assert_eq!(
+        reloaded[0]
+            .status_snapshot
+            .as_ref()
+            .and_then(|value| value.get("quota"))
+            .and_then(|value| value.get("credits"))
+            .and_then(|value| value.get("available_count")),
+        Some(&json!(2u64))
+    );
+
+    gateway_handle.abort();
+    execution_runtime_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_consumes_codex_reset_credit_with_pool_stable_client_headers() {
+    let execution_plans = Arc::new(Mutex::new(Vec::<aether_contracts::ExecutionPlan>::new()));
+    let execution_plans_clone = Arc::clone(&execution_plans);
+    let execution_runtime = Router::new().route(
+        "/v1/execute/sync",
+        any(move |request: Request| {
+            let execution_plans_inner = Arc::clone(&execution_plans_clone);
+            async move {
+                let plan: aether_contracts::ExecutionPlan = serde_json::from_slice(
+                    &to_bytes(request.into_body(), usize::MAX)
+                        .await
+                        .expect("body should read"),
+                )
+                .expect("plan should parse");
+                execution_plans_inner
+                    .lock()
+                    .expect("mutex should lock")
+                    .push(plan.clone());
+
+                let result = aether_contracts::ExecutionResult {
+                    request_id: plan.request_id,
+                    candidate_id: None,
+                    status_code: 200,
+                    headers: BTreeMap::new(),
+                    body: Some(aether_contracts::ResponseBody {
+                        json_body: Some(json!({"ok": true})),
+                        body_bytes_b64: None,
+                    }),
+                    telemetry: None,
+                    error: None,
+                };
+                (StatusCode::OK, Json(result))
+            }
+        }),
+    );
+
+    let mut provider = StoredProviderCatalogProvider::new(
+        "provider-codex".to_string(),
+        "codex".to_string(),
+        Some("https://example.com".to_string()),
+        "codex".to_string(),
+    )
+    .expect("provider should build");
+    provider.config = Some(json!({
+        "pool_advanced": {
+            "codex_client_headers": {
+                "profiles": [
+                    {
+                        "user_agent": "codex-reset-test/1.0",
+                        "originator": "codex-reset-test"
+                    }
+                ]
+            }
+        }
+    }));
+
+    let mut key = sample_key(
+        "key-codex-oauth",
+        "provider-codex",
+        "openai:responses",
+        "codex-access-token",
+    );
+    key.auth_type = "oauth".to_string();
+    key.encrypted_auth_config = Some(
+        encrypt_python_fernet_plaintext(
+            DEVELOPMENT_ENCRYPTION_KEY,
+            r#"{"account_id":"acct-codex-1"}"#,
+        )
+        .expect("auth config ciphertext should build"),
+    );
+
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        vec![sample_endpoint(
+            "endpoint-codex-cli",
+            "provider-codex",
+            "openai:responses",
+            "https://chatgpt.com/backend-api",
+        )],
+        vec![key],
+    ));
+
+    let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
+    let gateway = build_router_with_state(
+        build_state_with_execution_runtime_override(execution_runtime_url.clone())
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(
+                    provider_catalog_repository.clone(),
+                )
+                .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+            ),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{gateway_url}/api/admin/provider-oauth/keys/key-codex-oauth/codex-reset-credit"
+        ))
+        .header(GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(payload["status"], "success");
+    assert_eq!(payload["status_code"], 200);
+
+    let plans = execution_plans.lock().expect("mutex should lock");
+    assert_eq!(plans.len(), 1);
+    let plan = plans
+        .iter()
+        .find(|plan| plan.request_id.starts_with("codex-reset-credit:"))
+        .expect("reset credit plan should execute");
+    assert_eq!(
+        plan.url,
+        "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume"
+    );
+    assert_eq!(plan.method, "POST");
+    assert_eq!(
+        plan.headers.get("authorization").map(String::as_str),
+        Some("Bearer codex-access-token")
+    );
+    assert_eq!(
+        plan.headers.get("chatgpt-account-id").map(String::as_str),
+        Some("acct-codex-1")
+    );
+    assert_eq!(
+        plan.headers.get("user-agent").map(String::as_str),
+        Some("codex-reset-test/1.0")
+    );
+    assert_eq!(
+        plan.headers.get("originator").map(String::as_str),
+        Some("codex-reset-test")
+    );
+    assert!(plan
+        .body
+        .json_body
+        .as_ref()
+        .and_then(|value| value.get("redeem_request_id"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| !value.is_empty()));
+
+    gateway_handle.abort();
+    execution_runtime_handle.abort();
+}
+
+#[tokio::test]
 async fn gateway_marks_codex_quota_exhausted_when_wham_usage_returns_payment_required() {
     let upstream = Router::new().route(
         "/api/admin/endpoints/providers/provider-codex/refresh-quota",

@@ -601,7 +601,7 @@
                         variant="ghost"
                         size="icon"
                         class="h-4 w-4 shrink-0 text-muted-foreground hover:text-foreground"
-                        :disabled="resettingCodexCreditKeyId === key.key_id"
+                        :disabled="resettingCodexCreditKeyId === key.key_id || !keyUiStateMap[key.key_id]?.canConsumeCodexResetCredit"
                         :title="keyUiStateMap[key.key_id]?.codexResetCreditTitle || ''"
                         @click.stop="handleConsumeCodexResetCredit(key)"
                       >
@@ -610,6 +610,12 @@
                           :class="{ 'animate-spin': resettingCodexCreditKeyId === key.key_id }"
                         />
                       </Button>
+                      <span
+                        v-if="keyUiStateMap[key.key_id]?.showCodexResetCreditControl"
+                        class="text-[10px] leading-none text-muted-foreground tabular-nums"
+                      >
+                        {{ keyUiStateMap[key.key_id]?.codexResetCreditCountText }}
+                      </span>
                       <Badge
                         v-if="keyUiStateMap[key.key_id]?.planLabel"
                         variant="outline"
@@ -1210,6 +1216,15 @@
                 >
                   -
                 </div>
+                <div
+                  v-if="keyUiStateMap[key.key_id]?.showCodexResetCreditControl"
+                  class="mt-2 flex items-center justify-between gap-2 border-t border-border/40 pt-2 text-[10px] leading-none"
+                >
+                  <span class="text-muted-foreground">主动重置</span>
+                  <span class="font-medium tabular-nums text-foreground/80">
+                    {{ keyUiStateMap[key.key_id]?.codexResetCreditCountText }}
+                  </span>
+                </div>
               </div>
 
               <div class="flex items-center gap-0.5">
@@ -1257,7 +1272,7 @@
                     variant="ghost"
                     size="icon"
                     class="h-7 w-7 shrink-0 text-muted-foreground hover:text-foreground"
-                    :disabled="resettingCodexCreditKeyId === key.key_id"
+                    :disabled="resettingCodexCreditKeyId === key.key_id || !keyUiStateMap[key.key_id]?.canConsumeCodexResetCredit"
                     :title="keyUiStateMap[key.key_id]?.codexResetCreditTitle || ''"
                     @click.stop="handleConsumeCodexResetCredit(key)"
                   >
@@ -2408,6 +2423,8 @@ type PoolKeyUiState = {
   canRefreshToken: boolean
   showCodexResetCreditControl: boolean
   codexResetCreditTitle: string
+  codexResetCreditCountText: string
+  canConsumeCodexResetCredit: boolean
   planLabel: string
   planClass: string
   accountQuotaText: string | null
@@ -2440,6 +2457,9 @@ const keyUiStateMap = computed<Record<string, PoolKeyUiState>>(() => {
     const canRefreshToken = canRefreshOAuthCredential(key)
     const showOAuthRefreshControl = shouldShowOAuthRefreshControl(key, selectedProviderType.value)
     const showCodexResetCreditControl = shouldShowCodexResetCreditControl(key)
+    const codexResetCreditCount = getCodexResetCreditsAvailableCount(key)
+    const canConsumeCodexResetCredit =
+      showCodexResetCreditControl && codexResetCreditCount != null && codexResetCreditCount > 0
 
     map[key.key_id] = {
       rowClass: getRowClass(key),
@@ -2454,6 +2474,10 @@ const keyUiStateMap = computed<Record<string, PoolKeyUiState>>(() => {
       canRefreshToken,
       showCodexResetCreditControl,
       codexResetCreditTitle: showCodexResetCreditControl ? getCodexResetCreditTitle(key) : '',
+      codexResetCreditCountText: showCodexResetCreditControl
+        ? getCodexResetCreditCountText(key)
+        : '',
+      canConsumeCodexResetCredit,
       planLabel: planType ? formatOAuthPlanType(planType) : '',
       planClass: planType ? getOAuthPlanTypeClass(planType) : '',
       accountQuotaText,
@@ -3135,15 +3159,19 @@ async function handleConsumeCodexResetCredit(key: PoolKeyDetail) {
   if (resettingCodexCreditKeyId.value || !shouldShowCodexResetCreditControl(key)) return
 
   const availableCount = getCodexResetCreditsAvailableCount(key)
+  if (!canConsumeCodexResetCredit(key)) {
+    showWarning(
+      availableCount == null
+        ? '刷新额度后才能获取主动重置次数'
+        : '当前没有可用主动重置次数',
+    )
+    return
+  }
   const availableCountText =
-    availableCount == null
-      ? '当前未返回可用次数'
-      : availableCount > 0
-        ? `当前剩余 ${availableCount} 次`
-        : '当前没有可用次数'
+    (availableCount ?? 0) > 0 ? `当前剩余 ${availableCount} 次` : '当前没有可用次数'
   const confirmed = await confirm({
     title: '主动重置额度',
-    message: `确定要重置账号 "${key.key_name || key.key_id.slice(0, 8)}" 的 Codex 5H 窗口吗？${availableCountText}，仍会尝试提交这次请求。`,
+    message: `确定要消耗 1 次主动重置次数，重置账号 "${key.key_name || key.key_id.slice(0, 8)}" 的 Codex 5H 窗口吗？${availableCountText}。`,
     confirmText: '重置',
   })
   if (!confirmed) return
@@ -3953,11 +3981,22 @@ function shouldShowCodexResetCreditControl(key: PoolKeyDetail): boolean {
     && isOAuthManagedCredential(key)
 }
 
+function canConsumeCodexResetCredit(key: PoolKeyDetail): boolean {
+  const availableCount = getCodexResetCreditsAvailableCount(key)
+  return shouldShowCodexResetCreditControl(key) && availableCount != null && availableCount > 0
+}
+
+function getCodexResetCreditCountText(key: PoolKeyDetail): string {
+  const availableCount = getCodexResetCreditsAvailableCount(key)
+  if (availableCount == null) return '主动重置次数：未返回'
+  return `主动重置次数：${availableCount}`
+}
+
 function getCodexResetCreditTitle(key: PoolKeyDetail): string {
   const availableCount = getCodexResetCreditsAvailableCount(key)
-  if (availableCount === 0) return '没有可用次数，仍可点击提交'
+  if (availableCount === 0) return '没有可用主动重置次数'
   if (availableCount != null) return `主动重置 Codex 5H 窗口（剩余 ${availableCount} 次）`
-  return '未返回可用次数，仍可点击提交'
+  return '刷新额度后显示主动重置次数'
 }
 
 function getQuotaSnapshotUpdatedAtSeconds(quota: QuotaStatusSnapshot | null | undefined): number | null {

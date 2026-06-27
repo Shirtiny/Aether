@@ -8,10 +8,13 @@ use self::invalid::{
     codex_structured_invalid_reason,
 };
 use self::parse::{
-    build_codex_quota_exhausted_fallback_metadata, parse_codex_usage_headers,
-    parse_codex_wham_usage_response,
+    build_codex_quota_exhausted_fallback_metadata, parse_codex_rate_limit_reset_credits_response,
+    parse_codex_usage_headers, parse_codex_wham_usage_response,
 };
-use self::plan::{build_codex_quota_request_spec, execute_codex_quota_plan};
+use self::plan::{
+    build_codex_quota_request_spec, build_codex_reset_credits_request_spec,
+    execute_codex_quota_plan,
+};
 use super::shared::{
     build_quota_snapshot_payload, extract_execution_error_message,
     oauth_refresh_auto_removed_result, persist_provider_quota_refresh_state,
@@ -27,10 +30,12 @@ use aether_data_contracts::repository::provider_catalog::{
 };
 use serde_json::json;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::warn;
 
 fn merge_codex_quota_metadata(
     header_metadata: Option<&serde_json::Value>,
     body_metadata: &serde_json::Value,
+    additional_metadata: Option<&serde_json::Value>,
 ) -> serde_json::Value {
     let mut merged = header_metadata
         .and_then(serde_json::Value::as_object)
@@ -38,6 +43,11 @@ fn merge_codex_quota_metadata(
         .unwrap_or_default();
     if let Some(body_object) = body_metadata.as_object() {
         for (key, value) in body_object {
+            merged.insert(key.clone(), value.clone());
+        }
+    }
+    if let Some(additional_object) = additional_metadata.and_then(serde_json::Value::as_object) {
+        for (key, value) in additional_object {
             merged.insert(key.clone(), value.clone());
         }
     }
@@ -51,6 +61,58 @@ fn codex_oauth_refresh_issue_reason(reason: Option<&str>) -> bool {
             .map(str::trim)
             .any(|line| line.starts_with("[OAUTH_EXPIRED]") || line.starts_with("[REFRESH_FAILED]"))
     })
+}
+
+async fn fetch_codex_reset_credits_metadata(
+    state: &AdminAppState<'_>,
+    transport: &crate::handlers::admin::request::AdminGatewayProviderTransportSnapshot,
+    resolved_oauth_auth: Option<(String, String)>,
+    proxy_override: Option<&ProxySnapshot>,
+    now_unix_secs: u64,
+) -> Result<Option<serde_json::Value>, GatewayError> {
+    let Some(resolved_oauth_auth) = resolved_oauth_auth else {
+        return Ok(None);
+    };
+    let request_spec = build_codex_reset_credits_request_spec(transport, resolved_oauth_auth);
+    let result =
+        match execute_codex_quota_plan(state, transport, request_spec, proxy_override).await? {
+            ProviderQuotaExecutionOutcome::Response(result) => result,
+            ProviderQuotaExecutionOutcome::Failure(detail) => {
+                warn!(
+                    key_id = %transport.key.id,
+                    error = %detail,
+                    "codex reset credits lookup failed"
+                );
+                return Ok(None);
+            }
+        };
+
+    if !(200..300).contains(&result.status_code) {
+        warn!(
+            key_id = %transport.key.id,
+            status_code = result.status_code,
+            message = ?extract_execution_error_message(&result),
+            "codex reset credits lookup returned non-success status"
+        );
+        return Ok(None);
+    }
+
+    let Some(body_json) = result
+        .body
+        .as_ref()
+        .and_then(|body| body.json_body.as_ref())
+    else {
+        warn!(
+            key_id = %transport.key.id,
+            "codex reset credits lookup returned no JSON body"
+        );
+        return Ok(None);
+    };
+
+    Ok(parse_codex_rate_limit_reset_credits_response(
+        body_json,
+        now_unix_secs,
+    ))
 }
 
 pub(crate) async fn refresh_codex_provider_quota_locally(
@@ -95,6 +157,7 @@ pub(crate) async fn refresh_codex_provider_quota_locally(
         } else {
             None
         };
+        let reset_credits_oauth_auth = resolved_oauth_auth.clone();
         if is_oauth_managed && quota_key_auto_removed(state, &key.id).await? {
             auto_removed_count += 1;
             results.push(oauth_refresh_auto_removed_result(&key));
@@ -156,6 +219,28 @@ pub(crate) async fn refresh_codex_provider_quota_locally(
         let mut metadata_update = header_metadata
             .as_ref()
             .map(|metadata| json!({ "codex": metadata }));
+        let reset_credits_metadata = if result.status_code == 200 {
+            fetch_codex_reset_credits_metadata(
+                state,
+                &transport,
+                reset_credits_oauth_auth,
+                proxy_override.as_ref(),
+                now_unix_secs,
+            )
+            .await?
+        } else {
+            None
+        };
+        if let Some(reset_credits_metadata) = reset_credits_metadata.as_ref() {
+            let merged = merge_codex_quota_metadata(
+                metadata_update
+                    .as_ref()
+                    .and_then(|value| value.get("codex")),
+                reset_credits_metadata,
+                None,
+            );
+            metadata_update = Some(json!({ "codex": merged }));
+        }
         let (mut oauth_invalid_at_unix_secs, mut oauth_invalid_reason) = (None, None);
         let mut status = "error".to_string();
         let mut message = None::<String>;
@@ -169,7 +254,11 @@ pub(crate) async fn refresh_codex_provider_quota_locally(
             {
                 if let Some(parsed) = parse_codex_wham_usage_response(body_json, now_unix_secs) {
                     metadata_update = Some(json!({
-                        "codex": merge_codex_quota_metadata(header_metadata.as_ref(), &parsed)
+                        "codex": merge_codex_quota_metadata(
+                            header_metadata.as_ref(),
+                            &parsed,
+                            reset_credits_metadata.as_ref(),
+                        )
                     }));
                     (oauth_invalid_at_unix_secs, oauth_invalid_reason) =
                         quota_refresh_success_invalid_state(&key);

@@ -20,7 +20,8 @@ pub use chatgpt_web::{
 };
 pub use codex::CodexProviderPoolAdapter;
 pub use codex::{
-    build_codex_pool_quota_request, build_codex_pool_reset_credit_request, CODEX_RESET_CREDIT_URL,
+    build_codex_pool_quota_request, build_codex_pool_reset_credit_request,
+    build_codex_pool_reset_credits_request, CODEX_RESET_CREDITS_URL, CODEX_RESET_CREDIT_URL,
     CODEX_WHAM_USAGE_URL,
 };
 pub use default::DefaultProviderPoolAdapter;

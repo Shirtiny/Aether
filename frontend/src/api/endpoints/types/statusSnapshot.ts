@@ -46,6 +46,7 @@ export interface QuotaWindowSnapshot {
 export interface QuotaCreditsSnapshot {
   has_credits?: boolean | null
   balance?: number | null
+  available_count?: number | null
   remaining?: number | null
   consumed?: number | null
   total?: number | null

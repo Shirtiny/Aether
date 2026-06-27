@@ -181,7 +181,7 @@ async fn build_codex_reset_credit_execution_plan(
         quota_kind: _,
         method,
         url,
-        headers,
+        mut headers,
         content_type,
         json_body,
         client_api_format,
@@ -189,6 +189,7 @@ async fn build_codex_reset_credit_execution_plan(
         model_name,
         accept_invalid_certs: _,
     } = spec;
+    crate::ai_serving::apply_codex_pool_stable_client_headers(&mut headers, transport);
 
     ExecutionPlan {
         request_id,

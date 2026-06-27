@@ -17,6 +17,8 @@ use crate::quota::{
 use crate::quota_refresh::ProviderPoolQuotaRequestSpec;
 
 pub const CODEX_WHAM_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+pub const CODEX_RESET_CREDITS_URL: &str =
+    "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits";
 pub const CODEX_RESET_CREDIT_URL: &str =
     "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume";
 const CODEX_RESET_CREDIT_USER_AGENT: &str =
@@ -171,6 +173,50 @@ pub fn build_codex_pool_reset_credit_request(
         client_api_format: "openai:responses".to_string(),
         provider_api_format: "openai:responses".to_string(),
         model_name: Some("codex-reset-credit".to_string()),
+        accept_invalid_certs: false,
+    }
+}
+
+pub fn build_codex_pool_reset_credits_request(
+    key_id: &str,
+    resolved_oauth_auth: (String, String),
+    auth_config: Option<&Value>,
+) -> ProviderPoolQuotaRequestSpec {
+    let mut headers = BTreeMap::new();
+    headers.insert("accept".to_string(), "application/json".to_string());
+    headers.insert("openai-beta".to_string(), "codex-1".to_string());
+    headers.insert("originator".to_string(), "Codex Desktop".to_string());
+    headers.insert(
+        "user-agent".to_string(),
+        CODEX_RESET_CREDIT_USER_AGENT.to_string(),
+    );
+    headers.insert(
+        resolved_oauth_auth.0.to_ascii_lowercase(),
+        resolved_oauth_auth.1,
+    );
+
+    let oauth_account_id = auth_config
+        .and_then(|value| value.get("account_id"))
+        .or_else(|| auth_config.and_then(|value| value.get("chatgpt_account_id")))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(account_id) = oauth_account_id {
+        headers.insert("chatgpt-account-id".to_string(), account_id.to_string());
+    }
+
+    ProviderPoolQuotaRequestSpec {
+        request_id: format!("codex-reset-credits:{key_id}"),
+        provider_name: "codex".to_string(),
+        quota_kind: "codex_reset_credits".to_string(),
+        method: "GET".to_string(),
+        url: CODEX_RESET_CREDITS_URL.to_string(),
+        headers,
+        content_type: None,
+        json_body: None,
+        client_api_format: "openai:responses".to_string(),
+        provider_api_format: "openai:responses".to_string(),
+        model_name: Some("codex-reset-credits".to_string()),
         accept_invalid_certs: false,
     }
 }

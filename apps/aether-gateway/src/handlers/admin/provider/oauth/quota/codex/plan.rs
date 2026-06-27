@@ -5,7 +5,10 @@ use super::super::shared::{
 use crate::handlers::admin::request::{AdminAppState, AdminGatewayProviderTransportSnapshot};
 use crate::GatewayError;
 use aether_contracts::ProxySnapshot;
-use aether_provider_pool::{build_codex_pool_quota_request, ProviderPoolQuotaRequestSpec};
+use aether_provider_pool::{
+    build_codex_pool_quota_request, build_codex_pool_reset_credits_request,
+    ProviderPoolQuotaRequestSpec,
+};
 
 pub(super) fn build_codex_quota_request_spec(
     transport: &AdminGatewayProviderTransportSnapshot,
@@ -24,12 +27,29 @@ pub(super) fn build_codex_quota_request_spec(
     )
 }
 
+pub(super) fn build_codex_reset_credits_request_spec(
+    transport: &AdminGatewayProviderTransportSnapshot,
+    resolved_oauth_auth: (String, String),
+) -> ProviderPoolQuotaRequestSpec {
+    let auth_config = transport
+        .key
+        .decrypted_auth_config
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
+    build_codex_pool_reset_credits_request(
+        &transport.key.id,
+        resolved_oauth_auth,
+        auth_config.as_ref(),
+    )
+}
+
 pub(super) async fn execute_codex_quota_plan(
     state: &AdminAppState<'_>,
     transport: &AdminGatewayProviderTransportSnapshot,
-    spec: ProviderPoolQuotaRequestSpec,
+    mut spec: ProviderPoolQuotaRequestSpec,
     proxy_override: Option<&ProxySnapshot>,
 ) -> Result<ProviderQuotaExecutionOutcome, GatewayError> {
+    crate::ai_serving::apply_codex_pool_stable_client_headers(&mut spec.headers, transport);
     let proxy = match proxy_override {
         Some(proxy) => Some(proxy.clone()),
         None => {
