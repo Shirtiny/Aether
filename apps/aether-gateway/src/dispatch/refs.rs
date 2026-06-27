@@ -210,6 +210,7 @@ mod tests {
                 pool_sticky_session_token: None,
                 pool_sticky_bound_key_ineligible: false,
                 pool_sticky_bound_key_id: None,
+                pool_sticky_bound_key_ineligible_reason: None,
                 scheduler_affinity_epoch: None,
             },
             ranking: None,

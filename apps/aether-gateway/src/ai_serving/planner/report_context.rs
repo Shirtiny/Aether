@@ -49,6 +49,7 @@ pub(crate) struct LocalExecutionReportContextParts<'a> {
     pub(crate) pool_sticky_session_token: Option<&'a str>,
     pub(crate) pool_sticky_bound_key_ineligible: bool,
     pub(crate) pool_sticky_bound_key_id: Option<&'a str>,
+    pub(crate) pool_sticky_bound_key_ineligible_reason: Option<&'a str>,
     pub(crate) ranking: Option<&'a SchedulerRankingOutcome>,
     pub(crate) upstream_url: Option<&'a str>,
     pub(crate) header_rules: Option<&'a Value>,
@@ -124,6 +125,7 @@ pub(crate) fn build_local_execution_report_context(
         &mut extra_fields,
         parts.pool_sticky_bound_key_ineligible,
         parts.pool_sticky_bound_key_id,
+        parts.pool_sticky_bound_key_ineligible_reason,
     );
     if let Some(epoch) = parts.scheduler_affinity_epoch {
         extra_fields.insert(
@@ -323,6 +325,7 @@ mod tests {
                 pool_sticky_session_token: Some("session-1"),
                 pool_sticky_bound_key_ineligible: false,
                 pool_sticky_bound_key_id: None,
+                pool_sticky_bound_key_ineligible_reason: None,
                 ranking: None,
                 upstream_url: None,
                 header_rules: None,
@@ -409,6 +412,7 @@ mod tests {
                 pool_sticky_session_token: None,
                 pool_sticky_bound_key_ineligible: false,
                 pool_sticky_bound_key_id: None,
+                pool_sticky_bound_key_ineligible_reason: None,
                 ranking: None,
                 upstream_url: None,
                 header_rules: None,
@@ -483,6 +487,7 @@ mod tests {
                 pool_sticky_session_token: None,
                 pool_sticky_bound_key_ineligible: false,
                 pool_sticky_bound_key_id: None,
+                pool_sticky_bound_key_ineligible_reason: None,
                 ranking: None,
                 upstream_url: None,
                 header_rules: None,

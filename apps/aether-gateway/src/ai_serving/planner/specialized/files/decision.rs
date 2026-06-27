@@ -97,6 +97,10 @@ pub(super) async fn maybe_build_local_gemini_files_decision_payload_for_candidat
         pool_sticky_session_token: eligible.orchestration.pool_sticky_session_token.as_deref(),
         pool_sticky_bound_key_ineligible: eligible.orchestration.pool_sticky_bound_key_ineligible,
         pool_sticky_bound_key_id: eligible.orchestration.pool_sticky_bound_key_id.as_deref(),
+        pool_sticky_bound_key_ineligible_reason: eligible
+            .orchestration
+            .pool_sticky_bound_key_ineligible_reason
+            .as_deref(),
         ranking: eligible.ranking.as_ref(),
         upstream_url: None,
         header_rules: transport.endpoint.header_rules.as_ref(),

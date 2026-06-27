@@ -1058,14 +1058,6 @@ pub fn codex_structured_invalid_reason(status_code: u16, upstream_message: Optio
         };
         return format!("{OAUTH_ACCOUNT_BLOCK_PREFIX}{detail}");
     }
-    if status_code == 402 {
-        let detail = if message.is_empty() {
-            "Codex 账户需要付款 (402)"
-        } else {
-            message
-        };
-        return format!("{OAUTH_ACCOUNT_BLOCK_PREFIX}{detail}");
-    }
     message.to_string()
 }
 
@@ -1075,12 +1067,13 @@ pub fn codex_runtime_invalid_reason(
 ) -> Option<String> {
     match status_code {
         401 => Some(codex_structured_invalid_reason(401, upstream_message)),
-        402 => Some(codex_structured_invalid_reason(402, upstream_message)),
-        403 if codex_looks_like_token_invalidated(upstream_message)
-            || codex_looks_like_account_deactivated(upstream_message) =>
+        402 if codex_looks_like_workspace_deactivated(upstream_message)
+            || codex_looks_like_account_deactivated(upstream_message)
+            || codex_looks_like_token_invalidated(upstream_message) =>
         {
-            Some(codex_structured_invalid_reason(403, upstream_message))
+            Some(codex_structured_invalid_reason(402, upstream_message))
         }
+        403 => Some(codex_structured_invalid_reason(403, upstream_message)),
         _ => None,
     }
 }
@@ -1807,16 +1800,29 @@ mod tests {
     }
 
     #[test]
-    fn codex_runtime_invalid_reason_marks_402_as_account_blocked() {
+    fn codex_runtime_invalid_reason_ignores_generic_402_payment_required() {
         assert_eq!(
             codex_runtime_invalid_reason(402, Some("payment required")),
-            Some(format!("{OAUTH_ACCOUNT_BLOCK_PREFIX}payment required"))
+            None
         );
     }
 
     #[test]
-    fn codex_runtime_invalid_reason_ignores_generic_403() {
-        assert_eq!(codex_runtime_invalid_reason(403, Some("forbidden")), None);
+    fn codex_runtime_invalid_reason_marks_workspace_deactivated_402() {
+        assert_eq!(
+            codex_runtime_invalid_reason(402, Some("deactivated_workspace")),
+            Some(format!(
+                "{OAUTH_ACCOUNT_BLOCK_PREFIX}工作区已停用 (deactivated_workspace)"
+            ))
+        );
+    }
+
+    #[test]
+    fn codex_runtime_invalid_reason_marks_generic_403_as_account_blocked() {
+        assert_eq!(
+            codex_runtime_invalid_reason(403, Some("forbidden")),
+            Some(format!("{OAUTH_ACCOUNT_BLOCK_PREFIX}forbidden"))
+        );
     }
 
     #[test]

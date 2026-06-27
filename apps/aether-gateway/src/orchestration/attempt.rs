@@ -35,6 +35,7 @@ pub(crate) struct LocalExecutionCandidateMetadata {
     pub(crate) pool_sticky_session_token: Option<String>,
     pub(crate) pool_sticky_bound_key_ineligible: bool,
     pub(crate) pool_sticky_bound_key_id: Option<String>,
+    pub(crate) pool_sticky_bound_key_ineligible_reason: Option<String>,
     pub(crate) scheduler_affinity_epoch: Option<u64>,
 }
 
@@ -44,6 +45,8 @@ pub(crate) const POOL_STICKY_SESSION_TOKEN_REPORT_FIELD: &str = "pool_sticky_ses
 pub(crate) const POOL_STICKY_BOUND_KEY_INELIGIBLE_REPORT_FIELD: &str =
     "pool_sticky_bound_key_ineligible";
 pub(crate) const POOL_STICKY_BOUND_KEY_ID_REPORT_FIELD: &str = "pool_sticky_bound_key_id";
+pub(crate) const POOL_STICKY_BOUND_KEY_INELIGIBLE_REASON_REPORT_FIELD: &str =
+    "pool_sticky_bound_key_ineligible_reason";
 pub(crate) const POOL_KEY_LEASE_KEY_REPORT_FIELD: &str = "pool_key_lease_key";
 pub(crate) const POOL_KEY_LEASE_OWNER_REPORT_FIELD: &str = "pool_key_lease_owner";
 pub(crate) const POOL_KEY_LEASE_TOKEN_REPORT_FIELD: &str = "pool_key_lease_token";
@@ -98,6 +101,12 @@ pub(crate) fn local_execution_candidate_metadata_from_report_context(
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned),
+        pool_sticky_bound_key_ineligible_reason: report_context
+            .and_then(|value| value.get(POOL_STICKY_BOUND_KEY_INELIGIBLE_REASON_REPORT_FIELD))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned),
         scheduler_affinity_epoch: report_context
             .and_then(|value| value.get(SCHEDULER_AFFINITY_EPOCH_REPORT_FIELD))
             .and_then(Value::as_u64),
@@ -137,6 +146,7 @@ pub(crate) fn insert_pool_sticky_bound_key_ineligible_report_context_field(
     extra_fields: &mut serde_json::Map<String, Value>,
     ineligible: bool,
     bound_key_id: Option<&str>,
+    reason: Option<&str>,
 ) {
     if ineligible {
         extra_fields.insert(
@@ -150,6 +160,12 @@ pub(crate) fn insert_pool_sticky_bound_key_ineligible_report_context_field(
             extra_fields.insert(
                 POOL_STICKY_BOUND_KEY_ID_REPORT_FIELD.to_string(),
                 Value::String(bound_key_id.to_string()),
+            );
+        }
+        if let Some(reason) = reason.map(str::trim).filter(|value| !value.is_empty()) {
+            extra_fields.insert(
+                POOL_STICKY_BOUND_KEY_INELIGIBLE_REASON_REPORT_FIELD.to_string(),
+                Value::String(reason.to_string()),
             );
         }
     }
@@ -572,6 +588,7 @@ mod tests {
             "pool_sticky_session_token": "session-1",
             "pool_sticky_bound_key_ineligible": true,
             "pool_sticky_bound_key_id": "key-old",
+            "pool_sticky_bound_key_ineligible_reason": "pool_account_blocked",
         })));
 
         assert_eq!(
@@ -589,6 +606,7 @@ mod tests {
                 pool_sticky_session_token: Some("session-1".to_string()),
                 pool_sticky_bound_key_ineligible: true,
                 pool_sticky_bound_key_id: Some("key-old".to_string()),
+                pool_sticky_bound_key_ineligible_reason: Some("pool_account_blocked".to_string()),
                 scheduler_affinity_epoch: None,
             }
         );

@@ -84,7 +84,10 @@ enum QueuedPoolCandidateOrigin {
 
 enum StickyCandidateLookup {
     Missing,
-    Ineligible { bound_key_id: String },
+    Ineligible {
+        bound_key_id: String,
+        reason: &'static str,
+    },
     Candidate(EligibleLocalExecutionCandidate),
 }
 
@@ -428,6 +431,7 @@ pub(crate) struct PoolKeyCursor<'a> {
     sticky_init_claimed: bool,
     sticky_bound_key_ineligible: bool,
     sticky_bound_key_id: Option<String>,
+    sticky_bound_key_ineligible_reason: Option<&'static str>,
 }
 
 impl<'a> PoolKeyCursor<'a> {
@@ -506,6 +510,7 @@ impl<'a> PoolKeyCursor<'a> {
             sticky_init_claimed: false,
             sticky_bound_key_ineligible: false,
             sticky_bound_key_id: None,
+            sticky_bound_key_ineligible_reason: None,
         }
     }
 
@@ -549,9 +554,13 @@ impl<'a> PoolKeyCursor<'a> {
                         );
                         continue;
                     }
-                    StickyCandidateLookup::Ineligible { bound_key_id } => {
+                    StickyCandidateLookup::Ineligible {
+                        bound_key_id,
+                        reason,
+                    } => {
                         self.sticky_bound_key_ineligible = true;
                         self.sticky_bound_key_id = Some(bound_key_id);
+                        self.sticky_bound_key_ineligible_reason = Some(reason);
                     }
                     StickyCandidateLookup::Missing => {}
                 }
@@ -581,9 +590,13 @@ impl<'a> PoolKeyCursor<'a> {
                         self.sticky_init_state = PoolStickyInitState::Disabled;
                         return PoolStickyInitGate::Proceed;
                     }
-                    StickyCandidateLookup::Ineligible { bound_key_id } => {
+                    StickyCandidateLookup::Ineligible {
+                        bound_key_id,
+                        reason,
+                    } => {
                         self.sticky_bound_key_ineligible = true;
                         self.sticky_bound_key_id = Some(bound_key_id);
+                        self.sticky_bound_key_ineligible_reason = Some(reason);
                     }
                     StickyCandidateLookup::Missing => {}
                 }
@@ -610,9 +623,13 @@ impl<'a> PoolKeyCursor<'a> {
                 self.sticky_init_state = PoolStickyInitState::Disabled;
                 return PoolStickyInitGate::Proceed;
             }
-            StickyCandidateLookup::Ineligible { bound_key_id } => {
+            StickyCandidateLookup::Ineligible {
+                bound_key_id,
+                reason,
+            } => {
                 self.sticky_bound_key_ineligible = true;
                 self.sticky_bound_key_id = Some(bound_key_id);
+                self.sticky_bound_key_ineligible_reason = Some(reason);
             }
             StickyCandidateLookup::Missing => {}
         }
@@ -692,9 +709,14 @@ impl<'a> PoolKeyCursor<'a> {
         Some((candidate, origin))
     }
 
-    fn mark_sticky_bound_key_ineligible(&mut self, candidate: &EligibleLocalExecutionCandidate) {
+    fn mark_sticky_bound_key_ineligible(
+        &mut self,
+        candidate: &EligibleLocalExecutionCandidate,
+        reason: &'static str,
+    ) {
         self.sticky_bound_key_ineligible = true;
         self.sticky_bound_key_id = Some(candidate.candidate.key_id.clone());
+        self.sticky_bound_key_ineligible_reason = Some(reason);
         if self.sticky_init_state == PoolStickyInitState::Disabled {
             self.sticky_init_state = PoolStickyInitState::Unchecked;
             self.sticky_init_owner = None;
@@ -985,6 +1007,7 @@ impl<'a> PoolKeyCursor<'a> {
                 let Some(key) = keys.pop() else {
                     return StickyCandidateLookup::Ineligible {
                         bound_key_id: sticky_key_id,
+                        reason: "pool_sticky_bound_key_missing",
                     };
                 };
                 key
@@ -1002,12 +1025,14 @@ impl<'a> PoolKeyCursor<'a> {
                 );
                 return StickyCandidateLookup::Ineligible {
                     bound_key_id: sticky_key_id,
+                    reason: "pool_sticky_bound_key_load_failed",
                 };
             }
         };
         if key.provider_id != self.group.candidate.provider_id {
             return StickyCandidateLookup::Ineligible {
                 bound_key_id: sticky_key_id,
+                reason: "pool_sticky_bound_key_provider_mismatch",
             };
         }
 
@@ -1026,6 +1051,7 @@ impl<'a> PoolKeyCursor<'a> {
         {
             return StickyCandidateLookup::Ineligible {
                 bound_key_id: sticky_key_id,
+                reason: POOL_COOLDOWN_SKIP_REASON,
             };
         }
         if pool_config.cost_limit_per_key_tokens.is_some_and(|limit| {
@@ -1038,6 +1064,7 @@ impl<'a> PoolKeyCursor<'a> {
         }) {
             return StickyCandidateLookup::Ineligible {
                 bound_key_id: sticky_key_id,
+                reason: POOL_COST_LIMIT_REACHED_SKIP_REASON,
             };
         }
 
@@ -1049,11 +1076,16 @@ impl<'a> PoolKeyCursor<'a> {
             self.group.transport.provider.provider_type.as_str(),
             Some(pool_config.codex_quota_exhaustion_basis.as_str()),
         );
-        if key_context.account_blocked
-            || (pool_config.skip_exhausted_accounts && key_context.quota_exhausted)
-        {
+        if key_context.account_blocked {
             return StickyCandidateLookup::Ineligible {
                 bound_key_id: sticky_key_id,
+                reason: POOL_ACCOUNT_BLOCKED_SKIP_REASON,
+            };
+        }
+        if pool_config.skip_exhausted_accounts && key_context.quota_exhausted {
+            return StickyCandidateLookup::Ineligible {
+                bound_key_id: sticky_key_id,
+                reason: POOL_ACCOUNT_EXHAUSTED_SKIP_REASON,
             };
         }
 
@@ -1062,6 +1094,7 @@ impl<'a> PoolKeyCursor<'a> {
             Some(candidate) => StickyCandidateLookup::Candidate(candidate),
             None => StickyCandidateLookup::Ineligible {
                 bound_key_id: sticky_key_id,
+                reason: "pool_sticky_bound_key_unavailable",
             },
         }
     }
@@ -1113,14 +1146,17 @@ impl<'a> PoolKeyCursor<'a> {
                 .unwrap_or(QueuedPoolCandidateOrigin::Scheduled);
             if self.skip_candidate_if_routing_profile_disallowed(&candidate) {
                 if origin == QueuedPoolCandidateOrigin::StickyHit {
-                    self.mark_sticky_bound_key_ineligible(&candidate);
+                    self.mark_sticky_bound_key_ineligible(
+                        &candidate,
+                        ROUTING_PROFILE_DISALLOWED_KEY_SKIP_REASON,
+                    );
                 }
                 let _ = self.pop_front_queued_candidate();
                 continue;
             }
             if self.skip_candidate_if_runtime_cooldown(&candidate).await {
                 if origin == QueuedPoolCandidateOrigin::StickyHit {
-                    self.mark_sticky_bound_key_ineligible(&candidate);
+                    self.mark_sticky_bound_key_ineligible(&candidate, POOL_COOLDOWN_SKIP_REASON);
                 }
                 let _ = self.pop_front_queued_candidate();
                 continue;
@@ -1161,6 +1197,10 @@ impl<'a> PoolKeyCursor<'a> {
             if self.sticky_bound_key_ineligible {
                 candidate.orchestration.pool_sticky_bound_key_ineligible = true;
                 candidate.orchestration.pool_sticky_bound_key_id = self.sticky_bound_key_id.clone();
+                candidate
+                    .orchestration
+                    .pool_sticky_bound_key_ineligible_reason =
+                    self.sticky_bound_key_ineligible_reason.map(str::to_string);
             }
             self.next_pool_key_index = self.next_pool_key_index.saturating_add(1);
             return Some(candidate);
@@ -1983,6 +2023,7 @@ fn apply_pool_orchestration(
         pool_sticky_session_token: None,
         pool_sticky_bound_key_ineligible: false,
         pool_sticky_bound_key_id: None,
+        pool_sticky_bound_key_ineligible_reason: None,
         scheduler_affinity_epoch,
     };
     candidate
@@ -2192,6 +2233,7 @@ mod tests {
                 pool_sticky_session_token: None,
                 pool_sticky_bound_key_ineligible: false,
                 pool_sticky_bound_key_id: None,
+                pool_sticky_bound_key_ineligible_reason: None,
                 scheduler_affinity_epoch: None,
             }
         );
@@ -2213,6 +2255,7 @@ mod tests {
                 pool_sticky_session_token: None,
                 pool_sticky_bound_key_ineligible: false,
                 pool_sticky_bound_key_id: None,
+                pool_sticky_bound_key_ineligible_reason: None,
                 scheduler_affinity_epoch: None,
             }
         );
@@ -3401,6 +3444,13 @@ mod tests {
             Some("key-00000")
         );
         assert_eq!(
+            candidate
+                .orchestration
+                .pool_sticky_bound_key_ineligible_reason
+                .as_deref(),
+            Some(ROUTING_PROFILE_DISALLOWED_KEY_SKIP_REASON)
+        );
+        assert_eq!(
             cursor
                 .skip_reason_counts
                 .get(ROUTING_PROFILE_DISALLOWED_KEY_SKIP_REASON),
@@ -3491,6 +3541,185 @@ mod tests {
         assert_eq!(
             candidate.orchestration.pool_sticky_bound_key_id.as_deref(),
             Some("key-00000")
+        );
+        assert_eq!(
+            candidate
+                .orchestration
+                .pool_sticky_bound_key_ineligible_reason
+                .as_deref(),
+            Some(aether_pool_core::POOL_COOLDOWN_SKIP_REASON)
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_key_cursor_marks_sticky_oauth_invalid_as_account_blocked_reason() {
+        let provider_config = Some(json!({
+            "pool_advanced": {
+                "sticky_session_ttl_seconds": 120,
+                "scheduling_presets": [
+                    {"preset": "no_weight", "enabled": true}
+                ]
+            }
+        }));
+        let (provider, endpoint, mut keys, rows) = large_pool_fixture(2, provider_config.clone());
+        keys[0].auth_type = "oauth".to_string();
+        keys[0].oauth_invalid_at_unix_secs = Some(1_710_000_000);
+        keys[0].oauth_invalid_reason =
+            Some("[OAUTH_EXPIRED] Codex Token 无效或已过期 (401)".to_string());
+        let app = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_and_minimal_candidate_selection_for_tests(
+                    Arc::new(InMemoryProviderCatalogReadRepository::seed(
+                        vec![provider],
+                        vec![endpoint],
+                        keys,
+                    )),
+                    Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(rows)),
+                )
+                .with_encryption_key_for_tests(aether_crypto::DEVELOPMENT_ENCRYPTION_KEY),
+            );
+        let group = sample_eligible_candidate(
+            "provider-pool",
+            "endpoint-1",
+            "pool-group",
+            10,
+            provider_config.clone(),
+        );
+        let pool_config = pool_config_for_candidate(&group).expect("pool config should parse");
+        record_admin_provider_pool_success(
+            app.runtime_state.as_ref(),
+            "provider-pool",
+            "key-00000",
+            &pool_config,
+            Some("session-1"),
+            None,
+            false,
+            None,
+            0,
+            None,
+        )
+        .await;
+
+        let mut cursor = PoolKeyCursor::new(
+            PlannerAppState::new(&app),
+            group,
+            Some("session-1"),
+            None,
+            None,
+        );
+
+        let candidate = cursor
+            .next_key()
+            .await
+            .expect("cursor should fall back after oauth invalid sticky-bound key");
+
+        assert_eq!(candidate.candidate.key_id, "key-00001");
+        assert!(candidate.orchestration.pool_sticky_bound_key_ineligible);
+        assert_eq!(
+            candidate.orchestration.pool_sticky_bound_key_id.as_deref(),
+            Some("key-00000")
+        );
+        assert_eq!(
+            candidate
+                .orchestration
+                .pool_sticky_bound_key_ineligible_reason
+                .as_deref(),
+            Some(aether_pool_core::POOL_ACCOUNT_BLOCKED_SKIP_REASON)
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_key_cursor_marks_sticky_quota_exhausted_with_exhausted_reason() {
+        let provider_config = Some(json!({
+            "pool_advanced": {
+                "sticky_session_ttl_seconds": 120,
+                "skip_exhausted_accounts": true,
+                "scheduling_presets": [
+                    {"preset": "no_weight", "enabled": true}
+                ]
+            }
+        }));
+        let provider = sample_codex_pool_provider("provider-pool", 0, provider_config.clone());
+        let endpoint = sample_codex_pool_endpoint("provider-pool", "endpoint-1");
+        let mut key_exhausted = sample_codex_pool_key("provider-pool", "key-00000");
+        key_exhausted.status_snapshot = Some(json!({
+            "quota": {
+                "provider_type": "codex",
+                "exhausted": true,
+                "usage_ratio": 1.0
+            }
+        }));
+        let sticky_key = key_exhausted.clone();
+        let key_ready = sample_codex_pool_key("provider-pool", "key-00001");
+        let rows = vec![
+            sample_codex_pool_row("provider-pool", "endpoint-1", "key-00000", 0),
+            sample_codex_pool_row("provider-pool", "endpoint-1", "key-00001", 0),
+        ];
+        let app = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_and_minimal_candidate_selection_for_tests(
+                    Arc::new(InMemoryProviderCatalogReadRepository::seed(
+                        vec![provider],
+                        vec![endpoint],
+                        vec![key_exhausted, key_ready],
+                    )),
+                    Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(rows)),
+                )
+                .with_encryption_key_for_tests(aether_crypto::DEVELOPMENT_ENCRYPTION_KEY),
+            );
+        let group =
+            sample_codex_pool_group("provider-pool", "endpoint-1", 0, provider_config.clone());
+        let pool_config = pool_config_for_candidate(&group).expect("pool config should parse");
+        assert!(pool_config.skip_exhausted_accounts);
+        let key_context = build_pool_catalog_key_context(
+            PlannerAppState::new(&app),
+            &ProviderPoolService::with_builtin_adapters(),
+            &sticky_key,
+            group.transport.provider.provider_type.as_str(),
+            Some(pool_config.codex_quota_exhaustion_basis.as_str()),
+        );
+        assert!(key_context.quota_exhausted);
+        record_admin_provider_pool_success(
+            app.runtime_state.as_ref(),
+            "provider-pool",
+            "key-00000",
+            &pool_config,
+            Some("session-1"),
+            None,
+            false,
+            None,
+            0,
+            None,
+        )
+        .await;
+
+        let mut cursor = PoolKeyCursor::new(
+            PlannerAppState::new(&app),
+            group,
+            Some("session-1"),
+            None,
+            None,
+        );
+
+        let candidate = cursor
+            .next_key()
+            .await
+            .expect("cursor should fall back after exhausted sticky-bound key");
+
+        assert_eq!(candidate.candidate.key_id, "key-00001");
+        assert!(candidate.orchestration.pool_sticky_bound_key_ineligible);
+        assert_eq!(
+            candidate.orchestration.pool_sticky_bound_key_id.as_deref(),
+            Some("key-00000")
+        );
+        assert_eq!(
+            candidate
+                .orchestration
+                .pool_sticky_bound_key_ineligible_reason
+                .as_deref(),
+            Some(aether_pool_core::POOL_ACCOUNT_EXHAUSTED_SKIP_REASON)
         );
     }
 

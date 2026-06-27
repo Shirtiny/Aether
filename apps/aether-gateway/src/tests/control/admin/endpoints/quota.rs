@@ -790,6 +790,114 @@ async fn gateway_marks_codex_quota_exhausted_when_wham_usage_returns_payment_req
 }
 
 #[tokio::test]
+async fn gateway_marks_codex_quota_forbidden_as_oauth_invalid() {
+    let upstream = Router::new().route(
+        "/api/admin/endpoints/providers/provider-codex/refresh-quota",
+        any(move |_request: Request| async move {
+            (StatusCode::OK, Body::from("unexpected upstream hit"))
+        }),
+    );
+
+    let execution_runtime = Router::new().route(
+        "/v1/execute/sync",
+        any(move |request: Request| async move {
+            let plan: aether_contracts::ExecutionPlan = serde_json::from_slice(
+                &to_bytes(request.into_body(), usize::MAX)
+                    .await
+                    .expect("body should read"),
+            )
+            .expect("plan should parse");
+            let result = aether_contracts::ExecutionResult {
+                request_id: plan.request_id,
+                candidate_id: None,
+                status_code: 403,
+                headers: BTreeMap::new(),
+                body: Some(aether_contracts::ResponseBody {
+                    json_body: Some(json!({
+                        "error": {
+                            "message": "forbidden"
+                        }
+                    })),
+                    body_bytes_b64: None,
+                }),
+                telemetry: None,
+                error: None,
+            };
+            (StatusCode::OK, Json(result))
+        }),
+    );
+
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![StoredProviderCatalogProvider::new(
+            "provider-codex".to_string(),
+            "codex".to_string(),
+            Some("https://example.com".to_string()),
+            "codex".to_string(),
+        )
+        .expect("provider should build")],
+        vec![sample_endpoint(
+            "endpoint-codex-cli",
+            "provider-codex",
+            "openai:responses",
+            "https://chatgpt.com/backend-api",
+        )],
+        vec![sample_key(
+            "key-codex-forbidden",
+            "provider-codex",
+            "openai:responses",
+            "sk-codex-forbidden",
+        )],
+    ));
+
+    let (_upstream_url, upstream_handle) = start_server(upstream).await;
+    let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
+    let gateway = build_router_with_state(
+        build_state_with_execution_runtime_override(execution_runtime_url.clone())
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(
+                    provider_catalog_repository.clone(),
+                )
+                .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+            ),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{gateway_url}/api/admin/endpoints/providers/provider-codex/refresh-quota"
+        ))
+        .header(GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(payload["success"], 0);
+    assert_eq!(payload["failed"], 1);
+    assert_eq!(payload["results"][0]["status"], "forbidden");
+    assert_eq!(payload["results"][0]["status_code"], 403);
+
+    let reloaded = provider_catalog_repository
+        .list_keys_by_ids(&["key-codex-forbidden".to_string()])
+        .await
+        .expect("keys should read");
+    assert_eq!(reloaded.len(), 1);
+    assert!(reloaded[0].oauth_invalid_at_unix_secs.is_some());
+    assert_eq!(
+        reloaded[0].oauth_invalid_reason.as_deref(),
+        Some("[ACCOUNT_BLOCK] forbidden")
+    );
+
+    gateway_handle.abort();
+    execution_runtime_handle.abort();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
 async fn gateway_retains_codex_key_when_quota_only_reports_oauth_invalid() {
     let upstream = Router::new().route(
         "/api/admin/endpoints/providers/provider-codex/refresh-quota",

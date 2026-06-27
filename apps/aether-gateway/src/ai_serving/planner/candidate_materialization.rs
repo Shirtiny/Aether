@@ -124,11 +124,6 @@ impl<'a> LocalExecutionCandidateAttemptSource<'a> {
                     pool_exhaustion_persistence,
                 } => {
                     if let Some(attempt) = next_attempt_from_dispatch_sequence(pending_attempts) {
-                        if dispatch_sequence_exhausted(pending_attempts)
-                            && local_candidate_attempt_has_sticky_init_owner(&attempt)
-                        {
-                            self.items.pop_front();
-                        }
                         return Some(attempt);
                     }
                     let Some(candidate) = next_pool_cursor_candidate_with_timeout(
@@ -2111,6 +2106,7 @@ mod tests {
                 pool_sticky_session_token: None,
                 pool_sticky_bound_key_ineligible: false,
                 pool_sticky_bound_key_id: None,
+                pool_sticky_bound_key_ineligible_reason: None,
                 scheduler_affinity_epoch: None,
             },
             ranking: None,
@@ -2741,7 +2737,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dynamic_pool_attempt_source_stops_after_sticky_initializer() {
+    async fn dynamic_pool_attempt_source_continues_after_sticky_initializer() {
         let provider_config = Some(json!({
             "pool_advanced": {
                 "sticky_session_ttl_seconds": 120,
@@ -2802,9 +2798,25 @@ mod tests {
                 .is_some_and(|owner| !owner.is_empty()),
             "first dynamic pool attempt should be the sticky initializer"
         );
+        let first_owner = first
+            .eligible
+            .orchestration
+            .pool_sticky_init_owner
+            .clone()
+            .expect("first attempt should carry sticky init owner");
+        let second = source
+            .next_attempt()
+            .await
+            .expect("dynamic pool source should continue after sticky initializer");
+        assert_eq!(second.eligible.candidate.key_id, "pool-key-b");
         assert!(
-            source.next_attempt().await.is_none(),
-            "dynamic pool source must not continue expanding the same pool after sticky initializer"
+            second
+                .eligible
+                .orchestration
+                .pool_sticky_init_owner
+                .as_deref()
+                .is_some_and(|owner| owner == first_owner),
+            "continued dynamic pool attempt should retain the same sticky init owner"
         );
     }
 

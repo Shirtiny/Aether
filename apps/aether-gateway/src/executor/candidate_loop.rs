@@ -45,6 +45,7 @@ use crate::{AppState, GatewayError};
 
 const DEFAULT_STREAM_FIRST_BYTE_WATCHDOG_TIMEOUT_MS: u64 = 30_000;
 const POOL_STICKY_COLLATERAL_AVOIDANCE_SKIP_REASON: &str = "pool_sticky_collateral_avoidance";
+const POOL_ACCOUNT_BLOCKED_SKIP_REASON: &str = "pool_account_blocked";
 
 fn attach_redaction_execution_candidate(response: &mut Response<Body>, candidate_id: Option<&str>) {
     if let Some(candidate_id) = candidate_id
@@ -285,7 +286,9 @@ async fn pool_sticky_collateral_skip_reason(
 
     if !should_skip {
         let metadata = local_execution_candidate_metadata_from_report_context(report_context);
-        if metadata.pool_sticky_bound_key_ineligible {
+        if metadata.pool_sticky_bound_key_ineligible
+            && pool_sticky_bound_key_ineligible_triggers_collateral_avoidance(&metadata)
+        {
             if let Some(sticky_session_token) = sticky_session_token.as_deref() {
                 should_skip = remember_pool_sticky_collateral_block_if_enabled(
                     state,
@@ -422,6 +425,15 @@ fn request_candidate_json_text(value: &serde_json::Value) -> Option<String> {
         .or_else(|| serde_json::to_string(value).ok())
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn pool_sticky_bound_key_ineligible_triggers_collateral_avoidance(
+    metadata: &crate::orchestration::LocalExecutionCandidateMetadata,
+) -> bool {
+    matches!(
+        metadata.pool_sticky_bound_key_ineligible_reason.as_deref(),
+        Some(POOL_ACCOUNT_BLOCKED_SKIP_REASON | "key_invalid" | "oauth_invalid" | "auth_invalid")
+    )
 }
 
 pub(crate) async fn execute_sync_plan_and_reports<T>(
@@ -1487,6 +1499,57 @@ mod tests {
             503,
             Some("upstream overloaded")
         ));
+    }
+
+    #[test]
+    fn sticky_bound_key_ineligible_only_triggers_collateral_avoidance_for_key_invalid_reasons() {
+        fn metadata(reason: Option<&str>) -> crate::orchestration::LocalExecutionCandidateMetadata {
+            crate::orchestration::LocalExecutionCandidateMetadata {
+                candidate_group_id: None,
+                pool_key_index: None,
+                pool_key_lease: None,
+                pool_sticky_init_owner: None,
+                pool_sticky_session_token: Some("session-1".to_string()),
+                pool_sticky_bound_key_ineligible: true,
+                pool_sticky_bound_key_id: Some("key-old".to_string()),
+                pool_sticky_bound_key_ineligible_reason: reason.map(str::to_string),
+                scheduler_affinity_epoch: None,
+            }
+        }
+
+        for reason in [
+            aether_pool_core::POOL_ACCOUNT_BLOCKED_SKIP_REASON,
+            "key_invalid",
+            "oauth_invalid",
+            "auth_invalid",
+        ] {
+            assert!(
+                pool_sticky_bound_key_ineligible_triggers_collateral_avoidance(&metadata(Some(
+                    reason
+                ))),
+                "{reason} should trigger sticky collateral avoidance"
+            );
+        }
+
+        for reason in [
+            aether_pool_core::POOL_ACCOUNT_EXHAUSTED_SKIP_REASON,
+            aether_pool_core::POOL_COOLDOWN_SKIP_REASON,
+            aether_pool_core::POOL_COST_LIMIT_REACHED_SKIP_REASON,
+            "routing_profile_disallowed_key",
+            "pool_sticky_bound_key_missing",
+            "pool_sticky_bound_key_load_failed",
+            "pool_sticky_bound_key_provider_mismatch",
+            "pool_sticky_bound_key_unavailable",
+        ] {
+            assert!(
+                !pool_sticky_bound_key_ineligible_triggers_collateral_avoidance(&metadata(Some(
+                    reason
+                ))),
+                "{reason} should not trigger sticky collateral avoidance"
+            );
+        }
+
+        assert!(!pool_sticky_bound_key_ineligible_triggers_collateral_avoidance(&metadata(None)));
     }
 
     #[test]
