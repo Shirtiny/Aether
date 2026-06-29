@@ -59,6 +59,7 @@ export interface UsageRecordDetail {
   input_tokens: number
   effective_input_tokens?: number
   output_tokens: number
+  reasoning_output_tokens?: number
   total_tokens: number
   cost: number  // 官方费率
   actual_cost?: number  // 倍率消耗（仅管理员可见）
@@ -101,6 +102,7 @@ export interface ModelSummary {
   input_tokens: number
   effective_input_tokens?: number
   output_tokens: number
+  reasoning_output_tokens?: number
   total_tokens: number
   cache_read_tokens?: number
   cache_creation_tokens?: number
@@ -344,6 +346,7 @@ export const meApi = {
       input_tokens: number
       effective_input_tokens?: number | null
       output_tokens: number
+      reasoning_output_tokens?: number | null
       cache_creation_input_tokens?: number | null
       cache_creation_ephemeral_5m_input_tokens?: number | null
       cache_creation_ephemeral_1h_input_tokens?: number | null

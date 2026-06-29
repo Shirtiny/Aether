@@ -2249,10 +2249,6 @@ fn apply_standardized_usage_seed(usage: &StandardizedUsage, data: &mut UsageEven
 }
 
 fn apply_standardized_usage_dimensions_seed(usage: &StandardizedUsage, data: &mut UsageEventData) {
-    if usage.dimensions.is_empty() && usage.request_count <= 0 {
-        return;
-    }
-
     let mut dimensions = usage
         .dimensions
         .iter()
@@ -2262,6 +2258,13 @@ fn apply_standardized_usage_dimensions_seed(usage: &StandardizedUsage, data: &mu
         dimensions
             .entry("request_count".to_string())
             .or_insert_with(|| json!(usage.request_count));
+    }
+    let reasoning_output_tokens = standardized_usage_reasoning_output_tokens(usage);
+    if reasoning_output_tokens > 0 {
+        dimensions.insert(
+            "reasoning_output_tokens".to_string(),
+            json!(reasoning_output_tokens),
+        );
     }
     if dimensions.is_empty() {
         return;
@@ -2289,7 +2292,11 @@ fn standardized_usage_total_tokens(usage: &StandardizedUsage) -> u64 {
 
     positive_usage_component(usage.input_tokens)
         .saturating_add(positive_usage_component(usage.output_tokens))
-        .saturating_add(positive_usage_component(usage.reasoning_tokens))
+        .saturating_add(standardized_usage_reasoning_output_tokens(usage))
+}
+
+fn standardized_usage_reasoning_output_tokens(usage: &StandardizedUsage) -> u64 {
+    positive_usage_component(usage.reasoning_output_tokens.max(usage.reasoning_tokens))
 }
 
 fn standardized_usage_explicit_total_tokens(usage: &StandardizedUsage) -> Option<u64> {
@@ -3060,7 +3067,8 @@ fn extract_token_counts_from_json(value: &Value) -> Option<(u64, u64, u64)> {
             .and_then(Value::as_u64)
             .unwrap_or_default();
         let reasoning = usage
-            .get("reasoning_tokens")
+            .get("reasoning_output_tokens")
+            .or_else(|| usage.get("reasoning_tokens"))
             .and_then(Value::as_u64)
             .or_else(|| {
                 usage
@@ -3185,6 +3193,20 @@ mod tests {
         .expect("tokens should exist");
 
         assert_eq!(tokens, (3, 5, 8));
+    }
+
+    #[test]
+    fn extracts_openai_usage_tokens_with_reasoning_output_tokens() {
+        let tokens = extract_token_counts_from_json(&json!({
+            "usage": {
+                "input_tokens": 3,
+                "output_tokens": 5,
+                "reasoning_output_tokens": 516
+            }
+        }))
+        .expect("tokens should exist");
+
+        assert_eq!(tokens, (3, 5, 524));
     }
 
     #[test]

@@ -814,6 +814,9 @@ fn usage_sql_uses_json_null_placeholders_for_usage_payload_columns() {
         assert!(sql.contains("request_metadata->'client_session_affinity'->>'session_key'"));
         assert!(sql.contains("request_metadata->'client_session_affinity'->>'client_family'"));
         assert!(sql.contains("request_metadata->>'client_family'"));
+        assert!(sql.contains("'reasoning_output_tokens'"));
+        assert!(sql.contains("request_metadata->'dimensions'->>'reasoning_output_tokens'"));
+        assert!(sql.contains("request_metadata->'dimensions'->'reasoning_output_tokens'"));
         assert!(sql.contains("CAST(\"usage\".input_tokens AS INTEGER) AS input_tokens"));
         assert!(sql.contains(
             "usage_settlement_snapshots.billing_input_tokens AS settlement_billing_input_tokens"

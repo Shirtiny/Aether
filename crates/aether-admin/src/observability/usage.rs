@@ -1095,6 +1095,44 @@ fn admin_usage_metadata_string<'a>(
         .filter(|value| !value.is_empty())
 }
 
+fn admin_usage_value_as_u64(value: &Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_i64().and_then(|number| u64::try_from(number).ok()))
+        .or_else(|| {
+            value
+                .as_str()
+                .and_then(|text| text.trim().parse::<u64>().ok())
+        })
+        .filter(|value| *value > 0)
+}
+
+fn admin_usage_metadata_u64(item: &StoredRequestUsageAudit, key: &str) -> Option<u64> {
+    item.request_metadata
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|metadata| metadata.get(key))
+        .and_then(admin_usage_value_as_u64)
+}
+
+fn admin_usage_metadata_dimension_u64(item: &StoredRequestUsageAudit, key: &str) -> Option<u64> {
+    item.request_metadata
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|metadata| metadata.get("dimensions"))
+        .and_then(Value::as_object)
+        .and_then(|dimensions| dimensions.get(key))
+        .and_then(admin_usage_value_as_u64)
+}
+
+pub fn admin_usage_reasoning_output_tokens(item: &StoredRequestUsageAudit) -> u64 {
+    admin_usage_metadata_dimension_u64(item, "reasoning_output_tokens")
+        .or_else(|| admin_usage_metadata_dimension_u64(item, "reasoning_tokens"))
+        .or_else(|| admin_usage_metadata_u64(item, "reasoning_output_tokens"))
+        .or_else(|| admin_usage_metadata_u64(item, "reasoning_tokens"))
+        .unwrap_or(0)
+}
+
 fn infer_client_family_from_user_agent(user_agent: &str) -> Option<&'static str> {
     let normalized = user_agent.trim().to_ascii_lowercase();
     if normalized.is_empty() {
@@ -1224,6 +1262,7 @@ fn admin_usage_active_request_json(
         "input_tokens": item.input_tokens,
         "effective_input_tokens": admin_usage_effective_input_tokens(item),
         "output_tokens": item.output_tokens,
+        "reasoning_output_tokens": admin_usage_reasoning_output_tokens(item),
         "cache_creation_input_tokens": cache_creation_input_tokens,
         "cache_creation_ephemeral_5m_input_tokens": item.cache_creation_ephemeral_5m_input_tokens,
         "cache_creation_ephemeral_1h_input_tokens": item.cache_creation_ephemeral_1h_input_tokens,
@@ -1349,6 +1388,19 @@ pub fn admin_usage_record_json(
     let object = payload
         .as_object_mut()
         .expect("admin usage record payload should be an object");
+    object.insert(
+        "reasoning_output_tokens".to_string(),
+        json!(admin_usage_reasoning_output_tokens(item)),
+    );
+    object.insert(
+        "tokens".to_string(),
+        json!({
+            "input": admin_usage_effective_input_tokens(item),
+            "output": item.output_tokens,
+            "reasoning_output": admin_usage_reasoning_output_tokens(item),
+            "total": admin_usage_total_tokens(item),
+        }),
+    );
     object.insert("is_stream".to_string(), json!(item.is_stream));
     object.insert(
         UPSTREAM_IS_STREAM_KEY.to_string(),
@@ -1401,10 +1453,26 @@ pub fn admin_usage_record_json(
 }
 
 pub fn admin_usage_total_tokens(item: &StoredRequestUsageAudit) -> u64 {
-    admin_usage_effective_input_tokens(item)
+    let base_total = admin_usage_effective_input_tokens(item)
         .saturating_add(item.output_tokens)
         .saturating_add(admin_usage_cache_creation_tokens(item))
-        .saturating_add(item.cache_read_input_tokens)
+        .saturating_add(item.cache_read_input_tokens);
+    let reasoning_output_tokens = admin_usage_reasoning_output_tokens(item);
+    if reasoning_output_tokens == 0 {
+        return base_total;
+    }
+
+    let raw_total_without_reasoning = item
+        .input_tokens
+        .saturating_add(item.output_tokens)
+        .saturating_add(admin_usage_cache_creation_tokens(item))
+        .saturating_add(item.cache_read_input_tokens);
+    if item.total_tokens > raw_total_without_reasoning
+        && item.total_tokens <= raw_total_without_reasoning.saturating_add(reasoning_output_tokens)
+    {
+        return base_total.saturating_add(item.total_tokens - raw_total_without_reasoning);
+    }
+    base_total
 }
 
 pub fn admin_usage_cache_creation_tokens(item: &StoredRequestUsageAudit) -> u64 {
@@ -2559,7 +2627,8 @@ mod tests {
         admin_usage_active_request_json, admin_usage_client_is_stream, admin_usage_has_body_value,
         admin_usage_has_fallback, admin_usage_is_failed, admin_usage_is_ping,
         admin_usage_is_risk_control, admin_usage_is_success, admin_usage_matches_search,
-        admin_usage_matches_status, admin_usage_matches_username, admin_usage_record_json,
+        admin_usage_matches_status, admin_usage_matches_username,
+        admin_usage_reasoning_output_tokens, admin_usage_record_json,
         admin_usage_resolve_request_capture_body, admin_usage_total_tokens,
         admin_usage_upstream_is_stream, build_admin_usage_detail_payload,
     };
@@ -3502,6 +3571,59 @@ mod tests {
         assert_eq!(payload["output_price_per_1m"], 15.0);
         assert_eq!(payload["cache_creation_price_per_1m"], 3.75);
         assert_eq!(payload["cache_read_price_per_1m"], 0.30);
+    }
+
+    #[test]
+    fn admin_usage_record_exposes_reasoning_output_tokens_from_dimensions() {
+        let item = StoredRequestUsageAudit {
+            request_metadata: Some(json!({
+                "dimensions": {
+                    "reasoning_output_tokens": 516
+                }
+            })),
+            ..sample_usage("completed", Some(200), None)
+        };
+
+        let record = admin_usage_record_json(
+            &item,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            false,
+            false,
+            Some("primary"),
+        );
+        let active = admin_usage_active_request_json(&item, None, None, None);
+
+        assert_eq!(admin_usage_reasoning_output_tokens(&item), 516);
+        assert_eq!(record["reasoning_output_tokens"], 516);
+        assert_eq!(record["tokens"]["reasoning_output"], 516);
+        assert_eq!(record["total_tokens"], 30);
+        assert_eq!(active["reasoning_output_tokens"], 516);
+
+        let legacy_item = StoredRequestUsageAudit {
+            request_metadata: Some(json!({
+                "dimensions": {
+                    "reasoning_tokens": "1034"
+                }
+            })),
+            ..sample_usage("completed", Some(200), None)
+        };
+        assert_eq!(admin_usage_reasoning_output_tokens(&legacy_item), 1034);
+    }
+
+    #[test]
+    fn admin_usage_total_tokens_includes_hidden_reasoning_when_recorded_total_does() {
+        let item = StoredRequestUsageAudit {
+            total_tokens: 546,
+            request_metadata: Some(json!({
+                "dimensions": {
+                    "reasoning_output_tokens": 516
+                }
+            })),
+            ..sample_usage("completed", Some(200), None)
+        };
+
+        assert_eq!(admin_usage_total_tokens(&item), 546);
     }
 
     #[test]

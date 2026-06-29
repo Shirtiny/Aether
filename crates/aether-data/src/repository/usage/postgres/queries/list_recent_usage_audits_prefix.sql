@@ -134,6 +134,10 @@ SELECT
       END IS NOT NULL
       OR ("usage".request_metadata->>'client_requested_stream') IN ('true', 'false')
       OR ("usage".request_metadata->>'upstream_is_stream') IN ('true', 'false')
+      OR NULLIF(BTRIM("usage".request_metadata->>'reasoning_output_tokens'), '') IS NOT NULL
+      OR NULLIF(BTRIM("usage".request_metadata->>'reasoning_tokens'), '') IS NOT NULL
+      OR NULLIF(BTRIM("usage".request_metadata->'dimensions'->>'reasoning_output_tokens'), '') IS NOT NULL
+      OR NULLIF(BTRIM("usage".request_metadata->'dimensions'->>'reasoning_tokens'), '') IS NOT NULL
       THEN jsonb_strip_nulls(jsonb_build_object(
         'client_session_affinity',
         CASE
@@ -195,6 +199,22 @@ SELECT
         CASE
           WHEN ("usage".request_metadata->>'upstream_is_stream') IN ('true', 'false')
             THEN ("usage".request_metadata->>'upstream_is_stream')::boolean
+          ELSE NULL
+        END,
+        'reasoning_output_tokens',
+        "usage".request_metadata->'reasoning_output_tokens',
+        'reasoning_tokens',
+        "usage".request_metadata->'reasoning_tokens',
+        'dimensions',
+        CASE
+          WHEN NULLIF(BTRIM("usage".request_metadata->'dimensions'->>'reasoning_output_tokens'), '') IS NOT NULL
+            OR NULLIF(BTRIM("usage".request_metadata->'dimensions'->>'reasoning_tokens'), '') IS NOT NULL
+          THEN jsonb_strip_nulls(jsonb_build_object(
+            'reasoning_output_tokens',
+            "usage".request_metadata->'dimensions'->'reasoning_output_tokens',
+            'reasoning_tokens',
+            "usage".request_metadata->'dimensions'->'reasoning_tokens'
+          ))
           ELSE NULL
         END
       ))::json

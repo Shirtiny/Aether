@@ -158,6 +158,7 @@ import {
   getDateRangeFromPeriod
 } from '@/features/usage/composables'
 import { reconcileActiveRequestDiscovery } from '@/features/usage/utils/activeRequestDiscovery'
+import { mergePositiveTokenCount } from '@/features/usage/token-normalization'
 import {
   hasUsageFallback,
   isUsageRecordPing,
@@ -530,6 +531,7 @@ async function pollActiveRequests() {
         record.input_tokens = update.input_tokens
         record.effective_input_tokens = update.effective_input_tokens ?? record.effective_input_tokens
         record.output_tokens = update.output_tokens
+        record.reasoning_output_tokens = mergePositiveTokenCount(record.reasoning_output_tokens, update.reasoning_output_tokens)
         record.cache_creation_input_tokens = update.cache_creation_input_tokens ?? undefined
         record.cache_creation_ephemeral_5m_input_tokens =
           update.cache_creation_ephemeral_5m_input_tokens ?? undefined

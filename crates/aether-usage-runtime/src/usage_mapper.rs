@@ -28,6 +28,7 @@ impl UsageMapper {
 
         derive_missing_input_tokens(raw_usage, api_format, &mut usage);
         copy_explicit_total_tokens(raw_usage, api_format, &mut usage);
+        normalize_reasoning_output_tokens(&mut usage);
         usage.normalize_cache_creation_breakdown()
     }
 
@@ -121,6 +122,10 @@ fn base_mapping(api_format: &str) -> BTreeMap<String, String> {
             mapping.insert("input_tokens".to_string(), "input_tokens".to_string());
             mapping.insert("output_tokens".to_string(), "output_tokens".to_string());
             mapping.insert(
+                "reasoning_output_tokens".to_string(),
+                "reasoning_output_tokens".to_string(),
+            );
+            mapping.insert(
                 "cache_creation_input_tokens".to_string(),
                 "cache_creation_tokens".to_string(),
             );
@@ -188,6 +193,10 @@ fn base_mapping(api_format: &str) -> BTreeMap<String, String> {
             mapping.insert("input_tokens".to_string(), "input_tokens".to_string());
             mapping.insert("output_tokens".to_string(), "output_tokens".to_string());
             mapping.insert(
+                "reasoning_output_tokens".to_string(),
+                "reasoning_output_tokens".to_string(),
+            );
+            mapping.insert(
                 "cache_creation_input_tokens".to_string(),
                 "cache_creation_tokens".to_string(),
             );
@@ -208,6 +217,10 @@ fn base_mapping(api_format: &str) -> BTreeMap<String, String> {
             mapping.insert("input_tokens".to_string(), "input_tokens".to_string());
             mapping.insert("output_tokens".to_string(), "output_tokens".to_string());
             mapping.insert(
+                "reasoning_output_tokens".to_string(),
+                "reasoning_output_tokens".to_string(),
+            );
+            mapping.insert(
                 "cache_creation_input_tokens".to_string(),
                 "cache_creation_tokens".to_string(),
             );
@@ -218,6 +231,15 @@ fn base_mapping(api_format: &str) -> BTreeMap<String, String> {
         }
     }
     mapping
+}
+
+fn normalize_reasoning_output_tokens(usage: &mut StandardizedUsage) {
+    if usage.reasoning_output_tokens <= 0 && usage.reasoning_tokens > 0 {
+        usage.reasoning_output_tokens = usage.reasoning_tokens;
+    }
+    if usage.reasoning_tokens <= 0 && usage.reasoning_output_tokens > 0 {
+        usage.reasoning_tokens = usage.reasoning_output_tokens;
+    }
 }
 
 fn derive_missing_input_tokens(
@@ -341,6 +363,24 @@ mod tests {
         assert_eq!(usage.cache_creation_tokens, 1);
         assert_eq!(usage.cache_read_tokens, 2);
         assert_eq!(usage.reasoning_tokens, 3);
+        assert_eq!(usage.reasoning_output_tokens, 3);
+    }
+
+    #[test]
+    fn maps_codex_reasoning_output_tokens() {
+        let usage = map_usage(
+            &serde_json::json!({
+                "input_tokens": 12,
+                "output_tokens": 8,
+                "reasoning_output_tokens": 516
+            }),
+            "openai:responses",
+        );
+
+        assert_eq!(usage.input_tokens, 12);
+        assert_eq!(usage.output_tokens, 8);
+        assert_eq!(usage.reasoning_tokens, 516);
+        assert_eq!(usage.reasoning_output_tokens, 516);
     }
 
     #[test]
@@ -368,6 +408,7 @@ mod tests {
         assert_eq!(usage.cache_creation_tokens, 2);
         assert_eq!(usage.cache_read_tokens, 3);
         assert_eq!(usage.reasoning_tokens, 1);
+        assert_eq!(usage.reasoning_output_tokens, 1);
     }
 
     #[test]

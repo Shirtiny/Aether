@@ -14,6 +14,7 @@ import { createDefaultStats } from '../types'
 import { log } from '@/utils/logger'
 import { getErrorStatus } from '@/types/api-error'
 import { isUsageProviderVisible, normalizeUsageProviderStats } from '../utils/providerStats'
+import { mergePositiveTokenCount } from '../token-normalization'
 
 export interface UseUsageDataOptions {
   isAdminPage: Ref<boolean>
@@ -509,6 +510,7 @@ export function useUsageData(options: UseUsageDataOptions) {
             : existing.input_tokens,
           effective_input_tokens: record.effective_input_tokens ?? existing.effective_input_tokens,
           output_tokens: existing.output_tokens || record.output_tokens,
+          reasoning_output_tokens: mergePositiveTokenCount(existing.reasoning_output_tokens, record.reasoning_output_tokens),
           cache_creation_input_tokens: existing.cache_creation_input_tokens ?? record.cache_creation_input_tokens,
           cache_creation_ephemeral_5m_input_tokens:
             existing.cache_creation_ephemeral_5m_input_tokens

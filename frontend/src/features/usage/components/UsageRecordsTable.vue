@@ -391,10 +391,21 @@
           <span class="text-muted-foreground/40">·</span>
           <span
             class="min-w-0 truncate whitespace-nowrap tabular-nums text-foreground"
-            :title="hasRecordCacheTokens(record) ? getRecordCacheTokensTitle(record) : undefined"
+            :title="getRecordTokensTitle(record)"
           >
             <span class="text-muted-foreground">Tokens</span>
             <span class="ml-1">{{ formatTokens(getRecordEffectiveInputTokens(record)) }} / {{ formatTokens(record.output_tokens || 0) }}</span>
+            <template v-if="hasRecordReasoningOutputTokens(record)">
+              <span class="text-muted-foreground"> | </span>
+              <span>推理 {{ formatTokens(getRecordReasoningOutputTokens(record)) }}</span>
+              <Badge
+                v-if="isRecordReasoningDowngraded(record)"
+                variant="outline"
+                class="ml-1 h-4 px-1 text-[9px] leading-none text-amber-600 dark:text-amber-300"
+              >
+                降智
+              </Badge>
+            </template>
             <template v-if="hasRecordCacheTokens(record)">
               <span class="text-muted-foreground"> | </span>
               <span>{{ formatOptionalTokens(getRecordCacheReadTokens(record)) }} / {{ formatOptionalTokens(getRecordCacheCreationTokens(record)) }}</span>
@@ -1047,6 +1058,21 @@
                 {{ formatTokens(record.output_tokens || 0) }}
               </span>
             </div>
+            <div
+              v-if="hasRecordReasoningOutputTokens(record)"
+              class="mt-0.5 flex min-w-0 items-center justify-center gap-1 text-xs leading-tight tabular-nums text-muted-foreground"
+            >
+              <span class="whitespace-nowrap" :class="isRecordReasoningDowngraded(record) ? 'text-amber-600 dark:text-amber-300' : 'text-foreground/70'">
+                推理 {{ formatTokens(getRecordReasoningOutputTokens(record)) }}
+              </span>
+              <Badge
+                v-if="isRecordReasoningDowngraded(record)"
+                variant="outline"
+                class="h-4 px-1 text-[9px] leading-none text-amber-600 dark:text-amber-300"
+              >
+                降智
+              </Badge>
+            </div>
             <div class="mt-0.5 grid w-full min-w-0 grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] gap-x-1 text-xs leading-tight tabular-nums text-muted-foreground">
               <span
                 class="justify-self-end whitespace-nowrap text-right"
@@ -1190,7 +1216,7 @@ import {
 } from '@/components/ui'
 import { EyeOff, RefreshCcw, Search, Shuffle } from 'lucide-vue-next'
 import { formatTokens, formatCurrency } from '@/utils/format'
-import { getCacheCreationTokens, getCacheReadTokens, getEffectiveInputTokens } from '../token-normalization'
+import { getCacheCreationTokens, getCacheReadTokens, getEffectiveInputTokens, getReasoningOutputTokens, isDowngradedReasoningTokens } from '../token-normalization'
 import {
   formatOutputRate,
   formatOutputRateValue,
@@ -1644,6 +1670,18 @@ function getRecordCacheCreationTokens(record: UsageRecord): number {
   return getCacheCreationTokens(record)
 }
 
+function getRecordReasoningOutputTokens(record: UsageRecord): number {
+  return getReasoningOutputTokens(record)
+}
+
+function hasRecordReasoningOutputTokens(record: UsageRecord): boolean {
+  return hasPositiveTokens(getRecordReasoningOutputTokens(record))
+}
+
+function isRecordReasoningDowngraded(record: UsageRecord): boolean {
+  return isDowngradedReasoningTokens(getRecordReasoningOutputTokens(record))
+}
+
 function hasPositiveTokens(value: number | null | undefined): boolean {
   return typeof value === 'number' && Number.isFinite(value) && value > 0
 }
@@ -1656,8 +1694,11 @@ function hasRecordCacheTokens(record: UsageRecord): boolean {
   return hasPositiveTokens(getRecordCacheReadTokens(record)) || hasPositiveTokens(getRecordCacheCreationTokens(record))
 }
 
-function getRecordCacheTokensTitle(record: UsageRecord): string {
+function getRecordTokensTitle(record: UsageRecord): string {
   return [
+    `输入: ${formatTokens(getRecordEffectiveInputTokens(record))}`,
+    `输出: ${formatTokens(record.output_tokens || 0)}`,
+    `推理输出: ${formatOptionalTokens(getRecordReasoningOutputTokens(record))}${isRecordReasoningDowngraded(record) ? '（降智）' : ''}`,
     `缓存读取: ${formatOptionalTokens(getRecordCacheReadTokens(record))}`,
     `缓存写入: ${formatOptionalTokens(getRecordCacheCreationTokens(record))}`,
   ].join('\n')

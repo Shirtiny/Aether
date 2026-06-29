@@ -19,6 +19,7 @@ export interface UsageRecord {
   input_tokens: number
   effective_input_tokens?: number
   output_tokens: number
+  reasoning_output_tokens?: number
   cache_creation_input_tokens?: number
   cache_creation_ephemeral_5m_input_tokens?: number
   cache_creation_ephemeral_1h_input_tokens?: number
@@ -511,6 +512,7 @@ export const usageApi = {
       input_tokens: number
       effective_input_tokens?: number | null
       output_tokens: number
+      reasoning_output_tokens?: number | null
       cache_creation_input_tokens?: number | null
       cache_creation_ephemeral_5m_input_tokens?: number | null
       cache_creation_ephemeral_1h_input_tokens?: number | null

@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use aether_admin::observability::usage::{admin_usage_is_ping, admin_usage_is_risk_control};
+use aether_admin::observability::usage::{
+    admin_usage_is_ping, admin_usage_is_risk_control, admin_usage_reasoning_output_tokens,
+};
 use aether_ai_serving::UPSTREAM_IS_STREAM_KEY;
 use aether_billing::{
     normalize_input_tokens_for_billing, normalize_total_input_context_for_cache_hit_rate,
@@ -468,6 +470,7 @@ fn build_users_me_usage_record_payload(
     let rate_multiplier = item.settlement_rate_multiplier();
     let client_is_stream = users_me_usage_client_is_stream(item);
     let upstream_is_stream = users_me_usage_upstream_is_stream(item);
+    let reasoning_output_tokens = admin_usage_reasoning_output_tokens(item);
     let mut payload = json!({
         "id": item.id,
         "model": item.model,
@@ -478,6 +481,7 @@ fn build_users_me_usage_record_payload(
         "input_tokens": item.input_tokens,
         "effective_input_tokens": users_me_usage_effective_input_tokens(item),
         "output_tokens": item.output_tokens,
+        "reasoning_output_tokens": reasoning_output_tokens,
         "total_tokens": item.total_tokens,
         "cost": round_to(item.total_cost_usd, 6),
         "response_time_ms": item.response_time_ms,
@@ -534,12 +538,14 @@ fn build_users_me_usage_active_payload(item: &StoredRequestUsageAudit) -> serde_
     let cache_creation_input_tokens = users_me_usage_cache_creation_tokens(item);
     let client_is_stream = users_me_usage_client_is_stream(item);
     let upstream_is_stream = users_me_usage_upstream_is_stream(item);
+    let reasoning_output_tokens = admin_usage_reasoning_output_tokens(item);
     let mut payload = json!({
         "id": item.id,
         "status": item.status,
         "input_tokens": item.input_tokens,
         "effective_input_tokens": users_me_usage_effective_input_tokens(item),
         "output_tokens": item.output_tokens,
+        "reasoning_output_tokens": reasoning_output_tokens,
         "cache_creation_input_tokens": cache_creation_input_tokens,
         "cache_creation_ephemeral_5m_input_tokens": item.cache_creation_ephemeral_5m_input_tokens,
         "cache_creation_ephemeral_1h_input_tokens": item.cache_creation_ephemeral_1h_input_tokens,
@@ -1491,6 +1497,25 @@ mod tests {
         assert_eq!(payload["cache_creation_input_tokens"], 10);
         assert_eq!(payload["cache_creation_ephemeral_5m_input_tokens"], 4);
         assert_eq!(payload["cache_creation_ephemeral_1h_input_tokens"], 6);
+    }
+
+    #[test]
+    fn user_usage_payloads_include_reasoning_output_tokens() {
+        let item = StoredRequestUsageAudit {
+            request_metadata: Some(json!({
+                "dimensions": {
+                    "reasoning_output_tokens": 516
+                }
+            })),
+            ..sample_usage("streaming")
+        };
+
+        let record_payload =
+            build_users_me_usage_record_payload(&item, false, &BTreeMap::new(), false);
+        let active_payload = build_users_me_usage_active_payload(&item);
+
+        assert_eq!(record_payload["reasoning_output_tokens"], 516);
+        assert_eq!(active_payload["reasoning_output_tokens"], 516);
     }
 
     #[test]

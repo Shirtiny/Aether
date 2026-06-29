@@ -13,6 +13,8 @@ pub struct StandardizedUsage {
     pub cache_creation_ephemeral_1h_tokens: i64,
     pub cache_read_tokens: i64,
     pub reasoning_tokens: i64,
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub reasoning_output_tokens: i64,
     pub cache_storage_token_hours: f64,
     pub request_count: i64,
     pub dimensions: BTreeMap<String, serde_json::Value>,
@@ -39,6 +41,7 @@ impl StandardizedUsage {
             }
             "cache_read_tokens" => Some(serde_json::json!(self.cache_read_tokens)),
             "reasoning_tokens" => Some(serde_json::json!(self.reasoning_tokens)),
+            "reasoning_output_tokens" => Some(serde_json::json!(self.reasoning_output_tokens)),
             "cache_storage_token_hours" => Some(serde_json::json!(self.cache_storage_token_hours)),
             "request_count" => Some(serde_json::json!(self.request_count)),
             "extra" | "dimensions" => Some(serde_json::json!(self.dimensions)),
@@ -59,7 +62,18 @@ impl StandardizedUsage {
                 self.cache_creation_ephemeral_1h_tokens = as_i64(&value, 0)
             }
             "cache_read_tokens" => self.cache_read_tokens = as_i64(&value, 0),
-            "reasoning_tokens" => self.reasoning_tokens = as_i64(&value, 0),
+            "reasoning_tokens" => {
+                self.reasoning_tokens = as_i64(&value, 0);
+                if self.reasoning_output_tokens <= 0 {
+                    self.reasoning_output_tokens = self.reasoning_tokens;
+                }
+            }
+            "reasoning_output_tokens" => {
+                self.reasoning_output_tokens = as_i64(&value, 0);
+                if self.reasoning_tokens <= 0 {
+                    self.reasoning_tokens = self.reasoning_output_tokens;
+                }
+            }
             "cache_storage_token_hours" => self.cache_storage_token_hours = as_f64(&value, 0.0),
             "request_count" => self.request_count = as_i64(&value, 0),
             "extra" | "dimensions" => {
@@ -94,7 +108,7 @@ impl StandardizedUsage {
             self.cache_creation_ephemeral_5m_tokens,
             self.cache_creation_ephemeral_1h_tokens,
             self.cache_read_tokens,
-            self.reasoning_tokens,
+            self.reasoning_tokens.max(self.reasoning_output_tokens),
         ]
         .into_iter()
         .filter(|value| *value > 0)
@@ -141,6 +155,10 @@ pub struct ExecutionStreamTerminalSummary {
 }
 
 fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
+fn is_zero_i64(value: &i64) -> bool {
     *value == 0
 }
 
@@ -193,9 +211,15 @@ mod tests {
     fn standardized_usage_reads_and_writes_known_and_extra_fields() {
         let mut usage = StandardizedUsage::new();
         usage.set("input_tokens", 10);
+        usage.set("reasoning_output_tokens", 516);
         usage.set("custom_dimension", "value");
 
         assert_eq!(usage.get("input_tokens"), Some(serde_json::json!(10)));
+        assert_eq!(
+            usage.get("reasoning_output_tokens"),
+            Some(serde_json::json!(516))
+        );
+        assert_eq!(usage.get("reasoning_tokens"), Some(serde_json::json!(516)));
         assert_eq!(
             usage.get("custom_dimension"),
             Some(serde_json::json!("value"))
