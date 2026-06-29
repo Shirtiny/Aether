@@ -1095,6 +1095,7 @@ async fn gateway_pool_list_reads_materialized_codex_cycle_usage_from_quota_windo
     );
     usage_key.name = "codex cycle usage".to_string();
     usage_key.auth_type = "oauth".to_string();
+    usage_key.concurrent_limit = Some(4);
     usage_key.request_count = Some(4);
     usage_key.total_tokens = 999;
     usage_key.total_cost_usd = 9.99;
@@ -1278,6 +1279,7 @@ async fn gateway_pool_list_reads_materialized_codex_cycle_usage_from_quota_windo
         json!("0.60000000")
     );
     assert_eq!(usage_key_payload["request_count"], json!(4));
+    assert_eq!(usage_key_payload["concurrent_limit"], json!(4));
     assert_eq!(usage_key_payload["total_tokens"], json!(999));
     assert_eq!(usage_key_payload["total_cost_usd"], json!("9.99000000"));
 
