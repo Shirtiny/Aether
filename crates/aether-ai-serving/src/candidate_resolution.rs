@@ -186,6 +186,10 @@ where
 }
 
 pub fn extract_ai_pool_sticky_session_token(body_json: &serde_json::Value) -> Option<String> {
+    const CODEX_TURN_METADATA_KEY: &str = "x-codex-turn-metadata";
+    const CODEX_INSTALLATION_ID_KEY: &str = "x-codex-installation-id";
+    const CODEX_WINDOW_ID_KEY: &str = "x-codex-window-id";
+
     fn non_empty_str(value: Option<&serde_json::Value>) -> Option<&str> {
         value
             .and_then(serde_json::Value::as_str)
@@ -202,37 +206,69 @@ pub fn extract_ai_pool_sticky_session_token(body_json: &serde_json::Value) -> Op
             .map(ToOwned::to_owned)
     }
 
+    fn codex_session_from_turn_metadata(value: Option<&serde_json::Value>) -> Option<String> {
+        let decoded = serde_json::from_str::<serde_json::Value>(non_empty_str(value)?).ok()?;
+        non_empty_str(decoded.get("session_id"))
+            .or_else(|| non_empty_str(decoded.get("thread_id")))
+            .map(ToOwned::to_owned)
+    }
+
+    fn codex_session_from_client_metadata(
+        value: Option<&serde_json::Value>,
+        turn_metadata_key: &str,
+        installation_id_key: &str,
+        window_id_key: &str,
+    ) -> Option<String> {
+        let metadata = value?.as_object()?;
+        codex_session_from_turn_metadata(metadata.get(turn_metadata_key)).or_else(|| {
+            let has_codex_metadata = metadata.contains_key(turn_metadata_key)
+                || metadata.contains_key(installation_id_key)
+                || metadata.contains_key(window_id_key);
+            if !has_codex_metadata {
+                return None;
+            }
+            non_empty_str(metadata.get("session_id"))
+                .or_else(|| non_empty_str(metadata.get("thread_id")))
+                .map(ToOwned::to_owned)
+        })
+    }
+
     let object = body_json.as_object()?;
 
-    non_empty_str(object.get("prompt_cache_key"))
-        .map(ToOwned::to_owned)
-        .or_else(|| non_empty_str(object.get("conversation_id")).map(ToOwned::to_owned))
-        .or_else(|| non_empty_str(object.get("conversationId")).map(ToOwned::to_owned))
-        .or_else(|| non_empty_str(object.get("session_id")).map(ToOwned::to_owned))
-        .or_else(|| non_empty_str(object.get("sessionId")).map(ToOwned::to_owned))
-        .or_else(|| {
-            object
-                .get("metadata")
-                .and_then(serde_json::Value::as_object)
-                .and_then(|metadata| {
-                    non_empty_str(metadata.get("session_id"))
-                        .or_else(|| non_empty_str(metadata.get("sessionId")))
-                        .or_else(|| non_empty_str(metadata.get("conversation_id")))
-                        .or_else(|| non_empty_str(metadata.get("conversationId")))
-                        .map(ToOwned::to_owned)
-                        .or_else(|| session_from_json_string(metadata.get("user_id")))
-                })
-        })
-        .or_else(|| {
-            object
-                .get("conversationState")
-                .and_then(serde_json::Value::as_object)
-                .and_then(|state| {
-                    non_empty_str(state.get("conversationId"))
-                        .or_else(|| non_empty_str(state.get("sessionId")))
-                        .map(ToOwned::to_owned)
-                })
-        })
+    codex_session_from_client_metadata(
+        object.get("client_metadata"),
+        CODEX_TURN_METADATA_KEY,
+        CODEX_INSTALLATION_ID_KEY,
+        CODEX_WINDOW_ID_KEY,
+    )
+    .or_else(|| non_empty_str(object.get("prompt_cache_key")).map(ToOwned::to_owned))
+    .or_else(|| non_empty_str(object.get("conversation_id")).map(ToOwned::to_owned))
+    .or_else(|| non_empty_str(object.get("conversationId")).map(ToOwned::to_owned))
+    .or_else(|| non_empty_str(object.get("session_id")).map(ToOwned::to_owned))
+    .or_else(|| non_empty_str(object.get("sessionId")).map(ToOwned::to_owned))
+    .or_else(|| {
+        object
+            .get("metadata")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|metadata| {
+                non_empty_str(metadata.get("session_id"))
+                    .or_else(|| non_empty_str(metadata.get("sessionId")))
+                    .or_else(|| non_empty_str(metadata.get("conversation_id")))
+                    .or_else(|| non_empty_str(metadata.get("conversationId")))
+                    .map(ToOwned::to_owned)
+                    .or_else(|| session_from_json_string(metadata.get("user_id")))
+            })
+    })
+    .or_else(|| {
+        object
+            .get("conversationState")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|state| {
+                non_empty_str(state.get("conversationId"))
+                    .or_else(|| non_empty_str(state.get("sessionId")))
+                    .map(ToOwned::to_owned)
+            })
+    })
 }
 
 #[cfg(test)]
@@ -476,6 +512,38 @@ mod tests {
             }))
             .as_deref(),
             Some("session-e")
+        );
+    }
+
+    #[test]
+    fn sticky_session_token_prefers_codex_client_metadata_over_prompt_cache_key() {
+        assert_eq!(
+            extract_ai_pool_sticky_session_token(&json!({
+                "prompt_cache_key": "guardian:root-from-cache",
+                "client_metadata": {
+                    "x-codex-turn-metadata": serde_json::to_string(&json!({
+                        "session_id": "root-from-metadata",
+                        "thread_id": "thread-from-metadata"
+                    })).unwrap()
+                }
+            }))
+            .as_deref(),
+            Some("root-from-metadata")
+        );
+    }
+
+    #[test]
+    fn sticky_session_token_uses_codex_thread_when_session_is_missing() {
+        assert_eq!(
+            extract_ai_pool_sticky_session_token(&json!({
+                "prompt_cache_key": "cache-session",
+                "client_metadata": {
+                    "x-codex-window-id": "thread-from-flat:1",
+                    "thread_id": "thread-from-flat"
+                }
+            }))
+            .as_deref(),
+            Some("thread-from-flat")
         );
     }
 

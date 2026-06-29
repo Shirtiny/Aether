@@ -19,11 +19,11 @@ Aether stores per-request TLS capture under `usage.request_metadata.tls_fingerpr
       "source": "aether_transport_config",
       "observed": false,
       "transport_path": "direct",
-      "backend": "reqwest_rustls",
+      "backend": "reqwest_default_tls",
       "http_mode": "auto",
-      "tls_stack": "rustls",
-      "tls_versions_offered": ["TLS1.3", "TLS1.2"],
-      "alpn_offered": ["h2", "http/1.1"]
+      "tls_stack": "native_tls",
+      "tls_versions_offered": ["native_tls_default"],
+      "alpn_offered": []
     }
   }
 }
@@ -31,7 +31,134 @@ Aether stores per-request TLS capture under `usage.request_metadata.tls_fingerpr
 
 `incoming` is the client-to-Aether TLS fingerprint. It can be populated by Aether native TLS capture in direct deployments or by trusted reverse-proxy headers when TLS terminates before Aether.
 
-`outgoing` is the Aether-to-provider TLS transport record. The current gateway records the exact transport configuration it controls. It sets `observed: false` because reqwest/rustls does not expose the emitted ClientHello bytes on the direct path. A future connector-level ClientHello capture or probe result can reuse the same object with `observed: true` plus `ja3`, `ja3_hash`, and `ja4`.
+`outgoing` is the Aether-to-provider TLS transport record. The current gateway records the exact transport configuration it controls. It sets `observed: false` because the normal execution path does not expose emitted ClientHello bytes inline. Capture/probe results can reuse the same object shape with `observed: true` plus `ja3`, `ja3_hash`, and `ja4`.
+
+## Strict Codex Comparison
+
+Use `tools/tls-clienthello-capture.py` to compare normalized ClientHello structure, not raw TLS record bytes. Raw ClientHello bytes contain connection randomness and key-share material, so byte-for-byte equality is not a useful contract.
+
+The comparison currently checks:
+
+- TLS record and legacy ClientHello versions
+- cipher suite list/order with GREASE removed
+- extension list/order with GREASE removed
+- supported TLS versions
+- supported groups
+- EC point formats
+- signature algorithms
+- ALPN
+- JA3 string and hash
+
+Capture official installed Codex CLI against the local listener:
+
+```bash
+python3 tools/tls-clienthello-capture.py capture \
+  --timeout 40 \
+  --out /tmp/official-codex-clienthello.json \
+  -- \
+  codex exec \
+    --ignore-user-config \
+    --skip-git-repo-check \
+    --ephemeral \
+    -c model_provider="capture" \
+    -c model="gpt-5" \
+    -c model_providers.capture.name="capture" \
+    -c model_providers.capture.base_url='"{url}/v1"' \
+    -c model_providers.capture.wire_api="responses" \
+    -c model_providers.capture.requires_openai_auth=false \
+    -c model_providers.capture.experimental_bearer_token="dummy" \
+    -c model_providers.capture.request_max_retries=0 \
+    -c model_providers.capture.stream_max_retries=0 \
+    "Say hi"
+```
+
+Capture Aether's legacy explicit rustls profile:
+
+```bash
+cargo build --manifest-path tools/tls-profile-probe/Cargo.toml
+
+python3 tools/tls-clienthello-capture.py capture \
+  --timeout 30 \
+  --out /tmp/aether-current-rustls-clienthello.json \
+  -- \
+  tools/tls-profile-probe/target/debug/tls-profile-probe \
+    aether-current-rustls \
+    {url}
+```
+
+Capture Aether's Codex default TLS profile:
+
+```bash
+python3 tools/tls-clienthello-capture.py capture \
+  --timeout 30 \
+  --out /tmp/aether-codex-default-tls-vendored-clienthello.json \
+  -- \
+  tools/tls-profile-probe/target/debug/tls-profile-probe \
+    aether-codex-default-tls \
+    {url}
+```
+
+Capture the tunnel native-TLS connector shape:
+
+```bash
+python3 tools/tls-clienthello-capture.py capture \
+  --timeout 30 \
+  --out /tmp/aether-tunnel-native-tls-clienthello.json \
+  -- \
+  tools/tls-profile-probe/target/debug/tls-profile-probe \
+    aether-tunnel-native-tls \
+    {url}
+```
+
+Compare the official capture with the legacy rustls capture:
+
+```bash
+python3 tools/tls-clienthello-capture.py compare \
+  /tmp/official-codex-clienthello.json \
+  /tmp/aether-current-rustls-clienthello.json
+```
+
+Observed result on 2026-06-28:
+
+- official installed Codex CLI JA3 hash: `23211f2b48104c7030b93680a2efcfd0`
+- Aether legacy explicit rustls profile JA3 hash: `15a7254eddf31f45dc492932457ebcef`
+- comparison result: `MISMATCH`
+
+The main differences were cipher suites, extension ordering, supported groups, signature algorithms, and ALPN. Therefore the legacy `codex-reqwest-rustls-auto` profile is stable and observable, but it is not strict ordinary Codex CLI TLS equivalence.
+
+Compare the official capture with the Codex default TLS capture:
+
+```bash
+python3 tools/tls-clienthello-capture.py compare \
+  /tmp/official-codex-clienthello.json \
+  /tmp/aether-codex-default-tls-vendored-clienthello.json
+```
+
+Observed result on 2026-06-28:
+
+- Aether Codex default TLS profile JA3 hash: `23211f2b48104c7030b93680a2efcfd0`
+- comparison result: `MATCH`
+
+Compare the official capture with the tunnel native-TLS connector capture:
+
+```bash
+python3 tools/tls-clienthello-capture.py compare \
+  /tmp/official-codex-clienthello.json \
+  /tmp/aether-tunnel-native-tls-clienthello.json
+```
+
+Observed result on 2026-06-28:
+
+- Aether tunnel native-TLS connector JA3 hash: `23211f2b48104c7030b93680a2efcfd0`
+- comparison result: `MATCH`
+
+Strict matching required reqwest 0.12 default/native TLS with vendored OpenSSL. The same reqwest default TLS path backed by the host system OpenSSL was close but still different: it produced JA3 hash `2617ff3a2d7f879546f0aac7afc5f15c`, with a different extension/EC point-format shape. Keep `native-tls-vendored` enabled for strict Codex CLI equivalence on this Linux build.
+
+Aether also links `wreq` for browser-style transport profiles. Because `wreq` brings BoringSSL and Codex default TLS brings vendored OpenSSL, keep `wreq/prefix-symbols` enabled. Without it, test binaries that include both stacks can fail to link with duplicate crypto symbols.
+
+Profile-level Codex transport records persist the expected normalized fingerprint under `fingerprint.transport_profile.extra.tls_fingerprint`. Codex account profiles also persist `codex_client_profile.transport_tls_fingerprint_hash`, and include it in `codex_client_profile.fingerprint_hash`. Usage metadata copies the expected transport fingerprint to `tls_fingerprint.outgoing.expected` when a plan carries that profile. Runtime request metadata is still marked `observed: false` unless a packet capture/probe supplied the actual ClientHello bytes for that request.
+
+Keep the target shape fixed when comparing. An IP target normally has no SNI; a DNS target can add SNI. HTTP/2/ALPN configuration changes ClientHello. Proxy/tunnel routing must use the same selected transport backend; otherwise the route can replace the actual upstream TLS stack.
 
 ## Nginx TLS Termination
 

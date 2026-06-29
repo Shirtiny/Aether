@@ -47,7 +47,7 @@ pub(crate) fn has_explicit_update_proxy_env() -> bool {
 }
 
 fn base_update_http_client_builder(timeout: Duration) -> reqwest::ClientBuilder {
-    reqwest::Client::builder().timeout(timeout)
+    reqwest::Client::builder().use_rustls_tls().timeout(timeout)
 }
 
 fn update_proxy_url_from_env() -> Option<String> {

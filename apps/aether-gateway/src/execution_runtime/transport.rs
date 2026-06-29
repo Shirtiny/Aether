@@ -9,8 +9,8 @@ use aether_contracts::{
     ExecutionPlan, ExecutionResult, ExecutionTelemetry, ProxySnapshot, ResolvedTransportProfile,
     ResponseBody, EXECUTION_REQUEST_ACCEPT_INVALID_CERTS_HEADER,
     EXECUTION_REQUEST_FOLLOW_REDIRECTS_HEADER, EXECUTION_REQUEST_HTTP1_ONLY_HEADER,
-    TRANSPORT_BACKEND_BROWSER_WREQ, TRANSPORT_BACKEND_REQWEST_RUSTLS,
-    TRANSPORT_HTTP_MODE_HTTP1_ONLY,
+    TRANSPORT_BACKEND_BROWSER_WREQ, TRANSPORT_BACKEND_REQWEST_DEFAULT_TLS,
+    TRANSPORT_BACKEND_REQWEST_RUSTLS, TRANSPORT_HTTP_MODE_HTTP1_ONLY,
 };
 use aether_data::repository::proxy_nodes::ProxyNodeTrafficMutation;
 use aether_http::{apply_http_client_config, HttpClientConfig};
@@ -1126,7 +1126,6 @@ fn build_relay_client(
         reqwest::Client::builder(),
         &HttpClientConfig {
             connect_timeout_ms: timeouts.and_then(|timeouts| timeouts.connect_ms),
-            use_rustls_tls: false,
             ..HttpClientConfig::default()
         },
     );
@@ -1363,6 +1362,7 @@ fn build_client(
         builder,
         &HttpClientConfig {
             connect_timeout_ms: timeouts.and_then(|timeouts| timeouts.connect_ms),
+            use_rustls_tls: false,
             ..HttpClientConfig::default()
         },
     );
@@ -1479,10 +1479,9 @@ fn validate_reqwest_transport_profile(
     let Some(profile) = transport_profile else {
         return Ok(());
     };
-    if profile
-        .backend
-        .trim()
-        .eq_ignore_ascii_case(TRANSPORT_BACKEND_REQWEST_RUSTLS)
+    let backend = profile.backend.trim();
+    if backend.eq_ignore_ascii_case(TRANSPORT_BACKEND_REQWEST_RUSTLS)
+        || backend.eq_ignore_ascii_case(TRANSPORT_BACKEND_REQWEST_DEFAULT_TLS)
     {
         return Ok(());
     }
@@ -1556,17 +1555,47 @@ fn apply_transport_profile(
     builder: reqwest::ClientBuilder,
     transport_profile: Option<&ResolvedTransportProfile>,
 ) -> reqwest::ClientBuilder {
-    let Some(profile) = transport_profile else {
-        return builder;
-    };
-    let profile_id = profile.profile_id.trim();
-    if profile_id.is_empty() {
-        return builder;
+    match reqwest_tls_backend_for_transport_profile(transport_profile) {
+        ReqwestTlsBackend::DefaultNative => builder,
+        ReqwestTlsBackend::Rustls => {
+            let Some(profile) = transport_profile else {
+                return builder.use_rustls_tls();
+            };
+            let profile_id = profile.profile_id.trim();
+            if profile_id.is_empty() {
+                return builder.use_rustls_tls();
+            }
+
+            let _ = rustls::crypto::ring::default_provider().install_default();
+
+            builder.use_preconfigured_tls(build_best_effort_transport_tls_config())
+        }
     }
+}
 
-    let _ = rustls::crypto::ring::default_provider().install_default();
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReqwestTlsBackend {
+    Rustls,
+    DefaultNative,
+}
 
-    builder.use_preconfigured_tls(build_best_effort_transport_tls_config())
+fn reqwest_tls_backend_for_transport_profile(
+    transport_profile: Option<&ResolvedTransportProfile>,
+) -> ReqwestTlsBackend {
+    let Some(profile) = transport_profile else {
+        return ReqwestTlsBackend::Rustls;
+    };
+    if profile.profile_id.trim().is_empty() {
+        return ReqwestTlsBackend::Rustls;
+    }
+    if profile
+        .backend
+        .trim()
+        .eq_ignore_ascii_case(TRANSPORT_BACKEND_REQWEST_DEFAULT_TLS)
+    {
+        return ReqwestTlsBackend::DefaultNative;
+    }
+    ReqwestTlsBackend::Rustls
 }
 
 fn build_best_effort_transport_tls_config() -> rustls::ClientConfig {
@@ -1844,7 +1873,8 @@ mod tests {
     use aether_contracts::{
         ExecutionPlan, ExecutionTimeouts, ProxySnapshot, RequestBody, ResolvedTransportProfile,
         EXECUTION_REQUEST_FOLLOW_REDIRECTS_HEADER, EXECUTION_REQUEST_HTTP1_ONLY_HEADER,
-        TRANSPORT_BACKEND_BROWSER_WREQ, TRANSPORT_BACKEND_REQWEST_RUSTLS,
+        TRANSPORT_BACKEND_BROWSER_WREQ, TRANSPORT_BACKEND_REQWEST_DEFAULT_TLS,
+        TRANSPORT_BACKEND_REQWEST_RUSTLS,
     };
     use aether_data::repository::proxy_nodes::{
         InMemoryProxyNodeRepository, ProxyNodeReadRepository, StoredProxyNode,
@@ -3623,6 +3653,53 @@ mod tests {
             ExecutionRuntimeTransportError::UnsupportedTransportProfile(backend)
                 if backend == "utls"
         ));
+    }
+
+    #[test]
+    fn reqwest_transport_profile_selects_default_tls_only_for_explicit_backend() {
+        assert_eq!(
+            super::reqwest_tls_backend_for_transport_profile(None),
+            super::ReqwestTlsBackend::Rustls
+        );
+
+        let empty_profile = ResolvedTransportProfile {
+            profile_id: "".into(),
+            backend: TRANSPORT_BACKEND_REQWEST_DEFAULT_TLS.into(),
+            http_mode: "auto".into(),
+            pool_scope: "key".into(),
+            header_fingerprint: None,
+            extra: None,
+        };
+        assert_eq!(
+            super::reqwest_tls_backend_for_transport_profile(Some(&empty_profile)),
+            super::ReqwestTlsBackend::Rustls
+        );
+
+        let default_tls_profile = ResolvedTransportProfile {
+            profile_id: "codex-reqwest-default-tls-auto".into(),
+            backend: TRANSPORT_BACKEND_REQWEST_DEFAULT_TLS.into(),
+            http_mode: "auto".into(),
+            pool_scope: "key".into(),
+            header_fingerprint: None,
+            extra: None,
+        };
+        assert_eq!(
+            super::reqwest_tls_backend_for_transport_profile(Some(&default_tls_profile)),
+            super::ReqwestTlsBackend::DefaultNative
+        );
+
+        let rustls_profile = ResolvedTransportProfile {
+            profile_id: "codex-reqwest-rustls-auto".into(),
+            backend: TRANSPORT_BACKEND_REQWEST_RUSTLS.into(),
+            http_mode: "auto".into(),
+            pool_scope: "key".into(),
+            header_fingerprint: None,
+            extra: None,
+        };
+        assert_eq!(
+            super::reqwest_tls_backend_for_transport_profile(Some(&rustls_profile)),
+            super::ReqwestTlsBackend::Rustls
+        );
     }
 
     #[test]

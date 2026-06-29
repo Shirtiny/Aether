@@ -134,12 +134,14 @@ pub(crate) async fn build_admin_create_provider_key_record(
         _ => None,
     };
 
-    let encrypted_auth_config = auth_config
+    let auth_config_raw = auth_config
         .as_ref()
         .map(serde_json::to_string)
         .transpose()
-        .map_err(|err| err.to_string())?
-        .and_then(|plaintext| encrypt_catalog_secret_with_fallbacks(state, &plaintext));
+        .map_err(|err| err.to_string())?;
+    let encrypted_auth_config = auth_config_raw
+        .as_ref()
+        .and_then(|plaintext| encrypt_catalog_secret_with_fallbacks(state, plaintext));
 
     let now_unix_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -148,8 +150,22 @@ pub(crate) async fn build_admin_create_provider_key_record(
         .unwrap_or(0);
     let inherits_provider_api_formats =
         auth_type == "oauth" && provider_type_is_fixed(&provider.provider_type);
+    let key_id = Uuid::new_v4().to_string();
+    let normalized_fingerprint = normalize_json_object(payload.fingerprint, "fingerprint")?;
+    let materialized_fingerprint = crate::ai_serving::materialize_codex_pool_key_fingerprint(
+        provider.provider_type.as_str(),
+        provider.config.as_ref(),
+        normalized_fingerprint.as_ref(),
+        auth_config_raw.as_deref(),
+        key_id.as_str(),
+        name,
+        now_unix_secs,
+    )
+    .map(|outcome| outcome.fingerprint)
+    .or(normalized_fingerprint);
+
     let mut key = StoredProviderCatalogKey::new(
-        Uuid::new_v4().to_string(),
+        key_id,
         provider.id.clone(),
         name.to_string(),
         auth_type,
@@ -170,7 +186,7 @@ pub(crate) async fn build_admin_create_provider_key_record(
         normalize_string_list(payload.allowed_models).map(|value| json!(value)),
         None,
         None,
-        normalize_json_object(payload.fingerprint, "fingerprint")?,
+        materialized_fingerprint,
     )
     .map_err(|err| err.to_string())?;
     key.note = payload

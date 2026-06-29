@@ -6,7 +6,8 @@ use aether_ai_formats::api::{
 };
 use aether_contracts::{
     ExecutionTimeouts, ProxySnapshot, ResolvedTransportProfile, TRANSPORT_BACKEND_HYPER_RUSTLS,
-    TRANSPORT_BACKEND_REQWEST_RUSTLS, TRANSPORT_HTTP_MODE_HTTP1_ONLY,
+    TRANSPORT_BACKEND_REQWEST_DEFAULT_TLS, TRANSPORT_BACKEND_REQWEST_RUSTLS,
+    TRANSPORT_HTTP_MODE_HTTP1_ONLY,
 };
 use serde_json::{json, Map, Value};
 
@@ -142,7 +143,11 @@ fn outgoing_tls_fingerprint_value(
         .map(|profile| profile.http_mode.trim())
         .filter(|value| !value.is_empty())
         .unwrap_or("auto");
-    let alpn_offered = if http_mode.eq_ignore_ascii_case(TRANSPORT_HTTP_MODE_HTTP1_ONLY) {
+    let backend_is_default_tls =
+        backend.eq_ignore_ascii_case(TRANSPORT_BACKEND_REQWEST_DEFAULT_TLS);
+    let alpn_offered = if backend_is_default_tls {
+        json!([])
+    } else if http_mode.eq_ignore_ascii_case(TRANSPORT_HTTP_MODE_HTTP1_ONLY) {
         json!(["http/1.1"])
     } else {
         json!(["h2", "http/1.1"])
@@ -170,10 +175,24 @@ fn outgoing_tls_fingerprint_value(
         "http_mode".to_string(),
         Value::String(http_mode.to_string()),
     );
-    object.insert("tls_stack".to_string(), Value::String("rustls".to_string()));
+    object.insert(
+        "tls_stack".to_string(),
+        Value::String(
+            if backend_is_default_tls {
+                "native_tls"
+            } else {
+                "rustls"
+            }
+            .to_string(),
+        ),
+    );
     object.insert(
         "tls_versions_offered".to_string(),
-        json!(["TLS1.3", "TLS1.2"]),
+        if backend_is_default_tls {
+            json!(["native_tls_default"])
+        } else {
+            json!(["TLS1.3", "TLS1.2"])
+        },
     );
     object.insert("alpn_offered".to_string(), alpn_offered);
 
@@ -186,6 +205,20 @@ fn outgoing_tls_fingerprint_value(
             "pool_scope".to_string(),
             Value::String(profile.pool_scope.clone()),
         );
+        if let Some(expected) = profile
+            .extra
+            .as_ref()
+            .and_then(|extra| extra.get("tls_fingerprint"))
+            .cloned()
+        {
+            if let Some(ja3) = expected.get("ja3").and_then(Value::as_str) {
+                object.insert("ja3".to_string(), Value::String(ja3.to_string()));
+            }
+            if let Some(ja3_hash) = expected.get("ja3_hash").and_then(Value::as_str) {
+                object.insert("ja3_hash".to_string(), Value::String(ja3_hash.to_string()));
+            }
+            object.insert("expected".to_string(), expected);
+        }
     }
 
     Value::Object(object)
@@ -275,6 +308,42 @@ mod tests {
         assert_eq!(
             tls_fingerprint["outgoing"]["alpn_offered"],
             json!(["h2", "http/1.1"])
+        );
+    }
+
+    #[test]
+    fn decision_response_records_default_tls_profile_as_native_tls() {
+        let mut parts = sample_parts();
+        parts.transport_profile = Some(ResolvedTransportProfile {
+            profile_id: "codex-reqwest-default-tls-auto".to_string(),
+            backend: TRANSPORT_BACKEND_REQWEST_DEFAULT_TLS.to_string(),
+            http_mode: TRANSPORT_HTTP_MODE_AUTO.to_string(),
+            pool_scope: TRANSPORT_POOL_SCOPE_KEY.to_string(),
+            header_fingerprint: None,
+            extra: Some(json!({
+                "tls_fingerprint": {
+                    "source": "captured_official_codex_cli_2026_06_28",
+                    "ja3": "771,example",
+                    "ja3_hash": "23211f2b48104c7030b93680a2efcfd0"
+                }
+            })),
+        });
+
+        let decision = build_ai_execution_decision_response(parts);
+        let outgoing = &decision.report_context.unwrap()["tls_fingerprint"]["outgoing"];
+
+        assert_eq!(outgoing["backend"], TRANSPORT_BACKEND_REQWEST_DEFAULT_TLS);
+        assert_eq!(outgoing["tls_stack"], "native_tls");
+        assert_eq!(
+            outgoing["tls_versions_offered"],
+            json!(["native_tls_default"])
+        );
+        assert_eq!(outgoing["alpn_offered"], json!([]));
+        assert_eq!(outgoing["ja3"], "771,example");
+        assert_eq!(outgoing["ja3_hash"], "23211f2b48104c7030b93680a2efcfd0");
+        assert_eq!(
+            outgoing["expected"]["source"],
+            "captured_official_codex_cli_2026_06_28"
         );
     }
 

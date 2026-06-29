@@ -942,6 +942,7 @@ async fn maybe_build_local_openai_probe_response(
     let decision = request_context.control_decision.as_ref()?;
     if decision.route_family.as_deref() != Some("openai")
         || request_context.request_method != http::Method::POST
+        || decision.is_execution_runtime_candidate()
     {
         return None;
     }
@@ -2445,12 +2446,14 @@ fn estimate_text_tokens(text: &str) -> u64 {
 mod tests {
     use super::{
         arithmetic_probe_answer, estimate_claude_count_tokens, local_probe_chat_response_id,
-        local_probe_request_headers_json, local_probe_response_id, openai_chat_local_probe_answer,
+        local_probe_request_headers_json, local_probe_response_id,
+        maybe_build_local_openai_probe_response, openai_chat_local_probe_answer,
         openai_chat_local_probe_sse_body, openai_responses_local_probe_answer,
         openai_responses_local_probe_payload, openai_responses_local_probe_sse_body,
         parse_openai_image_validation_input, validate_openai_image_n, LocalProbeKind,
         OpenAiImageOperation,
     };
+    use crate::control::{GatewayControlDecision, GatewayPublicRequestContext};
     use crate::data::GatewayDataState;
     use crate::local_probe_intercept::{
         LOCAL_PROBE_INTERCEPT_ENABLED_KEY, LOCAL_PROBE_INTERCEPT_RULES_KEY,
@@ -2665,6 +2668,40 @@ mod tests {
                 kind: LocalProbeKind::Health,
             })
         );
+    }
+
+    #[tokio::test]
+    async fn openai_local_probe_skips_execution_runtime_candidates() {
+        let state = probe_default_rules_test_state();
+        let request_context = GatewayPublicRequestContext {
+            trace_id: "trace-local-runtime-probe-skip".to_string(),
+            request_method: http::Method::POST,
+            request_path: "/v1/responses".to_string(),
+            request_query_string: None,
+            request_content_type: Some("application/json".to_string()),
+            host_header: None,
+            control_decision: Some(
+                GatewayControlDecision::synthetic(
+                    "/v1/responses",
+                    Some("ai_public".to_string()),
+                    Some("openai".to_string()),
+                    Some("responses".to_string()),
+                    Some("openai:responses".to_string()),
+                )
+                .with_execution_runtime_candidate(true),
+            ),
+        };
+        let body = Bytes::from_static(br#"{"model":"gpt-5.4-mini","input":"hello"}"#);
+
+        assert!(maybe_build_local_openai_probe_response(
+            &state,
+            &request_context,
+            None,
+            Some(&body),
+            None,
+        )
+        .await
+        .is_none());
     }
 
     #[tokio::test]

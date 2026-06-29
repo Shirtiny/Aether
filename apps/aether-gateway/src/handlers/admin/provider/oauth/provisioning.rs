@@ -132,8 +132,22 @@ pub(crate) async fn create_provider_oauth_catalog_key(
         .ok()
         .map(|duration| duration.as_secs())
         .unwrap_or(0);
+    let key_id = Uuid::new_v4().to_string();
+    let fingerprint = grok_oauth_catalog_key_fingerprint(provider_type, auth_config);
+    let fingerprint = crate::ai_serving::materialize_codex_pool_key_fingerprint(
+        provider_type,
+        None,
+        fingerprint.as_ref(),
+        Some(&auth_config_json),
+        key_id.as_str(),
+        name,
+        now_unix_secs,
+    )
+    .map(|outcome| outcome.fingerprint)
+    .or(fingerprint);
+
     let mut record = StoredProviderCatalogKey::new(
-        Uuid::new_v4().to_string(),
+        key_id,
         provider_id.to_string(),
         name.to_string(),
         "oauth".to_string(),
@@ -150,7 +164,7 @@ pub(crate) async fn create_provider_oauth_catalog_key(
         None,
         expires_at_unix_secs,
         proxy,
-        grok_oauth_catalog_key_fingerprint(provider_type, auth_config),
+        fingerprint,
     )
     .map_err(|err| GatewayError::Internal(err.to_string()))?;
     record.internal_priority = 50;
@@ -208,9 +222,22 @@ pub(crate) async fn update_existing_provider_oauth_catalog_key(
     updated.expires_at_unix_secs = expires_at_unix_secs;
     updated.oauth_invalid_at_unix_secs = None;
     updated.oauth_invalid_reason = None;
-    if updated.fingerprint.is_none() {
-        updated.fingerprint = grok_oauth_catalog_key_fingerprint(provider_type, auth_config);
-    }
+    let fallback_fingerprint = if updated.fingerprint.is_none() {
+        grok_oauth_catalog_key_fingerprint(provider_type, auth_config)
+    } else {
+        updated.fingerprint.clone()
+    };
+    updated.fingerprint = crate::ai_serving::materialize_codex_pool_key_fingerprint(
+        provider_type,
+        None,
+        fallback_fingerprint.as_ref(),
+        Some(&auth_config_json),
+        updated.id.as_str(),
+        updated.name.as_str(),
+        now_unix_secs,
+    )
+    .map(|outcome| outcome.fingerprint)
+    .or(fallback_fingerprint);
     updated.health_by_format = Some(json!({}));
     updated.circuit_breaker_by_format = Some(json!({}));
     updated.error_count = Some(0);

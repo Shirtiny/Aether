@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 pub const EXECUTION_REQUEST_FOLLOW_REDIRECTS_HEADER: &str = "x-aether-execution-follow-redirects";
 pub const EXECUTION_REQUEST_HTTP1_ONLY_HEADER: &str = "x-aether-execution-http1-only";
@@ -62,11 +62,52 @@ pub struct ProxySnapshot {
 }
 
 pub const TRANSPORT_BACKEND_REQWEST_RUSTLS: &str = "reqwest_rustls";
+pub const TRANSPORT_BACKEND_REQWEST_DEFAULT_TLS: &str = "reqwest_default_tls";
 pub const TRANSPORT_BACKEND_HYPER_RUSTLS: &str = "hyper_rustls";
 pub const TRANSPORT_BACKEND_BROWSER_WREQ: &str = "browser_wreq";
 pub const TRANSPORT_HTTP_MODE_AUTO: &str = "auto";
 pub const TRANSPORT_HTTP_MODE_HTTP1_ONLY: &str = "http1_only";
 pub const TRANSPORT_POOL_SCOPE_KEY: &str = "key";
+pub const TRANSPORT_PROFILE_CODEX_REQWEST_DEFAULT_TLS_AUTO: &str = "codex-reqwest-default-tls-auto";
+pub const TRANSPORT_PROFILE_CODEX_LEGACY_REQWEST_RUSTLS_AUTO: &str = "codex-reqwest-rustls-auto";
+pub const CODEX_DEFAULT_TLS_FINGERPRINT_SOURCE: &str = "captured_official_codex_cli_2026_06_28";
+pub const CODEX_DEFAULT_TLS_JA3: &str = "771,4866-4867-4865-49196-49200-159-52393-52392-52394-49195-49199-158-49188-49192-107-49187-49191-103-49162-49172-57-49161-49171-51-157-156-61-60-53-47,65281-11-10-35-22-23-13-43-45-51,4588-29-23-30-24-25-256-257,0";
+pub const CODEX_DEFAULT_TLS_JA3_HASH: &str = "23211f2b48104c7030b93680a2efcfd0";
+
+pub fn codex_default_tls_fingerprint_metadata() -> Value {
+    json!({
+        "schema_version": 1,
+        "source": CODEX_DEFAULT_TLS_FINGERPRINT_SOURCE,
+        "comparison": "normalized_client_hello",
+        "ja3": CODEX_DEFAULT_TLS_JA3,
+        "ja3_hash": CODEX_DEFAULT_TLS_JA3_HASH,
+        "tls_stack": "native_tls",
+        "tls_provider": "vendored_openssl",
+        "alpn": [],
+        "supported_versions": [772, 771],
+        "cipher_suites": [
+            4866, 4867, 4865, 49196, 49200, 159, 52393, 52392, 52394, 49195,
+            49199, 158, 49188, 49192, 107, 49187, 49191, 103, 49162, 49172,
+            57, 49161, 49171, 51, 157, 156, 61, 60, 53, 47
+        ],
+        "extension_types": [65281, 11, 10, 35, 22, 23, 13, 43, 45, 51],
+        "supported_groups": [4588, 29, 23, 30, 24, 25, 256, 257],
+        "ec_point_formats": [0],
+        "signature_algorithms": [
+            2309, 2310, 2308, 1027, 1283, 1539, 2055, 2056, 2074, 2075,
+            2076, 2057, 2058, 2059, 2052, 2053, 2054, 1025, 1281, 1537,
+            771, 769, 770, 1026, 1282, 1538
+        ]
+    })
+}
+
+pub fn codex_default_transport_profile_extra() -> Value {
+    json!({
+        "official_codex_transport": "reqwest_0_12_default_tls",
+        "strict_equivalence_requires_capture": true,
+        "tls_fingerprint": codex_default_tls_fingerprint_metadata()
+    })
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]

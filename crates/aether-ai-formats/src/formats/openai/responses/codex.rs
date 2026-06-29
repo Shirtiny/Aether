@@ -532,19 +532,43 @@ fn btree_map_has_non_empty_value(headers: &BTreeMap<String, String>, header_name
         .any(|(name, value)| name.trim().eq_ignore_ascii_case(&target) && !value.trim().is_empty())
 }
 
+fn remove_btree_header_case_insensitive(headers: &mut BTreeMap<String, String>, header_name: &str) {
+    let target = header_name.trim().to_ascii_lowercase();
+    if target.is_empty() {
+        return;
+    }
+    let names = headers
+        .keys()
+        .filter(|name| name.trim().eq_ignore_ascii_case(&target))
+        .cloned()
+        .collect::<Vec<_>>();
+    for name in names {
+        headers.remove(&name);
+    }
+}
+
 fn extract_codex_account_id(decrypted_auth_config_raw: Option<&str>) -> Option<String> {
     let raw = decrypted_auth_config_raw?.trim();
     if raw.is_empty() {
         return None;
     }
 
+    const ACCOUNT_ID_KEYS: &[&str] = &[
+        "account_id",
+        "accountId",
+        "chatgpt_account_id",
+        "chatgptAccountId",
+    ];
+
     serde_json::from_str::<Value>(raw).ok().and_then(|value| {
-        value
-            .get("account_id")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned)
+        ACCOUNT_ID_KEYS.iter().find_map(|key| {
+            value
+                .get(*key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+        })
     })
 }
 
@@ -877,12 +901,9 @@ pub fn apply_codex_openai_responses_special_headers(
         .map(str::trim)
         .filter(|value| !value.is_empty());
 
-    if !header_map_has_non_empty_value(original_headers, "chatgpt-account-id")
-        && !btree_map_has_non_empty_value(provider_request_headers, "chatgpt-account-id")
-    {
-        if let Some(account_id) = extract_codex_account_id(decrypted_auth_config_raw) {
-            provider_request_headers.insert("chatgpt-account-id".to_string(), account_id);
-        }
+    remove_btree_header_case_insensitive(provider_request_headers, "chatgpt-account-id");
+    if let Some(account_id) = extract_codex_account_id(decrypted_auth_config_raw) {
+        provider_request_headers.insert("chatgpt-account-id".to_string(), account_id);
     }
 
     if !header_map_has_non_empty_value(original_headers, "x-client-request-id")
@@ -935,11 +956,12 @@ mod tests {
     use super::{
         apply_codex_openai_responses_chat_body_edits,
         apply_codex_openai_responses_special_body_edits,
-        apply_openai_responses_cache_control_bridge,
+        apply_codex_openai_responses_special_headers, apply_openai_responses_cache_control_bridge,
         apply_openai_responses_compact_special_body_edits, CODEX_OPENAI_IMAGE_INTERNAL_MODEL,
         CODEX_OPENAI_RESPONSES_UNSUPPORTED_BODY_FIELDS,
     };
     use serde_json::json;
+    use std::collections::BTreeMap;
 
     #[test]
     fn codex_responses_body_edits_inject_passthrough_fields_without_reasoning_summary() {
@@ -1064,6 +1086,33 @@ mod tests {
             json!("lookup_account")
         );
         assert!(provider_request_body["tools"][0].get("function").is_none());
+    }
+
+    #[test]
+    fn codex_responses_headers_accept_legacy_chatgpt_account_alias() {
+        let mut provider_request_headers = BTreeMap::from([(
+            "chatgpt-account-id".to_string(),
+            "stale-account".to_string(),
+        )]);
+        let provider_request_body = json!({
+            "model": "gpt-5.4"
+        });
+        let original_headers = http::HeaderMap::new();
+
+        apply_codex_openai_responses_special_headers(
+            &mut provider_request_headers,
+            &provider_request_body,
+            &original_headers,
+            "codex",
+            "openai:responses",
+            None,
+            Some(r#"{"chatgpt_account_id":"alias-account"}"#),
+        );
+
+        assert_eq!(
+            provider_request_headers.get("chatgpt-account-id"),
+            Some(&"alias-account".to_string())
+        );
     }
 
     #[test]

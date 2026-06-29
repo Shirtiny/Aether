@@ -2226,7 +2226,11 @@ async fn provider_query_execute_openai_image_test_candidate(
             Some(trace_id),
             transport.key.decrypted_auth_config.as_deref(),
         );
-        crate::ai_serving::apply_codex_pool_stable_client_headers(&mut request_headers, &transport);
+        crate::ai_serving::apply_codex_pool_concrete_account_profile(
+            &mut request_headers,
+            &mut provider_request_body,
+            &transport,
+        );
     }
     crate::provider_transport::ensure_upstream_auth_header(
         &mut request_headers,
@@ -3245,7 +3249,11 @@ async fn provider_query_execute_standard_test_candidate(
             Some(trace_id),
             transport.key.decrypted_auth_config.as_deref(),
         );
-        crate::ai_serving::apply_codex_pool_stable_client_headers(&mut request_headers, &transport);
+        crate::ai_serving::apply_codex_pool_concrete_account_profile(
+            &mut request_headers,
+            &mut provider_request_body,
+            &transport,
+        );
     }
     if !uses_vertex_query_auth {
         if let (Some(auth_header), Some(auth_value)) =

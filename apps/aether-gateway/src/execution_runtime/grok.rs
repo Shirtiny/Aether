@@ -1473,6 +1473,7 @@ async fn fetch_grok_attachment_url(
     loop {
         validate_grok_attachment_public_url(&url).await?;
         let response = reqwest::Client::builder()
+            .use_rustls_tls()
             .timeout(Duration::from_secs(30))
             .redirect(reqwest::redirect::Policy::none())
             .resolve_to_addrs(

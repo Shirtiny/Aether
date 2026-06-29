@@ -7,6 +7,12 @@ use std::collections::BTreeMap;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::codex_profile::{
+    apply_codex_concrete_account_profile_to_request, codex_account_selection_key,
+    materialize_codex_key_fingerprint, resolve_codex_concrete_account_profile,
+    CodexConcreteAccountProfile, CodexProfileMaterializationOutcome, CodexProfileMaterializeInput,
+};
+
 pub(crate) use crate::ai_serving::{
     apply_codex_openai_responses_special_body_edits, apply_codex_openai_responses_special_headers,
 };
@@ -161,14 +167,6 @@ pub(crate) fn apply_codex_pool_stable_client_headers(
     provider_request_headers: &mut BTreeMap<String, String>,
     transport: &GatewayProviderTransportSnapshot,
 ) {
-    let Some(pool_advanced) = transport
-        .provider
-        .config
-        .as_ref()
-        .and_then(|config| config.get("pool_advanced"))
-    else {
-        return;
-    };
     if !transport
         .provider
         .provider_type
@@ -179,14 +177,121 @@ pub(crate) fn apply_codex_pool_stable_client_headers(
     }
     remove_codex_pool_upstream_leak_headers(provider_request_headers);
 
-    let Some(profile) =
-        codex_pool_client_header_profile(pool_advanced, transport.key.name.as_str())
+    if let Some(profile) = resolve_codex_pool_concrete_account_profile(transport) {
+        provider_request_headers.insert("user-agent".to_string(), profile.user_agent);
+        provider_request_headers.insert("originator".to_string(), profile.originator);
+        return;
+    }
+
+    let default_pool_advanced = Value::Object(Default::default());
+    let pool_advanced = transport
+        .provider
+        .config
+        .as_ref()
+        .and_then(|config| config.get("pool_advanced"))
+        .unwrap_or(&default_pool_advanced);
+    let selection_key = codex_pool_client_profile_selection_key(transport);
+    let Some(header_profile) = codex_pool_client_header_profile(pool_advanced, &selection_key)
     else {
         return;
     };
 
-    provider_request_headers.insert("user-agent".to_string(), profile.user_agent);
-    provider_request_headers.insert("originator".to_string(), profile.originator);
+    provider_request_headers.insert("user-agent".to_string(), header_profile.user_agent);
+    provider_request_headers.insert("originator".to_string(), header_profile.originator);
+}
+
+pub(crate) fn apply_codex_pool_concrete_account_profile(
+    provider_request_headers: &mut BTreeMap<String, String>,
+    provider_request_body: &mut Value,
+    transport: &GatewayProviderTransportSnapshot,
+) {
+    if !transport
+        .provider
+        .provider_type
+        .trim()
+        .eq_ignore_ascii_case("codex")
+    {
+        return;
+    }
+    remove_codex_pool_upstream_leak_headers(provider_request_headers);
+
+    let Some(profile) = resolve_codex_pool_concrete_account_profile(transport) else {
+        return;
+    };
+    apply_codex_concrete_account_profile_to_request(
+        provider_request_headers,
+        provider_request_body,
+        &profile,
+    );
+}
+
+pub(crate) fn materialize_codex_pool_key_fingerprint(
+    provider_type: &str,
+    provider_config: Option<&Value>,
+    key_fingerprint: Option<&Value>,
+    auth_config_raw: Option<&str>,
+    key_id: &str,
+    key_name: &str,
+    now_unix_secs: u64,
+) -> Option<CodexProfileMaterializationOutcome> {
+    if !provider_type.trim().eq_ignore_ascii_case("codex") {
+        return None;
+    }
+    let default_pool_advanced = Value::Object(Default::default());
+    let pool_advanced = provider_config
+        .and_then(|config| config.get("pool_advanced"))
+        .unwrap_or(&default_pool_advanced);
+    let selection_key = codex_account_selection_key(auth_config_raw, key_name, key_id);
+    let header_profile = codex_pool_client_header_profile(pool_advanced, &selection_key)?;
+    materialize_codex_key_fingerprint(CodexProfileMaterializeInput {
+        provider_type,
+        fingerprint: key_fingerprint,
+        auth_config_raw,
+        key_id,
+        key_name,
+        user_agent: header_profile.user_agent.as_str(),
+        originator: header_profile.originator.as_str(),
+        now_unix_secs,
+    })
+}
+
+fn codex_pool_client_profile_selection_key(transport: &GatewayProviderTransportSnapshot) -> String {
+    codex_account_selection_key(
+        transport.key.decrypted_auth_config.as_deref(),
+        transport.key.name.as_str(),
+        transport.key.id.as_str(),
+    )
+}
+
+fn resolve_codex_pool_concrete_account_profile(
+    transport: &GatewayProviderTransportSnapshot,
+) -> Option<CodexConcreteAccountProfile> {
+    let default_pool_advanced = Value::Object(Default::default());
+    let pool_advanced = transport
+        .provider
+        .config
+        .as_ref()
+        .and_then(|config| config.get("pool_advanced"))
+        .unwrap_or(&default_pool_advanced);
+    if !transport
+        .provider
+        .provider_type
+        .trim()
+        .eq_ignore_ascii_case("codex")
+    {
+        return None;
+    }
+
+    let selection_key = codex_pool_client_profile_selection_key(transport);
+    let header_profile = codex_pool_client_header_profile(pool_advanced, &selection_key)?;
+    resolve_codex_concrete_account_profile(
+        transport.key.fingerprint.as_ref(),
+        transport.key.decrypted_auth_config.as_deref(),
+        transport.key.id.as_str(),
+        transport.key.name.as_str(),
+        header_profile.user_agent.as_str(),
+        header_profile.originator.as_str(),
+    )
 }
 
 fn remove_codex_pool_upstream_leak_headers(
@@ -208,7 +313,7 @@ fn remove_codex_pool_upstream_leak_headers(
 
 fn codex_pool_client_header_profile(
     pool_advanced: &Value,
-    key_id: &str,
+    selection_key: &str,
 ) -> Option<CodexClientHeaderProfile> {
     let header_config = pool_advanced.get("codex_client_headers");
     if header_config
@@ -226,7 +331,7 @@ fn codex_pool_client_header_profile(
     if profiles.is_empty() {
         return None;
     }
-    Some(profiles[stable_index_for_key(key_id, &profiles)].clone())
+    Some(profiles[stable_index_for_key(selection_key, &profiles)].clone())
 }
 
 fn parse_codex_client_header_profiles(value: &Value) -> Option<Vec<CodexClientHeaderProfile>> {
@@ -265,19 +370,19 @@ fn default_codex_client_header_profiles() -> Vec<CodexClientHeaderProfile> {
         .collect()
 }
 
-fn stable_index_for_key(key_id: &str, profiles: &[CodexClientHeaderProfile]) -> usize {
+fn stable_index_for_key(selection_key: &str, profiles: &[CodexClientHeaderProfile]) -> usize {
     profiles
         .iter()
         .enumerate()
-        .map(|(index, profile)| (index, stable_profile_score(key_id, profile)))
+        .map(|(index, profile)| (index, stable_profile_score(selection_key, profile)))
         .max_by(|(_, left), (_, right)| left.cmp(right))
         .map(|(index, _)| index)
         .unwrap_or(0)
 }
 
-fn stable_profile_score(key_id: &str, profile: &CodexClientHeaderProfile) -> [u8; 32] {
+fn stable_profile_score(selection_key: &str, profile: &CodexClientHeaderProfile) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(key_id.as_bytes());
+    hasher.update(selection_key.as_bytes());
     hasher.update([0]);
     hasher.update(profile.user_agent.as_bytes());
     hasher.update([0]);

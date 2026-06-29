@@ -6,6 +6,9 @@ use crate::headers::header_value_str;
 pub(crate) const AETHER_SESSION_ID_HEADER: &str = "x-aether-session-id";
 pub(crate) const AETHER_AGENT_ID_HEADER: &str = "x-aether-agent-id";
 pub(crate) const CLIENT_SESSION_AFFINITY_REPORT_CONTEXT_FIELD: &str = "client_session_affinity";
+const CODEX_TURN_METADATA_KEY: &str = "x-codex-turn-metadata";
+const CODEX_INSTALLATION_ID_KEY: &str = "x-codex-installation-id";
+const CODEX_WINDOW_ID_KEY: &str = "x-codex-window-id";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ClientSessionSignalSource {
@@ -107,6 +110,22 @@ struct OpenAiJsSdkSessionScopeAdapter;
 struct OpenAiPythonSdkSessionScopeAdapter;
 struct AnthropicJsSdkSessionScopeAdapter;
 struct AnthropicPythonSdkSessionScopeAdapter;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct CodexSessionIdentity {
+    session_id: Option<String>,
+    thread_id: Option<String>,
+}
+
+impl CodexSessionIdentity {
+    fn root_session(self) -> Option<String> {
+        self.session_id.or(self.thread_id)
+    }
+
+    fn has_root_session(&self) -> bool {
+        self.session_id.is_some() || self.thread_id.is_some()
+    }
+}
 
 pub(crate) fn client_session_affinity_from_request(
     headers: &http::HeaderMap,
@@ -377,20 +396,64 @@ impl ClientSessionScopeAdapter for CodexSessionScopeAdapter {
     fn detect(&self, request: &ClientSessionRequest<'_>) -> bool {
         header_contains(request.headers, http::header::USER_AGENT.as_str(), "codex")
             || header_contains(request.headers, "originator", "codex")
-            || header_value_str(request.headers, "chatgpt-account-id").is_some()
+            || header_value_str(request.headers, "session-id").is_some()
+            || header_value_str(request.headers, "thread-id").is_some()
+            || has_header_with_prefix(request.headers, "x-codex-")
+            || body_has_codex_client_metadata(request.body_json)
     }
 
     fn extract_scope(&self, request: &ClientSessionRequest<'_>) -> Option<ClientSessionScope> {
-        header_value_str(request.headers, "session_id")
-            .or_else(|| header_value_str(request.headers, "conversation_id"))
+        let account_hint: Option<String> = None;
+
+        codex_session_identity_from_body(request.body_json)
+            .and_then(CodexSessionIdentity::root_session)
             .map(|root_session| {
                 ClientSessionScope::new(
                     self.family(),
                     root_session,
                     None,
-                    header_value_str(request.headers, "chatgpt-account-id"),
-                    ClientSessionSignalSource::Header,
+                    account_hint.clone(),
+                    ClientSessionSignalSource::Body,
                 )
+            })
+            .or_else(|| {
+                codex_session_identity_from_turn_metadata_header(request.headers)
+                    .and_then(CodexSessionIdentity::root_session)
+                    .map(|root_session| {
+                        ClientSessionScope::new(
+                            self.family(),
+                            root_session,
+                            None,
+                            account_hint.clone(),
+                            ClientSessionSignalSource::Header,
+                        )
+                    })
+            })
+            .or_else(|| {
+                header_value_str(request.headers, "session-id")
+                    .or_else(|| header_value_str(request.headers, "thread-id"))
+                    .map(|root_session| {
+                        ClientSessionScope::new(
+                            self.family(),
+                            root_session,
+                            None,
+                            account_hint.clone(),
+                            ClientSessionSignalSource::Header,
+                        )
+                    })
+            })
+            .or_else(|| {
+                header_value_str(request.headers, "session_id")
+                    .or_else(|| header_value_str(request.headers, "conversation_id"))
+                    .map(|root_session| {
+                        ClientSessionScope::new(
+                            self.family(),
+                            root_session,
+                            None,
+                            account_hint.clone(),
+                            ClientSessionSignalSource::Header,
+                        )
+                    })
             })
             .or_else(|| {
                 let body_session = GenericSessionScopeAdapter.extract_scope(request)?;
@@ -398,7 +461,7 @@ impl ClientSessionScopeAdapter for CodexSessionScopeAdapter {
                     self.family(),
                     body_session.session_id,
                     body_session.agent_id,
-                    header_value_str(request.headers, "chatgpt-account-id"),
+                    account_hint,
                     body_session.source,
                 ))
             })
@@ -751,6 +814,66 @@ fn claude_code_session_id_from_body(body: &Value) -> Option<String> {
         })
 }
 
+fn body_has_codex_client_metadata(body: Option<&Value>) -> bool {
+    let Some(client_metadata) = body
+        .and_then(|body| body.get("client_metadata"))
+        .and_then(Value::as_object)
+    else {
+        return false;
+    };
+    client_metadata.contains_key(CODEX_TURN_METADATA_KEY)
+        || client_metadata.contains_key(CODEX_INSTALLATION_ID_KEY)
+        || client_metadata.contains_key(CODEX_WINDOW_ID_KEY)
+}
+
+fn codex_session_identity_from_body(body: Option<&Value>) -> Option<CodexSessionIdentity> {
+    let client_metadata = body
+        .and_then(|body| body.get("client_metadata"))
+        .and_then(Value::as_object)?;
+    codex_session_identity_from_turn_metadata(client_metadata.get(CODEX_TURN_METADATA_KEY))
+        .or_else(|| codex_session_identity_from_flat_client_metadata(client_metadata))
+}
+
+fn codex_session_identity_from_turn_metadata(
+    value: Option<&Value>,
+) -> Option<CodexSessionIdentity> {
+    let raw = value_at_value(value)?;
+    codex_session_identity_from_turn_metadata_str(raw)
+}
+
+fn codex_session_identity_from_turn_metadata_header(
+    headers: &http::HeaderMap,
+) -> Option<CodexSessionIdentity> {
+    let raw = header_value_str(headers, CODEX_TURN_METADATA_KEY)?;
+    codex_session_identity_from_turn_metadata_str(raw.as_str())
+}
+
+fn codex_session_identity_from_turn_metadata_str(raw: &str) -> Option<CodexSessionIdentity> {
+    let decoded = serde_json::from_str::<Value>(raw.trim()).ok()?;
+    let object = decoded.as_object()?;
+    let identity = CodexSessionIdentity {
+        session_id: value_at_value(object.get("session_id")).map(ToOwned::to_owned),
+        thread_id: value_at_value(object.get("thread_id")).map(ToOwned::to_owned),
+    };
+    if !identity.has_root_session() {
+        return None;
+    }
+    Some(identity)
+}
+
+fn codex_session_identity_from_flat_client_metadata(
+    client_metadata: &Map<String, Value>,
+) -> Option<CodexSessionIdentity> {
+    let identity = CodexSessionIdentity {
+        session_id: value_at_value(client_metadata.get("session_id")).map(ToOwned::to_owned),
+        thread_id: value_at_value(client_metadata.get("thread_id")).map(ToOwned::to_owned),
+    };
+    if !identity.has_root_session() {
+        return None;
+    }
+    Some(identity)
+}
+
 fn explicit_aether_session_scope(
     request: &ClientSessionRequest<'_>,
     client_family: &str,
@@ -797,6 +920,13 @@ fn value_at_path<'a>(body: &'a Value, path: &[&str]) -> Option<&'a str> {
     }
     current
         .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn value_at_value(value: Option<&Value>) -> Option<&str> {
+    value
+        .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
 }
@@ -887,6 +1017,143 @@ mod tests {
     }
 
     #[test]
+    fn codex_adapter_extracts_official_dash_session_header_before_short_compat_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert("originator", HeaderValue::from_static("codex-tui"));
+        headers.insert(
+            "session-id",
+            HeaderValue::from_static("019f0a27-08f6-77d2-ba0b-1ff45470ee76"),
+        );
+        headers.insert(
+            "thread-id",
+            HeaderValue::from_static("019f0a2e-a87b-7d91-a650-29b142e2a7cc"),
+        );
+        headers.insert("session_id", HeaderValue::from_static("642a96f77690e79d"));
+        headers.insert("chatgpt-account-id", HeaderValue::from_static("account-1"));
+
+        let scope = client_session_scope_from_request(&headers, None).expect("scope should build");
+        let affinity = scope
+            .scheduler_affinity()
+            .expect("scheduler affinity should build");
+
+        assert_eq!(scope.client_family, "codex");
+        assert_eq!(scope.source, ClientSessionSignalSource::Header);
+        assert_eq!(scope.session_id, "019f0a27-08f6-77d2-ba0b-1ff45470ee76");
+        assert_eq!(scope.account_hint, None);
+        assert_eq!(
+            affinity.session_key.as_deref(),
+            Some("session=019f0a27-08f6-77d2-ba0b-1ff45470ee76")
+        );
+    }
+
+    #[test]
+    fn codex_adapter_extracts_canonical_client_metadata_before_prompt_cache_key() {
+        let headers = HeaderMap::new();
+        let body = json!({
+            "prompt_cache_key": "guardian:019f0a27-08f6-77d2-ba0b-1ff45470ee76",
+            "client_metadata": {
+                "session_id": "flat-session-ignored",
+                "thread_id": "flat-thread-ignored",
+                "x-codex-window-id": "019f0a2e-a87b-7d91-a650-29b142e2a7cc:1",
+                "x-codex-turn-metadata": serde_json::to_string(&json!({
+                    "session_id": "019f0a27-08f6-77d2-ba0b-1ff45470ee76",
+                    "thread_id": "019f0a2e-a87b-7d91-a650-29b142e2a7cc",
+                    "parent_thread_id": "019f0a27-08f6-77d2-ba0b-1ff45470ee76",
+                    "subagent_kind": "guardian"
+                })).unwrap()
+            }
+        });
+
+        let scope =
+            client_session_scope_from_request(&headers, Some(&body)).expect("scope should build");
+        let affinity = scope
+            .scheduler_affinity()
+            .expect("scheduler affinity should build");
+
+        assert_eq!(scope.client_family, "codex");
+        assert_eq!(scope.source, ClientSessionSignalSource::Body);
+        assert_eq!(scope.session_id, "019f0a27-08f6-77d2-ba0b-1ff45470ee76");
+        assert_eq!(
+            affinity.session_key.as_deref(),
+            Some("session=019f0a27-08f6-77d2-ba0b-1ff45470ee76")
+        );
+    }
+
+    #[test]
+    fn codex_adapter_uses_thread_when_canonical_session_is_missing() {
+        let body = json!({
+            "client_metadata": {
+                "x-codex-turn-metadata": serde_json::to_string(&json!({
+                    "thread_id": "019f0a2e-a87b-7d91-a650-29b142e2a7cc"
+                })).unwrap()
+            }
+        });
+
+        let scope = client_session_scope_from_request(&HeaderMap::new(), Some(&body))
+            .expect("scope should build");
+
+        assert_eq!(scope.client_family, "codex");
+        assert_eq!(scope.session_id, "019f0a2e-a87b-7d91-a650-29b142e2a7cc");
+    }
+
+    #[test]
+    fn codex_adapter_extracts_direct_turn_metadata_header_as_compat_fallback() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-codex-turn-metadata",
+            HeaderValue::from_str(
+                &serde_json::to_string(&json!({
+                    "session_id": "019f0a27-08f6-77d2-ba0b-1ff45470ee76",
+                    "thread_id": "019f0a2e-a87b-7d91-a650-29b142e2a7cc"
+                }))
+                .unwrap(),
+            )
+            .unwrap(),
+        );
+        headers.insert("chatgpt-account-id", HeaderValue::from_static("account-1"));
+
+        let affinity =
+            client_session_affinity_from_request(&headers, None).expect("affinity should build");
+
+        assert_eq!(affinity.client_family.as_deref(), Some("codex"));
+        assert_eq!(
+            affinity.session_key.as_deref(),
+            Some("session=019f0a27-08f6-77d2-ba0b-1ff45470ee76")
+        );
+    }
+
+    #[test]
+    fn codex_affinity_ignores_request_chatgpt_account_id() {
+        let body = json!({
+            "client_metadata": {
+                "x-codex-turn-metadata": serde_json::to_string(&json!({
+                    "session_id": "019f0a27-08f6-77d2-ba0b-1ff45470ee76",
+                    "thread_id": "019f0a2e-a87b-7d91-a650-29b142e2a7cc"
+                })).unwrap()
+            }
+        });
+        let mut first_headers = HeaderMap::new();
+        first_headers.insert("chatgpt-account-id", HeaderValue::from_static("account-1"));
+        let mut second_headers = HeaderMap::new();
+        second_headers.insert("chatgpt-account-id", HeaderValue::from_static("account-2"));
+
+        let first = client_session_affinity_from_request(&first_headers, Some(&body))
+            .expect("first affinity should build");
+        let second = client_session_affinity_from_request(&second_headers, Some(&body))
+            .expect("second affinity should build");
+
+        assert_eq!(
+            first.session_key.as_deref(),
+            Some("session=019f0a27-08f6-77d2-ba0b-1ff45470ee76")
+        );
+        assert_eq!(
+            second.session_key.as_deref(),
+            Some("session=019f0a27-08f6-77d2-ba0b-1ff45470ee76")
+        );
+        assert_eq!(first.session_key, second.session_key);
+    }
+
+    #[test]
     fn codex_adapter_uses_body_session_instead_of_request_id() {
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -911,11 +1178,11 @@ mod tests {
         assert_eq!(scope.client_family, "codex");
         assert_eq!(scope.source, ClientSessionSignalSource::Body);
         assert_eq!(scope.session_id, "prompt-session-1");
-        assert_eq!(scope.account_hint.as_deref(), Some("account-1"));
+        assert_eq!(scope.account_hint, None);
         assert_eq!(affinity.client_family.as_deref(), Some("codex"));
         assert_eq!(
             affinity.session_key.as_deref(),
-            Some("account=account-1;session=prompt-session-1")
+            Some("session=prompt-session-1")
         );
     }
 

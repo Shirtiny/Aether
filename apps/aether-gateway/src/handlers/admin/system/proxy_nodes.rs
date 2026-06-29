@@ -1166,6 +1166,7 @@ async fn test_manual_proxy_connectivity_with_probe_url(
         }
     };
     let mut builder = reqwest::Client::builder()
+        .use_rustls_tls()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(5))

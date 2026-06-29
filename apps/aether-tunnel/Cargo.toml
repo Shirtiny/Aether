@@ -15,7 +15,9 @@ reqwest.workspace = true
 hyper = { version = "1", features = ["client", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "http2", "tokio"] }
 http-body-util = "0.1"
+native-tls = { version = "0.2", features = ["vendored"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+tokio-native-tls = "0.3"
 tokio-rustls = "0.26"
 futures-util = "0.3"
 base64 = "0.22"

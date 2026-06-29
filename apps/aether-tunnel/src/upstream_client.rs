@@ -11,7 +11,8 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use aether_contracts::{
-    ResolvedTransportProfile, TRANSPORT_BACKEND_HYPER_RUSTLS, TRANSPORT_BACKEND_REQWEST_RUSTLS,
+    ResolvedTransportProfile, TRANSPORT_BACKEND_HYPER_RUSTLS,
+    TRANSPORT_BACKEND_REQWEST_DEFAULT_TLS, TRANSPORT_BACKEND_REQWEST_RUSTLS,
     TRANSPORT_HTTP_MODE_HTTP1_ONLY,
 };
 use bytes::Bytes;
@@ -27,10 +28,12 @@ use hyper_util::client::legacy::connect::dns::Name;
 use hyper_util::client::legacy::connect::{Connected, Connection, HttpConnector};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use native_tls::TlsConnector as NativeTlsConnector;
 use rustls::pki_types::ServerName;
 use rustls::ClientConfig;
 use tokio::net::TcpStream;
-use tokio_rustls::TlsConnector;
+use tokio_native_tls::TlsConnector as TokioNativeTlsConnector;
+use tokio_rustls::TlsConnector as TokioRustlsTlsConnector;
 use tower_service::Service;
 
 use crate::config::Config;
@@ -43,7 +46,8 @@ use crate::target_filter::{self, DnsCache};
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 type PlainStream = TokioIo<TcpStream>;
-type TlsStream = TokioIo<tokio_rustls::client::TlsStream<TcpStream>>;
+type RustlsTlsStream = TokioIo<tokio_rustls::client::TlsStream<TcpStream>>;
+type NativeTlsStream = TokioIo<tokio_native_tls::TlsStream<TcpStream>>;
 
 pub type UpstreamRequestBody = UnsyncBoxBody<Bytes, io::Error>;
 pub type UpstreamClient = Client<InstrumentedConnector, UpstreamRequestBody>;
@@ -95,7 +99,7 @@ impl UpstreamClientPool {
             }
         }
 
-        validate_proxy_transport_backend(&key.backend)?;
+        let tls_backend = upstream_tls_backend(&key.backend)?;
         let http1_only = key
             .http_mode
             .eq_ignore_ascii_case(TRANSPORT_HTTP_MODE_HTTP1_ONLY);
@@ -103,6 +107,7 @@ impl UpstreamClientPool {
             &self.config,
             Arc::clone(&self.dns_cache),
             http1_only,
+            tls_backend,
         )?;
         let mut clients = self.clients.lock().expect("client pool lock");
         if let Some(entry) = clients.get_mut(&key) {
@@ -187,11 +192,20 @@ fn normalized_pool_key_part(value: Option<&str>) -> String {
         .to_string()
 }
 
-fn validate_proxy_transport_backend(backend: &str) -> Result<(), String> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UpstreamTlsBackend {
+    Rustls,
+    NativeDefault,
+}
+
+fn upstream_tls_backend(backend: &str) -> Result<UpstreamTlsBackend, String> {
     if backend.eq_ignore_ascii_case(TRANSPORT_BACKEND_HYPER_RUSTLS)
         || backend.eq_ignore_ascii_case(TRANSPORT_BACKEND_REQWEST_RUSTLS)
     {
-        return Ok(());
+        return Ok(UpstreamTlsBackend::Rustls);
+    }
+    if backend.eq_ignore_ascii_case(TRANSPORT_BACKEND_REQWEST_DEFAULT_TLS) {
+        return Ok(UpstreamTlsBackend::NativeDefault);
     }
     Err(format!("unsupported transport profile backend: {backend}"))
 }
@@ -297,7 +311,7 @@ impl Service<Name> for ValidatedResolver {
 #[derive(Clone)]
 pub struct InstrumentedConnector {
     http: HttpConnector<ValidatedResolver>,
-    tls_config: Arc<ClientConfig>,
+    tls: UpstreamTlsConnector,
     proxy: Option<UpstreamProxyConfig>,
     connect_timeout: Duration,
     tcp_nodelay: bool,
@@ -315,7 +329,7 @@ impl Service<Uri> for InstrumentedConnector {
 
     fn call(&mut self, dst: Uri) -> Self::Future {
         let scheme = dst.scheme_str().map(|value| value.to_ascii_lowercase());
-        let tls_config = Arc::clone(&self.tls_config);
+        let tls = self.tls.clone();
         if let Some(proxy) = self.proxy.clone() {
             let options = ProxyConnectOptions {
                 connect_timeout: self.connect_timeout,
@@ -325,7 +339,7 @@ impl Service<Uri> for InstrumentedConnector {
             };
             let connect_start = std::time::Instant::now();
             return Box::pin(async move {
-                connect_via_proxy(dst, scheme, tls_config, proxy, options, connect_start).await
+                connect_via_proxy(dst, scheme, tls, proxy, options, connect_start).await
             });
         }
         let connecting = self.http.call(dst.clone());
@@ -348,21 +362,16 @@ impl Service<Uri> for InstrumentedConnector {
                     ))
                 }
                 Some("https") => {
-                    let server_name = resolve_server_name(&dst)?;
                     let tcp = connecting.await.map_err(|err| Box::new(err) as BoxError)?;
                     let connect_ms = connect_start.elapsed().as_millis() as u64;
 
                     let tls_start = std::time::Instant::now();
-                    let tls_stream = TlsConnector::from(tls_config)
-                        .connect(server_name, tcp.into_inner())
+                    let stream = connect_tls(&tls, &dst, tcp.into_inner())
                         .await
                         .map_err(io::Error::other)?;
                     let tls_ms = tls_start.elapsed().as_millis() as u64;
 
-                    Ok(TimedConn::new(
-                        MaybeHttpsStream::Https(TokioIo::new(tls_stream)),
-                        ConnectTiming { connect_ms, tls_ms },
-                    ))
+                    Ok(TimedConn::new(stream, ConnectTiming { connect_ms, tls_ms }))
                 }
                 Some(other) => Err(io::Error::other(format!("unsupported scheme {other}")).into()),
                 None => Err(io::Error::other("missing scheme").into()),
@@ -374,7 +383,7 @@ impl Service<Uri> for InstrumentedConnector {
 async fn connect_via_proxy(
     dst: Uri,
     scheme: Option<String>,
-    tls_config: Arc<ClientConfig>,
+    tls: UpstreamTlsConnector,
     proxy: UpstreamProxyConfig,
     options: ProxyConnectOptions,
     connect_start: std::time::Instant,
@@ -425,15 +434,11 @@ async fn connect_via_proxy(
         )),
         "https" => {
             let tls_start = std::time::Instant::now();
-            let tls_stream = TlsConnector::from(tls_config)
-                .connect(resolve_server_name(&dst)?, tcp)
+            let stream = connect_tls(&tls, &dst, tcp)
                 .await
                 .map_err(io::Error::other)?;
             let tls_ms = tls_start.elapsed().as_millis() as u64;
-            Ok(TimedConn::new(
-                MaybeHttpsStream::Https(TokioIo::new(tls_stream)),
-                ConnectTiming { connect_ms, tls_ms },
-            ))
+            Ok(TimedConn::new(stream, ConnectTiming { connect_ms, tls_ms }))
         }
         other => Err(io::Error::other(format!("unsupported scheme {other}")).into()),
     }
@@ -472,6 +477,7 @@ fn build_upstream_client_with_protocol(
     config: &Config,
     dns_cache: Arc<DnsCache>,
     http1_only: bool,
+    tls_backend: UpstreamTlsBackend,
 ) -> Result<UpstreamClient, String> {
     let mut http = HttpConnector::new_with_resolver(ValidatedResolver::new(
         dns_cache,
@@ -492,7 +498,7 @@ fn build_upstream_client_with_protocol(
 
     let connector = InstrumentedConnector {
         http,
-        tls_config: build_tls_config(http1_only),
+        tls: build_tls_connector(http1_only, tls_backend)?,
         proxy: config
             .upstream_proxy_url
             .as_deref()
@@ -557,6 +563,50 @@ fn build_tls_config(http1_only: bool) -> Arc<ClientConfig> {
         vec![b"h2".to_vec(), b"http/1.1".to_vec()]
     };
     Arc::new(config)
+}
+
+#[derive(Clone)]
+enum UpstreamTlsConnector {
+    Rustls(Arc<ClientConfig>),
+    NativeDefault(Arc<NativeTlsConnector>),
+}
+
+fn build_tls_connector(
+    http1_only: bool,
+    tls_backend: UpstreamTlsBackend,
+) -> Result<UpstreamTlsConnector, String> {
+    match tls_backend {
+        UpstreamTlsBackend::Rustls => {
+            Ok(UpstreamTlsConnector::Rustls(build_tls_config(http1_only)))
+        }
+        UpstreamTlsBackend::NativeDefault => NativeTlsConnector::builder()
+            .build()
+            .map(Arc::new)
+            .map(UpstreamTlsConnector::NativeDefault)
+            .map_err(|err| format!("failed to build native TLS connector: {err}")),
+    }
+}
+
+async fn connect_tls(
+    tls: &UpstreamTlsConnector,
+    uri: &Uri,
+    tcp: TcpStream,
+) -> Result<MaybeHttpsStream, BoxError> {
+    match tls {
+        UpstreamTlsConnector::Rustls(config) => {
+            let tls_stream = TokioRustlsTlsConnector::from(Arc::clone(config))
+                .connect(resolve_server_name(uri)?, tcp)
+                .await?;
+            Ok(MaybeHttpsStream::HttpsRustls(TokioIo::new(tls_stream)))
+        }
+        UpstreamTlsConnector::NativeDefault(connector) => {
+            let host = uri_host(uri)?;
+            let tls_stream = TokioNativeTlsConnector::from((**connector).clone())
+                .connect(&host, tcp)
+                .await?;
+            Ok(MaybeHttpsStream::HttpsNative(TokioIo::new(tls_stream)))
+        }
+    }
 }
 
 fn resolve_server_name(uri: &Uri) -> Result<ServerName<'static>, BoxError> {
@@ -632,20 +682,26 @@ impl rt::Write for TimedConn {
 
 pub enum MaybeHttpsStream {
     Http { stream: PlainStream, is_proxy: bool },
-    Https(TlsStream),
+    HttpsRustls(RustlsTlsStream),
+    HttpsNative(NativeTlsStream),
 }
 
 impl Connection for MaybeHttpsStream {
     fn connected(&self) -> Connected {
         match self {
             Self::Http { stream, is_proxy } => stream.connected().proxy(*is_proxy),
-            Self::Https(stream) => {
+            Self::HttpsRustls(stream) => {
                 let (tcp, tls) = stream.inner().get_ref();
                 if tls.alpn_protocol() == Some(b"h2") {
                     tcp.connected().negotiated_h2()
                 } else {
                     tcp.connected()
                 }
+            }
+            Self::HttpsNative(stream) => {
+                let tls = stream.inner().get_ref();
+                let tcp = tls.get_ref().get_ref();
+                tcp.connected()
             }
         }
     }
@@ -659,7 +715,8 @@ impl rt::Read for MaybeHttpsStream {
     ) -> Poll<Result<(), io::Error>> {
         match Pin::get_mut(self) {
             Self::Http { stream, .. } => Pin::new(stream).poll_read(cx, buf),
-            Self::Https(stream) => Pin::new(stream).poll_read(cx, buf),
+            Self::HttpsRustls(stream) => Pin::new(stream).poll_read(cx, buf),
+            Self::HttpsNative(stream) => Pin::new(stream).poll_read(cx, buf),
         }
     }
 }
@@ -672,28 +729,32 @@ impl rt::Write for MaybeHttpsStream {
     ) -> Poll<Result<usize, io::Error>> {
         match Pin::get_mut(self) {
             Self::Http { stream, .. } => Pin::new(stream).poll_write(cx, buf),
-            Self::Https(stream) => Pin::new(stream).poll_write(cx, buf),
+            Self::HttpsRustls(stream) => Pin::new(stream).poll_write(cx, buf),
+            Self::HttpsNative(stream) => Pin::new(stream).poll_write(cx, buf),
         }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
         match Pin::get_mut(self) {
             Self::Http { stream, .. } => Pin::new(stream).poll_flush(cx),
-            Self::Https(stream) => Pin::new(stream).poll_flush(cx),
+            Self::HttpsRustls(stream) => Pin::new(stream).poll_flush(cx),
+            Self::HttpsNative(stream) => Pin::new(stream).poll_flush(cx),
         }
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
         match Pin::get_mut(self) {
             Self::Http { stream, .. } => Pin::new(stream).poll_shutdown(cx),
-            Self::Https(stream) => Pin::new(stream).poll_shutdown(cx),
+            Self::HttpsRustls(stream) => Pin::new(stream).poll_shutdown(cx),
+            Self::HttpsNative(stream) => Pin::new(stream).poll_shutdown(cx),
         }
     }
 
     fn is_write_vectored(&self) -> bool {
         match self {
             Self::Http { stream, .. } => stream.is_write_vectored(),
-            Self::Https(stream) => stream.is_write_vectored(),
+            Self::HttpsRustls(stream) => stream.is_write_vectored(),
+            Self::HttpsNative(stream) => stream.is_write_vectored(),
         }
     }
 
@@ -704,7 +765,8 @@ impl rt::Write for MaybeHttpsStream {
     ) -> Poll<Result<usize, io::Error>> {
         match Pin::get_mut(self) {
             Self::Http { stream, .. } => Pin::new(stream).poll_write_vectored(cx, bufs),
-            Self::Https(stream) => Pin::new(stream).poll_write_vectored(cx, bufs),
+            Self::HttpsRustls(stream) => Pin::new(stream).poll_write_vectored(cx, bufs),
+            Self::HttpsNative(stream) => Pin::new(stream).poll_write_vectored(cx, bufs),
         }
     }
 }
@@ -800,9 +862,52 @@ mod tests {
 
     #[test]
     fn upstream_client_pool_rejects_unsupported_backend() {
-        let error = validate_proxy_transport_backend("utls").unwrap_err();
+        let error = upstream_tls_backend("utls").unwrap_err();
 
         assert!(error.contains("unsupported transport profile backend"));
+    }
+
+    #[test]
+    fn upstream_client_pool_accepts_codex_default_tls_backend() {
+        assert_eq!(
+            upstream_tls_backend(TRANSPORT_BACKEND_REQWEST_DEFAULT_TLS).expect("backend"),
+            UpstreamTlsBackend::NativeDefault
+        );
+    }
+
+    #[test]
+    fn upstream_client_pool_key_keeps_transport_backends_isolated() {
+        let mut profile = ResolvedTransportProfile {
+            profile_id: "codex-reqwest-default-tls-auto".to_string(),
+            backend: TRANSPORT_BACKEND_REQWEST_DEFAULT_TLS.to_string(),
+            http_mode: "auto".to_string(),
+            pool_scope: "key".to_string(),
+            header_fingerprint: None,
+            extra: None,
+        };
+        let default_tls_key = upstream_client_pool_key(
+            Some("provider-1"),
+            Some("endpoint-1"),
+            Some("key-1"),
+            Some(&profile),
+            false,
+        );
+
+        profile.profile_id = "codex-reqwest-rustls-auto".to_string();
+        profile.backend = TRANSPORT_BACKEND_REQWEST_RUSTLS.to_string();
+        let rustls_key = upstream_client_pool_key(
+            Some("provider-1"),
+            Some("endpoint-1"),
+            Some("key-1"),
+            Some(&profile),
+            false,
+        );
+
+        assert_ne!(default_tls_key, rustls_key);
+        assert_eq!(
+            default_tls_key.backend,
+            TRANSPORT_BACKEND_REQWEST_DEFAULT_TLS
+        );
     }
 
     #[test]
@@ -962,6 +1067,7 @@ mod tests {
             &config,
             Arc::new(DnsCache::new(Duration::from_secs(60), 16)),
             true,
+            UpstreamTlsBackend::Rustls,
         )
         .expect("client should build")
     }

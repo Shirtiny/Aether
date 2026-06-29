@@ -64,7 +64,8 @@ pub(crate) use self::specialized::{
     set_local_openai_image_execution_exhausted_diagnostic,
 };
 pub(crate) use self::standard::{
-    apply_codex_pool_stable_client_headers, build_local_openai_chat_stream_attempt_source_for_kind,
+    apply_codex_pool_concrete_account_profile, apply_codex_pool_stable_client_headers,
+    build_local_openai_chat_stream_attempt_source_for_kind,
     build_local_openai_chat_stream_plan_and_reports_for_kind,
     build_local_openai_chat_sync_attempt_source_for_kind,
     build_local_openai_chat_sync_plan_and_reports_for_kind,
@@ -76,7 +77,7 @@ pub(crate) use self::standard::{
     build_local_stream_plan_and_reports as build_standard_family_stream_plan_and_reports,
     build_local_sync_attempt_source as build_standard_family_sync_attempt_source,
     build_local_sync_plan_and_reports as build_standard_family_sync_plan_and_reports,
-    set_local_openai_chat_execution_exhausted_diagnostic,
+    materialize_codex_pool_key_fingerprint, set_local_openai_chat_execution_exhausted_diagnostic,
 };
 pub(crate) use self::state::{
     GatewayAuthApiKeySnapshot, GatewayProviderTransportSnapshot, LocalResolvedOAuthRequestAuth,
@@ -92,6 +93,13 @@ pub(crate) fn pool_sticky_session_token_for_request(
     body_json: &serde_json::Value,
     client_session_affinity: Option<&aether_scheduler_core::ClientSessionAffinity>,
 ) -> Option<String> {
+    if let Some(session_key) = codex_affinity_session_key(client_session_affinity) {
+        return Some(canonicalize_codex_pool_sticky_session_token(
+            session_key,
+            client_session_affinity,
+        ));
+    }
+
     if let Some(token) = extract_pool_sticky_session_token(body_json) {
         return Some(canonicalize_codex_pool_sticky_session_token(
             token,
@@ -108,6 +116,27 @@ pub(crate) fn pool_sticky_session_token_for_request(
         session_key.to_string(),
         client_session_affinity,
     ))
+}
+
+fn codex_affinity_session_key(
+    client_session_affinity: Option<&aether_scheduler_core::ClientSessionAffinity>,
+) -> Option<String> {
+    let client_session_affinity = client_session_affinity?;
+    client_session_affinity
+        .client_family
+        .as_deref()
+        .is_some_and(|client_family| client_family.eq_ignore_ascii_case("codex"))
+        .then_some(())?;
+    client_session_affinity
+        .session_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|session_key| {
+            session_id_from_affinity_key(session_key)
+                .map(|session_id| format!("session={session_id}"))
+                .unwrap_or_else(|| session_key.to_string())
+        })
 }
 
 fn canonicalize_codex_pool_sticky_session_token(
@@ -213,7 +242,7 @@ mod tests {
             "session_id": "body-session"
         });
         let affinity = ClientSessionAffinity::new(
-            Some("codex".to_string()),
+            Some("unknown".to_string()),
             Some("session=header-session".to_string()),
         );
 
@@ -224,7 +253,24 @@ mod tests {
     }
 
     #[test]
-    fn pool_sticky_session_token_preserves_codex_guardian_body_session_without_root_match() {
+    fn pool_sticky_session_token_uses_codex_affinity_session_before_body_session() {
+        let body = json!({
+            "prompt_cache_key": "guardian:root-session",
+            "session_id": "provider-short-session"
+        });
+        let affinity = ClientSessionAffinity::new(
+            Some("codex".to_string()),
+            Some("account=account-1;session=root-session".to_string()),
+        );
+
+        assert_eq!(
+            pool_sticky_session_token_for_request(&body, Some(&affinity)).as_deref(),
+            Some("session=root-session")
+        );
+    }
+
+    #[test]
+    fn pool_sticky_session_token_uses_codex_affinity_even_when_body_guardian_differs() {
         let body = json!({
             "session_id": "guardian:body-session"
         });
@@ -235,23 +281,23 @@ mod tests {
 
         assert_eq!(
             pool_sticky_session_token_for_request(&body, Some(&affinity)).as_deref(),
-            Some("guardian:body-session")
+            Some("session=other-session")
         );
     }
 
     #[test]
-    fn pool_sticky_session_token_canonicalizes_body_guardian_session() {
+    fn pool_sticky_session_token_preserves_non_codex_guardian_body_session() {
         let body = json!({
             "session_id": "guardian:body-session"
         });
         let affinity = ClientSessionAffinity::new(
-            Some("codex".to_string()),
+            Some("unknown".to_string()),
             Some("session=body-session".to_string()),
         );
 
         assert_eq!(
             pool_sticky_session_token_for_request(&body, Some(&affinity)).as_deref(),
-            Some("body-session")
+            Some("guardian:body-session")
         );
     }
 
@@ -275,7 +321,7 @@ mod tests {
         );
         assert_eq!(
             pool_sticky_session_token_for_request(&body, Some(&affinity)).as_deref(),
-            Some("019f06bb-7437-7903-82e0-14fda38efd65")
+            Some("session=019f06bb-7437-7903-82e0-14fda38efd65")
         );
     }
 

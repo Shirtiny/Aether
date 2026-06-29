@@ -1,6 +1,8 @@
 use aether_contracts::{
-    ExecutionTimeouts, ProxySnapshot, ResolvedTransportProfile, TRANSPORT_BACKEND_REQWEST_RUSTLS,
-    TRANSPORT_HTTP_MODE_AUTO, TRANSPORT_POOL_SCOPE_KEY,
+    codex_default_transport_profile_extra, ExecutionTimeouts, ProxySnapshot,
+    ResolvedTransportProfile, TRANSPORT_BACKEND_REQWEST_DEFAULT_TLS,
+    TRANSPORT_BACKEND_REQWEST_RUSTLS, TRANSPORT_HTTP_MODE_AUTO, TRANSPORT_POOL_SCOPE_KEY,
+    TRANSPORT_PROFILE_CODEX_REQWEST_DEFAULT_TLS_AUTO,
 };
 use async_trait::async_trait;
 use serde_json::{json, Map, Value};
@@ -155,7 +157,26 @@ pub fn resolve_transport_profile(
     resolve_transport_profile_from_fingerprint(transport.key.fingerprint.as_ref()).or_else(|| {
         resolve_transport_profile_from_provider_config(transport.provider.config.as_ref())
             .or_else(|| resolve_grok_browser_transport_profile(transport))
+            .or_else(|| resolve_codex_default_transport_profile(transport))
     })
+}
+
+fn resolve_codex_default_transport_profile(
+    transport: &GatewayProviderTransportSnapshot,
+) -> Option<ResolvedTransportProfile> {
+    transport
+        .provider
+        .provider_type
+        .trim()
+        .eq_ignore_ascii_case("codex")
+        .then(|| ResolvedTransportProfile {
+            profile_id: TRANSPORT_PROFILE_CODEX_REQWEST_DEFAULT_TLS_AUTO.to_string(),
+            backend: TRANSPORT_BACKEND_REQWEST_DEFAULT_TLS.to_string(),
+            http_mode: TRANSPORT_HTTP_MODE_AUTO.to_string(),
+            pool_scope: TRANSPORT_POOL_SCOPE_KEY.to_string(),
+            header_fingerprint: None,
+            extra: Some(codex_default_transport_profile_extra()),
+        })
 }
 
 fn resolve_grok_browser_transport_profile(
@@ -227,11 +248,11 @@ fn parse_transport_profile_value(value: &Value) -> Option<ResolvedTransportProfi
     {
         return Some(ResolvedTransportProfile {
             profile_id: profile_id.to_string(),
-            backend: TRANSPORT_BACKEND_REQWEST_RUSTLS.to_string(),
+            backend: default_backend_for_transport_profile_id(profile_id).to_string(),
             http_mode: TRANSPORT_HTTP_MODE_AUTO.to_string(),
             pool_scope: TRANSPORT_POOL_SCOPE_KEY.to_string(),
             header_fingerprint: None,
-            extra: None,
+            extra: default_extra_for_transport_profile_id(profile_id),
         });
     }
 
@@ -243,7 +264,7 @@ fn parse_transport_profile_value(value: &Value) -> Option<ResolvedTransportProfi
     let backend = json_string_field(object, "backend")
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| TRANSPORT_BACKEND_REQWEST_RUSTLS.to_string());
+        .unwrap_or_else(|| default_backend_for_transport_profile_id(&profile_id).to_string());
     let http_mode = json_string_field(object, "http_mode")
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
@@ -253,7 +274,10 @@ fn parse_transport_profile_value(value: &Value) -> Option<ResolvedTransportProfi
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| TRANSPORT_POOL_SCOPE_KEY.to_string());
     let header_fingerprint = object.get("header_fingerprint").cloned();
-    let extra = object.get("extra").cloned();
+    let extra = object
+        .get("extra")
+        .cloned()
+        .or_else(|| default_extra_for_transport_profile_id(&profile_id));
 
     Some(ResolvedTransportProfile {
         profile_id,
@@ -263,6 +287,24 @@ fn parse_transport_profile_value(value: &Value) -> Option<ResolvedTransportProfi
         header_fingerprint,
         extra,
     })
+}
+
+fn default_backend_for_transport_profile_id(profile_id: &str) -> &'static str {
+    if profile_id
+        .trim()
+        .eq_ignore_ascii_case(TRANSPORT_PROFILE_CODEX_REQWEST_DEFAULT_TLS_AUTO)
+    {
+        TRANSPORT_BACKEND_REQWEST_DEFAULT_TLS
+    } else {
+        TRANSPORT_BACKEND_REQWEST_RUSTLS
+    }
+}
+
+fn default_extra_for_transport_profile_id(profile_id: &str) -> Option<Value> {
+    profile_id
+        .trim()
+        .eq_ignore_ascii_case(TRANSPORT_PROFILE_CODEX_REQWEST_DEFAULT_TLS_AUTO)
+        .then(codex_default_transport_profile_extra)
 }
 
 fn effective_proxy_config(transport: &GatewayProviderTransportSnapshot) -> Option<&Value> {
@@ -330,6 +372,7 @@ fn json_string_field(object: &Map<String, Value>, key: &str) -> Option<String> {
 mod tests {
     use std::collections::BTreeMap;
 
+    use aether_contracts::TRANSPORT_BACKEND_REQWEST_DEFAULT_TLS;
     use async_trait::async_trait;
     use serde_json::{json, Value};
 
@@ -590,7 +633,98 @@ mod tests {
     }
 
     #[test]
-    fn resolves_no_transport_profile_without_fingerprint_configuration() {
+    fn maps_codex_default_tls_profile_to_default_tls_backend() {
+        let mut transport = sample_transport();
+        transport.key.fingerprint = Some(json!({
+            "transport_profile": "codex-reqwest-default-tls-auto"
+        }));
+
+        let profile = resolve_transport_profile(&transport).expect("profile");
+
+        assert_eq!(profile.profile_id, "codex-reqwest-default-tls-auto");
+        assert_eq!(profile.backend, TRANSPORT_BACKEND_REQWEST_DEFAULT_TLS);
+        assert_eq!(profile.http_mode, "auto");
+        assert_eq!(profile.pool_scope, "key");
+        assert_eq!(
+            profile
+                .extra
+                .as_ref()
+                .and_then(|extra| extra.get("tls_fingerprint"))
+                .and_then(|tls| tls.get("ja3_hash"))
+                .and_then(Value::as_str),
+            Some("23211f2b48104c7030b93680a2efcfd0")
+        );
+    }
+
+    #[test]
+    fn maps_codex_default_tls_object_profile_without_backend_to_default_tls_backend() {
+        let mut transport = sample_transport();
+        transport.key.fingerprint = Some(json!({
+            "transport_profile": {
+                "profile_id": "codex-reqwest-default-tls-auto"
+            }
+        }));
+
+        let profile = resolve_transport_profile(&transport).expect("profile");
+
+        assert_eq!(profile.profile_id, "codex-reqwest-default-tls-auto");
+        assert_eq!(profile.backend, TRANSPORT_BACKEND_REQWEST_DEFAULT_TLS);
+        assert_eq!(
+            profile
+                .extra
+                .as_ref()
+                .and_then(|extra| extra.get("tls_fingerprint"))
+                .and_then(|tls| tls.get("ja3_hash"))
+                .and_then(Value::as_str),
+            Some("23211f2b48104c7030b93680a2efcfd0")
+        );
+    }
+
+    #[test]
+    fn codex_client_profile_transport_reference_does_not_override_execution_transport_profile() {
+        let mut transport = sample_transport();
+        transport.key.fingerprint = Some(json!({
+            "codex_client_profile": {
+                "transport_profile_id": "audit-only-profile"
+            },
+            "transport_profile": {
+                "profile_id": "execution-profile",
+                "backend": "reqwest_rustls",
+                "http_mode": "auto",
+                "pool_scope": "key"
+            }
+        }));
+
+        let profile = resolve_transport_profile(&transport).expect("profile");
+
+        assert_eq!(profile.profile_id, "execution-profile");
+    }
+
+    #[test]
+    fn resolves_codex_default_tls_profile_without_fingerprint_configuration() {
+        let mut transport = sample_transport();
+        transport.provider.provider_type = "codex".to_string();
+        transport.key.fingerprint = None;
+        transport.provider.config = None;
+
+        let profile = resolve_transport_profile(&transport).expect("codex default profile");
+
+        assert_eq!(profile.profile_id, "codex-reqwest-default-tls-auto");
+        assert_eq!(profile.backend, TRANSPORT_BACKEND_REQWEST_DEFAULT_TLS);
+        assert_eq!(
+            profile
+                .extra
+                .as_ref()
+                .and_then(|extra| extra.get("tls_fingerprint"))
+                .and_then(|tls| tls.get("ja3_hash"))
+                .and_then(Value::as_str),
+            Some("23211f2b48104c7030b93680a2efcfd0")
+        );
+        assert!(!transport_profile_is_configured(&transport));
+    }
+
+    #[test]
+    fn resolves_no_transport_profile_for_custom_without_fingerprint_configuration() {
         let mut transport = sample_transport();
         transport.key.fingerprint = None;
         transport.provider.config = None;

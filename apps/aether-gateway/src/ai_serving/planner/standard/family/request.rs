@@ -21,7 +21,7 @@ use crate::ai_serving::planner::redaction::{
 };
 use crate::ai_serving::planner::spec_metadata::local_standard_spec_metadata;
 use crate::ai_serving::planner::standard::{
-    apply_codex_openai_responses_special_headers, apply_codex_pool_stable_client_headers,
+    apply_codex_openai_responses_special_headers, apply_codex_pool_concrete_account_profile,
     apply_deepseek_tool_call_thinking_compat, is_deepseek_provider,
     request_body_build_failure_extra_data,
 };
@@ -843,7 +843,11 @@ pub(crate) async fn resolve_local_standard_candidate_payload_parts(
         Some(trace_id),
         transport.key.decrypted_auth_config.as_deref(),
     );
-    apply_codex_pool_stable_client_headers(&mut provider_request_headers, transport);
+    apply_codex_pool_concrete_account_profile(
+        &mut provider_request_headers,
+        &mut provider_request_body,
+        transport,
+    );
     request_identity_response_encoding_when_redacted(
         &mut provider_request_headers,
         redaction.redacted,
@@ -984,17 +988,22 @@ async fn build_gemini_cli_cross_format_payload_parts(
             }
         };
 
+    let mut provider_request_body = resolved.body;
     let mut provider_request_headers = resolved.headers.headers;
     apply_codex_openai_responses_special_headers(
         &mut provider_request_headers,
-        &resolved.body,
+        &provider_request_body,
         effective_headers,
         resolved.transport.provider.provider_type.as_str(),
         provider_api_format,
         Some(trace_id),
         resolved.transport.key.decrypted_auth_config.as_deref(),
     );
-    apply_codex_pool_stable_client_headers(&mut provider_request_headers, &resolved.transport);
+    apply_codex_pool_concrete_account_profile(
+        &mut provider_request_headers,
+        &mut provider_request_body,
+        &resolved.transport,
+    );
     request_identity_response_encoding_when_redacted(
         &mut provider_request_headers,
         request_redacted,
@@ -1005,7 +1014,7 @@ async fn build_gemini_cli_cross_format_payload_parts(
         auth_value: resolved.headers.auth_value,
         mapped_model,
         provider_api_format: provider_api_format.to_string(),
-        provider_request_body: resolved.body,
+        provider_request_body,
         provider_request_headers,
         upstream_url: resolved.upstream_url,
         upstream_is_stream,
@@ -1259,14 +1268,19 @@ async fn resolve_local_gemini_image_to_openai_image_candidate_payload_parts(
         Some(trace_id),
         transport.key.decrypted_auth_config.as_deref(),
     );
-    apply_codex_pool_stable_client_headers(&mut provider_request_headers, transport);
+    let mut provider_request_body = converted.body_json;
+    apply_codex_pool_concrete_account_profile(
+        &mut provider_request_headers,
+        &mut provider_request_body,
+        transport,
+    );
 
     Some(LocalStandardCandidatePayloadParts {
         auth_header: prepared_candidate.auth_header,
         auth_value: prepared_candidate.auth_value,
         mapped_model: converted.mapped_model,
         provider_api_format: provider_api_format.to_string(),
-        provider_request_body: converted.body_json,
+        provider_request_body,
         provider_request_headers,
         upstream_url,
         upstream_is_stream,

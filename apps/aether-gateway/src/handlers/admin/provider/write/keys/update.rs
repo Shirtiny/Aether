@@ -342,10 +342,34 @@ pub(crate) async fn build_admin_update_provider_key_record(
             .transpose()?;
     }
 
-    updated.updated_at_unix_secs = SystemTime::now()
+    let effective_auth_config_raw = auth_config
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|err| err.to_string())?
+        .or_else(|| {
+            parse_catalog_auth_config_json(state, existing)
+                .map(serde_json::Value::Object)
+                .map(|value| value.to_string())
+        });
+    let now_unix_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .ok()
-        .map(|duration| duration.as_secs());
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    if let Some(outcome) = crate::ai_serving::materialize_codex_pool_key_fingerprint(
+        provider.provider_type.as_str(),
+        provider.config.as_ref(),
+        updated.fingerprint.as_ref(),
+        effective_auth_config_raw.as_deref(),
+        updated.id.as_str(),
+        updated.name.as_str(),
+        now_unix_secs,
+    ) {
+        updated.fingerprint = Some(outcome.fingerprint);
+    }
+
+    updated.updated_at_unix_secs = Some(now_unix_secs);
     Ok(updated)
 }
 
