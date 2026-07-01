@@ -965,6 +965,22 @@ impl AppState {
         }
     }
 
+    pub(crate) fn upsert_local_execution_runtime_miss_diagnostic<F>(
+        &self,
+        trace_id: &str,
+        default: LocalExecutionRuntimeMissDiagnostic,
+        mutate: F,
+    ) where
+        F: FnOnce(&mut LocalExecutionRuntimeMissDiagnostic),
+    {
+        let mut diagnostics = self
+            .local_execution_runtime_miss_diagnostics
+            .lock()
+            .expect("local execution runtime miss diagnostics should lock");
+        let diagnostic = diagnostics.entry(trace_id.to_string()).or_insert(default);
+        mutate(diagnostic);
+    }
+
     pub(crate) fn local_execution_runtime_miss_diagnostic_has_candidate_signal(
         &self,
         trace_id: &str,

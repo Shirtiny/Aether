@@ -108,7 +108,7 @@ pub(crate) async fn build_local_video_sync_attempt_source_for_kind<'a>(
 #[async_trait]
 impl LocalExecutionAttemptSource<AiSyncAttempt> for LocalVideoCreateSyncAttemptSource<'_> {
     async fn next_execution_attempt(&mut self) -> Result<Option<AiSyncAttempt>, GatewayError> {
-        while let Some(attempt) = self.candidates.next_attempt().await {
+        while let Some(attempt) = self.candidates.next_attempt().await? {
             let cleanup_attempt = attempt.clone();
             let mut sticky_init_cleanup = attempt.pool_sticky_init_cleanup_guard(self.state);
             let built_attempt = match self.build_sync_attempt(attempt).await {
@@ -228,7 +228,7 @@ pub(crate) async fn maybe_build_sync_local_video_decision_payload(
         return Ok(None);
     };
 
-    while let Some(attempt) = source.next_attempt().await {
+    while let Some(attempt) = source.next_attempt().await? {
         let cleanup_attempt = attempt.clone();
         let payload = match maybe_build_local_video_create_decision_payload_for_candidate(
             state, parts, body_json, trace_id, &input, attempt, spec,
@@ -282,7 +282,7 @@ async fn build_local_sync_plan_and_reports(
     };
 
     let mut plans = Vec::new();
-    while let Some(attempt) = source.next_attempt().await {
+    while let Some(attempt) = source.next_attempt().await? {
         let sticky_init_attempt = local_candidate_attempt_has_sticky_init_owner(&attempt);
         let cleanup_attempt = attempt.clone();
         let payload = match maybe_build_local_video_create_decision_payload_for_candidate(

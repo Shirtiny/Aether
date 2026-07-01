@@ -35,7 +35,10 @@ use crate::ai_serving::planner::candidate_source::{
 };
 use crate::ai_serving::planner::materialization_policy::LocalCandidatePersistencePolicy;
 use crate::ai_serving::planner::pool_scheduler::PoolKeyCursor;
-use crate::ai_serving::planner::runtime_miss::record_local_runtime_candidate_skip_reason;
+use crate::ai_serving::planner::runtime_miss::{
+    record_local_runtime_candidate_skip_reason,
+    upsert_local_runtime_candidate_selection_unavailable,
+};
 use crate::ai_serving::planner::CandidateFailureDiagnostic;
 use crate::ai_serving::{GatewayAuthApiKeySnapshot, PlannerAppState};
 use crate::clock::current_unix_ms;
@@ -104,16 +107,20 @@ impl<'a> LocalExecutionCandidateAttemptSource<'a> {
         Self { items }
     }
 
-    pub(crate) async fn next_attempt(&mut self) -> Option<LocalExecutionCandidateAttempt> {
+    pub(crate) async fn next_attempt(
+        &mut self,
+    ) -> Result<Option<LocalExecutionCandidateAttempt>, GatewayError> {
         loop {
-            let front = self.items.front_mut()?;
+            let Some(front) = self.items.front_mut() else {
+                return Ok(None);
+            };
             match front {
                 LocalExecutionCandidateAttemptSourceItem::Static { attempts } => {
                     if let Some(attempt) = next_attempt_from_dispatch_sequence(attempts) {
                         if dispatch_sequence_exhausted(attempts) {
                             self.items.pop_front();
                         }
-                        return Some(attempt);
+                        return Ok(Some(attempt));
                     }
                     self.items.pop_front();
                 }
@@ -124,7 +131,7 @@ impl<'a> LocalExecutionCandidateAttemptSource<'a> {
                     pool_exhaustion_persistence,
                 } => {
                     if let Some(attempt) = next_attempt_from_dispatch_sequence(pending_attempts) {
-                        return Some(attempt);
+                        return Ok(Some(attempt));
                     }
                     let Some(candidate) = next_pool_cursor_candidate_with_timeout(
                         cursor,
@@ -145,11 +152,11 @@ impl<'a> LocalExecutionCandidateAttemptSource<'a> {
                     );
                 }
                 LocalExecutionCandidateAttemptSourceItem::RequestedModelPage { cursor } => {
-                    let Some(attempt) = cursor.next_attempt().await else {
+                    let Some(attempt) = cursor.next_attempt().await? else {
                         self.items.pop_front();
                         continue;
                     };
-                    return Some(attempt);
+                    return Ok(Some(attempt));
                 }
             }
         }
@@ -831,7 +838,7 @@ pub(crate) async fn build_lazy_requested_model_execution_candidate_attempt_sourc
     resolution_mode: LocalCandidateResolutionMode,
     build_available_extra_data: F,
     decorate_skipped_candidate: G,
-) -> (LocalExecutionCandidateAttemptSource<'a>, usize)
+) -> Result<(LocalExecutionCandidateAttemptSource<'a>, usize), GatewayError>
 where
     F: Fn(&EligibleLocalExecutionCandidate) -> Option<Value> + Send + Sync + 'a,
     G: Fn(SkippedLocalExecutionCandidate) -> SkippedLocalExecutionCandidate + Send + Sync + 'a,
@@ -881,7 +888,7 @@ where
         scheduler_cache_affinity_enabled,
         auth_api_key_concurrency_wait_deadline: None,
     };
-    cursor.load_next_page().await;
+    cursor.load_next_page().await?;
     let candidate_count = cursor.candidate_count;
     let mut items = VecDeque::new();
     if !cursor.pending_items.is_empty() {
@@ -891,10 +898,10 @@ where
             },
         );
     }
-    (
+    Ok((
         LocalExecutionCandidateAttemptSource { items },
         candidate_count,
-    )
+    ))
 }
 
 struct RequestedModelAttemptPageCursor<'a> {
@@ -925,13 +932,15 @@ struct RequestedModelAttemptPageCursor<'a> {
 }
 
 impl<'a> RequestedModelAttemptPageCursor<'a> {
-    async fn next_attempt(&mut self) -> Option<LocalExecutionCandidateAttempt> {
+    async fn next_attempt(
+        &mut self,
+    ) -> Result<Option<LocalExecutionCandidateAttempt>, GatewayError> {
         loop {
             if let Some(attempt) = pop_attempt_from_items(&mut self.pending_items).await {
-                return Some(attempt);
+                return Ok(Some(attempt));
             }
-            if !self.load_next_page().await {
-                return None;
+            if !self.load_next_page().await? {
+                return Ok(None);
             }
         }
     }
@@ -953,18 +962,19 @@ impl<'a> RequestedModelAttemptPageCursor<'a> {
         drained
     }
 
-    async fn load_next_page(&mut self) -> bool {
+    async fn load_next_page(&mut self) -> Result<bool, GatewayError> {
         loop {
             let page = match self.page_cursor.next_page().await {
                 Ok(Some(page)) => page,
-                Ok(None) => return false,
+                Ok(None) => return Ok(false),
                 Err(error) => {
                     warn!(
                         trace_id = %self.trace_id,
                         error = ?error,
                         "gateway lazy requested-model candidate page read failed"
                     );
-                    return false;
+                    self.record_candidate_selection_unavailable();
+                    return Err(error);
                 }
             };
 
@@ -974,7 +984,7 @@ impl<'a> RequestedModelAttemptPageCursor<'a> {
                 }
                 self.persist_final_auth_api_key_concurrency_skips(page.skipped_candidates)
                     .await;
-                return false;
+                return Ok(false);
             }
 
             let (candidates, resolved_skipped) =
@@ -1041,7 +1051,7 @@ impl<'a> RequestedModelAttemptPageCursor<'a> {
                 .saturating_add(u32::try_from(skipped_candidate_count).unwrap_or(u32::MAX));
             if !items.is_empty() {
                 self.pending_items = items;
-                return true;
+                return Ok(true);
             }
             let skipped_starting_candidate_index = next_candidate_index;
             let skipped_persistence = LocalSkippedCandidatePersistenceContext {
@@ -1065,6 +1075,20 @@ impl<'a> RequestedModelAttemptPageCursor<'a> {
             )
             .await;
         }
+    }
+
+    fn record_candidate_selection_unavailable(&self) {
+        if !self.record_runtime_miss_diagnostic {
+            return;
+        }
+        upsert_local_runtime_candidate_selection_unavailable(
+            self.state.app(),
+            &self.trace_id,
+            Some(self.client_api_format.clone()),
+            Some("requested_model".to_string()),
+            Some(self.client_api_format.clone()),
+            Some(self.requested_model.clone()),
+        );
     }
 
     async fn wait_for_auth_api_key_concurrency_retry(&mut self) -> bool {
@@ -1976,11 +2000,16 @@ mod tests {
     use aether_data::repository::candidate_selection::InMemoryMinimalCandidateSelectionReadRepository;
     use aether_data::repository::candidates::InMemoryRequestCandidateRepository;
     use aether_data::repository::provider_catalog::InMemoryProviderCatalogReadRepository;
-    use aether_data_contracts::repository::candidate_selection::StoredMinimalCandidateSelectionRow;
+    use aether_data_contracts::repository::candidate_selection::{
+        MinimalCandidateSelectionReadRepository, StoredMinimalCandidateSelectionRow,
+        StoredPoolKeyCandidateRowsByKeyIdsQuery, StoredPoolKeyCandidateRowsQuery,
+        StoredRequestedModelCandidateRowsQuery,
+    };
     use aether_data_contracts::repository::candidates::RequestCandidateStatus;
     use aether_data_contracts::repository::provider_catalog::{
         StoredProviderCatalogEndpoint, StoredProviderCatalogKey, StoredProviderCatalogProvider,
     };
+    use aether_data_contracts::DataLayerError;
     use aether_provider_transport::snapshot::{
         GatewayProviderTransportEndpoint, GatewayProviderTransportKey,
         GatewayProviderTransportProvider,
@@ -1990,6 +2019,7 @@ mod tests {
         SchedulerMinimalCandidateSelectionCandidate, SchedulerPriorityMode, SchedulerRankingMode,
         SchedulerRankingOutcome,
     };
+    use async_trait::async_trait;
     use serde_json::json;
 
     use super::*;
@@ -2003,6 +2033,68 @@ mod tests {
     use crate::orchestration::LocalExecutionCandidateMetadata;
     use crate::scheduler::affinity::SCHEDULER_AFFINITY_TTL;
     use crate::state::FrontdoorRuntimeGuardConfig;
+
+    #[derive(Debug, Default)]
+    struct FailingMinimalCandidateSelectionReadRepository;
+
+    #[async_trait]
+    impl MinimalCandidateSelectionReadRepository for FailingMinimalCandidateSelectionReadRepository {
+        async fn list_for_exact_api_format(
+            &self,
+            _api_format: &str,
+        ) -> Result<Vec<StoredMinimalCandidateSelectionRow>, DataLayerError> {
+            Err(DataLayerError::TimedOut(
+                "candidate selection unavailable".to_string(),
+            ))
+        }
+
+        async fn list_for_exact_api_format_and_global_model(
+            &self,
+            _api_format: &str,
+            _global_model_name: &str,
+        ) -> Result<Vec<StoredMinimalCandidateSelectionRow>, DataLayerError> {
+            Err(DataLayerError::TimedOut(
+                "candidate selection unavailable".to_string(),
+            ))
+        }
+
+        async fn list_for_exact_api_format_and_requested_model(
+            &self,
+            _api_format: &str,
+            _requested_model_name: &str,
+        ) -> Result<Vec<StoredMinimalCandidateSelectionRow>, DataLayerError> {
+            Err(DataLayerError::TimedOut(
+                "candidate selection unavailable".to_string(),
+            ))
+        }
+
+        async fn list_for_exact_api_format_and_requested_model_page(
+            &self,
+            _query: &StoredRequestedModelCandidateRowsQuery,
+        ) -> Result<Vec<StoredMinimalCandidateSelectionRow>, DataLayerError> {
+            Err(DataLayerError::TimedOut(
+                "candidate selection unavailable".to_string(),
+            ))
+        }
+
+        async fn list_pool_key_rows_for_group(
+            &self,
+            _query: &StoredPoolKeyCandidateRowsQuery,
+        ) -> Result<Vec<StoredMinimalCandidateSelectionRow>, DataLayerError> {
+            Err(DataLayerError::TimedOut(
+                "candidate selection unavailable".to_string(),
+            ))
+        }
+
+        async fn list_pool_key_rows_for_group_key_ids(
+            &self,
+            _query: &StoredPoolKeyCandidateRowsByKeyIdsQuery,
+        ) -> Result<Vec<StoredMinimalCandidateSelectionRow>, DataLayerError> {
+            Err(DataLayerError::TimedOut(
+                "candidate selection unavailable".to_string(),
+            ))
+        }
+    }
 
     fn sample_candidate(key_id: &str) -> SchedulerMinimalCandidateSelectionCandidate {
         SchedulerMinimalCandidateSelectionCandidate {
@@ -2683,6 +2775,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lazy_requested_model_candidate_page_error_is_not_reported_as_empty_list() {
+        let app = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_auth_candidate_selection_provider_catalog_and_request_candidate_repository_for_tests(
+                    Arc::new(InMemoryAuthApiKeySnapshotRepository::default()),
+                    Arc::new(FailingMinimalCandidateSelectionReadRepository),
+                    Arc::new(InMemoryProviderCatalogReadRepository::seed(
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                    )),
+                    Arc::new(InMemoryRequestCandidateRepository::default()),
+                    "test-encryption-key",
+                ),
+            );
+        let trace_id = "trace-candidate-page-read-failed";
+        app.set_local_execution_runtime_miss_diagnostic(
+            trace_id,
+            crate::LocalExecutionRuntimeMissDiagnostic {
+                reason: "candidate_evaluation_incomplete".to_string(),
+                route_family: Some("openai".to_string()),
+                route_kind: Some("chat".to_string()),
+                public_path: Some("/v1/chat/completions".to_string()),
+                plan_kind: Some("openai_chat_stream".to_string()),
+                requested_model: Some("gpt-5".to_string()),
+                candidate_count: None,
+                skipped_candidate_count: None,
+                skip_reasons: std::collections::BTreeMap::new(),
+            },
+        );
+
+        let err = match build_lazy_requested_model_execution_candidate_attempt_source_with_serving(
+            PlannerAppState::new(&app),
+            trace_id,
+            "openai:chat",
+            "gpt-5",
+            true,
+            &sample_auth_snapshot(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            LocalCandidatePersistencePolicy {
+                available: LocalAvailableCandidatePersistenceContext {
+                    user_id: "user-1",
+                    api_key_id: "api-key-1",
+                    required_capabilities: None,
+                    error_context: "persist should not fail",
+                },
+                skipped: LocalSkippedCandidatePersistenceContext {
+                    user_id: "user-1",
+                    api_key_id: "api-key-1",
+                    required_capabilities: None,
+                    error_context: "persist should not fail",
+                    record_runtime_miss_diagnostic: true,
+                },
+            },
+            false,
+            LocalCandidatePreselectionKeyMode::ProviderEndpointKeyModel,
+            LocalCandidateResolutionMode::Standard,
+            no_extra_data,
+            identity_skipped_candidate,
+        )
+        .await
+        {
+            Ok(_) => panic!("candidate page read failure should propagate"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.into_message()
+                .contains("candidate selection unavailable"),
+            "unexpected error message"
+        );
+        let diagnostic = app
+            .take_local_execution_runtime_miss_diagnostic(trace_id)
+            .expect("diagnostic should be retained");
+        assert_eq!(diagnostic.reason, "candidate_selection_unavailable");
+        assert_ne!(diagnostic.reason, "candidate_list_empty");
+        assert_eq!(
+            diagnostic.plan_kind.as_deref(),
+            Some("lazy_requested_model_candidate_page")
+        );
+    }
+
+    #[tokio::test]
     async fn dynamic_attempt_source_does_not_drain_unexecuted_single_keys() {
         let mut source = LocalExecutionCandidateAttemptSource {
             items: VecDeque::from([LocalExecutionCandidateAttemptSourceItem::Static {
@@ -2699,12 +2879,13 @@ mod tests {
         let first = source
             .next_attempt()
             .await
+            .expect("attempt source should not fail")
             .expect("first attempt should be available");
         assert_eq!(first.eligible.candidate.key_id, "normal-key");
 
         let remaining = source.drain_static_attempts();
         assert!(remaining.is_empty());
-        assert!(source.next_attempt().await.is_none());
+        assert!(source.next_attempt().await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -2733,7 +2914,7 @@ mod tests {
                 .as_deref(),
             Some("owner-1")
         );
-        assert!(source.next_attempt().await.is_none());
+        assert!(source.next_attempt().await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -2787,6 +2968,7 @@ mod tests {
         let first = source
             .next_attempt()
             .await
+            .expect("attempt source should not fail")
             .expect("sticky initializer should be returned");
 
         assert!(
@@ -2807,6 +2989,7 @@ mod tests {
         let second = source
             .next_attempt()
             .await
+            .expect("attempt source should not fail")
             .expect("dynamic pool source should continue after sticky initializer");
         assert_eq!(second.eligible.candidate.key_id, "pool-key-b");
         assert!(
@@ -2942,7 +3125,7 @@ mod tests {
             }]),
         };
 
-        assert!(source.next_attempt().await.is_none());
+        assert!(source.next_attempt().await.unwrap().is_none());
 
         let stored = app
             .read_request_candidates_by_request_id("trace-dynamic-pool")

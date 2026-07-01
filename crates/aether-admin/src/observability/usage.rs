@@ -496,6 +496,7 @@ fn admin_usage_local_runtime_miss_reason_label(reason: &str) -> &'static str {
     match reason {
         "all_candidates_skipped" => "所有候选均被跳过",
         "candidate_list_empty" => "没有可调度候选",
+        "candidate_selection_unavailable" => "候选读取失败或超时",
         "local_runtime_unavailable" => "本地执行运行时不可用",
         "provider_transport_unavailable" => "提供商传输不可用",
         _ => "本地调度未命中",

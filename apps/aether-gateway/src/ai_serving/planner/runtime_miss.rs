@@ -254,3 +254,32 @@ pub(crate) fn record_local_runtime_candidate_skip_reason(
     let port = GatewayRuntimeMissDiagnosticPort { state: Some(state) };
     record_ai_runtime_candidate_skip_reason(&port, trace_id, skip_reason);
 }
+
+pub(crate) fn upsert_local_runtime_candidate_selection_unavailable(
+    state: &AppState,
+    trace_id: &str,
+    route_family: Option<String>,
+    route_kind: Option<String>,
+    public_path: Option<String>,
+    requested_model: Option<String>,
+) {
+    state.upsert_local_execution_runtime_miss_diagnostic(
+        trace_id,
+        LocalExecutionRuntimeMissDiagnostic {
+            reason: "candidate_selection_unavailable".to_string(),
+            route_family,
+            route_kind,
+            public_path,
+            plan_kind: Some("lazy_requested_model_candidate_page".to_string()),
+            requested_model: requested_model.clone(),
+            candidate_count: None,
+            skipped_candidate_count: None,
+            skip_reasons: std::collections::BTreeMap::new(),
+        },
+        |diagnostic| {
+            diagnostic.reason = "candidate_selection_unavailable".to_string();
+            diagnostic.plan_kind = Some("lazy_requested_model_candidate_page".to_string());
+            diagnostic.requested_model = requested_model;
+        },
+    );
+}

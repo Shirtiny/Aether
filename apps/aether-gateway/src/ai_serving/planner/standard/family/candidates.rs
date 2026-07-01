@@ -309,7 +309,7 @@ pub(super) async fn build_local_standard_candidate_attempt_source<'a>(
                 skipped_candidate
             },
         )
-        .await;
+        .await?;
     Ok((source, candidate_count))
 }
 
