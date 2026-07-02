@@ -1000,12 +1000,14 @@ fn provider_query_test_key_sort_key(
     endpoint_api_format: &str,
     now_unix_secs: u64,
     codex_quota_basis: Option<&str>,
+    codex_quota_soft_threshold_percent: Option<f64>,
 ) -> (u8, u8, i32, u64, i32) {
     let quota_exhausted =
-        admin_provider_pool_pure::admin_pool_key_account_quota_exhausted_with_basis(
+        admin_provider_pool_pure::admin_pool_key_account_quota_exhausted_with_policy(
             key,
             provider_type,
             codex_quota_basis,
+            codex_quota_soft_threshold_percent,
         );
     let circuit_open = key
         .circuit_breaker_by_format
@@ -1050,6 +1052,7 @@ fn provider_query_pool_sort_seed() -> String {
 
 fn provider_query_ai_pool_scheduling_config(
     config: &AdminProviderPoolConfig,
+    provider_type: &str,
 ) -> AiPoolSchedulingConfig {
     AiPoolSchedulingConfig {
         scheduling_presets: config
@@ -1062,7 +1065,7 @@ fn provider_query_ai_pool_scheduling_config(
             })
             .collect(),
         lru_enabled: config.lru_enabled,
-        skip_exhausted_accounts: config.skip_exhausted_accounts,
+        skip_exhausted_accounts: config.skip_quota_exhausted_for_provider(provider_type),
         sticky_session_enabled: config.sticky_session_ttl_seconds > 0,
         cost_limit_per_key_tokens: config.cost_limit_per_key_tokens,
     }
@@ -1170,13 +1173,15 @@ fn provider_query_pool_catalog_key_quota_exhausted(
     provider_type: &str,
     quota_snapshot: Option<&Map<String, Value>>,
     codex_quota_basis: Option<&str>,
+    codex_quota_soft_threshold_percent: Option<f64>,
 ) -> bool {
     match provider_type.trim().to_ascii_lowercase().as_str() {
         "codex" | "kiro" | "chatgpt_web" => {
-            admin_provider_pool_pure::admin_pool_key_account_quota_exhausted_with_basis(
+            admin_provider_pool_pure::admin_pool_key_account_quota_exhausted_with_policy(
                 key,
                 provider_type,
                 codex_quota_basis,
+                codex_quota_soft_threshold_percent,
             )
         }
         _ => quota_snapshot
@@ -1191,6 +1196,7 @@ fn provider_query_pool_catalog_key_context(
     key: &StoredProviderCatalogKey,
     provider_type: &str,
     codex_quota_basis: Option<&str>,
+    codex_quota_soft_threshold_percent: Option<f64>,
 ) -> AiPoolCatalogKeyContext {
     let status_snapshot = provider_key_status_snapshot_payload(key, provider_type);
     let quota_snapshot = status_snapshot
@@ -1233,6 +1239,7 @@ fn provider_query_pool_catalog_key_context(
             provider_type,
             quota_snapshot,
             codex_quota_basis,
+            codex_quota_soft_threshold_percent,
         ),
         health_score,
         latency_avg_ms: None,
@@ -1249,6 +1256,7 @@ async fn provider_query_apply_pool_scheduler_to_test_candidates(
     keys: Vec<StoredProviderCatalogKey>,
     pool_config: &AdminProviderPoolConfig,
     codex_quota_basis: Option<&str>,
+    codex_quota_soft_threshold_percent: Option<f64>,
 ) -> Vec<ProviderQueryTestCandidate> {
     let key_ids = keys.iter().map(|key| key.id.clone()).collect::<Vec<_>>();
     let runtime = if key_ids.is_empty() {
@@ -1268,7 +1276,8 @@ async fn provider_query_apply_pool_scheduler_to_test_candidates(
         provider.id.clone(),
         provider_query_ai_pool_runtime_state(&runtime),
     );
-    let ai_pool_config = provider_query_ai_pool_scheduling_config(pool_config);
+    let ai_pool_config =
+        provider_query_ai_pool_scheduling_config(pool_config, provider.provider_type.as_str());
     let inputs = keys
         .into_iter()
         .map(|key| {
@@ -1294,6 +1303,7 @@ async fn provider_query_apply_pool_scheduler_to_test_candidates(
                     &key,
                     &provider.provider_type,
                     codex_quota_basis,
+                    codex_quota_soft_threshold_percent,
                 ),
                 candidate,
             }
@@ -1483,6 +1493,7 @@ async fn provider_query_build_kiro_test_candidates(
             &endpoint.api_format,
             now_unix_secs,
             None,
+            None,
         )
     });
 
@@ -1500,6 +1511,7 @@ async fn provider_query_build_kiro_test_candidates(
                 keys,
                 &pool_config,
                 Some(codex_quota_basis.as_str()),
+                pool_config.cost_soft_threshold_percent,
             )
             .await
         } else {
@@ -1509,6 +1521,7 @@ async fn provider_query_build_kiro_test_candidates(
                     key,
                     &endpoint.api_format,
                     now_unix_secs,
+                    None,
                     None,
                 )
             });
@@ -1528,6 +1541,7 @@ async fn provider_query_build_kiro_test_candidates(
                 key,
                 &endpoint.api_format,
                 now_unix_secs,
+                None,
                 None,
             )
         });

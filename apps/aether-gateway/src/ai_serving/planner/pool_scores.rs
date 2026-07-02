@@ -18,6 +18,7 @@ pub(crate) fn build_provider_key_pool_score_upsert(
     score_rules: PoolMemberScoreRules,
     skip_exhausted_accounts: bool,
     codex_quota_basis: Option<&str>,
+    codex_quota_soft_threshold_percent: Option<f64>,
 ) -> UpsertPoolMemberScore {
     let identity = PoolMemberIdentity::provider_api_key(key.provider_id.clone(), key.id.clone());
     let scope = provider_key_pool_score_scope();
@@ -30,6 +31,7 @@ pub(crate) fn build_provider_key_pool_score_upsert(
         now_unix_secs,
         skip_exhausted_accounts,
         codex_quota_basis,
+        codex_quota_soft_threshold_percent,
     );
     let output = score_pool_member_with_rules(&input, score_rules);
     UpsertPoolMemberScore {
@@ -94,6 +96,7 @@ fn provider_key_score_input(
     now_unix_secs: u64,
     skip_exhausted_accounts: bool,
     codex_quota_basis: Option<&str>,
+    codex_quota_soft_threshold_percent: Option<f64>,
 ) -> PoolMemberScoreInput {
     let status_snapshot = provider_key_status_snapshot_payload(key, provider_type);
     let quota_snapshot = status_snapshot
@@ -123,10 +126,11 @@ fn provider_key_score_input(
             .and_then(json_f64)
             .map(|value| value.clamp(0.0, 1.0)),
         quota_exhausted: skip_exhausted_accounts
-            && aether_admin::provider::pool::admin_pool_key_account_quota_exhausted_with_basis(
+            && aether_admin::provider::pool::admin_pool_key_account_quota_exhausted_with_policy(
                 key,
                 provider_type,
                 codex_quota_basis,
+                codex_quota_soft_threshold_percent,
             ),
         account_blocked: account_snapshot
             .and_then(|account| account.get("blocked"))
@@ -212,6 +216,7 @@ mod tests {
             PoolMemberScoreRules::default(),
             true,
             None,
+            None,
         );
 
         assert_eq!(score.hard_state, PoolMemberHardState::Available);
@@ -229,6 +234,7 @@ mod tests {
             now_unix_secs,
             PoolMemberScoreRules::default(),
             true,
+            None,
             None,
         );
 
@@ -263,6 +269,7 @@ mod tests {
             now_unix_secs,
             PoolMemberScoreRules::default(),
             false,
+            None,
             None,
         );
 

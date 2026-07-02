@@ -299,6 +299,7 @@ fn prune_unschedulable_active_probe_members_for_request(
             &pool_config,
             runtime,
             key_id,
+            candidate.transport.provider.provider_type.as_str(),
             key_context_by_id.get(key_id),
         ) {
             continue;
@@ -316,6 +317,7 @@ fn active_probe_member_is_unschedulable_for_request(
     pool_config: &AdminProviderPoolConfig,
     runtime: &AdminProviderPoolRuntimeState,
     key_id: &str,
+    provider_type: &str,
     key_context: Option<&PoolCatalogKeyContext>,
 ) -> bool {
     if runtime.cooldown_reason_by_key.contains_key(key_id) {
@@ -332,7 +334,9 @@ fn active_probe_member_is_unschedulable_for_request(
         return true;
     }
     key_context.is_some_and(|context| {
-        context.account_blocked || (pool_config.skip_exhausted_accounts && context.quota_exhausted)
+        context.account_blocked
+            || (pool_config.skip_quota_exhausted_for_provider(provider_type)
+                && context.quota_exhausted)
     })
 }
 
@@ -1076,6 +1080,7 @@ impl<'a> PoolKeyCursor<'a> {
             &key,
             self.group.transport.provider.provider_type.as_str(),
             Some(pool_config.codex_quota_exhaustion_basis.as_str()),
+            pool_config.cost_soft_threshold_percent,
         );
         if key_context.account_blocked {
             return StickyCandidateLookup::Ineligible {
@@ -1083,7 +1088,10 @@ impl<'a> PoolKeyCursor<'a> {
                 reason: POOL_ACCOUNT_BLOCKED_SKIP_REASON,
             };
         }
-        if pool_config.skip_exhausted_accounts && key_context.quota_exhausted {
+        if pool_config
+            .skip_quota_exhausted_for_provider(self.group.transport.provider.provider_type.as_str())
+            && key_context.quota_exhausted
+        {
             return StickyCandidateLookup::Ineligible {
                 bound_key_id: sticky_key_id,
                 reason: POOL_ACCOUNT_EXHAUSTED_SKIP_REASON,
@@ -1525,6 +1533,7 @@ async fn read_pool_catalog_key_contexts_by_id(
     let mut key_ids = Vec::new();
     let mut provider_type_by_key_id = BTreeMap::<String, String>::new();
     let mut codex_quota_basis_by_key_id = BTreeMap::<String, String>::new();
+    let mut codex_quota_soft_threshold_by_key_id = BTreeMap::<String, f64>::new();
 
     for candidate in candidates {
         let Some(pool_config) = pool_config_for_candidate(candidate) else {
@@ -1537,6 +1546,9 @@ async fn read_pool_catalog_key_contexts_by_id(
                 key_id.clone(),
                 pool_config.codex_quota_exhaustion_basis.clone(),
             );
+            if let Some(threshold) = pool_config.cost_soft_threshold_percent {
+                codex_quota_soft_threshold_by_key_id.insert(key_id.clone(), threshold);
+            }
             key_ids.push(key_id);
         }
     }
@@ -1577,6 +1589,7 @@ async fn read_pool_catalog_key_contexts_by_id(
                     &key,
                     provider_type,
                     codex_quota_basis_by_key_id.get(&key.id).map(String::as_str),
+                    codex_quota_soft_threshold_by_key_id.get(&key.id).copied(),
                 ),
             )
         })
@@ -1589,6 +1602,7 @@ fn build_pool_catalog_key_context(
     key: &StoredProviderCatalogKey,
     provider_type: &str,
     codex_quota_basis: Option<&str>,
+    codex_quota_soft_threshold_percent: Option<f64>,
 ) -> PoolCatalogKeyContext {
     let (health_score, _, _, _, _) = provider_key_health_summary(key);
     let health_score = key
@@ -1604,6 +1618,14 @@ fn build_pool_catalog_key_context(
         auth_config.as_ref(),
         codex_quota_basis,
     );
+    if admin_provider_pool_pure::admin_pool_key_account_quota_exhausted_with_policy(
+        key,
+        provider_type,
+        codex_quota_basis,
+        codex_quota_soft_threshold_percent,
+    ) {
+        signals.quota_exhausted = true;
+    }
     signals.account_blocked |= admin_provider_pool_pure::admin_pool_key_is_known_banned(key);
     signals.account_blocked |=
         pool_key_requires_reauth_for_scheduling(key, current_unix_ms().saturating_div(1000));
@@ -1972,6 +1994,7 @@ fn pool_scheduling_config(
     provider_type: &str,
 ) -> PoolSchedulingConfig {
     let service = ProviderPoolService::with_builtin_adapters();
+    let skip_exhausted_accounts = config.skip_quota_exhausted_for_provider(provider_type);
     let scheduling_presets = config
         .scheduling_presets
         .into_iter()
@@ -1985,7 +2008,7 @@ fn pool_scheduling_config(
         scheduling_presets: service
             .normalize_scheduling_presets(provider_type, &scheduling_presets),
         lru_enabled: config.lru_enabled,
-        skip_exhausted_accounts: config.skip_exhausted_accounts,
+        skip_exhausted_accounts,
         sticky_session_enabled: config.sticky_session_ttl_seconds > 0,
         cost_limit_per_key_tokens: config.cost_limit_per_key_tokens,
     }
@@ -2428,6 +2451,62 @@ mod tests {
                 ("key-cooldown", "pool_cooldown"),
                 ("key-cost", "pool_cost_limit_reached"),
             ]
+        );
+    }
+
+    #[test]
+    fn pool_scheduler_soft_threshold_skips_quota_exhausted_even_when_hard_exhaustion_skip_is_off() {
+        let key_ready = sample_eligible_candidate(
+            "provider-pool",
+            "endpoint-1",
+            "key-ready",
+            10,
+            Some(json!({
+                "pool_advanced": {
+                    "skip_exhausted_accounts": false,
+                    "cost_soft_threshold_percent": 99
+                }
+            })),
+        );
+        let key_soft_capped = sample_eligible_candidate(
+            "provider-pool",
+            "endpoint-1",
+            "key-soft-capped",
+            10,
+            Some(json!({
+                "pool_advanced": {
+                    "skip_exhausted_accounts": false,
+                    "cost_soft_threshold_percent": 99
+                }
+            })),
+        );
+        let key_context_by_id = BTreeMap::from([(
+            "key-soft-capped".to_string(),
+            PoolCatalogKeyContext {
+                quota_exhausted: true,
+                ..PoolCatalogKeyContext::default()
+            },
+        )]);
+
+        let (reordered, skipped) = apply_local_execution_pool_scheduler_with_runtime_map(
+            vec![key_soft_capped, key_ready],
+            &BTreeMap::new(),
+            &key_context_by_id,
+        );
+
+        assert_eq!(
+            reordered
+                .iter()
+                .map(|item| item.candidate.key_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["key-ready"]
+        );
+        assert_eq!(
+            skipped
+                .iter()
+                .map(|item| (item.candidate.key_id.as_str(), item.skip_reason))
+                .collect::<Vec<_>>(),
+            vec![("key-soft-capped", "pool_account_exhausted")]
         );
     }
 
@@ -3670,6 +3749,7 @@ mod tests {
             &sticky_key,
             group.transport.provider.provider_type.as_str(),
             Some(pool_config.codex_quota_exhaustion_basis.as_str()),
+            pool_config.cost_soft_threshold_percent,
         );
         assert!(key_context.quota_exhausted);
         record_admin_provider_pool_success(
@@ -5326,6 +5406,7 @@ mod tests {
             &key,
             "codex",
             None,
+            None,
         );
 
         assert_eq!(context.plan_tier.as_deref(), Some("team"));
@@ -5372,6 +5453,7 @@ mod tests {
             &key,
             "codex",
             None,
+            None,
         );
 
         assert!(!context.quota_exhausted);
@@ -5411,6 +5493,7 @@ mod tests {
             &key,
             "codex",
             Some("weekly"),
+            None,
         );
         let five_hour_context = build_pool_catalog_key_context(
             PlannerAppState::new(&app),
@@ -5418,10 +5501,48 @@ mod tests {
             &key,
             "codex",
             Some("five_hour"),
+            None,
         );
 
         assert!(weekly_context.quota_exhausted);
         assert!(!five_hour_context.quota_exhausted);
+    }
+
+    #[test]
+    fn pool_catalog_context_applies_codex_soft_threshold_to_weekly_and_five_hour_windows() {
+        let mut key = sample_catalog_oauth_key("key-codex-soft-threshold");
+        key.status_snapshot = Some(json!({
+            "quota": {
+                "version": 2,
+                "provider_type": "codex",
+                "code": "ok",
+                "exhausted": false,
+                "windows": [
+                    {
+                        "code": "weekly",
+                        "used_ratio": 0.50,
+                        "remaining_ratio": 0.50
+                    },
+                    {
+                        "code": "5h",
+                        "used_ratio": 0.991,
+                        "remaining_ratio": 0.009
+                    }
+                ]
+            }
+        }));
+
+        let app = app_state_with_catalog_key(key.clone());
+        let context = build_pool_catalog_key_context(
+            PlannerAppState::new(&app),
+            &ProviderPoolService::with_builtin_adapters(),
+            &key,
+            "codex",
+            Some("weekly"),
+            Some(99.0),
+        );
+
+        assert!(context.quota_exhausted);
     }
 
     #[test]
@@ -5439,6 +5560,7 @@ mod tests {
             &ProviderPoolService::with_builtin_adapters(),
             &key,
             "codex",
+            None,
             None,
         );
 
@@ -5471,6 +5593,7 @@ mod tests {
             &key,
             "antigravity",
             None,
+            None,
         );
 
         assert!(context.quota_exhausted);
@@ -5492,6 +5615,7 @@ mod tests {
             &ProviderPoolService::with_builtin_adapters(),
             &key,
             "codex",
+            None,
             None,
         );
 

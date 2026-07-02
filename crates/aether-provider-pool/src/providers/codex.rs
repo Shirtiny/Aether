@@ -252,6 +252,119 @@ fn codex_window_used_percent_exhausted(bucket: &Map<String, Value>, prefix: &str
         .is_some_and(|value| value >= 100.0 && !codex_window_reset_elapsed(bucket, prefix))
 }
 
+fn codex_window_used_percent_soft_capped(
+    bucket: &Map<String, Value>,
+    prefix: &str,
+    threshold_percent: f64,
+) -> bool {
+    let used_percent_key = format!("{prefix}_used_percent");
+    provider_pool_json_f64(bucket.get(used_percent_key.as_str())).is_some_and(|value| {
+        value >= threshold_percent && !codex_window_reset_elapsed(bucket, prefix)
+    })
+}
+
+fn normalized_codex_soft_threshold_percent(value: Option<f64>) -> Option<f64> {
+    value.filter(|value| value.is_finite() && *value > 0.0 && *value <= 100.0)
+}
+
+fn codex_window_code_is_primary_quota(code: &str) -> bool {
+    matches!(code.trim().to_ascii_lowercase().as_str(), "weekly" | "5h")
+}
+
+fn codex_window_used_ratio(window: &Map<String, Value>) -> Option<f64> {
+    provider_pool_json_f64(window.get("used_ratio"))
+        .or_else(|| provider_pool_json_f64(window.get("used_percent")).map(|value| value / 100.0))
+        .or_else(|| {
+            provider_pool_json_f64(window.get("remaining_ratio"))
+                .map(|value| 1.0 - value.clamp(0.0, 1.0))
+        })
+        .or_else(|| {
+            provider_pool_json_f64(window.get("remaining_percent"))
+                .map(|value| 1.0 - (value / 100.0).clamp(0.0, 1.0))
+        })
+        .map(|value| value.clamp(0.0, 1.0))
+}
+
+fn codex_quota_soft_threshold_from_status_snapshot(
+    key: &aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey,
+    threshold_percent: f64,
+) -> Option<bool> {
+    let quota_snapshot = key
+        .status_snapshot
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|snapshot| snapshot.get("quota"))
+        .and_then(Value::as_object)?;
+    if quota_snapshot
+        .get("credits")
+        .and_then(Value::as_object)
+        .and_then(|credits| provider_pool_json_bool(credits.get("unlimited")))
+        == Some(true)
+    {
+        return Some(false);
+    }
+
+    let windows = quota_snapshot
+        .get("windows")
+        .and_then(Value::as_array)
+        .filter(|windows| !windows.is_empty())?;
+    let threshold_ratio = threshold_percent / 100.0;
+    let snapshot_observed_at = provider_pool_timestamp_unix_secs(quota_snapshot.get("observed_at"))
+        .or_else(|| provider_pool_timestamp_unix_secs(quota_snapshot.get("updated_at")));
+    let now_unix_secs = provider_pool_current_unix_secs();
+    let mut saw_primary_quota_window = false;
+
+    for window in windows.iter().filter_map(Value::as_object) {
+        let Some(code) = window.get("code").and_then(Value::as_str) else {
+            continue;
+        };
+        if !codex_window_code_is_primary_quota(code) {
+            continue;
+        }
+        saw_primary_quota_window = true;
+        let Some(used_ratio) = codex_window_used_ratio(window) else {
+            continue;
+        };
+        if used_ratio + f64::EPSILON < threshold_ratio {
+            continue;
+        }
+        let reset_elapsed = now_unix_secs.is_some_and(|now| {
+            provider_pool_reset_deadline_elapsed(window, snapshot_observed_at, now)
+        });
+        if !reset_elapsed {
+            return Some(true);
+        }
+    }
+
+    saw_primary_quota_window.then_some(false)
+}
+
+fn codex_quota_soft_threshold_from_metadata(
+    bucket: &Map<String, Value>,
+    threshold_percent: f64,
+) -> bool {
+    if provider_pool_json_bool(bucket.get("credits_unlimited")) == Some(true) {
+        return false;
+    }
+    codex_window_used_percent_soft_capped(bucket, "primary", threshold_percent)
+        || codex_window_used_percent_soft_capped(bucket, "secondary", threshold_percent)
+}
+
+pub(crate) fn codex_quota_soft_threshold_exceeded(
+    key: &aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey,
+    threshold_percent: Option<f64>,
+) -> bool {
+    let Some(threshold_percent) = normalized_codex_soft_threshold_percent(threshold_percent) else {
+        return false;
+    };
+    if let Some(exceeded) = codex_quota_soft_threshold_from_status_snapshot(key, threshold_percent)
+    {
+        return exceeded;
+    }
+    provider_pool_metadata_bucket(key.upstream_metadata.as_ref(), "codex")
+        .is_some_and(|bucket| codex_quota_soft_threshold_from_metadata(bucket, threshold_percent))
+}
+
 fn normalized_codex_quota_basis(value: Option<&str>) -> &'static str {
     match value
         .map(str::trim)
@@ -373,5 +486,85 @@ mod tests {
             &bucket,
             Some("five_hour")
         ));
+    }
+
+    #[test]
+    fn codex_soft_threshold_caps_either_weekly_or_five_hour_window() {
+        let mut key =
+            aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey::new(
+                "key-soft-cap".to_string(),
+                "provider".to_string(),
+                "key-soft-cap".to_string(),
+                "oauth".to_string(),
+                None,
+                true,
+            )
+            .expect("key should build");
+        key.status_snapshot = Some(json!({
+            "quota": {
+                "provider_type": "codex",
+                "exhausted": false,
+                "credits": {"unlimited": false},
+                "windows": [
+                    {"code": "weekly", "used_ratio": 0.98, "remaining_ratio": 0.02},
+                    {"code": "5h", "used_ratio": 0.99, "remaining_ratio": 0.01}
+                ]
+            }
+        }));
+
+        assert!(codex_quota_soft_threshold_exceeded(&key, Some(99.0)));
+        assert!(!codex_quota_soft_threshold_exceeded(&key, Some(99.5)));
+    }
+
+    #[test]
+    fn codex_soft_threshold_ignores_elapsed_reset_windows() {
+        let now = provider_pool_current_unix_secs().expect("clock should be available");
+        let mut key =
+            aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey::new(
+                "key-reset".to_string(),
+                "provider".to_string(),
+                "key-reset".to_string(),
+                "oauth".to_string(),
+                None,
+                true,
+            )
+            .expect("key should build");
+        key.status_snapshot = Some(json!({
+            "quota": {
+                "provider_type": "codex",
+                "exhausted": false,
+                "windows": [
+                    {
+                        "code": "weekly",
+                        "used_ratio": 0.995,
+                        "reset_at": now.saturating_sub(1)
+                    }
+                ]
+            }
+        }));
+
+        assert!(!codex_quota_soft_threshold_exceeded(&key, Some(99.0)));
+    }
+
+    #[test]
+    fn codex_soft_threshold_falls_back_to_metadata_windows() {
+        let mut key =
+            aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey::new(
+                "key-metadata-soft-cap".to_string(),
+                "provider".to_string(),
+                "key-metadata-soft-cap".to_string(),
+                "oauth".to_string(),
+                None,
+                true,
+            )
+            .expect("key should build");
+        key.upstream_metadata = Some(json!({
+            "codex": {
+                "primary_used_percent": 10.0,
+                "secondary_used_percent": 99.2
+            }
+        }));
+
+        assert!(codex_quota_soft_threshold_exceeded(&key, Some(99.0)));
     }
 }

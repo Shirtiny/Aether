@@ -43,6 +43,7 @@ pub(crate) struct AdminProviderPoolConfig {
     pub(crate) latency_sample_limit: u64,
     pub(crate) cost_window_seconds: u64,
     pub(crate) cost_limit_per_key_tokens: Option<u64>,
+    pub(crate) cost_soft_threshold_percent: Option<f64>,
     pub(crate) rate_limit_cooldown_seconds: u64,
     pub(crate) overload_cooldown_seconds: u64,
     pub(crate) health_policy_enabled: bool,
@@ -59,6 +60,14 @@ pub(crate) struct AdminProviderPoolConfig {
     pub(crate) stream_timeout_threshold: u64,
     pub(crate) stream_timeout_window_seconds: u64,
     pub(crate) stream_timeout_cooldown_seconds: u64,
+}
+
+impl AdminProviderPoolConfig {
+    pub(crate) fn skip_quota_exhausted_for_provider(&self, provider_type: &str) -> bool {
+        self.skip_exhausted_accounts
+            || (provider_type.trim().eq_ignore_ascii_case("codex")
+                && self.cost_soft_threshold_percent.is_some())
+    }
 }
 
 #[derive(Debug, Default)]

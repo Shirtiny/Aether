@@ -421,10 +421,11 @@ fn admin_pool_quota_status_filter(
             .get("code")
             .and_then(Value::as_str)
             .is_some_and(|code| code.trim().eq_ignore_ascii_case("exhausted"))
-        && !admin_provider_pool_pure::admin_pool_key_account_quota_exhausted_with_basis(
+        && !admin_provider_pool_pure::admin_pool_key_account_quota_exhausted_with_policy(
             key,
             provider_type,
             codex_quota_basis,
+            pool_config.and_then(|config| config.cost_soft_threshold_percent),
         )
     {
         return None;
@@ -503,11 +504,12 @@ fn admin_pool_key_visible_status_filter(
     }
     if pool_config
         .as_ref()
-        .is_some_and(|config| config.skip_exhausted_accounts)
-        && admin_provider_pool_pure::admin_pool_key_account_quota_exhausted_with_basis(
+        .is_some_and(|config| config.skip_quota_exhausted_for_provider(provider_type))
+        && admin_provider_pool_pure::admin_pool_key_account_quota_exhausted_with_policy(
             key,
             provider_type,
             pool_config.map(|config| config.codex_quota_exhaustion_basis.as_str()),
+            pool_config.and_then(|config| config.cost_soft_threshold_percent),
         )
     {
         return "quota_exhausted";

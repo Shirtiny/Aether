@@ -976,6 +976,7 @@ mod tests {
             latency_sample_limit: 10,
             cost_window_seconds: 600,
             cost_limit_per_key_tokens: Some(10_000),
+            cost_soft_threshold_percent: None,
             rate_limit_cooldown_seconds: 300,
             overload_cooldown_seconds: 30,
             health_policy_enabled: true,

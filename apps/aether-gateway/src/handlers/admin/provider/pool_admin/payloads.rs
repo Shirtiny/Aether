@@ -1113,13 +1113,16 @@ pub(super) fn build_admin_pool_key_payload(
     let auth_semantics = provider_key_auth_semantics(key, provider_type);
     let account_quota_exhausted = pool_config
         .as_ref()
-        .is_some_and(|config| config.skip_exhausted_accounts)
-        && admin_provider_pool_pure::admin_pool_key_account_quota_exhausted_with_basis(
+        .is_some_and(|config| config.skip_quota_exhausted_for_provider(provider_type))
+        && admin_provider_pool_pure::admin_pool_key_account_quota_exhausted_with_policy(
             key,
             provider_type,
             pool_config
                 .as_ref()
                 .map(|config| config.codex_quota_exhaustion_basis.as_str()),
+            pool_config
+                .as_ref()
+                .and_then(|config| config.cost_soft_threshold_percent),
         );
     let auth_config = state.parse_catalog_auth_config_json(key);
     let oauth_expires_at =

@@ -68,6 +68,7 @@ pub(super) async fn read_candidate_runtime_selection_snapshot(
                 (
                     state.skip_exhausted_accounts,
                     state.codex_quota_exhaustion_basis.clone(),
+                    state.codex_quota_soft_threshold_percent,
                 ),
             )
         })
@@ -341,6 +342,7 @@ struct ProviderPoolState {
     pool_enabled: bool,
     skip_exhausted_accounts: bool,
     codex_quota_exhaustion_basis: String,
+    codex_quota_soft_threshold_percent: Option<f64>,
 }
 
 fn read_provider_pool_state_map_from_providers(
@@ -364,12 +366,17 @@ fn read_provider_pool_state_map_from_providers(
                 .and_then(serde_json::Value::as_object)
                 .map(parse_runtime_codex_quota_exhaustion_basis)
                 .unwrap_or_else(|| "weekly".to_string());
+            let codex_quota_soft_threshold_percent = pool_advanced
+                .and_then(serde_json::Value::as_object)
+                .and_then(parse_runtime_cost_soft_threshold_percent)
+                .filter(|_| provider.provider_type.trim().eq_ignore_ascii_case("codex"));
             (
                 provider.id,
                 ProviderPoolState {
                     pool_enabled: pool_advanced.is_some(),
                     skip_exhausted_accounts,
                     codex_quota_exhaustion_basis,
+                    codex_quota_soft_threshold_percent,
                 },
             )
         })
@@ -540,27 +547,47 @@ fn parse_runtime_codex_quota_exhaustion_basis(
     }
 }
 
+fn parse_runtime_cost_soft_threshold_percent(
+    pool_advanced: &serde_json::Map<String, serde_json::Value>,
+) -> Option<f64> {
+    pool_advanced
+        .get("cost_soft_threshold_percent")
+        .and_then(|value| {
+            value.as_f64().or_else(|| {
+                value
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .and_then(|value| value.parse::<f64>().ok())
+            })
+        })
+        .filter(|value| value.is_finite() && *value > 0.0 && *value <= 100.0)
+}
+
 fn read_key_account_quota_exhaustion_map(
     candidates: &[SchedulerMinimalCandidateSelectionCandidate],
     provider_key_rpm_states: &BTreeMap<String, StoredProviderCatalogKey>,
-    provider_skip_exhausted_accounts: &BTreeMap<String, (bool, String)>,
+    provider_skip_exhausted_accounts: &BTreeMap<String, (bool, String, Option<f64>)>,
 ) -> BTreeMap<String, bool> {
     candidates
         .iter()
         .map(|candidate| {
             let exhausted = provider_skip_exhausted_accounts
                 .get(candidate.provider_id.as_str())
-                .map(|(skip, _)| *skip)
+                .map(|(skip, _, threshold)| *skip || threshold.is_some())
                 .unwrap_or(false)
                 && provider_key_rpm_states
                     .get(candidate.key_id.as_str())
                     .is_some_and(|key| {
-                        admin_provider_pool_pure::admin_pool_key_account_quota_exhausted_with_basis(
+                        admin_provider_pool_pure::admin_pool_key_account_quota_exhausted_with_policy(
                             key,
                             candidate.provider_type.as_str(),
                             provider_skip_exhausted_accounts
                                 .get(candidate.provider_id.as_str())
-                                .map(|(_, basis)| basis.as_str()),
+                                .map(|(_, basis, _)| basis.as_str()),
+                            provider_skip_exhausted_accounts
+                                .get(candidate.provider_id.as_str())
+                                .and_then(|(_, _, threshold)| *threshold),
                         )
                     });
             (candidate.key_id.clone(), exhausted)

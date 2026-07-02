@@ -38,6 +38,13 @@ fn json_f64(value: &Value) -> Option<f64> {
     })
 }
 
+fn parse_pool_cost_soft_threshold_percent(pool_advanced: &Map<String, Value>) -> Option<f64> {
+    pool_advanced
+        .get("cost_soft_threshold_percent")
+        .and_then(json_f64)
+        .filter(|value| value.is_finite() && *value > 0.0 && *value <= 100.0)
+}
+
 fn parse_codex_quota_exhaustion_basis(pool_advanced: &Map<String, Value>) -> String {
     if let Some(weekly_basis) = pool_advanced
         .get("codex_quota_weekly_basis")
@@ -472,6 +479,7 @@ pub(crate) fn admin_provider_pool_config_from_config_value(
             latency_sample_limit: 50,
             cost_window_seconds: 18_000,
             cost_limit_per_key_tokens: None,
+            cost_soft_threshold_percent: None,
             rate_limit_cooldown_seconds: 300,
             overload_cooldown_seconds: 30,
             health_policy_enabled: true,
@@ -529,6 +537,7 @@ pub(crate) fn admin_provider_pool_config_from_config_value(
         cost_limit_per_key_tokens: pool_advanced
             .get("cost_limit_per_key_tokens")
             .and_then(json_u64),
+        cost_soft_threshold_percent: parse_pool_cost_soft_threshold_percent(pool_advanced),
         rate_limit_cooldown_seconds: pool_advanced
             .get("rate_limit_cooldown_seconds")
             .and_then(json_u64)
@@ -671,6 +680,7 @@ mod tests {
                 "latency_sample_limit": 75,
                 "cost_window_seconds": 7200,
                 "cost_limit_per_key_tokens": 12000,
+                "cost_soft_threshold_percent": 99,
                 "rate_limit_cooldown_seconds": 420,
                 "overload_cooldown_seconds": 45,
                 "health_policy_enabled": false,
@@ -712,6 +722,7 @@ mod tests {
         assert_eq!(config.latency_sample_limit, 75);
         assert_eq!(config.cost_window_seconds, 7200);
         assert_eq!(config.cost_limit_per_key_tokens, Some(12_000));
+        assert_eq!(config.cost_soft_threshold_percent, Some(99.0));
         assert_eq!(config.rate_limit_cooldown_seconds, 420);
         assert_eq!(config.overload_cooldown_seconds, 45);
         assert!(!config.health_policy_enabled);
