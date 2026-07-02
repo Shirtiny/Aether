@@ -508,6 +508,20 @@ fn push_sqlite_usage_list_filters(
             builder.push(")");
         }
     }
+    if let Some(client_family) = query.client_family.as_deref().map(str::trim) {
+        if !client_family.is_empty() {
+            push_sqlite_usage_where(builder, has_where);
+            builder
+                .push("LOWER(TRIM(COALESCE(json_extract(request_metadata, '$.client_session_affinity.client_family'), json_extract(request_metadata, '$.client_family'), ''))) = ")
+                .push_bind(client_family.to_ascii_lowercase());
+        }
+    }
+    if query.hide_unknown {
+        push_sqlite_usage_where(builder, has_where);
+        builder.push(
+            "LOWER(TRIM(COALESCE(model, ''))) NOT IN ('unknown', 'unknow') AND LOWER(TRIM(COALESCE(provider_name, ''))) NOT IN ('unknown', 'unknow')",
+        );
+    }
     if let Some(statuses) = query.statuses.as_deref() {
         if !statuses.is_empty() {
             push_sqlite_usage_where(builder, has_where);
@@ -561,6 +575,8 @@ fn push_sqlite_usage_keyword_filters(
             cafecode: query.cafecode.clone(),
             session_id: query.session_id.clone(),
             session_id_exact: query.session_id_exact,
+            client_family: query.client_family.clone(),
+            hide_unknown: query.hide_unknown,
             statuses: query.statuses.clone(),
             is_stream: query.is_stream,
             error_only: query.error_only,

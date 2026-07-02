@@ -734,6 +734,9 @@ pub struct UsageAuditListQuery {
     pub cafecode: Option<String>,
     pub session_id: Option<String>,
     pub session_id_exact: bool,
+    pub client_family: Option<String>,
+    #[serde(default)]
+    pub hide_unknown: bool,
     pub statuses: Option<Vec<String>>,
     pub is_stream: Option<bool>,
     pub error_only: bool,
@@ -756,6 +759,9 @@ pub struct UsageAuditKeywordSearchQuery {
     pub cafecode: Option<String>,
     pub session_id: Option<String>,
     pub session_id_exact: bool,
+    pub client_family: Option<String>,
+    #[serde(default)]
+    pub hide_unknown: bool,
     pub statuses: Option<Vec<String>>,
     pub is_stream: Option<bool>,
     pub error_only: bool,

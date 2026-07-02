@@ -48,6 +48,34 @@ fn cafecode_filter_uses_exact_identity_match_for_non_numeric_input() {
     assert!(!sql.contains("LIKE"));
 }
 
+#[test]
+fn client_family_filter_uses_exact_metadata_match() {
+    let mut builder = QueryBuilder::<Postgres>::new(r#"SELECT * FROM "usage""#);
+    let mut has_where = false;
+
+    super::push_postgres_usage_client_family_filter(&mut builder, &mut has_where, " web ");
+
+    let sql = builder.sql();
+    assert!(sql.contains("client_session_affinity,client_family"));
+    assert!(sql.contains("request_metadata->>'client_family'"));
+    assert!(sql.contains("BTRIM"));
+    assert!(sql.contains(" = "));
+    assert!(!sql.contains("LIKE"));
+}
+
+#[test]
+fn hide_unknown_filter_excludes_unknown_model_and_provider_labels() {
+    let mut builder = QueryBuilder::<Postgres>::new(r#"SELECT * FROM "usage""#);
+    let mut has_where = false;
+
+    super::push_postgres_usage_hide_unknown_filter(&mut builder, &mut has_where);
+
+    let sql = builder.sql();
+    assert!(sql.contains(r#""usage".model"#));
+    assert!(sql.contains(r#""usage".provider_name"#));
+    assert!(sql.contains("NOT IN ('unknown', 'unknow')"));
+}
+
 #[tokio::test]
 async fn repository_constructs_from_lazy_pool() {
     let factory = PostgresPoolFactory::new(PostgresPoolConfig {

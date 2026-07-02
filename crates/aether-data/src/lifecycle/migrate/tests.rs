@@ -1557,12 +1557,15 @@ fn pending_migrations_from_applied_skips_versions_already_applied() {
             20260527000000,
             20260528000000,
             20260528010000,
+            20260614000000,
+            20260702000000,
         ]
     );
 }
 
 #[test]
-fn pending_migrations_from_applied_is_empty_after_empty_database_snapshot_stamp() {
+fn pending_migrations_from_applied_lists_post_snapshot_incrementals_after_empty_database_snapshot_stamp(
+) {
     let applied = empty_database_snapshot_migrations(&POSTGRES_MIGRATOR)
         .expect("empty database snapshot migrations should resolve")
         .into_iter()
@@ -1572,12 +1575,12 @@ fn pending_migrations_from_applied_is_empty_after_empty_database_snapshot_stamp(
         })
         .collect::<Vec<_>>();
 
-    let pending = pending_migrations_from_applied(&applied);
+    let pending_versions = pending_migrations_from_applied(&applied)
+        .into_iter()
+        .map(|migration| migration.version)
+        .collect::<Vec<_>>();
 
-    assert!(
-            pending.is_empty(),
-            "empty database snapshot-stamped databases should not require a manual migration before first startup"
-        );
+    assert_eq!(pending_versions, vec![20260614000000, 20260702000000]);
 }
 
 #[tokio::test]

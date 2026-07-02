@@ -1301,6 +1301,33 @@ fn push_postgres_usage_session_id_filter(
     builder.push(")");
 }
 
+fn push_postgres_usage_client_family_filter(
+    builder: &mut QueryBuilder<'_, Postgres>,
+    has_where: &mut bool,
+    client_family: &str,
+) {
+    let client_family = client_family.trim();
+    if client_family.is_empty() {
+        return;
+    }
+    builder.push(if *has_where { " AND " } else { " WHERE " });
+    *has_where = true;
+    builder
+        .push(r#"LOWER(BTRIM(COALESCE("usage".request_metadata#>>'{client_session_affinity,client_family}', "usage".request_metadata->>'client_family', ''))) = "#)
+        .push_bind(client_family.to_ascii_lowercase());
+}
+
+fn push_postgres_usage_hide_unknown_filter(
+    builder: &mut QueryBuilder<'_, Postgres>,
+    has_where: &mut bool,
+) {
+    builder.push(if *has_where { " AND " } else { " WHERE " });
+    *has_where = true;
+    builder.push(
+        r#"LOWER(BTRIM(COALESCE("usage".model, ''))) NOT IN ('unknown', 'unknow') AND LOWER(BTRIM(COALESCE("usage".provider_name, ''))) NOT IN ('unknown', 'unknow')"#,
+    );
+}
+
 fn push_postgres_usage_ping_filter(builder: &mut QueryBuilder<'_, Postgres>, has_where: &mut bool) {
     builder.push(if *has_where { " AND " } else { " WHERE " });
     *has_where = true;
@@ -2698,6 +2725,12 @@ ORDER BY request_count DESC, "usage".provider_name ASC
                 query.session_id_exact,
             );
         }
+        if let Some(client_family) = query.client_family.as_deref() {
+            push_postgres_usage_client_family_filter(&mut builder, &mut has_where, client_family);
+        }
+        if query.hide_unknown {
+            push_postgres_usage_hide_unknown_filter(&mut builder, &mut has_where);
+        }
         if let Some(statuses) = query.statuses.as_deref() {
             if !statuses.is_empty() {
                 builder.push(if has_where { " AND " } else { " WHERE " });
@@ -2819,6 +2852,12 @@ OR (\"usage\".error_message IS NOT NULL AND BTRIM(\"usage\".error_message) <> ''
                 session_id,
                 query.session_id_exact,
             );
+        }
+        if let Some(client_family) = query.client_family.as_deref() {
+            push_postgres_usage_client_family_filter(&mut builder, &mut has_where, client_family);
+        }
+        if query.hide_unknown {
+            push_postgres_usage_hide_unknown_filter(&mut builder, &mut has_where);
         }
         if let Some(statuses) = query.statuses.as_deref() {
             if !statuses.is_empty() {
@@ -3022,6 +3061,12 @@ OR (\"usage\".error_message IS NOT NULL AND BTRIM(\"usage\".error_message) <> ''
                 query.session_id_exact,
             );
         }
+        if let Some(client_family) = query.client_family.as_deref() {
+            push_postgres_usage_client_family_filter(&mut builder, &mut has_where, client_family);
+        }
+        if query.hide_unknown {
+            push_postgres_usage_hide_unknown_filter(&mut builder, &mut has_where);
+        }
         if let Some(statuses) = query.statuses.as_deref() {
             if !statuses.is_empty() {
                 builder.push(if has_where { " AND " } else { " WHERE " });
@@ -3132,6 +3177,12 @@ OR (\"usage\".error_message IS NOT NULL AND BTRIM(\"usage\".error_message) <> ''
                 session_id,
                 query.session_id_exact,
             );
+        }
+        if let Some(client_family) = query.client_family.as_deref() {
+            push_postgres_usage_client_family_filter(&mut builder, &mut has_where, client_family);
+        }
+        if query.hide_unknown {
+            push_postgres_usage_hide_unknown_filter(&mut builder, &mut has_where);
         }
         if let Some(statuses) = query.statuses.as_deref() {
             if !statuses.is_empty() {
