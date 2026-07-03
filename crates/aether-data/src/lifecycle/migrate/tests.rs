@@ -268,6 +268,32 @@ fn baseline_migration_restores_search_path_for_sqlx_bookkeeping() {
 }
 
 #[test]
+fn postgres_concurrent_index_migrations_are_single_statement_no_tx() {
+    for migration in POSTGRES_MIGRATOR
+        .iter()
+        .filter(|migration| migration.migration_type.is_up_migration())
+    {
+        let normalized_sql = migration.sql.to_ascii_uppercase();
+        let concurrent_index_count = normalized_sql.matches("CREATE INDEX CONCURRENTLY").count();
+        if concurrent_index_count == 0 {
+            continue;
+        }
+
+        assert!(
+            migration.no_tx,
+            "Postgres migration {} ({}) uses CREATE INDEX CONCURRENTLY and must start with `-- no-transaction`",
+            migration.version,
+            migration.description,
+        );
+        assert_eq!(
+            concurrent_index_count, 1,
+            "Postgres migration {} ({}) must contain only one CREATE INDEX CONCURRENTLY statement; PostgreSQL rejects multiple statements in the same simple-query batch",
+            migration.version, migration.description,
+        );
+    }
+}
+
+#[test]
 fn empty_database_snapshot_covers_current_cutoff_versions() {
     let versions = empty_database_snapshot_migrations(&POSTGRES_MIGRATOR)
         .expect("empty database snapshot migrations should resolve")
@@ -1559,6 +1585,8 @@ fn pending_migrations_from_applied_skips_versions_already_applied() {
             20260528010000,
             20260614000000,
             20260702000000,
+            20260702000001,
+            20260702000002,
         ]
     );
 }
@@ -1580,7 +1608,15 @@ fn pending_migrations_from_applied_lists_post_snapshot_incrementals_after_empty_
         .map(|migration| migration.version)
         .collect::<Vec<_>>();
 
-    assert_eq!(pending_versions, vec![20260614000000, 20260702000000]);
+    assert_eq!(
+        pending_versions,
+        vec![
+            20260614000000,
+            20260702000000,
+            20260702000001,
+            20260702000002,
+        ]
+    );
 }
 
 #[tokio::test]
