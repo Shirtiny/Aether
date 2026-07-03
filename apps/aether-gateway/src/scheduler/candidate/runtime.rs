@@ -574,7 +574,7 @@ fn read_key_account_quota_exhaustion_map(
         .map(|candidate| {
             let exhausted = provider_skip_exhausted_accounts
                 .get(candidate.provider_id.as_str())
-                .map(|(skip, _, threshold)| *skip || threshold.is_some())
+                .map(|(skip, _, _)| *skip)
                 .unwrap_or(false)
                 && provider_key_rpm_states
                     .get(candidate.key_id.as_str())

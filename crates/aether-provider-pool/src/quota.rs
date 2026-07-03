@@ -45,6 +45,15 @@ pub fn provider_pool_key_account_quota_exhausted_with_policy(
             && codex_quota_soft_threshold_exceeded(key, codex_quota_soft_threshold_percent))
 }
 
+pub fn provider_pool_key_codex_quota_soft_threshold_exceeded(
+    key: &StoredProviderCatalogKey,
+    provider_type: &str,
+    codex_quota_soft_threshold_percent: Option<f64>,
+) -> bool {
+    provider_type.trim().eq_ignore_ascii_case("codex")
+        && codex_quota_soft_threshold_exceeded(key, codex_quota_soft_threshold_percent)
+}
+
 pub fn provider_pool_member_quota_snapshot<'a>(
     key: &'a StoredProviderCatalogKey,
     provider_type: &str,

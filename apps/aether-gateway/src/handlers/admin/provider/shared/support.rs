@@ -63,10 +63,8 @@ pub(crate) struct AdminProviderPoolConfig {
 }
 
 impl AdminProviderPoolConfig {
-    pub(crate) fn skip_quota_exhausted_for_provider(&self, provider_type: &str) -> bool {
+    pub(crate) fn skip_quota_exhausted_for_provider(&self, _provider_type: &str) -> bool {
         self.skip_exhausted_accounts
-            || (provider_type.trim().eq_ignore_ascii_case("codex")
-                && self.cost_soft_threshold_percent.is_some())
     }
 }
 

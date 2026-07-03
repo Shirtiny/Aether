@@ -2337,6 +2337,165 @@ async fn gateway_marks_exhausted_codex_pool_key_as_blocked_when_flag_enabled() {
 }
 
 #[tokio::test]
+async fn gateway_marks_codex_soft_threshold_as_orange_quota_protection() {
+    let mut provider = sample_provider("provider-codex", "codex", 10).with_transport_fields(
+        true,
+        false,
+        true,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(json!({
+            "pool_advanced": {
+                "enabled": true,
+                "skip_exhausted_accounts": true,
+                "cost_soft_threshold_percent": 99
+            }
+        })),
+    );
+    provider.provider_type = "codex".to_string();
+
+    let mut key = sample_key(
+        "key-codex-soft-capped",
+        "provider-codex",
+        "openai:responses",
+        "oauth-placeholder",
+    );
+    key.name = "codex soft capped".to_string();
+    key.auth_type = "oauth".to_string();
+    key.upstream_metadata = Some(json!({
+        "codex": {
+            "primary_used_percent": 99.1,
+            "secondary_used_percent": 25.0,
+            "plan_type": "plus"
+        }
+    }));
+
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        Vec::new(),
+        vec![key],
+    ));
+    let state = AppState::new()
+        .expect("gateway should build")
+        .with_data_state_for_tests(GatewayDataState::with_provider_catalog_reader_for_tests(
+            provider_catalog_repository,
+        ));
+
+    let response = local_admin_pool_response(
+        &state,
+        http::Method::GET,
+        "/api/admin/pool/provider-codex/keys?page=1&page_size=50&status=quota_exhausted",
+        None,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read"),
+    )
+    .expect("json body should parse");
+    let keys = payload["keys"].as_array().expect("keys should be array");
+
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0]["scheduling_status"], json!("blocked"));
+    assert_eq!(
+        keys[0]["scheduling_reason"],
+        json!("account_quota_soft_threshold")
+    );
+    assert_eq!(keys[0]["scheduling_label"], json!("额度耗尽"));
+    assert_eq!(
+        keys[0]["scheduling_reasons"][0],
+        json!({
+            "code": "account_quota_soft_threshold",
+            "label": "额度耗尽",
+            "blocking": true,
+            "source": "quota",
+            "ttl_seconds": serde_json::Value::Null,
+            "detail": serde_json::Value::Null,
+        })
+    );
+}
+
+#[tokio::test]
+async fn gateway_warns_but_does_not_block_codex_soft_threshold_when_skip_disabled() {
+    let mut provider = sample_provider("provider-codex", "codex", 10).with_transport_fields(
+        true,
+        false,
+        true,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(json!({
+            "pool_advanced": {
+                "enabled": true,
+                "skip_exhausted_accounts": false,
+                "cost_soft_threshold_percent": 99
+            }
+        })),
+    );
+    provider.provider_type = "codex".to_string();
+
+    let mut key = sample_key(
+        "key-codex-soft-warning",
+        "provider-codex",
+        "openai:responses",
+        "oauth-placeholder",
+    );
+    key.name = "codex soft warning".to_string();
+    key.auth_type = "oauth".to_string();
+    key.upstream_metadata = Some(json!({
+        "codex": {
+            "primary_used_percent": 99.1,
+            "secondary_used_percent": 25.0,
+            "plan_type": "plus"
+        }
+    }));
+
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        Vec::new(),
+        vec![key],
+    ));
+    let state = AppState::new()
+        .expect("gateway should build")
+        .with_data_state_for_tests(GatewayDataState::with_provider_catalog_reader_for_tests(
+            provider_catalog_repository,
+        ));
+
+    let response = local_admin_pool_response(
+        &state,
+        http::Method::GET,
+        "/api/admin/pool/provider-codex/keys?page=1&page_size=50&status=all",
+        None,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read"),
+    )
+    .expect("json body should parse");
+    let keys = payload["keys"].as_array().expect("keys should be array");
+
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0]["scheduling_status"], json!("degraded"));
+    assert_eq!(
+        keys[0]["scheduling_reason"],
+        json!("account_quota_soft_threshold")
+    );
+    assert_eq!(keys[0]["scheduling_reasons"][0]["blocking"], json!(false));
+}
+
+#[tokio::test]
 async fn gateway_lists_inherited_fixed_provider_api_formats_for_pool_keys() {
     let mut provider = sample_provider("provider-codex", "codex", 10).with_transport_fields(
         true,

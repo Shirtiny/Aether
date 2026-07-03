@@ -2455,7 +2455,7 @@ mod tests {
     }
 
     #[test]
-    fn pool_scheduler_soft_threshold_skips_quota_exhausted_even_when_hard_exhaustion_skip_is_off() {
+    fn pool_scheduler_soft_threshold_obeys_skip_exhausted_accounts() {
         let key_ready = sample_eligible_candidate(
             "provider-pool",
             "endpoint-1",
@@ -2499,14 +2499,14 @@ mod tests {
                 .iter()
                 .map(|item| item.candidate.key_id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["key-ready"]
+            vec!["key-soft-capped", "key-ready"]
         );
         assert_eq!(
             skipped
                 .iter()
                 .map(|item| (item.candidate.key_id.as_str(), item.skip_reason))
                 .collect::<Vec<_>>(),
-            vec![("key-soft-capped", "pool_account_exhausted")]
+            Vec::<(&str, &str)>::new()
         );
     }
 

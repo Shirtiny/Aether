@@ -3633,6 +3633,7 @@ function getSchedulingBadgeVariant(key: PoolKeyDetail): PoolStatusVariant {
   const reason = getVisibleSchedulingReason(key)
   if (reason === 'manual_disabled' || reason === 'inactive') return 'secondary'
   if (reason === 'account_blocked' || reason === 'account_quota_exhausted' || reason === 'cost_exhausted') return 'destructive'
+  if (reason === 'account_quota_soft_threshold') return 'warning'
   if (reason === 'cooldown') return 'warning'
   if (reason === 'cost_soft' || reason === 'cost') return 'warning'
   if (isPoolKeyCostExhausted(key)) return 'destructive'
