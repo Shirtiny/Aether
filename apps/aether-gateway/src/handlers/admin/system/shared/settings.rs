@@ -411,7 +411,7 @@ fn should_include_release_for_channel(
     release: &GitHubRelease,
     current_channel: UpdateChannel,
 ) -> bool {
-    if release.draft || !release.tag_name.starts_with('v') {
+    if release.draft || !release.tag_name.starts_with("backend-v") {
         return false;
     }
     if !release.prerelease {
@@ -445,11 +445,13 @@ impl UpdateChannel {
 }
 
 fn update_channel_for_version(version: &str) -> UpdateChannel {
-    let normalized = version
-        .trim()
-        .strip_prefix('v')
-        .or_else(|| version.trim().strip_prefix('V'))
-        .unwrap_or(version.trim());
+    let trimmed = version.trim();
+    let normalized = trimmed
+        .strip_prefix("backend-v")
+        .or_else(|| trimmed.strip_prefix("backend-V"))
+        .or_else(|| trimmed.strip_prefix('v'))
+        .or_else(|| trimmed.strip_prefix('V'))
+        .unwrap_or(trimmed);
     let Some((_, prerelease)) = normalized.split_once('-') else {
         return UpdateChannel::Stable;
     };

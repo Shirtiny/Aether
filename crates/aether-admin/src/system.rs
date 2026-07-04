@@ -1164,7 +1164,9 @@ fn admin_system_update_blocker(release: &AdminSystemUpdateRelease) -> Option<&'s
 fn normalized_admin_system_version(version: &str) -> String {
     let trimmed = version.trim();
     trimmed
-        .strip_prefix('v')
+        .strip_prefix("backend-v")
+        .or_else(|| trimmed.strip_prefix("backend-V"))
+        .or_else(|| trimmed.strip_prefix('v'))
         .or_else(|| trimmed.strip_prefix('V'))
         .unwrap_or(trimmed)
         .to_string()

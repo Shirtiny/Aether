@@ -18,7 +18,7 @@ uses tag-only push triggers for release publishing:
 on:
   push:
     tags:
-      - 'v*'
+      - 'backend-v*'
 ```
 
 Manual workflow runs are allowed only for validation/dry-run behavior unless the
@@ -26,28 +26,28 @@ workflow explicitly receives and validates a release tag context.
 
 ## Tag Format
 
-A release tag must use SemVer with a leading `v`:
+A backend release tag must use SemVer with the `backend-v` prefix:
 
 ```text
-vMAJOR.MINOR.PATCH
-vMAJOR.MINOR.PATCH-alpha.N
-vMAJOR.MINOR.PATCH-beta.N
-vMAJOR.MINOR.PATCH-rc.N
+backend-vMAJOR.MINOR.PATCH
+backend-vMAJOR.MINOR.PATCH-alpha.N
+backend-vMAJOR.MINOR.PATCH-beta.N
+backend-vMAJOR.MINOR.PATCH-rc.N
 ```
 
 Examples:
 
 ```text
-v0.7.11
-v0.8.0-alpha.1
-v0.8.0-beta.2
-v0.8.0-rc.1
+backend-v0.7.11
+backend-v0.8.0-alpha.1
+backend-v0.8.0-beta.2
+backend-v0.8.0-rc.1
 ```
 
 The release workflow must reject tags that do not match:
 
 ```regex
-^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.[0-9]+)?$
+^backend-v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.[0-9]+)?$
 ```
 
 Do not use ambiguous release tags such as:
@@ -56,33 +56,38 @@ Do not use ambiguous release tags such as:
 latest
 prod
 release
-v1
-v1.2
+backend-v1
+backend-v1.2
 20260704
 ```
 
 A published tag must be treated as immutable. Do not delete and recreate a tag to
 replace a bad build; publish a new version instead.
 
+The `backend-` prefix is part of the Git tag namespace and separates backend
+application releases from other release streams in the same repository. Docker
+image aliases may also include unprefixed SemVer tags such as `1.2.3` for
+operator convenience, but the Git release tag remains `backend-v1.2.3`.
+
 ## Image Tagging Rules
 
 Every release image must be identifiable by an immutable digest. Mutable tags are
 convenience aliases only.
 
-For a stable tag such as `v1.2.3`, the release workflow may publish:
+For a stable tag such as `backend-v1.2.3`, the release workflow may publish:
 
 ```text
-ghcr.io/<owner>/<image>:v1.2.3
+ghcr.io/<owner>/<image>:backend-v1.2.3
 ghcr.io/<owner>/<image>:1.2.3
 ghcr.io/<owner>/<image>:1.2
 ghcr.io/<owner>/<image>:latest
 ghcr.io/<owner>/<image>:<git-sha-tag>
 ```
 
-For a pre-release tag such as `v1.3.0-rc.1`, the release workflow may publish:
+For a pre-release tag such as `backend-v1.3.0-rc.1`, the release workflow may publish:
 
 ```text
-ghcr.io/<owner>/<image>:v1.3.0-rc.1
+ghcr.io/<owner>/<image>:backend-v1.3.0-rc.1
 ghcr.io/<owner>/<image>:1.3.0-rc.1
 ghcr.io/<owner>/<image>:rc
 ghcr.io/<owner>/<image>:<git-sha-tag>
@@ -256,15 +261,15 @@ newer build while performing a rollback.
 Create an annotated release tag and push it:
 
 ```sh
-git tag -a v1.2.3 -m "Release v1.2.3"
-git push origin v1.2.3
+git tag -a backend-v1.2.3 -m "Release backend-v1.2.3"
+git push origin backend-v1.2.3
 ```
 
 For a release candidate:
 
 ```sh
-git tag -a v1.3.0-rc.1 -m "Release v1.3.0-rc.1"
-git push origin v1.3.0-rc.1
+git tag -a backend-v1.3.0-rc.1 -m "Release backend-v1.3.0-rc.1"
+git push origin backend-v1.3.0-rc.1
 ```
 
 The tag push triggers the release workflow. The resulting image digest and build

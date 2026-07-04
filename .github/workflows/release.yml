@@ -3,7 +3,7 @@ name: Release Aether
 on:
   push:
     tags:
-      - 'v*'
+      - 'backend-v*'
   workflow_dispatch:
 
 concurrency:
@@ -25,6 +25,8 @@ jobs:
     outputs:
       publish: ${{ steps.classify.outputs.publish }}
       version_tag: ${{ steps.classify.outputs.version_tag }}
+      version_number: ${{ steps.classify.outputs.version_number }}
+      minor_tag: ${{ steps.classify.outputs.minor_tag }}
       prerelease: ${{ steps.classify.outputs.prerelease }}
       make_latest: ${{ steps.classify.outputs.make_latest }}
     steps:
@@ -36,6 +38,8 @@ jobs:
 
           echo "publish=false" >> "${GITHUB_OUTPUT}"
           echo "version_tag=" >> "${GITHUB_OUTPUT}"
+          echo "version_number=" >> "${GITHUB_OUTPUT}"
+          echo "minor_tag=" >> "${GITHUB_OUTPUT}"
           echo "prerelease=false" >> "${GITHUB_OUTPUT}"
           echo "make_latest=false" >> "${GITHUB_OUTPUT}"
 
@@ -45,15 +49,24 @@ jobs:
           fi
 
           tag="${GITHUB_REF_NAME}"
-          if [[ ! "${tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.[0-9]+)?$ ]]; then
+          if [[ ! "${tag}" =~ ^backend-v([0-9]+)\.([0-9]+)\.([0-9]+)(-(alpha|beta|rc)\.[0-9]+)?$ ]]; then
             echo "Unsupported release tag: ${tag}" >&2
-            echo "Expected vX.Y.Z, vX.Y.Z-alpha.N, vX.Y.Z-beta.N, or vX.Y.Z-rc.N." >&2
+            echo "Expected backend-vX.Y.Z, backend-vX.Y.Z-alpha.N, backend-vX.Y.Z-beta.N, or backend-vX.Y.Z-rc.N." >&2
             exit 1
           fi
 
-          echo "version_tag=${tag}" >> "${GITHUB_OUTPUT}"
+          major="${BASH_REMATCH[1]}"
+          minor="${BASH_REMATCH[2]}"
+          patch="${BASH_REMATCH[3]}"
+          prerelease_suffix="${BASH_REMATCH[4]:-}"
+          version_number="${major}.${minor}.${patch}${prerelease_suffix}"
+          minor_tag="${major}.${minor}"
 
-          if [[ "${tag}" == *-* ]]; then
+          echo "version_tag=${tag}" >> "${GITHUB_OUTPUT}"
+          echo "version_number=${version_number}" >> "${GITHUB_OUTPUT}"
+          echo "minor_tag=${minor_tag}" >> "${GITHUB_OUTPUT}"
+
+          if [[ -n "${prerelease_suffix}" ]]; then
             echo "prerelease=true" >> "${GITHUB_OUTPUT}"
           else
             echo "make_latest=true" >> "${GITHUB_OUTPUT}"
@@ -96,7 +109,7 @@ jobs:
   build_release_matrix:
     name: Build ${{ matrix.name }}
     needs: preflight
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/backend-v')
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: true
@@ -146,7 +159,7 @@ jobs:
 
       - name: Build
         env:
-          AETHER_VERSION: ${{ needs.preflight.outputs.version_tag }}
+          AETHER_VERSION: ${{ needs.preflight.outputs.version_number }}
           AETHER_BUILD_TYPE: release
           CARGO_TERM_COLOR: always
         shell: bash
@@ -206,9 +219,9 @@ jobs:
           images: |
             ${{ env.REGISTRY }}/${{ env.GHCR_IMAGE }}
           tags: |
-            type=raw,value=${{ github.ref_name }}
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}},enable=${{ needs.preflight.outputs.make_latest == 'true' }}
+            type=raw,value=${{ needs.preflight.outputs.version_tag }}
+            type=raw,value=${{ needs.preflight.outputs.version_number }}
+            type=raw,value=${{ needs.preflight.outputs.minor_tag }},enable=${{ needs.preflight.outputs.make_latest == 'true' }}
             type=raw,value=latest,enable=${{ needs.preflight.outputs.make_latest == 'true' }}
             type=raw,value=alpha,enable=${{ contains(github.ref_name, '-alpha.') }}
             type=raw,value=beta,enable=${{ contains(github.ref_name, '-beta.') }}
@@ -323,7 +336,7 @@ jobs:
   package:
     name: Release tarballs
     needs: [preflight, frontend, build_release_matrix]
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/backend-v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
