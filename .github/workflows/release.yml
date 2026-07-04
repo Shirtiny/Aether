@@ -127,18 +127,6 @@ jobs:
             arch: arm64
             os: ubuntu-latest
             use_cross: true
-          - name: macos-amd64
-            target: x86_64-apple-darwin
-            platform: macos
-            arch: amd64
-            os: macos-15-intel
-            use_cross: false
-          - name: macos-arm64
-            target: aarch64-apple-darwin
-            platform: macos
-            arch: arm64
-            os: macos-15
-            use_cross: false
     steps:
       - uses: actions/checkout@v5
 
@@ -358,7 +346,7 @@ jobs:
           fi
 
           mkdir -p package release-assets
-          for platform in linux macos; do
+          for platform in linux; do
             for arch in amd64 arm64; do
               bundle="aether-${VERSION}-${platform}-${arch}"
               root="package/${bundle}"

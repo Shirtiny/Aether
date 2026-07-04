@@ -102,6 +102,10 @@ Every published image build must produce a machine-readable and human-readable
 record. The record should be uploaded as workflow artifacts and attached to the
 GitHub Release.
 
+Backend release binaries and tarballs are produced only for Linux targets
+(`linux-amd64` and `linux-arm64`). macOS backend release artifacts are not built
+or published.
+
 Minimum fields:
 
 - release tag
