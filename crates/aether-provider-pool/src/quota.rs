@@ -4,6 +4,7 @@ use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKe
 use serde_json::{json, Map, Value};
 
 use crate::provider::ProviderPoolMemberInput;
+use crate::providers::codex::codex_quota_soft_threshold_exceeded;
 use crate::service::ProviderPoolService;
 
 pub fn provider_pool_key_account_quota_exhausted(
@@ -18,13 +19,39 @@ pub fn provider_pool_key_account_quota_exhausted_with_basis(
     provider_type: &str,
     codex_quota_basis: Option<&str>,
 ) -> bool {
+    provider_pool_key_account_quota_exhausted_with_policy(
+        key,
+        provider_type,
+        codex_quota_basis,
+        None,
+    )
+}
+
+pub fn provider_pool_key_account_quota_exhausted_with_policy(
+    key: &StoredProviderCatalogKey,
+    provider_type: &str,
+    codex_quota_basis: Option<&str>,
+    codex_quota_soft_threshold_percent: Option<f64>,
+) -> bool {
     let adapter = ProviderPoolService::with_builtin_adapters().adapter(provider_type);
-    adapter.quota_exhausted(&ProviderPoolMemberInput {
+    let exhausted = adapter.quota_exhausted(&ProviderPoolMemberInput {
         provider_type,
         key,
         auth_config: None,
         codex_quota_basis,
-    })
+    });
+    exhausted
+        || (provider_type.trim().eq_ignore_ascii_case("codex")
+            && codex_quota_soft_threshold_exceeded(key, codex_quota_soft_threshold_percent))
+}
+
+pub fn provider_pool_key_codex_quota_soft_threshold_exceeded(
+    key: &StoredProviderCatalogKey,
+    provider_type: &str,
+    codex_quota_soft_threshold_percent: Option<f64>,
+) -> bool {
+    provider_type.trim().eq_ignore_ascii_case("codex")
+        && codex_quota_soft_threshold_exceeded(key, codex_quota_soft_threshold_percent)
 }
 
 pub fn provider_pool_member_quota_snapshot<'a>(

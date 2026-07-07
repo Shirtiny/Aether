@@ -272,7 +272,21 @@
                     <div class="text-xs text-muted-foreground flex items-center gap-2 flex-wrap">
                       <span class="font-medium text-foreground">Token 计费</span>
                       <span class="font-mono font-medium text-foreground">${{ tokenCostTotal.toFixed(6) }}</span>
-                      <span class="text-muted-foreground/60">(输入 {{ formatNumber(displayInputTokens) }} + 缓存创建 {{ cacheCreationSummaryText }} + 缓存读取 {{ formatNumber(detail.cache_read_input_tokens || 0) }})</span>
+                      <span class="text-muted-foreground/60">
+                        (输入 {{ formatNumber(displayInputTokens) }} + 输出 {{ formatNumber(detailOutputTokens) }}
+                        <template v-if="hasDetailReasoningOutputTokens">
+                          （推理输出 {{ formatNumber(detailReasoningOutputTokens) }}
+                          <Badge
+                            v-if="detailReasoningDowngraded"
+                            variant="outline"
+                            class="ml-1 h-4 px-1 text-[9px] leading-none text-amber-600 dark:text-amber-300"
+                          >
+                            降智
+                          </Badge>
+                          ）
+                        </template>
+                        + 缓存创建 {{ cacheCreationSummaryText }} + 缓存读取 {{ formatNumber(detail.cache_read_input_tokens || 0) }})
+                      </span>
                       <Badge
                         v-if="displayTiers.length > 1"
                         variant="outline"
@@ -368,6 +382,22 @@
                             <span class="text-sm font-semibold font-mono text-right tabular-nums">{{ detail.tokens?.output || detail.output_tokens || 0 }}</span>
                             <span class="text-xs font-mono text-right tabular-nums">${{ effectiveOutputCost.toFixed(6) }}</span>
                           </div>
+                          <div
+                            v-if="hasDetailReasoningOutputTokens"
+                            class="grid grid-cols-[64px_minmax(0,1fr)_92px] items-center gap-x-2"
+                          >
+                            <span class="text-xs text-muted-foreground">推理输出</span>
+                            <span class="text-sm font-semibold font-mono text-right tabular-nums" :class="detailReasoningDowngraded ? 'text-amber-600 dark:text-amber-300' : ''">{{ formatNumber(detailReasoningOutputTokens) }}</span>
+                            <span class="text-xs text-right">
+                              <Badge
+                                v-if="detailReasoningDowngraded"
+                                variant="outline"
+                                class="h-4 px-1 text-[9px] leading-none text-amber-600 dark:text-amber-300"
+                              >
+                                降智
+                              </Badge>
+                            </span>
+                          </div>
                           <div class="grid grid-cols-[64px_minmax(0,1fr)_92px] items-center gap-x-2">
                             <span class="text-xs text-muted-foreground">缓存创建</span>
                             <span class="text-sm font-semibold font-mono text-right tabular-nums">{{ totalCacheCreationTokens }}</span>
@@ -394,6 +424,23 @@
                             <span class="text-xs text-muted-foreground w-[56px]">输出</span>
                             <span class="text-sm font-semibold font-mono flex-1 text-center">{{ detail.tokens?.output || detail.output_tokens || 0 }}</span>
                             <span class="text-xs font-mono">${{ effectiveOutputCost.toFixed(6) }}</span>
+                          </div>
+                        </div>
+                        <div
+                          v-if="hasDetailReasoningOutputTokens"
+                          class="hidden items-center sm:flex"
+                        >
+                          <div class="flex items-center flex-1">
+                            <span class="text-xs text-muted-foreground w-[56px]">推理输出</span>
+                            <span class="text-sm font-semibold font-mono flex-1 text-center" :class="detailReasoningDowngraded ? 'text-amber-600 dark:text-amber-300' : ''">{{ formatNumber(detailReasoningOutputTokens) }}</span>
+                            <Badge
+                              v-if="detailReasoningDowngraded"
+                              variant="outline"
+                              class="h-4 px-1 text-[9px] leading-none text-amber-600 dark:text-amber-300"
+                            >
+                              降智
+                            </Badge>
+                            <span v-else class="text-xs text-muted-foreground">reasoning_output_tokens</span>
                           </div>
                         </div>
                         <!-- 缓存创建 缓存读取 -->
@@ -927,7 +974,7 @@ import type { ImageProgress, RequestTrace } from '@/api/requestTrace'
 import { formatApiFormat } from '@/api/endpoints/types/api-format'
 import { formatCompactNumber, formatShortRequestId, formatTokens } from '@/utils/format'
 import { log } from '@/utils/logger'
-import { getEffectiveInputTokens } from '../token-normalization'
+import { getEffectiveInputTokens, getReasoningOutputTokens, isDowngradedReasoningTokens } from '../token-normalization'
 import {
   formatDurationMs,
   formatOutputRate,
@@ -1249,6 +1296,14 @@ const detailOutputTokens = computed(() => {
   if (!detail.value) return 0
   return detail.value.tokens?.output ?? detail.value.output_tokens ?? 0
 })
+
+const detailReasoningOutputTokens = computed(() => {
+  if (!detail.value) return 0
+  return getReasoningOutputTokens(detail.value)
+})
+
+const hasDetailReasoningOutputTokens = computed(() => detailReasoningOutputTokens.value > 0)
+const detailReasoningDowngraded = computed(() => isDowngradedReasoningTokens(detailReasoningOutputTokens.value))
 
 const detailOutputRate = computed(() => {
   if (!detail.value) return null
@@ -1991,9 +2046,10 @@ const hasTokenCost = computed(() => {
   if (!detail.value) return false
   const inputTokens = detail.value.tokens?.input || detail.value.input_tokens || 0
   const outputTokens = detail.value.tokens?.output || detail.value.output_tokens || 0
+  const reasoningOutputTokens = detailReasoningOutputTokens.value
   const cacheCreation = totalCacheCreationTokens.value
   const cacheRead = detail.value.cache_read_input_tokens || 0
-  return (inputTokens + outputTokens + cacheCreation + cacheRead) > 0 || tokenCostTotal.value > 0
+  return (inputTokens + outputTokens + reasoningOutputTokens + cacheCreation + cacheRead) > 0 || tokenCostTotal.value > 0
 })
 
 const tabs = [

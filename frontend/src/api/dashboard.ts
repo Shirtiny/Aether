@@ -174,6 +174,8 @@ export interface RequestDetail {
   tokens: {
     input: number
     output: number
+    reasoning_output?: number
+    reasoning_output_tokens?: number
     total: number
   }
   cost: {
@@ -185,6 +187,7 @@ export interface RequestDetail {
   input_tokens?: number
   effective_input_tokens?: number
   output_tokens?: number
+  reasoning_output_tokens?: number
   total_tokens?: number
   cache_creation_input_tokens?: number
   cache_creation_input_tokens_5m?: number

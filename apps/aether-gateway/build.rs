@@ -38,7 +38,14 @@ fn main() {
 fn git_describe_version() -> Option<String> {
     let output = Command::new("git")
         .args([
-            "describe", "--tags", "--match", "v[0-9]*", "--always", "--dirty",
+            "describe",
+            "--tags",
+            "--match",
+            "backend-v[0-9]*",
+            "--match",
+            "v[0-9]*",
+            "--always",
+            "--dirty",
         ])
         .output()
         .ok()?;
@@ -55,5 +62,11 @@ fn normalize_gateway_version_source(value: &str) -> Option<String> {
     if trimmed.is_empty() || trimmed.starts_with("tunnel-v") {
         return None;
     }
-    Some(trimmed.strip_prefix('v').unwrap_or(trimmed).to_string())
+    let normalized = trimmed
+        .strip_prefix("backend-v")
+        .or_else(|| trimmed.strip_prefix("backend-V"))
+        .or_else(|| trimmed.strip_prefix('v'))
+        .or_else(|| trimmed.strip_prefix('V'))
+        .unwrap_or(trimmed);
+    Some(normalized.to_string())
 }

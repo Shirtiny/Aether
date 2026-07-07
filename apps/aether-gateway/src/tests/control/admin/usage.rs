@@ -1337,6 +1337,80 @@ async fn gateway_filters_admin_usage_records_with_unknown_model_or_provider() {
 }
 
 #[tokio::test]
+async fn gateway_filters_admin_usage_records_by_client_family() {
+    let (_upstream_url, upstream_hits, upstream_handle) =
+        start_usage_upstream("/api/admin/usage/records").await;
+
+    let mut web_usage = sample_usage_row(
+        "usage-web",
+        "req-web",
+        Some("user-1"),
+        Some("key-1"),
+        Some("primary"),
+        "OpenAI",
+        "gpt-5",
+        "completed",
+        120,
+        30,
+        0.3,
+        0.36,
+        DAY_2_UNIX_SECS,
+    );
+    web_usage.request_metadata = Some(json!({
+        "client_session_affinity": {
+            "client_family": "web"
+        }
+    }));
+
+    let mut cli_usage = sample_usage_row(
+        "usage-cli",
+        "req-cli",
+        Some("user-1"),
+        Some("key-1"),
+        Some("primary"),
+        "OpenAI",
+        "gpt-5",
+        "completed",
+        120,
+        30,
+        0.3,
+        0.36,
+        DAY_2_UNIX_SECS,
+    );
+    cli_usage.request_metadata = Some(json!({
+        "client_family": "cli"
+    }));
+
+    let usage_repository = Arc::new(InMemoryUsageReadRepository::seed(vec![
+        web_usage, cli_usage,
+    ]));
+    let gateway = build_router_with_state(
+        AppState::new()
+            .expect("gateway should build")
+            .with_data_state_for_tests(GatewayDataState::with_usage_reader_for_tests(
+                usage_repository,
+            )),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = admin_request(reqwest::Client::new().get(format!(
+        "{gateway_url}/api/admin/usage/records?start_date=2024-03-21&end_date=2024-03-22&tz_offset_minutes=0&client_family=web&limit=10&offset=0"
+    )))
+    .send()
+    .await
+    .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(payload["total"], 1);
+    assert_eq!(payload["records"][0]["id"], "usage-web");
+    assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
+
+    gateway_handle.abort();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
 async fn gateway_handles_admin_usage_records_with_provider_key_name_fallback_from_request_metadata()
 {
     let (upstream_url, upstream_hits, upstream_handle) =

@@ -257,7 +257,7 @@ pub(crate) async fn build_local_image_stream_attempt_source_for_kind<'a>(
 #[async_trait]
 impl LocalExecutionAttemptSource<AiSyncAttempt> for LocalOpenAiImageSyncAttemptSource<'_> {
     async fn next_execution_attempt(&mut self) -> Result<Option<AiSyncAttempt>, GatewayError> {
-        while let Some(attempt) = self.candidates.next_attempt().await {
+        while let Some(attempt) = self.candidates.next_attempt().await? {
             let cleanup_attempt = attempt.clone();
             let mut sticky_init_cleanup = attempt.pool_sticky_init_cleanup_guard(self.state);
             let built_attempt = match self.build_sync_attempt(attempt).await {
@@ -310,7 +310,7 @@ impl LocalExecutionAttemptSource<AiSyncAttempt> for LocalOpenAiImageSyncAttemptS
 #[async_trait]
 impl LocalExecutionAttemptSource<AiStreamAttempt> for LocalOpenAiImageStreamAttemptSource<'_> {
     async fn next_execution_attempt(&mut self) -> Result<Option<AiStreamAttempt>, GatewayError> {
-        while let Some(attempt) = self.candidates.next_attempt().await {
+        while let Some(attempt) = self.candidates.next_attempt().await? {
             let cleanup_attempt = attempt.clone();
             let mut sticky_init_cleanup = attempt.pool_sticky_init_cleanup_guard(self.state);
             let built_attempt = match self.build_stream_attempt(attempt).await {
@@ -485,7 +485,7 @@ pub(crate) async fn maybe_build_sync_local_image_decision_payload(
         return Ok(None);
     };
 
-    while let Some(attempt) = source.next_attempt().await {
+    while let Some(attempt) = source.next_attempt().await? {
         let cleanup_attempt = attempt.clone();
         let payload = match maybe_build_local_openai_image_decision_payload_for_candidate(
             state,
@@ -555,7 +555,7 @@ pub(crate) async fn maybe_build_stream_local_image_decision_payload(
         return Ok(None);
     };
 
-    while let Some(attempt) = source.next_attempt().await {
+    while let Some(attempt) = source.next_attempt().await? {
         let cleanup_attempt = attempt.clone();
         let payload = match maybe_build_local_openai_image_decision_payload_for_candidate(
             state,
@@ -622,7 +622,7 @@ async fn build_local_sync_plan_and_reports(
     };
 
     let mut plans = Vec::new();
-    while let Some(attempt) = source.next_attempt().await {
+    while let Some(attempt) = source.next_attempt().await? {
         let sticky_init_attempt = local_candidate_attempt_has_sticky_init_owner(&attempt);
         let cleanup_attempt = attempt.clone();
         let payload = match maybe_build_local_openai_image_decision_payload_for_candidate(
@@ -721,7 +721,7 @@ async fn build_local_stream_plan_and_reports(
     };
 
     let mut plans = Vec::new();
-    while let Some(attempt) = source.next_attempt().await {
+    while let Some(attempt) = source.next_attempt().await? {
         let sticky_init_attempt = local_candidate_attempt_has_sticky_init_owner(&attempt);
         let cleanup_attempt = attempt.clone();
         let payload = match maybe_build_local_openai_image_decision_payload_for_candidate(

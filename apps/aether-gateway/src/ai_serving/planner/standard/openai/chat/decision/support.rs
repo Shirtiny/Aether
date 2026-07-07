@@ -23,7 +23,7 @@ use crate::ai_serving::{
     ai_local_execution_contract_for_formats, pool_sticky_session_token_for_request,
     ExecutionRuntimeAuthContext, PlannerAppState,
 };
-use crate::AppState;
+use crate::{AppState, GatewayError};
 
 pub(crate) use crate::ai_serving::planner::candidate_materialization::LocalExecutionCandidateAttempt as LocalOpenAiChatCandidateAttempt;
 pub(crate) use crate::ai_serving::planner::candidate_materialization::LocalExecutionCandidateAttemptSource as LocalOpenAiChatCandidateAttemptSource;
@@ -284,7 +284,7 @@ pub(crate) async fn build_lazy_local_openai_chat_candidate_attempt_source<'a>(
     input: &LocalOpenAiChatDecisionInput,
     body_json: &serde_json::Value,
     require_streaming: bool,
-) -> (LocalOpenAiChatCandidateAttemptSource<'a>, usize) {
+) -> Result<(LocalOpenAiChatCandidateAttemptSource<'a>, usize), GatewayError> {
     let planner_state = PlannerAppState::new(state);
     let sticky_session_token =
         pool_sticky_session_token_for_request(body_json, input.client_session_affinity.as_ref());

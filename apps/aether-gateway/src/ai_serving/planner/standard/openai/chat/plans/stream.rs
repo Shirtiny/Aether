@@ -58,7 +58,7 @@ pub(crate) async fn build_local_openai_chat_stream_attempt_source<'a>(
         &effective_body_json,
         true,
     )
-    .await;
+    .await?;
     if candidate_count == 0 {
         set_local_openai_chat_candidate_evaluation_diagnostic(
             state,
@@ -95,7 +95,7 @@ pub(crate) async fn build_local_openai_chat_stream_attempt_source<'a>(
 #[async_trait]
 impl LocalExecutionAttemptSource<AiStreamAttempt> for LocalOpenAiChatStreamAttemptSource<'_> {
     async fn next_execution_attempt(&mut self) -> Result<Option<AiStreamAttempt>, GatewayError> {
-        while let Some(attempt) = self.candidates.next_attempt().await {
+        while let Some(attempt) = self.candidates.next_attempt().await? {
             let cleanup_attempt = attempt.clone();
             let mut sticky_init_cleanup = attempt.pool_sticky_init_cleanup_guard(self.state);
             let built_attempt = match self.build_stream_attempt(attempt).await {

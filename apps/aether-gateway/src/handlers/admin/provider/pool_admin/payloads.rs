@@ -1001,6 +1001,8 @@ fn admin_pool_scheduling_payload(
     account_status_reason: Option<&str>,
     account_status_source: Option<&str>,
     account_quota_exhausted: bool,
+    account_quota_soft_threshold: bool,
+    account_quota_soft_threshold_blocking: bool,
     oauth_status_code: Option<&str>,
     oauth_status_label: Option<&str>,
     oauth_status_reason: Option<&str>,
@@ -1045,6 +1047,25 @@ fn admin_pool_scheduling_payload(
                 "code": "account_quota_exhausted",
                 "label": "额度耗尽",
                 "blocking": true,
+                "source": "quota",
+                "ttl_seconds": serde_json::Value::Null,
+                "detail": serde_json::Value::Null,
+            })],
+        );
+    }
+    if account_quota_soft_threshold {
+        return (
+            if account_quota_soft_threshold_blocking {
+                "blocked".to_string()
+            } else {
+                "degraded".to_string()
+            },
+            "account_quota_soft_threshold".to_string(),
+            "额度耗尽".to_string(),
+            vec![json!({
+                "code": "account_quota_soft_threshold",
+                "label": "额度耗尽",
+                "blocking": account_quota_soft_threshold_blocking,
                 "source": "quota",
                 "ttl_seconds": serde_json::Value::Null,
                 "detail": serde_json::Value::Null,
@@ -1111,16 +1132,28 @@ pub(super) fn build_admin_pool_key_payload(
     let health_score = admin_pool_health_score(key);
     let circuit_breaker_open = false;
     let auth_semantics = provider_key_auth_semantics(key, provider_type);
-    let account_quota_exhausted = pool_config
+    let skip_quota_exhausted = pool_config
         .as_ref()
-        .is_some_and(|config| config.skip_exhausted_accounts)
-        && admin_provider_pool_pure::admin_pool_key_account_quota_exhausted_with_basis(
+        .is_some_and(|config| config.skip_quota_exhausted_for_provider(provider_type));
+    let account_quota_hard_exhausted =
+        admin_provider_pool_pure::admin_pool_key_account_quota_exhausted_with_basis(
             key,
             provider_type,
             pool_config
                 .as_ref()
                 .map(|config| config.codex_quota_exhaustion_basis.as_str()),
         );
+    let account_quota_exhausted = skip_quota_exhausted && account_quota_hard_exhausted;
+    let account_quota_soft_threshold =
+        admin_provider_pool_pure::admin_pool_key_codex_quota_soft_threshold_exceeded(
+            key,
+            provider_type,
+            pool_config
+                .as_ref()
+                .and_then(|config| config.cost_soft_threshold_percent),
+        );
+    let account_quota_soft_threshold_blocking =
+        skip_quota_exhausted && account_quota_soft_threshold;
     let auth_config = state.parse_catalog_auth_config_json(key);
     let oauth_expires_at =
         admin_pool_derive_oauth_expires_at(provider_type, key, auth_config.as_ref());
@@ -1218,6 +1251,8 @@ pub(super) fn build_admin_pool_key_payload(
             account_status_reason.as_deref(),
             account_status_source.as_deref(),
             account_quota_exhausted,
+            account_quota_soft_threshold && !account_quota_hard_exhausted,
+            account_quota_soft_threshold_blocking && !account_quota_hard_exhausted,
             oauth_status_code.as_deref(),
             oauth_status_label.as_deref(),
             oauth_status_reason.as_deref(),
@@ -1361,6 +1396,7 @@ pub(super) fn build_admin_pool_key_payload(
         json!(key.internal_priority),
     );
     payload.insert("rpm_limit".to_string(), json!(key.rpm_limit));
+    payload.insert("concurrent_limit".to_string(), json!(key.concurrent_limit));
     payload.insert(
         "cache_ttl_minutes".to_string(),
         json!(key.cache_ttl_minutes),

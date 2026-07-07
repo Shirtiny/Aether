@@ -275,6 +275,14 @@ fn usage_matches_list_query(item: &StoredRequestUsageAudit, query: &UsageAuditLi
             return false;
         }
     }
+    if let Some(client_family) = query.client_family.as_deref().map(str::trim) {
+        if !client_family.is_empty() && !usage_client_family_matches(item, client_family) {
+            return false;
+        }
+    }
+    if query.hide_unknown && usage_has_unknown_model_or_provider(item) {
+        return false;
+    }
     if let Some(statuses) = query.statuses.as_ref() {
         if !statuses.iter().any(|status| status == &item.status) {
             return false;
@@ -405,6 +413,27 @@ fn usage_session_id_matches(item: &StoredRequestUsageAudit, needle: &str, exact:
         || usage_metadata_string_matches(item, "conversation_id", needle, exact)
 }
 
+fn usage_client_family_matches(item: &StoredRequestUsageAudit, needle: &str) -> bool {
+    let needle = needle.trim().to_ascii_lowercase();
+    item.client_family
+        .as_deref()
+        .or_else(|| usage_request_metadata_client_family(item.request_metadata.as_ref()))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some_and(|value| value.to_ascii_lowercase() == needle)
+}
+
+fn usage_is_unknown_label(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "unknown" | "unknow"
+    )
+}
+
+fn usage_has_unknown_model_or_provider(item: &StoredRequestUsageAudit) -> bool {
+    usage_is_unknown_label(&item.model) || usage_is_unknown_label(&item.provider_name)
+}
+
 fn usage_matches_keyword_search_query(
     item: &StoredRequestUsageAudit,
     query: &UsageAuditKeywordSearchQuery,
@@ -455,6 +484,14 @@ fn usage_matches_keyword_search_query(
         {
             return false;
         }
+    }
+    if let Some(client_family) = query.client_family.as_deref().map(str::trim) {
+        if !client_family.is_empty() && !usage_client_family_matches(item, client_family) {
+            return false;
+        }
+    }
+    if query.hide_unknown && usage_has_unknown_model_or_provider(item) {
+        return false;
     }
     if let Some(statuses) = query.statuses.as_ref() {
         if !statuses.iter().any(|status| status == &item.status) {

@@ -2099,6 +2099,7 @@ fn ai_serving_runtime_miss_owns_local_execution_miss_state_machine() {
         for forbidden in [
             "state.set_local_execution_runtime_miss_diagnostic(",
             "state.mutate_local_execution_runtime_miss_diagnostic(",
+            "state.upsert_local_execution_runtime_miss_diagnostic(",
         ] {
             assert!(
                 !source.contains(forbidden),

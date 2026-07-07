@@ -503,13 +503,20 @@ fn admin_pool_key_visible_status_filter(
     }
     if pool_config
         .as_ref()
-        .is_some_and(|config| config.skip_exhausted_accounts)
+        .is_some_and(|config| config.skip_quota_exhausted_for_provider(provider_type))
         && admin_provider_pool_pure::admin_pool_key_account_quota_exhausted_with_basis(
             key,
             provider_type,
             pool_config.map(|config| config.codex_quota_exhaustion_basis.as_str()),
         )
     {
+        return "quota_exhausted";
+    }
+    if admin_provider_pool_pure::admin_pool_key_codex_quota_soft_threshold_exceeded(
+        key,
+        provider_type,
+        pool_config.and_then(|config| config.cost_soft_threshold_percent),
+    ) {
         return "quota_exhausted";
     }
     if !key.is_active {

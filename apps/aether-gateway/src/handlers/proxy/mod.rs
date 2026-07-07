@@ -2079,6 +2079,11 @@ fn local_execution_runtime_miss_diagnostic_detail(
                 "本地执行候选评估未完成，暂时无法为本次{request_mode}请求选择上游提供商（{route_label}，原因代码: candidate_evaluation_incomplete）"
             ));
         }
+        "candidate_selection_unavailable" => {
+            return Some(format!(
+                "本地执行候选读取失败或超时，暂时无法为本次{request_mode}请求选择上游提供商（{route_label}，原因代码: candidate_selection_unavailable）"
+            ));
+        }
         "no_local_sync_plans" | "no_local_stream_plans" => {
             return Some(format!(
                 "找到了候选提供商，但无法为本次{request_mode}请求构建本地执行计划。请检查端点路径、认证方式、Header/Body 规则和格式转换配置（{route_label}，原因代码: {}）",

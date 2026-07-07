@@ -2835,6 +2835,7 @@ function toEndpointApiKey(key: PoolKeyDetail): EndpointAPIKey {
     rate_multipliers: key.rate_multipliers ?? null,
     internal_priority: key.internal_priority ?? 50,
     rpm_limit: key.rpm_limit ?? null,
+    concurrent_limit: key.concurrent_limit ?? null,
     allowed_models: key.allowed_models ?? null,
     capabilities: key.capabilities ?? null,
     cache_ttl_minutes: key.cache_ttl_minutes ?? 5,
@@ -3632,6 +3633,7 @@ function getSchedulingBadgeVariant(key: PoolKeyDetail): PoolStatusVariant {
   const reason = getVisibleSchedulingReason(key)
   if (reason === 'manual_disabled' || reason === 'inactive') return 'secondary'
   if (reason === 'account_blocked' || reason === 'account_quota_exhausted' || reason === 'cost_exhausted') return 'destructive'
+  if (reason === 'account_quota_soft_threshold') return 'warning'
   if (reason === 'cooldown') return 'warning'
   if (reason === 'cost_soft' || reason === 'cost') return 'warning'
   if (isPoolKeyCostExhausted(key)) return 'destructive'

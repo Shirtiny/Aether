@@ -146,9 +146,9 @@ pub(crate) async fn maybe_build_sync_local_decision_payload(
     let (mut source, _) = build_lazy_local_openai_chat_candidate_attempt_source(
         state, trace_id, &input, body_json, false,
     )
-    .await;
+    .await?;
 
-    while let Some(attempt) = source.next_attempt().await {
+    while let Some(attempt) = source.next_attempt().await? {
         let cleanup_attempt = attempt.clone();
         let upstream_is_stream = self::plans::openai_chat_upstream_is_stream_for_candidate(
             &attempt.eligible.transport,
@@ -207,9 +207,9 @@ pub(crate) async fn maybe_build_stream_local_decision_payload(
     let (mut source, _) = build_lazy_local_openai_chat_candidate_attempt_source(
         state, trace_id, &input, body_json, true,
     )
-    .await;
+    .await?;
 
-    while let Some(attempt) = source.next_attempt().await {
+    while let Some(attempt) = source.next_attempt().await? {
         let cleanup_attempt = attempt.clone();
         let upstream_is_stream = self::plans::openai_chat_upstream_is_stream_for_candidate(
             &attempt.eligible.transport,

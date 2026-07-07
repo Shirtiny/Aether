@@ -5,10 +5,9 @@ use crate::handlers::admin::request::{AdminAppState, AdminRequestContext};
 use crate::handlers::admin::shared::query_param_value;
 use crate::GatewayError;
 use aether_admin::observability::usage::{
-    admin_usage_bad_request_response, admin_usage_client_family,
-    admin_usage_data_unavailable_response, admin_usage_has_fallback, admin_usage_is_failed,
-    admin_usage_is_ping, admin_usage_is_risk_control, admin_usage_matches_search,
-    admin_usage_matches_username, admin_usage_parse_ids, admin_usage_parse_limit,
+    admin_usage_bad_request_response, admin_usage_data_unavailable_response,
+    admin_usage_has_fallback, admin_usage_is_failed, admin_usage_is_ping,
+    admin_usage_is_risk_control, admin_usage_parse_ids, admin_usage_parse_limit,
     admin_usage_parse_offset, admin_usage_provider_key_name, admin_usage_record_json,
     build_admin_usage_active_requests_response, build_admin_usage_records_response,
     build_admin_usage_summary_stats_response_from_summary, ADMIN_USAGE_DATA_UNAVAILABLE_DETAIL,
@@ -31,6 +30,7 @@ use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 
 const ADMIN_USAGE_ACTIVE_LIMIT: usize = 50;
+const ADMIN_USAGE_ATTEMPT_FILTER_SCAN_BATCH: usize = 500;
 
 async fn load_admin_usage_by_ids(
     state: &AdminAppState<'_>,
@@ -268,19 +268,6 @@ fn admin_usage_matches_attempt_status(
     }
 }
 
-fn admin_usage_matches_client_family(
-    item: &StoredRequestUsageAudit,
-    client_family: Option<&str>,
-) -> bool {
-    let Some(client_family) = client_family
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return true;
-    };
-    admin_usage_client_family(item).is_some_and(|value| value.eq_ignore_ascii_case(client_family))
-}
-
 fn admin_usage_bool_query_param(query: Option<&str>, name: &str) -> bool {
     query_param_value(query, name)
         .as_deref()
@@ -294,15 +281,102 @@ fn admin_usage_bool_query_param(query: Option<&str>, name: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn admin_usage_is_unknown_label(value: &str) -> bool {
-    matches!(
-        value.trim().to_ascii_lowercase().as_str(),
-        "unknown" | "unknow"
-    )
+async fn list_admin_usage_attempt_filtered_records(
+    state: &AdminAppState<'_>,
+    base_query: &UsageAuditListQuery,
+    attempt_status: &str,
+    limit: usize,
+    offset: usize,
+) -> Result<(Vec<StoredRequestUsageAudit>, usize), GatewayError> {
+    let mut records = Vec::new();
+    let mut total = 0_usize;
+    let mut scan_offset = 0_usize;
+    let request_candidate_reader_available = state.has_request_candidate_data_reader();
+
+    loop {
+        let mut page_query = base_query.clone();
+        page_query.limit = Some(ADMIN_USAGE_ATTEMPT_FILTER_SCAN_BATCH);
+        page_query.offset = Some(scan_offset);
+        let page = state.list_usage_audits(&page_query).await?;
+        if page.is_empty() {
+            break;
+        }
+
+        let attempt_flags_by_usage_id =
+            resolve_admin_usage_attempt_flags_by_usage_id(state, &page).await?;
+        for item in page {
+            if admin_usage_matches_attempt_status(
+                &item,
+                attempt_status,
+                &attempt_flags_by_usage_id,
+                request_candidate_reader_available,
+            ) {
+                if total >= offset && records.len() < limit {
+                    records.push(item);
+                }
+                total = total.saturating_add(1);
+            }
+        }
+
+        let Some(next_offset) = scan_offset.checked_add(ADMIN_USAGE_ATTEMPT_FILTER_SCAN_BATCH)
+        else {
+            break;
+        };
+        scan_offset = next_offset;
+    }
+
+    Ok((records, total))
 }
 
-fn admin_usage_has_unknown_model_or_provider(item: &StoredRequestUsageAudit) -> bool {
-    admin_usage_is_unknown_label(&item.model) || admin_usage_is_unknown_label(&item.provider_name)
+async fn list_admin_usage_attempt_filtered_keyword_records(
+    state: &AdminAppState<'_>,
+    keyword_query: &UsageAuditKeywordSearchQuery,
+    attempt_status: &str,
+    limit: usize,
+    offset: usize,
+) -> Result<(Vec<StoredRequestUsageAudit>, usize), GatewayError> {
+    let mut records = Vec::new();
+    let mut total = 0_usize;
+    let mut scan_offset = 0_usize;
+    let request_candidate_reader_available = state.has_request_candidate_data_reader();
+
+    loop {
+        let page_query = UsageAuditKeywordSearchQuery {
+            limit: Some(ADMIN_USAGE_ATTEMPT_FILTER_SCAN_BATCH),
+            offset: Some(scan_offset),
+            ..keyword_query.clone()
+        };
+        let page = state
+            .list_usage_audits_by_keyword_search(&page_query)
+            .await?;
+        if page.is_empty() {
+            break;
+        }
+
+        let attempt_flags_by_usage_id =
+            resolve_admin_usage_attempt_flags_by_usage_id(state, &page).await?;
+        for item in page {
+            if admin_usage_matches_attempt_status(
+                &item,
+                attempt_status,
+                &attempt_flags_by_usage_id,
+                request_candidate_reader_available,
+            ) {
+                if total >= offset && records.len() < limit {
+                    records.push(item);
+                }
+                total = total.saturating_add(1);
+            }
+        }
+
+        let Some(next_offset) = scan_offset.checked_add(ADMIN_USAGE_ATTEMPT_FILTER_SCAN_BATCH)
+        else {
+            break;
+        };
+        scan_offset = next_offset;
+    }
+
+    Ok((records, total))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -369,6 +443,9 @@ fn build_admin_usage_records_query(
         cafecode: query_param_value(query, "cafecode"),
         session_id: query_param_value(query, "session_id"),
         session_id_exact: false,
+        client_family: query_param_value(query, "client_family"),
+        hide_unknown: admin_usage_bool_query_param(query, "hide_unknown")
+            || admin_usage_bool_query_param(query, "hide_unknown_records"),
         limit,
         offset,
         newest_first: true,
@@ -497,6 +574,8 @@ fn build_admin_usage_keyword_search_query(
         cafecode: base_query.cafecode.clone(),
         session_id: base_query.session_id.clone(),
         session_id_exact: base_query.session_id_exact,
+        client_family: base_query.client_family.clone(),
+        hide_unknown: base_query.hide_unknown,
         statuses: base_query.statuses.clone(),
         is_stream: base_query.is_stream,
         error_only: base_query.error_only,
@@ -652,9 +731,6 @@ pub(super) async fn maybe_build_local_admin_usage_summary_response(
                 admin_usage_attempt_status_filter(query_param_value(query, "status").as_deref());
             let search = query_param_value(query, "search");
             let username_filter = query_param_value(query, "username");
-            let client_family_filter = query_param_value(query, "client_family");
-            let hide_unknown_records = admin_usage_bool_query_param(query, "hide_unknown")
-                || admin_usage_bool_query_param(query, "hide_unknown_records");
             let limit = match admin_usage_parse_limit(query) {
                 Ok(value) => value,
                 Err(detail) => return Ok(Some(admin_usage_bad_request_response(detail))),
@@ -689,68 +765,47 @@ pub(super) async fn maybe_build_local_admin_usage_summary_response(
             let active_username_filter = username_filter
                 .as_deref()
                 .filter(|value| !value.trim().is_empty());
-            let active_client_family_filter = client_family_filter
-                .as_deref()
-                .filter(|value| !value.trim().is_empty());
-            let (usage, total) = if hide_unknown_records
-                || attempt_status_filter.is_some()
-                || active_client_family_filter.is_some()
-            {
-                let mut usage = state.list_usage_audits(&base_query).await?;
-                let user_ids: Vec<String> = usage
-                    .iter()
-                    .filter_map(|item| item.user_id.clone())
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .collect();
-                let users_by_id: BTreeMap<
-                    String,
-                    aether_data::repository::users::StoredUserSummary,
-                > = state.resolve_auth_user_summaries_by_ids(&user_ids).await?;
-                let api_key_names = admin_usage_api_key_names(state, &usage).await?;
-                let attempt_flags_by_usage_id =
-                    resolve_admin_usage_attempt_flags_by_usage_id(state, &usage).await?;
-                let request_candidate_reader_available = state.has_request_candidate_data_reader();
-
-                usage.retain(|item| {
-                    admin_usage_matches_search(
-                        item,
-                        active_search,
-                        &users_by_id,
-                        &api_key_names,
-                        state.has_auth_user_data_reader(),
-                        state.has_auth_api_key_data_reader(),
-                    ) && admin_usage_matches_username(
-                        item,
+            let (usage, total) = if let Some(attempt_status) = attempt_status_filter {
+                if active_search.is_some() || active_username_filter.is_some() {
+                    let keywords = active_search
+                        .map(parse_admin_usage_search_keywords)
+                        .unwrap_or_default();
+                    let auth_user_reader_available = state.has_auth_user_data_reader();
+                    let auth_api_key_reader_available = state.has_auth_api_key_data_reader();
+                    let search_context = resolve_admin_usage_search_context(
+                        state,
+                        &keywords,
                         active_username_filter,
-                        &users_by_id,
-                        state.has_auth_user_data_reader(),
-                    ) && admin_usage_matches_client_family(item, active_client_family_filter)
-                        && (!hide_unknown_records
-                            || !admin_usage_has_unknown_model_or_provider(item))
-                });
-                if let Some(attempt_status) = attempt_status_filter {
-                    let mut resolved_usage = Vec::with_capacity(usage.len());
-                    for item in usage {
-                        if admin_usage_matches_attempt_status(
-                            &item,
-                            attempt_status,
-                            &attempt_flags_by_usage_id,
-                            request_candidate_reader_available,
-                        ) {
-                            resolved_usage.push(item);
-                        }
-                    }
-                    usage = resolved_usage;
+                    )
+                    .await?;
+                    let keyword_query = build_admin_usage_keyword_search_query(
+                        &base_query,
+                        keywords,
+                        active_username_filter.map(str::to_owned),
+                        search_context,
+                        auth_user_reader_available,
+                        auth_api_key_reader_available,
+                        None,
+                        None,
+                    );
+                    list_admin_usage_attempt_filtered_keyword_records(
+                        state,
+                        &keyword_query,
+                        attempt_status,
+                        limit,
+                        offset,
+                    )
+                    .await?
+                } else {
+                    list_admin_usage_attempt_filtered_records(
+                        state,
+                        &base_query,
+                        attempt_status,
+                        limit,
+                        offset,
+                    )
+                    .await?
                 }
-                sort_usage_newest_first(&mut usage);
-                let total = usage.len();
-                let records = usage
-                    .into_iter()
-                    .skip(offset)
-                    .take(limit)
-                    .collect::<Vec<_>>();
-                (records, total)
             } else if active_search.is_some() || active_username_filter.is_some() {
                 let keywords = active_search
                     .map(parse_admin_usage_search_keywords)

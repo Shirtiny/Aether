@@ -179,7 +179,7 @@
               </span>
             </div>
             <p class="text-xs leading-5 text-muted-foreground">
-              控制窗口期、Key 限额与软阈值，防止个别账号短时间内过度消耗。
+              Key 窗口限额按本地 token 滚动窗口硬限制；Codex 软阈值会同时保护官方 5H 与周额度。
             </p>
           </div>
 
@@ -216,7 +216,7 @@
             </div>
             <div class="space-y-1.5">
               <Label>
-                软阈值
+                Codex 软阈值
                 <span class="text-xs text-muted-foreground">(%)</span>
               </Label>
               <Input
@@ -224,7 +224,7 @@
                 type="number"
                 min="0"
                 max="100"
-                placeholder="80"
+                placeholder="99"
                 @update:model-value="(v) => form.cost_soft_threshold_percent = parseNum(v)"
               />
             </div>

@@ -182,7 +182,7 @@ pub(crate) async fn build_local_stream_attempt_source<'a>(
 #[async_trait]
 impl LocalExecutionAttemptSource<AiSyncAttempt> for LocalStandardSyncAttemptSource<'_> {
     async fn next_execution_attempt(&mut self) -> Result<Option<AiSyncAttempt>, GatewayError> {
-        while let Some(attempt) = self.candidates.next_attempt().await {
+        while let Some(attempt) = self.candidates.next_attempt().await? {
             let cleanup_attempt = attempt.clone();
             let mut sticky_init_cleanup = attempt.pool_sticky_init_cleanup_guard(self.state);
             let built_attempt = match self.build_sync_attempt(attempt).await {
@@ -240,7 +240,7 @@ impl LocalExecutionAttemptSource<AiSyncAttempt> for LocalStandardSyncAttemptSour
 #[async_trait]
 impl LocalExecutionAttemptSource<AiStreamAttempt> for LocalStandardStreamAttemptSource<'_> {
     async fn next_execution_attempt(&mut self) -> Result<Option<AiStreamAttempt>, GatewayError> {
-        while let Some(attempt) = self.candidates.next_attempt().await {
+        while let Some(attempt) = self.candidates.next_attempt().await? {
             let cleanup_attempt = attempt.clone();
             let mut sticky_init_cleanup = attempt.pool_sticky_init_cleanup_guard(self.state);
             let built_attempt = match self.build_stream_attempt(attempt).await {
@@ -404,7 +404,7 @@ pub(crate) async fn maybe_build_sync_via_standard_family_payload(
             .await?;
     apply_local_runtime_candidate_evaluation_progress(state, trace_id, candidate_count);
 
-    while let Some(attempt) = source.next_attempt().await {
+    while let Some(attempt) = source.next_attempt().await? {
         let cleanup_attempt = attempt.clone();
         let payload = match maybe_build_local_standard_decision_payload_for_candidate(
             state, parts, trace_id, body_json, &input, attempt, spec,
@@ -463,7 +463,7 @@ pub(crate) async fn maybe_build_stream_via_standard_family_payload(
             .await?;
     apply_local_runtime_candidate_evaluation_progress(state, trace_id, candidate_count);
 
-    while let Some(attempt) = source.next_attempt().await {
+    while let Some(attempt) = source.next_attempt().await? {
         let cleanup_attempt = attempt.clone();
         let payload = match maybe_build_local_standard_decision_payload_for_candidate(
             state, parts, trace_id, body_json, &input, attempt, spec,
@@ -531,7 +531,7 @@ pub(crate) async fn build_local_sync_plan_and_reports(
         return Ok(Vec::new());
     }
     let mut plans = Vec::new();
-    while let Some(attempt) = source.next_attempt().await {
+    while let Some(attempt) = source.next_attempt().await? {
         let sticky_init_attempt = local_candidate_attempt_has_sticky_init_owner(&attempt);
         let cleanup_attempt = attempt.clone();
         let payload = match maybe_build_local_standard_decision_payload_for_candidate(
@@ -628,7 +628,7 @@ pub(crate) async fn build_local_stream_plan_and_reports(
         return Ok(Vec::new());
     }
     let mut plans = Vec::new();
-    while let Some(attempt) = source.next_attempt().await {
+    while let Some(attempt) = source.next_attempt().await? {
         let sticky_init_attempt = local_candidate_attempt_has_sticky_init_owner(&attempt);
         let cleanup_attempt = attempt.clone();
         let payload = match maybe_build_local_standard_decision_payload_for_candidate(

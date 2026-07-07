@@ -35,7 +35,9 @@ pub use providers::{
 };
 pub use quota::{
     provider_pool_key_account_quota_exhausted,
-    provider_pool_key_account_quota_exhausted_with_basis, provider_pool_key_scheduling_label,
+    provider_pool_key_account_quota_exhausted_with_basis,
+    provider_pool_key_account_quota_exhausted_with_policy,
+    provider_pool_key_codex_quota_soft_threshold_exceeded, provider_pool_key_scheduling_label,
     provider_pool_member_quota_snapshot, provider_pool_quota_metadata_provider_type,
     provider_pool_quota_metadata_updated_at, provider_pool_quota_snapshot_updated_at,
 };

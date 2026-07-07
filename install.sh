@@ -74,11 +74,12 @@ Options:
                       compose-single-node: Docker Compose single-node app
                       single-node: single-node system service
                       Linux services use systemd; macOS services use launchd
-  --channel CHANNEL    Release channel to resolve when --version is omitted: stable, latest, rc, or beta
+  --channel CHANNEL    Release channel to resolve when --version is omitted: stable, latest, rc, beta, or alpha
                       stable/latest resolves the latest stable tag (default)
-                      rc resolves the latest tag like v0.7.0-rc.1
-                      beta resolves the latest tag like v0.7.0-beta.1
-  --version VERSION    Exact release tag to install, for example v0.7.0-rc.1
+                      rc resolves the latest tag like backend-v0.7.0-rc.1
+                      beta resolves the latest tag like backend-v0.7.0-beta.1
+                      alpha resolves the latest tag like backend-v0.7.0-alpha.1
+  --version VERSION    Exact release tag to install, for example backend-v0.7.0-rc.1
   --repo OWNER/REPO    GitHub repository to download from (default: Shirtiny/Aether)
   --source-ref REF     Source branch/tag used for compose templates (default: custom)
   --archive PATH       Install from a local release tarball instead of downloading
@@ -389,7 +390,8 @@ select_version() {
   1) 最新正式版
   2) 最新 RC 预发布版
   3) 最新 Beta 预发布版
-  4) 指定 tag，例如 v0.7.0-rc.1
+  4) 最新 Alpha 预发布版
+  5) 指定 tag，例如 backend-v0.7.0-rc.1
 
 请输入选项 [1]:
 EOF
@@ -400,7 +402,8 @@ Choose Aether version:
   1) Latest stable release
   2) Latest RC prerelease
   3) Latest beta prerelease
-  4) Exact tag, for example v0.7.0-rc.1
+  4) Latest alpha prerelease
+  5) Exact tag, for example backend-v0.7.0-rc.1
 
 Enter choice [1]:
 EOF
@@ -418,6 +421,9 @@ EOF
                 CHANNEL="beta"
                 ;;
             4)
+                CHANNEL="alpha"
+                ;;
+            5)
                 if ui_is_zh; then
                     cat >/dev/tty <<'EOF'
 请输入准确 tag:
@@ -890,23 +896,29 @@ resolve_version() {
         stable|latest)
             tag="$(download_stdout "https://api.github.com/repos/${REPO}/releases?per_page=50" |
                 sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' |
-                grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' |
+                grep -E '^backend-v[0-9]+\.[0-9]+\.[0-9]+$' |
                 head -n1 || true)"
             ;;
         rc)
             tag="$(download_stdout "https://api.github.com/repos/${REPO}/releases?per_page=50" |
                 sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' |
-                grep -E '^v[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+$' |
+                grep -E '^backend-v[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+$' |
                 head -n1 || true)"
             ;;
         beta)
             tag="$(download_stdout "https://api.github.com/repos/${REPO}/releases?per_page=50" |
                 sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' |
-                grep -E '^v[0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]+$' |
+                grep -E '^backend-v[0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]+$' |
+                head -n1 || true)"
+            ;;
+        alpha)
+            tag="$(download_stdout "https://api.github.com/repos/${REPO}/releases?per_page=50" |
+                sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' |
+                grep -E '^backend-v[0-9]+\.[0-9]+\.[0-9]+-alpha\.[0-9]+$' |
                 head -n1 || true)"
             ;;
         *)
-            die "unsupported release channel: ${CHANNEL}; expected stable, latest, rc, or beta"
+            die "unsupported release channel: ${CHANNEL}; expected stable, latest, rc, beta, or alpha"
             ;;
     esac
     echo "${tag}"
@@ -1215,11 +1227,11 @@ compose_image() {
             stable|latest)
                 tag="latest"
                 ;;
-            rc|beta)
+            rc|beta|alpha)
                 tag="${CHANNEL}"
                 ;;
             *)
-                die "unsupported release channel: ${CHANNEL}; expected stable, latest, rc, or beta"
+                die "unsupported release channel: ${CHANNEL}; expected stable, latest, rc, beta, or alpha"
                 ;;
         esac
     fi

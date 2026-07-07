@@ -2,8 +2,8 @@ name: Release Aether
 
 on:
   push:
-    branches: ['custom']
-    tags: ['v*']
+    tags:
+      - 'backend-v*'
   workflow_dispatch:
 
 concurrency:
@@ -25,6 +25,8 @@ jobs:
     outputs:
       publish: ${{ steps.classify.outputs.publish }}
       version_tag: ${{ steps.classify.outputs.version_tag }}
+      version_number: ${{ steps.classify.outputs.version_number }}
+      minor_tag: ${{ steps.classify.outputs.minor_tag }}
       prerelease: ${{ steps.classify.outputs.prerelease }}
       make_latest: ${{ steps.classify.outputs.make_latest }}
     steps:
@@ -36,6 +38,8 @@ jobs:
 
           echo "publish=false" >> "${GITHUB_OUTPUT}"
           echo "version_tag=" >> "${GITHUB_OUTPUT}"
+          echo "version_number=" >> "${GITHUB_OUTPUT}"
+          echo "minor_tag=" >> "${GITHUB_OUTPUT}"
           echo "prerelease=false" >> "${GITHUB_OUTPUT}"
           echo "make_latest=false" >> "${GITHUB_OUTPUT}"
 
@@ -45,15 +49,24 @@ jobs:
           fi
 
           tag="${GITHUB_REF_NAME}"
-          if [[ ! "${tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-(beta|rc)\.[0-9]+)?$ ]]; then
+          if [[ ! "${tag}" =~ ^backend-v([0-9]+)\.([0-9]+)\.([0-9]+)(-(alpha|beta|rc)\.[0-9]+)?$ ]]; then
             echo "Unsupported release tag: ${tag}" >&2
-            echo "Expected vX.Y.Z, vX.Y.Z-beta.N, or vX.Y.Z-rc.N." >&2
+            echo "Expected backend-vX.Y.Z, backend-vX.Y.Z-alpha.N, backend-vX.Y.Z-beta.N, or backend-vX.Y.Z-rc.N." >&2
             exit 1
           fi
 
-          echo "version_tag=${tag}" >> "${GITHUB_OUTPUT}"
+          major="${BASH_REMATCH[1]}"
+          minor="${BASH_REMATCH[2]}"
+          patch="${BASH_REMATCH[3]}"
+          prerelease_suffix="${BASH_REMATCH[4]:-}"
+          version_number="${major}.${minor}.${patch}${prerelease_suffix}"
+          minor_tag="${major}.${minor}"
 
-          if [[ "${tag}" == *-* ]]; then
+          echo "version_tag=${tag}" >> "${GITHUB_OUTPUT}"
+          echo "version_number=${version_number}" >> "${GITHUB_OUTPUT}"
+          echo "minor_tag=${minor_tag}" >> "${GITHUB_OUTPUT}"
+
+          if [[ -n "${prerelease_suffix}" ]]; then
             echo "prerelease=true" >> "${GITHUB_OUTPUT}"
           else
             echo "make_latest=true" >> "${GITHUB_OUTPUT}"
@@ -93,48 +106,10 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  build_custom_amd64:
-    name: Build linux-amd64 (custom)
-    needs: preflight
-    if: github.ref == 'refs/heads/custom'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-unknown-linux-musl
-
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: release-x86_64-unknown-linux-musl
-          workspaces: . -> target
-
-      - name: Install cross
-        uses: taiki-e/install-action@cross
-
-      - name: Build
-        env:
-          AETHER_VERSION: ""
-          CARGO_TERM_COLOR: always
-        shell: bash
-        run: |
-          cross build --release --locked -p aether-gateway --target x86_64-unknown-linux-musl
-
-      - name: Upload binary artifact
-        uses: actions/upload-artifact@v5
-        with:
-          name: aether-gateway-linux-amd64
-          path: target/x86_64-unknown-linux-musl/release/aether-gateway
-          if-no-files-found: error
-          retention-days: 1
-
   build_release_matrix:
     name: Build ${{ matrix.name }}
     needs: preflight
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/backend-v')
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: true
@@ -152,18 +127,6 @@ jobs:
             arch: arm64
             os: ubuntu-latest
             use_cross: true
-          - name: macos-amd64
-            target: x86_64-apple-darwin
-            platform: macos
-            arch: amd64
-            os: macos-15-intel
-            use_cross: false
-          - name: macos-arm64
-            target: aarch64-apple-darwin
-            platform: macos
-            arch: arm64
-            os: macos-15
-            use_cross: false
     steps:
       - uses: actions/checkout@v5
 
@@ -184,7 +147,7 @@ jobs:
 
       - name: Build
         env:
-          AETHER_VERSION: ${{ needs.preflight.outputs.version_tag }}
+          AETHER_VERSION: ${{ needs.preflight.outputs.version_number }}
           AETHER_BUILD_TYPE: release
           CARGO_TERM_COLOR: always
         shell: bash
@@ -202,58 +165,6 @@ jobs:
           path: target/${{ matrix.target }}/release/aether-gateway
           if-no-files-found: error
           retention-days: 1
-
-  docker_custom_amd64:
-    name: Docker linux/amd64 (custom)
-    needs: [frontend, build_custom_amd64]
-    if: github.ref == 'refs/heads/custom'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v5
-        with:
-          path: artifacts
-
-      - name: Prepare dist layout
-        run: |
-          mkdir -p dist
-          cp artifacts/aether-gateway-linux-amd64/aether-gateway dist/aether-gateway-amd64
-          chmod +x dist/aether-gateway-amd64
-          cp -r artifacts/frontend-dist dist/frontend
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: |
-            ${{ env.REGISTRY }}/${{ env.GHCR_IMAGE }}
-          tags: |
-            type=raw,value=latest
-            type=sha,prefix=
-          flavor: |
-            latest=false
-
-      - name: Build and push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./Dockerfile.app
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          platforms: linux/amd64
 
   docker_release_multiarch:
     name: Docker multi-arch (tag)
@@ -296,9 +207,11 @@ jobs:
           images: |
             ${{ env.REGISTRY }}/${{ env.GHCR_IMAGE }}
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}},enable=${{ needs.preflight.outputs.make_latest == 'true' }}
+            type=raw,value=${{ needs.preflight.outputs.version_tag }}
+            type=raw,value=${{ needs.preflight.outputs.version_number }}
+            type=raw,value=${{ needs.preflight.outputs.minor_tag }},enable=${{ needs.preflight.outputs.make_latest == 'true' }}
             type=raw,value=latest,enable=${{ needs.preflight.outputs.make_latest == 'true' }}
+            type=raw,value=alpha,enable=${{ contains(github.ref_name, '-alpha.') }}
             type=raw,value=beta,enable=${{ contains(github.ref_name, '-beta.') }}
             type=raw,value=rc,enable=${{ contains(github.ref_name, '-rc.') }}
             type=sha,prefix=
@@ -306,6 +219,7 @@ jobs:
             latest=false
 
       - name: Build and push
+        id: docker_build
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -315,10 +229,102 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           platforms: linux/amd64,linux/arm64
 
+      - name: Generate image build record
+        shell: bash
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.GHCR_IMAGE }}
+          VERSION_TAG: ${{ needs.preflight.outputs.version_tag }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+          DIGEST: ${{ steps.docker_build.outputs.digest }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p image-record
+
+          find crates/aether-data/migrations/postgres -maxdepth 1 -type f -name '*.sql' -print0 \
+            | sort -z \
+            | xargs -0 -r sha256sum > image-record/postgres-migrations.sha256
+
+          find crates/aether-data/backfills/postgres -maxdepth 1 -type f -name '*.sql' -print0 \
+            | sort -z \
+            | xargs -0 -r sha256sum > image-record/postgres-backfills.sha256
+
+          MIG_COUNT="$(wc -l < image-record/postgres-migrations.sha256 | tr -d ' ')"
+          BACKFILL_COUNT="$(wc -l < image-record/postgres-backfills.sha256 | tr -d ' ')"
+          MIG_LATEST="$(find crates/aether-data/migrations/postgres -maxdepth 1 -type f -name '*.sql' -printf '%f\n' | sort | tail -n 1)"
+          BACKFILL_LATEST="$(find crates/aether-data/backfills/postgres -maxdepth 1 -type f -name '*.sql' -printf '%f\n' | sort | tail -n 1)"
+          MIG_MANIFEST_SHA="$(sha256sum image-record/postgres-migrations.sha256 | awk '{print $1}')"
+          BACKFILL_MANIFEST_SHA="$(sha256sum image-record/postgres-backfills.sha256 | awk '{print $1}')"
+
+          cat > "image-record/image-build-${GITHUB_REF_NAME}.md" <<EOF
+          # Aether Image Build Record
+
+          - version: \`${VERSION_TAG}\`
+          - image: \`${IMAGE}@${DIGEST}\`
+          - git ref: \`${GITHUB_REF_NAME}\`
+          - git sha: \`${GITHUB_SHA}\`
+          - workflow run: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+
+          ## Tags
+
+          \`\`\`
+          ${TAGS}
+          \`\`\`
+
+          ## Postgres migrations in this image
+
+          - migration count: \`${MIG_COUNT}\`
+          - latest migration: \`${MIG_LATEST}\`
+          - migration manifest sha256: \`${MIG_MANIFEST_SHA}\`
+
+          ## Postgres backfills in this image
+
+          - backfill count: \`${BACKFILL_COUNT}\`
+          - latest backfill: \`${BACKFILL_LATEST}\`
+          - backfill manifest sha256: \`${BACKFILL_MANIFEST_SHA}\`
+          EOF
+
+          export MIG_COUNT BACKFILL_COUNT MIG_LATEST BACKFILL_LATEST MIG_MANIFEST_SHA BACKFILL_MANIFEST_SHA
+          python3 - <<'PY' > "image-record/image-build-${GITHUB_REF_NAME}.json"
+          import json
+          import os
+
+          record = {
+              "version": os.environ["VERSION_TAG"],
+              "image": os.environ["IMAGE"],
+              "digest": os.environ["DIGEST"],
+              "image_ref": f"{os.environ['IMAGE']}@{os.environ['DIGEST']}",
+              "git_ref": os.environ["GITHUB_REF_NAME"],
+              "git_sha": os.environ["GITHUB_SHA"],
+              "workflow_run": f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+              "postgres_migrations": {
+                  "count": int(os.environ["MIG_COUNT"]),
+                  "latest": os.environ["MIG_LATEST"],
+                  "manifest_sha256": os.environ["MIG_MANIFEST_SHA"],
+              },
+              "postgres_backfills": {
+                  "count": int(os.environ["BACKFILL_COUNT"]),
+                  "latest": os.environ["BACKFILL_LATEST"],
+                  "manifest_sha256": os.environ["BACKFILL_MANIFEST_SHA"],
+              },
+          }
+          print(json.dumps(record, ensure_ascii=False, indent=2))
+          PY
+
+          cat "image-record/image-build-${GITHUB_REF_NAME}.md" >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload image build record
+        uses: actions/upload-artifact@v5
+        with:
+          name: image-build-record
+          path: image-record/*
+          if-no-files-found: error
+          retention-days: 30
+
   package:
     name: Release tarballs
     needs: [preflight, frontend, build_release_matrix]
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/backend-v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -340,7 +346,7 @@ jobs:
           fi
 
           mkdir -p package release-assets
-          for platform in linux macos; do
+          for platform in linux; do
             for arch in amd64 arm64; do
               bundle="aether-${VERSION}-${platform}-${arch}"
               root="package/${bundle}"
@@ -394,6 +400,12 @@ jobs:
           name: release-assets
           path: release-assets
 
+      - name: Download image build record
+        uses: actions/download-artifact@v5
+        with:
+          name: image-build-record
+          path: release-assets/image-record
+
       - name: Delete stale draft releases for tag
         env:
           GH_TOKEN: ${{ github.token }}
@@ -425,3 +437,4 @@ jobs:
             release-assets/*.tar.gz
             release-assets/SHA256SUMS
             release-assets/install.sh
+            release-assets/image-record/*
