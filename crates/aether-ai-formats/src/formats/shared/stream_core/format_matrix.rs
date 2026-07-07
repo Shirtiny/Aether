@@ -330,6 +330,7 @@ fn standardized_usage_from_canonical(usage: CanonicalUsage) -> StandardizedUsage
         usage.cache_creation_ephemeral_1h_tokens as i64;
     standardized.cache_read_tokens = usage.cache_read_tokens as i64;
     standardized.reasoning_tokens = usage.reasoning_tokens as i64;
+    standardized.reasoning_output_tokens = usage.reasoning_tokens as i64;
     standardized.dimensions.insert(
         "total_tokens".to_string(),
         serde_json::json!(usage.total_tokens),
@@ -1001,6 +1002,7 @@ mod tests {
         assert_eq!(usage.input_tokens, 26);
         assert_eq!(usage.output_tokens, 137);
         assert_eq!(usage.reasoning_tokens, 10);
+        assert_eq!(usage.reasoning_output_tokens, 10);
         assert_eq!(usage.cache_read_tokens, 0);
     }
 

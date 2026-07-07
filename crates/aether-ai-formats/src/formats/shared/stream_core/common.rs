@@ -19,6 +19,21 @@ pub fn decode_json_data_line(line: &[u8]) -> Option<Value> {
     serde_json::from_str(data_line).ok()
 }
 
+fn usage_detail_u64(usage: &Map<String, Value>, key: &str) -> Option<u64> {
+    usage
+        .get("output_tokens_details")
+        .and_then(Value::as_object)
+        .and_then(|details| details.get(key))
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            usage
+                .get("completion_tokens_details")
+                .and_then(Value::as_object)
+                .and_then(|details| details.get(key))
+                .and_then(Value::as_u64)
+        })
+}
+
 pub fn resolve_identity(
     response_id: Option<&str>,
     model: Option<&str>,
@@ -78,16 +93,10 @@ pub fn canonical_usage_from_openai_usage(value: Option<&Value>) -> Option<Canoni
         })
         .unwrap_or(0);
     let reasoning_tokens = usage
-        .get("reasoning_tokens")
+        .get("reasoning_output_tokens")
         .and_then(Value::as_u64)
-        .or_else(|| {
-            usage
-                .get("output_tokens_details")
-                .or_else(|| usage.get("completion_tokens_details"))
-                .and_then(Value::as_object)
-                .and_then(|details| details.get("reasoning_tokens"))
-                .and_then(Value::as_u64)
-        })
+        .or_else(|| usage.get("reasoning_tokens").and_then(Value::as_u64))
+        .or_else(|| usage_detail_u64(usage, "reasoning_tokens"))
         .unwrap_or(0);
     let total_tokens = usage.get("total_tokens").and_then(Value::as_u64).unwrap_or(
         input_tokens

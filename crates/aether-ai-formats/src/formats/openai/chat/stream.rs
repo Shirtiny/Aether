@@ -2901,6 +2901,21 @@ mod tests {
     }
 
     #[test]
+    fn openai_usage_accepts_reasoning_output_tokens() {
+        let usage = canonical_usage_from_openai_usage(Some(&json!({
+            "input_tokens": 26,
+            "output_tokens": 137,
+            "reasoning_output_tokens": 516,
+            "total_tokens": 163,
+        })))
+        .expect("usage should parse");
+
+        assert_eq!(usage.input_tokens, 26);
+        assert_eq!(usage.output_tokens, 137);
+        assert_eq!(usage.reasoning_tokens, 516);
+    }
+
+    #[test]
     fn openai_chat_provider_state_accepts_usage_only_terminal_chunk() {
         let mut state = OpenAIChatProviderState::default();
         let report_context = json!({});
@@ -2974,6 +2989,7 @@ mod tests {
                                 "cached_tokens": 0,
                             },
                             "output_tokens": 137,
+                            "reasoning_output_tokens": 516,
                             "output_tokens_details": {
                                 "reasoning_tokens": 0,
                             },
@@ -2992,6 +3008,7 @@ mod tests {
                     input_tokens: 26,
                     output_tokens: 137,
                     cache_read_tokens: 0,
+                    reasoning_tokens: 516,
                     ..
                 }),
                 ..

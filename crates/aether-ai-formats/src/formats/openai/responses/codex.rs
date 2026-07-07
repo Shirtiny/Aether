@@ -23,9 +23,9 @@ const CODEX_OPENAI_RESPONSES_UNSUPPORTED_BODY_FIELDS: &[&str] = &[
     "metadata",
     "prompt_cache_retention",
     "safety_identifier",
-    "stream_options",
     "previous_response_id",
 ];
+const CODEX_REASONING_SUMMARY_DELIVERY_SEQUENTIAL_CUTOFF: &str = "sequential_cutoff";
 const CODEX_DEFAULT_USER_AGENT: &str =
     "codex-tui/0.122.0 (Mac OS 15.2.0; arm64) vscode/2.6.11 (codex-tui; 0.122.0)";
 const CODEX_DEFAULT_ORIGINATOR: &str = "codex-tui";
@@ -792,6 +792,38 @@ fn strip_codex_hosted_tool_choice_name_for_backend(
     }
 }
 
+fn normalize_codex_responses_stream_options_for_backend(
+    body_object: &mut serde_json::Map<String, Value>,
+    provider_api_format: &str,
+    body_rules: Option<&Value>,
+) {
+    if body_rules_handle_path(body_rules, "stream_options") {
+        return;
+    }
+    if is_openai_responses_compact_request(provider_api_format) {
+        body_object.remove("stream_options");
+        return;
+    }
+
+    let Some(stream_options) = body_object
+        .get_mut("stream_options")
+        .and_then(Value::as_object_mut)
+    else {
+        body_object.remove("stream_options");
+        return;
+    };
+    let keep_reasoning_summary_delivery = stream_options
+        .get("reasoning_summary_delivery")
+        .and_then(Value::as_str)
+        .is_some_and(|value| value == CODEX_REASONING_SUMMARY_DELIVERY_SEQUENTIAL_CUTOFF);
+    if !keep_reasoning_summary_delivery {
+        body_object.remove("stream_options");
+        return;
+    }
+
+    stream_options.retain(|key, _| key == "reasoning_summary_delivery");
+}
+
 pub fn apply_codex_openai_responses_special_body_edits(
     provider_request_body: &mut Value,
     provider_type: &str,
@@ -819,6 +851,11 @@ pub fn apply_codex_openai_responses_special_body_edits(
             body_object.remove(*field);
         }
     }
+    normalize_codex_responses_stream_options_for_backend(
+        body_object,
+        provider_api_format,
+        body_rules,
+    );
     if is_openai_responses_compact_request(provider_api_format) {
         body_object.remove("store");
     } else if !body_rules_handle_path(body_rules, "store") {
@@ -1148,7 +1185,54 @@ mod tests {
                 "{field} must be stripped"
             );
         }
+        assert!(provider_request_body.get("stream_options").is_none());
         assert_eq!(provider_request_body["input"][0]["content"], json!("hello"));
+    }
+
+    #[test]
+    fn codex_responses_body_edits_preserve_latest_official_stream_options() {
+        let mut provider_request_body = json!({
+            "input": [{"role": "user", "content": "hello"}],
+            "model": "gpt-5.4",
+            "stream_options": {
+                "reasoning_summary_delivery": "sequential_cutoff",
+                "include_usage": true
+            }
+        });
+
+        apply_codex_openai_responses_special_body_edits(
+            &mut provider_request_body,
+            "codex",
+            "openai:responses",
+            None,
+            None,
+        );
+
+        assert_eq!(
+            provider_request_body["stream_options"],
+            json!({"reasoning_summary_delivery": "sequential_cutoff"})
+        );
+    }
+
+    #[test]
+    fn codex_compact_body_edits_strip_stream_options() {
+        let mut provider_request_body = json!({
+            "input": [{"role": "user", "content": "hello"}],
+            "model": "gpt-5.4",
+            "stream_options": {
+                "reasoning_summary_delivery": "sequential_cutoff"
+            }
+        });
+
+        apply_codex_openai_responses_special_body_edits(
+            &mut provider_request_body,
+            "codex",
+            "openai:responses:compact",
+            None,
+            None,
+        );
+
+        assert!(provider_request_body.get("stream_options").is_none());
     }
 
     #[test]

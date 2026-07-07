@@ -35,6 +35,11 @@ Aether stores per-request TLS capture under `usage.request_metadata.tls_fingerpr
 
 ## Strict Codex Comparison
 
+Hard requirements when claiming Codex default TLS equivalence:
+
+- Keep `native-tls-vendored` enabled. Host OpenSSL produced a different JA3 in the 2026-06-28 comparison.
+- Use `reqwest_default_tls` for the Codex default TLS profile. Rustls profiles, including `codex-reqwest-rustls-auto`, are legacy/non-equivalent for strict official Codex matching.
+
 Use `tools/tls-clienthello-capture.py` to compare normalized ClientHello structure, not raw TLS record bytes. Raw ClientHello bytes contain connection randomness and key-share material, so byte-for-byte equality is not a useful contract.
 
 The comparison currently checks:

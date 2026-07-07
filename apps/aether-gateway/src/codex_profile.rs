@@ -189,7 +189,6 @@ pub(crate) fn resolve_codex_concrete_account_profile(
         .and_then(Value::as_object)
         .and_then(|object| object.get(CODEX_TRANSPORT_PROFILE_KEY))
         .and_then(transport_profile_id_from_value)
-        .filter(|profile_id| !is_legacy_codex_default_transport_profile_id(profile_id))
         .unwrap_or(TRANSPORT_PROFILE_CODEX_REQWEST_DEFAULT_TLS_AUTO);
     let transport_tls_fingerprint_hash = fingerprint
         .and_then(Value::as_object)
@@ -858,6 +857,39 @@ mod tests {
         assert_eq!(
             outcome.fingerprint[CODEX_CLIENT_PROFILE_KEY]["transport_profile_id"],
             TRANSPORT_PROFILE_CODEX_REQWEST_DEFAULT_TLS_AUTO
+        );
+    }
+
+    #[test]
+    fn read_only_resolution_keeps_legacy_transport_until_materialized() {
+        let fingerprint = json!({
+            "transport_profile": {
+                "profile_id": "codex-reqwest-rustls-auto",
+                "backend": "reqwest_rustls",
+                "http_mode": "auto",
+                "pool_scope": "key"
+            }
+        });
+
+        let profile = resolve_codex_concrete_account_profile(
+            Some(&fingerprint),
+            Some(r#"{"account_id":"acc-1"}"#),
+            "key-1",
+            "name-1",
+            "codex-tui/0.142.0 test",
+            "codex-tui",
+        )
+        .expect("profile should resolve");
+
+        assert_eq!(
+            profile.fingerprint_hash,
+            codex_concrete_profile_hash(
+                "codex-tui/0.142.0 test",
+                "codex-tui",
+                profile.installation_id.as_str(),
+                TRANSPORT_PROFILE_CODEX_LEGACY_REQWEST_RUSTLS_AUTO,
+                None,
+            )
         );
     }
 

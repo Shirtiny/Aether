@@ -1,6 +1,6 @@
 # Sticky And Profile
 
-Last updated: 2026-06-28
+Last updated: 2026-07-07
 
 This document records the Aether sticky-session contract for Codex traffic first. Profile/fingerprint handling is intentionally left as a follow-up section until the implementation is broader than stable client headers.
 
@@ -16,7 +16,8 @@ This document records the Aether sticky-session contract for Codex traffic first
 
 ### Official Codex Source Basis
 
-Verified against the local OpenAI Codex source checkout at `/opt/stacks/openai-codex` commit `d2885dc`.
+Verified first against the local OpenAI Codex source checkout at `/opt/stacks/openai-codex` commit `d2885dc`.
+Re-checked against an official `openai/codex` `main` snapshot on 2026-07-07, commit `42156ba007278d9068f1518ac1f627b56c136ef6`. This is a pinned comparison snapshot, not a claim that the document continuously tracks the latest upstream Codex commit.
 
 - `codex-rs/core/src/responses_metadata.rs`
   - `client_metadata["x-codex-turn-metadata"]` is documented as the canonical transport for the full turn metadata blob.
@@ -151,6 +152,7 @@ As of this document update, all three pass.
 This section records the official Codex client-feature inventory that should shape Aether's Codex profile work.
 
 Source snapshot: local official OpenAI Codex checkout `/opt/stacks/openai-codex` at commit `d2885dc`.
+Pinned source comparison snapshot: official `openai/codex` `main` at commit `42156ba007278d9068f1518ac1f627b56c136ef6`, checked on 2026-07-07.
 
 ### Profile Scope
 
@@ -600,14 +602,19 @@ Aether installation-id target behavior:
 
 Official Codex HTTP/TLS source:
 
-- `/opt/stacks/openai-codex/codex-rs/login/src/auth/default_client.rs` builds ordinary Codex HTTP traffic from `reqwest::Client::builder().default_headers(default_headers())`, plus Codex custom CA/proxy handling.
-- `/opt/stacks/openai-codex/codex-rs/Cargo.toml` declares workspace `reqwest = { version = "0.12", features = ["cookies"] }` with default features enabled. In the normal HTTP client path, this means reqwest's default TLS stack is in play.
-- `/opt/stacks/openai-codex/codex-rs/codex-client/src/custom_ca.rs` forces `builder.use_rustls_tls()` only when a Codex custom CA bundle is configured.
+- `codex-rs/login/src/auth/default_client.rs` builds ordinary Codex HTTP traffic from `reqwest::Client::builder().default_headers(default_headers())`, plus Codex custom CA/proxy handling.
+- Snapshot `42156ba` moved the shared wrapper/custom-CA code under `codex-rs/http-client/src/`, but the ordinary default path still starts from `reqwest::Client::builder().default_headers(default_headers())`.
+- `codex-rs/Cargo.toml` declares workspace `reqwest = { version = "0.12", features = ["cookies"] }` with default features enabled. In the normal HTTP client path, this means reqwest's default TLS stack is in play.
+- `codex-rs/http-client/src/custom_ca.rs` forces `builder.use_rustls_tls()` only when a Codex custom CA bundle is configured.
+- Snapshot `42156ba` added route-aware request client construction through `build_default_reqwest_client_for_route(...)`. When the outbound proxy policy is `ReqwestDefault` or the client is sandboxed, it intentionally preserves `build_reqwest_client()` behavior; otherwise proxy/PAC route selection becomes part of the transport profile and can affect the observed network/TLS route.
 - The searched official source did not show a normal Responses-path uTLS/JA3/JA4/ClientHello spoofing layer.
 - Therefore there is no official `installation_id`-like body/header field for TLS fingerprint. TLS behavior is transport behavior, not request metadata.
 
 Aether transport/TLS target behavior:
 
+- Hard requirements for the Codex default TLS profile:
+  - Keep `native-tls-vendored` enabled for Aether builds that claim strict Codex default TLS equivalence.
+  - Treat `reqwest_default_tls` as the Codex default TLS backend; `rustls`/`codex-reqwest-rustls-auto` are legacy/non-equivalent for Codex and must not be documented or surfaced as strict official-Codex matches.
 - Keep `fingerprint.transport_profile` as the execution source of truth.
 - Continue current resolver precedence in `crates/aether-provider-transport/src/network.rs`: key `fingerprint.transport_profile` first, provider config fallback, then provider-specific fallback such as Grok.
 - Use the existing `ResolvedTransportProfile` contract:
@@ -642,6 +649,31 @@ Strict TLS comparison result on 2026-06-28:
 - Tunnel native-TLS result: `MATCH`.
 - The same default/native TLS path using the host system OpenSSL produced JA3 hash `2617ff3a2d7f879546f0aac7afc5f15c`, so vendored OpenSSL is required for strict match on this Linux build.
 - The expected JA3/hash is persisted in the Codex transport profile extra metadata, copied into request report context as expected outbound TLS fingerprint metadata, and included in the Codex account portrait hash.
+
+Codex source comparison snapshot on 2026-07-07:
+
+- Compared official `openai/codex` `main` commit `42156ba007278d9068f1518ac1f627b56c136ef6` against the earlier local source snapshot `d2885dc`.
+- No profile/sticky contract change was found in `codex-rs/core/src/responses_metadata.rs`, `codex-rs/codex-api/src/requests/headers.rs`, `codex-rs/core/src/installation_id.rs`, `codex-rs/model-provider/src/auth.rs`, `codex-rs/model-provider/src/bearer_auth_provider.rs`, `codex-rs/terminal-detection/src/lib.rs`, `codex-rs/protocol/src/session_id.rs`, `codex-rs/protocol/src/thread_id.rs`, or `codex-rs/core/src/turn_metadata.rs`.
+- `client_metadata["x-codex-turn-metadata"]` remains the canonical full turn metadata transport; flat `client_metadata` keys and direct HTTP/WebSocket headers remain compatibility projections.
+- Official HTTP session headers remain `session-id` and `thread-id`; the snapshot source does not make `chatgpt-account-id` a Codex runtime sticky identity.
+- `installation_id` still resolves from `${CODEX_HOME}/installation_id`, reuses a valid UUID, and creates/persists a UUIDv4 when absent or invalid.
+- Auth/account headers still come from selected auth state: `Authorization`, `ChatGPT-Account-ID`, and FedRAMP routing where applicable.
+- UA/originator generation remains `originator/version (OS version; arch) terminal-token` plus optional suffix; first-party originator values are still represented by `codex_cli_rs`, `codex-tui`, `codex_vscode`, `Codex ...`, and chat-specific values.
+- Transport-relevant snapshot delta: default HTTP construction now has an explicit route-aware wrapper for non-default outbound proxy policies. Aether's strict TLS fingerprint claim is therefore scoped to the same effective route class: default reqwest/native-TLS path, same target/SNI, no custom CA unless the Codex custom-CA condition is intentionally mirrored, and no additional proxy/PAC route transformation.
+- Non-profile snapshot delta: `codex-rs/core/src/client.rs` can include `stream_options.reasoning_summary_delivery` when concurrent reasoning summaries are enabled. That field is request-body behavior, not account profile/fingerprint state. Aether preserves the official `{"reasoning_summary_delivery":"sequential_cutoff"}` shape on normal Codex Responses requests while continuing to remove unrelated legacy `stream_options` keys such as `include_usage` and to strip `stream_options` from compact requests.
+
+Validation on 2026-07-07:
+
+- Source snapshot check: `git ls-remote https://github.com/openai/codex.git refs/heads/main` returned `42156ba007278d9068f1518ac1f627b56c136ef6` at the time of comparison.
+- Source comparison inspected the official files under `/tmp/openai-codex-latest`, including `responses_metadata.rs`, `headers.rs`, `client.rs`, `default_client.rs`, `http-client/src/custom_ca.rs`, auth providers, terminal detection, session/thread id, and turn metadata.
+- Aether test coverage run after the comparison:
+  - `cargo fmt --check`
+  - `cargo test -p aether-ai-formats codex -- --nocapture`
+  - `cargo test -p aether-gateway --lib codex -- --nocapture`
+  - `cargo test -p aether-provider-transport --lib codex -- --nocapture`
+  - `cargo test -p aether-ai-serving decision_response_records_outgoing_tls_fingerprint -- --nocapture`
+  - `cargo test -p aether-ai-formats stream_core -- --nocapture`
+- The first sandboxed gateway Codex test run hit local listener bind `PermissionDenied`; the same command passed when rerun with the required non-sandbox permissions. This was an environment permission failure, not a Codex/profile assertion failure.
 
 TLS fingerprint device boundary:
 
