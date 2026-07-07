@@ -745,3 +745,48 @@ columns = ["billing_status"]
 [[table.usage_settlement_snapshots.indexes]]
 name = "usage_settlement_snapshots_wallet_id_idx"
 columns = ["wallet_id"]
+
+[table.usage_prompt_capture_entries]
+domain = "usage"
+order = 12
+primary_key = ["sha256"]
+
+[[table.usage_prompt_capture_entries.columns]]
+name = "sha256"
+type = "text"
+length = 64
+
+[[table.usage_prompt_capture_entries.columns]]
+name = "role"
+type = "text"
+length = 32
+
+[[table.usage_prompt_capture_entries.columns]]
+name = "chars"
+type = "int32"
+
+[[table.usage_prompt_capture_entries.columns]]
+name = "preview"
+type = "long_text"
+
+[[table.usage_prompt_capture_entries.columns]]
+name = "truncated"
+type = "bool"
+default = false
+
+[[table.usage_prompt_capture_entries.columns]]
+name = "first_seen_at"
+type = "timestamp"
+
+[[table.usage_prompt_capture_entries.columns]]
+name = "last_seen_at"
+type = "timestamp"
+
+[[table.usage_prompt_capture_entries.columns]]
+name = "seen_count"
+type = "int64"
+default = 1
+
+[[table.usage_prompt_capture_entries.indexes]]
+name = "usage_prompt_capture_entries_last_seen_at_idx"
+columns = ["last_seen_at"]

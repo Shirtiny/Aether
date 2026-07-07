@@ -2469,9 +2469,7 @@ fn build_stream_terminal_error_client_response(
     let mut error = provider_response
         .and_then(extract_error_object_from_json)
         .unwrap_or_default();
-    error
-        .entry("type".to_string())
-        .or_insert_with(|| Value::String(category.to_string()));
+    error.insert("type".to_string(), Value::String(category.to_string()));
     error
         .entry("message".to_string())
         .or_insert_with(|| Value::String(message.to_string()));

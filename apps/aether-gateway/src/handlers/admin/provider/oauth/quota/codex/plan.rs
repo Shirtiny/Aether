@@ -5,10 +5,8 @@ use super::super::shared::{
 use crate::handlers::admin::request::{AdminAppState, AdminGatewayProviderTransportSnapshot};
 use crate::GatewayError;
 use aether_contracts::ProxySnapshot;
-use aether_provider_pool::{
-    build_codex_pool_quota_request, build_codex_pool_reset_credits_request,
-    ProviderPoolQuotaRequestSpec,
-};
+use aether_provider_pool::build_codex_pool_reset_credits_request;
+use aether_provider_pool::{build_codex_pool_quota_request, ProviderPoolQuotaRequestSpec};
 
 pub(super) fn build_codex_quota_request_spec(
     transport: &AdminGatewayProviderTransportSnapshot,

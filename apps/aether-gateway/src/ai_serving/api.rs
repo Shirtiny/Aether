@@ -46,9 +46,10 @@ pub(crate) use aether_ai_formats::api::{
     core_success_background_report_kind, encode_kiro_sse_events,
     extract_provider_private_stream_error_body, implicit_sync_finalize_report_kind,
     is_core_error_finalize_kind, normalize_provider_private_report_context,
-    normalize_provider_private_response_value, provider_private_response_allows_sync_finalize,
-    resolve_claude_stream_spec, resolve_claude_sync_spec, resolve_gemini_stream_spec,
-    resolve_gemini_sync_spec, resolve_local_image_stream_spec, resolve_local_image_sync_spec,
+    normalize_provider_private_response_value, openai_stream_terminal_error_body,
+    provider_private_response_allows_sync_finalize, resolve_claude_stream_spec,
+    resolve_claude_sync_spec, resolve_gemini_stream_spec, resolve_gemini_sync_spec,
+    resolve_local_image_stream_spec, resolve_local_image_sync_spec,
     resolve_local_same_format_stream_spec, resolve_local_same_format_sync_spec,
     resolve_openai_embedding_sync_spec, sanitize_request_path_and_query, AiControlPlanRequest,
     CanonicalContentPart, CanonicalStreamEvent, CanonicalStreamFrame, ClaudeClientEmitter,
@@ -65,6 +66,7 @@ pub(crate) use aether_ai_formats::api::{
     OPENAI_VIDEO_REMIX_SYNC_PLAN_KIND,
 };
 pub(crate) use aether_ai_formats::protocol::stream::CanonicalUsage as StreamingCanonicalUsage;
+pub(crate) use aether_ai_formats::UPSTREAM_IS_STREAM_KEY;
 
 pub(crate) fn parse_direct_request_body(
     parts: &http::request::Parts,

@@ -111,6 +111,19 @@ CREATE TABLE IF NOT EXISTS `usage` (
     KEY usage_wallet_id_idx (`wallet_id`)
 );
 
+CREATE TABLE IF NOT EXISTS usage_prompt_capture_entries (
+    `sha256` VARCHAR(64) NOT NULL,
+    `role` VARCHAR(32) NOT NULL,
+    `chars` INT NOT NULL,
+    `preview` LONGTEXT NOT NULL,
+    `truncated` TINYINT(1) NOT NULL DEFAULT 0,
+    `first_seen_at` BIGINT NOT NULL,
+    `last_seen_at` BIGINT NOT NULL,
+    `seen_count` BIGINT NOT NULL DEFAULT 1,
+    PRIMARY KEY (`sha256`),
+    KEY usage_prompt_capture_entries_last_seen_at_idx (`last_seen_at`)
+);
+
 CREATE TABLE IF NOT EXISTS usage_counter_deltas (
     `id` VARCHAR(36) NOT NULL,
     `request_id` VARCHAR(128) NOT NULL,

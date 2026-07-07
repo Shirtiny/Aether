@@ -1,3 +1,4 @@
+use crate::ai_serving::api::UPSTREAM_IS_STREAM_KEY;
 use crate::async_task::CancelVideoTaskError;
 use crate::constants::EXECUTION_PATH_LOCAL_AI_PUBLIC;
 use crate::control::GatewayControlDecision;
@@ -10,7 +11,6 @@ use crate::local_probe_intercept::{
     LocalProbeInterceptKind,
 };
 use crate::{AppState, GatewayError};
-use aether_ai_formats::UPSTREAM_IS_STREAM_KEY;
 use aether_data_contracts::repository::video_tasks::{
     StoredVideoTask, VideoTaskQueryFilter, VideoTaskStatus,
 };

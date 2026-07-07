@@ -1833,13 +1833,16 @@ pub(crate) fn build_execution_response_body(
         return Ok(None);
     }
 
-    if let Some(body_json) = extract_provider_private_stream_error_body(None, decoded_body_bytes)
-        .or_else(|| extract_provider_private_stream_error_body(None, body_bytes))
-    {
-        return Ok(Some(ResponseBody {
-            json_body: Some(body_json),
-            body_bytes_b64: None,
-        }));
+    if stream {
+        if let Some(body_json) =
+            extract_provider_private_stream_error_body(None, decoded_body_bytes)
+                .or_else(|| extract_provider_private_stream_error_body(None, body_bytes))
+        {
+            return Ok(Some(ResponseBody {
+                json_body: Some(body_json),
+                body_bytes_b64: None,
+            }));
+        }
     }
 
     if stream {

@@ -112,6 +112,20 @@ CREATE INDEX IF NOT EXISTS usage_request_id_idx ON public.usage USING btree (req
 CREATE INDEX IF NOT EXISTS usage_user_id_idx ON public.usage USING btree (user_id);
 CREATE INDEX IF NOT EXISTS usage_wallet_id_idx ON public.usage USING btree (wallet_id);
 
+CREATE TABLE IF NOT EXISTS public.usage_prompt_capture_entries (
+    sha256 character varying(64) NOT NULL,
+    role character varying(32) NOT NULL,
+    chars integer NOT NULL,
+    preview text NOT NULL,
+    truncated boolean DEFAULT false NOT NULL,
+    first_seen_at timestamp with time zone NOT NULL,
+    last_seen_at timestamp with time zone NOT NULL,
+    seen_count bigint DEFAULT 1 NOT NULL
+);
+
+ALTER TABLE ONLY public.usage_prompt_capture_entries ADD CONSTRAINT usage_prompt_capture_entries_pkey PRIMARY KEY (sha256);
+CREATE INDEX IF NOT EXISTS usage_prompt_capture_entries_last_seen_at_idx ON public.usage_prompt_capture_entries USING btree (last_seen_at);
+
 CREATE TABLE IF NOT EXISTS public.usage_counter_deltas (
     id character varying(36) NOT NULL,
     request_id character varying(128) NOT NULL,

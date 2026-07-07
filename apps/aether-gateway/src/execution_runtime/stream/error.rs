@@ -8,11 +8,11 @@ use serde_json::{json, Map, Value};
 use tokio_util::codec::{FramedRead, LinesCodec};
 use tracing::warn;
 
+use crate::ai_serving::api::openai_stream_terminal_error_body;
 use crate::execution_runtime::ndjson::decode_stream_frame_ndjson;
 use crate::execution_runtime::submission::{has_nested_error, strip_utf8_bom_and_ws};
 use crate::GatewayError;
 use crate::MAX_ERROR_BODY_BYTES;
-use aether_ai_formats::api::openai_stream_terminal_error_body;
 
 #[derive(Debug)]
 pub(super) enum StreamPrefetchInspection {

@@ -3272,9 +3272,8 @@ async fn execute_stream_from_frame_stream(
     let emit_proxy_generated_sse_control_blocks =
         response_headers_are_sse && client_format_allows_proxy_generated_sse_control_blocks(&plan);
     let plan_for_report = plan;
-    let emit_passthrough_sse_terminal_error = skip_direct_finalize_prefetch
-        && response_headers_indicate_sse(&upstream_headers)
-        && !is_openai_image_stream_for_report;
+    let emit_passthrough_sse_terminal_error =
+        response_headers_are_sse && !is_openai_image_stream_for_report;
     let body_capture_policy = match UsageRuntimeAccess::body_capture_policy(state.data.as_ref())
         .await
     {
@@ -7691,6 +7690,13 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"type":"s
         .expect("execution should succeed")
         .expect("execution should return a client response");
 
+        let body_task = tokio::spawn(async move {
+            let body = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("response body should read");
+            String::from_utf8(body.to_vec()).expect("response body should be utf8")
+        });
+
         first_data_seen.notified().await;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         let live_usage = loop {
@@ -7714,10 +7720,7 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"type":"s
         assert!(live_usage.first_byte_time_ms.is_some());
 
         release_terminal.notify_one();
-        let body = to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("response body should read");
-        let text = String::from_utf8(body.to_vec()).expect("response body should be utf8");
+        let text = body_task.await.expect("response body task should finish");
         assert!(text.contains("response.output_text.delta"));
 
         server.abort();
@@ -7751,10 +7754,7 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"type":"s
                                 b"{\"type\":\"headers\",\"payload\":{\"kind\":\"headers\",\"status_code\":200,\"headers\":{\"content-type\":\"text/event-stream\"}}}\n",
                             ));
                             yield Ok::<Bytes, Infallible>(Bytes::from_static(
-                                b"{\"type\":\"data\",\"payload\":{\"kind\":\"data\",\"text\":\"\"}}\n",
-                            ));
-                            yield Ok::<Bytes, Infallible>(Bytes::from_static(
-                                b"{\"type\":\"telemetry\",\"payload\":{\"kind\":\"telemetry\",\"telemetry\":{\"ttfb_ms\":11,\"elapsed_ms\":12}}}\n",
+                                b"{\"type\":\"data\",\"payload\":{\"kind\":\"data\",\"text\":\"data: {\\\"choices\\\":[{\\\"delta\\\":{\\\"role\\\":\\\"assistant\\\"}}]}\\n\\n\"}}\n",
                             ));
                             first_event_seen.notify_one();
                             release_text.notified().await;
@@ -7856,6 +7856,13 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"type":"s
         .expect("execution should succeed")
         .expect("execution should return a client response");
 
+        let body_task = tokio::spawn(async move {
+            let body = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("response body should read");
+            String::from_utf8(body.to_vec()).expect("response body should be utf8")
+        });
+
         first_event_seen.notified().await;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         let first_event_usage = loop {
@@ -7880,10 +7887,7 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"type":"s
         text_seen.notified().await;
 
         release_terminal.notify_one();
-        let body = to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("response body should read");
-        let text = String::from_utf8(body.to_vec()).expect("response body should be utf8");
+        let text = body_task.await.expect("response body task should finish");
         assert!(text.contains("\"content\":\"hello\""));
 
         server.abort();
@@ -8546,7 +8550,7 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"type":"s
             request_header.stream_id,
             tunnel_protocol::RESPONSE_BODY,
             0,
-            b"data: hello\n\n",
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n",
         );
         tunnel_app
             .hub
@@ -8566,12 +8570,13 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"type":"s
             Some("text/event-stream")
         );
 
-        let body_task = tokio::spawn(async move {
-            let body = to_bytes(response.into_body(), usize::MAX)
-                .await
-                .expect("response body should read");
-            String::from_utf8(body.to_vec()).expect("response body should be utf8")
-        });
+        let mut body_stream = response.into_body().into_data_stream();
+        let first_chunk = tokio::time::timeout(Duration::from_secs(1), body_stream.next())
+            .await
+            .expect("first response body chunk should arrive")
+            .expect("response body should contain first chunk")
+            .expect("first response body chunk should read");
+        let mut body_bytes = first_chunk.to_vec();
 
         let original_error = "proxy disconnected while forwarding upstream body";
         let mut response_error_frame =
@@ -8581,9 +8586,21 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"type":"s
             .handle_proxy_frame(902, &mut response_error_frame)
             .await;
 
-        let body = body_task.await.expect("body task should complete");
-        assert!(body.contains("data: hello\n\n"));
-        assert!(body.contains("data: {\"error\":"));
+        loop {
+            match tokio::time::timeout(Duration::from_secs(1), body_stream.next()).await {
+                Ok(Some(Ok(chunk))) => body_bytes.extend_from_slice(chunk.as_ref()),
+                Ok(Some(Err(err))) => panic!("response body chunk should read: {err:?}"),
+                Ok(None) => break,
+                Err(_) => panic!("response body should finish after terminal error"),
+            }
+        }
+        let body = String::from_utf8(body_bytes).expect("response body should be utf8");
+
+        assert!(body.contains("\"content\":\"hello\""));
+        assert!(
+            body.contains("data: {\"error\":"),
+            "body should include terminal SSE error event, got: {body}"
+        );
         assert!(body.contains(original_error));
         assert!(body.contains("data: [DONE]\n\n"));
         assert!(

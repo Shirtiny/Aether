@@ -110,6 +110,18 @@ CREATE INDEX IF NOT EXISTS usage_request_id_idx ON "usage" (request_id);
 CREATE INDEX IF NOT EXISTS usage_user_id_idx ON "usage" (user_id);
 CREATE INDEX IF NOT EXISTS usage_wallet_id_idx ON "usage" (wallet_id);
 
+CREATE TABLE IF NOT EXISTS usage_prompt_capture_entries (
+    sha256 TEXT PRIMARY KEY NOT NULL,
+    role TEXT NOT NULL,
+    chars INTEGER NOT NULL,
+    preview TEXT NOT NULL,
+    truncated INTEGER NOT NULL DEFAULT 0,
+    first_seen_at INTEGER NOT NULL,
+    last_seen_at INTEGER NOT NULL,
+    seen_count INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS usage_prompt_capture_entries_last_seen_at_idx ON usage_prompt_capture_entries (last_seen_at);
+
 CREATE TABLE IF NOT EXISTS usage_counter_deltas (
     id TEXT PRIMARY KEY NOT NULL,
     request_id TEXT NOT NULL,
