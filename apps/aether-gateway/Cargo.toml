@@ -76,11 +76,13 @@ zstd.workspace = true
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = "0.6"
 
-# Static musl release images cannot reliably build OpenSSL/native-tls for every
-# release target. Keep the default workspace reqwest stack rustls-only for musl,
-# and enable reqwest's native default TLS only on non-musl gateway builds.
+# Static musl release images cannot reliably build the extra C TLS stacks for
+# every release target. Keep the default workspace HTTP clients on their
+# rustls/non-prefixed stacks for musl, and enable native default TLS plus Boring
+# symbol prefixing only on non-musl gateway builds.
 [target.'cfg(not(target_env = "musl"))'.dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["default-tls", "native-tls-vendored"] }
+wreq = { version = "6.0.0-rc.28", default-features = false, features = ["prefix-symbols"] }
 
 [dev-dependencies]
 aether-testkit.workspace = true
