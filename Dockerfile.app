@@ -1,11 +1,10 @@
 # syntax=docker/dockerfile:1
 # Aether Gateway runtime image (cross-compilation)
 # Binary and frontend assets are pre-built by CI; this Dockerfile only packages them.
-# Usage: docker buildx build --platform linux/amd64,linux/arm64 -f Dockerfile.app .
+# Usage: docker buildx build --platform linux/amd64 -f Dockerfile.app .
 #
 # Build context must contain:
 #   dist/aether-gateway-amd64   (x86_64-unknown-linux-musl cross-compiled binary)
-#   dist/aether-gateway-arm64   (aarch64-unknown-linux-musl cross-compiled binary)
 #   dist/frontend/              (npm run build output)
 
 # --- layout stage: create /opt/aether directory structure with symlink ---

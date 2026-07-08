@@ -121,12 +121,6 @@ jobs:
             arch: amd64
             os: ubuntu-latest
             use_cross: true
-          - name: linux-arm64
-            target: aarch64-unknown-linux-musl
-            platform: linux
-            arch: arm64
-            os: ubuntu-latest
-            use_cross: true
     steps:
       - uses: actions/checkout@v5
 
@@ -167,7 +161,7 @@ jobs:
           retention-days: 1
 
   docker_release_multiarch:
-    name: Docker multi-arch (tag)
+    name: Docker image amd64 (tag)
     needs: [preflight, frontend, build_release_matrix]
     if: needs.preflight.outputs.publish == 'true'
     runs-on: ubuntu-latest
@@ -183,12 +177,8 @@ jobs:
         run: |
           mkdir -p dist
           cp artifacts/aether-gateway-linux-amd64/aether-gateway dist/aether-gateway-amd64
-          cp artifacts/aether-gateway-linux-arm64/aether-gateway dist/aether-gateway-arm64
-          chmod +x dist/aether-gateway-amd64 dist/aether-gateway-arm64
+          chmod +x dist/aether-gateway-amd64
           cp -r artifacts/frontend-dist dist/frontend
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -227,7 +217,7 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
 
       - name: Generate image build record
         shell: bash
@@ -347,7 +337,7 @@ jobs:
 
           mkdir -p package release-assets
           for platform in linux; do
-            for arch in amd64 arm64; do
+            for arch in amd64; do
               bundle="aether-${VERSION}-${platform}-${arch}"
               root="package/${bundle}"
               mkdir -p \
