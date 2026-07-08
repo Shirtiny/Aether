@@ -942,7 +942,6 @@ async fn maybe_build_local_openai_probe_response(
     let decision = request_context.control_decision.as_ref()?;
     if decision.route_family.as_deref() != Some("openai")
         || request_context.request_method != http::Method::POST
-        || decision.is_execution_runtime_candidate()
     {
         return None;
     }
@@ -2451,11 +2450,12 @@ mod tests {
         openai_chat_local_probe_sse_body, openai_responses_local_probe_answer,
         openai_responses_local_probe_payload, openai_responses_local_probe_sse_body,
         parse_openai_image_validation_input, validate_openai_image_n, LocalProbeKind,
-        OpenAiImageOperation,
+        OpenAiImageOperation, LOCAL_PROBE_RESPONSE_HEADER,
     };
     use crate::control::{GatewayControlDecision, GatewayPublicRequestContext};
     use crate::data::GatewayDataState;
     use crate::local_probe_intercept::{
+        LOCAL_PROBE_INTERCEPT_DELAY_MAX_MS_KEY, LOCAL_PROBE_INTERCEPT_DELAY_MIN_MS_KEY,
         LOCAL_PROBE_INTERCEPT_ENABLED_KEY, LOCAL_PROBE_INTERCEPT_RULES_KEY,
     };
     use crate::AppState;
@@ -2492,6 +2492,8 @@ mod tests {
                             },
                         ]),
                     ),
+                    (LOCAL_PROBE_INTERCEPT_DELAY_MIN_MS_KEY.to_string(), json!(0)),
+                    (LOCAL_PROBE_INTERCEPT_DELAY_MAX_MS_KEY.to_string(), json!(0)),
                 ]),
             )
     }
@@ -2671,7 +2673,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn openai_local_probe_skips_execution_runtime_candidates() {
+    async fn openai_local_probe_ignores_execution_runtime_non_probe_requests() {
         let state = probe_default_rules_test_state();
         let request_context = GatewayPublicRequestContext {
             trace_id: "trace-local-runtime-probe-skip".to_string(),
@@ -2691,7 +2693,9 @@ mod tests {
                 .with_execution_runtime_candidate(true),
             ),
         };
-        let body = Bytes::from_static(br#"{"model":"gpt-5.4-mini","input":"hello"}"#);
+        let body = Bytes::from_static(
+            br#"{"model":"gpt-5.4-mini","input":"ordinary non probe request 12345"}"#,
+        );
 
         assert!(maybe_build_local_openai_probe_response(
             &state,
@@ -2702,6 +2706,48 @@ mod tests {
         )
         .await
         .is_none());
+    }
+
+    #[tokio::test]
+    async fn openai_local_probe_intercepts_execution_runtime_chat_ping() {
+        let state = probe_test_state();
+        let request_context = GatewayPublicRequestContext {
+            trace_id: "trace-local-runtime-probe-hit".to_string(),
+            request_method: http::Method::POST,
+            request_path: "/v1/chat/completions".to_string(),
+            request_query_string: None,
+            request_content_type: Some("application/json".to_string()),
+            host_header: None,
+            control_decision: Some(
+                GatewayControlDecision::synthetic(
+                    "/v1/chat/completions",
+                    Some("ai_public".to_string()),
+                    Some("openai".to_string()),
+                    Some("chat".to_string()),
+                    Some("openai:chat".to_string()),
+                )
+                .with_execution_runtime_candidate(true),
+            ),
+        };
+        let body = Bytes::from_static(
+            br#"{"model":"gpt-5.3-codex-spark","stream":true,"messages":[{"role":"user","content":[{"type":"text","text":"ping"}]}]}"#,
+        );
+
+        let response = maybe_build_local_openai_probe_response(
+            &state,
+            &request_context,
+            None,
+            Some(&body),
+            None,
+        )
+        .await
+        .expect("execution-runtime ping probes should be handled locally");
+
+        assert_eq!(response.status(), http::StatusCode::OK);
+        assert_eq!(
+            response.headers().get(LOCAL_PROBE_RESPONSE_HEADER),
+            Some(&HeaderValue::from_static("ping"))
+        );
     }
 
     #[tokio::test]
