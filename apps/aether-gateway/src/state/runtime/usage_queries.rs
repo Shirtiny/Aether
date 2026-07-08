@@ -51,6 +51,20 @@ impl AppState {
             .map_err(|err| GatewayError::Internal(err.to_string()))
     }
 
+    pub(crate) async fn read_risk_control_request_candidate_provider_ids_by_client_session_key(
+        &self,
+        provider_ids: &[String],
+        session_key: &str,
+    ) -> Result<Vec<String>, GatewayError> {
+        self.data
+            .list_risk_control_request_candidate_provider_ids_by_client_session_key(
+                provider_ids,
+                session_key,
+            )
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))
+    }
+
     pub(crate) async fn summarize_provider_usage_since(
         &self,
         provider_id: &str,
@@ -100,6 +114,22 @@ impl AppState {
     ) -> Result<bool, GatewayError> {
         self.data
             .provider_session_has_risk_control_usage(provider_id, session_key, since_unix_secs)
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))
+    }
+
+    pub(crate) async fn list_provider_ids_with_risk_control_usage_for_session(
+        &self,
+        provider_ids: &[String],
+        session_key: &str,
+        since_unix_secs: Option<u64>,
+    ) -> Result<Vec<String>, GatewayError> {
+        self.data
+            .list_provider_ids_with_risk_control_usage_for_session(
+                provider_ids,
+                session_key,
+                since_unix_secs,
+            )
             .await
             .map_err(|err| GatewayError::Internal(err.to_string()))
     }

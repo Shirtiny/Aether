@@ -41,6 +41,13 @@ pub(crate) trait SchedulerRuntimeState {
         since_unix_secs: Option<u64>,
     ) -> Result<bool, GatewayError>;
 
+    async fn list_provider_ids_with_risk_control_usage_for_session(
+        &self,
+        provider_ids: &[String],
+        session_key: &str,
+        since_unix_secs: Option<u64>,
+    ) -> Result<Vec<String>, GatewayError>;
+
     async fn provider_session_has_runtime_risk_control_block(
         &self,
         provider_id: &str,
@@ -63,6 +70,12 @@ pub(crate) trait SchedulerRuntimeState {
         provider_id: &str,
         session_key: &str,
     ) -> Result<Vec<StoredRequestCandidate>, GatewayError>;
+
+    async fn read_risk_control_request_candidate_provider_ids_by_client_session_key(
+        &self,
+        provider_ids: &[String],
+        session_key: &str,
+    ) -> Result<Vec<String>, GatewayError>;
 
     fn provider_key_rpm_reset_at(&self, key_id: &str, now_unix_secs: u64) -> Option<u64>;
 

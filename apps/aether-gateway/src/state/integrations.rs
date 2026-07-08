@@ -371,6 +371,21 @@ impl SchedulerRuntimeState for AppState {
         .await
     }
 
+    async fn list_provider_ids_with_risk_control_usage_for_session(
+        &self,
+        provider_ids: &[String],
+        session_key: &str,
+        since_unix_secs: Option<u64>,
+    ) -> Result<Vec<String>, GatewayError> {
+        AppState::list_provider_ids_with_risk_control_usage_for_session(
+            self,
+            provider_ids,
+            session_key,
+            since_unix_secs,
+        )
+        .await
+    }
+
     async fn provider_session_has_runtime_risk_control_block(
         &self,
         provider_id: &str,
@@ -408,6 +423,19 @@ impl SchedulerRuntimeState for AppState {
         AppState::read_request_candidates_by_provider_id_and_client_session_key(
             self,
             provider_id,
+            session_key,
+        )
+        .await
+    }
+
+    async fn read_risk_control_request_candidate_provider_ids_by_client_session_key(
+        &self,
+        provider_ids: &[String],
+        session_key: &str,
+    ) -> Result<Vec<String>, GatewayError> {
+        AppState::read_risk_control_request_candidate_provider_ids_by_client_session_key(
+            self,
+            provider_ids,
             session_key,
         )
         .await

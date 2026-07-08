@@ -1478,6 +1478,49 @@ pub trait UsageReadRepository: Send + Sync {
         query: &UsageAuditListQuery,
     ) -> Result<u64, crate::DataLayerError>;
 
+    async fn provider_session_has_risk_control_usage(
+        &self,
+        provider_id: &str,
+        session_key: &str,
+        since_unix_secs: Option<u64>,
+    ) -> Result<bool, crate::DataLayerError> {
+        let provider_id = provider_id.trim();
+        let session_key = session_key.trim();
+        if provider_id.is_empty() || session_key.is_empty() {
+            return Ok(false);
+        }
+
+        let query = UsageAuditListQuery {
+            created_from_unix_secs: since_unix_secs,
+            provider_id: Some(provider_id.to_string()),
+            session_id: Some(session_key.to_string()),
+            session_id_exact: true,
+            risk_control_only: true,
+            limit: Some(1),
+            newest_first: true,
+            ..UsageAuditListQuery::default()
+        };
+        Ok(!self.list_usage_audits(&query).await?.is_empty())
+    }
+
+    async fn list_provider_ids_with_risk_control_usage_for_session(
+        &self,
+        provider_ids: &[String],
+        session_key: &str,
+        since_unix_secs: Option<u64>,
+    ) -> Result<Vec<String>, crate::DataLayerError> {
+        let mut matched = Vec::new();
+        for provider_id in provider_ids {
+            if self
+                .provider_session_has_risk_control_usage(provider_id, session_key, since_unix_secs)
+                .await?
+            {
+                matched.push(provider_id.clone());
+            }
+        }
+        Ok(matched)
+    }
+
     async fn list_usage_audits_by_keyword_search(
         &self,
         query: &UsageAuditKeywordSearchQuery,

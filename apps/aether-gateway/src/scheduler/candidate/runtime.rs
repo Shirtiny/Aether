@@ -3,9 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use aether_admin::provider::{
     pool as admin_provider_pool_pure, status as admin_provider_status_pure,
 };
-use aether_data_contracts::repository::candidates::{
-    RequestCandidateStatus, StoredRequestCandidate,
-};
+use aether_data_contracts::repository::candidates::StoredRequestCandidate;
 use aether_data_contracts::repository::provider_catalog::{
     StoredProviderCatalogKey, StoredProviderCatalogProvider,
 };
@@ -14,12 +12,13 @@ use aether_scheduler_core::{
     candidate_is_selectable_with_runtime_state, candidate_runtime_skip_reason_with_state,
     CandidateRuntimeSelectabilityInput,
 };
-use aether_usage_runtime::{usage_json_text_matches_risk_control, usage_text_matches_risk_control};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::data::auth::GatewayAuthApiKeySnapshot;
 use crate::scheduler::pool_collateral_avoidance::provider_pool_sticky_collateral_avoidance_enabled;
-use crate::scheduler::session_risk_control::provider_session_risk_control_avoidance_mode;
+use crate::scheduler::session_risk_control::{
+    provider_session_risk_control_avoidance_mode, ProviderSessionRiskControlAvoidanceMode,
+};
 use crate::GatewayError;
 
 use super::{
@@ -401,58 +400,116 @@ async fn read_provider_session_risk_control_block_map(
     let Some(session_key) = session_key else {
         return Ok(ProviderSessionRiskControlSnapshot::default());
     };
-    let session_runtime_blocked = providers.iter().any(|provider| {
-        provider_session_risk_control_avoidance_mode(provider.config.as_ref()).blocks_session()
-    }) && state
-        .session_has_runtime_risk_control_block(session_key)
-        .await?;
-    let mut snapshot = ProviderSessionRiskControlSnapshot {
-        session_blocked: session_runtime_blocked,
-        provider_blocks: BTreeMap::new(),
-    };
-    for provider in providers {
-        let mode = provider_session_risk_control_avoidance_mode(provider.config.as_ref());
-        if !mode.is_enabled() {
-            continue;
-        }
-        let blocked =
-            provider_session_has_risk_control_history(state, provider.id.as_str(), session_key)
-                .await?;
-        if blocked && mode.blocks_session() {
-            snapshot.session_blocked = true;
-        }
-        snapshot
-            .provider_blocks
-            .insert(provider.id.clone(), blocked);
+
+    let enabled_modes = providers
+        .iter()
+        .filter_map(|provider| {
+            let provider_id = provider.id.trim();
+            if provider_id.is_empty() {
+                return None;
+            }
+            let mode = provider_session_risk_control_avoidance_mode(provider.config.as_ref());
+            mode.is_enabled().then(|| (provider_id.to_string(), mode))
+        })
+        .collect::<BTreeMap<_, _>>();
+    if enabled_modes.is_empty() {
+        return Ok(ProviderSessionRiskControlSnapshot::default());
     }
+
+    if enabled_modes.values().any(|mode| mode.blocks_session())
+        && state
+            .session_has_runtime_risk_control_block(session_key)
+            .await?
+    {
+        return Ok(ProviderSessionRiskControlSnapshot {
+            session_blocked: true,
+            provider_blocks: BTreeMap::new(),
+        });
+    }
+
+    let mut snapshot = ProviderSessionRiskControlSnapshot {
+        session_blocked: false,
+        provider_blocks: enabled_modes
+            .keys()
+            .map(|provider_id| (provider_id.clone(), false))
+            .collect(),
+    };
+    let mut history_provider_ids = Vec::with_capacity(enabled_modes.len());
+    for provider_id in enabled_modes.keys() {
+        if state
+            .provider_session_has_runtime_risk_control_block(provider_id, session_key)
+            .await?
+        {
+            mark_provider_session_risk_control_blocked(&mut snapshot, &enabled_modes, provider_id);
+            if snapshot.session_blocked {
+                return Ok(snapshot);
+            }
+        } else {
+            history_provider_ids.push(provider_id.clone());
+        }
+    }
+    if history_provider_ids.is_empty() {
+        return Ok(snapshot);
+    }
+
+    let usage_provider_ids = state
+        .list_provider_ids_with_risk_control_usage_for_session(
+            &history_provider_ids,
+            session_key,
+            None,
+        )
+        .await?;
+    for provider_id in usage_provider_ids {
+        mark_provider_session_risk_control_blocked(&mut snapshot, &enabled_modes, &provider_id);
+        if snapshot.session_blocked {
+            return Ok(snapshot);
+        }
+    }
+
+    let remaining_provider_ids = history_provider_ids
+        .into_iter()
+        .filter(|provider_id| {
+            !snapshot
+                .provider_blocks
+                .get(provider_id.as_str())
+                .copied()
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    if remaining_provider_ids.is_empty() {
+        return Ok(snapshot);
+    }
+
+    let request_candidate_provider_ids = state
+        .read_risk_control_request_candidate_provider_ids_by_client_session_key(
+            &remaining_provider_ids,
+            session_key,
+        )
+        .await?;
+    for provider_id in request_candidate_provider_ids {
+        mark_provider_session_risk_control_blocked(&mut snapshot, &enabled_modes, &provider_id);
+        if snapshot.session_blocked {
+            break;
+        }
+    }
+
     Ok(snapshot)
 }
 
-async fn provider_session_has_risk_control_history(
-    state: &(impl SchedulerRuntimeState + ?Sized),
+fn mark_provider_session_risk_control_blocked(
+    snapshot: &mut ProviderSessionRiskControlSnapshot,
+    enabled_modes: &BTreeMap<String, ProviderSessionRiskControlAvoidanceMode>,
     provider_id: &str,
-    session_key: &str,
-) -> Result<bool, GatewayError> {
-    if state
-        .provider_session_has_runtime_risk_control_block(provider_id, session_key)
-        .await?
-    {
-        return Ok(true);
+) {
+    let Some(mode) = enabled_modes.get(provider_id) else {
+        return;
+    };
+    snapshot
+        .provider_blocks
+        .insert(provider_id.to_string(), true);
+    if mode.blocks_session() {
+        snapshot.session_blocked = true;
     }
-
-    if state
-        .provider_session_has_risk_control_usage(provider_id, session_key, None)
-        .await?
-    {
-        return Ok(true);
-    }
-
-    let candidates = state
-        .read_request_candidates_by_provider_id_and_client_session_key(provider_id, session_key)
-        .await?;
-    Ok(candidates
-        .iter()
-        .any(request_candidate_matches_risk_control))
 }
 
 async fn read_provider_pool_sticky_collateral_block_map(
@@ -487,38 +544,6 @@ async fn read_provider_pool_sticky_collateral_block_map(
         provider_blocks.insert(provider.id.clone(), blocked);
     }
     Ok(provider_blocks)
-}
-
-fn request_candidate_matches_risk_control(candidate: &StoredRequestCandidate) -> bool {
-    if !matches!(
-        candidate.status,
-        RequestCandidateStatus::Failed | RequestCandidateStatus::Cancelled
-    ) {
-        return false;
-    }
-    usage_text_matches_risk_control(candidate.error_message.as_deref())
-        || request_candidate_json_field_matches_risk_control(
-            candidate,
-            &["upstream_response", "body"],
-        )
-        || request_candidate_json_field_matches_risk_control(candidate, &["error_flow"])
-}
-
-fn request_candidate_json_field_matches_risk_control(
-    candidate: &StoredRequestCandidate,
-    path: &[&str],
-) -> bool {
-    let Some(value) = candidate.extra_data.as_ref() else {
-        return false;
-    };
-    let mut current = value;
-    for field in path {
-        let Some(next) = current.get(*field) else {
-            return false;
-        };
-        current = next;
-    }
-    usage_json_text_matches_risk_control(current)
 }
 
 fn parse_runtime_codex_quota_exhaustion_basis(

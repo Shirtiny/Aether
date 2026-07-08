@@ -300,6 +300,67 @@ impl SqlxRequestCandidateReadRepository {
         collect_query_rows(builder.build().fetch(&self.pool), map_request_candidate_row).await
     }
 
+    pub async fn list_risk_control_provider_ids_by_client_session_key(
+        &self,
+        provider_ids: &[String],
+        session_key: &str,
+    ) -> Result<Vec<String>, DataLayerError> {
+        let provider_ids = provider_ids
+            .iter()
+            .map(|provider_id| provider_id.trim())
+            .filter(|provider_id| !provider_id.is_empty())
+            .map(ToOwned::to_owned)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let session_key = session_key.trim();
+        if provider_ids.is_empty() || session_key.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut builder = QueryBuilder::<Postgres>::new(
+            r#"SELECT input.provider_id
+FROM UNNEST("#,
+        );
+        builder.push_bind(provider_ids);
+        builder.push(
+            r#"::text[]) AS input(provider_id)
+WHERE EXISTS (
+  SELECT 1
+  FROM request_candidates
+  WHERE request_candidates.provider_id = input.provider_id
+    AND request_candidates.extra_data#>>'{client_session_affinity,session_key}' = "#,
+        );
+        builder.push_bind(session_key.to_string());
+        builder.push(
+            r#"
+    AND request_candidates.status IN ('failed', 'cancelled')
+    AND (
+      LOWER(COALESCE(request_candidates.error_message, '')) LIKE '%possible cybersecurity risk%'
+      OR LOWER(COALESCE(request_candidates.error_message, '')) LIKE '%trusted access for cyber%'
+      OR LOWER(COALESCE(request_candidates.error_message, '')) LIKE '%chatgpt.com/cyber%'
+      OR LOWER(COALESCE(request_candidates.extra_data#>>'{upstream_response,body}', '')) LIKE '%possible cybersecurity risk%'
+      OR LOWER(COALESCE(request_candidates.extra_data#>>'{upstream_response,body}', '')) LIKE '%trusted access for cyber%'
+      OR LOWER(COALESCE(request_candidates.extra_data#>>'{upstream_response,body}', '')) LIKE '%chatgpt.com/cyber%'
+      OR LOWER(COALESCE(request_candidates.extra_data#>>'{error_flow}', '')) LIKE '%possible cybersecurity risk%'
+      OR LOWER(COALESCE(request_candidates.extra_data#>>'{error_flow}', '')) LIKE '%trusted access for cyber%'
+      OR LOWER(COALESCE(request_candidates.extra_data#>>'{error_flow}', '')) LIKE '%chatgpt.com/cyber%'
+    )
+  LIMIT 1
+)
+"#,
+        );
+
+        let mut rows = builder.build().fetch(&self.pool);
+        let mut matched = Vec::new();
+        while let Some(row) = rows.try_next().await.map_postgres_err()? {
+            if let Some(provider_id) = row_get::<Option<String>>(&row, "provider_id")? {
+                matched.push(provider_id);
+            }
+        }
+        Ok(matched)
+    }
+
     pub async fn list_finalized_by_endpoint_ids_since(
         &self,
         endpoint_ids: &[String],
@@ -564,6 +625,15 @@ impl RequestCandidateReadRepository for SqlxRequestCandidateReadRepository {
         session_key: &str,
     ) -> Result<Vec<StoredRequestCandidate>, DataLayerError> {
         Self::list_by_provider_id_and_client_session_key(self, provider_id, session_key).await
+    }
+
+    async fn list_risk_control_provider_ids_by_client_session_key(
+        &self,
+        provider_ids: &[String],
+        session_key: &str,
+    ) -> Result<Vec<String>, DataLayerError> {
+        Self::list_risk_control_provider_ids_by_client_session_key(self, provider_ids, session_key)
+            .await
     }
 
     async fn count_finalized_statuses_by_endpoint_ids_since(

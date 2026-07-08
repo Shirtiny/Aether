@@ -45,6 +45,21 @@ impl GatewayDataState {
         }
     }
 
+    pub(crate) async fn list_risk_control_request_candidate_provider_ids_by_client_session_key(
+        &self,
+        provider_ids: &[String],
+        session_key: &str,
+    ) -> Result<Vec<String>, DataLayerError> {
+        match &self.request_candidate_reader {
+            Some(repository) => {
+                repository
+                    .list_risk_control_provider_ids_by_client_session_key(provider_ids, session_key)
+                    .await
+            }
+            None => Ok(Vec::new()),
+        }
+    }
+
     pub(crate) async fn list_recent_request_candidates(
         &self,
         limit: usize,

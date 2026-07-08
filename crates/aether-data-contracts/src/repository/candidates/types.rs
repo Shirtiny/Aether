@@ -435,6 +435,24 @@ pub struct PublicHealthTimelineBucket {
     pub max_created_at_unix_ms: Option<u64>,
 }
 
+fn candidate_json_matches_risk_control(value: &serde_json::Value) -> bool {
+    let text = match value {
+        serde_json::Value::String(text) => text.to_ascii_lowercase(),
+        _ => value.to_string().to_ascii_lowercase(),
+    };
+    candidate_normalized_text_matches_risk_control(text.as_str())
+}
+
+fn candidate_text_matches_risk_control(value: &str) -> bool {
+    candidate_normalized_text_matches_risk_control(value.to_ascii_lowercase().as_str())
+}
+
+fn candidate_normalized_text_matches_risk_control(value: &str) -> bool {
+    value.contains("possible cybersecurity risk")
+        || value.contains("trusted access for cyber")
+        || value.contains("chatgpt.com/cyber")
+}
+
 #[async_trait]
 pub trait RequestCandidateReadRepository: Send + Sync {
     async fn list_by_request_id(
@@ -458,6 +476,42 @@ pub trait RequestCandidateReadRepository: Send + Sync {
         provider_id: &str,
         session_key: &str,
     ) -> Result<Vec<StoredRequestCandidate>, crate::DataLayerError>;
+
+    async fn list_risk_control_provider_ids_by_client_session_key(
+        &self,
+        provider_ids: &[String],
+        session_key: &str,
+    ) -> Result<Vec<String>, crate::DataLayerError> {
+        let mut matched = Vec::new();
+        for provider_id in provider_ids {
+            let candidates = self
+                .list_by_provider_id_and_client_session_key(provider_id, session_key)
+                .await?;
+            if candidates.iter().any(|candidate| {
+                matches!(
+                    candidate.status,
+                    RequestCandidateStatus::Failed | RequestCandidateStatus::Cancelled
+                ) && (candidate
+                    .error_message
+                    .as_deref()
+                    .is_some_and(candidate_text_matches_risk_control)
+                    || candidate
+                        .extra_data
+                        .as_ref()
+                        .and_then(|value| value.get("upstream_response"))
+                        .and_then(|value| value.get("body"))
+                        .is_some_and(candidate_json_matches_risk_control)
+                    || candidate
+                        .extra_data
+                        .as_ref()
+                        .and_then(|value| value.get("error_flow"))
+                        .is_some_and(candidate_json_matches_risk_control))
+            }) {
+                matched.push(provider_id.clone());
+            }
+        }
+        Ok(matched)
+    }
 
     async fn list_finalized_by_endpoint_ids_since(
         &self,

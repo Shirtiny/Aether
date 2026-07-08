@@ -2784,6 +2784,105 @@ OR (\"usage\".error_message IS NOT NULL AND BTRIM(\"usage\".error_message) <> ''
         Ok(items)
     }
 
+    pub async fn provider_session_has_risk_control_usage(
+        &self,
+        provider_id: &str,
+        session_key: &str,
+        since_unix_secs: Option<u64>,
+    ) -> Result<bool, DataLayerError> {
+        let provider_id = provider_id.trim();
+        if provider_id.is_empty() {
+            return Ok(false);
+        }
+        Ok(self
+            .list_provider_ids_with_risk_control_usage_for_session(
+                &[provider_id.to_string()],
+                session_key,
+                since_unix_secs,
+            )
+            .await?
+            .iter()
+            .any(|matched_provider_id| matched_provider_id == provider_id))
+    }
+
+    pub async fn list_provider_ids_with_risk_control_usage_for_session(
+        &self,
+        provider_ids: &[String],
+        session_key: &str,
+        since_unix_secs: Option<u64>,
+    ) -> Result<Vec<String>, DataLayerError> {
+        let provider_ids = provider_ids
+            .iter()
+            .map(|provider_id| provider_id.trim())
+            .filter(|provider_id| !provider_id.is_empty())
+            .map(ToOwned::to_owned)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let session_key = session_key.trim();
+        if provider_ids.is_empty() || session_key.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let session_key = session_key.to_ascii_lowercase();
+        let mut builder = QueryBuilder::<Postgres>::new(
+            r#"SELECT input.provider_id
+FROM UNNEST("#,
+        );
+        builder.push_bind(provider_ids);
+        builder.push(
+            r#"::text[]) AS input(provider_id)
+WHERE EXISTS (
+  SELECT 1
+  FROM "usage"
+  WHERE "usage".provider_id = input.provider_id
+    AND ("usage".request_metadata->>'is_risk_control') = 'true'
+"#,
+        );
+        if let Some(since_unix_secs) = since_unix_secs {
+            builder
+                .push(r#"    AND "usage".created_at >= TO_TIMESTAMP("#)
+                .push_bind(since_unix_secs as f64)
+                .push(
+                    "::double precision)
+",
+                );
+        }
+        builder.push(
+            r#"    AND (
+      LOWER(COALESCE("usage".request_metadata#>>'{client_session_affinity,session_key}', '')) = "#,
+        );
+        builder.push_bind(session_key.clone());
+        builder.push(
+            r#"
+      OR LOWER(COALESCE("usage".request_metadata->>'session_id', '')) = "#,
+        );
+        builder.push_bind(session_key.clone());
+        builder.push(
+            r#"
+      OR LOWER(COALESCE("usage".request_metadata->>'conversation_id', '')) = "#,
+        );
+        builder.push_bind(session_key);
+        builder.push(
+            r#"
+    )
+  LIMIT 1
+)"#,
+        );
+
+        let mut rows = builder.build().fetch(&self.pool);
+        let mut matched = Vec::new();
+        while let Some(row) = rows.try_next().await.map_postgres_err()? {
+            if let Some(provider_id) = row
+                .try_get::<Option<String>, _>("provider_id")
+                .map_postgres_err()?
+            {
+                matched.push(provider_id);
+            }
+        }
+        Ok(matched)
+    }
+
     pub async fn list_usage_audits_by_keyword_search(
         &self,
         query: &UsageAuditKeywordSearchQuery,
@@ -9079,6 +9178,36 @@ impl UsageReadRepository for SqlxUsageReadRepository {
 
     async fn count_usage_audits(&self, query: &UsageAuditListQuery) -> Result<u64, DataLayerError> {
         Self::count_usage_audits(self, query).await
+    }
+
+    async fn provider_session_has_risk_control_usage(
+        &self,
+        provider_id: &str,
+        session_key: &str,
+        since_unix_secs: Option<u64>,
+    ) -> Result<bool, DataLayerError> {
+        Self::provider_session_has_risk_control_usage(
+            self,
+            provider_id,
+            session_key,
+            since_unix_secs,
+        )
+        .await
+    }
+
+    async fn list_provider_ids_with_risk_control_usage_for_session(
+        &self,
+        provider_ids: &[String],
+        session_key: &str,
+        since_unix_secs: Option<u64>,
+    ) -> Result<Vec<String>, DataLayerError> {
+        Self::list_provider_ids_with_risk_control_usage_for_session(
+            self,
+            provider_ids,
+            session_key,
+            since_unix_secs,
+        )
+        .await
     }
 
     async fn list_usage_audits_by_keyword_search(
