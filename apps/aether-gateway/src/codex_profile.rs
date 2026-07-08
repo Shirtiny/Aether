@@ -225,7 +225,7 @@ fn normalize_installation_id_in_headers(
     provider_request_headers: &mut BTreeMap<String, String>,
     installation_id: &str,
 ) {
-    replace_header_value_case_insensitive(
+    set_header_value_case_insensitive(
         provider_request_headers,
         X_CODEX_INSTALLATION_ID,
         installation_id,
@@ -240,19 +240,24 @@ fn normalize_installation_id_in_headers(
 }
 
 fn normalize_installation_id_in_body(provider_request_body: &mut Value, installation_id: &str) {
-    let Some(metadata) = provider_request_body
-        .as_object_mut()
-        .and_then(|body| body.get_mut("client_metadata"))
-        .and_then(Value::as_object_mut)
-    else {
+    let Some(body) = provider_request_body.as_object_mut() else {
         return;
     };
-    if metadata.contains_key(X_CODEX_INSTALLATION_ID) {
-        metadata.insert(
-            X_CODEX_INSTALLATION_ID.to_string(),
-            Value::String(installation_id.to_string()),
-        );
+
+    let metadata = body
+        .entry("client_metadata".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !metadata.is_object() {
+        *metadata = Value::Object(Map::new());
     }
+    let Some(metadata) = metadata.as_object_mut() else {
+        return;
+    };
+
+    metadata.insert(
+        X_CODEX_INSTALLATION_ID.to_string(),
+        Value::String(installation_id.to_string()),
+    );
     let Some(turn_metadata) = metadata.get_mut(X_CODEX_TURN_METADATA) else {
         return;
     };
@@ -298,14 +303,15 @@ fn rewrite_turn_metadata_installation_id_string(
     }
 }
 
-fn replace_header_value_case_insensitive(
+fn set_header_value_case_insensitive(
     headers: &mut BTreeMap<String, String>,
     target: &str,
     value: &str,
 ) {
-    if let Some((header_name, _)) = remove_header_case_insensitive(headers, target) {
-        headers.insert(header_name, value.to_string());
-    }
+    let header_name = remove_header_case_insensitive(headers, target)
+        .map(|(header_name, _)| header_name)
+        .unwrap_or_else(|| target.to_string());
+    headers.insert(header_name, value.to_string());
 }
 
 fn remove_header_case_insensitive(
@@ -960,6 +966,36 @@ mod tests {
         assert_eq!(body_metadata["thread_id"], "thread");
         assert_eq!(body_metadata["turn_id"], "turn");
         assert_eq!(body_metadata["window_id"], "window");
+        assert_eq!(body["instructions"], instructions);
+        assert_eq!(body["input"][0]["content"][0]["text"], input_text);
+    }
+
+    #[test]
+    fn injects_profile_installation_id_when_request_omits_codex_metadata() {
+        let profile = CodexConcreteAccountProfile {
+            user_agent: "ua".to_string(),
+            originator: "codex-tui".to_string(),
+            installation_id: "019f0a27-08f6-47d2-ba0b-1ff45470ee76".to_string(),
+            fingerprint_hash: "sha256:hash".to_string(),
+        };
+        let mut headers = BTreeMap::new();
+        let instructions = "do not mutate";
+        let input_text = "<environment_context><cwd>/Users/alice/repo</cwd></environment_context>";
+        let mut body = json!({
+            "instructions": instructions,
+            "input": [{"content": [{"type": "input_text", "text": input_text}]}]
+        });
+
+        apply_codex_concrete_account_profile_to_request(&mut headers, &mut body, &profile);
+
+        assert_eq!(
+            headers.get("x-codex-installation-id").map(String::as_str),
+            Some("019f0a27-08f6-47d2-ba0b-1ff45470ee76")
+        );
+        assert_eq!(
+            body["client_metadata"]["x-codex-installation-id"],
+            "019f0a27-08f6-47d2-ba0b-1ff45470ee76"
+        );
         assert_eq!(body["instructions"], instructions);
         assert_eq!(body["input"][0]["content"][0]["text"], input_text);
     }

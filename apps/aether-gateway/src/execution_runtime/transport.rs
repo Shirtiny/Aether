@@ -726,6 +726,33 @@ async fn send_request_inner(
         plan.transport_profile.as_ref(),
         transport_controls,
     )?;
+    let transport_profile = plan.transport_profile.as_ref();
+    let transport_profile_id = transport_profile
+        .map(|profile| profile.profile_id.trim())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("-");
+    let transport_backend = transport_profile
+        .map(|profile| profile.backend.trim())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("-");
+    let tls_backend = reqwest_tls_backend_for_transport_profile(transport_profile);
+    tracing::info!(
+        request_id = %plan.request_id,
+        provider_id = %plan.provider_id,
+        endpoint_id = %plan.endpoint_id,
+        key_id = %plan.key_id,
+        method = %method,
+        upstream_host = %execution_log_url_host(plan.url.as_str()),
+        path = "direct_reqwest",
+        proxy_mode = %proxy_log_mode(plan.proxy.as_ref()),
+        transport_profile_id = %transport_profile_id,
+        transport_backend = %transport_backend,
+        tls_backend = %tls_backend.as_log_str(),
+        body_bytes_len = body_bytes.len(),
+        follow_redirects = ?transport_controls.follow_redirects,
+        http1_only = transport_controls.http1_only,
+        "gateway execution runtime direct request prepared"
+    );
     let mut request = client.request(method, &plan.url);
     request = request.headers(headers).body(body_bytes);
     if let Some(timeout) = total_timeout {
@@ -1579,6 +1606,15 @@ enum ReqwestTlsBackend {
     DefaultNative,
 }
 
+impl ReqwestTlsBackend {
+    fn as_log_str(self) -> &'static str {
+        match self {
+            ReqwestTlsBackend::Rustls => "rustls",
+            ReqwestTlsBackend::DefaultNative => "default_native",
+        }
+    }
+}
+
 fn reqwest_tls_backend_for_transport_profile(
     transport_profile: Option<&ResolvedTransportProfile>,
 ) -> ReqwestTlsBackend {
@@ -1596,6 +1632,35 @@ fn reqwest_tls_backend_for_transport_profile(
         return ReqwestTlsBackend::DefaultNative;
     }
     ReqwestTlsBackend::Rustls
+}
+
+fn proxy_log_mode(proxy: Option<&ProxySnapshot>) -> &'static str {
+    let Some(proxy) = proxy else {
+        return "none";
+    };
+    if proxy.enabled == Some(false) {
+        return "disabled";
+    }
+    if resolve_tunnel_node_id(Some(proxy)).is_some() {
+        return "tunnel";
+    }
+    if proxy
+        .url
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|url| !url.is_empty())
+    {
+        return "proxy_url";
+    }
+    if proxy
+        .node_id
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|node_id| !node_id.is_empty())
+    {
+        return "node_reference";
+    }
+    "configured"
 }
 
 fn build_best_effort_transport_tls_config() -> rustls::ClientConfig {
