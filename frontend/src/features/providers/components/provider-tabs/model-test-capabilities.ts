@@ -44,6 +44,7 @@ const MODEL_TEST_DIAGNOSTIC_LABELS: Record<string, string> = {
   key_model_not_allowed: 'Key 未允许当前模型，已跳过',
   pool_account_blocked: '账号已失效，需重新授权',
   pool_sticky_collateral_avoidance: '该会话的 sticky 账号已失效，已跳过当前号池',
+  provider_anonymous_avoidance: '该提供商已开启回避匿名，无 session 请求已跳过',
 }
 
 export function normalizeModelTestStringList(values: string[] | null | undefined): string[] {

@@ -57,6 +57,7 @@ pub(super) async fn select_minimal_candidate(
     client_session_affinity: Option<&ClientSessionAffinity>,
     now_unix_secs: u64,
     enable_model_directives: bool,
+    enforce_provider_anonymous_avoidance: bool,
 ) -> Result<Option<SchedulerMinimalCandidateSelectionCandidate>, GatewayError> {
     let affinity_epoch = runtime_state.scheduler_affinity_epoch();
     let ordering_config = runtime_state.read_scheduler_ordering_config().await?;
@@ -90,6 +91,7 @@ pub(super) async fn select_minimal_candidate(
         now_unix_secs,
         ordering_config,
         priority_affinity_key,
+        enforce_provider_anonymous_avoidance,
     )
     .await?
     .0
@@ -120,6 +122,7 @@ pub(super) async fn collect_selectable_candidates(
     pool_sticky_session_token: Option<&str>,
     now_unix_secs: u64,
     enable_model_directives: bool,
+    enforce_provider_anonymous_avoidance: bool,
 ) -> Result<Vec<SchedulerMinimalCandidateSelectionCandidate>, GatewayError> {
     Ok(collect_selectable_candidates_with_skip_reasons(
         selection_row_source,
@@ -133,6 +136,7 @@ pub(super) async fn collect_selectable_candidates(
         pool_sticky_session_token,
         now_unix_secs,
         enable_model_directives,
+        enforce_provider_anonymous_avoidance,
     )
     .await?
     .0)
@@ -150,6 +154,7 @@ pub(super) async fn collect_selectable_candidates_with_skip_reasons(
     pool_sticky_session_token: Option<&str>,
     now_unix_secs: u64,
     enable_model_directives: bool,
+    enforce_provider_anonymous_avoidance: bool,
 ) -> Result<
     (
         Vec<SchedulerMinimalCandidateSelectionCandidate>,
@@ -182,6 +187,7 @@ pub(super) async fn collect_selectable_candidates_with_skip_reasons(
         now_unix_secs,
         ordering_config,
         priority_affinity_key,
+        enforce_provider_anonymous_avoidance,
     )
     .await
 }
@@ -199,6 +205,7 @@ pub(super) async fn collect_selectable_enumerated_candidates_with_skip_reasons(
     now_unix_secs: u64,
     ordering_config: crate::scheduler::config::SchedulerOrderingConfig,
     priority_affinity_key: Option<&str>,
+    enforce_provider_anonymous_avoidance: bool,
 ) -> Result<
     (
         Vec<SchedulerMinimalCandidateSelectionCandidate>,
@@ -212,6 +219,7 @@ pub(super) async fn collect_selectable_enumerated_candidates_with_skip_reasons(
         client_session_affinity,
         pool_sticky_session_token,
         now_unix_secs,
+        enforce_provider_anonymous_avoidance,
     )
     .await?;
     let affinity_cache_key = build_scheduler_affinity_cache_key(

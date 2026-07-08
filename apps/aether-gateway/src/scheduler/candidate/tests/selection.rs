@@ -54,6 +54,7 @@ async fn select_candidate(
         None,
         now_unix_secs,
         false,
+        false,
     )
     .await
 }
@@ -76,6 +77,7 @@ async fn select_candidate_with_session_affinity(
         None,
         client_session_affinity,
         now_unix_secs,
+        false,
         false,
     )
     .await
@@ -101,6 +103,7 @@ async fn collect_selectable_candidates(
         None,
         None,
         now_unix_secs,
+        false,
         false,
     )
     .await
@@ -132,6 +135,7 @@ async fn collect_selectable_candidates_with_skip_reasons(
         None,
         None,
         now_unix_secs,
+        false,
         false,
     )
     .await
@@ -268,6 +272,19 @@ fn provider_with_pool_sticky_collateral_avoidance(
         "pool_advanced": {
             "sticky_session_ttl_seconds": 600,
             "sticky_collateral_avoidance_enabled": enabled
+        }
+    }));
+    provider
+}
+
+fn provider_with_anonymous_avoidance(
+    id: &str,
+    enabled: bool,
+) -> aether_data_contracts::repository::provider_catalog::StoredProviderCatalogProvider {
+    let mut provider = sample_provider(id, None);
+    provider.config = Some(serde_json::json!({
+        "pool_advanced": {
+            "avoid_anonymous": enabled
         }
     }));
     provider
@@ -615,6 +632,7 @@ async fn pool_sticky_collateral_runtime_block_prefers_explicit_sticky_token() {
         Some(pool_sticky_session_token),
         200,
         false,
+        false,
     )
     .await
     .expect("selection should succeed");
@@ -625,6 +643,121 @@ async fn pool_sticky_collateral_runtime_block_prefers_explicit_sticky_token() {
         candidate.candidate.provider_id == "risk-provider-a"
             && candidate.skip_reason == "pool_sticky_collateral_avoidance"
     }));
+}
+
+#[tokio::test]
+async fn provider_anonymous_avoidance_skips_only_enabled_provider_without_session() {
+    let state = risk_control_session_avoidance_state_with_providers(
+        vec![
+            provider_with_anonymous_avoidance("risk-provider-a", true),
+            provider_with_anonymous_avoidance("risk-provider-b", false),
+        ],
+        Vec::new(),
+        Vec::new(),
+    );
+
+    let (selected, skipped) = collect_selectable_candidates_with_skip_reasons_impl(
+        state.data.as_ref(),
+        &state,
+        "openai:chat",
+        "gpt-4.1",
+        false,
+        None,
+        None,
+        None,
+        None,
+        200,
+        false,
+        true,
+    )
+    .await
+    .expect("selection should succeed");
+
+    assert_eq!(selected.len(), 1);
+    assert_eq!(selected[0].provider_id, "risk-provider-b");
+    assert!(skipped.iter().any(|candidate| {
+        candidate.candidate.provider_id == "risk-provider-a"
+            && candidate.skip_reason == "provider_anonymous_avoidance"
+    }));
+}
+
+#[tokio::test]
+async fn provider_anonymous_avoidance_allows_enabled_provider_with_session() {
+    let state = risk_control_session_avoidance_state_with_providers(
+        vec![
+            provider_with_anonymous_avoidance("risk-provider-a", true),
+            provider_with_anonymous_avoidance("risk-provider-b", false),
+        ],
+        Vec::new(),
+        Vec::new(),
+    );
+    let affinity = ClientSessionAffinity::from_session_key("session-alpha");
+
+    let (selected, skipped) = collect_selectable_candidates_with_skip_reasons_impl(
+        state.data.as_ref(),
+        &state,
+        "openai:chat",
+        "gpt-4.1",
+        false,
+        None,
+        None,
+        Some(&affinity),
+        None,
+        200,
+        false,
+        true,
+    )
+    .await
+    .expect("selection should succeed");
+
+    assert_eq!(
+        selected
+            .first()
+            .map(|candidate| candidate.provider_id.as_str()),
+        Some("risk-provider-a")
+    );
+    assert!(!skipped
+        .iter()
+        .any(|candidate| candidate.skip_reason == "provider_anonymous_avoidance"));
+}
+
+#[tokio::test]
+async fn provider_anonymous_avoidance_is_not_enforced_for_format_conversion_candidates() {
+    let state = risk_control_session_avoidance_state_with_providers(
+        vec![
+            provider_with_anonymous_avoidance("risk-provider-a", true),
+            provider_with_anonymous_avoidance("risk-provider-b", false),
+        ],
+        Vec::new(),
+        Vec::new(),
+    );
+
+    let (selected, skipped) = collect_selectable_candidates_with_skip_reasons_impl(
+        state.data.as_ref(),
+        &state,
+        "openai:chat",
+        "gpt-4.1",
+        false,
+        None,
+        None,
+        None,
+        None,
+        200,
+        false,
+        false,
+    )
+    .await
+    .expect("selection should succeed");
+
+    assert_eq!(
+        selected
+            .first()
+            .map(|candidate| candidate.provider_id.as_str()),
+        Some("risk-provider-a")
+    );
+    assert!(!skipped
+        .iter()
+        .any(|candidate| candidate.skip_reason == "provider_anonymous_avoidance"));
 }
 
 #[tokio::test]
@@ -1035,6 +1168,7 @@ async fn scheduler_selection_prefers_required_capability_matches_before_priority
         None,
         None,
         100,
+        false,
         false,
     )
     .await

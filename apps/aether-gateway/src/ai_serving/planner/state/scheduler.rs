@@ -21,6 +21,7 @@ impl<'a> PlannerAppState<'a> {
         client_session_affinity: Option<&ClientSessionAffinity>,
         pool_sticky_session_token: Option<&str>,
         now_unix_secs: u64,
+        enforce_provider_anonymous_avoidance: bool,
     ) -> Result<Vec<SchedulerMinimalCandidateSelectionCandidate>, GatewayError> {
         let enable_model_directives =
             crate::system_features::reasoning_model_directive_enabled_for_api_format_and_model(
@@ -41,6 +42,7 @@ impl<'a> PlannerAppState<'a> {
             pool_sticky_session_token,
             now_unix_secs,
             enable_model_directives,
+            enforce_provider_anonymous_avoidance,
         )
         .await
     }
@@ -55,6 +57,7 @@ impl<'a> PlannerAppState<'a> {
         client_session_affinity: Option<&ClientSessionAffinity>,
         pool_sticky_session_token: Option<&str>,
         now_unix_secs: u64,
+        enforce_provider_anonymous_avoidance: bool,
     ) -> Result<
         (
             Vec<SchedulerMinimalCandidateSelectionCandidate>,
@@ -87,6 +90,7 @@ impl<'a> PlannerAppState<'a> {
                 pool_sticky_session_token,
                 attempt_now_unix_secs,
                 enable_model_directives,
+                enforce_provider_anonymous_avoidance,
             )
             .await?;
 
@@ -117,6 +121,7 @@ impl<'a> PlannerAppState<'a> {
         client_session_affinity: Option<&ClientSessionAffinity>,
         pool_sticky_session_token: Option<&str>,
         now_unix_secs: u64,
+        enforce_provider_anonymous_avoidance: bool,
     ) -> Result<
         (
             Vec<SchedulerMinimalCandidateSelectionCandidate>,
@@ -134,6 +139,7 @@ impl<'a> PlannerAppState<'a> {
             client_session_affinity,
             pool_sticky_session_token,
             now_unix_secs,
+            enforce_provider_anonymous_avoidance,
         )
         .await
     }

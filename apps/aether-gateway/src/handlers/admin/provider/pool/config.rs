@@ -90,6 +90,18 @@ fn parse_pool_probe_target_count(pool_advanced: &Map<String, Value>) -> Option<u
         .map(|value| value.min(100_000))
 }
 
+fn parse_pool_anonymous_avoidance_enabled(pool_advanced: &Map<String, Value>) -> bool {
+    [
+        "avoid_anonymous",
+        "avoid_anonymous_requests",
+        "anonymous_avoidance_enabled",
+        "avoid_anonymous_requests_enabled",
+    ]
+    .into_iter()
+    .find_map(|key| pool_advanced.get(key).and_then(Value::as_bool))
+    .unwrap_or(false)
+}
+
 fn parse_sticky_collateral_avoidance_enabled(pool_advanced: &Map<String, Value>) -> bool {
     [
         "sticky_collateral_avoidance_enabled",
@@ -473,6 +485,7 @@ pub(crate) fn admin_provider_pool_config_from_config_value(
             lru_enabled: false,
             skip_exhausted_accounts: false,
             sticky_collateral_avoidance_enabled: false,
+            avoid_anonymous: false,
             codex_quota_exhaustion_basis: "weekly".to_string(),
             sticky_session_ttl_seconds: 0,
             latency_window_seconds: 3600,
@@ -514,6 +527,7 @@ pub(crate) fn admin_provider_pool_config_from_config_value(
         sticky_collateral_avoidance_enabled: parse_sticky_collateral_avoidance_enabled(
             pool_advanced,
         ),
+        avoid_anonymous: parse_pool_anonymous_avoidance_enabled(pool_advanced),
         codex_quota_exhaustion_basis: parse_codex_quota_exhaustion_basis(pool_advanced),
         sticky_session_ttl_seconds: pool_advanced
             .get("sticky_session_ttl_seconds")
@@ -661,6 +675,14 @@ mod tests {
     }
 
     #[test]
+    fn defaults_avoid_anonymous_to_false() {
+        let provider = sample_provider(json!({ "pool_advanced": {} }));
+        let config = admin_provider_pool_config(&provider).expect("pool config should exist");
+
+        assert!(!config.avoid_anonymous);
+    }
+
+    #[test]
     fn defaults_missing_sticky_session_ttl_to_disabled() {
         let provider = sample_provider(json!({ "pool_advanced": {} }));
         let config = admin_provider_pool_config(&provider).expect("pool config should exist");
@@ -674,6 +696,7 @@ mod tests {
             "pool_advanced": {
                 "skip_exhausted_accounts": true,
                 "sticky_collateral_avoidance_enabled": true,
+                "avoid_anonymous": true,
                 "lru_enabled": true,
                 "sticky_session_ttl_seconds": 600,
                 "latency_window_seconds": 900,
@@ -716,6 +739,7 @@ mod tests {
 
         assert!(config.skip_exhausted_accounts);
         assert!(config.sticky_collateral_avoidance_enabled);
+        assert!(config.avoid_anonymous);
         assert!(config.lru_enabled);
         assert_eq!(config.sticky_session_ttl_seconds, 600);
         assert_eq!(config.latency_window_seconds, 900);

@@ -49,6 +49,7 @@ async fn select_candidate(
         None,
         now_unix_secs,
         false,
+        false,
     )
     .await
 }

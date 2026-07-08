@@ -133,6 +133,7 @@ pub(super) async fn list_local_video_create_candidate_attempts(
             input.client_session_affinity.as_ref(),
             sticky_session_token.as_deref(),
             current_unix_secs(),
+            true,
         )
         .await
     {
@@ -192,6 +193,7 @@ pub(super) async fn build_local_video_create_candidate_attempt_source<'a>(
             input.client_session_affinity.as_ref(),
             sticky_session_token.as_deref(),
             current_unix_secs(),
+            true,
         )
         .await
     {

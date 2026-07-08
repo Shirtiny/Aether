@@ -730,6 +730,7 @@ export interface PoolAdvancedConfig {
   load_threshold_percent?: number | null
   skip_exhausted_accounts?: boolean | null
   sticky_collateral_avoidance_enabled?: boolean | null
+  avoid_anonymous?: boolean | null
   codex_quota_weekly_basis?: boolean | null
   codex_quota_exhaustion_basis?: 'weekly' | 'five_hour' | '5h' | string | null
   // 旧字段（兼容读取）

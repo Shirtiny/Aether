@@ -949,6 +949,7 @@ async fn maybe_build_local_openai_probe_response(
         return None;
     }
 
+    let is_execution_runtime_candidate = decision.is_execution_runtime_candidate();
     let request_body = request_body?;
     let payload = serde_json::from_slice::<Value>(request_body).ok()?;
     let probe = match (
@@ -966,6 +967,9 @@ async fn maybe_build_local_openai_probe_response(
         }
         _ => return None,
     };
+    if is_execution_runtime_candidate && !probe.answer().is_strict_execution_runtime_probe() {
+        return None;
+    }
     let model = payload
         .get("model")
         .and_then(Value::as_str)
@@ -1049,6 +1053,15 @@ impl OpenAiLocalProbeRequest {
                 text: answer.text.clone(),
                 kind: answer.kind,
             },
+        }
+    }
+}
+
+impl LocalProbeAnswer {
+    fn is_strict_execution_runtime_probe(&self) -> bool {
+        match self.kind {
+            LocalProbeKind::Arithmetic | LocalProbeKind::Ping => true,
+            LocalProbeKind::Health => self.text.trim().eq_ignore_ascii_case("OK"),
         }
     }
 }
@@ -2696,6 +2709,40 @@ mod tests {
         let body = Bytes::from_static(
             br#"{"model":"gpt-5.4-mini","input":"ordinary non probe request 12345"}"#,
         );
+
+        assert!(maybe_build_local_openai_probe_response(
+            &state,
+            &request_context,
+            None,
+            Some(&body),
+            None,
+        )
+        .await
+        .is_none());
+    }
+
+    #[tokio::test]
+    async fn openai_local_probe_does_not_intercept_execution_runtime_broad_health_rule() {
+        let state = probe_default_rules_test_state();
+        let request_context = GatewayPublicRequestContext {
+            trace_id: "trace-local-runtime-broad-health-skip".to_string(),
+            request_method: http::Method::POST,
+            request_path: "/v1/responses".to_string(),
+            request_query_string: None,
+            request_content_type: Some("application/json".to_string()),
+            host_header: None,
+            control_decision: Some(
+                GatewayControlDecision::synthetic(
+                    "/v1/responses",
+                    Some("ai_public".to_string()),
+                    Some("openai".to_string()),
+                    Some("responses".to_string()),
+                    Some("openai:responses".to_string()),
+                )
+                .with_execution_runtime_candidate(true),
+            ),
+        };
+        let body = Bytes::from_static(br#"{"model":"gpt-5","input":"hello"}"#);
 
         assert!(maybe_build_local_openai_probe_response(
             &state,

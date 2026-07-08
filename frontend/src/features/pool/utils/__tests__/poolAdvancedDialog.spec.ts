@@ -16,6 +16,8 @@ describe('poolAdvancedDialog', () => {
       'account_self_check_enabled',
       'auto_remove_banned_keys',
       'skip_exhausted_accounts',
+      'sticky_collateral_avoidance_enabled',
+      'avoid_anonymous',
       'codex_quota_weekly_basis',
     ])
   })
@@ -46,6 +48,16 @@ describe('poolAdvancedDialog', () => {
         key: 'skip_exhausted_accounts',
         label: '跳过额度耗尽账号',
         description: '当 Codex / Kiro 账号额度已耗尽时，直接标记为不可调度并在请求侧跳过。',
+      },
+      {
+        key: 'sticky_collateral_avoidance_enabled',
+        label: '连坐避险',
+        description: 'sticky 账号失效后跳过当前号池，避免同会话切到池内其他账号。',
+      },
+      {
+        key: 'avoid_anonymous',
+        label: '回避匿名',
+        description: '无客户端 session 且不发生格式转换的请求会跳过该提供商，并继续尝试其它候选。',
       },
       {
         key: 'codex_quota_weekly_basis',

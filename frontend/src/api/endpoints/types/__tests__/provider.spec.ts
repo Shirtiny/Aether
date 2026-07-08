@@ -13,6 +13,9 @@ describe('normalizePoolAdvancedConfig', () => {
     expect(normalizePoolAdvancedConfig({ sticky_collateral_avoidance_enabled: true })).toEqual({
       sticky_collateral_avoidance_enabled: true,
     })
+    expect(normalizePoolAdvancedConfig({ avoid_anonymous: true })).toEqual({
+      avoid_anonymous: true,
+    })
   })
 
   it('maps legacy boolean payloads to the current object semantics', () => {

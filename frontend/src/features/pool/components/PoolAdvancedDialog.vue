@@ -793,6 +793,7 @@ const form = ref({
   auto_remove_banned_keys: false,
   skip_exhausted_accounts: false,
   sticky_collateral_avoidance_enabled: false,
+  avoid_anonymous: false,
   codex_quota_weekly_basis: true,
 })
 
@@ -881,6 +882,8 @@ function getHealthToggleValue(key: PoolHealthToggleKey): boolean {
       return form.value.skip_exhausted_accounts
     case 'sticky_collateral_avoidance_enabled':
       return form.value.sticky_collateral_avoidance_enabled
+    case 'avoid_anonymous':
+      return form.value.avoid_anonymous
     case 'codex_quota_weekly_basis':
       return form.value.codex_quota_weekly_basis
   }
@@ -905,6 +908,9 @@ function updateHealthToggleValue(key: PoolHealthToggleKey, value: boolean): void
       return
     case 'sticky_collateral_avoidance_enabled':
       form.value.sticky_collateral_avoidance_enabled = value
+      return
+    case 'avoid_anonymous':
+      form.value.avoid_anonymous = value
       return
     case 'codex_quota_weekly_basis':
       form.value.codex_quota_weekly_basis = value
@@ -947,6 +953,7 @@ watch(() => props.modelValue, (open) => {
     auto_remove_banned_keys: cfg?.auto_remove_banned_keys ?? false,
     skip_exhausted_accounts: cfg?.skip_exhausted_accounts ?? false,
     sticky_collateral_avoidance_enabled: cfg?.sticky_collateral_avoidance_enabled ?? false,
+    avoid_anonymous: cfg?.avoid_anonymous ?? false,
     codex_quota_weekly_basis: cfg?.codex_quota_weekly_basis ?? !isCodexFiveHourQuotaBasis(cfg?.codex_quota_exhaustion_basis),
   }
 
@@ -1029,6 +1036,7 @@ async function handleSave() {
       auto_remove_banned_keys: form.value.auto_remove_banned_keys,
       skip_exhausted_accounts: form.value.skip_exhausted_accounts,
       sticky_collateral_avoidance_enabled: form.value.sticky_collateral_avoidance_enabled,
+      avoid_anonymous: form.value.avoid_anonymous,
       codex_quota_weekly_basis: form.value.codex_quota_weekly_basis,
       codex_quota_exhaustion_basis: form.value.codex_quota_weekly_basis ? 'weekly' : 'five_hour',
     }

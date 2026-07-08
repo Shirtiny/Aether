@@ -970,6 +970,7 @@ mod tests {
             lru_enabled: true,
             skip_exhausted_accounts: false,
             sticky_collateral_avoidance_enabled: false,
+            avoid_anonymous: false,
             codex_quota_exhaustion_basis: "weekly".to_string(),
             sticky_session_ttl_seconds: 120,
             latency_window_seconds: 600,

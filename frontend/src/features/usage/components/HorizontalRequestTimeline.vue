@@ -1368,6 +1368,7 @@ const SKIP_REASON_LABELS: Record<string, string> = {
   api_key_concurrency_limit_reached: '调用方 API Key 并发已达上限',
   pool_key_lease_busy: '池内账号正被其他请求占用',
   pool_sticky_collateral_avoidance: '该会话的 sticky 账号已失效，已跳过当前号池',
+  provider_anonymous_avoidance: '该提供商已开启回避匿名，无 session 请求已跳过',
   provider_concurrency_limit_reached: '上游提供商并发已达上限',
   provider_key_concurrency_limit_reached: '上游账号并发已达上限',
   provider_session_risk_control_avoidance: '该会话在此提供商已触发风控避险',

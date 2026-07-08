@@ -65,6 +65,7 @@ pub(crate) async fn list_selectable_candidates(
     pool_sticky_session_token: Option<&str>,
     now_unix_secs: u64,
     enable_model_directives: bool,
+    enforce_provider_anonymous_avoidance: bool,
 ) -> Result<Vec<SchedulerMinimalCandidateSelectionCandidate>, GatewayError> {
     collect_selectable_candidates(
         selection_row_source,
@@ -78,6 +79,7 @@ pub(crate) async fn list_selectable_candidates(
         pool_sticky_session_token,
         now_unix_secs,
         enable_model_directives,
+        enforce_provider_anonymous_avoidance,
     )
     .await
 }
@@ -101,6 +103,7 @@ pub(crate) async fn list_selectable_candidates_with_skip_reasons(
     pool_sticky_session_token: Option<&str>,
     now_unix_secs: u64,
     enable_model_directives: bool,
+    enforce_provider_anonymous_avoidance: bool,
 ) -> Result<
     (
         Vec<SchedulerMinimalCandidateSelectionCandidate>,
@@ -120,6 +123,7 @@ pub(crate) async fn list_selectable_candidates_with_skip_reasons(
         pool_sticky_session_token,
         now_unix_secs,
         enable_model_directives,
+        enforce_provider_anonymous_avoidance,
     )
     .await
 }
@@ -135,6 +139,7 @@ pub(crate) async fn list_selectable_enumerated_candidates_with_skip_reasons(
     client_session_affinity: Option<&ClientSessionAffinity>,
     pool_sticky_session_token: Option<&str>,
     now_unix_secs: u64,
+    enforce_provider_anonymous_avoidance: bool,
 ) -> Result<
     (
         Vec<SchedulerMinimalCandidateSelectionCandidate>,
@@ -157,6 +162,7 @@ pub(crate) async fn list_selectable_enumerated_candidates_with_skip_reasons(
         now_unix_secs,
         ordering_config,
         priority_affinity_key,
+        enforce_provider_anonymous_avoidance,
     )
     .await
 }
@@ -240,6 +246,7 @@ pub(crate) async fn list_selectable_candidates_for_required_capability_without_r
             client_session_affinity,
             None,
             now_unix_secs,
+            false,
             false,
         )
         .await?;

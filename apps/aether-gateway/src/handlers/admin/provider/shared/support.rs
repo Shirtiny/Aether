@@ -37,6 +37,7 @@ pub(crate) struct AdminProviderPoolConfig {
     pub(crate) lru_enabled: bool,
     pub(crate) skip_exhausted_accounts: bool,
     pub(crate) sticky_collateral_avoidance_enabled: bool,
+    pub(crate) avoid_anonymous: bool,
     pub(crate) codex_quota_exhaustion_basis: String,
     pub(crate) sticky_session_ttl_seconds: u64,
     pub(crate) latency_window_seconds: u64,

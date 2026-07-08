@@ -126,6 +126,7 @@ pub(crate) async fn materialize_local_same_format_provider_candidate_attempts(
             input.client_session_affinity.as_ref(),
             sticky_session_token.as_deref(),
             current_unix_secs(),
+            true,
         )
         .await?;
     let outcome = materialize_local_execution_candidates_with_serving(
@@ -225,6 +226,7 @@ pub(crate) async fn build_local_same_format_provider_candidate_attempt_source<'a
             input.client_session_affinity.as_ref(),
             sticky_session_token.as_deref(),
             current_unix_secs(),
+            true,
         )
         .await?;
 

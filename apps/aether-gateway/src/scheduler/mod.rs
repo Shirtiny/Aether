@@ -1,4 +1,5 @@
 pub(crate) mod affinity;
+pub(crate) mod anonymous_avoidance;
 pub(crate) mod candidate;
 pub(crate) mod config;
 pub(crate) mod pool_collateral_avoidance;

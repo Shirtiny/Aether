@@ -84,6 +84,7 @@ impl AiCandidatePreselectionPort for GatewayLocalCandidatePreselectionPort<'_> {
                 self.client_session_affinity,
                 self.pool_sticky_session_token,
                 current_unix_secs(),
+                matches_client_format,
             )
             .await?;
 
@@ -808,6 +809,7 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
                 self.client_session_affinity.as_ref(),
                 self.pool_sticky_session_token.as_deref(),
                 current_unix_secs(),
+                matches_client_format,
             )
             .await?;
         let skipped_candidates = skipped_candidates

@@ -15,6 +15,9 @@ use aether_scheduler_core::{
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::data::auth::GatewayAuthApiKeySnapshot;
+use crate::scheduler::anonymous_avoidance::{
+    provider_anonymous_avoidance_enabled, PROVIDER_ANONYMOUS_AVOIDANCE_SKIP_REASON,
+};
 use crate::scheduler::pool_collateral_avoidance::provider_pool_sticky_collateral_avoidance_enabled;
 use crate::scheduler::session_risk_control::{
     provider_session_risk_control_avoidance_mode, ProviderSessionRiskControlAvoidanceMode,
@@ -35,6 +38,7 @@ pub(super) struct CandidateRuntimeSelectionSnapshot {
     session_risk_control_blocked: bool,
     provider_session_risk_control_blocks: BTreeMap<String, bool>,
     provider_pool_sticky_collateral_blocks: BTreeMap<String, bool>,
+    provider_anonymous_avoidance_blocks: BTreeMap<String, bool>,
     provider_quota_blocks_requests: BTreeMap<String, bool>,
     key_account_quota_exhausted: BTreeMap<String, bool>,
     key_oauth_invalid: BTreeMap<String, bool>,
@@ -47,6 +51,7 @@ pub(super) async fn read_candidate_runtime_selection_snapshot(
     client_session_affinity: Option<&ClientSessionAffinity>,
     pool_sticky_session_token: Option<&str>,
     now_unix_secs: u64,
+    enforce_provider_anonymous_avoidance: bool,
 ) -> Result<CandidateRuntimeSelectionSnapshot, GatewayError> {
     let recent_candidates = state.read_recent_request_candidates(128).await?;
     let provider_concurrent_limits = read_provider_concurrent_limits(state, candidates).await?;
@@ -96,6 +101,11 @@ pub(super) async fn read_candidate_runtime_selection_snapshot(
         pool_sticky_session_token,
     )
     .await?;
+    let provider_anonymous_avoidance_blocks = read_provider_anonymous_avoidance_block_map(
+        &providers,
+        client_session_affinity,
+        enforce_provider_anonymous_avoidance,
+    );
     let provider_key_rpm_reset_ats =
         read_provider_key_rpm_reset_at_map(state, candidates, now_unix_secs);
 
@@ -107,6 +117,7 @@ pub(super) async fn read_candidate_runtime_selection_snapshot(
         session_risk_control_blocked: provider_session_risk_control.session_blocked,
         provider_session_risk_control_blocks: provider_session_risk_control.provider_blocks,
         provider_pool_sticky_collateral_blocks,
+        provider_anonymous_avoidance_blocks,
         provider_quota_blocks_requests,
         key_account_quota_exhausted,
         key_oauth_invalid,
@@ -158,6 +169,14 @@ pub(super) fn is_candidate_selectable(
     }
     if snapshot
         .provider_pool_sticky_collateral_blocks
+        .get(candidate.provider_id.as_str())
+        .copied()
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    if snapshot
+        .provider_anonymous_avoidance_blocks
         .get(candidate.provider_id.as_str())
         .copied()
         .unwrap_or(false)
@@ -234,6 +253,14 @@ pub(super) fn current_candidate_runtime_skip_reason(
         .unwrap_or(false)
     {
         return Some("pool_sticky_collateral_avoidance");
+    }
+    if snapshot
+        .provider_anonymous_avoidance_blocks
+        .get(candidate.provider_id.as_str())
+        .copied()
+        .unwrap_or(false)
+    {
+        return Some(PROVIDER_ANONYMOUS_AVOIDANCE_SKIP_REASON);
     }
     let rpm_reset_at = (!pool_group)
         .then(|| {
@@ -510,6 +537,30 @@ fn mark_provider_session_risk_control_blocked(
     if mode.blocks_session() {
         snapshot.session_blocked = true;
     }
+}
+
+fn read_provider_anonymous_avoidance_block_map(
+    providers: &[StoredProviderCatalogProvider],
+    client_session_affinity: Option<&ClientSessionAffinity>,
+    enforce_provider_anonymous_avoidance: bool,
+) -> BTreeMap<String, bool> {
+    if !enforce_provider_anonymous_avoidance || request_has_client_session(client_session_affinity)
+    {
+        return BTreeMap::new();
+    }
+
+    providers
+        .iter()
+        .filter(|provider| provider_anonymous_avoidance_enabled(provider.config.as_ref()))
+        .map(|provider| (provider.id.clone(), true))
+        .collect()
+}
+
+fn request_has_client_session(client_session_affinity: Option<&ClientSessionAffinity>) -> bool {
+    client_session_affinity
+        .and_then(|affinity| affinity.session_key.as_deref())
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
 }
 
 async fn read_provider_pool_sticky_collateral_block_map(

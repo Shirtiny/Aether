@@ -283,18 +283,33 @@
 
         <div
           v-if="form.pool_mode_enabled"
-          class="flex items-center justify-between p-3 border rounded-lg bg-muted/50"
+          class="space-y-3"
         >
-          <div class="space-y-0.5">
-            <span class="text-sm font-medium">号池连坐避险</span>
-            <p class="text-xs text-muted-foreground leading-relaxed">
-              sticky 账号失效后跳过当前号池
-            </p>
+          <div class="flex items-center justify-between p-3 border rounded-lg bg-muted/50">
+            <div class="space-y-0.5">
+              <span class="text-sm font-medium">号池连坐避险</span>
+              <p class="text-xs text-muted-foreground leading-relaxed">
+                sticky 账号失效后跳过当前号池
+              </p>
+            </div>
+            <Switch
+              :model-value="form.pool_sticky_collateral_avoidance_enabled"
+              @update:model-value="(v: boolean) => form.pool_sticky_collateral_avoidance_enabled = v"
+            />
           </div>
-          <Switch
-            :model-value="form.pool_sticky_collateral_avoidance_enabled"
-            @update:model-value="(v: boolean) => form.pool_sticky_collateral_avoidance_enabled = v"
-          />
+
+          <div class="flex items-center justify-between p-3 border rounded-lg bg-muted/50">
+            <div class="space-y-0.5">
+              <span class="text-sm font-medium">回避匿名</span>
+              <p class="text-xs text-muted-foreground leading-relaxed">
+                无客户端 session 且不发生格式转换的请求跳过该提供商，继续尝试其它候选
+              </p>
+            </div>
+            <Switch
+              :model-value="form.pool_avoid_anonymous"
+              @update:model-value="(v: boolean) => form.pool_avoid_anonymous = v"
+            />
+          </div>
         </div>
 
         <div class="flex items-center justify-between gap-4 p-3 border rounded-lg bg-muted/50">
@@ -449,6 +464,7 @@ const form = ref({
   // 号池模式
   pool_mode_enabled: false,
   pool_sticky_collateral_avoidance_enabled: false,
+  pool_avoid_anonymous: false,
   risk_control_session_avoidance_mode: 'ignore' as RiskControlSessionAvoidanceMode,
   // Kiro 专属配置
   kiro_simulated_cache_enabled: false,
@@ -479,6 +495,7 @@ function resetForm() {
     // 号池模式
     pool_mode_enabled: false,
     pool_sticky_collateral_avoidance_enabled: false,
+    pool_avoid_anonymous: false,
     risk_control_session_avoidance_mode: 'ignore',
     // Kiro 专属配置
     kiro_simulated_cache_enabled: false,
@@ -513,6 +530,7 @@ function loadProviderData() {
     // 号池模式
     pool_mode_enabled: poolAdvanced !== null,
     pool_sticky_collateral_avoidance_enabled: poolAdvanced?.sticky_collateral_avoidance_enabled ?? false,
+    pool_avoid_anonymous: poolAdvanced?.avoid_anonymous ?? false,
     risk_control_session_avoidance_mode: props.provider.risk_control_session_avoidance?.mode ?? 'ignore',
     // Kiro 专属配置
     kiro_simulated_cache_enabled: props.provider.kiro_simulated_cache_enabled ?? false,
@@ -570,6 +588,7 @@ const handleSubmit = async () => {
       ? {
           ...(currentPoolAdvanced ?? {}),
           sticky_collateral_avoidance_enabled: form.value.pool_sticky_collateral_avoidance_enabled,
+          avoid_anonymous: form.value.pool_avoid_anonymous,
         }
       : null
     const providerConfig = {
