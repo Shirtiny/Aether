@@ -1593,6 +1593,14 @@ fn reqwest_tls_backend_for_transport_profile(
         .trim()
         .eq_ignore_ascii_case(TRANSPORT_BACKEND_REQWEST_DEFAULT_TLS)
     {
+        #[cfg(target_env = "musl")]
+        {
+            // The static musl release artifacts intentionally compile reqwest
+            // without native-tls/OpenSSL so multi-arch release builds remain
+            // reproducible. Fall back to the rustls transport on those targets.
+            return ReqwestTlsBackend::Rustls;
+        }
+        #[cfg(not(target_env = "musl"))]
         return ReqwestTlsBackend::DefaultNative;
     }
     ReqwestTlsBackend::Rustls

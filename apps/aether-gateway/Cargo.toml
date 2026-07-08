@@ -76,6 +76,12 @@ zstd.workspace = true
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = "0.6"
 
+# Static musl release images cannot reliably build OpenSSL/native-tls for every
+# release target. Keep the default workspace reqwest stack rustls-only for musl,
+# and enable reqwest's native default TLS only on non-musl gateway builds.
+[target.'cfg(not(target_env = "musl"))'.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["default-tls", "native-tls-vendored"] }
+
 [dev-dependencies]
 aether-testkit.workspace = true
 tracing-subscriber.workspace = true
