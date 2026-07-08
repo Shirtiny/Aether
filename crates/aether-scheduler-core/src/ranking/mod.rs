@@ -386,16 +386,25 @@ mod tests {
     }
 
     #[test]
-    fn fixed_order_keeps_provider_priority_ties_in_original_order() {
-        let mut first = candidate("first", 0, 50, Some(50));
+    fn fixed_order_randomizes_equal_priority_ties_without_crossing_priority_slots() {
+        let mut first = candidate("first", 0, 0, Some(0));
         first.original_index = 0;
-        let mut second = candidate("second", 0, 10, Some(10));
+        let mut second = candidate("second", 0, 0, Some(0));
         second.original_index = 1;
-        let mut lower_priority = candidate("lower", 10, 0, Some(0));
+        let mut lower_priority = candidate("lower", 10, 0, Some(10));
         lower_priority.original_index = 2;
 
-        for seed in [0, 1, 127] {
-            assert_eq!(
+        let first_seed_order = ranked_ids(
+            &[first.clone(), second.clone(), lower_priority.clone()],
+            SchedulerRankingContext {
+                priority_mode: SchedulerPriorityMode::Provider,
+                ranking_mode: SchedulerRankingMode::FixedOrder,
+                include_health: false,
+                load_balance_seed: 0,
+            },
+        );
+        let alternate_order = (1..128)
+            .map(|seed| {
                 ranked_ids(
                     &[first.clone(), second.clone(), lower_priority.clone()],
                     SchedulerRankingContext {
@@ -404,10 +413,13 @@ mod tests {
                         include_health: false,
                         load_balance_seed: seed,
                     },
-                ),
-                vec!["provider-first", "provider-second", "provider-lower"]
-            );
-        }
+                )
+            })
+            .find(|order| order[0] != first_seed_order[0])
+            .expect("equal priority tie should vary by seed");
+
+        assert_eq!(first_seed_order[2], "provider-lower");
+        assert_eq!(alternate_order[2], "provider-lower");
     }
 
     #[test]

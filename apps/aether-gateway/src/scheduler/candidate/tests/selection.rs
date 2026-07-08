@@ -1111,7 +1111,7 @@ async fn fixed_order_ignores_cached_scheduler_affinity_promotion() {
 }
 
 #[tokio::test]
-async fn fixed_order_disables_same_priority_affinity_hash_tiebreaker() {
+async fn fixed_order_uses_same_priority_seeded_hash_tiebreaker() {
     let mut first = sample_row();
     first.provider_id = "provider-a".to_string();
     first.provider_name = "provider-a".to_string();
@@ -1160,12 +1160,12 @@ async fn fixed_order_disables_same_priority_affinity_hash_tiebreaker() {
     .expect("selection should succeed");
 
     assert_eq!(selection.len(), 2);
-    assert_eq!(selection[0].provider_id, "provider-a");
-    assert_eq!(selection[1].provider_id, "provider-b");
+    assert_eq!(selection[0].provider_id, "provider-b");
+    assert_eq!(selection[1].provider_id, "provider-a");
 }
 
 #[tokio::test]
-async fn fixed_order_provider_priority_tie_does_not_promote_other_provider_key_priority() {
+async fn fixed_order_provider_priority_tie_uses_key_priority() {
     let mut channel_98 = sample_row();
     channel_98.provider_id = "provider-98".to_string();
     channel_98.provider_name = "98-channel".to_string();
@@ -1213,10 +1213,10 @@ async fn fixed_order_provider_priority_tie_does_not_promote_other_provider_key_p
     .expect("selection should succeed");
 
     assert_eq!(selection.len(), 2);
-    assert_eq!(selection[0].provider_id, "provider-98");
-    assert_eq!(selection[0].key_id, "key-98-pro");
-    assert_eq!(selection[1].provider_id, "provider-g");
-    assert_eq!(selection[1].key_id, "key-g-pro");
+    assert_eq!(selection[0].provider_id, "provider-g");
+    assert_eq!(selection[0].key_id, "key-g-pro");
+    assert_eq!(selection[1].provider_id, "provider-98");
+    assert_eq!(selection[1].key_id, "key-98-pro");
 }
 
 #[tokio::test]
