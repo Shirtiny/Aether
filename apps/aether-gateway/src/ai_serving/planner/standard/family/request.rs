@@ -21,7 +21,8 @@ use crate::ai_serving::planner::redaction::{
 };
 use crate::ai_serving::planner::spec_metadata::local_standard_spec_metadata;
 use crate::ai_serving::planner::standard::{
-    apply_codex_openai_responses_special_headers, apply_codex_pool_concrete_account_profile,
+    apply_codex_openai_responses_special_headers,
+    apply_codex_pool_concrete_account_profile_for_api_format,
     apply_deepseek_tool_call_thinking_compat, is_deepseek_provider,
     request_body_build_failure_extra_data,
 };
@@ -843,10 +844,11 @@ pub(crate) async fn resolve_local_standard_candidate_payload_parts(
         Some(trace_id),
         transport.key.decrypted_auth_config.as_deref(),
     );
-    apply_codex_pool_concrete_account_profile(
+    apply_codex_pool_concrete_account_profile_for_api_format(
         &mut provider_request_headers,
         &mut provider_request_body,
         transport,
+        provider_api_format,
     );
     request_identity_response_encoding_when_redacted(
         &mut provider_request_headers,
@@ -999,10 +1001,11 @@ async fn build_gemini_cli_cross_format_payload_parts(
         Some(trace_id),
         resolved.transport.key.decrypted_auth_config.as_deref(),
     );
-    apply_codex_pool_concrete_account_profile(
+    apply_codex_pool_concrete_account_profile_for_api_format(
         &mut provider_request_headers,
         &mut provider_request_body,
         &resolved.transport,
+        provider_api_format,
     );
     request_identity_response_encoding_when_redacted(
         &mut provider_request_headers,
@@ -1269,10 +1272,11 @@ async fn resolve_local_gemini_image_to_openai_image_candidate_payload_parts(
         transport.key.decrypted_auth_config.as_deref(),
     );
     let mut provider_request_body = converted.body_json;
-    apply_codex_pool_concrete_account_profile(
+    apply_codex_pool_concrete_account_profile_for_api_format(
         &mut provider_request_headers,
         &mut provider_request_body,
         transport,
+        provider_api_format,
     );
 
     Some(LocalStandardCandidatePayloadParts {

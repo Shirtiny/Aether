@@ -8,9 +8,12 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::codex_profile::{
-    apply_codex_concrete_account_profile_to_request, codex_account_selection_key,
+    apply_codex_concrete_account_profile_to_request,
+    apply_codex_concrete_account_profile_to_request_with_body_policy, codex_account_selection_key,
     materialize_codex_key_fingerprint, resolve_codex_concrete_account_profile,
-    CodexConcreteAccountProfile, CodexProfileMaterializationOutcome, CodexProfileMaterializeInput,
+    strip_codex_client_metadata_from_body, CodexConcreteAccountProfile,
+    CodexProfileMaterializationOutcome, CodexProfileMaterializeInput,
+    CodexProfileRequestBodyPolicy,
 };
 
 pub(crate) use crate::ai_serving::{
@@ -205,6 +208,34 @@ pub(crate) fn apply_codex_pool_concrete_account_profile(
     provider_request_body: &mut Value,
     transport: &GatewayProviderTransportSnapshot,
 ) {
+    apply_codex_pool_concrete_account_profile_with_body_policy(
+        provider_request_headers,
+        provider_request_body,
+        transport,
+        CodexProfileRequestBodyPolicy::NormalizeClientMetadata,
+    );
+}
+
+pub(crate) fn apply_codex_pool_concrete_account_profile_for_api_format(
+    provider_request_headers: &mut BTreeMap<String, String>,
+    provider_request_body: &mut Value,
+    transport: &GatewayProviderTransportSnapshot,
+    provider_api_format: &str,
+) {
+    apply_codex_pool_concrete_account_profile_with_body_policy(
+        provider_request_headers,
+        provider_request_body,
+        transport,
+        codex_profile_request_body_policy(provider_api_format),
+    );
+}
+
+fn apply_codex_pool_concrete_account_profile_with_body_policy(
+    provider_request_headers: &mut BTreeMap<String, String>,
+    provider_request_body: &mut Value,
+    transport: &GatewayProviderTransportSnapshot,
+    body_policy: CodexProfileRequestBodyPolicy,
+) {
     if !transport
         .provider
         .provider_type
@@ -214,15 +245,30 @@ pub(crate) fn apply_codex_pool_concrete_account_profile(
         return;
     }
     remove_codex_pool_upstream_leak_headers(provider_request_headers);
+    if body_policy == CodexProfileRequestBodyPolicy::StripClientMetadata {
+        strip_codex_client_metadata_from_body(provider_request_body);
+    }
 
     let Some(profile) = resolve_codex_pool_concrete_account_profile(transport) else {
         return;
     };
-    apply_codex_concrete_account_profile_to_request(
+    apply_codex_concrete_account_profile_to_request_with_body_policy(
         provider_request_headers,
         provider_request_body,
         &profile,
+        body_policy,
     );
+}
+
+fn codex_profile_request_body_policy(provider_api_format: &str) -> CodexProfileRequestBodyPolicy {
+    if provider_api_format
+        .trim()
+        .eq_ignore_ascii_case("openai:responses:compact")
+    {
+        CodexProfileRequestBodyPolicy::StripClientMetadata
+    } else {
+        CodexProfileRequestBodyPolicy::NormalizeClientMetadata
+    }
 }
 
 pub(crate) fn materialize_codex_pool_key_fingerprint(

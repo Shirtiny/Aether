@@ -24,6 +24,12 @@ pub(crate) struct CodexConcreteAccountProfile {
     pub(crate) fingerprint_hash: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CodexProfileRequestBodyPolicy {
+    NormalizeClientMetadata,
+    StripClientMetadata,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CodexProfileMaterialization {
     Existing,
@@ -214,11 +220,32 @@ pub(crate) fn apply_codex_concrete_account_profile_to_request(
     provider_request_body: &mut Value,
     profile: &CodexConcreteAccountProfile,
 ) {
+    apply_codex_concrete_account_profile_to_request_with_body_policy(
+        provider_request_headers,
+        provider_request_body,
+        profile,
+        CodexProfileRequestBodyPolicy::NormalizeClientMetadata,
+    );
+}
+
+pub(crate) fn apply_codex_concrete_account_profile_to_request_with_body_policy(
+    provider_request_headers: &mut BTreeMap<String, String>,
+    provider_request_body: &mut Value,
+    profile: &CodexConcreteAccountProfile,
+    body_policy: CodexProfileRequestBodyPolicy,
+) {
     provider_request_headers.insert("user-agent".to_string(), profile.user_agent.clone());
     provider_request_headers.insert("originator".to_string(), profile.originator.clone());
 
     normalize_installation_id_in_headers(provider_request_headers, &profile.installation_id);
-    normalize_installation_id_in_body(provider_request_body, &profile.installation_id);
+    match body_policy {
+        CodexProfileRequestBodyPolicy::NormalizeClientMetadata => {
+            normalize_installation_id_in_body(provider_request_body, &profile.installation_id);
+        }
+        CodexProfileRequestBodyPolicy::StripClientMetadata => {
+            strip_codex_client_metadata_from_body(provider_request_body);
+        }
+    }
 }
 
 fn normalize_installation_id_in_headers(
@@ -237,6 +264,13 @@ fn normalize_installation_id_in_headers(
             .unwrap_or(metadata);
         provider_request_headers.insert(header_name, rewritten);
     }
+}
+
+pub(crate) fn strip_codex_client_metadata_from_body(provider_request_body: &mut Value) {
+    let Some(body) = provider_request_body.as_object_mut() else {
+        return;
+    };
+    body.remove("client_metadata");
 }
 
 fn normalize_installation_id_in_body(provider_request_body: &mut Value, installation_id: &str) {

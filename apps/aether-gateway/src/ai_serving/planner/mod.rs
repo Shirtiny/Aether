@@ -64,8 +64,9 @@ pub(crate) use self::specialized::{
     set_local_openai_image_execution_exhausted_diagnostic,
 };
 pub(crate) use self::standard::{
-    apply_codex_pool_concrete_account_profile, apply_codex_pool_stable_client_headers,
-    build_local_openai_chat_stream_attempt_source_for_kind,
+    apply_codex_pool_concrete_account_profile,
+    apply_codex_pool_concrete_account_profile_for_api_format,
+    apply_codex_pool_stable_client_headers, build_local_openai_chat_stream_attempt_source_for_kind,
     build_local_openai_chat_stream_plan_and_reports_for_kind,
     build_local_openai_chat_sync_attempt_source_for_kind,
     build_local_openai_chat_sync_plan_and_reports_for_kind,

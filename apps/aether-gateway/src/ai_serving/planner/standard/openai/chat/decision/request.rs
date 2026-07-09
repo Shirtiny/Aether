@@ -22,10 +22,10 @@ use crate::ai_serving::planner::redaction::{
 };
 use crate::ai_serving::planner::standard::{
     apply_codex_openai_responses_special_body_edits, apply_codex_openai_responses_special_headers,
-    apply_codex_pool_concrete_account_profile, apply_deepseek_tool_call_thinking_compat,
-    build_cross_format_openai_chat_request_body, build_cross_format_openai_chat_upstream_url,
-    build_local_openai_chat_request_body, build_local_openai_chat_upstream_url,
-    request_body_build_failure_extra_data,
+    apply_codex_pool_concrete_account_profile_for_api_format,
+    apply_deepseek_tool_call_thinking_compat, build_cross_format_openai_chat_request_body,
+    build_cross_format_openai_chat_upstream_url, build_local_openai_chat_request_body,
+    build_local_openai_chat_upstream_url, request_body_build_failure_extra_data,
 };
 use crate::ai_serving::transport::auth::resolve_local_openai_bearer_auth;
 use crate::ai_serving::transport::kiro::{
@@ -412,10 +412,11 @@ pub(crate) async fn resolve_local_openai_chat_candidate_payload_parts(
             Some(trace_id),
             transport.key.decrypted_auth_config.as_deref(),
         );
-        apply_codex_pool_concrete_account_profile(
+        apply_codex_pool_concrete_account_profile_for_api_format(
             &mut provider_request_headers,
             &mut provider_request_body,
             transport,
+            provider_api_format.as_ref(),
         );
         let (execution_strategy, conversion_mode) =
             ai_local_execution_contract_for_formats("openai:chat", "openai:chat");
@@ -759,10 +760,11 @@ pub(crate) async fn resolve_local_openai_chat_candidate_payload_parts(
         Some(trace_id),
         transport.key.decrypted_auth_config.as_deref(),
     );
-    apply_codex_pool_concrete_account_profile(
+    apply_codex_pool_concrete_account_profile_for_api_format(
         &mut provider_request_headers,
         &mut provider_request_body,
         transport,
+        provider_api_format.as_ref(),
     );
     request_identity_response_encoding_when_redacted(
         &mut provider_request_headers,
@@ -916,10 +918,11 @@ async fn build_gemini_cli_openai_chat_cross_format_payload_parts(
         Some(trace_id),
         resolved.transport.key.decrypted_auth_config.as_deref(),
     );
-    apply_codex_pool_concrete_account_profile(
+    apply_codex_pool_concrete_account_profile_for_api_format(
         &mut provider_request_headers,
         &mut provider_request_body,
         &resolved.transport,
+        provider_api_format.as_ref(),
     );
     request_identity_response_encoding_when_redacted(
         &mut provider_request_headers,
@@ -1102,10 +1105,11 @@ async fn resolve_openai_chat_to_openai_image_payload_parts(
             Some(trace_id),
             transport.key.decrypted_auth_config.as_deref(),
         );
-        apply_codex_pool_concrete_account_profile(
+        apply_codex_pool_concrete_account_profile_for_api_format(
             &mut provider_request_headers,
             &mut provider_request_body,
             transport,
+            provider_api_format.as_ref(),
         );
     }
 
