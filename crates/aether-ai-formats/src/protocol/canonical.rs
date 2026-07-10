@@ -4597,6 +4597,64 @@ pub(crate) fn canonical_response_format_to_openai(value: &CanonicalResponseForma
     Value::Object(output)
 }
 
+fn openai_usage_detail_token(usage: &Map<String, Value>, key: &str) -> Option<u64> {
+    ["input_tokens_details", "prompt_tokens_details"]
+        .iter()
+        .find_map(|details_key| {
+            usage
+                .get(*details_key)
+                .and_then(Value::as_object)
+                .and_then(|details| details.get(key))
+                .and_then(Value::as_u64)
+                .filter(|tokens| *tokens > 0)
+        })
+}
+
+fn openai_usage_cache_read_tokens(usage: &Map<String, Value>) -> u64 {
+    openai_usage_detail_token(usage, "cached_tokens")
+        .or_else(|| {
+            [
+                "cache_read_input_tokens",
+                "cache_read_tokens",
+                "cached_tokens",
+            ]
+            .iter()
+            .find_map(|key| {
+                usage
+                    .get(*key)
+                    .and_then(Value::as_u64)
+                    .filter(|tokens| *tokens > 0)
+            })
+        })
+        .unwrap_or(0)
+}
+
+fn openai_usage_cache_write_tokens(usage: &Map<String, Value>) -> u64 {
+    [
+        "cache_write_tokens",
+        "cache_creation_tokens",
+        "cached_creation_tokens",
+    ]
+    .iter()
+    .find_map(|key| openai_usage_detail_token(usage, key))
+    .or_else(|| {
+        [
+            "cache_write_tokens",
+            "cache_creation_input_tokens",
+            "cache_write_input_tokens",
+            "cache_creation_tokens",
+        ]
+        .iter()
+        .find_map(|key| {
+            usage
+                .get(*key)
+                .and_then(Value::as_u64)
+                .filter(|tokens| *tokens > 0)
+        })
+    })
+    .unwrap_or(0)
+}
+
 pub(crate) fn openai_usage_to_canonical(value: Option<&Value>) -> Option<CanonicalUsage> {
     let usage = value?.as_object()?;
     let input_tokens = usage
@@ -4616,24 +4674,8 @@ pub(crate) fn openai_usage_to_canonical(value: Option<&Value>) -> Option<Canonic
         .and_then(|details| details.get("reasoning_tokens"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    let cache_read_tokens = usage
-        .get("prompt_tokens_details")
-        .or_else(|| usage.get("input_tokens_details"))
-        .and_then(Value::as_object)
-        .and_then(|details| details.get("cached_tokens"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let cache_write_tokens = usage
-        .get("prompt_tokens_details")
-        .or_else(|| usage.get("input_tokens_details"))
-        .and_then(Value::as_object)
-        .and_then(|details| {
-            details
-                .get("cached_creation_tokens")
-                .or_else(|| details.get("cache_creation_tokens"))
-        })
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
+    let cache_read_tokens = openai_usage_cache_read_tokens(usage);
+    let cache_write_tokens = openai_usage_cache_write_tokens(usage);
     Some(CanonicalUsage {
         input_tokens,
         input_tokens_include_cache: cache_read_tokens > 0 || cache_write_tokens > 0,
@@ -4781,7 +4823,7 @@ pub(crate) fn canonical_usage_to_openai(value: &CanonicalUsage) -> Value {
         if output.get("prompt_tokens_details").is_none() {
             output["prompt_tokens_details"] = json!({});
         }
-        output["prompt_tokens_details"]["cached_creation_tokens"] =
+        output["prompt_tokens_details"]["cache_write_tokens"] =
             Value::from(value.cache_write_tokens);
     }
     output
@@ -4809,7 +4851,7 @@ pub(crate) fn canonical_usage_to_openai_responses_usage(value: &CanonicalUsage) 
         if output.get("input_tokens_details").is_none() {
             output["input_tokens_details"] = json!({});
         }
-        output["input_tokens_details"]["cached_creation_tokens"] =
+        output["input_tokens_details"]["cache_write_tokens"] =
             Value::from(value.cache_write_tokens);
     }
     output
@@ -5306,6 +5348,36 @@ mod tests {
         CanonicalEmbeddingInput, CanonicalEmbeddingRequest, CanonicalRole, CanonicalUsage,
     };
     use serde_json::{json, Value};
+
+    #[test]
+    fn openai_usage_preserves_official_cache_write_tokens_across_formats() {
+        let usage = super::openai_usage_to_canonical(Some(&json!({
+            "input_tokens": 100,
+            "output_tokens": 5,
+            "total_tokens": 105,
+            "cache_creation_input_tokens": 19,
+            "input_tokens_details": {
+                "cached_tokens": 11,
+                "cache_write_tokens": 7
+            }
+        })))
+        .expect("usage should parse");
+
+        assert_eq!(usage.cache_read_tokens, 11);
+        assert_eq!(usage.cache_write_tokens, 7);
+        assert!(usage.input_tokens_include_cache);
+
+        let responses = super::canonical_usage_to_openai_responses_usage(&usage);
+        assert_eq!(responses["input_tokens_details"]["cached_tokens"], 11);
+        assert_eq!(responses["input_tokens_details"]["cache_write_tokens"], 7);
+        assert!(responses["input_tokens_details"]
+            .get("cached_creation_tokens")
+            .is_none());
+
+        let chat = super::canonical_usage_to_openai(&usage);
+        assert_eq!(chat["prompt_tokens_details"]["cached_tokens"], 11);
+        assert_eq!(chat["prompt_tokens_details"]["cache_write_tokens"], 7);
+    }
 
     #[test]
     fn canonical_embedding_request_accepts_axonhub_input_shapes() {
@@ -6399,7 +6471,7 @@ mod tests {
             3
         );
         assert_eq!(
-            rebuilt_openai["usage"]["input_tokens_details"]["cached_creation_tokens"],
+            rebuilt_openai["usage"]["input_tokens_details"]["cache_write_tokens"],
             2
         );
         assert_eq!(rebuilt_openai["usage"]["total_tokens"], 23);

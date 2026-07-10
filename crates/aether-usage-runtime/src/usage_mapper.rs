@@ -26,6 +26,10 @@ impl UsageMapper {
             }
         }
 
+        if api_family(api_format).as_str() == "openai" {
+            apply_openai_cache_token_aliases(raw_usage, &mut usage);
+        }
+
         derive_missing_input_tokens(raw_usage, api_format, &mut usage);
         copy_explicit_total_tokens(raw_usage, api_format, &mut usage);
         normalize_reasoning_output_tokens(&mut usage);
@@ -43,6 +47,44 @@ impl UsageMapper {
             apply_openai_image_response_dimensions(response, &mut usage);
         }
         usage
+    }
+}
+
+fn first_positive_i64_path(value: &serde_json::Value, paths: &[&str]) -> Option<i64> {
+    paths
+        .iter()
+        .find_map(|path| numeric_i64(get_nested_value(value, path)).filter(|tokens| *tokens > 0))
+}
+
+fn apply_openai_cache_token_aliases(raw_usage: &serde_json::Value, usage: &mut StandardizedUsage) {
+    if let Some(tokens) = first_positive_i64_path(
+        raw_usage,
+        &[
+            "input_tokens_details.cache_write_tokens",
+            "prompt_tokens_details.cache_write_tokens",
+            "input_tokens_details.cache_creation_tokens",
+            "prompt_tokens_details.cache_creation_tokens",
+            "input_tokens_details.cached_creation_tokens",
+            "prompt_tokens_details.cached_creation_tokens",
+            "cache_write_tokens",
+            "cache_creation_input_tokens",
+            "cache_write_input_tokens",
+            "cache_creation_tokens",
+        ],
+    ) {
+        usage.cache_creation_tokens = tokens;
+    }
+    if let Some(tokens) = first_positive_i64_path(
+        raw_usage,
+        &[
+            "input_tokens_details.cached_tokens",
+            "prompt_tokens_details.cached_tokens",
+            "cache_read_input_tokens",
+            "cache_read_tokens",
+            "cached_tokens",
+        ],
+    ) {
+        usage.cache_read_tokens = tokens;
     }
 }
 
@@ -364,6 +406,27 @@ mod tests {
         assert_eq!(usage.cache_read_tokens, 2);
         assert_eq!(usage.reasoning_tokens, 3);
         assert_eq!(usage.reasoning_output_tokens, 3);
+    }
+
+    #[test]
+    fn maps_official_openai_cache_write_tokens_before_compat_aliases() {
+        let usage = map_usage(
+            &serde_json::json!({
+                "input_tokens": 100,
+                "output_tokens": 5,
+                "cache_creation_input_tokens": 19,
+                "input_tokens_details": {
+                    "cached_tokens": 11,
+                    "cache_write_tokens": 7
+                }
+            }),
+            "openai:responses",
+        );
+
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.output_tokens, 5);
+        assert_eq!(usage.cache_creation_tokens, 7);
+        assert_eq!(usage.cache_read_tokens, 11);
     }
 
     #[test]

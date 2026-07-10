@@ -190,6 +190,28 @@ mod tests {
     }
 
     #[test]
+    fn chat_and_responses_conversion_preserves_explicit_false_parallel_tool_calls() {
+        let chat = json!({
+            "model": "gpt-5.6-sol",
+            "messages": [{"role": "user", "content": "hello"}],
+            "parallel_tool_calls": false,
+        });
+
+        let responses = convert_openai_chat_request_to_openai_responses_request(
+            &chat,
+            "gpt-5.6-sol",
+            false,
+            false,
+        )
+        .expect("responses request");
+        assert_eq!(responses["parallel_tool_calls"], false);
+
+        let chat_again = normalize_openai_responses_request_to_openai_chat_request(&responses)
+            .expect("openai chat request");
+        assert_eq!(chat_again["parallel_tool_calls"], false);
+    }
+
+    #[test]
     fn pairwise_request_helper_keeps_claude_shape() {
         let body = json!({
             "model": "gpt-source",

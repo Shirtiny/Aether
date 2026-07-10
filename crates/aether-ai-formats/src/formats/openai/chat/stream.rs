@@ -2901,6 +2901,24 @@ mod tests {
     }
 
     #[test]
+    fn openai_usage_prefers_official_nested_cache_write_tokens() {
+        let usage = canonical_usage_from_openai_usage(Some(&json!({
+            "input_tokens": 100,
+            "output_tokens": 5,
+            "cache_creation_input_tokens": 19,
+            "input_tokens_details": {
+                "cached_tokens": 11,
+                "cache_write_tokens": 7
+            }
+        })))
+        .expect("usage should parse");
+
+        assert_eq!(usage.cache_creation_tokens, 7);
+        assert_eq!(usage.cache_read_tokens, 11);
+        assert!(usage.input_tokens_include_cache);
+    }
+
+    #[test]
     fn openai_usage_accepts_reasoning_output_tokens() {
         let usage = canonical_usage_from_openai_usage(Some(&json!({
             "input_tokens": 26,
@@ -3938,7 +3956,7 @@ mod tests {
         assert!(sse.contains("\"completion_tokens\":2"));
         assert!(sse.contains("\"prompt_tokens_details\":"));
         assert!(sse.contains("\"cached_tokens\":4"));
-        assert!(sse.contains("\"cached_creation_tokens\":5"));
+        assert!(sse.contains("\"cache_write_tokens\":5"));
         assert!(sse.contains("\"completion_tokens_details\":{\"reasoning_tokens\":1}"));
         assert!(sse.contains("\"total_tokens\":3"));
         assert!(sse.contains("data: [DONE]\n\n"));
@@ -4062,7 +4080,7 @@ mod tests {
         assert!(sse.contains("\"text\":\"because\""));
         assert!(sse.contains("\"input_tokens_details\":"));
         assert!(sse.contains("\"cached_tokens\":4"));
-        assert!(sse.contains("\"cached_creation_tokens\":5"));
+        assert!(sse.contains("\"cache_write_tokens\":5"));
         assert!(sse.contains("\"output_tokens_details\":{\"reasoning_tokens\":1}"));
     }
 

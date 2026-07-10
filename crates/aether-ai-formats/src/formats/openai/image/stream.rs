@@ -9,7 +9,8 @@ use crate::formats::openai::responses::codex::CODEX_OPENAI_IMAGE_DEFAULT_OUTPUT_
 use crate::formats::shared::sse::{encode_done_sse, encode_json_sse};
 use crate::formats::shared::stream_core::common::{
     build_openai_chat_chunk, build_openai_chat_finish_chunk,
-    build_openai_chat_usage_chunk_with_cache,
+    build_openai_chat_usage_chunk_with_cache, openai_cache_creation_tokens,
+    openai_cache_read_tokens,
 };
 use crate::formats::shared::AiSurfaceFinalizeError;
 
@@ -844,30 +845,9 @@ fn openai_image_usage_to_standardized_usage(value: &Value) -> Option<Standardize
         .or_else(|| usage.get("completion_tokens"))
         .and_then(Value::as_i64)
         .unwrap_or(0);
-    let cache_creation_tokens = usage
-        .get("cache_creation_input_tokens")
-        .and_then(Value::as_i64)
-        .or_else(|| {
-            usage
-                .get("input_tokens_details")
-                .or_else(|| usage.get("prompt_tokens_details"))
-                .and_then(Value::as_object)
-                .and_then(|details| details.get("cached_creation_tokens"))
-                .and_then(Value::as_i64)
-        })
-        .unwrap_or(0);
-    let cache_read_tokens = usage
-        .get("cache_read_input_tokens")
-        .and_then(Value::as_i64)
-        .or_else(|| {
-            usage
-                .get("input_tokens_details")
-                .or_else(|| usage.get("prompt_tokens_details"))
-                .and_then(Value::as_object)
-                .and_then(|details| details.get("cached_tokens"))
-                .and_then(Value::as_i64)
-        })
-        .unwrap_or(0);
+    let cache_creation_tokens =
+        i64::try_from(openai_cache_creation_tokens(usage)).unwrap_or(i64::MAX);
+    let cache_read_tokens = i64::try_from(openai_cache_read_tokens(usage)).unwrap_or(i64::MAX);
     let total_tokens = usage.get("total_tokens").and_then(Value::as_i64).unwrap_or(
         input_tokens
             .saturating_add(output_tokens)
@@ -921,30 +901,8 @@ fn openai_image_chat_usage_counts(usage: Option<&Value>) -> Option<(u64, u64, u6
         .or_else(|| usage.get("completion_tokens"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    let cache_creation_tokens = usage
-        .get("cache_creation_input_tokens")
-        .and_then(Value::as_u64)
-        .or_else(|| {
-            usage
-                .get("input_tokens_details")
-                .or_else(|| usage.get("prompt_tokens_details"))
-                .and_then(Value::as_object)
-                .and_then(|details| details.get("cached_creation_tokens"))
-                .and_then(Value::as_u64)
-        })
-        .unwrap_or(0);
-    let cache_read_tokens = usage
-        .get("cache_read_input_tokens")
-        .and_then(Value::as_u64)
-        .or_else(|| {
-            usage
-                .get("input_tokens_details")
-                .or_else(|| usage.get("prompt_tokens_details"))
-                .and_then(Value::as_object)
-                .and_then(|details| details.get("cached_tokens"))
-                .and_then(Value::as_u64)
-        })
-        .unwrap_or(0);
+    let cache_creation_tokens = openai_cache_creation_tokens(usage);
+    let cache_read_tokens = openai_cache_read_tokens(usage);
     let total_tokens = usage
         .get("total_tokens")
         .and_then(Value::as_u64)

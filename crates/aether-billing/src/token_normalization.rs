@@ -27,18 +27,21 @@ fn parse_api_family(api_format: Option<&str>) -> ApiFamily {
 pub fn normalize_input_tokens_for_billing(
     api_format: Option<&str>,
     input_tokens: i64,
+    cache_creation_tokens: i64,
     cache_read_tokens: i64,
 ) -> i64 {
     if input_tokens <= 0 {
         return input_tokens.max(0);
     }
-    if cache_read_tokens <= 0 {
+    if cache_creation_tokens <= 0 && cache_read_tokens <= 0 {
         return input_tokens;
     }
 
     match parse_api_family(api_format) {
         ApiFamily::Claude => input_tokens,
-        ApiFamily::OpenAi | ApiFamily::Gemini => (input_tokens - cache_read_tokens).max(0),
+        ApiFamily::OpenAi | ApiFamily::Gemini => {
+            (input_tokens - cache_creation_tokens.max(0) - cache_read_tokens.max(0)).max(0)
+        }
         ApiFamily::Unknown => input_tokens,
     }
 }
@@ -54,24 +57,19 @@ pub fn normalize_total_input_context_for_cache_hit_rate(
     let normalized_cache_read_tokens = cache_read_tokens.max(0);
 
     let fresh_input_tokens = match parse_api_family(api_format) {
-        ApiFamily::Claude => {
-            normalized_input_tokens.saturating_add(normalized_cache_creation_tokens)
-        }
+        ApiFamily::Claude => normalized_input_tokens,
         ApiFamily::OpenAi | ApiFamily::Gemini => normalize_input_tokens_for_billing(
             api_format,
             normalized_input_tokens,
+            normalized_cache_creation_tokens,
             normalized_cache_read_tokens,
         ),
-        ApiFamily::Unknown => {
-            if normalized_cache_creation_tokens > 0 {
-                normalized_input_tokens.saturating_add(normalized_cache_creation_tokens)
-            } else {
-                normalized_input_tokens
-            }
-        }
+        ApiFamily::Unknown => normalized_input_tokens,
     };
 
-    fresh_input_tokens.saturating_add(normalized_cache_read_tokens)
+    fresh_input_tokens
+        .saturating_add(normalized_cache_creation_tokens)
+        .saturating_add(normalized_cache_read_tokens)
 }
 
 #[cfg(test)]
@@ -83,19 +81,19 @@ mod tests {
     #[test]
     fn subtracts_cache_tokens_for_openai_and_gemini() {
         assert_eq!(
-            normalize_input_tokens_for_billing(Some("openai:chat"), 100, 20),
-            80
+            normalize_input_tokens_for_billing(Some("openai:chat"), 100, 15, 20),
+            65
         );
         assert_eq!(
-            normalize_input_tokens_for_billing(Some("gemini:generate_content"), 100, 20),
-            80
+            normalize_input_tokens_for_billing(Some("gemini:generate_content"), 100, 15, 20),
+            65
         );
     }
 
     #[test]
     fn keeps_input_tokens_for_claude() {
         assert_eq!(
-            normalize_input_tokens_for_billing(Some("claude:messages"), 100, 20),
+            normalize_input_tokens_for_billing(Some("claude:messages"), 100, 15, 20),
             100
         );
     }

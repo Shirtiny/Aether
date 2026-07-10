@@ -2975,10 +2975,16 @@ fn apply_explicit_request_cache_usage(value: &Value, usage: &mut EstimatedReques
     usage.cache_creation_tokens = first_positive_u64_path(
         value,
         &[
-            &["cache_creation_input_tokens"],
-            &["cache_creation_tokens"],
+            &["input_tokens_details", "cache_write_tokens"],
+            &["prompt_tokens_details", "cache_write_tokens"],
+            &["input_tokens_details", "cache_creation_tokens"],
+            &["prompt_tokens_details", "cache_creation_tokens"],
             &["input_tokens_details", "cached_creation_tokens"],
             &["prompt_tokens_details", "cached_creation_tokens"],
+            &["cache_write_tokens"],
+            &["cache_creation_input_tokens"],
+            &["cache_write_input_tokens"],
+            &["cache_creation_tokens"],
         ],
     )
     .unwrap_or_default();

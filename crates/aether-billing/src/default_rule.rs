@@ -23,6 +23,14 @@ impl DefaultBillingRuleGenerator {
         pricing: &BillingModelPricingSnapshot,
         task_type: &str,
     ) -> Option<VirtualBillingRule> {
+        Self::generate_for_pricing_and_service_tier(pricing, task_type, None)
+    }
+
+    pub fn generate_for_pricing_and_service_tier(
+        pricing: &BillingModelPricingSnapshot,
+        task_type: &str,
+        service_tier: Option<&str>,
+    ) -> Option<VirtualBillingRule> {
         let pricing_config = pricing.effective_tiered_pricing();
         let tiers = pricing
             .effective_tiered_pricing()
@@ -49,12 +57,35 @@ impl DefaultBillingRuleGenerator {
         }
 
         let first_tier = tiers.first().cloned().unwrap_or_else(|| json!({}));
-        let base_input_price = tier_value(&first_tier, "input_price_per_1m", 0.0);
-        let base_output_price = tier_value(&first_tier, "output_price_per_1m", 0.0);
-        let base_cache_creation_price =
-            tier_value_with_fallback(&first_tier, "cache_creation_price_per_1m", 1.25);
-        let base_cache_read_price =
-            tier_value_with_fallback(&first_tier, "cache_read_price_per_1m", 0.1);
+        let input_price_key = service_tier_price_key("input_price_per_1m", service_tier);
+        let output_price_key = service_tier_price_key("output_price_per_1m", service_tier);
+        let cache_creation_price_key =
+            service_tier_price_key("cache_creation_price_per_1m", service_tier);
+        let cache_read_price_key = service_tier_price_key("cache_read_price_per_1m", service_tier);
+        let base_input_price = tier_value_with_service_fallback(
+            &first_tier,
+            &input_price_key,
+            "input_price_per_1m",
+            None,
+        );
+        let base_output_price = tier_value_with_service_fallback(
+            &first_tier,
+            &output_price_key,
+            "output_price_per_1m",
+            None,
+        );
+        let base_cache_creation_price = tier_value_with_service_fallback(
+            &first_tier,
+            &cache_creation_price_key,
+            "cache_creation_price_per_1m",
+            Some((input_price_key.as_str(), 1.25)),
+        );
+        let base_cache_read_price = tier_value_with_service_fallback(
+            &first_tier,
+            &cache_read_price_key,
+            "cache_read_price_per_1m",
+            Some((input_price_key.as_str(), 0.1)),
+        );
         let base_request_price = pricing.effective_price_per_request().unwrap_or(0.0);
 
         let mut variables = BTreeMap::new();
@@ -171,7 +202,7 @@ impl DefaultBillingRuleGenerator {
                     "source": "tiered",
                     "tier_key": "total_input_context",
                     "allow_zero": true,
-                    "tiers": build_tier_entries(&tiers, "input_price_per_1m", None, false),
+                    "tiers": build_tier_entries(&tiers, &input_price_key, "input_price_per_1m", None, false),
                     "default": base_input_price,
                 }),
             );
@@ -181,7 +212,7 @@ impl DefaultBillingRuleGenerator {
                     "source": "tiered",
                     "tier_key": "total_input_context",
                     "allow_zero": true,
-                    "tiers": build_tier_entries(&tiers, "output_price_per_1m", None, false),
+                    "tiers": build_tier_entries(&tiers, &output_price_key, "output_price_per_1m", None, false),
                     "default": base_output_price,
                 }),
             );
@@ -192,8 +223,8 @@ impl DefaultBillingRuleGenerator {
                     "tier_key": "total_input_context",
                     "allow_zero": true,
                     "ttl_key": "cache_ttl_minutes",
-                    "ttl_value_key": "cache_creation_price_per_1m",
-                    "tiers": build_tier_entries(&tiers, "cache_creation_price_per_1m", Some(1.25), true),
+                    "ttl_value_key": cache_creation_price_key,
+                    "tiers": build_tier_entries(&tiers, &cache_creation_price_key, "cache_creation_price_per_1m", Some((&input_price_key, 1.25)), true),
                     "default": base_cache_creation_price,
                 }),
             );
@@ -204,8 +235,8 @@ impl DefaultBillingRuleGenerator {
                     "tier_key": "total_input_context",
                     "allow_zero": true,
                     "ttl_key": "cache_creation_ephemeral_5m_ttl_minutes",
-                    "ttl_value_key": "cache_creation_price_per_1m",
-                    "tiers": build_tier_entries(&tiers, "cache_creation_price_per_1m", Some(1.25), true),
+                    "ttl_value_key": cache_creation_price_key,
+                    "tiers": build_tier_entries(&tiers, &cache_creation_price_key, "cache_creation_price_per_1m", Some((&input_price_key, 1.25)), true),
                     "default": base_cache_creation_price,
                 }),
             );
@@ -216,8 +247,8 @@ impl DefaultBillingRuleGenerator {
                     "tier_key": "total_input_context",
                     "allow_zero": true,
                     "ttl_key": "cache_creation_ephemeral_1h_ttl_minutes",
-                    "ttl_value_key": "cache_creation_price_per_1m",
-                    "tiers": build_tier_entries(&tiers, "cache_creation_price_per_1m", Some(1.25), true),
+                    "ttl_value_key": cache_creation_price_key,
+                    "tiers": build_tier_entries(&tiers, &cache_creation_price_key, "cache_creation_price_per_1m", Some((&input_price_key, 1.25)), true),
                     "default": base_cache_creation_price,
                 }),
             );
@@ -228,8 +259,8 @@ impl DefaultBillingRuleGenerator {
                     "tier_key": "total_input_context",
                     "allow_zero": true,
                     "ttl_key": "cache_ttl_minutes",
-                    "ttl_value_key": "cache_read_price_per_1m",
-                    "tiers": build_tier_entries(&tiers, "cache_read_price_per_1m", Some(0.1), true),
+                    "ttl_value_key": cache_read_price_key,
+                    "tiers": build_tier_entries(&tiers, &cache_read_price_key, "cache_read_price_per_1m", Some((&input_price_key, 0.1)), true),
                     "default": base_cache_read_price,
                 }),
             );
@@ -255,24 +286,49 @@ pub fn normalize_task_type(task_type: &str) -> &str {
     }
 }
 
-fn tier_value(tier: &Value, key: &str, default: f64) -> f64 {
-    tier.get(key).and_then(Value::as_f64).unwrap_or(default)
+fn service_tier_price_key(base_key: &str, service_tier: Option<&str>) -> String {
+    let suffix = match service_tier
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("priority") => Some("priority"),
+        Some("flex") => Some("flex"),
+        Some("batch" | "batches") => Some("batches"),
+        _ => None,
+    };
+    suffix
+        .map(|suffix| format!("{base_key}_{suffix}"))
+        .unwrap_or_else(|| base_key.to_string())
 }
 
-fn tier_value_with_fallback(tier: &Value, key: &str, default_multiplier: f64) -> f64 {
-    if let Some(value) = tier.get(key).and_then(Value::as_f64) {
+fn tier_value_with_service_fallback(
+    tier: &Value,
+    selected_key: &str,
+    base_key: &str,
+    input_fallback: Option<(&str, f64)>,
+) -> f64 {
+    if let Some(value) = tier.get(selected_key).and_then(Value::as_f64) {
         return value;
     }
-    tier.get("input_price_per_1m")
-        .and_then(Value::as_f64)
-        .map(|value| value * default_multiplier)
+    if let Some(value) = tier.get(base_key).and_then(Value::as_f64) {
+        return value;
+    }
+    input_fallback
+        .and_then(|(input_key, multiplier)| {
+            tier.get(input_key)
+                .and_then(Value::as_f64)
+                .or_else(|| tier.get("input_price_per_1m").and_then(Value::as_f64))
+                .map(|value| value * multiplier)
+        })
         .unwrap_or(0.0)
 }
 
 fn build_tier_entries(
     tiers: &[Value],
-    key: &str,
-    default_multiplier: Option<f64>,
+    selected_key: &str,
+    base_key: &str,
+    input_fallback: Option<(&str, f64)>,
     include_cache_ttl_pricing: bool,
 ) -> Vec<Value> {
     tiers
@@ -283,10 +339,12 @@ fn build_tier_entries(
                 "up_to".to_string(),
                 tier.get("up_to").cloned().unwrap_or(Value::Null),
             );
-            let resolved = match default_multiplier {
-                Some(multiplier) => Value::from(tier_value_with_fallback(tier, key, multiplier)),
-                None => Value::from(tier_value(tier, key, 0.0)),
-            };
+            let resolved = Value::from(tier_value_with_service_fallback(
+                tier,
+                selected_key,
+                base_key,
+                input_fallback,
+            ));
             value.insert("value".to_string(), resolved);
             if include_cache_ttl_pricing {
                 if let Some(ttl_pricing) = tier.get("cache_ttl_pricing").cloned() {

@@ -1,4 +1,7 @@
 use aether_data_contracts::repository::billing::StoredBillingModelContext;
+use aether_data_contracts::repository::usage::{
+    extract_provider_service_tier_from_body, PROVIDER_SERVICE_TIER_METADATA_KEY,
+};
 use aether_data_contracts::DataLayerError;
 use aether_usage_runtime::{UsageEvent, UsageEventType};
 use async_trait::async_trait;
@@ -155,6 +158,7 @@ fn calculate_billing_computation(
             .endpoint_api_format
             .clone()
             .or_else(|| event.data.api_format.clone()),
+        service_tier: usage_event_service_tier(&event.data),
         request_count,
         input_tokens: event.data.input_tokens.unwrap_or_default() as i64,
         output_tokens: event.data.output_tokens.unwrap_or_default() as i64,
@@ -179,6 +183,25 @@ fn calculate_billing_computation(
         .calculate(pricing, &input)
         .map_err(|err| {
             DataLayerError::UnexpectedValue(format!("billing calculation failed: {err}"))
+        })
+}
+
+fn usage_event_service_tier(data: &aether_usage_runtime::UsageEventData) -> Option<String> {
+    data.request_metadata
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|metadata| metadata.get(PROVIDER_SERVICE_TIER_METADATA_KEY))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
+        .or_else(|| extract_provider_service_tier_from_body(data.provider_request_body.as_ref()))
+        .or_else(|| {
+            data.request_type
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| value.eq_ignore_ascii_case("batch"))
+                .map(|_| "batches".to_string())
         })
 }
 
@@ -471,6 +494,79 @@ mod tests {
                 .and_then(|value| value.get("status"))
                 .and_then(Value::as_str),
             Some("complete")
+        );
+    }
+
+    #[tokio::test]
+    async fn enriches_gpt56_priority_usage_with_official_fallback_prices() {
+        let lookup = TestLookup {
+            name_context: Some(
+                StoredBillingModelContext::new(
+                    "provider-1".to_string(),
+                    Some("pay_as_you_go".to_string()),
+                    Some("key-1".to_string()),
+                    None,
+                    None,
+                    "global-gpt56-sol".to_string(),
+                    "gpt-5.6-sol".to_string(),
+                    None,
+                    None,
+                    None,
+                    Some("model-gpt56-sol".to_string()),
+                    Some("gpt-5.6-sol".to_string()),
+                    None,
+                    None,
+                    None,
+                )
+                .expect("billing context should build"),
+            ),
+            model_id_context: None,
+        };
+        let mut event = UsageEvent::new(
+            UsageEventType::Completed,
+            "req-gpt56-priority",
+            UsageEventData {
+                provider_name: "OpenAI".to_string(),
+                model: "gpt-5.6-sol".to_string(),
+                provider_id: Some("provider-1".to_string()),
+                provider_api_key_id: Some("key-1".to_string()),
+                request_type: Some("chat".to_string()),
+                api_format: Some("openai:responses".to_string()),
+                endpoint_api_format: Some("openai:responses".to_string()),
+                input_tokens: Some(1_000),
+                output_tokens: Some(50),
+                cache_creation_input_tokens: Some(200),
+                cache_read_input_tokens: Some(100),
+                request_metadata: Some(json!({
+                    "provider_service_tier": "priority"
+                })),
+                status_code: Some(200),
+                ..UsageEventData::default()
+            },
+        );
+
+        enrich_usage_event_with_billing(&lookup, &mut event)
+            .await
+            .expect("billing should succeed");
+
+        assert_eq!(event.data.total_cost_usd, Some(0.0126));
+        assert_eq!(event.data.actual_total_cost_usd, Some(0.0126));
+        let metadata = event.data.request_metadata.as_ref().expect("metadata");
+        assert_eq!(
+            metadata["settlement_snapshot"]["pricing_snapshot"]["pricing_source"],
+            "official_fallback"
+        );
+        assert_eq!(
+            metadata["billing_snapshot"]["resolved_dimensions"]["service_tier"],
+            "priority"
+        );
+        assert_eq!(
+            metadata["billing_snapshot"]["resolved_variables"]["input_price_per_1m"],
+            10.0
+        );
+        assert_eq!(
+            metadata["billing_snapshot"]["resolved_variables"]["cache_creation_price_per_1m"],
+            12.5
         );
     }
 

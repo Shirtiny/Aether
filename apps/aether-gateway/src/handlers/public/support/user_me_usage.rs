@@ -133,8 +133,15 @@ fn users_me_usage_effective_input_tokens(item: &StoredRequestUsageAudit) -> u64 
         .as_deref()
         .or(item.api_format.as_deref());
     let input_tokens = i64::try_from(item.input_tokens).unwrap_or(i64::MAX);
+    let cache_creation_tokens =
+        i64::try_from(users_me_usage_cache_creation_tokens(item)).unwrap_or(i64::MAX);
     let cache_read_tokens = i64::try_from(item.cache_read_input_tokens).unwrap_or(i64::MAX);
-    normalize_input_tokens_for_billing(api_format, input_tokens, cache_read_tokens) as u64
+    normalize_input_tokens_for_billing(
+        api_format,
+        input_tokens,
+        cache_creation_tokens,
+        cache_read_tokens,
+    ) as u64
 }
 
 fn users_me_usage_effective_unix_secs(item: &StoredRequestUsageAudit) -> u64 {
@@ -1549,6 +1556,30 @@ mod tests {
         assert_eq!(payload["effective_input_tokens"], 4941);
         assert_eq!(payload["cache_creation_input_tokens"], 687);
         assert_eq!(payload["cache_read_input_tokens"], 52873);
+    }
+
+    #[test]
+    fn user_usage_payload_excludes_openai_cache_write_from_effective_input() {
+        let item = StoredRequestUsageAudit {
+            provider_name: "OpenAI".to_string(),
+            model: "gpt-5.6-sol".to_string(),
+            api_format: Some("openai:responses".to_string()),
+            api_family: Some("openai".to_string()),
+            endpoint_api_format: Some("openai:responses".to_string()),
+            provider_api_family: Some("openai".to_string()),
+            input_tokens: 100,
+            output_tokens: 5,
+            cache_creation_input_tokens: 20,
+            cache_read_input_tokens: 30,
+            ..sample_usage("completed")
+        };
+
+        let payload = build_users_me_usage_record_payload(&item, false, &BTreeMap::new(), false);
+
+        assert_eq!(payload["input_tokens"], 100);
+        assert_eq!(payload["effective_input_tokens"], 50);
+        assert_eq!(payload["cache_creation_input_tokens"], 20);
+        assert_eq!(payload["cache_read_input_tokens"], 30);
     }
 
     #[test]

@@ -2222,6 +2222,6 @@ mod tests {
             build_user_leaderboard_items(&[item], &BTreeMap::new(), false, false, false);
 
         assert_eq!(leaderboard.len(), 1);
-        assert_eq!(leaderboard[0].tokens, 140);
+        assert_eq!(leaderboard[0].tokens, 120);
     }
 }

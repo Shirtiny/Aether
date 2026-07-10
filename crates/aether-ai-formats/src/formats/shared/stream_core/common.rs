@@ -34,6 +34,64 @@ fn usage_detail_u64(usage: &Map<String, Value>, key: &str) -> Option<u64> {
         })
 }
 
+fn openai_input_usage_detail_u64(usage: &Map<String, Value>, key: &str) -> Option<u64> {
+    ["input_tokens_details", "prompt_tokens_details"]
+        .iter()
+        .find_map(|details_key| {
+            usage
+                .get(*details_key)
+                .and_then(Value::as_object)
+                .and_then(|details| details.get(key))
+                .and_then(Value::as_u64)
+                .filter(|tokens| *tokens > 0)
+        })
+}
+
+pub(crate) fn openai_cache_creation_tokens(usage: &Map<String, Value>) -> u64 {
+    [
+        "cache_write_tokens",
+        "cache_creation_tokens",
+        "cached_creation_tokens",
+    ]
+    .iter()
+    .find_map(|key| openai_input_usage_detail_u64(usage, key))
+    .or_else(|| {
+        [
+            "cache_write_tokens",
+            "cache_creation_input_tokens",
+            "cache_write_input_tokens",
+            "cache_creation_tokens",
+        ]
+        .iter()
+        .find_map(|key| {
+            usage
+                .get(*key)
+                .and_then(Value::as_u64)
+                .filter(|tokens| *tokens > 0)
+        })
+    })
+    .unwrap_or(0)
+}
+
+pub(crate) fn openai_cache_read_tokens(usage: &Map<String, Value>) -> u64 {
+    openai_input_usage_detail_u64(usage, "cached_tokens")
+        .or_else(|| {
+            [
+                "cache_read_input_tokens",
+                "cache_read_tokens",
+                "cached_tokens",
+            ]
+            .iter()
+            .find_map(|key| {
+                usage
+                    .get(*key)
+                    .and_then(Value::as_u64)
+                    .filter(|tokens| *tokens > 0)
+            })
+        })
+        .unwrap_or(0)
+}
+
 pub fn resolve_identity(
     response_id: Option<&str>,
     model: Option<&str>,
@@ -68,30 +126,8 @@ pub fn canonical_usage_from_openai_usage(value: Option<&Value>) -> Option<Canoni
         .or_else(|| usage.get("completion_tokens"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    let cache_creation_tokens = usage
-        .get("cache_creation_input_tokens")
-        .and_then(Value::as_u64)
-        .or_else(|| {
-            usage
-                .get("input_tokens_details")
-                .or_else(|| usage.get("prompt_tokens_details"))
-                .and_then(Value::as_object)
-                .and_then(|details| details.get("cached_creation_tokens"))
-                .and_then(Value::as_u64)
-        })
-        .unwrap_or(0);
-    let cache_read_tokens = usage
-        .get("cache_read_input_tokens")
-        .and_then(Value::as_u64)
-        .or_else(|| {
-            usage
-                .get("input_tokens_details")
-                .or_else(|| usage.get("prompt_tokens_details"))
-                .and_then(Value::as_object)
-                .and_then(|details| details.get("cached_tokens"))
-                .and_then(Value::as_u64)
-        })
-        .unwrap_or(0);
+    let cache_creation_tokens = openai_cache_creation_tokens(usage);
+    let cache_read_tokens = openai_cache_read_tokens(usage);
     let reasoning_tokens = usage
         .get("reasoning_output_tokens")
         .and_then(Value::as_u64)
@@ -636,7 +672,7 @@ fn openai_chat_usage_payload(
         }
         if cache_creation_tokens > 0 {
             prompt_tokens_details.insert(
-                "cached_creation_tokens".to_string(),
+                "cache_write_tokens".to_string(),
                 Value::from(cache_creation_tokens),
             );
         }
@@ -675,7 +711,7 @@ fn insert_openai_token_details(
     }
     if cache_creation_tokens > 0 {
         details.insert(
-            "cached_creation_tokens".to_string(),
+            "cache_write_tokens".to_string(),
             Value::from(cache_creation_tokens),
         );
     }

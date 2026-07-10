@@ -1510,8 +1510,15 @@ pub fn admin_usage_effective_input_tokens(item: &StoredRequestUsageAudit) -> u64
         .as_deref()
         .or(item.api_format.as_deref());
     let input_tokens = i64::try_from(item.input_tokens).unwrap_or(i64::MAX);
+    let cache_creation_tokens =
+        i64::try_from(admin_usage_cache_creation_tokens(item)).unwrap_or(i64::MAX);
     let cache_read_tokens = i64::try_from(item.cache_read_input_tokens).unwrap_or(i64::MAX);
-    normalize_input_tokens_for_billing(api_format, input_tokens, cache_read_tokens) as u64
+    normalize_input_tokens_for_billing(
+        api_format,
+        input_tokens,
+        cache_creation_tokens,
+        cache_read_tokens,
+    ) as u64
 }
 
 pub fn admin_usage_token_cache_hit_rate(total_input_context: u64, cache_read_tokens: u64) -> f64 {
@@ -3630,6 +3637,7 @@ mod tests {
     #[test]
     fn admin_usage_record_rehydrates_cache_creation_total_from_classified_fields() {
         let item = StoredRequestUsageAudit {
+            input_tokens: 30,
             cache_creation_input_tokens: 0,
             cache_creation_ephemeral_5m_input_tokens: 12,
             cache_creation_ephemeral_1h_input_tokens: 8,
@@ -3664,7 +3672,7 @@ mod tests {
             ..sample_usage("completed", Some(200), None)
         };
 
-        assert_eq!(admin_usage_total_tokens(&item), 140);
+        assert_eq!(admin_usage_total_tokens(&item), 120);
     }
 
     #[test]

@@ -15,7 +15,8 @@ use crate::formats::openai::chat::stream::{
 use crate::formats::shared::sse::{encode_done_sse, encode_json_sse};
 use crate::formats::shared::stream_core::common::{
     build_openai_chat_chunk, build_openai_chat_finish_chunk,
-    build_openai_chat_usage_chunk_with_cache,
+    build_openai_chat_usage_chunk_with_cache, openai_cache_creation_tokens,
+    openai_cache_read_tokens,
 };
 use crate::formats::shared::stream_core::{
     CanonicalStreamFrame, StreamingStandardFormatMatrix, StreamingStandardTerminalObserver,
@@ -1102,30 +1103,9 @@ fn standardized_usage_from_openai_usage(value: &Value) -> Option<StandardizedUsa
         .or_else(|| usage.get("completion_tokens"))
         .and_then(Value::as_i64)
         .unwrap_or(0);
-    let cache_creation_tokens = usage
-        .get("cache_creation_input_tokens")
-        .and_then(Value::as_i64)
-        .or_else(|| {
-            usage
-                .get("input_tokens_details")
-                .or_else(|| usage.get("prompt_tokens_details"))
-                .and_then(Value::as_object)
-                .and_then(|details| details.get("cached_creation_tokens"))
-                .and_then(Value::as_i64)
-        })
-        .unwrap_or(0);
-    let cache_read_tokens = usage
-        .get("cache_read_input_tokens")
-        .and_then(Value::as_i64)
-        .or_else(|| {
-            usage
-                .get("input_tokens_details")
-                .or_else(|| usage.get("prompt_tokens_details"))
-                .and_then(Value::as_object)
-                .and_then(|details| details.get("cached_tokens"))
-                .and_then(Value::as_i64)
-        })
-        .unwrap_or(0);
+    let cache_creation_tokens =
+        i64::try_from(openai_cache_creation_tokens(usage)).unwrap_or(i64::MAX);
+    let cache_read_tokens = i64::try_from(openai_cache_read_tokens(usage)).unwrap_or(i64::MAX);
     let total_tokens = usage.get("total_tokens").and_then(Value::as_i64).unwrap_or(
         input_tokens
             .saturating_add(output_tokens)
@@ -1262,7 +1242,7 @@ mod tests {
                     "output_tokens": 50,
                     "input_tokens_details": {
                         "cached_tokens": 20,
-                        "cached_creation_tokens": 10
+                        "cache_write_tokens": 10
                     }
                 }
             }),
@@ -1279,7 +1259,7 @@ mod tests {
         assert!(output.contains("![generated image 2](data:image/png;base64,d29ybGQ=)"));
         assert!(output.contains("\"finish_reason\":\"stop\""));
         assert!(output.contains("\"cached_tokens\":20"));
-        assert!(output.contains("\"cached_creation_tokens\":10"));
+        assert!(output.contains("\"cache_write_tokens\":10"));
         assert!(output.contains("data: [DONE]"));
         assert!(!output.contains("image_generation.completed"));
 

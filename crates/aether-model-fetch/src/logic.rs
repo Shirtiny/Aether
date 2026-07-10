@@ -374,6 +374,9 @@ pub fn preset_models_for_provider(provider_type: &str) -> Option<Vec<Value>> {
             preset_model("claude-haiku-4-5-20251001", "anthropic", "Claude Haiku 4.5", "claude:messages"),
         ],
         "codex" => vec![
+            preset_model("gpt-5.6-sol", "openai", "GPT-5.6 Sol", "openai:responses"),
+            preset_model("gpt-5.6-terra", "openai", "GPT-5.6 Terra", "openai:responses"),
+            preset_model("gpt-5.6-luna", "openai", "GPT-5.6 Luna", "openai:responses"),
             preset_model("gpt-5.5", "openai", "GPT-5.5", "openai:responses"),
             preset_model("gpt-5.4", "openai", "GPT-5.4", "openai:responses"),
             preset_model("gpt-5.4-mini", "openai", "GPT-5.4 Mini", "openai:responses"),
@@ -1243,6 +1246,9 @@ mod tests {
         assert_eq!(
             model_ids,
             vec![
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-5.6-luna",
                 "gpt-5.5",
                 "gpt-5.4",
                 "gpt-5.4-mini",

@@ -33,9 +33,11 @@ impl BillingService {
         pricing: &BillingModelPricingSnapshot,
         input: &BillingUsageInput,
     ) -> Result<BillingComputation, ExpressionEvaluationError> {
-        let Some(rule) =
-            DefaultBillingRuleGenerator::generate_for_pricing(pricing, &input.task_type)
-        else {
+        let Some(rule) = DefaultBillingRuleGenerator::generate_for_pricing_and_service_tier(
+            pricing,
+            &input.task_type,
+            input.service_tier.as_deref(),
+        ) else {
             return Ok(BillingComputation {
                 cost_result: CostResult {
                     cost: 0.0,
@@ -133,6 +135,7 @@ fn build_dimensions(
     let normalized_input_tokens = normalize_input_tokens_for_billing(
         input.api_format.as_deref(),
         input.input_tokens,
+        input.cache_creation_tokens,
         input.cache_read_tokens,
     );
     let classified_cache_creation_tokens = input
@@ -152,6 +155,10 @@ fn build_dimensions(
     let image_output_resolution = resolve_image_output_price_resolution(pricing, input);
 
     let mut out = BTreeMap::from([
+        (
+            "service_tier".to_string(),
+            json!(input.service_tier.as_deref().unwrap_or("standard")),
+        ),
         ("input_tokens".to_string(), json!(normalized_input_tokens)),
         ("output_tokens".to_string(), json!(input.output_tokens)),
         (
@@ -615,6 +622,17 @@ mod tests {
         }
     }
 
+    fn unconfigured_gpt56_pricing(model: &str) -> BillingModelPricingSnapshot {
+        let mut pricing = pricing();
+        pricing.provider_api_key_rate_multipliers = None;
+        pricing.global_model_name = model.to_string();
+        pricing.default_price_per_request = None;
+        pricing.default_tiered_pricing = None;
+        pricing.model_price_per_request = None;
+        pricing.model_tiered_pricing = None;
+        pricing
+    }
+
     #[test]
     fn calculates_complete_snapshot_for_usage() {
         let result = BillingService::new()
@@ -623,6 +641,7 @@ mod tests {
                 &BillingUsageInput {
                     task_type: "chat".to_string(),
                     api_format: Some("openai:chat".to_string()),
+                    service_tier: None,
                     request_count: 1,
                     input_tokens: 1_000,
                     output_tokens: 500,
@@ -646,17 +665,18 @@ mod tests {
     }
 
     #[test]
-    fn openai_cache_hit_context_does_not_double_count_cache_read() {
+    fn openai_cache_context_does_not_double_count_cache_read_or_creation() {
         let result = BillingService::new()
             .calculate(
                 &pricing(),
                 &BillingUsageInput {
                     task_type: "chat".to_string(),
                     api_format: Some("openai:responses".to_string()),
+                    service_tier: None,
                     request_count: 1,
                     input_tokens: 1_000,
                     output_tokens: 10,
-                    cache_creation_tokens: 0,
+                    cache_creation_tokens: 100,
                     cache_creation_ephemeral_5m_tokens: 0,
                     cache_creation_ephemeral_1h_tokens: 0,
                     cache_read_tokens: 800,
@@ -675,7 +695,15 @@ mod tests {
                 .snapshot
                 .resolved_dimensions
                 .get("input_tokens"),
-            Some(&json!(200))
+            Some(&json!(100))
+        );
+        assert_eq!(
+            result
+                .cost_result
+                .snapshot
+                .resolved_dimensions
+                .get("cache_creation_tokens"),
+            Some(&json!(100))
         );
         assert_eq!(
             result
@@ -685,6 +713,69 @@ mod tests {
                 .get("total_input_context"),
             Some(&json!(1_000))
         );
+    }
+
+    #[test]
+    fn gpt56_official_prices_match_standard_priority_flex_and_batch_tiers() {
+        for (model, standard_cost) in [
+            ("gpt-5.6-sol", 0.0063),
+            ("gpt-5.6-terra", 0.00315),
+            ("gpt-5.6-luna", 0.00126),
+        ] {
+            for (service_tier, multiplier) in [
+                (None, 1.0),
+                (Some("priority"), 2.0),
+                (Some("flex"), 0.5),
+                (Some("batches"), 0.5),
+            ] {
+                let result = BillingService::new()
+                    .calculate(
+                        &unconfigured_gpt56_pricing(model),
+                        &BillingUsageInput {
+                            task_type: "chat".to_string(),
+                            api_format: Some("openai:responses".to_string()),
+                            service_tier: service_tier.map(str::to_string),
+                            request_count: 1,
+                            input_tokens: 1_000,
+                            output_tokens: 50,
+                            cache_creation_tokens: 200,
+                            cache_creation_ephemeral_5m_tokens: 0,
+                            cache_creation_ephemeral_1h_tokens: 0,
+                            cache_read_tokens: 100,
+                            image_count: 0,
+                            image_size: None,
+                            image_quality: None,
+                            image_output_format: None,
+                            cache_ttl_minutes: None,
+                        },
+                    )
+                    .expect("GPT-5.6 billing should calculate");
+
+                let expected = standard_cost * multiplier;
+                assert!(
+                    (result.cost_result.cost - expected).abs() < 1e-12,
+                    "{model} tier={service_tier:?}: got {}, want {expected}",
+                    result.cost_result.cost
+                );
+                assert_eq!(result.cost_result.status, BillingSnapshotStatus::Complete);
+                assert_eq!(
+                    result
+                        .cost_result
+                        .snapshot
+                        .resolved_dimensions
+                        .get("input_tokens"),
+                    Some(&json!(700))
+                );
+                assert_eq!(
+                    result
+                        .cost_result
+                        .snapshot
+                        .resolved_dimensions
+                        .get("service_tier"),
+                    Some(&json!(service_tier.unwrap_or("standard")))
+                );
+            }
+        }
     }
 
     #[test]
@@ -707,6 +798,7 @@ mod tests {
                 &BillingUsageInput {
                     task_type: "image".to_string(),
                     api_format: Some("openai:image".to_string()),
+                    service_tier: None,
                     request_count: 1,
                     input_tokens: 1_000,
                     output_tokens: 20_000,
@@ -771,6 +863,7 @@ mod tests {
                 &BillingUsageInput {
                     task_type: "image".to_string(),
                     api_format: Some("openai:image".to_string()),
+                    service_tier: None,
                     request_count: 1,
                     input_tokens: 1_000,
                     output_tokens: 20_000,
@@ -822,6 +915,7 @@ mod tests {
                 &BillingUsageInput {
                     task_type: "image".to_string(),
                     api_format: Some("openai:image".to_string()),
+                    service_tier: None,
                     request_count: 1,
                     input_tokens: 0,
                     output_tokens: 0,
@@ -869,6 +963,7 @@ mod tests {
                 &BillingUsageInput {
                     task_type: "image".to_string(),
                     api_format: Some("openai:image".to_string()),
+                    service_tier: None,
                     request_count: 1,
                     input_tokens: 0,
                     output_tokens: 0,
@@ -929,6 +1024,7 @@ mod tests {
                 &BillingUsageInput {
                     task_type: "image".to_string(),
                     api_format: Some("openai:image".to_string()),
+                    service_tier: None,
                     request_count: 1,
                     input_tokens: 1_000,
                     output_tokens: 20_000,
@@ -994,6 +1090,7 @@ mod tests {
                 &BillingUsageInput {
                     task_type: "image".to_string(),
                     api_format: Some("openai:image".to_string()),
+                    service_tier: None,
                     request_count: 1,
                     input_tokens: 1_000,
                     output_tokens: 20_000,
@@ -1092,6 +1189,7 @@ mod tests {
                 &BillingUsageInput {
                     task_type: "chat".to_string(),
                     api_format: None,
+                    service_tier: None,
                     request_count: 1,
                     input_tokens: 1_000,
                     output_tokens: 10,
@@ -1165,6 +1263,7 @@ mod tests {
                 &BillingUsageInput {
                     task_type: "chat".to_string(),
                     api_format: None,
+                    service_tier: None,
                     request_count: 1,
                     input_tokens: 1_000,
                     output_tokens: 10,
