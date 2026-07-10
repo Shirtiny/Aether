@@ -962,6 +962,10 @@ fn codex_pool_concrete_account_profile_strips_leak_headers_when_profile_disabled
             "x-amz-user-agent".to_string(),
             "aws-sdk-js/1.0.27".to_string(),
         ),
+        (
+            "X-OAI-Attestation".to_string(),
+            "opaque-test-attestation".to_string(),
+        ),
         ("user-agent".to_string(), "Go-http-client/2.0".to_string()),
     ]);
     let mut body = json!({
@@ -972,6 +976,9 @@ fn codex_pool_concrete_account_profile_strips_leak_headers_when_profile_disabled
 
     assert!(!headers.contains_key("anthropic-version"));
     assert!(!headers.contains_key("x-amz-user-agent"));
+    assert!(!headers
+        .keys()
+        .any(|header| header.eq_ignore_ascii_case("x-oai-attestation")));
     assert_eq!(
         headers.get("user-agent"),
         Some(&"Go-http-client/2.0".to_string())

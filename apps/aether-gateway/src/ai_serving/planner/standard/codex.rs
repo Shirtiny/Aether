@@ -158,6 +158,10 @@ const CODEX_POOL_UPSTREAM_HEADER_BLOCKLIST: &[&str] = &[
     "x-amz-user-agent",
     "x-amzn-codewhisperer-optout",
     "x-amzn-kiro-agent-mode",
+    // Codex obtains this proof just in time from a capable Desktop host. A
+    // pooled request can switch the upstream account and concrete profile, so
+    // it must not reuse an inbound client attestation.
+    "x-oai-attestation",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
