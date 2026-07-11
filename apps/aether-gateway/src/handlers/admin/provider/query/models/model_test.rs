@@ -100,7 +100,7 @@ use self::adapter::{
 };
 use self::capabilities::{
     provider_query_openai_image_normalize_failure_message,
-    provider_query_openai_image_normalize_options,
+    provider_query_openai_image_normalize_options, provider_query_openai_image_test_request_path,
 };
 use self::model_mapping::{
     provider_query_resolve_explicit_mapped_effective_model,
@@ -2119,15 +2119,20 @@ async fn provider_query_execute_openai_image_test_candidate(
         &candidate.effective_model,
         route_path,
     );
+    let provider_type = transport.provider.provider_type.as_str();
     let incoming_request_headers = provider_query_extract_request_headers(payload);
+    let synthetic_request_path = provider_query_openai_image_test_request_path(
+        provider_type,
+        &candidate.effective_model,
+        &request_body,
+    );
     let mut synthetic_request = http::Request::builder()
-        .uri("/v1/images/generations")
+        .uri(synthetic_request_path)
         .body(())
         .map_err(|err| GatewayError::Internal(err.to_string()))?;
     *synthetic_request.headers_mut() = incoming_request_headers;
     let (parts, _) = synthetic_request.into_parts();
 
-    let provider_type = transport.provider.provider_type.as_str();
     let Some(normalized_request) = crate::ai_serving::normalize_openai_image_request_with_options(
         &parts,
         &request_body,

@@ -1,6 +1,6 @@
 use crate::handlers::admin::provider::shared::model_test_capabilities::{
-    admin_provider_openai_image_normalize_options, admin_provider_openai_image_test_capability,
-    AdminProviderOpenAiImageTestCapability,
+    admin_provider_model_is_image_edit_only, admin_provider_openai_image_normalize_options,
+    admin_provider_openai_image_test_capability, AdminProviderOpenAiImageTestCapability,
 };
 use serde_json::Value;
 
@@ -31,6 +31,21 @@ pub(super) fn provider_query_openai_image_requested_count(request_body: &Value) 
                 .and_then(|value| value.parse::<u64>().ok())
         })
     })
+}
+
+pub(super) fn provider_query_openai_image_test_request_path(
+    provider_type: &str,
+    model_id: &str,
+    request_body: &Value,
+) -> &'static str {
+    let has_edit_input = ["image", "images", "mask"]
+        .iter()
+        .any(|key| request_body.get(*key).is_some_and(|value| !value.is_null()));
+    if has_edit_input || admin_provider_model_is_image_edit_only(provider_type, model_id) {
+        "/v1/images/edits"
+    } else {
+        "/v1/images/generations"
+    }
 }
 
 pub(super) fn provider_query_openai_image_normalize_failure_message(

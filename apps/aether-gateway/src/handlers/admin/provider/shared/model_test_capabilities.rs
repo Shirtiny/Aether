@@ -78,6 +78,13 @@ pub(crate) fn admin_provider_model_supports_image_generation(
     fallback_supports_image_generation
 }
 
+pub(crate) fn admin_provider_model_is_image_edit_only(provider_type: &str, model_id: &str) -> bool {
+    provider_type.trim().eq_ignore_ascii_case("grok")
+        && GROK_IMAGE_EDIT_MODEL_IDS
+            .iter()
+            .any(|candidate| model_id.trim().eq_ignore_ascii_case(candidate))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -95,12 +102,17 @@ mod tests {
     #[test]
     fn grok_image_edit_model_is_edit_only_for_generation_tests() {
         for model in ["grok-imagine-edit", "grok-imagine-image-edit"] {
+            assert!(admin_provider_model_is_image_edit_only("grok", model));
             let payload = admin_provider_model_test_capabilities_payload("grok", model, true);
 
             assert_eq!(payload["openai:image"]["max_generation_count"], 4);
             assert_eq!(payload["openai:image"]["supports_generation"], false);
             assert_eq!(payload["openai:image"]["supports_edit"], true);
         }
+        assert!(!admin_provider_model_is_image_edit_only(
+            "grok",
+            "grok-imagine-image"
+        ));
     }
 
     #[test]

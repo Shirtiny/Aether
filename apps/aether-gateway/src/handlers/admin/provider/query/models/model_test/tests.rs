@@ -104,6 +104,34 @@ fn provider_query_model_test_allows_keys_without_model_restrictions() {
 }
 
 #[test]
+fn provider_query_openai_image_test_selects_edit_path_for_edit_models_and_inputs() {
+    assert_eq!(
+        provider_query_openai_image_test_request_path(
+            "grok",
+            "grok-imagine-edit",
+            &json!({"prompt": "edit"}),
+        ),
+        "/v1/images/edits"
+    );
+    assert_eq!(
+        provider_query_openai_image_test_request_path(
+            "custom",
+            "image-model",
+            &json!({"prompt": "edit", "image": {"b64_json": "aGVsbG8="}}),
+        ),
+        "/v1/images/edits"
+    );
+    assert_eq!(
+        provider_query_openai_image_test_request_path(
+            "grok",
+            "grok-imagine-image",
+            &json!({"prompt": "generate"}),
+        ),
+        "/v1/images/generations"
+    );
+}
+
+#[test]
 fn provider_query_model_test_filters_key_disallowed_for_requested_model() {
     let key = sample_catalog_key_with_allowed_models(Some(json!(["model-a"])));
 
