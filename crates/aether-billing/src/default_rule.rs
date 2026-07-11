@@ -3,7 +3,10 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::pricing::BillingModelPricingSnapshot;
+use crate::pricing::{
+    BillingModelPricingSnapshot, GPT56_LONG_CONTEXT_INPUT_MULTIPLIER,
+    GPT56_LONG_CONTEXT_INPUT_THRESHOLD, GPT56_LONG_CONTEXT_OUTPUT_MULTIPLIER,
+};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VirtualBillingRule {
@@ -32,12 +35,15 @@ impl DefaultBillingRuleGenerator {
         service_tier: Option<&str>,
     ) -> Option<VirtualBillingRule> {
         let pricing_config = pricing.effective_tiered_pricing();
-        let tiers = pricing
+        let mut tiers = pricing
             .effective_tiered_pricing()
             .and_then(|value| value.get("tiers"))
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
+        if pricing.uses_default_gpt56_long_context_policy() {
+            tiers = gpt56_long_context_tiers(tiers);
+        }
         let explicit_image_output_price_default =
             explicit_image_output_price_default(pricing_config);
         let image_output_price_default = explicit_image_output_price_default.unwrap_or(0.0);
@@ -354,6 +360,39 @@ fn build_tier_entries(
             Value::Object(value)
         })
         .collect()
+}
+
+fn gpt56_long_context_tiers(mut tiers: Vec<Value>) -> Vec<Value> {
+    let Some(base) = tiers.pop() else {
+        return tiers;
+    };
+    let Some(mut standard) = base.as_object().cloned() else {
+        return vec![base];
+    };
+    standard.insert(
+        "up_to".to_string(),
+        Value::from(GPT56_LONG_CONTEXT_INPUT_THRESHOLD),
+    );
+
+    let mut long = standard.clone();
+    long.insert("up_to".to_string(), Value::Null);
+    for (key, value) in &mut long {
+        let multiplier = if key.starts_with("output_price_per_1m") {
+            Some(GPT56_LONG_CONTEXT_OUTPUT_MULTIPLIER)
+        } else if key.starts_with("input_price_per_1m")
+            || key.starts_with("cache_creation_price_per_1m")
+            || key.starts_with("cache_read_price_per_1m")
+        {
+            Some(GPT56_LONG_CONTEXT_INPUT_MULTIPLIER)
+        } else {
+            None
+        };
+        if let (Some(multiplier), Some(price)) = (multiplier, value.as_f64()) {
+            *value = Value::from(price * multiplier);
+        }
+    }
+
+    vec![Value::Object(standard), Value::Object(long)]
 }
 
 pub(crate) fn explicit_image_output_price_entries(

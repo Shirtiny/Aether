@@ -8,7 +8,11 @@ use crate::default_rule::{
     explicit_image_output_price_ranges, normalize_task_type, DefaultBillingRuleGenerator,
 };
 use crate::precision::quantize_cost;
-use crate::pricing::{BillingComputation, BillingModelPricingSnapshot, BillingUsageInput};
+use crate::pricing::{
+    BillingComputation, BillingModelPricingSnapshot, BillingUsageInput,
+    GPT56_LONG_CONTEXT_INPUT_MULTIPLIER, GPT56_LONG_CONTEXT_INPUT_THRESHOLD,
+    GPT56_LONG_CONTEXT_OUTPUT_MULTIPLIER,
+};
 use crate::schema::{
     BillingSnapshot, BillingSnapshotStatus, CostResult, BILLING_SNAPSHOT_SCHEMA_VERSION,
 };
@@ -151,6 +155,9 @@ fn build_dimensions(
         input.cache_creation_tokens,
         input.cache_read_tokens,
     );
+    let gpt56_long_context_policy = pricing.uses_default_gpt56_long_context_policy();
+    let gpt56_long_context_applied =
+        gpt56_long_context_policy && total_input_context > GPT56_LONG_CONTEXT_INPUT_THRESHOLD;
     let image_output_pricing = image_output_pricing_state(pricing);
     let image_output_resolution = resolve_image_output_price_resolution(pricing, input);
 
@@ -217,6 +224,34 @@ fn build_dimensions(
         (
             "total_input_context".to_string(),
             json!(total_input_context),
+        ),
+        (
+            "gpt56_long_context_threshold".to_string(),
+            json!(if gpt56_long_context_policy {
+                GPT56_LONG_CONTEXT_INPUT_THRESHOLD
+            } else {
+                0
+            }),
+        ),
+        (
+            "gpt56_long_context_input_multiplier".to_string(),
+            json!(if gpt56_long_context_policy {
+                GPT56_LONG_CONTEXT_INPUT_MULTIPLIER
+            } else {
+                1.0
+            }),
+        ),
+        (
+            "gpt56_long_context_output_multiplier".to_string(),
+            json!(if gpt56_long_context_policy {
+                GPT56_LONG_CONTEXT_OUTPUT_MULTIPLIER
+            } else {
+                1.0
+            }),
+        ),
+        (
+            "gpt56_long_context_applied".to_string(),
+            json!(gpt56_long_context_applied),
         ),
         (
             "effective_task_type".to_string(),
@@ -776,6 +811,97 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn gpt56_long_context_matches_sub2api_main_across_models_and_service_tiers() {
+        for (model, input, cache_write, cache_read, output) in [
+            ("gpt-5.6-sol", 5e-6, 6.25e-6, 0.5e-6, 30e-6),
+            ("gpt-5.6-terra", 2.5e-6, 3.125e-6, 0.25e-6, 15e-6),
+            ("gpt-5.6-luna", 1e-6, 1.25e-6, 0.1e-6, 6e-6),
+        ] {
+            for (service_tier, tier_multiplier) in [
+                (None, 1.0),
+                (Some("priority"), 2.0),
+                (Some("flex"), 0.5),
+                (Some("batches"), 0.5),
+            ] {
+                let result = BillingService::new()
+                    .calculate(
+                        &unconfigured_gpt56_pricing(model),
+                        &BillingUsageInput {
+                            task_type: "chat".to_string(),
+                            api_format: Some("openai:responses".to_string()),
+                            service_tier: service_tier.map(str::to_string),
+                            request_count: 1,
+                            input_tokens: 273_000,
+                            output_tokens: 10,
+                            cache_creation_tokens: 100_000,
+                            cache_creation_ephemeral_5m_tokens: 0,
+                            cache_creation_ephemeral_1h_tokens: 0,
+                            cache_read_tokens: 73_000,
+                            image_count: 0,
+                            image_size: None,
+                            image_quality: None,
+                            image_output_format: None,
+                            cache_ttl_minutes: None,
+                        },
+                    )
+                    .expect("GPT-5.6 long-context billing should calculate");
+
+                let expected = (100_000.0 * input * 2.0
+                    + 100_000.0 * cache_write * 2.0
+                    + 73_000.0 * cache_read * 2.0
+                    + 10.0 * output * 1.5)
+                    * tier_multiplier;
+                assert!(
+                    (result.cost_result.cost - expected).abs() < 1e-12,
+                    "{model} tier={service_tier:?}: got {}, want {expected}",
+                    result.cost_result.cost
+                );
+                assert_eq!(
+                    result.cost_result.snapshot.resolved_dimensions["gpt56_long_context_applied"],
+                    json!(true)
+                );
+                assert_eq!(
+                    result.cost_result.snapshot.resolved_dimensions["input_tokens"],
+                    json!(100_000)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gpt56_long_context_threshold_is_exclusive() {
+        let result = BillingService::new()
+            .calculate(
+                &unconfigured_gpt56_pricing("gpt-5.6-sol"),
+                &BillingUsageInput {
+                    task_type: "chat".to_string(),
+                    api_format: Some("openai:responses".to_string()),
+                    service_tier: None,
+                    request_count: 1,
+                    input_tokens: 272_000,
+                    output_tokens: 10,
+                    cache_creation_tokens: 100_000,
+                    cache_creation_ephemeral_5m_tokens: 0,
+                    cache_creation_ephemeral_1h_tokens: 0,
+                    cache_read_tokens: 72_000,
+                    image_count: 0,
+                    image_size: None,
+                    image_quality: None,
+                    image_output_format: None,
+                    cache_ttl_minutes: None,
+                },
+            )
+            .expect("GPT-5.6 boundary billing should calculate");
+
+        let expected = 100_000.0 * 5e-6 + 100_000.0 * 6.25e-6 + 72_000.0 * 0.5e-6 + 10.0 * 30e-6;
+        assert!((result.cost_result.cost - expected).abs() < 1e-12);
+        assert_eq!(
+            result.cost_result.snapshot.resolved_dimensions["gpt56_long_context_applied"],
+            json!(false)
+        );
     }
 
     #[test]

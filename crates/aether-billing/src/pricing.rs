@@ -93,6 +93,10 @@ fn official_gpt56_pricing(model: &str) -> Option<&'static Value> {
     None
 }
 
+pub const GPT56_LONG_CONTEXT_INPUT_THRESHOLD: i64 = 272_000;
+pub const GPT56_LONG_CONTEXT_INPUT_MULTIPLIER: f64 = 2.0;
+pub const GPT56_LONG_CONTEXT_OUTPUT_MULTIPLIER: f64 = 1.5;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BillingModelPricingSnapshot {
     pub provider_id: String,
@@ -113,6 +117,27 @@ pub struct BillingModelPricingSnapshot {
 }
 
 impl BillingModelPricingSnapshot {
+    pub fn is_gpt56(&self) -> bool {
+        self.model_provider_model_name
+            .as_deref()
+            .is_some_and(|model| official_gpt56_pricing(model).is_some())
+            || official_gpt56_pricing(&self.global_model_name).is_some()
+    }
+
+    pub fn uses_default_gpt56_long_context_policy(&self) -> bool {
+        if !self.is_gpt56() {
+            return false;
+        }
+        let Some(tiers) = self
+            .effective_tiered_pricing()
+            .and_then(|value| value.get("tiers"))
+            .and_then(Value::as_array)
+        else {
+            return false;
+        };
+        tiers.len() == 1 && tiers[0].get("up_to").is_none_or(serde_json::Value::is_null)
+    }
+
     fn official_fallback_tiered_pricing(&self) -> Option<&'static Value> {
         if self.model_price_per_request.is_some() || self.default_price_per_request.is_some() {
             return None;
