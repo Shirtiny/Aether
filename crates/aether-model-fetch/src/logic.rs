@@ -384,6 +384,10 @@ pub fn preset_models_for_provider(provider_type: &str) -> Option<Vec<Value>> {
             preset_model("gpt-5.3-codex-spark", "openai", "GPT-5.3 Codex Spark", "openai:responses"),
         ],
         "grok" => vec![
+            preset_model("grok-4.5", "xai", "Grok 4.5", "openai:responses"),
+            preset_model("grok-4.3", "xai", "Grok 4.3", "openai:responses"),
+            preset_model("grok-build-0.1", "xai", "Grok Build 0.1", "openai:responses"),
+            preset_model("grok-composer-2.5-fast", "xai", "Grok Composer 2.5 Fast", "openai:chat"),
             preset_model("grok-4.20-0309-non-reasoning", "xai", "Grok 4.20 0309 Non-Reasoning", "openai:chat"),
             preset_model("grok-4.20-0309", "xai", "Grok 4.20 0309", "openai:chat"),
             preset_model("grok-4.20-0309-reasoning", "xai", "Grok 4.20 0309 Reasoning", "openai:chat"),
@@ -401,8 +405,12 @@ pub fn preset_models_for_provider(provider_type: &str) -> Option<Vec<Value>> {
             preset_model("grok-4.3-beta", "xai", "Grok 4.3 Beta", "openai:chat"),
             preset_model("grok-imagine-image-lite", "xai", "Grok Imagine Image Lite", "openai:image"),
             preset_model("grok-imagine-image", "xai", "Grok Imagine Image", "openai:image"),
+            preset_model("grok-imagine-image-quality", "xai", "Grok Imagine Image Quality", "openai:image"),
             preset_model("grok-imagine-image-pro", "xai", "Grok Imagine Image Pro", "openai:image"),
+            preset_model("grok-imagine-edit", "xai", "Grok Imagine Edit", "openai:image"),
             preset_model("grok-imagine-image-edit", "xai", "Grok Imagine Image Edit", "openai:image"),
+            preset_model("grok-imagine-video", "xai", "Grok Imagine Video", "openai:video"),
+            preset_model("grok-imagine-video-1.5", "xai", "Grok Imagine Video 1.5", "openai:video"),
         ],
         _ => return None,
     };
@@ -1289,7 +1297,7 @@ mod tests {
     }
 
     #[test]
-    fn preset_models_cover_grok_non_video_catalog() {
+    fn preset_models_cover_grok_catalog() {
         let models = preset_models_for_provider("grok").expect("preset models should exist");
         let model_ids = models
             .iter()
@@ -1298,6 +1306,10 @@ mod tests {
         assert_eq!(
             model_ids,
             vec![
+                "grok-4.5",
+                "grok-4.3",
+                "grok-build-0.1",
+                "grok-composer-2.5-fast",
                 "grok-4.20-0309-non-reasoning",
                 "grok-4.20-0309",
                 "grok-4.20-0309-reasoning",
@@ -1315,14 +1327,32 @@ mod tests {
                 "grok-4.3-beta",
                 "grok-imagine-image-lite",
                 "grok-imagine-image",
+                "grok-imagine-image-quality",
                 "grok-imagine-image-pro",
+                "grok-imagine-edit",
                 "grok-imagine-image-edit",
+                "grok-imagine-video",
+                "grok-imagine-video-1.5",
             ]
         );
-        assert!(!model_ids.contains(&"grok-imagine-video"));
-        assert_eq!(models[0]["api_formats"], json!(["openai:chat"]));
-        assert_eq!(models[10]["api_formats"], json!(["openai:chat"]));
-        assert_eq!(models[15]["api_formats"], json!(["openai:image"]));
-        assert_eq!(models[18]["api_formats"], json!(["openai:image"]));
+        let format_for = |id: &str| {
+            models
+                .iter()
+                .find(|model| model["id"] == id)
+                .map(|model| model["api_formats"].clone())
+                .expect("preset model")
+        };
+        assert_eq!(format_for("grok-4.5"), json!(["openai:responses"]));
+        assert_eq!(format_for("grok-composer-2.5-fast"), json!(["openai:chat"]));
+        assert_eq!(
+            format_for("grok-imagine-image-quality"),
+            json!(["openai:image"])
+        );
+        assert_eq!(format_for("grok-imagine-edit"), json!(["openai:image"]));
+        assert_eq!(format_for("grok-imagine-video"), json!(["openai:video"]));
+        assert_eq!(
+            format_for("grok-imagine-video-1.5"),
+            json!(["openai:video"])
+        );
     }
 }

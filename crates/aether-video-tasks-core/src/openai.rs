@@ -23,6 +23,10 @@ fn openai_video_resource_url(api_root: &str, suffix: &str) -> String {
     )
 }
 
+fn openai_video_duration_seconds(body: &Value) -> Option<u32> {
+    request_body_u32(body, "seconds").or_else(|| request_body_u32(body, "duration"))
+}
+
 pub fn map_openai_stored_task_to_read_response(
     task: StoredVideoTask,
 ) -> LocalVideoTaskReadResponse {
@@ -600,7 +604,9 @@ impl OpenAiVideoTaskSeed {
             model: self.model.clone().or_else(|| Some(String::new())),
             prompt: self.prompt.clone().or_else(|| Some(String::new())),
             original_request_body: Some(self.persistence.original_request_body.clone()),
-            duration_seconds: request_body_u32(&self.persistence.original_request_body, "seconds"),
+            duration_seconds: openai_video_duration_seconds(
+                &self.persistence.original_request_body,
+            ),
             resolution: request_body_string(&self.persistence.original_request_body, "resolution"),
             aspect_ratio: request_body_string(
                 &self.persistence.original_request_body,
@@ -634,7 +640,19 @@ impl OpenAiVideoTaskSeed {
 mod tests {
     use aether_data_contracts::repository::video_tasks::{StoredVideoTask, VideoTaskStatus};
 
-    use super::map_openai_stored_task_to_read_response;
+    use super::{map_openai_stored_task_to_read_response, openai_video_duration_seconds};
+
+    #[test]
+    fn reads_xai_duration_alias_for_openai_video_tasks() {
+        assert_eq!(
+            openai_video_duration_seconds(&serde_json::json!({"duration": 10})),
+            Some(10)
+        );
+        assert_eq!(
+            openai_video_duration_seconds(&serde_json::json!({"seconds": 4, "duration": 10})),
+            Some(4)
+        );
+    }
 
     fn sample_stored_task(status: VideoTaskStatus) -> StoredVideoTask {
         StoredVideoTask {

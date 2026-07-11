@@ -93,6 +93,49 @@ fn official_gpt56_pricing(model: &str) -> Option<&'static Value> {
     None
 }
 
+static GROK45_OFFICIAL_PRICING: LazyLock<Value> = LazyLock::new(|| {
+    serde_json::json!({
+        "tiers": [{
+            "up_to": null,
+            "input_price_per_1m": 2.0,
+            "output_price_per_1m": 6.0,
+            "cache_read_price_per_1m": 0.5
+        }]
+    })
+});
+
+static GROK43_OFFICIAL_PRICING: LazyLock<Value> = LazyLock::new(|| {
+    serde_json::json!({
+        "tiers": [{
+            "up_to": null,
+            "input_price_per_1m": 1.25,
+            "output_price_per_1m": 2.5
+        }]
+    })
+});
+
+static GROK_BUILD_OFFICIAL_PRICING: LazyLock<Value> = LazyLock::new(|| {
+    serde_json::json!({
+        "tiers": [{
+            "up_to": null,
+            "input_price_per_1m": 1.0,
+            "output_price_per_1m": 2.0
+        }]
+    })
+});
+
+fn official_grok_pricing(model: &str) -> Option<&'static Value> {
+    let normalized = model.trim().to_ascii_lowercase().replace('_', "-");
+    match normalized.as_str() {
+        "grok" | "grok-latest" | "grok-4.5" | "grok-4.5-latest" | "grok-build-latest" => {
+            Some(&GROK45_OFFICIAL_PRICING)
+        }
+        "grok-4.3" | "grok-4.3-latest" => Some(&GROK43_OFFICIAL_PRICING),
+        "grok-build" | "grok-build-0.1" => Some(&GROK_BUILD_OFFICIAL_PRICING),
+        _ => None,
+    }
+}
+
 pub const GPT56_LONG_CONTEXT_INPUT_THRESHOLD: i64 = 272_000;
 pub const GPT56_LONG_CONTEXT_INPUT_MULTIPLIER: f64 = 2.0;
 pub const GPT56_LONG_CONTEXT_OUTPUT_MULTIPLIER: f64 = 1.5;
@@ -144,8 +187,11 @@ impl BillingModelPricingSnapshot {
         }
         self.model_provider_model_name
             .as_deref()
-            .and_then(official_gpt56_pricing)
+            .and_then(|model| {
+                official_gpt56_pricing(model).or_else(|| official_grok_pricing(model))
+            })
             .or_else(|| official_gpt56_pricing(&self.global_model_name))
+            .or_else(|| official_grok_pricing(&self.global_model_name))
     }
 
     pub fn effective_tiered_pricing(&self) -> Option<&Value> {
@@ -313,6 +359,48 @@ mod tests {
             assert_eq!(tier["cache_read_price_per_1m"], cache_read);
             assert_eq!(pricing.pricing_source(), "official_fallback");
         }
+    }
+
+    #[test]
+    fn grok_models_use_sub2api_aligned_official_fallback_pricing() {
+        for (model, input, output, cache_read) in [
+            ("grok", 2.0, 6.0, Some(0.5)),
+            ("grok-4.5-latest", 2.0, 6.0, Some(0.5)),
+            ("grok-4.3", 1.25, 2.5, None),
+            ("grok-build-0.1", 1.0, 2.0, None),
+        ] {
+            let mut pricing = snapshot(None, None);
+            pricing.global_model_name = model.to_string();
+            let tier = pricing
+                .effective_tiered_pricing()
+                .and_then(|value| value.get("tiers"))
+                .and_then(serde_json::Value::as_array)
+                .and_then(|tiers| tiers.first())
+                .expect("official Grok tier");
+
+            assert_eq!(tier["input_price_per_1m"], input);
+            assert_eq!(tier["output_price_per_1m"], output);
+            assert_eq!(
+                tier.get("cache_read_price_per_1m")
+                    .and_then(serde_json::Value::as_f64),
+                cache_read
+            );
+            assert_eq!(pricing.pricing_source(), "official_fallback");
+        }
+    }
+
+    #[test]
+    fn explicit_grok_pricing_overrides_official_fallback() {
+        let explicit = json!({"tiers":[{
+            "up_to": null,
+            "input_price_per_1m": 9.0,
+            "output_price_per_1m": 10.0
+        }]});
+        let mut pricing = snapshot(Some(explicit.clone()), None);
+        pricing.global_model_name = "grok-4.5".to_string();
+
+        assert_eq!(pricing.effective_tiered_pricing(), Some(&explicit));
+        assert_eq!(pricing.pricing_source(), "provider_override");
     }
 
     #[test]
