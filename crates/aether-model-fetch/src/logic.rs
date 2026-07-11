@@ -387,30 +387,12 @@ pub fn preset_models_for_provider(provider_type: &str) -> Option<Vec<Value>> {
             preset_model("grok-4.5", "xai", "Grok 4.5", "openai:responses"),
             preset_model("grok-4.3", "xai", "Grok 4.3", "openai:responses"),
             preset_model("grok-build-0.1", "xai", "Grok Build 0.1", "openai:responses"),
-            preset_model("grok-composer-2.5-fast", "xai", "Grok Composer 2.5 Fast", "openai:chat"),
-            preset_model("grok-4.20-0309-non-reasoning", "xai", "Grok 4.20 0309 Non-Reasoning", "openai:chat"),
-            preset_model("grok-4.20-0309", "xai", "Grok 4.20 0309", "openai:chat"),
-            preset_model("grok-4.20-0309-reasoning", "xai", "Grok 4.20 0309 Reasoning", "openai:chat"),
-            preset_model("grok-4.20-0309-non-reasoning-super", "xai", "Grok 4.20 0309 Non-Reasoning Super", "openai:chat"),
-            preset_model("grok-4.20-0309-super", "xai", "Grok 4.20 0309 Super", "openai:chat"),
-            preset_model("grok-4.20-0309-reasoning-super", "xai", "Grok 4.20 0309 Reasoning Super", "openai:chat"),
-            preset_model("grok-4.20-0309-non-reasoning-heavy", "xai", "Grok 4.20 0309 Non-Reasoning Heavy", "openai:chat"),
-            preset_model("grok-4.20-0309-heavy", "xai", "Grok 4.20 0309 Heavy", "openai:chat"),
-            preset_model("grok-4.20-0309-reasoning-heavy", "xai", "Grok 4.20 0309 Reasoning Heavy", "openai:chat"),
-            preset_model("grok-4.20-multi-agent-0309", "xai", "Grok 4.20 Multi-Agent 0309", "openai:chat"),
-            preset_model("grok-4.20-auto", "xai", "Grok 4.20 Auto", "openai:chat"),
-            preset_model("grok-4.20-fast", "xai", "Grok 4.20 Fast", "openai:chat"),
-            preset_model("grok-4.20-expert", "xai", "Grok 4.20 Expert", "openai:chat"),
-            preset_model("grok-4.20-heavy", "xai", "Grok 4.20 Heavy", "openai:chat"),
-            preset_model("grok-4.3-beta", "xai", "Grok 4.3 Beta", "openai:chat"),
             preset_model("grok-imagine-image-lite", "xai", "Grok Imagine Image Lite", "openai:image"),
             preset_model("grok-imagine-image", "xai", "Grok Imagine Image", "openai:image"),
             preset_model("grok-imagine-image-quality", "xai", "Grok Imagine Image Quality", "openai:image"),
             preset_model("grok-imagine-image-pro", "xai", "Grok Imagine Image Pro", "openai:image"),
             preset_model("grok-imagine-edit", "xai", "Grok Imagine Edit", "openai:image"),
             preset_model("grok-imagine-image-edit", "xai", "Grok Imagine Image Edit", "openai:image"),
-            preset_model("grok-imagine-video", "xai", "Grok Imagine Video", "openai:video"),
-            preset_model("grok-imagine-video-1.5", "xai", "Grok Imagine Video 1.5", "openai:video"),
         ],
         _ => return None,
     };
@@ -1309,30 +1291,12 @@ mod tests {
                 "grok-4.5",
                 "grok-4.3",
                 "grok-build-0.1",
-                "grok-composer-2.5-fast",
-                "grok-4.20-0309-non-reasoning",
-                "grok-4.20-0309",
-                "grok-4.20-0309-reasoning",
-                "grok-4.20-0309-non-reasoning-super",
-                "grok-4.20-0309-super",
-                "grok-4.20-0309-reasoning-super",
-                "grok-4.20-0309-non-reasoning-heavy",
-                "grok-4.20-0309-heavy",
-                "grok-4.20-0309-reasoning-heavy",
-                "grok-4.20-multi-agent-0309",
-                "grok-4.20-auto",
-                "grok-4.20-fast",
-                "grok-4.20-expert",
-                "grok-4.20-heavy",
-                "grok-4.3-beta",
                 "grok-imagine-image-lite",
                 "grok-imagine-image",
                 "grok-imagine-image-quality",
                 "grok-imagine-image-pro",
                 "grok-imagine-edit",
                 "grok-imagine-image-edit",
-                "grok-imagine-video",
-                "grok-imagine-video-1.5",
             ]
         );
         let format_for = |id: &str| {
@@ -1343,16 +1307,20 @@ mod tests {
                 .expect("preset model")
         };
         assert_eq!(format_for("grok-4.5"), json!(["openai:responses"]));
-        assert_eq!(format_for("grok-composer-2.5-fast"), json!(["openai:chat"]));
         assert_eq!(
             format_for("grok-imagine-image-quality"),
             json!(["openai:image"])
         );
         assert_eq!(format_for("grok-imagine-edit"), json!(["openai:image"]));
-        assert_eq!(format_for("grok-imagine-video"), json!(["openai:video"]));
-        assert_eq!(
-            format_for("grok-imagine-video-1.5"),
-            json!(["openai:video"])
-        );
+        for unavailable in [
+            "grok-composer-2.5-fast",
+            "grok-4.20-0309-reasoning",
+            "grok-4.20-multi-agent-0309",
+            "grok-4.3-beta",
+            "grok-imagine-video",
+            "grok-imagine-video-1.5",
+        ] {
+            assert!(!model_ids.contains(&unavailable));
+        }
     }
 }

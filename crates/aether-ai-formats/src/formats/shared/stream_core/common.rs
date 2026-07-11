@@ -47,6 +47,21 @@ fn openai_input_usage_detail_u64(usage: &Map<String, Value>, key: &str) -> Optio
         })
 }
 
+fn openai_input_usage_detail_u64_including_zero(
+    usage: &Map<String, Value>,
+    key: &str,
+) -> Option<u64> {
+    ["input_tokens_details", "prompt_tokens_details"]
+        .iter()
+        .find_map(|details_key| {
+            usage
+                .get(*details_key)
+                .and_then(Value::as_object)
+                .and_then(|details| details.get(key))
+                .and_then(Value::as_u64)
+        })
+}
+
 pub(crate) fn openai_cache_creation_tokens(usage: &Map<String, Value>) -> u64 {
     [
         "cache_write_tokens",
@@ -54,7 +69,7 @@ pub(crate) fn openai_cache_creation_tokens(usage: &Map<String, Value>) -> u64 {
         "cached_creation_tokens",
     ]
     .iter()
-    .find_map(|key| openai_input_usage_detail_u64(usage, key))
+    .find_map(|key| openai_input_usage_detail_u64_including_zero(usage, key))
     .or_else(|| {
         [
             "cache_write_tokens",
@@ -63,12 +78,7 @@ pub(crate) fn openai_cache_creation_tokens(usage: &Map<String, Value>) -> u64 {
             "cache_creation_tokens",
         ]
         .iter()
-        .find_map(|key| {
-            usage
-                .get(*key)
-                .and_then(Value::as_u64)
-                .filter(|tokens| *tokens > 0)
-        })
+        .find_map(|key| usage.get(*key).and_then(Value::as_u64))
     })
     .unwrap_or(0)
 }

@@ -2919,6 +2919,31 @@ mod tests {
     }
 
     #[test]
+    fn openai_usage_explicit_zero_cache_write_overrides_legacy_fallbacks() {
+        for usage_json in [
+            json!({
+                "input_tokens": 100,
+                "output_tokens": 5,
+                "cache_creation_input_tokens": 19,
+                "input_tokens_details": {
+                    "cache_write_tokens": 0
+                }
+            }),
+            json!({
+                "input_tokens": 100,
+                "output_tokens": 5,
+                "cache_write_tokens": 0,
+                "cache_creation_input_tokens": 19
+            }),
+        ] {
+            let usage =
+                canonical_usage_from_openai_usage(Some(&usage_json)).expect("usage should parse");
+
+            assert_eq!(usage.cache_creation_tokens, 0);
+        }
+    }
+
+    #[test]
     fn openai_usage_accepts_reasoning_output_tokens() {
         let usage = canonical_usage_from_openai_usage(Some(&json!({
             "input_tokens": 26,

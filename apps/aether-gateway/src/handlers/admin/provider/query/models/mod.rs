@@ -115,7 +115,10 @@ fn provider_query_model_id(model: &Value) -> Option<&str> {
 fn provider_query_grok_required_tier_rank(model_id: &str) -> Option<u8> {
     match model_id.trim() {
         "grok-4.20-0309-non-reasoning" | "grok-4.20-fast" | "grok-imagine-image-lite" => Some(0),
-        "grok-4.20-0309"
+        "grok-4.5"
+        | "grok-4.3"
+        | "grok-build-0.1"
+        | "grok-4.20-0309"
         | "grok-4.20-0309-reasoning"
         | "grok-4.20-0309-non-reasoning-super"
         | "grok-4.20-0309-super"
@@ -124,7 +127,9 @@ fn provider_query_grok_required_tier_rank(model_id: &str) -> Option<u8> {
         | "grok-4.20-expert"
         | "grok-4.3-beta"
         | "grok-imagine-image"
+        | "grok-imagine-image-quality"
         | "grok-imagine-image-pro"
+        | "grok-imagine-edit"
         | "grok-imagine-image-edit" => Some(1),
         "grok-4.20-0309-non-reasoning-heavy"
         | "grok-4.20-0309-heavy"
@@ -793,11 +798,16 @@ mod tests {
             &grok_provider(),
             key,
             vec![
+                model("grok-4.5"),
+                model("grok-4.3"),
+                model("grok-build-0.1"),
                 model("grok-4.20-0309-non-reasoning"),
                 model("grok-4.20-auto"),
                 model("grok-4.20-heavy"),
                 model("grok-imagine-image-lite"),
                 model("grok-imagine-image"),
+                model("grok-imagine-image-quality"),
+                model("grok-imagine-edit"),
                 model("grok-imagine-image-edit"),
             ],
         )
@@ -823,10 +833,15 @@ mod tests {
         assert_eq!(
             filtered_ids(&key),
             [
+                "grok-4.5",
+                "grok-4.3",
+                "grok-build-0.1",
                 "grok-4.20-0309-non-reasoning",
                 "grok-4.20-auto",
                 "grok-imagine-image-lite",
                 "grok-imagine-image",
+                "grok-imagine-image-quality",
+                "grok-imagine-edit",
                 "grok-imagine-image-edit"
             ]
         );
@@ -839,11 +854,16 @@ mod tests {
         assert_eq!(
             filtered_ids(&key),
             [
+                "grok-4.5",
+                "grok-4.3",
+                "grok-build-0.1",
                 "grok-4.20-0309-non-reasoning",
                 "grok-4.20-auto",
                 "grok-4.20-heavy",
                 "grok-imagine-image-lite",
                 "grok-imagine-image",
+                "grok-imagine-image-quality",
+                "grok-imagine-edit",
                 "grok-imagine-image-edit"
             ]
         );
@@ -860,10 +880,15 @@ mod tests {
         assert_eq!(
             filtered_ids(&key),
             [
+                "grok-4.5",
+                "grok-4.3",
+                "grok-build-0.1",
                 "grok-4.20-0309-non-reasoning",
                 "grok-4.20-auto",
                 "grok-imagine-image-lite",
                 "grok-imagine-image",
+                "grok-imagine-image-quality",
+                "grok-imagine-edit",
                 "grok-imagine-image-edit"
             ]
         );
@@ -876,6 +901,8 @@ mod tests {
             vec![
                 model("grok-4.20-fast"),
                 model("grok-imagine-image"),
+                model("grok-imagine-image-quality"),
+                model("grok-imagine-edit"),
                 model("grok-imagine-image-edit"),
             ],
         );
@@ -891,10 +918,22 @@ mod tests {
         );
         assert_eq!(
             models[2]["model_test_capabilities"]["openai:image"]["supports_generation"],
+            json!(true)
+        );
+        assert_eq!(
+            models[3]["model_test_capabilities"]["openai:image"]["supports_generation"],
             json!(false)
         );
         assert_eq!(
-            models[2]["model_test_capabilities"]["openai:image"]["supports_edit"],
+            models[3]["model_test_capabilities"]["openai:image"]["supports_edit"],
+            json!(true)
+        );
+        assert_eq!(
+            models[4]["model_test_capabilities"]["openai:image"]["supports_generation"],
+            json!(false)
+        );
+        assert_eq!(
+            models[4]["model_test_capabilities"]["openai:image"]["supports_edit"],
             json!(true)
         );
     }

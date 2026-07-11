@@ -6,10 +6,12 @@ use serde_json::{json, Value};
 const GROK_IMAGE_MODEL_IDS: &[&str] = &[
     "grok-imagine-image-lite",
     "grok-imagine-image",
+    "grok-imagine-image-quality",
     "grok-imagine-image-pro",
+    "grok-imagine-edit",
     "grok-imagine-image-edit",
 ];
-const GROK_IMAGE_EDIT_MODEL_ID: &str = "grok-imagine-image-edit";
+const GROK_IMAGE_EDIT_MODEL_IDS: &[&str] = &["grok-imagine-edit", "grok-imagine-image-edit"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AdminProviderOpenAiImageTestCapability {
@@ -43,8 +45,10 @@ pub(crate) fn admin_provider_model_test_capabilities_payload(
 ) -> Value {
     let provider_type = provider_type.trim();
     let model_id = model_id.trim();
-    let is_grok_image_edit =
-        provider_type.eq_ignore_ascii_case("grok") && model_id == GROK_IMAGE_EDIT_MODEL_ID;
+    let is_grok_image_edit = provider_type.eq_ignore_ascii_case("grok")
+        && GROK_IMAGE_EDIT_MODEL_IDS
+            .iter()
+            .any(|candidate| model_id.eq_ignore_ascii_case(candidate));
     let openai_image = if supports_image_generation {
         Some(json!({
             "max_generation_count": admin_provider_openai_image_test_capability(provider_type).max_generation_count,
@@ -90,12 +94,13 @@ mod tests {
 
     #[test]
     fn grok_image_edit_model_is_edit_only_for_generation_tests() {
-        let payload =
-            admin_provider_model_test_capabilities_payload("grok", "grok-imagine-image-edit", true);
+        for model in ["grok-imagine-edit", "grok-imagine-image-edit"] {
+            let payload = admin_provider_model_test_capabilities_payload("grok", model, true);
 
-        assert_eq!(payload["openai:image"]["max_generation_count"], 4);
-        assert_eq!(payload["openai:image"]["supports_generation"], false);
-        assert_eq!(payload["openai:image"]["supports_edit"], true);
+            assert_eq!(payload["openai:image"]["max_generation_count"], 4);
+            assert_eq!(payload["openai:image"]["supports_generation"], false);
+            assert_eq!(payload["openai:image"]["supports_edit"], true);
+        }
     }
 
     #[test]
@@ -110,6 +115,16 @@ mod tests {
         assert!(admin_provider_model_supports_image_generation(
             "grok",
             "grok-imagine-image-pro",
+            false,
+        ));
+        assert!(admin_provider_model_supports_image_generation(
+            "grok",
+            "grok-imagine-image-quality",
+            false,
+        ));
+        assert!(admin_provider_model_supports_image_generation(
+            "grok",
+            "grok-imagine-edit",
             false,
         ));
         assert!(!admin_provider_model_supports_image_generation(

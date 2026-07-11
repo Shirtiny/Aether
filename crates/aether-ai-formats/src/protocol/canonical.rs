@@ -4610,6 +4610,18 @@ fn openai_usage_detail_token(usage: &Map<String, Value>, key: &str) -> Option<u6
         })
 }
 
+fn openai_usage_detail_token_including_zero(usage: &Map<String, Value>, key: &str) -> Option<u64> {
+    ["input_tokens_details", "prompt_tokens_details"]
+        .iter()
+        .find_map(|details_key| {
+            usage
+                .get(*details_key)
+                .and_then(Value::as_object)
+                .and_then(|details| details.get(key))
+                .and_then(Value::as_u64)
+        })
+}
+
 fn openai_usage_cache_read_tokens(usage: &Map<String, Value>) -> u64 {
     openai_usage_detail_token(usage, "cached_tokens")
         .or_else(|| {
@@ -4636,7 +4648,7 @@ fn openai_usage_cache_write_tokens(usage: &Map<String, Value>) -> u64 {
         "cached_creation_tokens",
     ]
     .iter()
-    .find_map(|key| openai_usage_detail_token(usage, key))
+    .find_map(|key| openai_usage_detail_token_including_zero(usage, key))
     .or_else(|| {
         [
             "cache_write_tokens",
@@ -4645,12 +4657,7 @@ fn openai_usage_cache_write_tokens(usage: &Map<String, Value>) -> u64 {
             "cache_creation_tokens",
         ]
         .iter()
-        .find_map(|key| {
-            usage
-                .get(*key)
-                .and_then(Value::as_u64)
-                .filter(|tokens| *tokens > 0)
-        })
+        .find_map(|key| usage.get(*key).and_then(Value::as_u64))
     })
     .unwrap_or(0)
 }
@@ -5377,6 +5384,31 @@ mod tests {
         let chat = super::canonical_usage_to_openai(&usage);
         assert_eq!(chat["prompt_tokens_details"]["cached_tokens"], 11);
         assert_eq!(chat["prompt_tokens_details"]["cache_write_tokens"], 7);
+    }
+
+    #[test]
+    fn openai_usage_explicit_zero_cache_write_overrides_legacy_fallbacks() {
+        for usage_json in [
+            json!({
+                "input_tokens": 100,
+                "output_tokens": 5,
+                "cache_creation_input_tokens": 19,
+                "input_tokens_details": {
+                    "cache_write_tokens": 0
+                }
+            }),
+            json!({
+                "input_tokens": 100,
+                "output_tokens": 5,
+                "cache_write_tokens": 0,
+                "cache_creation_input_tokens": 19
+            }),
+        ] {
+            let usage =
+                super::openai_usage_to_canonical(Some(&usage_json)).expect("usage should parse");
+
+            assert_eq!(usage.cache_write_tokens, 0);
+        }
     }
 
     #[test]
