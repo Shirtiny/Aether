@@ -12,6 +12,9 @@ use super::{
     UsageReadRepository, UsageRuntimeConfig, DEVELOPMENT_ENCRYPTION_KEY, TRACE_ID_HEADER,
 };
 use crate::constants::LOCAL_EXECUTION_RUNTIME_MISS_REASON_HEADER;
+use aether_data::repository::users::{
+    InMemoryUserReadRepository, StoredUserAuthRecord, UpsertUserGroupRecord, UserReadRepository,
+};
 use aether_data_contracts::repository::usage::UsageBodyCaptureState;
 
 fn deep_nested_metadata(levels: usize) -> serde_json::Value {
@@ -1469,6 +1472,50 @@ async fn gateway_preserves_stream_usage_when_max_response_body_size_truncates_ca
         vec![sample_local_openai_endpoint()],
         vec![sample_local_openai_key()],
     ));
+    let capture_user_id = "user-openai-usage-local-stream-truncated-1";
+    let user_repository: Arc<dyn UserReadRepository> =
+        Arc::new(InMemoryUserReadRepository::seed_auth_users(vec![
+            StoredUserAuthRecord {
+                id: capture_user_id.to_string(),
+                email: Some("capture@example.test".to_string()),
+                email_verified: true,
+                username: "capture-user".to_string(),
+                password_hash: None,
+                role: "user".to_string(),
+                auth_source: "local".to_string(),
+                allowed_providers: None,
+                allowed_providers_mode: "unrestricted".to_string(),
+                allowed_api_formats: None,
+                allowed_api_formats_mode: "unrestricted".to_string(),
+                allowed_models: None,
+                allowed_models_mode: "unrestricted".to_string(),
+                is_active: true,
+                is_deleted: false,
+                created_at: None,
+                last_login_at: None,
+            },
+        ]));
+    let capture_group = user_repository
+        .create_user_group(UpsertUserGroupRecord {
+            name: "Scoped stream capture".to_string(),
+            description: None,
+            priority: 0,
+            allowed_providers: None,
+            allowed_providers_mode: "unrestricted".to_string(),
+            allowed_api_formats: None,
+            allowed_api_formats_mode: "unrestricted".to_string(),
+            allowed_models: None,
+            allowed_models_mode: "unrestricted".to_string(),
+            rate_limit: None,
+            rate_limit_mode: "inherit".to_string(),
+        })
+        .await
+        .expect("capture group should create")
+        .expect("capture group should exist");
+    user_repository
+        .add_user_to_group(&capture_group.id, capture_user_id)
+        .await
+        .expect("capture group membership should create");
 
     let (_upstream_url, upstream_handle) = start_server(upstream).await;
     let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
@@ -1482,9 +1529,17 @@ async fn gateway_preserves_stream_usage_when_max_response_body_size_truncates_ca
                 Arc::clone(&usage_repository),
                 DEVELOPMENT_ENCRYPTION_KEY,
             )
+            .with_user_reader(user_repository)
             .with_system_config_values_for_tests([(
-                "max_response_body_size".to_string(),
-                json!(128),
+                "request_capture_policy".to_string(),
+                json!({
+                    "request_record_level": "full",
+                    "max_response_body_bytes": 128,
+                    "scope": {
+                        "mode": "include_groups",
+                        "group_ids": [capture_group.id]
+                    }
+                }),
             )]),
         )
         .with_usage_runtime_for_tests(UsageRuntimeConfig {

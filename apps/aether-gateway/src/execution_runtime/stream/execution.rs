@@ -3274,8 +3274,14 @@ async fn execute_stream_from_frame_stream(
     let plan_for_report = plan;
     let emit_passthrough_sse_terminal_error =
         response_headers_are_sse && !is_openai_image_stream_for_report;
-    let body_capture_policy = match UsageRuntimeAccess::body_capture_policy(state.data.as_ref())
-        .await
+    // Capture scopes are evaluated per authenticated user. Reading the global
+    // policy without this ID downgrades include_groups requests to Basic and
+    // disables provider/client stream response buffering.
+    let body_capture_policy = match UsageRuntimeAccess::body_capture_policy_for_user(
+        state.data.as_ref(),
+        lifecycle_seed_for_report.user_id.as_deref(),
+    )
+    .await
     {
         Ok(policy) => policy,
         Err(err) => {
