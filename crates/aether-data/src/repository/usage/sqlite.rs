@@ -289,8 +289,29 @@ CASE
     OR LOWER(COALESCE(endpoint_api_format, api_format, '')) LIKE 'google:%'
   )
   AND COALESCE(input_tokens, 0) > 0
-  AND COALESCE(cache_read_input_tokens, 0) > 0
-  THEN MAX(COALESCE(input_tokens, 0) - COALESCE(cache_read_input_tokens, 0), 0)
+  AND (
+    COALESCE(cache_creation_input_tokens, 0) > 0
+    OR COALESCE(cache_creation_ephemeral_5m_input_tokens, 0) > 0
+    OR COALESCE(cache_creation_ephemeral_1h_input_tokens, 0) > 0
+    OR COALESCE(cache_read_input_tokens, 0) > 0
+  )
+  THEN MAX(
+    COALESCE(input_tokens, 0)
+      - (
+          CASE
+            WHEN COALESCE(cache_creation_input_tokens, 0) = 0
+                 AND (
+                   COALESCE(cache_creation_ephemeral_5m_input_tokens, 0)
+                   + COALESCE(cache_creation_ephemeral_1h_input_tokens, 0)
+                 ) > 0
+            THEN COALESCE(cache_creation_ephemeral_5m_input_tokens, 0)
+               + COALESCE(cache_creation_ephemeral_1h_input_tokens, 0)
+            ELSE MAX(COALESCE(cache_creation_input_tokens, 0), 0)
+          END
+        )
+      - MAX(COALESCE(cache_read_input_tokens, 0), 0),
+    0
+  )
   ELSE MAX(COALESCE(input_tokens, 0), 0)
 END
 "#;
@@ -307,26 +328,42 @@ CASE
   )
   THEN (
     CASE
-      WHEN COALESCE(input_tokens, 0) > 0 AND COALESCE(cache_read_input_tokens, 0) > 0
-      THEN MAX(COALESCE(input_tokens, 0) - COALESCE(cache_read_input_tokens, 0), 0)
+      WHEN COALESCE(input_tokens, 0) > 0
+      THEN MAX(
+        COALESCE(input_tokens, 0)
+          - (
+              CASE
+                WHEN COALESCE(cache_creation_input_tokens, 0) = 0
+                     AND (
+                       COALESCE(cache_creation_ephemeral_5m_input_tokens, 0)
+                       + COALESCE(cache_creation_ephemeral_1h_input_tokens, 0)
+                     ) > 0
+                THEN COALESCE(cache_creation_ephemeral_5m_input_tokens, 0)
+                   + COALESCE(cache_creation_ephemeral_1h_input_tokens, 0)
+                ELSE MAX(COALESCE(cache_creation_input_tokens, 0), 0)
+              END
+            )
+          - MAX(COALESCE(cache_read_input_tokens, 0), 0),
+        0
+      )
       ELSE MAX(COALESCE(input_tokens, 0), 0)
     END
-  ) + MAX(COALESCE(cache_read_input_tokens, 0), 0)
+  )
   ELSE MAX(COALESCE(input_tokens, 0), 0)
-     + (
-       CASE
-         WHEN COALESCE(cache_creation_input_tokens, 0) = 0
-              AND (
-                COALESCE(cache_creation_ephemeral_5m_input_tokens, 0)
-                + COALESCE(cache_creation_ephemeral_1h_input_tokens, 0)
-              ) > 0
-         THEN COALESCE(cache_creation_ephemeral_5m_input_tokens, 0)
-            + COALESCE(cache_creation_ephemeral_1h_input_tokens, 0)
-         ELSE MAX(COALESCE(cache_creation_input_tokens, 0), 0)
-       END
-     )
-     + MAX(COALESCE(cache_read_input_tokens, 0), 0)
 END
++ (
+    CASE
+      WHEN COALESCE(cache_creation_input_tokens, 0) = 0
+           AND (
+             COALESCE(cache_creation_ephemeral_5m_input_tokens, 0)
+             + COALESCE(cache_creation_ephemeral_1h_input_tokens, 0)
+           ) > 0
+      THEN COALESCE(cache_creation_ephemeral_5m_input_tokens, 0)
+         + COALESCE(cache_creation_ephemeral_1h_input_tokens, 0)
+      ELSE MAX(COALESCE(cache_creation_input_tokens, 0), 0)
+    END
+  )
++ MAX(COALESCE(cache_read_input_tokens, 0), 0)
 "#;
 
 const SQLITE_USAGE_CANONICAL_TOTAL_TOKENS_EXPR: &str = r#"
@@ -341,8 +378,23 @@ const SQLITE_USAGE_CANONICAL_TOTAL_TOKENS_EXPR: &str = r#"
       OR LOWER(COALESCE(endpoint_api_format, api_format, '')) LIKE 'google:%'
     )
     AND COALESCE(input_tokens, 0) > 0
-    AND COALESCE(cache_read_input_tokens, 0) > 0
-    THEN MAX(COALESCE(input_tokens, 0) - COALESCE(cache_read_input_tokens, 0), 0)
+    THEN MAX(
+      COALESCE(input_tokens, 0)
+        - (
+            CASE
+              WHEN COALESCE(cache_creation_input_tokens, 0) = 0
+                   AND (
+                     COALESCE(cache_creation_ephemeral_5m_input_tokens, 0)
+                     + COALESCE(cache_creation_ephemeral_1h_input_tokens, 0)
+                   ) > 0
+              THEN COALESCE(cache_creation_ephemeral_5m_input_tokens, 0)
+                 + COALESCE(cache_creation_ephemeral_1h_input_tokens, 0)
+              ELSE MAX(COALESCE(cache_creation_input_tokens, 0), 0)
+            END
+          )
+        - MAX(COALESCE(cache_read_input_tokens, 0), 0),
+      0
+    )
     ELSE MAX(COALESCE(input_tokens, 0), 0)
   END
   + MAX(COALESCE(output_tokens, 0), 0)
@@ -4843,6 +4895,47 @@ INSERT INTO request_candidates (
         assert_eq!(summary.total_requests, 2);
         assert_eq!(summary.error_requests, 1);
         assert_eq!(summary.total_tokens, 10);
+    }
+
+    #[tokio::test]
+    async fn sqlite_dashboard_excludes_openai_cache_write_from_effective_input() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("sqlite pool should connect");
+        run_sqlite_migrations(&pool)
+            .await
+            .expect("sqlite migrations should run");
+        seed_stats_targets(&pool).await;
+
+        let mut usage = sample_usage("request-cache-write", "completed", "settled", 1_000);
+        usage.input_tokens = Some(100);
+        usage.output_tokens = Some(20);
+        usage.total_tokens = None;
+        usage.cache_creation_input_tokens = Some(20);
+        usage.cache_read_input_tokens = Some(30);
+
+        SqliteUsageWriteRepository::new(pool.clone())
+            .upsert(usage)
+            .await
+            .expect("usage should upsert");
+
+        let summary = SqliteUsageReadRepository::new(pool)
+            .summarize_dashboard_usage(&UsageDashboardSummaryQuery {
+                created_from_unix_secs: 999,
+                created_until_unix_secs: 1_001,
+                user_id: None,
+            })
+            .await
+            .expect("dashboard summary should load");
+
+        assert_eq!(summary.input_tokens, 100);
+        assert_eq!(summary.effective_input_tokens, 50);
+        assert_eq!(summary.cache_creation_tokens, 20);
+        assert_eq!(summary.cache_read_tokens, 30);
+        assert_eq!(summary.total_input_context, 100);
+        assert_eq!(summary.total_tokens, 120);
     }
 
     #[tokio::test]

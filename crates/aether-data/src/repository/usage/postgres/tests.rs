@@ -1933,3 +1933,21 @@ fn attach_usage_settlement_pricing_snapshot_metadata_adds_missing_values_without
         })
     );
 }
+
+#[test]
+fn settlement_fallback_normalizes_cache_write_and_read_tokens_once() {
+    let effective = super::usage_effective_input_tokens(Some(100), Some(20), Some(30), "openai");
+    assert_eq!(effective, Some(50));
+    assert_eq!(
+        super::usage_total_input_context(Some(100), effective, Some(20), Some(30),),
+        Some(100)
+    );
+
+    let claude_effective =
+        super::usage_effective_input_tokens(Some(100), Some(20), Some(30), "claude");
+    assert_eq!(claude_effective, Some(100));
+    assert_eq!(
+        super::usage_total_input_context(Some(100), claude_effective, Some(20), Some(30),),
+        Some(150)
+    );
+}

@@ -177,135 +177,23 @@ SELECT
   COALESCE(settlement.billing_status, usage_rows.billing_status) AS billing_status,
   usage_rows.created_at,
   COALESCE(settlement.finalized_at, usage_rows.finalized_at) AS finalized_at,
-  GREATEST(COALESCE(settlement.billing_input_tokens, usage_rows.input_tokens, 0), 0)::bigint
-    AS input_tokens,
-  GREATEST(
-    COALESCE(
-      settlement.billing_effective_input_tokens,
-      CASE
-        WHEN GREATEST(COALESCE(usage_rows.input_tokens, 0), 0) <= 0 THEN 0
-        WHEN GREATEST(COALESCE(usage_rows.cache_read_input_tokens, 0), 0) <= 0
-        THEN GREATEST(COALESCE(usage_rows.input_tokens, 0), 0)
-        WHEN split_part(lower(COALESCE(COALESCE(usage_rows.endpoint_api_format, usage_rows.api_format), '')), ':', 1)
-             IN ('openai', 'gemini', 'google')
-        THEN GREATEST(
-          GREATEST(COALESCE(usage_rows.input_tokens, 0), 0)
-            - GREATEST(COALESCE(usage_rows.cache_read_input_tokens, 0), 0),
-          0
-        )
-        ELSE GREATEST(COALESCE(usage_rows.input_tokens, 0), 0)
-      END
-    ),
-    0
-  )::bigint AS effective_input_tokens,
-  GREATEST(COALESCE(settlement.billing_output_tokens, usage_rows.output_tokens, 0), 0)::bigint
-    AS output_tokens,
-  GREATEST(
-    COALESCE(
-      settlement.billing_cache_creation_tokens,
-      CASE
-        WHEN COALESCE(usage_rows.cache_creation_input_tokens, 0) = 0
-             AND (
-               COALESCE(usage_rows.cache_creation_input_tokens_5m, 0)
-               + COALESCE(usage_rows.cache_creation_input_tokens_1h, 0)
-             ) > 0
-        THEN COALESCE(usage_rows.cache_creation_input_tokens_5m, 0)
-           + COALESCE(usage_rows.cache_creation_input_tokens_1h, 0)
-        ELSE COALESCE(usage_rows.cache_creation_input_tokens, 0)
-      END,
-      0
-    ),
-    0
-  )::bigint AS cache_creation_input_tokens,
-  GREATEST(
-    COALESCE(
-      settlement.billing_cache_creation_5m_tokens,
-      usage_rows.cache_creation_input_tokens_5m,
-      0
-    ),
-    0
-  )::bigint AS cache_creation_input_tokens_5m,
-  GREATEST(
-    COALESCE(
-      settlement.billing_cache_creation_1h_tokens,
-      usage_rows.cache_creation_input_tokens_1h,
-      0
-    ),
-    0
-  )::bigint AS cache_creation_input_tokens_1h,
-  GREATEST(COALESCE(settlement.billing_cache_read_tokens, usage_rows.cache_read_input_tokens, 0), 0)::bigint
-    AS cache_read_input_tokens,
-  GREATEST(
-    COALESCE(
-      CASE
-        WHEN settlement.billing_input_tokens IS NOT NULL
-          OR settlement.billing_output_tokens IS NOT NULL
-          OR settlement.billing_cache_creation_tokens IS NOT NULL
-          OR settlement.billing_cache_creation_5m_tokens IS NOT NULL
-          OR settlement.billing_cache_creation_1h_tokens IS NOT NULL
-          OR settlement.billing_cache_read_tokens IS NOT NULL
-        THEN COALESCE(settlement.billing_input_tokens, 0)
-          + COALESCE(settlement.billing_output_tokens, 0)
-          + COALESCE(
-              settlement.billing_cache_creation_tokens,
-              COALESCE(settlement.billing_cache_creation_5m_tokens, 0)
-                + COALESCE(settlement.billing_cache_creation_1h_tokens, 0),
-              0
-            )
-          + COALESCE(settlement.billing_cache_read_tokens, 0)
-      END,
-      usage_rows.total_tokens,
-      0
-    ),
-    0
+  resolved_tokens.input_tokens::bigint AS input_tokens,
+  normalized_tokens.effective_input_tokens::bigint AS effective_input_tokens,
+  resolved_tokens.output_tokens::bigint AS output_tokens,
+  resolved_tokens.cache_creation_tokens::bigint AS cache_creation_input_tokens,
+  resolved_tokens.cache_creation_5m_tokens::bigint AS cache_creation_input_tokens_5m,
+  resolved_tokens.cache_creation_1h_tokens::bigint AS cache_creation_input_tokens_1h,
+  resolved_tokens.cache_read_tokens::bigint AS cache_read_input_tokens,
+  (
+    normalized_tokens.effective_input_tokens
+      + resolved_tokens.output_tokens
+      + resolved_tokens.cache_creation_tokens
+      + resolved_tokens.cache_read_tokens
   )::bigint AS total_tokens,
-  GREATEST(
-    COALESCE(
-      settlement.billing_total_input_context,
-      CASE
-        WHEN split_part(lower(COALESCE(COALESCE(usage_rows.endpoint_api_format, usage_rows.api_format), '')), ':', 1)
-             IN ('claude', 'anthropic')
-        THEN GREATEST(COALESCE(usage_rows.input_tokens, 0), 0)
-           + CASE
-               WHEN COALESCE(usage_rows.cache_creation_input_tokens, 0) = 0
-                    AND (
-                      COALESCE(usage_rows.cache_creation_input_tokens_5m, 0)
-                      + COALESCE(usage_rows.cache_creation_input_tokens_1h, 0)
-                    ) > 0
-               THEN COALESCE(usage_rows.cache_creation_input_tokens_5m, 0)
-                  + COALESCE(usage_rows.cache_creation_input_tokens_1h, 0)
-               ELSE COALESCE(usage_rows.cache_creation_input_tokens, 0)
-             END
-           + GREATEST(COALESCE(usage_rows.cache_read_input_tokens, 0), 0)
-        WHEN split_part(lower(COALESCE(COALESCE(usage_rows.endpoint_api_format, usage_rows.api_format), '')), ':', 1)
-             IN ('openai', 'gemini', 'google')
-        THEN CASE
-               WHEN GREATEST(COALESCE(usage_rows.input_tokens, 0), 0) <= 0 THEN 0
-               WHEN GREATEST(COALESCE(usage_rows.cache_read_input_tokens, 0), 0) <= 0
-               THEN GREATEST(COALESCE(usage_rows.input_tokens, 0), 0)
-               ELSE GREATEST(
-                 GREATEST(COALESCE(usage_rows.input_tokens, 0), 0)
-                   - GREATEST(COALESCE(usage_rows.cache_read_input_tokens, 0), 0),
-                 0
-               )
-             END
-           + GREATEST(COALESCE(usage_rows.cache_read_input_tokens, 0), 0)
-        ELSE GREATEST(COALESCE(usage_rows.input_tokens, 0), 0)
-           + CASE
-               WHEN COALESCE(usage_rows.cache_creation_input_tokens, 0) = 0
-                    AND (
-                      COALESCE(usage_rows.cache_creation_input_tokens_5m, 0)
-                      + COALESCE(usage_rows.cache_creation_input_tokens_1h, 0)
-                    ) > 0
-               THEN COALESCE(usage_rows.cache_creation_input_tokens_5m, 0)
-                  + COALESCE(usage_rows.cache_creation_input_tokens_1h, 0)
-               ELSE COALESCE(usage_rows.cache_creation_input_tokens, 0)
-             END
-           + GREATEST(COALESCE(usage_rows.cache_read_input_tokens, 0), 0)
-      END,
-      0
-    ),
-    0
+  (
+    normalized_tokens.effective_input_tokens
+      + resolved_tokens.cache_creation_tokens
+      + resolved_tokens.cache_read_tokens
   )::bigint AS total_input_context,
   COALESCE(CAST(usage_rows.input_cost_usd AS DOUBLE PRECISION), 0) AS input_cost_usd,
   COALESCE(CAST(usage_rows.output_cost_usd AS DOUBLE PRECISION), 0) AS output_cost_usd,
@@ -355,7 +243,73 @@ SELECT
   COALESCE(usage_rows.upstream_is_stream, COALESCE(usage_rows.is_stream, FALSE)) AS upstream_is_stream
 FROM public."usage" AS usage_rows
 LEFT JOIN public.usage_settlement_snapshots AS settlement
-  ON settlement.request_id = usage_rows.request_id;
+  ON settlement.request_id = usage_rows.request_id
+CROSS JOIN LATERAL (
+  SELECT
+    GREATEST(COALESCE(settlement.billing_input_tokens, usage_rows.input_tokens, 0), 0) AS input_tokens,
+    GREATEST(COALESCE(settlement.billing_output_tokens, usage_rows.output_tokens, 0), 0) AS output_tokens,
+    GREATEST(
+      COALESCE(
+        settlement.billing_cache_creation_tokens,
+        CASE
+          WHEN COALESCE(usage_rows.cache_creation_input_tokens, 0) = 0
+               AND (
+                 COALESCE(usage_rows.cache_creation_input_tokens_5m, 0)
+                 + COALESCE(usage_rows.cache_creation_input_tokens_1h, 0)
+               ) > 0
+          THEN COALESCE(usage_rows.cache_creation_input_tokens_5m, 0)
+             + COALESCE(usage_rows.cache_creation_input_tokens_1h, 0)
+          ELSE COALESCE(usage_rows.cache_creation_input_tokens, 0)
+        END,
+        0
+      ),
+      0
+    ) AS cache_creation_tokens,
+    GREATEST(
+      COALESCE(
+        settlement.billing_cache_creation_5m_tokens,
+        usage_rows.cache_creation_input_tokens_5m,
+        0
+      ),
+      0
+    ) AS cache_creation_5m_tokens,
+    GREATEST(
+      COALESCE(
+        settlement.billing_cache_creation_1h_tokens,
+        usage_rows.cache_creation_input_tokens_1h,
+        0
+      ),
+      0
+    ) AS cache_creation_1h_tokens,
+    GREATEST(
+      COALESCE(settlement.billing_cache_read_tokens, usage_rows.cache_read_input_tokens, 0),
+      0
+    ) AS cache_read_tokens
+) AS resolved_tokens
+CROSS JOIN LATERAL (
+  SELECT GREATEST(
+    COALESCE(
+      settlement.billing_effective_input_tokens,
+      CASE
+        WHEN settlement.billing_input_tokens IS NOT NULL
+        THEN resolved_tokens.input_tokens
+        WHEN split_part(
+          lower(COALESCE(usage_rows.endpoint_api_format, usage_rows.api_format, '')),
+          ':',
+          1
+        ) IN ('openai', 'gemini', 'google')
+        THEN GREATEST(
+          resolved_tokens.input_tokens
+            - resolved_tokens.cache_creation_tokens
+            - resolved_tokens.cache_read_tokens,
+          0
+        )
+        ELSE resolved_tokens.input_tokens
+      END
+    ),
+    0
+  ) AS effective_input_tokens
+) AS normalized_tokens;
 
 COMMENT ON VIEW public.usage_billing_facts IS
   'Canonical billing read model. Token/cost fields prefer usage_settlement_snapshots.billing_* and fall back to deprecated usage mirrors for legacy rows.';

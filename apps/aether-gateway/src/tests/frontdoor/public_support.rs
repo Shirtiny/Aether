@@ -5740,7 +5740,7 @@ async fn gateway_handles_users_me_usage_locally_without_proxying_upstream() {
         payload["records"][0]["cache_creation_ephemeral_5m_input_tokens"],
         4
     );
-    assert_eq!(payload["records"][0]["effective_input_tokens"], 105);
+    assert_eq!(payload["records"][0]["effective_input_tokens"], 95);
     assert_eq!(
         payload["records"][0]["cache_creation_ephemeral_1h_input_tokens"],
         6
@@ -5767,10 +5767,7 @@ async fn gateway_handles_users_me_usage_locally_without_proxying_upstream() {
         payload["summary_by_model"][0]["cache_creation_ephemeral_1h_tokens"],
         6
     );
-    assert_eq!(
-        payload["summary_by_model"][0]["effective_input_tokens"],
-        105
-    );
+    assert_eq!(payload["summary_by_model"][0]["effective_input_tokens"], 95);
     assert_eq!(payload["summary_by_model"][0]["total_input_context"], 120);
     assert!(payload.get("summary_by_provider").is_none());
     assert_eq!(payload["billing"]["id"], "wallet-auth-1");

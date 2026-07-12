@@ -804,7 +804,7 @@ fn gateway_records_openai_sync_usage_and_pricing_with_cache_tokens() {
 async fn gateway_records_openai_sync_usage_and_pricing_with_cache_tokens_impl() {
     let expected = ExpectedUsagePricing {
         input_tokens: 120,
-        billed_input_tokens: 100,
+        billed_input_tokens: 20,
         output_tokens: 40,
         cache_creation_tokens: 80,
         cache_creation_ephemeral_5m_tokens: 0,
@@ -898,7 +898,7 @@ fn gateway_records_openai_stream_usage_and_pricing_with_cache_tokens() {
 async fn gateway_records_openai_stream_usage_and_pricing_with_cache_tokens_impl() {
     let expected = ExpectedUsagePricing {
         input_tokens: 240,
-        billed_input_tokens: 200,
+        billed_input_tokens: 120,
         output_tokens: 60,
         cache_creation_tokens: 80,
         cache_creation_ephemeral_5m_tokens: 0,

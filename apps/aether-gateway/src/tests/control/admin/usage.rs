@@ -641,7 +641,7 @@ async fn gateway_handles_admin_usage_aggregation_stats_locally_with_trusted_admi
     assert_eq!(items[0]["model"], "gpt-5");
     assert_eq!(items[0]["request_count"], 2);
     assert_eq!(items[0]["output_tokens"], 40);
-    assert_eq!(items[0]["effective_input_tokens"], 150);
+    assert_eq!(items[0]["effective_input_tokens"], 120);
     assert_eq!(items[0]["total_input_context"], 160);
     assert_eq!(items[0]["cache_creation_tokens"], 30);
     assert_eq!(items[0]["cache_creation_ephemeral_5m_tokens"], 12);
@@ -1026,7 +1026,7 @@ async fn gateway_handles_admin_usage_active_locally_with_trusted_admin_principal
     let payload: serde_json::Value = response.json().await.expect("json body should parse");
     assert_eq!(payload["requests"].as_array().expect("array").len(), 1);
     assert_eq!(payload["requests"][0]["id"], "usage-pending");
-    assert_eq!(payload["requests"][0]["effective_input_tokens"], 5);
+    assert_eq!(payload["requests"][0]["effective_input_tokens"], 0);
     assert_eq!(payload["requests"][0]["provider"], "OpenAI");
     assert_eq!(payload["requests"][0]["api_key_name"], "fresh-primary");
     assert_eq!(payload["requests"][0]["has_fallback"], true);
@@ -1250,7 +1250,7 @@ async fn gateway_handles_admin_usage_records_locally_with_trusted_admin_principa
         payload["records"][0]["provider_key_name"],
         "upstream-primary"
     );
-    assert_eq!(payload["records"][0]["effective_input_tokens"], 35);
+    assert_eq!(payload["records"][0]["effective_input_tokens"], 20);
     assert_eq!(payload["records"][0]["first_byte_time_ms"], 120);
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
@@ -1957,8 +1957,8 @@ async fn gateway_handles_admin_usage_detail_locally_with_trusted_admin_principal
     assert_eq!(payload["api_key"]["name"], "primary");
     assert_eq!(payload["provider"], "OpenAI");
     assert_eq!(payload["model"], "gpt-5");
-    assert_eq!(payload["effective_input_tokens"], 115);
-    assert_eq!(payload["total_tokens"], 165);
+    assert_eq!(payload["effective_input_tokens"], 100);
+    assert_eq!(payload["total_tokens"], 150);
     assert_eq!(payload["cache_creation_cost"], 0.0);
     assert_eq!(payload["cache_read_cost"], 0.0);
     assert_eq!(

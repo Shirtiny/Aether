@@ -87,133 +87,7 @@ SELECT
     (
         SELECT CAST(
             COALESCE(
-                SUM(
-                    CASE
-                        WHEN split_part(
-                            lower(
-                                COALESCE(
-                                    COALESCE(
-                                        completed_usage.endpoint_api_format,
-                                        completed_usage.api_format
-                                    ),
-                                    ''
-                                )
-                            ),
-                            ':',
-                            1
-                        ) IN ('claude', 'anthropic')
-                        THEN GREATEST(COALESCE(completed_usage.input_tokens, 0), 0)
-                            + CASE
-                                WHEN COALESCE(completed_usage.cache_creation_input_tokens, 0) = 0
-                                     AND (
-                                        COALESCE(completed_usage.cache_creation_input_tokens_5m, 0)
-                                        + COALESCE(completed_usage.cache_creation_input_tokens_1h, 0)
-                                     ) > 0
-                                THEN COALESCE(completed_usage.cache_creation_input_tokens_5m, 0)
-                                    + COALESCE(completed_usage.cache_creation_input_tokens_1h, 0)
-                                ELSE COALESCE(completed_usage.cache_creation_input_tokens, 0)
-                              END
-                            + GREATEST(COALESCE(completed_usage.cache_read_input_tokens, 0), 0)
-                        WHEN split_part(
-                            lower(
-                                COALESCE(
-                                    COALESCE(
-                                        completed_usage.endpoint_api_format,
-                                        completed_usage.api_format
-                                    ),
-                                    ''
-                                )
-                            ),
-                            ':',
-                            1
-                        ) IN ('openai', 'gemini', 'google')
-                        THEN (
-                            CASE
-                                WHEN GREATEST(COALESCE(completed_usage.input_tokens, 0), 0) <= 0
-                                THEN 0
-                                WHEN GREATEST(
-                                    COALESCE(completed_usage.cache_read_input_tokens, 0),
-                                    0
-                                ) <= 0
-                                THEN GREATEST(COALESCE(completed_usage.input_tokens, 0), 0)
-                                ELSE GREATEST(
-                                    GREATEST(COALESCE(completed_usage.input_tokens, 0), 0)
-                                        - GREATEST(
-                                            COALESCE(completed_usage.cache_read_input_tokens, 0),
-                                            0
-                                        ),
-                                    0
-                                )
-                            END
-                        ) + GREATEST(COALESCE(completed_usage.cache_read_input_tokens, 0), 0)
-                        ELSE CASE
-                            WHEN (
-                                CASE
-                                    WHEN COALESCE(
-                                        completed_usage.cache_creation_input_tokens,
-                                        0
-                                    ) = 0
-                                         AND (
-                                            COALESCE(
-                                                completed_usage.cache_creation_input_tokens_5m,
-                                                0
-                                            )
-                                            + COALESCE(
-                                                completed_usage.cache_creation_input_tokens_1h,
-                                                0
-                                            )
-                                         ) > 0
-                                    THEN COALESCE(
-                                        completed_usage.cache_creation_input_tokens_5m,
-                                        0
-                                    )
-                                        + COALESCE(
-                                            completed_usage.cache_creation_input_tokens_1h,
-                                            0
-                                        )
-                                    ELSE COALESCE(
-                                        completed_usage.cache_creation_input_tokens,
-                                        0
-                                    )
-                                END
-                            ) > 0
-                            THEN GREATEST(COALESCE(completed_usage.input_tokens, 0), 0)
-                                + (
-                                    CASE
-                                        WHEN COALESCE(
-                                            completed_usage.cache_creation_input_tokens,
-                                            0
-                                        ) = 0
-                                             AND (
-                                                COALESCE(
-                                                    completed_usage.cache_creation_input_tokens_5m,
-                                                    0
-                                                )
-                                                + COALESCE(
-                                                    completed_usage.cache_creation_input_tokens_1h,
-                                                    0
-                                                )
-                                             ) > 0
-                                        THEN COALESCE(
-                                            completed_usage.cache_creation_input_tokens_5m,
-                                            0
-                                        )
-                                            + COALESCE(
-                                                completed_usage.cache_creation_input_tokens_1h,
-                                                0
-                                            )
-                                        ELSE COALESCE(
-                                            completed_usage.cache_creation_input_tokens,
-                                            0
-                                        )
-                                    END
-                                )
-                                + GREATEST(COALESCE(completed_usage.cache_read_input_tokens, 0), 0)
-                            ELSE GREATEST(COALESCE(completed_usage.input_tokens, 0), 0)
-                                + GREATEST(COALESCE(completed_usage.cache_read_input_tokens, 0), 0)
-                        END
-                    END
-                ),
+                SUM(GREATEST(COALESCE(completed_usage.total_input_context, 0), 0)),
                 0
             ) AS BIGINT
         )
@@ -349,26 +223,7 @@ SELECT
         ) AS BIGINT
     ) AS error_requests,
     CAST(COALESCE(SUM(input_tokens), 0) AS BIGINT) AS input_tokens,
-    CAST(
-        COALESCE(
-            SUM(
-                CASE
-                    WHEN GREATEST(COALESCE(input_tokens, 0), 0) <= 0 THEN 0
-                    WHEN GREATEST(COALESCE(cache_read_input_tokens, 0), 0) <= 0
-                    THEN GREATEST(COALESCE(input_tokens, 0), 0)
-                    WHEN split_part(lower(COALESCE(COALESCE(endpoint_api_format, api_format), '')), ':', 1)
-                         IN ('openai', 'gemini', 'google')
-                    THEN GREATEST(
-                        GREATEST(COALESCE(input_tokens, 0), 0)
-                            - GREATEST(COALESCE(cache_read_input_tokens, 0), 0),
-                        0
-                    )
-                    ELSE GREATEST(COALESCE(input_tokens, 0), 0)
-                END
-            ),
-            0
-        ) AS BIGINT
-    ) AS effective_input_tokens,
+    CAST(COALESCE(SUM(GREATEST(COALESCE(effective_input_tokens, 0), 0)), 0) AS BIGINT) AS effective_input_tokens,
     CAST(COALESCE(SUM(output_tokens), 0) AS BIGINT) AS output_tokens,
     CAST(
         COALESCE(
@@ -392,73 +247,7 @@ SELECT
     CAST(COALESCE(SUM(cache_creation_input_tokens_1h), 0) AS BIGINT)
         AS cache_creation_ephemeral_1h_tokens,
     CAST(COALESCE(SUM(cache_read_input_tokens), 0) AS BIGINT) AS cache_read_tokens,
-    CAST(
-        COALESCE(
-            SUM(
-                CASE
-                    WHEN split_part(lower(COALESCE(COALESCE(endpoint_api_format, api_format), '')), ':', 1)
-                         IN ('claude', 'anthropic')
-                    THEN GREATEST(COALESCE(input_tokens, 0), 0)
-                        + CASE
-                            WHEN COALESCE(cache_creation_input_tokens, 0) = 0
-                                 AND (
-                                    COALESCE(cache_creation_input_tokens_5m, 0)
-                                    + COALESCE(cache_creation_input_tokens_1h, 0)
-                                 ) > 0
-                            THEN COALESCE(cache_creation_input_tokens_5m, 0)
-                                + COALESCE(cache_creation_input_tokens_1h, 0)
-                            ELSE COALESCE(cache_creation_input_tokens, 0)
-                          END
-                        + GREATEST(COALESCE(cache_read_input_tokens, 0), 0)
-                    WHEN split_part(lower(COALESCE(COALESCE(endpoint_api_format, api_format), '')), ':', 1)
-                         IN ('openai', 'gemini', 'google')
-                    THEN (
-                        CASE
-                            WHEN GREATEST(COALESCE(input_tokens, 0), 0) <= 0 THEN 0
-                            WHEN GREATEST(COALESCE(cache_read_input_tokens, 0), 0) <= 0
-                            THEN GREATEST(COALESCE(input_tokens, 0), 0)
-                            ELSE GREATEST(
-                                GREATEST(COALESCE(input_tokens, 0), 0)
-                                    - GREATEST(COALESCE(cache_read_input_tokens, 0), 0),
-                                0
-                            )
-                        END
-                    ) + GREATEST(COALESCE(cache_read_input_tokens, 0), 0)
-                    ELSE CASE
-                        WHEN (
-                            CASE
-                                WHEN COALESCE(cache_creation_input_tokens, 0) = 0
-                                     AND (
-                                        COALESCE(cache_creation_input_tokens_5m, 0)
-                                        + COALESCE(cache_creation_input_tokens_1h, 0)
-                                     ) > 0
-                                THEN COALESCE(cache_creation_input_tokens_5m, 0)
-                                    + COALESCE(cache_creation_input_tokens_1h, 0)
-                                ELSE COALESCE(cache_creation_input_tokens, 0)
-                            END
-                        ) > 0
-                        THEN GREATEST(COALESCE(input_tokens, 0), 0)
-                            + (
-                                CASE
-                                    WHEN COALESCE(cache_creation_input_tokens, 0) = 0
-                                         AND (
-                                            COALESCE(cache_creation_input_tokens_5m, 0)
-                                            + COALESCE(cache_creation_input_tokens_1h, 0)
-                                         ) > 0
-                                    THEN COALESCE(cache_creation_input_tokens_5m, 0)
-                                        + COALESCE(cache_creation_input_tokens_1h, 0)
-                                    ELSE COALESCE(cache_creation_input_tokens, 0)
-                                END
-                              )
-                            + GREATEST(COALESCE(cache_read_input_tokens, 0), 0)
-                        ELSE GREATEST(COALESCE(input_tokens, 0), 0)
-                            + GREATEST(COALESCE(cache_read_input_tokens, 0), 0)
-                    END
-                END
-            ),
-            0
-        ) AS BIGINT
-    ) AS total_input_context,
+    CAST(COALESCE(SUM(GREATEST(COALESCE(total_input_context, 0), 0)), 0) AS BIGINT) AS total_input_context,
     CAST(COALESCE(SUM(total_cost_usd), 0) AS DOUBLE PRECISION) AS total_cost,
     CAST(COALESCE(SUM(actual_total_cost_usd), 0) AS DOUBLE PRECISION) AS actual_total_cost,
     CAST(COALESCE(SUM(input_cost_usd), 0) AS DOUBLE PRECISION) AS input_cost,
@@ -1216,26 +1005,7 @@ WITH aggregated AS (
             ) AS BIGINT
         ) AS error_requests,
         CAST(COALESCE(SUM(input_tokens), 0) AS BIGINT) AS input_tokens,
-        CAST(
-            COALESCE(
-                SUM(
-                    CASE
-                        WHEN GREATEST(COALESCE(input_tokens, 0), 0) <= 0 THEN 0
-                        WHEN GREATEST(COALESCE(cache_read_input_tokens, 0), 0) <= 0
-                        THEN GREATEST(COALESCE(input_tokens, 0), 0)
-                        WHEN split_part(lower(COALESCE(COALESCE(endpoint_api_format, api_format), '')), ':', 1)
-                             IN ('openai', 'gemini', 'google')
-                        THEN GREATEST(
-                            GREATEST(COALESCE(input_tokens, 0), 0)
-                                - GREATEST(COALESCE(cache_read_input_tokens, 0), 0),
-                            0
-                        )
-                        ELSE GREATEST(COALESCE(input_tokens, 0), 0)
-                    END
-                ),
-                0
-            ) AS BIGINT
-        ) AS effective_input_tokens,
+        CAST(COALESCE(SUM(GREATEST(COALESCE(effective_input_tokens, 0), 0)), 0) AS BIGINT) AS effective_input_tokens,
         CAST(COALESCE(SUM(output_tokens), 0) AS BIGINT) AS output_tokens,
         CAST(COALESCE(SUM(cache_creation_input_tokens), 0) AS BIGINT) AS cache_creation_tokens,
         CAST(COALESCE(SUM(cache_read_input_tokens), 0) AS BIGINT) AS cache_read_tokens,
@@ -1360,26 +1130,7 @@ WITH aggregated AS (
             ) AS BIGINT
         ) AS error_requests,
         CAST(COALESCE(SUM(input_tokens), 0) AS BIGINT) AS input_tokens,
-        CAST(
-            COALESCE(
-                SUM(
-                    CASE
-                        WHEN GREATEST(COALESCE(input_tokens, 0), 0) <= 0 THEN 0
-                        WHEN GREATEST(COALESCE(cache_read_input_tokens, 0), 0) <= 0
-                        THEN GREATEST(COALESCE(input_tokens, 0), 0)
-                        WHEN split_part(lower(COALESCE(COALESCE(endpoint_api_format, api_format), '')), ':', 1)
-                             IN ('openai', 'gemini', 'google')
-                        THEN GREATEST(
-                            GREATEST(COALESCE(input_tokens, 0), 0)
-                                - GREATEST(COALESCE(cache_read_input_tokens, 0), 0),
-                            0
-                        )
-                        ELSE GREATEST(COALESCE(input_tokens, 0), 0)
-                    END
-                ),
-                0
-            ) AS BIGINT
-        ) AS effective_input_tokens,
+        CAST(COALESCE(SUM(GREATEST(COALESCE(effective_input_tokens, 0), 0)), 0) AS BIGINT) AS effective_input_tokens,
         CAST(COALESCE(SUM(output_tokens), 0) AS BIGINT) AS output_tokens,
         CAST(
             COALESCE(
@@ -1403,73 +1154,7 @@ WITH aggregated AS (
         CAST(COALESCE(SUM(cache_creation_input_tokens_1h), 0) AS BIGINT)
             AS cache_creation_ephemeral_1h_tokens,
         CAST(COALESCE(SUM(cache_read_input_tokens), 0) AS BIGINT) AS cache_read_tokens,
-        CAST(
-            COALESCE(
-                SUM(
-                    CASE
-                        WHEN split_part(lower(COALESCE(COALESCE(endpoint_api_format, api_format), '')), ':', 1)
-                             IN ('claude', 'anthropic')
-                        THEN GREATEST(COALESCE(input_tokens, 0), 0)
-                            + CASE
-                                WHEN COALESCE(cache_creation_input_tokens, 0) = 0
-                                     AND (
-                                        COALESCE(cache_creation_input_tokens_5m, 0)
-                                        + COALESCE(cache_creation_input_tokens_1h, 0)
-                                     ) > 0
-                                THEN COALESCE(cache_creation_input_tokens_5m, 0)
-                                    + COALESCE(cache_creation_input_tokens_1h, 0)
-                                ELSE COALESCE(cache_creation_input_tokens, 0)
-                              END
-                            + GREATEST(COALESCE(cache_read_input_tokens, 0), 0)
-                        WHEN split_part(lower(COALESCE(COALESCE(endpoint_api_format, api_format), '')), ':', 1)
-                             IN ('openai', 'gemini', 'google')
-                        THEN (
-                            CASE
-                                WHEN GREATEST(COALESCE(input_tokens, 0), 0) <= 0 THEN 0
-                                WHEN GREATEST(COALESCE(cache_read_input_tokens, 0), 0) <= 0
-                                THEN GREATEST(COALESCE(input_tokens, 0), 0)
-                                ELSE GREATEST(
-                                    GREATEST(COALESCE(input_tokens, 0), 0)
-                                        - GREATEST(COALESCE(cache_read_input_tokens, 0), 0),
-                                    0
-                                )
-                            END
-                        ) + GREATEST(COALESCE(cache_read_input_tokens, 0), 0)
-                        ELSE CASE
-                            WHEN (
-                                CASE
-                                    WHEN COALESCE(cache_creation_input_tokens, 0) = 0
-                                         AND (
-                                            COALESCE(cache_creation_input_tokens_5m, 0)
-                                            + COALESCE(cache_creation_input_tokens_1h, 0)
-                                         ) > 0
-                                    THEN COALESCE(cache_creation_input_tokens_5m, 0)
-                                        + COALESCE(cache_creation_input_tokens_1h, 0)
-                                    ELSE COALESCE(cache_creation_input_tokens, 0)
-                                END
-                            ) > 0
-                            THEN GREATEST(COALESCE(input_tokens, 0), 0)
-                                + (
-                                    CASE
-                                        WHEN COALESCE(cache_creation_input_tokens, 0) = 0
-                                             AND (
-                                                COALESCE(cache_creation_input_tokens_5m, 0)
-                                                + COALESCE(cache_creation_input_tokens_1h, 0)
-                                             ) > 0
-                                        THEN COALESCE(cache_creation_input_tokens_5m, 0)
-                                            + COALESCE(cache_creation_input_tokens_1h, 0)
-                                        ELSE COALESCE(cache_creation_input_tokens, 0)
-                                    END
-                                  )
-                                + GREATEST(COALESCE(cache_read_input_tokens, 0), 0)
-                            ELSE GREATEST(COALESCE(input_tokens, 0), 0)
-                                + GREATEST(COALESCE(cache_read_input_tokens, 0), 0)
-                        END
-                    END
-                ),
-                0
-            ) AS BIGINT
-        ) AS total_input_context,
+        CAST(COALESCE(SUM(GREATEST(COALESCE(total_input_context, 0), 0)), 0) AS BIGINT) AS total_input_context,
         CAST(COALESCE(SUM(total_cost_usd), 0) AS DOUBLE PRECISION) AS total_cost,
         CAST(COALESCE(SUM(cache_creation_cost_usd), 0) AS DOUBLE PRECISION) AS cache_creation_cost,
         CAST(COALESCE(SUM(cache_read_cost_usd), 0) AS DOUBLE PRECISION) AS cache_read_cost,
@@ -1717,26 +1402,7 @@ WITH aggregated AS (
             ) AS BIGINT
         ) AS success_requests,
         CAST(COALESCE(SUM(input_tokens), 0) AS BIGINT) AS input_tokens,
-        CAST(
-            COALESCE(
-                SUM(
-                    CASE
-                        WHEN GREATEST(COALESCE(input_tokens, 0), 0) <= 0 THEN 0
-                        WHEN GREATEST(COALESCE(cache_read_input_tokens, 0), 0) <= 0
-                        THEN GREATEST(COALESCE(input_tokens, 0), 0)
-                        WHEN split_part(lower(COALESCE(COALESCE(endpoint_api_format, api_format), '')), ':', 1)
-                             IN ('openai', 'gemini', 'google')
-                        THEN GREATEST(
-                            GREATEST(COALESCE(input_tokens, 0), 0)
-                                - GREATEST(COALESCE(cache_read_input_tokens, 0), 0),
-                            0
-                        )
-                        ELSE GREATEST(COALESCE(input_tokens, 0), 0)
-                    END
-                ),
-                0
-            ) AS BIGINT
-        ) AS effective_input_tokens,
+        CAST(COALESCE(SUM(GREATEST(COALESCE(effective_input_tokens, 0), 0)), 0) AS BIGINT) AS effective_input_tokens,
         CAST(COALESCE(SUM(output_tokens), 0) AS BIGINT) AS output_tokens,
         CAST(COALESCE(SUM(total_tokens), 0) AS BIGINT) AS total_tokens,
         CAST(
@@ -1761,73 +1427,7 @@ WITH aggregated AS (
         CAST(COALESCE(SUM(cache_creation_input_tokens_1h), 0) AS BIGINT)
             AS cache_creation_ephemeral_1h_tokens,
         CAST(COALESCE(SUM(cache_read_input_tokens), 0) AS BIGINT) AS cache_read_tokens,
-        CAST(
-            COALESCE(
-                SUM(
-                    CASE
-                        WHEN split_part(lower(COALESCE(COALESCE(endpoint_api_format, api_format), '')), ':', 1)
-                             IN ('claude', 'anthropic')
-                        THEN GREATEST(COALESCE(input_tokens, 0), 0)
-                            + CASE
-                                WHEN COALESCE(cache_creation_input_tokens, 0) = 0
-                                     AND (
-                                        COALESCE(cache_creation_input_tokens_5m, 0)
-                                        + COALESCE(cache_creation_input_tokens_1h, 0)
-                                     ) > 0
-                                THEN COALESCE(cache_creation_input_tokens_5m, 0)
-                                    + COALESCE(cache_creation_input_tokens_1h, 0)
-                                ELSE COALESCE(cache_creation_input_tokens, 0)
-                              END
-                            + GREATEST(COALESCE(cache_read_input_tokens, 0), 0)
-                        WHEN split_part(lower(COALESCE(COALESCE(endpoint_api_format, api_format), '')), ':', 1)
-                             IN ('openai', 'gemini', 'google')
-                        THEN (
-                            CASE
-                                WHEN GREATEST(COALESCE(input_tokens, 0), 0) <= 0 THEN 0
-                                WHEN GREATEST(COALESCE(cache_read_input_tokens, 0), 0) <= 0
-                                THEN GREATEST(COALESCE(input_tokens, 0), 0)
-                                ELSE GREATEST(
-                                    GREATEST(COALESCE(input_tokens, 0), 0)
-                                        - GREATEST(COALESCE(cache_read_input_tokens, 0), 0),
-                                    0
-                                )
-                            END
-                        ) + GREATEST(COALESCE(cache_read_input_tokens, 0), 0)
-                        ELSE CASE
-                            WHEN (
-                                CASE
-                                    WHEN COALESCE(cache_creation_input_tokens, 0) = 0
-                                         AND (
-                                            COALESCE(cache_creation_input_tokens_5m, 0)
-                                            + COALESCE(cache_creation_input_tokens_1h, 0)
-                                         ) > 0
-                                    THEN COALESCE(cache_creation_input_tokens_5m, 0)
-                                        + COALESCE(cache_creation_input_tokens_1h, 0)
-                                    ELSE COALESCE(cache_creation_input_tokens, 0)
-                                END
-                            ) > 0
-                            THEN GREATEST(COALESCE(input_tokens, 0), 0)
-                                + (
-                                    CASE
-                                        WHEN COALESCE(cache_creation_input_tokens, 0) = 0
-                                             AND (
-                                                COALESCE(cache_creation_input_tokens_5m, 0)
-                                                + COALESCE(cache_creation_input_tokens_1h, 0)
-                                             ) > 0
-                                        THEN COALESCE(cache_creation_input_tokens_5m, 0)
-                                            + COALESCE(cache_creation_input_tokens_1h, 0)
-                                        ELSE COALESCE(cache_creation_input_tokens, 0)
-                                    END
-                                  )
-                                + GREATEST(COALESCE(cache_read_input_tokens, 0), 0)
-                            ELSE GREATEST(COALESCE(input_tokens, 0), 0)
-                                + GREATEST(COALESCE(cache_read_input_tokens, 0), 0)
-                        END
-                    END
-                ),
-                0
-            ) AS BIGINT
-        ) AS total_input_context,
+        CAST(COALESCE(SUM(GREATEST(COALESCE(total_input_context, 0), 0)), 0) AS BIGINT) AS total_input_context,
         CAST(COALESCE(SUM(total_cost_usd), 0) AS DOUBLE PRECISION) AS total_cost,
         CAST(COALESCE(SUM(actual_total_cost_usd), 0) AS DOUBLE PRECISION) AS actual_total_cost,
         COALESCE(
@@ -1986,26 +1586,7 @@ WITH aggregated AS (
             ) AS BIGINT
         ) AS success_requests,
         CAST(COALESCE(SUM(input_tokens), 0) AS BIGINT) AS input_tokens,
-        CAST(
-            COALESCE(
-                SUM(
-                    CASE
-                        WHEN GREATEST(COALESCE(input_tokens, 0), 0) <= 0 THEN 0
-                        WHEN GREATEST(COALESCE(cache_read_input_tokens, 0), 0) <= 0
-                        THEN GREATEST(COALESCE(input_tokens, 0), 0)
-                        WHEN split_part(lower(COALESCE(COALESCE(endpoint_api_format, api_format), '')), ':', 1)
-                             IN ('openai', 'gemini', 'google')
-                        THEN GREATEST(
-                            GREATEST(COALESCE(input_tokens, 0), 0)
-                                - GREATEST(COALESCE(cache_read_input_tokens, 0), 0),
-                            0
-                        )
-                        ELSE GREATEST(COALESCE(input_tokens, 0), 0)
-                    END
-                ),
-                0
-            ) AS BIGINT
-        ) AS effective_input_tokens,
+        CAST(COALESCE(SUM(GREATEST(COALESCE(effective_input_tokens, 0), 0)), 0) AS BIGINT) AS effective_input_tokens,
         CAST(COALESCE(SUM(output_tokens), 0) AS BIGINT) AS output_tokens,
         CAST(COALESCE(SUM(total_tokens), 0) AS BIGINT) AS total_tokens,
         CAST(
@@ -2030,73 +1611,7 @@ WITH aggregated AS (
         CAST(COALESCE(SUM(cache_creation_input_tokens_1h), 0) AS BIGINT)
             AS cache_creation_ephemeral_1h_tokens,
         CAST(COALESCE(SUM(cache_read_input_tokens), 0) AS BIGINT) AS cache_read_tokens,
-        CAST(
-            COALESCE(
-                SUM(
-                    CASE
-                        WHEN split_part(lower(COALESCE(COALESCE(endpoint_api_format, api_format), '')), ':', 1)
-                             IN ('claude', 'anthropic')
-                        THEN GREATEST(COALESCE(input_tokens, 0), 0)
-                            + CASE
-                                WHEN COALESCE(cache_creation_input_tokens, 0) = 0
-                                     AND (
-                                        COALESCE(cache_creation_input_tokens_5m, 0)
-                                        + COALESCE(cache_creation_input_tokens_1h, 0)
-                                     ) > 0
-                                THEN COALESCE(cache_creation_input_tokens_5m, 0)
-                                    + COALESCE(cache_creation_input_tokens_1h, 0)
-                                ELSE COALESCE(cache_creation_input_tokens, 0)
-                              END
-                            + GREATEST(COALESCE(cache_read_input_tokens, 0), 0)
-                        WHEN split_part(lower(COALESCE(COALESCE(endpoint_api_format, api_format), '')), ':', 1)
-                             IN ('openai', 'gemini', 'google')
-                        THEN (
-                            CASE
-                                WHEN GREATEST(COALESCE(input_tokens, 0), 0) <= 0 THEN 0
-                                WHEN GREATEST(COALESCE(cache_read_input_tokens, 0), 0) <= 0
-                                THEN GREATEST(COALESCE(input_tokens, 0), 0)
-                                ELSE GREATEST(
-                                    GREATEST(COALESCE(input_tokens, 0), 0)
-                                        - GREATEST(COALESCE(cache_read_input_tokens, 0), 0),
-                                    0
-                                )
-                            END
-                        ) + GREATEST(COALESCE(cache_read_input_tokens, 0), 0)
-                        ELSE CASE
-                            WHEN (
-                                CASE
-                                    WHEN COALESCE(cache_creation_input_tokens, 0) = 0
-                                         AND (
-                                            COALESCE(cache_creation_input_tokens_5m, 0)
-                                            + COALESCE(cache_creation_input_tokens_1h, 0)
-                                         ) > 0
-                                    THEN COALESCE(cache_creation_input_tokens_5m, 0)
-                                        + COALESCE(cache_creation_input_tokens_1h, 0)
-                                    ELSE COALESCE(cache_creation_input_tokens, 0)
-                                END
-                            ) > 0
-                            THEN GREATEST(COALESCE(input_tokens, 0), 0)
-                                + (
-                                    CASE
-                                        WHEN COALESCE(cache_creation_input_tokens, 0) = 0
-                                             AND (
-                                                COALESCE(cache_creation_input_tokens_5m, 0)
-                                                + COALESCE(cache_creation_input_tokens_1h, 0)
-                                             ) > 0
-                                        THEN COALESCE(cache_creation_input_tokens_5m, 0)
-                                            + COALESCE(cache_creation_input_tokens_1h, 0)
-                                        ELSE COALESCE(cache_creation_input_tokens, 0)
-                                    END
-                                  )
-                                + GREATEST(COALESCE(cache_read_input_tokens, 0), 0)
-                            ELSE GREATEST(COALESCE(input_tokens, 0), 0)
-                                + GREATEST(COALESCE(cache_read_input_tokens, 0), 0)
-                        END
-                    END
-                ),
-                0
-            ) AS BIGINT
-        ) AS total_input_context,
+        CAST(COALESCE(SUM(GREATEST(COALESCE(total_input_context, 0), 0)), 0) AS BIGINT) AS total_input_context,
         CAST(COALESCE(SUM(total_cost_usd), 0) AS DOUBLE PRECISION) AS total_cost,
         CAST(COALESCE(SUM(actual_total_cost_usd), 0) AS DOUBLE PRECISION) AS actual_total_cost,
         COALESCE(
@@ -2254,26 +1769,7 @@ WITH aggregated AS (
             ) AS BIGINT
         ) AS success_requests,
         CAST(COALESCE(SUM(input_tokens), 0) AS BIGINT) AS input_tokens,
-        CAST(
-            COALESCE(
-                SUM(
-                    CASE
-                        WHEN GREATEST(COALESCE(input_tokens, 0), 0) <= 0 THEN 0
-                        WHEN GREATEST(COALESCE(cache_read_input_tokens, 0), 0) <= 0
-                        THEN GREATEST(COALESCE(input_tokens, 0), 0)
-                        WHEN split_part(lower(COALESCE(COALESCE(endpoint_api_format, api_format), '')), ':', 1)
-                             IN ('openai', 'gemini', 'google')
-                        THEN GREATEST(
-                            GREATEST(COALESCE(input_tokens, 0), 0)
-                                - GREATEST(COALESCE(cache_read_input_tokens, 0), 0),
-                            0
-                        )
-                        ELSE GREATEST(COALESCE(input_tokens, 0), 0)
-                    END
-                ),
-                0
-            ) AS BIGINT
-        ) AS effective_input_tokens,
+        CAST(COALESCE(SUM(GREATEST(COALESCE(effective_input_tokens, 0), 0)), 0) AS BIGINT) AS effective_input_tokens,
         CAST(COALESCE(SUM(output_tokens), 0) AS BIGINT) AS output_tokens,
         CAST(COALESCE(SUM(total_tokens), 0) AS BIGINT) AS total_tokens,
         CAST(
@@ -2298,73 +1794,7 @@ WITH aggregated AS (
         CAST(COALESCE(SUM(cache_creation_input_tokens_1h), 0) AS BIGINT)
             AS cache_creation_ephemeral_1h_tokens,
         CAST(COALESCE(SUM(cache_read_input_tokens), 0) AS BIGINT) AS cache_read_tokens,
-        CAST(
-            COALESCE(
-                SUM(
-                    CASE
-                        WHEN split_part(lower(COALESCE(COALESCE(endpoint_api_format, api_format), '')), ':', 1)
-                             IN ('claude', 'anthropic')
-                        THEN GREATEST(COALESCE(input_tokens, 0), 0)
-                            + CASE
-                                WHEN COALESCE(cache_creation_input_tokens, 0) = 0
-                                     AND (
-                                        COALESCE(cache_creation_input_tokens_5m, 0)
-                                        + COALESCE(cache_creation_input_tokens_1h, 0)
-                                     ) > 0
-                                THEN COALESCE(cache_creation_input_tokens_5m, 0)
-                                    + COALESCE(cache_creation_input_tokens_1h, 0)
-                                ELSE COALESCE(cache_creation_input_tokens, 0)
-                              END
-                            + GREATEST(COALESCE(cache_read_input_tokens, 0), 0)
-                        WHEN split_part(lower(COALESCE(COALESCE(endpoint_api_format, api_format), '')), ':', 1)
-                             IN ('openai', 'gemini', 'google')
-                        THEN (
-                            CASE
-                                WHEN GREATEST(COALESCE(input_tokens, 0), 0) <= 0 THEN 0
-                                WHEN GREATEST(COALESCE(cache_read_input_tokens, 0), 0) <= 0
-                                THEN GREATEST(COALESCE(input_tokens, 0), 0)
-                                ELSE GREATEST(
-                                    GREATEST(COALESCE(input_tokens, 0), 0)
-                                        - GREATEST(COALESCE(cache_read_input_tokens, 0), 0),
-                                    0
-                                )
-                            END
-                        ) + GREATEST(COALESCE(cache_read_input_tokens, 0), 0)
-                        ELSE CASE
-                            WHEN (
-                                CASE
-                                    WHEN COALESCE(cache_creation_input_tokens, 0) = 0
-                                         AND (
-                                            COALESCE(cache_creation_input_tokens_5m, 0)
-                                            + COALESCE(cache_creation_input_tokens_1h, 0)
-                                         ) > 0
-                                    THEN COALESCE(cache_creation_input_tokens_5m, 0)
-                                        + COALESCE(cache_creation_input_tokens_1h, 0)
-                                    ELSE COALESCE(cache_creation_input_tokens, 0)
-                                END
-                            ) > 0
-                            THEN GREATEST(COALESCE(input_tokens, 0), 0)
-                                + (
-                                    CASE
-                                        WHEN COALESCE(cache_creation_input_tokens, 0) = 0
-                                             AND (
-                                                COALESCE(cache_creation_input_tokens_5m, 0)
-                                                + COALESCE(cache_creation_input_tokens_1h, 0)
-                                             ) > 0
-                                        THEN COALESCE(cache_creation_input_tokens_5m, 0)
-                                            + COALESCE(cache_creation_input_tokens_1h, 0)
-                                        ELSE COALESCE(cache_creation_input_tokens, 0)
-                                    END
-                                  )
-                                + GREATEST(COALESCE(cache_read_input_tokens, 0), 0)
-                            ELSE GREATEST(COALESCE(input_tokens, 0), 0)
-                                + GREATEST(COALESCE(cache_read_input_tokens, 0), 0)
-                        END
-                    END
-                ),
-                0
-            ) AS BIGINT
-        ) AS total_input_context,
+        CAST(COALESCE(SUM(GREATEST(COALESCE(total_input_context, 0), 0)), 0) AS BIGINT) AS total_input_context,
         CAST(COALESCE(SUM(total_cost_usd), 0) AS DOUBLE PRECISION) AS total_cost,
         CAST(COALESCE(SUM(actual_total_cost_usd), 0) AS DOUBLE PRECISION) AS actual_total_cost,
         COALESCE(

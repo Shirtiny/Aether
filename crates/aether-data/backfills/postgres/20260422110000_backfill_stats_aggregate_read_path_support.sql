@@ -58,9 +58,10 @@ derived AS (
         raw.*,
         CASE
             WHEN raw.input_tokens_safe <= 0 THEN 0
-            WHEN raw.cache_read_tokens_safe <= 0 THEN raw.input_tokens_safe
             WHEN raw.normalized_api_format IN ('openai', 'gemini', 'google') THEN GREATEST(
-                raw.input_tokens_safe - raw.cache_read_tokens_safe,
+                raw.input_tokens_safe
+                    - raw.cache_creation_tokens_safe
+                    - raw.cache_read_tokens_safe,
                 0
             )
             ELSE raw.input_tokens_safe
@@ -69,19 +70,11 @@ derived AS (
 )
 SELECT
     derived.*,
-    CASE
-        WHEN derived.normalized_api_format IN ('claude', 'anthropic') THEN
-            derived.input_tokens_safe
-            + derived.cache_creation_tokens_safe
-            + derived.cache_read_tokens_safe
-        WHEN derived.normalized_api_format IN ('openai', 'gemini', 'google') THEN
-            derived.effective_input_tokens_safe + derived.cache_read_tokens_safe
-        WHEN derived.cache_creation_tokens_safe > 0 THEN
-            derived.input_tokens_safe
-            + derived.cache_creation_tokens_safe
-            + derived.cache_read_tokens_safe
-        ELSE derived.input_tokens_safe + derived.cache_read_tokens_safe
-    END::BIGINT AS total_input_context_safe,
+    (
+        derived.effective_input_tokens_safe
+        + derived.cache_creation_tokens_safe
+        + derived.cache_read_tokens_safe
+    )::BIGINT AS total_input_context_safe,
     (
         derived.status NOT IN ('pending', 'streaming')
         AND derived.provider_name NOT IN ('unknown', 'pending')
@@ -1060,9 +1053,10 @@ derived AS (
         raw.*,
         CASE
             WHEN raw.input_tokens_safe <= 0 THEN 0
-            WHEN raw.cache_read_tokens_safe <= 0 THEN raw.input_tokens_safe
             WHEN raw.normalized_api_format IN ('openai', 'gemini', 'google') THEN GREATEST(
-                raw.input_tokens_safe - raw.cache_read_tokens_safe,
+                raw.input_tokens_safe
+                    - raw.cache_creation_tokens_safe
+                    - raw.cache_read_tokens_safe,
                 0
             )
             ELSE raw.input_tokens_safe
@@ -1087,19 +1081,11 @@ derived AS (
 )
 SELECT
     derived.*,
-    CASE
-        WHEN derived.normalized_api_format IN ('claude', 'anthropic') THEN
-            derived.input_tokens_safe
-            + derived.cache_creation_tokens_safe
-            + derived.cache_read_tokens_safe
-        WHEN derived.normalized_api_format IN ('openai', 'gemini', 'google') THEN
-            derived.effective_input_tokens_safe + derived.cache_read_tokens_safe
-        WHEN derived.cache_creation_tokens_safe > 0 THEN
-            derived.input_tokens_safe
-            + derived.cache_creation_tokens_safe
-            + derived.cache_read_tokens_safe
-        ELSE derived.input_tokens_safe + derived.cache_read_tokens_safe
-    END::BIGINT AS total_input_context_safe,
+    (
+        derived.effective_input_tokens_safe
+        + derived.cache_creation_tokens_safe
+        + derived.cache_read_tokens_safe
+    )::BIGINT AS total_input_context_safe,
     CASE
         WHEN derived.success_flag > 0 THEN derived.response_time_sum_ms_safe
         ELSE 0
@@ -1652,73 +1638,12 @@ WITH aggregated AS (
         ), 0)::BIGINT AS completed_cache_creation_tokens,
         COALESCE(SUM(GREATEST(COALESCE(usage.cache_read_input_tokens, 0), 0)), 0)::BIGINT
             AS completed_cache_read_tokens,
-        COALESCE(SUM(
-            CASE
-                WHEN split_part(lower(COALESCE(COALESCE(usage.endpoint_api_format, usage.api_format), '')), ':', 1)
-                     IN ('claude', 'anthropic')
-                THEN GREATEST(COALESCE(usage.input_tokens, 0), 0)
-                   + CASE
-                       WHEN COALESCE(usage.cache_creation_input_tokens, 0) = 0
-                            AND (
-                              COALESCE(usage.cache_creation_input_tokens_5m, 0)
-                              + COALESCE(usage.cache_creation_input_tokens_1h, 0)
-                            ) > 0
-                       THEN COALESCE(usage.cache_creation_input_tokens_5m, 0)
-                          + COALESCE(usage.cache_creation_input_tokens_1h, 0)
-                       ELSE COALESCE(usage.cache_creation_input_tokens, 0)
-                     END
-                   + GREATEST(COALESCE(usage.cache_read_input_tokens, 0), 0)
-                WHEN split_part(lower(COALESCE(COALESCE(usage.endpoint_api_format, usage.api_format), '')), ':', 1)
-                     IN ('openai', 'gemini', 'google')
-                THEN (
-                    CASE
-                        WHEN GREATEST(COALESCE(usage.input_tokens, 0), 0) <= 0 THEN 0
-                        WHEN GREATEST(COALESCE(usage.cache_read_input_tokens, 0), 0) <= 0
-                        THEN GREATEST(COALESCE(usage.input_tokens, 0), 0)
-                        ELSE GREATEST(
-                            GREATEST(COALESCE(usage.input_tokens, 0), 0)
-                                - GREATEST(COALESCE(usage.cache_read_input_tokens, 0), 0),
-                            0
-                        )
-                    END
-                ) + GREATEST(COALESCE(usage.cache_read_input_tokens, 0), 0)
-                ELSE CASE
-                    WHEN (
-                        CASE
-                            WHEN COALESCE(usage.cache_creation_input_tokens, 0) = 0
-                                 AND (
-                                    COALESCE(usage.cache_creation_input_tokens_5m, 0)
-                                    + COALESCE(usage.cache_creation_input_tokens_1h, 0)
-                                 ) > 0
-                            THEN COALESCE(usage.cache_creation_input_tokens_5m, 0)
-                               + COALESCE(usage.cache_creation_input_tokens_1h, 0)
-                            ELSE COALESCE(usage.cache_creation_input_tokens, 0)
-                        END
-                    ) > 0
-                    THEN GREATEST(COALESCE(usage.input_tokens, 0), 0)
-                       + (
-                           CASE
-                               WHEN COALESCE(usage.cache_creation_input_tokens, 0) = 0
-                                    AND (
-                                      COALESCE(usage.cache_creation_input_tokens_5m, 0)
-                                      + COALESCE(usage.cache_creation_input_tokens_1h, 0)
-                                    ) > 0
-                               THEN COALESCE(usage.cache_creation_input_tokens_5m, 0)
-                                  + COALESCE(usage.cache_creation_input_tokens_1h, 0)
-                               ELSE COALESCE(usage.cache_creation_input_tokens, 0)
-                           END
-                         )
-                       + GREATEST(COALESCE(usage.cache_read_input_tokens, 0), 0)
-                    ELSE GREATEST(COALESCE(usage.input_tokens, 0), 0)
-                       + GREATEST(COALESCE(usage.cache_read_input_tokens, 0), 0)
-                END
-            END
-        ), 0)::BIGINT AS completed_total_input_context,
+        COALESCE(SUM(GREATEST(COALESCE(usage.total_input_context, 0), 0)), 0)::BIGINT AS completed_total_input_context,
         COALESCE(SUM(COALESCE(CAST(usage.cache_creation_cost_usd AS DOUBLE PRECISION), 0)), 0)
             AS completed_cache_creation_cost,
         COALESCE(SUM(COALESCE(CAST(usage.cache_read_cost_usd AS DOUBLE PRECISION), 0)), 0)
             AS completed_cache_read_cost
-    FROM usage
+    FROM usage_billing_facts AS usage
     CROSS JOIN tmp_stats_completed_cache_affinity_context AS context
     WHERE usage.created_at < context.current_day_utc
       AND usage.status = 'completed'
@@ -1773,73 +1698,12 @@ WITH aggregated AS (
         ), 0)::BIGINT AS completed_cache_creation_tokens,
         COALESCE(SUM(GREATEST(COALESCE(usage.cache_read_input_tokens, 0), 0)), 0)::BIGINT
             AS completed_cache_read_tokens,
-        COALESCE(SUM(
-            CASE
-                WHEN split_part(lower(COALESCE(COALESCE(usage.endpoint_api_format, usage.api_format), '')), ':', 1)
-                     IN ('claude', 'anthropic')
-                THEN GREATEST(COALESCE(usage.input_tokens, 0), 0)
-                   + CASE
-                       WHEN COALESCE(usage.cache_creation_input_tokens, 0) = 0
-                            AND (
-                              COALESCE(usage.cache_creation_input_tokens_5m, 0)
-                              + COALESCE(usage.cache_creation_input_tokens_1h, 0)
-                            ) > 0
-                       THEN COALESCE(usage.cache_creation_input_tokens_5m, 0)
-                          + COALESCE(usage.cache_creation_input_tokens_1h, 0)
-                       ELSE COALESCE(usage.cache_creation_input_tokens, 0)
-                     END
-                   + GREATEST(COALESCE(usage.cache_read_input_tokens, 0), 0)
-                WHEN split_part(lower(COALESCE(COALESCE(usage.endpoint_api_format, usage.api_format), '')), ':', 1)
-                     IN ('openai', 'gemini', 'google')
-                THEN (
-                    CASE
-                        WHEN GREATEST(COALESCE(usage.input_tokens, 0), 0) <= 0 THEN 0
-                        WHEN GREATEST(COALESCE(usage.cache_read_input_tokens, 0), 0) <= 0
-                        THEN GREATEST(COALESCE(usage.input_tokens, 0), 0)
-                        ELSE GREATEST(
-                            GREATEST(COALESCE(usage.input_tokens, 0), 0)
-                                - GREATEST(COALESCE(usage.cache_read_input_tokens, 0), 0),
-                            0
-                        )
-                    END
-                ) + GREATEST(COALESCE(usage.cache_read_input_tokens, 0), 0)
-                ELSE CASE
-                    WHEN (
-                        CASE
-                            WHEN COALESCE(usage.cache_creation_input_tokens, 0) = 0
-                                 AND (
-                                    COALESCE(usage.cache_creation_input_tokens_5m, 0)
-                                    + COALESCE(usage.cache_creation_input_tokens_1h, 0)
-                                 ) > 0
-                            THEN COALESCE(usage.cache_creation_input_tokens_5m, 0)
-                               + COALESCE(usage.cache_creation_input_tokens_1h, 0)
-                            ELSE COALESCE(usage.cache_creation_input_tokens, 0)
-                        END
-                    ) > 0
-                    THEN GREATEST(COALESCE(usage.input_tokens, 0), 0)
-                       + (
-                           CASE
-                               WHEN COALESCE(usage.cache_creation_input_tokens, 0) = 0
-                                    AND (
-                                      COALESCE(usage.cache_creation_input_tokens_5m, 0)
-                                      + COALESCE(usage.cache_creation_input_tokens_1h, 0)
-                                    ) > 0
-                               THEN COALESCE(usage.cache_creation_input_tokens_5m, 0)
-                                  + COALESCE(usage.cache_creation_input_tokens_1h, 0)
-                               ELSE COALESCE(usage.cache_creation_input_tokens, 0)
-                           END
-                         )
-                       + GREATEST(COALESCE(usage.cache_read_input_tokens, 0), 0)
-                    ELSE GREATEST(COALESCE(usage.input_tokens, 0), 0)
-                       + GREATEST(COALESCE(usage.cache_read_input_tokens, 0), 0)
-                END
-            END
-        ), 0)::BIGINT AS completed_total_input_context,
+        COALESCE(SUM(GREATEST(COALESCE(usage.total_input_context, 0), 0)), 0)::BIGINT AS completed_total_input_context,
         COALESCE(SUM(COALESCE(CAST(usage.cache_creation_cost_usd AS DOUBLE PRECISION), 0)), 0)
             AS completed_cache_creation_cost,
         COALESCE(SUM(COALESCE(CAST(usage.cache_read_cost_usd AS DOUBLE PRECISION), 0)), 0)
             AS completed_cache_read_cost
-    FROM usage
+    FROM usage_billing_facts AS usage
     CROSS JOIN tmp_stats_completed_cache_affinity_context AS context
     WHERE usage.created_at < context.current_hour_utc
       AND usage.status = 'completed'

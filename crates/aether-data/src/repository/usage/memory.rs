@@ -1060,18 +1060,19 @@ fn usage_api_family(api_format: Option<&str>) -> UsageApiFamily {
 fn normalize_usage_input_tokens(
     api_format: Option<&str>,
     input_tokens: i64,
+    cache_creation_tokens: i64,
     cache_read_tokens: i64,
 ) -> i64 {
     if input_tokens <= 0 {
         return input_tokens.max(0);
     }
-    if cache_read_tokens <= 0 {
+    if cache_creation_tokens <= 0 && cache_read_tokens <= 0 {
         return input_tokens;
     }
 
     match usage_api_family(api_format) {
         UsageApiFamily::OpenAi | UsageApiFamily::Gemini => {
-            (input_tokens - cache_read_tokens).max(0)
+            (input_tokens - cache_creation_tokens.max(0) - cache_read_tokens.max(0)).max(0)
         }
         UsageApiFamily::Claude | UsageApiFamily::Unknown => input_tokens,
     }
@@ -1087,25 +1088,20 @@ fn normalize_usage_total_input_context(
     let normalized_cache_creation_tokens = cache_creation_tokens.max(0);
     let normalized_cache_read_tokens = cache_read_tokens.max(0);
 
-    let fresh_input_tokens = match usage_api_family(api_format) {
-        UsageApiFamily::Claude => {
-            normalized_input_tokens.saturating_add(normalized_cache_creation_tokens)
-        }
+    let effective_input_tokens = match usage_api_family(api_format) {
+        UsageApiFamily::Claude => normalized_input_tokens,
         UsageApiFamily::OpenAi | UsageApiFamily::Gemini => normalize_usage_input_tokens(
             api_format,
             normalized_input_tokens,
+            normalized_cache_creation_tokens,
             normalized_cache_read_tokens,
         ),
-        UsageApiFamily::Unknown => {
-            if normalized_cache_creation_tokens > 0 {
-                normalized_input_tokens.saturating_add(normalized_cache_creation_tokens)
-            } else {
-                normalized_input_tokens
-            }
-        }
+        UsageApiFamily::Unknown => normalized_input_tokens,
     };
 
-    fresh_input_tokens.saturating_add(normalized_cache_read_tokens)
+    effective_input_tokens
+        .saturating_add(normalized_cache_creation_tokens)
+        .saturating_add(normalized_cache_read_tokens)
 }
 
 fn usage_total_input_context(item: &StoredRequestUsageAudit) -> u64 {
@@ -1131,8 +1127,15 @@ fn usage_effective_input_tokens(item: &StoredRequestUsageAudit) -> u64 {
         .as_deref()
         .or(item.api_format.as_deref());
     let input_tokens = i64::try_from(item.input_tokens).unwrap_or(i64::MAX);
+    let cache_creation_tokens =
+        i64::try_from(usage_cache_creation_tokens(item)).unwrap_or(i64::MAX);
     let cache_read_tokens = i64::try_from(item.cache_read_input_tokens).unwrap_or(i64::MAX);
-    normalize_usage_input_tokens(api_format, input_tokens, cache_read_tokens) as u64
+    normalize_usage_input_tokens(
+        api_format,
+        input_tokens,
+        cache_creation_tokens,
+        cache_read_tokens,
+    ) as u64
 }
 
 fn usage_total_tokens(item: &StoredRequestUsageAudit) -> u64 {
@@ -5088,9 +5091,9 @@ mod tests {
             })
             .await
             .expect("dashboard should summarize");
-        assert_eq!(dashboard.effective_input_tokens, 20);
+        assert_eq!(dashboard.effective_input_tokens, 0);
         assert_eq!(dashboard.cache_creation_tokens, 20);
-        assert_eq!(dashboard.total_tokens, 140);
+        assert_eq!(dashboard.total_tokens, 120);
 
         let leaderboard = repository
             .summarize_usage_leaderboard(&UsageLeaderboardQuery {
@@ -5104,7 +5107,7 @@ mod tests {
             .await
             .expect("leaderboard should summarize");
         assert_eq!(leaderboard.len(), 1);
-        assert_eq!(leaderboard[0].total_tokens, 140);
+        assert_eq!(leaderboard[0].total_tokens, 120);
     }
 
     #[tokio::test]

@@ -1379,7 +1379,7 @@ async fn gateway_handles_admin_stats_leaderboard_models_locally_with_trusted_adm
     assert_eq!(payload["metric"], "tokens");
     assert_eq!(payload["items"][0]["rank"], 1);
     assert_eq!(payload["items"][0]["id"], "gpt-5");
-    assert_eq!(payload["items"][0]["value"], 160);
+    assert_eq!(payload["items"][0]["value"], 150);
     assert_eq!(payload["items"][1]["id"], "claude-3-5-sonnet");
     assert_eq!(payload["items"][1]["value"], 100);
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
