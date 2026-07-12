@@ -1164,6 +1164,33 @@ mod tests {
     }
 
     #[test]
+    fn same_format_body_normalizes_gpt_5_6_ultra_effort_alias() {
+        let body = build_same_format_provider_request_body(SameFormatProviderRequestBodyInput {
+            body_json: &json!({
+                "model": "gpt-5.6-sol",
+                "input": "hello",
+                "reasoning": {"effort": "ultra", "summary": "detailed"}
+            }),
+            mapped_model: "gpt-5.6-sol",
+            client_api_format: "openai:responses",
+            provider_api_format: "openai:responses",
+            source_model: Some("gpt-5.6-sol"),
+            family: SameFormatProviderFamily::Standard,
+            body_rules: None,
+            request_headers: None,
+            upstream_is_stream: false,
+            force_body_stream_field: false,
+            kiro_auth_config: None,
+            is_claude_code: false,
+            enable_model_directives: true,
+        })
+        .expect("body should build");
+
+        assert_eq!(body["reasoning"]["effort"], "max");
+        assert_eq!(body["reasoning"]["summary"], "detailed");
+    }
+
+    #[test]
     fn builds_same_format_headers_with_auth_and_stream_accept() {
         let provider_request_body = json!({"model": "upstream-model"});
         let original_request_body = json!({"model": "client-model"});

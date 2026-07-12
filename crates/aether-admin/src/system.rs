@@ -1974,6 +1974,7 @@ pub fn admin_system_config_default_value(key: &str) -> Option<serde_json::Value>
                             "high": { "reasoning_effort": "high" },
                             "xhigh": { "reasoning_effort": "xhigh" },
                             "max": { "reasoning_effort": "xhigh" },
+                            "ultra": { "reasoning_effort": "max" },
                             "fast": { "service_tier": "priority" }
                         }
                     },
@@ -1985,6 +1986,7 @@ pub fn admin_system_config_default_value(key: &str) -> Option<serde_json::Value>
                             "high": { "reasoning": { "effort": "high" } },
                             "xhigh": { "reasoning": { "effort": "xhigh" } },
                             "max": { "reasoning": { "effort": "xhigh" } },
+                            "ultra": { "reasoning": { "effort": "max" } },
                             "fast": { "service_tier": "priority" }
                         }
                     },
@@ -1996,6 +1998,7 @@ pub fn admin_system_config_default_value(key: &str) -> Option<serde_json::Value>
                             "high": { "reasoning": { "effort": "high" } },
                             "xhigh": { "reasoning": { "effort": "xhigh" } },
                             "max": { "reasoning": { "effort": "xhigh" } },
+                            "ultra": { "reasoning": { "effort": "max" } },
                             "fast": { "service_tier": "priority" }
                         }
                     },
@@ -3827,6 +3830,34 @@ mod tests {
             admin_system_config_default_value("backup_s3_path_style"),
             Some(json!(true))
         );
+    }
+
+    #[test]
+    fn model_directive_defaults_preserve_legacy_max_and_expose_openai_ultra() {
+        let config = admin_system_config_default_value("model_directives")
+            .expect("model directive defaults should exist");
+        let formats = &config["reasoning_effort"]["api_formats"];
+
+        assert_eq!(
+            formats["openai:chat"]["mappings"]["max"],
+            json!({ "reasoning_effort": "xhigh" })
+        );
+        assert_eq!(
+            formats["openai:chat"]["mappings"]["ultra"],
+            json!({ "reasoning_effort": "max" })
+        );
+        for api_format in ["openai:responses", "openai:responses:compact"] {
+            assert_eq!(
+                formats[api_format]["mappings"]["max"],
+                json!({ "reasoning": { "effort": "xhigh" } })
+            );
+            assert_eq!(
+                formats[api_format]["mappings"]["ultra"],
+                json!({ "reasoning": { "effort": "max" } })
+            );
+        }
+        assert!(formats["claude:messages"]["mappings"]["ultra"].is_null());
+        assert!(formats["gemini:generate_content"]["mappings"]["ultra"].is_null());
     }
 
     #[test]

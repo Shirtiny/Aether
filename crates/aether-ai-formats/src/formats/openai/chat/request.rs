@@ -2,6 +2,7 @@ use serde_json::{json, Map, Value};
 
 use crate::{
     formats::context::FormatContext,
+    formats::shared::model_directives::model_supports_codex_max_ultra,
     protocol::canonical::{
         canonical_extension_object_mut, canonical_message_to_openai_chat_messages,
         canonical_response_format_to_openai, canonical_tool_choice_to_openai,
@@ -194,7 +195,7 @@ pub fn to_raw(canonical: &CanonicalRequest) -> Value {
                     .and_then(|value| value.get("effort"))
                     .and_then(Value::as_str)
             })
-            .and_then(openai_chat_reasoning_effort)
+            .and_then(|effort| openai_chat_reasoning_effort(effort, &canonical.model))
         {
             output.insert(
                 "reasoning_effort".to_string(),
@@ -220,11 +221,14 @@ pub fn to_raw(canonical: &CanonicalRequest) -> Value {
     Value::Object(output)
 }
 
-fn openai_chat_reasoning_effort(value: &str) -> Option<&'static str> {
+fn openai_chat_reasoning_effort(value: &str, model: &str) -> Option<&'static str> {
     match value.trim().to_ascii_lowercase().as_str() {
         "low" => Some("low"),
         "medium" => Some("medium"),
-        "high" | "xhigh" | "max" => Some("high"),
+        "high" | "xhigh" => Some("high"),
+        "max" if model_supports_codex_max_ultra(model) => Some("max"),
+        "max" => Some("high"),
+        "ultra" if model_supports_codex_max_ultra(model) => Some("max"),
         _ => None,
     }
 }

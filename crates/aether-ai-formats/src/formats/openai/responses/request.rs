@@ -5,6 +5,7 @@ use serde_json::{json, Map, Value};
 use crate::{
     formats::context::FormatContext,
     formats::openai::shared::map_thinking_budget_to_openai_reasoning_effort,
+    formats::shared::model_directives::model_supports_codex_max_ultra,
     protocol::canonical::{
         canonical_response_format_to_openai, canonicalize_tool_arguments,
         is_claude_messages_request, is_claude_system_instruction, is_claude_thinking_block,
@@ -563,7 +564,7 @@ fn canonical_reasoning_config_to_responses(canonical: &CanonicalRequest) -> Opti
         return canonical
             .thinking
             .as_ref()
-            .and_then(reasoning_config_to_responses);
+            .and_then(|thinking| reasoning_config_to_responses(thinking, &canonical.model));
     }
 
     let mut object = canonical
@@ -582,7 +583,7 @@ fn canonical_reasoning_config_to_responses(canonical: &CanonicalRequest) -> Opti
         .and_then(|value| value.get("output_config"))
         .and_then(|value| value.get("effort"))
         .and_then(Value::as_str)
-        .map(openai_responses_reasoning_effort)
+        .map(|effort| openai_responses_reasoning_effort(effort, &canonical.model))
         .unwrap_or("medium");
     object
         .entry("effort".to_string())
@@ -593,14 +594,16 @@ fn canonical_reasoning_config_to_responses(canonical: &CanonicalRequest) -> Opti
     Some(Value::Object(object))
 }
 
-fn reasoning_config_to_responses(thinking: &CanonicalThinkingConfig) -> Option<Value> {
+fn reasoning_config_to_responses(thinking: &CanonicalThinkingConfig, model: &str) -> Option<Value> {
     openai_responses_extension(&thinking.extensions)
         .cloned()
+        .map(|value| normalize_responses_reasoning_config(value, model))
         .or_else(|| {
             thinking
                 .extensions
                 .get(OPENAI_RESPONSES_LEGACY_EXTENSION_NAMESPACE)
                 .cloned()
+                .map(|value| normalize_responses_reasoning_config(value, model))
         })
         .or_else(|| {
             thinking
@@ -610,7 +613,7 @@ fn reasoning_config_to_responses(thinking: &CanonicalThinkingConfig) -> Option<V
                 .and_then(Value::as_str)
                 .map(|effort| {
                     json!({
-                        "effort": openai_responses_reasoning_effort(effort),
+                        "effort": openai_responses_reasoning_effort(effort, model),
                     })
                 })
         })
@@ -623,9 +626,24 @@ fn reasoning_config_to_responses(thinking: &CanonicalThinkingConfig) -> Option<V
         })
 }
 
-fn openai_responses_reasoning_effort(effort: &str) -> &str {
+fn normalize_responses_reasoning_config(mut value: Value, model: &str) -> Value {
+    if let Some(effort) = value
+        .get("effort")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+    {
+        value["effort"] =
+            Value::String(openai_responses_reasoning_effort(&effort, model).to_string());
+    }
+    value
+}
+
+fn openai_responses_reasoning_effort<'a>(effort: &'a str, model: &str) -> &'a str {
     match effort.trim().to_ascii_lowercase().as_str() {
-        "xhigh" | "max" => "xhigh",
+        "xhigh" => "xhigh",
+        "max" if model_supports_codex_max_ultra(model) => "max",
+        "max" => "xhigh",
+        "ultra" if model_supports_codex_max_ultra(model) => "max",
         "low" => "low",
         "medium" => "medium",
         "high" => "high",

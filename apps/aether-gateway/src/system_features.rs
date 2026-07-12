@@ -89,15 +89,19 @@ pub(crate) async fn reasoning_model_directive_enabled_for_api_format_and_model(
     }
 
     let Some(suffixes) = requested_model.and_then(model_directive_suffixes_from_model) else {
-        return false;
+        return matches!(
+            api_format.as_str(),
+            "openai:chat" | "openai:responses" | "openai:responses:compact"
+        ) && requested_model.is_some_and(crate::ai_serving::model_supports_codex_max_ultra);
     };
 
     let mappings = settings
         .as_ref()
         .and_then(|settings| settings.api_format_mappings(&api_format));
-    suffixes
-        .iter()
-        .all(|suffix| suffix_supported_for_api_format(&api_format, suffix, mappings.as_ref()))
+    suffixes.iter().all(|suffix| {
+        model_specific_reasoning_mapping(&api_format, suffix, requested_model).is_some()
+            || suffix_supported_for_api_format(&api_format, suffix, mappings.as_ref())
+    })
 }
 
 pub(crate) async fn reasoning_model_directive_mapping_for_api_format_and_model(
@@ -120,11 +124,11 @@ pub(crate) async fn reasoning_model_directive_mapping_for_api_format_and_model(
     let mappings = settings
         .as_ref()
         .and_then(|settings| settings.api_format_mappings(&api_format));
-    model_directive_mapping_for_suffixes(&api_format, &suffixes, mappings.as_ref())
+    model_directive_mapping_for_suffixes(&api_format, &suffixes, mappings.as_ref(), requested_model)
 }
 
 const DEFAULT_MODEL_DIRECTIVE_SUFFIXES: &[&str] =
-    &["low", "medium", "high", "xhigh", "max", "fast"];
+    &["low", "medium", "high", "xhigh", "max", "ultra", "fast"];
 
 #[derive(Debug, Clone, Default)]
 struct ReasoningModelDirectiveSettings {
@@ -213,6 +217,11 @@ fn model_directive_suffixes_from_model(model: &str) -> Option<Vec<String>> {
     if base_model.is_empty() || suffixes.is_empty() {
         return None;
     }
+    if suffixes.iter().any(|suffix| suffix == "ultra")
+        && !crate::ai_serving::model_supports_codex_max_ultra(base_model)
+    {
+        return None;
+    }
     suffixes.sort_by_key(|suffix| {
         DEFAULT_MODEL_DIRECTIVE_SUFFIXES
             .iter()
@@ -236,7 +245,7 @@ enum ModelDirectiveSuffixKind {
 
 fn model_directive_suffix_kind(suffix: &str) -> Option<ModelDirectiveSuffixKind> {
     match suffix {
-        "low" | "medium" | "high" | "xhigh" | "max" => {
+        "low" | "medium" | "high" | "xhigh" | "max" | "ultra" => {
             Some(ModelDirectiveSuffixKind::ReasoningEffort)
         }
         "fast" => Some(ModelDirectiveSuffixKind::ServiceTier),
@@ -316,11 +325,12 @@ fn model_directive_mapping_for_suffixes(
     api_format: &str,
     suffixes: &[String],
     mappings: Option<&serde_json::Map<String, serde_json::Value>>,
+    requested_model: Option<&str>,
 ) -> Option<serde_json::Value> {
     let mut combined = serde_json::json!({});
     for suffix in suffixes {
-        let mapping = mappings
-            .and_then(|mappings| mappings.get(suffix).cloned())
+        let mapping = model_specific_reasoning_mapping(api_format, suffix, requested_model)
+            .or_else(|| mappings.and_then(|mappings| mappings.get(suffix).cloned()))
             .or_else(|| {
                 mappings
                     .is_none()
@@ -330,6 +340,28 @@ fn model_directive_mapping_for_suffixes(
         deep_merge_json(&mut combined, &mapping);
     }
     Some(combined)
+}
+
+fn model_specific_reasoning_mapping(
+    api_format: &str,
+    suffix: &str,
+    requested_model: Option<&str>,
+) -> Option<serde_json::Value> {
+    if !matches!(suffix, "max" | "ultra") {
+        return None;
+    }
+    let requested_model = requested_model?;
+    let base_model = crate::ai_serving::model_directive_base_model(requested_model)?;
+    if !crate::ai_serving::model_supports_codex_max_ultra(&base_model) {
+        return None;
+    }
+    match api_format {
+        "openai:chat" => Some(serde_json::json!({ "reasoning_effort": "max" })),
+        "openai:responses" | "openai:responses:compact" => {
+            Some(serde_json::json!({ "reasoning": { "effort": "max" } }))
+        }
+        _ => None,
+    }
 }
 
 fn deep_merge_json(target: &mut serde_json::Value, patch: &serde_json::Value) {
@@ -398,8 +430,8 @@ fn parse_reasoning_model_directive_settings(
 mod tests {
     use super::{
         default_reasoning_mapping, model_directive_mapping_for_suffixes,
-        model_directive_suffixes_from_model, parse_reasoning_model_directive_settings,
-        suffix_supported_for_api_format,
+        model_directive_suffixes_from_model, model_specific_reasoning_mapping,
+        parse_reasoning_model_directive_settings, suffix_supported_for_api_format,
     };
     use serde_json::json;
 
@@ -458,6 +490,70 @@ mod tests {
     }
 
     #[test]
+    fn max_and_ultra_suffixes_map_to_supported_openai_efforts() {
+        assert_eq!(
+            model_directive_suffixes_from_model("gpt-5.6-sol-max"),
+            Some(vec!["max".to_string()])
+        );
+        assert_eq!(
+            model_directive_suffixes_from_model("gpt-5.6-terra-ultra"),
+            Some(vec!["ultra".to_string()])
+        );
+        assert_eq!(model_directive_suffixes_from_model("gpt-5.4-ultra"), None);
+        assert_eq!(
+            default_reasoning_mapping("openai:responses", "max"),
+            Some(json!({ "reasoning": { "effort": "xhigh" } }))
+        );
+        assert_eq!(
+            model_specific_reasoning_mapping("openai:responses", "max", Some("gpt-5.6-sol-max"),),
+            Some(json!({ "reasoning": { "effort": "max" } }))
+        );
+        assert_eq!(
+            model_specific_reasoning_mapping(
+                "openai:responses:compact",
+                "ultra",
+                Some("gpt-5.6-terra-ultra"),
+            ),
+            Some(json!({ "reasoning": { "effort": "max" } }))
+        );
+        assert_eq!(
+            model_specific_reasoning_mapping("openai:chat", "max", Some("gpt-5.6-luna-max"),),
+            Some(json!({ "reasoning_effort": "max" }))
+        );
+        assert_eq!(
+            model_specific_reasoning_mapping("openai:chat", "ultra", Some("gpt-5.6-sol-ultra"),),
+            Some(json!({ "reasoning_effort": "max" }))
+        );
+    }
+
+    #[test]
+    fn gpt_5_6_max_and_ultra_override_legacy_saved_openai_mappings() {
+        let legacy_mappings = json!({
+            "low": { "reasoning": { "effort": "low" } },
+            "medium": { "reasoning": { "effort": "medium" } },
+            "high": { "reasoning": { "effort": "high" } },
+            "xhigh": { "reasoning": { "effort": "xhigh" } },
+            "max": { "reasoning": { "effort": "xhigh" } },
+            "fast": { "service_tier": "priority" }
+        });
+        let legacy_mappings = legacy_mappings.as_object().expect("legacy mappings");
+
+        for (requested_model, suffix) in
+            [("gpt-5.6-sol-max", "max"), ("gpt-5.6-sol-ultra", "ultra")]
+        {
+            assert_eq!(
+                model_directive_mapping_for_suffixes(
+                    "openai:responses",
+                    &[suffix.to_string()],
+                    Some(legacy_mappings),
+                    Some(requested_model),
+                ),
+                Some(json!({ "reasoning": { "effort": "max" } }))
+            );
+        }
+    }
+
+    #[test]
     fn combined_suffixes_are_order_insensitive() {
         let expected = Some(vec!["xhigh".to_string(), "fast".to_string()]);
         assert_eq!(
@@ -473,6 +569,7 @@ mod tests {
                 "openai:chat",
                 expected.as_ref().expect("suffixes should parse"),
                 None,
+                Some("gpt-5.4-fast-xhigh"),
             ),
             Some(json!({
                 "reasoning_effort": "xhigh",
@@ -491,7 +588,12 @@ mod tests {
             .iter()
             .all(|suffix| { suffix_supported_for_api_format("claude:messages", suffix, None) }));
         assert_eq!(
-            model_directive_mapping_for_suffixes("claude:messages", &suffixes, None),
+            model_directive_mapping_for_suffixes(
+                "claude:messages",
+                &suffixes,
+                None,
+                Some("gpt-5.4-xhigh-fast"),
+            ),
             None
         );
     }

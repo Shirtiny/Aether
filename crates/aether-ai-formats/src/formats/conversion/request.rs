@@ -859,6 +859,25 @@ mod tests {
     }
 
     #[test]
+    fn chat_ultra_reasoning_effort_uses_max_for_responses() {
+        let body = json!({
+            "model": "gpt-5.6-sol",
+            "messages": [{"role": "user", "content": "hello"}],
+            "reasoning_effort": "ultra",
+        });
+
+        let converted = registry::convert_request(
+            "openai:chat",
+            "openai:responses",
+            &body,
+            &FormatContext::default(),
+        )
+        .expect("responses request");
+
+        assert_eq!(converted["reasoning"]["effort"], "max");
+    }
+
+    #[test]
     fn responses_to_claude_defaults_max_tokens_and_omits_false_is_error() {
         let body = json!({
             "model": "gpt-5",

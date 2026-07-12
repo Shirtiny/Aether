@@ -780,6 +780,27 @@ mod tests {
     }
 
     #[test]
+    fn local_openai_responses_request_body_normalizes_gpt_5_6_ultra_alias() {
+        let body_json = json!({
+            "model": "gpt-5.6-sol",
+            "input": "hello",
+            "reasoning": {"effort": "ultra", "summary": "detailed"}
+        });
+
+        let provider_request_body =
+            build_local_openai_responses_request_body_with_model_directives(
+                &body_json,
+                "gpt-5.6-sol",
+                false,
+                true,
+            )
+            .expect("openai responses body should build");
+
+        assert_eq!(provider_request_body["reasoning"]["effort"], "max");
+        assert_eq!(provider_request_body["reasoning"]["summary"], "detailed");
+    }
+
+    #[test]
     fn cross_format_request_body_applies_reasoning_effort_suffix() {
         let body_json = json!({
             "model": "gpt-5.4-high",

@@ -19,6 +19,7 @@ pub enum ReasoningEffort {
     High,
     XHigh,
     Max,
+    Ultra,
 }
 
 impl ReasoningEffort {
@@ -29,25 +30,34 @@ impl ReasoningEffort {
             "high" => Some(Self::High),
             "xhigh" => Some(Self::XHigh),
             "max" => Some(Self::Max),
+            "ultra" => Some(Self::Ultra),
             _ => None,
         }
     }
 
-    pub fn as_openai_chat_value(self) -> &'static str {
+    pub fn as_openai_chat_value(self, model: &str) -> &'static str {
         match self {
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
-            Self::XHigh | Self::Max => "high",
+            Self::XHigh => "high",
+            Self::Max if model_supports_codex_max_ultra(model) => "max",
+            Self::Max => "high",
+            // Codex implements `ultra` as wire-level `max` plus client-side delegation behavior.
+            Self::Ultra => "max",
         }
     }
 
-    pub fn as_openai_responses_value(self) -> &'static str {
+    pub fn as_openai_responses_value(self, model: &str) -> &'static str {
         match self {
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
-            Self::XHigh | Self::Max => "xhigh",
+            Self::XHigh => "xhigh",
+            Self::Max if model_supports_codex_max_ultra(model) => "max",
+            Self::Max => "xhigh",
+            // Codex keeps `ultra` as a client mode and sends `max` to Responses.
+            Self::Ultra => "max",
         }
     }
 
@@ -57,7 +67,7 @@ impl ReasoningEffort {
             Self::Medium => "medium",
             Self::High => "high",
             Self::XHigh => "xhigh",
-            Self::Max => "max",
+            Self::Max | Self::Ultra => "max",
         }
     }
 
@@ -65,7 +75,7 @@ impl ReasoningEffort {
         match self {
             Self::Low => "low",
             Self::Medium => "medium",
-            Self::High | Self::XHigh | Self::Max => "high",
+            Self::High | Self::XHigh | Self::Max | Self::Ultra => "high",
         }
     }
 
@@ -74,9 +84,16 @@ impl ReasoningEffort {
             Self::Low => 1280,
             Self::Medium => 2048,
             Self::High => 4096,
-            Self::XHigh | Self::Max => 8192,
+            Self::XHigh | Self::Max | Self::Ultra => 8192,
         }
     }
+}
+
+pub fn model_supports_codex_max_ultra(model: &str) -> bool {
+    matches!(
+        model.trim().to_ascii_lowercase().as_str(),
+        "gpt-5.6-luna" | "gpt-5.6-sol" | "gpt-5.6-terra"
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,6 +135,11 @@ fn parse_model_directive_parts(model: &str) -> Option<(String, Vec<ModelOverride
         base_model = candidate_base.trim();
     }
     if base_model.is_empty() {
+        return None;
+    }
+    if overrides.reasoning_effort == Some(ReasoningEffort::Ultra)
+        && !model_supports_codex_max_ultra(base_model)
+    {
         return None;
     }
     let overrides = overrides.into_overrides()?;
@@ -219,6 +241,7 @@ pub fn apply_model_directive_overrides_from_model(
     provider_model: &str,
     source_model: &str,
 ) -> Option<ModelDirective> {
+    normalize_codex_ultra_effort_alias(provider_request_body, provider_api_format, source_model);
     let directive = parse_model_directive(source_model)?;
     let mut patched_body = provider_request_body.clone();
     for override_item in &directive.overrides {
@@ -228,6 +251,7 @@ pub fn apply_model_directive_overrides_from_model(
                     &mut patched_body,
                     provider_api_format,
                     provider_model,
+                    &directive.base_model,
                     *effort,
                 )?;
             }
@@ -238,6 +262,53 @@ pub fn apply_model_directive_overrides_from_model(
     }
     *provider_request_body = patched_body;
     Some(directive)
+}
+
+fn normalize_codex_ultra_effort_alias(
+    provider_request_body: &mut Value,
+    provider_api_format: &str,
+    source_model: &str,
+) {
+    let source_base_model = parse_model_directive(source_model)
+        .map(|directive| directive.base_model)
+        .unwrap_or_else(|| source_model.trim().to_string());
+    if !model_supports_codex_max_ultra(&source_base_model) {
+        return;
+    }
+
+    match crate::normalize_api_format_alias(provider_api_format).as_str() {
+        "openai:chat" => {
+            let Some(object) = provider_request_body.as_object_mut() else {
+                return;
+            };
+            if object
+                .get("reasoning_effort")
+                .and_then(Value::as_str)
+                .is_some_and(|effort| effort.eq_ignore_ascii_case("ultra"))
+            {
+                object.insert(
+                    "reasoning_effort".to_string(),
+                    Value::String("max".to_string()),
+                );
+            }
+        }
+        "openai:responses" | "openai:responses:compact" => {
+            let Some(reasoning) = provider_request_body
+                .get_mut("reasoning")
+                .and_then(Value::as_object_mut)
+            else {
+                return;
+            };
+            if reasoning
+                .get("effort")
+                .and_then(Value::as_str)
+                .is_some_and(|effort| effort.eq_ignore_ascii_case("ultra"))
+            {
+                reasoning.insert("effort".to_string(), Value::String("max".to_string()));
+            }
+        }
+        _ => {}
+    }
 }
 
 pub fn apply_model_directive_mapping_patch(
@@ -270,17 +341,19 @@ fn apply_reasoning_effort_override(
     provider_request_body: &mut Value,
     provider_api_format: &str,
     provider_model: &str,
+    source_model: &str,
     effort: ReasoningEffort,
 ) -> Option<()> {
     match crate::normalize_api_format_alias(provider_api_format).as_str() {
         "openai:chat" => set_object_string(
             provider_request_body,
             "reasoning_effort",
-            effort.as_openai_chat_value(),
+            effort.as_openai_chat_value(source_model),
         ),
         "openai:responses" | "openai:responses:compact" => {
-            set_openai_responses_reasoning_effort(provider_request_body, effort)
+            set_openai_responses_reasoning_effort(provider_request_body, effort, source_model)
         }
+        "claude:messages" | "gemini:generate_content" if effort == ReasoningEffort::Ultra => None,
         "claude:messages" => {
             set_claude_reasoning_effort(provider_request_body, effort, provider_model)
         }
@@ -312,7 +385,11 @@ fn set_object_string(body: &mut Value, key: &str, value: &str) -> Option<()> {
     Some(())
 }
 
-fn set_openai_responses_reasoning_effort(body: &mut Value, effort: ReasoningEffort) -> Option<()> {
+fn set_openai_responses_reasoning_effort(
+    body: &mut Value,
+    effort: ReasoningEffort,
+    source_model: &str,
+) -> Option<()> {
     let body_object = body.as_object_mut()?;
     let reasoning = body_object
         .entry("reasoning".to_string())
@@ -322,7 +399,7 @@ fn set_openai_responses_reasoning_effort(body: &mut Value, effort: ReasoningEffo
     }
     reasoning.as_object_mut()?.insert(
         "effort".to_string(),
-        Value::String(effort.as_openai_responses_value().to_string()),
+        Value::String(effort.as_openai_responses_value(source_model).to_string()),
     );
     Some(())
 }
@@ -478,6 +555,15 @@ mod tests {
                 overrides: vec![ModelOverride::ReasoningEffort(ReasoningEffort::Max)],
             })
         );
+        for base_model in ["gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"] {
+            assert_eq!(
+                parse_model_directive(&format!("{base_model}-ULTRA")),
+                Some(ModelDirective {
+                    base_model: base_model.to_string(),
+                    overrides: vec![ModelOverride::ReasoningEffort(ReasoningEffort::Ultra)],
+                })
+            );
+        }
     }
 
     #[test]
@@ -506,6 +592,7 @@ mod tests {
 
     #[test]
     fn ignores_unknown_or_incomplete_suffixes() {
+        assert_eq!(parse_model_directive("gpt-5.4-extreme"), None);
         assert_eq!(parse_model_directive("gpt-5.4-ultra"), None);
         assert_eq!(parse_model_directive("gpt-5.4"), None);
         assert_eq!(parse_model_directive("-high"), None);
@@ -525,6 +612,24 @@ mod tests {
         .expect("directive should apply");
         assert_eq!(openai_chat["reasoning_effort"], "high");
 
+        apply_model_directive_overrides_from_model(
+            &mut openai_chat,
+            "openai:chat",
+            "gpt-5.6-sol",
+            "gpt-5.6-sol-max",
+        )
+        .expect("max directive should apply to chat");
+        assert_eq!(openai_chat["reasoning_effort"], "max");
+
+        apply_model_directive_overrides_from_model(
+            &mut openai_chat,
+            "openai:chat",
+            "gpt-5.6-sol",
+            "gpt-5.6-sol-ultra",
+        )
+        .expect("ultra directive should clamp to the highest chat effort");
+        assert_eq!(openai_chat["reasoning_effort"], "max");
+
         let mut responses = json!({
             "model": "gpt-5-upstream",
             "reasoning": {"effort": "low", "summary": "auto"}
@@ -538,6 +643,15 @@ mod tests {
         .expect("directive should apply");
         assert_eq!(responses["reasoning"]["effort"], "xhigh");
         assert_eq!(responses["reasoning"]["summary"], "auto");
+
+        apply_model_directive_overrides_from_model(
+            &mut responses,
+            "openai:responses",
+            "gpt-5.6-sol",
+            "gpt-5.6-sol-ultra",
+        )
+        .expect("ultra directive should apply");
+        assert_eq!(responses["reasoning"]["effort"], "max");
 
         let mut claude = json!({"model": "claude-sonnet-4-5"});
         apply_model_directive_overrides_from_model(
@@ -561,6 +675,37 @@ mod tests {
             gemini["generationConfig"]["thinkingConfig"]["thinkingBudget"],
             2048
         );
+    }
+
+    #[test]
+    fn normalizes_direct_gpt_5_6_ultra_body_effort_to_wire_max() {
+        let mut responses = json!({
+            "model": "gpt-5.6-sol",
+            "reasoning": {"effort": "ULTRA", "summary": "detailed"}
+        });
+
+        assert!(apply_model_directive_overrides_from_model(
+            &mut responses,
+            "openai:responses",
+            "gpt-5.6-sol",
+            "gpt-5.6-sol",
+        )
+        .is_none());
+        assert_eq!(responses["reasoning"]["effort"], "max");
+        assert_eq!(responses["reasoning"]["summary"], "detailed");
+
+        let mut legacy = json!({
+            "model": "gpt-5.4",
+            "reasoning": {"effort": "ultra"}
+        });
+        assert!(apply_model_directive_overrides_from_model(
+            &mut legacy,
+            "openai:responses",
+            "gpt-5.4",
+            "gpt-5.4",
+        )
+        .is_none());
+        assert_eq!(legacy["reasoning"]["effort"], "ultra");
     }
 
     #[test]

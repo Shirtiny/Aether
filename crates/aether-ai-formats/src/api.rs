@@ -76,8 +76,8 @@ pub use crate::formats::shared::model_directives::{
     apply_model_directive_mapping_patch, apply_model_directive_overrides_from_model,
     apply_model_directive_overrides_from_request, claude_model_uses_adaptive_effort,
     extract_gemini_model_from_path, gemini_model_uses_thinking_level, model_directive_base_model,
-    normalize_model_directive_model, parse_model_directive, ModelDirective, ModelOverride,
-    ReasoningEffort, ServiceTier,
+    model_supports_codex_max_ultra, normalize_model_directive_model, parse_model_directive,
+    ModelDirective, ModelOverride, ReasoningEffort, ServiceTier,
 };
 pub use crate::formats::shared::passthrough::{
     resolve_stream_spec as resolve_local_same_format_stream_spec,

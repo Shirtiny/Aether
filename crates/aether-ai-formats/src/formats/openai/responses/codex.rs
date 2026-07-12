@@ -1624,6 +1624,26 @@ mod tests {
     }
 
     #[test]
+    fn codex_chat_body_edits_preserve_existing_max_reasoning_effort() {
+        let mut provider_request_body = json!({
+            "input": [],
+            "model": "gpt-5.6-sol",
+            "reasoning": {"effort": "max"}
+        });
+
+        apply_codex_openai_responses_chat_body_edits(
+            &mut provider_request_body,
+            "codex",
+            "openai:responses",
+            None,
+            None,
+        );
+
+        assert_eq!(provider_request_body["reasoning"]["effort"], json!("max"));
+        assert_eq!(provider_request_body["reasoning"]["summary"], json!("auto"));
+    }
+
+    #[test]
     fn codex_image_body_edits_force_tool_choice_and_default_generate_tool_fields() {
         let mut provider_request_body = json!({
             "input": [{
