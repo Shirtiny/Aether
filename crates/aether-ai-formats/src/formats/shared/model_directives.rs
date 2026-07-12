@@ -241,7 +241,7 @@ pub fn apply_model_directive_overrides_from_model(
     provider_model: &str,
     source_model: &str,
 ) -> Option<ModelDirective> {
-    normalize_codex_ultra_effort_alias(provider_request_body, provider_api_format, source_model);
+    normalize_codex_effort_alias(provider_request_body, provider_api_format, source_model);
     let directive = parse_model_directive(source_model)?;
     let mut patched_body = provider_request_body.clone();
     for override_item in &directive.overrides {
@@ -264,7 +264,7 @@ pub fn apply_model_directive_overrides_from_model(
     Some(directive)
 }
 
-fn normalize_codex_ultra_effort_alias(
+fn normalize_codex_effort_alias(
     provider_request_body: &mut Value,
     provider_api_format: &str,
     source_model: &str,
@@ -281,14 +281,14 @@ fn normalize_codex_ultra_effort_alias(
             let Some(object) = provider_request_body.as_object_mut() else {
                 return;
             };
-            if object
+            if let Some(effort) = object
                 .get("reasoning_effort")
                 .and_then(Value::as_str)
-                .is_some_and(|effort| effort.eq_ignore_ascii_case("ultra"))
+                .and_then(normalize_gpt_5_6_reasoning_effort)
             {
                 object.insert(
                     "reasoning_effort".to_string(),
-                    Value::String("max".to_string()),
+                    Value::String(effort.to_string()),
                 );
             }
         }
@@ -299,15 +299,25 @@ fn normalize_codex_ultra_effort_alias(
             else {
                 return;
             };
-            if reasoning
+            if let Some(effort) = reasoning
                 .get("effort")
                 .and_then(Value::as_str)
-                .is_some_and(|effort| effort.eq_ignore_ascii_case("ultra"))
+                .and_then(normalize_gpt_5_6_reasoning_effort)
             {
-                reasoning.insert("effort".to_string(), Value::String("max".to_string()));
+                reasoning.insert("effort".to_string(), Value::String(effort.to_string()));
             }
         }
         _ => {}
+    }
+}
+
+fn normalize_gpt_5_6_reasoning_effort(effort: &str) -> Option<&'static str> {
+    match effort.trim().to_ascii_lowercase().as_str() {
+        "ultra" => Some("max"),
+        // GPT-5.6 does not accept a disabled-reasoning level. Preserve the
+        // caller's lowest-effort intent instead of forwarding an upstream 400.
+        "off" | "none" | "minimal" => Some("low"),
+        _ => None,
     }
 }
 
@@ -706,6 +716,51 @@ mod tests {
         )
         .is_none());
         assert_eq!(legacy["reasoning"]["effort"], "ultra");
+    }
+
+    #[test]
+    fn normalizes_disabled_gpt_5_6_effort_to_wire_low() {
+        for unsupported in ["off", "none", "minimal"] {
+            let mut responses = json!({
+                "model": "gpt-5.6-sol",
+                "reasoning": {"effort": unsupported, "summary": "auto"}
+            });
+            assert!(apply_model_directive_overrides_from_model(
+                &mut responses,
+                "openai:responses",
+                "gpt-5.6-sol",
+                "gpt-5.6-sol",
+            )
+            .is_none());
+            assert_eq!(responses["reasoning"]["effort"], "low");
+            assert_eq!(responses["reasoning"]["summary"], "auto");
+
+            let mut chat = json!({
+                "model": "gpt-5.6-terra",
+                "reasoning_effort": unsupported
+            });
+            assert!(apply_model_directive_overrides_from_model(
+                &mut chat,
+                "openai:chat",
+                "gpt-5.6-terra",
+                "gpt-5.6-terra",
+            )
+            .is_none());
+            assert_eq!(chat["reasoning_effort"], "low");
+        }
+
+        let mut legacy = json!({
+            "model": "gpt-5.4",
+            "reasoning": {"effort": "off"}
+        });
+        assert!(apply_model_directive_overrides_from_model(
+            &mut legacy,
+            "openai:responses",
+            "gpt-5.4",
+            "gpt-5.4",
+        )
+        .is_none());
+        assert_eq!(legacy["reasoning"]["effort"], "off");
     }
 
     #[test]
