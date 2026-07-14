@@ -297,6 +297,9 @@ pub(crate) fn provider_pool_quota_snapshot_exhausted_decision(
             let mut saw_exhausted_window = false;
             let mut saw_active_exhausted_window = false;
             let mut windows_max_ratio = None::<f64>;
+            let top_level_reset_active =
+                provider_pool_reset_deadline_unix_secs(quota_snapshot, snapshot_observed_at)
+                    .is_some_and(|reset_at| now_unix_secs.is_none_or(|now| reset_at > now));
 
             for window in windows.iter().filter_map(Value::as_object) {
                 if let Some(ratio) = provider_pool_json_f64(window.get("used_ratio")) {
@@ -305,17 +308,23 @@ pub(crate) fn provider_pool_quota_snapshot_exhausted_decision(
                 }
                 if provider_pool_quota_window_is_exhausted(window) {
                     saw_exhausted_window = true;
-                    let reset_elapsed = now_unix_secs.is_some_and(|now| {
-                        provider_pool_reset_deadline_elapsed(window, snapshot_observed_at, now)
-                    });
-                    if !reset_elapsed {
+                    let reset_active =
+                        provider_pool_reset_deadline_unix_secs(window, snapshot_observed_at)
+                            .is_some_and(|reset_at| now_unix_secs.is_none_or(|now| reset_at > now));
+                    // A raw exhausted flag without a recovery deadline is an
+                    // observation, not a permanent scheduling block. Runtime
+                    // error cooldowns provide the bounded fallback.
+                    if reset_active {
                         saw_active_exhausted_window = true;
                     }
                 }
             }
 
             if saw_exhausted_window {
-                return Some(saw_active_exhausted_window);
+                return Some(saw_active_exhausted_window || top_level_reset_active);
+            }
+            if top_level_reset_active {
+                return Some(true);
             }
             if windows_max_ratio.is_some_and(|ratio| ratio < 1.0 - 1e-6) {
                 return Some(false);
@@ -367,4 +376,60 @@ pub(crate) fn provider_pool_account_blocked(key: &StoredProviderCatalogKey) -> b
             .iter()
             .any(|hint| normalized.contains(hint))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key_with_quota(quota: Value) -> StoredProviderCatalogKey {
+        let mut key = StoredProviderCatalogKey::new(
+            "key-grok".to_string(),
+            "provider-grok".to_string(),
+            "grok".to_string(),
+            "oauth".to_string(),
+            None,
+            true,
+        )
+        .expect("key");
+        key.status_snapshot = Some(json!({ "quota": quota }));
+        key
+    }
+
+    #[test]
+    fn exhausted_window_without_deadline_is_not_a_permanent_block() {
+        let key = key_with_quota(json!({
+            "provider_type": "grok",
+            "exhausted": true,
+            "windows": [{
+                "code": "requests",
+                "used_ratio": 1.0,
+                "is_exhausted": true
+            }]
+        }));
+        assert_eq!(
+            provider_pool_quota_snapshot_exhausted_decision(&key, "grok"),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn top_level_retry_deadline_blocks_even_when_windows_have_capacity() {
+        let now = provider_pool_current_unix_secs().expect("clock");
+        let key = key_with_quota(json!({
+            "provider_type": "grok",
+            "observed_at": now,
+            "exhausted": true,
+            "reset_at": now + 120,
+            "windows": [{
+                "code": "requests",
+                "used_ratio": 0.5,
+                "is_exhausted": false
+            }]
+        }));
+        assert_eq!(
+            provider_pool_quota_snapshot_exhausted_decision(&key, "grok"),
+            Some(true)
+        );
+    }
 }

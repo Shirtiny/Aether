@@ -183,7 +183,12 @@ fn merge_upstream_metadata(
         .unwrap_or_default();
     if let Some(update_object) = updates.as_object() {
         for (key, value) in update_object {
-            merged.insert(key.clone(), value.clone());
+            let value = if key.eq_ignore_ascii_case("grok") {
+                aether_provider_pool::merge_grok_quota_snapshot(merged.get(key), value)
+            } else {
+                value.clone()
+            };
+            merged.insert(key.clone(), value);
         }
     }
     serde_json::Value::Object(merged)

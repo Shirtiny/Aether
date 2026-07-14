@@ -315,6 +315,24 @@ async fn set_pool_cooldown(
     spawn_remove_pool_active_probe_member(runtime, provider_id, key_id);
 }
 
+pub(crate) async fn record_admin_provider_pool_grok_auth_cooldown(
+    runtime: &RuntimeState,
+    provider_id: &str,
+    key_id: &str,
+    status_code: u16,
+) -> bool {
+    let (reason, ttl_seconds) = match status_code {
+        401 => ("grok_oauth_unauthorized_401", 10 * 60),
+        403 => ("grok_entitlement_denied_403", 30 * 60),
+        _ => return false,
+    };
+    if status_code == 401 {
+        invalidate_pool_oauth_cache(runtime, key_id).await;
+    }
+    set_pool_cooldown(runtime, provider_id, key_id, reason, ttl_seconds).await;
+    true
+}
+
 fn spawn_remove_pool_active_probe_member(runtime: &RuntimeState, provider_id: &str, key_id: &str) {
     let runtime = runtime.clone();
     let provider_id = provider_id.to_string();
@@ -922,8 +940,8 @@ mod tests {
         clear_admin_provider_pool_sticky_session_if_bound_to_key,
         clear_admin_provider_pool_sticky_session_prebind_if_owner,
         parse_google_quota_cooldown_seconds_at, prebind_admin_provider_pool_sticky_session,
-        record_admin_provider_pool_error, record_admin_provider_pool_stream_timeout,
-        record_admin_provider_pool_success,
+        record_admin_provider_pool_error, record_admin_provider_pool_grok_auth_cooldown,
+        record_admin_provider_pool_stream_timeout, record_admin_provider_pool_success,
         refresh_admin_provider_pool_sticky_session_if_bound_to_key,
         release_admin_provider_pool_sticky_session_init_if_owner,
     };
@@ -2132,6 +2150,67 @@ mod tests {
             .cooldown_ttl_by_key
             .get("key-2")
             .is_some_and(|ttl| *ttl <= 120 && *ttl >= 100));
+    }
+
+    #[tokio::test]
+    async fn grok_auth_failures_use_bounded_account_cooldowns() {
+        let Some(redis) = start_managed_redis_or_skip().await else {
+            return;
+        };
+        let app = build_runner_app(redis.redis_url(), "pool_runtime_grok_auth_cooldown").await;
+        let runtime = app.runtime_state.as_ref();
+        let pool_config = sample_pool_config();
+        let key_ids = vec!["grok-401".to_string(), "grok-403".to_string()];
+
+        assert!(
+            record_admin_provider_pool_grok_auth_cooldown(
+                runtime,
+                "provider-grok",
+                "grok-401",
+                401,
+            )
+            .await
+        );
+        assert!(
+            record_admin_provider_pool_grok_auth_cooldown(
+                runtime,
+                "provider-grok",
+                "grok-403",
+                403,
+            )
+            .await
+        );
+
+        let state = read_admin_provider_pool_runtime_state(
+            runtime,
+            "provider-grok",
+            &key_ids,
+            &pool_config,
+            None,
+        )
+        .await;
+        assert_eq!(
+            state
+                .cooldown_reason_by_key
+                .get("grok-401")
+                .map(String::as_str),
+            Some("grok_oauth_unauthorized_401")
+        );
+        assert_eq!(
+            state
+                .cooldown_reason_by_key
+                .get("grok-403")
+                .map(String::as_str),
+            Some("grok_entitlement_denied_403")
+        );
+        assert!(state
+            .cooldown_ttl_by_key
+            .get("grok-401")
+            .is_some_and(|ttl| *ttl <= 600 && *ttl >= 580));
+        assert!(state
+            .cooldown_ttl_by_key
+            .get("grok-403")
+            .is_some_and(|ttl| *ttl <= 1_800 && *ttl >= 1_780));
     }
 
     #[tokio::test]

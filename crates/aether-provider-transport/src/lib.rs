@@ -60,15 +60,9 @@ pub use generic_oauth::{
     supports_local_generic_oauth_request_auth_resolution, GenericOAuthRefreshAdapter,
 };
 pub use grok::{
-    build_grok_app_chat_body, build_grok_browser_headers, build_grok_upstream_url, grok_base_url,
-    grok_browser_profile_id_from_user_agent,
-    grok_browser_profile_metadata_from_resolved_transport_profile,
-    grok_browser_resolved_transport_profile,
-    grok_browser_resolved_transport_profile_from_auth_config,
-    grok_browser_transport_fingerprint_from_auth_config, is_grok_provider_transport,
-    resolve_grok_session_auth, GrokBrowserProfileMetadata, GrokHeaderInput, GROK_CHAT_PATH,
-    GROK_DEFAULT_BASE_URL, GROK_DEFAULT_BROWSER_PROFILE, GROK_DEFAULT_USER_AGENT,
-    GROK_INTERNAL_HEADER, GROK_RATE_LIMITS_PATH,
+    apply_grok_xai_responses_body_edits, build_grok_upstream_url, grok_base_url,
+    is_grok_provider_transport, resolve_grok_bearer_auth, resolve_grok_model_alias,
+    GROK_DEFAULT_BASE_URL,
 };
 pub use headers::{should_skip_request_header, should_skip_upstream_passthrough_header};
 pub use network::{

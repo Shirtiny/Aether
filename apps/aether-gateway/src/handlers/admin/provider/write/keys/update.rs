@@ -9,7 +9,6 @@ use crate::handlers::admin::shared::{
     decrypt_catalog_secret_with_fallbacks, encrypt_catalog_secret_with_fallbacks, json_string_list,
     normalize_json_object, normalize_string_list, parse_catalog_auth_config_json,
 };
-use crate::handlers::shared::normalize_optional_api_key_concurrent_limit;
 use crate::provider_key_auth::provider_key_is_oauth_managed;
 use aether_data_contracts::repository::provider_catalog::{
     StoredProviderCatalogKey, StoredProviderCatalogProvider,
@@ -279,8 +278,17 @@ pub(crate) async fn build_admin_update_provider_key_record(
         }
     }
     if fields.contains("concurrent_limit") {
-        updated.concurrent_limit =
-            normalize_optional_api_key_concurrent_limit(payload.concurrent_limit)?;
+        updated.concurrent_limit = super::normalize_provider_key_concurrent_limit(
+            &provider.provider_type,
+            &updated.auth_type,
+            payload.concurrent_limit,
+            false,
+        )?;
+    } else if auth_type_switch
+        && provider.provider_type.trim().eq_ignore_ascii_case("grok")
+        && updated.auth_type.eq_ignore_ascii_case("oauth")
+    {
+        updated.concurrent_limit = Some(1);
     }
     if fields.contains("allowed_models") {
         updated.allowed_models =

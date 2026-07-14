@@ -27,16 +27,10 @@ pub(super) struct AdminProviderOAuthBatchImportEntry {
     pub account_id: Option<String>,
     pub account_user_id: Option<String>,
     pub plan_type: Option<String>,
-    pub pool_tier: Option<String>,
     pub user_id: Option<String>,
     pub email: Option<String>,
     pub account_name: Option<String>,
     pub project_id: Option<String>,
-    pub sso_rw_token: Option<String>,
-    pub cf_cookies: Option<String>,
-    pub cf_clearance: Option<String>,
-    pub user_agent: Option<String>,
-    pub browser_profile: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -111,52 +105,24 @@ fn json_import_expiry_from_keys(
         .find_map(|key| json_import_expiry_value(object.get(*key)))
 }
 
-fn grok_cookie_value(raw: &str, name: &str) -> Option<String> {
+fn looks_like_legacy_grok_cookie(raw: &str) -> bool {
     raw.trim()
         .strip_prefix("Cookie:")
         .unwrap_or_else(|| raw.trim())
         .split(';')
         .filter_map(|segment| segment.trim().split_once('='))
-        .find_map(|(cookie_name, cookie_value)| {
-            cookie_name
-                .trim()
-                .eq_ignore_ascii_case(name)
-                .then(|| cookie_value.trim())
-                .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned)
+        .any(|(cookie_name, _)| {
+            matches!(
+                cookie_name.trim().to_ascii_lowercase().as_str(),
+                "sso" | "sso-rw" | "cf_clearance" | "x-userid"
+            )
         })
 }
 
-fn grok_cookie_profile(raw: &str) -> Option<String> {
-    let raw = raw
-        .trim()
-        .strip_prefix("Cookie:")
-        .unwrap_or_else(|| raw.trim());
-    let parts = raw
-        .split(';')
-        .filter_map(|segment| {
-            let (cookie_name, cookie_value) = segment.trim().split_once('=')?;
-            let cookie_name = cookie_name.trim();
-            let cookie_value = cookie_value.trim();
-            if cookie_name.is_empty()
-                || cookie_value.is_empty()
-                || cookie_name.eq_ignore_ascii_case("sso")
-                || cookie_name.eq_ignore_ascii_case("sso-rw")
-            {
-                return None;
-            }
-            Some(format!("{cookie_name}={cookie_value}"))
-        })
-        .collect::<Vec<_>>();
-    (!parts.is_empty()).then(|| parts.join("; "))
-}
-
-fn grok_cookie_session_token(provider_type: &str, raw: &str) -> Option<String> {
-    provider_type
-        .trim()
-        .eq_ignore_ascii_case("grok")
-        .then(|| grok_cookie_value(raw, "sso"))
-        .flatten()
+fn legacy_grok_import_error() -> AdminProviderOAuthBatchImportEntry {
+    parse_error_entry(
+        "Grok 已迁移至官方 xAI OAuth，不再支持 grok.com Cookie 或 sso/session token".to_string(),
+    )
 }
 
 fn extract_admin_provider_oauth_batch_import_entry(
@@ -168,10 +134,12 @@ fn extract_admin_provider_oauth_batch_import_entry(
             let raw_token = value.trim();
             if raw_token.is_empty() {
                 None
+            } else if provider_type.trim().eq_ignore_ascii_case("grok")
+                && looks_like_legacy_grok_cookie(raw_token)
+            {
+                Some(legacy_grok_import_error())
             } else {
-                let sso_from_cookie = grok_cookie_session_token(provider_type, raw_token);
-                let token_input = sso_from_cookie.as_deref().unwrap_or(raw_token);
-                let (refresh_token, access_token) = import_tokens_from_raw_token(token_input);
+                let (refresh_token, access_token) = import_tokens_from_raw_token(raw_token);
                 let (refresh_token, access_token) = normalize_provider_import_tokens(
                     provider_type,
                     refresh_token.as_deref(),
@@ -186,16 +154,10 @@ fn extract_admin_provider_oauth_batch_import_entry(
                     account_id: None,
                     account_user_id: None,
                     plan_type: None,
-                    pool_tier: None,
-                    user_id: grok_cookie_value(raw_token, "x-userid"),
+                    user_id: None,
                     email: None,
                     account_name: None,
                     project_id: None,
-                    sso_rw_token: grok_cookie_value(raw_token, "sso-rw"),
-                    cf_cookies: grok_cookie_profile(raw_token),
-                    cf_clearance: grok_cookie_value(raw_token, "cf_clearance"),
-                    user_agent: None,
-                    browser_profile: None,
                 })
             }
         }
@@ -212,27 +174,38 @@ fn extract_admin_provider_oauth_batch_import_entry(
                     .get("access_token")
                     .or_else(|| object.get("accessToken")),
             );
-            let grok_token_alias = if is_grok { object.get("token") } else { None };
-            let grok_cookie = if is_grok {
-                coerce_admin_provider_oauth_import_str(
-                    object.get("cookie").or_else(|| object.get("cookieHeader")),
-                )
-            } else {
-                None
-            };
-            let session_token = coerce_admin_provider_oauth_import_str(
-                object
-                    .get("sso_token")
-                    .or_else(|| object.get("ssoToken"))
-                    .or_else(|| object.get("session_token"))
-                    .or_else(|| object.get("sessionToken"))
-                    .or(grok_token_alias),
-            )
-            .or_else(|| {
-                grok_cookie
-                    .as_deref()
-                    .and_then(|cookie| grok_cookie_value(cookie, "sso"))
-            });
+            let has_legacy_grok_fields = is_grok
+                && [
+                    "sso_token",
+                    "ssoToken",
+                    "session_token",
+                    "sessionToken",
+                    "token",
+                    "cookie",
+                    "cookieHeader",
+                    "cf_clearance",
+                    "cfClearance",
+                ]
+                .iter()
+                .any(|key| object.contains_key(*key));
+            if is_grok
+                && refresh_token.is_none()
+                && access_token.is_none()
+                && has_legacy_grok_fields
+            {
+                return Some(legacy_grok_import_error());
+            }
+            let session_token = (!is_grok)
+                .then(|| {
+                    coerce_admin_provider_oauth_import_str(
+                        object
+                            .get("sso_token")
+                            .or_else(|| object.get("ssoToken"))
+                            .or_else(|| object.get("session_token"))
+                            .or_else(|| object.get("sessionToken")),
+                    )
+                })
+                .flatten();
             let (refresh_token, access_token) = normalize_provider_import_tokens(
                 provider_type,
                 refresh_token.as_deref(),
@@ -299,25 +272,13 @@ fn extract_admin_provider_oauth_batch_import_entry(
                     .or_else(|| object.get("chatgptPlanType")),
             )
             .map(|value| value.to_ascii_lowercase());
-            let pool_tier = coerce_admin_provider_oauth_import_str(
-                object
-                    .get("pool_tier")
-                    .or_else(|| object.get("poolTier"))
-                    .or_else(|| object.get("tier")),
-            )
-            .map(|value| value.to_ascii_lowercase());
             let user_id = coerce_admin_provider_oauth_import_str(
                 object
                     .get("user_id")
                     .or_else(|| object.get("userId"))
                     .or_else(|| object.get("chatgpt_user_id"))
                     .or_else(|| object.get("chatgptUserId")),
-            )
-            .or_else(|| {
-                grok_cookie
-                    .as_deref()
-                    .and_then(|cookie| grok_cookie_value(cookie, "x-userid"))
-            });
+            );
             let email = coerce_admin_provider_oauth_import_str(object.get("email"));
             let account_name = coerce_admin_provider_oauth_import_str(
                 object
@@ -331,40 +292,6 @@ fn extract_admin_provider_oauth_batch_import_entry(
                     .or_else(|| object.get("cloudaicompanionProject"))
                     .or_else(|| object.get("cloudAiCompanionProject")),
             );
-            let sso_rw_token = coerce_admin_provider_oauth_import_str(
-                object
-                    .get("sso_rw_token")
-                    .or_else(|| object.get("ssoRwToken")),
-            )
-            .or_else(|| {
-                grok_cookie
-                    .as_deref()
-                    .and_then(|cookie| grok_cookie_value(cookie, "sso-rw"))
-            });
-            let cf_clearance = coerce_admin_provider_oauth_import_str(
-                object
-                    .get("cf_clearance")
-                    .or_else(|| object.get("cfClearance")),
-            )
-            .or_else(|| {
-                grok_cookie
-                    .as_deref()
-                    .and_then(|cookie| grok_cookie_value(cookie, "cf_clearance"))
-            });
-            let cf_cookies = coerce_admin_provider_oauth_import_str(
-                object.get("cf_cookies").or_else(|| object.get("cfCookies")),
-            )
-            .or_else(|| grok_cookie.as_deref().and_then(grok_cookie_profile));
-            let user_agent = coerce_admin_provider_oauth_import_str(
-                object.get("user_agent").or_else(|| object.get("userAgent")),
-            );
-            let browser_profile = coerce_admin_provider_oauth_import_str(
-                object
-                    .get("browser_profile")
-                    .or_else(|| object.get("browserProfile"))
-                    .or_else(|| object.get("browser"))
-                    .or_else(|| object.get("impersonate")),
-            );
             Some(AdminProviderOAuthBatchImportEntry {
                 parse_error: None,
                 refresh_token,
@@ -374,16 +301,10 @@ fn extract_admin_provider_oauth_batch_import_entry(
                 account_id,
                 account_user_id,
                 plan_type,
-                pool_tier,
                 user_id,
                 email,
                 account_name,
                 project_id,
-                sso_rw_token,
-                cf_cookies,
-                cf_clearance,
-                user_agent,
-                browser_profile,
             })
         }
         _ => None,
@@ -465,16 +386,10 @@ fn parse_error_entry(error: String) -> AdminProviderOAuthBatchImportEntry {
         account_id: None,
         account_user_id: None,
         plan_type: None,
-        pool_tier: None,
         user_id: None,
         email: None,
         account_name: None,
         project_id: None,
-        sso_rw_token: None,
-        cf_cookies: None,
-        cf_clearance: None,
-        user_agent: None,
-        browser_profile: None,
     }
 }
 
@@ -520,11 +435,6 @@ pub(super) fn apply_admin_provider_oauth_batch_import_hints(
             .entry("plan_type".to_string())
             .or_insert_with(|| json!(plan_type));
     }
-    if let Some(pool_tier) = entry.pool_tier.as_ref() {
-        auth_config
-            .entry("pool_tier".to_string())
-            .or_insert_with(|| json!(pool_tier));
-    }
     if let Some(user_id) = entry.user_id.as_ref() {
         auth_config
             .entry("user_id".to_string())
@@ -539,31 +449,6 @@ pub(super) fn apply_admin_provider_oauth_batch_import_hints(
         auth_config
             .entry("account_name".to_string())
             .or_insert_with(|| json!(account_name));
-    }
-    if let Some(sso_rw_token) = entry.sso_rw_token.as_ref() {
-        auth_config
-            .entry("sso_rw_token".to_string())
-            .or_insert_with(|| json!(sso_rw_token));
-    }
-    if let Some(cf_cookies) = entry.cf_cookies.as_ref() {
-        auth_config
-            .entry("cf_cookies".to_string())
-            .or_insert_with(|| json!(cf_cookies));
-    }
-    if let Some(cf_clearance) = entry.cf_clearance.as_ref() {
-        auth_config
-            .entry("cf_clearance".to_string())
-            .or_insert_with(|| json!(cf_clearance));
-    }
-    if let Some(user_agent) = entry.user_agent.as_ref() {
-        auth_config
-            .entry("user_agent".to_string())
-            .or_insert_with(|| json!(user_agent));
-    }
-    if let Some(browser_profile) = entry.browser_profile.as_ref() {
-        auth_config
-            .entry("browser_profile".to_string())
-            .or_insert_with(|| json!(browser_profile));
     }
 }
 
@@ -713,82 +598,59 @@ mod tests {
     }
 
     #[test]
-    fn parses_grok_jsonl_session_entries() {
+    fn parses_grok_official_oauth_json_entry() {
         let entries = parse_admin_provider_oauth_batch_import_entries(
             "grok",
-            r#"{"sso_token":"sso-1","cf_clearance":"cf-1","pool_tier":"heavy","email":"grok@example.com","browser_profile":"chrome136"}"#,
+            r#"{"refresh_token":"xai-refresh-1","access_token":"xai-access-1","expires_at":2100000000,"email":"grok@example.com"}"#,
         );
 
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].refresh_token, None);
-        assert_eq!(entries[0].access_token.as_deref(), Some("sso-1"));
-        assert_eq!(entries[0].cf_clearance.as_deref(), Some("cf-1"));
-        assert_eq!(entries[0].pool_tier.as_deref(), Some("heavy"));
+        assert_eq!(entries[0].refresh_token.as_deref(), Some("xai-refresh-1"));
+        assert_eq!(entries[0].access_token.as_deref(), Some("xai-access-1"));
+        assert_eq!(entries[0].expires_at, Some(2_100_000_000));
         assert_eq!(entries[0].email.as_deref(), Some("grok@example.com"));
-        assert_eq!(entries[0].browser_profile.as_deref(), Some("chrome136"));
     }
 
     #[test]
-    fn parses_grok_token_alias_with_account_traits() {
+    fn rejects_grok_legacy_session_json_entry() {
         let entries = parse_admin_provider_oauth_batch_import_entries(
             "grok",
-            r#"[{"token":"sso-1","planType":"super","tier":"heavy","accountName":"Grok Heavy"}]"#,
+            r#"[{"sso_token":"sso-1","cf_clearance":"cf-1","browser_profile":"chrome136"}]"#,
         );
 
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].refresh_token, None);
-        assert_eq!(entries[0].access_token.as_deref(), Some("sso-1"));
-        assert_eq!(entries[0].plan_type.as_deref(), Some("super"));
-        assert_eq!(entries[0].pool_tier.as_deref(), Some("heavy"));
-        assert_eq!(entries[0].account_name.as_deref(), Some("Grok Heavy"));
+        assert!(entries[0].refresh_token.is_none());
+        assert!(entries[0].access_token.is_none());
+        assert!(entries[0]
+            .parse_error
+            .as_deref()
+            .is_some_and(|error| error.contains("官方 xAI OAuth")));
     }
 
     #[test]
-    fn parses_grok_plain_line_as_session_token() {
-        let entries = parse_admin_provider_oauth_batch_import_entries("grok", "opaque-sso-token");
+    fn parses_grok_plain_line_as_refresh_token() {
+        let entries = parse_admin_provider_oauth_batch_import_entries("grok", "xai-refresh-token");
 
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].refresh_token, None);
-        assert_eq!(entries[0].access_token.as_deref(), Some("opaque-sso-token"));
+        assert_eq!(
+            entries[0].refresh_token.as_deref(),
+            Some("xai-refresh-token")
+        );
+        assert!(entries[0].access_token.is_none());
     }
 
     #[test]
-    fn parses_grok_cookie_line_as_session_metadata() {
+    fn rejects_grok_cookie_line() {
         let entries = parse_admin_provider_oauth_batch_import_entries(
             "grok",
             "i18nextLng=zh; cf_clearance=cf-1; sso-rw=rw-1; sso=sso-1; x-userid=user-1",
         );
 
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].refresh_token, None);
-        assert_eq!(entries[0].access_token.as_deref(), Some("sso-1"));
-        assert_eq!(entries[0].sso_rw_token.as_deref(), Some("rw-1"));
-        assert_eq!(
-            entries[0].cf_cookies.as_deref(),
-            Some("i18nextLng=zh; cf_clearance=cf-1; x-userid=user-1")
-        );
-        assert_eq!(entries[0].cf_clearance.as_deref(), Some("cf-1"));
-        assert_eq!(entries[0].user_id.as_deref(), Some("user-1"));
-    }
-
-    #[test]
-    fn parses_grok_cookie_object_as_session_metadata() {
-        let entries = parse_admin_provider_oauth_batch_import_entries(
-            "grok",
-            r#"[{"cookie":"cf_clearance=cf-1; sso-rw=rw-1; sso=sso-1; x-userid=user-1","tier":"heavy"}]"#,
-        );
-
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].refresh_token, None);
-        assert_eq!(entries[0].access_token.as_deref(), Some("sso-1"));
-        assert_eq!(entries[0].sso_rw_token.as_deref(), Some("rw-1"));
-        assert_eq!(
-            entries[0].cf_cookies.as_deref(),
-            Some("cf_clearance=cf-1; x-userid=user-1")
-        );
-        assert_eq!(entries[0].cf_clearance.as_deref(), Some("cf-1"));
-        assert_eq!(entries[0].user_id.as_deref(), Some("user-1"));
-        assert_eq!(entries[0].pool_tier.as_deref(), Some("heavy"));
+        assert!(entries[0]
+            .parse_error
+            .as_deref()
+            .is_some_and(|error| error.contains("grok.com Cookie")));
     }
 
     #[test]

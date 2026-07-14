@@ -289,6 +289,20 @@ function getGrokQuotaText(quota: QuotaStatusSnapshot): string | null {
 
   if (modelParts.length > 0) return modelParts.join(' | ')
 
+  const dimensionParts = ([
+    ['请求', 'requests'],
+    ['Token', 'tokens'],
+  ] as const)
+    .map(([label, code]) => {
+      const window = getQuotaWindow(quota, code)
+      const remainingPercent = getQuotaWindowRemainingPercent(window)
+      if (remainingPercent == null) return null
+      const valueText = getQuotaWindowValueText(window)
+      return `${label}剩余 ${formatPercent(remainingPercent)}${valueText ? ` (${valueText})` : ''}`
+    })
+    .filter((value): value is string => value != null)
+  if (dimensionParts.length > 0) return dimensionParts.join(' | ')
+
   const window = getQuotaWindow(quota, 'usage') ?? getQuotaWindowsByScope(quota, 'account')[0] ?? null
   const remainingPercent = getQuotaWindowRemainingPercent(window)
   if (typeof window?.remaining_value === 'number' && typeof window.limit_value === 'number' && window.limit_value > 0 && window.remaining_value <= 0) {

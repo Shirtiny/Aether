@@ -10,7 +10,6 @@ use serde_json::{json, Value};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ProviderQueryTestAdapter {
     Standard,
-    Grok,
     Kiro,
     OpenAiImage,
     Antigravity,
@@ -155,64 +154,6 @@ pub(super) fn provider_query_antigravity_test_unsupported_reason(
     }
 }
 
-pub(super) fn provider_query_grok_test_unsupported_reason(
-    transport: &AdminGatewayProviderTransportSnapshot,
-    api_format: &str,
-) -> Option<&'static str> {
-    if !transport.provider.is_active {
-        return Some("provider_inactive");
-    }
-    if !transport.endpoint.is_active {
-        return Some("endpoint_inactive");
-    }
-    if !transport.key.is_active {
-        return Some("key_inactive");
-    }
-    if !transport
-        .provider
-        .provider_type
-        .trim()
-        .eq_ignore_ascii_case("grok")
-    {
-        return Some("transport_provider_type_unsupported");
-    }
-    let normalized_api_format = provider_query_normalize_api_format_alias(api_format);
-    if !matches!(
-        normalized_api_format.as_str(),
-        "openai:chat" | "openai:responses" | "openai:responses:compact" | "claude:messages"
-    ) {
-        return Some("transport_api_format_mismatch");
-    }
-    if provider_query_normalize_api_format_alias(&transport.endpoint.api_format)
-        != normalized_api_format
-    {
-        return Some("transport_api_format_mismatch");
-    }
-    if crate::provider_transport::resolve_grok_session_auth(transport).is_none() {
-        return Some("transport_oauth_resolution_unsupported");
-    }
-    if !crate::provider_transport::header_rules_are_locally_supported(
-        transport.endpoint.header_rules.as_ref(),
-    ) {
-        return Some("transport_header_rules_unsupported");
-    }
-    if !crate::provider_transport::body_rules_are_locally_supported(
-        transport.endpoint.body_rules.as_ref(),
-    ) {
-        return Some("transport_body_rules_unsupported");
-    }
-    if !crate::provider_transport::transport_proxy_is_locally_supported(transport) {
-        return Some("transport_proxy_unsupported");
-    }
-    if crate::provider_transport::transport_profile_is_configured(transport)
-        && crate::provider_transport::resolve_transport_profile(transport).is_none()
-    {
-        return Some("transport_profile_unsupported");
-    }
-
-    None
-}
-
 pub(super) fn provider_query_normalize_api_format_alias(value: &str) -> String {
     crate::ai_serving::normalize_api_format_alias(value)
 }
@@ -227,13 +168,11 @@ pub(super) fn provider_query_test_adapter_for_provider_api_format(
 
     let normalized_api_format = provider_query_normalize_api_format_alias(api_format);
     if provider_type.trim().eq_ignore_ascii_case("grok") {
-        return match normalized_api_format.as_str() {
-            "openai:chat" | "openai:responses" | "openai:responses:compact" | "claude:messages" => {
-                Some(ProviderQueryTestAdapter::Grok)
-            }
-            "openai:image" => Some(ProviderQueryTestAdapter::OpenAiImage),
-            _ => None,
-        };
+        return matches!(
+            normalized_api_format.as_str(),
+            "openai:chat" | "openai:responses"
+        )
+        .then_some(ProviderQueryTestAdapter::Standard);
     }
     if normalized_api_format == "openai:image" {
         return Some(ProviderQueryTestAdapter::OpenAiImage);
@@ -271,16 +210,6 @@ pub(super) fn provider_query_model_test_endpoint_priority(
     let normalized_api_format = provider_query_normalize_api_format_alias(api_format);
     match provider_query_test_adapter_for_provider_api_format(provider_type, api_format)? {
         ProviderQueryTestAdapter::Kiro => Some(0),
-        ProviderQueryTestAdapter::Grok => {
-            if matches!(
-                normalized_api_format.as_str(),
-                "openai:chat" | "openai:responses" | "openai:responses:compact" | "claude:messages"
-            ) {
-                Some(0)
-            } else {
-                Some(2)
-            }
-        }
         ProviderQueryTestAdapter::Antigravity => Some(1),
         ProviderQueryTestAdapter::OpenAiImage => Some(2),
         ProviderQueryTestAdapter::Standard => {
@@ -341,9 +270,6 @@ pub(super) fn provider_query_transport_supports_model_test_execution(
                 &provider_query_default_antigravity_endpoint_test_body(),
             )
             .is_none()
-        }
-        Some(ProviderQueryTestAdapter::Grok) => {
-            provider_query_grok_test_unsupported_reason(transport, api_format).is_none()
         }
         Some(ProviderQueryTestAdapter::Standard) => match crate::ai_serving::normalize_api_format_alias(api_format).as_str() {
         "openai:chat" => {

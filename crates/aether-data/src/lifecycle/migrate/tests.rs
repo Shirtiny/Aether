@@ -754,6 +754,7 @@ fn mysql_and_sqlite_migrations_include_enabled_incrementals() {
             20260527000000,
             20260528000000,
             20260614000000,
+            20260714000000,
         ]
     );
     assert_eq!(
@@ -781,6 +782,7 @@ fn mysql_and_sqlite_migrations_include_enabled_incrementals() {
             20260527000000,
             20260528000000,
             20260614000000,
+            20260714000000,
         ]
     );
 }
@@ -1059,6 +1061,109 @@ INSERT INTO provider_endpoints (id, provider_id, api_format, base_url, custom_pa
         rows.get("fixed-grok-root"),
         Some(&("https://grok.com".to_string(), None))
     );
+}
+
+#[tokio::test]
+async fn grok_xai_migration_quarantines_all_legacy_keys_and_clamps_oauth_concurrency() {
+    let pool = SqlitePool::connect("sqlite::memory:")
+        .await
+        .expect("sqlite pool should connect");
+    sqlx::raw_sql(
+        r#"
+CREATE TABLE providers (
+  id TEXT PRIMARY KEY,
+  provider_type TEXT NOT NULL
+);
+CREATE TABLE provider_endpoints (
+  id TEXT PRIMARY KEY,
+  provider_id TEXT NOT NULL,
+  api_format TEXT NOT NULL,
+  base_url TEXT NOT NULL,
+  custom_path TEXT,
+  is_active INTEGER NOT NULL,
+  updated_at INTEGER
+);
+CREATE TABLE provider_api_keys (
+  id TEXT PRIMARY KEY,
+  provider_id TEXT NOT NULL,
+  auth_type TEXT NOT NULL,
+  is_active INTEGER NOT NULL,
+  status TEXT,
+  oauth_invalid_at INTEGER,
+  oauth_invalid_reason TEXT,
+  fingerprint TEXT,
+  concurrent_limit INTEGER,
+  updated_at INTEGER
+);
+INSERT INTO providers (id, provider_type) VALUES
+  ('grok-provider', 'grok'),
+  ('openai-provider', 'openai');
+INSERT INTO provider_endpoints
+  (id, provider_id, api_format, base_url, custom_path, is_active, updated_at)
+VALUES
+  ('grok-chat', 'grok-provider', 'openai:chat', 'https://custom.invalid/v1', '/chat', 1, 1),
+  ('grok-image', 'grok-provider', 'openai:image', 'https://custom.invalid/v1', '/images', 1, 1),
+  ('openai-chat', 'openai-provider', 'openai:chat', 'https://api.openai.com/v1', NULL, 1, 1);
+INSERT INTO provider_api_keys
+  (id, provider_id, auth_type, is_active, fingerprint, concurrent_limit, updated_at)
+VALUES
+  ('grok-oauth-null-fingerprint', 'grok-provider', 'oauth', 1, NULL, 0, 1),
+  ('grok-oauth-custom-fingerprint', 'grok-provider', 'oauth', 1, '{"transport":"manual"}', 8, 1),
+  ('grok-cookie-key', 'grok-provider', 'api_key', 1, NULL, NULL, 1),
+  ('openai-key', 'openai-provider', 'oauth', 1, NULL, 9, 1);
+"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("migration fixture should build");
+
+    let migration = super::sqlite::MIGRATOR
+        .iter()
+        .find(|migration| migration.version == 20260714000000)
+        .expect("Grok xAI migration should be embedded");
+    sqlx::raw_sql(migration.sql.as_ref())
+        .execute(&pool)
+        .await
+        .expect("Grok xAI migration should apply");
+
+    let grok_keys = sqlx::query_as::<_, (String, i64, Option<String>, Option<i64>)>(
+        "SELECT id, is_active, oauth_invalid_reason, concurrent_limit FROM provider_api_keys WHERE provider_id = 'grok-provider' ORDER BY id",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("Grok keys should load");
+    assert_eq!(grok_keys.len(), 3);
+    for (id, is_active, reason, concurrent_limit) in grok_keys {
+        assert_eq!(is_active, 0, "legacy Grok key {id} should be inactive");
+        assert!(
+            reason.is_some_and(|value| value.contains("重新授权")),
+            "legacy Grok key {id} should require reauthorization"
+        );
+        if id.starts_with("grok-oauth") {
+            assert_eq!(concurrent_limit, Some(1));
+        }
+    }
+
+    let grok_endpoints = sqlx::query_as::<_, (String, String, Option<String>, i64)>(
+        "SELECT id, base_url, custom_path, is_active FROM provider_endpoints WHERE provider_id = 'grok-provider' ORDER BY id",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("Grok endpoints should load");
+    assert_eq!(grok_endpoints[0].1, "https://api.x.ai/v1");
+    assert_eq!(grok_endpoints[0].2, None);
+    assert_eq!(grok_endpoints[0].3, 1);
+    assert_eq!(grok_endpoints[1].1, "https://api.x.ai/v1");
+    assert_eq!(grok_endpoints[1].2, None);
+    assert_eq!(grok_endpoints[1].3, 0);
+
+    let openai_key = sqlx::query_as::<_, (i64, Option<i64>)>(
+        "SELECT is_active, concurrent_limit FROM provider_api_keys WHERE id = 'openai-key'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("non-Grok key should load");
+    assert_eq!(openai_key, (1, Some(9)));
 }
 
 #[test]
@@ -1594,6 +1699,7 @@ fn pending_migrations_from_applied_skips_versions_already_applied() {
             20260708090002,
             20260708090003,
             20260712120000,
+            20260714000000,
         ]
     );
 }
@@ -1627,6 +1733,7 @@ fn pending_migrations_from_applied_lists_post_snapshot_incrementals_after_empty_
             20260708090002,
             20260708090003,
             20260712120000,
+            20260714000000,
         ]
     );
 }

@@ -448,10 +448,7 @@ fn key_auth_channel_matches(row: &CandidateSelectionRow, api_format: &str) -> bo
         }
         "grok" => {
             auth_type == "oauth"
-                && matches!(
-                    api_format.as_str(),
-                    "openai:chat" | "openai:responses" | "claude:messages" | "openai:image"
-                )
+                && matches!(api_format.as_str(), "openai:chat" | "openai:responses")
         }
         "windsurf" => {
             matches!(auth_type.as_str(), "oauth" | "api_key" | "bearer")

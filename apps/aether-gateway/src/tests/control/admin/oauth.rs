@@ -25,6 +25,7 @@ use axum::body::{to_bytes, Body, Bytes};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, delete, get, patch, post, put};
 use axum::{extract::Request, Json, Router};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use http::{HeaderMap, HeaderValue, StatusCode};
 use serde_json::json;
 
@@ -3131,6 +3132,159 @@ async fn gateway_completes_admin_provider_oauth_provider_locally_with_trusted_ad
     gateway_handle.abort();
     token_handle.abort();
     upstream_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_completes_grok_xai_oauth_pkce_and_persists_official_credentials() {
+    let seen_token_body = Arc::new(Mutex::new(None::<String>));
+    let seen_token_body_clone = Arc::clone(&seen_token_body);
+    let xai_id_token = format!(
+        "e30.{}.signature",
+        URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&json!({
+                "sub": "xai-user-1",
+                "email": "grok@example.com",
+                "nonce": "nonce-provider-grok-123",
+            }))
+            .expect("id token claims should serialize")
+        )
+    );
+    let token_server = Router::new().route(
+        "/oauth2/token",
+        post(move |body: Bytes| {
+            let seen_token_body_inner = Arc::clone(&seen_token_body_clone);
+            let xai_id_token = xai_id_token.clone();
+            async move {
+                *seen_token_body_inner.lock().expect("mutex should lock") =
+                    Some(String::from_utf8(body.to_vec()).expect("token form should be utf8"));
+                Json(json!({
+                    "access_token": "xai-access-token",
+                    "refresh_token": "xai-refresh-token",
+                    "id_token": xai_id_token,
+                    "token_type": "Bearer",
+                    "expires_at": 4_102_444_800u64,
+                    "scope": "openid profile email offline_access grok-cli:access api:access",
+                    "email": "grok@example.com",
+                    "subscription_tier": "heavy",
+                    "entitlement_status": "active"
+                }))
+            }
+        }),
+    );
+
+    let mut provider = sample_provider("provider-grok-oauth", "Grok", 10);
+    provider.provider_type = "grok".to_string();
+    provider.concurrent_limit = None;
+    let endpoint = sample_endpoint(
+        "endpoint-grok-responses",
+        "provider-grok-oauth",
+        "openai:responses",
+        "https://api.x.ai/v1",
+    );
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        vec![endpoint],
+        Vec::new(),
+    ));
+
+    let (token_url, token_handle) = start_server(token_server).await;
+    let gateway = build_router_with_state(
+        AppState::new()
+            .expect("gateway should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(
+                    provider_catalog_repository.clone(),
+                )
+                .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+            )
+            .with_provider_oauth_state_entry_for_tests(
+                "nonce-provider-grok-123",
+                json!({
+                    "nonce": "nonce-provider-grok-123",
+                    "key_id": "",
+                    "provider_id": "provider-grok-oauth",
+                    "provider_type": "grok",
+                    "pkce_verifier": "verifier-provider-grok-123"
+                }),
+            )
+            .with_provider_oauth_token_url_for_tests("grok", format!("{token_url}/oauth2/token")),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{gateway_url}/api/admin/provider-oauth/providers/provider-grok-oauth/complete"
+        ))
+        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&json!({
+            "callback_url": "http://127.0.0.1:56121/callback?code=xai-code-123&state=nonce-provider-grok-123"
+        }))
+        .send()
+        .await
+        .expect("request should succeed");
+
+    let status = response.status();
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(status, StatusCode::OK, "payload={payload}");
+    assert_eq!(payload["provider_type"], "grok");
+    assert_eq!(payload["has_refresh_token"], true);
+    assert_eq!(payload["email"], "grok@example.com");
+
+    let token_body = seen_token_body
+        .lock()
+        .expect("mutex should lock")
+        .clone()
+        .expect("token request should be recorded");
+    assert!(token_body.contains("grant_type=authorization_code"));
+    assert!(token_body.contains("code=xai-code-123"));
+    assert!(token_body.contains("code_verifier=verifier-provider-grok-123"));
+    assert!(token_body.contains("client_id=b1a00492-073a-47ea-816f-4c329264a828"));
+    assert!(token_body.contains("grok-cli%3Aaccess"));
+
+    let persisted = provider_catalog_repository
+        .list_keys_by_provider_ids(&["provider-grok-oauth".to_string()])
+        .await
+        .expect("keys should load")
+        .into_iter()
+        .next()
+        .expect("grok oauth key should be created");
+    assert_eq!(persisted.auth_type, "oauth");
+    assert_eq!(persisted.concurrent_limit, Some(1));
+    let decrypted_api_key = decrypt_python_fernet_ciphertext(
+        DEVELOPMENT_ENCRYPTION_KEY,
+        persisted
+            .encrypted_api_key
+            .as_deref()
+            .expect("access token should be stored"),
+    )
+    .expect("access token should decrypt");
+    assert_eq!(decrypted_api_key, "xai-access-token");
+    let decrypted_auth_config = decrypt_python_fernet_ciphertext(
+        DEVELOPMENT_ENCRYPTION_KEY,
+        persisted
+            .encrypted_auth_config
+            .as_deref()
+            .expect("auth config should be stored"),
+    )
+    .expect("auth config should decrypt");
+    let auth_config: serde_json::Value =
+        serde_json::from_str(&decrypted_auth_config).expect("auth config should parse");
+    assert_eq!(auth_config["refresh_token"], "xai-refresh-token");
+    assert_eq!(auth_config["base_url"], "https://api.x.ai/v1");
+    assert_eq!(
+        auth_config["token_endpoint"],
+        "https://auth.x.ai/oauth2/token"
+    );
+    assert_eq!(auth_config["subscription_tier"], "heavy");
+    assert_eq!(auth_config["entitlement_status"], "active");
+    assert!(auth_config.get("sso_token").is_none());
+    assert!(auth_config.get("browser_profile").is_none());
+
+    gateway_handle.abort();
+    token_handle.abort();
 }
 
 #[tokio::test]

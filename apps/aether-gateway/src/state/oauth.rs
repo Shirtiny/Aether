@@ -663,7 +663,7 @@ impl AppState {
 
     pub(crate) fn provider_oauth_token_url(
         &self,
-        _provider_type: &str,
+        provider_type: &str,
         default_token_url: &str,
     ) -> String {
         #[cfg(test)]
@@ -672,11 +672,15 @@ impl AppState {
                 .provider_oauth_token_url_overrides
                 .lock()
                 .expect("provider oauth token url overrides should lock")
-                .get(_provider_type.trim())
+                .get(provider_type.trim())
                 .cloned()
             {
                 return value;
             }
+        }
+
+        if provider_type.trim().eq_ignore_ascii_case("grok") {
+            return aether_oauth::provider::providers::effective_xai_oauth_token_url();
         }
 
         default_token_url.to_string()

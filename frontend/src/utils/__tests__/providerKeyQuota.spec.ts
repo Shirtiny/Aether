@@ -108,6 +108,34 @@ describe('providerKeyQuota', () => {
     }, 'grok')).toBe('Auto剩余 40.0% (60/150) | Heavy剩余 0.0% (0/20)')
   })
 
+  it('formats official xAI request and token quota windows', () => {
+    expect(getQuotaDisplayText({
+      status_snapshot: {
+        quota: {
+          provider_type: 'grok',
+          code: 'ok',
+          exhausted: false,
+          windows: [
+            {
+              code: 'requests',
+              scope: 'account',
+              remaining_ratio: 0.4,
+              remaining_value: 40,
+              limit_value: 100,
+            },
+            {
+              code: 'tokens',
+              scope: 'account',
+              remaining_ratio: 0.25,
+              remaining_value: 250,
+              limit_value: 1000,
+            },
+          ],
+        },
+      },
+    }, 'grok')).toBe('请求剩余 40.0% (40/100) | Token剩余 25.0% (250/1000)')
+  })
+
   it('formats Gemini CLI AI credits from status snapshot and upstream metadata', () => {
     expect(getQuotaDisplayText({
       status_snapshot: {

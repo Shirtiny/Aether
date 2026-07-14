@@ -4187,6 +4187,26 @@ function buildQuotaProgressItemsFromSnapshot(key: PoolKeyDetail): QuotaProgressI
   if (providerType === 'grok') {
     const quotaResetAtSeconds = getQuotaSnapshotResetAtSeconds(quota)
     const quotaResetSeconds = getQuotaSnapshotResetSeconds(quota)
+    const dimensionWindows = [
+      ['请求', getQuotaSnapshotWindow(quota, 'requests')],
+      ['Token', getQuotaSnapshotWindow(quota, 'tokens')],
+    ] as const
+    const dimensionItems = dimensionWindows
+      .map(([label, window]): QuotaProgressItem | null => {
+        const remainingPercent = getQuotaWindowRemainingPercent(window)
+        if (remainingPercent == null) return null
+        return {
+          label,
+          remainingPercent,
+          detail: getQuotaWindowValueText(window),
+          resetAtSeconds: normalizeUnixSeconds(window?.reset_at ?? quotaResetAtSeconds ?? null),
+          resetSeconds: normalizeRemainingSeconds(window?.reset_seconds ?? quotaResetSeconds ?? null),
+          updatedAtSeconds: getQuotaSnapshotUpdatedAtSeconds(quota),
+        }
+      })
+      .filter((item): item is QuotaProgressItem => item != null)
+    if (dimensionItems.length > 0) return dimensionItems
+
     const modelWindows = getQuotaSnapshotWindowsByScope(quota, 'model')
     if (modelWindows.length > 0) {
       return modelWindows

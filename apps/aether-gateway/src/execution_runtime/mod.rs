@@ -6,7 +6,6 @@ use serde_json::{Map, Value};
 mod chatgpt_web_image;
 mod constants;
 mod fallback;
-mod grok;
 mod kiro_cache;
 mod kiro_web_search;
 pub(crate) mod ndjson;

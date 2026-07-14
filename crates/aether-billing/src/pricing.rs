@@ -127,11 +127,15 @@ static GROK_BUILD_OFFICIAL_PRICING: LazyLock<Value> = LazyLock::new(|| {
 fn official_grok_pricing(model: &str) -> Option<&'static Value> {
     let normalized = model.trim().to_ascii_lowercase().replace('_', "-");
     match normalized.as_str() {
-        "grok" | "grok-latest" | "grok-4.5" | "grok-4.5-latest" | "grok-build-latest" => {
+        "grok" | "grok-4.5" | "grok-4.5-latest" | "grok-build-latest" => {
             Some(&GROK45_OFFICIAL_PRICING)
         }
-        "grok-4.3" | "grok-4.3-latest" => Some(&GROK43_OFFICIAL_PRICING),
-        "grok-build" | "grok-build-0.1" => Some(&GROK_BUILD_OFFICIAL_PRICING),
+        "grok-latest" | "grok-4.3" | "grok-4.3-latest" => Some(&GROK43_OFFICIAL_PRICING),
+        "grok-build"
+        | "grok-build-0.1"
+        | "grok-code-fast"
+        | "grok-code-fast-1"
+        | "grok-code-fast-1-0825" => Some(&GROK_BUILD_OFFICIAL_PRICING),
         _ => None,
     }
 }
@@ -366,8 +370,10 @@ mod tests {
         for (model, input, output, cache_read) in [
             ("grok", 2.0, 6.0, Some(0.5)),
             ("grok-4.5-latest", 2.0, 6.0, Some(0.5)),
+            ("grok-latest", 1.25, 2.5, None),
             ("grok-4.3", 1.25, 2.5, None),
             ("grok-build-0.1", 1.0, 2.0, None),
+            ("grok-code-fast-1", 1.0, 2.0, None),
         ] {
             let mut pricing = snapshot(None, None);
             pricing.global_model_name = model.to_string();

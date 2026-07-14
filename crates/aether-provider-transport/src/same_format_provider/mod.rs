@@ -10,7 +10,6 @@ use crate::auth::{
 use crate::claude_code::build_claude_code_passthrough_headers;
 use crate::claude_code::local_claude_code_transport_unsupported_reason_with_network;
 use crate::gemini_cli::is_gemini_cli_provider_transport;
-use crate::grok::{is_grok_provider_transport, resolve_grok_session_auth};
 use crate::kiro::{
     build_kiro_provider_headers, build_kiro_provider_request_body, is_kiro_provider_transport,
     local_kiro_request_transport_unsupported_reason_with_network, KiroAuthConfig,
@@ -400,10 +399,6 @@ pub fn same_format_provider_transport_unsupported_reason(
     family: SameFormatProviderFamily,
     api_format: &str,
 ) -> Option<&'static str> {
-    if is_grok_provider_transport(transport) && matches!(family, SameFormatProviderFamily::Standard)
-    {
-        return None;
-    }
     if behavior.is_kiro {
         local_kiro_request_transport_unsupported_reason_with_network(transport)
     } else if behavior.is_antigravity {
@@ -492,10 +487,6 @@ pub fn resolve_same_format_provider_direct_auth(
     family: SameFormatProviderFamily,
     provider_api_format: &str,
 ) -> Option<(String, String)> {
-    if is_grok_provider_transport(transport) && matches!(family, SameFormatProviderFamily::Standard)
-    {
-        return resolve_grok_session_auth(transport);
-    }
     if behavior.is_vertex {
         None
     } else {

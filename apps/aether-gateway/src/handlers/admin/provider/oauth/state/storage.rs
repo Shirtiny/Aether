@@ -12,10 +12,18 @@ pub(crate) fn build_provider_oauth_start_response(
         .unwrap_or_else(|| {
             build_provider_oauth_authorization_url_legacy(template, nonce, code_challenge)
         });
+    let redirect_uri = url::Url::parse(&authorization_url)
+        .ok()
+        .and_then(|url| {
+            url.query_pairs()
+                .find(|(key, _)| key == "redirect_uri")
+                .map(|(_, value)| value.into_owned())
+        })
+        .unwrap_or_else(|| template.redirect_uri.to_string());
 
     json!({
         "authorization_url": authorization_url,
-        "redirect_uri": template.redirect_uri,
+        "redirect_uri": redirect_uri,
         "provider_type": template.provider_type,
         "instructions": "1) 打开 authorization_url 完成授权\n2) 授权后会跳转到 redirect_uri（localhost）\n3) 复制浏览器地址栏完整 URL，调用 complete 接口粘贴 callback_url",
     })

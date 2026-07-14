@@ -143,6 +143,10 @@ pub async fn read_provider_transport_snapshot(
     let mut endpoint = map_endpoint(endpoint);
     let mut key = map_key(key, encryption_key, &fallback_encryption_keys)?;
 
+    if provider.provider_type.trim().eq_ignore_ascii_case("grok") {
+        endpoint.base_url = aether_oauth::provider::providers::effective_xai_base_url();
+    }
+
     if let LocalAuthConfigAbsorption::Absorbed {
         base_url,
         header_rules,

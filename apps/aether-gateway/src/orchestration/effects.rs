@@ -39,8 +39,8 @@ use crate::handlers::shared::provider_pool::{
     clear_admin_provider_pool_sticky_session_prebind_if_owner,
     prebind_admin_provider_pool_sticky_session, read_admin_provider_pool_hot_runtime_state,
     read_admin_provider_pool_runtime_state, record_admin_provider_pool_error,
-    record_admin_provider_pool_stream_timeout, record_admin_provider_pool_success,
-    refresh_admin_provider_pool_sticky_session_if_bound_to_key,
+    record_admin_provider_pool_grok_auth_cooldown, record_admin_provider_pool_stream_timeout,
+    record_admin_provider_pool_success, refresh_admin_provider_pool_sticky_session_if_bound_to_key,
     release_admin_provider_pool_key_lease,
     release_admin_provider_pool_sticky_session_init_if_owner,
     renew_admin_provider_pool_sticky_session_init_if_owner, AdminProviderPoolConfig,
@@ -119,6 +119,7 @@ pub(crate) enum LocalExecutionEffect<'a> {
 
 struct PoolFeedbackContext {
     pool_config: AdminProviderPoolConfig,
+    provider_type: String,
     sticky_session_token: Option<String>,
 }
 
@@ -605,6 +606,7 @@ async fn resolve_pool_feedback_context(
 
     Some(PoolFeedbackContext {
         pool_config,
+        provider_type: transport.provider.provider_type,
         sticky_session_token,
     })
 }
@@ -1311,21 +1313,38 @@ async fn record_pool_error_effect(
     )
     .await;
     clear_pool_key_circuit_breaker(state, context).await;
-    record_admin_provider_pool_error(
-        state.runtime_state.as_ref(),
-        &context.plan.provider_id,
-        &context.plan.key_id,
-        &pool_context.pool_config,
-        effect.status_code,
-        effect.error_body,
-        Some(effect.headers),
-    )
-    .await;
+    let grok_auth_cooldown = pool_context
+        .provider_type
+        .trim()
+        .eq_ignore_ascii_case("grok")
+        && record_admin_provider_pool_grok_auth_cooldown(
+            state.runtime_state.as_ref(),
+            &context.plan.provider_id,
+            &context.plan.key_id,
+            effect.status_code,
+        )
+        .await;
+    if !grok_auth_cooldown {
+        record_admin_provider_pool_error(
+            state.runtime_state.as_ref(),
+            &context.plan.provider_id,
+            &context.plan.key_id,
+            &pool_context.pool_config,
+            effect.status_code,
+            effect.error_body,
+            Some(effect.headers),
+        )
+        .await;
+    }
     record_pool_score_schedule_feedback(
         state,
         context,
         Some(false),
-        pool_score_hard_state_for_status(effect.status_code, effect.error_body),
+        if grok_auth_cooldown {
+            Some(PoolMemberHardState::Cooldown)
+        } else {
+            pool_score_hard_state_for_status(effect.status_code, effect.error_body)
+        },
         Some(pool_score_delta_for_status(effect.status_code)),
         serde_json::json!({
             "last_request_feedback": {
@@ -1421,6 +1440,23 @@ async fn record_oauth_invalidation_effect(
         }
     };
     if !transport.key.auth_type.trim().eq_ignore_ascii_case("oauth") {
+        return;
+    }
+
+    if transport
+        .provider
+        .provider_type
+        .trim()
+        .eq_ignore_ascii_case("grok")
+        && matches!(effect.status_code, 401 | 403)
+    {
+        // PoolError is emitted immediately after OauthInvalidation for terminal
+        // request failures and owns the pool cooldown/score mutation. Keep this
+        // effect limited to evicting the stale OAuth entry so one failure is
+        // not counted and penalized twice.
+        let _ = state
+            .invalidate_local_oauth_refresh_entry(&plan.key_id)
+            .await;
         return;
     }
 

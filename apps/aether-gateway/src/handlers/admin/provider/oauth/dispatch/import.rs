@@ -184,7 +184,28 @@ fn apply_single_import_hints(
             ][..],
         ),
         ("pool_tier", &["pool_tier", "poolTier", "tier"][..]),
+        (
+            "subscription_tier",
+            &["subscription_tier", "subscriptionTier"][..],
+        ),
+        (
+            "entitlement_status",
+            &["entitlement_status", "entitlementStatus"][..],
+        ),
     ] {
+        if provider_type == "grok"
+            && matches!(
+                target,
+                "sso_rw_token"
+                    | "cf_cookies"
+                    | "cf_clearance"
+                    | "user_agent"
+                    | "browser_profile"
+                    | "pool_tier"
+            )
+        {
+            continue;
+        }
         let Some(value) = import_payload_string_any(payload, keys) else {
             continue;
         };
@@ -222,7 +243,7 @@ async fn resolve_admin_provider_oauth_single_import_tokens(
                         access_token,
                         Some(refresh_token),
                         imported_expires_at,
-                        Some("Provider 不支持 Refresh Token 交换，已回退为 Session Token 导入"),
+                        Some("Provider 不支持 Refresh Token 交换，已回退为 Access Token 导入"),
                     );
                     return Ok(AdminProviderOAuthSingleImportTokens {
                         access_token: access_token.to_string(),
@@ -233,7 +254,7 @@ async fn resolve_admin_provider_oauth_single_import_tokens(
             }
             return Err(build_internal_control_error_response(
                 http::StatusCode::BAD_REQUEST,
-                "该 Provider 不支持 Refresh Token 导入，请提供 sso_token 或 access_token",
+                "该 Provider 不支持 Refresh Token 导入，请提供 access_token",
             ));
         };
 
@@ -416,16 +437,11 @@ pub(super) async fn handle_admin_provider_oauth_import_refresh_token(
         }
     };
     let refresh_token_input = import_payload_string(&raw_payload, "refresh_token", "refreshToken");
-    let access_token_input = import_payload_string_any(
+    let access_token_input =
+        import_payload_string_any(&raw_payload, &["access_token", "accessToken"]);
+    let legacy_session_token_input = import_payload_string_any(
         &raw_payload,
-        &[
-            "access_token",
-            "accessToken",
-            "sso_token",
-            "ssoToken",
-            "session_token",
-            "sessionToken",
-        ],
+        &["sso_token", "ssoToken", "session_token", "sessionToken"],
     );
     let imported_expires_at =
         import_payload_u64_any(&raw_payload, &["expires_at", "expiresAt", "expired"]);
@@ -454,6 +470,11 @@ pub(super) async fn handle_admin_provider_oauth_import_refresh_token(
         ));
     };
     let provider_type = provider.provider_type.trim().to_ascii_lowercase();
+    let access_token_input = if provider_type == "grok" {
+        access_token_input
+    } else {
+        access_token_input.or(legacy_session_token_input)
+    };
     let (refresh_token_input, access_token_input) = normalize_provider_import_tokens(
         &provider_type,
         refresh_token_input.as_deref(),
@@ -462,7 +483,7 @@ pub(super) async fn handle_admin_provider_oauth_import_refresh_token(
     if refresh_token_input.is_none() && access_token_input.is_none() {
         return Ok(build_internal_control_error_response(
             http::StatusCode::BAD_REQUEST,
-            "Refresh Token、Access Token 或 sso_token 不能为空",
+            "Refresh Token 或 Access Token 不能为空",
         ));
     }
     if !is_fixed_provider_type_for_provider_oauth(&provider_type) {

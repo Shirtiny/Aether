@@ -39,12 +39,18 @@ pub(crate) fn build_admin_fixed_provider_endpoint_defaults(
     )
     .and_then(|(_, rules)| (!rules.is_empty()).then_some(serde_json::Value::Array(rules)));
 
+    let template_base_url = if provider.provider_type.trim().eq_ignore_ascii_case("grok") {
+        aether_oauth::provider::providers::effective_xai_base_url()
+    } else {
+        template.base_url.to_string()
+    };
+
     Ok(AdminFixedProviderEndpointDefaults {
         api_format: normalized_api_format.to_string(),
         api_family: api_family.to_string(),
         endpoint_kind: endpoint_kind.to_string(),
         is_active: true,
-        base_url: normalize_admin_base_url(template.base_url)?,
+        base_url: normalize_admin_base_url(&template_base_url)?,
         header_rules: None,
         body_rules,
         max_retries: Some(provider.max_retries.unwrap_or(2)),

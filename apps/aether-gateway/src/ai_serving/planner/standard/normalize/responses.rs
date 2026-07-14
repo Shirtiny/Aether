@@ -43,6 +43,11 @@ pub(crate) fn build_local_openai_responses_request_body(
         body_rules,
         user_api_key_id,
     );
+    crate::provider_transport::apply_grok_xai_responses_body_edits(
+        &mut provider_request_body,
+        provider_type,
+        provider_api_format,
+    );
     apply_openai_responses_compact_special_body_edits(
         &mut provider_request_body,
         provider_api_format,
@@ -90,6 +95,11 @@ pub(crate) fn build_cross_format_openai_responses_request_body(
         provider_api_format,
         body_rules,
         user_api_key_id,
+    );
+    crate::provider_transport::apply_grok_xai_responses_body_edits(
+        &mut provider_request_body,
+        provider_type,
+        provider_api_format,
     );
     apply_openai_responses_compact_special_body_edits(
         &mut provider_request_body,

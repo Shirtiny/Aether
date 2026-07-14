@@ -30,8 +30,8 @@ pub use gemini_cli::{
     build_gemini_cli_pool_quota_request, GEMINI_CLI_RETRIEVE_USER_QUOTA_PATH, GEMINI_CLI_USER_AGENT,
 };
 pub use grok::{
-    grok_mode_id_for_model, grok_pool_tier_from_quota_bucket, grok_quota_window_key_for_model,
-    grok_supported_quota_windows_for_tier, GrokProviderPoolAdapter,
+    build_grok_pool_quota_request, merge_grok_quota_snapshot, parse_grok_quota_headers,
+    GrokProviderPoolAdapter, XAI_DEFAULT_BASE_URL, XAI_QUOTA_PROBE_MODEL,
 };
 pub use kiro::KiroProviderPoolAdapter;
 pub use kiro::{

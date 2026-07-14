@@ -35,11 +35,16 @@ pub(crate) async fn prepare_header_authenticated_candidate(
         None
     };
 
-    prepare_ai_header_authenticated_candidate(
+    let mut prepared = prepare_ai_header_authenticated_candidate(
         direct_auth,
         oauth_auth,
         candidate.selected_provider_model_name.as_str(),
-    )
+    )?;
+    prepared.mapped_model = crate::provider_transport::resolve_grok_model_alias(
+        &transport.provider.provider_type,
+        &prepared.mapped_model,
+    );
+    Ok(prepared)
 }
 
 pub(crate) fn prepare_header_authenticated_candidate_from_auth(

@@ -98,7 +98,7 @@ INNER JOIN LATERAL (
       OR (
         LOWER(BTRIM(p.provider_type)) = 'grok'
         AND LOWER(BTRIM(pak.auth_type)) = 'oauth'
-        AND LOWER($3) IN ('openai:chat', 'openai:responses', 'claude:messages', 'openai:image')
+        AND LOWER($3) IN ('openai:chat', 'openai:responses')
       )
       OR (
         LOWER(BTRIM(p.provider_type)) IN ('gemini_cli', 'antigravity')
@@ -191,7 +191,7 @@ WHERE p.is_active = TRUE
     OR (
       LOWER(BTRIM(p.provider_type)) = 'grok'
       AND LOWER(BTRIM(pak.auth_type)) = 'oauth'
-      AND LOWER($3) IN ('openai:chat', 'openai:responses', 'claude:messages', 'openai:image')
+      AND LOWER($3) IN ('openai:chat', 'openai:responses')
     )
     OR (
       LOWER(BTRIM(p.provider_type)) IN ('gemini_cli', 'antigravity')
@@ -378,7 +378,7 @@ INNER JOIN LATERAL (
       OR (
         LOWER(BTRIM(p.provider_type)) = 'grok'
         AND LOWER(BTRIM(pak.auth_type)) = 'oauth'
-        AND LOWER($4) IN ('openai:chat', 'openai:responses', 'claude:messages', 'openai:image')
+        AND LOWER($4) IN ('openai:chat', 'openai:responses')
       )
       OR (
         LOWER(BTRIM(p.provider_type)) IN ('gemini_cli', 'antigravity')
@@ -472,7 +472,7 @@ WHERE p.is_active = TRUE
     OR (
       LOWER(BTRIM(p.provider_type)) = 'grok'
       AND LOWER(BTRIM(pak.auth_type)) = 'oauth'
-      AND LOWER($4) IN ('openai:chat', 'openai:responses', 'claude:messages', 'openai:image')
+      AND LOWER($4) IN ('openai:chat', 'openai:responses')
     )
     OR (
       LOWER(BTRIM(p.provider_type)) IN ('gemini_cli', 'antigravity')
@@ -667,7 +667,7 @@ WHERE p.is_active = TRUE
     OR (
       LOWER(BTRIM(p.provider_type)) = 'grok'
       AND LOWER(BTRIM(pak.auth_type)) = 'oauth'
-      AND LOWER($6) IN ('openai:chat', 'openai:responses', 'claude:messages', 'openai:image')
+      AND LOWER($6) IN ('openai:chat', 'openai:responses')
     )
     OR (
       LOWER(BTRIM(p.provider_type)) IN ('gemini_cli', 'antigravity')
@@ -1525,8 +1525,7 @@ mod tests {
         ] {
             assert!(sql.contains("LOWER(BTRIM(p.provider_type)) = 'grok'"));
             assert!(sql.contains("LOWER(BTRIM(pak.auth_type)) = 'oauth'"));
-            assert!(sql
-                .contains("'openai:chat', 'openai:responses', 'claude:messages', 'openai:image'"));
+            assert!(sql.contains("'openai:chat', 'openai:responses'"));
             assert!(sql.contains("'grok',"));
         }
     }

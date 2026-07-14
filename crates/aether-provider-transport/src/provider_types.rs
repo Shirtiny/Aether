@@ -259,9 +259,8 @@ const GROK_RUNTIME_POLICY: ProviderRuntimePolicy = ProviderRuntimePolicy {
     fixed_provider: true,
     api_format_inheritance: ProviderApiFormatInheritance::OAuth,
     enable_format_conversion_by_default: true,
+    oauth_is_bearer_like: true,
     supports_model_fetch: false,
-    supports_local_openai_chat_transport: false,
-    supports_local_same_format_transport: false,
     ..STANDARD_RUNTIME_POLICY
 };
 
@@ -397,8 +396,8 @@ const ANTIGRAVITY_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProvider
 
 const GROK_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProviderTemplate {
     provider_type: "grok",
-    version: 1,
-    base_url: "https://grok.com",
+    version: 2,
+    base_url: "https://api.x.ai/v1",
     endpoints: &[
         FixedProviderEndpointTemplate {
             item_key: "openai:chat",
@@ -409,18 +408,6 @@ const GROK_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProviderTemplat
         FixedProviderEndpointTemplate {
             item_key: "openai:responses",
             api_format: "openai:responses",
-            custom_path: None,
-            config_defaults: EMPTY_ENDPOINT_CONFIG_DEFAULTS,
-        },
-        FixedProviderEndpointTemplate {
-            item_key: "claude:messages",
-            api_format: "claude:messages",
-            custom_path: None,
-            config_defaults: EMPTY_ENDPOINT_CONFIG_DEFAULTS,
-        },
-        FixedProviderEndpointTemplate {
-            item_key: "openai:image",
-            api_format: "openai:image",
             custom_path: None,
             config_defaults: EMPTY_ENDPOINT_CONFIG_DEFAULTS,
         },
@@ -603,6 +590,24 @@ pub fn provider_type_admin_oauth_template(provider_type: &str) -> Option<Provide
             redirect_uri: "http://localhost:51121/oauth2callback",
             use_pkce: true,
         }),
+        "grok" => Some(ProviderOAuthTemplate {
+            provider_type: "grok",
+            display_name: "Grok (xAI)",
+            authorize_url: "https://auth.x.ai/oauth2/authorize",
+            token_url: "https://auth.x.ai/oauth2/token",
+            client_id: "b1a00492-073a-47ea-816f-4c329264a828",
+            client_secret: "",
+            scopes: &[
+                "openid",
+                "profile",
+                "email",
+                "offline_access",
+                "grok-cli:access",
+                "api:access",
+            ],
+            redirect_uri: "http://127.0.0.1:56121/callback",
+            use_pkce: true,
+        }),
         "windsurf" => Some(ProviderOAuthTemplate {
             provider_type: "windsurf",
             display_name: "Windsurf",
@@ -624,6 +629,7 @@ pub const ADMIN_PROVIDER_OAUTH_TEMPLATE_TYPES: &[&str] = &[
     "chatgpt_web",
     "gemini_cli",
     "antigravity",
+    "grok",
     "windsurf",
 ];
 
@@ -704,26 +710,26 @@ mod tests {
     }
 
     #[test]
-    fn grok_fixed_provider_template_exposes_chat_responses_messages_and_image() {
+    fn grok_fixed_provider_template_uses_xai_oauth_text_endpoints() {
         let template = fixed_provider_template("grok").expect("grok template should exist");
-        assert_eq!(template.base_url, "https://grok.com");
-        assert_eq!(template.version, 1);
+        assert_eq!(template.base_url, "https://api.x.ai/v1");
+        assert_eq!(template.version, 2);
         assert_eq!(
             template
                 .endpoints
                 .iter()
                 .map(|item| item.api_format)
                 .collect::<Vec<_>>(),
-            vec![
-                "openai:chat",
-                "openai:responses",
-                "claude:messages",
-                "openai:image"
-            ]
+            vec!["openai:chat", "openai:responses"]
         );
         assert!(!template.runtime_policy.supports_model_fetch);
-        assert!(!template.runtime_policy.supports_local_openai_chat_transport);
-        assert!(!template.runtime_policy.supports_local_same_format_transport);
+        assert!(template.runtime_policy.oauth_is_bearer_like);
+        assert!(template.runtime_policy.supports_local_openai_chat_transport);
+        assert!(template.runtime_policy.supports_local_same_format_transport);
+        let oauth =
+            provider_type_admin_oauth_template("grok").expect("grok oauth template should exist");
+        assert_eq!(oauth.token_url, "https://auth.x.ai/oauth2/token");
+        assert!(oauth.scopes.contains(&"api:access"));
     }
 
     #[test]

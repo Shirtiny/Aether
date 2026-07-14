@@ -836,7 +836,7 @@ function getSelectedNodeLabel(): string {
 
 // 模式
 type DialogMode = 'oauth' | 'import'
-const mode = ref<DialogMode>((props.providerType || '').toLowerCase() === 'grok' ? 'import' : 'oauth')
+const mode = ref<DialogMode>('oauth')
 type WindsurfImportMethod = 'email_password' | 'token_json'
 
 // OAuth 状态
@@ -937,8 +937,8 @@ const isKiroProvider = computed(() => (props.providerType || '').toLowerCase() =
 const isGrokProvider = computed(() => (props.providerType || '').toLowerCase() === 'grok')
 const isWindsurfProvider = computed(() => (props.providerType || '').toLowerCase() === 'windsurf')
 const isDeviceBrowserProvider = computed(() => isKiroProvider.value || isWindsurfProvider.value)
-const showAuthorizationMode = computed(() => !isGrokProvider.value)
-const defaultMode = computed<DialogMode>(() => (isGrokProvider.value ? 'import' : 'oauth'))
+const showAuthorizationMode = computed(() => true)
+const defaultMode = computed<DialogMode>(() => 'oauth')
 
 const isSocialDeviceAuth = computed(() =>
   device.value.auth_type === 'google' || device.value.auth_type === 'github'
@@ -996,31 +996,31 @@ const canImport = computed(() => {
   return importText.value.trim().length > 0 && !importing.value
 })
 
-const importModeLabel = computed(() => (isGrokProvider.value ? '导入账号' : '导入授权'))
-const importButtonLabel = computed(() => (isGrokProvider.value ? '导入账号' : '导入'))
+const importModeLabel = computed(() => (isGrokProvider.value ? '导入 Token' : '导入授权'))
+const importButtonLabel = computed(() => (isGrokProvider.value ? '导入 Token' : '导入'))
 const importDropTitle = computed(() => (
-  isGrokProvider.value ? '拖入 Grok 账号文件或点击选择' : '拖入授权文件或点击选择'
+  isGrokProvider.value ? '拖入 xAI OAuth Token 文件或点击选择' : '拖入授权文件或点击选择'
 ))
 const importDropHint = computed(() => (
   isGrokProvider.value ? '支持 .json / .txt，可多选、批量导入' : '支持 .json / .txt，可多选'
 ))
 const importManualPlaceholder = computed(() => (
   isGrokProvider.value
-    ? '粘贴 Grok sso/session token，支持每行一个；或粘贴包含 token、sso_token、access_token、plan_type、pool_tier 的 JSON'
+    ? '粘贴 xAI OAuth refresh_token / access_token，支持每行一个；或粘贴包含 refresh_token、access_token、expires_at 的 JSON'
     : isWindsurfProvider.value
       ? '粘贴 show-auth-token Token、API key 或 JSON 内容'
       : '粘贴 Refresh Token / Access Token 或 JSON 内容'
 ))
 const importManualDescription = computed(() => (
   isGrokProvider.value
-    ? 'plan_type / pool_tier 会作为账号套餐与能力特征保存，不是路由池选择。'
+    ? '仅支持官方 xAI OAuth Token，不支持 grok.com Cookie 或 sso/session token；推荐使用“获取授权”。'
     : ''
 ))
 const importPasteToggleText = computed(() => (
-  isGrokProvider.value ? '或手动粘贴 Grok Token' : '或手动粘贴 Token'
+  isGrokProvider.value ? '或手动粘贴 xAI OAuth Token' : '或手动粘贴 Token'
 ))
 const importFileToggleText = computed(() => (
-  isGrokProvider.value ? '或选择 Grok Token 文件导入' : '或选择 JSON 文件导入'
+  isGrokProvider.value ? '或选择 xAI OAuth Token 文件导入' : '或选择 JSON 文件导入'
 ))
 const providerCredentialActionLabel = computed(() => (isGrokProvider.value ? '导入' : '授权'))
 const isWindsurfEmailPasswordImport = computed(() =>
@@ -1361,13 +1361,6 @@ function parseImportText(text: string): {
     return { refresh_token: trimmed }
   }
 
-  if (isGrokProvider.value) {
-    const cookieImport = parseGrokCookieImport(trimmed)
-    if (cookieImport) {
-      return cookieImport
-    }
-  }
-
   if (isWindsurfProvider.value) {
     try {
       const parsed: unknown = JSON.parse(trimmed)
@@ -1401,18 +1394,12 @@ function parseImportText(text: string): {
     const parsed: unknown = JSON.parse(trimmed)
     if (typeof parsed === 'object' && parsed !== null) {
       const obj = parsed as Record<string, unknown>
-      const grokCookieImport = isGrokProvider.value
-        ? parseGrokCookieImport(normalizeStringField(obj.cookie) ?? normalizeStringField(obj.cookieHeader) ?? '')
-        : null
       const refreshToken = obj.refresh_token
       const refreshTokenCamel = obj.refreshToken
       const accessToken = obj.access_token
       const accessTokenCamel = obj.accessToken
       const sessionToken = obj.session_token
       const sessionTokenCamel = obj.sessionToken
-      const grokSsoToken = isGrokProvider.value
-        ? normalizeStringField(obj.sso_token) ?? normalizeStringField(obj.ssoToken) ?? normalizeStringField(obj.token) ?? grokCookieImport?.access_token
-        : undefined
       const normalizedRefreshToken = typeof refreshToken === 'string' && refreshToken.trim()
         ? refreshToken.trim()
         : (typeof refreshTokenCamel === 'string' && refreshTokenCamel.trim() ? refreshTokenCamel.trim() : undefined)
@@ -1422,7 +1409,22 @@ function parseImportText(text: string): {
       const normalizedSessionToken = typeof sessionToken === 'string' && sessionToken.trim()
         ? sessionToken.trim()
         : (typeof sessionTokenCamel === 'string' && sessionTokenCamel.trim() ? sessionTokenCamel.trim() : undefined)
-      const importedAccessToken = normalizedAccessToken ?? grokSsoToken ?? normalizedSessionToken
+      if (isGrokProvider.value) {
+        if (!normalizedRefreshToken && !normalizedAccessToken) return null
+        return {
+          refresh_token: normalizedRefreshToken,
+          access_token: normalizedAccessToken,
+          expires_at: normalizeExpiryField(obj.expires_at) ?? normalizeExpiryField(obj.expiresAt) ?? normalizeExpiryField(obj.expired),
+          name: normalizeStringField(obj.name) ?? normalizeStringField(obj.oauth_email),
+          email: normalizeStringField(obj.email) ?? normalizeStringField(obj.oauth_email),
+          account_id: normalizeStringField(obj.account_id) ?? normalizeStringField(obj.accountId),
+          account_user_id: normalizeStringField(obj.account_user_id) ?? normalizeStringField(obj.accountUserId),
+          user_id: normalizeStringField(obj.user_id) ?? normalizeStringField(obj.userId),
+          account_name: normalizeStringField(obj.account_name) ?? normalizeStringField(obj.accountName),
+        }
+      }
+
+      const importedAccessToken = normalizedAccessToken ?? normalizedSessionToken
       if (normalizedRefreshToken || importedAccessToken) {
         return {
           refresh_token: normalizedRefreshToken,
@@ -1433,12 +1435,6 @@ function parseImportText(text: string): {
           account_id: normalizeStringField(obj.account_id) ?? normalizeStringField(obj.accountId) ?? normalizeStringField(obj.chatgpt_account_id) ?? normalizeStringField(obj.chatgptAccountId),
           account_user_id: normalizeStringField(obj.account_user_id) ?? normalizeStringField(obj.accountUserId) ?? normalizeStringField(obj.chatgpt_account_user_id) ?? normalizeStringField(obj.chatgptAccountUserId),
           plan_type: normalizeStringField(obj.plan_type) ?? normalizeStringField(obj.planType) ?? normalizeStringField(obj.chatgpt_plan_type) ?? normalizeStringField(obj.chatgptPlanType),
-          pool_tier: isGrokProvider.value ? normalizeStringField(obj.pool_tier) ?? normalizeStringField(obj.poolTier) ?? normalizeStringField(obj.tier) : undefined,
-          sso_rw_token: isGrokProvider.value ? normalizeStringField(obj.sso_rw_token) ?? normalizeStringField(obj.ssoRwToken) ?? grokCookieImport?.sso_rw_token : undefined,
-          cf_cookies: isGrokProvider.value ? normalizeStringField(obj.cf_cookies) ?? normalizeStringField(obj.cfCookies) ?? grokCookieImport?.cf_cookies : undefined,
-          cf_clearance: isGrokProvider.value ? normalizeStringField(obj.cf_clearance) ?? normalizeStringField(obj.cfClearance) ?? grokCookieImport?.cf_clearance : undefined,
-          user_agent: isGrokProvider.value ? normalizeStringField(obj.user_agent) ?? normalizeStringField(obj.userAgent) ?? grokCookieImport?.user_agent : undefined,
-          browser_profile: isGrokProvider.value ? normalizeStringField(obj.browser_profile) ?? normalizeStringField(obj.browserProfile) ?? normalizeStringField(obj.browser) ?? normalizeStringField(obj.impersonate) ?? grokCookieImport?.browser_profile : undefined,
           user_id: normalizeStringField(obj.user_id) ?? normalizeStringField(obj.userId) ?? normalizeStringField(obj.chatgpt_user_id) ?? normalizeStringField(obj.chatgptUserId),
           account_name: normalizeStringField(obj.account_name) ?? normalizeStringField(obj.accountName),
         }
@@ -1454,72 +1450,6 @@ function parseImportText(text: string): {
   }
 
   return { refresh_token: trimmed }
-}
-
-function parseGrokCookieImport(text: string): {
-  access_token: string
-  sso_rw_token?: string
-  cf_cookies?: string
-  cf_clearance?: string
-  user_agent?: string
-  browser_profile?: string
-  user_id?: string
-} | null {
-  const cookies = parseCookieHeader(text)
-  const sso = cookies.get('sso')
-  if (!sso) return null
-  const userAgent = currentBrowserUserAgent()
-
-  return {
-    access_token: sso,
-    sso_rw_token: cookies.get('sso-rw'),
-    cf_cookies: buildGrokCookieProfile(cookies),
-    cf_clearance: cookies.get('cf_clearance'),
-    user_agent: userAgent,
-    browser_profile: inferGrokBrowserProfile(userAgent),
-    user_id: cookies.get('x-userid'),
-  }
-}
-
-function currentBrowserUserAgent(): string | undefined {
-  const value = typeof navigator !== 'undefined' ? navigator.userAgent?.trim() : ''
-  return value || undefined
-}
-
-function inferGrokBrowserProfile(userAgent: string | undefined): string | undefined {
-  const value = (userAgent || '').toLowerCase()
-  if (!value) return 'chrome136'
-  if (value.includes('firefox/')) return 'firefox'
-  if (value.includes('safari/') && !value.includes('chrome/') && !value.includes('chromium/')) {
-    return value.includes('iphone') || value.includes('ipad') ? 'safari_ios' : 'safari'
-  }
-  return 'chrome136'
-}
-
-function buildGrokCookieProfile(cookies: Map<string, string>): string | undefined {
-  const parts: string[] = []
-  for (const [name, value] of cookies) {
-    if (name === 'sso' || name === 'sso-rw') continue
-    parts.push(`${name}=${value}`)
-  }
-  return parts.length > 0 ? parts.join('; ') : undefined
-}
-
-function parseCookieHeader(text: string): Map<string, string> {
-  const normalized = text.trim().replace(/^cookie:\s*/i, '')
-  const cookies = new Map<string, string>()
-  for (const segment of normalized.split(';')) {
-    const part = segment.trim()
-    if (!part) continue
-    const separator = part.indexOf('=')
-    if (separator <= 0) continue
-    const name = part.slice(0, separator).trim().toLowerCase()
-    const value = part.slice(separator + 1).trim()
-    if (name && value) {
-      cookies.set(name, value)
-    }
-  }
-  return cookies
 }
 
 function normalizeStringField(value: unknown): string | undefined {
@@ -1865,24 +1795,28 @@ onBeforeUnmount(() => {
   stopDevicePolling()
 })
 
-watch(() => props.open, (newOpen) => {
-  if (newOpen) {
-    proxyNodesStore.ensureLoaded()
-    mode.value = defaultMode.value
-    if (!showAuthorizationMode.value) {
-      return
-    }
-    if (isWindsurfProvider.value) {
-      device.value.auth_type = 'default'
-    } else if (isKiroProvider.value) {
-      void ensureKiroSocialDeviceAuth()
+watch(
+  () => props.open,
+  (newOpen) => {
+    if (newOpen) {
+      proxyNodesStore.ensureLoaded()
+      mode.value = defaultMode.value
+      if (!showAuthorizationMode.value) {
+        return
+      }
+      if (isWindsurfProvider.value) {
+        device.value.auth_type = 'default'
+      } else if (isKiroProvider.value) {
+        void ensureKiroSocialDeviceAuth()
+      } else {
+        initOAuth()
+      }
     } else {
-      initOAuth()
+      resetForm()
     }
-  } else {
-    resetForm()
-  }
-})
+  },
+  { immediate: true },
+)
 
 watch(
   () => [props.open, props.providerId, props.providerType] as const,

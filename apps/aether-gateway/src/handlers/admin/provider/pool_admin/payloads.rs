@@ -794,6 +794,25 @@ fn admin_pool_build_grok_account_quota_from_snapshot(
         return Some(model_parts.join(" | "));
     }
 
+    let dimension_parts = [("请求", "requests"), ("Token", "tokens")]
+        .into_iter()
+        .filter_map(|(label, code)| {
+            let window = admin_pool_quota_window(quota_snapshot, code)?;
+            let remaining_percent = admin_pool_quota_window_remaining_percent(window)?;
+            let mut part = format!(
+                "{label}剩余 {}",
+                admin_pool_format_percent(remaining_percent)
+            );
+            if let Some(value_text) = admin_pool_quota_window_value_text(window) {
+                part.push_str(&format!(" ({value_text})"));
+            }
+            Some(part)
+        })
+        .collect::<Vec<_>>();
+    if !dimension_parts.is_empty() {
+        return Some(dimension_parts.join(" | "));
+    }
+
     let window = admin_pool_quota_window(quota_snapshot, "usage")
         .or_else(|| admin_pool_quota_windows(quota_snapshot).into_iter().next())?;
     let remaining_value = admin_pool_json_to_f64(window.get("remaining_value"));
@@ -1586,6 +1605,37 @@ mod tests {
         assert_eq!(
             admin_pool_build_account_quota("grok", Some(quota_snapshot)),
             Some("Auto剩余 40.0% (60/150) | Heavy剩余 0.0% (0/20)".to_string())
+        );
+    }
+
+    #[test]
+    fn grok_xai_dimension_quotas_are_rendered_for_pool_rows() {
+        let quota_snapshot = json!({
+            "provider_type": "grok",
+            "code": "ok",
+            "exhausted": false,
+            "windows": [
+                {
+                    "code": "requests",
+                    "scope": "account",
+                    "remaining_ratio": 0.4,
+                    "remaining_value": 40,
+                    "limit_value": 100
+                },
+                {
+                    "code": "tokens",
+                    "scope": "account",
+                    "remaining_ratio": 0.25,
+                    "remaining_value": 250,
+                    "limit_value": 1000
+                }
+            ]
+        });
+        let quota_snapshot = quota_snapshot.as_object().unwrap();
+
+        assert_eq!(
+            admin_pool_build_account_quota("grok", Some(quota_snapshot)),
+            Some("请求剩余 40.0% (40/100) | Token剩余 25.0% (250/1000)".to_string())
         );
     }
 }

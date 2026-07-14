@@ -121,13 +121,10 @@ fn provider_uses_bearer_oauth_runtime(provider_type: &str) -> bool {
             | "chatgpt_web"
             | "gemini_cli"
             | "antigravity"
+            | "grok"
             | "kiro"
             | "windsurf"
     )
-}
-
-fn provider_uses_grok_session_runtime(provider_type: &str) -> bool {
-    provider_type.trim().eq_ignore_ascii_case("grok")
 }
 
 fn provider_key_is_legacy_kiro_oauth_session(
@@ -146,8 +143,7 @@ pub(crate) fn provider_key_auth_semantics(
 ) -> ProviderKeyAuthSemantics {
     let auth_type = normalized_auth_type(key);
     let oauth_managed = auth_type == "oauth"
-        || provider_key_is_legacy_kiro_oauth_session(key, provider_type, &auth_type)
-        || (provider_uses_grok_session_runtime(provider_type) && key_has_auth_config(key));
+        || provider_key_is_legacy_kiro_oauth_session(key, provider_type, &auth_type);
     let credential_kind = if oauth_managed {
         ProviderKeyCredentialKind::OAuthSession
     } else if matches!(auth_type.as_str(), "service_account" | "vertex_ai") {
@@ -160,8 +156,6 @@ pub(crate) fn provider_key_auth_semantics(
         ProviderKeyCredentialKind::OAuthSession => {
             if provider_uses_bearer_oauth_runtime(provider_type) {
                 ProviderKeyRuntimeAuthKind::Bearer
-            } else if provider_uses_grok_session_runtime(provider_type) {
-                ProviderKeyRuntimeAuthKind::Unknown
             } else {
                 ProviderKeyRuntimeAuthKind::Unknown
             }
@@ -323,19 +317,27 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_grok_oauth_session_as_managed_without_bearer_runtime() {
+    fn recognizes_grok_oauth_as_refreshable_bearer_runtime() {
         let mut key = sample_key("oauth");
-        key.encrypted_auth_config = Some(r#"{"sso_token":"abc"}"#.to_string());
+        key.encrypted_auth_config = Some(r#"{"refresh_token":"rt-1"}"#.to_string());
 
         let semantics = provider_key_auth_semantics(&key, "grok");
         assert!(semantics.oauth_managed());
+        assert!(provider_key_can_refresh_oauth(
+            semantics,
+            serde_json::from_str::<serde_json::Value>(
+                key.encrypted_auth_config.as_deref().unwrap()
+            )
+            .unwrap()
+            .as_object()
+        ));
         assert_eq!(
             semantics.credential_kind(),
             ProviderKeyCredentialKind::OAuthSession
         );
         assert_eq!(
             semantics.runtime_auth_kind(),
-            ProviderKeyRuntimeAuthKind::Unknown
+            ProviderKeyRuntimeAuthKind::Bearer
         );
     }
 

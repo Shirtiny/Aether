@@ -140,6 +140,10 @@ fn provider_type_uses_openai_chatgpt_identity(provider_type: &str) -> bool {
     )
 }
 
+fn provider_type_uses_standard_oidc_identity(provider_type: &str) -> bool {
+    provider_type.trim().eq_ignore_ascii_case("grok")
+}
+
 fn extract_openai_chatgpt_auth_fields_from_object(
     source: &Map<String, Value>,
 ) -> Map<String, Value> {
@@ -253,23 +257,27 @@ pub fn enrich_admin_provider_oauth_auth_config(
         ],
     );
 
-    if !provider_type_uses_openai_chatgpt_identity(provider_type) {
+    let uses_openai_identity = provider_type_uses_openai_chatgpt_identity(provider_type);
+    let uses_standard_oidc_identity = provider_type_uses_standard_oidc_identity(provider_type);
+    if !uses_openai_identity && !uses_standard_oidc_identity {
         return;
     }
 
-    let chatgpt_fields = extract_openai_chatgpt_auth_fields_from_object(token_payload_object);
-    merge_missing_auth_config_fields(
-        auth_config,
-        &chatgpt_fields,
-        &[
-            "email",
-            "account_id",
-            "account_user_id",
-            "plan_type",
-            "user_id",
-            "organizations",
-        ],
-    );
+    if uses_openai_identity {
+        let chatgpt_fields = extract_openai_chatgpt_auth_fields_from_object(token_payload_object);
+        merge_missing_auth_config_fields(
+            auth_config,
+            &chatgpt_fields,
+            &[
+                "email",
+                "account_id",
+                "account_user_id",
+                "plan_type",
+                "user_id",
+                "organizations",
+            ],
+        );
+    }
 
     for token_field in ["id_token", "idToken", "access_token", "accessToken"] {
         let Some(token) = json_non_empty_string(token_payload.get(token_field)) else {
@@ -290,6 +298,14 @@ pub fn enrich_admin_provider_oauth_auth_config(
                 "account_name",
             ],
         );
+        if uses_standard_oidc_identity && !auth_config.contains_key("user_id") {
+            if let Some(subject) = claims.get("sub").cloned() {
+                auth_config.insert("user_id".to_string(), subject);
+            }
+        }
+        if !uses_openai_identity {
+            continue;
+        }
         let chatgpt_claim_fields = extract_openai_chatgpt_auth_fields_from_object(&claims);
         merge_missing_auth_config_fields(
             auth_config,

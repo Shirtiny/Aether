@@ -261,14 +261,14 @@ function getButton(root: HTMLElement, text: string) {
 }
 
 function getImportTextarea(root: HTMLElement) {
-  const textarea = root.querySelector('textarea')
+  const textarea = root.querySelector('textarea[placeholder*="xAI OAuth"]')
   if (!(textarea instanceof HTMLTextAreaElement)) {
     throw new Error('Expected import textarea to exist')
   }
   return textarea
 }
 
-describe('OAuthAccountDialog Grok import', () => {
+describe('OAuthAccountDialog Grok xAI OAuth', () => {
   beforeEach(() => {
     endpointMocks.startProviderLevelOAuth.mockReset()
     endpointMocks.completeProviderLevelOAuth.mockReset()
@@ -278,6 +278,19 @@ describe('OAuthAccountDialog Grok import', () => {
     endpointMocks.startDeviceAuthorize.mockReset()
     endpointMocks.pollDeviceAuthorize.mockReset()
     endpointMocks.getAwsRegions.mockReset()
+
+    endpointMocks.startProviderLevelOAuth.mockResolvedValue({
+      authorization_url: 'https://auth.x.ai/oauth2/authorize?client_id=xai-client',
+      redirect_uri: 'http://127.0.0.1:56121/callback',
+      instructions: 'Complete xAI OAuth authorization',
+      provider_type: 'grok',
+    })
+    endpointMocks.completeProviderLevelOAuth.mockResolvedValue({
+      provider_type: 'grok',
+      has_refresh_token: true,
+      email: 'grok@example.com',
+      replaced: false,
+    })
 
     endpointMocks.importProviderRefreshToken.mockResolvedValue({
       provider_type: 'grok',
@@ -303,96 +316,83 @@ describe('OAuthAccountDialog Grok import', () => {
     }
   })
 
-  it('opens Grok in import mode without starting unsupported OAuth', async () => {
+  it('opens Grok in official xAI OAuth mode', async () => {
     const root = mountDialog('grok')
     await settle()
 
-    expect(endpointMocks.startProviderLevelOAuth).not.toHaveBeenCalled()
-    expect(root.textContent).not.toContain('获取授权')
-    expect(root.querySelector('textarea')?.getAttribute('placeholder')).toContain('Grok sso/session token')
-    expect(root.textContent).toContain('plan_type / pool_tier')
-    expect(getButton(root, '导入账号')).toBeTruthy()
+    expect(endpointMocks.startProviderLevelOAuth).toHaveBeenCalledWith('provider-1')
+    expect(root.textContent).toContain('获取授权')
+    expect(root.textContent).toContain('前往授权')
+    expect(root.textContent).toContain('导入 Token')
+    expect(root.textContent).not.toContain('Grok sso/session token')
   })
 
-  it('maps a single Grok JSON token into account metadata import payload', async () => {
+  it('submits the xAI OAuth callback URL', async () => {
     const root = mountDialog('grok')
+    await settle()
+
+    const textarea = root.querySelector('textarea[placeholder*="callback?code"]')
+    expect(textarea).toBeInstanceOf(HTMLTextAreaElement)
+    ;(textarea as HTMLTextAreaElement).value = 'http://127.0.0.1:56121/callback?code=xai-code&state=xai-state'
+    textarea.dispatchEvent(new Event('input'))
+    await settle()
+
+    getButton(root, '验证')?.click()
+    await settle()
+
+    expect(endpointMocks.completeProviderLevelOAuth).toHaveBeenCalledWith('provider-1', {
+      callback_url: 'http://127.0.0.1:56121/callback?code=xai-code&state=xai-state',
+      proxy_node_id: undefined,
+    })
+  })
+
+  it('imports only official xAI OAuth token fields', async () => {
+    const root = mountDialog('grok')
+    await settle()
+
+    Array.from(root.querySelectorAll('button'))
+      .filter(button => button.textContent?.includes('导入 Token'))
+      .at(-1)
+      ?.click()
     await settle()
 
     const textarea = getImportTextarea(root)
     textarea.value = JSON.stringify({
-      token: 'sso-1',
-      planType: 'super',
-      tier: 'heavy',
+      refresh_token: 'xai-refresh-token',
+      access_token: 'xai-access-token',
+      expires_at: 1_800_000_000,
       email: 'grok@example.com',
-      accountName: 'Grok Heavy',
+      account_name: 'xAI Account',
+      sso_token: 'must-not-be-imported',
+      cf_clearance: 'must-not-be-imported',
     })
     textarea.dispatchEvent(new Event('input'))
     await settle()
 
-    getButton(root, '导入账号')?.click()
+    Array.from(root.querySelectorAll('button'))
+      .filter(button => button.textContent?.includes('导入 Token'))
+      .at(-1)
+      ?.click()
     await settle()
 
     expect(endpointMocks.importProviderRefreshToken).toHaveBeenCalledWith('provider-1', {
-      access_token: 'sso-1',
-      account_name: 'Grok Heavy',
+      refresh_token: 'xai-refresh-token',
+      access_token: 'xai-access-token',
+      expires_at: 1_800_000_000,
+      name: undefined,
       email: 'grok@example.com',
-      plan_type: 'super',
-      pool_tier: 'heavy',
+      account_id: undefined,
+      account_user_id: undefined,
+      plan_type: undefined,
+      pool_tier: undefined,
       sso_rw_token: undefined,
       cf_cookies: undefined,
       cf_clearance: undefined,
       user_agent: undefined,
       browser_profile: undefined,
-      proxy_node_id: undefined,
-      refresh_token: undefined,
-      expires_at: undefined,
-      name: undefined,
-      account_id: undefined,
-      account_user_id: undefined,
       user_id: undefined,
+      account_name: 'xAI Account',
+      proxy_node_id: undefined,
     })
-  })
-
-  it('keeps Grok multiline token import on the batch task path', async () => {
-    const root = mountDialog('grok')
-    await settle()
-
-    const textarea = getImportTextarea(root)
-    textarea.value = 'sso-1\nsso-2'
-    textarea.dispatchEvent(new Event('input'))
-    await settle()
-
-    getButton(root, '导入账号')?.click()
-    await settle()
-
-    expect(endpointMocks.startBatchImportOAuthTask).toHaveBeenCalledWith(
-      'provider-1',
-      '["sso-1","sso-2"]',
-      undefined,
-    )
-    expect(endpointMocks.importProviderRefreshToken).not.toHaveBeenCalled()
-  })
-
-  it('extracts Grok account fields from a pasted browser cookie header', async () => {
-    const root = mountDialog('grok')
-    await settle()
-
-    const textarea = getImportTextarea(root)
-    textarea.value = 'i18nextLng=zh; cf_clearance=cf-1; sso-rw=rw-1; sso=sso-1; x-userid=user-1'
-    textarea.dispatchEvent(new Event('input'))
-    await settle()
-
-    getButton(root, '导入账号')?.click()
-    await settle()
-
-    expect(endpointMocks.importProviderRefreshToken).toHaveBeenCalledWith('provider-1', expect.objectContaining({
-      access_token: 'sso-1',
-      sso_rw_token: 'rw-1',
-      cf_cookies: 'i18nextlng=zh; cf_clearance=cf-1; x-userid=user-1',
-      cf_clearance: 'cf-1',
-      user_agent: expect.any(String),
-      browser_profile: 'chrome136',
-      user_id: 'user-1',
-    }))
   })
 })

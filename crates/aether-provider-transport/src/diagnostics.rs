@@ -8,7 +8,6 @@ use crate::conversion::{
     request_conversion_enabled_for_transport, request_conversion_transport_unsupported_reason,
     request_pair_allowed_for_transport,
 };
-use crate::grok::grok_browser_resolved_transport_profile_from_auth_config;
 use crate::network::{
     resolve_transport_profile, resolve_transport_profile_id, transport_proxy_is_locally_supported,
 };
@@ -90,31 +89,7 @@ pub fn build_transport_diagnostics(
         .and_then(|value| value.get("transport_profile"))
         .cloned()
         .unwrap_or(Value::Null);
-    let configured_legacy_grok_transport_profile = if transport
-        .provider
-        .provider_type
-        .trim()
-        .eq_ignore_ascii_case("grok")
-    {
-        transport
-            .key
-            .decrypted_auth_config
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .and_then(|value| serde_json::from_str::<Value>(value).ok())
-            .and_then(|value| value.as_object().cloned())
-            .and_then(|auth_config| {
-                grok_browser_resolved_transport_profile_from_auth_config(
-                    &auth_config,
-                    "grok_auth_config",
-                )
-                .and_then(|profile| serde_json::to_value(profile).ok())
-            })
-            .unwrap_or(Value::Null)
-    } else {
-        Value::Null
-    };
+    let configured_legacy_grok_transport_profile = Value::Null;
     let has_oauth_config = transport.key.decrypted_auth_config.is_some();
     let oauth_resolution_supported =
         !has_oauth_config || crate::supports_local_oauth_request_auth_resolution(transport);
@@ -468,25 +443,15 @@ mod tests {
     }
 
     #[test]
-    fn transport_diagnostics_include_legacy_grok_transport_profile() {
+    fn transport_diagnostics_ignore_legacy_grok_browser_profile() {
         let diagnostics = build_transport_diagnostics(
             &sample_grok_transport_with_legacy_user_agent(),
             "openai:chat",
             "openai:chat",
         );
 
-        assert_eq!(
-            diagnostics["configured_legacy_grok_transport_profile"]["profile_id"],
-            "chrome137"
-        );
-        assert_eq!(
-            diagnostics["resolved_transport_profile"]["profile_id"],
-            "chrome137"
-        );
-        assert_eq!(
-            diagnostics["resolved_transport_profile"]["backend"],
-            "browser_wreq"
-        );
+        assert!(diagnostics["configured_legacy_grok_transport_profile"].is_null());
+        assert!(diagnostics["resolved_transport_profile"].is_null());
     }
 
     #[test]

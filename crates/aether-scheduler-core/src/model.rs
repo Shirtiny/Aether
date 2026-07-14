@@ -41,6 +41,14 @@ pub fn resolve_requested_global_model_name_with_model_directives(
             })
             .or_else(|| {
                 resolve_global_model_name_by(rows, |row| {
+                    provider_default_model_alias_target(&row.provider_type, requested_model_name)
+                        .is_some_and(|target| {
+                            candidate_model_names(row, api_format).contains(target)
+                        })
+                })
+            })
+            .or_else(|| {
+                resolve_global_model_name_by(rows, |row| {
                     row.model_provider_model_mappings
                         .as_ref()
                         .is_some_and(|mappings| {
@@ -91,10 +99,15 @@ fn row_supports_requested_model_exact(
     requested_model_name: &str,
     api_format: &str,
 ) -> bool {
+    let provider_alias_matches =
+        provider_default_model_alias_target(&row.provider_type, requested_model_name)
+            .is_some_and(|target| candidate_model_names(row, api_format).contains(target));
+
     row_has_available_provider_model(row, api_format)
         && (row.global_model_name == requested_model_name
             || (row_default_provider_model_name_available(row, api_format)
                 && row.model_provider_model_name == requested_model_name)
+            || provider_alias_matches
             || row.global_model_mappings.as_ref().is_some_and(|patterns| {
                 patterns
                     .iter()
@@ -109,6 +122,24 @@ fn row_supports_requested_model_exact(
                         && mapping.name == requested_model_name
                 })
             })
+}
+
+fn provider_default_model_alias_target<'a>(
+    provider_type: &str,
+    requested_model_name: &'a str,
+) -> Option<&'a str> {
+    if !provider_type.trim().eq_ignore_ascii_case("grok") {
+        return None;
+    }
+    match requested_model_name.trim().to_ascii_lowercase().as_str() {
+        "grok" | "grok-4.5-latest" => Some("grok-4.5"),
+        "grok-latest" | "grok-4.3-latest" => Some("grok-4.3"),
+        "grok-build" | "grok-code-fast" | "grok-code-fast-1" | "grok-code-fast-1-0825" => {
+            Some("grok-build-0.1")
+        }
+        "grok-build-latest" => Some("grok-4.5"),
+        _ => None,
+    }
 }
 
 fn resolve_global_model_name_by<F>(
@@ -681,6 +712,35 @@ mod tests {
             )
             .as_deref(),
             Some("deepseek-v4-pro")
+        );
+    }
+
+    #[test]
+    fn grok_default_aliases_select_official_xai_models() {
+        let mut latest = sample_row("grok-4.3", "grok-4.3");
+        latest.provider_type = "grok".to_string();
+        let mut build = sample_row("grok-build-0.1", "grok-build-0.1");
+        build.provider_type = "grok".to_string();
+
+        assert!(row_supports_requested_model(
+            &latest,
+            "grok-latest",
+            "openai:responses"
+        ));
+        assert!(row_supports_requested_model(
+            &build,
+            "grok-code-fast-1",
+            "openai:responses"
+        ));
+        assert_eq!(
+            resolve_requested_global_model_name_with_model_directives(
+                &[latest, build],
+                "grok-latest",
+                "openai:responses",
+                false,
+            )
+            .as_deref(),
+            Some("grok-4.3")
         );
     }
 

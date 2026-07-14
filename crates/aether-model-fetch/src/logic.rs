@@ -387,12 +387,6 @@ pub fn preset_models_for_provider(provider_type: &str) -> Option<Vec<Value>> {
             preset_model("grok-4.5", "xai", "Grok 4.5", "openai:responses"),
             preset_model("grok-4.3", "xai", "Grok 4.3", "openai:responses"),
             preset_model("grok-build-0.1", "xai", "Grok Build 0.1", "openai:responses"),
-            preset_model("grok-imagine-image-lite", "xai", "Grok Imagine Image Lite", "openai:image"),
-            preset_model("grok-imagine-image", "xai", "Grok Imagine Image", "openai:image"),
-            preset_model("grok-imagine-image-quality", "xai", "Grok Imagine Image Quality", "openai:image"),
-            preset_model("grok-imagine-image-pro", "xai", "Grok Imagine Image Pro", "openai:image"),
-            preset_model("grok-imagine-edit", "xai", "Grok Imagine Edit", "openai:image"),
-            preset_model("grok-imagine-image-edit", "xai", "Grok Imagine Image Edit", "openai:image"),
         ],
         _ => return None,
     };
@@ -1285,20 +1279,7 @@ mod tests {
             .iter()
             .map(|model| model["id"].as_str().expect("model id"))
             .collect::<Vec<_>>();
-        assert_eq!(
-            model_ids,
-            vec![
-                "grok-4.5",
-                "grok-4.3",
-                "grok-build-0.1",
-                "grok-imagine-image-lite",
-                "grok-imagine-image",
-                "grok-imagine-image-quality",
-                "grok-imagine-image-pro",
-                "grok-imagine-edit",
-                "grok-imagine-image-edit",
-            ]
-        );
+        assert_eq!(model_ids, vec!["grok-4.5", "grok-4.3", "grok-build-0.1"]);
         let format_for = |id: &str| {
             models
                 .iter()
@@ -1307,11 +1288,6 @@ mod tests {
                 .expect("preset model")
         };
         assert_eq!(format_for("grok-4.5"), json!(["openai:responses"]));
-        assert_eq!(
-            format_for("grok-imagine-image-quality"),
-            json!(["openai:image"])
-        );
-        assert_eq!(format_for("grok-imagine-edit"), json!(["openai:image"]));
         for unavailable in [
             "grok-composer-2.5-fast",
             "grok-4.20-0309-reasoning",
@@ -1319,6 +1295,9 @@ mod tests {
             "grok-4.3-beta",
             "grok-imagine-video",
             "grok-imagine-video-1.5",
+            "grok-imagine-image",
+            "grok-imagine-image-quality",
+            "grok-imagine-edit",
         ] {
             assert!(!model_ids.contains(&unavailable));
         }

@@ -10,9 +10,6 @@ use aether_admin::provider::status as admin_provider_status_pure;
 use aether_crypto::DEVELOPMENT_ENCRYPTION_KEY;
 use aether_crypto::{decrypt_python_fernet_ciphertext, encrypt_python_fernet_plaintext};
 use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey;
-use aether_provider_pool::{
-    grok_pool_tier_from_quota_bucket, grok_supported_quota_windows_for_tier,
-};
 use aether_scheduler_core::provider_key_circuit_payload_is_active_open_at;
 use serde_json::{json, Map, Value};
 use std::borrow::Cow;
@@ -1523,50 +1520,47 @@ fn build_grok_quota_status_snapshot(
     source: &str,
 ) -> Option<Value> {
     let metadata = provider_quota_metadata_bucket(upstream_metadata, "grok")?;
-    let observed_at_unix_secs = provider_quota_timestamp_unix_secs(metadata.get("updated_at"));
-    let inferred_pool_tier = grok_pool_tier_from_quota_bucket(metadata);
-    let pool_tier = provider_quota_metadata_string(metadata, &["pool_tier", "tier"])
-        .or_else(|| inferred_pool_tier.map(ToOwned::to_owned));
-    let plan_type = provider_quota_metadata_string(metadata, &["plan_type", "plan"])
-        .or_else(|| pool_tier.clone());
-    let supported_windows = grok_supported_quota_windows_for_tier(pool_tier.as_deref());
-    let windows = provider_quota_model_bucket(metadata)
-        .map(|models| {
-            models
-                .iter()
-                .filter_map(|(model_name, item)| {
-                    if !supported_windows
-                        .iter()
-                        .any(|(quota_key, _)| *quota_key == model_name.as_str())
-                    {
-                        return None;
-                    }
-                    model_quota_window_snapshot(
-                        model_name,
-                        item.as_object()?,
-                        observed_at_unix_secs,
-                    )
-                })
-                .collect::<Vec<_>>()
-        })
+    let observed_at_unix_secs = provider_quota_timestamp_unix_secs(
+        metadata
+            .get("observed_at")
+            .or_else(|| metadata.get("updated_at")),
+    );
+    let windows = metadata
+        .get("windows")
+        .and_then(Value::as_array)
+        .cloned()
         .unwrap_or_default();
 
     if windows.is_empty() && observed_at_unix_secs.is_none() {
         return None;
     }
 
-    let usage_ratio = quota_windows_usage_ratio(&windows);
-    let reset_seconds = quota_windows_min_reset_seconds(&windows);
-    let reset_at = quota_windows_min_reset_at(&windows);
-    let exhausted = quota_windows_all_exhausted(&windows);
+    let usage_ratio = metadata.get("usage_ratio").cloned().unwrap_or(Value::Null);
+    let reset_seconds = metadata
+        .get("reset_seconds")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let reset_at = metadata.get("reset_at").cloned().unwrap_or(Value::Null);
+    let exhausted = metadata
+        .get("exhausted")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let code = metadata
+        .get("code")
+        .and_then(Value::as_str)
+        .unwrap_or(if exhausted { "exhausted" } else { "ok" });
+    let plan_type = provider_quota_metadata_string(
+        metadata,
+        &["plan_type", "subscription_tier", "tier", "plan"],
+    );
 
     Some(json!({
         "version": 2,
         "provider_type": "grok",
-        "code": if exhausted { "exhausted" } else { "ok" },
+        "code": code,
         "label": if exhausted { Some("额度耗尽") } else { None::<&str> },
         "reason": if exhausted {
-            Some("所有 Grok 模式额度已耗尽")
+            Some("xAI 请求或 Token 额度已耗尽")
         } else {
             None::<&str>
         },
@@ -1579,7 +1573,11 @@ fn build_grok_quota_status_snapshot(
         "reset_at": reset_at,
         "reset_seconds": reset_seconds,
         "plan_type": plan_type,
-        "pool_tier": pool_tier,
+        "subscription_tier": metadata.get("subscription_tier").cloned(),
+        "entitlement_status": metadata.get("entitlement_status").cloned(),
+        "retry_after_seconds": metadata.get("retry_after_seconds").cloned(),
+        "status_code": metadata.get("status_code").cloned(),
+        "headers_observed": metadata.get("headers_observed").cloned(),
         "windows": windows,
     }))
 }
@@ -2823,27 +2821,36 @@ mod tests {
         let mut key = sample_catalog_key();
         key.upstream_metadata = Some(json!({
             "grok": {
+                "version": 2,
+                "provider_type": "grok",
+                "code": "ok",
+                "observed_at": 1_778_067_246u64,
                 "updated_at": 1_778_067_246u64,
-                "pool_tier": "heavy",
-                "plan_type": "heavy",
-                "quota_by_model": {
-                    "quota_auto": {
-                        "display_name": "auto",
-                        "remaining_fraction": 0.4,
-                        "used_percent": 60.0,
+                "subscription_tier": "heavy",
+                "entitlement_status": "active",
+                "exhausted": false,
+                "usage_ratio": 1.0,
+                "reset_at": 1_778_157_172u64,
+                "reset_seconds": 89_926u64,
+                "headers_observed": true,
+                "windows": [
+                    {
+                        "code": "requests",
                         "remaining": 60.0,
-                        "total": 150.0,
+                        "limit": 150.0,
+                        "used_ratio": 0.6,
                         "reset_at": 1_778_157_172u64,
                         "is_exhausted": false
                     },
-                    "quota_heavy": {
-                        "display_name": "heavy",
-                        "remaining_fraction": 0.0,
-                        "used_percent": 100.0,
+                    {
+                        "code": "tokens",
+                        "remaining": 0.0,
+                        "limit": 1000.0,
+                        "used_ratio": 1.0,
                         "reset_at": 1_778_157_172u64,
                         "is_exhausted": true
                     }
-                }
+                ]
             }
         }));
 
@@ -2860,7 +2867,9 @@ mod tests {
         assert_eq!(quota.get("provider_type"), Some(&json!("grok")));
         assert_eq!(quota.get("code"), Some(&json!("ok")));
         assert_eq!(quota.get("plan_type"), Some(&json!("heavy")));
-        assert_eq!(quota.get("pool_tier"), Some(&json!("heavy")));
+        assert_eq!(quota.get("subscription_tier"), Some(&json!("heavy")));
+        assert_eq!(quota.get("entitlement_status"), Some(&json!("active")));
+        assert!(quota.get("pool_tier").is_none());
         assert_eq!(quota.get("exhausted"), Some(&json!(false)));
         assert_eq!(quota.get("usage_ratio"), Some(&json!(1.0)));
         assert_eq!(quota.get("reset_at"), Some(&json!(1_778_157_172u64)));
@@ -2869,16 +2878,16 @@ mod tests {
             window
                 .get("code")
                 .and_then(Value::as_str)
-                .is_some_and(|code| code == "model:quota_auto")
+                .is_some_and(|code| code == "requests")
         }));
-        let auto = windows
+        let requests = windows
             .iter()
             .filter_map(Value::as_object)
-            .find(|window| window.get("code") == Some(&json!("model:quota_auto")))
-            .expect("auto quota window should exist");
-        assert_eq!(auto.get("remaining_value"), Some(&json!(60.0)));
-        assert_eq!(auto.get("limit_value"), Some(&json!(150.0)));
-        assert_eq!(auto.get("used_value"), Some(&json!(90.0)));
+            .find(|window| window.get("code") == Some(&json!("requests")))
+            .expect("requests quota window should exist");
+        assert_eq!(requests.get("remaining"), Some(&json!(60.0)));
+        assert_eq!(requests.get("limit"), Some(&json!(150.0)));
+        assert_eq!(requests.get("used_ratio"), Some(&json!(0.6)));
     }
 
     #[test]

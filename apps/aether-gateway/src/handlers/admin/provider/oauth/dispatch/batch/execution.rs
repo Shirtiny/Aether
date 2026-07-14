@@ -177,7 +177,7 @@ async fn resolve_admin_provider_oauth_batch_import_tokens(
                         access_token,
                         Some(refresh_token),
                         entry.expires_at,
-                        Some("Provider 不支持 Refresh Token 交换，已回退为 Session Token 导入"),
+                        Some("Provider 不支持 Refresh Token 交换，已回退为 Access Token 导入"),
                     );
                     return Ok(AdminProviderOAuthResolvedBatchImport {
                         access_token: access_token.to_string(),
@@ -186,10 +186,7 @@ async fn resolve_admin_provider_oauth_batch_import_tokens(
                     });
                 }
             }
-            return Err(
-                "该 Provider 不支持 Refresh Token 导入，请提供 sso_token 或 access_token"
-                    .to_string(),
-            );
+            return Err("该 Provider 不支持 Refresh Token 导入，请提供 access_token".to_string());
         };
 
         let token_payload = match exchange_admin_provider_oauth_refresh_token(

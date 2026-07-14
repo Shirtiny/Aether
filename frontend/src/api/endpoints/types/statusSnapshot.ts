@@ -36,6 +36,9 @@ export interface QuotaWindowSnapshot {
   used_value?: number | null
   remaining_value?: number | null
   limit_value?: number | null
+  /** Provider-native aliases retained by xAI quota observations. */
+  remaining?: number | null
+  limit?: number | null
   reset_at?: number | null
   reset_seconds?: number | null
   window_minutes?: number | null

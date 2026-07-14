@@ -2342,8 +2342,14 @@ function getKiroQuotaDisplay(key: EndpointAPIKey): KiroUpstreamMetadata | null {
     if (updatedAt !== undefined) display.banned_at = updatedAt
   }
 
+  const dimensionWindow = ['requests', 'tokens']
+    .map(code => getQuotaWindow(quota, code))
+    .filter((window): window is QuotaWindowSnapshot => window != null)
+    .map(window => ({ window, usedPercent: getQuotaWindowUsedPercent(window) ?? -1 }))
+    .sort((a, b) => b.usedPercent - a.usedPercent)[0]?.window
   const usageWindow =
-    getQuotaWindow(quota, 'usage')
+    dimensionWindow
+    ?? getQuotaWindow(quota, 'usage')
     ?? getQuotaWindowByScope(quota, 'account')[0]
     ?? null
   if (usageWindow) {
@@ -2492,7 +2498,17 @@ function getWindsurfQuotaDisplay(key: EndpointAPIKey): WindsurfQuotaDisplay | nu
 
 function hasGrokQuotaDisplayData(key: EndpointAPIKey): boolean {
   const grok = getGrokQuotaDisplay(key)
-  return !!grok && (grok.usage_percentage !== undefined || grok.usage_limit !== undefined)
+  const quota = getQuotaSnapshotForProvider(key, 'grok')
+  const hasDimensionWindow = ['requests', 'tokens'].some(code => {
+    const window = getQuotaWindow(quota, code)
+    return window != null && (
+      getQuotaWindowUsedPercent(window) !== undefined
+      || typeof window.limit_value === 'number'
+      || typeof window.limit === 'number'
+    )
+  })
+  return hasDimensionWindow
+    || (!!grok && (grok.usage_percentage !== undefined || grok.usage_limit !== undefined))
 }
 
 function hasWindsurfQuotaDisplayData(key: EndpointAPIKey): boolean {

@@ -142,15 +142,15 @@ fn provider_query_grok_required_tier_rank(model_id: &str) -> Option<u8> {
 
 fn provider_query_normalize_grok_pool_tier(value: Option<&str>) -> Option<&'static str> {
     match value?.trim().to_ascii_lowercase().as_str() {
-        "basic" => Some("basic"),
-        "super" => Some("super"),
-        "heavy" => Some("heavy"),
+        "basic" | "free" => Some("basic"),
+        "super" | "supergrok" | "super_grok" | "premium" => Some("super"),
+        "heavy" | "supergrok_heavy" | "super_grok_heavy" => Some("heavy"),
         _ => None,
     }
 }
 
 fn provider_query_grok_pool_tier_rank(value: Option<&str>) -> u8 {
-    match provider_query_normalize_grok_pool_tier(value).unwrap_or("basic") {
+    match provider_query_normalize_grok_pool_tier(value).unwrap_or("super") {
         "heavy" => 2,
         "super" => 1,
         _ => 0,
@@ -168,53 +168,9 @@ fn provider_query_grok_quota_string(quota: &Map<String, Value>, fields: &[&str])
     })
 }
 
-fn provider_query_grok_window_limit(quota: &Map<String, Value>, model_name: &str) -> Option<f64> {
-    quota
-        .get("windows")
-        .and_then(Value::as_array)?
-        .iter()
-        .filter_map(Value::as_object)
-        .find(|window| {
-            window
-                .get("model")
-                .and_then(Value::as_str)
-                .is_some_and(|value| value.trim() == model_name)
-        })
-        .and_then(|window| window.get("limit_value"))
-        .and_then(Value::as_f64)
-        .filter(|value| value.is_finite() && *value > 0.0)
-}
-
 fn provider_query_grok_pool_tier_from_quota(quota: &Map<String, Value>) -> Option<&'static str> {
-    if let Some(tier) =
-        provider_query_grok_quota_string(quota, &["pool_tier", "tier", "plan_type", "plan"])
-            .and_then(|value| provider_query_normalize_grok_pool_tier(Some(&value)))
-    {
-        return Some(tier);
-    }
-
-    if let Some(auto_total) = provider_query_grok_window_limit(quota, "quota_auto") {
-        if (auto_total - 150.0).abs() < f64::EPSILON {
-            return Some("heavy");
-        }
-        if (auto_total - 50.0).abs() < f64::EPSILON {
-            return Some("super");
-        }
-    }
-
-    if let Some(fast_total) = provider_query_grok_window_limit(quota, "quota_fast") {
-        if (fast_total - 400.0).abs() < f64::EPSILON {
-            return Some("heavy");
-        }
-        if (fast_total - 140.0).abs() < f64::EPSILON {
-            return Some("super");
-        }
-        if (fast_total - 30.0).abs() < f64::EPSILON {
-            return Some("basic");
-        }
-    }
-
-    None
+    provider_query_grok_quota_string(quota, &["subscription_tier", "plan_type", "tier", "plan"])
+        .and_then(|value| provider_query_normalize_grok_pool_tier(Some(&value)))
 }
 
 fn provider_query_grok_key_pool_tier(key: &StoredProviderCatalogKey) -> Option<&'static str> {
@@ -818,7 +774,7 @@ mod tests {
 
     #[test]
     fn provider_query_grok_basic_tier_hides_super_and_heavy_models() {
-        let key = grok_key_with_quota(json!({ "pool_tier": "basic" }));
+        let key = grok_key_with_quota(json!({ "subscription_tier": "basic" }));
 
         assert_eq!(
             filtered_ids(&key),
@@ -849,7 +805,7 @@ mod tests {
 
     #[test]
     fn provider_query_grok_heavy_tier_keeps_full_non_video_catalog() {
-        let key = grok_key_with_quota(json!({ "pool_tier": "heavy" }));
+        let key = grok_key_with_quota(json!({ "subscription_tier": "heavy" }));
 
         assert_eq!(
             filtered_ids(&key),
@@ -870,7 +826,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_query_grok_tier_falls_back_to_live_quota_windows() {
+    fn provider_query_grok_ignores_legacy_magic_quota_totals() {
         let key = grok_key_with_quota(json!({
             "windows": [
                 { "model": "quota_fast", "limit_value": 140.0 }

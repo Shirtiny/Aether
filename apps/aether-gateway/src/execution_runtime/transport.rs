@@ -348,18 +348,6 @@ pub(crate) async fn execute_sync_plan_with_report_context(
             .map_err(|err| GatewayError::Internal(err.to_string()));
     }
 
-    match super::grok::maybe_execute_grok_sync(plan, report_context).await {
-        Ok(Some(result)) => {
-            record_manual_proxy_request_outcome(state, plan, result.status_code).await;
-            return Ok(result);
-        }
-        Ok(None) => {}
-        Err(err) => {
-            record_manual_proxy_request_failure(state, plan).await;
-            return Err(GatewayError::Internal(err.to_string()));
-        }
-    }
-
     let _ = trace_id;
     match maybe_execute_windsurf_sync(state, plan, None).await {
         Ok(Some(result)) => return Ok(result),
@@ -2823,103 +2811,6 @@ mod tests {
             ExecutionRuntimeTransportError::UnsupportedTransportProfile(backend)
                 if backend == "browser_wreq:firefox999"
         ));
-    }
-
-    #[tokio::test]
-    async fn execute_sync_plan_routes_grok_marker_through_grok_runtime() {
-        let listener = crate::test_support::bind_loopback_listener()
-            .await
-            .expect("listener should bind");
-        let addr = listener.local_addr().expect("local addr should resolve");
-        let app = Router::new().route(
-            "/rest/app-chat/conversations/new",
-            post(|body: Bytes| async move {
-                let body_json: serde_json::Value =
-                    serde_json::from_slice(&body).expect("request body should be json");
-                if body_json.get("message").and_then(serde_json::Value::as_str)
-                    != Some("[user]: hello")
-                {
-                    return (
-                        axum::http::StatusCode::BAD_REQUEST,
-                        Json(json!({
-                            "error": {
-                                "message": "expected grok app-chat message",
-                                "body": body_json,
-                            }
-                        })),
-                    );
-                }
-                (
-                    axum::http::StatusCode::OK,
-                    Json(json!({
-                        "result": {
-                            "response": {
-                                "token": "pong",
-                                "messageTag": "final"
-                            }
-                        }
-                    })),
-                )
-            }),
-        );
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app)
-                .await
-                .expect("test server should run");
-        });
-        let plan = ExecutionPlan {
-            request_id: "req-grok-runtime".into(),
-            candidate_id: Some("cand-grok".into()),
-            provider_name: Some("grok".into()),
-            provider_id: "provider-grok".into(),
-            endpoint_id: "endpoint-grok".into(),
-            key_id: "key-grok".into(),
-            method: "POST".into(),
-            url: format!("http://{addr}/rest/app-chat/conversations/new"),
-            headers: BTreeMap::from([
-                ("content-type".into(), "application/json".into()),
-                (
-                    aether_provider_transport::GROK_INTERNAL_HEADER.into(),
-                    "1".into(),
-                ),
-            ]),
-            content_type: Some("application/json".into()),
-            content_encoding: None,
-            body: RequestBody::from_json(json!({
-                "model": "grok-4.20-0309-non-reasoning",
-                "messages": [{"role": "user", "content": "hello"}],
-            })),
-            stream: true,
-            client_api_format: "openai:chat".into(),
-            provider_api_format: "openai:chat".into(),
-            model_name: Some("grok-4.20-0309-non-reasoning".into()),
-            proxy: None,
-            transport_profile: None,
-            timeouts: Some(ExecutionTimeouts {
-                connect_ms: Some(5_000),
-                total_ms: Some(LOCAL_HTTP_SUCCESS_TIMEOUT_MS),
-                ..ExecutionTimeouts::default()
-            }),
-        };
-        let report_context = json!({"mapped_model": "grok-4.20-fast"});
-
-        let result = super::super::grok::maybe_execute_grok_sync(&plan, Some(&report_context))
-            .await
-            .expect("grok runtime plan should execute")
-            .expect("grok runtime should handle marked plan");
-
-        server.abort();
-
-        assert_eq!(result.status_code, http::StatusCode::OK.as_u16());
-        assert_eq!(
-            result
-                .body
-                .and_then(|body| body.json_body)
-                .and_then(|body| body["choices"][0]["message"]["content"]
-                    .as_str()
-                    .map(str::to_string)),
-            Some("pong".to_string())
-        );
     }
 
     #[tokio::test]

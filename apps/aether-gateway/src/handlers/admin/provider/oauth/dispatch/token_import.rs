@@ -82,25 +82,11 @@ pub(super) fn normalize_single_import_tokens(
 }
 
 pub(super) fn normalize_provider_import_tokens(
-    provider_type: &str,
+    _provider_type: &str,
     refresh_token: Option<&str>,
     access_token: Option<&str>,
 ) -> (Option<String>, Option<String>) {
-    let provider_type = provider_type.trim().to_ascii_lowercase();
-    let refresh_token = refresh_token
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned);
-    let access_token = access_token
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned);
-
-    if provider_type == "grok" {
-        return (None, access_token.or(refresh_token));
-    }
-
-    normalize_single_import_tokens(refresh_token.as_deref(), access_token.as_deref())
+    normalize_single_import_tokens(refresh_token, access_token)
 }
 
 pub(super) fn import_tokens_from_raw_token(token: &str) -> (Option<String>, Option<String>) {
@@ -143,11 +129,6 @@ pub(super) fn build_provider_access_token_import_auth_config(
         .filter(|value| !value.is_empty());
     if let Some(refresh_token) = refresh_token {
         auth_config.insert("refresh_token".to_string(), json!(refresh_token));
-    }
-
-    if provider_type.trim().eq_ignore_ascii_case("grok") {
-        auth_config.insert("sso_token".to_string(), json!(access_token));
-        auth_config.insert("auth_method".to_string(), json!("sso_token"));
     }
 
     auth_config.insert(
@@ -279,18 +260,18 @@ mod tests {
     }
 
     #[test]
-    fn normalize_grok_import_treats_opaque_session_as_access_token() {
+    fn normalize_grok_import_treats_opaque_token_as_refresh_token() {
         let (refresh_token, access_token) =
-            normalize_provider_import_tokens("grok", Some("sso_session_token"), None);
-        assert!(refresh_token.is_none());
-        assert_eq!(access_token.as_deref(), Some("sso_session_token"));
+            normalize_provider_import_tokens("grok", Some("xai-refresh-token"), None);
+        assert_eq!(refresh_token.as_deref(), Some("xai-refresh-token"));
+        assert!(access_token.is_none());
     }
 
     #[test]
-    fn builds_grok_auth_config_from_session_token() {
+    fn builds_grok_auth_config_from_official_access_token() {
         let (auth_config, expires_at) = build_provider_access_token_import_auth_config(
             "grok",
-            "sso_session_token",
+            "xai-access-token",
             None,
             Some(2_200_000_000),
             None,
@@ -298,10 +279,11 @@ mod tests {
 
         assert_eq!(expires_at, Some(2_200_000_000));
         assert_eq!(
-            auth_config.get("sso_token"),
-            Some(&json!("sso_session_token"))
+            auth_config.get("access_token"),
+            Some(&json!("xai-access-token"))
         );
-        assert_eq!(auth_config.get("auth_method"), Some(&json!("sso_token")));
+        assert!(auth_config.get("sso_token").is_none());
+        assert!(auth_config.get("auth_method").is_none());
         assert_eq!(
             auth_config.get("expires_at"),
             Some(&json!(2_200_000_000u64))

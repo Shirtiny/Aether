@@ -57,6 +57,7 @@ fn derive_plan_tier_from_map(source: &Map<String, Value>, provider_type: &str) -
         "plan",
         "subscription_title",
         "subscription_plan",
+        "subscription_tier",
     ] {
         if let Some(value) = source.get(field).and_then(Value::as_str) {
             if let Some(normalized) = normalize_provider_plan_tier(value, provider_type) {

@@ -2251,35 +2251,53 @@ async fn gateway_streams_codex_openai_responses_upstream_for_admin_pool_model_te
 }
 
 #[tokio::test]
-async fn gateway_routes_grok_responses_admin_pool_model_test_through_grok_runtime() {
+async fn gateway_routes_grok_responses_admin_pool_model_test_through_xai_api() {
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
         any(move |Json(plan): Json<ExecutionPlan>| async move {
             assert_eq!(plan.provider_id, "provider-grok");
-            assert_eq!(plan.endpoint_id, "endpoint-grok-responses");
             assert_eq!(plan.key_id, "key-grok-oauth");
-            assert_eq!(plan.client_api_format, "openai:responses");
-            assert_eq!(plan.provider_api_format, "openai:responses");
-            assert_eq!(plan.url, "https://grok.com/rest/app-chat/conversations/new");
-            assert_eq!(plan.model_name.as_deref(), Some("grok-4.20-fast"));
-            assert!(plan.stream, "Grok model test should request a stream");
+            assert_eq!(plan.client_api_format, "openai:chat");
+            assert_eq!(plan.model_name.as_deref(), Some("grok-4.5"));
             assert_eq!(
-                plan.headers
-                    .get(aether_provider_transport::GROK_INTERNAL_HEADER)
-                    .map(String::as_str),
-                Some("1")
-            );
-            assert_eq!(
-                plan.headers.get("cookie").map(String::as_str),
-                Some("sso=grok-sso; sso-rw=grok-rw")
+                plan.headers.get("authorization").map(String::as_str),
+                Some("Bearer xai-access-token")
             );
             let body = plan.body.json_body.as_ref().expect("json body");
-            assert_eq!(body["model"], json!("grok-4.20-fast"));
-            assert_eq!(body["input"], json!("Hello! This is a test message."));
-            assert_eq!(
-                body["messages"][0]["content"],
-                json!("stale chat-shaped frontend body")
-            );
+            assert_eq!(body["model"], json!("grok-4.5"));
+            let upstream_body = if plan.provider_api_format == "openai:responses" {
+                assert_eq!(plan.endpoint_id, "endpoint-grok-responses");
+                assert_eq!(plan.url, "https://api.x.ai/v1/responses");
+                assert!(body.get("input").is_some());
+                assert!(body.get("message").is_none());
+                for unsupported in [
+                    "prompt_cache_retention",
+                    "safety_identifier",
+                    "presence_penalty",
+                    "frequency_penalty",
+                    "stop",
+                ] {
+                    assert!(
+                        body.get(unsupported).is_none(),
+                        "xAI request retained unsupported field {unsupported}: {body}"
+                    );
+                }
+                json!({
+                    "id": "resp-grok-model-test",
+                    "model": "grok-4.5",
+                    "output_text": "ok"
+                })
+            } else {
+                assert_eq!(plan.provider_api_format, "openai:chat");
+                assert_eq!(plan.endpoint_id, "endpoint-grok-chat");
+                assert_eq!(plan.url, "https://api.x.ai/v1/chat/completions");
+                assert!(body.get("messages").is_some());
+                json!({
+                    "id": "chatcmpl-grok-model-test",
+                    "model": "grok-4.5",
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}}]
+                })
+            };
             Json(json!({
                 "request_id": plan.request_id,
                 "candidate_id": plan.candidate_id,
@@ -2288,11 +2306,7 @@ async fn gateway_routes_grok_responses_admin_pool_model_test_through_grok_runtim
                     "content-type": "application/json"
                 },
                 "body": {
-                    "json_body": {
-                        "id": "resp-grok-model-test",
-                        "model": "grok-4.20-fast",
-                        "output_text": "ok"
-                    }
+                    "json_body": upstream_body
                 },
                 "telemetry": {
                     "elapsed_ms": 18
@@ -2309,7 +2323,7 @@ async fn gateway_routes_grok_responses_admin_pool_model_test_through_grok_runtim
         "key-grok-oauth",
         "provider-grok",
         "openai:responses",
-        "__placeholder__",
+        "xai-access-token",
     );
     key.auth_type = "oauth".to_string();
     key.encrypted_auth_config = Some(
@@ -2317,20 +2331,28 @@ async fn gateway_routes_grok_responses_admin_pool_model_test_through_grok_runtim
             DEVELOPMENT_ENCRYPTION_KEY,
             r#"{
                 "provider_type":"grok",
-                "sso_token":"grok-sso",
-                "sso_rw_token":"grok-rw"
+                "refresh_token":"grok-refresh-token",
+                "expires_at":4102444800
             }"#,
         )
         .expect("auth config should encrypt"),
     );
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
         vec![provider],
-        vec![sample_endpoint(
-            "endpoint-grok-responses",
-            "provider-grok",
-            "openai:responses",
-            "https://grok.com",
-        )],
+        vec![
+            sample_endpoint(
+                "endpoint-grok-responses",
+                "provider-grok",
+                "openai:responses",
+                "https://api.x.ai/v1",
+            ),
+            sample_endpoint(
+                "endpoint-grok-chat",
+                "provider-grok",
+                "openai:chat",
+                "https://api.x.ai/v1",
+            ),
+        ],
         vec![key],
     ));
 
@@ -2354,15 +2376,20 @@ async fn gateway_routes_grok_responses_admin_pool_model_test_through_grok_runtim
         .json(&json!({
             "provider_id": "provider-grok",
             "mode": "pool",
-            "model": "grok-4.20-fast",
-            "failover_models": ["grok-4.20-fast"],
+            "model": "grok-4.5",
+            "failover_models": ["grok-4.5"],
             "api_format": "openai:responses",
             "endpoint_id": "endpoint-grok-responses",
             "request_body": {
-                "model": "grok-4.20-fast",
-                "messages": [{
+                "model": "grok-4.5",
+                "prompt_cache_retention": "24h",
+                "safety_identifier": "admin-model-test",
+                "presence_penalty": 0.2,
+                "frequency_penalty": 0.3,
+                "stop": ["done"],
+                "input": [{
                     "role": "user",
-                    "content": "stale chat-shaped frontend body"
+                    "content": "native responses-shaped frontend body"
                 }],
                 "stream": true
             }
@@ -2376,13 +2403,42 @@ async fn gateway_routes_grok_responses_admin_pool_model_test_through_grok_runtim
     assert_eq!(payload["success"], json!(true));
     assert_eq!(payload["attempts"][0]["status"], json!("success"));
     assert_eq!(
-        payload["attempts"][0]["request_body"]["message"],
-        json!("Hello! This is a test message.")
+        payload["attempts"][0]["request_headers"]["authorization"],
+        json!("[REDACTED]")
     );
-    assert_eq!(
-        payload["attempts"][0]["request_headers"][aether_provider_transport::GROK_INTERNAL_HEADER],
-        json!("1")
-    );
+    assert!(payload["attempts"][0]["request_headers"]
+        .get("x-aether-grok-runtime")
+        .is_none());
+
+    let chat_response = reqwest::Client::new()
+        .post(format!(
+            "{gateway_url}/api/admin/provider-query/test-model-failover"
+        ))
+        .header(GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&json!({
+            "provider_id": "provider-grok",
+            "mode": "pool",
+            "model": "grok-4.5",
+            "failover_models": ["grok-4.5"],
+            "api_format": "openai:chat",
+            "endpoint_id": "endpoint-grok-chat",
+            "request_body": {
+                "model": "grok-4.5",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": false
+            }
+        }))
+        .send()
+        .await
+        .expect("chat request should succeed");
+    assert_eq!(chat_response.status(), StatusCode::OK);
+    let chat_payload: serde_json::Value =
+        chat_response.json().await.expect("chat json should parse");
+    assert_eq!(chat_payload["success"], json!(true));
+    assert_eq!(chat_payload["attempts"][0]["status"], json!("success"));
 
     gateway_handle.abort();
     execution_runtime_handle.abort();

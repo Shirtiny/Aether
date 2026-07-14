@@ -10,12 +10,25 @@ use crate::GatewayError;
 use aether_data_contracts::repository::provider_catalog::{
     StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
 };
-use aether_provider_transport::{
-    grok_browser_transport_fingerprint_from_auth_config, provider_types::provider_type_is_fixed,
-};
+use aether_provider_transport::provider_types::provider_type_is_fixed;
 use serde_json::{json, Map, Value};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
+
+fn normalized_provider_oauth_concurrent_limit(
+    provider_type: &str,
+    current: Option<i32>,
+    allow_unsafe_grok_concurrency: bool,
+) -> Option<i32> {
+    if !provider_type.trim().eq_ignore_ascii_case("grok") {
+        return current;
+    }
+    if allow_unsafe_grok_concurrency {
+        current.or(Some(1))
+    } else {
+        Some(1)
+    }
+}
 
 pub(crate) fn provider_oauth_key_proxy_value(
     proxy_node_id: Option<&str>,
@@ -92,18 +105,54 @@ pub(crate) fn build_provider_oauth_auth_config_from_token_payload(
     if let Some(scope) = token_payload.get("scope").cloned() {
         auth_config.insert("scope".to_string(), scope);
     }
+    if provider_type.trim().eq_ignore_ascii_case("grok") {
+        if let Some(access_token) = access_token.as_ref() {
+            auth_config.insert("access_token".to_string(), json!(access_token));
+        }
+        if let Some(id_token) = json_non_empty_string(
+            token_payload
+                .get("id_token")
+                .or_else(|| token_payload.get("idToken")),
+        ) {
+            auth_config.insert("id_token".to_string(), json!(id_token));
+        }
+        auth_config.insert(
+            "token_endpoint".to_string(),
+            json!(aether_oauth::provider::providers::effective_xai_oauth_token_url()),
+        );
+        auth_config.insert(
+            "client_id".to_string(),
+            json!(provider_oauth_env_or_default(
+                "XAI_OAUTH_CLIENT_ID",
+                "b1a00492-073a-47ea-816f-4c329264a828",
+            )),
+        );
+        auth_config.insert(
+            "base_url".to_string(),
+            json!(aether_oauth::provider::providers::effective_xai_base_url()),
+        );
+        auth_config.entry("scope".to_string()).or_insert_with(|| {
+            json!(provider_oauth_env_or_default(
+                "XAI_OAUTH_SCOPE",
+                "openid profile email offline_access grok-cli:access api:access",
+            ))
+        });
+        for field in ["subscription_tier", "entitlement_status"] {
+            if let Some(value) = token_payload.get(field).cloned() {
+                auth_config.insert(field.to_string(), value);
+            }
+        }
+    }
     enrich_admin_provider_oauth_auth_config(provider_type, &mut auth_config, token_payload);
     (auth_config, access_token, refresh_token, expires_at)
 }
 
-fn grok_oauth_catalog_key_fingerprint(
-    provider_type: &str,
-    auth_config: &Map<String, Value>,
-) -> Option<Value> {
-    if !provider_type.trim().eq_ignore_ascii_case("grok") {
-        return None;
-    }
-    grok_browser_transport_fingerprint_from_auth_config(auth_config)
+fn provider_oauth_env_or_default(name: &str, default: &str) -> String {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| default.to_string())
 }
 
 pub(crate) async fn create_provider_oauth_catalog_key(
@@ -133,7 +182,7 @@ pub(crate) async fn create_provider_oauth_catalog_key(
         .map(|duration| duration.as_secs())
         .unwrap_or(0);
     let key_id = Uuid::new_v4().to_string();
-    let fingerprint = grok_oauth_catalog_key_fingerprint(provider_type, auth_config);
+    let fingerprint = None;
     let fingerprint = crate::ai_serving::materialize_codex_pool_key_fingerprint(
         provider_type,
         None,
@@ -168,6 +217,9 @@ pub(crate) async fn create_provider_oauth_catalog_key(
     )
     .map_err(|err| GatewayError::Internal(err.to_string()))?;
     record.internal_priority = 50;
+    if provider_type.trim().eq_ignore_ascii_case("grok") {
+        record.concurrent_limit = Some(1);
+    }
     record.cache_ttl_minutes = 5;
     record.max_probe_interval_minutes = 32;
     record.request_count = Some(0);
@@ -222,8 +274,13 @@ pub(crate) async fn update_existing_provider_oauth_catalog_key(
     updated.expires_at_unix_secs = expires_at_unix_secs;
     updated.oauth_invalid_at_unix_secs = None;
     updated.oauth_invalid_reason = None;
-    let fallback_fingerprint = if updated.fingerprint.is_none() {
-        grok_oauth_catalog_key_fingerprint(provider_type, auth_config)
+    updated.concurrent_limit = normalized_provider_oauth_concurrent_limit(
+        provider_type,
+        updated.concurrent_limit,
+        crate::handlers::admin::provider::write::keys::grok_unsafe_concurrency_override_enabled(),
+    );
+    let fallback_fingerprint = if provider_type.trim().eq_ignore_ascii_case("grok") {
+        None
     } else {
         updated.fingerprint.clone()
     };
@@ -334,7 +391,9 @@ fn provider_oauth_catalog_key_api_formats(
 #[cfg(test)]
 mod tests {
     use super::{
-        grok_oauth_catalog_key_fingerprint, provider_oauth_token_payload_expires_at_unix_secs,
+        build_provider_oauth_auth_config_from_token_payload,
+        normalized_provider_oauth_concurrent_limit,
+        provider_oauth_token_payload_expires_at_unix_secs,
     };
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use serde_json::json;
@@ -387,58 +446,59 @@ mod tests {
     }
 
     #[test]
-    fn grok_oauth_catalog_key_fingerprint_uses_browser_wreq_profile() {
-        let auth_config = json!({
-            "sso_token": "abc",
-            "browser_profile": "chrome-137",
+    fn grok_oauth_auth_config_uses_official_xai_fields_without_browser_profile() {
+        let id_token = sample_unsigned_jwt(json!({
+            "sub": "xai-user-1",
+            "email": "alice@example.com",
+        }));
+        let payload = json!({
+            "access_token": "xai-access",
+            "refresh_token": "xai-refresh",
+            "id_token": id_token,
+            "expires_in": 3600,
         });
-        let auth_config = auth_config.as_object().expect("object");
 
-        let fingerprint = grok_oauth_catalog_key_fingerprint("grok", auth_config)
-            .expect("fingerprint should resolve");
+        let (config, access_token, refresh_token, _) =
+            build_provider_oauth_auth_config_from_token_payload("grok", &payload);
+        assert_eq!(access_token.as_deref(), Some("xai-access"));
+        assert_eq!(refresh_token.as_deref(), Some("xai-refresh"));
+        assert_eq!(config["token_endpoint"], "https://auth.x.ai/oauth2/token");
+        assert_eq!(config["base_url"], "https://api.x.ai/v1");
+        assert_eq!(config["user_id"], "xai-user-1");
+        assert_eq!(config["email"], "alice@example.com");
+        assert!(!config.contains_key("browser_profile"));
+        assert!(!config.contains_key("sso_token"));
+    }
 
+    #[test]
+    fn grok_oauth_reauthorization_clamps_legacy_concurrency_by_default() {
         assert_eq!(
-            fingerprint["transport_profile"]["profile_id"],
-            json!("chrome137")
+            normalized_provider_oauth_concurrent_limit("grok", Some(0), false),
+            Some(1)
         );
         assert_eq!(
-            fingerprint["transport_profile"]["backend"],
-            json!("browser_wreq")
+            normalized_provider_oauth_concurrent_limit("grok", Some(8), false),
+            Some(1)
         );
         assert_eq!(
-            fingerprint["transport_profile"]["extra"]["browser_profile"],
-            json!("chrome137")
+            normalized_provider_oauth_concurrent_limit("grok", None, false),
+            Some(1)
         );
     }
 
     #[test]
-    fn grok_oauth_catalog_key_fingerprint_infers_profile_from_user_agent() {
-        let auth_config = json!({
-            "sso_token": "abc",
-            "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
-        });
-        let auth_config = auth_config.as_object().expect("object");
-
-        let fingerprint = grok_oauth_catalog_key_fingerprint("grok", auth_config)
-            .expect("fingerprint should resolve");
-
+    fn grok_oauth_reauthorization_preserves_explicit_unsafe_concurrency() {
         assert_eq!(
-            fingerprint["transport_profile"]["profile_id"],
-            json!("chrome137")
+            normalized_provider_oauth_concurrent_limit("grok", Some(8), true),
+            Some(8)
         );
         assert_eq!(
-            fingerprint["transport_profile"]["extra"]["browser_profile"],
-            json!("chrome137")
+            normalized_provider_oauth_concurrent_limit("grok", None, true),
+            Some(1)
         );
-    }
-
-    #[test]
-    fn grok_oauth_catalog_key_fingerprint_ignores_non_grok_providers() {
-        let auth_config = json!({
-            "browser_profile": "chrome136",
-        });
-        let auth_config = auth_config.as_object().expect("object");
-
-        assert!(grok_oauth_catalog_key_fingerprint("openai", auth_config).is_none());
+        assert_eq!(
+            normalized_provider_oauth_concurrent_limit("codex", Some(4), false),
+            Some(4)
+        );
     }
 }

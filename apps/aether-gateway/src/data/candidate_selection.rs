@@ -184,6 +184,18 @@ pub(crate) fn requested_model_candidate_names(
     enable_model_directives: bool,
 ) -> Vec<String> {
     let mut requested_names = vec![requested_model_name.trim().to_string()];
+    let normalized = requested_model_name.trim().to_ascii_lowercase();
+    let grok_target = match normalized.as_str() {
+        "grok" | "grok-4.5-latest" | "grok-build-latest" => Some("grok-4.5"),
+        "grok-latest" | "grok-4.3-latest" => Some("grok-4.3"),
+        "grok-build" | "grok-code-fast" | "grok-code-fast-1" | "grok-code-fast-1-0825" => {
+            Some("grok-build-0.1")
+        }
+        _ => None,
+    };
+    if let Some(grok_target) = grok_target {
+        requested_names.push(grok_target.to_string());
+    }
     if enable_model_directives {
         if let Some(base_model) =
             crate::ai_serving::model_directive_base_model(requested_model_name)
@@ -379,7 +391,8 @@ pub(crate) fn auth_snapshot_constraints(
 mod tests {
     use super::{
         read_requested_model_rows, read_requested_model_rows_fast_path_page,
-        MinimalCandidateSelectionRowSource, StoredMinimalCandidateSelectionRow,
+        requested_model_candidate_names, MinimalCandidateSelectionRowSource,
+        StoredMinimalCandidateSelectionRow,
     };
     use aether_data::DataLayerError;
     use aether_data_contracts::repository::candidate_selection::{
@@ -387,6 +400,18 @@ mod tests {
     };
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn grok_alias_fast_path_includes_official_model_name() {
+        assert_eq!(
+            requested_model_candidate_names("grok-latest", false),
+            vec!["grok-latest", "grok-4.3"]
+        );
+        assert_eq!(
+            requested_model_candidate_names("grok-code-fast-1", false),
+            vec!["grok-code-fast-1", "grok-build-0.1"]
+        );
+    }
 
     struct CountingSelectionSource {
         fast_rows: Vec<StoredMinimalCandidateSelectionRow>,
