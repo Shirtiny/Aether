@@ -3041,6 +3041,10 @@ async fn provider_query_execute_standard_test_candidate(
             provider_api_format,
         );
     }
+    // A model test has to carry the same identity as real traffic, on both the
+    // chat and responses formats, or it reports a failure the live path would
+    // not hit.
+    crate::provider_transport::apply_grok_chat_identity_headers(&mut request_headers, &transport);
     if !uses_vertex_query_auth {
         if let (Some(auth_header), Some(auth_value)) =
             (auth_header.as_deref(), auth_value.as_deref())

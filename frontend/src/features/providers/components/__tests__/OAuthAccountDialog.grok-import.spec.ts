@@ -310,40 +310,106 @@ describe('OAuthAccountDialog Grok xAI OAuth', () => {
   })
 
   afterEach(() => {
+    vi.useRealTimers()
     for (const { app, root } of mountedApps.splice(0)) {
       app.unmount()
       root.remove()
     }
   })
 
-  it('opens Grok in official xAI OAuth mode', async () => {
+  it('opens Grok in xAI device authorization mode', async () => {
     const root = mountDialog('grok')
     await settle()
 
-    expect(endpointMocks.startProviderLevelOAuth).toHaveBeenCalledWith('provider-1')
-    expect(root.textContent).toContain('获取授权')
-    expect(root.textContent).toContain('前往授权')
+    // The authorization-code flow needs a redirect target this deployment
+    // cannot receive, so Grok must not fall back to it.
+    expect(endpointMocks.startProviderLevelOAuth).not.toHaveBeenCalled()
+    expect(root.textContent).toContain('设备授权')
     expect(root.textContent).toContain('导入 Token')
+    expect(root.textContent).not.toContain('前往授权')
     expect(root.textContent).not.toContain('Grok sso/session token')
   })
 
-  it('submits the xAI OAuth callback URL', async () => {
+  it('starts the device grant without Kiro region or start_url', async () => {
+    endpointMocks.startDeviceAuthorize.mockResolvedValue({
+      session_id: 'session-1',
+      user_code: 'ABCD-1234',
+      verification_uri: 'https://x.ai/device',
+      verification_uri_complete: 'https://x.ai/device?code=ABCD-1234',
+      expires_in: 600,
+      interval: 5,
+      auth_type: 'device',
+    })
     const root = mountDialog('grok')
     await settle()
 
-    const textarea = root.querySelector('textarea[placeholder*="callback?code"]')
-    expect(textarea).toBeInstanceOf(HTMLTextAreaElement)
-    ;(textarea as HTMLTextAreaElement).value = 'http://127.0.0.1:56121/callback?code=xai-code&state=xai-state'
-    textarea.dispatchEvent(new Event('input'))
+    getButton(root, '开始授权')?.click()
     await settle()
 
-    getButton(root, '验证')?.click()
-    await settle()
-
-    expect(endpointMocks.completeProviderLevelOAuth).toHaveBeenCalledWith('provider-1', {
-      callback_url: 'http://127.0.0.1:56121/callback?code=xai-code&state=xai-state',
+    expect(endpointMocks.startDeviceAuthorize).toHaveBeenCalledWith('provider-1', {
+      auth_type: 'device',
+      login_option: undefined,
+      start_url: undefined,
+      region: undefined,
       proxy_node_id: undefined,
     })
+    expect(root.textContent).toContain('ABCD-1234')
+  })
+
+  it('self-polls the device grant instead of waiting on a callback', async () => {
+    endpointMocks.startDeviceAuthorize.mockResolvedValue({
+      session_id: 'session-1',
+      user_code: 'ABCD-1234',
+      verification_uri: 'https://x.ai/device',
+      verification_uri_complete: 'https://x.ai/device?code=ABCD-1234',
+      expires_in: 600,
+      interval: 5,
+      auth_type: 'device',
+    })
+    endpointMocks.pollDeviceAuthorize.mockResolvedValue({
+      status: 'pending',
+      replaced: false,
+    })
+    const root = mountDialog('grok')
+    await settle()
+
+    getButton(root, '开始授权')?.click()
+    await settle()
+
+    // Kiro's shared default auth_type is a social one; Grok must not inherit
+    // its callback prompt.
+    expect(root.querySelector('textarea[placeholder*="callback"]')).toBeNull()
+    expect(root.textContent).not.toContain('验证')
+  })
+
+  it('uses the backend interval after xAI asks the device poller to slow down', async () => {
+    vi.useFakeTimers()
+    endpointMocks.startDeviceAuthorize.mockResolvedValue({
+      session_id: 'session-1',
+      user_code: 'ABCD-1234',
+      verification_uri: 'https://x.ai/device',
+      verification_uri_complete: 'https://x.ai/device?code=ABCD-1234',
+      expires_in: 600,
+      interval: 31,
+      auth_type: 'device',
+    })
+    endpointMocks.pollDeviceAuthorize
+      .mockResolvedValueOnce({ status: 'slow_down', interval: 36, replaced: false })
+      .mockResolvedValue({ status: 'pending', interval: 36, replaced: false })
+    const root = mountDialog('grok')
+    await settle()
+
+    getButton(root, '开始授权')?.click()
+    await settle()
+
+    await vi.advanceTimersByTimeAsync(31_000)
+    expect(endpointMocks.pollDeviceAuthorize).toHaveBeenCalledTimes(1)
+
+    // The previous 30-second cap would already have sent this second poll.
+    await vi.advanceTimersByTimeAsync(35_000)
+    expect(endpointMocks.pollDeviceAuthorize).toHaveBeenCalledTimes(1)
+    await vi.advanceTimersByTimeAsync(1_000)
+    expect(endpointMocks.pollDeviceAuthorize).toHaveBeenCalledTimes(2)
   })
 
   it('imports only official xAI OAuth token fields', async () => {

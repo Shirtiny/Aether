@@ -299,17 +299,228 @@ async fn gateway_handles_admin_provider_oauth_supported_types_locally_with_trust
     assert_eq!(response.status(), StatusCode::OK);
     let payload: serde_json::Value = response.json().await.expect("json body should parse");
     let items = payload.as_array().expect("items should be array");
-    assert_eq!(items.len(), 6);
+    assert_eq!(items.len(), 7);
     assert_eq!(items[0]["provider_type"], "claude_code");
     assert_eq!(items[1]["provider_type"], "codex");
     assert_eq!(items[2]["provider_type"], "chatgpt_web");
     assert_eq!(items[3]["provider_type"], "gemini_cli");
     assert_eq!(items[4]["provider_type"], "antigravity");
-    assert_eq!(items[5]["provider_type"], "windsurf");
+    assert_eq!(items[5]["provider_type"], "grok");
+    assert_eq!(items[6]["provider_type"], "windsurf");
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();
     upstream_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_runs_grok_xai_device_authorization_end_to_end() {
+    let seen_device_form = Arc::new(Mutex::new(None::<String>));
+    let seen_device_form_clone = Arc::clone(&seen_device_form);
+    let seen_token_form = Arc::new(Mutex::new(None::<String>));
+    let seen_token_form_clone = Arc::clone(&seen_token_form);
+    let poll_count = Arc::new(Mutex::new(0usize));
+    let poll_count_clone = Arc::clone(&poll_count);
+
+    // The discovery document is what tells us where to send the device code, so
+    // the test serves it rather than hardcoding endpoints. Its own base URL is
+    // only known once the mock is listening, so the handler reads it late.
+    let xai_base = Arc::new(Mutex::new(String::new()));
+    let xai_base_clone = Arc::clone(&xai_base);
+    let xai = Router::new()
+        .route(
+            "/.well-known/openid-configuration",
+            axum::routing::get(move || {
+                let base = Arc::clone(&xai_base_clone);
+                async move {
+                    let base = base.lock().expect("mutex should lock").clone();
+                    Json(json!({
+                        "device_authorization_endpoint": format!("{base}/oauth2/device/code"),
+                        "token_endpoint": format!("{base}/oauth2/token"),
+                    }))
+                }
+            }),
+        )
+        .route(
+            "/oauth2/device/code",
+            post(move |body: Bytes| {
+                let seen = Arc::clone(&seen_device_form_clone);
+                async move {
+                    *seen.lock().expect("mutex should lock") =
+                        Some(String::from_utf8(body.to_vec()).expect("form should be utf8"));
+                    Json(json!({
+                        "device_code": "xai-device-code-1",
+                        "user_code": "WXYZ-7890",
+                        "verification_uri": "https://x.ai/device",
+                        "verification_uri_complete": "https://x.ai/device?code=WXYZ-7890",
+                        "expires_in": 600,
+                        "interval": 5,
+                    }))
+                }
+            }),
+        )
+        .route(
+            "/oauth2/token",
+            post(move |body: Bytes| {
+                let seen = Arc::clone(&seen_token_form_clone);
+                let count = Arc::clone(&poll_count_clone);
+                async move {
+                    *seen.lock().expect("mutex should lock") =
+                        Some(String::from_utf8(body.to_vec()).expect("form should be utf8"));
+                    let mut count = count.lock().expect("mutex should lock");
+                    *count += 1;
+                    // First poll is still waiting on the operator; the second
+                    // one lands the grant.
+                    if *count == 1 {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({ "error": "authorization_pending" })),
+                        );
+                    }
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "access_token": "xai-device-access-token",
+                            "refresh_token": "xai-device-refresh-token",
+                            "token_type": "Bearer",
+                            "expires_in": 3600,
+                            "email": "grok-device@example.com",
+                        })),
+                    )
+                }
+            }),
+        );
+
+    let mut provider = sample_provider("provider-grok-device", "Grok", 10);
+    provider.provider_type = "grok".to_string();
+    provider.concurrent_limit = None;
+    let endpoint = sample_endpoint(
+        "endpoint-grok-responses",
+        "provider-grok-device",
+        "openai:responses",
+        "https://cli-chat-proxy.grok.com/v1",
+    );
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        vec![endpoint],
+        Vec::new(),
+    ));
+
+    let (xai_url, xai_handle) = start_server(xai).await;
+    *xai_base.lock().expect("mutex should lock") = xai_url.clone();
+    let state = AppState::new()
+        .expect("gateway should build")
+        .with_data_state_for_tests(
+            GatewayDataState::with_provider_catalog_repository_for_tests(
+                provider_catalog_repository.clone(),
+            )
+            .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+        )
+        .with_provider_oauth_discovery_url_for_tests(
+            "grok",
+            format!("{xai_url}/.well-known/openid-configuration"),
+        );
+
+    let response = local_admin_provider_oauth_response(
+        &state,
+        http::Method::POST,
+        "/api/admin/provider-oauth/providers/provider-grok-device/device-authorize",
+        Some(json!({ "auth_type": "device" })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body should read");
+    let payload: serde_json::Value = serde_json::from_slice(&body).expect("json should parse");
+    let session_id = payload["session_id"]
+        .as_str()
+        .expect("session_id should exist")
+        .to_string();
+    assert_eq!(payload["user_code"], "WXYZ-7890");
+    assert_eq!(payload["auth_type"], "device");
+    // A device grant needs no redirect back to us.
+    assert!(payload.get("callback_required").is_none());
+
+    let device_form = seen_device_form
+        .lock()
+        .expect("mutex should lock")
+        .clone()
+        .expect("device request should be recorded");
+    assert!(device_form.contains("client_id=b1a00492-073a-47ea-816f-4c329264a828"));
+    assert!(device_form.contains("grok-cli%3Aaccess"));
+
+    let pending = local_admin_provider_oauth_response(
+        &state,
+        http::Method::POST,
+        "/api/admin/provider-oauth/providers/provider-grok-device/device-poll",
+        Some(json!({ "session_id": session_id })),
+    )
+    .await;
+    let pending_body = to_bytes(pending.into_body(), usize::MAX)
+        .await
+        .expect("body should read");
+    let pending_payload: serde_json::Value =
+        serde_json::from_slice(&pending_body).expect("json should parse");
+    assert_eq!(
+        pending_payload["status"], "pending",
+        "an unapproved device grant is not a failure: {pending_payload}"
+    );
+
+    let authorized = local_admin_provider_oauth_response(
+        &state,
+        http::Method::POST,
+        "/api/admin/provider-oauth/providers/provider-grok-device/device-poll",
+        Some(json!({ "session_id": session_id })),
+    )
+    .await;
+    let authorized_body = to_bytes(authorized.into_body(), usize::MAX)
+        .await
+        .expect("body should read");
+    let authorized_payload: serde_json::Value =
+        serde_json::from_slice(&authorized_body).expect("json should parse");
+    assert_eq!(
+        authorized_payload["status"], "authorized",
+        "payload={authorized_payload}"
+    );
+
+    let token_form = seen_token_form
+        .lock()
+        .expect("mutex should lock")
+        .clone()
+        .expect("token request should be recorded");
+    assert!(
+        token_form.contains("grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Adevice_code")
+    );
+    assert!(token_form.contains("device_code=xai-device-code-1"));
+
+    let persisted = provider_catalog_repository
+        .list_keys_by_provider_ids(&["provider-grok-device".to_string()])
+        .await
+        .expect("keys should load")
+        .into_iter()
+        .next()
+        .expect("grok device key should be created");
+    assert_eq!(persisted.auth_type, "oauth");
+    // SuperGrok TOS safety: a pooled Grok account stays single-flight.
+    assert_eq!(persisted.concurrent_limit, Some(1));
+    let decrypted_auth_config = decrypt_python_fernet_ciphertext(
+        DEVELOPMENT_ENCRYPTION_KEY,
+        persisted
+            .encrypted_auth_config
+            .as_deref()
+            .expect("device auth config should be encrypted"),
+    )
+    .expect("device auth config should decrypt");
+    let auth_config: serde_json::Value =
+        serde_json::from_str(&decrypted_auth_config).expect("device auth config should parse");
+    assert_eq!(
+        auth_config["token_endpoint"],
+        format!("{xai_url}/oauth2/token")
+    );
+    assert_eq!(auth_config["auth_method"], "device");
+
+    xai_handle.abort();
 }
 
 #[tokio::test]
@@ -3273,7 +3484,12 @@ async fn gateway_completes_grok_xai_oauth_pkce_and_persists_official_credentials
     let auth_config: serde_json::Value =
         serde_json::from_str(&decrypted_auth_config).expect("auth config should parse");
     assert_eq!(auth_config["refresh_token"], "xai-refresh-token");
-    assert_eq!(auth_config["base_url"], "https://api.x.ai/v1");
+    // A subscription grant is served by the Grok CLI chat-proxy, not by the
+    // official API root.
+    assert_eq!(
+        auth_config["base_url"],
+        "https://cli-chat-proxy.grok.com/v1"
+    );
     assert_eq!(
         auth_config["token_endpoint"],
         "https://auth.x.ai/oauth2/token"

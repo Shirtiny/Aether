@@ -26,6 +26,7 @@ use crate::ai_serving::planner::standard::{
     apply_deepseek_tool_call_thinking_compat, is_deepseek_provider,
     request_body_build_failure_extra_data,
 };
+use crate::ai_serving::transport::grok::apply_grok_chat_identity_headers;
 use crate::ai_serving::transport::kiro::{
     build_kiro_provider_headers, build_kiro_provider_request_body,
     is_kiro_claude_messages_transport, KiroProviderHeadersInput, KiroRequestAuth,
@@ -712,6 +713,7 @@ pub(crate) async fn resolve_local_standard_candidate_payload_parts(
         transport,
         provider_api_format,
     );
+    apply_grok_chat_identity_headers(&mut provider_request_headers, transport);
     request_identity_response_encoding_when_redacted(
         &mut provider_request_headers,
         redaction.redacted,
@@ -869,6 +871,7 @@ async fn build_gemini_cli_cross_format_payload_parts(
         &resolved.transport,
         provider_api_format,
     );
+    apply_grok_chat_identity_headers(&mut provider_request_headers, &resolved.transport);
     request_identity_response_encoding_when_redacted(
         &mut provider_request_headers,
         request_redacted,
@@ -1140,6 +1143,7 @@ async fn resolve_local_gemini_image_to_openai_image_candidate_payload_parts(
         transport,
         provider_api_format,
     );
+    apply_grok_chat_identity_headers(&mut provider_request_headers, transport);
 
     Some(LocalStandardCandidatePayloadParts {
         auth_header: prepared_candidate.auth_header,

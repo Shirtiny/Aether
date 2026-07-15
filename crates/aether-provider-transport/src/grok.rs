@@ -1,8 +1,23 @@
+use std::collections::BTreeMap;
+
 use serde_json::Value;
 
 use crate::snapshot::GatewayProviderTransportSnapshot;
 
-pub const GROK_DEFAULT_BASE_URL: &str = "https://api.x.ai/v1";
+/// Official xAI API root, used for media traffic and for accounts that opt into
+/// API mode.
+pub const GROK_API_BASE_URL: &str = "https://api.x.ai/v1";
+/// Grok CLI chat-proxy root. A subscription OAuth grant serves non-media chat
+/// from here rather than from the official API root.
+pub const GROK_CLI_CHAT_PROXY_BASE_URL: &str = "https://cli-chat-proxy.grok.com/v1";
+pub const GROK_DEFAULT_BASE_URL: &str = GROK_CLI_CHAT_PROXY_BASE_URL;
+
+/// Identity headers the Grok CLI chat-proxy expects. It rejects a request that
+/// carries only a bearer token.
+const GROK_CLI_CLIENT_VERSION: &str = "0.2.93";
+const GROK_CLI_TOKEN_AUTH_HEADER: &str = "x-xai-token-auth";
+const GROK_CLI_TOKEN_AUTH_VALUE: &str = "xai-grok-cli";
+const GROK_CLI_CLIENT_VERSION_HEADER: &str = "x-grok-client-version";
 
 pub fn is_grok_provider_transport(transport: &GatewayProviderTransportSnapshot) -> bool {
     transport
@@ -12,17 +27,98 @@ pub fn is_grok_provider_transport(transport: &GatewayProviderTransportSnapshot) 
         .eq_ignore_ascii_case("grok")
 }
 
+fn normalize_grok_base_url(base_url: &str) -> String {
+    base_url.trim().trim_end_matches('/').to_string()
+}
+
+fn is_grok_api_base_url(base_url: &str) -> bool {
+    normalize_grok_base_url(base_url) == normalize_grok_base_url(GROK_API_BASE_URL)
+}
+
+pub fn is_grok_cli_chat_proxy_base_url(base_url: &str) -> bool {
+    normalize_grok_base_url(base_url) == normalize_grok_base_url(GROK_CLI_CHAT_PROXY_BASE_URL)
+}
+
+/// Report whether a key reaches xAI as a direct API consumer rather than as a
+/// pooled Grok CLI subscription. OAuth keys default to subscription mode; an
+/// explicit `using_api` in the key's auth config wins over that default.
+pub fn grok_using_api(transport: &GatewayProviderTransportSnapshot) -> bool {
+    let declared = transport
+        .key
+        .decrypted_auth_config
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .and_then(|config| match config.get("using_api") {
+            Some(Value::Bool(value)) => Some(*value),
+            Some(Value::String(value)) => value.trim().parse::<bool>().ok(),
+            _ => None,
+        });
+    if let Some(using_api) = declared {
+        return using_api;
+    }
+    !transport.key.auth_type.trim().eq_ignore_ascii_case("oauth")
+}
+
+/// Resolve the base URL for non-media Grok chat. API-mode keys keep the
+/// official API root. Subscription keys are served by the CLI chat-proxy, so an
+/// empty or official-default base URL is rewritten to it while a deliberate
+/// custom base URL is left alone.
+pub fn grok_chat_base_url(base_url: &str, using_api: bool) -> String {
+    let base_url = normalize_grok_base_url(base_url);
+    if using_api {
+        if base_url.is_empty() {
+            return GROK_API_BASE_URL.to_string();
+        }
+        return base_url;
+    }
+    if !base_url.is_empty() && !is_grok_api_base_url(&base_url) {
+        return base_url;
+    }
+    GROK_CLI_CHAT_PROXY_BASE_URL.to_string()
+}
+
 pub fn grok_base_url(base_url: &str) -> String {
-    let base_url = base_url.trim().trim_end_matches('/');
+    let base_url = normalize_grok_base_url(base_url);
     if base_url.is_empty() {
         GROK_DEFAULT_BASE_URL.to_string()
     } else {
-        base_url.to_string()
+        base_url
     }
 }
 
+/// Attach the Grok CLI identity headers when a subscription key is routed to
+/// the chat-proxy. API-mode keys and custom base URLs are left untouched.
+///
+/// This keys off the endpoint's configured base URL rather than off
+/// [`grok_chat_base_url`], because request planning sends to that configured
+/// URL verbatim. Deciding from a rewritten URL could attach chat-proxy identity
+/// to a request that is actually leaving for the official API root.
+pub fn apply_grok_chat_identity_headers(
+    headers: &mut BTreeMap<String, String>,
+    transport: &GatewayProviderTransportSnapshot,
+) {
+    if !is_grok_provider_transport(transport) || grok_using_api(transport) {
+        return;
+    }
+    if !is_grok_cli_chat_proxy_base_url(&transport.endpoint.base_url) {
+        return;
+    }
+    headers.insert(
+        GROK_CLI_TOKEN_AUTH_HEADER.to_string(),
+        GROK_CLI_TOKEN_AUTH_VALUE.to_string(),
+    );
+    headers.insert(
+        GROK_CLI_CLIENT_VERSION_HEADER.to_string(),
+        GROK_CLI_CLIENT_VERSION.to_string(),
+    );
+    headers.insert(
+        "user-agent".to_string(),
+        format!("xai-grok-workspace/{GROK_CLI_CLIENT_VERSION}"),
+    );
+}
+
 pub fn build_grok_upstream_url(transport: &GatewayProviderTransportSnapshot, path: &str) -> String {
-    let base_url = grok_base_url(&transport.endpoint.base_url);
+    let base_url = grok_chat_base_url(&transport.endpoint.base_url, grok_using_api(transport));
     let path = path.trim();
     if path.starts_with('/') {
         format!("{base_url}{path}")
@@ -143,13 +239,15 @@ fn remove_grok_xai_field_recursively(value: &mut Value, field: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_grok_xai_responses_body_edits, build_grok_upstream_url, grok_base_url,
+        apply_grok_chat_identity_headers, apply_grok_xai_responses_body_edits,
+        build_grok_upstream_url, grok_base_url, grok_chat_base_url, grok_using_api,
         resolve_grok_bearer_auth, resolve_grok_model_alias,
     };
     use crate::snapshot::{
         GatewayProviderTransportEndpoint, GatewayProviderTransportKey,
         GatewayProviderTransportProvider, GatewayProviderTransportSnapshot,
     };
+    use std::collections::BTreeMap;
 
     fn sample_transport(access_token: &str) -> GatewayProviderTransportSnapshot {
         GatewayProviderTransportSnapshot {
@@ -222,13 +320,122 @@ mod tests {
     }
 
     #[test]
-    fn defaults_to_official_xai_api_root() {
-        assert_eq!(grok_base_url(""), "https://api.x.ai/v1");
+    fn defaults_to_the_cli_chat_proxy_root() {
+        assert_eq!(grok_base_url(""), "https://cli-chat-proxy.grok.com/v1");
         let transport = sample_transport("access-token");
         assert_eq!(
             build_grok_upstream_url(&transport, "/responses"),
-            "https://api.x.ai/v1/responses"
+            "https://cli-chat-proxy.grok.com/v1/responses"
         );
+    }
+
+    #[test]
+    fn oauth_keys_default_to_subscription_mode() {
+        let mut transport = sample_transport("access-token");
+        assert!(!grok_using_api(&transport));
+
+        transport.key.auth_type = "api_key".to_string();
+        assert!(grok_using_api(&transport));
+    }
+
+    #[test]
+    fn an_explicit_using_api_flag_overrides_the_auth_type_default() {
+        let mut transport = sample_transport("access-token");
+        transport.key.decrypted_auth_config =
+            Some(serde_json::json!({"using_api": true}).to_string());
+        assert!(grok_using_api(&transport));
+
+        transport.key.decrypted_auth_config =
+            Some(serde_json::json!({"using_api": "false"}).to_string());
+        transport.key.auth_type = "api_key".to_string();
+        assert!(!grok_using_api(&transport));
+    }
+
+    #[test]
+    fn subscription_chat_rewrites_the_official_api_root_to_the_chat_proxy() {
+        for base_url in ["", "https://api.x.ai/v1", "https://api.x.ai/v1/"] {
+            assert_eq!(
+                grok_chat_base_url(base_url, false),
+                "https://cli-chat-proxy.grok.com/v1",
+                "subscription chat must not reach the official API root ({base_url:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn a_deliberate_custom_base_url_survives_subscription_rewriting() {
+        assert_eq!(
+            grok_chat_base_url("https://grok.example.com/v1", false),
+            "https://grok.example.com/v1"
+        );
+    }
+
+    #[test]
+    fn api_mode_keeps_the_official_api_root() {
+        assert_eq!(grok_chat_base_url("", true), "https://api.x.ai/v1");
+        assert_eq!(
+            grok_chat_base_url("https://api.x.ai/v1", true),
+            "https://api.x.ai/v1"
+        );
+    }
+
+    #[test]
+    fn chat_proxy_requests_carry_the_grok_cli_identity() {
+        let mut transport = sample_transport("access-token");
+        transport.endpoint.base_url = "https://cli-chat-proxy.grok.com/v1".to_string();
+        let mut headers = BTreeMap::new();
+        apply_grok_chat_identity_headers(&mut headers, &transport);
+
+        assert_eq!(
+            headers.get("x-xai-token-auth").map(String::as_str),
+            Some("xai-grok-cli")
+        );
+        assert_eq!(
+            headers.get("x-grok-client-version").map(String::as_str),
+            Some("0.2.93")
+        );
+        assert_eq!(
+            headers.get("user-agent").map(String::as_str),
+            Some("xai-grok-workspace/0.2.93")
+        );
+    }
+
+    #[test]
+    fn api_mode_and_custom_hosts_skip_the_grok_cli_identity() {
+        let mut api_mode = sample_transport("access-token");
+        api_mode.endpoint.base_url = "https://cli-chat-proxy.grok.com/v1".to_string();
+        api_mode.key.decrypted_auth_config =
+            Some(serde_json::json!({"using_api": true}).to_string());
+        let mut headers = BTreeMap::new();
+        apply_grok_chat_identity_headers(&mut headers, &api_mode);
+        assert!(headers.is_empty());
+
+        let mut custom_host = sample_transport("access-token");
+        custom_host.endpoint.base_url = "https://grok.example.com/v1".to_string();
+        let mut headers = BTreeMap::new();
+        apply_grok_chat_identity_headers(&mut headers, &custom_host);
+        assert!(headers.is_empty());
+    }
+
+    #[test]
+    fn the_official_api_root_never_receives_chat_proxy_identity() {
+        // Request planning sends to the configured base URL as-is, so an
+        // endpoint still pointed at the API root must not be told it is talking
+        // to the CLI chat-proxy.
+        let mut transport = sample_transport("access-token");
+        transport.endpoint.base_url = "https://api.x.ai/v1".to_string();
+        let mut headers = BTreeMap::new();
+        apply_grok_chat_identity_headers(&mut headers, &transport);
+        assert!(headers.is_empty());
+    }
+
+    #[test]
+    fn a_non_grok_provider_never_receives_the_grok_cli_identity() {
+        let mut transport = sample_transport("access-token");
+        transport.provider.provider_type = "openai".to_string();
+        let mut headers = BTreeMap::new();
+        apply_grok_chat_identity_headers(&mut headers, &transport);
+        assert!(headers.is_empty());
     }
 
     #[test]

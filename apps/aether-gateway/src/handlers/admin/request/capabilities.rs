@@ -14,6 +14,10 @@ impl<'a> AdminAppState<'a> {
             .provider_oauth_token_url(provider_type, default_url)
     }
 
+    pub(crate) fn provider_oauth_discovery_url(&self, provider_type: &str) -> String {
+        self.app.provider_oauth_discovery_url(provider_type)
+    }
+
     pub(crate) fn encryption_key(&self) -> Option<&str> {
         self.app.encryption_key()
     }

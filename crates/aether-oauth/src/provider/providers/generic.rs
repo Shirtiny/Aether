@@ -1,4 +1,6 @@
-use crate::core::{current_unix_secs, OAuthAuthorizeResponse, OAuthError, OAuthTokenSet};
+use crate::core::{
+    current_unix_secs, OAuthAuthorizeResponse, OAuthDeviceAuthorization, OAuthError, OAuthTokenSet,
+};
 use crate::network::{OAuthHttpExecutor, OAuthHttpRequest};
 use crate::provider::ProviderOAuthAdapter;
 use crate::provider::{
@@ -14,7 +16,23 @@ use url::form_urlencoded;
 
 pub const XAI_DEFAULT_AUTHORIZE_URL: &str = "https://auth.x.ai/oauth2/authorize";
 pub const XAI_DEFAULT_TOKEN_URL: &str = "https://auth.x.ai/oauth2/token";
-pub const XAI_DEFAULT_BASE_URL: &str = "https://api.x.ai/v1";
+/// OIDC discovery document. xAI publishes no stable device authorization URL,
+/// so discovery is the only supported way to locate that endpoint.
+pub const XAI_DEFAULT_DISCOVERY_URL: &str = "https://auth.x.ai/.well-known/openid-configuration";
+/// RFC 8628 device authorization grant.
+pub const XAI_DEVICE_CODE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
+/// Poll interval floor applied when the device endpoint omits `interval`.
+pub const XAI_DEVICE_DEFAULT_POLL_INTERVAL_SECS: u64 = 5;
+/// Upper bound on how long a device authorization may stay pending.
+pub const XAI_DEVICE_MAX_POLL_DURATION_SECS: u64 = 30 * 60;
+/// Official xAI API root. Grok CLI OAuth grants reach it only when the account
+/// opts into API mode; it is also the endpoint for media and websocket traffic
+/// once those return.
+pub const XAI_API_BASE_URL: &str = "https://api.x.ai/v1";
+/// Grok CLI chat-proxy root. A subscription OAuth grant serves non-media chat
+/// from here, so it is the default base URL for pooled Grok accounts.
+pub const XAI_CLI_CHAT_PROXY_BASE_URL: &str = "https://cli-chat-proxy.grok.com/v1";
+pub const XAI_DEFAULT_BASE_URL: &str = XAI_CLI_CHAT_PROXY_BASE_URL;
 pub const XAI_DEFAULT_REDIRECT_URI: &str = "http://127.0.0.1:56121/callback";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,6 +146,7 @@ pub struct GenericProviderOAuthAdapter {
     template: GenericProviderOAuthTemplate,
     authorize_url_override: Option<String>,
     token_url_override: Option<String>,
+    discovery_url_override: Option<String>,
     client_id_override: Option<String>,
     scopes_override: Option<Vec<String>>,
     redirect_uri_override: Option<String>,
@@ -140,6 +159,7 @@ impl GenericProviderOAuthAdapter {
             template,
             authorize_url_override: None,
             token_url_override: None,
+            discovery_url_override: None,
             client_id_override: None,
             scopes_override: None,
             redirect_uri_override: None,
@@ -170,6 +190,35 @@ impl GenericProviderOAuthAdapter {
     pub fn with_token_url_override(mut self, token_url: impl Into<String>) -> Self {
         self.token_url_override = Some(token_url.into());
         self
+    }
+
+    pub fn with_discovery_url_override(mut self, discovery_url: impl Into<String>) -> Self {
+        self.discovery_url_override = Some(discovery_url.into());
+        self
+    }
+
+    /// Reuse an xAI token endpoint previously admitted from discovery. This is
+    /// intentionally stricter than `with_token_url_override`: refresh tokens
+    /// must not be sent to an arbitrary URL read from stored account metadata.
+    pub fn with_discovered_xai_token_url_override(
+        mut self,
+        token_url: impl Into<String>,
+    ) -> Result<Self, OAuthError> {
+        if self.template.provider_type != "grok" {
+            return Err(OAuthError::UnsupportedProvider(
+                self.template.provider_type.to_string(),
+            ));
+        }
+        let discovery_url = self
+            .discovery_url_override
+            .clone()
+            .unwrap_or_else(effective_xai_oauth_discovery_url);
+        self.token_url_override = Some(validate_xai_discovery_endpoint(
+            &token_url.into(),
+            "token_endpoint",
+            &discovery_url,
+        )?);
+        Ok(self)
     }
 
     pub fn with_token_url_for_tests(self, token_url: impl Into<String>) -> Self {
@@ -214,6 +263,235 @@ impl GenericProviderOAuthAdapter {
         self.base_url_override
             .as_deref()
             .unwrap_or(XAI_DEFAULT_BASE_URL)
+    }
+
+    /// Resolve xAI's OAuth endpoints from its OIDC discovery document. There is
+    /// no fallback: the device authorization endpoint is published nowhere else,
+    /// and guessing it would send device codes to an unverified URL.
+    pub async fn discover_xai_oauth_endpoints(
+        &self,
+        executor: &dyn OAuthHttpExecutor,
+        ctx: &ProviderOAuthTransportContext,
+    ) -> Result<XaiOAuthDiscovery, OAuthError> {
+        if self.template.provider_type != "grok" {
+            return Err(OAuthError::UnsupportedProvider(
+                self.template.provider_type.to_string(),
+            ));
+        }
+        let discovery_url = self
+            .discovery_url_override
+            .clone()
+            .unwrap_or_else(effective_xai_oauth_discovery_url);
+        let response = executor
+            .execute(OAuthHttpRequest {
+                request_id: "provider-oauth:grok:discovery".to_string(),
+                method: reqwest::Method::GET,
+                url: discovery_url.clone(),
+                headers: json_headers(),
+                content_type: None,
+                json_body: None,
+                body_bytes: None,
+                network: ctx.network.clone(),
+            })
+            .await?;
+        if !(200..300).contains(&response.status_code) {
+            return Err(OAuthError::HttpStatus {
+                status_code: response.status_code,
+                body_excerpt: truncate_body(&response.body_text),
+            });
+        }
+        let payload = response
+            .json_body
+            .or_else(|| serde_json::from_str::<Value>(&response.body_text).ok())
+            .ok_or_else(|| OAuthError::invalid_response("xai discovery response is not json"))?;
+        let device_authorization_endpoint = validate_xai_discovery_endpoint(
+            payload
+                .get("device_authorization_endpoint")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            "device_authorization_endpoint",
+            &discovery_url,
+        )?;
+        let token_endpoint = validate_xai_discovery_endpoint(
+            payload
+                .get("token_endpoint")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            "token_endpoint",
+            &discovery_url,
+        )?;
+        Ok(XaiOAuthDiscovery {
+            device_authorization_endpoint,
+            token_endpoint,
+        })
+    }
+
+    /// Ask xAI for a device code the operator can approve from any browser.
+    pub async fn start_xai_device_authorization(
+        &self,
+        executor: &dyn OAuthHttpExecutor,
+        ctx: &ProviderOAuthTransportContext,
+    ) -> Result<XaiDeviceAuthorization, OAuthError> {
+        let discovery = self.discover_xai_oauth_endpoints(executor, ctx).await?;
+        let form_body = {
+            let mut form = form_urlencoded::Serializer::new(String::new());
+            form.append_pair("client_id", self.client_id());
+            let scopes = self.scopes();
+            if !scopes.is_empty() {
+                form.append_pair("scope", &scopes.join(" "));
+            }
+            form.finish().into_bytes()
+        };
+        let response = executor
+            .execute(OAuthHttpRequest {
+                request_id: "provider-oauth:grok:device-authorize".to_string(),
+                method: reqwest::Method::POST,
+                url: discovery.device_authorization_endpoint.clone(),
+                headers: form_headers(),
+                content_type: Some("application/x-www-form-urlencoded".to_string()),
+                json_body: None,
+                body_bytes: Some(form_body),
+                network: ctx.network.clone(),
+            })
+            .await?;
+        if !(200..300).contains(&response.status_code) {
+            return Err(OAuthError::HttpStatus {
+                status_code: response.status_code,
+                body_excerpt: truncate_body(&response.body_text),
+            });
+        }
+        let payload = response
+            .json_body
+            .or_else(|| serde_json::from_str::<Value>(&response.body_text).ok())
+            .ok_or_else(|| {
+                OAuthError::invalid_response("xai device authorization response is not json")
+            })?;
+        let string_field = |key: &str| {
+            payload
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+        };
+        let device_code = string_field("device_code").ok_or_else(|| {
+            OAuthError::invalid_response("xai device authorization missing device_code")
+        })?;
+        let user_code = string_field("user_code").ok_or_else(|| {
+            OAuthError::invalid_response("xai device authorization missing user_code")
+        })?;
+        let verification_uri = string_field("verification_uri")
+            .or_else(|| string_field("verification_url"))
+            .ok_or_else(|| {
+                OAuthError::invalid_response("xai device authorization missing verification_uri")
+            })?;
+        let verification_uri_complete = string_field("verification_uri_complete")
+            .or_else(|| string_field("verification_url_complete"))
+            .unwrap_or_else(|| verification_uri.clone());
+        let expires_in = payload
+            .get("expires_in")
+            .and_then(Value::as_u64)
+            .unwrap_or(XAI_DEVICE_MAX_POLL_DURATION_SECS)
+            .min(XAI_DEVICE_MAX_POLL_DURATION_SECS);
+        let interval = payload
+            .get("interval")
+            .and_then(Value::as_u64)
+            .filter(|interval| *interval > 0)
+            .unwrap_or(XAI_DEVICE_DEFAULT_POLL_INTERVAL_SECS)
+            .max(XAI_DEVICE_DEFAULT_POLL_INTERVAL_SECS);
+        Ok(XaiDeviceAuthorization {
+            authorization: OAuthDeviceAuthorization {
+                device_code,
+                user_code,
+                verification_uri,
+                verification_uri_complete,
+                expires_in,
+                interval,
+            },
+            token_endpoint: discovery.token_endpoint,
+        })
+    }
+
+    /// Poll once for the outcome of a device authorization. A pending or
+    /// slow-down answer is a normal state, not a failure.
+    pub async fn poll_xai_device_token(
+        &self,
+        executor: &dyn OAuthHttpExecutor,
+        ctx: &ProviderOAuthTransportContext,
+        device_code: &str,
+        token_endpoint: &str,
+    ) -> Result<XaiDevicePollOutcome, OAuthError> {
+        // Re-check the pinned endpoint against the same rule that admitted it,
+        // so a tampered session cannot move the exchange.
+        let discovery_url = self
+            .discovery_url_override
+            .clone()
+            .unwrap_or_else(effective_xai_oauth_discovery_url);
+        let token_endpoint =
+            validate_xai_discovery_endpoint(token_endpoint, "token_endpoint", &discovery_url)?;
+        let form_body = {
+            let mut form = form_urlencoded::Serializer::new(String::new());
+            form.append_pair("grant_type", XAI_DEVICE_CODE_GRANT_TYPE);
+            form.append_pair("client_id", self.client_id());
+            form.append_pair("device_code", device_code);
+            form.finish().into_bytes()
+        };
+        let response = executor
+            .execute(OAuthHttpRequest {
+                request_id: "provider-oauth:grok:device-poll".to_string(),
+                method: reqwest::Method::POST,
+                url: token_endpoint.clone(),
+                headers: form_headers(),
+                content_type: Some("application/x-www-form-urlencoded".to_string()),
+                json_body: None,
+                body_bytes: Some(form_body),
+                network: ctx.network.clone(),
+            })
+            .await?;
+        let payload = response
+            .json_body
+            .clone()
+            .or_else(|| serde_json::from_str::<Value>(&response.body_text).ok());
+        if (200..300).contains(&response.status_code) {
+            let payload = payload.ok_or_else(|| {
+                OAuthError::invalid_response("xai device token response is not json")
+            })?;
+            let mut result = self.token_set_from_payload(payload)?;
+            if let Some(auth_config) = result.auth_config.as_object_mut() {
+                // The endpoint used for the device grant, rather than the
+                // authorization-code fallback endpoint, owns this refresh
+                // token and must be retained for subsequent refreshes.
+                auth_config.insert("token_endpoint".to_string(), json!(token_endpoint));
+            }
+            return Ok(XaiDevicePollOutcome::Authorized(Box::new(result)));
+        }
+        // RFC 8628 reports the in-progress states as OAuth errors, so the error
+        // code decides whether to keep waiting rather than to give up.
+        let error_code = payload
+            .as_ref()
+            .and_then(|payload| payload.get("error"))
+            .and_then(Value::as_str)
+            .map(|value| value.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        match error_code.as_str() {
+            "authorization_pending" => Ok(XaiDevicePollOutcome::Pending { slow_down: false }),
+            "slow_down" => Ok(XaiDevicePollOutcome::Pending { slow_down: true }),
+            "expired_token" => Ok(XaiDevicePollOutcome::Expired),
+            "access_denied" => Ok(XaiDevicePollOutcome::Denied(
+                payload
+                    .as_ref()
+                    .and_then(|payload| payload.get("error_description"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("授权被拒绝")
+                    .to_string(),
+            )),
+            _ => Err(OAuthError::HttpStatus {
+                status_code: response.status_code,
+                body_excerpt: truncate_body(&response.body_text),
+            }),
+        }
     }
 
     async fn exchange_grant(
@@ -390,6 +668,16 @@ impl ProviderOAuthAdapter for GenericProviderOAuthAdapter {
     }
 
     fn capabilities(&self) -> ProviderOAuthCapabilities {
+        if self.template.provider_type == "grok" {
+            // The device grant is how Grok is meant to be enrolled: it needs no
+            // redirect target, which a server-side deployment cannot receive.
+            // The authorization-code path stays reachable as a fallback, so it
+            // is still advertised.
+            return ProviderOAuthCapabilities {
+                supports_device_flow: true,
+                ..ProviderOAuthCapabilities::GENERIC_AUTH_CODE
+            };
+        }
         ProviderOAuthCapabilities::GENERIC_AUTH_CODE
     }
 
@@ -566,6 +854,108 @@ pub fn effective_xai_oauth_redirect_uri() -> String {
 
 pub fn effective_xai_base_url() -> String {
     effective_xai_url_override("XAI_BASE_URL", XAI_DEFAULT_BASE_URL, XaiUrlKind::ApiBase)
+}
+
+pub fn effective_xai_oauth_discovery_url() -> String {
+    effective_xai_url_override(
+        "XAI_OAUTH_DISCOVERY_URL",
+        XAI_DEFAULT_DISCOVERY_URL,
+        XaiUrlKind::OAuth,
+    )
+}
+
+/// Endpoints resolved from xAI's OIDC discovery document.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XaiOAuthDiscovery {
+    pub device_authorization_endpoint: String,
+    pub token_endpoint: String,
+}
+
+/// A device authorization pending user approval, paired with the token endpoint
+/// that resolved alongside it so polling cannot drift to a different host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XaiDeviceAuthorization {
+    pub authorization: OAuthDeviceAuthorization,
+    pub token_endpoint: String,
+}
+
+/// The state of a device authorization as of one poll.
+#[derive(Debug, Clone, PartialEq)]
+pub enum XaiDevicePollOutcome {
+    /// The user has not finished approving yet. `slow_down` asks the caller to
+    /// widen its poll interval.
+    Pending {
+        slow_down: bool,
+    },
+    /// The user refused, or the authorization server rejected the client.
+    Denied(String),
+    /// The device code aged out before approval.
+    Expired,
+    Authorized(Box<ProviderOAuthTokenSet>),
+}
+
+/// Validate an endpoint handed to us by the discovery document. The document is
+/// fetched over the network, so a compromised or spoofed response must not be
+/// able to redirect a device code or a bearer token off x.ai.
+///
+/// A discovery document served from x.ai may name any x.ai host, matching how
+/// xAI publishes its endpoints. A deliberately overridden discovery URL (self
+/// hosting, tests) is instead trusted only to describe its own origin, so an
+/// override can never widen where credentials may be sent.
+fn validate_xai_discovery_endpoint(
+    raw: &str,
+    field: &str,
+    discovery_url: &str,
+) -> Result<String, OAuthError> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err(OAuthError::invalid_response(format!(
+            "xai discovery {field} is empty"
+        )));
+    }
+    let url = url::Url::parse(raw)
+        .map_err(|_| OAuthError::invalid_response(format!("xai discovery {field} is invalid")))?;
+    let host_of = |url: &url::Url| {
+        url.host_str()
+            .map(|host| host.trim().to_ascii_lowercase())
+            .unwrap_or_default()
+    };
+    let is_on_xai = |host: &str| host == "x.ai" || host.ends_with(".x.ai");
+
+    let discovery = url::Url::parse(discovery_url.trim()).ok();
+    let discovery_is_official = discovery
+        .as_ref()
+        .is_some_and(|discovery| discovery.scheme() == "https" && is_on_xai(&host_of(discovery)));
+
+    if discovery_is_official {
+        if url.scheme() != "https" {
+            return Err(OAuthError::invalid_response(format!(
+                "xai discovery {field} must use https"
+            )));
+        }
+        let host = host_of(&url);
+        if !is_on_xai(&host) {
+            return Err(OAuthError::invalid_response(format!(
+                "xai discovery {field} host {host:?} is not on x.ai"
+            )));
+        }
+        return Ok(url.to_string());
+    }
+
+    let Some(discovery) = discovery else {
+        return Err(OAuthError::invalid_response(format!(
+            "xai discovery {field} cannot be checked against an invalid discovery url"
+        )));
+    };
+    if url.scheme() != discovery.scheme()
+        || host_of(&url) != host_of(&discovery)
+        || url.port_or_known_default() != discovery.port_or_known_default()
+    {
+        return Err(OAuthError::invalid_response(format!(
+            "xai discovery {field} must stay on the discovery document's own origin"
+        )));
+    }
+    Ok(url.to_string())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -850,7 +1240,7 @@ fn decode_jwt_claims(token: &str) -> Option<serde_json::Map<String, Value>> {
 mod tests {
     use super::{
         template_for_provider_type, validate_xai_id_token_nonce, validate_xai_url_override,
-        GenericProviderOAuthAdapter, XaiUrlKind,
+        GenericProviderOAuthAdapter, XaiDevicePollOutcome, XaiUrlKind,
     };
     use crate::network::{OAuthHttpExecutor, OAuthHttpRequest, OAuthHttpResponse};
     use crate::provider::ProviderOAuthAdapter;
@@ -1044,7 +1434,10 @@ mod tests {
             exchanged.auth_config["client_id"],
             "b1a00492-073a-47ea-816f-4c329264a828"
         );
-        assert_eq!(exchanged.auth_config["base_url"], "https://api.x.ai/v1");
+        assert_eq!(
+            exchanged.auth_config["base_url"],
+            "https://cli-chat-proxy.grok.com/v1"
+        );
         assert_eq!(
             exchanged.auth_config["token_endpoint"],
             "https://auth.x.ai/oauth2/token"
@@ -1129,5 +1522,379 @@ mod tests {
             .expect("form body should be utf8");
         assert!(form.contains("grant_type=refresh_token"));
         assert!(form.contains("refresh_token=old-refresh-token"));
+    }
+
+    /// Replays a queued response per call so a multi-leg flow can be driven end
+    /// to end, and keeps every request for inspection.
+    struct ScriptedExecutor {
+        responses: Mutex<std::collections::VecDeque<OAuthHttpResponse>>,
+        seen_requests: Arc<Mutex<Vec<OAuthHttpRequest>>>,
+    }
+
+    impl ScriptedExecutor {
+        fn new(
+            responses: Vec<(u16, serde_json::Value)>,
+            seen_requests: Arc<Mutex<Vec<OAuthHttpRequest>>>,
+        ) -> Self {
+            Self {
+                responses: Mutex::new(
+                    responses
+                        .into_iter()
+                        .map(|(status_code, body)| OAuthHttpResponse {
+                            status_code,
+                            body_text: body.to_string(),
+                            json_body: None,
+                        })
+                        .collect(),
+                ),
+                seen_requests,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl OAuthHttpExecutor for ScriptedExecutor {
+        async fn execute(
+            &self,
+            request: OAuthHttpRequest,
+        ) -> Result<OAuthHttpResponse, crate::core::OAuthError> {
+            self.seen_requests
+                .lock()
+                .expect("mutex should lock")
+                .push(request);
+            self.responses
+                .lock()
+                .expect("mutex should lock")
+                .pop_front()
+                .ok_or_else(|| crate::core::OAuthError::Transport("no scripted response".into()))
+        }
+    }
+
+    fn grok_adapter() -> GenericProviderOAuthAdapter {
+        GenericProviderOAuthAdapter::new(
+            template_for_provider_type("grok").expect("grok template should exist"),
+        )
+    }
+
+    fn discovery_body() -> serde_json::Value {
+        json!({
+            "device_authorization_endpoint": "https://auth.x.ai/oauth2/device/code",
+            "token_endpoint": "https://auth.x.ai/oauth2/token",
+        })
+    }
+
+    #[tokio::test]
+    async fn grok_device_authorization_resolves_endpoints_through_discovery() {
+        let seen_requests = Arc::new(Mutex::new(Vec::new()));
+        let executor = ScriptedExecutor::new(
+            vec![
+                (200, discovery_body()),
+                (
+                    200,
+                    json!({
+                        "device_code": "device-code-1",
+                        "user_code": "ABCD-1234",
+                        "verification_uri": "https://x.ai/device",
+                        "verification_uri_complete": "https://x.ai/device?code=ABCD-1234",
+                        "expires_in": 600,
+                        "interval": 7,
+                    }),
+                ),
+            ],
+            Arc::clone(&seen_requests),
+        );
+
+        let started = grok_adapter()
+            .start_xai_device_authorization(&executor, &grok_context())
+            .await
+            .expect("device authorization should start");
+
+        assert_eq!(started.authorization.user_code, "ABCD-1234");
+        assert_eq!(started.authorization.device_code, "device-code-1");
+        assert_eq!(started.authorization.interval, 7);
+        assert_eq!(started.token_endpoint, "https://auth.x.ai/oauth2/token");
+
+        let requests = seen_requests.lock().expect("mutex should lock").clone();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].url,
+            "https://auth.x.ai/.well-known/openid-configuration"
+        );
+        assert_eq!(requests[1].url, "https://auth.x.ai/oauth2/device/code");
+        let form = String::from_utf8(
+            requests[1]
+                .body_bytes
+                .clone()
+                .expect("form body should exist"),
+        )
+        .expect("form body should be utf8");
+        assert!(form.contains("client_id=b1a00492-073a-47ea-816f-4c329264a828"));
+        assert!(form.contains("grok-cli%3Aaccess"));
+    }
+
+    #[tokio::test]
+    async fn grok_device_authorization_floors_a_missing_or_tiny_poll_interval() {
+        let seen_requests = Arc::new(Mutex::new(Vec::new()));
+        let executor = ScriptedExecutor::new(
+            vec![
+                (200, discovery_body()),
+                (
+                    200,
+                    json!({
+                        "device_code": "device-code-1",
+                        "user_code": "ABCD-1234",
+                        "verification_uri": "https://x.ai/device",
+                        "interval": 1,
+                    }),
+                ),
+            ],
+            Arc::clone(&seen_requests),
+        );
+
+        let started = grok_adapter()
+            .start_xai_device_authorization(&executor, &grok_context())
+            .await
+            .expect("device authorization should start");
+
+        assert_eq!(started.authorization.interval, 5);
+        // A device endpoint that omits verification_uri_complete still gives the
+        // operator something to open.
+        assert_eq!(
+            started.authorization.verification_uri_complete,
+            "https://x.ai/device"
+        );
+    }
+
+    #[tokio::test]
+    async fn grok_device_discovery_refuses_endpoints_that_leave_x_ai() {
+        for evil in [
+            json!({
+                "device_authorization_endpoint": "https://evil.example.com/device",
+                "token_endpoint": "https://auth.x.ai/oauth2/token",
+            }),
+            json!({
+                "device_authorization_endpoint": "https://auth.x.ai/oauth2/device/code",
+                "token_endpoint": "https://evil.example.com/token",
+            }),
+            json!({
+                "device_authorization_endpoint": "http://auth.x.ai/oauth2/device/code",
+                "token_endpoint": "https://auth.x.ai/oauth2/token",
+            }),
+        ] {
+            let executor =
+                ScriptedExecutor::new(vec![(200, evil)], Arc::new(Mutex::new(Vec::new())));
+            let error = grok_adapter()
+                .discover_xai_oauth_endpoints(&executor, &grok_context())
+                .await
+                .expect_err("discovery must reject an endpoint that is not https on x.ai");
+            assert!(matches!(error, crate::core::OAuthError::InvalidResponse(_)));
+        }
+    }
+
+    #[tokio::test]
+    async fn an_overridden_discovery_may_only_describe_its_own_origin() {
+        // Self-hosting and tests point discovery elsewhere; that must not become
+        // a way to send device codes to a third host.
+        let executor = ScriptedExecutor::new(
+            vec![(
+                200,
+                json!({
+                    "device_authorization_endpoint": "http://127.0.0.1:9999/device",
+                    "token_endpoint": "https://evil.example.com/token",
+                }),
+            )],
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        let adapter = grok_adapter()
+            .with_discovery_url_override("http://127.0.0.1:9999/.well-known/openid-configuration");
+        let error = adapter
+            .discover_xai_oauth_endpoints(&executor, &grok_context())
+            .await
+            .expect_err("an overridden discovery must not name a foreign origin");
+        assert!(matches!(error, crate::core::OAuthError::InvalidResponse(_)));
+
+        let executor = ScriptedExecutor::new(
+            vec![(
+                200,
+                json!({
+                    "device_authorization_endpoint": "http://127.0.0.1:9999/device",
+                    "token_endpoint": "http://127.0.0.1:9999/token",
+                }),
+            )],
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        let resolved = grok_adapter()
+            .with_discovery_url_override("http://127.0.0.1:9999/.well-known/openid-configuration")
+            .discover_xai_oauth_endpoints(&executor, &grok_context())
+            .await
+            .expect("same-origin endpoints should be accepted");
+        assert_eq!(resolved.token_endpoint, "http://127.0.0.1:9999/token");
+    }
+
+    #[tokio::test]
+    async fn grok_device_poll_treats_pending_states_as_normal() {
+        for (error_code, expected_slow_down) in
+            [("authorization_pending", false), ("slow_down", true)]
+        {
+            let executor = ScriptedExecutor::new(
+                vec![(400, json!({ "error": error_code }))],
+                Arc::new(Mutex::new(Vec::new())),
+            );
+            let outcome = grok_adapter()
+                .poll_xai_device_token(
+                    &executor,
+                    &grok_context(),
+                    "device-code-1",
+                    "https://auth.x.ai/oauth2/token",
+                )
+                .await
+                .expect("a pending device authorization is not a failure");
+            assert_eq!(
+                outcome,
+                XaiDevicePollOutcome::Pending {
+                    slow_down: expected_slow_down
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn grok_device_poll_reports_terminal_states() {
+        let executor = ScriptedExecutor::new(
+            vec![(400, json!({ "error": "expired_token" }))],
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        assert_eq!(
+            grok_adapter()
+                .poll_xai_device_token(
+                    &executor,
+                    &grok_context(),
+                    "device-code-1",
+                    "https://auth.x.ai/oauth2/token",
+                )
+                .await
+                .expect("expired is a poll outcome"),
+            XaiDevicePollOutcome::Expired
+        );
+
+        let executor = ScriptedExecutor::new(
+            vec![(
+                400,
+                json!({ "error": "access_denied", "error_description": "user refused" }),
+            )],
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        assert_eq!(
+            grok_adapter()
+                .poll_xai_device_token(
+                    &executor,
+                    &grok_context(),
+                    "device-code-1",
+                    "https://auth.x.ai/oauth2/token",
+                )
+                .await
+                .expect("denial is a poll outcome"),
+            XaiDevicePollOutcome::Denied("user refused".to_string())
+        );
+
+        // An unrecognised failure must surface rather than look like pending.
+        let executor = ScriptedExecutor::new(
+            vec![(500, json!({ "error": "server_error" }))],
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        assert!(grok_adapter()
+            .poll_xai_device_token(
+                &executor,
+                &grok_context(),
+                "device-code-1",
+                "https://auth.x.ai/oauth2/token",
+            )
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn grok_device_poll_builds_a_refreshable_auth_config() {
+        let seen_requests = Arc::new(Mutex::new(Vec::new()));
+        let executor = ScriptedExecutor::new(
+            vec![(
+                200,
+                json!({
+                    "access_token": "device-access-token",
+                    "refresh_token": "device-refresh-token",
+                    "expires_in": 3600,
+                }),
+            )],
+            Arc::clone(&seen_requests),
+        );
+
+        let outcome = grok_adapter()
+            .poll_xai_device_token(
+                &executor,
+                &grok_context(),
+                "device-code-1",
+                "https://device.auth.x.ai/oauth2/token",
+            )
+            .await
+            .expect("poll should succeed");
+
+        let XaiDevicePollOutcome::Authorized(token_set) = outcome else {
+            panic!("expected an authorized outcome");
+        };
+        assert_eq!(token_set.token_set.access_token, "device-access-token");
+        assert_eq!(
+            token_set.auth_config.get("refresh_token"),
+            Some(&json!("device-refresh-token"))
+        );
+        assert_eq!(
+            token_set.auth_config.get("base_url"),
+            Some(&json!("https://cli-chat-proxy.grok.com/v1"))
+        );
+        assert_eq!(
+            token_set.auth_config.get("token_endpoint"),
+            Some(&json!("https://device.auth.x.ai/oauth2/token"))
+        );
+
+        let requests = seen_requests.lock().expect("mutex should lock").clone();
+        assert_eq!(requests[0].url, "https://device.auth.x.ai/oauth2/token");
+        let form = String::from_utf8(
+            requests[0]
+                .body_bytes
+                .clone()
+                .expect("form body should exist"),
+        )
+        .expect("form body should be utf8");
+        assert!(form.contains("grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Adevice_code"));
+        assert!(form.contains("device_code=device-code-1"));
+    }
+
+    #[tokio::test]
+    async fn grok_device_poll_refuses_a_token_endpoint_off_x_ai() {
+        let executor = ScriptedExecutor::new(vec![], Arc::new(Mutex::new(Vec::new())));
+        assert!(grok_adapter()
+            .poll_xai_device_token(
+                &executor,
+                &grok_context(),
+                "device-code-1",
+                "https://evil.example.com/token",
+            )
+            .await
+            .is_err());
+    }
+
+    #[test]
+    fn grok_advertises_device_flow() {
+        let capabilities = grok_adapter().capabilities();
+        assert!(capabilities.supports_device_flow);
+        // The authorization-code path still works and stays available as a
+        // fallback until the device grant is proven against a live account.
+        assert!(capabilities.supports_authorization_code);
+
+        let codex = GenericProviderOAuthAdapter::new(
+            template_for_provider_type("codex").expect("codex template should exist"),
+        )
+        .capabilities();
+        assert!(!codex.supports_device_flow);
+        assert!(codex.supports_authorization_code);
     }
 }

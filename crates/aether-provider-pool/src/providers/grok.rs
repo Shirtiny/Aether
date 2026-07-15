@@ -16,7 +16,10 @@ use crate::quota::{
 };
 use crate::quota_refresh::ProviderPoolQuotaRequestSpec;
 
-pub const XAI_DEFAULT_BASE_URL: &str = "https://api.x.ai/v1";
+/// Fallback probe root. Callers resolve the account's real chat base URL and
+/// pass it in; a subscription grant is served by the Grok CLI chat-proxy rather
+/// than by the official API root.
+pub const XAI_DEFAULT_BASE_URL: &str = "https://cli-chat-proxy.grok.com/v1";
 pub const XAI_QUOTA_PROBE_MODEL: &str = "grok-4.3";
 const PLACEHOLDER_API_KEY: &str = "__placeholder__";
 

@@ -40,7 +40,7 @@ pub(crate) async fn prepare_header_authenticated_candidate(
         oauth_auth,
         candidate.selected_provider_model_name.as_str(),
     )?;
-    prepared.mapped_model = crate::provider_transport::resolve_grok_model_alias(
+    prepared.mapped_model = crate::ai_serving::transport::grok::resolve_grok_model_alias(
         &transport.provider.provider_type,
         &prepared.mapped_model,
     );

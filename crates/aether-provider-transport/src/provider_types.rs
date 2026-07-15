@@ -396,8 +396,8 @@ const ANTIGRAVITY_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProvider
 
 const GROK_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProviderTemplate {
     provider_type: "grok",
-    version: 2,
-    base_url: "https://api.x.ai/v1",
+    version: 3,
+    base_url: crate::grok::GROK_DEFAULT_BASE_URL,
     endpoints: &[
         FixedProviderEndpointTemplate {
             item_key: "openai:chat",
@@ -712,8 +712,8 @@ mod tests {
     #[test]
     fn grok_fixed_provider_template_uses_xai_oauth_text_endpoints() {
         let template = fixed_provider_template("grok").expect("grok template should exist");
-        assert_eq!(template.base_url, "https://api.x.ai/v1");
-        assert_eq!(template.version, 2);
+        assert_eq!(template.base_url, "https://cli-chat-proxy.grok.com/v1");
+        assert_eq!(template.version, 3);
         assert_eq!(
             template
                 .endpoints

@@ -463,7 +463,7 @@ mod tests {
         assert_eq!(access_token.as_deref(), Some("xai-access"));
         assert_eq!(refresh_token.as_deref(), Some("xai-refresh"));
         assert_eq!(config["token_endpoint"], "https://auth.x.ai/oauth2/token");
-        assert_eq!(config["base_url"], "https://api.x.ai/v1");
+        assert_eq!(config["base_url"], "https://cli-chat-proxy.grok.com/v1");
         assert_eq!(config["user_id"], "xai-user-1");
         assert_eq!(config["email"], "alice@example.com");
         assert!(!config.contains_key("browser_profile"));

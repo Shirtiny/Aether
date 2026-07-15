@@ -44,10 +44,26 @@ impl GenericOAuthRefreshAdapter {
     fn adapter_for_provider_type(
         &self,
         provider_type: &'static str,
+        auth_config: &Value,
     ) -> Option<GenericProviderOAuthAdapter> {
         let adapter = GenericProviderOAuthAdapter::for_provider_type(provider_type)?;
         if let Some(token_url) = self.token_url_overrides.get(provider_type) {
             return Some(adapter.with_token_url_override(token_url.clone()));
+        }
+        if provider_type == "grok" {
+            let object = auth_config.as_object();
+            let uses_device_grant = object
+                .and_then(|object| object.get("auth_method"))
+                .and_then(Value::as_str)
+                .is_some_and(|method| method.trim().eq_ignore_ascii_case("device"));
+            if uses_device_grant {
+                let token_url = object
+                    .and_then(|object| object.get("token_endpoint"))
+                    .and_then(non_empty_string)?;
+                return adapter
+                    .with_discovered_xai_token_url_override(token_url)
+                    .ok();
+            }
         }
         Some(adapter)
     }
@@ -238,7 +254,7 @@ impl LocalOAuthRefreshAdapter for GenericOAuthRefreshAdapter {
             );
             return Ok(None);
         };
-        let Some(adapter) = self.adapter_for_provider_type(provider_type) else {
+        let Some(adapter) = self.adapter_for_provider_type(provider_type, &auth_config) else {
             return Ok(None);
         };
 

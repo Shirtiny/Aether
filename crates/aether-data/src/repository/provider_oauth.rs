@@ -23,6 +23,10 @@ pub struct StoredAdminProviderOAuthDeviceSession {
     pub redirect_uri: Option<String>,
     #[serde(default)]
     pub machine_id: Option<String>,
+    /// Token endpoint resolved when the device authorization started. Polling
+    /// reuses it so a later discovery response cannot move the exchange.
+    #[serde(default)]
+    pub token_endpoint: Option<String>,
     pub interval: u64,
     pub expires_at_unix_secs: u64,
     pub status: String,

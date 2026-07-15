@@ -21,9 +21,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 async fn execute_grok_quota_plan(
     state: &AdminAppState<'_>,
     transport: &AdminGatewayProviderTransportSnapshot,
-    spec: ProviderPoolQuotaRequestSpec,
+    mut spec: ProviderPoolQuotaRequestSpec,
     proxy_override: Option<&ProxySnapshot>,
 ) -> Result<ProviderQuotaExecutionOutcome, GatewayError> {
+    // The probe only exists to observe rate-limit headers, so it has to look
+    // like the chat traffic it is measuring.
+    crate::provider_transport::apply_grok_chat_identity_headers(&mut spec.headers, transport);
     let proxy = match proxy_override {
         Some(proxy) => Some(proxy.clone()),
         None => {
@@ -111,6 +114,8 @@ pub(crate) async fn refresh_grok_provider_quota_locally(
             }
         };
 
+        // Probe the endpoint chat actually uses, so the observed rate-limit
+        // headers describe the host serving real traffic.
         let spec = match build_grok_pool_quota_request(
             &transport.key.id,
             &transport.endpoint.base_url,

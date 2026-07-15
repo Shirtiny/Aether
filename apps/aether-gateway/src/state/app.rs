@@ -192,4 +192,6 @@ pub struct AppState {
     pub(crate) admin_monitoring_redis_key_store: Option<Arc<StdMutex<HashMap<String, String>>>>,
     #[cfg(test)]
     pub(crate) provider_oauth_token_url_overrides: Arc<StdMutex<HashMap<String, String>>>,
+    #[cfg(test)]
+    pub(crate) provider_oauth_discovery_url_overrides: Arc<StdMutex<HashMap<String, String>>>,
 }

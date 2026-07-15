@@ -2251,7 +2251,7 @@ async fn gateway_streams_codex_openai_responses_upstream_for_admin_pool_model_te
 }
 
 #[tokio::test]
-async fn gateway_routes_grok_responses_admin_pool_model_test_through_xai_api() {
+async fn gateway_routes_grok_responses_admin_pool_model_test_through_the_cli_chat_proxy() {
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
         any(move |Json(plan): Json<ExecutionPlan>| async move {
@@ -2265,9 +2265,20 @@ async fn gateway_routes_grok_responses_admin_pool_model_test_through_xai_api() {
             );
             let body = plan.body.json_body.as_ref().expect("json body");
             assert_eq!(body["model"], json!("grok-4.5"));
+            // A subscription grant is served by the Grok CLI chat-proxy, which
+            // rejects a request carrying only a bearer token.
+            assert_eq!(
+                plan.headers.get("x-xai-token-auth").map(String::as_str),
+                Some("xai-grok-cli")
+            );
+            assert_eq!(
+                plan.headers.get("user-agent").map(String::as_str),
+                Some("xai-grok-workspace/0.2.93")
+            );
+            assert!(plan.headers.contains_key("x-grok-client-version"));
             let upstream_body = if plan.provider_api_format == "openai:responses" {
                 assert_eq!(plan.endpoint_id, "endpoint-grok-responses");
-                assert_eq!(plan.url, "https://api.x.ai/v1/responses");
+                assert_eq!(plan.url, "https://cli-chat-proxy.grok.com/v1/responses");
                 assert!(body.get("input").is_some());
                 assert!(body.get("message").is_none());
                 for unsupported in [
@@ -2290,7 +2301,10 @@ async fn gateway_routes_grok_responses_admin_pool_model_test_through_xai_api() {
             } else {
                 assert_eq!(plan.provider_api_format, "openai:chat");
                 assert_eq!(plan.endpoint_id, "endpoint-grok-chat");
-                assert_eq!(plan.url, "https://api.x.ai/v1/chat/completions");
+                assert_eq!(
+                    plan.url,
+                    "https://cli-chat-proxy.grok.com/v1/chat/completions"
+                );
                 assert!(body.get("messages").is_some());
                 json!({
                     "id": "chatcmpl-grok-model-test",
@@ -2344,13 +2358,13 @@ async fn gateway_routes_grok_responses_admin_pool_model_test_through_xai_api() {
                 "endpoint-grok-responses",
                 "provider-grok",
                 "openai:responses",
-                "https://api.x.ai/v1",
+                "https://cli-chat-proxy.grok.com/v1",
             ),
             sample_endpoint(
                 "endpoint-grok-chat",
                 "provider-grok",
                 "openai:chat",
-                "https://api.x.ai/v1",
+                "https://cli-chat-proxy.grok.com/v1",
             ),
         ],
         vec![key],

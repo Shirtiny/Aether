@@ -686,6 +686,23 @@ impl AppState {
         default_token_url.to_string()
     }
 
+    pub(crate) fn provider_oauth_discovery_url(&self, provider_type: &str) -> String {
+        #[cfg(test)]
+        {
+            if let Some(value) = self
+                .provider_oauth_discovery_url_overrides
+                .lock()
+                .expect("provider oauth discovery url overrides should lock")
+                .get(provider_type.trim())
+                .cloned()
+            {
+                return value;
+            }
+        }
+        let _ = provider_type;
+        aether_oauth::provider::providers::effective_xai_oauth_discovery_url()
+    }
+
     pub(crate) fn save_provider_oauth_state_for_tests(&self, _key: &str, _value: &str) -> bool {
         #[cfg(test)]
         {

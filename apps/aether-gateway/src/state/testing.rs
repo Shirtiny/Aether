@@ -654,4 +654,19 @@ impl AppState {
             .insert(provider_type.trim().to_ascii_lowercase(), token_url.into());
         self
     }
+
+    pub(crate) fn with_provider_oauth_discovery_url_for_tests(
+        self,
+        provider_type: &str,
+        discovery_url: impl Into<String>,
+    ) -> Self {
+        self.provider_oauth_discovery_url_overrides
+            .lock()
+            .expect("provider oauth discovery url overrides should lock")
+            .insert(
+                provider_type.trim().to_ascii_lowercase(),
+                discovery_url.into(),
+            );
+        self
+    }
 }

@@ -73,7 +73,7 @@
           ]"
           @click="switchMode('oauth')"
         >
-          {{ isDeviceBrowserProvider ? (isWindsurfProvider ? '浏览器登录' : '设备授权') : '获取授权' }}
+          {{ isWindsurfProvider ? '浏览器登录' : (isDeviceBrowserProvider ? '设备授权' : '获取授权') }}
         </button>
         <button
           class="flex-1 px-3 py-1.5 text-xs font-medium rounded-md transition-all"
@@ -516,6 +516,125 @@
             </div>
           </template>
 
+          <!-- Grok: xAI 设备授权（RFC 8628，无需回调） -->
+          <template v-else-if="isGrokProvider">
+            <div class="space-y-4">
+              <div
+                v-if="device.status === 'error' || device.status === 'expired'"
+                class="rounded-xl border border-destructive/40 bg-destructive/5 p-5"
+              >
+                <div class="flex flex-col items-center text-center space-y-3">
+                  <div class="w-10 h-10 rounded-full bg-destructive/10 flex items-center justify-center">
+                    <ExternalLink class="w-5 h-5 text-destructive" />
+                  </div>
+                  <div class="space-y-1">
+                    <p class="text-sm font-medium">
+                      {{ device.status === 'expired' ? '授权已过期' : '授权失败' }}
+                    </p>
+                    <p class="text-xs text-muted-foreground">
+                      {{ device.error || '请重试' }}
+                    </p>
+                  </div>
+                  <Button
+                    class="w-full"
+                    size="sm"
+                    :disabled="device.starting"
+                    @click="startDeviceAuth"
+                  >
+                    重新授权
+                  </Button>
+                </div>
+              </div>
+
+              <div
+                v-else-if="device.starting && !device.session_id"
+                class="flex items-center justify-center py-12"
+              >
+                <div class="text-center">
+                  <div class="animate-spin rounded-full h-6 w-6 border-b-2 border-primary mx-auto mb-3" />
+                  <p class="text-xs text-muted-foreground">
+                    正在向 xAI 申请设备码...
+                  </p>
+                </div>
+              </div>
+
+              <div
+                v-else-if="device.session_id && device.status === 'pending'"
+                class="rounded-xl border border-border bg-muted/20 p-5"
+              >
+                <div class="flex flex-col items-center text-center space-y-4">
+                  <div class="space-y-1">
+                    <p class="text-sm font-medium">
+                      在浏览器中输入下面的配对码
+                    </p>
+                    <p class="text-xs text-muted-foreground">
+                      授权完成后此页面将自动更新
+                    </p>
+                  </div>
+
+                  <div class="w-full rounded-lg border border-border bg-background p-3">
+                    <div class="flex items-center justify-between gap-2">
+                      <span class="text-[10px] text-muted-foreground shrink-0">配对码</span>
+                      <div class="flex items-center gap-1.5">
+                        <span class="text-lg font-mono font-bold tracking-[0.25em]">{{ device.user_code }}</span>
+                        <button
+                          class="p-1 rounded hover:bg-muted transition-colors"
+                          title="复制配对码"
+                          @click="copyToClipboard(device.user_code)"
+                        >
+                          <Copy class="w-3 h-3 text-muted-foreground" />
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div class="flex items-center gap-1.5 text-xs text-muted-foreground">
+                    <div class="animate-spin rounded-full h-3 w-3 border-[1.5px] border-primary/30 border-t-primary" />
+                    <span>剩余 {{ deviceCountdownFormatted }}</span>
+                  </div>
+
+                  <div class="flex gap-2 w-full">
+                    <Button
+                      class="flex-1"
+                      size="sm"
+                      :disabled="!device.verification_uri_complete"
+                      @click="openDeviceVerificationUrl"
+                    >
+                      <ExternalLink class="w-3.5 h-3.5 mr-1.5" />
+                      打开授权页面
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      :disabled="!device.verification_uri_complete"
+                      @click="copyToClipboard(device.verification_uri_complete)"
+                    >
+                      <Copy class="w-3.5 h-3.5" />
+                    </Button>
+                  </div>
+                </div>
+              </div>
+
+              <div
+                v-else
+                class="rounded-xl border border-border bg-muted/20 p-5"
+              >
+                <div class="flex flex-col items-center text-center space-y-4">
+                  <p class="text-xs text-muted-foreground">
+                    将向 xAI 申请一个配对码，在任意浏览器中批准即可完成授权。
+                  </p>
+                  <Button
+                    class="w-full"
+                    :disabled="device.starting"
+                    @click="startDeviceAuth"
+                  >
+                    {{ device.starting ? '正在准备授权...' : '开始授权' }}
+                  </Button>
+                </div>
+              </div>
+            </div>
+          </template>
+
           <!-- 非 Kiro: 原有 OAuth 流程 -->
           <template v-else>
             <div
@@ -936,7 +1055,9 @@ const isOpen = computed(() => props.open)
 const isKiroProvider = computed(() => (props.providerType || '').toLowerCase() === 'kiro')
 const isGrokProvider = computed(() => (props.providerType || '').toLowerCase() === 'grok')
 const isWindsurfProvider = computed(() => (props.providerType || '').toLowerCase() === 'windsurf')
-const isDeviceBrowserProvider = computed(() => isKiroProvider.value || isWindsurfProvider.value)
+const isDeviceBrowserProvider = computed(
+  () => isKiroProvider.value || isWindsurfProvider.value || isGrokProvider.value,
+)
 const showAuthorizationMode = computed(() => true)
 const defaultMode = computed<DialogMode>(() => 'oauth')
 
@@ -1649,17 +1770,22 @@ async function startDeviceAuth() {
   device.value.error = ''
   try {
     const isWindsurf = isWindsurfProvider.value
+    const isGrok = isGrokProvider.value
     const isBuilderID = requestedAuthType === 'builder_id'
     const isSocial = requestedAuthType === 'google' || requestedAuthType === 'github'
     const windsurfLoginOption: WindsurfLoginOption = isSocial ? requestedAuthType : 'default'
-    const authTypeForRequest = isWindsurf
-      ? 'browser'
-      : (requestedAuthType === 'default' ? 'google' : requestedAuthType)
+    // xAI resolves everything from OIDC discovery, so the Kiro region/start_url
+    // and the Windsurf login option have no counterpart here.
+    const authTypeForRequest = isGrok
+      ? 'device'
+      : isWindsurf
+        ? 'browser'
+        : (requestedAuthType === 'default' ? 'google' : requestedAuthType)
     const resp = await startDeviceAuthorize(props.providerId, {
       auth_type: authTypeForRequest,
       login_option: isWindsurf ? windsurfLoginOption : undefined,
-      start_url: isWindsurf ? undefined : (isBuilderID ? BUILDER_ID_START_URL : (isSocial ? undefined : (device.value.start_url.trim() || undefined))),
-      region: isWindsurf ? undefined : (isBuilderID || isSocial ? BUILDER_ID_REGION : (device.value.region.trim() || undefined)),
+      start_url: isWindsurf || isGrok ? undefined : (isBuilderID ? BUILDER_ID_START_URL : (isSocial ? undefined : (device.value.start_url.trim() || undefined))),
+      region: isWindsurf || isGrok ? undefined : (isBuilderID || isSocial ? BUILDER_ID_REGION : (device.value.region.trim() || undefined)),
       proxy_node_id: selectedProxyNodeId.value || undefined,
     })
     if (requestId !== deviceAuthRequestId || device.value.auth_type !== requestedAuthType) return
@@ -1669,7 +1795,11 @@ async function startDeviceAuth() {
     device.value.verification_uri_complete = resp.verification_uri_complete
     device.value.expires_at = Date.now() + resp.expires_in * 1000
     device.value.interval = resp.interval || 5
-    device.value.callback_required = resp.callback_required === true || isSocial || isWindsurf
+    // The device grant needs no redirect back to us, so it always self-polls.
+    // The social/Windsurf flags below describe Kiro's shared default auth_type
+    // and must not be read as a callback requirement here.
+    device.value.callback_required =
+      !isGrok && (resp.callback_required === true || isSocial || isWindsurf)
     device.value.status = 'pending'
     startCountdown()
     if (!device.value.callback_required) {
@@ -1702,6 +1832,12 @@ async function ensureKiroSocialDeviceAuth() {
 function scheduleDevicePoll() {
   if (devicePollTimer) clearTimeout(devicePollTimer)
   devicePollTimer = setTimeout(() => pollDevice(), device.value.interval * 1000)
+}
+
+function applyDevicePollInterval(interval: number | undefined): boolean {
+  if (typeof interval !== 'number' || !Number.isFinite(interval) || interval <= 0) return false
+  device.value.interval = interval
+  return true
 }
 
 async function completeDeviceAuth() {
@@ -1759,12 +1895,18 @@ async function pollDevice(withCallback = false) {
         handleClose()
         return
       case 'pending':
+        applyDevicePollInterval(result.interval)
         if (!device.value.callback_required) {
           scheduleDevicePoll()
         }
         return
       case 'slow_down':
-        device.value.interval = Math.min(device.value.interval + 5, 30)
+        // Prefer the backend's persisted RFC 8628 interval. If an older
+        // backend omits it, increase locally without imposing a cap that could
+        // leave us polling faster than the authorization server requested.
+        if (!applyDevicePollInterval(result.interval)) {
+          device.value.interval += 5
+        }
         scheduleDevicePoll()
         return
       case 'expired':

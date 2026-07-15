@@ -314,6 +314,8 @@ impl AppState {
             admin_monitoring_redis_key_store: Some(Arc::new(StdMutex::new(HashMap::new()))),
             #[cfg(test)]
             provider_oauth_token_url_overrides: Arc::new(StdMutex::new(HashMap::new())),
+            #[cfg(test)]
+            provider_oauth_discovery_url_overrides: Arc::new(StdMutex::new(HashMap::new())),
         })
     }
 
