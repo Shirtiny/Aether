@@ -516,179 +516,204 @@
             </div>
           </template>
 
-          <!-- Grok: xAI 设备授权（RFC 8628，无需回调） -->
-          <template v-else-if="isGrokProvider">
-            <div class="space-y-4">
-              <div
-                v-if="device.status === 'error' || device.status === 'expired'"
-                class="rounded-xl border border-destructive/40 bg-destructive/5 p-5"
+          <!-- 非 Kiro：通用 OAuth；Grok 同时保留 CPA 设备流与 Codex 式回调流 -->
+          <template v-else>
+            <div
+              v-if="isGrokProvider"
+              class="grid grid-cols-2 gap-1.5 rounded-lg border border-border p-0.5 bg-muted/30 mb-4"
+            >
+              <button
+                class="h-8 text-xs font-medium rounded-md transition-colors"
+                :class="grokOAuthFlow === 'device'
+                  ? 'bg-background text-foreground shadow-sm'
+                  : 'text-muted-foreground hover:text-foreground'"
+                @click="selectGrokOAuthFlow('device')"
               >
-                <div class="flex flex-col items-center text-center space-y-3">
-                  <div class="w-10 h-10 rounded-full bg-destructive/10 flex items-center justify-center">
-                    <ExternalLink class="w-5 h-5 text-destructive" />
-                  </div>
-                  <div class="space-y-1">
-                    <p class="text-sm font-medium">
-                      {{ device.status === 'expired' ? '授权已过期' : '授权失败' }}
-                    </p>
-                    <p class="text-xs text-muted-foreground">
-                      {{ device.error || '请重试' }}
-                    </p>
-                  </div>
-                  <Button
-                    class="w-full"
-                    size="sm"
-                    :disabled="device.starting"
-                    @click="startDeviceAuth"
-                  >
-                    重新授权
-                  </Button>
-                </div>
-              </div>
+                设备授权（推荐）
+              </button>
+              <button
+                class="h-8 text-xs font-medium rounded-md transition-colors"
+                :class="grokOAuthFlow === 'callback'
+                  ? 'bg-background text-foreground shadow-sm'
+                  : 'text-muted-foreground hover:text-foreground'"
+                @click="selectGrokOAuthFlow('callback')"
+              >
+                回调 URL
+              </button>
+            </div>
 
+            <template v-if="!isGrokProvider || grokOAuthFlow === 'callback'">
               <div
-                v-else-if="device.starting && !device.session_id"
+                v-if="oauth.starting && !oauth.authorization_url"
                 class="flex items-center justify-center py-12"
               >
                 <div class="text-center">
                   <div class="animate-spin rounded-full h-6 w-6 border-b-2 border-primary mx-auto mb-3" />
                   <p class="text-xs text-muted-foreground">
-                    正在向 xAI 申请设备码...
+                    正在准备授权...
                   </p>
                 </div>
               </div>
 
-              <div
-                v-else-if="device.session_id && device.status === 'pending'"
-                class="rounded-xl border border-border bg-muted/20 p-5"
-              >
-                <div class="flex flex-col items-center text-center space-y-4">
-                  <div class="space-y-1">
-                    <p class="text-sm font-medium">
-                      在浏览器中输入下面的配对码
-                    </p>
-                    <p class="text-xs text-muted-foreground">
-                      授权完成后此页面将自动更新
-                    </p>
+              <template v-else-if="oauth.authorization_url">
+                <div class="space-y-2">
+                  <div class="flex items-center gap-2">
+                    <span class="flex items-center justify-center w-4 h-4 rounded-full bg-primary/10 text-primary text-[10px] font-semibold shrink-0">1</span>
+                    <span class="text-xs font-medium">前往授权</span>
                   </div>
-
-                  <div class="w-full rounded-lg border border-border bg-background p-3">
-                    <div class="flex items-center justify-between gap-2">
-                      <span class="text-[10px] text-muted-foreground shrink-0">配对码</span>
-                      <div class="flex items-center gap-1.5">
-                        <span class="text-lg font-mono font-bold tracking-[0.25em]">{{ device.user_code }}</span>
-                        <button
-                          class="p-1 rounded hover:bg-muted transition-colors"
-                          title="复制配对码"
-                          @click="copyToClipboard(device.user_code)"
-                        >
-                          <Copy class="w-3 h-3 text-muted-foreground" />
-                        </button>
-                      </div>
-                    </div>
-                  </div>
-
-                  <div class="flex items-center gap-1.5 text-xs text-muted-foreground">
-                    <div class="animate-spin rounded-full h-3 w-3 border-[1.5px] border-primary/30 border-t-primary" />
-                    <span>剩余 {{ deviceCountdownFormatted }}</span>
-                  </div>
-
-                  <div class="flex gap-2 w-full">
+                  <div class="flex gap-2 pl-6">
                     <Button
-                      class="flex-1"
                       size="sm"
-                      :disabled="!device.verification_uri_complete"
-                      @click="openDeviceVerificationUrl"
+                      :disabled="oauthBusy"
+                      @click="openAuthorizationUrl"
                     >
-                      <ExternalLink class="w-3.5 h-3.5 mr-1.5" />
-                      打开授权页面
+                      <ExternalLink class="w-3 h-3 mr-1" />
+                      打开
                     </Button>
                     <Button
                       size="sm"
                       variant="outline"
-                      :disabled="!device.verification_uri_complete"
-                      @click="copyToClipboard(device.verification_uri_complete)"
+                      :disabled="oauthBusy"
+                      @click="copyToClipboard(oauth.authorization_url)"
                     >
-                      <Copy class="w-3.5 h-3.5" />
+                      <Copy class="w-3 h-3 mr-1" />
+                      复制
                     </Button>
                   </div>
                 </div>
-              </div>
 
-              <div
-                v-else
-                class="rounded-xl border border-border bg-muted/20 p-5"
-              >
-                <div class="flex flex-col items-center text-center space-y-4">
-                  <p class="text-xs text-muted-foreground">
-                    将向 xAI 申请一个配对码，在任意浏览器中批准即可完成授权。
-                  </p>
-                  <Button
-                    class="w-full"
-                    :disabled="device.starting"
-                    @click="startDeviceAuth"
-                  >
-                    {{ device.starting ? '正在准备授权...' : '开始授权' }}
-                  </Button>
+                <div class="space-y-2">
+                  <div class="flex items-center gap-2">
+                    <span class="flex items-center justify-center w-4 h-4 rounded-full bg-primary/10 text-primary text-[10px] font-semibold shrink-0">2</span>
+                    <span class="text-xs font-medium">粘贴回调 URL</span>
+                  </div>
+                  <div class="pl-6">
+                    <Textarea
+                      v-model="oauth.callback_url"
+                      :disabled="oauthBusy"
+                      placeholder="http://localhost:xxx/callback?code=..."
+                      class="min-h-[120px] text-xs font-mono break-all !rounded-xl"
+                      spellcheck="false"
+                    />
+                  </div>
                 </div>
-              </div>
-            </div>
-          </template>
+              </template>
+            </template>
 
-          <!-- 非 Kiro: 原有 OAuth 流程 -->
-          <template v-else>
-            <div
-              v-if="oauth.starting && !oauth.authorization_url"
-              class="flex items-center justify-center py-12"
-            >
-              <div class="text-center">
-                <div class="animate-spin rounded-full h-6 w-6 border-b-2 border-primary mx-auto mb-3" />
-                <p class="text-xs text-muted-foreground">
-                  正在准备授权...
-                </p>
-              </div>
-            </div>
+            <template v-else>
+              <div class="space-y-4">
+                <div
+                  v-if="device.status === 'error' || device.status === 'expired'"
+                  class="rounded-xl border border-destructive/40 bg-destructive/5 p-5"
+                >
+                  <div class="flex flex-col items-center text-center space-y-3">
+                    <div class="w-10 h-10 rounded-full bg-destructive/10 flex items-center justify-center">
+                      <ExternalLink class="w-5 h-5 text-destructive" />
+                    </div>
+                    <div class="space-y-1">
+                      <p class="text-sm font-medium">
+                        {{ device.status === 'expired' ? '授权已过期' : '授权失败' }}
+                      </p>
+                      <p class="text-xs text-muted-foreground">
+                        {{ device.error || '请重试' }}
+                      </p>
+                    </div>
+                    <Button
+                      class="w-full"
+                      size="sm"
+                      :disabled="device.starting"
+                      @click="startDeviceAuth"
+                    >
+                      重新授权
+                    </Button>
+                  </div>
+                </div>
 
-            <template v-else-if="oauth.authorization_url">
-              <div class="space-y-2">
-                <div class="flex items-center gap-2">
-                  <span class="flex items-center justify-center w-4 h-4 rounded-full bg-primary/10 text-primary text-[10px] font-semibold shrink-0">1</span>
-                  <span class="text-xs font-medium">前往授权</span>
+                <div
+                  v-else-if="device.starting && !device.session_id"
+                  class="flex items-center justify-center py-12"
+                >
+                  <div class="text-center">
+                    <div class="animate-spin rounded-full h-6 w-6 border-b-2 border-primary mx-auto mb-3" />
+                    <p class="text-xs text-muted-foreground">
+                      正在向 xAI 申请设备码...
+                    </p>
+                  </div>
                 </div>
-                <div class="flex gap-2 pl-6">
-                  <Button
-                    size="sm"
-                    :disabled="oauthBusy"
-                    @click="openAuthorizationUrl"
-                  >
-                    <ExternalLink class="w-3 h-3 mr-1" />
-                    打开
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    :disabled="oauthBusy"
-                    @click="copyToClipboard(oauth.authorization_url)"
-                  >
-                    <Copy class="w-3 h-3 mr-1" />
-                    复制
-                  </Button>
-                </div>
-              </div>
 
-              <div class="space-y-2">
-                <div class="flex items-center gap-2">
-                  <span class="flex items-center justify-center w-4 h-4 rounded-full bg-primary/10 text-primary text-[10px] font-semibold shrink-0">2</span>
-                  <span class="text-xs font-medium">粘贴回调 URL</span>
+                <div
+                  v-else-if="device.session_id && device.status === 'pending'"
+                  class="rounded-xl border border-border bg-muted/20 p-5"
+                >
+                  <div class="flex flex-col items-center text-center space-y-4">
+                    <div class="space-y-1">
+                      <p class="text-sm font-medium">
+                        在浏览器中输入下面的配对码
+                      </p>
+                      <p class="text-xs text-muted-foreground">
+                        授权完成后此页面将自动更新
+                      </p>
+                    </div>
+
+                    <div class="w-full rounded-lg border border-border bg-background p-3">
+                      <div class="flex items-center justify-between gap-2">
+                        <span class="text-[10px] text-muted-foreground shrink-0">配对码</span>
+                        <div class="flex items-center gap-1.5">
+                          <span class="text-lg font-mono font-bold tracking-[0.25em]">{{ device.user_code }}</span>
+                          <button
+                            class="p-1 rounded hover:bg-muted transition-colors"
+                            title="复制配对码"
+                            @click="copyToClipboard(device.user_code)"
+                          >
+                            <Copy class="w-3 h-3 text-muted-foreground" />
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div class="flex items-center gap-1.5 text-xs text-muted-foreground">
+                      <div class="animate-spin rounded-full h-3 w-3 border-[1.5px] border-primary/30 border-t-primary" />
+                      <span>剩余 {{ deviceCountdownFormatted }}</span>
+                    </div>
+
+                    <div class="flex gap-2 w-full">
+                      <Button
+                        class="flex-1"
+                        size="sm"
+                        :disabled="!device.verification_uri_complete"
+                        @click="openDeviceVerificationUrl"
+                      >
+                        <ExternalLink class="w-3.5 h-3.5 mr-1.5" />
+                        打开授权页面
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        :disabled="!device.verification_uri_complete"
+                        @click="copyToClipboard(device.verification_uri_complete)"
+                      >
+                        <Copy class="w-3.5 h-3.5" />
+                      </Button>
+                    </div>
+                  </div>
                 </div>
-                <div class="pl-6">
-                  <Textarea
-                    v-model="oauth.callback_url"
-                    :disabled="oauthBusy"
-                    placeholder="http://localhost:xxx/callback?code=..."
-                    class="min-h-[120px] text-xs font-mono break-all !rounded-xl"
-                    spellcheck="false"
-                  />
+
+                <div
+                  v-else
+                  class="rounded-xl border border-border bg-muted/20 p-5"
+                >
+                  <div class="flex flex-col items-center text-center space-y-4">
+                    <p class="text-xs text-muted-foreground">
+                      使用 CPA v7.2.77 同款 xAI Device Flow，无需复制回调 URL。
+                    </p>
+                    <Button
+                      class="w-full"
+                      :disabled="device.starting"
+                      @click="startDeviceAuth"
+                    >
+                      {{ device.starting ? '正在准备授权...' : '开始授权' }}
+                    </Button>
+                  </div>
                 </div>
               </div>
             </template>
@@ -833,7 +858,7 @@
         取消
       </Button>
       <Button
-        v-if="mode === 'oauth' && showAuthorizationMode && !isDeviceBrowserProvider"
+        v-if="mode === 'oauth' && showAuthorizationMode && !isActiveDeviceAuthorizationMode"
         :disabled="!canCompleteOAuth"
         @click="handleCompleteOAuth"
       >
@@ -955,7 +980,9 @@ function getSelectedNodeLabel(): string {
 
 // 模式
 type DialogMode = 'oauth' | 'import'
+type GrokOAuthFlow = 'device' | 'callback'
 const mode = ref<DialogMode>('oauth')
+const grokOAuthFlow = ref<GrokOAuthFlow>('device')
 type WindsurfImportMethod = 'email_password' | 'token_json'
 
 // OAuth 状态
@@ -1056,7 +1083,11 @@ const isKiroProvider = computed(() => (props.providerType || '').toLowerCase() =
 const isGrokProvider = computed(() => (props.providerType || '').toLowerCase() === 'grok')
 const isWindsurfProvider = computed(() => (props.providerType || '').toLowerCase() === 'windsurf')
 const isDeviceBrowserProvider = computed(
-  () => isKiroProvider.value || isWindsurfProvider.value || isGrokProvider.value,
+  () => isKiroProvider.value || isWindsurfProvider.value,
+)
+const isActiveDeviceAuthorizationMode = computed(() =>
+  isDeviceBrowserProvider.value
+  || (isGrokProvider.value && grokOAuthFlow.value === 'device')
 )
 const showAuthorizationMode = computed(() => true)
 const defaultMode = computed<DialogMode>(() => 'oauth')
@@ -1117,7 +1148,7 @@ const canImport = computed(() => {
   return importText.value.trim().length > 0 && !importing.value
 })
 
-const importModeLabel = computed(() => (isGrokProvider.value ? '导入 Token' : '导入授权'))
+const importModeLabel = computed(() => '导入授权')
 const importButtonLabel = computed(() => (isGrokProvider.value ? '导入 Token' : '导入'))
 const importDropTitle = computed(() => (
   isGrokProvider.value ? '拖入 xAI OAuth Token 文件或点击选择' : '拖入授权文件或点击选择'
@@ -1368,6 +1399,25 @@ function resetForm() {
   proxyPopoverOpen.value = false
   selectedProxyNodeId.value = ''
   mode.value = defaultMode.value
+  grokOAuthFlow.value = 'device'
+}
+
+function selectGrokOAuthFlow(flow: GrokOAuthFlow) {
+  if (!isGrokProvider.value || grokOAuthFlow.value === flow) return
+  grokOAuthFlow.value = flow
+  if (flow === 'callback') {
+    deviceAuthRequestId += 1
+    resetDeviceRuntimeState()
+    if (mode.value === 'oauth' && !oauth.value.authorization_url && !oauth.value.starting) {
+      initOAuth()
+    }
+  } else {
+    // Ignore a callback-flow initialization that completes after the operator
+    // has switched back to device authorization. In particular, a late failure
+    // must not force the now-active device flow into import mode.
+    oauthInitRequestId += 1
+    oauth.value.starting = false
+  }
 }
 
 function switchMode(newMode: DialogMode) {
@@ -1378,6 +1428,8 @@ function switchMode(newMode: DialogMode) {
   if (newMode === 'oauth') {
     if (isKiroProvider.value) {
       void ensureKiroSocialDeviceAuth()
+    } else if (isGrokProvider.value && grokOAuthFlow.value === 'device') {
+      return
     } else if (!oauth.value.authorization_url && !oauth.value.starting) {
       initOAuth()
     }
@@ -1405,6 +1457,7 @@ async function initOAuth() {
   if (!props.providerId) return
   if (!showAuthorizationMode.value) return
   if (isDeviceBrowserProvider.value) return
+  if (isGrokProvider.value && grokOAuthFlow.value === 'device') return
   if (oauth.value.starting) return
 
   const requestId = ++oauthInitRequestId

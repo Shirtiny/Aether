@@ -14,7 +14,7 @@ aether 现有的 grok 接入是**旧版 grok.com 网页抓取**（grok2api 风�
 
 - **完全迁移**到官方 xAI OAuth API；**下线** grok.com 网页抓取路径。
 - **保留 `provider_type = "grok"`**——不改名为 `xai`，不做 provider_type 字符串的 DB 数据迁移。（"Grok" 保留为模型系列名，底层 vendor 是 xAI。）
-- **仅 OAuth 订阅账号**（device flow 登录 + 可刷新 Bearer）。本轮不做直连 API-key 模式。
+- **仅 OAuth 订阅账号**（管理界面同时提供 device flow 与 PKCE 回调 URL 手工回填，均使用可刷新 Bearer）。本轮不做直连 API-key 模式。
 - **先做核心**：Chat + Responses + 完整号池现代化。**推迟**多媒体（图像/视频生成与编辑）、composer 图像输入桥接、主动配额探测的精细项、以及按模型的 tool 过滤。
 
 > **2026-07-15 修订（对齐 CLIProxyAPI v7.2.77）**
@@ -22,9 +22,9 @@ aether 现有的 grok 接入是**旧版 grok.com 网页抓取**（grok2api 风�
 > 首版实现参考的是 cpa v7.1.75（2026-06-13）。上游随后有约 38 个 xai/grok 提交，其中三处与本文档的原始决策冲突，已按上游语义修正：
 >
 > 1. **base_url**：订阅（OAuth）账号的非多媒体 chat 走 `https://cli-chat-proxy.grok.com/v1`，**不是** `api.x.ai/v1`；后者只服务 `using_api=true` 或 API-key 模式，以及多媒体/websocket。走 chat-proxy 时必须带 Grok CLI 身份头（`X-XAI-Token-Auth: xai-grok-cli`、`x-grok-client-version`、`User-Agent: xai-grok-workspace/<ver>`）。**这解决了原「风险 #3」。**
-> 2. **登录方式**：PKCE 授权码流程 → **RFC 8628 device flow**（上游 `6e819ab6` 已删除 `pkce.go`）。aether 部署在服务端，`127.0.0.1:56121/callback` 无法接住用户浏览器的重定向，device flow 不需要任何回调。
->     - **与上游的有意偏差**：aether **保留**了授权码代码路径作为后台回退（界面已不再暴露，`capabilities` 如实标注两者都支持）。理由：device flow 尚未用真实订阅号验证过，删掉 PKCE 会让唯一已知可用的登录路径一起消失。待 device flow 实测通过后可再删除。
-> 3. **端点解析**：authorize/token 端点改由 **OIDC discovery**（`https://auth.x.ai/.well-known/openid-configuration`）解析。device authorization 端点没有硬编码默认值，discovery 失败即硬失败——不猜测 URL。
+> 2. **登录方式**：CPA v7.2.77 已改为 **RFC 8628 device flow**（`6e819ab6` 删除了 `pkce.go`），aether 以此作为管理界面的默认推荐方式，同时保留 PKCE 授权码流程。
+>     - **与上游的有意偏差**：管理界面允许切换到与 Codex 相同的 PKCE 手工回填流程。浏览器即使无法真正连接 `127.0.0.1:56121`，地址栏仍会包含 `code` 和 `state`；管理员复制完整回调 URL 并粘贴回 aether 即可完成交换，因此服务器无需直接接收 loopback 回调。`capabilities` 如实标注两者都支持。
+> 3. **端点解析**：device authorization/token 端点由 **OIDC discovery**（`https://auth.x.ai/.well-known/openid-configuration`）解析。device authorization 端点没有硬编码默认值，discovery 失败即硬失败——不猜测 URL。PKCE 流程仍分别读取 `XAI_OAUTH_AUTHORIZE_URL` 与 `XAI_OAUTH_TOKEN_URL`。
 >     - discovery 文档来自网络，因此端点需校验来源：**官方 discovery（https + x.ai）可指定任意 x.ai 主机**（对齐 cpa，容忍 xAI 换子域）；**被 `XAI_OAUTH_DISCOVERY_URL` 覆盖的 discovery 只能描述它自己的 origin**——覆盖只能收窄凭据的可达范围，不能扩大。轮询时用同一规则复核 session 中 pin 的 token 端点。
 >
 > 未变：client_id `b1a00492-…`、scope 集合、issuer `auth.x.ai`——上游至今没动过。

@@ -317,20 +317,64 @@ describe('OAuthAccountDialog Grok xAI OAuth', () => {
     }
   })
 
-  it('opens Grok in xAI device authorization mode', async () => {
+  it('offers both CPA device flow and the Codex-style callback flow', async () => {
     const root = mountDialog('grok')
     await settle()
 
-    // The authorization-code flow needs a redirect target this deployment
-    // cannot receive, so Grok must not fall back to it.
     expect(endpointMocks.startProviderLevelOAuth).not.toHaveBeenCalled()
-    expect(root.textContent).toContain('设备授权')
-    expect(root.textContent).toContain('导入 Token')
-    expect(root.textContent).not.toContain('前往授权')
+    expect(root.textContent).toContain('获取授权')
+    expect(root.textContent).toContain('导入授权')
+    expect(root.textContent).toContain('设备授权（推荐）')
+    expect(root.textContent).toContain('回调 URL')
+    expect(root.textContent).toContain('CPA v7.2.77')
     expect(root.textContent).not.toContain('Grok sso/session token')
   })
 
-  it('starts the device grant without Kiro region or start_url', async () => {
+  it('submits the pasted xAI OAuth callback URL', async () => {
+    const root = mountDialog('grok')
+    await settle()
+
+    getButton(root, '回调 URL')?.click()
+    await settle()
+
+    expect(endpointMocks.startProviderLevelOAuth).toHaveBeenCalledWith('provider-1')
+    const textarea = root.querySelector('textarea[placeholder*="callback?code"]')
+    expect(textarea).toBeInstanceOf(HTMLTextAreaElement)
+    ;(textarea as HTMLTextAreaElement).value = 'http://127.0.0.1:56121/callback?code=xai-code&state=xai-state'
+    textarea.dispatchEvent(new Event('input'))
+    await settle()
+
+    getButton(root, '验证')?.click()
+    await settle()
+
+    expect(endpointMocks.completeProviderLevelOAuth).toHaveBeenCalledWith('provider-1', {
+      callback_url: 'http://127.0.0.1:56121/callback?code=xai-code&state=xai-state',
+      proxy_node_id: undefined,
+    })
+  })
+
+  it('ignores a late callback initialization failure after switching back to device flow', async () => {
+    let rejectInitialization: ((reason?: unknown) => void) | undefined
+    endpointMocks.startProviderLevelOAuth.mockImplementationOnce(() => new Promise((_, reject) => {
+      rejectInitialization = reject
+    }))
+    const root = mountDialog('grok')
+    await settle()
+
+    getButton(root, '回调 URL')?.click()
+    await settle()
+    expect(endpointMocks.startProviderLevelOAuth).toHaveBeenCalledWith('provider-1')
+
+    getButton(root, '设备授权（推荐）')?.click()
+    await settle()
+    rejectInitialization?.(new Error('callback initialization failed'))
+    await settle()
+
+    expect(getButton(root, '获取授权')?.className).toContain('bg-background')
+    expect(root.textContent).toContain('CPA v7.2.77')
+  })
+
+  it('starts and self-polls the CPA-compatible device flow', async () => {
     endpointMocks.startDeviceAuthorize.mockResolvedValue({
       session_id: 'session-1',
       user_code: 'ABCD-1234',
@@ -339,6 +383,11 @@ describe('OAuthAccountDialog Grok xAI OAuth', () => {
       expires_in: 600,
       interval: 5,
       auth_type: 'device',
+    })
+    endpointMocks.pollDeviceAuthorize.mockResolvedValue({
+      status: 'pending',
+      interval: 5,
+      replaced: false,
     })
     const root = mountDialog('grok')
     await settle()
@@ -354,72 +403,14 @@ describe('OAuthAccountDialog Grok xAI OAuth', () => {
       proxy_node_id: undefined,
     })
     expect(root.textContent).toContain('ABCD-1234')
-  })
-
-  it('self-polls the device grant instead of waiting on a callback', async () => {
-    endpointMocks.startDeviceAuthorize.mockResolvedValue({
-      session_id: 'session-1',
-      user_code: 'ABCD-1234',
-      verification_uri: 'https://x.ai/device',
-      verification_uri_complete: 'https://x.ai/device?code=ABCD-1234',
-      expires_in: 600,
-      interval: 5,
-      auth_type: 'device',
-    })
-    endpointMocks.pollDeviceAuthorize.mockResolvedValue({
-      status: 'pending',
-      replaced: false,
-    })
-    const root = mountDialog('grok')
-    await settle()
-
-    getButton(root, '开始授权')?.click()
-    await settle()
-
-    // Kiro's shared default auth_type is a social one; Grok must not inherit
-    // its callback prompt.
     expect(root.querySelector('textarea[placeholder*="callback"]')).toBeNull()
-    expect(root.textContent).not.toContain('验证')
-  })
-
-  it('uses the backend interval after xAI asks the device poller to slow down', async () => {
-    vi.useFakeTimers()
-    endpointMocks.startDeviceAuthorize.mockResolvedValue({
-      session_id: 'session-1',
-      user_code: 'ABCD-1234',
-      verification_uri: 'https://x.ai/device',
-      verification_uri_complete: 'https://x.ai/device?code=ABCD-1234',
-      expires_in: 600,
-      interval: 31,
-      auth_type: 'device',
-    })
-    endpointMocks.pollDeviceAuthorize
-      .mockResolvedValueOnce({ status: 'slow_down', interval: 36, replaced: false })
-      .mockResolvedValue({ status: 'pending', interval: 36, replaced: false })
-    const root = mountDialog('grok')
-    await settle()
-
-    getButton(root, '开始授权')?.click()
-    await settle()
-
-    await vi.advanceTimersByTimeAsync(31_000)
-    expect(endpointMocks.pollDeviceAuthorize).toHaveBeenCalledTimes(1)
-
-    // The previous 30-second cap would already have sent this second poll.
-    await vi.advanceTimersByTimeAsync(35_000)
-    expect(endpointMocks.pollDeviceAuthorize).toHaveBeenCalledTimes(1)
-    await vi.advanceTimersByTimeAsync(1_000)
-    expect(endpointMocks.pollDeviceAuthorize).toHaveBeenCalledTimes(2)
   })
 
   it('imports only official xAI OAuth token fields', async () => {
     const root = mountDialog('grok')
     await settle()
 
-    Array.from(root.querySelectorAll('button'))
-      .filter(button => button.textContent?.includes('导入 Token'))
-      .at(-1)
-      ?.click()
+    getButton(root, '导入授权')?.click()
     await settle()
 
     const textarea = getImportTextarea(root)
