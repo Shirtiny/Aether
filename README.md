@@ -138,6 +138,12 @@ Aether Tunnel 是配套的正向代理节点，部署在海外 VPS 上，为墙�
 - Embeddings: [OpenAI compatible `POST /v1/embeddings`](docs/api/embeddings.md)
 - Rerank: [OpenAI/Jina compatible `POST /v1/rerank`](docs/api/rerank.md)
 
+## 功能与运维文档
+
+- [Codex 官方 WebSocket：配置、账号控制、TLS profile、调度与上线门禁](docs/codex-websocket.md)
+- [Grok 迁移到 xAI OAuth](docs/grok-xai-oauth-migration.md)
+- [Redis runtime 运维手册](docs/operations/redis-runtime-runbook.md)
+
 ## 环境变量
 
 - `APP_PORT`：`aether-gateway` 唯一监听端口，固定绑定 `0.0.0.0:${APP_PORT}`
