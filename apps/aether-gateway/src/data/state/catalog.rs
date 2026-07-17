@@ -519,6 +519,32 @@ impl GatewayDataState {
         Ok(updated)
     }
 
+    pub(crate) async fn update_provider_catalog_key_codex_ws_metadata(
+        &self,
+        key_id: &str,
+        enabled: bool,
+        websocket_transport_profile: Option<&serde_json::Value>,
+        updated_at_unix_secs: u64,
+    ) -> Result<bool, DataLayerError> {
+        let updated = match &self.provider_catalog_writer {
+            Some(repository) => {
+                repository
+                    .update_key_codex_ws_metadata(
+                        key_id,
+                        enabled,
+                        websocket_transport_profile,
+                        updated_at_unix_secs,
+                    )
+                    .await
+            }
+            None => Ok(false),
+        }?;
+        if updated {
+            self.clear_provider_catalog_cache();
+        }
+        Ok(updated)
+    }
+
     pub(crate) async fn update_provider_catalog_key_upstream_metadata(
         &self,
         key_id: &str,

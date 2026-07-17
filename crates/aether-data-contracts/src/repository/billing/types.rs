@@ -74,6 +74,17 @@ impl StoredBillingModelContext {
     }
 }
 
+/// One exact provider/key/model lookup used by request-admission cost estimation.
+///
+/// The owned representation keeps the batch API object-safe and lets database
+/// implementations bind the whole request in one round trip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BillingModelContextByModelIdLookup {
+    pub provider_id: String,
+    pub provider_api_key_id: Option<String>,
+    pub model_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AdminBillingRuleRecord {
     pub id: String,
@@ -255,6 +266,17 @@ pub trait BillingReadRepository: Send + Sync {
         let _ = (provider_id, provider_api_key_id, model_id);
         Ok(None)
     }
+
+    /// Resolves exact model-id contexts in input order.
+    ///
+    /// Implementations must provide an explicit batch path so request
+    /// admission cannot silently regress to one repository round trip per
+    /// scheduler candidate. The existing single-item API remains available to
+    /// usage settlement and other point-lookups.
+    async fn find_model_contexts_by_model_ids(
+        &self,
+        lookups: &[BillingModelContextByModelIdLookup],
+    ) -> Result<Vec<Option<StoredBillingModelContext>>, crate::DataLayerError>;
 
     async fn admin_billing_enabled_default_value_exists(
         &self,

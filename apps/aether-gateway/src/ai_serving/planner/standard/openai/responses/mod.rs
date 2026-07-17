@@ -1,3 +1,7 @@
+use std::sync::Arc;
+
+use aether_routing_core::RoutingJsonPatchOperation;
+
 use crate::ai_serving::planner::candidate_materialization::release_pool_sticky_init_for_unbuilt_attempt;
 use crate::ai_serving::planner::plan_builders::{AiStreamAttempt, AiSyncAttempt};
 use crate::ai_serving::GatewayControlDecision;
@@ -6,6 +10,12 @@ use crate::{AiExecutionDecision, AppState, GatewayError};
 mod decision;
 mod plans;
 
+pub(crate) struct CodexWsPlanningAttempt<Preflight> {
+    pub(crate) attempt: AiStreamAttempt,
+    pub(crate) preflight: Preflight,
+    pub(crate) provider_body_patch: Arc<[RoutingJsonPatchOperation]>,
+}
+
 use self::decision::{
     build_local_openai_responses_candidate_attempt_source,
     maybe_build_local_openai_responses_decision_payload_for_candidate,
@@ -13,6 +23,8 @@ use self::decision::{
 };
 use self::plans::{
     build_local_stream_attempt_source, build_local_stream_plan_and_reports,
+    build_local_stream_plan_and_reports_with_required_capabilities,
+    build_local_stream_plan_and_reports_with_required_capabilities_compact,
     build_local_sync_attempt_source, build_local_sync_plan_and_reports, resolve_stream_spec,
     resolve_sync_spec,
 };
@@ -45,6 +57,68 @@ pub(crate) async fn build_local_openai_responses_stream_plan_and_reports_for_kin
     };
 
     build_local_stream_plan_and_reports(state, parts, trace_id, decision, body_json, spec).await
+}
+
+pub(crate) async fn build_local_openai_responses_stream_plan_and_reports_for_kind_with_required_capabilities(
+    state: &AppState,
+    parts: &http::request::Parts,
+    trace_id: &str,
+    decision: &GatewayControlDecision,
+    body_json: &serde_json::Value,
+    plan_kind: &str,
+    explicit_required_capabilities: &serde_json::Value,
+) -> Result<Vec<AiStreamAttempt>, GatewayError> {
+    let Some(spec) = resolve_stream_spec(plan_kind) else {
+        return Ok(Vec::new());
+    };
+
+    build_local_stream_plan_and_reports_with_required_capabilities(
+        state,
+        parts,
+        trace_id,
+        decision,
+        body_json,
+        spec,
+        Some(explicit_required_capabilities),
+    )
+    .await
+}
+
+pub(crate) async fn build_compact_local_openai_responses_stream_plan_and_reports_for_kind_with_required_capabilities<
+    Preflight,
+    PreflightFn,
+    PreflightFuture,
+>(
+    state: &AppState,
+    parts: &http::request::Parts,
+    trace_id: &str,
+    decision: &GatewayControlDecision,
+    body_json: &serde_json::Value,
+    plan_kind: &str,
+    explicit_required_capabilities: &serde_json::Value,
+    max_materialized_attempts: usize,
+    preflight: PreflightFn,
+) -> Result<Vec<CodexWsPlanningAttempt<Preflight>>, GatewayError>
+where
+    PreflightFn: FnMut(self::decision::LocalOpenAiResponsesCandidateAttempt) -> PreflightFuture,
+    PreflightFuture: std::future::Future<Output = Option<Preflight>>,
+{
+    let Some(spec) = resolve_stream_spec(plan_kind) else {
+        return Ok(Vec::new());
+    };
+
+    build_local_stream_plan_and_reports_with_required_capabilities_compact(
+        state,
+        parts,
+        trace_id,
+        decision,
+        body_json,
+        spec,
+        Some(explicit_required_capabilities),
+        max_materialized_attempts,
+        preflight,
+    )
+    .await
 }
 
 pub(crate) async fn build_local_openai_responses_sync_attempt_source_for_kind<'a>(

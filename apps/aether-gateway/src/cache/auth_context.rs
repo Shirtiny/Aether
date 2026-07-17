@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use aether_cache::ExpiringMap;
@@ -7,6 +8,7 @@ use crate::control::GatewayControlAuthContext;
 #[derive(Debug, Default)]
 pub(crate) struct AuthContextCache {
     entries: ExpiringMap<String, GatewayControlAuthContext>,
+    invalidation_epoch: AtomicU64,
 }
 
 impl AuthContextCache {
@@ -31,5 +33,25 @@ impl AuthContextCache {
 
     pub(crate) fn clear(&self) {
         self.entries.clear();
+        self.invalidation_epoch.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub(crate) fn invalidation_epoch(&self) -> u64 {
+        self.invalidation_epoch.load(Ordering::Acquire)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AuthContextCache;
+
+    #[test]
+    fn clearing_auth_snapshot_advances_invalidation_epoch() {
+        let cache = AuthContextCache::default();
+        let before = cache.invalidation_epoch();
+
+        cache.clear();
+
+        assert_eq!(cache.invalidation_epoch(), before + 1);
     }
 }

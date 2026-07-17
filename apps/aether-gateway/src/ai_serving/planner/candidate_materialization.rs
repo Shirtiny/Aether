@@ -27,8 +27,9 @@ use uuid::Uuid;
 use crate::ai_serving::planner::candidate_affinity_cache::remember_scheduler_affinity_for_candidate_at_epoch;
 use crate::ai_serving::planner::candidate_ranking::scheduler_ordering_config_for_routing_policy;
 use crate::ai_serving::planner::candidate_resolution::{
-    resolve_and_rank_logical_local_execution_candidates, EligibleLocalExecutionCandidate,
-    LocalExecutionCandidateKind, SkippedLocalExecutionCandidate,
+    resolve_and_rank_logical_local_execution_candidates,
+    resolve_and_rank_logical_local_execution_candidates_with_batched_transports,
+    EligibleLocalExecutionCandidate, LocalExecutionCandidateKind, SkippedLocalExecutionCandidate,
 };
 use crate::ai_serving::planner::candidate_source::{
     LocalCandidatePreselectionKeyMode, LocalCandidatePreselectionPageCursor,
@@ -361,6 +362,12 @@ impl PoolGroupExhaustionPersistenceContext {
 }
 
 pub(crate) use aether_ai_serving::AiCandidateResolutionMode as LocalCandidateResolutionMode;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LocalCandidateTransportReadMode {
+    PerCandidate,
+    BatchedPage,
+}
 
 struct GatewayLocalCandidateMaterializationPort<'a, F, G> {
     state: PlannerAppState<'a>,
@@ -752,6 +759,7 @@ where
             client_api_format,
             routing_policy,
         )),
+        LocalCandidateTransportReadMode::PerCandidate,
     );
 
     (
@@ -771,6 +779,7 @@ fn build_logical_candidate_items<'a>(
     request_auth_channel: Option<&str>,
     routing_policy: Option<&ResolvedRoutingPolicy>,
     pool_exhaustion_persistence: Option<PoolGroupExhaustionPersistenceContext>,
+    transport_read_mode: LocalCandidateTransportReadMode,
 ) -> (VecDeque<LocalExecutionCandidateAttemptSourceItem<'a>>, u32) {
     let mut items = VecDeque::new();
     let mut next_candidate_index = starting_candidate_index;
@@ -798,6 +807,12 @@ fn build_logical_candidate_items<'a>(
                     request_auth_channel,
                     routing_policy,
                 );
+                let cursor = match transport_read_mode {
+                    LocalCandidateTransportReadMode::PerCandidate => cursor,
+                    LocalCandidateTransportReadMode::BatchedPage => {
+                        cursor.with_batched_transport_reads()
+                    }
+                };
                 let cursor = if let Some(trace_id) = trace_id {
                     cursor.with_runtime_miss_diagnostic(trace_id, record_runtime_miss_diagnostic)
                 } else {
@@ -836,6 +851,7 @@ pub(crate) async fn build_lazy_requested_model_execution_candidate_attempt_sourc
     use_api_format_alias_match: bool,
     key_mode: LocalCandidatePreselectionKeyMode,
     resolution_mode: LocalCandidateResolutionMode,
+    transport_read_mode: LocalCandidateTransportReadMode,
     build_available_extra_data: F,
     decorate_skipped_candidate: G,
 ) -> Result<(LocalExecutionCandidateAttemptSource<'a>, usize), GatewayError>
@@ -862,6 +878,10 @@ where
         key_mode,
     )
     .await;
+    let page_cursor = match transport_read_mode {
+        LocalCandidateTransportReadMode::PerCandidate => page_cursor,
+        LocalCandidateTransportReadMode::BatchedPage => page_cursor.same_format_only(),
+    };
     let mut cursor = RequestedModelAttemptPageCursor {
         state,
         trace_id: trace_id.to_string(),
@@ -879,6 +899,7 @@ where
         skipped_error_context: persistence_policy.skipped.error_context,
         record_runtime_miss_diagnostic,
         resolution_mode,
+        transport_read_mode,
         decorate_skipped_candidate,
         page_cursor,
         pending_items: VecDeque::new(),
@@ -921,6 +942,7 @@ struct RequestedModelAttemptPageCursor<'a> {
     skipped_error_context: &'static str,
     record_runtime_miss_diagnostic: bool,
     resolution_mode: LocalCandidateResolutionMode,
+    transport_read_mode: LocalCandidateTransportReadMode,
     decorate_skipped_candidate: DecorateSkippedCandidateFn<'a>,
     page_cursor: LocalCandidatePreselectionPageCursor<'a>,
     pending_items: VecDeque<LocalExecutionCandidateAttemptSourceItem<'a>>,
@@ -987,21 +1009,40 @@ impl<'a> RequestedModelAttemptPageCursor<'a> {
                 return Ok(false);
             }
 
-            let (candidates, resolved_skipped) =
-                resolve_and_rank_logical_local_execution_candidates(
-                    self.state,
-                    page.candidates,
-                    &self.client_api_format,
-                    Some(&self.requested_model),
-                    Some(&self.auth_snapshot),
-                    self.client_session_affinity.as_ref(),
-                    self.required_capabilities.as_ref(),
-                    self.routing_policy.as_ref(),
-                    self.sticky_session_token.as_deref(),
-                    self.request_auth_channel.as_deref(),
-                    self.resolution_mode,
-                )
-                .await;
+            let (candidates, resolved_skipped) = match self.transport_read_mode {
+                LocalCandidateTransportReadMode::PerCandidate => {
+                    resolve_and_rank_logical_local_execution_candidates(
+                        self.state,
+                        page.candidates,
+                        &self.client_api_format,
+                        Some(&self.requested_model),
+                        Some(&self.auth_snapshot),
+                        self.client_session_affinity.as_ref(),
+                        self.required_capabilities.as_ref(),
+                        self.routing_policy.as_ref(),
+                        self.sticky_session_token.as_deref(),
+                        self.request_auth_channel.as_deref(),
+                        self.resolution_mode,
+                    )
+                    .await
+                }
+                LocalCandidateTransportReadMode::BatchedPage => {
+                    resolve_and_rank_logical_local_execution_candidates_with_batched_transports(
+                        self.state,
+                        page.candidates,
+                        &self.client_api_format,
+                        Some(&self.requested_model),
+                        Some(&self.auth_snapshot),
+                        self.client_session_affinity.as_ref(),
+                        self.required_capabilities.as_ref(),
+                        self.routing_policy.as_ref(),
+                        self.sticky_session_token.as_deref(),
+                        self.request_auth_channel.as_deref(),
+                        self.resolution_mode,
+                    )
+                    .await
+                }
+            };
             let skipped_candidates = page
                 .skipped_candidates
                 .into_iter()
@@ -1046,6 +1087,7 @@ impl<'a> RequestedModelAttemptPageCursor<'a> {
                     client_api_format: self.client_api_format.clone(),
                     routing_policy: self.routing_policy.clone(),
                 }),
+                self.transport_read_mode,
             );
             self.next_candidate_index = next_candidate_index
                 .saturating_add(u32::try_from(skipped_candidate_count).unwrap_or(u32::MAX));
@@ -2837,6 +2879,7 @@ mod tests {
             false,
             LocalCandidatePreselectionKeyMode::ProviderEndpointKeyModel,
             LocalCandidateResolutionMode::Standard,
+            LocalCandidateTransportReadMode::PerCandidate,
             no_extra_data,
             identity_skipped_candidate,
         )
@@ -2962,6 +3005,7 @@ mod tests {
             None,
             None,
             None,
+            LocalCandidateTransportReadMode::PerCandidate,
         );
         let mut source = LocalExecutionCandidateAttemptSource { items };
 

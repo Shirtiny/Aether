@@ -1,6 +1,7 @@
 import client from '../client'
 import type { EndpointAPIKey, AllowedModels } from './types'
 import type { QuotaStatusSnapshot } from './types'
+import { CODEX_WS_PROFILE_ID } from '@/constants/codexWs'
 
 // Re-export types for convenience
 export type { EndpointAPIKey, AllowedModels }
@@ -222,6 +223,30 @@ export async function updateProviderKey(
     `/api/admin/endpoints/keys/${keyId}`,
     data,
     requestOptions,
+  )
+  return response.data
+}
+
+export interface CodexWsAccountStatus {
+  key_id: string
+  configured: boolean
+  profile_effective: boolean
+  /** Null when no concrete request model/route/runtime snapshot was evaluated. */
+  runtime_eligible: boolean | null
+  profile_id: string | null
+  runtime_state: 'request_scoped' | 'profile_blocked' | 'soft_draining' | 'hard_revoked'
+  profile_reasons: string[]
+  runtime_reasons: string[]
+}
+
+/** Atomically toggles only the account's official Codex WebSocket capability. */
+export async function updateProviderKeyCodexWs(
+  keyId: string,
+  enabled: boolean,
+): Promise<CodexWsAccountStatus> {
+  const response = await client.put<CodexWsAccountStatus>(
+    `/api/admin/endpoints/keys/${keyId}/codex-ws`,
+    { enabled, ...(enabled ? { profile_id: CODEX_WS_PROFILE_ID } : {}) },
   )
   return response.data
 }

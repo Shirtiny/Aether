@@ -22,10 +22,12 @@ pub use formats::matrix::{
 pub use formats::registry::{build_stream_transcoder, convert_request, convert_response};
 pub use formats::shared::model_directives::{
     apply_model_directive_mapping_patch, apply_model_directive_overrides_from_model,
-    apply_model_directive_overrides_from_request, claude_model_uses_adaptive_effort,
-    extract_gemini_model_from_path, gemini_model_uses_thinking_level, model_directive_base_model,
-    model_supports_codex_max_ultra, normalize_model_directive_model, parse_model_directive,
-    ModelDirective, ModelOverride, ReasoningEffort, ServiceTier,
+    apply_model_directive_overrides_from_request,
+    apply_openai_responses_model_directive_overrides_from_model_in_place,
+    claude_model_uses_adaptive_effort, extract_gemini_model_from_path,
+    gemini_model_uses_thinking_level, model_directive_base_model, model_supports_codex_max_ultra,
+    normalize_model_directive_model, parse_model_directive, ModelDirective, ModelOverride,
+    ReasoningEffort, ServiceTier,
 };
 pub use formats::shared::request::{
     endpoint_config_forces_upstream_stream_policy, enforce_request_body_stream_field,

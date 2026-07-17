@@ -15,8 +15,9 @@ use aether_usage_runtime::{
     build_stream_terminal_usage_outcome, build_sync_terminal_usage_outcome,
     GatewayStreamReportRequest, GatewaySyncReportRequest, TerminalUsageOutcome,
 };
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use serde_json::Value;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::Duration;
 use tracing::warn;
 
@@ -185,14 +186,61 @@ pub(crate) async fn apply_local_execution_effect(
     }
 }
 
-async fn release_pool_key_lease_effect(state: &AppState, context: LocalExecutionEffectContext<'_>) {
+pub(crate) async fn release_local_pool_key_lease_for_attempt(
+    state: &AppState,
+    context: LocalExecutionEffectContext<'_>,
+) {
+    release_pool_key_lease_effect(state, context).await;
+}
+
+pub(crate) async fn release_local_pool_key_lease_for_attempt_strict(
+    state: &AppState,
+    context: LocalExecutionEffectContext<'_>,
+) -> Result<bool, aether_runtime_state::DataLayerError> {
     let metadata = local_execution_candidate_metadata_from_report_context(context.report_context);
     let Some(lease) = metadata.pool_key_lease else {
-        return;
+        return Ok(false);
     };
-    if let Err(err) =
-        release_admin_provider_pool_key_lease(state.runtime_state.as_ref(), &lease).await
-    {
+    release_admin_provider_pool_key_lease(state.runtime_state.as_ref(), &lease).await
+}
+
+pub(crate) fn stop_local_pool_sticky_init_renewer_for_attempt(
+    context: LocalExecutionEffectContext<'_>,
+) {
+    let metadata = local_execution_candidate_metadata_from_report_context(context.report_context);
+    let sticky_session_token = metadata
+        .pool_sticky_session_token
+        .or_else(|| pool_feedback_sticky_session_token(context.plan, context.report_context));
+    stop_pool_sticky_init_renewer(context, sticky_session_token.as_deref());
+}
+
+pub(crate) async fn apply_local_pool_terminal_effect_after_lease_release(
+    state: &AppState,
+    context: LocalExecutionEffectContext<'_>,
+    effect: LocalExecutionEffect<'_>,
+) {
+    match effect {
+        LocalExecutionEffect::PoolSuccessSync { payload } => {
+            record_sync_pool_success_effect(state, context, payload).await;
+        }
+        LocalExecutionEffect::PoolSuccessStream { payload } => {
+            record_stream_pool_success_effect(state, context, payload).await;
+        }
+        LocalExecutionEffect::PoolAttemptAborted => {
+            record_pool_attempt_aborted_effect(state, context).await;
+        }
+        LocalExecutionEffect::PoolError(effect) => {
+            record_pool_error_effect(state, context, effect).await;
+        }
+        LocalExecutionEffect::PoolStreamTimeout => {
+            record_pool_stream_timeout_effect(state, context).await;
+        }
+        effect => apply_local_execution_effect(state, context, effect).await,
+    }
+}
+
+async fn release_pool_key_lease_effect(state: &AppState, context: LocalExecutionEffectContext<'_>) {
+    if let Err(err) = release_local_pool_key_lease_for_attempt_strict(state, context).await {
         warn!(
             error = ?err,
             provider_id = %context.plan.provider_id,
@@ -755,29 +803,89 @@ pub(crate) async fn prepare_pool_attempt_started_effect(
 }
 
 pub(crate) struct PoolAttemptStartCleanupGuard {
+    cleanup_permit: Option<mpsc::OwnedPermit<PoolAttemptStartCleanupJob>>,
+    cleanup_job: Option<PoolAttemptStartCleanupJob>,
+    armed: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PoolAttemptStartCleanupUnavailable;
+
+struct PoolAttemptStartCleanupJob {
     runtime: std::sync::Arc<aether_runtime_state::RuntimeState>,
     provider_id: String,
     key_id: String,
     sticky_session_token: Option<String>,
     owner: Option<String>,
-    armed: bool,
 }
 
+struct PoolAttemptStartCleanupQueue {
+    sender: mpsc::Sender<PoolAttemptStartCleanupJob>,
+}
+
+const POOL_ATTEMPT_START_CLEANUP_QUEUE_CAPACITY: usize = 4_096;
+const POOL_ATTEMPT_START_CLEANUP_CONCURRENCY: usize = 16;
+static POOL_ATTEMPT_START_CLEANUP_RESERVE_FULL_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+static POOL_ATTEMPT_START_CLEANUP_QUEUE: LazyLock<PoolAttemptStartCleanupQueue> =
+    LazyLock::new(|| {
+        let (sender, receiver) = mpsc::channel(POOL_ATTEMPT_START_CLEANUP_QUEUE_CAPACITY);
+        std::thread::Builder::new()
+            .name("pool-attempt-start-cleanup".into())
+            .stack_size(512 * 1024)
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("pool cleanup runtime should initialize");
+                runtime.block_on(run_pool_attempt_start_cleanup_worker(receiver));
+            })
+            .expect("pool cleanup worker thread should start");
+        PoolAttemptStartCleanupQueue { sender }
+    });
+
 impl PoolAttemptStartCleanupGuard {
-    pub(crate) fn new(state: &AppState, context: LocalExecutionEffectContext<'_>) -> Option<Self> {
+    pub(crate) fn new(
+        state: &AppState,
+        context: LocalExecutionEffectContext<'_>,
+    ) -> Result<Option<Self>, PoolAttemptStartCleanupUnavailable> {
         let metadata =
             local_execution_candidate_metadata_from_report_context(context.report_context);
-        let owner = metadata.pool_sticky_init_owner?;
+        let Some(owner) = metadata.pool_sticky_init_owner else {
+            return Ok(None);
+        };
         let sticky_session_token =
             pool_feedback_sticky_session_token(context.plan, context.report_context);
-        Some(Self {
-            runtime: std::sync::Arc::clone(&state.runtime_state),
-            provider_id: context.plan.provider_id.clone(),
-            key_id: context.plan.key_id.clone(),
-            sticky_session_token,
-            owner: Some(owner),
+        let cleanup_permit = POOL_ATTEMPT_START_CLEANUP_QUEUE
+            .sender
+            .clone()
+            .try_reserve_owned()
+            .map_err(|_| {
+                let reserve_full_total = POOL_ATTEMPT_START_CLEANUP_RESERVE_FULL_TOTAL
+                    .fetch_add(1, AtomicOrdering::AcqRel)
+                    + 1;
+                tracing::error!(
+                    event_name = "pool_attempt_start_cleanup_queue_full",
+                    log_type = "ops",
+                    provider_id = %context.plan.provider_id,
+                    key_id = %context.plan.key_id,
+                    queue_capacity = POOL_ATTEMPT_START_CLEANUP_QUEUE_CAPACITY,
+                    reserve_full_total,
+                    "sticky initialization cleanup queue capacity was unavailable"
+                );
+                PoolAttemptStartCleanupUnavailable
+            })?;
+        Ok(Some(Self {
+            cleanup_permit: Some(cleanup_permit),
+            cleanup_job: Some(PoolAttemptStartCleanupJob {
+                runtime: std::sync::Arc::clone(&state.runtime_state),
+                provider_id: context.plan.provider_id.clone(),
+                key_id: context.plan.key_id.clone(),
+                sticky_session_token,
+                owner: Some(owner),
+            }),
             armed: true,
-        })
+        }))
     }
 
     pub(crate) fn disarm(&mut self) {
@@ -790,22 +898,43 @@ impl Drop for PoolAttemptStartCleanupGuard {
         if !self.armed {
             return;
         }
-        let runtime = std::sync::Arc::clone(&self.runtime);
-        let provider_id = self.provider_id.clone();
-        let key_id = self.key_id.clone();
-        let sticky_session_token = self.sticky_session_token.clone();
-        let owner = self.owner.clone();
-        tokio::spawn(async move {
-            release_pool_sticky_initialization_for_owner(
-                runtime.as_ref(),
-                &provider_id,
-                &key_id,
-                sticky_session_token.as_deref(),
-                owner.as_deref(),
-            )
-            .await;
-        });
+        let Some(cleanup_permit) = self.cleanup_permit.take() else {
+            return;
+        };
+        let Some(cleanup_job) = self.cleanup_job.take() else {
+            return;
+        };
+        cleanup_permit.send(cleanup_job);
     }
+}
+
+async fn run_pool_attempt_start_cleanup_worker(
+    mut receiver: mpsc::Receiver<PoolAttemptStartCleanupJob>,
+) {
+    let mut pending = FuturesUnordered::new();
+    loop {
+        tokio::select! {
+            job = receiver.recv(), if pending.len() < POOL_ATTEMPT_START_CLEANUP_CONCURRENCY => {
+                let Some(job) = job else {
+                    break;
+                };
+                pending.push(process_pool_attempt_start_cleanup(job));
+            }
+            _ = pending.next(), if !pending.is_empty() => {}
+        }
+    }
+    while pending.next().await.is_some() {}
+}
+
+async fn process_pool_attempt_start_cleanup(job: PoolAttemptStartCleanupJob) {
+    release_pool_sticky_initialization_for_owner(
+        job.runtime.as_ref(),
+        &job.provider_id,
+        &job.key_id,
+        job.sticky_session_token.as_deref(),
+        job.owner.as_deref(),
+    )
+    .await;
 }
 
 async fn try_claim_pool_sticky_init_for_attempt(
@@ -2305,6 +2434,7 @@ mod tests {
                     report_context: Some(&report_context),
                 },
             )
+            .expect("cleanup queue should have capacity")
             .expect("cleanup guard should arm"),
         );
 
@@ -2832,6 +2962,7 @@ mod tests {
                     report_context: Some(&report_context),
                 },
             )
+            .expect("cleanup queue should have capacity")
             .expect("cleanup guard should arm"),
         );
 

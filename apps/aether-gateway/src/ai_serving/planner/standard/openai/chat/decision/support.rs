@@ -6,7 +6,7 @@ use crate::ai_serving::planner::candidate_materialization::{
     mark_skipped_local_execution_candidate, mark_skipped_local_execution_candidate_with_extra_data,
     mark_skipped_local_execution_candidate_with_failure_diagnostic,
     materialize_local_execution_candidates_with_serving, LocalCandidateResolutionMode,
-    LocalExecutionCandidateAttemptSource,
+    LocalCandidateTransportReadMode, LocalExecutionCandidateAttemptSource,
 };
 use crate::ai_serving::planner::candidate_metadata::{
     build_local_execution_candidate_contract_metadata,
@@ -310,6 +310,7 @@ pub(crate) async fn build_lazy_local_openai_chat_candidate_attempt_source<'a>(
         false,
         LocalCandidatePreselectionKeyMode::ProviderEndpointKeyModel,
         LocalCandidateResolutionMode::Standard,
+        LocalCandidateTransportReadMode::PerCandidate,
         move |eligible| {
             let provider_api_format = eligible.provider_api_format.clone();
             let (execution_strategy, conversion_mode) =

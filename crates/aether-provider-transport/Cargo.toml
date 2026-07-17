@@ -30,4 +30,5 @@ url.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+aether-codex-ws-connector.workspace = true
 axum = { version = "0.8", features = ["ws"] }

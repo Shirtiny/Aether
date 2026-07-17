@@ -4,9 +4,10 @@ use std::sync::RwLock;
 use async_trait::async_trait;
 
 use super::{
-    AdminBillingMutationOutcome, BillingPlanRecord, BillingPlanWriteInput, BillingReadRepository,
-    PaymentGatewayConfigRecord, PaymentGatewayConfigWriteInput, StoredBillingModelContext,
-    UserDailyQuotaAvailabilityRecord, UserPlanEntitlementRecord,
+    AdminBillingMutationOutcome, BillingModelContextByModelIdLookup, BillingPlanRecord,
+    BillingPlanWriteInput, BillingReadRepository, PaymentGatewayConfigRecord,
+    PaymentGatewayConfigWriteInput, StoredBillingModelContext, UserDailyQuotaAvailabilityRecord,
+    UserPlanEntitlementRecord,
 };
 use crate::DataLayerError;
 
@@ -185,6 +186,41 @@ impl BillingReadRepository for InMemoryBillingReadRepository {
                 stored_provider_id == provider_id && value.model_id.as_deref() == Some(model_id)
             })
             .map(|(_, value)| value.clone()))
+    }
+
+    async fn find_model_contexts_by_model_ids(
+        &self,
+        lookups: &[BillingModelContextByModelIdLookup],
+    ) -> Result<Vec<Option<StoredBillingModelContext>>, DataLayerError> {
+        let by_key = self.by_key.read().expect("billing repository lock");
+        Ok(lookups
+            .iter()
+            .map(|lookup| {
+                find_context_by_model_id_and_key(
+                    &by_key,
+                    &lookup.provider_id,
+                    lookup.provider_api_key_id.as_deref(),
+                    &lookup.model_id,
+                )
+                .or_else(|| {
+                    find_context_by_model_id_and_key(
+                        &by_key,
+                        &lookup.provider_id,
+                        None,
+                        &lookup.model_id,
+                    )
+                })
+                .or_else(|| {
+                    by_key
+                        .iter()
+                        .find(|((stored_provider_id, _, _), value)| {
+                            stored_provider_id == &lookup.provider_id
+                                && value.model_id.as_deref() == Some(lookup.model_id.as_str())
+                        })
+                        .map(|(_, value)| value.clone())
+                })
+            })
+            .collect())
     }
 
     async fn find_payment_gateway_config(
@@ -449,7 +485,9 @@ mod tests {
     use serde_json::json;
 
     use super::InMemoryBillingReadRepository;
-    use crate::repository::billing::{BillingReadRepository, StoredBillingModelContext};
+    use crate::repository::billing::{
+        BillingModelContextByModelIdLookup, BillingReadRepository, StoredBillingModelContext,
+    };
 
     fn sample_context() -> StoredBillingModelContext {
         StoredBillingModelContext::new(
@@ -483,6 +521,35 @@ mod tests {
 
         assert_eq!(stored.provider_id, "provider-1");
         assert_eq!(stored.global_model_name, "gpt-5");
+    }
+
+    #[tokio::test]
+    async fn batch_model_id_lookup_preserves_input_order_and_missing_slots() {
+        let repository = InMemoryBillingReadRepository::seed(vec![sample_context()]);
+        let contexts = repository
+            .find_model_contexts_by_model_ids(&[
+                BillingModelContextByModelIdLookup {
+                    provider_id: "provider-1".to_string(),
+                    provider_api_key_id: Some("key-1".to_string()),
+                    model_id: "model-1".to_string(),
+                },
+                BillingModelContextByModelIdLookup {
+                    provider_id: "provider-1".to_string(),
+                    provider_api_key_id: Some("key-1".to_string()),
+                    model_id: "missing".to_string(),
+                },
+            ])
+            .await
+            .expect("batch lookup should succeed");
+
+        assert_eq!(contexts.len(), 2);
+        assert_eq!(
+            contexts[0]
+                .as_ref()
+                .and_then(|context| context.model_id.as_deref()),
+            Some("model-1")
+        );
+        assert!(contexts[1].is_none());
     }
 
     #[tokio::test]

@@ -206,6 +206,34 @@ impl RedisRuntimeRunner {
         Ok(updated > 0)
     }
 
+    pub(crate) async fn kv_set_if_value(
+        &self,
+        key: &str,
+        expected_value: &str,
+        value: String,
+        ttl: Duration,
+    ) -> Result<bool, DataLayerError> {
+        let namespaced_key = self.keyspace.key(key);
+        let ttl_ms = u64::try_from(ttl.as_millis().max(1)).unwrap_or(u64::MAX);
+        let mut connection = self.connections.connection(RedisConnectionLane::Fast);
+        let updated = script(
+            "if redis.call('get', KEYS[1]) == ARGV[1] then \
+                 redis.call('psetex', KEYS[1], ARGV[3], ARGV[2]) \
+                 return 1 \
+             else \
+                 return 0 \
+             end",
+        )
+        .key(namespaced_key)
+        .arg(expected_value)
+        .arg(value)
+        .arg(ttl_ms)
+        .invoke_async::<i32>(&mut connection)
+        .await
+        .map_redis_err()?;
+        Ok(updated > 0)
+    }
+
     pub(crate) async fn kv_delete_if_value(
         &self,
         key: &str,

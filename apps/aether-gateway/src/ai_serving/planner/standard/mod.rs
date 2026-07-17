@@ -15,10 +15,11 @@ mod normalize;
 mod openai;
 
 pub(crate) use self::codex::{
-    apply_codex_openai_responses_special_body_edits, apply_codex_openai_responses_special_headers,
-    apply_codex_pool_concrete_account_profile,
+    apply_codex_official_ws_handshake_headers, apply_codex_openai_responses_special_body_edits,
+    apply_codex_openai_responses_special_headers, apply_codex_pool_concrete_account_profile,
     apply_codex_pool_concrete_account_profile_for_api_format,
     apply_codex_pool_stable_client_headers, materialize_codex_pool_key_fingerprint,
+    resolve_codex_pool_concrete_account_profile,
 };
 pub(crate) use self::deepseek::{apply_deepseek_tool_call_thinking_compat, is_deepseek_provider};
 pub(crate) use self::family::{
@@ -30,15 +31,17 @@ pub(crate) use self::normalize::{
     build_cross_format_openai_responses_request_body,
     build_cross_format_openai_responses_upstream_url, build_local_openai_chat_request_body,
     build_local_openai_chat_upstream_url, build_local_openai_responses_request_body,
-    build_local_openai_responses_upstream_url,
+    build_local_openai_responses_upstream_url, build_owned_local_openai_responses_request_body,
 };
 pub(crate) use self::openai::{
+    build_compact_local_openai_responses_stream_plan_and_reports_for_kind_with_required_capabilities,
     build_local_openai_chat_stream_attempt_source_for_kind,
     build_local_openai_chat_stream_plan_and_reports_for_kind,
     build_local_openai_chat_sync_attempt_source_for_kind,
     build_local_openai_chat_sync_plan_and_reports_for_kind,
     build_local_openai_responses_stream_attempt_source_for_kind,
     build_local_openai_responses_stream_plan_and_reports_for_kind,
+    build_local_openai_responses_stream_plan_and_reports_for_kind_with_required_capabilities,
     build_local_openai_responses_sync_attempt_source_for_kind,
     build_local_openai_responses_sync_plan_and_reports_for_kind, copy_request_number_field,
     copy_request_number_field_as, map_openai_reasoning_effort_to_claude_output,

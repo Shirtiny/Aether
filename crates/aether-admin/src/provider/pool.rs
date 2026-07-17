@@ -33,6 +33,8 @@ pub enum AdminPoolBatchActionKind {
     ClearProxy,
     SetProxy,
     RegenerateFingerprint,
+    EnableCodexWs,
+    DisableCodexWs,
     Delete,
 }
 
@@ -407,10 +409,21 @@ pub fn build_admin_pool_batch_action_plan(
             AdminPoolBatchActionKind::RegenerateFingerprint,
             "fingerprint regenerated",
         ),
+        "enable_codex_ws" => (AdminPoolBatchActionKind::EnableCodexWs, "Codex WS enabled"),
+        "disable_codex_ws" => (
+            AdminPoolBatchActionKind::DisableCodexWs,
+            "Codex WS disabled",
+        ),
+        "drain_codex_ws" => {
+            return Err(
+                "drain_codex_ws is not supported yet; disable_codex_ws applies the configured soft-drain policy"
+                    .to_string(),
+            );
+        }
         "delete" => (AdminPoolBatchActionKind::Delete, "deleted"),
         _ => {
             return Err(format!(
-                "Invalid action: {action}. Supported locally: enable, disable, clear_proxy, set_proxy, regenerate_fingerprint, delete"
+                "Invalid action: {action}. Supported locally: enable, disable, clear_proxy, set_proxy, regenerate_fingerprint, enable_codex_ws, disable_codex_ws, delete"
             ));
         }
     };
@@ -530,7 +543,8 @@ pub fn build_admin_pool_selection_payload(keys: &[StoredProviderCatalogKey]) -> 
 mod tests {
     use super::{
         admin_pool_key_account_quota_exhausted, admin_pool_key_is_known_banned,
-        build_admin_pool_key_payload, AdminPoolKeyPayloadContext,
+        build_admin_pool_batch_action_plan, build_admin_pool_key_payload, AdminPoolBatchActionKind,
+        AdminPoolBatchActionRequest, AdminPoolKeyPayloadContext,
     };
     use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey;
     use serde_json::json;
@@ -547,6 +561,31 @@ mod tests {
         .expect("key should build");
         key.upstream_metadata = upstream_metadata;
         key
+    }
+
+    #[test]
+    fn parses_dedicated_codex_ws_batch_actions() {
+        for (action, expected) in [
+            ("enable_codex_ws", AdminPoolBatchActionKind::EnableCodexWs),
+            ("disable_codex_ws", AdminPoolBatchActionKind::DisableCodexWs),
+        ] {
+            let plan = build_admin_pool_batch_action_plan(AdminPoolBatchActionRequest {
+                key_ids: vec![" key-1 ".to_string(), "key-1".to_string()],
+                action: action.to_string(),
+                payload: None,
+            })
+            .expect("Codex WS action should parse");
+            assert_eq!(plan.action, expected);
+            assert_eq!(plan.key_ids, vec!["key-1"]);
+        }
+
+        let drain_error = build_admin_pool_batch_action_plan(AdminPoolBatchActionRequest {
+            key_ids: vec!["key-1".to_string()],
+            action: "drain_codex_ws".to_string(),
+            payload: None,
+        })
+        .expect_err("drain must not be silently emulated");
+        assert!(drain_error.contains("not supported"));
     }
 
     #[test]

@@ -81,6 +81,23 @@ fn classifies_openai_chat_and_responses_separately_from_embedding() {
 }
 
 #[test]
+fn classifies_get_responses_as_dedicated_websocket_route() {
+    let headers = headers(&[("authorization", "Bearer sk-test")]);
+    let uri: Uri = "/v1/responses".parse().expect("uri should parse");
+
+    let decision = classify_control_route(&http::Method::GET, &uri, &headers)
+        .expect("responses websocket route should classify");
+
+    assert_eq!(decision.route_family.as_deref(), Some("openai"));
+    assert_eq!(decision.route_kind.as_deref(), Some("responses_ws"));
+    assert_eq!(
+        decision.auth_endpoint_signature.as_deref(),
+        Some("openai:responses")
+    );
+    assert!(!decision.is_execution_runtime_candidate());
+}
+
+#[test]
 fn classifies_openai_image_generation_and_edit_but_not_variation() {
     let headers = headers(&[("authorization", "Bearer sk-test")]);
 

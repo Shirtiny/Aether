@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use aether_data::repository::candidate_selection::InMemoryMinimalCandidateSelectionReadRepository;
 use aether_data::repository::candidates::InMemoryRequestCandidateRepository;
@@ -7,19 +8,242 @@ use aether_data::repository::quota::InMemoryProviderQuotaRepository;
 use aether_data_contracts::repository::candidates::{
     RequestCandidateStatus, StoredRequestCandidate,
 };
+use aether_data_contracts::repository::provider_catalog::{
+    StoredProviderCatalogKey, StoredProviderCatalogProvider,
+};
+use aether_data_contracts::repository::quota::StoredProviderQuotaSnapshot;
 use aether_scheduler_core::ClientSessionAffinity;
+use async_trait::async_trait;
 
 use crate::cache::SchedulerAffinityTarget;
 use crate::data::GatewayDataState;
 use crate::scheduler::affinity::SCHEDULER_AFFINITY_TTL;
-use crate::AppState;
+use crate::scheduler::config::{SchedulerOrderingConfig, SchedulerSchedulingMode};
+use crate::scheduler::state::SchedulerRuntimeState;
+use crate::{AppState, GatewayError};
 
 use super::super::affinity::build_scheduler_affinity_cache_key;
 use super::super::{
+    list_selectable_candidates,
     list_selectable_candidates_for_required_capability_without_requested_model,
     list_selectable_candidates_for_required_capability_without_requested_model_with_auth_limit_signal,
 };
 use super::support::{sample_auth_snapshot, sample_provider, sample_row};
+
+#[derive(Default)]
+struct RecordingRuntimeState {
+    provider_reads: Mutex<Vec<Vec<String>>>,
+    key_reads: Mutex<Vec<Vec<String>>>,
+    quota_reads: Mutex<Vec<String>>,
+}
+
+#[async_trait]
+impl SchedulerRuntimeState for RecordingRuntimeState {
+    async fn read_provider_quota_snapshot(
+        &self,
+        provider_id: &str,
+    ) -> Result<Option<StoredProviderQuotaSnapshot>, GatewayError> {
+        self.quota_reads
+            .lock()
+            .expect("quota reads should lock")
+            .push(provider_id.to_string());
+        Ok(None)
+    }
+
+    async fn read_provider_catalog_providers_by_ids(
+        &self,
+        provider_ids: &[String],
+    ) -> Result<Vec<StoredProviderCatalogProvider>, GatewayError> {
+        self.provider_reads
+            .lock()
+            .expect("provider reads should lock")
+            .push(provider_ids.to_vec());
+        Ok(Vec::new())
+    }
+
+    async fn read_provider_catalog_keys_by_ids(
+        &self,
+        key_ids: &[String],
+    ) -> Result<Vec<StoredProviderCatalogKey>, GatewayError> {
+        self.key_reads
+            .lock()
+            .expect("key reads should lock")
+            .push(key_ids.to_vec());
+        Ok(Vec::new())
+    }
+
+    async fn read_recent_request_candidates(
+        &self,
+        _limit: usize,
+    ) -> Result<Vec<StoredRequestCandidate>, GatewayError> {
+        Ok(Vec::new())
+    }
+
+    async fn provider_session_has_risk_control_usage(
+        &self,
+        _provider_id: &str,
+        _session_key: &str,
+        _since_unix_secs: Option<u64>,
+    ) -> Result<bool, GatewayError> {
+        Ok(false)
+    }
+
+    async fn list_provider_ids_with_risk_control_usage_for_session(
+        &self,
+        _provider_ids: &[String],
+        _session_key: &str,
+        _since_unix_secs: Option<u64>,
+    ) -> Result<Vec<String>, GatewayError> {
+        Ok(Vec::new())
+    }
+
+    async fn provider_session_has_runtime_risk_control_block(
+        &self,
+        _provider_id: &str,
+        _session_key: &str,
+    ) -> Result<bool, GatewayError> {
+        Ok(false)
+    }
+
+    async fn provider_session_has_runtime_pool_sticky_collateral_block_if_enabled(
+        &self,
+        _provider_id: &str,
+        _sticky_session_token: &str,
+    ) -> Result<bool, GatewayError> {
+        Ok(false)
+    }
+
+    async fn session_has_runtime_risk_control_block(
+        &self,
+        _session_key: &str,
+    ) -> Result<bool, GatewayError> {
+        Ok(false)
+    }
+
+    async fn read_request_candidates_by_provider_id_and_client_session_key(
+        &self,
+        _provider_id: &str,
+        _session_key: &str,
+    ) -> Result<Vec<StoredRequestCandidate>, GatewayError> {
+        Ok(Vec::new())
+    }
+
+    async fn read_risk_control_request_candidate_provider_ids_by_client_session_key(
+        &self,
+        _provider_ids: &[String],
+        _session_key: &str,
+    ) -> Result<Vec<String>, GatewayError> {
+        Ok(Vec::new())
+    }
+
+    fn provider_key_rpm_reset_at(&self, _key_id: &str, _now_unix_secs: u64) -> Option<u64> {
+        None
+    }
+
+    fn read_cached_scheduler_affinity_target(
+        &self,
+        _cache_key: &str,
+        _ttl: Duration,
+    ) -> Option<SchedulerAffinityTarget> {
+        None
+    }
+
+    fn scheduler_affinity_epoch(&self) -> u64 {
+        1
+    }
+
+    fn remember_scheduler_affinity_target(
+        &self,
+        _cache_key: &str,
+        _target: SchedulerAffinityTarget,
+        _ttl: Duration,
+        _max_entries: usize,
+    ) {
+    }
+
+    fn remember_scheduler_affinity_target_for_epoch(
+        &self,
+        _cache_key: &str,
+        _target: SchedulerAffinityTarget,
+        _ttl: Duration,
+        _max_entries: usize,
+        _expected_epoch: Option<u64>,
+    ) -> bool {
+        true
+    }
+
+    async fn read_scheduler_ordering_config(
+        &self,
+    ) -> Result<SchedulerOrderingConfig, GatewayError> {
+        Ok(SchedulerOrderingConfig {
+            scheduling_mode: SchedulerSchedulingMode::FixedOrder,
+            ..SchedulerOrderingConfig::default()
+        })
+    }
+}
+
+#[tokio::test]
+async fn codex_ws_hard_filter_runs_before_runtime_catalog_and_quota_reads() {
+    let mut rejected = sample_row();
+    rejected.provider_id = "provider-rejected".to_string();
+    rejected.provider_name = "provider-rejected".to_string();
+    rejected.provider_type = "codex".to_string();
+    rejected.endpoint_id = "endpoint-rejected".to_string();
+    rejected.endpoint_api_format = "openai:responses".to_string();
+    rejected.endpoint_kind = Some("responses".to_string());
+    rejected.key_id = "key-rejected".to_string();
+    rejected.key_auth_type = "oauth".to_string();
+    rejected.key_api_formats = Some(vec!["openai:responses".to_string()]);
+    rejected.key_capabilities = Some(serde_json::json!({"codex_official_ws": "true"}));
+
+    let mut accepted = rejected.clone();
+    accepted.provider_id = "provider-accepted".to_string();
+    accepted.provider_name = "provider-accepted".to_string();
+    accepted.endpoint_id = "endpoint-accepted".to_string();
+    accepted.key_id = "key-accepted".to_string();
+    accepted.key_capabilities = Some(serde_json::json!({"codex_official_ws": true}));
+
+    let rows = Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(vec![
+        rejected, accepted,
+    ]));
+    let quotas = Arc::new(InMemoryProviderQuotaRepository::seed(Vec::new()));
+    let data = GatewayDataState::with_candidate_selection_and_quota_for_tests(rows, quotas);
+    let runtime = RecordingRuntimeState::default();
+    let required = serde_json::json!({"codex_official_ws": true});
+
+    let _ = list_selectable_candidates(
+        &data,
+        &runtime,
+        "openai:responses",
+        "gpt-4.1",
+        true,
+        Some(&required),
+        None,
+        None,
+        None,
+        100,
+        false,
+        false,
+    )
+    .await
+    .expect("selection should succeed");
+
+    let provider_reads = runtime
+        .provider_reads
+        .lock()
+        .expect("provider reads should lock");
+    assert!(!provider_reads.is_empty());
+    assert!(provider_reads
+        .iter()
+        .flatten()
+        .all(|id| id == "provider-accepted"));
+    let key_reads = runtime.key_reads.lock().expect("key reads should lock");
+    assert!(!key_reads.is_empty());
+    assert!(key_reads.iter().flatten().all(|id| id == "key-accepted"));
+    let quota_reads = runtime.quota_reads.lock().expect("quota reads should lock");
+    assert!(!quota_reads.is_empty());
+    assert!(quota_reads.iter().all(|id| id == "provider-accepted"));
+}
 
 #[tokio::test]
 async fn compatible_required_capability_prefers_matching_keys_without_hard_filtering() {

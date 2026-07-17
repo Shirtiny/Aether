@@ -220,7 +220,7 @@
             />
             <div class="grid gap-2 sm:grid-cols-2 lg:grid-cols-1">
               <Button
-                v-for="item in ACTION_OPTIONS"
+                v-for="item in availableActionOptions"
                 :key="item.value"
                 class="h-8 w-full px-3 text-xs"
                 :variant="getActionButtonVariant(item)"
@@ -324,6 +324,8 @@ type BatchActionValue =
   | 'set_proxy'
   | 'enable'
   | 'disable'
+  | 'enable_codex_ws'
+  | 'disable_codex_ws'
 
 type BatchActionOption = {
   value: BatchActionValue
@@ -376,6 +378,8 @@ const ACTION_OPTIONS: BatchActionOption[] = [
   { value: 'clear_proxy', label: '清除代理', hint: '移除账号独立代理，回退到提供商默认代理。' },
   { value: 'enable', label: '启用', hint: '批量启用账号，恢复可调度状态。' },
   { value: 'disable', label: '禁用', hint: '批量禁用账号，保留数据但停止调度。' },
+  { value: 'enable_codex_ws', label: '启用 Codex WS', hint: '只启用账号级官方 Codex WebSocket，不改变 HTTP 调度状态。' },
+  { value: 'disable_codex_ws', label: '关闭 Codex WS', hint: '软排空账号的 WebSocket 连接，HTTP 调度不受影响。' },
   { value: 'export', label: '导出凭据', hint: '仅导出 OAuth 凭据，其他类型账号将被跳过。' },
   { value: 'delete', label: '删除账号', hint: '永久删除账号数据，执行后不可恢复。', destructive: true },
 ]
@@ -383,6 +387,13 @@ const ACTION_OPTIONS: BatchActionOption[] = [
 const { success, warning, error: showError } = useToast()
 const { confirm } = useConfirm()
 const proxyNodesStore = useProxyNodesStore()
+const availableActionOptions = computed(() => {
+  const isCodex = props.providerType?.trim().toLowerCase() === 'codex'
+  return ACTION_OPTIONS.filter((option) => {
+    const codexWsAction = option.value === 'enable_codex_ws' || option.value === 'disable_codex_ws'
+    return !codexWsAction || isCodex
+  })
+})
 
 const loading = ref(false)
 const executing = ref(false)
@@ -930,6 +941,25 @@ async function executeAction(actionOverride?: BatchActionValue): Promise<void> {
 
         progressDone.value = Math.min(i + BATCH_SIZE, targetIds.length)
       }
+    } else if (selectedAction.value === 'enable_codex_ws' || selectedAction.value === 'disable_codex_ws') {
+      const oauthKeys = selectedKeys.filter((key) => key.auth_type.trim().toLowerCase() === 'oauth')
+      skippedCount += selectedKeys.length - oauthKeys.length
+      const counts = await runChunkedBatchAction({
+        items: oauthKeys.map((key) => key.key_id),
+        chunkSize: 2000,
+        runChunk: async (batch) => {
+          const result = await batchActionPoolKeys(props.providerId, {
+            key_ids: batch,
+            action: selectedAction.value as 'enable_codex_ws' | 'disable_codex_ws',
+          })
+          return { total: batch.length, success: result.affected }
+        },
+        onChunkDone: ({ processed }) => {
+          progressDone.value = processed + skippedCount
+        },
+      })
+      successCount += counts.success
+      failedCount += counts.failed
     } else if (['enable', 'disable', 'clear_proxy', 'set_proxy'].includes(selectedAction.value)) {
       const targetIds = selectedKeys.map((key) => key.key_id)
       const BATCH_SIZE = 2000

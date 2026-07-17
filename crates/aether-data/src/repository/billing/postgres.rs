@@ -1,12 +1,12 @@
 use async_trait::async_trait;
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, Postgres, QueryBuilder, Row};
 
 use super::{
     AdminBillingCollectorRecord, AdminBillingCollectorWriteInput, AdminBillingMutationOutcome,
     AdminBillingPresetApplyResult, AdminBillingRuleRecord, AdminBillingRuleWriteInput,
-    BillingPlanRecord, BillingPlanWriteInput, BillingReadRepository, PaymentGatewayConfigRecord,
-    PaymentGatewayConfigWriteInput, StoredBillingModelContext, UserDailyQuotaAvailabilityRecord,
-    UserPlanEntitlementRecord,
+    BillingModelContextByModelIdLookup, BillingPlanRecord, BillingPlanWriteInput,
+    BillingReadRepository, PaymentGatewayConfigRecord, PaymentGatewayConfigWriteInput,
+    StoredBillingModelContext, UserDailyQuotaAvailabilityRecord, UserPlanEntitlementRecord,
 };
 use crate::{error::SqlxResultExt, DataLayerError};
 
@@ -106,6 +106,30 @@ WHERE p.id = $1
 LIMIT 1
 "#;
 
+const BATCH_MODEL_CONTEXT_COLUMNS: &str = r#"
+  l.lookup_ordinal AS lookup_ordinal,
+  p.id AS provider_id,
+  CAST(p.billing_type AS TEXT) AS provider_billing_type,
+  pak.id AS provider_api_key_id,
+  pak.rate_multipliers AS provider_api_key_rate_multipliers,
+  pak.cache_ttl_minutes AS provider_api_key_cache_ttl_minutes,
+  gm.id AS global_model_id,
+  gm.name AS global_model_name,
+  gm.config AS global_model_config,
+  CAST(gm.default_price_per_request AS DOUBLE PRECISION) AS default_price_per_request,
+  gm.default_tiered_pricing AS default_tiered_pricing,
+  m.id AS model_id,
+  m.provider_model_name AS model_provider_model_name,
+  m.config AS model_config,
+  CAST(m.price_per_request AS DOUBLE PRECISION) AS model_price_per_request,
+  m.tiered_pricing AS model_tiered_pricing
+"#;
+
+// Four binds per lookup; this stays below every supported backend's normal
+// parameter limit while covering the request planner's 16-candidate bound in
+// a single database round trip.
+const BILLING_CONTEXT_BATCH_CHUNK_SIZE: usize = 128;
+
 #[derive(Debug, Clone)]
 pub struct SqlxBillingReadRepository {
     pool: PgPool,
@@ -167,6 +191,70 @@ impl BillingReadRepository for SqlxBillingReadRepository {
         model_id: &str,
     ) -> Result<Option<StoredBillingModelContext>, DataLayerError> {
         Self::find_model_context_by_model_id(self, provider_id, provider_api_key_id, model_id).await
+    }
+
+    async fn find_model_contexts_by_model_ids(
+        &self,
+        lookups: &[BillingModelContextByModelIdLookup],
+    ) -> Result<Vec<Option<StoredBillingModelContext>>, DataLayerError> {
+        if lookups.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut contexts = vec![None; lookups.len()];
+        for (chunk_index, chunk) in lookups.chunks(BILLING_CONTEXT_BATCH_CHUNK_SIZE).enumerate() {
+            let offset = chunk_index * BILLING_CONTEXT_BATCH_CHUNK_SIZE;
+            let mut query = QueryBuilder::<Postgres>::new(
+                "WITH lookups (lookup_ordinal, provider_id, provider_api_key_id, model_id) AS (",
+            );
+            query.push_values(chunk.iter().enumerate(), |mut row, (index, lookup)| {
+                row.push_bind((offset + index) as i64)
+                    .push_bind(&lookup.provider_id)
+                    .push_bind(lookup.provider_api_key_id.as_deref())
+                    .push_bind(&lookup.model_id);
+            });
+            query.push(") SELECT ");
+            query.push(BATCH_MODEL_CONTEXT_COLUMNS);
+            query.push(
+                r#"
+FROM lookups l
+INNER JOIN providers p
+  ON p.id = l.provider_id
+INNER JOIN models m
+  ON m.id = l.model_id
+ AND m.provider_id = p.id
+ AND m.is_active = TRUE
+INNER JOIN global_models gm
+  ON gm.id = m.global_model_id
+ AND gm.is_active = TRUE
+LEFT JOIN provider_api_keys pak
+  ON pak.id = l.provider_api_key_id
+ AND pak.provider_id = p.id
+ORDER BY l.lookup_ordinal
+"#,
+            );
+            let rows = query
+                .build()
+                .fetch_all(&self.pool)
+                .await
+                .map_postgres_err()?;
+            for row in rows {
+                let ordinal = row
+                    .try_get::<i64, _>("lookup_ordinal")
+                    .map_err(|error| DataLayerError::UnexpectedValue(error.to_string()))?;
+                let ordinal = usize::try_from(ordinal).map_err(|_| {
+                    DataLayerError::UnexpectedValue(
+                        "billing batch lookup ordinal is negative".to_string(),
+                    )
+                })?;
+                let slot = contexts.get_mut(ordinal).ok_or_else(|| {
+                    DataLayerError::UnexpectedValue(
+                        "billing batch lookup ordinal is out of range".to_string(),
+                    )
+                })?;
+                *slot = Some(map_row(&row)?);
+            }
+        }
+        Ok(contexts)
     }
 
     async fn admin_billing_enabled_default_value_exists(

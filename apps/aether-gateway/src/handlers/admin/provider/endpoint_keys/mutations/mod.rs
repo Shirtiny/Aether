@@ -1,4 +1,5 @@
 mod batch;
+mod codex_ws;
 mod create;
 mod delete;
 mod oauth_invalid;
@@ -17,6 +18,9 @@ pub(super) async fn maybe_handle(
     request_context: &AdminRequestContext<'_>,
     request_body: Option<&Bytes>,
 ) -> Result<Option<Response<Body>>, GatewayError> {
+    if let Some(response) = codex_ws::maybe_handle(state, request_context, request_body).await? {
+        return Ok(Some(response));
+    }
     if let Some(response) = update::maybe_handle(state, request_context, request_body).await? {
         return Ok(Some(response));
     }

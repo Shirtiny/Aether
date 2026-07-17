@@ -32,8 +32,10 @@ pub(crate) use self::classifier::{
     LocalFailoverInput,
 };
 pub(crate) use self::effects::{
-    apply_local_execution_effect, prepare_pool_attempt_started_effect,
-    release_pool_sticky_initialization_for_owner, LocalAdaptiveRateLimitEffect,
+    apply_local_execution_effect, apply_local_pool_terminal_effect_after_lease_release,
+    prepare_pool_attempt_started_effect, release_local_pool_key_lease_for_attempt,
+    release_local_pool_key_lease_for_attempt_strict, release_pool_sticky_initialization_for_owner,
+    stop_local_pool_sticky_init_renewer_for_attempt, LocalAdaptiveRateLimitEffect,
     LocalAdaptiveSuccessEffect, LocalAttemptFailureEffect, LocalExecutionEffect,
     LocalExecutionEffectContext, LocalHealthFailureEffect, LocalHealthSuccessEffect,
     LocalOAuthInvalidationEffect, LocalPoolErrorEffect, PoolAttemptStartCleanupGuard,
@@ -54,7 +56,8 @@ pub(crate) use self::recovery::{
 #[cfg(test)]
 pub(crate) use self::report_effects::clear_local_report_effect_caches_for_tests;
 pub(crate) use self::report_effects::{
-    apply_local_report_effect, store_local_gemini_file_mapping, LocalReportEffect,
+    apply_local_codex_quota_headers_effect, apply_local_report_effect,
+    store_local_gemini_file_mapping, LocalReportEffect,
 };
 
 pub(crate) async fn resolve_local_failover_analysis_for_attempt(

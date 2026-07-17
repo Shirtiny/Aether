@@ -341,6 +341,19 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
         }
     }
 
+    pub(crate) fn same_format_only(mut self) -> Self {
+        let client_api_format = self.client_api_format.clone();
+        let use_api_format_alias_match = self.use_api_format_alias_match;
+        self.candidate_api_formats.retain(|candidate_api_format| {
+            matches_client_api_format(
+                use_api_format_alias_match,
+                candidate_api_format,
+                &client_api_format,
+            )
+        });
+        self
+    }
+
     pub(crate) async fn next_page(
         &mut self,
     ) -> Result<

@@ -16,6 +16,15 @@ impl<'a> PlannerAppState<'a> {
             .await
     }
 
+    pub(crate) async fn read_provider_transport_snapshots(
+        self,
+        identities: &[(String, String, String)],
+    ) -> Result<Vec<Option<GatewayProviderTransportSnapshot>>, GatewayError> {
+        self.app()
+            .read_provider_transport_snapshots(identities)
+            .await
+    }
+
     pub(crate) async fn resolve_local_oauth_request_auth(
         self,
         transport: &GatewayProviderTransportSnapshot,

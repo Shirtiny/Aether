@@ -729,6 +729,68 @@ impl ProviderCatalogWriteRepository for InMemoryProviderCatalogReadRepository {
         Ok(stored.clone())
     }
 
+    async fn update_key_codex_ws_metadata(
+        &self,
+        key_id: &str,
+        enabled: bool,
+        websocket_transport_profile: Option<&serde_json::Value>,
+        updated_at_unix_secs: u64,
+    ) -> Result<bool, DataLayerError> {
+        let profile_patch = if enabled {
+            Some(
+                websocket_transport_profile
+                    .and_then(serde_json::Value::as_object)
+                    .ok_or_else(|| {
+                        DataLayerError::InvalidInput(
+                            "websocket_transport_profile must be an object when enabled"
+                                .to_string(),
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
+        let mut index = self
+            .index
+            .write()
+            .expect("provider catalog repository lock");
+        let Some(key) = index.keys.get_mut(key_id) else {
+            return Ok(false);
+        };
+
+        let capabilities = key
+            .capabilities
+            .get_or_insert_with(|| serde_json::json!({}));
+        if !capabilities.is_object() {
+            *capabilities = serde_json::json!({});
+        }
+        capabilities
+            .as_object_mut()
+            .expect("capabilities normalized to object")
+            .insert("codex_official_ws".to_string(), enabled.into());
+
+        if let Some(profile_patch) = profile_patch {
+            let fingerprint = key.fingerprint.get_or_insert_with(|| serde_json::json!({}));
+            if !fingerprint.is_object() {
+                *fingerprint = serde_json::json!({});
+            }
+            let profile = fingerprint
+                .as_object_mut()
+                .expect("fingerprint normalized to object")
+                .entry("websocket_transport_profile")
+                .or_insert_with(|| serde_json::json!({}));
+            if !profile.is_object() {
+                *profile = serde_json::json!({});
+            }
+            profile
+                .as_object_mut()
+                .expect("websocket profile normalized to object")
+                .extend(profile_patch.clone());
+        }
+        key.updated_at_unix_secs = Some(updated_at_unix_secs);
+        Ok(true)
+    }
+
     async fn update_key_upstream_metadata(
         &self,
         key_id: &str,
@@ -1308,6 +1370,62 @@ mod tests {
             .expect("keys should read");
         assert_eq!(reloaded[0].name, "updated");
         assert_eq!(reloaded[0].internal_priority, 7);
+    }
+
+    #[tokio::test]
+    async fn codex_ws_metadata_merge_preserves_unknown_json_and_http_active_state() {
+        let mut key = sample_key("key-1", "provider-1");
+        key.capabilities = Some(serde_json::json!({"retained_capability": true}));
+        key.fingerprint = Some(serde_json::json!({
+            "retained_fingerprint": "value",
+            "websocket_transport_profile": {"retained_nested": 7}
+        }));
+        let repository = InMemoryProviderCatalogReadRepository::seed(
+            vec![sample_provider("provider-1")],
+            vec![],
+            vec![key],
+        );
+        let manifest = serde_json::json!({
+            "schema_version": 1,
+            "profile_id": "profile-1"
+        });
+
+        assert!(repository
+            .update_key_codex_ws_metadata("key-1", true, Some(&manifest), 123)
+            .await
+            .expect("metadata should merge"));
+        assert!(repository
+            .update_key_codex_ws_metadata("key-1", false, None, 124)
+            .await
+            .expect("metadata should disable"));
+
+        let stored = repository
+            .list_keys_by_ids(&["key-1".to_string()])
+            .await
+            .expect("key should read")
+            .remove(0);
+        assert_eq!(
+            stored.capabilities.as_ref().unwrap()["retained_capability"],
+            true
+        );
+        assert_eq!(
+            stored.capabilities.as_ref().unwrap()["codex_official_ws"],
+            false
+        );
+        assert_eq!(
+            stored.fingerprint.as_ref().unwrap()["retained_fingerprint"],
+            "value"
+        );
+        assert_eq!(
+            stored.fingerprint.as_ref().unwrap()["websocket_transport_profile"]["retained_nested"],
+            7
+        );
+        assert_eq!(
+            stored.fingerprint.as_ref().unwrap()["websocket_transport_profile"]["profile_id"],
+            "profile-1"
+        );
+        assert!(stored.is_active);
+        assert_eq!(stored.updated_at_unix_secs, Some(124));
     }
 
     #[tokio::test]

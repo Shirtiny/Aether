@@ -300,6 +300,48 @@ pub fn build_local_openai_responses_request_body_with_model_directives(
     Some(provider_request_body)
 }
 
+/// Owned variant for large same-format Responses requests. It preserves all
+/// untouched JSON allocations and avoids retaining a second deep-cloned body.
+pub fn build_local_openai_responses_request_body_owned_with_model_directives(
+    mut body_json: Value,
+    mapped_model: &str,
+    require_streaming: bool,
+    enable_model_directives: bool,
+) -> Option<Value> {
+    let request_body_object = body_json.as_object_mut()?;
+    let require_body_stream_field = request_body_object.contains_key("stream");
+    let source_model = match request_body_object.get_mut("model") {
+        Some(model) => match std::mem::replace(model, Value::String(mapped_model.to_string())) {
+            Value::String(model) => Some(model),
+            _ => None,
+        },
+        None => {
+            request_body_object
+                .insert("model".to_string(), Value::String(mapped_model.to_string()));
+            None
+        }
+    };
+    if require_streaming {
+        request_body_object.insert("stream".to_string(), Value::Bool(true));
+    }
+    if enable_model_directives {
+        if let Some(source_model) = source_model.as_deref() {
+            crate::formats::shared::model_directives::apply_openai_responses_model_directive_overrides_from_model_in_place(
+                &mut body_json,
+                mapped_model,
+                source_model,
+            );
+        }
+    }
+    crate::formats::shared::request::enforce_request_body_stream_field(
+        &mut body_json,
+        "openai:responses",
+        require_streaming,
+        require_body_stream_field,
+    );
+    Some(body_json)
+}
+
 pub fn build_cross_format_openai_responses_request_body(
     body_json: &Value,
     mapped_model: &str,
@@ -402,6 +444,7 @@ mod tests {
         build_cross_format_openai_chat_request_body_with_model_directives,
         build_cross_format_openai_responses_request_body, build_local_openai_chat_request_body,
         build_local_openai_chat_request_body_with_model_directives,
+        build_local_openai_responses_request_body_owned_with_model_directives,
         build_local_openai_responses_request_body_with_model_directives,
     };
     use serde_json::{json, Value};
@@ -434,6 +477,32 @@ mod tests {
         assert_eq!(provider_request_body["model"], "gpt-5-upstream");
         assert_eq!(provider_request_body["messages"][0]["role"], "user");
         assert_eq!(provider_request_body["messages"][0]["content"], "hello");
+    }
+
+    #[test]
+    fn owned_openai_responses_body_matches_borrowed_and_moves_large_fields() {
+        let body_json = json!({
+            "model": "gpt-5.4-max-fast",
+            "input": "x".repeat(1024 * 1024),
+            "reasoning": {"effort": "low", "summary": "auto"},
+            "stream": false
+        });
+        let input_pointer = body_json["input"].as_str().expect("input string").as_ptr();
+        let borrowed = build_local_openai_responses_request_body_with_model_directives(
+            &body_json, "gpt-5.4", true, true,
+        )
+        .expect("borrowed request body");
+        let owned = build_local_openai_responses_request_body_owned_with_model_directives(
+            body_json, "gpt-5.4", true, true,
+        )
+        .expect("owned request body");
+
+        assert_eq!(owned, borrowed);
+        assert_eq!(
+            owned["input"].as_str().expect("owned input").as_ptr(),
+            input_pointer,
+            "owned normalization must preserve the large input allocation"
+        );
     }
 
     #[test]

@@ -596,7 +596,25 @@ where
             );
             return Ok(None);
         }
-        let mut sticky_init_cleanup = PoolAttemptStartCleanupGuard::new(self.state, context);
+        let mut sticky_init_cleanup = match PoolAttemptStartCleanupGuard::new(self.state, context) {
+            Ok(cleanup) => cleanup,
+            Err(_) => {
+                apply_local_execution_effect(
+                    self.state,
+                    context,
+                    LocalExecutionEffect::PoolAttemptAborted,
+                )
+                .await;
+                warn!(
+                    event_name = "pool_attempt_start_cleanup_backpressure",
+                    log_type = "ops",
+                    provider_id = %attempt.execution_plan().provider_id,
+                    key_id = %attempt.execution_plan().key_id,
+                    "gateway skipped a local sync candidate because sticky cleanup capacity was unavailable"
+                );
+                return Ok(None);
+            }
+        };
         let should_execute = prepare_pool_attempt_started_effect(self.state, context).await;
         if !should_execute {
             return Ok(None);
@@ -965,7 +983,25 @@ where
             );
             return Ok(None);
         }
-        let mut sticky_init_cleanup = PoolAttemptStartCleanupGuard::new(self.state, context);
+        let mut sticky_init_cleanup = match PoolAttemptStartCleanupGuard::new(self.state, context) {
+            Ok(cleanup) => cleanup,
+            Err(_) => {
+                apply_local_execution_effect(
+                    self.state,
+                    context,
+                    LocalExecutionEffect::PoolAttemptAborted,
+                )
+                .await;
+                warn!(
+                    event_name = "pool_attempt_start_cleanup_backpressure",
+                    log_type = "ops",
+                    provider_id = %plan.provider_id,
+                    key_id = %plan.key_id,
+                    "gateway skipped a local stream candidate because sticky cleanup capacity was unavailable"
+                );
+                return Ok(None);
+            }
+        };
         let should_execute = prepare_pool_attempt_started_effect(self.state, context).await;
         if !should_execute {
             return Ok(None);

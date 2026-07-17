@@ -135,6 +135,17 @@ pub(super) fn classify_admin_endpoints_family_route(
         ))
     } else if method == http::Method::PUT
         && normalized_path.starts_with("/api/admin/endpoints/keys/")
+        && normalized_path.ends_with("/codex-ws")
+    {
+        Some(classified(
+            "admin_proxy",
+            "endpoints_manage",
+            "update_key_codex_ws",
+            "admin:endpoints_manage",
+            false,
+        ))
+    } else if method == http::Method::PUT
+        && normalized_path.starts_with("/api/admin/endpoints/keys/")
     {
         Some(classified(
             "admin_proxy",

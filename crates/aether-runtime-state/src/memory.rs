@@ -253,6 +253,36 @@ impl MemoryRuntimeBackend {
         true
     }
 
+    pub(crate) async fn kv_set_if_value(
+        &self,
+        key: &str,
+        expected_value: &str,
+        value: String,
+        ttl: Duration,
+    ) -> bool {
+        let mut kv = self.kv.lock().await;
+        let now = Instant::now();
+        let Some(entry) = kv.get(key) else {
+            return false;
+        };
+        if entry.is_expired(now) {
+            kv.remove(key);
+            return false;
+        }
+        if entry.value != expected_value || ttl.is_zero() {
+            return false;
+        }
+        kv.insert(
+            key.to_string(),
+            MemoryKvEntry {
+                value,
+                inserted_at: now,
+                expires_at: Some(now + ttl),
+            },
+        );
+        true
+    }
+
     pub(crate) fn kv_set_nowait(&self, key: &str, value: String, ttl: Option<Duration>) -> bool {
         let Ok(mut kv) = self.kv.try_lock() else {
             return false;

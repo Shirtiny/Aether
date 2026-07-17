@@ -36,6 +36,8 @@ mod cache;
 mod client_session_affinity;
 mod clock;
 mod codex_profile;
+mod codex_ws;
+mod codex_ws_config;
 mod constants;
 mod control;
 mod data;
@@ -110,7 +112,7 @@ pub(crate) use self::state::{
     GatewayUserPreferenceView, GatewayUserSessionView, LocalExecutionRuntimeMissDiagnostic,
     LocalMutationOutcome, LocalProviderDeleteTaskState,
 };
-pub use self::state::{AppState, FrontdoorCorsConfig};
+pub use self::state::{AppState, CodexWsUsageReporterWorker, FrontdoorCorsConfig};
 pub use self::tunnel::{
     build_tunnel_runtime_router_with_state, tunnel_protocol, TunnelConnConfig,
     TunnelControlPlaneClient, TunnelRuntimeState,

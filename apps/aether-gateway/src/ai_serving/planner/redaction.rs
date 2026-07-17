@@ -147,6 +147,41 @@ pub(crate) async fn resolve_provider_chat_pii_redaction<'a>(
     })
 }
 
+/// Native Codex WS cannot safely run the existing request masking/response
+/// unmasking session without retaining a second payload. Check the effective
+/// policy before candidate fanout so the WS path fails closed instead of
+/// silently bypassing redaction.
+pub(crate) async fn codex_ws_pii_redaction_required(
+    state: &AppState,
+    auth_context: &ExecutionRuntimeAuthContext,
+    client_api_format: &str,
+) -> Result<bool, GatewayError> {
+    if ChatPiiRedactionRequestFormat::from_api_format(client_api_format).is_none() {
+        return Ok(false);
+    }
+    let runtime_config = read_chat_pii_redaction_runtime_config(state)
+        .await
+        .map_err(|err| {
+            warn!(
+                error = ?err,
+                "gateway failed to read Codex WS pii redaction runtime config"
+            );
+            GatewayError::Internal("chat pii redaction setup failed".to_string())
+        })?;
+    if !runtime_config.enabled {
+        return Ok(false);
+    }
+    let account_enabled = resolve_chat_pii_redaction_feature_settings(state, auth_context)
+        .await?
+        .effective_enabled();
+    Ok(
+        crate::ai_serving::transport::codex_official_ws_requires_http_redaction(
+            runtime_config.enabled,
+            account_enabled,
+        ),
+    )
+}
+
 async fn resolve_chat_pii_redaction_feature_settings(
     state: &AppState,
     auth_context: &ExecutionRuntimeAuthContext,

@@ -47,6 +47,25 @@ pub(crate) async fn apply_local_report_effect(state: &AppState, effect: LocalRep
     }
 }
 
+pub(crate) async fn apply_local_codex_quota_headers_effect(
+    state: &AppState,
+    key_id: &str,
+    headers: &BTreeMap<String, String>,
+) {
+    let report_context = serde_json::json!({"key_id": key_id});
+    if let Err(err) =
+        sync_codex_quota_from_response_headers(state, Some(&report_context), headers).await
+    {
+        warn!(
+            event_name = "codex_realtime_quota_sync_failed",
+            log_type = "ops",
+            key_id = %key_id,
+            error = ?err,
+            "gateway failed to persist codex realtime quota from WebSocket response headers"
+        );
+    }
+}
+
 fn codex_quota_header_fingerprint_cache() -> &'static HeaderFingerprintCache {
     CODEX_QUOTA_HEADER_FINGERPRINT_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }

@@ -8,7 +8,8 @@ use super::{
     StoredUserExportRow, Utc,
 };
 use aether_data_contracts::repository::billing::{
-    BillingReadRepository, StoredBillingModelContext, UserDailyQuotaAvailabilityRecord,
+    BillingModelContextByModelIdLookup, BillingReadRepository, StoredBillingModelContext,
+    UserDailyQuotaAvailabilityRecord,
 };
 use aether_data_contracts::DataLayerError;
 
@@ -28,6 +29,13 @@ impl BillingReadRepository for StaticDailyQuotaBillingRepository {
     ) -> Result<Option<StoredBillingModelContext>, DataLayerError> {
         let _ = (provider_id, provider_api_key_id, global_model_name);
         Ok(None)
+    }
+
+    async fn find_model_contexts_by_model_ids(
+        &self,
+        lookups: &[BillingModelContextByModelIdLookup],
+    ) -> Result<Vec<Option<StoredBillingModelContext>>, DataLayerError> {
+        Ok(vec![None; lookups.len()])
     }
 
     async fn find_user_daily_quota_availability(

@@ -3,6 +3,7 @@ use aether_data_contracts::repository::provider_catalog::{
 };
 use aether_data_contracts::DataLayerError;
 use async_trait::async_trait;
+use std::collections::{BTreeSet, HashMap};
 
 use super::auth_config::{absorb_local_auth_config_safe_subset, LocalAuthConfigAbsorption};
 
@@ -101,31 +102,111 @@ pub async fn read_provider_transport_snapshot(
     endpoint_id: &str,
     key_id: &str,
 ) -> Result<Option<GatewayProviderTransportSnapshot>, DataLayerError> {
+    let mut snapshots = read_provider_transport_snapshots(
+        state,
+        &[(
+            provider_id.to_string(),
+            endpoint_id.to_string(),
+            key_id.to_string(),
+        )],
+    )
+    .await?;
+    Ok(snapshots.pop().flatten())
+}
+
+/// Reads an ordered set of full transport snapshots with one batch lookup per catalog table.
+/// Missing identities remain `None` in the returned vector at the matching input position.
+pub async fn read_provider_transport_snapshots(
+    state: &dyn ProviderTransportSnapshotSource,
+    identities: &[(String, String, String)],
+) -> Result<Vec<Option<GatewayProviderTransportSnapshot>>, DataLayerError> {
+    read_provider_transport_snapshots_with_item_errors(state, identities)
+        .await?
+        .into_iter()
+        .collect()
+}
+
+/// Reads an ordered set of full transport snapshots with one batch lookup per catalog table.
+///
+/// Catalog read failures still fail the batch. Missing identities and snapshot mapping failures
+/// are returned per item so a caller that can skip one bad candidate does not lose the rest of
+/// the page.
+pub async fn read_provider_transport_snapshots_with_item_errors(
+    state: &dyn ProviderTransportSnapshotSource,
+    identities: &[(String, String, String)],
+) -> Result<Vec<Result<Option<GatewayProviderTransportSnapshot>, DataLayerError>>, DataLayerError> {
+    if identities.is_empty() {
+        return Ok(Vec::new());
+    }
     let Some(encryption_key) = state.encryption_key() else {
-        return Ok(None);
+        return Ok((0..identities.len()).map(|_| Ok(None)).collect());
     };
     let fallback_encryption_keys = fallback_encryption_keys(encryption_key);
+    let provider_ids = identities
+        .iter()
+        .map(|identity| identity.0.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let endpoint_ids = identities
+        .iter()
+        .map(|identity| identity.1.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let key_ids = identities
+        .iter()
+        .map(|identity| identity.2.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let (providers, endpoints, keys) = tokio::try_join!(
+        state.list_provider_catalog_providers_by_ids(&provider_ids),
+        state.list_provider_catalog_endpoints_by_ids(&endpoint_ids),
+        state.list_provider_catalog_keys_by_ids(&key_ids),
+    )?;
+    let providers = providers
+        .into_iter()
+        .map(|provider| (provider.id.clone(), provider))
+        .collect::<HashMap<_, _>>();
+    let endpoints = endpoints
+        .into_iter()
+        .map(|endpoint| (endpoint.id.clone(), endpoint))
+        .collect::<HashMap<_, _>>();
+    let keys = keys
+        .into_iter()
+        .map(|key| (key.id.clone(), key))
+        .collect::<HashMap<_, _>>();
 
-    let providers = state
-        .list_provider_catalog_providers_by_ids(&[provider_id.to_string()])
-        .await?;
-    let endpoints = state
-        .list_provider_catalog_endpoints_by_ids(&[endpoint_id.to_string()])
-        .await?;
-    let keys = state
-        .list_provider_catalog_keys_by_ids(&[key_id.to_string()])
-        .await?;
+    Ok(identities
+        .iter()
+        .map(|(provider_id, endpoint_id, key_id)| {
+            let (Some(provider), Some(endpoint), Some(key)) = (
+                providers.get(provider_id),
+                endpoints.get(endpoint_id),
+                keys.get(key_id),
+            ) else {
+                return Ok(None);
+            };
+            map_transport_snapshot(
+                provider.clone(),
+                endpoint.clone(),
+                key.clone(),
+                encryption_key,
+                &fallback_encryption_keys,
+            )
+            .map(Some)
+        })
+        .collect())
+}
 
-    let Some(provider) = providers.into_iter().next() else {
-        return Ok(None);
-    };
-    let Some(endpoint) = endpoints.into_iter().next() else {
-        return Ok(None);
-    };
-    let Some(key) = keys.into_iter().next() else {
-        return Ok(None);
-    };
-
+fn map_transport_snapshot(
+    provider: StoredProviderCatalogProvider,
+    endpoint: StoredProviderCatalogEndpoint,
+    key: StoredProviderCatalogKey,
+    encryption_key: &str,
+    fallback_encryption_keys: &[String],
+) -> Result<GatewayProviderTransportSnapshot, DataLayerError> {
     if endpoint.provider_id != provider.id {
         return Err(DataLayerError::UnexpectedValue(format!(
             "provider_endpoints.provider_id mismatch: expected {}, got {}",
@@ -141,12 +222,10 @@ pub async fn read_provider_transport_snapshot(
 
     let provider = map_provider(provider);
     let mut endpoint = map_endpoint(endpoint);
-    let mut key = map_key(key, encryption_key, &fallback_encryption_keys)?;
-
+    let mut key = map_key(key, encryption_key, fallback_encryption_keys)?;
     if provider.provider_type.trim().eq_ignore_ascii_case("grok") {
         endpoint.base_url = aether_oauth::provider::providers::effective_xai_base_url();
     }
-
     if let LocalAuthConfigAbsorption::Absorbed {
         base_url,
         header_rules,
@@ -162,15 +241,16 @@ pub async fn read_provider_transport_snapshot(
         endpoint.custom_path = custom_path;
         key.decrypted_auth_config = None;
     }
-
-    Ok(Some(GatewayProviderTransportSnapshot {
+    Ok(GatewayProviderTransportSnapshot {
         provider,
         endpoint,
         key,
-    }))
+    })
 }
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use aether_crypto::{encrypt_python_fernet_plaintext, DEVELOPMENT_ENCRYPTION_KEY};
     use aether_data_contracts::repository::provider_catalog::{
         StoredProviderCatalogEndpoint, StoredProviderCatalogKey, StoredProviderCatalogProvider,
@@ -182,7 +262,8 @@ mod tests {
         supports_local_openai_chat_transport, supports_local_standard_transport_with_network,
     };
     use super::{
-        map_key, read_provider_transport_snapshot, GatewayProviderTransportSnapshot,
+        map_key, read_provider_transport_snapshot, read_provider_transport_snapshots,
+        read_provider_transport_snapshots_with_item_errors, GatewayProviderTransportSnapshot,
         ProviderTransportSnapshotSource,
     };
 
@@ -191,6 +272,9 @@ mod tests {
         endpoints: Vec<StoredProviderCatalogEndpoint>,
         keys: Vec<StoredProviderCatalogKey>,
         encryption_key: Option<String>,
+        provider_reads: AtomicUsize,
+        endpoint_reads: AtomicUsize,
+        key_reads: AtomicUsize,
     }
 
     impl TestSnapshotSource {
@@ -205,6 +289,9 @@ mod tests {
                 endpoints,
                 keys,
                 encryption_key: encryption_key.into(),
+                provider_reads: AtomicUsize::new(0),
+                endpoint_reads: AtomicUsize::new(0),
+                key_reads: AtomicUsize::new(0),
             }
         }
     }
@@ -219,6 +306,7 @@ mod tests {
             &self,
             ids: &[String],
         ) -> Result<Vec<StoredProviderCatalogProvider>, DataLayerError> {
+            self.provider_reads.fetch_add(1, Ordering::Relaxed);
             Ok(self
                 .providers
                 .iter()
@@ -231,6 +319,7 @@ mod tests {
             &self,
             ids: &[String],
         ) -> Result<Vec<StoredProviderCatalogEndpoint>, DataLayerError> {
+            self.endpoint_reads.fetch_add(1, Ordering::Relaxed);
             Ok(self
                 .endpoints
                 .iter()
@@ -243,6 +332,7 @@ mod tests {
             &self,
             ids: &[String],
         ) -> Result<Vec<StoredProviderCatalogKey>, DataLayerError> {
+            self.key_reads.fetch_add(1, Ordering::Relaxed);
             Ok(self
                 .keys
                 .iter()
@@ -411,6 +501,85 @@ mod tests {
                 },
             }
         );
+    }
+
+    #[tokio::test]
+    async fn batch_snapshot_reads_each_catalog_table_once_for_many_candidates() {
+        let state = read_state();
+        let identities = (0..64)
+            .map(|_| {
+                (
+                    "provider-1".to_string(),
+                    "endpoint-1".to_string(),
+                    "key-1".to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let snapshots = read_provider_transport_snapshots(&state, &identities)
+            .await
+            .expect("batch snapshot read should succeed");
+
+        assert_eq!(snapshots.len(), identities.len());
+        assert!(snapshots.iter().all(Option::is_some));
+        assert_eq!(state.provider_reads.load(Ordering::Relaxed), 1);
+        assert_eq!(state.endpoint_reads.load(Ordering::Relaxed), 1);
+        assert_eq!(state.key_reads.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn batch_snapshot_isolates_missing_and_invalid_candidates() {
+        let mut valid_keys = (0..14)
+            .map(|index| {
+                let mut key = sample_key();
+                key.id = format!("key-{index}");
+                key.name = format!("key {index}");
+                key
+            })
+            .collect::<Vec<_>>();
+        let mut invalid_key = sample_key();
+        invalid_key.id = "key-invalid".to_string();
+        invalid_key.provider_id = "provider-other".to_string();
+        valid_keys.push(invalid_key);
+        let state = TestSnapshotSource::new(
+            vec![sample_provider()],
+            vec![sample_endpoint()],
+            valid_keys,
+            Some(DEVELOPMENT_ENCRYPTION_KEY.to_string()),
+        );
+        let mut identities = (0..14)
+            .map(|index| {
+                (
+                    "provider-1".to_string(),
+                    "endpoint-1".to_string(),
+                    format!("key-{index}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        identities.push((
+            "provider-1".to_string(),
+            "endpoint-1".to_string(),
+            "key-missing".to_string(),
+        ));
+        identities.push((
+            "provider-1".to_string(),
+            "endpoint-1".to_string(),
+            "key-invalid".to_string(),
+        ));
+
+        let snapshots = read_provider_transport_snapshots_with_item_errors(&state, &identities)
+            .await
+            .expect("catalog batch reads should succeed");
+
+        assert_eq!(snapshots.len(), 16);
+        assert!(snapshots[..14]
+            .iter()
+            .all(|snapshot| matches!(snapshot, Ok(Some(_)))));
+        assert!(matches!(snapshots[14], Ok(None)));
+        assert!(snapshots[15].is_err());
+        assert_eq!(state.provider_reads.load(Ordering::Relaxed), 1);
+        assert_eq!(state.endpoint_reads.load(Ordering::Relaxed), 1);
+        assert_eq!(state.key_reads.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

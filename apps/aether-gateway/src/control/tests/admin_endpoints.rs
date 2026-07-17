@@ -274,6 +274,20 @@ fn classifies_admin_update_key_as_admin_proxy_route() {
 }
 
 #[test]
+fn classifies_admin_update_key_codex_ws_before_generic_update() {
+    let headers = http::HeaderMap::new();
+    let uri: Uri = "/api/admin/endpoints/keys/key-codex/codex-ws"
+        .parse()
+        .expect("uri should parse");
+    let decision = classify_control_route(&http::Method::PUT, &uri, &headers)
+        .expect("decision should resolve");
+    assert_eq!(decision.route_class.as_deref(), Some("admin_proxy"));
+    assert_eq!(decision.route_family.as_deref(), Some("endpoints_manage"));
+    assert_eq!(decision.route_kind.as_deref(), Some("update_key_codex_ws"));
+    assert!(!decision.is_execution_runtime_candidate());
+}
+
+#[test]
 fn classifies_admin_delete_key_as_admin_proxy_route() {
     let headers = http::HeaderMap::new();
     let uri: Uri = "/api/admin/endpoints/keys/key-openai"

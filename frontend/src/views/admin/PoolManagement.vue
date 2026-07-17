@@ -523,6 +523,15 @@
                       <span class="text-sm truncate block">
                         {{ key.key_name || '未命名' }}
                       </span>
+                      <Badge
+                        v-if="canConfigureCodexWs(selectedProviderType, key)"
+                        variant="outline"
+                        class="h-4 shrink-0 px-1 text-[9px]"
+                        :class="getCodexWsBadgeClass(key)"
+                        :title="getCodexWsStatusTitle(key)"
+                      >
+                        {{ getCodexWsStatusLabel(key) }}
+                      </Badge>
                     </div>
                     <div class="flex items-center flex-wrap gap-1 text-[11px] text-muted-foreground mt-0.5 min-w-0">
                       <input
@@ -836,6 +845,15 @@
                 </TableCell>
                 <TableCell class="py-3 px-2 align-middle">
                   <div class="flex justify-center gap-0.5">
+                    <Switch
+                      v-if="canConfigureCodexWs(selectedProviderType, key)"
+                      class="mr-1 scale-75"
+                      :model-value="isCodexWsEnabled(key)"
+                      :disabled="togglingCodexWsKeyId === key.key_id"
+                      :title="getCodexWsToggleTitle(key)"
+                      :aria-label="getCodexWsToggleTitle(key)"
+                      @update:model-value="(enabled: boolean) => toggleCodexWs(key, enabled)"
+                    />
                     <Button
                       v-if="key.cooldown_reason"
                       variant="ghost"
@@ -965,8 +983,17 @@
             :class="keyUiStateMap[key.key_id]?.rowClass || ''"
           >
             <div class="space-y-3">
-              <div class="text-sm font-medium truncate">
-                {{ key.key_name || '未命名' }}
+              <div class="flex min-w-0 items-center gap-1.5">
+                <span class="truncate text-sm font-medium">{{ key.key_name || '未命名' }}</span>
+                <Badge
+                  v-if="canConfigureCodexWs(selectedProviderType, key)"
+                  variant="outline"
+                  class="h-4 shrink-0 px-1 text-[9px]"
+                  :class="getCodexWsBadgeClass(key)"
+                  :title="getCodexWsStatusTitle(key)"
+                >
+                  {{ getCodexWsStatusLabel(key) }}
+                </Badge>
               </div>
 
               <div class="flex flex-wrap items-center gap-1.5">
@@ -1235,6 +1262,19 @@
               </div>
 
               <div class="flex items-center gap-0.5">
+                <div
+                  v-if="canConfigureCodexWs(selectedProviderType, key)"
+                  class="flex min-w-12 items-center justify-center"
+                >
+                  <Switch
+                    class="scale-75"
+                    :model-value="isCodexWsEnabled(key)"
+                    :disabled="togglingCodexWsKeyId === key.key_id"
+                    :title="getCodexWsToggleTitle(key)"
+                    :aria-label="getCodexWsToggleTitle(key)"
+                    @update:model-value="(enabled: boolean) => toggleCodexWs(key, enabled)"
+                  />
+                </div>
                 <div
                   v-for="actionId in keyUiStateMap[key.key_id]?.mobileActionIds || []"
                   :key="`${key.key_id}-${actionId}`"
@@ -1586,6 +1626,7 @@ import {
   Popover,
   PopoverTrigger,
   PopoverContent,
+  Switch,
 } from '@/components/ui'
 import RefreshButton from '@/components/ui/refresh-button.vue'
 import { useToast } from '@/composables/useToast'
@@ -1605,8 +1646,10 @@ import {
   exportKey,
   deleteEndpointKey,
   updateProviderKey,
+  updateProviderKeyCodexWs,
   refreshProviderQuota,
   resetProviderKeyCycleStats,
+  type CodexWsAccountStatus,
 } from '@/api/endpoints/keys'
 import { consumeCodexResetCredit, refreshProviderOAuth } from '@/api/endpoints/provider_oauth'
 import type {
@@ -1644,6 +1687,11 @@ import {
   type PoolMobileTagItem,
   type PoolMobileTagTone,
 } from '@/features/pool/utils/poolMobilePresentation'
+import {
+  canConfigureCodexWs,
+  describeCodexWsAccount,
+  isCodexWsEnabled,
+} from '@/features/pool/utils/codexWsAccount'
 import {
   buildPoolManagementQueryPatch,
   readPoolManagementViewState,
@@ -2271,6 +2319,8 @@ const scoreDesktopPopoverOpenKeyId = ref<string | null>(null)
 const scoreMobilePopoverOpenKeyId = ref<string | null>(null)
 const deletingKeyId = ref<string | null>(null)
 const togglingKeyId = ref<string | null>(null)
+const togglingCodexWsKeyId = ref<string | null>(null)
+const codexWsStatusByKey = ref<Record<string, CodexWsAccountStatus>>({})
 const editingPriorityKeyId = ref<string | null>(null)
 const editingPriorityValue = ref<number>(0)
 const prioritySavingKeyId = ref<string | null>(null)
@@ -3267,6 +3317,47 @@ async function toggleKeyActive(key: PoolKeyDetail) {
     showError(parseApiError(err))
   } finally {
     togglingKeyId.value = null
+  }
+}
+
+function getCodexWsStatusLabel(key: PoolKeyDetail): string {
+  return describeCodexWsAccount(key, codexWsStatusByKey.value[key.key_id]).label
+}
+
+function getCodexWsStatusTitle(key: PoolKeyDetail): string {
+  return describeCodexWsAccount(key, codexWsStatusByKey.value[key.key_id]).title
+}
+
+function getCodexWsToggleTitle(key: PoolKeyDetail): string {
+  return isCodexWsEnabled(key) ? '关闭账号级 Codex WS' : '启用账号级 Codex WS'
+}
+
+function getCodexWsBadgeClass(key: PoolKeyDetail): string {
+  const tone = describeCodexWsAccount(key, codexWsStatusByKey.value[key.key_id]).tone
+  if (tone === 'success') return 'border-emerald-500/40 text-emerald-600 dark:text-emerald-400'
+  if (tone === 'warning') return 'border-amber-500/40 text-amber-600 dark:text-amber-400'
+  if (tone === 'danger') return 'border-destructive/40 text-destructive'
+  return 'text-muted-foreground'
+}
+
+async function toggleCodexWs(key: PoolKeyDetail, enabled: boolean): Promise<void> {
+  if (togglingCodexWsKeyId.value) return
+  togglingCodexWsKeyId.value = key.key_id
+  try {
+    const status = await updateProviderKeyCodexWs(key.key_id, enabled)
+    codexWsStatusByKey.value = {
+      ...codexWsStatusByKey.value,
+      [key.key_id]: status,
+    }
+    key.capabilities = {
+      ...(key.capabilities || {}),
+      codex_official_ws: status.configured,
+    }
+    success(status.configured ? '账号级 Codex WS 已启用' : '账号级 Codex WS 已关闭，HTTP 不受影响')
+  } catch (err) {
+    showError(parseApiError(err, enabled ? '启用 Codex WS 失败' : '关闭 Codex WS 失败'))
+  } finally {
+    togglingCodexWsKeyId.value = null
   }
 }
 

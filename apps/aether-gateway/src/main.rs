@@ -1237,6 +1237,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         );
         None
     };
+    let codex_ws_usage_reporter = state.spawn_codex_ws_usage_reporter()?;
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     let public_base_url = resolve_local_http_base_url(app_port)?;
     let frontdoor_health_url = format!("{public_base_url}/_gateway/health");
@@ -1263,14 +1264,25 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         "aether-gateway ready"
     );
 
-    axum::serve(
+    let serve_result = axum::serve(
         listener,
         router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .await?;
+    .await;
+    if !codex_ws_usage_reporter
+        .shutdown(std::time::Duration::from_secs(10))
+        .await
+    {
+        warn!(
+            event_name = "codex_ws_usage_reporter_shutdown_timeout",
+            log_type = "ops",
+            "Codex WS usage reporter did not drain before shutdown timeout"
+        );
+    }
     if let Some(background_tasks) = background_tasks {
         background_tasks.shutdown().await;
     }
+    serve_result?;
     Ok(())
 }
 

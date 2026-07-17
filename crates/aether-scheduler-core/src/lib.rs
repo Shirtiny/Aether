@@ -19,12 +19,15 @@ pub use auth::{
 };
 pub use candidate::{
     auth_api_key_concurrency_limit_reached, candidate_is_selectable_with_runtime_state,
-    candidate_runtime_skip_reason_with_state, candidate_supports_required_capability,
+    candidate_runtime_skip_reason_with_state, candidate_supports_codex_official_ws_capability,
+    candidate_supports_flat_required_capabilities, candidate_supports_required_capability,
     collect_global_model_names_for_required_capability, enumerate_minimal_candidate_selection,
     enumerate_minimal_candidate_selection_with_model_directives,
-    requested_capability_priority_for_candidate, CandidateRuntimeSelectabilityInput,
-    EnumerateMinimalCandidateSelectionInput, SchedulerMinimalCandidateSelectionCandidate,
-    SchedulerPriorityMode,
+    hard_filter_candidates_by_flat_required_capabilities,
+    hard_filter_candidates_for_codex_official_ws, requested_capability_priority_for_candidate,
+    CandidateRuntimeSelectabilityInput, EnumerateMinimalCandidateSelectionInput,
+    SchedulerMinimalCandidateSelectionCandidate, SchedulerPriorityMode,
+    CODEX_OFFICIAL_WS_REQUIRED_CAPABILITY,
 };
 pub use health::{
     aggregate_provider_key_health_score, any_provider_key_circuit_open_at,

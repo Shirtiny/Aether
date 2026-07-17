@@ -3,7 +3,7 @@ use tracing::warn;
 use crate::ai_serving::planner::candidate_materialization::{
     build_lazy_requested_model_execution_candidate_attempt_source_with_serving,
     materialize_local_execution_candidates_with_serving, LocalCandidateResolutionMode,
-    LocalExecutionCandidateAttemptSource,
+    LocalCandidateTransportReadMode, LocalExecutionCandidateAttemptSource,
 };
 use crate::ai_serving::planner::candidate_metadata::{
     build_local_execution_candidate_contract_metadata,
@@ -260,6 +260,7 @@ pub(super) async fn build_local_standard_candidate_attempt_source<'a>(
             false,
             LocalCandidatePreselectionKeyMode::ProviderEndpointKeyModelAndApiFormat,
             LocalCandidateResolutionMode::Standard,
+            LocalCandidateTransportReadMode::PerCandidate,
             move |eligible| {
                 let provider_api_format = eligible.provider_api_format.clone();
                 let (execution_strategy, conversion_mode) = ai_local_execution_contract_for_formats(

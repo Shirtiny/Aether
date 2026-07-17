@@ -3,6 +3,7 @@ pub mod auth;
 mod auth_config;
 mod cache;
 pub mod claude_code;
+mod codex_ws;
 pub mod conversion;
 mod diagnostics;
 pub mod gemini_cli;
@@ -30,6 +31,21 @@ pub mod windsurf;
 pub use aether_oauth as oauth;
 pub use auth::{build_passthrough_headers, ensure_upstream_auth_header};
 pub use cache::{provider_transport_snapshot_looks_refreshed, ProviderTransportSnapshotCacheKey};
+pub use codex_ws::{
+    build_codex_official_ws_planning_plan, codex_official_ws_requires_http_redaction,
+    resolve_codex_official_ws, resolve_codex_official_ws_admin_runtime_state,
+    CodexOfficialWsAdminRuntimeState, CodexOfficialWsGlobalFlags,
+    CodexOfficialWsIneligibilityReason, CodexOfficialWsIneligibilityReasons,
+    CodexOfficialWsPlanningPlanInput, CodexOfficialWsResolution,
+    CodexOfficialWsRuntimeEligibilityReason, CodexOfficialWsRuntimeEligibilityResolution,
+    CODEX_OFFICIAL_WS_BASE_PATH, CODEX_OFFICIAL_WS_CAPABILITY, CODEX_OFFICIAL_WS_CODEX_COMMIT,
+    CODEX_OFFICIAL_WS_CONTINUATION_MODE, CODEX_OFFICIAL_WS_CRYPTO_PROVIDER, CODEX_OFFICIAL_WS_HOST,
+    CODEX_OFFICIAL_WS_MAX_RETAINED_WRITE_BUFFER_CAPACITY_BYTES,
+    CODEX_OFFICIAL_WS_MAX_WRITE_BUFFER_SIZE_BYTES, CODEX_OFFICIAL_WS_PROFILE_FINGERPRINT_KEY,
+    CODEX_OFFICIAL_WS_PROFILE_ID, CODEX_OFFICIAL_WS_PROFILE_SCHEMA_VERSION,
+    CODEX_OFFICIAL_WS_TOKIO_TUNGSTENITE_REV, CODEX_OFFICIAL_WS_TUNGSTENITE_PATCH_ID,
+    CODEX_OFFICIAL_WS_TUNGSTENITE_REV, CODEX_OFFICIAL_WS_WRITE_BUFFER_SIZE_BYTES,
+};
 pub use conversion::{
     candidate_common_transport_skip_reason, candidate_transport_pair_skip_reason,
     request_conversion_direct_auth, request_conversion_enabled_for_transport,
@@ -102,8 +118,9 @@ pub use request_url::{
 pub use rules::{
     apply_local_body_rules, apply_local_body_rules_with_request_headers, apply_local_header_rules,
     apply_local_header_rules_with_request_headers, body_rules_are_locally_supported,
-    body_rules_handle_path, body_rules_have_enabled_rules, header_rules_are_locally_supported,
-    header_rules_have_enabled_rules,
+    body_rules_are_owned_materialization_safe, body_rules_handle_path,
+    body_rules_have_enabled_rules, header_rules_are_body_free_candidate_safe,
+    header_rules_are_locally_supported, header_rules_have_enabled_rules,
 };
 pub use same_format_provider::{
     build_same_format_provider_headers, build_same_format_provider_request_body,
@@ -117,8 +134,10 @@ pub use same_format_provider::{
     SameFormatProviderUpstreamUrlParams,
 };
 pub use snapshot::{
-    read_provider_transport_snapshot, GatewayProviderTransportSnapshot,
-    ProviderTransportSnapshotSource,
+    read_provider_transport_snapshot, read_provider_transport_snapshots,
+    read_provider_transport_snapshots_with_item_errors, GatewayProviderTransportEndpoint,
+    GatewayProviderTransportKey, GatewayProviderTransportProvider,
+    GatewayProviderTransportSnapshot, ProviderTransportSnapshotSource,
 };
 pub use standard::{
     apply_standard_provider_request_body_rules,

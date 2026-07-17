@@ -85,7 +85,8 @@ mod tests {
     use aether_data::repository::usage::InMemoryUsageReadRepository;
     use aether_data::repository::wallet::{InMemoryWalletRepository, StoredWalletSnapshot};
     use aether_data_contracts::repository::billing::{
-        BillingReadRepository, StoredBillingModelContext, UserDailyQuotaAvailabilityRecord,
+        BillingModelContextByModelIdLookup, BillingReadRepository, StoredBillingModelContext,
+        UserDailyQuotaAvailabilityRecord,
     };
     use aether_data_contracts::DataLayerError;
     use aether_wallet::{WalletAccessFailure, WalletLimitMode, WalletSnapshot, WalletStatus};
@@ -113,6 +114,13 @@ mod tests {
             _global_model_name: &str,
         ) -> Result<Option<StoredBillingModelContext>, DataLayerError> {
             Ok(None)
+        }
+
+        async fn find_model_contexts_by_model_ids(
+            &self,
+            lookups: &[BillingModelContextByModelIdLookup],
+        ) -> Result<Vec<Option<StoredBillingModelContext>>, DataLayerError> {
+            Ok(vec![None; lookups.len()])
         }
 
         async fn find_user_daily_quota_availability(

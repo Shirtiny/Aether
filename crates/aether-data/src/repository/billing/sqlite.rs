@@ -1,12 +1,12 @@
 use async_trait::async_trait;
-use sqlx::{sqlite::SqliteRow, Row};
+use sqlx::{sqlite::SqliteRow, QueryBuilder, Row, Sqlite};
 
 use super::{
     AdminBillingCollectorRecord, AdminBillingCollectorWriteInput, AdminBillingMutationOutcome,
     AdminBillingPresetApplyResult, AdminBillingRuleRecord, AdminBillingRuleWriteInput,
-    BillingPlanRecord, BillingPlanWriteInput, BillingReadRepository, PaymentGatewayConfigRecord,
-    PaymentGatewayConfigWriteInput, StoredBillingModelContext, UserDailyQuotaAvailabilityRecord,
-    UserPlanEntitlementRecord,
+    BillingModelContextByModelIdLookup, BillingPlanRecord, BillingPlanWriteInput,
+    BillingReadRepository, PaymentGatewayConfigRecord, PaymentGatewayConfigWriteInput,
+    StoredBillingModelContext, UserDailyQuotaAvailabilityRecord, UserPlanEntitlementRecord,
 };
 use crate::driver::sqlite::{sqlite_optional_real, SqlitePool};
 use crate::error::SqlResultExt;
@@ -34,6 +34,27 @@ SELECT
   m.created_at AS model_created_at
 FROM providers p
 "#;
+
+const BATCH_MODEL_CONTEXT_COLUMNS: &str = r#"
+  l.lookup_ordinal AS lookup_ordinal,
+  p.id AS provider_id,
+  p.billing_type AS provider_billing_type,
+  pak.id AS provider_api_key_id,
+  pak.rate_multipliers AS provider_api_key_rate_multipliers,
+  pak.cache_ttl_minutes AS provider_api_key_cache_ttl_minutes,
+  gm.id AS global_model_id,
+  gm.name AS global_model_name,
+  gm.config AS global_model_config,
+  CAST(gm.default_price_per_request AS REAL) AS default_price_per_request,
+  gm.default_tiered_pricing AS default_tiered_pricing,
+  m.id AS model_id,
+  m.provider_model_name AS model_provider_model_name,
+  m.config AS model_config,
+  CAST(m.price_per_request AS REAL) AS model_price_per_request,
+  m.tiered_pricing AS model_tiered_pricing
+"#;
+
+const BILLING_CONTEXT_BATCH_CHUNK_SIZE: usize = 128;
 
 #[derive(Debug, Clone)]
 pub struct SqliteBillingReadRepository {
@@ -128,6 +149,72 @@ LIMIT 1
         .await
         .map_sql_err()?;
         row.as_ref().map(map_row).transpose()
+    }
+
+    async fn find_model_contexts_by_model_ids(
+        &self,
+        lookups: &[BillingModelContextByModelIdLookup],
+    ) -> Result<Vec<Option<StoredBillingModelContext>>, DataLayerError> {
+        if lookups.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut contexts = vec![None; lookups.len()];
+        for (chunk_index, chunk) in lookups.chunks(BILLING_CONTEXT_BATCH_CHUNK_SIZE).enumerate() {
+            let offset = chunk_index * BILLING_CONTEXT_BATCH_CHUNK_SIZE;
+            let mut query = QueryBuilder::<Sqlite>::new(
+                "WITH lookups (lookup_ordinal, provider_id, provider_api_key_id, model_id) AS (",
+            );
+            for (index, lookup) in chunk.iter().enumerate() {
+                if index > 0 {
+                    query.push(" UNION ALL ");
+                }
+                query
+                    .push("SELECT ")
+                    .push_bind((offset + index) as i64)
+                    .push(", ")
+                    .push_bind(&lookup.provider_id)
+                    .push(", ")
+                    .push_bind(lookup.provider_api_key_id.as_deref())
+                    .push(", ")
+                    .push_bind(&lookup.model_id);
+            }
+            query.push(") SELECT ");
+            query.push(BATCH_MODEL_CONTEXT_COLUMNS);
+            query.push(
+                r#"
+FROM lookups l
+INNER JOIN providers p
+  ON p.id = l.provider_id
+INNER JOIN models m
+  ON m.id = l.model_id
+ AND m.provider_id = p.id
+ AND m.is_active = 1
+INNER JOIN global_models gm
+  ON gm.id = m.global_model_id
+ AND gm.is_active = 1
+LEFT JOIN provider_api_keys pak
+  ON pak.id = l.provider_api_key_id
+ AND pak.provider_id = p.id
+ORDER BY l.lookup_ordinal
+"#,
+            );
+            let rows = query.build().fetch_all(&self.pool).await.map_sql_err()?;
+            for row in rows {
+                let ordinal = row.try_get::<i64, _>("lookup_ordinal").map_sql_err()?;
+                let ordinal = usize::try_from(ordinal).map_err(|_| {
+                    DataLayerError::UnexpectedValue(
+                        "billing batch lookup ordinal is negative".to_string(),
+                    )
+                })?;
+                let slot = contexts.get_mut(ordinal).ok_or_else(|| {
+                    DataLayerError::UnexpectedValue(
+                        "billing batch lookup ordinal is out of range".to_string(),
+                    )
+                })?;
+                *slot = Some(map_row(&row)?);
+            }
+        }
+        Ok(contexts)
     }
 
     async fn admin_billing_enabled_default_value_exists(
@@ -1403,7 +1490,7 @@ mod tests {
     use crate::lifecycle::migrate::run_sqlite_migrations;
     use crate::repository::billing::{
         AdminBillingCollectorWriteInput, AdminBillingMutationOutcome, AdminBillingRuleWriteInput,
-        BillingPlanWriteInput, BillingReadRepository,
+        BillingModelContextByModelIdLookup, BillingPlanWriteInput, BillingReadRepository,
     };
 
     #[tokio::test]
@@ -1434,6 +1521,44 @@ mod tests {
             .expect("model lookup should run")
             .expect("context should exist");
         assert_eq!(by_model_id.global_model_name, "gpt-5");
+
+        let batch = repository
+            .find_model_contexts_by_model_ids(&[
+                BillingModelContextByModelIdLookup {
+                    provider_id: "provider-1".to_string(),
+                    provider_api_key_id: Some("key-1".to_string()),
+                    model_id: "model-1".to_string(),
+                },
+                BillingModelContextByModelIdLookup {
+                    provider_id: "provider-1".to_string(),
+                    provider_api_key_id: Some("key-1".to_string()),
+                    model_id: "missing-model".to_string(),
+                },
+                BillingModelContextByModelIdLookup {
+                    provider_id: "provider-1".to_string(),
+                    provider_api_key_id: None,
+                    model_id: "model-1".to_string(),
+                },
+            ])
+            .await
+            .expect("batch model lookup should run");
+        assert_eq!(batch.len(), 3);
+        assert_eq!(
+            batch[0]
+                .as_ref()
+                .and_then(|value| value.model_id.as_deref()),
+            Some("model-1")
+        );
+        assert!(batch[1].is_none());
+        assert_eq!(
+            batch[2]
+                .as_ref()
+                .and_then(|value| value.model_id.as_deref()),
+            Some("model-1")
+        );
+        assert!(batch[2]
+            .as_ref()
+            .is_some_and(|value| value.provider_api_key_id.is_none()));
     }
 
     #[tokio::test]

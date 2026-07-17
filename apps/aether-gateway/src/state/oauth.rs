@@ -18,8 +18,9 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use flate2::read::{DeflateDecoder, GzDecoder};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aether_crypto::encrypt_python_fernet_plaintext;
@@ -473,6 +474,8 @@ impl<'a> provider_transport::LocalOAuthHttpExecutor for GatewayLocalOAuthHttpExe
 
 impl AppState {
     pub(crate) fn clear_provider_transport_snapshot_cache(&self) {
+        self.provider_transport_snapshot_cache_epoch
+            .fetch_add(1, Ordering::AcqRel);
         self.provider_transport_snapshot_cache
             .lock()
             .expect("provider transport snapshot cache should lock")
@@ -483,12 +486,17 @@ impl AppState {
         &self,
         cache_key: &ProviderTransportSnapshotCacheKey,
     ) -> Option<provider_transport::GatewayProviderTransportSnapshot> {
+        let current_epoch = self
+            .provider_transport_snapshot_cache_epoch
+            .load(Ordering::Acquire);
         let mut cache = self
             .provider_transport_snapshot_cache
             .lock()
             .expect("provider transport snapshot cache should lock");
         let cached = cache.get(cache_key).cloned()?;
-        if cached.loaded_at.elapsed() <= PROVIDER_TRANSPORT_SNAPSHOT_CACHE_TTL {
+        if cached.epoch == current_epoch
+            && cached.loaded_at.elapsed() <= PROVIDER_TRANSPORT_SNAPSHOT_CACHE_TTL
+        {
             return Some(cached.snapshot);
         }
         cache.remove(cache_key);
@@ -499,14 +507,23 @@ impl AppState {
         &self,
         cache_key: ProviderTransportSnapshotCacheKey,
         snapshot: provider_transport::GatewayProviderTransportSnapshot,
+        load_epoch: u64,
     ) {
         let mut cache = self
             .provider_transport_snapshot_cache
             .lock()
             .expect("provider transport snapshot cache should lock");
+        if self
+            .provider_transport_snapshot_cache_epoch
+            .load(Ordering::Acquire)
+            != load_epoch
+        {
+            return;
+        }
         if cache.len() >= PROVIDER_TRANSPORT_SNAPSHOT_CACHE_MAX_ENTRIES {
             cache.retain(|_, entry| {
-                entry.loaded_at.elapsed() <= PROVIDER_TRANSPORT_SNAPSHOT_CACHE_TTL
+                entry.epoch == load_epoch
+                    && entry.loaded_at.elapsed() <= PROVIDER_TRANSPORT_SNAPSHOT_CACHE_TTL
             });
             if cache.len() >= PROVIDER_TRANSPORT_SNAPSHOT_CACHE_MAX_ENTRIES {
                 cache.clear();
@@ -515,6 +532,7 @@ impl AppState {
         cache.insert(
             cache_key,
             CachedProviderTransportSnapshot {
+                epoch: load_epoch,
                 loaded_at: std::time::Instant::now(),
                 snapshot,
             },
@@ -538,18 +556,21 @@ impl AppState {
         &self,
         mut snapshot: crate::provider_transport::GatewayProviderTransportSnapshot,
     ) -> crate::provider_transport::GatewayProviderTransportSnapshot {
+        if self.global_format_conversion_enabled().await {
+            snapshot.provider.enable_format_conversion = true;
+        }
+        snapshot
+    }
+
+    async fn global_format_conversion_enabled(&self) -> bool {
         let global_config =
             Box::pin(self.read_system_config_json_value("enable_format_conversion"))
                 .await
                 .ok()
                 .flatten();
-        let global_enabled = global_config
+        global_config
             .and_then(|value| value.as_bool())
-            .unwrap_or(false);
-        if global_enabled {
-            snapshot.provider.enable_format_conversion = true;
-        }
-        snapshot
+            .unwrap_or(false)
     }
 
     pub(crate) async fn list_enabled_oauth_module_providers(
@@ -832,11 +853,14 @@ impl AppState {
             ));
         }
 
+        let load_epoch = self
+            .provider_transport_snapshot_cache_epoch
+            .load(Ordering::Acquire);
         let snapshot = self
             .read_provider_transport_snapshot_uncached(provider_id, endpoint_id, key_id)
             .await?;
         if let Some(snapshot) = snapshot.as_ref() {
-            self.put_cached_provider_transport_snapshot(cache_key, snapshot.clone());
+            self.put_cached_provider_transport_snapshot(cache_key, snapshot.clone(), load_epoch);
         }
         match snapshot {
             Some(snapshot) => Ok(Some(
@@ -844,6 +868,103 @@ impl AppState {
             )),
             None => Ok(None),
         }
+    }
+
+    pub(crate) async fn read_provider_transport_snapshots(
+        &self,
+        identities: &[(String, String, String)],
+    ) -> Result<
+        Vec<Option<crate::provider_transport::GatewayProviderTransportSnapshot>>,
+        GatewayError,
+    > {
+        if identities.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut snapshots = (0..identities.len()).map(|_| None).collect::<Vec<_>>();
+        let mut missing_positions =
+            HashMap::<(String, String, String), Vec<usize>>::with_capacity(identities.len());
+        let mut missing_identities = Vec::with_capacity(identities.len());
+
+        for (index, identity) in identities.iter().enumerate() {
+            let cache_key = ProviderTransportSnapshotCacheKey::new(
+                identity.0.as_str(),
+                identity.1.as_str(),
+                identity.2.as_str(),
+            );
+            if let Some(snapshot) = cache_key
+                .as_ref()
+                .and_then(|cache_key| self.get_cached_provider_transport_snapshot(cache_key))
+            {
+                snapshots[index] = Some(snapshot);
+                continue;
+            }
+
+            match missing_positions.entry(identity.clone()) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    entry.get_mut().push(index);
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    missing_identities.push(identity.clone());
+                    entry.insert(vec![index]);
+                }
+            }
+        }
+
+        if !missing_identities.is_empty() {
+            let load_epoch = self
+                .provider_transport_snapshot_cache_epoch
+                .load(Ordering::Acquire);
+            let loaded = provider_transport::read_provider_transport_snapshots_with_item_errors(
+                self.data.as_ref(),
+                &missing_identities,
+            )
+            .await
+            .map_err(|error| GatewayError::Internal(error.to_string()))?;
+
+            for (identity, loaded) in missing_identities.into_iter().zip(loaded) {
+                let Some(positions) = missing_positions.remove(&identity) else {
+                    continue;
+                };
+                match loaded {
+                    Ok(Some(snapshot)) => {
+                        if let Some(cache_key) = ProviderTransportSnapshotCacheKey::new(
+                            identity.0.as_str(),
+                            identity.1.as_str(),
+                            identity.2.as_str(),
+                        ) {
+                            self.put_cached_provider_transport_snapshot(
+                                cache_key,
+                                snapshot.clone(),
+                                load_epoch,
+                            );
+                        }
+                        for index in positions {
+                            snapshots[index] = Some(snapshot.clone());
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            event_name = "candidate_resolution_transport_batch_item_load_failed",
+                            log_type = "event",
+                            provider_id = %identity.0,
+                            endpoint_id = %identity.1,
+                            key_id = %identity.2,
+                            error = ?error,
+                            "failed to map one provider transport from a candidate batch"
+                        );
+                    }
+                }
+            }
+        }
+
+        if snapshots.iter().any(Option::is_some) && self.global_format_conversion_enabled().await {
+            for snapshot in snapshots.iter_mut().flatten() {
+                snapshot.provider.enable_format_conversion = true;
+            }
+        }
+        Ok(snapshots)
     }
 
     pub(crate) async fn update_provider_catalog_key_oauth_credentials(
@@ -1636,7 +1757,7 @@ fn local_oauth_request_uses_direct_client(url: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{atomic::Ordering, Arc};
 
     use aether_data::repository::provider_catalog::InMemoryProviderCatalogReadRepository;
     use aether_data_contracts::repository::provider_catalog::{
@@ -1756,6 +1877,43 @@ mod tests {
             .expect("snapshot read should succeed")
             .expect("snapshot should exist");
         assert!(!snapshot.provider.enable_format_conversion);
+    }
+
+    #[tokio::test]
+    async fn stale_transport_snapshot_load_cannot_repopulate_new_cache_epoch() {
+        let state = state_with_global_format_conversion(false);
+        let snapshot = state
+            .read_provider_transport_snapshot_uncached("provider-1", "endpoint-1", "key-1")
+            .await
+            .expect("snapshot read should succeed")
+            .expect("snapshot should exist");
+        let cache_key = crate::provider_transport::ProviderTransportSnapshotCacheKey::new(
+            "provider-1",
+            "endpoint-1",
+            "key-1",
+        )
+        .expect("cache key should build");
+        let stale_epoch = state
+            .provider_transport_snapshot_cache_epoch
+            .load(Ordering::Acquire);
+
+        state.clear_provider_transport_snapshot_cache();
+        state.put_cached_provider_transport_snapshot(
+            cache_key.clone(),
+            snapshot.clone(),
+            stale_epoch,
+        );
+        assert!(state
+            .get_cached_provider_transport_snapshot(&cache_key)
+            .is_none());
+
+        let current_epoch = state
+            .provider_transport_snapshot_cache_epoch
+            .load(Ordering::Acquire);
+        state.put_cached_provider_transport_snapshot(cache_key.clone(), snapshot, current_epoch);
+        assert!(state
+            .get_cached_provider_transport_snapshot(&cache_key)
+            .is_some());
     }
 
     #[test]

@@ -3,8 +3,8 @@ mod memory;
 pub mod redis;
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub use crate::redis::{
@@ -17,7 +17,7 @@ use async_trait::async_trait;
 pub use error::DataLayerError;
 use memory::MemoryRuntimeBackend;
 pub use memory::MemoryRuntimeStateConfig;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -392,6 +392,26 @@ impl RuntimeState {
         }
     }
 
+    pub async fn kv_set_if_value(
+        &self,
+        key: &str,
+        expected_value: &str,
+        value: impl Into<String> + Send,
+        ttl: Duration,
+    ) -> Result<bool, DataLayerError> {
+        match self.backend.as_ref() {
+            RuntimeStateBackend::Memory(memory) => Ok(memory
+                .kv_set_if_value(key, expected_value, value.into(), ttl)
+                .await),
+            RuntimeStateBackend::Redis(redis) => {
+                redis
+                    .runtime
+                    .kv_set_if_value(key, expected_value, value.into(), ttl)
+                    .await
+            }
+        }
+    }
+
     pub async fn kv_get(&self, key: &str) -> Result<Option<String>, DataLayerError> {
         match self.backend.as_ref() {
             RuntimeStateBackend::Memory(memory) => Ok(memory.kv_get(key).await),
@@ -752,6 +772,16 @@ impl RuntimeState {
         config: RuntimeSemaphoreConfig,
     ) -> Result<RuntimeSemaphore, RuntimeSemaphoreError> {
         RuntimeSemaphore::new(self.clone(), gate, limit, config)
+    }
+
+    pub fn keyed_semaphore(
+        &self,
+        gate: &'static str,
+        resource: &str,
+        limit: usize,
+        config: RuntimeSemaphoreConfig,
+    ) -> Result<RuntimeSemaphore, RuntimeSemaphoreError> {
+        RuntimeSemaphore::new_keyed(self.clone(), gate, resource, limit, config)
     }
 }
 
@@ -1199,6 +1229,38 @@ impl RuntimeSemaphore {
         limit: usize,
         config: RuntimeSemaphoreConfig,
     ) -> Result<Self, RuntimeSemaphoreError> {
+        Self::new_with_key(runtime, gate, format!("admission:{gate}"), limit, config)
+    }
+
+    fn new_keyed(
+        runtime: RuntimeState,
+        gate: &'static str,
+        resource: &str,
+        limit: usize,
+        config: RuntimeSemaphoreConfig,
+    ) -> Result<Self, RuntimeSemaphoreError> {
+        let resource = resource.trim();
+        if resource.is_empty() {
+            return Err(RuntimeSemaphoreError::InvalidConfiguration(
+                "runtime keyed semaphore resource cannot be empty".to_string(),
+            ));
+        }
+        Self::new_with_key(
+            runtime,
+            gate,
+            format!("admission:{gate}:{resource}"),
+            limit,
+            config,
+        )
+    }
+
+    fn new_with_key(
+        runtime: RuntimeState,
+        gate: &'static str,
+        key: String,
+        limit: usize,
+        config: RuntimeSemaphoreConfig,
+    ) -> Result<Self, RuntimeSemaphoreError> {
         if limit == 0 {
             return Err(RuntimeSemaphoreError::InvalidConfiguration(
                 "runtime semaphore limit must be positive".to_string(),
@@ -1216,7 +1278,7 @@ impl RuntimeSemaphore {
         }
         Ok(Self {
             state: Arc::new(RuntimeSemaphoreState {
-                key: format!("admission:{gate}"),
+                key,
                 runtime,
                 gate,
                 limit,
@@ -1247,24 +1309,169 @@ impl RuntimeSemaphore {
 #[derive(Debug)]
 pub struct RuntimeSemaphorePermit {
     state: Arc<RuntimeSemaphoreState>,
-    token: String,
+    token: Option<String>,
     renew_task: JoinHandle<()>,
+    lease_signal: Arc<RuntimeSemaphoreLeaseSignal>,
+}
+
+#[derive(Debug)]
+struct RuntimeSemaphoreLeaseSignal {
+    lost: AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl RuntimeSemaphoreLeaseSignal {
+    fn mark_lost(&self) {
+        if !self.lost.swap(true, Ordering::AcqRel) {
+            self.notify.notify_waiters();
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeSemaphoreLeaseStatus {
+    signal: Arc<RuntimeSemaphoreLeaseSignal>,
+}
+
+impl RuntimeSemaphoreLeaseStatus {
+    pub fn is_valid(&self) -> bool {
+        !self.signal.lost.load(Ordering::Acquire)
+    }
+
+    pub async fn lost(&self) {
+        loop {
+            let notified = self.signal.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if !self.is_valid() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+const RUNTIME_SEMAPHORE_RELEASE_QUEUE_CAPACITY: usize = 4_096;
+const RUNTIME_SEMAPHORE_RELEASE_CONCURRENCY: usize = 16;
+static RUNTIME_SEMAPHORE_RELEASE_ENQUEUE_FAILURE_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+struct RuntimeSemaphoreReleaseJob {
+    state: Arc<RuntimeSemaphoreState>,
+    token: String,
+}
+
+struct RuntimeSemaphoreReleaseQueue {
+    sender: tokio::sync::mpsc::Sender<RuntimeSemaphoreReleaseJob>,
+}
+
+static RUNTIME_SEMAPHORE_RELEASE_QUEUE: LazyLock<RuntimeSemaphoreReleaseQueue> =
+    LazyLock::new(|| {
+        let (sender, receiver) =
+            tokio::sync::mpsc::channel(RUNTIME_SEMAPHORE_RELEASE_QUEUE_CAPACITY);
+        std::thread::Builder::new()
+            .name("runtime-semaphore-release".into())
+            .stack_size(512 * 1024)
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("runtime semaphore release runtime should initialize");
+                runtime.block_on(run_runtime_semaphore_release_worker(receiver));
+            })
+            .expect("runtime semaphore release worker should start");
+        RuntimeSemaphoreReleaseQueue { sender }
+    });
+
+impl RuntimeSemaphorePermit {
+    pub fn lease_status(&self) -> RuntimeSemaphoreLeaseStatus {
+        RuntimeSemaphoreLeaseStatus {
+            signal: Arc::clone(&self.lease_signal),
+        }
+    }
+
+    /// Release the backend lease before returning. Cancellation and backend failures remain safe:
+    /// `Drop` moves the still-owned token into the bounded release queue.
+    pub async fn release(mut self) -> Result<(), RuntimeSemaphoreError> {
+        self.renew_task.abort();
+        let _ = (&mut self.renew_task).await;
+        let Some(token) = self.token.as_deref() else {
+            return Ok(());
+        };
+        self.state.release(token).await?;
+        self.token.take();
+        Ok(())
+    }
 }
 
 impl Drop for RuntimeSemaphorePermit {
     fn drop(&mut self) {
         self.renew_task.abort();
-        let state = Arc::clone(&self.state);
-        let token = self.token.clone();
-        tokio::spawn(async move {
-            if let Err(err) = state.release(&token).await {
-                warn!(
-                    gate = state.gate,
-                    error = %err,
-                    "failed to release runtime semaphore permit"
-                );
-            }
+        let Some(token) = self.token.take() else {
+            return;
+        };
+        enqueue_runtime_semaphore_release(RuntimeSemaphoreReleaseJob {
+            state: Arc::clone(&self.state),
+            token,
         });
+    }
+}
+
+fn enqueue_runtime_semaphore_release(job: RuntimeSemaphoreReleaseJob) {
+    let gate = job.state.gate;
+    let result = RUNTIME_SEMAPHORE_RELEASE_QUEUE.sender.try_send(job);
+    let Err(error) = result else {
+        return;
+    };
+    let queue_state = match error {
+        tokio::sync::mpsc::error::TrySendError::Full(_) => "full",
+        tokio::sync::mpsc::error::TrySendError::Closed(_) => "closed",
+    };
+    let failure_total =
+        RUNTIME_SEMAPHORE_RELEASE_ENQUEUE_FAILURE_TOTAL.fetch_add(1, Ordering::AcqRel) + 1;
+    if failure_total.is_power_of_two() {
+        warn!(
+            gate,
+            queue_state,
+            queue_capacity = RUNTIME_SEMAPHORE_RELEASE_QUEUE_CAPACITY,
+            failure_total,
+            fallback = "lease_ttl_expiry",
+            "runtime semaphore release queue could not accept a permit"
+        );
+    }
+}
+
+async fn run_runtime_semaphore_release_worker(
+    mut receiver: tokio::sync::mpsc::Receiver<RuntimeSemaphoreReleaseJob>,
+) {
+    let mut pending = JoinSet::new();
+    loop {
+        tokio::select! {
+            job = receiver.recv(), if pending.len() < RUNTIME_SEMAPHORE_RELEASE_CONCURRENCY => {
+                let Some(job) = job else {
+                    break;
+                };
+                pending.spawn(async move {
+                    if let Err(error) = job.state.release(&job.token).await {
+                        warn!(
+                            gate = job.state.gate,
+                            error = %error,
+                            fallback = "lease_ttl_expiry",
+                            "failed to release runtime semaphore permit"
+                        );
+                    }
+                });
+            }
+            result = pending.join_next(), if !pending.is_empty() => {
+                if let Some(Err(error)) = result {
+                    warn!(error = %error, "runtime semaphore release worker task failed");
+                }
+            }
+        }
+    }
+    while let Some(result) = pending.join_next().await {
+        if let Err(error) = result {
+            warn!(error = %error, "runtime semaphore release worker task failed while draining");
+        }
     }
 }
 
@@ -1272,6 +1479,7 @@ impl RuntimeSemaphoreState {
     async fn try_acquire(
         self: &Arc<Self>,
     ) -> Result<RuntimeSemaphorePermit, RuntimeSemaphoreError> {
+        LazyLock::force(&RUNTIME_SEMAPHORE_RELEASE_QUEUE);
         let token = format!("{}:{}", self.gate, Uuid::new_v4());
         let in_flight = match self.runtime.backend.as_ref() {
             RuntimeStateBackend::Memory(memory) => memory
@@ -1296,24 +1504,70 @@ impl RuntimeSemaphoreState {
 
         let renew_state = Arc::clone(self);
         let renew_token = token.clone();
+        let lease_signal = Arc::new(RuntimeSemaphoreLeaseSignal {
+            lost: AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+        });
+        let renew_lease_signal = Arc::clone(&lease_signal);
         let renew_task = tokio::spawn(async move {
             let interval = Duration::from_millis(renew_state.config.renew_interval_ms);
+            let lease_ttl = Duration::from_millis(renew_state.config.lease_ttl_ms);
+            let retry_interval =
+                Duration::from_millis((renew_state.config.renew_interval_ms / 4).clamp(50, 500));
+            let mut confirmed_until = tokio::time::Instant::now() + lease_ttl;
+            let mut next_attempt = tokio::time::Instant::now() + interval;
+            let mut consecutive_errors = 0_u64;
             loop {
-                tokio::time::sleep(interval).await;
-                if let Err(err) = renew_state.renew(&renew_token).await {
-                    warn!(
-                        gate = renew_state.gate,
-                        error = %err,
-                        "failed to renew runtime semaphore permit"
-                    );
-                    break;
+                tokio::time::sleep_until(next_attempt).await;
+                match renew_state.renew(&renew_token).await {
+                    Ok(true) => {
+                        consecutive_errors = 0;
+                        let now = tokio::time::Instant::now();
+                        confirmed_until = now + lease_ttl;
+                        next_attempt = now + interval;
+                    }
+                    Ok(false) => {
+                        renew_lease_signal.mark_lost();
+                        warn!(
+                            gate = renew_state.gate,
+                            "runtime semaphore lease token was lost"
+                        );
+                        break;
+                    }
+                    Err(err) => {
+                        consecutive_errors = consecutive_errors.saturating_add(1);
+                        let now = tokio::time::Instant::now();
+                        if now >= confirmed_until {
+                            renew_lease_signal.mark_lost();
+                            warn!(
+                                gate = renew_state.gate,
+                                error = %err,
+                                consecutive_errors,
+                                "runtime semaphore lease expired after bounded renewal retries"
+                            );
+                            break;
+                        }
+                        if consecutive_errors.is_power_of_two() {
+                            warn!(
+                                gate = renew_state.gate,
+                                error = %err,
+                                consecutive_errors,
+                                remaining_lease_ms = confirmed_until
+                                    .saturating_duration_since(now)
+                                    .as_millis(),
+                                "runtime semaphore renewal failed transiently; retrying before expiry"
+                            );
+                        }
+                        next_attempt = std::cmp::min(now + retry_interval, confirmed_until);
+                    }
                 }
             }
         });
         Ok(RuntimeSemaphorePermit {
             state: Arc::clone(self),
-            token,
+            token: Some(token),
             renew_task,
+            lease_signal,
         })
     }
 
@@ -1357,18 +1611,11 @@ impl RuntimeSemaphoreState {
         Ok(in_flight)
     }
 
-    async fn renew(&self, token: &str) -> Result<(), RuntimeSemaphoreError> {
+    async fn renew(&self, token: &str) -> Result<bool, RuntimeSemaphoreError> {
         match self.runtime.backend.as_ref() {
-            RuntimeStateBackend::Memory(memory) => {
-                if memory
-                    .semaphore_renew(&self.key, token, self.config.lease_ttl_ms)
-                    .await
-                {
-                    Ok(())
-                } else {
-                    Err(self.unavailable("lease token expired".to_string()))
-                }
-            }
+            RuntimeStateBackend::Memory(memory) => Ok(memory
+                .semaphore_renew(&self.key, token, self.config.lease_ttl_ms)
+                .await),
             RuntimeStateBackend::Redis(redis) => {
                 let renewed = redis
                     .runtime
@@ -1381,10 +1628,7 @@ impl RuntimeSemaphoreState {
                         self.config.command_timeout_ms,
                     )
                     .await?;
-                if renewed == 0 {
-                    return Err(self.unavailable("lease token expired".to_string()));
-                }
-                Ok(())
+                Ok(renewed > 0)
             }
         }
     }
@@ -1427,14 +1671,6 @@ impl RuntimeSemaphoreState {
         };
         self.observe_in_flight(count);
         Ok(count)
-    }
-
-    fn unavailable(&self, message: String) -> RuntimeSemaphoreError {
-        RuntimeSemaphoreError::Unavailable {
-            gate: self.gate,
-            limit: self.limit,
-            message,
-        }
     }
 
     fn observe_in_flight(&self, in_flight: usize) {
@@ -1514,6 +1750,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memory_kv_compare_and_set_rejects_absent_key() {
+        let runtime = RuntimeState::memory(MemoryRuntimeStateConfig::default());
+        assert!(!runtime
+            .kv_set_if_value(
+                "strict-cas:absent",
+                "expected",
+                "replacement",
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("strict CAS should execute"));
+        assert_eq!(
+            runtime.kv_get("strict-cas:absent").await.expect("get"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_kv_stale_transition_cannot_overwrite_new_generation() {
+        let runtime = RuntimeState::memory(MemoryRuntimeStateConfig::default());
+        runtime
+            .kv_set(
+                "strict-cas:generation",
+                "transition-a",
+                Some(Duration::from_secs(60)),
+            )
+            .await
+            .expect("writer A transition");
+        runtime
+            .kv_set(
+                "strict-cas:generation",
+                "transition-b",
+                Some(Duration::from_secs(60)),
+            )
+            .await
+            .expect("writer B transition");
+        assert!(runtime
+            .kv_set_if_value(
+                "strict-cas:generation",
+                "transition-b",
+                "stable-b",
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("writer B finish"));
+        assert!(!runtime
+            .kv_set_if_value(
+                "strict-cas:generation",
+                "transition-a",
+                "stable-a",
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("stale writer A finish"));
+        assert_eq!(
+            runtime
+                .kv_get("strict-cas:generation")
+                .await
+                .expect("get")
+                .as_deref(),
+            Some("stable-b")
+        );
+    }
+
+    #[tokio::test]
+    async fn semaphore_lease_loss_notifies_waiter_without_polling() {
+        let signal = Arc::new(RuntimeSemaphoreLeaseSignal {
+            lost: AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+        });
+        let status = RuntimeSemaphoreLeaseStatus {
+            signal: Arc::clone(&signal),
+        };
+        let waiter = tokio::spawn(async move { status.lost().await });
+        tokio::task::yield_now().await;
+        signal.mark_lost();
+        tokio::time::timeout(Duration::from_millis(100), waiter)
+            .await
+            .expect("lease-loss waiter should wake")
+            .expect("lease-loss waiter should join");
+    }
+
+    #[tokio::test]
+    async fn memory_semaphore_missing_token_wakes_lease_status() {
+        let runtime = RuntimeState::memory(MemoryRuntimeStateConfig::default());
+        let gate = runtime
+            .semaphore(
+                "lease-loss-token",
+                1,
+                RuntimeSemaphoreConfig {
+                    lease_ttl_ms: 100,
+                    renew_interval_ms: 10,
+                    command_timeout_ms: Some(50),
+                },
+            )
+            .expect("gate should build");
+        let permit = gate.try_acquire().await.expect("permit should acquire");
+        let status = permit.lease_status();
+        let token = permit
+            .token
+            .as_deref()
+            .expect("permit should own a token")
+            .to_string();
+        permit
+            .state
+            .release(&token)
+            .await
+            .expect("test should remove the backend token");
+
+        tokio::time::timeout(Duration::from_millis(250), status.lost())
+            .await
+            .expect("renewal should observe the missing token and notify");
+        assert!(!status.is_valid());
+        drop(permit);
+    }
+
+    #[tokio::test]
     async fn memory_rate_limit_rejects_after_limit() {
         let runtime = RuntimeState::memory(MemoryRuntimeStateConfig::default());
         let input = RateLimitInput {
@@ -1555,8 +1908,108 @@ mod tests {
             RuntimeSemaphoreError::Saturated { .. }
         ));
         drop(permit);
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        wait_for_semaphore_count(&gate, 0).await;
+    }
+
+    #[tokio::test]
+    async fn memory_semaphore_explicit_release_is_observable_before_return() {
+        let runtime = RuntimeState::memory(MemoryRuntimeStateConfig::default());
+        let gate = runtime
+            .semaphore("explicit-release", 1, RuntimeSemaphoreConfig::default())
+            .expect("gate should build");
+        let permit = gate.try_acquire().await.expect("permit should acquire");
+
+        permit.release().await.expect("permit should release");
+
         assert_eq!(gate.snapshot().await.expect("snapshot").in_flight, 0);
+        let reacquired = gate
+            .try_acquire()
+            .await
+            .expect("released capacity should be immediately reusable");
+        reacquired.release().await.expect("cleanup release");
+    }
+
+    #[tokio::test]
+    async fn memory_semaphore_drop_does_not_require_a_caller_runtime() {
+        let runtime = RuntimeState::memory(MemoryRuntimeStateConfig::default());
+        let gate = runtime
+            .semaphore(
+                "runtime-independent-drop",
+                1,
+                RuntimeSemaphoreConfig::default(),
+            )
+            .expect("gate should build");
+        let permit = gate.try_acquire().await.expect("permit should acquire");
+
+        std::thread::spawn(move || drop(permit))
+            .join()
+            .expect("permit drop thread should finish");
+
+        wait_for_semaphore_count(&gate, 0).await;
+    }
+
+    #[tokio::test]
+    async fn memory_keyed_semaphore_isolates_resources_and_shares_matching_resource() {
+        let runtime = RuntimeState::memory(MemoryRuntimeStateConfig::default());
+        let first = runtime
+            .keyed_semaphore(
+                "codex_ws_provider",
+                "provider-1",
+                1,
+                RuntimeSemaphoreConfig::default(),
+            )
+            .expect("first keyed gate should build");
+        let same = runtime
+            .keyed_semaphore(
+                "codex_ws_provider",
+                "provider-1",
+                1,
+                RuntimeSemaphoreConfig::default(),
+            )
+            .expect("matching keyed gate should build");
+        let other = runtime
+            .keyed_semaphore(
+                "codex_ws_provider",
+                "provider-2",
+                1,
+                RuntimeSemaphoreConfig::default(),
+            )
+            .expect("other keyed gate should build");
+
+        let permit = first.try_acquire().await.expect("first resource permit");
+        assert!(matches!(
+            same.try_acquire()
+                .await
+                .expect_err("same resource rejected"),
+            RuntimeSemaphoreError::Saturated { .. }
+        ));
+        let other_permit = other
+            .try_acquire()
+            .await
+            .expect("different resource remains available");
+
+        drop(permit);
+        drop(other_permit);
+        wait_for_semaphore_count(&same, 0).await;
+        wait_for_semaphore_count(&other, 0).await;
+        let reacquired = same
+            .try_acquire()
+            .await
+            .expect("dropped permit should release matching resource");
+        drop(reacquired);
+    }
+
+    async fn wait_for_semaphore_count(gate: &RuntimeSemaphore, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if gate.snapshot().await.expect("snapshot").in_flight == expected {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("semaphore release should complete within the bounded queue deadline");
     }
 
     #[tokio::test]
@@ -1809,6 +2262,50 @@ mod tests {
         assert_eq!(
             runtime.kv_get("contract:nx").await.expect("expired nx key"),
             None
+        );
+
+        assert!(!runtime
+            .kv_set_if_value(
+                "contract:strict-cas",
+                "missing",
+                "must-not-create",
+                Duration::from_secs(1),
+            )
+            .await
+            .expect("strict CAS rejects absent key"));
+        runtime
+            .kv_set(
+                "contract:strict-cas",
+                "generation-b",
+                Some(Duration::from_secs(1)),
+            )
+            .await
+            .expect("seed strict CAS key");
+        assert!(!runtime
+            .kv_set_if_value(
+                "contract:strict-cas",
+                "generation-a",
+                "stale-a",
+                Duration::from_secs(1),
+            )
+            .await
+            .expect("strict CAS rejects stale value"));
+        assert!(runtime
+            .kv_set_if_value(
+                "contract:strict-cas",
+                "generation-b",
+                "stable-b",
+                Duration::from_secs(1),
+            )
+            .await
+            .expect("strict CAS accepts exact value"));
+        assert_eq!(
+            runtime
+                .kv_get("contract:strict-cas")
+                .await
+                .expect("get strict CAS key")
+                .as_deref(),
+            Some("stable-b")
         );
 
         runtime

@@ -5,6 +5,77 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::warn;
 
 impl AppState {
+    async fn finish_codex_ws_catalog_hot_after_authoritative_read<T>(
+        &self,
+        mutation: crate::codex_ws::hot_state::CodexWsHotMutation,
+        authoritative_read: Result<T, aether_data::DataLayerError>,
+    ) -> Result<(), GatewayError> {
+        match authoritative_read {
+            Ok(_) => crate::codex_ws::hot_state::finish_catalog_hot_mutation(self, mutation).await,
+            Err(err) => {
+                crate::codex_ws::hot_state::leave_hot_mutation_unstable(self, mutation).await;
+                Err(GatewayError::Internal(err.to_string()))
+            }
+        }
+    }
+
+    async fn finish_codex_ws_key_hot_after_authoritative_read(
+        &self,
+        mutation: crate::codex_ws::hot_state::CodexWsHotMutation,
+        key_id: &str,
+    ) -> Result<(), GatewayError> {
+        self.data.clear_provider_catalog_cache();
+        match self
+            .data
+            .list_provider_catalog_keys_by_ids(&[key_id.to_string()])
+            .await
+        {
+            Ok(keys) => {
+                crate::codex_ws::hot_state::finish_key_hot_mutation(self, mutation, keys.first())
+                    .await
+            }
+            Err(err) => {
+                crate::codex_ws::hot_state::leave_hot_mutation_unstable(self, mutation).await;
+                Err(GatewayError::Internal(err.to_string()))
+            }
+        }
+    }
+
+    async fn provider_is_codex_for_ws(&self, provider_id: &str) -> Result<bool, GatewayError> {
+        Ok(self
+            .data
+            .list_provider_catalog_providers_by_ids(&[provider_id.to_string()])
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))?
+            .first()
+            .is_some_and(|provider| provider.provider_type.trim().eq_ignore_ascii_case("codex")))
+    }
+
+    async fn key_is_codex_ws_relevant(
+        &self,
+        key: &provider_catalog::StoredProviderCatalogKey,
+        explicit_ws_mutation: bool,
+    ) -> Result<bool, GatewayError> {
+        if !codex_ws_key_shape_matches(key, explicit_ws_mutation) {
+            return Ok(false);
+        }
+        self.provider_is_codex_for_ws(&key.provider_id).await
+    }
+
+    async fn endpoint_is_codex_ws_relevant(
+        &self,
+        endpoint: &provider_catalog::StoredProviderCatalogEndpoint,
+    ) -> Result<bool, GatewayError> {
+        if !endpoint
+            .api_format
+            .trim()
+            .eq_ignore_ascii_case("openai:responses")
+        {
+            return Ok(false);
+        }
+        self.provider_is_codex_for_ws(&endpoint.provider_id).await
+    }
+
     pub fn has_provider_catalog_data_reader(&self) -> bool {
         self.data.has_provider_catalog_reader()
     }
@@ -504,11 +575,20 @@ impl AppState {
         &self,
         key: &provider_catalog::StoredProviderCatalogKey,
     ) -> Result<Option<provider_catalog::StoredProviderCatalogKey>, GatewayError> {
-        let created = self
-            .data
-            .create_provider_catalog_key(key)
-            .await
-            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+        let hot_mutation = self
+            .key_is_codex_ws_relevant(key, false)
+            .await?
+            .then(|| crate::codex_ws::hot_state::begin_key_hot_mutation(self, &key.id));
+        let hot_mutation = match hot_mutation {
+            Some(mutation) => Some(mutation.await?),
+            None => None,
+        };
+        let created = self.data.create_provider_catalog_key(key).await;
+        if let Some(mutation) = hot_mutation {
+            self.finish_codex_ws_key_hot_after_authoritative_read(mutation, &key.id)
+                .await?;
+        }
+        let created = created.map_err(|err| GatewayError::Internal(err.to_string()))?;
         if created.is_some() {
             self.invalidate_provider_routing_caches();
         }
@@ -520,11 +600,25 @@ impl AppState {
         provider: &provider_catalog::StoredProviderCatalogProvider,
         shift_existing_priorities_from: Option<i32>,
     ) -> Result<Option<provider_catalog::StoredProviderCatalogProvider>, GatewayError> {
+        let hot_mutation = if provider.provider_type.trim().eq_ignore_ascii_case("codex") {
+            Some(crate::codex_ws::hot_state::begin_catalog_hot_mutation(self).await?)
+        } else {
+            None
+        };
         let created = self
             .data
             .create_provider_catalog_provider(provider, shift_existing_priorities_from)
-            .await
-            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+            .await;
+        if let Some(mutation) = hot_mutation {
+            self.data.clear_provider_catalog_cache();
+            let authoritative = self
+                .data
+                .list_provider_catalog_providers_by_ids(&[provider.id.clone()])
+                .await;
+            self.finish_codex_ws_catalog_hot_after_authoritative_read(mutation, authoritative)
+                .await?;
+        }
+        let created = created.map_err(|err| GatewayError::Internal(err.to_string()))?;
         if created.is_some() {
             self.invalidate_provider_routing_caches();
         }
@@ -535,11 +629,24 @@ impl AppState {
         &self,
         provider: &provider_catalog::StoredProviderCatalogProvider,
     ) -> Result<Option<provider_catalog::StoredProviderCatalogProvider>, GatewayError> {
-        let updated = self
-            .data
-            .update_provider_catalog_provider(provider)
-            .await
-            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+        let existing_relevant = self.provider_is_codex_for_ws(&provider.id).await?;
+        let hot_mutation =
+            if existing_relevant || provider.provider_type.trim().eq_ignore_ascii_case("codex") {
+                Some(crate::codex_ws::hot_state::begin_catalog_hot_mutation(self).await?)
+            } else {
+                None
+            };
+        let updated = self.data.update_provider_catalog_provider(provider).await;
+        if let Some(mutation) = hot_mutation {
+            self.data.clear_provider_catalog_cache();
+            let authoritative = self
+                .data
+                .list_provider_catalog_providers_by_ids(&[provider.id.clone()])
+                .await;
+            self.finish_codex_ws_catalog_hot_after_authoritative_read(mutation, authoritative)
+                .await?;
+        }
+        let updated = updated.map_err(|err| GatewayError::Internal(err.to_string()))?;
         if updated.is_some() {
             self.invalidate_provider_routing_caches();
         }
@@ -550,11 +657,25 @@ impl AppState {
         &self,
         provider_id: &str,
     ) -> Result<bool, GatewayError> {
+        let hot_mutation = if self.provider_is_codex_for_ws(provider_id).await? {
+            Some(crate::codex_ws::hot_state::begin_catalog_hot_mutation(self).await?)
+        } else {
+            None
+        };
         let deleted = self
             .data
             .delete_provider_catalog_provider(provider_id)
-            .await
-            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+            .await;
+        if let Some(mutation) = hot_mutation {
+            self.data.clear_provider_catalog_cache();
+            let authoritative = self
+                .data
+                .list_provider_catalog_providers_by_ids(&[provider_id.to_string()])
+                .await;
+            self.finish_codex_ws_catalog_hot_after_authoritative_read(mutation, authoritative)
+                .await?;
+        }
+        let deleted = deleted.map_err(|err| GatewayError::Internal(err.to_string()))?;
         if deleted {
             self.invalidate_provider_routing_caches();
         }
@@ -600,11 +721,22 @@ impl AppState {
         &self,
         endpoint: &provider_catalog::StoredProviderCatalogEndpoint,
     ) -> Result<Option<provider_catalog::StoredProviderCatalogEndpoint>, GatewayError> {
-        let created = self
-            .data
-            .create_provider_catalog_endpoint(endpoint)
-            .await
-            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+        let hot_mutation = if self.endpoint_is_codex_ws_relevant(endpoint).await? {
+            Some(crate::codex_ws::hot_state::begin_catalog_hot_mutation(self).await?)
+        } else {
+            None
+        };
+        let created = self.data.create_provider_catalog_endpoint(endpoint).await;
+        if let Some(mutation) = hot_mutation {
+            self.data.clear_provider_catalog_cache();
+            let authoritative = self
+                .data
+                .list_provider_catalog_endpoints_by_ids(&[endpoint.id.clone()])
+                .await;
+            self.finish_codex_ws_catalog_hot_after_authoritative_read(mutation, authoritative)
+                .await?;
+        }
+        let created = created.map_err(|err| GatewayError::Internal(err.to_string()))?;
         if created.is_some() {
             self.invalidate_provider_routing_caches();
         }
@@ -615,11 +747,34 @@ impl AppState {
         &self,
         endpoint: &provider_catalog::StoredProviderCatalogEndpoint,
     ) -> Result<Option<provider_catalog::StoredProviderCatalogEndpoint>, GatewayError> {
-        let updated = self
+        let existing = self
             .data
-            .update_provider_catalog_endpoint(endpoint)
+            .list_provider_catalog_endpoints_by_ids(&[endpoint.id.clone()])
             .await
-            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+            .map_err(|err| GatewayError::Internal(err.to_string()))?
+            .into_iter()
+            .next();
+        let relevant = self.endpoint_is_codex_ws_relevant(endpoint).await?
+            || match existing.as_ref() {
+                Some(existing) => self.endpoint_is_codex_ws_relevant(existing).await?,
+                None => false,
+            };
+        let hot_mutation = if relevant {
+            Some(crate::codex_ws::hot_state::begin_catalog_hot_mutation(self).await?)
+        } else {
+            None
+        };
+        let updated = self.data.update_provider_catalog_endpoint(endpoint).await;
+        if let Some(mutation) = hot_mutation {
+            self.data.clear_provider_catalog_cache();
+            let authoritative = self
+                .data
+                .list_provider_catalog_endpoints_by_ids(&[endpoint.id.clone()])
+                .await;
+            self.finish_codex_ws_catalog_hot_after_authoritative_read(mutation, authoritative)
+                .await?;
+        }
+        let updated = updated.map_err(|err| GatewayError::Internal(err.to_string()))?;
         if updated.is_some() {
             self.invalidate_provider_routing_caches();
         }
@@ -630,11 +785,36 @@ impl AppState {
         &self,
         endpoint_id: &str,
     ) -> Result<bool, GatewayError> {
+        let existing = self
+            .data
+            .list_provider_catalog_endpoints_by_ids(&[endpoint_id.to_string()])
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))?
+            .into_iter()
+            .next();
+        let relevant = match existing.as_ref() {
+            Some(existing) => self.endpoint_is_codex_ws_relevant(existing).await?,
+            None => false,
+        };
+        let hot_mutation = if relevant {
+            Some(crate::codex_ws::hot_state::begin_catalog_hot_mutation(self).await?)
+        } else {
+            None
+        };
         let deleted = self
             .data
             .delete_provider_catalog_endpoint(endpoint_id)
-            .await
-            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+            .await;
+        if let Some(mutation) = hot_mutation {
+            self.data.clear_provider_catalog_cache();
+            let authoritative = self
+                .data
+                .list_provider_catalog_endpoints_by_ids(&[endpoint_id.to_string()])
+                .await;
+            self.finish_codex_ws_catalog_hot_after_authoritative_read(mutation, authoritative)
+                .await?;
+        }
+        let deleted = deleted.map_err(|err| GatewayError::Internal(err.to_string()))?;
         if deleted {
             self.invalidate_provider_routing_caches();
         }
@@ -645,12 +825,73 @@ impl AppState {
         &self,
         key: &provider_catalog::StoredProviderCatalogKey,
     ) -> Result<Option<provider_catalog::StoredProviderCatalogKey>, GatewayError> {
+        let existing = self
+            .data
+            .list_provider_catalog_keys_by_ids(&[key.id.clone()])
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))?
+            .into_iter()
+            .next();
+        let relevant = self.key_is_codex_ws_relevant(key, false).await?
+            || match existing.as_ref() {
+                Some(existing) => self.key_is_codex_ws_relevant(existing, false).await?,
+                None => false,
+            };
+        let hot_mutation = if relevant {
+            Some(crate::codex_ws::hot_state::begin_key_hot_mutation(self, &key.id).await?)
+        } else {
+            None
+        };
+        let updated = self.data.update_provider_catalog_key(key).await;
+        if let Some(mutation) = hot_mutation {
+            self.finish_codex_ws_key_hot_after_authoritative_read(mutation, &key.id)
+                .await?;
+        }
+        let updated = updated.map_err(|err| GatewayError::Internal(err.to_string()))?;
+        if updated.is_some() {
+            self.invalidate_provider_routing_caches();
+        }
+        Ok(updated)
+    }
+
+    pub(crate) async fn update_provider_catalog_key_codex_ws_metadata(
+        &self,
+        key_id: &str,
+        enabled: bool,
+        websocket_transport_profile: Option<&serde_json::Value>,
+        updated_at_unix_secs: u64,
+    ) -> Result<bool, GatewayError> {
+        let existing = self
+            .data
+            .list_provider_catalog_keys_by_ids(&[key_id.to_string()])
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))?
+            .into_iter()
+            .next();
+        let relevant = match existing.as_ref() {
+            Some(existing) => self.key_is_codex_ws_relevant(existing, true).await?,
+            None => false,
+        };
+        let hot_mutation = if relevant {
+            Some(crate::codex_ws::hot_state::begin_key_hot_mutation(self, key_id).await?)
+        } else {
+            None
+        };
         let updated = self
             .data
-            .update_provider_catalog_key(key)
-            .await
-            .map_err(|err| GatewayError::Internal(err.to_string()))?;
-        if updated.is_some() {
+            .update_provider_catalog_key_codex_ws_metadata(
+                key_id,
+                enabled,
+                websocket_transport_profile,
+                updated_at_unix_secs,
+            )
+            .await;
+        if let Some(mutation) = hot_mutation {
+            self.finish_codex_ws_key_hot_after_authoritative_read(mutation, key_id)
+                .await?;
+        }
+        let updated = updated.map_err(|err| GatewayError::Internal(err.to_string()))?;
+        if updated {
             self.invalidate_provider_routing_caches();
         }
         Ok(updated)
@@ -660,11 +901,23 @@ impl AppState {
         &self,
         key: &provider_catalog::StoredProviderCatalogKey,
     ) -> Result<Option<provider_catalog::StoredProviderCatalogKey>, GatewayError> {
-        let updated = self
-            .data
-            .update_provider_catalog_key(key)
-            .await
-            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+        let restrictive = !crate::codex_ws::hot_state::key_runtime_eligibility(key).0;
+        let relevant = restrictive && self.key_is_codex_ws_relevant(key, true).await?;
+        // Restrictive runtime writes are rare and safety-sensitive. Use the
+        // same distributed transition lock as admin mutations so a failed
+        // one-shot CAS can never leave an eligible generation visible after
+        // the authoritative DB commit.
+        let hot_mutation = if relevant {
+            Some(crate::codex_ws::hot_state::begin_key_hot_mutation(self, &key.id).await?)
+        } else {
+            None
+        };
+        let updated = self.data.update_provider_catalog_key(key).await;
+        if let Some(mutation) = hot_mutation {
+            self.finish_codex_ws_key_hot_after_authoritative_read(mutation, &key.id)
+                .await?;
+        }
+        let updated = updated.map_err(|err| GatewayError::Internal(err.to_string()))?;
         if updated.is_some() {
             self.invalidate_provider_health_routing_caches();
         }
@@ -703,11 +956,21 @@ impl AppState {
             .map_err(|err| GatewayError::Internal(err.to_string()))?
             .into_iter()
             .next();
-        let deleted = self
-            .data
-            .delete_provider_catalog_key(key_id)
-            .await
-            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+        let relevant = match existing_key.as_ref() {
+            Some(key) => self.key_is_codex_ws_relevant(key, false).await?,
+            None => false,
+        };
+        let hot_mutation = if relevant {
+            Some(crate::codex_ws::hot_state::begin_key_hot_mutation(self, key_id).await?)
+        } else {
+            None
+        };
+        let deleted = self.data.delete_provider_catalog_key(key_id).await;
+        if let Some(mutation) = hot_mutation {
+            self.finish_codex_ws_key_hot_after_authoritative_read(mutation, key_id)
+                .await?;
+        }
+        let deleted = deleted.map_err(|err| GatewayError::Internal(err.to_string()))?;
         if deleted {
             if let Some(key) = existing_key {
                 if let Err(err) = self
@@ -851,6 +1114,24 @@ impl AppState {
         health_by_format: Option<&serde_json::Value>,
         circuit_breaker_by_format: Option<&serde_json::Value>,
     ) -> Result<bool, GatewayError> {
+        let relevant = if is_active {
+            false
+        } else {
+            let keys = self
+                .data
+                .list_provider_catalog_keys_by_ids(&[key_id.to_string()])
+                .await
+                .map_err(|err| GatewayError::Internal(err.to_string()))?;
+            match keys.first() {
+                Some(key) => self.key_is_codex_ws_relevant(key, false).await?,
+                None => false,
+            }
+        };
+        let hot_mutation = if relevant {
+            Some(crate::codex_ws::hot_state::begin_key_hot_mutation(self, key_id).await?)
+        } else {
+            None
+        };
         let updated = self
             .data
             .update_provider_catalog_key_health_state(
@@ -859,13 +1140,54 @@ impl AppState {
                 health_by_format,
                 circuit_breaker_by_format,
             )
-            .await
-            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+            .await;
+        if let Some(mutation) = hot_mutation {
+            self.finish_codex_ws_key_hot_after_authoritative_read(mutation, key_id)
+                .await?;
+        }
+        let updated = updated.map_err(|err| GatewayError::Internal(err.to_string()))?;
         if updated {
             self.invalidate_provider_health_routing_caches();
         }
         Ok(updated)
     }
+}
+
+fn codex_ws_key_shape_matches(
+    key: &provider_catalog::StoredProviderCatalogKey,
+    explicit_ws_mutation: bool,
+) -> bool {
+    let oauth_for_responses = key.auth_type.trim().eq_ignore_ascii_case("oauth")
+        || key
+            .auth_type_by_format
+            .as_ref()
+            .and_then(serde_json::Value::as_object)
+            .and_then(|formats| formats.get("openai:responses"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|auth_type| auth_type.trim().eq_ignore_ascii_case("oauth"));
+    if !oauth_for_responses {
+        return false;
+    }
+    let supports_responses = key.api_formats.as_ref().is_none_or(|formats| {
+        formats.as_array().is_some_and(|formats| {
+            formats.iter().any(|format| {
+                format
+                    .as_str()
+                    .is_some_and(|format| format.trim().eq_ignore_ascii_case("openai:responses"))
+            })
+        })
+    });
+    if !supports_responses {
+        return false;
+    }
+    explicit_ws_mutation
+        || key
+            .capabilities
+            .as_ref()
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|capabilities| {
+                capabilities.contains_key(aether_provider_transport::CODEX_OFFICIAL_WS_CAPABILITY)
+            })
 }
 
 #[cfg(test)]
@@ -1191,6 +1513,39 @@ mod tests {
             .expect("provider transport should read after update")
             .expect("provider transport should exist after update");
         assert!(snapshot.provider.keep_priority_on_conversion);
+    }
+
+    #[tokio::test]
+    async fn non_codex_provider_update_does_not_wait_for_codex_ws_hot_state() {
+        let provider = sample_provider();
+        let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![provider.clone()],
+            vec![sample_endpoint()],
+            vec![sample_key()],
+        ));
+        let state = AppState::new()
+            .expect("app state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(repository)
+                    .with_encryption_key_for_tests("test-encryption-key"),
+            );
+        let held_codex_ws_mutation = crate::codex_ws::hot_state::begin_catalog_hot_mutation(&state)
+            .await
+            .expect("test should hold the Codex WS mutation lock");
+
+        let mut updated = provider;
+        updated.description = Some("ordinary OpenAI update".to_string());
+        let result = tokio::time::timeout(
+            Duration::from_millis(250),
+            state.update_provider_catalog_provider(&updated),
+        )
+        .await
+        .expect("non-Codex update must not contend on the Codex WS lock")
+        .expect("non-Codex update should succeed");
+        assert!(result.is_some());
+
+        crate::codex_ws::hot_state::leave_hot_mutation_unstable(&state, held_codex_ws_mutation)
+            .await;
     }
 
     #[tokio::test]

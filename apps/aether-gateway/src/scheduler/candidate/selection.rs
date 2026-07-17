@@ -213,6 +213,14 @@ pub(super) async fn collect_selectable_enumerated_candidates_with_skip_reasons(
     ),
     GatewayError,
 > {
+    if required_capabilities
+        .and_then(serde_json::Value::as_object)
+        .and_then(|capabilities| capabilities.get("codex_official_ws"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        aether_scheduler_core::hard_filter_candidates_for_codex_official_ws(&mut candidates);
+    }
     let runtime_snapshot = read_candidate_runtime_selection_snapshot(
         runtime_state,
         &candidates,

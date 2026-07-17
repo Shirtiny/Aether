@@ -74,10 +74,12 @@ pub use crate::formats::shared::image_bridge::{
 };
 pub use crate::formats::shared::model_directives::{
     apply_model_directive_mapping_patch, apply_model_directive_overrides_from_model,
-    apply_model_directive_overrides_from_request, claude_model_uses_adaptive_effort,
-    extract_gemini_model_from_path, gemini_model_uses_thinking_level, model_directive_base_model,
-    model_supports_codex_max_ultra, normalize_model_directive_model, parse_model_directive,
-    ModelDirective, ModelOverride, ReasoningEffort, ServiceTier,
+    apply_model_directive_overrides_from_request,
+    apply_openai_responses_model_directive_overrides_from_model_in_place,
+    claude_model_uses_adaptive_effort, extract_gemini_model_from_path,
+    gemini_model_uses_thinking_level, model_directive_base_model, model_supports_codex_max_ultra,
+    normalize_model_directive_model, parse_model_directive, ModelDirective, ModelOverride,
+    ReasoningEffort, ServiceTier,
 };
 pub use crate::formats::shared::passthrough::{
     resolve_stream_spec as resolve_local_same_format_stream_spec,
@@ -146,6 +148,7 @@ pub use crate::formats::{
         embedding::spec::resolve_sync_spec as resolve_openai_embedding_sync_spec,
         responses::{
             codex::{
+                apply_codex_official_ws_handshake_headers,
                 apply_codex_openai_responses_chat_body_edits,
                 apply_codex_openai_responses_special_body_edits,
                 apply_codex_openai_responses_special_headers,
@@ -174,6 +177,7 @@ pub use crate::formats::{
             build_local_openai_chat_request_body,
             build_local_openai_chat_request_body_with_model_directives,
             build_local_openai_responses_request_body,
+            build_local_openai_responses_request_body_owned_with_model_directives,
             build_local_openai_responses_request_body_with_model_directives,
             is_claude_messages_shaped_body_on_openai_chat_endpoint,
         },

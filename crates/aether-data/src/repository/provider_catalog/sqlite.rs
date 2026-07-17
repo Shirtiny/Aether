@@ -1152,6 +1152,76 @@ WHERE id = ?
         Ok(rows_affected > 0)
     }
 
+    pub async fn update_key_codex_ws_metadata(
+        &self,
+        key_id: &str,
+        enabled: bool,
+        websocket_transport_profile: Option<&serde_json::Value>,
+        updated_at_unix_secs: u64,
+    ) -> Result<bool, DataLayerError> {
+        validate_non_empty(key_id, "provider catalog key_id")?;
+        if enabled
+            && websocket_transport_profile
+                .and_then(serde_json::Value::as_object)
+                .is_none()
+        {
+            return Err(DataLayerError::InvalidInput(
+                "websocket_transport_profile must be an object when enabled".to_string(),
+            ));
+        }
+        let profile_json = websocket_transport_profile
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| DataLayerError::UnexpectedValue(error.to_string()))?
+            .unwrap_or_else(|| "{}".to_string());
+
+        let rows_affected = sqlx::query(
+            r#"
+UPDATE provider_api_keys
+SET
+  capabilities = json_set(
+    CASE
+      WHEN json_valid(capabilities) AND json_type(capabilities) = 'object' THEN capabilities
+      ELSE '{}'
+    END,
+    '$.codex_official_ws',
+    json(?)
+  ),
+  fingerprint = CASE
+    WHEN ? THEN json_set(
+      CASE
+        WHEN json_valid(fingerprint) AND json_type(fingerprint) = 'object' THEN fingerprint
+        ELSE '{}'
+      END,
+      '$.websocket_transport_profile',
+      json_patch(
+        CASE
+          WHEN json_valid(fingerprint)
+            AND json_type(fingerprint, '$.websocket_transport_profile') = 'object'
+            THEN json_extract(fingerprint, '$.websocket_transport_profile')
+          ELSE '{}'
+        END,
+        json(?)
+      )
+    )
+    ELSE fingerprint
+  END,
+  updated_at = ?
+WHERE id = ?
+"#,
+        )
+        .bind(if enabled { "true" } else { "false" })
+        .bind(enabled)
+        .bind(profile_json)
+        .bind(updated_at_unix_secs as i64)
+        .bind(key_id)
+        .execute(&self.pool)
+        .await
+        .map_sql_err()?
+        .rows_affected();
+        Ok(rows_affected > 0)
+    }
+
     pub async fn update_key_upstream_metadata(
         &self,
         key_id: &str,
@@ -1446,6 +1516,23 @@ impl ProviderCatalogWriteRepository for SqliteProviderCatalogReadRepository {
         key: &StoredProviderCatalogKey,
     ) -> Result<StoredProviderCatalogKey, DataLayerError> {
         Self::update_key(self, key).await
+    }
+
+    async fn update_key_codex_ws_metadata(
+        &self,
+        key_id: &str,
+        enabled: bool,
+        websocket_transport_profile: Option<&serde_json::Value>,
+        updated_at_unix_secs: u64,
+    ) -> Result<bool, DataLayerError> {
+        Self::update_key_codex_ws_metadata(
+            self,
+            key_id,
+            enabled,
+            websocket_transport_profile,
+            updated_at_unix_secs,
+        )
+        .await
     }
 
     async fn update_key_upstream_metadata(
@@ -2237,7 +2324,10 @@ mod tests {
             Some(json!(["gpt-4.1"])),
             Some(1_730_000_000),
             Some(json!({"http":"proxy"})),
-            Some(json!({"fp":"abc"})),
+            Some(json!({
+                "fp":"abc",
+                "websocket_transport_profile":{"retained_nested":true}
+            })),
         )
         .expect("key transport should build")
         .with_rate_limit_fields(
@@ -2269,6 +2359,41 @@ mod tests {
             created_key.last_models_fetch_error.as_deref(),
             Some("stale models fetch error")
         );
+
+        let ws_profile = json!({"schema_version":1,"profile_id":"profile-1"});
+        assert!(repository
+            .update_key_codex_ws_metadata("key-write-1", true, Some(&ws_profile), 1_730_000_150,)
+            .await
+            .expect("Codex WS metadata should enable"));
+        assert!(repository
+            .update_key_codex_ws_metadata("key-write-1", false, None, 1_730_000_151)
+            .await
+            .expect("Codex WS metadata should disable"));
+        let ws_updated_key = repository
+            .list_keys_by_ids(&["key-write-1".to_string()])
+            .await
+            .expect("Codex WS key should reload")
+            .remove(0);
+        assert_eq!(
+            ws_updated_key.capabilities.as_ref().unwrap()["cache_1h"],
+            true
+        );
+        assert_eq!(
+            ws_updated_key.capabilities.as_ref().unwrap()["codex_official_ws"],
+            false
+        );
+        assert_eq!(ws_updated_key.fingerprint.as_ref().unwrap()["fp"], "abc");
+        assert_eq!(
+            ws_updated_key.fingerprint.as_ref().unwrap()["websocket_transport_profile"]
+                ["retained_nested"],
+            true
+        );
+        assert_eq!(
+            ws_updated_key.fingerprint.as_ref().unwrap()["websocket_transport_profile"]
+                ["profile_id"],
+            "profile-1"
+        );
+        assert!(ws_updated_key.is_active);
 
         let mut updated_key = created_key.clone();
         updated_key.name = "Updated Key".to_string();

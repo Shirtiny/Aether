@@ -17,7 +17,8 @@ use crate::codex_profile::{
 };
 
 pub(crate) use crate::ai_serving::{
-    apply_codex_openai_responses_special_body_edits, apply_codex_openai_responses_special_headers,
+    apply_codex_official_ws_handshake_headers, apply_codex_openai_responses_special_body_edits,
+    apply_codex_openai_responses_special_headers,
 };
 
 use crate::ai_serving::GatewayProviderTransportSnapshot;
@@ -313,7 +314,7 @@ fn codex_pool_client_profile_selection_key(transport: &GatewayProviderTransportS
     )
 }
 
-fn resolve_codex_pool_concrete_account_profile(
+pub(crate) fn resolve_codex_pool_concrete_account_profile(
     transport: &GatewayProviderTransportSnapshot,
 ) -> Option<CodexConcreteAccountProfile> {
     let default_pool_advanced = Value::Object(Default::default());

@@ -1,0 +1,49 @@
+{
+  "schema_version": 3,
+  "profile_id": "codex-ws-0.144.1-linux-x64-rustls023-aws-lc-caenv1-wbufret256k1",
+  "continuation_mode": "connection_local",
+  "source": {
+    "codex_version": "0.144.1",
+    "codex_revision": "1f0566d3f59298d1bb88820a0d35294f1eeb07ea",
+    "connector_path": "codex-rs/websocket-client"
+  },
+  "dependencies": {
+    "tokio_tungstenite_revision": "0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186",
+    "tungstenite_revision": "4fffad30fe373adbdcffab9545e9e9bf4f2fc19f",
+    "tungstenite_patch_id": "aether-tungstenite-0.27-out-buffer-retention-v1",
+    "rustls_version": "0.23.36",
+    "rustls_webpki_version": "0.103.13",
+    "rustls_native_certs_version": "0.8.3",
+    "rustls_pki_types_version": "1.14.0",
+    "tokio_rustls_version": "0.26.4",
+    "aws_lc_rs_version": "1.16.2",
+    "aws_lc_sys_version": "0.39.0"
+  },
+  "tls": {
+    "crypto_provider": "aws-lc-rs",
+    "root_store": "native-plus-selected-env-ca-cached",
+    "client_config_scope": "per-connection",
+    "alpn_protocols": [],
+    "session_resumption": "rustls-default-empty-at-build",
+    "custom_ca_env_precedence": [
+      "CODEX_CA_CERTIFICATE",
+      "SSL_CERT_FILE"
+    ],
+    "invalid_custom_ca_policy": "fail-closed"
+  },
+  "websocket": {
+    "permessage_deflate": true,
+    "max_frame_size_bytes": 16777216,
+    "max_message_size_bytes": 67108864,
+    "write_buffer_size_bytes": 131072,
+    "max_write_buffer_size_bytes": 17825792,
+    "max_retained_write_buffer_capacity_bytes": 262144,
+    "tcp_nodelay": false
+  },
+  "proxy_routes": [
+    "transport_default",
+    "direct",
+    "http_connect",
+    "https_connect"
+  ]
+}

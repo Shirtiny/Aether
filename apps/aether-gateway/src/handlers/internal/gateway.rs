@@ -577,8 +577,29 @@ pub(crate) async fn maybe_build_local_internal_proxy_response_impl(
                                 plan: &plan,
                                 report_context: report_context.as_ref(),
                             };
-                            let mut sticky_init_cleanup =
-                                PoolAttemptStartCleanupGuard::new(state, context);
+                            let mut sticky_init_cleanup = match PoolAttemptStartCleanupGuard::new(
+                                state, context,
+                            ) {
+                                Ok(cleanup) => cleanup,
+                                Err(_) => {
+                                    apply_local_execution_effect(
+                                        state,
+                                        context,
+                                        LocalExecutionEffect::PoolAttemptAborted,
+                                    )
+                                    .await;
+                                    tracing::warn!(
+                                        event_name = "pool_attempt_start_cleanup_backpressure",
+                                        log_type = "ops",
+                                        provider_id = %plan.provider_id,
+                                        key_id = %plan.key_id,
+                                        "internal sync execution skipped because sticky cleanup capacity was unavailable"
+                                    );
+                                    return Ok(
+                                        Some(build_internal_gateway_proxy_public_response()),
+                                    );
+                                }
+                            };
                             if !prepare_pool_attempt_started_effect(state, context).await {
                                 return Ok(Some(build_internal_gateway_proxy_public_response()));
                             }
@@ -688,8 +709,29 @@ pub(crate) async fn maybe_build_local_internal_proxy_response_impl(
                                 plan: &plan,
                                 report_context: report_context.as_ref(),
                             };
-                            let mut sticky_init_cleanup =
-                                PoolAttemptStartCleanupGuard::new(state, context);
+                            let mut sticky_init_cleanup = match PoolAttemptStartCleanupGuard::new(
+                                state, context,
+                            ) {
+                                Ok(cleanup) => cleanup,
+                                Err(_) => {
+                                    apply_local_execution_effect(
+                                        state,
+                                        context,
+                                        LocalExecutionEffect::PoolAttemptAborted,
+                                    )
+                                    .await;
+                                    tracing::warn!(
+                                        event_name = "pool_attempt_start_cleanup_backpressure",
+                                        log_type = "ops",
+                                        provider_id = %plan.provider_id,
+                                        key_id = %plan.key_id,
+                                        "internal stream execution skipped because sticky cleanup capacity was unavailable"
+                                    );
+                                    return Ok(
+                                        Some(build_internal_gateway_proxy_public_response()),
+                                    );
+                                }
+                            };
                             if !prepare_pool_attempt_started_effect(state, context).await {
                                 return Ok(Some(build_internal_gateway_proxy_public_response()));
                             }

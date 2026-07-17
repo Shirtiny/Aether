@@ -248,6 +248,21 @@ pub(crate) fn apply_codex_concrete_account_profile_to_request_with_body_policy(
     }
 }
 
+pub(crate) fn apply_codex_concrete_account_profile_to_body_with_policy(
+    provider_request_body: &mut Value,
+    profile: &CodexConcreteAccountProfile,
+    body_policy: CodexProfileRequestBodyPolicy,
+) {
+    match body_policy {
+        CodexProfileRequestBodyPolicy::NormalizeClientMetadata => {
+            normalize_installation_id_in_body(provider_request_body, &profile.installation_id);
+        }
+        CodexProfileRequestBodyPolicy::StripClientMetadata => {
+            strip_codex_client_metadata_from_body(provider_request_body);
+        }
+    }
+}
+
 fn normalize_installation_id_in_headers(
     provider_request_headers: &mut BTreeMap<String, String>,
     installation_id: &str,
@@ -335,6 +350,13 @@ fn rewrite_turn_metadata_installation_id_string(
         }
         None => None,
     }
+}
+
+pub(crate) fn normalize_codex_turn_metadata_for_profile(
+    raw: &str,
+    profile: &CodexConcreteAccountProfile,
+) -> Option<String> {
+    rewrite_turn_metadata_installation_id_string(raw, &profile.installation_id)
 }
 
 fn set_header_value_case_insensitive(

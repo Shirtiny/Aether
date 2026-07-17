@@ -988,10 +988,41 @@ pub fn apply_codex_openai_responses_special_headers(
     }
 }
 
+/// Applies only the body-independent Codex headers that may be copied to the
+/// official WebSocket handshake. Session/thread identity is supplied by the WS
+/// runtime, so prompt-cache-derived HTTP compatibility headers are excluded.
+pub fn apply_codex_official_ws_handshake_headers(
+    provider_request_headers: &mut BTreeMap<String, String>,
+    original_headers: &http::HeaderMap,
+    provider_type: &str,
+    provider_api_format: &str,
+    decrypted_auth_config_raw: Option<&str>,
+) {
+    if !is_codex_openai_responses_request(provider_type, provider_api_format) {
+        return;
+    }
+    remove_btree_header_case_insensitive(provider_request_headers, "chatgpt-account-id");
+    if let Some(account_id) = extract_codex_account_id(decrypted_auth_config_raw) {
+        provider_request_headers.insert("chatgpt-account-id".to_string(), account_id);
+    }
+    maybe_insert_default_codex_header(
+        provider_request_headers,
+        original_headers,
+        "user-agent",
+        CODEX_DEFAULT_USER_AGENT,
+    );
+    maybe_insert_default_codex_header(
+        provider_request_headers,
+        original_headers,
+        "originator",
+        CODEX_DEFAULT_ORIGINATOR,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_codex_openai_responses_chat_body_edits,
+        apply_codex_official_ws_handshake_headers, apply_codex_openai_responses_chat_body_edits,
         apply_codex_openai_responses_special_body_edits,
         apply_codex_openai_responses_special_headers, apply_openai_responses_cache_control_bridge,
         apply_openai_responses_compact_special_body_edits, CODEX_OPENAI_IMAGE_INTERNAL_MODEL,
@@ -1150,6 +1181,30 @@ mod tests {
             provider_request_headers.get("chatgpt-account-id"),
             Some(&"alias-account".to_string())
         );
+    }
+
+    #[test]
+    fn official_ws_headers_are_body_independent_and_exclude_prompt_cache_identity() {
+        let mut provider_request_headers = BTreeMap::new();
+        let original_headers = http::HeaderMap::new();
+
+        apply_codex_official_ws_handshake_headers(
+            &mut provider_request_headers,
+            &original_headers,
+            "codex",
+            "openai:responses",
+            Some(r#"{"account_id":"account-1"}"#),
+        );
+
+        assert_eq!(
+            provider_request_headers.get("chatgpt-account-id"),
+            Some(&"account-1".to_string())
+        );
+        assert!(provider_request_headers.contains_key("user-agent"));
+        assert!(provider_request_headers.contains_key("originator"));
+        assert!(!provider_request_headers.contains_key("session_id"));
+        assert!(!provider_request_headers.contains_key("conversation_id"));
+        assert!(!provider_request_headers.contains_key("x-client-request-id"));
     }
 
     #[test]

@@ -12,6 +12,7 @@ use super::super::cache::{
     AuthApiKeyLastUsedCache, AuthContextCache, DashboardResponseCache, DirectPlanBypassCache,
     SchedulerAffinityCache, SystemConfigCache,
 };
+use super::super::codex_ws_config::CodexWsFeatureFlagsSnapshot;
 use super::super::data::GatewayDataState;
 use super::super::fallback_metrics;
 use super::super::rate_limit::FrontdoorUserRpmLimiter;
@@ -109,6 +110,7 @@ pub struct AppState {
     pub(crate) data: Arc<GatewayDataState>,
     pub(crate) runtime_state: Arc<RuntimeState>,
     pub(crate) usage_runtime: Arc<usage::UsageRuntime>,
+    pub(crate) codex_ws_usage_reporter: Arc<crate::codex_ws::CodexWsUsageReporter>,
     pub(crate) video_tasks: Arc<VideoTaskService>,
     pub(crate) video_task_poller: Option<VideoTaskPollerConfig>,
     pub(crate) frontdoor_runtime_guards: Arc<FrontdoorRuntimeGuardConfig>,
@@ -121,14 +123,17 @@ pub struct AppState {
     pub(crate) direct_plan_bypass_cache: Arc<DirectPlanBypassCache>,
     pub(crate) scheduler_affinity_cache: Arc<SchedulerAffinityCache>,
     pub(crate) scheduler_affinity_epoch: Arc<AtomicU64>,
+    pub(crate) codex_ws_catalog_snapshot_generation: Arc<StdMutex<Option<String>>>,
     pub(crate) dashboard_response_cache: Arc<DashboardResponseCache>,
     pub(crate) system_config_cache: Arc<SystemConfigCache>,
+    pub(crate) codex_ws_feature_flags: Arc<CodexWsFeatureFlagsSnapshot>,
     pub(crate) fallback_metrics: Arc<fallback_metrics::GatewayFallbackMetrics>,
     pub(crate) frontdoor_cors: Option<Arc<FrontdoorCorsConfig>>,
     pub(crate) frontdoor_user_rpm: Arc<FrontdoorUserRpmLimiter>,
     pub(crate) tunnel: crate::tunnel::EmbeddedTunnelState,
     pub(crate) provider_transport_snapshot_cache:
         Arc<StdMutex<HashMap<ProviderTransportSnapshotCacheKey, CachedProviderTransportSnapshot>>>,
+    pub(crate) provider_transport_snapshot_cache_epoch: Arc<AtomicU64>,
     pub(crate) provider_key_rpm_resets: Arc<StdMutex<HashMap<String, u64>>>,
     pub(crate) local_execution_runtime_miss_diagnostics:
         Arc<StdMutex<HashMap<String, LocalExecutionRuntimeMissDiagnostic>>>,
@@ -194,4 +199,19 @@ pub struct AppState {
     pub(crate) provider_oauth_token_url_overrides: Arc<StdMutex<HashMap<String, String>>>,
     #[cfg(test)]
     pub(crate) provider_oauth_discovery_url_overrides: Arc<StdMutex<HashMap<String, String>>>,
+}
+
+#[derive(Debug)]
+pub struct CodexWsUsageReporterWorker {
+    inner: crate::codex_ws::CodexWsUsageReporterWorker,
+}
+
+impl CodexWsUsageReporterWorker {
+    pub(crate) fn new(inner: crate::codex_ws::CodexWsUsageReporterWorker) -> Self {
+        Self { inner }
+    }
+
+    pub async fn shutdown(self, timeout: std::time::Duration) -> bool {
+        self.inner.shutdown(timeout).await
+    }
 }

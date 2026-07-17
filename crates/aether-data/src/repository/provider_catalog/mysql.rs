@@ -728,6 +728,82 @@ WHERE id = ?
         Ok(rows_affected > 0)
     }
 
+    pub async fn update_key_codex_ws_metadata(
+        &self,
+        key_id: &str,
+        enabled: bool,
+        websocket_transport_profile: Option<&serde_json::Value>,
+        updated_at_unix_secs: u64,
+    ) -> Result<bool, DataLayerError> {
+        validate_non_empty(key_id, "provider catalog key_id")?;
+        if enabled
+            && websocket_transport_profile
+                .and_then(serde_json::Value::as_object)
+                .is_none()
+        {
+            return Err(DataLayerError::InvalidInput(
+                "websocket_transport_profile must be an object when enabled".to_string(),
+            ));
+        }
+        let profile_json = websocket_transport_profile
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| DataLayerError::UnexpectedValue(error.to_string()))?
+            .unwrap_or_else(|| "{}".to_string());
+
+        let rows_affected = sqlx::query(
+            r#"
+UPDATE provider_api_keys
+SET
+  capabilities = JSON_SET(
+    CASE WHEN JSON_TYPE(capabilities) = 'OBJECT' THEN capabilities ELSE JSON_OBJECT() END,
+    '$.codex_official_ws',
+    JSON_EXTRACT(?, '$')
+  ),
+  fingerprint = CASE
+    WHEN ? THEN JSON_SET(
+      CASE WHEN JSON_TYPE(fingerprint) = 'OBJECT' THEN fingerprint ELSE JSON_OBJECT() END,
+      '$.websocket_transport_profile',
+      JSON_MERGE_PATCH(
+        CASE
+          WHEN JSON_TYPE(JSON_EXTRACT(fingerprint, '$.websocket_transport_profile')) = 'OBJECT'
+            THEN JSON_EXTRACT(fingerprint, '$.websocket_transport_profile')
+          ELSE JSON_OBJECT()
+        END,
+        JSON_EXTRACT(?, '$')
+      )
+    )
+    ELSE fingerprint
+  END,
+  updated_at = ?
+WHERE id = ?
+"#,
+        )
+        .bind(if enabled { "true" } else { "false" })
+        .bind(enabled)
+        .bind(profile_json)
+        .bind(updated_at_unix_secs as i64)
+        .bind(key_id)
+        .execute(&self.pool)
+        .await
+        .map_sql_err()?
+        .rows_affected();
+        if rows_affected > 0 {
+            return Ok(true);
+        }
+
+        // MySQL reports changed rows by default. An idempotent update can therefore return zero
+        // even though the key exists and already contains the requested metadata.
+        let key_exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM provider_api_keys WHERE id = ?)",
+        )
+        .bind(key_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_sql_err()?;
+        Ok(key_exists)
+    }
+
     pub async fn update_key_upstream_metadata(
         &self,
         key_id: &str,
@@ -1037,6 +1113,23 @@ impl ProviderCatalogWriteRepository for MysqlProviderCatalogReadRepository {
         key: &StoredProviderCatalogKey,
     ) -> Result<StoredProviderCatalogKey, DataLayerError> {
         Self::update_key(self, key).await
+    }
+
+    async fn update_key_codex_ws_metadata(
+        &self,
+        key_id: &str,
+        enabled: bool,
+        websocket_transport_profile: Option<&serde_json::Value>,
+        updated_at_unix_secs: u64,
+    ) -> Result<bool, DataLayerError> {
+        Self::update_key_codex_ws_metadata(
+            self,
+            key_id,
+            enabled,
+            websocket_transport_profile,
+            updated_at_unix_secs,
+        )
+        .await
     }
 
     async fn update_key_upstream_metadata(
@@ -1759,6 +1852,25 @@ mod tests {
             .expect("keys should list");
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].total_tokens, 1234);
+
+        let ws_profile = json!({"schema_version":2,"profile_id":"codex-ws-test"});
+        assert!(repository
+            .update_key_codex_ws_metadata(&key_id, true, Some(&ws_profile), 1_735_000_000)
+            .await
+            .expect("Codex WS metadata should enable"));
+        assert!(repository
+            .update_key_codex_ws_metadata(&key_id, true, Some(&ws_profile), 1_735_000_000)
+            .await
+            .expect("idempotent Codex WS metadata update should still match the key"));
+        assert!(!repository
+            .update_key_codex_ws_metadata(
+                &format!("missing-{suffix}"),
+                true,
+                Some(&ws_profile),
+                1_735_000_000,
+            )
+            .await
+            .expect("missing Codex WS key should not update"));
 
         assert!(repository
             .update_key_upstream_metadata(

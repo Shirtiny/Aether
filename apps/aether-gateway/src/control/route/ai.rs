@@ -34,6 +34,14 @@ pub(super) fn classify_ai_public_route(
             "openai:rerank",
             true,
         ))
+    } else if method == http::Method::GET && normalized_path == "/v1/responses" {
+        Some(classified(
+            "ai_public",
+            "openai",
+            "responses_ws",
+            "openai:responses",
+            false,
+        ))
     } else if method == http::Method::POST
         && matches!(normalized_path, "/v1/responses" | "/v1/responses/compact")
     {

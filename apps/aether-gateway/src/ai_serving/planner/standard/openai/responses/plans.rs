@@ -2,11 +2,14 @@ use async_trait::async_trait;
 use tracing::warn;
 
 use super::decision::{
+    build_batched_local_openai_responses_candidate_attempt_source,
     build_local_openai_responses_candidate_attempt_source,
+    maybe_build_local_openai_responses_codex_ws_planning_attempt,
     maybe_build_local_openai_responses_decision_payload_for_candidate,
-    resolve_local_openai_responses_decision_input, LocalOpenAiResponsesCandidateAttempt,
-    LocalOpenAiResponsesCandidateAttemptSource, LocalOpenAiResponsesDecisionInput,
-    LocalOpenAiResponsesSpec,
+    resolve_local_openai_responses_decision_input,
+    resolve_local_openai_responses_decision_input_with_required_capabilities,
+    LocalOpenAiResponsesCandidateAttempt, LocalOpenAiResponsesCandidateAttemptSource,
+    LocalOpenAiResponsesDecisionInput, LocalOpenAiResponsesSpec,
 };
 use crate::ai_serving::planner::candidate_materialization::{
     local_candidate_attempt_has_sticky_init_owner, release_pool_sticky_init_for_unbuilt_attempt,
@@ -17,6 +20,7 @@ use crate::ai_serving::planner::plan_builders::{
     build_openai_responses_sync_plan_from_decision, stream_attempt_has_sticky_init_owner,
     sync_attempt_has_sticky_init_owner, AiStreamAttempt, AiSyncAttempt,
 };
+use crate::ai_serving::planner::redaction::codex_ws_pii_redaction_required;
 use crate::ai_serving::planner::runtime_miss::{
     apply_local_runtime_candidate_evaluation_progress,
     apply_local_runtime_candidate_terminal_reason, set_local_runtime_miss_diagnostic_reason,
@@ -28,6 +32,8 @@ pub(crate) use crate::ai_serving::{
     resolve_openai_responses_sync_spec as resolve_sync_spec,
 };
 use crate::{AppState, GatewayError};
+
+use super::CodexWsPlanningAttempt;
 
 pub(crate) struct LocalOpenAiResponsesSyncAttemptSource<'a> {
     state: &'a AppState,
@@ -457,14 +463,193 @@ pub(super) async fn build_local_stream_plan_and_reports(
     body_json: &serde_json::Value,
     spec: LocalOpenAiResponsesSpec,
 ) -> Result<Vec<AiStreamAttempt>, GatewayError> {
+    build_local_stream_plan_and_reports_with_required_capabilities(
+        state, parts, trace_id, decision, body_json, spec, None,
+    )
+    .await
+}
+
+pub(super) async fn build_local_stream_plan_and_reports_with_required_capabilities(
+    state: &AppState,
+    parts: &http::request::Parts,
+    trace_id: &str,
+    decision: &GatewayControlDecision,
+    body_json: &serde_json::Value,
+    spec: LocalOpenAiResponsesSpec,
+    explicit_required_capabilities: Option<&serde_json::Value>,
+) -> Result<Vec<AiStreamAttempt>, GatewayError> {
+    build_local_stream_plan_and_reports_with_required_capabilities_mode(
+        state,
+        parts,
+        trace_id,
+        decision,
+        body_json,
+        spec,
+        explicit_required_capabilities,
+        false,
+    )
+    .await
+}
+
+pub(super) async fn build_local_stream_plan_and_reports_with_required_capabilities_compact<
+    Preflight,
+    PreflightFn,
+    PreflightFuture,
+>(
+    state: &AppState,
+    parts: &http::request::Parts,
+    trace_id: &str,
+    decision: &GatewayControlDecision,
+    body_json: &serde_json::Value,
+    spec: LocalOpenAiResponsesSpec,
+    explicit_required_capabilities: Option<&serde_json::Value>,
+    max_materialized_attempts: usize,
+    preflight: PreflightFn,
+) -> Result<Vec<CodexWsPlanningAttempt<Preflight>>, GatewayError>
+where
+    PreflightFn: FnMut(LocalOpenAiResponsesCandidateAttempt) -> PreflightFuture,
+    PreflightFuture: std::future::Future<Output = Option<Preflight>>,
+{
     let spec_metadata = local_openai_responses_spec_metadata(spec);
-    let Some(input) = resolve_local_openai_responses_decision_input(
+    let Some(input) = resolve_local_openai_responses_decision_input_with_required_capabilities(
         state,
         parts,
         trace_id,
         decision,
         body_json,
         spec_metadata.decision_kind,
+        explicit_required_capabilities,
+    )
+    .await?
+    else {
+        return Ok(Vec::new());
+    };
+    set_local_runtime_miss_diagnostic_reason(
+        state,
+        trace_id,
+        decision,
+        spec_metadata.decision_kind,
+        Some(input.requested_model.as_str()),
+        "candidate_evaluation_incomplete",
+    );
+    if codex_ws_pii_redaction_required(state, &input.auth_context, spec_metadata.api_format).await?
+    {
+        set_local_runtime_miss_diagnostic_reason(
+            state,
+            trace_id,
+            decision,
+            spec_metadata.decision_kind,
+            Some(input.requested_model.as_str()),
+            "codex_ws_pii_redaction_requires_http_path",
+        );
+        return Err(GatewayError::Client {
+            status: http::StatusCode::PRECONDITION_FAILED,
+            message: "Codex WebSocket is unavailable when chat PII redaction is enabled"
+                .to_string(),
+        });
+    }
+    // Routing may have produced one request-scoped effective body. Borrow it
+    // throughout candidate fanout; do not clone it into each candidate plan.
+    let effective_body_json = input.effective_body_json(body_json);
+    let (mut source, candidate_count) =
+        build_batched_local_openai_responses_candidate_attempt_source(
+            state,
+            trace_id,
+            &input,
+            effective_body_json,
+            spec,
+        )
+        .await?;
+    apply_local_runtime_candidate_evaluation_progress(state, trace_id, candidate_count);
+
+    let mut preflight = preflight;
+    let mut selected =
+        std::collections::VecDeque::with_capacity(max_materialized_attempts.min(candidate_count));
+    while selected.len() < max_materialized_attempts {
+        let Some(attempt) = source.next_attempt().await? else {
+            break;
+        };
+        match preflight(attempt.clone()).await {
+            Some(preflight) => selected.push_back((attempt, preflight)),
+            None => release_pool_sticky_init_for_unbuilt_attempt(state, &attempt).await,
+        }
+    }
+    for deferred in source.drain_static_attempts() {
+        release_pool_sticky_init_for_unbuilt_attempt(state, &deferred).await;
+    }
+
+    let mut plans = Vec::with_capacity(selected.len());
+    while let Some((attempt, preflight)) = selected.pop_front() {
+        let sticky_init_attempt = local_candidate_attempt_has_sticky_init_owner(&attempt);
+        let cleanup_attempt = attempt.clone();
+        let planning_attempt = match maybe_build_local_openai_responses_codex_ws_planning_attempt(
+            state,
+            parts,
+            trace_id,
+            effective_body_json,
+            &input,
+            attempt,
+            spec,
+        )
+        .await
+        {
+            Ok(value) => value,
+            Err(err) => {
+                release_pool_sticky_init_for_unbuilt_attempt(state, &cleanup_attempt).await;
+                release_preflight_attempts(state, &mut selected).await;
+                return Err(err);
+            }
+        };
+        let Some((value, provider_body_patch)) = planning_attempt else {
+            release_pool_sticky_init_for_unbuilt_attempt(state, &cleanup_attempt).await;
+            continue;
+        };
+        let stop_after_value = stream_attempt_has_sticky_init_owner(&value);
+        if sticky_init_attempt && !stop_after_value {
+            release_pool_sticky_init_for_unbuilt_attempt(state, &cleanup_attempt).await;
+        }
+        plans.push(CodexWsPlanningAttempt {
+            attempt: value,
+            preflight,
+            provider_body_patch,
+        });
+        if stop_after_value {
+            release_preflight_attempts(state, &mut selected).await;
+            break;
+        }
+    }
+    apply_local_runtime_candidate_terminal_reason(state, trace_id, "no_local_stream_plans");
+    Ok(plans)
+}
+
+async fn release_preflight_attempts<Preflight>(
+    state: &AppState,
+    selected: &mut std::collections::VecDeque<(LocalOpenAiResponsesCandidateAttempt, Preflight)>,
+) {
+    while let Some((attempt, _)) = selected.pop_front() {
+        release_pool_sticky_init_for_unbuilt_attempt(state, &attempt).await;
+    }
+}
+
+async fn build_local_stream_plan_and_reports_with_required_capabilities_mode(
+    state: &AppState,
+    parts: &http::request::Parts,
+    trace_id: &str,
+    decision: &GatewayControlDecision,
+    body_json: &serde_json::Value,
+    spec: LocalOpenAiResponsesSpec,
+    explicit_required_capabilities: Option<&serde_json::Value>,
+    compact_attempts: bool,
+) -> Result<Vec<AiStreamAttempt>, GatewayError> {
+    let spec_metadata = local_openai_responses_spec_metadata(spec);
+    let Some(input) = resolve_local_openai_responses_decision_input_with_required_capabilities(
+        state,
+        parts,
+        trace_id,
+        decision,
+        body_json,
+        spec_metadata.decision_kind,
+        explicit_required_capabilities,
     )
     .await?
     else {
@@ -514,10 +699,16 @@ pub(super) async fn build_local_stream_plan_and_reports(
             payload,
             spec.compact,
         ) {
-            Ok(Some(value)) => {
+            Ok(Some(mut value)) => {
                 let stop_after_value = stream_attempt_has_sticky_init_owner(&value);
                 if sticky_init_attempt && !stop_after_value {
                     release_pool_sticky_init_for_unbuilt_attempt(state, &cleanup_attempt).await;
+                }
+                if compact_attempts {
+                    value.plan = crate::codex_ws::compact_ws_planning_attempt_plan(&value.plan);
+                    value.report_context = crate::codex_ws::compact_report_context_template(
+                        value.report_context.as_ref(),
+                    );
                 }
                 plans.push(value);
                 if stop_after_value {

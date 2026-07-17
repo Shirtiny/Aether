@@ -264,6 +264,34 @@ pub fn apply_model_directive_overrides_from_model(
     Some(directive)
 }
 
+/// Applies model directives to an owned OpenAI Responses request without
+/// cloning the complete request body. The caller must pass an object body;
+/// every directive supported by this format can then be applied in place.
+pub fn apply_openai_responses_model_directive_overrides_from_model_in_place(
+    provider_request_body: &mut Value,
+    provider_model: &str,
+    source_model: &str,
+) -> Option<ModelDirective> {
+    provider_request_body.as_object()?;
+    normalize_codex_effort_alias(provider_request_body, "openai:responses", source_model);
+    let directive = parse_model_directive(source_model)?;
+    for override_item in &directive.overrides {
+        match override_item {
+            ModelOverride::ReasoningEffort(effort) => apply_reasoning_effort_override(
+                provider_request_body,
+                "openai:responses",
+                provider_model,
+                &directive.base_model,
+                *effort,
+            )?,
+            ModelOverride::ServiceTier(tier) => {
+                apply_service_tier_override(provider_request_body, "openai:responses", *tier)?
+            }
+        }
+    }
+    Some(directive)
+}
+
 fn normalize_codex_effort_alias(
     provider_request_body: &mut Value,
     provider_api_format: &str,

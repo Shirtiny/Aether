@@ -102,6 +102,31 @@ fn system_config_key_affects_frontdoor_rpm(key: &str) -> bool {
 }
 
 impl AppState {
+    async fn finish_codex_ws_global_hot_after_authoritative_read(
+        &self,
+        mutation: crate::codex_ws::hot_state::CodexWsHotMutation,
+    ) -> Result<Option<serde_json::Value>, GatewayError> {
+        match self
+            .data
+            .find_system_config_value(crate::codex_ws_config::CODEX_WS_SYSTEM_CONFIG_KEY)
+            .await
+        {
+            Ok(value) => {
+                crate::codex_ws::hot_state::finish_global_hot_mutation(
+                    self,
+                    mutation,
+                    crate::codex_ws_config::parse_codex_ws_feature_flags(value.as_ref()),
+                )
+                .await?;
+                Ok(value)
+            }
+            Err(err) => {
+                crate::codex_ws::hot_state::leave_hot_mutation_unstable(self, mutation).await;
+                Err(GatewayError::Internal(err.to_string()))
+            }
+        }
+    }
+
     fn usage_worker_queue_for(
         runtime_state: &Arc<RuntimeState>,
     ) -> Option<Arc<dyn RuntimeQueueStore>> {
@@ -180,6 +205,7 @@ impl AppState {
         self.invalidate_scheduler_affinity_cache();
         self.invalidate_auth_context_cache();
         self.system_config_cache.clear();
+        self.codex_ws_feature_flags.clear();
         self.frontdoor_user_rpm.clear_system_default_cache();
         let data = Arc::new(
             (*data)
@@ -238,6 +264,7 @@ impl AppState {
             data: Arc::clone(&data),
             runtime_state: runtime_state.clone(),
             usage_runtime: Arc::new(usage::UsageRuntime::disabled()),
+            codex_ws_usage_reporter: Arc::new(crate::codex_ws::CodexWsUsageReporter::from_env()),
             video_tasks: Arc::new(VideoTaskService::new(
                 VideoTaskTruthSourceMode::PythonSyncReport,
             )),
@@ -252,8 +279,12 @@ impl AppState {
             direct_plan_bypass_cache: Arc::new(DirectPlanBypassCache::default()),
             scheduler_affinity_cache: Arc::new(SchedulerAffinityCache::default()),
             scheduler_affinity_epoch: Arc::new(AtomicU64::new(0)),
+            codex_ws_catalog_snapshot_generation: Arc::new(StdMutex::new(None)),
             dashboard_response_cache: Arc::new(DashboardResponseCache::default()),
             system_config_cache: Arc::new(SystemConfigCache::default()),
+            codex_ws_feature_flags: Arc::new(
+                crate::codex_ws_config::CodexWsFeatureFlagsSnapshot::default(),
+            ),
             fallback_metrics: Arc::new(fallback_metrics::GatewayFallbackMetrics::default()),
             frontdoor_cors: None,
             frontdoor_user_rpm: Arc::new(FrontdoorUserRpmLimiter::new(
@@ -264,6 +295,7 @@ impl AppState {
                 runtime_state.clone(),
             ),
             provider_transport_snapshot_cache: Arc::new(StdMutex::new(HashMap::new())),
+            provider_transport_snapshot_cache_epoch: Arc::new(AtomicU64::new(0)),
             provider_key_rpm_resets: Arc::new(StdMutex::new(HashMap::new())),
             local_execution_runtime_miss_diagnostics: Arc::new(StdMutex::new(HashMap::new())),
             admin_monitoring_error_stats_reset_at: Arc::new(StdMutex::new(None)),
@@ -362,6 +394,15 @@ impl AppState {
     ) -> Result<Self, aether_data::DataLayerError> {
         self.usage_runtime = Arc::new(usage::UsageRuntime::new(config)?);
         Ok(self)
+    }
+
+    pub fn spawn_codex_ws_usage_reporter(
+        &self,
+    ) -> Result<super::CodexWsUsageReporterWorker, std::io::Error> {
+        self.codex_ws_usage_reporter
+            .start(self.clone())
+            .map(super::CodexWsUsageReporterWorker::new)
+            .map_err(std::io::Error::other)
     }
 
     pub async fn run_database_migrations(&self) -> Result<bool, sqlx::migrate::MigrateError> {
@@ -531,13 +572,28 @@ impl AppState {
         value: &serde_json::Value,
         description: Option<&str>,
     ) -> Result<serde_json::Value, GatewayError> {
-        let value = self
+        let hot_mutation = if key == crate::codex_ws_config::CODEX_WS_SYSTEM_CONFIG_KEY {
+            Some(crate::codex_ws::hot_state::begin_global_hot_mutation(self).await?)
+        } else {
+            None
+        };
+        let write_result = self
             .data
             .upsert_system_config_value(key, value, description)
-            .await
-            .map_err(|err| GatewayError::Internal(err.to_string()))?;
-        self.remember_system_config_write(key, Some(value.clone()));
-        Ok(value)
+            .await;
+        let authoritative = match hot_mutation {
+            Some(mutation) => Some(
+                self.finish_codex_ws_global_hot_after_authoritative_read(mutation)
+                    .await?,
+            ),
+            None => None,
+        };
+        let written = write_result.map_err(|err| GatewayError::Internal(err.to_string()))?;
+        self.remember_system_config_write(
+            key,
+            authoritative.unwrap_or_else(|| Some(written.clone())),
+        );
+        Ok(written)
     }
 
     pub(crate) async fn list_system_config_entries(
@@ -555,23 +611,51 @@ impl AppState {
         value: &serde_json::Value,
         description: Option<&str>,
     ) -> Result<crate::data::state::StoredSystemConfigEntry, GatewayError> {
-        let entry = self
+        let hot_mutation = if key == crate::codex_ws_config::CODEX_WS_SYSTEM_CONFIG_KEY {
+            Some(crate::codex_ws::hot_state::begin_global_hot_mutation(self).await?)
+        } else {
+            None
+        };
+        let write_result = self
             .data
             .upsert_system_config_entry(key, value, description)
-            .await
-            .map_err(|err| GatewayError::Internal(err.to_string()))?;
-        self.remember_system_config_write(entry.key.as_str(), Some(entry.value.clone()));
+            .await;
+        let authoritative = match hot_mutation {
+            Some(mutation) => Some(
+                self.finish_codex_ws_global_hot_after_authoritative_read(mutation)
+                    .await?,
+            ),
+            None => None,
+        };
+        let entry = write_result.map_err(|err| GatewayError::Internal(err.to_string()))?;
+        self.remember_system_config_write(
+            entry.key.as_str(),
+            authoritative.unwrap_or_else(|| Some(entry.value.clone())),
+        );
         Ok(entry)
     }
 
     pub(crate) async fn delete_system_config_value(&self, key: &str) -> Result<bool, GatewayError> {
-        let deleted = self
-            .data
-            .delete_system_config_value(key)
-            .await
-            .map_err(|err| GatewayError::Internal(err.to_string()))?;
-        self.system_config_cache
-            .insert(key.to_string(), None, SYSTEM_CONFIG_CACHE_TTL);
+        let hot_mutation = if key == crate::codex_ws_config::CODEX_WS_SYSTEM_CONFIG_KEY {
+            Some(crate::codex_ws::hot_state::begin_global_hot_mutation(self).await?)
+        } else {
+            None
+        };
+        let write_result = self.data.delete_system_config_value(key).await;
+        let authoritative = match hot_mutation {
+            Some(mutation) => Some(
+                self.finish_codex_ws_global_hot_after_authoritative_read(mutation)
+                    .await?,
+            ),
+            None => None,
+        };
+        let deleted = write_result.map_err(|err| GatewayError::Internal(err.to_string()))?;
+        if let Some(authoritative) = authoritative {
+            self.remember_system_config_write(key, authoritative);
+        } else {
+            self.system_config_cache
+                .insert(key.to_string(), None, SYSTEM_CONFIG_CACHE_TTL);
+        }
         if deleted && system_config_key_affects_scheduler(key) {
             self.invalidate_scheduler_affinity_cache();
         }
@@ -601,7 +685,16 @@ impl AppState {
         self.auth_context_cache.clear();
     }
 
+    pub(crate) fn auth_context_invalidation_epoch(&self) -> u64 {
+        self.auth_context_cache.invalidation_epoch()
+    }
+
     fn remember_system_config_write(&self, key: &str, value: Option<serde_json::Value>) {
+        if key == crate::codex_ws_config::CODEX_WS_SYSTEM_CONFIG_KEY {
+            self.codex_ws_feature_flags.store(
+                crate::codex_ws_config::parse_codex_ws_feature_flags(value.as_ref()),
+            );
+        }
         self.system_config_cache
             .insert(key.to_string(), value, SYSTEM_CONFIG_CACHE_TTL);
         if system_config_key_affects_scheduler(key) {
@@ -641,6 +734,7 @@ impl AppState {
                 | aether_data::repository::system::AdminSystemPurgeTarget::Stats
         ) {
             self.system_config_cache.clear();
+            self.codex_ws_feature_flags.clear();
             self.invalidate_provider_routing_caches();
         }
         Ok(summary)

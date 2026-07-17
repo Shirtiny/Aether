@@ -43,6 +43,24 @@ pub(crate) fn extract_requested_model(
         .filter(|value| !value.is_empty())
 }
 
+pub(crate) fn extract_requested_model_from_json(
+    decision: &GatewayControlDecision,
+    uri: &Uri,
+    body: &serde_json::Value,
+) -> Option<String> {
+    if decision.route_family.as_deref() == Some("gemini") {
+        if let Some(model) = extract_gemini_model_from_path(uri.path()) {
+            return Some(model);
+        }
+    }
+
+    body.get("model")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 pub(super) fn extract_request_credentials(
     headers: &http::HeaderMap,
     uri: &Uri,

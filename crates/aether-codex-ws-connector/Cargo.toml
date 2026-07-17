@@ -1,0 +1,35 @@
+[package]
+name = "aether-codex-ws-connector"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Isolated OpenAI Codex Responses WebSocket connector"
+
+[dependencies]
+aws-lc-rs = "=1.16.2"
+aws-lc-sys = "=0.39.0"
+futures-util.workspace = true
+rustls = { version = "=0.23.36", default-features = false, features = ["aws_lc_rs", "std"] }
+rustls-native-certs = "=0.8.3"
+rustls-pki-types = "=1.14.0"
+rustls-webpki = "=0.103.13"
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["net", "rt", "time"] }
+tokio-rustls = "=0.26.4"
+tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186", features = ["proxy", "rustls-tls-native-roots"] }
+tungstenite = { path = "../../vendor/tungstenite", features = ["deflate", "proxy"] }
+url.workspace = true
+
+[dev-dependencies]
+base64.workspace = true
+# Prove the pinned KX order survives feature unification in the embedding gateway.
+rustls = { version = "=0.23.36", default-features = false, features = ["prefer-post-quantum"] }
+tempfile = "3.27.0"
+tokio = { workspace = true, features = ["macros", "test-util"] }
+toml = "0.8"
+
+[lib]
+doctest = false

@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 
 use super::{
     build_cross_format_openai_responses_request_body, build_local_openai_responses_request_body,
-    build_local_openai_responses_upstream_url,
+    build_local_openai_responses_upstream_url, build_owned_local_openai_responses_request_body,
 };
 
 fn object_keys(value: &Value) -> Vec<&str> {
@@ -242,6 +242,81 @@ fn local_openai_responses_wrapper_applies_model_directive_before_body_rules() {
     assert_eq!(provider_request_body["reasoning"]["effort"], "xhigh");
     assert_eq!(provider_request_body["reasoning"]["summary"], "auto");
     assert_eq!(provider_request_body["metadata"]["override_seen"], true);
+}
+
+#[test]
+fn owned_codex_ws_materialization_matches_borrowed_rules_without_cloning_input() {
+    let large_input = "x".repeat(1024 * 1024);
+    let body_json = json!({
+        "model": "gpt-5.4-max-fast",
+        "input": large_input,
+        "reasoning": {"effort": "low", "summary": "auto"},
+        "stream": false
+    });
+    let input_pointer = body_json["input"].as_str().expect("input string").as_ptr();
+    let body_rules = json!([
+        {"action":"set","path":"metadata.header_seen","value":true,"condition":{"source":"request_headers","path":"x-mode","op":"eq","value":"fast"}},
+        {"action":"set","path":"metadata.model_seen","value":true,"condition":{"source":"current","path":"model","op":"eq","value":"gpt-5.4"}}
+    ]);
+    let mut headers = http::HeaderMap::new();
+    headers.insert("x-mode", http::HeaderValue::from_static("fast"));
+
+    let expected = build_local_openai_responses_request_body(
+        &body_json,
+        "gpt-5.4",
+        true,
+        false,
+        "codex",
+        "openai:responses",
+        Some(&body_rules),
+        Some("key-123"),
+        &headers,
+        true,
+    )
+    .expect("borrowed materialization");
+    let actual = build_owned_local_openai_responses_request_body(
+        body_json,
+        "gpt-5.4",
+        true,
+        false,
+        "codex",
+        "openai:responses",
+        Some(&body_rules),
+        Some("key-123"),
+        &headers,
+        true,
+    )
+    .expect("owned materialization");
+
+    assert_eq!(actual, expected);
+    assert_eq!(
+        actual["input"].as_str().expect("owned input").as_ptr(),
+        input_pointer,
+        "the large client payload allocation must move into the provider body"
+    );
+}
+
+#[test]
+fn owned_codex_ws_materialization_rejects_original_body_rules() {
+    let body_rules = json!([{
+        "action": "set",
+        "path": "metadata.from_original",
+        "value": true,
+        "condition": {"source": "original", "path": "model", "op": "exists"}
+    }]);
+    assert!(build_owned_local_openai_responses_request_body(
+        json!({"model":"gpt-5.4","input":"hello"}),
+        "gpt-5.4",
+        true,
+        false,
+        "codex",
+        "openai:responses",
+        Some(&body_rules),
+        Some("key-123"),
+        &http::HeaderMap::new(),
+        false,
+    )
+    .is_none());
 }
 
 #[test]

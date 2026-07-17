@@ -23,7 +23,8 @@ use crate::ai_serving::planner::redaction::{
 };
 use crate::ai_serving::planner::spec_metadata::local_openai_responses_spec_metadata;
 use crate::ai_serving::planner::standard::{
-    apply_codex_openai_responses_special_body_edits, apply_codex_openai_responses_special_headers,
+    apply_codex_official_ws_handshake_headers, apply_codex_openai_responses_special_body_edits,
+    apply_codex_openai_responses_special_headers,
     apply_codex_pool_concrete_account_profile_for_api_format,
     apply_deepseek_tool_call_thinking_compat, build_cross_format_openai_responses_request_body,
     build_cross_format_openai_responses_upstream_url, build_local_openai_responses_request_body,
@@ -45,10 +46,11 @@ use crate::ai_serving::transport::kiro::{
     KiroRequestAuth, KIRO_ENVELOPE_NAME,
 };
 use crate::ai_serving::transport::{
-    build_kiro_cross_format_upstream_url, build_openai_image_headers,
-    build_openai_image_upstream_url, build_standard_provider_request_headers,
-    build_windsurf_cascade_headers, build_windsurf_cascade_request_body,
-    build_windsurf_cascade_upstream_url, is_gemini_cli_provider_transport,
+    body_rules_are_owned_materialization_safe, build_kiro_cross_format_upstream_url,
+    build_openai_image_headers, build_openai_image_upstream_url,
+    build_standard_provider_request_headers, build_windsurf_cascade_headers,
+    build_windsurf_cascade_request_body, build_windsurf_cascade_upstream_url,
+    header_rules_are_body_free_candidate_safe, is_gemini_cli_provider_transport,
     is_windsurf_provider_transport, local_standard_transport_unsupported_reason_with_network,
     local_windsurf_request_transport_unsupported_reason_with_network,
     openai_image_transport_unsupported_reason, resolve_openai_image_auth,
@@ -90,6 +92,221 @@ pub(crate) struct LocalOpenAiResponsesCandidatePayloadParts {
     pub(super) transport_profile: Option<ResolvedTransportProfile>,
     pub(super) image_request_summary: Option<Value>,
     pub(super) request_redacted: bool,
+}
+
+/// The account-scoped request data needed to open an official Codex WebSocket.
+///
+/// This intentionally borrows the response.create body while evaluating header
+/// rules and never stores or rebuilds it. Body rules, model directives and the
+/// concrete account body profile are applied once, after the account is chosen.
+pub(crate) struct LocalOpenAiResponsesCodexWsCandidateParts {
+    pub(super) mapped_model: String,
+    pub(super) provider_api_format: String,
+    pub(super) provider_request_headers: BTreeMap<String, String>,
+    pub(super) upstream_url: String,
+    pub(super) upstream_is_stream: bool,
+    pub(super) transport: Arc<GatewayProviderTransportSnapshot>,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn resolve_local_openai_responses_codex_ws_candidate_parts(
+    state: &AppState,
+    parts: &http::request::Parts,
+    trace_id: &str,
+    body_json: &serde_json::Value,
+    input: &LocalOpenAiResponsesDecisionInput,
+    eligible: &EligibleLocalExecutionCandidate,
+    candidate_index: u32,
+    candidate_id: &str,
+    spec: LocalOpenAiResponsesSpec,
+) -> Result<Option<LocalOpenAiResponsesCodexWsCandidateParts>, GatewayError> {
+    let spec_metadata = local_openai_responses_spec_metadata(spec);
+    let candidate = &eligible.candidate;
+    let transport = &eligible.transport;
+    let provider_api_format = eligible.provider_api_format.as_str();
+    if !crate::ai_serving::normalize_api_format_alias(provider_api_format)
+        .eq_ignore_ascii_case("openai:responses")
+        || !transport
+            .provider
+            .provider_type
+            .trim()
+            .eq_ignore_ascii_case("codex")
+    {
+        mark_skipped_local_openai_responses_candidate(
+            state,
+            input,
+            trace_id,
+            candidate,
+            candidate_index,
+            candidate_id,
+            "codex_ws_transport_unsupported",
+        )
+        .await;
+        return Ok(None);
+    }
+    if let Some(skip_reason) =
+        local_standard_transport_unsupported_reason_with_network(transport, provider_api_format)
+    {
+        mark_skipped_local_openai_responses_candidate(
+            state,
+            input,
+            trace_id,
+            candidate,
+            candidate_index,
+            candidate_id,
+            skip_reason,
+        )
+        .await;
+        return Ok(None);
+    }
+    if !header_rules_are_body_free_candidate_safe(transport.endpoint.header_rules.as_ref()) {
+        mark_skipped_local_openai_responses_candidate(
+            state,
+            input,
+            trace_id,
+            candidate,
+            candidate_index,
+            candidate_id,
+            "codex_ws_header_rules_require_provider_body",
+        )
+        .await;
+        return Ok(None);
+    }
+    if !body_rules_are_owned_materialization_safe(transport.endpoint.body_rules.as_ref()) {
+        mark_skipped_local_openai_responses_candidate(
+            state,
+            input,
+            trace_id,
+            candidate,
+            candidate_index,
+            candidate_id,
+            "codex_ws_body_rules_require_original_body",
+        )
+        .await;
+        return Ok(None);
+    }
+
+    let prepared = match prepare_header_authenticated_candidate(
+        PlannerAppState::new(state),
+        transport,
+        candidate,
+        resolve_local_openai_bearer_auth(transport),
+        OauthPreparationContext {
+            trace_id,
+            api_format: provider_api_format,
+            operation: "codex_ws_candidate_request",
+        },
+    )
+    .await
+    {
+        Ok(prepared) => prepared,
+        Err(skip_reason) => {
+            mark_skipped_local_openai_responses_candidate(
+                state,
+                input,
+                trace_id,
+                candidate,
+                candidate_index,
+                candidate_id,
+                skip_reason,
+            )
+            .await;
+            return Ok(None);
+        }
+    };
+
+    let upstream_is_stream = resolve_upstream_is_stream_for_provider(
+        transport.endpoint.config.as_ref(),
+        transport.provider.provider_type.as_str(),
+        provider_api_format,
+        spec_metadata.require_streaming,
+        false,
+    );
+    let Some(upstream_url) = build_local_openai_responses_upstream_url(
+        parts,
+        transport,
+        crate::ai_serving::normalize_api_format_alias(provider_api_format)
+            .eq_ignore_ascii_case("openai:responses:compact"),
+    ) else {
+        mark_skipped_local_openai_responses_candidate_with_failure_diagnostic(
+            state,
+            input,
+            trace_id,
+            candidate,
+            candidate_index,
+            candidate_id,
+            "upstream_url_missing",
+            CandidateFailureDiagnostic::upstream_url_missing(
+                spec_metadata.api_format,
+                provider_api_format,
+                "codex_ws_url",
+            ),
+        )
+        .await;
+        return Ok(None);
+    };
+
+    // Header rules only inspect the borrowed effective body. The provider body
+    // itself is intentionally not cloned or normalized during candidate fanout.
+    let effective_headers = input.effective_headers(&parts.headers);
+    let Some(resolved_headers) =
+        build_standard_provider_request_headers(StandardProviderRequestHeadersInput {
+            transport,
+            provider_api_format,
+            same_format: true,
+            headers: effective_headers,
+            auth_header: &prepared.auth_header,
+            auth_value: &prepared.auth_value,
+            extra_headers: &BTreeMap::new(),
+            header_rules: transport.endpoint.header_rules.as_ref(),
+            provider_request_body: body_json,
+            original_request_body: body_json,
+            upstream_is_stream,
+        })
+    else {
+        mark_skipped_local_openai_responses_candidate_with_failure_diagnostic(
+            state,
+            input,
+            trace_id,
+            candidate,
+            candidate_index,
+            candidate_id,
+            "transport_header_rules_apply_failed",
+            CandidateFailureDiagnostic::header_rules_apply_failed(
+                spec_metadata.api_format,
+                provider_api_format,
+                "codex_ws_headers",
+            ),
+        )
+        .await;
+        return Ok(None);
+    };
+    let mut provider_request_headers = resolved_headers.headers;
+    apply_codex_official_ws_handshake_headers(
+        &mut provider_request_headers,
+        effective_headers,
+        transport.provider.provider_type.as_str(),
+        provider_api_format,
+        transport.key.decrypted_auth_config.as_deref(),
+    );
+    // The concrete profile's header half is independent of the body. The body
+    // half is applied after the winning account is selected.
+    let mut ignored_body = Value::Null;
+    apply_codex_pool_concrete_account_profile_for_api_format(
+        &mut provider_request_headers,
+        &mut ignored_body,
+        transport,
+        provider_api_format,
+    );
+
+    Ok(Some(LocalOpenAiResponsesCodexWsCandidateParts {
+        mapped_model: prepared.mapped_model,
+        provider_api_format: provider_api_format.to_string(),
+        provider_request_headers,
+        upstream_url,
+        upstream_is_stream,
+        transport: Arc::clone(transport),
+    }))
 }
 
 #[allow(clippy::too_many_arguments)]

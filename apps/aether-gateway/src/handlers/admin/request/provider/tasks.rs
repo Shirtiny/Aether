@@ -368,6 +368,62 @@ impl<'a> AdminAppState<'a> {
             .into_response());
         }
 
+        if matches!(
+            plan.action,
+            AdminPoolBatchActionKind::EnableCodexWs | AdminPoolBatchActionKind::DisableCodexWs
+        ) {
+            if !provider.provider_type.trim().eq_ignore_ascii_case("codex") {
+                return Ok((
+                    http::StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(json!({ "detail": "Codex WS batch actions require a Codex provider" })),
+                )
+                    .into_response());
+            }
+            let enabled = plan.action == AdminPoolBatchActionKind::EnableCodexWs;
+            let profile = enabled.then(|| {
+                json!({
+                    "schema_version": aether_provider_transport::CODEX_OFFICIAL_WS_PROFILE_SCHEMA_VERSION,
+                    "profile_id": aether_provider_transport::CODEX_OFFICIAL_WS_PROFILE_ID,
+                    "codex_commit": aether_provider_transport::CODEX_OFFICIAL_WS_CODEX_COMMIT,
+                    "tokio_tungstenite_rev": aether_provider_transport::CODEX_OFFICIAL_WS_TOKIO_TUNGSTENITE_REV,
+                    "tungstenite_rev": aether_provider_transport::CODEX_OFFICIAL_WS_TUNGSTENITE_REV,
+                    "tungstenite_patch_id": aether_provider_transport::CODEX_OFFICIAL_WS_TUNGSTENITE_PATCH_ID,
+                    "write_buffer_size_bytes": aether_provider_transport::CODEX_OFFICIAL_WS_WRITE_BUFFER_SIZE_BYTES,
+                    "max_write_buffer_size_bytes": aether_provider_transport::CODEX_OFFICIAL_WS_MAX_WRITE_BUFFER_SIZE_BYTES,
+                    "max_retained_write_buffer_capacity_bytes": aether_provider_transport::CODEX_OFFICIAL_WS_MAX_RETAINED_WRITE_BUFFER_CAPACITY_BYTES,
+                    "crypto_provider": aether_provider_transport::CODEX_OFFICIAL_WS_CRYPTO_PROVIDER,
+                })
+            });
+            let updated_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_secs())
+                .unwrap_or(0);
+            let mut affected = 0usize;
+            for key in keys
+                .iter()
+                .filter(|key| key.auth_type.trim().eq_ignore_ascii_case("oauth"))
+            {
+                if self
+                    .update_provider_catalog_key_codex_ws_metadata(
+                        &key.id,
+                        enabled,
+                        profile.as_ref(),
+                        updated_at,
+                    )
+                    .await?
+                {
+                    affected = affected.saturating_add(1);
+                }
+            }
+            return Ok(Json(
+                admin_provider_pool_pure::build_admin_pool_batch_action_result_payload(
+                    affected,
+                    plan.action_label,
+                ),
+            )
+            .into_response());
+        }
+
         let mut affected = 0usize;
         for mut key in keys {
             match plan.action {
@@ -379,6 +435,8 @@ impl<'a> AdminAppState<'a> {
                     key.fingerprint =
                         Some(aether_provider_transport::claude_code::generate_random_fingerprint())
                 }
+                AdminPoolBatchActionKind::EnableCodexWs
+                | AdminPoolBatchActionKind::DisableCodexWs => unreachable!(),
                 AdminPoolBatchActionKind::Delete => unreachable!(),
             }
             if self.update_provider_catalog_key(&key).await?.is_some() {

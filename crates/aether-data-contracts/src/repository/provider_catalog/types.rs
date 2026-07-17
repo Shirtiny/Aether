@@ -677,6 +677,17 @@ pub trait ProviderCatalogWriteRepository: Send + Sync {
         key: &StoredProviderCatalogKey,
     ) -> Result<StoredProviderCatalogKey, crate::DataLayerError>;
 
+    /// Atomically changes the account-scoped Codex WebSocket metadata without replacing either
+    /// JSON document. Implementations must retain unknown keys in `capabilities`, `fingerprint`,
+    /// and the existing `websocket_transport_profile` object.
+    async fn update_key_codex_ws_metadata(
+        &self,
+        key_id: &str,
+        enabled: bool,
+        websocket_transport_profile: Option<&serde_json::Value>,
+        updated_at_unix_secs: u64,
+    ) -> Result<bool, crate::DataLayerError>;
+
     async fn update_key_upstream_metadata(
         &self,
         key_id: &str,

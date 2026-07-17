@@ -154,6 +154,7 @@ export interface PoolKeyDetail {
   note?: string | null
   allowed_models?: AllowedModels
   capabilities?: Record<string, boolean> | null
+  fingerprint?: Record<string, unknown> | null
   auto_fetch_models?: boolean
   locked_models?: string[] | null
   model_include_patterns?: string[] | null
@@ -333,6 +334,8 @@ export interface PoolBatchAction {
   action:
     | 'enable'
     | 'disable'
+    | 'enable_codex_ws'
+    | 'disable_codex_ws'
     | 'delete'
     | 'clear_proxy'
     | 'set_proxy'

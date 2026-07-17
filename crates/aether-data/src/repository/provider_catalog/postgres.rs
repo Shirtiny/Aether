@@ -1834,6 +1834,67 @@ WHERE id = $1
         Ok(rows_affected > 0)
     }
 
+    pub async fn update_key_codex_ws_metadata(
+        &self,
+        key_id: &str,
+        enabled: bool,
+        websocket_transport_profile: Option<&serde_json::Value>,
+        updated_at_unix_secs: u64,
+    ) -> Result<bool, DataLayerError> {
+        if key_id.trim().is_empty() {
+            return Err(DataLayerError::InvalidInput(
+                "provider catalog key_id is empty".to_string(),
+            ));
+        }
+        if enabled
+            && websocket_transport_profile
+                .and_then(serde_json::Value::as_object)
+                .is_none()
+        {
+            return Err(DataLayerError::InvalidInput(
+                "websocket_transport_profile must be an object when enabled".to_string(),
+            ));
+        }
+
+        let rows_affected = sqlx::query(
+            r#"
+UPDATE provider_api_keys
+SET
+  capabilities = jsonb_set(
+    CASE WHEN jsonb_typeof(capabilities) = 'object' THEN capabilities ELSE '{}'::jsonb END,
+    '{codex_official_ws}',
+    TO_JSONB($2::boolean),
+    true
+  ),
+  fingerprint = CASE
+    WHEN $2::boolean THEN jsonb_set(
+      CASE WHEN jsonb_typeof(fingerprint) = 'object' THEN fingerprint ELSE '{}'::jsonb END,
+      '{websocket_transport_profile}',
+      CASE
+        WHEN jsonb_typeof(fingerprint->'websocket_transport_profile') = 'object'
+          THEN fingerprint->'websocket_transport_profile'
+        ELSE '{}'::jsonb
+      END || $3::jsonb,
+      true
+    )
+    ELSE fingerprint
+  END,
+  updated_at = TO_TIMESTAMP($4::double precision)
+WHERE id = $1
+"#,
+        )
+        .bind(key_id)
+        .bind(enabled)
+        .bind(websocket_transport_profile)
+        .bind(updated_at_unix_secs as f64)
+        .execute(&self.pool)
+        .await
+        .map_postgres_err()?
+        .rows_affected();
+
+        Ok(rows_affected > 0)
+    }
+
     pub async fn update_key_upstream_metadata(
         &self,
         key_id: &str,
@@ -2039,6 +2100,23 @@ impl ProviderCatalogWriteRepository for SqlxProviderCatalogReadRepository {
         key: &StoredProviderCatalogKey,
     ) -> Result<StoredProviderCatalogKey, DataLayerError> {
         Self::update_key(self, key).await
+    }
+
+    async fn update_key_codex_ws_metadata(
+        &self,
+        key_id: &str,
+        enabled: bool,
+        websocket_transport_profile: Option<&serde_json::Value>,
+        updated_at_unix_secs: u64,
+    ) -> Result<bool, DataLayerError> {
+        Self::update_key_codex_ws_metadata(
+            self,
+            key_id,
+            enabled,
+            websocket_transport_profile,
+            updated_at_unix_secs,
+        )
+        .await
     }
 
     async fn update_key_upstream_metadata(

@@ -44,6 +44,55 @@ pub fn header_rules_have_enabled_rules(rules: Option<&Value>) -> bool {
         .any(|rule| rule.as_object().is_some_and(header_rule_is_enabled))
 }
 
+/// Returns true when enabled header rules can be evaluated without a
+/// materialized provider body or the incrementally mutated provider headers.
+/// This is the safe subset for account fanout before a single upstream body is
+/// built: no condition, `request_headers`, or `original` request body only.
+pub fn header_rules_are_body_free_candidate_safe(rules: Option<&Value>) -> bool {
+    let Some(rules) = rules else {
+        return true;
+    };
+    let Some(rules) = rules.as_array() else {
+        return false;
+    };
+    rules.iter().all(|rule| {
+        let Some(rule) = rule.as_object() else {
+            return true;
+        };
+        if !header_rule_is_enabled(rule) {
+            return true;
+        }
+        rule.get("condition")
+            .filter(|condition| !condition.is_null())
+            .is_none_or(header_condition_is_body_free_candidate_safe)
+    })
+}
+
+fn header_condition_is_body_free_candidate_safe(condition: &Value) -> bool {
+    let Some(condition) = condition.as_object() else {
+        return false;
+    };
+    if let Some(children) = condition.get("all").and_then(Value::as_array) {
+        return !children.is_empty()
+            && children
+                .iter()
+                .all(header_condition_is_body_free_candidate_safe);
+    }
+    if let Some(children) = condition.get("any").and_then(Value::as_array) {
+        return !children.is_empty()
+            && children
+                .iter()
+                .all(header_condition_is_body_free_candidate_safe);
+    }
+    matches!(
+        condition
+            .get("source")
+            .and_then(Value::as_str)
+            .map(str::trim),
+        Some("request_headers" | "original")
+    )
+}
+
 pub fn apply_local_header_rules(
     headers: &mut BTreeMap<String, String>,
     rules: Option<&Value>,
@@ -191,6 +240,48 @@ pub fn body_rules_have_enabled_rules(rules: Option<&Value>) -> bool {
     rules
         .iter()
         .any(|rule| rule.as_object().is_some_and(body_rule_is_enabled))
+}
+
+/// Returns true when body rules can be evaluated after taking ownership of a
+/// single provider body. Rules that explicitly inspect the original request
+/// need a second retained body and are therefore excluded from the WS path.
+pub fn body_rules_are_owned_materialization_safe(rules: Option<&Value>) -> bool {
+    let Some(rules) = rules else {
+        return true;
+    };
+    let Some(rules) = rules.as_array() else {
+        return false;
+    };
+    rules.iter().all(|rule| {
+        let Some(rule) = rule.as_object() else {
+            return true;
+        };
+        if !body_rule_is_enabled(rule) {
+            return true;
+        }
+        rule.get("condition")
+            .filter(|condition| !condition.is_null())
+            .is_none_or(|condition| !condition_uses_original_request(condition))
+    })
+}
+
+fn condition_uses_original_request(condition: &Value) -> bool {
+    let Some(condition) = condition.as_object() else {
+        return false;
+    };
+    for collection in ["all", "any"] {
+        if condition
+            .get(collection)
+            .and_then(Value::as_array)
+            .is_some_and(|children| children.iter().any(condition_uses_original_request))
+        {
+            return true;
+        }
+    }
+    condition
+        .get("source")
+        .and_then(Value::as_str)
+        .is_some_and(|source| source.trim().eq_ignore_ascii_case("original"))
 }
 
 pub fn body_rules_handle_path(rules: Option<&Value>, path: &str) -> bool {
@@ -1332,8 +1423,10 @@ mod tests {
     use super::{
         apply_local_body_rules, apply_local_body_rules_with_request_headers,
         apply_local_header_rules, apply_local_header_rules_with_request_headers,
-        body_rules_are_locally_supported, body_rules_handle_path, body_rules_have_enabled_rules,
-        header_rules_are_locally_supported, header_rules_have_enabled_rules,
+        body_rules_are_locally_supported, body_rules_are_owned_materialization_safe,
+        body_rules_handle_path, body_rules_have_enabled_rules,
+        header_rules_are_body_free_candidate_safe, header_rules_are_locally_supported,
+        header_rules_have_enabled_rules,
     };
 
     #[test]
@@ -1764,6 +1857,55 @@ mod tests {
             {"enabled":false,"action":"set","key":"x-disabled","value":"bad"}
         ]);
         assert!(!header_rules_have_enabled_rules(Some(&disabled_only)));
+    }
+
+    #[test]
+    fn body_free_candidate_header_rules_reject_current_provider_state() {
+        let safe = serde_json::json!([
+            {"action":"set","key":"x-static","value":"1"},
+            {"action":"set","key":"x-request","value":"1","condition":{"source":"request_headers","path":"x-mode","op":"eq","value":"fast"}},
+            {"action":"set","key":"x-original","value":"1","condition":{"source":"original","path":"metadata.client","op":"exists"}},
+            {"enabled":false,"action":"set","key":"x-disabled","value":"1","condition":{"source":"body","path":"model","op":"exists"}}
+        ]);
+        assert!(header_rules_are_body_free_candidate_safe(Some(&safe)));
+
+        for unsafe_rules in [
+            serde_json::json!([{"action":"set","key":"x","value":"1","condition":{"path":"model","op":"exists"}}]),
+            serde_json::json!([{"action":"set","key":"x","value":"1","condition":{"source":"current","path":"model","op":"exists"}}]),
+            serde_json::json!([{"action":"set","key":"x","value":"1","condition":{"source":"headers","path":"x-before","op":"exists"}}]),
+            serde_json::json!([{"action":"set","key":"x","value":"1","condition":{"all":[{"source":"original","path":"model","op":"exists"},{"source":"body","path":"model","op":"exists"}]}}]),
+        ] {
+            assert!(!header_rules_are_body_free_candidate_safe(Some(
+                &unsafe_rules
+            )));
+        }
+    }
+
+    #[test]
+    fn owned_materialization_body_rules_reject_original_request_conditions() {
+        let safe = serde_json::json!([
+            {"action":"set","path":"metadata.static","value":true},
+            {"action":"set","path":"metadata.current","value":true,"condition":{"source":"current","path":"model","op":"exists"}},
+            {"action":"set","path":"metadata.header","value":true,"condition":{"source":"request_headers","path":"x-mode","op":"exists"}},
+            {"enabled":false,"action":"set","path":"metadata.disabled","value":true,"condition":{"source":"original","path":"model","op":"exists"}}
+        ]);
+        assert!(body_rules_are_owned_materialization_safe(Some(&safe)));
+
+        let direct = serde_json::json!([
+            {"action":"set","path":"metadata.original","value":true,"condition":{"source":"original","path":"model","op":"exists"}}
+        ]);
+        assert!(!body_rules_are_owned_materialization_safe(Some(&direct)));
+
+        let nested = serde_json::json!([
+            {"action":"drop","path":"metadata","condition":{"any":[
+                {"source":"body","path":"model","op":"exists"},
+                {"source":"original","path":"input","op":"exists"}
+            ]}}
+        ]);
+        assert!(!body_rules_are_owned_materialization_safe(Some(&nested)));
+        assert!(!body_rules_are_owned_materialization_safe(Some(
+            &serde_json::json!({"not":"an array"})
+        )));
     }
 
     #[test]

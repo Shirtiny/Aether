@@ -12,6 +12,7 @@ members = [
     "crates/aether-data-schema",
     "crates/aether-dispatch-core",
     "crates/aether-cache",
+    "crates/aether-codex-ws-connector",
     "crates/aether-billing",
     "crates/aether-wallet",
     "crates/aether-crypto",
@@ -29,6 +30,11 @@ members = [
     "crates/aether-http",
     "crates/aether-runtime",
     "crates/aether-testkit",
+]
+exclude = [
+    "vendor/axum-0.8.8",
+    "vendor/tungstenite",
+    "vendor/tungstenite-0.28.0",
 ]
 resolver = "2"
 
@@ -49,6 +55,7 @@ aether-data-query = { path = "crates/aether-data-query" }
 aether-data-schema = { path = "crates/aether-data-schema" }
 aether-dispatch-core = { path = "crates/aether-dispatch-core" }
 aether-cache = { path = "crates/aether-cache" }
+aether-codex-ws-connector = { path = "crates/aether-codex-ws-connector" }
 aether-billing = { path = "crates/aether-billing" }
 aether-wallet = { path = "crates/aether-wallet" }
 aether-crypto = { path = "crates/aether-crypto" }
@@ -81,6 +88,7 @@ flate2 = "1"
 futures-util = "0.3"
 hmac = "0.12"
 http = "1"
+memchr = "2"
 object_store = { version = "0.12", default-features = false, features = ["aws"] }
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "default-tls", "native-tls-vendored", "rustls-tls", "http2", "socks"] }
@@ -120,3 +128,10 @@ debug = "line-tables-only"
 lto = "thin"
 strip = true
 codegen-units = 8
+
+[patch."https://github.com/openai-oss-forks/tungstenite-rs"]
+tungstenite = { path = "vendor/tungstenite" }
+
+[patch.crates-io]
+axum = { path = "vendor/axum-0.8.8" }
+tungstenite = { path = "vendor/tungstenite-0.28.0" }

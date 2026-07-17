@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use aether_ai_serving::{
@@ -63,12 +64,42 @@ struct GatewayLocalCandidateResolutionPort<'a> {
     required_capabilities: Option<&'a serde_json::Value>,
     routing_policy: Option<&'a ResolvedRoutingPolicy>,
     request_auth_channel: Option<&'a str>,
+    prefetched_transports: Option<
+        &'a HashMap<CandidateTransportIdentity, Option<Arc<GatewayProviderTransportSnapshot>>>,
+    >,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CandidateTransportIdentity {
+    provider_id: String,
+    endpoint_id: String,
+    key_id: String,
+}
+
+impl CandidateTransportIdentity {
+    fn from_candidate(candidate: &SchedulerMinimalCandidateSelectionCandidate) -> Self {
+        Self {
+            provider_id: candidate.provider_id.clone(),
+            endpoint_id: candidate.endpoint_id.clone(),
+            key_id: candidate.key_id.clone(),
+        }
+    }
+
+    fn into_tuple(self) -> (String, String, String) {
+        (self.provider_id, self.endpoint_id, self.key_id)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateTransportReadMode {
+    PerCandidate,
+    BatchedPage,
 }
 
 #[async_trait]
 impl AiCandidateResolutionPort for GatewayLocalCandidateResolutionPort<'_> {
     type Candidate = SchedulerMinimalCandidateSelectionCandidate;
-    type Transport = GatewayProviderTransportSnapshot;
+    type Transport = Arc<GatewayProviderTransportSnapshot>;
     type Eligible = EligibleLocalExecutionCandidate;
     type Skipped = SkippedLocalExecutionCandidate;
     type Error = Infallible;
@@ -77,7 +108,15 @@ impl AiCandidateResolutionPort for GatewayLocalCandidateResolutionPort<'_> {
         &self,
         candidate: &Self::Candidate,
     ) -> Result<Option<Self::Transport>, Self::Error> {
-        Ok(read_candidate_transport_snapshot(self.state, candidate).await)
+        if let Some(prefetched) = self.prefetched_transports {
+            return Ok(prefetched
+                .get(&CandidateTransportIdentity::from_candidate(candidate))
+                .cloned()
+                .flatten());
+        }
+        Ok(read_candidate_transport_snapshot(self.state, candidate)
+            .await
+            .map(Arc::new))
     }
 
     fn build_missing_transport_skipped_candidate(
@@ -100,20 +139,20 @@ impl AiCandidateResolutionPort for GatewayLocalCandidateResolutionPort<'_> {
         requested_model: Option<&str>,
     ) -> Option<&'static str> {
         if let Some(skip_reason) =
-            routing_policy_candidate_skip_reason(self.routing_policy, candidate, transport)
+            routing_policy_candidate_skip_reason(self.routing_policy, candidate, transport.as_ref())
         {
             return Some(skip_reason);
         }
-        if provider_transport_uses_pool(transport) {
-            return pool_group_common_transport_skip_reason(candidate, transport);
+        if provider_transport_uses_pool(transport.as_ref()) {
+            return pool_group_common_transport_skip_reason(candidate, transport.as_ref());
         }
         if let Some(skip_reason) =
-            candidate_auth_channel_skip_reason(transport, self.request_auth_channel)
+            candidate_auth_channel_skip_reason(transport.as_ref(), self.request_auth_channel)
         {
             return Some(skip_reason);
         }
         candidate_common_transport_skip_reason(
-            transport,
+            transport.as_ref(),
             candidate_transport_policy_facts(candidate),
             requested_model,
         )
@@ -127,7 +166,7 @@ impl AiCandidateResolutionPort for GatewayLocalCandidateResolutionPort<'_> {
         requested_model: &str,
     ) -> Option<&'static str> {
         let _ = (candidate, requested_model);
-        candidate_transport_pair_skip_reason(transport, normalized_client_api_format)
+        candidate_transport_pair_skip_reason(transport.as_ref(), normalized_client_api_format)
     }
 
     fn build_skipped_candidate(
@@ -139,7 +178,7 @@ impl AiCandidateResolutionPort for GatewayLocalCandidateResolutionPort<'_> {
         SkippedLocalExecutionCandidate {
             candidate,
             skip_reason,
-            transport: Some(Arc::new(transport)),
+            transport: Some(transport),
             ranking: None,
             extra_data: None,
         }
@@ -151,7 +190,7 @@ impl AiCandidateResolutionPort for GatewayLocalCandidateResolutionPort<'_> {
         transport: Self::Transport,
     ) -> Self::Eligible {
         let provider_api_format = transport.endpoint.api_format.trim().to_ascii_lowercase();
-        let kind = if provider_transport_uses_pool(&transport) {
+        let kind = if provider_transport_uses_pool(transport.as_ref()) {
             LocalExecutionCandidateKind::PoolGroup
         } else {
             LocalExecutionCandidateKind::SingleKey
@@ -159,7 +198,7 @@ impl AiCandidateResolutionPort for GatewayLocalCandidateResolutionPort<'_> {
         EligibleLocalExecutionCandidate {
             kind,
             candidate,
-            transport: Arc::new(transport),
+            transport,
             provider_api_format,
             orchestration: LocalExecutionCandidateMetadata::default(),
             ranking: None,
@@ -285,6 +324,41 @@ pub(crate) async fn resolve_and_rank_logical_local_execution_candidates(
         request_auth_channel,
         mode,
         false,
+        CandidateTransportReadMode::PerCandidate,
+    )
+    .await
+}
+
+pub(crate) async fn resolve_and_rank_logical_local_execution_candidates_with_batched_transports(
+    state: PlannerAppState<'_>,
+    candidates: Vec<SchedulerMinimalCandidateSelectionCandidate>,
+    client_api_format: &str,
+    requested_model: Option<&str>,
+    auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
+    client_session_affinity: Option<&ClientSessionAffinity>,
+    required_capabilities: Option<&serde_json::Value>,
+    routing_policy: Option<&ResolvedRoutingPolicy>,
+    _sticky_session_token: Option<&str>,
+    request_auth_channel: Option<&str>,
+    mode: AiCandidateResolutionMode,
+) -> (
+    Vec<EligibleLocalExecutionCandidate>,
+    Vec<SkippedLocalExecutionCandidate>,
+) {
+    resolve_and_rank_local_execution_candidates_with_pool_expansion(
+        state,
+        candidates,
+        client_api_format,
+        requested_model,
+        auth_snapshot,
+        client_session_affinity,
+        required_capabilities,
+        routing_policy,
+        None,
+        request_auth_channel,
+        mode,
+        false,
+        CandidateTransportReadMode::BatchedPage,
     )
     .await
 }
@@ -318,6 +392,7 @@ async fn resolve_and_rank_local_execution_candidates_with_mode(
         request_auth_channel,
         mode,
         false,
+        CandidateTransportReadMode::PerCandidate,
     )
     .await
 }
@@ -336,11 +411,18 @@ async fn resolve_and_rank_local_execution_candidates_with_pool_expansion(
     request_auth_channel: Option<&str>,
     mode: AiCandidateResolutionMode,
     expand_pool_groups: bool,
+    transport_read_mode: CandidateTransportReadMode,
 ) -> (
     Vec<EligibleLocalExecutionCandidate>,
     Vec<SkippedLocalExecutionCandidate>,
 ) {
     let scheduler_affinity_epoch = state.app().scheduler_affinity_epoch();
+    let prefetched_transports = match transport_read_mode {
+        CandidateTransportReadMode::PerCandidate => None,
+        CandidateTransportReadMode::BatchedPage => {
+            Some(read_candidate_transport_snapshots(state, &candidates).await)
+        }
+    };
     let port = GatewayLocalCandidateResolutionPort {
         state,
         requested_model,
@@ -349,6 +431,7 @@ async fn resolve_and_rank_local_execution_candidates_with_pool_expansion(
         required_capabilities,
         routing_policy,
         request_auth_channel,
+        prefetched_transports: prefetched_transports.as_ref(),
     };
 
     let request = AiCandidateResolutionRequest {
@@ -500,6 +583,38 @@ fn auth_channel_mismatch_is_explicitly_disabled_for_format(
         .iter()
         .filter_map(serde_json::Value::as_str)
         .any(|item| crate::ai_serving::normalize_api_format_alias(item) == api_format)
+}
+
+async fn read_candidate_transport_snapshots(
+    state: PlannerAppState<'_>,
+    candidates: &[SchedulerMinimalCandidateSelectionCandidate],
+) -> HashMap<CandidateTransportIdentity, Option<Arc<GatewayProviderTransportSnapshot>>> {
+    let candidate_identities = candidates
+        .iter()
+        .map(CandidateTransportIdentity::from_candidate)
+        .collect::<Vec<_>>();
+    let identities = candidate_identities
+        .iter()
+        .cloned()
+        .map(CandidateTransportIdentity::into_tuple)
+        .collect::<Vec<_>>();
+    match state.read_provider_transport_snapshots(&identities).await {
+        Ok(snapshots) => candidate_identities
+            .into_iter()
+            .zip(snapshots)
+            .map(|(identity, snapshot)| (identity, snapshot.map(Arc::new)))
+            .collect(),
+        Err(error) => {
+            warn!(
+                event_name = "candidate_resolution_transport_batch_load_failed",
+                log_type = "event",
+                candidate_count = identities.len(),
+                error = ?error,
+                "failed to batch load provider transports for a candidate page"
+            );
+            HashMap::new()
+        }
+    }
 }
 
 pub(crate) async fn read_candidate_transport_snapshot(

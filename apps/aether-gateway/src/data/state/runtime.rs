@@ -5,13 +5,13 @@ use super::{
     AdminBillingRuleWriteInput, AdminPaymentOrderListQuery, AdminRedeemCodeBatchListQuery,
     AdminRedeemCodeListQuery, AdminWalletLedgerQuery, AdminWalletListQuery,
     AdminWalletRefundRequestListQuery, AnnouncementListQuery, AuditLogListQuery,
-    BackgroundTaskListQuery, BackgroundTaskSummary, BillingPlanRecord, BillingPlanWriteInput,
-    CompleteAdminWalletRefundInput, CreateAdminRedeemCodeBatchInput,
-    CreateAdminRedeemCodeBatchResult, CreateAnnouncementRecord, CreateManualWalletRechargeInput,
-    CreatePlanPurchaseOrderInput, CreatePlanPurchaseOrderOutcome, CreateWalletRechargeOrderInput,
-    CreateWalletRechargeOrderOutcome, CreateWalletRefundRequestInput,
-    CreateWalletRefundRequestOutcome, CreditAdminPaymentOrderInput, DataLayerError,
-    DatabaseMaintenanceSummary, DecisionTrace, DeleteAdminRedeemCodeBatchInput,
+    BackgroundTaskListQuery, BackgroundTaskSummary, BillingModelContextByModelIdLookup,
+    BillingPlanRecord, BillingPlanWriteInput, CompleteAdminWalletRefundInput,
+    CreateAdminRedeemCodeBatchInput, CreateAdminRedeemCodeBatchResult, CreateAnnouncementRecord,
+    CreateManualWalletRechargeInput, CreatePlanPurchaseOrderInput, CreatePlanPurchaseOrderOutcome,
+    CreateWalletRechargeOrderInput, CreateWalletRechargeOrderOutcome,
+    CreateWalletRefundRequestInput, CreateWalletRefundRequestOutcome, CreditAdminPaymentOrderInput,
+    DataLayerError, DatabaseMaintenanceSummary, DecisionTrace, DeleteAdminRedeemCodeBatchInput,
     DisableAdminRedeemCodeBatchInput, DisableAdminRedeemCodeInput, FailAdminWalletRefundInput,
     GatewayDataState, GatewayProviderTransportSnapshot, LocalVideoTaskReadResponse,
     PaymentGatewayConfigRecord, PaymentGatewayConfigWriteInput, ProcessAdminWalletRefundInput,
@@ -1723,6 +1723,16 @@ impl GatewayDataState {
                     .await
             }
             None => Ok(None),
+        }
+    }
+
+    pub(crate) async fn find_billing_model_contexts_by_model_ids(
+        &self,
+        lookups: &[BillingModelContextByModelIdLookup],
+    ) -> Result<Vec<Option<StoredBillingModelContext>>, DataLayerError> {
+        match &self.billing_reader {
+            Some(repository) => repository.find_model_contexts_by_model_ids(lookups).await,
+            None => Ok(vec![None; lookups.len()]),
         }
     }
 

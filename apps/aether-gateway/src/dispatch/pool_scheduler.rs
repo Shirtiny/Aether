@@ -436,6 +436,7 @@ pub(crate) struct PoolKeyCursor<'a> {
     sticky_bound_key_ineligible: bool,
     sticky_bound_key_id: Option<String>,
     sticky_bound_key_ineligible_reason: Option<&'static str>,
+    batched_transport_reads: bool,
 }
 
 impl<'a> PoolKeyCursor<'a> {
@@ -515,7 +516,13 @@ impl<'a> PoolKeyCursor<'a> {
             sticky_bound_key_ineligible: false,
             sticky_bound_key_id: None,
             sticky_bound_key_ineligible_reason: None,
+            batched_transport_reads: false,
         }
+    }
+
+    pub(crate) fn with_batched_transport_reads(mut self) -> Self {
+        self.batched_transport_reads = true;
+        self
     }
 
     pub(crate) fn with_runtime_miss_diagnostic(
@@ -1403,10 +1410,66 @@ impl<'a> PoolKeyCursor<'a> {
         &mut self,
         rows: Vec<StoredMinimalCandidateSelectionRow>,
     ) -> Vec<EligibleLocalExecutionCandidate> {
-        let mut candidates = Vec::with_capacity(rows.len());
+        let mut unresolved = Vec::with_capacity(rows.len());
         for row in rows {
             let candidate = pool_candidate_from_row(&self.group, row);
-            if let Some(candidate) = self.build_eligible_candidate(candidate).await {
+            if self.seen_key_ids.insert(candidate.key_id.clone()) {
+                unresolved.push(candidate);
+            }
+        }
+        if !self.batched_transport_reads {
+            let mut candidates = Vec::with_capacity(unresolved.len());
+            for candidate in unresolved {
+                let transport = read_candidate_transport_snapshot(self.state, &candidate).await;
+                if let Some(candidate) =
+                    self.build_eligible_candidate_from_transport(candidate, transport)
+                {
+                    candidates.push(candidate);
+                }
+            }
+            return candidates;
+        }
+
+        let identities = unresolved
+            .iter()
+            .map(|candidate| {
+                (
+                    candidate.provider_id.clone(),
+                    candidate.endpoint_id.clone(),
+                    candidate.key_id.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let transports = match self
+            .state
+            .read_provider_transport_snapshots(&identities)
+            .await
+        {
+            Ok(transports) => transports,
+            Err(error) => {
+                warn!(
+                    event_name = "pool_group_transport_batch_load_failed",
+                    log_type = "event",
+                    provider_id = %self.group.candidate.provider_id,
+                    endpoint_id = %self.group.candidate.endpoint_id,
+                    model_id = %self.group.candidate.model_id,
+                    candidate_count = unresolved.len(),
+                    error = ?error,
+                    "gateway pool scheduler failed to batch load a pool key page"
+                );
+                for _ in &unresolved {
+                    self.record_skip_reason("transport_snapshot_missing");
+                }
+                return Vec::new();
+            }
+        };
+        let mut transports = transports.into_iter();
+        let mut candidates = Vec::with_capacity(unresolved.len());
+        for candidate in unresolved {
+            let transport = transports.next().flatten();
+            if let Some(candidate) =
+                self.build_eligible_candidate_from_transport(candidate, transport)
+            {
                 candidates.push(candidate);
             }
         }
@@ -1421,8 +1484,16 @@ impl<'a> PoolKeyCursor<'a> {
             return None;
         }
 
-        let Some(transport) = read_candidate_transport_snapshot(self.state, &candidate).await
-        else {
+        let transport = read_candidate_transport_snapshot(self.state, &candidate).await;
+        self.build_eligible_candidate_from_transport(candidate, transport)
+    }
+
+    fn build_eligible_candidate_from_transport(
+        &mut self,
+        candidate: aether_scheduler_core::SchedulerMinimalCandidateSelectionCandidate,
+        transport: Option<crate::ai_serving::GatewayProviderTransportSnapshot>,
+    ) -> Option<EligibleLocalExecutionCandidate> {
+        let Some(transport) = transport else {
             self.record_skip_reason("transport_snapshot_missing");
             return None;
         };

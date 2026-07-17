@@ -2,11 +2,22 @@ use axum::body::Bytes;
 use axum::http::Uri;
 
 use super::super::GatewayControlDecision;
-use super::credentials::{contains_string, extract_requested_model};
+use super::credentials::{
+    contains_string, extract_requested_model, extract_requested_model_from_json,
+};
 use super::GatewayControlAuthContext;
 use crate::{AppState, GatewayError};
 
 const DAILY_QUOTA_EPSILON_USD: f64 = 0.000_000_01;
+
+#[derive(Clone, Copy)]
+enum LocalPolicyBody<'a> {
+    Raw {
+        headers: &'a http::HeaderMap,
+        body: &'a Bytes,
+    },
+    Parsed(&'a serde_json::Value),
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum GatewayLocalAuthRejection {
@@ -54,6 +65,45 @@ pub(crate) async fn request_model_local_rejection(
     headers: &http::HeaderMap,
     body: &Bytes,
 ) -> Result<Option<GatewayLocalAuthRejection>, GatewayError> {
+    let requested_model =
+        decision.and_then(|decision| extract_requested_model(decision, uri, headers, body));
+    request_model_local_rejection_inner(
+        state,
+        decision,
+        requested_model,
+        LocalPolicyBody::Raw { headers, body },
+    )
+    .await
+}
+
+/// Runs the local model and balance policy directly on an already parsed request.
+///
+/// This is the Codex WebSocket hot-path entry point. It intentionally avoids
+/// serializing and reparsing `ResponseCreateStep.value`; the HTTP entry point
+/// above remains responsible for decoding content encodings and JSON bytes.
+pub(crate) async fn request_model_local_rejection_from_json(
+    state: &AppState,
+    decision: Option<&GatewayControlDecision>,
+    uri: &Uri,
+    body: &serde_json::Value,
+) -> Result<Option<GatewayLocalAuthRejection>, GatewayError> {
+    let requested_model =
+        decision.and_then(|decision| extract_requested_model_from_json(decision, uri, body));
+    request_model_local_rejection_inner(
+        state,
+        decision,
+        requested_model,
+        LocalPolicyBody::Parsed(body),
+    )
+    .await
+}
+
+async fn request_model_local_rejection_inner(
+    state: &AppState,
+    decision: Option<&GatewayControlDecision>,
+    requested_model: Option<String>,
+    body: LocalPolicyBody<'_>,
+) -> Result<Option<GatewayLocalAuthRejection>, GatewayError> {
     let Some(decision) = decision else {
         return Ok(None);
     };
@@ -63,7 +113,6 @@ pub(crate) async fn request_model_local_rejection(
     let Some(auth_context) = decision.auth_context.as_ref() else {
         return Ok(None);
     };
-    let requested_model = extract_requested_model(decision, uri, headers, body);
     if let (Some(allowed_models), Some(requested_model)) = (
         auth_context.allowed_models.as_deref(),
         requested_model.as_deref(),
@@ -95,7 +144,6 @@ pub(crate) async fn request_model_local_rejection(
         decision,
         auth_context,
         requested_model.as_deref(),
-        headers,
         body,
     )
     .await
@@ -106,8 +154,7 @@ async fn balance_capacity_rejection(
     decision: &GatewayControlDecision,
     auth_context: &GatewayControlAuthContext,
     requested_model: Option<&str>,
-    headers: &http::HeaderMap,
-    body: &Bytes,
+    body: LocalPolicyBody<'_>,
 ) -> Result<Option<GatewayLocalAuthRejection>, GatewayError> {
     if auth_context.api_key_is_standalone {
         return Ok(None);
@@ -149,8 +196,7 @@ async fn balance_capacity_rejection(
         return Ok(None);
     };
     let Some(estimated_cost_usd) =
-        estimate_request_cost_upper_bound_usd(state, decision, requested_model, headers, body)
-            .await?
+        estimate_request_cost_upper_bound_usd(state, decision, requested_model, body).await?
     else {
         return Ok(None);
     };
@@ -177,8 +223,42 @@ async fn estimate_request_cost_upper_bound_usd(
     state: &AppState,
     decision: &GatewayControlDecision,
     requested_model: &str,
-    headers: &http::HeaderMap,
-    body: &Bytes,
+    body: LocalPolicyBody<'_>,
+) -> Result<Option<f64>, GatewayError> {
+    match body {
+        LocalPolicyBody::Parsed(body_json) => {
+            estimate_request_cost_upper_bound_usd_from_json(
+                state,
+                decision,
+                requested_model,
+                body_json,
+            )
+            .await
+        }
+        LocalPolicyBody::Raw { headers, body } => {
+            let body = crate::headers::decoded_request_body_bytes(headers, body.as_ref()).ok();
+            let body_json = body
+                .as_ref()
+                .and_then(|body| serde_json::from_slice::<serde_json::Value>(body.as_ref()).ok());
+            let Some(body_json) = body_json.as_ref() else {
+                return Ok(None);
+            };
+            estimate_request_cost_upper_bound_usd_from_json(
+                state,
+                decision,
+                requested_model,
+                body_json,
+            )
+            .await
+        }
+    }
+}
+
+async fn estimate_request_cost_upper_bound_usd_from_json(
+    state: &AppState,
+    decision: &GatewayControlDecision,
+    requested_model: &str,
+    body_json: &serde_json::Value,
 ) -> Result<Option<f64>, GatewayError> {
     let Some(api_format) = decision
         .auth_endpoint_signature
@@ -188,36 +268,39 @@ async fn estimate_request_cost_upper_bound_usd(
     else {
         return Ok(None);
     };
-    let body = crate::headers::decoded_request_body_bytes(headers, body.as_ref()).ok();
-    let Some(body) = body else {
+    let input_tokens = estimate_json_tokens(body_json);
+    if input_tokens == 0 {
         return Ok(None);
-    };
-    let body_json = serde_json::from_slice::<serde_json::Value>(body.as_ref()).ok();
-    let Some(input_tokens) = body_json
-        .as_ref()
-        .map(estimate_json_tokens)
-        .filter(|value| *value > 0)
-    else {
-        return Ok(None);
-    };
-    let max_output_tokens = body_json.as_ref().and_then(max_output_tokens_from_request);
+    }
+    let max_output_tokens = max_output_tokens_from_request(body_json);
     let candidates = state
         .list_minimal_candidate_selection_rows_for_api_format_and_requested_model(
             &api_format,
             requested_model,
         )
         .await?;
+    let lookups = candidates
+        .iter()
+        .map(|candidate| {
+            aether_data_contracts::repository::billing::BillingModelContextByModelIdLookup {
+                provider_id: candidate.provider_id.clone(),
+                provider_api_key_id: Some(candidate.key_id.clone()),
+                model_id: candidate.model_id.clone(),
+            }
+        })
+        .collect::<Vec<_>>();
+    let contexts = state
+        .data
+        .find_billing_model_contexts_by_model_ids(&lookups)
+        .await
+        .map_err(|err| GatewayError::Internal(err.to_string()))?;
+    if contexts.len() != lookups.len() {
+        return Err(GatewayError::Internal(
+            "billing model context batch returned an invalid result count".to_string(),
+        ));
+    }
     let mut max_estimate = None::<f64>;
-    for candidate in candidates {
-        let context = state
-            .data
-            .find_billing_model_context_by_model_id(
-                &candidate.provider_id,
-                Some(&candidate.key_id),
-                &candidate.model_id,
-            )
-            .await
-            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+    for context in contexts {
         let Some(context) = context else {
             continue;
         };
@@ -469,12 +552,14 @@ fn push_unique_api_format(api_formats: &mut Vec<String>, api_format: &str) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     use aether_data::repository::candidate_selection::InMemoryMinimalCandidateSelectionReadRepository;
     use aether_data::repository::wallet::StoredWalletSnapshot;
     use aether_data_contracts::repository::billing::{
-        BillingReadRepository, StoredBillingModelContext, UserDailyQuotaAvailabilityRecord,
+        BillingModelContextByModelIdLookup, BillingReadRepository, StoredBillingModelContext,
+        UserDailyQuotaAvailabilityRecord,
     };
     use aether_data_contracts::repository::candidate_selection::{
         StoredMinimalCandidateSelectionRow, StoredProviderModelMapping,
@@ -487,7 +572,7 @@ mod tests {
 
     use super::{
         estimate_cost_from_billing_context, request_model_local_rejection,
-        GatewayLocalAuthRejection,
+        request_model_local_rejection_from_json, GatewayLocalAuthRejection,
     };
     use crate::control::{GatewayControlAuthContext, GatewayControlDecision};
     use crate::data::GatewayDataState;
@@ -686,6 +771,15 @@ mod tests {
         context: StoredBillingModelContext,
     }
 
+    #[derive(Debug)]
+    struct CountingBatchBillingReadRepository {
+        quota: UserDailyQuotaAvailabilityRecord,
+        context: StoredBillingModelContext,
+        single_calls: Arc<AtomicUsize>,
+        batch_calls: Arc<AtomicUsize>,
+        batch_lookup_count: Arc<AtomicUsize>,
+    }
+
     #[async_trait]
     impl BillingReadRepository for FixedBillingReadRepository {
         async fn find_model_context(
@@ -706,12 +800,121 @@ mod tests {
             Ok(Some(self.context.clone()))
         }
 
+        async fn find_model_contexts_by_model_ids(
+            &self,
+            lookups: &[BillingModelContextByModelIdLookup],
+        ) -> Result<Vec<Option<StoredBillingModelContext>>, DataLayerError> {
+            Ok(vec![Some(self.context.clone()); lookups.len()])
+        }
+
         async fn find_user_daily_quota_availability(
             &self,
             _user_id: &str,
         ) -> Result<Option<UserDailyQuotaAvailabilityRecord>, DataLayerError> {
             Ok(Some(self.quota.clone()))
         }
+    }
+
+    #[async_trait]
+    impl BillingReadRepository for CountingBatchBillingReadRepository {
+        async fn find_model_context(
+            &self,
+            _provider_id: &str,
+            _provider_api_key_id: Option<&str>,
+            _global_model_name: &str,
+        ) -> Result<Option<StoredBillingModelContext>, DataLayerError> {
+            Ok(Some(self.context.clone()))
+        }
+
+        async fn find_model_context_by_model_id(
+            &self,
+            _provider_id: &str,
+            _provider_api_key_id: Option<&str>,
+            _model_id: &str,
+        ) -> Result<Option<StoredBillingModelContext>, DataLayerError> {
+            self.single_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(Some(self.context.clone()))
+        }
+
+        async fn find_model_contexts_by_model_ids(
+            &self,
+            lookups: &[BillingModelContextByModelIdLookup],
+        ) -> Result<Vec<Option<StoredBillingModelContext>>, DataLayerError> {
+            self.batch_calls.fetch_add(1, Ordering::Relaxed);
+            self.batch_lookup_count
+                .fetch_add(lookups.len(), Ordering::Relaxed);
+            Ok(vec![Some(self.context.clone()); lookups.len()])
+        }
+
+        async fn find_user_daily_quota_availability(
+            &self,
+            _user_id: &str,
+        ) -> Result<Option<UserDailyQuotaAvailabilityRecord>, DataLayerError> {
+            Ok(Some(self.quota.clone()))
+        }
+    }
+
+    #[tokio::test]
+    async fn parsed_policy_batches_sixteen_candidate_billing_lookups_once() {
+        let context = billing_context_with_pricing(
+            Some(json!({
+                "tiers": [{
+                    "up_to": null,
+                    "input_price_per_1m": 1.0,
+                    "output_price_per_1m": 2.0
+                }]
+            })),
+            None,
+            None,
+            None,
+        );
+        let rows = (0..16)
+            .map(|index| {
+                let mut row = sample_row();
+                row.provider_id = format!("provider-{index}");
+                row.endpoint_id = format!("endpoint-{index}");
+                row.key_id = format!("key-{index}");
+                row.model_id = format!("model-{index}");
+                row
+            })
+            .collect::<Vec<_>>();
+        let single_calls = Arc::new(AtomicUsize::new(0));
+        let batch_calls = Arc::new(AtomicUsize::new(0));
+        let batch_lookup_count = Arc::new(AtomicUsize::new(0));
+        let billing_repository = Arc::new(CountingBatchBillingReadRepository {
+            quota: quota_availability(50.0, false),
+            context,
+            single_calls: Arc::clone(&single_calls),
+            batch_calls: Arc::clone(&batch_calls),
+            batch_lookup_count: Arc::clone(&batch_lookup_count),
+        });
+        let candidate_repository =
+            Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(rows));
+        let data = GatewayDataState::with_minimal_candidate_selection_and_billing_for_tests(
+            candidate_repository,
+            billing_repository,
+        );
+        let state = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(data)
+            .with_auth_wallets_for_tests(vec![sample_wallet("user-1", 30.0)]);
+        let decision = decision_with_allowed_models(vec!["gpt-5".to_string()]);
+        let uri: Uri = "/v1/responses".parse().expect("uri should parse");
+        let body = json!({
+            "model": "gpt-5",
+            "input": "hello",
+            "max_output_tokens": 100
+        });
+
+        let rejection =
+            request_model_local_rejection_from_json(&state, Some(&decision), &uri, &body)
+                .await
+                .expect("parsed policy should resolve");
+
+        assert_eq!(rejection, None);
+        assert_eq!(batch_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(batch_lookup_count.load(Ordering::Relaxed), 16);
+        assert_eq!(single_calls.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
