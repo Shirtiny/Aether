@@ -42,6 +42,13 @@
                   </template>
                 </div>
                 <Badge
+                  v-if="detail?.ws_step"
+                  variant="outline"
+                  class="border-violet-500/40 bg-violet-500/10 text-violet-700 dark:text-violet-300"
+                >
+                  WS
+                </Badge>
+                <Badge
                   v-if="detail?.status_code === 200"
                   variant="success"
                 >

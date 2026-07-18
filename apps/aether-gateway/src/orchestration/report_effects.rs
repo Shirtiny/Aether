@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Mutex, OnceLock};
+use std::future::Future;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use aether_admin::provider::quota as admin_provider_quota_pure;
@@ -24,7 +25,171 @@ const CODEX_QUOTA_CACHE_MAX_ENTRIES: usize = 4096;
 
 type HeaderFingerprintCache = Mutex<HashMap<String, (String, Instant)>>;
 
-static CODEX_QUOTA_HEADER_FINGERPRINT_CACHE: OnceLock<HeaderFingerprintCache> = OnceLock::new();
+type CodexQuotaSyncRegistry = Mutex<HashMap<String, CodexQuotaSyncSlot>>;
+
+#[derive(Default)]
+struct CodexQuotaSyncCoordinator {
+    fingerprints: HeaderFingerprintCache,
+    registry: CodexQuotaSyncRegistry,
+}
+
+struct CodexQuotaSyncSlot {
+    lock: Arc<tokio::sync::Mutex<()>>,
+    reservations: usize,
+}
+
+struct CodexQuotaSyncReservation<'a> {
+    coordinator: &'a CodexQuotaSyncCoordinator,
+    key_id: String,
+    lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+struct CodexQuotaSyncGuard<'a> {
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    reservation: Option<CodexQuotaSyncReservation<'a>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexQuotaPersistenceOutcome {
+    CacheableNoop,
+    Updated,
+    RetryableNoop,
+}
+
+// Coordination and fingerprint suppression are process-local.
+static CODEX_QUOTA_SYNC_COORDINATOR: OnceLock<CodexQuotaSyncCoordinator> = OnceLock::new();
+
+fn codex_quota_sync_coordinator() -> &'static CodexQuotaSyncCoordinator {
+    CODEX_QUOTA_SYNC_COORDINATOR.get_or_init(CodexQuotaSyncCoordinator::default)
+}
+
+impl CodexQuotaSyncCoordinator {
+    fn reserve(&self, key_id: &str) -> CodexQuotaSyncReservation<'_> {
+        let mut registry = self
+            .registry
+            .lock()
+            .expect("codex quota sync registry should lock");
+        let slot = registry
+            .entry(key_id.to_string())
+            .or_insert_with(|| CodexQuotaSyncSlot {
+                lock: Arc::new(tokio::sync::Mutex::new(())),
+                reservations: 0,
+            });
+        slot.reservations = slot
+            .reservations
+            .checked_add(1)
+            .expect("codex quota sync reservation count overflow");
+        CodexQuotaSyncReservation {
+            coordinator: self,
+            key_id: key_id.to_string(),
+            lock: Arc::clone(&slot.lock),
+        }
+    }
+
+    async fn acquire(&self, key_id: &str) -> CodexQuotaSyncGuard<'_> {
+        let reservation = self.reserve(key_id);
+        let guard = Arc::clone(&reservation.lock).lock_owned().await;
+        CodexQuotaSyncGuard {
+            guard: Some(guard),
+            reservation: Some(reservation),
+        }
+    }
+
+    fn get_cached_fingerprint(&self, key_id: &str, now: Instant) -> Option<String> {
+        get_cached_codex_quota_fingerprint(&self.fingerprints, key_id, now)
+    }
+
+    fn set_cached_fingerprint(&self, key_id: &str, fingerprint: String, now: Instant) {
+        set_cached_codex_quota_fingerprint(&self.fingerprints, key_id, fingerprint, now);
+    }
+
+    async fn sync<F, Fut>(
+        &self,
+        key_id: &str,
+        incoming_fingerprint: String,
+        persist: F,
+    ) -> Result<bool, GatewayError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<CodexQuotaPersistenceOutcome, GatewayError>>,
+    {
+        let _guard = self.acquire(key_id).await;
+        let now = Instant::now();
+        if self.get_cached_fingerprint(key_id, now).as_deref()
+            == Some(incoming_fingerprint.as_str())
+        {
+            return Ok(false);
+        }
+
+        match persist().await? {
+            CodexQuotaPersistenceOutcome::CacheableNoop => {
+                self.set_cached_fingerprint(key_id, incoming_fingerprint, now);
+                Ok(false)
+            }
+            CodexQuotaPersistenceOutcome::Updated => {
+                self.set_cached_fingerprint(key_id, incoming_fingerprint, now);
+                Ok(true)
+            }
+            CodexQuotaPersistenceOutcome::RetryableNoop => Ok(false),
+        }
+    }
+
+    #[cfg(test)]
+    fn active_key_count(&self) -> usize {
+        self.registry
+            .lock()
+            .expect("codex quota sync registry should lock")
+            .len()
+    }
+
+    #[cfg(test)]
+    fn reservation_count(&self, key_id: &str) -> usize {
+        self.registry
+            .lock()
+            .expect("codex quota sync registry should lock")
+            .get(key_id)
+            .map(|slot| slot.reservations)
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    fn clear_fingerprints(&self) {
+        self.fingerprints
+            .lock()
+            .expect("codex realtime quota cache should lock")
+            .clear();
+    }
+}
+
+impl Drop for CodexQuotaSyncReservation<'_> {
+    fn drop(&mut self) {
+        let mut registry = self
+            .coordinator
+            .registry
+            .lock()
+            .expect("codex quota sync registry should lock");
+        let remove = registry
+            .get_mut(&self.key_id)
+            .filter(|slot| Arc::ptr_eq(&slot.lock, &self.lock))
+            .is_some_and(|slot| {
+                slot.reservations = slot
+                    .reservations
+                    .checked_sub(1)
+                    .expect("codex quota sync reservation count should be positive");
+                slot.reservations == 0
+            });
+        if remove {
+            registry.remove(&self.key_id);
+        }
+    }
+}
+
+impl Drop for CodexQuotaSyncGuard<'_> {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        drop(self.reservation.take());
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum LocalReportEffect<'a> {
@@ -64,10 +229,6 @@ pub(crate) async fn apply_local_codex_quota_headers_effect(
             "gateway failed to persist codex realtime quota from WebSocket response headers"
         );
     }
-}
-
-fn codex_quota_header_fingerprint_cache() -> &'static HeaderFingerprintCache {
-    CODEX_QUOTA_HEADER_FINGERPRINT_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn report_context_key_id(report_context: Option<&Value>) -> Option<String> {
@@ -130,8 +291,12 @@ fn fingerprint_codex_payload(value: &Value) -> Option<String> {
     serde_json::to_string(&Value::Object(normalized)).ok()
 }
 
-fn get_cached_codex_quota_fingerprint(key_id: &str, now: Instant) -> Option<String> {
-    let mut cache = codex_quota_header_fingerprint_cache()
+fn get_cached_codex_quota_fingerprint(
+    cache: &HeaderFingerprintCache,
+    key_id: &str,
+    now: Instant,
+) -> Option<String> {
+    let mut cache = cache
         .lock()
         .expect("codex realtime quota cache should lock");
     match cache.get(key_id) {
@@ -144,8 +309,13 @@ fn get_cached_codex_quota_fingerprint(key_id: &str, now: Instant) -> Option<Stri
     }
 }
 
-fn set_cached_codex_quota_fingerprint(key_id: &str, fingerprint: String, now: Instant) {
-    let mut cache = codex_quota_header_fingerprint_cache()
+fn set_cached_codex_quota_fingerprint(
+    cache: &HeaderFingerprintCache,
+    key_id: &str,
+    fingerprint: String,
+    now: Instant,
+) {
+    let mut cache = cache
         .lock()
         .expect("codex realtime quota cache should lock");
     cache.insert(
@@ -630,85 +800,78 @@ async fn sync_codex_quota_from_response_headers(
         return Ok(false);
     };
 
-    let now = Instant::now();
-    if get_cached_codex_quota_fingerprint(&key_id, now).as_deref()
-        == Some(incoming_fingerprint.as_str())
-    {
-        return Ok(false);
-    }
+    let persistence_key_id = key_id.clone();
+    codex_quota_sync_coordinator()
+        .sync(&key_id, incoming_fingerprint.clone(), || async move {
+            let Some(key) = state
+                .read_provider_catalog_keys_by_ids(std::slice::from_ref(&persistence_key_id))
+                .await?
+                .into_iter()
+                .next()
+            else {
+                return Ok(CodexQuotaPersistenceOutcome::CacheableNoop);
+            };
 
-    let Some(key) = state
-        .read_provider_catalog_keys_by_ids(std::slice::from_ref(&key_id))
-        .await?
-        .into_iter()
-        .next()
-    else {
-        set_cached_codex_quota_fingerprint(&key_id, incoming_fingerprint, now);
-        return Ok(false);
-    };
+            let Some(provider) = state
+                .read_provider_catalog_providers_by_ids(std::slice::from_ref(&key.provider_id))
+                .await?
+                .into_iter()
+                .next()
+            else {
+                return Ok(CodexQuotaPersistenceOutcome::CacheableNoop);
+            };
+            if !provider.provider_type.trim().eq_ignore_ascii_case("codex") {
+                return Ok(CodexQuotaPersistenceOutcome::CacheableNoop);
+            }
 
-    let Some(provider) = state
-        .read_provider_catalog_providers_by_ids(std::slice::from_ref(&key.provider_id))
-        .await?
-        .into_iter()
-        .next()
-    else {
-        set_cached_codex_quota_fingerprint(&key_id, incoming_fingerprint, now);
-        return Ok(false);
-    };
-    if !provider.provider_type.trim().eq_ignore_ascii_case("codex") {
-        set_cached_codex_quota_fingerprint(&key_id, incoming_fingerprint, now);
-        return Ok(false);
-    }
+            let current_codex = key
+                .upstream_metadata
+                .as_ref()
+                .and_then(Value::as_object)
+                .and_then(|metadata| metadata.get("codex"))
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_else(serde_json::Map::new);
+            let current_codex = Value::Object(current_codex);
+            let Some(current_fingerprint) = fingerprint_codex_payload(&current_codex) else {
+                return Ok(CodexQuotaPersistenceOutcome::CacheableNoop);
+            };
+            if current_fingerprint == incoming_fingerprint {
+                return Ok(CodexQuotaPersistenceOutcome::CacheableNoop);
+            }
 
-    let current_codex = key
-        .upstream_metadata
-        .as_ref()
-        .and_then(Value::as_object)
-        .and_then(|metadata| metadata.get("codex"))
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_else(serde_json::Map::new);
-    let current_codex = Value::Object(current_codex);
-    let Some(current_fingerprint) = fingerprint_codex_payload(&current_codex) else {
-        set_cached_codex_quota_fingerprint(&key_id, incoming_fingerprint, now);
-        return Ok(false);
-    };
-    if current_fingerprint == incoming_fingerprint {
-        set_cached_codex_quota_fingerprint(&key_id, incoming_fingerprint, now);
-        return Ok(false);
-    }
+            let updated_upstream_metadata =
+                merge_metadata_object(key.upstream_metadata.as_ref(), "codex", parsed);
+            let updated_status_snapshot = sync_provider_key_quota_status_snapshot(
+                key.status_snapshot.as_ref(),
+                provider.provider_type.as_str(),
+                updated_upstream_metadata.as_ref(),
+                "response_headers",
+            );
+            let mut updated_key = key;
+            updated_key.upstream_metadata = updated_upstream_metadata;
+            updated_key.status_snapshot = updated_status_snapshot;
+            updated_key.updated_at_unix_secs = Some(now_unix_secs);
 
-    let updated_upstream_metadata =
-        merge_metadata_object(key.upstream_metadata.as_ref(), "codex", parsed);
-    let updated_status_snapshot = sync_provider_key_quota_status_snapshot(
-        key.status_snapshot.as_ref(),
-        provider.provider_type.as_str(),
-        updated_upstream_metadata.as_ref(),
-        "response_headers",
-    );
-    let mut updated_key = key;
-    updated_key.upstream_metadata = updated_upstream_metadata;
-    updated_key.status_snapshot = updated_status_snapshot;
-    updated_key.updated_at_unix_secs = Some(now_unix_secs);
-
-    let updated = state
-        .update_provider_catalog_key_runtime_state(&updated_key)
-        .await?
-        .is_some();
-    if updated {
-        set_cached_codex_quota_fingerprint(&key_id, incoming_fingerprint, now);
-    }
-    Ok(updated)
+            Ok(
+                if state
+                    .update_provider_catalog_key_runtime_state(&updated_key)
+                    .await?
+                    .is_some()
+                {
+                    CodexQuotaPersistenceOutcome::Updated
+                } else {
+                    CodexQuotaPersistenceOutcome::RetryableNoop
+                },
+            )
+        })
+        .await
 }
 
 #[cfg(test)]
 pub(crate) fn clear_local_report_effect_caches_for_tests() {
-    if let Some(cache) = CODEX_QUOTA_HEADER_FINGERPRINT_CACHE.get() {
-        cache
-            .lock()
-            .expect("codex realtime quota cache should lock")
-            .clear();
+    if let Some(coordinator) = CODEX_QUOTA_SYNC_COORDINATOR.get() {
+        coordinator.clear_fingerprints();
     }
 }
 
@@ -716,6 +879,386 @@ pub(crate) fn clear_local_report_effect_caches_for_tests() {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn identical_concurrent_codex_quota_sync_persists_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::Poll;
+
+        let coordinator = Arc::new(CodexQuotaSyncCoordinator::default());
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+
+        let first_coordinator = Arc::clone(&coordinator);
+        let first_attempts = Arc::clone(&attempts);
+        let first_entered = Arc::clone(&entered);
+        let first_release = Arc::clone(&release);
+        let first = tokio::spawn(async move {
+            first_coordinator
+                .sync(
+                    "key-identical",
+                    "fingerprint-1".to_string(),
+                    || async move {
+                        first_attempts.fetch_add(1, Ordering::AcqRel);
+                        first_entered.add_permits(1);
+                        first_release
+                            .acquire()
+                            .await
+                            .expect("release semaphore should remain open")
+                            .forget();
+                        Ok(CodexQuotaPersistenceOutcome::Updated)
+                    },
+                )
+                .await
+        });
+        entered
+            .acquire()
+            .await
+            .expect("first persistence should enter")
+            .forget();
+
+        let second_attempts = Arc::clone(&attempts);
+        let second = coordinator.sync(
+            "key-identical",
+            "fingerprint-1".to_string(),
+            || async move {
+                second_attempts.fetch_add(1, Ordering::AcqRel);
+                Ok(CodexQuotaPersistenceOutcome::Updated)
+            },
+        );
+        tokio::pin!(second);
+        assert!(matches!(
+            futures_util::poll!(second.as_mut()),
+            Poll::Pending
+        ));
+        assert_eq!(attempts.load(Ordering::Acquire), 1);
+
+        release.add_permits(1);
+        assert!(matches!(
+            first.await.expect("first task should join"),
+            Ok(true)
+        ));
+        assert!(matches!(second.await, Ok(false)));
+        assert_eq!(attempts.load(Ordering::Acquire), 1);
+        assert_eq!(coordinator.active_key_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn different_concurrent_codex_quota_fingerprints_serialize() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::Poll;
+
+        let coordinator = Arc::new(CodexQuotaSyncCoordinator::default());
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+
+        let first_coordinator = Arc::clone(&coordinator);
+        let first_attempts = Arc::clone(&attempts);
+        let first_entered = Arc::clone(&entered);
+        let first_release = Arc::clone(&release);
+        let first = tokio::spawn(async move {
+            first_coordinator
+                .sync(
+                    "key-serialized",
+                    "fingerprint-1".to_string(),
+                    || async move {
+                        first_attempts.fetch_add(1, Ordering::AcqRel);
+                        first_entered.add_permits(1);
+                        first_release
+                            .acquire()
+                            .await
+                            .expect("release semaphore should remain open")
+                            .forget();
+                        Ok(CodexQuotaPersistenceOutcome::Updated)
+                    },
+                )
+                .await
+        });
+        entered
+            .acquire()
+            .await
+            .expect("first persistence should enter")
+            .forget();
+
+        let second_attempts = Arc::clone(&attempts);
+        let second = coordinator.sync(
+            "key-serialized",
+            "fingerprint-2".to_string(),
+            || async move {
+                second_attempts.fetch_add(1, Ordering::AcqRel);
+                Ok(CodexQuotaPersistenceOutcome::Updated)
+            },
+        );
+        tokio::pin!(second);
+        assert!(matches!(
+            futures_util::poll!(second.as_mut()),
+            Poll::Pending
+        ));
+        assert_eq!(attempts.load(Ordering::Acquire), 1);
+
+        release.add_permits(1);
+        assert!(matches!(
+            first.await.expect("first task should join"),
+            Ok(true)
+        ));
+        assert!(matches!(second.await, Ok(true)));
+        assert_eq!(attempts.load(Ordering::Acquire), 2);
+        assert_eq!(coordinator.active_key_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn codex_quota_sync_failure_and_none_remain_retryable() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let coordinator = CodexQuotaSyncCoordinator::default();
+        let attempts = AtomicUsize::new(0);
+
+        let failed = coordinator
+            .sync("key-retry", "fingerprint-1".to_string(), || async {
+                attempts.fetch_add(1, Ordering::AcqRel);
+                Err(GatewayError::Internal(
+                    "test persistence failure".to_string(),
+                ))
+            })
+            .await;
+        assert!(failed.is_err());
+
+        let missing = coordinator
+            .sync("key-retry", "fingerprint-1".to_string(), || async {
+                attempts.fetch_add(1, Ordering::AcqRel);
+                Ok(CodexQuotaPersistenceOutcome::RetryableNoop)
+            })
+            .await;
+        assert!(matches!(missing, Ok(false)));
+
+        let retried = coordinator
+            .sync("key-retry", "fingerprint-1".to_string(), || async {
+                attempts.fetch_add(1, Ordering::AcqRel);
+                Ok(CodexQuotaPersistenceOutcome::Updated)
+            })
+            .await;
+        assert!(matches!(retried, Ok(true)));
+        assert_eq!(attempts.load(Ordering::Acquire), 3);
+        assert_eq!(coordinator.active_key_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn changed_codex_quota_fingerprint_persists_again() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let coordinator = CodexQuotaSyncCoordinator::default();
+        let attempts = AtomicUsize::new(0);
+
+        for fingerprint in ["fingerprint-1", "fingerprint-2"] {
+            assert!(matches!(
+                coordinator
+                    .sync("key-changed", fingerprint.to_string(), || async {
+                        attempts.fetch_add(1, Ordering::AcqRel);
+                        Ok(CodexQuotaPersistenceOutcome::Updated)
+                    })
+                    .await,
+                Ok(true)
+            ));
+        }
+        assert!(matches!(
+            coordinator
+                .sync("key-changed", "fingerprint-2".to_string(), || async {
+                    attempts.fetch_add(1, Ordering::AcqRel);
+                    Ok(CodexQuotaPersistenceOutcome::Updated)
+                })
+                .await,
+            Ok(false)
+        ));
+        assert_eq!(attempts.load(Ordering::Acquire), 2);
+    }
+
+    #[tokio::test]
+    async fn independent_codex_quota_keys_persist_concurrently() {
+        use std::task::Poll;
+
+        let coordinator = Arc::new(CodexQuotaSyncCoordinator::default());
+        let first_entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let first_release = Arc::new(tokio::sync::Semaphore::new(0));
+
+        let first_coordinator = Arc::clone(&coordinator);
+        let entered = Arc::clone(&first_entered);
+        let release = Arc::clone(&first_release);
+        let first = tokio::spawn(async move {
+            first_coordinator
+                .sync(
+                    "key-independent-1",
+                    "fingerprint-1".to_string(),
+                    || async move {
+                        entered.add_permits(1);
+                        release
+                            .acquire()
+                            .await
+                            .expect("release semaphore should remain open")
+                            .forget();
+                        Ok(CodexQuotaPersistenceOutcome::Updated)
+                    },
+                )
+                .await
+        });
+        first_entered
+            .acquire()
+            .await
+            .expect("first key persistence should enter")
+            .forget();
+
+        let second = coordinator.sync("key-independent-2", "fingerprint-1".to_string(), || async {
+            Ok(CodexQuotaPersistenceOutcome::Updated)
+        });
+        tokio::pin!(second);
+        assert!(matches!(
+            futures_util::poll!(second.as_mut()),
+            Poll::Ready(Ok(true))
+        ));
+
+        first_release.add_permits(1);
+        assert!(matches!(
+            first.await.expect("first task should join"),
+            Ok(true)
+        ));
+        assert_eq!(coordinator.active_key_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn cacheable_codex_quota_noop_suppresses_identical_retry() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let coordinator = CodexQuotaSyncCoordinator::default();
+        let attempts = AtomicUsize::new(0);
+
+        assert!(matches!(
+            coordinator
+                .sync("key-noop", "fingerprint-1".to_string(), || async {
+                    attempts.fetch_add(1, Ordering::AcqRel);
+                    Ok(CodexQuotaPersistenceOutcome::CacheableNoop)
+                })
+                .await,
+            Ok(false)
+        ));
+        assert!(matches!(
+            coordinator
+                .sync("key-noop", "fingerprint-1".to_string(), || async {
+                    attempts.fetch_add(1, Ordering::AcqRel);
+                    Ok(CodexQuotaPersistenceOutcome::Updated)
+                })
+                .await,
+            Ok(false)
+        ));
+        assert_eq!(attempts.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_codex_quota_persistence_remains_retryable() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::Poll;
+
+        let coordinator = CodexQuotaSyncCoordinator::default();
+        let attempts = AtomicUsize::new(0);
+        let entered = tokio::sync::Semaphore::new(0);
+        let release = tokio::sync::Semaphore::new(0);
+
+        let mut cancelled = Box::pin(coordinator.sync(
+            "key-persistence-cancelled",
+            "fingerprint-1".to_string(),
+            || async {
+                attempts.fetch_add(1, Ordering::AcqRel);
+                entered.add_permits(1);
+                release
+                    .acquire()
+                    .await
+                    .expect("release semaphore should remain open")
+                    .forget();
+                Ok(CodexQuotaPersistenceOutcome::Updated)
+            },
+        ));
+        assert!(matches!(
+            futures_util::poll!(cancelled.as_mut()),
+            Poll::Pending
+        ));
+        entered
+            .acquire()
+            .await
+            .expect("cancelled persistence should enter")
+            .forget();
+        drop(cancelled);
+
+        assert_eq!(coordinator.active_key_count(), 0);
+        assert!(matches!(
+            coordinator
+                .sync(
+                    "key-persistence-cancelled",
+                    "fingerprint-1".to_string(),
+                    || async {
+                        attempts.fetch_add(1, Ordering::AcqRel);
+                        Ok(CodexQuotaPersistenceOutcome::Updated)
+                    }
+                )
+                .await,
+            Ok(true)
+        ));
+        assert_eq!(attempts.load(Ordering::Acquire), 2);
+    }
+
+    #[tokio::test]
+    async fn codex_quota_sync_cancellation_cleans_registry_without_split_lock() {
+        use std::task::Poll;
+
+        let coordinator = CodexQuotaSyncCoordinator::default();
+        let held = coordinator.acquire("key-cancelled").await;
+        assert_eq!(coordinator.active_key_count(), 1);
+        assert_eq!(coordinator.reservation_count("key-cancelled"), 1);
+
+        let mut cancelled = Box::pin(coordinator.acquire("key-cancelled"));
+        assert!(matches!(
+            futures_util::poll!(cancelled.as_mut()),
+            Poll::Pending
+        ));
+        assert_eq!(coordinator.reservation_count("key-cancelled"), 2);
+        drop(cancelled);
+        assert_eq!(coordinator.reservation_count("key-cancelled"), 1);
+
+        let mut replacement = Box::pin(coordinator.acquire("key-cancelled"));
+        assert!(matches!(
+            futures_util::poll!(replacement.as_mut()),
+            Poll::Pending
+        ));
+        assert_eq!(coordinator.reservation_count("key-cancelled"), 2);
+
+        drop(held);
+        let replacement = replacement.await;
+        assert_eq!(coordinator.reservation_count("key-cancelled"), 1);
+        drop(replacement);
+        assert_eq!(coordinator.active_key_count(), 0);
+    }
+
+    #[test]
+    fn codex_quota_fingerprint_cache_preserves_ttl_and_max_entries() {
+        let cache = HeaderFingerprintCache::default();
+        let now = Instant::now();
+        let expired = now.checked_sub(Duration::from_secs(1)).unwrap_or(now);
+        cache
+            .lock()
+            .expect("codex realtime quota cache should lock")
+            .insert("expired".to_string(), ("old".to_string(), expired));
+
+        for index in 0..=CODEX_QUOTA_CACHE_MAX_ENTRIES {
+            let key = format!("key-{index}");
+            set_cached_codex_quota_fingerprint(&cache, &key, format!("fingerprint-{index}"), now);
+        }
+
+        let cache = cache
+            .lock()
+            .expect("codex realtime quota cache should lock");
+        assert_eq!(cache.len(), CODEX_QUOTA_CACHE_MAX_ENTRIES);
+        assert!(!cache.contains_key("expired"));
+        assert!(cache.values().all(|(_, expires_at)| *expires_at > now));
+    }
 
     #[test]
     fn grok_realtime_quota_uses_official_xai_headers() {

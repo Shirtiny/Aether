@@ -210,6 +210,7 @@ export interface RequestDetail {
   request_type: string
   is_stream: boolean
   upstream_is_stream?: boolean
+  ws_step?: boolean
   client_requested_stream?: boolean
   client_is_stream?: boolean
   status_code: number

@@ -285,6 +285,15 @@ fn classifies_admin_update_key_codex_ws_before_generic_update() {
     assert_eq!(decision.route_family.as_deref(), Some("endpoints_manage"));
     assert_eq!(decision.route_kind.as_deref(), Some("update_key_codex_ws"));
     assert!(!decision.is_execution_runtime_candidate());
+
+    let context = GatewayPublicRequestContext::from_request_parts(
+        "trace-update-key-codex-ws",
+        &http::Method::PUT,
+        &uri,
+        &headers,
+        Some(decision),
+    );
+    assert!(local_proxy_route_requires_buffered_body(&context));
 }
 
 #[test]

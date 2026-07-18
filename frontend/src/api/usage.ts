@@ -36,6 +36,7 @@ export interface UsageRecord {
   user_agent?: string | null
   request_path?: string | null
   request_path_and_query?: string | null
+  ws_step?: boolean
 }
 
 export interface UsageStats {
@@ -532,6 +533,7 @@ export const usageApi = {
       endpoint_api_format?: string | null
       is_stream?: boolean | null
       upstream_is_stream?: boolean | null
+      ws_step?: boolean | null
       client_requested_stream?: boolean | null
       client_is_stream?: boolean | null
       has_format_conversion?: boolean | null

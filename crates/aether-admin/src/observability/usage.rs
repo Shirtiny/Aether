@@ -1083,6 +1083,15 @@ fn admin_usage_upstream_is_stream(item: &StoredRequestUsageAudit) -> bool {
         .unwrap_or(item.is_stream)
 }
 
+fn admin_usage_is_ws(item: &StoredRequestUsageAudit) -> bool {
+    item.request_metadata
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|metadata| metadata.get("ws_step"))
+        .and_then(Value::as_bool)
+        == Some(true)
+}
+
 fn admin_usage_metadata_string<'a>(
     item: &'a StoredRequestUsageAudit,
     key: &str,
@@ -1279,6 +1288,7 @@ fn admin_usage_active_request_json(
         "provider_key_name": provider_key_name,
         "is_stream": item.is_stream,
         "upstream_is_stream": upstream_is_stream,
+        "ws_step": admin_usage_is_ws(item),
         "client_requested_stream": client_is_stream,
         "client_is_stream": client_is_stream,
         "client_family": admin_usage_client_family(item),
@@ -1407,6 +1417,7 @@ pub fn admin_usage_record_json(
         UPSTREAM_IS_STREAM_KEY.to_string(),
         json!(upstream_is_stream),
     );
+    object.insert("ws_step".to_string(), json!(admin_usage_is_ws(item)));
     object.insert(
         "client_requested_stream".to_string(),
         json!(client_is_stream),
@@ -2634,8 +2645,8 @@ mod tests {
     use super::{
         admin_usage_active_request_json, admin_usage_client_is_stream, admin_usage_has_body_value,
         admin_usage_has_fallback, admin_usage_is_failed, admin_usage_is_ping,
-        admin_usage_is_risk_control, admin_usage_is_success, admin_usage_matches_search,
-        admin_usage_matches_status, admin_usage_matches_username,
+        admin_usage_is_risk_control, admin_usage_is_success, admin_usage_is_ws,
+        admin_usage_matches_search, admin_usage_matches_status, admin_usage_matches_username,
         admin_usage_reasoning_output_tokens, admin_usage_record_json,
         admin_usage_resolve_request_capture_body, admin_usage_total_tokens,
         admin_usage_upstream_is_stream, build_admin_usage_detail_payload,
@@ -2750,6 +2761,44 @@ mod tests {
         assert_eq!(record["upstream_is_stream"], true);
         assert_eq!(record["client_requested_stream"], false);
         assert_eq!(record["client_is_stream"], false);
+    }
+
+    #[test]
+    fn admin_usage_payloads_include_ws_step_flag() {
+        let item = StoredRequestUsageAudit {
+            request_metadata: Some(json!({
+                "ws_step": true
+            })),
+            ..sample_usage("completed", Some(200), None)
+        };
+
+        assert!(admin_usage_is_ws(&item));
+
+        let record = admin_usage_record_json(
+            &item,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            false,
+            false,
+            None,
+        );
+        let active = admin_usage_active_request_json(&item, None, None, None);
+        let detail = build_admin_usage_detail_payload(
+            &item,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            false,
+            false,
+            None,
+            false,
+            None,
+            &BTreeMap::new(),
+        );
+
+        assert_eq!(record["ws_step"], true);
+        assert_eq!(active["ws_step"], true);
+        assert_eq!(detail["ws_step"], true);
+        assert_eq!(detail["metadata"]["ws_step"], true);
     }
 
     #[test]

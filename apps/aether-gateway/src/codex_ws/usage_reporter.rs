@@ -750,6 +750,7 @@ fn compact_usage_report_context(context: Option<&serde_json::Value>) -> Option<s
         "user_agent",
         "client_requested_stream",
         "upstream_is_stream",
+        "ws_step",
         "api_key_is_standalone",
         "request_body_ref",
         "provider_request_body_ref",
@@ -784,6 +785,21 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+
+    #[test]
+    fn compact_usage_report_context_preserves_ws_step() {
+        let context = serde_json::json!({
+            "request_id": "req-1",
+            "ws_step": true,
+            "secret": "drop-me"
+        });
+
+        let compact = compact_usage_report_context(Some(&context)).expect("context should remain");
+
+        assert_eq!(compact["request_id"], "req-1");
+        assert_eq!(compact["ws_step"], true);
+        assert!(compact.get("secret").is_none());
+    }
 
     #[test]
     fn production_config_enforces_capacity_and_worker_bounds() {

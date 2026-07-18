@@ -330,6 +330,12 @@ describe('UsageRecordsTable', () => {
     expect(root.querySelector('[data-usage-attempt-marker="retry"]')).not.toBeNull()
   })
 
+  it('shows the WS transport badge for WebSocket usage', () => {
+    const root = mountUsageRecordsTable([buildRecord({ ws_step: true })])
+
+    expect(root.textContent).toContain('WS')
+  })
+
   it('adds the session id column to saved visible column preferences once', () => {
     window.localStorage.setItem(
       'usage-records-visible-columns-admin',

@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use aether_codex_ws_connector::{
     CodexWebSocketConnector, IntoClientRequest, Message as OfficialMessage, OutboundRoute,
-    WebSocketConnection, WebSocketError,
+    WebSocketConnection, WebSocketError, WebSocketProtocolError, WebSocketTlsError,
+    WebSocketUrlError,
 };
 use aether_routing_core::RoutingJsonPatchOperation;
 use aether_runtime::AdmissionPermit;
@@ -59,6 +60,23 @@ const MAX_TERMINAL_ID_BYTES: usize = 256;
 const MAX_TERMINAL_MODEL_BYTES: usize = 256;
 const MAX_HANDSHAKE_ERROR_BODY_BYTES: usize = 8 * 1024;
 const STEP_PERMIT_RELEASE_TIMEOUT: Duration = Duration::from_millis(100);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexWsRouteKind {
+    TransportDefault,
+    Direct,
+    Proxy,
+}
+
+impl CodexWsRouteKind {
+    const fn from_route(route: &OutboundRoute) -> Self {
+        match route {
+            OutboundRoute::TransportDefault => Self::TransportDefault,
+            OutboundRoute::Direct => Self::Direct,
+            OutboundRoute::Proxy { .. } => Self::Proxy,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CodexWsTimeouts {
@@ -176,6 +194,7 @@ struct CodexWsHandshakeFailure {
     error_type: String,
     error_message: String,
     error_body: Option<String>,
+    diagnostic_detail: Option<String>,
     route_reason: &'static str,
 }
 
@@ -1113,6 +1132,7 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
         .await;
         candidate.lifecycle.mark_started();
         let route = take_outbound_route_for_connect(&mut candidate.route);
+        let route_kind = CodexWsRouteKind::from_route(&route);
         let connect_result = tokio::time::timeout(
             candidate.timeouts().connect,
             self.connector.connect(request, route),
@@ -1121,7 +1141,15 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
         let (connection, response) = match connect_result {
             Ok(Ok(connected)) => connected,
             Ok(Err(error)) => {
-                let failure = classify_codex_ws_handshake_failure(error);
+                let failure = classify_codex_ws_handshake_failure(error, route_kind);
+                tracing::warn!(
+                    event_name = "codex_ws_handshake_failed",
+                    log_type = "ops",
+                    route_kind = ?route_kind,
+                    error_type = %failure.error_type,
+                    error_detail = failure.diagnostic_detail.as_deref().unwrap_or("none"),
+                    "official Codex WebSocket handshake failed"
+                );
                 self.enqueue_handshake_failure(&candidate, &mut cancellation_guard, &failure)
                     .await?;
                 cancellation_guard.disarm();
@@ -1134,6 +1162,7 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
                     error_type: "codex_ws_connect_timeout".to_string(),
                     error_message: "official Codex WebSocket connect timed out".to_string(),
                     error_body: None,
+                    diagnostic_detail: None,
                     route_reason: "official_ws_connect_timeout",
                 };
                 self.enqueue_handshake_failure(&candidate, &mut cancellation_guard, &failure)
@@ -1530,58 +1559,276 @@ impl GatewayCodexWsRuntime {
     }
 }
 
-fn classify_codex_ws_handshake_failure(error: WebSocketError) -> CodexWsHandshakeFailure {
-    if let WebSocketError::Http(response) = error {
-        let status_code = response.status().as_u16();
-        let response_headers = compact_codex_response_headers(response.headers());
-        let error_body = response.body().as_ref().and_then(|body| {
-            let body = &body[..body.len().min(MAX_HANDSHAKE_ERROR_BODY_BYTES)];
-            (!body.is_empty()).then(|| String::from_utf8_lossy(body).into_owned())
-        });
-        let (error_type, error_message, route_reason) = match status_code {
-            401 | 403 => (
-                "codex_ws_handshake_unauthorized",
-                "official Codex WebSocket rejected account authorization",
-                "official_ws_account_unauthorized",
-            ),
-            409 => (
-                "codex_ws_handshake_connection_limit",
-                "official Codex WebSocket account connection limit was reached",
-                "official_ws_connection_limit",
-            ),
-            429 => (
-                "codex_ws_handshake_rate_limited",
-                "official Codex WebSocket account was rate limited",
-                "official_ws_account_rate_limited",
-            ),
-            500..=599 => (
-                "codex_ws_handshake_upstream_failure",
-                "official Codex WebSocket handshake failed upstream",
-                "official_ws_upstream_failure",
-            ),
-            _ => (
-                "codex_ws_handshake_http_error",
-                "official Codex WebSocket handshake was rejected",
-                "official_ws_handshake_rejected",
-            ),
-        };
-        return CodexWsHandshakeFailure {
-            status_code,
-            response_headers,
-            error_type: error_type.to_string(),
-            error_message: error_message.to_string(),
-            error_body,
-            route_reason,
-        };
+fn classify_codex_ws_handshake_failure(
+    error: WebSocketError,
+    route_kind: CodexWsRouteKind,
+) -> CodexWsHandshakeFailure {
+    match error {
+        WebSocketError::Http(response) => {
+            let status_code = response.status().as_u16();
+            let response_headers = compact_codex_response_headers(response.headers());
+            let error_body = response.body().as_ref().and_then(|body| {
+                let body = &body[..body.len().min(MAX_HANDSHAKE_ERROR_BODY_BYTES)];
+                (!body.is_empty()).then(|| String::from_utf8_lossy(body).into_owned())
+            });
+            let (error_type, error_message, route_reason) = match status_code {
+                401 | 403 => (
+                    "codex_ws_handshake_unauthorized",
+                    "official Codex WebSocket rejected account authorization",
+                    "official_ws_account_unauthorized",
+                ),
+                409 => (
+                    "codex_ws_handshake_connection_limit",
+                    "official Codex WebSocket account connection limit was reached",
+                    "official_ws_connection_limit",
+                ),
+                429 => (
+                    "codex_ws_handshake_rate_limited",
+                    "official Codex WebSocket account was rate limited",
+                    "official_ws_account_rate_limited",
+                ),
+                500..=599 => (
+                    "codex_ws_handshake_upstream_failure",
+                    "official Codex WebSocket handshake failed upstream",
+                    "official_ws_upstream_failure",
+                ),
+                _ => (
+                    "codex_ws_handshake_http_error",
+                    "official Codex WebSocket handshake was rejected",
+                    "official_ws_handshake_rejected",
+                ),
+            };
+            CodexWsHandshakeFailure {
+                status_code,
+                response_headers,
+                error_type: error_type.to_string(),
+                error_message: error_message.to_string(),
+                error_body,
+                diagnostic_detail: Some(format!("http_status={status_code}")),
+                route_reason,
+            }
+        }
+        WebSocketError::Io(error) => {
+            let error_type = match route_kind {
+                CodexWsRouteKind::Proxy => "codex_ws_handshake_proxy_io_error",
+                CodexWsRouteKind::TransportDefault | CodexWsRouteKind::Direct => {
+                    "codex_ws_handshake_io_error"
+                }
+            };
+            transport_handshake_failure(
+                error_type,
+                "official Codex WebSocket transport I/O failed",
+                "official_ws_handshake_io_failed",
+                Some(format!("io_kind={}", io_error_kind_name(error.kind()))),
+            )
+        }
+        WebSocketError::Tls(error) => transport_handshake_failure(
+            "codex_ws_handshake_tls_error",
+            "official Codex WebSocket TLS handshake failed",
+            "official_ws_handshake_tls_failed",
+            Some(format!("tls_kind={}", tls_error_kind_name(&error))),
+        ),
+        WebSocketError::Protocol(error) => transport_handshake_failure(
+            "codex_ws_handshake_protocol_error",
+            "official Codex WebSocket protocol handshake failed",
+            "official_ws_handshake_protocol_failed",
+            Some(format!(
+                "protocol_kind={}",
+                protocol_error_kind_name(&error)
+            )),
+        ),
+        WebSocketError::Url(error) => {
+            let (error_type, error_message, route_reason) = match error {
+                WebSocketUrlError::ProxyConnect(_) => (
+                    "codex_ws_handshake_proxy_connect_error",
+                    "official Codex WebSocket proxy CONNECT failed",
+                    "official_ws_proxy_connect_failed",
+                ),
+                _ => (
+                    "codex_ws_handshake_url_error",
+                    "official Codex WebSocket transport route was invalid",
+                    "official_ws_handshake_url_failed",
+                ),
+            };
+            transport_handshake_failure(
+                error_type,
+                error_message,
+                route_reason,
+                Some(format!("url_kind={}", url_error_kind_name(&error))),
+            )
+        }
+        WebSocketError::HttpFormat(_) => transport_handshake_failure(
+            "codex_ws_handshake_http_format_error",
+            "official Codex WebSocket HTTP handshake was invalid",
+            "official_ws_handshake_http_format_failed",
+            Some("http_format_error".to_string()),
+        ),
+        WebSocketError::Capacity(_) => transport_handshake_failure(
+            "codex_ws_handshake_capacity_error",
+            "official Codex WebSocket handshake exceeded a transport limit",
+            "official_ws_handshake_capacity_failed",
+            Some("capacity_error".to_string()),
+        ),
+        WebSocketError::Utf8(_) => transport_handshake_failure(
+            "codex_ws_handshake_utf8_error",
+            "official Codex WebSocket handshake contained invalid text",
+            "official_ws_handshake_utf8_failed",
+            Some("utf8_error".to_string()),
+        ),
+        WebSocketError::ConnectionClosed => transport_handshake_failure(
+            "codex_ws_handshake_connection_closed",
+            "official Codex WebSocket closed during handshake",
+            "official_ws_handshake_connection_closed",
+            Some("connection_closed".to_string()),
+        ),
+        WebSocketError::AlreadyClosed => transport_handshake_failure(
+            "codex_ws_handshake_already_closed",
+            "official Codex WebSocket transport was already closed",
+            "official_ws_handshake_already_closed",
+            Some("already_closed".to_string()),
+        ),
+        WebSocketError::WriteBufferFull(_) => transport_handshake_failure(
+            "codex_ws_handshake_write_buffer_full",
+            "official Codex WebSocket handshake write buffer was full",
+            "official_ws_handshake_write_buffer_full",
+            Some("write_buffer_full".to_string()),
+        ),
+        WebSocketError::AttackAttempt => transport_handshake_failure(
+            "codex_ws_handshake_attack_attempt",
+            "official Codex WebSocket handshake was rejected as unsafe",
+            "official_ws_handshake_attack_attempt",
+            Some("attack_attempt".to_string()),
+        ),
     }
+}
 
+fn transport_handshake_failure(
+    error_type: &'static str,
+    error_message: &'static str,
+    route_reason: &'static str,
+    diagnostic_detail: Option<String>,
+) -> CodexWsHandshakeFailure {
     CodexWsHandshakeFailure {
         status_code: http::StatusCode::BAD_GATEWAY.as_u16(),
         response_headers: BTreeMap::new(),
-        error_type: "codex_ws_handshake_transport_error".to_string(),
-        error_message: "official Codex WebSocket transport handshake failed".to_string(),
-        error_body: None,
-        route_reason: "official_ws_handshake_transport_failed",
+        error_type: error_type.to_string(),
+        error_message: error_message.to_string(),
+        error_body: diagnostic_detail.clone(),
+        diagnostic_detail,
+        route_reason,
+    }
+}
+
+fn io_error_kind_name(kind: std::io::ErrorKind) -> &'static str {
+    use std::io::ErrorKind;
+
+    match kind {
+        ErrorKind::NotFound => "not_found",
+        ErrorKind::PermissionDenied => "permission_denied",
+        ErrorKind::ConnectionRefused => "connection_refused",
+        ErrorKind::ConnectionReset => "connection_reset",
+        ErrorKind::HostUnreachable => "host_unreachable",
+        ErrorKind::NetworkUnreachable => "network_unreachable",
+        ErrorKind::ConnectionAborted => "connection_aborted",
+        ErrorKind::NotConnected => "not_connected",
+        ErrorKind::AddrInUse => "address_in_use",
+        ErrorKind::AddrNotAvailable => "address_not_available",
+        ErrorKind::NetworkDown => "network_down",
+        ErrorKind::BrokenPipe => "broken_pipe",
+        ErrorKind::AlreadyExists => "already_exists",
+        ErrorKind::WouldBlock => "would_block",
+        ErrorKind::NotADirectory => "not_a_directory",
+        ErrorKind::IsADirectory => "is_a_directory",
+        ErrorKind::DirectoryNotEmpty => "directory_not_empty",
+        ErrorKind::ReadOnlyFilesystem => "read_only_filesystem",
+        ErrorKind::StaleNetworkFileHandle => "stale_network_file_handle",
+        ErrorKind::InvalidInput => "invalid_input",
+        ErrorKind::InvalidData => "invalid_data",
+        ErrorKind::TimedOut => "timed_out",
+        ErrorKind::WriteZero => "write_zero",
+        ErrorKind::StorageFull => "storage_full",
+        ErrorKind::NotSeekable => "not_seekable",
+        ErrorKind::QuotaExceeded => "quota_exceeded",
+        ErrorKind::FileTooLarge => "file_too_large",
+        ErrorKind::ResourceBusy => "resource_busy",
+        ErrorKind::ExecutableFileBusy => "executable_file_busy",
+        ErrorKind::Deadlock => "deadlock",
+        ErrorKind::CrossesDevices => "crosses_devices",
+        ErrorKind::TooManyLinks => "too_many_links",
+        ErrorKind::InvalidFilename => "invalid_filename",
+        ErrorKind::ArgumentListTooLong => "argument_list_too_long",
+        ErrorKind::Interrupted => "interrupted",
+        ErrorKind::Unsupported => "unsupported",
+        ErrorKind::UnexpectedEof => "unexpected_eof",
+        ErrorKind::OutOfMemory => "out_of_memory",
+        ErrorKind::Other => "other",
+        _ => "unknown",
+    }
+}
+
+fn tls_error_kind_name(error: &WebSocketTlsError) -> &'static str {
+    match error {
+        WebSocketTlsError::Rustls(_) => "rustls",
+        WebSocketTlsError::InvalidDnsName => "invalid_dns_name",
+        _ => "other",
+    }
+}
+
+fn protocol_error_kind_name(error: &WebSocketProtocolError) -> &'static str {
+    match error {
+        WebSocketProtocolError::WrongHttpMethod => "wrong_http_method",
+        WebSocketProtocolError::WrongHttpVersion => "wrong_http_version",
+        WebSocketProtocolError::MissingConnectionUpgradeHeader => {
+            "missing_connection_upgrade_header"
+        }
+        WebSocketProtocolError::MissingUpgradeWebSocketHeader => "missing_upgrade_websocket_header",
+        WebSocketProtocolError::MissingSecWebSocketVersionHeader => {
+            "missing_sec_websocket_version_header"
+        }
+        WebSocketProtocolError::MissingSecWebSocketKey => "missing_sec_websocket_key",
+        WebSocketProtocolError::SecWebSocketAcceptKeyMismatch => {
+            "sec_websocket_accept_key_mismatch"
+        }
+        WebSocketProtocolError::SecWebSocketSubProtocolError(_) => {
+            "sec_websocket_subprotocol_error"
+        }
+        WebSocketProtocolError::InvalidExtensionsHeader(_) => "invalid_extensions_header",
+        WebSocketProtocolError::JunkAfterRequest => "junk_after_request",
+        WebSocketProtocolError::CustomResponseSuccessful => "custom_response_successful",
+        WebSocketProtocolError::InvalidHeader(_) => "invalid_header",
+        WebSocketProtocolError::HandshakeIncomplete => "handshake_incomplete",
+        WebSocketProtocolError::HttparseError(_) => "http_parse_error",
+        WebSocketProtocolError::SendAfterClosing => "send_after_closing",
+        WebSocketProtocolError::ReceivedAfterClosing => "received_after_closing",
+        WebSocketProtocolError::NonZeroReservedBits => "non_zero_reserved_bits",
+        WebSocketProtocolError::UnmaskedFrameFromClient => "unmasked_frame_from_client",
+        WebSocketProtocolError::MaskedFrameFromServer => "masked_frame_from_server",
+        WebSocketProtocolError::FragmentedControlFrame => "fragmented_control_frame",
+        WebSocketProtocolError::CompressedControlFrame => "compressed_control_frame",
+        WebSocketProtocolError::ControlFrameTooBig => "control_frame_too_big",
+        WebSocketProtocolError::UnknownControlFrameType(_) => "unknown_control_frame_type",
+        WebSocketProtocolError::UnknownDataFrameType(_) => "unknown_data_frame_type",
+        WebSocketProtocolError::UnexpectedContinueFrame => "unexpected_continue_frame",
+        WebSocketProtocolError::CompressedContinueFrame => "compressed_continue_frame",
+        WebSocketProtocolError::ExpectedFragment(_) => "expected_fragment",
+        WebSocketProtocolError::ResetWithoutClosingHandshake => "reset_without_closing_handshake",
+        WebSocketProtocolError::InvalidOpcode(_) => "invalid_opcode",
+        WebSocketProtocolError::InvalidCloseSequence => "invalid_close_sequence",
+        WebSocketProtocolError::CompressionFailure(_) => "compression_failure",
+    }
+}
+
+fn url_error_kind_name(error: &WebSocketUrlError) -> &'static str {
+    match error {
+        WebSocketUrlError::TlsFeatureNotEnabled => "tls_feature_not_enabled",
+        WebSocketUrlError::NoHostName => "no_host_name",
+        WebSocketUrlError::UnableToConnect(_) => "unable_to_connect",
+        WebSocketUrlError::UnsupportedUrlScheme => "unsupported_url_scheme",
+        WebSocketUrlError::EmptyHostName => "empty_host_name",
+        WebSocketUrlError::NoPathOrQuery => "no_path_or_query",
+        WebSocketUrlError::UnsupportedProxyScheme => "unsupported_proxy_scheme",
+        WebSocketUrlError::InvalidProxyConfig(_) => "invalid_proxy_config",
+        WebSocketUrlError::ProxyConnect(_) => "proxy_connect",
     }
 }
 
@@ -1685,14 +1932,16 @@ fn step_report_context(
     context: Option<serde_json::Value>,
     step: &ResponseCreateStep,
 ) -> Option<serde_json::Value> {
-    let mut context = context?;
-    let object = context.as_object_mut()?;
-    object.insert(
+    let mut context = match context {
+        Some(serde_json::Value::Object(context)) => context,
+        _ => serde_json::Map::new(),
+    };
+    context.insert(
         "request_id".to_string(),
         serde_json::Value::String(step_usage_request_id(step)),
     );
-    object.insert("ws_step".to_string(), serde_json::Value::Bool(true));
-    Some(context)
+    context.insert("ws_step".to_string(), serde_json::Value::Bool(true));
+    Some(serde_json::Value::Object(context))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1975,6 +2224,37 @@ impl Sink<RelayFrame> for OfficialPeer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codex_ws::protocol::StepFence;
+
+    #[test]
+    fn step_report_context_creates_ws_metadata_without_base_context() {
+        let step = ResponseCreateStep {
+            value: json!({}),
+            encoded_len: 2,
+            model: "gpt-test".into(),
+            previous_response_id: None,
+            logical_turn_id: None,
+            official_identity: OfficialRequestIdentity {
+                session_id: "session-1".into(),
+                thread_id: "thread-1".into(),
+                window_id: None,
+                turn_metadata: None,
+                parent_thread_id: None,
+                subagent: None,
+                responses_lite: false,
+            },
+            fence: StepFence {
+                correlation_id: "correlation-1".into(),
+                binding_epoch_id: "epoch-1".into(),
+                binding_generation: 1,
+            },
+        };
+
+        let context = step_report_context(None, &step).expect("context should be created");
+
+        assert_eq!(context["request_id"], step_usage_request_id(&step));
+        assert_eq!(context["ws_step"], true);
+    }
 
     #[test]
     fn local_capacity_failures_retain_the_middle_route() {
@@ -2089,6 +2369,96 @@ mod tests {
             };
             assert!(outbound_route(Some(&proxy)).is_none());
         }
+    }
+
+    #[test]
+    fn handshake_http_classification_keeps_body_out_of_diagnostics() {
+        let secret_body = br#"{"error":{"message":"provider-secret"}}"#.to_vec();
+        let response = http::Response::builder()
+            .status(http::StatusCode::UNAUTHORIZED)
+            .body(Some(secret_body))
+            .expect("HTTP response should build");
+        let failure = classify_codex_ws_handshake_failure(
+            WebSocketError::Http(Box::new(response)),
+            CodexWsRouteKind::Proxy,
+        );
+
+        assert_eq!(failure.error_type, "codex_ws_handshake_unauthorized");
+        assert!(failure
+            .error_body
+            .as_deref()
+            .is_some_and(|body| body.contains("provider-secret")));
+        assert_eq!(
+            failure.diagnostic_detail.as_deref(),
+            Some("http_status=401")
+        );
+        assert!(!failure
+            .diagnostic_detail
+            .as_deref()
+            .unwrap()
+            .contains("provider-secret"));
+    }
+
+    #[test]
+    fn handshake_io_classification_keeps_only_route_and_io_kind() {
+        let failure = classify_codex_ws_handshake_failure(
+            WebSocketError::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "http://user:password@proxy.invalid:8080",
+            )),
+            CodexWsRouteKind::Proxy,
+        );
+
+        assert_eq!(failure.error_type, "codex_ws_handshake_proxy_io_error");
+        assert_eq!(
+            failure.diagnostic_detail.as_deref(),
+            Some("io_kind=connection_reset")
+        );
+        assert_eq!(failure.error_body, failure.diagnostic_detail);
+        assert!(!failure.error_body.unwrap().contains("password"));
+    }
+
+    #[test]
+    fn handshake_proxy_connect_classification_redacts_proxy_error() {
+        let failure = classify_codex_ws_handshake_failure(
+            WebSocketError::Url(WebSocketUrlError::ProxyConnect(
+                "http://user:password@proxy.invalid:8080".into(),
+            )),
+            CodexWsRouteKind::Proxy,
+        );
+
+        assert_eq!(failure.error_type, "codex_ws_handshake_proxy_connect_error");
+        assert_eq!(
+            failure.diagnostic_detail.as_deref(),
+            Some("url_kind=proxy_connect")
+        );
+        assert_eq!(failure.error_body, failure.diagnostic_detail);
+        assert!(!failure.error_body.unwrap().contains("password"));
+    }
+
+    #[test]
+    fn handshake_tls_and_protocol_classification_exposes_only_variants() {
+        let tls = classify_codex_ws_handshake_failure(
+            WebSocketError::Tls(WebSocketTlsError::InvalidDnsName),
+            CodexWsRouteKind::Direct,
+        );
+        let protocol = classify_codex_ws_handshake_failure(
+            WebSocketError::Protocol(WebSocketProtocolError::MissingUpgradeWebSocketHeader),
+            CodexWsRouteKind::Direct,
+        );
+
+        assert_eq!(tls.error_type, "codex_ws_handshake_tls_error");
+        assert_eq!(
+            tls.diagnostic_detail.as_deref(),
+            Some("tls_kind=invalid_dns_name")
+        );
+        assert_eq!(tls.error_body, tls.diagnostic_detail);
+        assert_eq!(protocol.error_type, "codex_ws_handshake_protocol_error");
+        assert_eq!(
+            protocol.diagnostic_detail.as_deref(),
+            Some("protocol_kind=missing_upgrade_websocket_header")
+        );
+        assert_eq!(protocol.error_body, protocol.diagnostic_detail);
     }
 
     #[test]

@@ -275,6 +275,13 @@
               >
                 fast
               </Badge>
+              <Badge
+                v-if="record.ws_step"
+                variant="outline"
+                class="h-4 shrink-0 whitespace-nowrap rounded-full border-violet-500/40 bg-violet-500/10 px-1.5 text-[10px] leading-4 text-violet-700 dark:text-violet-300"
+              >
+                WS
+              </Badge>
               <!-- 状态 Badge -->
               <Badge
                 v-if="isUsageRecordFailed(record)"
@@ -993,55 +1000,64 @@
             v-if="isColumnVisible('status')"
             class="text-center py-4 w-[9%]"
           >
-            <!-- 优先显示请求状态 -->
-            <Badge
-              v-if="isUsageRecordFailed(record)"
-              variant="destructive"
-              class="whitespace-nowrap"
-            >
-              失败
-            </Badge>
-            <Badge
-              v-else-if="getDisplayStatus(record) === 'pending'"
-              variant="outline"
-              class="whitespace-nowrap animate-pulse border-muted-foreground/30 text-muted-foreground"
-            >
-              等待中
-            </Badge>
-            <Badge
-              v-else-if="getDisplayStatus(record) === 'streaming'"
-              variant="outline"
-              class="whitespace-nowrap animate-pulse border-primary/50 text-primary"
-            >
-              传输中
-            </Badge>
-            <Badge
-              v-else-if="record.status === 'cancelled'"
-              variant="outline"
-              class="whitespace-nowrap border-amber-500/50 text-amber-600 dark:text-amber-400"
-            >
-              已取消
-            </Badge>
-            <Badge
-              v-else-if="getStreamModeSegments(record).hasConversion"
-              :variant="streamBadgeVariant(getStreamModeSegments(record).client === '流式')"
-              :class="(streamBadgeVariant(getStreamModeSegments(record).client === '流式') === 'secondary')
-                ? 'whitespace-nowrap inline-flex items-center gap-1'
-                : 'whitespace-nowrap border-border/60 text-muted-foreground inline-flex items-center gap-1'"
-            >
-              <span>{{ getStreamModeSegments(record).client }}</span>
-              <span class="opacity-60">→</span>
-              <span>{{ getStreamModeSegments(record).upstream }}</span>
-            </Badge>
-            <Badge
-              v-else
-              :variant="streamBadgeVariant(getUpstreamStream(record))"
-              :class="(streamBadgeVariant(getUpstreamStream(record)) === 'secondary')
-                ? 'whitespace-nowrap'
-                : 'whitespace-nowrap border-border/60 text-muted-foreground'"
-            >
-              {{ getStreamModeLabel(record) }}
-            </Badge>
+            <div class="flex flex-wrap items-center justify-center gap-1">
+              <Badge
+                v-if="record.ws_step"
+                variant="outline"
+                class="whitespace-nowrap border-violet-500/40 bg-violet-500/10 text-violet-700 dark:text-violet-300"
+              >
+                WS
+              </Badge>
+              <!-- 优先显示请求状态 -->
+              <Badge
+                v-if="isUsageRecordFailed(record)"
+                variant="destructive"
+                class="whitespace-nowrap"
+              >
+                失败
+              </Badge>
+              <Badge
+                v-else-if="getDisplayStatus(record) === 'pending'"
+                variant="outline"
+                class="whitespace-nowrap animate-pulse border-muted-foreground/30 text-muted-foreground"
+              >
+                等待中
+              </Badge>
+              <Badge
+                v-else-if="getDisplayStatus(record) === 'streaming'"
+                variant="outline"
+                class="whitespace-nowrap animate-pulse border-primary/50 text-primary"
+              >
+                传输中
+              </Badge>
+              <Badge
+                v-else-if="record.status === 'cancelled'"
+                variant="outline"
+                class="whitespace-nowrap border-amber-500/50 text-amber-600 dark:text-amber-400"
+              >
+                已取消
+              </Badge>
+              <Badge
+                v-else-if="getStreamModeSegments(record).hasConversion"
+                :variant="streamBadgeVariant(getStreamModeSegments(record).client === '流式')"
+                :class="(streamBadgeVariant(getStreamModeSegments(record).client === '流式') === 'secondary')
+                  ? 'whitespace-nowrap inline-flex items-center gap-1'
+                  : 'whitespace-nowrap border-border/60 text-muted-foreground inline-flex items-center gap-1'"
+              >
+                <span>{{ getStreamModeSegments(record).client }}</span>
+                <span class="opacity-60">→</span>
+                <span>{{ getStreamModeSegments(record).upstream }}</span>
+              </Badge>
+              <Badge
+                v-else
+                :variant="streamBadgeVariant(getUpstreamStream(record))"
+                :class="(streamBadgeVariant(getUpstreamStream(record)) === 'secondary')
+                  ? 'whitespace-nowrap'
+                  : 'whitespace-nowrap border-border/60 text-muted-foreground'"
+              >
+                {{ getStreamModeLabel(record) }}
+              </Badge>
+            </div>
           </TableCell>
           <TableCell
             v-if="isColumnVisible('tokens')"

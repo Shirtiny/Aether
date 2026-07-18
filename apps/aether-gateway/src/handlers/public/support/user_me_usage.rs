@@ -332,6 +332,15 @@ fn users_me_usage_upstream_is_stream(item: &StoredRequestUsageAudit) -> bool {
         .unwrap_or(item.is_stream)
 }
 
+fn users_me_usage_is_ws(item: &StoredRequestUsageAudit) -> bool {
+    item.request_metadata
+        .as_ref()
+        .and_then(serde_json::Value::as_object)
+        .and_then(|metadata| metadata.get("ws_step"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+}
+
 fn users_me_usage_metadata_string<'a>(
     item: &'a StoredRequestUsageAudit,
     key: &str,
@@ -495,6 +504,7 @@ fn build_users_me_usage_record_payload(
         "first_byte_time_ms": item.first_byte_time_ms,
         "is_stream": item.is_stream,
         "upstream_is_stream": upstream_is_stream,
+        "ws_step": users_me_usage_is_ws(item),
         "client_requested_stream": client_is_stream,
         "client_is_stream": client_is_stream,
         "client_family": users_me_usage_client_family(item),
@@ -570,6 +580,7 @@ fn build_users_me_usage_active_payload(item: &StoredRequestUsageAudit) -> serde_
         "endpoint_api_format": item.endpoint_api_format,
         "is_stream": item.is_stream,
         "upstream_is_stream": upstream_is_stream,
+        "ws_step": users_me_usage_is_ws(item),
         "client_requested_stream": client_is_stream,
         "client_is_stream": client_is_stream,
         "has_format_conversion": item.has_format_conversion,
@@ -1436,7 +1447,7 @@ mod tests {
 
     use super::{
         build_users_me_usage_active_payload, build_users_me_usage_record_payload,
-        users_me_usage_client_is_stream, users_me_usage_is_failed,
+        users_me_usage_client_is_stream, users_me_usage_is_failed, users_me_usage_is_ws,
         users_me_usage_upstream_is_stream,
     };
 
@@ -1634,6 +1645,25 @@ mod tests {
         assert_eq!(active_payload["upstream_is_stream"], true);
         assert_eq!(active_payload["client_requested_stream"], false);
         assert_eq!(active_payload["client_is_stream"], false);
+    }
+
+    #[test]
+    fn user_usage_payloads_include_ws_step_flag() {
+        let item = StoredRequestUsageAudit {
+            request_metadata: Some(json!({
+                "ws_step": true
+            })),
+            ..sample_usage("completed")
+        };
+
+        assert!(users_me_usage_is_ws(&item));
+
+        let record_payload =
+            build_users_me_usage_record_payload(&item, false, &BTreeMap::new(), false);
+        let active_payload = build_users_me_usage_active_payload(&item);
+
+        assert_eq!(record_payload["ws_step"], true);
+        assert_eq!(active_payload["ws_step"], true);
     }
 
     #[test]

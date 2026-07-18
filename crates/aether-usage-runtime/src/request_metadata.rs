@@ -168,6 +168,7 @@ fn copy_allowed_metadata_fields(source: &Map<String, Value>, target: &mut Map<St
     copy_non_empty_string(source, target, "client_family");
     copy_bool(source, target, "client_requested_stream");
     copy_bool(source, target, UPSTREAM_IS_STREAM_KEY);
+    copy_bool(source, target, "ws_step");
     copy_bool(source, target, "is_risk_control");
     copy_bool(source, target, "is_ping");
     copy_non_empty_string(source, target, "ping_kind");
@@ -216,6 +217,7 @@ fn move_allowed_metadata_fields(mut source: Map<String, Value>, target: &mut Map
     remove_non_empty_string(&mut source, target, "client_family");
     remove_bool(&mut source, target, "client_requested_stream");
     remove_bool(&mut source, target, UPSTREAM_IS_STREAM_KEY);
+    remove_bool(&mut source, target, "ws_step");
     remove_bool(&mut source, target, "is_risk_control");
     remove_bool(&mut source, target, "is_ping");
     remove_non_empty_string(&mut source, target, "ping_kind");
@@ -826,6 +828,7 @@ mod tests {
             "user_agent": "Claude-Code/1.0",
             "client_requested_stream": false,
             "upstream_is_stream": true,
+            "ws_step": true,
             "is_risk_control": true,
             "api_key_is_standalone": true,
             "provider_request_body_base64_bytes": 512,
@@ -860,6 +863,7 @@ mod tests {
                 "user_agent": "Claude-Code/1.0",
                 "client_requested_stream": false,
                 "upstream_is_stream": true,
+                "ws_step": true,
                 "is_risk_control": true,
                 "api_key_is_standalone": true,
                 "provider_request_body_base64_bytes": 512,
@@ -1159,6 +1163,7 @@ mod tests {
                     "candidate_index": 0,
                     "client_requested_stream": false,
                     "upstream_is_stream": true,
+                    "ws_step": true,
                     "api_key_is_standalone": true,
                     "provider_id": "provider-1",
                     "model_id": "model-1",
@@ -1179,6 +1184,7 @@ mod tests {
             json!({
                 "client_requested_stream": false,
                 "upstream_is_stream": true,
+                "ws_step": true,
                 "api_key_is_standalone": true,
                 "model_id": "model-1",
                 "global_model_id": "global-model-1",
@@ -1194,15 +1200,17 @@ mod tests {
     fn merges_and_filters_request_metadata() {
         let metadata = merge_usage_request_metadata(
             Some(json!({
-                "request_id": "req-1"
+                "request_id": "req-1",
+                "ws_step": false
             })),
             Some(json!({
                 "candidate_index": 0,
-                "provider_name": "OpenAI"
+                "provider_name": "OpenAI",
+                "ws_step": true
             })),
         );
 
-        assert_eq!(metadata, None);
+        assert_eq!(metadata, Some(json!({ "ws_step": true })));
     }
 
     #[test]
@@ -1252,11 +1260,13 @@ mod tests {
     fn owned_merge_matches_filtered_merge_for_trusted_objects() {
         let base = Some(json!({
             "trace_id": "trace-1",
+            "ws_step": false,
             "provider_request_body_base64_bytes": 128
         }));
         let override_value = Some(json!({
             "billing_snapshot_status": "complete",
-            "trace_id": "trace-2"
+            "trace_id": "trace-2",
+            "ws_step": true
         }));
 
         assert_eq!(
@@ -1269,6 +1279,7 @@ mod tests {
     fn borrowed_sanitize_matches_owned_sanitize() {
         let value = json!({
             "trace_id": "trace-1",
+            "ws_step": true,
             "billing_snapshot": {"status": "complete"},
             "provider_name": "OpenAI"
         });

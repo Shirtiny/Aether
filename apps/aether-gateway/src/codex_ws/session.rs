@@ -2350,7 +2350,7 @@ mod tests {
             })
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn falls_back_before_write_and_releases_step_permit_after_exactly_one_report() {
         let created = json!({
             "type": "response.created",
@@ -2591,7 +2591,7 @@ mod tests {
         }));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn stale_and_duplicate_provenance_events_are_consumed_without_mis_settlement() {
         let first_created = json!({
             "type": "response.created",
@@ -2737,7 +2737,7 @@ mod tests {
         }));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn bound_follow_up_may_omit_model_but_may_not_change_it() {
         let first_created = json!({
             "type": "response.created",

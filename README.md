@@ -124,6 +124,95 @@ make dev
 `make dev` 会同时启动后端 `aether-gateway` 和前端 `frontend` 的 Vite dev server。需要单独启动时可使用 `make dev-backend` 或 `make dev-frontend`。
 Postgres / Redis 本地依赖未就绪时，`make dev` 会自动执行 `docker compose up -d postgres redis`。
 
+### Windows 原生开发
+
+Windows 原生环境建议使用 PowerShell 分别启动后端和前端，不依赖 Makefile。以下配置使用本地 SQLite 和内存运行时，无需 Docker、Postgres 或 Redis。
+
+#### 1. 安装工具链
+
+安装 Node.js LTS、Rustup、Visual Studio 2022 Build Tools、CMake、NASM 和 LLVM：
+
+```powershell
+winget install --id OpenJS.NodeJS.LTS -e
+winget install --id Rustlang.Rustup -e
+winget install --id Microsoft.VisualStudio.2022.BuildTools -e
+winget install --id Kitware.CMake -e
+winget install --id NASM.NASM -e
+winget install --id LLVM.LLVM -e
+```
+
+在 Visual Studio Installer 中为 Build Tools 安装“使用 C++ 的桌面开发”，包含 MSVC 和 Windows SDK。安装完成后重新打开 PowerShell，在仓库根目录执行：
+
+```powershell
+rustup toolchain install 1.95.0
+$env:LIBCLANG_PATH = "$env:ProgramFiles\LLVM\bin"
+[Environment]::SetEnvironmentVariable('LIBCLANG_PATH', $env:LIBCLANG_PATH, 'User')
+npm --prefix frontend ci
+```
+
+可用 `cmake --version`、`nasm -v` 和 `Test-Path "$env:LIBCLANG_PATH\libclang.dll"` 检查原生构建依赖。
+
+#### 2. 配置本地环境
+
+复制配置模板：
+
+```powershell
+Copy-Item .env.example .env
+```
+
+修改 `.env` 中的密钥和管理员密码，并加入或覆盖以下开发配置：
+
+```dotenv
+APP_PORT=8084
+JWT_SECRET_KEY=<本地随机密钥>
+ENCRYPTION_KEY=<另一个本地随机密钥>
+
+ADMIN_EMAIL=admin@example.com
+ADMIN_USERNAME=admin123456
+ADMIN_PASSWORD=<包含大小写字母、数字和特殊字符的本地密码>
+
+AETHER_DATABASE_DRIVER=sqlite
+AETHER_DATABASE_URL=sqlite://./data/aether.db
+AETHER_RUNTIME_BACKEND=memory
+AETHER_GATEWAY_DEPLOYMENT_TOPOLOGY=single-node
+AETHER_GATEWAY_NODE_ROLE=all
+AETHER_GATEWAY_AUTO_PREPARE_DATABASE=true
+```
+
+`.env` 已被 Git 忽略；上述 SQLite、内存运行时和开发凭据仅用于本机开发，不应复制到生产环境。
+
+#### 3. 启动后端
+
+在第一个 PowerShell 窗口的仓库根目录导入 `.env` 并启动网关：
+
+```powershell
+Get-Content .env | ForEach-Object {
+  if ($_ -match '^\s*([A-Za-z_][A-Za-z0-9_]*)=(.*)$') {
+    Set-Item -Path "Env:$($matches[1])" -Value $matches[2].Trim()
+  }
+}
+$env:LIBCLANG_PATH = "$env:ProgramFiles\LLVM\bin"
+cargo run -p aether-gateway -- --app-port $env:APP_PORT
+```
+
+首次编译耗时较长。后端就绪后可在另一个窗口检查：
+
+```powershell
+curl.exe --noproxy "*" http://127.0.0.1:8084/_gateway/health
+```
+
+#### 4. 启动前端
+
+在第二个 PowerShell 窗口的仓库根目录执行：
+
+```powershell
+npm --prefix frontend run dev
+```
+
+前端开发服务器固定使用 `http://127.0.0.1:5175`，并启用严格端口检查；如果 `5175` 已被占用，Vite 会直接报错而不会切换端口。该端口只属于 Vite 开发服务器，不影响生产构建、预览或部署配置。
+
+两个进程均可使用 `Ctrl+C` 停止。
+
 ## Aether Tunnel (可选)
 
 Aether Tunnel 是配套的正向代理节点，部署在海外 VPS 上，为墙内的 Aether 实例中转 API 流量。

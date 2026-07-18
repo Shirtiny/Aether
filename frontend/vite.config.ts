@@ -72,7 +72,8 @@ export default defineConfig(({ mode }) => {
       drop: mode === 'production' ? ['console', 'debugger'] : [],
     },
     server: {
-      port: 5173,
+      port: 5175,
+      strictPort: true,
       proxy: {
         // 只代理真正的 API 路径；目标端口由根目录 APP_PORT 控制
         '/api/': {
@@ -84,6 +85,7 @@ export default defineConfig(({ mode }) => {
           target: gatewayTarget,
           changeOrigin: true,
           secure: false,
+          ws: true,
         },
         '/health': {
           target: gatewayTarget,

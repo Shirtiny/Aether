@@ -116,6 +116,7 @@ export interface UsageRecord {
   first_byte_time_ms?: number | null  // 首字时间 (TTFB)
   is_stream: boolean
   upstream_is_stream?: boolean
+  ws_step?: boolean
   client_requested_stream?: boolean
   client_is_stream?: boolean
   client_family?: string | null

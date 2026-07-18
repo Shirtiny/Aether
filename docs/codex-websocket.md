@@ -3,8 +3,8 @@
 本文档说明 Aether 的 Codex 官方原生 WebSocket 功能、启用条件、账号控制、
 `route-v1` 协议、TLS/profile 约束、调度行为、性能参数和上线检查。
 
-> 状态：代码已实现，但所有全局开关和账号开关默认关闭。部署新版本不会自动启用
-> Codex WS，也不代表真实凭据、TLS 抓取、多实例或负载门禁已经通过。
+> 状态：代码已实现。隐藏的全局熔断开关缺省开启，账号开关缺省关闭；部署新版本
+> 不会自动启用任何账号，也不代表真实凭据、TLS 抓取、多实例或负载门禁已经通过。
 
 ## 1. 功能范围
 
@@ -104,28 +104,13 @@ adapter_proof_version=1
 一旦 Provider write 的结果不确定，Aether 不会把当前 step 自动投递到另一个账号。
 这条限制用于避免重复执行和重复计费。
 
-## 3. 全局开关
+## 3. 隐藏的全局熔断
 
-系统配置 key 为 `codex_ws`，两个布尔值默认均为 `false`：
+系统配置 key 为 `codex_ws`。管理界面不暴露该配置；没有配置记录时，`enabled` 和
+`native_codex_ws_enabled` 缺省均为 `true`。对象中缺失的字段同样缺省开启，显式
+`false` 才关闭对应 gate。顶层值不是对象或字段存在但无法解析时 fail closed。
 
-```http
-PUT /api/admin/system/configs/codex_ws
-Content-Type: application/json
-
-{
-  "value": {
-    "enabled": true,
-    "native_codex_ws_enabled": true
-  },
-  "description": "Official Codex native WebSocket"
-}
-```
-
-只有两个值都为 `true` 才开放入口和官方原生 Connector。管理 API 写入成功后会
-立即更新进程内原子快照，不要求重启。每次限制性变更都会推进 generation；已保留
-连接在后续执行 fence 发现 generation 改变后失败关闭，不能继续使用旧配置写上游。
-
-紧急关闭全局功能：
+管理员日常只操作账号开关。全局配置仅用于紧急熔断：
 
 ```http
 PUT /api/admin/system/configs/codex_ws
@@ -140,8 +125,19 @@ Content-Type: application/json
 }
 ```
 
-全局开关不是环境变量。`AETHER_CODEX_WS_*` 环境变量只负责容量和 worker 调优，
-不能启用功能。
+恢复缺省开启可删除该记录：
+
+```http
+DELETE /api/admin/system/configs/codex_ws
+```
+
+也可显式写入两个 `true`。只有两个 gate 都为 `true` 才开放入口和官方原生
+Connector。管理 API 写入或删除成功后会立即更新进程内原子快照，不要求重启。
+每次限制性变更都会推进 generation；已保留连接在后续执行 fence 发现 generation
+改变后失败关闭，不能继续使用旧配置写上游。
+
+全局熔断不是环境变量。`AETHER_CODEX_WS_*` 环境变量只负责容量和 worker 调优，
+不能改变功能开关。
 
 ## 4. Codex 账号级控制
 
@@ -397,13 +393,15 @@ endpoint_api_format_unsupported
 
 ## 10. 与 sub2api 的对应配置
 
-Aether 两层开关打开后，sub2api 仍需单独启用：
+Aether 隐藏全局熔断缺省开启。sub2api 的基础 router v2、Responses WS v2、API Key WS
+和 Aether route-v1 也缺省开启，管理员日常只需启用两端账号开关：
 
-- `gateway.openai_ws.mode_router_v2_enabled=true`；
-- `gateway.openai_ws.responses_websockets_v2=true`；
-- `gateway.openai_ws.aether_route_control_enabled=true`；
-- 对应 Aether API Key 账号的“作为 Aether WS 账号”开关；
-- 只有实测官方 reconnect fixture 通过后才启用 reconnect migration。
+- Aether Codex OAuth Key 的“启用账号级 Codex WS”；
+- 对应 sub2api Aether API Key 账号的“作为 Aether WS 账号”。
+
+`gateway.openai_ws.mode_router_v2_enabled`、`responses_websockets_v2`、
+`apikey_enabled` 或 `aether_route_control_enabled` 可显式设为 `false` 进行全局熔断。
+reconnect migration 仍缺省关闭，只有实测官方 reconnect fixture 通过后才可启用。
 
 sub2api 中保存的 Aether base URL仍是本地 HTTP base，例如：
 
@@ -421,17 +419,16 @@ http://aether:8080/v1
 
 先在 staging 执行：
 
-1. 部署代码，保持 Aether 全局开关、账号开关和 sub2api route 开关关闭；
-2. 验证数据库没有意外 pending migration；
-3. 打开 Aether 全局两个 `codex_ws` 开关；
-4. 对一个 Codex OAuth Key 启用账号级 WS；
-5. 确认 `configured=true`、`profile_effective=true`、
+1. 部署代码，保持两端账号开关和 reconnect migration 关闭；
+2. 验证数据库没有意外 pending migration，并确认 `codex_ws` 没有遗留的显式关闭或损坏值；
+3. 对一个 Codex OAuth Key 启用账号级 WS；
+4. 确认 `configured=true`、`profile_effective=true`、
    `runtime_eligible=null`、`runtime_state=request_scoped`；
-6. 打开一个 sub2api Aether 账号；
-7. 先只打开 route-v1，不打开 reconnect migration；
-8. 运行单 turn、多 turn、初始 failover、账号禁用和配额耗尽测试；
-9. 真实 reconnect fixture 通过后再打开 migration；
-10. 逐步扩大账号，同时观察连接延迟、CPU admission、队列深度、结算延迟和 RSS。
+5. 打开一个 sub2api Aether 账号；
+6. 保持基础 route-v1 缺省开启，不打开 reconnect migration；
+7. 运行单 turn、多 turn、初始 failover、账号禁用和配额耗尽测试；
+8. 真实 reconnect fixture 通过后再打开 migration；
+9. 逐步扩大账号，同时观察连接延迟、CPU admission、队列深度、结算延迟和 RSS。
 
 如果必须保证链路始终经过 Aether，sub2api 客户端所属组必须是 Aether-only。混合组允许
 调度器在故障时切换到非 Aether 官方账号，这是设计行为。
@@ -440,9 +437,9 @@ http://aether:8080/v1
 
 最小影响顺序：
 
-1. 在 sub2api 关闭单个 Aether 账号，或关闭 `aether_route_control_enabled`；
+1. 在 sub2api 关闭单个 Aether 账号，或显式关闭 `aether_route_control_enabled`；
 2. 在 Aether 关闭受影响 Codex Key 的账号级 WS；
-3. 关闭 Aether 全局 `codex_ws` 两个开关；
+3. 向 Aether `codex_ws` 显式写入两个 `false`，执行全局熔断；
 4. 继续使用现有 HTTP/SSE 路由。
 
 上述动态开关不要求数据库 schema 回滚。不要通过删除 Key、清除 OAuth 凭据或修改固定

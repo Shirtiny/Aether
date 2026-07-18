@@ -9,6 +9,10 @@ use crate::provider_transport::CodexOfficialWsGlobalFlags;
 use crate::AppState;
 
 pub(crate) const CODEX_WS_SYSTEM_CONFIG_KEY: &str = "codex_ws";
+const DEFAULT_CODEX_WS_FEATURE_FLAGS: CodexWsFeatureFlags = CodexWsFeatureFlags {
+    enabled: true,
+    native_codex_ws_enabled: true,
+};
 const ENABLED: u64 = 1 << 0;
 const NATIVE_CODEX_WS_ENABLED: u64 = 1 << 1;
 const SNAPSHOT_INITIALIZED: u64 = 1 << 2;
@@ -214,13 +218,19 @@ pub(crate) async fn read_codex_ws_feature_flags(state: &AppState) -> CodexWsFeat
 }
 
 pub(crate) fn parse_codex_ws_feature_flags(config: Option<&Value>) -> CodexWsFeatureFlags {
-    let Some(config) = config.and_then(Value::as_object) else {
+    let Some(config) = config else {
+        return DEFAULT_CODEX_WS_FEATURE_FLAGS;
+    };
+    let Some(config) = config.as_object() else {
         return CodexWsFeatureFlags::default();
     };
 
     CodexWsFeatureFlags {
-        enabled: system_config_bool(config.get("enabled"), false),
-        native_codex_ws_enabled: system_config_bool(config.get("native_codex_ws_enabled"), false),
+        enabled: system_config_bool(config.get("enabled"), !config.contains_key("enabled")),
+        native_codex_ws_enabled: system_config_bool(
+            config.get("native_codex_ws_enabled"),
+            !config.contains_key("native_codex_ws_enabled"),
+        ),
     }
 }
 
@@ -238,11 +248,34 @@ mod tests {
     use crate::AppState;
 
     #[test]
-    fn defaults_every_flag_off_for_missing_or_malformed_config() {
+    fn defaults_missing_config_and_fields_on() {
+        let enabled = CodexWsFeatureFlags {
+            enabled: true,
+            native_codex_ws_enabled: true,
+        };
+
+        assert_eq!(parse_codex_ws_feature_flags(None), enabled);
+        assert_eq!(parse_codex_ws_feature_flags(Some(&json!({}))), enabled);
         assert_eq!(
-            parse_codex_ws_feature_flags(None),
-            CodexWsFeatureFlags::default()
+            parse_codex_ws_feature_flags(Some(&json!({"enabled": false}))),
+            CodexWsFeatureFlags {
+                enabled: false,
+                native_codex_ws_enabled: true,
+            }
         );
+        assert_eq!(
+            parse_codex_ws_feature_flags(Some(&json!({
+                "native_codex_ws_enabled": false
+            }))),
+            CodexWsFeatureFlags {
+                enabled: true,
+                native_codex_ws_enabled: false,
+            }
+        );
+    }
+
+    #[test]
+    fn malformed_config_and_fields_fail_closed() {
         assert_eq!(
             parse_codex_ws_feature_flags(Some(&json!(true))),
             CodexWsFeatureFlags::default()
@@ -253,6 +286,13 @@ mod tests {
                 "native_codex_ws_enabled": null
             }))),
             CodexWsFeatureFlags::default()
+        );
+        assert_eq!(
+            parse_codex_ws_feature_flags(Some(&json!({"enabled": []}))),
+            CodexWsFeatureFlags {
+                enabled: false,
+                native_codex_ws_enabled: true,
+            }
         );
     }
 
@@ -391,6 +431,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_app_config_initializes_the_process_snapshot_on() {
+        let state = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(GatewayDataState::disabled());
+
+        let flags = read_codex_ws_feature_flags(&state).await;
+
+        assert!(flags.native_enabled());
+        assert_eq!(state.codex_ws_feature_flags.load(), Some(flags));
+    }
+
+    #[tokio::test]
     async fn initializes_once_then_reads_only_the_process_snapshot() {
         let data = GatewayDataState::disabled().with_system_config_values_for_tests([(
             CODEX_WS_SYSTEM_CONFIG_KEY.to_string(),
@@ -455,5 +507,14 @@ mod tests {
         let disabled = read_codex_ws_feature_flags(&state).await;
         assert_eq!(disabled.flags, CodexWsFeatureFlags::default());
         assert!(disabled.generation > enabled.generation);
+
+        assert!(state
+            .delete_system_config_value(CODEX_WS_SYSTEM_CONFIG_KEY)
+            .await
+            .expect("app config delete should succeed"));
+
+        let restored_default = read_codex_ws_feature_flags(&state).await;
+        assert!(restored_default.native_enabled());
+        assert!(restored_default.generation > disabled.generation);
     }
 }
