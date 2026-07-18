@@ -338,6 +338,38 @@ FROM provider_api_keys
 WHERE provider_id IN (
 "#;
 
+const UPDATE_KEY_CODEX_WS_METADATA_SQL: &str = r#"
+UPDATE provider_api_keys
+SET
+  capabilities = jsonb_set(
+    CASE
+      WHEN jsonb_typeof(capabilities::jsonb) = 'object' THEN capabilities::jsonb
+      ELSE '{}'::jsonb
+    END,
+    '{codex_official_ws}',
+    TO_JSONB($2::boolean),
+    true
+  )::json,
+  fingerprint = CASE
+    WHEN $2::boolean THEN jsonb_set(
+      CASE
+        WHEN jsonb_typeof(fingerprint::jsonb) = 'object' THEN fingerprint::jsonb
+        ELSE '{}'::jsonb
+      END,
+      '{websocket_transport_profile}',
+      CASE
+        WHEN jsonb_typeof((fingerprint::jsonb)->'websocket_transport_profile') = 'object'
+          THEN (fingerprint::jsonb)->'websocket_transport_profile'
+        ELSE '{}'::jsonb
+      END || $3::jsonb,
+      true
+    )::json
+    ELSE fingerprint
+  END,
+  updated_at = TO_TIMESTAMP($4::double precision)
+WHERE id = $1
+"#;
+
 #[derive(Debug, Clone)]
 pub struct SqlxProviderCatalogReadRepository {
     pool: PgPool,
@@ -1856,41 +1888,15 @@ WHERE id = $1
             ));
         }
 
-        let rows_affected = sqlx::query(
-            r#"
-UPDATE provider_api_keys
-SET
-  capabilities = jsonb_set(
-    CASE WHEN jsonb_typeof(capabilities) = 'object' THEN capabilities ELSE '{}'::jsonb END,
-    '{codex_official_ws}',
-    TO_JSONB($2::boolean),
-    true
-  ),
-  fingerprint = CASE
-    WHEN $2::boolean THEN jsonb_set(
-      CASE WHEN jsonb_typeof(fingerprint) = 'object' THEN fingerprint ELSE '{}'::jsonb END,
-      '{websocket_transport_profile}',
-      CASE
-        WHEN jsonb_typeof(fingerprint->'websocket_transport_profile') = 'object'
-          THEN fingerprint->'websocket_transport_profile'
-        ELSE '{}'::jsonb
-      END || $3::jsonb,
-      true
-    )
-    ELSE fingerprint
-  END,
-  updated_at = TO_TIMESTAMP($4::double precision)
-WHERE id = $1
-"#,
-        )
-        .bind(key_id)
-        .bind(enabled)
-        .bind(websocket_transport_profile)
-        .bind(updated_at_unix_secs as f64)
-        .execute(&self.pool)
-        .await
-        .map_postgres_err()?
-        .rows_affected();
+        let rows_affected = sqlx::query(UPDATE_KEY_CODEX_WS_METADATA_SQL)
+            .bind(key_id)
+            .bind(enabled)
+            .bind(websocket_transport_profile)
+            .bind(updated_at_unix_secs as f64)
+            .execute(&self.pool)
+            .await
+            .map_postgres_err()?
+            .rows_affected();
 
         Ok(rows_affected > 0)
     }
@@ -2703,5 +2709,18 @@ mod tests {
         assert!(source.contains(
             "  CASE\n    WHEN $52::double precision IS NULL THEN NOW()\n    ELSE TO_TIMESTAMP($52::double precision)\n  END,\n  $53"
         ));
+    }
+
+    #[test]
+    fn codex_ws_metadata_update_casts_json_columns_before_jsonb_functions() {
+        let sql = super::UPDATE_KEY_CODEX_WS_METADATA_SQL;
+
+        assert!(sql.contains("jsonb_typeof(capabilities::jsonb)"));
+        assert!(sql.contains("jsonb_typeof(fingerprint::jsonb)"));
+        assert!(sql.contains("jsonb_typeof((fingerprint::jsonb)->'websocket_transport_profile')"));
+        assert!(!sql.contains("jsonb_typeof(capabilities)"));
+        assert!(!sql.contains("jsonb_typeof(fingerprint)"));
+        assert!(sql.contains("  )::json,"));
+        assert!(sql.contains("    )::json\n    ELSE fingerprint"));
     }
 }
