@@ -273,6 +273,7 @@ pub fn build_standard_provider_request_headers(
             .entry("accept".to_string())
             .or_insert_with(|| "text/event-stream".to_string());
     }
+    crate::grok::apply_grok_chat_identity_headers(&mut headers, input.transport);
 
     Some(StandardProviderRequestHeaders {
         headers,
@@ -388,6 +389,53 @@ mod tests {
             Some(&"text/event-stream".to_string())
         );
         assert_eq!(resolved.headers.get("x-client"), Some(&"demo".to_string()));
+    }
+
+    #[test]
+    fn standard_grok_responses_headers_include_cli_identity() {
+        let mut request_headers = HeaderMap::new();
+        request_headers.insert(
+            http::header::USER_AGENT,
+            "codex-tui/0.144.6".parse().expect("header"),
+        );
+        let mut transport = sample_transport("openai:responses");
+        transport.provider.provider_type = "grok".to_string();
+        transport.endpoint.base_url = "https://cli-chat-proxy.grok.com/v1".to_string();
+        transport.key.auth_type = "oauth".to_string();
+        transport.key.decrypted_auth_config =
+            Some(json!({"refresh_token":"refresh-token"}).to_string());
+
+        let resolved =
+            build_standard_provider_request_headers(StandardProviderRequestHeadersInput {
+                transport: &transport,
+                provider_api_format: "openai:responses",
+                same_format: true,
+                headers: &request_headers,
+                auth_header: "authorization",
+                auth_value: "Bearer secret",
+                extra_headers: &BTreeMap::new(),
+                header_rules: None,
+                provider_request_body: &json!({"model":"grok-4.5"}),
+                original_request_body: &json!({"model":"grok-4.5"}),
+                upstream_is_stream: true,
+            })
+            .expect("headers should build");
+
+        assert_eq!(
+            resolved.headers.get("x-xai-token-auth").map(String::as_str),
+            Some("xai-grok-cli")
+        );
+        assert_eq!(
+            resolved
+                .headers
+                .get("x-grok-client-version")
+                .map(String::as_str),
+            Some("0.2.93")
+        );
+        assert_eq!(
+            resolved.headers.get("user-agent").map(String::as_str),
+            Some("xai-grok-workspace/0.2.93")
+        );
     }
 
     #[test]
