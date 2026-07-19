@@ -59,7 +59,7 @@ pub enum OutboundRoute {
     TransportDefault,
     /// Connect directly to the WebSocket authority.
     Direct,
-    /// Tunnel through an explicit `http://` or `https://` proxy URL.
+    /// Tunnel through an explicit `http://`, `https://`, `socks5://`, or `socks5h://` proxy URL.
     Proxy { url: String },
 }
 

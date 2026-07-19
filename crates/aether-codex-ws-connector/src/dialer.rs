@@ -101,6 +101,7 @@ impl ProxyEndpoint {
         let tls = match parsed_url.scheme() {
             "http" => false,
             "https" => true,
+            "socks5" | "socks5h" => false,
             _ => return Err(WebSocketError::Url(UrlError::UnsupportedProxyScheme)),
         };
         if tls {

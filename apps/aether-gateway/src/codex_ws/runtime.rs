@@ -2132,7 +2132,8 @@ fn outbound_route(proxy: Option<&aether_contracts::ProxySnapshot>) -> Option<Out
         return Some(OutboundRoute::TransportDefault);
     };
     let scheme = url::Url::parse(url).ok()?.scheme().to_ascii_lowercase();
-    matches!(scheme.as_str(), "http" | "https").then(|| OutboundRoute::proxy(url))
+    matches!(scheme.as_str(), "http" | "https" | "socks5" | "socks5h")
+        .then(|| OutboundRoute::proxy(url))
 }
 
 fn compact_proxy_for_plan(
@@ -2440,7 +2441,12 @@ mod tests {
 
     #[test]
     fn explicit_proxy_preflight_accepts_only_reviewed_connect_schemes() {
-        for url in ["http://proxy.invalid:8080", "https://proxy.invalid:8443"] {
+        for url in [
+            "http://proxy.invalid:8080",
+            "https://proxy.invalid:8443",
+            "socks5://proxy.invalid:1080",
+            "socks5h://proxy.invalid:1080",
+        ] {
             let proxy = aether_contracts::ProxySnapshot {
                 url: Some(url.into()),
                 ..Default::default()
@@ -2460,7 +2466,7 @@ mod tests {
             outbound_route(Some(&manual_node)),
             Some(OutboundRoute::Proxy { .. })
         ));
-        for url in ["socks5://proxy.invalid:1080", "not a URL"] {
+        for url in ["ftp://proxy.invalid:21", "not a URL"] {
             let proxy = aether_contracts::ProxySnapshot {
                 url: Some(url.into()),
                 ..Default::default()

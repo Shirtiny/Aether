@@ -134,6 +134,16 @@ async fn https_proxy_tunnels_secure_websocket_before_handshake() {
     assert_proxy_tunnels_secure_websocket(true).await;
 }
 
+#[tokio::test]
+async fn socks5_proxy_tunnels_secure_websocket_before_handshake() {
+    assert_socks5_tunnels_secure_websocket(false).await;
+}
+
+#[tokio::test]
+async fn authenticated_socks5_proxy_tunnels_secure_websocket_before_handshake() {
+    assert_socks5_tunnels_secure_websocket(true).await;
+}
+
 #[test]
 fn https_proxy_defaults_to_port_443_and_preserves_explicit_port() {
     let default_port = ProxyEndpoint::parse("https://proxy.example").expect("proxy should parse");
@@ -149,8 +159,24 @@ fn https_proxy_defaults_to_port_443_and_preserves_explicit_port() {
 }
 
 #[test]
-fn explicit_proxy_rejects_non_http_schemes_and_debug_redacts_credentials() {
-    assert!(ProxyEndpoint::parse("socks5://proxy.example:1080").is_err());
+fn explicit_proxy_accepts_reviewed_schemes_and_debug_redacts_credentials() {
+    let socks = ProxyEndpoint::parse("socks5://user:p%40ss@proxy.example:1080")
+        .expect("SOCKS5 proxy should parse");
+    assert_eq!(socks.config.scheme, ProxyScheme::Socks5);
+    assert_eq!(socks.config.port, 1080);
+    assert_eq!(
+        socks
+            .config
+            .auth
+            .as_ref()
+            .map(|auth| (auth.username.as_str(), auth.password.as_str())),
+        Some(("user", "p@ss"))
+    );
+    let socks5h =
+        ProxyEndpoint::parse("socks5h://proxy.example").expect("SOCKS5h proxy should parse");
+    assert_eq!(socks5h.config.scheme, ProxyScheme::Socks5h);
+    assert_eq!(socks5h.config.port, 1080);
+    assert!(ProxyEndpoint::parse("ftp://proxy.example").is_err());
     let route = OutboundRoute::proxy("http://user:password@proxy.example:8080");
     let debug = format!("{route:?}");
     assert!(!debug.contains("user"));
@@ -343,6 +369,141 @@ async fn assert_proxy_tunnels_secure_websocket(proxy_tls: bool) {
         .expect("proxy should record CONNECT request");
     let expected_request_line = format!("CONNECT {target_authority} HTTP/1.1");
     assert_eq!(request.lines().next(), Some(expected_request_line.as_str()));
+}
+
+async fn assert_socks5_tunnels_secure_websocket(authenticated: bool) {
+    let (connector, acceptor) = test_tls_configs();
+    let (target_addr, target_task) = start_tls_websocket_server(acceptor).await;
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("SOCKS5 proxy listener should bind");
+    let proxy_addr = proxy_listener
+        .local_addr()
+        .expect("SOCKS5 proxy listener should have an address");
+    let proxy_task = tokio::spawn(async move {
+        let (mut client, _) = proxy_listener
+            .accept()
+            .await
+            .expect("SOCKS5 proxy should accept");
+        let mut greeting = [0_u8; 2];
+        client
+            .read_exact(&mut greeting)
+            .await
+            .expect("SOCKS5 proxy should read greeting");
+        assert_eq!(greeting[0], 5);
+        let mut methods = vec![0_u8; greeting[1] as usize];
+        client
+            .read_exact(&mut methods)
+            .await
+            .expect("SOCKS5 proxy should read auth methods");
+        let selected_method = if authenticated { 2 } else { 0 };
+        assert!(methods.contains(&selected_method));
+        client
+            .write_all(&[5, selected_method])
+            .await
+            .expect("SOCKS5 proxy should select auth method");
+
+        if authenticated {
+            let mut auth_header = [0_u8; 2];
+            client
+                .read_exact(&mut auth_header)
+                .await
+                .expect("SOCKS5 proxy should read auth header");
+            assert_eq!(auth_header[0], 1);
+            let mut username = vec![0_u8; auth_header[1] as usize];
+            client
+                .read_exact(&mut username)
+                .await
+                .expect("SOCKS5 proxy should read username");
+            let password_len = client
+                .read_u8()
+                .await
+                .expect("SOCKS5 proxy should read password length");
+            let mut password = vec![0_u8; password_len as usize];
+            client
+                .read_exact(&mut password)
+                .await
+                .expect("SOCKS5 proxy should read password");
+            assert_eq!(username, b"user@name");
+            assert_eq!(password, b"p@ss");
+            client
+                .write_all(&[1, 0])
+                .await
+                .expect("SOCKS5 proxy should accept credentials");
+        }
+
+        let mut request_header = [0_u8; 4];
+        client
+            .read_exact(&mut request_header)
+            .await
+            .expect("SOCKS5 proxy should read CONNECT header");
+        assert_eq!(request_header[..3], [5, 1, 0]);
+        match request_header[3] {
+            1 => {
+                let mut address = [0_u8; 4];
+                client
+                    .read_exact(&mut address)
+                    .await
+                    .expect("SOCKS5 proxy should read IPv4 target");
+            }
+            3 => {
+                let domain_len = client
+                    .read_u8()
+                    .await
+                    .expect("SOCKS5 proxy should read domain length");
+                let mut domain = vec![0_u8; domain_len as usize];
+                client
+                    .read_exact(&mut domain)
+                    .await
+                    .expect("SOCKS5 proxy should read target domain");
+                assert_eq!(domain, b"localhost");
+            }
+            4 => {
+                let mut address = [0_u8; 16];
+                client
+                    .read_exact(&mut address)
+                    .await
+                    .expect("SOCKS5 proxy should read IPv6 target");
+            }
+            address_type => panic!("unexpected SOCKS5 address type: {address_type}"),
+        }
+        let requested_port = client
+            .read_u16()
+            .await
+            .expect("SOCKS5 proxy should read target port");
+        assert_eq!(requested_port, target_addr.port());
+
+        let mut target = tokio::net::TcpStream::connect(target_addr)
+            .await
+            .expect("SOCKS5 proxy should connect to target");
+        let reply_port = target_addr.port().to_be_bytes();
+        client
+            .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, reply_port[0], reply_port[1]])
+            .await
+            .expect("SOCKS5 proxy should acknowledge CONNECT");
+        let _ = tokio::io::copy_bidirectional(&mut client, &mut target).await;
+    });
+
+    let request = format!("wss://localhost:{}/v1/responses", target_addr.port())
+        .into_client_request()
+        .expect("websocket request should build");
+    let proxy_url = if authenticated {
+        format!(
+            "socks5://user%40name:p%40ss@localhost:{}",
+            proxy_addr.port()
+        )
+    } else {
+        format!("socks5h://localhost:{}", proxy_addr.port())
+    };
+    let (websocket, _) = connector
+        .connect(request, OutboundRoute::proxy(proxy_url))
+        .await
+        .expect("SOCKS5-proxied websocket handshake should succeed");
+    drop(websocket);
+
+    target_task.await.expect("target task should finish");
+    proxy_task.await.expect("SOCKS5 proxy task should finish");
 }
 
 async fn start_tls_websocket_server(acceptor: TlsAcceptor) -> (SocketAddr, JoinHandle<()>) {
