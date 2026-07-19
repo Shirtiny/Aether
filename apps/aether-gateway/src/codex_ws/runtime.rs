@@ -267,6 +267,7 @@ impl PreparedStep {
                 permit: None,
                 settlement_permit: None,
                 plan: None,
+                original_request_body: None,
             },
         }
     }
@@ -354,6 +355,7 @@ pub(crate) struct UsageReportReservation {
     permit: Option<tokio::sync::mpsc::OwnedPermit<CodexWsUsageCommit>>,
     settlement_permit: Option<tokio::sync::mpsc::OwnedPermit<CodexWsSettlementCommit>>,
     plan: Option<aether_contracts::ExecutionPlan>,
+    original_request_body: Option<serde_json::Value>,
 }
 
 impl UsageReportReservation {
@@ -363,11 +365,13 @@ impl UsageReportReservation {
         Option<tokio::sync::mpsc::OwnedPermit<CodexWsUsageCommit>>,
         Option<tokio::sync::mpsc::OwnedPermit<CodexWsSettlementCommit>>,
         Option<aether_contracts::ExecutionPlan>,
+        Option<serde_json::Value>,
     ) {
         (
             self.permit.take(),
             self.settlement_permit.take(),
             self.plan.take(),
+            self.original_request_body.take(),
         )
     }
 }
@@ -1304,53 +1308,64 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
             .map_err(|_| local_capacity_error("step_admission_unavailable"))?;
 
         let body = std::mem::take(&mut step.value);
-        let body_text = if super::cpu_budget::requires_large_frame_cpu_budget(step.encoded_len) {
-            let materialization_cpu =
-                super::cpu_budget::acquire_large_frame_cpu_budget(step.encoded_len)
-                    .await
-                    .map_err(|_| local_capacity_error("large_frame_cpu_unavailable"))?;
-            let mapped_model = candidate.mapped_model.clone();
-            let body_rules = candidate.body_rules.clone();
-            let provider_body_patch = Arc::clone(&candidate.provider_body_patch);
-            let model_directive_mapping = candidate.model_directive_mapping.clone();
-            let client_api_key_id = candidate.client_api_key_id.clone();
-            let request_headers = self.request_headers.clone();
-            let account_profile = candidate.account_profile.clone();
-            let force_body_stream_field = candidate.force_body_stream_field;
-            let enable_model_directives = candidate.enable_model_directives;
-            tokio::task::spawn_blocking(move || {
-                let _materialization_cpu = materialization_cpu;
-                materialize_codex_ws_step_body(
+        // The long-lived candidate template intentionally carries no payload,
+        // but each settled WS step still needs its own accepted client body for
+        // the normal usage-capture pipeline. Keep the clone step-scoped and
+        // release it together with the terminal report reservation. Large
+        // bodies are cloned under the same bounded blocking CPU budget used by
+        // provider-body materialization.
+        let (materialized_body, original_request_body) =
+            if super::cpu_budget::requires_large_frame_cpu_budget(step.encoded_len) {
+                let materialization_cpu =
+                    super::cpu_budget::acquire_large_frame_cpu_budget(step.encoded_len)
+                        .await
+                        .map_err(|_| local_capacity_error("large_frame_cpu_unavailable"))?;
+                let mapped_model = candidate.mapped_model.clone();
+                let body_rules = candidate.body_rules.clone();
+                let provider_body_patch = Arc::clone(&candidate.provider_body_patch);
+                let model_directive_mapping = candidate.model_directive_mapping.clone();
+                let client_api_key_id = candidate.client_api_key_id.clone();
+                let request_headers = self.request_headers.clone();
+                let account_profile = candidate.account_profile.clone();
+                let force_body_stream_field = candidate.force_body_stream_field;
+                let enable_model_directives = candidate.enable_model_directives;
+                tokio::task::spawn_blocking(move || {
+                    let _materialization_cpu = materialization_cpu;
+                    let original_request_body = body.clone();
+                    let materialized_body = materialize_codex_ws_step_body(
+                        body,
+                        &mapped_model,
+                        force_body_stream_field,
+                        body_rules.as_deref(),
+                        &client_api_key_id,
+                        &request_headers,
+                        enable_model_directives,
+                        model_directive_mapping.as_deref(),
+                        provider_body_patch.as_ref(),
+                        account_profile.as_deref(),
+                    )?;
+                    Ok::<_, StepPreparationError>((materialized_body, original_request_body))
+                })
+                .await
+                .map_err(|_| {
+                    StepPreparationError::retain("provider_request_body_materialization_failed")
+                })??
+            } else {
+                let original_request_body = body.clone();
+                let materialized_body = materialize_codex_ws_step_body(
                     body,
-                    &mapped_model,
-                    force_body_stream_field,
-                    body_rules.as_deref(),
-                    &client_api_key_id,
-                    &request_headers,
-                    enable_model_directives,
-                    model_directive_mapping.as_deref(),
-                    provider_body_patch.as_ref(),
-                    account_profile.as_deref(),
-                )
-            })
-            .await
-            .map_err(|_| {
-                StepPreparationError::retain("provider_request_body_materialization_failed")
-            })??
-        } else {
-            materialize_codex_ws_step_body(
-                body,
-                &candidate.mapped_model,
-                candidate.force_body_stream_field,
-                candidate.body_rules.as_deref(),
-                &candidate.client_api_key_id,
-                &self.request_headers,
-                candidate.enable_model_directives,
-                candidate.model_directive_mapping.as_deref(),
-                candidate.provider_body_patch.as_ref(),
-                candidate.account_profile.as_deref(),
-            )?
-        };
+                    &candidate.mapped_model,
+                    candidate.force_body_stream_field,
+                    candidate.body_rules.as_deref(),
+                    &candidate.client_api_key_id,
+                    &self.request_headers,
+                    candidate.enable_model_directives,
+                    candidate.model_directive_mapping.as_deref(),
+                    candidate.provider_body_patch.as_ref(),
+                    candidate.account_profile.as_deref(),
+                )?;
+                (materialized_body, original_request_body)
+            };
         let (provider_concurrency, key_concurrency) =
             self.acquire_candidate_concurrency(candidate).await?;
         if let Err(error) = self.consume_bound_step_rpm(candidate).await {
@@ -1362,8 +1377,9 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
         }
         let mut usage_plan = candidate.lifecycle.plan().clone();
         usage_plan.request_id = step_usage_request_id(step);
+        usage_plan.body = aether_contracts::RequestBody::from_json(materialized_body.json);
         Ok(PreparedStep {
-            body: body_text,
+            body: materialized_body.text,
             admission,
             provider_concurrency,
             key_concurrency,
@@ -1371,6 +1387,7 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
                 permit: Some(usage_report),
                 settlement_permit: Some(settlement_report),
                 plan: Some(usage_plan),
+                original_request_body: Some(original_request_body),
             },
         })
     }
@@ -1401,8 +1418,6 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
         elapsed: std::time::Duration,
         usage_report: UsageReportReservation,
     ) {
-        let report_context =
-            step_report_context(candidate.lifecycle.report_context().cloned(), step);
         let step_settlement = if first_dispatch {
             candidate.lifecycle.first_settlement(disposition.clone())
         } else {
@@ -1426,7 +1441,13 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
         drop(terminal_event);
         let status_code = disposition_status_code(&disposition);
         let cancelled = matches!(disposition, CodexWsStepDisposition::Cancelled { .. });
-        let (usage_permit, settlement_permit, reserved_plan) = usage_report.into_parts();
+        let (usage_permit, settlement_permit, reserved_plan, original_request_body) =
+            usage_report.into_parts();
+        let report_context = step_report_context(
+            candidate.lifecycle.report_context().cloned(),
+            step,
+            original_request_body,
+        );
         let mut plan = reserved_plan.unwrap_or_else(|| candidate.lifecycle.plan().clone());
         plan.request_id = trace_id.clone();
         let Some(settlement_permit) = settlement_permit else {
@@ -1931,6 +1952,7 @@ fn compact_codex_response_headers(headers: &HeaderMap) -> BTreeMap<String, Strin
 fn step_report_context(
     context: Option<serde_json::Value>,
     step: &ResponseCreateStep,
+    original_request_body: Option<serde_json::Value>,
 ) -> Option<serde_json::Value> {
     let mut context = match context {
         Some(serde_json::Value::Object(context)) => context,
@@ -1941,7 +1963,15 @@ fn step_report_context(
         serde_json::Value::String(step_usage_request_id(step)),
     );
     context.insert("ws_step".to_string(), serde_json::Value::Bool(true));
+    if let Some(original_request_body) = original_request_body {
+        context.insert("original_request_body".to_string(), original_request_body);
+    }
     Some(serde_json::Value::Object(context))
+}
+
+struct MaterializedCodexWsStepBody {
+    text: String,
+    json: serde_json::Value,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1956,7 +1986,15 @@ fn materialize_codex_ws_step_body(
     model_directive_mapping: Option<&serde_json::Value>,
     provider_body_patch: &[RoutingJsonPatchOperation],
     account_profile: Option<&CodexConcreteAccountProfile>,
-) -> Result<String, StepPreparationError> {
+) -> Result<MaterializedCodexWsStepBody, StepPreparationError> {
+    // The shared Codex HTTP normalizer strips previous_response_id because
+    // HTTP requests are self-contained. Native Responses WebSocket follow-up
+    // steps are different: custom/function tool outputs are resolved against
+    // the preceding response on the bound provider connection.
+    let previous_response_id = body
+        .get("previous_response_id")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned);
     let mut body = crate::ai_serving::build_codex_ws_local_openai_responses_request_body(
         body,
         mapped_model,
@@ -1984,17 +2022,27 @@ fn materialize_codex_ws_step_body(
             CodexProfileRequestBodyPolicy::NormalizeClientMetadata,
         );
     }
-    body.as_object_mut()
-        .ok_or(StepPreparationError::retain(
-            "provider_request_body_materialization_failed",
-        ))?
-        .insert("stream".to_string(), serde_json::Value::Bool(true));
+    let body_object = body.as_object_mut().ok_or(StepPreparationError::retain(
+        "provider_request_body_materialization_failed",
+    ))?;
+    body_object.insert("stream".to_string(), serde_json::Value::Bool(true));
+    if let Some(previous_response_id) = previous_response_id {
+        // Restore this after all route/profile edits so a validated connection
+        // fence cannot silently turn into an unlinked tool-output request.
+        body_object.insert(
+            "previous_response_id".to_string(),
+            serde_json::Value::String(previous_response_id),
+        );
+    }
     let body_text = serde_json::to_string(&body)
         .map_err(|_| StepPreparationError::retain("account_profile_materialization_failed"))?;
     if body_text.len() > super::protocol::MAX_PUBLIC_CLIENT_PAYLOAD_BYTES {
         return Err(StepPreparationError::retain("materialized_step_too_large"));
     }
-    Ok(body_text)
+    Ok(MaterializedCodexWsStepBody {
+        text: body_text,
+        json: body,
+    })
 }
 
 fn normalize_concurrent_limit(limit: Option<i32>) -> Option<usize> {
@@ -2250,10 +2298,60 @@ mod tests {
             },
         };
 
-        let context = step_report_context(None, &step).expect("context should be created");
+        let original_request_body = json!({
+            "type": "response.create",
+            "input": [{
+                "type": "custom_tool_call_output",
+                "call_id": "call-1",
+                "output": "ok"
+            }]
+        });
+        let context = step_report_context(None, &step, Some(original_request_body.clone()))
+            .expect("context should be created");
 
         assert_eq!(context["request_id"], step_usage_request_id(&step));
         assert_eq!(context["ws_step"], true);
+        assert_eq!(context["original_request_body"], original_request_body);
+    }
+
+    #[test]
+    fn materialized_follow_up_preserves_previous_response_for_custom_tool_output() {
+        let body = json!({
+            "type": "response.create",
+            "model": "gpt-5.6-terra",
+            "previous_response_id": "resp-1",
+            "input": [{
+                "type": "custom_tool_call_output",
+                "call_id": "call-1",
+                "output": "tool result"
+            }]
+        });
+
+        let materialized = materialize_codex_ws_step_body(
+            body,
+            "gpt-5.6-terra",
+            false,
+            None,
+            "client-key-1",
+            &HeaderMap::new(),
+            false,
+            None,
+            &[],
+            None,
+        )
+        .expect("follow-up body should materialize");
+
+        assert_eq!(materialized.json["previous_response_id"], "resp-1");
+        assert_eq!(
+            materialized.json["input"][0]["type"],
+            "custom_tool_call_output"
+        );
+        assert_eq!(materialized.json["input"][0]["call_id"], "call-1");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&materialized.text)
+                .expect("materialized text should be JSON"),
+            materialized.json
+        );
     }
 
     #[test]

@@ -676,7 +676,7 @@ fn build_usage_outcome(
     payload: &mut crate::usage::GatewayStreamReportRequest,
     cancelled: bool,
 ) -> aether_usage_runtime::TerminalUsageOutcome {
-    payload.report_context = compact_usage_report_context(payload.report_context.as_ref());
+    payload.report_context = compact_usage_report_context(payload.report_context.take());
     let context_seed = aether_usage_runtime::build_terminal_usage_context_seed(
         plan,
         payload.report_context.as_ref(),
@@ -717,7 +717,7 @@ async fn process_usage_commit(state: AppState, commit: CodexWsUsageCommit) {
     }
 }
 
-fn compact_usage_report_context(context: Option<&serde_json::Value>) -> Option<serde_json::Value> {
+fn compact_usage_report_context(context: Option<serde_json::Value>) -> Option<serde_json::Value> {
     const FIELDS: &[&str] = &[
         "request_id",
         "trace_id",
@@ -754,16 +754,20 @@ fn compact_usage_report_context(context: Option<&serde_json::Value>) -> Option<s
         "upstream_is_stream",
         "ws_step",
         "api_key_is_standalone",
+        "original_request_body",
         "request_body_ref",
         "provider_request_body_ref",
         "response_body_ref",
         "client_response_body_ref",
     ];
-    let object = context?.as_object()?;
+    let mut object = match context? {
+        serde_json::Value::Object(object) => object,
+        _ => return None,
+    };
     let mut compact = serde_json::Map::new();
     for field in FIELDS {
-        if let Some(value) = object.get(*field) {
-            compact.insert((*field).to_string(), value.clone());
+        if let Some(value) = object.remove(*field) {
+            compact.insert((*field).to_string(), value);
         }
     }
     Some(serde_json::Value::Object(compact))
@@ -795,16 +799,84 @@ mod tests {
             "ws_step": true,
             "cafecode_uid": "372",
             "cafecode_uname": "xiapeng8618",
+            "original_request_body": {
+                "type": "response.create",
+                "input": [{
+                    "type": "custom_tool_call_output",
+                    "call_id": "call-1",
+                    "output": "ok"
+                }]
+            },
             "secret": "drop-me"
         });
 
-        let compact = compact_usage_report_context(Some(&context)).expect("context should remain");
+        let compact = compact_usage_report_context(Some(context)).expect("context should remain");
 
         assert_eq!(compact["request_id"], "req-1");
         assert_eq!(compact["ws_step"], true);
         assert_eq!(compact["cafecode_uid"], "372");
         assert_eq!(compact["cafecode_uname"], "xiapeng8618");
+        assert_eq!(
+            compact["original_request_body"]["input"][0]["call_id"],
+            "call-1"
+        );
         assert!(compact.get("secret").is_none());
+    }
+
+    #[test]
+    fn ws_usage_seed_captures_client_and_materialized_provider_bodies() {
+        let original_request_body = serde_json::json!({
+            "type": "response.create",
+            "previous_response_id": "resp-1",
+            "input": [{
+                "type": "custom_tool_call_output",
+                "call_id": "call-1",
+                "output": "ok"
+            }]
+        });
+        let provider_request_body = serde_json::json!({
+            "type": "response.create",
+            "model": "gpt-5.6-terra",
+            "previous_response_id": "resp-1",
+            "stream": true,
+            "input": [{
+                "type": "custom_tool_call_output",
+                "call_id": "call-1",
+                "output": "ok"
+            }]
+        });
+        let context = compact_usage_report_context(Some(serde_json::json!({
+            "request_id": "ws-request-1",
+            "ws_step": true,
+            "original_request_body": original_request_body
+        })))
+        .expect("WS report context should remain");
+        let plan = aether_contracts::ExecutionPlan {
+            request_id: "ws-request-1".into(),
+            candidate_id: Some("candidate-1".into()),
+            provider_name: Some("Codex".into()),
+            provider_id: "provider-1".into(),
+            endpoint_id: "endpoint-1".into(),
+            key_id: "key-1".into(),
+            method: "GET".into(),
+            url: "wss://chatgpt.com/backend-api/codex/responses".into(),
+            headers: BTreeMap::new(),
+            content_type: Some("application/json".into()),
+            content_encoding: None,
+            body: aether_contracts::RequestBody::from_json(provider_request_body.clone()),
+            stream: true,
+            client_api_format: "openai:responses".into(),
+            provider_api_format: "openai:responses".into(),
+            model_name: Some("gpt-5.6-terra".into()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        };
+
+        let seed = aether_usage_runtime::build_terminal_usage_context_seed(&plan, Some(&context));
+
+        assert_eq!(seed.request_body, Some(original_request_body));
+        assert_eq!(seed.provider_request, Some(provider_request_body));
     }
 
     #[test]
