@@ -18,16 +18,11 @@ use uuid::Uuid;
 fn normalized_provider_oauth_concurrent_limit(
     provider_type: &str,
     current: Option<i32>,
-    allow_unsafe_grok_concurrency: bool,
 ) -> Option<i32> {
     if !provider_type.trim().eq_ignore_ascii_case("grok") {
         return current;
     }
-    if allow_unsafe_grok_concurrency {
-        current.or(Some(1))
-    } else {
-        Some(1)
-    }
+    current.or(Some(1))
 }
 
 pub(crate) fn provider_oauth_key_proxy_value(
@@ -274,11 +269,8 @@ pub(crate) async fn update_existing_provider_oauth_catalog_key(
     updated.expires_at_unix_secs = expires_at_unix_secs;
     updated.oauth_invalid_at_unix_secs = None;
     updated.oauth_invalid_reason = None;
-    updated.concurrent_limit = normalized_provider_oauth_concurrent_limit(
-        provider_type,
-        updated.concurrent_limit,
-        crate::handlers::admin::provider::write::keys::grok_unsafe_concurrency_override_enabled(),
-    );
+    updated.concurrent_limit =
+        normalized_provider_oauth_concurrent_limit(provider_type, updated.concurrent_limit);
     let fallback_fingerprint = if provider_type.trim().eq_ignore_ascii_case("grok") {
         None
     } else {
@@ -471,33 +463,21 @@ mod tests {
     }
 
     #[test]
-    fn grok_oauth_reauthorization_clamps_legacy_concurrency_by_default() {
+    fn grok_oauth_reauthorization_defaults_missing_concurrency_only() {
         assert_eq!(
-            normalized_provider_oauth_concurrent_limit("grok", Some(0), false),
-            Some(1)
+            normalized_provider_oauth_concurrent_limit("grok", Some(0)),
+            Some(0)
         );
         assert_eq!(
-            normalized_provider_oauth_concurrent_limit("grok", Some(8), false),
-            Some(1)
-        );
-        assert_eq!(
-            normalized_provider_oauth_concurrent_limit("grok", None, false),
-            Some(1)
-        );
-    }
-
-    #[test]
-    fn grok_oauth_reauthorization_preserves_explicit_unsafe_concurrency() {
-        assert_eq!(
-            normalized_provider_oauth_concurrent_limit("grok", Some(8), true),
+            normalized_provider_oauth_concurrent_limit("grok", Some(8)),
             Some(8)
         );
         assert_eq!(
-            normalized_provider_oauth_concurrent_limit("grok", None, true),
+            normalized_provider_oauth_concurrent_limit("grok", None),
             Some(1)
         );
         assert_eq!(
-            normalized_provider_oauth_concurrent_limit("codex", Some(4), false),
+            normalized_provider_oauth_concurrent_limit("codex", Some(4)),
             Some(4)
         );
     }

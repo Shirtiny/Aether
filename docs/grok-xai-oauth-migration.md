@@ -65,7 +65,7 @@ Codex 已经是一个 OAuth-Bearer、OpenAI-`responses` 形态的 provider，它
 - **模型目录 + 映射**：`crates/aether-model-fetch/src/logic.rs:386`——保持 grok 模型集为最新（`grok-4.5`、`grok-4.3`、`grok-build-0.1`，imagine-* 留待后续），并新增默认别名表，镜像 `sub2api/.../xai/models.go` 的 `DefaultModelMapping`（`grok→grok-4.5`、`grok-latest→grok-4.3`、`grok-code-fast*→grok-build-0.1` 等）。tier 门控保留在 `handlers/admin/provider/query/models/mod.rs`。
 - **端点 / base_url**：将默认 grok 端点 `base_url` 从 `https://grok.com` 改为 `https://api.x.ai/v1`；在 `crates/aether-data/migrations/{postgres,mysql,sqlite}/` 下新增 SQL 迁移：(a) 把既有 grok `provider_endpoints.base_url` 重写为 `api.x.ai/v1`，(b) 把既有**仅 cookie** 的 grok key 置为 inactive 并写入 `oauth_invalid_reason`，提示运维通过 OAuth 重新接入（"完全迁移"接受的代价）。
 - **配置/env**：新增 xAI OAuth 覆盖项，镜像 `sub2api/.../xai/oauth.go`（`XAI_OAUTH_CLIENT_ID`、`XAI_OAUTH_SCOPE`、`XAI_OAUTH_REDIRECT_URI`、`XAI_OAUTH_AUTHORIZE_URL`、`XAI_OAUTH_TOKEN_URL`、`XAI_BASE_URL`）到 `.env.example` + 配置管线；内置合理默认值。
-- **防封并发**：grok OAuth key 默认 `concurrent_limit = 1`（SuperGrok TOS 安全），配 unsafe 覆盖 env，镜像 `XAI_GROK_UNSAFE_ALLOW_CONCURRENCY_GT_ONE`。
+- **默认并发**：grok OAuth key 新建或首次接入时默认 `concurrent_limit = 1`；管理员可在 key 配置中手动调整，OAuth 重新授权会保留已设置的值。
 - **候选资格**：本轮把 grok oauth 的 format 收窄为 `openai:chat | openai:responses`，位于 `crates/aether-data/src/repository/candidate_selection/{memory,postgres,sqlite,mysql}.rs`（多媒体回归前先去掉 `openai:image`/`claude:messages`）。
 - **计费**：`crates/aether-billing/src/pricing.rs:127`——保留/调整 grok 定价；订阅访问可沿用既有官方 grok 定价条目。
 

@@ -17,24 +17,7 @@ fn normalize_provider_key_concurrent_limit(
         None if default_grok_oauth_limit && is_grok_oauth => Some(1),
         None => None,
     };
-    if is_grok_oauth && normalized != Some(1) && !grok_unsafe_concurrency_override_enabled() {
-        return Err(
-            "Grok OAuth Key 默认只允许并发 1；如确认风险，请设置 XAI_GROK_UNSAFE_ALLOW_CONCURRENCY_GT_ONE=true"
-                .to_string(),
-        );
-    }
     Ok(normalized)
-}
-
-pub(crate) fn grok_unsafe_concurrency_override_enabled() -> bool {
-    std::env::var("XAI_GROK_UNSAFE_ALLOW_CONCURRENCY_GT_ONE")
-        .ok()
-        .is_some_and(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
 }
 
 mod create;
@@ -51,6 +34,25 @@ mod tests {
             normalize_provider_key_concurrent_limit("grok", "oauth", None, true)
                 .expect("grok key limit"),
             Some(1)
+        );
+    }
+
+    #[test]
+    fn grok_oauth_key_allows_explicit_concurrency() {
+        assert_eq!(
+            normalize_provider_key_concurrent_limit("grok", "oauth", Some(8), true)
+                .expect("explicit grok key limit"),
+            Some(8)
+        );
+        assert_eq!(
+            normalize_provider_key_concurrent_limit("grok", "oauth", Some(0), false)
+                .expect("unlimited grok key concurrency"),
+            Some(0)
+        );
+        assert_eq!(
+            normalize_provider_key_concurrent_limit("grok", "oauth", None, false)
+                .expect("cleared grok key concurrency"),
+            None
         );
     }
 
