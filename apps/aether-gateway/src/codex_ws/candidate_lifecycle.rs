@@ -1055,6 +1055,8 @@ pub(crate) fn compact_report_context_template(
         "needs_conversion",
         "client_ip",
         "user_agent",
+        "cafecode_uid",
+        "cafecode_uname",
         "client_requested_stream",
         "upstream_is_stream",
         "api_key_is_standalone",
@@ -1097,6 +1099,18 @@ pub(crate) fn compact_report_context_template(
             .saturating_add(field.len())
             .saturating_add(value_bytes);
         compact.insert((*field).to_string(), value.clone());
+    }
+    if let Some(serde_json::Value::Object(identity)) =
+        aether_usage_runtime::attach_cafecode_identity_metadata(
+            None,
+            object.get("original_headers"),
+        )
+    {
+        for field in ["cafecode_uid", "cafecode_uname"] {
+            if let Some(value) = identity.get(field) {
+                compact.insert(field.to_string(), value.clone());
+            }
+        }
     }
     Some(serde_json::Value::Object(compact))
 }
@@ -1225,6 +1239,25 @@ mod tests {
         );
         assert!(plan.body.json_body.is_some());
         assert!(!lifecycle.is_terminal_claimed());
+    }
+
+    #[test]
+    fn lifecycle_report_context_keeps_only_cafecode_identity_from_original_headers() {
+        let context = json!({
+            "request_id": "request-original",
+            "original_headers": {
+                "authorization": "Bearer secret",
+                "cafecode-uid": "372",
+                "Cafecode-Uname": "xiapeng8618"
+            }
+        });
+
+        let compact = compact_report_context_template(Some(&context)).expect("compact context");
+
+        assert_eq!(compact["cafecode_uid"], "372");
+        assert_eq!(compact["cafecode_uname"], "xiapeng8618");
+        assert!(compact.get("original_headers").is_none());
+        assert!(!compact.to_string().contains("Bearer secret"));
     }
 
     #[test]

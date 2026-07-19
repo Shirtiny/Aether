@@ -748,6 +748,8 @@ fn compact_usage_report_context(context: Option<&serde_json::Value>) -> Option<s
         "needs_conversion",
         "client_ip",
         "user_agent",
+        "cafecode_uid",
+        "cafecode_uname",
         "client_requested_stream",
         "upstream_is_stream",
         "ws_step",
@@ -791,6 +793,8 @@ mod tests {
         let context = serde_json::json!({
             "request_id": "req-1",
             "ws_step": true,
+            "cafecode_uid": "372",
+            "cafecode_uname": "xiapeng8618",
             "secret": "drop-me"
         });
 
@@ -798,6 +802,8 @@ mod tests {
 
         assert_eq!(compact["request_id"], "req-1");
         assert_eq!(compact["ws_step"], true);
+        assert_eq!(compact["cafecode_uid"], "372");
+        assert_eq!(compact["cafecode_uname"], "xiapeng8618");
         assert!(compact.get("secret").is_none());
     }
 

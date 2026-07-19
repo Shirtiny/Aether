@@ -1909,6 +1909,11 @@ fn build_runtime_request_metadata_seed_from_parts(
     if let Some(user_agent) = context_string(context, "user_agent") {
         metadata.insert("user_agent".to_string(), Value::String(user_agent));
     }
+    for field in ["cafecode_uid", "cafecode_uname"] {
+        if let Some(value) = context_string(context, field) {
+            metadata.insert(field.to_string(), Value::String(value));
+        }
+    }
     if let Some(headers) = context_value(context, "original_headers") {
         if let Some(Value::Object(identity)) =
             attach_cafecode_identity_metadata(None, Some(&headers))
@@ -6036,6 +6041,48 @@ mod tests {
                 .and_then(|metadata| metadata.get("cafecode_uname"))
                 .and_then(serde_json::Value::as_str),
             Some("xiapeng8618")
+        );
+    }
+
+    #[test]
+    fn usage_event_data_seed_preserves_trusted_cafecode_identity_metadata() {
+        let plan = ExecutionPlan {
+            request_id: "req-cafecode-ws-1".to_string(),
+            candidate_id: Some("cand-cafecode-ws-1".to_string()),
+            provider_name: Some("OpenAI".to_string()),
+            provider_id: "provider-1".to_string(),
+            endpoint_id: "endpoint-1".to_string(),
+            key_id: "key-1".to_string(),
+            method: "GET".to_string(),
+            url: "wss://example.com/v1/responses".to_string(),
+            headers: BTreeMap::new(),
+            content_type: Some("application/json".to_string()),
+            content_encoding: None,
+            body: RequestBody::from_json(json!({"model": "gpt-5"})),
+            stream: true,
+            client_api_format: "openai:responses".to_string(),
+            provider_api_format: "openai:responses".to_string(),
+            model_name: Some("gpt-5".to_string()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        };
+
+        let data = build_usage_event_data_seed(
+            &plan,
+            Some(&json!({
+                "cafecode_uid": "372",
+                "cafecode_uname": "xiapeng8618"
+            })),
+        );
+
+        assert_eq!(
+            data.request_metadata.as_ref().unwrap()["cafecode_uid"],
+            "372"
+        );
+        assert_eq!(
+            data.request_metadata.as_ref().unwrap()["cafecode_uname"],
+            "xiapeng8618"
         );
     }
 
