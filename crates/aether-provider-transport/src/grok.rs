@@ -179,9 +179,8 @@ pub fn resolve_grok_model_alias(provider_type: &str, model: &str) -> String {
     }
 }
 
-/// Remove OpenAI Responses fields that the official xAI subscription
-/// endpoint rejects. This intentionally stays smaller than the deferred
-/// provider-specific tool filtering and multimedia compatibility work.
+/// Remove OpenAI Responses fields and tool variants that the official xAI
+/// subscription endpoint rejects.
 pub fn apply_grok_xai_responses_body_edits(
     body: &mut Value,
     provider_type: &str,
@@ -216,7 +215,54 @@ pub fn apply_grok_xai_responses_body_edits(
             }
         }
     }
+    remove_grok_xai_unsupported_response_tools(body);
     remove_grok_xai_field_recursively(body, "external_web_access");
+}
+
+fn remove_grok_xai_unsupported_response_tools(body: &mut Value) {
+    let Some(object) = body.as_object_mut() else {
+        return;
+    };
+
+    let tools_empty = object
+        .get_mut("tools")
+        .and_then(Value::as_array_mut)
+        .map(|tools| {
+            tools.retain(|tool| {
+                !tool
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|tool_type| {
+                        matches!(
+                            tool_type.trim().to_ascii_lowercase().as_str(),
+                            "namespace" | "custom"
+                        )
+                    })
+            });
+            tools.is_empty()
+        })
+        .unwrap_or(false);
+
+    if tools_empty {
+        object.remove("tools");
+        object.remove("tool_choice");
+        return;
+    }
+
+    let unsupported_tool_choice = object
+        .get("tool_choice")
+        .and_then(Value::as_object)
+        .and_then(|choice| choice.get("type"))
+        .and_then(Value::as_str)
+        .is_some_and(|tool_type| {
+            matches!(
+                tool_type.trim().to_ascii_lowercase().as_str(),
+                "namespace" | "custom"
+            )
+        });
+    if unsupported_tool_choice {
+        object.insert("tool_choice".to_string(), Value::String("auto".to_string()));
+    }
 }
 
 fn remove_grok_xai_field_recursively(value: &mut Value, field: &str) {
@@ -482,6 +528,51 @@ mod tests {
             .get("external_web_access")
             .is_none());
         assert_eq!(body["input"][0]["content"][0]["text"], "hello");
+    }
+
+    #[test]
+    fn drops_codex_namespace_tools_rejected_by_xai_responses() {
+        let mut body = serde_json::json!({
+            "model": "grok-4.5",
+            "input": "hello",
+            "tools": [
+                {"type":"function","name":"exec_command","parameters":{"type":"object"}},
+                {
+                    "type":"namespace",
+                    "name":"multi_agent_v1",
+                    "tools":[{"type":"function","name":"spawn_agent"}]
+                },
+                {"type":"custom","name":"unsupported_custom"},
+                {"type":"web_search"}
+            ],
+            "tool_choice": {"type":"namespace","name":"multi_agent_v1"}
+        });
+
+        apply_grok_xai_responses_body_edits(&mut body, "grok", "openai:responses");
+
+        assert_eq!(
+            body["tools"],
+            serde_json::json!([
+                {"type":"function","name":"exec_command","parameters":{"type":"object"}},
+                {"type":"web_search"}
+            ])
+        );
+        assert_eq!(body["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn removes_tool_fields_when_xai_rejects_every_tool() {
+        let mut body = serde_json::json!({
+            "model": "grok-4.5",
+            "input": "hello",
+            "tools": [{"type":"namespace","name":"mcp__node_repl","tools":[]}],
+            "tool_choice": "required"
+        });
+
+        apply_grok_xai_responses_body_edits(&mut body, "grok", "openai:responses");
+
+        assert!(body.get("tools").is_none());
+        assert!(body.get("tool_choice").is_none());
     }
 
     #[test]
