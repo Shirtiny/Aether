@@ -15,6 +15,7 @@ use crate::ai_serving::transport::antigravity::{
     classify_local_antigravity_request_support, AntigravityEnvelopeRequestType,
     AntigravityRequestEnvelopeSupport, AntigravityRequestSideSupport,
 };
+use crate::ai_serving::transport::grok::apply_grok_chat_identity_headers;
 use crate::ai_serving::transport::{
     build_gemini_cli_v1internal_request, build_same_format_provider_headers,
     resolve_local_gemini_cli_request_auth, GeminiCliRequestAuth, GeminiCliRequestAuthSupport,
@@ -410,6 +411,7 @@ pub(crate) async fn resolve_local_same_format_provider_candidate_payload_parts(
         .await;
         return Ok(None);
     };
+    apply_grok_chat_identity_headers(&mut provider_request_headers, &transport);
     request_identity_response_encoding_when_redacted(
         &mut provider_request_headers,
         redaction.redacted,
