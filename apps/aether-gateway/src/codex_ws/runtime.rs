@@ -268,6 +268,7 @@ impl PreparedStep {
                 settlement_permit: None,
                 plan: None,
                 original_request_body: None,
+                lifecycle_seed: None,
             },
         }
     }
@@ -356,9 +357,14 @@ pub(crate) struct UsageReportReservation {
     settlement_permit: Option<tokio::sync::mpsc::OwnedPermit<CodexWsSettlementCommit>>,
     plan: Option<aether_contracts::ExecutionPlan>,
     original_request_body: Option<serde_json::Value>,
+    lifecycle_seed: Option<aether_usage_runtime::LifecycleUsageSeed>,
 }
 
 impl UsageReportReservation {
+    fn lifecycle_seed(&self) -> Option<&aether_usage_runtime::LifecycleUsageSeed> {
+        self.lifecycle_seed.as_ref()
+    }
+
     fn into_parts(
         mut self,
     ) -> (
@@ -460,6 +466,23 @@ pub(crate) trait CodexWsRuntimePort: Send + Sync {
         first_dispatch: bool,
     );
 
+    fn record_step_pending(
+        &self,
+        _candidate: &CodexWsCandidate,
+        _step: &ResponseCreateStep,
+        _usage_report: &UsageReportReservation,
+    ) {
+    }
+
+    fn record_step_stream_started(
+        &self,
+        _candidate: &CodexWsCandidate,
+        _step: &ResponseCreateStep,
+        _first_byte_elapsed: std::time::Duration,
+        _usage_report: &UsageReportReservation,
+    ) {
+    }
+
     fn record_step_terminal(
         &self,
         candidate: &CodexWsCandidate,
@@ -468,6 +491,7 @@ pub(crate) trait CodexWsRuntimePort: Send + Sync {
         terminal_kind: Option<TerminalKind>,
         disposition: CodexWsStepDisposition,
         first_dispatch: bool,
+        first_byte_elapsed: Option<std::time::Duration>,
         elapsed: std::time::Duration,
         usage_report: UsageReportReservation,
     );
@@ -1378,6 +1402,12 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
         let mut usage_plan = candidate.lifecycle.plan().clone();
         usage_plan.request_id = step_usage_request_id(step);
         usage_plan.body = aether_contracts::RequestBody::from_json(materialized_body.json);
+        let lifecycle_report_context =
+            step_report_context(candidate.lifecycle.report_context().cloned(), step, None);
+        let lifecycle_seed = aether_usage_runtime::build_lifecycle_usage_seed(
+            &usage_plan,
+            lifecycle_report_context.as_ref(),
+        );
         Ok(PreparedStep {
             body: materialized_body.text,
             admission,
@@ -1388,6 +1418,7 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
                 settlement_permit: Some(settlement_report),
                 plan: Some(usage_plan),
                 original_request_body: Some(original_request_body),
+                lifecycle_seed: Some(lifecycle_seed),
             },
         })
     }
@@ -1407,6 +1438,44 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
             .await;
     }
 
+    fn record_step_pending(
+        &self,
+        _candidate: &CodexWsCandidate,
+        _step: &ResponseCreateStep,
+        usage_report: &UsageReportReservation,
+    ) {
+        let Some(seed) = usage_report.lifecycle_seed() else {
+            return;
+        };
+        self.state
+            .usage_runtime
+            .record_pending(self.state.data.as_ref(), seed.clone());
+    }
+
+    fn record_step_stream_started(
+        &self,
+        _candidate: &CodexWsCandidate,
+        _step: &ResponseCreateStep,
+        first_byte_elapsed: std::time::Duration,
+        usage_report: &UsageReportReservation,
+    ) {
+        let Some(seed) = usage_report.lifecycle_seed() else {
+            return;
+        };
+        let first_byte_ms = u64::try_from(first_byte_elapsed.as_millis()).ok();
+        let telemetry = aether_contracts::ExecutionTelemetry {
+            ttfb_ms: first_byte_ms,
+            elapsed_ms: first_byte_ms,
+            upstream_bytes: None,
+        };
+        self.state.usage_runtime.record_stream_started(
+            self.state.data.as_ref(),
+            seed,
+            http::StatusCode::OK.as_u16(),
+            Some(&telemetry),
+        );
+    }
+
     fn record_step_terminal(
         &self,
         candidate: &CodexWsCandidate,
@@ -1415,6 +1484,7 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
         terminal_kind: Option<TerminalKind>,
         disposition: CodexWsStepDisposition,
         first_dispatch: bool,
+        first_byte_elapsed: Option<std::time::Duration>,
         elapsed: std::time::Duration,
         usage_report: UsageReportReservation,
     ) {
@@ -1431,6 +1501,8 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
             response_headers.extend(terminal_event.provider_headers.clone());
         }
         let fallback_model = step.model.clone();
+        let first_byte_ms =
+            first_byte_elapsed.and_then(|duration| u64::try_from(duration.as_millis()).ok());
         let elapsed_ms = u64::try_from(elapsed.as_millis()).ok();
         let terminal_summary = compact_terminal_summary(
             terminal_event.as_ref(),
@@ -1468,6 +1540,7 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
             response_headers,
             terminal_summary,
             status_code,
+            first_byte_ms,
             elapsed_ms,
             cancelled,
             step_settlement,

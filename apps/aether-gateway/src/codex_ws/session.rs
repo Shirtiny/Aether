@@ -181,6 +181,7 @@ struct StepSettlementGuard<'a> {
     execution_guard: Option<StepExecutionGuard>,
     usage_report: Option<UsageReportReservation>,
     first_dispatch: bool,
+    first_byte_elapsed: Option<Duration>,
 }
 
 impl<'a> StepSettlementGuard<'a> {
@@ -201,7 +202,32 @@ impl<'a> StepSettlementGuard<'a> {
             execution_guard: Some(execution_guard),
             usage_report: Some(usage_report),
             first_dispatch,
+            first_byte_elapsed: None,
         }
+    }
+
+    fn record_pending(&self) {
+        let Some(usage_report) = self.usage_report.as_ref() else {
+            return;
+        };
+        self.runtime
+            .record_step_pending(self.candidate, self.step, usage_report);
+    }
+
+    fn record_stream_started(&mut self, first_byte_elapsed: Duration) {
+        if self.first_byte_elapsed.is_some() {
+            return;
+        }
+        self.first_byte_elapsed = Some(first_byte_elapsed);
+        let Some(usage_report) = self.usage_report.as_ref() else {
+            return;
+        };
+        self.runtime.record_step_stream_started(
+            self.candidate,
+            self.step,
+            first_byte_elapsed,
+            usage_report,
+        );
     }
 
     async fn finish(
@@ -240,6 +266,7 @@ impl<'a> StepSettlementGuard<'a> {
             terminal_kind,
             disposition,
             self.first_dispatch,
+            self.first_byte_elapsed,
             self.started_at.elapsed(),
             usage_report,
         );
@@ -615,7 +642,7 @@ pub(crate) async fn run_codex_ws_session(
             return;
         }
         let first_dispatch = candidate_attempt.mark_provider_write_attempted();
-        let settlement = StepSettlementGuard::new(
+        let mut settlement = StepSettlementGuard::new(
             runtime,
             &candidate,
             &step,
@@ -624,6 +651,7 @@ pub(crate) async fn run_codex_ws_session(
             usage_report,
             first_dispatch,
         );
+        settlement.record_pending();
         let provider_write = send_ready_until_with_optional_cpu_budget(
             peer.as_mut(),
             RelayFrame::Text(materialized_step.into()),
@@ -679,6 +707,8 @@ pub(crate) async fn run_codex_ws_session(
             candidate.selected_catalog_epoch,
             &execution_lease_status,
             &deadlines,
+            step_started,
+            |first_byte_elapsed| settlement.record_stream_started(first_byte_elapsed),
         )
         .await;
         match outcome {
@@ -1251,7 +1281,7 @@ fn terminal_kind_label(kind: TerminalKind) -> &'static str {
     }
 }
 
-async fn relay_one_response(
+async fn relay_one_response<F>(
     client: &mut Box<dyn RelayPeer>,
     official: &mut dyn RelayPeer,
     binding: &mut BindingState,
@@ -1261,7 +1291,12 @@ async fn relay_one_response(
     selected_catalog_epoch: u64,
     execution_lease_status: &StepExecutionLeaseStatus,
     deadlines: &StepDeadlines,
-) -> StepOutcome {
+    step_started: tokio::time::Instant,
+    mut on_first_business_frame: F,
+) -> StepOutcome
+where
+    F: FnMut(Duration),
+{
     let mut active_response_id = None::<String>;
     let mut received_business_frame = false;
     let mut upstream_deadline = tokio::time::Instant::now() + deadlines.first_byte;
@@ -1412,6 +1447,9 @@ async fn relay_one_response(
                             if let Some(response_id) = terminal_response_id.as_ref() {
                                 binding.settled_response_ids.insert(response_id.clone());
                             }
+                        }
+                        if recognized_business && !received_business_frame {
+                            on_first_business_frame(step_started.elapsed());
                         }
                         if recognized_business {
                             received_business_frame = true;
@@ -1823,9 +1861,13 @@ mod tests {
         validate_calls: AtomicUsize,
         connect_calls: AtomicUsize,
         prepare_calls: AtomicUsize,
+        pending_calls: AtomicUsize,
+        stream_started_calls: AtomicUsize,
+        stream_first_byte_ms: Mutex<Vec<u64>>,
         report_calls: AtomicUsize,
         report_after_release: AtomicUsize,
         report_terminal_kinds: Mutex<Vec<Option<TerminalKind>>>,
+        report_first_byte_ms: Mutex<Vec<Option<u64>>>,
         started_candidates: Mutex<Vec<String>>,
         aborted_candidates: Mutex<Vec<String>>,
         unused_candidates: Mutex<Vec<String>>,
@@ -1860,9 +1902,13 @@ mod tests {
                 validate_calls: AtomicUsize::new(0),
                 connect_calls: AtomicUsize::new(0),
                 prepare_calls: AtomicUsize::new(0),
+                pending_calls: AtomicUsize::new(0),
+                stream_started_calls: AtomicUsize::new(0),
+                stream_first_byte_ms: Mutex::new(Vec::new()),
                 report_calls: AtomicUsize::new(0),
                 report_after_release: AtomicUsize::new(0),
                 report_terminal_kinds: Mutex::new(Vec::new()),
+                report_first_byte_ms: Mutex::new(Vec::new()),
                 started_candidates: Mutex::new(Vec::new()),
                 aborted_candidates: Mutex::new(Vec::new()),
                 unused_candidates: Mutex::new(Vec::new()),
@@ -2079,6 +2125,29 @@ mod tests {
         ) {
         }
 
+        fn record_step_pending(
+            &self,
+            _candidate: &CodexWsCandidate,
+            _step: &ResponseCreateStep,
+            _usage_report: &UsageReportReservation,
+        ) {
+            self.pending_calls.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn record_step_stream_started(
+            &self,
+            _candidate: &CodexWsCandidate,
+            _step: &ResponseCreateStep,
+            first_byte_elapsed: Duration,
+            _usage_report: &UsageReportReservation,
+        ) {
+            self.stream_started_calls.fetch_add(1, Ordering::Relaxed);
+            self.stream_first_byte_ms
+                .lock()
+                .expect("stream first-byte values should lock")
+                .push(first_byte_elapsed.as_millis() as u64);
+        }
+
         fn record_step_terminal(
             &self,
             _candidate: &CodexWsCandidate,
@@ -2087,6 +2156,7 @@ mod tests {
             terminal_kind: Option<TerminalKind>,
             _disposition: CodexWsStepDisposition,
             _first_dispatch: bool,
+            first_byte_elapsed: Option<Duration>,
             _elapsed: Duration,
             _usage_report: UsageReportReservation,
         ) {
@@ -2095,6 +2165,10 @@ mod tests {
                 .lock()
                 .expect("terminal kinds should lock")
                 .push(terminal_kind);
+            self.report_first_byte_ms
+                .lock()
+                .expect("terminal first-byte values should lock")
+                .push(first_byte_elapsed.map(|elapsed| elapsed.as_millis() as u64));
             if self.gate.snapshot().in_flight == 0 {
                 self.report_after_release.fetch_add(1, Ordering::Relaxed);
             }
@@ -2363,7 +2437,7 @@ mod tests {
         })
         .to_string();
         let (official, official_sent) = ScriptedPeer::new([
-            (Duration::ZERO, relay_text(created)),
+            (Duration::from_millis(7), relay_text(created)),
             (Duration::ZERO, relay_text(terminal.clone())),
         ]);
         let runtime = TestRuntime::new(Box::new(official), true);
@@ -2377,9 +2451,25 @@ mod tests {
         assert_eq!(runtime.validate_calls.load(Ordering::Relaxed), 1);
         assert_eq!(runtime.connect_calls.load(Ordering::Relaxed), 2);
         assert_eq!(runtime.prepare_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(runtime.pending_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(runtime.stream_started_calls.load(Ordering::Relaxed), 1);
         assert_eq!(runtime.report_calls.load(Ordering::Relaxed), 1);
         assert_eq!(runtime.report_after_release.load(Ordering::Relaxed), 1);
         assert_eq!(runtime.gate.snapshot().in_flight, 0);
+        assert_eq!(
+            *runtime
+                .stream_first_byte_ms
+                .lock()
+                .expect("stream first-byte values should lock"),
+            vec![7]
+        );
+        assert_eq!(
+            *runtime
+                .report_first_byte_ms
+                .lock()
+                .expect("terminal first-byte values should lock"),
+            vec![Some(7)]
+        );
         assert_eq!(
             *runtime
                 .started_candidates
@@ -2956,6 +3046,15 @@ mod tests {
         assert_eq!(runtime.connect_calls.load(Ordering::Relaxed), 1);
         assert_eq!(runtime.report_calls.load(Ordering::Relaxed), 1);
         assert_eq!(runtime.report_after_release.load(Ordering::Relaxed), 1);
+        assert_eq!(runtime.pending_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(runtime.stream_started_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            *runtime
+                .report_first_byte_ms
+                .lock()
+                .expect("terminal first-byte values should lock"),
+            vec![None]
+        );
         assert_eq!(runtime.gate.snapshot().in_flight, 0);
         assert_eq!(
             official_sent
