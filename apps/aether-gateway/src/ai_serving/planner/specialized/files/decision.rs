@@ -81,6 +81,7 @@ pub(super) async fn maybe_build_local_gemini_files_decision_payload_for_candidat
         attempt_identity,
         model: "gemini-files",
         provider_name: &transport.provider.name,
+        provider_type: &transport.provider.provider_type,
         provider_id: &candidate.provider_id,
         endpoint_id: &candidate.endpoint_id,
         key_id: &candidate.key_id,

@@ -9,8 +9,8 @@ use crate::ai_serving::planner::materialization_policy::{
 };
 use crate::ai_serving::planner::passthrough::maybe_build_local_same_format_provider_decision_payload_for_candidate;
 use crate::ai_serving::planner::report_context::{
-    build_local_execution_report_context, insert_native_client_envelope_name,
-    LocalExecutionReportContextParts,
+    build_local_execution_report_context, insert_grok_response_tool_refs,
+    insert_native_client_envelope_name, LocalExecutionReportContextParts,
 };
 use crate::ai_serving::planner::spec_metadata::local_standard_spec_metadata;
 use crate::ai_serving::planner::CandidateFailureDiagnostic;
@@ -88,6 +88,12 @@ pub(super) async fn maybe_build_local_standard_decision_payload_for_candidate(
         .resolve_transport_proxy_snapshot_with_tunnel_affinity(&resolved.transport)
         .await;
     let mut extra_fields = serde_json::Map::new();
+    insert_grok_response_tool_refs(
+        &mut extra_fields,
+        &resolved.transport.provider.provider_type,
+        &resolved.provider_api_format,
+        body_json,
+    );
     if let Some(proxy_value) =
         build_request_trace_proxy_value(Some(&resolved.transport), proxy.as_ref())
     {
@@ -114,6 +120,7 @@ pub(super) async fn maybe_build_local_standard_decision_payload_for_candidate(
                 attempt_identity: attempt.attempt_identity(),
                 model: &input.requested_model,
                 provider_name: &candidate.provider_name,
+                provider_type: &resolved.transport.provider.provider_type,
                 provider_id: &candidate.provider_id,
                 endpoint_id: &candidate.endpoint_id,
                 key_id: &candidate.key_id,

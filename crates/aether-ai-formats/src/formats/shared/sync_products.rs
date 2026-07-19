@@ -281,6 +281,26 @@ pub fn maybe_build_standard_sync_finalize_product_from_normalized_payload(
     body_json: Option<&Value>,
     body_base64: Option<&str>,
 ) -> Result<Option<StandardSyncFinalizeNormalizedProduct>, AiSurfaceFinalizeError> {
+    let grok_tool_refs = report_context.and_then(|context| {
+        context.get(crate::provider_compat::grok_responses::GROK_RESPONSE_TOOL_REFS_REPORT_FIELD)
+    });
+    let mut restored_body_json = body_json.cloned();
+    if let (Some(body), Some(refs)) = (restored_body_json.as_mut(), grok_tool_refs) {
+        crate::provider_compat::grok_responses::restore_grok_response_tool_calls(body, refs);
+    }
+    let restored_body_base64 = match (body_base64, grok_tool_refs) {
+        (Some(encoded), Some(refs)) => {
+            let bytes = base64::engine::general_purpose::STANDARD.decode(encoded)?;
+            let restored = crate::provider_compat::grok_responses::restore_grok_response_sse_bytes(
+                &bytes, refs,
+            );
+            Some(base64::engine::general_purpose::STANDARD.encode(restored))
+        }
+        _ => None,
+    };
+    let body_json = restored_body_json.as_ref().or(body_json);
+    let body_base64 = restored_body_base64.as_deref().or(body_base64);
+
     if let Some(body_json) = maybe_build_standard_same_format_sync_body_from_normalized_payload(
         report_kind,
         status_code,

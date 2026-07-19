@@ -14,7 +14,7 @@ pub const GROK_DEFAULT_BASE_URL: &str = GROK_CLI_CHAT_PROXY_BASE_URL;
 
 /// Identity headers the Grok CLI chat-proxy expects. It rejects a request that
 /// carries only a bearer token.
-const GROK_CLI_CLIENT_VERSION: &str = "0.2.93";
+const GROK_CLI_CLIENT_VERSION: &str = "0.2.103";
 const GROK_CLI_TOKEN_AUTH_HEADER: &str = "x-xai-token-auth";
 const GROK_CLI_TOKEN_AUTH_VALUE: &str = "xai-grok-cli";
 const GROK_CLI_CLIENT_VERSION_HEADER: &str = "x-grok-client-version";
@@ -179,8 +179,10 @@ pub fn resolve_grok_model_alias(provider_type: &str, model: &str) -> String {
     }
 }
 
-/// Remove OpenAI Responses fields and tool variants that the official xAI
-/// subscription endpoint rejects.
+/// Remove rejected fields and adapt Codex namespace/custom tools to the
+/// function-only Responses shape accepted by xAI. The reversible identities
+/// are collected separately into the execution report context so response
+/// finalization can restore Codex routing fields.
 pub fn apply_grok_xai_responses_body_edits(
     body: &mut Value,
     provider_type: &str,
@@ -215,54 +217,10 @@ pub fn apply_grok_xai_responses_body_edits(
             }
         }
     }
-    remove_grok_xai_unsupported_response_tools(body);
+    aether_ai_formats::provider_compat::grok_responses::normalize_grok_responses_request_tools(
+        body,
+    );
     remove_grok_xai_field_recursively(body, "external_web_access");
-}
-
-fn remove_grok_xai_unsupported_response_tools(body: &mut Value) {
-    let Some(object) = body.as_object_mut() else {
-        return;
-    };
-
-    let tools_empty = object
-        .get_mut("tools")
-        .and_then(Value::as_array_mut)
-        .map(|tools| {
-            tools.retain(|tool| {
-                !tool
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .is_some_and(|tool_type| {
-                        matches!(
-                            tool_type.trim().to_ascii_lowercase().as_str(),
-                            "namespace" | "custom"
-                        )
-                    })
-            });
-            tools.is_empty()
-        })
-        .unwrap_or(false);
-
-    if tools_empty {
-        object.remove("tools");
-        object.remove("tool_choice");
-        return;
-    }
-
-    let unsupported_tool_choice = object
-        .get("tool_choice")
-        .and_then(Value::as_object)
-        .and_then(|choice| choice.get("type"))
-        .and_then(Value::as_str)
-        .is_some_and(|tool_type| {
-            matches!(
-                tool_type.trim().to_ascii_lowercase().as_str(),
-                "namespace" | "custom"
-            )
-        });
-    if unsupported_tool_choice {
-        object.insert("tool_choice".to_string(), Value::String("auto".to_string()));
-    }
 }
 
 fn remove_grok_xai_field_recursively(value: &mut Value, field: &str) {
@@ -438,11 +396,11 @@ mod tests {
         );
         assert_eq!(
             headers.get("x-grok-client-version").map(String::as_str),
-            Some("0.2.93")
+            Some("0.2.103")
         );
         assert_eq!(
             headers.get("user-agent").map(String::as_str),
-            Some("xai-grok-workspace/0.2.93")
+            Some("xai-grok-workspace/0.2.103")
         );
     }
 
@@ -531,7 +489,7 @@ mod tests {
     }
 
     #[test]
-    fn drops_codex_namespace_tools_rejected_by_xai_responses() {
+    fn flattens_codex_namespace_and_custom_tools_for_xai_responses() {
         let mut body = serde_json::json!({
             "model": "grok-4.5",
             "input": "hello",
@@ -554,6 +512,8 @@ mod tests {
             body["tools"],
             serde_json::json!([
                 {"type":"function","name":"exec_command","parameters":{"type":"object"}},
+                {"type":"function","name":"multi_agent_v1__spawn_agent","parameters":{"type":"object","properties":{}}},
+                {"type":"function","name":"unsupported_custom","parameters":{"type":"object","properties":{"input":{}},"required":["input"],"additionalProperties":false}},
                 {"type":"web_search"}
             ])
         );

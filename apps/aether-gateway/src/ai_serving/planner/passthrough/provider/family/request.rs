@@ -156,6 +156,7 @@ pub(crate) async fn resolve_local_same_format_provider_candidate_payload_parts(
     let Some(mut base_provider_request_body) =
         super::super::request::build_same_format_provider_request_body(
             body_json,
+            prepared.transport.provider.provider_type.as_str(),
             prepared.provider_api_format.as_str(),
             &prepared.mapped_model,
             spec,

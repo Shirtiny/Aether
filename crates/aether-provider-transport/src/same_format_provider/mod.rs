@@ -61,6 +61,7 @@ pub struct SameFormatProviderRequestBehavior {
 pub struct SameFormatProviderRequestBodyInput<'a> {
     pub body_json: &'a Value,
     pub mapped_model: &'a str,
+    pub provider_type: &'a str,
     pub client_api_format: &'a str,
     pub provider_api_format: &'a str,
     pub source_model: Option<&'a str>,
@@ -238,6 +239,11 @@ pub fn build_same_format_provider_request_body(
     {
         strip_gemini_function_response_ids(&mut provider_request_body);
     }
+    crate::grok::apply_grok_xai_responses_body_edits(
+        &mut provider_request_body,
+        input.provider_type,
+        input.provider_api_format,
+    );
     let require_body_stream_field = input.force_body_stream_field
         || input
             .body_json
@@ -756,6 +762,7 @@ mod tests {
                         "stream": client_is_stream
                     }),
                     mapped_model: "upstream-model",
+                    provider_type: "openai",
                     client_api_format: "openai:chat",
                     provider_api_format: "openai:chat",
                     source_model: Some("client-model"),
@@ -855,6 +862,7 @@ mod tests {
                 "messages": [{"role": "user", "content": "hello"}]
             }),
             mapped_model: "upstream-model",
+            provider_type: "openai",
             client_api_format: "openai:chat",
             provider_api_format: "openai:chat",
             source_model: Some("client-model"),
@@ -874,6 +882,38 @@ mod tests {
     }
 
     #[test]
+    fn same_format_grok_responses_flattens_namespace_tools() {
+        let body = build_same_format_provider_request_body(SameFormatProviderRequestBodyInput {
+            body_json: &json!({
+                "model": "grok-4.5",
+                "input": "hello",
+                "tools": [{
+                    "type": "namespace",
+                    "name": "multi_agent_v1",
+                    "tools": [{"type":"function","name":"spawn_agent"}]
+                }]
+            }),
+            mapped_model: "grok-4.5",
+            provider_type: "grok",
+            client_api_format: "openai:responses",
+            provider_api_format: "openai:responses",
+            source_model: Some("grok-4.5"),
+            family: SameFormatProviderFamily::Standard,
+            body_rules: None,
+            request_headers: None,
+            upstream_is_stream: true,
+            force_body_stream_field: false,
+            kiro_auth_config: None,
+            is_claude_code: false,
+            enable_model_directives: false,
+        })
+        .expect("body should build");
+
+        assert_eq!(body["tools"][0]["type"], "function");
+        assert_eq!(body["tools"][0]["name"], "multi_agent_v1__spawn_agent");
+    }
+
+    #[test]
     fn same_format_embedding_body_rejects_multimodal_for_openai_like_provider() {
         let body = build_same_format_provider_request_body(SameFormatProviderRequestBodyInput {
             body_json: &json!({
@@ -884,6 +924,7 @@ mod tests {
                 ]
             }),
             mapped_model: "openai-qwen-fallback",
+            provider_type: "openai",
             client_api_format: "openai:embedding",
             provider_api_format: "openai:embedding",
             source_model: Some("qwen3-vl-embedding"),
@@ -909,6 +950,7 @@ mod tests {
                 "stream": true
             }),
             mapped_model: "upstream-model",
+            provider_type: "openai",
             client_api_format: "openai:chat",
             provider_api_format: "openai:chat",
             source_model: Some("client-model"),
@@ -935,6 +977,7 @@ mod tests {
                 "messages": [{"role": "user", "content": "hello"}]
             }),
             mapped_model: "upstream-model",
+            provider_type: "openai",
             client_api_format: "openai:chat",
             provider_api_format: "openai:chat",
             source_model: Some("client-model"),
@@ -961,6 +1004,7 @@ mod tests {
                 "messages": [{"role": "user", "content": "hello"}]
             }),
             mapped_model: "upstream-model",
+            provider_type: "openai",
             client_api_format: "openai:chat",
             provider_api_format: "openai:chat",
             source_model: Some("client-model"),
@@ -987,6 +1031,7 @@ mod tests {
                 "stream": true
             }),
             mapped_model: "gemini-upstream",
+            provider_type: "openai",
             client_api_format: "gemini:generate_content",
             provider_api_format: "gemini:generate_content",
             source_model: None,
@@ -1037,6 +1082,7 @@ mod tests {
                 "stream": true
             }),
             mapped_model: "gemini-upstream",
+            provider_type: "openai",
             client_api_format: "gemini:generate_content",
             provider_api_format: "gemini:generate_content",
             source_model: None,
@@ -1077,6 +1123,7 @@ mod tests {
                 "stream": true
             }),
             mapped_model: "upstream-model",
+            provider_type: "openai",
             client_api_format: "openai:chat",
             provider_api_format: "openai:chat",
             source_model: Some("client-model"),
@@ -1107,6 +1154,7 @@ mod tests {
                 "stream": true
             }),
             mapped_model: "upstream-model",
+            provider_type: "openai",
             client_api_format: "openai:responses:compact",
             provider_api_format: "openai:responses:compact",
             source_model: Some("client-model"),
@@ -1133,6 +1181,7 @@ mod tests {
                 "reasoning_effort": "low"
             }),
             mapped_model: "upstream-model",
+            provider_type: "openai",
             client_api_format: "openai:chat",
             provider_api_format: "openai:chat",
             source_model: Some("gpt-5.4-high"),
@@ -1163,6 +1212,7 @@ mod tests {
                 "reasoning": {"effort": "ultra", "summary": "detailed"}
             }),
             mapped_model: "gpt-5.6-sol",
+            provider_type: "openai",
             client_api_format: "openai:responses",
             provider_api_format: "openai:responses",
             source_model: Some("gpt-5.6-sol"),

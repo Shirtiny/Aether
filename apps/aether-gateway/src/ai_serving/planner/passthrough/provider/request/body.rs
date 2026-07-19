@@ -8,6 +8,7 @@ use crate::ai_serving::transport::{
 
 pub(crate) fn build_same_format_provider_request_body(
     body_json: &Value,
+    provider_type: &str,
     provider_api_format: &str,
     mapped_model: &str,
     spec: LocalSameFormatProviderSpec,
@@ -22,6 +23,7 @@ pub(crate) fn build_same_format_provider_request_body(
     build_same_format_provider_request_body_impl(SameFormatProviderRequestBodyInput {
         body_json,
         mapped_model,
+        provider_type,
         client_api_format: spec.api_format,
         provider_api_format,
         source_model: body_json.get("model").and_then(Value::as_str),

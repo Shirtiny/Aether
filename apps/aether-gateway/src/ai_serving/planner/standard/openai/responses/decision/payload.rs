@@ -4,8 +4,9 @@ use tracing::debug;
 use crate::ai_serving::build_request_trace_proxy_value;
 use crate::ai_serving::planner::decision_input::apply_provider_request_routing_policy_to_decision;
 use crate::ai_serving::planner::report_context::{
-    build_local_execution_report_context, insert_native_client_envelope_name,
-    insert_provider_stream_event_api_format, LocalExecutionReportContextParts,
+    build_local_execution_report_context, insert_grok_response_tool_refs,
+    insert_native_client_envelope_name, insert_provider_stream_event_api_format,
+    LocalExecutionReportContextParts,
 };
 use crate::ai_serving::planner::spec_metadata::local_openai_responses_spec_metadata;
 use crate::ai_serving::planner::{
@@ -78,6 +79,12 @@ pub(crate) async fn maybe_build_local_openai_responses_decision_payload_for_cand
         .or_else(|| resolve_transport_profile(&resolved.transport));
     let timeouts = resolve_transport_execution_timeouts(&resolved.transport);
     let mut extra_fields = serde_json::Map::new();
+    insert_grok_response_tool_refs(
+        &mut extra_fields,
+        &resolved.transport.provider.provider_type,
+        &resolved.provider_api_format,
+        body_json,
+    );
     if let Some(proxy_value) =
         build_request_trace_proxy_value(Some(&resolved.transport), proxy.as_ref())
     {
@@ -125,6 +132,7 @@ pub(crate) async fn maybe_build_local_openai_responses_decision_payload_for_cand
                 attempt_identity,
                 model: &input.requested_model,
                 provider_name: &resolved.transport.provider.name,
+                provider_type: &resolved.transport.provider.provider_type,
                 provider_id: &candidate.provider_id,
                 endpoint_id: &candidate.endpoint_id,
                 key_id: &candidate.key_id,

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Map, Value};
 
@@ -26,6 +26,7 @@ pub enum FinalizeStreamRewriteMode {
     Standard,
     KiroToClaudeCli,
     KiroToClaudeCliThenStandard,
+    GrokResponseTools,
 }
 
 pub fn resolve_finalize_stream_rewrite_mode(
@@ -53,6 +54,15 @@ pub fn resolve_finalize_stream_rewrite_mode(
         .unwrap_or_default()
         .trim()
         .to_ascii_lowercase();
+
+    if report_context
+        .get(crate::provider_compat::grok_responses::GROK_RESPONSE_TOOL_REFS_REPORT_FIELD)
+        .is_some_and(Value::is_object)
+        && is_openai_responses_family(&provider_api_format)
+        && is_openai_responses_family(&client_api_format)
+    {
+        return Some(FinalizeStreamRewriteMode::GrokResponseTools);
+    }
 
     if !needs_conversion
         && client_consumes_same_private_stream_envelope(
@@ -168,6 +178,7 @@ enum AiSurfaceStreamRewriteState {
         kiro: Box<KiroToClaudeCliStreamState>,
         standard: Box<StreamingStandardFormatMatrix>,
     },
+    GrokResponseTools(Box<GrokResponseToolStreamState>),
 }
 
 pub struct AiSurfaceStreamRewriter<'a> {
@@ -210,6 +221,11 @@ pub fn maybe_build_ai_surface_stream_rewriter<'a>(
                 standard: Box::<StreamingStandardFormatMatrix>::default(),
             }
         }
+        FinalizeStreamRewriteMode::GrokResponseTools => {
+            AiSurfaceStreamRewriteState::GrokResponseTools(Box::new(
+                GrokResponseToolStreamState::new(report_context),
+            ))
+        }
     };
 
     Some(AiSurfaceStreamRewriter {
@@ -238,6 +254,7 @@ impl AiSurfaceStreamRewriter<'_> {
                 let claude_bytes = kiro.push_chunk(self.report_context, chunk)?;
                 transform_standard_bytes(standard, self.report_context, claude_bytes)
             }
+            AiSurfaceStreamRewriteState::GrokResponseTools(state) => state.push_chunk(chunk),
             AiSurfaceStreamRewriteState::EnvelopeUnwrap
             | AiSurfaceStreamRewriteState::ModelDirectiveDisplay
             | AiSurfaceStreamRewriteState::Standard(_) => {
@@ -273,6 +290,7 @@ impl AiSurfaceStreamRewriter<'_> {
                 output.extend(standard.finish(self.report_context)?);
                 Ok(output)
             }
+            AiSurfaceStreamRewriteState::GrokResponseTools(state) => state.finish(),
             AiSurfaceStreamRewriteState::EnvelopeUnwrap
             | AiSurfaceStreamRewriteState::ModelDirectiveDisplay
             | AiSurfaceStreamRewriteState::Standard(_) => {
@@ -309,8 +327,111 @@ impl AiSurfaceStreamRewriter<'_> {
             | AiSurfaceStreamRewriteState::OpenAiImageToOpenAiChat(_)
             | AiSurfaceStreamRewriteState::ClaudeReadToolSanitize(_)
             | AiSurfaceStreamRewriteState::KiroToClaudeCli(_)
-            | AiSurfaceStreamRewriteState::KiroToClaudeCliThenStandard { .. } => Ok(Vec::new()),
+            | AiSurfaceStreamRewriteState::KiroToClaudeCliThenStandard { .. }
+            | AiSurfaceStreamRewriteState::GrokResponseTools(_) => Ok(Vec::new()),
         }
+    }
+}
+
+struct GrokResponseToolStreamState {
+    buffered: Vec<u8>,
+    refs: Value,
+    display_model: Option<String>,
+    custom_output_indexes: BTreeSet<u64>,
+    custom_item_ids: BTreeSet<String>,
+}
+
+impl GrokResponseToolStreamState {
+    fn new(report_context: &Value) -> Self {
+        Self {
+            buffered: Vec::new(),
+            refs: report_context
+                .get(crate::provider_compat::grok_responses::GROK_RESPONSE_TOOL_REFS_REPORT_FIELD)
+                .cloned()
+                .unwrap_or(Value::Null),
+            display_model: model_directive_display_model_from_report_context(report_context),
+            custom_output_indexes: BTreeSet::new(),
+            custom_item_ids: BTreeSet::new(),
+        }
+    }
+
+    fn push_chunk(&mut self, chunk: &[u8]) -> Result<Vec<u8>, AiSurfaceFinalizeError> {
+        self.buffered.extend_from_slice(chunk);
+        let mut output = Vec::new();
+        while let Some(record) = drain_next_sse_record(&mut self.buffered) {
+            output.extend(self.transform_record(record)?);
+        }
+        Ok(output)
+    }
+
+    fn finish(&mut self) -> Result<Vec<u8>, AiSurfaceFinalizeError> {
+        if self.buffered.is_empty() {
+            return Ok(Vec::new());
+        }
+        let record = std::mem::take(&mut self.buffered);
+        self.transform_record(record)
+    }
+
+    fn transform_record(&mut self, record: Vec<u8>) -> Result<Vec<u8>, AiSurfaceFinalizeError> {
+        let Some((event, mut payload)) = parse_sse_record_json(&record) else {
+            return Ok(record);
+        };
+
+        let custom_before_restore = payload
+            .get("item")
+            .and_then(Value::as_object)
+            .and_then(|item| item.get("name").and_then(Value::as_str))
+            .and_then(|name| self.refs.get(name))
+            .and_then(Value::as_object)
+            .is_some_and(|reference| {
+                reference.get("type").and_then(Value::as_str) == Some("custom")
+            });
+        if custom_before_restore {
+            if let Some(index) = payload.get("output_index").and_then(Value::as_u64) {
+                self.custom_output_indexes.insert(index);
+            }
+            if let Some(item) = payload.get("item").and_then(Value::as_object) {
+                for field in ["id", "call_id"] {
+                    if let Some(id) = item.get(field).and_then(Value::as_str) {
+                        self.custom_item_ids.insert(id.to_string());
+                    }
+                }
+            }
+        }
+
+        crate::provider_compat::grok_responses::restore_grok_response_tool_calls(
+            &mut payload,
+            &self.refs,
+        );
+        if let Some(display_model) = self.display_model.as_deref() {
+            rewrite_stream_payload_model(&mut payload, display_model);
+        }
+
+        let is_custom_event = payload
+            .get("output_index")
+            .and_then(Value::as_u64)
+            .is_some_and(|index| self.custom_output_indexes.contains(&index))
+            || ["item_id", "call_id"].iter().any(|field| {
+                payload
+                    .get(*field)
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| self.custom_item_ids.contains(id))
+            });
+        if is_custom_event {
+            if let Some(object) = payload.as_object_mut() {
+                let event_type = object
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if event_type == "response.function_call_arguments.delta" {
+                    return Ok(Vec::new());
+                }
+                if event_type == "response.function_call_arguments.done" {
+                    return Ok(Vec::new());
+                }
+            }
+        }
+        encode_json_sse(event.as_deref(), &payload)
     }
 }
 
@@ -1217,5 +1338,52 @@ data: {"type":"response.completed","response":{"id":"resp_123","model":"gpt-imag
         assert!(final_text.contains("![generated image](data:image/png;base64,aGVsbG8=)"));
         assert!(final_text.contains("data: [DONE]"));
         assert!(!final_text.contains("image_generation.completed"));
+    }
+
+    #[test]
+    fn restores_grok_namespace_and_custom_calls_in_responses_streams() {
+        let report_context = json!({
+            "provider_api_format": "openai:responses",
+            "client_api_format": "openai:responses",
+            "needs_conversion": false,
+            "grok_response_tool_refs": {
+                "multi_agent_v1__spawn_agent": {
+                    "namespace": "multi_agent_v1",
+                    "name": "spawn_agent",
+                    "type": "function"
+                },
+                "multi_agent_v1__apply_patch": {
+                    "namespace": "multi_agent_v1",
+                    "name": "apply_patch",
+                    "type": "custom"
+                }
+            }
+        });
+        assert_eq!(
+            resolve_finalize_stream_rewrite_mode(&report_context),
+            Some(FinalizeStreamRewriteMode::GrokResponseTools)
+        );
+        let mut rewriter = maybe_build_ai_surface_stream_rewriter(Some(&report_context))
+            .expect("grok response tool rewriter should exist");
+        let output = rewriter
+            .push_chunk(
+                br#"event: response.output_item.added
+data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"multi_agent_v1__apply_patch","arguments":"{\"input\":\"*** Begin Patch\"}"}}
+
+event: response.function_call_arguments.done
+data: {"type":"response.function_call_arguments.done","output_index":0,"item_id":"fc_1","arguments":"{\"input\":\"*** Begin Patch\"}"}
+
+event: response.completed
+data: {"type":"response.completed","response":{"output":[{"type":"function_call","name":"multi_agent_v1__spawn_agent","arguments":"{}"}]}}
+
+"#,
+            )
+            .expect("rewrite should succeed");
+        let output = String::from_utf8(output).expect("output should be utf8");
+        assert!(output.contains("\"type\":\"custom_tool_call\""));
+        assert!(output.contains("\"namespace\":\"multi_agent_v1\""));
+        assert!(output.contains("\"name\":\"apply_patch\""));
+        assert!(!output.contains("response.function_call_arguments.done"));
+        assert!(output.contains("\"name\":\"spawn_agent\""));
     }
 }

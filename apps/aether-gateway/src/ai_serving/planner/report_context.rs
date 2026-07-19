@@ -33,6 +33,7 @@ pub(crate) struct LocalExecutionReportContextParts<'a> {
     pub(crate) attempt_identity: ExecutionAttemptIdentity,
     pub(crate) model: &'a str,
     pub(crate) provider_name: &'a str,
+    pub(crate) provider_type: &'a str,
     pub(crate) provider_id: &'a str,
     pub(crate) endpoint_id: &'a str,
     pub(crate) key_id: &'a str,
@@ -86,6 +87,26 @@ pub(crate) fn build_local_execution_report_context(
         parts.original_request_body_base64,
     );
     let mut extra_fields = parts.extra_fields;
+    if parts.provider_type.trim().eq_ignore_ascii_case("grok")
+        && matches!(
+            parts
+                .provider_api_format
+                .trim()
+                .to_ascii_lowercase()
+                .as_str(),
+            "openai:responses" | "openai:responses:compact"
+        )
+    {
+        if let Some(refs) = parts.original_request_body_json.and_then(
+            aether_ai_formats::provider_compat::grok_responses::collect_grok_response_tool_refs,
+        ) {
+            extra_fields.insert(
+                aether_ai_formats::provider_compat::grok_responses::GROK_RESPONSE_TOOL_REFS_REPORT_FIELD
+                    .to_string(),
+                refs,
+            );
+        }
+    }
     if let Some(value) = parts
         .client_session_affinity
         .and_then(client_session_affinity_report_context_value)
@@ -183,6 +204,33 @@ pub(crate) fn build_local_execution_report_context(
     })
 }
 
+pub(crate) fn insert_grok_response_tool_refs(
+    extra_fields: &mut Map<String, Value>,
+    provider_type: &str,
+    provider_api_format: &str,
+    original_request_body: &Value,
+) {
+    if !provider_type.trim().eq_ignore_ascii_case("grok")
+        || !matches!(
+            provider_api_format.trim().to_ascii_lowercase().as_str(),
+            "openai:responses" | "openai:responses:compact"
+        )
+    {
+        return;
+    }
+    if let Some(refs) =
+        aether_ai_formats::provider_compat::grok_responses::collect_grok_response_tool_refs(
+            original_request_body,
+        )
+    {
+        extra_fields.insert(
+            aether_ai_formats::provider_compat::grok_responses::GROK_RESPONSE_TOOL_REFS_REPORT_FIELD
+                .to_string(),
+            refs,
+        );
+    }
+}
+
 fn insert_request_path_fields(
     extra_fields: &mut Map<String, Value>,
     request_path: Option<&str>,
@@ -252,8 +300,8 @@ mod tests {
     use serde_json::{json, Map, Value};
 
     use super::{
-        build_local_execution_report_context, provider_stream_event_api_format_for_provider_type,
-        LocalExecutionReportContextParts,
+        build_local_execution_report_context, insert_grok_response_tool_refs,
+        provider_stream_event_api_format_for_provider_type, LocalExecutionReportContextParts,
     };
     use crate::ai_serving::ExecutionRuntimeAuthContext;
     use crate::ai_serving::RequestOrigin;
@@ -268,6 +316,29 @@ mod tests {
         assert_eq!(
             provider_stream_event_api_format_for_provider_type("CODEX"),
             Some("openai:responses")
+        );
+    }
+
+    #[test]
+    fn grok_report_context_fields_keep_reversible_namespace_tool_refs() {
+        let mut fields = Map::new();
+        insert_grok_response_tool_refs(
+            &mut fields,
+            "grok",
+            "openai:responses",
+            &json!({"tools":[{
+                "type":"namespace",
+                "name":"multi_agent_v1",
+                "tools":[{"type":"function","name":"spawn_agent"}]
+            }]}),
+        );
+        assert_eq!(
+            fields["grok_response_tool_refs"]["multi_agent_v1__spawn_agent"]["namespace"],
+            "multi_agent_v1"
+        );
+        assert_eq!(
+            fields["grok_response_tool_refs"]["multi_agent_v1__spawn_agent"]["name"],
+            "spawn_agent"
         );
     }
 
@@ -309,6 +380,7 @@ mod tests {
                 attempt_identity: ExecutionAttemptIdentity::new(0, 0),
                 model: "gpt-5",
                 provider_name: "OpenAI",
+                provider_type: "openai",
                 provider_id: "provider-1",
                 endpoint_id: "endpoint-1",
                 key_id: "key-1",
@@ -396,6 +468,7 @@ mod tests {
                 attempt_identity: ExecutionAttemptIdentity::new(0, 0),
                 model: "gemini-3.1-flash-image-preview",
                 provider_name: "Gemini",
+                provider_type: "gemini",
                 provider_id: "provider-1",
                 endpoint_id: "endpoint-1",
                 key_id: "key-1",
@@ -471,6 +544,7 @@ mod tests {
                 attempt_identity: ExecutionAttemptIdentity::new(0, 0),
                 model: "gpt-5",
                 provider_name: "OpenAI",
+                provider_type: "openai",
                 provider_id: "provider-1",
                 endpoint_id: "endpoint-1",
                 key_id: "key-1",
