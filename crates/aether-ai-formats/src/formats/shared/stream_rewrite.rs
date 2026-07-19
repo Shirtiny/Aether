@@ -55,9 +55,14 @@ pub fn resolve_finalize_stream_rewrite_mode(
         .trim()
         .to_ascii_lowercase();
 
-    if report_context
+    let has_grok_tool_refs = report_context
         .get(crate::provider_compat::grok_responses::GROK_RESPONSE_TOOL_REFS_REPORT_FIELD)
-        .is_some_and(Value::is_object)
+        .is_some_and(Value::is_object);
+    let filter_grok_internal_x_search = report_context
+        .get(crate::provider_compat::grok_responses::GROK_RESPONSE_INTERNAL_X_SEARCH_REPORT_FIELD)
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if (has_grok_tool_refs || filter_grok_internal_x_search)
         && is_openai_responses_family(&provider_api_format)
         && is_openai_responses_family(&client_api_format)
     {
@@ -337,8 +342,15 @@ struct GrokResponseToolStreamState {
     buffered: Vec<u8>,
     refs: Value,
     display_model: Option<String>,
+    filter_internal_x_search: bool,
+    internal_x_search_filter:
+        crate::provider_compat::grok_responses::GrokInternalXSearchStreamFilter,
     custom_output_indexes: BTreeSet<u64>,
     custom_item_ids: BTreeSet<String>,
+    custom_item_ids_by_key: BTreeMap<String, String>,
+    custom_call_ids_by_key: BTreeMap<String, String>,
+    custom_argument_buffers: BTreeMap<String, String>,
+    custom_delta_emitted: BTreeSet<String>,
 }
 
 impl GrokResponseToolStreamState {
@@ -350,8 +362,19 @@ impl GrokResponseToolStreamState {
                 .cloned()
                 .unwrap_or(Value::Null),
             display_model: model_directive_display_model_from_report_context(report_context),
+            filter_internal_x_search: report_context
+                .get(
+                    crate::provider_compat::grok_responses::GROK_RESPONSE_INTERNAL_X_SEARCH_REPORT_FIELD,
+                )
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            internal_x_search_filter: Default::default(),
             custom_output_indexes: BTreeSet::new(),
             custom_item_ids: BTreeSet::new(),
+            custom_item_ids_by_key: BTreeMap::new(),
+            custom_call_ids_by_key: BTreeMap::new(),
+            custom_argument_buffers: BTreeMap::new(),
+            custom_delta_emitted: BTreeSet::new(),
         }
     }
 
@@ -377,6 +400,17 @@ impl GrokResponseToolStreamState {
             return Ok(record);
         };
 
+        if self.filter_internal_x_search && !self.internal_x_search_filter.apply(&mut payload) {
+            return Ok(Vec::new());
+        }
+
+        let event_type = payload
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let raw_arguments = grok_stream_event_arguments(&payload).map(str::to_string);
+
         let custom_before_restore = payload
             .get("item")
             .and_then(Value::as_object)
@@ -387,16 +421,7 @@ impl GrokResponseToolStreamState {
                 reference.get("type").and_then(Value::as_str) == Some("custom")
             });
         if custom_before_restore {
-            if let Some(index) = payload.get("output_index").and_then(Value::as_u64) {
-                self.custom_output_indexes.insert(index);
-            }
-            if let Some(item) = payload.get("item").and_then(Value::as_object) {
-                for field in ["id", "call_id"] {
-                    if let Some(id) = item.get(field).and_then(Value::as_str) {
-                        self.custom_item_ids.insert(id.to_string());
-                    }
-                }
-            }
+            self.record_custom_item(&payload, raw_arguments.as_deref());
         }
 
         crate::provider_compat::grok_responses::restore_grok_response_tool_calls(
@@ -418,21 +443,213 @@ impl GrokResponseToolStreamState {
                     .is_some_and(|id| self.custom_item_ids.contains(id))
             });
         if is_custom_event {
-            if let Some(object) = payload.as_object_mut() {
-                let event_type = object
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                if event_type == "response.function_call_arguments.delta" {
+            let key = self.custom_event_key(&payload);
+            if event_type == "response.custom_tool_call_input.delta" {
+                if let Some(key) = key {
+                    self.custom_delta_emitted.insert(key);
+                }
+                return encode_json_sse(event.as_deref(), &payload);
+            }
+            if event_type == "response.function_call_arguments.delta" {
+                if let (Some(key), Some(delta)) =
+                    (key, payload.get("delta").and_then(Value::as_str))
+                {
+                    self.custom_argument_buffers
+                        .entry(key)
+                        .or_default()
+                        .push_str(delta);
+                }
+                return Ok(Vec::new());
+            }
+            if event_type == "response.function_call_arguments.done" {
+                if key
+                    .as_ref()
+                    .is_some_and(|key| self.custom_delta_emitted.contains(key))
+                {
                     return Ok(Vec::new());
                 }
-                if event_type == "response.function_call_arguments.done" {
+                let arguments = raw_arguments
+                    .filter(|arguments| !arguments.is_empty())
+                    .or_else(|| {
+                        key.as_ref()
+                            .and_then(|key| self.custom_argument_buffers.get(key).cloned())
+                    });
+                let Some(arguments) = arguments else {
                     return Ok(Vec::new());
+                };
+                return self.encode_custom_input_delta(&payload, key.as_deref(), &arguments, true);
+            }
+            if event_type == "response.output_item.done" {
+                if let Some(key) = key.as_deref() {
+                    if !self.custom_delta_emitted.contains(key) {
+                        let arguments = raw_arguments
+                            .clone()
+                            .or_else(|| self.custom_argument_buffers.get(key).cloned());
+                        if let Some(arguments) = arguments {
+                            let mut output = self.encode_custom_input_delta(
+                                &payload,
+                                Some(key),
+                                &arguments,
+                                false,
+                            )?;
+                            output.extend(encode_json_sse(event.as_deref(), &payload)?);
+                            return Ok(output);
+                        }
+                    }
                 }
             }
         }
         encode_json_sse(event.as_deref(), &payload)
     }
+
+    fn record_custom_item(&mut self, payload: &Value, arguments: Option<&str>) {
+        let Some(key) = grok_stream_event_key(payload) else {
+            return;
+        };
+        if let Some(index) = payload.get("output_index").and_then(Value::as_u64) {
+            self.custom_output_indexes.insert(index);
+        }
+        if let Some(item) = payload.get("item").and_then(Value::as_object) {
+            if let Some(item_id) = item
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+            {
+                self.custom_item_ids.insert(item_id.to_string());
+                self.custom_item_ids_by_key
+                    .insert(key.clone(), item_id.to_string());
+            }
+            if let Some(call_id) = item
+                .get("call_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+            {
+                self.custom_item_ids.insert(call_id.to_string());
+                self.custom_call_ids_by_key
+                    .insert(key.clone(), call_id.to_string());
+            }
+        }
+        if let Some(arguments) = arguments.filter(|arguments| !arguments.is_empty()) {
+            self.custom_argument_buffers
+                .insert(key, arguments.to_string());
+        }
+    }
+
+    fn custom_event_key(&self, payload: &Value) -> Option<String> {
+        if let Some(index) = payload.get("output_index").and_then(Value::as_u64) {
+            return Some(format!("output_index:{index}"));
+        }
+        for (field, known) in [
+            ("item_id", &self.custom_item_ids_by_key),
+            ("call_id", &self.custom_call_ids_by_key),
+        ] {
+            if let Some(id) = payload
+                .get(field)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+            {
+                if let Some((key, _)) = known.iter().find(|(_, known_id)| known_id.as_str() == id) {
+                    return Some(key.clone());
+                }
+            }
+        }
+        grok_stream_event_key(payload)
+    }
+
+    fn encode_custom_input_delta(
+        &mut self,
+        source: &Value,
+        key: Option<&str>,
+        arguments: &str,
+        include_sequence_number: bool,
+    ) -> Result<Vec<u8>, AiSurfaceFinalizeError> {
+        let delta =
+            crate::provider_compat::grok_responses::grok_custom_arguments_to_input(arguments);
+        let mut payload = Map::new();
+        payload.insert(
+            "type".to_string(),
+            Value::String("response.custom_tool_call_input.delta".to_string()),
+        );
+        for field in ["response_id", "output_index"] {
+            if let Some(value) = source.get(field) {
+                payload.insert(field.to_string(), value.clone());
+            }
+        }
+        if include_sequence_number {
+            if let Some(value) = source.get("sequence_number") {
+                payload.insert("sequence_number".to_string(), value.clone());
+            }
+        }
+        let item_id = source
+            .get("item_id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| key.and_then(|key| self.custom_item_ids_by_key.get(key).cloned()));
+        if let Some(item_id) = item_id {
+            payload.insert("item_id".to_string(), Value::String(item_id));
+        }
+        let call_id = source
+            .get("call_id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| key.and_then(|key| self.custom_call_ids_by_key.get(key).cloned()));
+        if let Some(call_id) = call_id {
+            payload.insert("call_id".to_string(), Value::String(call_id));
+        }
+        payload.insert("delta".to_string(), Value::String(delta));
+        if let Some(key) = key {
+            self.custom_delta_emitted.insert(key.to_string());
+            self.custom_argument_buffers.remove(key);
+        }
+        encode_json_sse(
+            Some("response.custom_tool_call_input.delta"),
+            &Value::Object(payload),
+        )
+    }
+}
+
+fn grok_stream_event_key(payload: &Value) -> Option<String> {
+    if let Some(index) = payload.get("output_index").and_then(Value::as_u64) {
+        return Some(format!("output_index:{index}"));
+    }
+    for field in ["item_id", "call_id"] {
+        if let Some(id) = payload
+            .get(field)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        {
+            return Some(format!("{field}:{id}"));
+        }
+    }
+    let item = payload.get("item").and_then(Value::as_object)?;
+    for field in ["id", "call_id"] {
+        if let Some(id) = item
+            .get(field)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        {
+            return Some(format!("item_{field}:{id}"));
+        }
+    }
+    None
+}
+
+fn grok_stream_event_arguments(payload: &Value) -> Option<&str> {
+    payload
+        .get("arguments")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            payload
+                .get("item")
+                .and_then(Value::as_object)
+                .and_then(|item| item.get("arguments"))
+                .and_then(Value::as_str)
+        })
 }
 
 #[derive(Default)]
@@ -1368,10 +1585,19 @@ data: {"type":"response.completed","response":{"id":"resp_123","model":"gpt-imag
         let output = rewriter
             .push_chunk(
                 br#"event: response.output_item.added
-data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"multi_agent_v1__apply_patch","arguments":"{\"input\":\"*** Begin Patch\"}"}}
+data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"multi_agent_v1__apply_patch","arguments":""}}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","item_id":"fc_1","delta":"{\"input\":\"*** Begin"}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","item_id":"fc_1","delta":" Patch\"}"}
 
 event: response.function_call_arguments.done
-data: {"type":"response.function_call_arguments.done","output_index":0,"item_id":"fc_1","arguments":"{\"input\":\"*** Begin Patch\"}"}
+data: {"type":"response.function_call_arguments.done","output_index":0,"item_id":"fc_1","call_id":"call_1"}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"multi_agent_v1__apply_patch","arguments":"{\"input\":\"*** Begin Patch\"}"}}
 
 event: response.completed
 data: {"type":"response.completed","response":{"output":[{"type":"function_call","name":"multi_agent_v1__spawn_agent","arguments":"{}"}]}}
@@ -1383,7 +1609,97 @@ data: {"type":"response.completed","response":{"output":[{"type":"function_call"
         assert!(output.contains("\"type\":\"custom_tool_call\""));
         assert!(output.contains("\"namespace\":\"multi_agent_v1\""));
         assert!(output.contains("\"name\":\"apply_patch\""));
+        assert!(output.contains("response.custom_tool_call_input.delta"));
+        assert!(output.contains("\"delta\":\"*** Begin Patch\""));
+        assert!(output.contains("\"call_id\":\"call_1\""));
+        assert!(output.contains("response.output_item.done"));
+        assert!(output.contains("\"input\":\"*** Begin Patch\""));
+        assert!(!output.contains("response.function_call_arguments.delta"));
         assert!(!output.contains("response.function_call_arguments.done"));
         assert!(output.contains("\"name\":\"spawn_agent\""));
+    }
+
+    #[test]
+    fn filters_internal_x_search_stream_events_and_compacts_output_indexes() {
+        let report_context = json!({
+            "provider_api_format": "openai:responses",
+            "client_api_format": "openai:responses",
+            "needs_conversion": false,
+            "grok_response_internal_x_search": true
+        });
+        assert_eq!(
+            resolve_finalize_stream_rewrite_mode(&report_context),
+            Some(FinalizeStreamRewriteMode::GrokResponseTools)
+        );
+        let mut rewriter = maybe_build_ai_surface_stream_rewriter(Some(&report_context))
+            .expect("grok x_search filter should exist");
+        let output = rewriter
+            .push_chunk(
+                br#"event: response.output_item.added
+data: {"type":"response.output_item.added","output_index":0,"item":{"type":"custom_tool_call","id":"xs_item_1","call_id":"xs_call_1","name":"x_keyword_search","input":"rust"}}
+
+event: response.custom_tool_call_input.delta
+data: {"type":"response.custom_tool_call_input.delta","output_index":0,"item_id":"xs_item_1","call_id":"xs_call_1","delta":"rust"}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","output_index":0,"item":{"type":"custom_tool_call","id":"xs_item_1","call_id":"xs_call_1","name":"x_keyword_search","input":"rust"}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","output_index":1,"item":{"type":"message","id":"msg_1","role":"assistant","content":[]}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","output_index":1,"item_id":"msg_1","content_index":0,"delta":"done"}
+
+event: response.completed
+data: {"type":"response.completed","response":{"output":[{"type":"custom_tool_call","id":"xs_item_1","call_id":"xs_call_1","name":"x_keyword_search","input":"rust"},{"type":"message","id":"msg_1","role":"assistant","content":[]}]}}
+
+"#,
+            )
+            .expect("rewrite should succeed");
+        let output = String::from_utf8(output).expect("output should be utf8");
+
+        assert!(!output.contains("x_keyword_search"));
+        assert!(!output.contains("xs_call_1"));
+        assert!(output.contains("\"output_index\":0"));
+        assert!(!output.contains("\"output_index\":1"));
+        assert!(output.contains("\"id\":\"msg_1\""));
+        assert!(output.contains("response.completed"));
+    }
+
+    #[test]
+    fn restores_custom_input_from_output_item_done_when_argument_events_are_empty() {
+        let report_context = json!({
+            "provider_api_format":"openai:responses",
+            "client_api_format":"openai:responses",
+            "grok_response_tool_refs":{
+                "functions__apply_patch":{
+                    "namespace":"functions",
+                    "name":"apply_patch",
+                    "type":"custom"
+                }
+            }
+        });
+        let mut rewriter = maybe_build_ai_surface_stream_rewriter(Some(&report_context))
+            .expect("grok custom rewriter should exist");
+        let output = rewriter
+            .push_chunk(
+                br#"event: response.output_item.added
+data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"functions__apply_patch","arguments":""}}
+
+event: response.function_call_arguments.done
+data: {"type":"response.function_call_arguments.done","output_index":0,"item_id":"fc_1","call_id":"call_1"}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"functions__apply_patch","arguments":"{\"input\":\"patch body\"}"}}
+
+"#,
+            )
+            .expect("rewrite should succeed");
+        let output = String::from_utf8(output).expect("output should be utf8");
+
+        assert!(output.contains("response.custom_tool_call_input.delta"));
+        assert!(output.contains("\"delta\":\"patch body\""));
+        assert!(output.contains("response.output_item.done"));
+        assert!(!output.contains("response.function_call_arguments.done"));
     }
 }

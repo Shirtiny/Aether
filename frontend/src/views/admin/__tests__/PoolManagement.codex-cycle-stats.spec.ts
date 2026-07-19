@@ -688,6 +688,51 @@ describe('PoolManagement Codex cycle stats mode', () => {
     expect(root.textContent).toContain('生图')
   })
 
+  it('shows Grok static upstream ceilings separately from local cumulative usage', async () => {
+    const grokKey = createPoolKey('grok', {
+      auth_type: 'oauth',
+      status_snapshot: {
+        oauth: { code: 'valid' },
+        account: { code: 'ok', blocked: false },
+        quota: {
+          code: 'ok',
+          exhausted: false,
+          provider_type: 'grok',
+          windows: [
+            {
+              code: 'requests',
+              scope: 'account',
+              remaining_ratio: 1,
+              remaining_value: 480,
+              limit_value: 480,
+              remaining_source: 'upstream_static_ceiling',
+              local_used_value: 151,
+            },
+            {
+              code: 'tokens',
+              scope: 'account',
+              remaining_ratio: 1,
+              remaining_value: 10_000_000,
+              limit_value: 10_000_000,
+              remaining_source: 'upstream_static_ceiling',
+              local_used_value: 163_673,
+            },
+          ],
+        },
+      },
+    })
+    endpointMocks.getPoolOverview.mockResolvedValue({ items: [createOverview('grok')] })
+    endpointMocks.listPoolKeys.mockResolvedValue(createKeyPage(grokKey))
+    endpointMocks.getProvider.mockResolvedValue(createProvider('grok'))
+
+    const root = mountPoolManagement()
+    await settle()
+
+    expect(root.textContent).toContain('请求（上游）')
+    expect(root.textContent).toContain('Token（上游）')
+    expect(root.textContent).toContain('本地累计已用：请求 151 | Token 163673')
+  })
+
   it('opens only one score popover across desktop and mobile layouts', async () => {
     const scoredKey = createPoolKey('codex', {
       pool_score: {

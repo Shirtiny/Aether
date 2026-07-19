@@ -11,9 +11,11 @@ use aether_scheduler_core::{ClientSessionAffinity, SchedulerRankingOutcome};
 use serde_json::{Map, Value};
 
 use crate::ai_serving::{
+    collect_grok_response_tool_refs, grok_response_request_uses_x_search,
     request_origin_from_headers, request_path_implies_stream_request, sanitize_request_path,
     sanitize_request_path_and_query, sanitize_request_query_string, ExecutionRuntimeAuthContext,
-    RequestOrigin,
+    RequestOrigin, GROK_RESPONSE_INTERNAL_X_SEARCH_REPORT_FIELD,
+    GROK_RESPONSE_TOOL_REFS_REPORT_FIELD,
 };
 use crate::client_session_affinity::{
     client_session_affinity_report_context_value, CLIENT_SESSION_AFFINITY_REPORT_CONTEXT_FIELD,
@@ -97,14 +99,16 @@ pub(crate) fn build_local_execution_report_context(
             "openai:responses" | "openai:responses:compact"
         )
     {
-        if let Some(refs) = parts.original_request_body_json.and_then(
-            aether_ai_formats::provider_compat::grok_responses::collect_grok_response_tool_refs,
-        ) {
-            extra_fields.insert(
-                aether_ai_formats::provider_compat::grok_responses::GROK_RESPONSE_TOOL_REFS_REPORT_FIELD
-                    .to_string(),
-                refs,
-            );
+        if let Some(original_request_body) = parts.original_request_body_json {
+            if let Some(refs) = collect_grok_response_tool_refs(original_request_body) {
+                extra_fields.insert(GROK_RESPONSE_TOOL_REFS_REPORT_FIELD.to_string(), refs);
+            }
+            if grok_response_request_uses_x_search(original_request_body) {
+                extra_fields.insert(
+                    GROK_RESPONSE_INTERNAL_X_SEARCH_REPORT_FIELD.to_string(),
+                    Value::Bool(true),
+                );
+            }
         }
     }
     if let Some(value) = parts
@@ -218,15 +222,13 @@ pub(crate) fn insert_grok_response_tool_refs(
     {
         return;
     }
-    if let Some(refs) =
-        aether_ai_formats::provider_compat::grok_responses::collect_grok_response_tool_refs(
-            original_request_body,
-        )
-    {
+    if let Some(refs) = collect_grok_response_tool_refs(original_request_body) {
+        extra_fields.insert(GROK_RESPONSE_TOOL_REFS_REPORT_FIELD.to_string(), refs);
+    }
+    if grok_response_request_uses_x_search(original_request_body) {
         extra_fields.insert(
-            aether_ai_formats::provider_compat::grok_responses::GROK_RESPONSE_TOOL_REFS_REPORT_FIELD
-                .to_string(),
-            refs,
+            GROK_RESPONSE_INTERNAL_X_SEARCH_REPORT_FIELD.to_string(),
+            Value::Bool(true),
         );
     }
 }
@@ -340,6 +342,25 @@ mod tests {
             fields["grok_response_tool_refs"]["multi_agent_v1__spawn_agent"]["name"],
             "spawn_agent"
         );
+    }
+
+    #[test]
+    fn grok_report_context_enables_internal_x_search_response_filter() {
+        let mut fields = Map::new();
+        insert_grok_response_tool_refs(
+            &mut fields,
+            "grok",
+            "openai:responses",
+            &json!({
+                "input":[{
+                    "type":"additional_tools",
+                    "tools":[{"type":"x_search"}]
+                }]
+            }),
+        );
+
+        assert_eq!(fields["grok_response_internal_x_search"], true);
+        assert!(fields.get("grok_response_tool_refs").is_none());
     }
 
     #[test]

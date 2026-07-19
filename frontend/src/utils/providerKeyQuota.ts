@@ -148,6 +148,27 @@ function getQuotaWindowValueText(window: QuotaWindowSnapshot | null | undefined)
   return null
 }
 
+export function isQuotaWindowUpstreamStaticCeiling(
+  window: QuotaWindowSnapshot | null | undefined,
+): boolean {
+  return normalizeText(window?.remaining_source)?.toLowerCase() === 'upstream_static_ceiling'
+}
+
+function getQuotaWindowLocalUsedValue(
+  window: QuotaWindowSnapshot | null | undefined,
+): number | null {
+  if (!isQuotaWindowUpstreamStaticCeiling(window)) return null
+  const value = finiteNumber(window?.local_used_value)
+  return value != null && value >= 0 ? value : null
+}
+
+function getQuotaWindowLocalUsageText(
+  window: QuotaWindowSnapshot | null | undefined,
+): string | null {
+  const localUsed = getQuotaWindowLocalUsedValue(window)
+  return localUsed == null ? null : `本地累计已用 ${formatQuotaValue(localUsed)}`
+}
+
 function getGeminiCliCreditsTextFromQuota(quota: QuotaStatusSnapshot | null | undefined): string | null {
   const credits = quota?.credits
   if (!credits) return null
@@ -298,7 +319,10 @@ function getGrokQuotaText(quota: QuotaStatusSnapshot): string | null {
       const remainingPercent = getQuotaWindowRemainingPercent(window)
       if (remainingPercent == null) return null
       const valueText = getQuotaWindowValueText(window)
-      return `${label}剩余 ${formatPercent(remainingPercent)}${valueText ? ` (${valueText})` : ''}`
+      const staticCeiling = isQuotaWindowUpstreamStaticCeiling(window)
+      const details = [valueText, getQuotaWindowLocalUsageText(window)]
+        .filter((value): value is string => value != null)
+      return `${label}${staticCeiling ? '上游' : ''}剩余 ${formatPercent(remainingPercent)}${details.length > 0 ? ` (${details.join(', ')})` : ''}`
     })
     .filter((value): value is string => value != null)
   if (dimensionParts.length > 0) return dimensionParts.join(' | ')
@@ -321,6 +345,26 @@ function getGrokQuotaText(quota: QuotaStatusSnapshot): string | null {
   }
 
   return normalizeText(quota.label)
+}
+
+export function getGrokLocalUsageObservationText(
+  input: ProviderKeyQuotaCarrier,
+  fallbackProviderType?: string | null,
+): string | null {
+  const quota = getQuotaSnapshot(input)
+  if (getQuotaProviderType(quota, fallbackProviderType) !== 'grok') return null
+
+  const parts = ([
+    ['请求', 'requests'],
+    ['Token', 'tokens'],
+  ] as const)
+    .map(([label, code]) => {
+      const localUsed = getQuotaWindowLocalUsedValue(getQuotaWindow(quota, code))
+      return localUsed == null ? null : `${label} ${formatQuotaValue(localUsed)}`
+    })
+    .filter((value): value is string => value != null)
+
+  return parts.length > 0 ? `本地累计已用：${parts.join(' | ')}` : null
 }
 
 function getWindsurfQuotaText(quota: QuotaStatusSnapshot): string | null {

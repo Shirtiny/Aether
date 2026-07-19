@@ -2273,7 +2273,7 @@ async fn gateway_routes_grok_responses_admin_pool_model_test_through_the_cli_cha
             );
             assert_eq!(
                 plan.headers.get("user-agent").map(String::as_str),
-                Some("xai-grok-workspace/0.2.93")
+                Some("xai-grok-workspace/0.2.103")
             );
             assert!(plan.headers.contains_key("x-grok-client-version"));
             let upstream_body = if plan.provider_api_format == "openai:responses" {

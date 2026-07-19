@@ -146,4 +146,8 @@ pub(crate) use aether_ai_formats::api::{
     OPENAI_VIDEO_CREATE_SYNC_PLAN_KIND, OPENAI_VIDEO_DELETE_SYNC_PLAN_KIND,
     OPENAI_VIDEO_REMIX_SYNC_PLAN_KIND,
 };
+pub(crate) use aether_ai_formats::provider_compat::grok_responses::{
+    collect_grok_response_tool_refs, grok_response_request_uses_x_search,
+    GROK_RESPONSE_INTERNAL_X_SEARCH_REPORT_FIELD, GROK_RESPONSE_TOOL_REFS_REPORT_FIELD,
+};
 pub(crate) use aether_ai_formats::{is_embedding_api_format, is_rerank_api_format};

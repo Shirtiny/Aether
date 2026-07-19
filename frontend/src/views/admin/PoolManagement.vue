@@ -1729,8 +1729,10 @@ import {
 } from '@/utils/providerKeyStatus'
 import {
   getGeminiCliAccountCreditsText,
+  getGrokLocalUsageObservationText,
   getLegacyAccountQuotaText,
   getQuotaDisplayText,
+  isQuotaWindowUpstreamStaticCeiling,
 } from '@/utils/providerKeyQuota'
 
 type PoolKeyScore = NonNullable<PoolKeyDetail['pool_score']>
@@ -3998,6 +4000,8 @@ function getQuotaFallbackText(key: PoolKeyDetail): string | null {
 }
 
 function getAccountQuotaText(key: PoolKeyDetail): string | null {
+  const grokLocalUsageText = getGrokLocalUsageObservationText(key, selectedProviderType.value)
+  if (grokLocalUsageText) return grokLocalUsageText
   return getGeminiCliAccountCreditsText(key, selectedProviderType.value)
 }
 
@@ -4286,8 +4290,9 @@ function buildQuotaProgressItemsFromSnapshot(key: PoolKeyDetail): QuotaProgressI
       .map(([label, window]): QuotaProgressItem | null => {
         const remainingPercent = getQuotaWindowRemainingPercent(window)
         if (remainingPercent == null) return null
+        const staticCeiling = isQuotaWindowUpstreamStaticCeiling(window)
         return {
-          label,
+          label: staticCeiling ? `${label}（上游）` : label,
           remainingPercent,
           detail: getQuotaWindowValueText(window),
           resetAtSeconds: normalizeUnixSeconds(window?.reset_at ?? quotaResetAtSeconds ?? null),

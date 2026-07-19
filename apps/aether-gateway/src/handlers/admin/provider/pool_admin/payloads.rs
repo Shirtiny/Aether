@@ -495,10 +495,11 @@ fn admin_pool_apply_codex_window_usage_summaries(
 
 /// The Grok CLI chat proxy currently reports request/token rate-limit headers
 /// with `remaining == limit` and no reset timestamp on every successful
-/// response. Those values describe a static ceiling rather than a consumable
-/// balance. Project the key's locally settled usage into those windows for the
-/// admin UI, while retaining the raw upstream value for diagnostics.
-fn admin_pool_apply_grok_local_usage_estimate(
+/// response. Those values are an upstream static ceiling, while the key usage
+/// counters are lifetime totals rather than usage in an authoritative reset
+/// window. Keep the upstream remaining/exhaustion semantics intact and attach
+/// the local settled totals only as a changing observation for the admin UI.
+fn admin_pool_attach_grok_local_usage_observation(
     status_snapshot: &mut serde_json::Value,
     request_count: u64,
     total_tokens: u64,
@@ -516,8 +517,7 @@ fn admin_pool_apply_grok_local_usage_estimate(
         return;
     };
 
-    let mut projected_usage_ratio: Option<f64> = None;
-    let mut projected_exhausted = false;
+    let mut observed_static_ceiling = false;
     for window in windows
         .iter_mut()
         .filter_map(serde_json::Value::as_object_mut)
@@ -529,8 +529,8 @@ fn admin_pool_apply_grok_local_usage_estimate(
             .unwrap_or_default()
             .to_ascii_lowercase();
         let locally_used = match code.as_str() {
-            "requests" => request_count as f64,
-            "tokens" => total_tokens as f64,
+            "requests" => request_count,
+            "tokens" => total_tokens,
             _ => continue,
         };
         window.insert(
@@ -564,39 +564,18 @@ fn admin_pool_apply_grok_local_usage_estimate(
             continue;
         }
 
-        let used = locally_used.max(0.0);
-        let remaining = (limit - used).max(0.0);
-        let used_ratio = (used / limit).clamp(0.0, 1.0);
-        let remaining_ratio = (remaining / limit).clamp(0.0, 1.0);
-        let exhausted = remaining <= 0.0;
-        window.insert(
-            "upstream_remaining_value".to_string(),
-            json!(upstream_remaining),
-        );
         window.insert(
             "remaining_source".to_string(),
-            json!("local_usage_estimate"),
+            json!("upstream_static_ceiling"),
         );
-        window.insert("used_value".to_string(), json!(used));
-        window.insert("used_ratio".to_string(), json!(used_ratio));
-        window.insert("remaining".to_string(), json!(remaining));
-        window.insert("remaining_value".to_string(), json!(remaining));
-        window.insert("remaining_ratio".to_string(), json!(remaining_ratio));
-        window.insert("is_exhausted".to_string(), json!(exhausted));
-        projected_usage_ratio = Some(
-            projected_usage_ratio
-                .map(|current| current.max(used_ratio))
-                .unwrap_or(used_ratio),
-        );
-        projected_exhausted |= exhausted;
+        window.insert("local_used_value".to_string(), json!(locally_used));
+        observed_static_ceiling = true;
     }
 
-    if let Some(usage_ratio) = projected_usage_ratio {
-        quota.insert("usage_ratio".to_string(), json!(usage_ratio));
-        quota.insert("exhausted".to_string(), json!(projected_exhausted));
+    if observed_static_ceiling {
         quota.insert(
             "usage_source".to_string(),
-            json!("local_settled_usage_estimate"),
+            json!("local_settled_usage_observation"),
         );
     }
 }
@@ -907,18 +886,31 @@ fn admin_pool_build_grok_account_quota_from_snapshot(
         .filter_map(|(label, code)| {
             let window = admin_pool_quota_window(quota_snapshot, code)?;
             let remaining_percent = admin_pool_quota_window_remaining_percent(window)?;
-            let qualifier = window
+            let upstream_static_ceiling = window
                 .get("remaining_source")
                 .and_then(serde_json::Value::as_str)
-                .is_some_and(|source| source.eq_ignore_ascii_case("local_usage_estimate"))
-                .then_some("估算")
+                .is_some_and(|source| source.eq_ignore_ascii_case("upstream_static_ceiling"));
+            let qualifier = upstream_static_ceiling
+                .then_some("上游")
                 .unwrap_or_default();
             let mut part = format!(
                 "{label}{qualifier}剩余 {}",
                 admin_pool_format_percent(remaining_percent)
             );
             if let Some(value_text) = admin_pool_quota_window_value_text(window) {
-                part.push_str(&format!(" ({value_text})"));
+                if upstream_static_ceiling {
+                    if let Some(local_used) = admin_pool_json_to_f64(window.get("local_used_value"))
+                    {
+                        part.push_str(&format!(
+                            " ({value_text}, 本地累计已用 {})",
+                            admin_pool_format_quota_value(local_used)
+                        ));
+                    } else {
+                        part.push_str(&format!(" ({value_text})"));
+                    }
+                } else {
+                    part.push_str(&format!(" ({value_text})"));
+                }
             }
             Some(part)
         })
@@ -1310,7 +1302,7 @@ pub(super) fn build_admin_pool_key_payload(
             now_unix_secs,
         );
     } else if provider_type.trim().eq_ignore_ascii_case("grok") {
-        admin_pool_apply_grok_local_usage_estimate(
+        admin_pool_attach_grok_local_usage_observation(
             &mut status_snapshot,
             u64::from(key.request_count.unwrap_or_default()),
             key.total_tokens,
@@ -1760,7 +1752,7 @@ mod tests {
     }
 
     #[test]
-    fn grok_static_full_headers_use_local_settled_usage_for_display() {
+    fn grok_static_full_headers_show_local_usage_without_projecting_remaining() {
         let mut status_snapshot = json!({
             "quota": {
                 "provider_type": "grok",
@@ -1796,21 +1788,28 @@ mod tests {
             }
         });
 
-        admin_pool_apply_grok_local_usage_estimate(&mut status_snapshot, 151, 163_673);
+        admin_pool_attach_grok_local_usage_observation(&mut status_snapshot, 151, 163_673);
 
         let quota = status_snapshot["quota"].as_object().expect("quota");
-        assert_eq!(quota["usage_source"], json!("local_settled_usage_estimate"));
-        assert_eq!(quota["windows"][0]["remaining_value"], json!(329.0));
         assert_eq!(
-            quota["windows"][0]["upstream_remaining_value"],
-            json!(480.0)
+            quota["usage_source"],
+            json!("local_settled_usage_observation")
         );
-        assert_eq!(quota["windows"][1]["remaining_value"], json!(9_836_327.0));
+        assert_eq!(quota["usage_ratio"], json!(0.0));
+        assert_eq!(quota["exhausted"], json!(false));
+        assert_eq!(quota["windows"][0]["remaining_value"], json!(480));
+        assert_eq!(
+            quota["windows"][0]["remaining_source"],
+            json!("upstream_static_ceiling")
+        );
+        assert_eq!(quota["windows"][0]["local_used_value"], json!(151));
+        assert_eq!(quota["windows"][1]["remaining_value"], json!(10_000_000));
+        assert_eq!(quota["windows"][1]["local_used_value"], json!(163_673));
         assert_eq!(quota["windows"][1]["usage"]["total_tokens"], json!(163_673));
         assert_eq!(
             admin_pool_build_account_quota("grok", Some(quota)),
             Some(
-                "请求估算剩余 68.5% (329/480) | Token估算剩余 98.4% (9836327/10000000)".to_string()
+                "请求上游剩余 100.0% (480/480, 本地累计已用 151) | Token上游剩余 100.0% (10000000/10000000, 本地累计已用 163673)".to_string()
             )
         );
     }
@@ -1832,11 +1831,12 @@ mod tests {
             }
         });
 
-        admin_pool_apply_grok_local_usage_estimate(&mut status_snapshot, 90, 1_000);
+        admin_pool_attach_grok_local_usage_observation(&mut status_snapshot, 90, 1_000);
 
         let requests = &status_snapshot["quota"]["windows"][0];
         assert_eq!(requests["remaining_value"], json!(40));
-        assert!(requests.get("upstream_remaining_value").is_none());
+        assert!(requests.get("remaining_source").is_none());
+        assert!(requests.get("local_used_value").is_none());
         assert_eq!(requests["usage"]["request_count"], json!(90));
     }
 }

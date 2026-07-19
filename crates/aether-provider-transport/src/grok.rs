@@ -202,7 +202,11 @@ pub fn apply_grok_xai_responses_body_edits(
         .and_then(Value::as_str)
         .is_some_and(|model| model.trim().eq_ignore_ascii_case("grok-4.5"));
     if let Some(object) = body.as_object_mut() {
-        for field in ["prompt_cache_retention", "safety_identifier"] {
+        for field in [
+            "prompt_cache_retention",
+            "safety_identifier",
+            "stream_options",
+        ] {
             object.remove(field);
         }
         if is_grok_45 {
@@ -220,20 +224,60 @@ pub fn apply_grok_xai_responses_body_edits(
     aether_ai_formats::provider_compat::grok_responses::normalize_grok_responses_request_tools(
         body,
     );
-    remove_grok_xai_field_recursively(body, "external_web_access");
+    sanitize_grok_xai_responses_tool_fields(body);
+    remove_grok_xai_field_outside_schemas(body, "external_web_access");
 }
 
-fn remove_grok_xai_field_recursively(value: &mut Value, field: &str) {
+/// Remove only tool-declaration fields that xAI documents as request-rejected.
+fn sanitize_grok_xai_responses_tool_fields(body: &mut Value) {
+    let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for tool in tools.iter_mut().filter_map(Value::as_object_mut) {
+        match tool
+            .get("type")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default()
+        {
+            "web_search" => {
+                for field in [
+                    "external_web_access",
+                    "search_context_size",
+                    "user_location",
+                ] {
+                    tool.remove(field);
+                }
+            }
+            "file_search" => {
+                for field in ["filters", "ranking_options"] {
+                    tool.remove(field);
+                }
+            }
+            "code_interpreter" => {
+                tool.remove("container");
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Preserve the existing compatibility cleanup for misplaced
+/// `external_web_access` fields while leaving JSON Schema property names intact.
+fn remove_grok_xai_field_outside_schemas(value: &mut Value, field: &str) {
     match value {
         Value::Object(object) => {
             object.remove(field);
-            for child in object.values_mut() {
-                remove_grok_xai_field_recursively(child, field);
+            for (key, child) in object.iter_mut() {
+                if matches!(key.as_str(), "parameters" | "schema") {
+                    continue;
+                }
+                remove_grok_xai_field_outside_schemas(child, field);
             }
         }
         Value::Array(items) => {
             for item in items {
-                remove_grok_xai_field_recursively(item, field);
+                remove_grok_xai_field_outside_schemas(item, field);
             }
         }
         _ => {}
@@ -470,6 +514,7 @@ mod tests {
             }],
             "prompt_cache_retention": "24h",
             "safety_identifier": "user-1",
+            "stream_options": {"reasoning_summary_delivery":"sequential_cutoff"},
             "presence_penalty": 0.2,
             "frequency_penalty": 0.3,
             "stop": ["done"]
@@ -479,6 +524,7 @@ mod tests {
 
         assert!(body.get("prompt_cache_retention").is_none());
         assert!(body.get("safety_identifier").is_none());
+        assert!(body.get("stream_options").is_none());
         assert!(body.get("presence_penalty").is_none());
         assert!(body.get("frequency_penalty").is_none());
         assert!(body.get("stop").is_none());
@@ -501,6 +547,8 @@ mod tests {
                     "tools":[{"type":"function","name":"spawn_agent"}]
                 },
                 {"type":"custom","name":"unsupported_custom"},
+                {"type":"tool_search"},
+                {"type":"computer_use_preview"},
                 {"type":"web_search"}
             ],
             "tool_choice": {"type":"namespace","name":"multi_agent_v1"}
@@ -518,6 +566,110 @@ mod tests {
             ])
         );
         assert_eq!(body["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn simplifies_function_parameter_schemas_rejected_by_xai_responses() {
+        let mut body = serde_json::json!({
+            "model": "grok-4.5",
+            "input": "hello",
+            "tools": [{
+                "type":"namespace",
+                "name":"codex_app",
+                "tools":[{
+                    "type":"function",
+                    "name":"automation_update",
+                    "strict":true,
+                    "parameters":{
+                        "oneOf":[
+                            {"$ref":"#/$defs/create"},
+                            {"type":"null"}
+                        ]
+                    }
+                }]
+            }]
+        });
+
+        apply_grok_xai_responses_body_edits(&mut body, "grok", "openai:responses");
+
+        assert_eq!(body["tools"][0]["name"], "codex_app__automation_update");
+        assert_eq!(
+            body["tools"][0]["parameters"],
+            serde_json::json!({
+                "type":"object",
+                "properties":{},
+                "additionalProperties":true
+            })
+        );
+        assert_eq!(body["tools"][0]["strict"], false);
+    }
+
+    #[test]
+    fn removes_only_xai_rejected_tool_options_without_mutating_user_data() {
+        let mut body = serde_json::json!({
+            "model":"grok-4.5",
+            "input":[{
+                "role":"user",
+                "content":[{
+                    "type":"input_text",
+                    "text":"{\"external_web_access\":true,\"filters\":{\"keep\":true}}"
+                }]
+            }, {
+                "type":"function_call",
+                "name":"lookup",
+                "call_id":"call_1",
+                "arguments":"{\"external_web_access\":true}"
+            }],
+            "tools":[
+                {
+                    "type":"web_search",
+                    "external_web_access":true,
+                    "search_context_size":"high",
+                    "user_location":{"type":"approximate","country":"US"},
+                    "allowed_domains":["example.com"]
+                },
+                {
+                    "type":"file_search",
+                    "vector_store_ids":["collection_1"],
+                    "filters":{"type":"eq"},
+                    "ranking_options":{"ranker":"auto"}
+                },
+                {
+                    "type":"code_interpreter",
+                    "container":{"type":"auto"}
+                },
+                {
+                    "type":"function",
+                    "name":"lookup",
+                    "parameters":{
+                        "type":"object",
+                        "properties":{"external_web_access":{"type":"boolean"}}
+                    }
+                }
+            ]
+        });
+
+        apply_grok_xai_responses_body_edits(&mut body, "grok", "openai:responses");
+
+        assert!(body["tools"][0].get("external_web_access").is_none());
+        assert!(body["tools"][0].get("search_context_size").is_none());
+        assert!(body["tools"][0].get("user_location").is_none());
+        assert_eq!(body["tools"][0]["allowed_domains"][0], "example.com");
+        assert!(body["tools"][1].get("filters").is_none());
+        assert!(body["tools"][1].get("ranking_options").is_none());
+        assert!(body["tools"][2].get("container").is_none());
+        assert_eq!(
+            body["tools"][3]["parameters"]["properties"]["external_web_access"]["type"],
+            "boolean"
+        );
+        assert!(body["input"][0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("external_web_access"));
+        assert!(body["input"][1]["arguments"]
+            .as_str()
+            .unwrap()
+            .contains("external_web_access"));
     }
 
     #[test]

@@ -284,15 +284,38 @@ pub fn maybe_build_standard_sync_finalize_product_from_normalized_payload(
     let grok_tool_refs = report_context.and_then(|context| {
         context.get(crate::provider_compat::grok_responses::GROK_RESPONSE_TOOL_REFS_REPORT_FIELD)
     });
+    let filter_grok_internal_x_search = report_context
+        .and_then(|context| {
+            context.get(
+                crate::provider_compat::grok_responses::GROK_RESPONSE_INTERNAL_X_SEARCH_REPORT_FIELD,
+            )
+        })
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let rewrite_grok_response = grok_tool_refs.is_some() || filter_grok_internal_x_search;
     let mut restored_body_json = body_json.cloned();
-    if let (Some(body), Some(refs)) = (restored_body_json.as_mut(), grok_tool_refs) {
-        crate::provider_compat::grok_responses::restore_grok_response_tool_calls(body, refs);
+    if rewrite_grok_response {
+        if let Some(body) = restored_body_json.as_mut() {
+            if filter_grok_internal_x_search {
+                crate::provider_compat::grok_responses::filter_grok_internal_x_search_tool_calls(
+                    body,
+                );
+            }
+            if let Some(refs) = grok_tool_refs {
+                crate::provider_compat::grok_responses::restore_grok_response_tool_calls(
+                    body, refs,
+                );
+            }
+        }
     }
-    let restored_body_base64 = match (body_base64, grok_tool_refs) {
-        (Some(encoded), Some(refs)) => {
+    let empty_grok_tool_refs = Value::Null;
+    let restored_body_base64 = match (body_base64, rewrite_grok_response) {
+        (Some(encoded), true) => {
             let bytes = base64::engine::general_purpose::STANDARD.decode(encoded)?;
             let restored = crate::provider_compat::grok_responses::restore_grok_response_sse_bytes(
-                &bytes, refs,
+                &bytes,
+                grok_tool_refs.unwrap_or(&empty_grok_tool_refs),
+                filter_grok_internal_x_search,
             );
             Some(base64::engine::general_purpose::STANDARD.encode(restored))
         }
@@ -4644,6 +4667,66 @@ mod tests {
                 provider_body_json
             ))
         );
+    }
+
+    #[test]
+    fn standard_sync_finalize_restores_grok_tools_and_hides_internal_x_search() {
+        let report_context = json!({
+            "provider_api_format":"openai:responses",
+            "client_api_format":"openai:responses",
+            "needs_conversion":false,
+            "grok_response_internal_x_search":true,
+            "grok_response_tool_refs":{
+                "multi_agent_v1__apply_patch":{
+                    "namespace":"multi_agent_v1",
+                    "name":"apply_patch",
+                    "type":"custom"
+                }
+            }
+        });
+        let provider_body_json = json!({
+            "id":"resp_grok_123",
+            "object":"response",
+            "status":"completed",
+            "output":[
+                {
+                    "type":"custom_tool_call",
+                    "call_id":"xs_call_1",
+                    "name":"x_keyword_search",
+                    "input":"rust"
+                },
+                {
+                    "type":"function_call",
+                    "call_id":"call_1",
+                    "name":"multi_agent_v1__apply_patch",
+                    "arguments":"{\"input\":\"*** Begin Patch\"}"
+                },
+                {
+                    "type":"message",
+                    "role":"assistant",
+                    "content":[]
+                }
+            ]
+        });
+
+        let product = maybe_build_standard_sync_finalize_product_from_normalized_payload(
+            "openai_responses_sync_finalize",
+            200,
+            Some(&report_context),
+            Some(&provider_body_json),
+            None,
+        )
+        .expect("dispatch should succeed")
+        .expect("dispatch should produce a body");
+
+        let StandardSyncFinalizeNormalizedProduct::SuccessBody(body) = product else {
+            panic!("same-family Grok response should remain a success body")
+        };
+        assert_eq!(body["output"].as_array().unwrap().len(), 2);
+        assert_eq!(body["output"][0]["type"], "custom_tool_call");
+        assert_eq!(body["output"][0]["namespace"], "multi_agent_v1");
+        assert_eq!(body["output"][0]["name"], "apply_patch");
+        assert_eq!(body["output"][0]["input"], "*** Begin Patch");
     }
 
     #[test]

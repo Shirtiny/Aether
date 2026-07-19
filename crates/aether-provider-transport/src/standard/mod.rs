@@ -430,11 +430,11 @@ mod tests {
                 .headers
                 .get("x-grok-client-version")
                 .map(String::as_str),
-            Some("0.2.93")
+            Some("0.2.103")
         );
         assert_eq!(
             resolved.headers.get("user-agent").map(String::as_str),
-            Some("xai-grok-workspace/0.2.93")
+            Some("xai-grok-workspace/0.2.103")
         );
     }
 

@@ -20,6 +20,7 @@ export interface AccountStatusSnapshot {
 }
 
 export interface QuotaWindowUsageSnapshot {
+  source?: string | null
   request_count?: number | null
   total_tokens?: number | null
   total_cost_usd?: number | string | null
@@ -39,6 +40,10 @@ export interface QuotaWindowSnapshot {
   /** Provider-native aliases retained by xAI quota observations. */
   remaining?: number | null
   limit?: number | null
+  /** Indicates that the upstream value is a static ceiling, not a decrementing balance. */
+  remaining_source?: string | null
+  /** Locally settled lifetime usage shown separately from upstream quota semantics. */
+  local_used_value?: number | null
   reset_at?: number | null
   reset_seconds?: number | null
   window_minutes?: number | null
@@ -66,6 +71,7 @@ export interface QuotaStatusSnapshot {
   reason?: string | null
   freshness?: 'fresh' | 'stale' | 'unknown' | 'error' | string | null
   source?: string | null
+  usage_source?: string | null
   observed_at?: number | null
   exhausted: boolean
   usage_ratio?: number | null

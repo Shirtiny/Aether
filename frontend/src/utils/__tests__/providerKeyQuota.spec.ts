@@ -136,6 +136,42 @@ describe('providerKeyQuota', () => {
     }, 'grok')).toBe('请求剩余 40.0% (40/100) | Token剩余 25.0% (250/1000)')
   })
 
+  it('separates Grok static upstream ceilings from locally settled lifetime usage', () => {
+    const input = {
+      status_snapshot: {
+        quota: {
+          provider_type: 'grok',
+          code: 'ok',
+          exhausted: false,
+          windows: [
+            {
+              code: 'requests',
+              scope: 'account',
+              remaining_ratio: 1,
+              remaining_value: 480,
+              limit_value: 480,
+              remaining_source: 'upstream_static_ceiling',
+              local_used_value: 151,
+            },
+            {
+              code: 'tokens',
+              scope: 'account',
+              remaining_ratio: 1,
+              remaining_value: 10_000_000,
+              limit_value: 10_000_000,
+              remaining_source: 'upstream_static_ceiling',
+              local_used_value: 163_673,
+            },
+          ],
+        },
+      },
+    }
+
+    expect(getQuotaDisplayText(input, 'grok')).toBe(
+      '请求上游剩余 100.0% (480/480, 本地累计已用 151) | Token上游剩余 100.0% (10000000/10000000, 本地累计已用 163673)',
+    )
+  })
+
   it('formats Gemini CLI AI credits from status snapshot and upstream metadata', () => {
     expect(getQuotaDisplayText({
       status_snapshot: {
