@@ -15,9 +15,9 @@ use super::protocol::{
     FIRST_FRAME_TIMEOUT, MAX_PUBLIC_CLIENT_PAYLOAD_BYTES,
 };
 use super::runtime::{
-    CodexWsCandidate, CodexWsRuntimePort, CodexWsTimeouts, ConnectedCandidate, RelayFrame,
-    RelayPeer, StepExecutionGuard, StepExecutionLeaseStatus, StepPreparationError,
-    UsageReportReservation,
+    CodexWsCandidate, CodexWsRuntimePort, CodexWsStepUsageContext, CodexWsTimeouts,
+    ConnectedCandidate, RelayFrame, RelayPeer, StepExecutionGuard, StepExecutionLeaseStatus,
+    StepPreparationError, UsageReportReservation,
 };
 use super::CodexWsStepDisposition;
 
@@ -173,6 +173,79 @@ impl Drop for CandidateAttemptGuard<'_> {
     }
 }
 
+struct StepUsageLifecycleGuard<'a> {
+    runtime: &'a dyn CodexWsRuntimePort,
+    usage_context: Option<CodexWsStepUsageContext>,
+    started_at: tokio::time::Instant,
+}
+
+impl<'a> StepUsageLifecycleGuard<'a> {
+    fn new(runtime: &'a dyn CodexWsRuntimePort, started_at: tokio::time::Instant) -> Self {
+        Self {
+            runtime,
+            usage_context: None,
+            started_at,
+        }
+    }
+
+    fn bind(&mut self, candidate: &CodexWsCandidate, step: &ResponseCreateStep) {
+        let usage_context = CodexWsStepUsageContext::new(candidate, step);
+        if self.usage_context.is_none() {
+            self.runtime.record_step_pending(&usage_context);
+        }
+        self.usage_context = Some(usage_context);
+    }
+
+    fn started_at(&self) -> tokio::time::Instant {
+        self.started_at
+    }
+
+    fn reject(
+        mut self,
+        status_code: u16,
+        error_type: &'static str,
+        error_message: &'static str,
+        cancelled: bool,
+    ) {
+        self.record_rejection(status_code, error_type, error_message, cancelled);
+    }
+
+    fn disarm(mut self) {
+        self.usage_context = None;
+    }
+
+    fn record_rejection(
+        &mut self,
+        status_code: u16,
+        error_type: &'static str,
+        error_message: &'static str,
+        cancelled: bool,
+    ) {
+        let Some(usage_context) = self.usage_context.take() else {
+            return;
+        };
+        self.runtime.record_step_rejected(
+            usage_context,
+            self.started_at.elapsed(),
+            status_code,
+            error_type,
+            error_message,
+            cancelled,
+        );
+    }
+}
+
+impl Drop for StepUsageLifecycleGuard<'_> {
+    fn drop(&mut self) {
+        self.record_rejection(
+            499,
+            "codex_ws_step_cancelled_before_execution",
+            "Codex WebSocket step was cancelled before provider execution",
+            true,
+        );
+    }
+}
+
 struct StepSettlementGuard<'a> {
     runtime: &'a dyn CodexWsRuntimePort,
     candidate: &'a CodexWsCandidate,
@@ -204,14 +277,6 @@ impl<'a> StepSettlementGuard<'a> {
             first_dispatch,
             first_byte_elapsed: None,
         }
-    }
-
-    fn record_pending(&self) {
-        let Some(usage_report) = self.usage_report.as_ref() else {
-            return;
-        };
-        self.runtime
-            .record_step_pending(self.candidate, self.step, usage_report);
     }
 
     fn record_stream_started(&mut self, first_byte_elapsed: Duration) {
@@ -340,6 +405,7 @@ pub(crate) async fn run_codex_ws_session(
                 return;
             }
         };
+    let first_step_started = tokio::time::Instant::now();
     let first_step =
         match parse_response_create_with_cpu_budget(first_text, OwnedResponseCreateContext::First)
             .await
@@ -377,6 +443,7 @@ pub(crate) async fn run_codex_ws_session(
     let initial_connect_budget = initial_connect_budget(&candidates);
     let initial_connect_deadline = tokio::time::Instant::now() + initial_connect_budget;
     let mut remaining_candidates = RemainingCandidatesGuard::new(runtime, candidates);
+    let mut step_usage = StepUsageLifecycleGuard::new(runtime, first_step_started);
     let mut connected = None;
     let mut last_connect_error = None;
     loop {
@@ -389,6 +456,7 @@ pub(crate) async fn run_codex_ws_session(
         let Some(candidate) = remaining_candidates.next() else {
             break;
         };
+        step_usage.bind(&candidate, &first_step);
         let connect_result = match tokio::time::timeout_at(
             initial_connect_deadline,
             connect_candidate_while_client_open(&mut client, runtime, candidate),
@@ -396,7 +464,15 @@ pub(crate) async fn run_codex_ws_session(
         .await
         {
             Ok(Some(connect_result)) => connect_result,
-            Ok(None) => return,
+            Ok(None) => {
+                step_usage.reject(
+                    499,
+                    "codex_ws_client_disconnected_while_connecting",
+                    "client disconnected while the provider WebSocket was connecting",
+                    true,
+                );
+                return;
+            }
             Err(_) => {
                 last_connect_error = Some(StepPreparationError::retain(
                     "initial_connect_budget_exhausted",
@@ -421,6 +497,12 @@ pub(crate) async fn run_codex_ws_session(
                 last_connect_error.map(|error| (error.reason, error.middle_route_disposition))
             })
             .unwrap_or(("candidate_unavailable", MiddleRouteDisposition::Retain));
+        step_usage.reject(
+            http::StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+            reason,
+            "no official Codex WebSocket candidate could be connected",
+            false,
+        );
         send_not_executed_control(&mut client, &first_step, reason, middle_route_disposition).await;
         return;
     };
@@ -433,6 +515,12 @@ pub(crate) async fn run_codex_ws_session(
     let mut binding = match BindingState::new(handshake_turn_state, &first_step) {
         Ok(binding) => binding,
         Err(error) => {
+            step_usage.reject(
+                http::StatusCode::BAD_REQUEST.as_u16(),
+                "codex_ws_binding_invalid",
+                "Codex WebSocket binding state was invalid",
+                false,
+            );
             runtime.abort_candidate(&candidate).await;
             close_with_error(&mut client, error.message()).await;
             best_effort_control_send(peer.as_mut(), RelayFrame::Close).await;
@@ -442,6 +530,12 @@ pub(crate) async fn run_codex_ws_session(
     let cleanup_permit = candidate.take_prewrite_cleanup_permit();
     let mut candidate_attempt = CandidateAttemptGuard::new(runtime, &candidate, cleanup_permit);
     if let Err(error) = runtime.validate_candidate_current_state(&candidate).await {
+        step_usage.reject(
+            http::StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+            error.reason,
+            "Codex WebSocket candidate changed before execution",
+            false,
+        );
         candidate_attempt.abort().await;
         send_not_executed_control(
             &mut client,
@@ -454,12 +548,16 @@ pub(crate) async fn run_codex_ws_session(
         return;
     }
 
-    let mut next_step = Some((first_step, true));
+    let mut next_step = Some((first_step, true, step_usage));
     loop {
-        let (mut step, already_validated) = match next_step.take() {
+        let (mut step, already_validated, mut step_usage) = match next_step.take() {
             Some(step) => step,
             None => match receive_idle_step(&mut client, peer.as_mut(), &binding).await {
-                Ok(Some(step)) => (step, false),
+                Ok(Some((step, started_at))) => (
+                    step,
+                    false,
+                    StepUsageLifecycleGuard::new(runtime, started_at),
+                ),
                 Ok(None) => {
                     candidate_attempt.abort().await;
                     best_effort_control_send(peer.as_mut(), RelayFrame::Close).await;
@@ -504,6 +602,12 @@ pub(crate) async fn run_codex_ws_session(
             }
         }
         if step.model != candidate.model {
+            step_usage.reject(
+                http::StatusCode::BAD_REQUEST.as_u16(),
+                "bound_model_changed",
+                "the model changed on a bound Codex WebSocket connection",
+                false,
+            );
             candidate_attempt.abort().await;
             send_not_executed_control(
                 &mut client,
@@ -519,6 +623,12 @@ pub(crate) async fn run_codex_ws_session(
             .official_identity
             .matches_connection_binding(&candidate.identity)
         {
+            step_usage.reject(
+                http::StatusCode::BAD_REQUEST.as_u16(),
+                "codex_identity_changed",
+                "the Codex identity changed on a bound WebSocket connection",
+                false,
+            );
             candidate_attempt.abort().await;
             send_not_executed_control(
                 &mut client,
@@ -530,9 +640,16 @@ pub(crate) async fn run_codex_ws_session(
             best_effort_control_send(peer.as_mut(), RelayFrame::Close).await;
             return;
         }
+        step_usage.bind(&candidate, &step);
         let prepared_step = match runtime.prepare_step(&candidate, &mut step).await {
             Ok(prepared_step) => prepared_step,
             Err(error) => {
+                step_usage.reject(
+                    http::StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                    error.reason,
+                    "Codex WebSocket step preparation failed",
+                    false,
+                );
                 candidate_attempt.abort().await;
                 send_not_executed_control(
                     &mut client,
@@ -546,7 +663,7 @@ pub(crate) async fn run_codex_ws_session(
             }
         };
         let (materialized_step, step_execution_guard, usage_report) = prepared_step.into_parts();
-        let step_started = tokio::time::Instant::now();
+        let step_started = step_usage.started_at();
         let deadlines = StepDeadlines::new(step_started, candidate.timeouts());
         let provider_write_deadline = deadlines.write_deadline();
         if let Err(ready_error) = wait_until_ready(peer.as_mut(), provider_write_deadline).await {
@@ -554,6 +671,16 @@ pub(crate) async fn run_codex_ws_session(
                 BoundedSendError::Timeout => "official_provider_not_ready_timeout",
                 BoundedSendError::Peer => "official_provider_not_ready",
             };
+            let status_code = match ready_error {
+                BoundedSendError::Timeout => http::StatusCode::GATEWAY_TIMEOUT.as_u16(),
+                BoundedSendError::Peer => http::StatusCode::BAD_GATEWAY.as_u16(),
+            };
+            step_usage.reject(
+                status_code,
+                reason,
+                "official Codex WebSocket was not ready for the request",
+                false,
+            );
             step_execution_guard.release().await;
             drop(usage_report);
             candidate_attempt.abort().await;
@@ -563,6 +690,12 @@ pub(crate) async fn run_codex_ws_session(
             return;
         }
         if let Err(error) = runtime.validate_candidate_current_state(&candidate).await {
+            step_usage.reject(
+                http::StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                error.reason,
+                "Codex WebSocket candidate changed before provider execution",
+                false,
+            );
             step_execution_guard.release().await;
             drop(usage_report);
             candidate_attempt.abort().await;
@@ -577,6 +710,12 @@ pub(crate) async fn run_codex_ws_session(
             return;
         }
         if tokio::time::Instant::now() >= provider_write_deadline {
+            step_usage.reject(
+                http::StatusCode::GATEWAY_TIMEOUT.as_u16(),
+                "official_provider_write_budget_exhausted",
+                "official Codex WebSocket write budget was exhausted",
+                false,
+            );
             step_execution_guard.release().await;
             drop(usage_report);
             candidate_attempt.abort().await;
@@ -592,6 +731,12 @@ pub(crate) async fn run_codex_ws_session(
         }
         let execution_lease_status = step_execution_guard.lease_status();
         if !execution_lease_status.is_valid() {
+            step_usage.reject(
+                http::StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                "runtime_permit_lease_lost",
+                "runtime concurrency permit was lost before provider execution",
+                false,
+            );
             step_execution_guard.release().await;
             drop(usage_report);
             candidate_attempt.abort().await;
@@ -612,6 +757,12 @@ pub(crate) async fn run_codex_ws_session(
             match super::cpu_budget::try_acquire_large_frame_cpu_budget(materialized_step.len()) {
                 Ok(permit) => permit,
                 Err(()) => {
+                    step_usage.reject(
+                        http::StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                        "large_frame_cpu_unavailable",
+                        "large-frame CPU capacity was unavailable before provider execution",
+                        false,
+                    );
                     step_execution_guard.release().await;
                     drop(usage_report);
                     candidate_attempt.abort().await;
@@ -627,6 +778,12 @@ pub(crate) async fn run_codex_ws_session(
                 }
             };
         if tokio::time::Instant::now() >= provider_write_deadline {
+            step_usage.reject(
+                http::StatusCode::GATEWAY_TIMEOUT.as_u16(),
+                "official_provider_write_budget_exhausted",
+                "official Codex WebSocket write budget was exhausted",
+                false,
+            );
             drop(provider_write_cpu);
             step_execution_guard.release().await;
             drop(usage_report);
@@ -651,7 +808,7 @@ pub(crate) async fn run_codex_ws_session(
             usage_report,
             first_dispatch,
         );
-        settlement.record_pending();
+        step_usage.disarm();
         let provider_write = send_ready_until_with_optional_cpu_budget(
             peer.as_mut(),
             RelayFrame::Text(materialized_step.into()),
@@ -1087,7 +1244,7 @@ async fn receive_idle_step(
     client: &mut Box<dyn RelayPeer>,
     official: &mut dyn RelayPeer,
     binding: &BindingState,
-) -> Result<Option<ResponseCreateStep>, ProtocolError> {
+) -> Result<Option<(ResponseCreateStep, tokio::time::Instant)>, ProtocolError> {
     loop {
         tokio::select! {
             biased;
@@ -1139,6 +1296,7 @@ async fn receive_idle_step(
                     .map_err(|_| ProtocolError::Policy("downstream WebSocket receive failed"))?;
                 match frame {
                     Some(RelayFrame::Text(text)) => {
+                        let started_at = tokio::time::Instant::now();
                         let bound_turn_state = binding
                             .turn_state
                             .as_ref()
@@ -1152,7 +1310,7 @@ async fn receive_idle_step(
                             },
                         )
                         .await
-                        .map(Some);
+                        .map(|step| Some((step, started_at)));
                     }
                     Some(RelayFrame::Ping(bytes)) => {
                         bounded_control_send(client.as_mut(), RelayFrame::Pong(bytes))
@@ -1862,6 +2020,8 @@ mod tests {
         connect_calls: AtomicUsize,
         prepare_calls: AtomicUsize,
         pending_calls: AtomicUsize,
+        rejected_calls: AtomicUsize,
+        rejected_reasons: Mutex<Vec<&'static str>>,
         stream_started_calls: AtomicUsize,
         stream_first_byte_ms: Mutex<Vec<u64>>,
         report_calls: AtomicUsize,
@@ -1903,6 +2063,8 @@ mod tests {
                 connect_calls: AtomicUsize::new(0),
                 prepare_calls: AtomicUsize::new(0),
                 pending_calls: AtomicUsize::new(0),
+                rejected_calls: AtomicUsize::new(0),
+                rejected_reasons: Mutex::new(Vec::new()),
                 stream_started_calls: AtomicUsize::new(0),
                 stream_first_byte_ms: Mutex::new(Vec::new()),
                 report_calls: AtomicUsize::new(0),
@@ -2125,13 +2287,24 @@ mod tests {
         ) {
         }
 
-        fn record_step_pending(
-            &self,
-            _candidate: &CodexWsCandidate,
-            _step: &ResponseCreateStep,
-            _usage_report: &UsageReportReservation,
-        ) {
+        fn record_step_pending(&self, _usage_context: &CodexWsStepUsageContext) {
             self.pending_calls.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn record_step_rejected(
+            &self,
+            _usage_context: CodexWsStepUsageContext,
+            _elapsed: Duration,
+            _status_code: u16,
+            error_type: &'static str,
+            _error_message: &'static str,
+            _cancelled: bool,
+        ) {
+            self.rejected_calls.fetch_add(1, Ordering::Relaxed);
+            self.rejected_reasons
+                .lock()
+                .expect("rejected reasons should lock")
+                .push(error_type);
         }
 
         fn record_step_stream_started(
@@ -2383,7 +2556,7 @@ mod tests {
         let (client, _) = ScriptedPeer::new([(Duration::from_millis(1), relay_text(request()))]);
         let mut client: Box<dyn RelayPeer> = Box::new(client);
 
-        let step = receive_idle_step(&mut client, &mut official, &idle_binding())
+        let (step, _started_at) = receive_idle_step(&mut client, &mut official, &idle_binding())
             .await
             .expect("idle receive should succeed")
             .expect("the next step should parse");
@@ -2441,6 +2614,7 @@ mod tests {
             (Duration::ZERO, relay_text(terminal.clone())),
         ]);
         let runtime = TestRuntime::new(Box::new(official), true);
+        runtime.push_connect_delay(Duration::from_millis(11));
         let (client, client_sent) = ScriptedPeer::new([
             (Duration::ZERO, relay_text(request())),
             (Duration::from_millis(20), RelayFrame::Close),
@@ -2452,6 +2626,7 @@ mod tests {
         assert_eq!(runtime.connect_calls.load(Ordering::Relaxed), 2);
         assert_eq!(runtime.prepare_calls.load(Ordering::Relaxed), 1);
         assert_eq!(runtime.pending_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(runtime.rejected_calls.load(Ordering::Relaxed), 0);
         assert_eq!(runtime.stream_started_calls.load(Ordering::Relaxed), 1);
         assert_eq!(runtime.report_calls.load(Ordering::Relaxed), 1);
         assert_eq!(runtime.report_after_release.load(Ordering::Relaxed), 1);
@@ -2461,14 +2636,14 @@ mod tests {
                 .stream_first_byte_ms
                 .lock()
                 .expect("stream first-byte values should lock"),
-            vec![7]
+            vec![18]
         );
         assert_eq!(
             *runtime
                 .report_first_byte_ms
                 .lock()
                 .expect("terminal first-byte values should lock"),
-            vec![Some(7)]
+            vec![Some(18)]
         );
         assert_eq!(
             *runtime
@@ -2539,6 +2714,15 @@ mod tests {
 
         assert_eq!(runtime.prepare_calls.load(Ordering::Relaxed), 1);
         assert_eq!(runtime.report_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(runtime.pending_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(runtime.rejected_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            *runtime
+                .rejected_reasons
+                .lock()
+                .expect("rejected reasons should lock"),
+            vec!["account_catalog_changed"]
+        );
         assert_eq!(runtime.gate.snapshot().in_flight, 0);
         assert_eq!(
             official_sent
@@ -2572,6 +2756,15 @@ mod tests {
 
         assert_eq!(runtime.prepare_calls.load(Ordering::Relaxed), 0);
         assert_eq!(runtime.report_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(runtime.pending_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(runtime.rejected_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            *runtime
+                .rejected_reasons
+                .lock()
+                .expect("rejected reasons should lock"),
+            vec!["codex_ws_global_configuration_changed"]
+        );
         assert_eq!(runtime.gate.snapshot().in_flight, 0);
         assert_eq!(
             official_sent
@@ -2612,6 +2805,15 @@ mod tests {
 
         assert_eq!(runtime.prepare_calls.load(Ordering::Relaxed), 1);
         assert_eq!(runtime.report_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(runtime.pending_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(runtime.rejected_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            *runtime
+                .rejected_reasons
+                .lock()
+                .expect("rejected reasons should lock"),
+            vec!["codex_ws_global_configuration_changed"]
+        );
         assert_eq!(runtime.gate.snapshot().in_flight, 0);
         assert_eq!(
             official_sent
@@ -2965,6 +3167,38 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn pending_usage_is_visible_while_the_initial_provider_connect_is_in_flight() {
+        let (official, _) = ScriptedPeer::new([]);
+        let runtime = Arc::new(TestRuntime::new(Box::new(official), false));
+        runtime.push_connect_delay(Duration::from_secs(30));
+        let (client, _) = ScriptedPeer::new([(Duration::ZERO, relay_text(request()))]);
+        let task_runtime = Arc::clone(&runtime);
+        let task = tokio::spawn(async move {
+            run_codex_ws_session(Box::new(client), task_runtime.as_ref()).await;
+        });
+        while runtime.connect_calls.load(Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(runtime.pending_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(runtime.rejected_calls.load(Ordering::Relaxed), 0);
+
+        task.abort();
+        assert!(task
+            .await
+            .expect_err("task should be cancelled")
+            .is_cancelled());
+        assert_eq!(runtime.rejected_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            *runtime
+                .rejected_reasons
+                .lock()
+                .expect("rejected reasons should lock"),
+            vec!["codex_ws_step_cancelled_before_execution"]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn initial_connect_budget_bounds_all_sequential_candidates() {
         let (official, _) = ScriptedPeer::new([]);
         let runtime = TestRuntime::new(Box::new(official), true);
@@ -2982,6 +3216,15 @@ mod tests {
         assert_eq!(runtime.connect_calls.load(Ordering::Relaxed), 2);
         assert_eq!(runtime.prepare_calls.load(Ordering::Relaxed), 0);
         assert_eq!(runtime.report_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(runtime.pending_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(runtime.rejected_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            *runtime
+                .rejected_reasons
+                .lock()
+                .expect("rejected reasons should lock"),
+            vec!["initial_connect_budget_exhausted"]
+        );
         assert_eq!(
             *runtime
                 .started_candidates
@@ -3083,6 +3326,15 @@ mod tests {
         run_codex_ws_session(Box::new(client), &runtime).await;
 
         assert_eq!(runtime.report_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(runtime.pending_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(runtime.rejected_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            *runtime
+                .rejected_reasons
+                .lock()
+                .expect("rejected reasons should lock"),
+            vec!["official_provider_not_ready_timeout"]
+        );
         assert_eq!(runtime.gate.snapshot().in_flight, 0);
         assert!(official_sent
             .lock()
@@ -3221,7 +3473,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn task_cancel_before_provider_write_aborts_candidate_without_usage_report() {
+    async fn task_cancel_before_provider_write_aborts_candidate_and_cancels_pending_usage() {
         let (official, _) = ScriptedPeer::new([]);
         let runtime = Arc::new(TestRuntime::new(Box::new(official), false));
         runtime.set_prepare_delay(Duration::from_secs(60));
@@ -3241,6 +3493,15 @@ mod tests {
             .is_cancelled());
 
         assert_eq!(runtime.report_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(runtime.pending_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(runtime.rejected_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            *runtime
+                .rejected_reasons
+                .lock()
+                .expect("rejected reasons should lock"),
+            vec!["codex_ws_step_cancelled_before_execution"]
+        );
         assert_eq!(runtime.gate.snapshot().in_flight, 0);
         assert_eq!(
             *runtime

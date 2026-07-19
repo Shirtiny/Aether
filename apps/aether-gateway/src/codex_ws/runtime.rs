@@ -360,6 +360,26 @@ pub(crate) struct UsageReportReservation {
     lifecycle_seed: Option<aether_usage_runtime::LifecycleUsageSeed>,
 }
 
+pub(crate) struct CodexWsStepUsageContext {
+    plan: aether_contracts::ExecutionPlan,
+    report_kind: String,
+    report_context: Option<serde_json::Value>,
+}
+
+impl CodexWsStepUsageContext {
+    pub(crate) fn new(candidate: &CodexWsCandidate, step: &ResponseCreateStep) -> Self {
+        let mut plan = candidate.lifecycle.plan().clone();
+        plan.request_id = step_usage_request_id(step);
+        let report_context =
+            step_report_context(candidate.lifecycle.report_context().cloned(), step, None);
+        Self {
+            plan,
+            report_kind: candidate.report_kind.clone(),
+            report_context,
+        }
+    }
+}
+
 impl UsageReportReservation {
     fn lifecycle_seed(&self) -> Option<&aether_usage_runtime::LifecycleUsageSeed> {
         self.lifecycle_seed.as_ref()
@@ -466,11 +486,17 @@ pub(crate) trait CodexWsRuntimePort: Send + Sync {
         first_dispatch: bool,
     );
 
-    fn record_step_pending(
+    fn record_step_pending(&self, _usage_context: &CodexWsStepUsageContext) {}
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_step_rejected(
         &self,
-        _candidate: &CodexWsCandidate,
-        _step: &ResponseCreateStep,
-        _usage_report: &UsageReportReservation,
+        _usage_context: CodexWsStepUsageContext,
+        _elapsed: std::time::Duration,
+        _status_code: u16,
+        _error_type: &'static str,
+        _error_message: &'static str,
+        _cancelled: bool,
     ) {
     }
 
@@ -1438,18 +1464,66 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
             .await;
     }
 
-    fn record_step_pending(
-        &self,
-        _candidate: &CodexWsCandidate,
-        _step: &ResponseCreateStep,
-        usage_report: &UsageReportReservation,
-    ) {
-        let Some(seed) = usage_report.lifecycle_seed() else {
-            return;
-        };
+    fn record_step_pending(&self, usage_context: &CodexWsStepUsageContext) {
+        let seed = aether_usage_runtime::build_lifecycle_usage_seed(
+            &usage_context.plan,
+            usage_context.report_context.as_ref(),
+        );
         self.state
             .usage_runtime
-            .record_pending(self.state.data.as_ref(), seed.clone());
+            .record_pending(self.state.data.as_ref(), seed);
+    }
+
+    fn record_step_rejected(
+        &self,
+        usage_context: CodexWsStepUsageContext,
+        elapsed: std::time::Duration,
+        status_code: u16,
+        error_type: &'static str,
+        error_message: &'static str,
+        cancelled: bool,
+    ) {
+        let CodexWsStepUsageContext {
+            plan,
+            report_kind,
+            report_context,
+        } = usage_context;
+        let request_id = plan.request_id.clone();
+        let model = plan.model_name.clone();
+        let context_seed =
+            aether_usage_runtime::build_terminal_usage_context_seed(&plan, report_context.as_ref());
+        let payload = crate::usage::GatewayStreamReportRequest {
+            trace_id: request_id,
+            report_kind,
+            report_context,
+            status_code,
+            headers: BTreeMap::new(),
+            provider_body_base64: None,
+            provider_body_state: None,
+            client_body_base64: None,
+            client_body_state: None,
+            terminal_summary: Some(aether_contracts::ExecutionStreamTerminalSummary {
+                standardized_usage: None,
+                finish_reason: None,
+                response_id: None,
+                model,
+                observed_finish: false,
+                unknown_event_count: 0,
+                parser_error: Some(format!("{error_type}: {error_message}")),
+            }),
+            telemetry: Some(aether_contracts::ExecutionTelemetry {
+                ttfb_ms: None,
+                elapsed_ms: u64::try_from(elapsed.as_millis()).ok(),
+                upstream_bytes: None,
+            }),
+        };
+        let payload_seed = aether_usage_runtime::build_stream_terminal_usage_payload_seed(&payload);
+        self.state.usage_runtime.record_stream_terminal(
+            self.state.data.as_ref(),
+            context_seed,
+            payload_seed,
+            cancelled,
+        );
     }
 
     fn record_step_stream_started(
