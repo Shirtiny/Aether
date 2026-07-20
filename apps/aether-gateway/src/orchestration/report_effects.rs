@@ -468,7 +468,7 @@ async fn sync_gemini_cli_credits_from_report(
     updated_key.updated_at_unix_secs = Some(now_unix_secs);
 
     Ok(state
-        .update_provider_catalog_key(&updated_key)
+        .update_provider_catalog_key_runtime_state(&updated_key)
         .await?
         .is_some())
 }

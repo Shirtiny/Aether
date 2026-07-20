@@ -861,7 +861,7 @@ pub(crate) async fn run_codex_ws_session(
             &step,
             runtime,
             &candidate.key_id,
-            candidate.selected_catalog_epoch,
+            candidate.selected_scheduler_epoch,
             &execution_lease_status,
             &deadlines,
             step_started,
@@ -882,6 +882,16 @@ pub(crate) async fn run_codex_ws_session(
                         CodexWsStepDisposition::Completed,
                     )
                     .await;
+                // A provider/key/catalog transition that races an in-flight
+                // response is allowed to settle, then drains the binding so
+                // the next step is planned from fresh authoritative state.
+                // This avoids turning a successfully completed response into
+                // a retry while preserving fail-closed checks before every
+                // provider write.
+                close_after_terminal |= runtime
+                    .validate_candidate_current_state(&candidate)
+                    .await
+                    .is_err();
                 if !deliver_terminal_after_settlement(
                     &mut client,
                     &step,
@@ -1446,7 +1456,7 @@ async fn relay_one_response<F>(
     step: &ResponseCreateStep,
     runtime: &dyn CodexWsRuntimePort,
     key_id: &str,
-    selected_catalog_epoch: u64,
+    selected_scheduler_epoch: u64,
     execution_lease_status: &StepExecutionLeaseStatus,
     deadlines: &StepDeadlines,
     step_started: tokio::time::Instant,
@@ -1619,7 +1629,7 @@ where
                             }
                         }
                         let close_after_terminal = terminal == Some(TerminalKind::Completed)
-                            && (runtime.catalog_epoch() != selected_catalog_epoch
+                            && (runtime.scheduler_epoch() != selected_scheduler_epoch
                                 || runtime.validate_runtime_fences().is_err());
                         if terminal == Some(TerminalKind::Completed) {
                             let response_id = terminal_response_id
@@ -2033,6 +2043,8 @@ mod tests {
         unused_candidates: Mutex<Vec<String>>,
         epoch: AtomicUsize,
         bump_epoch_during_prepare: AtomicBool,
+        candidate_state_valid: AtomicBool,
+        invalidate_candidate_during_prepare: AtomicBool,
         runtime_fences_valid: Arc<AtomicBool>,
         invalidate_fences_during_connect: AtomicBool,
         invalidate_fences_during_prepare: AtomicBool,
@@ -2076,6 +2088,8 @@ mod tests {
                 unused_candidates: Mutex::new(Vec::new()),
                 epoch: AtomicUsize::new(7),
                 bump_epoch_during_prepare: AtomicBool::new(false),
+                candidate_state_valid: AtomicBool::new(true),
+                invalidate_candidate_during_prepare: AtomicBool::new(false),
                 runtime_fences_valid,
                 invalidate_fences_during_connect: AtomicBool::new(false),
                 invalidate_fences_during_prepare: AtomicBool::new(false),
@@ -2269,6 +2283,12 @@ mod tests {
                 self.epoch.store(8, Ordering::Release);
             }
             if self
+                .invalidate_candidate_during_prepare
+                .swap(false, Ordering::AcqRel)
+            {
+                self.candidate_state_valid.store(false, Ordering::Release);
+            }
+            if self
                 .invalidate_fences_during_prepare
                 .swap(false, Ordering::AcqRel)
             {
@@ -2278,6 +2298,17 @@ mod tests {
                 "materialized-step".to_string(),
                 Some(permit.into()),
             ))
+        }
+
+        async fn validate_candidate_current_state(
+            &self,
+            candidate: &CodexWsCandidate,
+        ) -> Result<(), StepPreparationError> {
+            self.validate_candidate_fences(candidate)?;
+            self.candidate_state_valid
+                .load(Ordering::Acquire)
+                .then_some(())
+                .ok_or(StepPreparationError::retain("account_catalog_changed"))
         }
 
         async fn release_candidate_scheduling_resources(
@@ -2347,7 +2378,7 @@ mod tests {
             }
         }
 
-        fn catalog_epoch(&self) -> u64 {
+        fn scheduler_epoch(&self) -> u64 {
             self.epoch.load(Ordering::Acquire) as u64
         }
     }
@@ -2450,7 +2481,7 @@ mod tests {
             route: OutboundRoute::Direct,
             timeouts,
             lifecycle,
-            selected_catalog_epoch: 7,
+            selected_scheduler_epoch: 7,
             provider_concurrent_limit: None,
             key_concurrent_limit: None,
             key_rpm_limit: None,
@@ -2702,11 +2733,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn catalog_change_during_prepare_is_rejected_before_provider_write() {
-        let (official, official_sent) = ScriptedPeer::new([]);
+    async fn scheduler_epoch_change_during_prepare_uses_frozen_step_then_drains_binding() {
+        let created = json!({
+            "type": "response.created",
+            "response": {"id": "resp-epoch", "model": "gpt-5.4"}
+        })
+        .to_string();
+        let terminal = json!({
+            "type": "response.completed",
+            "response": {"id": "resp-epoch", "model": "gpt-5.4"}
+        })
+        .to_string();
+        let (official, official_sent) = ScriptedPeer::new([
+            (Duration::ZERO, relay_text(created)),
+            (Duration::ZERO, relay_text(terminal.clone())),
+        ]);
         let runtime = TestRuntime::new(Box::new(official), false);
         runtime
             .bump_epoch_during_prepare
+            .store(true, Ordering::Release);
+        let (client, client_sent) = ScriptedPeer::new([(Duration::ZERO, relay_text(request()))]);
+
+        run_codex_ws_session(Box::new(client), &runtime).await;
+
+        assert_eq!(runtime.prepare_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(runtime.report_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(runtime.pending_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(runtime.rejected_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(runtime.gate.snapshot().in_flight, 0);
+        assert_eq!(
+            official_sent
+                .lock()
+                .expect("official frames should lock")
+                .iter()
+                .filter(|frame| matches!(frame, RelayFrame::Text(_)))
+                .count(),
+            1
+        );
+        let client_sent = client_sent.lock().expect("client frames should lock");
+        assert!(client_sent.contains(&relay_text(terminal)));
+        assert!(client_sent.contains(&RelayFrame::Close));
+        assert!(!client_sent.iter().any(|frame| match frame {
+            RelayFrame::Text(text) => text_bytes_contains(text, "codex_official_ws.not_executed"),
+            _ => false,
+        }));
+    }
+
+    #[tokio::test]
+    async fn shared_catalog_change_during_prepare_is_rejected_before_provider_write() {
+        let (official, official_sent) = ScriptedPeer::new([]);
+        let runtime = TestRuntime::new(Box::new(official), false);
+        runtime
+            .invalidate_candidate_during_prepare
             .store(true, Ordering::Release);
         let (client, client_sent) = ScriptedPeer::new([(Duration::ZERO, relay_text(request()))]);
 

@@ -171,7 +171,12 @@ pub(crate) struct CodexWsCandidate {
     pub(crate) route: OutboundRoute,
     pub(crate) timeouts: CodexWsTimeouts,
     pub(crate) lifecycle: Arc<CodexWsCandidateLifecycle>,
-    pub(crate) selected_catalog_epoch: u64,
+    /// Snapshot of the generic scheduler-affinity epoch used only to drain a
+    /// bound connection after the current response settles. Account safety is
+    /// fenced by the shared global/catalog/key generations below; the generic
+    /// epoch also changes for unrelated provider telemetry and must never be a
+    /// pre-write rejection signal.
+    pub(crate) selected_scheduler_epoch: u64,
     pub(crate) provider_concurrent_limit: Option<usize>,
     pub(crate) key_concurrent_limit: Option<usize>,
     pub(crate) key_rpm_limit: Option<u32>,
@@ -434,13 +439,9 @@ pub(crate) trait CodexWsRuntimePort: Send + Sync {
 
     fn validate_candidate_fences(
         &self,
-        candidate: &CodexWsCandidate,
+        _candidate: &CodexWsCandidate,
     ) -> Result<(), StepPreparationError> {
-        self.validate_runtime_fences()?;
-        if self.catalog_epoch() != candidate.selected_catalog_epoch {
-            return Err(StepPreparationError::retain("account_catalog_changed"));
-        }
-        Ok(())
+        self.validate_runtime_fences()
     }
 
     async fn validate_candidate_current_state(
@@ -524,7 +525,7 @@ pub(crate) trait CodexWsRuntimePort: Send + Sync {
 
     fn record_codex_quota_headers(&self, _key_id: &str, _headers: BTreeMap<String, String>) {}
 
-    fn catalog_epoch(&self) -> u64;
+    fn scheduler_epoch(&self) -> u64;
 }
 
 pub(crate) struct GatewayCodexWsRuntime {
@@ -845,7 +846,7 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
         }
         super::hot_state::bind_catalog_snapshot_generation(&self.state, &shared_catalog.generation)
             .map_err(|_| StepPreparationError::retain("account_catalog_snapshot_bind_failed"))?;
-        let selected_catalog_epoch = self.state.scheduler_affinity_epoch();
+        let selected_scheduler_epoch = self.state.scheduler_affinity_epoch();
         let parts = self
             .request_parts()
             .map_err(|_| StepPreparationError::retain("candidate_request_context_invalid"))?;
@@ -971,17 +972,6 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
                 }
             };
 
-        if self.state.scheduler_affinity_epoch() != selected_catalog_epoch {
-            crate::executor::candidate_loop::mark_unused_local_candidates(
-                &self.state,
-                attempts
-                    .into_iter()
-                    .map(|planned| planned.attempt)
-                    .collect(),
-            )
-            .await;
-            return Err(StepPreparationError::retain("account_catalog_changed"));
-        }
         if let Err(error) = self.validate_runtime_fences() {
             crate::executor::candidate_loop::mark_unused_local_candidates(
                 &self.state,
@@ -1104,7 +1094,7 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
                 route: preflight.route,
                 timeouts,
                 lifecycle,
-                selected_catalog_epoch,
+                selected_scheduler_epoch,
                 provider_concurrent_limit,
                 key_concurrent_limit,
                 key_rpm_limit,
@@ -1120,10 +1110,6 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
                 hot_rejected_attempts,
             )
             .await;
-        }
-        if self.state.scheduler_affinity_epoch() != selected_catalog_epoch {
-            self.mark_unused_candidates(candidates).await;
-            return Err(StepPreparationError::retain("account_catalog_changed"));
         }
         Ok(candidates)
     }
@@ -1640,7 +1626,7 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
         }
     }
 
-    fn catalog_epoch(&self) -> u64 {
+    fn scheduler_epoch(&self) -> u64 {
         self.state.scheduler_affinity_epoch()
     }
 

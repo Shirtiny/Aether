@@ -356,7 +356,9 @@ async fn persist_key_fetch_failure(
     updated.last_models_fetch_at_unix_secs = Some(now_unix_secs);
     updated.last_models_fetch_error = Some(error);
     updated.updated_at_unix_secs = Some(now_unix_secs);
-    state.update_provider_catalog_key(&updated).await?;
+    state
+        .update_provider_catalog_key_runtime_state(&updated)
+        .await?;
     Ok(())
 }
 
@@ -625,6 +627,13 @@ mod tests {
             };
             *slot = key.clone();
             Ok(())
+        }
+
+        async fn update_provider_catalog_key_runtime_state(
+            &self,
+            key: &StoredProviderCatalogKey,
+        ) -> Result<(), GatewayError> {
+            self.update_provider_catalog_key(key).await
         }
 
         async fn write_upstream_models_cache(

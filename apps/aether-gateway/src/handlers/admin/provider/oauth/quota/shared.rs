@@ -305,6 +305,7 @@ pub(crate) async fn persist_provider_quota_refresh_state(
         quota_snapshot_provider_type =
             aether_provider_pool::provider_pool_quota_metadata_provider_type(metadata_update);
     }
+    let credentials_changed = encrypted_auth_config.is_some();
     if let Some(encrypted_auth_config) = encrypted_auth_config {
         latest_key.encrypted_auth_config = Some(encrypted_auth_config);
     }
@@ -324,10 +325,26 @@ pub(crate) async fn persist_provider_quota_refresh_state(
         .duration_since(UNIX_EPOCH)
         .ok()
         .map(|duration| duration.as_secs());
-    Ok(state
-        .update_provider_catalog_key(&latest_key)
-        .await?
-        .is_some())
+    if credentials_changed {
+        // Rotated credential material is a structural account mutation. Keep
+        // the full key-update fence so concurrent refreshes and any binding on
+        // that concrete account observe the new credential generation.
+        Ok(state
+            .update_provider_catalog_key(&latest_key)
+            .await?
+            .is_some())
+    } else {
+        // Quota and OAuth eligibility telemetry is account-local runtime
+        // state. Refresh candidate/transport snapshots without advancing the
+        // global scheduler-affinity epoch: that epoch is also observed by
+        // native Codex WebSocket bindings, so telemetry must not drain or
+        // reject unrelated accounts. Restrictive OAuth changes still publish
+        // the key-specific Codex WS hot-state generation.
+        Ok(state
+            .update_provider_catalog_key_runtime_state(&latest_key)
+            .await?
+            .is_some())
+    }
 }
 
 pub(super) async fn execute_provider_quota_plan(
@@ -369,5 +386,145 @@ pub(super) async fn execute_provider_quota_plan(
             );
             Ok(ProviderQuotaExecutionOutcome::Failure(error))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use aether_data::repository::provider_catalog::InMemoryProviderCatalogReadRepository;
+    use aether_data_contracts::repository::provider_catalog::{
+        StoredProviderCatalogEndpoint, StoredProviderCatalogKey, StoredProviderCatalogProvider,
+    };
+    use serde_json::json;
+
+    use super::persist_provider_quota_refresh_state;
+    use crate::cache::SchedulerAffinityTarget;
+    use crate::data::GatewayDataState;
+    use crate::handlers::admin::request::AdminAppState;
+    use crate::AppState;
+
+    fn quota_state() -> AppState {
+        let provider = StoredProviderCatalogProvider::new(
+            "provider-1".to_string(),
+            "Provider 1".to_string(),
+            None,
+            "grok".to_string(),
+        )
+        .expect("provider should build");
+        let endpoint = StoredProviderCatalogEndpoint::new(
+            "endpoint-1".to_string(),
+            "provider-1".to_string(),
+            "openai:responses".to_string(),
+            Some("openai".to_string()),
+            Some("responses".to_string()),
+            true,
+        )
+        .expect("endpoint should build");
+        let key = StoredProviderCatalogKey::new(
+            "key-1".to_string(),
+            "provider-1".to_string(),
+            "Key 1".to_string(),
+            "oauth".to_string(),
+            None,
+            true,
+        )
+        .expect("key should build");
+        let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![provider],
+            vec![endpoint],
+            vec![key],
+        ));
+        AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(repository)
+                    .with_encryption_key_for_tests("test-encryption-key"),
+            )
+    }
+
+    #[tokio::test]
+    async fn quota_refresh_runtime_write_preserves_unrelated_scheduler_affinity() {
+        let state = quota_state();
+        let cache_key = "scheduler_affinity:client-key:openai:responses:gpt-5.5";
+        let ttl = Duration::from_secs(300);
+        let target = SchedulerAffinityTarget {
+            provider_id: "provider-other".to_string(),
+            endpoint_id: "endpoint-other".to_string(),
+            key_id: "key-other".to_string(),
+        };
+        state.remember_scheduler_affinity_target(cache_key, target.clone(), ttl, 128);
+        let initial_epoch = state.scheduler_affinity_epoch();
+
+        let persisted = persist_provider_quota_refresh_state(
+            &AdminAppState::new(&state),
+            "key-1",
+            Some(&json!({
+                "grok": {
+                    "requests": {"remaining": 479, "limit": 480},
+                    "updated_at": 1_721_440_000_u64
+                }
+            })),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("quota state should persist");
+
+        assert!(persisted);
+        assert_eq!(state.scheduler_affinity_epoch(), initial_epoch);
+        assert_eq!(
+            state.read_scheduler_affinity_target(cache_key, ttl),
+            Some(target)
+        );
+        let updated = state
+            .read_provider_catalog_keys_by_ids(&["key-1".to_string()])
+            .await
+            .expect("updated key should read")
+            .into_iter()
+            .next()
+            .expect("updated key should exist");
+        assert_eq!(
+            updated
+                .upstream_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.pointer("/grok/requests/remaining"))
+                .and_then(serde_json::Value::as_u64),
+            Some(479)
+        );
+    }
+
+    #[tokio::test]
+    async fn quota_refresh_credential_rotation_uses_structural_key_fence() {
+        let state = quota_state();
+        let initial_epoch = state.scheduler_affinity_epoch();
+
+        let persisted = persist_provider_quota_refresh_state(
+            &AdminAppState::new(&state),
+            "key-1",
+            None,
+            None,
+            None,
+            Some("refreshed-encrypted-auth".to_string()),
+        )
+        .await
+        .expect("credential state should persist");
+
+        assert!(persisted);
+        assert!(state.scheduler_affinity_epoch() > initial_epoch);
+        let updated = state
+            .read_provider_catalog_keys_by_ids(&["key-1".to_string()])
+            .await
+            .expect("updated key should read")
+            .into_iter()
+            .next()
+            .expect("updated key should exist");
+        assert_eq!(
+            updated.encrypted_auth_config.as_deref(),
+            Some("refreshed-encrypted-auth")
+        );
     }
 }

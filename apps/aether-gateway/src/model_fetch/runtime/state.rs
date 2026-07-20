@@ -47,6 +47,11 @@ pub(crate) trait ModelFetchRuntimeState:
         key: &StoredProviderCatalogKey,
     ) -> Result<(), GatewayError>;
 
+    async fn update_provider_catalog_key_runtime_state(
+        &self,
+        key: &StoredProviderCatalogKey,
+    ) -> Result<(), GatewayError>;
+
     async fn write_upstream_models_cache(
         &self,
         provider_id: &str,

@@ -1236,7 +1236,7 @@ impl AppState {
         latest_key.status_snapshot =
             sync_provider_key_oauth_status_snapshot(current_status_snapshot, &latest_key);
         let updated = self
-            .update_provider_catalog_key(&latest_key)
+            .update_provider_catalog_key_runtime_state(&latest_key)
             .await?
             .is_some();
         if updated {
@@ -1411,7 +1411,7 @@ impl AppState {
                 sync_provider_key_oauth_status_snapshot(current_status_snapshot, &latest_key);
 
             updated = self
-                .update_provider_catalog_key(&latest_key)
+                .update_provider_catalog_key_runtime_state(&latest_key)
                 .await?
                 .is_some();
             if updated {

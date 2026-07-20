@@ -901,6 +901,10 @@ impl AppState {
         &self,
         key: &provider_catalog::StoredProviderCatalogKey,
     ) -> Result<Option<provider_catalog::StoredProviderCatalogKey>, GatewayError> {
+        // Runtime telemetry, refreshed OAuth material, and health/quota state
+        // may change very frequently. Refresh selection/transport snapshots,
+        // but preserve the global scheduler-affinity epoch so unrelated
+        // long-lived bindings are not treated as stale catalog snapshots.
         let restrictive = !crate::codex_ws::hot_state::key_runtime_eligibility(key).0;
         let relevant = restrictive && self.key_is_codex_ws_relevant(key, true).await?;
         // Restrictive runtime writes are rare and safety-sensitive. Use the
@@ -919,7 +923,7 @@ impl AppState {
         }
         let updated = updated.map_err(|err| GatewayError::Internal(err.to_string()))?;
         if updated.is_some() {
-            self.invalidate_provider_health_routing_caches();
+            self.invalidate_provider_runtime_routing_caches();
         }
         Ok(updated)
     }
@@ -940,7 +944,10 @@ impl AppState {
             .await
             .map_err(|err| GatewayError::Internal(err.to_string()))?;
         if updated {
-            self.invalidate_provider_routing_caches();
+            // Upstream metadata is refreshed by runtime discovery/quota paths.
+            // It can affect candidate facts and transport materialization, but
+            // it does not change the identity of an existing affinity target.
+            self.invalidate_provider_runtime_routing_caches();
         }
         Ok(updated)
     }
@@ -1020,7 +1027,7 @@ impl AppState {
             .ok()
             .map(|duration| duration.as_secs());
 
-        self.update_provider_catalog_key(&key)
+        self.update_provider_catalog_key_runtime_state(&key)
             .await
             .map(|updated| updated.is_some())
     }
@@ -1147,7 +1154,7 @@ impl AppState {
         }
         let updated = updated.map_err(|err| GatewayError::Internal(err.to_string()))?;
         if updated {
-            self.invalidate_provider_health_routing_caches();
+            self.invalidate_provider_runtime_routing_caches();
         }
         Ok(updated)
     }
@@ -1216,6 +1223,7 @@ mod tests {
         StoredProviderCatalogEndpoint, StoredProviderCatalogKey, StoredProviderCatalogProvider,
     };
     use async_trait::async_trait;
+    use serde_json::json;
 
     use crate::cache::SchedulerAffinityTarget;
     use crate::data::GatewayDataState;
@@ -1264,6 +1272,58 @@ mod tests {
             true,
         )
         .expect("key should build")
+    }
+
+    fn sample_codex_provider() -> StoredProviderCatalogProvider {
+        StoredProviderCatalogProvider::new(
+            "provider-1".to_string(),
+            "Codex".to_string(),
+            None,
+            "codex".to_string(),
+        )
+        .expect("Codex provider should build")
+    }
+
+    fn sample_codex_endpoint() -> StoredProviderCatalogEndpoint {
+        StoredProviderCatalogEndpoint::new(
+            "endpoint-1".to_string(),
+            "provider-1".to_string(),
+            "openai:responses".to_string(),
+            Some("openai".to_string()),
+            Some("responses".to_string()),
+            true,
+        )
+        .expect("Codex endpoint should build")
+    }
+
+    fn sample_codex_ws_key() -> StoredProviderCatalogKey {
+        let mut key = StoredProviderCatalogKey::new(
+            "key-1".to_string(),
+            "provider-1".to_string(),
+            "Codex OAuth".to_string(),
+            "oauth".to_string(),
+            Some(json!({
+                (aether_provider_transport::CODEX_OFFICIAL_WS_CAPABILITY): true
+            })),
+            true,
+        )
+        .expect("Codex key should build");
+        key.api_formats = Some(json!(["openai:responses"]));
+        key.fingerprint = Some(json!({
+            (aether_provider_transport::CODEX_OFFICIAL_WS_PROFILE_FINGERPRINT_KEY): {
+                "schema_version": aether_provider_transport::CODEX_OFFICIAL_WS_PROFILE_SCHEMA_VERSION,
+                "profile_id": aether_provider_transport::CODEX_OFFICIAL_WS_PROFILE_ID,
+                "codex_commit": aether_provider_transport::CODEX_OFFICIAL_WS_CODEX_COMMIT,
+                "tokio_tungstenite_rev": aether_provider_transport::CODEX_OFFICIAL_WS_TOKIO_TUNGSTENITE_REV,
+                "tungstenite_rev": aether_provider_transport::CODEX_OFFICIAL_WS_TUNGSTENITE_REV,
+                "tungstenite_patch_id": aether_provider_transport::CODEX_OFFICIAL_WS_TUNGSTENITE_PATCH_ID,
+                "write_buffer_size_bytes": aether_provider_transport::CODEX_OFFICIAL_WS_WRITE_BUFFER_SIZE_BYTES,
+                "max_write_buffer_size_bytes": aether_provider_transport::CODEX_OFFICIAL_WS_MAX_WRITE_BUFFER_SIZE_BYTES,
+                "max_retained_write_buffer_capacity_bytes": aether_provider_transport::CODEX_OFFICIAL_WS_MAX_RETAINED_WRITE_BUFFER_CAPACITY_BYTES,
+                "crypto_provider": aether_provider_transport::CODEX_OFFICIAL_WS_CRYPTO_PROVIDER,
+            }
+        }));
+        key
     }
 
     fn sample_admin_global_model() -> StoredAdminGlobalModel {
@@ -1589,5 +1649,91 @@ mod tests {
             state.read_scheduler_affinity_target(cache_key, ttl),
             Some(target)
         );
+    }
+
+    #[tokio::test]
+    async fn provider_key_upstream_metadata_update_keeps_scheduler_affinity_cache() {
+        let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![sample_provider()],
+            vec![sample_endpoint()],
+            vec![sample_key()],
+        ));
+        let state = AppState::new()
+            .expect("app state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(repository)
+                    .with_encryption_key_for_tests("test-encryption-key"),
+            );
+
+        let cache_key = "scheduler_affinity:api-key-1:openai:chat:gpt-5";
+        let ttl = Duration::from_secs(300);
+        let target = SchedulerAffinityTarget {
+            provider_id: "provider-1".to_string(),
+            endpoint_id: "endpoint-1".to_string(),
+            key_id: "key-1".to_string(),
+        };
+        state.remember_scheduler_affinity_target(cache_key, target.clone(), ttl, 128);
+        let initial_epoch = state.scheduler_affinity_epoch();
+
+        let updated = state
+            .update_provider_catalog_key_upstream_metadata(
+                "key-1",
+                Some(&json!({"quota": {"remaining": 99}})),
+                Some(1_721_440_000),
+            )
+            .await
+            .expect("upstream metadata update should succeed");
+
+        assert!(updated);
+        assert_eq!(state.scheduler_affinity_epoch(), initial_epoch);
+        assert_eq!(
+            state.read_scheduler_affinity_target(cache_key, ttl),
+            Some(target)
+        );
+    }
+
+    #[tokio::test]
+    async fn restrictive_codex_runtime_update_fences_only_the_changed_key() {
+        let key = sample_codex_ws_key();
+        let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![sample_codex_provider()],
+            vec![sample_codex_endpoint()],
+            vec![key.clone()],
+        ));
+        let state = AppState::new()
+            .expect("app state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(repository)
+                    .with_encryption_key_for_tests("test-encryption-key"),
+            );
+        let initial_lease =
+            crate::codex_ws::hot_state::ensure_key_hot_leases(&state, std::slice::from_ref(&key))
+                .await
+                .expect("initial key hot state should initialize")
+                .remove(&key.id)
+                .expect("initial key lease should exist");
+        assert!(initial_lease.eligible);
+        let initial_scheduler_epoch = state.scheduler_affinity_epoch();
+
+        let mut blocked = key;
+        blocked.oauth_invalid_at_unix_secs = Some(1_721_440_000);
+        blocked.oauth_invalid_reason = Some("oauth refresh rejected".to_string());
+        state
+            .update_provider_catalog_key_runtime_state(&blocked)
+            .await
+            .expect("restrictive runtime state should persist")
+            .expect("key should update");
+
+        assert_eq!(state.scheduler_affinity_epoch(), initial_scheduler_epoch);
+        let blocked_lease = crate::codex_ws::hot_state::ensure_key_hot_leases(
+            &state,
+            std::slice::from_ref(&blocked),
+        )
+        .await
+        .expect("blocked key hot state should read")
+        .remove(&blocked.id)
+        .expect("blocked key lease should exist");
+        assert!(!blocked_lease.eligible);
+        assert_ne!(blocked_lease.generation, initial_lease.generation);
     }
 }

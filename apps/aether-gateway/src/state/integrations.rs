@@ -199,6 +199,14 @@ impl ModelFetchRuntimeState for AppState {
         Ok(())
     }
 
+    async fn update_provider_catalog_key_runtime_state(
+        &self,
+        key: &StoredProviderCatalogKey,
+    ) -> Result<(), GatewayError> {
+        AppState::update_provider_catalog_key_runtime_state(self, key).await?;
+        Ok(())
+    }
+
     async fn write_upstream_models_cache(
         &self,
         provider_id: &str,
