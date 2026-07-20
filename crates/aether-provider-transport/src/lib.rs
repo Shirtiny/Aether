@@ -76,8 +76,9 @@ pub use generic_oauth::{
     supports_local_generic_oauth_request_auth_resolution, GenericOAuthRefreshAdapter,
 };
 pub use grok::{
-    apply_grok_chat_identity_headers, apply_grok_xai_responses_body_edits, build_grok_upstream_url,
-    grok_base_url, grok_chat_base_url, grok_using_api, is_grok_cli_chat_proxy_base_url,
+    apply_grok_chat_identity_headers, apply_grok_xai_body_edits, apply_grok_xai_chat_body_edits,
+    apply_grok_xai_responses_body_edits, build_grok_upstream_url, grok_base_url,
+    grok_chat_base_url, grok_using_api, is_grok_cli_chat_proxy_base_url,
     is_grok_provider_transport, resolve_grok_bearer_auth, resolve_grok_model_alias,
     GROK_API_BASE_URL, GROK_CLI_CHAT_PROXY_BASE_URL, GROK_DEFAULT_BASE_URL,
 };

@@ -462,7 +462,9 @@ async fn gateway_executes_codex_cli_stream_via_local_decision_gate_after_oauth_r
             format!("Bearer {client_api_key}"),
         )
         .header(TRACE_ID_HEADER, "trace-codex-cli-stream-local-123")
-        .body("{\"model\":\"gpt-5.4\",\"input\":\"hello\",\"stream\":true}")
+        .body(
+            "{\"model\":\"gpt-5.4\",\"input\":\"exercise execution runtime path\",\"stream\":true}",
+        )
         .send()
         .await
         .expect("request should succeed");

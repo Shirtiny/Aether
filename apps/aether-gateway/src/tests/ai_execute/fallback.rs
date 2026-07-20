@@ -536,7 +536,7 @@ async fn gateway_locally_denies_openai_responses_after_execution_runtime_miss_wi
         "openai",
         "responses",
         "openai:responses",
-        "{\"model\":\"gpt-5\",\"input\":\"hello\"}",
+        "{\"model\":\"gpt-5\",\"input\":\"exercise execution runtime path\"}",
         "请求缺少有效的用户或 API Key 认证上下文，无法选择上游提供商",
     )
     .await;
@@ -564,7 +564,7 @@ async fn gateway_locally_denies_openai_responses_stream_after_execution_runtime_
         "openai",
         "responses",
         "openai:responses",
-        "{\"model\":\"gpt-5\",\"input\":\"hello\",\"stream\":true}",
+        "{\"model\":\"gpt-5\",\"input\":\"exercise execution runtime path\",\"stream\":true}",
         "请求缺少有效的用户或 API Key 认证上下文，无法选择上游提供商",
     )
     .await;
@@ -592,7 +592,7 @@ async fn gateway_locally_denies_openai_responses_compact_after_execution_runtime
         "openai",
         "responses:compact",
         "openai:responses:compact",
-        "{\"model\":\"gpt-5\",\"input\":\"hello\"}",
+        "{\"model\":\"gpt-5\",\"input\":\"exercise execution runtime path\"}",
         "请求缺少有效的用户或 API Key 认证上下文，无法选择上游提供商",
     )
     .await;
@@ -606,7 +606,7 @@ async fn gateway_locally_denies_openai_responses_compact_stream_after_execution_
         "openai",
         "responses:compact",
         "openai:responses:compact",
-        "{\"model\":\"gpt-5\",\"input\":\"hello\",\"stream\":true}",
+        "{\"model\":\"gpt-5\",\"input\":\"exercise execution runtime path\",\"stream\":true}",
         "请求缺少有效的用户或 API Key 认证上下文，无法选择上游提供商",
     )
     .await;

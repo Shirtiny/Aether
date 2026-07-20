@@ -217,6 +217,11 @@ pub(crate) async fn resolve_local_openai_chat_candidate_payload_parts(
             "openai:chat",
             Some(body_json),
         );
+        crate::ai_serving::transport::grok::apply_grok_xai_body_edits(
+            &mut provider_request_body,
+            transport.provider.provider_type.as_str(),
+            "openai:chat",
+        );
 
         let Some(upstream_url) = build_local_openai_chat_upstream_url(parts, transport) else {
             mark_skipped_local_openai_chat_candidate_with_failure_diagnostic(
@@ -511,6 +516,11 @@ pub(crate) async fn resolve_local_openai_chat_candidate_payload_parts(
         transport.endpoint.base_url.as_str(),
         provider_api_format.as_str(),
         Some(body_json),
+    );
+    crate::ai_serving::transport::grok::apply_grok_xai_body_edits(
+        &mut provider_request_body,
+        transport.provider.provider_type.as_str(),
+        provider_api_format.as_str(),
     );
 
     if let Some(kiro_auth) = kiro_auth.as_ref() {

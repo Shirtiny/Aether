@@ -2074,6 +2074,11 @@ fn local_execution_runtime_miss_diagnostic_detail(
                 "已尝试所有本地执行候选提供商，但没有任何候选成功完成请求（{route_label}，原因代码: execution_runtime_candidates_exhausted）"
             ));
         }
+        "execution_runtime_candidates_skipped_before_provider_execution" => {
+            return Some(format!(
+                "本地执行候选已构建，但全部在进入上游执行前被运行时保护或资源状态检查跳过（{route_label}，原因代码: execution_runtime_candidates_skipped_before_provider_execution）"
+            ));
+        }
         "candidate_evaluation_incomplete" => {
             return Some(format!(
                 "本地执行候选评估未完成，暂时无法为本次{request_mode}请求选择上游提供商（{route_label}，原因代码: candidate_evaluation_incomplete）"
@@ -2550,6 +2555,34 @@ mod tests {
             detail.as_deref(),
             Some(
                 "请求缺少有效的用户或 API Key 认证上下文，无法选择上游提供商（Claude Messages，原因代码: missing_auth_context）"
+            )
+        );
+    }
+
+    #[test]
+    fn runtime_miss_detail_explains_when_candidates_were_skipped_before_provider_execution() {
+        let decision = GatewayControlDecision::synthetic(
+            "/v1/responses",
+            Some("ai_public".to_string()),
+            Some("openai".to_string()),
+            Some("responses".to_string()),
+            Some("openai:responses".to_string()),
+        );
+        let diagnostic = LocalExecutionRuntimeMissDiagnostic {
+            reason: "execution_runtime_candidates_skipped_before_provider_execution".to_string(),
+            requested_model: Some("grok-4.5".to_string()),
+            candidate_count: Some(2),
+            skipped_candidate_count: Some(2),
+            ..LocalExecutionRuntimeMissDiagnostic::default()
+        };
+
+        let detail =
+            local_execution_runtime_miss_detail(Some(&decision), Some(&diagnostic), false, true);
+
+        assert_eq!(
+            detail.as_deref(),
+            Some(
+                "本地执行候选已构建，但全部在进入上游执行前被运行时保护或资源状态检查跳过（OpenAI Responses，原因代码: execution_runtime_candidates_skipped_before_provider_execution）"
             )
         );
     }

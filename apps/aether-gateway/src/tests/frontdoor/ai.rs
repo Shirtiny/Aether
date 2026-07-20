@@ -1122,7 +1122,7 @@ async fn gateway_does_not_locally_reject_image_model_name_on_chat_completions() 
         .body(
             serde_json::to_vec(&json!({
                 "model": "gpt-image-2",
-                "messages": [{"role": "user", "content": "hello"}]
+                "messages": [{"role": "user", "content": "exercise execution runtime path"}]
             }))
             .expect("request body should encode"),
         )

@@ -1,5 +1,5 @@
 use aether_ai_serving::{
-    apply_ai_runtime_candidate_evaluation_progress,
+    apply_ai_runtime_attempts_exhausted, apply_ai_runtime_candidate_evaluation_progress,
     apply_ai_runtime_candidate_evaluation_progress_preserving_candidate_signal,
     apply_ai_runtime_candidate_evaluation_progress_to_diagnostic,
     apply_ai_runtime_candidate_terminal_plan_reason_to_diagnostic,
@@ -244,6 +244,15 @@ pub(crate) fn apply_local_runtime_candidate_terminal_reason(
 ) {
     let port = GatewayRuntimeMissDiagnosticPort { state: Some(state) };
     apply_ai_runtime_candidate_terminal_reason(&port, trace_id, no_plan_reason);
+}
+
+pub(crate) fn apply_local_runtime_attempts_exhausted(
+    state: &AppState,
+    trace_id: &str,
+    provider_execution_attempted: bool,
+) {
+    let port = GatewayRuntimeMissDiagnosticPort { state: Some(state) };
+    apply_ai_runtime_attempts_exhausted(&port, trace_id, provider_execution_attempted);
 }
 
 pub(crate) fn record_local_runtime_candidate_skip_reason(

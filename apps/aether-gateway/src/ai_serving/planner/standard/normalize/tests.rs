@@ -103,6 +103,92 @@ fn builds_openai_chat_cross_format_request_body_from_openai_responses_source() {
 }
 
 #[test]
+fn grok_chat_cross_format_request_fills_required_tool_parameters() {
+    let body_json = json!({
+        "model": "grok-4.5",
+        "input": "hello",
+        "tools": [{"type": "web_search"}],
+    });
+    let body_rules = json!([{
+        "action": "drop",
+        "path": "tools[*].function.parameters"
+    }]);
+
+    let provider_request_body = build_cross_format_openai_responses_request_body(
+        &body_json,
+        "grok-4.5",
+        "openai:responses",
+        "openai:chat",
+        true,
+        false,
+        "grok",
+        Some(&body_rules),
+        None,
+        &http::HeaderMap::new(),
+        false,
+    )
+    .expect("grok chat request should build");
+
+    assert_eq!(
+        provider_request_body["tools"][0]["function"]["parameters"],
+        json!({"type": "object", "properties": {}})
+    );
+}
+
+#[test]
+fn grok_responses_request_sanitizes_codex_reasoning_history() {
+    let body_json = json!({
+        "model": "grok-4.5",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hello"}],
+                "internal_chat_message_metadata_passthrough": {"turn_id": "turn-1"}
+            },
+            {
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": "thinking"}],
+                "content": null,
+                "encrypted_content": null,
+                "internal_chat_message_metadata_passthrough": {"turn_id": "turn-1"}
+            }
+        ],
+        "client_metadata": {"client_version": "0.144.5"}
+    });
+
+    let provider_request_body = build_local_openai_responses_request_body(
+        &body_json,
+        "grok-4.5",
+        true,
+        false,
+        "grok",
+        "openai:responses",
+        None,
+        None,
+        &http::HeaderMap::new(),
+        false,
+    )
+    .expect("grok responses request should build");
+
+    assert!(provider_request_body.get("client_metadata").is_none());
+    assert!(provider_request_body["input"][0]
+        .get("internal_chat_message_metadata_passthrough")
+        .is_none());
+    assert!(provider_request_body["input"][1]
+        .get("internal_chat_message_metadata_passthrough")
+        .is_none());
+    assert!(provider_request_body["input"][1].get("content").is_none());
+    assert!(provider_request_body["input"][1]
+        .get("encrypted_content")
+        .is_none());
+    assert_eq!(
+        provider_request_body["input"][1]["summary"][0]["text"],
+        "thinking"
+    );
+}
+
+#[test]
 fn local_openai_responses_wrapper_preserves_body_order_after_edits() {
     let body_json: Value = serde_json::from_str(
         r#"{

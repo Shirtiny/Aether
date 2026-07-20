@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::snapshot::GatewayProviderTransportSnapshot;
 
@@ -203,6 +203,7 @@ pub fn apply_grok_xai_responses_body_edits(
         .is_some_and(|model| model.trim().eq_ignore_ascii_case("grok-4.5"));
     if let Some(object) = body.as_object_mut() {
         for field in [
+            "client_metadata",
             "prompt_cache_retention",
             "safety_identifier",
             "stream_options",
@@ -224,8 +225,58 @@ pub fn apply_grok_xai_responses_body_edits(
     aether_ai_formats::provider_compat::grok_responses::normalize_grok_responses_request_tools(
         body,
     );
+    sanitize_grok_xai_responses_input(body);
     sanitize_grok_xai_responses_tool_fields(body);
     remove_grok_xai_field_outside_schemas(body, "external_web_access");
+}
+
+pub fn apply_grok_xai_chat_body_edits(
+    body: &mut Value,
+    provider_type: &str,
+    provider_api_format: &str,
+) {
+    if !provider_type.trim().eq_ignore_ascii_case("grok")
+        || aether_ai_formats::normalize_api_format_alias(provider_api_format) != "openai:chat"
+    {
+        return;
+    }
+
+    let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for function in tools
+        .iter_mut()
+        .filter_map(Value::as_object_mut)
+        .filter(|tool| tool.get("type").and_then(Value::as_str) == Some("function"))
+        .filter_map(|tool| tool.get_mut("function"))
+        .filter_map(Value::as_object_mut)
+    {
+        function
+            .entry("parameters".to_string())
+            .or_insert_with(|| json!({"type": "object", "properties": {}}));
+    }
+}
+
+pub fn apply_grok_xai_body_edits(body: &mut Value, provider_type: &str, provider_api_format: &str) {
+    apply_grok_xai_chat_body_edits(body, provider_type, provider_api_format);
+    apply_grok_xai_responses_body_edits(body, provider_type, provider_api_format);
+}
+
+fn sanitize_grok_xai_responses_input(body: &mut Value) {
+    let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for item in input.iter_mut().filter_map(Value::as_object_mut) {
+        item.remove("internal_chat_message_metadata_passthrough");
+        if item.get("type").and_then(Value::as_str) != Some("reasoning") {
+            continue;
+        }
+        for field in ["content", "encrypted_content"] {
+            if item.get(field).is_some_and(Value::is_null) {
+                item.remove(field);
+            }
+        }
+    }
 }
 
 /// Remove only tool-declaration fields that xAI documents as request-rejected.
@@ -287,9 +338,9 @@ fn remove_grok_xai_field_outside_schemas(value: &mut Value, field: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_grok_chat_identity_headers, apply_grok_xai_responses_body_edits,
-        build_grok_upstream_url, grok_base_url, grok_chat_base_url, grok_using_api,
-        resolve_grok_bearer_auth, resolve_grok_model_alias,
+        apply_grok_chat_identity_headers, apply_grok_xai_chat_body_edits,
+        apply_grok_xai_responses_body_edits, build_grok_upstream_url, grok_base_url,
+        grok_chat_base_url, grok_using_api, resolve_grok_bearer_auth, resolve_grok_model_alias,
     };
     use crate::snapshot::{
         GatewayProviderTransportEndpoint, GatewayProviderTransportKey,
@@ -532,6 +583,77 @@ mod tests {
             .get("external_web_access")
             .is_none());
         assert_eq!(body["input"][0]["content"][0]["text"], "hello");
+    }
+
+    #[test]
+    fn sanitizes_codex_history_for_xai_responses_model_input() {
+        let mut body = serde_json::json!({
+            "model": "grok-4.5",
+            "client_metadata": {"client_version": "0.144.5"},
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hi"}],
+                    "internal_chat_message_metadata_passthrough": {"turn_id": "turn-1"}
+                },
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "thinking"}],
+                    "content": null,
+                    "encrypted_content": null,
+                    "internal_chat_message_metadata_passthrough": {"turn_id": "turn-1"}
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "hello"}],
+                    "internal_chat_message_metadata_passthrough": {"turn_id": "turn-1"}
+                }
+            ]
+        });
+
+        apply_grok_xai_responses_body_edits(&mut body, "grok", "openai:responses");
+
+        assert!(body.get("client_metadata").is_none());
+        for item in body["input"].as_array().expect("input") {
+            assert!(item
+                .get("internal_chat_message_metadata_passthrough")
+                .is_none());
+        }
+        assert!(body["input"][1].get("content").is_none());
+        assert!(body["input"][1].get("encrypted_content").is_none());
+        assert_eq!(body["input"][1]["summary"][0]["text"], "thinking");
+        assert_eq!(body["input"][2]["content"][0]["text"], "hello");
+    }
+
+    #[test]
+    fn fills_missing_grok_chat_function_parameters() {
+        let mut body = serde_json::json!({
+            "model": "grok-4.5",
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [
+                {"type": "function", "function": {"name": "web_search"}},
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "shell_command",
+                        "parameters": {"type": "object", "required": ["command"]}
+                    }
+                }
+            ]
+        });
+
+        apply_grok_xai_chat_body_edits(&mut body, "grok", "openai:chat");
+
+        assert_eq!(
+            body["tools"][0]["function"]["parameters"],
+            serde_json::json!({"type": "object", "properties": {}})
+        );
+        assert_eq!(
+            body["tools"][1]["function"]["parameters"],
+            serde_json::json!({"type": "object", "required": ["command"]})
+        );
     }
 
     #[test]

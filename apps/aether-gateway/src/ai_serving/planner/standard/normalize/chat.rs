@@ -82,7 +82,7 @@ pub(crate) fn build_cross_format_openai_chat_request_body(
         body_rules,
         user_api_key_id,
     );
-    crate::ai_serving::transport::grok::apply_grok_xai_responses_body_edits(
+    crate::ai_serving::transport::grok::apply_grok_xai_body_edits(
         &mut provider_request_body,
         provider_type,
         provider_api_format,

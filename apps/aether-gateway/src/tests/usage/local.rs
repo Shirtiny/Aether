@@ -811,6 +811,13 @@ async fn gateway_records_failed_usage_when_all_local_openai_chat_candidates_exha
     let response = send_request(gateway, request).await;
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        response
+            .headers()
+            .get(LOCAL_EXECUTION_RUNTIME_MISS_REASON_HEADER)
+            .and_then(|value| value.to_str().ok()),
+        Some("execution_runtime_candidates_exhausted")
+    );
     let body_json: serde_json::Value = serde_json::from_slice(
         &axum::body::to_bytes(response.into_body(), usize::MAX)
             .await

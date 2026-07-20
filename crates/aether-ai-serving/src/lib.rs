@@ -52,7 +52,8 @@ pub use aether_pool_core::{
     REQUEST_FAILURE_PENALTY, UNSCHEDULABLE_SCORE_CAP,
 };
 pub use attempt_loop::{
-    run_ai_attempt_loop, AiAttemptLoopOutcome, AiAttemptLoopPort, AiExecutionAttempt,
+    run_ai_attempt_loop, AiAttemptExecutionOutcome, AiAttemptLoopOutcome, AiAttemptLoopPort,
+    AiExecutionAttempt,
 };
 pub use attempt_plan::{
     build_ai_execution_decision_from_plan, build_ai_execution_plan_from_decision,
@@ -129,7 +130,7 @@ pub use request_body_diagnostics::{
     request_body_build_failure_extra_data, same_format_provider_request_body_failure_extra_data,
 };
 pub use runtime_miss::{
-    apply_ai_runtime_candidate_evaluation_progress,
+    apply_ai_runtime_attempts_exhausted, apply_ai_runtime_candidate_evaluation_progress,
     apply_ai_runtime_candidate_evaluation_progress_preserving_candidate_signal,
     apply_ai_runtime_candidate_evaluation_progress_to_diagnostic,
     apply_ai_runtime_candidate_terminal_plan_reason_to_diagnostic,

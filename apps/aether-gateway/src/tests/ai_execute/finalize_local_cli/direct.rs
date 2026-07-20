@@ -404,7 +404,7 @@ async fn gateway_executes_openai_responses_sync_upstream_stream_via_local_finali
             "Bearer sk-client-openai-cli-finalize-local",
         )
         .header(TRACE_ID_HEADER, "trace-openai-cli-stream-sync-direct-123")
-        .body("{\"model\":\"gpt-5\",\"input\":\"hello\"}")
+        .body("{\"model\":\"gpt-5\",\"input\":\"exercise execution runtime path\"}")
         .send()
         .await
         .expect("request should succeed");

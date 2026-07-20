@@ -2031,6 +2031,7 @@ fn ai_serving_runtime_miss_owns_local_execution_miss_state_machine() {
         "pub fn apply_ai_runtime_candidate_evaluation_progress_to_diagnostic",
         "pub fn apply_ai_runtime_candidate_terminal_plan_reason_to_diagnostic",
         "pub fn record_ai_runtime_candidate_skip_reason_on_diagnostic",
+        "pub fn apply_ai_runtime_attempts_exhausted",
     ] {
         assert!(
             serving_runtime_miss.contains(pattern),
@@ -2051,6 +2052,7 @@ fn ai_serving_runtime_miss_owns_local_execution_miss_state_machine() {
         "pub(crate) fn apply_local_runtime_candidate_evaluation_progress(",
         "pub(crate) fn apply_local_runtime_candidate_evaluation_progress_preserving_candidate_signal(",
         "pub(crate) fn apply_local_runtime_candidate_terminal_reason(",
+        "pub(crate) fn apply_local_runtime_attempts_exhausted(",
         "pub(crate) fn record_local_runtime_candidate_skip_reason(",
         "set_ai_runtime_miss_diagnostic_reason(",
         "build_ai_runtime_execution_exhausted_diagnostic(",
@@ -2059,6 +2061,7 @@ fn ai_serving_runtime_miss_owns_local_execution_miss_state_machine() {
         "record_ai_runtime_candidate_skip_reason_on_diagnostic(",
         "apply_ai_runtime_candidate_evaluation_progress_preserving_candidate_signal(",
         "record_ai_runtime_candidate_skip_reason(",
+        "apply_ai_runtime_attempts_exhausted(",
     ] {
         assert!(
             runtime_miss.contains(pattern),
@@ -2978,6 +2981,28 @@ fn ai_serving_standard_plan_builders_delegate_fallback_transport_policy() {
         assert!(
             provider_transport_standard.contains(pattern),
             "aether-provider-transport standard.rs should own fallback transport policy {pattern}"
+        );
+    }
+}
+
+#[test]
+fn ai_serving_grok_compatibility_finalizes_after_model_directives() {
+    for path in [
+        "apps/aether-gateway/src/ai_serving/planner/standard/family/request.rs",
+        "apps/aether-gateway/src/ai_serving/planner/standard/openai/chat/decision/request.rs",
+        "apps/aether-gateway/src/ai_serving/planner/standard/openai/responses/decision/request.rs",
+        "apps/aether-gateway/src/ai_serving/planner/passthrough/provider/family/request.rs",
+    ] {
+        let source = read_workspace_file(path);
+        let directive_offset = source
+            .rfind("apply_model_directive_mapping_patch(")
+            .expect("request builder should apply model directive mapping");
+        let grok_offset = source
+            .rfind("apply_grok_xai_body_edits(")
+            .expect("request builder should apply final Grok body compatibility edits");
+        assert!(
+            grok_offset > directive_offset,
+            "{path} should apply final Grok compatibility edits after model directive mapping"
         );
     }
 }

@@ -409,7 +409,7 @@ async fn gateway_executes_openai_responses_cross_format_upstream_stream_via_loca
             "Bearer sk-client-openai-cli-xfmt-stream",
         )
         .header(TRACE_ID_HEADER, "trace-openai-cli-xfmt-stream-123")
-        .body("{\"model\":\"gpt-5\",\"input\":\"hello\"}")
+        .body("{\"model\":\"gpt-5\",\"input\":\"exercise execution runtime path\"}")
         .send()
         .await
         .expect("request should succeed");
@@ -1451,7 +1451,7 @@ async fn gateway_executes_openai_responses_antigravity_cross_format_upstream_str
             TRACE_ID_HEADER,
             "trace-openai-cli-antigravity-xfmt-stream-123",
         )
-        .body("{\"model\":\"gpt-5\",\"input\":\"hello\"}")
+        .body("{\"model\":\"gpt-5\",\"input\":\"exercise execution runtime path\"}")
         .send()
         .await
         .expect("request should succeed");

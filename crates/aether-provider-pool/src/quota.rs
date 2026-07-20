@@ -284,6 +284,7 @@ pub(crate) fn provider_pool_quota_snapshot_exhausted_decision(
     }
     let exhausted = provider_pool_json_bool(quota_snapshot.get("exhausted"))?;
     if exhausted {
+        let requires_explicit_recovery_deadline = provider_type.trim().eq_ignore_ascii_case("grok");
         let now_unix_secs = provider_pool_current_unix_secs();
         let snapshot_observed_at =
             provider_pool_timestamp_unix_secs(quota_snapshot.get("observed_at"))
@@ -297,8 +298,8 @@ pub(crate) fn provider_pool_quota_snapshot_exhausted_decision(
             let mut saw_exhausted_window = false;
             let mut saw_active_exhausted_window = false;
             let mut windows_max_ratio = None::<f64>;
-            let top_level_reset_active =
-                provider_pool_reset_deadline_unix_secs(quota_snapshot, snapshot_observed_at)
+            let top_level_reset_active = requires_explicit_recovery_deadline
+                && provider_pool_reset_deadline_unix_secs(quota_snapshot, snapshot_observed_at)
                     .is_some_and(|reset_at| now_unix_secs.is_none_or(|now| reset_at > now));
 
             for window in windows.iter().filter_map(Value::as_object) {
@@ -308,12 +309,13 @@ pub(crate) fn provider_pool_quota_snapshot_exhausted_decision(
                 }
                 if provider_pool_quota_window_is_exhausted(window) {
                     saw_exhausted_window = true;
-                    let reset_active =
-                        provider_pool_reset_deadline_unix_secs(window, snapshot_observed_at)
-                            .is_some_and(|reset_at| now_unix_secs.is_none_or(|now| reset_at > now));
-                    // A raw exhausted flag without a recovery deadline is an
-                    // observation, not a permanent scheduling block. Runtime
-                    // error cooldowns provide the bounded fallback.
+                    let reset_active = match provider_pool_reset_deadline_unix_secs(
+                        window,
+                        snapshot_observed_at,
+                    ) {
+                        Some(reset_at) => now_unix_secs.is_none_or(|now| reset_at > now),
+                        None => !requires_explicit_recovery_deadline,
+                    };
                     if reset_active {
                         saw_active_exhausted_window = true;
                     }
@@ -332,6 +334,11 @@ pub(crate) fn provider_pool_quota_snapshot_exhausted_decision(
         } else if now_unix_secs.is_some_and(|now| {
             provider_pool_reset_deadline_elapsed(quota_snapshot, snapshot_observed_at, now)
         }) {
+            return Some(false);
+        } else if requires_explicit_recovery_deadline
+            && provider_pool_reset_deadline_unix_secs(quota_snapshot, snapshot_observed_at)
+                .is_none()
+        {
             return Some(false);
         }
     }
@@ -397,7 +404,7 @@ mod tests {
     }
 
     #[test]
-    fn exhausted_window_without_deadline_is_not_a_permanent_block() {
+    fn grok_exhausted_window_without_deadline_is_not_a_permanent_block() {
         let key = key_with_quota(json!({
             "provider_type": "grok",
             "exhausted": true,
@@ -409,6 +416,50 @@ mod tests {
         }));
         assert_eq!(
             provider_pool_quota_snapshot_exhausted_decision(&key, "grok"),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn non_grok_exhausted_window_without_deadline_remains_blocking() {
+        let key = key_with_quota(json!({
+            "provider_type": "antigravity",
+            "exhausted": true,
+            "windows": [{
+                "code": "gemini-2.5-pro",
+                "used_ratio": 1.0,
+                "is_exhausted": true
+            }]
+        }));
+        assert_eq!(
+            provider_pool_quota_snapshot_exhausted_decision(&key, "antigravity"),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn non_grok_healthy_windows_override_stale_top_level_exhaustion() {
+        let now = provider_pool_current_unix_secs().expect("clock");
+        let key = key_with_quota(json!({
+            "provider_type": "codex",
+            "observed_at": now,
+            "exhausted": true,
+            "reset_at": now + 120,
+            "windows": [
+                {
+                    "code": "weekly",
+                    "used_ratio": 0.0,
+                    "is_exhausted": false
+                },
+                {
+                    "code": "5h",
+                    "used_ratio": 0.0,
+                    "is_exhausted": false
+                }
+            ]
+        }));
+        assert_eq!(
+            provider_pool_quota_snapshot_exhausted_decision(&key, "codex"),
             Some(false)
         );
     }

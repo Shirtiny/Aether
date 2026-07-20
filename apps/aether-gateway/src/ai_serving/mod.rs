@@ -23,7 +23,8 @@ pub(crate) use self::finalize::internal::{
 pub(crate) use self::planner::{
     apply_codex_official_ws_handshake_headers, apply_codex_pool_concrete_account_profile,
     apply_codex_pool_concrete_account_profile_for_api_format,
-    apply_codex_pool_stable_client_headers, apply_local_runtime_candidate_terminal_reason,
+    apply_codex_pool_stable_client_headers, apply_local_runtime_attempts_exhausted,
+    apply_local_runtime_candidate_terminal_reason,
     build_codex_ws_local_openai_responses_request_body,
     build_compact_local_openai_responses_stream_plan_and_reports_for_kind_with_required_capabilities,
     build_gemini_stream_plan_from_decision, build_gemini_sync_plan_from_decision,

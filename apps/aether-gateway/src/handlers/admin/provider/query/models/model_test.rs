@@ -2800,6 +2800,11 @@ async fn provider_query_execute_standard_test_candidate(
             ));
         }
     };
+    crate::provider_transport::apply_grok_xai_body_edits(
+        &mut provider_request_body,
+        transport.provider.provider_type.as_str(),
+        provider_api_format,
+    );
     crate::ai_serving::enforce_request_body_stream_field(
         &mut provider_request_body,
         provider_api_format,

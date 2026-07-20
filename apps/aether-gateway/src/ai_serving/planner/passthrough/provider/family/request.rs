@@ -216,6 +216,11 @@ pub(crate) async fn resolve_local_same_format_provider_candidate_payload_parts(
             );
         }
     }
+    crate::ai_serving::transport::grok::apply_grok_xai_body_edits(
+        &mut base_provider_request_body,
+        prepared.transport.provider.provider_type.as_str(),
+        prepared.provider_api_format.as_str(),
+    );
 
     let antigravity_auth = if prepared.is_antigravity {
         match classify_local_antigravity_request_support(

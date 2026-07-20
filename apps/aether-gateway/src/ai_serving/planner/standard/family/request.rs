@@ -296,6 +296,17 @@ pub(crate) async fn resolve_local_standard_candidate_payload_parts(
     let transport_profile = crate::ai_serving::transport::resolve_transport_profile(transport);
     let provider_api_format = attempt.eligible.provider_api_format.as_str();
     let effective_headers = input.effective_headers(&parts.headers);
+    if spec_metadata.api_format == "gemini:generate_content"
+        && provider_api_format == "openai:image"
+        && gemini_request_is_image_generation(body_json)
+    {
+        return Ok(
+            resolve_local_gemini_image_to_openai_image_candidate_payload_parts(
+                state, parts, trace_id, body_json, input, attempt,
+            )
+            .await,
+        );
+    }
     if !crate::ai_serving::request_pair_allowed_for_transport(
         transport,
         spec_metadata.api_format,
@@ -571,6 +582,12 @@ pub(crate) async fn resolve_local_standard_candidate_payload_parts(
             Some(body_json),
         );
     }
+
+    crate::ai_serving::transport::grok::apply_grok_xai_body_edits(
+        &mut provider_request_body,
+        transport.provider.provider_type.as_str(),
+        provider_api_format,
+    );
 
     if let Some(kiro_auth) = kiro_auth.as_ref() {
         return Ok(build_kiro_cross_format_payload_parts(

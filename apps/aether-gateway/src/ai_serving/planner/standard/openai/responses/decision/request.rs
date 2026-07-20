@@ -592,6 +592,11 @@ pub(crate) async fn resolve_local_openai_responses_candidate_payload_parts(
         provider_api_format,
         Some(body_json),
     );
+    crate::ai_serving::transport::grok::apply_grok_xai_body_edits(
+        &mut base_provider_request_body,
+        transport.provider.provider_type.as_str(),
+        provider_api_format,
+    );
     let antigravity_auth = if is_antigravity {
         match classify_local_antigravity_request_support(
             transport,

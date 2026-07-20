@@ -1,5 +1,6 @@
 use aether_ai_serving::{
-    run_ai_attempt_loop, AiAttemptLoopOutcome, AiAttemptLoopPort, AiExecutionAttempt,
+    run_ai_attempt_loop, AiAttemptExecutionOutcome, AiAttemptLoopOutcome, AiAttemptLoopPort,
+    AiExecutionAttempt,
 };
 use aether_contracts::ExecutionPlan;
 use aether_data_contracts::repository::candidates::{
@@ -17,7 +18,7 @@ use std::sync::Arc;
 use tokio::time::{timeout, Duration};
 use tracing::{debug, warn, Instrument};
 
-use crate::ai_serving::LocalExecutionAttemptSource;
+use crate::ai_serving::{apply_local_runtime_attempts_exhausted, LocalExecutionAttemptSource};
 use crate::clock::current_unix_ms;
 use crate::control::GatewayControlDecision;
 use crate::execution_runtime::{execute_execution_runtime_stream, execute_execution_runtime_sync};
@@ -561,7 +562,10 @@ where
     type Exhaustion = crate::executor::LocalExecutionExhaustion;
     type Error = GatewayError;
 
-    async fn execute_attempt(&self, attempt: &T) -> Result<Option<Self::Response>, Self::Error> {
+    async fn execute_attempt(
+        &self,
+        attempt: &T,
+    ) -> Result<AiAttemptExecutionOutcome<Self::Response>, Self::Error> {
         let report_context = attempt.report_context();
         let context = LocalExecutionEffectContext {
             plan: attempt.execution_plan(),
@@ -594,7 +598,7 @@ where
                 skip_reason = skip_reason,
                 "gateway skipped local sync candidate after sticky pool collateral avoidance"
             );
-            return Ok(None);
+            return Ok(AiAttemptExecutionOutcome::SkippedBeforeProviderExecution);
         }
         let mut sticky_init_cleanup = match PoolAttemptStartCleanupGuard::new(self.state, context) {
             Ok(cleanup) => cleanup,
@@ -612,12 +616,12 @@ where
                     key_id = %attempt.execution_plan().key_id,
                     "gateway skipped a local sync candidate because sticky cleanup capacity was unavailable"
                 );
-                return Ok(None);
+                return Ok(AiAttemptExecutionOutcome::SkippedBeforeProviderExecution);
             }
         };
         let should_execute = prepare_pool_attempt_started_effect(self.state, context).await;
         if !should_execute {
-            return Ok(None);
+            return Ok(AiAttemptExecutionOutcome::SkippedBeforeProviderExecution);
         }
         if let Some(skip_reason) = provider_session_risk_control_skip_reason(
             self.state,
@@ -649,7 +653,7 @@ where
                 skip_reason = skip_reason,
                 "gateway skipped local sync candidate after same request triggered risk-control avoidance"
             );
-            return Ok(None);
+            return Ok(AiAttemptExecutionOutcome::SkippedBeforeProviderExecution);
         }
         let result = execute_execution_runtime_sync(
             self.state,
@@ -723,7 +727,10 @@ where
                 attempt.execution_plan().candidate_id.as_deref(),
             );
         }
-        Ok(response)
+        Ok(match response {
+            Some(response) => AiAttemptExecutionOutcome::Responded(response),
+            None => AiAttemptExecutionOutcome::FailedAfterProviderExecution,
+        })
     }
 
     async fn mark_unused_attempts(&self, attempts: Vec<T>) -> Result<(), Self::Error> {
@@ -735,7 +742,13 @@ where
         &self,
         last_plan: aether_contracts::ExecutionPlan,
         last_report_context: Option<serde_json::Value>,
+        provider_execution_attempted: bool,
     ) -> Result<Self::Exhaustion, Self::Error> {
+        apply_local_runtime_attempts_exhausted(
+            self.state,
+            self.trace_id,
+            provider_execution_attempted,
+        );
         warn!(
             event_name = "candidate_loop_exhausted",
             log_type = "ops",
@@ -875,15 +888,22 @@ where
     Attempt: AiExecutionAttempt + Send + Sync + 'static,
 {
     let mut last_attempted = None;
+    let mut provider_execution_attempted = false;
 
     while let Some(attempt) =
         next_execution_attempt_with_timeout(source, trace_id, plan_kind, planning_timeout).await?
     {
         last_attempted = Some((attempt.execution_plan().clone(), attempt.report_context()));
-        if let Some(response) = port.execute_attempt(&attempt).await? {
-            let remaining = source.drain_execution_attempts().await?;
-            port.mark_unused_attempts(remaining).await?;
-            return Ok(LocalExecutionRequestOutcome::responded(response));
+        match port.execute_attempt(&attempt).await? {
+            AiAttemptExecutionOutcome::Responded(response) => {
+                let remaining = source.drain_execution_attempts().await?;
+                port.mark_unused_attempts(remaining).await?;
+                return Ok(LocalExecutionRequestOutcome::responded(response));
+            }
+            AiAttemptExecutionOutcome::FailedAfterProviderExecution => {
+                provider_execution_attempted = true;
+            }
+            AiAttemptExecutionOutcome::SkippedBeforeProviderExecution => {}
         }
     }
 
@@ -892,7 +912,7 @@ where
     };
 
     Ok(LocalExecutionRequestOutcome::Exhausted(
-        port.build_exhaustion(last_plan, last_report_context)
+        port.build_exhaustion(last_plan, last_report_context, provider_execution_attempted)
             .await?,
     ))
 }
@@ -947,7 +967,10 @@ where
     type Exhaustion = crate::executor::LocalExecutionExhaustion;
     type Error = GatewayError;
 
-    async fn execute_attempt(&self, attempt: &T) -> Result<Option<Self::Response>, Self::Error> {
+    async fn execute_attempt(
+        &self,
+        attempt: &T,
+    ) -> Result<AiAttemptExecutionOutcome<Self::Response>, Self::Error> {
         let plan = attempt.execution_plan().clone();
         let report_context = attempt.report_context();
         let context = LocalExecutionEffectContext {
@@ -981,7 +1004,7 @@ where
                 skip_reason = skip_reason,
                 "gateway skipped local stream candidate after sticky pool collateral avoidance"
             );
-            return Ok(None);
+            return Ok(AiAttemptExecutionOutcome::SkippedBeforeProviderExecution);
         }
         let mut sticky_init_cleanup = match PoolAttemptStartCleanupGuard::new(self.state, context) {
             Ok(cleanup) => cleanup,
@@ -999,12 +1022,12 @@ where
                     key_id = %plan.key_id,
                     "gateway skipped a local stream candidate because sticky cleanup capacity was unavailable"
                 );
-                return Ok(None);
+                return Ok(AiAttemptExecutionOutcome::SkippedBeforeProviderExecution);
             }
         };
         let should_execute = prepare_pool_attempt_started_effect(self.state, context).await;
         if !should_execute {
-            return Ok(None);
+            return Ok(AiAttemptExecutionOutcome::SkippedBeforeProviderExecution);
         }
         if let Some(skip_reason) = provider_session_risk_control_skip_reason(
             self.state,
@@ -1036,7 +1059,7 @@ where
                 skip_reason = skip_reason,
                 "gateway skipped local stream candidate after same request triggered risk-control avoidance"
             );
-            return Ok(None);
+            return Ok(AiAttemptExecutionOutcome::SkippedBeforeProviderExecution);
         }
         let candidate_index = parse_request_candidate_report_context(report_context.as_ref())
             .and_then(|context| context.candidate_index)
@@ -1141,7 +1164,10 @@ where
             }
             attach_redaction_execution_candidate(response, watchdog_plan.candidate_id.as_deref());
         }
-        Ok(response)
+        Ok(match response {
+            Some(response) => AiAttemptExecutionOutcome::Responded(response),
+            None => AiAttemptExecutionOutcome::FailedAfterProviderExecution,
+        })
     }
 
     async fn mark_unused_attempts(&self, attempts: Vec<T>) -> Result<(), Self::Error> {
@@ -1153,7 +1179,13 @@ where
         &self,
         last_plan: aether_contracts::ExecutionPlan,
         last_report_context: Option<serde_json::Value>,
+        provider_execution_attempted: bool,
     ) -> Result<Self::Exhaustion, Self::Error> {
+        apply_local_runtime_attempts_exhausted(
+            self.state,
+            self.trace_id,
+            provider_execution_attempted,
+        );
         warn!(
             event_name = "candidate_loop_exhausted",
             log_type = "ops",

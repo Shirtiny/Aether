@@ -239,7 +239,7 @@ pub fn build_same_format_provider_request_body(
     {
         strip_gemini_function_response_ids(&mut provider_request_body);
     }
-    crate::grok::apply_grok_xai_responses_body_edits(
+    crate::grok::apply_grok_xai_body_edits(
         &mut provider_request_body,
         input.provider_type,
         input.provider_api_format,

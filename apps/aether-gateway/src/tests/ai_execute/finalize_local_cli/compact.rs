@@ -400,7 +400,7 @@ async fn gateway_executes_openai_responses_compact_openai_family_upstream_stream
             TRACE_ID_HEADER,
             "trace-openai-compact-openai-family-stream-123",
         )
-        .body("{\"model\":\"gpt-5\",\"input\":\"hello\"}")
+        .body("{\"model\":\"gpt-5\",\"input\":\"exercise execution runtime path\"}")
         .send()
         .await
         .expect("request should succeed");

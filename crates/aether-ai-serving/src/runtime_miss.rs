@@ -164,6 +164,26 @@ pub fn set_ai_runtime_execution_exhausted_diagnostic<Port>(
     );
 }
 
+pub fn apply_ai_runtime_attempts_exhausted<Port>(
+    port: &Port,
+    trace_id: &str,
+    provider_execution_attempted: bool,
+) where
+    Port: AiRuntimeMissDiagnosticPort,
+    Port::Diagnostic: AiRuntimeMissDiagnosticFields,
+{
+    port.mutate_runtime_miss_diagnostic(trace_id, |diagnostic| {
+        diagnostic.set_reason(
+            if provider_execution_attempted {
+                "execution_runtime_candidates_exhausted"
+            } else {
+                "execution_runtime_candidates_skipped_before_provider_execution"
+            }
+            .to_string(),
+        );
+    });
+}
+
 pub fn build_ai_runtime_candidate_evaluation_diagnostic<Port>(
     port: &Port,
     decision: &Port::Decision,
@@ -432,6 +452,49 @@ mod tests {
                 candidate_count: Some(2),
                 terminal_reason: Some("no_local_sync_plans"),
                 skip_reasons: BTreeMap::from([("transport_missing", 1)]),
+                ..Default::default()
+            })
+        );
+    }
+
+    #[test]
+    fn runtime_miss_marks_execution_exhausted_without_losing_candidate_signal() {
+        let port = TestPort::default();
+        apply_ai_runtime_candidate_evaluation_progress(&port, "trace-a", 3);
+        record_ai_runtime_candidate_skip_reason(&port, "trace-a", "transport_missing");
+        apply_ai_runtime_candidate_terminal_reason(&port, "trace-a", "no_local_stream_plans");
+
+        apply_ai_runtime_attempts_exhausted(&port, "trace-a", true);
+
+        let diagnostic = port.diagnostics.lock().unwrap().get("trace-a").cloned();
+        assert_eq!(
+            diagnostic,
+            Some(TestDiagnostic {
+                reason: "execution_runtime_candidates_exhausted".to_string(),
+                candidate_count: Some(3),
+                terminal_reason: Some("no_local_stream_plans"),
+                skip_reasons: BTreeMap::from([("transport_missing", 1)]),
+                ..Default::default()
+            })
+        );
+    }
+
+    #[test]
+    fn runtime_miss_distinguishes_pre_execution_skips_from_provider_failures() {
+        let port = TestPort::default();
+        apply_ai_runtime_candidate_evaluation_progress(&port, "trace-a", 2);
+        apply_ai_runtime_candidate_terminal_reason(&port, "trace-a", "no_local_stream_plans");
+
+        apply_ai_runtime_attempts_exhausted(&port, "trace-a", false);
+
+        let diagnostic = port.diagnostics.lock().unwrap().get("trace-a").cloned();
+        assert_eq!(
+            diagnostic,
+            Some(TestDiagnostic {
+                reason: "execution_runtime_candidates_skipped_before_provider_execution"
+                    .to_string(),
+                candidate_count: Some(2),
+                terminal_reason: Some("no_local_stream_plans"),
                 ..Default::default()
             })
         );

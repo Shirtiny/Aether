@@ -471,7 +471,7 @@ async fn gateway_executes_openai_responses_sync_via_local_decision_gate_with_loc
         .header("x-client-rename", "rename-openai-cli")
         .header("x-drop-me", "drop-openai-cli")
         .header(TRACE_ID_HEADER, "trace-openai-cli-local-123")
-        .body("{\"model\":\"gpt-5\",\"input\":\"hello\",\"metadata\":{\"client\":\"desktop-openai-cli\"},\"store\":false}")
+        .body("{\"model\":\"gpt-5\",\"input\":\"exercise execution runtime path\",\"metadata\":{\"client\":\"desktop-openai-cli\"},\"store\":false}")
         .send()
         .await
         .expect("request should succeed");
@@ -923,7 +923,7 @@ async fn gateway_waits_for_api_key_concurrency_slot_then_executes_openai_respons
             "Bearer sk-client-openai-cli-local-limit",
         )
         .header(TRACE_ID_HEADER, "trace-openai-cli-local-limit-123")
-        .body("{\"model\":\"gpt-5\",\"input\":\"hello\",\"store\":false}")
+        .body("{\"model\":\"gpt-5\",\"input\":\"exercise execution runtime path\",\"store\":false}")
         .send()
         .await
         .expect("request should succeed");
@@ -1274,7 +1274,7 @@ async fn gateway_returns_concurrency_limited_after_wait_budget_expires_for_opena
             "Bearer sk-client-openai-cli-local-timeout",
         )
         .header(TRACE_ID_HEADER, "trace-openai-cli-local-timeout-123")
-        .body("{\"model\":\"gpt-5\",\"input\":\"hello\",\"store\":false}")
+        .body("{\"model\":\"gpt-5\",\"input\":\"exercise execution runtime path\",\"store\":false}")
         .send()
         .await
         .expect("request should complete");
@@ -1583,7 +1583,7 @@ async fn gateway_returns_openai_responses_error_for_local_sync_failure_impl() {
             format!("Bearer {client_api_key}"),
         )
         .header(TRACE_ID_HEADER, "trace-openai-cli-local-error-123")
-        .body("{\"model\":\"gpt-5\",\"input\":\"hello\",\"metadata\":{\"client\":\"desktop-openai-cli\"},\"store\":false}")
+        .body("{\"model\":\"gpt-5\",\"input\":\"exercise execution runtime path\",\"metadata\":{\"client\":\"desktop-openai-cli\"},\"store\":false}")
         .send()
         .await
         .expect("request should succeed");
@@ -1958,7 +1958,7 @@ async fn gateway_returns_openai_responses_error_for_local_cross_format_gemini_cl
         )
         .header(TRACE_ID_HEADER, "trace-openai-cli-gemini-local-error-123")
         .body(
-            "{\"model\":\"gpt-5\",\"input\":\"hello\",\"metadata\":{\"client\":\"desktop-openai-cli\"},\"store\":false}",
+            "{\"model\":\"gpt-5\",\"input\":\"exercise execution runtime path\",\"metadata\":{\"client\":\"desktop-openai-cli\"},\"store\":false}",
         )
         .send()
         .await
@@ -2351,7 +2351,7 @@ async fn gateway_returns_openai_responses_error_for_local_cross_format_claude_sy
         )
         .header(TRACE_ID_HEADER, "trace-openai-cli-claude-local-error-123")
         .body(
-            "{\"model\":\"gpt-5\",\"input\":\"hello\",\"metadata\":{\"client\":\"desktop-openai-cli\"},\"store\":false}",
+            "{\"model\":\"gpt-5\",\"input\":\"exercise execution runtime path\",\"metadata\":{\"client\":\"desktop-openai-cli\"},\"store\":false}",
         )
         .send()
         .await
@@ -2736,7 +2736,7 @@ async fn gateway_returns_openai_responses_error_for_local_cross_format_claude_ch
         )
         .header(TRACE_ID_HEADER, "trace-openai-cli-claude-chat-local-error-123")
         .body(
-            "{\"model\":\"gpt-5\",\"input\":\"hello\",\"metadata\":{\"client\":\"desktop-openai-cli\"},\"store\":false}",
+            "{\"model\":\"gpt-5\",\"input\":\"exercise execution runtime path\",\"metadata\":{\"client\":\"desktop-openai-cli\"},\"store\":false}",
         )
         .send()
         .await
@@ -3123,7 +3123,7 @@ async fn gateway_returns_openai_responses_error_for_local_cross_format_gemini_ch
         )
         .header(TRACE_ID_HEADER, "trace-openai-cli-gemini-chat-local-error-123")
         .body(
-            "{\"model\":\"gpt-5\",\"input\":\"hello\",\"metadata\":{\"client\":\"desktop-openai-cli\"},\"store\":false}",
+            "{\"model\":\"gpt-5\",\"input\":\"exercise execution runtime path\",\"metadata\":{\"client\":\"desktop-openai-cli\"},\"store\":false}",
         )
         .send()
         .await
@@ -3580,7 +3580,7 @@ async fn gateway_executes_codex_cli_sync_via_local_decision_gate_after_oauth_ref
             format!("Bearer {client_api_key}"),
         )
         .header(TRACE_ID_HEADER, "trace-codex-cli-local-123")
-        .body("{\"model\":\"gpt-5.4\",\"input\":\"hello\"}")
+        .body("{\"model\":\"gpt-5.4\",\"input\":\"exercise execution runtime path\"}")
         .send()
         .await
         .expect("request should succeed");

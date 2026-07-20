@@ -467,7 +467,7 @@ async fn gateway_executes_openai_responses_compact_stream_via_local_decision_gat
         .header("x-client-rename", "rename-openai-compact")
         .header("x-drop-me", "drop-openai-compact")
         .header(TRACE_ID_HEADER, "trace-openai-compact-local-123")
-        .body("{\"model\":\"gpt-5\",\"input\":\"hello\",\"stream\":true,\"metadata\":{\"client\":\"desktop-openai-compact\"},\"store\":false}")
+        .body("{\"model\":\"gpt-5\",\"input\":\"exercise execution runtime path\",\"stream\":true,\"metadata\":{\"client\":\"desktop-openai-compact\"},\"store\":false}")
         .send()
         .await
         .expect("request should succeed");
