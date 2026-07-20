@@ -267,6 +267,15 @@ mod tests {
     }
 
     #[test]
+    fn disabled_configured_rule_does_not_match() {
+        let rules = parse_local_probe_intercept_rules(&serde_json::json!([
+            {"prompt": "hi", "response": "Hello!", "kind": "health", "enabled": false}
+        ]));
+
+        assert_eq!(local_probe_intercept_answer_from_rules("hi", &rules), None);
+    }
+
+    #[test]
     fn delay_bounds_are_normalized_and_capped() {
         assert_eq!(
             LocalProbeInterceptDelay::from_bounds(2_000, 900),

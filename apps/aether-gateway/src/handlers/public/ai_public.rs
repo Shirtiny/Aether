@@ -949,7 +949,6 @@ async fn maybe_build_local_openai_probe_response(
         return None;
     }
 
-    let is_execution_runtime_candidate = decision.is_execution_runtime_candidate();
     let request_body = request_body?;
     let payload = serde_json::from_slice::<Value>(request_body).ok()?;
     let probe = match (
@@ -967,13 +966,9 @@ async fn maybe_build_local_openai_probe_response(
         }
         _ => return None,
     };
-    if is_execution_runtime_candidate
-        && !probe.answer().is_strict_execution_runtime_probe()
-        && !(local_probe_has_authenticated_request(decision)
-            && local_probe_is_authenticated_execution_runtime_hi(decision, &payload))
-    {
-        return None;
-    }
+    // Reaching this point means an enabled operator-configured rule (or an
+    // arithmetic probe) matched exactly. Execution-runtime classification must
+    // not silently override the local-probe module's configured behavior.
     let model = payload
         .get("model")
         .and_then(Value::as_str)
@@ -1059,44 +1054,6 @@ impl OpenAiLocalProbeRequest {
             },
         }
     }
-}
-
-impl LocalProbeAnswer {
-    fn is_strict_execution_runtime_probe(&self) -> bool {
-        match self.kind {
-            LocalProbeKind::Arithmetic | LocalProbeKind::Ping => true,
-            LocalProbeKind::Health => self.text.trim().eq_ignore_ascii_case("OK"),
-        }
-    }
-}
-
-fn local_probe_has_authenticated_request(
-    decision: &crate::control::GatewayControlDecision,
-) -> bool {
-    decision.auth_context.as_ref().is_some_and(|auth_context| {
-        auth_context.access_allowed
-            && auth_context.local_rejection.is_none()
-            && !auth_context.user_id.trim().is_empty()
-            && !auth_context.api_key_id.trim().is_empty()
-    }) && decision.local_auth_rejection.is_none()
-}
-
-/// Execution-runtime traffic may contain ordinary conversational prompts that
-/// overlap broad health rules (for example `hello`). Only the exact authenticated
-/// `hi` probe observed from the account liveness checker is allowlisted here;
-/// explicit ping/arithmetic/`OK` probes remain covered by the strict path above.
-fn local_probe_is_authenticated_execution_runtime_hi(
-    decision: &crate::control::GatewayControlDecision,
-    payload: &Value,
-) -> bool {
-    let text = match decision.route_kind.as_deref() {
-        Some("responses") | Some("responses:compact") => {
-            extract_openai_responses_last_user_text(payload)
-        }
-        Some("chat") => extract_openai_chat_last_user_text(payload),
-        _ => None,
-    };
-    text.is_some_and(|text| crate::local_probe_intercept::local_probe_prompt_key(&text) == "hi")
 }
 
 fn extract_openai_responses_last_user_text(payload: &Value) -> Option<String> {
@@ -2498,9 +2455,7 @@ mod tests {
         parse_openai_image_validation_input, validate_openai_image_n, LocalProbeKind,
         OpenAiImageOperation, LOCAL_PROBE_RESPONSE_HEADER,
     };
-    use crate::control::{
-        GatewayControlAuthContext, GatewayControlDecision, GatewayPublicRequestContext,
-    };
+    use crate::control::{GatewayControlDecision, GatewayPublicRequestContext};
     use crate::data::GatewayDataState;
     use crate::local_probe_intercept::{
         LOCAL_PROBE_INTERCEPT_DELAY_MAX_MS_KEY, LOCAL_PROBE_INTERCEPT_DELAY_MIN_MS_KEY,
@@ -2567,27 +2522,6 @@ mod tests {
                     (LOCAL_PROBE_INTERCEPT_DELAY_MAX_MS_KEY.to_string(), json!(0)),
                 ]),
             )
-    }
-
-    fn authenticated_execution_runtime_decision(
-        mut decision: GatewayControlDecision,
-    ) -> GatewayControlDecision {
-        decision.auth_context = Some(GatewayControlAuthContext {
-            user_id: "user-probe".to_string(),
-            api_key_id: "key-probe".to_string(),
-            username: Some("probe-user".to_string()),
-            api_key_name: Some("probe-key".to_string()),
-            balance_remaining: Some(1.0),
-            access_allowed: true,
-            user_rate_limit: None,
-            api_key_rate_limit: None,
-            api_key_is_standalone: false,
-            admin_bypass_limits: false,
-            local_rejection: None,
-            allowed_models: None,
-            ip_rules: None,
-        });
-        decision
     }
 
     #[test]
@@ -2779,7 +2713,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn openai_local_probe_does_not_intercept_unauthenticated_runtime_broad_health_rule() {
+    async fn openai_local_probe_intercepts_execution_runtime_configured_responses_rule() {
         let state = probe_default_rules_test_state();
         let request_context = GatewayPublicRequestContext {
             trace_id: "trace-local-runtime-broad-health-skip".to_string(),
@@ -2801,7 +2735,7 @@ mod tests {
         };
         let body = Bytes::from_static(br#"{"model":"gpt-5","input":"hello"}"#);
 
-        assert!(maybe_build_local_openai_probe_response(
+        let response = maybe_build_local_openai_probe_response(
             &state,
             &request_context,
             None,
@@ -2809,20 +2743,26 @@ mod tests {
             None,
         )
         .await
-        .is_none());
+        .expect("enabled configured rules should apply to execution-runtime requests");
+
+        assert_eq!(response.status(), http::StatusCode::OK);
+        assert_eq!(
+            response.headers().get(LOCAL_PROBE_RESPONSE_HEADER),
+            Some(&HeaderValue::from_static("health"))
+        );
     }
 
     #[tokio::test]
-    async fn openai_local_probe_intercepts_authenticated_runtime_chat_hi() {
+    async fn openai_local_probe_intercepts_execution_runtime_configured_chat_hi() {
         let state = probe_default_rules_test_state();
         let request_context = GatewayPublicRequestContext {
-            trace_id: "trace-authenticated-runtime-hi-probe".to_string(),
+            trace_id: "trace-runtime-configured-hi-probe".to_string(),
             request_method: http::Method::POST,
             request_path: "/v1/chat/completions".to_string(),
             request_query_string: None,
             request_content_type: Some("application/json".to_string()),
             host_header: None,
-            control_decision: Some(authenticated_execution_runtime_decision(
+            control_decision: Some(
                 GatewayControlDecision::synthetic(
                     "/v1/chat/completions",
                     Some("ai_public".to_string()),
@@ -2831,7 +2771,7 @@ mod tests {
                     Some("openai:chat".to_string()),
                 )
                 .with_execution_runtime_candidate(true),
-            )),
+            ),
         };
         let body = Bytes::from_static(
             br#"{"model":"grok-4.5","stream":false,"messages":[{"role":"user","content":"hi"}]}"#,
@@ -2845,7 +2785,7 @@ mod tests {
             None,
         )
         .await
-        .expect("authenticated configured hi probes should be handled locally");
+        .expect("enabled configured hi rules should be handled locally");
 
         assert_eq!(response.status(), http::StatusCode::OK);
         assert_eq!(
@@ -2855,16 +2795,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn openai_local_probe_does_not_intercept_authenticated_runtime_chat_hello() {
+    async fn openai_local_probe_intercepts_execution_runtime_configured_chat_hello() {
         let state = probe_default_rules_test_state();
         let request_context = GatewayPublicRequestContext {
-            trace_id: "trace-authenticated-runtime-hello-normal-request".to_string(),
+            trace_id: "trace-runtime-configured-hello-probe".to_string(),
             request_method: http::Method::POST,
             request_path: "/v1/chat/completions".to_string(),
             request_query_string: None,
             request_content_type: Some("application/json".to_string()),
             host_header: None,
-            control_decision: Some(authenticated_execution_runtime_decision(
+            control_decision: Some(
                 GatewayControlDecision::synthetic(
                     "/v1/chat/completions",
                     Some("ai_public".to_string()),
@@ -2873,13 +2813,13 @@ mod tests {
                     Some("openai:chat".to_string()),
                 )
                 .with_execution_runtime_candidate(true),
-            )),
+            ),
         };
         let body = Bytes::from_static(
             br#"{"model":"grok-4.5","stream":false,"messages":[{"role":"user","content":"hello"}]}"#,
         );
 
-        assert!(maybe_build_local_openai_probe_response(
+        let response = maybe_build_local_openai_probe_response(
             &state,
             &request_context,
             None,
@@ -2887,7 +2827,13 @@ mod tests {
             None,
         )
         .await
-        .is_none());
+        .expect("enabled configured hello rules should be handled locally");
+
+        assert_eq!(response.status(), http::StatusCode::OK);
+        assert_eq!(
+            response.headers().get(LOCAL_PROBE_RESPONSE_HEADER),
+            Some(&HeaderValue::from_static("health"))
+        );
     }
 
     #[tokio::test]
