@@ -2431,6 +2431,70 @@ async fn pool_provider_ignores_key_circuit_open_runtime_skip() {
 }
 
 #[tokio::test]
+async fn pool_provider_defers_representative_key_concurrency_to_pool_expansion() {
+    let row = provider_key_concurrency_row(
+        "test-provider-a",
+        "endpoint-a",
+        "provider-key-a",
+        "alpha",
+        0,
+        0,
+    );
+    let candidates = Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(vec![
+        row,
+    ]));
+    let mut pool_provider = sample_provider("test-provider-a", None);
+    pool_provider.config = Some(serde_json::json!({"pool_advanced": {"enabled": true}}));
+    let provider_catalog = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![pool_provider],
+        Vec::new(),
+        vec![provider_key_with_concurrent_limit(
+            "provider-key-a",
+            "test-provider-a",
+            Some(1),
+        )],
+    ));
+    let quotas = Arc::new(InMemoryProviderQuotaRepository::seed(vec![]));
+    let request_candidates = Arc::new(InMemoryRequestCandidateRepository::seed(vec![
+        active_provider_key_candidate(
+            "cand-provider-key-a",
+            "req-provider-key-a",
+            "test-provider-a",
+            "endpoint-a",
+            "provider-key-a",
+            RequestCandidateStatus::Pending,
+        ),
+    ]));
+    let state = AppState::new()
+        .expect("state should build")
+        .with_data_state_for_tests(
+            GatewayDataState::with_candidate_selection_provider_catalog_quota_and_request_candidates_for_tests(
+                candidates,
+                provider_catalog,
+                quotas,
+                request_candidates,
+            ),
+        );
+
+    let (selected, skipped) = collect_selectable_candidates_with_skip_reasons(
+        state.data.as_ref(),
+        &state,
+        "openai:chat",
+        "gpt-4.1",
+        false,
+        None,
+        100,
+    )
+    .await
+    .expect("selection should succeed");
+
+    assert_eq!(selected.len(), 1);
+    assert_eq!(selected[0].provider_id, "test-provider-a");
+    assert_eq!(selected[0].key_id, "provider-key-a");
+    assert!(skipped.is_empty());
+}
+
+#[tokio::test]
 async fn exposes_runtime_skipped_candidates_with_skip_reasons() {
     let mut first = sample_row();
     first.provider_id = "provider-a".to_string();

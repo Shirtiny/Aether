@@ -186,11 +186,20 @@ pub(super) fn is_candidate_selectable(
     let pool_group = snapshot
         .pool_provider_ids
         .contains(candidate.provider_id.as_str());
+    let empty_provider_key_runtime_states = BTreeMap::new();
+    let provider_key_runtime_states = if pool_group {
+        &empty_provider_key_runtime_states
+    } else {
+        &snapshot.provider_key_rpm_states
+    };
     candidate_is_selectable_with_runtime_state(CandidateRuntimeSelectabilityInput {
         candidate,
         recent_candidates: &snapshot.recent_candidates,
         provider_concurrent_limits: &snapshot.provider_concurrent_limits,
-        provider_key_rpm_states: &snapshot.provider_key_rpm_states,
+        // A pool candidate is only a logical group represented by one arbitrary key.
+        // Key-local runtime gates must run after the group is expanded, otherwise a
+        // saturated representative key incorrectly hides other available pool keys.
+        provider_key_rpm_states: provider_key_runtime_states,
         now_unix_secs,
         provider_quota_blocks_requests: snapshot
             .provider_quota_blocks_requests
@@ -233,6 +242,12 @@ pub(super) fn current_candidate_runtime_skip_reason(
     let pool_group = snapshot
         .pool_provider_ids
         .contains(candidate.provider_id.as_str());
+    let empty_provider_key_runtime_states = BTreeMap::new();
+    let provider_key_runtime_states = if pool_group {
+        &empty_provider_key_runtime_states
+    } else {
+        &snapshot.provider_key_rpm_states
+    };
     let provider_quota_blocks_requests = snapshot
         .provider_quota_blocks_requests
         .get(candidate.provider_id.as_str())
@@ -276,7 +291,7 @@ pub(super) fn current_candidate_runtime_skip_reason(
         candidate,
         recent_candidates: &snapshot.recent_candidates,
         provider_concurrent_limits: &snapshot.provider_concurrent_limits,
-        provider_key_rpm_states: &snapshot.provider_key_rpm_states,
+        provider_key_rpm_states: provider_key_runtime_states,
         now_unix_secs,
         provider_quota_blocks_requests,
         account_quota_exhausted: !pool_group

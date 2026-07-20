@@ -9,6 +9,7 @@ use aether_data_contracts::repository::candidate_selection::{
     StoredMinimalCandidateSelectionRow, StoredPoolKeyCandidateOrder,
     StoredPoolKeyCandidateRowsByKeyIdsQuery, StoredPoolKeyCandidateRowsQuery,
 };
+use aether_data_contracts::repository::candidates::StoredRequestCandidate;
 use aether_data_contracts::repository::pool_scores::{
     ListRankedPoolMembersQuery, PoolMemberHardState, PoolMemberIdentity,
     PoolMemberScheduleFeedback, PoolScoreScope, StoredPoolMemberScore, POOL_KIND_PROVIDER_KEY_POOL,
@@ -22,6 +23,9 @@ use aether_pool_core::{
 };
 use aether_provider_pool::ProviderPoolService;
 use aether_routing_core::{RankingOverlay, ResolvedRoutingPolicy};
+use aether_scheduler_core::{
+    candidate_runtime_skip_reason_with_state, CandidateRuntimeSelectabilityInput,
+};
 use tokio::sync::Semaphore;
 use tokio::time::{sleep, Duration};
 use tracing::{debug, warn};
@@ -49,6 +53,8 @@ use crate::orchestration::LocalExecutionCandidateMetadata;
 static LOAD_BALANCE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static POOL_SCORE_SCHEDULE_INTEREST_SEMAPHORE: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(POOL_SCORE_SCHEDULE_INTEREST_CONCURRENCY)));
+static EMPTY_PROVIDER_CONCURRENT_LIMITS: LazyLock<BTreeMap<String, usize>> =
+    LazyLock::new(BTreeMap::new);
 const POOL_ACTIVE_PROBE_SEALED_SKIP_REASON: &str = "pool_active_probe_sealed";
 const ROUTING_PROFILE_DISALLOWED_KEY_SKIP_REASON: &str = "routing_profile_disallowed_key";
 const POOL_SCORE_SCHEDULE_INTEREST_CONCURRENCY: usize = 4;
@@ -80,6 +86,11 @@ enum PoolStickyInitGate {
 enum QueuedPoolCandidateOrigin {
     Scheduled,
     StickyHit,
+}
+
+struct PoolKeyRuntimeSnapshot {
+    recent_candidates: Vec<StoredRequestCandidate>,
+    now_unix_secs: u64,
 }
 
 enum StickyCandidateLookup {
@@ -135,6 +146,7 @@ async fn schedule_pool_page_candidates(
     state: PlannerAppState<'_>,
     candidates: Vec<EligibleLocalExecutionCandidate>,
     sticky_session_token: Option<&str>,
+    key_runtime_snapshot: &PoolKeyRuntimeSnapshot,
 ) -> (
     Vec<EligibleLocalExecutionCandidate>,
     Vec<SkippedLocalExecutionCandidate>,
@@ -155,7 +167,17 @@ async fn schedule_pool_page_candidates(
         entry.1.insert(candidate.candidate.key_id.clone());
     }
 
-    let key_context_by_id = read_pool_catalog_key_contexts_by_id(state, &candidates).await;
+    let (provider_key_runtime_states, key_context_by_id) =
+        read_pool_catalog_key_runtime_by_id(state, &candidates).await;
+    let (candidates, mut skipped) = filter_pool_page_candidates_by_key_runtime(
+        state,
+        candidates,
+        &provider_key_runtime_states,
+        key_runtime_snapshot,
+    );
+    if candidates.is_empty() {
+        return (Vec::new(), skipped);
+    }
 
     let mut runtime_by_provider = BTreeMap::new();
     let mut pool_config_by_provider = BTreeMap::new();
@@ -201,7 +223,7 @@ async fn schedule_pool_page_candidates(
         &key_context_by_id,
     );
     let scheduled = outcome.candidates;
-    let skipped = outcome.skipped;
+    skipped.extend(outcome.skipped);
     burst_provider_ids.extend(outcome.active_probe_seal_fallback_provider_ids);
     spawn_active_probe_member_evictions_for_request(
         state,
@@ -225,6 +247,69 @@ async fn schedule_pool_page_candidates(
     }
 
     (scheduled, skipped)
+}
+
+fn filter_pool_page_candidates_by_key_runtime(
+    state: PlannerAppState<'_>,
+    candidates: Vec<EligibleLocalExecutionCandidate>,
+    provider_key_runtime_states: &BTreeMap<String, StoredProviderCatalogKey>,
+    key_runtime_snapshot: &PoolKeyRuntimeSnapshot,
+) -> (
+    Vec<EligibleLocalExecutionCandidate>,
+    Vec<SkippedLocalExecutionCandidate>,
+) {
+    if provider_key_runtime_states.is_empty() {
+        return (candidates, Vec::new());
+    }
+
+    let mut available = Vec::with_capacity(candidates.len());
+    let mut skipped = Vec::new();
+
+    for candidate in candidates {
+        let skip_reason = pool_candidate_key_runtime_skip_reason(
+            state,
+            &candidate.candidate,
+            provider_key_runtime_states,
+            key_runtime_snapshot,
+        );
+        if let Some(skip_reason) = skip_reason {
+            skipped.push(SkippedLocalExecutionCandidate {
+                candidate: candidate.candidate.clone(),
+                skip_reason,
+                transport: Some(candidate.transport.clone()),
+                ranking: candidate.ranking.clone(),
+                extra_data: None,
+            });
+        } else {
+            available.push(candidate);
+        }
+    }
+
+    (available, skipped)
+}
+
+fn pool_candidate_key_runtime_skip_reason(
+    state: PlannerAppState<'_>,
+    candidate: &aether_scheduler_core::SchedulerMinimalCandidateSelectionCandidate,
+    provider_key_runtime_states: &BTreeMap<String, StoredProviderCatalogKey>,
+    key_runtime_snapshot: &PoolKeyRuntimeSnapshot,
+) -> Option<&'static str> {
+    let rpm_reset_at = state.app().provider_key_rpm_reset_at(
+        candidate.key_id.as_str(),
+        key_runtime_snapshot.now_unix_secs,
+    );
+    candidate_runtime_skip_reason_with_state(CandidateRuntimeSelectabilityInput {
+        candidate,
+        recent_candidates: &key_runtime_snapshot.recent_candidates,
+        provider_concurrent_limits: &EMPTY_PROVIDER_CONCURRENT_LIMITS,
+        provider_key_rpm_states: provider_key_runtime_states,
+        now_unix_secs: key_runtime_snapshot.now_unix_secs,
+        provider_quota_blocks_requests: false,
+        account_quota_exhausted: false,
+        oauth_invalid: false,
+        enforce_key_circuit_breaker: true,
+        rpm_reset_at,
+    })
 }
 
 async fn remove_active_probe_members_for_request(
@@ -437,6 +522,7 @@ pub(crate) struct PoolKeyCursor<'a> {
     sticky_bound_key_id: Option<String>,
     sticky_bound_key_ineligible_reason: Option<&'static str>,
     batched_transport_reads: bool,
+    key_runtime_snapshot: Option<PoolKeyRuntimeSnapshot>,
 }
 
 impl<'a> PoolKeyCursor<'a> {
@@ -517,6 +603,7 @@ impl<'a> PoolKeyCursor<'a> {
             sticky_bound_key_id: None,
             sticky_bound_key_ineligible_reason: None,
             batched_transport_reads: false,
+            key_runtime_snapshot: None,
         }
     }
 
@@ -538,6 +625,7 @@ impl<'a> PoolKeyCursor<'a> {
     }
 
     pub(crate) async fn next_key(&mut self) -> Option<EligibleLocalExecutionCandidate> {
+        self.ensure_key_runtime_snapshot().await;
         loop {
             match self.ensure_sticky_session_init_gate().await {
                 PoolStickyInitGate::Proceed => {}
@@ -1105,7 +1193,21 @@ impl<'a> PoolKeyCursor<'a> {
             };
         }
 
+        let provider_key_runtime_states = BTreeMap::from([(key.id.clone(), key.clone())]);
         let candidate = pool_candidate_from_catalog_key(&self.group, key);
+        if let Some(reason) = pool_candidate_key_runtime_skip_reason(
+            self.state,
+            &candidate,
+            &provider_key_runtime_states,
+            self.key_runtime_snapshot
+                .as_ref()
+                .expect("pool key runtime snapshot should be initialized"),
+        ) {
+            return StickyCandidateLookup::Ineligible {
+                bound_key_id: sticky_key_id,
+                reason,
+            };
+        }
         match self.build_eligible_candidate(candidate).await {
             Some(candidate) => StickyCandidateLookup::Candidate(candidate),
             None => StickyCandidateLookup::Ineligible {
@@ -1136,6 +1238,9 @@ impl<'a> PoolKeyCursor<'a> {
                 self.state,
                 candidates,
                 self.sticky_session_token.as_deref(),
+                self.key_runtime_snapshot
+                    .as_ref()
+                    .expect("pool key runtime snapshot should be initialized"),
             )
             .await;
             self.record_skipped_candidates(&skipped);
@@ -1151,6 +1256,32 @@ impl<'a> PoolKeyCursor<'a> {
             }
             return true;
         }
+    }
+
+    async fn ensure_key_runtime_snapshot(&mut self) {
+        if self.key_runtime_snapshot.is_some() {
+            return;
+        }
+
+        let recent_candidates = match self.state.app().read_recent_request_candidates(128).await {
+            Ok(candidates) => candidates,
+            Err(error) => {
+                warn!(
+                    event_name = "pool_group_key_runtime_load_failed",
+                    log_type = "event",
+                    provider_id = %self.group.candidate.provider_id,
+                    endpoint_id = %self.group.candidate.endpoint_id,
+                    model_id = %self.group.candidate.model_id,
+                    error = ?error,
+                    "gateway pool scheduler failed to read recent candidates for key runtime gates"
+                );
+                Vec::new()
+            }
+        };
+        self.key_runtime_snapshot = Some(PoolKeyRuntimeSnapshot {
+            recent_candidates,
+            now_unix_secs: current_unix_ms().saturating_div(1000),
+        });
     }
 
     async fn next_queued_candidate(&mut self) -> Option<EligibleLocalExecutionCandidate> {
@@ -1597,10 +1728,13 @@ fn pool_candidate_from_catalog_key(
     candidate
 }
 
-async fn read_pool_catalog_key_contexts_by_id(
+async fn read_pool_catalog_key_runtime_by_id(
     state: PlannerAppState<'_>,
     candidates: &[EligibleLocalExecutionCandidate],
-) -> BTreeMap<String, PoolCatalogKeyContext> {
+) -> (
+    BTreeMap<String, StoredProviderCatalogKey>,
+    BTreeMap<String, PoolCatalogKeyContext>,
+) {
     let mut key_ids = Vec::new();
     let mut provider_type_by_key_id = BTreeMap::<String, String>::new();
     let mut codex_quota_basis_by_key_id = BTreeMap::<String, String>::new();
@@ -1625,7 +1759,7 @@ async fn read_pool_catalog_key_contexts_by_id(
     }
 
     if key_ids.is_empty() {
-        return BTreeMap::new();
+        return (BTreeMap::new(), BTreeMap::new());
     }
 
     let keys = match state
@@ -1640,19 +1774,21 @@ async fn read_pool_catalog_key_contexts_by_id(
                 key_count = key_ids.len(),
                 "gateway pool scheduler: failed to read catalog key metadata"
             );
-            return BTreeMap::new();
+            return (BTreeMap::new(), BTreeMap::new());
         }
     };
 
     let provider_pool_service = ProviderPoolService::with_builtin_adapters();
 
-    keys.into_iter()
+    let mut provider_key_runtime_states = BTreeMap::new();
+    let key_context_by_id = keys
+        .into_iter()
         .map(|key| {
             let provider_type = provider_type_by_key_id
                 .get(&key.id)
                 .map(String::as_str)
                 .unwrap_or_default();
-            (
+            let context = (
                 key.id.clone(),
                 build_pool_catalog_key_context(
                     state,
@@ -1662,9 +1798,12 @@ async fn read_pool_catalog_key_contexts_by_id(
                     codex_quota_basis_by_key_id.get(&key.id).map(String::as_str),
                     codex_quota_soft_threshold_by_key_id.get(&key.id).copied(),
                 ),
-            )
+            );
+            provider_key_runtime_states.insert(key.id.clone(), key);
+            context
         })
-        .collect()
+        .collect();
+    (provider_key_runtime_states, key_context_by_id)
 }
 
 fn build_pool_catalog_key_context(
@@ -2143,10 +2282,15 @@ mod tests {
     use crate::state::FrontdoorRuntimeGuardConfig;
     use crate::{AppState, LocalExecutionRuntimeMissDiagnostic};
     use aether_data::repository::candidate_selection::InMemoryMinimalCandidateSelectionReadRepository;
+    use aether_data::repository::candidates::InMemoryRequestCandidateRepository;
     use aether_data::repository::pool_scores::InMemoryPoolMemberScoreRepository;
     use aether_data::repository::provider_catalog::InMemoryProviderCatalogReadRepository;
+    use aether_data::repository::quota::InMemoryProviderQuotaRepository;
     use aether_data_contracts::repository::candidate_selection::{
         StoredMinimalCandidateSelectionRow, StoredPoolKeyCandidateOrder,
+    };
+    use aether_data_contracts::repository::candidates::{
+        RequestCandidateStatus, StoredRequestCandidate,
     };
     use aether_data_contracts::repository::pool_scores::{
         PoolMemberHardState, PoolMemberIdentity, PoolMemberProbeStatus, StoredPoolMemberScore,
@@ -4856,6 +5000,93 @@ mod tests {
         assert!(skipped.iter().all(|candidate| {
             candidate.skip_reason == aether_pool_core::POOL_ACCOUNT_EXHAUSTED_SKIP_REASON
         }));
+    }
+
+    #[tokio::test]
+    async fn pool_key_cursor_skips_saturated_key_and_uses_available_pool_key() {
+        let provider_config = Some(json!({
+            "pool_advanced": {
+                "scheduling_presets": [
+                    {"preset": "no_weight", "enabled": true}
+                ]
+            }
+        }));
+        let (provider, endpoint, mut keys, rows) = large_pool_fixture(2, provider_config.clone());
+        keys[0].concurrent_limit = Some(1);
+        keys[1].concurrent_limit = Some(100);
+
+        let now_unix_ms = i64::try_from(crate::clock::current_unix_ms())
+            .expect("current unix timestamp should fit i64");
+        let active_candidate = StoredRequestCandidate::new(
+            "active-candidate-key-00000".to_string(),
+            "active-request-key-00000".to_string(),
+            None,
+            None,
+            None,
+            None,
+            0,
+            0,
+            Some("provider-pool".to_string()),
+            Some("endpoint-1".to_string()),
+            Some("key-00000".to_string()),
+            RequestCandidateStatus::Pending,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            now_unix_ms,
+            Some(now_unix_ms),
+            None,
+        )
+        .expect("active request candidate should build");
+        let data_state = GatewayDataState::with_candidate_selection_provider_catalog_quota_and_request_candidates_for_tests(
+            Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(rows)),
+            Arc::new(InMemoryProviderCatalogReadRepository::seed(
+                vec![provider],
+                vec![endpoint],
+                keys,
+            )),
+            Arc::new(InMemoryProviderQuotaRepository::seed(Vec::new())),
+            Arc::new(InMemoryRequestCandidateRepository::seed(vec![active_candidate])),
+        )
+        .with_encryption_key_for_tests(aether_crypto::DEVELOPMENT_ENCRYPTION_KEY);
+        let app = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(data_state);
+        let group = sample_eligible_candidate(
+            "provider-pool",
+            "endpoint-1",
+            "pool-group",
+            10,
+            provider_config,
+        );
+
+        let mut cursor = PoolKeyCursor::new(PlannerAppState::new(&app), group, None, None, None);
+        let candidate = cursor
+            .next_key()
+            .await
+            .expect("cursor should fall back to an available pool key");
+
+        assert_eq!(candidate.candidate.key_id, "key-00001");
+        assert_eq!(candidate.orchestration.pool_key_index, Some(0));
+        assert_eq!(
+            cursor
+                .skip_reason_counts
+                .get("provider_key_concurrency_limit_reached"),
+            Some(&1)
+        );
+        let skipped = cursor.take_skipped_candidates();
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].candidate.key_id, "key-00000");
+        assert_eq!(
+            skipped[0].skip_reason,
+            "provider_key_concurrency_limit_reached"
+        );
     }
 
     #[tokio::test]
