@@ -48,7 +48,7 @@ pub(crate) use self::pool_scores::{
 };
 pub(crate) use self::route::is_matching_stream_request as planner_is_matching_stream_request;
 pub(crate) use self::runtime_miss::{
-    apply_local_runtime_attempts_exhausted, apply_local_runtime_candidate_terminal_reason,
+    apply_local_runtime_candidate_terminal_reason, finalize_local_runtime_attempts_exhausted,
     record_local_runtime_candidate_skip_reason,
 };
 pub(crate) use self::specialized::{

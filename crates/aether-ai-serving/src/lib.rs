@@ -53,7 +53,7 @@ pub use aether_pool_core::{
 };
 pub use attempt_loop::{
     run_ai_attempt_loop, AiAttemptExecutionOutcome, AiAttemptLoopOutcome, AiAttemptLoopPort,
-    AiExecutionAttempt,
+    AiAttemptLoopProgress, AiExecutionAttempt,
 };
 pub use attempt_plan::{
     build_ai_execution_decision_from_plan, build_ai_execution_plan_from_decision,
@@ -130,16 +130,17 @@ pub use request_body_diagnostics::{
     request_body_build_failure_extra_data, same_format_provider_request_body_failure_extra_data,
 };
 pub use runtime_miss::{
-    apply_ai_runtime_attempts_exhausted, apply_ai_runtime_candidate_evaluation_progress,
+    apply_ai_runtime_candidate_evaluation_progress,
     apply_ai_runtime_candidate_evaluation_progress_preserving_candidate_signal,
     apply_ai_runtime_candidate_evaluation_progress_to_diagnostic,
     apply_ai_runtime_candidate_terminal_plan_reason_to_diagnostic,
     apply_ai_runtime_candidate_terminal_reason, build_ai_runtime_candidate_evaluation_diagnostic,
-    build_ai_runtime_execution_exhausted_diagnostic, record_ai_runtime_candidate_skip_reason,
-    record_ai_runtime_candidate_skip_reason_on_diagnostic,
+    build_ai_runtime_execution_exhausted_diagnostic, finalize_ai_runtime_attempts_exhausted,
+    record_ai_runtime_candidate_skip_reason, record_ai_runtime_candidate_skip_reason_on_diagnostic,
     set_ai_runtime_candidate_evaluation_diagnostic, set_ai_runtime_execution_exhausted_diagnostic,
     set_ai_runtime_miss_diagnostic_reason, AiRuntimeMissDiagnosticFields,
-    AiRuntimeMissDiagnosticPort,
+    AiRuntimeMissDiagnosticPort, EXECUTION_RUNTIME_CANDIDATES_EXHAUSTED_REASON,
+    EXECUTION_RUNTIME_CANDIDATES_SKIPPED_BEFORE_DISPATCH_REASON,
 };
 pub use surface_spec::{
     ai_gemini_files_spec_metadata, ai_openai_image_spec_metadata,

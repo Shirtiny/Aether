@@ -32,6 +32,14 @@ pub trait AiRuntimeMissDiagnosticPort: Send + Sync {
 
     fn set_runtime_miss_diagnostic(&self, trace_id: &str, diagnostic: Self::Diagnostic);
 
+    fn upsert_runtime_miss_diagnostic<F>(
+        &self,
+        trace_id: &str,
+        default: Self::Diagnostic,
+        apply: F,
+    ) where
+        F: FnOnce(&mut Self::Diagnostic) + Send;
+
     fn mutate_runtime_miss_diagnostic<F>(&self, trace_id: &str, apply: F)
     where
         F: FnOnce(&mut Self::Diagnostic) + Send;
@@ -42,6 +50,10 @@ pub trait AiRuntimeMissDiagnosticPort: Send + Sync {
 pub const AUTH_API_KEY_CONCURRENCY_LIMIT_SKIP_REASON: &str =
     "auth_api_key_concurrency_limit_reached";
 pub const LEGACY_API_KEY_CONCURRENCY_LIMIT_SKIP_REASON: &str = "api_key_concurrency_limit_reached";
+pub const EXECUTION_RUNTIME_CANDIDATES_EXHAUSTED_REASON: &str =
+    "execution_runtime_candidates_exhausted";
+pub const EXECUTION_RUNTIME_CANDIDATES_SKIPPED_BEFORE_DISPATCH_REASON: &str =
+    "execution_runtime_candidates_skipped_before_execution_dispatch";
 
 fn auth_api_key_concurrency_skip_count<Diagnostic>(diagnostic: &Diagnostic) -> usize
 where
@@ -52,6 +64,7 @@ where
 }
 
 pub trait AiRuntimeMissDiagnosticFields {
+    fn reason(&self) -> &str;
     fn set_reason(&mut self, reason: String);
     fn set_candidate_count(&mut self, candidate_count: usize);
     fn candidate_count(&self) -> Option<usize>;
@@ -59,6 +72,39 @@ pub trait AiRuntimeMissDiagnosticFields {
     fn skip_reason_count(&self, skip_reason: &str) -> usize;
     fn skip_reason_len(&self) -> usize;
     fn record_skip_reason(&mut self, skip_reason: &'static str);
+}
+
+fn ai_runtime_attempts_terminal_reason(reason: &str) -> bool {
+    matches!(
+        reason,
+        EXECUTION_RUNTIME_CANDIDATES_EXHAUSTED_REASON
+            | EXECUTION_RUNTIME_CANDIDATES_SKIPPED_BEFORE_DISPATCH_REASON
+    )
+}
+
+fn merge_ai_runtime_attempts_terminal_reason(
+    existing_reason: &str,
+    execution_dispatched: bool,
+) -> &'static str {
+    if execution_dispatched || existing_reason == EXECUTION_RUNTIME_CANDIDATES_EXHAUSTED_REASON {
+        EXECUTION_RUNTIME_CANDIDATES_EXHAUSTED_REASON
+    } else {
+        EXECUTION_RUNTIME_CANDIDATES_SKIPPED_BEFORE_DISPATCH_REASON
+    }
+}
+
+fn update_ai_runtime_candidate_count<Diagnostic>(
+    diagnostic: &mut Diagnostic,
+    candidate_count: usize,
+) where
+    Diagnostic: AiRuntimeMissDiagnosticFields,
+{
+    diagnostic.set_candidate_count(
+        diagnostic
+            .candidate_count()
+            .unwrap_or_default()
+            .max(candidate_count),
+    );
 }
 
 pub fn apply_ai_runtime_candidate_evaluation_progress_to_diagnostic<Diagnostic>(
@@ -136,7 +182,7 @@ where
         decision,
         plan_kind,
         requested_model,
-        "execution_runtime_candidates_exhausted",
+        EXECUTION_RUNTIME_CANDIDATES_EXHAUSTED_REASON,
     );
     port.set_candidate_count(&mut diagnostic, candidate_count);
     diagnostic
@@ -151,36 +197,46 @@ pub fn set_ai_runtime_execution_exhausted_diagnostic<Port>(
     candidate_count: usize,
 ) where
     Port: AiRuntimeMissDiagnosticPort,
+    Port::Diagnostic: AiRuntimeMissDiagnosticFields,
 {
-    port.set_runtime_miss_diagnostic(
-        trace_id,
-        build_ai_runtime_execution_exhausted_diagnostic(
-            port,
-            decision,
-            plan_kind,
-            requested_model,
-            candidate_count,
-        ),
+    let default = build_ai_runtime_execution_exhausted_diagnostic(
+        port,
+        decision,
+        plan_kind,
+        requested_model,
+        candidate_count,
     );
+    port.upsert_runtime_miss_diagnostic(trace_id, default, |diagnostic| {
+        let preserve_attempt_terminal_reason =
+            ai_runtime_attempts_terminal_reason(diagnostic.reason());
+        update_ai_runtime_candidate_count(diagnostic, candidate_count);
+        if !preserve_attempt_terminal_reason {
+            diagnostic.set_reason(EXECUTION_RUNTIME_CANDIDATES_EXHAUSTED_REASON.to_string());
+        }
+    });
 }
 
-pub fn apply_ai_runtime_attempts_exhausted<Port>(
+pub fn finalize_ai_runtime_attempts_exhausted<Port>(
     port: &Port,
     trace_id: &str,
-    provider_execution_attempted: bool,
+    decision: &Port::Decision,
+    plan_kind: &str,
+    requested_model: Option<&str>,
+    candidate_count: usize,
+    execution_dispatched: bool,
 ) where
     Port: AiRuntimeMissDiagnosticPort,
     Port::Diagnostic: AiRuntimeMissDiagnosticFields,
 {
-    port.mutate_runtime_miss_diagnostic(trace_id, |diagnostic| {
-        diagnostic.set_reason(
-            if provider_execution_attempted {
-                "execution_runtime_candidates_exhausted"
-            } else {
-                "execution_runtime_candidates_skipped_before_provider_execution"
-            }
-            .to_string(),
-        );
+    let reason = merge_ai_runtime_attempts_terminal_reason("", execution_dispatched);
+    let mut default =
+        port.build_runtime_miss_diagnostic(decision, plan_kind, requested_model, reason);
+    port.set_candidate_count(&mut default, candidate_count);
+    port.upsert_runtime_miss_diagnostic(trace_id, default, |diagnostic| {
+        let merged_reason =
+            merge_ai_runtime_attempts_terminal_reason(diagnostic.reason(), execution_dispatched);
+        diagnostic.set_reason(merged_reason.to_string());
+        update_ai_runtime_candidate_count(diagnostic, candidate_count);
     });
 }
 
@@ -359,6 +415,19 @@ mod tests {
                 .insert(trace_id.to_string(), diagnostic);
         }
 
+        fn upsert_runtime_miss_diagnostic<F>(
+            &self,
+            trace_id: &str,
+            default: Self::Diagnostic,
+            apply: F,
+        ) where
+            F: FnOnce(&mut Self::Diagnostic) + Send,
+        {
+            let mut diagnostics = self.diagnostics.lock().unwrap();
+            let diagnostic = diagnostics.entry(trace_id.to_string()).or_insert(default);
+            apply(diagnostic);
+        }
+
         fn mutate_runtime_miss_diagnostic<F>(&self, trace_id: &str, apply: F)
         where
             F: FnOnce(&mut Self::Diagnostic) + Send,
@@ -378,6 +447,10 @@ mod tests {
     }
 
     impl AiRuntimeMissDiagnosticFields for TestDiagnostic {
+        fn reason(&self) -> &str {
+            &self.reason
+        }
+
         fn set_reason(&mut self, reason: String) {
             self.reason = reason;
         }
@@ -464,7 +537,15 @@ mod tests {
         record_ai_runtime_candidate_skip_reason(&port, "trace-a", "transport_missing");
         apply_ai_runtime_candidate_terminal_reason(&port, "trace-a", "no_local_stream_plans");
 
-        apply_ai_runtime_attempts_exhausted(&port, "trace-a", true);
+        finalize_ai_runtime_attempts_exhausted(
+            &port,
+            "trace-a",
+            &TestDecision { id: "decision-a" },
+            "openai_chat",
+            Some("gpt-5"),
+            3,
+            true,
+        );
 
         let diagnostic = port.diagnostics.lock().unwrap().get("trace-a").cloned();
         assert_eq!(
@@ -480,21 +561,136 @@ mod tests {
     }
 
     #[test]
-    fn runtime_miss_distinguishes_pre_execution_skips_from_provider_failures() {
+    fn runtime_miss_distinguishes_pre_dispatch_skips_from_dispatched_failures() {
         let port = TestPort::default();
         apply_ai_runtime_candidate_evaluation_progress(&port, "trace-a", 2);
         apply_ai_runtime_candidate_terminal_reason(&port, "trace-a", "no_local_stream_plans");
 
-        apply_ai_runtime_attempts_exhausted(&port, "trace-a", false);
+        finalize_ai_runtime_attempts_exhausted(
+            &port,
+            "trace-a",
+            &TestDecision { id: "decision-a" },
+            "openai_chat",
+            Some("gpt-5"),
+            2,
+            false,
+        );
 
         let diagnostic = port.diagnostics.lock().unwrap().get("trace-a").cloned();
         assert_eq!(
             diagnostic,
             Some(TestDiagnostic {
-                reason: "execution_runtime_candidates_skipped_before_provider_execution"
-                    .to_string(),
+                reason: EXECUTION_RUNTIME_CANDIDATES_SKIPPED_BEFORE_DISPATCH_REASON.to_string(),
                 candidate_count: Some(2),
                 terminal_reason: Some("no_local_stream_plans"),
+                ..Default::default()
+            })
+        );
+    }
+
+    #[test]
+    fn generic_exhaustion_enrichment_preserves_attempt_terminal_reason_and_skip_context() {
+        let port = TestPort::default();
+        apply_ai_runtime_candidate_evaluation_progress(&port, "trace-a", 2);
+        record_ai_runtime_candidate_skip_reason(&port, "trace-a", "pool_account_blocked");
+        finalize_ai_runtime_attempts_exhausted(
+            &port,
+            "trace-a",
+            &TestDecision { id: "decision-a" },
+            "openai_chat",
+            Some("gpt-5"),
+            1,
+            false,
+        );
+
+        set_ai_runtime_execution_exhausted_diagnostic(
+            &port,
+            "trace-a",
+            &TestDecision { id: "decision-a" },
+            "openai_chat",
+            Some("gpt-5"),
+            3,
+        );
+
+        let diagnostic = port.diagnostics.lock().unwrap().get("trace-a").cloned();
+        assert_eq!(
+            diagnostic,
+            Some(TestDiagnostic {
+                reason: EXECUTION_RUNTIME_CANDIDATES_SKIPPED_BEFORE_DISPATCH_REASON.to_string(),
+                candidate_count: Some(3),
+                skip_reasons: BTreeMap::from([("pool_account_blocked", 1)]),
+                ..Default::default()
+            })
+        );
+    }
+
+    #[test]
+    fn attempts_terminal_reason_never_downgrades_after_an_earlier_dispatch() {
+        let port = TestPort::default();
+        finalize_ai_runtime_attempts_exhausted(
+            &port,
+            "trace-a",
+            &TestDecision { id: "decision-a" },
+            "standard_text",
+            Some("requested-model"),
+            1,
+            true,
+        );
+        finalize_ai_runtime_attempts_exhausted(
+            &port,
+            "trace-a",
+            &TestDecision { id: "decision-a" },
+            "standard_text",
+            Some("requested-model"),
+            2,
+            false,
+        );
+
+        let diagnostic = port.diagnostics.lock().unwrap().get("trace-a").cloned();
+        assert_eq!(
+            diagnostic,
+            Some(TestDiagnostic {
+                decision_id: "decision-a".to_string(),
+                plan_kind: "standard_text".to_string(),
+                requested_model: Some("requested-model".to_string()),
+                reason: EXECUTION_RUNTIME_CANDIDATES_EXHAUSTED_REASON.to_string(),
+                candidate_count: Some(2),
+                ..Default::default()
+            })
+        );
+    }
+
+    #[test]
+    fn attempts_terminal_reason_upgrades_when_a_later_group_dispatches() {
+        let port = TestPort::default();
+        finalize_ai_runtime_attempts_exhausted(
+            &port,
+            "trace-a",
+            &TestDecision { id: "decision-a" },
+            "standard_text",
+            Some("requested-model"),
+            2,
+            false,
+        );
+        finalize_ai_runtime_attempts_exhausted(
+            &port,
+            "trace-a",
+            &TestDecision { id: "decision-a" },
+            "standard_text",
+            Some("requested-model"),
+            1,
+            true,
+        );
+
+        let diagnostic = port.diagnostics.lock().unwrap().get("trace-a").cloned();
+        assert_eq!(
+            diagnostic,
+            Some(TestDiagnostic {
+                decision_id: "decision-a".to_string(),
+                plan_kind: "standard_text".to_string(),
+                requested_model: Some("requested-model".to_string()),
+                reason: EXECUTION_RUNTIME_CANDIDATES_EXHAUSTED_REASON.to_string(),
+                candidate_count: Some(2),
                 ..Default::default()
             })
         );

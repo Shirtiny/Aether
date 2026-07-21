@@ -1,11 +1,11 @@
 use aether_ai_serving::{
-    apply_ai_runtime_attempts_exhausted, apply_ai_runtime_candidate_evaluation_progress,
+    apply_ai_runtime_candidate_evaluation_progress,
     apply_ai_runtime_candidate_evaluation_progress_preserving_candidate_signal,
     apply_ai_runtime_candidate_evaluation_progress_to_diagnostic,
     apply_ai_runtime_candidate_terminal_plan_reason_to_diagnostic,
     apply_ai_runtime_candidate_terminal_reason, build_ai_runtime_candidate_evaluation_diagnostic,
-    build_ai_runtime_execution_exhausted_diagnostic, record_ai_runtime_candidate_skip_reason,
-    record_ai_runtime_candidate_skip_reason_on_diagnostic,
+    build_ai_runtime_execution_exhausted_diagnostic, finalize_ai_runtime_attempts_exhausted,
+    record_ai_runtime_candidate_skip_reason, record_ai_runtime_candidate_skip_reason_on_diagnostic,
     set_ai_runtime_candidate_evaluation_diagnostic, set_ai_runtime_execution_exhausted_diagnostic,
     set_ai_runtime_miss_diagnostic_reason, AiRuntimeMissDiagnosticFields,
     AiRuntimeMissDiagnosticPort,
@@ -19,6 +19,10 @@ struct GatewayRuntimeMissDiagnosticPort<'a> {
 }
 
 impl AiRuntimeMissDiagnosticFields for LocalExecutionRuntimeMissDiagnostic {
+    fn reason(&self) -> &str {
+        &self.reason
+    }
+
     fn set_reason(&mut self, reason: String) {
         self.reason = reason;
     }
@@ -108,6 +112,15 @@ impl AiRuntimeMissDiagnosticPort for GatewayRuntimeMissDiagnosticPort<'_> {
         self.state
             .expect("runtime miss diagnostic setter requires gateway state")
             .set_local_execution_runtime_miss_diagnostic(trace_id, diagnostic);
+    }
+
+    fn upsert_runtime_miss_diagnostic<F>(&self, trace_id: &str, default: Self::Diagnostic, apply: F)
+    where
+        F: FnOnce(&mut Self::Diagnostic) + Send,
+    {
+        self.state
+            .expect("runtime miss diagnostic upsert requires gateway state")
+            .upsert_local_execution_runtime_miss_diagnostic(trace_id, default, apply);
     }
 
     fn mutate_runtime_miss_diagnostic<F>(&self, trace_id: &str, apply: F)
@@ -246,13 +259,25 @@ pub(crate) fn apply_local_runtime_candidate_terminal_reason(
     apply_ai_runtime_candidate_terminal_reason(&port, trace_id, no_plan_reason);
 }
 
-pub(crate) fn apply_local_runtime_attempts_exhausted(
+pub(crate) fn finalize_local_runtime_attempts_exhausted(
     state: &AppState,
     trace_id: &str,
-    provider_execution_attempted: bool,
+    decision: &GatewayControlDecision,
+    plan_kind: &str,
+    requested_model: Option<&str>,
+    candidate_count: usize,
+    execution_dispatched: bool,
 ) {
     let port = GatewayRuntimeMissDiagnosticPort { state: Some(state) };
-    apply_ai_runtime_attempts_exhausted(&port, trace_id, provider_execution_attempted);
+    finalize_ai_runtime_attempts_exhausted(
+        &port,
+        trace_id,
+        decision,
+        plan_kind,
+        requested_model,
+        candidate_count,
+        execution_dispatched,
+    );
 }
 
 pub(crate) fn record_local_runtime_candidate_skip_reason(
@@ -291,4 +316,65 @@ pub(crate) fn upsert_local_runtime_candidate_selection_unavailable(
             diagnostic.requested_model = requested_model;
         },
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aether_ai_serving::EXECUTION_RUNTIME_CANDIDATES_SKIPPED_BEFORE_DISPATCH_REASON;
+
+    #[test]
+    fn outer_exhaustion_enrichment_preserves_pre_dispatch_terminal_reason() {
+        let state = AppState::new().expect("state should build");
+        let decision = GatewayControlDecision::synthetic(
+            "/v1/responses",
+            Some("ai_public".to_string()),
+            Some("openai".to_string()),
+            Some("responses".to_string()),
+            Some("openai:responses".to_string()),
+        );
+        let trace_id = "trace-pre-dispatch-exhaustion";
+
+        set_local_runtime_candidate_evaluation_diagnostic(
+            &state,
+            trace_id,
+            &decision,
+            "openai_responses_stream",
+            Some("grok-4.5"),
+            2,
+        );
+        record_local_runtime_candidate_skip_reason(&state, trace_id, "pool_account_blocked");
+        finalize_local_runtime_attempts_exhausted(
+            &state,
+            trace_id,
+            &decision,
+            "openai_responses_stream",
+            Some("grok-4.5"),
+            1,
+            false,
+        );
+
+        set_local_runtime_execution_exhausted_diagnostic(
+            &state,
+            trace_id,
+            &decision,
+            "openai_responses_stream",
+            Some("grok-4.5"),
+            3,
+        );
+
+        let diagnostic = state
+            .take_local_execution_runtime_miss_diagnostic(trace_id)
+            .expect("diagnostic should exist");
+        assert_eq!(
+            diagnostic.reason,
+            EXECUTION_RUNTIME_CANDIDATES_SKIPPED_BEFORE_DISPATCH_REASON
+        );
+        assert_eq!(diagnostic.candidate_count, Some(3));
+        assert_eq!(diagnostic.skipped_candidate_count, Some(1));
+        assert_eq!(
+            diagnostic.skip_reasons.get("pool_account_blocked"),
+            Some(&1)
+        );
+    }
 }

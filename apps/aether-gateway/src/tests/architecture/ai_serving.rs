@@ -2031,7 +2031,7 @@ fn ai_serving_runtime_miss_owns_local_execution_miss_state_machine() {
         "pub fn apply_ai_runtime_candidate_evaluation_progress_to_diagnostic",
         "pub fn apply_ai_runtime_candidate_terminal_plan_reason_to_diagnostic",
         "pub fn record_ai_runtime_candidate_skip_reason_on_diagnostic",
-        "pub fn apply_ai_runtime_attempts_exhausted",
+        "pub fn finalize_ai_runtime_attempts_exhausted",
     ] {
         assert!(
             serving_runtime_miss.contains(pattern),
@@ -2052,7 +2052,7 @@ fn ai_serving_runtime_miss_owns_local_execution_miss_state_machine() {
         "pub(crate) fn apply_local_runtime_candidate_evaluation_progress(",
         "pub(crate) fn apply_local_runtime_candidate_evaluation_progress_preserving_candidate_signal(",
         "pub(crate) fn apply_local_runtime_candidate_terminal_reason(",
-        "pub(crate) fn apply_local_runtime_attempts_exhausted(",
+        "pub(crate) fn finalize_local_runtime_attempts_exhausted(",
         "pub(crate) fn record_local_runtime_candidate_skip_reason(",
         "set_ai_runtime_miss_diagnostic_reason(",
         "build_ai_runtime_execution_exhausted_diagnostic(",
@@ -2061,7 +2061,7 @@ fn ai_serving_runtime_miss_owns_local_execution_miss_state_machine() {
         "record_ai_runtime_candidate_skip_reason_on_diagnostic(",
         "apply_ai_runtime_candidate_evaluation_progress_preserving_candidate_signal(",
         "record_ai_runtime_candidate_skip_reason(",
-        "apply_ai_runtime_attempts_exhausted(",
+        "finalize_ai_runtime_attempts_exhausted(",
     ] {
         assert!(
             runtime_miss.contains(pattern),

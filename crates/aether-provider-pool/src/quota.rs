@@ -269,6 +269,27 @@ fn provider_pool_quota_snapshot_matches_provider(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderQuotaSnapshotPolicy {
+    AggregateAuthoritative,
+    CodexWindowsAuthoritative,
+    GrokDeadlineBounded,
+}
+
+fn provider_quota_snapshot_policy(provider_type: &str) -> ProviderQuotaSnapshotPolicy {
+    if provider_type.trim().eq_ignore_ascii_case("codex") {
+        ProviderQuotaSnapshotPolicy::CodexWindowsAuthoritative
+    } else if provider_type.trim().eq_ignore_ascii_case("grok") {
+        ProviderQuotaSnapshotPolicy::GrokDeadlineBounded
+    } else {
+        ProviderQuotaSnapshotPolicy::AggregateAuthoritative
+    }
+}
+
+fn provider_pool_reset_deadline_active(reset_at: Option<u64>, now_unix_secs: Option<u64>) -> bool {
+    reset_at.is_some_and(|reset_at| now_unix_secs.is_none_or(|now| reset_at > now))
+}
+
 pub(crate) fn provider_pool_quota_snapshot_exhausted_decision(
     key: &StoredProviderCatalogKey,
     provider_type: &str,
@@ -284,11 +305,18 @@ pub(crate) fn provider_pool_quota_snapshot_exhausted_decision(
     }
     let exhausted = provider_pool_json_bool(quota_snapshot.get("exhausted"))?;
     if exhausted {
-        let requires_explicit_recovery_deadline = provider_type.trim().eq_ignore_ascii_case("grok");
+        let policy = provider_quota_snapshot_policy(provider_type);
         let now_unix_secs = provider_pool_current_unix_secs();
         let snapshot_observed_at =
             provider_pool_timestamp_unix_secs(quota_snapshot.get("observed_at"))
                 .or_else(|| provider_pool_timestamp_unix_secs(quota_snapshot.get("updated_at")));
+        let top_level_reset_at =
+            provider_pool_reset_deadline_unix_secs(quota_snapshot, snapshot_observed_at);
+        let top_level_reset_active =
+            provider_pool_reset_deadline_active(top_level_reset_at, now_unix_secs);
+        let top_level_reset_elapsed = top_level_reset_at
+            .zip(now_unix_secs)
+            .is_some_and(|(reset_at, now)| reset_at <= now);
 
         if let Some(windows) = quota_snapshot
             .get("windows")
@@ -298,9 +326,6 @@ pub(crate) fn provider_pool_quota_snapshot_exhausted_decision(
             let mut saw_exhausted_window = false;
             let mut saw_active_exhausted_window = false;
             let mut windows_max_ratio = None::<f64>;
-            let top_level_reset_active = requires_explicit_recovery_deadline
-                && provider_pool_reset_deadline_unix_secs(quota_snapshot, snapshot_observed_at)
-                    .is_some_and(|reset_at| now_unix_secs.is_none_or(|now| reset_at > now));
 
             for window in windows.iter().filter_map(Value::as_object) {
                 if let Some(ratio) = provider_pool_json_f64(window.get("used_ratio")) {
@@ -313,8 +338,10 @@ pub(crate) fn provider_pool_quota_snapshot_exhausted_decision(
                         window,
                         snapshot_observed_at,
                     ) {
-                        Some(reset_at) => now_unix_secs.is_none_or(|now| reset_at > now),
-                        None => !requires_explicit_recovery_deadline,
+                        Some(reset_at) => {
+                            provider_pool_reset_deadline_active(Some(reset_at), now_unix_secs)
+                        }
+                        None => !matches!(policy, ProviderQuotaSnapshotPolicy::GrokDeadlineBounded),
                     };
                     if reset_active {
                         saw_active_exhausted_window = true;
@@ -323,21 +350,31 @@ pub(crate) fn provider_pool_quota_snapshot_exhausted_decision(
             }
 
             if saw_exhausted_window {
-                return Some(saw_active_exhausted_window || top_level_reset_active);
+                let top_level_deadline_overrides_window_state = !matches!(
+                    policy,
+                    ProviderQuotaSnapshotPolicy::CodexWindowsAuthoritative
+                ) && top_level_reset_active;
+                return Some(
+                    saw_active_exhausted_window || top_level_deadline_overrides_window_state,
+                );
             }
-            if top_level_reset_active {
-                return Some(true);
+            match policy {
+                ProviderQuotaSnapshotPolicy::AggregateAuthoritative => {
+                    return Some(!top_level_reset_elapsed);
+                }
+                ProviderQuotaSnapshotPolicy::CodexWindowsAuthoritative => {
+                    if windows_max_ratio.is_some_and(|ratio| ratio < 1.0 - 1e-6) {
+                        return Some(false);
+                    }
+                }
+                ProviderQuotaSnapshotPolicy::GrokDeadlineBounded => {
+                    return Some(top_level_reset_active);
+                }
             }
-            if windows_max_ratio.is_some_and(|ratio| ratio < 1.0 - 1e-6) {
-                return Some(false);
-            }
-        } else if now_unix_secs.is_some_and(|now| {
-            provider_pool_reset_deadline_elapsed(quota_snapshot, snapshot_observed_at, now)
-        }) {
+        } else if top_level_reset_elapsed {
             return Some(false);
-        } else if requires_explicit_recovery_deadline
-            && provider_pool_reset_deadline_unix_secs(quota_snapshot, snapshot_observed_at)
-                .is_none()
+        } else if matches!(policy, ProviderQuotaSnapshotPolicy::GrokDeadlineBounded)
+            && top_level_reset_at.is_none()
         {
             return Some(false);
         }
@@ -438,7 +475,7 @@ mod tests {
     }
 
     #[test]
-    fn non_grok_healthy_windows_override_stale_top_level_exhaustion() {
+    fn codex_healthy_windows_override_stale_top_level_exhaustion() {
         let now = provider_pool_current_unix_secs().expect("clock");
         let key = key_with_quota(json!({
             "provider_type": "codex",
@@ -460,6 +497,77 @@ mod tests {
         }));
         assert_eq!(
             provider_pool_quota_snapshot_exhausted_decision(&key, "codex"),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn non_codex_non_grok_providers_keep_aggregate_exhaustion_authoritative() {
+        let now = provider_pool_current_unix_secs().expect("clock");
+        for provider_type in [
+            "antigravity",
+            "chatgpt_web",
+            "gemini_cli",
+            "kiro",
+            "windsurf",
+            "custom_provider",
+        ] {
+            let key = key_with_quota(json!({
+                "provider_type": provider_type,
+                "observed_at": now,
+                "exhausted": true,
+                "reset_at": now + 120,
+                "windows": [{
+                    "code": "quota",
+                    "used_ratio": 0.5,
+                    "is_exhausted": false
+                }]
+            }));
+            assert_eq!(
+                provider_pool_quota_snapshot_exhausted_decision(&key, provider_type),
+                Some(true),
+                "provider {provider_type} must not inherit Codex window recovery semantics"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_without_healthy_window_evidence_keeps_aggregate_exhaustion() {
+        let key = key_with_quota(json!({
+            "provider_type": "codex",
+            "exhausted": true
+        }));
+        assert_eq!(
+            provider_pool_quota_snapshot_exhausted_decision(&key, "codex"),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn codex_deadline_less_exhausted_window_remains_blocking() {
+        let key = key_with_quota(json!({
+            "provider_type": "codex",
+            "exhausted": true,
+            "windows": [{
+                "code": "weekly",
+                "used_ratio": 1.0,
+                "is_exhausted": true
+            }]
+        }));
+        assert_eq!(
+            provider_pool_quota_snapshot_exhausted_decision(&key, "codex"),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn grok_metadata_only_exhaustion_without_deadline_is_transient() {
+        let key = key_with_quota(json!({
+            "provider_type": "grok",
+            "exhausted": true
+        }));
+        assert_eq!(
+            provider_pool_quota_snapshot_exhausted_decision(&key, "grok"),
             Some(false)
         );
     }

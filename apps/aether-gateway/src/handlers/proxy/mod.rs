@@ -2074,9 +2074,10 @@ fn local_execution_runtime_miss_diagnostic_detail(
                 "已尝试所有本地执行候选提供商，但没有任何候选成功完成请求（{route_label}，原因代码: execution_runtime_candidates_exhausted）"
             ));
         }
-        "execution_runtime_candidates_skipped_before_provider_execution" => {
+        "execution_runtime_candidates_skipped_before_execution_dispatch"
+        | "execution_runtime_candidates_skipped_before_provider_execution" => {
             return Some(format!(
-                "本地执行候选已构建，但全部在进入上游执行前被运行时保护或资源状态检查跳过（{route_label}，原因代码: execution_runtime_candidates_skipped_before_provider_execution）"
+                "本地执行候选已构建，但全部在交给执行运行时前被运行时保护或资源状态检查跳过（{route_label}，原因代码: execution_runtime_candidates_skipped_before_execution_dispatch）"
             ));
         }
         "candidate_evaluation_incomplete" => {
@@ -2560,7 +2561,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_miss_detail_explains_when_candidates_were_skipped_before_provider_execution() {
+    fn runtime_miss_detail_explains_when_candidates_were_skipped_before_execution_dispatch() {
         let decision = GatewayControlDecision::synthetic(
             "/v1/responses",
             Some("ai_public".to_string()),
@@ -2569,7 +2570,7 @@ mod tests {
             Some("openai:responses".to_string()),
         );
         let diagnostic = LocalExecutionRuntimeMissDiagnostic {
-            reason: "execution_runtime_candidates_skipped_before_provider_execution".to_string(),
+            reason: "execution_runtime_candidates_skipped_before_execution_dispatch".to_string(),
             requested_model: Some("grok-4.5".to_string()),
             candidate_count: Some(2),
             skipped_candidate_count: Some(2),
@@ -2582,7 +2583,7 @@ mod tests {
         assert_eq!(
             detail.as_deref(),
             Some(
-                "本地执行候选已构建，但全部在进入上游执行前被运行时保护或资源状态检查跳过（OpenAI Responses，原因代码: execution_runtime_candidates_skipped_before_provider_execution）"
+                "本地执行候选已构建，但全部在交给执行运行时前被运行时保护或资源状态检查跳过（OpenAI Responses，原因代码: execution_runtime_candidates_skipped_before_execution_dispatch）"
             )
         );
     }
