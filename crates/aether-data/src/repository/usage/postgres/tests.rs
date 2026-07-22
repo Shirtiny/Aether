@@ -14,8 +14,10 @@ use super::{
     usage_metadata_is_ws_step, usage_routing_snapshot_from_usage,
     usage_settlement_pricing_snapshot_from_usage, AggregateRangeSplit, SqlxUsageReadRepository,
     UsageHttpAuditRefs, UsagePromptCaptureEntry, UsageRoutingSnapshot,
-    UsageSettlementPricingSnapshot, FIND_WS_CONNECTION_PROMPT_CAPTURE_SQL,
-    FIND_WS_SESSION_PROMPT_CAPTURE_SQL, MAX_INLINE_USAGE_BODY_BYTES,
+    UsageSettlementPricingSnapshot, WsPromptCaptureScope, COUNT_USAGE_AUDITS_WITH_CANDIDATE_PREFIX,
+    FIND_WS_CONNECTION_PROMPT_CAPTURE_SQL, FIND_WS_PROMPT_CAPTURE_SCOPE_SQL,
+    FIND_WS_SESSION_PROMPT_CAPTURE_SQL, FIND_WS_USAGE_SESSION_PROMPT_CAPTURE_SQL,
+    MAX_INLINE_USAGE_BODY_BYTES,
 };
 use crate::driver::postgres::{PostgresPoolConfig, PostgresPoolFactory};
 use crate::repository::usage::UpsertUsageRecord;
@@ -63,13 +65,14 @@ fn client_family_filter_uses_exact_metadata_match() {
     assert!(sql.contains("request_metadata->>'client_family'"));
     assert!(sql.contains("request_candidates.extra_data"));
     assert!(sql.contains("BTRIM"));
+    assert!(sql.contains("NULLIF"));
     assert!(sql.contains(" = "));
     assert!(!sql.contains("LIKE"));
 }
 
 #[test]
-fn session_id_filter_reads_usage_metadata_without_candidate_affinity() {
-    let mut builder = QueryBuilder::<Postgres>::new(r#"SELECT * FROM "usage""#);
+fn session_id_filter_reads_candidate_and_usage_affinity() {
+    let mut builder = QueryBuilder::<Postgres>::new(COUNT_USAGE_AUDITS_WITH_CANDIDATE_PREFIX);
     let mut has_where = false;
 
     super::push_postgres_usage_session_id_filter(
@@ -81,19 +84,28 @@ fn session_id_filter_reads_usage_metadata_without_candidate_affinity() {
 
     let sql = builder.sql();
     assert!(sql.contains("request_metadata#>>'{client_session_affinity,session_key}'"));
-    assert!(!sql.contains("request_candidates"));
+    assert!(sql.contains("request_candidates.extra_data"));
+    assert!(sql.contains("LEFT JOIN request_candidates"));
     assert!(sql.contains(" = "));
 }
 
 #[test]
 fn count_queries_only_join_candidate_affinity_for_relevant_filters() {
-    assert!(!super::usage_filters_need_candidate_affinity_join(None));
-    assert!(!super::usage_filters_need_candidate_affinity_join(Some(
-        "  "
-    )));
-    assert!(super::usage_filters_need_candidate_affinity_join(Some(
-        "codex"
-    )));
+    assert!(!super::usage_filters_need_candidate_affinity_join(
+        None, None
+    ));
+    assert!(!super::usage_filters_need_candidate_affinity_join(
+        Some(" "),
+        Some("")
+    ));
+    assert!(super::usage_filters_need_candidate_affinity_join(
+        Some("session-1"),
+        None
+    ));
+    assert!(super::usage_filters_need_candidate_affinity_join(
+        None,
+        Some("codex")
+    ));
 }
 
 #[test]
@@ -1285,22 +1297,58 @@ fn ws_prompt_capture_queries_use_connection_fast_path_then_session_fallback() {
     );
     assert!(!FIND_WS_CONNECTION_PROMPT_CAPTURE_SQL.contains("source_candidate"));
 
-    assert!(FIND_WS_SESSION_PROMPT_CAPTURE_SQL.contains("WITH current_scope"));
-    assert!(FIND_WS_SESSION_PROMPT_CAPTURE_SQL.contains("current_candidate.id = $1"));
-    assert!(FIND_WS_SESSION_PROMPT_CAPTURE_SQL.contains("current.request_id = $2"));
-    assert!(FIND_WS_SESSION_PROMPT_CAPTURE_SQL.contains("current_scope.api_key_id"));
+    assert!(FIND_WS_PROMPT_CAPTURE_SCOPE_SQL.contains("current_candidate.id = $1"));
+    assert!(FIND_WS_PROMPT_CAPTURE_SCOPE_SQL.contains("current.request_id = $2"));
+    assert!(FIND_WS_PROMPT_CAPTURE_SCOPE_SQL.contains("usage_session_key"));
+    assert!(FIND_WS_PROMPT_CAPTURE_SCOPE_SQL.contains("client_family"));
+
+    assert!(!FIND_WS_SESSION_PROMPT_CAPTURE_SQL.contains("WITH current_scope"));
     assert!(
         FIND_WS_SESSION_PROMPT_CAPTURE_SQL.contains("FROM request_candidates AS source_candidate")
     );
     assert!(FIND_WS_SESSION_PROMPT_CAPTURE_SQL.contains("source_candidate.extra_data"));
-    assert!(FIND_WS_SESSION_PROMPT_CAPTURE_SQL.contains("current_scope.session_key IS NOT NULL"));
+    assert!(FIND_WS_SESSION_PROMPT_CAPTURE_SQL.contains("source_candidate.user_id"));
+    assert!(FIND_WS_SESSION_PROMPT_CAPTURE_SQL.contains("source.api_key_id = $4"));
+    assert!(FIND_WS_SESSION_PROMPT_CAPTURE_SQL.contains("source.created_at <= $5"));
+    assert!(FIND_WS_SESSION_PROMPT_CAPTURE_SQL.contains("client_family"));
     assert!(!FIND_WS_SESSION_PROMPT_CAPTURE_SQL.contains("source_routing.candidate_id = $1"));
-    assert!(FIND_WS_SESSION_PROMPT_CAPTURE_SQL
-        .contains("source.created_at <= current_scope.created_at"));
     assert!(
         FIND_WS_SESSION_PROMPT_CAPTURE_SQL.contains("source.request_metadata->>'ws_step' = 'true'")
     );
     assert!(FIND_WS_SESSION_PROMPT_CAPTURE_SQL.contains("ORDER BY source.created_at DESC"));
+
+    assert!(FIND_WS_USAGE_SESSION_PROMPT_CAPTURE_SQL
+        .contains("request_metadata#>>'{client_session_affinity,session_key}'"));
+    assert!(FIND_WS_USAGE_SESSION_PROMPT_CAPTURE_SQL.contains("source.user_id"));
+    assert!(FIND_WS_USAGE_SESSION_PROMPT_CAPTURE_SQL.contains("client_family"));
+    assert!(!FIND_WS_USAGE_SESSION_PROMPT_CAPTURE_SQL.contains("request_candidates"));
+}
+
+#[test]
+fn ws_prompt_capture_scope_requires_an_identity_for_cross_candidate_lookup() {
+    let identified = WsPromptCaptureScope {
+        user_id: Some("user-1".to_string()),
+        api_key_id: None,
+        created_at: Utc::now(),
+        session_key: "session=session-1".to_string(),
+        usage_session_key: None,
+        client_family: Some("codex".to_string()),
+    };
+    assert!(identified.has_identity());
+
+    let api_key_identified = WsPromptCaptureScope {
+        user_id: None,
+        api_key_id: Some("key-1".to_string()),
+        ..identified.clone()
+    };
+    assert!(api_key_identified.has_identity());
+
+    let anonymous = WsPromptCaptureScope {
+        user_id: None,
+        api_key_id: None,
+        ..identified
+    };
+    assert!(!anonymous.has_identity());
 }
 
 #[test]

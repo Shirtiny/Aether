@@ -110,26 +110,39 @@ WHERE source_routing.candidate_id = $1
   )
   AND source.created_at <= current.created_at
   AND source.request_metadata->>'ws_step' = 'true'
-  AND json_typeof(source.request_metadata->'prompt_capture'->'items') = 'array'
-  AND json_array_length(source.request_metadata->'prompt_capture'->'items') > 0
+  AND CASE
+    WHEN json_typeof(source.request_metadata->'prompt_capture'->'items') = 'array'
+      THEN json_array_length(source.request_metadata->'prompt_capture'->'items') > 0
+    ELSE FALSE
+  END
 ORDER BY source.created_at DESC, source.updated_at_unix_secs DESC
 LIMIT 1
 "#;
+const FIND_WS_PROMPT_CAPTURE_SCOPE_SQL: &str = r#"
+SELECT
+  current.user_id,
+  current.api_key_id,
+  current.created_at,
+  NULLIF(
+    BTRIM(current.request_metadata#>>'{client_session_affinity,session_key}'),
+    ''
+  ) AS usage_session_key,
+  COALESCE(
+    NULLIF(BTRIM(current.request_metadata#>>'{client_session_affinity,session_key}'), ''),
+    NULLIF(BTRIM(current_candidate.extra_data#>>'{client_session_affinity,session_key}'), '')
+  ) AS session_key,
+  COALESCE(
+    NULLIF(LOWER(BTRIM(current.request_metadata#>>'{client_session_affinity,client_family}')), ''),
+    NULLIF(LOWER(BTRIM(current.request_metadata->>'client_family')), ''),
+    NULLIF(LOWER(BTRIM(current_candidate.extra_data#>>'{client_session_affinity,client_family}')), '')
+  ) AS client_family
+FROM "usage" AS current
+LEFT JOIN request_candidates AS current_candidate
+  ON current_candidate.id = $1
+WHERE current.request_id = $2
+LIMIT 1
+"#;
 const FIND_WS_SESSION_PROMPT_CAPTURE_SQL: &str = r#"
-WITH current_scope AS (
-  SELECT
-    current.user_id,
-    current.api_key_id,
-    current.created_at,
-    COALESCE(
-      NULLIF(BTRIM(current.request_metadata#>>'{client_session_affinity,session_key}'), ''),
-      NULLIF(BTRIM(current_candidate.extra_data#>>'{client_session_affinity,session_key}'), '')
-    ) AS session_key
-  FROM "usage" AS current
-  LEFT JOIN request_candidates AS current_candidate
-    ON current_candidate.id = $1
-  WHERE current.request_id = $2
-)
 SELECT
   source.request_id AS source_request_id,
   source.request_metadata->'prompt_capture' AS prompt_capture
@@ -138,21 +151,98 @@ INNER JOIN usage_routing_snapshots AS source_routing
   ON source_routing.candidate_id = source_candidate.id
 INNER JOIN "usage" AS source
   ON source.request_id = source_routing.request_id
-CROSS JOIN current_scope
-WHERE current_scope.session_key IS NOT NULL
-  AND NULLIF(
+WHERE NULLIF(
     BTRIM(source_candidate.extra_data#>>'{client_session_affinity,session_key}'),
     ''
-  ) = current_scope.session_key
-  AND source.user_id IS NOT DISTINCT FROM current_scope.user_id
+  ) = $1
   AND (
-    current_scope.user_id IS NOT NULL
-    OR source.api_key_id IS NOT DISTINCT FROM current_scope.api_key_id
+    (
+      $3::text IS NOT NULL
+      AND (
+        source_candidate.user_id = $3
+        OR source_candidate.user_id IS NULL
+      )
+    )
+    OR (
+      $3::text IS NULL
+      AND $4::text IS NOT NULL
+      AND source_candidate.user_id IS NULL
+      AND (
+        source_candidate.api_key_id = $4
+        OR source_candidate.api_key_id IS NULL
+      )
+    )
   )
-  AND source.created_at <= current_scope.created_at
+  AND (
+    ($3::text IS NOT NULL AND source.user_id = $3)
+    OR (
+      $3::text IS NULL
+      AND $4::text IS NOT NULL
+      AND source.user_id IS NULL
+      AND source.api_key_id = $4
+    )
+  )
+  AND (
+    $2::text IS NULL
+    OR COALESCE(
+      NULLIF(LOWER(BTRIM(source.request_metadata#>>'{client_session_affinity,client_family}')), ''),
+      NULLIF(LOWER(BTRIM(source.request_metadata->>'client_family')), ''),
+      NULLIF(LOWER(BTRIM(source_candidate.extra_data#>>'{client_session_affinity,client_family}')), '')
+    ) IS NULL
+    OR COALESCE(
+      NULLIF(LOWER(BTRIM(source.request_metadata#>>'{client_session_affinity,client_family}')), ''),
+      NULLIF(LOWER(BTRIM(source.request_metadata->>'client_family')), ''),
+      NULLIF(LOWER(BTRIM(source_candidate.extra_data#>>'{client_session_affinity,client_family}')), '')
+    ) = $2
+  )
+  AND source.created_at <= $5
   AND source.request_metadata->>'ws_step' = 'true'
-  AND json_typeof(source.request_metadata->'prompt_capture'->'items') = 'array'
-  AND json_array_length(source.request_metadata->'prompt_capture'->'items') > 0
+  AND CASE
+    WHEN json_typeof(source.request_metadata->'prompt_capture'->'items') = 'array'
+      THEN json_array_length(source.request_metadata->'prompt_capture'->'items') > 0
+    ELSE FALSE
+  END
+ORDER BY source.created_at DESC, source.updated_at_unix_secs DESC
+LIMIT 1
+"#;
+const FIND_WS_USAGE_SESSION_PROMPT_CAPTURE_SQL: &str = r#"
+SELECT
+  source.request_id AS source_request_id,
+  source.request_metadata->'prompt_capture' AS prompt_capture
+FROM "usage" AS source
+WHERE NULLIF(
+    BTRIM(source.request_metadata#>>'{client_session_affinity,session_key}'),
+    ''
+  ) = $1
+  AND (
+    ($3::text IS NOT NULL AND source.user_id = $3)
+    OR (
+      $3::text IS NULL
+      AND $4::text IS NOT NULL
+      AND source.user_id IS NULL
+      AND source.api_key_id = $4
+    )
+  )
+  AND (
+    $2::text IS NULL
+    OR LOWER(BTRIM(COALESCE(
+      source.request_metadata#>>'{client_session_affinity,client_family}',
+      source.request_metadata->>'client_family',
+      ''
+    ))) = $2
+    OR LOWER(BTRIM(COALESCE(
+      source.request_metadata#>>'{client_session_affinity,client_family}',
+      source.request_metadata->>'client_family',
+      ''
+    ))) = ''
+  )
+  AND source.created_at <= $5
+  AND source.request_metadata->>'ws_step' = 'true'
+  AND CASE
+    WHEN json_typeof(source.request_metadata->'prompt_capture'->'items') = 'array'
+      THEN json_array_length(source.request_metadata->'prompt_capture'->'items') > 0
+    ELSE FALSE
+  END
 ORDER BY source.created_at DESC, source.updated_at_unix_secs DESC
 LIMIT 1
 "#;
@@ -1349,7 +1439,7 @@ fn push_postgres_usage_session_id_filter(
     *has_where = true;
     builder.push("(");
     builder
-        .push("LOWER(COALESCE(\"usage\".request_metadata#>>'{client_session_affinity,session_key}', ''))")
+        .push("LOWER(COALESCE(NULLIF(BTRIM(\"usage\".request_metadata#>>'{client_session_affinity,session_key}'), ''), NULLIF(BTRIM(request_candidates.extra_data#>>'{client_session_affinity,session_key}'), ''), ''))")
         .push(operator)
         .push_bind(pattern.clone());
     builder.push(" OR ");
@@ -1364,8 +1454,12 @@ fn push_postgres_usage_session_id_filter(
     builder.push(")");
 }
 
-fn usage_filters_need_candidate_affinity_join(client_family: Option<&str>) -> bool {
-    client_family.is_some_and(|value| !value.trim().is_empty())
+fn usage_filters_need_candidate_affinity_join(
+    session_id: Option<&str>,
+    client_family: Option<&str>,
+) -> bool {
+    session_id.is_some_and(|value| !value.trim().is_empty())
+        || client_family.is_some_and(|value| !value.trim().is_empty())
 }
 
 fn push_postgres_usage_client_family_filter(
@@ -1380,7 +1474,7 @@ fn push_postgres_usage_client_family_filter(
     builder.push(if *has_where { " AND " } else { " WHERE " });
     *has_where = true;
     builder
-        .push(r#"LOWER(BTRIM(COALESCE("usage".request_metadata#>>'{client_session_affinity,client_family}', "usage".request_metadata->>'client_family', request_candidates.extra_data#>>'{client_session_affinity,client_family}', ''))) = "#)
+        .push(r#"LOWER(COALESCE(NULLIF(BTRIM("usage".request_metadata#>>'{client_session_affinity,client_family}'), ''), NULLIF(BTRIM("usage".request_metadata->>'client_family'), ''), NULLIF(BTRIM(request_candidates.extra_data#>>'{client_session_affinity,client_family}'), ''), '')) = "#)
         .push_bind(client_family.to_ascii_lowercase());
 }
 
@@ -3087,12 +3181,14 @@ OR (\"usage\".error_message IS NOT NULL AND BTRIM(\"usage\".error_message) <> ''
         &self,
         query: &UsageAuditListQuery,
     ) -> Result<u64, DataLayerError> {
-        let count_prefix =
-            if usage_filters_need_candidate_affinity_join(query.client_family.as_deref()) {
-                COUNT_USAGE_AUDITS_WITH_CANDIDATE_PREFIX
-            } else {
-                COUNT_USAGE_AUDITS_PREFIX
-            };
+        let count_prefix = if usage_filters_need_candidate_affinity_join(
+            query.session_id.as_deref(),
+            query.client_family.as_deref(),
+        ) {
+            COUNT_USAGE_AUDITS_WITH_CANDIDATE_PREFIX
+        } else {
+            COUNT_USAGE_AUDITS_PREFIX
+        };
         let mut builder = QueryBuilder::<Postgres>::new(count_prefix);
         let mut has_where = false;
 
@@ -3209,12 +3305,14 @@ OR (\"usage\".error_message IS NOT NULL AND BTRIM(\"usage\".error_message) <> ''
         &self,
         query: &UsageAuditKeywordSearchQuery,
     ) -> Result<u64, DataLayerError> {
-        let count_prefix =
-            if usage_filters_need_candidate_affinity_join(query.client_family.as_deref()) {
-                COUNT_USAGE_AUDITS_WITH_CANDIDATE_PREFIX
-            } else {
-                COUNT_USAGE_AUDITS_PREFIX
-            };
+        let count_prefix = if usage_filters_need_candidate_affinity_join(
+            query.session_id.as_deref(),
+            query.client_family.as_deref(),
+        ) {
+            COUNT_USAGE_AUDITS_WITH_CANDIDATE_PREFIX
+        } else {
+            COUNT_USAGE_AUDITS_PREFIX
+        };
         let mut builder = QueryBuilder::<Postgres>::new(count_prefix);
         let mut has_where = false;
 
@@ -10789,6 +10887,22 @@ fn attach_ws_session_prompt_capture_metadata(
     Some(Value::Object(metadata))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WsPromptCaptureScope {
+    user_id: Option<String>,
+    api_key_id: Option<String>,
+    created_at: DateTime<Utc>,
+    session_key: String,
+    usage_session_key: Option<String>,
+    client_family: Option<String>,
+}
+
+impl WsPromptCaptureScope {
+    fn has_identity(&self) -> bool {
+        self.user_id.is_some() || self.api_key_id.is_some()
+    }
+}
+
 async fn find_ws_session_prompt_capture_metadata(
     pool: &PgPool,
     candidate_id: &str,
@@ -10800,39 +10914,121 @@ async fn find_ws_session_prompt_capture_metadata(
         return Ok(None);
     }
 
-    // Normal WS steps share a candidate; only reconnects need the broader session lookup.
-    if let Some(prompt_capture) = query_ws_prompt_capture_metadata(
-        pool,
-        FIND_WS_CONNECTION_PROMPT_CAPTURE_SQL,
-        candidate_id,
-        request_id,
-    )
-    .await?
+    if let Some(prompt_capture) =
+        query_ws_connection_prompt_capture_metadata(pool, candidate_id, request_id).await?
     {
         return Ok(Some(prompt_capture));
     }
 
-    query_ws_prompt_capture_metadata(
-        pool,
-        FIND_WS_SESSION_PROMPT_CAPTURE_SQL,
-        candidate_id,
-        request_id,
-    )
-    .await
+    let Some(scope) = find_ws_prompt_capture_scope(pool, candidate_id, request_id).await? else {
+        return Ok(None);
+    };
+    if !scope.has_identity() {
+        return Ok(None);
+    }
+
+    if let Some(prompt_capture) =
+        query_ws_candidate_session_prompt_capture_metadata(pool, &scope).await?
+    {
+        return Ok(Some(prompt_capture));
+    }
+
+    let Some(usage_session_key) = scope.usage_session_key.as_deref() else {
+        return Ok(None);
+    };
+    query_ws_usage_session_prompt_capture_metadata(pool, &scope, usage_session_key).await
 }
 
-async fn query_ws_prompt_capture_metadata(
+async fn query_ws_connection_prompt_capture_metadata(
     pool: &PgPool,
-    sql: &str,
     candidate_id: &str,
     request_id: &str,
 ) -> Result<Option<(String, Value)>, DataLayerError> {
-    let row = sqlx::query(sql)
+    let row = sqlx::query(FIND_WS_CONNECTION_PROMPT_CAPTURE_SQL)
         .bind(candidate_id)
         .bind(request_id)
         .fetch_optional(pool)
         .await
         .map_postgres_err()?;
+    decode_ws_prompt_capture_row(row)
+}
+
+async fn find_ws_prompt_capture_scope(
+    pool: &PgPool,
+    candidate_id: &str,
+    request_id: &str,
+) -> Result<Option<WsPromptCaptureScope>, DataLayerError> {
+    let row = sqlx::query(FIND_WS_PROMPT_CAPTURE_SCOPE_SQL)
+        .bind(candidate_id)
+        .bind(request_id)
+        .fetch_optional(pool)
+        .await
+        .map_postgres_err()?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let Some(session_key) = row
+        .try_get::<Option<String>, _>("session_key")
+        .map_postgres_err()?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(WsPromptCaptureScope {
+        user_id: row
+            .try_get::<Option<String>, _>("user_id")
+            .map_postgres_err()?,
+        api_key_id: row
+            .try_get::<Option<String>, _>("api_key_id")
+            .map_postgres_err()?,
+        created_at: row
+            .try_get::<DateTime<Utc>, _>("created_at")
+            .map_postgres_err()?,
+        session_key,
+        usage_session_key: row
+            .try_get::<Option<String>, _>("usage_session_key")
+            .map_postgres_err()?,
+        client_family: row
+            .try_get::<Option<String>, _>("client_family")
+            .map_postgres_err()?,
+    }))
+}
+
+async fn query_ws_candidate_session_prompt_capture_metadata(
+    pool: &PgPool,
+    scope: &WsPromptCaptureScope,
+) -> Result<Option<(String, Value)>, DataLayerError> {
+    let row = sqlx::query(FIND_WS_SESSION_PROMPT_CAPTURE_SQL)
+        .bind(&scope.session_key)
+        .bind(scope.client_family.as_deref())
+        .bind(scope.user_id.as_deref())
+        .bind(scope.api_key_id.as_deref())
+        .bind(scope.created_at)
+        .fetch_optional(pool)
+        .await
+        .map_postgres_err()?;
+    decode_ws_prompt_capture_row(row)
+}
+
+async fn query_ws_usage_session_prompt_capture_metadata(
+    pool: &PgPool,
+    scope: &WsPromptCaptureScope,
+    usage_session_key: &str,
+) -> Result<Option<(String, Value)>, DataLayerError> {
+    let row = sqlx::query(FIND_WS_USAGE_SESSION_PROMPT_CAPTURE_SQL)
+        .bind(usage_session_key)
+        .bind(scope.client_family.as_deref())
+        .bind(scope.user_id.as_deref())
+        .bind(scope.api_key_id.as_deref())
+        .bind(scope.created_at)
+        .fetch_optional(pool)
+        .await
+        .map_postgres_err()?;
+    decode_ws_prompt_capture_row(row)
+}
+
+fn decode_ws_prompt_capture_row(
+    row: Option<PgRow>,
+) -> Result<Option<(String, Value)>, DataLayerError> {
     row.map(|row| {
         Ok((
             row.try_get::<String, _>("source_request_id")
