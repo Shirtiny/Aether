@@ -94,17 +94,45 @@ DO UPDATE SET
   seen_count = usage_prompt_capture_entries.seen_count + 1
 "#;
 const FIND_WS_SESSION_PROMPT_CAPTURE_SQL: &str = r#"
+WITH current_scope AS (
+  SELECT
+    current.user_id,
+    current.api_key_id,
+    current.created_at,
+    COALESCE(
+      NULLIF(BTRIM(current.request_metadata#>>'{client_session_affinity,session_key}'), ''),
+      NULLIF(BTRIM(current_candidate.extra_data#>>'{client_session_affinity,session_key}'), '')
+    ) AS session_key
+  FROM "usage" AS current
+  LEFT JOIN request_candidates AS current_candidate
+    ON current_candidate.id = $1
+  WHERE current.request_id = $2
+)
 SELECT
   source.request_id AS source_request_id,
   source.request_metadata->'prompt_capture' AS prompt_capture
 FROM "usage" AS source
 INNER JOIN usage_routing_snapshots AS source_routing
   ON source_routing.request_id = source.request_id
-INNER JOIN "usage" AS current
-  ON current.request_id = $2
-WHERE source_routing.candidate_id = $1
-  AND source.user_id IS NOT DISTINCT FROM current.user_id
-  AND source.created_at <= current.created_at
+LEFT JOIN request_candidates AS source_candidate
+  ON source_candidate.id = source_routing.candidate_id
+CROSS JOIN current_scope
+WHERE source.user_id IS NOT DISTINCT FROM current_scope.user_id
+  AND (
+    current_scope.user_id IS NOT NULL
+    OR source.api_key_id IS NOT DISTINCT FROM current_scope.api_key_id
+  )
+  AND source.created_at <= current_scope.created_at
+  AND (
+    (
+      current_scope.session_key IS NOT NULL
+      AND COALESCE(
+        NULLIF(BTRIM(source.request_metadata#>>'{client_session_affinity,session_key}'), ''),
+        NULLIF(BTRIM(source_candidate.extra_data#>>'{client_session_affinity,session_key}'), '')
+      ) = current_scope.session_key
+    )
+    OR source_routing.candidate_id = $1
+  )
   AND source.request_metadata->>'ws_step' = 'true'
   AND json_typeof(source.request_metadata->'prompt_capture'->'items') = 'array'
   AND json_array_length(source.request_metadata->'prompt_capture'->'items') > 0
@@ -1304,7 +1332,7 @@ fn push_postgres_usage_session_id_filter(
     *has_where = true;
     builder.push("(");
     builder
-        .push("LOWER(COALESCE(\"usage\".request_metadata#>>'{client_session_affinity,session_key}', ''))")
+        .push("LOWER(COALESCE(\"usage\".request_metadata#>>'{client_session_affinity,session_key}', request_candidates.extra_data#>>'{client_session_affinity,session_key}', ''))")
         .push(operator)
         .push_bind(pattern.clone());
     builder.push(" OR ");
@@ -1319,6 +1347,14 @@ fn push_postgres_usage_session_id_filter(
     builder.push(")");
 }
 
+fn usage_filters_need_candidate_affinity_join(
+    session_id: Option<&str>,
+    client_family: Option<&str>,
+) -> bool {
+    session_id.is_some_and(|value| !value.trim().is_empty())
+        || client_family.is_some_and(|value| !value.trim().is_empty())
+}
+
 fn push_postgres_usage_client_family_filter(
     builder: &mut QueryBuilder<'_, Postgres>,
     has_where: &mut bool,
@@ -1331,7 +1367,7 @@ fn push_postgres_usage_client_family_filter(
     builder.push(if *has_where { " AND " } else { " WHERE " });
     *has_where = true;
     builder
-        .push(r#"LOWER(BTRIM(COALESCE("usage".request_metadata#>>'{client_session_affinity,client_family}', "usage".request_metadata->>'client_family', ''))) = "#)
+        .push(r#"LOWER(BTRIM(COALESCE("usage".request_metadata#>>'{client_session_affinity,client_family}', "usage".request_metadata->>'client_family', request_candidates.extra_data#>>'{client_session_affinity,client_family}', ''))) = "#)
         .push_bind(client_family.to_ascii_lowercase());
 }
 
@@ -1670,6 +1706,13 @@ const REBUILD_PROVIDER_API_KEY_CODEX_WINDOW_USAGE_STATS_SQL: &str =
     include_str!("queries/rebuild_provider_api_key_codex_window_usage_stats_sql.sql");
 
 const LIST_USAGE_AUDITS_PREFIX: &str = include_str!("queries/list_usage_audits_prefix.sql");
+const COUNT_USAGE_AUDITS_PREFIX: &str = r#"SELECT COUNT(*)::BIGINT AS total FROM "usage""#;
+const COUNT_USAGE_AUDITS_WITH_CANDIDATE_PREFIX: &str = r#"SELECT COUNT(*)::BIGINT AS total
+FROM "usage"
+LEFT JOIN usage_routing_snapshots
+  ON usage_routing_snapshots.request_id = "usage".request_id
+LEFT JOIN request_candidates
+  ON request_candidates.id = usage_routing_snapshots.candidate_id"#;
 const USAGE_PROVIDER_IDENTITY_FILTER_SQL: &str = r#" AND (
       (
         BTRIM(COALESCE("usage".provider_id, '')) <> ''
@@ -3031,8 +3074,15 @@ OR (\"usage\".error_message IS NOT NULL AND BTRIM(\"usage\".error_message) <> ''
         &self,
         query: &UsageAuditListQuery,
     ) -> Result<u64, DataLayerError> {
-        let mut builder =
-            QueryBuilder::<Postgres>::new(r#"SELECT COUNT(*)::BIGINT AS total FROM "usage""#);
+        let count_prefix = if usage_filters_need_candidate_affinity_join(
+            query.session_id.as_deref(),
+            query.client_family.as_deref(),
+        ) {
+            COUNT_USAGE_AUDITS_WITH_CANDIDATE_PREFIX
+        } else {
+            COUNT_USAGE_AUDITS_PREFIX
+        };
+        let mut builder = QueryBuilder::<Postgres>::new(count_prefix);
         let mut has_where = false;
 
         if let Some(created_from_unix_secs) = query.created_from_unix_secs {
@@ -3148,8 +3198,15 @@ OR (\"usage\".error_message IS NOT NULL AND BTRIM(\"usage\".error_message) <> ''
         &self,
         query: &UsageAuditKeywordSearchQuery,
     ) -> Result<u64, DataLayerError> {
-        let mut builder =
-            QueryBuilder::<Postgres>::new(r#"SELECT COUNT(*)::BIGINT AS total FROM "usage""#);
+        let count_prefix = if usage_filters_need_candidate_affinity_join(
+            query.session_id.as_deref(),
+            query.client_family.as_deref(),
+        ) {
+            COUNT_USAGE_AUDITS_WITH_CANDIDATE_PREFIX
+        } else {
+            COUNT_USAGE_AUDITS_PREFIX
+        };
+        let mut builder = QueryBuilder::<Postgres>::new(count_prefix);
         let mut has_where = false;
 
         if let Some(created_from_unix_secs) = query.created_from_unix_secs {
@@ -10176,6 +10233,10 @@ fn map_usage_row(
         resolve_compressed_bodies,
     )?;
     let request_metadata: Option<Value> = row.try_get("request_metadata").map_postgres_err()?;
+    let request_metadata = attach_candidate_client_session_affinity_metadata(
+        request_metadata,
+        row_try_get_optional::<Value>(row, "routing_client_session_affinity")?.as_ref(),
+    );
     let http_audit_refs = UsageHttpAuditRefs {
         request_body_ref: row_try_get_optional(row, "http_request_body_ref")?,
         provider_request_body_ref: row_try_get_optional(row, "http_provider_request_body_ref")?,
@@ -10259,6 +10320,66 @@ fn map_usage_row(
         &settlement_pricing_snapshot,
     );
     Ok(usage)
+}
+
+fn attach_candidate_client_session_affinity_metadata(
+    metadata: Option<Value>,
+    candidate_affinity: Option<&Value>,
+) -> Option<Value> {
+    let candidate_affinity = candidate_affinity.and_then(Value::as_object);
+    let candidate_session_key = candidate_affinity
+        .and_then(|affinity| affinity.get("session_key"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let candidate_client_family = candidate_affinity
+        .and_then(|affinity| affinity.get("client_family"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if candidate_session_key.is_none() && candidate_client_family.is_none() {
+        return metadata;
+    }
+
+    let mut metadata = match metadata {
+        Some(Value::Object(metadata)) => metadata,
+        _ => Map::new(),
+    };
+    let mut affinity = metadata
+        .remove("client_session_affinity")
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    let has_session_key = affinity
+        .get("session_key")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty());
+    if !has_session_key {
+        if let Some(session_key) = candidate_session_key {
+            affinity.insert(
+                "session_key".to_string(),
+                Value::String(session_key.to_string()),
+            );
+        }
+    }
+    let has_client_family = affinity
+        .get("client_family")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty());
+    if !has_client_family {
+        if let Some(client_family) = candidate_client_family {
+            affinity.insert(
+                "client_family".to_string(),
+                Value::String(client_family.to_string()),
+            );
+        }
+    }
+    if !affinity.is_empty() {
+        metadata.insert(
+            "client_session_affinity".to_string(),
+            Value::Object(affinity),
+        );
+    }
+    Some(Value::Object(metadata))
 }
 
 fn to_i32(value: u64) -> Result<i32, DataLayerError> {

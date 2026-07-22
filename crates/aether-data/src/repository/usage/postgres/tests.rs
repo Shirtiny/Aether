@@ -3,18 +3,19 @@ use serde_json::{json, Value};
 use sqlx::{Postgres, QueryBuilder};
 
 use super::{
-    attach_compressed_body_refs, attach_usage_http_audit_body_refs,
-    attach_usage_routing_snapshot_metadata, attach_usage_settlement_pricing_snapshot_metadata,
-    attach_ws_session_prompt_capture_metadata, inflate_usage_json_value,
-    prepare_prompt_capture_metadata, prepare_request_metadata_for_body_storage,
-    prepare_usage_body_storage, resolved_read_usage_body_ref, resolved_write_usage_body_ref,
+    attach_candidate_client_session_affinity_metadata, attach_compressed_body_refs,
+    attach_usage_http_audit_body_refs, attach_usage_routing_snapshot_metadata,
+    attach_usage_settlement_pricing_snapshot_metadata, attach_ws_session_prompt_capture_metadata,
+    inflate_usage_json_value, prepare_prompt_capture_metadata,
+    prepare_request_metadata_for_body_storage, prepare_usage_body_storage,
+    resolved_read_usage_body_ref, resolved_write_usage_body_ref,
     split_dashboard_daily_aggregate_range, split_dashboard_hourly_aggregate_range, usage_body_ref,
     usage_http_audit_body_refs, usage_http_audit_capture_mode, usage_metadata_has_prompt_capture,
     usage_metadata_is_ws_step, usage_routing_snapshot_from_usage,
     usage_settlement_pricing_snapshot_from_usage, AggregateRangeSplit, SqlxUsageReadRepository,
     UsageHttpAuditRefs, UsagePromptCaptureEntry, UsageRoutingSnapshot,
-    UsageSettlementPricingSnapshot, FIND_WS_SESSION_PROMPT_CAPTURE_SQL,
-    MAX_INLINE_USAGE_BODY_BYTES,
+    UsageSettlementPricingSnapshot, COUNT_USAGE_AUDITS_WITH_CANDIDATE_PREFIX,
+    FIND_WS_SESSION_PROMPT_CAPTURE_SQL, MAX_INLINE_USAGE_BODY_BYTES,
 };
 use crate::driver::postgres::{PostgresPoolConfig, PostgresPoolFactory};
 use crate::repository::usage::UpsertUsageRecord;
@@ -60,9 +61,47 @@ fn client_family_filter_uses_exact_metadata_match() {
     let sql = builder.sql();
     assert!(sql.contains("client_session_affinity,client_family"));
     assert!(sql.contains("request_metadata->>'client_family'"));
+    assert!(sql.contains("request_candidates.extra_data"));
     assert!(sql.contains("BTRIM"));
     assert!(sql.contains(" = "));
     assert!(!sql.contains("LIKE"));
+}
+
+#[test]
+fn session_id_filter_falls_back_to_routing_candidate_affinity() {
+    let mut builder = QueryBuilder::<Postgres>::new(COUNT_USAGE_AUDITS_WITH_CANDIDATE_PREFIX);
+    let mut has_where = false;
+
+    super::push_postgres_usage_session_id_filter(
+        &mut builder,
+        &mut has_where,
+        "session=session-1",
+        true,
+    );
+
+    let sql = builder.sql();
+    assert!(sql.contains("LEFT JOIN request_candidates"));
+    assert!(sql.contains("request_candidates.extra_data#>>'{client_session_affinity,session_key}'"));
+    assert!(sql.contains(" = "));
+}
+
+#[test]
+fn count_queries_only_join_candidate_affinity_for_relevant_filters() {
+    assert!(!super::usage_filters_need_candidate_affinity_join(
+        None, None
+    ));
+    assert!(!super::usage_filters_need_candidate_affinity_join(
+        Some("  "),
+        Some("")
+    ));
+    assert!(super::usage_filters_need_candidate_affinity_join(
+        Some("session-1"),
+        None
+    ));
+    assert!(super::usage_filters_need_candidate_affinity_join(
+        None,
+        Some("codex")
+    ));
 }
 
 #[test]
@@ -741,6 +780,10 @@ fn usage_sql_reads_http_audits_for_single_record_fetches() {
 fn usage_sql_reads_routing_snapshots_for_single_record_fetches() {
     assert!(super::FIND_BY_REQUEST_ID_SQL.contains("LEFT JOIN usage_routing_snapshots"));
     assert!(super::FIND_BY_ID_SQL.contains("LEFT JOIN usage_routing_snapshots"));
+    assert!(super::FIND_BY_REQUEST_ID_SQL.contains("LEFT JOIN request_candidates"));
+    assert!(super::FIND_BY_ID_SQL.contains("LEFT JOIN request_candidates"));
+    assert!(super::FIND_BY_REQUEST_ID_SQL.contains("routing_client_session_affinity"));
+    assert!(super::FIND_BY_ID_SQL.contains("routing_client_session_affinity"));
     assert!(super::FIND_BY_REQUEST_ID_SQL.contains("routing_candidate_id"));
     assert!(super::FIND_BY_REQUEST_ID_SQL.contains("routing_candidate_index"));
     assert!(super::FIND_BY_ID_SQL.contains("routing_local_execution_runtime_miss_reason"));
@@ -798,6 +841,8 @@ fn usage_sql_uses_json_null_placeholders_for_usage_payload_columns() {
     assert!(super::LIST_USAGE_AUDITS_PREFIX.contains("usage_routing_snapshots.candidate_index"));
     assert!(super::LIST_USAGE_AUDITS_PREFIX.contains("request_metadata->>'candidate_index'"));
     assert!(super::LIST_USAGE_AUDITS_PREFIX.contains("LEFT JOIN usage_routing_snapshots"));
+    assert!(super::LIST_USAGE_AUDITS_PREFIX.contains("LEFT JOIN request_candidates"));
+    assert!(super::LIST_USAGE_AUDITS_PREFIX.contains("routing_client_session_affinity"));
     assert!(super::LIST_USAGE_AUDITS_PREFIX.contains("LEFT JOIN usage_settlement_snapshots"));
     assert!(super::LIST_USAGE_AUDITS_PREFIX.contains("settlement_billing_snapshot_schema_version"));
     assert!(super::LIST_RECENT_USAGE_AUDITS_PREFIX.contains("NULL::json AS request_headers"));
@@ -816,6 +861,8 @@ fn usage_sql_uses_json_null_placeholders_for_usage_payload_columns() {
     );
     assert!(super::LIST_RECENT_USAGE_AUDITS_PREFIX.contains("request_metadata->>'candidate_index'"));
     assert!(super::LIST_RECENT_USAGE_AUDITS_PREFIX.contains("LEFT JOIN usage_routing_snapshots"));
+    assert!(super::LIST_RECENT_USAGE_AUDITS_PREFIX.contains("LEFT JOIN request_candidates"));
+    assert!(super::LIST_RECENT_USAGE_AUDITS_PREFIX.contains("routing_client_session_affinity"));
     assert!(
         super::LIST_RECENT_USAGE_AUDITS_PREFIX.contains("usage_routing_snapshots.execution_path")
     );
@@ -1237,14 +1284,69 @@ fn prepare_prompt_capture_metadata_handles_large_sanitized_prompt_capture() {
 }
 
 #[test]
-fn ws_session_prompt_capture_query_uses_candidate_and_prior_request_boundary() {
-    assert!(FIND_WS_SESSION_PROMPT_CAPTURE_SQL.contains("source_routing.candidate_id = $1"));
+fn ws_session_prompt_capture_query_prefers_session_and_keeps_candidate_fallback() {
+    assert!(FIND_WS_SESSION_PROMPT_CAPTURE_SQL.contains("WITH current_scope"));
+    assert!(FIND_WS_SESSION_PROMPT_CAPTURE_SQL.contains("current_candidate.id = $1"));
     assert!(FIND_WS_SESSION_PROMPT_CAPTURE_SQL.contains("current.request_id = $2"));
-    assert!(FIND_WS_SESSION_PROMPT_CAPTURE_SQL.contains("source.created_at <= current.created_at"));
+    assert!(FIND_WS_SESSION_PROMPT_CAPTURE_SQL.contains("current_scope.api_key_id"));
+    assert!(FIND_WS_SESSION_PROMPT_CAPTURE_SQL.contains("source_candidate.extra_data"));
+    assert!(FIND_WS_SESSION_PROMPT_CAPTURE_SQL.contains("current_scope.session_key IS NOT NULL"));
+    assert!(FIND_WS_SESSION_PROMPT_CAPTURE_SQL.contains("source_routing.candidate_id = $1"));
+    assert!(FIND_WS_SESSION_PROMPT_CAPTURE_SQL
+        .contains("source.created_at <= current_scope.created_at"));
     assert!(
         FIND_WS_SESSION_PROMPT_CAPTURE_SQL.contains("source.request_metadata->>'ws_step' = 'true'")
     );
     assert!(FIND_WS_SESSION_PROMPT_CAPTURE_SQL.contains("ORDER BY source.created_at DESC"));
+}
+
+#[test]
+fn attaches_candidate_session_affinity_when_terminal_usage_metadata_lacks_it() {
+    let metadata = attach_candidate_client_session_affinity_metadata(
+        Some(json!({
+            "ws_step": true,
+            "trace_id": "trace-1"
+        })),
+        Some(&json!({
+            "client_family": "codex",
+            "session_key": "session=session-1"
+        })),
+    )
+    .expect("metadata should remain");
+
+    assert_eq!(metadata["trace_id"], json!("trace-1"));
+    assert_eq!(
+        metadata["client_session_affinity"],
+        json!({
+            "client_family": "codex",
+            "session_key": "session=session-1"
+        })
+    );
+}
+
+#[test]
+fn candidate_session_affinity_only_fills_missing_metadata_fields() {
+    let metadata = attach_candidate_client_session_affinity_metadata(
+        Some(json!({
+            "client_session_affinity": {
+                "session_key": "session=usage-session"
+            }
+        })),
+        Some(&json!({
+            "client_family": "codex",
+            "session_key": "session=candidate-session"
+        })),
+    )
+    .expect("metadata should remain");
+
+    assert_eq!(
+        metadata["client_session_affinity"]["session_key"],
+        json!("session=usage-session")
+    );
+    assert_eq!(
+        metadata["client_session_affinity"]["client_family"],
+        json!("codex")
+    );
 }
 
 #[test]

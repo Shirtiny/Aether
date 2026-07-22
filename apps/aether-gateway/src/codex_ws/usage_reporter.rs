@@ -755,6 +755,7 @@ fn compact_usage_report_context(context: Option<serde_json::Value>) -> Option<se
         "client_requested_stream",
         "upstream_is_stream",
         "ws_step",
+        "client_session_affinity",
         "api_key_is_standalone",
         "original_request_body",
         "request_body_ref",
@@ -801,6 +802,10 @@ mod tests {
             "ws_step": true,
             "cafecode_uid": "372",
             "cafecode_uname": "xiapeng8618",
+            "client_session_affinity": {
+                "client_family": "codex",
+                "session_key": "session=session-1"
+            },
             "original_request_body": {
                 "type": "response.create",
                 "input": [{
@@ -818,6 +823,11 @@ mod tests {
         assert_eq!(compact["ws_step"], true);
         assert_eq!(compact["cafecode_uid"], "372");
         assert_eq!(compact["cafecode_uname"], "xiapeng8618");
+        assert_eq!(
+            compact["client_session_affinity"]["session_key"],
+            "session=session-1"
+        );
+        assert_eq!(compact["client_session_affinity"]["client_family"], "codex");
         assert_eq!(
             compact["original_request_body"]["input"][0]["call_id"],
             "call-1"
@@ -850,6 +860,10 @@ mod tests {
         let context = compact_usage_report_context(Some(serde_json::json!({
             "request_id": "ws-request-1",
             "ws_step": true,
+            "client_session_affinity": {
+                "client_family": "codex",
+                "session_key": "session=session-1"
+            },
             "original_request_body": original_request_body
         })))
         .expect("WS report context should remain");
@@ -879,6 +893,13 @@ mod tests {
 
         assert_eq!(seed.request_body, Some(original_request_body));
         assert_eq!(seed.provider_request, Some(provider_request_body));
+        assert_eq!(
+            seed.request_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("client_session_affinity"))
+                .and_then(|affinity| affinity.get("session_key")),
+            Some(&serde_json::json!("session=session-1"))
+        );
     }
 
     #[test]

@@ -2096,6 +2096,28 @@ fn step_report_context(
         serde_json::Value::String(step_usage_request_id(step)),
     );
     context.insert("ws_step".to_string(), serde_json::Value::Bool(true));
+    let has_session_affinity = context
+        .get("client_session_affinity")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|affinity| affinity.get("session_key"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|session_key| !session_key.trim().is_empty());
+    if !has_session_affinity {
+        let session_id = if !step.official_identity.session_id.trim().is_empty() {
+            step.official_identity.session_id.trim()
+        } else {
+            step.official_identity.thread_id.trim()
+        };
+        if !session_id.is_empty() {
+            context.insert(
+                "client_session_affinity".to_string(),
+                serde_json::json!({
+                    "client_family": "codex",
+                    "session_key": format!("session={session_id}")
+                }),
+            );
+        }
+    }
     if let Some(original_request_body) = original_request_body {
         context.insert("original_request_body".to_string(), original_request_body);
     }
@@ -2445,7 +2467,53 @@ mod tests {
 
         assert_eq!(context["request_id"], step_usage_request_id(&step));
         assert_eq!(context["ws_step"], true);
+        assert_eq!(context["client_session_affinity"]["client_family"], "codex");
+        assert_eq!(
+            context["client_session_affinity"]["session_key"],
+            "session=session-1"
+        );
         assert_eq!(context["original_request_body"], original_request_body);
+    }
+
+    #[test]
+    fn step_report_context_preserves_existing_session_affinity() {
+        let step = ResponseCreateStep {
+            value: json!({}),
+            encoded_len: 2,
+            model: "gpt-test".into(),
+            previous_response_id: None,
+            logical_turn_id: None,
+            official_identity: OfficialRequestIdentity {
+                session_id: "official-session".into(),
+                thread_id: "thread-1".into(),
+                window_id: None,
+                turn_metadata: None,
+                parent_thread_id: None,
+                subagent: None,
+                responses_lite: false,
+            },
+            fence: StepFence {
+                correlation_id: "correlation-1".into(),
+                binding_epoch_id: "epoch-1".into(),
+                binding_generation: 1,
+            },
+        };
+        let context = step_report_context(
+            Some(json!({
+                "client_session_affinity": {
+                    "client_family": "codex",
+                    "session_key": "account=account-1;session=planner-session"
+                }
+            })),
+            &step,
+            None,
+        )
+        .expect("context should remain");
+
+        assert_eq!(
+            context["client_session_affinity"]["session_key"],
+            "account=account-1;session=planner-session"
+        );
     }
 
     #[test]

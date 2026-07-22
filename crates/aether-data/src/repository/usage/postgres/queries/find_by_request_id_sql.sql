@@ -95,7 +95,8 @@ SELECT
   COALESCE(usage_settlement_snapshots.billing_status, "usage".billing_status) AS billing_status,
   COALESCE(
     NULLIF(BTRIM("usage".request_metadata->'client_session_affinity'->>'client_family'), ''),
-    NULLIF(BTRIM("usage".request_metadata->>'client_family'), '')
+    NULLIF(BTRIM("usage".request_metadata->>'client_family'), ''),
+    NULLIF(BTRIM(request_candidates.extra_data->'client_session_affinity'->>'client_family'), '')
   ) AS client_family,
   COALESCE(usage_http_audits.request_headers, "usage".request_headers) AS request_headers,
   "usage".request_body,
@@ -132,6 +133,7 @@ SELECT
   usage_routing_snapshots.route_kind AS routing_route_kind,
   usage_routing_snapshots.execution_path AS routing_execution_path,
   usage_routing_snapshots.local_execution_runtime_miss_reason AS routing_local_execution_runtime_miss_reason,
+  request_candidates.extra_data->'client_session_affinity' AS routing_client_session_affinity,
   usage_settlement_snapshots.billing_snapshot_schema_version AS settlement_billing_snapshot_schema_version,
   usage_settlement_snapshots.billing_snapshot_status AS settlement_billing_snapshot_status,
   CAST(usage_settlement_snapshots.rate_multiplier AS DOUBLE PRECISION) AS settlement_rate_multiplier,
@@ -179,6 +181,8 @@ LEFT JOIN usage_http_audits
   ON usage_http_audits.request_id = "usage".request_id
 LEFT JOIN usage_routing_snapshots
   ON usage_routing_snapshots.request_id = "usage".request_id
+LEFT JOIN request_candidates
+  ON request_candidates.id = usage_routing_snapshots.candidate_id
 LEFT JOIN usage_settlement_snapshots
   ON usage_settlement_snapshots.request_id = "usage".request_id
 WHERE "usage".request_id = $1
