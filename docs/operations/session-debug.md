@@ -125,24 +125,49 @@ Aether normalizes known client session affinity under:
 usage.request_metadata.client_session_affinity.session_key
 ```
 
-For Codex-style requests, this is normally `session=<uuid>`.
+For Codex-style requests, this is normally `session=<uuid>`. New WS usage rows
+persist this value directly. Historical rows may only have it in the selected
+request candidate, so always calculate the effective value with the same
+precedence used by the usage list and filters.
 
 ```sh
 docker exec aether-postgres psql -U postgres -d aether -c "
 SELECT
-  request_id,
-  request_metadata::jsonb #>> '{client_session_affinity,session_key}' AS session_key,
-  request_metadata->>'client_family' AS client_family,
-  request_metadata->>'cafecode_uid' AS cafecode_uid,
-  request_metadata->>'cafecode_uname' AS cafecode_uname,
-  request_metadata->>'client_ip' AS client_ip,
-  request_metadata->>'user_agent' AS user_agent
-FROM usage
-WHERE request_id = '<full-request-id>';
+  u.request_id,
+  NULLIF(BTRIM(
+    u.request_metadata::jsonb #>> '{client_session_affinity,session_key}'
+  ), '') AS usage_session_key,
+  NULLIF(BTRIM(
+    candidate.extra_data::jsonb #>> '{client_session_affinity,session_key}'
+  ), '') AS candidate_session_key,
+  COALESCE(
+    NULLIF(BTRIM(u.request_metadata::jsonb #>> '{client_session_affinity,session_key}'), ''),
+    NULLIF(BTRIM(candidate.extra_data::jsonb #>> '{client_session_affinity,session_key}'), '')
+  ) AS effective_session_key,
+  COALESCE(
+    NULLIF(BTRIM(u.request_metadata::jsonb #>> '{client_session_affinity,client_family}'), ''),
+    NULLIF(BTRIM(u.request_metadata->>'client_family'), ''),
+    NULLIF(BTRIM(candidate.extra_data::jsonb #>> '{client_session_affinity,client_family}'), '')
+  ) AS effective_client_family,
+  u.request_metadata->>'cafecode_uid' AS cafecode_uid,
+  u.request_metadata->>'cafecode_uname' AS cafecode_uname,
+  u.request_metadata->>'client_ip' AS client_ip,
+  u.request_metadata->>'user_agent' AS user_agent
+FROM usage u
+LEFT JOIN usage_routing_snapshots routing
+  ON routing.request_id = u.request_id
+LEFT JOIN request_candidates candidate
+  ON candidate.id = routing.candidate_id
+WHERE u.request_id = '<full-request-id>';
 "
 ```
 
-If `session_key` is missing, inspect raw client metadata in
+Use `effective_session_key` for the remaining session queries. Keep
+`usage_session_key` separate when diagnosing candidate cleanup: only a value
+persisted on usage can survive after both routing candidate details and their
+affinity metadata are removed.
+
+If `effective_session_key` is missing, inspect raw client metadata in
 `x-codex-turn-metadata`:
 
 ```sh
@@ -169,15 +194,38 @@ Use this distinction in reports:
 
 - `session_id` / `thread_id`: created by the client.
 - `client_session_affinity.session_key`: Aether's normalized grouping key.
+- `effective_session_key`: usage session key with a non-empty candidate fallback
+  for legacy rows.
 - `request_id`: a single HTTP request through Aether.
 - `turn_id`: a client turn inside the session/thread.
+
+The write path, prompt-summary inheritance layers, identity boundaries, and
+first-phase limitations are documented in
+[WebSocket Usage Session Identity and Prompt Summaries](../architecture/ws-usage-session-observability.md).
 
 ## 3. Build The Session Timeline
 
 Once the session key is known, summarize the whole session.
 
+The effective-session expression may scan usage and candidate metadata on large
+datasets. In production diagnostics, add a known `u.user_id`/`u.api_key_id` and
+`u.created_at` window inside each `session_usage` CTE whenever possible. Do not
+run an unbounded historical session scan as a routine dashboard query.
+
 ```sh
 docker exec aether-postgres psql -U postgres -d aether -c "
+WITH session_usage AS (
+  SELECT u.*
+  FROM usage u
+  LEFT JOIN usage_routing_snapshots routing
+    ON routing.request_id = u.request_id
+  LEFT JOIN request_candidates candidate
+    ON candidate.id = routing.candidate_id
+  WHERE COALESCE(
+    NULLIF(BTRIM(u.request_metadata::jsonb #>> '{client_session_affinity,session_key}'), ''),
+    NULLIF(BTRIM(candidate.extra_data::jsonb #>> '{client_session_affinity,session_key}'), '')
+  ) = '<session-key>'
+)
 SELECT
   count(*) AS total,
   min(created_at) AS first_at,
@@ -185,8 +233,7 @@ SELECT
   count(*) FILTER (WHERE status_code = 400) AS status_400,
   min(created_at) FILTER (WHERE status_code = 400) AS first_400_at,
   max(created_at) FILTER (WHERE status_code = 400) AS last_400_at
-FROM usage
-WHERE request_metadata::jsonb #>> '{client_session_affinity,session_key}' = '<session-key>';
+FROM session_usage;
 "
 ```
 
@@ -194,6 +241,18 @@ List the timeline. Keep the error text short in the first pass.
 
 ```sh
 docker exec aether-postgres psql -U postgres -d aether -c "
+WITH session_usage AS (
+  SELECT u.*
+  FROM usage u
+  LEFT JOIN usage_routing_snapshots routing
+    ON routing.request_id = u.request_id
+  LEFT JOIN request_candidates candidate
+    ON candidate.id = routing.candidate_id
+  WHERE COALESCE(
+    NULLIF(BTRIM(u.request_metadata::jsonb #>> '{client_session_affinity,session_key}'), ''),
+    NULLIF(BTRIM(candidate.extra_data::jsonb #>> '{client_session_affinity,session_key}'), '')
+  ) = '<session-key>'
+)
 SELECT
   to_char(created_at, 'YYYY-MM-DD HH24:MI:SS TZ') AS created_at,
   request_id,
@@ -206,8 +265,7 @@ SELECT
   left(coalesce(error_message, ''), 160) AS error,
   request_metadata->>'client_ip' AS client_ip,
   request_metadata->>'user_agent' AS user_agent
-FROM usage
-WHERE request_metadata::jsonb #>> '{client_session_affinity,session_key}' = '<session-key>'
+FROM session_usage
 ORDER BY created_at;
 "
 ```
@@ -216,6 +274,18 @@ Group by status and provider to avoid misreading a mixed session.
 
 ```sh
 docker exec aether-postgres psql -U postgres -d aether -c "
+WITH session_usage AS (
+  SELECT u.*
+  FROM usage u
+  LEFT JOIN usage_routing_snapshots routing
+    ON routing.request_id = u.request_id
+  LEFT JOIN request_candidates candidate
+    ON candidate.id = routing.candidate_id
+  WHERE COALESCE(
+    NULLIF(BTRIM(u.request_metadata::jsonb #>> '{client_session_affinity,session_key}'), ''),
+    NULLIF(BTRIM(candidate.extra_data::jsonb #>> '{client_session_affinity,session_key}'), '')
+  ) = '<session-key>'
+)
 SELECT
   provider_name,
   provider_id,
@@ -225,8 +295,7 @@ SELECT
   count(*) AS n,
   min(created_at) AS first_at,
   max(created_at) AS last_at
-FROM usage
-WHERE request_metadata::jsonb #>> '{client_session_affinity,session_key}' = '<session-key>'
+FROM session_usage
 GROUP BY provider_name, provider_id, provider_endpoint_id, provider_api_key_id, status_code
 ORDER BY first_at;
 "
@@ -407,7 +476,14 @@ SELECT
   max(rc.created_at) AS last_at
 FROM request_candidates rc
 JOIN usage u ON u.request_id = rc.request_id
-WHERE u.request_metadata::jsonb #>> '{client_session_affinity,session_key}' = '<session-key>'
+LEFT JOIN usage_routing_snapshots affinity_routing
+  ON affinity_routing.request_id = u.request_id
+LEFT JOIN request_candidates affinity_candidate
+  ON affinity_candidate.id = affinity_routing.candidate_id
+WHERE COALESCE(
+  NULLIF(BTRIM(u.request_metadata::jsonb #>> '{client_session_affinity,session_key}'), ''),
+  NULLIF(BTRIM(affinity_candidate.extra_data::jsonb #>> '{client_session_affinity,session_key}'), '')
+) = '<session-key>'
 GROUP BY rc.provider_id, rc.endpoint_id, rc.key_id, rc.status, rc.status_code, rc.error_type
 ORDER BY first_at;
 "

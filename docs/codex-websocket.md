@@ -309,6 +309,28 @@ Provider dispatch 前必须预留 required usage/settlement 容量。队列满�
 terminal JSON 或 socket context。若产品要求进程崩溃后仍保证 usage 交付，必须另加
 durable outbox；当前内存队列本身不提供 crash-surviving 保证。
 
+### 7.1 使用记录会话身份与提示词摘要
+
+每个 WS step 的 usage context 会保留 `client_session_affinity`。context 没有有效
+`session_key` 时，使用官方 `session_id`（缺失时使用 `thread_id`）生成 Codex 会话 key，
+使新 usage 记录在 candidate 清理后仍可识别逻辑会话。
+
+历史 usage 缺少会话身份时，读取路径可以通过 routing snapshot 从 candidate 补齐。列表展示、
+会话筛选和计数使用相同的非空优先级，避免“列表显示了会话 ID，但筛选不到”。
+
+后续 WS step 没有自己的 prompt capture 时，详情读取按以下顺序查找摘要：
+
+1. 当前 candidate 的同连接快速路径；
+2. 受用户/API Key、客户端族和时间边界约束的 candidate 会话回退；
+3. 当前 usage 已持久化 session key 时的 usage 元数据保底。
+
+跨 candidate 继承不只依赖 session key。没有用户 ID 和 API Key ID 的记录禁止扩大到其他
+candidate。继承结果只附加到详情响应，并标记 `scope=ws_session`、`inherited=true` 和
+`source_request_id`，不会回写数据库。
+
+完整的数据优先级、查询分层、性能边界和第一阶段限制见
+[WebSocket Usage 会话身份与提示词摘要](architecture/ws-usage-session-observability.md)。
+
 ## 8. 性能环境变量
 
 所有值在进程启动时读取。未设置、空值、非法值或 `0` 使用默认值，并按范围 clamp。
