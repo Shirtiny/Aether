@@ -874,6 +874,20 @@
                               {{ promptCapture.itemCount }} 条
                             </Badge>
                             <Badge
+                              v-if="promptCapture.inherited"
+                              variant="outline"
+                              class="border-violet-500/30 bg-violet-500/10 text-[10px] text-violet-700 dark:text-violet-300"
+                            >
+                              会话继承
+                            </Badge>
+                            <span
+                              v-if="promptCapture.inherited && promptCapture.sourceRequestId"
+                              class="font-mono text-[10px] text-muted-foreground"
+                              :title="promptCapture.sourceRequestId"
+                            >
+                              来源 {{ formatShortRequestId(promptCapture.sourceRequestId) }}
+                            </span>
+                            <Badge
                               v-for="(count, role) in promptCapture.roleCounts"
                               :key="role"
                               variant="outline"

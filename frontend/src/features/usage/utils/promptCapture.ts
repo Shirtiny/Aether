@@ -14,6 +14,9 @@ export interface PromptCaptureItemView {
 export interface PromptCaptureView {
   itemCount: number
   roleCounts: Record<string, number>
+  scope: string
+  inherited: boolean
+  sourceRequestId: string
   items: PromptCaptureItemView[]
 }
 
@@ -98,6 +101,9 @@ export function extractPromptCaptureMetadata(
   return {
     itemCount: asNumber(capture.item_count) ?? items.length,
     roleCounts: normalizeRoleCounts(capture.role_counts),
+    scope: asString(capture.scope),
+    inherited: asBoolean(capture.inherited),
+    sourceRequestId: asString(capture.source_request_id),
     items,
   }
 }

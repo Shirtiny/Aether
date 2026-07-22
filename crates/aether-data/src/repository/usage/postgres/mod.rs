@@ -93,6 +93,24 @@ DO UPDATE SET
   last_seen_at = NOW(),
   seen_count = usage_prompt_capture_entries.seen_count + 1
 "#;
+const FIND_WS_SESSION_PROMPT_CAPTURE_SQL: &str = r#"
+SELECT
+  source.request_id AS source_request_id,
+  source.request_metadata->'prompt_capture' AS prompt_capture
+FROM "usage" AS source
+INNER JOIN usage_routing_snapshots AS source_routing
+  ON source_routing.request_id = source.request_id
+INNER JOIN "usage" AS current
+  ON current.request_id = $2
+WHERE source_routing.candidate_id = $1
+  AND source.user_id IS NOT DISTINCT FROM current.user_id
+  AND source.created_at <= current.created_at
+  AND source.request_metadata->>'ws_step' = 'true'
+  AND json_typeof(source.request_metadata->'prompt_capture'->'items') = 'array'
+  AND json_array_length(source.request_metadata->'prompt_capture'->'items') > 0
+ORDER BY source.created_at DESC, source.updated_at_unix_secs DESC
+LIMIT 1
+"#;
 const UPSERT_USAGE_BODY_BLOB_SQL: &str = include_str!("queries/upsert_usage_body_blob_sql.sql");
 const DELETE_USAGE_BODY_BLOB_SQL: &str = include_str!("queries/delete_usage_body_blob_sql.sql");
 
@@ -2506,6 +2524,26 @@ ORDER BY request_count DESC, "usage".provider_name ASC
         &self,
         mut usage: StoredRequestUsageAudit,
     ) -> Result<StoredRequestUsageAudit, DataLayerError> {
+        if usage_metadata_is_ws_step(usage.request_metadata.as_ref())
+            && !usage_metadata_has_prompt_capture(usage.request_metadata.as_ref())
+        {
+            if let Some(candidate_id) = usage.routing_candidate_id().map(str::to_owned) {
+                if let Some((source_request_id, prompt_capture)) =
+                    find_ws_session_prompt_capture_metadata(
+                        &self.pool,
+                        &candidate_id,
+                        &usage.request_id,
+                    )
+                    .await?
+                {
+                    usage.request_metadata = attach_ws_session_prompt_capture_metadata(
+                        usage.request_metadata,
+                        prompt_capture,
+                        &source_request_id,
+                    );
+                }
+            }
+        }
         usage.request_metadata =
             hydrate_prompt_capture_metadata(&self.pool, usage.request_metadata).await?;
         Ok(usage)
@@ -10570,6 +10608,83 @@ async fn sync_usage_prompt_capture_entries(
             .map_postgres_err()?;
     }
     Ok(())
+}
+
+fn usage_metadata_is_ws_step(metadata: Option<&Value>) -> bool {
+    metadata
+        .and_then(Value::as_object)
+        .and_then(|metadata| metadata.get("ws_step"))
+        .and_then(Value::as_bool)
+        == Some(true)
+}
+
+fn usage_metadata_has_prompt_capture(metadata: Option<&Value>) -> bool {
+    metadata
+        .and_then(Value::as_object)
+        .and_then(|metadata| metadata.get("prompt_capture"))
+        .and_then(Value::as_object)
+        .and_then(|capture| capture.get("items"))
+        .and_then(Value::as_array)
+        .is_some_and(|items| !items.is_empty())
+}
+
+fn attach_ws_session_prompt_capture_metadata(
+    metadata: Option<Value>,
+    prompt_capture: Value,
+    source_request_id: &str,
+) -> Option<Value> {
+    let Value::Object(mut prompt_capture) = prompt_capture else {
+        return metadata;
+    };
+    if !prompt_capture
+        .get("items")
+        .and_then(Value::as_array)
+        .is_some_and(|items| !items.is_empty())
+    {
+        return metadata;
+    }
+
+    prompt_capture.insert("scope".to_string(), Value::String("ws_session".to_string()));
+    prompt_capture.insert("inherited".to_string(), Value::Bool(true));
+    prompt_capture.insert(
+        "source_request_id".to_string(),
+        Value::String(source_request_id.to_string()),
+    );
+
+    let mut metadata = match metadata {
+        Some(Value::Object(metadata)) => metadata,
+        _ => Map::new(),
+    };
+    metadata.insert("prompt_capture".to_string(), Value::Object(prompt_capture));
+    Some(Value::Object(metadata))
+}
+
+async fn find_ws_session_prompt_capture_metadata(
+    pool: &PgPool,
+    candidate_id: &str,
+    request_id: &str,
+) -> Result<Option<(String, Value)>, DataLayerError> {
+    let candidate_id = candidate_id.trim();
+    let request_id = request_id.trim();
+    if candidate_id.is_empty() || request_id.is_empty() {
+        return Ok(None);
+    }
+
+    let row = sqlx::query(FIND_WS_SESSION_PROMPT_CAPTURE_SQL)
+        .bind(candidate_id)
+        .bind(request_id)
+        .fetch_optional(pool)
+        .await
+        .map_postgres_err()?;
+    row.map(|row| {
+        Ok((
+            row.try_get::<String, _>("source_request_id")
+                .map_postgres_err()?,
+            row.try_get::<Value, _>("prompt_capture")
+                .map_postgres_err()?,
+        ))
+    })
+    .transpose()
 }
 
 async fn hydrate_prompt_capture_metadata(

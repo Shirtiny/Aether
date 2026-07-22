@@ -36,6 +36,9 @@ describe('prompt capture metadata', () => {
     expect(capture).toEqual({
       itemCount: 2,
       roleCounts: { system: 1, user: 1 },
+      scope: '',
+      inherited: false,
+      sourceRequestId: '',
       items: [
         {
           source: 'messages[0].content',
@@ -87,5 +90,25 @@ describe('prompt capture metadata', () => {
   it('returns null when there are no prompt capture items', () => {
     expect(extractPromptCaptureMetadata({ prompt_capture: { items: [] } })).toBeNull()
     expect(extractPromptCaptureMetadata({})).toBeNull()
+  })
+
+  it('exposes websocket session inheritance metadata', () => {
+    const capture = extractPromptCaptureMetadata({
+      prompt_capture: {
+        scope: 'ws_session',
+        inherited: true,
+        source_request_id: 'ws-source-1',
+        items: [
+          {
+            role: 'user',
+            preview: 'session prompt',
+          },
+        ],
+      },
+    })
+
+    expect(capture?.scope).toBe('ws_session')
+    expect(capture?.inherited).toBe(true)
+    expect(capture?.sourceRequestId).toBe('ws-source-1')
   })
 })

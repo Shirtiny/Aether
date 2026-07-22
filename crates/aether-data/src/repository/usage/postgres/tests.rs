@@ -5,14 +5,16 @@ use sqlx::{Postgres, QueryBuilder};
 use super::{
     attach_compressed_body_refs, attach_usage_http_audit_body_refs,
     attach_usage_routing_snapshot_metadata, attach_usage_settlement_pricing_snapshot_metadata,
-    inflate_usage_json_value, prepare_prompt_capture_metadata,
-    prepare_request_metadata_for_body_storage, prepare_usage_body_storage,
-    resolved_read_usage_body_ref, resolved_write_usage_body_ref,
+    attach_ws_session_prompt_capture_metadata, inflate_usage_json_value,
+    prepare_prompt_capture_metadata, prepare_request_metadata_for_body_storage,
+    prepare_usage_body_storage, resolved_read_usage_body_ref, resolved_write_usage_body_ref,
     split_dashboard_daily_aggregate_range, split_dashboard_hourly_aggregate_range, usage_body_ref,
-    usage_http_audit_body_refs, usage_http_audit_capture_mode, usage_routing_snapshot_from_usage,
+    usage_http_audit_body_refs, usage_http_audit_capture_mode, usage_metadata_has_prompt_capture,
+    usage_metadata_is_ws_step, usage_routing_snapshot_from_usage,
     usage_settlement_pricing_snapshot_from_usage, AggregateRangeSplit, SqlxUsageReadRepository,
     UsageHttpAuditRefs, UsagePromptCaptureEntry, UsageRoutingSnapshot,
-    UsageSettlementPricingSnapshot, MAX_INLINE_USAGE_BODY_BYTES,
+    UsageSettlementPricingSnapshot, FIND_WS_SESSION_PROMPT_CAPTURE_SQL,
+    MAX_INLINE_USAGE_BODY_BYTES,
 };
 use crate::driver::postgres::{PostgresPoolConfig, PostgresPoolFactory};
 use crate::repository::usage::UpsertUsageRecord;
@@ -1232,6 +1234,67 @@ fn prepare_prompt_capture_metadata_handles_large_sanitized_prompt_capture() {
         .expect("hash refs should remain");
     assert_eq!(refs.len(), 32);
     assert!(refs.iter().all(|item| item.get("preview").is_none()));
+}
+
+#[test]
+fn ws_session_prompt_capture_query_uses_candidate_and_prior_request_boundary() {
+    assert!(FIND_WS_SESSION_PROMPT_CAPTURE_SQL.contains("source_routing.candidate_id = $1"));
+    assert!(FIND_WS_SESSION_PROMPT_CAPTURE_SQL.contains("current.request_id = $2"));
+    assert!(FIND_WS_SESSION_PROMPT_CAPTURE_SQL.contains("source.created_at <= current.created_at"));
+    assert!(
+        FIND_WS_SESSION_PROMPT_CAPTURE_SQL.contains("source.request_metadata->>'ws_step' = 'true'")
+    );
+    assert!(FIND_WS_SESSION_PROMPT_CAPTURE_SQL.contains("ORDER BY source.created_at DESC"));
+}
+
+#[test]
+fn attaches_prior_prompt_capture_to_ws_session_step_metadata() {
+    let metadata = attach_ws_session_prompt_capture_metadata(
+        Some(json!({
+            "ws_step": true,
+            "trace_id": "ws-step-2"
+        })),
+        json!({
+            "version": 2,
+            "item_count": 1,
+            "role_counts": { "user": 1 },
+            "items": [{
+                "source": "request.input[0].content[0].text",
+                "role": "user",
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }]
+        }),
+        "ws-step-1",
+    )
+    .expect("metadata should remain");
+
+    assert!(usage_metadata_is_ws_step(Some(&metadata)));
+    assert!(usage_metadata_has_prompt_capture(Some(&metadata)));
+    assert_eq!(metadata["trace_id"], json!("ws-step-2"));
+    assert_eq!(metadata["prompt_capture"]["scope"], json!("ws_session"));
+    assert_eq!(metadata["prompt_capture"]["inherited"], json!(true));
+    assert_eq!(
+        metadata["prompt_capture"]["source_request_id"],
+        json!("ws-step-1")
+    );
+    assert_eq!(
+        metadata["prompt_capture"]["items"][0]["role"],
+        json!("user")
+    );
+}
+
+#[test]
+fn ignores_empty_ws_session_prompt_capture_metadata() {
+    let original = Some(json!({ "ws_step": true }));
+    let metadata = attach_ws_session_prompt_capture_metadata(
+        original.clone(),
+        json!({ "items": [] }),
+        "ws-step-1",
+    );
+
+    assert_eq!(metadata, original);
+    assert!(usage_metadata_is_ws_step(metadata.as_ref()));
+    assert!(!usage_metadata_has_prompt_capture(metadata.as_ref()));
 }
 
 #[test]
