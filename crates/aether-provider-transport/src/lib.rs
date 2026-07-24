@@ -148,6 +148,7 @@ pub use standard::{
     StandardPlanFallbackAcceptPolicy, StandardPlanFallbackHeadersInput,
     StandardProviderRequestHeaders, StandardProviderRequestHeadersInput,
 };
+pub use url::build_openai_search_url;
 pub use vertex::{
     is_vertex_api_key_transport_context, is_vertex_service_account_transport_context,
     is_vertex_transport_context, uses_vertex_api_key_query_auth,

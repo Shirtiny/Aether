@@ -2072,6 +2072,12 @@ async fn execute_execution_runtime_sync_impl(
     let mut client_headers = headers.clone();
     apply_endpoint_response_header_rules(state, &plan, &mut client_headers, body_json.as_ref())
         .await?;
+    if plan.client_api_format.eq_ignore_ascii_case("openai:search") {
+        client_headers.insert(
+            "x-aether-upstream-disposition".to_string(),
+            "dispatched".to_string(),
+        );
+    }
     let explicit_finalize = should_finalize_sync_response(report_kind.as_deref());
     let mapped_error_finalize_kind =
         resolve_core_sync_error_finalize_report_kind(plan_kind, &result, body_json.as_ref());

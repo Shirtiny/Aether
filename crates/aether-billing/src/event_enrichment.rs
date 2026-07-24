@@ -286,6 +286,11 @@ fn apply_billing_computation(
     pricing: &BillingModelPricingSnapshot,
     computation: BillingComputation,
 ) -> Result<(), DataLayerError> {
+    let api_format = event
+        .data
+        .endpoint_api_format
+        .as_deref()
+        .or(event.data.api_format.as_deref());
     event.data.total_cost_usd = Some(computation.cost_result.cost);
     event.data.actual_total_cost_usd = Some(computation.actual_total_cost);
     merge_billing_snapshot_metadata(
@@ -295,6 +300,7 @@ fn apply_billing_computation(
         computation.actual_total_cost,
         computation.rate_multiplier,
         computation.is_free_tier,
+        api_format,
     )
 }
 
@@ -325,6 +331,7 @@ fn merge_billing_snapshot_metadata(
     actual_total_cost: f64,
     rate_multiplier: f64,
     is_free_tier: bool,
+    api_format: Option<&str>,
 ) -> Result<(), DataLayerError> {
     let billing_snapshot = serde_json::to_value(snapshot).map_err(|err| {
         DataLayerError::UnexpectedValue(format!("failed to serialize billing snapshot: {err}"))
@@ -335,6 +342,7 @@ fn merge_billing_snapshot_metadata(
         actual_total_cost,
         rate_multiplier,
         is_free_tier,
+        api_format,
     );
 
     let mut metadata = match request_metadata.take() {
@@ -363,6 +371,7 @@ fn build_settlement_snapshot(
     actual_total_cost: f64,
     rate_multiplier: f64,
     is_free_tier: bool,
+    api_format: Option<&str>,
 ) -> Value {
     json!({
         "schema_version": SETTLEMENT_SNAPSHOT_SCHEMA_VERSION,
@@ -374,9 +383,10 @@ fn build_settlement_snapshot(
             "global_model_name": pricing.global_model_name.clone(),
             "model_id": pricing.model_id.clone(),
             "provider_model_name": pricing.model_provider_model_name.clone(),
-            "pricing_source": pricing.pricing_source(),
+            "pricing_source": pricing.pricing_source_for_api_format(api_format),
             "tiered_pricing": pricing.effective_tiered_pricing().cloned(),
-            "price_per_request": pricing.effective_price_per_request(),
+            "price_per_request": pricing.effective_price_per_request_for_api_format(api_format),
+            "api_format": api_format,
             "rate_multiplier": rate_multiplier,
             "is_free_tier": is_free_tier,
         },

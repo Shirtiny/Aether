@@ -37,11 +37,14 @@ impl BillingService {
         pricing: &BillingModelPricingSnapshot,
         input: &BillingUsageInput,
     ) -> Result<BillingComputation, ExpressionEvaluationError> {
-        let Some(rule) = DefaultBillingRuleGenerator::generate_for_pricing_and_service_tier(
-            pricing,
-            &input.task_type,
-            input.service_tier.as_deref(),
-        ) else {
+        let Some(rule) =
+            DefaultBillingRuleGenerator::generate_for_pricing_api_format_and_service_tier(
+                pricing,
+                &input.task_type,
+                input.api_format.as_deref(),
+                input.service_tier.as_deref(),
+            )
+        else {
             return Ok(BillingComputation {
                 cost_result: CostResult {
                     cost: 0.0,
@@ -747,6 +750,66 @@ mod tests {
                 .resolved_dimensions
                 .get("total_input_context"),
             Some(&json!(1_000))
+        );
+    }
+
+    #[test]
+    fn openai_search_bills_only_surface_request_price() {
+        let mut pricing = pricing();
+        pricing.provider_api_key_rate_multipliers =
+            Some(json!({"openai:chat": 0.5, "openai:search": 2.0}));
+        pricing.model_config = Some(json!({
+            "surface_pricing": {
+                "openai:search": {"price_per_request": 0.03}
+            }
+        }));
+        pricing.model_price_per_request = Some(99.0);
+
+        let result = BillingService::new()
+            .calculate(
+                &pricing,
+                &BillingUsageInput {
+                    task_type: "search".to_string(),
+                    api_format: Some("openai:search".to_string()),
+                    service_tier: None,
+                    request_count: 1,
+                    input_tokens: 1_000_000,
+                    output_tokens: 1_000_000,
+                    cache_creation_tokens: 1_000_000,
+                    cache_creation_ephemeral_5m_tokens: 0,
+                    cache_creation_ephemeral_1h_tokens: 0,
+                    cache_read_tokens: 1_000_000,
+                    image_count: 3,
+                    image_size: Some("1024x1024".to_string()),
+                    image_quality: Some("high".to_string()),
+                    image_output_format: Some("png".to_string()),
+                    cache_ttl_minutes: Some(60),
+                },
+            )
+            .expect("search billing should calculate");
+
+        assert_eq!(result.cost_result.cost, 0.03);
+        assert_eq!(result.actual_total_cost, 0.06);
+        assert_eq!(result.rate_multiplier, 2.0);
+        assert_eq!(
+            result
+                .cost_result
+                .snapshot
+                .cost_breakdown
+                .get("request_cost"),
+            Some(&0.03)
+        );
+        assert_eq!(
+            result.cost_result.snapshot.cost_breakdown.get("input_cost"),
+            Some(&0.0)
+        );
+        assert_eq!(
+            result
+                .cost_result
+                .snapshot
+                .cost_breakdown
+                .get("output_cost"),
+            Some(&0.0)
         );
     }
 

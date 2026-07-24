@@ -291,6 +291,22 @@
         </div>
       </div>
 
+      <div
+        v-if="showStandaloneSearchCapability"
+        class="flex items-center justify-between rounded-md border border-border/60 bg-muted/30 px-3 py-2"
+      >
+        <div class="space-y-0.5 pr-4">
+          <Label class="text-sm font-medium">Standalone Web Search</Label>
+          <p class="text-xs text-muted-foreground">
+            允许此 Codex Key 承接 /v1/alpha/search；默认关闭，只有已验证支持该上游端点时才启用。
+          </p>
+        </div>
+        <Switch
+          :model-value="standaloneSearchEnabled"
+          @update:model-value="setStandaloneSearchEnabled"
+        />
+      </div>
+
       <!-- 自动获取模型 -->
       <div class="space-y-3 py-2 px-3 rounded-md border border-border/60 bg-muted/30">
         <div class="flex items-center justify-between">
@@ -534,6 +550,32 @@ const visibleApiFormats = computed(() => getSelectableApiFormats())
 
 const authTypeOptions = computed(() => getAuthTypeOptions(props.providerType))
 const showAuthTypeSelector = computed(() => props.providerType === 'vertex_ai')
+const showStandaloneSearchCapability = computed(() =>
+  props.providerType === 'codex'
+  && form.value.api_formats.some(format => normalizeApiFormat(format) === 'openai:responses')
+)
+const standaloneSearchEnabled = computed(() =>
+  form.value.capabilities.supports_standalone_web_search === true
+)
+
+function setStandaloneSearchEnabled(enabled: boolean) {
+  form.value.capabilities = {
+    ...form.value.capabilities,
+    supports_standalone_web_search: enabled,
+  }
+}
+
+function normalizeCapabilities(
+  capabilities: Record<string, boolean> | null | undefined
+): Record<string, boolean> {
+  return capabilities ? { ...capabilities } : {}
+}
+
+function buildCapabilitiesPayload(): Record<string, boolean> | null {
+  return Object.keys(form.value.capabilities).length > 0
+    ? { ...form.value.capabilities }
+    : null
+}
 
 const apiFormatHelpOpen = ref(false)
 const apiFormatHelpHovered = ref(false)
@@ -700,6 +742,7 @@ const form = ref({
   auth_config_text: '',  // Service Account JSON 文本（用于表单输入）
   api_formats: [] as string[],  // 支持的 API 格式列表
   rate_multipliers: {} as Record<string, number>,  // 按 API 格式的成本倍率
+  capabilities: {} as Record<string, boolean>,
   internal_priority: 10,
   rpm_limit: undefined as number | null | undefined,  // RPM 限制（null=自适应，undefined=保持原值）
   concurrent_limit: undefined as number | null | undefined,  // 并发请求上限（null/0=不限制，undefined=保持原值）
@@ -794,6 +837,7 @@ function resetForm() {
     auth_config_text: '',
     api_formats: defaultApiFormats,
     rate_multipliers: {},
+    capabilities: {},
     internal_priority: 10,
     rpm_limit: undefined,
     concurrent_limit: undefined,
@@ -844,6 +888,7 @@ function loadKeyData() {
       )
       : [],  // 编辑模式下保持原有选择，不默认全选
     rate_multipliers: { ...(props.editingKey.rate_multipliers || {}) },
+    capabilities: normalizeCapabilities(props.editingKey.capabilities),
     internal_priority: props.editingKey.internal_priority ?? 10,
     // 保留原始的 null/undefined 状态，null 表示自适应模式
     rpm_limit: props.editingKey.rpm_limit ?? undefined,
@@ -955,6 +1000,7 @@ async function handleSave() {
     const authConfig = parseAuthConfig()
     const authTypeByFormat = buildAuthTypeByFormatPayload()
     const allowAuthChannelMismatchFormats = buildAllowAuthChannelMismatchFormatsPayload()
+    const capabilities = buildCapabilitiesPayload()
 
     if (props.editingKey) {
       const shouldClearAllowedModels = !!props.editingKey.auto_fetch_models && !form.value.auto_fetch_models
@@ -968,6 +1014,7 @@ async function handleSave() {
         auth_type_by_format: authTypeByFormat,
         allow_auth_channel_mismatch_formats: allowAuthChannelMismatchFormats,
         rate_multipliers: rateMultipliersData,
+        capabilities,
         internal_priority: form.value.internal_priority,
         rpm_limit: form.value.rpm_limit,
         concurrent_limit: form.value.concurrent_limit,
@@ -1002,6 +1049,7 @@ async function handleSave() {
         auth_config: authConfig || undefined,
         name: form.value.name,
         rate_multipliers: rateMultipliersData,
+        capabilities: capabilities || undefined,
         internal_priority: form.value.internal_priority,
         rpm_limit: form.value.rpm_limit,
         concurrent_limit: form.value.concurrent_limit,

@@ -124,6 +124,7 @@ pub(crate) const RUST_FRONTDOOR_OWNED_ROUTE_PATTERNS: &[&str] = &[
     "/v1/messages/count_tokens",
     "/v1/responses",
     "/v1/responses/compact",
+    "/v1/alpha/search",
     "/v1/models/{model}:generateContent",
     "/v1/models/{model}:streamGenerateContent",
     "/v1/models/{model}:predictLongRunning",

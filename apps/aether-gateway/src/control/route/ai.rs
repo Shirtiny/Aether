@@ -62,6 +62,14 @@ pub(super) fn classify_ai_public_route(
                 true,
             ))
         }
+    } else if method == http::Method::POST && normalized_path == "/v1/alpha/search" {
+        Some(classified(
+            "ai_public",
+            "openai",
+            "search",
+            "openai:search",
+            true,
+        ))
     } else if method == http::Method::POST
         && matches!(
             normalized_path,

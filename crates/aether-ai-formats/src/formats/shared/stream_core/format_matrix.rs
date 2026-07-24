@@ -256,6 +256,7 @@ impl ProviderStreamParser {
             FormatId::ClaudeMessages => Self::Claude(ClaudeProviderState::default()),
             FormatId::GeminiGenerateContent => Self::Gemini(GeminiProviderState::default()),
             FormatId::OpenAiEmbedding
+            | FormatId::OpenAiSearch
             | FormatId::OpenAiRerank
             | FormatId::GeminiEmbedding
             | FormatId::JinaEmbedding
@@ -348,6 +349,7 @@ impl ClientStreamEmitter {
             FormatId::ClaudeMessages => Self::Claude(ClaudeClientEmitter::default()),
             FormatId::GeminiGenerateContent => Self::Gemini(GeminiClientEmitter::default()),
             FormatId::OpenAiEmbedding
+            | FormatId::OpenAiSearch
             | FormatId::OpenAiRerank
             | FormatId::GeminiEmbedding
             | FormatId::JinaEmbedding
@@ -413,6 +415,7 @@ fn parse_provider_error(
         FormatId::ClaudeMessages => parse_claude_error(payload),
         FormatId::GeminiGenerateContent => parse_gemini_error(payload),
         FormatId::OpenAiEmbedding
+        | FormatId::OpenAiSearch
         | FormatId::OpenAiRerank
         | FormatId::GeminiEmbedding
         | FormatId::JinaEmbedding

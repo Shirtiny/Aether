@@ -6,6 +6,7 @@ export const API_FORMATS = {
   OPENAI: 'openai:chat',
   OPENAI_RESPONSES: 'openai:responses',
   OPENAI_RESPONSES_COMPACT: 'openai:responses:compact',
+  OPENAI_SEARCH: 'openai:search',
   OPENAI_IMAGE: 'openai:image',
   OPENAI_VIDEO: 'openai:video',
   OPENAI_EMBEDDING: 'openai:embedding',
@@ -29,6 +30,7 @@ export const API_FORMAT_LABELS: Record<string, string> = {
   [API_FORMATS.OPENAI]: 'OpenAI Chat',
   [API_FORMATS.OPENAI_RESPONSES]: 'OpenAI Responses',
   [API_FORMATS.OPENAI_RESPONSES_COMPACT]: 'OpenAI Responses Compact',
+  [API_FORMATS.OPENAI_SEARCH]: 'OpenAI Search',
   [API_FORMATS.OPENAI_IMAGE]: 'OpenAI Image',
   [API_FORMATS.OPENAI_VIDEO]: 'OpenAI Video',
   [API_FORMATS.OPENAI_EMBEDDING]: 'OpenAI Embedding',
@@ -46,6 +48,7 @@ export const API_FORMAT_LABELS: Record<string, string> = {
   OPENAI: 'OpenAI Chat',
   OPENAI_RESPONSES: 'OpenAI Responses',
   OPENAI_RESPONSES_COMPACT: 'OpenAI Responses Compact',
+  OPENAI_SEARCH: 'OpenAI Search',
   OPENAI_IMAGE: 'OpenAI Image',
   OPENAI_VIDEO: 'OpenAI Video',
   OPENAI_EMBEDDING: 'OpenAI Embedding',
@@ -66,6 +69,7 @@ export const API_FORMAT_SHORT: Record<string, string> = {
   [API_FORMATS.OPENAI]: 'O',
   [API_FORMATS.OPENAI_RESPONSES]: 'OR',
   [API_FORMATS.OPENAI_RESPONSES_COMPACT]: 'ORC',
+  [API_FORMATS.OPENAI_SEARCH]: 'OS',
   [API_FORMATS.OPENAI_IMAGE]: 'OI',
   [API_FORMATS.OPENAI_VIDEO]: 'OV',
   [API_FORMATS.OPENAI_EMBEDDING]: 'OE',
@@ -82,6 +86,7 @@ export const API_FORMAT_SHORT: Record<string, string> = {
   OPENAI: 'O',
   OPENAI_RESPONSES: 'OR',
   OPENAI_RESPONSES_COMPACT: 'ORC',
+  OPENAI_SEARCH: 'OS',
   OPENAI_IMAGE: 'OI',
   OPENAI_VIDEO: 'OV',
   OPENAI_EMBEDDING: 'OE',
@@ -104,6 +109,7 @@ export const API_FORMAT_ORDER: string[] = [
   API_FORMATS.OPENAI,
   API_FORMATS.OPENAI_RESPONSES,
   API_FORMATS.OPENAI_RESPONSES_COMPACT,
+  API_FORMATS.OPENAI_SEARCH,
   API_FORMATS.OPENAI_EMBEDDING,
   API_FORMATS.OPENAI_RERANK,
   API_FORMATS.OPENAI_IMAGE,
@@ -134,6 +140,7 @@ export const API_FORMAT_KIND_LABELS: Record<string, string> = {
   chat: 'Chat',
   responses: 'Responses',
   'responses:compact': 'Responses Compact',
+  search: 'Search',
   messages: 'Messages',
   generate_content: 'Generate Content',
   image: 'Image',
@@ -167,6 +174,8 @@ export function normalizeApiFormatAlias(format: string | null | undefined): stri
       return API_FORMATS.OPENAI_RESPONSES
     case 'OPENAI_RESPONSES_COMPACT':
       return API_FORMATS.OPENAI_RESPONSES_COMPACT
+    case 'OPENAI_SEARCH':
+      return API_FORMATS.OPENAI_SEARCH
     case 'OPENAI_IMAGE':
       return API_FORMATS.OPENAI_IMAGE
     case 'OPENAI_VIDEO':

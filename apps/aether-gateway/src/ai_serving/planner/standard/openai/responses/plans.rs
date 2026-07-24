@@ -6,7 +6,7 @@ use super::decision::{
     build_local_openai_responses_candidate_attempt_source,
     maybe_build_local_openai_responses_codex_ws_planning_attempt,
     maybe_build_local_openai_responses_decision_payload_for_candidate,
-    resolve_local_openai_responses_decision_input,
+    openai_search_body_requires_bound_affinity, resolve_local_openai_responses_decision_input,
     resolve_local_openai_responses_decision_input_with_required_capabilities,
     LocalOpenAiResponsesCandidateAttempt, LocalOpenAiResponsesCandidateAttemptSource,
     LocalOpenAiResponsesDecisionInput, LocalOpenAiResponsesSpec,
@@ -95,6 +95,13 @@ pub(super) async fn build_local_sync_attempt_source<'a>(
     .await?;
     apply_local_runtime_candidate_evaluation_progress(state, trace_id, candidate_count);
     if candidate_count == 0 {
+        if spec.companion_search && openai_search_body_requires_bound_affinity(&effective_body_json)
+        {
+            return Err(GatewayError::Client {
+                status: http::StatusCode::CONFLICT,
+                message: "search_session_affinity_lost: the bound search session candidate is unavailable".to_string(),
+            });
+        }
         return Ok(None);
     }
 
@@ -202,6 +209,13 @@ impl LocalExecutionAttemptSource<AiSyncAttempt> for LocalOpenAiResponsesSyncAtte
             self.trace_id,
             "no_local_sync_plans",
         );
+        if self.spec.companion_search && openai_search_body_requires_bound_affinity(&self.body_json)
+        {
+            return Err(GatewayError::Client {
+                status: http::StatusCode::CONFLICT,
+                message: "search_session_affinity_lost: the bound search session candidate is unavailable".to_string(),
+            });
+        }
         Ok(None)
     }
 

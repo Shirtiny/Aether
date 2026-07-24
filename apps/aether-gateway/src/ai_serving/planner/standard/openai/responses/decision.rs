@@ -13,7 +13,7 @@ pub(super) use self::support::{
     build_batched_local_openai_responses_candidate_attempt_source,
     build_local_openai_responses_candidate_attempt_source,
     materialize_local_openai_responses_candidate_attempts,
-    resolve_local_openai_responses_decision_input,
+    openai_search_body_requires_bound_affinity, resolve_local_openai_responses_decision_input,
     resolve_local_openai_responses_decision_input_with_required_capabilities,
     LocalOpenAiResponsesCandidateAttempt, LocalOpenAiResponsesCandidateAttemptSource,
     LocalOpenAiResponsesDecisionInput,

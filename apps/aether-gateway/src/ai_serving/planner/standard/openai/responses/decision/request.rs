@@ -26,7 +26,8 @@ use crate::ai_serving::planner::standard::{
     apply_codex_official_ws_handshake_headers, apply_codex_openai_responses_special_body_edits,
     apply_codex_openai_responses_special_headers,
     apply_codex_pool_concrete_account_profile_for_api_format,
-    apply_deepseek_tool_call_thinking_compat, build_cross_format_openai_responses_request_body,
+    apply_codex_pool_stable_client_headers, apply_deepseek_tool_call_thinking_compat,
+    build_cross_format_openai_responses_request_body,
     build_cross_format_openai_responses_upstream_url, build_local_openai_responses_request_body,
     build_local_openai_responses_upstream_url, request_body_build_failure_extra_data,
 };
@@ -69,7 +70,7 @@ use super::support::{
     mark_skipped_local_openai_responses_candidate,
     mark_skipped_local_openai_responses_candidate_with_extra_data,
     mark_skipped_local_openai_responses_candidate_with_failure_diagnostic,
-    LocalOpenAiResponsesDecisionInput,
+    openai_search_body_requires_bound_affinity, LocalOpenAiResponsesDecisionInput,
 };
 use super::LocalOpenAiResponsesSpec;
 
@@ -321,6 +322,20 @@ pub(crate) async fn resolve_local_openai_responses_candidate_payload_parts(
     candidate_id: &str,
     spec: LocalOpenAiResponsesSpec,
 ) -> Result<Option<LocalOpenAiResponsesCandidatePayloadParts>, GatewayError> {
+    if spec.companion_search {
+        return resolve_local_openai_search_candidate_payload_parts(
+            state,
+            parts,
+            trace_id,
+            body_json,
+            input,
+            eligible,
+            candidate_index,
+            candidate_id,
+        )
+        .await;
+    }
+
     let spec_metadata = local_openai_responses_spec_metadata(spec);
     let client_api_format = spec_metadata.api_format.trim().to_ascii_lowercase();
     let planner_state = PlannerAppState::new(state);
@@ -867,6 +882,261 @@ pub(crate) async fn resolve_local_openai_responses_candidate_payload_parts(
         image_request_summary: None,
         request_redacted: redaction.redacted,
     }))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn resolve_local_openai_search_candidate_payload_parts(
+    state: &AppState,
+    parts: &http::request::Parts,
+    trace_id: &str,
+    body_json: &serde_json::Value,
+    input: &LocalOpenAiResponsesDecisionInput,
+    eligible: &EligibleLocalExecutionCandidate,
+    candidate_index: u32,
+    candidate_id: &str,
+) -> Result<Option<LocalOpenAiResponsesCandidatePayloadParts>, GatewayError> {
+    const SEARCH_FORMAT: &str = "openai:search";
+    const CANDIDATE_FORMAT: &str = "openai:responses";
+
+    let candidate = &eligible.candidate;
+    let transport = &eligible.transport;
+    if openai_search_body_requires_bound_affinity(body_json)
+        && !openai_search_candidate_matches_preexisting_affinity(input, eligible)
+    {
+        mark_skipped_local_openai_responses_candidate(
+            state,
+            input,
+            trace_id,
+            candidate,
+            candidate_index,
+            candidate_id,
+            "search_session_affinity_candidate_mismatch",
+        )
+        .await;
+        return Ok(None);
+    }
+    if !crate::ai_serving::normalize_api_format_alias(eligible.provider_api_format.as_str())
+        .eq_ignore_ascii_case(CANDIDATE_FORMAT)
+        || !transport
+            .provider
+            .provider_type
+            .trim()
+            .eq_ignore_ascii_case("codex")
+    {
+        mark_skipped_local_openai_responses_candidate(
+            state,
+            input,
+            trace_id,
+            candidate,
+            candidate_index,
+            candidate_id,
+            "openai_search_codex_responses_candidate_required",
+        )
+        .await;
+        return Ok(None);
+    }
+    if let Some(skip_reason) =
+        local_standard_transport_unsupported_reason_with_network(transport, CANDIDATE_FORMAT)
+    {
+        mark_skipped_local_openai_responses_candidate(
+            state,
+            input,
+            trace_id,
+            candidate,
+            candidate_index,
+            candidate_id,
+            skip_reason,
+        )
+        .await;
+        return Ok(None);
+    }
+
+    let prepared = match prepare_header_authenticated_candidate(
+        PlannerAppState::new(state),
+        transport,
+        candidate,
+        resolve_local_openai_bearer_auth(transport),
+        OauthPreparationContext {
+            trace_id,
+            api_format: CANDIDATE_FORMAT,
+            operation: "openai_search_candidate_request",
+        },
+    )
+    .await
+    {
+        Ok(prepared) => prepared,
+        Err(skip_reason) => {
+            mark_skipped_local_openai_responses_candidate(
+                state,
+                input,
+                trace_id,
+                candidate,
+                candidate_index,
+                candidate_id,
+                skip_reason,
+            )
+            .await;
+            return Ok(None);
+        }
+    };
+
+    let Some(provider_request_body) =
+        build_openai_search_provider_body(body_json, prepared.mapped_model.as_str())
+    else {
+        mark_skipped_local_openai_responses_candidate(
+            state,
+            input,
+            trace_id,
+            candidate,
+            candidate_index,
+            candidate_id,
+            "provider_request_body_build_failed",
+        )
+        .await;
+        return Ok(None);
+    };
+    let effective_headers = input.effective_headers(&parts.headers);
+    let Some(resolved_headers) =
+        build_standard_provider_request_headers(StandardProviderRequestHeadersInput {
+            transport,
+            provider_api_format: CANDIDATE_FORMAT,
+            same_format: true,
+            headers: effective_headers,
+            auth_header: &prepared.auth_header,
+            auth_value: &prepared.auth_value,
+            extra_headers: &BTreeMap::new(),
+            header_rules: transport.endpoint.header_rules.as_ref(),
+            provider_request_body: &provider_request_body,
+            original_request_body: body_json,
+            upstream_is_stream: false,
+        })
+    else {
+        mark_skipped_local_openai_responses_candidate(
+            state,
+            input,
+            trace_id,
+            candidate,
+            candidate_index,
+            candidate_id,
+            "transport_header_rules_apply_failed",
+        )
+        .await;
+        return Ok(None);
+    };
+    let mut provider_request_headers = resolved_headers.headers;
+    apply_codex_openai_responses_special_headers(
+        &mut provider_request_headers,
+        &provider_request_body,
+        effective_headers,
+        transport.provider.provider_type.as_str(),
+        CANDIDATE_FORMAT,
+        Some(trace_id),
+        transport.key.decrypted_auth_config.as_deref(),
+    );
+    apply_codex_pool_stable_client_headers(&mut provider_request_headers, transport);
+    normalize_openai_search_headers(&mut provider_request_headers);
+
+    let upstream_url = crate::ai_serving::transport::build_openai_search_url(
+        transport.endpoint.base_url.as_str(),
+        parts.uri.query(),
+    );
+    let transport_profile = crate::ai_serving::transport::resolve_transport_profile(transport);
+
+    Ok(Some(LocalOpenAiResponsesCandidatePayloadParts {
+        auth_header: prepared.auth_header,
+        auth_value: prepared.auth_value,
+        mapped_model: prepared.mapped_model,
+        provider_api_format: SEARCH_FORMAT.to_string(),
+        provider_request_body,
+        provider_request_headers,
+        upstream_url,
+        execution_strategy: ExecutionStrategy::LocalSameFormat,
+        conversion_mode: ConversionMode::None,
+        is_antigravity: false,
+        envelope_name: None,
+        upstream_is_stream: false,
+        transport: Arc::clone(transport),
+        transport_profile,
+        image_request_summary: None,
+        request_redacted: false,
+    }))
+}
+
+fn openai_search_candidate_matches_preexisting_affinity(
+    input: &LocalOpenAiResponsesDecisionInput,
+    eligible: &EligibleLocalExecutionCandidate,
+) -> bool {
+    if input.client_session_affinity.is_none()
+        || eligible.orchestration.pool_sticky_bound_key_ineligible
+        || eligible.orchestration.pool_sticky_init_owner.is_some()
+    {
+        return false;
+    }
+    let Some(target) = input.preexisting_scheduler_affinity_target.as_ref() else {
+        return false;
+    };
+    let candidate = &eligible.candidate;
+    if target.provider_id != candidate.provider_id || target.endpoint_id != candidate.endpoint_id {
+        return false;
+    }
+    if eligible.orchestration.candidate_group_id.is_some() {
+        return eligible
+            .orchestration
+            .pool_sticky_bound_key_id
+            .as_deref()
+            .is_some_and(|key_id| key_id == candidate.key_id);
+    }
+    target.key_id == candidate.key_id
+}
+
+fn build_openai_search_provider_body(body_json: &Value, mapped_model: &str) -> Option<Value> {
+    let mut object = body_json.as_object()?.clone();
+    let mapped_model = mapped_model.trim();
+    if mapped_model.is_empty() {
+        return None;
+    }
+    object.insert("model".to_string(), Value::String(mapped_model.to_string()));
+    object.remove("prompt_cache_key");
+    object.remove("prompt_cache_retention");
+    Some(Value::Object(object))
+}
+
+fn normalize_openai_search_headers(headers: &mut BTreeMap<String, String>) {
+    const BLOCKED: &[&str] = &[
+        "openai-beta",
+        "session_id",
+        "conversation_id",
+        "x-codex-beta-features",
+        "x-codex-turn-state",
+        "x-openai-internal-codex-responses-lite",
+    ];
+    headers.retain(|key, _| {
+        !BLOCKED
+            .iter()
+            .any(|blocked| key.eq_ignore_ascii_case(blocked))
+    });
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    headers.insert("accept".to_string(), "application/json".to_string());
+
+    let has_version = headers
+        .iter()
+        .any(|(key, value)| key.eq_ignore_ascii_case("version") && !value.trim().is_empty());
+    if !has_version {
+        let version = headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("user-agent"))
+            .and_then(|(_, value)| codex_version_from_user_agent(value));
+        if let Some(version) = version {
+            headers.insert("version".to_string(), version);
+        }
+    }
+}
+
+fn codex_version_from_user_agent(user_agent: &str) -> Option<String> {
+    let token = user_agent.split_whitespace().next()?.trim();
+    let (_, version) = token.split_once('/')?;
+    let version = version.trim();
+    (!version.is_empty()).then(|| version.to_string())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1807,6 +2077,81 @@ async fn build_kiro_openai_responses_payload_parts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn openai_search_body_is_opaque_except_model_mapping_and_responses_cache_fields() {
+        let body = json!({
+            "id": "search-session-1",
+            "model": "client-model",
+            "commands": {"search_query": [{"q": "primary source"}]},
+            "prompt_cache_key": "responses-cache",
+            "prompt_cache_retention": "24h",
+            "future_field": {"must_survive": true}
+        });
+
+        let provider_body = build_openai_search_provider_body(&body, "mapped-model")
+            .expect("search body should build");
+
+        assert_eq!(provider_body["model"], "mapped-model");
+        assert_eq!(provider_body["id"], "search-session-1");
+        assert_eq!(provider_body["future_field"]["must_survive"], true);
+        assert!(provider_body.get("prompt_cache_key").is_none());
+        assert!(provider_body.get("prompt_cache_retention").is_none());
+    }
+
+    #[test]
+    fn openai_search_headers_strip_responses_state_and_derive_version() {
+        let mut headers = BTreeMap::from([
+            (
+                "authorization".to_string(),
+                "Bearer final-token".to_string(),
+            ),
+            (
+                "user-agent".to_string(),
+                "codex-tui/0.142.0 (Linux; x86_64)".to_string(),
+            ),
+            ("originator".to_string(), "codex-tui".to_string()),
+            (
+                "openai-beta".to_string(),
+                "responses=experimental".to_string(),
+            ),
+            ("session_id".to_string(), "response-session".to_string()),
+            (
+                "x-openai-internal-codex-responses-lite".to_string(),
+                "true".to_string(),
+            ),
+        ]);
+
+        normalize_openai_search_headers(&mut headers);
+
+        assert_eq!(
+            headers.get("accept").map(String::as_str),
+            Some("application/json")
+        );
+        assert_eq!(headers.get("version").map(String::as_str), Some("0.142.0"));
+        assert!(!headers.contains_key("openai-beta"));
+        assert!(!headers.contains_key("session_id"));
+        assert!(!headers.contains_key("x-openai-internal-codex-responses-lite"));
+    }
+
+    #[test]
+    fn openai_search_non_url_ref_requires_existing_affinity() {
+        assert!(openai_search_body_requires_bound_affinity(&json!({
+            "commands": {"open": [{"ref_id": "turn0search0"}]}
+        })));
+        assert!(openai_search_body_requires_bound_affinity(&json!({
+            "commands": {"click": [{"ref_id": "turn0search0", "id": 3}]}
+        })));
+        assert!(!openai_search_body_requires_bound_affinity(&json!({
+            "commands": {"open": [{"ref_id": "https://example.com/source"}]}
+        })));
+        assert!(openai_search_body_requires_bound_affinity(&json!({
+            "commands": {"open": [{"ref_id": "https://"}]}
+        })));
+        assert!(!openai_search_body_requires_bound_affinity(&json!({
+            "commands": {"search_query": [{"q": "primary source"}]}
+        })));
+    }
 
     #[test]
     fn openai_responses_image_bridge_body_preserves_image_generation_tool() {

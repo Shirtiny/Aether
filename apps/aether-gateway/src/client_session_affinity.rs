@@ -153,6 +153,28 @@ pub(crate) fn client_session_affinity_from_parts(
     client_session_scope_from_parts(parts, body_json)?.scheduler_affinity()
 }
 
+pub(crate) fn client_session_affinity_from_search_parts(
+    parts: &http::request::Parts,
+    body_json: Option<&Value>,
+) -> Option<ClientSessionAffinity> {
+    body_json
+        .and_then(|body| body.get("id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|session_id| {
+            ClientSessionScope::new(
+                "codex",
+                session_id,
+                None,
+                None,
+                ClientSessionSignalSource::Body,
+            )
+            .scheduler_affinity()
+        })
+        .or_else(|| client_session_affinity_from_parts(parts, body_json))
+}
+
 pub(crate) fn client_session_scope_from_parts(
     parts: &http::request::Parts,
     body_json: Option<&Value>,
@@ -947,12 +969,32 @@ fn has_header_with_prefix(headers: &http::HeaderMap, prefix: &str) -> bool {
 mod tests {
     use super::{
         client_session_affinity_from_report_context_value, client_session_affinity_from_request,
-        client_session_affinity_report_context_value, client_session_scope_from_request,
-        ClientSessionSignalSource, AETHER_AGENT_ID_HEADER, AETHER_SESSION_ID_HEADER,
+        client_session_affinity_from_search_parts, client_session_affinity_report_context_value,
+        client_session_scope_from_request, ClientSessionSignalSource, AETHER_AGENT_ID_HEADER,
+        AETHER_SESSION_ID_HEADER,
     };
     use aether_scheduler_core::ClientSessionAffinity;
     use http::{HeaderMap, HeaderValue};
     use serde_json::json;
+
+    #[test]
+    fn search_adapter_uses_top_level_id_as_codex_session() {
+        let request = http::Request::builder()
+            .uri("/v1/alpha/search")
+            .body(())
+            .expect("request should build");
+        let (parts, _) = request.into_parts();
+        let body = json!({"id": "search-session-1", "model": "gpt-5.6-sol"});
+
+        let affinity = client_session_affinity_from_search_parts(&parts, Some(&body))
+            .expect("search affinity should build");
+
+        assert_eq!(affinity.client_family.as_deref(), Some("codex"));
+        assert_eq!(
+            affinity.session_key.as_deref(),
+            Some("session=search-session-1")
+        );
+    }
 
     #[test]
     fn unknown_adapter_extracts_body_session_and_agent() {

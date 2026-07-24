@@ -21,7 +21,10 @@ use crate::{
 };
 
 use super::request::resolve_local_openai_responses_candidate_payload_parts;
-use super::support::{LocalOpenAiResponsesCandidateAttempt, LocalOpenAiResponsesDecisionInput};
+use super::support::{
+    openai_search_body_requires_bound_affinity, LocalOpenAiResponsesCandidateAttempt,
+    LocalOpenAiResponsesDecisionInput,
+};
 use super::LocalOpenAiResponsesSpec;
 
 pub(crate) async fn maybe_build_local_openai_responses_decision_payload_for_candidate(
@@ -57,7 +60,9 @@ pub(crate) async fn maybe_build_local_openai_responses_decision_payload_for_cand
         return Ok(None);
     };
     let candidate = &eligible.candidate;
-    let original_request_body_json = if resolved.request_redacted {
+    let original_request_body_json = if spec.companion_search {
+        None
+    } else if resolved.request_redacted {
         Some(&resolved.provider_request_body)
     } else {
         Some(body_json)
@@ -79,6 +84,12 @@ pub(crate) async fn maybe_build_local_openai_responses_decision_payload_for_cand
         .or_else(|| resolve_transport_profile(&resolved.transport));
     let timeouts = resolve_transport_execution_timeouts(&resolved.transport);
     let mut extra_fields = serde_json::Map::new();
+    if spec.companion_search {
+        extra_fields.insert(
+            "candidate_anchor_api_format".to_string(),
+            json!(spec.candidate_api_format),
+        );
+    }
     insert_grok_response_tool_refs(
         &mut extra_fields,
         &resolved.transport.provider.provider_type,
@@ -117,6 +128,10 @@ pub(crate) async fn maybe_build_local_openai_responses_decision_payload_for_cand
                 ]
             }),
         );
+    }
+    if spec.companion_search && openai_search_body_requires_bound_affinity(body_json) {
+        extra_fields.insert("disable_local_candidate_failover".to_string(), json!(true));
+        extra_fields.insert("search_requires_bound_affinity".to_string(), json!(true));
     }
     insert_provider_stream_event_api_format(
         &mut extra_fields,
@@ -190,7 +205,7 @@ pub(crate) async fn maybe_build_local_openai_responses_decision_payload_for_cand
             resolved.execution_strategy,
             resolved.conversion_mode,
             spec_metadata.api_format,
-            candidate.endpoint_api_format.as_str(),
+            resolved.provider_api_format.as_str(),
         ),
         &resolved.transport,
     );

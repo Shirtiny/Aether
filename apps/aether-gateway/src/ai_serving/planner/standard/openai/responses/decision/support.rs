@@ -1,6 +1,7 @@
 use aether_scheduler_core::SchedulerMinimalCandidateSelectionCandidate;
 use tracing::warn;
 
+use crate::ai_serving::planner::candidate_affinity_cache::read_cached_scheduler_affinity_target;
 use crate::ai_serving::planner::candidate_materialization::{
     build_lazy_requested_model_execution_candidate_attempt_source_with_serving,
     build_local_execution_candidate_attempt_source_with_serving,
@@ -34,7 +35,9 @@ use crate::ai_serving::{
     resolve_local_decision_execution_runtime_auth_context, ExecutionRuntimeAuthContext,
     GatewayControlDecision, PlannerAppState,
 };
-use crate::client_session_affinity::client_session_affinity_from_parts;
+use crate::client_session_affinity::{
+    client_session_affinity_from_parts, client_session_affinity_from_search_parts,
+};
 use crate::{AppState, GatewayError};
 
 use super::super::super::openai_request_is_image_generation_intent;
@@ -44,6 +47,42 @@ pub(crate) use crate::ai_serving::planner::candidate_materialization::LocalExecu
 pub(crate) use crate::ai_serving::planner::candidate_materialization::LocalExecutionCandidateAttemptSource as LocalOpenAiResponsesCandidateAttemptSource;
 pub(crate) use crate::ai_serving::planner::decision_input::LocalRequestedModelDecisionInput as LocalOpenAiResponsesDecisionInput;
 
+pub(crate) fn openai_search_body_requires_bound_affinity(value: &serde_json::Value) -> bool {
+    openai_search_body_requires_bound_affinity_at_depth(value, 0)
+}
+
+fn openai_search_body_requires_bound_affinity_at_depth(
+    value: &serde_json::Value,
+    depth: usize,
+) -> bool {
+    const MAX_SEARCH_REF_SCAN_DEPTH: usize = 32;
+    if depth >= MAX_SEARCH_REF_SCAN_DEPTH {
+        return false;
+    }
+    match value {
+        serde_json::Value::Object(object) => object.iter().any(|(key, value)| {
+            if key.eq_ignore_ascii_case("ref_id") {
+                return value
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .is_some_and(|value| !openai_search_ref_is_absolute_http_url(value));
+            }
+            openai_search_body_requires_bound_affinity_at_depth(value, depth + 1)
+        }),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .any(|value| openai_search_body_requires_bound_affinity_at_depth(value, depth + 1)),
+        _ => false,
+    }
+}
+
+fn openai_search_ref_is_absolute_http_url(value: &str) -> bool {
+    value.parse::<http::Uri>().ok().is_some_and(|uri| {
+        matches!(uri.scheme_str(), Some("http" | "https")) && uri.authority().is_some()
+    })
+}
+
 pub(crate) async fn resolve_local_openai_responses_decision_input(
     state: &AppState,
     parts: &http::request::Parts,
@@ -52,8 +91,20 @@ pub(crate) async fn resolve_local_openai_responses_decision_input(
     body_json: &serde_json::Value,
     plan_kind: &str,
 ) -> Result<Option<LocalOpenAiResponsesDecisionInput>, GatewayError> {
+    let search_capabilities = serde_json::json!({
+        "supports_standalone_web_search": true
+    });
+    let explicit_required_capabilities = (plan_kind
+        == aether_ai_formats::api::OPENAI_SEARCH_SYNC_PLAN_KIND)
+        .then_some(&search_capabilities);
     resolve_local_openai_responses_decision_input_with_required_capabilities(
-        state, parts, trace_id, decision, body_json, plan_kind, None,
+        state,
+        parts,
+        trace_id,
+        decision,
+        body_json,
+        plan_kind,
+        explicit_required_capabilities,
     )
     .await
 }
@@ -148,13 +199,39 @@ pub(crate) async fn resolve_local_openai_responses_decision_input_with_required_
 
     let mut input = build_local_requested_model_decision_input(resolved_input, requested_model);
     input.request_auth_channel = decision.request_auth_channel.clone();
-    input.client_session_affinity = client_session_affinity_from_parts(parts, Some(body_json));
+    let is_search = plan_kind == aether_ai_formats::api::OPENAI_SEARCH_SYNC_PLAN_KIND;
+    input.client_session_affinity = if is_search {
+        client_session_affinity_from_search_parts(parts, Some(body_json))
+    } else {
+        client_session_affinity_from_parts(parts, Some(body_json))
+    };
+    if is_search {
+        input.preexisting_scheduler_affinity_target = read_cached_scheduler_affinity_target(
+            PlannerAppState::new(state),
+            Some(&input.auth_snapshot),
+            input.client_session_affinity.as_ref(),
+            "openai:responses",
+            Some(input.requested_model.as_str()),
+        );
+        if openai_search_body_requires_bound_affinity(body_json)
+            && input.preexisting_scheduler_affinity_target.is_none()
+        {
+            return Err(GatewayError::Client {
+                status: http::StatusCode::CONFLICT,
+                message: "search_session_affinity_lost: the search request references prior results but no bound session candidate exists".to_string(),
+            });
+        }
+    }
     if let Err(err) = attach_routing_policy_to_local_requested_model_input(
         state,
         parts,
         &mut input,
         body_json,
-        "openai:responses",
+        if is_search {
+            "openai:search"
+        } else {
+            "openai:responses"
+        },
     )
     .await
     {
@@ -187,7 +264,7 @@ pub(crate) async fn materialize_local_openai_responses_candidate_attempts(
     );
     let preselection = preselect_local_execution_candidates_with_serving(
         planner_state,
-        spec_metadata.api_format,
+        spec.candidate_api_format,
         &input.requested_model,
         spec_metadata.require_streaming,
         input.required_capabilities.as_ref(),
@@ -202,7 +279,7 @@ pub(crate) async fn materialize_local_openai_responses_candidate_attempts(
     let outcome = materialize_local_execution_candidates_with_serving(
         planner_state,
         trace_id,
-        spec_metadata.api_format,
+        spec.candidate_api_format,
         Some(&input.requested_model),
         Some(&input.auth_snapshot),
         input.client_session_affinity.as_ref(),
@@ -215,7 +292,9 @@ pub(crate) async fn materialize_local_openai_responses_candidate_attempts(
         preselection.skipped_candidates,
         LocalCandidateResolutionMode::Standard,
         |eligible| {
-            let provider_api_format = eligible.provider_api_format.clone();
+            let provider_api_format =
+                execution_provider_api_format(spec, eligible.provider_api_format.as_str())
+                    .to_string();
             let (execution_strategy, conversion_mode) = ai_local_execution_contract_for_formats(
                 spec_metadata.api_format,
                 &provider_api_format,
@@ -225,15 +304,15 @@ pub(crate) async fn materialize_local_openai_responses_candidate_attempts(
                     eligible,
                     provider_api_format: provider_api_format.as_str(),
                     client_api_format: spec_metadata.api_format,
-                    extra_fields: serde_json::Map::new(),
+                    extra_fields: candidate_contract_extra_fields(spec),
                 },
                 execution_strategy,
                 conversion_mode,
-                eligible.candidate.endpoint_api_format.as_str(),
+                provider_api_format.as_str(),
             ))
         },
         |mut skipped_candidate| {
-            let provider_api_format = skipped_candidate
+            let candidate_provider_api_format = skipped_candidate
                 .transport
                 .as_ref()
                 .map(|transport| transport.endpoint.api_format.trim().to_ascii_lowercase())
@@ -244,6 +323,9 @@ pub(crate) async fn materialize_local_openai_responses_candidate_attempts(
                         .trim()
                         .to_ascii_lowercase()
                 });
+            let provider_api_format =
+                execution_provider_api_format(spec, candidate_provider_api_format.as_str())
+                    .to_string();
             let (execution_strategy, conversion_mode) = ai_local_execution_contract_for_formats(
                 spec_metadata.api_format,
                 &provider_api_format,
@@ -254,7 +336,7 @@ pub(crate) async fn materialize_local_openai_responses_candidate_attempts(
                     skipped_candidate.transport_ref(),
                     provider_api_format.as_str(),
                     spec_metadata.api_format,
-                    serde_json::Map::new(),
+                    candidate_contract_extra_fields(spec),
                     execution_strategy,
                     conversion_mode,
                     provider_api_format.as_str(),
@@ -322,7 +404,9 @@ async fn build_local_openai_responses_candidate_attempt_source_with_transport_re
         input.required_capabilities.as_ref(),
         LocalCandidatePersistencePolicyKind::OpenAiResponsesDecision,
     );
-    if openai_request_is_image_generation_intent(&input.requested_model, body_json) {
+    if !spec.companion_search
+        && openai_request_is_image_generation_intent(&input.requested_model, body_json)
+    {
         let (image_candidates, image_candidate_count) =
             build_local_openai_responses_image_candidate_attempt_source(
                 state, trace_id, input, body_json, spec,
@@ -336,7 +420,7 @@ async fn build_local_openai_responses_candidate_attempt_source_with_transport_re
         build_lazy_requested_model_execution_candidate_attempt_source_with_serving(
             planner_state,
             trace_id,
-            spec_metadata.api_format,
+            spec.candidate_api_format,
             &input.requested_model,
             spec_metadata.require_streaming,
             &input.auth_snapshot,
@@ -351,7 +435,9 @@ async fn build_local_openai_responses_candidate_attempt_source_with_transport_re
             LocalCandidateResolutionMode::Standard,
             transport_read_mode,
             move |eligible| {
-                let provider_api_format = eligible.provider_api_format.clone();
+                let provider_api_format =
+                    execution_provider_api_format(spec, eligible.provider_api_format.as_str())
+                        .to_string();
                 let (execution_strategy, conversion_mode) = ai_local_execution_contract_for_formats(
                     spec_metadata.api_format,
                     &provider_api_format,
@@ -361,15 +447,15 @@ async fn build_local_openai_responses_candidate_attempt_source_with_transport_re
                         eligible,
                         provider_api_format: provider_api_format.as_str(),
                         client_api_format: spec_metadata.api_format,
-                        extra_fields: serde_json::Map::new(),
+                        extra_fields: candidate_contract_extra_fields(spec),
                     },
                     execution_strategy,
                     conversion_mode,
-                    eligible.candidate.endpoint_api_format.as_str(),
+                    provider_api_format.as_str(),
                 ))
             },
             move |mut skipped_candidate| {
-                let provider_api_format = skipped_candidate
+                let candidate_provider_api_format = skipped_candidate
                     .transport
                     .as_ref()
                     .map(|transport| transport.endpoint.api_format.trim().to_ascii_lowercase())
@@ -380,6 +466,9 @@ async fn build_local_openai_responses_candidate_attempt_source_with_transport_re
                             .trim()
                             .to_ascii_lowercase()
                     });
+                let provider_api_format =
+                    execution_provider_api_format(spec, candidate_provider_api_format.as_str())
+                        .to_string();
                 let (execution_strategy, conversion_mode) = ai_local_execution_contract_for_formats(
                     spec_metadata.api_format,
                     &provider_api_format,
@@ -390,7 +479,7 @@ async fn build_local_openai_responses_candidate_attempt_source_with_transport_re
                         skipped_candidate.transport_ref(),
                         provider_api_format.as_str(),
                         spec_metadata.api_format,
-                        serde_json::Map::new(),
+                        candidate_contract_extra_fields(spec),
                         execution_strategy,
                         conversion_mode,
                         provider_api_format.as_str(),
@@ -401,6 +490,30 @@ async fn build_local_openai_responses_candidate_attempt_source_with_transport_re
         )
         .await?,
     )
+}
+
+fn execution_provider_api_format<'a>(
+    spec: LocalOpenAiResponsesSpec,
+    candidate_provider_api_format: &'a str,
+) -> &'a str {
+    if spec.companion_search {
+        "openai:search"
+    } else {
+        candidate_provider_api_format
+    }
+}
+
+fn candidate_contract_extra_fields(
+    spec: LocalOpenAiResponsesSpec,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut extra_fields = serde_json::Map::new();
+    if spec.companion_search {
+        extra_fields.insert(
+            "candidate_anchor_api_format".to_string(),
+            serde_json::json!(spec.candidate_api_format),
+        );
+    }
+    extra_fields
 }
 
 pub(crate) async fn build_local_openai_responses_image_candidate_attempt_source<'a>(

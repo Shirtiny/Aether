@@ -215,6 +215,48 @@ impl BillingModelPricingSnapshot {
             .or(self.default_price_per_request)
     }
 
+    pub fn effective_price_per_request_for_api_format(
+        &self,
+        api_format: Option<&str>,
+    ) -> Option<f64> {
+        let normalized = api_format
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if normalized == "openai:search" {
+            return configured_surface_price_per_request(
+                self.model_config.as_ref(),
+                self.global_model_config.as_ref(),
+                normalized.as_str(),
+            );
+        }
+        self.effective_price_per_request()
+    }
+
+    pub fn pricing_source_for_api_format(&self, api_format: Option<&str>) -> &'static str {
+        let normalized = api_format
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if normalized == "openai:search" {
+            if configured_surface_price_from_config(self.model_config.as_ref(), normalized.as_str())
+                .is_some()
+            {
+                return "provider_surface_override";
+            }
+            if configured_surface_price_from_config(
+                self.global_model_config.as_ref(),
+                normalized.as_str(),
+            )
+            .is_some()
+            {
+                return "global_surface_default";
+            }
+            return "unpriced";
+        }
+        self.pricing_source()
+    }
+
     pub fn pricing_source(&self) -> &'static str {
         if self
             .model_tiered_pricing
@@ -261,6 +303,52 @@ impl BillingModelPricingSnapshot {
             .and_then(|value| value.as_f64())
             .unwrap_or(1.0)
     }
+}
+
+pub fn configured_surface_price_per_request(
+    model_config: Option<&Value>,
+    global_model_config: Option<&Value>,
+    api_format: &str,
+) -> Option<f64> {
+    configured_surface_price_from_config(model_config, api_format)
+        .or_else(|| configured_surface_price_from_config(global_model_config, api_format))
+}
+
+fn configured_surface_price_from_config(config: Option<&Value>, api_format: &str) -> Option<f64> {
+    let config = config?.as_object()?;
+    let normalized = api_format.trim().to_ascii_lowercase();
+    for container in ["surface_pricing", "api_format_pricing"] {
+        if let Some(value) = config
+            .get(container)
+            .and_then(Value::as_object)
+            .and_then(|mapping| {
+                mapping.get(normalized.as_str()).or_else(|| {
+                    mapping
+                        .iter()
+                        .find(|(key, _)| key.eq_ignore_ascii_case(&normalized))
+                        .map(|(_, value)| value)
+                })
+            })
+            .and_then(|value| value.get("price_per_request").or(Some(value)))
+            .and_then(non_negative_f64)
+        {
+            return Some(value);
+        }
+    }
+    if normalized == "openai:search" {
+        return config
+            .get("search_price_per_request")
+            .or_else(|| config.get("web_search_price_per_call"))
+            .and_then(non_negative_f64);
+    }
+    None
+}
+
+fn non_negative_f64(value: &Value) -> Option<f64> {
+    let value = value
+        .as_f64()
+        .or_else(|| value.as_str().and_then(|value| value.trim().parse().ok()))?;
+    (value.is_finite() && value >= 0.0).then_some(value)
 }
 
 fn has_pricing_data(value: &Value) -> bool {
@@ -339,6 +427,32 @@ mod tests {
         let pricing = snapshot(Some(provider_pricing.clone()), Some(default_pricing));
 
         assert_eq!(pricing.effective_tiered_pricing(), Some(&provider_pricing));
+    }
+
+    #[test]
+    fn openai_search_uses_surface_scoped_request_price_without_charging_responses() {
+        let mut pricing = snapshot(None, None);
+        pricing.global_model_config = Some(json!({
+            "surface_pricing": {
+                "openai:search": {"price_per_request": 0.01}
+            }
+        }));
+        pricing.model_config = Some(json!({
+            "search_price_per_request": 0.02
+        }));
+
+        assert_eq!(
+            pricing.effective_price_per_request_for_api_format(Some("openai:search")),
+            Some(0.02)
+        );
+        assert_eq!(
+            pricing.effective_price_per_request_for_api_format(Some("openai:responses")),
+            None
+        );
+        assert_eq!(
+            pricing.pricing_source_for_api_format(Some("openai:search")),
+            "provider_surface_override"
+        );
     }
 
     #[test]

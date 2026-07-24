@@ -273,9 +273,14 @@ async fn estimate_request_cost_upper_bound_usd_from_json(
         return Ok(None);
     }
     let max_output_tokens = max_output_tokens_from_request(body_json);
+    let candidate_api_format = if api_format.eq_ignore_ascii_case("openai:search") {
+        "openai:responses"
+    } else {
+        api_format.as_str()
+    };
     let candidates = state
         .list_minimal_candidate_selection_rows_for_api_format_and_requested_model(
-            &api_format,
+            candidate_api_format,
             requested_model,
         )
         .await?;
@@ -329,6 +334,16 @@ fn estimate_cost_from_billing_context(
         .is_some_and(|value| value.eq_ignore_ascii_case("free_tier"))
     {
         return Some(0.0);
+    }
+    if api_format.eq_ignore_ascii_case("openai:search") {
+        let price_per_request = aether_billing::configured_surface_price_per_request(
+            context.model_config.as_ref(),
+            context.global_model_config.as_ref(),
+            api_format,
+        )
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .unwrap_or(0.0);
+        return Some(price_per_request * rate_multiplier_for_api_format(context, api_format));
     }
     let price_per_request = context
         .model_price_per_request
@@ -536,6 +551,9 @@ async fn request_model_resolves_to_allowed_model(
 fn candidate_api_formats_for_model_resolution(client_api_format: &str) -> Vec<String> {
     let mut api_formats = Vec::new();
     push_unique_api_format(&mut api_formats, client_api_format);
+    if client_api_format.eq_ignore_ascii_case("openai:search") {
+        push_unique_api_format(&mut api_formats, "openai:responses");
+    }
     for api_format in crate::ai_serving::request_candidate_api_formats(client_api_format, false) {
         push_unique_api_format(&mut api_formats, api_format);
     }
@@ -1171,6 +1189,38 @@ mod tests {
                 .expect("estimate should resolve");
 
         assert_eq!(estimate, 6.0);
+    }
+
+    #[test]
+    fn daily_quota_search_estimate_uses_only_surface_request_price() {
+        let mut context = billing_context_with_pricing(
+            Some(json!({
+                "tiers": [{
+                    "up_to": null,
+                    "input_price_per_1m": 100.0,
+                    "output_price_per_1m": 200.0
+                }]
+            })),
+            None,
+            Some(json!({ "openai:search": 2.0 })),
+            None,
+        );
+        context.model_config = Some(json!({
+            "surface_pricing": {
+                "openai:search": {"price_per_request": 0.03}
+            }
+        }));
+        context.model_price_per_request = Some(99.0);
+
+        let estimate = estimate_cost_from_billing_context(
+            &context,
+            "openai:search",
+            1_000_000,
+            Some(1_000_000),
+        )
+        .expect("search estimate should resolve");
+
+        assert_eq!(estimate, 0.06);
     }
 
     #[test]

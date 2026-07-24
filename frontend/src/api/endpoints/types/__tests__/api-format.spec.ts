@@ -14,6 +14,7 @@ describe('api format display helpers', () => {
     expect(normalizeApiFormatAlias('CLAUDE_MESSAGES')).toBe(API_FORMATS.CLAUDE_MESSAGES)
     expect(normalizeApiFormatAlias('OPENAI_RESPONSES')).toBe(API_FORMATS.OPENAI_RESPONSES)
     expect(normalizeApiFormatAlias('OPENAI_RESPONSES_COMPACT')).toBe(API_FORMATS.OPENAI_RESPONSES_COMPACT)
+    expect(normalizeApiFormatAlias('OPENAI_SEARCH')).toBe(API_FORMATS.OPENAI_SEARCH)
     expect(normalizeApiFormatAlias('GEMINI_GENERATE_CONTENT')).toBe(API_FORMATS.GEMINI_GENERATE_CONTENT)
     expect(normalizeApiFormatAlias('OPENAI_EMBEDDING')).toBe(API_FORMATS.OPENAI_EMBEDDING)
     expect(normalizeApiFormatAlias('OPENAI_RERANK')).toBe(API_FORMATS.OPENAI_RERANK)
@@ -30,6 +31,11 @@ describe('api format display helpers', () => {
     expect(formatApiFormat(API_FORMATS.JINA_RERANK)).toBe('Jina Rerank')
     expect(formatApiFormatShort(API_FORMATS.OPENAI_RERANK)).toBe('ORR')
     expect(formatApiFormatShort(API_FORMATS.JINA_RERANK)).toBe('JR')
+  })
+
+  it('formats openai search as an independent surface', () => {
+    expect(formatApiFormat(API_FORMATS.OPENAI_SEARCH)).toBe('OpenAI Search')
+    expect(formatApiFormatShort(API_FORMATS.OPENAI_SEARCH)).toBe('OS')
   })
 
   it('formats embedding api format ids distinctly from chat formats', () => {

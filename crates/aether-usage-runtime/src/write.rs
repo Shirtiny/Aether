@@ -2200,6 +2200,7 @@ fn infer_request_type(api_format: Option<&str>) -> String {
     match infer_endpoint_kind(api_format.unwrap_or_default()) {
         Some("video") => "video".to_string(),
         Some("image") => "image".to_string(),
+        Some("search") => "search".to_string(),
         _ => "chat".to_string(),
     }
 }

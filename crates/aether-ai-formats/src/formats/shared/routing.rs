@@ -11,9 +11,10 @@ use crate::contracts::{
     OPENAI_EMBEDDING_SYNC_PLAN_KIND, OPENAI_IMAGE_STREAM_PLAN_KIND, OPENAI_IMAGE_SYNC_PLAN_KIND,
     OPENAI_RERANK_SYNC_PLAN_KIND, OPENAI_RESPONSES_COMPACT_STREAM_PLAN_KIND,
     OPENAI_RESPONSES_COMPACT_SYNC_PLAN_KIND, OPENAI_RESPONSES_STREAM_PLAN_KIND,
-    OPENAI_RESPONSES_SYNC_PLAN_KIND, OPENAI_VIDEO_CANCEL_SYNC_PLAN_KIND,
-    OPENAI_VIDEO_CONTENT_PLAN_KIND, OPENAI_VIDEO_CREATE_SYNC_PLAN_KIND,
-    OPENAI_VIDEO_DELETE_SYNC_PLAN_KIND, OPENAI_VIDEO_REMIX_SYNC_PLAN_KIND,
+    OPENAI_RESPONSES_SYNC_PLAN_KIND, OPENAI_SEARCH_SYNC_PLAN_KIND,
+    OPENAI_VIDEO_CANCEL_SYNC_PLAN_KIND, OPENAI_VIDEO_CONTENT_PLAN_KIND,
+    OPENAI_VIDEO_CREATE_SYNC_PLAN_KIND, OPENAI_VIDEO_DELETE_SYNC_PLAN_KIND,
+    OPENAI_VIDEO_REMIX_SYNC_PLAN_KIND,
 };
 use crate::formats::openai::image::request::is_openai_image_stream_request;
 
@@ -204,6 +205,14 @@ pub fn resolve_execution_runtime_sync_plan_kind(
         && path == "/v1/rerank"
     {
         return Some(OPENAI_RERANK_SYNC_PLAN_KIND);
+    }
+
+    if route_family == Some("openai")
+        && route_kind == Some("search")
+        && *method == Method::POST
+        && path == "/v1/alpha/search"
+    {
+        return Some(OPENAI_SEARCH_SYNC_PLAN_KIND);
     }
 
     if route_family == Some("openai")
@@ -423,6 +432,7 @@ pub fn supports_sync_execution_decision_kind(plan_kind: &str) -> bool {
             | OPENAI_IMAGE_SYNC_PLAN_KIND
             | OPENAI_RESPONSES_SYNC_PLAN_KIND
             | OPENAI_RESPONSES_COMPACT_SYNC_PLAN_KIND
+            | OPENAI_SEARCH_SYNC_PLAN_KIND
             | CLAUDE_CHAT_SYNC_PLAN_KIND
             | CLAUDE_CLI_SYNC_PLAN_KIND
             | GEMINI_CHAT_SYNC_PLAN_KIND
@@ -477,6 +487,7 @@ mod tests {
         OPENAI_IMAGE_STREAM_PLAN_KIND, OPENAI_IMAGE_SYNC_PLAN_KIND, OPENAI_RERANK_SYNC_PLAN_KIND,
         OPENAI_RESPONSES_COMPACT_STREAM_PLAN_KIND, OPENAI_RESPONSES_COMPACT_SYNC_PLAN_KIND,
         OPENAI_RESPONSES_STREAM_PLAN_KIND, OPENAI_RESPONSES_SYNC_PLAN_KIND,
+        OPENAI_SEARCH_SYNC_PLAN_KIND,
     };
 
     #[test]
@@ -588,6 +599,38 @@ mod tests {
         ));
         assert!(supports_stream_execution_decision_kind(
             OPENAI_RESPONSES_COMPACT_STREAM_PLAN_KIND
+        ));
+    }
+
+    #[test]
+    fn resolves_openai_search_as_sync_only_plan_kind() {
+        assert_eq!(
+            resolve_execution_runtime_sync_plan_kind(
+                Some("ai_public"),
+                Some("openai"),
+                Some("search"),
+                None,
+                &Method::POST,
+                "/v1/alpha/search",
+            ),
+            Some(OPENAI_SEARCH_SYNC_PLAN_KIND)
+        );
+        assert_eq!(
+            resolve_execution_runtime_stream_plan_kind(
+                Some("ai_public"),
+                Some("openai"),
+                Some("search"),
+                None,
+                &Method::POST,
+                "/v1/alpha/search",
+            ),
+            None
+        );
+        assert!(supports_sync_execution_decision_kind(
+            OPENAI_SEARCH_SYNC_PLAN_KIND
+        ));
+        assert!(!supports_stream_execution_decision_kind(
+            OPENAI_SEARCH_SYNC_PLAN_KIND
         ));
     }
 

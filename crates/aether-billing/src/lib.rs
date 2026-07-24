@@ -22,7 +22,10 @@ pub use precision::{
     quantize_cost, quantize_display, quantize_value, BILLING_DISPLAY_PRECISION,
     BILLING_STORAGE_PRECISION,
 };
-pub use pricing::{BillingComputation, BillingModelPricingSnapshot, BillingUsageInput};
+pub use pricing::{
+    configured_surface_price_per_request, BillingComputation, BillingModelPricingSnapshot,
+    BillingUsageInput,
+};
 pub use schema::{
     BillingSnapshot, BillingSnapshotStatus, CostResult, BILLING_SNAPSHOT_SCHEMA_VERSION,
 };

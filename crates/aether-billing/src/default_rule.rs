@@ -34,14 +34,32 @@ impl DefaultBillingRuleGenerator {
         task_type: &str,
         service_tier: Option<&str>,
     ) -> Option<VirtualBillingRule> {
-        let pricing_config = pricing.effective_tiered_pricing();
-        let mut tiers = pricing
-            .effective_tiered_pricing()
+        Self::generate_for_pricing_api_format_and_service_tier(
+            pricing,
+            task_type,
+            None,
+            service_tier,
+        )
+    }
+
+    pub fn generate_for_pricing_api_format_and_service_tier(
+        pricing: &BillingModelPricingSnapshot,
+        task_type: &str,
+        api_format: Option<&str>,
+        service_tier: Option<&str>,
+    ) -> Option<VirtualBillingRule> {
+        let is_search_surface = api_format
+            .map(str::trim)
+            .is_some_and(|value| value.eq_ignore_ascii_case("openai:search"));
+        let pricing_config = (!is_search_surface)
+            .then(|| pricing.effective_tiered_pricing())
+            .flatten();
+        let mut tiers = pricing_config
             .and_then(|value| value.get("tiers"))
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        if pricing.uses_default_gpt56_long_context_policy() {
+        if !is_search_surface && pricing.uses_default_gpt56_long_context_policy() {
             tiers = gpt56_long_context_tiers(tiers);
         }
         let explicit_image_output_price_default =
@@ -56,7 +74,9 @@ impl DefaultBillingRuleGenerator {
             || explicit_image_output_price_default.is_some();
 
         if tiers.is_empty()
-            && pricing.effective_price_per_request().is_none()
+            && pricing
+                .effective_price_per_request_for_api_format(api_format)
+                .is_none()
             && !has_image_output_pricing
         {
             return None;
@@ -92,7 +112,9 @@ impl DefaultBillingRuleGenerator {
             "cache_read_price_per_1m",
             Some((input_price_key.as_str(), 0.1)),
         );
-        let base_request_price = pricing.effective_price_per_request().unwrap_or(0.0);
+        let base_request_price = pricing
+            .effective_price_per_request_for_api_format(api_format)
+            .unwrap_or(0.0);
 
         let mut variables = BTreeMap::new();
         variables.insert("input_price_per_1m".to_string(), json!(base_input_price));

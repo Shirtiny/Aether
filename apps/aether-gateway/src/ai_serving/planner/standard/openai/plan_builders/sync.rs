@@ -125,6 +125,26 @@ pub(crate) fn build_openai_chat_sync_plan_from_decision(
     }))
 }
 
+fn openai_search_report_body_summary(body: &serde_json::Value) -> serde_json::Value {
+    let command_types = body
+        .get("commands")
+        .and_then(serde_json::Value::as_object)
+        .map(|commands| {
+            commands
+                .keys()
+                .cloned()
+                .map(serde_json::Value::String)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    serde_json::json!({
+        "model": body.get("model").and_then(serde_json::Value::as_str),
+        "id_present": body.get("id").and_then(serde_json::Value::as_str).is_some(),
+        "command_types": command_types,
+        "opaque_body_redacted": true
+    })
+}
+
 pub(crate) fn build_openai_responses_sync_plan_from_decision(
     parts: &http::request::Parts,
     _body_json: &serde_json::Value,
@@ -181,10 +201,15 @@ pub(crate) fn build_openai_responses_sync_plan_from_decision(
         .content_type
         .take()
         .or_else(|| Some("application/json".to_string()));
+    let report_provider_request_body = if core.client_api_format == "openai:search" {
+        openai_search_report_body_summary(&provider_request_body_value)
+    } else {
+        provider_request_body_value.clone()
+    };
     let report_context = augment_sync_report_context(
         payload.report_context.take(),
         &provider_request_headers,
-        &provider_request_body_value,
+        &report_provider_request_body,
     )?;
     let stream = payload.upstream_is_stream;
     let plan = build_ai_execution_plan_from_decision(

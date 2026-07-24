@@ -5,7 +5,7 @@ use aether_routing_core::{
     rank_vector_for_candidate, CandidateKind, ResolvedRoutingPolicy, RoutingCandidateFacts,
     RoutingCandidateTrace, RoutingDecisionTrace, RoutingPoolExpansionTrace, RoutingRulePhase,
 };
-use aether_scheduler_core::ClientSessionAffinity;
+use aether_scheduler_core::{ClientSessionAffinity, SchedulerAffinityTarget};
 use async_trait::async_trait;
 use http::StatusCode;
 use http::{HeaderMap, HeaderName, HeaderValue};
@@ -38,6 +38,7 @@ pub(crate) struct LocalRequestedModelDecisionInput {
     pub(crate) required_capabilities: Option<serde_json::Value>,
     pub(crate) request_auth_channel: Option<String>,
     pub(crate) client_session_affinity: Option<ClientSessionAffinity>,
+    pub(crate) preexisting_scheduler_affinity_target: Option<SchedulerAffinityTarget>,
     pub(crate) routing_policy: Option<ResolvedRoutingPolicy>,
     pub(crate) routing_trace_seed: Option<RoutingDecisionTrace>,
     pub(crate) routing_context: Option<LocalRoutingRequestContext>,
@@ -205,6 +206,7 @@ pub(crate) fn build_local_requested_model_decision_input(
         required_capabilities: resolved_input.required_capabilities,
         request_auth_channel: None,
         client_session_affinity: None,
+        preexisting_scheduler_affinity_target: None,
         routing_policy: None,
         routing_trace_seed: None,
         routing_context: None,
@@ -646,6 +648,7 @@ mod tests {
             required_capabilities: None,
             request_auth_channel: None,
             client_session_affinity: None,
+            preexisting_scheduler_affinity_target: None,
             routing_policy: None,
             routing_trace_seed: None,
             routing_context: Some(LocalRoutingRequestContext {

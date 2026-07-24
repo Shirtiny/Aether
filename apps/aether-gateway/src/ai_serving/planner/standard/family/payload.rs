@@ -388,6 +388,7 @@ mod tests {
             required_capabilities: None,
             request_auth_channel: None,
             client_session_affinity: None,
+            preexisting_scheduler_affinity_target: None,
             routing_policy: None,
             routing_trace_seed: None,
             routing_context: None,

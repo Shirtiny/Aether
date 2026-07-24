@@ -31,6 +31,7 @@ pub fn parse_request(
         FormatId::OpenAiRerank => openai::rerank::request::from(body, ctx),
         FormatId::JinaRerank => jina::rerank::request::from(body, ctx),
         FormatId::GeminiEmbedding
+        | FormatId::OpenAiSearch
         | FormatId::DoubaoEmbedding
         | FormatId::AliyunMultimodalEmbedding => None,
     }
@@ -64,6 +65,7 @@ pub fn emit_request(
         FormatId::OpenAiRerank => openai::rerank::request::to(&request, ctx),
         FormatId::JinaRerank => jina::rerank::request::to(&request, ctx),
         FormatId::GeminiEmbedding => gemini::embedding::request::to(&request, ctx),
+        FormatId::OpenAiSearch => None,
         FormatId::DoubaoEmbedding => doubao::embedding::request::to(&request, ctx),
         FormatId::AliyunMultimodalEmbedding => aliyun::embedding::request::to(&request, ctx),
     }
@@ -96,6 +98,7 @@ pub fn parse_response(
         FormatId::ClaudeMessages => claude_messages::response::from(body, ctx),
         FormatId::GeminiGenerateContent => gemini_generate_content::response::from(body, ctx),
         FormatId::OpenAiEmbedding
+        | FormatId::OpenAiSearch
         | FormatId::JinaEmbedding
         | FormatId::OpenAiRerank
         | FormatId::JinaRerank
@@ -121,6 +124,7 @@ pub fn emit_response(
         FormatId::ClaudeMessages => claude_messages::response::to(response, ctx),
         FormatId::GeminiGenerateContent => gemini_generate_content::response::to(response, ctx),
         FormatId::OpenAiEmbedding
+        | FormatId::OpenAiSearch
         | FormatId::JinaEmbedding
         | FormatId::OpenAiRerank
         | FormatId::JinaRerank

@@ -98,6 +98,25 @@ fn classifies_get_responses_as_dedicated_websocket_route() {
 }
 
 #[test]
+fn classifies_openai_alpha_search_as_independent_sync_surface() {
+    let headers = headers(&[("authorization", "Bearer sk-test")]);
+    let uri: Uri = "/v1/alpha/search".parse().expect("uri should parse");
+    let decision = classify_control_route(&http::Method::POST, &uri, &headers)
+        .expect("alpha search route should classify");
+
+    assert_eq!(decision.route_class.as_deref(), Some("ai_public"));
+    assert_eq!(decision.route_family.as_deref(), Some("openai"));
+    assert_eq!(decision.route_kind.as_deref(), Some("search"));
+    assert_eq!(
+        decision.auth_endpoint_signature.as_deref(),
+        Some("openai:search")
+    );
+    assert!(decision.is_execution_runtime_candidate());
+
+    assert!(classify_control_route(&http::Method::GET, &uri, &headers).is_none());
+}
+
+#[test]
 fn classifies_openai_image_generation_and_edit_but_not_variation() {
     let headers = headers(&[("authorization", "Bearer sk-test")]);
 

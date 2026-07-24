@@ -23,6 +23,7 @@ pub enum FormatId {
     OpenAiChat,
     OpenAiResponses,
     OpenAiResponsesCompact,
+    OpenAiSearch,
     OpenAiEmbedding,
     OpenAiRerank,
     ClaudeMessages,
@@ -48,6 +49,7 @@ impl FormatId {
             Self::OpenAiChat
             | Self::OpenAiResponses
             | Self::OpenAiResponsesCompact
+            | Self::OpenAiSearch
             | Self::OpenAiEmbedding
             | Self::OpenAiRerank => FormatFamily::OpenAi,
             Self::ClaudeMessages => FormatFamily::Claude,
@@ -70,6 +72,7 @@ impl FormatId {
             Self::OpenAiChat => "openai:chat",
             Self::OpenAiResponses => "openai:responses",
             Self::OpenAiResponsesCompact => "openai:responses:compact",
+            Self::OpenAiSearch => "openai:search",
             Self::OpenAiEmbedding => "openai:embedding",
             Self::OpenAiRerank => "openai:rerank",
             Self::ClaudeMessages => "claude:messages",
@@ -99,6 +102,7 @@ impl FromStr for FormatId {
             "openai:responses:compact" | "/v1/responses/compact" => {
                 Ok(Self::OpenAiResponsesCompact)
             }
+            "openai:search" | "/v1/alpha/search" => Ok(Self::OpenAiSearch),
             "openai:embedding" | "/v1/embeddings" => Ok(Self::OpenAiEmbedding),
             "openai:rerank" | "/v1/rerank" => Ok(Self::OpenAiRerank),
             "claude:messages" | "/v1/messages" => Ok(Self::ClaudeMessages),
@@ -217,6 +221,21 @@ mod tests {
             Some("aliyun:multimodal_embedding".to_string())
         );
         assert_eq!(FormatId::OpenAiEmbedding.to_string(), "openai:embedding");
+    }
+
+    #[test]
+    fn parses_openai_search_as_independent_format() {
+        assert_eq!(
+            FormatId::parse("openai:search"),
+            Some(FormatId::OpenAiSearch)
+        );
+        assert_eq!(
+            FormatId::parse("/v1/alpha/search"),
+            Some(FormatId::OpenAiSearch)
+        );
+        assert_eq!(FormatId::OpenAiSearch.to_string(), "openai:search");
+        assert!(!super::is_openai_responses_family_format("openai:search"));
+        assert!(!super::api_format_uses_body_stream_field("openai:search"));
     }
 
     #[test]

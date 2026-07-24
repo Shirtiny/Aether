@@ -186,6 +186,22 @@
           <span class="text-xs text-muted-foreground">每次请求固定费用，留空使用全局模型默认值</span>
         </div>
 
+        <div class="flex items-center gap-3 pt-2 border-t">
+          <Label class="text-xs whitespace-nowrap">Search 按次计费 ($/次)</Label>
+          <Input
+            :model-value="searchPricePerRequest ?? ''"
+            type="number"
+            step="0.001"
+            min="0"
+            class="w-32"
+            placeholder="未配置为 $0"
+            @update:model-value="setSearchPricePerRequest"
+          />
+          <span class="text-xs text-muted-foreground">
+            仅作用于 openai:search，不会给普通 Responses 请求加价。
+          </span>
+        </div>
+
         <!-- 视频计费（可选覆盖） -->
         <div class="pt-3 border-t space-y-2">
           <div class="text-sm font-medium">
@@ -400,6 +416,7 @@ type VideoResolutionPriceRow = { resolution: string; price_per_second: number | 
 
 const configTouched = ref(false)
 const videoResolutionPrices = ref<VideoResolutionPriceRow[]>([])
+const searchPricePerRequest = ref<number | undefined>(undefined)
 
 const VIDEO_RESOLUTION_PRICE_PRESETS: Record<
   'common' | 'sora' | 'veo',
@@ -476,6 +493,7 @@ watch(() => props.open, async (newOpen) => {
       }
       // 从有效配置中加载视频费用
       loadVideoPricingFromConfig(effectiveConfig)
+      loadSearchPricingFromConfig(effectiveConfig)
       // 加载阶梯计费配置：优先使用 Provider 自定义配置，否则使用有效配置（继承自全局模型）
       const pricing = props.editingModel.tiered_pricing || props.editingModel.effective_tiered_pricing
       if (pricing) {
@@ -509,6 +527,7 @@ watch(() => form.value.global_model_id, (newId) => {
     tieredPricingModified.value = false
     // 同时继承按次计费（仅供预览）
     form.value.price_per_request = selectedModel?.default_price_per_request ?? undefined
+    loadSearchPricingFromConfig(selectedModel?.config || {})
   }
 })
 
@@ -539,6 +558,7 @@ function resetForm() {
   }
   configTouched.value = false
   videoResolutionPrices.value = []
+  searchPricePerRequest.value = undefined
   tieredPricing.value = null
   tieredPricingModified.value = false
   originalTieredPricing.value = ''
@@ -666,6 +686,37 @@ function pruneEmptyBillingConfig(cfg: Record<string, unknown>) {
   }
   if (Object.keys(billingObj).length === 0) {
     delete cfg.billing
+  }
+}
+
+function loadSearchPricingFromConfig(cfg: Record<string, unknown>) {
+  const price = toFinitePrice(getNested(cfg, 'surface_pricing.openai:search.price_per_request'))
+  searchPricePerRequest.value = price !== null && price >= 0 ? price : undefined
+}
+
+function setSearchPricePerRequest(value: string | number) {
+  searchPricePerRequest.value = parseNumberInput(value, { allowFloat: true, min: 0 })
+  configTouched.value = true
+}
+
+function applySearchPricingToConfig(cfg: Record<string, unknown>) {
+  const price = searchPricePerRequest.value
+  if (typeof price === 'number' && Number.isFinite(price) && price >= 0) {
+    setNested(cfg, 'surface_pricing.openai:search.price_per_request', price)
+    return
+  }
+
+  deleteNested(cfg, 'surface_pricing.openai:search.price_per_request')
+  const surfacePricing = cfg.surface_pricing
+  if (!surfacePricing || typeof surfacePricing !== 'object' || Array.isArray(surfacePricing)) return
+  const surfacePricingObject = surfacePricing as Record<string, unknown>
+  const searchPricing = surfacePricingObject['openai:search']
+  if (searchPricing && typeof searchPricing === 'object' && !Array.isArray(searchPricing)
+    && Object.keys(searchPricing).length === 0) {
+    delete surfacePricingObject['openai:search']
+  }
+  if (Object.keys(surfacePricingObject).length === 0) {
+    delete cfg.surface_pricing
   }
 }
 
@@ -825,6 +876,7 @@ async function handleSubmit() {
 
     // Apply billing (video) pricing into config.
     applyVideoPricingToConfig(form.value.config)
+    applySearchPricingToConfig(form.value.config)
     const cleanConfig = form.value.config && Object.keys(form.value.config).length > 0
       ? form.value.config
       : undefined

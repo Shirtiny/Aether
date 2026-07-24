@@ -14,6 +14,7 @@ const AI_POST_ROUTE_PATTERNS: &[&str] = &[
     "/v1/messages",
     "/v1/messages/count_tokens",
     "/v1/responses/compact",
+    "/v1/alpha/search",
     "/v1/images/generations",
     "/v1/images/edits",
     "/v1internal:loadCodeAssist",
@@ -113,6 +114,7 @@ mod tests {
                 "/api/v1/services/embeddings/multimodal-embedding/multimodal-embedding",
             ),
             ("openai:rerank", "openai", "rerank", "/v1/rerank"),
+            ("openai:search", "openai", "search", "/v1/alpha/search"),
             ("jina:rerank", "jina", "rerank", "/v1/rerank"),
         ] {
             assert_eq!(

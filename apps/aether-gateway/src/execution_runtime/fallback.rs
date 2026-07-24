@@ -24,6 +24,14 @@ fn openai_image_success_disables_local_success_failover(
             .eq_ignore_ascii_case("openai:image")
 }
 
+fn openai_search_request_error_disables_local_failover(
+    plan: &ExecutionPlan,
+    status_code: u16,
+) -> bool {
+    plan.client_api_format.eq_ignore_ascii_case("openai:search")
+        && matches!(status_code, 400 | 409 | 422)
+}
+
 pub(crate) async fn should_retry_next_local_candidate_sync(
     state: &AppState,
     plan: &ExecutionPlan,
@@ -55,6 +63,25 @@ pub(crate) async fn analyze_local_candidate_failover_sync(
     result: &ExecutionResult,
     response_text: Option<&str>,
 ) -> LocalFailoverAnalysis {
+    if report_context.is_some_and(|value| {
+        value
+            .get("disable_local_candidate_failover")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    }) {
+        return LocalFailoverAnalysis {
+            classification: LocalFailoverClassification::StopExecutionError,
+            decision: LocalFailoverDecision::StopLocalFailover,
+        };
+    }
+
+    if openai_search_request_error_disables_local_failover(plan, result.status_code) {
+        return LocalFailoverAnalysis {
+            classification: LocalFailoverClassification::StopStatusCode,
+            decision: LocalFailoverDecision::StopLocalFailover,
+        };
+    }
+
     if sync_plan_kind_disables_local_candidate_failover(plan_kind) {
         return LocalFailoverAnalysis::use_default();
     }
@@ -177,6 +204,7 @@ pub(crate) fn resolve_core_sync_error_finalize_report_kind(
         "openai_chat_sync" => "openai_chat_sync_finalize",
         "openai_responses_sync" => "openai_responses_sync_finalize",
         "openai_responses_compact_sync" => "openai_responses_compact_sync_finalize",
+        "openai_search_sync" => "openai_search_sync_finalize",
         "claude_chat_sync" => "claude_chat_sync_finalize",
         "gemini_chat_sync" => "gemini_chat_sync_finalize",
         "claude_cli_sync" => "claude_cli_sync_finalize",
@@ -497,6 +525,32 @@ mod tests {
     }
 
     #[test]
+    fn sync_search_errors_use_search_finalize_kind_without_control_fallback() {
+        let result = ExecutionResult {
+            request_id: "req-search-error-1".to_string(),
+            candidate_id: None,
+            status_code: 404,
+            headers: Default::default(),
+            body: None,
+            telemetry: None,
+            error: None,
+        };
+
+        assert!(!should_fallback_to_control_sync(
+            "openai_search_sync",
+            &result,
+            None,
+            false,
+            false,
+            true,
+        ));
+        assert_eq!(
+            resolve_core_sync_error_finalize_report_kind("openai_search_sync", &result, None),
+            Some("openai_search_sync_finalize".to_string())
+        );
+    }
+
+    #[test]
     fn stream_failover_marks_chat_errors() {
         assert!(should_fallback_to_control_stream(
             "openai_chat_stream",
@@ -566,6 +620,94 @@ mod tests {
                 &plan,
                 "claude_chat_sync",
                 None,
+                &result,
+                None,
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_stateful_search_ref_disables_cross_candidate_failover() {
+        let result = ExecutionResult {
+            request_id: "req-search-1".to_string(),
+            candidate_id: None,
+            status_code: 502,
+            headers: Default::default(),
+            body: None,
+            telemetry: None,
+            error: None,
+        };
+        let local_report_context = serde_json::json!({
+            "candidate_index": 0,
+            "retry_index": 0,
+            "disable_local_candidate_failover": true,
+            "search_requires_bound_affinity": true,
+        });
+        let state = build_state_with_provider_config(None);
+        let plan = sample_plan();
+
+        assert!(
+            !should_retry_next_local_candidate_sync(
+                &state,
+                &plan,
+                "openai_search_sync",
+                Some(&local_report_context),
+                &result,
+                None,
+            )
+            .await
+        );
+        assert!(
+            should_stop_local_candidate_failover_sync(
+                &state,
+                &plan,
+                "openai_search_sync",
+                Some(&local_report_context),
+                &result,
+                None,
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_search_validation_error_does_not_switch_codex_key() {
+        let result = ExecutionResult {
+            request_id: "req-search-validation-1".to_string(),
+            candidate_id: None,
+            status_code: 422,
+            headers: Default::default(),
+            body: None,
+            telemetry: None,
+            error: None,
+        };
+        let local_report_context = serde_json::json!({
+            "candidate_index": 0,
+            "retry_index": 0,
+        });
+        let state = build_state_with_provider_config(None);
+        let mut plan = sample_plan();
+        plan.client_api_format = "openai:search".to_string();
+        plan.provider_api_format = "openai:search".to_string();
+
+        assert!(
+            !should_retry_next_local_candidate_sync(
+                &state,
+                &plan,
+                "openai_search_sync",
+                Some(&local_report_context),
+                &result,
+                None,
+            )
+            .await
+        );
+        assert!(
+            should_stop_local_candidate_failover_sync(
+                &state,
+                &plan,
+                "openai_search_sync",
+                Some(&local_report_context),
                 &result,
                 None,
             )

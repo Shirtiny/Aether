@@ -111,6 +111,30 @@ mod tests {
     }
 
     #[test]
+    fn resolves_openai_search_as_sync_only_via_format_crate() {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/alpha/search")
+            .body(())
+            .expect("request should build");
+        let (parts, _) = request.into_parts();
+        let decision = sample_decision("openai", "search");
+
+        assert_eq!(
+            resolve_execution_runtime_sync_plan_kind(&parts, &decision),
+            Some("openai_search_sync")
+        );
+        assert_eq!(
+            resolve_execution_runtime_stream_plan_kind(&parts, &decision),
+            None
+        );
+        assert!(supports_sync_execution_decision_kind("openai_search_sync"));
+        assert!(!supports_stream_execution_decision_kind(
+            "openai_search_sync"
+        ));
+    }
+
+    #[test]
     fn resolves_endpoint_route_kinds_by_request_auth_channel_via_format_crate() {
         let claude_request = Request::builder()
             .method(Method::POST)
