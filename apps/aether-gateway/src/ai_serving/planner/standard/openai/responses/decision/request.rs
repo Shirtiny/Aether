@@ -2154,6 +2154,16 @@ mod tests {
     }
 
     #[test]
+    fn openai_search_deeply_nested_non_url_ref_cannot_bypass_affinity() {
+        let mut nested = json!({"ref_id": "turn0search0"});
+        for _ in 0..64 {
+            nested = json!({"future_wrapper": [nested]});
+        }
+
+        assert!(openai_search_body_requires_bound_affinity(&nested));
+    }
+
+    #[test]
     fn openai_responses_image_bridge_body_preserves_image_generation_tool() {
         let body_json = json!({
             "model": "gpt-image-2",

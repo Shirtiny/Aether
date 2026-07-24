@@ -33,7 +33,7 @@ use crate::ai_serving::planner::CandidateFailureDiagnostic;
 use crate::ai_serving::{
     ai_local_execution_contract_for_formats, pool_sticky_session_token_for_request,
     resolve_local_decision_execution_runtime_auth_context, ExecutionRuntimeAuthContext,
-    GatewayControlDecision, PlannerAppState,
+    GatewayControlDecision, PlannerAppState, OPENAI_SEARCH_SYNC_PLAN_KIND,
 };
 use crate::client_session_affinity::{
     client_session_affinity_from_parts, client_session_affinity_from_search_parts,
@@ -48,33 +48,30 @@ pub(crate) use crate::ai_serving::planner::candidate_materialization::LocalExecu
 pub(crate) use crate::ai_serving::planner::decision_input::LocalRequestedModelDecisionInput as LocalOpenAiResponsesDecisionInput;
 
 pub(crate) fn openai_search_body_requires_bound_affinity(value: &serde_json::Value) -> bool {
-    openai_search_body_requires_bound_affinity_at_depth(value, 0)
-}
-
-fn openai_search_body_requires_bound_affinity_at_depth(
-    value: &serde_json::Value,
-    depth: usize,
-) -> bool {
-    const MAX_SEARCH_REF_SCAN_DEPTH: usize = 32;
-    if depth >= MAX_SEARCH_REF_SCAN_DEPTH {
-        return false;
-    }
-    match value {
-        serde_json::Value::Object(object) => object.iter().any(|(key, value)| {
-            if key.eq_ignore_ascii_case("ref_id") {
-                return value
-                    .as_str()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .is_some_and(|value| !openai_search_ref_is_absolute_http_url(value));
+    // Walk iteratively so a deeply nested ref_id cannot evade the affinity
+    // guard while also avoiding recursion proportional to untrusted JSON depth.
+    let mut pending = vec![value];
+    while let Some(value) = pending.pop() {
+        match value {
+            serde_json::Value::Object(object) => {
+                for (key, value) in object {
+                    if key.eq_ignore_ascii_case("ref_id")
+                        && value
+                            .as_str()
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .is_some_and(|value| !openai_search_ref_is_absolute_http_url(value))
+                    {
+                        return true;
+                    }
+                    pending.push(value);
+                }
             }
-            openai_search_body_requires_bound_affinity_at_depth(value, depth + 1)
-        }),
-        serde_json::Value::Array(items) => items
-            .iter()
-            .any(|value| openai_search_body_requires_bound_affinity_at_depth(value, depth + 1)),
-        _ => false,
+            serde_json::Value::Array(items) => pending.extend(items),
+            _ => {}
+        }
     }
+    false
 }
 
 fn openai_search_ref_is_absolute_http_url(value: &str) -> bool {
@@ -94,9 +91,8 @@ pub(crate) async fn resolve_local_openai_responses_decision_input(
     let search_capabilities = serde_json::json!({
         "supports_standalone_web_search": true
     });
-    let explicit_required_capabilities = (plan_kind
-        == aether_ai_formats::api::OPENAI_SEARCH_SYNC_PLAN_KIND)
-        .then_some(&search_capabilities);
+    let explicit_required_capabilities =
+        (plan_kind == OPENAI_SEARCH_SYNC_PLAN_KIND).then_some(&search_capabilities);
     resolve_local_openai_responses_decision_input_with_required_capabilities(
         state,
         parts,
@@ -199,7 +195,7 @@ pub(crate) async fn resolve_local_openai_responses_decision_input_with_required_
 
     let mut input = build_local_requested_model_decision_input(resolved_input, requested_model);
     input.request_auth_channel = decision.request_auth_channel.clone();
-    let is_search = plan_kind == aether_ai_formats::api::OPENAI_SEARCH_SYNC_PLAN_KIND;
+    let is_search = plan_kind == OPENAI_SEARCH_SYNC_PLAN_KIND;
     input.client_session_affinity = if is_search {
         client_session_affinity_from_search_parts(parts, Some(body_json))
     } else {

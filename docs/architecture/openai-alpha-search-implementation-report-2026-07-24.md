@@ -107,7 +107,7 @@ Search 的权限、账单和指标混入 Responses。
 
 - 使用顶层 `id` 作为 Search session affinity；
 - 与 Responses 使用同一候选锚点命名空间；
-- 递归扫描 body 内非 URL `ref_id`，最大深度为 32；
+- 迭代扫描 body 内全部层级的非 URL `ref_id`，不再使用可被深层嵌套绕过的固定深度截断；
 - 只有带 authority 的绝对 `http`/`https` URI 被视为无状态 URL；
 - 状态型请求没有既有绑定时返回 `409 search_session_affinity_lost`；
 - 已绑定候选不匹配时不得执行其他候选；
@@ -159,9 +159,14 @@ API Key 上游返回 404/405 时按“端点未实现”处理：允许换号，
   一个 `/v1/alpha/search`，不会出现双 `/v1`；
 - 删除 `prompt_cache_key` 和 `prompt_cache_retention`；
 - 删除 `OpenAI-Beta`、`Session_ID`、`Conversation_ID` 等 Responses 专用头；
+- 同时删除 `X-OpenAI-Internal-Codex-Responses-Lite`，避免 Responses Lite 内部状态泄漏到
+  standalone Search；
 - 保留未知 Search body 字段；
 - 保留 Aether 的 `x-aether-upstream-disposition` 响应头；
 - Aether 返回 409 时原样透传，不触发 Sub2API 外层 failover，也不计费；
+- 对包含非 URL `ref_id` 的状态型请求，任何已发出上游尝试后的可 failover 错误都禁止
+  Sub2API 跨账号重放，而不只限制 409；
+- API Key base URL 自带 query 时先正确追加 `/alpha/search`，再与入站 query 合并；
 - API Key 上游 404/405 触发端点级 failover。
 
 ### 4.4 按次计费
@@ -252,6 +257,25 @@ git diff --check
 ---
 
 ## 6. 未执行事项与上线前条件
+
+### 6.1 二次审查补充
+
+标签发布前的二次审查额外发现并修复了以下问题：
+
+- Aether 原 32 层 `ref_id` 扫描上限会把更深层的 opaque reference 误判为无状态，现改为
+  迭代完整扫描并增加 64 层回归测试；
+- Aether Search planner 直接引用 `aether_ai_formats::api`，会触发 release workflow 的架构
+  边界测试，现改为通过 `ai_serving` 根 seam 引用；
+- Sub2API 原先仅依赖 Aether 409 阻止外层换号，对状态型请求的 401/403/429/5xx 仍可能
+  跨账号重放，现统一 fail closed；
+- Sub2API API contract fixture 未包含新增的 `web_search_price_per_call` 字段，已补齐；
+- Sub2API Security Scan 发现 `golang.org/x/text`、Axios 和 PostCSS 高危公告，已升级到无
+  可达漏洞/无高危生产依赖的版本；
+- Sub2API golangci-lint 暴露了既有格式、弃用 API 和安全注释问题，已逐项修复并用 CI
+  同版 v2.9 验证为 0 issues。
+
+上述修复仍只涉及源码、测试、依赖锁文件和文档，没有执行生产迁移、部署、重启或容器
+更新。
 
 以下事项没有在本任务中执行：
 
