@@ -1,8 +1,13 @@
 use std::sync::{Arc, Mutex};
 
 use aether_crypto::{encrypt_python_fernet_plaintext, DEVELOPMENT_ENCRYPTION_KEY};
+use aether_data::repository::background_tasks::InMemoryBackgroundTaskRepository;
 use aether_data::repository::candidates::InMemoryRequestCandidateRepository;
 use aether_data::repository::provider_catalog::InMemoryProviderCatalogReadRepository;
+use aether_data_contracts::repository::background_tasks::{
+    BackgroundTaskKind, BackgroundTaskListQuery, BackgroundTaskReadRepository,
+    BackgroundTaskStatus, StoredBackgroundTaskRun,
+};
 use aether_data_contracts::repository::candidates::{
     RequestCandidateReadRepository, RequestCandidateStatus, RequestCandidateWriteRepository,
     UpsertRequestCandidateRecord,
@@ -14,7 +19,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::json;
 
-use super::ProviderCheckinRunSummary;
+use super::{BackgroundTaskCleanupSummary, ProviderCheckinRunSummary};
 use crate::AppState;
 
 async fn start_server(app: Router) -> (String, tokio::task::JoinHandle<()>) {
@@ -433,5 +438,182 @@ async fn gateway_provider_checkin_skips_when_disabled_via_system_config() {
             failed: 0,
             skipped: 0,
         }
+    );
+}
+
+fn stored_background_task_run(
+    id: &str,
+    status: BackgroundTaskStatus,
+    updated_at_unix_secs: u64,
+) -> StoredBackgroundTaskRun {
+    StoredBackgroundTaskRun {
+        id: id.to_string(),
+        task_key: "model.fetch.worker".to_string(),
+        kind: BackgroundTaskKind::Scheduled,
+        trigger: "interval".to_string(),
+        status,
+        attempt: 1,
+        max_attempts: 1,
+        owner_instance: Some("test-instance".to_string()),
+        progress_percent: 0,
+        progress_message: Some("worker booted".to_string()),
+        payload_json: None,
+        result_json: None,
+        error_message: None,
+        cancel_requested: false,
+        created_by: Some("system".to_string()),
+        created_at_unix_secs: updated_at_unix_secs,
+        started_at_unix_secs: Some(updated_at_unix_secs),
+        finished_at_unix_secs: None,
+        updated_at_unix_secs,
+    }
+}
+
+#[tokio::test]
+async fn gateway_background_task_cleanup_deletes_expired_runs_in_batches() {
+    const DAY: u64 = 24 * 60 * 60;
+    let now = 100 * DAY;
+
+    let repository = Arc::new(InMemoryBackgroundTaskRepository::seed_runs([
+        stored_background_task_run(
+            "run-expired-1",
+            BackgroundTaskStatus::Succeeded,
+            now - 60 * DAY,
+        ),
+        stored_background_task_run(
+            "run-expired-2",
+            BackgroundTaskStatus::Failed,
+            now - 40 * DAY,
+        ),
+        stored_background_task_run("run-fresh", BackgroundTaskStatus::Succeeded, now - 1 * DAY),
+    ]));
+    let data_state = crate::data::GatewayDataState::disabled()
+        .with_background_task_repository_for_tests(Arc::clone(&repository))
+        .with_system_config_values_for_tests([
+            ("enable_auto_cleanup".to_string(), json!(true)),
+            ("background_task_runs_retention_days".to_string(), json!(30)),
+            (
+                "background_task_runs_cleanup_batch_size".to_string(),
+                json!(1),
+            ),
+        ]);
+
+    let summary = crate::maintenance::cleanup_background_task_runs_at(&data_state, now)
+        .await
+        .expect("background task cleanup should succeed");
+
+    assert_eq!(
+        summary.deleted_runs, 2,
+        "both expired runs should be deleted"
+    );
+    let remaining = repository
+        .list_runs(&BackgroundTaskListQuery {
+            offset: 0,
+            limit: 10,
+            ..Default::default()
+        })
+        .await
+        .expect("listing runs should succeed");
+    assert_eq!(remaining.total, 1);
+    assert_eq!(remaining.items[0].id, "run-fresh");
+}
+
+#[tokio::test]
+async fn gateway_background_task_cleanup_deletes_stale_worker_boot_runs() {
+    const DAY: u64 = 24 * 60 * 60;
+    let now = 100 * DAY;
+
+    // A boot row left behind by a previous process, plus one written by the
+    // process that is currently running.
+    let repository = Arc::new(InMemoryBackgroundTaskRepository::seed_runs([
+        stored_background_task_run(
+            "boot:model.fetch.worker:old-instance",
+            BackgroundTaskStatus::Running,
+            now - 2 * DAY,
+        ),
+        stored_background_task_run(
+            "boot:model.fetch.worker:current-instance",
+            BackgroundTaskStatus::Running,
+            now - 60,
+        ),
+        stored_background_task_run("run-active", BackgroundTaskStatus::Running, now - 2 * DAY),
+    ]));
+    let data_state = crate::data::GatewayDataState::disabled()
+        .with_background_task_repository_for_tests(Arc::clone(&repository))
+        .with_system_config_values_for_tests([
+            ("enable_auto_cleanup".to_string(), json!(true)),
+            ("background_task_runs_retention_days".to_string(), json!(30)),
+        ]);
+
+    let summary = crate::maintenance::cleanup_background_task_runs_at(&data_state, now)
+        .await
+        .expect("background task cleanup should succeed");
+
+    assert_eq!(summary.deleted_boot_runs, 1);
+    assert_eq!(
+        summary.deleted_runs, 0,
+        "nothing else is past the retention window"
+    );
+
+    assert!(
+        repository
+            .find_run("boot:model.fetch.worker:old-instance")
+            .await
+            .expect("lookup should succeed")
+            .is_none(),
+        "a stale boot row from a dead process is removed outright"
+    );
+
+    let current = repository
+        .find_run("boot:model.fetch.worker:current-instance")
+        .await
+        .expect("lookup should succeed")
+        .expect("current boot run should still exist");
+    assert_eq!(
+        current.status,
+        BackgroundTaskStatus::Running,
+        "a boot row from the live process must not be touched"
+    );
+
+    let active = repository
+        .find_run("run-active")
+        .await
+        .expect("lookup should succeed")
+        .expect("active run should still exist");
+    assert_eq!(
+        active.status,
+        BackgroundTaskStatus::Running,
+        "only worker-boot rows are removed by the stale-boot sweep"
+    );
+}
+
+#[tokio::test]
+async fn gateway_background_task_cleanup_respects_auto_cleanup_switch() {
+    const DAY: u64 = 24 * 60 * 60;
+    let now = 100 * DAY;
+
+    let repository = Arc::new(InMemoryBackgroundTaskRepository::seed_runs([
+        stored_background_task_run(
+            "run-expired",
+            BackgroundTaskStatus::Succeeded,
+            now - 90 * DAY,
+        ),
+    ]));
+    let data_state = crate::data::GatewayDataState::disabled()
+        .with_background_task_repository_for_tests(Arc::clone(&repository))
+        .with_system_config_values_for_tests([("enable_auto_cleanup".to_string(), json!(false))]);
+
+    let summary = crate::maintenance::cleanup_background_task_runs_at(&data_state, now)
+        .await
+        .expect("background task cleanup should succeed");
+
+    assert_eq!(summary, BackgroundTaskCleanupSummary::default());
+    assert!(
+        repository
+            .find_run("run-expired")
+            .await
+            .expect("lookup should succeed")
+            .is_some(),
+        "cleanup must not delete anything while auto cleanup is disabled"
     );
 }

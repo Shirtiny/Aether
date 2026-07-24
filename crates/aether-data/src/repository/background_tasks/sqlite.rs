@@ -6,6 +6,7 @@ use super::{
     BackgroundTaskStatus, BackgroundTaskSummary, BackgroundTaskWriteRepository,
     StoredBackgroundTaskEvent, StoredBackgroundTaskRun, StoredBackgroundTaskRunPage,
     UpsertBackgroundTaskEvent, UpsertBackgroundTaskRun,
+    BACKGROUND_TASK_WORKER_BOOT_RUN_ID_PREFIX as BOOT_RUN_ID_PREFIX,
 };
 use crate::driver::sqlite::SqlitePool;
 use crate::error::SqlResultExt;
@@ -353,6 +354,53 @@ ON CONFLICT(id) DO UPDATE SET
             .map_sql_err()?;
         map_event_row(&row)
     }
+
+    async fn delete_runs_updated_before(
+        &self,
+        retain_from_unix_secs: u64,
+        delete_limit: usize,
+    ) -> Result<usize, DataLayerError> {
+        let deleted = sqlx::query(
+            r#"
+DELETE FROM background_task_runs
+WHERE id IN (
+  SELECT id
+  FROM background_task_runs
+  WHERE updated_at_unix_secs < ?
+  ORDER BY updated_at_unix_secs ASC
+  LIMIT ?
+)
+"#,
+        )
+        .bind(i64::try_from(retain_from_unix_secs).unwrap_or(i64::MAX))
+        .bind(i64::try_from(delete_limit.max(1)).unwrap_or(i64::MAX))
+        .execute(&self.pool)
+        .await
+        .map_sql_err()?
+        .rows_affected() as usize;
+        Ok(deleted)
+    }
+
+    async fn delete_stale_worker_boot_runs(
+        &self,
+        stale_before_unix_secs: u64,
+    ) -> Result<usize, DataLayerError> {
+        let deleted = sqlx::query(
+            r#"
+DELETE FROM background_task_runs
+WHERE status = 'running'
+  AND id LIKE ?
+  AND updated_at_unix_secs < ?
+"#,
+        )
+        .bind(format!("{BOOT_RUN_ID_PREFIX}%"))
+        .bind(i64::try_from(stale_before_unix_secs).unwrap_or(i64::MAX))
+        .execute(&self.pool)
+        .await
+        .map_sql_err()?
+        .rows_affected() as usize;
+        Ok(deleted)
+    }
 }
 
 fn map_run_row(row: &SqliteRow) -> Result<StoredBackgroundTaskRun, DataLayerError> {
@@ -423,4 +471,195 @@ fn u64_to_i64(value: u64, label: &str) -> Result<i64, DataLayerError> {
     i64::try_from(value).map_err(|_| {
         DataLayerError::UnexpectedValue(format!("background task {label} overflow: {value}"))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SqliteBackgroundTaskRepository;
+    use crate::lifecycle::migrate::run_sqlite_migrations;
+    use crate::repository::background_tasks::{
+        BackgroundTaskKind, BackgroundTaskReadRepository, BackgroundTaskStatus,
+        BackgroundTaskWriteRepository, UpsertBackgroundTaskEvent, UpsertBackgroundTaskRun,
+    };
+
+    async fn connect() -> SqliteBackgroundTaskRepository {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("sqlite pool should connect");
+        run_sqlite_migrations(&pool)
+            .await
+            .expect("sqlite migrations should run");
+        SqliteBackgroundTaskRepository::new(pool)
+    }
+
+    fn run(id: &str, status: BackgroundTaskStatus, updated_at: u64) -> UpsertBackgroundTaskRun {
+        UpsertBackgroundTaskRun {
+            id: id.to_string(),
+            task_key: "model.fetch.worker".to_string(),
+            kind: BackgroundTaskKind::Scheduled,
+            trigger: "interval".to_string(),
+            status,
+            attempt: 1,
+            max_attempts: 1,
+            owner_instance: Some("instance-1".to_string()),
+            progress_percent: 0,
+            progress_message: Some("worker booted".to_string()),
+            payload_json: None,
+            result_json: None,
+            error_message: None,
+            cancel_requested: false,
+            created_by: Some("system".to_string()),
+            created_at_unix_secs: updated_at,
+            started_at_unix_secs: Some(updated_at),
+            finished_at_unix_secs: None,
+            updated_at_unix_secs: updated_at,
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_repository_deletes_expired_runs_in_batches_with_their_events() {
+        let repository = connect().await;
+        for (id, updated_at) in [("run-old", 100_u64), ("run-mid", 200), ("run-fresh", 9_000)] {
+            repository
+                .upsert_run(run(id, BackgroundTaskStatus::Succeeded, updated_at))
+                .await
+                .expect("run should seed");
+            repository
+                .upsert_event(UpsertBackgroundTaskEvent {
+                    id: format!("event-{id}"),
+                    run_id: id.to_string(),
+                    event_type: "succeeded".to_string(),
+                    message: "done".to_string(),
+                    payload_json: None,
+                    created_at_unix_secs: updated_at,
+                })
+                .await
+                .expect("event should seed");
+        }
+
+        let first = repository
+            .delete_runs_updated_before(1_000, 1)
+            .await
+            .expect("delete should succeed");
+        assert_eq!(first, 1, "batch limit should cap a single pass");
+        assert!(
+            repository
+                .find_run("run-old")
+                .await
+                .expect("lookup should succeed")
+                .is_none(),
+            "the oldest run is deleted first"
+        );
+
+        let second = repository
+            .delete_runs_updated_before(1_000, 10)
+            .await
+            .expect("delete should succeed");
+        assert_eq!(second, 1);
+        assert!(repository
+            .find_run("run-fresh")
+            .await
+            .expect("lookup should succeed")
+            .is_some());
+
+        // The events table has ON DELETE CASCADE, so the attached events must be
+        // gone along with their runs.
+        assert!(repository
+            .list_events("run-old", 0, 10)
+            .await
+            .expect("event lookup should succeed")
+            .is_empty());
+        assert_eq!(
+            repository
+                .list_events("run-fresh", 0, 10)
+                .await
+                .expect("event lookup should succeed")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_repository_deletes_only_stale_worker_boot_runs() {
+        let repository = connect().await;
+        repository
+            .upsert_run(run(
+                "boot:model.fetch.worker:old",
+                BackgroundTaskStatus::Running,
+                100,
+            ))
+            .await
+            .expect("stale boot run should seed");
+        // Attach an event so the cascade delete is exercised as well.
+        repository
+            .upsert_event(UpsertBackgroundTaskEvent {
+                id: "event-old".to_string(),
+                run_id: "boot:model.fetch.worker:old".to_string(),
+                event_type: "worker_boot".to_string(),
+                message: "booted".to_string(),
+                payload_json: None,
+                created_at_unix_secs: 100,
+            })
+            .await
+            .expect("event should seed");
+        repository
+            .upsert_run(run(
+                "boot:model.fetch.worker:current",
+                BackgroundTaskStatus::Running,
+                9_000,
+            ))
+            .await
+            .expect("current boot run should seed");
+        repository
+            .upsert_run(run("regular-run", BackgroundTaskStatus::Running, 100))
+            .await
+            .expect("regular run should seed");
+
+        let deleted = repository
+            .delete_stale_worker_boot_runs(5_000)
+            .await
+            .expect("delete should succeed");
+        assert_eq!(deleted, 1);
+
+        assert!(
+            repository
+                .find_run("boot:model.fetch.worker:old")
+                .await
+                .expect("lookup should succeed")
+                .is_none(),
+            "a stale running boot row is removed outright"
+        );
+        assert!(
+            repository
+                .list_events("boot:model.fetch.worker:old", 0, 10)
+                .await
+                .expect("event lookup should succeed")
+                .is_empty(),
+            "its events are removed by the cascade"
+        );
+
+        let current = repository
+            .find_run("boot:model.fetch.worker:current")
+            .await
+            .expect("lookup should succeed")
+            .expect("current boot run should still exist");
+        assert_eq!(
+            current.status,
+            BackgroundTaskStatus::Running,
+            "a boot row from the live process must not be touched"
+        );
+
+        let regular = repository
+            .find_run("regular-run")
+            .await
+            .expect("lookup should succeed")
+            .expect("regular run should still exist");
+        assert_eq!(
+            regular.status,
+            BackgroundTaskStatus::Running,
+            "only worker-boot rows are removed"
+        );
+    }
 }

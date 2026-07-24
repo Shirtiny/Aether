@@ -10,6 +10,8 @@ use crate::{AppState, GatewayError};
 mod account_self_check;
 #[path = "runtime/audit_cleanup.rs"]
 mod audit_cleanup;
+#[path = "runtime/background_task_cleanup.rs"]
+mod background_task_cleanup;
 #[path = "runtime/cleanup_runs.rs"]
 mod cleanup_runs;
 #[path = "runtime/config.rs"]
@@ -64,6 +66,11 @@ pub(crate) use aether_data_contracts::repository::usage::{
     UsageCleanupSummary, UsageCleanupWindow,
 };
 use audit_cleanup::*;
+use background_task_cleanup::*;
+pub(crate) use background_task_cleanup::{
+    cleanup_background_task_runs_at, cleanup_background_task_runs_once,
+    BackgroundTaskCleanupSummary,
+};
 pub(crate) use cleanup_runs::{
     list_admin_cleanup_run_records, record_admin_cleanup_run, record_completed_cleanup_run,
     record_failed_cleanup_run, start_admin_request_body_cleanup_task,
@@ -126,6 +133,10 @@ pub(super) fn postgres_error(
 }
 
 const AUDIT_LOG_CLEANUP_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+const BACKGROUND_TASK_CLEANUP_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+/// A worker-boot row is written once and never refreshed, so anything still
+/// marked `running` after this window belongs to a process that is long gone.
+const BACKGROUND_TASK_BOOT_RUN_STALE_AFTER_SECS: u64 = 6 * 60 * 60;
 const GEMINI_FILE_MAPPING_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const PENDING_CLEANUP_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const PROXY_NODE_STALE_SWEEP_INTERVAL: Duration = Duration::from_secs(5);

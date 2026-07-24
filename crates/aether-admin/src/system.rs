@@ -1931,6 +1931,8 @@ pub fn admin_system_config_default_value(key: &str) -> Option<serde_json::Value>
         "proxy_node_metrics_1m_retention_days" => Some(json!(30)),
         "proxy_node_metrics_1h_retention_days" => Some(json!(180)),
         "proxy_node_metrics_cleanup_batch_size" => Some(json!(5000)),
+        "background_task_runs_retention_days" => Some(json!(30)),
+        "background_task_runs_cleanup_batch_size" => Some(json!(1000)),
         "enable_provider_checkin" => Some(json!(true)),
         "provider_checkin_time" => Some(json!("01:05")),
         "provider_priority_mode" => Some(json!("provider")),

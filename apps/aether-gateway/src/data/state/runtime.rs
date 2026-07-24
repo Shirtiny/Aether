@@ -2116,6 +2116,35 @@ impl GatewayDataState {
             None => Ok(None),
         }
     }
+
+    pub(crate) async fn delete_background_task_runs_updated_before(
+        &self,
+        retain_from_unix_secs: u64,
+        delete_limit: usize,
+    ) -> Result<usize, DataLayerError> {
+        match &self.background_task_writer {
+            Some(repository) => {
+                repository
+                    .delete_runs_updated_before(retain_from_unix_secs, delete_limit)
+                    .await
+            }
+            None => Ok(0),
+        }
+    }
+
+    pub(crate) async fn delete_stale_worker_boot_runs(
+        &self,
+        stale_before_unix_secs: u64,
+    ) -> Result<usize, DataLayerError> {
+        match &self.background_task_writer {
+            Some(repository) => {
+                repository
+                    .delete_stale_worker_boot_runs(stale_before_unix_secs)
+                    .await
+            }
+            None => Ok(0),
+        }
+    }
 }
 
 #[cfg(test)]

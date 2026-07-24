@@ -12,21 +12,23 @@ use super::{
     duration_until_next_db_maintenance_run, duration_until_next_stats_aggregation_run,
     duration_until_next_stats_hourly_aggregation_run, maintenance_timezone, parse_hhmm_time,
     perform_oauth_token_refresh_once, perform_provider_quota_alert_once, provider_checkin_schedule,
-    run_audit_cleanup_once, run_db_maintenance_once, run_gemini_file_mapping_cleanup_once,
-    run_pending_cleanup_once, run_pool_monitor_once, run_provider_checkin_once,
-    run_proxy_node_metrics_cleanup_once, run_proxy_node_stale_cleanup_once,
-    run_proxy_upgrade_rollout_once, run_request_candidate_cleanup_once, run_stats_aggregation_once,
+    run_audit_cleanup_once, run_background_task_cleanup_once, run_db_maintenance_once,
+    run_gemini_file_mapping_cleanup_once, run_pending_cleanup_once, run_pool_monitor_once,
+    run_provider_checkin_once, run_proxy_node_metrics_cleanup_once,
+    run_proxy_node_stale_cleanup_once, run_proxy_upgrade_rollout_once,
+    run_request_candidate_cleanup_once, run_stats_aggregation_once,
     run_stats_hourly_aggregation_once, run_usage_cleanup_once, run_usage_counter_flush_once,
     run_wallet_daily_usage_aggregation_once, AUDIT_LOG_CLEANUP_INTERVAL,
-    GEMINI_FILE_MAPPING_CLEANUP_INTERVAL, OAUTH_TOKEN_REFRESH_INTERVAL, PENDING_CLEANUP_INTERVAL,
-    POOL_MONITOR_INTERVAL, PROVIDER_CHECKIN_DEFAULT_TIME, PROVIDER_QUOTA_ALERT_INTERVAL,
-    PROXY_NODE_METRICS_CLEANUP_HOUR, PROXY_NODE_METRICS_CLEANUP_MINUTE,
-    PROXY_NODE_STALE_SWEEP_INTERVAL, PROXY_UPGRADE_ROLLOUT_INTERVAL,
-    REQUEST_CANDIDATE_CLEANUP_INTERVAL, USAGE_CLEANUP_HOUR, USAGE_CLEANUP_MINUTE,
-    USAGE_COUNTER_DELTA_CLEANUP_BATCH_SIZE, USAGE_COUNTER_DELTA_CLEANUP_INTERVAL,
-    USAGE_COUNTER_DELTA_RETENTION_SECS, USAGE_COUNTER_FLUSH_BATCH_SIZE,
-    USAGE_COUNTER_FLUSH_CATCH_UP_BURST_LIMIT, USAGE_COUNTER_FLUSH_INTERVAL,
-    WALLET_DAILY_USAGE_AGGREGATION_HOUR, WALLET_DAILY_USAGE_AGGREGATION_MINUTE,
+    BACKGROUND_TASK_CLEANUP_INTERVAL, GEMINI_FILE_MAPPING_CLEANUP_INTERVAL,
+    OAUTH_TOKEN_REFRESH_INTERVAL, PENDING_CLEANUP_INTERVAL, POOL_MONITOR_INTERVAL,
+    PROVIDER_CHECKIN_DEFAULT_TIME, PROVIDER_QUOTA_ALERT_INTERVAL, PROXY_NODE_METRICS_CLEANUP_HOUR,
+    PROXY_NODE_METRICS_CLEANUP_MINUTE, PROXY_NODE_STALE_SWEEP_INTERVAL,
+    PROXY_UPGRADE_ROLLOUT_INTERVAL, REQUEST_CANDIDATE_CLEANUP_INTERVAL, USAGE_CLEANUP_HOUR,
+    USAGE_CLEANUP_MINUTE, USAGE_COUNTER_DELTA_CLEANUP_BATCH_SIZE,
+    USAGE_COUNTER_DELTA_CLEANUP_INTERVAL, USAGE_COUNTER_DELTA_RETENTION_SECS,
+    USAGE_COUNTER_FLUSH_BATCH_SIZE, USAGE_COUNTER_FLUSH_CATCH_UP_BURST_LIMIT,
+    USAGE_COUNTER_FLUSH_INTERVAL, WALLET_DAILY_USAGE_AGGREGATION_HOUR,
+    WALLET_DAILY_USAGE_AGGREGATION_MINUTE,
 };
 
 const STATS_DAILY_CATCH_UP_BURST_LIMIT: usize = 14;
@@ -550,6 +552,29 @@ pub(crate) fn spawn_stats_hourly_aggregation_worker(
             }
 
             tokio::time::sleep(duration_until_next_stats_hourly_aggregation_run(Utc::now())).await;
+        }
+    }))
+}
+
+pub(crate) fn spawn_background_task_cleanup_worker(
+    data: Arc<GatewayDataState>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if !data.has_background_task_writer() {
+        return None;
+    }
+
+    Some(tokio::spawn(async move {
+        if let Err(err) = run_background_task_cleanup_once(&data).await {
+            log_maintenance_worker_failure("background_task_cleanup", "startup", &err);
+        }
+        let mut interval = tokio::time::interval(BACKGROUND_TASK_CLEANUP_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            if let Err(err) = run_background_task_cleanup_once(&data).await {
+                log_maintenance_worker_failure("background_task_cleanup", "tick", &err);
+            }
         }
     }))
 }

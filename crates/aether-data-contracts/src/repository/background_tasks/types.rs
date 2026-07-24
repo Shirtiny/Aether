@@ -230,6 +230,15 @@ pub struct StoredBackgroundTaskRunPage {
     pub total: usize,
 }
 
+/// Prefix used by the run ids that record "a supervised worker booted on this
+/// instance". Those rows are written once at startup and never updated again,
+/// so they must not be treated as long-lived `running` work.
+pub const BACKGROUND_TASK_WORKER_BOOT_RUN_ID_PREFIX: &str = "boot:";
+
+pub fn build_worker_boot_run_id(task_key: &str, instance_id: &str) -> String {
+    format!("{BACKGROUND_TASK_WORKER_BOOT_RUN_ID_PREFIX}{task_key}:{instance_id}")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct BackgroundTaskSummary {
     pub total: u64,
@@ -277,6 +286,28 @@ pub trait BackgroundTaskWriteRepository: Send + Sync {
         &self,
         event: UpsertBackgroundTaskEvent,
     ) -> Result<StoredBackgroundTaskEvent, crate::DataLayerError>;
+
+    /// Deletes at most `delete_limit` runs whose last update is older than
+    /// `retain_from_unix_secs`. Attached events are removed along with their
+    /// run. Returns the number of deleted runs.
+    async fn delete_runs_updated_before(
+        &self,
+        retain_from_unix_secs: u64,
+        delete_limit: usize,
+    ) -> Result<usize, crate::DataLayerError>;
+
+    /// Deletes worker-boot rows left behind by an earlier process.
+    ///
+    /// Boot rows are written once when a supervised worker starts and are never
+    /// touched again, so a process restart leaves them pinned in `running`
+    /// forever while carrying no useful information. Only `running` rows last
+    /// updated before `stale_before_unix_secs` are removed, which keeps the
+    /// boot rows written by the current process intact. Attached events are
+    /// removed along with their run. Returns the number of deleted runs.
+    async fn delete_stale_worker_boot_runs(
+        &self,
+        stale_before_unix_secs: u64,
+    ) -> Result<usize, crate::DataLayerError>;
 }
 
 pub trait BackgroundTaskRepository:

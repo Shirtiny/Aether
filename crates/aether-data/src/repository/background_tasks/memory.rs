@@ -7,7 +7,7 @@ use super::{
     BackgroundTaskListQuery, BackgroundTaskReadRepository, BackgroundTaskStatus,
     BackgroundTaskSummary, BackgroundTaskWriteRepository, StoredBackgroundTaskEvent,
     StoredBackgroundTaskRun, StoredBackgroundTaskRunPage, UpsertBackgroundTaskEvent,
-    UpsertBackgroundTaskRun,
+    UpsertBackgroundTaskRun, BACKGROUND_TASK_WORKER_BOOT_RUN_ID_PREFIX,
 };
 use crate::DataLayerError;
 
@@ -214,5 +214,50 @@ impl BackgroundTaskWriteRepository for InMemoryBackgroundTaskRepository {
                 .then_with(|| left.id.cmp(&right.id))
         });
         Ok(stored)
+    }
+
+    async fn delete_runs_updated_before(
+        &self,
+        retain_from_unix_secs: u64,
+        delete_limit: usize,
+    ) -> Result<usize, DataLayerError> {
+        let mut guard = self.index.write().expect("background task repository lock");
+        let mut expired = guard
+            .runs
+            .values()
+            .filter(|run| run.updated_at_unix_secs < retain_from_unix_secs)
+            .map(|run| (run.updated_at_unix_secs, run.id.clone()))
+            .collect::<Vec<_>>();
+        expired.sort();
+        expired.truncate(delete_limit.max(1));
+        for (_, run_id) in &expired {
+            guard.runs.remove(run_id);
+            guard.events_by_run.remove(run_id);
+        }
+        Ok(expired.len())
+    }
+
+    async fn delete_stale_worker_boot_runs(
+        &self,
+        stale_before_unix_secs: u64,
+    ) -> Result<usize, DataLayerError> {
+        let mut guard = self.index.write().expect("background task repository lock");
+        let stale = guard
+            .runs
+            .values()
+            .filter(|run| {
+                run.status == BackgroundTaskStatus::Running
+                    && run
+                        .id
+                        .starts_with(BACKGROUND_TASK_WORKER_BOOT_RUN_ID_PREFIX)
+                    && run.updated_at_unix_secs < stale_before_unix_secs
+            })
+            .map(|run| run.id.clone())
+            .collect::<Vec<_>>();
+        for run_id in &stale {
+            guard.runs.remove(run_id);
+            guard.events_by_run.remove(run_id);
+        }
+        Ok(stale.len())
     }
 }

@@ -2,8 +2,8 @@ use std::future::Future;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aether_data_contracts::repository::background_tasks::{
-    BackgroundTaskKind, BackgroundTaskStatus, StoredBackgroundTaskRun, UpsertBackgroundTaskEvent,
-    UpsertBackgroundTaskRun,
+    build_worker_boot_run_id, BackgroundTaskKind, BackgroundTaskStatus, StoredBackgroundTaskRun,
+    UpsertBackgroundTaskEvent, UpsertBackgroundTaskRun,
 };
 use aether_runtime::task::spawn_named;
 pub(crate) use aether_task_runtime::TaskSupervisor;
@@ -28,6 +28,7 @@ pub(crate) const TASK_KEY_ACCOUNT_SELF_CHECK: &str = "account.self_check.worker"
 pub(crate) const TASK_KEY_POOL_SCORE_REBUILD: &str = "pool.score.rebuild.worker";
 pub(crate) const TASK_KEY_POOL_MONITOR: &str = "pool.monitor.worker";
 pub(crate) const TASK_KEY_AUDIT_CLEANUP: &str = "maintenance.audit.cleanup";
+pub(crate) const TASK_KEY_BACKGROUND_TASK_CLEANUP: &str = "maintenance.background_task.cleanup";
 pub(crate) const TASK_KEY_DB_MAINTENANCE: &str = "maintenance.database";
 pub(crate) const TASK_KEY_PENDING_CLEANUP: &str = "maintenance.pending.cleanup";
 pub(crate) const TASK_KEY_REQUEST_CANDIDATE_CLEANUP: &str = "maintenance.request.candidate.cleanup";
@@ -148,6 +149,14 @@ const TASK_DEFINITIONS: &[TaskDefinition] = &[
     ),
     TaskDefinition::new(
         TASK_KEY_AUDIT_CLEANUP,
+        TaskKind::Scheduled,
+        "interval",
+        true,
+        true,
+        RETRY_ONCE,
+    ),
+    TaskDefinition::new(
+        TASK_KEY_BACKGROUND_TASK_CLEANUP,
         TaskKind::Scheduled,
         "interval",
         true,
@@ -436,17 +445,22 @@ pub(crate) fn spawn_record_worker_boot(
 ) -> JoinHandle<()> {
     spawn_named("task-runtime-record-worker-boot", async move {
         let now = now_unix_secs();
-        let run_id = format!("boot:{}:{}", task_key, app.tunnel.local_instance_id());
+        let run_id = build_worker_boot_run_id(task_key, app.tunnel.local_instance_id());
+        // A boot row records the one-off "this worker started" event and is
+        // never updated afterwards. Storing it as `running` would leave it
+        // pinned in that state for the lifetime of the row, so it is written as
+        // an already finished run and `running` stays meaningful for work that
+        // is actually executing.
         let run = UpsertBackgroundTaskRun {
             id: run_id.clone(),
             task_key: task_key.to_string(),
             kind,
             trigger: trigger.to_string(),
-            status: BackgroundTaskStatus::Running,
+            status: BackgroundTaskStatus::Succeeded,
             attempt: 1,
             max_attempts: 1,
             owner_instance: Some(app.tunnel.local_instance_id().to_string()),
-            progress_percent: 0,
+            progress_percent: 100,
             progress_message: Some("worker booted".to_string()),
             payload_json: None,
             result_json: None,
@@ -455,7 +469,7 @@ pub(crate) fn spawn_record_worker_boot(
             created_by: Some("system".to_string()),
             created_at_unix_secs: now,
             started_at_unix_secs: Some(now),
-            finished_at_unix_secs: None,
+            finished_at_unix_secs: Some(now),
             updated_at_unix_secs: now,
         };
         let _ = upsert_run_with_logging(&app, run).await;

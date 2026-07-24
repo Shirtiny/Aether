@@ -6,6 +6,7 @@ use super::{
     BackgroundTaskStatus, BackgroundTaskSummary, BackgroundTaskWriteRepository,
     StoredBackgroundTaskEvent, StoredBackgroundTaskRun, StoredBackgroundTaskRunPage,
     UpsertBackgroundTaskEvent, UpsertBackgroundTaskRun,
+    BACKGROUND_TASK_WORKER_BOOT_RUN_ID_PREFIX as BOOT_RUN_ID_PREFIX,
 };
 use crate::error::SqlxResultExt;
 use crate::DataLayerError;
@@ -371,6 +372,55 @@ ON CONFLICT(id) DO UPDATE SET
             .await
             .map_postgres_err()?;
         map_event_row(&row)
+    }
+
+    async fn delete_runs_updated_before(
+        &self,
+        retain_from_unix_secs: u64,
+        delete_limit: usize,
+    ) -> Result<usize, DataLayerError> {
+        let deleted = sqlx::query(
+            r#"
+WITH expired AS (
+  SELECT id
+  FROM background_task_runs
+  WHERE updated_at_unix_secs < $1
+  ORDER BY updated_at_unix_secs ASC
+  LIMIT $2
+)
+DELETE FROM background_task_runs runs
+USING expired
+WHERE runs.id = expired.id
+"#,
+        )
+        .bind(i64::try_from(retain_from_unix_secs).unwrap_or(i64::MAX))
+        .bind(i64::try_from(delete_limit.max(1)).unwrap_or(i64::MAX))
+        .execute(&self.pool)
+        .await
+        .map_postgres_err()?
+        .rows_affected() as usize;
+        Ok(deleted)
+    }
+
+    async fn delete_stale_worker_boot_runs(
+        &self,
+        stale_before_unix_secs: u64,
+    ) -> Result<usize, DataLayerError> {
+        let deleted = sqlx::query(
+            r#"
+DELETE FROM background_task_runs
+WHERE status = 'running'
+  AND id LIKE $1
+  AND updated_at_unix_secs < $2
+"#,
+        )
+        .bind(format!("{BOOT_RUN_ID_PREFIX}%"))
+        .bind(i64::try_from(stale_before_unix_secs).unwrap_or(i64::MAX))
+        .execute(&self.pool)
+        .await
+        .map_postgres_err()?
+        .rows_affected() as usize;
+        Ok(deleted)
     }
 }
 

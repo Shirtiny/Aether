@@ -55,6 +55,7 @@ use super::super::{provider_transport, usage};
 
 use crate::maintenance::spawn_account_self_check_worker;
 use crate::maintenance::spawn_audit_cleanup_worker;
+use crate::maintenance::spawn_background_task_cleanup_worker;
 use crate::maintenance::spawn_db_maintenance_worker;
 use crate::maintenance::spawn_gemini_file_mapping_cleanup_worker;
 use crate::maintenance::spawn_oauth_token_refresh_worker;
@@ -1525,6 +1526,10 @@ impl AppState {
         supervise_worker(
             crate::task_runtime::TASK_KEY_AUDIT_CLEANUP,
             spawn_audit_cleanup_worker(self.data.clone()),
+        );
+        supervise_worker(
+            crate::task_runtime::TASK_KEY_BACKGROUND_TASK_CLEANUP,
+            spawn_background_task_cleanup_worker(self.data.clone()),
         );
         supervise_worker(
             crate::task_runtime::TASK_KEY_DB_MAINTENANCE,

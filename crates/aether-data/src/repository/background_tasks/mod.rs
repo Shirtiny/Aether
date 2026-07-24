@@ -9,6 +9,7 @@ pub(crate) use aether_data_contracts::repository::background_tasks::{
     BackgroundTaskRepository, BackgroundTaskStatus, BackgroundTaskSummary,
     BackgroundTaskWriteRepository, StoredBackgroundTaskEvent, StoredBackgroundTaskRun,
     StoredBackgroundTaskRunPage, UpsertBackgroundTaskEvent, UpsertBackgroundTaskRun,
+    BACKGROUND_TASK_WORKER_BOOT_RUN_ID_PREFIX,
 };
 
 pub use memory::InMemoryBackgroundTaskRepository;
