@@ -2,8 +2,8 @@
 
 - **状态：** 代码已实施并完成本地验证
 - **日期：** 2026-07-24
-- **Aether 分支/提交：** `custom` / `a832d953`
-- **Sub2API 分支/提交：** `custom-prod` / `36efa398b`
+- **Aether 分支/审查基线：** `custom` / `4c6a3970`
+- **Sub2API 分支/审查基线：** `custom-prod` / `f08a0b106`
 - **Codex 协议参考：** `/opt/stacks/openai-codex@81da9deb`
 - **生产状态：** 未部署、未重启、未执行数据库迁移
 - **调查报告：** `openai-alpha-search-endpoint-investigation-2026-07-24.md`
@@ -220,8 +220,20 @@ cargo check -p aether-gateway --tests --locked
 frontend: npm run type-check
   passed
 
-frontend: npm run test:run -- src/api/endpoints/types/__tests__/api-format.spec.ts
-  10 passed
+frontend: npm run test:run
+  84 files / 479 tests passed
+
+frontend: npm run test:run -- \
+  src/utils/__tests__/providerKeyQuota.spec.ts \
+  src/views/admin/__tests__/PoolManagement.codex-cycle-stats.spec.ts
+  2 files / 22 tests passed
+
+frontend: npm run build
+  passed
+
+frontend: npm audit --json
+frontend: npm audit --omit=dev --json
+  0 vulnerabilities
 ```
 
 ### 5.2 Sub2API
@@ -272,7 +284,14 @@ git diff --check
 - Sub2API Security Scan 发现 `golang.org/x/text`、Axios 和 PostCSS 高危公告，已升级到无
   可达漏洞/无高危生产依赖的版本；
 - Sub2API golangci-lint 暴露了既有格式、弃用 API 和安全注释问题，已逐项修复并用 CI
-  同版 v2.9 验证为 0 issues。
+  同版 v2.9 验证为 0 issues；
+- Aether 前端生产依赖审计发现 Axios、form-data 和 DOMPurify 公告，完整依赖树还包含
+  Vite/Vitest 开发工具链的高危或严重公告；已升级 Axios `1.18.1`、form-data `4.0.6`、
+  DOMPurify `3.4.12`、Vite `7.3.6`、Vitest/UI `4.1.10`，干净安装后的完整和生产依赖
+  审计均为 0 vulnerabilities；
+- Aether 全量前端测试暴露了一个既有的过期断言：实现从 2026-05 起会把旧存储状态
+  `active` 迁移为 `available`，测试仍期待 `active`。现已修正普通回退用例，并增加旧值
+  迁移回归测试；全量 479 项测试通过。
 
 上述修复仍只涉及源码、测试、依赖锁文件和文档，没有执行生产迁移、部署、重启或容器
 更新。

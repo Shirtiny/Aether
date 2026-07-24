@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it } from 'vitest'
 
 import {
+  POOL_MANAGEMENT_VIEW_STORAGE_KEY,
   buildPoolManagementQueryPatch,
   readPoolManagementViewState,
   resolvePoolManagementPageAfterLoad,
@@ -75,7 +76,7 @@ describe('poolManagementState', () => {
       {
         providerId: 'provider-c',
         search: 'stored only',
-        status: 'active',
+        status: 'available',
         page: 2,
         pageSize: 50,
         sortBy: 'last_used_at',
@@ -90,13 +91,22 @@ describe('poolManagementState', () => {
     expect(state).toEqual({
       providerId: 'provider-c',
       search: 'stored only',
-      status: 'active',
+      status: 'available',
       page: 2,
       pageSize: 50,
       sortBy: 'last_used_at',
       sortOrder: 'asc',
       statsMode: 'account_total',
     })
+  })
+
+  it('migrates the legacy active status restored from storage', () => {
+    storage.setItem(
+      POOL_MANAGEMENT_VIEW_STORAGE_KEY,
+      JSON.stringify({ status: 'active' }),
+    )
+
+    expect(readPoolManagementViewState({}, storage).status).toBe('available')
   })
 
   it('supports score sort in storage and query state', () => {
