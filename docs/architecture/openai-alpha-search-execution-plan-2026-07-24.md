@@ -808,10 +808,14 @@ Body 必须保持 opaque，只进行：
 1. 只在 Search route 上把顶层 `id` 解释为 Codex session；
 2. 不把全局 Generic adapter 的任意顶层 `id` 都当 session，避免影响其他 API；
 3. 对外 report 仍记录 `client_api_format=openai:search`；
-4. affinity cache 使用独立的 `openai:search` namespace，不与 Responses 共享候选绑定；
-5. 保证 Search 自身连续请求稳定命中同一 key，并明确不能依赖 Responses 亲和完成状态型
-   Search 操作；
-6. endpoint 或 key 状态变化时使绑定失效或重新验证。
+4. affinity cache 使用独立的 `openai:search` namespace，不把 Responses 绑定直接当作
+   Search 的状态型候选绑定；
+5. Search 尚无精确绑定时，可把同一会话的 `openai:responses` 绑定作为首次请求的账号提示，
+   跨 endpoint ID 匹配相同 provider/key；Search 一旦建立精确绑定，必须优先使用自身绑定；
+6. Responses 账号提示不能作为非 URL `ref_id` 已建立 Search 状态的证明，状态型操作仍要求
+   已存在精确的 Search 绑定；
+7. 保证 Search 自身连续请求稳定命中同一 key，并在 endpoint 或 key 状态变化时使绑定失效
+   或重新验证。
 
 #### 7.5.1 Stateful ref 识别
 

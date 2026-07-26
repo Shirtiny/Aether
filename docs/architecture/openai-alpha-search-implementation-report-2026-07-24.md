@@ -403,8 +403,16 @@ web search，而不会请求 `/v1/alpha/search`。
    Codex 客户端 TOML（`[model_providers.*]` 与 `[features]`），那是客户端声明和功能开关，
    不属于 Aether provider key 配置。
 5. **认证与 profile**：Search 仍使用 Codex OAuth 的 Bearer 认证、账号 ID、稳定 user-agent/
-   originator 等 profile 头，但请求契约和上游 URL 的 provider format 均是 Search。
-6. **计费**：本次没有改变 Search 的按次计费规则；`openai:search` 继续使用 surface-scoped
+   originator 和 TLS profile；`version` 从最终 user-agent 重新派生，不接受客户端残留值。
+   可解析的 `x-codex-turn-metadata` 中的 `installation_id` 会
+   改写为最终 Codex key 的稳定 installation identity，无法解析的 metadata 会被丢弃；
+   客户端直接提供的 `x-codex-installation-id` 不向 Search 上游透传。该处理不会向 Search
+   body 注入 Responses 专用的 `client_metadata`。
+6. **伴生账号亲和**：Search 精确绑定仍保存在独立的 `openai:search` namespace。首次 Search
+   尚无精确绑定时，候选排序会读取同一会话的 `openai:responses` 绑定作为 provider/key
+   提示；Search 自身绑定一旦存在便具有更高优先级。非 URL `ref_id` 仍只接受精确 Search
+   绑定，不能依靠 Responses 提示绕过 `409 search_session_affinity_lost`。
+7. **计费**：本次没有改变 Search 的按次计费规则；`openai:search` 继续使用 surface-scoped
    `price_per_request`，不回退到 Responses token 价格。
 
 本地验证（仅源码和测试，未部署）包括：
@@ -413,7 +421,8 @@ web search，而不会请求 `/v1/alpha/search`。
 cargo check -p aether-gateway                         passed
 cargo test -p aether-provider-transport codex_fixed_provider_template --lib  passed
 cargo test -p aether-ai-formats search_candidate_registry_is_same_format_only --lib  passed
-cargo test -p aether-gateway openai_search_ --lib      6 passed
+cargo test -p aether-gateway openai_search_ --lib      7 passed
+cargo test -p aether-gateway codex_pool_ --lib         18 passed
 cargo test -p aether-data candidate_selection --lib    28 passed
 frontend: npm run type-check                           passed
 git diff --check                                       passed

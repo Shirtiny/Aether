@@ -248,6 +248,28 @@ pub(crate) fn apply_codex_concrete_account_profile_to_request_with_body_policy(
     }
 }
 
+pub(crate) fn apply_codex_concrete_account_profile_to_search_headers(
+    provider_request_headers: &mut BTreeMap<String, String>,
+    profile: &CodexConcreteAccountProfile,
+) {
+    provider_request_headers.insert("user-agent".to_string(), profile.user_agent.clone());
+    provider_request_headers.insert("originator".to_string(), profile.originator.clone());
+    remove_header_case_insensitive(provider_request_headers, X_CODEX_INSTALLATION_ID);
+
+    // Standalone Search carries turn metadata as a header and does not use the
+    // Responses client_metadata body contract. Preserve the Search payload while
+    // keeping its installation identity aligned with the selected pool account.
+    if let Some((header_name, metadata)) =
+        remove_header_case_insensitive(provider_request_headers, X_CODEX_TURN_METADATA)
+    {
+        if let Some(rewritten) =
+            rewrite_turn_metadata_installation_id_string(&metadata, &profile.installation_id)
+        {
+            provider_request_headers.insert(header_name, rewritten);
+        }
+    }
+}
+
 pub(crate) fn apply_codex_concrete_account_profile_to_body_with_policy(
     provider_request_body: &mut Value,
     profile: &CodexConcreteAccountProfile,

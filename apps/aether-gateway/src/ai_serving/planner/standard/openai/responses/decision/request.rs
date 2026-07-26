@@ -26,7 +26,7 @@ use crate::ai_serving::planner::standard::{
     apply_codex_official_ws_handshake_headers, apply_codex_openai_responses_special_body_edits,
     apply_codex_openai_responses_special_headers,
     apply_codex_pool_concrete_account_profile_for_api_format,
-    apply_codex_pool_stable_client_headers, apply_deepseek_tool_call_thinking_compat,
+    apply_codex_pool_search_account_profile, apply_deepseek_tool_call_thinking_compat,
     build_cross_format_openai_responses_request_body,
     build_cross_format_openai_responses_upstream_url, build_local_openai_responses_request_body,
     build_local_openai_responses_upstream_url, request_body_build_failure_extra_data,
@@ -1030,7 +1030,7 @@ async fn resolve_local_openai_search_candidate_payload_parts(
         Some(trace_id),
         transport.key.decrypted_auth_config.as_deref(),
     );
-    apply_codex_pool_stable_client_headers(&mut provider_request_headers, transport);
+    apply_codex_pool_search_account_profile(&mut provider_request_headers, transport);
     normalize_openai_search_headers(&mut provider_request_headers);
 
     let upstream_url = crate::ai_serving::transport::build_openai_search_url(
@@ -1114,6 +1114,7 @@ fn build_openai_search_provider_body(body_json: &Value, mapped_model: &str) -> O
 fn normalize_openai_search_headers(headers: &mut BTreeMap<String, String>) {
     const BLOCKED: &[&str] = &[
         "openai-beta",
+        "x-codex-installation-id",
         "session_id",
         "conversation_id",
         "x-codex-beta-features",
@@ -1128,17 +1129,13 @@ fn normalize_openai_search_headers(headers: &mut BTreeMap<String, String>) {
     headers.insert("content-type".to_string(), "application/json".to_string());
     headers.insert("accept".to_string(), "application/json".to_string());
 
-    let has_version = headers
+    headers.retain(|key, _| !key.eq_ignore_ascii_case("version"));
+    let version = headers
         .iter()
-        .any(|(key, value)| key.eq_ignore_ascii_case("version") && !value.trim().is_empty());
-    if !has_version {
-        let version = headers
-            .iter()
-            .find(|(key, _)| key.eq_ignore_ascii_case("user-agent"))
-            .and_then(|(_, value)| codex_version_from_user_agent(value));
-        if let Some(version) = version {
-            headers.insert("version".to_string(), version);
-        }
+        .find(|(key, _)| key.eq_ignore_ascii_case("user-agent"))
+        .and_then(|(_, value)| codex_version_from_user_agent(value));
+    if let Some(version) = version {
+        headers.insert("version".to_string(), version);
     }
 }
 
@@ -2137,11 +2134,16 @@ mod tests {
                 "codex-tui/0.142.0 (Linux; x86_64)".to_string(),
             ),
             ("originator".to_string(), "codex-tui".to_string()),
+            ("version".to_string(), "9.9.9".to_string()),
             (
                 "openai-beta".to_string(),
                 "responses=experimental".to_string(),
             ),
             ("session_id".to_string(), "response-session".to_string()),
+            (
+                "x-codex-installation-id".to_string(),
+                "client-installation".to_string(),
+            ),
             (
                 "x-openai-internal-codex-responses-lite".to_string(),
                 "true".to_string(),
@@ -2157,6 +2159,7 @@ mod tests {
         assert_eq!(headers.get("version").map(String::as_str), Some("0.142.0"));
         assert!(!headers.contains_key("openai-beta"));
         assert!(!headers.contains_key("session_id"));
+        assert!(!headers.contains_key("x-codex-installation-id"));
         assert!(!headers.contains_key("x-openai-internal-codex-responses-lite"));
     }
 

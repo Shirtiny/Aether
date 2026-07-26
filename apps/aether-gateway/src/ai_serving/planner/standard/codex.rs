@@ -9,7 +9,8 @@ use sha2::{Digest, Sha256};
 
 use crate::codex_profile::{
     apply_codex_concrete_account_profile_to_request,
-    apply_codex_concrete_account_profile_to_request_with_body_policy, codex_account_selection_key,
+    apply_codex_concrete_account_profile_to_request_with_body_policy,
+    apply_codex_concrete_account_profile_to_search_headers, codex_account_selection_key,
     materialize_codex_key_fingerprint, resolve_codex_concrete_account_profile,
     strip_codex_client_metadata_from_body, CodexConcreteAccountProfile,
     CodexProfileMaterializationOutcome, CodexProfileMaterializeInput,
@@ -206,6 +207,27 @@ pub(crate) fn apply_codex_pool_stable_client_headers(
 
     provider_request_headers.insert("user-agent".to_string(), header_profile.user_agent);
     provider_request_headers.insert("originator".to_string(), header_profile.originator);
+}
+
+pub(crate) fn apply_codex_pool_search_account_profile(
+    provider_request_headers: &mut BTreeMap<String, String>,
+    transport: &GatewayProviderTransportSnapshot,
+) {
+    if !transport
+        .provider
+        .provider_type
+        .trim()
+        .eq_ignore_ascii_case("codex")
+    {
+        return;
+    }
+    remove_codex_pool_upstream_leak_headers(provider_request_headers);
+
+    let Some(profile) = resolve_codex_pool_concrete_account_profile(transport) else {
+        apply_codex_pool_stable_client_headers(provider_request_headers, transport);
+        return;
+    };
+    apply_codex_concrete_account_profile_to_search_headers(provider_request_headers, &profile);
 }
 
 pub(crate) fn apply_codex_pool_concrete_account_profile(

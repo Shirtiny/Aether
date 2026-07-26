@@ -4,7 +4,7 @@ use super::{
     apply_codex_openai_responses_special_body_edits, apply_codex_openai_responses_special_headers,
     apply_codex_pool_concrete_account_profile,
     apply_codex_pool_concrete_account_profile_for_api_format,
-    apply_codex_pool_stable_client_headers,
+    apply_codex_pool_search_account_profile, apply_codex_pool_stable_client_headers,
 };
 use crate::ai_serving::{
     transport::snapshot::{
@@ -762,6 +762,77 @@ fn codex_pool_concrete_account_profile_normalizes_installation_id_only() {
         "<environment_context><cwd>/Users/alice/repo</cwd></environment_context>"
     );
     assert_eq!(body["prompt_cache_key"], "existing-cache");
+}
+
+#[test]
+fn codex_pool_search_profile_rewrites_only_header_installation_identity() {
+    let mut transport = sample_transport(
+        "codex",
+        Some(json!({
+            "pool_advanced": {
+                "codex_client_headers": {
+                    "profiles": [
+                        {"user_agent": "codex-tui/0.142.0 changed-template", "originator": "codex-tui"}
+                    ]
+                }
+            }
+        })),
+    );
+    transport.key.fingerprint = Some(json!({
+        "codex_client_profile": {
+            "selection_key_kind": "auth_account_id",
+            "selection_key_hash": "sha256:1ce67b02fd7c533958bf175317ed8a68773889b8d4a455d1f3ba6152d75ba6e4",
+            "client_headers": {
+                "user_agent": "codex-tui/0.142.0 persisted",
+                "originator": "codex-tui"
+            },
+            "install_identity": {
+                "installation_id": "019f0a27-08f6-47d2-ba0b-1ff45470ee76"
+            },
+            "fingerprint_hash": "sha256:test"
+        }
+    }));
+    let mut headers = BTreeMap::from([
+        (
+            "x-codex-installation-id".to_string(),
+            "client-installation".to_string(),
+        ),
+        (
+            "x-codex-turn-metadata".to_string(),
+            r#"{"installation_id":"client-installation","session_id":"sess","thread_id":"thread","mcp_request_meta":"opaque"}"#.to_string(),
+        ),
+        ("anthropic-version".to_string(), "2023-06-01".to_string()),
+    ]);
+
+    apply_codex_pool_search_account_profile(&mut headers, &transport);
+
+    assert_eq!(
+        headers.get("user-agent").map(String::as_str),
+        Some("codex-tui/0.142.0 persisted")
+    );
+    assert_eq!(
+        headers.get("originator").map(String::as_str),
+        Some("codex-tui")
+    );
+    assert!(!headers.contains_key("x-codex-installation-id"));
+    assert!(!headers.contains_key("anthropic-version"));
+    let metadata: Value = serde_json::from_str(
+        headers
+            .get("x-codex-turn-metadata")
+            .expect("turn metadata header"),
+    )
+    .expect("turn metadata should remain valid JSON");
+    assert_eq!(
+        metadata["installation_id"],
+        "019f0a27-08f6-47d2-ba0b-1ff45470ee76"
+    );
+    assert_eq!(metadata["session_id"], "sess");
+    assert_eq!(metadata["thread_id"], "thread");
+    assert_eq!(metadata["mcp_request_meta"], "opaque");
+
+    headers.insert("x-codex-turn-metadata".to_string(), "not-json".to_string());
+    apply_codex_pool_search_account_profile(&mut headers, &transport);
+    assert!(!headers.contains_key("x-codex-turn-metadata"));
 }
 
 #[test]

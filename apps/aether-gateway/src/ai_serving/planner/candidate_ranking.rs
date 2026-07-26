@@ -37,10 +37,22 @@ struct GatewayLocalCandidateRankingPort<'a> {
     routing_policy: Option<&'a ResolvedRoutingPolicy>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalCachedAffinityScope {
+    ExactEndpoint,
+    OpenAiResponsesCompanionAccount,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocalCachedAffinityTarget {
+    target: SchedulerAffinityTarget,
+    scope: LocalCachedAffinityScope,
+}
+
 #[async_trait]
 impl AiCandidateRankingPort for GatewayLocalCandidateRankingPort<'_> {
     type Candidate = EligibleLocalExecutionCandidate;
-    type AffinityTarget = SchedulerAffinityTarget;
+    type AffinityTarget = LocalCachedAffinityTarget;
     type Error = std::convert::Infallible;
 
     fn affinity_requested_model(&self, candidates: &[Self::Candidate]) -> Option<String> {
@@ -60,13 +72,42 @@ impl AiCandidateRankingPort for GatewayLocalCandidateRankingPort<'_> {
         normalized_client_api_format: &str,
         affinity_requested_model: Option<&str>,
     ) -> Result<Option<Self::AffinityTarget>, Self::Error> {
-        Ok(read_cached_scheduler_affinity_target(
+        let exact = read_cached_scheduler_affinity_target(
             self.state,
             self.auth_snapshot,
             self.client_session_affinity,
             normalized_client_api_format,
             affinity_requested_model,
-        ))
+        );
+        if let Some(target) = exact {
+            return Ok(Some(LocalCachedAffinityTarget {
+                target,
+                scope: LocalCachedAffinityScope::ExactEndpoint,
+            }));
+        }
+
+        if normalized_client_api_format.eq_ignore_ascii_case("openai:search")
+            && self.client_session_affinity.is_some_and(|affinity| {
+                affinity
+                    .client_family
+                    .as_deref()
+                    .is_some_and(|family| family.eq_ignore_ascii_case("codex"))
+            })
+        {
+            return Ok(read_cached_scheduler_affinity_target(
+                self.state,
+                self.auth_snapshot,
+                self.client_session_affinity,
+                "openai:responses",
+                affinity_requested_model,
+            )
+            .map(|target| LocalCachedAffinityTarget {
+                target,
+                scope: LocalCachedAffinityScope::OpenAiResponsesCompanionAccount,
+            }));
+        }
+
+        Ok(None)
     }
 
     fn cached_affinity_matches(
@@ -74,7 +115,14 @@ impl AiCandidateRankingPort for GatewayLocalCandidateRankingPort<'_> {
         candidate: &Self::Candidate,
         target: &Self::AffinityTarget,
     ) -> bool {
-        cached_affinity_matches_local_execution_scope(candidate, target)
+        match target.scope {
+            LocalCachedAffinityScope::ExactEndpoint => {
+                cached_affinity_matches_local_execution_scope(candidate, &target.target)
+            }
+            LocalCachedAffinityScope::OpenAiResponsesCompanionAccount => {
+                cached_companion_account_matches_local_execution_scope(candidate, &target.target)
+            }
+        }
     }
 
     async fn build_rankable_candidate(
@@ -172,6 +220,17 @@ fn cached_affinity_matches_local_execution_scope(
     }
 
     matches_affinity_target(&eligible.candidate, target)
+}
+
+fn cached_companion_account_matches_local_execution_scope(
+    eligible: &EligibleLocalExecutionCandidate,
+    target: &SchedulerAffinityTarget,
+) -> bool {
+    if eligible.candidate.provider_id != target.provider_id {
+        return false;
+    }
+
+    local_execution_candidate_uses_pool(eligible) || eligible.candidate.key_id == target.key_id
 }
 
 fn local_execution_candidate_uses_pool(eligible: &EligibleLocalExecutionCandidate) -> bool {
@@ -1590,6 +1649,163 @@ mod tests {
                 .and_then(|ranking| ranking.promoted_by),
             Some(RANKING_REASON_CACHED_AFFINITY)
         );
+    }
+
+    #[tokio::test]
+    async fn openai_search_prefers_exact_affinity_then_responses_companion_account_hint() {
+        let provider_catalog = InMemoryProviderCatalogReadRepository::seed(
+            vec![
+                sample_provider_with_options("provider-priority", false, 0),
+                sample_provider_with_options("provider-responses", false, 10),
+            ],
+            vec![
+                sample_endpoint_for_provider(
+                    "provider-priority",
+                    "endpoint-priority-search",
+                    "openai:search",
+                ),
+                sample_endpoint_for_provider(
+                    "provider-responses",
+                    "endpoint-responses-search",
+                    "openai:search",
+                ),
+            ],
+            vec![
+                sample_key_for_provider_with_options(
+                    "provider-priority",
+                    "key-priority",
+                    "",
+                    true,
+                    Some(json!(["openai:search"])),
+                    None,
+                ),
+                sample_key_for_provider_with_options(
+                    "provider-responses",
+                    "key-responses",
+                    "",
+                    true,
+                    Some(json!(["openai:search"])),
+                    None,
+                ),
+            ],
+        );
+        let data_state = GatewayDataState::with_provider_transport_reader_for_tests(
+            std::sync::Arc::new(provider_catalog),
+            "development-key",
+        );
+        let state = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(data_state);
+        let auth_snapshot = sample_auth_snapshot();
+        let session_affinity = ClientSessionAffinity::new(
+            Some("codex".to_string()),
+            Some("session=search-session-1".to_string()),
+        );
+        let responses_candidate = sample_priority_candidate(
+            "provider-responses",
+            "endpoint-responses",
+            "key-responses",
+            "openai:responses",
+            Some(10),
+            10,
+        );
+        remember_scheduler_affinity_for_candidate(
+            PlannerAppState::new(&state),
+            Some(&auth_snapshot),
+            Some(&session_affinity),
+            "openai:responses",
+            "gpt-4.1",
+            &responses_candidate,
+        );
+
+        let (ranked, skipped) = resolve_and_rank_local_execution_candidates(
+            PlannerAppState::new(&state),
+            vec![
+                sample_priority_candidate(
+                    "provider-priority",
+                    "endpoint-priority-search",
+                    "key-priority",
+                    "openai:search",
+                    Some(0),
+                    0,
+                ),
+                sample_priority_candidate(
+                    "provider-responses",
+                    "endpoint-responses-search",
+                    "key-responses",
+                    "openai:search",
+                    Some(10),
+                    10,
+                ),
+            ],
+            "openai:search",
+            "gpt-4.1",
+            Some(&auth_snapshot),
+            Some(&session_affinity),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(skipped.is_empty());
+        assert_eq!(ranked[0].candidate.provider_id, "provider-responses");
+        assert_eq!(ranked[0].candidate.endpoint_id, "endpoint-responses-search");
+        assert_eq!(ranked[0].candidate.key_id, "key-responses");
+        assert_eq!(
+            ranked[0]
+                .ranking
+                .as_ref()
+                .and_then(|ranking| ranking.promoted_by),
+            Some(RANKING_REASON_CACHED_AFFINITY)
+        );
+
+        let exact_search_candidate = sample_priority_candidate(
+            "provider-priority",
+            "endpoint-priority-search",
+            "key-priority",
+            "openai:search",
+            Some(0),
+            0,
+        );
+        remember_scheduler_affinity_for_candidate(
+            PlannerAppState::new(&state),
+            Some(&auth_snapshot),
+            Some(&session_affinity),
+            "openai:search",
+            "gpt-4.1",
+            &exact_search_candidate,
+        );
+
+        let (ranked, skipped) = resolve_and_rank_local_execution_candidates(
+            PlannerAppState::new(&state),
+            vec![
+                exact_search_candidate,
+                sample_priority_candidate(
+                    "provider-responses",
+                    "endpoint-responses-search",
+                    "key-responses",
+                    "openai:search",
+                    Some(10),
+                    10,
+                ),
+            ],
+            "openai:search",
+            "gpt-4.1",
+            Some(&auth_snapshot),
+            Some(&session_affinity),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(skipped.is_empty());
+        assert_eq!(ranked[0].candidate.provider_id, "provider-priority");
+        assert_eq!(ranked[0].candidate.endpoint_id, "endpoint-priority-search");
+        assert_eq!(ranked[0].candidate.key_id, "key-priority");
     }
 
     #[tokio::test]
