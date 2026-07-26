@@ -9,6 +9,17 @@ pub(crate) const FORWARDED_PROTO_HEADER: &str = "x-forwarded-proto";
 pub(crate) const GATEWAY_HEADER: &str = "x-aether-gateway";
 pub(crate) const EXECUTION_PATH_HEADER: &str = "x-aether-execution-path";
 pub(crate) const DEPENDENCY_REASON_HEADER: &str = "x-aether-dependency-reason";
+// Upstream time to first byte as Aether measured it, so a downstream proxy can
+// report Aether's own number instead of one inflated by the hop and by however
+// long Aether held the stream for prefetch inspection.
+pub(crate) const UPSTREAM_TTFB_MS_HEADER: &str = "x-aether-ttfb-ms";
+// How long the stream sat buffered after its first upstream data frame arrived,
+// and why the prefetch released. This is latency the gateway added, measured
+// from the first frame rather than from prefetch start so that time the upstream
+// itself spent is not counted here. Emitted for diagnosis: without it the hold
+// can only be recovered by correlating the access log against the usage table.
+pub(crate) const PREFETCH_HOLD_MS_HEADER: &str = "x-aether-prefetch-ms";
+pub(crate) const PREFETCH_RELEASE_HEADER: &str = "x-aether-prefetch-release";
 pub(crate) const EXECUTION_RUNTIME_LOOP_GUARD_HEADER: &str = "x-aether-execution-loop-guard";
 pub(crate) const EXECUTION_RUNTIME_LOOP_GUARD_VALUE: &str = "local-runtime";
 pub(crate) const EXECUTION_RUNTIME_LOOP_GUARD_VIA_TOKEN: &str = "aether-execution-runtime";

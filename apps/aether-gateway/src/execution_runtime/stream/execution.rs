@@ -59,7 +59,10 @@ use crate::api::response::{
     attach_control_metadata_headers, build_client_response, build_client_response_from_parts,
 };
 use crate::clock::current_unix_ms as current_request_candidate_unix_ms;
-use crate::constants::{CONTROL_CANDIDATE_ID_HEADER, CONTROL_REQUEST_ID_HEADER};
+use crate::constants::{
+    CONTROL_CANDIDATE_ID_HEADER, CONTROL_REQUEST_ID_HEADER, PREFETCH_HOLD_MS_HEADER,
+    PREFETCH_RELEASE_HEADER, UPSTREAM_TTFB_MS_HEADER,
+};
 use crate::control::GatewayControlDecision;
 use crate::execution_runtime::build_direct_execution_frame_stream;
 use crate::execution_runtime::chatgpt_web_image::maybe_execute_chatgpt_web_image_stream;
@@ -122,7 +125,13 @@ const SSE_TERMINAL_DETECTOR_MAX_LINE_BYTES: usize = 1024 * 1024;
 const STREAM_IDLE_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const STREAM_IDLE_LOG_INTERVAL_MS: u64 = 60_000;
 const REWRITTEN_STREAM_PREFETCH_TIMEOUT: Duration = Duration::from_millis(750);
-const CONTROL_STREAM_PREFETCH_EXTENSION_TIMEOUT: Duration = Duration::from_secs(3);
+// Reasoning models open every stream with control-only events, so this
+// extension fires on a large share of production traffic and is paid directly in
+// client-visible TTFB. Upstreams that reject a request emit the error close
+// behind the preamble, so a sub-second budget keeps the embedded-error failover
+// while bounding the latency the extension can add. See
+// `docs/architecture/stream-prefetch-ttfb-investigation-2026-07-26.md`.
+const CONTROL_STREAM_PREFETCH_EXTENSION_TIMEOUT: Duration = Duration::from_millis(500);
 const CONTROL_STREAM_PREFETCH_EXTENSION_MAX_BYTES: usize = 256 * 1024;
 
 fn record_sync_terminal_usage(
@@ -2553,6 +2562,10 @@ async fn execute_stream_from_frame_stream(
     let mut reached_eof = false;
     let mut sync_json_stream_bridge_active = false;
     let prefetch_started_at = Instant::now();
+    // Distinct from `prefetch_started_at`, which also spans the wait for the
+    // upstream's first data frame. Only the time after that frame arrives is
+    // latency this gateway added rather than latency the upstream spent.
+    let mut first_data_frame_at: Option<Instant> = None;
     let mut continue_prefetching_control_stream = false;
     let mut logged_control_prefetch_extension = false;
     let mut prefetch_release_reason = "not_started";
@@ -2747,6 +2760,7 @@ async fn execute_stream_from_frame_stream(
             let frame_observed_at = observed_frame.observed_at;
             match observed_frame.frame.payload {
                 StreamFramePayload::Data { chunk_b64, text } => {
+                    first_data_frame_at.get_or_insert(frame_observed_at);
                     maybe_capture_first_stream_event_telemetry(
                         stream_started_at,
                         frame_observed_at,
@@ -3191,6 +3205,27 @@ async fn execute_stream_from_frame_stream(
     }
 
     apply_endpoint_response_header_rules(state, &plan, &mut headers, None).await?;
+
+    // Publish Aether's own view of upstream latency. A downstream proxy measures
+    // TTFB from when bytes reach it, which also counts the hop and the prefetch
+    // hold below; these headers let it report the upstream number instead.
+    // Everything here is already computed, so this costs no extra work.
+    if let Some(ttfb_ms) = prefetched_telemetry
+        .as_ref()
+        .and_then(|telemetry| telemetry.ttfb_ms)
+    {
+        headers.insert(UPSTREAM_TTFB_MS_HEADER.to_string(), ttfb_ms.to_string());
+    }
+    if let Some(first_data_frame_at) = first_data_frame_at {
+        headers.insert(
+            PREFETCH_HOLD_MS_HEADER.to_string(),
+            (first_data_frame_at.elapsed().as_millis() as u64).to_string(),
+        );
+    }
+    headers.insert(
+        PREFETCH_RELEASE_HEADER.to_string(),
+        prefetch_release_reason.to_string(),
+    );
 
     let request_id = request_id.to_string();
     let candidate_id = candidate_id.map(ToOwned::to_owned);
@@ -4497,6 +4532,7 @@ mod tests {
         stream_terminal_summary_missing_observed_finish_with_requirement,
         stream_terminal_summary_represents_failure_with_requirement,
         ClientVisibleStreamCompletionTracker, StreamTerminalEventDiagnosticsTracker,
+        CONTROL_STREAM_PREFETCH_EXTENSION_TIMEOUT, REWRITTEN_STREAM_PREFETCH_TIMEOUT,
     };
     use crate::control::GatewayControlDecision;
     use crate::handlers::shared::provider_pool::{
@@ -6279,6 +6315,28 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"type":"s
         assert!(should_probe_success_failover_before_stream(
             &BTreeMap::from([("content-type".to_string(), "application/json".to_string(),)])
         ));
+    }
+
+    #[test]
+    fn bounds_control_stream_prefetch_extension_below_one_second() {
+        // The control-only extension fires on every reasoning stream, and the
+        // whole budget is spent before the client sees a single byte. Keep it
+        // sub-second and no looser than the rewritten-stream prefetch budget so
+        // a future change cannot silently reintroduce a multi-second stall.
+        assert!(
+            CONTROL_STREAM_PREFETCH_EXTENSION_TIMEOUT < Duration::from_secs(1),
+            "control prefetch extension must stay sub-second, got {CONTROL_STREAM_PREFETCH_EXTENSION_TIMEOUT:?}"
+        );
+        assert!(
+            CONTROL_STREAM_PREFETCH_EXTENSION_TIMEOUT <= REWRITTEN_STREAM_PREFETCH_TIMEOUT,
+            "control prefetch extension should not outlast the rewritten-stream budget"
+        );
+        // Still long enough for an upstream to emit `response.failed` right
+        // behind the control preamble, which is what the extension exists for.
+        assert!(
+            CONTROL_STREAM_PREFETCH_EXTENSION_TIMEOUT >= Duration::from_millis(250),
+            "control prefetch extension must leave room to catch embedded errors"
+        );
     }
 
     #[test]
