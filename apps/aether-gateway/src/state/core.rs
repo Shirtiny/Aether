@@ -74,7 +74,10 @@ use crate::maintenance::spawn_usage_cleanup_worker;
 use crate::maintenance::spawn_usage_counter_flush_worker;
 use crate::maintenance::spawn_wallet_daily_usage_aggregation_worker;
 
-const SYSTEM_CONFIG_CACHE_TTL: Duration = Duration::from_secs(3);
+// Writes go through `remember_system_config_write`, which refreshes the cache
+// entry directly, so the TTL only bounds staleness for changes made outside the
+// gateway process. A short TTL cost ~54 `system_configs` reads per request.
+const SYSTEM_CONFIG_CACHE_TTL: Duration = Duration::from_secs(30);
 const SCHEDULER_AFFECTING_SYSTEM_CONFIG_KEYS: &[&str] = &[
     "enable_format_conversion",
     "keep_priority_on_conversion",
