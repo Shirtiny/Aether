@@ -31,8 +31,8 @@ use super::super::async_task::{
 };
 use super::super::cache::{
     AuthApiKeyLastUsedCache, AuthContextCache, DashboardResponseCache, DirectPlanBypassCache,
-    SchedulerAffinityCache, SchedulerAffinitySnapshotEntry, SchedulerAffinityTarget,
-    SystemConfigCache,
+    ProxyNodeCache, SchedulerAffinityCache, SchedulerAffinitySnapshotEntry,
+    SchedulerAffinityTarget, SystemConfigCache,
 };
 use super::super::data::{GatewayDataConfig, GatewayDataState};
 use super::super::fallback_metrics;
@@ -78,6 +78,13 @@ use crate::maintenance::spawn_wallet_daily_usage_aggregation_worker;
 // entry directly, so the TTL only bounds staleness for changes made outside the
 // gateway process. A short TTL cost ~54 `system_configs` reads per request.
 const SYSTEM_CONFIG_CACHE_TTL: Duration = Duration::from_secs(30);
+// Transport resolution reads a proxy node per candidate, so a single request
+// repeats the same handful of lookups tens of times. Node rows back routing
+// decisions and are rewritten by heartbeats and tunnel connect/disconnect, so
+// the window is sized to collapse the repeats within one request's selection
+// phase and nothing more. Kept below any plausible mutation-to-next-request
+// interval so that staleness never needs explicit invalidation to stay correct.
+const PROXY_NODE_CACHE_TTL: Duration = Duration::from_millis(250);
 const SCHEDULER_AFFECTING_SYSTEM_CONFIG_KEYS: &[&str] = &[
     "enable_format_conversion",
     "keep_priority_on_conversion",
@@ -209,6 +216,7 @@ impl AppState {
         self.invalidate_scheduler_affinity_cache();
         self.invalidate_auth_context_cache();
         self.system_config_cache.clear();
+        self.proxy_node_cache.clear();
         self.codex_ws_feature_flags.clear();
         self.frontdoor_user_rpm.clear_system_default_cache();
         let data = Arc::new(
@@ -286,6 +294,7 @@ impl AppState {
             codex_ws_catalog_snapshot_generation: Arc::new(StdMutex::new(None)),
             dashboard_response_cache: Arc::new(DashboardResponseCache::default()),
             system_config_cache: Arc::new(SystemConfigCache::default()),
+            proxy_node_cache: Arc::new(ProxyNodeCache::default()),
             codex_ws_feature_flags: Arc::new(
                 crate::codex_ws_config::CodexWsFeatureFlagsSnapshot::default(),
             ),
@@ -738,6 +747,7 @@ impl AppState {
                 | aether_data::repository::system::AdminSystemPurgeTarget::Stats
         ) {
             self.system_config_cache.clear();
+            self.proxy_node_cache.clear();
             self.codex_ws_feature_flags.clear();
             self.invalidate_provider_routing_caches();
         }
@@ -794,10 +804,17 @@ impl AppState {
         &self,
         node_id: &str,
     ) -> Result<Option<StoredProxyNode>, GatewayError> {
-        self.data
+        if let Some(node) = self.proxy_node_cache.get(node_id, PROXY_NODE_CACHE_TTL) {
+            return Ok(node);
+        }
+        let node = self
+            .data
             .find_proxy_node(node_id)
             .await
-            .map_err(|err| GatewayError::Internal(err.to_string()))
+            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+        self.proxy_node_cache
+            .insert(node_id.to_string(), node.clone(), PROXY_NODE_CACHE_TTL);
+        Ok(node)
     }
 
     pub(crate) async fn list_proxy_nodes(&self) -> Result<Vec<StoredProxyNode>, GatewayError> {
@@ -1652,9 +1669,28 @@ mod tests {
 
     use serde_json::json;
 
-    use super::AppState;
+    use super::{AppState, PROXY_NODE_CACHE_TTL};
     use crate::cache::SchedulerAffinityTarget;
     use crate::data::GatewayDataState;
+
+    #[test]
+    fn proxy_node_cache_window_stays_short_enough_to_need_no_invalidation() {
+        // Proxy node rows decide where traffic is sent, and nothing invalidates
+        // this cache on mutation. Correctness therefore rests entirely on the
+        // window being shorter than the interval between a node changing and
+        // the next request that routes on it. Widening it means adding
+        // invalidation at every proxy node mutation site first.
+        assert!(
+            PROXY_NODE_CACHE_TTL <= std::time::Duration::from_millis(500),
+            "proxy node cache window must stay short, got {PROXY_NODE_CACHE_TTL:?}"
+        );
+        // Still long enough to span one request's candidate resolution, which is
+        // the whole reason the cache exists.
+        assert!(
+            PROXY_NODE_CACHE_TTL >= std::time::Duration::from_millis(100),
+            "proxy node cache window must cover a request's candidate resolution"
+        );
+    }
 
     #[tokio::test]
     async fn system_config_reads_use_short_lived_cache_until_app_invalidation() {

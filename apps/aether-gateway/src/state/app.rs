@@ -10,7 +10,7 @@ use aether_runtime_state::{RuntimeSemaphore, RuntimeState};
 use super::super::async_task::{VideoTaskPollerConfig, VideoTaskService};
 use super::super::cache::{
     AuthApiKeyLastUsedCache, AuthContextCache, DashboardResponseCache, DirectPlanBypassCache,
-    SchedulerAffinityCache, SystemConfigCache,
+    ProxyNodeCache, SchedulerAffinityCache, SystemConfigCache,
 };
 use super::super::codex_ws_config::CodexWsFeatureFlagsSnapshot;
 use super::super::data::GatewayDataState;
@@ -126,6 +126,7 @@ pub struct AppState {
     pub(crate) codex_ws_catalog_snapshot_generation: Arc<StdMutex<Option<String>>>,
     pub(crate) dashboard_response_cache: Arc<DashboardResponseCache>,
     pub(crate) system_config_cache: Arc<SystemConfigCache>,
+    pub(crate) proxy_node_cache: Arc<ProxyNodeCache>,
     pub(crate) codex_ws_feature_flags: Arc<CodexWsFeatureFlagsSnapshot>,
     pub(crate) fallback_metrics: Arc<fallback_metrics::GatewayFallbackMetrics>,
     pub(crate) frontdoor_cors: Option<Arc<FrontdoorCorsConfig>>,
