@@ -1144,6 +1144,17 @@ impl<'a> RequestedModelAttemptPageCursor<'a> {
 
         let sleep_duration =
             AUTH_API_KEY_CONCURRENCY_RETRY_DELAY.min(deadline.saturating_duration_since(now));
+        // TEMPORARY latency probe (2026-07-26): elimination points here, but the
+        // concurrency counters this gate reads showed 0-1 against a limit of 20,
+        // so confirm the retry actually fires before acting on it.
+        tracing::info!(
+            event_name = "probe_auth_api_key_concurrency_retry",
+            log_type = "ops",
+            trace_id = %self.trace_id,
+            sleep_us = sleep_duration.as_micros() as u64,
+            remaining_us = deadline.saturating_duration_since(now).as_micros() as u64,
+            "temporary latency probe for auth api key concurrency retry"
+        );
         tokio::time::sleep(sleep_duration).await;
         self.page_cursor.restart_scan();
         true
