@@ -119,7 +119,13 @@ services:
         max-size: "100m"
         max-file: "10"
     restart: unless-stopped
+    networks:
+      - default
+      - cpa-shared
 volumes:
   postgres_data:
   mysql_data:
   redis_data:
+networks:
+  cpa-shared:
+    external: true
