@@ -273,14 +273,9 @@ async fn estimate_request_cost_upper_bound_usd_from_json(
         return Ok(None);
     }
     let max_output_tokens = max_output_tokens_from_request(body_json);
-    let candidate_api_format = if api_format.eq_ignore_ascii_case("openai:search") {
-        "openai:responses"
-    } else {
-        api_format.as_str()
-    };
     let candidates = state
         .list_minimal_candidate_selection_rows_for_api_format_and_requested_model(
-            candidate_api_format,
+            &api_format,
             requested_model,
         )
         .await?;
@@ -551,9 +546,6 @@ async fn request_model_resolves_to_allowed_model(
 fn candidate_api_formats_for_model_resolution(client_api_format: &str) -> Vec<String> {
     let mut api_formats = Vec::new();
     push_unique_api_format(&mut api_formats, client_api_format);
-    if client_api_format.eq_ignore_ascii_case("openai:search") {
-        push_unique_api_format(&mut api_formats, "openai:responses");
-    }
     for api_format in crate::ai_serving::request_candidate_api_formats(client_api_format, false) {
         push_unique_api_format(&mut api_formats, api_format);
     }

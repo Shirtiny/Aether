@@ -291,22 +291,6 @@
         </div>
       </div>
 
-      <div
-        v-if="showStandaloneSearchCapability"
-        class="flex items-center justify-between rounded-md border border-border/60 bg-muted/30 px-3 py-2"
-      >
-        <div class="space-y-0.5 pr-4">
-          <Label class="text-sm font-medium">Standalone Web Search</Label>
-          <p class="text-xs text-muted-foreground">
-            允许此 Codex Key 承接 /v1/alpha/search；默认关闭，只有已验证支持该上游端点时才启用。
-          </p>
-        </div>
-        <Switch
-          :model-value="standaloneSearchEnabled"
-          @update:model-value="setStandaloneSearchEnabled"
-        />
-      </div>
-
       <!-- 自动获取模型 -->
       <div class="space-y-3 py-2 px-3 rounded-md border border-border/60 bg-muted/30">
         <div class="flex items-center justify-between">
@@ -550,25 +534,16 @@ const visibleApiFormats = computed(() => getSelectableApiFormats())
 
 const authTypeOptions = computed(() => getAuthTypeOptions(props.providerType))
 const showAuthTypeSelector = computed(() => props.providerType === 'vertex_ai')
-const showStandaloneSearchCapability = computed(() =>
-  props.providerType === 'codex'
-  && form.value.api_formats.some(format => normalizeApiFormat(format) === 'openai:responses')
-)
-const standaloneSearchEnabled = computed(() =>
-  form.value.capabilities.supports_standalone_web_search === true
-)
-
-function setStandaloneSearchEnabled(enabled: boolean) {
-  form.value.capabilities = {
-    ...form.value.capabilities,
-    supports_standalone_web_search: enabled,
-  }
-}
 
 function normalizeCapabilities(
   capabilities: Record<string, boolean> | null | undefined
 ): Record<string, boolean> {
-  return capabilities ? { ...capabilities } : {}
+  const normalized = capabilities ? { ...capabilities } : {}
+  // Search is controlled by the Codex provider's openai:search endpoint, not by an
+  // individual provider key. Drop the legacy key-level switch when an old
+  // record is edited so it does not remain a misleading source of truth.
+  delete normalized.supports_standalone_web_search
+  return normalized
 }
 
 function buildCapabilitiesPayload(): Record<string, boolean> | null {

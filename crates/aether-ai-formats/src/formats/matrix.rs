@@ -102,6 +102,12 @@ pub fn request_candidate_api_formats(
     _require_streaming: bool,
 ) -> Vec<&'static str> {
     let client_api_format = normalize_api_format_alias(client_api_format);
+    // Search is an opaque same-format surface. It must never enter the normal
+    // chat/Responses/Claude/Gemini conversion candidate matrix; provider
+    // availability is controlled by the provider's openai:search endpoint.
+    if client_api_format == "openai:search" {
+        return vec!["openai:search"];
+    }
     if client_api_format == "openai:responses:compact" {
         return vec!["openai:responses:compact"];
     }
@@ -139,6 +145,9 @@ pub fn request_conversion_kind(
 ) -> Option<RequestConversionKind> {
     let client_api_format = normalize_api_format_alias(client_api_format);
     let provider_api_format = normalize_api_format_alias(provider_api_format);
+    if client_api_format == "openai:search" || provider_api_format == "openai:search" {
+        return None;
+    }
     if client_api_format == provider_api_format {
         return None;
     }
@@ -477,6 +486,22 @@ mod tests {
             "openai:embedding",
             "jina:embedding"
         ));
+    }
+
+    #[test]
+    fn search_candidate_registry_is_same_format_only() {
+        assert_eq!(
+            request_candidate_api_formats("openai:search", false),
+            vec!["openai:search"]
+        );
+        assert_eq!(
+            request_candidate_api_formats("OPENAI_SEARCH", false),
+            vec!["openai:search"]
+        );
+        assert_eq!(
+            request_conversion_kind("openai:search", "openai:responses"),
+            None
+        );
     }
 
     #[test]

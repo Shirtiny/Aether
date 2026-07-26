@@ -1,14 +1,14 @@
 # OpenAI Codex `alpha/search` 跨仓执行方案
 
-- **状态：** 已实施并完成本地验证；未部署、未执行生产迁移
-- **方案日期：** 2026-07-24
-- **Aether 基线：** `/opt/stacks/aether`，分支 `custom`，提交 `a6920836`
-- **Sub2API 目标基线：** `/opt/stacks/sub2api`，分支 `custom-prod`，提交 `05cb36dd`
+- **状态：** 原方案已实施并上线；2026-07-26 端点级配置修正已完成本地验证，尚未发布
+- **方案日期：** 2026-07-26（基于 2026-07-24 方案补充）
+- **Aether 基线：** `/opt/stacks/aether`，分支 `custom`，提交 `c6647fdb7`（工作区有未提交修改）
+- **Sub2API 当前检查基线：** `/opt/stacks/sub2api`，分支 `custom-prod`，提交 `d2cb9e445`
 - **Sub2API 参考基线：** `/opt/stacks/sub2api`，`origin/main`，提交 `cb24522dd`
 - **Codex 协议参考：** `/opt/stacks/openai-codex`，提交 `81da9deb`
 - **调查报告：** `docs/architecture/openai-alpha-search-endpoint-investigation-2026-07-24.md`
 - **实施报告：** `docs/architecture/openai-alpha-search-implementation-report-2026-07-24.md`
-- **生产变更：** 本方案不包含部署、重启、容器更新、数据库执行或线上开关操作
+- **生产变更：** 旧版 Search 已上线；本轮修正不包含部署、重启、容器更新、数据库执行或线上开关操作
 
 ---
 
@@ -16,7 +16,12 @@
 
 > 2026-07-24 执行结果：Aether 实现提交为 `a832d953`，Sub2API
 > `custom-prod` 实现提交为 `36efa398b`。两仓定向测试、编译检查和前端类型检查均通过；
-> 没有部署、重启、拉取生产镜像或执行迁移。详细证据与剩余限制见实施报告。
+> 当轮没有部署、重启、拉取生产镜像或执行迁移。旧版随后已上线；详细时间线、线上诊断
+> 与剩余限制见实施报告。
+
+对内只选择 active `openai:search` Codex provider endpoint、模型映射和账号凭据，通过
+Search 专用同步透传 planner 调用 `{provider_api_root}/alpha/search`。Aether 不再使用
+Responses endpoint 或账号级 `supports_standalone_web_search` 作为 Search 调度门禁。
 
 目标链路为：
 
@@ -32,8 +37,8 @@ Codex 客户端
 1. 对外与 `openai:chat`、`openai:responses` 并列的独立 surface：
    `openai:search`；
 2. 只支持同步 JSON，不支持 SSE、WebSocket 或 Chat/Responses 格式转换；
-3. 对内以 `openai:responses` provider、模型映射和 Codex key pool 为候选锚点；
-4. 仅允许显式声明 standalone search 能力的最终候选；
+3. 对内以独立的 `openai:search` provider endpoint、模型映射和 Codex key pool 为候选；
+4. 由 endpoint `is_active` 控制是否参与 Search，不再要求账号级 Search capability；
 5. 以请求体顶层 `id` 建立最终 Codex 账号粘性；
 6. 只有最终 2xx 计一次 Search，用 surface-scoped 按次价格结算；
 7. 对需要旧 `ref_id` 的状态型操作实施 fail-closed，不能在粘性丢失后静默换号；
@@ -103,14 +108,14 @@ local custom-prod:  05cb36dd70a92bb9e41feaa06a929a26300bb1de
   Search；
 - 请求和响应按 opaque JSON 处理；
 - body `id`、query、未知 body 字段、未知响应字段端到端保留；
-- Search 独立 capability、usage、计费、审计、指标与错误分类；
+- Search 独立 endpoint、Sub2API capability、usage、计费、审计、指标与错误分类；
 - 两仓单元/集成测试和本地 mock 联合测试。
 
 ### 3.2 本期非目标
 
 - 不把 Search 加入 Chat、Responses、Claude、Gemini 的 canonical conversion matrix；
 - 不把 Search 响应改造成 Responses object 或 SSE；
-- 不在没有明确能力声明时向任意 OpenAI-compatible provider 发送 Search；
+- 不在没有独立 active Search endpoint 时向任意 OpenAI-compatible provider 发送 Search；
 - 不在本任务中探测或调用真实生产 OpenAI/ChatGPT 账号；
 - 不实施生产迁移、部署、重启或账号开关；
 - 不顺带合并 `origin/main` 的其他大规模功能；
@@ -216,13 +221,13 @@ Aether 与 Sub2API 都不得因当前代码不认识 `results` 子结构、`encr
 
 ## 5. 总体架构决策
 
-### 5.1 Surface 与 provider anchor 分离
+### 5.1 Surface 与 provider endpoint 分离
 
 使用两个明确概念：
 
 ```text
 client_api_format = openai:search
-provider_anchor   = openai:responses
+provider_endpoint = openai:search
 ```
 
 `openai:search` 用于：
@@ -235,13 +240,13 @@ provider_anchor   = openai:responses
 - Search 按次计价；
 - 管理端可见性。
 
-`openai:responses` anchor 用于：
+`openai:search` provider endpoint 用于：
 
-- 模型目录和 alias；
-- provider endpoint；
+- Search 专用端点启用/停用；
+- Search 候选查询和 endpoint-scoped 模型映射；
 - Codex OAuth key pool；
 - 现有 Codex profile、header 和认证物化；
-- 与 Responses 伴生的账号亲和性。
+- Search 请求的官方 `/alpha/search` 路径。
 
 不得为了复用候选而把客户端格式改写为 `openai:responses`，否则权限、账单和指标会
 混在一起。
@@ -260,21 +265,16 @@ Search planner 只需要：
 不要建立 Search canonical request/response schema。协议仍为 Alpha，固定 Rust/Go DTO
 会扩大未来字段演进的兼容风险。
 
-### 5.3 显式 capability
+### 5.3 提供商端点开关
 
-建议能力名：
+Search 不再新增或依赖账号级 `supports_standalone_web_search`。规则为：
 
-```text
-supports_standalone_web_search
-```
-
-规则：
-
-- Aether 最终 candidate 必须显式为 `true`；
-- 自定义 Responses provider 默认 `false`；
-- 官方 Codex OAuth pool 可由 provider/key 配置显式开启；
-- 能力判断不得只看 provider 名称或 URL；
-- 能力变化需要使候选缓存失效。
+- Codex 固定 provider 模板包含 `openai:search` endpoint；
+- endpoint `is_active=true` 时可参与 Search，停用后在候选查询阶段被排除；
+- 通用端点管理界面的 Power 按钮就是 Search 开关；
+- Codex OAuth key 的历史 `api_formats` 列表不会遮蔽固定 provider endpoint；
+- Codex 客户端 TOML 中的 `supports_standalone_web_search` 仍是客户端 provider 声明，
+  不属于 Aether 账号配置。
 
 ### 5.4 `d2b080e88` 的准确含义
 
@@ -711,9 +711,9 @@ apps/aether-gateway/src/ai_serving/planner/standard/openai/search/
 不要把它塞进 Responses body normalization。该 planner 可复用 same-format sync 的传输和
 finalize 原语，但必须有 Search 专用的：
 
-- 候选 anchor；
+- `openai:search` endpoint candidate；
 - URL builder；
-- capability filter；
+- endpoint active filter；
 - body validator；
 - header policy；
 - affinity policy；
@@ -723,23 +723,22 @@ Plan 决策要求：
 
 - 只产生 sync plan；
 - client format 始终为 `openai:search`；
-- provider candidate 查询以 Responses-compatible endpoint 为 anchor；
+- provider candidate 查询只使用 `openai:search` endpoint；
 - provider actual path 为 Search；
 - 不创建 stream fallback；
 - 不做 sync-to-stream 或 stream-to-sync 聚合；
 - 不调用 OpenAI Chat/Responses response converter。
 
-### 7.3 A3：候选解析和 capability 门控
+### 7.3 A3：候选解析和 endpoint 门控
 
-候选来源复用当前 `openai:responses` 模型和 provider endpoint，但在 materialization 前后
-都要验证 Search 能力，防止缓存或旧数据绕过。
+候选来源使用 Codex 固定 provider 的 `openai:search` endpoint，并在 materialization 前后
+验证 endpoint/provider/key 状态，防止缓存或旧数据绕过。
 
 候选必须满足：
 
 ```text
-endpoint supports openai:responses anchor
-AND provider/key supports_standalone_web_search == true
-AND key active/healthy/schedulable
+endpoint api_format == openai:search
+AND provider/endpoint/key active and schedulable
 AND requested model resolves on that endpoint
 AND auth/profile materialization succeeds
 ```
@@ -750,13 +749,7 @@ AND auth/profile materialization succeeds
 - `apps/aether-gateway/src/ai_serving/planner/candidate_materialization.rs`
 - `apps/aether-gateway/src/ai_serving/planner/standard/openai/search/`
 - `crates/aether-provider-pool/src/providers/codex.rs`
-- provider/key admin DTO 与持久化 metadata
-
-实现前先确定 capability 的存储层级：
-
-1. **优先：endpoint/provider-key 显式 capability**，可对不同 key 精确关闭；
-2. provider 默认 capability 只能作为显式配置模板；
-3. 不建议仅使用全局 feature flag，因为它不能表达某个自定义上游是否支持 Search。
+- provider endpoint admin DTO 与固定模板 metadata
 
 ### 7.4 A4：官方 URL、认证和身份头
 
@@ -815,12 +808,10 @@ Body 必须保持 opaque，只进行：
 1. 只在 Search route 上把顶层 `id` 解释为 Codex session；
 2. 不把全局 Generic adapter 的任意顶层 `id` 都当 session，避免影响其他 API；
 3. 对外 report 仍记录 `client_api_format=openai:search`；
-4. affinity cache 内部使用明确的 companion namespace，例如
-   `openai:responses-companion`，使同一 Aether API key、模型、Codex session 可与 Responses
-   共享最终 candidate；
-5. 若不选择共享 namespace，则至少保证 Search 自身连续请求稳定命中同一 key，并在文档
-   中明确不能与 Responses 共粘；
-6. capability 或 key 状态变化时使绑定失效或重新验证。
+4. affinity cache 使用独立的 `openai:search` namespace，不与 Responses 共享候选绑定；
+5. 保证 Search 自身连续请求稳定命中同一 key，并明确不能依赖 Responses 亲和完成状态型
+   Search 操作；
+6. endpoint 或 key 状态变化时使绑定失效或重新验证。
 
 #### 7.5.1 Stateful ref 识别
 
@@ -905,7 +896,7 @@ api_format       = openai:search
 request_count    = 1
 input_tokens     = 0/unknown
 output_tokens    = 0/unknown
-provider anchor  = openai:responses（仅内部 metadata）
+provider endpoint = openai:search
 status           = success
 ```
 
@@ -976,18 +967,17 @@ plan_kind = openai_search_sync
 - `crates/aether-admin/src/system.rs`
 - provider endpoint/model/key API DTO
 - `frontend/src/api/endpoints/types/api-format.ts`
-- provider endpoint 和 key capability 表单
+- provider endpoint 表单（使用通用启用/停用按钮）
 - pricing/billing rule 表单
 - 对应 i18n 与前端测试
 
 需要展示：
 
 - `openai:search` 格式名称和 `/v1/alpha/search`；
-- 它是 Responses companion，不是转换格式；
-- `supports_standalone_web_search` 开关；
+- 它是 Codex provider 的独立 endpoint，不是转换格式；
+- endpoint `is_active` 开关；
 - Search surface 按次价格；
-- 未声明能力时默认关闭；
-- 不应把 Search 自动加到所有 OpenAI endpoint。
+- 不应把 Search 自动加到 custom/OpenAI endpoint。
 
 ---
 
@@ -999,11 +989,11 @@ plan_kind = openai_search_sync
 | --- | --- | --- |
 | A1 | `FormatId::OpenAiSearch`、公共 route、route classification | 路由/格式测试 |
 | A2 | Search sync plan kind、opaque planner/finalizer | planner 与原样响应测试 |
-| A3 | Responses companion candidate、capability | 候选正反例测试 |
+| A3 | Codex `openai:search` endpoint candidate、endpoint gate | 候选/停用端点测试 |
 | A4 | Codex URL/auth/header/body policy | mock upstream wire 测试 |
 | A5 | body `id` affinity、stateful ref 409 | affinity/failover 测试 |
 | A6 | Search usage、surface-scoped billing、auth estimate | billing 测试 |
-| A7 | 管理端/前端 capability 与 pricing | typecheck/UI 测试 |
+| A7 | 管理端/前端 endpoint 开关与 pricing | typecheck/UI 测试 |
 | A8 | 跨层 fixture、文档和运行手册 | 本地 E2E |
 
 ### 8.2 Sub2API 提交序列
@@ -1027,7 +1017,7 @@ plan_kind = openai_search_sync
 
 1. 冻结 fixture 和错误矩阵；
 2. Aether 完成 A1-A5，使本地 mock 可完整跑通 `/v1/alpha/search`；
-3. Aether 完成 usage/billing，但 capability 默认关闭；
+3. Aether 完成 usage/billing，并完成 fixed provider endpoint reconcile；
 4. Sub2API 完成 S1-S3，指向本地 Aether fixture；
 5. 如需与 `origin/main` 完全对齐，再完成 PAT fallback；
 6. 两仓完成计费和 first-byte timing；
@@ -1078,7 +1068,7 @@ Mock upstream 必须捕获：
 13. Aether route 未安装的 404 触发 Sub2API API Key failover；
 14. API Key 404/405 不把 Aether 账号永久置错；
 15. OAuth 404 行为保持原有语义；
-16. Aether capability 未启用时不选择候选；
+16. Aether `openai:search` endpoint 停用时不选择候选；
 17. Search 计费不影响相同模型的 Responses；
 18. first-byte latency 在两层各自正确记录；
 19. body 超限、无效 JSON、缺 model 均在发 upstream 前失败；
@@ -1150,7 +1140,7 @@ npm run build
 
 ### 12.1 代码和数据
 
-- [ ] Aether route 默认已安装，但 Search capability 默认关闭；
+- [ ] Aether Codex provider 已有 `openai:search` endpoint，且可通过 `is_active` 控制；
 - [ ] Aether surface-scoped pricing 有明确默认/NULL/0 语义；
 - [ ] Sub2API 使用 migration `181`，不存在编号冲突；
 - [ ] 两仓 schema/生成代码一致；
@@ -1165,7 +1155,7 @@ npm run build
 - [ ] ChatGPT token/account ID 不会返回客户端或进入普通日志；
 - [ ] Search body 未进入 Responses converter；
 - [ ] stateful ref 失败为 409；
-- [ ] capability 未开时无候选；
+- [ ] Search endpoint 停用时无候选且不回退到 Responses；
 - [ ] 未知字段端到端保留；
 - [ ] 404/405 两层语义有测试。
 
@@ -1185,8 +1175,8 @@ npm run build
 生产发布必须由用户另行明确授权。届时建议最小顺序是：
 
 1. 记录 Aether 当前版本/digest、健康状态和迁移状态；
-2. 发布支持 Search 但 capability 默认关闭的 Aether；
-3. 在非生产或隔离账号启用 capability，跑联合 smoke test；
+2. 发布包含 `openai:search` fixed endpoint 的 Aether；
+3. 在非生产或隔离 provider 上启用 endpoint，跑联合 smoke test；
 4. 记录 Sub2API 当前版本/digest、健康状态和 migration 状态；
 5. 发布含 Search 路由和 migration 181 的 Sub2API，但先不向用户开放；
 6. 验证普通 Chat/Responses 无回归；
@@ -1196,8 +1186,8 @@ npm run build
 
 安全回退优先使用开关：
 
-1. 先在 Sub2API group 关闭 Search capability/入口；
-2. 再在 Aether 关闭 standalone search capability；
+1. 先在 Sub2API group 关闭 Search 入口；
+2. 再在 Aether 停用 Codex provider 的 `openai:search` endpoint；
 3. 保留新增 nullable schema，不做数据库 downgrade；
 4. 如需代码回退，回到明确的上一版本/digest；
 5. 不删除 usage 或 group price 字段，不执行破坏性反向迁移。
@@ -1247,7 +1237,7 @@ pricing 结构的实现。
 
 - [ ] Sub2API 三条路由均正确；
 - [ ] Aether `/v1/alpha/search` 是独立 `openai:search` surface；
-- [ ] Aether 候选锚定 Responses，但只选择显式 Search-capable key；
+- [ ] Aether 候选只查询 active `openai:search` Codex endpoint；
 - [ ] Sub2API API Key 类型 Aether 账号可被选中；
 - [ ] body/query/未知响应字段端到端保留；
 - [ ] OAuth/APIKey/PAT 各自 wire 行为有测试；
@@ -1260,6 +1250,23 @@ pricing 结构的实现。
 - [ ] migration 使用 181 且 Ent 重新生成；
 - [ ] 两仓重点包测试、前端检查和本地联合 E2E 全部通过；
 - [ ] 代码已提交并推送，生产仍保持未变更，等待用户明确发布授权。
+
+### 16.1 2026-07-26 设计修正
+
+原方案中的“Responses provider anchor + `supports_standalone_web_search` 账号能力”已
+废弃。实施时应以以下最终规则为准：
+
+1. Codex fixed provider template version 2 增加 `openai:search` endpoint；
+2. Search planner、candidate selection、model-resolution 和 pre-auth estimate 均使用
+   `openai:search`，不再隐式查询 `openai:responses`；
+3. Codex OAuth key 的旧 `api_formats` 限制不会遮蔽 fixed provider endpoint；
+4. 后台节点启动 reconcile 既有 fixed providers，通用 endpoint UI 的 `is_active` 是唯一
+   Aether provider-level Search 开关；
+5. Key/OAuth 编辑 UI 不再提供 Search capability 字段；Codex 客户端 TOML 中同名字段仍
+   可作为客户端 provider 声明保留；
+6. Search 继续保持同步、opaque、same-format-only 和按次计费。
+
+本修正只涉及源码、测试和文档，不包含部署、重启、生产数据库写入或迁移执行。
 
 ---
 

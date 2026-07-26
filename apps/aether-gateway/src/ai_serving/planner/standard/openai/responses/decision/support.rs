@@ -88,19 +88,8 @@ pub(crate) async fn resolve_local_openai_responses_decision_input(
     body_json: &serde_json::Value,
     plan_kind: &str,
 ) -> Result<Option<LocalOpenAiResponsesDecisionInput>, GatewayError> {
-    let search_capabilities = serde_json::json!({
-        "supports_standalone_web_search": true
-    });
-    let explicit_required_capabilities =
-        (plan_kind == OPENAI_SEARCH_SYNC_PLAN_KIND).then_some(&search_capabilities);
     resolve_local_openai_responses_decision_input_with_required_capabilities(
-        state,
-        parts,
-        trace_id,
-        decision,
-        body_json,
-        plan_kind,
-        explicit_required_capabilities,
+        state, parts, trace_id, decision, body_json, plan_kind, None,
     )
     .await
 }
@@ -206,7 +195,7 @@ pub(crate) async fn resolve_local_openai_responses_decision_input_with_required_
             PlannerAppState::new(state),
             Some(&input.auth_snapshot),
             input.client_session_affinity.as_ref(),
-            "openai:responses",
+            "openai:search",
             Some(input.requested_model.as_str()),
         );
         if openai_search_body_requires_bound_affinity(body_json)

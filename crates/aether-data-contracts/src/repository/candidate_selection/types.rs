@@ -93,6 +93,14 @@ impl StoredMinimalCandidateSelectionRow {
     }
 
     pub fn key_supports_api_format(&self, api_format: &str) -> bool {
+        // Fixed Codex OAuth credentials inherit the provider's endpoint set.
+        // Their legacy key-level api_formats list may only contain Responses;
+        // it must not hide the provider-level openai:search endpoint.
+        if self.provider_type.trim().eq_ignore_ascii_case("codex")
+            && self.key_auth_type.trim().eq_ignore_ascii_case("oauth")
+        {
+            return true;
+        }
         match self.key_api_formats.as_deref() {
             None => true,
             Some(formats) => formats

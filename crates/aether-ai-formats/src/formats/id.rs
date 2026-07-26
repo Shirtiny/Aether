@@ -102,7 +102,12 @@ impl FromStr for FormatId {
             "openai:responses:compact" | "/v1/responses/compact" => {
                 Ok(Self::OpenAiResponsesCompact)
             }
-            "openai:search" | "/v1/alpha/search" => Ok(Self::OpenAiSearch),
+            "openai:search"
+            | "openai_search"
+            | "alpha_search"
+            | "/v1/alpha/search"
+            | "/alpha/search"
+            | "/backend-api/codex/alpha/search" => Ok(Self::OpenAiSearch),
             "openai:embedding" | "/v1/embeddings" => Ok(Self::OpenAiEmbedding),
             "openai:rerank" | "/v1/rerank" => Ok(Self::OpenAiRerank),
             "claude:messages" | "/v1/messages" => Ok(Self::ClaudeMessages),
@@ -231,6 +236,14 @@ mod tests {
         );
         assert_eq!(
             FormatId::parse("/v1/alpha/search"),
+            Some(FormatId::OpenAiSearch)
+        );
+        assert_eq!(
+            FormatId::parse("openai_search"),
+            Some(FormatId::OpenAiSearch)
+        );
+        assert_eq!(
+            FormatId::parse("alpha_search"),
             Some(FormatId::OpenAiSearch)
         );
         assert_eq!(FormatId::OpenAiSearch.to_string(), "openai:search");

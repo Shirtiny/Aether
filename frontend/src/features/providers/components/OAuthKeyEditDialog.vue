@@ -130,19 +130,6 @@
         </div>
       </div>
 
-      <div
-        v-if="showStandaloneSearchCapability"
-        class="flex items-center justify-between rounded-md border border-border/60 bg-muted/30 px-3 py-2"
-      >
-        <div class="space-y-0.5 pr-4">
-          <Label class="text-sm font-medium">Standalone Web Search</Label>
-          <p class="text-xs text-muted-foreground">
-            允许此 Codex OAuth 账号承接 /v1/alpha/search；默认关闭，需确认账号支持后再启用。
-          </p>
-        </div>
-        <Switch v-model="form.supports_standalone_web_search" />
-      </div>
-
       <!-- 自动获取模型 -->
       <div class="space-y-3 py-2 px-3 rounded-md border border-border/60 bg-muted/30">
         <div class="flex items-center justify-between">
@@ -269,11 +256,6 @@ const canSave = computed(() => {
 
 const isOpen = computed(() => props.open)
 const saving = ref(false)
-const showStandaloneSearchCapability = computed(() =>
-  props.editingKey?.api_formats?.some(
-    format => format.trim().toLowerCase() === 'openai:responses'
-  ) === true
-)
 
 const form = ref({
   name: '',
@@ -283,7 +265,6 @@ const form = ref({
   cache_ttl_minutes: 5,
   max_probe_interval_minutes: 32,
   note: '',
-  supports_standalone_web_search: false,
   auto_fetch_models: false,
   model_include_patterns_text: '',
   model_exclude_patterns_text: ''
@@ -320,7 +301,6 @@ function resetForm() {
     cache_ttl_minutes: 5,
     max_probe_interval_minutes: 32,
     note: '',
-    supports_standalone_web_search: false,
     auto_fetch_models: false,
     model_include_patterns_text: '',
     model_exclude_patterns_text: ''
@@ -339,8 +319,6 @@ function loadKeyData() {
     cache_ttl_minutes: props.editingKey.cache_ttl_minutes ?? 5,
     max_probe_interval_minutes: props.editingKey.max_probe_interval_minutes ?? 32,
     note: props.editingKey.note || '',
-    supports_standalone_web_search:
-      props.editingKey.capabilities?.supports_standalone_web_search === true,
     auto_fetch_models: props.editingKey.auto_fetch_models ?? false,
     model_include_patterns_text: (props.editingKey.model_include_patterns || []).join(', '),
     model_exclude_patterns_text: (props.editingKey.model_exclude_patterns || []).join(', ')
@@ -398,6 +376,8 @@ async function handleSave() {
   saving.value = true
   try {
     const shouldClearAllowedModels = !!props.editingKey.auto_fetch_models && !form.value.auto_fetch_models
+    const capabilities = { ...(props.editingKey.capabilities || {}) }
+    delete capabilities.supports_standalone_web_search
     const updateData: EndpointAPIKeyUpdate = {
       name: form.value.name,
       internal_priority: form.value.internal_priority,
@@ -406,10 +386,7 @@ async function handleSave() {
       cache_ttl_minutes: form.value.cache_ttl_minutes,
       max_probe_interval_minutes: form.value.max_probe_interval_minutes,
       note: form.value.note,
-      capabilities: {
-        ...(props.editingKey.capabilities || {}),
-        supports_standalone_web_search: form.value.supports_standalone_web_search,
-      },
+      capabilities: Object.keys(capabilities).length > 0 ? capabilities : null,
       allowed_models: shouldClearAllowedModels ? null : undefined,
       auto_fetch_models: form.value.auto_fetch_models,
       model_include_patterns: parsePatternText(form.value.model_include_patterns_text),

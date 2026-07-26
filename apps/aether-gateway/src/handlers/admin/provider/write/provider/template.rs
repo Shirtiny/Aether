@@ -534,3 +534,47 @@ fn sync_override_if_changed<T>(
     }
     sync_override(overrides, key, actual, desired);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disabled_codex_search_endpoint_stays_disabled_after_template_reconcile() {
+        let provider = StoredProviderCatalogProvider::new(
+            "provider-codex".to_string(),
+            "Codex".to_string(),
+            None,
+            "codex".to_string(),
+        )
+        .expect("provider should build");
+        let template = fixed_provider_template("codex").expect("codex template should exist");
+        let endpoint_template = template
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.api_format == "openai:search")
+            .expect("search endpoint template should exist");
+
+        let mut existing =
+            build_admin_fixed_provider_endpoint_record(&provider, template, endpoint_template)
+                .expect("search endpoint should build");
+        upsert_fixed_provider_endpoint_metadata(
+            &mut existing,
+            &managed_fixed_provider_endpoint_metadata(template, endpoint_template),
+        );
+
+        let mut disabled = existing.clone();
+        disabled.is_active = false;
+        apply_admin_fixed_provider_endpoint_template_overrides(&provider, &existing, &mut disabled)
+            .expect("endpoint override should apply");
+
+        let reconciled =
+            reconcile_fixed_provider_endpoint(&provider, &disabled, template, endpoint_template)
+                .expect("endpoint should reconcile");
+        assert!(!reconciled.is_active);
+        assert!(fixed_provider_endpoint_metadata(&reconciled)
+            .expect("managed metadata should exist")
+            .overrides
+            .contains(OVERRIDE_IS_ACTIVE));
+    }
+}

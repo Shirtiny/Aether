@@ -1,10 +1,43 @@
 use super::{AppState, GatewayError, LocalMutationOutcome, LocalProviderDeleteTaskState};
+use crate::admin_api::{reconcile_admin_fixed_provider_template_endpoints, AdminAppState};
 use crate::handlers::shared::sync_provider_key_oauth_status_snapshot;
 use aether_data_contracts::repository::{candidates, global_models, pool_scores, provider_catalog};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::warn;
 
 impl AppState {
+    /// Ensure fixed-provider endpoint templates are present after a binary
+    /// upgrade. This is intentionally limited to endpoint reconciliation; the
+    /// endpoint's `is_active` value remains the provider-level Search gate.
+    pub async fn reconcile_fixed_provider_templates_on_startup(&self) -> Result<usize, String> {
+        if !self.has_provider_catalog_data_reader() || !self.has_provider_catalog_data_writer() {
+            return Ok(0);
+        }
+
+        let providers = self
+            .list_provider_catalog_providers(false)
+            .await
+            .map_err(GatewayError::into_message)?;
+        let admin_state = AdminAppState::new(self);
+        let mut reconciled = 0usize;
+        for provider in providers {
+            if admin_state
+                .fixed_provider_template(&provider.provider_type)
+                .is_none()
+            {
+                continue;
+            }
+            reconcile_admin_fixed_provider_template_endpoints(&admin_state, &provider)
+                .await
+                .map_err(GatewayError::into_message)?;
+            reconciled += 1;
+        }
+        if reconciled > 0 {
+            self.invalidate_provider_runtime_routing_caches();
+        }
+        Ok(reconciled)
+    }
+
     async fn finish_codex_ws_catalog_hot_after_authoritative_read<T>(
         &self,
         mutation: crate::codex_ws::hot_state::CodexWsHotMutation,
@@ -1343,6 +1376,44 @@ mod tests {
             Some(1_711_000_000),
         )
         .expect("global model should build")
+    }
+
+    #[tokio::test]
+    async fn startup_reconcile_adds_missing_codex_search_endpoint() {
+        let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![sample_codex_provider()],
+            vec![sample_codex_endpoint()],
+            vec![sample_codex_ws_key()],
+        ));
+        let state = AppState::new()
+            .expect("app state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(repository),
+            );
+
+        let reconciled = state
+            .reconcile_fixed_provider_templates_on_startup()
+            .await
+            .expect("fixed provider templates should reconcile");
+        assert_eq!(reconciled, 1);
+
+        let mut formats = state
+            .list_provider_catalog_endpoints_by_provider_ids(&["provider-1".to_string()])
+            .await
+            .expect("endpoints should list")
+            .into_iter()
+            .map(|endpoint| endpoint.api_format)
+            .collect::<Vec<_>>();
+        formats.sort();
+        assert_eq!(
+            formats,
+            vec![
+                "openai:image".to_string(),
+                "openai:responses".to_string(),
+                "openai:responses:compact".to_string(),
+                "openai:search".to_string(),
+            ]
+        );
     }
 
     fn sample_provider_model_record(

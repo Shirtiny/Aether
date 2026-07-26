@@ -1219,6 +1219,23 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         "aether-gateway data layer configured"
     );
     prepare_database_startup_requirements(&state, args.auto_prepare_database).await?;
+    if args.node_role.spawns_background_tasks() {
+        match state.reconcile_fixed_provider_templates_on_startup().await {
+            Ok(reconciled_fixed_provider_count) if reconciled_fixed_provider_count > 0 => {
+                info!(
+                    reconciled_fixed_provider_count,
+                    "reconciled fixed provider endpoint templates on startup"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    "fixed provider endpoint template reconciliation failed; startup will continue"
+                );
+            }
+        }
+    }
     let reset_stale_proxy_nodes = state.reset_stale_proxy_node_tunnel_statuses().await?;
     if reset_stale_proxy_nodes > 0 {
         info!(

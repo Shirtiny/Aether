@@ -1553,13 +1553,14 @@ cherry-pick。尤其要在编译前确认 `d2b080e88` 的 API Key capability 语
 - 独立权限；
 - 独立限流和审计；
 - 独立请求计价；
-- 明确的 Alpha capability。
+- 明确的 Alpha Search endpoint capability。
 
 它不适合成为 Chat/Responses canonical conversion matrix 中的第三种通用生成格式。
 
 在当前 Codex provider 设计下，最符合事实的实现是：对外使用 `openai:search` 标识，
-对内绑定到显式支持 standalone search 的 Responses provider、模型映射和账号凭据，
-通过 Search 专用同步透传 planner 调用 `{provider_api_root}/alpha/search`。
+对内只选择 active `openai:search` Codex provider endpoint、模型映射和账号凭据，通过
+Search 专用同步透传 planner 调用 `{provider_api_root}/alpha/search`。Aether 不需要再为
+同一能力增加账号级开关。
 
 结合 Sub2API `origin/main` 的实际实现，Aether 不是可选的旁路，而是 API Key account
 所指向的最终账号池网关。Aether 的最低协同要求是：提供 `/v1/alpha/search`、接受
@@ -1571,3 +1572,26 @@ Sub2API 侧必须保留 `d2b080e88` 修复后的 API Key Search 调度语义，�
 仓库依赖该提交；Aether 侧必须使用
 surface-scoped Search 定价，不能通过共享 Responses 模型的普通 `price_per_request`
 实现。官方 `ref_id` 返回 `404` 时的两层语义仍需联合 fixture 或真实受控测试确认。
+
+---
+
+## 26. 设计修正记录（2026-07-26）
+
+本调查报告第 25 节描述的是最初实施方案（Search 绑定 Responses endpoint，并要求账号级
+`supports_standalone_web_search`）。在实际线上诊断和管理端使用反馈后，该开关被判定为
+重复配置，现已改为以下最终设计：
+
+- Codex 固定 provider 模板新增 `openai:search` endpoint；
+- Search 候选只查询该 endpoint，不能通过 Responses/Chat/其他格式转换绕过；
+- endpoint `is_active` 是唯一的 Aether provider-level Search 调度开关，通用端点管理界面
+  可直接停用或启用；
+- Codex OAuth key 的旧 `api_formats` 列表和旧 Search capability 不再阻塞 Search，避免
+  历史账号数据排除新端点；
+- Codex 客户端配置文件中的 `supports_standalone_web_search` 仍可保留，因为那是客户端
+  provider 声明，不是 Aether 账号级能力开关；
+- Aether 启动后台节点会 reconcile 固定 provider endpoint，使已有 Codex provider 能看到
+  Search endpoint；本轮修正未部署、未重启，也未执行生产数据库操作。旧版 Search 已在
+  此前上线，其线上诊断记录见实施报告 6.2。
+
+因此，本节修正后的结论仍支持 Search 作为 Chat/Responses 同级公共 surface，但其内部
+提供商选择应理解为“独立 Search endpoint”，而不是“Responses companion + key capability”。

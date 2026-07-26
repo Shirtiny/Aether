@@ -416,6 +416,10 @@ fn push_key_api_format_sql_filter(
   AND (
     pak.api_formats IS NULL
     OR TRIM(pak.api_formats) = ''
+    OR (
+      LOWER(TRIM(p.provider_type)) = 'codex'
+      AND LOWER(TRIM(pak.auth_type)) = 'oauth'
+    )
     OR CASE
       WHEN json_valid(pak.api_formats) THEN
       (
@@ -493,7 +497,7 @@ fn push_key_auth_channel_sql_filter(
     );
     builder.push_bind(api_format.clone());
     builder.push(
-        r#" IN ('openai:responses', 'openai:responses:compact', 'openai:image')
+        r#" IN ('openai:responses', 'openai:responses:compact', 'openai:search', 'openai:image')
     )
     OR (
       LOWER(TRIM(p.provider_type)) = 'chatgpt_web'
@@ -825,7 +829,10 @@ fn key_auth_channel_matches(row: &CandidateSelectionRow, api_format: &str) -> bo
             auth_type == "oauth"
                 && matches!(
                     api_format.as_str(),
-                    "openai:responses" | "openai:responses:compact" | "openai:image"
+                    "openai:responses"
+                        | "openai:responses:compact"
+                        | "openai:search"
+                        | "openai:image"
                 )
         }
         "chatgpt_web" => {
@@ -1261,6 +1268,25 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["key-chatgpt-web-oauth", "key-chatgpt-web-bearer"]
         );
+
+        let search_rows = repository
+            .list_for_exact_api_format_and_requested_model_page(
+                &StoredRequestedModelCandidateRowsQuery {
+                    api_format: "openai:search".to_string(),
+                    requested_model_name: "gpt-5-search".to_string(),
+                    offset: 0,
+                    limit: 10,
+                },
+            )
+            .await
+            .expect("codex search rows should load");
+        assert_eq!(
+            search_rows
+                .iter()
+                .map(|row| row.key_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["key-codex-oauth"]
+        );
     }
 
     async fn seed_candidate_selection(pool: &sqlx::SqlitePool) {
@@ -1293,6 +1319,11 @@ INSERT INTO providers (
 )
 VALUES ('provider-windsurf', 'Windsurf', 'windsurf', 15, 1, 1, 1);
 
+INSERT INTO providers (
+  id, name, provider_type, provider_priority, is_active, created_at, updated_at
+)
+VALUES ('provider-codex', 'Codex', 'codex', 25, 1, 1, 1);
+
 INSERT INTO provider_endpoints (
   id, provider_id, name, base_url, api_format, is_active, created_at, updated_at
 )
@@ -1309,6 +1340,14 @@ VALUES (
   'https://server.codeium.com', 'openai:chat', 1, 1, 1
 );
 
+INSERT INTO provider_endpoints (
+  id, provider_id, name, base_url, api_format, is_active, created_at, updated_at
+)
+VALUES (
+  'endpoint-codex-search', 'provider-codex', 'Codex Search',
+  'https://chatgpt.com/backend-api/codex', 'openai:search', 1, 1, 1
+);
+
 INSERT INTO provider_api_keys (
   id, provider_id, name, auth_type, api_formats, internal_priority, is_active, created_at, updated_at
 )
@@ -1316,6 +1355,13 @@ VALUES
   ('key-chatgpt-web-oauth', 'provider-chatgpt-web', 'OAuth', 'oauth', '["openai:image"]', 10, 1, 1, 1),
   ('key-chatgpt-web-bearer', 'provider-chatgpt-web', 'Bearer', 'bearer', '["openai:image"]', 20, 1, 1, 1),
   ('key-chatgpt-web-api-key', 'provider-chatgpt-web', 'API Key', 'api_key', '["openai:image"]', 30, 1, 1, 1);
+
+INSERT INTO provider_api_keys (
+  id, provider_id, name, auth_type, api_formats, internal_priority, is_active, created_at, updated_at
+)
+VALUES (
+  'key-codex-oauth', 'provider-codex', 'OAuth', 'oauth', '["openai:responses"]', 10, 1, 1, 1
+);
 
 INSERT INTO provider_api_keys (
   id, provider_id, name, auth_type, api_formats, internal_priority, is_active, created_at, updated_at
@@ -1330,7 +1376,8 @@ INSERT INTO global_models (
 VALUES
   ('global-1', 'gpt-5', '{"model_mappings":["alias-global"],"streaming":true}', 1, 1, 1),
   ('global-image-1', 'gpt-image-2', NULL, 1, 1, 1),
-  ('global-windsurf-1', 'claude-opus-4-7', '{"streaming":true}', 1, 1, 1);
+  ('global-windsurf-1', 'claude-opus-4-7', '{"streaming":true}', 1, 1, 1),
+  ('global-codex-search', 'gpt-5-search', NULL, 1, 1, 1);
 
 INSERT INTO models (
   id, provider_id, global_model_id, provider_model_name, provider_model_mappings,
@@ -1347,6 +1394,10 @@ VALUES (
 ),
 (
   'model-windsurf-opus', 'provider-windsurf', 'global-windsurf-1', 'claude-opus-4-7',
+  NULL, NULL, 1, 1, 1, 1
+),
+(
+  'model-codex-search', 'provider-codex', 'global-codex-search', 'gpt-5-search',
   NULL, NULL, 1, 1, 1, 1
 );
 "#,

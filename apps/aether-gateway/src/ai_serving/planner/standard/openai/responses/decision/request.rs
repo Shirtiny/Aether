@@ -896,7 +896,8 @@ async fn resolve_local_openai_search_candidate_payload_parts(
     candidate_id: &str,
 ) -> Result<Option<LocalOpenAiResponsesCandidatePayloadParts>, GatewayError> {
     const SEARCH_FORMAT: &str = "openai:search";
-    const CANDIDATE_FORMAT: &str = "openai:responses";
+    const CANDIDATE_FORMAT: &str = "openai:search";
+    const CODEX_PROFILE_FORMAT: &str = "openai:responses";
 
     let candidate = &eligible.candidate;
     let transport = &eligible.transport;
@@ -918,7 +919,6 @@ async fn resolve_local_openai_search_candidate_payload_parts(
     if let Some(skip_reason) = openai_search_candidate_contract_skip_reason(
         eligible.provider_api_format.as_str(),
         transport.provider.provider_type.as_str(),
-        candidate,
     ) {
         mark_skipped_local_openai_responses_candidate(
             state,
@@ -1026,7 +1026,7 @@ async fn resolve_local_openai_search_candidate_payload_parts(
         &provider_request_body,
         effective_headers,
         transport.provider.provider_type.as_str(),
-        CANDIDATE_FORMAT,
+        CODEX_PROFILE_FORMAT,
         Some(trace_id),
         transport.key.decrypted_auth_config.as_deref(),
     );
@@ -1062,19 +1062,12 @@ async fn resolve_local_openai_search_candidate_payload_parts(
 fn openai_search_candidate_contract_skip_reason(
     provider_api_format: &str,
     provider_type: &str,
-    candidate: &aether_scheduler_core::SchedulerMinimalCandidateSelectionCandidate,
 ) -> Option<&'static str> {
     if !crate::ai_serving::normalize_api_format_alias(provider_api_format)
-        .eq_ignore_ascii_case("openai:responses")
+        .eq_ignore_ascii_case("openai:search")
         || !provider_type.trim().eq_ignore_ascii_case("codex")
     {
-        return Some("openai_search_codex_responses_candidate_required");
-    }
-    if !aether_scheduler_core::candidate_supports_required_capability(
-        candidate,
-        "supports_standalone_web_search",
-    ) {
-        return Some("openai_search_standalone_web_search_capability_required");
+        return Some("openai_search_codex_search_endpoint_required");
     }
     None
 }
@@ -2095,51 +2088,18 @@ async fn build_kiro_openai_responses_payload_parts(
 mod tests {
     use super::*;
 
-    fn sample_openai_search_candidate(
-        capabilities: Option<Value>,
-    ) -> aether_scheduler_core::SchedulerMinimalCandidateSelectionCandidate {
-        aether_scheduler_core::SchedulerMinimalCandidateSelectionCandidate {
-            provider_id: "provider-1".to_string(),
-            provider_name: "Codex".to_string(),
-            provider_type: "codex".to_string(),
-            provider_priority: 1,
-            endpoint_id: "endpoint-1".to_string(),
-            endpoint_api_format: "openai:responses".to_string(),
-            key_id: "key-1".to_string(),
-            key_name: "search-key".to_string(),
-            key_auth_type: "oauth".to_string(),
-            key_internal_priority: 1,
-            key_global_priority_for_format: None,
-            key_capabilities: capabilities,
-            model_id: "model-1".to_string(),
-            global_model_id: "global-model-1".to_string(),
-            global_model_name: "gpt-5.6-sol".to_string(),
-            selected_provider_model_name: "gpt-5.6-sol".to_string(),
-            mapping_matched_model: None,
-        }
-    }
-
     #[test]
-    fn openai_search_candidate_contract_requires_codex_responses_and_key_capability() {
-        let enabled = sample_openai_search_candidate(Some(json!({
-            "supports_standalone_web_search": true
-        })));
+    fn openai_search_candidate_contract_requires_active_codex_search_endpoint() {
         assert_eq!(
-            openai_search_candidate_contract_skip_reason("openai:responses", "custom", &enabled,),
-            Some("openai_search_codex_responses_candidate_required")
+            openai_search_candidate_contract_skip_reason("openai:search", "custom"),
+            Some("openai_search_codex_search_endpoint_required")
         );
         assert_eq!(
-            openai_search_candidate_contract_skip_reason("openai:chat", "codex", &enabled),
-            Some("openai_search_codex_responses_candidate_required")
-        );
-
-        let missing = sample_openai_search_candidate(Some(json!({"codex_official_ws": true})));
-        assert_eq!(
-            openai_search_candidate_contract_skip_reason("openai:responses", "codex", &missing,),
-            Some("openai_search_standalone_web_search_capability_required")
+            openai_search_candidate_contract_skip_reason("openai:responses", "codex"),
+            Some("openai_search_codex_search_endpoint_required")
         );
         assert_eq!(
-            openai_search_candidate_contract_skip_reason("openai:responses", "codex", &enabled,),
+            openai_search_candidate_contract_skip_reason("openai:search", "codex"),
             None
         );
     }

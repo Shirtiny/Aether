@@ -447,13 +447,18 @@ mod tests {
         let key = sample_key("oauth");
         let endpoints = vec![
             sample_endpoint("openai:responses", true),
+            sample_endpoint("openai:search", true),
             sample_endpoint("openai:image", true),
         ];
 
         assert!(provider_key_inherits_provider_api_formats(&key, "codex"));
         assert_eq!(
             provider_key_effective_api_formats(&key, "codex", &endpoints),
-            vec!["openai:responses".to_string(), "openai:image".to_string()]
+            vec![
+                "openai:responses".to_string(),
+                "openai:search".to_string(),
+                "openai:image".to_string()
+            ]
         );
     }
 
@@ -463,13 +468,18 @@ mod tests {
         key.api_formats = Some(json!(["openai:responses:compact"]));
         let endpoints = vec![
             sample_endpoint("openai:responses", true),
+            sample_endpoint("openai:search", true),
             sample_endpoint("openai:image", true),
         ];
 
         assert!(provider_key_inherits_provider_api_formats(&key, "codex"));
         assert_eq!(
             provider_key_effective_api_formats(&key, "codex", &endpoints),
-            vec!["openai:responses".to_string(), "openai:image".to_string()]
+            vec![
+                "openai:responses".to_string(),
+                "openai:search".to_string(),
+                "openai:image".to_string()
+            ]
         );
     }
 

@@ -290,7 +290,7 @@ const CLAUDE_CODE_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProvider
 
 const CODEX_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProviderTemplate {
     provider_type: "codex",
-    version: 1,
+    version: 2,
     base_url: "https://chatgpt.com/backend-api/codex",
     endpoints: &[
         FixedProviderEndpointTemplate {
@@ -302,6 +302,12 @@ const CODEX_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProviderTempla
         FixedProviderEndpointTemplate {
             item_key: "openai:responses:compact",
             api_format: "openai:responses:compact",
+            custom_path: None,
+            config_defaults: EMPTY_ENDPOINT_CONFIG_DEFAULTS,
+        },
+        FixedProviderEndpointTemplate {
+            item_key: "openai:search",
+            api_format: "openai:search",
             custom_path: None,
             config_defaults: EMPTY_ENDPOINT_CONFIG_DEFAULTS,
         },
@@ -645,10 +651,10 @@ mod tests {
     };
 
     #[test]
-    fn codex_fixed_provider_template_includes_openai_image() {
+    fn codex_fixed_provider_template_includes_search_and_image() {
         let template = fixed_provider_template("codex").expect("codex template should exist");
         assert_eq!(template.base_url, "https://chatgpt.com/backend-api/codex");
-        assert_eq!(template.version, 1);
+        assert_eq!(template.version, 2);
         assert_eq!(
             template
                 .endpoints
@@ -658,9 +664,15 @@ mod tests {
             vec![
                 "openai:responses",
                 "openai:responses:compact",
+                "openai:search",
                 "openai:image"
             ]
         );
+
+        let search_template =
+            fixed_provider_endpoint_template_by_api_format("codex", "openai:search")
+                .expect("codex search endpoint should exist");
+        assert!(search_template.config_defaults.is_empty());
 
         let image_template =
             fixed_provider_endpoint_template_by_api_format("codex", "openai:image")

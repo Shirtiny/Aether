@@ -1,11 +1,11 @@
 # OpenAI Codex `alpha/search` 跨仓实施报告
 
-- **状态：** 代码已实施并完成本地验证
-- **日期：** 2026-07-24
-- **Aether 分支/审查基线：** `custom` / `4c6a3970`
-- **Sub2API 分支/审查基线：** `custom-prod` / `f08a0b106`
+- **状态：** 原链路已上线并完成线上诊断；2026-07-26 提供商端点级修正已在本地完成，尚未发布
+- **日期：** 2026-07-26（基于 2026-07-24 报告补充）
+- **Aether 分支/审查基线：** `custom` / `c6647fdb7`（工作区含未提交修改）
+- **Sub2API 分支/当前检查基线：** `custom-prod` / `d2cb9e445`
 - **Codex 协议参考：** `/opt/stacks/openai-codex@81da9deb`
-- **生产状态：** 未部署、未重启、未执行数据库迁移
+- **生产状态：** 旧版 Search 已上线；本轮端点级修正未部署、未重启，也未执行生产数据库操作
 - **调查报告：** `openai-alpha-search-endpoint-investigation-2026-07-24.md`
 - **执行方案：** `openai-alpha-search-execution-plan-2026-07-24.md`
 
@@ -23,11 +23,13 @@ Codex client
 ```
 
 实现结果符合调查阶段的核心判断：Search 在公共路由、权限、审计、usage 和计费上是
-独立 surface，但在 Aether 的最终 provider 选择上复用 Responses/Codex 候选体系。它没有
-加入 Chat、Responses、Claude Messages 或 Gemini 的通用格式转换矩阵。
+独立 surface；当前修正版还把最终 Codex 选择收敛到独立的 `openai:search` 提供商端点。
+它没有加入 Chat、Responses、Claude Messages 或 Gemini 的通用格式转换矩阵，也不再用
+Responses 端点或账号 capability 作为 Search 的开关。
 
-当前代码仅完成开发与本地验证。数据库迁移 `181_group_web_search_price_per_call.sql` 尚未
-在任何生产数据库执行，两个服务也没有因本任务被部署或重启。
+本轮 Aether 端点级修正仅完成开发与本地验证，没有部署或重启服务，也没有执行数据库
+迁移。旧版 Search 上线时的生产迁移状态未在本轮重新核验，因此本报告不对 migration 181
+当前是否已执行作额外断言。
 
 ---
 
@@ -81,16 +83,17 @@ d2b080e88  restore APIKey account scheduling
 - `apps/aether-gateway/src/api/ai/openai.rs`
 - `apps/aether-gateway/src/ai_serving/planner/route.rs`
 
-### 3.2 Responses companion planner
+### 3.2 提供商端点级 Search planner（2026-07-26 修正版）
 
-Search 客户端格式保持 `openai:search`，候选锚点使用 `openai:responses`。候选必须满足：
+Search 客户端格式和候选格式均为 `openai:search`。候选必须满足：
 
-- provider 为 Codex；
-- endpoint 为 Responses；
-- capability 包含 `supports_standalone_web_search=true`。
+- provider 类型为 Codex；
+- provider endpoint 的 `api_format` 为 `openai:search`；
+- provider、endpoint、key、model 均处于可调度状态。
 
-这使 Search 能复用现有 Codex OAuth key pool、模型映射、profile 和身份头，同时避免把
-Search 的权限、账单和指标混入 Responses。
+Codex OAuth key、模型映射和账号 profile 仍复用现有 Codex 体系，但 Search 是否可用由
+提供商端点的 `is_active` 决定。`supports_standalone_web_search` 不再是 Aether 账号级
+调度门禁；历史字段只作为兼容数据读取，不参与 Search 选择。
 
 ### 3.3 请求和响应处理
 
@@ -293,29 +296,32 @@ git diff --check
   `active` 迁移为 `available`，测试仍期待 `active`。现已修正普通回退用例，并增加旧值
   迁移回归测试；全量 479 项测试通过。
 
-上述修复仍只涉及源码、测试、依赖锁文件和文档，没有执行生产迁移、部署、重启或容器
-更新。
+截至 2026-07-24 首轮实施验收，上述修复只涉及源码、测试、依赖锁文件和文档，当时没有
+执行生产迁移、部署、重启或容器更新。旧版 Search 随后已上线，线上结果见 6.2。
 
-以下事项没有在本任务中执行：
+以下事项截至首轮实施验收没有执行；本轮端点级修正同样没有执行任何生产操作：
 
-- 未执行 migration 181；
-- 未部署或重启 Aether/Sub2API；
+- 首轮验收时未执行 migration 181；本轮未重新核验其线上状态；
+- 本轮未部署或重启 Aether/Sub2API；
 - 未修改容器、镜像、systemd、反向代理或数据库；
 - 本次诊断未由我们主动调用真实 OpenAI/ChatGPT Search 上游端点（线上客户端请求仍会经过 Aether；见 6.2）；
-- 未启用任何生产 capability 或账号；
+- 未更改任何生产 endpoint 开关或账号配置；
 - 未验证真实生产额度、风控或官方 Alpha 服务端的未公开限制。
 
-上线前至少需要：
+本轮修正版发布前至少需要：
 
-1. 在 Aether 最终 Codex candidate/key 上显式启用
-   `supports_standalone_web_search=true`；
+1. 确认 Codex provider 的 `openai:search` endpoint 已由模板 reconcile 创建，并按需通过
+   endpoint 的启用/停用按钮控制；
 2. 在 Sub2API 创建或确认 API Key 类型的 Aether account，配置 Aether base URL 和 key；
-3. 审核并执行 migration 181；
+3. 核验 migration 181 的线上状态；仅在确认尚未执行且另行获得生产授权后再执行；
 4. 确认 Sub2API group 的 Search 单价与 Aether 上游 Search 成本定价，避免双层价格口径错误；
 5. 使用非生产凭据完成一组真实或 mock 联合冒烟测试；
 6. 由用户另行明确授权后再部署、迁移或重启。
 
-### 6.2 线上更新后的实测诊断（2026-07-26）
+### 6.2 线上更新后的实测诊断（2026-07-26，旧代码行为）
+
+本节记录的是旧实现上线后的客观诊断，保留用于解释为什么需要本次设计修正；其中
+“Responses endpoint + 账号 capability”结论已被 6.3 的端点级设计取代。
 
 生产更新后的实测显示“Searching the web”后返回访问限制。需要区分两类请求：
 
@@ -347,7 +353,7 @@ git diff --check
   候选排序，payload 层没有对具体 pool key 做硬门控。这样即使亲和修复后，也可能错误地把未显式
   开启 Search 的 Codex key 用于 Search。
 
-本地源码已修复上述两点：
+当时的本地源码曾修复上述两点：
 
 - `apps/aether-gateway/src/client_session_affinity.rs` 新增无 `Parts` 依赖的 Search 亲和解析；
 - `apps/aether-gateway/src/ai_serving/planner/decision_input.rs` 在 `openai:search` routing
@@ -357,7 +363,8 @@ git diff --check
   `openai_search_standalone_web_search_capability_required` 跳过原因。
 
 目标回归测试已通过：Search 亲和测试 1/1、Search 请求/候选契约测试 6/6、客户端亲和全量测试
-27/27。上述源码修复尚未部署到生产；本次没有修改生产数据库、provider key、容器或服务。
+27/27。在本轮端点级修正开始前，该组源码修复只确认完成了本地验证；本轮没有重新核验
+生产是否已采用对应提交，也没有修改生产数据库、provider key、容器或服务。
 
 Codex 源码确认自定义 provider 要稳定选择 standalone Search，客户端配置需要同时满足：
 
@@ -374,19 +381,56 @@ standalone_web_search = true
 Search feature。缺少任一条件时，非 Responses Lite 客户端可能继续暴露 hosted Responses
 web search，而不会请求 `/v1/alpha/search`。
 
-因此线上恢复需要同时完成：部署上述 Aether 代码修复；在实际可达的 Codex Pro pool key 上显式
-启用 `supports_standalone_web_search=true`；再执行一次带真实认证的 Search 冒烟，确认进入
-`https://chatgpt.com/backend-api/codex/alpha/search`、返回 2xx，并核对 Search 按次计费而非
-Responses token 计费。启用 capability、部署、重启或迁移均需另行明确授权。
+因此旧方案要求启用账号 capability；该要求在本次修正中取消，线上恢复应按 6.3 的提供商
+端点流程执行。
+
+### 6.3 端点级设计修正（2026-07-26）
+
+本次修改的目标不是增加第二个账号开关，而是让 Search 与 OpenAI Chat/Responses 一样，
+通过提供商端点的存在和 `is_active` 控制是否参与调度：
+
+1. **固定端点模板**：Codex 固定 provider 模板版本升至 2，端点集合包含
+   `openai:responses`、`openai:responses:compact`、`openai:search` 和 `openai:image`。
+   `openai:search` 使用 Codex API root，目标路径仍为 `/alpha/search`。
+2. **现有 provider 自动补全**：后台节点启动时执行固定端点模板 reconcile；provider 创建或
+   更新时沿用既有 reconcile。新 Search endpoint 默认启用，管理员可在通用端点管理界面
+   点击 Power 按钮停用；托管端点的显式停用状态由 metadata 保留。
+3. **候选选择**：Search 只查询 `openai:search` endpoint，禁止 Search 进入普通格式转换
+   矩阵，也不再把 `openai:responses` 作为候选锚点。Codex OAuth 的历史 `api_formats` 列表
+   不会遮蔽新端点，但 endpoint inactive 会在候选过滤阶段生效。
+4. **账号配置清理**：Aether 前端移除 Key/OAuth 编辑对话框中的 Search capability 开关；
+   编辑旧记录时删除 `supports_standalone_web_search` 这个历史字段。该字段仍可能出现在
+   Codex 客户端 TOML（`[model_providers.*]` 与 `[features]`），那是客户端声明和功能开关，
+   不属于 Aether provider key 配置。
+5. **认证与 profile**：Search 仍使用 Codex OAuth 的 Bearer 认证、账号 ID、稳定 user-agent/
+   originator 等 profile 头，但请求契约和上游 URL 的 provider format 均是 Search。
+6. **计费**：本次没有改变 Search 的按次计费规则；`openai:search` 继续使用 surface-scoped
+   `price_per_request`，不回退到 Responses token 价格。
+
+本地验证（仅源码和测试，未部署）包括：
+
+```text
+cargo check -p aether-gateway                         passed
+cargo test -p aether-provider-transport codex_fixed_provider_template --lib  passed
+cargo test -p aether-ai-formats search_candidate_registry_is_same_format_only --lib  passed
+cargo test -p aether-gateway openai_search_ --lib      6 passed
+cargo test -p aether-data candidate_selection --lib    28 passed
+frontend: npm run type-check                           passed
+git diff --check                                       passed
+```
+
+上线后验证重点是：后台节点日志出现固定端点 reconcile；管理端能看到 `OpenAI Search`；
+停用该端点后 Search 返回本地无候选且不会调用 Responses；启用后再用非生产凭据确认
+`https://chatgpt.com/backend-api/codex/alpha/search` 的 2xx 透传和独立按次计费。
 
 ---
 
 ## 7. 最终评价
 
 从代码结构和本地测试看，`alpha/search` 适合作为与 OpenAI Chat、OpenAI Responses 同级
-可见的独立 API surface，但不适合作为可互转的第三种生成协议。当前实现已经把 surface
-隔离、Responses companion 候选、Aether API Key 调度、强粘性、按次计费和 opaque wire
-compatibility 分开处理。
+可见的独立 API surface，但不适合作为可互转的第三种生成协议。当前修正版把 surface
+隔离、Codex Search provider endpoint、强粘性、按次计费和 opaque wire compatibility 分开
+处理；账号级 Search capability 不再承担 provider 开关职责。
 
 剩余风险主要来自 Alpha 协议本身可能变化、真实官方服务端行为尚未联调，以及 PAT 基础
 能力尚未进入 `custom-prod`，而不是当前 Aether API Key 链路的已知结构缺口。

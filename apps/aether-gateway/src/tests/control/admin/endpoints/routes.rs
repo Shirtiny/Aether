@@ -189,6 +189,12 @@ async fn gateway_counts_fixed_provider_oauth_keys_for_inherited_endpoint_formats
                 "https://chatgpt.com/backend-api/codex",
             ),
             sample_endpoint(
+                "endpoint-codex-search",
+                "provider-codex",
+                "openai:search",
+                "https://chatgpt.com/backend-api/codex",
+            ),
+            sample_endpoint(
                 "endpoint-chatgpt-web-image",
                 "provider-chatgpt-web",
                 "openai:image",
@@ -224,7 +230,7 @@ async fn gateway_counts_fixed_provider_oauth_keys_for_inherited_endpoint_formats
     let codex_items = codex_payload
         .as_array()
         .expect("payload should be an array");
-    for api_format in ["openai:responses:compact", "openai:image"] {
+    for api_format in ["openai:responses:compact", "openai:search", "openai:image"] {
         let endpoint = codex_items
             .iter()
             .find(|item| item["api_format"] == api_format)

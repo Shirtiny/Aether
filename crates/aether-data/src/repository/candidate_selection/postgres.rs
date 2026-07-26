@@ -61,6 +61,10 @@ INNER JOIN LATERAL (
     AND pak.is_active IS TRUE
     AND (
       pak.api_formats IS NULL
+      OR (
+        LOWER(BTRIM(p.provider_type)) = 'codex'
+        AND LOWER(BTRIM(pak.auth_type)) = 'oauth'
+      )
       OR EXISTS (
         SELECT 1
         FROM json_array_elements_text(pak.api_formats) AS fmt(value)
@@ -71,7 +75,7 @@ INNER JOIN LATERAL (
       (
         LOWER(BTRIM(p.provider_type)) = 'codex'
         AND LOWER(BTRIM(pak.auth_type)) = 'oauth'
-        AND LOWER($3) IN ('openai:responses', 'openai:responses:compact', 'openai:image')
+        AND LOWER($3) IN ('openai:responses', 'openai:responses:compact', 'openai:search', 'openai:image')
       )
       OR (
         LOWER(BTRIM(p.provider_type)) = 'chatgpt_web'
@@ -154,6 +158,10 @@ WHERE p.is_active = TRUE
   AND LOWER(pe.api_format) = LOWER($1)
   AND (
     pak.api_formats IS NULL
+    OR (
+      LOWER(BTRIM(p.provider_type)) = 'codex'
+      AND LOWER(BTRIM(pak.auth_type)) = 'oauth'
+    )
     OR EXISTS (
       SELECT 1
       FROM json_array_elements_text(pak.api_formats) AS fmt(value)
@@ -164,7 +172,7 @@ WHERE p.is_active = TRUE
     (
       LOWER(BTRIM(p.provider_type)) = 'codex'
       AND LOWER(BTRIM(pak.auth_type)) = 'oauth'
-      AND LOWER($3) IN ('openai:responses', 'openai:responses:compact', 'openai:image')
+      AND LOWER($3) IN ('openai:responses', 'openai:responses:compact', 'openai:search', 'openai:image')
     )
     OR (
       LOWER(BTRIM(p.provider_type)) = 'chatgpt_web'
@@ -341,6 +349,10 @@ INNER JOIN LATERAL (
     AND pak.is_active IS TRUE
     AND (
       pak.api_formats IS NULL
+      OR (
+        LOWER(BTRIM(p.provider_type)) = 'codex'
+        AND LOWER(BTRIM(pak.auth_type)) = 'oauth'
+      )
       OR EXISTS (
         SELECT 1
         FROM json_array_elements_text(pak.api_formats) AS fmt(value)
@@ -351,7 +363,7 @@ INNER JOIN LATERAL (
       (
         LOWER(BTRIM(p.provider_type)) = 'codex'
         AND LOWER(BTRIM(pak.auth_type)) = 'oauth'
-        AND LOWER($4) IN ('openai:responses', 'openai:responses:compact', 'openai:image')
+        AND LOWER($4) IN ('openai:responses', 'openai:responses:compact', 'openai:search', 'openai:image')
       )
       OR (
         LOWER(BTRIM(p.provider_type)) = 'chatgpt_web'
@@ -435,6 +447,10 @@ WHERE p.is_active = TRUE
   AND gm.name = $2
   AND (
     pak.api_formats IS NULL
+    OR (
+      LOWER(BTRIM(p.provider_type)) = 'codex'
+      AND LOWER(BTRIM(pak.auth_type)) = 'oauth'
+    )
     OR EXISTS (
       SELECT 1
       FROM json_array_elements_text(pak.api_formats) AS fmt(value)
@@ -445,7 +461,7 @@ WHERE p.is_active = TRUE
     (
       LOWER(BTRIM(p.provider_type)) = 'codex'
       AND LOWER(BTRIM(pak.auth_type)) = 'oauth'
-      AND LOWER($4) IN ('openai:responses', 'openai:responses:compact', 'openai:image')
+      AND LOWER($4) IN ('openai:responses', 'openai:responses:compact', 'openai:search', 'openai:image')
     )
     OR (
       LOWER(BTRIM(p.provider_type)) = 'chatgpt_web'
@@ -630,6 +646,10 @@ WHERE p.is_active = TRUE
   AND m.id = $4
   AND (
     pak.api_formats IS NULL
+    OR (
+      LOWER(BTRIM(p.provider_type)) = 'codex'
+      AND LOWER(BTRIM(pak.auth_type)) = 'oauth'
+    )
     OR EXISTS (
       SELECT 1
       FROM json_array_elements_text(pak.api_formats) AS fmt(value)
@@ -640,7 +660,7 @@ WHERE p.is_active = TRUE
     (
       LOWER(BTRIM(p.provider_type)) = 'codex'
       AND LOWER(BTRIM(pak.auth_type)) = 'oauth'
-      AND LOWER($6) IN ('openai:responses', 'openai:responses:compact', 'openai:image')
+      AND LOWER($6) IN ('openai:responses', 'openai:responses:compact', 'openai:search', 'openai:image')
     )
     OR (
       LOWER(BTRIM(p.provider_type)) = 'chatgpt_web'
@@ -1527,6 +1547,21 @@ mod tests {
             assert!(sql.contains("LOWER(BTRIM(pak.auth_type)) = 'oauth'"));
             assert!(sql.contains("'openai:chat', 'openai:responses'"));
             assert!(sql.contains("'grok',"));
+        }
+    }
+
+    #[test]
+    fn candidate_selection_sql_allows_codex_search_with_legacy_key_formats() {
+        let requested_model_sql = requested_model_selection_sql();
+        for sql in [
+            LIST_FOR_EXACT_API_FORMAT_SQL,
+            LIST_FOR_EXACT_API_FORMAT_AND_GLOBAL_MODEL_SQL,
+            LIST_POOL_KEYS_FOR_GROUP_SQL,
+            requested_model_sql.as_str(),
+        ] {
+            assert!(sql.contains("LOWER(BTRIM(p.provider_type)) = 'codex'"));
+            assert!(sql.contains("LOWER(BTRIM(pak.auth_type)) = 'oauth'"));
+            assert!(sql.contains("'openai:search'"));
         }
     }
 

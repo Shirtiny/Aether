@@ -305,7 +305,10 @@ fn key_auth_channel_matches(row: &StoredMinimalCandidateSelectionRow, api_format
             auth_type == "oauth"
                 && matches!(
                     api_format.as_str(),
-                    "openai:responses" | "openai:responses:compact" | "openai:image"
+                    "openai:responses"
+                        | "openai:responses:compact"
+                        | "openai:search"
+                        | "openai:image"
                 )
         }
         "chatgpt_web" => {
@@ -407,6 +410,27 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].provider_id, "provider-1");
         assert_eq!(rows[1].provider_id, "provider-2");
+    }
+
+    #[tokio::test]
+    async fn codex_oauth_search_uses_endpoint_not_legacy_key_format_list() {
+        let mut codex = sample_row("provider-codex", "openai:search", "gpt-5", 10);
+        codex.provider_type = "codex".to_string();
+        codex.key_auth_type = "oauth".to_string();
+        codex.key_api_formats = Some(vec!["openai:responses".to_string()]);
+
+        let mut custom = sample_row("provider-custom", "openai:search", "gpt-5", 20);
+        custom.key_api_formats = Some(vec!["openai:responses".to_string()]);
+
+        let repository = InMemoryMinimalCandidateSelectionReadRepository::seed(vec![codex, custom]);
+        let rows = repository
+            .list_for_exact_api_format("openai:search")
+            .await
+            .expect("search candidates should load");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].provider_type, "codex");
+        assert_eq!(rows[0].key_auth_type, "oauth");
     }
 
     #[tokio::test]
