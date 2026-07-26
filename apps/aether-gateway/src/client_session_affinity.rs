@@ -157,6 +157,13 @@ pub(crate) fn client_session_affinity_from_search_parts(
     parts: &http::request::Parts,
     body_json: Option<&Value>,
 ) -> Option<ClientSessionAffinity> {
+    client_session_affinity_from_search_request(&parts.headers, body_json)
+}
+
+pub(crate) fn client_session_affinity_from_search_request(
+    headers: &http::HeaderMap,
+    body_json: Option<&Value>,
+) -> Option<ClientSessionAffinity> {
     body_json
         .and_then(|body| body.get("id"))
         .and_then(Value::as_str)
@@ -172,7 +179,7 @@ pub(crate) fn client_session_affinity_from_search_parts(
             )
             .scheduler_affinity()
         })
-        .or_else(|| client_session_affinity_from_parts(parts, body_json))
+        .or_else(|| client_session_affinity_from_request(headers, body_json))
 }
 
 pub(crate) fn client_session_scope_from_parts(

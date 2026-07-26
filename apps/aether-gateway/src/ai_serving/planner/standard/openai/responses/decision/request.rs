@@ -915,14 +915,11 @@ async fn resolve_local_openai_search_candidate_payload_parts(
         .await;
         return Ok(None);
     }
-    if !crate::ai_serving::normalize_api_format_alias(eligible.provider_api_format.as_str())
-        .eq_ignore_ascii_case(CANDIDATE_FORMAT)
-        || !transport
-            .provider
-            .provider_type
-            .trim()
-            .eq_ignore_ascii_case("codex")
-    {
+    if let Some(skip_reason) = openai_search_candidate_contract_skip_reason(
+        eligible.provider_api_format.as_str(),
+        transport.provider.provider_type.as_str(),
+        candidate,
+    ) {
         mark_skipped_local_openai_responses_candidate(
             state,
             input,
@@ -930,7 +927,7 @@ async fn resolve_local_openai_search_candidate_payload_parts(
             candidate,
             candidate_index,
             candidate_id,
-            "openai_search_codex_responses_candidate_required",
+            skip_reason,
         )
         .await;
         return Ok(None);
@@ -1060,6 +1057,26 @@ async fn resolve_local_openai_search_candidate_payload_parts(
         image_request_summary: None,
         request_redacted: false,
     }))
+}
+
+fn openai_search_candidate_contract_skip_reason(
+    provider_api_format: &str,
+    provider_type: &str,
+    candidate: &aether_scheduler_core::SchedulerMinimalCandidateSelectionCandidate,
+) -> Option<&'static str> {
+    if !crate::ai_serving::normalize_api_format_alias(provider_api_format)
+        .eq_ignore_ascii_case("openai:responses")
+        || !provider_type.trim().eq_ignore_ascii_case("codex")
+    {
+        return Some("openai_search_codex_responses_candidate_required");
+    }
+    if !aether_scheduler_core::candidate_supports_required_capability(
+        candidate,
+        "supports_standalone_web_search",
+    ) {
+        return Some("openai_search_standalone_web_search_capability_required");
+    }
+    None
 }
 
 fn openai_search_candidate_matches_preexisting_affinity(
@@ -2077,6 +2094,55 @@ async fn build_kiro_openai_responses_payload_parts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_openai_search_candidate(
+        capabilities: Option<Value>,
+    ) -> aether_scheduler_core::SchedulerMinimalCandidateSelectionCandidate {
+        aether_scheduler_core::SchedulerMinimalCandidateSelectionCandidate {
+            provider_id: "provider-1".to_string(),
+            provider_name: "Codex".to_string(),
+            provider_type: "codex".to_string(),
+            provider_priority: 1,
+            endpoint_id: "endpoint-1".to_string(),
+            endpoint_api_format: "openai:responses".to_string(),
+            key_id: "key-1".to_string(),
+            key_name: "search-key".to_string(),
+            key_auth_type: "oauth".to_string(),
+            key_internal_priority: 1,
+            key_global_priority_for_format: None,
+            key_capabilities: capabilities,
+            model_id: "model-1".to_string(),
+            global_model_id: "global-model-1".to_string(),
+            global_model_name: "gpt-5.6-sol".to_string(),
+            selected_provider_model_name: "gpt-5.6-sol".to_string(),
+            mapping_matched_model: None,
+        }
+    }
+
+    #[test]
+    fn openai_search_candidate_contract_requires_codex_responses_and_key_capability() {
+        let enabled = sample_openai_search_candidate(Some(json!({
+            "supports_standalone_web_search": true
+        })));
+        assert_eq!(
+            openai_search_candidate_contract_skip_reason("openai:responses", "custom", &enabled,),
+            Some("openai_search_codex_responses_candidate_required")
+        );
+        assert_eq!(
+            openai_search_candidate_contract_skip_reason("openai:chat", "codex", &enabled),
+            Some("openai_search_codex_responses_candidate_required")
+        );
+
+        let missing = sample_openai_search_candidate(Some(json!({"codex_official_ws": true})));
+        assert_eq!(
+            openai_search_candidate_contract_skip_reason("openai:responses", "codex", &missing,),
+            Some("openai_search_standalone_web_search_capability_required")
+        );
+        assert_eq!(
+            openai_search_candidate_contract_skip_reason("openai:responses", "codex", &enabled,),
+            None
+        );
+    }
 
     #[test]
     fn openai_search_body_is_opaque_except_model_mapping_and_responses_cache_fields() {

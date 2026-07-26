@@ -301,7 +301,7 @@ git diff --check
 - 未执行 migration 181；
 - 未部署或重启 Aether/Sub2API；
 - 未修改容器、镜像、systemd、反向代理或数据库；
-- 未调用真实 OpenAI/ChatGPT Search 端点；
+- 本次诊断未由我们主动调用真实 OpenAI/ChatGPT Search 上游端点（线上客户端请求仍会经过 Aether；见 6.2）；
 - 未启用任何生产 capability 或账号；
 - 未验证真实生产额度、风控或官方 Alpha 服务端的未公开限制。
 
@@ -317,16 +317,47 @@ git diff --check
 
 ### 6.2 线上更新后的实测诊断（2026-07-26）
 
-生产更新后的首次实测显示“Searching the web”后返回访问限制。只读检查得到以下证据：
+生产更新后的实测显示“Searching the web”后返回访问限制。需要区分两类请求：
+
+1. `40016fbb-6ef6-4a04-b6d0-2d74c047a42e`（页面只显示前缀 `40016fbb`）是本次诊断主动发出的
+   无 Authorization 路由探针，预期结果就是 `503 / missing_auth_context / User: Unknown`，不是用户
+   的真实失败请求。
+2. 随后真实 Search 请求（例如 trace `21437401-c442-4972-bad0-b9246721d8e0`）已带有效认证并命中
+   `/v1/alpha/search`，Aether 记录 `route_kind=search`、`status=allowed`，但最终为
+   `no_local_sync_plans`。Sub2API 的错误记录也确认请求进入 `/v1/alpha/search`，而非旧的
+   `/v1/responses` 路径。
+
+只读检查得到以下证据：
 
 - Aether 运行镜像 revision 为 `e1343300e`，Sub2API 为 `c76631bc4`，两个容器均健康；
-- Sub2API 路由探针命中 `/v1/alpha/search` 并按预期返回未认证，Aether 也将同一路径识别为
-  `openai:search`，因此不是路由或镜像缺失；
-- 实测时间窗内两层日志和 Sub2API usage/error 记录均没有真实 `/v1/alpha/search` 请求，只有
-  诊断探针产生的未认证记录；
-- Aether 当时共有 64 个 active provider key，但
-  `supports_standalone_web_search=true` 的 key 数量为 0；active Codex key 只声明了
-  `codex_official_ws=true`。
+- `gpt-5.6-sol` 已存在于 Codex Pro 的 active `openai:responses` endpoint，模型映射不是缺失；
+- 当前 active Codex Pro key 均只声明 `codex_official_ws=true`，
+  `supports_standalone_web_search=true` 的 key 数量为 0；
+- 真实失败请求的候选诊断为 `candidate_count=31`、`skipped_candidate_count=58`，可见候选全部因
+  `openai_search_codex_responses_candidate_required` 被跳过，未进入上游执行。
+
+根因有两个层次：
+
+* **已确认的直接代码缺陷**：Search 入口先用请求体顶层 `id` 生成 `session=<id>` 的 Codex 会话
+  亲和键；随后 `attach_routing_policy_to_local_requested_model_input` 又用普通 Responses 的
+  通用字段重算亲和键。通用解析不读取顶层 `id`，导致亲和键被清空。Codex Pro provider 配置了
+  `pool_advanced.avoid_anonymous=true`，于是该池在候选选择阶段被当成 anonymous 请求排除，剩余
+  custom Responses 候选才统一触发 `openai_search_codex_responses_candidate_required`。
+* **能力配置/安全门控缺口**：Search 所需的 `supports_standalone_web_search` 在旧实现中只影响
+  候选排序，payload 层没有对具体 pool key 做硬门控。这样即使亲和修复后，也可能错误地把未显式
+  开启 Search 的 Codex key 用于 Search。
+
+本地源码已修复上述两点：
+
+- `apps/aether-gateway/src/client_session_affinity.rs` 新增无 `Parts` 依赖的 Search 亲和解析；
+- `apps/aether-gateway/src/ai_serving/planner/decision_input.rs` 在 `openai:search` routing
+  路径保留顶层 `id` 亲和；
+- `apps/aether-gateway/src/ai_serving/planner/standard/openai/responses/decision/request.rs`
+  对具体候选增加 `supports_standalone_web_search` 硬门控，并返回明确的
+  `openai_search_standalone_web_search_capability_required` 跳过原因。
+
+目标回归测试已通过：Search 亲和测试 1/1、Search 请求/候选契约测试 6/6、客户端亲和全量测试
+27/27。上述源码修复尚未部署到生产；本次没有修改生产数据库、provider key、容器或服务。
 
 Codex 源码确认自定义 provider 要稳定选择 standalone Search，客户端配置需要同时满足：
 
@@ -343,10 +374,10 @@ standalone_web_search = true
 Search feature。缺少任一条件时，非 Responses Lite 客户端可能继续暴露 hosted Responses
 web search，而不会请求 `/v1/alpha/search`。
 
-因此这次不可用包含两个独立配置阻断：客户端生成配置没有同时写入上述字段；Aether provider
-key 也没有启用 Search capability。代码侧已修正 Aether 首页/CCSwitch 和 Sub2API 普通/WS
-Codex 配置生成器并增加回归测试。本次诊断没有修改生产 provider key、数据库、容器或服务；
-线上恢复仍需显式授权并选择要启用的 Codex key。
+因此线上恢复需要同时完成：部署上述 Aether 代码修复；在实际可达的 Codex Pro pool key 上显式
+启用 `supports_standalone_web_search=true`；再执行一次带真实认证的 Search 冒烟，确认进入
+`https://chatgpt.com/backend-api/codex/alpha/search`、返回 2xx，并核对 Search 按次计费而非
+Responses token 计费。启用 capability、部署、重启或迁移均需另行明确授权。
 
 ---
 

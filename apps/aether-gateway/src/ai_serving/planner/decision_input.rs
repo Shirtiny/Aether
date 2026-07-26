@@ -14,7 +14,9 @@ use tracing::warn;
 
 use crate::ai_serving::planner::common::extract_standard_requested_model;
 use crate::ai_serving::{ExecutionRuntimeAuthContext, GatewayAuthApiKeySnapshot, PlannerAppState};
-use crate::client_session_affinity::client_session_affinity_from_request;
+use crate::client_session_affinity::{
+    client_session_affinity_from_request, client_session_affinity_from_search_request,
+};
 use crate::clock::current_unix_secs;
 use crate::routing::{
     apply_routing_mutation_plan, build_routing_trace_seed, resolve_gateway_routing_policy,
@@ -273,8 +275,11 @@ pub(crate) async fn attach_routing_policy_to_local_requested_model_input(
 
     let Some((group_id, group_version, group_config_json, selection_source)) = selected_group
     else {
-        input.client_session_affinity =
-            client_session_affinity_from_request(&parts.headers, Some(body_json));
+        input.client_session_affinity = client_session_affinity_for_api_format(
+            &parts.headers,
+            Some(body_json),
+            client_api_format,
+        );
         input.routing_policy = None;
         input.routing_trace_seed = None;
         input.routing_context = None;
@@ -324,8 +329,11 @@ pub(crate) async fn attach_routing_policy_to_local_requested_model_input(
     }
 
     let effective_headers_json = headers_to_routing_value(&effective_headers);
-    input.client_session_affinity =
-        client_session_affinity_from_request(&effective_headers, Some(&effective_body_json));
+    input.client_session_affinity = client_session_affinity_for_api_format(
+        &effective_headers,
+        Some(&effective_body_json),
+        client_api_format,
+    );
     let mut final_policy = resolve_gateway_routing_policy(GatewayRoutingPolicyInput {
         group_id: group_id.as_deref(),
         group_version,
@@ -353,6 +361,18 @@ pub(crate) async fn attach_routing_policy_to_local_requested_model_input(
         effective_headers,
     });
     Ok(())
+}
+
+fn client_session_affinity_for_api_format(
+    headers: &HeaderMap,
+    body_json: Option<&Value>,
+    client_api_format: &str,
+) -> Option<ClientSessionAffinity> {
+    if crate::ai_serving::normalize_api_format_alias(client_api_format) == "openai:search" {
+        client_session_affinity_from_search_request(headers, body_json)
+    } else {
+        client_session_affinity_from_request(headers, body_json)
+    }
 }
 
 pub(crate) fn build_local_authenticated_decision_input(
@@ -598,6 +618,29 @@ fn ensure_report_context_routing_trace(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn routing_affinity_uses_search_top_level_id_for_openai_search() {
+        let headers = HeaderMap::new();
+        let body = json!({
+            "id": "search-session-1",
+            "model": "gpt-5.6-sol"
+        });
+
+        let affinity =
+            client_session_affinity_for_api_format(&headers, Some(&body), "openai:search")
+                .expect("search affinity should use the top-level id");
+
+        assert_eq!(affinity.client_family.as_deref(), Some("codex"));
+        assert_eq!(
+            affinity.session_key.as_deref(),
+            Some("session=search-session-1")
+        );
+        assert!(
+            client_session_affinity_for_api_format(&headers, Some(&body), "openai:responses")
+                .is_none()
+        );
+    }
 
     fn sample_auth_context() -> ExecutionRuntimeAuthContext {
         ExecutionRuntimeAuthContext {
