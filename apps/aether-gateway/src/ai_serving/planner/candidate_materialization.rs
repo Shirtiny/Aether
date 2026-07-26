@@ -986,10 +986,6 @@ impl<'a> RequestedModelAttemptPageCursor<'a> {
 
     async fn load_next_page(&mut self) -> Result<bool, GatewayError> {
         loop {
-            // TEMPORARY latency probe (2026-07-26): candidate materialization
-            // measures ~80ms and holds only two awaits, the page read and the
-            // transport resolution. Split them before choosing a fix.
-            let probe_page_start = std::time::Instant::now();
             let page = match self.page_cursor.next_page().await {
                 Ok(Some(page)) => page,
                 Ok(None) => return Ok(false),
@@ -1013,9 +1009,6 @@ impl<'a> RequestedModelAttemptPageCursor<'a> {
                 return Ok(false);
             }
 
-            let probe_page_us = probe_page_start.elapsed().as_micros() as u64;
-            let probe_page_candidates = page.candidates.len();
-            let probe_resolve_start = std::time::Instant::now();
             let (candidates, resolved_skipped) = match self.transport_read_mode {
                 LocalCandidateTransportReadMode::PerCandidate => {
                     resolve_and_rank_logical_local_execution_candidates(
@@ -1050,16 +1043,6 @@ impl<'a> RequestedModelAttemptPageCursor<'a> {
                     .await
                 }
             };
-            tracing::info!(
-                event_name = "probe_load_next_page_split",
-                log_type = "ops",
-                trace_id = %self.trace_id,
-                mode = ?self.transport_read_mode,
-                page_candidates = probe_page_candidates,
-                page_read_us = probe_page_us,
-                resolve_transports_us = probe_resolve_start.elapsed().as_micros() as u64,
-                "temporary latency probe for candidate page load"
-            );
             let skipped_candidates = page
                 .skipped_candidates
                 .into_iter()
@@ -1161,17 +1144,6 @@ impl<'a> RequestedModelAttemptPageCursor<'a> {
 
         let sleep_duration =
             AUTH_API_KEY_CONCURRENCY_RETRY_DELAY.min(deadline.saturating_duration_since(now));
-        // TEMPORARY latency probe (2026-07-26): elimination points here, but the
-        // concurrency counters this gate reads showed 0-1 against a limit of 20,
-        // so confirm the retry actually fires before acting on it.
-        tracing::info!(
-            event_name = "probe_auth_api_key_concurrency_retry",
-            log_type = "ops",
-            trace_id = %self.trace_id,
-            sleep_us = sleep_duration.as_micros() as u64,
-            remaining_us = deadline.saturating_duration_since(now).as_micros() as u64,
-            "temporary latency probe for auth api key concurrency retry"
-        );
         tokio::time::sleep(sleep_duration).await;
         self.page_cursor.restart_scan();
         true

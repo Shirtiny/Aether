@@ -315,11 +315,6 @@ pub(crate) async fn maybe_execute_stream_via_local_openai_responses_decision(
     body_json: &serde_json::Value,
     plan_kind: &str,
 ) -> Result<LocalExecutionRequestOutcome, GatewayError> {
-    // TEMPORARY latency probe (2026-07-26). Everything before this point is
-    // already measured in microseconds, so the ~82ms gap ahead of the candidate
-    // loop has to be inside candidate materialization. Remove with the other
-    // probes once attributed.
-    let probe_start = std::time::Instant::now();
     let Some((attempt_source, _candidate_count)) =
         build_local_openai_responses_stream_attempt_source_for_kind(
             state, parts, trace_id, decision, body_json, plan_kind,
@@ -328,15 +323,6 @@ pub(crate) async fn maybe_execute_stream_via_local_openai_responses_decision(
     else {
         return Ok(LocalExecutionRequestOutcome::NoPath);
     };
-    tracing::info!(
-        event_name = "probe_responses_attempt_source_built",
-        log_type = "ops",
-        trace_id = %trace_id,
-        plan_kind,
-        candidate_count = _candidate_count,
-        elapsed_us = probe_start.elapsed().as_micros() as u64,
-        "temporary latency probe for candidate materialization"
-    );
 
     execute_stream_attempt_source::<AiStreamAttempt, _>(
         state,

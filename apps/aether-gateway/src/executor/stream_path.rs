@@ -33,33 +33,23 @@ pub(crate) async fn maybe_execute_via_stream_decision_path(
     trace_id: &str,
     decision: &GatewayControlDecision,
 ) -> Result<LocalExecutionRequestOutcome, GatewayError> {
-    // TEMPORARY latency probe (2026-07-26). The span from request body
-    // buffering to the candidate loop measures ~82ms at p50 and is not
-    // explained by Postgres (a 151ms instance held zero statements), Redis
-    // (0.1% busy), CPU (~32ms for the whole request lifecycle), or thread
-    // blocking. Remove once the cost is attributed.
-    let probe_start = std::time::Instant::now();
     let Some(plan_kind) = resolve_execution_runtime_stream_plan_kind(parts, decision) else {
         return Ok(LocalExecutionRequestOutcome::NoPath);
     };
-    let probe_kind_us = probe_start.elapsed().as_micros() as u64;
 
     let Some((body_json, body_base64)) = parse_local_request_body(parts, body_bytes) else {
         return Ok(LocalExecutionRequestOutcome::NoPath);
     };
-    let probe_parsed_us = probe_start.elapsed().as_micros() as u64;
 
     if !is_matching_stream_request(plan_kind, parts, &body_json, body_base64.as_deref()) {
         return Ok(LocalExecutionRequestOutcome::NoPath);
     }
-    let probe_matched_us = probe_start.elapsed().as_micros() as u64;
 
     let bypass_cache_key =
         build_direct_plan_bypass_cache_key(plan_kind, parts, body_bytes, decision);
     if should_skip_direct_plan(state, &bypass_cache_key) {
         return Ok(LocalExecutionRequestOutcome::NoPath);
     }
-    let probe_cache_key_us = probe_start.elapsed().as_micros() as u64;
 
     let port = GatewayStreamExecutionPathPort {
         state,
@@ -73,24 +63,9 @@ pub(crate) async fn maybe_execute_via_stream_decision_path(
         scheduler_supported: supports_stream_execution_decision_kind(plan_kind),
     };
 
-    let outcome = run_ai_stream_execution_path(&port).await?;
-    let probe_path_us = probe_start.elapsed().as_micros() as u64;
-    tracing::info!(
-        event_name = "probe_stream_decision_path_breakdown",
-        log_type = "ops",
-        trace_id = %trace_id,
-        plan_kind,
-        body_bytes_len = body_bytes.len(),
-        resolve_kind_us = probe_kind_us,
-        parse_body_us = probe_parsed_us - probe_kind_us,
-        match_stream_us = probe_matched_us - probe_parsed_us,
-        bypass_cache_key_us = probe_cache_key_us - probe_matched_us,
-        execution_path_us = probe_path_us - probe_cache_key_us,
-        total_us = probe_path_us,
-        "temporary latency probe for stream decision path"
-    );
-
-    Ok(from_ai_serving_outcome(outcome))
+    Ok(from_ai_serving_outcome(
+        run_ai_stream_execution_path(&port).await?,
+    ))
 }
 
 struct GatewayStreamExecutionPathPort<'a> {
@@ -119,10 +94,6 @@ impl AiStreamExecutionPathPort for GatewayStreamExecutionPathPort<'_> {
         &self,
         step: AiStreamExecutionStep,
     ) -> Result<AiServingExecutionOutcome<Self::Response, Self::Exhaustion>, Self::Error> {
-        // TEMPORARY latency probe (2026-07-26): steps are attempted in order, so
-        // a step that does work before declining still costs the request.
-        let probe_step_start = std::time::Instant::now();
-        let probe_step_name = format!("{step:?}");
         let outcome = match step {
             AiStreamExecutionStep::LocalVideoContent => {
                 maybe_execute_local_video_task_content_stream(
@@ -217,15 +188,6 @@ impl AiStreamExecutionPathPort for GatewayStreamExecutionPathPort<'_> {
                 }
             }
         };
-        tracing::info!(
-            event_name = "probe_stream_step_elapsed",
-            log_type = "ops",
-            trace_id = %self.trace_id,
-            step = %probe_step_name,
-            declined = matches!(outcome, LocalExecutionRequestOutcome::NoPath),
-            elapsed_us = probe_step_start.elapsed().as_micros() as u64,
-            "temporary latency probe for stream execution step"
-        );
         Ok(to_ai_serving_outcome(outcome))
     }
 
