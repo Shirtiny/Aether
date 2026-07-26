@@ -113,6 +113,8 @@ describe('ccswitchImport', () => {
     expect(config.config).toContain('model = "gpt-5"')
     expect(config.config).toContain('base_url = "https://aether.example.com/v1"')
     expect(config.config).toContain('wire_api = "responses"')
+    expect(config.config).toContain('supports_standalone_web_search = true')
+    expect(config.config).toContain('[features]\nstandalone_web_search = true')
   })
 
   it.each([

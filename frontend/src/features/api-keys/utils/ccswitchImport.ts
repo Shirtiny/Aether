@@ -126,7 +126,11 @@ function buildCodexToml(baseUrl: string, modelId: string): string {
     'name = "Aether"',
     `base_url = ${quoteTomlString(aetherV1BaseUrl(baseUrl))}`,
     'wire_api = "responses"',
+    'supports_standalone_web_search = true',
     'requires_openai_auth = true',
+    '',
+    '[features]',
+    'standalone_web_search = true',
     '',
   ].join('\n')
 }

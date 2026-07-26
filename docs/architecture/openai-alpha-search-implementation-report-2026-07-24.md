@@ -315,6 +315,39 @@ git diff --check
 5. 使用非生产凭据完成一组真实或 mock 联合冒烟测试；
 6. 由用户另行明确授权后再部署、迁移或重启。
 
+### 6.2 线上更新后的实测诊断（2026-07-26）
+
+生产更新后的首次实测显示“Searching the web”后返回访问限制。只读检查得到以下证据：
+
+- Aether 运行镜像 revision 为 `e1343300e`，Sub2API 为 `c76631bc4`，两个容器均健康；
+- Sub2API 路由探针命中 `/v1/alpha/search` 并按预期返回未认证，Aether 也将同一路径识别为
+  `openai:search`，因此不是路由或镜像缺失；
+- 实测时间窗内两层日志和 Sub2API usage/error 记录均没有真实 `/v1/alpha/search` 请求，只有
+  诊断探针产生的未认证记录；
+- Aether 当时共有 64 个 active provider key，但
+  `supports_standalone_web_search=true` 的 key 数量为 0；active Codex key 只声明了
+  `codex_official_ws=true`。
+
+Codex 源码确认自定义 provider 要稳定选择 standalone Search，客户端配置需要同时满足：
+
+```toml
+[model_providers.example]
+wire_api = "responses"
+supports_standalone_web_search = true
+
+[features]
+standalone_web_search = true
+```
+
+第一个字段声明自定义 provider 支持该端点；第二个字段在普通 Responses 模式启用 standalone
+Search feature。缺少任一条件时，非 Responses Lite 客户端可能继续暴露 hosted Responses
+web search，而不会请求 `/v1/alpha/search`。
+
+因此这次不可用包含两个独立配置阻断：客户端生成配置没有同时写入上述字段；Aether provider
+key 也没有启用 Search capability。代码侧已修正 Aether 首页/CCSwitch 和 Sub2API 普通/WS
+Codex 配置生成器并增加回归测试。本次诊断没有修改生产 provider key、数据库、容器或服务；
+线上恢复仍需显式授权并选择要启用的 Codex key。
+
 ---
 
 ## 7. 最终评价

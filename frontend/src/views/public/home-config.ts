@@ -63,7 +63,11 @@ disable_response_storage = true
 name = "OpenAI"
 base_url = "${baseUrl.value}/v1"
 wire_api = "responses"
-requires_openai_auth = true`)
+supports_standalone_web_search = true
+requires_openai_auth = true
+
+[features]
+standalone_web_search = true`)
 
   const codexAuthConfig = computed(() => `{
   "OPENAI_API_KEY": "your-api-key"
