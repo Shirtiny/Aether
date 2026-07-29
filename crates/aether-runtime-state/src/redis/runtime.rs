@@ -135,6 +135,38 @@ impl RedisRuntimeRunner {
         Ok(())
     }
 
+    pub(crate) async fn kv_set_many_with_ttl(
+        &self,
+        entries: &[(String, String)],
+        ttl: Duration,
+    ) -> Result<(), DataLayerError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        let ttl_ms = u64::try_from(ttl.as_millis().max(1)).unwrap_or(u64::MAX);
+        let script = script(
+            "for index = 1, #KEYS do \
+                 redis.call('psetex', KEYS[index], ARGV[1], ARGV[index + 1]) \
+             end \
+             return #KEYS",
+        );
+        let mut invocation = script.prepare_invoke();
+        for (key, _) in entries {
+            invocation.key(self.keyspace.key(key));
+        }
+        invocation.arg(ttl_ms);
+        for (_, value) in entries {
+            invocation.arg(value);
+        }
+        let mut connection = self.connections.connection(RedisConnectionLane::Fast);
+        invocation
+            .invoke_async::<i32>(&mut connection)
+            .await
+            .map_redis_err()?;
+        Ok(())
+    }
+
     pub(crate) async fn kv_set_if_absent(
         &self,
         key: &str,

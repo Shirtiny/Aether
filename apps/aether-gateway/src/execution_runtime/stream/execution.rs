@@ -839,6 +839,34 @@ fn stream_terminal_summary_represents_failure_with_requirement(
     })
 }
 
+async fn remember_provider_session_risk_control_block_for_terminal_summary(
+    state: &AppState,
+    plan: &ExecutionPlan,
+    report_context: Option<&Value>,
+    summary: Option<&ExecutionStreamTerminalSummary>,
+    status_code: u16,
+    recorded: &mut bool,
+) {
+    if *recorded {
+        return;
+    }
+    let Some(error_message) = summary.and_then(|summary| summary.parser_error.as_deref()) else {
+        return;
+    };
+    let failure = build_stream_failure_report(
+        "stream_terminal_error",
+        error_message.to_string(),
+        status_code,
+    );
+    *recorded = remember_provider_session_risk_control_block_for_failure(
+        state,
+        plan,
+        report_context,
+        &failure,
+    )
+    .await;
+}
+
 async fn execute_in_process_stream(
     state: &AppState,
     plan: &ExecutionPlan,
@@ -3294,6 +3322,7 @@ async fn execute_stream_from_frame_stream(
     let provider_pool_in_flight_guard_for_report = in_flight_guard;
     tokio::spawn(async move {
         let _provider_pool_in_flight_guard = provider_pool_in_flight_guard_for_report;
+        let mut session_risk_control_block_recorded = false;
         let mut provider_buffered_body = Vec::new();
         let mut buffered_body = Vec::new();
         let mut provider_body_truncated = false;
@@ -3497,6 +3526,17 @@ async fn execute_stream_from_frame_stream(
                     replay_chunk,
                 );
             }
+            remember_provider_session_risk_control_block_for_terminal_summary(
+                &state_for_report,
+                &plan_for_report,
+                report_context_owned.as_ref(),
+                stream_usage_observer
+                    .as_ref()
+                    .and_then(StreamingStandardTerminalObserver::latest_summary),
+                status_code,
+                &mut session_risk_control_block_recorded,
+            )
+            .await;
             if terminal_failure.is_none() {
                 if let Some(rewriter) = local_stream_rewriter.as_mut() {
                     if let Err(err) = rewriter.push_chunk(replay_chunk) {
@@ -3658,6 +3698,17 @@ async fn execute_stream_from_frame_stream(
                                 &normalized_chunk,
                             );
                         }
+                        remember_provider_session_risk_control_block_for_terminal_summary(
+                            &state_for_report,
+                            &plan_for_report,
+                            report_context_owned.as_ref(),
+                            stream_usage_observer
+                                .as_ref()
+                                .and_then(StreamingStandardTerminalObserver::latest_summary),
+                            status_code,
+                            &mut session_risk_control_block_recorded,
+                        )
+                        .await;
                         let rewritten_chunk = if let Some(rewriter) = local_stream_rewriter.as_mut()
                         {
                             match rewriter.push_chunk(&normalized_chunk) {
@@ -3829,6 +3880,17 @@ async fn execute_stream_from_frame_stream(
                             &normalized_chunk,
                         );
                     }
+                    remember_provider_session_risk_control_block_for_terminal_summary(
+                        &state_for_report,
+                        &plan_for_report,
+                        report_context_owned.as_ref(),
+                        stream_usage_observer
+                            .as_ref()
+                            .and_then(StreamingStandardTerminalObserver::latest_summary),
+                        status_code,
+                        &mut session_risk_control_block_recorded,
+                    )
+                    .await;
                     if !downstream_dropped {
                         let rewritten_chunk = if let Some(rewriter) = local_stream_rewriter.as_mut()
                         {
@@ -4057,6 +4119,26 @@ async fn execute_stream_from_frame_stream(
                 &mut stream_usage_observer_buffered,
             ),
         );
+        remember_provider_session_risk_control_block_for_terminal_summary(
+            &state_for_report,
+            &plan_for_report,
+            report_context_owned.as_ref(),
+            stream_terminal_summary.as_ref(),
+            status_code,
+            &mut session_risk_control_block_recorded,
+        )
+        .await;
+        if downstream_dropped && !session_risk_control_block_recorded {
+            if let Some(failure) = terminal_failure.as_ref() {
+                let _ = remember_provider_session_risk_control_block_for_failure(
+                    &state_for_report,
+                    &plan_for_report,
+                    report_context_owned.as_ref(),
+                    failure,
+                )
+                .await;
+            }
+        }
 
         if downstream_dropped && client_visible_stream_completed && terminal_failure.is_none() {
             debug!(
@@ -4201,20 +4283,6 @@ async fn execute_stream_from_frame_stream(
                 })
             });
         if stream_failed {
-            if let Some(error_message) = stream_terminal_error_message.as_deref() {
-                let failure = build_stream_failure_report(
-                    "stream_terminal_error",
-                    error_message.to_string(),
-                    status_code,
-                );
-                remember_provider_session_risk_control_block_for_failure(
-                    &state_for_report,
-                    &plan_for_report,
-                    report_context_owned.as_ref(),
-                    &failure,
-                )
-                .await;
-            }
             warn!(
                 event_name = "execution_runtime_stream_missing_terminal_event",
                 log_type = "ops",
@@ -6773,8 +6841,15 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"type":"s
         assert_eq!(candidates[0].error_type.as_deref(), Some("internal"));
     }
 
-    #[tokio::test]
-    async fn midstream_response_failed_records_session_risk_control_block() {
+    async fn start_midstream_risk_control_stream(
+        session_key: &str,
+        finish_after_risk: Option<Arc<tokio::sync::Notify>>,
+    ) -> (
+        AppState,
+        axum::http::Response<Body>,
+        &'static str,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
         let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
         let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
         let mut provider = sample_provider_catalog_provider("provider-g-aisc", "codex");
@@ -6802,9 +6877,10 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"type":"s
                 enabled: true,
                 ..UsageRuntimeConfig::default()
             });
-        let session_key = "session=risk-midstream";
         let risk_message = "This content was flagged for possible cybersecurity risk";
         let padding = "x".repeat(crate::execution_runtime::MAX_STREAM_PREFETCH_BYTES + 1);
+        let upstream_eof_reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let upstream_eof_reached_for_stream = Arc::clone(&upstream_eof_reached);
         let frame_stream = stream! {
             yield Ok::<Bytes, std::io::Error>(ndjson_frame(StreamFrame {
                 frame_type: StreamFrameType::Headers,
@@ -6843,6 +6919,11 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"type":"s
                     )),
                 },
             }));
+            if let Some(finish_after_risk) = finish_after_risk {
+                finish_after_risk.notified().await;
+            }
+            upstream_eof_reached_for_stream
+                .store(true, std::sync::atomic::Ordering::Release);
         }
         .boxed();
         let mut report_context = test_prefetch_report_context(
@@ -6870,11 +6951,11 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"type":"s
         .await
         .expect("stream execution should succeed")
         .expect("stream execution should return a response");
-        let body = to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("response body should read");
-        assert!(String::from_utf8_lossy(body.as_ref()).contains(risk_message));
 
+        (state, response, risk_message, upstream_eof_reached)
+    }
+
+    async fn wait_for_session_risk_control_block(state: &AppState, session_key: &str) {
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 if state
@@ -6888,7 +6969,53 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"type":"s
             }
         })
         .await
-        .expect("midstream risk response should synchronously establish a session block");
+        .expect("midstream risk response should establish a session block");
+    }
+
+    #[tokio::test]
+    async fn midstream_response_failed_records_session_risk_control_block() {
+        let session_key = "session=risk-midstream";
+        let (state, response, risk_message, _) =
+            start_midstream_risk_control_stream(session_key, None).await;
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should read");
+        assert!(String::from_utf8_lossy(body.as_ref()).contains(risk_message));
+
+        wait_for_session_risk_control_block(&state, session_key).await;
+    }
+
+    #[tokio::test]
+    async fn midstream_response_failed_records_block_after_downstream_disconnect() {
+        let session_key = "session=risk-midstream-disconnected";
+        let (state, response, _, _) = start_midstream_risk_control_stream(session_key, None).await;
+        drop(response);
+
+        wait_for_session_risk_control_block(&state, session_key).await;
+    }
+
+    #[tokio::test]
+    async fn midstream_response_failed_records_block_before_upstream_eof() {
+        let session_key = "session=risk-midstream-before-eof";
+        let finish_after_risk = Arc::new(tokio::sync::Notify::new());
+        let (state, response, risk_message, upstream_eof_reached) =
+            start_midstream_risk_control_stream(session_key, Some(Arc::clone(&finish_after_risk)))
+                .await;
+        let body_task =
+            tokio::spawn(async move { to_bytes(response.into_body(), usize::MAX).await });
+
+        wait_for_session_risk_control_block(&state, session_key).await;
+        assert!(
+            !upstream_eof_reached.load(std::sync::atomic::Ordering::Acquire),
+            "session block should be visible before the upstream stream reaches EOF"
+        );
+
+        finish_after_risk.notify_one();
+        let body = body_task
+            .await
+            .expect("body task should join")
+            .expect("response body should read");
+        assert!(String::from_utf8_lossy(body.as_ref()).contains(risk_message));
     }
 
     #[tokio::test]

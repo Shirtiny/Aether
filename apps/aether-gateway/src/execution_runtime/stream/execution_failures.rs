@@ -546,28 +546,32 @@ pub(super) async fn remember_provider_session_risk_control_block_for_failure(
     plan: &ExecutionPlan,
     report_context: Option<&Value>,
     failure: &StreamFailureReport,
-) {
+) -> bool {
     if !usage_text_matches_risk_control(Some(failure.error_message.as_str()))
         && !usage_text_matches_risk_control(Some(failure.error_type.as_str()))
     {
-        return;
+        return false;
     }
     let Some(session_key) = client_session_key_from_metadata(report_context) else {
-        return;
+        return false;
     };
-    if let Err(err) = state
+    match state
         .remember_provider_session_risk_control_block_if_enabled(&plan.provider_id, session_key)
         .await
     {
-        warn!(
-            event_name = "provider_session_risk_control_block_record_failed",
-            log_type = "ops",
-            request_id = %short_request_id(plan.request_id.as_str()),
-            candidate_id = ?plan.candidate_id,
-            provider_id = %plan.provider_id,
-            error = ?err,
-            "gateway failed to persist provider session risk-control avoidance block"
-        );
+        Ok(recorded) => recorded,
+        Err(err) => {
+            warn!(
+                event_name = "provider_session_risk_control_block_record_failed",
+                log_type = "ops",
+                request_id = %short_request_id(plan.request_id.as_str()),
+                candidate_id = ?plan.candidate_id,
+                provider_id = %plan.provider_id,
+                error = ?err,
+                "gateway failed to persist provider session risk-control avoidance block"
+            );
+            false
+        }
     }
 }
 

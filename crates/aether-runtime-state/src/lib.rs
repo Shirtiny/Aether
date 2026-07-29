@@ -340,6 +340,25 @@ impl RuntimeState {
         }
     }
 
+    pub async fn kv_set_many_with_ttl(
+        &self,
+        entries: &[(String, String)],
+        ttl: Duration,
+    ) -> Result<(), DataLayerError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        match self.backend.as_ref() {
+            RuntimeStateBackend::Memory(memory) => {
+                memory.kv_set_many_with_ttl(entries, ttl).await;
+                Ok(())
+            }
+            RuntimeStateBackend::Redis(redis) => {
+                redis.runtime.kv_set_many_with_ttl(entries, ttl).await
+            }
+        }
+    }
+
     pub async fn kv_set_if_absent(
         &self,
         key: &str,
@@ -2232,6 +2251,27 @@ mod tests {
     }
 
     async fn assert_kv_score_and_queue_contract(runtime: &RuntimeState) {
+        runtime
+            .kv_set_many_with_ttl(
+                &[
+                    ("contract:batch:first".to_string(), "alpha".to_string()),
+                    ("contract:batch:second".to_string(), "beta".to_string()),
+                ],
+                Duration::from_secs(1),
+            )
+            .await
+            .expect("set batch with ttl");
+        assert_eq!(
+            runtime
+                .kv_get_many(&[
+                    "contract:batch:first".to_string(),
+                    "contract:batch:second".to_string(),
+                ])
+                .await
+                .expect("get batch values"),
+            vec![Some("alpha".to_string()), Some("beta".to_string())]
+        );
+
         runtime
             .kv_set("contract:ttl:set", "value", Some(Duration::from_millis(30)))
             .await

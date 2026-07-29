@@ -86,19 +86,15 @@ fn new_pool_sticky_collateral_blocks() -> Arc<tokio::sync::Mutex<PoolStickyColla
 async fn provider_risk_control_session_avoidance_mode(
     state: &AppState,
     provider_id: &str,
-) -> ProviderSessionRiskControlAvoidanceMode {
+) -> Result<ProviderSessionRiskControlAvoidanceMode, GatewayError> {
     let provider_ids = [provider_id.to_string()];
-    state
+    Ok(state
         .read_provider_catalog_providers_by_ids(&provider_ids)
-        .await
-        .ok()
-        .and_then(|providers| {
-            providers
-                .into_iter()
-                .find(|provider| provider.id == provider_id)
-        })
+        .await?
+        .into_iter()
+        .find(|provider| provider.id == provider_id)
         .map(|provider| provider_session_risk_control_avoidance_mode(provider.config.as_ref()))
-        .unwrap_or(ProviderSessionRiskControlAvoidanceMode::Disabled)
+        .unwrap_or(ProviderSessionRiskControlAvoidanceMode::Disabled))
 }
 
 fn value_matches_risk_control(value: Option<&serde_json::Value>) -> bool {
@@ -155,7 +151,21 @@ async fn record_provider_session_risk_control_block_if_needed(
     if !candidate_matches_risk_control(&candidate) {
         return;
     }
-    let mode = provider_risk_control_session_avoidance_mode(state, &plan.provider_id).await;
+    let mode = match provider_risk_control_session_avoidance_mode(state, &plan.provider_id).await {
+        Ok(mode) => mode,
+        Err(err) => {
+            warn!(
+                event_name = "provider_session_risk_control_mode_read_failed",
+                log_type = "ops",
+                request_id = %short_request_id(plan.request_id.as_str()),
+                candidate_id = ?plan.candidate_id,
+                provider_id = %plan.provider_id,
+                error = ?err,
+                "gateway failed to read provider session risk-control mode"
+            );
+            return;
+        }
+    };
     if !mode.is_enabled() {
         return;
     }
@@ -195,13 +205,19 @@ async fn provider_session_risk_control_skip_reason(
                 .await?
             {
                 Some("session_risk_control_blocked")
-            } else if state
-                .provider_session_has_runtime_risk_control_block(&plan.provider_id, session_key)
-                .await?
-            {
-                Some("provider_session_risk_control_avoidance")
             } else {
-                None
+                let provider_blocked = state
+                    .provider_session_has_runtime_risk_control_block(&plan.provider_id, session_key)
+                    .await?;
+                if provider_blocked
+                    && provider_risk_control_session_avoidance_mode(state, &plan.provider_id)
+                        .await?
+                        .is_enabled()
+                {
+                    Some("provider_session_risk_control_avoidance")
+                } else {
+                    None
+                }
             }
         } else {
             None
@@ -1610,6 +1626,77 @@ mod tests {
         .expect("blocked session should skip dispatch");
 
         assert_eq!(skip_reason, "session_risk_control_blocked");
+    }
+
+    #[tokio::test]
+    async fn candidate_dispatch_ignores_stale_provider_block_after_mode_disabled() {
+        let provider = StoredProviderCatalogProvider::new(
+            "provider_id".to_string(),
+            "provider".to_string(),
+            None,
+            "codex".to_string(),
+        )
+        .expect("provider should build")
+        .with_transport_fields(
+            true,
+            false,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(json!({
+                "risk_control_session_avoidance": {
+                    "mode": "ignore",
+                    "ttl_seconds": 600
+                }
+            })),
+        );
+        let provider_catalog = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![provider],
+            Vec::new(),
+            Vec::new(),
+        ));
+        let state = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::disabled()
+                    .attach_provider_catalog_repository_for_tests(provider_catalog),
+            );
+        let session_key = "session=dispatch-gate-disabled";
+        let block_key =
+            crate::scheduler::session_risk_control::provider_session_risk_control_block_key(
+                "provider_id",
+                session_key,
+            )
+            .expect("provider block key should build");
+        state
+            .runtime_kv_setex(&block_key, "1", 600)
+            .await
+            .expect("stale provider block should write");
+        let plan = test_plan(None);
+        let report_context = json!({
+            "request_id": plan.request_id,
+            "candidate_id": plan.candidate_id,
+            "candidate_index": 0,
+            "retry_index": 0,
+            "client_session_affinity": {
+                "client_family": "codex",
+                "session_key": session_key,
+            }
+        });
+
+        let skip_reason = provider_session_risk_control_skip_reason(
+            &state,
+            &new_provider_session_risk_control_blocks(),
+            &plan,
+            Some(&report_context),
+        )
+        .await
+        .expect("dispatch gate should read");
+
+        assert_eq!(skip_reason, None);
     }
 
     #[test]

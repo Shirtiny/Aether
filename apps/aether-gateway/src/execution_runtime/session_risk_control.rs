@@ -45,10 +45,7 @@ pub(crate) async fn should_return_and_record_session_risk_control_block_response
     }
 
     if let Err(err) = state
-        .remember_provider_session_risk_control_block_response_if_enabled(
-            &plan.provider_id,
-            session_key,
-        )
+        .remember_provider_session_risk_control_block_if_enabled(&plan.provider_id, session_key)
         .await
     {
         warn!(

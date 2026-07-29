@@ -170,6 +170,53 @@ impl MemoryRuntimeBackend {
         );
     }
 
+    pub(crate) async fn kv_set_many_with_ttl(&self, entries: &[(String, String)], ttl: Duration) {
+        if entries.is_empty() {
+            return;
+        }
+
+        let mut kv = self.kv.lock().await;
+        let now = Instant::now();
+        let incoming_keys = entries
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect::<BTreeSet<_>>();
+        if ttl.is_zero() {
+            for key in incoming_keys {
+                kv.remove(key);
+            }
+            return;
+        }
+
+        prune_kv(&mut kv, now);
+        for key in &incoming_keys {
+            kv.remove(*key);
+        }
+        // Keep a batch indivisible even under an unusually small test capacity.
+        let max_entries = self.config.max_kv_entries.max(incoming_keys.len()).max(1);
+        while kv.len().saturating_add(incoming_keys.len()) > max_entries {
+            let Some(oldest_key) = kv
+                .iter()
+                .min_by_key(|(_, entry)| entry.inserted_at)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            kv.remove(&oldest_key);
+        }
+        let expires_at = Some(now + ttl);
+        for (key, value) in entries {
+            kv.insert(
+                key.clone(),
+                MemoryKvEntry {
+                    value: value.clone(),
+                    inserted_at: now,
+                    expires_at,
+                },
+            );
+        }
+    }
+
     pub(crate) async fn kv_set_if_absent(&self, key: &str, value: String, ttl: Duration) -> bool {
         let mut kv = self.kv.lock().await;
         let now = Instant::now();

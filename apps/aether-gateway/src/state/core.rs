@@ -1180,6 +1180,17 @@ impl AppState {
             .map_err(|err| GatewayError::Internal(err.to_string()))
     }
 
+    async fn runtime_kv_set_many_with_ttl(
+        &self,
+        entries: &[(String, String)],
+        ttl_seconds: u64,
+    ) -> Result<(), GatewayError> {
+        self.runtime_state
+            .kv_set_many_with_ttl(entries, Duration::from_secs(ttl_seconds))
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))
+    }
+
     pub(crate) async fn runtime_kv_get(&self, key: &str) -> Result<Option<String>, GatewayError> {
         self.runtime_state
             .kv_get(key)
@@ -1236,52 +1247,19 @@ impl AppState {
         }
         let ttl_seconds =
             provider_session_risk_control_avoidance_ttl_seconds(provider.config.as_ref());
-        self.runtime_kv_setex(&block_key, "1", ttl_seconds).await?;
-        if mode.blocks_session() {
-            if let Some(session_block_key) = session_risk_control_block_key(session_key) {
-                self.runtime_kv_setex(&session_block_key, provider_id, ttl_seconds)
-                    .await?;
-            }
-        }
-        Ok(true)
-    }
-
-    pub(crate) async fn remember_provider_session_risk_control_block_response_if_enabled(
-        &self,
-        provider_id: &str,
-        session_key: &str,
-    ) -> Result<bool, GatewayError> {
-        let provider_id = provider_id.trim();
-        let Some(block_key) = provider_session_risk_control_block_key(provider_id, session_key)
-        else {
-            return Ok(false);
-        };
-        let provider_ids = [provider_id.to_string()];
-        let Some(provider) = self
-            .read_provider_catalog_providers_by_ids(&provider_ids)
-            .await?
-            .into_iter()
-            .find(|provider| provider.id == provider_id)
-        else {
-            return Ok(false);
-        };
-        let mode = provider_session_risk_control_avoidance_mode(provider.config.as_ref());
-        if !mode.is_enabled() {
-            return Ok(false);
-        }
-        let ttl_seconds =
-            provider_session_risk_control_avoidance_ttl_seconds(provider.config.as_ref());
-        self.runtime_kv_setex(&block_key, "1", ttl_seconds).await?;
+        let mut entries = Vec::with_capacity(if mode.blocks_session() { 2 } else { 1 });
         if mode.blocks_session() {
             if let Some(session_block_key) = session_risk_control_block_key(session_key) {
                 let response =
                     canonical_session_risk_control_block_response(provider_id.to_string());
                 let encoded = serde_json::to_string(&response)
                     .map_err(|err| GatewayError::Internal(err.to_string()))?;
-                self.runtime_kv_setex(&session_block_key, &encoded, ttl_seconds)
-                    .await?;
+                entries.push((session_block_key, encoded));
             }
         }
+        entries.push((block_key, "1".to_string()));
+        self.runtime_kv_set_many_with_ttl(&entries, ttl_seconds)
+            .await?;
         Ok(true)
     }
 
@@ -1771,12 +1749,19 @@ mod tests {
             );
 
         assert!(state
-            .remember_provider_session_risk_control_block_response_if_enabled(
+            .remember_provider_session_risk_control_block_if_enabled(
                 "provider-risk",
                 "session=canonical-response",
             )
             .await
             .expect("block response should write"));
+        assert!(state
+            .provider_session_has_runtime_risk_control_block(
+                "provider-risk",
+                "session=canonical-response",
+            )
+            .await
+            .expect("provider block should read"));
         let response = state
             .session_risk_control_block_response("session=canonical-response")
             .await
