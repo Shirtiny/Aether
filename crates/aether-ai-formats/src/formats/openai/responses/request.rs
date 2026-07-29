@@ -7,10 +7,11 @@ use crate::{
     formats::openai::shared::map_thinking_budget_to_openai_reasoning_effort,
     formats::shared::model_directives::model_supports_codex_max_ultra,
     protocol::canonical::{
-        canonical_response_format_to_openai, canonicalize_tool_arguments,
-        is_claude_messages_request, is_claude_system_instruction, is_claude_thinking_block,
-        is_claude_tool_result, media_data_or_url, namespace_extension_object, openai_content_text,
-        openai_extensions, openai_response_format_to_canonical, openai_responses_extension,
+        canonical_response_format_to_openai, canonicalize_tool_arguments, claude_document_title,
+        file_part_filename, is_claude_messages_request, is_claude_system_instruction,
+        is_claude_thinking_block, is_claude_tool_result, media_data_or_url,
+        namespace_extension_object, openai_content_text, openai_extensions,
+        openai_response_format_to_canonical, openai_responses_extension,
         openai_responses_generation_config, openai_responses_input_to_canonical_messages,
         openai_responses_tool_choice_to_canonical, openai_responses_tools_to_canonical,
         CanonicalContentBlock, CanonicalInstruction, CanonicalRequest, CanonicalRole,
@@ -508,8 +509,15 @@ fn canonical_block_to_responses_input_part(
                     "file_data".to_string(),
                     Value::String(media_data_or_url(media_type, data, file_url)),
                 );
-            }
-            if let Some(value) = filename {
+                item.insert(
+                    "filename".to_string(),
+                    Value::String(file_part_filename(
+                        filename.as_deref(),
+                        media_type.as_deref(),
+                        file_url.as_deref(),
+                    )),
+                );
+            } else if let Some(value) = filename {
                 item.insert("filename".to_string(), Value::String(value.clone()));
             }
             (item.len() > 1).then_some(Value::Object(item))
@@ -853,7 +861,7 @@ fn claude_image_block_to_responses_input_part(block: &Map<String, Value>) -> Opt
 
 fn claude_document_block_to_responses_input_part(block: &Map<String, Value>) -> Option<Value> {
     let source = block.get("source")?.as_object()?;
-    let file_data = match source
+    let (file_data, file_url) = match source
         .get("type")
         .and_then(Value::as_str)
         .unwrap_or_default()
@@ -861,23 +869,26 @@ fn claude_document_block_to_responses_input_part(block: &Map<String, Value>) -> 
         "base64" => {
             let media_type = claude_source_media_type(source).unwrap_or("application/octet-stream");
             let data = claude_source_str(source, "data")?;
-            format!("data:{media_type};base64,{data}")
+            (format!("data:{media_type};base64,{data}"), None)
         }
-        "url" => claude_source_str(source, "url")?.to_string(),
+        "url" => {
+            let url = claude_source_str(source, "url")?;
+            (url.to_string(), Some(url))
+        }
         _ => return None,
     };
 
     let mut part = Map::new();
     part.insert("type".to_string(), Value::String("input_file".to_string()));
     part.insert("file_data".to_string(), Value::String(file_data));
-    if let Some(filename) = block
-        .get("title")
-        .or_else(|| block.get("name"))
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-    {
-        part.insert("filename".to_string(), Value::String(filename.to_string()));
-    }
+    part.insert(
+        "filename".to_string(),
+        Value::String(file_part_filename(
+            claude_document_title(block).as_deref(),
+            claude_source_media_type(source),
+            file_url,
+        )),
+    );
     Some(Value::Object(part))
 }
 

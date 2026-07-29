@@ -1340,6 +1340,18 @@ pub(crate) fn claude_block_to_canonical_block(block: &Value) -> Option<Canonical
     }
 }
 
+/// Claude `document` blocks keep the display name in `title` (some clients use
+/// `name`); both are optional, so this may still come back empty.
+pub(crate) fn claude_document_title(block: &Map<String, Value>) -> Option<String> {
+    block
+        .get("title")
+        .or_else(|| block.get("name"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 pub(crate) fn claude_media_block_to_canonical(
     block: &Map<String, Value>,
     image: bool,
@@ -1401,7 +1413,7 @@ pub(crate) fn claude_media_block_to_canonical(
             file_id: None,
             file_url: None,
             media_type,
-            filename: None,
+            filename: claude_document_title(block),
             extensions: claude_extensions(block, &["type", "source"]),
         }),
         (false, "url") => Some(CanonicalContentBlock::File {
@@ -1412,7 +1424,7 @@ pub(crate) fn claude_media_block_to_canonical(
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned),
             media_type: None,
-            filename: None,
+            filename: claude_document_title(block),
             extensions: claude_extensions(block, &["type", "source"]),
         }),
         _ => Some(CanonicalContentBlock::Unknown {
@@ -2830,6 +2842,11 @@ fn anthropic_document_block_to_openai_chat_part(block: &Map<String, Value>) -> O
                 "type": "file",
                 "file": {
                     "file_data": format!("data:{media_type};base64,{data}"),
+                    "filename": file_part_filename(
+                        claude_document_title(block).as_deref(),
+                        Some(media_type),
+                        None,
+                    ),
                 },
             }))
         }
@@ -2940,8 +2957,15 @@ pub(crate) fn canonical_content_block_to_openai_part(
                     "file_data".to_string(),
                     Value::String(media_data_or_url(media_type, data, file_url)),
                 );
-            }
-            if let Some(value) = filename {
+                file.insert(
+                    "filename".to_string(),
+                    Value::String(file_part_filename(
+                        filename.as_deref(),
+                        media_type.as_deref(),
+                        file_url.as_deref(),
+                    )),
+                );
+            } else if let Some(value) = filename {
                 file.insert("filename".to_string(), Value::String(value.clone()));
             }
             Some(json!({
@@ -3022,8 +3046,15 @@ pub(crate) fn canonical_content_block_to_openai_responses_part(
                     "file_data".to_string(),
                     Value::String(media_data_or_url(media_type, data, file_url)),
                 );
-            }
-            if let Some(value) = filename {
+                file.insert(
+                    "filename".to_string(),
+                    Value::String(file_part_filename(
+                        filename.as_deref(),
+                        media_type.as_deref(),
+                        file_url.as_deref(),
+                    )),
+                );
+            } else if let Some(value) = filename {
                 file.insert("filename".to_string(), Value::String(value.clone()));
             }
             Some(json!({
@@ -5062,6 +5093,75 @@ pub(crate) fn media_data_or_url(
     url.clone().unwrap_or_default()
 }
 
+/// OpenAI-compatible endpoints reject inline file payloads that carry `file_data`
+/// without a `filename`, so every emitter has to fall back to a synthesized name
+/// when the source format left it out (Claude `document` blocks make the title
+/// optional, and Claude Code never sends one).
+pub(crate) fn file_part_filename(
+    filename: Option<&str>,
+    media_type: Option<&str>,
+    reference: Option<&str>,
+) -> String {
+    if let Some(value) = filename.map(str::trim).filter(|value| !value.is_empty()) {
+        return value.to_string();
+    }
+    if let Some(value) = reference
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && !value.starts_with("data:"))
+        .and_then(url_basename)
+    {
+        return value;
+    }
+    format!("document.{}", media_type_extension(media_type))
+}
+
+fn url_basename(url: &str) -> Option<String> {
+    let path = url.split(['?', '#']).next().unwrap_or_default();
+    let path = path
+        .split_once("://")
+        .map_or(path, |(_, rest)| rest)
+        .split_once('/')?
+        .1;
+    let candidate = path.trim_end_matches('/').rsplit('/').next()?.trim();
+    (!candidate.is_empty() && candidate.contains('.')).then(|| candidate.to_string())
+}
+
+fn media_type_extension(media_type: Option<&str>) -> String {
+    let base = media_type
+        .unwrap_or_default()
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let extension = match base.as_str() {
+        "application/pdf" => "pdf",
+        "text/plain" => "txt",
+        "text/markdown" | "text/x-markdown" => "md",
+        "text/csv" => "csv",
+        "text/html" => "html",
+        "application/json" => "json",
+        "application/xml" | "text/xml" => "xml",
+        "application/zip" => "zip",
+        "application/msword" => "doc",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => "docx",
+        "application/vnd.ms-excel" => "xls",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => "xlsx",
+        "application/vnd.ms-powerpoint" => "ppt",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation" => "pptx",
+        other => other
+            .rsplit('/')
+            .next()
+            .filter(|subtype| {
+                !subtype.is_empty()
+                    && subtype.len() <= 8
+                    && subtype.chars().all(|value| value.is_ascii_alphanumeric())
+            })
+            .unwrap_or("bin"),
+    };
+    extension.to_string()
+}
+
 pub(crate) fn offset_openai_annotation_indices(annotation: &Value, offset: i64) -> Value {
     let Some(object) = annotation.as_object() else {
         return annotation.clone();
@@ -5355,6 +5455,49 @@ mod tests {
         CanonicalEmbeddingInput, CanonicalEmbeddingRequest, CanonicalRole, CanonicalUsage,
     };
     use serde_json::{json, Value};
+
+    #[test]
+    fn file_part_filename_falls_back_without_an_explicit_name() {
+        let name = |filename, media_type, reference| {
+            super::file_part_filename(filename, media_type, reference)
+        };
+
+        assert_eq!(
+            name(Some("  spec.pdf "), Some("application/pdf"), None),
+            "spec.pdf"
+        );
+        assert_eq!(name(None, Some("application/pdf"), None), "document.pdf");
+        assert_eq!(
+            name(Some("   "), Some("APPLICATION/PDF"), None),
+            "document.pdf"
+        );
+        assert_eq!(
+            name(None, Some("text/plain; charset=utf-8"), None),
+            "document.txt"
+        );
+        assert_eq!(
+            name(None, Some("application/octet-stream"), None),
+            "document.bin"
+        );
+        assert_eq!(name(None, None, None), "document.bin");
+        assert_eq!(
+            name(None, None, Some("https://example.com/files/report.pdf?v=2")),
+            "report.pdf"
+        );
+        // A bare host has no basename to borrow, and a data URL is not a reference.
+        assert_eq!(
+            name(None, Some("application/pdf"), Some("https://example.com")),
+            "document.pdf"
+        );
+        assert_eq!(
+            name(
+                None,
+                Some("application/pdf"),
+                Some("data:application/pdf;base64,JVBERi0x")
+            ),
+            "document.pdf"
+        );
+    }
 
     #[test]
     fn openai_usage_preserves_official_cache_write_tokens_across_formats() {

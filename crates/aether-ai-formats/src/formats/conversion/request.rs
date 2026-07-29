@@ -742,7 +742,10 @@ mod tests {
                 }),
                 json!({
                     "type": "file",
-                    "file": {"file_data": "data:application/pdf;base64,JVBERi0x"}
+                    "file": {
+                        "file_data": "data:application/pdf;base64,JVBERi0x",
+                        "filename": "document.pdf"
+                    }
                 }),
                 json!({"type": "text", "text": "[File: https://example.com/report.pdf]"}),
                 json!({

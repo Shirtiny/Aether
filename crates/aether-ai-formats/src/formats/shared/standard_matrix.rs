@@ -1493,6 +1493,127 @@ mod tests {
         );
     }
 
+    fn collect_file_payloads(value: &Value, found: &mut Vec<Value>) {
+        match value {
+            Value::Object(map) => {
+                if map.contains_key("file_data") {
+                    found.push(value.clone());
+                }
+                for nested in map.values() {
+                    collect_file_payloads(nested, found);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    collect_file_payloads(item, found);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn claude_request_with_document(document: Value) -> Value {
+        json!({
+            "model": "source-model",
+            "max_tokens": 128,
+            "messages": [
+                {"role": "user", "content": "read the attachment"},
+                {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_read",
+                        "name": "read_file",
+                        "input": {"path": "report.pdf"}
+                    }]
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "toolu_read", "content": "ok"},
+                        document
+                    ]
+                }
+            ]
+        })
+    }
+
+    #[test]
+    fn claude_document_without_title_still_sends_a_filename_to_openai_targets() {
+        let request = claude_request_with_document(json!({
+            "type": "document",
+            "source": {
+                "type": "base64",
+                "media_type": "application/pdf",
+                "data": "JVBERi0x"
+            }
+        }));
+
+        for provider_api_format in [
+            "openai:responses",
+            "openai:responses:compact",
+            "openai:chat",
+        ] {
+            let converted = build_standard_request_body(
+                &request,
+                "claude:messages",
+                "mapped-model",
+                "custom",
+                provider_api_format,
+                "/v1/messages",
+                true,
+                None,
+                None,
+            )
+            .unwrap_or_else(|| panic!("claude:messages -> {provider_api_format} should build"));
+
+            let mut payloads = Vec::new();
+            collect_file_payloads(&converted, &mut payloads);
+            assert_eq!(
+                payloads.len(),
+                1,
+                "{provider_api_format} should keep exactly one inline file payload"
+            );
+            assert_eq!(
+                payloads[0]["filename"], "document.pdf",
+                "{provider_api_format} must name the file, upstreams reject file_data without filename"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_document_title_is_used_as_the_filename_for_openai_targets() {
+        let request = claude_request_with_document(json!({
+            "type": "document",
+            "title": "Q3 报告.pdf",
+            "source": {
+                "type": "base64",
+                "media_type": "application/pdf",
+                "data": "JVBERi0x"
+            }
+        }));
+
+        for provider_api_format in ["openai:responses", "openai:chat"] {
+            let converted = build_standard_request_body(
+                &request,
+                "claude:messages",
+                "mapped-model",
+                "custom",
+                provider_api_format,
+                "/v1/messages",
+                true,
+                None,
+                None,
+            )
+            .unwrap_or_else(|| panic!("claude:messages -> {provider_api_format} should build"));
+
+            let mut payloads = Vec::new();
+            collect_file_payloads(&converted, &mut payloads);
+            assert_eq!(payloads.len(), 1);
+            assert_eq!(payloads[0]["filename"], "Q3 报告.pdf");
+        }
+    }
+
     #[test]
     fn builds_gemini_request_from_openai_chat_with_structured_output_and_images() {
         let request = json!({
