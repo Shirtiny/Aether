@@ -1647,7 +1647,7 @@ fn canonical_session_risk_control_block_response(
         "error": {
             "type": "session_risk_control_blocked",
             "code": "session_risk_control_blocked",
-            "message": "This session is blocked by risk control. Start a new session or wait for the block to expire."
+            "message": "您的请求成功了但是被官方明确风控禁止、阻断，多次尝试将会封号。"
         }
     })
     .to_string();
@@ -1707,6 +1707,10 @@ mod tests {
         assert_eq!(response.status_code, 400);
         assert_eq!(response.provider_id, "provider-risk");
         assert_eq!(body["error"]["code"], "session_risk_control_blocked");
+        assert_eq!(
+            body["error"]["message"],
+            "您的请求成功了但是被官方明确风控禁止、阻断，多次尝试将会封号。"
+        );
     }
 
     #[tokio::test]
