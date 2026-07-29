@@ -1,8 +1,5 @@
-use std::collections::BTreeMap;
-
 use aether_contracts::ExecutionPlan;
 use aether_usage_runtime::{usage_json_text_matches_risk_control, usage_text_matches_risk_control};
-use base64::Engine as _;
 use serde_json::Value;
 use tracing::warn;
 
@@ -17,7 +14,6 @@ pub(crate) async fn should_return_and_record_session_risk_control_block_response
     plan: &ExecutionPlan,
     report_context: Option<&Value>,
     status_code: u16,
-    headers: &BTreeMap<String, String>,
     response_text: Option<&str>,
     response_json: Option<&Value>,
     response_body: &[u8],
@@ -48,14 +44,10 @@ pub(crate) async fn should_return_and_record_session_risk_control_block_response
         return false;
     }
 
-    let body_base64 = base64::engine::general_purpose::STANDARD.encode(response_body);
     if let Err(err) = state
         .remember_provider_session_risk_control_block_response_if_enabled(
             &plan.provider_id,
             session_key,
-            status_code,
-            headers,
-            body_base64.as_str(),
         )
         .await
     {

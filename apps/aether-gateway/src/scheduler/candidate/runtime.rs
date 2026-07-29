@@ -443,6 +443,19 @@ async fn read_provider_session_risk_control_block_map(
         return Ok(ProviderSessionRiskControlSnapshot::default());
     };
 
+    // A session-wide block is independent of the providers in this selection
+    // pass. In particular, format-conversion fallback may enumerate a different
+    // provider set than the provider that originally tripped the block.
+    if state
+        .session_has_runtime_risk_control_block(session_key)
+        .await?
+    {
+        return Ok(ProviderSessionRiskControlSnapshot {
+            session_blocked: true,
+            provider_blocks: BTreeMap::new(),
+        });
+    }
+
     let enabled_modes = providers
         .iter()
         .filter_map(|provider| {
@@ -456,17 +469,6 @@ async fn read_provider_session_risk_control_block_map(
         .collect::<BTreeMap<_, _>>();
     if enabled_modes.is_empty() {
         return Ok(ProviderSessionRiskControlSnapshot::default());
-    }
-
-    if enabled_modes.values().any(|mode| mode.blocks_session())
-        && state
-            .session_has_runtime_risk_control_block(session_key)
-            .await?
-    {
-        return Ok(ProviderSessionRiskControlSnapshot {
-            session_blocked: true,
-            provider_blocks: BTreeMap::new(),
-        });
     }
 
     let mut snapshot = ProviderSessionRiskControlSnapshot {

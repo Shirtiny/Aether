@@ -2327,7 +2327,6 @@ async fn execute_stream_from_frame_stream(
                 &plan,
                 report_context.as_ref(),
                 status_code,
-                &headers,
                 error_response_text.as_deref(),
                 client_body_json.as_ref().or(provider_body_json.as_ref()),
                 &client_error_body,
@@ -4202,6 +4201,20 @@ async fn execute_stream_from_frame_stream(
                 })
             });
         if stream_failed {
+            if let Some(error_message) = stream_terminal_error_message.as_deref() {
+                let failure = build_stream_failure_report(
+                    "stream_terminal_error",
+                    error_message.to_string(),
+                    status_code,
+                );
+                remember_provider_session_risk_control_block_for_failure(
+                    &state_for_report,
+                    &plan_for_report,
+                    report_context_owned.as_ref(),
+                    &failure,
+                )
+                .await;
+            }
             warn!(
                 event_name = "execution_runtime_stream_missing_terminal_event",
                 log_type = "ops",
@@ -6758,6 +6771,124 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"type":"s
         .expect("candidate should be marked failed");
         assert_eq!(candidates[0].status_code, Some(200));
         assert_eq!(candidates[0].error_type.as_deref(), Some("internal"));
+    }
+
+    #[tokio::test]
+    async fn midstream_response_failed_records_session_risk_control_block() {
+        let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
+        let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
+        let mut provider = sample_provider_catalog_provider("provider-g-aisc", "codex");
+        provider.config = Some(json!({
+            "risk_control_session_avoidance": {
+                "mode": "block",
+                "ttl_seconds": 600
+            }
+        }));
+        let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![provider],
+            Vec::new(),
+            vec![sample_provider_catalog_key("key-g-aisc", "provider-g-aisc")],
+        ));
+        let state = AppState::new()
+            .expect("app state should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
+                    Arc::clone(&request_candidate_repository),
+                    Arc::clone(&usage_repository),
+                )
+                .attach_provider_catalog_repository_for_tests(Arc::clone(&provider_catalog_repository)),
+            )
+            .with_usage_runtime_for_tests(UsageRuntimeConfig {
+                enabled: true,
+                ..UsageRuntimeConfig::default()
+            });
+        let session_key = "session=risk-midstream";
+        let risk_message = "This content was flagged for possible cybersecurity risk";
+        let padding = "x".repeat(crate::execution_runtime::MAX_STREAM_PREFETCH_BYTES + 1);
+        let frame_stream = stream! {
+            yield Ok::<Bytes, std::io::Error>(ndjson_frame(StreamFrame {
+                frame_type: StreamFrameType::Headers,
+                payload: StreamFramePayload::Headers {
+                    status_code: 200,
+                    headers: BTreeMap::from([(
+                        "content-type".to_string(),
+                        "text/event-stream".to_string(),
+                    )]),
+                },
+            }));
+            yield Ok::<Bytes, std::io::Error>(ndjson_frame(StreamFrame {
+                frame_type: StreamFrameType::Data,
+                payload: StreamFramePayload::Data {
+                    chunk_b64: None,
+                    text: Some(format!(
+                        concat!(
+                            "event: response.created\n",
+                            "data: {{\"type\":\"response.created\",\"response\":{{\"id\":\"resp_risk\",\"status\":\"in_progress\",\"metadata\":{{\"padding\":\"{}\"}}}}}}\n\n"
+                        ),
+                        padding,
+                    )),
+                },
+            }));
+            tokio::time::sleep(CONTROL_STREAM_PREFETCH_EXTENSION_TIMEOUT + Duration::from_millis(50)).await;
+            yield Ok::<Bytes, std::io::Error>(ndjson_frame(StreamFrame {
+                frame_type: StreamFrameType::Data,
+                payload: StreamFramePayload::Data {
+                    chunk_b64: None,
+                    text: Some(format!(
+                        concat!(
+                            "event: response.failed\n",
+                            "data: {{\"type\":\"response.failed\",\"response\":{{\"id\":\"resp_risk\",\"status\":\"failed\",\"error\":{{\"type\":\"invalid_request_error\",\"code\":\"cyber_policy\",\"message\":\"{}\"}}}}}}\n\n"
+                        ),
+                        risk_message
+                    )),
+                },
+            }));
+        }
+        .boxed();
+        let mut report_context = test_prefetch_report_context(
+            "req-midstream-risk-control",
+            "cand-midstream-risk-control",
+        );
+        report_context["client_session_affinity"] = json!({
+            "client_family": "codex",
+            "session_key": session_key,
+        });
+
+        let response = execute_stream_from_frame_stream(
+            &state,
+            test_responses_stream_plan("req-midstream-risk-control", "cand-midstream-risk-control"),
+            "trace-midstream-risk-control",
+            &test_decision(),
+            "openai_responses_stream",
+            Some("openai_responses_stream_success".to_string()),
+            Some(report_context),
+            crate::clock::current_unix_ms(),
+            Instant::now(),
+            frame_stream,
+            None,
+        )
+        .await
+        .expect("stream execution should succeed")
+        .expect("stream execution should return a response");
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should read");
+        assert!(String::from_utf8_lossy(body.as_ref()).contains(risk_message));
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if state
+                    .session_has_runtime_risk_control_block(session_key)
+                    .await
+                    .expect("runtime block should read")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("midstream risk response should synchronously establish a session block");
     }
 
     #[tokio::test]

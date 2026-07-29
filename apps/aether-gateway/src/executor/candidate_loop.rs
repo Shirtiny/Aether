@@ -187,8 +187,26 @@ async fn provider_session_risk_control_skip_reason(
     blocks: &Arc<tokio::sync::Mutex<ProviderSessionRiskControlLoopBlocks>>,
     plan: &ExecutionPlan,
     report_context: Option<&serde_json::Value>,
-) -> Option<&'static str> {
-    let skip_reason = {
+) -> Result<Option<&'static str>, GatewayError> {
+    let runtime_skip_reason =
+        if let Some(session_key) = client_session_key_from_metadata(report_context) {
+            if state
+                .session_has_runtime_risk_control_block(session_key)
+                .await?
+            {
+                Some("session_risk_control_blocked")
+            } else if state
+                .provider_session_has_runtime_risk_control_block(&plan.provider_id, session_key)
+                .await?
+            {
+                Some("provider_session_risk_control_avoidance")
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+    let local_skip_reason = {
         let blocks = blocks.lock().await;
         if blocks.session_blocked {
             Some("session_risk_control_blocked")
@@ -197,7 +215,11 @@ async fn provider_session_risk_control_skip_reason(
         } else {
             None
         }
-    }?;
+    };
+    let skip_reason = runtime_skip_reason.or(local_skip_reason);
+    let Some(skip_reason) = skip_reason else {
+        return Ok(None);
+    };
     record_skipped_local_request_candidate(
         state,
         plan,
@@ -206,7 +228,7 @@ async fn provider_session_risk_control_skip_reason(
         current_unix_ms(),
     )
     .await;
-    Some(skip_reason)
+    Ok(Some(skip_reason))
 }
 
 async fn remember_pool_sticky_collateral_block_if_enabled(
@@ -629,7 +651,7 @@ where
             attempt.execution_plan(),
             report_context.as_ref(),
         )
-        .await
+        .await?
         {
             apply_local_execution_effect(
                 self.state,
@@ -1043,7 +1065,7 @@ where
             &plan,
             report_context.as_ref(),
         )
-        .await
+        .await?
         {
             apply_local_execution_effect(
                 self.state,
@@ -1414,9 +1436,11 @@ mod tests {
     use std::sync::Arc;
 
     use aether_contracts::{ExecutionPlan, ExecutionTimeouts, RequestBody};
+    use aether_data::repository::provider_catalog::InMemoryProviderCatalogReadRepository;
     use aether_data_contracts::repository::candidates::{
         RequestCandidateStatus, UpsertRequestCandidateRecord,
     };
+    use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogProvider;
     use async_trait::async_trait;
     use serde_json::json;
     use tokio::sync::Mutex;
@@ -1520,6 +1544,72 @@ mod tests {
             "user_id": "user_1",
             "api_key_id": "api_key_1",
         })
+    }
+
+    #[tokio::test]
+    async fn candidate_dispatch_rechecks_runtime_session_risk_control_block() {
+        let provider = StoredProviderCatalogProvider::new(
+            "provider_id".to_string(),
+            "provider".to_string(),
+            None,
+            "codex".to_string(),
+        )
+        .expect("provider should build")
+        .with_transport_fields(
+            true,
+            false,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(json!({
+                "risk_control_session_avoidance": {
+                    "mode": "block",
+                    "ttl_seconds": 600
+                }
+            })),
+        );
+        let provider_catalog = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![provider],
+            Vec::new(),
+            Vec::new(),
+        ));
+        let state = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::disabled()
+                    .attach_provider_catalog_repository_for_tests(provider_catalog),
+            );
+        let session_key = "session=dispatch-gate";
+        assert!(state
+            .remember_provider_session_risk_control_block_if_enabled("provider_id", session_key)
+            .await
+            .expect("runtime block should write"));
+        let plan = test_plan(None);
+        let report_context = json!({
+            "request_id": plan.request_id,
+            "candidate_id": plan.candidate_id,
+            "candidate_index": 0,
+            "retry_index": 0,
+            "client_session_affinity": {
+                "client_family": "codex",
+                "session_key": session_key,
+            }
+        });
+
+        let skip_reason = provider_session_risk_control_skip_reason(
+            &state,
+            &new_provider_session_risk_control_blocks(),
+            &plan,
+            Some(&report_context),
+        )
+        .await
+        .expect("dispatch gate should read")
+        .expect("blocked session should skip dispatch");
+
+        assert_eq!(skip_reason, "session_risk_control_blocked");
     }
 
     #[test]

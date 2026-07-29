@@ -2004,7 +2004,6 @@ async fn execute_execution_runtime_sync_impl(
             &plan,
             report_context.as_ref(),
             result.status_code,
-            &headers,
             local_failover_response_text.as_deref(),
             body_json.as_ref(),
             &body_bytes,

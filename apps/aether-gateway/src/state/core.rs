@@ -20,6 +20,7 @@ use aether_runtime_state::{
     RuntimeSemaphoreSnapshot, RuntimeState,
 };
 use aether_scheduler_core::PROVIDER_KEY_RPM_WINDOW_SECS;
+use base64::Engine as _;
 
 use super::{
     AppState, FrontdoorCorsConfig, FrontdoorRuntimeGuardConfig,
@@ -1249,9 +1250,6 @@ impl AppState {
         &self,
         provider_id: &str,
         session_key: &str,
-        status_code: u16,
-        headers: &BTreeMap<String, String>,
-        body_base64: &str,
     ) -> Result<bool, GatewayError> {
         let provider_id = provider_id.trim();
         let Some(block_key) = provider_session_risk_control_block_key(provider_id, session_key)
@@ -1276,12 +1274,8 @@ impl AppState {
         self.runtime_kv_setex(&block_key, "1", ttl_seconds).await?;
         if mode.blocks_session() {
             if let Some(session_block_key) = session_risk_control_block_key(session_key) {
-                let response = SessionRiskControlBlockResponse {
-                    provider_id: provider_id.to_string(),
-                    status_code,
-                    headers: headers.clone(),
-                    body_base64: body_base64.trim().to_string(),
-                };
+                let response =
+                    canonical_session_risk_control_block_response(provider_id.to_string());
                 let encoded = serde_json::to_string(&response)
                     .map_err(|err| GatewayError::Internal(err.to_string()))?;
                 self.runtime_kv_setex(&session_block_key, &encoded, ttl_seconds)
@@ -1396,9 +1390,14 @@ impl AppState {
         let Some(raw) = self.runtime_kv_get(&block_key).await? else {
             return Ok(None);
         };
-        let Ok(response) = serde_json::from_str::<SessionRiskControlBlockResponse>(raw.as_str())
-        else {
-            return Ok(None);
+        let response = match serde_json::from_str::<SessionRiskControlBlockResponse>(raw.as_str()) {
+            Ok(response) => response,
+            Err(_) => {
+                let Some(provider_id) = session_risk_control_block_provider_id(raw.as_str()) else {
+                    return Ok(None);
+                };
+                canonical_session_risk_control_block_response(provider_id)
+            }
         };
         if response.provider_id.trim().is_empty() {
             return Ok(None);
@@ -1663,13 +1662,37 @@ fn session_risk_control_block_provider_id(raw: &str) -> Option<String> {
     Some(value.to_string())
 }
 
+fn canonical_session_risk_control_block_response(
+    provider_id: String,
+) -> SessionRiskControlBlockResponse {
+    let body = serde_json::json!({
+        "error": {
+            "type": "session_risk_control_blocked",
+            "code": "session_risk_control_blocked",
+            "message": "This session is blocked by risk control. Start a new session or wait for the block to expire."
+        }
+    })
+    .to_string();
+    SessionRiskControlBlockResponse {
+        provider_id,
+        status_code: 400,
+        headers: BTreeMap::from([
+            ("content-type".to_string(), "application/json".to_string()),
+            ("cache-control".to_string(), "no-store".to_string()),
+        ]),
+        body_base64: base64::engine::general_purpose::STANDARD.encode(body),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
+    use aether_data::repository::provider_catalog::InMemoryProviderCatalogReadRepository;
+    use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogProvider;
     use serde_json::json;
 
-    use super::{AppState, PROXY_NODE_CACHE_TTL};
+    use super::{canonical_session_risk_control_block_response, AppState, PROXY_NODE_CACHE_TTL};
     use crate::cache::SchedulerAffinityTarget;
     use crate::data::GatewayDataState;
 
@@ -1690,6 +1713,83 @@ mod tests {
             PROXY_NODE_CACHE_TTL >= std::time::Duration::from_millis(100),
             "proxy node cache window must cover a request's candidate resolution"
         );
+    }
+
+    #[test]
+    fn canonical_session_risk_control_response_does_not_replay_upstream_data() {
+        use base64::Engine as _;
+
+        let response = canonical_session_risk_control_block_response("provider-risk".to_string());
+        let body = base64::engine::general_purpose::STANDARD
+            .decode(response.body_base64)
+            .expect("canonical body should decode");
+        let body: serde_json::Value =
+            serde_json::from_slice(&body).expect("canonical body should be JSON");
+
+        assert_eq!(response.status_code, 400);
+        assert_eq!(response.provider_id, "provider-risk");
+        assert_eq!(body["error"]["code"], "session_risk_control_blocked");
+    }
+
+    #[tokio::test]
+    async fn remembered_session_risk_control_response_is_canonical() {
+        use base64::Engine as _;
+
+        let provider = StoredProviderCatalogProvider::new(
+            "provider-risk".to_string(),
+            "provider-risk".to_string(),
+            None,
+            "codex".to_string(),
+        )
+        .expect("provider should build")
+        .with_transport_fields(
+            true,
+            false,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(json!({
+                "risk_control_session_avoidance": {
+                    "mode": "block",
+                    "ttl_seconds": 600
+                }
+            })),
+        );
+        let state = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::disabled().attach_provider_catalog_repository_for_tests(
+                    Arc::new(InMemoryProviderCatalogReadRepository::seed(
+                        vec![provider],
+                        Vec::new(),
+                        Vec::new(),
+                    )),
+                ),
+            );
+
+        assert!(state
+            .remember_provider_session_risk_control_block_response_if_enabled(
+                "provider-risk",
+                "session=canonical-response",
+            )
+            .await
+            .expect("block response should write"));
+        let response = state
+            .session_risk_control_block_response("session=canonical-response")
+            .await
+            .expect("block response should read")
+            .expect("block response should exist");
+        let body = base64::engine::general_purpose::STANDARD
+            .decode(response.body_base64)
+            .expect("block response should decode");
+        let body: serde_json::Value =
+            serde_json::from_slice(&body).expect("block response should be JSON");
+
+        assert_eq!(response.status_code, 400);
+        assert_eq!(body["error"]["code"], "session_risk_control_blocked");
     }
 
     #[tokio::test]

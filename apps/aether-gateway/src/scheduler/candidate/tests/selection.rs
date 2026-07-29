@@ -864,6 +864,70 @@ async fn risk_control_session_block_mode_blocks_all_candidates_from_runtime_bloc
 }
 
 #[tokio::test]
+async fn risk_control_session_block_survives_format_conversion_candidate_set_change() {
+    let session_key = "session-risk-conversion-fallback";
+    let candidates = Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(vec![
+        provider_key_concurrency_row(
+            "risk-provider-b",
+            "endpoint-risk-b",
+            "key-risk-b",
+            "beta",
+            0,
+            0,
+        ),
+    ]));
+    let provider_catalog = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![
+            provider_with_risk_control_session_avoidance_mode("risk-provider-a", "block"),
+            provider_with_risk_control_session_avoidance_mode("risk-provider-b", "ignore"),
+        ],
+        Vec::new(),
+        vec![
+            sample_key("key-risk-a", "risk-provider-a", Some(10)),
+            sample_key("key-risk-b", "risk-provider-b", Some(10)),
+        ],
+    ));
+    let state = AppState::new()
+        .expect("state should build")
+        .with_data_state_for_tests(
+            GatewayDataState::with_candidate_selection_provider_catalog_quota_and_request_candidates_for_tests(
+                candidates,
+                provider_catalog,
+                Arc::new(InMemoryProviderQuotaRepository::seed(vec![])),
+                Arc::new(InMemoryRequestCandidateRepository::seed(Vec::new())),
+            ),
+        );
+    let remembered = state
+        .remember_provider_session_risk_control_block_if_enabled("risk-provider-a", session_key)
+        .await
+        .expect("runtime block should be recorded");
+    assert!(remembered);
+    let affinity = ClientSessionAffinity::from_session_key(session_key);
+
+    let (selected, skipped) = collect_selectable_candidates_with_skip_reasons_impl(
+        state.data.as_ref(),
+        &state,
+        "openai:chat",
+        "gpt-4.1",
+        false,
+        None,
+        None,
+        Some(&affinity),
+        None,
+        200,
+        false,
+        false,
+    )
+    .await
+    .expect("selection should succeed");
+
+    assert!(selected.is_empty());
+    assert_eq!(skipped.len(), 1);
+    assert_eq!(skipped[0].candidate.provider_id, "risk-provider-b");
+    assert_eq!(skipped[0].skip_reason, "session_risk_control_blocked");
+}
+
+#[tokio::test]
 async fn risk_control_session_runtime_block_respects_current_provider_mode() {
     let session_key = "session-risk-alpha";
     let state = risk_control_session_avoidance_state_with_providers(
