@@ -382,10 +382,19 @@ impl StepDeadlines {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum BoundedSendError {
-    Peer,
+    Peer(super::runtime::PeerError),
     Timeout,
+}
+
+impl BoundedSendError {
+    fn detail(&self) -> &str {
+        match self {
+            Self::Peer(error) => error.0.as_str(),
+            Self::Timeout => "operation timed out",
+        }
+    }
 }
 
 pub(crate) async fn run_codex_ws_session(
@@ -516,13 +525,22 @@ pub(crate) async fn run_codex_ws_session(
         Ok(binding) => binding,
         Err(error) => {
             step_usage.reject(
-                http::StatusCode::BAD_REQUEST.as_u16(),
-                "codex_ws_binding_invalid",
-                "Codex WebSocket binding state was invalid",
+                http::StatusCode::BAD_GATEWAY.as_u16(),
+                "codex_ws_official_binding_invalid",
+                "official Codex WebSocket binding state was invalid",
                 false,
             );
             runtime.abort_candidate(&candidate).await;
-            close_with_error(&mut client, error.message()).await;
+            let request_id = super::runtime::step_usage_request_id(&first_step);
+            log_upstream_protocol_failure(
+                request_id.as_str(),
+                candidate.key_id.as_str(),
+                first_step.model.as_str(),
+                "binding",
+                error.message(),
+                None,
+            );
+            close_with_upstream_protocol_error(&mut client, error.message()).await;
             best_effort_control_send(peer.as_mut(), RelayFrame::Close).await;
             return;
         }
@@ -563,9 +581,23 @@ pub(crate) async fn run_codex_ws_session(
                     best_effort_control_send(peer.as_mut(), RelayFrame::Close).await;
                     return;
                 }
-                Err(error) => {
+                Err(IdleStepError::Client(error)) => {
                     candidate_attempt.abort().await;
                     close_with_error(&mut client, error.message()).await;
+                    best_effort_control_send(peer.as_mut(), RelayFrame::Close).await;
+                    return;
+                }
+                Err(IdleStepError::Upstream(failure)) => {
+                    candidate_attempt.abort().await;
+                    log_upstream_protocol_failure(
+                        binding.last_usage_request_id.as_str(),
+                        candidate.key_id.as_str(),
+                        binding.model.as_str(),
+                        "idle",
+                        failure.reason,
+                        failure.transport_detail.as_deref(),
+                    );
+                    best_effort_control_send(client.as_mut(), RelayFrame::Close).await;
                     best_effort_control_send(peer.as_mut(), RelayFrame::Close).await;
                     return;
                 }
@@ -573,7 +605,7 @@ pub(crate) async fn run_codex_ws_session(
         };
 
         if !already_validated {
-            if let Err(error) = binding.accept_step_fence(&step.fence) {
+            if let Err(error) = binding.accept_step(&step) {
                 candidate_attempt.abort().await;
                 send_not_executed_control(
                     &mut client,
@@ -667,13 +699,15 @@ pub(crate) async fn run_codex_ws_session(
         let deadlines = StepDeadlines::new(step_started, candidate.timeouts());
         let provider_write_deadline = deadlines.write_deadline();
         if let Err(ready_error) = wait_until_ready(peer.as_mut(), provider_write_deadline).await {
-            let reason = match ready_error {
-                BoundedSendError::Timeout => "official_provider_not_ready_timeout",
-                BoundedSendError::Peer => "official_provider_not_ready",
-            };
-            let status_code = match ready_error {
-                BoundedSendError::Timeout => http::StatusCode::GATEWAY_TIMEOUT.as_u16(),
-                BoundedSendError::Peer => http::StatusCode::BAD_GATEWAY.as_u16(),
+            let (reason, status_code) = match ready_error {
+                BoundedSendError::Timeout => (
+                    "official_provider_not_ready_timeout",
+                    http::StatusCode::GATEWAY_TIMEOUT.as_u16(),
+                ),
+                BoundedSendError::Peer(_) => (
+                    "official_provider_not_ready",
+                    http::StatusCode::BAD_GATEWAY.as_u16(),
+                ),
             };
             step_usage.reject(
                 status_code,
@@ -817,9 +851,9 @@ pub(crate) async fn run_codex_ws_session(
         )
         .await;
         if let Err(write_error) = provider_write {
-            let reason = match write_error {
+            let reason = match &write_error {
                 BoundedSendError::Timeout => "official_provider_write_timeout",
-                BoundedSendError::Peer => "official_provider_write_failed",
+                BoundedSendError::Peer(_) => "official_provider_write_failed",
             };
             settlement
                 .finish(
@@ -996,6 +1030,7 @@ struct BindingState {
     binding_epoch_id: String,
     binding_generation: u64,
     seen_step_correlations: SettledResponseHistory,
+    last_usage_request_id: String,
     last_completed_response_id: Option<String>,
     turn_state: Option<(String, String)>,
     settled_response_ids: SettledResponseHistory,
@@ -1072,16 +1107,15 @@ impl BindingState {
                 seen.insert(first_step.fence.correlation_id.clone());
                 seen
             },
+            last_usage_request_id: super::runtime::step_usage_request_id(first_step),
             last_completed_response_id: None,
             turn_state,
             settled_response_ids: SettledResponseHistory::new(),
         })
     }
 
-    fn accept_step_fence(
-        &mut self,
-        fence: &super::protocol::StepFence,
-    ) -> Result<(), ProtocolError> {
+    fn accept_step(&mut self, step: &ResponseCreateStep) -> Result<(), ProtocolError> {
+        let fence = &step.fence;
         if fence.binding_epoch_id != self.binding_epoch_id
             || fence.binding_generation != self.binding_generation
         {
@@ -1096,6 +1130,7 @@ impl BindingState {
         }
         self.seen_step_correlations
             .insert(fence.correlation_id.clone());
+        self.last_usage_request_id = super::runtime::step_usage_request_id(step);
         Ok(())
     }
 }
@@ -1119,7 +1154,7 @@ async fn wait_until_ready(
     let ready = std::future::poll_fn(|context| Pin::new(&mut *peer).poll_ready(context));
     match tokio::time::timeout_at(deadline, ready).await {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(_)) => Err(BoundedSendError::Peer),
+        Ok(Err(error)) => Err(BoundedSendError::Peer(error)),
         Err(_) => Err(BoundedSendError::Timeout),
     }
 }
@@ -1135,7 +1170,7 @@ async fn send_ready_until_with_optional_cpu_budget(
     }
     let start_result = Pin::new(&mut *peer)
         .start_send(frame)
-        .map_err(|_| BoundedSendError::Peer);
+        .map_err(BoundedSendError::Peer);
     // Compression and frame serialization happen synchronously in
     // start_send. Socket readiness was awaited before acquiring the permit,
     // and flushing happens after releasing it.
@@ -1144,7 +1179,7 @@ async fn send_ready_until_with_optional_cpu_budget(
     let flush = std::future::poll_fn(|context| Pin::new(&mut *peer).poll_flush(context));
     match tokio::time::timeout_at(deadline, flush).await {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(_)) => Err(BoundedSendError::Peer),
+        Ok(Err(error)) => Err(BoundedSendError::Peer(error)),
         Err(_) => Err(BoundedSendError::Timeout),
     }
 }
@@ -1182,7 +1217,11 @@ async fn send_client_step_data_frame(
     wait_until_ready(client, deadline).await?;
     let cpu = super::cpu_budget::acquire_large_frame_cpu_budget(relay_frame_payload_len(&frame))
         .await
-        .map_err(|_| BoundedSendError::Peer)?;
+        .map_err(|_| {
+            BoundedSendError::Peer(super::runtime::PeerError(
+                "large frame CPU capacity is unavailable".into(),
+            ))
+        })?;
     send_ready_until_with_optional_cpu_budget(client, frame, deadline, cpu).await
 }
 
@@ -1250,31 +1289,76 @@ async fn receive_first_text(
     }
 }
 
+#[derive(Debug)]
+struct UpstreamProtocolFailure {
+    reason: &'static str,
+    transport_detail: Option<String>,
+}
+
+impl UpstreamProtocolFailure {
+    fn new(reason: &'static str, transport_detail: Option<String>) -> Self {
+        Self {
+            reason,
+            transport_detail,
+        }
+    }
+
+    fn protocol(error: ProtocolError) -> Self {
+        Self::new(error.message(), None)
+    }
+}
+
+#[derive(Debug)]
+enum IdleStepError {
+    Client(ProtocolError),
+    Upstream(UpstreamProtocolFailure),
+}
+
 async fn receive_idle_step(
     client: &mut Box<dyn RelayPeer>,
     official: &mut dyn RelayPeer,
     binding: &BindingState,
-) -> Result<Option<(ResponseCreateStep, tokio::time::Instant)>, ProtocolError> {
+) -> Result<Option<(ResponseCreateStep, tokio::time::Instant)>, IdleStepError> {
     loop {
         tokio::select! {
             biased;
             official_frame = receive_peer(official) => {
-                let frame = official_frame
-                    .map_err(|_| ProtocolError::Upstream("official connection failed while idle"))?;
-                match frame {
-                    Some(RelayFrame::Ping(bytes)) => {
-                        bounded_control_send(official, RelayFrame::Pong(bytes))
-                            .await
-                            .map_err(|_| ProtocolError::Upstream("official WebSocket pong failed"))?;
+                let frame = match official_frame {
+                    Ok(Some(frame)) => frame,
+                    Ok(None) => {
+                        return Err(IdleStepError::Upstream(UpstreamProtocolFailure::new(
+                            "official connection ended while idle",
+                            Some("official WebSocket stream ended without a frame".into()),
+                        )));
                     }
-                    Some(RelayFrame::Pong(_)) => {}
-                    Some(RelayFrame::Text(text)) => {
-                        if !official_text_frame_within_public_limit(&text) {
-                            return Err(ProtocolError::Upstream(
-                                "official Codex frame exceeds the public relay limit",
-                            ));
+                    Err(error) => {
+                        return Err(IdleStepError::Upstream(UpstreamProtocolFailure::new(
+                            "official connection failed while idle",
+                            Some(error.0),
+                        )));
+                    }
+                };
+                match frame {
+                    RelayFrame::Ping(bytes) => {
+                        if let Err(error) = bounded_control_send(official, RelayFrame::Pong(bytes)).await {
+                            return Err(IdleStepError::Upstream(UpstreamProtocolFailure::new(
+                                "official WebSocket pong failed while idle",
+                                Some(error.detail().to_string()),
+                            )));
                         }
-                        let classification = classify_server_event_with_cpu_budget(&text).await?;
+                    }
+                    RelayFrame::Pong(_) => {}
+                    RelayFrame::Text(text) => {
+                        if !official_text_frame_within_public_limit(&text) {
+                            return Err(IdleStepError::Upstream(UpstreamProtocolFailure::new(
+                                "official Codex frame exceeds the public relay limit",
+                                None,
+                            )));
+                        }
+                        let classification = classify_server_event_with_cpu_budget(&text)
+                            .await
+                            .map_err(UpstreamProtocolFailure::protocol)
+                            .map_err(IdleStepError::Upstream)?;
                         let response_id = classification
                             .terminal_response_id
                             .as_deref()
@@ -1284,26 +1368,29 @@ async fn receive_idle_step(
                             continue;
                         }
                         if classification.recognized_business || classification.terminal.is_some() {
-                            return Err(ProtocolError::Upstream(
+                            return Err(IdleStepError::Upstream(UpstreamProtocolFailure::new(
                                 "official Codex emitted an unexpected idle business frame",
-                            ));
+                                None,
+                            )));
                         }
                     }
-                    Some(RelayFrame::Binary(_)) => {
-                        return Err(ProtocolError::Upstream(
+                    RelayFrame::Binary(_) => {
+                        return Err(IdleStepError::Upstream(UpstreamProtocolFailure::new(
                             "official Codex emitted an idle binary frame",
-                        ));
+                            None,
+                        )));
                     }
-                    Some(RelayFrame::Close) | None => {
-                        return Err(ProtocolError::Upstream(
+                    RelayFrame::Close => {
+                        return Err(IdleStepError::Upstream(UpstreamProtocolFailure::new(
                             "official connection closed while idle",
-                        ));
+                            Some("official peer emitted a close frame without close details".into()),
+                        )));
                     }
                 }
             }
             client_frame = receive_peer(client.as_mut()) => {
                 let frame = client_frame
-                    .map_err(|_| ProtocolError::Policy("downstream WebSocket receive failed"))?;
+                    .map_err(|_| IdleStepError::Client(ProtocolError::Policy("downstream WebSocket receive failed")))?;
                 match frame {
                     Some(RelayFrame::Text(text)) => {
                         let started_at = tokio::time::Instant::now();
@@ -1320,18 +1407,19 @@ async fn receive_idle_step(
                             },
                         )
                         .await
+                        .map_err(IdleStepError::Client)
                         .map(|step| Some((step, started_at)));
                     }
                     Some(RelayFrame::Ping(bytes)) => {
                         bounded_control_send(client.as_mut(), RelayFrame::Pong(bytes))
                             .await
-                            .map_err(|_| ProtocolError::Policy("downstream WebSocket send failed"))?;
+                            .map_err(|_| IdleStepError::Client(ProtocolError::Policy("downstream WebSocket send failed")))?;
                     }
                     Some(RelayFrame::Pong(_)) => {}
                     Some(RelayFrame::Binary(_)) => {
-                        return Err(ProtocolError::Policy(
+                        return Err(IdleStepError::Client(ProtocolError::Policy(
                             "binary response.create frames are unsupported",
-                        ));
+                        )));
                     }
                     Some(RelayFrame::Close) | None => return Ok(None),
                 }
@@ -1499,8 +1587,14 @@ where
                 } else {
                     ("codex_ws_first_byte_timeout", "official Codex first business frame timed out")
                 };
-                close_with_timeout_error(client, message).await;
-                return StepOutcome::stream_timeout(error_type, message);
+                return fail_upstream_timeout(
+                    client,
+                    step,
+                    key_id,
+                    error_type,
+                    message,
+                )
+                .await;
             }
             client_frame = receive_peer(client.as_mut()) => {
                 match client_frame {
@@ -1525,27 +1619,50 @@ where
             official_frame = receive_peer(official) => {
                 let frame = match official_frame {
                     Ok(Some(frame)) => frame,
-                    Ok(None) | Err(_) => {
-                        close_with_error_step(client, "official connection ended before a terminal event", deadlines).await;
-                        return StepOutcome::poisoned();
+                    Ok(None) => {
+                        return fail_upstream_protocol(
+                            client,
+                            step,
+                            key_id,
+                            "official connection ended before a terminal event",
+                            Some("official WebSocket stream ended without a frame"),
+                            deadlines,
+                        )
+                        .await;
+                    }
+                    Err(error) => {
+                        return fail_upstream_protocol(
+                            client,
+                            step,
+                            key_id,
+                            "official connection ended before a terminal event",
+                            Some(error.0.as_str()),
+                            deadlines,
+                        )
+                        .await;
                     }
                 };
                 match frame {
                     RelayFrame::Text(text) => {
                         if !official_text_frame_within_public_limit(&text) {
-                            close_with_error_step(
+                            return fail_upstream_protocol(
                                 client,
+                                step,
+                                key_id,
                                 "official Codex frame exceeds the public relay limit",
+                                None,
                                 deadlines,
                             )
                             .await;
-                            return StepOutcome::poisoned();
                         }
                         let classification = match classify_server_event_with_cpu_budget(&text).await {
                             Ok(classification) => classification,
                             Err(error) => {
-                                close_with_error_step(client, error.message(), deadlines).await;
-                                return StepOutcome::poisoned();
+                                let reason = error.message();
+                                return fail_upstream_protocol(
+                                    client, step, key_id, reason, None, deadlines,
+                                )
+                                .await;
                             }
                         };
                         let super::protocol::ServerEventClassification {
@@ -1564,8 +1681,15 @@ where
                         }
                         if created {
                             let Some(response_id) = created_response_id else {
-                                close_with_error_step(client, "response.created omitted response.id", deadlines).await;
-                                return StepOutcome::poisoned();
+                                return fail_upstream_protocol(
+                                    client,
+                                    step,
+                                    key_id,
+                                    "response.created omitted response.id",
+                                    None,
+                                    deadlines,
+                                )
+                                .await;
                             };
                             if binding.settled_response_ids.contains(&response_id) {
                                 continue;
@@ -1574,8 +1698,15 @@ where
                                 if active == response_id {
                                     continue;
                                 }
-                                close_with_error_step(client, "response.created provenance mismatch", deadlines).await;
-                                return StepOutcome::poisoned();
+                                return fail_upstream_protocol(
+                                    client,
+                                    step,
+                                    key_id,
+                                    "response.created provenance mismatch",
+                                    None,
+                                    deadlines,
+                                )
+                                .await;
                             }
                             active_response_id = Some(response_id);
                         }
@@ -1585,8 +1716,15 @@ where
                                     continue;
                                 }
                                 if active_response_id.as_deref() != Some(response_id) {
-                                    close_with_error_step(client, "official event provenance mismatch", deadlines).await;
-                                    return StepOutcome::poisoned();
+                                    return fail_upstream_protocol(
+                                        client,
+                                        step,
+                                        key_id,
+                                        "official event provenance mismatch",
+                                        None,
+                                        deadlines,
+                                    )
+                                    .await;
                                 }
                             }
                         }
@@ -1598,19 +1736,40 @@ where
                             }
                             if kind == TerminalKind::Completed {
                                 let Some(response_id) = terminal_response_id.as_ref() else {
-                                    close_with_error_step(client, "response.completed omitted response.id", deadlines).await;
-                                    return StepOutcome::poisoned();
+                                    return fail_upstream_protocol(
+                                        client,
+                                        step,
+                                        key_id,
+                                        "response.completed omitted response.id",
+                                        None,
+                                        deadlines,
+                                    )
+                                    .await;
                                 };
                                 if active_response_id.as_deref() != Some(response_id.as_str())
                                 {
-                                    close_with_error_step(client, "response terminal provenance mismatch", deadlines).await;
-                                    return StepOutcome::poisoned();
+                                    return fail_upstream_protocol(
+                                        client,
+                                        step,
+                                        key_id,
+                                        "response terminal provenance mismatch",
+                                        None,
+                                        deadlines,
+                                    )
+                                    .await;
                                 }
                             } else if terminal_response_id.as_ref().is_some_and(|response_id| {
                                 active_response_id.as_ref().is_none_or(|active| active != response_id)
                             }) {
-                                close_with_error_step(client, "response terminal provenance mismatch", deadlines).await;
-                                return StepOutcome::poisoned();
+                                return fail_upstream_protocol(
+                                    client,
+                                    step,
+                                    key_id,
+                                    "response terminal provenance mismatch",
+                                    None,
+                                    deadlines,
+                                )
+                                .await;
                             }
                             if let Some(response_id) = terminal_response_id.as_ref() {
                                 binding.settled_response_ids.insert(response_id.clone());
@@ -1652,19 +1811,40 @@ where
                         }
                     }
                     RelayFrame::Ping(bytes) => {
-                        if send_step_frame(official, RelayFrame::Pong(bytes), deadlines).await.is_err() {
-                            close_with_error_step(client, "official WebSocket pong failed", deadlines).await;
-                            return StepOutcome::poisoned();
+                        if let Err(error) = send_step_frame(official, RelayFrame::Pong(bytes), deadlines).await {
+                            return fail_upstream_protocol(
+                                client,
+                                step,
+                                key_id,
+                                "official WebSocket pong failed",
+                                Some(error.detail()),
+                                deadlines,
+                            )
+                            .await;
                         }
                     }
                     RelayFrame::Pong(_) => {}
                     RelayFrame::Binary(_) => {
-                        close_with_error_step(client, "official Codex emitted a binary business frame", deadlines).await;
-                        return StepOutcome::poisoned();
+                        return fail_upstream_protocol(
+                            client,
+                            step,
+                            key_id,
+                            "official Codex emitted a binary business frame",
+                            None,
+                            deadlines,
+                        )
+                        .await;
                     }
                     RelayFrame::Close => {
-                        close_with_error_step(client, "official connection closed before a terminal event", deadlines).await;
-                        return StepOutcome::poisoned();
+                        return fail_upstream_protocol(
+                            client,
+                            step,
+                            key_id,
+                            "official connection closed before a terminal event",
+                            Some("official peer emitted a close frame without close details"),
+                            deadlines,
+                        )
+                        .await;
                     }
                 }
             }
@@ -1782,11 +1962,85 @@ async fn close_with_error_step(
     best_effort_step_send(client.as_mut(), RelayFrame::Close, deadlines).await;
 }
 
-async fn close_with_timeout_error(client: &mut Box<dyn RelayPeer>, message: &'static str) {
+async fn close_with_upstream_protocol_error(
+    client: &mut Box<dyn RelayPeer>,
+    message: &'static str,
+) {
+    let event = upstream_protocol_error_event(message);
+    best_effort_control_send(client.as_mut(), RelayFrame::Text(event.into())).await;
+    best_effort_control_send(client.as_mut(), RelayFrame::Close).await;
+}
+
+fn log_upstream_protocol_failure(
+    request_id: &str,
+    key_id: &str,
+    model: &str,
+    phase: &'static str,
+    message: &'static str,
+    transport_detail: Option<&str>,
+) {
+    tracing::warn!(
+        event_name = "codex_ws_official_protocol_failed",
+        log_type = "ops",
+        status = "failed",
+        status_code = http::StatusCode::BAD_GATEWAY.as_u16(),
+        request_id,
+        key_id,
+        model,
+        protocol_phase = phase,
+        protocol_reason = message,
+        transport_detail = transport_detail.unwrap_or("none"),
+        "official Codex WebSocket protocol failed"
+    );
+}
+
+async fn fail_upstream_protocol(
+    client: &mut Box<dyn RelayPeer>,
+    step: &ResponseCreateStep,
+    key_id: &str,
+    message: &'static str,
+    transport_detail: Option<&str>,
+    deadlines: &StepDeadlines,
+) -> StepOutcome {
+    let request_id = super::runtime::step_usage_request_id(step);
+    log_upstream_protocol_failure(
+        request_id.as_str(),
+        key_id,
+        step.model.as_str(),
+        "response",
+        message,
+        transport_detail,
+    );
+    let event = upstream_protocol_error_event(message);
+    best_effort_step_send(client.as_mut(), RelayFrame::Text(event.into()), deadlines).await;
+    best_effort_step_send(client.as_mut(), RelayFrame::Close, deadlines).await;
+    StepOutcome::poisoned()
+}
+
+async fn fail_upstream_timeout(
+    client: &mut Box<dyn RelayPeer>,
+    step: &ResponseCreateStep,
+    key_id: &str,
+    error_type: &'static str,
+    message: &'static str,
+) -> StepOutcome {
+    tracing::warn!(
+        event_name = "codex_ws_official_timeout",
+        log_type = "ops",
+        status = "failed",
+        status_code = http::StatusCode::GATEWAY_TIMEOUT.as_u16(),
+        request_id = %super::runtime::step_usage_request_id(step),
+        key_id,
+        model = %step.model,
+        timeout_type = error_type,
+        timeout_reason = message,
+        "official Codex WebSocket timed out"
+    );
     let deadline = tokio::time::Instant::now() + TIMEOUT_CLOSE_GRACE;
-    let event = protocol_error_event(message);
+    let event = upstream_timeout_error_event(message);
     let _ = send_until(client.as_mut(), RelayFrame::Text(event.into()), deadline).await;
     let _ = send_until(client.as_mut(), RelayFrame::Close, deadline).await;
+    StepOutcome::stream_timeout(error_type, message)
 }
 
 fn protocol_error_event(message: &'static str) -> String {
@@ -1795,7 +2049,33 @@ fn protocol_error_event(message: &'static str) -> String {
         "status": 400,
         "error": {
             "type": "invalid_request_error",
-            "code": "aether_codex_ws_protocol_error",
+            "code": "websocket_protocol_error",
+            "message": message,
+        }
+    })
+    .to_string()
+}
+
+fn upstream_protocol_error_event(message: &'static str) -> String {
+    serde_json::json!({
+        "type": "error",
+        "status": 502,
+        "error": {
+            "type": "server_error",
+            "code": "upstream_websocket_error",
+            "message": message,
+        }
+    })
+    .to_string()
+}
+
+fn upstream_timeout_error_event(message: &'static str) -> String {
+    serde_json::json!({
+        "type": "error",
+        "status": 504,
+        "error": {
+            "type": "server_error",
+            "code": "upstream_timeout",
             "message": message,
         }
     })
@@ -1817,6 +2097,8 @@ mod tests {
     use async_trait::async_trait;
     use futures_util::{Sink, Stream};
     use serde_json::json;
+    use tracing_subscriber::filter::LevelFilter;
+    use tracing_subscriber::prelude::*;
 
     use super::*;
 
@@ -1837,8 +2119,59 @@ mod tests {
     };
     use crate::codex_ws::CodexWsCandidateLifecycle;
 
+    #[derive(Clone, Default)]
+    struct SharedLogBuffer(Arc<Mutex<Vec<u8>>>);
+
+    struct SharedLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl SharedLogBuffer {
+        fn lines(&self) -> Vec<serde_json::Value> {
+            String::from_utf8(self.0.lock().expect("log buffer should lock").clone())
+                .expect("log buffer should contain UTF-8")
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(|line| serde_json::from_str(line).expect("log line should be JSON"))
+                .collect()
+        }
+    }
+
+    impl std::io::Write for SharedLogWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("log buffer should lock")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::writer::MakeWriter<'a> for SharedLogBuffer {
+        type Writer = SharedLogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            SharedLogWriter(Arc::clone(&self.0))
+        }
+    }
+
+    fn json_log_dispatch(writer: SharedLogBuffer) -> tracing::Dispatch {
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .flatten_event(true)
+                .with_current_span(false)
+                .with_span_list(false)
+                .with_writer(writer)
+                .with_filter(LevelFilter::WARN),
+        );
+        tracing::Dispatch::new(subscriber)
+    }
+
     struct ScriptedPeer {
-        incoming: VecDeque<(Duration, RelayFrame)>,
+        incoming: VecDeque<(Duration, Result<RelayFrame, PeerError>)>,
         sent: Arc<Mutex<Vec<RelayFrame>>>,
         send_delay: Duration,
         flush_delay: Duration,
@@ -1852,6 +2185,16 @@ mod tests {
     impl ScriptedPeer {
         fn new(
             incoming: impl IntoIterator<Item = (Duration, RelayFrame)>,
+        ) -> (Self, Arc<Mutex<Vec<RelayFrame>>>) {
+            Self::new_results(
+                incoming
+                    .into_iter()
+                    .map(|(delay, frame)| (delay, Ok(frame))),
+            )
+        }
+
+        fn new_results(
+            incoming: impl IntoIterator<Item = (Duration, Result<RelayFrame, PeerError>)>,
         ) -> (Self, Arc<Mutex<Vec<RelayFrame>>>) {
             let sent = Arc::new(Mutex::new(Vec::new()));
             (
@@ -1908,7 +2251,7 @@ mod tests {
                 .incoming
                 .pop_front()
                 .expect("front scripted frame should remain until its delay completes");
-            Poll::Ready(Some(Ok(frame)))
+            Poll::Ready(Some(frame))
         }
     }
 
@@ -2023,6 +2366,7 @@ mod tests {
         official: Mutex<Option<Box<dyn RelayPeer>>>,
         fail_first_connect: bool,
         connect_delays: Mutex<VecDeque<Duration>>,
+        handshake_turn_state: Mutex<Option<String>>,
         prepare_delay: Mutex<Option<Duration>>,
         timeouts: Mutex<Option<aether_contracts::ExecutionTimeouts>>,
         gate: ConcurrencyGate,
@@ -2068,6 +2412,7 @@ mod tests {
                 official: Mutex::new(Some(official)),
                 fail_first_connect,
                 connect_delays: Mutex::new(VecDeque::new()),
+                handshake_turn_state: Mutex::new(None),
                 prepare_delay: Mutex::new(None),
                 timeouts: Mutex::new(None),
                 gate: ConcurrencyGate::new("codex-ws-test", 1),
@@ -2105,6 +2450,13 @@ mod tests {
                 .lock()
                 .expect("connect delays should lock")
                 .push_back(delay);
+        }
+
+        fn set_handshake_turn_state(&self, turn_state: impl Into<String>) {
+            *self
+                .handshake_turn_state
+                .lock()
+                .expect("handshake turn state should lock") = Some(turn_state.into());
         }
 
         fn set_prepare_delay(&self, delay: Duration) {
@@ -2215,7 +2567,11 @@ mod tests {
             Ok(ConnectedCandidate {
                 candidate,
                 peer,
-                handshake_turn_state: None,
+                handshake_turn_state: self
+                    .handshake_turn_state
+                    .lock()
+                    .expect("handshake turn state should lock")
+                    .take(),
             })
         }
 
@@ -2393,6 +2749,40 @@ mod tests {
 
     fn text_bytes_contains(text: &Bytes, needle: &str) -> bool {
         std::str::from_utf8(text).is_ok_and(|text| text.contains(needle))
+    }
+
+    #[test]
+    fn public_error_events_are_neutral_and_classified_by_failure_source() {
+        let cases = [
+            (
+                protocol_error_event("client protocol failure"),
+                400,
+                "invalid_request_error",
+                "websocket_protocol_error",
+            ),
+            (
+                upstream_protocol_error_event("upstream protocol failure"),
+                502,
+                "server_error",
+                "upstream_websocket_error",
+            ),
+            (
+                upstream_timeout_error_event("upstream timeout"),
+                504,
+                "server_error",
+                "upstream_timeout",
+            ),
+        ];
+
+        for (event, status, error_type, code) in cases {
+            assert!(!event.to_ascii_lowercase().contains("aether"));
+            let event: serde_json::Value =
+                serde_json::from_str(&event).expect("error event should be valid JSON");
+            assert_eq!(event["type"], json!("error"));
+            assert_eq!(event["status"], json!(status));
+            assert_eq!(event["error"]["type"], json!(error_type));
+            assert_eq!(event["error"]["code"], json!(code));
+        }
     }
 
     fn request_step(correlation_id: &str, previous_response_id: Option<&str>) -> String {
@@ -2573,6 +2963,7 @@ mod tests {
             binding_epoch_id: "epoch-1".into(),
             binding_generation: 1,
             seen_step_correlations: SettledResponseHistory::new(),
+            last_usage_request_id: "ws-idle-test".into(),
             last_completed_response_id: None,
             turn_state: None,
             settled_response_ids: SettledResponseHistory::new(),
@@ -2611,7 +3002,136 @@ mod tests {
         let error = receive_idle_step(&mut client, &mut official, &idle_binding())
             .await
             .expect_err("an idle upstream close must poison the binding");
-        assert_eq!(error.message(), "official connection closed while idle");
+        let IdleStepError::Upstream(error) = error else {
+            panic!("official close should be classified as an upstream failure");
+        };
+        assert_eq!(error.reason, "official connection closed while idle");
+        assert_eq!(
+            error.transport_detail.as_deref(),
+            Some("official peer emitted a close frame without close details")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn active_upstream_transport_error_is_logged_and_returned_as_retryable() {
+        let writer = SharedLogBuffer::default();
+        let dispatch = json_log_dispatch(writer.clone());
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        let transport_detail =
+            "official Codex WS receive failed: WebSocket protocol error: connection reset";
+        let (official, _) =
+            ScriptedPeer::new_results([(Duration::ZERO, Err(PeerError(transport_detail.into())))]);
+        let runtime = TestRuntime::new(Box::new(official), false);
+        let (client, client_sent) = ScriptedPeer::new([(Duration::ZERO, relay_text(request()))]);
+
+        run_codex_ws_session(Box::new(client), &runtime).await;
+
+        assert!(sent_text_contains(&client_sent, "\"status\":502"));
+        assert!(sent_text_contains(
+            &client_sent,
+            "\"code\":\"upstream_websocket_error\""
+        ));
+        assert!(!sent_text_contains(&client_sent, "aether"));
+        let logs = writer.lines();
+        let log = logs
+            .iter()
+            .find(|log| log["event_name"] == "codex_ws_official_protocol_failed")
+            .expect("upstream protocol failure should be logged");
+        assert_eq!(log["protocol_phase"], "response");
+        assert_eq!(
+            log["protocol_reason"],
+            "official connection ended before a terminal event"
+        );
+        assert_eq!(log["transport_detail"], transport_detail);
+        assert_eq!(log["key_id"], "key-1");
+        assert_eq!(log["model"], "gpt-5.4");
+        assert!(log["request_id"]
+            .as_str()
+            .is_some_and(|request_id| request_id.starts_with("ws-")));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn invalid_official_binding_is_502_and_logged_before_provider_write() {
+        let writer = SharedLogBuffer::default();
+        let dispatch = json_log_dispatch(writer.clone());
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        let (official, official_sent) = ScriptedPeer::new([]);
+        let runtime = TestRuntime::new(Box::new(official), false);
+        runtime.set_handshake_turn_state("\u{2603}");
+        let (client, client_sent) = ScriptedPeer::new([(Duration::ZERO, relay_text(request()))]);
+
+        run_codex_ws_session(Box::new(client), &runtime).await;
+
+        assert_eq!(
+            official_sent
+                .lock()
+                .expect("official frames should lock")
+                .iter()
+                .filter(|frame| matches!(frame, RelayFrame::Text(_)))
+                .count(),
+            0
+        );
+        assert!(sent_text_contains(&client_sent, "\"status\":502"));
+        assert!(sent_text_contains(
+            &client_sent,
+            "official server emitted an invalid turn state"
+        ));
+        assert!(!sent_text_contains(&client_sent, "aether"));
+        let logs = writer.lines();
+        let log = logs
+            .iter()
+            .find(|log| log["event_name"] == "codex_ws_official_protocol_failed")
+            .expect("binding failure should be logged");
+        assert_eq!(log["protocol_phase"], "binding");
+        assert_eq!(
+            log["protocol_reason"],
+            "official server emitted an invalid turn state"
+        );
+        assert_eq!(log["transport_detail"], "none");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn idle_upstream_transport_error_is_logged_and_only_closes_downstream() {
+        let writer = SharedLogBuffer::default();
+        let dispatch = json_log_dispatch(writer.clone());
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        let created = json!({"type":"response.created","response":{"id":"resp-1"}}).to_string();
+        let completed = json!({"type":"response.completed","response":{"id":"resp-1"}}).to_string();
+        let transport_detail = "official Codex WS closed: code=1012, reason=\"service restart\"";
+        let (official, _) = ScriptedPeer::new_results([
+            (Duration::ZERO, Ok(relay_text(created))),
+            (Duration::ZERO, Ok(relay_text(completed))),
+            (Duration::ZERO, Err(PeerError(transport_detail.to_string()))),
+        ]);
+        let runtime = TestRuntime::new(Box::new(official), false);
+        let (client, client_sent) = ScriptedPeer::new([(Duration::ZERO, relay_text(request()))]);
+
+        run_codex_ws_session(Box::new(client), &runtime).await;
+
+        let client_sent = client_sent.lock().expect("client frames should lock");
+        assert!(client_sent.contains(&RelayFrame::Close));
+        assert!(!client_sent.iter().any(|frame| match frame {
+            RelayFrame::Text(text) => {
+                text_bytes_contains(text, "upstream_websocket_error")
+                    || text_bytes_contains(text, "websocket_protocol_error")
+            }
+            _ => false,
+        }));
+        drop(client_sent);
+        let logs = writer.lines();
+        let log = logs
+            .iter()
+            .find(|log| log["event_name"] == "codex_ws_official_protocol_failed")
+            .expect("idle upstream failure should be logged");
+        assert_eq!(log["protocol_phase"], "idle");
+        assert_eq!(
+            log["protocol_reason"],
+            "official connection failed while idle"
+        );
+        assert_eq!(log["transport_detail"], transport_detail);
+        assert!(log["request_id"]
+            .as_str()
+            .is_some_and(|request_id| request_id.starts_with("ws-")));
     }
 
     fn sent_text_contains(sent: &Arc<Mutex<Vec<RelayFrame>>>, needle: &str) -> bool {
@@ -3102,6 +3622,9 @@ mod tests {
         assert!(client_sent.iter().any(|frame| match frame {
             RelayFrame::Text(text) => {
                 text_bytes_contains(text, "official event provenance mismatch")
+                    && text_bytes_contains(text, "\"status\":502")
+                    && text_bytes_contains(text, "\"type\":\"server_error\"")
+                    && !text_bytes_contains(text, "aether")
             }
             _ => false,
         }));
@@ -3425,8 +3948,11 @@ mod tests {
         assert!(sent_text_contains(&client_sent, "proven_not_executed"));
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn first_business_frame_timeout_releases_and_reports_once() {
+        let writer = SharedLogBuffer::default();
+        let dispatch = json_log_dispatch(writer.clone());
+        let _guard = tracing::dispatcher::set_default(&dispatch);
         let (official, _) = ScriptedPeer::new([]);
         let runtime = TestRuntime::new(Box::new(official), false);
         runtime.set_timeouts(short_timeouts());
@@ -3438,6 +3964,23 @@ mod tests {
             &client_sent,
             "official Codex first business frame timed out"
         ));
+        assert!(sent_text_contains(&client_sent, "\"status\":504"));
+        assert!(sent_text_contains(
+            &client_sent,
+            "\"code\":\"upstream_timeout\""
+        ));
+        assert!(!sent_text_contains(&client_sent, "aether"));
+        let logs = writer.lines();
+        let log = logs
+            .iter()
+            .find(|log| log["event_name"] == "codex_ws_official_timeout")
+            .expect("upstream timeout should be logged");
+        assert_eq!(log["status_code"], 504);
+        assert_eq!(log["timeout_type"], "codex_ws_first_byte_timeout");
+        assert_eq!(
+            log["timeout_reason"],
+            "official Codex first business frame timed out"
+        );
         assert_eq!(runtime.report_calls.load(Ordering::Relaxed), 1);
         assert_eq!(runtime.report_after_release.load(Ordering::Relaxed), 1);
         assert_eq!(runtime.gate.snapshot().in_flight, 0);

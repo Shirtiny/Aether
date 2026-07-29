@@ -1986,7 +1986,7 @@ fn url_error_kind_name(error: &WebSocketUrlError) -> &'static str {
     }
 }
 
-fn step_usage_request_id(step: &ResponseCreateStep) -> String {
+pub(crate) fn step_usage_request_id(step: &ResponseCreateStep) -> String {
     let source = format!(
         "{}:{}:{}",
         step.fence.binding_epoch_id, step.fence.binding_generation, step.fence.correlation_id
@@ -2344,6 +2344,15 @@ struct OfficialPeer {
     connection: WebSocketConnection,
 }
 
+fn official_close_peer_error(close: Option<(String, String)>) -> PeerError {
+    match close {
+        Some((code, reason)) => PeerError(format!(
+            "official Codex WS closed: code={code}, reason={reason:?}"
+        )),
+        None => PeerError("official Codex WS closed without close details".into()),
+    }
+}
+
 impl Stream for OfficialPeer {
     type Item = Result<RelayFrame, PeerError>;
 
@@ -2354,10 +2363,10 @@ impl Stream for OfficialPeer {
         loop {
             let message = match std::pin::Pin::new(&mut self.connection).poll_next(context) {
                 std::task::Poll::Ready(Some(Ok(message))) => message,
-                std::task::Poll::Ready(Some(Err(_))) => {
-                    return std::task::Poll::Ready(Some(Err(PeerError(
-                        "official Codex WS receive failed".into(),
-                    ))))
+                std::task::Poll::Ready(Some(Err(error))) => {
+                    return std::task::Poll::Ready(Some(Err(PeerError(format!(
+                        "official Codex WS receive failed: {error}"
+                    )))));
                 }
                 std::task::Poll::Ready(None) => return std::task::Poll::Ready(None),
                 std::task::Poll::Pending => return std::task::Poll::Pending,
@@ -2367,7 +2376,11 @@ impl Stream for OfficialPeer {
                 OfficialMessage::Binary(bytes) => RelayFrame::Binary(bytes),
                 OfficialMessage::Ping(bytes) => RelayFrame::Ping(bytes),
                 OfficialMessage::Pong(bytes) => RelayFrame::Pong(bytes),
-                OfficialMessage::Close(_) => RelayFrame::Close,
+                OfficialMessage::Close(close) => {
+                    let close =
+                        close.map(|frame| (frame.code.to_string(), frame.reason.to_string()));
+                    return std::task::Poll::Ready(Some(Err(official_close_peer_error(close))));
+                }
                 OfficialMessage::Frame(_) => continue,
             };
             return std::task::Poll::Ready(Some(Ok(frame)));
@@ -2384,7 +2397,7 @@ impl Sink<RelayFrame> for OfficialPeer {
     ) -> std::task::Poll<Result<(), Self::Error>> {
         std::pin::Pin::new(&mut self.connection)
             .poll_ready(context)
-            .map_err(|_| PeerError("official Codex WS send failed".into()))
+            .map_err(|error| PeerError(format!("official Codex WS send readiness failed: {error}")))
     }
 
     fn start_send(
@@ -2403,7 +2416,7 @@ impl Sink<RelayFrame> for OfficialPeer {
             };
         std::pin::Pin::new(&mut self.connection)
             .start_send(frame)
-            .map_err(|_| PeerError("official Codex WS send failed".into()))
+            .map_err(|error| PeerError(format!("official Codex WS send failed: {error}")))
     }
 
     fn poll_flush(
@@ -2412,7 +2425,7 @@ impl Sink<RelayFrame> for OfficialPeer {
     ) -> std::task::Poll<Result<(), Self::Error>> {
         std::pin::Pin::new(&mut self.connection)
             .poll_flush(context)
-            .map_err(|_| PeerError("official Codex WS send failed".into()))
+            .map_err(|error| PeerError(format!("official Codex WS flush failed: {error}")))
     }
 
     fn poll_close(
@@ -2421,7 +2434,7 @@ impl Sink<RelayFrame> for OfficialPeer {
     ) -> std::task::Poll<Result<(), Self::Error>> {
         std::pin::Pin::new(&mut self.connection)
             .poll_close(context)
-            .map_err(|_| PeerError("official Codex WS close failed".into()))
+            .map_err(|error| PeerError(format!("official Codex WS close failed: {error}")))
     }
 }
 
@@ -2429,6 +2442,23 @@ impl Sink<RelayFrame> for OfficialPeer {
 mod tests {
     use super::*;
     use crate::codex_ws::protocol::StepFence;
+
+    #[test]
+    fn official_close_error_preserves_code_and_reason() {
+        let error = official_close_peer_error(Some((
+            "1012".to_string(),
+            "service restart\nretry later".to_string(),
+        )));
+
+        assert_eq!(
+            error.0,
+            "official Codex WS closed: code=1012, reason=\"service restart\\nretry later\""
+        );
+        assert_eq!(
+            official_close_peer_error(None).0,
+            "official Codex WS closed without close details"
+        );
+    }
 
     #[test]
     fn step_report_context_creates_ws_metadata_without_base_context() {
