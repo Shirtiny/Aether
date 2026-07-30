@@ -26,6 +26,8 @@ const TIMEOUT_CLOSE_GRACE: Duration = Duration::from_millis(100);
 const TERMINAL_DELIVERY_MIN_GRACE: Duration = Duration::from_secs(5);
 const TERMINAL_DELIVERY_MAX_GRACE: Duration = Duration::from_secs(30);
 const MAX_INITIAL_CONNECT_BUDGET: Duration = Duration::from_secs(60);
+const INITIAL_SELECTION_REPLAN_BACKOFF: Duration = Duration::from_millis(25);
+const MAX_INITIAL_SELECTION_REPLANS: usize = 1;
 
 enum OwnedResponseCreateContext {
     First,
@@ -436,17 +438,31 @@ pub(crate) async fn run_codex_ws_session(
         return;
     }
 
-    let candidates = match runtime.select_candidates(&first_step).await {
-        Ok(candidates) => candidates,
-        Err(error) => {
-            send_not_executed_control(
-                &mut client,
-                &first_step,
-                error.reason,
-                error.middle_route_disposition,
-            )
-            .await;
-            return;
+    let mut selection_replans = 0usize;
+    let candidates = loop {
+        match runtime.select_candidates(&first_step).await {
+            Ok(candidates) => break candidates,
+            Err(error)
+                if selection_replans < MAX_INITIAL_SELECTION_REPLANS
+                    && matches!(
+                        error.reason,
+                        "account_catalog_changed_during_selection"
+                            | "account_catalog_transitioning"
+                    ) =>
+            {
+                selection_replans += 1;
+                tokio::time::sleep(INITIAL_SELECTION_REPLAN_BACKOFF).await;
+            }
+            Err(error) => {
+                send_not_executed_control(
+                    &mut client,
+                    &first_step,
+                    error.reason,
+                    error.middle_route_disposition,
+                )
+                .await;
+                return;
+            }
         }
     };
     let initial_connect_budget = initial_connect_budget(&candidates);
@@ -2379,6 +2395,8 @@ mod tests {
         prepare_delay: Mutex<Option<Duration>>,
         timeouts: Mutex<Option<aether_contracts::ExecutionTimeouts>>,
         gate: ConcurrencyGate,
+        select_calls: AtomicUsize,
+        selection_failures: Mutex<VecDeque<&'static str>>,
         validate_calls: AtomicUsize,
         connect_calls: AtomicUsize,
         prepare_calls: AtomicUsize,
@@ -2427,6 +2445,8 @@ mod tests {
                 prepare_delay: Mutex::new(None),
                 timeouts: Mutex::new(None),
                 gate: ConcurrencyGate::new("codex-ws-test", 1),
+                select_calls: AtomicUsize::new(0),
+                selection_failures: Mutex::new(VecDeque::new()),
                 validate_calls: AtomicUsize::new(0),
                 connect_calls: AtomicUsize::new(0),
                 prepare_calls: AtomicUsize::new(0),
@@ -2520,6 +2540,15 @@ mod tests {
             &self,
             first_step: &ResponseCreateStep,
         ) -> Result<Vec<CodexWsCandidate>, StepPreparationError> {
+            self.select_calls.fetch_add(1, Ordering::Relaxed);
+            if let Some(reason) = self
+                .selection_failures
+                .lock()
+                .expect("selection failures should lock")
+                .pop_front()
+            {
+                return Err(StepPreparationError::retain(reason));
+            }
             let mut candidates = Vec::new();
             if self.fail_first_connect {
                 candidates.push(self.configured_candidate(first_step, "provider-failed"));
@@ -3277,6 +3306,54 @@ mod tests {
         assert_eq!(runtime.prepare_calls.load(Ordering::Relaxed), 1);
         assert_eq!(runtime.report_calls.load(Ordering::Relaxed), 1);
         assert_eq!(runtime.gate.snapshot().in_flight, 0);
+    }
+
+    #[tokio::test]
+    async fn catalog_change_during_initial_selection_replans_once_without_client_reconnect() {
+        let created = json!({
+            "type": "response.created",
+            "response": {"id": "resp-replan", "model": "gpt-5.4"}
+        })
+        .to_string();
+        let terminal = json!({
+            "type": "response.completed",
+            "response": {"id": "resp-replan", "model": "gpt-5.4"}
+        })
+        .to_string();
+        let (official, official_sent) = ScriptedPeer::new([
+            (Duration::ZERO, relay_text(created)),
+            (Duration::ZERO, relay_text(terminal.clone())),
+        ]);
+        let runtime = TestRuntime::new(Box::new(official), false);
+        runtime
+            .selection_failures
+            .lock()
+            .expect("selection failures should lock")
+            .push_back("account_catalog_changed_during_selection");
+        let (client, client_sent) = ScriptedPeer::new([
+            (Duration::ZERO, relay_text(request())),
+            (Duration::from_millis(20), RelayFrame::Close),
+        ]);
+
+        run_codex_ws_session(Box::new(client), &runtime).await;
+
+        assert_eq!(runtime.select_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(runtime.report_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            official_sent
+                .lock()
+                .expect("official frames should lock")
+                .iter()
+                .filter(|frame| matches!(frame, RelayFrame::Text(_)))
+                .count(),
+            1
+        );
+        let client_sent = client_sent.lock().expect("client frames should lock");
+        assert!(client_sent.contains(&relay_text(terminal)));
+        assert!(!client_sent.iter().any(|frame| match frame {
+            RelayFrame::Text(text) => text_bytes_contains(text, "codex_official_ws.not_executed"),
+            _ => false,
+        }));
     }
 
     #[tokio::test]

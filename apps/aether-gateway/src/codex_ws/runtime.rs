@@ -848,6 +848,13 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
         }
         super::hot_state::bind_catalog_snapshot_generation(&self.state, &shared_catalog.generation)
             .map_err(|_| StepPreparationError::retain("account_catalog_snapshot_bind_failed"))?;
+        let catalog_fence_v2_enabled =
+            super::hot_state::ensure_catalog_fence_feature_lease(&self.state)
+                .await
+                .map_err(|_| {
+                    StepPreparationError::retain("catalog_fence_feature_state_unavailable")
+                })?
+                .enabled;
         let selected_scheduler_epoch = self.state.scheduler_affinity_epoch();
         let parts = self
             .request_parts()
@@ -902,11 +909,6 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
         .await
         .map_err(|_| StepPreparationError::retain("candidate_planning_failed"))?;
 
-        let catalog_fence_v2_enabled =
-            crate::codex_ws_config::read_codex_ws_feature_flags(&self.state)
-                .await
-                .flags
-                .catalog_fence_v2_enabled;
         let catalog_resource_leases = if catalog_fence_v2_enabled {
             let mut seeds = Vec::with_capacity(attempts.len().saturating_mul(2));
             for planned in &attempts {
@@ -1022,6 +1024,23 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
                 }
             };
 
+        if let Err(reason) = super::hot_state::validate_candidate_selection_hot_leases(
+            &self.state,
+            &shared_global,
+            &shared_catalog,
+        )
+        .await
+        {
+            crate::executor::candidate_loop::mark_unused_local_candidates(
+                &self.state,
+                attempts
+                    .into_iter()
+                    .map(|planned| planned.attempt)
+                    .collect(),
+            )
+            .await;
+            return Err(StepPreparationError::retain(reason));
+        }
         if let Err(error) = self.validate_runtime_fences() {
             crate::executor::candidate_loop::mark_unused_local_candidates(
                 &self.state,

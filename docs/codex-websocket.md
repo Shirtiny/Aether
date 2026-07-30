@@ -135,12 +135,15 @@ DELETE /api/admin/system/configs/codex_ws
 ```
 
 也可显式写入前两个 gate 为 `true`。只有这两个 gate 都为 `true` 才开放入口和官方原生
-Connector。管理 API 写入或删除成功后会立即更新进程内原子快照，不要求重启。
+Connector。管理 API 写入或删除成功后会立即发布共享的 v2 reader runtime-state 快照，
+不要求重启；所有 gateway 实例读取同一份 feature lease，不能依赖进程内缓存。会话级
+global gate 仍保留进程内原子代际，并由共享 global hot-state 在跨实例执行 fence 上兜底。
 每次限制性变更都会推进 generation；已保留连接在后续执行 fence 发现 generation
 改变后失败关闭，不能继续使用旧配置写上游。
 
 `catalog_fence_v2_enabled=false` 不关闭 WebSocket，只让读路径继续使用 v1 的全局
-catalog 硬 fence。Provider/Endpoint 写路径始终同时发布 v1 和 v2 Redis 状态，因此
+catalog 硬 fence。Provider/Endpoint 写路径先通过共享目录写锁串行化分类，再始终同时发布
+v1 和 v2 Redis 状态，因此
 该开关可动态关闭作为无 schema 回滚手段。
 
 全局熔断不是环境变量。`AETHER_CODEX_WS_*` 环境变量只负责容量和 worker 调优，
@@ -293,8 +296,11 @@ v2 将目录变更分为三类：
 | 调度预设、优先级、权重、健康分等 | 当前 step 允许执行并交付 terminal，随后 `close_after_terminal` |
 | 禁用/删除、代理、Endpoint URL、Header/Body、固定 profile 或未知执行字段 | Provider write 前拒绝，并发送未执行证明 |
 
-分类采用显式软字段 allow-list；新增或未知配置默认进入 hard fence。全局 catalog
-generation 只负责冷选择与本地缓存一致性，不再使无关 Provider 的已绑定连接失败。
+分类采用显式软字段 allow-list；新增或未知配置默认进入 hard fence。Provider/Endpoint 写入先在共享
+目录写锁内完成权威重读和分类；读取端只为缺失的资源 key 做初始化，不会用候选规划中的旧 seed
+覆盖已经存在的禁用状态。候选构建完成后会再次校验 global/catalog lease；若目录在规划期间变化，
+首次选择最多重规划一次，不会把旧 transport 绑定到新代际。全局 catalog generation 只负责冷选择
+与本地缓存一致性，不再使无关 Provider 的已绑定连接失败。
 限制性账号变更、配额耗尽或候选失效会阻止后续写入。只有存在
 `codex_official_ws.not_executed` 证明时才允许发出 `client_reconnect`；否则关闭连接，
 由上层决定是否让用户显式重试。

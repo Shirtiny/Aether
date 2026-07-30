@@ -70,6 +70,35 @@ impl AppState {
         }
     }
 
+    async fn restore_codex_ws_catalog_hot_before_write(
+        &self,
+        mutation: crate::codex_ws::hot_state::CodexWsHotMutation,
+        error: GatewayError,
+    ) -> GatewayError {
+        match crate::codex_ws::hot_state::finish_catalog_hot_mutation(self, mutation).await {
+            Ok(()) => error,
+            Err(recovery_error) => GatewayError::Internal(format!(
+                "{error:?}; failed to restore catalog hot state before write: {recovery_error:?}"
+            )),
+        }
+    }
+
+    async fn finish_provider_catalog_write<T>(
+        &self,
+        lock: crate::codex_ws::hot_state::CodexWsCatalogWriteLock,
+        result: Result<T, GatewayError>,
+    ) -> Result<T, GatewayError> {
+        match crate::codex_ws::hot_state::release_catalog_write_lock(self, lock).await {
+            Ok(()) => result,
+            Err(release_error) => match result {
+                Ok(_) => Err(release_error),
+                Err(error) => Err(GatewayError::Internal(format!(
+                    "{error:?}; failed to release provider catalog write lock: {release_error:?}"
+                ))),
+            },
+        }
+    }
+
     async fn finish_codex_ws_endpoint_hot_after_authoritative_read(
         &self,
         mutation: crate::codex_ws::hot_state::CodexWsCatalogResourceMutation,
@@ -695,6 +724,23 @@ impl AppState {
         provider: &provider_catalog::StoredProviderCatalogProvider,
         shift_existing_priorities_from: Option<i32>,
     ) -> Result<Option<provider_catalog::StoredProviderCatalogProvider>, GatewayError> {
+        let lock = crate::codex_ws::hot_state::begin_catalog_write_lock(self).await?;
+        let result = self
+            .create_provider_catalog_provider_locked(
+                provider,
+                shift_existing_priorities_from,
+                &lock,
+            )
+            .await;
+        self.finish_provider_catalog_write(lock, result).await
+    }
+
+    async fn create_provider_catalog_provider_locked(
+        &self,
+        provider: &provider_catalog::StoredProviderCatalogProvider,
+        shift_existing_priorities_from: Option<i32>,
+        write_lock: &crate::codex_ws::hot_state::CodexWsCatalogWriteLock,
+    ) -> Result<Option<provider_catalog::StoredProviderCatalogProvider>, GatewayError> {
         let hot_mutation = if provider.provider_type.trim().eq_ignore_ascii_case("codex") {
             let seed = crate::codex_ws::hot_state::CodexWsCatalogResourceSeed {
                 kind: crate::codex_ws::hot_state::CatalogResourceKind::Provider,
@@ -713,10 +759,12 @@ impl AppState {
         } else {
             None
         };
+        crate::codex_ws::hot_state::confirm_catalog_write_lock(self, write_lock).await?;
         let created = self
             .data
             .create_provider_catalog_provider(provider, shift_existing_priorities_from)
             .await;
+        crate::codex_ws::hot_state::confirm_catalog_write_lock(self, write_lock).await?;
         if let Some(mutation) = hot_mutation {
             self.data.clear_provider_catalog_cache();
             let authoritative = self
@@ -737,33 +785,60 @@ impl AppState {
         &self,
         provider: &provider_catalog::StoredProviderCatalogProvider,
     ) -> Result<Option<provider_catalog::StoredProviderCatalogProvider>, GatewayError> {
-        let existing = self
+        let lock = crate::codex_ws::hot_state::begin_catalog_write_lock(self).await?;
+        let result = self
+            .update_provider_catalog_provider_locked(provider, &lock)
+            .await;
+        self.finish_provider_catalog_write(lock, result).await
+    }
+
+    async fn update_provider_catalog_provider_locked(
+        &self,
+        provider: &provider_catalog::StoredProviderCatalogProvider,
+        write_lock: &crate::codex_ws::hot_state::CodexWsCatalogWriteLock,
+    ) -> Result<Option<provider_catalog::StoredProviderCatalogProvider>, GatewayError> {
+        self.data.clear_provider_catalog_cache();
+        let preliminary_existing = self
             .data
             .list_provider_catalog_providers_by_ids(std::slice::from_ref(&provider.id))
             .await
             .map_err(|err| GatewayError::Internal(err.to_string()))?
             .into_iter()
             .next();
-        let relevant = existing
+        let relevant = preliminary_existing
             .as_ref()
             .is_some_and(|existing| existing.provider_type.trim().eq_ignore_ascii_case("codex"))
             || provider.provider_type.trim().eq_ignore_ascii_case("codex");
-        let impact = if relevant {
-            Some(
-                existing
+        let hot_mutation = if relevant {
+            let legacy = crate::codex_ws::hot_state::begin_catalog_hot_mutation(self).await?;
+            self.data.clear_provider_catalog_cache();
+            let existing = match self
+                .data
+                .list_provider_catalog_providers_by_ids(std::slice::from_ref(&provider.id))
+                .await
+            {
+                Ok(providers) => providers.into_iter().next(),
+                Err(error) => {
+                    return Err(self
+                        .restore_codex_ws_catalog_hot_before_write(
+                            legacy,
+                            GatewayError::Internal(error.to_string()),
+                        )
+                        .await);
+                }
+            };
+            let still_relevant = existing.as_ref().is_some_and(|existing| {
+                existing.provider_type.trim().eq_ignore_ascii_case("codex")
+            }) || provider.provider_type.trim().eq_ignore_ascii_case("codex");
+            if still_relevant {
+                let impact = existing
                     .as_ref()
                     .and_then(|existing| {
                         crate::codex_ws::catalog_fence::classify_provider_update(existing, provider)
                     })
                     .unwrap_or(
                         crate::codex_ws::catalog_fence::CatalogMutationImpact::SelectionOnly,
-                    ),
-            )
-        } else {
-            None
-        };
-        let hot_mutation = match impact {
-            Some(impact) => {
+                    );
                 let (eligible, ineligible_reason) = existing
                     .as_ref()
                     .map(codex_ws_provider_resource_eligibility)
@@ -775,15 +850,21 @@ impl AppState {
                     ineligible_reason,
                 };
                 Some(
-                    crate::codex_ws::hot_state::begin_catalog_resource_hot_mutation(
-                        self, &seed, impact,
+                    crate::codex_ws::hot_state::begin_catalog_resource_hot_mutation_with_legacy(
+                        self, legacy, &seed, impact,
                     )
                     .await?,
                 )
+            } else {
+                crate::codex_ws::hot_state::finish_catalog_hot_mutation(self, legacy).await?;
+                None
             }
-            None => None,
+        } else {
+            None
         };
+        crate::codex_ws::hot_state::confirm_catalog_write_lock(self, write_lock).await?;
         let updated = self.data.update_provider_catalog_provider(provider).await;
+        crate::codex_ws::hot_state::confirm_catalog_write_lock(self, write_lock).await?;
         if let Some(mutation) = hot_mutation {
             self.data.clear_provider_catalog_cache();
             let authoritative = self
@@ -804,41 +885,84 @@ impl AppState {
         &self,
         provider_id: &str,
     ) -> Result<bool, GatewayError> {
-        let existing = self
+        let lock = crate::codex_ws::hot_state::begin_catalog_write_lock(self).await?;
+        let result = self
+            .delete_provider_catalog_provider_locked(provider_id, &lock)
+            .await;
+        self.finish_provider_catalog_write(lock, result).await
+    }
+
+    async fn delete_provider_catalog_provider_locked(
+        &self,
+        provider_id: &str,
+        write_lock: &crate::codex_ws::hot_state::CodexWsCatalogWriteLock,
+    ) -> Result<bool, GatewayError> {
+        self.data.clear_provider_catalog_cache();
+        let preliminary_existing = self
             .data
             .list_provider_catalog_providers_by_ids(&[provider_id.to_string()])
             .await
             .map_err(|err| GatewayError::Internal(err.to_string()))?
             .into_iter()
             .next();
-        let hot_mutation = match existing
+        let relevant = preliminary_existing
             .as_ref()
-            .filter(|provider| provider.provider_type.trim().eq_ignore_ascii_case("codex"))
-        {
-            Some(provider) => {
-                let (eligible, ineligible_reason) =
-                    codex_ws_provider_resource_eligibility(provider);
-                let seed = crate::codex_ws::hot_state::CodexWsCatalogResourceSeed {
-                    kind: crate::codex_ws::hot_state::CatalogResourceKind::Provider,
-                    id: provider_id.to_string(),
-                    eligible,
-                    ineligible_reason,
-                };
-                Some(
-                    crate::codex_ws::hot_state::begin_catalog_resource_hot_mutation(
-                        self,
-                        &seed,
-                        crate::codex_ws::catalog_fence::CatalogMutationImpact::HardFence,
+            .is_some_and(|provider| provider.provider_type.trim().eq_ignore_ascii_case("codex"));
+        let hot_mutation = if relevant {
+            let legacy = crate::codex_ws::hot_state::begin_catalog_hot_mutation(self).await?;
+            self.data.clear_provider_catalog_cache();
+            let existing = match self
+                .data
+                .list_provider_catalog_providers_by_ids(&[provider_id.to_string()])
+                .await
+            {
+                Ok(providers) => providers.into_iter().next(),
+                Err(error) => {
+                    return Err(self
+                        .restore_codex_ws_catalog_hot_before_write(
+                            legacy,
+                            GatewayError::Internal(error.to_string()),
+                        )
+                        .await);
+                }
+            };
+            match existing
+                .as_ref()
+                .filter(|provider| provider.provider_type.trim().eq_ignore_ascii_case("codex"))
+            {
+                Some(provider) => {
+                    let (eligible, ineligible_reason) =
+                        codex_ws_provider_resource_eligibility(provider);
+                    let seed = crate::codex_ws::hot_state::CodexWsCatalogResourceSeed {
+                        kind: crate::codex_ws::hot_state::CatalogResourceKind::Provider,
+                        id: provider_id.to_string(),
+                        eligible,
+                        ineligible_reason,
+                    };
+                    Some(
+                        crate::codex_ws::hot_state::begin_catalog_resource_hot_mutation_with_legacy(
+                            self,
+                            legacy,
+                            &seed,
+                            crate::codex_ws::catalog_fence::CatalogMutationImpact::HardFence,
+                        )
+                        .await?,
                     )
-                    .await?,
-                )
+                }
+                None => {
+                    crate::codex_ws::hot_state::finish_catalog_hot_mutation(self, legacy).await?;
+                    None
+                }
             }
-            None => None,
+        } else {
+            None
         };
+        crate::codex_ws::hot_state::confirm_catalog_write_lock(self, write_lock).await?;
         let deleted = self
             .data
             .delete_provider_catalog_provider(provider_id)
             .await;
+        crate::codex_ws::hot_state::confirm_catalog_write_lock(self, write_lock).await?;
         if let Some(mutation) = hot_mutation {
             self.data.clear_provider_catalog_cache();
             let authoritative = self
@@ -894,6 +1018,18 @@ impl AppState {
         &self,
         endpoint: &provider_catalog::StoredProviderCatalogEndpoint,
     ) -> Result<Option<provider_catalog::StoredProviderCatalogEndpoint>, GatewayError> {
+        let lock = crate::codex_ws::hot_state::begin_catalog_write_lock(self).await?;
+        let result = self
+            .create_provider_catalog_endpoint_locked(endpoint, &lock)
+            .await;
+        self.finish_provider_catalog_write(lock, result).await
+    }
+
+    async fn create_provider_catalog_endpoint_locked(
+        &self,
+        endpoint: &provider_catalog::StoredProviderCatalogEndpoint,
+        write_lock: &crate::codex_ws::hot_state::CodexWsCatalogWriteLock,
+    ) -> Result<Option<provider_catalog::StoredProviderCatalogEndpoint>, GatewayError> {
         let hot_mutation = if self.endpoint_is_codex_ws_relevant(endpoint).await? {
             let seed = crate::codex_ws::hot_state::CodexWsCatalogResourceSeed {
                 kind: crate::codex_ws::hot_state::CatalogResourceKind::Endpoint,
@@ -912,7 +1048,9 @@ impl AppState {
         } else {
             None
         };
+        crate::codex_ws::hot_state::confirm_catalog_write_lock(self, write_lock).await?;
         let created = self.data.create_provider_catalog_endpoint(endpoint).await;
+        crate::codex_ws::hot_state::confirm_catalog_write_lock(self, write_lock).await?;
         if let Some(mutation) = hot_mutation {
             self.data.clear_provider_catalog_cache();
             let authoritative = self
@@ -933,7 +1071,20 @@ impl AppState {
         &self,
         endpoint: &provider_catalog::StoredProviderCatalogEndpoint,
     ) -> Result<Option<provider_catalog::StoredProviderCatalogEndpoint>, GatewayError> {
-        let existing = self
+        let lock = crate::codex_ws::hot_state::begin_catalog_write_lock(self).await?;
+        let result = self
+            .update_provider_catalog_endpoint_locked(endpoint, &lock)
+            .await;
+        self.finish_provider_catalog_write(lock, result).await
+    }
+
+    async fn update_provider_catalog_endpoint_locked(
+        &self,
+        endpoint: &provider_catalog::StoredProviderCatalogEndpoint,
+        write_lock: &crate::codex_ws::hot_state::CodexWsCatalogWriteLock,
+    ) -> Result<Option<provider_catalog::StoredProviderCatalogEndpoint>, GatewayError> {
+        self.data.clear_provider_catalog_cache();
+        let preliminary_existing = self
             .data
             .list_provider_catalog_endpoints_by_ids(std::slice::from_ref(&endpoint.id))
             .await
@@ -941,32 +1092,60 @@ impl AppState {
             .into_iter()
             .next();
         let relevant = self.endpoint_is_codex_ws_relevant(endpoint).await?
-            || match existing.as_ref() {
+            || match preliminary_existing.as_ref() {
                 Some(existing) => self.endpoint_is_codex_ws_relevant(existing).await?,
                 None => false,
             };
-        let impact = if relevant {
-            Some(
-                existing
+        let hot_mutation = if relevant {
+            let legacy = crate::codex_ws::hot_state::begin_catalog_hot_mutation(self).await?;
+            self.data.clear_provider_catalog_cache();
+            let existing = match self
+                .data
+                .list_provider_catalog_endpoints_by_ids(std::slice::from_ref(&endpoint.id))
+                .await
+            {
+                Ok(endpoints) => endpoints.into_iter().next(),
+                Err(error) => {
+                    return Err(self
+                        .restore_codex_ws_catalog_hot_before_write(
+                            legacy,
+                            GatewayError::Internal(error.to_string()),
+                        )
+                        .await);
+                }
+            };
+            let proposed_relevant = match self.endpoint_is_codex_ws_relevant(endpoint).await {
+                Ok(relevant) => relevant,
+                Err(error) => {
+                    return Err(self
+                        .restore_codex_ws_catalog_hot_before_write(legacy, error)
+                        .await);
+                }
+            };
+            let existing_relevant = match existing.as_ref() {
+                Some(existing) => match self.endpoint_is_codex_ws_relevant(existing).await {
+                    Ok(relevant) => relevant,
+                    Err(error) => {
+                        return Err(self
+                            .restore_codex_ws_catalog_hot_before_write(legacy, error)
+                            .await);
+                    }
+                },
+                None => false,
+            };
+            let still_relevant = proposed_relevant || existing_relevant;
+            if still_relevant {
+                let impact = existing
                     .as_ref()
                     .and_then(|existing| {
                         crate::codex_ws::catalog_fence::classify_endpoint_update(existing, endpoint)
                     })
                     .unwrap_or(
                         crate::codex_ws::catalog_fence::CatalogMutationImpact::SelectionOnly,
-                    ),
-            )
-        } else {
-            None
-        };
-        let hot_mutation = match impact {
-            Some(impact) => {
-                let eligible = match existing.as_ref() {
-                    Some(existing) => {
-                        existing.is_active && self.endpoint_is_codex_ws_relevant(existing).await?
-                    }
-                    None => false,
-                };
+                    );
+                let eligible = existing
+                    .as_ref()
+                    .is_some_and(|existing| existing.is_active && existing_relevant);
                 let seed = crate::codex_ws::hot_state::CodexWsCatalogResourceSeed {
                     kind: crate::codex_ws::hot_state::CatalogResourceKind::Endpoint,
                     id: endpoint.id.clone(),
@@ -974,15 +1153,21 @@ impl AppState {
                     ineligible_reason: "endpoint_ineligible",
                 };
                 Some(
-                    crate::codex_ws::hot_state::begin_catalog_resource_hot_mutation(
-                        self, &seed, impact,
+                    crate::codex_ws::hot_state::begin_catalog_resource_hot_mutation_with_legacy(
+                        self, legacy, &seed, impact,
                     )
                     .await?,
                 )
+            } else {
+                crate::codex_ws::hot_state::finish_catalog_hot_mutation(self, legacy).await?;
+                None
             }
-            None => None,
+        } else {
+            None
         };
+        crate::codex_ws::hot_state::confirm_catalog_write_lock(self, write_lock).await?;
         let updated = self.data.update_provider_catalog_endpoint(endpoint).await;
+        crate::codex_ws::hot_state::confirm_catalog_write_lock(self, write_lock).await?;
         if let Some(mutation) = hot_mutation {
             self.data.clear_provider_catalog_cache();
             let authoritative = self
@@ -1003,44 +1188,91 @@ impl AppState {
         &self,
         endpoint_id: &str,
     ) -> Result<bool, GatewayError> {
-        let existing = self
+        let lock = crate::codex_ws::hot_state::begin_catalog_write_lock(self).await?;
+        let result = self
+            .delete_provider_catalog_endpoint_locked(endpoint_id, &lock)
+            .await;
+        self.finish_provider_catalog_write(lock, result).await
+    }
+
+    async fn delete_provider_catalog_endpoint_locked(
+        &self,
+        endpoint_id: &str,
+        write_lock: &crate::codex_ws::hot_state::CodexWsCatalogWriteLock,
+    ) -> Result<bool, GatewayError> {
+        self.data.clear_provider_catalog_cache();
+        let preliminary_existing = self
             .data
             .list_provider_catalog_endpoints_by_ids(&[endpoint_id.to_string()])
             .await
             .map_err(|err| GatewayError::Internal(err.to_string()))?
             .into_iter()
             .next();
-        let relevant = match existing.as_ref() {
+        let relevant = match preliminary_existing.as_ref() {
             Some(existing) => self.endpoint_is_codex_ws_relevant(existing).await?,
             None => false,
         };
         let hot_mutation = if relevant {
-            let Some(endpoint) = existing.as_ref() else {
-                return Err(GatewayError::Internal(
-                    "relevant Codex WS endpoint disappeared before deletion".to_string(),
-                ));
+            let legacy = crate::codex_ws::hot_state::begin_catalog_hot_mutation(self).await?;
+            self.data.clear_provider_catalog_cache();
+            let existing = match self
+                .data
+                .list_provider_catalog_endpoints_by_ids(&[endpoint_id.to_string()])
+                .await
+            {
+                Ok(endpoints) => endpoints.into_iter().next(),
+                Err(error) => {
+                    return Err(self
+                        .restore_codex_ws_catalog_hot_before_write(
+                            legacy,
+                            GatewayError::Internal(error.to_string()),
+                        )
+                        .await);
+                }
             };
-            let seed = crate::codex_ws::hot_state::CodexWsCatalogResourceSeed {
-                kind: crate::codex_ws::hot_state::CatalogResourceKind::Endpoint,
-                id: endpoint_id.to_string(),
-                eligible: endpoint.is_active,
-                ineligible_reason: "endpoint_ineligible",
+            let existing_relevant = match existing.as_ref() {
+                Some(endpoint) => match self.endpoint_is_codex_ws_relevant(endpoint).await {
+                    Ok(relevant) => relevant,
+                    Err(error) => {
+                        return Err(self
+                            .restore_codex_ws_catalog_hot_before_write(legacy, error)
+                            .await);
+                    }
+                },
+                None => false,
             };
-            Some(
-                crate::codex_ws::hot_state::begin_catalog_resource_hot_mutation(
-                    self,
-                    &seed,
-                    crate::codex_ws::catalog_fence::CatalogMutationImpact::HardFence,
-                )
-                .await?,
-            )
+            match existing.as_ref().filter(|_| existing_relevant) {
+                Some(endpoint) => {
+                    let seed = crate::codex_ws::hot_state::CodexWsCatalogResourceSeed {
+                        kind: crate::codex_ws::hot_state::CatalogResourceKind::Endpoint,
+                        id: endpoint_id.to_string(),
+                        eligible: endpoint.is_active,
+                        ineligible_reason: "endpoint_ineligible",
+                    };
+                    Some(
+                        crate::codex_ws::hot_state::begin_catalog_resource_hot_mutation_with_legacy(
+                            self,
+                            legacy,
+                            &seed,
+                            crate::codex_ws::catalog_fence::CatalogMutationImpact::HardFence,
+                        )
+                        .await?,
+                    )
+                }
+                _ => {
+                    crate::codex_ws::hot_state::finish_catalog_hot_mutation(self, legacy).await?;
+                    None
+                }
+            }
         } else {
             None
         };
+        crate::codex_ws::hot_state::confirm_catalog_write_lock(self, write_lock).await?;
         let deleted = self
             .data
             .delete_provider_catalog_endpoint(endpoint_id)
             .await;
+        crate::codex_ws::hot_state::confirm_catalog_write_lock(self, write_lock).await?;
         if let Some(mutation) = hot_mutation {
             self.data.clear_provider_catalog_cache();
             let authoritative = self
@@ -1892,6 +2124,42 @@ mod tests {
 
         crate::codex_ws::hot_state::leave_hot_mutation_unstable(&state, held_codex_ws_mutation)
             .await;
+    }
+
+    #[tokio::test]
+    async fn provider_catalog_writes_are_serialized_before_relevance_classification() {
+        let provider = sample_provider();
+        let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![provider.clone()],
+            vec![sample_endpoint()],
+            vec![sample_key()],
+        ));
+        let state = AppState::new()
+            .expect("app state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(repository)
+                    .with_encryption_key_for_tests("test-encryption-key"),
+            );
+        let held_catalog_write = crate::codex_ws::hot_state::begin_catalog_write_lock(&state)
+            .await
+            .expect("test should hold the provider catalog write lock");
+
+        let mut updated = provider.clone();
+        updated.provider_type = "codex".to_string();
+        let error = state
+            .update_provider_catalog_provider(&updated)
+            .await
+            .expect_err("concurrent catalog write must fail before reading stale relevance");
+        assert!(error.into_message().contains("catalog write is busy"));
+
+        crate::codex_ws::hot_state::release_catalog_write_lock(&state, held_catalog_write)
+            .await
+            .expect("test should release the provider catalog write lock");
+        assert!(state
+            .update_provider_catalog_provider(&updated)
+            .await
+            .expect("provider update should succeed after lock release")
+            .is_some());
     }
 
     #[tokio::test]
