@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::io::{self, Write as _};
 
 use aether_contracts::{
     codex_default_transport_profile_extra, CODEX_DEFAULT_TLS_JA3, CODEX_DEFAULT_TLS_JA3_HASH,
@@ -6,6 +7,7 @@ use aether_contracts::{
     TRANSPORT_PROFILE_CODEX_LEGACY_REQWEST_RUSTLS_AUTO,
     TRANSPORT_PROFILE_CODEX_REQWEST_DEFAULT_TLS_AUTO,
 };
+use serde::Serialize;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -357,6 +359,62 @@ fn rewrite_turn_metadata_installation_id_value(value: &mut Value, installation_i
     }
 }
 
+struct AsciiJsonFormatter;
+
+impl serde_json::ser::Formatter for AsciiJsonFormatter {
+    fn write_string_fragment<W>(&mut self, writer: &mut W, fragment: &str) -> io::Result<()>
+    where
+        W: ?Sized + io::Write,
+    {
+        let mut run_start = 0;
+        for (index, character) in fragment.char_indices() {
+            if character.is_ascii() && character != '\u{7f}' {
+                continue;
+            }
+            writer.write_all(fragment[run_start..index].as_bytes())?;
+            write_json_unicode_escape(writer, character)?;
+            run_start = index + character.len_utf8();
+        }
+        writer.write_all(fragment[run_start..].as_bytes())
+    }
+}
+
+fn write_json_unicode_escape<W>(writer: &mut W, character: char) -> io::Result<()>
+where
+    W: ?Sized + io::Write,
+{
+    let scalar = character as u32;
+    if scalar <= u16::MAX as u32 {
+        return write_json_unicode_escape_unit(writer, scalar as u16);
+    }
+    let surrogate = scalar - 0x1_0000;
+    write_json_unicode_escape_unit(writer, 0xd800 | (surrogate >> 10) as u16)?;
+    write_json_unicode_escape_unit(writer, 0xdc00 | (surrogate & 0x3ff) as u16)
+}
+
+fn write_json_unicode_escape_unit<W>(writer: &mut W, unit: u16) -> io::Result<()>
+where
+    W: ?Sized + io::Write,
+{
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    writer.write_all(&[
+        b'\\',
+        b'u',
+        HEX[((unit >> 12) & 0xf) as usize],
+        HEX[((unit >> 8) & 0xf) as usize],
+        HEX[((unit >> 4) & 0xf) as usize],
+        HEX[(unit & 0xf) as usize],
+    ])
+}
+
+fn serialize_ascii_json(value: &Value) -> Option<String> {
+    let mut encoded = Vec::new();
+    let mut serializer = serde_json::Serializer::with_formatter(&mut encoded, AsciiJsonFormatter);
+    value.serialize(&mut serializer).ok()?;
+    debug_assert!(encoded.is_ascii());
+    String::from_utf8(encoded).ok()
+}
+
 fn rewrite_turn_metadata_installation_id_string(
     raw: &str,
     installation_id: &str,
@@ -368,7 +426,9 @@ fn rewrite_turn_metadata_installation_id_string(
                 "installation_id".to_string(),
                 Value::String(installation_id.to_string()),
             );
-            serde_json::to_string(&parsed).ok()
+            // This JSON is embedded in an HTTP header. Preserve Unicode
+            // semantics while keeping every serialized byte header-safe.
+            serialize_ascii_json(&parsed)
         }
         None => None,
     }
@@ -1046,6 +1106,38 @@ mod tests {
         assert_eq!(body_metadata["window_id"], "window");
         assert_eq!(body["instructions"], instructions);
         assert_eq!(body["input"][0]["content"][0]["text"], input_text);
+    }
+
+    #[test]
+    fn turn_metadata_normalization_ascii_escapes_unicode_for_http_headers() {
+        let profile = CodexConcreteAccountProfile {
+            user_agent: "ua".to_string(),
+            originator: "codex-tui".to_string(),
+            installation_id: "019f0a27-08f6-47d2-ba0b-1ff45470ee76".to_string(),
+            fingerprint_hash: "sha256:hash".to_string(),
+        };
+        let original = r#"{"installation_id":"old","cwd":"/workspace/\u9879\u76ee\ud83d\ude80","label":"caf\u00e9","delete":"\u007f","\u8def\u5f84":"value"}"#;
+        let expected =
+            serde_json::from_str::<Value>(original).expect("source metadata should parse");
+
+        let rewritten = normalize_codex_turn_metadata_for_profile(original, &profile)
+            .expect("turn metadata should normalize");
+
+        assert!(rewritten.is_ascii());
+        assert!(rewritten.contains(r#"\u9879\u76ee\ud83d\ude80"#));
+        assert!(rewritten.contains(r#"caf\u00e9"#));
+        assert!(rewritten.contains(r#"\u007f"#));
+        assert!(http::HeaderValue::from_str(&rewritten)
+            .expect("rewritten metadata should be a valid header value")
+            .to_str()
+            .is_ok());
+        let actual =
+            serde_json::from_str::<Value>(&rewritten).expect("rewritten metadata should parse");
+        assert_eq!(actual["installation_id"], profile.installation_id);
+        assert_eq!(actual["cwd"], expected["cwd"]);
+        assert_eq!(actual["label"], expected["label"]);
+        assert_eq!(actual["delete"], expected["delete"]);
+        assert_eq!(actual["\u{8def}\u{5f84}"], expected["\u{8def}\u{5f84}"]);
     }
 
     #[test]

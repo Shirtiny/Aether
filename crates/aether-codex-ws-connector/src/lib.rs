@@ -53,6 +53,10 @@ pub use tungstenite::handshake::client::Response;
 pub use tungstenite::Error as WebSocketError;
 pub use tungstenite::Message;
 
+/// Prefix for redacted diagnostics produced by handshake Header preflight.
+pub const HANDSHAKE_HEADER_NOT_VISIBLE_ASCII_PREFIX: &str =
+    "handshake header is not visible ASCII: ";
+
 #[derive(Clone, PartialEq, Eq)]
 pub enum OutboundRoute {
     /// Preserve the pinned transport's HTTP(S)_PROXY, ALL_PROXY, and NO_PROXY handling.
@@ -112,6 +116,7 @@ impl CodexWebSocketConnector {
         request: Request,
         route: OutboundRoute,
     ) -> Result<(WebSocketConnection, Response), WebSocketError> {
+        validate_handshake_header_values(&request)?;
         let tls_config = self
             .fresh_tls_config()
             .map_err(|error| WebSocketError::Io(std::io::Error::other(error)))?;
@@ -123,6 +128,17 @@ impl CodexWebSocketConnector {
     fn fresh_tls_config(&self) -> Result<Arc<ClientConfig>, ConnectorBuildError> {
         Ok(Arc::new(tls::build_tls_config((*self.roots).clone())?))
     }
+}
+
+fn validate_handshake_header_values(request: &Request) -> Result<(), WebSocketError> {
+    for (name, value) in request.headers() {
+        if value.to_str().is_err() {
+            return Err(WebSocketError::Utf8(format!(
+                "{HANDSHAKE_HEADER_NOT_VISIBLE_ASCII_PREFIX}{name}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Established WebSocket independent of its direct, proxy, and TLS transport layers.

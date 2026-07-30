@@ -19,6 +19,8 @@ use tokio_rustls::TlsAcceptor;
 use tungstenite::client::IntoClientRequest;
 use tungstenite::handshake::server::Request as ServerRequest;
 use tungstenite::handshake::server::Response as ServerResponse;
+use tungstenite::http::header::AUTHORIZATION;
+use tungstenite::http::HeaderValue;
 use tungstenite::proxy::ProxyScheme;
 use tungstenite::Message;
 
@@ -72,6 +74,30 @@ const TEST_PRIVATE_KEY_DER_BASE64: &str = concat!(
     "8Dkcn7Hd7HqmdkXkuliE+DLxR4ZmG65gpmdAESQ4ZdAzKno+jPSy0Y+PnyxHGki2r0+",
     "gYfhfEvVoxWYPyv0V9dXes/0eIC9jpRS5ZYeR7dmpjf+J9YrtmdszFcZcS/GfcpBb7M="
 );
+
+#[test]
+fn handshake_header_preflight_rejects_non_ascii_without_exposing_the_value() {
+    let mut request = "wss://chatgpt.com/backend-api/codex/responses"
+        .into_client_request()
+        .expect("websocket request should build");
+    let sensitive_value = "Bearer secret-\u{5bc6}\u{94a5}";
+    request.headers_mut().insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(sensitive_value).expect("opaque header bytes should be accepted"),
+    );
+
+    let error = validate_handshake_header_values(&request)
+        .expect_err("non-ASCII header should fail before any network operation");
+    let WebSocketError::Utf8(detail) = error else {
+        panic!("non-ASCII header should be classified as UTF-8");
+    };
+    assert_eq!(
+        detail,
+        format!("{HANDSHAKE_HEADER_NOT_VISIBLE_ASCII_PREFIX}authorization")
+    );
+    assert!(!detail.contains("secret"));
+    assert!(!detail.contains("Bearer"));
+}
 
 #[tokio::test]
 async fn public_connector_negotiates_permessage_deflate_and_exposes_stream_and_sink() {

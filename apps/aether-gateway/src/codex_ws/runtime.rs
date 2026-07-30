@@ -6,7 +6,7 @@ use std::time::Duration;
 use aether_codex_ws_connector::{
     CodexWebSocketConnector, IntoClientRequest, Message as OfficialMessage, OutboundRoute,
     WebSocketConnection, WebSocketError, WebSocketProtocolError, WebSocketTlsError,
-    WebSocketUrlError,
+    WebSocketUrlError, HANDSHAKE_HEADER_NOT_VISIBLE_ASCII_PREFIX,
 };
 use aether_routing_core::RoutingJsonPatchOperation;
 use aether_runtime::AdmissionPermit;
@@ -1919,11 +1919,11 @@ fn classify_codex_ws_handshake_failure(
             "official_ws_handshake_capacity_failed",
             Some("capacity_error".to_string()),
         ),
-        WebSocketError::Utf8(_) => transport_handshake_failure(
+        WebSocketError::Utf8(error) => transport_handshake_failure(
             "codex_ws_handshake_utf8_error",
             "official Codex WebSocket handshake contained invalid text",
             "official_ws_handshake_utf8_failed",
-            Some("utf8_error".to_string()),
+            Some(handshake_utf8_diagnostic(&error)),
         ),
         WebSocketError::ConnectionClosed => transport_handshake_failure(
             "codex_ws_handshake_connection_closed",
@@ -1967,6 +1967,26 @@ fn transport_handshake_failure(
         diagnostic_detail,
         route_reason,
     }
+}
+
+fn handshake_utf8_diagnostic(error: &str) -> String {
+    handshake_utf8_header_name(error)
+        .map(|name| format!("utf8_header={name}"))
+        .unwrap_or_else(|| "utf8_error".to_string())
+}
+
+fn handshake_utf8_header_name(error: &str) -> Option<String> {
+    let candidate = error
+        .strip_prefix(HANDSHAKE_HEADER_NOT_VISIBLE_ASCII_PREFIX)
+        .map(str::trim)
+        .or_else(|| {
+            error
+                .split_once("for header name '")
+                .and_then(|(_, suffix)| suffix.split_once('\'').map(|(name, _)| name))
+        })?;
+    HeaderName::from_bytes(candidate.as_bytes())
+        .ok()
+        .map(|name| name.as_str().to_string())
 }
 
 fn io_error_kind_name(kind: std::io::ErrorKind) -> &'static str {
@@ -2423,6 +2443,9 @@ fn insert_header(headers: &mut HeaderMap, name: &str, value: &str) -> Result<(),
         .map_err(|_| PeerError("official Codex header name is invalid".into()))?;
     let value = HeaderValue::from_str(value)
         .map_err(|_| PeerError("official Codex header value is invalid".into()))?;
+    value
+        .to_str()
+        .map_err(|_| PeerError("official Codex header value is not visible ASCII".into()))?;
     headers.insert(name, value);
     Ok(())
 }
@@ -2757,6 +2780,20 @@ mod tests {
     }
 
     #[test]
+    fn official_header_builder_rejects_non_ascii_before_connector() {
+        let mut headers = HeaderMap::new();
+        let error = insert_header(
+            &mut headers,
+            "x-codex-turn-metadata",
+            "{\"cwd\":\"/workspace/\u{9879}\u{76ee}\"}",
+        )
+        .expect_err("non-ASCII header should fail materialization");
+
+        assert_eq!(error.0, "official Codex header value is not visible ASCII");
+        assert!(!headers.contains_key("x-codex-turn-metadata"));
+    }
+
+    #[test]
     fn tunnel_proxy_is_not_eligible_for_the_native_connector() {
         let proxy = aether_contracts::ProxySnapshot {
             mode: Some("tunnel".into()),
@@ -2890,6 +2927,41 @@ mod tests {
             Some("protocol_kind=missing_upgrade_websocket_header")
         );
         assert_eq!(protocol.error_body, protocol.diagnostic_detail);
+    }
+
+    #[test]
+    fn handshake_utf8_classification_keeps_only_the_header_name() {
+        for (detail, expected_header) in [
+            (
+                format!("{HANDSHAKE_HEADER_NOT_VISIBLE_ASCII_PREFIX}x-codex-turn-metadata"),
+                "utf8_header=x-codex-turn-metadata",
+            ),
+            (
+                "failed to convert header for header name 'authorization' with value: Bearer secret"
+                    .to_string(),
+                "utf8_header=authorization",
+            ),
+        ] {
+            let failure = classify_codex_ws_handshake_failure(
+                WebSocketError::Utf8(detail),
+                CodexWsRouteKind::Direct,
+            );
+
+            assert_eq!(failure.error_type, "codex_ws_handshake_utf8_error");
+            assert_eq!(failure.diagnostic_detail.as_deref(), Some(expected_header));
+            assert_eq!(failure.error_body, failure.diagnostic_detail);
+            assert!(!failure.error_body.as_deref().unwrap().contains("secret"));
+            assert!(!failure.error_body.as_deref().unwrap().contains("Bearer"));
+        }
+
+        let failure = classify_codex_ws_handshake_failure(
+            WebSocketError::Utf8("Bearer secret with no parseable header".to_string()),
+            CodexWsRouteKind::Direct,
+        );
+        assert_eq!(failure.diagnostic_detail.as_deref(), Some("utf8_error"));
+        assert_eq!(failure.error_body.as_deref(), Some("utf8_error"));
+        assert!(!failure.error_body.as_deref().unwrap().contains("secret"));
+        assert!(!failure.error_body.as_deref().unwrap().contains("Bearer"));
     }
 
     #[test]
