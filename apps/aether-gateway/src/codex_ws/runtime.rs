@@ -183,6 +183,7 @@ pub(crate) struct CodexWsCandidate {
     pub(crate) shared_global_generation: String,
     pub(crate) shared_catalog_generation: String,
     pub(crate) shared_key_generation: String,
+    pub(crate) shared_catalog_binding: Option<super::hot_state::CodexWsCatalogBindingLease>,
     pub(crate) prewrite_cleanup_permit:
         Option<tokio::sync::mpsc::OwnedPermit<CodexWsSettlementCommit>>,
 }
@@ -447,8 +448,9 @@ pub(crate) trait CodexWsRuntimePort: Send + Sync {
     async fn validate_candidate_current_state(
         &self,
         candidate: &CodexWsCandidate,
-    ) -> Result<(), StepPreparationError> {
-        self.validate_candidate_fences(candidate)
+    ) -> Result<super::hot_state::CodexWsFenceDecision, StepPreparationError> {
+        self.validate_candidate_fences(candidate)?;
+        Ok(super::hot_state::CodexWsFenceDecision::Continue)
     }
 
     async fn validate_step(&self, step: &ResponseCreateStep) -> Result<(), StepPreparationError>;
@@ -900,6 +902,54 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
         .await
         .map_err(|_| StepPreparationError::retain("candidate_planning_failed"))?;
 
+        let catalog_fence_v2_enabled =
+            crate::codex_ws_config::read_codex_ws_feature_flags(&self.state)
+                .await
+                .flags
+                .catalog_fence_v2_enabled;
+        let catalog_resource_leases = if catalog_fence_v2_enabled {
+            let mut seeds = Vec::with_capacity(attempts.len().saturating_mul(2));
+            for planned in &attempts {
+                let provider = &planned.preflight.transport.provider;
+                seeds.push(super::hot_state::CodexWsCatalogResourceSeed {
+                    kind: super::hot_state::CatalogResourceKind::Provider,
+                    id: provider.id.clone(),
+                    eligible: provider.is_active
+                        && provider.provider_type.trim().eq_ignore_ascii_case("codex"),
+                    ineligible_reason: "provider_ineligible",
+                });
+                let endpoint = &planned.preflight.transport.endpoint;
+                seeds.push(super::hot_state::CodexWsCatalogResourceSeed {
+                    kind: super::hot_state::CatalogResourceKind::Endpoint,
+                    id: endpoint.id.clone(),
+                    eligible: endpoint.is_active
+                        && endpoint
+                            .api_format
+                            .trim()
+                            .eq_ignore_ascii_case("openai:responses"),
+                    ineligible_reason: "endpoint_ineligible",
+                });
+            }
+            match super::hot_state::ensure_catalog_resource_hot_leases(&self.state, &seeds).await {
+                Ok(leases) => Some(leases),
+                Err(_) => {
+                    crate::executor::candidate_loop::mark_unused_local_candidates(
+                        &self.state,
+                        attempts
+                            .into_iter()
+                            .map(|planned| planned.attempt)
+                            .collect(),
+                    )
+                    .await;
+                    return Err(StepPreparationError::retain(
+                        "catalog_resource_hot_state_unavailable",
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+
         // These settings are request-scoped and must remain frozen for every
         // subsequent response.create on the same provider connection.
         let enable_model_directives =
@@ -1033,6 +1083,17 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
                 hot_rejected_attempts.push(attempt);
                 continue;
             }
+            let shared_catalog_binding = match catalog_resource_leases.as_ref() {
+                Some(leases) => match leases.binding(&provider_id, &endpoint_id) {
+                    Some(binding) => Some(binding),
+                    None => {
+                        drop(cleanup_permits.pop_front());
+                        hot_rejected_attempts.push(attempt);
+                        continue;
+                    }
+                },
+                None => None,
+            };
             let headers = attempt.plan.headers.clone();
             let report_kind = attempt
                 .report_kind
@@ -1101,6 +1162,7 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
                 shared_global_generation: shared_global.generation.clone(),
                 shared_catalog_generation: shared_catalog.generation.clone(),
                 shared_key_generation: key_hot_lease.generation.clone(),
+                shared_catalog_binding,
                 prewrite_cleanup_permit: cleanup_permits.pop_front(),
             });
         }
@@ -1633,17 +1695,32 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
     async fn validate_candidate_current_state(
         &self,
         candidate: &CodexWsCandidate,
-    ) -> Result<(), StepPreparationError> {
+    ) -> Result<super::hot_state::CodexWsFenceDecision, StepPreparationError> {
         self.validate_candidate_fences(candidate)?;
-        super::hot_state::validate_hot_leases(
-            &self.state,
-            &candidate.key_id,
-            &candidate.shared_global_generation,
-            &candidate.shared_catalog_generation,
-            &candidate.shared_key_generation,
-        )
-        .await
-        .map_err(StepPreparationError::retain)
+        match candidate.shared_catalog_binding.as_ref() {
+            Some(binding) => super::hot_state::validate_hot_leases_v2(
+                &self.state,
+                &candidate.provider_id,
+                &candidate.endpoint_id,
+                &candidate.key_id,
+                &candidate.shared_global_generation,
+                &candidate.shared_catalog_generation,
+                &candidate.shared_key_generation,
+                binding,
+            )
+            .await
+            .map_err(StepPreparationError::retain),
+            None => super::hot_state::validate_hot_leases(
+                &self.state,
+                &candidate.key_id,
+                &candidate.shared_global_generation,
+                &candidate.shared_catalog_generation,
+                &candidate.shared_key_generation,
+            )
+            .await
+            .map(|()| super::hot_state::CodexWsFenceDecision::Continue)
+            .map_err(StepPreparationError::retain),
+        }
     }
 }
 

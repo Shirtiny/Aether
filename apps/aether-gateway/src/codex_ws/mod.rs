@@ -1,4 +1,5 @@
 mod candidate_lifecycle;
+pub(crate) mod catalog_fence;
 mod cpu_budget;
 pub(crate) mod hot_state;
 mod ingress;

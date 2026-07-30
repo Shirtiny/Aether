@@ -8,10 +8,12 @@ use aether_runtime_state::RuntimeLockLease;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
+use super::catalog_fence::CatalogMutationImpact;
 use crate::codex_ws_config::{parse_codex_ws_feature_flags, CodexWsFeatureFlags};
 use crate::{AppState, GatewayError};
 
 const HOT_STATE_SCHEMA_VERSION: u8 = 1;
+const CATALOG_RESOURCE_SCHEMA_VERSION: u8 = 2;
 const HOT_STATE_TTL: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 const HOT_TRANSITION_TTL: Duration = Duration::from_secs(120);
 const MUTATION_LOCK_TTL: Duration = Duration::from_secs(60);
@@ -19,6 +21,7 @@ const MUTATION_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const MUTATION_RECOVERY_TIMEOUT: Duration = Duration::from_secs(1);
 const GLOBAL_STATE_KEY: &str = "codex-ws:eligibility:v1:global";
 const CATALOG_STATE_KEY: &str = "codex-ws:eligibility:v1:catalog";
+const CATALOG_RESOURCE_KEY_PREFIX: &str = "codex-ws:catalog-fence:v2";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -36,6 +39,114 @@ struct HotSwitch {
 pub(crate) struct CodexWsHotLease {
     pub(crate) generation: String,
     pub(crate) eligible: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum CatalogResourceKind {
+    Provider,
+    Endpoint,
+}
+
+impl CatalogResourceKind {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Provider => "provider",
+            Self::Endpoint => "endpoint",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CodexWsCatalogResourceSeed {
+    pub(crate) kind: CatalogResourceKind,
+    pub(crate) id: String,
+    pub(crate) eligible: bool,
+    pub(crate) ineligible_reason: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CodexWsCatalogResourceLease {
+    pub(crate) hard_generation: String,
+    pub(crate) drain_generation: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CodexWsCatalogBindingLease {
+    pub(crate) provider: CodexWsCatalogResourceLease,
+    pub(crate) endpoint: CodexWsCatalogResourceLease,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct CodexWsCatalogResourceLeases {
+    providers: BTreeMap<String, CodexWsCatalogResourceLease>,
+    endpoints: BTreeMap<String, CodexWsCatalogResourceLease>,
+}
+
+impl CodexWsCatalogResourceLeases {
+    pub(crate) fn binding(
+        &self,
+        provider_id: &str,
+        endpoint_id: &str,
+    ) -> Option<CodexWsCatalogBindingLease> {
+        Some(CodexWsCatalogBindingLease {
+            provider: self.providers.get(provider_id)?.clone(),
+            endpoint: self.endpoints.get(endpoint_id)?.clone(),
+        })
+    }
+
+    fn insert(
+        &mut self,
+        kind: CatalogResourceKind,
+        id: String,
+        lease: CodexWsCatalogResourceLease,
+    ) {
+        match kind {
+            CatalogResourceKind::Provider => self.providers.insert(id, lease),
+            CatalogResourceKind::Endpoint => self.endpoints.insert(id, lease),
+        };
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CodexWsFenceDecision {
+    Continue,
+    ContinueAndDrain,
+}
+
+impl CodexWsFenceDecision {
+    pub(crate) const fn should_drain(self) -> bool {
+        matches!(self, Self::ContinueAndDrain)
+    }
+
+    fn combine(self, other: Self) -> Self {
+        if self == Self::ContinueAndDrain || other == Self::ContinueAndDrain {
+            Self::ContinueAndDrain
+        } else {
+            Self::Continue
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogResourceSwitch {
+    schema_version: u8,
+    hard_generation: String,
+    drain_generation: String,
+    stable: bool,
+    eligible: bool,
+    reason: Option<String>,
+    transition_impact: Option<CatalogMutationImpact>,
+}
+
+pub(crate) struct CodexWsCatalogResourceMutation {
+    legacy: CodexWsHotMutation,
+    resource_kind: CatalogResourceKind,
+    resource_id: String,
+    resource_key: String,
+    transition_raw: String,
+    previous: CatalogResourceSwitch,
+    impact: CatalogMutationImpact,
 }
 
 pub(crate) struct CodexWsHotMutation {
@@ -97,6 +208,129 @@ pub(crate) async fn ensure_catalog_hot_lease(
     state: &AppState,
 ) -> Result<CodexWsHotLease, GatewayError> {
     ensure_switch(state, CATALOG_STATE_KEY, true, "catalog_unavailable", None).await
+}
+
+/// Lazily publishes resource-scoped v2 state from the same authoritative
+/// snapshots used by candidate planning. Writers publish this state even
+/// while the reader flag is disabled, which permits a mixed-version rollout.
+pub(crate) async fn ensure_catalog_resource_hot_leases(
+    state: &AppState,
+    seeds: &[CodexWsCatalogResourceSeed],
+) -> Result<CodexWsCatalogResourceLeases, GatewayError> {
+    let mut unique = BTreeMap::new();
+    for seed in seeds {
+        let state_key = catalog_resource_state_key(seed.kind, &seed.id)?;
+        unique.entry(state_key).or_insert_with(|| seed.clone());
+    }
+    if unique.is_empty() {
+        return Ok(CodexWsCatalogResourceLeases::default());
+    }
+
+    let state_keys = unique.keys().cloned().collect::<Vec<_>>();
+    let seeds = unique.into_values().collect::<Vec<_>>();
+    let initial_values = state
+        .runtime_state
+        .kv_get_many(&state_keys)
+        .await
+        .map_err(hot_state_error)?;
+    if initial_values.len() != seeds.len() {
+        return Err(GatewayError::Internal(
+            "codex ws catalog resource batch length mismatch".to_string(),
+        ));
+    }
+
+    let mut writes = Vec::new();
+    for ((seed, state_key), raw) in seeds.iter().zip(&state_keys).zip(&initial_values) {
+        match raw {
+            Some(previous_raw) => {
+                let mut snapshot = decode_catalog_resource_switch(previous_raw)?;
+                if !snapshot.stable
+                    || (snapshot.eligible == seed.eligible
+                        && snapshot.reason
+                            == (!seed.eligible).then_some(seed.ineligible_reason.to_string()))
+                {
+                    continue;
+                }
+                snapshot.hard_generation = uuid::Uuid::new_v4().to_string();
+                snapshot.drain_generation = uuid::Uuid::new_v4().to_string();
+                snapshot.eligible = seed.eligible;
+                snapshot.reason = (!seed.eligible).then_some(seed.ineligible_reason.to_string());
+                snapshot.transition_impact = None;
+                writes.push(KeyHotStateWrite::CompareAndSet {
+                    state_key: state_key.clone(),
+                    expected: previous_raw.clone(),
+                    value: encode_catalog_resource_switch(&snapshot)?,
+                });
+            }
+            None => {
+                let snapshot = initial_catalog_resource_switch(
+                    seed.eligible,
+                    (!seed.eligible).then_some(seed.ineligible_reason),
+                );
+                writes.push(KeyHotStateWrite::SetIfAbsent {
+                    state_key: state_key.clone(),
+                    value: encode_catalog_resource_switch(&snapshot)?,
+                });
+            }
+        }
+    }
+
+    if !writes.is_empty() {
+        let results = futures_util::future::join_all(writes.into_iter().map(|write| {
+            let runtime_state = Arc::clone(&state.runtime_state);
+            async move {
+                match write {
+                    KeyHotStateWrite::SetIfAbsent { state_key, value } => {
+                        runtime_state
+                            .kv_set_if_absent(&state_key, value, HOT_STATE_TTL)
+                            .await
+                    }
+                    KeyHotStateWrite::CompareAndSet {
+                        state_key,
+                        expected,
+                        value,
+                    } => {
+                        runtime_state
+                            .kv_set_if_value(&state_key, &expected, value, HOT_STATE_TTL)
+                            .await
+                    }
+                }
+            }
+        }))
+        .await;
+        for result in results {
+            result.map_err(hot_state_error)?;
+        }
+    }
+
+    let actual_values = state
+        .runtime_state
+        .kv_get_many(&state_keys)
+        .await
+        .map_err(hot_state_error)?;
+    if actual_values.len() != seeds.len() {
+        return Err(GatewayError::Internal(
+            "codex ws catalog resource batch length mismatch".to_string(),
+        ));
+    }
+    let mut leases = CodexWsCatalogResourceLeases::default();
+    for (seed, raw) in seeds.into_iter().zip(actual_values) {
+        let Some(raw) = raw else {
+            continue;
+        };
+        let snapshot = decode_catalog_resource_switch(&raw)?;
+        if snapshot.stable && snapshot.eligible {
+            leases.insert(
+                seed.kind,
+                seed.id,
+                CodexWsCatalogResourceLease {
+                    hard_generation: snapshot.hard_generation,
+                    drain_generation: snapshot.drain_generation,
+                },
+            );
+        }
+    }
+    Ok(leases)
 }
 
 pub(crate) fn bind_catalog_snapshot_generation(
@@ -301,6 +535,98 @@ pub(crate) async fn validate_hot_leases(
     Ok(())
 }
 
+pub(crate) async fn validate_hot_leases_v2(
+    state: &AppState,
+    provider_id: &str,
+    endpoint_id: &str,
+    key_id: &str,
+    global_generation: &str,
+    _catalog_generation: &str,
+    key_generation: &str,
+    binding: &CodexWsCatalogBindingLease,
+) -> Result<CodexWsFenceDecision, &'static str> {
+    let key_state_key = key_state_key(key_id).map_err(|_| "account_hot_state_invalid")?;
+    let provider_state_key = catalog_resource_state_key(CatalogResourceKind::Provider, provider_id)
+        .map_err(|_| "provider_hot_state_invalid")?;
+    let endpoint_state_key = catalog_resource_state_key(CatalogResourceKind::Endpoint, endpoint_id)
+        .map_err(|_| "endpoint_hot_state_invalid")?;
+    let keys = vec![
+        GLOBAL_STATE_KEY.to_string(),
+        key_state_key,
+        provider_state_key,
+        endpoint_state_key,
+    ];
+    let values = state
+        .runtime_state
+        .kv_get_many(&keys)
+        .await
+        .map_err(|_| "account_hot_state_unavailable")?;
+    if values.len() != keys.len() {
+        return Err("account_hot_state_unavailable");
+    }
+
+    validate_switch(
+        values[0].as_deref(),
+        global_generation,
+        "codex_ws_global_changed",
+    )?;
+    validate_switch(
+        values[1].as_deref(),
+        key_generation,
+        "bound_account_ineligible",
+    )?;
+
+    let mut decision = validate_catalog_resource_switch(
+        values[2].as_deref(),
+        &binding.provider,
+        "bound_provider_changed",
+    )?;
+    decision = decision.combine(validate_catalog_resource_switch(
+        values[3].as_deref(),
+        &binding.endpoint,
+        "bound_endpoint_changed",
+    )?);
+    Ok(decision)
+}
+
+fn validate_catalog_resource_switch(
+    raw: Option<&str>,
+    expected: &CodexWsCatalogResourceLease,
+    changed_reason: &'static str,
+) -> Result<CodexWsFenceDecision, &'static str> {
+    let raw = raw.ok_or("account_hot_state_missing")?;
+    let snapshot: CatalogResourceSwitch =
+        serde_json::from_str(raw).map_err(|_| "account_hot_state_invalid")?;
+    if snapshot.schema_version != CATALOG_RESOURCE_SCHEMA_VERSION {
+        return Err("account_hot_state_invalid");
+    }
+    if !snapshot.eligible {
+        return Err(changed_reason);
+    }
+    if !snapshot.stable {
+        return match snapshot.transition_impact {
+            Some(CatalogMutationImpact::SelectionOnly)
+                if snapshot.hard_generation == expected.hard_generation =>
+            {
+                Ok(CodexWsFenceDecision::Continue)
+            }
+            Some(CatalogMutationImpact::Drain)
+                if snapshot.hard_generation == expected.hard_generation =>
+            {
+                Ok(CodexWsFenceDecision::ContinueAndDrain)
+            }
+            _ => Err(changed_reason),
+        };
+    }
+    if snapshot.hard_generation != expected.hard_generation {
+        return Err(changed_reason);
+    }
+    if snapshot.drain_generation != expected.drain_generation {
+        return Ok(CodexWsFenceDecision::ContinueAndDrain);
+    }
+    Ok(CodexWsFenceDecision::Continue)
+}
+
 pub(crate) async fn begin_global_hot_mutation(
     state: &AppState,
 ) -> Result<CodexWsHotMutation, GatewayError> {
@@ -334,6 +660,163 @@ pub(crate) async fn finish_catalog_hot_mutation(
     mutation: CodexWsHotMutation,
 ) -> Result<(), GatewayError> {
     finish_mutation(state, mutation, true, None, None).await
+}
+
+pub(crate) async fn begin_catalog_resource_hot_mutation(
+    state: &AppState,
+    seed: &CodexWsCatalogResourceSeed,
+    impact: CatalogMutationImpact,
+) -> Result<CodexWsCatalogResourceMutation, GatewayError> {
+    ensure_catalog_resource_hot_leases(state, std::slice::from_ref(seed)).await?;
+    let resource_key = catalog_resource_state_key(seed.kind, &seed.id)?;
+    let previous_raw = state
+        .runtime_state
+        .kv_get(&resource_key)
+        .await
+        .map_err(hot_state_error)?
+        .ok_or_else(|| {
+            GatewayError::Internal("codex ws catalog resource state disappeared".to_string())
+        })?;
+    let previous = decode_catalog_resource_switch(&previous_raw)?;
+    if !previous.stable {
+        return Err(GatewayError::Internal(
+            "codex ws catalog resource mutation is busy".to_string(),
+        ));
+    }
+
+    // The legacy catalog mutation owns the cross-instance catalog writer lock.
+    // Its transition is also retained for old readers during the rollout.
+    let legacy = begin_catalog_hot_mutation(state).await?;
+    let transition = CatalogResourceSwitch {
+        schema_version: CATALOG_RESOURCE_SCHEMA_VERSION,
+        hard_generation: previous.hard_generation.clone(),
+        drain_generation: previous.drain_generation.clone(),
+        stable: false,
+        eligible: previous.eligible,
+        reason: Some("mutation_in_progress".to_string()),
+        transition_impact: Some(impact),
+    };
+    let transition_raw = encode_catalog_resource_switch(&transition)?;
+    let write_result = state
+        .runtime_state
+        .kv_set_if_value(
+            &resource_key,
+            &previous_raw,
+            transition_raw.clone(),
+            HOT_TRANSITION_TTL,
+        )
+        .await
+        .map_err(hot_state_error);
+    match write_result {
+        Ok(true) => Ok(CodexWsCatalogResourceMutation {
+            legacy,
+            resource_kind: seed.kind,
+            resource_id: seed.id.clone(),
+            resource_key,
+            transition_raw,
+            previous,
+            impact,
+        }),
+        Ok(false) => {
+            let _ = finish_catalog_hot_mutation(state, legacy).await;
+            Err(GatewayError::Internal(
+                "codex ws catalog resource mutation lost its initial CAS".to_string(),
+            ))
+        }
+        Err(error) => {
+            let _ = finish_catalog_hot_mutation(state, legacy).await;
+            Err(error)
+        }
+    }
+}
+
+pub(crate) async fn finish_catalog_resource_hot_mutation(
+    state: &AppState,
+    mutation: CodexWsCatalogResourceMutation,
+    eligible: bool,
+    reason: Option<&str>,
+) -> Result<(), GatewayError> {
+    let effective_impact = if mutation.previous.eligible == eligible {
+        mutation.impact
+    } else {
+        CatalogMutationImpact::HardFence
+    };
+    tracing::info!(
+        event_name = "codex_ws_catalog_resource_mutation",
+        log_type = "ops",
+        resource_kind = mutation.resource_kind.label(),
+        resource_id = %mutation.resource_id,
+        requested_impact = mutation.impact.label(),
+        effective_impact = effective_impact.label(),
+        eligible,
+        "publishing Codex WebSocket catalog resource fence"
+    );
+    let (hard_generation, drain_generation) = match effective_impact {
+        CatalogMutationImpact::SelectionOnly => (
+            mutation.previous.hard_generation.clone(),
+            mutation.previous.drain_generation.clone(),
+        ),
+        CatalogMutationImpact::Drain => (
+            mutation.previous.hard_generation.clone(),
+            uuid::Uuid::new_v4().to_string(),
+        ),
+        CatalogMutationImpact::HardFence => (
+            uuid::Uuid::new_v4().to_string(),
+            uuid::Uuid::new_v4().to_string(),
+        ),
+    };
+    let stable = CatalogResourceSwitch {
+        schema_version: CATALOG_RESOURCE_SCHEMA_VERSION,
+        hard_generation,
+        drain_generation,
+        stable: true,
+        eligible,
+        reason: reason.map(str::to_string),
+        transition_impact: None,
+    };
+    let stable_raw = encode_catalog_resource_switch(&stable)?;
+    let lock_confirmed = confirm_mutation_lock(state, &mutation.legacy).await;
+    let write_result = if lock_confirmed {
+        state
+            .runtime_state
+            .kv_set_if_value(
+                &mutation.resource_key,
+                &mutation.transition_raw,
+                stable_raw,
+                HOT_STATE_TTL,
+            )
+            .await
+            .map_err(hot_state_error)
+    } else {
+        Ok(false)
+    };
+
+    match write_result {
+        Ok(true) => finish_catalog_hot_mutation(state, mutation.legacy).await,
+        Ok(false) => {
+            let recovery =
+                restore_catalog_resource_restrictive(state, &mutation.resource_key).await;
+            leave_hot_mutation_unstable(state, mutation.legacy).await;
+            recovery?;
+            Err(GatewayError::Internal(
+                "codex ws catalog resource mutation lost its lease or strict CAS".to_string(),
+            ))
+        }
+        Err(error) => {
+            let recovery =
+                restore_catalog_resource_restrictive(state, &mutation.resource_key).await;
+            leave_hot_mutation_unstable(state, mutation.legacy).await;
+            recovery?;
+            Err(error)
+        }
+    }
+}
+
+pub(crate) async fn leave_catalog_resource_hot_mutation_unstable(
+    state: &AppState,
+    mutation: CodexWsCatalogResourceMutation,
+) {
+    leave_hot_mutation_unstable(state, mutation.legacy).await;
 }
 
 pub(crate) async fn begin_key_hot_mutation(
@@ -662,6 +1145,54 @@ async fn restore_restrictive_after_failed_finish(
     })?
 }
 
+async fn restore_catalog_resource_restrictive(
+    state: &AppState,
+    state_key: &str,
+) -> Result<(), GatewayError> {
+    tokio::time::timeout(MUTATION_RECOVERY_TIMEOUT, async {
+        loop {
+            let Some(observed_raw) = state
+                .runtime_state
+                .kv_get(state_key)
+                .await
+                .map_err(hot_state_error)?
+            else {
+                return Ok(());
+            };
+            let _ = decode_catalog_resource_switch(&observed_raw)?;
+            let recovery = CatalogResourceSwitch {
+                schema_version: CATALOG_RESOURCE_SCHEMA_VERSION,
+                hard_generation: uuid::Uuid::new_v4().to_string(),
+                drain_generation: uuid::Uuid::new_v4().to_string(),
+                stable: false,
+                eligible: false,
+                reason: Some("lost_mutation_recovery".to_string()),
+                transition_impact: Some(CatalogMutationImpact::HardFence),
+            };
+            if state
+                .runtime_state
+                .kv_set_if_value(
+                    state_key,
+                    &observed_raw,
+                    encode_catalog_resource_switch(&recovery)?,
+                    HOT_TRANSITION_TTL,
+                )
+                .await
+                .map_err(hot_state_error)?
+            {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        GatewayError::Internal(
+            "timed out restoring restrictive Codex WS catalog resource state".to_string(),
+        )
+    })?
+}
+
 async fn release_mutation_lock(
     state: &AppState,
     mut mutation: CodexWsHotMutation,
@@ -834,6 +1365,58 @@ fn key_state_key(key_id: &str) -> Result<String, GatewayError> {
     Ok(format!("codex-ws:eligibility:v1:key:{key_id}"))
 }
 
+fn catalog_resource_state_key(
+    kind: CatalogResourceKind,
+    resource_id: &str,
+) -> Result<String, GatewayError> {
+    let resource_id = resource_id.trim();
+    if resource_id.is_empty() || resource_id.len() > 512 {
+        return Err(GatewayError::Internal(
+            "invalid codex ws catalog resource identity".to_string(),
+        ));
+    }
+    Ok(format!(
+        "{CATALOG_RESOURCE_KEY_PREFIX}:{}:{resource_id}",
+        kind.label()
+    ))
+}
+
+fn initial_catalog_resource_switch(eligible: bool, reason: Option<&str>) -> CatalogResourceSwitch {
+    CatalogResourceSwitch {
+        schema_version: CATALOG_RESOURCE_SCHEMA_VERSION,
+        hard_generation: uuid::Uuid::new_v4().to_string(),
+        drain_generation: uuid::Uuid::new_v4().to_string(),
+        stable: true,
+        eligible,
+        reason: reason.map(str::to_string),
+        transition_impact: None,
+    }
+}
+
+fn encode_catalog_resource_switch(
+    snapshot: &CatalogResourceSwitch,
+) -> Result<String, GatewayError> {
+    serde_json::to_string(snapshot).map_err(|error| {
+        GatewayError::Internal(format!(
+            "codex ws catalog resource hot-state encode: {error}"
+        ))
+    })
+}
+
+fn decode_catalog_resource_switch(raw: &str) -> Result<CatalogResourceSwitch, GatewayError> {
+    let snapshot: CatalogResourceSwitch = serde_json::from_str(raw).map_err(|error| {
+        GatewayError::Internal(format!(
+            "codex ws catalog resource hot-state decode: {error}"
+        ))
+    })?;
+    if snapshot.schema_version != CATALOG_RESOURCE_SCHEMA_VERSION {
+        return Err(GatewayError::Internal(
+            "unsupported codex ws catalog resource hot-state schema".to_string(),
+        ));
+    }
+    Ok(snapshot)
+}
+
 fn encode_switch(snapshot: &HotSwitch) -> Result<String, GatewayError> {
     serde_json::to_string(snapshot)
         .map_err(|error| GatewayError::Internal(format!("codex ws hot-state encode: {error}")))
@@ -893,12 +1476,264 @@ mod tests {
         key
     }
 
+    fn resource_seed(kind: CatalogResourceKind, id: &str) -> CodexWsCatalogResourceSeed {
+        CodexWsCatalogResourceSeed {
+            kind,
+            id: id.to_string(),
+            eligible: true,
+            ineligible_reason: "resource_ineligible",
+        }
+    }
+
+    async fn resource_lease(
+        state: &AppState,
+        kind: CatalogResourceKind,
+        id: &str,
+    ) -> CodexWsCatalogResourceLease {
+        let raw = state
+            .runtime_state
+            .kv_get(&catalog_resource_state_key(kind, id).expect("resource state key"))
+            .await
+            .expect("read resource state")
+            .expect("resource state should exist");
+        let snapshot = decode_catalog_resource_switch(&raw).expect("decode resource state");
+        assert!(snapshot.stable);
+        assert!(snapshot.eligible);
+        CodexWsCatalogResourceLease {
+            hard_generation: snapshot.hard_generation,
+            drain_generation: snapshot.drain_generation,
+        }
+    }
+
     #[test]
     fn refreshable_access_token_expiry_is_not_a_shared_hard_blocker() {
         let mut key = eligible_key();
         key.expires_at_unix_secs = Some(0);
         assert_eq!(key_runtime_eligibility(&key), (true, "eligible"));
         assert_eq!(known_key_runtime_blocker(&key), None);
+    }
+
+    #[tokio::test]
+    async fn catalog_mutation_impacts_have_distinct_bound_session_decisions() {
+        let runtime = Arc::new(RuntimeState::memory(MemoryRuntimeStateConfig::default()));
+        let state_a = AppState::new()
+            .expect("state A")
+            .with_runtime_state(Arc::clone(&runtime));
+        let state_b = AppState::new()
+            .expect("state B")
+            .with_runtime_state(runtime);
+        let seed = resource_seed(CatalogResourceKind::Provider, "provider-1");
+        ensure_catalog_resource_hot_leases(&state_a, std::slice::from_ref(&seed))
+            .await
+            .expect("initialize provider resource state");
+        let original = resource_lease(&state_a, seed.kind, &seed.id).await;
+
+        let selection_only = begin_catalog_resource_hot_mutation(
+            &state_a,
+            &seed,
+            CatalogMutationImpact::SelectionOnly,
+        )
+        .await
+        .expect("begin selection-only mutation");
+        let selection_transition_raw = state_b
+            .runtime_state
+            .kv_get(&catalog_resource_state_key(seed.kind, &seed.id).expect("state key"))
+            .await
+            .expect("read selection transition")
+            .expect("selection transition should exist");
+        assert_eq!(
+            validate_catalog_resource_switch(
+                Some(&selection_transition_raw),
+                &original,
+                "bound_provider_changed"
+            ),
+            Ok(CodexWsFenceDecision::Continue)
+        );
+        finish_catalog_resource_hot_mutation(&state_a, selection_only, true, None)
+            .await
+            .expect("finish selection-only mutation");
+        assert_eq!(
+            resource_lease(&state_b, seed.kind, &seed.id).await,
+            original
+        );
+
+        let drain =
+            begin_catalog_resource_hot_mutation(&state_a, &seed, CatalogMutationImpact::Drain)
+                .await
+                .expect("begin drain mutation");
+        let transition_raw = state_b
+            .runtime_state
+            .kv_get(&catalog_resource_state_key(seed.kind, &seed.id).expect("state key"))
+            .await
+            .expect("read transition")
+            .expect("transition should exist");
+        assert_eq!(
+            validate_catalog_resource_switch(
+                Some(&transition_raw),
+                &original,
+                "bound_provider_changed"
+            ),
+            Ok(CodexWsFenceDecision::ContinueAndDrain)
+        );
+        finish_catalog_resource_hot_mutation(&state_a, drain, true, None)
+            .await
+            .expect("finish drain mutation");
+        let after_drain = resource_lease(&state_b, seed.kind, &seed.id).await;
+        assert_eq!(after_drain.hard_generation, original.hard_generation);
+        assert_ne!(after_drain.drain_generation, original.drain_generation);
+
+        let hard =
+            begin_catalog_resource_hot_mutation(&state_a, &seed, CatalogMutationImpact::HardFence)
+                .await
+                .expect("begin hard mutation");
+        let hard_transition_raw = state_b
+            .runtime_state
+            .kv_get(&catalog_resource_state_key(seed.kind, &seed.id).expect("state key"))
+            .await
+            .expect("read hard transition")
+            .expect("hard transition should exist");
+        assert_eq!(
+            validate_catalog_resource_switch(
+                Some(&hard_transition_raw),
+                &after_drain,
+                "bound_provider_changed"
+            ),
+            Err("bound_provider_changed")
+        );
+        finish_catalog_resource_hot_mutation(&state_a, hard, true, None)
+            .await
+            .expect("finish hard mutation");
+        let after_hard_raw = state_b
+            .runtime_state
+            .kv_get(&catalog_resource_state_key(seed.kind, &seed.id).expect("state key"))
+            .await
+            .expect("read hard state")
+            .expect("hard state should exist");
+        assert_eq!(
+            validate_catalog_resource_switch(
+                Some(&after_hard_raw),
+                &after_drain,
+                "bound_provider_changed"
+            ),
+            Err("bound_provider_changed")
+        );
+    }
+
+    #[tokio::test]
+    async fn hard_generation_prevents_aba_after_transport_meaning_returns() {
+        let state = AppState::new().expect("state should build");
+        let seed = resource_seed(CatalogResourceKind::Endpoint, "endpoint-1");
+        ensure_catalog_resource_hot_leases(&state, std::slice::from_ref(&seed))
+            .await
+            .expect("initialize endpoint resource state");
+        let original = resource_lease(&state, seed.kind, &seed.id).await;
+
+        for _ in 0..2 {
+            let mutation = begin_catalog_resource_hot_mutation(
+                &state,
+                &seed,
+                CatalogMutationImpact::HardFence,
+            )
+            .await
+            .expect("begin hard mutation");
+            finish_catalog_resource_hot_mutation(&state, mutation, true, None)
+                .await
+                .expect("finish hard mutation");
+        }
+
+        let actual_raw = state
+            .runtime_state
+            .kv_get(&catalog_resource_state_key(seed.kind, &seed.id).expect("state key"))
+            .await
+            .expect("read endpoint state")
+            .expect("endpoint state should exist");
+        assert_eq!(
+            validate_catalog_resource_switch(
+                Some(&actual_raw),
+                &original,
+                "bound_endpoint_changed"
+            ),
+            Err("bound_endpoint_changed")
+        );
+    }
+
+    #[tokio::test]
+    async fn unrelated_provider_mutation_does_not_change_v2_bound_decision() {
+        let runtime = Arc::new(RuntimeState::memory(MemoryRuntimeStateConfig::default()));
+        let state_a = AppState::new()
+            .expect("state A")
+            .with_runtime_state(Arc::clone(&runtime));
+        let state_b = AppState::new()
+            .expect("state B")
+            .with_runtime_state(runtime);
+        let global = ensure_switch(
+            &state_a,
+            GLOBAL_STATE_KEY,
+            true,
+            "global_codex_ws_disabled",
+            None,
+        )
+        .await
+        .expect("initialize global state");
+        let catalog = ensure_catalog_hot_lease(&state_a)
+            .await
+            .expect("initialize catalog state");
+        let key = eligible_key();
+        let key_lease = ensure_key_hot_leases(&state_a, std::slice::from_ref(&key))
+            .await
+            .expect("initialize key state")
+            .remove(&key.id)
+            .expect("key lease");
+        let seeds = [
+            resource_seed(CatalogResourceKind::Provider, "provider-1"),
+            resource_seed(CatalogResourceKind::Endpoint, "endpoint-1"),
+            resource_seed(CatalogResourceKind::Provider, "provider-2"),
+        ];
+        let resources = ensure_catalog_resource_hot_leases(&state_a, &seeds)
+            .await
+            .expect("initialize resources");
+        let binding = resources
+            .binding("provider-1", "endpoint-1")
+            .expect("candidate binding");
+
+        let unrelated = begin_catalog_resource_hot_mutation(
+            &state_a,
+            &seeds[2],
+            CatalogMutationImpact::HardFence,
+        )
+        .await
+        .expect("begin unrelated provider mutation");
+        assert_eq!(
+            validate_hot_leases_v2(
+                &state_b,
+                "provider-1",
+                "endpoint-1",
+                &key.id,
+                &global.generation,
+                &catalog.generation,
+                &key_lease.generation,
+                &binding,
+            )
+            .await,
+            Ok(CodexWsFenceDecision::Continue)
+        );
+        finish_catalog_resource_hot_mutation(&state_a, unrelated, true, None)
+            .await
+            .expect("finish unrelated provider mutation");
+        assert_eq!(
+            validate_hot_leases_v2(
+                &state_b,
+                "provider-1",
+                "endpoint-1",
+                &key.id,
+                &global.generation,
+                &catalog.generation,
+                &key_lease.generation,
+                &binding,
+            )
+            .await,
+            Ok(CodexWsFenceDecision::Continue)
+        );
     }
 
     #[test]
@@ -1046,6 +1881,7 @@ mod tests {
             CodexWsFeatureFlags {
                 enabled: true,
                 native_codex_ws_enabled: true,
+                catalog_fence_v2_enabled: false,
             },
         )
         .await
@@ -1122,6 +1958,7 @@ mod tests {
                 CodexWsFeatureFlags {
                     enabled: true,
                     native_codex_ws_enabled: true,
+                    catalog_fence_v2_enabled: false,
                 },
             )
             .await

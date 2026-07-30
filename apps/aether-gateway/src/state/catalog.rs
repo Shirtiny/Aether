@@ -38,15 +38,77 @@ impl AppState {
         Ok(reconciled)
     }
 
-    async fn finish_codex_ws_catalog_hot_after_authoritative_read<T>(
+    async fn finish_codex_ws_provider_hot_after_authoritative_read(
         &self,
-        mutation: crate::codex_ws::hot_state::CodexWsHotMutation,
-        authoritative_read: Result<T, aether_data::DataLayerError>,
+        mutation: crate::codex_ws::hot_state::CodexWsCatalogResourceMutation,
+        authoritative_read: Result<
+            Vec<provider_catalog::StoredProviderCatalogProvider>,
+            aether_data::DataLayerError,
+        >,
     ) -> Result<(), GatewayError> {
         match authoritative_read {
-            Ok(_) => crate::codex_ws::hot_state::finish_catalog_hot_mutation(self, mutation).await,
+            Ok(providers) => {
+                let (eligible, reason) = providers
+                    .first()
+                    .map(codex_ws_provider_resource_eligibility)
+                    .unwrap_or((false, "provider_deleted"));
+                crate::codex_ws::hot_state::finish_catalog_resource_hot_mutation(
+                    self,
+                    mutation,
+                    eligible,
+                    (!eligible).then_some(reason),
+                )
+                .await
+            }
             Err(err) => {
-                crate::codex_ws::hot_state::leave_hot_mutation_unstable(self, mutation).await;
+                crate::codex_ws::hot_state::leave_catalog_resource_hot_mutation_unstable(
+                    self, mutation,
+                )
+                .await;
+                Err(GatewayError::Internal(err.to_string()))
+            }
+        }
+    }
+
+    async fn finish_codex_ws_endpoint_hot_after_authoritative_read(
+        &self,
+        mutation: crate::codex_ws::hot_state::CodexWsCatalogResourceMutation,
+        authoritative_read: Result<
+            Vec<provider_catalog::StoredProviderCatalogEndpoint>,
+            aether_data::DataLayerError,
+        >,
+    ) -> Result<(), GatewayError> {
+        match authoritative_read {
+            Ok(endpoints) => {
+                let (eligible, reason) = match endpoints.first() {
+                    Some(endpoint) => {
+                        let relevant = match self.endpoint_is_codex_ws_relevant(endpoint).await {
+                            Ok(relevant) => relevant,
+                            Err(error) => {
+                                crate::codex_ws::hot_state::leave_catalog_resource_hot_mutation_unstable(
+                                    self, mutation,
+                                )
+                                .await;
+                                return Err(error);
+                            }
+                        };
+                        (endpoint.is_active && relevant, "endpoint_ineligible")
+                    }
+                    None => (false, "endpoint_deleted"),
+                };
+                crate::codex_ws::hot_state::finish_catalog_resource_hot_mutation(
+                    self,
+                    mutation,
+                    eligible,
+                    (!eligible).then_some(reason),
+                )
+                .await
+            }
+            Err(err) => {
+                crate::codex_ws::hot_state::leave_catalog_resource_hot_mutation_unstable(
+                    self, mutation,
+                )
+                .await;
                 Err(GatewayError::Internal(err.to_string()))
             }
         }
@@ -634,7 +696,20 @@ impl AppState {
         shift_existing_priorities_from: Option<i32>,
     ) -> Result<Option<provider_catalog::StoredProviderCatalogProvider>, GatewayError> {
         let hot_mutation = if provider.provider_type.trim().eq_ignore_ascii_case("codex") {
-            Some(crate::codex_ws::hot_state::begin_catalog_hot_mutation(self).await?)
+            let seed = crate::codex_ws::hot_state::CodexWsCatalogResourceSeed {
+                kind: crate::codex_ws::hot_state::CatalogResourceKind::Provider,
+                id: provider.id.clone(),
+                eligible: false,
+                ineligible_reason: "provider_missing",
+            };
+            Some(
+                crate::codex_ws::hot_state::begin_catalog_resource_hot_mutation(
+                    self,
+                    &seed,
+                    crate::codex_ws::catalog_fence::CatalogMutationImpact::SelectionOnly,
+                )
+                .await?,
+            )
         } else {
             None
         };
@@ -646,9 +721,9 @@ impl AppState {
             self.data.clear_provider_catalog_cache();
             let authoritative = self
                 .data
-                .list_provider_catalog_providers_by_ids(&[provider.id.clone()])
+                .list_provider_catalog_providers_by_ids(std::slice::from_ref(&provider.id))
                 .await;
-            self.finish_codex_ws_catalog_hot_after_authoritative_read(mutation, authoritative)
+            self.finish_codex_ws_provider_hot_after_authoritative_read(mutation, authoritative)
                 .await?;
         }
         let created = created.map_err(|err| GatewayError::Internal(err.to_string()))?;
@@ -662,21 +737,60 @@ impl AppState {
         &self,
         provider: &provider_catalog::StoredProviderCatalogProvider,
     ) -> Result<Option<provider_catalog::StoredProviderCatalogProvider>, GatewayError> {
-        let existing_relevant = self.provider_is_codex_for_ws(&provider.id).await?;
-        let hot_mutation =
-            if existing_relevant || provider.provider_type.trim().eq_ignore_ascii_case("codex") {
-                Some(crate::codex_ws::hot_state::begin_catalog_hot_mutation(self).await?)
-            } else {
-                None
-            };
+        let existing = self
+            .data
+            .list_provider_catalog_providers_by_ids(std::slice::from_ref(&provider.id))
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))?
+            .into_iter()
+            .next();
+        let relevant = existing
+            .as_ref()
+            .is_some_and(|existing| existing.provider_type.trim().eq_ignore_ascii_case("codex"))
+            || provider.provider_type.trim().eq_ignore_ascii_case("codex");
+        let impact = if relevant {
+            Some(
+                existing
+                    .as_ref()
+                    .and_then(|existing| {
+                        crate::codex_ws::catalog_fence::classify_provider_update(existing, provider)
+                    })
+                    .unwrap_or(
+                        crate::codex_ws::catalog_fence::CatalogMutationImpact::SelectionOnly,
+                    ),
+            )
+        } else {
+            None
+        };
+        let hot_mutation = match impact {
+            Some(impact) => {
+                let (eligible, ineligible_reason) = existing
+                    .as_ref()
+                    .map(codex_ws_provider_resource_eligibility)
+                    .unwrap_or((false, "provider_missing"));
+                let seed = crate::codex_ws::hot_state::CodexWsCatalogResourceSeed {
+                    kind: crate::codex_ws::hot_state::CatalogResourceKind::Provider,
+                    id: provider.id.clone(),
+                    eligible,
+                    ineligible_reason,
+                };
+                Some(
+                    crate::codex_ws::hot_state::begin_catalog_resource_hot_mutation(
+                        self, &seed, impact,
+                    )
+                    .await?,
+                )
+            }
+            None => None,
+        };
         let updated = self.data.update_provider_catalog_provider(provider).await;
         if let Some(mutation) = hot_mutation {
             self.data.clear_provider_catalog_cache();
             let authoritative = self
                 .data
-                .list_provider_catalog_providers_by_ids(&[provider.id.clone()])
+                .list_provider_catalog_providers_by_ids(std::slice::from_ref(&provider.id))
                 .await;
-            self.finish_codex_ws_catalog_hot_after_authoritative_read(mutation, authoritative)
+            self.finish_codex_ws_provider_hot_after_authoritative_read(mutation, authoritative)
                 .await?;
         }
         let updated = updated.map_err(|err| GatewayError::Internal(err.to_string()))?;
@@ -690,10 +804,36 @@ impl AppState {
         &self,
         provider_id: &str,
     ) -> Result<bool, GatewayError> {
-        let hot_mutation = if self.provider_is_codex_for_ws(provider_id).await? {
-            Some(crate::codex_ws::hot_state::begin_catalog_hot_mutation(self).await?)
-        } else {
-            None
+        let existing = self
+            .data
+            .list_provider_catalog_providers_by_ids(&[provider_id.to_string()])
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))?
+            .into_iter()
+            .next();
+        let hot_mutation = match existing
+            .as_ref()
+            .filter(|provider| provider.provider_type.trim().eq_ignore_ascii_case("codex"))
+        {
+            Some(provider) => {
+                let (eligible, ineligible_reason) =
+                    codex_ws_provider_resource_eligibility(provider);
+                let seed = crate::codex_ws::hot_state::CodexWsCatalogResourceSeed {
+                    kind: crate::codex_ws::hot_state::CatalogResourceKind::Provider,
+                    id: provider_id.to_string(),
+                    eligible,
+                    ineligible_reason,
+                };
+                Some(
+                    crate::codex_ws::hot_state::begin_catalog_resource_hot_mutation(
+                        self,
+                        &seed,
+                        crate::codex_ws::catalog_fence::CatalogMutationImpact::HardFence,
+                    )
+                    .await?,
+                )
+            }
+            None => None,
         };
         let deleted = self
             .data
@@ -705,7 +845,7 @@ impl AppState {
                 .data
                 .list_provider_catalog_providers_by_ids(&[provider_id.to_string()])
                 .await;
-            self.finish_codex_ws_catalog_hot_after_authoritative_read(mutation, authoritative)
+            self.finish_codex_ws_provider_hot_after_authoritative_read(mutation, authoritative)
                 .await?;
         }
         let deleted = deleted.map_err(|err| GatewayError::Internal(err.to_string()))?;
@@ -755,7 +895,20 @@ impl AppState {
         endpoint: &provider_catalog::StoredProviderCatalogEndpoint,
     ) -> Result<Option<provider_catalog::StoredProviderCatalogEndpoint>, GatewayError> {
         let hot_mutation = if self.endpoint_is_codex_ws_relevant(endpoint).await? {
-            Some(crate::codex_ws::hot_state::begin_catalog_hot_mutation(self).await?)
+            let seed = crate::codex_ws::hot_state::CodexWsCatalogResourceSeed {
+                kind: crate::codex_ws::hot_state::CatalogResourceKind::Endpoint,
+                id: endpoint.id.clone(),
+                eligible: false,
+                ineligible_reason: "endpoint_missing",
+            };
+            Some(
+                crate::codex_ws::hot_state::begin_catalog_resource_hot_mutation(
+                    self,
+                    &seed,
+                    crate::codex_ws::catalog_fence::CatalogMutationImpact::SelectionOnly,
+                )
+                .await?,
+            )
         } else {
             None
         };
@@ -764,9 +917,9 @@ impl AppState {
             self.data.clear_provider_catalog_cache();
             let authoritative = self
                 .data
-                .list_provider_catalog_endpoints_by_ids(&[endpoint.id.clone()])
+                .list_provider_catalog_endpoints_by_ids(std::slice::from_ref(&endpoint.id))
                 .await;
-            self.finish_codex_ws_catalog_hot_after_authoritative_read(mutation, authoritative)
+            self.finish_codex_ws_endpoint_hot_after_authoritative_read(mutation, authoritative)
                 .await?;
         }
         let created = created.map_err(|err| GatewayError::Internal(err.to_string()))?;
@@ -782,7 +935,7 @@ impl AppState {
     ) -> Result<Option<provider_catalog::StoredProviderCatalogEndpoint>, GatewayError> {
         let existing = self
             .data
-            .list_provider_catalog_endpoints_by_ids(&[endpoint.id.clone()])
+            .list_provider_catalog_endpoints_by_ids(std::slice::from_ref(&endpoint.id))
             .await
             .map_err(|err| GatewayError::Internal(err.to_string()))?
             .into_iter()
@@ -792,19 +945,51 @@ impl AppState {
                 Some(existing) => self.endpoint_is_codex_ws_relevant(existing).await?,
                 None => false,
             };
-        let hot_mutation = if relevant {
-            Some(crate::codex_ws::hot_state::begin_catalog_hot_mutation(self).await?)
+        let impact = if relevant {
+            Some(
+                existing
+                    .as_ref()
+                    .and_then(|existing| {
+                        crate::codex_ws::catalog_fence::classify_endpoint_update(existing, endpoint)
+                    })
+                    .unwrap_or(
+                        crate::codex_ws::catalog_fence::CatalogMutationImpact::SelectionOnly,
+                    ),
+            )
         } else {
             None
+        };
+        let hot_mutation = match impact {
+            Some(impact) => {
+                let eligible = match existing.as_ref() {
+                    Some(existing) => {
+                        existing.is_active && self.endpoint_is_codex_ws_relevant(existing).await?
+                    }
+                    None => false,
+                };
+                let seed = crate::codex_ws::hot_state::CodexWsCatalogResourceSeed {
+                    kind: crate::codex_ws::hot_state::CatalogResourceKind::Endpoint,
+                    id: endpoint.id.clone(),
+                    eligible,
+                    ineligible_reason: "endpoint_ineligible",
+                };
+                Some(
+                    crate::codex_ws::hot_state::begin_catalog_resource_hot_mutation(
+                        self, &seed, impact,
+                    )
+                    .await?,
+                )
+            }
+            None => None,
         };
         let updated = self.data.update_provider_catalog_endpoint(endpoint).await;
         if let Some(mutation) = hot_mutation {
             self.data.clear_provider_catalog_cache();
             let authoritative = self
                 .data
-                .list_provider_catalog_endpoints_by_ids(&[endpoint.id.clone()])
+                .list_provider_catalog_endpoints_by_ids(std::slice::from_ref(&endpoint.id))
                 .await;
-            self.finish_codex_ws_catalog_hot_after_authoritative_read(mutation, authoritative)
+            self.finish_codex_ws_endpoint_hot_after_authoritative_read(mutation, authoritative)
                 .await?;
         }
         let updated = updated.map_err(|err| GatewayError::Internal(err.to_string()))?;
@@ -830,7 +1015,25 @@ impl AppState {
             None => false,
         };
         let hot_mutation = if relevant {
-            Some(crate::codex_ws::hot_state::begin_catalog_hot_mutation(self).await?)
+            let Some(endpoint) = existing.as_ref() else {
+                return Err(GatewayError::Internal(
+                    "relevant Codex WS endpoint disappeared before deletion".to_string(),
+                ));
+            };
+            let seed = crate::codex_ws::hot_state::CodexWsCatalogResourceSeed {
+                kind: crate::codex_ws::hot_state::CatalogResourceKind::Endpoint,
+                id: endpoint_id.to_string(),
+                eligible: endpoint.is_active,
+                ineligible_reason: "endpoint_ineligible",
+            };
+            Some(
+                crate::codex_ws::hot_state::begin_catalog_resource_hot_mutation(
+                    self,
+                    &seed,
+                    crate::codex_ws::catalog_fence::CatalogMutationImpact::HardFence,
+                )
+                .await?,
+            )
         } else {
             None
         };
@@ -844,7 +1047,7 @@ impl AppState {
                 .data
                 .list_provider_catalog_endpoints_by_ids(&[endpoint_id.to_string()])
                 .await;
-            self.finish_codex_ws_catalog_hot_after_authoritative_read(mutation, authoritative)
+            self.finish_codex_ws_endpoint_hot_after_authoritative_read(mutation, authoritative)
                 .await?;
         }
         let deleted = deleted.map_err(|err| GatewayError::Internal(err.to_string()))?;
@@ -1191,6 +1394,18 @@ impl AppState {
         }
         Ok(updated)
     }
+}
+
+fn codex_ws_provider_resource_eligibility(
+    provider: &provider_catalog::StoredProviderCatalogProvider,
+) -> (bool, &'static str) {
+    if !provider.provider_type.trim().eq_ignore_ascii_case("codex") {
+        return (false, "provider_type_changed");
+    }
+    if !provider.is_active {
+        return (false, "provider_inactive");
+    }
+    (true, "eligible")
 }
 
 fn codex_ws_key_shape_matches(
@@ -1677,6 +1892,81 @@ mod tests {
 
         crate::codex_ws::hot_state::leave_hot_mutation_unstable(&state, held_codex_ws_mutation)
             .await;
+    }
+
+    #[tokio::test]
+    async fn codex_scheduling_update_advances_only_the_provider_drain_generation() {
+        let mut provider = sample_codex_provider();
+        provider.config = Some(json!({
+            "pool_advanced": {
+                "scheduling_presets": [
+                    {"preset": "lru", "enabled": true},
+                    {"preset": "no_weight", "enabled": false}
+                ]
+            }
+        }));
+        let endpoint = sample_codex_endpoint();
+        let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![provider.clone()],
+            vec![endpoint.clone()],
+            vec![sample_codex_ws_key()],
+        ));
+        let state = AppState::new()
+            .expect("app state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(repository)
+                    .with_encryption_key_for_tests("test-encryption-key"),
+            );
+        let seeds = [
+            crate::codex_ws::hot_state::CodexWsCatalogResourceSeed {
+                kind: crate::codex_ws::hot_state::CatalogResourceKind::Provider,
+                id: provider.id.clone(),
+                eligible: true,
+                ineligible_reason: "provider_ineligible",
+            },
+            crate::codex_ws::hot_state::CodexWsCatalogResourceSeed {
+                kind: crate::codex_ws::hot_state::CatalogResourceKind::Endpoint,
+                id: endpoint.id.clone(),
+                eligible: true,
+                ineligible_reason: "endpoint_ineligible",
+            },
+        ];
+        let initial =
+            crate::codex_ws::hot_state::ensure_catalog_resource_hot_leases(&state, &seeds)
+                .await
+                .expect("initialize resource hot states")
+                .binding(&provider.id, &endpoint.id)
+                .expect("initial resource binding");
+
+        let mut updated = provider.clone();
+        updated.config = Some(json!({
+            "pool_advanced": {
+                "scheduling_presets": [
+                    {"preset": "lru", "enabled": false},
+                    {"preset": "no_weight", "enabled": true}
+                ]
+            }
+        }));
+        state
+            .update_provider_catalog_provider(&updated)
+            .await
+            .expect("provider update should succeed")
+            .expect("provider should update");
+
+        let actual = crate::codex_ws::hot_state::ensure_catalog_resource_hot_leases(&state, &seeds)
+            .await
+            .expect("read resource hot states")
+            .binding(&provider.id, &endpoint.id)
+            .expect("updated resource binding");
+        assert_eq!(
+            actual.provider.hard_generation,
+            initial.provider.hard_generation
+        );
+        assert_ne!(
+            actual.provider.drain_generation,
+            initial.provider.drain_generation
+        );
+        assert_eq!(actual.endpoint, initial.endpoint);
     }
 
     #[tokio::test]

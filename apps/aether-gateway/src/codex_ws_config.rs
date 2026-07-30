@@ -12,11 +12,15 @@ pub(crate) const CODEX_WS_SYSTEM_CONFIG_KEY: &str = "codex_ws";
 const DEFAULT_CODEX_WS_FEATURE_FLAGS: CodexWsFeatureFlags = CodexWsFeatureFlags {
     enabled: true,
     native_codex_ws_enabled: true,
+    // The v2 reader is deliberately opt-in. Writers can dual-publish the v2
+    // state before every gateway instance is upgraded.
+    catalog_fence_v2_enabled: false,
 };
 const ENABLED: u64 = 1 << 0;
 const NATIVE_CODEX_WS_ENABLED: u64 = 1 << 1;
-const SNAPSHOT_INITIALIZED: u64 = 1 << 2;
-const GENERATION_SHIFT: u32 = 3;
+const CATALOG_FENCE_V2_ENABLED: u64 = 1 << 2;
+const SNAPSHOT_INITIALIZED: u64 = 1 << 3;
+const GENERATION_SHIFT: u32 = 4;
 const STATE_MASK: u64 = (1 << GENERATION_SHIFT) - 1;
 const CONFIG_READ_ERROR_BACKOFF_MS: u64 = 250;
 
@@ -24,6 +28,7 @@ const CONFIG_READ_ERROR_BACKOFF_MS: u64 = 250;
 pub(crate) struct CodexWsFeatureFlags {
     pub(crate) enabled: bool,
     pub(crate) native_codex_ws_enabled: bool,
+    pub(crate) catalog_fence_v2_enabled: bool,
 }
 
 impl CodexWsFeatureFlags {
@@ -41,12 +46,18 @@ impl CodexWsFeatureFlags {
             } else {
                 0
             })
+            | (if self.catalog_fence_v2_enabled {
+                CATALOG_FENCE_V2_ENABLED
+            } else {
+                0
+            })
     }
 
     const fn from_bits(bits: u64) -> Self {
         Self {
             enabled: bits & ENABLED != 0,
             native_codex_ws_enabled: bits & NATIVE_CODEX_WS_ENABLED != 0,
+            catalog_fence_v2_enabled: bits & CATALOG_FENCE_V2_ENABLED != 0,
         }
     }
 }
@@ -231,6 +242,7 @@ pub(crate) fn parse_codex_ws_feature_flags(config: Option<&Value>) -> CodexWsFea
             config.get("native_codex_ws_enabled"),
             !config.contains_key("native_codex_ws_enabled"),
         ),
+        catalog_fence_v2_enabled: system_config_bool(config.get("catalog_fence_v2_enabled"), false),
     }
 }
 
@@ -252,6 +264,7 @@ mod tests {
         let enabled = CodexWsFeatureFlags {
             enabled: true,
             native_codex_ws_enabled: true,
+            catalog_fence_v2_enabled: false,
         };
 
         assert_eq!(parse_codex_ws_feature_flags(None), enabled);
@@ -261,6 +274,7 @@ mod tests {
             CodexWsFeatureFlags {
                 enabled: false,
                 native_codex_ws_enabled: true,
+                catalog_fence_v2_enabled: false,
             }
         );
         assert_eq!(
@@ -270,6 +284,7 @@ mod tests {
             CodexWsFeatureFlags {
                 enabled: true,
                 native_codex_ws_enabled: false,
+                catalog_fence_v2_enabled: false,
             }
         );
     }
@@ -292,6 +307,7 @@ mod tests {
             CodexWsFeatureFlags {
                 enabled: false,
                 native_codex_ws_enabled: true,
+                catalog_fence_v2_enabled: false,
             }
         );
     }
@@ -300,7 +316,8 @@ mod tests {
     fn parses_all_flags_from_one_config_object() {
         let flags = parse_codex_ws_feature_flags(Some(&json!({
             "enabled": true,
-            "native_codex_ws_enabled": true
+            "native_codex_ws_enabled": true,
+            "catalog_fence_v2_enabled": true
         })));
 
         assert_eq!(
@@ -308,6 +325,7 @@ mod tests {
             CodexWsFeatureFlags {
                 enabled: true,
                 native_codex_ws_enabled: true,
+                catalog_fence_v2_enabled: true,
             }
         );
         assert_eq!(
@@ -325,6 +343,7 @@ mod tests {
         let fresh = CodexWsFeatureFlags {
             enabled: true,
             native_codex_ws_enabled: true,
+            catalog_fence_v2_enabled: false,
         };
         let expected = snapshot.state.load(Ordering::Acquire);
         let written = snapshot.store(fresh);
@@ -344,6 +363,7 @@ mod tests {
         let enabled = CodexWsFeatureFlags {
             enabled: true,
             native_codex_ws_enabled: true,
+            catalog_fence_v2_enabled: false,
         };
         let original = snapshot.store(enabled);
         assert!(snapshot.is_current_native(original));
@@ -364,6 +384,7 @@ mod tests {
         let retained = snapshot.store(CodexWsFeatureFlags {
             enabled: true,
             native_codex_ws_enabled: true,
+            catalog_fence_v2_enabled: false,
         });
 
         snapshot.clear();
@@ -383,6 +404,7 @@ mod tests {
             CodexWsFeatureFlags {
                 enabled: true,
                 native_codex_ws_enabled: true,
+                catalog_fence_v2_enabled: false,
             },
         );
 
@@ -406,6 +428,7 @@ mod tests {
                     let lease = snapshot.store(CodexWsFeatureFlags {
                         enabled: index % 2 == 0,
                         native_codex_ws_enabled: index % 2 == 0,
+                        catalog_fence_v2_enabled: false,
                     });
                     generations
                         .lock()
@@ -462,6 +485,7 @@ mod tests {
             CodexWsFeatureFlags {
                 enabled: true,
                 native_codex_ws_enabled: true,
+                catalog_fence_v2_enabled: false,
             }
         );
 

@@ -107,8 +107,10 @@ adapter_proof_version=1
 ## 3. 隐藏的全局熔断
 
 系统配置 key 为 `codex_ws`。管理界面不暴露该配置；没有配置记录时，`enabled` 和
-`native_codex_ws_enabled` 缺省均为 `true`。对象中缺失的字段同样缺省开启，显式
-`false` 才关闭对应 gate。顶层值不是对象或字段存在但无法解析时 fail closed。
+`native_codex_ws_enabled` 缺省均为 `true`。资源级 catalog fence 读路径由
+`catalog_fence_v2_enabled` 控制，缺省为 `false`，用于先发布双写再独立灰度读路径。
+顶层值不是对象或字段存在但无法解析时，功能 gate fail closed；v2 开关无法解析时
+保持关闭。
 
 管理员日常只操作账号开关。全局配置仅用于紧急熔断：
 
@@ -119,7 +121,8 @@ Content-Type: application/json
 {
   "value": {
     "enabled": false,
-    "native_codex_ws_enabled": false
+    "native_codex_ws_enabled": false,
+    "catalog_fence_v2_enabled": false
   },
   "description": "Official Codex native WebSocket disabled"
 }
@@ -131,10 +134,14 @@ Content-Type: application/json
 DELETE /api/admin/system/configs/codex_ws
 ```
 
-也可显式写入两个 `true`。只有两个 gate 都为 `true` 才开放入口和官方原生
+也可显式写入前两个 gate 为 `true`。只有这两个 gate 都为 `true` 才开放入口和官方原生
 Connector。管理 API 写入或删除成功后会立即更新进程内原子快照，不要求重启。
 每次限制性变更都会推进 generation；已保留连接在后续执行 fence 发现 generation
 改变后失败关闭，不能继续使用旧配置写上游。
+
+`catalog_fence_v2_enabled=false` 不关闭 WebSocket，只让读路径继续使用 v1 的全局
+catalog 硬 fence。Provider/Endpoint 写路径始终同时发布 v1 和 v2 Redis 状态，因此
+该开关可动态关闭作为无 schema 回滚手段。
 
 全局熔断不是环境变量。`AETHER_CODEX_WS_*` 环境变量只负责容量和 worker 调优，
 不能改变功能开关。
@@ -272,11 +279,22 @@ profile 中任意 revision、crypto provider 或 buffer 字段不匹配都会 fa
 长连接的每个 turn 在 Provider write 前重新验证：
 
 - 全局配置 generation；
-- Provider/Endpoint/Key catalog generation；
+- 当前 Provider 和 Endpoint 的资源级 hard/drain generation；
+- 当前 Key 的 hard generation；
 - Key capability、活动状态和固定 profile；
 - 模型、配额、熔断、代理和并发；
 - 当前 binding fence。
 
+v2 将目录变更分为三类：
+
+| 变更 | 已绑定连接行为 |
+|---|---|
+| 展示字段或仅影响新候选的字段 | 继续，不改变资源代际 |
+| 调度预设、优先级、权重、健康分等 | 当前 step 允许执行并交付 terminal，随后 `close_after_terminal` |
+| 禁用/删除、代理、Endpoint URL、Header/Body、固定 profile 或未知执行字段 | Provider write 前拒绝，并发送未执行证明 |
+
+分类采用显式软字段 allow-list；新增或未知配置默认进入 hard fence。全局 catalog
+generation 只负责冷选择与本地缓存一致性，不再使无关 Provider 的已绑定连接失败。
 限制性账号变更、配额耗尽或候选失效会阻止后续写入。只有存在
 `codex_official_ws.not_executed` 证明时才允许发出 `client_reconnect`；否则关闭连接，
 由上层决定是否让用户显式重试。
@@ -285,7 +303,7 @@ profile 中任意 revision、crypto provider 或 buffer 字段不匹配都会 fa
 
 多实例生产环境必须使用共享 Redis runtime backend，并验证：
 
-- global/catalog/key generation 跨节点一致；
+- global/key generation 和 Provider/Endpoint hard/drain generation 跨节点一致；
 - 限制性变更的 mutation lock/CAS；
 - 节点丢失后的 lease 恢复；
 - Provider/Key 并发 permit 不会在节点间超卖。
@@ -441,16 +459,20 @@ http://aether:8080/v1
 
 先在 staging 执行：
 
-1. 部署代码，保持两端账号开关和 reconnect migration 关闭；
-2. 验证数据库没有意外 pending migration，并确认 `codex_ws` 没有遗留的显式关闭或损坏值；
-3. 对一个 Codex OAuth Key 启用账号级 WS；
-4. 确认 `configured=true`、`profile_effective=true`、
+1. 将包含 v2 writer 的同一版本部署到所有 gateway，保持
+   `catalog_fence_v2_enabled=false`；
+2. 验证所有实例都在目录写入时发布 `codex-ws:catalog-fence:v2:*`，且 v1 行为无回归；
+3. 确认集群中不再有旧 writer，再在 staging 设置
+   `catalog_fence_v2_enabled=true`；
+4. 验证数据库没有意外 pending migration，并确认 `codex_ws` 没有损坏值；
+5. 对一个 Codex OAuth Key 启用账号级 WS；
+6. 确认 `configured=true`、`profile_effective=true`、
    `runtime_eligible=null`、`runtime_state=request_scoped`；
-5. 打开一个 sub2api Aether 账号；
-6. 保持基础 route-v1 缺省开启，不打开 reconnect migration；
-7. 运行单 turn、多 turn、初始 failover、账号禁用和配额耗尽测试；
-8. 真实 reconnect fixture 通过后再打开 migration；
-9. 逐步扩大账号，同时观察连接延迟、CPU admission、队列深度、结算延迟和 RSS。
+7. 打开一个 sub2api Aether 账号；
+8. 保持基础 route-v1 缺省开启，不打开 reconnect migration；
+9. 运行单 turn、多 turn、软排空、硬阻断、无关 Provider 更新和配额耗尽测试；
+10. 真实 reconnect fixture 通过后再打开 migration；
+11. 逐步扩大账号，同时观察连接延迟、503 reason、排空次数、结算延迟和 RSS。
 
 如果必须保证链路始终经过 Aether，sub2api 客户端所属组必须是 Aether-only。混合组允许
 调度器在故障时切换到非 Aether 官方账号，这是设计行为。
@@ -459,10 +481,11 @@ http://aether:8080/v1
 
 最小影响顺序：
 
-1. 在 sub2api 关闭单个 Aether 账号，或显式关闭 `aether_route_control_enabled`；
-2. 在 Aether 关闭受影响 Codex Key 的账号级 WS；
-3. 向 Aether `codex_ws` 显式写入两个 `false`，执行全局熔断；
-4. 继续使用现有 HTTP/SSE 路由。
+1. 若仅 v2 判定异常，设置 `catalog_fence_v2_enabled=false` 回退到 v1 reader；
+2. 在 sub2api 关闭单个 Aether 账号，或显式关闭 `aether_route_control_enabled`；
+3. 在 Aether 关闭受影响 Codex Key 的账号级 WS；
+4. 向 Aether `codex_ws` 显式写入两个功能 gate 为 `false`，执行全局熔断；
+5. 继续使用现有 HTTP/SSE 路由。
 
 上述动态开关不要求数据库 schema 回滚。不要通过删除 Key、清除 OAuth 凭据或修改固定
 profile 来紧急止损。若部署版本同时包含其他数据库迁移，应在更新前单独审查；本文档

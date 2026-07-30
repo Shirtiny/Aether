@@ -547,24 +547,28 @@ pub(crate) async fn run_codex_ws_session(
     };
     let cleanup_permit = candidate.take_prewrite_cleanup_permit();
     let mut candidate_attempt = CandidateAttemptGuard::new(runtime, &candidate, cleanup_permit);
-    if let Err(error) = runtime.validate_candidate_current_state(&candidate).await {
-        step_usage.reject(
-            http::StatusCode::SERVICE_UNAVAILABLE.as_u16(),
-            error.reason,
-            "Codex WebSocket candidate changed before execution",
-            false,
-        );
-        candidate_attempt.abort().await;
-        send_not_executed_control(
-            &mut client,
-            &first_step,
-            error.reason,
-            error.middle_route_disposition,
-        )
-        .await;
-        best_effort_control_send(peer.as_mut(), RelayFrame::Close).await;
-        return;
-    }
+    let mut drain_after_terminal = match runtime.validate_candidate_current_state(&candidate).await
+    {
+        Ok(decision) => decision.should_drain(),
+        Err(error) => {
+            step_usage.reject(
+                http::StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                error.reason,
+                "Codex WebSocket candidate changed before execution",
+                false,
+            );
+            candidate_attempt.abort().await;
+            send_not_executed_control(
+                &mut client,
+                &first_step,
+                error.reason,
+                error.middle_route_disposition,
+            )
+            .await;
+            best_effort_control_send(peer.as_mut(), RelayFrame::Close).await;
+            return;
+        }
+    };
 
     let mut next_step = Some((first_step, true, step_usage));
     loop {
@@ -723,25 +727,28 @@ pub(crate) async fn run_codex_ws_session(
             best_effort_step_send(peer.as_mut(), RelayFrame::Close, &deadlines).await;
             return;
         }
-        if let Err(error) = runtime.validate_candidate_current_state(&candidate).await {
-            step_usage.reject(
-                http::StatusCode::SERVICE_UNAVAILABLE.as_u16(),
-                error.reason,
-                "Codex WebSocket candidate changed before provider execution",
-                false,
-            );
-            step_execution_guard.release().await;
-            drop(usage_report);
-            candidate_attempt.abort().await;
-            send_not_executed_control(
-                &mut client,
-                &step,
-                error.reason,
-                error.middle_route_disposition,
-            )
-            .await;
-            best_effort_control_send(peer.as_mut(), RelayFrame::Close).await;
-            return;
+        match runtime.validate_candidate_current_state(&candidate).await {
+            Ok(decision) => drain_after_terminal |= decision.should_drain(),
+            Err(error) => {
+                step_usage.reject(
+                    http::StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                    error.reason,
+                    "Codex WebSocket candidate changed before provider execution",
+                    false,
+                );
+                step_execution_guard.release().await;
+                drop(usage_report);
+                candidate_attempt.abort().await;
+                send_not_executed_control(
+                    &mut client,
+                    &step,
+                    error.reason,
+                    error.middle_route_disposition,
+                )
+                .await;
+                best_effort_control_send(peer.as_mut(), RelayFrame::Close).await;
+                return;
+            }
         }
         if tokio::time::Instant::now() >= provider_write_deadline {
             step_usage.reject(
@@ -909,6 +916,7 @@ pub(crate) async fn run_codex_ws_session(
                 terminal_frame,
             } => {
                 close_after_terminal |= !execution_lease_status.is_valid();
+                close_after_terminal |= drain_after_terminal;
                 settlement
                     .finish(
                         Some(terminal_event),
@@ -922,10 +930,11 @@ pub(crate) async fn run_codex_ws_session(
                 // This avoids turning a successfully completed response into
                 // a retry while preserving fail-closed checks before every
                 // provider write.
-                close_after_terminal |= runtime
-                    .validate_candidate_current_state(&candidate)
-                    .await
-                    .is_err();
+                close_after_terminal |=
+                    match runtime.validate_candidate_current_state(&candidate).await {
+                        Ok(decision) => decision.should_drain(),
+                        Err(_) => true,
+                    };
                 if !deliver_terminal_after_settlement(
                     &mut client,
                     &step,
@@ -2388,7 +2397,9 @@ mod tests {
         epoch: AtomicUsize,
         bump_epoch_during_prepare: AtomicBool,
         candidate_state_valid: AtomicBool,
+        candidate_state_should_drain: AtomicBool,
         invalidate_candidate_during_prepare: AtomicBool,
+        drain_candidate_during_prepare: AtomicBool,
         runtime_fences_valid: Arc<AtomicBool>,
         invalidate_fences_during_connect: AtomicBool,
         invalidate_fences_during_prepare: AtomicBool,
@@ -2434,7 +2445,9 @@ mod tests {
                 epoch: AtomicUsize::new(7),
                 bump_epoch_during_prepare: AtomicBool::new(false),
                 candidate_state_valid: AtomicBool::new(true),
+                candidate_state_should_drain: AtomicBool::new(false),
                 invalidate_candidate_during_prepare: AtomicBool::new(false),
+                drain_candidate_during_prepare: AtomicBool::new(false),
                 runtime_fences_valid,
                 invalidate_fences_during_connect: AtomicBool::new(false),
                 invalidate_fences_during_prepare: AtomicBool::new(false),
@@ -2645,6 +2658,13 @@ mod tests {
                 self.candidate_state_valid.store(false, Ordering::Release);
             }
             if self
+                .drain_candidate_during_prepare
+                .swap(false, Ordering::AcqRel)
+            {
+                self.candidate_state_should_drain
+                    .store(true, Ordering::Release);
+            }
+            if self
                 .invalidate_fences_during_prepare
                 .swap(false, Ordering::AcqRel)
             {
@@ -2659,12 +2679,18 @@ mod tests {
         async fn validate_candidate_current_state(
             &self,
             candidate: &CodexWsCandidate,
-        ) -> Result<(), StepPreparationError> {
+        ) -> Result<super::super::hot_state::CodexWsFenceDecision, StepPreparationError> {
             self.validate_candidate_fences(candidate)?;
-            self.candidate_state_valid
-                .load(Ordering::Acquire)
-                .then_some(())
-                .ok_or(StepPreparationError::retain("account_catalog_changed"))
+            if !self.candidate_state_valid.load(Ordering::Acquire) {
+                return Err(StepPreparationError::retain("account_catalog_changed"));
+            }
+            Ok(
+                if self.candidate_state_should_drain.load(Ordering::Acquire) {
+                    super::super::hot_state::CodexWsFenceDecision::ContinueAndDrain
+                } else {
+                    super::super::hot_state::CodexWsFenceDecision::Continue
+                },
+            )
         }
 
         async fn release_candidate_scheduling_resources(
@@ -2878,6 +2904,7 @@ mod tests {
             shared_global_generation: "global-generation".to_string(),
             shared_catalog_generation: "catalog-generation".to_string(),
             shared_key_generation: "key-generation".to_string(),
+            shared_catalog_binding: None,
             prewrite_cleanup_permit: None,
         }
     }
@@ -3293,6 +3320,56 @@ mod tests {
         let client_sent = client_sent.lock().expect("client frames should lock");
         assert!(client_sent.contains(&relay_text(terminal)));
         assert!(client_sent.contains(&RelayFrame::Close));
+        assert!(!client_sent.iter().any(|frame| match frame {
+            RelayFrame::Text(text) => text_bytes_contains(text, "codex_official_ws.not_executed"),
+            _ => false,
+        }));
+    }
+
+    #[tokio::test]
+    async fn catalog_drain_during_prepare_executes_once_then_closes_after_terminal() {
+        let created = json!({
+            "type": "response.created",
+            "response": {"id": "resp-drain", "model": "gpt-5.4"}
+        })
+        .to_string();
+        let terminal = json!({
+            "type": "response.completed",
+            "response": {"id": "resp-drain", "model": "gpt-5.4"}
+        })
+        .to_string();
+        let (official, official_sent) = ScriptedPeer::new([
+            (Duration::ZERO, relay_text(created)),
+            (Duration::ZERO, relay_text(terminal.clone())),
+        ]);
+        let runtime = TestRuntime::new(Box::new(official), false);
+        runtime
+            .drain_candidate_during_prepare
+            .store(true, Ordering::Release);
+        let (client, client_sent) = ScriptedPeer::new([(Duration::ZERO, relay_text(request()))]);
+
+        run_codex_ws_session(Box::new(client), &runtime).await;
+
+        assert_eq!(runtime.prepare_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(runtime.report_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(runtime.rejected_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(runtime.gate.snapshot().in_flight, 0);
+        assert_eq!(
+            official_sent
+                .lock()
+                .expect("official frames should lock")
+                .iter()
+                .filter(|frame| matches!(frame, RelayFrame::Text(_)))
+                .count(),
+            1
+        );
+        let client_sent = client_sent.lock().expect("client frames should lock");
+        assert!(client_sent.contains(&relay_text(terminal)));
+        assert!(client_sent.contains(&RelayFrame::Close));
+        assert!(client_sent.iter().any(|frame| match frame {
+            RelayFrame::Text(text) => text_bytes_contains(text, "close_after_terminal"),
+            _ => false,
+        }));
         assert!(!client_sent.iter().any(|frame| match frame {
             RelayFrame::Text(text) => text_bytes_contains(text, "codex_official_ws.not_executed"),
             _ => false,
