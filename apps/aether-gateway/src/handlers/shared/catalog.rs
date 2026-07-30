@@ -1520,18 +1520,30 @@ fn build_grok_quota_status_snapshot(
     source: &str,
 ) -> Option<Value> {
     let metadata = provider_quota_metadata_bucket(upstream_metadata, "grok")?;
-    let observed_at_unix_secs = provider_quota_timestamp_unix_secs(
+    // Billing refreshes deliberately leave the header observation timestamps
+    // alone, so take whichever source was seen most recently. Otherwise a key
+    // whose billing was just probed still reads as stale, and the
+    // `recent_refresh` scheduling preset orders it as if nothing happened.
+    let observed_at_unix_secs = [
+        metadata.get("observed_at").or_else(|| metadata.get("updated_at")),
         metadata
-            .get("observed_at")
-            .or_else(|| metadata.get("updated_at")),
-    );
+            .get("billing")
+            .and_then(Value::as_object)
+            .and_then(|billing| billing.get("observed_at")),
+    ]
+    .into_iter()
+    .filter_map(provider_quota_timestamp_unix_secs)
+    .max();
     let windows = metadata
         .get("windows")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
 
-    if windows.is_empty() && observed_at_unix_secs.is_none() {
+    // Billing alone is a complete quota view for a paid account: its rate-limit
+    // windows are a static ceiling that never reports usage.
+    let billing = metadata.get("billing").cloned();
+    if windows.is_empty() && observed_at_unix_secs.is_none() && billing.is_none() {
         return None;
     }
 
@@ -1552,7 +1564,14 @@ fn build_grok_quota_status_snapshot(
     let plan_type = provider_quota_metadata_string(
         metadata,
         &["plan_type", "subscription_tier", "tier", "plan"],
-    );
+    )
+    .or_else(|| {
+        // Only billing names the paid tier; the chat headers never carry it.
+        billing
+            .as_ref()
+            .and_then(Value::as_object)
+            .and_then(|billing| provider_quota_metadata_string(billing, &["plan"]))
+    });
 
     Some(json!({
         "version": 2,
@@ -1578,6 +1597,7 @@ fn build_grok_quota_status_snapshot(
         "retry_after_seconds": metadata.get("retry_after_seconds").cloned(),
         "status_code": metadata.get("status_code").cloned(),
         "headers_observed": metadata.get("headers_observed").cloned(),
+        "billing": billing,
         "windows": windows,
     }))
 }
@@ -2814,6 +2834,31 @@ mod tests {
         assert_eq!(window.get("remaining_value"), Some(&json!(19.0)));
         assert_eq!(window.get("limit_value"), Some(&json!(19.0)));
         assert_eq!(window.get("used_value"), Some(&json!(0.0)));
+    }
+
+    #[test]
+    fn grok_status_snapshot_freshness_follows_the_newest_of_headers_and_billing() {
+        let mut key = sample_catalog_key();
+        key.upstream_metadata = Some(json!({
+            "grok": {
+                "provider_type": "grok",
+                // Header observation is a day older than the billing probe.
+                "observed_at": 1_778_067_246u64,
+                "windows": [{"code": "requests", "limit": 8300.0, "remaining": 8300.0}],
+                "billing": {"plan": "SuperGrok", "observed_at": 1_778_153_646u64}
+            }
+        }));
+
+        let payload = provider_key_status_snapshot_payload(&key, "grok");
+        let quota = payload
+            .get("quota")
+            .and_then(Value::as_object)
+            .expect("quota snapshot should be object");
+
+        assert_eq!(quota.get("observed_at"), Some(&json!(1_778_153_646u64)));
+        assert_eq!(quota.get("updated_at"), Some(&json!(1_778_153_646u64)));
+        // Only billing names the paid tier.
+        assert_eq!(quota.get("plan_type"), Some(&json!("SuperGrok")));
     }
 
     #[test]

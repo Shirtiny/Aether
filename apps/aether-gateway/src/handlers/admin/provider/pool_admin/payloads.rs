@@ -448,7 +448,9 @@ fn admin_pool_normalize_codex_quota_snapshot_for_basis(
     quota_snapshot.insert("reason".to_string(), serde_json::Value::Null);
 }
 
-fn admin_pool_apply_codex_window_usage_summaries(
+/// Attach locally settled usage to each quota window that has a matching
+/// summary. Provider-agnostic: the caller decides which windows were counted.
+fn admin_pool_apply_window_usage_summaries(
     status_snapshot: &mut serde_json::Value,
     usage_by_code: Option<&BTreeMap<String, StoredProviderApiKeyWindowUsageSummary>>,
 ) {
@@ -510,6 +512,13 @@ fn admin_pool_attach_grok_local_usage_observation(
     else {
         return;
     };
+    // Once billing describes the subscription allowance directly, the lifetime
+    // counters no longer have to stand in for it. Showing them beside a real
+    // quota invites reading two different scales as one number.
+    if aether_provider_pool::grok_billing_has_authoritative_quota(quota.get("billing")) {
+        return;
+    }
+
     let Some(windows) = quota
         .get_mut("windows")
         .and_then(serde_json::Value::as_array_mut)
@@ -1247,7 +1256,7 @@ pub(super) fn build_admin_pool_key_payload(
     runtime: &AdminProviderPoolRuntimeState,
     pool_config: Option<AdminProviderPoolConfig>,
     pool_score: Option<&StoredPoolMemberScore>,
-    codex_cycle_usage_by_code: Option<&BTreeMap<String, StoredProviderApiKeyWindowUsageSummary>>,
+    window_usage_by_code: Option<&BTreeMap<String, StoredProviderApiKeyWindowUsageSummary>>,
     now_unix_secs: u64,
 ) -> serde_json::Value {
     let cooldown_reason = runtime.cooldown_reason_by_key.get(&key.id).cloned();
@@ -1289,10 +1298,7 @@ pub(super) fn build_admin_pool_key_payload(
     };
     let mut status_snapshot = provider_key_status_snapshot_payload(key, provider_type);
     if provider_type.trim().eq_ignore_ascii_case("codex") {
-        admin_pool_apply_codex_window_usage_summaries(
-            &mut status_snapshot,
-            codex_cycle_usage_by_code,
-        );
+        admin_pool_apply_window_usage_summaries(&mut status_snapshot, window_usage_by_code);
         admin_pool_prune_expired_codex_window_usage_at(&mut status_snapshot, now_unix_secs);
         admin_pool_normalize_codex_quota_snapshot_for_basis(
             &mut status_snapshot,
@@ -1302,6 +1308,10 @@ pub(super) fn build_admin_pool_key_payload(
             now_unix_secs,
         );
     } else if provider_type.trim().eq_ignore_ascii_case("grok") {
+        // Billing windows are counted over their own period, so they carry
+        // comparable usage. Without billing the lifetime totals are all there
+        // is, and they are attached as a plain observation instead.
+        admin_pool_apply_window_usage_summaries(&mut status_snapshot, window_usage_by_code);
         admin_pool_attach_grok_local_usage_observation(
             &mut status_snapshot,
             u64::from(key.request_count.unwrap_or_default()),
@@ -1812,6 +1822,30 @@ mod tests {
                 "请求上游剩余 100.0% (480/480, 本地累计已用 151) | Token上游剩余 100.0% (10000000/10000000, 本地累计已用 163673)".to_string()
             )
         );
+    }
+
+    #[test]
+    fn authoritative_billing_replaces_the_lifetime_usage_stand_in() {
+        let mut status_snapshot = json!({
+            "quota": {
+                "provider_type": "grok",
+                "billing": {"plan": "SuperGrok", "usage_percent": 100.0},
+                "windows": [{
+                    "code": "requests",
+                    "limit_value": 480,
+                    "remaining_value": 480
+                }]
+            }
+        });
+
+        admin_pool_attach_grok_local_usage_observation(&mut status_snapshot, 151, 163_673);
+
+        let quota = status_snapshot["quota"].as_object().expect("quota");
+        // Lifetime totals measure a different thing than the billing window, so
+        // they must not be attached beside it.
+        assert!(quota.get("usage_source").is_none());
+        assert!(quota["windows"][0].get("local_used_value").is_none());
+        assert!(quota["windows"][0].get("remaining_source").is_none());
     }
 
     #[test]

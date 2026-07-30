@@ -172,6 +172,48 @@ describe('providerKeyQuota', () => {
     )
   })
 
+  it('prefers the projected Grok billing windows over the static ceiling', () => {
+    expect(getQuotaDisplayText({
+      status_snapshot: {
+        quota: {
+          provider_type: 'grok',
+          code: 'exhausted',
+          exhausted: true,
+          plan_type: 'SuperGrok',
+          billing: { partial: false },
+          windows: [
+            {
+              code: 'requests',
+              scope: 'account',
+              remaining_ratio: 1,
+              remaining_value: 8300,
+              limit_value: 8300,
+              remaining_source: 'upstream_static_ceiling',
+            },
+            {
+              code: 'billing_weekly',
+              scope: 'account',
+              unit: 'percent',
+              used_ratio: 1,
+              remaining_ratio: 0,
+              is_exhausted: true,
+            },
+            {
+              code: 'billing_monthly',
+              scope: 'account',
+              unit: 'usd',
+              limit_value: 150,
+              used_value: 104.06,
+              remaining_value: 45.94,
+              used_ratio: 0.6937,
+              remaining_ratio: 0.3063,
+            },
+          ],
+        },
+      },
+    } as never, 'grok')).toBe('SuperGrok · 周剩余 0.0% · 月剩余 30.6% ($45.94/$150.00)')
+  })
+
   it('formats Gemini CLI AI credits from status snapshot and upstream metadata', () => {
     expect(getQuotaDisplayText({
       status_snapshot: {

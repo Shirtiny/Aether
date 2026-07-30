@@ -139,11 +139,16 @@ function formatQuotaValue(value: number | null | undefined): string {
 
 function getQuotaWindowValueText(window: QuotaWindowSnapshot | null | undefined): string | null {
   if (!window || typeof window.limit_value !== 'number' || window.limit_value <= 0) return null
+  // Currency windows carry dollars, so the unit has to be visible and the
+  // shared one-decimal rounding would drop cents.
+  const isCurrency = normalizeText(window.unit)?.toLowerCase() === 'usd'
+  const format = (value: number) =>
+    isCurrency ? `$${value.toFixed(2)}` : formatQuotaValue(value)
   if (typeof window.remaining_value === 'number') {
-    return `${formatQuotaValue(window.remaining_value)}/${formatQuotaValue(window.limit_value)}`
+    return `${format(window.remaining_value)}/${format(window.limit_value)}`
   }
   if (typeof window.used_value === 'number') {
-    return `${formatQuotaValue(Math.max(window.limit_value - window.used_value, 0))}/${formatQuotaValue(window.limit_value)}`
+    return `${format(Math.max(window.limit_value - window.used_value, 0))}/${format(window.limit_value)}`
   }
   return null
 }
@@ -289,6 +294,40 @@ function getKiroQuotaText(quota: QuotaStatusSnapshot): string | null {
   return normalizeText(quota.label)
 }
 
+/**
+ * Billing describes the subscription allowance that actually runs out, so it
+ * wins over the rate-limit windows a paid Grok account reports as a static
+ * ceiling. The backend projects it into ordinary quota windows, so this reads
+ * them through the same helpers as every other window.
+ */
+function getGrokBillingText(quota: QuotaStatusSnapshot): string | null {
+  const parts: string[] = []
+  const plan = normalizeText(quota.plan_type)
+  if (plan) parts.push(plan)
+
+  const windowParts = ([
+    ['周', 'billing_weekly'],
+    ['月', 'billing_monthly'],
+  ] as const)
+    .map(([label, code]) => {
+      const window = getQuotaWindow(quota, code)
+      const remainingPercent = getQuotaWindowRemainingPercent(window)
+      if (remainingPercent == null) return null
+      const valueText = getQuotaWindowValueText(window)
+      return `${label}剩余 ${formatPercent(remainingPercent)}${valueText ? ` (${valueText})` : ''}`
+    })
+    .filter((value): value is string => value != null)
+
+  if (windowParts.length === 0) return null
+  parts.push(...windowParts)
+
+  // A window that failed to refresh keeps its previous value, so say so rather
+  // than presenting a mixed-freshness view as current.
+  if (quota.billing?.partial === true) parts.push('部分窗口未刷新')
+
+  return parts.join(' · ')
+}
+
 function getGrokQuotaText(quota: QuotaStatusSnapshot): string | null {
   const code = normalizeText(quota.code)?.toLowerCase()
   if (code === 'banned') {
@@ -297,6 +336,9 @@ function getGrokQuotaText(quota: QuotaStatusSnapshot): string | null {
   if (code === 'forbidden') {
     return normalizeText(quota.label) || '访问受限'
   }
+
+  const billingText = getGrokBillingText(quota)
+  if (billingText) return billingText
 
   const modelWindows = getQuotaWindowsByScope(quota, 'model')
   const modelParts = modelWindows

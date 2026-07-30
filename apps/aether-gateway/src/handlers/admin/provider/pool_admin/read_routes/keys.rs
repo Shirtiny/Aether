@@ -34,7 +34,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-type AdminPoolCodexCycleUsageByKey =
+/// Locally settled usage for each key, keyed by the quota window it belongs to.
+type AdminPoolWindowUsageByKey =
     BTreeMap<String, BTreeMap<String, StoredProviderApiKeyWindowUsageSummary>>;
 
 fn admin_pool_json_u64(value: Option<&serde_json::Value>) -> Option<u64> {
@@ -127,9 +128,52 @@ fn admin_pool_codex_cycle_usage_request(
     })
 }
 
-fn admin_pool_codex_cycle_usage_requests(
+/// Grok's billing windows publish their own bounds, so the counted span is the
+/// billing period itself rather than a width subtracted from the reset.
+fn admin_pool_grok_billing_usage_request(
+    key: &StoredProviderCatalogKey,
+    window: &serde_json::Map<String, serde_json::Value>,
+    now_unix_secs: u64,
+) -> Option<ProviderApiKeyWindowUsageRequest> {
+    let window_code = window
+        .get("code")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|code| {
+            code.eq_ignore_ascii_case("billing_weekly")
+                || code.eq_ignore_ascii_case("billing_monthly")
+        })?
+        .to_ascii_lowercase();
+    let start_unix_secs = admin_pool_json_u64(window.get("window_start_at"))?;
+    let reset_at = admin_pool_json_u64(window.get("reset_at"))?;
+    if start_unix_secs >= reset_at || start_unix_secs >= now_unix_secs {
+        return None;
+    }
+
+    Some(ProviderApiKeyWindowUsageRequest {
+        provider_api_key_id: key.id.clone(),
+        window_code,
+        // A period that has already closed is still worth reporting in full.
+        end_unix_secs: now_unix_secs.min(reset_at),
+        start_unix_secs,
+    })
+}
+
+fn admin_pool_grok_billing_usage_requests(
     keys: &[StoredProviderCatalogKey],
     now_unix_secs: u64,
+) -> Vec<ProviderApiKeyWindowUsageRequest> {
+    admin_pool_window_usage_requests(keys, |key, window| {
+        admin_pool_grok_billing_usage_request(key, window, now_unix_secs)
+    })
+}
+
+fn admin_pool_window_usage_requests(
+    keys: &[StoredProviderCatalogKey],
+    mut build: impl FnMut(
+        &StoredProviderCatalogKey,
+        &serde_json::Map<String, serde_json::Value>,
+    ) -> Option<ProviderApiKeyWindowUsageRequest>,
 ) -> Vec<ProviderApiKeyWindowUsageRequest> {
     keys.iter()
         .flat_map(|key| {
@@ -143,25 +187,37 @@ fn admin_pool_codex_cycle_usage_requests(
                 .into_iter()
                 .flatten()
                 .filter_map(serde_json::Value::as_object)
-                .filter_map(|window| {
-                    admin_pool_codex_cycle_usage_request(key, window, now_unix_secs)
-                })
+                .filter_map(|window| build(key, window))
                 .collect::<Vec<_>>()
         })
         .collect()
 }
 
-async fn read_admin_pool_codex_cycle_usage_by_key(
+fn admin_pool_codex_cycle_usage_requests(
+    keys: &[StoredProviderCatalogKey],
+    now_unix_secs: u64,
+) -> Vec<ProviderApiKeyWindowUsageRequest> {
+    admin_pool_window_usage_requests(keys, |key, window| {
+        admin_pool_codex_cycle_usage_request(key, window, now_unix_secs)
+    })
+}
+
+/// Local usage counted over the same span each provider's quota windows cover,
+/// so the settled totals stay comparable to the upstream figures beside them.
+async fn read_admin_pool_window_usage_by_key(
     state: &AdminAppState<'_>,
     provider_type: &str,
     keys: &[StoredProviderCatalogKey],
     now_unix_secs: u64,
-) -> Result<AdminPoolCodexCycleUsageByKey, GatewayError> {
-    if !provider_type.trim().eq_ignore_ascii_case("codex") || keys.is_empty() {
+) -> Result<AdminPoolWindowUsageByKey, GatewayError> {
+    if keys.is_empty() {
         return Ok(BTreeMap::new());
     }
-
-    let requests = admin_pool_codex_cycle_usage_requests(keys, now_unix_secs);
+    let requests = match provider_type.trim().to_ascii_lowercase().as_str() {
+        "codex" => admin_pool_codex_cycle_usage_requests(keys, now_unix_secs),
+        "grok" => admin_pool_grok_billing_usage_requests(keys, now_unix_secs),
+        _ => return Ok(BTreeMap::new()),
+    };
     if requests.is_empty() {
         return Ok(BTreeMap::new());
     }
@@ -170,7 +226,7 @@ async fn read_admin_pool_codex_cycle_usage_by_key(
         .app()
         .summarize_usage_by_provider_api_key_windows(&requests)
         .await?;
-    let mut usage_by_key = AdminPoolCodexCycleUsageByKey::new();
+    let mut usage_by_key = AdminPoolWindowUsageByKey::new();
     for summary in summaries {
         let window_code = summary.window_code.trim().to_ascii_lowercase();
         if window_code.is_empty() {
@@ -758,7 +814,7 @@ pub(super) async fn build_admin_pool_list_keys_response(
         }
         _ => AdminProviderPoolRuntimeState::default(),
     };
-    let codex_cycle_usage_by_key = read_admin_pool_codex_cycle_usage_by_key(
+    let window_usage_by_key = read_admin_pool_window_usage_by_key(
         state,
         &provider.provider_type,
         &keys,
@@ -777,7 +833,7 @@ pub(super) async fn build_admin_pool_list_keys_response(
                 &runtime,
                 pool_config.clone(),
                 pool_scores_by_key_id.get(&key.id),
-                codex_cycle_usage_by_key.get(&key.id),
+                window_usage_by_key.get(&key.id),
                 now_unix_secs,
             )
         })
@@ -807,6 +863,65 @@ mod tests {
             true,
         )
         .expect("sample key should build")
+    }
+
+    fn grok_key_with_billing_windows() -> StoredProviderCatalogKey {
+        let mut key = sample_key("oauth");
+        key.status_snapshot = Some(json!({
+            "quota": {
+                "provider_type": "grok",
+                "windows": [
+                    // A header-observed window has no counted period.
+                    {"code": "requests", "limit_value": 8300, "remaining_value": 8300},
+                    {
+                        "code": "billing_weekly",
+                        "window_start_at": 1_000u64,
+                        "reset_at": 3_000u64
+                    },
+                    {
+                        "code": "billing_monthly",
+                        "window_start_at": 500u64,
+                        "reset_at": 4_000u64
+                    }
+                ]
+            }
+        }));
+        key
+    }
+
+    #[test]
+    fn grok_billing_usage_is_counted_over_the_billing_period() {
+        let keys = [grok_key_with_billing_windows()];
+        let requests = admin_pool_grok_billing_usage_requests(&keys, 2_000);
+
+        assert_eq!(requests.len(), 2, "only the billing windows are counted");
+        let weekly = requests
+            .iter()
+            .find(|request| request.window_code == "billing_weekly")
+            .expect("weekly request");
+        assert_eq!(weekly.start_unix_secs, 1_000);
+        // The period is still open, so it is counted up to now.
+        assert_eq!(weekly.end_unix_secs, 2_000);
+    }
+
+    #[test]
+    fn grok_billing_usage_stops_counting_at_a_closed_period() {
+        let keys = [grok_key_with_billing_windows()];
+        let requests = admin_pool_grok_billing_usage_requests(&keys, 9_000);
+
+        let weekly = requests
+            .iter()
+            .find(|request| request.window_code == "billing_weekly")
+            .expect("weekly request");
+        // Past the reset the window is closed; counting on to `now` would mix
+        // in the next period's traffic.
+        assert_eq!(weekly.end_unix_secs, 3_000);
+    }
+
+    #[test]
+    fn window_usage_is_not_counted_for_providers_without_counted_windows() {
+        let keys = [grok_key_with_billing_windows()];
+        assert!(admin_pool_codex_cycle_usage_requests(&keys, 2_000).is_empty());
     }
 
     #[test]
