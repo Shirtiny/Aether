@@ -2931,9 +2931,17 @@ mod tests {
             key_concurrent_limit: None,
             key_rpm_limit: None,
             shared_global_generation: "global-generation".to_string(),
-            shared_catalog_generation: "catalog-generation".to_string(),
             shared_key_generation: "key-generation".to_string(),
-            shared_catalog_binding: None,
+            shared_catalog_binding: super::super::hot_state::CodexWsCatalogBindingLease {
+                provider: super::super::hot_state::CodexWsCatalogResourceLease {
+                    hard_generation: "provider-hard-generation".to_string(),
+                    drain_generation: "provider-drain-generation".to_string(),
+                },
+                endpoint: super::super::hot_state::CodexWsCatalogResourceLease {
+                    hard_generation: "endpoint-hard-generation".to_string(),
+                    drain_generation: "endpoint-drain-generation".to_string(),
+                },
+            },
             prewrite_cleanup_permit: None,
         }
     }

@@ -22,7 +22,6 @@ const MUTATION_RECOVERY_TIMEOUT: Duration = Duration::from_secs(1);
 const GLOBAL_STATE_KEY: &str = "codex-ws:eligibility:v1:global";
 const CATALOG_STATE_KEY: &str = "codex-ws:eligibility:v1:catalog";
 const CATALOG_RESOURCE_KEY_PREFIX: &str = "codex-ws:catalog-fence:v2";
-const CATALOG_FENCE_FEATURE_STATE_KEY: &str = "codex-ws:catalog-fence:v2:reader";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -40,12 +39,6 @@ struct HotSwitch {
 pub(crate) struct CodexWsHotLease {
     pub(crate) generation: String,
     pub(crate) eligible: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CodexWsCatalogFenceFeatureLease {
-    pub(crate) generation: String,
-    pub(crate) enabled: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -163,7 +156,6 @@ pub(crate) struct CodexWsCatalogWriteLock {
 pub(crate) struct CodexWsHotMutation {
     state_key: String,
     transition_raw: String,
-    feature_transition_raw: Option<String>,
     lock: RenewableMutationLock,
 }
 
@@ -242,7 +234,6 @@ pub(crate) async fn ensure_global_hot_lease(
         .await
         .map_err(|error| GatewayError::Internal(error.to_string()))?;
     let flags = parse_codex_ws_feature_flags(config.as_ref());
-    publish_catalog_fence_feature_state(state, flags.catalog_fence_v2_enabled).await?;
     ensure_switch(
         state,
         GLOBAL_STATE_KEY,
@@ -259,58 +250,8 @@ pub(crate) async fn ensure_catalog_hot_lease(
     ensure_switch(state, CATALOG_STATE_KEY, true, "catalog_unavailable", None).await
 }
 
-pub(crate) async fn ensure_catalog_fence_feature_lease(
-    state: &AppState,
-) -> Result<CodexWsCatalogFenceFeatureLease, GatewayError> {
-    if let Some(snapshot) = read_switch(state, CATALOG_FENCE_FEATURE_STATE_KEY).await? {
-        return Ok(catalog_fence_feature_lease(snapshot));
-    }
-    let config = state
-        .data
-        .find_system_config_value(crate::codex_ws_config::CODEX_WS_SYSTEM_CONFIG_KEY)
-        .await
-        .map_err(|error| GatewayError::Internal(error.to_string()))?;
-    let enabled = parse_codex_ws_feature_flags(config.as_ref()).catalog_fence_v2_enabled;
-    let lease = ensure_switch(
-        state,
-        CATALOG_FENCE_FEATURE_STATE_KEY,
-        enabled,
-        "catalog_fence_v2_disabled",
-        None,
-    )
-    .await?;
-    Ok(CodexWsCatalogFenceFeatureLease {
-        generation: lease.generation,
-        enabled: lease.eligible,
-    })
-}
-
-async fn publish_catalog_fence_feature_state(
-    state: &AppState,
-    enabled: bool,
-) -> Result<(), GatewayError> {
-    let snapshot = HotSwitch {
-        schema_version: HOT_STATE_SCHEMA_VERSION,
-        generation: uuid::Uuid::new_v4().to_string(),
-        stable: true,
-        eligible: enabled,
-        reason: (!enabled).then_some("catalog_fence_v2_disabled".to_string()),
-        valid_until_unix_secs: None,
-    };
-    state
-        .runtime_state
-        .kv_set(
-            CATALOG_FENCE_FEATURE_STATE_KEY,
-            encode_switch(&snapshot)?,
-            Some(HOT_STATE_TTL),
-        )
-        .await
-        .map_err(hot_state_error)
-}
-
-/// Lazily publishes resource-scoped v2 state from the same authoritative
-/// snapshots used by candidate planning. Writers publish this state even
-/// while the reader flag is disabled, which permits a mixed-version rollout.
+/// Lazily publishes resource-scoped state from the same authoritative
+/// snapshots used by candidate planning.
 pub(crate) async fn ensure_catalog_resource_hot_leases(
     state: &AppState,
     seeds: &[CodexWsCatalogResourceSeed],
@@ -633,50 +574,10 @@ fn decode_key_hot_leases(
 
 pub(crate) async fn validate_hot_leases(
     state: &AppState,
-    key_id: &str,
-    global_generation: &str,
-    catalog_generation: &str,
-    key_generation: &str,
-) -> Result<(), &'static str> {
-    let key_state_key = key_state_key(key_id).map_err(|_| "account_hot_state_invalid")?;
-    let keys = vec![
-        GLOBAL_STATE_KEY.to_string(),
-        CATALOG_STATE_KEY.to_string(),
-        key_state_key,
-    ];
-    let values = state
-        .runtime_state
-        .kv_get_many(&keys)
-        .await
-        .map_err(|_| "account_hot_state_unavailable")?;
-    if values.len() != 3 {
-        return Err("account_hot_state_unavailable");
-    }
-    validate_switch(
-        values[0].as_deref(),
-        global_generation,
-        "codex_ws_global_changed",
-    )?;
-    validate_switch(
-        values[1].as_deref(),
-        catalog_generation,
-        "account_catalog_changed",
-    )?;
-    validate_switch(
-        values[2].as_deref(),
-        key_generation,
-        "bound_account_ineligible",
-    )?;
-    Ok(())
-}
-
-pub(crate) async fn validate_hot_leases_v2(
-    state: &AppState,
     provider_id: &str,
     endpoint_id: &str,
     key_id: &str,
     global_generation: &str,
-    _catalog_generation: &str,
     key_generation: &str,
     binding: &CodexWsCatalogBindingLease,
 ) -> Result<CodexWsFenceDecision, &'static str> {
@@ -765,12 +666,7 @@ fn validate_catalog_resource_switch(
 pub(crate) async fn begin_global_hot_mutation(
     state: &AppState,
 ) -> Result<CodexWsHotMutation, GatewayError> {
-    let mut mutation = begin_mutation(state, GLOBAL_STATE_KEY, "global").await?;
-    if let Err(error) = begin_catalog_fence_feature_transition(state, &mut mutation).await {
-        leave_hot_mutation_unstable(state, mutation).await;
-        return Err(error);
-    }
-    Ok(mutation)
+    begin_mutation(state, GLOBAL_STATE_KEY, "global").await
 }
 
 pub(crate) async fn finish_global_hot_mutation(
@@ -788,13 +684,6 @@ pub(crate) async fn finish_global_hot_mutation(
             None,
         )
         .await;
-    }
-    if let Err(error) =
-        finish_catalog_fence_feature_transition(state, &mutation, flags.catalog_fence_v2_enabled)
-            .await
-    {
-        leave_hot_mutation_unstable(state, mutation).await;
-        return Err(error);
     }
     finish_mutation(
         state,
@@ -1105,7 +994,6 @@ async fn begin_mutation(
     Ok(CodexWsHotMutation {
         state_key: state_key.to_string(),
         transition_raw,
-        feature_transition_raw: None,
         lock,
     })
 }
@@ -1178,90 +1066,6 @@ async fn acquire_renewable_mutation_lock(
         lease_lost,
         confirmed_until_unix_ms,
     })
-}
-
-async fn begin_catalog_fence_feature_transition(
-    state: &AppState,
-    mutation: &mut CodexWsHotMutation,
-) -> Result<(), GatewayError> {
-    let transition = HotSwitch {
-        schema_version: HOT_STATE_SCHEMA_VERSION,
-        generation: uuid::Uuid::new_v4().to_string(),
-        stable: false,
-        eligible: false,
-        reason: Some("global_mutation_in_progress".to_string()),
-        valid_until_unix_secs: None,
-    };
-    let transition_raw = encode_switch(&transition)?;
-    let previous_raw = state
-        .runtime_state
-        .kv_get(CATALOG_FENCE_FEATURE_STATE_KEY)
-        .await
-        .map_err(hot_state_error)?;
-    let wrote = match previous_raw.as_deref() {
-        Some(previous_raw) => state
-            .runtime_state
-            .kv_set_if_value(
-                CATALOG_FENCE_FEATURE_STATE_KEY,
-                previous_raw,
-                transition_raw.clone(),
-                HOT_TRANSITION_TTL,
-            )
-            .await
-            .map_err(hot_state_error)?,
-        None => state
-            .runtime_state
-            .kv_set_if_absent(
-                CATALOG_FENCE_FEATURE_STATE_KEY,
-                transition_raw.clone(),
-                HOT_TRANSITION_TTL,
-            )
-            .await
-            .map_err(hot_state_error)?,
-    };
-    if !wrote {
-        return Err(GatewayError::Internal(
-            "codex ws catalog fence feature state changed before global mutation".to_string(),
-        ));
-    }
-    mutation.feature_transition_raw = Some(transition_raw);
-    Ok(())
-}
-
-async fn finish_catalog_fence_feature_transition(
-    state: &AppState,
-    mutation: &CodexWsHotMutation,
-    enabled: bool,
-) -> Result<(), GatewayError> {
-    let Some(transition_raw) = mutation.feature_transition_raw.as_deref() else {
-        return publish_catalog_fence_feature_state(state, enabled).await;
-    };
-    let stable = HotSwitch {
-        schema_version: HOT_STATE_SCHEMA_VERSION,
-        generation: uuid::Uuid::new_v4().to_string(),
-        stable: true,
-        eligible: enabled,
-        reason: (!enabled).then_some("catalog_fence_v2_disabled".to_string()),
-        valid_until_unix_secs: None,
-    };
-    let stable_raw = encode_switch(&stable)?;
-    if state
-        .runtime_state
-        .kv_set_if_value(
-            CATALOG_FENCE_FEATURE_STATE_KEY,
-            transition_raw,
-            stable_raw,
-            HOT_STATE_TTL,
-        )
-        .await
-        .map_err(hot_state_error)?
-    {
-        Ok(())
-    } else {
-        Err(GatewayError::Internal(
-            "codex ws catalog fence feature mutation lost its strict CAS".to_string(),
-        ))
-    }
 }
 
 async fn finish_mutation(
@@ -1515,13 +1319,6 @@ fn hot_lease(snapshot: HotSwitch) -> CodexWsHotLease {
     CodexWsHotLease {
         generation: snapshot.generation,
         eligible: snapshot.stable && snapshot.eligible && within_validity,
-    }
-}
-
-fn catalog_fence_feature_lease(snapshot: HotSwitch) -> CodexWsCatalogFenceFeatureLease {
-    CodexWsCatalogFenceFeatureLease {
-        generation: snapshot.generation,
-        enabled: snapshot.stable && snapshot.eligible,
     }
 }
 
@@ -2012,7 +1809,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unrelated_provider_mutation_does_not_change_v2_bound_decision() {
+    async fn unrelated_provider_mutation_does_not_change_bound_decision() {
         let runtime = Arc::new(RuntimeState::memory(MemoryRuntimeStateConfig::default()));
         let state_a = AppState::new()
             .expect("state A")
@@ -2029,9 +1826,6 @@ mod tests {
         )
         .await
         .expect("initialize global state");
-        let catalog = ensure_catalog_hot_lease(&state_a)
-            .await
-            .expect("initialize catalog state");
         let key = eligible_key();
         let key_lease = ensure_key_hot_leases(&state_a, std::slice::from_ref(&key))
             .await
@@ -2058,13 +1852,12 @@ mod tests {
         .await
         .expect("begin unrelated provider mutation");
         assert_eq!(
-            validate_hot_leases_v2(
+            validate_hot_leases(
                 &state_b,
                 "provider-1",
                 "endpoint-1",
                 &key.id,
                 &global.generation,
-                &catalog.generation,
                 &key_lease.generation,
                 &binding,
             )
@@ -2075,13 +1868,12 @@ mod tests {
             .await
             .expect("finish unrelated provider mutation");
         assert_eq!(
-            validate_hot_leases_v2(
+            validate_hot_leases(
                 &state_b,
                 "provider-1",
                 "endpoint-1",
                 &key.id,
                 &global.generation,
-                &catalog.generation,
                 &key_lease.generation,
                 &binding,
             )
@@ -2166,65 +1958,6 @@ mod tests {
         assert!(!observed.eligible);
         assert_ne!(observed.generation, enabled.generation);
         assert_ne!(observed.generation, transition_generation);
-    }
-
-    #[tokio::test]
-    async fn catalog_fence_reader_flag_is_shared_and_reversible_across_instances() {
-        let runtime = Arc::new(RuntimeState::memory(MemoryRuntimeStateConfig::default()));
-        let state_a = AppState::new()
-            .expect("state A")
-            .with_runtime_state(Arc::clone(&runtime));
-        let state_b = AppState::new()
-            .expect("state B")
-            .with_runtime_state(runtime);
-        ensure_switch(
-            &state_a,
-            GLOBAL_STATE_KEY,
-            true,
-            "global_codex_ws_disabled",
-            None,
-        )
-        .await
-        .expect("initialize global state");
-
-        let enable = begin_global_hot_mutation(&state_a)
-            .await
-            .expect("begin feature enable");
-        finish_global_hot_mutation(
-            &state_a,
-            enable,
-            CodexWsFeatureFlags {
-                enabled: true,
-                native_codex_ws_enabled: true,
-                catalog_fence_v2_enabled: true,
-            },
-        )
-        .await
-        .expect("publish feature enable");
-        let enabled = ensure_catalog_fence_feature_lease(&state_b)
-            .await
-            .expect("instance B reads enabled feature");
-        assert!(enabled.enabled);
-
-        let disable = begin_global_hot_mutation(&state_a)
-            .await
-            .expect("begin feature rollback");
-        finish_global_hot_mutation(
-            &state_a,
-            disable,
-            CodexWsFeatureFlags {
-                enabled: true,
-                native_codex_ws_enabled: true,
-                catalog_fence_v2_enabled: false,
-            },
-        )
-        .await
-        .expect("publish feature rollback");
-        let disabled = ensure_catalog_fence_feature_lease(&state_b)
-            .await
-            .expect("instance B reads rolled-back feature");
-        assert!(!disabled.enabled);
-        assert_ne!(disabled.generation, enabled.generation);
     }
 
     #[tokio::test]
@@ -2316,7 +2049,6 @@ mod tests {
             CodexWsFeatureFlags {
                 enabled: true,
                 native_codex_ws_enabled: true,
-                catalog_fence_v2_enabled: false,
             },
         )
         .await
@@ -2394,7 +2126,6 @@ mod tests {
                 CodexWsFeatureFlags {
                     enabled: true,
                     native_codex_ws_enabled: true,
-                    catalog_fence_v2_enabled: false,
                 },
             )
             .await

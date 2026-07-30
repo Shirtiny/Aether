@@ -107,10 +107,8 @@ adapter_proof_version=1
 ## 3. 隐藏的全局熔断
 
 系统配置 key 为 `codex_ws`。管理界面不暴露该配置；没有配置记录时，`enabled` 和
-`native_codex_ws_enabled` 缺省均为 `true`。资源级 catalog fence 读路径由
-`catalog_fence_v2_enabled` 控制，缺省为 `false`，用于先发布双写再独立灰度读路径。
-顶层值不是对象或字段存在但无法解析时，功能 gate fail closed；v2 开关无法解析时
-保持关闭。
+`native_codex_ws_enabled` 缺省均为 `true`。资源级 catalog fence 固定启用，没有独立的
+灰度配置。顶层值不是对象，或这两个已知字段存在但无法解析时，功能 gate fail closed。
 
 管理员日常只操作账号开关。全局配置仅用于紧急熔断：
 
@@ -121,8 +119,7 @@ Content-Type: application/json
 {
   "value": {
     "enabled": false,
-    "native_codex_ws_enabled": false,
-    "catalog_fence_v2_enabled": false
+    "native_codex_ws_enabled": false
   },
   "description": "Official Codex native WebSocket disabled"
 }
@@ -135,16 +132,15 @@ DELETE /api/admin/system/configs/codex_ws
 ```
 
 也可显式写入前两个 gate 为 `true`。只有这两个 gate 都为 `true` 才开放入口和官方原生
-Connector。管理 API 写入或删除成功后会立即发布共享的 v2 reader runtime-state 快照，
-不要求重启；所有 gateway 实例读取同一份 feature lease，不能依赖进程内缓存。会话级
-global gate 仍保留进程内原子代际，并由共享 global hot-state 在跨实例执行 fence 上兜底。
+Connector。管理 API 写入或删除成功后会立即更新进程内 feature generation，并发布共享
+global hot-state，不要求重启。会话级 global gate 由共享状态在跨实例执行 fence 上兜底。
 每次限制性变更都会推进 generation；已保留连接在后续执行 fence 发现 generation
 改变后失败关闭，不能继续使用旧配置写上游。
 
-`catalog_fence_v2_enabled=false` 不关闭 WebSocket，只让读路径继续使用 v1 的全局
-catalog 硬 fence。Provider/Endpoint 写路径先通过共享目录写锁串行化分类，再始终同时发布
-v1 和 v2 Redis 状态，因此
-该开关可动态关闭作为无 schema 回滚手段。
+Provider/Endpoint 写路径通过共享目录写锁串行化分类，并发布资源级 Redis 状态。候选必须
+绑定对应 Provider 和 Endpoint 的资源代际；绑定缺失或状态不可用时失败关闭，不回退到全局
+catalog 硬 fence。Redis key `codex-ws:catalog-fence:v2:*` 中的 `v2` 仅表示状态 schema
+命名空间，不是功能开关。
 
 全局熔断不是环境变量。`AETHER_CODEX_WS_*` 环境变量只负责容量和 worker 调优，
 不能改变功能开关。
@@ -288,7 +284,7 @@ profile 中任意 revision、crypto provider 或 buffer 字段不匹配都会 fa
 - 模型、配额、熔断、代理和并发；
 - 当前 binding fence。
 
-v2 将目录变更分为三类：
+资源级 catalog fence 将目录变更分为三类：
 
 | 变更 | 已绑定连接行为 |
 |---|---|
@@ -465,13 +461,11 @@ http://aether:8080/v1
 
 先在 staging 执行：
 
-1. 将包含 v2 writer 的同一版本部署到所有 gateway，保持
-   `catalog_fence_v2_enabled=false`；
-2. 验证所有实例都在目录写入时发布 `codex-ws:catalog-fence:v2:*`，且 v1 行为无回归；
-3. 确认集群中不再有旧 writer，再在 staging 设置
-   `catalog_fence_v2_enabled=true`；
+1. 在跨版本滚动更新前，将 `enabled` 和 `native_codex_ws_enabled` 都设为 `false`；
+2. 将同一版本部署到所有 gateway，确认集群中不再有旧 writer；
+3. 验证所有实例都在目录写入时发布 `codex-ws:catalog-fence:v2:*`，并使用共享目录写锁；
 4. 验证数据库没有意外 pending migration，并确认 `codex_ws` 没有损坏值；
-5. 对一个 Codex OAuth Key 启用账号级 WS；
+5. 将两个全局 gate 恢复为 `true`，对一个 Codex OAuth Key 启用账号级 WS；
 6. 确认 `configured=true`、`profile_effective=true`、
    `runtime_eligible=null`、`runtime_state=request_scoped`；
 7. 打开一个 sub2api Aether 账号；
@@ -487,13 +481,13 @@ http://aether:8080/v1
 
 最小影响顺序：
 
-1. 若仅 v2 判定异常，设置 `catalog_fence_v2_enabled=false` 回退到 v1 reader；
-2. 在 sub2api 关闭单个 Aether 账号，或显式关闭 `aether_route_control_enabled`；
-3. 在 Aether 关闭受影响 Codex Key 的账号级 WS；
-4. 向 Aether `codex_ws` 显式写入两个功能 gate 为 `false`，执行全局熔断；
+1. 在 sub2api 关闭单个 Aether 账号，或显式关闭 `aether_route_control_enabled`；
+2. 在 Aether 关闭受影响 Codex Key 的账号级 WS；
+3. 向 Aether `codex_ws` 显式写入两个功能 gate 为 `false`，执行全局熔断；
+4. 若必须回退二进制版本，保持全局熔断，直到所有 gateway 都处于同一版本；
 5. 继续使用现有 HTTP/SSE 路由。
 
-上述动态开关不要求数据库 schema 回滚。不要通过删除 Key、清除 OAuth 凭据或修改固定
+上述关闭手段不要求数据库 schema 回滚。不要通过删除 Key、清除 OAuth 凭据或修改固定
 profile 来紧急止损。若部署版本同时包含其他数据库迁移，应在更新前单独审查；本文档
 只描述 Codex WS，本功能自身没有新增 schema migration。
 
