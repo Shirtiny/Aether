@@ -594,7 +594,7 @@
                         />
                       </Button>
                       <span
-                        v-if="keyUiStateMap[key.key_id]?.showOAuthRefreshControl && keyUiStateMap[key.key_id]?.visibleOAuthState"
+                        v-if="keyUiStateMap[key.key_id]?.visibleOAuthState && (keyUiStateMap[key.key_id]?.showOAuthRefreshControl || keyUiStateMap[key.key_id]?.oauthStatusIsAlert)"
                         class="text-[10px]"
                         :class="{
                           'text-destructive': keyUiStateMap[key.key_id]?.visibleOAuthState?.isInvalid || keyUiStateMap[key.key_id]?.visibleOAuthState?.isExpired,
@@ -2510,6 +2510,7 @@ type PoolKeyUiState = {
   oauthStatusTitle: string
   oauthRefreshButtonTitle: string
   showOAuthRefreshControl: boolean
+  oauthStatusIsAlert: boolean
   canRefreshToken: boolean
   showCodexResetCreditControl: boolean
   codexResetCreditTitle: string
@@ -2546,6 +2547,17 @@ const keyUiStateMap = computed<Record<string, PoolKeyUiState>>(() => {
     const planType = resolvePoolKeyPlanType(key)
     const canRefreshToken = canRefreshOAuthCredential(key)
     const showOAuthRefreshControl = shouldShowOAuthRefreshControl(key, selectedProviderType.value)
+    // Session-cookie credentials have no refresh control, so the desktop row hid
+    // their whole OAuth status — including expiry/invalid warnings that these
+    // non-refreshable accounts most need surfaced. Track the alert states so the
+    // warning shows regardless of the refresh control.
+    const oauthStatusIsAlert = Boolean(
+      visibleOAuthState
+      && (visibleOAuthState.isInvalid
+        || visibleOAuthState.isExpired
+        || visibleOAuthState.isExpiringSoon
+        || visibleOAuthState.requiresReauth),
+    )
     const showCodexResetCreditControl = shouldShowCodexResetCreditControl(key)
     const codexResetCreditCount = getCodexResetCreditsAvailableCount(key)
     const canConsumeCodexResetCredit =
@@ -2561,6 +2573,7 @@ const keyUiStateMap = computed<Record<string, PoolKeyUiState>>(() => {
       oauthStatusTitle: visibleOAuthState ? getOAuthStatusTitle(key) : '',
       oauthRefreshButtonTitle: showOAuthRefreshControl ? getOAuthRefreshButtonTitle(key) : '',
       showOAuthRefreshControl,
+      oauthStatusIsAlert,
       canRefreshToken,
       showCodexResetCreditControl,
       codexResetCreditTitle: showCodexResetCreditControl ? getCodexResetCreditTitle(key) : '',
