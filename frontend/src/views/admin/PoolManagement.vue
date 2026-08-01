@@ -4348,6 +4348,42 @@ function buildQuotaProgressItemsFromSnapshot(key: PoolKeyDetail): QuotaProgressI
   if (providerType === 'grok') {
     const quotaResetAtSeconds = getQuotaSnapshotResetAtSeconds(quota)
     const quotaResetSeconds = getQuotaSnapshotResetSeconds(quota)
+
+    // Billing is the authoritative subscription allowance; when present it wins
+    // over the request/token windows, which a paid account reports as a static
+    // ceiling that always reads as a full bar.
+    const billingItems = ([
+      ['周', 'billing_weekly'],
+      ['月', 'billing_monthly'],
+    ] as const)
+      .map(([label, code]): QuotaProgressItem | null => {
+        const window = getQuotaSnapshotWindow(quota, code)
+        const remainingPercent = getQuotaWindowRemainingPercent(window)
+        if (remainingPercent == null) return null
+        const isCurrency = window?.unit?.trim().toLowerCase() === 'usd'
+        let detail = getQuotaWindowValueText(window)
+        if (isCurrency && typeof window?.limit_value === 'number' && window.limit_value > 0) {
+          const remainingValue = typeof window.remaining_value === 'number'
+            ? window.remaining_value
+            : typeof window.used_value === 'number'
+              ? Math.max(window.limit_value - window.used_value, 0)
+              : null
+          if (remainingValue != null) {
+            detail = `$${remainingValue.toFixed(2)}/$${window.limit_value.toFixed(2)}`
+          }
+        }
+        return {
+          label,
+          remainingPercent,
+          detail,
+          resetAtSeconds: normalizeUnixSeconds(window?.reset_at ?? quotaResetAtSeconds ?? null),
+          resetSeconds: normalizeRemainingSeconds(window?.reset_seconds ?? quotaResetSeconds ?? null),
+          updatedAtSeconds: getQuotaSnapshotUpdatedAtSeconds(quota),
+        }
+      })
+      .filter((item): item is QuotaProgressItem => item != null)
+    if (billingItems.length > 0) return billingItems
+
     const dimensionWindows = [
       ['请求', getQuotaSnapshotWindow(quota, 'requests')],
       ['Token', getQuotaSnapshotWindow(quota, 'tokens')],
