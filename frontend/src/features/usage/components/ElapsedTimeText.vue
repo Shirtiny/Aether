@@ -1,5 +1,9 @@
 <template>
-  <span class="tabular-nums">{{ displayText }}</span>
+  <span
+    class="tabular-nums"
+    :title="displayTitle"
+    :data-terminal-sync-delayed="terminalSyncDelayed ? 'true' : undefined"
+  >{{ displayText }}</span>
 </template>
 
 <script setup lang="ts">
@@ -10,11 +14,13 @@ const props = withDefaults(defineProps<{
   status?: string | null
   responseTimeMs?: number | null
   precision?: number
+  syncDelayThresholdMs?: number
 }>(), {
   createdAt: null,
   status: null,
   responseTimeMs: null,
   precision: 2,
+  syncDelayThresholdMs: 60_000,
 })
 
 const now = ref(Date.now())
@@ -71,6 +77,29 @@ const displayText = computed(() => {
   if (Number.isNaN(createdAtMs)) return '-'
 
   const elapsedMs = Math.max(0, now.value - createdAtMs)
+  if (terminalSyncDelayed.value && props.responseTimeMs != null) {
+    return `${(props.responseTimeMs / 1000).toFixed(precision.value)}s · 终态同步中`
+  }
   return `${(elapsedMs / 1000).toFixed(precision.value)}s`
+})
+
+const terminalSyncDelayed = computed(() => {
+  if (!isActive.value || !props.createdAt) return false
+  if (props.responseTimeMs == null || !Number.isFinite(props.responseTimeMs) || props.responseTimeMs <= 0) {
+    return false
+  }
+  const createdAtMs = parseCreatedAtMs(props.createdAt)
+  if (Number.isNaN(createdAtMs)) return false
+  const elapsedMs = Math.max(0, now.value - createdAtMs)
+  const thresholdMs = Math.max(1_000, props.syncDelayThresholdMs)
+  return elapsedMs >= props.responseTimeMs + thresholdMs
+})
+
+const displayTitle = computed(() => {
+  if (!terminalSyncDelayed.value || !props.createdAt || props.responseTimeMs == null) return undefined
+  const createdAtMs = parseCreatedAtMs(props.createdAt)
+  if (Number.isNaN(createdAtMs)) return undefined
+  const syncDelayMs = Math.max(0, now.value - createdAtMs - props.responseTimeMs)
+  return `请求已记录 ${(props.responseTimeMs / 1000).toFixed(precision.value)}s 响应耗时，终态同步延迟 ${(syncDelayMs / 1000).toFixed(precision.value)}s`
 })
 </script>

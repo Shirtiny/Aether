@@ -191,6 +191,7 @@ pub(crate) struct AdminSystemCleanupSummary {
         aether_data::repository::proxy_nodes::ProxyNodeMetricsCleanupSummary,
     pub(crate) pending_failed: usize,
     pub(crate) pending_recovered: usize,
+    pub(crate) pending_reconciliation_required: usize,
     pub(crate) usage: UsageCleanupSummary,
 }
 
@@ -216,6 +217,7 @@ pub(crate) async fn run_admin_system_cleanup_once(
         proxy_node_metrics,
         pending_failed: pending.failed,
         pending_recovered: pending.recovered,
+        pending_reconciliation_required: pending.reconciliation_required,
         usage,
     })
 }

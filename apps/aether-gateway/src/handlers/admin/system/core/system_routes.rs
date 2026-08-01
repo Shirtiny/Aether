@@ -766,6 +766,7 @@ async fn build_admin_system_cleanup_payload(
         "proxy_node_metrics_1h": summary.proxy_node_metrics.deleted_1h_rows,
         "pending_failed": summary.pending_failed,
         "pending_recovered": summary.pending_recovered,
+        "pending_reconciliation_required": summary.pending_reconciliation_required,
         "usage_body_externalized": summary.usage.body_externalized,
         "usage_legacy_body_refs_migrated": summary.usage.legacy_body_refs_migrated,
         "usage_body_cleaned": summary.usage.body_cleaned,

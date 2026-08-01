@@ -3,7 +3,9 @@ use std::sync::Arc;
 use serde_json::json;
 
 use aether_data_contracts::DataLayerError;
-use aether_runtime_state::{RuntimeQueueEntry, RuntimeQueueReclaimConfig, RuntimeQueueStore};
+use aether_runtime_state::{
+    RuntimeQueueEntry, RuntimeQueueReclaimConfig, RuntimeQueueReclaimResult, RuntimeQueueStore,
+};
 
 use super::config::UsageRuntimeConfig;
 use super::event::UsageEvent;
@@ -64,7 +66,7 @@ impl UsageQueue {
         &self,
         consumer: &str,
         start_id: &str,
-    ) -> Result<Vec<RuntimeQueueEntry>, DataLayerError> {
+    ) -> Result<RuntimeQueueReclaimResult, DataLayerError> {
         self.runner
             .claim_stale(
                 &self.stream,

@@ -602,13 +602,14 @@ pub(super) async fn run_pending_cleanup_once(
 ) -> Result<(), DataLayerError> {
     let summary = cleanup_stale_pending_requests_once(data).await?;
     if summary.failed > 0 || summary.recovered > 0 {
-        info!(
+        warn!(
             event_name = "pending_cleanup_completed",
             log_type = "ops",
             worker = "pending_cleanup",
             failed = summary.failed,
             recovered = summary.recovered,
-            "gateway cleaned stale pending and streaming requests"
+            reconciliation_required = summary.reconciliation_required,
+            "gateway cleaned stale pending requests; reconciliation_required counts recovered successes awaiting terminal usage replay"
         );
     }
     Ok(())

@@ -849,6 +849,13 @@ pub struct RuntimeQueueEntry {
     pub fields: BTreeMap<String, String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RuntimeQueueReclaimResult {
+    pub next_start_id: String,
+    pub entries: Vec<RuntimeQueueEntry>,
+    pub deleted_ids: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeQueueReclaimConfig {
     pub min_idle_ms: u64,
@@ -912,7 +919,7 @@ pub trait RuntimeQueueStore: Send + Sync {
         consumer: &str,
         start_id: &str,
         config: RuntimeQueueReclaimConfig,
-    ) -> Result<Vec<RuntimeQueueEntry>, DataLayerError>;
+    ) -> Result<RuntimeQueueReclaimResult, DataLayerError>;
 
     async fn ack(&self, stream: &str, group: &str, ids: &[String])
         -> Result<usize, DataLayerError>;
@@ -1030,7 +1037,7 @@ impl RuntimeQueueStore for RuntimeState {
         consumer: &str,
         start_id: &str,
         config: RuntimeQueueReclaimConfig,
-    ) -> Result<Vec<RuntimeQueueEntry>, DataLayerError> {
+    ) -> Result<RuntimeQueueReclaimResult, DataLayerError> {
         validate_runtime_queue_name(stream, "runtime queue stream")?;
         validate_runtime_queue_name(group, "runtime queue group")?;
         validate_runtime_queue_name(consumer, "runtime queue consumer")?;
@@ -1055,13 +1062,7 @@ impl RuntimeQueueStore for RuntimeState {
                     },
                 )
                 .await?
-                .entries
-                .into_iter()
-                .map(|entry| RuntimeQueueEntry {
-                    id: entry.id,
-                    fields: entry.fields,
-                })
-                .collect()),
+                .into()),
         }
     }
 
@@ -2665,15 +2666,33 @@ mod tests {
             "0-0",
             RuntimeQueueReclaimConfig {
                 min_idle_ms: 1,
-                count: 10,
+                count: 1,
             },
         )
         .await
         .expect("claim stale");
-        let ids = claimed
+        let first_page_ids = claimed
+            .entries
             .iter()
             .map(|entry| entry.id.clone())
             .collect::<Vec<_>>();
+        assert_eq!(first_page_ids, vec![first.clone()]);
+        assert_ne!(claimed.next_start_id, "0-0");
+        let claimed_next = RuntimeQueueStore::claim_stale(
+            runtime,
+            "contract:stream",
+            "workers",
+            "consumer-b",
+            &claimed.next_start_id,
+            RuntimeQueueReclaimConfig {
+                min_idle_ms: 1,
+                count: 1,
+            },
+        )
+        .await
+        .expect("claim next stale page");
+        let mut ids = first_page_ids;
+        ids.extend(claimed_next.entries.iter().map(|entry| entry.id.clone()));
         assert_eq!(ids, vec![first.clone(), second.clone()]);
         assert_eq!(
             RuntimeQueueStore::ack(runtime, "contract:stream", "workers", &ids)

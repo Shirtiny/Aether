@@ -917,7 +917,7 @@ impl MemoryRuntimeBackend {
         consumer: &str,
         start_id: &str,
         config: RuntimeQueueReclaimConfig,
-    ) -> Result<Vec<RuntimeQueueEntry>, DataLayerError> {
+    ) -> Result<crate::RuntimeQueueReclaimResult, DataLayerError> {
         let start_sequence = parse_memory_stream_sequence(start_id)?;
         let min_idle = Duration::from_millis(config.min_idle_ms.max(1));
         let now = Instant::now();
@@ -943,15 +943,27 @@ impl MemoryRuntimeBackend {
         let mut ids = ids;
         ids.sort_by_key(|(sequence, _)| *sequence);
 
+        let selected = ids
+            .into_iter()
+            .take(config.count.max(1))
+            .collect::<Vec<_>>();
         let mut claimed = Vec::new();
-        for (_, id) in ids.into_iter().take(config.count.max(1)) {
-            if let Some(pending) = group_state.pending.get_mut(&id) {
+        for (_, id) in &selected {
+            if let Some(pending) = group_state.pending.get_mut(id) {
                 pending.consumer = consumer.to_string();
                 pending.delivered_at = now;
                 claimed.push(pending.entry.clone());
             }
         }
-        Ok(claimed)
+        let next_start_id = selected
+            .last()
+            .map(|(sequence, _)| format!("{}-0", sequence.saturating_add(1)))
+            .unwrap_or_else(|| "0-0".to_string());
+        Ok(crate::RuntimeQueueReclaimResult {
+            next_start_id,
+            entries: claimed,
+            deleted_ids: Vec::new(),
+        })
     }
 
     pub(crate) async fn queue_ack(

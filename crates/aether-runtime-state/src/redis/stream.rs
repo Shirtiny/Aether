@@ -34,6 +34,23 @@ pub struct RedisStreamReclaimResult {
     pub deleted_ids: Vec<String>,
 }
 
+impl From<RedisStreamReclaimResult> for crate::RuntimeQueueReclaimResult {
+    fn from(result: RedisStreamReclaimResult) -> Self {
+        Self {
+            next_start_id: result.next_start_id,
+            entries: result
+                .entries
+                .into_iter()
+                .map(|entry| crate::RuntimeQueueEntry {
+                    id: entry.id,
+                    fields: entry.fields,
+                })
+                .collect(),
+            deleted_ids: result.deleted_ids,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RedisStreamReclaimConfig {
     pub min_idle_ms: u64,

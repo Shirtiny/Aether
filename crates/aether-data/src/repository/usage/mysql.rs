@@ -1014,6 +1014,7 @@ WHERE request_id = ?
                     .await
                     .map_sql_err()?;
                     summary.recovered += 1;
+                    summary.reconciliation_required += 1;
                     continue;
                 }
 

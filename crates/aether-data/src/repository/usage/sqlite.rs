@@ -4045,6 +4045,7 @@ WHERE request_id = ?
                     .await
                     .map_sql_err()?;
                     summary.recovered += 1;
+                    summary.reconciliation_required += 1;
                     continue;
                 }
 
@@ -4701,6 +4702,7 @@ INSERT INTO request_candidates (
             .await
             .expect("cleanup should run");
         assert_eq!(summary.recovered, 1);
+        assert_eq!(summary.reconciliation_required, 1);
         assert_eq!(summary.failed, 1);
 
         let recovered = repository

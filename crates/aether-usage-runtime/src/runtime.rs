@@ -19,6 +19,13 @@ use crate::{
     UsageEvent, UsageQueue, UsageRecordWriter, UsageRuntimeConfig, UsageSettlementWriter,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageTerminalPersistence {
+    Disabled,
+    Queued,
+    DirectWritten,
+}
+
 #[async_trait]
 pub trait UsageBillingEventEnricher: Send + Sync {
     async fn enrich_usage_event(&self, event: &mut UsageEvent) -> Result<(), DataLayerError>;
@@ -259,31 +266,35 @@ impl UsageRuntime {
         let data = T::clone(data);
         let request_id = context_seed.request_id.clone();
         spawn_on_usage_background_runtime(boxed_usage_task(async move {
-            match build_sync_terminal_usage_event_offthread(context_seed, payload_seed).await {
-                Ok(mut event) => {
-                    apply_body_capture_policy_from_data(&data, &mut event).await;
-                    if let Err(err) = data.enrich_usage_event(&mut event).await {
-                        warn!(
-                            event_name = "usage_sync_terminal_billing_enrichment_failed",
-                            log_type = "event",
-                            request_id = %request_id,
-                            error = %err,
-                            "usage runtime failed to enrich sync usage event with billing"
-                        );
-                    }
-                    runtime.enqueue_or_write_terminal(&data, event).await
-                }
-                Err(err) => {
-                    warn!(
-                        event_name = "usage_sync_terminal_build_failed",
-                        log_type = "event",
-                        request_id = %request_id,
-                        error = %err,
-                        "usage runtime failed to build sync terminal usage event"
-                    )
-                }
+            if let Err(err) = runtime
+                .persist_sync_terminal(&data, context_seed, payload_seed)
+                .await
+            {
+                warn!(
+                    event_name = "usage_sync_terminal_persist_failed",
+                    log_type = "event",
+                    request_id = %request_id,
+                    error = %err,
+                    "usage runtime failed to durably persist sync terminal usage"
+                );
             }
         }));
+    }
+
+    pub async fn persist_sync_terminal<T>(
+        &self,
+        data: &T,
+        context_seed: TerminalUsageContextSeed,
+        payload_seed: SyncTerminalUsagePayloadSeed,
+    ) -> Result<UsageTerminalPersistence, DataLayerError>
+    where
+        T: UsageRuntimeAccess,
+    {
+        if !self.is_enabled() {
+            return Ok(UsageTerminalPersistence::Disabled);
+        }
+        let event = build_sync_terminal_usage_event_offthread(context_seed, payload_seed).await?;
+        self.persist_terminal_event(data, event).await
     }
 
     pub fn record_stream_terminal<T>(
@@ -302,33 +313,38 @@ impl UsageRuntime {
         let data = T::clone(data);
         let request_id = context_seed.request_id.clone();
         spawn_on_usage_background_runtime(boxed_usage_task(async move {
-            match build_stream_terminal_usage_event_offthread(context_seed, payload_seed, cancelled)
+            if let Err(err) = runtime
+                .persist_stream_terminal(&data, context_seed, payload_seed, cancelled)
                 .await
             {
-                Ok(mut event) => {
-                    apply_body_capture_policy_from_data(&data, &mut event).await;
-                    if let Err(err) = data.enrich_usage_event(&mut event).await {
-                        warn!(
-                            event_name = "usage_stream_terminal_billing_enrichment_failed",
-                            log_type = "event",
-                            request_id = %request_id,
-                            error = %err,
-                            "usage runtime failed to enrich stream usage event with billing"
-                        );
-                    }
-                    runtime.enqueue_or_write_terminal(&data, event).await
-                }
-                Err(err) => {
-                    warn!(
-                        event_name = "usage_stream_terminal_build_failed",
-                        log_type = "event",
-                        request_id = %request_id,
-                        error = %err,
-                        "usage runtime failed to build stream terminal usage event"
-                    )
-                }
+                warn!(
+                    event_name = "usage_stream_terminal_persist_failed",
+                    log_type = "event",
+                    request_id = %request_id,
+                    error = %err,
+                    "usage runtime failed to durably persist stream terminal usage"
+                );
             }
         }));
+    }
+
+    pub async fn persist_stream_terminal<T>(
+        &self,
+        data: &T,
+        context_seed: TerminalUsageContextSeed,
+        payload_seed: StreamTerminalUsagePayloadSeed,
+        cancelled: bool,
+    ) -> Result<UsageTerminalPersistence, DataLayerError>
+    where
+        T: UsageRuntimeAccess,
+    {
+        if !self.is_enabled() {
+            return Ok(UsageTerminalPersistence::Disabled);
+        }
+        let event =
+            build_stream_terminal_usage_event_offthread(context_seed, payload_seed, cancelled)
+                .await?;
+        self.persist_terminal_event(data, event).await
     }
 
     pub fn submit_terminal_event<T>(&self, data: &T, event: UsageEvent)
@@ -345,12 +361,32 @@ impl UsageRuntime {
         }));
     }
 
-    pub async fn record_terminal_event<T>(&self, data: &T, mut event: UsageEvent)
+    pub async fn record_terminal_event<T>(&self, data: &T, event: UsageEvent)
+    where
+        T: UsageRuntimeAccess,
+    {
+        let request_id = event.request_id.clone();
+        if let Err(err) = self.persist_terminal_event(data, event).await {
+            warn!(
+                event_name = "usage_terminal_persist_failed",
+                log_type = "event",
+                request_id = %request_id,
+                error = %err,
+                "usage runtime failed to durably persist terminal usage"
+            );
+        }
+    }
+
+    pub async fn persist_terminal_event<T>(
+        &self,
+        data: &T,
+        mut event: UsageEvent,
+    ) -> Result<UsageTerminalPersistence, DataLayerError>
     where
         T: UsageRuntimeAccess,
     {
         if !self.is_enabled() {
-            return;
+            return Ok(UsageTerminalPersistence::Disabled);
         }
         apply_body_capture_policy_from_data(data, &mut event).await;
         if let Err(err) = data.enrich_usage_event(&mut event).await {
@@ -362,15 +398,35 @@ impl UsageRuntime {
                 "usage runtime failed to enrich terminal usage event with billing"
             );
         }
-        self.enqueue_or_write_terminal(data, event).await;
+        self.enqueue_or_write_terminal(data, event).await
     }
 
-    pub async fn record_terminal_event_direct<T>(&self, data: &T, mut event: UsageEvent)
+    pub async fn record_terminal_event_direct<T>(&self, data: &T, event: UsageEvent)
+    where
+        T: UsageRuntimeAccess,
+    {
+        let request_id = event.request_id.clone();
+        if let Err(err) = self.persist_terminal_event_direct(data, event).await {
+            warn!(
+                event_name = "usage_terminal_direct_persist_failed",
+                log_type = "event",
+                request_id = %request_id,
+                error = %err,
+                "usage runtime failed to directly persist terminal usage"
+            );
+        }
+    }
+
+    pub async fn persist_terminal_event_direct<T>(
+        &self,
+        data: &T,
+        mut event: UsageEvent,
+    ) -> Result<UsageTerminalPersistence, DataLayerError>
     where
         T: UsageRuntimeAccess,
     {
         if !self.is_enabled() {
-            return;
+            return Ok(UsageTerminalPersistence::Disabled);
         }
         apply_body_capture_policy_from_data(data, &mut event).await;
         if let Err(err) = data.enrich_usage_event(&mut event).await {
@@ -382,10 +438,15 @@ impl UsageRuntime {
                 "usage runtime failed to enrich terminal usage event with billing"
             );
         }
-        self.write_terminal_direct(data, &event).await;
+        self.write_terminal_direct(data, &event).await?;
+        Ok(UsageTerminalPersistence::DirectWritten)
     }
 
-    async fn enqueue_or_write_terminal<T>(&self, data: &T, event: UsageEvent)
+    async fn enqueue_or_write_terminal<T>(
+        &self,
+        data: &T,
+        event: UsageEvent,
+    ) -> Result<UsageTerminalPersistence, DataLayerError>
     where
         T: UsageRuntimeAccess,
     {
@@ -393,7 +454,7 @@ impl UsageRuntime {
             if let Some(runner) = data.usage_worker_queue() {
                 match UsageQueue::new(runner, self.config.clone()) {
                     Ok(queue) => match queue.enqueue(&event).await {
-                        Ok(_) => return,
+                        Ok(_) => return Ok(UsageTerminalPersistence::Queued),
                         Err(err) => {
                             warn!(
                                 event_name = "usage_terminal_enqueue_failed",
@@ -419,47 +480,23 @@ impl UsageRuntime {
             }
         }
 
-        self.write_terminal_direct(data, &event).await;
+        self.write_terminal_direct(data, &event).await?;
+        Ok(UsageTerminalPersistence::DirectWritten)
     }
 
-    async fn write_terminal_direct<T>(&self, data: &T, event: &UsageEvent)
+    async fn write_terminal_direct<T>(
+        &self,
+        data: &T,
+        event: &UsageEvent,
+    ) -> Result<(), DataLayerError>
     where
         T: UsageRuntimeAccess,
     {
-        match build_upsert_usage_record_from_event(event) {
-            Ok(record) => match data.upsert_usage_record(record).await {
-                Ok(Some(stored)) => {
-                    if let Err(err) = settle_usage_if_needed(data, &stored).await {
-                        warn!(
-                            event_name = "usage_terminal_settlement_failed",
-                            log_type = "event",
-                            request_id = %event.request_id,
-                            error = %err,
-                            "usage runtime failed to settle terminal usage directly"
-                        );
-                    }
-                }
-                Ok(None) => {}
-                Err(err) => {
-                    warn!(
-                        event_name = "usage_terminal_upsert_failed",
-                        log_type = "event",
-                        request_id = %event.request_id,
-                        error = %err,
-                        "usage runtime failed to upsert terminal usage directly"
-                    );
-                }
-            },
-            Err(err) => {
-                warn!(
-                    event_name = "usage_terminal_upsert_build_failed",
-                    log_type = "event",
-                    request_id = %event.request_id,
-                    error = %err,
-                    "usage runtime failed to build terminal usage upsert"
-                )
-            }
+        let record = build_upsert_usage_record_from_event(event)?;
+        if let Some(stored) = data.upsert_usage_record(record).await? {
+            settle_usage_if_needed(data, &stored).await?;
         }
+        Ok(())
     }
 }
 
@@ -607,6 +644,7 @@ mod tests {
     use crate::{
         apply_usage_body_capture_policy_to_event, UsageEvent, UsageEventData, UsageEventType,
         UsageRecordWriter, UsageRuntime, UsageRuntimeConfig, UsageSettlementWriter,
+        UsageTerminalPersistence,
     };
 
     #[derive(Default)]
@@ -759,7 +797,11 @@ mod tests {
             },
         );
 
-        runtime.record_terminal_event(&store, event).await;
+        let persistence = runtime
+            .persist_terminal_event(&store, event)
+            .await
+            .expect("direct terminal persistence should succeed");
+        assert_eq!(persistence, UsageTerminalPersistence::DirectWritten);
 
         let records = store.records.lock().expect("records lock");
         assert_eq!(records.len(), 1);
@@ -792,7 +834,11 @@ mod tests {
             },
         );
 
-        runtime.record_terminal_event_direct(&store, event).await;
+        let persistence = runtime
+            .persist_terminal_event_direct(&store, event)
+            .await
+            .expect("forced direct terminal persistence should succeed");
+        assert_eq!(persistence, UsageTerminalPersistence::DirectWritten);
 
         let records = store.inner.records.lock().expect("records lock");
         assert_eq!(records.len(), 1);
@@ -800,6 +846,65 @@ mod tests {
         assert_eq!(records[0].status, "failed");
         assert_eq!(records[0].billing_status, "void");
         assert_eq!(records[0].status_code, Some(503));
+    }
+
+    #[tokio::test]
+    async fn terminal_usage_reports_durable_queue_boundary() {
+        let runtime = UsageRuntime::new(UsageRuntimeConfig {
+            enabled: true,
+            queue_terminal_events: true,
+            stream_key: "usage:test:durable-boundary".to_string(),
+            consumer_group: "usage:test:durable-boundary:group".to_string(),
+            dlq_stream_key: "usage:test:durable-boundary:dlq".to_string(),
+            ..UsageRuntimeConfig::default()
+        })
+        .expect("usage runtime should build");
+        let queue = Arc::new(RuntimeState::memory(MemoryRuntimeStateConfig::default()));
+        let store = QueueConfiguredUsageStore {
+            inner: NoRedisUsageStore::default(),
+            queue: queue.clone(),
+        };
+        let event = UsageEvent::new(
+            UsageEventType::Completed,
+            "req-durably-queued-1",
+            UsageEventData {
+                provider_name: "openai".to_string(),
+                model: "gpt-5".to_string(),
+                status_code: Some(200),
+                ..UsageEventData::default()
+            },
+        );
+
+        let persistence = runtime
+            .persist_terminal_event(&store, event)
+            .await
+            .expect("queue persistence should succeed");
+        assert_eq!(persistence, UsageTerminalPersistence::Queued);
+        assert!(store.inner.records.lock().expect("records lock").is_empty());
+
+        queue
+            .ensure_consumer_group(
+                "usage:test:durable-boundary",
+                "usage:test:durable-boundary:group",
+                "0-0",
+            )
+            .await
+            .expect("group should initialize");
+        let queued = queue
+            .read_group(
+                "usage:test:durable-boundary",
+                "usage:test:durable-boundary:group",
+                "durable-boundary-consumer",
+                10,
+                Some(1),
+            )
+            .await
+            .expect("queued event should read");
+        assert_eq!(queued.len(), 1);
+        assert!(queued[0]
+            .fields
+            .get("payload")
+            .is_some_and(|payload| payload.contains("req-durably-queued-1")));
     }
 
     #[test]

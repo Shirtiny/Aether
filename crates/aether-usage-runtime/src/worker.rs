@@ -5,13 +5,22 @@ use aether_data_contracts::repository::usage::{StoredRequestUsageAudit, UpsertUs
 use aether_data_contracts::DataLayerError;
 use aether_runtime_state::{RuntimeQueueEntry, RuntimeQueueStore};
 use async_trait::async_trait;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::executor::spawn_on_usage_background_runtime;
 use crate::{
     build_upsert_usage_record_from_event, settle_usage_if_needed, UsageEvent, UsageQueue,
     UsageRuntimeConfig, UsageSettlementWriter,
 };
+
+const USAGE_RECLAIM_MAX_PAGES_PER_PASS: usize = 16;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct UsageBatchProcessSummary {
+    received: usize,
+    acknowledged: usize,
+    retryable_failed: usize,
+}
 
 #[async_trait]
 pub trait UsageEventRecorder: Send + Sync {
@@ -85,87 +94,161 @@ impl UsageQueueWorker {
     }
 
     async fn run_forever(self) {
-        if let Err(err) = self.queue.ensure_consumer_group().await {
-            warn!(
-                event_name = "usage_worker_consumer_group_failed",
-                log_type = "ops",
-                worker_consumer = %self.consumer,
-                worker_group = %self.config.consumer_group,
-                error = %err,
-                "usage worker failed to ensure consumer group"
-            );
-            return;
+        loop {
+            match self.queue.ensure_consumer_group().await {
+                Ok(()) => break,
+                Err(err) => {
+                    warn!(
+                        event_name = "usage_worker_consumer_group_failed",
+                        log_type = "ops",
+                        worker_consumer = %self.consumer,
+                        worker_group = %self.config.consumer_group,
+                        retry_delay_ms = 1_000_u64,
+                        error = %err,
+                        "usage worker failed to ensure consumer group and will retry"
+                    );
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
         }
 
-        let mut reclaim_interval =
-            tokio::time::interval(Duration::from_millis(self.config.reclaim_interval_ms));
-        reclaim_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        reclaim_interval.tick().await;
+        // Do not race a blocking XREADGROUP future against a timer. Redis may have
+        // already moved an entry to the PEL when a cancelled client future is
+        // dropped, leaving the application without the delivered payload. Each
+        // read is bounded by consumer_block_ms, so completing it before checking
+        // the reclaim deadline keeps reclaim jitter bounded without losing reads.
+        let reclaim_every = Duration::from_millis(self.config.reclaim_interval_ms.max(1));
+        let mut next_reclaim_at = tokio::time::Instant::now();
+        let mut reclaim_cursor = "0-0".to_string();
 
         loop {
-            tokio::select! {
-                _ = reclaim_interval.tick() => {
-                    match self.queue.claim_stale(&self.consumer, "0-0").await {
-                        Ok(entries) => {
-                            if let Err(err) = self.process_entries(entries).await {
-                                warn!(
-                                    event_name = "usage_worker_reclaim_process_failed",
-                                    log_type = "ops",
-                                    worker_consumer = %self.consumer,
-                                    worker_group = %self.config.consumer_group,
-                                    error = %err,
-                                    "usage worker failed while reclaiming stale entries"
-                                );
-                            }
-                        }
-                        Err(err) => warn!(
-                            event_name = "usage_worker_reclaim_failed",
+            if tokio::time::Instant::now() >= next_reclaim_at {
+                self.reclaim_stale_pass(&mut reclaim_cursor).await;
+                next_reclaim_at = tokio::time::Instant::now() + reclaim_every;
+            }
+
+            match self.queue.read_group(&self.consumer).await {
+                Ok(entries) => {
+                    if let Err(err) = self.process_entries(entries).await {
+                        warn!(
+                            event_name = "usage_worker_process_failed",
                             log_type = "ops",
                             worker_consumer = %self.consumer,
                             worker_group = %self.config.consumer_group,
                             error = %err,
-                            "usage worker failed to reclaim stale entries"
-                        ),
+                            "usage worker failed to finish queue batch acknowledgement"
+                        );
+                        tokio::time::sleep(Duration::from_millis(250)).await;
                     }
                 }
-                result = self.queue.read_group(&self.consumer) => {
-                    match result {
-                        Ok(entries) => {
-                            if let Err(err) = self.process_entries(entries).await {
-                                warn!(
-                                    event_name = "usage_worker_process_failed",
-                                    log_type = "ops",
-                                    worker_consumer = %self.consumer,
-                                    worker_group = %self.config.consumer_group,
-                                    error = %err,
-                                    "usage worker failed to process queue entries"
-                                );
-                                tokio::time::sleep(Duration::from_millis(250)).await;
-                            }
-                        }
-                        Err(err) => {
-                            warn!(
-                                event_name = "usage_worker_read_failed",
-                                log_type = "ops",
-                                worker_consumer = %self.consumer,
-                                worker_group = %self.config.consumer_group,
-                                error = %err,
-                                "usage worker failed to read queue"
-                            );
-                            tokio::time::sleep(Duration::from_millis(500)).await;
-                        }
-                    }
+                Err(err) => {
+                    warn!(
+                        event_name = "usage_worker_read_failed",
+                        log_type = "ops",
+                        worker_consumer = %self.consumer,
+                        worker_group = %self.config.consumer_group,
+                        error = %err,
+                        "usage worker failed to read queue"
+                    );
+                    tokio::time::sleep(Duration::from_millis(500)).await;
                 }
             }
         }
     }
 
-    async fn process_entries(&self, entries: Vec<RuntimeQueueEntry>) -> Result<(), DataLayerError> {
-        if entries.is_empty() {
-            return Ok(());
+    async fn reclaim_stale_pass(&self, cursor: &mut String) {
+        for _ in 0..USAGE_RECLAIM_MAX_PAGES_PER_PASS {
+            let result = match self.queue.claim_stale(&self.consumer, cursor).await {
+                Ok(result) => result,
+                Err(err) => {
+                    warn!(
+                        event_name = "usage_worker_reclaim_failed",
+                        log_type = "ops",
+                        worker_consumer = %self.consumer,
+                        worker_group = %self.config.consumer_group,
+                        reclaim_cursor = cursor.as_str(),
+                        error = %err,
+                        "usage worker failed to reclaim stale entries"
+                    );
+                    return;
+                }
+            };
+
+            let next_start_id = if result.next_start_id.trim().is_empty() {
+                "0-0".to_string()
+            } else {
+                result.next_start_id
+            };
+            let deleted_count = result.deleted_ids.len();
+            if deleted_count > 0 {
+                warn!(
+                    event_name = "usage_worker_reclaim_deleted_entries_observed",
+                    log_type = "ops",
+                    worker_consumer = %self.consumer,
+                    worker_group = %self.config.consumer_group,
+                    deleted_count,
+                    deleted_ids = ?result.deleted_ids,
+                    "usage worker observed PEL entries whose stream payloads were already deleted"
+                );
+            }
+
+            match self.process_entries(result.entries).await {
+                Ok(summary) if summary.received > 0 => {
+                    info!(
+                        event_name = "usage_worker_reclaim_batch_processed",
+                        log_type = "ops",
+                        worker_consumer = %self.consumer,
+                        worker_group = %self.config.consumer_group,
+                        reclaim_cursor = cursor.as_str(),
+                        next_reclaim_cursor = next_start_id.as_str(),
+                        received = summary.received,
+                        acknowledged = summary.acknowledged,
+                        retryable_failed = summary.retryable_failed,
+                        "usage worker processed a reclaimed terminal usage batch"
+                    );
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    warn!(
+                        event_name = "usage_worker_reclaim_process_failed",
+                        log_type = "ops",
+                        worker_consumer = %self.consumer,
+                        worker_group = %self.config.consumer_group,
+                        reclaim_cursor = cursor.as_str(),
+                        error = %err,
+                        "usage worker failed to finish reclaimed batch acknowledgement"
+                    );
+                }
+            }
+
+            *cursor = next_start_id;
+            if cursor.as_str() == "0-0" {
+                return;
+            }
         }
 
+        warn!(
+            event_name = "usage_worker_reclaim_pass_bounded",
+            log_type = "ops",
+            worker_consumer = %self.consumer,
+            worker_group = %self.config.consumer_group,
+            reclaim_cursor = cursor.as_str(),
+            max_pages = USAGE_RECLAIM_MAX_PAGES_PER_PASS,
+            "usage worker bounded a reclaim pass and will resume from the saved cursor"
+        );
+    }
+
+    async fn process_entries(
+        &self,
+        entries: Vec<RuntimeQueueEntry>,
+    ) -> Result<UsageBatchProcessSummary, DataLayerError> {
+        if entries.is_empty() {
+            return Ok(UsageBatchProcessSummary::default());
+        }
+
+        let received = entries.len();
         let mut ack_ids = Vec::new();
+        let mut retryable_failed = 0usize;
         for entry in entries {
             match self.process_entry(&entry).await {
                 Ok(should_ack) => {
@@ -174,19 +257,30 @@ impl UsageQueueWorker {
                     }
                 }
                 Err(err) => {
-                    if !ack_ids.is_empty() {
-                        let _ = self.queue.ack_and_delete(&ack_ids).await;
-                    }
-                    return Err(err);
+                    retryable_failed = retryable_failed.saturating_add(1);
+                    warn!(
+                        event_name = "usage_worker_entry_left_pending",
+                        log_type = "ops",
+                        worker_consumer = %self.consumer,
+                        worker_group = %self.config.consumer_group,
+                        entry_id = %entry.id,
+                        error = %err,
+                        "usage worker left one retryable entry pending and continued the batch"
+                    );
                 }
             }
         }
 
+        let acknowledged = ack_ids.len();
         if !ack_ids.is_empty() {
             self.queue.ack_and_delete(&ack_ids).await?;
         }
 
-        Ok(())
+        Ok(UsageBatchProcessSummary {
+            received,
+            acknowledged,
+            retryable_failed,
+        })
     }
 
     async fn process_entry(&self, entry: &RuntimeQueueEntry) -> Result<bool, DataLayerError> {
@@ -355,6 +449,7 @@ fn consumer_name() -> String {
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use aether_data_contracts::repository::settlement::{
         StoredUsageSettlement, UsageSettlementInput,
@@ -482,6 +577,9 @@ mod tests {
                 return Err(DataLayerError::UnexpectedValue(
                     "permanent test error".to_string(),
                 ));
+            }
+            if event.request_id == "req-worker-retryable" {
+                return Err(DataLayerError::Redis("retryable test error".to_string()));
             }
             Ok(())
         }
@@ -630,5 +728,68 @@ mod tests {
             .expect("dlq payload should exist");
         assert!(payload.contains("req-worker-poison"));
         assert!(payload.contains("permanent test error"));
+    }
+
+    #[tokio::test]
+    async fn process_entries_leaves_retryable_failure_pending_and_acks_later_success() {
+        let runner = Arc::new(RuntimeState::memory(MemoryRuntimeStateConfig::default()));
+        let queue_runner: Arc<dyn RuntimeQueueStore> = runner.clone();
+        let recorder = Arc::new(SelectiveFailingRecorder::default());
+        let config = UsageRuntimeConfig {
+            enabled: true,
+            stream_key: "usage:test:worker:retry:events".to_string(),
+            consumer_group: "usage:test:worker:retry:group".to_string(),
+            dlq_stream_key: "usage:test:worker:retry:dlq".to_string(),
+            consumer_batch_size: 10,
+            consumer_block_ms: 1,
+            reclaim_idle_ms: 1,
+            reclaim_count: 10,
+            ..UsageRuntimeConfig::default()
+        };
+        let worker = UsageQueueWorker::new(queue_runner, recorder.clone(), config)
+            .expect("worker should build");
+        worker
+            .queue
+            .ensure_consumer_group()
+            .await
+            .expect("group should initialize");
+
+        for request_id in ["req-worker-ok-a", "req-worker-retryable", "req-worker-ok-b"] {
+            let mut event = sample_event();
+            event.request_id = request_id.to_string();
+            worker
+                .queue
+                .enqueue(&event)
+                .await
+                .expect("event should enqueue");
+        }
+
+        let entries = worker
+            .queue
+            .read_group(&worker.consumer)
+            .await
+            .expect("events should read");
+        let summary = worker
+            .process_entries(entries)
+            .await
+            .expect("retryable failure must not abort acknowledgement of siblings");
+        assert_eq!(summary.received, 3);
+        assert_eq!(summary.acknowledged, 2);
+        assert_eq!(summary.retryable_failed, 1);
+        assert_eq!(
+            recorder.calls.lock().expect("calls lock").as_slice(),
+            ["req-worker-ok-a", "req-worker-retryable", "req-worker-ok-b"]
+        );
+
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        let reclaimed = worker
+            .queue
+            .claim_stale("retry-consumer", "0-0")
+            .await
+            .expect("retryable entry should remain reclaimable");
+        assert_eq!(reclaimed.entries.len(), 1);
+        let event = UsageEvent::from_stream_fields(&reclaimed.entries[0].fields)
+            .expect("reclaimed event should decode");
+        assert_eq!(event.request_id, "req-worker-retryable");
     }
 }

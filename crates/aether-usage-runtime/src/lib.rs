@@ -45,7 +45,7 @@ pub use report_context::{
 pub use request_metadata::attach_cafecode_identity_metadata;
 pub use runtime::{
     UsageBillingEventEnricher, UsageBodyCapturePolicy, UsagePromptCapturePolicy,
-    UsageRequestRecordLevel, UsageRuntime, UsageRuntimeAccess,
+    UsageRequestRecordLevel, UsageRuntime, UsageRuntimeAccess, UsageTerminalPersistence,
     DEFAULT_USAGE_REQUEST_BODY_CAPTURE_LIMIT_BYTES,
     DEFAULT_USAGE_RESPONSE_BODY_CAPTURE_LIMIT_BYTES,
 };

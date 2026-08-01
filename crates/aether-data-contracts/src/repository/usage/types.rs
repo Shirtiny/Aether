@@ -1910,6 +1910,9 @@ impl<T> UsageRepository for T where T: UsageReadRepository + UsageWriteRepositor
 pub struct PendingUsageCleanupSummary {
     pub failed: usize,
     pub recovered: usize,
+    /// Requests whose transport completed but whose terminal usage payload still
+    /// needs replay before tokens, costs, and settlement are authoritative.
+    pub reconciliation_required: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

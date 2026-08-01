@@ -454,6 +454,92 @@ impl AppState {
         self.data.pending_database_backfills().await
     }
 
+    /// Reads the durable usage row used to verify an explicit terminal-event
+    /// reconciliation. This intentionally exposes only a read operation; the
+    /// corresponding mutation below still validates that the row already
+    /// exists and that its request identity matches the supplied event.
+    pub async fn find_usage_for_reconciliation(
+        &self,
+        request_id: &str,
+    ) -> Result<
+        Option<aether_data_contracts::repository::usage::StoredRequestUsageAudit>,
+        aether_data::DataLayerError,
+    > {
+        self.data.find_request_usage_by_request_id(request_id).await
+    }
+
+    /// Replays one terminal usage event directly into the idempotent usage and
+    /// settlement writers. Queue acknowledgement and secondary request-count
+    /// effects are deliberately not part of this operation, so the normal
+    /// worker can later consume the source event without double-counting.
+    pub async fn reconcile_terminal_usage_event(
+        &self,
+        event: &aether_usage_runtime::UsageEvent,
+    ) -> Result<
+        aether_data_contracts::repository::usage::StoredRequestUsageAudit,
+        aether_data::DataLayerError,
+    > {
+        use aether_usage_runtime::UsageEventType;
+
+        if !matches!(
+            event.event_type,
+            UsageEventType::Completed | UsageEventType::Failed | UsageEventType::Cancelled
+        ) {
+            return Err(aether_data::DataLayerError::InvalidInput(
+                "usage reconciliation accepts terminal events only".to_string(),
+            ));
+        }
+        let request_id = event.request_id.trim();
+        if request_id.is_empty() {
+            return Err(aether_data::DataLayerError::InvalidInput(
+                "usage reconciliation event request_id cannot be empty".to_string(),
+            ));
+        }
+        if event.request_id != request_id
+            || event.data.provider_name != event.data.provider_name.trim()
+            || event.data.model != event.data.model.trim()
+        {
+            return Err(aether_data::DataLayerError::InvalidInput(
+                "usage reconciliation identity fields cannot contain surrounding whitespace"
+                    .to_string(),
+            ));
+        }
+
+        let existing = self
+            .data
+            .find_request_usage_by_request_id(request_id)
+            .await?
+            .ok_or_else(|| {
+                aether_data::DataLayerError::InvalidInput(format!(
+                    "usage reconciliation refused to create missing request {request_id}"
+                ))
+            })?;
+        if existing.provider_name.trim() != event.data.provider_name.trim()
+            || existing.model.trim() != event.data.model.trim()
+        {
+            return Err(aether_data::DataLayerError::InvalidInput(format!(
+                "usage reconciliation identity mismatch for request {request_id}: stored provider/model={}/{}, event={}/{}",
+                existing.provider_name,
+                existing.model,
+                event.data.provider_name,
+                event.data.model
+            )));
+        }
+
+        let record = aether_usage_runtime::build_upsert_usage_record_from_event(event)?;
+        if let Some(stored) = self.data.upsert_usage(record).await? {
+            aether_usage_runtime::settle_usage_if_needed(self.data.as_ref(), &stored).await?;
+        }
+        self.data
+            .find_request_usage_by_request_id(request_id)
+            .await?
+            .ok_or_else(|| {
+                aether_data::DataLayerError::UnexpectedValue(format!(
+                    "usage reconciliation write completed but request {request_id} could not be read back"
+                ))
+            })
+    }
+
     pub fn with_video_task_poller_config(mut self, interval: Duration, batch_size: usize) -> Self {
         self.video_task_poller = Some(VideoTaskPollerConfig {
             interval,
@@ -1667,7 +1753,10 @@ mod tests {
     use std::sync::Arc;
 
     use aether_data::repository::provider_catalog::InMemoryProviderCatalogReadRepository;
+    use aether_data::repository::usage::InMemoryUsageReadRepository;
     use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogProvider;
+    use aether_data_contracts::repository::usage::UsageWriteRepository;
+    use aether_usage_runtime::{UsageEvent, UsageEventData, UsageEventType};
     use serde_json::json;
 
     use super::{canonical_session_risk_control_block_response, AppState, PROXY_NODE_CACHE_TTL};
@@ -1711,6 +1800,70 @@ mod tests {
             body["error"]["message"],
             "您的请求成功了但是被官方明确风控禁止、阻断，多次尝试将会封号。"
         );
+    }
+
+    #[tokio::test]
+    async fn terminal_usage_reconciliation_requires_existing_identity_and_updates_usage() {
+        let repository = Arc::new(InMemoryUsageReadRepository::default());
+        // Mirrors cleanup recovery: transport status is already completed, but
+        // tokens/costs and settlement are still pending until the queued event
+        // is replayed.
+        let recovered = UsageEvent::new(
+            UsageEventType::Completed,
+            "req-reconcile-state-1",
+            UsageEventData {
+                provider_name: "openai".to_string(),
+                model: "gpt-5".to_string(),
+                status_code: Some(200),
+                is_stream: Some(true),
+                ..UsageEventData::default()
+            },
+        );
+        repository
+            .upsert(
+                aether_usage_runtime::build_upsert_usage_record_from_event(&recovered)
+                    .expect("recovered usage record"),
+            )
+            .await
+            .expect("recovered usage should seed");
+        let state = AppState::new()
+            .expect("state should build")
+            .with_usage_data_repository_for_tests(repository);
+
+        let completed = UsageEvent::new(
+            UsageEventType::Completed,
+            "req-reconcile-state-1",
+            UsageEventData {
+                provider_name: "openai".to_string(),
+                model: "gpt-5".to_string(),
+                status_code: Some(200),
+                is_stream: Some(true),
+                input_tokens: Some(237_505),
+                output_tokens: Some(39),
+                total_tokens: Some(237_544),
+                total_cost_usd: Some(0.243_886),
+                actual_total_cost_usd: Some(0.243_886),
+                response_time_ms: Some(5_037),
+                ..UsageEventData::default()
+            },
+        );
+        let stored = state
+            .reconcile_terminal_usage_event(&completed)
+            .await
+            .expect("terminal event should reconcile");
+
+        assert_eq!(stored.status, "completed");
+        assert_eq!(stored.total_tokens, 237_544);
+        assert_eq!(stored.total_cost_usd, 0.243_886);
+        assert_eq!(stored.response_time_ms, Some(5_037));
+
+        let mut wrong_identity = completed;
+        wrong_identity.data.provider_name = "different-provider".to_string();
+        let error = state
+            .reconcile_terminal_usage_event(&wrong_identity)
+            .await
+            .expect_err("mismatched identity must be rejected");
+        assert!(error.to_string().contains("identity mismatch"));
     }
 
     #[tokio::test]

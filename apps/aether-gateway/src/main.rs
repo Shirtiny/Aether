@@ -2,6 +2,7 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -585,6 +586,8 @@ enum DataCommand {
     Import(DataImportArgs),
     /// Copy persistent SQL data directly between two databases without a JSONL file.
     Copy(DataCopyArgs),
+    /// Inspect or explicitly replay terminal usage events from JSON/JSONL.
+    ReconcileUsage(DataReconcileUsageArgs),
 }
 
 #[derive(ClapArgs, Debug, Clone)]
@@ -627,6 +630,25 @@ struct DataCopyArgs {
 
     #[arg(long)]
     omit_request_body_details: bool,
+}
+
+#[derive(ClapArgs, Debug, Clone)]
+struct DataReconcileUsageArgs {
+    #[command(flatten)]
+    data: GatewayDataArgs,
+
+    /// JSON/JSONL containing UsageEvent objects, Redis stream envelopes, or
+    /// objects with a string `payload` field copied from the usage stream/DLQ.
+    #[arg(long)]
+    input: PathBuf,
+
+    /// Restrict the operation to these request IDs. May be repeated or comma-separated.
+    #[arg(long = "request-id", value_delimiter = ',')]
+    request_ids: Vec<String>,
+
+    /// Apply the replay. Without this flag the command is read-only.
+    #[arg(long, default_value_t = false)]
+    execute: bool,
 }
 
 impl GatewayLoggingArgs {
@@ -1308,6 +1330,7 @@ async fn run_data_command(command: &DataCommand) -> Result<(), Box<dyn std::erro
         DataCommand::Export(args) => run_data_export(args).await,
         DataCommand::Import(args) => run_data_import(args).await,
         DataCommand::Copy(args) => run_data_copy(args).await,
+        DataCommand::ReconcileUsage(args) => run_data_reconcile_usage(args).await,
     }
 }
 
@@ -1335,6 +1358,265 @@ fn current_unix_secs() -> Result<u64, std::time::SystemTimeError> {
     Ok(std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs())
+}
+
+fn decode_usage_reconciliation_value(
+    value: serde_json::Value,
+) -> Result<aether_usage_runtime::UsageEvent, Box<dyn std::error::Error>> {
+    if value.get("event_type").is_some() {
+        return Ok(serde_json::from_value(value)?);
+    }
+
+    let payload = match value.get("payload").and_then(serde_json::Value::as_str) {
+        Some(payload) => payload.to_string(),
+        None => serde_json::to_string(&value)?,
+    };
+    let fields = BTreeMap::from([("payload".to_string(), payload)]);
+    Ok(aether_usage_runtime::UsageEvent::from_stream_fields(
+        &fields,
+    )?)
+}
+
+fn decode_usage_reconciliation_input(
+    input: &str,
+) -> Result<Vec<aether_usage_runtime::UsageEvent>, Box<dyn std::error::Error>> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "usage reconciliation input is empty",
+        )
+        .into());
+    }
+
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(input) {
+        return match value {
+            serde_json::Value::Array(values) => values
+                .into_iter()
+                .map(decode_usage_reconciliation_value)
+                .collect(),
+            value => decode_usage_reconciliation_value(value).map(|event| vec![event]),
+        };
+    }
+
+    input
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty())
+        .map(|(index, line)| {
+            let value: serde_json::Value = serde_json::from_str(line).map_err(|err| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "invalid usage reconciliation JSON on line {}: {err}",
+                        index + 1
+                    ),
+                )
+            })?;
+            decode_usage_reconciliation_value(value)
+        })
+        .collect()
+}
+
+fn usage_reconciliation_view(
+    usage: &aether_data_contracts::repository::usage::StoredRequestUsageAudit,
+) -> serde_json::Value {
+    serde_json::json!({
+        "request_id": usage.request_id,
+        "provider_name": usage.provider_name,
+        "model": usage.model,
+        "status": usage.status,
+        "billing_status": usage.billing_status,
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "total_tokens": usage.total_tokens,
+        "total_cost_usd": usage.total_cost_usd,
+        "actual_total_cost_usd": usage.actual_total_cost_usd,
+        "status_code": usage.status_code,
+        "response_time_ms": usage.response_time_ms,
+        "first_byte_time_ms": usage.first_byte_time_ms,
+        "updated_at_unix_secs": usage.updated_at_unix_secs,
+        "finalized_at_unix_secs": usage.finalized_at_unix_secs,
+    })
+}
+
+fn validate_usage_reconciliation_identity(
+    event: &aether_usage_runtime::UsageEvent,
+    usage: &aether_data_contracts::repository::usage::StoredRequestUsageAudit,
+) -> Result<(), std::io::Error> {
+    if usage.provider_name.trim() != event.data.provider_name.trim()
+        || usage.model.trim() != event.data.model.trim()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "usage reconciliation identity mismatch for request {}: stored provider/model={}/{}, event={}/{}",
+                event.request_id,
+                usage.provider_name,
+                usage.model,
+                event.data.provider_name,
+                event.data.model
+            ),
+        ));
+    }
+    Ok(())
+}
+
+async fn run_data_reconcile_usage(
+    args: &DataReconcileUsageArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = required_sql_database_config(&args.data)?;
+    let encoded = tokio::fs::read_to_string(&args.input).await?;
+    let events = decode_usage_reconciliation_input(&encoded)?;
+    if events.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "usage reconciliation input contains no events",
+        )
+        .into());
+    }
+
+    let requested_ids = args
+        .request_ids
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    let mut seen_ids = BTreeSet::new();
+    for event in &events {
+        use aether_usage_runtime::UsageEventType;
+        if !matches!(
+            event.event_type,
+            UsageEventType::Completed | UsageEventType::Failed | UsageEventType::Cancelled
+        ) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "usage reconciliation accepts terminal events only; request {} is {:?}",
+                    event.request_id, event.event_type
+                ),
+            )
+            .into());
+        }
+        if event.request_id.trim().is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "usage reconciliation event request_id cannot be empty",
+            )
+            .into());
+        }
+        if event.request_id != event.request_id.trim()
+            || event.data.provider_name != event.data.provider_name.trim()
+            || event.data.model != event.data.model.trim()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "usage reconciliation identity fields must not contain surrounding whitespace for request {:?}",
+                    event.request_id
+                ),
+            )
+            .into());
+        }
+        if !requested_ids.is_empty() && !requested_ids.contains(event.request_id.trim()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "input contains request {} which was not selected with --request-id",
+                    event.request_id
+                ),
+            )
+            .into());
+        }
+        if !seen_ids.insert(event.request_id.trim().to_string()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "duplicate reconciliation event for request {}",
+                    event.request_id
+                ),
+            )
+            .into());
+        }
+        // Validate the exact persistence payload before opening the database or
+        // applying any item from the batch.
+        let _ = aether_usage_runtime::build_upsert_usage_record_from_event(event)?;
+    }
+    let missing_requested_ids = requested_ids
+        .difference(&seen_ids)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing_requested_ids.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "selected request IDs are missing from input: {}",
+                missing_requested_ids.join(", ")
+            ),
+        )
+        .into());
+    }
+
+    let state = AppState::new()?.with_data_config(args.data.to_config())?;
+    let mut before = Vec::with_capacity(events.len());
+    for event in &events {
+        let usage = state
+            .find_usage_for_reconciliation(event.request_id.trim())
+            .await?
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "usage reconciliation refused to create missing request {}",
+                        event.request_id
+                    ),
+                )
+            })?;
+        validate_usage_reconciliation_identity(event, &usage)?;
+        before.push(usage);
+    }
+
+    for (event, prior) in events.iter().zip(before.iter()) {
+        let after = if args.execute {
+            state.reconcile_terminal_usage_event(event).await?
+        } else {
+            prior.clone()
+        };
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "mode": if args.execute { "executed" } else { "dry_run" },
+                "event": {
+                    "event_type": event.event_type,
+                    "request_id": event.request_id,
+                    "timestamp_ms": event.timestamp_ms,
+                    "provider_name": event.data.provider_name,
+                    "model": event.data.model,
+                    "input_tokens": event.data.input_tokens,
+                    "output_tokens": event.data.output_tokens,
+                    "total_tokens": event.data.total_tokens,
+                    "total_cost_usd": event.data.total_cost_usd,
+                    "actual_total_cost_usd": event.data.actual_total_cost_usd,
+                    "status_code": event.data.status_code,
+                    "response_time_ms": event.data.response_time_ms,
+                },
+                "before": usage_reconciliation_view(prior),
+                "after": usage_reconciliation_view(&after),
+            }))?
+        );
+    }
+
+    eprintln!(
+        "usage reconciliation {} for {} event(s); source queue entries were not acknowledged",
+        if args.execute {
+            "executed"
+        } else {
+            "dry-run complete"
+        },
+        events.len()
+    );
+    Ok(())
 }
 
 async fn run_data_export(args: &DataExportArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -1657,11 +1939,11 @@ fn pending_backfills_error(
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_database_backfills_are_current, ensure_database_schema_is_current,
-        pending_backfills_error, pending_schema_error, resolve_healthcheck_url, Args,
-        DatabaseDriverArg, DeploymentTopologyArg, GatewayDataArgs, GatewayFrontdoorArgs,
-        GatewayLogDestinationArg, GatewayLogFormatArg, GatewayLogRotationArg, GatewayLoggingArgs,
-        GatewayRateLimitArgs, GatewayUsageArgs, NodeRoleArg, RuntimeBackendArg,
+        decode_usage_reconciliation_input, ensure_database_backfills_are_current,
+        ensure_database_schema_is_current, pending_backfills_error, pending_schema_error,
+        resolve_healthcheck_url, Args, DatabaseDriverArg, DeploymentTopologyArg, GatewayDataArgs,
+        GatewayFrontdoorArgs, GatewayLogDestinationArg, GatewayLogFormatArg, GatewayLogRotationArg,
+        GatewayLoggingArgs, GatewayRateLimitArgs, GatewayUsageArgs, NodeRoleArg, RuntimeBackendArg,
         VideoTaskTruthSourceArg,
     };
     use aether_data::{DatabaseDriver, SqlDatabaseConfig, SqlPoolConfig};
@@ -1738,6 +2020,62 @@ mod tests {
                 log_max_files: 30,
             },
         }
+    }
+
+    #[test]
+    fn usage_reconciliation_input_accepts_direct_event_and_stream_envelope_jsonl() {
+        let event = aether_usage_runtime::UsageEvent::new(
+            aether_usage_runtime::UsageEventType::Completed,
+            "req-reconcile-1",
+            aether_usage_runtime::UsageEventData {
+                provider_name: "openai".to_string(),
+                model: "gpt-5".to_string(),
+                total_tokens: Some(12),
+                ..aether_usage_runtime::UsageEventData::default()
+            },
+        );
+        let direct = serde_json::to_string(&event).expect("direct event JSON");
+        let payload = event
+            .to_stream_fields()
+            .expect("stream fields")
+            .remove("payload")
+            .expect("stream payload");
+        let encoded = format!(
+            "{direct}\n{}",
+            serde_json::to_string(&serde_json::json!({"payload": payload}))
+                .expect("wrapped stream payload")
+        );
+
+        let decoded = decode_usage_reconciliation_input(&encoded)
+            .expect("both supported representations should decode");
+        assert_eq!(decoded, vec![event.clone(), event]);
+    }
+
+    #[test]
+    fn usage_reconciliation_input_accepts_stream_envelope_array() {
+        let event = aether_usage_runtime::UsageEvent::new(
+            aether_usage_runtime::UsageEventType::Failed,
+            "req-reconcile-2",
+            aether_usage_runtime::UsageEventData {
+                provider_name: "anthropic".to_string(),
+                model: "claude-test".to_string(),
+                status_code: Some(502),
+                ..aether_usage_runtime::UsageEventData::default()
+            },
+        );
+        let payload = event
+            .to_stream_fields()
+            .expect("stream fields")
+            .remove("payload")
+            .expect("stream payload");
+        let envelope: serde_json::Value =
+            serde_json::from_str(&payload).expect("stream envelope JSON");
+
+        let decoded = decode_usage_reconciliation_input(
+            &serde_json::to_string(&vec![envelope]).expect("envelope array"),
+        )
+        .expect("stream envelope array should decode");
+        assert_eq!(decoded, vec![event]);
     }
 
     #[test]

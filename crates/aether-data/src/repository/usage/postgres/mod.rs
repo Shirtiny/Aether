@@ -8951,6 +8951,7 @@ ORDER BY "usage".user_id ASC
                         .await
                         .map_postgres_err()?;
                     summary.recovered += 1;
+                    summary.reconciliation_required += 1;
                     continue;
                 }
 

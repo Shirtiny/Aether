@@ -11,6 +11,7 @@ use super::{pending_cleanup_batch_size, pending_cleanup_timeout_minutes};
 pub(crate) struct PendingCleanupSummary {
     pub(crate) failed: usize,
     pub(crate) recovered: usize,
+    pub(crate) reconciliation_required: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,6 +60,7 @@ pub(crate) async fn cleanup_stale_pending_requests_once(
     Ok(PendingCleanupSummary {
         failed: summary.failed,
         recovered: summary.recovered,
+        reconciliation_required: summary.reconciliation_required,
     })
 }
 
