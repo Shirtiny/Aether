@@ -936,20 +936,6 @@
                       </PopoverContent>
                     </Popover>
                     <Button
-                      v-if="quotaRefreshSupported"
-                      variant="ghost"
-                      size="icon"
-                      class="h-7 w-7"
-                      :disabled="refreshingQuotaKeyId === key.key_id"
-                      title="刷新额度"
-                      @click="handleRefreshKeyQuota(key)"
-                    >
-                      <RefreshCw
-                        class="w-3.5 h-3.5"
-                        :class="{ 'animate-spin': refreshingQuotaKeyId === key.key_id }"
-                      />
-                    </Button>
-                    <Button
                       variant="ghost"
                       size="icon"
                       class="h-7 w-7"
@@ -1424,20 +1410,6 @@
                     <RotateCcw
                       class="w-3.5 h-3.5"
                       :class="{ 'animate-spin': resettingCycleKeyId === key.key_id }"
-                    />
-                  </Button>
-                  <Button
-                    v-else-if="actionId === 'refresh_quota'"
-                    variant="ghost"
-                    size="icon"
-                    class="h-7 w-7 shrink-0"
-                    :disabled="refreshingQuotaKeyId === key.key_id"
-                    title="刷新额度"
-                    @click.stop="handleRefreshKeyQuota(key)"
-                  >
-                    <RefreshCw
-                      class="w-3.5 h-3.5"
-                      :class="{ 'animate-spin': refreshingQuotaKeyId === key.key_id }"
                     />
                   </Button>
                   <Button
@@ -2349,7 +2321,6 @@ const scoreDesktopPopoverOpenKeyId = ref<string | null>(null)
 const scoreMobilePopoverOpenKeyId = ref<string | null>(null)
 const deletingKeyId = ref<string | null>(null)
 const togglingKeyId = ref<string | null>(null)
-const refreshingQuotaKeyId = ref<string | null>(null)
 const togglingCodexWsKeyId = ref<string | null>(null)
 const codexWsStatusByKey = ref<Record<string, CodexWsAccountStatus>>({})
 const editingPriorityKeyId = ref<string | null>(null)
@@ -2599,7 +2570,6 @@ const keyUiStateMap = computed<Record<string, PoolKeyUiState>>(() => {
         canResetCycleStats: canResetCycleStats(key),
         canClearCooldown: Boolean(key.cooldown_reason),
         hasProxy: true,
-        canRefreshQuota: quotaRefreshSupported.value,
       }).primary,
     }
   }
@@ -2800,42 +2770,6 @@ async function refreshCurrentPageQuotaInBackground(
     return false
   } finally {
     refreshingCurrentPageQuota.value = false
-  }
-}
-
-async function handleRefreshKeyQuota(key: PoolKeyDetail): Promise<void> {
-  if (!selectedProviderId.value || !quotaRefreshSupported.value) return
-  const keyId = String(key.key_id || '').trim()
-  if (!keyId || refreshingQuotaKeyId.value) return
-
-  const updatedAt = normalizeQuotaUpdatedAt(key.quota_updated_at ?? null)
-  if (updatedAt != null) {
-    const remaining = MANUAL_QUOTA_REFRESH_COOLDOWN_SECONDS - (Math.floor(Date.now() / 1000) - updatedAt)
-    if (remaining > 0) {
-      showWarning(`该账号额度在冷却中，请 ${formatTTL(remaining)} 后再试`)
-      return
-    }
-  }
-
-  const providerId = selectedProviderId.value
-  refreshingQuotaKeyId.value = keyId
-  try {
-    const result = await refreshProviderQuota(providerId, [keyId])
-    applyQuotaRefreshResultToCurrentPage(result)
-    const successCount = Number(result.success || 0)
-    const failedCount = Number(result.failed || 0)
-    const firstFailureMessage = result.results?.find((item) => item.status !== 'success')?.message?.trim()
-    if (successCount > 0) {
-      success('额度刷新完成')
-    } else if (failedCount > 0 && firstFailureMessage) {
-      showError(`额度刷新失败：${firstFailureMessage}`)
-    } else {
-      showWarning('额度未更新')
-    }
-  } catch (err) {
-    showError(parseApiError(err, '刷新额度失败'))
-  } finally {
-    refreshingQuotaKeyId.value = null
   }
 }
 
