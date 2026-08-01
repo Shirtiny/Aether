@@ -21,6 +21,7 @@ export interface PoolMobileTagInput {
 export type PoolMobileActionId =
   | 'copy_or_download'
   | 'refresh_token'
+  | 'refresh_quota'
   | 'reset_codex_credit'
   | 'reset_cycle_stats'
   | 'clear_cooldown'
@@ -35,6 +36,7 @@ export interface PoolMobileActionInput {
   canDownloadOrCopy?: boolean
   canRefreshToken?: boolean
   showRefreshToken?: boolean
+  canRefreshQuota?: boolean
   canResetCodexCredit?: boolean
   canResetCycleStats?: boolean
   canClearCooldown?: boolean
@@ -90,6 +92,9 @@ export function splitPoolMobileActions(input: PoolMobileActionInput): {
     if (input.hasProxy) {
       primary.push('proxy')
     }
+    if (input.canRefreshQuota) {
+      primary.push('refresh_quota')
+    }
     primary.push('edit', 'toggle', 'delete')
 
     return {
@@ -117,6 +122,9 @@ export function splitPoolMobileActions(input: PoolMobileActionInput): {
   primary.push('permissions')
   if (input.hasProxy) {
     primary.push('proxy')
+  }
+  if (input.canRefreshQuota) {
+    primary.push('refresh_quota')
   }
   primary.push('edit', 'toggle', 'delete')
 
