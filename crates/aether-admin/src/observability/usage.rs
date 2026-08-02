@@ -2397,18 +2397,44 @@ pub fn build_admin_usage_active_requests_response(
     provider_key_names: &BTreeMap<String, String>,
     image_progress_by_request_id: &BTreeMap<String, Value>,
 ) -> Response<Body> {
+    build_admin_usage_active_requests_response_with_terminal_sync(
+        items,
+        api_key_names,
+        auth_api_key_reader_available,
+        provider_key_names,
+        image_progress_by_request_id,
+        &BTreeMap::new(),
+    )
+}
+
+pub fn build_admin_usage_active_requests_response_with_terminal_sync(
+    items: &[StoredRequestUsageAudit],
+    api_key_names: &BTreeMap<String, String>,
+    auth_api_key_reader_available: bool,
+    provider_key_names: &BTreeMap<String, String>,
+    image_progress_by_request_id: &BTreeMap<String, Value>,
+    terminal_sync_by_usage_id: &BTreeMap<String, Option<u64>>,
+) -> Response<Body> {
     let payload: Vec<_> = items
         .iter()
         .map(|item| {
             let provider_key_name = admin_usage_provider_key_name(item, provider_key_names);
             let api_key_name =
                 admin_usage_api_key_name(item, api_key_names, auth_api_key_reader_available);
-            admin_usage_active_request_json(
+            let mut value = admin_usage_active_request_json(
                 item,
                 api_key_name,
                 provider_key_name,
                 image_progress_by_request_id.get(&item.request_id),
-            )
+            );
+            let terminal_response_time_ms = terminal_sync_by_usage_id.get(&item.id);
+            value["terminal_sync_pending"] = json!(terminal_response_time_ms.is_some());
+            value["terminal_response_time_ms"] = terminal_response_time_ms
+                .copied()
+                .flatten()
+                .map(Value::from)
+                .unwrap_or(Value::Null);
+            value
         })
         .collect();
 

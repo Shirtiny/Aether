@@ -42,8 +42,13 @@ impl UsageQueue {
 
     pub async fn enqueue(&self, event: &UsageEvent) -> Result<String, DataLayerError> {
         let fields = event.to_stream_fields()?;
+        // Never apply MAXLEN to the authoritative terminal-event stream. Redis
+        // trimming can evict entries that are still in a consumer group's PEL,
+        // which turns a temporary database outage into permanent usage loss.
+        // Successfully processed entries are explicitly XACKed and XDELeted by
+        // the worker, so the healthy steady-state stream remains bounded.
         self.runner
-            .append_fields_with_maxlen(&self.stream, &fields, Some(self.config.stream_maxlen))
+            .append_fields_with_maxlen(&self.stream, &fields, None)
             .await
     }
 
@@ -129,8 +134,8 @@ fn usage_queue_runtime_settings(config: &UsageRuntimeConfig) -> UsageQueueRuntim
 #[cfg(test)]
 mod tests {
     use super::{usage_queue_runtime_settings, UsageQueue, UsageQueueRuntimeSettings};
-    use crate::UsageRuntimeConfig;
-    use aether_runtime_state::{MemoryRuntimeStateConfig, RuntimeState};
+    use crate::{UsageEvent, UsageEventData, UsageEventType, UsageRuntimeConfig};
+    use aether_runtime_state::{MemoryRuntimeStateConfig, RuntimeQueueStore, RuntimeState};
     use std::sync::Arc;
 
     #[test]
@@ -155,5 +160,51 @@ mod tests {
                 read_count: 123,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn enqueue_does_not_trim_unacknowledged_terminal_events() {
+        let config = UsageRuntimeConfig {
+            enabled: true,
+            queue_terminal_events: true,
+            stream_key: "usage:test:no-unacked-trim".to_string(),
+            consumer_group: "usage:test:no-unacked-trim:group".to_string(),
+            dlq_stream_key: "usage:test:no-unacked-trim:dlq".to_string(),
+            stream_maxlen: 1,
+            ..UsageRuntimeConfig::default()
+        };
+        let runtime = Arc::new(RuntimeState::memory(MemoryRuntimeStateConfig::default()));
+        let queue = UsageQueue::new(runtime.clone(), config).expect("usage queue should build");
+        queue
+            .ensure_consumer_group()
+            .await
+            .expect("consumer group should initialize");
+
+        for request_id in ["request-1", "request-2"] {
+            queue
+                .enqueue(&UsageEvent::new(
+                    UsageEventType::Completed,
+                    request_id,
+                    UsageEventData {
+                        provider_name: "openai".to_string(),
+                        model: "gpt-5.6".to_string(),
+                        ..UsageEventData::default()
+                    },
+                ))
+                .await
+                .expect("terminal event should enqueue");
+        }
+
+        let entries = RuntimeQueueStore::read_group(
+            runtime.as_ref(),
+            "usage:test:no-unacked-trim",
+            "usage:test:no-unacked-trim:group",
+            "consumer-1",
+            10,
+            Some(1),
+        )
+        .await
+        .expect("terminal events should read");
+        assert_eq!(entries.len(), 2);
     }
 }

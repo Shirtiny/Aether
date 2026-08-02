@@ -327,6 +327,7 @@ fn proxy_delta_for_index(index: usize) -> ProxyNodeCounterDelta {
         failed_requests_delta: if index.is_multiple_of(10) { 1 } else { 0 },
         dns_failures_delta: if index.is_multiple_of(25) { 1 } else { 0 },
         stream_errors_delta: if index.is_multiple_of(40) { 1 } else { 0 },
+        idempotency_key: None,
     }
 }
 

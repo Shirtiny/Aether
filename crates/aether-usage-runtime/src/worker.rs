@@ -31,6 +31,7 @@ pub trait UsageEventRecorder: Send + Sync {
 pub trait ManualProxyNodeCounter: Send + Sync {
     async fn increment_manual_proxy_node_requests(
         &self,
+        request_id: &str,
         node_id: &str,
         total_delta: i64,
         failed_delta: i64,
@@ -383,11 +384,14 @@ where
     if let Some(stored) = data.upsert_usage_record(record).await? {
         settle_usage_if_needed(data, &stored).await?;
     }
-    increment_manual_proxy_node_from_event(data, event).await;
+    increment_manual_proxy_node_from_event(data, event).await?;
     Ok(())
 }
 
-async fn increment_manual_proxy_node_from_event<T>(data: &T, event: &UsageEvent)
+async fn increment_manual_proxy_node_from_event<T>(
+    data: &T,
+    event: &UsageEvent,
+) -> Result<(), DataLayerError>
 where
     T: ManualProxyNodeCounter + Send + Sync,
 {
@@ -396,16 +400,22 @@ where
         crate::UsageEventType::Completed | crate::UsageEventType::Failed
     );
     if !is_terminal {
-        return;
+        return Ok(());
     }
     let Some(node_id) = extract_manual_proxy_node_id(event) else {
-        return;
+        return Ok(());
     };
     let failed = matches!(event.event_type, crate::UsageEventType::Failed);
     let failed_delta = if failed { 1i64 } else { 0i64 };
     let latency_ms = event.data.response_time_ms.map(|v| v as i64);
     if let Err(err) = data
-        .increment_manual_proxy_node_requests(&node_id, 1, failed_delta, latency_ms)
+        .increment_manual_proxy_node_requests(
+            event.request_id.as_str(),
+            &node_id,
+            1,
+            failed_delta,
+            latency_ms,
+        )
         .await
     {
         warn!(
@@ -415,7 +425,9 @@ where
             error = ?err,
             "failed to increment manual proxy node request count"
         );
+        return Err(err);
     }
+    Ok(())
 }
 
 fn extract_manual_proxy_node_id(event: &UsageEvent) -> Option<String> {
@@ -448,6 +460,7 @@ fn consumer_name() -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -471,6 +484,8 @@ mod tests {
     struct TestUsageStore {
         records: Mutex<Vec<UpsertUsageRecord>>,
         settlements: Mutex<Vec<UsageSettlementInput>>,
+        proxy_counter_calls: Mutex<Vec<(String, String)>>,
+        fail_proxy_counter: AtomicBool,
     }
 
     #[derive(Default)]
@@ -557,11 +572,21 @@ mod tests {
     impl ManualProxyNodeCounter for TestUsageStore {
         async fn increment_manual_proxy_node_requests(
             &self,
-            _node_id: &str,
+            request_id: &str,
+            node_id: &str,
             _total_delta: i64,
             _failed_delta: i64,
             _latency_ms: Option<i64>,
         ) -> Result<(), aether_data_contracts::DataLayerError> {
+            self.proxy_counter_calls
+                .lock()
+                .expect("proxy counter calls lock")
+                .push((request_id.to_string(), node_id.to_string()));
+            if self.fail_proxy_counter.load(Ordering::Relaxed) {
+                return Err(aether_data_contracts::DataLayerError::Redis(
+                    "proxy counter unavailable".to_string(),
+                ));
+            }
             Ok(())
         }
     }
@@ -628,6 +653,51 @@ mod tests {
         let settlements = store.settlements.lock().expect("settlements lock");
         assert_eq!(settlements.len(), 1);
         assert_eq!(settlements[0].request_id, "req-worker-123");
+    }
+
+    #[tokio::test]
+    async fn manual_proxy_counter_uses_stable_request_identity_across_replay() {
+        let store = TestUsageStore::default();
+        let mut event = sample_event();
+        event.data.request_metadata = Some(serde_json::json!({
+            "proxy": { "mode": "manual", "node_id": "proxy-node-1" }
+        }));
+
+        write_event_record(&store, &event)
+            .await
+            .expect("first delivery should succeed");
+        write_event_record(&store, &event)
+            .await
+            .expect("replayed delivery should succeed");
+
+        assert_eq!(
+            store
+                .proxy_counter_calls
+                .lock()
+                .expect("proxy counter calls lock")
+                .as_slice(),
+            [
+                ("req-worker-123".to_string(), "proxy-node-1".to_string()),
+                ("req-worker-123".to_string(), "proxy-node-1".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_proxy_counter_failure_keeps_the_usage_event_retryable() {
+        let store = TestUsageStore {
+            fail_proxy_counter: AtomicBool::new(true),
+            ..Default::default()
+        };
+        let mut event = sample_event();
+        event.data.request_metadata = Some(serde_json::json!({
+            "proxy": { "mode": "manual", "node_id": "proxy-node-1" }
+        }));
+
+        let error = write_event_record(&store, &event)
+            .await
+            .expect_err("counter failure must keep the event retryable");
+        assert!(matches!(error, DataLayerError::Redis(_)));
     }
 
     #[test]

@@ -13,10 +13,10 @@ use crate::executor::spawn_on_usage_background_runtime;
 use crate::{
     apply_usage_body_capture_policy_to_event, apply_usage_body_capture_policy_to_record,
     build_stream_terminal_usage_seed, build_sync_terminal_usage_seed,
-    build_terminal_usage_event_from_seed, build_upsert_usage_record_from_event,
-    build_usage_queue_worker, settle_usage_if_needed, LifecycleUsageSeed,
-    StreamTerminalUsagePayloadSeed, SyncTerminalUsagePayloadSeed, TerminalUsageContextSeed,
-    UsageEvent, UsageQueue, UsageRecordWriter, UsageRuntimeConfig, UsageSettlementWriter,
+    build_terminal_usage_event_from_seed, build_usage_queue_worker, write_event_record,
+    LifecycleUsageSeed, StreamTerminalUsagePayloadSeed, SyncTerminalUsagePayloadSeed,
+    TerminalUsageContextSeed, UsageEvent, UsageQueue, UsageRecordWriter, UsageRuntimeConfig,
+    UsageSettlementWriter,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -492,11 +492,7 @@ impl UsageRuntime {
     where
         T: UsageRuntimeAccess,
     {
-        let record = build_upsert_usage_record_from_event(event)?;
-        if let Some(stored) = data.upsert_usage_record(record).await? {
-            settle_usage_if_needed(data, &stored).await?;
-        }
-        Ok(())
+        write_event_record(data, event).await
     }
 }
 
@@ -650,6 +646,7 @@ mod tests {
     #[derive(Default)]
     struct NoRedisUsageStore {
         records: Mutex<Vec<UpsertUsageRecord>>,
+        proxy_counter_calls: Mutex<Vec<(String, String)>>,
     }
 
     struct QueueConfiguredUsageStore {
@@ -693,11 +690,16 @@ mod tests {
     impl ManualProxyNodeCounter for NoRedisUsageStore {
         async fn increment_manual_proxy_node_requests(
             &self,
-            _node_id: &str,
+            request_id: &str,
+            node_id: &str,
             _total_delta: i64,
             _failed_delta: i64,
             _latency_ms: Option<i64>,
         ) -> Result<(), DataLayerError> {
+            self.proxy_counter_calls
+                .lock()
+                .expect("proxy counter calls lock")
+                .push((request_id.to_string(), node_id.to_string()));
             Ok(())
         }
     }
@@ -751,6 +753,7 @@ mod tests {
     impl ManualProxyNodeCounter for QueueConfiguredUsageStore {
         async fn increment_manual_proxy_node_requests(
             &self,
+            _request_id: &str,
             _node_id: &str,
             _total_delta: i64,
             _failed_delta: i64,
@@ -793,6 +796,9 @@ mod tests {
                 output_tokens: Some(8),
                 total_tokens: Some(12),
                 status_code: Some(200),
+                request_metadata: Some(json!({
+                    "proxy": { "mode": "manual", "node_id": "proxy-node-direct" }
+                })),
                 ..UsageEventData::default()
             },
         );
@@ -808,6 +814,18 @@ mod tests {
         assert_eq!(records[0].request_id, "req-no-redis-1");
         assert_eq!(records[0].status, "completed");
         assert_eq!(records[0].total_tokens, Some(12));
+        drop(records);
+        assert_eq!(
+            store
+                .proxy_counter_calls
+                .lock()
+                .expect("proxy counter calls lock")
+                .as_slice(),
+            [(
+                "req-no-redis-1".to_string(),
+                "proxy-node-direct".to_string()
+            )]
+        );
     }
 
     #[tokio::test]

@@ -7,11 +7,14 @@ use aether_ai_serving::UPSTREAM_IS_STREAM_KEY;
 use aether_billing::{
     normalize_input_tokens_for_billing, normalize_total_input_context_for_cache_hit_rate,
 };
-use aether_data_contracts::repository::usage::{
-    StoredRequestUsageAudit, StoredUsageBreakdownSummaryRow, StoredUsageDailySummary,
-    UsageAuditKeywordSearchQuery, UsageAuditListQuery, UsageBreakdownGroupBy,
-    UsageBreakdownSummaryQuery, UsageCacheAffinityIntervalGroupBy, UsageCacheAffinityIntervalQuery,
-    UsageDashboardSummaryQuery,
+use aether_data_contracts::repository::{
+    candidates::StoredRequestCandidate,
+    usage::{
+        StoredRequestUsageAudit, StoredUsageBreakdownSummaryRow, StoredUsageDailySummary,
+        UsageAuditKeywordSearchQuery, UsageAuditListQuery, UsageBreakdownGroupBy,
+        UsageBreakdownSummaryQuery, UsageCacheAffinityIntervalGroupBy,
+        UsageCacheAffinityIntervalQuery, UsageDashboardSummaryQuery,
+    },
 };
 use axum::{
     body::Body,
@@ -21,7 +24,9 @@ use axum::{
 };
 use chrono::Utc;
 use serde_json::json;
+use tracing::warn;
 
+use crate::handlers::shared::{resolve_usage_terminal_sync_state, UsageTerminalSyncState};
 use crate::GatewayError;
 
 use super::{
@@ -472,11 +477,66 @@ fn users_me_usage_client_family(item: &StoredRequestUsageAudit) -> Option<&str> 
         })
 }
 
-fn build_users_me_usage_record_payload(
+async fn resolve_users_me_usage_terminal_sync_by_usage_id(
+    state: &AppState,
+    items: &[StoredRequestUsageAudit],
+) -> Result<BTreeMap<String, UsageTerminalSyncState>, GatewayError> {
+    if !state.has_request_candidate_data_reader() || items.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+
+    let active_items = items
+        .iter()
+        .filter(|item| {
+            matches!(
+                item.status.trim().to_ascii_lowercase().as_str(),
+                "pending" | "streaming"
+            )
+        })
+        .collect::<Vec<_>>();
+    if active_items.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+
+    let request_ids = active_items
+        .iter()
+        .map(|item| item.request_id.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut candidates_by_request_id = BTreeMap::<String, Vec<StoredRequestCandidate>>::new();
+    for candidate in state
+        .read_request_candidates_by_request_ids(&request_ids)
+        .await?
+    {
+        candidates_by_request_id
+            .entry(candidate.request_id.clone())
+            .or_default()
+            .push(candidate);
+    }
+
+    Ok(active_items
+        .into_iter()
+        .filter_map(|item| {
+            let candidates = candidates_by_request_id.get(&item.request_id)?;
+            let terminal_sync = resolve_usage_terminal_sync_state(
+                &item.status,
+                item.created_at_unix_ms,
+                candidates,
+            );
+            terminal_sync
+                .pending
+                .then(|| (item.id.clone(), terminal_sync))
+        })
+        .collect())
+}
+
+fn build_users_me_usage_record_payload_with_terminal_sync(
     item: &StoredRequestUsageAudit,
     include_actual_cost: bool,
     api_key_names: &BTreeMap<String, String>,
     auth_api_key_reader_available: bool,
+    terminal_sync: UsageTerminalSyncState,
 ) -> serde_json::Value {
     let input_price_per_1m = item.settlement_input_price_per_1m();
     let output_price_per_1m = item.settlement_output_price_per_1m();
@@ -534,6 +594,8 @@ fn build_users_me_usage_record_payload(
             auth_api_key_reader_available,
         ),
     });
+    payload["terminal_sync_pending"] = json!(terminal_sync.pending);
+    payload["terminal_response_time_ms"] = json!(terminal_sync.response_time_ms);
 
     if item.target_model.is_some() {
         payload["target_model"] = json!(item.target_model.clone());
@@ -551,7 +613,26 @@ fn build_users_me_usage_record_payload(
     payload
 }
 
-fn build_users_me_usage_active_payload(item: &StoredRequestUsageAudit) -> serde_json::Value {
+#[cfg(test)]
+fn build_users_me_usage_record_payload(
+    item: &StoredRequestUsageAudit,
+    include_actual_cost: bool,
+    api_key_names: &BTreeMap<String, String>,
+    auth_api_key_reader_available: bool,
+) -> serde_json::Value {
+    build_users_me_usage_record_payload_with_terminal_sync(
+        item,
+        include_actual_cost,
+        api_key_names,
+        auth_api_key_reader_available,
+        UsageTerminalSyncState::default(),
+    )
+}
+
+fn build_users_me_usage_active_payload_with_terminal_sync(
+    item: &StoredRequestUsageAudit,
+    terminal_sync: UsageTerminalSyncState,
+) -> serde_json::Value {
     let cache_creation_input_tokens = users_me_usage_cache_creation_tokens(item);
     let client_is_stream = users_me_usage_client_is_stream(item);
     let upstream_is_stream = users_me_usage_upstream_is_stream(item);
@@ -591,6 +672,8 @@ fn build_users_me_usage_active_payload(item: &StoredRequestUsageAudit) -> serde_
         "target_model": item.target_model,
         "has_fallback": item.has_fallback(),
     });
+    payload["terminal_sync_pending"] = json!(terminal_sync.pending);
+    payload["terminal_response_time_ms"] = json!(terminal_sync.response_time_ms);
     if item.api_format.is_none() {
         payload
             .as_object_mut()
@@ -616,6 +699,11 @@ fn build_users_me_usage_active_payload(item: &StoredRequestUsageAudit) -> serde_
         payload["service_tier"] = json!(service_tier);
     }
     payload
+}
+
+#[cfg(test)]
+fn build_users_me_usage_active_payload(item: &StoredRequestUsageAudit) -> serde_json::Value {
+    build_users_me_usage_active_payload_with_terminal_sync(item, UsageTerminalSyncState::default())
 }
 
 fn users_me_usage_is_failed(item: &StoredRequestUsageAudit) -> bool {
@@ -1122,14 +1210,31 @@ pub(super) async fn handle_users_me_usage_get(
         )
     };
 
+    let terminal_sync_by_usage_id =
+        match resolve_users_me_usage_terminal_sync_by_usage_id(state, &record_items).await {
+            Ok(value) => value,
+            Err(err) => {
+                warn!(
+                    event_name = "user_usage_terminal_sync_lookup_failed",
+                    log_type = "ops",
+                    error = ?err,
+                    "gateway could not enrich user usage records with terminal sync state"
+                );
+                BTreeMap::new()
+            }
+        };
     let records = record_items
         .into_iter()
         .map(|item| {
-            build_users_me_usage_record_payload(
+            build_users_me_usage_record_payload_with_terminal_sync(
                 &item,
                 include_actual_cost,
                 &api_key_names,
                 auth_api_key_reader_available,
+                terminal_sync_by_usage_id
+                    .get(&item.id)
+                    .copied()
+                    .unwrap_or_default(),
             )
         })
         .collect::<Vec<_>>();
@@ -1247,10 +1352,30 @@ pub(super) async fn handle_users_me_usage_active_get(
             .collect::<Vec<_>>()
     };
 
+    let terminal_sync_by_usage_id =
+        match resolve_users_me_usage_terminal_sync_by_usage_id(state, &items).await {
+            Ok(value) => value,
+            Err(err) => {
+                warn!(
+                    event_name = "user_active_usage_terminal_sync_lookup_failed",
+                    log_type = "ops",
+                    error = ?err,
+                    "gateway could not enrich active user usage with terminal sync state"
+                );
+                BTreeMap::new()
+            }
+        };
+
     Json(json!({
         "requests": items
             .iter()
-            .map(build_users_me_usage_active_payload)
+            .map(|item| build_users_me_usage_active_payload_with_terminal_sync(
+                item,
+                terminal_sync_by_usage_id
+                    .get(&item.id)
+                    .copied()
+                    .unwrap_or_default(),
+            ))
             .collect::<Vec<_>>(),
     }))
     .into_response()
@@ -1446,10 +1571,12 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        build_users_me_usage_active_payload, build_users_me_usage_record_payload,
-        users_me_usage_client_is_stream, users_me_usage_is_failed, users_me_usage_is_ws,
-        users_me_usage_upstream_is_stream,
+        build_users_me_usage_active_payload,
+        build_users_me_usage_active_payload_with_terminal_sync,
+        build_users_me_usage_record_payload, users_me_usage_client_is_stream,
+        users_me_usage_is_failed, users_me_usage_is_ws, users_me_usage_upstream_is_stream,
     };
+    use crate::handlers::shared::UsageTerminalSyncState;
 
     fn sample_usage(status: &str) -> StoredRequestUsageAudit {
         StoredRequestUsageAudit::new(
@@ -1523,6 +1650,21 @@ mod tests {
         assert_eq!(payload["cache_creation_input_tokens"], 10);
         assert_eq!(payload["cache_creation_ephemeral_5m_input_tokens"], 4);
         assert_eq!(payload["cache_creation_ephemeral_1h_input_tokens"], 6);
+    }
+
+    #[test]
+    fn user_usage_active_payload_exposes_explicit_terminal_sync_state() {
+        let item = sample_usage("streaming");
+        let payload = build_users_me_usage_active_payload_with_terminal_sync(
+            &item,
+            UsageTerminalSyncState {
+                pending: true,
+                response_time_ms: Some(5_037),
+            },
+        );
+
+        assert_eq!(payload["terminal_sync_pending"], true);
+        assert_eq!(payload["terminal_response_time_ms"], 5_037);
     }
 
     #[test]

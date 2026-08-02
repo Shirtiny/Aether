@@ -1683,7 +1683,17 @@ INSERT INTO usage_counter_deltas (
 ) VALUES (
   $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18
 )
+ON CONFLICT (id) DO NOTHING
 "#;
+
+fn proxy_node_counter_delta_idempotency_id(node_id: &str, idempotency_key: &str) -> String {
+    let identity = format!(
+        "aether:usage-counter:proxy-node:{}:{}",
+        node_id.trim(),
+        idempotency_key.trim()
+    );
+    Uuid::new_v5(&Uuid::NAMESPACE_URL, identity.as_bytes()).to_string()
+}
 
 const CLAIM_USAGE_COUNTER_DELTAS_SQL: &str = r#"
 WITH claimed AS (
@@ -8698,13 +8708,25 @@ ORDER BY "usage".user_id ASC
             return Ok(false);
         }
         let node_id = delta.node_id.trim().to_string();
-        let request_id = format!("proxy_node:{node_id}:{}", Uuid::new_v4());
+        let idempotency_key = delta
+            .idempotency_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let (row_id, request_id) = match idempotency_key {
+            Some(idempotency_key) => {
+                let row_id = proxy_node_counter_delta_idempotency_id(&node_id, idempotency_key);
+                (Some(row_id.clone()), format!("proxy_node_usage:{row_id}"))
+            }
+            None => (None, format!("proxy_node:{node_id}:{}", Uuid::new_v4())),
+        };
         self.tx_runner
             .run_read_write(|tx| {
                 Box::pin(async move {
                     insert_usage_counter_delta_in_tx(
                         tx,
                         UsageCounterDeltaInsert {
+                            row_id: row_id.as_deref(),
                             request_id: &request_id,
                             kind: USAGE_COUNTER_KIND_PROXY_NODE,
                             target_id: &node_id,
@@ -8755,6 +8777,7 @@ ORDER BY "usage".user_id ASC
                     insert_usage_counter_delta_in_tx(
                         tx,
                         UsageCounterDeltaInsert {
+                            row_id: None,
                             request_id: &request_id,
                             kind: USAGE_COUNTER_KIND_MANAGEMENT_TOKEN,
                             target_id: &token_id,
@@ -8796,6 +8819,7 @@ ORDER BY "usage".user_id ASC
                     insert_usage_counter_delta_in_tx(
                         tx,
                         UsageCounterDeltaInsert {
+                            row_id: None,
                             request_id: &request_id,
                             kind: USAGE_COUNTER_KIND_API_KEY_LAST_USED,
                             target_id: &api_key_id,
@@ -9611,6 +9635,7 @@ impl UsageCounterDeltaAggregates {
                             failed_requests_delta: 0,
                             dns_failures_delta: 0,
                             stream_errors_delta: 0,
+                            idempotency_key: None,
                         });
                     entry.total_requests_delta += row.total_requests_delta;
                     entry.failed_requests_delta += row.error_count_delta;
@@ -9733,6 +9758,7 @@ async fn enqueue_api_key_usage_delta_in_tx(
     insert_usage_counter_delta_in_tx(
         tx,
         UsageCounterDeltaInsert {
+            row_id: None,
             request_id,
             kind: USAGE_COUNTER_KIND_API_KEY,
             target_id: api_key_id,
@@ -9767,6 +9793,7 @@ async fn enqueue_model_usage_delta_in_tx(
     insert_usage_counter_delta_in_tx(
         tx,
         UsageCounterDeltaInsert {
+            row_id: None,
             request_id,
             kind: USAGE_COUNTER_KIND_MODEL,
             target_id: model,
@@ -9806,6 +9833,7 @@ async fn enqueue_provider_api_key_usage_delta_in_tx(
     insert_usage_counter_delta_in_tx(
         tx,
         UsageCounterDeltaInsert {
+            row_id: None,
             request_id,
             kind: USAGE_COUNTER_KIND_PROVIDER_API_KEY,
             target_id: key_id,
@@ -9829,6 +9857,7 @@ async fn enqueue_provider_api_key_usage_delta_in_tx(
 }
 
 struct UsageCounterDeltaInsert<'a> {
+    row_id: Option<&'a str>,
     request_id: &'a str,
     kind: &'a str,
     target_id: &'a str,
@@ -9874,8 +9903,15 @@ async fn insert_usage_counter_delta_in_tx(
         input.last_used_at_unix_secs,
     )?;
 
+    let row_id = input
+        .row_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+
     sqlx::query(INSERT_USAGE_COUNTER_DELTA_SQL)
-        .bind(Uuid::new_v4().to_string())
+        .bind(row_id)
         .bind(request_id)
         .bind(input.kind)
         .bind(target_id)

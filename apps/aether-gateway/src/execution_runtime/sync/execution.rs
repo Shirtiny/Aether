@@ -290,7 +290,7 @@ struct ImplicitSyncFinalizeOutcome {
     outcome: LocalCoreSyncFinalizeOutcome,
 }
 
-fn record_sync_terminal_usage(
+async fn record_sync_terminal_usage(
     state: &AppState,
     plan: &ExecutionPlan,
     report_context: Option<&serde_json::Value>,
@@ -298,19 +298,29 @@ fn record_sync_terminal_usage(
 ) {
     let context_seed = build_terminal_usage_context_seed(plan, report_context);
     let payload_seed = build_sync_terminal_usage_payload_seed(payload);
-    state
+    if let Err(err) = state
         .usage_runtime
-        .record_sync_terminal(state.data.as_ref(), context_seed, payload_seed);
+        .persist_sync_terminal(state.data.as_ref(), context_seed, payload_seed)
+        .await
+    {
+        warn!(
+            event_name = "usage_sync_terminal_persist_failed",
+            log_type = "event",
+            request_id = %plan.request_id,
+            error = %err,
+            "gateway could not durably persist a synchronous terminal usage event"
+        );
+    }
 }
 
-fn record_sync_terminal_usage_and_disarm_guard(
+async fn record_sync_terminal_usage_and_disarm_guard(
     state: &AppState,
     plan: &ExecutionPlan,
     report_context: Option<&serde_json::Value>,
     payload: &GatewaySyncReportRequest,
     terminal_guard: &mut SyncAttemptTerminalGuard,
 ) {
-    record_sync_terminal_usage(state, plan, report_context, payload);
+    record_sync_terminal_usage(state, plan, report_context, payload).await;
     terminal_guard.disarm();
 }
 
@@ -2203,7 +2213,8 @@ async fn execute_execution_runtime_sync_impl(
             usage_payload.report_context.as_ref(),
             &usage_payload,
             &mut terminal_guard,
-        );
+        )
+        .await;
         let response = attach_control_metadata_headers(
             build_client_response_from_parts(
                 status_code,
@@ -2240,7 +2251,8 @@ async fn execute_execution_runtime_sync_impl(
             implicit_finalize.payload.report_context.as_ref(),
             usage_payload,
             &mut terminal_guard,
-        );
+        )
+        .await;
         if let Some(report_payload) = implicit_finalize.outcome.background_report {
             spawn_sync_report(state.clone(), report_payload);
         } else {
@@ -2293,7 +2305,8 @@ async fn execute_execution_runtime_sync_impl(
                 payload.report_context.as_ref(),
                 usage_payload,
                 &mut terminal_guard,
-            );
+            )
+            .await;
             if let Some(report_payload) = outcome.background_report {
                 spawn_sync_report(state.clone(), report_payload);
             } else {
@@ -2339,7 +2352,8 @@ async fn execute_execution_runtime_sync_impl(
                     original_report_context.as_ref(),
                     &report_payload,
                     &mut terminal_guard,
-                );
+                )
+                .await;
                 if let Some(snapshot) = local_task_snapshot {
                     let _ = state.upsert_video_task_snapshot(&snapshot).await?;
                     state.video_tasks.record_snapshot(snapshot);
@@ -2373,7 +2387,8 @@ async fn execute_execution_runtime_sync_impl(
                 payload.report_context.as_ref(),
                 &payload,
                 &mut terminal_guard,
-            );
+            )
+            .await;
             state
                 .video_tasks
                 .apply_finalize_mutation(request_path, payload.report_kind.as_str());
@@ -2419,7 +2434,8 @@ async fn execute_execution_runtime_sync_impl(
                 payload.report_context.as_ref(),
                 &payload,
                 &mut terminal_guard,
-            );
+            )
+            .await;
             if background_error_report_kind.is_some() {
                 spawn_sync_report(state.clone(), payload);
             } else {
@@ -2445,7 +2461,8 @@ async fn execute_execution_runtime_sync_impl(
             payload.report_context.as_ref(),
             &payload,
             &mut terminal_guard,
-        );
+        )
+        .await;
         let response =
             submit_local_core_error_or_sync_finalize(state, trace_id, decision, payload).await?;
         return Ok(Some(attach_control_metadata_headers(
@@ -2480,7 +2497,8 @@ async fn execute_execution_runtime_sync_impl(
         usage_payload.report_context.as_ref(),
         &usage_payload,
         &mut terminal_guard,
-    );
+    )
+    .await;
     let response = attach_control_metadata_headers(
         build_client_response_from_parts(
             status_code,

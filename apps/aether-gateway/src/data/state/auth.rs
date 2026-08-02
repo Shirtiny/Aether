@@ -1300,6 +1300,7 @@ impl GatewayDataState {
                     failed_requests_delta: mutation.failed_requests_delta,
                     dns_failures_delta: mutation.dns_failures_delta,
                     stream_errors_delta: mutation.stream_errors_delta,
+                    idempotency_key: None,
                 })
                 .await?;
             if enqueued {

@@ -356,6 +356,8 @@ export const meApi = {
       rate_multiplier?: number | null
       response_time_ms: number | null
       first_byte_time_ms: number | null
+      terminal_sync_pending?: boolean | null
+      terminal_response_time_ms?: number | null
       status_code?: number | null
       error_message?: string | null
       session_id?: string | null

@@ -29,6 +29,16 @@ impl AppState {
             .map_err(|err| GatewayError::Internal(err.to_string()))
     }
 
+    pub(crate) async fn read_request_candidates_by_request_ids(
+        &self,
+        request_ids: &[String],
+    ) -> Result<Vec<candidates::StoredRequestCandidate>, GatewayError> {
+        self.data
+            .list_request_candidates_by_request_ids(request_ids)
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))
+    }
+
     pub(crate) async fn read_request_candidates_by_provider_id(
         &self,
         provider_id: &str,

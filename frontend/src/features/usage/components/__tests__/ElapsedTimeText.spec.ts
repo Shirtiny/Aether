@@ -32,27 +32,39 @@ describe('ElapsedTimeText', () => {
     return container.querySelector('span') as HTMLSpanElement
   }
 
-  it('shows live elapsed time while an active request is still within the sync threshold', async () => {
+  it('shows live elapsed time while an active request has no explicit terminal signal', async () => {
     const root = await mount({
-      createdAt: '2026-08-01T07:59:55.000Z',
+      createdAt: '2026-08-01T07:53:20.000Z',
       status: 'streaming',
       responseTimeMs: 3_000,
     })
 
-    expect(root.textContent).toBe('5.00s')
+    expect(root.textContent).toBe('400.00s')
     expect(root.dataset.terminalSyncDelayed).toBeUndefined()
   })
 
-  it('shows recorded latency instead of an unbounded timer when terminal sync is delayed', async () => {
+  it('shows terminal transport latency when the backend reports delayed terminal sync', async () => {
     const root = await mount({
       createdAt: '2026-08-01T07:53:20.000Z',
       status: 'streaming',
-      responseTimeMs: 5_037,
+      responseTimeMs: 3_000,
+      terminalSyncPending: true,
+      terminalResponseTimeMs: 5_037,
     })
 
     expect(root.textContent).toBe('5.04s · 终态同步中')
     expect(root.dataset.terminalSyncDelayed).toBe('true')
     expect(root.title).toContain('终态同步延迟')
+  })
+
+  it('shows an explicit sync state even when terminal latency is unavailable', async () => {
+    const root = await mount({
+      status: 'streaming',
+      terminalSyncPending: true,
+    })
+
+    expect(root.textContent).toBe('终态同步中')
+    expect(root.dataset.terminalSyncDelayed).toBe('true')
   })
 
   it('keeps the authoritative recorded duration after completion', async () => {

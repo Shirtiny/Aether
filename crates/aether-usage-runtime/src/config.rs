@@ -7,6 +7,8 @@ pub struct UsageRuntimeConfig {
     pub stream_key: String,
     pub consumer_group: String,
     pub dlq_stream_key: String,
+    /// Legacy configuration compatibility. Terminal events are never trimmed
+    /// before acknowledgement; successful entries are ACKed and deleted.
     pub stream_maxlen: usize,
     pub consumer_batch_size: usize,
     pub consumer_block_ms: u64,

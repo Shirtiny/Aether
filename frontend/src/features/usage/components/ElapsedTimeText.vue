@@ -13,14 +13,16 @@ const props = withDefaults(defineProps<{
   createdAt?: string | null
   status?: string | null
   responseTimeMs?: number | null
+  terminalSyncPending?: boolean
+  terminalResponseTimeMs?: number | null
   precision?: number
-  syncDelayThresholdMs?: number
 }>(), {
   createdAt: null,
   status: null,
   responseTimeMs: null,
+  terminalSyncPending: false,
+  terminalResponseTimeMs: null,
   precision: 2,
-  syncDelayThresholdMs: 60_000,
 })
 
 const now = ref(Date.now())
@@ -71,35 +73,52 @@ const displayText = computed(() => {
     return `${(props.responseTimeMs / 1000).toFixed(precision.value)}s`
   }
 
+  if (terminalSyncDelayed.value) {
+    const terminalResponseTimeMs = resolvedTerminalResponseTimeMs.value
+    if (terminalResponseTimeMs == null) return '终态同步中'
+    return `${(terminalResponseTimeMs / 1000).toFixed(precision.value)}s · 终态同步中`
+  }
+
   if (!props.createdAt) return '-'
 
   const createdAtMs = parseCreatedAtMs(props.createdAt)
   if (Number.isNaN(createdAtMs)) return '-'
 
   const elapsedMs = Math.max(0, now.value - createdAtMs)
-  if (terminalSyncDelayed.value && props.responseTimeMs != null) {
-    return `${(props.responseTimeMs / 1000).toFixed(precision.value)}s · 终态同步中`
-  }
   return `${(elapsedMs / 1000).toFixed(precision.value)}s`
 })
 
 const terminalSyncDelayed = computed(() => {
-  if (!isActive.value || !props.createdAt) return false
-  if (props.responseTimeMs == null || !Number.isFinite(props.responseTimeMs) || props.responseTimeMs <= 0) {
-    return false
+  return isActive.value && props.terminalSyncPending === true
+})
+
+const resolvedTerminalResponseTimeMs = computed(() => {
+  if (
+    props.terminalResponseTimeMs != null &&
+    Number.isFinite(props.terminalResponseTimeMs) &&
+    props.terminalResponseTimeMs > 0
+  ) {
+    return props.terminalResponseTimeMs
   }
-  const createdAtMs = parseCreatedAtMs(props.createdAt)
-  if (Number.isNaN(createdAtMs)) return false
-  const elapsedMs = Math.max(0, now.value - createdAtMs)
-  const thresholdMs = Math.max(1_000, props.syncDelayThresholdMs)
-  return elapsedMs >= props.responseTimeMs + thresholdMs
+  if (
+    props.responseTimeMs != null &&
+    Number.isFinite(props.responseTimeMs) &&
+    props.responseTimeMs > 0
+  ) {
+    return props.responseTimeMs
+  }
+  return null
 })
 
 const displayTitle = computed(() => {
-  if (!terminalSyncDelayed.value || !props.createdAt || props.responseTimeMs == null) return undefined
+  if (!terminalSyncDelayed.value) return undefined
+  const terminalResponseTimeMs = resolvedTerminalResponseTimeMs.value
+  if (!props.createdAt || terminalResponseTimeMs == null) {
+    return 'Provider 请求已结束，正在等待用量终态同步'
+  }
   const createdAtMs = parseCreatedAtMs(props.createdAt)
-  if (Number.isNaN(createdAtMs)) return undefined
-  const syncDelayMs = Math.max(0, now.value - createdAtMs - props.responseTimeMs)
-  return `请求已记录 ${(props.responseTimeMs / 1000).toFixed(precision.value)}s 响应耗时，终态同步延迟 ${(syncDelayMs / 1000).toFixed(precision.value)}s`
+  if (Number.isNaN(createdAtMs)) return 'Provider 请求已结束，正在等待用量终态同步'
+  const syncDelayMs = Math.max(0, now.value - createdAtMs - terminalResponseTimeMs)
+  return `Provider 请求耗时 ${(terminalResponseTimeMs / 1000).toFixed(precision.value)}s，用量终态同步延迟 ${(syncDelayMs / 1000).toFixed(precision.value)}s`
 })
 </script>

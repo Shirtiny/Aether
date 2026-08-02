@@ -11,6 +11,7 @@ pub(crate) mod provider_pool;
 mod request_utils;
 mod system_config_values;
 mod usage_stats;
+mod usage_terminal_sync;
 
 pub(crate) use self::admin_proxy::{
     attach_admin_audit_response, build_admin_proxy_auth_required_response,
@@ -74,4 +75,7 @@ pub(crate) use self::system_config_values::{
 pub(crate) use self::usage_stats::{
     admin_stats_bad_request_response, parse_bounded_u32, round_to, AdminStatsTimeRange,
     AdminStatsUsageFilter,
+};
+pub(crate) use self::usage_terminal_sync::{
+    resolve_usage_terminal_sync_state, UsageTerminalSyncState,
 };

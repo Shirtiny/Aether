@@ -382,6 +382,8 @@
                 :created-at="record.created_at"
                 :status="getDisplayStatus(record)"
                 :response-time-ms="record.response_time_ms ?? null"
+                :terminal-sync-pending="record.terminal_sync_pending === true"
+                :terminal-response-time-ms="record.terminal_response_time_ms ?? null"
               />
               <span class="text-muted-foreground"> / </span>
               <span>{{ formatOutputRate(getRecordDisplayOutputRate(record)) }}</span>
@@ -1142,6 +1144,8 @@
                   :created-at="record.created_at"
                   :status="getDisplayStatus(record)"
                   :response-time-ms="record.response_time_ms ?? null"
+                  :terminal-sync-pending="record.terminal_sync_pending === true"
+                  :terminal-response-time-ms="record.terminal_response_time_ms ?? null"
                 />
               </span>
             </div>

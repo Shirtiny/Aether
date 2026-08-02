@@ -451,6 +451,8 @@ struct GatewayUsageArgs {
     )]
     queue_dlq_stream_key: String,
 
+    /// Legacy compatibility knob. Unacknowledged terminal usage events are not
+    /// trimmed; workers ACK and delete successfully persisted entries instead.
     #[arg(
         long,
         env = "AETHER_GATEWAY_USAGE_QUEUE_STREAM_MAXLEN",
@@ -1363,14 +1365,66 @@ fn current_unix_secs() -> Result<u64, std::time::SystemTimeError> {
 fn decode_usage_reconciliation_value(
     value: serde_json::Value,
 ) -> Result<aether_usage_runtime::UsageEvent, Box<dyn std::error::Error>> {
-    if value.get("event_type").is_some() {
+    decode_usage_reconciliation_value_at_depth(value, 0)
+}
+
+fn decode_usage_reconciliation_value_at_depth(
+    value: serde_json::Value,
+    depth: usize,
+) -> Result<aether_usage_runtime::UsageEvent, Box<dyn std::error::Error>> {
+    const MAX_NESTING_DEPTH: usize = 8;
+    if depth > MAX_NESTING_DEPTH {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "usage reconciliation payload nesting exceeds 8 layers",
+        )
+        .into());
+    }
+
+    if value.get("event_type").is_some()
+        && value.get("request_id").is_some()
+        && value.get("data").is_some()
+    {
         return Ok(serde_json::from_value(value)?);
     }
 
-    let payload = match value.get("payload").and_then(serde_json::Value::as_str) {
-        Some(payload) => payload.to_string(),
-        None => serde_json::to_string(&value)?,
-    };
+    if let Some(fields) = value.get("fields").and_then(serde_json::Value::as_object) {
+        if let Some(payload) = fields.get("payload") {
+            let nested = match payload {
+                serde_json::Value::String(payload) => {
+                    serde_json::from_str::<serde_json::Value>(payload).map_err(|err| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "invalid nested usage reconciliation fields.payload JSON: {err}"
+                            ),
+                        )
+                    })?
+                }
+                payload => payload.clone(),
+            };
+            return decode_usage_reconciliation_value_at_depth(nested, depth + 1);
+        }
+    }
+
+    if let Some(payload) = value.get("payload") {
+        let nested = match payload {
+            serde_json::Value::String(payload) => {
+                serde_json::from_str::<serde_json::Value>(payload).map_err(|err| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("invalid nested usage reconciliation payload JSON: {err}"),
+                    )
+                })?
+            }
+            payload => payload.clone(),
+        };
+        return decode_usage_reconciliation_value_at_depth(nested, depth + 1);
+    }
+
+    // A raw Redis stream envelope uses `type` rather than the public
+    // UsageEvent field name `event_type`.
+    let payload = serde_json::to_string(&value)?;
     let fields = BTreeMap::from([("payload".to_string(), payload)]);
     Ok(aether_usage_runtime::UsageEvent::from_stream_fields(
         &fields,
@@ -1459,7 +1513,309 @@ fn validate_usage_reconciliation_identity(
             ),
         ));
     }
+    let scoped_identity_fields = [
+        (
+            "user_id",
+            usage.user_id.as_deref(),
+            event.data.user_id.as_deref(),
+        ),
+        (
+            "api_key_id",
+            usage.api_key_id.as_deref(),
+            event.data.api_key_id.as_deref(),
+        ),
+        (
+            "provider_id",
+            usage.provider_id.as_deref(),
+            event.data.provider_id.as_deref(),
+        ),
+        (
+            "provider_endpoint_id",
+            usage.provider_endpoint_id.as_deref(),
+            event.data.provider_endpoint_id.as_deref(),
+        ),
+        (
+            "provider_api_key_id",
+            usage.provider_api_key_id.as_deref(),
+            event.data.provider_api_key_id.as_deref(),
+        ),
+    ];
+    if let Some((field, _, _)) = scoped_identity_fields
+        .into_iter()
+        .find(
+            |(_, stored, supplied)| match (stored.map(str::trim), supplied.map(str::trim)) {
+                (Some(stored), Some(supplied)) => !stored.is_empty() && stored != supplied,
+                _ => false,
+            },
+        )
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "usage reconciliation identity mismatch for request {}: {field} differs",
+                event.request_id
+            ),
+        ));
+    }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UsageReconciliationOutcome {
+    Reconciled,
+    SettlementReconciled,
+    AlreadyAuthoritative,
+    ReconciledSettlementPending,
+    NotApplied,
+}
+
+impl UsageReconciliationOutcome {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Reconciled => "reconciled",
+            Self::SettlementReconciled => "settlement_reconciled",
+            Self::AlreadyAuthoritative => "already_authoritative",
+            Self::ReconciledSettlementPending => "reconciled_settlement_pending",
+            Self::NotApplied => "not_applied",
+        }
+    }
+
+    const fn is_complete(self) -> bool {
+        matches!(
+            self,
+            Self::Reconciled | Self::SettlementReconciled | Self::AlreadyAuthoritative
+        )
+    }
+}
+
+fn usage_reconciliation_expected_billing_status(
+    event: &aether_usage_runtime::UsageEvent,
+) -> &'static str {
+    match event.event_type {
+        aether_usage_runtime::UsageEventType::Completed
+        | aether_usage_runtime::UsageEventType::Cancelled => "settled",
+        aether_usage_runtime::UsageEventType::Failed => "void",
+        aether_usage_runtime::UsageEventType::Pending
+        | aether_usage_runtime::UsageEventType::Streaming => "pending",
+    }
+}
+
+fn usage_reconciliation_mismatches(
+    event: &aether_usage_runtime::UsageEvent,
+    usage: &aether_data_contracts::repository::usage::StoredRequestUsageAudit,
+) -> Result<Vec<&'static str>, aether_data::DataLayerError> {
+    let expected = aether_usage_runtime::build_upsert_usage_record_from_event(event)?;
+    let mut mismatches = Vec::new();
+
+    if usage.provider_name.trim() != expected.provider_name.trim() {
+        mismatches.push("provider_name");
+    }
+    if usage.model.trim() != expected.model.trim() {
+        mismatches.push("model");
+    }
+    if expected
+        .user_id
+        .as_deref()
+        .is_some_and(|value| usage.user_id.as_deref() != Some(value))
+    {
+        mismatches.push("user_id");
+    }
+    if expected
+        .api_key_id
+        .as_deref()
+        .is_some_and(|value| usage.api_key_id.as_deref() != Some(value))
+    {
+        mismatches.push("api_key_id");
+    }
+    if expected
+        .target_model
+        .as_deref()
+        .is_some_and(|value| usage.target_model.as_deref() != Some(value))
+    {
+        mismatches.push("target_model");
+    }
+    if expected
+        .provider_id
+        .as_deref()
+        .is_some_and(|value| usage.provider_id.as_deref() != Some(value))
+    {
+        mismatches.push("provider_id");
+    }
+    if expected
+        .provider_endpoint_id
+        .as_deref()
+        .is_some_and(|value| usage.provider_endpoint_id.as_deref() != Some(value))
+    {
+        mismatches.push("provider_endpoint_id");
+    }
+    if expected
+        .provider_api_key_id
+        .as_deref()
+        .is_some_and(|value| usage.provider_api_key_id.as_deref() != Some(value))
+    {
+        mismatches.push("provider_api_key_id");
+    }
+    if expected
+        .api_format
+        .as_deref()
+        .is_some_and(|value| usage.api_format.as_deref() != Some(value))
+    {
+        mismatches.push("api_format");
+    }
+    if expected
+        .is_stream
+        .is_some_and(|value| usage.is_stream != value)
+    {
+        mismatches.push("is_stream");
+    }
+    if expected
+        .has_format_conversion
+        .is_some_and(|value| usage.has_format_conversion != value)
+    {
+        mismatches.push("has_format_conversion");
+    }
+    if usage.status != expected.status {
+        mismatches.push("status");
+    }
+    if expected
+        .input_tokens
+        .is_some_and(|value| usage.input_tokens < value)
+    {
+        mismatches.push("input_tokens");
+    }
+    if expected
+        .output_tokens
+        .is_some_and(|value| usage.output_tokens < value)
+    {
+        mismatches.push("output_tokens");
+    }
+    if expected
+        .total_tokens
+        .is_some_and(|value| usage.total_tokens < value)
+    {
+        mismatches.push("total_tokens");
+    }
+    if expected
+        .cache_creation_input_tokens
+        .is_some_and(|value| usage.cache_creation_input_tokens < value)
+    {
+        mismatches.push("cache_creation_input_tokens");
+    }
+    if expected
+        .cache_creation_ephemeral_5m_input_tokens
+        .is_some_and(|value| usage.cache_creation_ephemeral_5m_input_tokens < value)
+    {
+        mismatches.push("cache_creation_ephemeral_5m_input_tokens");
+    }
+    if expected
+        .cache_creation_ephemeral_1h_input_tokens
+        .is_some_and(|value| usage.cache_creation_ephemeral_1h_input_tokens < value)
+    {
+        mismatches.push("cache_creation_ephemeral_1h_input_tokens");
+    }
+    if expected
+        .cache_read_input_tokens
+        .is_some_and(|value| usage.cache_read_input_tokens < value)
+    {
+        mismatches.push("cache_read_input_tokens");
+    }
+    if expected
+        .cache_creation_cost_usd
+        .is_some_and(|value| usage.cache_creation_cost_usd + 1e-12 < value)
+    {
+        mismatches.push("cache_creation_cost_usd");
+    }
+    if expected
+        .cache_read_cost_usd
+        .is_some_and(|value| usage.cache_read_cost_usd + 1e-12 < value)
+    {
+        mismatches.push("cache_read_cost_usd");
+    }
+    if expected
+        .total_cost_usd
+        .is_some_and(|value| usage.total_cost_usd + 1e-12 < value)
+    {
+        mismatches.push("total_cost_usd");
+    }
+    if expected
+        .actual_total_cost_usd
+        .is_some_and(|value| usage.actual_total_cost_usd + 1e-12 < value)
+    {
+        mismatches.push("actual_total_cost_usd");
+    }
+    let terminal_clears_failure_fields = matches!(
+        event.event_type,
+        aether_usage_runtime::UsageEventType::Completed
+            | aether_usage_runtime::UsageEventType::Cancelled
+    );
+    if (terminal_clears_failure_fields || expected.status_code.is_some())
+        && usage.status_code != expected.status_code
+    {
+        mismatches.push("status_code");
+    }
+    if expected
+        .response_time_ms
+        .filter(|value| *value > 0)
+        .is_some_and(|value| usage.response_time_ms != Some(value))
+    {
+        mismatches.push("response_time_ms");
+    }
+    if expected
+        .first_byte_time_ms
+        .filter(|value| *value > 0)
+        .is_some_and(|value| usage.first_byte_time_ms != Some(value))
+    {
+        mismatches.push("first_byte_time_ms");
+    }
+    if (terminal_clears_failure_fields || expected.error_message.is_some())
+        && usage.error_message != expected.error_message
+    {
+        mismatches.push("error_message");
+    }
+    if (terminal_clears_failure_fields || expected.error_category.is_some())
+        && usage.error_category != expected.error_category
+    {
+        mismatches.push("error_category");
+    }
+    if usage.finalized_at_unix_secs.is_none() {
+        mismatches.push("finalized_at_unix_secs");
+    }
+
+    Ok(mismatches)
+}
+
+fn assess_usage_reconciliation_outcome(
+    event: &aether_usage_runtime::UsageEvent,
+    before: &aether_data_contracts::repository::usage::StoredRequestUsageAudit,
+    after: &aether_data_contracts::repository::usage::StoredRequestUsageAudit,
+) -> Result<(UsageReconciliationOutcome, Vec<&'static str>), aether_data::DataLayerError> {
+    let after_mismatches = usage_reconciliation_mismatches(event, after)?;
+    if !after_mismatches.is_empty() {
+        return Ok((UsageReconciliationOutcome::NotApplied, after_mismatches));
+    }
+    if after.billing_status == "pending" {
+        return Ok((
+            UsageReconciliationOutcome::ReconciledSettlementPending,
+            vec!["billing_status"],
+        ));
+    }
+    if after.billing_status != usage_reconciliation_expected_billing_status(event) {
+        return Ok((
+            UsageReconciliationOutcome::NotApplied,
+            vec!["billing_status"],
+        ));
+    }
+
+    let before_mismatches = usage_reconciliation_mismatches(event, before)?;
+    if before_mismatches.is_empty()
+        && before.billing_status == usage_reconciliation_expected_billing_status(event)
+    {
+        Ok((UsageReconciliationOutcome::AlreadyAuthoritative, Vec::new()))
+    } else if before_mismatches.is_empty() && before.billing_status == "pending" {
+        Ok((UsageReconciliationOutcome::SettlementReconciled, Vec::new()))
+    } else {
+        Ok((UsageReconciliationOutcome::Reconciled, Vec::new()))
+    }
 }
 
 async fn run_data_reconcile_usage(
@@ -1577,16 +1933,41 @@ async fn run_data_reconcile_usage(
         before.push(usage);
     }
 
+    let mut incomplete = Vec::new();
     for (event, prior) in events.iter().zip(before.iter()) {
         let after = if args.execute {
             state.reconcile_terminal_usage_event(event).await?
         } else {
             prior.clone()
         };
+        let (outcome, mismatches) = if args.execute {
+            assess_usage_reconciliation_outcome(event, prior, &after)?
+        } else {
+            let mut mismatches = usage_reconciliation_mismatches(event, prior)?;
+            let expected_billing_status = usage_reconciliation_expected_billing_status(event);
+            if prior.billing_status != expected_billing_status {
+                mismatches.push("billing_status");
+            }
+            let outcome = if mismatches.is_empty() {
+                UsageReconciliationOutcome::AlreadyAuthoritative
+            } else if mismatches == ["billing_status"] && prior.billing_status == "pending" {
+                UsageReconciliationOutcome::ReconciledSettlementPending
+            } else {
+                UsageReconciliationOutcome::NotApplied
+            };
+            (outcome, mismatches)
+        };
+        if args.execute && !outcome.is_complete() {
+            incomplete.push(format!("{}:{}", event.request_id, outcome.as_str()));
+        }
         println!(
             "{}",
             serde_json::to_string(&serde_json::json!({
-                "mode": if args.execute { "executed" } else { "dry_run" },
+                "mode": if args.execute { "execute" } else { "dry_run" },
+                "outcome": if args.execute { outcome.as_str() } else { "dry_run" },
+                "current_outcome": (!args.execute).then(|| outcome.as_str()),
+                "verified_complete": args.execute && outcome.is_complete(),
+                "mismatches": mismatches,
                 "event": {
                     "event_type": event.event_type,
                     "request_id": event.request_id,
@@ -1608,14 +1989,23 @@ async fn run_data_reconcile_usage(
     }
 
     eprintln!(
-        "usage reconciliation {} for {} event(s); source queue entries were not acknowledged",
-        if args.execute {
-            "executed"
-        } else {
+        "usage reconciliation {} for {} event(s); source queue entries were not acknowledged and secondary request-count effects were not replayed",
+        if !args.execute {
             "dry-run complete"
+        } else if incomplete.is_empty() {
+            "executed and verified complete"
+        } else {
+            "executed but verification is incomplete"
         },
         events.len()
     );
+    if !incomplete.is_empty() {
+        return Err(std::io::Error::other(format!(
+            "usage reconciliation verification incomplete: {}",
+            incomplete.join(", ")
+        ))
+        .into());
+    }
     Ok(())
 }
 
@@ -1939,15 +2329,72 @@ fn pending_backfills_error(
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_usage_reconciliation_input, ensure_database_backfills_are_current,
-        ensure_database_schema_is_current, pending_backfills_error, pending_schema_error,
-        resolve_healthcheck_url, Args, DatabaseDriverArg, DeploymentTopologyArg, GatewayDataArgs,
-        GatewayFrontdoorArgs, GatewayLogDestinationArg, GatewayLogFormatArg, GatewayLogRotationArg,
-        GatewayLoggingArgs, GatewayRateLimitArgs, GatewayUsageArgs, NodeRoleArg, RuntimeBackendArg,
-        VideoTaskTruthSourceArg,
+        assess_usage_reconciliation_outcome, decode_usage_reconciliation_input,
+        ensure_database_backfills_are_current, ensure_database_schema_is_current,
+        pending_backfills_error, pending_schema_error, resolve_healthcheck_url,
+        validate_usage_reconciliation_identity, Args, DatabaseDriverArg, DeploymentTopologyArg,
+        GatewayDataArgs, GatewayFrontdoorArgs, GatewayLogDestinationArg, GatewayLogFormatArg,
+        GatewayLogRotationArg, GatewayLoggingArgs, GatewayRateLimitArgs, GatewayUsageArgs,
+        NodeRoleArg, RuntimeBackendArg, UsageReconciliationOutcome, VideoTaskTruthSourceArg,
     };
     use aether_data::{DatabaseDriver, SqlDatabaseConfig, SqlPoolConfig};
+    use aether_data_contracts::repository::usage::StoredRequestUsageAudit;
     use aether_gateway::AppState;
+
+    fn reconciliation_usage(
+        event: &aether_usage_runtime::UsageEvent,
+        status: &str,
+        billing_status: &str,
+    ) -> StoredRequestUsageAudit {
+        let mut usage = StoredRequestUsageAudit::new(
+            "usage-reconcile-test".to_string(),
+            event.request_id.clone(),
+            event.data.user_id.clone(),
+            event.data.api_key_id.clone(),
+            None,
+            None,
+            event.data.provider_name.clone(),
+            event.data.model.clone(),
+            event.data.target_model.clone(),
+            event.data.provider_id.clone(),
+            event.data.provider_endpoint_id.clone(),
+            event.data.provider_api_key_id.clone(),
+            event.data.request_type.clone(),
+            event.data.api_format.clone(),
+            event.data.api_family.clone(),
+            event.data.endpoint_kind.clone(),
+            event.data.endpoint_api_format.clone(),
+            event.data.provider_api_family.clone(),
+            event.data.provider_endpoint_kind.clone(),
+            event.data.has_format_conversion.unwrap_or(false),
+            event.data.is_stream.unwrap_or(false),
+            i32::try_from(event.data.input_tokens.unwrap_or_default()).unwrap_or(i32::MAX),
+            i32::try_from(event.data.output_tokens.unwrap_or_default()).unwrap_or(i32::MAX),
+            i32::try_from(event.data.total_tokens.unwrap_or_default()).unwrap_or(i32::MAX),
+            event.data.total_cost_usd.unwrap_or_default(),
+            event.data.actual_total_cost_usd.unwrap_or_default(),
+            event.data.status_code.map(i32::from),
+            event.data.error_message.clone(),
+            event.data.error_category.clone(),
+            event
+                .data
+                .response_time_ms
+                .map(|value| i32::try_from(value).unwrap_or(i32::MAX)),
+            event
+                .data
+                .first_byte_time_ms
+                .map(|value| i32::try_from(value).unwrap_or(i32::MAX)),
+            status.to_string(),
+            billing_status.to_string(),
+            i64::try_from(event.timestamp_ms).unwrap_or(i64::MAX),
+            i64::try_from(event.timestamp_ms / 1_000).unwrap_or(i64::MAX),
+            Some(i64::try_from(event.timestamp_ms / 1_000).unwrap_or(i64::MAX)),
+        )
+        .expect("reconciliation usage should build");
+        usage.response_time_ms = event.data.response_time_ms;
+        usage.first_byte_time_ms = event.data.first_byte_time_ms;
+        usage
+    }
 
     fn test_args() -> Args {
         Args {
@@ -2076,6 +2523,140 @@ mod tests {
         )
         .expect("stream envelope array should decode");
         assert_eq!(decoded, vec![event]);
+    }
+
+    #[test]
+    fn usage_reconciliation_input_accepts_actual_dead_letter_wrapper() {
+        let event = aether_usage_runtime::UsageEvent::new(
+            aether_usage_runtime::UsageEventType::Completed,
+            "req-reconcile-dlq",
+            aether_usage_runtime::UsageEventData {
+                provider_name: "openai".to_string(),
+                model: "gpt-5.6".to_string(),
+                total_tokens: Some(42),
+                ..aether_usage_runtime::UsageEventData::default()
+            },
+        );
+        let fields = event.to_stream_fields().expect("stream fields");
+        let dead_letter = serde_json::json!({
+            "payload": serde_json::to_string(&serde_json::json!({
+                "entry_id": "123-0",
+                "fields": fields,
+                "error": "permanent test failure",
+            }))
+            .expect("dead-letter wrapper JSON"),
+        });
+
+        let decoded = decode_usage_reconciliation_input(
+            &serde_json::to_string(&dead_letter).expect("outer DLQ JSON"),
+        )
+        .expect("DLQ representation should decode");
+        assert_eq!(decoded, vec![event]);
+    }
+
+    #[test]
+    fn usage_reconciliation_assessment_distinguishes_verified_outcomes() {
+        let event = aether_usage_runtime::UsageEvent::new(
+            aether_usage_runtime::UsageEventType::Completed,
+            "req-reconcile-outcome",
+            aether_usage_runtime::UsageEventData {
+                provider_name: "openai".to_string(),
+                model: "gpt-5.6".to_string(),
+                input_tokens: Some(10),
+                output_tokens: Some(20),
+                total_tokens: Some(30),
+                total_cost_usd: Some(0.25),
+                actual_total_cost_usd: Some(0.5),
+                status_code: Some(200),
+                response_time_ms: Some(5_037),
+                first_byte_time_ms: Some(3_170),
+                ..aether_usage_runtime::UsageEventData::default()
+            },
+        );
+        let mut before = reconciliation_usage(&event, "streaming", "pending");
+        before.total_tokens = 0;
+        before.finalized_at_unix_secs = None;
+        let after = reconciliation_usage(&event, "completed", "settled");
+
+        let (outcome, mismatches) = assess_usage_reconciliation_outcome(&event, &before, &after)
+            .expect("assessment should succeed");
+        assert_eq!(outcome, UsageReconciliationOutcome::Reconciled);
+        assert!(mismatches.is_empty());
+
+        let (outcome, mismatches) = assess_usage_reconciliation_outcome(&event, &after, &after)
+            .expect("assessment should succeed");
+        assert_eq!(outcome, UsageReconciliationOutcome::AlreadyAuthoritative);
+        assert!(mismatches.is_empty());
+    }
+
+    #[test]
+    fn usage_reconciliation_assessment_fails_closed_on_locked_or_pending_rows() {
+        let event = aether_usage_runtime::UsageEvent::new(
+            aether_usage_runtime::UsageEventType::Completed,
+            "req-reconcile-incomplete",
+            aether_usage_runtime::UsageEventData {
+                provider_name: "openai".to_string(),
+                model: "gpt-5.6".to_string(),
+                total_tokens: Some(30),
+                response_time_ms: Some(5_037),
+                ..aether_usage_runtime::UsageEventData::default()
+            },
+        );
+        let before = reconciliation_usage(&event, "streaming", "settled");
+        let (outcome, mismatches) = assess_usage_reconciliation_outcome(&event, &before, &before)
+            .expect("assessment should succeed");
+        assert_eq!(outcome, UsageReconciliationOutcome::NotApplied);
+        assert!(mismatches.contains(&"status"));
+
+        let pending = reconciliation_usage(&event, "completed", "pending");
+        let (outcome, mismatches) = assess_usage_reconciliation_outcome(&event, &before, &pending)
+            .expect("assessment should succeed");
+        assert_eq!(
+            outcome,
+            UsageReconciliationOutcome::ReconciledSettlementPending
+        );
+        assert_eq!(mismatches, vec!["billing_status"]);
+
+        let wrong_settlement = reconciliation_usage(&event, "completed", "void");
+        let (outcome, mismatches) =
+            assess_usage_reconciliation_outcome(&event, &before, &wrong_settlement)
+                .expect("assessment should reject the wrong final billing state");
+        assert_eq!(outcome, UsageReconciliationOutcome::NotApplied);
+        assert_eq!(mismatches, vec!["billing_status"]);
+
+        let mut stale_failure = reconciliation_usage(&event, "completed", "settled");
+        stale_failure.status_code = Some(500);
+        stale_failure.error_message = Some("stale failure".to_string());
+        let (outcome, mismatches) =
+            assess_usage_reconciliation_outcome(&event, &before, &stale_failure)
+                .expect("assessment should reject stale failure fields");
+        assert_eq!(outcome, UsageReconciliationOutcome::NotApplied);
+        assert!(mismatches.contains(&"status_code"));
+        assert!(mismatches.contains(&"error_message"));
+    }
+
+    #[test]
+    fn usage_reconciliation_rejects_scoped_identity_mismatch() {
+        let mut event = aether_usage_runtime::UsageEvent::new(
+            aether_usage_runtime::UsageEventType::Completed,
+            "req-reconcile-identity",
+            aether_usage_runtime::UsageEventData {
+                user_id: Some("user-1".to_string()),
+                api_key_id: Some("api-key-1".to_string()),
+                provider_name: "openai".to_string(),
+                model: "gpt-5.6".to_string(),
+                provider_id: Some("provider-1".to_string()),
+                provider_endpoint_id: Some("endpoint-1".to_string()),
+                provider_api_key_id: Some("provider-key-1".to_string()),
+                ..aether_usage_runtime::UsageEventData::default()
+            },
+        );
+        let usage = reconciliation_usage(&event, "streaming", "pending");
+        event.data.provider_api_key_id = Some("provider-key-2".to_string());
+
+        let error = validate_usage_reconciliation_identity(&event, &usage)
+            .expect_err("reconciliation must reject a different provider key identity");
+        assert!(error.to_string().contains("provider_api_key_id differs"));
     }
 
     #[test]

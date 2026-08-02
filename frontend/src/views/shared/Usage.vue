@@ -543,6 +543,14 @@ async function pollActiveRequests() {
         record.rate_multiplier = update.rate_multiplier ?? undefined
         record.response_time_ms = update.response_time_ms ?? undefined
         record.first_byte_time_ms = update.first_byte_time_ms ?? undefined
+        if ('terminal_sync_pending' in update) {
+          record.terminal_sync_pending = update.terminal_sync_pending === true
+        }
+        if ('terminal_response_time_ms' in update) {
+          record.terminal_response_time_ms = typeof update.terminal_response_time_ms === 'number'
+            ? update.terminal_response_time_ms
+            : null
+        }
         record.status_code = update.status_code ?? undefined
         record.error_message = update.error_message ?? undefined
         if (typeof update.upstream_is_stream === 'boolean') {

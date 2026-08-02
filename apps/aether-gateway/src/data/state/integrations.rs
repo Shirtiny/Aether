@@ -514,6 +514,7 @@ impl GatewayDataState {
 impl aether_usage_runtime::ManualProxyNodeCounter for GatewayDataState {
     async fn increment_manual_proxy_node_requests(
         &self,
+        request_id: &str,
         node_id: &str,
         total_delta: i64,
         failed_delta: i64,
@@ -527,6 +528,7 @@ impl aether_usage_runtime::ManualProxyNodeCounter for GatewayDataState {
                     failed_requests_delta: failed_delta,
                     dns_failures_delta: 0,
                     stream_errors_delta: 0,
+                    idempotency_key: Some(request_id.to_string()),
                 })
                 .await?;
             if enqueued {

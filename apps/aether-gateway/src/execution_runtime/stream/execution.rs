@@ -134,7 +134,7 @@ const REWRITTEN_STREAM_PREFETCH_TIMEOUT: Duration = Duration::from_millis(750);
 const CONTROL_STREAM_PREFETCH_EXTENSION_TIMEOUT: Duration = Duration::from_millis(500);
 const CONTROL_STREAM_PREFETCH_EXTENSION_MAX_BYTES: usize = 256 * 1024;
 
-fn record_sync_terminal_usage(
+async fn record_sync_terminal_usage(
     state: &AppState,
     plan: &ExecutionPlan,
     report_context: Option<&serde_json::Value>,
@@ -142,9 +142,19 @@ fn record_sync_terminal_usage(
 ) {
     let context_seed = build_terminal_usage_context_seed(plan, report_context);
     let payload_seed = build_sync_terminal_usage_payload_seed(payload);
-    state
+    if let Err(err) = state
         .usage_runtime
-        .record_sync_terminal(state.data.as_ref(), context_seed, payload_seed);
+        .persist_sync_terminal(state.data.as_ref(), context_seed, payload_seed)
+        .await
+    {
+        warn!(
+            event_name = "usage_sync_terminal_persist_failed",
+            log_type = "event",
+            request_id = %plan.request_id,
+            error = %err,
+            "gateway could not durably persist a synchronous terminal usage event"
+        );
+    }
 }
 
 fn build_stream_sync_payload(
@@ -216,7 +226,7 @@ fn build_stream_error_sync_payload(
     }
 }
 
-fn record_stream_terminal_usage(
+async fn record_stream_terminal_usage(
     state: &AppState,
     plan: &ExecutionPlan,
     report_context: Option<&serde_json::Value>,
@@ -225,12 +235,19 @@ fn record_stream_terminal_usage(
 ) {
     let context_seed = build_terminal_usage_context_seed(plan, report_context);
     let payload_seed = build_stream_terminal_usage_payload_seed(payload);
-    state.usage_runtime.record_stream_terminal(
-        state.data.as_ref(),
-        context_seed,
-        payload_seed,
-        cancelled,
-    );
+    if let Err(err) = state
+        .usage_runtime
+        .persist_stream_terminal(state.data.as_ref(), context_seed, payload_seed, cancelled)
+        .await
+    {
+        warn!(
+            event_name = "usage_stream_terminal_persist_failed",
+            log_type = "event",
+            request_id = %plan.request_id,
+            error = %err,
+            "gateway could not durably persist a streaming terminal usage event"
+        );
+    }
 }
 
 fn build_stream_body_capture(
@@ -2513,7 +2530,7 @@ async fn execute_stream_from_frame_stream(
             payload_client_body_json,
             None,
         );
-        record_sync_terminal_usage(state, &plan, payload.report_context.as_ref(), &payload);
+        record_sync_terminal_usage(state, &plan, payload.report_context.as_ref(), &payload).await;
         let terminal_unix_secs = current_request_candidate_unix_ms();
         record_local_request_candidate_status(
             state,
@@ -4187,7 +4204,8 @@ async fn execute_stream_from_frame_stream(
                 usage_payload.report_context.as_ref(),
                 &usage_payload,
                 true,
-            );
+            )
+            .await;
             record_local_request_candidate_status(
                 &state_for_report,
                 &plan_for_report,
@@ -4473,7 +4491,8 @@ async fn execute_stream_from_frame_stream(
             usage_payload.report_context.as_ref(),
             &usage_payload,
             false,
-        );
+        )
+        .await;
         record_local_request_candidate_status(
             &state_for_report,
             &plan_for_report,

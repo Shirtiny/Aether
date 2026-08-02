@@ -369,9 +369,19 @@ async fn record_stream_sync_failure(
     .await;
     let context_seed = build_terminal_usage_context_seed(plan, report_context);
     let payload_seed = build_sync_terminal_usage_payload_seed(payload);
-    state
+    if let Err(err) = state
         .usage_runtime
-        .record_sync_terminal(state.data.as_ref(), context_seed, payload_seed);
+        .persist_sync_terminal(state.data.as_ref(), context_seed, payload_seed)
+        .await
+    {
+        warn!(
+            event_name = "usage_sync_terminal_persist_failed",
+            log_type = "event",
+            request_id = %plan.request_id,
+            error = %err,
+            "gateway could not durably persist a stream setup failure usage event"
+        );
+    }
     let terminal_unix_secs = current_request_candidate_unix_ms();
     record_report_request_candidate_status(
         state,

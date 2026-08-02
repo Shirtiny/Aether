@@ -229,6 +229,21 @@ impl SqlxRequestCandidateReadRepository {
         collect_query_rows(builder.build().fetch(&self.pool), map_request_candidate_row).await
     }
 
+    pub async fn list_by_request_ids(
+        &self,
+        request_ids: &[String],
+    ) -> Result<Vec<StoredRequestCandidate>, DataLayerError> {
+        if request_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut builder = QueryBuilder::<Postgres>::new(candidate_columns());
+        let mut where_clause = WhereClause::new();
+        push_in(&mut builder, &mut where_clause, "request_id", request_ids);
+        builder
+            .push(" ORDER BY request_id ASC, candidate_index ASC, retry_index ASC, created_at ASC");
+        collect_query_rows(builder.build().fetch(&self.pool), map_request_candidate_row).await
+    }
+
     pub async fn list_recent(
         &self,
         limit: usize,
@@ -593,6 +608,13 @@ impl RequestCandidateReadRepository for SqlxRequestCandidateReadRepository {
         request_id: &str,
     ) -> Result<Vec<StoredRequestCandidate>, DataLayerError> {
         Self::list_by_request_id(self, request_id).await
+    }
+
+    async fn list_by_request_ids(
+        &self,
+        request_ids: &[String],
+    ) -> Result<Vec<StoredRequestCandidate>, DataLayerError> {
+        Self::list_by_request_ids(self, request_ids).await
     }
 
     async fn list_recent(

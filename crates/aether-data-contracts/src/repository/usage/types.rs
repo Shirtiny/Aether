@@ -1943,6 +1943,9 @@ pub struct ProxyNodeCounterDelta {
     pub failed_requests_delta: i64,
     pub dns_failures_delta: i64,
     pub stream_errors_delta: i64,
+    /// Stable source identity for at-least-once delivery. Re-enqueuing the same
+    /// key must be treated as successfully handled without applying it twice.
+    pub idempotency_key: Option<String>,
 }
 
 impl ProxyNodeCounterDelta {

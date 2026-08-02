@@ -382,6 +382,19 @@ fn usage_sql_moves_shared_counter_updates_behind_outbox() {
 }
 
 #[test]
+fn proxy_usage_counter_replay_uses_a_stable_scoped_outbox_identity() {
+    let first = super::proxy_node_counter_delta_idempotency_id("node-1", "request-1");
+    let replay = super::proxy_node_counter_delta_idempotency_id("node-1", "request-1");
+    let other_request = super::proxy_node_counter_delta_idempotency_id("node-1", "request-2");
+    let other_node = super::proxy_node_counter_delta_idempotency_id("node-2", "request-1");
+
+    assert_eq!(first, replay);
+    assert_ne!(first, other_request);
+    assert_ne!(first, other_node);
+    assert!(super::INSERT_USAGE_COUNTER_DELTA_SQL.contains("ON CONFLICT (id) DO NOTHING"));
+}
+
+#[test]
 fn usage_counter_delta_aggregation_preserves_net_response_time_delta() {
     fn provider_key_delta_row(id: &str, response_time_delta: i64) -> super::UsageCounterDeltaRow {
         super::UsageCounterDeltaRow {

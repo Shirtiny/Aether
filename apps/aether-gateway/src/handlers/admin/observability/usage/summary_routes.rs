@@ -3,14 +3,17 @@ use super::analytics::admin_usage_api_key_names;
 use super::analytics::admin_usage_provider_key_names;
 use crate::handlers::admin::request::{AdminAppState, AdminRequestContext};
 use crate::handlers::admin::shared::query_param_value;
+use crate::handlers::shared::{resolve_usage_terminal_sync_state, UsageTerminalSyncState};
 use crate::GatewayError;
 use aether_admin::observability::usage::{
     admin_usage_bad_request_response, admin_usage_data_unavailable_response,
     admin_usage_has_fallback, admin_usage_is_failed, admin_usage_is_ping,
     admin_usage_is_risk_control, admin_usage_parse_ids, admin_usage_parse_limit,
     admin_usage_parse_offset, admin_usage_provider_key_name, admin_usage_record_json,
-    build_admin_usage_active_requests_response, build_admin_usage_records_response,
-    build_admin_usage_summary_stats_response_from_summary, ADMIN_USAGE_DATA_UNAVAILABLE_DETAIL,
+    build_admin_usage_active_requests_response,
+    build_admin_usage_active_requests_response_with_terminal_sync,
+    build_admin_usage_records_response, build_admin_usage_summary_stats_response_from_summary,
+    ADMIN_USAGE_DATA_UNAVAILABLE_DETAIL,
 };
 use aether_data::repository::users::StoredUserSummary;
 use aether_data_contracts::repository::{
@@ -78,6 +81,7 @@ fn apply_admin_usage_status_filter(query: &mut UsageAuditListQuery, status: Opti
 struct AdminUsageAttemptFlags {
     has_fallback: bool,
     has_retry: bool,
+    terminal_sync: UsageTerminalSyncState,
 }
 
 fn admin_usage_attempt_status_filter(status: Option<&str>) -> Option<&'static str> {
@@ -142,6 +146,11 @@ fn admin_usage_attempt_flags_from_candidates(
     AdminUsageAttemptFlags {
         has_fallback,
         has_retry,
+        terminal_sync: resolve_usage_terminal_sync_state(
+            &item.status,
+            item.created_at_unix_ms,
+            candidates,
+        ),
     }
 }
 
@@ -157,6 +166,7 @@ fn admin_usage_attempt_flags_for_item(
             AdminUsageAttemptFlags {
                 has_fallback: admin_usage_has_fallback(item),
                 has_retry: false,
+                ..Default::default()
             }
         }
     })
@@ -173,16 +183,19 @@ async fn resolve_admin_usage_attempt_flags_by_usage_id(
     let request_ids = items
         .iter()
         .map(|item| item.request_id.clone())
-        .collect::<BTreeSet<_>>();
-    let mut candidates_by_request_id = BTreeMap::new();
-    for request_id in request_ids {
-        candidates_by_request_id.insert(
-            request_id.clone(),
-            state
-                .app()
-                .read_request_candidates_by_request_id(&request_id)
-                .await?,
-        );
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut candidates_by_request_id = BTreeMap::<String, Vec<StoredRequestCandidate>>::new();
+    for candidate in state
+        .app()
+        .read_request_candidates_by_request_ids(&request_ids)
+        .await?
+    {
+        candidates_by_request_id
+            .entry(candidate.request_id.clone())
+            .or_default()
+            .push(candidate);
     }
 
     Ok(items
@@ -197,29 +210,59 @@ async fn resolve_admin_usage_attempt_flags_by_usage_id(
         .collect())
 }
 
-async fn resolve_admin_usage_image_progress_by_request_id(
+async fn resolve_admin_usage_active_candidate_state(
     state: &AdminAppState<'_>,
     items: &[StoredRequestUsageAudit],
-) -> Result<BTreeMap<String, serde_json::Value>, GatewayError> {
+) -> Result<
+    (
+        BTreeMap<String, serde_json::Value>,
+        BTreeMap<String, Option<u64>>,
+    ),
+    GatewayError,
+> {
     if !state.has_request_candidate_data_reader() || items.is_empty() {
-        return Ok(BTreeMap::new());
+        return Ok((BTreeMap::new(), BTreeMap::new()));
     }
 
     let request_ids = items
         .iter()
         .map(|item| item.request_id.clone())
-        .collect::<BTreeSet<_>>();
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut candidates_by_request_id = BTreeMap::<String, Vec<StoredRequestCandidate>>::new();
+    for candidate in state
+        .app()
+        .read_request_candidates_by_request_ids(&request_ids)
+        .await?
+    {
+        candidates_by_request_id
+            .entry(candidate.request_id.clone())
+            .or_default()
+            .push(candidate);
+    }
     let mut progress_by_request_id = BTreeMap::new();
+    let mut terminal_sync_by_usage_id = BTreeMap::new();
     for request_id in request_ids {
-        let candidates = state
-            .app()
-            .read_request_candidates_by_request_id(&request_id)
-            .await?;
-        if let Some(progress) = latest_admin_usage_image_progress(&candidates) {
-            progress_by_request_id.insert(request_id, progress);
+        let candidates = candidates_by_request_id
+            .get(&request_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if let Some(progress) = latest_admin_usage_image_progress(candidates) {
+            progress_by_request_id.insert(request_id.clone(), progress);
+        }
+        for item in items.iter().filter(|item| item.request_id == request_id) {
+            let terminal_sync = resolve_usage_terminal_sync_state(
+                &item.status,
+                item.created_at_unix_ms,
+                candidates,
+            );
+            if terminal_sync.pending {
+                terminal_sync_by_usage_id.insert(item.id.clone(), terminal_sync.response_time_ms);
+            }
         }
     }
-    Ok(progress_by_request_id)
+    Ok((progress_by_request_id, terminal_sync_by_usage_id))
 }
 
 fn latest_admin_usage_image_progress(
@@ -412,6 +455,8 @@ fn build_admin_usage_records_response_with_attempt_flags(
             );
             record["has_fallback"] = json!(flags.has_fallback);
             record["has_retry"] = json!(flags.has_retry);
+            record["terminal_sync_pending"] = json!(flags.terminal_sync.pending);
+            record["terminal_response_time_ms"] = json!(flags.terminal_sync.response_time_ms);
             record
         })
         .collect();
@@ -698,16 +743,19 @@ pub(super) async fn maybe_build_local_admin_usage_summary_response(
             };
             let api_key_names = admin_usage_api_key_names(state, &items).await?;
             let provider_key_names = admin_usage_provider_key_names(state, &items).await?;
-            let image_progress_by_request_id =
-                resolve_admin_usage_image_progress_by_request_id(state, &items).await?;
+            let (image_progress_by_request_id, terminal_sync_by_usage_id) =
+                resolve_admin_usage_active_candidate_state(state, &items).await?;
 
-            return Ok(Some(build_admin_usage_active_requests_response(
-                &items,
-                &api_key_names,
-                state.has_auth_api_key_data_reader(),
-                &provider_key_names,
-                &image_progress_by_request_id,
-            )));
+            return Ok(Some(
+                build_admin_usage_active_requests_response_with_terminal_sync(
+                    &items,
+                    &api_key_names,
+                    state.has_auth_api_key_data_reader(),
+                    &provider_key_names,
+                    &image_progress_by_request_id,
+                    &terminal_sync_by_usage_id,
+                ),
+            ));
         }
         Some("records")
             if request_context.request_method == http::Method::GET

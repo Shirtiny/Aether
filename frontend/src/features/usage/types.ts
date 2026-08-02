@@ -114,6 +114,8 @@ export interface UsageRecord {
   actual_cost?: number
   response_time_ms?: number | null
   first_byte_time_ms?: number | null  // 首字时间 (TTFB)
+  terminal_sync_pending?: boolean  // Provider 已结束、用量终态仍在同步
+  terminal_response_time_ms?: number | null
   is_stream: boolean
   upstream_is_stream?: boolean
   ws_step?: boolean

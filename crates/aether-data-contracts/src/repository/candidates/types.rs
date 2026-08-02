@@ -460,6 +460,17 @@ pub trait RequestCandidateReadRepository: Send + Sync {
         request_id: &str,
     ) -> Result<Vec<StoredRequestCandidate>, crate::DataLayerError>;
 
+    async fn list_by_request_ids(
+        &self,
+        request_ids: &[String],
+    ) -> Result<Vec<StoredRequestCandidate>, crate::DataLayerError> {
+        let mut candidates = Vec::new();
+        for request_id in request_ids {
+            candidates.extend(self.list_by_request_id(request_id).await?);
+        }
+        Ok(candidates)
+    }
+
     async fn list_recent(
         &self,
         limit: usize,
