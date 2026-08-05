@@ -120,10 +120,16 @@ use crate::{
 const OPENAI_IMAGE_STREAM_PLAN_KIND: &str = "openai_image_stream";
 const SSE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const SSE_KEEPALIVE_BYTES: &[u8] = b": aether-keepalive\n\n";
+const CODEX_RESPONSES_KEEPALIVE_BYTES: &[u8] =
+    b"event: response.aether_keepalive\ndata: {\"type\":\"response.aether_keepalive\"}\n\n";
 const SSE_CONTROL_FILTER_MAX_BUFFER_BYTES: usize = 1024 * 1024;
 const SSE_TERMINAL_DETECTOR_MAX_LINE_BYTES: usize = 1024 * 1024;
 const STREAM_IDLE_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const STREAM_IDLE_LOG_INTERVAL_MS: u64 = 60_000;
+const DEFAULT_STREAM_UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+const STREAM_CLIENT_PROGRESS_IDLE_MULTIPLIER: u32 = 2;
+const DEFAULT_STREAM_DOWNSTREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_STREAM_DOWNSTREAM_DRAIN_GRACE: Duration = Duration::from_secs(30);
 const REWRITTEN_STREAM_PREFETCH_TIMEOUT: Duration = Duration::from_millis(750);
 // Reasoning models open every stream with control-only events, so this
 // extension fires on a large share of production traffic and is paid directly in
@@ -1376,17 +1382,65 @@ fn parse_prefetched_sync_json_body(body: &[u8]) -> Option<Value> {
     serde_json::from_slice::<Value>(stripped).ok()
 }
 
-fn encode_terminal_sse_error_event(failure: &StreamFailureReport) -> Result<Bytes, std::io::Error> {
-    let payload = failure
-        .to_json_string()
-        .map_err(|err| IoError::other(err.to_string()))?;
+fn encode_terminal_sse_error_event(
+    plan: &ExecutionPlan,
+    failure: &StreamFailureReport,
+) -> Result<Bytes, std::io::Error> {
+    let client_api_format = plan.client_api_format.trim().to_ascii_lowercase();
+    let (event_name, payload, append_done) =
+        if is_openai_responses_family_format(client_api_format.as_str()) {
+            (
+                Some("response.failed"),
+                json!({
+                    "type": "response.failed",
+                    "response": {
+                        "status": "failed",
+                        "error": {
+                            "type": failure.error_type.as_str(),
+                            "code": failure.error_type.as_str(),
+                            "message": failure.error_message.as_str(),
+                        }
+                    }
+                }),
+                false,
+            )
+        } else if client_api_format == "claude:messages" {
+            (
+                Some("error"),
+                json!({
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "code": failure.error_type.as_str(),
+                        "message": failure.error_message.as_str(),
+                    }
+                }),
+                false,
+            )
+        } else {
+            let payload = failure
+                .to_json_string()
+                .map_err(|err| IoError::other(err.to_string()))?;
+            let payload =
+                serde_json::from_str(&payload).map_err(|err| IoError::other(err.to_string()))?;
+            (None, payload, true)
+        };
+    let payload = serde_json::to_string(&payload).map_err(|err| IoError::other(err.to_string()))?;
     let mut event = String::new();
+    if let Some(event_name) = event_name {
+        event.push_str("event: ");
+        event.push_str(event_name);
+        event.push('\n');
+    }
     for line in payload.lines() {
         event.push_str("data: ");
         event.push_str(line);
         event.push('\n');
     }
-    event.push_str("\ndata: [DONE]\n\n");
+    event.push('\n');
+    if append_done {
+        event.push_str("data: [DONE]\n\n");
+    }
     Ok(Bytes::from(event))
 }
 
@@ -1442,8 +1496,9 @@ fn should_limit_direct_finalize_prefetch(plan_kind: &str, has_local_stream_rewri
 
 fn client_format_allows_proxy_generated_sse_control_blocks(plan: &ExecutionPlan) -> bool {
     // OpenAI-compatible clients commonly parse every client-visible SSE event as
-    // an OpenAI JSON payload or [DONE]. Keep the downstream wire format strict:
-    // do not inject proxy-generated comments, pings, or keepalives for openai:*.
+    // an OpenAI JSON payload or [DONE]. Keep the default downstream wire format
+    // strict; the Codex Responses exception is selected separately using its
+    // detected client family and a protocol-valid JSON event.
     !plan
         .client_api_format
         .trim()
@@ -1451,11 +1506,96 @@ fn client_format_allows_proxy_generated_sse_control_blocks(plan: &ExecutionPlan)
         .starts_with("openai:")
 }
 
+fn stream_report_context_client_family(report_context: Option<&Value>) -> Option<&str> {
+    let object = report_context?.as_object()?;
+    object
+        .get("client_family")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            object
+                .get("client_session_affinity")
+                .and_then(Value::as_object)
+                .and_then(|affinity| affinity.get("client_family"))
+                .and_then(Value::as_str)
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn client_family_is_codex(report_context: Option<&Value>) -> bool {
+    stream_report_context_client_family(report_context).is_some_and(|client_family| {
+        client_family.eq_ignore_ascii_case("codex")
+            || client_family.to_ascii_lowercase().starts_with("codex_")
+    })
+}
+
+fn resolve_proxy_generated_sse_keepalive(
+    plan: &ExecutionPlan,
+    report_context: Option<&Value>,
+) -> Option<&'static [u8]> {
+    if is_openai_responses_family_format(plan.client_api_format.as_str())
+        && client_family_is_codex(report_context)
+    {
+        return Some(CODEX_RESPONSES_KEEPALIVE_BYTES);
+    }
+    client_format_allows_proxy_generated_sse_control_blocks(plan).then_some(SSE_KEEPALIVE_BYTES)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StreamLifecycleTimeouts {
+    upstream_idle: Duration,
+    client_progress_idle: Duration,
+    downstream_write: Duration,
+    downstream_drain: Duration,
+}
+
+fn resolve_stream_lifecycle_timeouts(plan: &ExecutionPlan) -> StreamLifecycleTimeouts {
+    let upstream_idle = plan
+        .timeouts
+        .as_ref()
+        .and_then(|timeouts| timeouts.read_ms)
+        .map(|timeout_ms| Duration::from_millis(timeout_ms.max(1)))
+        .unwrap_or(DEFAULT_STREAM_UPSTREAM_IDLE_TIMEOUT);
+    let client_progress_idle = upstream_idle
+        .checked_mul(STREAM_CLIENT_PROGRESS_IDLE_MULTIPLIER)
+        .unwrap_or(Duration::MAX);
+    let downstream_write = plan
+        .timeouts
+        .as_ref()
+        .and_then(|timeouts| timeouts.write_ms)
+        .map(|timeout_ms| Duration::from_millis(timeout_ms.max(1)))
+        .unwrap_or(DEFAULT_STREAM_DOWNSTREAM_WRITE_TIMEOUT);
+    StreamLifecycleTimeouts {
+        upstream_idle,
+        client_progress_idle,
+        downstream_write,
+        downstream_drain: upstream_idle.min(DEFAULT_STREAM_DOWNSTREAM_DRAIN_GRACE),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DownstreamSendFailure {
+    Disconnected,
+    WriteTimeout,
+}
+
+async fn send_downstream_stream_chunk(
+    tx: &mpsc::Sender<Result<Bytes, IoError>>,
+    chunk: Bytes,
+    timeout: Duration,
+) -> Result<(), DownstreamSendFailure> {
+    match tokio::time::timeout(timeout, tx.send(Ok(chunk))).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(DownstreamSendFailure::Disconnected),
+        Err(_) => Err(DownstreamSendFailure::WriteTimeout),
+    }
+}
+
 fn build_sse_body_stream(
     prefetched_chunks_for_body: Vec<Bytes>,
     mut rx: mpsc::Receiver<Result<Bytes, IoError>>,
     filter_control_blocks: bool,
-    emit_keepalive: bool,
+    keepalive_bytes: Option<&'static [u8]>,
     keepalive_interval: Duration,
 ) -> impl futures_util::Stream<Item = Result<Bytes, IoError>> + Send + 'static {
     stream! {
@@ -1468,9 +1608,13 @@ fn build_sse_body_stream(
             }
         }
 
-        if emit_keepalive {
-            if !sent_prefetched_chunk {
-                yield Ok(Bytes::from_static(SSE_KEEPALIVE_BYTES));
+        if let Some(keepalive_bytes) = keepalive_bytes {
+            // A data-bearing Codex heartbeat traverses compatibility proxies as
+            // client output. Wait one interval before the first one so a fast
+            // business/error event can retain its real TTFB and failover window.
+            let emit_initial_keepalive = keepalive_bytes == SSE_KEEPALIVE_BYTES;
+            if !sent_prefetched_chunk && emit_initial_keepalive {
+                yield Ok(Bytes::from_static(keepalive_bytes));
             }
             let mut keepalive = tokio::time::interval(keepalive_interval);
             keepalive.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -1478,6 +1622,9 @@ fn build_sse_body_stream(
             loop {
                 tokio::select! {
                     biased;
+                    _ = keepalive.tick() => {
+                        yield Ok(Bytes::from_static(keepalive_bytes));
+                    }
                     item = rx.recv() => {
                         let Some(item) = item else {
                             break;
@@ -1490,9 +1637,6 @@ fn build_sse_body_stream(
                             }
                             Err(err) => yield Err(err),
                         }
-                    }
-                    _ = keepalive.tick() => {
-                        yield Ok(Bytes::from_static(SSE_KEEPALIVE_BYTES));
                     }
                 }
             }
@@ -1606,6 +1750,16 @@ fn filter_upstream_sse_control_chunk(
 fn flush_upstream_sse_control_filter(filter: &mut Option<SseControlBlockFilter>) -> Option<Bytes> {
     let filtered = filter.as_mut()?.finish();
     (!filtered.is_empty()).then(|| Bytes::from(filtered))
+}
+
+fn observe_client_visible_stream_bytes(
+    filter: &mut Option<SseControlBlockFilter>,
+    chunk: &[u8],
+) -> usize {
+    let Some(filter) = filter.as_mut() else {
+        return chunk.len();
+    };
+    filter.push_chunk(chunk).len()
 }
 
 fn find_sse_block_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
@@ -1949,6 +2103,47 @@ where
     read_next_observed_stream_frame(lines).await
 }
 
+enum PrefetchFrameWait {
+    Frame(Result<Option<ObservedStreamFrame>, GatewayError>),
+    PrefetchBudgetExpired,
+    UpstreamIdleExpired,
+}
+
+async fn wait_for_next_prefetch_frame<R>(
+    buffered_frames: &mut VecDeque<ObservedStreamFrame>,
+    lines: &mut FramedRead<R, LinesCodec>,
+    upstream_idle_remaining: Duration,
+    prefetch_budget: Option<Duration>,
+) -> PrefetchFrameWait
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    if let Some(prefetch_budget) = prefetch_budget {
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep(upstream_idle_remaining) => {
+                PrefetchFrameWait::UpstreamIdleExpired
+            }
+            _ = tokio::time::sleep(prefetch_budget) => {
+                PrefetchFrameWait::PrefetchBudgetExpired
+            }
+            result = next_stream_frame(buffered_frames, lines) => {
+                PrefetchFrameWait::Frame(result)
+            }
+        }
+    } else {
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep(upstream_idle_remaining) => {
+                PrefetchFrameWait::UpstreamIdleExpired
+            }
+            result = next_stream_frame(buffered_frames, lines) => {
+                PrefetchFrameWait::Frame(result)
+            }
+        }
+    }
+}
+
 fn should_refresh_stream_usage_telemetry(
     previous: Option<&ExecutionTelemetry>,
     next: &ExecutionTelemetry,
@@ -2159,6 +2354,7 @@ async fn execute_stream_from_frame_stream(
     frame_stream: BoxStream<'static, Result<Bytes, IoError>>,
     in_flight_guard: Option<ProviderPoolInFlightGuard>,
 ) -> Result<Option<Response<Body>>, GatewayError> {
+    let stream_lifecycle_timeouts = resolve_stream_lifecycle_timeouts(&plan);
     let request_id = plan.request_id.as_str();
     let request_id_for_log = short_request_id(request_id);
     let candidate_id = plan.candidate_id.as_deref();
@@ -2174,7 +2370,17 @@ async fn execute_stream_from_frame_stream(
     let reader = StreamReader::new(frame_stream);
     let mut lines = FramedRead::new(reader, LinesCodec::new());
 
-    let first_frame = read_next_frame(&mut lines).await?.ok_or_else(|| {
+    let first_frame = tokio::time::timeout(
+        stream_lifecycle_timeouts.upstream_idle,
+        read_next_frame(&mut lines),
+    )
+    .await
+    .map_err(|_| GatewayError::LocalExecutionPlanningTimeout {
+        trace_id: trace_id.to_string(),
+        phase: "execution_runtime_stream_headers",
+        timeout_ms: stream_lifecycle_timeouts.upstream_idle.as_millis() as u64,
+    })??
+    .ok_or_else(|| {
         GatewayError::Internal("execution runtime stream ended before headers frame".to_string())
     })?;
     let StreamFramePayload::Headers {
@@ -2198,8 +2404,16 @@ async fn execute_stream_from_frame_stream(
     let mut buffered_frames = VecDeque::new();
     let mut stream_terminal_summary: Option<ExecutionStreamTerminalSummary> = None;
     if status_code == 200 && should_probe_success_failover_before_stream(&headers) {
-        let success_probe_text =
-            probe_local_stream_success_failover_text(&mut buffered_frames, &mut lines).await?;
+        let success_probe_text = tokio::time::timeout(
+            stream_lifecycle_timeouts.upstream_idle,
+            probe_local_stream_success_failover_text(&mut buffered_frames, &mut lines),
+        )
+        .await
+        .map_err(|_| GatewayError::LocalExecutionPlanningTimeout {
+            trace_id: trace_id.to_string(),
+            phase: "execution_runtime_stream_success_probe",
+            timeout_ms: stream_lifecycle_timeouts.upstream_idle.as_millis() as u64,
+        })??;
         if should_retry_next_local_candidate_stream(
             state,
             &plan,
@@ -2606,6 +2820,7 @@ async fn execute_stream_from_frame_stream(
     let mut reached_eof = false;
     let mut sync_json_stream_bridge_active = false;
     let prefetch_started_at = Instant::now();
+    let mut last_prefetch_upstream_frame_at = prefetch_started_at;
     // Distinct from `prefetch_started_at`, which also spans the wait for the
     // upstream's first data frame. Only the time after that frame arrives is
     // latency this gateway added rather than latency the upstream spent.
@@ -2685,7 +2900,7 @@ async fn execute_stream_from_frame_stream(
                     "gateway extended control-only stream prefetch before client-visible body"
                 );
             }
-            let next_frame_result = if extend_control_prefetch {
+            let prefetch_budget = if extend_control_prefetch {
                 let Some(remaining) = CONTROL_STREAM_PREFETCH_EXTENSION_TIMEOUT
                     .checked_sub(prefetch_started_at.elapsed())
                 else {
@@ -2710,14 +2925,26 @@ async fn execute_stream_from_frame_stream(
                     );
                     break;
                 };
-                match tokio::time::timeout(
-                    remaining,
-                    next_stream_frame(&mut buffered_frames, &mut lines),
-                )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(_) => {
+                Some(remaining)
+            } else if limit_direct_finalize_prefetch {
+                Some(REWRITTEN_STREAM_PREFETCH_TIMEOUT)
+            } else {
+                None
+            };
+            let upstream_idle_remaining = stream_lifecycle_timeouts
+                .upstream_idle
+                .saturating_sub(last_prefetch_upstream_frame_at.elapsed());
+            let next_frame_result = match wait_for_next_prefetch_frame(
+                &mut buffered_frames,
+                &mut lines,
+                upstream_idle_remaining,
+                prefetch_budget,
+            )
+            .await
+            {
+                PrefetchFrameWait::Frame(result) => result,
+                PrefetchFrameWait::PrefetchBudgetExpired => {
+                    if extend_control_prefetch {
                         prefetch_release_reason = "control_extension_limited";
                         debug!(
                             event_name = "execution_runtime_stream_prefetch_control_extension_limited",
@@ -2737,18 +2964,7 @@ async fn execute_stream_from_frame_stream(
                             prefetched_bytes = prefetched_inspection_body.len(),
                             "gateway stopped control-only stream prefetch before client-visible body"
                         );
-                        break;
-                    }
-                }
-            } else if limit_direct_finalize_prefetch {
-                match tokio::time::timeout(
-                    REWRITTEN_STREAM_PREFETCH_TIMEOUT,
-                    next_stream_frame(&mut buffered_frames, &mut lines),
-                )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(_) => {
+                    } else {
                         prefetch_release_reason = "rewritten_timeout";
                         debug!(
                             event_name = "execution_runtime_stream_prefetch_limited",
@@ -2766,11 +2982,52 @@ async fn execute_stream_from_frame_stream(
                             timeout_ms = REWRITTEN_STREAM_PREFETCH_TIMEOUT.as_millis() as u64,
                             "gateway stopped rewritten stream prefetch before client-visible body"
                         );
-                        break;
                     }
+                    break;
                 }
-            } else {
-                next_stream_frame(&mut buffered_frames, &mut lines).await
+                PrefetchFrameWait::UpstreamIdleExpired => {
+                    warn!(
+                        event_name = "stream_execution_prefetch_upstream_idle_timeout",
+                        log_type = "ops",
+                        trace_id = %trace_id,
+                        request_id = %request_id_for_log,
+                        candidate_id = ?candidate_id,
+                        plan_kind,
+                        report_kind,
+                        provider_name,
+                        endpoint_id = %plan.endpoint_id,
+                        key_id = %plan.key_id,
+                        model_name,
+                        candidate_index = candidate_index.as_str(),
+                        upstream_idle_timeout_ms = stream_lifecycle_timeouts.upstream_idle.as_millis() as u64,
+                        prefetched_frames = prefetched_chunks.len(),
+                        prefetched_bytes = prefetched_inspection_body.len(),
+                        "gateway terminated stream prefetch after the upstream idle timeout"
+                    );
+                    let failure = build_stream_failure_report(
+                        "stream_idle_timeout",
+                        format!(
+                            "provider stream produced no upstream frame for {} ms during prefetch",
+                            stream_lifecycle_timeouts.upstream_idle.as_millis()
+                        ),
+                        504,
+                    );
+                    return handle_prefetch_stream_failure(
+                        state,
+                        trace_id,
+                        decision,
+                        &plan,
+                        report_context,
+                        request_id,
+                        candidate_id,
+                        report_kind,
+                        headers,
+                        prefetched_usage_telemetry.clone(),
+                        &provider_prefetched_body,
+                        failure,
+                    )
+                    .await;
+                }
             };
             let Some(observed_frame) = (match next_frame_result {
                 Ok(frame) => frame,
@@ -2802,6 +3059,7 @@ async fn execute_stream_from_frame_stream(
                 break;
             };
             let frame_observed_at = observed_frame.observed_at;
+            last_prefetch_upstream_frame_at = frame_observed_at;
             match observed_frame.frame.payload {
                 StreamFramePayload::Data { chunk_b64, text } => {
                     first_data_frame_at.get_or_insert(frame_observed_at);
@@ -3295,8 +3553,10 @@ async fn execute_stream_from_frame_stream(
     let candidate_index_for_report = candidate_index.clone();
     let is_openai_image_stream_for_report = plan_kind == OPENAI_IMAGE_STREAM_PLAN_KIND;
     let response_headers_are_sse = response_headers_indicate_sse(&headers);
-    let emit_proxy_generated_sse_control_blocks =
-        response_headers_are_sse && client_format_allows_proxy_generated_sse_control_blocks(&plan);
+    let proxy_generated_sse_keepalive = response_headers_are_sse
+        .then(|| resolve_proxy_generated_sse_keepalive(&plan, report_context_owned.as_ref()))
+        .flatten();
+    let emit_proxy_generated_sse_control_blocks = proxy_generated_sse_keepalive.is_some();
     let plan_for_report = plan;
     let emit_passthrough_sse_terminal_error =
         response_headers_are_sse && !is_openai_image_stream_for_report;
@@ -3381,20 +3641,31 @@ async fn execute_stream_from_frame_stream(
         let mut client_stream_completion_tracker = ClientVisibleStreamCompletionTracker::default();
         let mut client_visible_stream_completed =
             client_stream_completion_tracker.observe_chunk(&prefetched_body_for_report);
+        let mut client_visible_stream_filter =
+            response_headers_are_sse.then(SseControlBlockFilter::default);
+        let prefetched_client_visible_bytes = observe_client_visible_stream_bytes(
+            &mut client_visible_stream_filter,
+            &prefetched_body_for_report,
+        );
         let mut provider_terminal_diagnostics_tracker = tracing::enabled!(tracing::Level::DEBUG)
             .then(StreamTerminalEventDiagnosticsTracker::default);
         let mut usage_stream_telemetry: Option<ExecutionTelemetry> = initial_usage_telemetry;
         let mut telemetry: Option<ExecutionTelemetry> = initial_telemetry;
         let reached_eof = initial_reached_eof;
         let mut downstream_dropped = false;
+        let mut downstream_dropped_at: Option<Instant> = None;
+        let mut downstream_failure_type = "downstream_disconnect";
+        let mut downstream_failure_message = "client disconnected before stream completion";
         let mut terminal_failure: Option<StreamFailureReport> = None;
+        let mut last_upstream_frame_at = Instant::now();
+        let mut last_client_visible_chunk_at = Instant::now();
         let initial_elapsed_ms = stream_started_at_for_report
             .elapsed()
             .as_millis()
             .min(u128::from(u64::MAX)) as u64;
         let last_upstream_frame_elapsed_ms = Arc::new(AtomicU64::new(initial_elapsed_ms));
         let last_client_chunk_elapsed_ms =
-            Arc::new(AtomicU64::new(if prefetched_body_for_report.is_empty() {
+            Arc::new(AtomicU64::new(if prefetched_client_visible_bytes == 0 {
                 0
             } else {
                 initial_elapsed_ms
@@ -3403,7 +3674,7 @@ async fn execute_stream_from_frame_stream(
             u64::try_from(provider_prefetched_body_for_report.len()).unwrap_or(u64::MAX),
         ));
         let client_stream_bytes = Arc::new(AtomicU64::new(
-            u64::try_from(prefetched_body_for_report.len()).unwrap_or(u64::MAX),
+            u64::try_from(prefetched_client_visible_bytes).unwrap_or(u64::MAX),
         ));
         let idle_monitor_done = Arc::new(AtomicBool::new(false));
         let idle_monitor_handle = {
@@ -3580,10 +3851,88 @@ async fn execute_stream_from_frame_stream(
 
         if terminal_failure.is_none() && !reached_eof {
             loop {
+                let upstream_idle_remaining = stream_lifecycle_timeouts
+                    .upstream_idle
+                    .saturating_sub(last_upstream_frame_at.elapsed());
+                let client_progress_idle_remaining = stream_lifecycle_timeouts
+                    .client_progress_idle
+                    .saturating_sub(last_client_visible_chunk_at.elapsed());
+                let downstream_drain_remaining = downstream_dropped_at
+                    .map(|dropped_at| {
+                        stream_lifecycle_timeouts
+                            .downstream_drain
+                            .saturating_sub(dropped_at.elapsed())
+                    })
+                    .unwrap_or(stream_lifecycle_timeouts.downstream_drain);
                 let next_frame_result = tokio::select! {
                     biased;
-                    _ = tx.closed(), if client_visible_stream_completed => {
+                    _ = tx.closed(), if !downstream_dropped => {
                         downstream_dropped = true;
+                        downstream_dropped_at = Some(Instant::now());
+                        if client_visible_stream_completed {
+                            break;
+                        }
+                        warn!(
+                            event_name = "stream_execution_downstream_disconnected",
+                            log_type = "ops",
+                            trace_id = %trace_id_owned,
+                            request_id = %request_id_for_report_log,
+                            candidate_id = ?candidate_id_for_report.as_deref(),
+                            downstream_drain_timeout_ms = stream_lifecycle_timeouts.downstream_drain.as_millis() as u64,
+                            "gateway stream downstream dropped; draining the execution runtime stream for a bounded grace period"
+                        );
+                        continue;
+                    }
+                    _ = tokio::time::sleep(downstream_drain_remaining), if downstream_dropped => {
+                        warn!(
+                            event_name = "stream_execution_downstream_drain_timeout",
+                            log_type = "ops",
+                            trace_id = %trace_id_owned,
+                            request_id = %request_id_for_report_log,
+                            candidate_id = ?candidate_id_for_report.as_deref(),
+                            downstream_drain_timeout_ms = stream_lifecycle_timeouts.downstream_drain.as_millis() as u64,
+                            "gateway stopped draining the execution runtime stream after the downstream disconnect grace period"
+                        );
+                        break;
+                    }
+                    _ = tokio::time::sleep(upstream_idle_remaining), if !downstream_dropped => {
+                        warn!(
+                            event_name = "stream_execution_upstream_idle_timeout",
+                            log_type = "ops",
+                            trace_id = %trace_id_owned,
+                            request_id = %request_id_for_report_log,
+                            candidate_id = ?candidate_id_for_report.as_deref(),
+                            upstream_idle_timeout_ms = stream_lifecycle_timeouts.upstream_idle.as_millis() as u64,
+                            "gateway terminated a stream that produced no upstream frame within the idle timeout"
+                        );
+                        terminal_failure = Some(build_stream_failure_report(
+                            "stream_idle_timeout",
+                            format!(
+                                "provider stream produced no upstream frame for {} ms",
+                                stream_lifecycle_timeouts.upstream_idle.as_millis()
+                            ),
+                            504,
+                        ));
+                        break;
+                    }
+                    _ = tokio::time::sleep(client_progress_idle_remaining), if !downstream_dropped => {
+                        warn!(
+                            event_name = "stream_execution_client_progress_idle_timeout",
+                            log_type = "ops",
+                            trace_id = %trace_id_owned,
+                            request_id = %request_id_for_report_log,
+                            candidate_id = ?candidate_id_for_report.as_deref(),
+                            client_progress_idle_timeout_ms = stream_lifecycle_timeouts.client_progress_idle.as_millis() as u64,
+                            "gateway terminated a stream that produced no client-visible data within the progress timeout"
+                        );
+                        terminal_failure = Some(build_stream_failure_report(
+                            "stream_progress_timeout",
+                            format!(
+                                "provider stream produced no client-visible data for {} ms",
+                                stream_lifecycle_timeouts.client_progress_idle.as_millis()
+                            ),
+                            504,
+                        ));
                         break;
                     }
                     result = next_stream_frame(&mut buffered_frames, &mut lines) => result,
@@ -3617,6 +3966,7 @@ async fn execute_stream_from_frame_stream(
                 let frame_observed_at = observed_frame.observed_at;
                 let frame_elapsed_ms =
                     stream_elapsed_ms_at(stream_started_at_for_report, frame_observed_at);
+                last_upstream_frame_at = frame_observed_at;
                 last_upstream_frame_elapsed_ms.store(frame_elapsed_ms, Ordering::Relaxed);
                 match observed_frame.frame.payload {
                     StreamFramePayload::Data { chunk_b64, text } => {
@@ -3774,34 +4124,57 @@ async fn execute_stream_from_frame_stream(
                             max_stream_body_buffer_bytes,
                             &mut client_body_truncated,
                         );
-                        let rewritten_chunk_len =
-                            u64::try_from(rewritten_chunk.len()).unwrap_or(u64::MAX);
                         if downstream_dropped {
                             continue;
                         }
+                        let client_visible_chunk_len = observe_client_visible_stream_bytes(
+                            &mut client_visible_stream_filter,
+                            &rewritten_chunk,
+                        );
                         let rewritten_chunk = Bytes::from(rewritten_chunk);
-                        if tx.send(Ok(rewritten_chunk.clone())).await.is_err() {
+                        if let Err(send_failure) = send_downstream_stream_chunk(
+                            &tx,
+                            rewritten_chunk.clone(),
+                            stream_lifecycle_timeouts.downstream_write,
+                        )
+                        .await
+                        {
+                            if send_failure == DownstreamSendFailure::WriteTimeout {
+                                downstream_failure_type = "downstream_write_timeout";
+                                downstream_failure_message =
+                                    "client did not accept stream data within the downstream write timeout";
+                            }
                             warn!(
                                 event_name = "stream_execution_downstream_disconnected",
                                 log_type = "ops",
                                 trace_id = %trace_id_owned,
                                 request_id = %request_id_for_report_log,
                                 candidate_id = ?candidate_id_for_report.as_deref(),
-                                "gateway stream downstream dropped; continuing to drain execution runtime stream"
+                                send_failure = ?send_failure,
+                                downstream_write_timeout_ms = stream_lifecycle_timeouts.downstream_write.as_millis() as u64,
+                                downstream_drain_timeout_ms = stream_lifecycle_timeouts.downstream_drain.as_millis() as u64,
+                                "gateway stream downstream dropped; draining the execution runtime stream for a bounded grace period"
                             );
                             downstream_dropped = true;
+                            downstream_dropped_at = Some(Instant::now());
                         } else {
                             client_visible_stream_completed |= client_stream_completion_tracker
                                 .observe_chunk(rewritten_chunk.as_ref());
-                            client_stream_bytes.fetch_add(rewritten_chunk_len, Ordering::Relaxed);
-                            last_client_chunk_elapsed_ms.store(
-                                stream_started_at_for_report
-                                    .elapsed()
-                                    .as_millis()
-                                    .min(u128::from(u64::MAX))
-                                    as u64,
+                            client_stream_bytes.fetch_add(
+                                u64::try_from(client_visible_chunk_len).unwrap_or(u64::MAX),
                                 Ordering::Relaxed,
                             );
+                            if client_visible_chunk_len > 0 {
+                                last_client_visible_chunk_at = Instant::now();
+                                last_client_chunk_elapsed_ms.store(
+                                    stream_started_at_for_report
+                                        .elapsed()
+                                        .as_millis()
+                                        .min(u128::from(u64::MAX))
+                                        as u64,
+                                    Ordering::Relaxed,
+                                );
+                            }
                         }
                         if let Some(error_body_json) = provider_private_error_body_json {
                             let error_status_code =
@@ -3942,32 +4315,52 @@ async fn execute_stream_from_frame_stream(
                                 max_stream_body_buffer_bytes,
                                 &mut client_body_truncated,
                             );
-                            let rewritten_chunk_len =
-                                u64::try_from(rewritten_chunk.len()).unwrap_or(u64::MAX);
+                            let client_visible_chunk_len = observe_client_visible_stream_bytes(
+                                &mut client_visible_stream_filter,
+                                &rewritten_chunk,
+                            );
                             let rewritten_chunk = Bytes::from(rewritten_chunk);
-                            if tx.send(Ok(rewritten_chunk.clone())).await.is_err() {
+                            if let Err(send_failure) = send_downstream_stream_chunk(
+                                &tx,
+                                rewritten_chunk.clone(),
+                                stream_lifecycle_timeouts.downstream_write,
+                            )
+                            .await
+                            {
+                                if send_failure == DownstreamSendFailure::WriteTimeout {
+                                    downstream_failure_type = "downstream_write_timeout";
+                                    downstream_failure_message = "client did not accept stream data within the downstream write timeout";
+                                }
                                 warn!(
                                     event_name = "stream_execution_downstream_flush_disconnected",
                                     log_type = "ops",
                                     trace_id = %trace_id_owned,
                                     request_id = %request_id_for_report_log,
-                                candidate_id = ?candidate_id_for_report.as_deref(),
-                                "gateway stream downstream dropped while flushing private stream normalization"
+                                    candidate_id = ?candidate_id_for_report.as_deref(),
+                                    send_failure = ?send_failure,
+                                    downstream_write_timeout_ms = stream_lifecycle_timeouts.downstream_write.as_millis() as u64,
+                                    "gateway stream downstream dropped while flushing private stream normalization"
                                 );
                                 downstream_dropped = true;
+                                downstream_dropped_at.get_or_insert_with(Instant::now);
                             } else {
                                 client_visible_stream_completed |= client_stream_completion_tracker
                                     .observe_chunk(rewritten_chunk.as_ref());
-                                client_stream_bytes
-                                    .fetch_add(rewritten_chunk_len, Ordering::Relaxed);
-                                last_client_chunk_elapsed_ms.store(
-                                    stream_started_at_for_report
-                                        .elapsed()
-                                        .as_millis()
-                                        .min(u128::from(u64::MAX))
-                                        as u64,
+                                client_stream_bytes.fetch_add(
+                                    u64::try_from(client_visible_chunk_len).unwrap_or(u64::MAX),
                                     Ordering::Relaxed,
                                 );
+                                if client_visible_chunk_len > 0 {
+                                    last_client_visible_chunk_at = Instant::now();
+                                    last_client_chunk_elapsed_ms.store(
+                                        stream_started_at_for_report
+                                            .elapsed()
+                                            .as_millis()
+                                            .min(u128::from(u64::MAX))
+                                            as u64,
+                                        Ordering::Relaxed,
+                                    );
+                                }
                             }
                         }
                         if let Some(error_body_json) = provider_private_error_body_json {
@@ -4013,31 +4406,52 @@ async fn execute_stream_from_frame_stream(
                             max_stream_body_buffer_bytes,
                             &mut client_body_truncated,
                         );
-                        let flushed_chunk_len =
-                            u64::try_from(flushed_chunk.len()).unwrap_or(u64::MAX);
+                        let client_visible_chunk_len = observe_client_visible_stream_bytes(
+                            &mut client_visible_stream_filter,
+                            &flushed_chunk,
+                        );
                         let flushed_chunk = Bytes::from(flushed_chunk);
-                        if tx.send(Ok(flushed_chunk.clone())).await.is_err() {
+                        if let Err(send_failure) = send_downstream_stream_chunk(
+                            &tx,
+                            flushed_chunk.clone(),
+                            stream_lifecycle_timeouts.downstream_write,
+                        )
+                        .await
+                        {
+                            if send_failure == DownstreamSendFailure::WriteTimeout {
+                                downstream_failure_type = "downstream_write_timeout";
+                                downstream_failure_message = "client did not accept stream data within the downstream write timeout";
+                            }
                             warn!(
                                 event_name = "stream_execution_downstream_rewrite_flush_disconnected",
                                 log_type = "ops",
                                 trace_id = %trace_id_owned,
                                 request_id = %request_id_for_report_log,
-                            candidate_id = ?candidate_id_for_report.as_deref(),
-                            "gateway stream downstream dropped while flushing local stream rewrite"
+                                candidate_id = ?candidate_id_for_report.as_deref(),
+                                send_failure = ?send_failure,
+                                downstream_write_timeout_ms = stream_lifecycle_timeouts.downstream_write.as_millis() as u64,
+                                "gateway stream downstream dropped while flushing local stream rewrite"
                             );
                             downstream_dropped = true;
+                            downstream_dropped_at.get_or_insert_with(Instant::now);
                         } else {
                             client_visible_stream_completed |= client_stream_completion_tracker
                                 .observe_chunk(flushed_chunk.as_ref());
-                            client_stream_bytes.fetch_add(flushed_chunk_len, Ordering::Relaxed);
-                            last_client_chunk_elapsed_ms.store(
-                                stream_started_at_for_report
-                                    .elapsed()
-                                    .as_millis()
-                                    .min(u128::from(u64::MAX))
-                                    as u64,
+                            client_stream_bytes.fetch_add(
+                                u64::try_from(client_visible_chunk_len).unwrap_or(u64::MAX),
                                 Ordering::Relaxed,
                             );
+                            if client_visible_chunk_len > 0 {
+                                last_client_visible_chunk_at = Instant::now();
+                                last_client_chunk_elapsed_ms.store(
+                                    stream_started_at_for_report
+                                        .elapsed()
+                                        .as_millis()
+                                        .min(u128::from(u64::MAX))
+                                        as u64,
+                                    Ordering::Relaxed,
+                                );
+                            }
                         }
                     }
                     Ok(_) => {}
@@ -4071,7 +4485,7 @@ async fn execute_stream_from_frame_stream(
                         failure,
                     ))
                 } else if emit_passthrough_sse_terminal_error {
-                    Some(encode_terminal_sse_error_event(failure))
+                    Some(encode_terminal_sse_error_event(&plan_for_report, failure))
                 } else {
                     None
                 };
@@ -4086,16 +4500,29 @@ async fn execute_stream_from_frame_stream(
                                 max_stream_body_buffer_bytes,
                                 &mut client_body_truncated,
                             );
-                            if tx.send(Ok(error_event)).await.is_err() {
+                            if let Err(send_failure) = send_downstream_stream_chunk(
+                                &tx,
+                                error_event,
+                                stream_lifecycle_timeouts.downstream_write,
+                            )
+                            .await
+                            {
+                                if send_failure == DownstreamSendFailure::WriteTimeout {
+                                    downstream_failure_type = "downstream_write_timeout";
+                                    downstream_failure_message = "client did not accept stream data within the downstream write timeout";
+                                }
                                 warn!(
-                                event_name = "stream_execution_downstream_terminal_error_disconnected",
-                                log_type = "ops",
-                                trace_id = %trace_id_owned,
-                                request_id = %request_id_for_report_log,
-                                candidate_id = ?candidate_id_for_report.as_deref(),
-                                "gateway stream downstream dropped while sending terminal SSE error event"
+                                    event_name = "stream_execution_downstream_terminal_error_disconnected",
+                                    log_type = "ops",
+                                    trace_id = %trace_id_owned,
+                                    request_id = %request_id_for_report_log,
+                                    candidate_id = ?candidate_id_for_report.as_deref(),
+                                    send_failure = ?send_failure,
+                                    downstream_write_timeout_ms = stream_lifecycle_timeouts.downstream_write.as_millis() as u64,
+                                    "gateway stream downstream dropped while sending terminal SSE error event"
                                 );
                                 downstream_dropped = true;
+                                downstream_dropped_at.get_or_insert_with(Instant::now);
                             } else {
                                 client_stream_bytes.fetch_add(error_event_len, Ordering::Relaxed);
                                 last_client_chunk_elapsed_ms.store(
@@ -4213,8 +4640,8 @@ async fn execute_stream_from_frame_stream(
                 SchedulerRequestCandidateStatusUpdate {
                     status: RequestCandidateStatus::Cancelled,
                     status_code: Some(499),
-                    error_type: Some("downstream_disconnect".to_string()),
-                    error_message: Some("client disconnected before stream completion".to_string()),
+                    error_type: Some(downstream_failure_type.to_string()),
+                    error_message: Some(downstream_failure_message.to_string()),
                     latency_ms: usage_payload
                         .telemetry
                         .as_ref()
@@ -4562,7 +4989,7 @@ async fn execute_stream_from_frame_stream(
         prefetched_chunks_for_body,
         rx,
         response_headers_are_sse,
-        emit_proxy_generated_sse_control_blocks,
+        proxy_generated_sse_keepalive,
         SSE_KEEPALIVE_INTERVAL,
     );
 
@@ -4620,19 +5047,23 @@ mod tests {
 
     use super::{
         build_sse_body_stream, build_stream_failure_report,
-        client_format_allows_proxy_generated_sse_control_blocks,
+        client_format_allows_proxy_generated_sse_control_blocks, encode_terminal_sse_error_event,
         ensure_stream_terminal_summary_for_missing_observed_finish,
         execute_execution_runtime_stream, execute_stream_from_frame_stream,
         handle_prefetch_provider_private_stream_error, handle_prefetch_stream_failure,
         maybe_apply_kiro_prompt_cache_usage_to_stream_summary, merge_stream_terminal_summary,
-        resolve_local_sync_error_status_code, should_limit_direct_finalize_prefetch,
-        should_probe_success_failover_before_stream, should_skip_direct_finalize_prefetch,
-        stream_chunk_contains_sse_done, stream_requires_observed_terminal_event,
-        stream_terminal_summary_missing_observed_finish,
+        observe_client_visible_stream_bytes, resolve_local_sync_error_status_code,
+        resolve_proxy_generated_sse_keepalive, resolve_stream_lifecycle_timeouts,
+        should_limit_direct_finalize_prefetch, should_probe_success_failover_before_stream,
+        should_skip_direct_finalize_prefetch, stream_chunk_contains_sse_done,
+        stream_requires_observed_terminal_event, stream_terminal_summary_missing_observed_finish,
         stream_terminal_summary_missing_observed_finish_with_requirement,
         stream_terminal_summary_represents_failure_with_requirement,
-        ClientVisibleStreamCompletionTracker, StreamTerminalEventDiagnosticsTracker,
-        CONTROL_STREAM_PREFETCH_EXTENSION_TIMEOUT, REWRITTEN_STREAM_PREFETCH_TIMEOUT,
+        ClientVisibleStreamCompletionTracker, SseControlBlockFilter,
+        StreamTerminalEventDiagnosticsTracker, CODEX_RESPONSES_KEEPALIVE_BYTES,
+        CONTROL_STREAM_PREFETCH_EXTENSION_TIMEOUT, DEFAULT_STREAM_DOWNSTREAM_DRAIN_GRACE,
+        DEFAULT_STREAM_DOWNSTREAM_WRITE_TIMEOUT, DEFAULT_STREAM_UPSTREAM_IDLE_TIMEOUT,
+        REWRITTEN_STREAM_PREFETCH_TIMEOUT, SSE_KEEPALIVE_BYTES,
     };
     use crate::control::GatewayControlDecision;
     use crate::handlers::shared::provider_pool::{
@@ -4658,6 +5089,28 @@ mod tests {
 
     fn test_state() -> AppState {
         AppState::new().expect("gateway state should build")
+    }
+
+    fn test_stream_state() -> (
+        AppState,
+        Arc<InMemoryUsageReadRepository>,
+        Arc<InMemoryRequestCandidateRepository>,
+    ) {
+        let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
+        let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
+        let state = AppState::new()
+            .expect("app state should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
+                    Arc::clone(&request_candidate_repository),
+                    Arc::clone(&usage_repository),
+                ),
+            )
+            .with_usage_runtime_for_tests(UsageRuntimeConfig {
+                enabled: true,
+                ..UsageRuntimeConfig::default()
+            });
+        (state, usage_repository, request_candidate_repository)
     }
 
     fn test_responses_stream_plan(request_id: &str, candidate_id: &str) -> ExecutionPlan {
@@ -6492,6 +6945,529 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"type":"s
         ));
     }
 
+    #[test]
+    fn codex_responses_uses_data_event_keepalive_without_relaxing_other_openai_clients() {
+        let plan = test_responses_stream_plan("req-codex-keepalive", "cand-codex-keepalive");
+        let codex_context = json!({
+            "client_session_affinity": {
+                "client_family": "codex",
+                "session_key": "session-codex-keepalive"
+            }
+        });
+        assert_eq!(
+            resolve_proxy_generated_sse_keepalive(&plan, Some(&codex_context)),
+            Some(CODEX_RESPONSES_KEEPALIVE_BYTES)
+        );
+
+        let generic_context = json!({"client_family": "openai_js_sdk"});
+        assert_eq!(
+            resolve_proxy_generated_sse_keepalive(&plan, Some(&generic_context)),
+            None
+        );
+
+        let mut chat_plan = plan;
+        chat_plan.client_api_format = "openai:chat".into();
+        assert_eq!(
+            resolve_proxy_generated_sse_keepalive(&chat_plan, Some(&codex_context)),
+            None
+        );
+    }
+
+    #[test]
+    fn stream_lifecycle_timeouts_default_and_follow_plan_read_timeout() {
+        let mut plan =
+            test_responses_stream_plan("req-lifecycle-timeouts", "cand-lifecycle-timeouts");
+        assert_eq!(
+            resolve_stream_lifecycle_timeouts(&plan),
+            super::StreamLifecycleTimeouts {
+                upstream_idle: DEFAULT_STREAM_UPSTREAM_IDLE_TIMEOUT,
+                client_progress_idle: DEFAULT_STREAM_UPSTREAM_IDLE_TIMEOUT * 2,
+                downstream_write: DEFAULT_STREAM_DOWNSTREAM_WRITE_TIMEOUT,
+                downstream_drain: DEFAULT_STREAM_DOWNSTREAM_DRAIN_GRACE,
+            }
+        );
+
+        plan.timeouts = Some(ExecutionTimeouts {
+            read_ms: Some(25),
+            write_ms: Some(15),
+            ..ExecutionTimeouts::default()
+        });
+        assert_eq!(
+            resolve_stream_lifecycle_timeouts(&plan),
+            super::StreamLifecycleTimeouts {
+                upstream_idle: Duration::from_millis(25),
+                client_progress_idle: Duration::from_millis(50),
+                downstream_write: Duration::from_millis(15),
+                downstream_drain: Duration::from_millis(25),
+            }
+        );
+    }
+
+    #[test]
+    fn client_visible_stream_activity_ignores_sse_control_only_blocks() {
+        let mut filter = Some(SseControlBlockFilter::default());
+        assert_eq!(
+            observe_client_visible_stream_bytes(&mut filter, b": upstream-keepalive\n"),
+            0
+        );
+        assert_eq!(observe_client_visible_stream_bytes(&mut filter, b"\n"), 0);
+        assert!(
+            observe_client_visible_stream_bytes(
+                &mut filter,
+                b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n"
+            ) > 0
+        );
+    }
+
+    #[test]
+    fn terminal_sse_errors_use_client_protocol_native_events() {
+        let failure =
+            build_stream_failure_report("stream_idle_timeout", "provider stream was idle", 504);
+        let responses_plan = test_responses_stream_plan("req-native-error", "cand-native-error");
+        let responses_event = encode_terminal_sse_error_event(&responses_plan, &failure)
+            .expect("responses error should encode");
+        let responses_event = String::from_utf8_lossy(responses_event.as_ref());
+        assert!(responses_event.starts_with("event: response.failed\n"));
+        assert!(responses_event.contains("\"type\":\"response.failed\""));
+        assert!(responses_event.contains("\"code\":\"stream_idle_timeout\""));
+        assert!(!responses_event.contains("[DONE]"));
+
+        let claude_plan =
+            test_claude_from_responses_stream_plan("req-claude-error", "cand-claude-error");
+        let claude_event = encode_terminal_sse_error_event(&claude_plan, &failure)
+            .expect("claude error should encode");
+        let claude_event = String::from_utf8_lossy(claude_event.as_ref());
+        assert!(claude_event.starts_with("event: error\n"));
+        assert!(claude_event.contains("\"type\":\"error\""));
+        assert!(claude_event.contains("\"type\":\"api_error\""));
+        assert!(!claude_event.contains("[DONE]"));
+    }
+
+    #[tokio::test]
+    async fn codex_sse_body_stream_emits_json_keepalive_events() {
+        let (_tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(1);
+        let mut body_stream = Box::pin(build_sse_body_stream(
+            Vec::new(),
+            rx,
+            true,
+            Some(CODEX_RESPONSES_KEEPALIVE_BYTES),
+            Duration::from_millis(10),
+        ));
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), body_stream.next())
+                .await
+                .is_err(),
+            "Codex heartbeat should preserve the initial business/error window"
+        );
+
+        let first = tokio::time::timeout(Duration::from_millis(50), body_stream.next())
+            .await
+            .expect("Codex keepalive should arrive after one interval")
+            .expect("stream should yield a Codex keepalive")
+            .expect("Codex keepalive should be valid");
+        assert_eq!(first.as_ref(), CODEX_RESPONSES_KEEPALIVE_BYTES);
+
+        let second = tokio::time::timeout(Duration::from_millis(100), body_stream.next())
+            .await
+            .expect("periodic Codex keepalive should arrive")
+            .expect("stream should yield a periodic Codex keepalive")
+            .expect("periodic Codex keepalive should be valid");
+        assert_eq!(second.as_ref(), CODEX_RESPONSES_KEEPALIVE_BYTES);
+    }
+
+    #[tokio::test]
+    async fn stalled_upstream_stream_fails_and_persists_terminal_state() {
+        let (state, usage_repository, request_candidate_repository) = test_stream_state();
+        let mut plan =
+            test_responses_stream_plan("req-upstream-idle-timeout", "cand-upstream-idle-timeout");
+        plan.timeouts = Some(ExecutionTimeouts {
+            read_ms: Some(40),
+            ..ExecutionTimeouts::default()
+        });
+        let frame_stream = stream! {
+            yield Ok::<Bytes, std::io::Error>(ndjson_frame(StreamFrame {
+                frame_type: StreamFrameType::Headers,
+                payload: StreamFramePayload::Headers {
+                    status_code: 200,
+                    headers: BTreeMap::from([(
+                        "content-type".to_string(),
+                        "text/event-stream".to_string(),
+                    )]),
+                },
+            }));
+            yield Ok::<Bytes, std::io::Error>(ndjson_frame(StreamFrame {
+                frame_type: StreamFrameType::Data,
+                payload: StreamFramePayload::Data {
+                    chunk_b64: None,
+                    text: Some(concat!(
+                        "event: response.output_text.delta\n",
+                        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n"
+                    ).to_string()),
+                },
+            }));
+            std::future::pending::<()>().await;
+        }
+        .boxed();
+        let mut report_context =
+            test_prefetch_report_context("req-upstream-idle-timeout", "cand-upstream-idle-timeout");
+        report_context["client_session_affinity"] = json!({
+            "client_family": "codex",
+            "session_key": "session-upstream-idle-timeout"
+        });
+
+        let response = execute_stream_from_frame_stream(
+            &state,
+            plan,
+            "trace-upstream-idle-timeout",
+            &test_decision(),
+            "openai_responses_stream",
+            Some("openai_responses_stream_success".to_string()),
+            Some(report_context),
+            crate::clock::current_unix_ms(),
+            Instant::now(),
+            frame_stream,
+            None,
+        )
+        .await
+        .expect("stream execution should succeed")
+        .expect("stream execution should return a response");
+
+        let body = tokio::time::timeout(
+            Duration::from_secs(1),
+            to_bytes(response.into_body(), usize::MAX),
+        )
+        .await
+        .expect("idle stream response should terminate")
+        .expect("idle stream response body should read");
+        let body = String::from_utf8_lossy(body.as_ref());
+        assert!(body.contains("event: response.failed"));
+        assert!(body.contains("stream_idle_timeout"));
+
+        let usage = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(usage) = usage_repository
+                    .find_by_request_id("req-upstream-idle-timeout")
+                    .await
+                    .expect("usage should read")
+                    .filter(|usage| usage.status == "failed")
+                {
+                    break usage;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("idle stream terminal usage should persist");
+        assert_eq!(usage.status_code, Some(504));
+
+        let candidates = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let candidates = request_candidate_repository
+                    .list_by_request_id("req-upstream-idle-timeout")
+                    .await
+                    .expect("request candidates should read");
+                if candidates
+                    .first()
+                    .is_some_and(|candidate| candidate.status == RequestCandidateStatus::Failed)
+                {
+                    break candidates;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("idle stream candidate state should persist");
+        assert_eq!(candidates[0].status, RequestCandidateStatus::Failed);
+        assert_eq!(
+            candidates[0].error_type.as_deref(),
+            Some("stream_idle_timeout")
+        );
+    }
+
+    #[tokio::test]
+    async fn stalled_stream_prefetch_fails_before_publishing_a_stream_response() {
+        let (state, usage_repository, request_candidate_repository) = test_stream_state();
+        let mut plan =
+            test_responses_stream_plan("req-prefetch-idle-timeout", "cand-prefetch-idle-timeout");
+        plan.timeouts = Some(ExecutionTimeouts {
+            read_ms: Some(40),
+            ..ExecutionTimeouts::default()
+        });
+        let frame_stream = stream! {
+            yield Ok::<Bytes, std::io::Error>(ndjson_frame(StreamFrame {
+                frame_type: StreamFrameType::Headers,
+                payload: StreamFramePayload::Headers {
+                    status_code: 200,
+                    headers: BTreeMap::from([(
+                        "content-type".to_string(),
+                        "text/event-stream".to_string(),
+                    )]),
+                },
+            }));
+            std::future::pending::<()>().await;
+        }
+        .boxed();
+        let mut report_context =
+            test_prefetch_report_context("req-prefetch-idle-timeout", "cand-prefetch-idle-timeout");
+        report_context["local_failover_policy"] = json!({"stop_status_codes": [504]});
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            execute_stream_from_frame_stream(
+                &state,
+                plan,
+                "trace-prefetch-idle-timeout",
+                &test_decision(),
+                "openai_responses_stream",
+                Some("openai_responses_stream_success".to_string()),
+                Some(report_context),
+                crate::clock::current_unix_ms(),
+                Instant::now(),
+                frame_stream,
+                None,
+            ),
+        )
+        .await
+        .expect("stalled prefetch should terminate")
+        .expect("prefetch timeout should produce a handled response")
+        .expect("prefetch timeout should not schedule another candidate");
+        assert_eq!(response.status().as_u16(), 504);
+
+        let usage = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(usage) = usage_repository
+                    .find_by_request_id("req-prefetch-idle-timeout")
+                    .await
+                    .expect("usage should read")
+                    .filter(|usage| usage.status == "failed")
+                {
+                    break usage;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("prefetch timeout usage should persist");
+        assert_eq!(usage.status_code, Some(504));
+
+        let candidates = request_candidate_repository
+            .list_by_request_id("req-prefetch-idle-timeout")
+            .await
+            .expect("request candidates should read");
+        assert_eq!(candidates[0].status, RequestCandidateStatus::Failed);
+        assert_eq!(
+            candidates[0].error_type.as_deref(),
+            Some("stream_idle_timeout")
+        );
+    }
+
+    #[tokio::test]
+    async fn stalled_json_success_probe_returns_planning_timeout() {
+        let state = test_state();
+        let mut plan = test_responses_stream_plan(
+            "req-success-probe-idle-timeout",
+            "cand-success-probe-idle-timeout",
+        );
+        plan.timeouts = Some(ExecutionTimeouts {
+            read_ms: Some(40),
+            ..ExecutionTimeouts::default()
+        });
+        let frame_stream = stream! {
+            yield Ok::<Bytes, std::io::Error>(ndjson_frame(StreamFrame {
+                frame_type: StreamFrameType::Headers,
+                payload: StreamFramePayload::Headers {
+                    status_code: 200,
+                    headers: BTreeMap::from([(
+                        "content-type".to_string(),
+                        "application/json".to_string(),
+                    )]),
+                },
+            }));
+            std::future::pending::<()>().await;
+        }
+        .boxed();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            execute_stream_from_frame_stream(
+                &state,
+                plan,
+                "trace-success-probe-idle-timeout",
+                &test_decision(),
+                "openai_responses_stream",
+                Some("openai_responses_stream_success".to_string()),
+                Some(test_prefetch_report_context(
+                    "req-success-probe-idle-timeout",
+                    "cand-success-probe-idle-timeout",
+                )),
+                crate::clock::current_unix_ms(),
+                Instant::now(),
+                frame_stream,
+                None,
+            ),
+        )
+        .await
+        .expect("stalled success probe should terminate");
+        assert!(matches!(
+            result,
+            Err(crate::GatewayError::LocalExecutionPlanningTimeout {
+                phase: "execution_runtime_stream_success_probe",
+                timeout_ms: 40,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn stalled_execution_runtime_headers_return_planning_timeout() {
+        let state = test_state();
+        let mut plan = test_responses_stream_plan(
+            "req-runtime-headers-idle-timeout",
+            "cand-runtime-headers-idle-timeout",
+        );
+        plan.timeouts = Some(ExecutionTimeouts {
+            read_ms: Some(40),
+            ..ExecutionTimeouts::default()
+        });
+        let frame_stream = futures_util::stream::pending::<Result<Bytes, std::io::Error>>().boxed();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            execute_stream_from_frame_stream(
+                &state,
+                plan,
+                "trace-runtime-headers-idle-timeout",
+                &test_decision(),
+                "openai_responses_stream",
+                Some("openai_responses_stream_success".to_string()),
+                Some(test_prefetch_report_context(
+                    "req-runtime-headers-idle-timeout",
+                    "cand-runtime-headers-idle-timeout",
+                )),
+                crate::clock::current_unix_ms(),
+                Instant::now(),
+                frame_stream,
+                None,
+            ),
+        )
+        .await
+        .expect("stalled execution runtime headers should terminate");
+        assert!(matches!(
+            result,
+            Err(crate::GatewayError::LocalExecutionPlanningTimeout {
+                phase: "execution_runtime_stream_headers",
+                timeout_ms: 40,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn control_only_upstream_frames_do_not_mask_client_progress_timeout() {
+        let (state, _usage_repository, request_candidate_repository) = test_stream_state();
+        let mut plan = test_responses_stream_plan(
+            "req-client-progress-timeout",
+            "cand-client-progress-timeout",
+        );
+        plan.timeouts = Some(ExecutionTimeouts {
+            read_ms: Some(40),
+            ..ExecutionTimeouts::default()
+        });
+        let frame_stream = stream! {
+            yield Ok::<Bytes, std::io::Error>(ndjson_frame(StreamFrame {
+                frame_type: StreamFrameType::Headers,
+                payload: StreamFramePayload::Headers {
+                    status_code: 200,
+                    headers: BTreeMap::from([(
+                        "content-type".to_string(),
+                        "text/event-stream".to_string(),
+                    )]),
+                },
+            }));
+            yield Ok::<Bytes, std::io::Error>(ndjson_frame(StreamFrame {
+                frame_type: StreamFrameType::Data,
+                payload: StreamFramePayload::Data {
+                    chunk_b64: None,
+                    text: Some(concat!(
+                        "event: response.output_text.delta\n",
+                        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n"
+                    ).to_string()),
+                },
+            }));
+            for _ in 0..20 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                yield Ok::<Bytes, std::io::Error>(ndjson_frame(StreamFrame {
+                    frame_type: StreamFrameType::Data,
+                    payload: StreamFramePayload::Data {
+                        chunk_b64: None,
+                        text: Some(": upstream-keepalive\n\n".to_string()),
+                    },
+                }));
+            }
+            std::future::pending::<()>().await;
+        }
+        .boxed();
+        let mut report_context = test_prefetch_report_context(
+            "req-client-progress-timeout",
+            "cand-client-progress-timeout",
+        );
+        report_context["client_session_affinity"] = json!({
+            "client_family": "codex",
+            "session_key": "session-client-progress-timeout"
+        });
+
+        let response = execute_stream_from_frame_stream(
+            &state,
+            plan,
+            "trace-client-progress-timeout",
+            &test_decision(),
+            "openai_responses_stream",
+            Some("openai_responses_stream_success".to_string()),
+            Some(report_context),
+            crate::clock::current_unix_ms(),
+            Instant::now(),
+            frame_stream,
+            None,
+        )
+        .await
+        .expect("stream execution should succeed")
+        .expect("stream execution should return a response");
+
+        let body = tokio::time::timeout(
+            Duration::from_secs(1),
+            to_bytes(response.into_body(), usize::MAX),
+        )
+        .await
+        .expect("control-only stream response should terminate")
+        .expect("control-only stream response body should read");
+        let body = String::from_utf8_lossy(body.as_ref());
+        assert!(body.contains("stream_progress_timeout"));
+        assert!(!body.contains(": upstream-keepalive"));
+
+        let candidates = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let candidates = request_candidate_repository
+                    .list_by_request_id("req-client-progress-timeout")
+                    .await
+                    .expect("request candidates should read");
+                if candidates
+                    .first()
+                    .is_some_and(|candidate| candidate.status == RequestCandidateStatus::Failed)
+                {
+                    break candidates;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("progress timeout candidate state should persist");
+        assert_eq!(
+            candidates[0].error_type.as_deref(),
+            Some("stream_progress_timeout")
+        );
+    }
+
     #[tokio::test]
     async fn sse_body_stream_emits_initial_and_periodic_keepalive_without_business_chunks() {
         let (_tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(1);
@@ -6499,7 +7475,7 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"type":"s
             Vec::new(),
             rx,
             true,
-            true,
+            Some(SSE_KEEPALIVE_BYTES),
             Duration::from_millis(10),
         ));
 
@@ -6525,7 +7501,7 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"type":"s
             vec![Bytes::from_static(b": upstream-keepalive\n\n")],
             rx,
             true,
-            false,
+            None,
             Duration::from_millis(10),
         ));
 
@@ -6565,7 +7541,7 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"type":"s
             ],
             rx,
             true,
-            true,
+            Some(SSE_KEEPALIVE_BYTES),
             Duration::from_secs(60),
         ));
 
@@ -6594,7 +7570,7 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"type":"s
             ],
             rx,
             true,
-            true,
+            Some(SSE_KEEPALIVE_BYTES),
             Duration::from_secs(60),
         ));
 
@@ -6617,7 +7593,7 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"type":"s
             Vec::new(),
             rx,
             true,
-            true,
+            Some(SSE_KEEPALIVE_BYTES),
             Duration::from_secs(60),
         ));
 
@@ -6673,7 +7649,7 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"type":"s
             vec![Bytes::from_static(b": upstream-keepalive\n\n")],
             rx,
             true,
-            true,
+            Some(SSE_KEEPALIVE_BYTES),
             Duration::from_secs(60),
         ));
 
@@ -6835,9 +7811,11 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"type":"s
         assert!(!body_text.contains("event: message_delta"));
         assert!(!body_text.contains("event: message_stop"));
         assert!(!body_text.contains("\"stop_reason\":\"tool_use\""));
+        assert!(body_text.contains("event: error"));
+        assert!(body_text.contains("\"type\":\"api_error\""));
         assert!(body_text.contains("\"error\""));
         assert!(body_text.contains("unexpected internal error encountered"));
-        assert!(body_text.contains("data: [DONE]"));
+        assert!(!body_text.contains("data: [DONE]"));
 
         let candidates = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
@@ -7378,6 +8356,228 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"type":"s
             Some(&json!("resource_exhausted"))
         );
         assert!(record.response_body_ref.is_none());
+    }
+
+    #[tokio::test]
+    async fn downstream_backpressure_cancels_stream_after_write_timeout() {
+        let (state, usage_repository, request_candidate_repository) = test_stream_state();
+        let mut plan = test_responses_stream_plan(
+            "req-downstream-write-timeout",
+            "cand-downstream-write-timeout",
+        );
+        plan.timeouts = Some(ExecutionTimeouts {
+            read_ms: Some(100),
+            write_ms: Some(30),
+            ..ExecutionTimeouts::default()
+        });
+        let frame_stream = stream! {
+            yield Ok::<Bytes, std::io::Error>(ndjson_frame(StreamFrame {
+                frame_type: StreamFrameType::Headers,
+                payload: StreamFramePayload::Headers {
+                    status_code: 200,
+                    headers: BTreeMap::from([(
+                        "content-type".to_string(),
+                        "text/event-stream".to_string(),
+                    )]),
+                },
+            }));
+            for index in 0..24 {
+                yield Ok::<Bytes, std::io::Error>(ndjson_frame(StreamFrame {
+                    frame_type: StreamFrameType::Data,
+                    payload: StreamFramePayload::Data {
+                        chunk_b64: None,
+                        text: Some(format!(
+                            concat!(
+                                "event: response.output_text.delta\n",
+                                "data: {{\"type\":\"response.output_text.delta\",\"delta\":\"chunk-{}\"}}\n\n"
+                            ),
+                            index,
+                        )),
+                    },
+                }));
+            }
+            std::future::pending::<()>().await;
+        }
+        .boxed();
+        let report_context = test_prefetch_report_context(
+            "req-downstream-write-timeout",
+            "cand-downstream-write-timeout",
+        );
+
+        let _response = execute_stream_from_frame_stream(
+            &state,
+            plan,
+            "trace-downstream-write-timeout",
+            &test_decision(),
+            "openai_responses_stream",
+            Some("openai_responses_stream_success".to_string()),
+            Some(report_context),
+            crate::clock::current_unix_ms(),
+            Instant::now(),
+            frame_stream,
+            None,
+        )
+        .await
+        .expect("stream execution should succeed")
+        .expect("stream execution should return a response");
+
+        let usage = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(usage) = usage_repository
+                    .find_by_request_id("req-downstream-write-timeout")
+                    .await
+                    .expect("usage should read")
+                    .filter(|usage| usage.status == "cancelled")
+                {
+                    break usage;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("downstream write timeout should cancel the stream");
+        assert_eq!(usage.status_code, Some(499));
+
+        let candidates = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let candidates = request_candidate_repository
+                    .list_by_request_id("req-downstream-write-timeout")
+                    .await
+                    .expect("request candidates should read");
+                if candidates
+                    .first()
+                    .is_some_and(|candidate| candidate.status == RequestCandidateStatus::Cancelled)
+                {
+                    break candidates;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("downstream write timeout candidate state should persist");
+        assert_eq!(
+            candidates[0].error_type.as_deref(),
+            Some("downstream_write_timeout")
+        );
+    }
+
+    #[tokio::test]
+    async fn downstream_disconnect_cancels_a_stalled_upstream_after_bounded_drain() {
+        let (state, usage_repository, request_candidate_repository) = test_stream_state();
+        let mut plan = test_responses_stream_plan(
+            "req-client-drop-stalled-upstream",
+            "cand-client-drop-stalled-upstream",
+        );
+        plan.timeouts = Some(ExecutionTimeouts {
+            read_ms: Some(50),
+            ..ExecutionTimeouts::default()
+        });
+        let frame_stream = stream! {
+            yield Ok::<Bytes, std::io::Error>(ndjson_frame(StreamFrame {
+                frame_type: StreamFrameType::Headers,
+                payload: StreamFramePayload::Headers {
+                    status_code: 200,
+                    headers: BTreeMap::from([(
+                        "content-type".to_string(),
+                        "text/event-stream".to_string(),
+                    )]),
+                },
+            }));
+            yield Ok::<Bytes, std::io::Error>(ndjson_frame(StreamFrame {
+                frame_type: StreamFrameType::Data,
+                payload: StreamFramePayload::Data {
+                    chunk_b64: None,
+                    text: Some(concat!(
+                        "event: response.output_text.delta\n",
+                        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n"
+                    ).to_string()),
+                },
+            }));
+            std::future::pending::<()>().await;
+        }
+        .boxed();
+        let mut report_context = test_prefetch_report_context(
+            "req-client-drop-stalled-upstream",
+            "cand-client-drop-stalled-upstream",
+        );
+        report_context["client_session_affinity"] = json!({
+            "client_family": "codex",
+            "session_key": "session-client-drop-stalled-upstream"
+        });
+
+        let response = execute_stream_from_frame_stream(
+            &state,
+            plan,
+            "trace-client-drop-stalled-upstream",
+            &test_decision(),
+            "openai_responses_stream",
+            Some("openai_responses_stream_success".to_string()),
+            Some(report_context),
+            crate::clock::current_unix_ms(),
+            Instant::now(),
+            frame_stream,
+            None,
+        )
+        .await
+        .expect("stream execution should succeed")
+        .expect("stream execution should return a response");
+
+        let mut body_stream = response.into_body().into_data_stream();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let chunk = body_stream
+                    .next()
+                    .await
+                    .expect("body should yield a business chunk")
+                    .expect("business chunk should be valid");
+                if String::from_utf8_lossy(chunk.as_ref()).contains("response.output_text.delta") {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("first business chunk should arrive");
+        drop(body_stream);
+
+        let usage = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(usage) = usage_repository
+                    .find_by_request_id("req-client-drop-stalled-upstream")
+                    .await
+                    .expect("usage should read")
+                    .filter(|usage| usage.status == "cancelled")
+                {
+                    break usage;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("stalled upstream should be cancelled after bounded drain");
+        assert_eq!(usage.status_code, Some(499));
+
+        let candidates = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let candidates = request_candidate_repository
+                    .list_by_request_id("req-client-drop-stalled-upstream")
+                    .await
+                    .expect("request candidates should read");
+                if candidates
+                    .first()
+                    .is_some_and(|candidate| candidate.status == RequestCandidateStatus::Cancelled)
+                {
+                    break candidates;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("downstream disconnect candidate state should persist");
+        assert_eq!(candidates[0].status, RequestCandidateStatus::Cancelled);
+        assert_eq!(
+            candidates[0].error_type.as_deref(),
+            Some("downstream_disconnect")
+        );
     }
 
     #[tokio::test]

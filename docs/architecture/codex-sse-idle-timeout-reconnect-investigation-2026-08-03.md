@@ -271,3 +271,17 @@ aether（本仓库）：
 - `aether-postgres` / `aether`：`provider_api_keys.id=4da4ba36-…`（布韩账号）
 - `sub2api-postgres` / `sub2api`：`usage_logs` / `ops_error_logs`（`user_id=192`，2026-08-03）
 - `aether-app` 日志：`codex_ws_official_protocol_failed`（key 4da4ba36，24h×11）
+
+---
+
+## 12. 2026-08-05 实施状态
+
+本节是对原调查记录的后续更新。修复已在本地源码实现并加入测试，**尚未部署到生产环境**。
+
+- Codex `openai:responses` 且 `client_family=codex` 时，从首个 15 秒周期到期后发送协议有效的未知 JSON 事件 `response.aether_keepalive`；其他 `openai:*` 客户端仍保持严格线格式，不注入该事件。延迟首个心跳可避免兼容代理把它误记为真实首字节并提前关闭 failover 窗口。
+- 流执行使用 `ExecutionTimeouts.read_ms` 作为活动期限；未配置时默认 300 秒无上游帧失败，客户端 600 秒无真实 `data:` 进展失败。该限制不是总耗时上限，持续有活动的长流不受影响。
+- 首个 execution-runtime headers 帧、JSON 成功探测、预取阶段和已返回响应后的主消费循环均受活动期限保护。
+- 下游写入使用 `ExecutionTimeouts.write_ms`，未配置时默认 30 秒；客户端连接未断但停止读取时会以 `downstream_write_timeout` 取消，不再永久阻塞生产任务。
+- 客户端断开后仅继续排空最多 30 秒（若 `read_ms` 更短则取更短值），随后取消上游任务并写入 `cancelled/499` 终态。
+- 中途超时对 OpenAI Responses 输出原生 `response.failed`，对 Claude Messages 输出原生 `error`，使客户端立即得到明确终态。
+- SSE 注释/控制块不再被计作客户端可见进展；合成心跳只维持 Codex 客户端连接，不会重置网关自身的上游或业务进展 watchdog。
