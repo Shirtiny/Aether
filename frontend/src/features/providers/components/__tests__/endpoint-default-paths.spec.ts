@@ -8,6 +8,7 @@ const apiFormats = [
   { value: 'gemini:embedding', default_path: '/v1beta/models/{model}:embedContent' },
   { value: 'gemini:video', default_path: '/v1beta/models/{model}:predictLongRunning' },
   { value: 'openai:responses', default_path: '/v1/responses' },
+  { value: 'openai:search', default_path: '/v1/alpha/search' },
   { value: 'openai:embedding', default_path: '/v1/embeddings' },
   { value: 'openai:rerank', default_path: '/v1/rerank' },
   { value: 'openai:image', default_path: '/v1/images/generations' },
@@ -66,6 +67,23 @@ describe('endpoint default paths', () => {
       providerType: 'codex',
       apiFormats,
     })).toBe('/responses')
+  })
+
+  it('resolves alpha/search relative to the API root for both Codex and relays', () => {
+    // 运行时统一按 {base_url}/alpha/search 拼接，展示的默认路径必须与之一致。
+    expect(getDefaultEndpointPath({
+      apiFormat: 'openai:search',
+      providerType: 'codex',
+      baseUrl: 'https://chatgpt.com/backend-api/codex',
+      apiFormats,
+    })).toBe('/alpha/search')
+
+    expect(getDefaultEndpointPath({
+      apiFormat: 'openai:search',
+      providerType: 'custom',
+      baseUrl: 'https://relay.example.com/v1',
+      apiFormats,
+    })).toBe('/alpha/search')
   })
 
   it('drops /v1 from API-root defaults because base URL is the API root', () => {
@@ -187,6 +205,11 @@ describe('endpoint default paths', () => {
       apiFormat: 'claude:messages',
       baseUrl: 'https://api.anthropic.com',
     })).toBe('https://api.anthropic.com/v1')
+
+    expect(getDefaultEndpointBaseUrl({
+      apiFormat: 'openai:search',
+      baseUrl: 'https://relay.example.com',
+    })).toBe('https://relay.example.com/v1')
 
     expect(getDefaultEndpointBaseUrl({
       apiFormat: 'openai:embedding',

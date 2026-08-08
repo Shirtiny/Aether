@@ -90,6 +90,7 @@ function usesVersionedApiRootByDefault(apiFormat: string): boolean {
   return apiFormat === 'openai:chat'
     || apiFormat === 'openai:responses'
     || apiFormat === 'openai:responses:compact'
+    || apiFormat === 'openai:search'
     || apiFormat === 'openai:embedding'
     || apiFormat === 'openai:rerank'
     || apiFormat === 'openai:image'
