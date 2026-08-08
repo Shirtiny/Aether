@@ -916,10 +916,9 @@ async fn resolve_local_openai_search_candidate_payload_parts(
         .await;
         return Ok(None);
     }
-    if let Some(skip_reason) = openai_search_candidate_contract_skip_reason(
-        eligible.provider_api_format.as_str(),
-        transport.provider.provider_type.as_str(),
-    ) {
+    if let Some(skip_reason) =
+        openai_search_candidate_contract_skip_reason(eligible.provider_api_format.as_str())
+    {
         mark_skipped_local_openai_responses_candidate(
             state,
             input,
@@ -1033,10 +1032,22 @@ async fn resolve_local_openai_search_candidate_payload_parts(
     apply_codex_pool_search_account_profile(&mut provider_request_headers, transport);
     normalize_openai_search_headers(&mut provider_request_headers);
 
-    let upstream_url = crate::ai_serving::transport::build_openai_search_url(
-        transport.endpoint.base_url.as_str(),
+    let Some(upstream_url) = crate::ai_serving::transport::build_local_openai_search_upstream_url(
+        transport,
         parts.uri.query(),
-    );
+    ) else {
+        mark_skipped_local_openai_responses_candidate(
+            state,
+            input,
+            trace_id,
+            candidate,
+            candidate_index,
+            candidate_id,
+            "upstream_url_missing",
+        )
+        .await;
+        return Ok(None);
+    };
     let transport_profile = crate::ai_serving::transport::resolve_transport_profile(transport);
 
     Ok(Some(LocalOpenAiResponsesCandidatePayloadParts {
@@ -1059,15 +1070,17 @@ async fn resolve_local_openai_search_candidate_payload_parts(
     }))
 }
 
+/// alpha/search 只要求候选落在 `openai:search` 端点上。
+/// 上游是官方 Codex（base 为 `.../backend-api/codex`）还是转发同一协议的中转
+/// （base 为 `{host}/v1`）由端点 base_url 决定，两者请求体与鉴权方式一致，
+/// 因此这里不再按 provider_type 收窄。
 fn openai_search_candidate_contract_skip_reason(
     provider_api_format: &str,
-    provider_type: &str,
 ) -> Option<&'static str> {
     if !crate::ai_serving::normalize_api_format_alias(provider_api_format)
         .eq_ignore_ascii_case("openai:search")
-        || !provider_type.trim().eq_ignore_ascii_case("codex")
     {
-        return Some("openai_search_codex_search_endpoint_required");
+        return Some("openai_search_endpoint_required");
     }
     None
 }
@@ -2086,17 +2099,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn openai_search_candidate_contract_requires_active_codex_search_endpoint() {
+    fn openai_search_candidate_contract_requires_search_endpoint_regardless_of_provider_type() {
         assert_eq!(
-            openai_search_candidate_contract_skip_reason("openai:search", "custom"),
-            Some("openai_search_codex_search_endpoint_required")
+            openai_search_candidate_contract_skip_reason("openai:responses"),
+            Some("openai_search_endpoint_required")
         );
         assert_eq!(
-            openai_search_candidate_contract_skip_reason("openai:responses", "codex"),
-            Some("openai_search_codex_search_endpoint_required")
+            openai_search_candidate_contract_skip_reason("openai:responses:compact"),
+            Some("openai_search_endpoint_required")
         );
         assert_eq!(
-            openai_search_candidate_contract_skip_reason("openai:search", "codex"),
+            openai_search_candidate_contract_skip_reason("openai:search"),
             None
         );
     }

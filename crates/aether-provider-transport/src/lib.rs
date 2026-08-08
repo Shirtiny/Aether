@@ -112,9 +112,9 @@ pub use request_body::{
 pub use request_url::{
     build_cross_format_openai_chat_upstream_url, build_cross_format_openai_responses_upstream_url,
     build_kiro_cross_format_upstream_url, build_local_openai_chat_upstream_url,
-    build_local_openai_responses_upstream_url, build_transport_request_url,
-    build_transport_request_url_for_request_body, gemini_embedding_request_body_uses_batch,
-    TransportRequestUrlParams,
+    build_local_openai_responses_upstream_url, build_local_openai_search_upstream_url,
+    build_transport_request_url, build_transport_request_url_for_request_body,
+    gemini_embedding_request_body_uses_batch, TransportRequestUrlParams,
 };
 pub use rules::{
     apply_local_body_rules, apply_local_body_rules_with_request_headers, apply_local_header_rules,

@@ -16,7 +16,8 @@ use crate::gemini_cli::{
 use crate::snapshot::GatewayProviderTransportSnapshot;
 use crate::url::{
     build_claude_messages_url, build_gemini_content_url, build_openai_chat_url,
-    build_openai_responses_url, build_passthrough_path_url, normalize_gemini_content_action_path,
+    build_openai_responses_url, build_openai_search_url, build_passthrough_path_url,
+    normalize_gemini_content_action_path,
 };
 use crate::vertex::{
     build_vertex_api_key_gemini_content_url, build_vertex_api_key_gemini_embedding_url,
@@ -124,6 +125,10 @@ fn build_transport_request_url_inner(
             params.request_query,
             true,
         )),
+        "openai:search" => Some(build_openai_search_url(
+            &transport.endpoint.base_url,
+            params.request_query,
+        )),
         "openai:embedding" | "jina:embedding" => {
             build_provider_embedding_v1_url(&transport.endpoint.base_url, params.request_query)
         }
@@ -216,6 +221,24 @@ pub fn build_local_openai_responses_upstream_url(
         transport,
         TransportRequestUrlParams {
             provider_api_format,
+            mapped_model: None,
+            upstream_is_stream: false,
+            request_query,
+            kiro_api_region: None,
+        },
+    )
+}
+
+/// alpha/search 与其它格式一样走端点路径体系：先认端点上的自定义路径，
+/// 没配才回落到 `{base_url}/alpha/search`。
+pub fn build_local_openai_search_upstream_url(
+    transport: &GatewayProviderTransportSnapshot,
+    request_query: Option<&str>,
+) -> Option<String> {
+    build_transport_request_url(
+        transport,
+        TransportRequestUrlParams {
+            provider_api_format: "openai:search",
             mapped_model: None,
             upstream_is_stream: false,
             request_query,
@@ -557,8 +580,9 @@ fn custom_path_template_regex() -> &'static Regex {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_kiro_cross_format_upstream_url, build_transport_request_url,
-        build_transport_request_url_for_request_body, TransportRequestUrlParams,
+        build_kiro_cross_format_upstream_url, build_local_openai_search_upstream_url,
+        build_transport_request_url, build_transport_request_url_for_request_body,
+        TransportRequestUrlParams,
     };
     use crate::snapshot::{
         GatewayProviderTransportEndpoint, GatewayProviderTransportKey,
@@ -1007,6 +1031,40 @@ mod tests {
             "https://codewhisperer.us-west-2.amazonaws.com/generateAssistantResponse"
         ));
         assert!(url.contains("conversationId=abc"));
+    }
+
+    #[test]
+    fn openai_search_request_url_honors_custom_path_and_falls_back_to_base_url() {
+        // 官方 Codex：base 自带 /backend-api/codex，回落路径必须仍是 /alpha/search。
+        let codex = sample_transport(
+            "codex",
+            "openai:search",
+            "https://chatgpt.example/backend-api/codex",
+            None,
+        );
+        assert_eq!(
+            build_local_openai_search_upstream_url(&codex, None).as_deref(),
+            Some("https://chatgpt.example/backend-api/codex/alpha/search")
+        );
+
+        // 中转：base 带 /v1，回落同样拼出 /v1/alpha/search。
+        let relay = sample_transport("custom", "openai:search", "https://relay.example/v1", None);
+        assert_eq!(
+            build_local_openai_search_upstream_url(&relay, Some("tenant=demo")).as_deref(),
+            Some("https://relay.example/v1/alpha/search?tenant=demo")
+        );
+
+        // 端点填了自定义路径时以自定义路径为准。
+        let relay_with_custom_path = sample_transport(
+            "custom",
+            "openai:search",
+            "https://relay.example",
+            Some("/v1/alpha/search"),
+        );
+        assert_eq!(
+            build_local_openai_search_upstream_url(&relay_with_custom_path, None).as_deref(),
+            Some("https://relay.example/v1/alpha/search")
+        );
     }
 
     #[test]
