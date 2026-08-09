@@ -21,7 +21,14 @@ function resolveProviderType(input: ProviderKeyAuthCarrier, providerType?: strin
 }
 
 function isGrokSessionCredential(input: ProviderKeyAuthCarrier, providerType?: string | null): boolean {
-  return resolveProviderType(input, providerType) === 'grok' && isOAuthManagedCredential(input)
+  // Legacy Grok browser-session credentials were also represented as
+  // `auth_type=oauth`, but they have no refresh token. Do not classify every
+  // Grok OAuth credential as a Session Cookie: the official xAI OAuth path is
+  // refreshable and must expose the normal OAuth controls.
+  return resolveProviderType(input, providerType) === 'grok'
+    && isOAuthManagedCredential(input)
+    && input.oauth_temporary !== true
+    && input.can_refresh_oauth === false
 }
 
 export function getProviderCredentialKind(
@@ -91,7 +98,10 @@ export function shouldShowOAuthRefreshControl(
   input: ProviderKeyAuthCarrier,
   providerType?: string | null,
 ): boolean {
-  if (isGrokSessionCredential(input, providerType)) return false
+  // Refreshability is provider/backend metadata. In particular, Grok OAuth
+  // accounts with a stored refresh token are refreshable just like Codex.
+  // Keep the provider argument for API compatibility with existing callers.
+  void providerType
   return canRefreshOAuthCredential(input)
 }
 

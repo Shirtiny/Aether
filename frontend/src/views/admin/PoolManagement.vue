@@ -2518,10 +2518,10 @@ const keyUiStateMap = computed<Record<string, PoolKeyUiState>>(() => {
     const planType = resolvePoolKeyPlanType(key)
     const canRefreshToken = canRefreshOAuthCredential(key)
     const showOAuthRefreshControl = shouldShowOAuthRefreshControl(key, selectedProviderType.value)
-    // Session-cookie credentials have no refresh control, so the desktop row hid
-    // their whole OAuth status — including expiry/invalid warnings that these
-    // non-refreshable accounts most need surfaced. Track the alert states so the
-    // warning shows regardless of the refresh control.
+    // Non-refreshable session credentials have no refresh control, so the
+    // desktop row hid their whole OAuth status — including expiry/invalid
+    // warnings that these non-refreshable accounts most need surfaced. Track
+    // the alert states so the warning shows regardless of the refresh control.
     const oauthStatusIsAlert = Boolean(
       visibleOAuthState
       && (visibleOAuthState.isInvalid
