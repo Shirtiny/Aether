@@ -7,6 +7,7 @@ use super::{
     apply_codex_pool_search_account_profile, apply_codex_pool_stable_client_headers,
 };
 use crate::ai_serving::{
+    apply_openai_responses_stable_prompt_cache_key,
     transport::snapshot::{
         GatewayProviderTransportEndpoint, GatewayProviderTransportKey,
         GatewayProviderTransportProvider,
@@ -145,24 +146,48 @@ fn strips_store_for_compact_even_when_body_rules_handle_it() {
 }
 
 #[test]
-fn injects_stable_prompt_cache_key_for_codex_requests() {
-    let mut body = json!({
+fn codex_requests_use_content_cohorts_instead_of_aether_api_key_identity() {
+    let body = json!({
         "model": "gpt-5",
         "input": "hello",
     });
+    let mut body_a = body.clone();
+    let mut body_b = body;
 
     apply_codex_openai_responses_special_body_edits(
-        &mut body,
+        &mut body_a,
         "codex",
         "openai:responses",
         None,
-        Some("key-123"),
+        Some("aether-user-a"),
     );
+    apply_codex_openai_responses_special_body_edits(
+        &mut body_b,
+        "codex",
+        "openai:responses",
+        None,
+        Some("aether-user-b"),
+    );
+    assert!(body_a.get("prompt_cache_key").is_none());
+    assert!(body_b.get("prompt_cache_key").is_none());
 
-    assert_eq!(
-        body["prompt_cache_key"],
-        "53363264-dbb0-5f9d-b9c7-3e92c45c5bdf"
-    );
+    assert!(apply_openai_responses_stable_prompt_cache_key(
+        &mut body_a,
+        "openai:responses",
+        None,
+        None,
+        None,
+    )
+    .is_some());
+    assert!(apply_openai_responses_stable_prompt_cache_key(
+        &mut body_b,
+        "openai:responses",
+        None,
+        None,
+        None,
+    )
+    .is_some());
+    assert_eq!(body_a["prompt_cache_key"], body_b["prompt_cache_key"]);
 }
 
 #[test]

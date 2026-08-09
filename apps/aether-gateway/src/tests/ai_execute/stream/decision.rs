@@ -884,15 +884,15 @@ async fn gateway_executes_openai_chat_stream_via_local_openai_responses_cross_fo
     );
     assert_eq!(
         seen_execution_runtime_request.prompt_cache_key,
-        "bc749eb7-a9e2-5793-8d14-abd659c700b0"
+        "e6f694b0-4805-5a82-8e4f-a775530c5626"
     );
     assert_eq!(
         seen_execution_runtime_request.session_id,
-        "d1e9b802644e1f52"
+        "9a36b9d316f36996"
     );
     assert_eq!(
         seen_execution_runtime_request.conversation_id,
-        "d1e9b802644e1f52"
+        "9a36b9d316f36996"
     );
     assert_eq!(
         seen_execution_runtime_request.instructions,

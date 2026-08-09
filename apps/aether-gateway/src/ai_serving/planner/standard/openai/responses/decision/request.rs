@@ -27,6 +27,7 @@ use crate::ai_serving::planner::standard::{
     apply_codex_openai_responses_special_headers,
     apply_codex_pool_concrete_account_profile_for_api_format,
     apply_codex_pool_search_account_profile, apply_deepseek_tool_call_thinking_compat,
+    apply_openai_responses_stable_prompt_cache_key,
     build_cross_format_openai_responses_request_body,
     build_cross_format_openai_responses_upstream_url, build_local_openai_responses_request_body,
     build_local_openai_responses_upstream_url, request_body_build_failure_extra_data,
@@ -540,7 +541,7 @@ pub(crate) async fn resolve_local_openai_responses_candidate_payload_parts(
             } else {
                 transport.endpoint.body_rules.as_ref()
             },
-            Some(input.auth_context.api_key_id.as_str()),
+            None,
             effective_headers,
             enable_model_directives,
         )
@@ -557,7 +558,7 @@ pub(crate) async fn resolve_local_openai_responses_candidate_payload_parts(
             } else {
                 transport.endpoint.body_rules.as_ref()
             },
-            Some(input.auth_context.api_key_id.as_str()),
+            None,
             effective_headers,
             enable_model_directives,
         )
@@ -737,6 +738,34 @@ pub(crate) async fn resolve_local_openai_responses_candidate_payload_parts(
             redaction.redacted,
         )
         .await);
+    }
+
+    let injected_prompt_cache_key_source = if is_antigravity {
+        None
+    } else {
+        apply_openai_responses_stable_prompt_cache_key(
+            &mut provider_request_body,
+            provider_api_format,
+            transport.endpoint.body_rules.as_ref(),
+            input
+                .client_session_affinity
+                .as_ref()
+                .and_then(|affinity| affinity.session_key.as_deref()),
+            Some(body_json),
+        )
+    };
+    if let Some(cohort_source) = injected_prompt_cache_key_source {
+        debug!(
+            event_name = "openai_responses_stable_prompt_cache_key_injected",
+            log_type = "debug",
+            trace_id = %trace_id,
+            candidate_id = %candidate_id,
+            provider_id = %candidate.provider_id,
+            endpoint_id = %candidate.endpoint_id,
+            provider_api_format = %provider_api_format,
+            cohort_source = cohort_source.as_str(),
+            "gateway injected a stable Responses prompt cache key"
+        );
     }
 
     let Some(upstream_url) = (if needs_bidirectional_conversion {
@@ -1074,9 +1103,7 @@ async fn resolve_local_openai_search_candidate_payload_parts(
 /// 上游是官方 Codex（base 为 `.../backend-api/codex`）还是转发同一协议的中转
 /// （base 为 `{host}/v1`）由端点 base_url 决定，两者请求体与鉴权方式一致，
 /// 因此这里不再按 provider_type 收窄。
-fn openai_search_candidate_contract_skip_reason(
-    provider_api_format: &str,
-) -> Option<&'static str> {
+fn openai_search_candidate_contract_skip_reason(provider_api_format: &str) -> Option<&'static str> {
     if !crate::ai_serving::normalize_api_format_alias(provider_api_format)
         .eq_ignore_ascii_case("openai:search")
     {
@@ -2203,6 +2230,88 @@ mod tests {
         }
 
         assert!(openai_search_body_requires_bound_affinity(&nested));
+    }
+
+    #[test]
+    fn normalized_responses_wire_body_gets_a_content_cache_cohort() {
+        let source = json!({
+            "model": "gpt-5.6-terra",
+            "instructions": "You are Codex.",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "inspect the workspace"}]
+            }],
+            "stream": true
+        });
+        let mut provider_body = build_local_openai_responses_request_body(
+            &source,
+            "gpt-5.6-terra",
+            true,
+            false,
+            "codex",
+            "openai:responses",
+            None,
+            None,
+            &http::HeaderMap::new(),
+            false,
+        )
+        .expect("provider body should normalize");
+
+        assert_eq!(
+            apply_openai_responses_stable_prompt_cache_key(
+                &mut provider_body,
+                "openai:responses",
+                None,
+                None,
+                Some(&source),
+            )
+            .map(|source| source.as_str()),
+            Some("content_prefix")
+        );
+        assert!(provider_body["prompt_cache_key"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()));
+    }
+
+    #[test]
+    fn normalized_responses_continuation_does_not_infer_a_root_cache_cohort() {
+        let source = json!({
+            "model": "gpt-5.6-terra",
+            "previous_response_id": "resp_previous",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "continue"}]
+            }],
+            "stream": true
+        });
+        let mut provider_body = build_local_openai_responses_request_body(
+            &source,
+            "gpt-5.6-terra",
+            true,
+            false,
+            "codex",
+            "openai:responses",
+            None,
+            None,
+            &http::HeaderMap::new(),
+            false,
+        )
+        .expect("provider body should normalize");
+        assert!(provider_body.get("previous_response_id").is_none());
+
+        assert_eq!(
+            apply_openai_responses_stable_prompt_cache_key(
+                &mut provider_body,
+                "openai:responses",
+                None,
+                None,
+                Some(&source),
+            ),
+            None
+        );
+        assert!(provider_body.get("prompt_cache_key").is_none());
     }
 
     #[test]

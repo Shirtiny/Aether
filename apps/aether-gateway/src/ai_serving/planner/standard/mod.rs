@@ -55,10 +55,10 @@ pub(crate) use self::openai::{
 };
 pub(crate) use crate::ai_serving::normalize_standard_request_to_openai_chat_request;
 pub(crate) use crate::ai_serving::{
-    build_core_error_body_for_client_format, request_conversion_kind,
-    request_conversion_transport_supported, sync_chat_response_conversion_kind,
-    sync_cli_response_conversion_kind, RequestConversionKind, SyncChatResponseConversionKind,
-    SyncCliResponseConversionKind,
+    apply_openai_responses_stable_prompt_cache_key, build_core_error_body_for_client_format,
+    request_conversion_kind, request_conversion_transport_supported,
+    sync_chat_response_conversion_kind, sync_cli_response_conversion_kind, RequestConversionKind,
+    SyncChatResponseConversionKind, SyncCliResponseConversionKind,
 };
 pub(crate) use crate::ai_serving::{
     build_standard_request_body, build_standard_request_body_with_model_directives,

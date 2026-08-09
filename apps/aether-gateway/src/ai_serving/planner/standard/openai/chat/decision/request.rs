@@ -23,9 +23,10 @@ use crate::ai_serving::planner::redaction::{
 use crate::ai_serving::planner::standard::{
     apply_codex_openai_responses_special_body_edits, apply_codex_openai_responses_special_headers,
     apply_codex_pool_concrete_account_profile_for_api_format,
-    apply_deepseek_tool_call_thinking_compat, build_cross_format_openai_chat_request_body,
-    build_cross_format_openai_chat_upstream_url, build_local_openai_chat_request_body,
-    build_local_openai_chat_upstream_url, request_body_build_failure_extra_data,
+    apply_deepseek_tool_call_thinking_compat, apply_openai_responses_stable_prompt_cache_key,
+    build_cross_format_openai_chat_request_body, build_cross_format_openai_chat_upstream_url,
+    build_local_openai_chat_request_body, build_local_openai_chat_upstream_url,
+    request_body_build_failure_extra_data,
 };
 use crate::ai_serving::transport::auth::resolve_local_openai_bearer_auth;
 use crate::ai_serving::transport::kiro::{
@@ -468,7 +469,7 @@ pub(crate) async fn resolve_local_openai_chat_candidate_payload_parts(
         } else {
             transport.endpoint.body_rules.as_ref()
         },
-        Some(input.auth_context.api_key_id.as_str()),
+        None,
         effective_headers,
         enable_model_directives,
     ) else {
@@ -569,6 +570,31 @@ pub(crate) async fn resolve_local_openai_chat_candidate_payload_parts(
             redaction.redacted,
         )
         .await);
+    }
+
+    // Derive the cache cohort only after every private-envelope transport has
+    // returned, so this always operates on the actual upstream wire body.
+    if let Some(cohort_source) = apply_openai_responses_stable_prompt_cache_key(
+        &mut provider_request_body,
+        provider_api_format.as_str(),
+        transport.endpoint.body_rules.as_ref(),
+        input
+            .client_session_affinity
+            .as_ref()
+            .and_then(|affinity| affinity.session_key.as_deref()),
+        Some(body_json),
+    ) {
+        tracing::debug!(
+            event_name = "openai_responses_stable_prompt_cache_key_injected",
+            log_type = "debug",
+            trace_id = %trace_id,
+            candidate_id = %candidate_id,
+            provider_id = %candidate.provider_id,
+            endpoint_id = %candidate.endpoint_id,
+            provider_api_format = %provider_api_format,
+            cohort_source = cohort_source.as_str(),
+            "gateway injected a stable Responses prompt cache key"
+        );
     }
 
     let Some(upstream_url) = build_cross_format_openai_chat_upstream_url(

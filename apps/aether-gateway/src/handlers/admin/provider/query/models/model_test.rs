@@ -2750,6 +2750,13 @@ async fn provider_query_execute_standard_test_candidate(
                 &mut provider_request_body,
                 provider_api_format,
             );
+            let _ = crate::ai_serving::apply_openai_responses_stable_prompt_cache_key(
+                &mut provider_request_body,
+                provider_api_format,
+                transport.endpoint.body_rules.as_ref(),
+                None,
+                Some(&request_body),
+            );
             provider_request_body
         }
         "openai:embedding"

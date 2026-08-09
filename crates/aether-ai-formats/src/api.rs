@@ -159,6 +159,9 @@ pub use crate::formats::{
                 CODEX_OPENAI_IMAGE_DEFAULT_VARIATION_MODEL,
                 CODEX_OPENAI_IMAGE_DEFAULT_VARIATION_PROMPT, CODEX_OPENAI_IMAGE_INTERNAL_MODEL,
             },
+            prompt_cache::{
+                apply_openai_responses_stable_prompt_cache_key, OpenAiResponsesPromptCacheKeySource,
+            },
             spec::{
                 resolve_stream_spec as resolve_openai_responses_stream_spec,
                 resolve_sync_spec as resolve_openai_responses_sync_spec, LocalOpenAiResponsesSpec,

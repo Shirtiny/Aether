@@ -2917,7 +2917,6 @@ mod tests {
             force_body_stream_field: false,
             enable_model_directives: false,
             model_directive_mapping: None,
-            client_api_key_id: String::new(),
             headers: BTreeMap::new(),
             response_headers: BTreeMap::new(),
             account_profile: None,

@@ -162,7 +162,6 @@ pub(crate) struct CodexWsCandidate {
     pub(crate) force_body_stream_field: bool,
     pub(crate) enable_model_directives: bool,
     pub(crate) model_directive_mapping: Option<Arc<serde_json::Value>>,
-    pub(crate) client_api_key_id: String,
     pub(crate) headers: BTreeMap<String, String>,
     pub(crate) response_headers: BTreeMap<String, String>,
     pub(crate) account_profile: Option<Arc<CodexConcreteAccountProfile>>,
@@ -962,13 +961,6 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
             )
             .await
             .map(Arc::new);
-        let client_api_key_id = self
-            .decision
-            .auth_context
-            .as_ref()
-            .map(|auth| auth.api_key_id.clone())
-            .unwrap_or_default();
-
         let key_ids = attempts
             .iter()
             .map(|planned| planned.attempt.plan.key_id.clone())
@@ -1154,7 +1146,6 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
                 force_body_stream_field,
                 enable_model_directives,
                 model_directive_mapping: model_directive_mapping.clone(),
-                client_api_key_id: client_api_key_id.clone(),
                 headers,
                 response_headers: BTreeMap::new(),
                 account_profile,
@@ -1429,7 +1420,6 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
                 let body_rules = candidate.body_rules.clone();
                 let provider_body_patch = Arc::clone(&candidate.provider_body_patch);
                 let model_directive_mapping = candidate.model_directive_mapping.clone();
-                let client_api_key_id = candidate.client_api_key_id.clone();
                 let request_headers = self.request_headers.clone();
                 let account_profile = candidate.account_profile.clone();
                 let force_body_stream_field = candidate.force_body_stream_field;
@@ -1442,7 +1432,6 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
                         &mapped_model,
                         force_body_stream_field,
                         body_rules.as_deref(),
-                        &client_api_key_id,
                         &request_headers,
                         enable_model_directives,
                         model_directive_mapping.as_deref(),
@@ -1462,7 +1451,6 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
                     &candidate.mapped_model,
                     candidate.force_body_stream_field,
                     candidate.body_rules.as_deref(),
-                    &candidate.client_api_key_id,
                     &self.request_headers,
                     candidate.enable_model_directives,
                     candidate.model_directive_mapping.as_deref(),
@@ -2226,13 +2214,19 @@ fn materialize_codex_ws_step_body(
     mapped_model: &str,
     force_body_stream_field: bool,
     body_rules: Option<&serde_json::Value>,
-    client_api_key_id: &str,
     request_headers: &HeaderMap,
     enable_model_directives: bool,
     model_directive_mapping: Option<&serde_json::Value>,
     provider_body_patch: &[RoutingJsonPatchOperation],
     account_profile: Option<&CodexConcreteAccountProfile>,
 ) -> Result<MaterializedCodexWsStepBody, StepPreparationError> {
+    let explicit_session_key =
+        crate::client_session_affinity::client_session_affinity_from_request(
+            request_headers,
+            Some(&body),
+        )
+        .and_then(|affinity| affinity.session_key);
+
     // The shared Codex HTTP normalizer strips previous_response_id because
     // HTTP requests are self-contained. Native Responses WebSocket follow-up
     // steps are different: custom/function tool outputs are resolved against
@@ -2249,7 +2243,7 @@ fn materialize_codex_ws_step_body(
         "codex",
         "openai:responses",
         body_rules,
-        Some(client_api_key_id),
+        None,
         request_headers,
         enable_model_directives,
     )
@@ -2280,6 +2274,13 @@ fn materialize_codex_ws_step_body(
             serde_json::Value::String(previous_response_id),
         );
     }
+    let _ = crate::ai_serving::apply_openai_responses_stable_prompt_cache_key(
+        &mut body,
+        "openai:responses",
+        body_rules,
+        explicit_session_key.as_deref(),
+        None,
+    );
     let body_text = serde_json::to_string(&body)
         .map_err(|_| StepPreparationError::retain("account_profile_materialization_failed"))?;
     if body_text.len() > super::protocol::MAX_PUBLIC_CLIENT_PAYLOAD_BYTES {
@@ -2641,6 +2642,36 @@ mod tests {
     }
 
     #[test]
+    fn materialized_initial_step_uses_a_content_cache_cohort_without_session_identity() {
+        let body = json!({
+            "type": "response.create",
+            "model": "gpt-5.6-terra",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "inspect the workspace"}]
+            }]
+        });
+
+        let materialized = materialize_codex_ws_step_body(
+            body,
+            "gpt-5.6-terra",
+            false,
+            None,
+            &HeaderMap::new(),
+            false,
+            None,
+            &[],
+            None,
+        )
+        .expect("initial body should materialize");
+
+        assert!(materialized.json["prompt_cache_key"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()));
+    }
+
+    #[test]
     fn materialized_follow_up_preserves_previous_response_for_custom_tool_output() {
         let body = json!({
             "type": "response.create",
@@ -2658,7 +2689,6 @@ mod tests {
             "gpt-5.6-terra",
             false,
             None,
-            "client-key-1",
             &HeaderMap::new(),
             false,
             None,
@@ -2673,6 +2703,7 @@ mod tests {
             "custom_tool_call_output"
         );
         assert_eq!(materialized.json["input"][0]["call_id"], "call-1");
+        assert!(materialized.json.get("prompt_cache_key").is_none());
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&materialized.text)
                 .expect("materialized text should be JSON"),

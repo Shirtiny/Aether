@@ -211,10 +211,6 @@ fn build_stable_codex_prompt_cache_key_from_seed(kind: &str, seed: &str) -> Opti
     Some(Uuid::from_bytes(bytes).to_string())
 }
 
-fn build_stable_codex_prompt_cache_key(user_api_key_id: &str) -> Option<String> {
-    build_stable_codex_prompt_cache_key_from_seed("user", user_api_key_id)
-}
-
 fn extract_codex_prompt_cache_session_seed(provider_request_body: &Value) -> Option<String> {
     fn non_empty_str(value: Option<&Value>) -> Option<&str> {
         value
@@ -330,39 +326,6 @@ fn compact_prompt_cache_anchor(value: &Value) -> Value {
     }
 }
 
-fn compact_prompt_cache_json_anchor(value: &Value) -> Value {
-    match value {
-        Value::String(text) => compact_prompt_cache_text(text).unwrap_or(Value::Null),
-        Value::Array(items) => Value::Array(
-            items
-                .iter()
-                .take(16)
-                .map(compact_prompt_cache_json_anchor)
-                .filter(|value| !value.is_null())
-                .collect(),
-        ),
-        Value::Object(object) => {
-            let mut compacted = serde_json::Map::new();
-            let mut keys = object.keys().collect::<Vec<_>>();
-            keys.sort();
-            for key in keys {
-                if key == "cache_control" {
-                    continue;
-                }
-                let Some(value) = object.get(key) else {
-                    continue;
-                };
-                let value = compact_prompt_cache_json_anchor(value);
-                if !value.is_null() {
-                    compacted.insert(key.clone(), value);
-                }
-            }
-            Value::Object(compacted)
-        }
-        Value::Null | Value::Bool(_) | Value::Number(_) => value.clone(),
-    }
-}
-
 fn collect_codex_prompt_cache_control_anchors(value: &Value, anchors: &mut Vec<Value>) {
     const MAX_PROMPT_CACHE_CONTROL_ANCHORS: usize = 16;
     if anchors.len() >= MAX_PROMPT_CACHE_CONTROL_ANCHORS {
@@ -427,65 +390,6 @@ fn extract_codex_prompt_cache_control_seed(provider_request_body: &Value) -> Opt
         "anchors": anchors,
     });
     stable_json_digest(&seed).map(|digest| format!("cache_control:{digest}"))
-}
-
-fn first_responses_input_anchor(input: &Value) -> Option<Value> {
-    let items = input.as_array()?;
-    let first_user_message = items.iter().find(|item| {
-        item.get("type")
-            .and_then(Value::as_str)
-            .is_some_and(|value| value == "message")
-            && item
-                .get("role")
-                .and_then(Value::as_str)
-                .is_some_and(|value| value == "user")
-    });
-    let first_item = first_user_message.or_else(|| items.first())?;
-    let anchor = compact_prompt_cache_anchor(first_item);
-    (!anchor.is_null()).then_some(anchor)
-}
-
-fn extract_codex_stable_request_prompt_cache_seed(
-    provider_request_body: &Value,
-    user_api_key_id: Option<&str>,
-) -> Option<String> {
-    let object = provider_request_body.as_object()?;
-    let mut seed = serde_json::Map::new();
-
-    for key in [
-        "model",
-        "instructions",
-        "reasoning",
-        "tools",
-        "tool_choice",
-        "parallel_tool_calls",
-    ] {
-        if let Some(value) = object.get(key).filter(|value| !value.is_null()) {
-            let value = if key == "tools" {
-                compact_prompt_cache_json_anchor(value)
-            } else {
-                compact_prompt_cache_anchor(value)
-            };
-            seed.insert(key.to_string(), value);
-        }
-    }
-    if let Some(input_anchor) = object.get("input").and_then(first_responses_input_anchor) {
-        seed.insert("first_input".to_string(), input_anchor);
-    }
-    if let Some(user_api_key_id) = user_api_key_id
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        seed.insert(
-            "api_key_id".to_string(),
-            Value::String(user_api_key_id.to_string()),
-        );
-    }
-
-    if seed.len() < 2 {
-        return None;
-    }
-    stable_json_digest(&Value::Object(seed)).map(|digest| format!("stable_request:{digest}"))
 }
 
 fn build_short_codex_header_id(seed: &str) -> Option<String> {
@@ -591,7 +495,6 @@ fn codex_prompt_cache_key_to_insert(
     provider_request_body: &Value,
     provider_type: &str,
     provider_api_format: &str,
-    user_api_key_id: Option<&str>,
 ) -> Option<String> {
     if !is_codex_openai_responses_request(provider_type, provider_api_format) {
         return None;
@@ -612,11 +515,6 @@ fn codex_prompt_cache_key_to_insert(
             extract_codex_prompt_cache_control_seed(provider_request_body)
                 .and_then(|seed| build_stable_codex_prompt_cache_key_from_seed("anchor", &seed))
         })
-        .or_else(|| {
-            extract_codex_stable_request_prompt_cache_seed(provider_request_body, user_api_key_id)
-                .and_then(|seed| build_stable_codex_prompt_cache_key_from_seed("request", &seed))
-        })
-        .or_else(|| user_api_key_id.and_then(build_stable_codex_prompt_cache_key))
 }
 
 fn insert_codex_prompt_cache_key(
@@ -829,18 +727,14 @@ pub fn apply_codex_openai_responses_special_body_edits(
     provider_type: &str,
     provider_api_format: &str,
     body_rules: Option<&Value>,
-    user_api_key_id: Option<&str>,
+    _user_api_key_id: Option<&str>,
 ) {
     if !is_codex_openai_responses_request(provider_type, provider_api_format) {
         return;
     }
 
-    let prompt_cache_key = codex_prompt_cache_key_to_insert(
-        provider_request_body,
-        provider_type,
-        provider_api_format,
-        user_api_key_id,
-    );
+    let prompt_cache_key =
+        codex_prompt_cache_key_to_insert(provider_request_body, provider_type, provider_api_format);
 
     let Some(body_object) = provider_request_body.as_object_mut() else {
         return;
@@ -1533,16 +1427,12 @@ mod tests {
     }
 
     #[test]
-    fn codex_responses_body_edits_derive_prompt_cache_key_from_stable_request_anchor() {
-        let mut body_a = json!({
+    fn codex_responses_body_edits_do_not_use_api_key_as_cache_identity() {
+        let body = json!({
             "input": [{
                 "type": "message",
                 "role": "user",
                 "content": [{"type": "input_text", "text": "open workspace"}]
-            }, {
-                "type": "message",
-                "role": "user",
-                "content": [{"type": "input_text", "text": "new turn A"}]
             }],
             "model": "gpt-5.4",
             "instructions": "Be concise.",
@@ -1553,61 +1443,26 @@ mod tests {
             }],
             "reasoning": {"effort": "medium"}
         });
-        let mut body_b = json!({
-            "input": [{
-                "type": "message",
-                "role": "user",
-                "content": [{"type": "input_text", "text": "open workspace"}]
-            }, {
-                "type": "message",
-                "role": "user",
-                "content": [{"type": "input_text", "text": "new turn B"}]
-            }],
-            "model": "gpt-5.4",
-            "instructions": "Be concise.",
-            "tools": [{
-                "type": "function",
-                "name": "shell",
-                "parameters": {"type": "object", "properties": {}}
-            }],
-            "reasoning": {"effort": "medium"}
-        });
-        let mut body_c = json!({
-            "input": [{
-                "type": "message",
-                "role": "user",
-                "content": [{"type": "input_text", "text": "open another workspace"}]
-            }],
-            "model": "gpt-5.4",
-            "instructions": "Be concise.",
-            "tools": [{"type": "function", "name": "shell"}],
-            "reasoning": {"effort": "medium"}
-        });
+        let mut body_a = body.clone();
+        let mut body_b = body;
 
         apply_codex_openai_responses_special_body_edits(
             &mut body_a,
             "codex",
             "openai:responses",
             None,
-            Some("key-a"),
+            Some("aether-user-a"),
         );
         apply_codex_openai_responses_special_body_edits(
             &mut body_b,
             "codex",
             "openai:responses",
             None,
-            Some("key-a"),
-        );
-        apply_codex_openai_responses_special_body_edits(
-            &mut body_c,
-            "codex",
-            "openai:responses",
-            None,
-            Some("key-a"),
+            Some("aether-user-b"),
         );
 
-        assert_eq!(body_a["prompt_cache_key"], body_b["prompt_cache_key"]);
-        assert_ne!(body_a["prompt_cache_key"], body_c["prompt_cache_key"]);
+        assert!(body_a.get("prompt_cache_key").is_none());
+        assert!(body_b.get("prompt_cache_key").is_none());
     }
 
     #[test]

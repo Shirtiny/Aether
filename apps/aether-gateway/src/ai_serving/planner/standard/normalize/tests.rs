@@ -233,11 +233,11 @@ fn local_openai_responses_wrapper_preserves_body_order_after_edits() {
             "tool_choice",
             "parallel_tool_calls",
             "instructions",
-            "prompt_cache_key",
         ]
     );
     assert_eq!(provider_request_body["parallel_tool_calls"], json!(true));
     assert_eq!(provider_request_body["instructions"], json!(""));
+    assert!(provider_request_body.get("prompt_cache_key").is_none());
 }
 
 #[test]
@@ -294,10 +294,7 @@ fn local_openai_responses_compact_wrapper_strips_include_for_codex_requests() {
     assert!(provider_request_body.get("store").is_none());
     assert!(provider_request_body.get("stream").is_none());
     assert_eq!(provider_request_body["instructions"], "");
-    assert_eq!(
-        provider_request_body["prompt_cache_key"],
-        "3d2e2842-74cb-55dd-803a-b8940b3500c2"
-    );
+    assert!(provider_request_body.get("prompt_cache_key").is_none());
 }
 
 #[test]
@@ -532,7 +529,7 @@ fn applies_codex_defaults_unless_body_rules_handle_the_field() {
 }
 
 #[test]
-fn injects_codex_prompt_cache_key_for_openai_responses_cross_format_requests() {
+fn responses_normalization_does_not_use_api_key_as_prompt_cache_identity() {
     let body_json = json!({
         "model": "claude-sonnet-4-5",
         "messages": [{
@@ -556,14 +553,11 @@ fn injects_codex_prompt_cache_key_for_openai_responses_cross_format_requests() {
     )
     .expect("claude cli to codex request should build");
 
-    assert_eq!(
-        provider_request_body["prompt_cache_key"],
-        "4ee6ea6e-3ac6-5a18-8cb8-1f8b956419e5"
-    );
+    assert!(provider_request_body.get("prompt_cache_key").is_none());
 }
 
 #[test]
-fn injects_codex_prompt_cache_key_for_openai_chat_cross_format_requests() {
+fn chat_normalization_does_not_use_api_key_as_prompt_cache_identity() {
     let body_json = json!({
         "model": "gpt-5",
         "messages": [{
@@ -586,8 +580,5 @@ fn injects_codex_prompt_cache_key_for_openai_chat_cross_format_requests() {
     )
     .expect("openai chat to codex request should build");
 
-    assert_eq!(
-        provider_request_body["prompt_cache_key"],
-        "4ee6ea6e-3ac6-5a18-8cb8-1f8b956419e5"
-    );
+    assert!(provider_request_body.get("prompt_cache_key").is_none());
 }
