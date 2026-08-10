@@ -1,23 +1,26 @@
+use std::{collections::BTreeMap, time::Duration};
+
 use chrono::{TimeZone, Utc};
 use serde_json::{json, Value};
 use sqlx::{Postgres, QueryBuilder};
 
 use super::{
-    attach_candidate_client_session_affinity_metadata, attach_compressed_body_refs,
-    attach_usage_http_audit_body_refs, attach_usage_routing_snapshot_metadata,
-    attach_usage_settlement_pricing_snapshot_metadata, attach_ws_session_prompt_capture_metadata,
-    inflate_usage_json_value, prepare_prompt_capture_metadata,
-    prepare_request_metadata_for_body_storage, prepare_usage_body_storage,
-    resolved_read_usage_body_ref, resolved_write_usage_body_ref,
-    split_dashboard_daily_aggregate_range, split_dashboard_hourly_aggregate_range, usage_body_ref,
-    usage_http_audit_body_refs, usage_http_audit_capture_mode, usage_metadata_has_prompt_capture,
-    usage_metadata_is_ws_step, usage_routing_snapshot_from_usage,
-    usage_settlement_pricing_snapshot_from_usage, AggregateRangeSplit, SqlxUsageReadRepository,
-    UsageHttpAuditRefs, UsagePromptCaptureEntry, UsageRoutingSnapshot,
-    UsageSettlementPricingSnapshot, WsPromptCaptureScope, COUNT_USAGE_AUDITS_WITH_CANDIDATE_PREFIX,
-    FIND_WS_CONNECTION_PROMPT_CAPTURE_SQL, FIND_WS_PROMPT_CAPTURE_SCOPE_SQL,
-    FIND_WS_SESSION_PROMPT_CAPTURE_SQL, FIND_WS_USAGE_SESSION_PROMPT_CAPTURE_SQL,
-    MAX_INLINE_USAGE_BODY_BYTES,
+    aggregate_usage_prompt_capture_entries, attach_candidate_client_session_affinity_metadata,
+    attach_compressed_body_refs, attach_usage_http_audit_body_refs,
+    attach_usage_routing_snapshot_metadata, attach_usage_settlement_pricing_snapshot_metadata,
+    attach_ws_session_prompt_capture_metadata, inflate_usage_json_value,
+    prepare_prompt_capture_metadata, prepare_request_metadata_for_body_storage,
+    prepare_usage_body_storage, resolved_read_usage_body_ref, resolved_write_usage_body_ref,
+    split_dashboard_daily_aggregate_range, split_dashboard_hourly_aggregate_range,
+    sync_usage_prompt_capture_entries, usage_body_ref, usage_http_audit_body_refs,
+    usage_http_audit_capture_mode, usage_metadata_has_prompt_capture, usage_metadata_is_ws_step,
+    usage_routing_snapshot_from_usage, usage_settlement_pricing_snapshot_from_usage,
+    AggregateRangeSplit, SqlxUsageReadRepository, UsageHttpAuditRefs, UsagePromptCaptureEntry,
+    UsageRoutingSnapshot, UsageSettlementPricingSnapshot, WsPromptCaptureScope,
+    COUNT_USAGE_AUDITS_WITH_CANDIDATE_PREFIX, FIND_WS_CONNECTION_PROMPT_CAPTURE_SQL,
+    FIND_WS_PROMPT_CAPTURE_SCOPE_SQL, FIND_WS_SESSION_PROMPT_CAPTURE_SQL,
+    FIND_WS_USAGE_SESSION_PROMPT_CAPTURE_SQL, MAX_INLINE_USAGE_BODY_BYTES,
+    UPSERT_USAGE_PROMPT_CAPTURE_ENTRIES_SQL,
 };
 use crate::driver::postgres::{PostgresPoolConfig, PostgresPoolFactory};
 use crate::repository::usage::UpsertUsageRecord;
@@ -1298,6 +1301,408 @@ fn prepare_prompt_capture_metadata_handles_large_sanitized_prompt_capture() {
         .expect("hash refs should remain");
     assert_eq!(refs.len(), 32);
     assert!(refs.iter().all(|item| item.get("preview").is_none()));
+}
+
+#[test]
+fn aggregate_prompt_capture_entries_matches_sequential_reference_at_supported_boundaries() {
+    for seed in 0..8usize {
+        for size in [0usize, 1, 32, 256] {
+            let entries = (0..size)
+                .map(|index| {
+                    let hash_index = (index.wrapping_mul(17).wrapping_add(seed)) % 11;
+                    let preview = match (index + seed) % 4 {
+                        0 => "😀".repeat((index % 5) + 1),
+                        1 => "x".repeat((index % 9) + 1),
+                        2 => format!("equal-{}", index % 3),
+                        _ => format!("preview-{seed}-{index}"),
+                    };
+                    UsagePromptCaptureEntry {
+                        sha256: format!("{hash_index:064x}"),
+                        role: match (index + seed) % 3 {
+                            0 => "system",
+                            1 => "user",
+                            _ => "unknown",
+                        }
+                        .to_string(),
+                        chars: i32::try_from((index * 13 + seed) % 97)
+                            .expect("test chars should fit i32"),
+                        preview,
+                        truncated: (index + seed) % 7 == 0,
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            let actual = aggregate_usage_prompt_capture_entries(&entries)
+                .expect("valid prompt capture entries should aggregate")
+                .into_iter()
+                .map(|entry| (entry.entry, entry.seen_count))
+                .collect::<Vec<_>>();
+            let expected = sequential_prompt_capture_reference(&entries);
+
+            assert_eq!(actual, expected, "seed={seed}, size={size}");
+        }
+    }
+}
+
+fn sequential_prompt_capture_reference(
+    entries: &[UsagePromptCaptureEntry],
+) -> Vec<(UsagePromptCaptureEntry, i64)> {
+    let mut rows = BTreeMap::<String, (UsagePromptCaptureEntry, i64)>::new();
+    for entry in entries {
+        match rows.get_mut(&entry.sha256) {
+            Some((stored, seen_count)) => {
+                if !entry.role.is_empty() {
+                    stored.role.clone_from(&entry.role);
+                }
+                stored.chars = stored.chars.max(entry.chars);
+                if stored.preview.chars().count() < entry.preview.chars().count() {
+                    stored.preview.clone_from(&entry.preview);
+                }
+                stored.truncated |= entry.truncated;
+                *seen_count += 1;
+            }
+            None => {
+                rows.insert(entry.sha256.clone(), (entry.clone(), 1));
+            }
+        }
+    }
+    rows.into_values().collect()
+}
+
+#[test]
+fn aggregate_prompt_capture_entries_preserves_sequential_upsert_semantics() {
+    let sha_a = "a".repeat(64);
+    let sha_b = "b".repeat(64);
+    let entries = vec![
+        UsagePromptCaptureEntry {
+            sha256: sha_b.clone(),
+            role: "system".to_string(),
+            chars: 10,
+            preview: "😀😀😀".to_string(),
+            truncated: false,
+        },
+        UsagePromptCaptureEntry {
+            sha256: sha_a.clone(),
+            role: "user".to_string(),
+            chars: 5,
+            preview: "first".to_string(),
+            truncated: false,
+        },
+        UsagePromptCaptureEntry {
+            sha256: sha_b.clone(),
+            role: "unknown".to_string(),
+            chars: 20,
+            preview: "abcd".to_string(),
+            truncated: true,
+        },
+        UsagePromptCaptureEntry {
+            sha256: sha_b.clone(),
+            role: String::new(),
+            chars: 15,
+            preview: "wxyz".to_string(),
+            truncated: false,
+        },
+    ];
+
+    let aggregated = aggregate_usage_prompt_capture_entries(&entries)
+        .expect("valid prompt capture entries should aggregate");
+
+    assert_eq!(aggregated.len(), 2);
+    assert_eq!(aggregated[0].entry.sha256, sha_a);
+    assert_eq!(aggregated[1].entry.sha256, sha_b);
+    assert_eq!(aggregated[1].entry.role, "unknown");
+    assert_eq!(aggregated[1].entry.chars, 20);
+    assert_eq!(aggregated[1].entry.preview, "abcd");
+    assert!(aggregated[1].entry.truncated);
+    assert_eq!(aggregated[1].seen_count, 3);
+}
+
+#[test]
+fn prepare_prompt_capture_metadata_keeps_duplicate_refs_when_entries_are_batched() {
+    let sha = "c".repeat(64);
+    let (metadata, entries) = prepare_prompt_capture_metadata(Some(json!({
+        "prompt_capture": {
+            "items": [
+                {
+                    "source": "request",
+                    "role": "system",
+                    "sha256": sha,
+                    "chars": 8,
+                    "preview": "original",
+                    "truncated": false
+                },
+                {
+                    "source": "provider_request",
+                    "role": "user",
+                    "sha256": sha,
+                    "chars": 12,
+                    "preview": "transformed",
+                    "truncated": true
+                }
+            ]
+        }
+    })));
+
+    let refs = metadata
+        .as_ref()
+        .and_then(|value| value.pointer("/prompt_capture/items"))
+        .and_then(Value::as_array)
+        .expect("prompt capture refs should remain");
+    assert_eq!(refs.len(), 2);
+    assert_eq!(refs[0].get("source"), Some(&json!("request")));
+    assert_eq!(refs[1].get("source"), Some(&json!("provider_request")));
+
+    let aggregated = aggregate_usage_prompt_capture_entries(&entries)
+        .expect("valid prompt capture entries should aggregate");
+    assert_eq!(aggregated.len(), 1);
+    assert_eq!(aggregated[0].seen_count, 2);
+}
+
+#[test]
+fn aggregate_prompt_capture_entries_rejects_invalid_values_before_deduplication() {
+    let sha = "d".repeat(64);
+    let valid = UsagePromptCaptureEntry {
+        sha256: sha.clone(),
+        role: "user".to_string(),
+        chars: 12,
+        preview: "longer valid preview".to_string(),
+        truncated: false,
+    };
+    let invalid_role = UsagePromptCaptureEntry {
+        sha256: sha.clone(),
+        role: "r".repeat(33),
+        chars: 1,
+        preview: "short".to_string(),
+        truncated: false,
+    };
+    assert!(matches!(
+        aggregate_usage_prompt_capture_entries(&[invalid_role, valid.clone()]),
+        Err(crate::DataLayerError::InvalidInput(_))
+    ));
+
+    let invalid_preview = UsagePromptCaptureEntry {
+        sha256: sha,
+        role: "system".to_string(),
+        chars: 1,
+        preview: "bad\0preview".to_string(),
+        truncated: false,
+    };
+    assert!(matches!(
+        aggregate_usage_prompt_capture_entries(&[invalid_preview, valid]),
+        Err(crate::DataLayerError::InvalidInput(_))
+    ));
+}
+
+#[test]
+fn prompt_capture_batch_upsert_uses_fixed_shape_arrays() {
+    assert!(UPSERT_USAGE_PROMPT_CAPTURE_ENTRIES_SQL.contains("FROM UNNEST("));
+    assert!(UPSERT_USAGE_PROMPT_CAPTURE_ENTRIES_SQL.contains("$6::BIGINT[]"));
+    assert!(UPSERT_USAGE_PROMPT_CAPTURE_ENTRIES_SQL.contains("ORDER BY incoming.sha256"));
+    assert!(UPSERT_USAGE_PROMPT_CAPTURE_ENTRIES_SQL
+        .contains("seen_count = stored.seen_count + EXCLUDED.seen_count"));
+}
+
+#[tokio::test]
+async fn prompt_capture_batch_upsert_executes_when_postgres_url_is_set() {
+    let Some(database_url) = std::env::var("AETHER_TEST_POSTGRES_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        eprintln!(
+            "skipping prompt capture batch postgres test because AETHER_TEST_POSTGRES_URL is unset"
+        );
+        return;
+    };
+
+    let pool = sqlx::PgPool::connect(&database_url)
+        .await
+        .expect("postgres test pool should connect");
+    crate::lifecycle::migrate::run_migrations(&pool)
+        .await
+        .expect("postgres migrations should run");
+
+    for size in [0usize, 1, 32, 256] {
+        let prefix = uuid::Uuid::new_v4().simple().to_string();
+        let entries = (0..size)
+            .map(|index| UsagePromptCaptureEntry {
+                sha256: format!("{prefix}{index:032x}"),
+                role: "user".to_string(),
+                chars: i32::try_from(index).expect("test index should fit i32"),
+                preview: format!("preview-{index}"),
+                truncated: index % 2 == 0,
+            })
+            .collect::<Vec<_>>();
+        let hashes = entries
+            .iter()
+            .map(|entry| entry.sha256.clone())
+            .collect::<Vec<_>>();
+        let mut tx = pool
+            .begin()
+            .await
+            .expect("postgres transaction should begin");
+        sync_usage_prompt_capture_entries(&mut tx, &entries)
+            .await
+            .expect("prompt capture batch should execute");
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM usage_prompt_capture_entries WHERE sha256 = ANY($1::TEXT[])",
+        )
+        .bind(&hashes)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("prompt capture batch should be visible in transaction");
+        assert_eq!(
+            count,
+            i64::try_from(size).expect("test size should fit i64")
+        );
+        tx.rollback()
+            .await
+            .expect("prompt capture boundary transaction should roll back");
+        let count_after_rollback: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM usage_prompt_capture_entries WHERE sha256 = ANY($1::TEXT[])",
+        )
+        .bind(&hashes)
+        .fetch_one(&pool)
+        .await
+        .expect("prompt capture rows should be queried after rollback");
+        assert_eq!(count_after_rollback, 0);
+    }
+
+    let sha = format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    );
+    let initial = UsagePromptCaptureEntry {
+        sha256: sha.clone(),
+        role: "system".to_string(),
+        chars: 3,
+        preview: "😀😀😀".to_string(),
+        truncated: false,
+    };
+    let mut conn = pool
+        .acquire()
+        .await
+        .expect("postgres connection should acquire");
+    sync_usage_prompt_capture_entries(&mut conn, &[initial])
+        .await
+        .expect("initial prompt capture should insert");
+    sync_usage_prompt_capture_entries(
+        &mut conn,
+        &[
+            UsagePromptCaptureEntry {
+                sha256: sha.clone(),
+                role: "user".to_string(),
+                chars: 20,
+                preview: "abcd".to_string(),
+                truncated: true,
+            },
+            UsagePromptCaptureEntry {
+                sha256: sha.clone(),
+                role: "unknown".to_string(),
+                chars: 15,
+                preview: "wxyz".to_string(),
+                truncated: false,
+            },
+        ],
+    )
+    .await
+    .expect("existing prompt capture should update");
+    let row: (String, i32, String, bool, i64) = sqlx::query_as(
+        "SELECT role, chars, preview, truncated, seen_count FROM usage_prompt_capture_entries WHERE sha256 = $1",
+    )
+    .bind(&sha)
+    .fetch_one(&mut *conn)
+    .await
+    .expect("updated prompt capture should read");
+    assert_eq!(
+        row,
+        ("unknown".to_string(), 20, "abcd".to_string(), true, 3)
+    );
+
+    let sha_a = format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    );
+    let sha_b = format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    );
+    let left_entries = vec![
+        UsagePromptCaptureEntry {
+            sha256: sha_b.clone(),
+            role: "user".to_string(),
+            chars: 1,
+            preview: "left-b".to_string(),
+            truncated: false,
+        },
+        UsagePromptCaptureEntry {
+            sha256: sha_a.clone(),
+            role: "user".to_string(),
+            chars: 1,
+            preview: "left-a".to_string(),
+            truncated: false,
+        },
+    ];
+    let right_entries = vec![
+        UsagePromptCaptureEntry {
+            sha256: sha_a.clone(),
+            role: "user".to_string(),
+            chars: 2,
+            preview: "right-a".to_string(),
+            truncated: false,
+        },
+        UsagePromptCaptureEntry {
+            sha256: sha_b.clone(),
+            role: "user".to_string(),
+            chars: 2,
+            preview: "right-b".to_string(),
+            truncated: false,
+        },
+    ];
+    let left_pool = pool.clone();
+    let right_pool = pool.clone();
+    tokio::time::timeout(Duration::from_secs(30), async move {
+        tokio::join!(
+            async move {
+                let mut conn = left_pool
+                    .acquire()
+                    .await
+                    .expect("left postgres connection should acquire");
+                sync_usage_prompt_capture_entries(&mut conn, &left_entries)
+                    .await
+                    .expect("left prompt capture batch should execute");
+            },
+            async move {
+                let mut conn = right_pool
+                    .acquire()
+                    .await
+                    .expect("right postgres connection should acquire");
+                sync_usage_prompt_capture_entries(&mut conn, &right_entries)
+                    .await
+                    .expect("right prompt capture batch should execute");
+            }
+        );
+    })
+    .await
+    .expect("overlapping prompt capture batches should not deadlock");
+    let seen_counts = sqlx::query_as::<_, (String, i64)>(
+        "SELECT sha256, seen_count FROM usage_prompt_capture_entries WHERE sha256 = ANY($1::TEXT[]) ORDER BY sha256",
+    )
+    .bind(vec![sha_a.clone(), sha_b.clone()])
+    .fetch_all(&pool)
+    .await
+    .expect("overlapping prompt capture rows should read");
+    let mut expected_seen_counts = vec![(sha_a.clone(), 2), (sha_b.clone(), 2)];
+    expected_seen_counts.sort_by(|left, right| left.0.cmp(&right.0));
+    assert_eq!(seen_counts, expected_seen_counts);
+
+    sqlx::query("DELETE FROM usage_prompt_capture_entries WHERE sha256 = ANY($1::TEXT[])")
+        .bind(vec![sha, sha_a, sha_b])
+        .execute(&pool)
+        .await
+        .expect("prompt capture test rows should clean up");
 }
 
 #[test]

@@ -61,8 +61,8 @@ const MAX_INLINE_USAGE_BODY_BYTES: usize = 0;
 const MAX_SUPPORTED_UNIX_SECS: u64 = 253_402_300_799;
 const FIND_USAGE_BODY_BLOB_BY_REF_SQL: &str =
     r#"SELECT payload_gzip FROM usage_body_blobs WHERE body_ref = $1 LIMIT 1"#;
-const UPSERT_USAGE_PROMPT_CAPTURE_ENTRY_SQL: &str = r#"
-INSERT INTO usage_prompt_capture_entries (
+const UPSERT_USAGE_PROMPT_CAPTURE_ENTRIES_SQL: &str = r#"
+INSERT INTO usage_prompt_capture_entries AS stored (
   sha256,
   role,
   chars,
@@ -71,27 +71,35 @@ INSERT INTO usage_prompt_capture_entries (
   first_seen_at,
   last_seen_at,
   seen_count
-) VALUES (
-  $1,
-  $2,
-  $3,
-  $4,
-  $5,
+) SELECT
+  incoming.sha256,
+  incoming.role,
+  incoming.chars,
+  incoming.preview,
+  incoming.truncated,
   NOW(),
   NOW(),
-  1
-)
+  incoming.seen_count
+FROM UNNEST(
+  $1::TEXT[],
+  $2::TEXT[],
+  $3::INTEGER[],
+  $4::TEXT[],
+  $5::BOOLEAN[],
+  $6::BIGINT[]
+) AS incoming (sha256, role, chars, preview, truncated, seen_count)
+ORDER BY incoming.sha256
 ON CONFLICT (sha256)
 DO UPDATE SET
-  role = COALESCE(NULLIF(EXCLUDED.role, ''), usage_prompt_capture_entries.role),
-  chars = GREATEST(usage_prompt_capture_entries.chars, EXCLUDED.chars),
+  role = COALESCE(NULLIF(EXCLUDED.role, ''), stored.role),
+  chars = GREATEST(stored.chars, EXCLUDED.chars),
   preview = CASE
-    WHEN char_length(usage_prompt_capture_entries.preview) < char_length(EXCLUDED.preview) THEN EXCLUDED.preview
-    ELSE usage_prompt_capture_entries.preview
+    WHEN char_length(stored.preview) < char_length(EXCLUDED.preview) THEN EXCLUDED.preview
+    ELSE stored.preview
   END,
-  truncated = usage_prompt_capture_entries.truncated OR EXCLUDED.truncated,
+  truncated = stored.truncated OR EXCLUDED.truncated,
   last_seen_at = NOW(),
-  seen_count = usage_prompt_capture_entries.seen_count + 1
+  seen_count = stored.seen_count + EXCLUDED.seen_count
 "#;
 const FIND_WS_CONNECTION_PROMPT_CAPTURE_SQL: &str = r#"
 SELECT
@@ -10761,6 +10769,73 @@ struct UsagePromptCaptureEntry {
     truncated: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AggregatedUsagePromptCaptureEntry {
+    entry: UsagePromptCaptureEntry,
+    preview_chars: usize,
+    seen_count: i64,
+}
+
+fn aggregate_usage_prompt_capture_entries(
+    entries: &[UsagePromptCaptureEntry],
+) -> Result<Vec<AggregatedUsagePromptCaptureEntry>, DataLayerError> {
+    let mut aggregated = BTreeMap::<String, AggregatedUsagePromptCaptureEntry>::new();
+    for entry in entries {
+        validate_usage_prompt_capture_entry(entry)?;
+        if let Some(existing) = aggregated.get_mut(&entry.sha256) {
+            if !entry.role.is_empty() {
+                existing.entry.role.clone_from(&entry.role);
+            }
+            existing.entry.chars = existing.entry.chars.max(entry.chars);
+            let preview_chars = entry.preview.chars().count();
+            if existing.preview_chars < preview_chars {
+                existing.entry.preview.clone_from(&entry.preview);
+                existing.preview_chars = preview_chars;
+            }
+            existing.entry.truncated |= entry.truncated;
+            existing.seen_count += 1;
+            continue;
+        }
+
+        aggregated.insert(
+            entry.sha256.clone(),
+            AggregatedUsagePromptCaptureEntry {
+                entry: entry.clone(),
+                preview_chars: entry.preview.chars().count(),
+                seen_count: 1,
+            },
+        );
+    }
+    Ok(aggregated.into_values().collect())
+}
+
+fn validate_usage_prompt_capture_entry(
+    entry: &UsagePromptCaptureEntry,
+) -> Result<(), DataLayerError> {
+    for (field, value) in [
+        ("sha256", entry.sha256.as_str()),
+        ("role", entry.role.as_str()),
+        ("preview", entry.preview.as_str()),
+    ] {
+        if value.contains('\0') {
+            return Err(DataLayerError::InvalidInput(format!(
+                "usage prompt capture {field} contains a NUL character"
+            )));
+        }
+    }
+    if entry.sha256.chars().count() > 64 {
+        return Err(DataLayerError::InvalidInput(
+            "usage prompt capture sha256 exceeds 64 characters".to_string(),
+        ));
+    }
+    if entry.role.chars().count() > 32 {
+        return Err(DataLayerError::InvalidInput(
+            "usage prompt capture role exceeds 32 characters".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn prepare_prompt_capture_metadata(
     metadata: Option<Value>,
 ) -> (Option<Value>, Vec<UsagePromptCaptureEntry>) {
@@ -10861,17 +10936,45 @@ async fn sync_usage_prompt_capture_entries(
     conn: &mut PgConnection,
     entries: &[UsagePromptCaptureEntry],
 ) -> Result<(), DataLayerError> {
-    for entry in entries {
-        sqlx::query(UPSERT_USAGE_PROMPT_CAPTURE_ENTRY_SQL)
-            .bind(&entry.sha256)
-            .bind(&entry.role)
-            .bind(entry.chars)
-            .bind(&entry.preview)
-            .bind(entry.truncated)
-            .execute(&mut *conn)
-            .await
-            .map_postgres_err()?;
+    let entries = aggregate_usage_prompt_capture_entries(entries)?;
+    if entries.is_empty() {
+        return Ok(());
     }
+
+    let mut sha256s = Vec::with_capacity(entries.len());
+    let mut roles = Vec::with_capacity(entries.len());
+    let mut chars = Vec::with_capacity(entries.len());
+    let mut previews = Vec::with_capacity(entries.len());
+    let mut truncated = Vec::with_capacity(entries.len());
+    let mut seen_counts = Vec::with_capacity(entries.len());
+    for entry in entries {
+        sha256s.push(entry.entry.sha256);
+        roles.push(entry.entry.role);
+        chars.push(entry.entry.chars);
+        previews.push(entry.entry.preview);
+        truncated.push(entry.entry.truncated);
+        seen_counts.push(entry.seen_count);
+    }
+    debug_assert!([
+        roles.len(),
+        chars.len(),
+        previews.len(),
+        truncated.len(),
+        seen_counts.len(),
+    ]
+    .into_iter()
+    .all(|len| len == sha256s.len()));
+
+    sqlx::query(UPSERT_USAGE_PROMPT_CAPTURE_ENTRIES_SQL)
+        .bind(&sha256s)
+        .bind(&roles)
+        .bind(&chars)
+        .bind(&previews)
+        .bind(&truncated)
+        .bind(&seen_counts)
+        .execute(&mut *conn)
+        .await
+        .map_postgres_err()?;
     Ok(())
 }
 
