@@ -36,6 +36,13 @@ const LEGACY_REQUEST_LOG_LEVEL_KEY: &str = "request_log_level";
 const MAX_REQUEST_BODY_SIZE_KEY: &str = "max_request_body_size";
 const MAX_RESPONSE_BODY_SIZE_KEY: &str = "max_response_body_size";
 const REQUEST_CAPTURE_POLICY_KEY: &str = "request_capture_policy";
+const BODY_CAPTURE_SYSTEM_CONFIG_KEYS: [&str; 5] = [
+    REQUEST_RECORD_LEVEL_KEY,
+    LEGACY_REQUEST_LOG_LEVEL_KEY,
+    REQUEST_CAPTURE_POLICY_KEY,
+    MAX_REQUEST_BODY_SIZE_KEY,
+    MAX_RESPONSE_BODY_SIZE_KEY,
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RequestCaptureScopeMode {
@@ -433,25 +440,20 @@ impl UsageRuntimeAccess for GatewayDataState {
         &self,
         user_id: Option<&str>,
     ) -> Result<UsageBodyCapturePolicy, DataLayerError> {
-        let value = GatewayDataState::find_system_config_value(self, REQUEST_RECORD_LEVEL_KEY)
-            .await?
-            .or(
-                GatewayDataState::find_system_config_value(self, LEGACY_REQUEST_LOG_LEVEL_KEY)
-                    .await?,
-            );
-        let request_capture_policy =
-            GatewayDataState::find_system_config_value(self, REQUEST_CAPTURE_POLICY_KEY).await?;
-        let max_request_body_size =
-            GatewayDataState::find_system_config_value(self, MAX_REQUEST_BODY_SIZE_KEY).await?;
-        let max_response_body_size =
-            GatewayDataState::find_system_config_value(self, MAX_RESPONSE_BODY_SIZE_KEY).await?;
+        let values =
+            GatewayDataState::find_system_config_values(self, &BODY_CAPTURE_SYSTEM_CONFIG_KEYS)
+                .await?;
+        let value = values
+            .get(REQUEST_RECORD_LEVEL_KEY)
+            .or_else(|| values.get(LEGACY_REQUEST_LOG_LEVEL_KEY));
+        let request_capture_policy = values.get(REQUEST_CAPTURE_POLICY_KEY);
         let policy = request_capture_policy_from_values(
-            request_capture_policy.as_ref(),
-            value.as_ref(),
-            max_request_body_size.as_ref(),
-            max_response_body_size.as_ref(),
+            request_capture_policy,
+            value,
+            values.get(MAX_REQUEST_BODY_SIZE_KEY),
+            values.get(MAX_RESPONSE_BODY_SIZE_KEY),
         );
-        let Some(config_value) = request_capture_policy.as_ref() else {
+        let Some(config_value) = request_capture_policy else {
             return Ok(policy.body);
         };
         if self
@@ -660,6 +662,20 @@ mod tests {
             .expect("legacy request log level should read");
 
         assert_eq!(level, UsageRequestRecordLevel::Basic);
+    }
+
+    #[tokio::test]
+    async fn usage_runtime_access_prefers_request_record_level_over_legacy_alias() {
+        let state = GatewayDataState::disabled().with_system_config_values_for_tests([
+            ("request_record_level".to_string(), json!("full")),
+            ("request_log_level".to_string(), json!("headers")),
+        ]);
+
+        let level = UsageRuntimeAccess::request_record_level(&state)
+            .await
+            .expect("request record level should read");
+
+        assert_eq!(level, UsageRequestRecordLevel::Full);
     }
 
     #[tokio::test]

@@ -280,6 +280,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mysql_system_config_batch_matches_single_lookup_when_url_is_set() {
+        let Some(database_url) = std::env::var("AETHER_TEST_MYSQL_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            eprintln!(
+                "skipping mysql system config batch test because AETHER_TEST_MYSQL_URL is unset"
+            );
+            return;
+        };
+
+        let config = SqlDatabaseConfig {
+            driver: DatabaseDriver::Mysql,
+            url: database_url,
+            pool: SqlPoolConfig {
+                max_connections: 1,
+                ..SqlPoolConfig::default()
+            },
+        };
+        let backend = MysqlBackend::from_config(config).expect("mysql backend should build");
+        run_mysql_migrations(backend.pool())
+            .await
+            .expect("mysql migrations should run");
+
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let requested_key = format!("test.system-config-batch.{suffix}");
+        let stored_key = requested_key.to_ascii_uppercase();
+        let value = serde_json::json!({"mixed_case": true});
+        backend
+            .upsert_system_config_entry(&stored_key, &value, Some("batch contract test"))
+            .await
+            .expect("system config should upsert");
+
+        let single = backend
+            .find_system_config_value(&requested_key)
+            .await
+            .expect("single system config lookup should succeed");
+        let batch = backend
+            .find_system_config_values(&[requested_key.as_str()])
+            .await
+            .expect("batch system config lookup should succeed");
+        assert_eq!(batch.get(&requested_key), single.as_ref());
+        if single.is_some() {
+            assert_eq!(batch.get(&requested_key), Some(&value));
+            assert!(!batch.contains_key(&stored_key));
+        }
+
+        backend
+            .delete_system_config_value(&stored_key)
+            .await
+            .expect("system config should clean up");
+    }
+
+    #[tokio::test]
     async fn mysql_wallet_daily_usage_aggregation_uses_settlement_wallets_when_url_is_set() {
         let Some(database_url) = std::env::var("AETHER_TEST_MYSQL_URL")
             .ok()

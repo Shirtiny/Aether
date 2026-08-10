@@ -1,5 +1,5 @@
 use futures_util::TryStreamExt;
-use sqlx::Row;
+use sqlx::{QueryBuilder, Row};
 use std::collections::BTreeMap;
 
 use super::{MysqlBackend, PostgresBackend, SqliteBackend};
@@ -121,6 +121,40 @@ impl PostgresBackend {
         row.map(|row| row.try_get("value"))
             .transpose()
             .map_postgres_err()
+    }
+
+    pub async fn find_system_config_values(
+        &self,
+        keys: &[&str],
+    ) -> Result<BTreeMap<String, serde_json::Value>, DataLayerError> {
+        if keys.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+
+        let mut query = QueryBuilder::<sqlx::Postgres>::new(
+            "SELECT key, value FROM system_configs WHERE key IN (",
+        );
+        {
+            let mut separated = query.separated(", ");
+            for key in keys {
+                separated.push_bind(*key);
+            }
+        }
+        query.push(")");
+
+        let rows = query
+            .build()
+            .fetch_all(self.pool())
+            .await
+            .map_postgres_err()?;
+        rows.into_iter()
+            .map(|row| {
+                Ok((
+                    row.try_get("key").map_postgres_err()?,
+                    row.try_get("value").map_postgres_err()?,
+                ))
+            })
+            .collect()
     }
 
     pub async fn upsert_system_config_value(
@@ -274,6 +308,41 @@ LIMIT 1
                 .and_then(parse_json_value)
         })
         .transpose()
+    }
+
+    pub async fn find_system_config_values(
+        &self,
+        keys: &[&str],
+    ) -> Result<BTreeMap<String, serde_json::Value>, DataLayerError> {
+        if keys.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+
+        let mut query = QueryBuilder::<sqlx::MySql>::new(
+            "SELECT requested.requested_key AS `key`, config.value FROM (",
+        );
+        for (index, key) in keys.iter().enumerate() {
+            if index > 0 {
+                query.push(" UNION ALL ");
+            }
+            query
+                .push("SELECT ")
+                .push_bind(*key)
+                .push(" AS requested_key");
+        }
+        query.push(
+            ") AS requested INNER JOIN system_configs AS config ON config.`key` = requested.requested_key",
+        );
+
+        let rows = query.build().fetch_all(self.pool()).await.map_sql_err()?;
+        rows.into_iter()
+            .map(|row| {
+                Ok((
+                    row.try_get("key").map_sql_err()?,
+                    parse_json_value(row.try_get("value").map_sql_err()?)?,
+                ))
+            })
+            .collect()
     }
 
     pub async fn upsert_system_config_value(
@@ -451,6 +520,36 @@ LIMIT 1
                 .and_then(parse_json_value)
         })
         .transpose()
+    }
+
+    pub async fn find_system_config_values(
+        &self,
+        keys: &[&str],
+    ) -> Result<BTreeMap<String, serde_json::Value>, DataLayerError> {
+        if keys.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+
+        let mut query = QueryBuilder::<sqlx::Sqlite>::new(
+            "SELECT key, value FROM system_configs WHERE key IN (",
+        );
+        {
+            let mut separated = query.separated(", ");
+            for key in keys {
+                separated.push_bind(*key);
+            }
+        }
+        query.push(")");
+
+        let rows = query.build().fetch_all(self.pool()).await.map_sql_err()?;
+        rows.into_iter()
+            .map(|row| {
+                Ok((
+                    row.try_get("key").map_sql_err()?,
+                    parse_json_value(row.try_get("value").map_sql_err()?)?,
+                ))
+            })
+            .collect()
     }
 
     pub async fn upsert_system_config_value(

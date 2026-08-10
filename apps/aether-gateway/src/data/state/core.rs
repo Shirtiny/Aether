@@ -407,6 +407,27 @@ impl GatewayDataState {
         backends.find_system_config_value(key).await
     }
 
+    pub(crate) async fn find_system_config_values(
+        &self,
+        keys: &[&str],
+    ) -> Result<std::collections::BTreeMap<String, serde_json::Value>, DataLayerError> {
+        if let Some(values) = &self.system_config_values {
+            let values = values.read().expect("system config values lock");
+            return Ok(keys
+                .iter()
+                .filter_map(|key| {
+                    values
+                        .get(*key)
+                        .map(|entry| ((*key).to_string(), entry.value.clone()))
+                })
+                .collect());
+        }
+        let Some(backends) = self.backends.as_ref() else {
+            return Ok(std::collections::BTreeMap::new());
+        };
+        backends.find_system_config_values(keys).await
+    }
+
     pub(crate) async fn upsert_system_config_value(
         &self,
         key: &str,

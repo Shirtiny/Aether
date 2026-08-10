@@ -313,8 +313,19 @@ mod tests {
                 .find_system_config_value("feature.local")
                 .await
                 .expect("system config should read"),
-            Some(value)
+            Some(value.clone())
         );
+        let values = backend
+            .find_system_config_values(&["feature.local", "missing"])
+            .await
+            .expect("system configs should read in one query");
+        assert_eq!(values.get("feature.local"), Some(&value));
+        assert!(!values.contains_key("missing"));
+        assert!(backend
+            .find_system_config_values(&[])
+            .await
+            .expect("empty system config lookup should succeed")
+            .is_empty());
         assert_eq!(
             backend
                 .list_system_config_entries()

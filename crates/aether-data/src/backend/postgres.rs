@@ -273,6 +273,7 @@ impl PostgresBackend {
 mod tests {
     use super::PostgresBackend;
     use crate::driver::postgres::{PostgresLeaseRunnerConfig, PostgresPoolConfig};
+    use crate::lifecycle::migrate::run_migrations;
 
     #[tokio::test]
     async fn backend_retains_config_and_pool() {
@@ -326,5 +327,81 @@ mod tests {
             .lease_runner(PostgresLeaseRunnerConfig::default())
             .expect("lease runner should build");
         let _provider_quota_writer = backend.provider_quota_write_repository();
+    }
+
+    #[tokio::test]
+    async fn postgres_system_config_batch_round_trips_when_url_is_set() {
+        let Some(database_url) = std::env::var("AETHER_TEST_POSTGRES_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            eprintln!(
+                "skipping postgres system config batch test because AETHER_TEST_POSTGRES_URL is unset"
+            );
+            return;
+        };
+
+        let backend = PostgresBackend::from_config(PostgresPoolConfig {
+            database_url,
+            min_connections: 1,
+            max_connections: 2,
+            acquire_timeout_ms: 5_000,
+            idle_timeout_ms: 5_000,
+            max_lifetime_ms: 30_000,
+            statement_cache_capacity: 64,
+            require_ssl: false,
+        })
+        .expect("postgres backend should build");
+        run_migrations(backend.pool())
+            .await
+            .expect("postgres migrations should run");
+
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let keys = (0..5)
+            .map(|index| format!("test.system-config-batch.{suffix}.{index}"))
+            .collect::<Vec<_>>();
+        let expected = [
+            serde_json::json!(true),
+            serde_json::json!("value"),
+            serde_json::json!({"nested": 1}),
+            serde_json::Value::Null,
+            serde_json::json!(42),
+        ];
+        for (key, value) in keys.iter().zip(&expected) {
+            backend
+                .upsert_system_config_entry(key, value, Some("batch contract test"))
+                .await
+                .expect("system config should upsert");
+        }
+
+        let key_refs = keys.iter().map(String::as_str).collect::<Vec<_>>();
+        let values = backend
+            .find_system_config_values(&key_refs)
+            .await
+            .expect("system configs should batch read");
+        for (key, value) in keys.iter().zip(&expected) {
+            assert_eq!(values.get(key), Some(value));
+        }
+
+        let updated = serde_json::json!({"updated": true});
+        backend
+            .upsert_system_config_entry(&keys[0], &updated, None)
+            .await
+            .expect("system config should update");
+        assert_eq!(
+            backend
+                .find_system_config_values(&[keys[0].as_str(), "missing"])
+                .await
+                .expect("updated system config should batch read")
+                .get(&keys[0]),
+            Some(&updated)
+        );
+
+        for key in keys {
+            backend
+                .delete_system_config_value(&key)
+                .await
+                .expect("system config should clean up");
+        }
     }
 }

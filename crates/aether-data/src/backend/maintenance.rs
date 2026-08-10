@@ -14,6 +14,7 @@ use crate::repository::system::{
 };
 use crate::DataLayerError;
 use sqlx::migrate::MigrateError;
+use std::collections::BTreeMap;
 
 fn maintenance_identifier(value: &str) -> Result<&str, DataLayerError> {
     let valid = !value.is_empty()
@@ -146,6 +147,16 @@ impl DataBackends {
         match self.sql_backend() {
             Some(backend) => backend.find_system_config_value(key).await,
             None => Ok(None),
+        }
+    }
+
+    pub async fn find_system_config_values(
+        &self,
+        keys: &[&str],
+    ) -> Result<BTreeMap<String, serde_json::Value>, DataLayerError> {
+        match self.sql_backend() {
+            Some(backend) => backend.find_system_config_values(keys).await,
+            None => Ok(BTreeMap::new()),
         }
     }
 
@@ -473,6 +484,17 @@ impl<'a> SqlBackendRef<'a> {
             Self::Postgres(postgres) => postgres.find_system_config_value(key).await,
             Self::Mysql(mysql) => mysql.find_system_config_value(key).await,
             Self::Sqlite(sqlite) => sqlite.find_system_config_value(key).await,
+        }
+    }
+
+    async fn find_system_config_values(
+        self,
+        keys: &[&str],
+    ) -> Result<BTreeMap<String, serde_json::Value>, DataLayerError> {
+        match self {
+            Self::Postgres(postgres) => postgres.find_system_config_values(keys).await,
+            Self::Mysql(mysql) => mysql.find_system_config_values(keys).await,
+            Self::Sqlite(sqlite) => sqlite.find_system_config_values(keys).await,
         }
     }
 
