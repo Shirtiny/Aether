@@ -515,7 +515,9 @@ fn admin_pool_attach_grok_local_usage_observation(
     // Once billing describes the subscription allowance directly, the lifetime
     // counters no longer have to stand in for it. Showing them beside a real
     // quota invites reading two different scales as one number.
-    if aether_provider_pool::grok_billing_has_authoritative_quota(quota.get("billing")) {
+    if aether_provider_pool::grok_billing_has_authoritative_quota(quota.get("billing"))
+        || aether_provider_pool::grok_billing_has_successful_response(quota.get("billing"))
+    {
         return;
     }
 
@@ -862,6 +864,36 @@ fn admin_pool_build_grok_account_quota_from_snapshot(
             .and_then(serde_json::Value::as_str)
             .map(ToOwned::to_owned)
             .or_else(|| Some("访问受限".to_string()));
+    }
+
+    let billing = quota_snapshot.get("billing");
+    let billing_selected = aether_provider_pool::grok_billing_has_authoritative_quota(billing)
+        || aether_provider_pool::grok_billing_has_successful_response(billing);
+    if billing_selected {
+        let mut parts = [("周", "billing_weekly"), ("月", "billing_monthly")]
+            .into_iter()
+            .filter_map(|(label, code)| {
+                let window = admin_pool_quota_window(quota_snapshot, code)?;
+                let remaining = admin_pool_quota_window_remaining_percent(window)?;
+                let mut part = format!("{label}剩余 {}", admin_pool_format_percent(remaining));
+                if let Some(value_text) = admin_pool_quota_window_value_text(window) {
+                    part.push_str(&format!(" ({value_text})"));
+                }
+                Some(part)
+            })
+            .collect::<Vec<_>>();
+        if parts.is_empty() {
+            parts.push("Billing 未返回可量化额度".to_string());
+        }
+        if billing
+            .and_then(serde_json::Value::as_object)
+            .and_then(|billing| billing.get("partial"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            parts.push("部分窗口未刷新".to_string());
+        }
+        return Some(parts.join(" · "));
     }
 
     let model_parts = admin_pool_quota_windows(quota_snapshot)
@@ -1846,6 +1878,42 @@ mod tests {
         assert!(quota.get("usage_source").is_none());
         assert!(quota["windows"][0].get("local_used_value").is_none());
         assert!(quota["windows"][0].get("remaining_source").is_none());
+    }
+
+    #[test]
+    fn successful_empty_billing_hides_static_ceiling_and_lifetime_usage() {
+        let mut status_snapshot = json!({
+            "quota": {
+                "provider_type": "grok",
+                "billing": {
+                    "source": "billing_probe",
+                    "weekly_status_code": 200,
+                    "monthly_status_code": 200,
+                    "usage_percent": null,
+                    "monthly_limit_cents": 0.0,
+                    "plan": null
+                },
+                "windows": [{
+                    "code": "requests",
+                    "limit_value": 900,
+                    "remaining_value": 900
+                }, {
+                    "code": "tokens",
+                    "limit_value": 15_000_000,
+                    "remaining_value": 15_000_000
+                }]
+            }
+        });
+
+        admin_pool_attach_grok_local_usage_observation(&mut status_snapshot, 0, 0);
+
+        let quota = status_snapshot["quota"].as_object().expect("quota");
+        assert!(quota.get("usage_source").is_none());
+        assert!(quota["windows"][0].get("local_used_value").is_none());
+        assert_eq!(
+            admin_pool_build_account_quota("grok", Some(quota)),
+            Some("Billing 未返回可量化额度".to_string())
+        );
     }
 
     #[test]

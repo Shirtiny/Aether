@@ -31,9 +31,10 @@ pub use gemini_cli::{
 };
 pub use grok::{
     build_grok_billing_request, build_grok_pool_quota_request,
-    grok_billing_has_authoritative_quota, merge_grok_billing_snapshot, merge_grok_quota_snapshot,
-    parse_grok_billing_payload, parse_grok_quota_headers, GrokBillingWindow,
-    GrokProviderPoolAdapter, XAI_BILLING_PROBE_MODEL, XAI_DEFAULT_BASE_URL, XAI_QUOTA_PROBE_MODEL,
+    grok_billing_has_authoritative_quota, grok_billing_has_successful_response,
+    merge_grok_billing_snapshot, merge_grok_quota_snapshot, parse_grok_billing_payload,
+    parse_grok_quota_headers, GrokBillingWindow, GrokProviderPoolAdapter, XAI_BILLING_PROBE_MODEL,
+    XAI_DEFAULT_BASE_URL, XAI_QUOTA_PROBE_MODEL,
 };
 pub use kiro::KiroProviderPoolAdapter;
 pub use kiro::{

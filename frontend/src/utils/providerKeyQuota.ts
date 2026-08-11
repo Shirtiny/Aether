@@ -318,7 +318,10 @@ function getGrokBillingText(quota: QuotaStatusSnapshot): string | null {
     })
     .filter((value): value is string => value != null)
 
-  if (windowParts.length === 0) return null
+  if (windowParts.length === 0) {
+    if (!hasSuccessfulGrokBillingResponse(quota)) return null
+    parts.push('Billing 未返回可量化额度')
+  }
   parts.push(...windowParts)
 
   // A window that failed to refresh keeps its previous value, so say so rather
@@ -326,6 +329,15 @@ function getGrokBillingText(quota: QuotaStatusSnapshot): string | null {
   if (quota.billing?.partial === true) parts.push('部分窗口未刷新')
 
   return parts.join(' · ')
+}
+
+export function hasSuccessfulGrokBillingResponse(
+  quota: QuotaStatusSnapshot | null | undefined,
+): boolean {
+  const billing = quota?.billing
+  if (!billing) return false
+  return [billing.weekly_status_code, billing.monthly_status_code]
+    .some(status => typeof status === 'number' && status >= 200 && status < 300)
 }
 
 function getGrokQuotaText(quota: QuotaStatusSnapshot): string | null {
@@ -395,6 +407,7 @@ export function getGrokLocalUsageObservationText(
 ): string | null {
   const quota = getQuotaSnapshot(input)
   if (getQuotaProviderType(quota, fallbackProviderType) !== 'grok') return null
+  if (hasSuccessfulGrokBillingResponse(quota)) return null
 
   const parts = ([
     ['请求', 'requests'],

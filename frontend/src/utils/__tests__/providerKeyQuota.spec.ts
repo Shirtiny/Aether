@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import {
   getGeminiCliAccountCreditsText,
+  getGrokLocalUsageObservationText,
   getQuotaDisplayText,
 } from '../providerKeyQuota'
 
@@ -212,6 +213,43 @@ describe('providerKeyQuota', () => {
         },
       },
     } as never, 'grok')).toBe('SuperGrok · 周剩余 0.0% · 月剩余 30.6% ($45.94/$150.00)')
+  })
+
+  it('does not fall back to Grok static ceilings after an empty successful billing response', () => {
+    const input = {
+      status_snapshot: {
+        quota: {
+          provider_type: 'grok',
+          code: 'ok',
+          exhausted: false,
+          billing: {
+            weekly_status_code: 200,
+            monthly_status_code: 200,
+            usage_percent: null,
+            monthly_limit_cents: 0,
+            plan: null,
+          },
+          windows: [{
+            code: 'requests',
+            remaining_ratio: 1,
+            remaining_value: 900,
+            limit_value: 900,
+            remaining_source: 'upstream_static_ceiling',
+            local_used_value: 0,
+          }, {
+            code: 'tokens',
+            remaining_ratio: 1,
+            remaining_value: 15_000_000,
+            limit_value: 15_000_000,
+            remaining_source: 'upstream_static_ceiling',
+            local_used_value: 0,
+          }],
+        },
+      },
+    }
+
+    expect(getQuotaDisplayText(input as never, 'grok')).toBe('Billing 未返回可量化额度')
+    expect(getGrokLocalUsageObservationText(input as never, 'grok')).toBeNull()
   })
 
   it('formats Gemini CLI AI credits from status snapshot and upstream metadata', () => {

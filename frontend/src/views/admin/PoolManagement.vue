@@ -1732,6 +1732,7 @@ import {
   getGrokLocalUsageObservationText,
   getLegacyAccountQuotaText,
   getQuotaDisplayText,
+  hasSuccessfulGrokBillingResponse,
   isQuotaWindowUpstreamStaticCeiling,
 } from '@/utils/providerKeyQuota'
 
@@ -4330,6 +4331,7 @@ function buildQuotaProgressItemsFromSnapshot(key: PoolKeyDetail): QuotaProgressI
       })
       .filter((item): item is QuotaProgressItem => item != null)
     if (billingItems.length > 0) return billingItems
+    if (hasSuccessfulGrokBillingResponse(quota)) return []
 
     const dimensionWindows = [
       ['请求', getQuotaSnapshotWindow(quota, 'requests')],

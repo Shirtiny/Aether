@@ -34,7 +34,7 @@ HTTP 402。但同一时刻 aether 记录的该号额度是**满格**。查库确
 
 - **只把额度数据做准，不改调度语义。** 本轮不让 billing 结果反向影响 `quota_exhausted`（`crates/aether-provider-pool/src/providers/grok.rs:50`）的返回值——aether 已有熔断机制，额度数据驱动选号会引入新的失效模式。`exhausted` 的判据留到 P0 实测拿到真实样本后单独决策。
 - **不做 402 冷却。** 熔断已覆盖，不重复建设。
-- **billing 优先，header 兜底。** 付费号以 billing 为权威；Free 号（xAI 对其不返回 `usage_percent`）继续用 ratelimit 头 + 滚动 24h 窗口。
+- **billing 优先，header 只做运行时兜底。** 只要 billing 请求成功，管理页就以 billing 为展示来源；xAI 未返回 `usage_percent`/金额时明确显示“Billing 未返回可量化额度”，不再把静态 ratelimit 上限展示成订阅余额。无可量化 billing 的账号仍可在调度层使用 header 信号，不改变运行时可用性判断。
 - **保持现有存储形状。** billing 作为 `upstream_metadata->grok->billing` 子对象，与现有 `windows[]` 平级，不动 `windows[]` 的语义，老快照继续可读。
 - **P0 是阻塞步骤。** 三个关键判据（见「待验证」）全部取决于真实响应，未实测前不写解析以外的任何决策逻辑。
 
@@ -178,7 +178,7 @@ User-Agent: <grok cli ua>
 已完成：
 
 - `build_grok_quota_status_snapshot`（`catalog.rs:1518`）把 `billing` 透传进 `status_snapshot.quota`，header 不带 tier 时用 `billing.plan` 兜底 `plan_type`；billing-only 的 bucket 也能 materialize（原本 `windows` 为空就直接返回 `None`）。
-- 前端 `QuotaBillingSnapshot` 类型 + `getGrokQuotaText` 的 billing 分支（`providerKeyQuota.ts`），渲染 `SuperGrok · 周已用 100.0% · 月 $104.06/$150.00`；`partial` 时追加「部分窗口未刷新」。无 billing 时完全走原有逻辑，Free 号路径不受影响。
+- 前端 `QuotaBillingSnapshot` 类型 + `getGrokQuotaText` 的 billing 分支（`providerKeyQuota.ts`），渲染 `SuperGrok · 周已用 100.0% · 月 $104.06/$150.00`；`partial` 时追加「部分窗口未刷新」。billing 成功但没有数值字段时显示“Billing 未返回可量化额度”；只有 billing 请求未成功时才允许展示旧 header 视图。
 - `admin_pool_attach_grok_local_usage_observation`（`payloads.rs:502`）在 billing 权威时**直接返回**，不再挂 `upstream_static_ceiling` 和终身累计 `local_used_value`——那两个数和 billing 不同量纲，并排显示会被读成一把尺子。
 
 **未完成**：本地用量按 billing period 取窗口。需要仿 codex 的做法新增 `read_admin_pool_grok_billing_usage_by_key`（`read_routes/keys.rs:154` 是模板），用 `summarize_usage_by_provider_api_key_windows` 按 `billing.period_start/end` 与 `billing_period_start/end` 批量查，再经 `build_admin_pool_key_payload` 已有的那个参数传进来。约 100 行，跨 2 个文件。目前的效果是「不显示误导数字」，而不是「显示对齐窗口的数字」。

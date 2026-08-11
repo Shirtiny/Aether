@@ -681,6 +681,22 @@ pub fn grok_billing_has_authoritative_quota(billing: Option<&Value>) -> bool {
         || billing_string(billing.get("plan")).is_some()
 }
 
+/// Whether at least one billing endpoint returned a successful response.
+///
+/// This is deliberately weaker than `grok_billing_has_authoritative_quota`:
+/// some xAI plans return HTTP 200 plus period boundaries, but omit numeric
+/// usage and limits. Admin surfaces must still treat that as the billing view
+/// instead of presenting static request/token ceilings as subscription quota.
+pub fn grok_billing_has_successful_response(billing: Option<&Value>) -> bool {
+    let Some(billing) = billing.and_then(Value::as_object) else {
+        return false;
+    };
+    ["weekly_status_code", "monthly_status_code"]
+        .into_iter()
+        .filter_map(|field| billing.get(field).and_then(Value::as_u64))
+        .any(|status| (200..300).contains(&status))
+}
+
 /// Project the billing view into the shared quota-window shape, so exhaustion,
 /// utilisation, reset deadlines and rendering all run through the generic
 /// machinery instead of grok-specific branches.
@@ -1408,6 +1424,24 @@ mod tests {
         }))));
         assert!(grok_billing_has_authoritative_quota(Some(&json!({
             "plan": "SuperGrok"
+        }))));
+    }
+
+    #[test]
+    fn successful_empty_billing_is_still_a_display_result() {
+        let billing = json!({
+            "weekly_status_code": 200,
+            "monthly_status_code": 200,
+            "usage_percent": Value::Null,
+            "monthly_limit_cents": 0.0,
+            "plan": Value::Null
+        });
+
+        assert!(grok_billing_has_successful_response(Some(&billing)));
+        assert!(!grok_billing_has_authoritative_quota(Some(&billing)));
+        assert!(!grok_billing_has_successful_response(Some(&json!({
+            "weekly_status_code": 503,
+            "monthly_status_code": 0
         }))));
     }
 

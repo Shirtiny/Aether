@@ -733,6 +733,58 @@ describe('PoolManagement Codex cycle stats mode', () => {
     expect(root.textContent).toContain('本地累计已用：请求 151 | Token 163673')
   })
 
+  it('does not show Grok static ceilings when billing succeeded without numeric allowance', async () => {
+    const grokKey = createPoolKey('grok', {
+      auth_type: 'oauth',
+      oauth_plan_type: 'P50',
+      status_snapshot: {
+        oauth: { code: 'valid' },
+        account: { code: 'ok', blocked: false },
+        quota: {
+          code: 'ok',
+          exhausted: false,
+          provider_type: 'grok',
+          billing: {
+            weekly_status_code: 200,
+            monthly_status_code: 200,
+            usage_percent: null,
+            monthly_limit_cents: 0,
+            plan: null,
+          },
+          windows: [{
+            code: 'requests',
+            scope: 'account',
+            remaining_ratio: 1,
+            remaining_value: 900,
+            limit_value: 900,
+            remaining_source: 'upstream_static_ceiling',
+            local_used_value: 0,
+          }, {
+            code: 'tokens',
+            scope: 'account',
+            remaining_ratio: 1,
+            remaining_value: 15_000_000,
+            limit_value: 15_000_000,
+            remaining_source: 'upstream_static_ceiling',
+            local_used_value: 0,
+          }],
+        },
+      },
+    })
+    endpointMocks.getPoolOverview.mockResolvedValue({ items: [createOverview('grok')] })
+    endpointMocks.listPoolKeys.mockResolvedValue(createKeyPage(grokKey))
+    endpointMocks.getProvider.mockResolvedValue(createProvider('grok'))
+
+    const root = mountPoolManagement()
+    await settle()
+
+    expect(root.textContent).toContain('P50')
+    expect(root.textContent).toContain('Billing 未返回可量化额度')
+    expect(root.textContent).not.toContain('请求（上游）')
+    expect(root.textContent).not.toContain('Token（上游）')
+    expect(root.textContent).not.toContain('本地累计已用')
+  })
+
   it('opens only one score popover across desktop and mobile layouts', async () => {
     const scoredKey = createPoolKey('codex', {
       pool_score: {
