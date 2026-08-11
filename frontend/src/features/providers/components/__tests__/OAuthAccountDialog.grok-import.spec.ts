@@ -280,7 +280,7 @@ describe('OAuthAccountDialog Grok xAI OAuth', () => {
     endpointMocks.getAwsRegions.mockReset()
 
     endpointMocks.startProviderLevelOAuth.mockResolvedValue({
-      authorization_url: 'https://auth.x.ai/oauth2/authorize?client_id=xai-client',
+      authorization_url: 'https://auth.x.ai/oauth2/authorize?client_id=xai-client&state=xai-state',
       redirect_uri: 'http://127.0.0.1:56121/callback',
       instructions: 'Complete xAI OAuth authorization',
       provider_type: 'grok',
@@ -338,7 +338,7 @@ describe('OAuthAccountDialog Grok xAI OAuth', () => {
     await settle()
 
     expect(endpointMocks.startProviderLevelOAuth).toHaveBeenCalledWith('provider-1')
-    const textarea = root.querySelector('textarea[placeholder*="callback?code"]')
+    const textarea = root.querySelector('textarea[placeholder*="授权码"]')
     expect(textarea).toBeInstanceOf(HTMLTextAreaElement)
     ;(textarea as HTMLTextAreaElement).value = 'http://127.0.0.1:56121/callback?code=xai-code&state=xai-state'
     textarea.dispatchEvent(new Event('input'))
@@ -349,6 +349,50 @@ describe('OAuthAccountDialog Grok xAI OAuth', () => {
 
     expect(endpointMocks.completeProviderLevelOAuth).toHaveBeenCalledWith('provider-1', {
       callback_url: 'http://127.0.0.1:56121/callback?code=xai-code&state=xai-state',
+      proxy_node_id: undefined,
+    })
+  })
+
+  it('adds the authorization state when the pasted xAI callback URL only contains code', async () => {
+    const root = mountDialog('grok')
+    await settle()
+
+    getButton(root, '回调 URL')?.click()
+    await settle()
+
+    const textarea = root.querySelector('textarea[placeholder*="授权码"]')
+    expect(textarea).toBeInstanceOf(HTMLTextAreaElement)
+    ;(textarea as HTMLTextAreaElement).value = 'http://localhost:4001/callback?code=T_lrx9BUTNXmsXiGSoxv2WTwOTn67JV9KfI_hBYtYmj7D47sTPdeIZHhaGp7oWGRWC21u3qQ8q7sR8yCrYrOVA'
+    textarea.dispatchEvent(new Event('input'))
+    await settle()
+
+    getButton(root, '验证')?.click()
+    await settle()
+
+    expect(endpointMocks.completeProviderLevelOAuth).toHaveBeenCalledWith('provider-1', {
+      callback_url: 'http://localhost:4001/callback?code=T_lrx9BUTNXmsXiGSoxv2WTwOTn67JV9KfI_hBYtYmj7D47sTPdeIZHhaGp7oWGRWC21u3qQ8q7sR8yCrYrOVA&state=xai-state',
+      proxy_node_id: undefined,
+    })
+  })
+
+  it('accepts the authorization code shown by xAI without requiring a callback URL', async () => {
+    const root = mountDialog('grok')
+    await settle()
+
+    getButton(root, '回调 URL')?.click()
+    await settle()
+
+    const textarea = root.querySelector('textarea[placeholder*="授权码"]')
+    expect(textarea).toBeInstanceOf(HTMLTextAreaElement)
+    ;(textarea as HTMLTextAreaElement).value = 'xai-code-only'
+    textarea.dispatchEvent(new Event('input'))
+    await settle()
+
+    getButton(root, '验证')?.click()
+    await settle()
+
+    expect(endpointMocks.completeProviderLevelOAuth).toHaveBeenCalledWith('provider-1', {
+      callback_url: 'http://127.0.0.1:56121/callback?code=xai-code-only&state=xai-state',
       proxy_node_id: undefined,
     })
   })

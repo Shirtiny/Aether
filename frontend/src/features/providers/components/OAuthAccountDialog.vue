@@ -591,10 +591,18 @@
                     <Textarea
                       v-model="oauth.callback_url"
                       :disabled="oauthBusy"
-                      placeholder="http://localhost:xxx/callback?code=..."
+                      :placeholder="isGrokProvider
+                        ? '粘贴完整回调 URL，或直接粘贴 xAI 页面显示的授权码'
+                        : 'http://localhost:xxx/callback?code=...&state=...'"
                       class="min-h-[120px] text-xs font-mono break-all !rounded-xl"
                       spellcheck="false"
                     />
+                    <p
+                      v-if="isGrokProvider"
+                      class="mt-1.5 text-[11px] leading-4 text-muted-foreground"
+                    >
+                      若 xAI 页面只显示授权码，可直接粘贴；系统会自动补全本次授权的 state。
+                    </p>
                   </div>
                 </div>
               </template>
@@ -1453,6 +1461,47 @@ function openAuthorizationUrl() {
   window.open(url, '_blank', 'noopener,noreferrer')
 }
 
+function normalizeOAuthCallbackSubmission(value: string): string {
+  const submitted = value.trim()
+  if (!submitted) return submitted
+
+  let state = ''
+  try {
+    state = new URL(oauth.value.authorization_url).searchParams.get('state')?.trim() || ''
+  } catch {
+    return submitted
+  }
+  if (!state) return submitted
+
+  try {
+    const callbackUrl = new URL(submitted)
+    if (callbackUrl.searchParams.get('code')?.trim() && !callbackUrl.searchParams.get('state')?.trim()) {
+      callbackUrl.searchParams.set('state', state)
+      return callbackUrl.toString()
+    }
+    return submitted
+  } catch {
+    // xAI may show only the authorization code instead of navigating to localhost.
+  }
+
+  const rawParams = submitted.startsWith('?') ? submitted.slice(1) : submitted
+  const params = new URLSearchParams(rawParams)
+  const queryCode = params.get('code')?.trim()
+  if (queryCode) {
+    if (!params.get('state')?.trim()) params.set('state', state)
+    return params.toString()
+  }
+
+  try {
+    const callbackUrl = new URL(oauth.value.redirect_uri)
+    callbackUrl.searchParams.set('code', submitted)
+    callbackUrl.searchParams.set('state', state)
+    return callbackUrl.toString()
+  } catch {
+    return submitted
+  }
+}
+
 async function initOAuth() {
   if (!props.providerId) return
   if (!showAuthorizationMode.value) return
@@ -1488,7 +1537,7 @@ async function handleCompleteOAuth() {
   oauth.value.completing = true
   try {
     const result = await completeProviderLevelOAuth(props.providerId, {
-      callback_url: oauth.value.callback_url.trim(),
+      callback_url: normalizeOAuthCallbackSubmission(oauth.value.callback_url),
       proxy_node_id: selectedProxyNodeId.value || undefined,
     })
     if (requestId !== oauthCompleteRequestId) return
