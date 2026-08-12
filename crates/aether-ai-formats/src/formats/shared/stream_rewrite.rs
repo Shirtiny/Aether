@@ -1284,6 +1284,44 @@ data: {\"type\":\"response.reasoning_summary_text.delta\",\"response_id\":\"resp
     }
 
     #[test]
+    fn standard_rewriter_converts_modern_responses_reasoning_to_claude() {
+        let report_context = json!({
+            "provider_api_format": "openai:responses",
+            "client_api_format": "claude:messages",
+            "needs_conversion": true,
+            "mapped_model": "gpt-5.6-sol",
+        });
+        let mut rewriter = maybe_build_ai_surface_stream_rewriter(Some(&report_context))
+            .expect("rewriter should exist");
+        let output = rewriter
+            .push_chunk(
+                br#"event: response.created
+data: {"type":"response.created","response":{"id":"resp_modern_123","object":"response","model":"gpt-5.6-sol","status":"in_progress","output":[]}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","response_id":"resp_modern_123","output_index":0,"item":{"type":"reasoning","id":"rs_modern_123","summary":[]}}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","response_id":"resp_modern_123","item_id":"rs_modern_123","output_index":0,"content_index":0,"delta":"working"}
+
+event: response.reasoning_text.done
+data: {"type":"response.reasoning_text.done","response_id":"resp_modern_123","item_id":"rs_modern_123","output_index":0,"content_index":0,"text":"working"}
+
+event: response.done
+data: {"type":"response.done","response":{"id":"resp_modern_123","object":"response","model":"gpt-5.6-sol","status":"completed","output":[],"usage":{"input_tokens":3,"output_tokens":5,"total_tokens":8}}}
+
+"#,
+            )
+            .expect("rewrite should succeed");
+        let output = String::from_utf8(output).expect("output should be utf8");
+
+        assert!(output.contains("event: message_start"));
+        assert!(output.contains("\"type\":\"thinking_delta\""));
+        assert!(output.contains("\"thinking\":\"working\""));
+        assert!(output.contains("event: message_stop"));
+    }
+
+    #[test]
     fn same_family_responses_passthrough_preserves_encrypted_content() {
         // When provider and client are both OpenAI Responses family,
         // the stream should pass through verbatim (only model name rewrite).

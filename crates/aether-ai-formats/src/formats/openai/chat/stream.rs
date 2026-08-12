@@ -961,7 +961,7 @@ impl OpenAIResponsesProviderState {
                     self.emit_missing_text(report_context, &mut out, key, text);
                 }
             }
-            "response.reasoning_summary_text.delta" => {
+            "response.reasoning_text.delta" | "response.reasoning_summary_text.delta" => {
                 let piece = value
                     .get("delta")
                     .and_then(Value::as_str)
@@ -986,7 +986,7 @@ impl OpenAIResponsesProviderState {
                     });
                 }
             }
-            "response.reasoning_summary_text.done" => {
+            "response.reasoning_text.done" | "response.reasoning_summary_text.done" => {
                 let text = value
                     .get("text")
                     .and_then(Value::as_str)
@@ -1243,7 +1243,7 @@ impl OpenAIResponsesProviderState {
                 }
                 out.push(self.unknown_frame(report_context, payload));
             }
-            "response.completed" => {
+            "response.completed" | "response.done" => {
                 let Some(response) = value.get("response").and_then(Value::as_object) else {
                     return Ok(out);
                 };
@@ -4342,6 +4342,88 @@ mod tests {
             reasoning[0].event,
             CanonicalStreamEvent::ReasoningDelta(ref text) if text == "step"
         ));
+    }
+
+    #[test]
+    fn openai_responses_provider_state_accepts_modern_reasoning_and_done_aliases() {
+        let mut state = OpenAIResponsesProviderState::default();
+        let report_context = json!({});
+        let mut frames = Vec::new();
+
+        for event in [
+            json!({
+                "type": "response.created",
+                "response": {
+                    "id": "resp_modern_reasoning",
+                    "model": "gpt-5.6-sol",
+                }
+            }),
+            json!({
+                "type": "response.output_item.added",
+                "response_id": "resp_modern_reasoning",
+                "output_index": 0,
+                "item": {
+                    "type": "reasoning",
+                    "id": "rs_modern_reasoning",
+                    "summary": [],
+                }
+            }),
+            json!({
+                "type": "response.reasoning_text.delta",
+                "response_id": "resp_modern_reasoning",
+                "item_id": "rs_modern_reasoning",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": "working",
+            }),
+            json!({
+                "type": "response.reasoning_text.done",
+                "response_id": "resp_modern_reasoning",
+                "item_id": "rs_modern_reasoning",
+                "output_index": 0,
+                "content_index": 0,
+                "text": "working",
+            }),
+            json!({
+                "type": "response.done",
+                "response": {
+                    "id": "resp_modern_reasoning",
+                    "object": "response",
+                    "model": "gpt-5.6-sol",
+                    "status": "completed",
+                    "output": [],
+                    "usage": {
+                        "input_tokens": 3,
+                        "output_tokens": 5,
+                        "total_tokens": 8,
+                    }
+                }
+            }),
+        ] {
+            frames.extend(
+                state
+                    .push_line(&report_context, data_line(event))
+                    .expect("modern Responses event should parse"),
+            );
+        }
+
+        assert!(frames.iter().any(|frame| matches!(
+            frame.event,
+            CanonicalStreamEvent::ReasoningDelta(ref text) if text == "working"
+        )));
+        assert!(frames
+            .iter()
+            .any(|frame| matches!(frame.event, CanonicalStreamEvent::ReasoningSummaryDone)));
+        assert!(frames.iter().any(|frame| matches!(
+            frame.event,
+            CanonicalStreamEvent::Finish {
+                finish_reason: Some(ref reason),
+                ..
+            } if reason == "stop"
+        )));
+        assert!(!frames
+            .iter()
+            .any(|frame| matches!(frame.event, CanonicalStreamEvent::UnknownEvent(_))));
     }
 
     #[test]

@@ -1820,7 +1820,7 @@ pub fn aggregate_openai_responses_stream_sync_response(body: &[u8]) -> Option<Va
                     part,
                 );
             }
-            "response.reasoning_summary_text.delta" => {
+            "response.reasoning_text.delta" | "response.reasoning_summary_text.delta" => {
                 let output_index = openai_responses_event_output_index(event_object).unwrap_or(0);
                 let delta = event_object
                     .get("delta")
@@ -1835,7 +1835,7 @@ pub fn aggregate_openai_responses_stream_sync_response(body: &[u8]) -> Option<Va
                     .summary_text
                     .push_str(delta);
             }
-            "response.reasoning_summary_text.done" => {
+            "response.reasoning_text.done" | "response.reasoning_summary_text.done" => {
                 let output_index = openai_responses_event_output_index(event_object).unwrap_or(0);
                 let text = event_object
                     .get("text")
@@ -1961,7 +1961,7 @@ pub fn aggregate_openai_responses_stream_sync_response(body: &[u8]) -> Option<Va
                     output_index,
                 );
             }
-            "response.completed" => {
+            "response.completed" | "response.done" => {
                 response_object = event_object
                     .get("response")
                     .and_then(Value::as_object)
@@ -3917,6 +3917,25 @@ mod tests {
         assert_eq!(result["output"][0]["call_id"], "call_done_weather");
         assert_eq!(result["output"][0]["name"], "get_weather");
         assert_eq!(result["output"][0]["arguments"], r#"{"location": "Tokyo"}"#);
+    }
+
+    #[test]
+    fn aggregates_modern_reasoning_text_and_response_done_alias() {
+        let body = concat!(
+            "event: response.reasoning_text.delta\n",
+            "data: {\"type\":\"response.reasoning_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"Need\"}\n\n",
+            "event: response.reasoning_text.done\n",
+            "data: {\"type\":\"response.reasoning_text.done\",\"output_index\":0,\"content_index\":0,\"text\":\"Need care\"}\n\n",
+            "event: response.done\n",
+            "data: {\"type\":\"response.done\",\"response\":{\"id\":\"resp_done_alias_123\",\"object\":\"response\",\"model\":\"gpt-5.6-sol\",\"status\":\"completed\"}}\n\n",
+        );
+
+        let result = aggregate_openai_responses_stream_sync_response(body.as_bytes())
+            .expect("modern response.done stream should aggregate");
+
+        assert_eq!(result["id"], "resp_done_alias_123");
+        assert_eq!(result["output"][0]["type"], "reasoning");
+        assert_eq!(result["output"][0]["summary"][0]["text"], "Need care");
     }
 
     #[test]
