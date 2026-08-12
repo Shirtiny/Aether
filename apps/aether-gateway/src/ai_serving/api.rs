@@ -65,6 +65,7 @@ pub(crate) use aether_ai_formats::api::{
     OPENAI_VIDEO_CANCEL_SYNC_PLAN_KIND, OPENAI_VIDEO_CONTENT_PLAN_KIND,
     OPENAI_VIDEO_DELETE_SYNC_PLAN_KIND, OPENAI_VIDEO_REMIX_SYNC_PLAN_KIND,
 };
+pub(crate) use aether_ai_formats::formats::shared::response::build_openai_responses_message_item_id;
 pub(crate) use aether_ai_formats::protocol::stream::CanonicalUsage as StreamingCanonicalUsage;
 pub(crate) use aether_ai_formats::UPSTREAM_IS_STREAM_KEY;
 
