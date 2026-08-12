@@ -11,6 +11,7 @@ use crate::local_probe_intercept::{
     LocalProbeInterceptKind,
 };
 use crate::{AppState, GatewayError};
+use aether_ai_formats::formats::shared::response::build_openai_responses_message_item_id;
 use aether_data_contracts::repository::video_tasks::{
     StoredVideoTask, VideoTaskQueryFilter, VideoTaskStatus,
 };
@@ -1388,7 +1389,7 @@ fn openai_responses_local_probe_payload(
     text: &str,
     created_at: i64,
 ) -> Value {
-    let message_id = format!("{response_id}_msg");
+    let message_id = build_openai_responses_message_item_id(response_id, 0);
     let message = json!({
         "id": message_id,
         "type": "message",
@@ -2918,6 +2919,8 @@ mod tests {
             .expect("sse body should be utf-8");
 
         assert!(body.contains("event: response.completed"));
+        assert_eq!(response["output"][0]["id"], json!("msg_probe"));
+        assert!(body.contains("\"item_id\":\"msg_probe\""));
         assert!(body.contains("\"output_text\":\"21\""));
         assert!(body.ends_with("data: [DONE]\n\n"));
     }

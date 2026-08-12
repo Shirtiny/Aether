@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
 use crate::formats::openai::shared::map_thinking_budget_to_openai_reasoning_effort;
-use crate::formats::shared::response::remove_empty_pages_from_tool_input_value;
+use crate::formats::shared::response::{
+    build_openai_responses_message_item_id, remove_empty_pages_from_tool_input_value,
+};
 
 pub use crate::protocol::stream::{CanonicalStreamEvent, CanonicalStreamFrame};
 
@@ -3085,11 +3087,7 @@ pub(crate) fn flush_openai_responses_message_item(
     if message_content.is_empty() {
         return;
     }
-    let id = if *message_index == 0 {
-        format!("{response_id}_msg")
-    } else {
-        format!("{response_id}_msg_{message_index}")
-    };
+    let id = build_openai_responses_message_item_id(response_id, *message_index);
     output.push(json!({
         "type": "message",
         "id": id,

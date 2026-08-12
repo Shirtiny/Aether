@@ -4,6 +4,9 @@ use serde_json::{json, Map, Value};
 
 use crate::{
     formats::context::FormatContext,
+    formats::shared::response::{
+        build_openai_responses_image_item_id, build_openai_responses_reasoning_item_id,
+    },
     protocol::canonical::{
         canonical_content_block_to_openai_responses_part,
         canonical_usage_to_openai_responses_usage, canonicalize_tool_arguments,
@@ -135,7 +138,10 @@ pub fn to_raw(canonical: &CanonicalResponse, report_context: &Value, _compact: b
                 item.insert("type".to_string(), Value::String("reasoning".to_string()));
                 item.insert(
                     "id".to_string(),
-                    Value::String(format!("{}_rs_{}", response_id, output.len())),
+                    Value::String(build_openai_responses_reasoning_item_id(
+                        &response_id,
+                        output.len(),
+                    )),
                 );
                 item.insert("status".to_string(), Value::String("completed".to_string()));
                 if let Some(encrypted_content) =
@@ -304,7 +310,7 @@ fn openai_responses_image_generation_call_item(
     let mut item = Map::new();
     item.insert(
         "id".to_string(),
-        Value::String(format!("{response_id}_ig_{index}")),
+        Value::String(build_openai_responses_image_item_id(response_id, index)),
     );
     item.insert(
         "type".to_string(),

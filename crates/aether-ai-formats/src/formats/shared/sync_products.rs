@@ -22,6 +22,7 @@ use super::AiSurfaceFinalizeError;
 use crate::formats::gemini::generate_content::stream::GeminiProviderState;
 use crate::formats::shared::model_directives::model_directive_display_model_from_report_context;
 use crate::formats::shared::response::{
+    build_openai_responses_message_item_id, build_openai_responses_reasoning_item_id,
     remove_empty_pages_from_tool_arguments, remove_empty_pages_from_tool_input_value,
     sanitize_claude_read_tool_inputs,
 };
@@ -2050,12 +2051,14 @@ pub fn aggregate_openai_responses_stream_sync_response(body: &[u8]) -> Option<Va
             if let Some(state) = reasoning_states.remove(&output_index) {
                 output.push(materialize_openai_responses_reasoning_item(
                     &response_id,
+                    output_index,
                     state,
                 ));
             }
             if let Some(state) = message_states.remove(&output_index) {
                 output.push(materialize_openai_responses_message_item(
                     &response_id,
+                    output_index,
                     state,
                 ));
             }
@@ -2371,13 +2374,18 @@ fn resolve_openai_responses_tool_output_index(
 
 fn materialize_openai_responses_message_item(
     response_id: &str,
+    output_index: usize,
     state: OpenAIResponsesSyncMessageState,
 ) -> Value {
     let mut item = state.item;
     item.entry("type".to_string())
         .or_insert_with(|| Value::String("message".to_string()));
-    item.entry("id".to_string())
-        .or_insert_with(|| Value::String(format!("{response_id}_msg")));
+    item.entry("id".to_string()).or_insert_with(|| {
+        Value::String(build_openai_responses_message_item_id(
+            response_id,
+            output_index,
+        ))
+    });
     item.entry("role".to_string())
         .or_insert_with(|| Value::String("assistant".to_string()));
     item.entry("status".to_string())
@@ -2400,13 +2408,18 @@ fn materialize_openai_responses_message_item(
 
 fn materialize_openai_responses_reasoning_item(
     response_id: &str,
+    output_index: usize,
     state: OpenAIResponsesSyncReasoningState,
 ) -> Value {
     let mut item = state.item;
     item.entry("type".to_string())
         .or_insert_with(|| Value::String("reasoning".to_string()));
-    item.entry("id".to_string())
-        .or_insert_with(|| Value::String(format!("{response_id}_rs_0")));
+    item.entry("id".to_string()).or_insert_with(|| {
+        Value::String(build_openai_responses_reasoning_item_id(
+            response_id,
+            output_index,
+        ))
+    });
     item.entry("status".to_string())
         .or_insert_with(|| Value::String("completed".to_string()));
     if !state.summary_text.is_empty() {

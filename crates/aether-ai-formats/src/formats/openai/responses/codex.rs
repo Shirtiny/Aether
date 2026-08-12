@@ -7,6 +7,8 @@ use sha1::{Digest as Sha1Digest, Sha1};
 use sha2::Sha256;
 use uuid::Uuid;
 
+use crate::formats::shared::response::build_openai_responses_message_item_id;
+
 const CODEX_PROMPT_CACHE_NAMESPACE_VERSION: &str = "v3";
 const CODEX_DEFAULT_INSTRUCTIONS: &str = "";
 const CODEX_DEFAULT_REASONING_EFFORT: &str = "medium";
@@ -535,6 +537,55 @@ fn insert_codex_prompt_cache_key(
     );
 }
 
+fn normalize_legacy_aether_responses_message_ids(provider_request_body: &mut Value) {
+    let Some(input) = provider_request_body
+        .get_mut("input")
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+
+    for item in input {
+        let Some(item) = item.as_object_mut() else {
+            continue;
+        };
+        if item.get("type").and_then(Value::as_str) != Some("message") {
+            continue;
+        }
+        let Some(id) = item
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.starts_with("msg_"))
+        else {
+            continue;
+        };
+
+        let legacy = id
+            .strip_suffix("_msg")
+            .map(|response_id| (response_id, 0))
+            .or_else(|| {
+                let (response_id, index) = id.rsplit_once("_msg_")?;
+                let index = index.parse::<usize>().ok()?;
+                Some((response_id, index))
+            });
+        let Some((response_id, message_index)) = legacy else {
+            continue;
+        };
+        if !response_id.starts_with("resp_") && !response_id.starts_with("resp-") {
+            continue;
+        }
+
+        item.insert(
+            "id".to_string(),
+            Value::String(build_openai_responses_message_item_id(
+                response_id,
+                message_index,
+            )),
+        );
+    }
+}
+
 fn openai_responses_cache_control_prompt_cache_key_to_insert(
     provider_request_body: &Value,
 ) -> Option<String> {
@@ -732,6 +783,8 @@ pub fn apply_codex_openai_responses_special_body_edits(
     if !is_codex_openai_responses_request(provider_type, provider_api_format) {
         return;
     }
+
+    normalize_legacy_aether_responses_message_ids(provider_request_body);
 
     let prompt_cache_key =
         codex_prompt_cache_key_to_insert(provider_request_body, provider_type, provider_api_format);
@@ -951,6 +1004,77 @@ mod tests {
         );
         assert_eq!(provider_request_body["parallel_tool_calls"], json!(true));
         assert_eq!(provider_request_body["instructions"], json!(""));
+    }
+
+    #[test]
+    fn codex_responses_body_edits_repair_legacy_aether_message_ids() {
+        let mut provider_request_body = json!({
+            "input": [{
+                "type": "message",
+                "id": "resp_local_probe_7706c7fd30354e6eb46b9a6e05530ea8_msg",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "OK"}]
+            }, {
+                "type": "message",
+                "id": "resp_cross_format_123_msg_2",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "done"}]
+            }, {
+                "type": "message",
+                "id": "third_party_message_123",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "opaque"}]
+            }],
+            "model": "gpt-5.6-sol",
+            "stream": true
+        });
+
+        apply_codex_openai_responses_special_body_edits(
+            &mut provider_request_body,
+            "codex",
+            "openai:responses",
+            None,
+            None,
+        );
+
+        assert_eq!(
+            provider_request_body["input"][0]["id"],
+            json!("msg_local_probe_7706c7fd30354e6eb46b9a6e05530ea8")
+        );
+        assert_eq!(
+            provider_request_body["input"][1]["id"],
+            json!("msg_cross_format_123_2")
+        );
+        assert_eq!(
+            provider_request_body["input"][2]["id"],
+            json!("third_party_message_123")
+        );
+    }
+
+    #[test]
+    fn non_codex_body_edits_leave_legacy_aether_message_ids_unchanged() {
+        let mut provider_request_body = json!({
+            "input": [{
+                "type": "message",
+                "id": "resp_local_probe_123_msg",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "OK"}]
+            }],
+            "model": "gpt-5.6-sol"
+        });
+
+        apply_codex_openai_responses_special_body_edits(
+            &mut provider_request_body,
+            "openai",
+            "openai:responses",
+            None,
+            None,
+        );
+
+        assert_eq!(
+            provider_request_body["input"][0]["id"],
+            json!("resp_local_probe_123_msg")
+        );
     }
 
     #[test]

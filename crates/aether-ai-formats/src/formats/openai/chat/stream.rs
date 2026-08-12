@@ -2,7 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Map, Value};
 
-use crate::formats::shared::response::build_generated_tool_call_id;
+use crate::formats::shared::response::{
+    build_generated_tool_call_id, build_openai_responses_message_item_id,
+    build_openai_responses_reasoning_item_id,
+};
 use crate::formats::shared::sse::{encode_done_sse, encode_json_sse};
 use crate::formats::shared::stream_core::common::*;
 use crate::formats::shared::AiSurfaceFinalizeError;
@@ -1720,25 +1723,31 @@ impl OpenAIResponsesClientEmitter {
     fn message_item_id(&self) -> String {
         self.message_item_id
             .clone()
-            .unwrap_or_else(|| format!("{}_msg", self.response_id()))
+            .unwrap_or_else(|| build_openai_responses_message_item_id(self.response_id(), 0))
     }
 
     fn reasoning_item_id(&self) -> String {
         self.reasoning_item_id
             .clone()
-            .unwrap_or_else(|| format!("{}_rs_0", self.response_id()))
+            .unwrap_or_else(|| build_openai_responses_reasoning_item_id(self.response_id(), 0))
     }
 
     fn ensure_message_item_id(&mut self) -> String {
         if self.message_item_id.is_none() {
-            self.message_item_id = Some(format!("{}_msg", self.response_id()));
+            self.message_item_id = Some(build_openai_responses_message_item_id(
+                self.response_id(),
+                0,
+            ));
         }
         self.message_item_id()
     }
 
     fn ensure_reasoning_item_id(&mut self) -> String {
         if self.reasoning_item_id.is_none() {
-            self.reasoning_item_id = Some(format!("{}_rs_0", self.response_id()));
+            self.reasoning_item_id = Some(build_openai_responses_reasoning_item_id(
+                self.response_id(),
+                0,
+            ));
         }
         self.reasoning_item_id()
     }
@@ -3101,7 +3110,7 @@ mod tests {
         assert!(sse.contains("event: response.output_item.done\n"));
         assert!(sse.contains("event: response.completed\n"));
         assert!(sse.contains("\"response_id\":\"resp_stream_123\""));
-        assert!(sse.contains("\"item_id\":\"resp_stream_123_msg\""));
+        assert!(sse.contains("\"item_id\":\"msg_stream_123\""));
         assert!(sse.contains("\"text\":\"Hello\""));
         assert_eq!(response_sequence_numbers(&sse), (1..=9).collect::<Vec<_>>());
     }
@@ -3162,8 +3171,8 @@ mod tests {
         );
 
         let sse = String::from_utf8(bytes).expect("sse should be utf8");
-        assert!(sse.contains("\"item_id\":\"msg_first_msg\""));
-        assert!(!sse.contains("\"item_id\":\"msg_second_msg\""));
+        assert!(sse.contains("\"item_id\":\"msg_first\""));
+        assert!(!sse.contains("\"item_id\":\"msg_second\""));
     }
 
     #[test]
@@ -4146,7 +4155,7 @@ mod tests {
         assert!(sse.contains("event: response.reasoning_summary_text.delta\n"));
         assert!(sse.contains("event: response.reasoning_summary_text.done\n"));
         assert!(sse.contains("event: response.reasoning_summary_part.done\n"));
-        assert!(sse.contains("\"item_id\":\"resp_456_rs_0\""));
+        assert!(sse.contains("\"item_id\":\"rs_456_0\""));
         assert!(sse.contains("\"type\":\"reasoning\""));
         assert_eq!(response_sequence_numbers(&sse), (1..=9).collect::<Vec<_>>());
     }

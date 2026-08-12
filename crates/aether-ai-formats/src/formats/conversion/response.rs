@@ -6,6 +6,9 @@
 
 use serde_json::{json, Value};
 
+use crate::formats::shared::response::{
+    build_openai_responses_message_item_id, build_openai_responses_reasoning_item_id,
+};
 use crate::formats::{context::FormatContext, registry};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,7 +203,7 @@ pub fn build_openai_responses_response_with_content(
         }
         output.push(json!({
             "type": "reasoning",
-            "id": format!("{response_id}_rs_{index}"),
+            "id": build_openai_responses_reasoning_item_id(response_id, index),
             "status": "completed",
             "summary": [{
                 "type": "summary_text",
@@ -211,7 +214,7 @@ pub fn build_openai_responses_response_with_content(
     if !content.is_empty() {
         output.push(json!({
             "type": "message",
-            "id": format!("{response_id}_msg"),
+            "id": build_openai_responses_message_item_id(response_id, 0),
             "role": "assistant",
             "status": "completed",
             "content": content

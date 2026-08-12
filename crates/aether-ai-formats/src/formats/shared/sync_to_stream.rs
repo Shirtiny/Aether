@@ -12,6 +12,7 @@ use crate::formats::gemini::generate_content::stream::GeminiClientEmitter;
 use crate::formats::openai::chat::stream::{
     OpenAIChatClientEmitter, OpenAIResponsesClientEmitter, OpenAIResponsesProviderState,
 };
+use crate::formats::shared::response::build_openai_responses_image_item_id;
 use crate::formats::shared::sse::{encode_done_sse, encode_json_sse};
 use crate::formats::shared::stream_core::common::{
     build_openai_chat_chunk, build_openai_chat_finish_chunk,
@@ -315,7 +316,7 @@ impl OpenAiImageOutput {
         let mut item = Map::new();
         item.insert(
             "id".to_string(),
-            Value::String(format!("{response_id}_img_{index}")),
+            Value::String(build_openai_responses_image_item_id(response_id, index)),
         );
         item.insert(
             "type".to_string(),

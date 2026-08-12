@@ -21,6 +21,44 @@ pub fn build_generated_tool_call_id(index: usize) -> String {
     format!("call_auto_{index}")
 }
 
+fn openai_responses_item_id_suffix(response_id: &str) -> &str {
+    let response_id = response_id.trim();
+    ["resp_", "resp-", "chatcmpl_", "chatcmpl-"]
+        .into_iter()
+        .find_map(|prefix| response_id.strip_prefix(prefix))
+        .filter(|suffix| !suffix.is_empty())
+        .unwrap_or(response_id)
+}
+
+pub fn build_openai_responses_message_item_id(response_id: &str, message_index: usize) -> String {
+    if message_index == 0 && response_id.trim().starts_with("msg_") {
+        return response_id.trim().to_string();
+    }
+    let suffix = openai_responses_item_id_suffix(response_id);
+    if message_index == 0 {
+        format!("msg_{suffix}")
+    } else {
+        format!("msg_{suffix}_{message_index}")
+    }
+}
+
+pub fn build_openai_responses_reasoning_item_id(
+    response_id: &str,
+    reasoning_index: usize,
+) -> String {
+    format!(
+        "rs_{}_{reasoning_index}",
+        openai_responses_item_id_suffix(response_id)
+    )
+}
+
+pub fn build_openai_responses_image_item_id(response_id: &str, image_index: usize) -> String {
+    format!(
+        "ig_{}_{image_index}",
+        openai_responses_item_id_suffix(response_id)
+    )
+}
+
 pub fn canonicalize_tool_arguments(value: Option<Value>) -> String {
     match value {
         Some(Value::String(text)) => text,
@@ -170,12 +208,37 @@ mod tests {
 
     use super::{
         build_generated_tool_call_id, build_local_success_background_report,
-        build_local_success_conversion_background_report, canonicalize_tool_arguments,
-        prepare_local_success_response_parts, prepare_local_success_response_parts_owned,
-        remove_empty_pages_from_tool_arguments, sanitize_claude_read_tool_inputs,
-        LocalSyncReportParts,
+        build_local_success_conversion_background_report, build_openai_responses_image_item_id,
+        build_openai_responses_message_item_id, build_openai_responses_reasoning_item_id,
+        canonicalize_tool_arguments, prepare_local_success_response_parts,
+        prepare_local_success_response_parts_owned, remove_empty_pages_from_tool_arguments,
+        sanitize_claude_read_tool_inputs, LocalSyncReportParts,
     };
     use std::collections::BTreeMap;
+
+    #[test]
+    fn generated_openai_responses_item_ids_use_type_prefixes() {
+        assert_eq!(
+            build_openai_responses_message_item_id("resp_local_probe_123", 0),
+            "msg_local_probe_123"
+        );
+        assert_eq!(
+            build_openai_responses_message_item_id("resp_local_probe_123", 2),
+            "msg_local_probe_123_2"
+        );
+        assert_eq!(
+            build_openai_responses_message_item_id("msg_native_123", 0),
+            "msg_native_123"
+        );
+        assert_eq!(
+            build_openai_responses_reasoning_item_id("resp_local_probe_123", 1),
+            "rs_local_probe_123_1"
+        );
+        assert_eq!(
+            build_openai_responses_image_item_id("chatcmpl-local-123", 3),
+            "ig_local-123_3"
+        );
+    }
 
     #[test]
     fn generated_tool_call_ids_are_stable() {
