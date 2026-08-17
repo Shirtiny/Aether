@@ -951,6 +951,9 @@ async fn maybe_build_local_openai_probe_response(
 
     let request_body = request_body?;
     let payload = serde_json::from_slice::<Value>(request_body).ok()?;
+    let is_compaction = decision.route_kind.as_deref() == Some("responses:compact")
+        || request_context.request_path == "/v1/responses/compact"
+        || openai_responses_has_compaction_trigger(&payload);
     let probe = match (
         decision.route_kind.as_deref(),
         request_context.request_path.as_str(),
@@ -997,6 +1000,7 @@ async fn maybe_build_local_openai_probe_response(
         model,
         &answer,
         stream,
+        is_compaction,
     )
     .await;
     Some(match probe {
@@ -1006,6 +1010,7 @@ async fn maybe_build_local_openai_probe_response(
             &answer.text,
             answer.kind,
             stream,
+            is_compaction,
         ),
         OpenAiLocalProbeRequest::Chat(answer) => build_openai_chat_local_probe_response(
             request_context,
@@ -1066,6 +1071,17 @@ fn extract_openai_responses_last_user_text(payload: &Value) -> Option<String> {
             .find_map(openai_responses_input_item_user_text),
         _ => None,
     }
+}
+
+fn openai_responses_has_compaction_trigger(payload: &Value) -> bool {
+    payload
+        .get("input")
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| item.get("type").and_then(Value::as_str) == Some("compaction_trigger"))
+        })
 }
 
 fn openai_responses_input_item_user_text(item: &Value) -> Option<String> {
@@ -1243,12 +1259,21 @@ fn build_openai_responses_local_probe_response(
     text: &str,
     kind: LocalProbeKind,
     stream: bool,
+    is_compaction: bool,
 ) -> Response<Body> {
     let response_id = local_probe_response_id(&request_context.trace_id);
     let created_at = chrono::Utc::now().timestamp().max(0);
-    let response = openai_responses_local_probe_payload(&response_id, model, text, created_at);
+    let response = if is_compaction {
+        openai_responses_local_compaction_probe_payload(&response_id, model, text, created_at)
+    } else {
+        openai_responses_local_probe_payload(&response_id, model, text, created_at)
+    };
     if stream {
-        let body = openai_responses_local_probe_sse_body(&response);
+        let body = if is_compaction {
+            openai_responses_local_compaction_probe_sse_body(&response)
+        } else {
+            openai_responses_local_probe_sse_body(&response)
+        };
         return Response::builder()
             .status(http::StatusCode::OK)
             .header(http::header::CONTENT_TYPE, "text/event-stream")
@@ -1422,6 +1447,111 @@ fn openai_responses_local_probe_payload(
     })
 }
 
+fn openai_responses_local_compaction_probe_payload(
+    response_id: &str,
+    model: &str,
+    encrypted_content: &str,
+    created_at: i64,
+) -> Value {
+    let compaction = json!({
+        "type": "compaction",
+        "encrypted_content": encrypted_content
+    });
+    json!({
+        "id": response_id,
+        "object": "response",
+        "created_at": created_at,
+        "status": "completed",
+        "model": model,
+        "output": [compaction],
+        "usage": {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "input_tokens_details": {
+                "cached_tokens": 0
+            },
+            "output_tokens_details": {
+                "reasoning_tokens": 0
+            }
+        }
+    })
+}
+
+fn openai_responses_local_compaction_probe_sse_body(response: &Value) -> Vec<u8> {
+    let response_id = response
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("resp_local_probe");
+    let model = response
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("local-probe");
+    let created_at = response
+        .get("created_at")
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    let output = response
+        .get("output")
+        .and_then(Value::as_array)
+        .and_then(|items| items.first())
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let events = [
+        (
+            "response.created",
+            json!({
+                "type": "response.created",
+                "response": {
+                    "id": response_id,
+                    "object": "response",
+                    "created_at": created_at,
+                    "status": "in_progress",
+                    "model": model,
+                    "output": []
+                }
+            }),
+        ),
+        (
+            "response.output_item.added",
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": output
+            }),
+        ),
+        (
+            "response.output_item.done",
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": output
+            }),
+        ),
+        (
+            "response.completed",
+            json!({
+                "type": "response.completed",
+                "response": response
+            }),
+        ),
+    ];
+
+    let mut body = String::new();
+    for (event, data) in events {
+        body.push_str("event: ");
+        body.push_str(event);
+        body.push('\n');
+        body.push_str("data: ");
+        body.push_str(
+            &serde_json::to_string(&data).expect("local compaction probe event should serialize"),
+        );
+        body.push_str("\n\n");
+    }
+    body.push_str("data: [DONE]\n\n");
+    body.into_bytes()
+}
+
 fn openai_responses_local_probe_sse_body(response: &Value) -> Vec<u8> {
     let response_id = response
         .get("id")
@@ -1564,6 +1694,7 @@ async fn record_local_openai_probe_usage(
     model: &str,
     answer: &LocalProbeAnswer,
     stream: bool,
+    is_compaction: bool,
 ) {
     if !state.usage_runtime.is_enabled() {
         return;
@@ -1617,6 +1748,10 @@ async fn record_local_openai_probe_usage(
     );
     metadata.insert("client_requested_stream".to_string(), Value::Bool(stream));
     metadata.insert(UPSTREAM_IS_STREAM_KEY.to_string(), Value::Bool(false));
+    metadata.insert(
+        "local_probe_compaction".to_string(),
+        Value::Bool(is_compaction),
+    );
 
     let content_type = if stream {
         "text/event-stream"
@@ -1659,11 +1794,22 @@ async fn record_local_openai_probe_usage(
         request_body,
         response_headers: Some(response_headers.clone()),
         client_response_headers: Some(response_headers),
-        client_response_body: Some(json!({
-            "local_probe": true,
-            "kind": answer.kind.as_str(),
-            "output_text": answer.text
-        })),
+        client_response_body: Some(if is_compaction {
+            json!({
+                "local_probe": true,
+                "kind": answer.kind.as_str(),
+                "output": [{
+                    "type": "compaction",
+                    "encrypted_content": answer.text
+                }]
+            })
+        } else {
+            json!({
+                "local_probe": true,
+                "kind": answer.kind.as_str(),
+                "output_text": answer.text
+            })
+        }),
         route_family: decision.and_then(|value| value.route_family.clone()),
         route_kind: decision.and_then(|value| value.route_kind.clone()),
         execution_path: Some(EXECUTION_PATH_LOCAL_AI_PUBLIC.to_string()),
@@ -2450,7 +2596,9 @@ mod tests {
         arithmetic_probe_answer, estimate_claude_count_tokens, local_probe_chat_response_id,
         local_probe_request_headers_json, local_probe_response_id,
         maybe_build_local_openai_probe_response, openai_chat_local_probe_answer,
-        openai_chat_local_probe_sse_body, openai_responses_local_probe_answer,
+        openai_chat_local_probe_sse_body, openai_responses_has_compaction_trigger,
+        openai_responses_local_compaction_probe_payload,
+        openai_responses_local_compaction_probe_sse_body, openai_responses_local_probe_answer,
         openai_responses_local_probe_payload, openai_responses_local_probe_sse_body,
         parse_openai_image_validation_input, validate_openai_image_n, LocalProbeKind,
         OpenAiImageOperation, LOCAL_PROBE_RESPONSE_HEADER,
@@ -2921,6 +3069,58 @@ mod tests {
         assert_eq!(response["output"][0]["id"], json!("msg_probe"));
         assert!(body.contains("\"item_id\":\"msg_probe\""));
         assert!(body.contains("\"output_text\":\"21\""));
+        assert!(body.ends_with("data: [DONE]\n\n"));
+    }
+
+    #[test]
+    fn responses_compaction_probe_is_detected_from_trigger_item() {
+        let payload = json!({
+            "model": "gpt-5.6-sol",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": "Respond with OK."
+                },
+                {"type": "compaction_trigger"}
+            ]
+        });
+
+        assert!(openai_responses_has_compaction_trigger(&payload));
+        assert!(!openai_responses_has_compaction_trigger(&json!({
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": "Respond with OK."
+            }]
+        })));
+    }
+
+    #[test]
+    fn local_compaction_probe_sse_contains_one_compaction_output_item() {
+        let response = openai_responses_local_compaction_probe_payload(
+            "resp_compact_probe",
+            "gpt-5.6-sol",
+            "OK",
+            1,
+        );
+        assert_eq!(response["output"].as_array().map(Vec::len), Some(1));
+        assert_eq!(response["output"][0]["type"], json!("compaction"));
+        assert_eq!(response["output"][0]["encrypted_content"], json!("OK"));
+
+        let body = String::from_utf8(openai_responses_local_compaction_probe_sse_body(&response))
+            .expect("compaction SSE body should be utf-8");
+        let done_items = body
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter(|line| *line != "[DONE]")
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|event| event["type"] == "response.output_item.done")
+            .collect::<Vec<_>>();
+
+        assert_eq!(done_items.len(), 1);
+        assert_eq!(done_items[0]["item"]["type"], json!("compaction"));
+        assert!(body.contains("event: response.completed"));
         assert!(body.ends_with("data: [DONE]\n\n"));
     }
 
