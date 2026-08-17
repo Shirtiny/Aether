@@ -5,6 +5,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::Engine as _;
 use bytes::Bytes;
 use futures_util::StreamExt;
 
@@ -1684,6 +1685,14 @@ where
                             Ok(classification) => classification,
                             Err(error) => {
                                 let reason = error.message();
+                                let request_id = super::runtime::step_usage_request_id(step);
+                                log_invalid_official_frame(
+                                    request_id.as_str(),
+                                    key_id,
+                                    step.model.as_str(),
+                                    &text,
+                                    reason,
+                                );
                                 return fail_upstream_protocol(
                                     client, step, key_id, reason, None, deadlines,
                                 )
@@ -2016,6 +2025,36 @@ fn log_upstream_protocol_failure(
         protocol_reason = message,
         transport_detail = transport_detail.unwrap_or("none"),
         "official Codex WebSocket protocol failed"
+    );
+}
+
+fn log_invalid_official_frame(
+    request_id: &str,
+    key_id: &str,
+    model: &str,
+    frame: &Bytes,
+    reason: &'static str,
+) {
+    let (frame_encoding, frame_content) = match std::str::from_utf8(frame) {
+        Ok(content) => ("utf8", content.to_owned()),
+        Err(_) => (
+            "base64",
+            base64::engine::general_purpose::STANDARD.encode(frame),
+        ),
+    };
+    tracing::warn!(
+        event_name = "codex_ws_official_invalid_frame",
+        log_type = "ops",
+        status = "failed",
+        status_code = http::StatusCode::BAD_GATEWAY.as_u16(),
+        request_id,
+        key_id,
+        model,
+        protocol_reason = reason,
+        frame_bytes = frame.len(),
+        frame_encoding,
+        frame_content = %frame_content,
+        "raw official Codex WebSocket frame could not be classified"
     );
 }
 
@@ -3151,6 +3190,67 @@ mod tests {
             "official server emitted an invalid turn state"
         );
         assert_eq!(log["transport_detail"], "none");
+    }
+
+    #[test]
+    fn invalid_official_frame_log_preserves_non_utf8_bytes_as_base64() {
+        let writer = SharedLogBuffer::default();
+        let dispatch = json_log_dispatch(writer.clone());
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+
+        log_invalid_official_frame(
+            "ws-test",
+            "key-test",
+            "gpt-test",
+            &Bytes::from_static(&[0xff, 0x00]),
+            "official server emitted invalid JSON",
+        );
+
+        let log = writer
+            .lines()
+            .into_iter()
+            .find(|log| log["event_name"] == "codex_ws_official_invalid_frame")
+            .expect("invalid frame log should be emitted");
+        assert_eq!(log["frame_bytes"], 2);
+        assert_eq!(log["frame_encoding"], "base64");
+        assert_eq!(log["frame_content"], "/wA=");
+        assert_eq!(
+            log["protocol_reason"],
+            "official server emitted invalid JSON"
+        );
+        assert_eq!(log["request_id"], "ws-test");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn invalid_official_response_frame_is_logged_with_raw_content() {
+        let writer = SharedLogBuffer::default();
+        let dispatch = json_log_dispatch(writer.clone());
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        let raw_frame = r#"{"type":"response.delta","delta":"unterminated""#;
+        let (official, _) = ScriptedPeer::new([(Duration::ZERO, relay_text(raw_frame))]);
+        let runtime = TestRuntime::new(Box::new(official), false);
+        let (client, client_sent) = ScriptedPeer::new([(Duration::ZERO, relay_text(request()))]);
+
+        run_codex_ws_session(Box::new(client), &runtime).await;
+
+        assert!(sent_text_contains(&client_sent, "\"status\":502"));
+        let logs = writer.lines();
+        let log = logs
+            .iter()
+            .find(|log| log["event_name"] == "codex_ws_official_invalid_frame")
+            .expect("invalid official frame should be logged");
+        assert_eq!(log["frame_encoding"], "utf8");
+        assert_eq!(log["frame_content"], raw_frame);
+        assert_eq!(
+            log["protocol_reason"],
+            "official server emitted invalid JSON"
+        );
+        assert_eq!(log["frame_bytes"], raw_frame.len());
+        assert_eq!(log["key_id"], "key-1");
+        assert_eq!(log["model"], "gpt-5.4");
+        assert!(log["request_id"]
+            .as_str()
+            .is_some_and(|request_id| request_id.starts_with("ws-")));
     }
 
     #[tokio::test(flavor = "current_thread")]
