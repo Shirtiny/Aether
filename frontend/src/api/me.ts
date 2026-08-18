@@ -70,6 +70,8 @@ export interface UsageRecordDetail {
   upstream_is_stream?: boolean
   client_requested_stream?: boolean
   client_is_stream?: boolean
+  is_compaction?: boolean
+  compaction_version?: string | null
   client_family?: string | null
   client_ip?: string | null
   user_agent?: string | null
@@ -367,6 +369,8 @@ export const meApi = {
       upstream_is_stream?: boolean | null
       client_requested_stream?: boolean | null
       client_is_stream?: boolean | null
+      is_compaction?: boolean | null
+      compaction_version?: string | null
       has_format_conversion?: boolean | null
       has_fallback?: boolean | null
       target_model?: string | null

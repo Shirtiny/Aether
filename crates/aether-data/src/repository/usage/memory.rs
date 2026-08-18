@@ -318,6 +318,9 @@ fn usage_matches_list_query(item: &StoredRequestUsageAudit, query: &UsageAuditLi
     if query.ping_only && !usage_metadata_bool(item, "is_ping") {
         return false;
     }
+    if query.compaction_only && !usage_metadata_bool(item, "is_compaction") {
+        return false;
+    }
 
     true
 }
@@ -526,6 +529,9 @@ fn usage_matches_keyword_search_query(
         return false;
     }
     if query.ping_only && !usage_metadata_bool(item, "is_ping") {
+        return false;
+    }
+    if query.compaction_only && !usage_metadata_bool(item, "is_compaction") {
         return false;
     }
 
@@ -5020,6 +5026,28 @@ mod tests {
         assert_eq!(by_name.len(), 1);
         assert_eq!(by_name[0].request_id, "req-cafecode-1");
         assert!(by_partial_name.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_usage_audits_filters_by_compaction_metadata() {
+        let mut compaction = sample_usage("req-compaction", 1);
+        compaction.request_metadata = Some(json!({
+            "is_compaction": true,
+            "compaction_version": "v2"
+        }));
+        let normal = sample_usage("req-normal", 2);
+        let repository = InMemoryUsageReadRepository::seed(vec![compaction, normal]);
+
+        let items = repository
+            .list_usage_audits(&crate::repository::usage::UsageAuditListQuery {
+                compaction_only: true,
+                ..Default::default()
+            })
+            .await
+            .expect("list by compaction metadata should succeed");
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].request_id, "req-compaction");
     }
 
     #[tokio::test]

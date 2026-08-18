@@ -742,6 +742,8 @@ pub struct UsageAuditListQuery {
     pub error_only: bool,
     pub risk_control_only: bool,
     pub ping_only: bool,
+    #[serde(default)]
+    pub compaction_only: bool,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
     pub newest_first: bool,
@@ -767,6 +769,8 @@ pub struct UsageAuditKeywordSearchQuery {
     pub error_only: bool,
     pub risk_control_only: bool,
     pub ping_only: bool,
+    #[serde(default)]
+    pub compaction_only: bool,
     pub keywords: Vec<String>,
     pub matched_user_ids_by_keyword: Vec<Vec<String>>,
     pub auth_user_reader_available: bool,

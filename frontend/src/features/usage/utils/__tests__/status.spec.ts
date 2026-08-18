@@ -4,6 +4,7 @@ import {
   formatUsageStreamLabel,
   hasUsageFallback,
   hasUsageRetry,
+  isUsageRecordCompaction,
   isUsageRecordFailed,
   isUsageRecordPing,
   isUsageRecordRiskControl,
@@ -197,6 +198,16 @@ describe('usage status helpers', () => {
 
     expect(isUsageRecordPing(buildUsageRecord({
       is_ping: false,
+    }))).toBe(false)
+  })
+
+  it('detects compaction records from the backend flag only', () => {
+    expect(isUsageRecordCompaction(buildUsageRecord({
+      is_compaction: true,
+    }))).toBe(true)
+
+    expect(isUsageRecordCompaction(buildUsageRecord({
+      is_compaction: false,
     }))).toBe(false)
   })
 

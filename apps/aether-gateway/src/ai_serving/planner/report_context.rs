@@ -230,10 +230,48 @@ pub(crate) fn insert_openai_compaction_metadata(
     request_path: Option<&str>,
     request_body: Option<&Value>,
 ) {
-    let path = request_path.map(str::trim).unwrap_or_default();
-    let normalized_path = crate::ai_serving::normalize_api_format_alias(path);
-    let client_format = crate::ai_serving::normalize_api_format_alias(client_api_format);
-    let provider_format = crate::ai_serving::normalize_api_format_alias(provider_api_format);
+    let version = openai_compaction_version(
+        Some(client_api_format),
+        Some(provider_api_format),
+        request_path,
+        request_body,
+    );
+    let Some(version) = version else {
+        return;
+    };
+
+    extra_fields.insert(
+        COMPACTION_IS_COMPACTION_METADATA_KEY.to_string(),
+        Value::Bool(true),
+    );
+    extra_fields.insert(
+        COMPACTION_VERSION_METADATA_KEY.to_string(),
+        Value::String(version.to_string()),
+    );
+}
+
+/// Returns the compaction protocol version represented by a request.
+///
+/// This deliberately accepts optional format values because a runtime-miss
+/// record can be created before a candidate (and therefore its format) exists.
+/// In that case the public route still provides enough information to classify
+/// the request.
+pub(crate) fn openai_compaction_version(
+    client_api_format: Option<&str>,
+    provider_api_format: Option<&str>,
+    request_path: Option<&str>,
+    request_body: Option<&Value>,
+) -> Option<&'static str> {
+    let normalized_path = request_path
+        .map(str::trim)
+        .map(crate::ai_serving::normalize_api_format_alias)
+        .unwrap_or_default();
+    let client_format = client_api_format
+        .map(crate::ai_serving::normalize_api_format_alias)
+        .unwrap_or_default();
+    let provider_format = provider_api_format
+        .map(crate::ai_serving::normalize_api_format_alias)
+        .unwrap_or_default();
     let is_legacy_compact_endpoint = normalized_path == "openai:responses:compact"
         || client_format == "openai:responses:compact";
     let is_responses_request = matches!(
@@ -255,25 +293,13 @@ pub(crate) fn insert_openai_compaction_metadata(
                 .any(|item| item.get("type").and_then(Value::as_str) == Some("compaction_trigger"))
         });
 
-    let version = if has_compaction_trigger && is_responses_request && !is_legacy_compact_endpoint {
-        Some("v2")
-    } else if is_legacy_compact_endpoint {
+    if is_legacy_compact_endpoint {
         Some("legacy")
+    } else if has_compaction_trigger && is_responses_request {
+        Some("v2")
     } else {
         None
-    };
-    let Some(version) = version else {
-        return;
-    };
-
-    extra_fields.insert(
-        COMPACTION_IS_COMPACTION_METADATA_KEY.to_string(),
-        Value::Bool(true),
-    );
-    extra_fields.insert(
-        COMPACTION_VERSION_METADATA_KEY.to_string(),
-        Value::String(version.to_string()),
-    );
+    }
 }
 
 pub(crate) fn insert_grok_response_tool_refs(
@@ -407,6 +433,22 @@ mod tests {
         );
         assert_eq!(v2.get("is_compaction"), Some(&Value::Bool(true)));
         assert_eq!(v2.get("compaction_version"), Some(&json!("v2")));
+
+        let mut converted_v2 = Map::new();
+        insert_openai_compaction_metadata(
+            &mut converted_v2,
+            "openai:responses",
+            "openai:responses:compact",
+            Some("/v1/responses"),
+            Some(&json!({
+                "input": [{"type": "compaction_trigger"}]
+            })),
+        );
+        assert_eq!(
+            converted_v2.get("compaction_version"),
+            Some(&json!("v2")),
+            "provider-side compact adaptation must not relabel the client's v2 request"
+        );
 
         let mut legacy = Map::new();
         insert_openai_compaction_metadata(

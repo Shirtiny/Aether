@@ -301,6 +301,7 @@ pub fn admin_usage_matches_status(item: &StoredRequestUsageAudit, status: Option
         "failed" => admin_usage_is_failed(item),
         "risk_control" => admin_usage_is_risk_control(item),
         "ping" => admin_usage_is_ping(item),
+        "compaction" => admin_usage_is_compaction(item),
         "active" => matches!(item.status.as_str(), "pending" | "streaming"),
         "has_fallback" => admin_usage_has_fallback(item),
         _ => true,
@@ -2787,6 +2788,19 @@ mod tests {
 
         assert!(admin_usage_is_ping(&item));
         assert!(admin_usage_matches_status(&item, Some("ping")));
+    }
+
+    #[test]
+    fn compaction_status_matches_request_metadata_flag() {
+        let item = StoredRequestUsageAudit {
+            request_metadata: Some(json!({
+                "is_compaction": true
+            })),
+            ..sample_usage("completed", Some(200), None)
+        };
+
+        assert!(admin_usage_is_compaction(&item));
+        assert!(admin_usage_matches_status(&item, Some("compaction")));
     }
 
     #[test]

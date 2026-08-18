@@ -18,6 +18,10 @@ use base64::Engine as _;
 use serde_json::{json, Map, Value};
 use tracing::warn;
 
+use crate::ai_serving::{
+    openai_compaction_version, COMPACTION_IS_COMPACTION_METADATA_KEY,
+    COMPACTION_VERSION_METADATA_KEY,
+};
 use crate::constants::{
     EXECUTION_PATH_LOCAL_EXECUTION_RUNTIME_MISS, LOCAL_EXECUTION_RUNTIME_MISS_REASON_HEADER,
 };
@@ -362,6 +366,16 @@ pub(crate) async fn record_failed_usage_for_runtime_miss_request(
         "trace_id".to_string(),
         Value::String(request_id.to_string()),
     );
+    let original_request_body_json =
+        request_body.and_then(|body| serde_json::from_slice::<Value>(body.as_ref()).ok());
+    insert_runtime_miss_compaction_metadata(
+        &mut request_metadata,
+        decision,
+        diagnostic,
+        api_format.as_deref(),
+        provider_api_format.as_deref(),
+        original_request_body_json.as_ref(),
+    );
     let mut data = UsageEventData {
         user_id: context.auth_user_id.clone(),
         api_key_id: context.auth_api_key_id.clone(),
@@ -433,6 +447,78 @@ pub(crate) async fn record_failed_usage_for_runtime_miss_request(
             UsageEvent::new(UsageEventType::Failed, request_id, data),
         )
         .await;
+}
+
+fn insert_runtime_miss_compaction_metadata(
+    request_metadata: &mut Map<String, Value>,
+    decision: Option<&GatewayControlDecision>,
+    diagnostic: Option<&LocalExecutionRuntimeMissDiagnostic>,
+    client_api_format: Option<&str>,
+    provider_api_format: Option<&str>,
+    request_body: Option<&Value>,
+) {
+    let request_path = diagnostic
+        .and_then(|value| value.public_path.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            decision
+                .map(|value| value.public_path.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        });
+    let route_api_format = runtime_miss_route_api_format(decision, diagnostic);
+    let client_api_format = client_api_format
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| decision.and_then(|value| value.auth_endpoint_signature.as_deref()))
+        .or(route_api_format);
+    let provider_api_format = provider_api_format
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or(client_api_format);
+    let Some(version) = openai_compaction_version(
+        client_api_format,
+        provider_api_format,
+        request_path,
+        request_body,
+    ) else {
+        return;
+    };
+
+    request_metadata.insert(
+        COMPACTION_IS_COMPACTION_METADATA_KEY.to_string(),
+        Value::Bool(true),
+    );
+    request_metadata.insert(
+        COMPACTION_VERSION_METADATA_KEY.to_string(),
+        Value::String(version.to_string()),
+    );
+}
+
+fn runtime_miss_route_api_format(
+    decision: Option<&GatewayControlDecision>,
+    diagnostic: Option<&LocalExecutionRuntimeMissDiagnostic>,
+) -> Option<&'static str> {
+    let route_family = diagnostic
+        .and_then(|value| value.route_family.as_deref())
+        .or_else(|| decision.and_then(|value| value.route_family.as_deref()));
+    let route_kind = diagnostic
+        .and_then(|value| value.route_kind.as_deref())
+        .or_else(|| decision.and_then(|value| value.route_kind.as_deref()));
+    if !route_family
+        .map(|value| value.trim().eq_ignore_ascii_case("openai"))
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    match route_kind.map(str::trim) {
+        Some(value) if value.eq_ignore_ascii_case("responses:compact") => {
+            Some("openai:responses:compact")
+        }
+        Some(value) if value.eq_ignore_ascii_case("responses") => Some("openai:responses"),
+        _ => None,
+    }
 }
 
 pub(crate) fn beautify_local_execution_client_error_message(message: &str) -> String {
@@ -1045,16 +1131,89 @@ fn trimmed_non_empty(value: Option<&str>) -> Option<String> {
 mod tests {
     use super::{
         apply_runtime_miss_usage_routing, beautify_local_execution_client_error_message,
-        request_candidate_represents_provider_execution,
+        insert_runtime_miss_compaction_metadata, request_candidate_represents_provider_execution,
         select_last_runtime_miss_executed_candidate, RuntimeMissCandidateContext,
     };
     use crate::constants::EXECUTION_PATH_LOCAL_EXECUTION_RUNTIME_MISS;
+    use crate::control::GatewayControlDecision;
     use crate::state::LocalExecutionRuntimeMissDiagnostic;
     use aether_data_contracts::repository::candidates::{
         RequestCandidateStatus, StoredRequestCandidate,
     };
     use aether_usage_runtime::UsageEventData;
     use serde_json::{json, Map, Value};
+
+    #[test]
+    fn runtime_miss_metadata_identifies_compaction_without_a_candidate() {
+        let decision = GatewayControlDecision::synthetic(
+            "/v1/responses",
+            Some("ai_public".to_string()),
+            Some("openai".to_string()),
+            Some("responses".to_string()),
+            Some("openai:responses".to_string()),
+        );
+        let mut metadata = Map::new();
+        insert_runtime_miss_compaction_metadata(
+            &mut metadata,
+            Some(&decision),
+            None,
+            None,
+            None,
+            Some(&json!({
+                "input": [{"type": "compaction_trigger"}]
+            })),
+        );
+
+        assert_eq!(metadata.get("is_compaction"), Some(&Value::Bool(true)));
+        assert_eq!(metadata.get("compaction_version"), Some(&json!("v2")));
+    }
+
+    #[test]
+    fn runtime_miss_metadata_marks_retired_compact_endpoint_as_legacy() {
+        let diagnostic = LocalExecutionRuntimeMissDiagnostic {
+            route_family: Some("openai".to_string()),
+            route_kind: Some("responses:compact".to_string()),
+            public_path: Some("/v1/responses/compact".to_string()),
+            ..LocalExecutionRuntimeMissDiagnostic::default()
+        };
+        let mut metadata = Map::new();
+        insert_runtime_miss_compaction_metadata(
+            &mut metadata,
+            None,
+            Some(&diagnostic),
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(metadata.get("is_compaction"), Some(&Value::Bool(true)));
+        assert_eq!(metadata.get("compaction_version"), Some(&json!("legacy")));
+    }
+
+    #[test]
+    fn runtime_miss_metadata_ignores_compaction_shaped_input_on_non_responses_routes() {
+        let decision = GatewayControlDecision::synthetic(
+            "/v1/chat/completions",
+            Some("ai_public".to_string()),
+            Some("openai".to_string()),
+            Some("chat".to_string()),
+            Some("openai:chat".to_string()),
+        );
+        let mut metadata = Map::new();
+        insert_runtime_miss_compaction_metadata(
+            &mut metadata,
+            Some(&decision),
+            None,
+            None,
+            None,
+            Some(&json!({
+                "input": [{"type": "compaction_trigger"}]
+            })),
+        );
+
+        assert!(metadata.get("is_compaction").is_none());
+        assert!(metadata.get("compaction_version").is_none());
+    }
 
     #[test]
     fn local_execution_client_error_message_is_client_friendly() {

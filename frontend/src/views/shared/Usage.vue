@@ -161,6 +161,7 @@ import { reconcileActiveRequestDiscovery } from '@/features/usage/utils/activeRe
 import { mergePositiveTokenCount } from '@/features/usage/token-normalization'
 import {
   hasUsageFallback,
+  isUsageRecordCompaction,
   isUsageRecordPing,
   isUsageRecordRiskControl,
   isUsageRecordFailed,
@@ -433,6 +434,8 @@ const filteredRecords = computed(() => {
         records = records.filter(record => isUsageRecordRiskControl(record))
       } else if (filterStatus.value === 'ping') {
         records = records.filter(record => isUsageRecordPing(record))
+      } else if (filterStatus.value === 'compaction') {
+        records = records.filter(record => isUsageRecordCompaction(record))
       } else if (filterStatus.value === 'has_fallback') {
         records = records.filter(record => hasUsageFallback(record))
       } else if (filterStatus.value === 'has_retry') {
@@ -573,6 +576,12 @@ async function pollActiveRequests() {
         if (update.has_format_conversion != null) record.has_format_conversion = update.has_format_conversion
         if (typeof update.has_fallback === 'boolean') {
           record.has_fallback = record.has_fallback === true || update.has_fallback
+        }
+        if (update.is_compaction === true) {
+          record.is_compaction = true
+        }
+        if (typeof update.compaction_version === 'string') {
+          record.compaction_version = update.compaction_version
         }
         // 模型映射：streaming 时已可确定
         if ('target_model' in update && (typeof update.target_model === 'string' || update.target_model === null)) {

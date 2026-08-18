@@ -179,6 +179,9 @@
             <SelectItem value="ping">
               ping
             </SelectItem>
+            <SelectItem value="compaction">
+              压缩
+            </SelectItem>
             <SelectItem value="cancelled">
               已取消
             </SelectItem>
@@ -1554,6 +1557,7 @@ const statusFilterOptions: FilterOption[] = [
   { value: 'failed', label: '失败' },
   { value: 'risk_control', label: '风控' },
   { value: 'ping', label: 'ping' },
+  { value: 'compaction', label: '压缩' },
   { value: 'cancelled', label: '已取消' },
   { value: 'has_retry', label: '发生重试' },
   { value: 'has_fallback', label: '发生转移' },

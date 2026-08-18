@@ -59,6 +59,12 @@ export function isUsageRecordPing(record: UsageFailureSignal): boolean {
   return record.is_ping === true
 }
 
+export function isUsageRecordCompaction(
+  record: Pick<UsageRecord, 'is_compaction'>
+): boolean {
+  return record.is_compaction === true
+}
+
 export function resolveUsageStreamModes(
   record: Pick<
     UsageRecord,

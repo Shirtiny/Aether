@@ -65,6 +65,7 @@ fn apply_admin_usage_status_filter(query: &mut UsageAuditListQuery, status: Opti
         "standard" => query.is_stream = Some(false),
         "risk_control" => query.risk_control_only = true,
         "ping" => query.ping_only = true,
+        "compaction" => query.compaction_only = true,
         "error" | "failed" => query.error_only = true,
         "active" => {
             query.statuses = Some(vec!["pending".to_string(), "streaming".to_string()]);
@@ -626,6 +627,7 @@ fn build_admin_usage_keyword_search_query(
         error_only: base_query.error_only,
         risk_control_only: base_query.risk_control_only,
         ping_only: base_query.ping_only,
+        compaction_only: base_query.compaction_only,
         keywords,
         matched_user_ids_by_keyword: search_context.matched_user_ids_by_keyword,
         auth_user_reader_available,
@@ -930,4 +932,24 @@ pub(super) async fn maybe_build_local_admin_usage_summary_response(
     }
 
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_admin_usage_status_filter;
+    use aether_data_contracts::repository::usage::UsageAuditListQuery;
+
+    #[test]
+    fn compaction_status_enables_only_the_compaction_filter() {
+        let mut query = UsageAuditListQuery::default();
+
+        apply_admin_usage_status_filter(&mut query, Some("compaction"));
+
+        assert!(query.compaction_only);
+        assert!(!query.risk_control_only);
+        assert!(!query.ping_only);
+        assert!(!query.error_only);
+        assert_eq!(query.is_stream, None);
+        assert_eq!(query.statuses, None);
+    }
 }

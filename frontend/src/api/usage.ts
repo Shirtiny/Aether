@@ -484,7 +484,7 @@ export const usageApi = {
     model?: string
     provider?: string
     api_format?: string  // API 格式筛选（如 openai:chat, claude:messages）
-    status?: string // 'stream' | 'standard' | 'error' | 'risk_control' | 'ping'
+    status?: string // 'stream' | 'standard' | 'error' | 'risk_control' | 'ping' | 'compaction'
     hide_unknown?: boolean
     limit?: number
     offset?: number
@@ -540,6 +540,8 @@ export const usageApi = {
       ws_step?: boolean | null
       client_requested_stream?: boolean | null
       client_is_stream?: boolean | null
+      is_compaction?: boolean | null
+      compaction_version?: string | null
       has_format_conversion?: boolean | null
       has_fallback?: boolean | null
       target_model?: string | null

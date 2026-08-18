@@ -124,6 +124,24 @@ fn hide_unknown_filter_excludes_unknown_model_and_provider_labels() {
     assert!(sql.contains("NOT IN ('unknown', 'unknow')"));
 }
 
+#[test]
+fn compaction_filter_matches_the_partial_index_predicate() {
+    let mut builder = QueryBuilder::<Postgres>::new(r#"SELECT * FROM "usage""#);
+    let mut has_where = false;
+
+    super::push_postgres_usage_compaction_filter(&mut builder, &mut has_where);
+
+    let predicate = r#"("usage".request_metadata->>'is_compaction') = 'true'"#;
+    assert!(builder.sql().contains(predicate));
+
+    let migration = include_str!(
+        "../../../../migrations/postgres/20260818155000_add_usage_compaction_filter_index.sql"
+    );
+    assert!(migration.contains("-- no-transaction"));
+    assert!(migration.contains("(created_at DESC, id ASC)"));
+    assert!(migration.contains("(request_metadata->>'is_compaction') = 'true'"));
+}
+
 #[tokio::test]
 async fn repository_constructs_from_lazy_pool() {
     let factory = PostgresPoolFactory::new(PostgresPoolConfig {

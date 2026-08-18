@@ -67,6 +67,10 @@ pub(crate) use self::planner::{
     GatewayProviderTransportSnapshot, LocalExecutionAttemptSource, LocalExecutionCandidateKind,
     LocalResolvedOAuthRequestAuth, PlannerAppState, SkippedLocalExecutionCandidate,
 };
+pub(crate) use self::planner::{
+    openai_compaction_version, COMPACTION_IS_COMPACTION_METADATA_KEY,
+    COMPACTION_VERSION_METADATA_KEY,
+};
 pub(crate) use self::pure::*;
 pub(crate) use self::transport::{
     append_transport_diagnostics_to_value, build_request_trace_proxy_value,

@@ -1503,6 +1503,15 @@ fn push_postgres_usage_ping_filter(builder: &mut QueryBuilder<'_, Postgres>, has
     builder.push(r#"("usage".request_metadata->>'is_ping') = 'true'"#);
 }
 
+fn push_postgres_usage_compaction_filter(
+    builder: &mut QueryBuilder<'_, Postgres>,
+    has_where: &mut bool,
+) {
+    builder.push(if *has_where { " AND " } else { " WHERE " });
+    *has_where = true;
+    builder.push(r#"("usage".request_metadata->>'is_compaction') = 'true'"#);
+}
+
 fn decode_usage_time_series_bucket_row(
     row: &PgRow,
 ) -> Result<StoredUsageTimeSeriesBucket, DataLayerError> {
@@ -2868,6 +2877,9 @@ OR (\"usage\".error_message IS NOT NULL AND BTRIM(\"usage\".error_message) <> ''
         if query.ping_only {
             push_postgres_usage_ping_filter(&mut builder, &mut has_where);
         }
+        if query.compaction_only {
+            push_postgres_usage_compaction_filter(&mut builder, &mut has_where);
+        }
 
         if query.newest_first {
             builder.push(" ORDER BY \"usage\".created_at DESC, \"usage\".id ASC");
@@ -3095,6 +3107,9 @@ OR (\"usage\".error_message IS NOT NULL AND BTRIM(\"usage\".error_message) <> ''
         if query.ping_only {
             push_postgres_usage_ping_filter(&mut builder, &mut has_where);
         }
+        if query.compaction_only {
+            push_postgres_usage_compaction_filter(&mut builder, &mut has_where);
+        }
         for (index, keyword) in query.keywords.iter().enumerate() {
             let keyword = keyword.trim();
             if keyword.is_empty() {
@@ -3310,6 +3325,9 @@ OR (\"usage\".error_message IS NOT NULL AND BTRIM(\"usage\".error_message) <> ''
         if query.ping_only {
             push_postgres_usage_ping_filter(&mut builder, &mut has_where);
         }
+        if query.compaction_only {
+            push_postgres_usage_compaction_filter(&mut builder, &mut has_where);
+        }
 
         let row = builder
             .build()
@@ -3433,6 +3451,9 @@ OR (\"usage\".error_message IS NOT NULL AND BTRIM(\"usage\".error_message) <> ''
         }
         if query.ping_only {
             push_postgres_usage_ping_filter(&mut builder, &mut has_where);
+        }
+        if query.compaction_only {
+            push_postgres_usage_compaction_filter(&mut builder, &mut has_where);
         }
         for (index, keyword) in query.keywords.iter().enumerate() {
             let keyword = keyword.trim();

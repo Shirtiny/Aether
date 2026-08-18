@@ -3,6 +3,7 @@ import type { UsageRecord, FilterStatusValue } from '../types'
 import {
   hasUsageFallback,
   hasUsageRetry,
+  isUsageRecordCompaction,
   isUsageRecordPing,
   isUsageRecordRiskControl,
   isUsageRecordFailed,
@@ -92,6 +93,8 @@ export function useUsageFilters(options: UseUsageFiltersOptions) {
         records = records.filter(record => isUsageRecordRiskControl(record))
       } else if (filterStatus.value === 'ping') {
         records = records.filter(record => isUsageRecordPing(record))
+      } else if (filterStatus.value === 'compaction') {
+        records = records.filter(record => isUsageRecordCompaction(record))
       } else if (filterStatus.value === 'has_fallback') {
         records = records.filter(record => hasUsageFallback(record))
       } else if (filterStatus.value === 'has_retry') {

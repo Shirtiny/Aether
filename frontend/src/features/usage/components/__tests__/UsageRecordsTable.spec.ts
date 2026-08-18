@@ -309,6 +309,21 @@ describe('UsageRecordsTable', () => {
     expect(root.textContent).toContain('Doubao Embedding')
   })
 
+  it('offers compaction as a request type filter', () => {
+    const root = mountUsageRecordsTable([buildRecord()])
+
+    expect(root.textContent).toContain('压缩')
+  })
+
+  it('shows the compaction marker on compacted records', () => {
+    const root = mountUsageRecordsTable([buildRecord({
+      is_compaction: true,
+      compaction_version: 'v2',
+    })])
+
+    expect(root.textContent).toContain('压缩 v2')
+  })
+
   it('emits hide unknown toggle changes', () => {
     const onUpdateHideUnknownRecords = vi.fn()
     const root = mountUsageRecordsTable([buildRecord()], {

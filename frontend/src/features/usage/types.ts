@@ -165,6 +165,7 @@ export type FilterStatusValue =
   'cancelled' |
   'risk_control' |
   'ping' |
+  'compaction' |
   'has_fallback' |
   'has_retry'
 

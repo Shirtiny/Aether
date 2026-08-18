@@ -607,6 +607,10 @@ OR (error_message IS NOT NULL AND TRIM(error_message) <> ''))",
         push_sqlite_usage_where(builder, has_where);
         builder.push("json_extract(request_metadata, '$.is_ping') = 1");
     }
+    if query.compaction_only {
+        push_sqlite_usage_where(builder, has_where);
+        builder.push("json_extract(request_metadata, '$.is_compaction') = 1");
+    }
 }
 
 fn push_sqlite_usage_keyword_filters(
@@ -634,6 +638,7 @@ fn push_sqlite_usage_keyword_filters(
             error_only: query.error_only,
             risk_control_only: query.risk_control_only,
             ping_only: query.ping_only,
+            compaction_only: query.compaction_only,
             limit: None,
             offset: None,
             newest_first: query.newest_first,
@@ -4562,6 +4567,30 @@ mod tests {
         assert!(sql.contains("TRIM"));
         assert!(sql.contains(" = "));
         assert!(!sql.contains("LIKE"));
+    }
+
+    #[test]
+    fn compaction_filter_matches_the_partial_index_predicate() {
+        let mut builder = QueryBuilder::<Sqlite>::new(r#"SELECT * FROM "usage""#);
+        let mut has_where = false;
+
+        super::push_sqlite_usage_list_filters(
+            &mut builder,
+            &UsageAuditListQuery {
+                compaction_only: true,
+                ..UsageAuditListQuery::default()
+            },
+            &mut has_where,
+        );
+
+        let predicate = "json_extract(request_metadata, '$.is_compaction') = 1";
+        assert!(builder.sql().contains(predicate));
+
+        let migration = include_str!(
+            "../../../migrations/sqlite/20260818155000_add_usage_compaction_filter_index.sql"
+        );
+        assert!(migration.contains("(created_at_unix_ms DESC, id ASC)"));
+        assert!(migration.contains(predicate));
     }
 
     #[tokio::test]

@@ -1933,6 +1933,15 @@ fn build_runtime_request_metadata_seed_from_parts(
             Value::Bool(upstream_is_stream),
         );
     }
+    if let Some(is_compaction) = context_bool(context, "is_compaction") {
+        metadata.insert("is_compaction".to_string(), Value::Bool(is_compaction));
+    }
+    if let Some(compaction_version) = context_string(context, "compaction_version") {
+        metadata.insert(
+            "compaction_version".to_string(),
+            Value::String(compaction_version),
+        );
+    }
     if let Some(api_key_is_standalone) = context_bool(context, "api_key_is_standalone") {
         metadata.insert(
             "api_key_is_standalone".to_string(),
@@ -3397,6 +3406,68 @@ mod tests {
             Some("all_candidates_skipped")
         );
         assert_eq!(record.request_metadata, None);
+    }
+
+    #[test]
+    fn lifecycle_and_event_seeds_preserve_compaction_metadata() {
+        let plan = ExecutionPlan {
+            request_id: "req-compaction-metadata-1".to_string(),
+            candidate_id: Some("cand-compaction-metadata-1".to_string()),
+            provider_name: Some("OpenAI".to_string()),
+            provider_id: "provider-1".to_string(),
+            endpoint_id: "endpoint-1".to_string(),
+            key_id: "key-1".to_string(),
+            method: "POST".to_string(),
+            url: "https://example.com/v1/responses".to_string(),
+            headers: BTreeMap::new(),
+            content_type: Some("application/json".to_string()),
+            content_encoding: None,
+            body: RequestBody::from_json(json!({
+                "model": "gpt-5.6",
+                "input": [{"type": "compaction_trigger"}]
+            })),
+            stream: true,
+            client_api_format: "openai:responses".to_string(),
+            provider_api_format: "openai:responses".to_string(),
+            model_name: Some("gpt-5.6".to_string()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        };
+        let context = json!({
+            "is_compaction": true,
+            "compaction_version": "v2"
+        });
+
+        let pending = build_pending_usage_record(&plan, Some(&context), 1_700_000_000)
+            .expect("pending usage should build");
+        assert_eq!(
+            pending.request_metadata,
+            Some(json!({
+                "is_compaction": true,
+                "compaction_version": "v2"
+            }))
+        );
+
+        let streaming =
+            build_streaming_usage_record(&plan, Some(&context), 200, None, 1_700_000_000)
+                .expect("streaming usage should build");
+        assert_eq!(
+            streaming.request_metadata,
+            Some(json!({
+                "is_compaction": true,
+                "compaction_version": "v2"
+            }))
+        );
+
+        let event_data = build_usage_event_data_seed(&plan, Some(&context));
+        assert_eq!(
+            event_data.request_metadata,
+            Some(json!({
+                "is_compaction": true,
+                "compaction_version": "v2"
+            }))
+        );
     }
 
     #[test]
