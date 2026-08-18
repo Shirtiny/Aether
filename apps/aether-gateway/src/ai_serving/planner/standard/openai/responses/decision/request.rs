@@ -1005,9 +1005,17 @@ async fn resolve_local_openai_search_candidate_payload_parts(
         }
     };
 
-    let Some(provider_request_body) =
-        build_openai_search_provider_body(body_json, prepared.mapped_model.as_str())
-    else {
+    let (upstream_is_stream, require_body_stream_field) = resolve_openai_search_stream_policy(
+        transport.endpoint.config.as_ref(),
+        transport.provider.provider_type.as_str(),
+        body_json,
+    );
+    let Some(provider_request_body) = build_openai_search_provider_body(
+        body_json,
+        prepared.mapped_model.as_str(),
+        upstream_is_stream,
+        require_body_stream_field,
+    ) else {
         mark_skipped_local_openai_responses_candidate(
             state,
             input,
@@ -1033,7 +1041,7 @@ async fn resolve_local_openai_search_candidate_payload_parts(
             header_rules: transport.endpoint.header_rules.as_ref(),
             provider_request_body: &provider_request_body,
             original_request_body: body_json,
-            upstream_is_stream: false,
+            upstream_is_stream,
         })
     else {
         mark_skipped_local_openai_responses_candidate(
@@ -1059,7 +1067,7 @@ async fn resolve_local_openai_search_candidate_payload_parts(
         transport.key.decrypted_auth_config.as_deref(),
     );
     apply_codex_pool_search_account_profile(&mut provider_request_headers, transport);
-    normalize_openai_search_headers(&mut provider_request_headers);
+    normalize_openai_search_headers(&mut provider_request_headers, upstream_is_stream);
 
     let Some(upstream_url) = crate::ai_serving::transport::build_local_openai_search_upstream_url(
         transport,
@@ -1091,7 +1099,7 @@ async fn resolve_local_openai_search_candidate_payload_parts(
         conversion_mode: ConversionMode::None,
         is_antigravity: false,
         envelope_name: None,
-        upstream_is_stream: false,
+        upstream_is_stream,
         transport: Arc::clone(transport),
         transport_profile,
         image_request_summary: None,
@@ -1139,7 +1147,31 @@ fn openai_search_candidate_matches_preexisting_affinity(
     target.key_id == candidate.key_id
 }
 
-fn build_openai_search_provider_body(body_json: &Value, mapped_model: &str) -> Option<Value> {
+fn resolve_openai_search_stream_policy(
+    endpoint_config: Option<&Value>,
+    provider_type: &str,
+    body_json: &Value,
+) -> (bool, bool) {
+    let force_body_stream_field = endpoint_config_forces_body_stream_field(endpoint_config);
+    let upstream_is_stream = resolve_upstream_is_stream_for_provider(
+        endpoint_config,
+        provider_type,
+        "openai:search",
+        false,
+        false,
+    );
+    (
+        upstream_is_stream,
+        request_requires_body_stream_field(body_json, force_body_stream_field),
+    )
+}
+
+fn build_openai_search_provider_body(
+    body_json: &Value,
+    mapped_model: &str,
+    upstream_is_stream: bool,
+    require_body_stream_field: bool,
+) -> Option<Value> {
     let mut object = body_json.as_object()?.clone();
     let mapped_model = mapped_model.trim();
     if mapped_model.is_empty() {
@@ -1148,10 +1180,36 @@ fn build_openai_search_provider_body(body_json: &Value, mapped_model: &str) -> O
     object.insert("model".to_string(), Value::String(mapped_model.to_string()));
     object.remove("prompt_cache_key");
     object.remove("prompt_cache_retention");
-    Some(Value::Object(object))
+    let mut body = Value::Object(object);
+    enforce_openai_search_body_stream_field(
+        &mut body,
+        upstream_is_stream,
+        require_body_stream_field,
+    );
+    Some(body)
 }
 
-fn normalize_openai_search_headers(headers: &mut BTreeMap<String, String>) {
+fn enforce_openai_search_body_stream_field(
+    body: &mut Value,
+    upstream_is_stream: bool,
+    require_body_stream_field: bool,
+) {
+    let Some(object) = body.as_object_mut() else {
+        return;
+    };
+    // Search remains a sync-only client surface; this field only adapts relays
+    // whose endpoint policy explicitly requires a streamed upstream request.
+    if upstream_is_stream || require_body_stream_field || object.contains_key("stream") {
+        object.insert("stream".to_string(), Value::Bool(upstream_is_stream));
+    } else {
+        object.remove("stream");
+    }
+}
+
+fn normalize_openai_search_headers(
+    headers: &mut BTreeMap<String, String>,
+    upstream_is_stream: bool,
+) {
     const BLOCKED: &[&str] = &[
         "openai-beta",
         "x-codex-installation-id",
@@ -1167,7 +1225,15 @@ fn normalize_openai_search_headers(headers: &mut BTreeMap<String, String>) {
             .any(|blocked| key.eq_ignore_ascii_case(blocked))
     });
     headers.insert("content-type".to_string(), "application/json".to_string());
-    headers.insert("accept".to_string(), "application/json".to_string());
+    headers.insert(
+        "accept".to_string(),
+        if upstream_is_stream {
+            "text/event-stream"
+        } else {
+            "application/json"
+        }
+        .to_string(),
+    );
 
     headers.retain(|key, _| !key.eq_ignore_ascii_case("version"));
     let version = headers
@@ -2152,7 +2218,7 @@ mod tests {
             "future_field": {"must_survive": true}
         });
 
-        let provider_body = build_openai_search_provider_body(&body, "mapped-model")
+        let provider_body = build_openai_search_provider_body(&body, "mapped-model", false, false)
             .expect("search body should build");
 
         assert_eq!(provider_body["model"], "mapped-model");
@@ -2160,6 +2226,72 @@ mod tests {
         assert_eq!(provider_body["future_field"]["must_survive"], true);
         assert!(provider_body.get("prompt_cache_key").is_none());
         assert!(provider_body.get("prompt_cache_retention").is_none());
+    }
+
+    #[test]
+    fn openai_search_stream_policy_controls_upstream_body() {
+        let body = json!({
+            "id": "search-session-1",
+            "model": "client-model",
+            "commands": {"search_query": [{"q": "primary source"}]}
+        });
+        let (upstream_is_stream, require_body_stream_field) =
+            resolve_openai_search_stream_policy(None, "custom", &body);
+        let provider_body = build_openai_search_provider_body(
+            &body,
+            "mapped-model",
+            upstream_is_stream,
+            require_body_stream_field,
+        )
+        .expect("search body should build");
+        assert!(!upstream_is_stream);
+        assert!(provider_body.get("stream").is_none());
+
+        let body_with_stream = json!({"model": "client-model", "stream": true});
+        let (upstream_is_stream, require_body_stream_field) =
+            resolve_openai_search_stream_policy(None, "custom", &body_with_stream);
+        let provider_body = build_openai_search_provider_body(
+            &body_with_stream,
+            "mapped-model",
+            upstream_is_stream,
+            require_body_stream_field,
+        )
+        .expect("search body should build");
+        assert!(!upstream_is_stream);
+        assert_eq!(provider_body.get("stream"), Some(&json!(false)));
+
+        let (upstream_is_stream, require_body_stream_field) = resolve_openai_search_stream_policy(
+            Some(&json!({"upstream_stream_policy": "force_stream"})),
+            "custom",
+            &body,
+        );
+        assert!(upstream_is_stream);
+        assert!(require_body_stream_field);
+
+        let provider_body = build_openai_search_provider_body(
+            &body,
+            "mapped-model",
+            upstream_is_stream,
+            require_body_stream_field,
+        )
+        .expect("search body should build");
+        assert_eq!(provider_body.get("stream"), Some(&json!(true)));
+
+        let body = json!({"model": "client-model", "stream": true});
+        let (upstream_is_stream, require_body_stream_field) = resolve_openai_search_stream_policy(
+            Some(&json!({"upstream_stream_policy": "force_non_stream"})),
+            "custom",
+            &body,
+        );
+        let provider_body = build_openai_search_provider_body(
+            &body,
+            "mapped-model",
+            upstream_is_stream,
+            require_body_stream_field,
+        )
+        .expect("search body should build");
+        assert!(!upstream_is_stream);
+        assert_eq!(provider_body.get("stream"), Some(&json!(false)));
     }
 
     #[test]
@@ -2190,7 +2322,7 @@ mod tests {
             ),
         ]);
 
-        normalize_openai_search_headers(&mut headers);
+        normalize_openai_search_headers(&mut headers, false);
 
         assert_eq!(
             headers.get("accept").map(String::as_str),
@@ -2201,6 +2333,12 @@ mod tests {
         assert!(!headers.contains_key("session_id"));
         assert!(!headers.contains_key("x-codex-installation-id"));
         assert!(!headers.contains_key("x-openai-internal-codex-responses-lite"));
+
+        normalize_openai_search_headers(&mut headers, true);
+        assert_eq!(
+            headers.get("accept").map(String::as_str),
+            Some("text/event-stream")
+        );
     }
 
     #[test]

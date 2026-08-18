@@ -1462,6 +1462,7 @@ fn is_openai_responses_finalize_kind(report_kind: &str) -> bool {
 fn standard_same_format_api_format(report_kind: &str) -> Option<&'static str> {
     match report_kind {
         "openai_chat_sync_finalize" => Some("openai:chat"),
+        "openai_search_sync_finalize" => Some("openai:search"),
         "claude_chat_sync_finalize" => Some("claude:messages"),
         "gemini_chat_sync_finalize" => Some("gemini:generate_content"),
         "openai_embedding_sync_finalize" => Some("openai:embedding"),
@@ -1474,10 +1475,35 @@ fn standard_same_format_api_format(report_kind: &str) -> Option<&'static str> {
 fn aggregate_same_format_stream_sync_response(api_format: &str, body: &[u8]) -> Option<Value> {
     match api_format {
         "openai:chat" => aggregate_openai_chat_stream_sync_response(body),
+        "openai:search" => aggregate_openai_search_stream_sync_response(body),
         "claude:messages" => aggregate_claude_stream_sync_response(body),
         "gemini:generate_content" => aggregate_gemini_stream_sync_response(body),
         _ => None,
     }
+}
+
+fn aggregate_openai_search_stream_sync_response(body: &[u8]) -> Option<Value> {
+    if let Ok(value) = serde_json::from_slice::<Value>(body) {
+        if let Some(response) = openai_search_response_from_stream_value(&value) {
+            return Some(response);
+        }
+    }
+
+    parse_stream_json_events(body)?
+        .iter()
+        .rev()
+        .find_map(openai_search_response_from_stream_value)
+}
+
+fn openai_search_response_from_stream_value(value: &Value) -> Option<Value> {
+    if value.get("output").and_then(Value::as_str).is_some() {
+        return Some(value.clone());
+    }
+
+    ["response", "result"]
+        .iter()
+        .find_map(|key| value.get(*key))
+        .and_then(openai_search_response_from_stream_value)
 }
 
 fn is_openai_responses_family_api_format(api_format: &str) -> bool {
@@ -4823,6 +4849,63 @@ mod tests {
             product,
             StandardSyncFinalizeNormalizedProduct::CrossFormat(_)
         ));
+    }
+
+    #[test]
+    fn standard_sync_finalize_product_aggregates_streamed_openai_search_json() {
+        let body = json!({
+            "encrypted_output": null,
+            "output": "search output",
+            "results": [{"url": "https://example.test/source"}]
+        });
+        let report_context = json!({
+            "provider_api_format": "openai:search",
+            "client_api_format": "openai:search",
+            "needs_conversion": false,
+        });
+
+        let product = maybe_build_standard_sync_finalize_product_from_normalized_payload(
+            "openai_search_sync_finalize",
+            200,
+            Some(&report_context),
+            None,
+            Some(&base64::engine::general_purpose::STANDARD.encode(body.to_string())),
+        )
+        .expect("dispatch should succeed");
+
+        assert_eq!(
+            product,
+            Some(StandardSyncFinalizeNormalizedProduct::SuccessBody(body))
+        );
+    }
+
+    #[test]
+    fn standard_sync_finalize_product_unwraps_openai_search_sse_response() {
+        let body = concat!(
+            "event: search.completed\n",
+            "data: {\"type\":\"search.completed\",\"response\":{\"encrypted_output\":null,\"output\":\"search output\",\"results\":[]}}\n\n",
+        );
+        let report_context = json!({
+            "provider_api_format": "openai:search",
+            "client_api_format": "openai:search",
+            "needs_conversion": false,
+        });
+
+        let product = maybe_build_standard_sync_finalize_product_from_normalized_payload(
+            "openai_search_sync_finalize",
+            200,
+            Some(&report_context),
+            None,
+            Some(&base64::engine::general_purpose::STANDARD.encode(body)),
+        )
+        .expect("dispatch should succeed")
+        .expect("dispatch should produce a product");
+
+        let StandardSyncFinalizeNormalizedProduct::SuccessBody(body) = product else {
+            panic!("search SSE should aggregate to a same-format JSON response")
+        };
+        assert_eq!(body["output"], "search output");
+        assert_eq!(body["results"], json!([]));
     }
 
     #[test]
