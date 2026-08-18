@@ -282,6 +282,13 @@
               >
                 WS
               </Badge>
+              <Badge
+                v-if="record.is_compaction"
+                variant="outline"
+                class="h-4 shrink-0 whitespace-nowrap rounded-full border-teal-500/40 bg-teal-500/10 px-1.5 text-[10px] leading-4 text-teal-700 dark:text-teal-300"
+              >
+                {{ record.compaction_version === 'v2' ? '压缩 v2' : '压缩' }}
+              </Badge>
               <!-- 状态 Badge -->
               <Badge
                 v-if="isUsageRecordFailed(record)"
@@ -1009,6 +1016,13 @@
                 class="whitespace-nowrap border-violet-500/40 bg-violet-500/10 text-violet-700 dark:text-violet-300"
               >
                 WS
+              </Badge>
+              <Badge
+                v-if="record.is_compaction"
+                variant="outline"
+                class="whitespace-nowrap border-teal-500/40 bg-teal-500/10 text-teal-700 dark:text-teal-300"
+              >
+                {{ record.compaction_version === 'v2' ? '压缩 v2' : '压缩' }}
               </Badge>
               <!-- 优先显示请求状态 -->
               <Badge

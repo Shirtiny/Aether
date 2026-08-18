@@ -755,6 +755,8 @@ fn compact_usage_report_context(context: Option<serde_json::Value>) -> Option<se
         "client_requested_stream",
         "upstream_is_stream",
         "ws_step",
+        "is_compaction",
+        "compaction_version",
         "client_session_affinity",
         "api_key_is_standalone",
         "original_request_body",
@@ -800,6 +802,8 @@ mod tests {
         let context = serde_json::json!({
             "request_id": "req-1",
             "ws_step": true,
+            "is_compaction": true,
+            "compaction_version": "v2",
             "cafecode_uid": "372",
             "cafecode_uname": "xiapeng8618",
             "client_session_affinity": {
@@ -821,6 +825,8 @@ mod tests {
 
         assert_eq!(compact["request_id"], "req-1");
         assert_eq!(compact["ws_step"], true);
+        assert_eq!(compact["is_compaction"], true);
+        assert_eq!(compact["compaction_version"], "v2");
         assert_eq!(compact["cafecode_uid"], "372");
         assert_eq!(compact["cafecode_uname"], "xiapeng8618");
         assert_eq!(

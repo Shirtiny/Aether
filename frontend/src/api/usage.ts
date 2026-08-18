@@ -31,6 +31,8 @@ export interface UsageRecord {
   has_fallback?: boolean // 🆕 是否发生了 fallback
   is_risk_control?: boolean
   is_ping?: boolean
+  is_compaction?: boolean
+  compaction_version?: string | null
   client_family?: string | null
   client_ip?: string | null
   user_agent?: string | null

@@ -5,8 +5,8 @@ use crate::ai_serving::build_request_trace_proxy_value;
 use crate::ai_serving::planner::decision_input::apply_provider_request_routing_policy_to_decision;
 use crate::ai_serving::planner::report_context::{
     build_local_execution_report_context, insert_grok_response_tool_refs,
-    insert_native_client_envelope_name, insert_provider_stream_event_api_format,
-    LocalExecutionReportContextParts,
+    insert_native_client_envelope_name, insert_openai_compaction_metadata,
+    insert_provider_stream_event_api_format, LocalExecutionReportContextParts,
 };
 use crate::ai_serving::planner::spec_metadata::local_openai_responses_spec_metadata;
 use crate::ai_serving::planner::{
@@ -84,6 +84,13 @@ pub(crate) async fn maybe_build_local_openai_responses_decision_payload_for_cand
         .or_else(|| resolve_transport_profile(&resolved.transport));
     let timeouts = resolve_transport_execution_timeouts(&resolved.transport);
     let mut extra_fields = serde_json::Map::new();
+    insert_openai_compaction_metadata(
+        &mut extra_fields,
+        spec_metadata.api_format,
+        &resolved.provider_api_format,
+        Some(parts.uri.path()),
+        Some(body_json),
+    );
     if spec.companion_search {
         extra_fields.insert(
             "candidate_anchor_api_format".to_string(),

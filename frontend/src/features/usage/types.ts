@@ -134,6 +134,8 @@ export interface UsageRecord {
   status?: RequestStatus  // 请求状态: pending, streaming, completed, failed
   is_risk_control?: boolean
   is_ping?: boolean
+  is_compaction?: boolean
+  compaction_version?: string | null
   created_at: string
   has_fallback?: boolean
   has_retry?: boolean

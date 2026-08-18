@@ -1403,6 +1403,12 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
             .await
             .map_err(|_| local_capacity_error("step_admission_unavailable"))?;
 
+        // Build the step-scoped lifecycle context before taking ownership of
+        // the body. Later response.create steps may be compaction requests on
+        // a reused connection, and their trigger must be visible to usage
+        // settlement even though the body is moved for materialization below.
+        let lifecycle_report_context =
+            step_report_context(candidate.lifecycle.report_context().cloned(), step, None);
         let body = std::mem::take(&mut step.value);
         // The long-lived candidate template intentionally carries no payload,
         // but each settled WS step still needs its own accepted client body for
@@ -1471,8 +1477,6 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
         let mut usage_plan = candidate.lifecycle.plan().clone();
         usage_plan.request_id = step_usage_request_id(step);
         usage_plan.body = aether_contracts::RequestBody::from_json(materialized_body.json);
-        let lifecycle_report_context =
-            step_report_context(candidate.lifecycle.report_context().cloned(), step, None);
         let lifecycle_seed = aether_usage_runtime::build_lifecycle_usage_seed(
             &usage_plan,
             lifecycle_report_context.as_ref(),
@@ -2170,6 +2174,36 @@ fn step_report_context(
         Some(serde_json::Value::Object(context)) => context,
         _ => serde_json::Map::new(),
     };
+    let has_compaction_trigger = |body: &serde_json::Value| {
+        body.get("input")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|items| {
+                items.iter().any(|item| {
+                    item.get("type").and_then(serde_json::Value::as_str)
+                        == Some("compaction_trigger")
+                })
+            })
+    };
+    let is_compaction_v2 = has_compaction_trigger(&step.value)
+        || original_request_body
+            .as_ref()
+            .is_some_and(has_compaction_trigger);
+    if is_compaction_v2 {
+        context.insert("is_compaction".to_string(), serde_json::Value::Bool(true));
+        context.insert(
+            "compaction_version".to_string(),
+            serde_json::Value::String("v2".to_string()),
+        );
+    } else if context
+        .get("compaction_version")
+        .and_then(serde_json::Value::as_str)
+        == Some("v2")
+    {
+        // A Codex WebSocket is reused across turns; do not carry a previous
+        // turn's compaction marker onto an ordinary response.create step.
+        context.remove("is_compaction");
+        context.remove("compaction_version");
+    }
     context.insert(
         "request_id".to_string(),
         serde_json::Value::String(step_usage_request_id(step)),
@@ -2558,7 +2592,9 @@ mod tests {
     #[test]
     fn step_report_context_creates_ws_metadata_without_base_context() {
         let step = ResponseCreateStep {
-            value: json!({}),
+            value: json!({
+                "input": [{"type": "compaction_trigger"}]
+            }),
             encoded_len: 2,
             model: "gpt-test".into(),
             previous_response_id: None,
@@ -2592,6 +2628,8 @@ mod tests {
 
         assert_eq!(context["request_id"], step_usage_request_id(&step));
         assert_eq!(context["ws_step"], true);
+        assert_eq!(context["is_compaction"], true);
+        assert_eq!(context["compaction_version"], "v2");
         assert_eq!(context["client_session_affinity"]["client_family"], "codex");
         assert_eq!(
             context["client_session_affinity"]["session_key"],
@@ -2639,6 +2677,43 @@ mod tests {
             context["client_session_affinity"]["session_key"],
             "account=account-1;session=planner-session"
         );
+    }
+
+    #[test]
+    fn step_report_context_detects_compaction_from_saved_body_after_step_body_is_taken() {
+        let step = ResponseCreateStep {
+            value: json!({}),
+            encoded_len: 2,
+            model: "gpt-test".into(),
+            previous_response_id: None,
+            logical_turn_id: None,
+            official_identity: OfficialRequestIdentity {
+                session_id: "session-1".into(),
+                thread_id: "thread-1".into(),
+                window_id: None,
+                turn_metadata: None,
+                parent_thread_id: None,
+                subagent: None,
+                responses_lite: false,
+            },
+            fence: StepFence {
+                correlation_id: "correlation-1".into(),
+                binding_epoch_id: "epoch-1".into(),
+                binding_generation: 1,
+            },
+        };
+        let context = step_report_context(
+            None,
+            &step,
+            Some(json!({
+                "type": "response.create",
+                "input": [{"type": "compaction_trigger"}]
+            })),
+        )
+        .expect("context should be created");
+
+        assert_eq!(context["is_compaction"], true);
+        assert_eq!(context["compaction_version"], "v2");
     }
 
     #[test]

@@ -1752,6 +1752,22 @@ async fn record_local_openai_probe_usage(
         "local_probe_compaction".to_string(),
         Value::Bool(is_compaction),
     );
+    if is_compaction {
+        let compaction_version = if decision
+            .and_then(|value| value.route_kind.as_deref())
+            .is_some_and(|route_kind| route_kind == "responses:compact")
+            || request_context.request_path == "/v1/responses/compact"
+        {
+            "legacy"
+        } else {
+            "v2"
+        };
+        metadata.insert("is_compaction".to_string(), Value::Bool(true));
+        metadata.insert(
+            "compaction_version".to_string(),
+            Value::String(compaction_version.to_string()),
+        );
+    }
 
     let content_type = if stream {
         "text/event-stream"

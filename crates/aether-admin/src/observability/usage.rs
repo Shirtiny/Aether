@@ -268,6 +268,19 @@ pub fn admin_usage_is_ping(item: &StoredRequestUsageAudit) -> bool {
         == Some(true)
 }
 
+pub fn admin_usage_is_compaction(item: &StoredRequestUsageAudit) -> bool {
+    item.request_metadata
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|metadata| metadata.get("is_compaction"))
+        .and_then(Value::as_bool)
+        == Some(true)
+}
+
+fn admin_usage_compaction_version(item: &StoredRequestUsageAudit) -> Option<&str> {
+    admin_usage_metadata_string(item, "compaction_version")
+}
+
 pub fn admin_usage_has_fallback(item: &StoredRequestUsageAudit) -> bool {
     item.has_fallback()
 }
@@ -1298,6 +1311,7 @@ fn admin_usage_active_request_json(
         "request_path": admin_usage_metadata_string(item, "request_path"),
         "request_path_and_query": admin_usage_metadata_string(item, "request_path_and_query"),
         "has_fallback": admin_usage_has_fallback(item),
+        "is_compaction": admin_usage_is_compaction(item),
     });
     if let Some(api_format) = item.api_format.as_ref() {
         value["api_format"] = json!(api_format);
@@ -1314,6 +1328,9 @@ fn admin_usage_active_request_json(
     }
     if let Some(service_tier) = item.provider_service_tier() {
         value["service_tier"] = json!(service_tier);
+    }
+    if let Some(compaction_version) = admin_usage_compaction_version(item) {
+        value["compaction_version"] = json!(compaction_version);
     }
     if let Some(image_progress) = image_progress {
         value["image_progress"] = image_progress.clone();
@@ -1414,6 +1431,10 @@ pub fn admin_usage_record_json(
     );
     object.insert("is_stream".to_string(), json!(item.is_stream));
     object.insert(
+        "is_compaction".to_string(),
+        json!(admin_usage_is_compaction(item)),
+    );
+    object.insert(
         UPSTREAM_IS_STREAM_KEY.to_string(),
         json!(upstream_is_stream),
     );
@@ -1454,6 +1475,11 @@ pub fn admin_usage_record_json(
         object,
         "request_path_and_query",
         admin_usage_metadata_string(item, "request_path_and_query"),
+    );
+    maybe_insert_string_field(
+        object,
+        "compaction_version",
+        admin_usage_compaction_version(item),
     );
     if let Some(reasoning_effort) = item.provider_reasoning_effort() {
         object.insert("reasoning_effort".to_string(), json!(reasoning_effort));
@@ -2670,10 +2696,10 @@ mod tests {
 
     use super::{
         admin_usage_active_request_json, admin_usage_client_is_stream, admin_usage_has_body_value,
-        admin_usage_has_fallback, admin_usage_is_failed, admin_usage_is_ping,
-        admin_usage_is_risk_control, admin_usage_is_success, admin_usage_is_ws,
-        admin_usage_matches_search, admin_usage_matches_status, admin_usage_matches_username,
-        admin_usage_reasoning_output_tokens, admin_usage_record_json,
+        admin_usage_has_fallback, admin_usage_is_compaction, admin_usage_is_failed,
+        admin_usage_is_ping, admin_usage_is_risk_control, admin_usage_is_success,
+        admin_usage_is_ws, admin_usage_matches_search, admin_usage_matches_status,
+        admin_usage_matches_username, admin_usage_reasoning_output_tokens, admin_usage_record_json,
         admin_usage_resolve_request_capture_body, admin_usage_total_tokens,
         admin_usage_upstream_is_stream, build_admin_usage_detail_payload,
     };
@@ -2825,6 +2851,49 @@ mod tests {
         assert_eq!(active["ws_step"], true);
         assert_eq!(detail["ws_step"], true);
         assert_eq!(detail["metadata"]["ws_step"], true);
+    }
+
+    #[test]
+    fn admin_usage_payloads_include_compaction_v2_marker() {
+        let item = StoredRequestUsageAudit {
+            request_metadata: Some(json!({
+                "is_compaction": true,
+                "compaction_version": "v2"
+            })),
+            ..sample_usage("completed", Some(200), None)
+        };
+
+        assert!(admin_usage_is_compaction(&item));
+
+        let record = admin_usage_record_json(
+            &item,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            false,
+            false,
+            None,
+        );
+        let active = admin_usage_active_request_json(&item, None, None, None);
+        let detail = build_admin_usage_detail_payload(
+            &item,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            false,
+            false,
+            None,
+            false,
+            None,
+            &BTreeMap::new(),
+        );
+
+        assert_eq!(record["is_compaction"], true);
+        assert_eq!(record["compaction_version"], "v2");
+        assert_eq!(active["is_compaction"], true);
+        assert_eq!(active["compaction_version"], "v2");
+        assert_eq!(detail["is_compaction"], true);
+        assert_eq!(detail["compaction_version"], "v2");
+        assert_eq!(detail["metadata"]["is_compaction"], true);
+        assert_eq!(detail["metadata"]["compaction_version"], "v2");
     }
 
     #[test]

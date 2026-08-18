@@ -171,6 +171,8 @@ fn copy_allowed_metadata_fields(source: &Map<String, Value>, target: &mut Map<St
     copy_bool(source, target, "ws_step");
     copy_bool(source, target, "is_risk_control");
     copy_bool(source, target, "is_ping");
+    copy_bool(source, target, "is_compaction");
+    copy_non_empty_string(source, target, "compaction_version");
     copy_non_empty_string(source, target, "ping_kind");
     copy_non_null_value(source, target, "client_session_affinity");
     copy_bool(source, target, "api_key_is_standalone");
@@ -220,6 +222,8 @@ fn move_allowed_metadata_fields(mut source: Map<String, Value>, target: &mut Map
     remove_bool(&mut source, target, "ws_step");
     remove_bool(&mut source, target, "is_risk_control");
     remove_bool(&mut source, target, "is_ping");
+    remove_bool(&mut source, target, "is_compaction");
+    remove_non_empty_string(&mut source, target, "compaction_version");
     remove_non_empty_string(&mut source, target, "ping_kind");
     remove_non_null_value(&mut source, target, "client_session_affinity");
     remove_bool(&mut source, target, "api_key_is_standalone");
@@ -830,6 +834,8 @@ mod tests {
             "upstream_is_stream": true,
             "ws_step": true,
             "is_risk_control": true,
+            "is_compaction": true,
+            "compaction_version": "v2",
             "api_key_is_standalone": true,
             "provider_request_body_base64_bytes": 512,
             "provider_response_body_base64_bytes": 1024,
@@ -865,6 +871,8 @@ mod tests {
                 "upstream_is_stream": true,
                 "ws_step": true,
                 "is_risk_control": true,
+                "is_compaction": true,
+                "compaction_version": "v2",
                 "api_key_is_standalone": true,
                 "provider_request_body_base64_bytes": 512,
                 "provider_response_body_base64_bytes": 1024,
@@ -1164,6 +1172,8 @@ mod tests {
                     "client_requested_stream": false,
                     "upstream_is_stream": true,
                     "ws_step": true,
+                    "is_compaction": true,
+                    "compaction_version": "v2",
                     "api_key_is_standalone": true,
                     "provider_id": "provider-1",
                     "model_id": "model-1",
@@ -1185,6 +1195,8 @@ mod tests {
                 "client_requested_stream": false,
                 "upstream_is_stream": true,
                 "ws_step": true,
+                "is_compaction": true,
+                "compaction_version": "v2",
                 "api_key_is_standalone": true,
                 "model_id": "model-1",
                 "global_model_id": "global-model-1",

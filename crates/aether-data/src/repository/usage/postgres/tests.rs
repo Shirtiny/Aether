@@ -905,6 +905,10 @@ fn usage_sql_uses_json_null_placeholders_for_usage_payload_columns() {
         assert!(sql.contains("request_metadata->>'cafecode_uname'"));
         assert!(sql.contains("'is_risk_control'"));
         assert!(sql.contains("request_metadata->>'is_risk_control'"));
+        assert!(sql.contains("'is_compaction'"));
+        assert!(sql.contains("request_metadata->>'is_compaction'"));
+        assert!(sql.contains("'compaction_version'"));
+        assert!(sql.contains("request_metadata->>'compaction_version'"));
         assert!(sql.contains("AS client_family"));
         assert!(sql.contains("'client_session_affinity'"));
         assert!(sql.contains("'session_key'"));

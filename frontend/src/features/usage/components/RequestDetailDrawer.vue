@@ -49,6 +49,13 @@
                   WS
                 </Badge>
                 <Badge
+                  v-if="detail?.is_compaction"
+                  variant="outline"
+                  class="whitespace-nowrap border-teal-500/40 bg-teal-500/10 text-teal-700 dark:text-teal-300"
+                >
+                  {{ detail.compaction_version === 'v2' ? '压缩 v2' : '压缩' }}
+                </Badge>
+                <Badge
                   v-if="detail?.status_code === 200"
                   variant="success"
                 >

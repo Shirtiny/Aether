@@ -1059,6 +1059,8 @@ pub(crate) fn compact_report_context_template(
         "cafecode_uname",
         "client_requested_stream",
         "upstream_is_stream",
+        "is_compaction",
+        "compaction_version",
         "api_key_is_standalone",
         "candidate_group_id",
         "pool_key_index",
@@ -1245,6 +1247,8 @@ mod tests {
     fn lifecycle_report_context_keeps_only_cafecode_identity_from_original_headers() {
         let context = json!({
             "request_id": "request-original",
+            "is_compaction": true,
+            "compaction_version": "v2",
             "original_headers": {
                 "authorization": "Bearer secret",
                 "cafecode-uid": "372",
@@ -1256,6 +1260,8 @@ mod tests {
 
         assert_eq!(compact["cafecode_uid"], "372");
         assert_eq!(compact["cafecode_uname"], "xiapeng8618");
+        assert_eq!(compact["is_compaction"], true);
+        assert_eq!(compact["compaction_version"], "v2");
         assert!(compact.get("original_headers").is_none());
         assert!(!compact.to_string().contains("Bearer secret"));
     }

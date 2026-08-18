@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use aether_admin::observability::usage::{
-    admin_usage_is_ping, admin_usage_is_risk_control, admin_usage_reasoning_output_tokens,
+    admin_usage_is_compaction, admin_usage_is_ping, admin_usage_is_risk_control,
+    admin_usage_reasoning_output_tokens,
 };
 use aether_ai_serving::UPSTREAM_IS_STREAM_KEY;
 use aether_billing::{
@@ -594,6 +595,7 @@ fn build_users_me_usage_record_payload_with_terminal_sync(
             auth_api_key_reader_available,
         ),
     });
+    payload["is_compaction"] = json!(admin_usage_is_compaction(item));
     payload["terminal_sync_pending"] = json!(terminal_sync.pending);
     payload["terminal_response_time_ms"] = json!(terminal_sync.response_time_ms);
 
@@ -605,6 +607,9 @@ fn build_users_me_usage_record_payload_with_terminal_sync(
     }
     if let Some(service_tier) = item.provider_service_tier() {
         payload["service_tier"] = json!(service_tier);
+    }
+    if let Some(compaction_version) = users_me_usage_metadata_string(item, "compaction_version") {
+        payload["compaction_version"] = json!(compaction_version);
     }
     if include_actual_cost {
         payload["actual_cost"] = json!(round_to(item.actual_total_cost_usd, 6));
@@ -672,8 +677,12 @@ fn build_users_me_usage_active_payload_with_terminal_sync(
         "target_model": item.target_model,
         "has_fallback": item.has_fallback(),
     });
+    payload["is_compaction"] = json!(admin_usage_is_compaction(item));
     payload["terminal_sync_pending"] = json!(terminal_sync.pending);
     payload["terminal_response_time_ms"] = json!(terminal_sync.response_time_ms);
+    if let Some(compaction_version) = users_me_usage_metadata_string(item, "compaction_version") {
+        payload["compaction_version"] = json!(compaction_version);
+    }
     if item.api_format.is_none() {
         payload
             .as_object_mut()
@@ -1806,6 +1815,26 @@ mod tests {
 
         assert_eq!(record_payload["ws_step"], true);
         assert_eq!(active_payload["ws_step"], true);
+    }
+
+    #[test]
+    fn user_usage_payloads_include_compaction_v2_marker() {
+        let item = StoredRequestUsageAudit {
+            request_metadata: Some(json!({
+                "is_compaction": true,
+                "compaction_version": "v2"
+            })),
+            ..sample_usage("completed")
+        };
+
+        let record_payload =
+            build_users_me_usage_record_payload(&item, false, &BTreeMap::new(), false);
+        let active_payload = build_users_me_usage_active_payload(&item);
+
+        assert_eq!(record_payload["is_compaction"], true);
+        assert_eq!(record_payload["compaction_version"], "v2");
+        assert_eq!(active_payload["is_compaction"], true);
+        assert_eq!(active_payload["compaction_version"], "v2");
     }
 
     #[test]

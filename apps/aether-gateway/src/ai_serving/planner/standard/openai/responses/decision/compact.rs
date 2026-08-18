@@ -9,7 +9,8 @@ use crate::ai_serving::ai_local_execution_contract_for_formats;
 use crate::ai_serving::planner::plan_builders::AiStreamAttempt;
 use crate::ai_serving::planner::report_context::{
     build_local_execution_report_context, insert_grok_response_tool_refs,
-    insert_provider_stream_event_api_format, LocalExecutionReportContextParts,
+    insert_openai_compaction_metadata, insert_provider_stream_event_api_format,
+    LocalExecutionReportContextParts,
 };
 use crate::ai_serving::planner::spec_metadata::local_openai_responses_spec_metadata;
 use crate::ai_serving::transport::{
@@ -74,6 +75,13 @@ pub(crate) async fn maybe_build_local_openai_responses_codex_ws_planning_attempt
     let candidate = &eligible.candidate;
     let effective_headers = input.effective_headers(&parts.headers);
     let mut extra_fields = serde_json::Map::new();
+    insert_openai_compaction_metadata(
+        &mut extra_fields,
+        spec_metadata.api_format,
+        &resolved.provider_api_format,
+        Some(parts.uri.path()),
+        Some(body_json),
+    );
     insert_grok_response_tool_refs(
         &mut extra_fields,
         &resolved.transport.provider.provider_type,

@@ -28,6 +28,9 @@ use crate::orchestration::{
     SCHEDULER_AFFINITY_EPOCH_REPORT_FIELD,
 };
 
+pub(crate) const COMPACTION_IS_COMPACTION_METADATA_KEY: &str = "is_compaction";
+pub(crate) const COMPACTION_VERSION_METADATA_KEY: &str = "compaction_version";
+
 pub(crate) struct LocalExecutionReportContextParts<'a> {
     pub(crate) auth_context: &'a ExecutionRuntimeAuthContext,
     pub(crate) request_id: &'a str,
@@ -89,6 +92,13 @@ pub(crate) fn build_local_execution_report_context(
         parts.original_request_body_base64,
     );
     let mut extra_fields = parts.extra_fields;
+    insert_openai_compaction_metadata(
+        &mut extra_fields,
+        parts.client_api_format,
+        parts.provider_api_format,
+        parts.request_path,
+        parts.original_request_body_json,
+    );
     if parts.provider_type.trim().eq_ignore_ascii_case("grok")
         && matches!(
             parts
@@ -208,6 +218,64 @@ pub(crate) fn build_local_execution_report_context(
     })
 }
 
+/// Records the compaction protocol without changing route selection or provider behavior.
+///
+/// Compact v2 is sent to the normal Responses endpoint and is identified by the
+/// `compaction_trigger` input item. The retired compact endpoint is retained as a
+/// legacy marker so old traffic is still visible in request records.
+pub(crate) fn insert_openai_compaction_metadata(
+    extra_fields: &mut Map<String, Value>,
+    client_api_format: &str,
+    provider_api_format: &str,
+    request_path: Option<&str>,
+    request_body: Option<&Value>,
+) {
+    let path = request_path.map(str::trim).unwrap_or_default();
+    let normalized_path = crate::ai_serving::normalize_api_format_alias(path);
+    let client_format = crate::ai_serving::normalize_api_format_alias(client_api_format);
+    let provider_format = crate::ai_serving::normalize_api_format_alias(provider_api_format);
+    let is_legacy_compact_endpoint = normalized_path == "openai:responses:compact"
+        || client_format == "openai:responses:compact";
+    let is_responses_request = matches!(
+        normalized_path.as_str(),
+        "openai:responses" | "openai:responses:compact"
+    ) || matches!(
+        client_format.as_str(),
+        "openai:responses" | "openai:responses:compact"
+    ) || matches!(
+        provider_format.as_str(),
+        "openai:responses" | "openai:responses:compact"
+    );
+    let has_compaction_trigger = request_body
+        .and_then(|body| body.get("input"))
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| item.get("type").and_then(Value::as_str) == Some("compaction_trigger"))
+        });
+
+    let version = if has_compaction_trigger && is_responses_request && !is_legacy_compact_endpoint {
+        Some("v2")
+    } else if is_legacy_compact_endpoint {
+        Some("legacy")
+    } else {
+        None
+    };
+    let Some(version) = version else {
+        return;
+    };
+
+    extra_fields.insert(
+        COMPACTION_IS_COMPACTION_METADATA_KEY.to_string(),
+        Value::Bool(true),
+    );
+    extra_fields.insert(
+        COMPACTION_VERSION_METADATA_KEY.to_string(),
+        Value::String(version.to_string()),
+    );
+}
+
 pub(crate) fn insert_grok_response_tool_refs(
     extra_fields: &mut Map<String, Value>,
     provider_type: &str,
@@ -303,7 +371,8 @@ mod tests {
 
     use super::{
         build_local_execution_report_context, insert_grok_response_tool_refs,
-        provider_stream_event_api_format_for_provider_type, LocalExecutionReportContextParts,
+        insert_openai_compaction_metadata, provider_stream_event_api_format_for_provider_type,
+        LocalExecutionReportContextParts,
     };
     use crate::ai_serving::ExecutionRuntimeAuthContext;
     use crate::ai_serving::RequestOrigin;
@@ -319,6 +388,46 @@ mod tests {
             provider_stream_event_api_format_for_provider_type("CODEX"),
             Some("openai:responses")
         );
+    }
+
+    #[test]
+    fn openai_compaction_metadata_distinguishes_v2_from_legacy_endpoint() {
+        let mut v2 = Map::new();
+        insert_openai_compaction_metadata(
+            &mut v2,
+            "openai:responses",
+            "openai:responses",
+            Some("/v1/responses"),
+            Some(&json!({
+                "input": [
+                    {"type": "message", "role": "user", "content": "compact"},
+                    {"type": "compaction_trigger"}
+                ]
+            })),
+        );
+        assert_eq!(v2.get("is_compaction"), Some(&Value::Bool(true)));
+        assert_eq!(v2.get("compaction_version"), Some(&json!("v2")));
+
+        let mut legacy = Map::new();
+        insert_openai_compaction_metadata(
+            &mut legacy,
+            "openai:responses:compact",
+            "openai:responses:compact",
+            Some("/v1/responses/compact"),
+            None,
+        );
+        assert_eq!(legacy.get("is_compaction"), Some(&Value::Bool(true)));
+        assert_eq!(legacy.get("compaction_version"), Some(&json!("legacy")));
+
+        let mut standard = Map::new();
+        insert_openai_compaction_metadata(
+            &mut standard,
+            "openai:responses",
+            "openai:responses",
+            Some("/v1/responses"),
+            Some(&json!({"input": [{"type": "message"}]})),
+        );
+        assert!(standard.is_empty());
     }
 
     #[test]
