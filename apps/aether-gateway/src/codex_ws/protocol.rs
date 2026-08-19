@@ -440,8 +440,8 @@ struct BorrowedServerEvent<'a> {
     response: Option<BorrowedServerResponse<'a>>,
     #[serde(borrow)]
     headers: Option<BorrowedServerHeaders<'a>>,
-    #[serde(alias = "status_code")]
-    status: Option<u16>,
+    status: Option<ServerEventStatus>,
+    status_code: Option<u16>,
     #[serde(borrow)]
     error: Option<BorrowedServerError<'a>>,
     rate_limits: Option<BorrowedRateLimitDetails>,
@@ -451,6 +451,59 @@ struct BorrowedServerEvent<'a> {
     codex_turn_state: Option<Cow<'a, str>>,
     #[serde(borrow)]
     turn_state: Option<Cow<'a, str>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ServerEventStatus {
+    code: Option<u16>,
+}
+
+impl ServerEventStatus {
+    fn code(self) -> Option<u16> {
+        self.code
+    }
+}
+
+impl<'de> Deserialize<'de> for ServerEventStatus {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct StatusVisitor;
+
+        impl serde::de::Visitor<'_> for StatusVisitor {
+            type Value = ServerEventStatus;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a response lifecycle status string or HTTP status code")
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                let code = u16::try_from(value)
+                    .map_err(|_| E::invalid_value(serde::de::Unexpected::Unsigned(value), &self))?;
+                Ok(ServerEventStatus { code: Some(code) })
+            }
+
+            fn visit_borrowed_str<E>(self, _value: &'_ str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(ServerEventStatus { code: None })
+            }
+
+            fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(ServerEventStatus { code: None })
+            }
+        }
+
+        deserializer.deserialize_any(StatusVisitor)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1142,10 +1195,10 @@ pub(crate) fn classify_server_event(
     }
     #[cfg(test)]
     SERVER_EVENT_JSON_PARSE_COUNT.with(|count| count.set(count.get() + 1));
-    // The borrowed struct parser is also the syntax and duplicate-field scanner.
-    // Unknown delta payload fields are skipped without constructing a Value tree.
+    // The scanner already validated JSON syntax. This pass enforces the fields
+    // whose types or duplicate presence affect routing and accounting.
     let value: BorrowedServerEvent<'_> = serde_json::from_slice(bytes)
-        .map_err(|_| ProtocolError::Upstream("official server emitted invalid JSON"))?;
+        .map_err(|_| ProtocolError::Upstream("official server emitted invalid event schema"))?;
     let kind = value.kind.as_deref().unwrap_or_default();
     if kind == ROUTE_CONTROL_EVENT_TYPE {
         return Err(ProtocolError::Upstream(
@@ -1215,6 +1268,16 @@ pub(crate) fn classify_server_event(
     if kind == "codex.rate_limits" {
         append_rate_limit_event_headers(&value, &mut provider_headers);
     }
+    let status_code_from_status = value.status.and_then(ServerEventStatus::code);
+    if status_code_from_status
+        .zip(value.status_code)
+        .is_some_and(|(status, status_code)| status != status_code)
+    {
+        return Err(ProtocolError::Upstream(
+            "official server emitted conflicting status codes",
+        ));
+    }
+    let explicit_status_code = value.status_code.or(status_code_from_status);
     let terminal_event = terminal.map(|kind| {
         let provider_error = value
             .response
@@ -1233,8 +1296,7 @@ pub(crate) fn classify_server_event(
             .and_then(|response| response.incomplete_details.as_ref())
             .and_then(|details| details.reason.as_deref())
             .and_then(|reason| bounded_ascii_string(reason, MAX_PROVIDER_ERROR_CODE_BYTES));
-        let provider_status_code = value
-            .status
+        let provider_status_code = explicit_status_code
             .filter(|status| (400..=599).contains(status))
             .or_else(|| {
                 inferred_provider_status_code(
@@ -1420,22 +1482,30 @@ fn is_recognized_business_kind(kind: &[u8]) -> bool {
     matches!(
         kind,
         b"response.created"
+            | b"response.in_progress"
             | b"response.completed"
             | b"response.failed"
             | b"response.incomplete"
             | b"error"
-            | b"response.output_item.done"
             | b"response.output_item.added"
+            | b"response.output_item.done"
+            | b"response.content_part.added"
+            | b"response.content_part.done"
             | b"response.output_text.delta"
+            | b"response.output_text.done"
             | b"response.custom_tool_call_input.delta"
+            | b"response.custom_tool_call_input.done"
+            | b"response.function_call_arguments.delta"
+            | b"response.function_call_arguments.done"
+            | b"response.reasoning_summary_part.added"
+            | b"response.reasoning_summary_part.done"
             | b"response.reasoning_summary_text.delta"
             | b"response.reasoning_summary_text.done"
             | b"response.reasoning_text.delta"
-            | b"response.reasoning_summary_part.added"
-            | b"response.function_call_arguments.delta"
             | b"response.metadata"
-            | b"codex.rate_limits"
             | b"response.new_tool_event"
+            | b"codex.response.metadata"
+            | b"codex.rate_limits"
     )
 }
 
@@ -1889,6 +1959,56 @@ mod tests {
     }
 
     #[test]
+    fn official_reasoning_part_done_accepts_string_lifecycle_status() {
+        let frame = r#"{"type":"response.reasoning_summary_part.done","status":"incomplete","item_id":"rs_0ce8a3aec6cb9147016a8489e6109c87d0adf71b5ab7c85aaf","output_index":0,"part":{"type":"summary_text","text":"summary"},"sequence_number":6,"summary_index":0}"#;
+
+        reset_server_event_json_parse_count();
+        let classified = classify_server_event(frame)
+            .expect("official string lifecycle status should be accepted");
+
+        assert!(classified.recognized_business);
+        assert_eq!(classified.terminal, None);
+        assert_eq!(classified.provenance_response_id, None);
+        assert_eq!(server_event_json_parse_count(), 1);
+    }
+
+    #[test]
+    fn only_known_response_events_count_as_business_activity() {
+        reset_server_event_json_parse_count();
+        let unknown = classify_server_event(
+            r#"{"type":"response.future_protocol_event","sequence_number":7}"#,
+        )
+        .expect("future response event should classify");
+
+        assert!(!unknown.recognized_business);
+        assert_eq!(unknown.terminal, None);
+        assert_eq!(server_event_json_parse_count(), 1);
+
+        for kind in [
+            "response.in_progress",
+            "response.content_part.added",
+            "response.content_part.done",
+            "response.output_text.done",
+            "response.custom_tool_call_input.done",
+            "response.function_call_arguments.done",
+            "response.reasoning_summary_part.done",
+            "codex.response.metadata",
+        ] {
+            let frame = format!(r#"{{"type":"{kind}"}}"#);
+            let known = classify_server_event(frame).expect("known response event should classify");
+            assert!(
+                known.recognized_business,
+                "event was not recognized: {kind}"
+            );
+        }
+
+        let transport_metadata =
+            classify_server_event(r#"{"type":"responsesapi.websocket_timing","response_ms":12}"#)
+                .expect("transport metadata should classify");
+        assert!(!transport_metadata.recognized_business);
+    }
+
+    #[test]
     fn codex_rate_limit_event_projects_quota_feedback_headers() {
         let classified = classify_server_event(
             r#"{"type":"codex.rate_limits","rate_limits":{"primary":{"used_percent":75.5,"window_minutes":300,"reset_at":1700000000},"secondary":{"used_percent":25.0,"window_minutes":10080,"reset_at":1700600000}},"credits":{"has_credits":true,"unlimited":false,"balance":"12.50"}}"#,
@@ -2011,6 +2131,34 @@ mod tests {
         .terminal_event
         .expect("response.incomplete should have a summary");
         assert_eq!(incomplete.provider_status_code, Some(400));
+
+        let string_status_with_code = classify_server_event(
+            r#"{"type":"error","status":"failed","status_code":503,"error":{"type":"server_error","message":"retry later"}}"#,
+        )
+        .expect("string lifecycle status and numeric status code should coexist")
+        .terminal_event
+        .expect("error should have a summary");
+        assert_eq!(string_status_with_code.provider_status_code, Some(503));
+    }
+
+    #[test]
+    fn official_status_fields_reject_conflicts_and_invalid_shapes() {
+        assert!(classify_server_event(
+            r#"{"type":"error","status":429,"status_code":503,"error":{"type":"server_error"}}"#,
+        )
+        .is_err());
+        let invalid_shape = classify_server_event(
+            r#"{"type":"response.output_text.done","status":{"state":"completed"}}"#,
+        )
+        .expect_err("object lifecycle status should be rejected");
+        assert_eq!(
+            invalid_shape.message(),
+            "official server emitted invalid event schema"
+        );
+        assert!(classify_server_event(
+            r#"{"type":"response.output_text.done","status":"completed","status":"incomplete"}"#,
+        )
+        .is_err());
     }
 
     #[test]

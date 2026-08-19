@@ -3254,6 +3254,51 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn string_status_reasoning_part_is_relayed_without_protocol_failure() {
+        let writer = SharedLogBuffer::default();
+        let dispatch = json_log_dispatch(writer.clone());
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        let created = json!({
+            "type": "response.created",
+            "response": {"id": "resp-1"}
+        })
+        .to_string();
+        let reasoning_part = r#"{"type":"response.reasoning_summary_part.done","status":"incomplete","item_id":"rs_0ce8a3aec6cb9147016a8489e6109c87d0adf71b5ab7c85aaf","output_index":0,"part":{"type":"summary_text","text":"summary"},"sequence_number":6,"summary_index":0}"#.to_string();
+        let completed = json!({
+            "type": "response.completed",
+            "response": {"id": "resp-1"}
+        })
+        .to_string();
+        let (official, _) = ScriptedPeer::new([
+            (Duration::ZERO, relay_text(created)),
+            (Duration::ZERO, relay_text(reasoning_part.clone())),
+            (Duration::ZERO, relay_text(completed.clone())),
+        ]);
+        let runtime = TestRuntime::new(Box::new(official), false);
+        let (client, client_sent) = ScriptedPeer::new([
+            (Duration::ZERO, relay_text(request())),
+            (Duration::from_millis(20), RelayFrame::Close),
+        ]);
+
+        run_codex_ws_session(Box::new(client), &runtime).await;
+
+        let client_sent = client_sent.lock().expect("client frames should lock");
+        assert!(client_sent.contains(&relay_text(reasoning_part)));
+        assert!(client_sent.contains(&relay_text(completed)));
+        assert!(!client_sent.iter().any(|frame| match frame {
+            RelayFrame::Text(text) => text_bytes_contains(text, "\"status\":502"),
+            _ => false,
+        }));
+        drop(client_sent);
+        assert!(!writer
+            .lines()
+            .iter()
+            .any(|log| log["event_name"] == "codex_ws_official_invalid_frame"));
+        assert_eq!(runtime.report_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(runtime.gate.snapshot().in_flight, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn idle_upstream_transport_error_is_logged_and_only_closes_downstream() {
         let writer = SharedLogBuffer::default();
         let dispatch = json_log_dispatch(writer.clone());
