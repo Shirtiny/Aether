@@ -10,10 +10,10 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 
 use super::protocol::{
-    classify_server_event, parse_response_create, route_control_event,
-    validate_official_turn_state, MiddleRouteDisposition, ProtocolError, ResponseCreateContext,
-    ResponseCreateStep, RouteControlAction, TerminalEventSummary, TerminalKind,
-    FIRST_FRAME_TIMEOUT, MAX_PUBLIC_CLIENT_PAYLOAD_BYTES,
+    classify_server_event, classify_standard_server_event, parse_response_create,
+    route_control_event, validate_official_turn_state, CodexRelayDirective, MiddleRouteDisposition,
+    ProtocolError, ResponseCreateContext, ResponseCreateStep, RouteControlAction,
+    TerminalEventSummary, TerminalKind, FIRST_FRAME_TIMEOUT, MAX_PUBLIC_CLIENT_PAYLOAD_BYTES,
 };
 use super::runtime::{
     CodexWsCandidate, CodexWsRuntimePort, CodexWsStepUsageContext, CodexWsTimeouts,
@@ -79,9 +79,15 @@ async fn parse_response_create_with_cpu_budget(
 
 async fn classify_server_event_with_cpu_budget(
     text: &Bytes,
+    adapter: crate::orchestration::ResponsesWebSocketAdapter,
 ) -> Result<super::protocol::ServerEventClassification, ProtocolError> {
     if !super::cpu_budget::requires_large_frame_cpu_budget(text.len()) {
-        return classify_server_event(text);
+        return match adapter {
+            crate::orchestration::ResponsesWebSocketAdapter::Codex => classify_server_event(text),
+            crate::orchestration::ResponsesWebSocketAdapter::Standard => {
+                classify_standard_server_event(text)
+            }
+        };
     }
     let permit = super::cpu_budget::acquire_large_frame_cpu_budget(text.len())
         .await
@@ -89,7 +95,12 @@ async fn classify_server_event_with_cpu_budget(
     let text = text.clone();
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        classify_server_event(&text)
+        match adapter {
+            crate::orchestration::ResponsesWebSocketAdapter::Codex => classify_server_event(&text),
+            crate::orchestration::ResponsesWebSocketAdapter::Standard => {
+                classify_standard_server_event(&text)
+            }
+        }
     })
     .await
     .map_err(|_| ProtocolError::Upstream("large official frame processing failed"))?
@@ -131,7 +142,7 @@ impl Drop for RemainingCandidatesGuard<'_> {
 
 struct CandidateAttemptGuard<'a> {
     runtime: &'a dyn CodexWsRuntimePort,
-    candidate: &'a CodexWsCandidate,
+    candidate: Arc<CodexWsCandidate>,
     cleanup_permit: Option<tokio::sync::mpsc::OwnedPermit<super::CodexWsSettlementCommit>>,
     pending_before_write: bool,
 }
@@ -139,7 +150,7 @@ struct CandidateAttemptGuard<'a> {
 impl<'a> CandidateAttemptGuard<'a> {
     fn new(
         runtime: &'a dyn CodexWsRuntimePort,
-        candidate: &'a CodexWsCandidate,
+        candidate: Arc<CodexWsCandidate>,
         cleanup_permit: Option<tokio::sync::mpsc::OwnedPermit<super::CodexWsSettlementCommit>>,
     ) -> Self {
         Self {
@@ -154,7 +165,7 @@ impl<'a> CandidateAttemptGuard<'a> {
         if !self.pending_before_write {
             return;
         }
-        self.runtime.abort_candidate(self.candidate).await;
+        self.runtime.abort_candidate(self.candidate.as_ref()).await;
         drop(self.cleanup_permit.take());
         self.pending_before_write = false;
     }
@@ -171,7 +182,7 @@ impl Drop for CandidateAttemptGuard<'_> {
     fn drop(&mut self) {
         if self.pending_before_write {
             self.runtime
-                .abort_candidate_detached(self.candidate, self.cleanup_permit.take());
+                .abort_candidate_detached(self.candidate.as_ref(), self.cleanup_permit.take());
         }
     }
 }
@@ -439,22 +450,27 @@ pub(crate) async fn run_codex_ws_session(
         return;
     }
 
-    let mut selection_replans = 0usize;
-    let candidates = loop {
-        match runtime.select_candidates(&first_step).await {
-            Ok(candidates) => break candidates,
-            Err(error)
-                if selection_replans < MAX_INITIAL_SELECTION_REPLANS
-                    && matches!(
-                        error.reason,
-                        "account_catalog_changed_during_selection"
-                            | "account_catalog_transitioning"
-                    ) =>
-            {
-                selection_replans += 1;
-                tokio::time::sleep(INITIAL_SELECTION_REPLAN_BACKOFF).await;
+    let mut step_usage = StepUsageLifecycleGuard::new(runtime, first_step_started);
+    let connected =
+        match select_and_connect_for_step(&mut client, runtime, &first_step, &mut step_usage).await
+        {
+            Ok(connected) => connected,
+            Err(CandidateConnectionError::ClientClosed) => {
+                step_usage.reject(
+                    499,
+                    "responses_websocket_client_disconnected_while_connecting",
+                    "client disconnected while the provider WebSocket was connecting",
+                    true,
+                );
+                return;
             }
-            Err(error) => {
+            Err(CandidateConnectionError::Unavailable(error)) => {
+                step_usage.reject(
+                    http::StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                    error.reason,
+                    "no Responses WebSocket candidate could be connected",
+                    false,
+                );
                 send_not_executed_control(
                     &mut client,
                     &first_step,
@@ -464,75 +480,7 @@ pub(crate) async fn run_codex_ws_session(
                 .await;
                 return;
             }
-        }
-    };
-    let initial_connect_budget = initial_connect_budget(&candidates);
-    let initial_connect_deadline = tokio::time::Instant::now() + initial_connect_budget;
-    let mut remaining_candidates = RemainingCandidatesGuard::new(runtime, candidates);
-    let mut step_usage = StepUsageLifecycleGuard::new(runtime, first_step_started);
-    let mut connected = None;
-    let mut last_connect_error = None;
-    loop {
-        if tokio::time::Instant::now() >= initial_connect_deadline {
-            last_connect_error = Some(StepPreparationError::retain(
-                "initial_connect_budget_exhausted",
-            ));
-            break;
-        }
-        let Some(candidate) = remaining_candidates.next() else {
-            break;
         };
-        step_usage.bind(&candidate, &first_step);
-        let connect_result = match tokio::time::timeout_at(
-            initial_connect_deadline,
-            connect_candidate_while_client_open(&mut client, runtime, candidate),
-        )
-        .await
-        {
-            Ok(Some(connect_result)) => connect_result,
-            Ok(None) => {
-                step_usage.reject(
-                    499,
-                    "codex_ws_client_disconnected_while_connecting",
-                    "client disconnected while the provider WebSocket was connecting",
-                    true,
-                );
-                return;
-            }
-            Err(_) => {
-                last_connect_error = Some(StepPreparationError::retain(
-                    "initial_connect_budget_exhausted",
-                ));
-                break;
-            }
-        };
-        match connect_result {
-            Ok(value) => {
-                connected = Some(value);
-                break;
-            }
-            Err(error) => last_connect_error = Some(error),
-        }
-    }
-    let Some(connected) = connected else {
-        let (reason, middle_route_disposition) = runtime
-            .validate_runtime_fences()
-            .err()
-            .map(|error| (error.reason, error.middle_route_disposition))
-            .or_else(|| {
-                last_connect_error.map(|error| (error.reason, error.middle_route_disposition))
-            })
-            .unwrap_or(("candidate_unavailable", MiddleRouteDisposition::Retain));
-        step_usage.reject(
-            http::StatusCode::SERVICE_UNAVAILABLE.as_u16(),
-            reason,
-            "no official Codex WebSocket candidate could be connected",
-            false,
-        );
-        send_not_executed_control(&mut client, &first_step, reason, middle_route_disposition).await;
-        return;
-    };
-    remaining_candidates.finish();
     let ConnectedCandidate {
         mut candidate,
         mut peer,
@@ -563,7 +511,9 @@ pub(crate) async fn run_codex_ws_session(
         }
     };
     let cleanup_permit = candidate.take_prewrite_cleanup_permit();
-    let mut candidate_attempt = CandidateAttemptGuard::new(runtime, &candidate, cleanup_permit);
+    let mut candidate = Arc::new(candidate);
+    let mut candidate_attempt =
+        CandidateAttemptGuard::new(runtime, Arc::clone(&candidate), cleanup_permit);
     let mut drain_after_terminal = match runtime.validate_candidate_current_state(&candidate).await
     {
         Ok(decision) => decision.should_drain(),
@@ -591,38 +541,42 @@ pub(crate) async fn run_codex_ws_session(
     loop {
         let (mut step, already_validated, mut step_usage) = match next_step.take() {
             Some(step) => step,
-            None => match receive_idle_step(&mut client, peer.as_mut(), &binding).await {
-                Ok(Some((step, started_at))) => (
-                    step,
-                    false,
-                    StepUsageLifecycleGuard::new(runtime, started_at),
-                ),
-                Ok(None) => {
-                    candidate_attempt.abort().await;
-                    best_effort_control_send(peer.as_mut(), RelayFrame::Close).await;
-                    return;
+            None => {
+                match receive_idle_step(&mut client, peer.as_mut(), &binding, candidate.adapter)
+                    .await
+                {
+                    Ok(Some((step, started_at))) => (
+                        step,
+                        false,
+                        StepUsageLifecycleGuard::new(runtime, started_at),
+                    ),
+                    Ok(None) => {
+                        candidate_attempt.abort().await;
+                        best_effort_control_send(peer.as_mut(), RelayFrame::Close).await;
+                        return;
+                    }
+                    Err(IdleStepError::Client(error)) => {
+                        candidate_attempt.abort().await;
+                        close_with_error(&mut client, error.message()).await;
+                        best_effort_control_send(peer.as_mut(), RelayFrame::Close).await;
+                        return;
+                    }
+                    Err(IdleStepError::Upstream(failure)) => {
+                        candidate_attempt.abort().await;
+                        log_upstream_protocol_failure(
+                            binding.last_usage_request_id.as_str(),
+                            candidate.key_id.as_str(),
+                            binding.model.as_str(),
+                            "idle",
+                            failure.reason,
+                            failure.transport_detail.as_deref(),
+                        );
+                        best_effort_control_send(client.as_mut(), RelayFrame::Close).await;
+                        best_effort_control_send(peer.as_mut(), RelayFrame::Close).await;
+                        return;
+                    }
                 }
-                Err(IdleStepError::Client(error)) => {
-                    candidate_attempt.abort().await;
-                    close_with_error(&mut client, error.message()).await;
-                    best_effort_control_send(peer.as_mut(), RelayFrame::Close).await;
-                    return;
-                }
-                Err(IdleStepError::Upstream(failure)) => {
-                    candidate_attempt.abort().await;
-                    log_upstream_protocol_failure(
-                        binding.last_usage_request_id.as_str(),
-                        candidate.key_id.as_str(),
-                        binding.model.as_str(),
-                        "idle",
-                        failure.reason,
-                        failure.transport_detail.as_deref(),
-                    );
-                    best_effort_control_send(client.as_mut(), RelayFrame::Close).await;
-                    best_effort_control_send(peer.as_mut(), RelayFrame::Close).await;
-                    return;
-                }
-            },
+            }
         };
 
         if !already_validated {
@@ -654,44 +608,223 @@ pub(crate) async fn run_codex_ws_session(
                 return;
             }
         }
-        if step.model != candidate.model {
-            step_usage.reject(
-                http::StatusCode::BAD_REQUEST.as_u16(),
-                "bound_model_changed",
-                "the model changed on a bound Codex WebSocket connection",
-                false,
-            );
-            candidate_attempt.abort().await;
-            send_not_executed_control(
-                &mut client,
-                &step,
-                "bound_model_changed",
-                MiddleRouteDisposition::Retain,
-            )
-            .await;
-            best_effort_control_send(peer.as_mut(), RelayFrame::Close).await;
-            return;
-        }
-        if !step
-            .official_identity
-            .matches_connection_binding(&candidate.identity)
-        {
-            step_usage.reject(
-                http::StatusCode::BAD_REQUEST.as_u16(),
-                "codex_identity_changed",
-                "the Codex identity changed on a bound WebSocket connection",
-                false,
-            );
-            candidate_attempt.abort().await;
-            send_not_executed_control(
-                &mut client,
-                &step,
-                "codex_identity_changed",
-                MiddleRouteDisposition::Retain,
-            )
-            .await;
-            best_effort_control_send(peer.as_mut(), RelayFrame::Close).await;
-            return;
+        if !already_validated && step.previous_response_id.is_none() {
+            let mut candidates = match select_candidates_for_step(runtime, &step).await {
+                Ok(candidates) => candidates,
+                Err(error) => {
+                    step_usage.reject(
+                        http::StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                        error.reason,
+                        "Responses WebSocket candidate selection failed",
+                        false,
+                    );
+                    candidate_attempt.abort().await;
+                    send_not_executed_control(
+                        &mut client,
+                        &step,
+                        error.reason,
+                        error.middle_route_disposition,
+                    )
+                    .await;
+                    best_effort_control_send(peer.as_mut(), RelayFrame::Close).await;
+                    return;
+                }
+            };
+            let can_reuse = candidates
+                .first()
+                .is_some_and(|next| candidate.can_reuse_physical_binding(next))
+                && matches!(
+                    runtime.validate_candidate_current_state(&candidate).await,
+                    Ok(decision) if !decision.should_drain()
+                );
+            let mut reused = false;
+            let mut reuse_error = None;
+            if can_reuse {
+                let next_candidate = candidates.remove(0);
+                step_usage.bind(&next_candidate, &step);
+                match runtime.activate_reused_candidate(next_candidate).await {
+                    Ok(mut next_candidate) => {
+                        runtime
+                            .mark_unused_candidates(std::mem::take(&mut candidates))
+                            .await;
+                        if let Err(error) = binding.rebind(None, &step) {
+                            step_usage.reject(
+                                http::StatusCode::BAD_GATEWAY.as_u16(),
+                                "responses_websocket_binding_invalid",
+                                "provider WebSocket binding state was invalid",
+                                false,
+                            );
+                            runtime.abort_candidate(&next_candidate).await;
+                            close_with_upstream_protocol_error(&mut client, error.message()).await;
+                            candidate_attempt.abort().await;
+                            best_effort_control_send(peer.as_mut(), RelayFrame::Close).await;
+                            return;
+                        }
+                        let cleanup_permit = next_candidate.take_prewrite_cleanup_permit();
+                        let next_candidate = Arc::new(next_candidate);
+                        let next_candidate_attempt = CandidateAttemptGuard::new(
+                            runtime,
+                            Arc::clone(&next_candidate),
+                            cleanup_permit,
+                        );
+                        candidate_attempt.abort().await;
+                        candidate = next_candidate;
+                        candidate_attempt = next_candidate_attempt;
+                        drain_after_terminal = false;
+                        reused = true;
+                    }
+                    Err(error) => reuse_error = Some(error),
+                }
+            }
+            if !reused {
+                let no_fallback_candidate = candidates.is_empty();
+                let connected = match connect_candidates_for_step(
+                    &mut client,
+                    runtime,
+                    &step,
+                    &mut step_usage,
+                    candidates,
+                )
+                .await
+                {
+                    Ok(connected) => connected,
+                    Err(CandidateConnectionError::ClientClosed) => {
+                        step_usage.reject(
+                            499,
+                            "responses_websocket_client_disconnected_while_connecting",
+                            "client disconnected while the provider WebSocket was connecting",
+                            true,
+                        );
+                        candidate_attempt.abort().await;
+                        best_effort_control_send(peer.as_mut(), RelayFrame::Close).await;
+                        return;
+                    }
+                    Err(CandidateConnectionError::Unavailable(error)) => {
+                        let error = if no_fallback_candidate {
+                            reuse_error.unwrap_or(error)
+                        } else {
+                            error
+                        };
+                        step_usage.reject(
+                            http::StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                            error.reason,
+                            "no Responses WebSocket candidate could be connected",
+                            false,
+                        );
+                        candidate_attempt.abort().await;
+                        send_not_executed_control(
+                            &mut client,
+                            &step,
+                            error.reason,
+                            error.middle_route_disposition,
+                        )
+                        .await;
+                        best_effort_control_send(peer.as_mut(), RelayFrame::Close).await;
+                        return;
+                    }
+                };
+                let ConnectedCandidate {
+                    candidate: mut next_candidate,
+                    peer: mut next_peer,
+                    handshake_turn_state,
+                } = connected;
+                if let Err(error) = binding.rebind(handshake_turn_state, &step) {
+                    step_usage.reject(
+                        http::StatusCode::BAD_GATEWAY.as_u16(),
+                        "responses_websocket_binding_invalid",
+                        "provider WebSocket binding state was invalid",
+                        false,
+                    );
+                    runtime.abort_candidate(&next_candidate).await;
+                    close_with_upstream_protocol_error(&mut client, error.message()).await;
+                    best_effort_control_send(next_peer.as_mut(), RelayFrame::Close).await;
+                    candidate_attempt.abort().await;
+                    best_effort_control_send(peer.as_mut(), RelayFrame::Close).await;
+                    return;
+                }
+                let next_drain_after_terminal = match runtime
+                    .validate_candidate_current_state(&next_candidate)
+                    .await
+                {
+                    Ok(decision) => decision.should_drain(),
+                    Err(error) => {
+                        step_usage.reject(
+                            http::StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                            error.reason,
+                            "Responses WebSocket candidate changed before execution",
+                            false,
+                        );
+                        runtime.abort_candidate(&next_candidate).await;
+                        send_not_executed_control(
+                            &mut client,
+                            &step,
+                            error.reason,
+                            error.middle_route_disposition,
+                        )
+                        .await;
+                        best_effort_control_send(next_peer.as_mut(), RelayFrame::Close).await;
+                        candidate_attempt.abort().await;
+                        best_effort_control_send(peer.as_mut(), RelayFrame::Close).await;
+                        return;
+                    }
+                };
+                let cleanup_permit = next_candidate.take_prewrite_cleanup_permit();
+                let next_candidate = Arc::new(next_candidate);
+                let next_candidate_attempt = CandidateAttemptGuard::new(
+                    runtime,
+                    Arc::clone(&next_candidate),
+                    cleanup_permit,
+                );
+                candidate_attempt.abort().await;
+                best_effort_control_send(peer.as_mut(), RelayFrame::Close).await;
+                candidate = next_candidate;
+                peer = next_peer;
+                candidate_attempt = next_candidate_attempt;
+                drain_after_terminal = next_drain_after_terminal;
+            }
+        } else {
+            if step.model != candidate.model {
+                step_usage.reject(
+                    http::StatusCode::BAD_REQUEST.as_u16(),
+                    "bound_model_changed",
+                    "the model changed on a continuing Responses WebSocket connection",
+                    false,
+                );
+                candidate_attempt.abort().await;
+                send_not_executed_control(
+                    &mut client,
+                    &step,
+                    "bound_model_changed",
+                    MiddleRouteDisposition::Retain,
+                )
+                .await;
+                best_effort_control_send(peer.as_mut(), RelayFrame::Close).await;
+                return;
+            }
+            if candidate.adapter == crate::orchestration::ResponsesWebSocketAdapter::Codex
+                && !step
+                    .official_identity
+                    .as_ref()
+                    .zip(candidate.identity.as_ref())
+                    .is_some_and(|(step, bound)| step.matches_connection_binding(bound))
+            {
+                step_usage.reject(
+                    http::StatusCode::BAD_REQUEST.as_u16(),
+                    "codex_identity_changed",
+                    "the Codex identity changed on a continuing WebSocket connection",
+                    false,
+                );
+                candidate_attempt.abort().await;
+                send_not_executed_control(
+                    &mut client,
+                    &step,
+                    "codex_identity_changed",
+                    MiddleRouteDisposition::Retain,
+                )
+                .await;
+                best_effort_control_send(peer.as_mut(), RelayFrame::Close).await;
+                return;
+            }
         }
         step_usage.bind(&candidate, &step);
         let prepared_step = match runtime.prepare_step(&candidate, &mut step).await {
@@ -918,6 +1051,7 @@ pub(crate) async fn run_codex_ws_session(
             &mut binding,
             &step,
             runtime,
+            candidate.adapter,
             &candidate.key_id,
             candidate.selected_scheduler_epoch,
             &execution_lease_status,
@@ -930,14 +1064,15 @@ pub(crate) async fn run_codex_ws_session(
             StepOutcome::Completed {
                 mut close_after_terminal,
                 terminal_event,
-                terminal_frame,
+                terminal_kind,
+                terminal_frames,
             } => {
                 close_after_terminal |= !execution_lease_status.is_valid();
                 close_after_terminal |= drain_after_terminal;
                 settlement
                     .finish(
                         Some(terminal_event),
-                        Some(TerminalKind::Completed),
+                        Some(terminal_kind),
                         CodexWsStepDisposition::Completed,
                     )
                     .await;
@@ -955,7 +1090,7 @@ pub(crate) async fn run_codex_ws_session(
                 if !deliver_terminal_after_settlement(
                     &mut client,
                     &step,
-                    terminal_frame,
+                    terminal_frames,
                     close_after_terminal,
                     &deadlines,
                 )
@@ -990,16 +1125,16 @@ pub(crate) async fn run_codex_ws_session(
                 terminal_event,
                 terminal_kind,
                 disposition,
-                terminal_frame,
+                terminal_frames,
             } => {
                 settlement
                     .finish(terminal_event, terminal_kind, disposition)
                     .await;
-                if let Some(terminal_frame) = terminal_frame {
+                if let Some(terminal_frames) = terminal_frames {
                     let _ = deliver_terminal_after_settlement(
                         &mut client,
                         &step,
-                        terminal_frame,
+                        terminal_frames,
                         false,
                         &deadlines,
                     )
@@ -1010,6 +1145,100 @@ pub(crate) async fn run_codex_ws_session(
             }
         }
     }
+}
+
+enum CandidateConnectionError {
+    ClientClosed,
+    Unavailable(StepPreparationError),
+}
+
+async fn select_and_connect_for_step(
+    client: &mut Box<dyn RelayPeer>,
+    runtime: &dyn CodexWsRuntimePort,
+    step: &ResponseCreateStep,
+    step_usage: &mut StepUsageLifecycleGuard<'_>,
+) -> Result<ConnectedCandidate, CandidateConnectionError> {
+    let candidates = select_candidates_for_step(runtime, step)
+        .await
+        .map_err(CandidateConnectionError::Unavailable)?;
+    connect_candidates_for_step(client, runtime, step, step_usage, candidates).await
+}
+
+async fn select_candidates_for_step(
+    runtime: &dyn CodexWsRuntimePort,
+    step: &ResponseCreateStep,
+) -> Result<Vec<CodexWsCandidate>, StepPreparationError> {
+    let mut selection_replans = 0usize;
+    loop {
+        match runtime.select_candidates(step).await {
+            Ok(candidates) => return Ok(candidates),
+            Err(error)
+                if selection_replans < MAX_INITIAL_SELECTION_REPLANS
+                    && matches!(
+                        error.reason,
+                        "account_catalog_changed_during_selection"
+                            | "account_catalog_transitioning"
+                    ) =>
+            {
+                selection_replans += 1;
+                tokio::time::sleep(INITIAL_SELECTION_REPLAN_BACKOFF).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+async fn connect_candidates_for_step(
+    client: &mut Box<dyn RelayPeer>,
+    runtime: &dyn CodexWsRuntimePort,
+    step: &ResponseCreateStep,
+    step_usage: &mut StepUsageLifecycleGuard<'_>,
+    candidates: Vec<CodexWsCandidate>,
+) -> Result<ConnectedCandidate, CandidateConnectionError> {
+    let connect_deadline =
+        tokio::time::Instant::now() + initial_connect_budget(candidates.as_slice());
+    let mut remaining_candidates = RemainingCandidatesGuard::new(runtime, candidates);
+    let mut last_connect_error = None;
+    loop {
+        if tokio::time::Instant::now() >= connect_deadline {
+            last_connect_error = Some(StepPreparationError::retain(
+                "initial_connect_budget_exhausted",
+            ));
+            break;
+        }
+        let Some(candidate) = remaining_candidates.next() else {
+            break;
+        };
+        step_usage.bind(&candidate, step);
+        let connect_result = match tokio::time::timeout_at(
+            connect_deadline,
+            connect_candidate_while_client_open(client, runtime, candidate),
+        )
+        .await
+        {
+            Ok(Some(connect_result)) => connect_result,
+            Ok(None) => return Err(CandidateConnectionError::ClientClosed),
+            Err(_) => {
+                last_connect_error = Some(StepPreparationError::retain(
+                    "initial_connect_budget_exhausted",
+                ));
+                break;
+            }
+        };
+        match connect_result {
+            Ok(connected) => {
+                remaining_candidates.finish();
+                return Ok(connected);
+            }
+            Err(error) => last_connect_error = Some(error),
+        }
+    }
+    let error = runtime
+        .validate_runtime_fences()
+        .err()
+        .or(last_connect_error)
+        .unwrap_or_else(|| StepPreparationError::retain("candidate_unavailable"));
+    Err(CandidateConnectionError::Unavailable(error))
 }
 
 fn initial_connect_budget(candidates: &[CodexWsCandidate]) -> Duration {
@@ -1157,6 +1386,22 @@ impl BindingState {
         self.seen_step_correlations
             .insert(fence.correlation_id.clone());
         self.last_usage_request_id = super::runtime::step_usage_request_id(step);
+        Ok(())
+    }
+
+    fn rebind(
+        &mut self,
+        handshake_turn_state: Option<String>,
+        step: &ResponseCreateStep,
+    ) -> Result<(), ProtocolError> {
+        let handshake_turn_state = handshake_turn_state
+            .map(|state| validate_official_turn_state(&state))
+            .transpose()?;
+        self.model = step.model.clone();
+        self.last_completed_response_id = None;
+        self.turn_state = handshake_turn_state
+            .zip(step.logical_turn_id.as_ref())
+            .map(|(state, turn_id)| (turn_id.clone(), state));
         Ok(())
     }
 }
@@ -1344,6 +1589,7 @@ async fn receive_idle_step(
     client: &mut Box<dyn RelayPeer>,
     official: &mut dyn RelayPeer,
     binding: &BindingState,
+    adapter: crate::orchestration::ResponsesWebSocketAdapter,
 ) -> Result<Option<(ResponseCreateStep, tokio::time::Instant)>, IdleStepError> {
     loop {
         tokio::select! {
@@ -1381,7 +1627,7 @@ async fn receive_idle_step(
                                 None,
                             )));
                         }
-                        let classification = classify_server_event_with_cpu_budget(&text)
+                        let classification = classify_server_event_with_cpu_budget(&text, adapter)
                             .await
                             .map_err(UpstreamProtocolFailure::protocol)
                             .map_err(IdleStepError::Upstream)?;
@@ -1458,14 +1704,15 @@ enum StepOutcome {
     Completed {
         close_after_terminal: bool,
         terminal_event: TerminalEventSummary,
-        terminal_frame: Bytes,
+        terminal_kind: TerminalKind,
+        terminal_frames: Vec<Bytes>,
     },
     ClientClosed,
     Poisoned {
         terminal_event: Option<TerminalEventSummary>,
         terminal_kind: Option<TerminalKind>,
         disposition: CodexWsStepDisposition,
-        terminal_frame: Option<Bytes>,
+        terminal_frames: Option<Vec<Bytes>>,
     },
 }
 
@@ -1480,7 +1727,7 @@ impl StepOutcome {
                 error_message: "official Codex WebSocket protocol failed".to_string(),
                 error_body: None,
             },
-            terminal_frame: None,
+            terminal_frames: None,
         }
     }
 
@@ -1492,7 +1739,7 @@ impl StepOutcome {
                 error_type: error_type.to_string(),
                 error_message: error_message.to_string(),
             },
-            terminal_frame: None,
+            terminal_frames: None,
         }
     }
 
@@ -1504,7 +1751,7 @@ impl StepOutcome {
                 error_type: error_type.to_string(),
                 error_message: error_message.to_string(),
             },
-            terminal_frame: None,
+            terminal_frames: None,
         }
     }
 }
@@ -1513,13 +1760,29 @@ fn terminal_outcome(
     kind: TerminalKind,
     terminal_event: TerminalEventSummary,
     close_after_terminal: bool,
-    terminal_frame: Bytes,
+    terminal_frames: Vec<Bytes>,
 ) -> StepOutcome {
-    if kind == TerminalKind::Completed {
+    let normal_terminal = kind == TerminalKind::Completed
+        || (kind == TerminalKind::Incomplete
+            && terminal_event
+                .provider_status_code
+                .is_none_or(|status| (200..300).contains(&status)));
+    if normal_terminal {
         StepOutcome::Completed {
             close_after_terminal,
             terminal_event,
-            terminal_frame,
+            terminal_kind: kind,
+            terminal_frames,
+        }
+    } else if kind == TerminalKind::Cancelled {
+        StepOutcome::Poisoned {
+            terminal_event: Some(terminal_event),
+            terminal_kind: Some(kind),
+            disposition: CodexWsStepDisposition::Cancelled {
+                error_type: "responses_websocket_provider_cancelled".to_string(),
+                error_message: "provider cancelled the Responses WebSocket turn".to_string(),
+            },
+            terminal_frames: Some(terminal_frames),
         }
     } else {
         let status_code = terminal_event
@@ -1549,7 +1812,7 @@ fn terminal_outcome(
                 error_message,
                 error_body,
             },
-            terminal_frame: Some(terminal_frame),
+            terminal_frames: Some(terminal_frames),
         }
     }
 }
@@ -1559,6 +1822,7 @@ fn terminal_kind_label(kind: TerminalKind) -> &'static str {
         TerminalKind::Completed => "completed",
         TerminalKind::Failed => "failed",
         TerminalKind::Incomplete => "incomplete",
+        TerminalKind::Cancelled => "cancelled",
         TerminalKind::Error => "error",
     }
 }
@@ -1569,6 +1833,7 @@ async fn relay_one_response<F>(
     binding: &mut BindingState,
     step: &ResponseCreateStep,
     runtime: &dyn CodexWsRuntimePort,
+    adapter: crate::orchestration::ResponsesWebSocketAdapter,
     key_id: &str,
     selected_scheduler_epoch: u64,
     execution_lease_status: &StepExecutionLeaseStatus,
@@ -1681,7 +1946,7 @@ where
                             )
                             .await;
                         }
-                        let classification = match classify_server_event_with_cpu_budget(&text).await {
+                        let classification = match classify_server_event_with_cpu_budget(&text, adapter).await {
                             Ok(classification) => classification,
                             Err(error) => {
                                 let reason = error.message();
@@ -1709,8 +1974,22 @@ where
                             turn_state,
                             provider_headers,
                             terminal_event,
+                            codex_relay,
                         } = classification;
-                        if !provider_headers.is_empty() {
+                        let relay_frames = match (adapter, codex_relay) {
+                            (
+                                crate::orchestration::ResponsesWebSocketAdapter::Codex,
+                                CodexRelayDirective::ForwardEvents(events),
+                            ) => events,
+                            (
+                                crate::orchestration::ResponsesWebSocketAdapter::Codex,
+                                CodexRelayDirective::SuppressProviderPrivate,
+                            ) => Vec::new(),
+                            _ => vec![text],
+                        };
+                        if adapter == crate::orchestration::ResponsesWebSocketAdapter::Codex
+                            && !provider_headers.is_empty()
+                        {
                             runtime.record_codex_quota_headers(key_id, provider_headers);
                         }
                         if created {
@@ -1816,32 +2095,44 @@ where
                             received_business_frame = true;
                             upstream_deadline = tokio::time::Instant::now() + deadlines.read;
                         }
-                        if let Some(turn_state) = turn_state {
-                            if let Some(turn_id) = step.logical_turn_id.as_ref() {
-                                binding.turn_state = Some((turn_id.clone(), turn_state));
+                        if adapter == crate::orchestration::ResponsesWebSocketAdapter::Codex {
+                            if let Some(turn_state) = turn_state {
+                                if let Some(turn_id) = step.logical_turn_id.as_ref() {
+                                    binding.turn_state = Some((turn_id.clone(), turn_state));
+                                }
                             }
                         }
-                        let close_after_terminal = terminal == Some(TerminalKind::Completed)
+                        let successful_terminal = terminal.is_some_and(|kind| {
+                            kind == TerminalKind::Completed
+                                || (kind == TerminalKind::Incomplete
+                                    && terminal_event.as_ref().is_some_and(|event| {
+                                        event
+                                            .provider_status_code
+                                            .is_none_or(|status| (200..300).contains(&status))
+                                    }))
+                        });
+                        let close_after_terminal = successful_terminal
                             && (runtime.scheduler_epoch() != selected_scheduler_epoch
                                 || runtime.validate_runtime_fences().is_err());
-                        if terminal == Some(TerminalKind::Completed) {
-                            let response_id = terminal_response_id
-                                .clone()
-                                .expect("completed response id was validated");
-                            binding.last_completed_response_id = Some(response_id);
+                        if successful_terminal {
+                            if let Some(response_id) = terminal_response_id.clone() {
+                                binding.last_completed_response_id = Some(response_id);
+                            }
                         }
                         if let Some((kind, event)) = terminal.zip(terminal_event) {
-                            return terminal_outcome(kind, event, close_after_terminal, text);
+                            return terminal_outcome(kind, event, close_after_terminal, relay_frames);
                         }
-                        if send_client_step_data_frame(
-                            client.as_mut(),
-                            RelayFrame::Text(text),
-                            deadlines,
-                        )
-                            .await
-                            .is_err()
-                        {
-                            return StepOutcome::ClientClosed;
+                        for relay_frame in relay_frames {
+                            if send_client_step_data_frame(
+                                client.as_mut(),
+                                RelayFrame::Text(relay_frame),
+                                deadlines,
+                            )
+                                .await
+                                .is_err()
+                            {
+                                return StepOutcome::ClientClosed;
+                            }
                         }
                     }
                     RelayFrame::Ping(bytes) => {
@@ -1889,16 +2180,18 @@ where
 async fn deliver_terminal_after_settlement(
     client: &mut Box<dyn RelayPeer>,
     step: &ResponseCreateStep,
-    terminal_frame: Bytes,
+    terminal_frames: Vec<Bytes>,
     close_after_terminal: bool,
     deadlines: &StepDeadlines,
 ) -> bool {
     let deadline = terminal_delivery_deadline(deadlines);
-    if send_client_data_until(client.as_mut(), RelayFrame::Text(terminal_frame), deadline)
-        .await
-        .is_err()
-    {
-        return false;
+    for terminal_frame in terminal_frames {
+        if send_client_data_until(client.as_mut(), RelayFrame::Text(terminal_frame), deadline)
+            .await
+            .is_err()
+        {
+            return false;
+        }
     }
     if close_after_terminal {
         let control = route_control_event(
@@ -2427,7 +2720,7 @@ mod tests {
     }
 
     struct TestRuntime {
-        official: Mutex<Option<Box<dyn RelayPeer>>>,
+        official: Mutex<VecDeque<Box<dyn RelayPeer>>>,
         fail_first_connect: bool,
         connect_delays: Mutex<VecDeque<Duration>>,
         handshake_turn_state: Mutex<Option<String>>,
@@ -2477,7 +2770,7 @@ mod tests {
             runtime_fences_valid: Arc<AtomicBool>,
         ) -> Self {
             Self {
-                official: Mutex::new(Some(official)),
+                official: Mutex::new(VecDeque::from([official])),
                 fail_first_connect,
                 connect_delays: Mutex::new(VecDeque::new()),
                 handshake_turn_state: Mutex::new(None),
@@ -2522,6 +2815,13 @@ mod tests {
                 .lock()
                 .expect("connect delays should lock")
                 .push_back(delay);
+        }
+
+        fn push_official(&self, official: Box<dyn RelayPeer>) {
+            self.official
+                .lock()
+                .expect("official peers should lock")
+                .push_back(official);
         }
 
         fn set_handshake_turn_state(&self, turn_state: impl Into<String>) {
@@ -2637,8 +2937,8 @@ mod tests {
                 .official
                 .lock()
                 .expect("official peer should lock")
-                .take()
-                .expect("one official peer should connect");
+                .pop_front()
+                .expect("an official peer should connect");
             if self
                 .invalidate_fences_during_connect
                 .swap(false, Ordering::AcqRel)
@@ -2654,6 +2954,17 @@ mod tests {
                     .expect("handshake turn state should lock")
                     .take(),
             })
+        }
+
+        async fn activate_reused_candidate(
+            &self,
+            candidate: CodexWsCandidate,
+        ) -> Result<CodexWsCandidate, StepPreparationError> {
+            self.started_candidates
+                .lock()
+                .expect("started candidates should lock")
+                .push(candidate.provider_id.clone());
+            Ok(candidate)
         }
 
         async fn abort_candidate(&self, candidate: &CodexWsCandidate) {
@@ -2960,7 +3271,16 @@ mod tests {
             response_headers: BTreeMap::new(),
             account_profile: None,
             report_kind: "openai_responses_stream_success".to_string(),
+            binding_identity: super::super::runtime::UpstreamBindingIdentity::for_test(
+                crate::orchestration::ResponsesWebSocketAdapter::Codex,
+                provider_id,
+                "endpoint-1",
+                "key-1",
+            ),
+            adapter: crate::orchestration::ResponsesWebSocketAdapter::Codex,
+            provider_type: "codex".to_string(),
             identity: step.official_identity.clone(),
+            connect_plan: None,
             route: OutboundRoute::Direct,
             timeouts,
             lifecycle,
@@ -2968,7 +3288,7 @@ mod tests {
             provider_concurrent_limit: None,
             key_concurrent_limit: None,
             key_rpm_limit: None,
-            shared_global_generation: "global-generation".to_string(),
+            shared_global_generation: Some("global-generation".to_string()),
             shared_key_generation: "key-generation".to_string(),
             shared_catalog_binding: super::super::hot_state::CodexWsCatalogBindingLease {
                 provider: super::super::hot_state::CodexWsCatalogResourceLease {
@@ -3043,7 +3363,7 @@ mod tests {
                 ..TerminalEventSummary::default()
             },
             false,
-            Bytes::from_static(b"{}"),
+            vec![Bytes::from_static(b"{}")],
         );
         let StepOutcome::Poisoned { disposition, .. } = outcome else {
             panic!("provider failure should poison the current binding");
@@ -3080,10 +3400,15 @@ mod tests {
         let (client, _) = ScriptedPeer::new([(Duration::from_millis(1), relay_text(request()))]);
         let mut client: Box<dyn RelayPeer> = Box::new(client);
 
-        let (step, _started_at) = receive_idle_step(&mut client, &mut official, &idle_binding())
-            .await
-            .expect("idle receive should succeed")
-            .expect("the next step should parse");
+        let (step, _started_at) = receive_idle_step(
+            &mut client,
+            &mut official,
+            &idle_binding(),
+            crate::orchestration::ResponsesWebSocketAdapter::Codex,
+        )
+        .await
+        .expect("idle receive should succeed")
+        .expect("the next step should parse");
 
         assert_eq!(step.fence.correlation_id, "step-1");
         assert_eq!(
@@ -3101,9 +3426,14 @@ mod tests {
         let (client, _) = ScriptedPeer::new([(Duration::ZERO, relay_text(request()))]);
         let mut client: Box<dyn RelayPeer> = Box::new(client);
 
-        let error = receive_idle_step(&mut client, &mut official, &idle_binding())
-            .await
-            .expect_err("an idle upstream close must poison the binding");
+        let error = receive_idle_step(
+            &mut client,
+            &mut official,
+            &idle_binding(),
+            crate::orchestration::ResponsesWebSocketAdapter::Codex,
+        )
+        .await
+        .expect_err("an idle upstream close must poison the binding");
         let IdleStepError::Upstream(error) = error else {
             panic!("official close should be classified as an upstream failure");
         };
@@ -4027,6 +4357,122 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn independent_turn_replans_and_reuses_an_identical_physical_binding() {
+        let (official, official_sent) = ScriptedPeer::new([
+            (
+                Duration::ZERO,
+                relay_text(
+                    json!({"type":"response.created","response":{"id":"resp-1"}}).to_string(),
+                ),
+            ),
+            (
+                Duration::ZERO,
+                relay_text(
+                    json!({"type":"response.completed","response":{"id":"resp-1"}}).to_string(),
+                ),
+            ),
+            (
+                Duration::from_millis(25),
+                relay_text(
+                    json!({"type":"response.created","response":{"id":"resp-2"}}).to_string(),
+                ),
+            ),
+            (
+                Duration::ZERO,
+                relay_text(
+                    json!({"type":"response.completed","response":{"id":"resp-2"}}).to_string(),
+                ),
+            ),
+        ]);
+        let runtime = TestRuntime::new(Box::new(official), false);
+        let (client, _) = ScriptedPeer::new([
+            (Duration::ZERO, relay_text(request())),
+            (
+                Duration::from_millis(20),
+                relay_text(request_step("step-2", None)),
+            ),
+            (Duration::from_millis(50), RelayFrame::Close),
+        ]);
+
+        run_codex_ws_session(Box::new(client), &runtime).await;
+
+        assert_eq!(runtime.select_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(runtime.connect_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(runtime.prepare_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(runtime.report_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            official_sent
+                .lock()
+                .expect("official frames should lock")
+                .iter()
+                .filter(|frame| matches!(frame, RelayFrame::Text(_)))
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn independent_model_change_replaces_the_physical_binding() {
+        let (first_official, first_sent) = ScriptedPeer::new([
+            (
+                Duration::ZERO,
+                relay_text(
+                    json!({"type":"response.created","response":{"id":"resp-1"}}).to_string(),
+                ),
+            ),
+            (
+                Duration::ZERO,
+                relay_text(
+                    json!({"type":"response.completed","response":{"id":"resp-1"}}).to_string(),
+                ),
+            ),
+        ]);
+        let (second_official, second_sent) = ScriptedPeer::new([
+            (
+                Duration::ZERO,
+                relay_text(
+                    json!({"type":"response.created","response":{"id":"resp-2"}}).to_string(),
+                ),
+            ),
+            (
+                Duration::ZERO,
+                relay_text(
+                    json!({"type":"response.completed","response":{"id":"resp-2"}}).to_string(),
+                ),
+            ),
+        ]);
+        let runtime = TestRuntime::new(Box::new(first_official), false);
+        runtime.push_official(Box::new(second_official));
+        let mut second: serde_json::Value = serde_json::from_str(&request_step("step-2", None))
+            .expect("request fixture should parse");
+        second["model"] = json!("gpt-other");
+        let (client, _) = ScriptedPeer::new([
+            (Duration::ZERO, relay_text(request())),
+            (Duration::from_millis(20), relay_text(second.to_string())),
+            (Duration::from_millis(20), RelayFrame::Close),
+        ]);
+
+        run_codex_ws_session(Box::new(client), &runtime).await;
+
+        assert_eq!(runtime.select_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(runtime.connect_calls.load(Ordering::Relaxed), 2);
+        assert!(first_sent
+            .lock()
+            .expect("first provider frames should lock")
+            .iter()
+            .any(|frame| matches!(frame, RelayFrame::Close)));
+        assert_eq!(
+            second_sent
+                .lock()
+                .expect("second provider frames should lock")
+                .iter()
+                .filter(|frame| matches!(frame, RelayFrame::Text(_)))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn connect_timeout_falls_back_before_any_provider_write() {
         let created = json!({
             "type": "response.created",
@@ -4172,8 +4618,14 @@ mod tests {
         let started_at = tokio::time::Instant::now();
 
         assert!(
-            deliver_terminal_after_settlement(&mut client, &step, terminal, false, &deadlines)
-                .await
+            deliver_terminal_after_settlement(
+                &mut client,
+                &step,
+                vec![terminal],
+                false,
+                &deadlines,
+            )
+            .await
         );
         assert_eq!(started_at.elapsed(), Duration::from_millis(500));
         assert!(sent
@@ -4293,9 +4745,9 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn upstream_read_timeout_is_not_extended_by_unknown_text() {
+    async fn upstream_read_timeout_is_not_extended_by_non_business_text() {
         let created = json!({"type":"response.created","response":{"id":"resp-1"}}).to_string();
-        let unknown = json!({"type":"response.future_metadata","value":true}).to_string();
+        let unknown = json!({"type":"provider.future_metadata","value":true}).to_string();
         let (official, _) = ScriptedPeer::new([
             (Duration::ZERO, relay_text(created)),
             (Duration::from_millis(8), relay_text(unknown.clone())),

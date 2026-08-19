@@ -492,6 +492,48 @@ mod tests {
     }
 
     #[test]
+    fn selected_provider_credentials_replace_client_credentials() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("api-key", http::HeaderValue::from_static("client-key"));
+        headers.insert("cookie", http::HeaderValue::from_static("session=client"));
+
+        let built = build_complete_passthrough_headers_with_auth(
+            &headers,
+            "api-key",
+            "provider-key",
+            &BTreeMap::new(),
+            Some("application/json"),
+        );
+
+        assert_eq!(
+            built.get("api-key").map(String::as_str),
+            Some("provider-key")
+        );
+        assert_eq!(built.get("cookie"), None);
+    }
+
+    #[test]
+    fn trusted_provider_header_override_keeps_precedence_over_key_auth() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("api-key", http::HeaderValue::from_static("client-key"));
+        let extra_headers =
+            BTreeMap::from([("api-key".to_string(), "configured-provider-key".to_string())]);
+
+        let built = build_complete_passthrough_headers_with_auth(
+            &headers,
+            "api-key",
+            "selected-key",
+            &extra_headers,
+            Some("application/json"),
+        );
+
+        assert_eq!(
+            built.get("api-key").map(String::as_str),
+            Some("configured-provider-key")
+        );
+    }
+
+    #[test]
     fn passthrough_headers_strip_internal_cafecode_identity() {
         let mut headers = http::HeaderMap::new();
         headers.insert("cafecode-uid", http::HeaderValue::from_static("372"));

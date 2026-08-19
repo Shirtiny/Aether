@@ -268,6 +268,24 @@
           />
         </div>
 
+        <div
+          class="flex items-center justify-between p-3 border rounded-lg bg-muted/50"
+          data-testid="responses-websocket-setting"
+        >
+          <Label
+            for="responses-websocket-enabled"
+            class="text-sm font-medium"
+          >
+            Responses WebSocket 模式
+          </Label>
+          <Switch
+            id="responses-websocket-enabled"
+            :model-value="form.responses_websocket_enabled"
+            aria-label="Responses WebSocket 模式"
+            @update:model-value="(v: boolean) => form.responses_websocket_enabled = v"
+          />
+        </div>
+
         <div class="flex items-center justify-between p-3 border rounded-lg bg-muted/50">
           <div class="space-y-0.5">
             <span class="text-sm font-medium">号池调度模式</span>
@@ -452,6 +470,7 @@ const form = ref({
   quota_expires_at: '',
   provider_priority: 100,
   keep_priority_on_conversion: false,  // 格式转换时是否保持优先级
+  responses_websocket_enabled: false,
   // 状态配置
   is_active: true,
   rate_limit: undefined as number | undefined,
@@ -484,6 +503,7 @@ function resetForm() {
     quota_expires_at: '',
     provider_priority: defaultPriority.value,
     keep_priority_on_conversion: false,
+    responses_websocket_enabled: false,
     is_active: true,
     rate_limit: undefined,
     concurrent_limit: undefined,
@@ -519,6 +539,7 @@ function loadProviderData() {
     quota_expires_at: formatDateTimeLocalInput(props.provider.quota_expires_at),
     provider_priority: props.provider.provider_priority || 999,
     keep_priority_on_conversion: props.provider.keep_priority_on_conversion ?? false,
+    responses_websocket_enabled: props.provider.responses_websocket_enabled ?? false,
     is_active: props.provider.is_active,
     rate_limit: undefined,
     concurrent_limit: undefined,
@@ -614,6 +635,7 @@ const handleSubmit = async () => {
       quota_last_reset_at: quotaLastResetAt,
       quota_expires_at: quotaExpiresAt,
       keep_priority_on_conversion: form.value.keep_priority_on_conversion,
+      responses_websocket_enabled: form.value.responses_websocket_enabled,
       is_active: form.value.is_active,
       // 请求配置
       max_retries: form.value.max_retries ?? undefined,

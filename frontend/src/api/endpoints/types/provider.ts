@@ -180,6 +180,10 @@ export interface ChatPiiRedactionProviderConfig {
   enabled: boolean
 }
 
+export interface ResponsesWebSocketProviderConfig {
+  enabled: boolean
+}
+
 export type RiskControlSessionAvoidanceMode = 'ignore' | 'candidate' | 'block'
 
 export interface RiskControlSessionAvoidanceProviderConfig {
@@ -188,6 +192,7 @@ export interface RiskControlSessionAvoidanceProviderConfig {
 
 export interface ProviderConfig {
   chat_pii_redaction?: ChatPiiRedactionProviderConfig
+  responses_websocket?: ResponsesWebSocketProviderConfig
   risk_control_session_avoidance?: RiskControlSessionAvoidanceProviderConfig
   pool_advanced?: PoolAdvancedConfig
   failover_rules?: FailoverRulesConfig
@@ -820,6 +825,7 @@ export interface ProviderWithEndpointsSummary {
   website?: string
   provider_priority: number
   keep_priority_on_conversion: boolean  // 格式转换时是否保持优先级
+  responses_websocket_enabled?: boolean
   enable_format_conversion: boolean  // 是否允许格式转换（提供商级别开关）
   billing_type?: 'monthly_quota' | 'pay_as_you_go' | 'free_tier'
   monthly_quota_usd?: number

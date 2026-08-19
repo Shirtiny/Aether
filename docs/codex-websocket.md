@@ -1,42 +1,47 @@
-# Codex 官方 WebSocket
+# Responses WebSocket 与 Codex Adapter
 
-本文档说明 Aether 的 Codex 官方原生 WebSocket 功能、启用条件、账号控制、
-`route-v1` 协议、TLS/profile 约束、调度行为、性能参数和上线检查。
+本文档说明 Aether 的原生 Responses WebSocket、Standard/Codex adapter、启用条件、
+`route-v1` 协议、Codex TLS/profile 约束、调度行为和资源边界。
 
-> 状态：代码已实现。隐藏的全局熔断开关缺省开启，账号开关缺省关闭；部署新版本
-> 不会自动启用任何账号，也不代表真实凭据、TLS 抓取、多实例或负载门禁已经通过。
+> Provider 级 `responses_websocket.enabled` 缺省为关闭。Codex 还要求隐藏的全局熔断
+> 和账号 capability 同时开启。部署新版本不会自动启用任何 Provider 或账号。
 
 ## 1. 功能范围
 
 支持的链路：
 
 ```text
-Codex 客户端 WebSocket
+Responses 客户端 WebSocket
   -> sub2api 账号级 WebSocket 入口
   -> Aether GET /v1/responses（route-v1）
-  -> Aether Codex OAuth 号池调度
-  -> wss://chatgpt.com/backend-api/codex/responses
+  -> Aether Provider/Key 账号池调度
+  -> Provider 原生 Responses WebSocket
 ```
 
-本功能只支持：
+共享入口支持：
 
-- Provider 类型为 `codex`；
-- Key 认证类型为 `oauth`；
 - Provider API 格式为 `openai:responses`；
+- 显式启用 `responses_websocket.enabled=true` 的 OpenAI Responses WS 兼容 Provider；
 - Codex 官方 `chatgpt.com/backend-api/codex` Endpoint；
-- 固定、不可替换的 Codex Rustls WebSocket profile。
+- Standard adapter 使用 planner 生成的 URL、认证头、代理和 transport profile；
+- Codex adapter 使用固定、不可替换的 Codex Rustls WebSocket profile。
 
 明确不支持：
 
-- 其他 Provider 的原生 WebSocket；
+- 未显式验证并启用的 Provider 原生 WebSocket；
 - API Key 类型的 Codex 官方账号；
-- 任意 OpenAI-compatible 自定义上游复用本 profile；
+- Standard Provider 复用 Codex 官方 connector/profile；
 - 浏览器/uTLS/Chrome JA3 或 JA4 模拟；
 - Provider 已经可能执行当前 step 后的自动重放；
 - 把 HTTP/SSE 响应重新解析成 Aether 原生 WS。
 
-不满足原生 WS 条件的普通 HTTP/SSE 路由保持原有行为。关闭某个 Codex Key 的
-账号级 WS 不会关闭该 Key 的 HTTP 调度。
+不满足原生 WS 条件的普通 HTTP/SSE 路由保持原有行为。Provider 级 WS 开关及 Codex
+账号 capability 均不会关闭对应的 HTTP 调度。
+
+Standard adapter 保留客户端明确提供的 `store`、`previous_response_id` 和 `generate`，
+并移除 HTTP transport 专属的 `stream` 与 `background`。它对合法 Provider 事件做原帧
+透传，不解释 Codex quota/metadata。Codex adapter 才会过滤明确的 Codex 私有 envelope
+并同步账号 quota 状态。
 
 ## 2. 入口和 `route-v1` 协议
 
@@ -72,19 +77,16 @@ Aether API Key，并把该 Key 绑定到只包含目标 Codex OAuth 号池的组
 - 官方上游最大 frame 为 16 MiB、最大 message 为 64 MiB；
 - 同一连接同一时间只允许一个 in-flight step。
 
-sub2api 发给 Aether 的每个 `response.create` 必须携带稳定身份和 fence 元数据，
-包括：
+sub2api 发给 Aether 的每个 `response.create` 必须携带 step fence：
 
 ```text
-session_id
-thread_id
 sub2api_step_correlation_id
 sub2api_binding_epoch_id
 sub2api_binding_generation
 ```
 
-这些字段用于识别逻辑会话、阻止旧 binding 重放，并把控制消息关联到唯一 step。
-不得用 prompt 内容代替会话身份。
+Codex adapter 另外要求成对出现的 `session_id` 和 `thread_id`；Standard adapter 不要求
+Codex 身份字段。fence 用于阻止旧 binding 重放，并把控制消息关联到唯一 step。
 
 ### 2.3 控制事件
 
@@ -106,7 +108,8 @@ adapter_proof_version=1
 
 ## 3. 隐藏的全局熔断
 
-系统配置 key 为 `codex_ws`。管理界面不暴露该配置；没有配置记录时，`enabled` 和
+系统配置 key 为 `codex_ws`。它只控制 Codex adapter，不控制 Standard adapter，也不再
+关闭共享 GET `/v1/responses` 入口。管理界面不暴露该配置；没有配置记录时，`enabled` 和
 `native_codex_ws_enabled` 缺省均为 `true`。资源级 catalog fence 固定启用，没有独立的
 灰度配置。顶层值不是对象，或这两个已知字段存在但无法解析时，功能 gate fail closed。
 
@@ -131,8 +134,8 @@ Content-Type: application/json
 DELETE /api/admin/system/configs/codex_ws
 ```
 
-也可显式写入前两个 gate 为 `true`。只有这两个 gate 都为 `true` 才开放入口和官方原生
-Connector。管理 API 写入或删除成功后会立即更新进程内 feature generation，并发布共享
+也可显式写入前两个 gate 为 `true`。只有这两个 gate 都为 `true` 才允许 Codex 候选使用
+官方 Connector。管理 API 写入或删除成功后会立即更新进程内 feature generation，并发布共享
 global hot-state，不要求重启。会话级 global gate 由共享状态在跨实例执行 fence 上兜底。
 每次限制性变更都会推进 generation；已保留连接在后续执行 fence 发现 generation
 改变后失败关闭，不能继续使用旧配置写上游。
@@ -145,13 +148,28 @@ catalog 硬 fence。Redis key `codex-ws:catalog-fence:v2:*` 中的 `v2` 仅表�
 全局熔断不是环境变量。`AETHER_CODEX_WS_*` 环境变量只负责容量和 worker 调优，
 不能改变功能开关。
 
-## 4. Codex 账号级控制
+## 4. Provider 与 Codex 账号控制
 
-### 4.1 静态启用条件
+### 4.1 Provider 级开关
+
+所有 Responses WS Provider 都必须设置：
+
+```json
+{
+  "responses_websocket": {
+    "enabled": true
+  }
+}
+```
+
+可在 Provider 编辑对话框中切换 **Responses WebSocket 模式**，或通过 Provider 创建/更新
+API 的 `responses_websocket_enabled` 布尔字段设置。关闭后只退出 WS 候选集，不影响 HTTP。
+
+### 4.2 Codex 静态启用条件
 
 账号能够进入原生 WS 候选集之前必须同时满足：
 
-1. Provider 类型精确为 `codex`，且 Provider 启用；
+1. Provider 类型精确为 `codex`，Provider 启用且 Provider 级 WS 开关开启；
 2. Key 的 `auth_type` 为 `oauth`，且 Key 启用；
 3. `capabilities.codex_official_ws=true`；
 4. Key 携带完整且精确匹配的 schema-3 transport profile；
@@ -163,7 +181,7 @@ catalog 硬 fence。Redis key `codex-ws:catalog-fence:v2:*` 中的 `v2` 仅表�
 
 `profile_effective=true` 只说明静态条件成立，不代表某次真实请求必然可调度。
 
-### 4.2 管理界面
+### 4.3 Codex 管理界面
 
 进入 **Admin -> Pool Management**，找到 Codex OAuth 账号：
 
@@ -173,7 +191,7 @@ catalog 硬 fence。Redis key `codex-ws:catalog-fence:v2:*` 中的 `v2` 仅表�
 
 管理界面会自动写入固定 profile，操作员不应手工拼装 fingerprint。
 
-### 4.3 单账号 API
+### 4.4 Codex 单账号 API
 
 启用：
 
@@ -213,7 +231,7 @@ Content-Type: application/json
 | `profile_reasons` | 静态不满足原因 |
 | `runtime_reasons` | 配额、代理、模型、熔断、并发等运行期原因 |
 
-### 4.4 批量 API
+### 4.5 Codex 批量 API
 
 ```http
 POST /api/admin/pool/{provider_id}/keys/batch-action
@@ -274,6 +292,11 @@ profile 中任意 revision、crypto provider 或 buffer 字段不匹配都会 fa
 - request body 不复制到每个候选，最终选中账号只在写入前物化一次。
 
 ### 6.2 后续 turn
+
+携带非空 `previous_response_id` 的 continuation 固定到创建该 response 的物理 binding，
+不得切换 Provider、Endpoint、Key、URL、认证、代理或 transport profile。不携带该字段的
+独立 turn 会重新规划；若新候选的物理 binding identity 与当前连接相同则复用，否则先建立
+新上游连接，再关闭旧连接，下游 WS 保持打开。
 
 长连接的每个 turn 在 Provider write 前重新验证：
 

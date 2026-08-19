@@ -19,28 +19,21 @@ const DOWNSTREAM_WRITE_BUFFER_SIZE_BYTES: usize = 128 * 1024;
 const DOWNSTREAM_MAX_WRITE_BUFFER_SIZE_BYTES: usize = 17 * 1024 * 1024;
 const DOWNSTREAM_MAX_RETAINED_WRITE_BUFFER_CAPACITY_BYTES: usize = 256 * 1024;
 
-pub(crate) async fn codex_responses_websocket(
+pub(crate) async fn responses_websocket(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
     ConnectInfo(remote_addr): ConnectInfo<std::net::SocketAddr>,
     uri: Uri,
     headers: HeaderMap,
 ) -> Response<Body> {
-    let shared_global = match super::hot_state::ensure_global_hot_lease(&state).await {
-        Ok(lease) => lease,
-        Err(_) => {
-            return error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Codex WebSocket configuration is unavailable",
-            )
-        }
-    };
-    if !shared_global.eligible {
-        return error_response(
-            StatusCode::UPGRADE_REQUIRED,
-            "Codex WebSocket ingress is disabled",
-        );
-    }
+    // The global switch belongs only to the Codex adapter. Failure to read it
+    // must keep Codex fail-closed without disabling Standard providers.
+    let shared_global = super::hot_state::ensure_global_hot_lease(&state)
+        .await
+        .unwrap_or(super::hot_state::CodexWsHotLease {
+            generation: String::new(),
+            eligible: false,
+        });
     if let Err(error) = negotiate_route_control(&headers) {
         return error_response(StatusCode::PRECONDITION_FAILED, error.message());
     }
@@ -62,7 +55,7 @@ pub(crate) async fn codex_responses_websocket(
     let Some(decision) = request_context.control_decision else {
         return error_response(
             StatusCode::NOT_FOUND,
-            "Codex WebSocket route is unavailable",
+            "Responses WebSocket route is unavailable",
         );
     };
     if trusted_auth_local_rejection(Some(&decision), &headers).is_some() {
@@ -84,13 +77,14 @@ pub(crate) async fn codex_responses_websocket(
             "auth context changed during WebSocket admission",
         );
     }
-    if super::hot_state::validate_global_hot_lease(&state, &shared_global)
-        .await
-        .is_err()
+    if shared_global.eligible
+        && super::hot_state::validate_global_hot_lease(&state, &shared_global)
+            .await
+            .is_err()
     {
         return error_response(
             StatusCode::SERVICE_UNAVAILABLE,
-            "Codex WebSocket configuration changed during admission",
+            "Responses WebSocket configuration changed during admission",
         );
     }
 
@@ -108,7 +102,7 @@ pub(crate) async fn codex_responses_websocket(
         Err(_) => {
             return error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
-                "Codex WebSocket runtime is unavailable",
+                "Responses WebSocket runtime is unavailable",
             )
         }
     };
@@ -137,7 +131,7 @@ pub(crate) async fn codex_responses_websocket(
 fn error_response(status: StatusCode, message: &'static str) -> Response<Body> {
     let payload = serde_json::json!({
         "error": {
-            "type": "codex_websocket_error",
+            "type": "responses_websocket_error",
             "message": message,
         }
     });
@@ -145,7 +139,7 @@ fn error_response(status: StatusCode, message: &'static str) -> Response<Body> {
         .status(status)
         .header(http::header::CONTENT_TYPE, "application/json")
         .body(Body::from(payload.to_string()))
-        .expect("static Codex WS error response should build")
+        .expect("static Responses WS error response should build")
 }
 
 struct AxumPeer {

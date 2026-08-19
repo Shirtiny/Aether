@@ -7,6 +7,52 @@ use tracing::debug;
 use crate::provider_transport::GatewayProviderTransportSnapshot;
 use crate::AppState;
 
+pub(crate) const RESPONSES_WEBSOCKET_CONFIG_KEY: &str = "responses_websocket";
+
+/// Provider-specific behavior layered on top of the shared Responses
+/// WebSocket session. Eligibility remains provider-scoped and opt-in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResponsesWebSocketAdapter {
+    Standard,
+    Codex,
+}
+
+impl ResponsesWebSocketAdapter {
+    pub(crate) fn supports_provider_type(self, provider_type: &str) -> bool {
+        match self {
+            Self::Standard => {
+                !provider_type.trim().is_empty()
+                    && !provider_type.trim().eq_ignore_ascii_case("codex")
+            }
+            Self::Codex => provider_type.trim().eq_ignore_ascii_case("codex"),
+        }
+    }
+}
+
+pub(crate) fn responses_websocket_enabled(provider_config: Option<&Value>) -> bool {
+    provider_config
+        .and_then(|config| config.get(RESPONSES_WEBSOCKET_CONFIG_KEY))
+        .and_then(Value::as_object)
+        .and_then(|responses| responses.get("enabled"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+pub(crate) fn responses_websocket_adapter(
+    provider_type: &str,
+    provider_config: Option<&Value>,
+) -> Option<ResponsesWebSocketAdapter> {
+    let provider_type = provider_type.trim();
+    if provider_type.is_empty() || !responses_websocket_enabled(provider_config) {
+        return None;
+    }
+    Some(if provider_type.eq_ignore_ascii_case("codex") {
+        ResponsesWebSocketAdapter::Codex
+    } else {
+        ResponsesWebSocketAdapter::Standard
+    })
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct LocalFailoverPolicy {
     pub(crate) max_retries: Option<u64>,
@@ -253,7 +299,8 @@ mod tests {
 
     use super::{
         append_local_failover_policy_to_value, local_failover_policy_from_report_context,
-        LocalFailoverPolicy, LocalFailoverRegexRule,
+        responses_websocket_adapter, responses_websocket_enabled, LocalFailoverPolicy,
+        LocalFailoverRegexRule, ResponsesWebSocketAdapter,
     };
     use crate::provider_transport::snapshot::{
         GatewayProviderTransportEndpoint, GatewayProviderTransportKey,
@@ -358,5 +405,33 @@ mod tests {
                 }],
             })
         );
+    }
+
+    #[test]
+    fn responses_websocket_requires_an_explicit_provider_switch() {
+        assert!(!responses_websocket_enabled(None));
+        assert!(!responses_websocket_enabled(Some(&json!({
+            "responses_websocket": {"enabled": false}
+        }))));
+        assert!(responses_websocket_enabled(Some(&json!({
+            "responses_websocket": {"enabled": true}
+        }))));
+        assert_eq!(
+            responses_websocket_adapter(
+                "custom",
+                Some(&json!({"responses_websocket": {"enabled": true}})),
+            ),
+            Some(ResponsesWebSocketAdapter::Standard)
+        );
+        assert_eq!(
+            responses_websocket_adapter(
+                "codex",
+                Some(&json!({"responses_websocket": {"enabled": true}})),
+            ),
+            Some(ResponsesWebSocketAdapter::Codex)
+        );
+        assert!(ResponsesWebSocketAdapter::Codex.supports_provider_type("CODEX"));
+        assert!(ResponsesWebSocketAdapter::Standard.supports_provider_type("openai"));
+        assert!(!ResponsesWebSocketAdapter::Standard.supports_provider_type("codex"));
     }
 }

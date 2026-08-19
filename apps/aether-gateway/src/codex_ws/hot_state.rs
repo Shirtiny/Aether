@@ -417,10 +417,14 @@ pub(crate) async fn validate_global_hot_lease(
 
 pub(crate) async fn validate_candidate_selection_hot_leases(
     state: &AppState,
-    global: &CodexWsHotLease,
+    global: Option<&CodexWsHotLease>,
     catalog: &CodexWsHotLease,
 ) -> Result<(), &'static str> {
-    let keys = vec![GLOBAL_STATE_KEY.to_string(), CATALOG_STATE_KEY.to_string()];
+    let mut keys = Vec::with_capacity(2);
+    if global.is_some() {
+        keys.push(GLOBAL_STATE_KEY.to_string());
+    }
+    keys.push(CATALOG_STATE_KEY.to_string());
     let values = state
         .runtime_state
         .kv_get_many(&keys)
@@ -429,14 +433,19 @@ pub(crate) async fn validate_candidate_selection_hot_leases(
     if values.len() != keys.len() {
         return Err("candidate_selection_hot_state_unavailable");
     }
+    let catalog_index = if let Some(global) = global {
+        validate_switch(
+            values[0].as_deref(),
+            &global.generation,
+            "codex_ws_global_changed_during_selection",
+        )
+        .map_err(|_| "codex_ws_global_changed_during_selection")?;
+        1
+    } else {
+        0
+    };
     validate_switch(
-        values[0].as_deref(),
-        &global.generation,
-        "codex_ws_global_changed_during_selection",
-    )
-    .map_err(|_| "codex_ws_global_changed_during_selection")?;
-    validate_switch(
-        values[1].as_deref(),
+        values[catalog_index].as_deref(),
         &catalog.generation,
         "account_catalog_changed_during_selection",
     )
@@ -577,7 +586,7 @@ pub(crate) async fn validate_hot_leases(
     provider_id: &str,
     endpoint_id: &str,
     key_id: &str,
-    global_generation: &str,
+    global_generation: Option<&str>,
     key_generation: &str,
     binding: &CodexWsCatalogBindingLease,
 ) -> Result<CodexWsFenceDecision, &'static str> {
@@ -586,12 +595,11 @@ pub(crate) async fn validate_hot_leases(
         .map_err(|_| "provider_hot_state_invalid")?;
     let endpoint_state_key = catalog_resource_state_key(CatalogResourceKind::Endpoint, endpoint_id)
         .map_err(|_| "endpoint_hot_state_invalid")?;
-    let keys = vec![
-        GLOBAL_STATE_KEY.to_string(),
-        key_state_key,
-        provider_state_key,
-        endpoint_state_key,
-    ];
+    let mut keys = Vec::with_capacity(4);
+    if global_generation.is_some() {
+        keys.push(GLOBAL_STATE_KEY.to_string());
+    }
+    keys.extend([key_state_key, provider_state_key, endpoint_state_key]);
     let values = state
         .runtime_state
         .kv_get_many(&keys)
@@ -601,24 +609,29 @@ pub(crate) async fn validate_hot_leases(
         return Err("account_hot_state_unavailable");
     }
 
+    let key_index = if let Some(global_generation) = global_generation {
+        validate_switch(
+            values[0].as_deref(),
+            global_generation,
+            "codex_ws_global_changed",
+        )?;
+        1
+    } else {
+        0
+    };
     validate_switch(
-        values[0].as_deref(),
-        global_generation,
-        "codex_ws_global_changed",
-    )?;
-    validate_switch(
-        values[1].as_deref(),
+        values[key_index].as_deref(),
         key_generation,
         "bound_account_ineligible",
     )?;
 
     let mut decision = validate_catalog_resource_switch(
-        values[2].as_deref(),
+        values[key_index + 1].as_deref(),
         &binding.provider,
         "bound_provider_changed",
     )?;
     decision = decision.combine(validate_catalog_resource_switch(
-        values[3].as_deref(),
+        values[key_index + 2].as_deref(),
         &binding.endpoint,
         "bound_endpoint_changed",
     )?);
@@ -1354,23 +1367,9 @@ pub(crate) fn key_runtime_eligibility(key: &StoredProviderCatalogKey) -> (bool, 
     if !key.is_active {
         return (false, "key_inactive");
     }
-    if !key.auth_type.trim().eq_ignore_ascii_case("oauth") {
-        return (false, "key_auth_type_unsupported");
-    }
-    if key
-        .capabilities
-        .as_ref()
-        .and_then(serde_json::Value::as_object)
-        .and_then(|values| values.get(aether_provider_transport::CODEX_OFFICIAL_WS_CAPABILITY))
-        .and_then(serde_json::Value::as_bool)
-        != Some(true)
+    if key.auth_type.trim().eq_ignore_ascii_case("oauth")
+        && key.oauth_invalid_at_unix_secs.is_some()
     {
-        return (false, "key_capability_disabled");
-    }
-    if !key_profile_matches(key) {
-        return (false, "key_ws_profile_mismatch");
-    }
-    if key.oauth_invalid_at_unix_secs.is_some() {
         return (false, "key_oauth_invalid");
     }
     (true, "eligible")
@@ -1379,65 +1378,6 @@ pub(crate) fn key_runtime_eligibility(key: &StoredProviderCatalogKey) -> (bool, 
 pub(crate) fn known_key_runtime_blocker(key: &StoredProviderCatalogKey) -> Option<&'static str> {
     let (eligible, reason) = key_runtime_eligibility(key);
     (!eligible).then_some(reason)
-}
-
-fn key_profile_matches(key: &StoredProviderCatalogKey) -> bool {
-    let Some(profile) = key
-        .fingerprint
-        .as_ref()
-        .and_then(serde_json::Value::as_object)
-        .and_then(|fingerprint| {
-            fingerprint.get(aether_provider_transport::CODEX_OFFICIAL_WS_PROFILE_FINGERPRINT_KEY)
-        })
-        .and_then(serde_json::Value::as_object)
-    else {
-        return false;
-    };
-    profile
-        .get("schema_version")
-        .and_then(serde_json::Value::as_u64)
-        == Some(aether_provider_transport::CODEX_OFFICIAL_WS_PROFILE_SCHEMA_VERSION)
-        && profile
-            .get("profile_id")
-            .and_then(serde_json::Value::as_str)
-            == Some(aether_provider_transport::CODEX_OFFICIAL_WS_PROFILE_ID)
-        && profile
-            .get("codex_commit")
-            .and_then(serde_json::Value::as_str)
-            == Some(aether_provider_transport::CODEX_OFFICIAL_WS_CODEX_COMMIT)
-        && profile
-            .get("tokio_tungstenite_rev")
-            .and_then(serde_json::Value::as_str)
-            == Some(aether_provider_transport::CODEX_OFFICIAL_WS_TOKIO_TUNGSTENITE_REV)
-        && profile
-            .get("tungstenite_rev")
-            .and_then(serde_json::Value::as_str)
-            == Some(aether_provider_transport::CODEX_OFFICIAL_WS_TUNGSTENITE_REV)
-        && profile
-            .get("tungstenite_patch_id")
-            .and_then(serde_json::Value::as_str)
-            == Some(aether_provider_transport::CODEX_OFFICIAL_WS_TUNGSTENITE_PATCH_ID)
-        && profile
-            .get("write_buffer_size_bytes")
-            .and_then(serde_json::Value::as_u64)
-            == Some(aether_provider_transport::CODEX_OFFICIAL_WS_WRITE_BUFFER_SIZE_BYTES as u64)
-        && profile
-            .get("max_write_buffer_size_bytes")
-            .and_then(serde_json::Value::as_u64)
-            == Some(
-                aether_provider_transport::CODEX_OFFICIAL_WS_MAX_WRITE_BUFFER_SIZE_BYTES as u64,
-            )
-        && profile
-            .get("max_retained_write_buffer_capacity_bytes")
-            .and_then(serde_json::Value::as_u64)
-            == Some(
-                aether_provider_transport::CODEX_OFFICIAL_WS_MAX_RETAINED_WRITE_BUFFER_CAPACITY_BYTES
-                    as u64,
-            )
-        && profile
-            .get("crypto_provider")
-            .and_then(serde_json::Value::as_str)
-            == Some(aether_provider_transport::CODEX_OFFICIAL_WS_CRYPTO_PROVIDER)
 }
 
 fn key_state_key(key_id: &str) -> Result<String, GatewayError> {
@@ -1796,14 +1736,14 @@ mod tests {
             .await
             .expect("begin catalog change");
         assert_eq!(
-            validate_candidate_selection_hot_leases(&state, &global, &catalog).await,
+            validate_candidate_selection_hot_leases(&state, Some(&global), &catalog).await,
             Err("account_catalog_changed_during_selection")
         );
         finish_catalog_hot_mutation(&state, mutation)
             .await
             .expect("finish catalog change");
         assert_eq!(
-            validate_candidate_selection_hot_leases(&state, &global, &catalog).await,
+            validate_candidate_selection_hot_leases(&state, Some(&global), &catalog).await,
             Err("account_catalog_changed_during_selection")
         );
     }
@@ -1857,7 +1797,7 @@ mod tests {
                 "provider-1",
                 "endpoint-1",
                 &key.id,
-                &global.generation,
+                Some(&global.generation),
                 &key_lease.generation,
                 &binding,
             )
@@ -1873,7 +1813,7 @@ mod tests {
                 "provider-1",
                 "endpoint-1",
                 &key.id,
-                &global.generation,
+                Some(&global.generation),
                 &key_lease.generation,
                 &binding,
             )

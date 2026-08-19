@@ -166,7 +166,7 @@ pub(crate) fn build_admin_provider_summary_value(
         .or(provider.quota_expires_at_unix_secs)
         .and_then(unix_secs_to_rfc3339);
 
-    json!({
+    let mut summary = json!({
         "id": provider.id.clone(),
         "name": provider.name.clone(),
         "provider_type": provider.provider_type.clone(),
@@ -208,5 +208,19 @@ pub(crate) fn build_admin_provider_summary_value(
         "ops_quota_alert_enabled": ops_quota_alert_enabled,
         "created_at": endpoint_timestamp_or_now(provider.created_at_unix_ms, now_unix_secs),
         "updated_at": endpoint_timestamp_or_now(provider.updated_at_unix_secs, now_unix_secs),
-    })
+    });
+    summary
+        .as_object_mut()
+        .expect("provider summary is an object")
+        .insert(
+            "responses_websocket_enabled".to_string(),
+            serde_json::Value::Bool(
+                crate::orchestration::responses_websocket_adapter(
+                    &provider.provider_type,
+                    provider_config.as_ref(),
+                )
+                .is_some(),
+            ),
+        );
+    summary
 }

@@ -6,6 +6,9 @@ use crate::handlers::admin::provider::write::normalize::normalize_chat_pii_redac
 use crate::handlers::admin::provider::write::normalize::normalize_pool_advanced_config;
 use crate::handlers::admin::provider::write::normalize::normalize_provider_type_input;
 use crate::handlers::admin::provider::write::normalize::normalize_risk_control_session_avoidance_config;
+use crate::handlers::admin::provider::write::normalize::{
+    set_responses_websocket_enabled, validate_responses_websocket_config,
+};
 use crate::handlers::admin::request::AdminAppState;
 use crate::handlers::admin::shared::normalize_json_object;
 use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogProvider;
@@ -287,6 +290,13 @@ pub(crate) async fn build_admin_update_provider_record(
         }
     }
 
+    if fields.contains("responses_websocket_enabled") {
+        let Some(enabled) = payload.responses_websocket_enabled else {
+            return Err("responses_websocket_enabled 必须是布尔值".to_string());
+        };
+        set_responses_websocket_enabled(&mut config_map, enabled)?;
+    }
+
     if config_map.contains_key("chat_pii_redaction") {
         let value = normalize_chat_pii_redaction_config(config_map.remove("chat_pii_redaction"))?;
         if let Some(value) = value {
@@ -301,6 +311,7 @@ pub(crate) async fn build_admin_update_provider_record(
             config_map.insert("risk_control_session_avoidance".to_string(), value);
         }
     }
+    validate_responses_websocket_config(&config_map)?;
 
     updated.config = (!config_map.is_empty()).then_some(serde_json::Value::Object(config_map));
     updated.updated_at_unix_secs = SystemTime::now()

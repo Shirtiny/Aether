@@ -34,6 +34,11 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "10"
     restart: unless-stopped
   redis:
     image: redis:7-alpine

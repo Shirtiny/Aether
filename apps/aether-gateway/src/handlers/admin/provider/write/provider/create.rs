@@ -6,6 +6,9 @@ use crate::handlers::admin::provider::write::normalize::normalize_chat_pii_redac
 use crate::handlers::admin::provider::write::normalize::normalize_pool_advanced_config;
 use crate::handlers::admin::provider::write::normalize::normalize_provider_type_input;
 use crate::handlers::admin::provider::write::normalize::normalize_risk_control_session_avoidance_config;
+use crate::handlers::admin::provider::write::normalize::{
+    set_responses_websocket_enabled, validate_responses_websocket_config,
+};
 use crate::handlers::admin::request::AdminAppState;
 use crate::handlers::admin::shared::normalize_json_object;
 use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogProvider;
@@ -128,6 +131,9 @@ pub(crate) async fn build_admin_create_provider_record(
     if let Some(value) = normalize_json_object(payload.failover_rules, "failover_rules")? {
         config_map.insert("failover_rules".to_string(), value);
     }
+    if let Some(enabled) = payload.responses_websocket_enabled {
+        set_responses_websocket_enabled(&mut config_map, enabled)?;
+    }
     if let Some(value) =
         normalize_json_object(payload.claude_code_advanced, "claude_code_advanced")?
     {
@@ -150,6 +156,7 @@ pub(crate) async fn build_admin_create_provider_record(
             config_map.insert("risk_control_session_avoidance".to_string(), value);
         }
     }
+    validate_responses_websocket_config(&config_map)?;
     let config = (!config_map.is_empty()).then_some(serde_json::Value::Object(config_map));
 
     let now_unix_secs = SystemTime::now()

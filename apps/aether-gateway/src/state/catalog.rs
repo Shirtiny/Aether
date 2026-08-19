@@ -165,14 +165,22 @@ impl AppState {
         }
     }
 
-    async fn provider_is_codex_for_ws(&self, provider_id: &str) -> Result<bool, GatewayError> {
+    async fn provider_responses_ws_adapter(
+        &self,
+        provider_id: &str,
+    ) -> Result<Option<crate::orchestration::ResponsesWebSocketAdapter>, GatewayError> {
         Ok(self
             .data
             .list_provider_catalog_providers_by_ids(&[provider_id.to_string()])
             .await
             .map_err(|err| GatewayError::Internal(err.to_string()))?
             .first()
-            .is_some_and(|provider| provider.provider_type.trim().eq_ignore_ascii_case("codex")))
+            .and_then(|provider| {
+                crate::orchestration::responses_websocket_adapter(
+                    &provider.provider_type,
+                    provider.config.as_ref(),
+                )
+            }))
     }
 
     async fn key_is_codex_ws_relevant(
@@ -180,10 +188,18 @@ impl AppState {
         key: &provider_catalog::StoredProviderCatalogKey,
         explicit_ws_mutation: bool,
     ) -> Result<bool, GatewayError> {
-        if !codex_ws_key_shape_matches(key, explicit_ws_mutation) {
+        if !responses_ws_key_supports_responses(key) {
             return Ok(false);
         }
-        self.provider_is_codex_for_ws(&key.provider_id).await
+        Ok(
+            match self.provider_responses_ws_adapter(&key.provider_id).await? {
+                Some(crate::orchestration::ResponsesWebSocketAdapter::Standard) => true,
+                Some(crate::orchestration::ResponsesWebSocketAdapter::Codex) => {
+                    codex_ws_key_shape_matches(key, explicit_ws_mutation)
+                }
+                None => false,
+            },
+        )
     }
 
     async fn endpoint_is_codex_ws_relevant(
@@ -197,7 +213,10 @@ impl AppState {
         {
             return Ok(false);
         }
-        self.provider_is_codex_for_ws(&endpoint.provider_id).await
+        Ok(self
+            .provider_responses_ws_adapter(&endpoint.provider_id)
+            .await?
+            .is_some())
     }
 
     pub fn has_provider_catalog_data_reader(&self) -> bool {
@@ -741,7 +760,12 @@ impl AppState {
         shift_existing_priorities_from: Option<i32>,
         write_lock: &crate::codex_ws::hot_state::CodexWsCatalogWriteLock,
     ) -> Result<Option<provider_catalog::StoredProviderCatalogProvider>, GatewayError> {
-        let hot_mutation = if provider.provider_type.trim().eq_ignore_ascii_case("codex") {
+        let hot_mutation = if crate::orchestration::responses_websocket_adapter(
+            &provider.provider_type,
+            provider.config.as_ref(),
+        )
+        .is_some()
+        {
             let seed = crate::codex_ws::hot_state::CodexWsCatalogResourceSeed {
                 kind: crate::codex_ws::hot_state::CatalogResourceKind::Provider,
                 id: provider.id.clone(),
@@ -805,10 +829,17 @@ impl AppState {
             .map_err(|err| GatewayError::Internal(err.to_string()))?
             .into_iter()
             .next();
-        let relevant = preliminary_existing
-            .as_ref()
-            .is_some_and(|existing| existing.provider_type.trim().eq_ignore_ascii_case("codex"))
-            || provider.provider_type.trim().eq_ignore_ascii_case("codex");
+        let relevant = preliminary_existing.as_ref().is_some_and(|existing| {
+            crate::orchestration::responses_websocket_adapter(
+                &existing.provider_type,
+                existing.config.as_ref(),
+            )
+            .is_some()
+        }) || crate::orchestration::responses_websocket_adapter(
+            &provider.provider_type,
+            provider.config.as_ref(),
+        )
+        .is_some();
         let hot_mutation = if relevant {
             let legacy = crate::codex_ws::hot_state::begin_catalog_hot_mutation(self).await?;
             self.data.clear_provider_catalog_cache();
@@ -828,8 +859,16 @@ impl AppState {
                 }
             };
             let still_relevant = existing.as_ref().is_some_and(|existing| {
-                existing.provider_type.trim().eq_ignore_ascii_case("codex")
-            }) || provider.provider_type.trim().eq_ignore_ascii_case("codex");
+                crate::orchestration::responses_websocket_adapter(
+                    &existing.provider_type,
+                    existing.config.as_ref(),
+                )
+                .is_some()
+            }) || crate::orchestration::responses_websocket_adapter(
+                &provider.provider_type,
+                provider.config.as_ref(),
+            )
+            .is_some();
             if still_relevant {
                 let impact = existing
                     .as_ref()
@@ -905,9 +944,13 @@ impl AppState {
             .map_err(|err| GatewayError::Internal(err.to_string()))?
             .into_iter()
             .next();
-        let relevant = preliminary_existing
-            .as_ref()
-            .is_some_and(|provider| provider.provider_type.trim().eq_ignore_ascii_case("codex"));
+        let relevant = preliminary_existing.as_ref().is_some_and(|provider| {
+            crate::orchestration::responses_websocket_adapter(
+                &provider.provider_type,
+                provider.config.as_ref(),
+            )
+            .is_some()
+        });
         let hot_mutation = if relevant {
             let legacy = crate::codex_ws::hot_state::begin_catalog_hot_mutation(self).await?;
             self.data.clear_provider_catalog_cache();
@@ -926,10 +969,13 @@ impl AppState {
                         .await);
                 }
             };
-            match existing
-                .as_ref()
-                .filter(|provider| provider.provider_type.trim().eq_ignore_ascii_case("codex"))
-            {
+            match existing.as_ref().filter(|provider| {
+                crate::orchestration::responses_websocket_adapter(
+                    &provider.provider_type,
+                    provider.config.as_ref(),
+                )
+                .is_some()
+            }) {
                 Some(provider) => {
                     let (eligible, ineligible_reason) =
                         codex_ws_provider_resource_eligibility(provider);
@@ -1631,8 +1677,13 @@ impl AppState {
 fn codex_ws_provider_resource_eligibility(
     provider: &provider_catalog::StoredProviderCatalogProvider,
 ) -> (bool, &'static str) {
-    if !provider.provider_type.trim().eq_ignore_ascii_case("codex") {
-        return (false, "provider_type_changed");
+    if crate::orchestration::responses_websocket_adapter(
+        &provider.provider_type,
+        provider.config.as_ref(),
+    )
+    .is_none()
+    {
+        return (false, "provider_responses_websocket_disabled");
     }
     if !provider.is_active {
         return (false, "provider_inactive");
@@ -1655,18 +1706,6 @@ fn codex_ws_key_shape_matches(
     if !oauth_for_responses {
         return false;
     }
-    let supports_responses = key.api_formats.as_ref().is_none_or(|formats| {
-        formats.as_array().is_some_and(|formats| {
-            formats.iter().any(|format| {
-                format
-                    .as_str()
-                    .is_some_and(|format| format.trim().eq_ignore_ascii_case("openai:responses"))
-            })
-        })
-    });
-    if !supports_responses {
-        return false;
-    }
     explicit_ws_mutation
         || key
             .capabilities
@@ -1675,6 +1714,18 @@ fn codex_ws_key_shape_matches(
             .is_some_and(|capabilities| {
                 capabilities.contains_key(aether_provider_transport::CODEX_OFFICIAL_WS_CAPABILITY)
             })
+}
+
+fn responses_ws_key_supports_responses(key: &provider_catalog::StoredProviderCatalogKey) -> bool {
+    key.api_formats.as_ref().is_none_or(|formats| {
+        formats.as_array().is_some_and(|formats| {
+            formats.iter().any(|format| {
+                format
+                    .as_str()
+                    .is_some_and(|format| format.trim().eq_ignore_ascii_case("openai:responses"))
+            })
+        })
+    })
 }
 
 #[cfg(test)]
@@ -2166,6 +2217,7 @@ mod tests {
     async fn codex_scheduling_update_advances_only_the_provider_drain_generation() {
         let mut provider = sample_codex_provider();
         provider.config = Some(json!({
+            "responses_websocket": {"enabled": true},
             "pool_advanced": {
                 "scheduling_presets": [
                     {"preset": "lru", "enabled": true},
@@ -2208,6 +2260,7 @@ mod tests {
 
         let mut updated = provider.clone();
         updated.config = Some(json!({
+            "responses_websocket": {"enabled": true},
             "pool_advanced": {
                 "scheduling_presets": [
                     {"preset": "lru", "enabled": false},
@@ -2235,6 +2288,76 @@ mod tests {
             initial.provider.drain_generation
         );
         assert_eq!(actual.endpoint, initial.endpoint);
+    }
+
+    #[tokio::test]
+    async fn disabling_responses_websocket_hard_fences_the_bound_provider() {
+        let mut provider = sample_codex_provider();
+        provider.config = Some(json!({
+            "responses_websocket": {"enabled": true}
+        }));
+        let endpoint = sample_codex_endpoint();
+        let key = sample_codex_ws_key();
+        let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![provider.clone()],
+            vec![endpoint.clone()],
+            vec![key.clone()],
+        ));
+        let state = AppState::new()
+            .expect("app state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(repository)
+                    .with_encryption_key_for_tests("test-encryption-key"),
+            );
+        let seeds = [
+            crate::codex_ws::hot_state::CodexWsCatalogResourceSeed {
+                kind: crate::codex_ws::hot_state::CatalogResourceKind::Provider,
+                id: provider.id.clone(),
+                eligible: true,
+                ineligible_reason: "provider_ineligible",
+            },
+            crate::codex_ws::hot_state::CodexWsCatalogResourceSeed {
+                kind: crate::codex_ws::hot_state::CatalogResourceKind::Endpoint,
+                id: endpoint.id.clone(),
+                eligible: true,
+                ineligible_reason: "endpoint_ineligible",
+            },
+        ];
+        let binding =
+            crate::codex_ws::hot_state::ensure_catalog_resource_hot_leases(&state, &seeds)
+                .await
+                .expect("initialize resource hot states")
+                .binding(&provider.id, &endpoint.id)
+                .expect("initial resource binding");
+        let key_lease =
+            crate::codex_ws::hot_state::ensure_key_hot_leases(&state, std::slice::from_ref(&key))
+                .await
+                .expect("initialize key hot state")
+                .remove(&key.id)
+                .expect("initial key lease");
+
+        provider.config = Some(json!({
+            "responses_websocket": {"enabled": false}
+        }));
+        state
+            .update_provider_catalog_provider(&provider)
+            .await
+            .expect("provider update should succeed")
+            .expect("provider should update");
+
+        assert_eq!(
+            crate::codex_ws::hot_state::validate_hot_leases(
+                &state,
+                &provider.id,
+                &endpoint.id,
+                &key.id,
+                None,
+                &key_lease.generation,
+                &binding,
+            )
+            .await,
+            Err("bound_provider_changed")
+        );
     }
 
     #[tokio::test]

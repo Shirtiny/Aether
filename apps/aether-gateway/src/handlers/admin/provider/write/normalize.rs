@@ -1,5 +1,41 @@
 use std::collections::BTreeSet;
 
+const RESPONSES_WEBSOCKET_CONFIG_KEY: &str = "responses_websocket";
+
+pub(crate) fn set_responses_websocket_enabled(
+    config: &mut serde_json::Map<String, serde_json::Value>,
+    enabled: bool,
+) -> Result<(), String> {
+    let mut responses = match config.remove(RESPONSES_WEBSOCKET_CONFIG_KEY) {
+        None => serde_json::Map::new(),
+        Some(serde_json::Value::Object(config)) => config,
+        Some(_) => return Err("config.responses_websocket 必须是 JSON 对象".to_string()),
+    };
+    responses.insert("enabled".to_string(), serde_json::Value::Bool(enabled));
+    config.insert(
+        RESPONSES_WEBSOCKET_CONFIG_KEY.to_string(),
+        serde_json::Value::Object(responses),
+    );
+    Ok(())
+}
+
+pub(crate) fn validate_responses_websocket_config(
+    config: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    if let Some(value) = config.get(RESPONSES_WEBSOCKET_CONFIG_KEY) {
+        let responses = value
+            .as_object()
+            .ok_or_else(|| "config.responses_websocket 必须是 JSON 对象".to_string())?;
+        let enabled = responses
+            .get("enabled")
+            .ok_or_else(|| "config.responses_websocket.enabled 为必填布尔值".to_string())?;
+        if !enabled.is_boolean() {
+            return Err("config.responses_websocket.enabled 必须是布尔值".to_string());
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn normalize_provider_type_input(value: &str) -> Result<String, String> {
     let normalized = value.trim().to_ascii_lowercase();
     match normalized.as_str() {
@@ -287,6 +323,7 @@ mod tests {
         normalize_api_format_list, normalize_auth_type, normalize_auth_type_by_format,
         normalize_chat_pii_redaction_config, normalize_pool_advanced_config,
         normalize_provider_type_input, normalize_risk_control_session_avoidance_config,
+        set_responses_websocket_enabled, validate_responses_websocket_config,
         validate_vertex_api_formats,
     };
     use serde_json::json;
@@ -328,6 +365,29 @@ mod tests {
         assert_eq!(
             normalize_chat_pii_redaction_config(Some(json!({ "enabled": "yes" }))).unwrap_err(),
             "chat_pii_redaction.enabled 必须是布尔值"
+        );
+    }
+
+    #[test]
+    fn responses_websocket_setting_preserves_extensions_and_validates_enabled() {
+        let mut config = json!({
+            "responses_websocket": {"future_option": "keep"}
+        })
+        .as_object()
+        .expect("fixture should be an object")
+        .clone();
+        set_responses_websocket_enabled(&mut config, true)
+            .expect("setting should accept an object");
+        assert_eq!(
+            config["responses_websocket"],
+            json!({"enabled": true, "future_option": "keep"})
+        );
+        validate_responses_websocket_config(&config).expect("setting should validate");
+
+        config.insert("responses_websocket".to_string(), json!({"enabled": "yes"}));
+        assert_eq!(
+            validate_responses_websocket_config(&config).unwrap_err(),
+            "config.responses_websocket.enabled 必须是布尔值"
         );
     }
 

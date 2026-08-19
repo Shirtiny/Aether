@@ -46,8 +46,9 @@ pub(crate) use self::health::{
 };
 pub(crate) use self::policy::{
     append_local_failover_policy_to_value, local_failover_policy_from_report_context,
-    local_failover_policy_from_transport, resolve_local_failover_policy, LocalFailoverPolicy,
-    LocalFailoverRegexRule,
+    local_failover_policy_from_transport, resolve_local_failover_policy,
+    responses_websocket_adapter, responses_websocket_enabled, LocalFailoverPolicy,
+    LocalFailoverRegexRule, ResponsesWebSocketAdapter,
 };
 pub(crate) use self::recovery::{
     analyze_local_failover, recover_local_failover_decision, LocalFailoverAnalysis,

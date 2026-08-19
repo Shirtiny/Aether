@@ -96,7 +96,7 @@ pub(crate) struct LocalOpenAiResponsesCandidatePayloadParts {
     pub(super) request_redacted: bool,
 }
 
-/// The account-scoped request data needed to open an official Codex WebSocket.
+/// The account-scoped request data needed to open a Responses WebSocket.
 ///
 /// This intentionally borrows the response.create body while evaluating header
 /// rules and never stores or rebuilds it. Body rules, model directives and the
@@ -126,13 +126,13 @@ pub(crate) async fn resolve_local_openai_responses_codex_ws_candidate_parts(
     let candidate = &eligible.candidate;
     let transport = &eligible.transport;
     let provider_api_format = eligible.provider_api_format.as_str();
+    let adapter = crate::orchestration::responses_websocket_adapter(
+        transport.provider.provider_type.as_str(),
+        transport.provider.config.as_ref(),
+    );
     if !crate::ai_serving::normalize_api_format_alias(provider_api_format)
         .eq_ignore_ascii_case("openai:responses")
-        || !transport
-            .provider
-            .provider_type
-            .trim()
-            .eq_ignore_ascii_case("codex")
+        || adapter.is_none()
     {
         mark_skipped_local_openai_responses_candidate(
             state,
@@ -141,7 +141,7 @@ pub(crate) async fn resolve_local_openai_responses_codex_ws_candidate_parts(
             candidate,
             candidate_index,
             candidate_id,
-            "codex_ws_transport_unsupported",
+            "responses_websocket_transport_unsupported",
         )
         .await;
         return Ok(None);
@@ -284,22 +284,24 @@ pub(crate) async fn resolve_local_openai_responses_codex_ws_candidate_parts(
         return Ok(None);
     };
     let mut provider_request_headers = resolved_headers.headers;
-    apply_codex_official_ws_handshake_headers(
-        &mut provider_request_headers,
-        effective_headers,
-        transport.provider.provider_type.as_str(),
-        provider_api_format,
-        transport.key.decrypted_auth_config.as_deref(),
-    );
-    // The concrete profile's header half is independent of the body. The body
-    // half is applied after the winning account is selected.
-    let mut ignored_body = Value::Null;
-    apply_codex_pool_concrete_account_profile_for_api_format(
-        &mut provider_request_headers,
-        &mut ignored_body,
-        transport,
-        provider_api_format,
-    );
+    if adapter == Some(crate::orchestration::ResponsesWebSocketAdapter::Codex) {
+        apply_codex_official_ws_handshake_headers(
+            &mut provider_request_headers,
+            effective_headers,
+            transport.provider.provider_type.as_str(),
+            provider_api_format,
+            transport.key.decrypted_auth_config.as_deref(),
+        );
+        // The concrete profile's header half is independent of the body. The
+        // body half is applied after the winning account is selected.
+        let mut ignored_body = Value::Null;
+        apply_codex_pool_concrete_account_profile_for_api_format(
+            &mut provider_request_headers,
+            &mut ignored_body,
+            transport,
+            provider_api_format,
+        );
+    }
 
     Ok(Some(LocalOpenAiResponsesCodexWsCandidateParts {
         mapped_model: prepared.mapped_model,

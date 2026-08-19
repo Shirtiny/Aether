@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 
+use bytes::Bytes;
 use http::HeaderMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -76,7 +77,7 @@ pub(crate) struct ResponseCreateStep {
     pub(crate) model: String,
     pub(crate) previous_response_id: Option<String>,
     pub(crate) logical_turn_id: Option<String>,
-    pub(crate) official_identity: OfficialRequestIdentity,
+    pub(crate) official_identity: Option<OfficialRequestIdentity>,
     pub(crate) fence: StepFence,
 }
 
@@ -136,7 +137,7 @@ pub(crate) fn parse_response_create(
                 && model.trim().len() <= MAX_MODEL_ID_BYTES
                 && model.trim().is_ascii() =>
         {
-            Some(model.trim())
+            Some(model.trim().to_string())
         }
         Some(Value::String(_)) => {
             return Err(ProtocolError::Policy("response.create model is invalid"));
@@ -147,53 +148,50 @@ pub(crate) fn parse_response_create(
             ));
         }
     };
-    let (model, expected_previous_response_id, bound_turn_state) = match context {
-        ResponseCreateContext::First => (
-            explicit_model
-                .ok_or(ProtocolError::Policy("response.create model is required"))?
-                .to_string(),
-            None,
-            None,
-        ),
+    let previous_response_id = optional_non_empty_string(object.get("previous_response_id"))?;
+    let (model, bound_turn_state) = match context {
+        ResponseCreateContext::First => {
+            if previous_response_id.is_some() {
+                return Err(ProtocolError::Policy(
+                    "the first response.create must be protocol self-contained",
+                ));
+            }
+            (
+                explicit_model.ok_or(ProtocolError::Policy("response.create model is required"))?,
+                None,
+            )
+        }
         ResponseCreateContext::Bound {
             model,
             expected_previous_response_id,
             turn_state,
         } => {
-            if explicit_model.is_some_and(|explicit| explicit != model) {
-                return Err(ProtocolError::Policy(
-                    "response.create model does not match the bound connection",
-                ));
+            if let Some(previous_response_id) = previous_response_id.as_deref() {
+                let Some(expected) = expected_previous_response_id else {
+                    return Err(ProtocolError::Policy(
+                        "previous_response_id does not belong to this connection epoch",
+                    ));
+                };
+                if previous_response_id != expected {
+                    return Err(ProtocolError::Policy(
+                        "previous_response_id does not belong to this connection epoch",
+                    ));
+                }
+                if explicit_model
+                    .as_deref()
+                    .is_some_and(|explicit| explicit != model)
+                {
+                    return Err(ProtocolError::Policy(
+                        "response.create model does not match the bound connection",
+                    ));
+                }
+                (model.to_string(), turn_state)
+            } else {
+                (explicit_model.unwrap_or_else(|| model.to_string()), None)
             }
-            (model.to_string(), expected_previous_response_id, turn_state)
         }
     };
     object.insert("model".to_string(), Value::String(model.clone()));
-    if object
-        .get("background")
-        .is_some_and(|value| !value.is_null())
-    {
-        return Err(ProtocolError::Policy(
-            "background responses are unsupported on Codex WebSocket",
-        ));
-    }
-    object.insert("store".to_string(), Value::Bool(false));
-
-    let previous_response_id = optional_non_empty_string(object.get("previous_response_id"))?;
-    if let Some(expected) = expected_previous_response_id {
-        if previous_response_id
-            .as_deref()
-            .is_some_and(|actual| actual != expected)
-        {
-            return Err(ProtocolError::Policy(
-                "previous_response_id does not belong to this connection epoch",
-            ));
-        }
-    } else if previous_response_id.is_some() {
-        return Err(ProtocolError::Policy(
-            "the first response.create must be protocol self-contained",
-        ));
-    }
 
     let metadata = normalize_client_metadata(object)?;
     let fence = take_step_fence(metadata)?;
@@ -224,12 +222,21 @@ pub(crate) fn parse_response_create(
 
 fn official_request_identity(
     metadata: &Map<String, Value>,
-) -> Result<OfficialRequestIdentity, ProtocolError> {
-    Ok(OfficialRequestIdentity {
-        session_id: bounded_metadata_string(metadata, "session_id", true, MAX_CONTROL_ID_BYTES)?
-            .unwrap(),
-        thread_id: bounded_metadata_string(metadata, "thread_id", true, MAX_CONTROL_ID_BYTES)?
-            .unwrap(),
+) -> Result<Option<OfficialRequestIdentity>, ProtocolError> {
+    let session_id = bounded_metadata_string(metadata, "session_id", false, MAX_CONTROL_ID_BYTES)?;
+    let thread_id = bounded_metadata_string(metadata, "thread_id", false, MAX_CONTROL_ID_BYTES)?;
+    let (session_id, thread_id) = match (session_id, thread_id) {
+        (None, None) => return Ok(None),
+        (Some(session_id), Some(thread_id)) => (session_id, thread_id),
+        _ => {
+            return Err(ProtocolError::Policy(
+                "Codex session_id and thread_id must be provided together",
+            ))
+        }
+    };
+    Ok(Some(OfficialRequestIdentity {
+        session_id,
+        thread_id,
         window_id: bounded_metadata_string(
             metadata,
             "x-codex-window-id",
@@ -258,7 +265,7 @@ fn official_request_identity(
             metadata,
             "ws_request_header_x_openai_internal_codex_responses_lite",
         )?,
-    })
+    }))
 }
 
 fn metadata_flag(
@@ -402,6 +409,7 @@ pub(crate) enum TerminalKind {
     Completed,
     Failed,
     Incomplete,
+    Cancelled,
     Error,
 }
 
@@ -416,6 +424,15 @@ pub(crate) struct ServerEventClassification {
     pub(crate) turn_state: Option<String>,
     pub(crate) provider_headers: std::collections::BTreeMap<String, String>,
     pub(crate) terminal_event: Option<TerminalEventSummary>,
+    pub(crate) codex_relay: CodexRelayDirective,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) enum CodexRelayDirective {
+    #[default]
+    ForwardOriginal,
+    ForwardEvents(Vec<Bytes>),
+    SuppressProviderPrivate,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -444,6 +461,8 @@ struct BorrowedServerEvent<'a> {
     status_code: Option<u16>,
     #[serde(borrow)]
     error: Option<BorrowedServerError<'a>>,
+    #[serde(borrow)]
+    incomplete_details: Option<BorrowedIncompleteDetails<'a>>,
     rate_limits: Option<BorrowedRateLimitDetails>,
     #[serde(borrow)]
     credits: Option<BorrowedRateLimitCredits<'a>>,
@@ -774,8 +793,10 @@ impl<'a> JsonScanner<'a> {
                     | b"response.completed"
                     | b"response.failed"
                     | b"response.incomplete"
+                    | b"response.cancelled"
                     | b"error"
                     | b"codex.rate_limits"
+                    | b"codex.response.metadata"
             )
         {
             return Ok(Some(ServerEventClassification {
@@ -1190,6 +1211,29 @@ pub(crate) fn classify_server_event(
     text: impl AsRef<[u8]>,
 ) -> Result<ServerEventClassification, ProtocolError> {
     let bytes = text.as_ref();
+    // Codex may batch standard Responses events in a private `chunks`
+    // envelope. Observe every event in document order while the caller keeps
+    // the original frame bytes for opaque relay.
+    if bytes
+        .windows(b"\"chunks\"".len())
+        .any(|window| window == b"\"chunks\"")
+    {
+        let value: Value = serde_json::from_slice(bytes)
+            .map_err(|_| ProtocolError::Upstream("official server emitted invalid JSON"))?;
+        if value.get("chunks").and_then(Value::as_array).is_some() {
+            return classify_chunked_server_frame(&value);
+        }
+    }
+    classify_direct_server_event(bytes)
+}
+
+pub(crate) fn classify_standard_server_event(
+    text: impl AsRef<[u8]>,
+) -> Result<ServerEventClassification, ProtocolError> {
+    classify_direct_server_event(text.as_ref())
+}
+
+fn classify_direct_server_event(bytes: &[u8]) -> Result<ServerEventClassification, ProtocolError> {
     if let Some(classification) = JsonScanner::new(bytes)?.scan_fast_server_event()? {
         return Ok(classification);
     }
@@ -1209,6 +1253,7 @@ pub(crate) fn classify_server_event(
         "response.completed" => Some(TerminalKind::Completed),
         "response.failed" => Some(TerminalKind::Failed),
         "response.incomplete" => Some(TerminalKind::Incomplete),
+        "response.cancelled" => Some(TerminalKind::Cancelled),
         "error" => Some(TerminalKind::Error),
         _ => None,
     };
@@ -1294,6 +1339,7 @@ pub(crate) fn classify_server_event(
             .response
             .as_ref()
             .and_then(|response| response.incomplete_details.as_ref())
+            .or(value.incomplete_details.as_ref())
             .and_then(|details| details.reason.as_deref())
             .and_then(|reason| bounded_ascii_string(reason, MAX_PROVIDER_ERROR_CODE_BYTES));
         let provider_status_code = explicit_status_code
@@ -1330,8 +1376,9 @@ pub(crate) fn classify_server_event(
             provider_headers: provider_headers.clone(),
         }
     });
+    let codex_private = is_codex_private_event_type(kind);
     Ok(ServerEventClassification {
-        recognized_business: is_recognized_business_kind(kind.as_bytes()),
+        recognized_business: is_recognized_business_kind(kind.as_bytes()) && !codex_private,
         created: kind == "response.created",
         terminal,
         provenance_response_id: event_response_id.clone(),
@@ -1340,7 +1387,125 @@ pub(crate) fn classify_server_event(
         turn_state,
         provider_headers,
         terminal_event,
+        codex_relay: if codex_private {
+            CodexRelayDirective::SuppressProviderPrivate
+        } else {
+            CodexRelayDirective::ForwardOriginal
+        },
     })
+}
+
+fn classify_chunked_server_frame(
+    frame: &Value,
+) -> Result<ServerEventClassification, ProtocolError> {
+    let mut merged = ServerEventClassification::default();
+    let mut events = Vec::new();
+    if frame.get("type").and_then(Value::as_str).is_some() {
+        events.push(frame);
+    }
+    if let Some(chunks) = frame.get("chunks").and_then(Value::as_array) {
+        events.extend(
+            chunks
+                .iter()
+                .filter(|event| event.get("type").and_then(Value::as_str).is_some()),
+        );
+    }
+    for event in events {
+        let encoded = serde_json::to_vec(event)
+            .map_err(|_| ProtocolError::Upstream("official server emitted invalid event schema"))?;
+        merge_server_event_classification(&mut merged, classify_direct_server_event(&encoded)?)?;
+    }
+    if is_explicit_codex_batch_envelope(frame) {
+        let public_events = frame
+            .get("chunks")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|event| {
+                !event
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(is_codex_private_event_type)
+            })
+            .map(|event| {
+                serde_json::to_vec(event).map(Bytes::from).map_err(|_| {
+                    ProtocolError::Upstream("official server emitted invalid event schema")
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        merged.codex_relay = if public_events.is_empty() {
+            CodexRelayDirective::SuppressProviderPrivate
+        } else {
+            CodexRelayDirective::ForwardEvents(public_events)
+        };
+    } else {
+        merged.codex_relay = CodexRelayDirective::ForwardOriginal;
+    }
+    Ok(merged)
+}
+
+fn is_explicit_codex_batch_envelope(frame: &Value) -> bool {
+    if frame
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(is_codex_private_event_type)
+    {
+        return true;
+    }
+    frame.as_object().is_some_and(|object| {
+        object.len() == 1
+            && object.contains_key("chunks")
+            && frame.get("type").and_then(Value::as_str).is_none()
+    })
+}
+
+fn is_codex_private_event_type(kind: &str) -> bool {
+    matches!(kind, "codex.rate_limits" | "codex.response.metadata")
+}
+
+fn merge_server_event_classification(
+    merged: &mut ServerEventClassification,
+    next: ServerEventClassification,
+) -> Result<(), ProtocolError> {
+    merged.recognized_business |= next.recognized_business;
+    merged.created |= next.created;
+    merge_consistent_value(
+        &mut merged.provenance_response_id,
+        next.provenance_response_id,
+        "official server emitted conflicting response ids",
+    )?;
+    merge_consistent_value(
+        &mut merged.created_response_id,
+        next.created_response_id,
+        "official server emitted conflicting response ids",
+    )?;
+    merge_consistent_value(
+        &mut merged.turn_state,
+        next.turn_state,
+        "official server emitted conflicting turn states",
+    )?;
+    merged.provider_headers.extend(next.provider_headers);
+    if merged.terminal.is_none() {
+        merged.terminal = next.terminal;
+        merged.terminal_response_id = next.terminal_response_id;
+        merged.terminal_event = next.terminal_event;
+    }
+    Ok(())
+}
+
+fn merge_consistent_value(
+    current: &mut Option<String>,
+    next: Option<String>,
+    conflict: &'static str,
+) -> Result<(), ProtocolError> {
+    let Some(next) = next else {
+        return Ok(());
+    };
+    if current.as_ref().is_some_and(|current| current != &next) {
+        return Err(ProtocolError::Upstream(conflict));
+    }
+    *current = Some(next);
+    Ok(())
 }
 
 fn append_rate_limit_event_headers(
@@ -1450,10 +1615,22 @@ fn inferred_provider_status_code(
         | "server_overloaded_error"
         | "server_is_overloaded"
         | "slow_down" => 503,
-        _ if terminal == TerminalKind::Incomplete => match incomplete_reason.unwrap_or_default() {
-            "max_output_tokens" | "content_filter" => 400,
-            _ => 502,
-        },
+        _ if terminal == TerminalKind::Cancelled => 499,
+        _ if terminal == TerminalKind::Incomplete && error_code.is_some() => 502,
+        _ if terminal == TerminalKind::Incomplete => {
+            match incomplete_reason
+                .map(str::trim)
+                .filter(|reason| !reason.is_empty())
+            {
+                Some(reason)
+                    if !reason.eq_ignore_ascii_case("error")
+                        && !reason.eq_ignore_ascii_case("server_error") =>
+                {
+                    200
+                }
+                _ => 502,
+            }
+        }
         _ => 502,
     };
     Some(status)
@@ -1479,34 +1656,11 @@ fn compact_provider_error_body(
 }
 
 fn is_recognized_business_kind(kind: &[u8]) -> bool {
-    matches!(
-        kind,
-        b"response.created"
-            | b"response.in_progress"
-            | b"response.completed"
-            | b"response.failed"
-            | b"response.incomplete"
-            | b"error"
-            | b"response.output_item.added"
-            | b"response.output_item.done"
-            | b"response.content_part.added"
-            | b"response.content_part.done"
-            | b"response.output_text.delta"
-            | b"response.output_text.done"
-            | b"response.custom_tool_call_input.delta"
-            | b"response.custom_tool_call_input.done"
-            | b"response.function_call_arguments.delta"
-            | b"response.function_call_arguments.done"
-            | b"response.reasoning_summary_part.added"
-            | b"response.reasoning_summary_part.done"
-            | b"response.reasoning_summary_text.delta"
-            | b"response.reasoning_summary_text.done"
-            | b"response.reasoning_text.delta"
-            | b"response.metadata"
-            | b"response.new_tool_event"
-            | b"codex.response.metadata"
-            | b"codex.rate_limits"
-    )
+    kind.starts_with(b"response.")
+        || matches!(
+            kind,
+            b"error" | b"codex.response.metadata" | b"codex.rate_limits"
+        )
 }
 
 impl CompactOpenAiUsage {
@@ -1774,9 +1928,13 @@ mod tests {
                 .expect("request should parse");
         assert_eq!(parsed.model, "gpt-5");
         assert_eq!(parsed.fence.correlation_id, "step-1");
-        assert_eq!(parsed.official_identity.session_id, "session-1");
-        assert_eq!(parsed.official_identity.thread_id, "thread-1");
-        assert_eq!(parsed.value["store"], false);
+        let identity = parsed
+            .official_identity
+            .as_ref()
+            .expect("official identity should parse");
+        assert_eq!(identity.session_id, "session-1");
+        assert_eq!(identity.thread_id, "thread-1");
+        assert!(parsed.value.get("store").is_none());
         assert_eq!(parsed.value["client_metadata"]["keep"], "yes");
         assert!(parsed.value["client_metadata"]
             .get("aether.sub2api_step_control")
@@ -1810,7 +1968,7 @@ mod tests {
     }
 
     #[test]
-    fn only_bound_follow_up_steps_may_inherit_the_connection_model() {
+    fn bound_steps_inherit_the_model_but_independent_turns_may_change_it() {
         let mut request: Value = serde_json::from_str(&fenced_request(json!(true))).unwrap();
         request.as_object_mut().unwrap().remove("model");
         let text = request.to_string();
@@ -1829,11 +1987,23 @@ mod tests {
         assert_eq!(inherited.value["model"], "gpt-5");
 
         request["model"] = json!("gpt-other");
-        assert!(parse_response_create(
+        let independent = parse_response_create(
             &request.to_string(),
             ResponseCreateContext::Bound {
                 model: "gpt-5",
                 expected_previous_response_id: None,
+                turn_state: None,
+            },
+        )
+        .expect("independent turn should be allowed to change model");
+        assert_eq!(independent.model, "gpt-other");
+
+        request["previous_response_id"] = json!("resp-1");
+        assert!(parse_response_create(
+            &request.to_string(),
+            ResponseCreateContext::Bound {
+                model: "gpt-5",
+                expected_previous_response_id: Some("resp-1"),
                 turn_state: None,
             },
         )
@@ -1919,6 +2089,46 @@ mod tests {
     }
 
     #[test]
+    fn codex_continuation_binding_ignores_turn_scoped_identity_fields() {
+        let identity = OfficialRequestIdentity {
+            session_id: "session-1".into(),
+            thread_id: "thread-1".into(),
+            window_id: Some("window-1".into()),
+            turn_metadata: Some(r#"{"turn":"one"}"#.into()),
+            parent_thread_id: Some("parent-1".into()),
+            subagent: Some("review".into()),
+            responses_lite: false,
+        };
+        assert!(identity.matches_connection_binding(&identity));
+
+        let mut changed = identity.clone();
+        changed.turn_metadata = Some(r#"{"turn":"two"}"#.into());
+        assert!(identity.matches_connection_binding(&changed));
+        changed = identity.clone();
+        changed.parent_thread_id = Some("parent-2".into());
+        assert!(identity.matches_connection_binding(&changed));
+        changed = identity.clone();
+        changed.subagent = Some("compact".into());
+        assert!(identity.matches_connection_binding(&changed));
+        changed = identity.clone();
+        changed.window_id = Some("window-2".into());
+        assert!(!identity.matches_connection_binding(&changed));
+    }
+
+    #[test]
+    fn standard_classifier_does_not_interpret_codex_chunk_envelopes() {
+        let event = classify_standard_server_event(
+            r#"{"chunks":[{"type":"response.completed","response":{"id":"resp-1"}}]}"#,
+        )
+        .expect("a standard provider extension should remain opaque");
+
+        assert!(!event.recognized_business);
+        assert_eq!(event.terminal, None);
+        assert_eq!(event.terminal_response_id, None);
+        assert_eq!(event.codex_relay, CodexRelayDirective::ForwardOriginal);
+    }
+
+    #[test]
     fn delta_frames_use_zero_allocating_fast_scan_without_retaining_payload_trees() {
         reset_server_event_json_parse_count();
         for index in 0..1_000 {
@@ -1973,16 +2183,16 @@ mod tests {
     }
 
     #[test]
-    fn only_known_response_events_count_as_business_activity() {
+    fn current_and_future_response_events_count_as_business_activity() {
         reset_server_event_json_parse_count();
         let unknown = classify_server_event(
             r#"{"type":"response.future_protocol_event","sequence_number":7}"#,
         )
         .expect("future response event should classify");
 
-        assert!(!unknown.recognized_business);
+        assert!(unknown.recognized_business);
         assert_eq!(unknown.terminal, None);
-        assert_eq!(server_event_json_parse_count(), 1);
+        assert_eq!(server_event_json_parse_count(), 0);
 
         for kind in [
             "response.in_progress",
@@ -1992,7 +2202,6 @@ mod tests {
             "response.custom_tool_call_input.done",
             "response.function_call_arguments.done",
             "response.reasoning_summary_part.done",
-            "codex.response.metadata",
         ] {
             let frame = format!(r#"{{"type":"{kind}"}}"#);
             let known = classify_server_event(frame).expect("known response event should classify");
@@ -2006,6 +2215,14 @@ mod tests {
             classify_server_event(r#"{"type":"responsesapi.websocket_timing","response_ms":12}"#)
                 .expect("transport metadata should classify");
         assert!(!transport_metadata.recognized_business);
+
+        let private = classify_server_event(r#"{"type":"codex.response.metadata"}"#)
+            .expect("private metadata should classify");
+        assert!(!private.recognized_business);
+        assert_eq!(
+            private.codex_relay,
+            CodexRelayDirective::SuppressProviderPrivate
+        );
     }
 
     #[test]
@@ -2014,7 +2231,11 @@ mod tests {
             r#"{"type":"codex.rate_limits","rate_limits":{"primary":{"used_percent":75.5,"window_minutes":300,"reset_at":1700000000},"secondary":{"used_percent":25.0,"window_minutes":10080,"reset_at":1700600000}},"credits":{"has_credits":true,"unlimited":false,"balance":"12.50"}}"#,
         )
         .expect("rate-limit event should classify");
-        assert!(classified.recognized_business);
+        assert!(!classified.recognized_business);
+        assert_eq!(
+            classified.codex_relay,
+            CodexRelayDirective::SuppressProviderPrivate
+        );
         assert_eq!(
             classified
                 .provider_headers
@@ -2130,7 +2351,7 @@ mod tests {
         .expect("response.incomplete should classify")
         .terminal_event
         .expect("response.incomplete should have a summary");
-        assert_eq!(incomplete.provider_status_code, Some(400));
+        assert_eq!(incomplete.provider_status_code, Some(200));
 
         let string_status_with_code = classify_server_event(
             r#"{"type":"error","status":"failed","status_code":503,"error":{"type":"server_error","message":"retry later"}}"#,
@@ -2176,6 +2397,98 @@ mod tests {
         assert_eq!(terminal.provenance_response_id.as_deref(), Some("resp-1"));
         assert_eq!(terminal.terminal_response_id.as_deref(), Some("resp-1"));
         assert_eq!(terminal.terminal, Some(TerminalKind::Completed));
+    }
+
+    #[test]
+    fn chunked_events_preserve_lifecycle_usage_and_terminal_order() {
+        let classification = classify_server_event(
+            r#"{"chunks":[{"type":"response.created","response":{"id":"resp-batch"}},{"type":"response.output_text.delta","response_id":"resp-batch","delta":"hi","future_field":{"kept":true}},{"type":"response.completed","response":{"id":"resp-batch","model":"gpt-test","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}]}"#,
+        )
+        .expect("batch should classify");
+
+        assert!(classification.recognized_business);
+        assert!(classification.created);
+        assert_eq!(classification.terminal, Some(TerminalKind::Completed));
+        assert_eq!(
+            classification.terminal_response_id.as_deref(),
+            Some("resp-batch")
+        );
+        let CodexRelayDirective::ForwardEvents(relay_events) = classification.codex_relay.clone()
+        else {
+            panic!("explicit Codex batch should expose public events");
+        };
+        assert_eq!(relay_events.len(), 3);
+        assert!(relay_events[1]
+            .windows(b"future_field".len())
+            .any(|window| window == b"future_field"));
+        let usage = classification
+            .terminal_event
+            .and_then(|event| event.standardized_usage)
+            .expect("terminal usage should survive batching");
+        assert_eq!(usage.input_tokens, 3);
+        assert_eq!(usage.output_tokens, 2);
+    }
+
+    #[test]
+    fn codex_batch_filters_only_explicit_private_events() {
+        let classification = classify_server_event(
+            r#"{"type":"codex.response.metadata","chunks":[{"type":"codex.rate_limits","rate_limits":{}},{"type":"response.future.delta","future":{"kept":true}},{"provider_future_event":{"unknown":"must survive"}}]}"#,
+        )
+        .expect("Codex batch should classify");
+
+        let CodexRelayDirective::ForwardEvents(events) = classification.codex_relay else {
+            panic!("public event should be retained");
+        };
+        assert_eq!(events.len(), 2);
+        assert!(events[0]
+            .windows(b"response.future.delta".len())
+            .any(|window| window == b"response.future.delta"));
+        assert!(events[1]
+            .windows(b"provider_future_event".len())
+            .any(|window| window == b"provider_future_event"));
+    }
+
+    #[test]
+    fn direct_future_response_event_keeps_opaque_chunks() {
+        let classification = classify_server_event(
+            r#"{"type":"response.future.delta","chunks":[{"future_payload":true}]}"#,
+        )
+        .expect("future event with opaque chunks should classify");
+
+        assert!(classification.recognized_business);
+        assert_eq!(
+            classification.codex_relay,
+            CodexRelayDirective::ForwardOriginal
+        );
+    }
+
+    #[test]
+    fn cancelled_and_future_incomplete_reasons_are_terminal_without_synthetic_502() {
+        let cancelled = classify_server_event(
+            r#"{"type":"response.cancelled","response":{"id":"resp-cancelled"}}"#,
+        )
+        .expect("cancelled should classify");
+        assert_eq!(cancelled.terminal, Some(TerminalKind::Cancelled));
+        assert_eq!(
+            cancelled
+                .terminal_event
+                .as_ref()
+                .and_then(|event| event.provider_status_code),
+            Some(499)
+        );
+
+        let incomplete = classify_server_event(
+            r#"{"type":"response.incomplete","response":{"id":"resp-future","incomplete_details":{"reason":"future_context_boundary"}}}"#,
+        )
+        .expect("future incomplete reason should classify");
+        assert_eq!(incomplete.terminal, Some(TerminalKind::Incomplete));
+        assert_eq!(
+            incomplete
+                .terminal_event
+                .as_ref()
+                .and_then(|event| event.provider_status_code),
+            Some(200)
+        );
     }
 
     #[test]

@@ -35,12 +35,10 @@ pub fn should_skip_upstream_passthrough_header(name: &str) -> bool {
     if lower.starts_with("x-stainless-") || lower.starts_with("anthropic-") {
         return true;
     }
-    matches!(
-        lower.as_str(),
-        "authorization"
-            | "x-api-key"
-            | "x-goog-api-key"
-            | "host"
+    is_client_credential_header(&lower)
+        || matches!(
+            lower.as_str(),
+            "host"
             | "content-length"
             | "transfer-encoding"
             | "connection"
@@ -56,30 +54,43 @@ pub fn should_skip_upstream_passthrough_header(name: &str) -> bool {
             // Claude CLI client identifier; re-injected by the Claude Code adapter
             // when the upstream is Anthropic, filtered for everybody else.
             | "x-app"
-    ) || should_skip_request_header(name)
+        )
+        || should_skip_request_header(name)
 }
 
 pub(crate) fn should_skip_upstream_complete_passthrough_header(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
+    is_client_credential_header(&lower)
+        || matches!(
+            lower.as_str(),
+            "host"
+                | "content-length"
+                | "transfer-encoding"
+                | "connection"
+                | "accept-encoding"
+                | "content-encoding"
+                | "x-real-ip"
+                | "x-real-proto"
+                | "x-forwarded-for"
+                | "x-forwarded-proto"
+                | "x-forwarded-scheme"
+                | "x-forwarded-host"
+                | "x-forwarded-port"
+        )
+        || should_skip_request_header(name)
+}
+
+fn is_client_credential_header(name: &str) -> bool {
     matches!(
-        lower.as_str(),
-        "authorization"
+        name,
+        "api-key"
+            | "authorization"
+            | "cookie"
+            | "proxy-authorization"
+            | "set-cookie"
             | "x-api-key"
             | "x-goog-api-key"
-            | "host"
-            | "content-length"
-            | "transfer-encoding"
-            | "connection"
-            | "accept-encoding"
-            | "content-encoding"
-            | "x-real-ip"
-            | "x-real-proto"
-            | "x-forwarded-for"
-            | "x-forwarded-proto"
-            | "x-forwarded-scheme"
-            | "x-forwarded-host"
-            | "x-forwarded-port"
-    ) || should_skip_request_header(name)
+    )
 }
 
 #[cfg(test)]
@@ -161,6 +172,29 @@ mod tests {
             assert!(
                 should_skip_upstream_complete_passthrough_header(h),
                 "should skip complete passthrough {h}"
+            );
+        }
+    }
+
+    #[test]
+    fn strips_client_credentials_from_all_passthrough_modes() {
+        for header in [
+            "api-key",
+            "authorization",
+            "cookie",
+            "proxy-authorization",
+            "set-cookie",
+            "x-api-key",
+            "x-goog-api-key",
+            "Cookie",
+        ] {
+            assert!(
+                should_skip_upstream_passthrough_header(header),
+                "should skip passthrough {header}"
+            );
+            assert!(
+                should_skip_upstream_complete_passthrough_header(header),
+                "should skip complete passthrough {header}"
             );
         }
     }

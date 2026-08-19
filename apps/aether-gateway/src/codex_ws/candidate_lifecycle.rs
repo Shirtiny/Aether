@@ -1017,6 +1017,9 @@ pub(crate) fn compact_ws_planning_attempt_plan(
 ) -> aether_contracts::ExecutionPlan {
     let mut compact = compact_execution_plan_template(plan);
     compact.headers = plan.headers.clone();
+    // Standard Responses WebSocket candidates need the resolved client
+    // profile until their physical connection has been established.
+    compact.transport_profile = plan.transport_profile.clone();
     compact.timeouts = plan.timeouts.clone();
     compact
 }

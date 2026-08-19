@@ -19,6 +19,7 @@ use bytes::Bytes;
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use http::{HeaderMap, HeaderName, HeaderValue, Uri};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use super::protocol::{
     MiddleRouteDisposition, OfficialRequestIdentity, ResponseCreateStep, TerminalEventSummary,
@@ -166,7 +167,13 @@ pub(crate) struct CodexWsCandidate {
     pub(crate) response_headers: BTreeMap<String, String>,
     pub(crate) account_profile: Option<Arc<CodexConcreteAccountProfile>>,
     pub(crate) report_kind: String,
-    pub(crate) identity: OfficialRequestIdentity,
+    pub(crate) binding_identity: UpstreamBindingIdentity,
+    pub(crate) adapter: crate::orchestration::ResponsesWebSocketAdapter,
+    pub(crate) provider_type: String,
+    pub(crate) identity: Option<OfficialRequestIdentity>,
+    /// Full, short-lived transport plan retained only until a Standard
+    /// provider's physical WebSocket has connected.
+    pub(crate) connect_plan: Option<aether_contracts::ExecutionPlan>,
     pub(crate) route: OutboundRoute,
     pub(crate) timeouts: CodexWsTimeouts,
     pub(crate) lifecycle: Arc<CodexWsCandidateLifecycle>,
@@ -179,15 +186,62 @@ pub(crate) struct CodexWsCandidate {
     pub(crate) provider_concurrent_limit: Option<usize>,
     pub(crate) key_concurrent_limit: Option<usize>,
     pub(crate) key_rpm_limit: Option<u32>,
-    pub(crate) shared_global_generation: String,
+    pub(crate) shared_global_generation: Option<String>,
     pub(crate) shared_key_generation: String,
     pub(crate) shared_catalog_binding: super::hot_state::CodexWsCatalogBindingLease,
     pub(crate) prewrite_cleanup_permit:
         Option<tokio::sync::mpsc::OwnedPermit<CodexWsSettlementCommit>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UpstreamBindingIdentity {
+    adapter: crate::orchestration::ResponsesWebSocketAdapter,
+    provider_id: String,
+    endpoint_id: String,
+    key_id: String,
+    websocket_url: String,
+    handshake_fingerprint: [u8; 32],
+    proxy_fingerprint: [u8; 32],
+    transport_profile_fingerprint: [u8; 32],
+}
+
+#[cfg(test)]
+impl UpstreamBindingIdentity {
+    pub(crate) fn for_test(
+        adapter: crate::orchestration::ResponsesWebSocketAdapter,
+        provider_id: &str,
+        endpoint_id: &str,
+        key_id: &str,
+    ) -> Self {
+        Self {
+            adapter,
+            provider_id: provider_id.to_string(),
+            endpoint_id: endpoint_id.to_string(),
+            key_id: key_id.to_string(),
+            websocket_url: "wss://example.test/v1/responses".to_string(),
+            handshake_fingerprint: [1; 32],
+            proxy_fingerprint: [2; 32],
+            transport_profile_fingerprint: [3; 32],
+        }
+    }
+}
+
+impl CodexWsCandidate {
+    pub(crate) fn can_reuse_physical_binding(&self, next: &Self) -> bool {
+        self.binding_identity == next.binding_identity
+            && (self.adapter != crate::orchestration::ResponsesWebSocketAdapter::Codex
+                || (self.model == next.model
+                    && self
+                        .identity
+                        .as_ref()
+                        .zip(next.identity.as_ref())
+                        .is_some_and(|(current, next)| current.matches_connection_binding(next))))
+    }
+}
+
 struct CodexWsCandidatePreflight {
     transport: Arc<crate::ai_serving::GatewayProviderTransportSnapshot>,
+    adapter: crate::orchestration::ResponsesWebSocketAdapter,
     proxy: Option<aether_contracts::ProxySnapshot>,
     route: OutboundRoute,
 }
@@ -230,6 +284,10 @@ impl CodexWsCandidate {
         self.attempt
             .take()
             .expect("unconnected Codex WS candidate must retain its planning attempt")
+    }
+
+    fn take_connect_plan(&mut self) -> Option<aether_contracts::ExecutionPlan> {
+        self.connect_plan.take()
     }
 }
 
@@ -463,6 +521,15 @@ pub(crate) trait CodexWsRuntimePort: Send + Sync {
         candidate: CodexWsCandidate,
     ) -> Result<ConnectedCandidate, StepPreparationError>;
 
+    async fn activate_reused_candidate(
+        &self,
+        _candidate: CodexWsCandidate,
+    ) -> Result<CodexWsCandidate, StepPreparationError> {
+        Err(StepPreparationError::retain(
+            "responses_websocket_binding_reuse_unsupported",
+        ))
+    }
+
     async fn abort_candidate(&self, candidate: &CodexWsCandidate);
 
     fn abort_candidate_detached(
@@ -631,6 +698,10 @@ impl GatewayCodexWsRuntime {
         &self,
         candidate: &CodexWsCandidate,
     ) -> Result<aether_codex_ws_connector::Request, PeerError> {
+        let identity = candidate
+            .identity
+            .as_ref()
+            .ok_or_else(|| PeerError("official Codex WebSocket identity is missing".into()))?;
         let mut request = OFFICIAL_CODEX_RESPONSES_WS_URL
             .into_client_request()
             .map_err(|_| PeerError("failed to build official Codex WS request".into()))?;
@@ -664,42 +735,34 @@ impl GatewayCodexWsRuntime {
                 insert_header(request.headers_mut(), name, value)?;
             }
         }
-        insert_header(
-            request.headers_mut(),
-            "session-id",
-            &candidate.identity.session_id,
-        )?;
-        insert_header(
-            request.headers_mut(),
-            "thread-id",
-            &candidate.identity.thread_id,
-        )?;
+        insert_header(request.headers_mut(), "session-id", &identity.session_id)?;
+        insert_header(request.headers_mut(), "thread-id", &identity.thread_id)?;
         insert_header(
             request.headers_mut(),
             "x-client-request-id",
-            &candidate.identity.thread_id,
+            &identity.thread_id,
         )?;
-        if let Some(window_id) = candidate.identity.window_id.as_deref() {
+        if let Some(window_id) = identity.window_id.as_deref() {
             insert_header(request.headers_mut(), "x-codex-window-id", window_id)?;
         }
-        if let Some(parent_thread_id) = candidate.identity.parent_thread_id.as_deref() {
+        if let Some(parent_thread_id) = identity.parent_thread_id.as_deref() {
             insert_header(
                 request.headers_mut(),
                 "x-codex-parent-thread-id",
                 parent_thread_id,
             )?;
         }
-        if let Some(subagent) = candidate.identity.subagent.as_deref() {
+        if let Some(subagent) = identity.subagent.as_deref() {
             insert_header(request.headers_mut(), "x-openai-subagent", subagent)?;
         }
-        if candidate.identity.responses_lite {
+        if identity.responses_lite {
             insert_header(
                 request.headers_mut(),
                 "x-openai-internal-codex-responses-lite",
                 "true",
             )?;
         }
-        if let Some(turn_metadata) = candidate.identity.turn_metadata.as_deref() {
+        if let Some(turn_metadata) = identity.turn_metadata.as_deref() {
             let normalized_turn_metadata;
             let turn_metadata = if let Some(profile) = candidate.account_profile.as_deref() {
                 normalized_turn_metadata =
@@ -833,9 +896,6 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
     ) -> Result<Vec<CodexWsCandidate>, StepPreparationError> {
         self.validate_runtime_fences()?;
         let shared_global = self.shared_global.clone();
-        if !shared_global.eligible {
-            return Err(StepPreparationError::retain("codex_ws_global_disabled"));
-        }
         let shared_catalog = super::hot_state::ensure_catalog_hot_lease(&self.state)
             .await
             .map_err(|_| StepPreparationError::retain("account_catalog_hot_state_unavailable"))?;
@@ -850,13 +910,18 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
         let parts = self
             .request_parts()
             .map_err(|_| StepPreparationError::retain("candidate_request_context_invalid"))?;
-        let required_capabilities = json!({"codex_official_ws": true});
+        // Adapter eligibility is provider-scoped. Codex capability/profile
+        // requirements are checked in preflight, while Standard providers use
+        // their ordinary key contract.
+        let required_capabilities = json!({});
         let planning_state = self.state.clone();
+        let codex_global_eligible = shared_global.eligible;
+        let codex_identity_present = first_step.official_identity.is_some();
         let native_account_flags = crate::provider_transport::CodexOfficialWsGlobalFlags {
             enabled: true,
             native_codex_ws_enabled: true,
         };
-        let attempts = build_compact_local_openai_responses_stream_plan_and_reports_for_kind_with_required_capabilities(
+        let mut attempts = build_compact_local_openai_responses_stream_plan_and_reports_for_kind_with_required_capabilities(
             &self.state,
             &parts,
             &self.trace_id,
@@ -877,20 +942,38 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
                         return None;
                     }
                     let transport = Arc::clone(&attempt.eligible.transport);
-                    if !crate::provider_transport::resolve_codex_official_ws(
-                        transport.as_ref(),
-                        native_account_flags,
-                    )
-                    .profile_effective
+                    let adapter = crate::orchestration::responses_websocket_adapter(
+                        transport.provider.provider_type.as_str(),
+                        transport.provider.config.as_ref(),
+                    )?;
+                    if adapter == crate::orchestration::ResponsesWebSocketAdapter::Codex
+                        && (!codex_global_eligible
+                            || !codex_identity_present
+                            || first_step
+                                .value
+                                .get("background")
+                                .is_some_and(|value| !value.is_null())
+                            || !crate::provider_transport::resolve_codex_official_ws(
+                                transport.as_ref(),
+                                native_account_flags,
+                            )
+                            .profile_effective)
                     {
                         return None;
                     }
                     let proxy = state
                         .resolve_transport_proxy_snapshot_with_tunnel_affinity(transport.as_ref())
                         .await;
-                    let route = outbound_route(proxy.as_ref())?;
+                    let route = if adapter
+                        == crate::orchestration::ResponsesWebSocketAdapter::Codex
+                    {
+                        outbound_route(proxy.as_ref())?
+                    } else {
+                        OutboundRoute::Direct
+                    };
                     Some(CodexWsCandidatePreflight {
                         transport,
+                        adapter,
                         proxy,
                         route,
                     })
@@ -907,7 +990,11 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
                 kind: super::hot_state::CatalogResourceKind::Provider,
                 id: provider.id.clone(),
                 eligible: provider.is_active
-                    && provider.provider_type.trim().eq_ignore_ascii_case("codex"),
+                    && crate::orchestration::responses_websocket_adapter(
+                        &provider.provider_type,
+                        provider.config.as_ref(),
+                    )
+                    .is_some(),
                 ineligible_reason: "provider_ineligible",
             });
             let endpoint = &planned.preflight.transport.endpoint;
@@ -1011,7 +1098,7 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
 
         if let Err(reason) = super::hot_state::validate_candidate_selection_hot_leases(
             &self.state,
-            &shared_global,
+            None,
             &shared_catalog,
         )
         .await
@@ -1025,6 +1112,35 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
             )
             .await;
             return Err(StepPreparationError::retain(reason));
+        }
+        if attempts.iter().any(|planned| {
+            planned.preflight.adapter == crate::orchestration::ResponsesWebSocketAdapter::Codex
+        }) && super::hot_state::validate_global_hot_lease(&self.state, &shared_global)
+            .await
+            .is_err()
+        {
+            let mut standard_attempts = Vec::with_capacity(attempts.len());
+            let mut stale_codex_attempts = Vec::new();
+            for planned in attempts {
+                if planned.preflight.adapter
+                    == crate::orchestration::ResponsesWebSocketAdapter::Codex
+                {
+                    stale_codex_attempts.push(planned.attempt);
+                } else {
+                    standard_attempts.push(planned);
+                }
+            }
+            crate::executor::candidate_loop::mark_unused_local_candidates(
+                &self.state,
+                stale_codex_attempts,
+            )
+            .await;
+            attempts = standard_attempts;
+            if attempts.is_empty() {
+                return Err(StepPreparationError::retain(
+                    "codex_ws_global_changed_during_selection",
+                ));
+            }
         }
         if let Err(error) = self.validate_runtime_fences() {
             crate::executor::candidate_loop::mark_unused_local_candidates(
@@ -1063,10 +1179,16 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
         for planned in attempts {
             let mut attempt = planned.attempt;
             let preflight = planned.preflight;
+            let adapter = preflight.adapter;
             // Freeze reporting/settlement and the connector route from the
             // same concrete proxy resolution. Never resolve a pool key's
             // proxy again after preflight.
-            attempt.plan.proxy = preflight.proxy.as_ref().map(compact_proxy_for_plan);
+            attempt.plan.proxy =
+                if adapter == crate::orchestration::ResponsesWebSocketAdapter::Standard {
+                    preflight.proxy.clone()
+                } else {
+                    preflight.proxy.as_ref().map(compact_proxy_for_plan)
+                };
             let provider_body_patch = planned.provider_body_patch;
             let transport = preflight.transport;
             let timeouts = CodexWsTimeouts::from_plan(&attempt.plan);
@@ -1121,19 +1243,40 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
                 })
                 .unwrap_or_else(|| first_step.model.clone());
             attempt.report_context = report_context.clone();
-            attempt.plan = compact_execution_plan_template(&attempt.plan);
+            let connect_plan = (adapter
+                == crate::orchestration::ResponsesWebSocketAdapter::Standard)
+                .then(|| attempt.plan.clone());
             let provider_concurrent_limit =
                 normalize_concurrent_limit(transport.provider.concurrent_limit);
             let key_concurrent_limit = key_concurrent_limits.get(&key_id).copied().flatten();
             let key_rpm_limit = key_rpm_limits.get(&key_id).copied().flatten();
-            let account_profile =
-                crate::ai_serving::resolve_codex_pool_concrete_account_profile(transport.as_ref())
-                    .map(Arc::new);
+            let account_profile = (adapter
+                == crate::orchestration::ResponsesWebSocketAdapter::Codex)
+                .then(|| {
+                    crate::ai_serving::resolve_codex_pool_concrete_account_profile(
+                        transport.as_ref(),
+                    )
+                    .map(Arc::new)
+                })
+                .flatten();
             let body_rules = transport.endpoint.body_rules.clone().map(Arc::new);
             let force_body_stream_field =
                 crate::ai_serving::endpoint_config_forces_upstream_stream_policy(
                     transport.endpoint.config.as_ref(),
                 );
+            let binding_identity = upstream_binding_identity(
+                adapter,
+                &provider_id,
+                &endpoint_id,
+                &key_id,
+                &attempt.plan,
+                preflight.proxy.as_ref(),
+                &headers,
+                first_step.official_identity.as_ref(),
+                account_profile.as_deref(),
+                &self.request_headers,
+            );
+            attempt.plan = compact_execution_plan_template(&attempt.plan);
             candidates.push(CodexWsCandidate {
                 attempt: Some(attempt),
                 provider_id,
@@ -1150,7 +1293,11 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
                 response_headers: BTreeMap::new(),
                 account_profile,
                 report_kind,
+                binding_identity,
+                adapter,
+                provider_type: transport.provider.provider_type.clone(),
                 identity: first_step.official_identity.clone(),
+                connect_plan,
                 route: preflight.route,
                 timeouts,
                 lifecycle,
@@ -1158,7 +1305,9 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
                 provider_concurrent_limit,
                 key_concurrent_limit,
                 key_rpm_limit,
-                shared_global_generation: shared_global.generation.clone(),
+                shared_global_generation: (adapter
+                    == crate::orchestration::ResponsesWebSocketAdapter::Codex)
+                    .then(|| shared_global.generation.clone()),
                 shared_key_generation: key_hot_lease.generation.clone(),
                 shared_catalog_binding,
                 prewrite_cleanup_permit: cleanup_permits.pop_front(),
@@ -1191,22 +1340,28 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
             cancellation_guard.disarm();
             return Err(error);
         }
-        let request = match self.official_request(&candidate) {
-            Ok(request) => request,
-            Err(error) => {
-                self.finish_aborted_candidate(
-                    &candidate,
-                    aether_data_contracts::repository::candidates::RequestCandidateStatus::Failed,
-                    "codex_ws_request_materialization_failed",
-                    &error.0,
-                    false,
-                )
-                .await;
-                cancellation_guard.disarm();
-                return Err(StepPreparationError::exclude(
-                    "selected_account_materialization_failed",
-                ));
+        let official_request = if candidate.adapter
+            == crate::orchestration::ResponsesWebSocketAdapter::Codex
+        {
+            match self.official_request(&candidate) {
+                Ok(request) => Some(request),
+                Err(error) => {
+                    self.finish_aborted_candidate(
+                        &candidate,
+                        aether_data_contracts::repository::candidates::RequestCandidateStatus::Failed,
+                        "codex_ws_request_materialization_failed",
+                        &error.0,
+                        false,
+                    )
+                    .await;
+                    cancellation_guard.disarm();
+                    return Err(StepPreparationError::exclude(
+                        "selected_account_materialization_failed",
+                    ));
+                }
             }
+        } else {
+            None
         };
         let context = LocalExecutionEffectContext {
             plan: &candidate.planning_attempt().plan,
@@ -1231,44 +1386,139 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
         )
         .await;
         candidate.lifecycle.mark_started();
-        let route = take_outbound_route_for_connect(&mut candidate.route);
-        let route_kind = CodexWsRouteKind::from_route(&route);
-        let connect_result = tokio::time::timeout(
-            candidate.timeouts().connect,
-            self.connector.connect(request, route),
-        )
-        .await;
-        let (connection, response) = match connect_result {
-            Ok(Ok(connected)) => connected,
-            Ok(Err(error)) => {
-                let failure = classify_codex_ws_handshake_failure(error, route_kind);
-                tracing::warn!(
-                    event_name = "codex_ws_handshake_failed",
-                    log_type = "ops",
-                    route_kind = ?route_kind,
-                    error_type = %failure.error_type,
-                    error_detail = failure.diagnostic_detail.as_deref().unwrap_or("none"),
-                    "official Codex WebSocket handshake failed"
-                );
-                self.enqueue_handshake_failure(&candidate, &mut cancellation_guard, &failure)
-                    .await?;
-                cancellation_guard.disarm();
-                return Err(StepPreparationError::retain(failure.route_reason));
-            }
-            Err(_) => {
-                let failure = CodexWsHandshakeFailure {
-                    status_code: http::StatusCode::GATEWAY_TIMEOUT.as_u16(),
-                    response_headers: BTreeMap::new(),
-                    error_type: "codex_ws_connect_timeout".to_string(),
-                    error_message: "official Codex WebSocket connect timed out".to_string(),
-                    error_body: None,
-                    diagnostic_detail: None,
-                    route_reason: "official_ws_connect_timeout",
+        let (peer, response_headers, handshake_turn_state): (
+            Box<dyn RelayPeer>,
+            BTreeMap<String, String>,
+            Option<String>,
+        ) = match candidate.adapter {
+            crate::orchestration::ResponsesWebSocketAdapter::Codex => {
+                let request = official_request
+                    .expect("Codex candidate request was materialized before pool start");
+                let route = take_outbound_route_for_connect(&mut candidate.route);
+                let route_kind = CodexWsRouteKind::from_route(&route);
+                let connect_result = tokio::time::timeout(
+                    candidate.timeouts().connect,
+                    self.connector.connect(request, route),
+                )
+                .await;
+                let (connection, response) = match connect_result {
+                    Ok(Ok(connected)) => connected,
+                    Ok(Err(error)) => {
+                        let failure = classify_codex_ws_handshake_failure(error, route_kind);
+                        tracing::warn!(
+                            event_name = "codex_ws_handshake_failed",
+                            log_type = "ops",
+                            route_kind = ?route_kind,
+                            error_type = %failure.error_type,
+                            error_detail = failure.diagnostic_detail.as_deref().unwrap_or("none"),
+                            "official Codex WebSocket handshake failed"
+                        );
+                        self.enqueue_handshake_failure(
+                            &candidate,
+                            &mut cancellation_guard,
+                            &failure,
+                        )
+                        .await?;
+                        cancellation_guard.disarm();
+                        return Err(StepPreparationError::retain(failure.route_reason));
+                    }
+                    Err(_) => {
+                        let failure = CodexWsHandshakeFailure {
+                            status_code: http::StatusCode::GATEWAY_TIMEOUT.as_u16(),
+                            response_headers: BTreeMap::new(),
+                            error_type: "codex_ws_connect_timeout".to_string(),
+                            error_message: "official Codex WebSocket connect timed out".to_string(),
+                            error_body: None,
+                            diagnostic_detail: None,
+                            route_reason: "official_ws_connect_timeout",
+                        };
+                        self.enqueue_handshake_failure(
+                            &candidate,
+                            &mut cancellation_guard,
+                            &failure,
+                        )
+                        .await?;
+                        cancellation_guard.disarm();
+                        return Err(StepPreparationError::retain("official_ws_connect_timeout"));
+                    }
                 };
-                self.enqueue_handshake_failure(&candidate, &mut cancellation_guard, &failure)
-                    .await?;
-                cancellation_guard.disarm();
-                return Err(StepPreparationError::retain("official_ws_connect_timeout"));
+                let handshake_turn_state = response
+                    .headers()
+                    .get("x-codex-turn-state")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string);
+                (
+                    Box::new(OfficialPeer { connection }),
+                    compact_codex_response_headers(response.headers()),
+                    handshake_turn_state,
+                )
+            }
+            crate::orchestration::ResponsesWebSocketAdapter::Standard => {
+                let Some(connect_plan) = candidate.take_connect_plan() else {
+                    self.finish_aborted_candidate(
+                        &candidate,
+                        aether_data_contracts::repository::candidates::RequestCandidateStatus::Failed,
+                        "responses_websocket_connect_plan_missing",
+                        "standard Responses WebSocket connect plan is missing",
+                        false,
+                    )
+                    .await;
+                    cancellation_guard.disarm();
+                    return Err(StepPreparationError::exclude(
+                        "selected_account_materialization_failed",
+                    ));
+                };
+                match tokio::time::timeout(
+                    candidate.timeouts().connect,
+                    super::standard_transport::connect_standard_websocket(&connect_plan),
+                )
+                .await
+                {
+                    Ok(Ok(connection)) => {
+                        (Box::new(connection.peer), connection.response_headers, None)
+                    }
+                    Ok(Err(error)) => {
+                        let failure = classify_standard_ws_handshake_failure(error);
+                        tracing::warn!(
+                            event_name = "responses_websocket_handshake_failed",
+                            log_type = "ops",
+                            adapter = "standard",
+                            error_type = %failure.error_type,
+                            error_detail = failure.diagnostic_detail.as_deref().unwrap_or("none"),
+                            "standard Responses WebSocket handshake failed"
+                        );
+                        self.enqueue_handshake_failure(
+                            &candidate,
+                            &mut cancellation_guard,
+                            &failure,
+                        )
+                        .await?;
+                        cancellation_guard.disarm();
+                        return Err(StepPreparationError::retain(failure.route_reason));
+                    }
+                    Err(_) => {
+                        let failure = CodexWsHandshakeFailure {
+                            status_code: http::StatusCode::GATEWAY_TIMEOUT.as_u16(),
+                            response_headers: BTreeMap::new(),
+                            error_type: "responses_websocket_connect_timeout".to_string(),
+                            error_message: "standard Responses WebSocket connect timed out"
+                                .to_string(),
+                            error_body: None,
+                            diagnostic_detail: None,
+                            route_reason: "responses_websocket_connect_timeout",
+                        };
+                        self.enqueue_handshake_failure(
+                            &candidate,
+                            &mut cancellation_guard,
+                            &failure,
+                        )
+                        .await?;
+                        cancellation_guard.disarm();
+                        return Err(StepPreparationError::retain(failure.route_reason));
+                    }
+                }
             }
         };
         if let Err(error) = self.validate_candidate_current_state(&candidate).await {
@@ -1281,28 +1531,81 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
             )
             .await;
             cancellation_guard.disarm();
-            drop(connection);
+            drop(peer);
             return Err(error);
         }
         cancellation_guard.restore(&mut candidate);
-        let handshake_turn_state = response
-            .headers()
-            .get("x-codex-turn-state")
-            .and_then(|value| value.to_str().ok())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string);
-        candidate.response_headers = compact_codex_response_headers(response.headers());
+        candidate.response_headers = response_headers;
         candidate.headers.clear();
+        candidate.connect_plan = None;
         // Pool-start and unused-candidate effects have been transferred to the
         // lifecycle. Do not retain a duplicate plan/context for an idle,
         // potentially long-lived provider connection.
         drop(candidate.take_planning_attempt());
         Ok(ConnectedCandidate {
             candidate,
-            peer: Box::new(OfficialPeer { connection }),
+            peer,
             handshake_turn_state,
         })
+    }
+
+    async fn activate_reused_candidate(
+        &self,
+        mut candidate: CodexWsCandidate,
+    ) -> Result<CodexWsCandidate, StepPreparationError> {
+        let mut cancellation_guard = ConnectAttemptCancellationGuard::new(&mut candidate);
+        if let Err(error) = self.validate_candidate_current_state(&candidate).await {
+            self.finish_aborted_candidate(
+                &candidate,
+                aether_data_contracts::repository::candidates::RequestCandidateStatus::Cancelled,
+                "responses_websocket_reused_candidate_fence_changed",
+                error.reason,
+                false,
+            )
+            .await;
+            cancellation_guard.disarm();
+            return Err(error);
+        }
+        let context = LocalExecutionEffectContext {
+            plan: &candidate.planning_attempt().plan,
+            report_context: candidate.planning_attempt().report_context.as_ref(),
+        };
+        if !prepare_pool_attempt_started_effect(&self.state, context).await {
+            self.finish_aborted_candidate(
+                &candidate,
+                aether_data_contracts::repository::candidates::RequestCandidateStatus::Unused,
+                "responses_websocket_reused_pool_attempt_not_started",
+                "Responses WebSocket reused candidate was not eligible to start",
+                false,
+            )
+            .await;
+            cancellation_guard.disarm();
+            return Err(StepPreparationError::retain("candidate_pool_busy"));
+        }
+        apply_local_execution_effect(
+            &self.state,
+            context,
+            LocalExecutionEffect::PoolAttemptStarted,
+        )
+        .await;
+        candidate.lifecycle.mark_started();
+        if let Err(error) = self.validate_candidate_current_state(&candidate).await {
+            self.finish_aborted_candidate(
+                &candidate,
+                aether_data_contracts::repository::candidates::RequestCandidateStatus::Cancelled,
+                "responses_websocket_reused_candidate_changed_after_start",
+                error.reason,
+                false,
+            )
+            .await;
+            cancellation_guard.disarm();
+            return Err(error);
+        }
+        cancellation_guard.restore(&mut candidate);
+        candidate.headers.clear();
+        candidate.connect_plan = None;
+        drop(candidate.take_planning_attempt());
+        Ok(candidate)
     }
 
     async fn abort_candidate(&self, candidate: &CodexWsCandidate) {
@@ -1428,6 +1731,8 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
                 let model_directive_mapping = candidate.model_directive_mapping.clone();
                 let request_headers = self.request_headers.clone();
                 let account_profile = candidate.account_profile.clone();
+                let adapter = candidate.adapter;
+                let provider_type = candidate.provider_type.clone();
                 let force_body_stream_field = candidate.force_body_stream_field;
                 let enable_model_directives = candidate.enable_model_directives;
                 tokio::task::spawn_blocking(move || {
@@ -1443,6 +1748,8 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
                         model_directive_mapping.as_deref(),
                         provider_body_patch.as_ref(),
                         account_profile.as_deref(),
+                        adapter,
+                        &provider_type,
                     )?;
                     Ok::<_, StepPreparationError>((materialized_body, original_request_body))
                 })
@@ -1462,6 +1769,8 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
                     candidate.model_directive_mapping.as_deref(),
                     candidate.provider_body_patch.as_ref(),
                     candidate.account_profile.as_deref(),
+                    candidate.adapter,
+                    &candidate.provider_type,
                 )?;
                 (materialized_body, original_request_body)
             };
@@ -1701,7 +2010,7 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
             &candidate.provider_id,
             &candidate.endpoint_id,
             &candidate.key_id,
-            &candidate.shared_global_generation,
+            candidate.shared_global_generation.as_deref(),
             &candidate.shared_key_generation,
             &candidate.shared_catalog_binding,
         )
@@ -1919,6 +2228,66 @@ fn classify_codex_ws_handshake_failure(
     }
 }
 
+fn classify_standard_ws_handshake_failure(
+    error: super::standard_transport::StandardWebSocketConnectError,
+) -> CodexWsHandshakeFailure {
+    match error {
+        super::standard_transport::StandardWebSocketConnectError::Rejected {
+            status_code,
+            response_headers,
+            error_body,
+        } => {
+            let (error_type, error_message, route_reason) = match status_code {
+                401 | 403 => (
+                    "responses_websocket_handshake_unauthorized",
+                    "standard Responses WebSocket rejected provider authorization",
+                    "responses_websocket_account_unauthorized",
+                ),
+                409 => (
+                    "responses_websocket_handshake_connection_limit",
+                    "standard Responses WebSocket provider connection limit was reached",
+                    "responses_websocket_connection_limit",
+                ),
+                429 => (
+                    "responses_websocket_handshake_rate_limited",
+                    "standard Responses WebSocket provider was rate limited",
+                    "responses_websocket_account_rate_limited",
+                ),
+                500..=599 => (
+                    "responses_websocket_handshake_upstream_failure",
+                    "standard Responses WebSocket handshake failed upstream",
+                    "responses_websocket_upstream_failure",
+                ),
+                _ => (
+                    "responses_websocket_handshake_http_error",
+                    "standard Responses WebSocket handshake was rejected",
+                    "responses_websocket_handshake_rejected",
+                ),
+            };
+            CodexWsHandshakeFailure {
+                status_code,
+                response_headers,
+                error_type: error_type.to_string(),
+                error_message: error_message.to_string(),
+                error_body,
+                diagnostic_detail: Some(format!("http_status={status_code}")),
+                route_reason,
+            }
+        }
+        super::standard_transport::StandardWebSocketConnectError::Transport(error) => {
+            CodexWsHandshakeFailure {
+                status_code: http::StatusCode::BAD_GATEWAY.as_u16(),
+                response_headers: BTreeMap::new(),
+                error_type: "responses_websocket_handshake_failed".to_string(),
+                error_message: "standard Responses WebSocket handshake failed".to_string(),
+                error_body: None,
+                diagnostic_detail: Some(error.0),
+                route_reason: "responses_websocket_handshake_failed",
+            }
+        }
+    }
+}
+
 fn transport_handshake_failure(
     error_type: &'static str,
     error_message: &'static str,
@@ -2128,6 +2497,7 @@ fn terminal_kind_name(kind: TerminalKind) -> &'static str {
         TerminalKind::Completed => "completed",
         TerminalKind::Failed => "failed",
         TerminalKind::Incomplete => "incomplete",
+        TerminalKind::Cancelled => "cancelled",
         TerminalKind::Error => "error",
     }
 }
@@ -2216,19 +2586,21 @@ fn step_report_context(
         .and_then(serde_json::Value::as_str)
         .is_some_and(|session_key| !session_key.trim().is_empty());
     if !has_session_affinity {
-        let session_id = if !step.official_identity.session_id.trim().is_empty() {
-            step.official_identity.session_id.trim()
-        } else {
-            step.official_identity.thread_id.trim()
-        };
-        if !session_id.is_empty() {
-            context.insert(
-                "client_session_affinity".to_string(),
-                serde_json::json!({
-                    "client_family": "codex",
-                    "session_key": format!("session={session_id}")
-                }),
-            );
+        if let Some(identity) = step.official_identity.as_ref() {
+            let session_id = if !identity.session_id.trim().is_empty() {
+                identity.session_id.trim()
+            } else {
+                identity.thread_id.trim()
+            };
+            if !session_id.is_empty() {
+                context.insert(
+                    "client_session_affinity".to_string(),
+                    serde_json::json!({
+                        "client_family": "codex",
+                        "session_key": format!("session={session_id}")
+                    }),
+                );
+            }
         }
     }
     if let Some(original_request_body) = original_request_body {
@@ -2253,6 +2625,8 @@ fn materialize_codex_ws_step_body(
     model_directive_mapping: Option<&serde_json::Value>,
     provider_body_patch: &[RoutingJsonPatchOperation],
     account_profile: Option<&CodexConcreteAccountProfile>,
+    adapter: crate::orchestration::ResponsesWebSocketAdapter,
+    provider_type: &str,
 ) -> Result<MaterializedCodexWsStepBody, StepPreparationError> {
     let explicit_session_key =
         crate::client_session_affinity::client_session_affinity_from_request(
@@ -2261,20 +2635,25 @@ fn materialize_codex_ws_step_body(
         )
         .and_then(|affinity| affinity.session_key);
 
-    // The shared Codex HTTP normalizer strips previous_response_id because
-    // HTTP requests are self-contained. Native Responses WebSocket follow-up
-    // steps are different: custom/function tool outputs are resolved against
-    // the preceding response on the bound provider connection.
-    let previous_response_id = body
-        .get("previous_response_id")
-        .and_then(serde_json::Value::as_str)
-        .map(ToOwned::to_owned);
+    // The shared HTTP normalizer strips connection-scoped fields. Preserve
+    // the client's explicit WebSocket semantics and restore them only after
+    // route/profile edits have completed.
+    let explicit_store = body.get("store").cloned();
+    let explicit_previous_response_id = body.get("previous_response_id").cloned();
+    let explicit_generate = body.get("generate").cloned();
+    if adapter == crate::orchestration::ResponsesWebSocketAdapter::Codex
+        && body.get("background").is_some_and(|value| !value.is_null())
+    {
+        return Err(StepPreparationError::retain(
+            "codex_ws_background_response_unsupported",
+        ));
+    }
     let mut body = crate::ai_serving::build_codex_ws_local_openai_responses_request_body(
         body,
         mapped_model,
         true,
         force_body_stream_field,
-        "codex",
+        provider_type,
         "openai:responses",
         body_rules,
         None,
@@ -2299,14 +2678,24 @@ fn materialize_codex_ws_step_body(
     let body_object = body.as_object_mut().ok_or(StepPreparationError::retain(
         "provider_request_body_materialization_failed",
     ))?;
-    body_object.insert("stream".to_string(), serde_json::Value::Bool(true));
-    if let Some(previous_response_id) = previous_response_id {
-        // Restore this after all route/profile edits so a validated connection
-        // fence cannot silently turn into an unlinked tool-output request.
-        body_object.insert(
-            "previous_response_id".to_string(),
-            serde_json::Value::String(previous_response_id),
-        );
+    match adapter {
+        crate::orchestration::ResponsesWebSocketAdapter::Codex => {
+            body_object.insert("stream".to_string(), serde_json::Value::Bool(true));
+            body_object.insert("store".to_string(), serde_json::Value::Bool(false));
+        }
+        crate::orchestration::ResponsesWebSocketAdapter::Standard => {
+            body_object.remove("stream");
+            body_object.remove("background");
+            if let Some(store) = explicit_store {
+                body_object.insert("store".to_string(), store);
+            }
+        }
+    }
+    if let Some(previous_response_id) = explicit_previous_response_id {
+        body_object.insert("previous_response_id".to_string(), previous_response_id);
+    }
+    if let Some(generate) = explicit_generate {
+        body_object.insert("generate".to_string(), generate);
     }
     let _ = crate::ai_serving::apply_openai_responses_stable_prompt_cache_key(
         &mut body,
@@ -2330,6 +2719,86 @@ fn normalize_concurrent_limit(limit: Option<i32>) -> Option<usize> {
     limit
         .filter(|limit| *limit > 0)
         .and_then(|limit| usize::try_from(limit).ok())
+}
+
+fn upstream_binding_identity(
+    adapter: crate::orchestration::ResponsesWebSocketAdapter,
+    provider_id: &str,
+    endpoint_id: &str,
+    key_id: &str,
+    plan: &aether_contracts::ExecutionPlan,
+    resolved_proxy: Option<&aether_contracts::ProxySnapshot>,
+    headers: &BTreeMap<String, String>,
+    identity: Option<&OfficialRequestIdentity>,
+    account_profile: Option<&CodexConcreteAccountProfile>,
+    client_headers: &HeaderMap,
+) -> UpstreamBindingIdentity {
+    let websocket_url = match adapter {
+        crate::orchestration::ResponsesWebSocketAdapter::Codex => {
+            OFFICIAL_CODEX_RESPONSES_WS_URL.to_string()
+        }
+        crate::orchestration::ResponsesWebSocketAdapter::Standard => {
+            super::standard_transport::websocket_upstream_url(&plan.url)
+                .map(|url| url.to_string())
+                .unwrap_or_else(|_| plan.url.trim().to_string())
+        }
+    };
+    let codex_client_headers = if adapter == crate::orchestration::ResponsesWebSocketAdapter::Codex
+    {
+        [
+            "x-codex-beta-features",
+            "x-openai-memgen-request",
+            "x-responsesapi-include-timing-metrics",
+        ]
+        .into_iter()
+        .filter_map(|name| {
+            exact_request_header(client_headers, name)
+                .map(|value| (name.to_string(), value.to_string()))
+        })
+        .collect::<BTreeMap<_, _>>()
+    } else {
+        BTreeMap::new()
+    };
+    // Turn metadata is re-materialized in response.create.client_metadata and
+    // does not identify the physical socket.
+    let official_identity = identity.map(|identity| {
+        json!({
+            "session_id": identity.session_id,
+            "thread_id": identity.thread_id,
+            "window_id": identity.window_id,
+            "parent_thread_id": identity.parent_thread_id,
+            "subagent": identity.subagent,
+            "responses_lite": identity.responses_lite,
+        })
+    });
+    let account_profile = account_profile.map(|profile| {
+        json!({
+            "user_agent": profile.user_agent,
+            "originator": profile.originator,
+            "installation_id": profile.installation_id,
+            "fingerprint_hash": profile.fingerprint_hash,
+        })
+    });
+    UpstreamBindingIdentity {
+        adapter,
+        provider_id: provider_id.to_string(),
+        endpoint_id: endpoint_id.to_string(),
+        key_id: key_id.to_string(),
+        websocket_url,
+        handshake_fingerprint: sha256_serializable(&json!({
+            "provider_headers": headers,
+            "codex_client_headers": codex_client_headers,
+            "official_identity": official_identity,
+            "account_profile": account_profile,
+        })),
+        proxy_fingerprint: sha256_serializable(&resolved_proxy),
+        transport_profile_fingerprint: sha256_serializable(&plan.transport_profile),
+    }
+}
+
+fn sha256_serializable(value: &impl serde::Serialize) -> [u8; 32] {
+    let encoded = serde_json::to_vec(value).expect("binding identity inputs are JSON serializable");
+    Sha256::digest(encoded).into()
 }
 
 async fn acquire_keyed_concurrency_permit(
@@ -2599,7 +3068,7 @@ mod tests {
             model: "gpt-test".into(),
             previous_response_id: None,
             logical_turn_id: None,
-            official_identity: OfficialRequestIdentity {
+            official_identity: Some(OfficialRequestIdentity {
                 session_id: "session-1".into(),
                 thread_id: "thread-1".into(),
                 window_id: None,
@@ -2607,7 +3076,7 @@ mod tests {
                 parent_thread_id: None,
                 subagent: None,
                 responses_lite: false,
-            },
+            }),
             fence: StepFence {
                 correlation_id: "correlation-1".into(),
                 binding_epoch_id: "epoch-1".into(),
@@ -2646,7 +3115,7 @@ mod tests {
             model: "gpt-test".into(),
             previous_response_id: None,
             logical_turn_id: None,
-            official_identity: OfficialRequestIdentity {
+            official_identity: Some(OfficialRequestIdentity {
                 session_id: "official-session".into(),
                 thread_id: "thread-1".into(),
                 window_id: None,
@@ -2654,7 +3123,7 @@ mod tests {
                 parent_thread_id: None,
                 subagent: None,
                 responses_lite: false,
-            },
+            }),
             fence: StepFence {
                 correlation_id: "correlation-1".into(),
                 binding_epoch_id: "epoch-1".into(),
@@ -2687,7 +3156,7 @@ mod tests {
             model: "gpt-test".into(),
             previous_response_id: None,
             logical_turn_id: None,
-            official_identity: OfficialRequestIdentity {
+            official_identity: Some(OfficialRequestIdentity {
                 session_id: "session-1".into(),
                 thread_id: "thread-1".into(),
                 window_id: None,
@@ -2695,7 +3164,7 @@ mod tests {
                 parent_thread_id: None,
                 subagent: None,
                 responses_lite: false,
-            },
+            }),
             fence: StepFence {
                 correlation_id: "correlation-1".into(),
                 binding_epoch_id: "epoch-1".into(),
@@ -2738,6 +3207,8 @@ mod tests {
             None,
             &[],
             None,
+            crate::orchestration::ResponsesWebSocketAdapter::Codex,
+            "codex",
         )
         .expect("initial body should materialize");
 
@@ -2769,6 +3240,8 @@ mod tests {
             None,
             &[],
             None,
+            crate::orchestration::ResponsesWebSocketAdapter::Codex,
+            "codex",
         )
         .expect("follow-up body should materialize");
 
@@ -2784,6 +3257,39 @@ mod tests {
                 .expect("materialized text should be JSON"),
             materialized.json
         );
+    }
+
+    #[test]
+    fn standard_materialization_preserves_ws_fields_and_removes_http_fields() {
+        let materialized = materialize_codex_ws_step_body(
+            json!({
+                "type": "response.create",
+                "model": "gpt-test",
+                "stream": true,
+                "background": true,
+                "store": true,
+                "previous_response_id": "resp-1",
+                "generate": false,
+                "input": []
+            }),
+            "gpt-test",
+            false,
+            None,
+            &HeaderMap::new(),
+            false,
+            None,
+            &[],
+            None,
+            crate::orchestration::ResponsesWebSocketAdapter::Standard,
+            "openai",
+        )
+        .expect("standard body should materialize");
+
+        assert!(materialized.json.get("stream").is_none());
+        assert!(materialized.json.get("background").is_none());
+        assert_eq!(materialized.json["store"], true);
+        assert_eq!(materialized.json["previous_response_id"], "resp-1");
+        assert_eq!(materialized.json["generate"], false);
     }
 
     #[test]
@@ -2846,6 +3352,65 @@ mod tests {
         assert!(compact.headers.is_empty());
         assert_eq!(compact.request_id, source.request_id);
         assert_eq!(compact.candidate_id, source.candidate_id);
+    }
+
+    #[test]
+    fn codex_binding_fingerprint_ignores_turn_metadata_but_tracks_connection_identity() {
+        let plan = usage_plan_with_body();
+        let identity = OfficialRequestIdentity {
+            session_id: "session-1".into(),
+            thread_id: "thread-1".into(),
+            window_id: Some("window-1".into()),
+            turn_metadata: Some(r#"{"turn":"one"}"#.into()),
+            parent_thread_id: Some("parent-1".into()),
+            subagent: Some("review".into()),
+            responses_lite: false,
+        };
+        let original = upstream_binding_identity(
+            crate::orchestration::ResponsesWebSocketAdapter::Codex,
+            "provider-1",
+            "endpoint-1",
+            "key-1",
+            &plan,
+            None,
+            &BTreeMap::new(),
+            Some(&identity),
+            None,
+            &HeaderMap::new(),
+        );
+        let mut changed = identity.clone();
+        changed.turn_metadata = Some(r#"{"turn":"two"}"#.into());
+        let changed = upstream_binding_identity(
+            crate::orchestration::ResponsesWebSocketAdapter::Codex,
+            "provider-1",
+            "endpoint-1",
+            "key-1",
+            &plan,
+            None,
+            &BTreeMap::new(),
+            Some(&changed),
+            None,
+            &HeaderMap::new(),
+        );
+
+        assert_eq!(original, changed);
+
+        let mut changed = identity;
+        changed.window_id = Some("window-2".into());
+        let changed = upstream_binding_identity(
+            crate::orchestration::ResponsesWebSocketAdapter::Codex,
+            "provider-1",
+            "endpoint-1",
+            "key-1",
+            &plan,
+            None,
+            &BTreeMap::new(),
+            Some(&changed),
+            None,
+            &HeaderMap::new(),
+        );
+
+        assert_ne!(original, changed);
     }
 
     #[test]
@@ -2946,6 +3511,42 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("provider-secret"));
+    }
+
+    #[test]
+    fn standard_handshake_http_classification_preserves_provider_rejection() {
+        let failure = classify_standard_ws_handshake_failure(
+            crate::codex_ws::standard_transport::StandardWebSocketConnectError::Rejected {
+                status_code: http::StatusCode::TOO_MANY_REQUESTS.as_u16(),
+                response_headers: BTreeMap::from([("retry-after".into(), "7".into())]),
+                error_body: Some(r#"{"error":"limited"}"#.into()),
+            },
+        );
+
+        assert_eq!(failure.status_code, 429);
+        assert_eq!(
+            failure.error_type,
+            "responses_websocket_handshake_rate_limited"
+        );
+        assert_eq!(
+            failure.route_reason,
+            "responses_websocket_account_rate_limited"
+        );
+        assert_eq!(
+            failure
+                .response_headers
+                .get("retry-after")
+                .map(String::as_str),
+            Some("7")
+        );
+        assert_eq!(
+            failure.error_body.as_deref(),
+            Some(r#"{"error":"limited"}"#)
+        );
+        assert_eq!(
+            failure.diagnostic_detail.as_deref(),
+            Some("http_status=429")
+        );
     }
 
     #[test]
