@@ -2,8 +2,8 @@ use aether_contracts::{ExecutionError, ExecutionPlan, ExecutionTelemetry};
 use aether_data_contracts::repository::candidates::RequestCandidateStatus;
 use aether_scheduler_core::SchedulerRequestCandidateStatusUpdate;
 use aether_usage_runtime::{
-    build_sync_terminal_usage_payload_seed, build_terminal_usage_context_seed,
-    usage_text_matches_risk_control,
+    build_sync_terminal_usage_payload_seed, build_terminal_usage_context_seed_with_policy,
+    usage_text_matches_risk_control, UsageBodyCapturePolicy,
 };
 use axum::body::Body;
 use axum::http::Response;
@@ -353,6 +353,7 @@ async fn record_stream_sync_failure(
     report_context: Option<&Value>,
     payload: &GatewaySyncReportRequest,
     started_at_unix_ms: Option<u64>,
+    body_capture_policy: UsageBodyCapturePolicy,
 ) {
     let error_type = stream_failure_body_field(payload, "type").unwrap_or("internal");
     let error_message = stream_failure_body_field(payload, "message").unwrap_or_default();
@@ -367,7 +368,8 @@ async fn record_stream_sync_failure(
         error_body.as_deref(),
     )
     .await;
-    let context_seed = build_terminal_usage_context_seed(plan, report_context);
+    let context_seed =
+        build_terminal_usage_context_seed_with_policy(plan, report_context, body_capture_policy);
     let payload_seed = build_sync_terminal_usage_payload_seed(payload);
     if let Err(err) = state
         .usage_runtime
@@ -600,6 +602,7 @@ pub(super) async fn handle_prefetch_provider_private_stream_error(
     buffered_body: &[u8],
     status_code: u16,
     body_json: Value,
+    body_capture_policy: UsageBodyCapturePolicy,
 ) -> Result<Option<Response<Body>>, GatewayError> {
     let failure = build_stream_failure_from_provider_error_body(status_code, &body_json);
     info!(
@@ -657,7 +660,15 @@ pub(super) async fn handle_prefetch_provider_private_stream_error(
         return Ok(None);
     }
 
-    record_stream_sync_failure(state, plan, payload.report_context.as_ref(), &payload, None).await;
+    record_stream_sync_failure(
+        state,
+        plan,
+        payload.report_context.as_ref(),
+        &payload,
+        None,
+        body_capture_policy,
+    )
+    .await;
 
     let response =
         submit_local_core_error_or_sync_finalize(state, trace_id, decision, payload).await?;
@@ -682,6 +693,7 @@ pub(super) async fn handle_prefetch_stream_failure(
     telemetry: Option<ExecutionTelemetry>,
     buffered_body: &[u8],
     failure: StreamFailureReport,
+    body_capture_policy: UsageBodyCapturePolicy,
 ) -> Result<Option<Response<Body>>, GatewayError> {
     remember_provider_session_risk_control_block_for_failure(
         state,
@@ -733,7 +745,15 @@ pub(super) async fn handle_prefetch_stream_failure(
         return Ok(None);
     }
 
-    record_stream_sync_failure(state, plan, payload.report_context.as_ref(), &payload, None).await;
+    record_stream_sync_failure(
+        state,
+        plan,
+        payload.report_context.as_ref(),
+        &payload,
+        None,
+        body_capture_policy,
+    )
+    .await;
 
     let response =
         submit_local_core_error_or_sync_finalize(state, trace_id, decision, payload).await?;
@@ -755,6 +775,7 @@ pub(super) async fn submit_midstream_stream_failure(
     buffered_body: &[u8],
     started_at_unix_ms: u64,
     failure: StreamFailureReport,
+    body_capture_policy: UsageBodyCapturePolicy,
 ) {
     remember_provider_session_risk_control_block_for_failure(
         state,
@@ -785,6 +806,7 @@ pub(super) async fn submit_midstream_stream_failure(
         payload.report_context.as_ref(),
         &payload,
         Some(started_at_unix_ms),
+        body_capture_policy,
     )
     .await;
     if let Err(err) = submit_sync_report(state, payload).await {

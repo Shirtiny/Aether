@@ -163,6 +163,18 @@ impl UsageRuntime {
         Some(worker.spawn())
     }
 
+    pub async fn resolve_body_capture_policy<T>(
+        &self,
+        data: &T,
+        user_id: Option<&str>,
+        request_id: &str,
+    ) -> UsageBodyCapturePolicy
+    where
+        T: UsageRuntimeAccess,
+    {
+        resolve_body_capture_policy_from_data(data, user_id, request_id).await
+    }
+
     pub fn record_pending<T>(&self, data: &T, seed: LifecycleUsageSeed)
     where
         T: UsageRuntimeAccess + Clone + 'static,
@@ -172,11 +184,17 @@ impl UsageRuntime {
         }
         let data = T::clone(data);
         let request_id = seed.request_id.clone();
+        let body_capture_policy = seed.body_capture_policy();
         spawn_on_usage_background_runtime(boxed_usage_task(async move {
             let now_unix_secs = now_unix_secs();
             match build_pending_usage_record_offthread(seed, now_unix_secs).await {
                 Ok(mut record) => {
-                    apply_body_capture_policy_to_record_from_data(&data, &mut record).await;
+                    apply_body_capture_policy_to_record_from_data(
+                        &data,
+                        &mut record,
+                        body_capture_policy,
+                    )
+                    .await;
                     if let Err(err) = data.upsert_usage_record(record).await {
                         warn!(
                             event_name = "usage_pending_record_failed",
@@ -216,6 +234,7 @@ impl UsageRuntime {
         let seed = seed.clone();
         let telemetry = telemetry.cloned();
         let request_id = seed.request_id.clone();
+        let body_capture_policy = seed.body_capture_policy();
         spawn_on_usage_background_runtime(boxed_usage_task(async move {
             let now_unix_secs = now_unix_secs();
             match build_streaming_usage_record_offthread(
@@ -227,7 +246,12 @@ impl UsageRuntime {
             .await
             {
                 Ok(mut record) => {
-                    apply_body_capture_policy_to_record_from_data(&data, &mut record).await;
+                    apply_body_capture_policy_to_record_from_data(
+                        &data,
+                        &mut record,
+                        body_capture_policy,
+                    )
+                    .await;
                     if let Err(err) = data.upsert_usage_record(record).await {
                         warn!(
                             event_name = "usage_stream_record_failed",
@@ -293,8 +317,10 @@ impl UsageRuntime {
         if !self.is_enabled() {
             return Ok(UsageTerminalPersistence::Disabled);
         }
+        let body_capture_policy = context_seed.body_capture_policy();
         let event = build_sync_terminal_usage_event_offthread(context_seed, payload_seed).await?;
-        self.persist_terminal_event(data, event).await
+        self.persist_terminal_event_with_resolved_policy(data, event, body_capture_policy)
+            .await
     }
 
     pub fn record_stream_terminal<T>(
@@ -341,10 +367,12 @@ impl UsageRuntime {
         if !self.is_enabled() {
             return Ok(UsageTerminalPersistence::Disabled);
         }
+        let body_capture_policy = context_seed.body_capture_policy();
         let event =
             build_stream_terminal_usage_event_offthread(context_seed, payload_seed, cancelled)
                 .await?;
-        self.persist_terminal_event(data, event).await
+        self.persist_terminal_event_with_resolved_policy(data, event, body_capture_policy)
+            .await
     }
 
     pub fn submit_terminal_event<T>(&self, data: &T, event: UsageEvent)
@@ -380,7 +408,20 @@ impl UsageRuntime {
     pub async fn persist_terminal_event<T>(
         &self,
         data: &T,
+        event: UsageEvent,
+    ) -> Result<UsageTerminalPersistence, DataLayerError>
+    where
+        T: UsageRuntimeAccess,
+    {
+        self.persist_terminal_event_with_resolved_policy(data, event, None)
+            .await
+    }
+
+    async fn persist_terminal_event_with_resolved_policy<T>(
+        &self,
+        data: &T,
         mut event: UsageEvent,
+        body_capture_policy: Option<UsageBodyCapturePolicy>,
     ) -> Result<UsageTerminalPersistence, DataLayerError>
     where
         T: UsageRuntimeAccess,
@@ -388,7 +429,7 @@ impl UsageRuntime {
         if !self.is_enabled() {
             return Ok(UsageTerminalPersistence::Disabled);
         }
-        apply_body_capture_policy_from_data(data, &mut event).await;
+        apply_body_capture_policy_from_data(data, &mut event, body_capture_policy).await;
         if let Err(err) = data.enrich_usage_event(&mut event).await {
             warn!(
                 event_name = "usage_terminal_billing_enrichment_failed",
@@ -417,10 +458,50 @@ impl UsageRuntime {
         }
     }
 
+    pub async fn record_terminal_event_direct_with_policy<T>(
+        &self,
+        data: &T,
+        event: UsageEvent,
+        body_capture_policy: UsageBodyCapturePolicy,
+    ) where
+        T: UsageRuntimeAccess,
+    {
+        let request_id = event.request_id.clone();
+        if let Err(err) = self
+            .persist_terminal_event_direct_with_resolved_policy(
+                data,
+                event,
+                Some(body_capture_policy),
+            )
+            .await
+        {
+            warn!(
+                event_name = "usage_terminal_direct_persist_failed",
+                log_type = "event",
+                request_id = %request_id,
+                error = %err,
+                "usage runtime failed to directly persist terminal usage"
+            );
+        }
+    }
+
     pub async fn persist_terminal_event_direct<T>(
         &self,
         data: &T,
+        event: UsageEvent,
+    ) -> Result<UsageTerminalPersistence, DataLayerError>
+    where
+        T: UsageRuntimeAccess,
+    {
+        self.persist_terminal_event_direct_with_resolved_policy(data, event, None)
+            .await
+    }
+
+    async fn persist_terminal_event_direct_with_resolved_policy<T>(
+        &self,
+        data: &T,
         mut event: UsageEvent,
+        body_capture_policy: Option<UsageBodyCapturePolicy>,
     ) -> Result<UsageTerminalPersistence, DataLayerError>
     where
         T: UsageRuntimeAccess,
@@ -428,7 +509,7 @@ impl UsageRuntime {
         if !self.is_enabled() {
             return Ok(UsageTerminalPersistence::Disabled);
         }
-        apply_body_capture_policy_from_data(data, &mut event).await;
+        apply_body_capture_policy_from_data(data, &mut event, body_capture_policy).await;
         if let Err(err) = data.enrich_usage_event(&mut event).await {
             warn!(
                 event_name = "usage_terminal_billing_enrichment_failed",
@@ -559,48 +640,68 @@ fn join_error_to_data_layer(err: tokio::task::JoinError) -> DataLayerError {
     DataLayerError::UnexpectedValue(format!("usage builder task join failed: {err}"))
 }
 
-async fn apply_body_capture_policy_from_data<T>(data: &T, event: &mut UsageEvent)
-where
+async fn apply_body_capture_policy_from_data<T>(
+    data: &T,
+    event: &mut UsageEvent,
+    body_capture_policy: Option<UsageBodyCapturePolicy>,
+) where
     T: UsageRuntimeAccess,
 {
-    match data
-        .body_capture_policy_for_user(event.data.user_id.as_deref())
-        .await
-    {
-        Ok(policy) => apply_usage_body_capture_policy_to_event(policy, event),
-        Err(err) => {
-            warn!(
-                event_name = "usage_body_capture_policy_read_failed",
-                log_type = "event",
-                request_id = %event.request_id,
-                fallback = "default",
-                error = %err,
-                "usage runtime failed to read body capture policy; keeping default capture"
-            );
-            apply_usage_body_capture_policy_to_event(UsageBodyCapturePolicy::default(), event);
+    let policy = match body_capture_policy {
+        Some(policy) => policy,
+        None => {
+            resolve_body_capture_policy_from_data(
+                data,
+                event.data.user_id.as_deref(),
+                event.request_id.as_str(),
+            )
+            .await
         }
-    }
+    };
+    apply_usage_body_capture_policy_to_event(policy, event);
 }
 
-async fn apply_body_capture_policy_to_record_from_data<T>(data: &T, record: &mut UpsertUsageRecord)
+async fn apply_body_capture_policy_to_record_from_data<T>(
+    data: &T,
+    record: &mut UpsertUsageRecord,
+    body_capture_policy: Option<UsageBodyCapturePolicy>,
+) where
+    T: UsageRuntimeAccess,
+{
+    let policy = match body_capture_policy {
+        Some(policy) => policy,
+        None => {
+            resolve_body_capture_policy_from_data(
+                data,
+                record.user_id.as_deref(),
+                record.request_id.as_str(),
+            )
+            .await
+        }
+    };
+    apply_usage_body_capture_policy_to_record(policy, record);
+}
+
+async fn resolve_body_capture_policy_from_data<T>(
+    data: &T,
+    user_id: Option<&str>,
+    request_id: &str,
+) -> UsageBodyCapturePolicy
 where
     T: UsageRuntimeAccess,
 {
-    match data
-        .body_capture_policy_for_user(record.user_id.as_deref())
-        .await
-    {
-        Ok(policy) => apply_usage_body_capture_policy_to_record(policy, record),
+    match data.body_capture_policy_for_user(user_id).await {
+        Ok(policy) => policy,
         Err(err) => {
             warn!(
                 event_name = "usage_body_capture_policy_read_failed",
                 log_type = "event",
-                request_id = %record.request_id,
+                request_id,
                 fallback = "default",
                 error = %err,
                 "usage runtime failed to read body capture policy; keeping default capture"
             );
-            apply_usage_body_capture_policy_to_record(UsageBodyCapturePolicy::default(), record);
+            UsageBodyCapturePolicy::default()
         }
     }
 }
@@ -621,6 +722,7 @@ fn now_unix_secs() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use aether_data_contracts::repository::settlement::{
@@ -647,6 +749,7 @@ mod tests {
     struct NoRedisUsageStore {
         records: Mutex<Vec<UpsertUsageRecord>>,
         proxy_counter_calls: Mutex<Vec<(String, String)>>,
+        body_capture_policy_reads: AtomicUsize,
     }
 
     struct QueueConfiguredUsageStore {
@@ -704,6 +807,7 @@ mod tests {
         }
     }
 
+    #[async_trait]
     impl UsageRuntimeAccess for NoRedisUsageStore {
         fn has_usage_writer(&self) -> bool {
             true
@@ -715,6 +819,15 @@ mod tests {
 
         fn usage_worker_queue(&self) -> Option<Arc<dyn RuntimeQueueStore>> {
             None
+        }
+
+        async fn body_capture_policy_for_user(
+            &self,
+            _user_id: Option<&str>,
+        ) -> Result<UsageBodyCapturePolicy, DataLayerError> {
+            self.body_capture_policy_reads
+                .fetch_add(1, Ordering::SeqCst);
+            Ok(UsageBodyCapturePolicy::default())
         }
     }
 
@@ -864,6 +977,53 @@ mod tests {
         assert_eq!(records[0].status, "failed");
         assert_eq!(records[0].billing_status, "void");
         assert_eq!(records[0].status_code, Some(503));
+    }
+
+    #[tokio::test]
+    async fn resolved_body_capture_policy_is_reused_without_another_data_read() {
+        let runtime = UsageRuntime::new(UsageRuntimeConfig {
+            enabled: true,
+            ..UsageRuntimeConfig::default()
+        })
+        .expect("usage runtime should build");
+        let store = NoRedisUsageStore::default();
+        let policy = runtime
+            .resolve_body_capture_policy(&store, Some("user-1"), "req-policy-once-1")
+            .await;
+        assert_eq!(store.body_capture_policy_reads.load(Ordering::SeqCst), 1);
+
+        runtime
+            .record_terminal_event_direct_with_policy(
+                &store,
+                UsageEvent::new(
+                    UsageEventType::Completed,
+                    "req-policy-once-1",
+                    UsageEventData {
+                        user_id: Some("user-1".to_string()),
+                        provider_name: "openai".to_string(),
+                        model: "gpt-5".to_string(),
+                        status_code: Some(200),
+                        ..UsageEventData::default()
+                    },
+                ),
+                policy,
+            )
+            .await;
+
+        assert_eq!(store.body_capture_policy_reads.load(Ordering::SeqCst), 1);
+        assert_eq!(store.records.lock().expect("records lock").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn capture_policy_resolution_is_independent_of_runtime_enablement() {
+        let runtime = UsageRuntime::disabled();
+        let store = NoRedisUsageStore::default();
+
+        let _ = runtime
+            .resolve_body_capture_policy(&store, Some("user-1"), "req-policy-disabled-1")
+            .await;
+
+        assert_eq!(store.body_capture_policy_reads.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

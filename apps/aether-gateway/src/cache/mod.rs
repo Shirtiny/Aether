@@ -14,4 +14,4 @@ pub(crate) use proxy_node::ProxyNodeCache;
 pub(crate) use scheduler_affinity::{
     SchedulerAffinityCache, SchedulerAffinitySnapshotEntry, SchedulerAffinityTarget,
 };
-pub(crate) use system_config::SystemConfigCache;
+pub(crate) use system_config::{SystemConfigCache, SYSTEM_CONFIG_CACHE_TTL};

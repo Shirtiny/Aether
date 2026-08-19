@@ -2,9 +2,11 @@ use aether_data::{DataBackends, DataLayerError, DatabaseDriver};
 use aether_data_contracts::repository::candidate_selection::MinimalCandidateSelectionReadRepository;
 use aether_data_contracts::repository::provider_catalog::ProviderCatalogReadRepository;
 use aether_runtime_state::RuntimeQueueStore;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use super::{GatewayDataConfig, GatewayDataState, StoredSystemConfigEntry};
+use crate::cache::{SystemConfigCache, SYSTEM_CONFIG_CACHE_TTL};
 
 fn current_system_config_updated_at_unix_secs() -> u64 {
     std::time::SystemTime::now()
@@ -64,6 +66,7 @@ impl GatewayDataState {
                 wallet_writer: None,
                 settlement_writer: None,
                 system_config_values: None,
+                system_config_cache: Arc::new(SystemConfigCache::default()),
             });
         }
 
@@ -166,7 +169,12 @@ impl GatewayDataState {
             wallet_writer,
             settlement_writer,
             system_config_values: None,
+            system_config_cache: Arc::new(SystemConfigCache::default()),
         })
+    }
+
+    pub(crate) fn clear_system_config_cache(&self) {
+        self.system_config_cache.clear();
     }
 
     pub(crate) fn has_backends(&self) -> bool {
@@ -401,16 +409,13 @@ impl GatewayDataState {
                 .get(key)
                 .map(|entry| entry.value.clone()));
         }
-        let Some(backends) = self.backends.as_ref() else {
-            return Ok(None);
-        };
-        backends.find_system_config_value(key).await
+        Ok(self.find_system_config_values(&[key]).await?.remove(key))
     }
 
     pub(crate) async fn find_system_config_values(
         &self,
         keys: &[&str],
-    ) -> Result<std::collections::BTreeMap<String, serde_json::Value>, DataLayerError> {
+    ) -> Result<BTreeMap<String, serde_json::Value>, DataLayerError> {
         if let Some(values) = &self.system_config_values {
             let values = values.read().expect("system config values lock");
             return Ok(keys
@@ -422,10 +427,54 @@ impl GatewayDataState {
                 })
                 .collect());
         }
-        let Some(backends) = self.backends.as_ref() else {
-            return Ok(std::collections::BTreeMap::new());
+
+        let unique_keys = keys.iter().copied().collect::<BTreeSet<_>>();
+        let mut resolved = BTreeMap::new();
+        let mut misses = Vec::new();
+        for key in &unique_keys {
+            match self.system_config_cache.get(key, SYSTEM_CONFIG_CACHE_TTL) {
+                Some(Some(value)) => {
+                    resolved.insert((*key).to_string(), value);
+                }
+                Some(None) => {}
+                None => misses.push(*key),
+            }
+        }
+        if misses.is_empty() {
+            return Ok(resolved);
+        }
+
+        let _reload = self.system_config_cache.lock_reload().await;
+        let mut cold_keys = Vec::new();
+        for key in misses {
+            match self.system_config_cache.get(key, SYSTEM_CONFIG_CACHE_TTL) {
+                Some(Some(value)) => {
+                    resolved.insert(key.to_string(), value);
+                }
+                Some(None) => {}
+                None => cold_keys.push(key),
+            }
+        }
+        if cold_keys.is_empty() {
+            return Ok(resolved);
+        }
+
+        let loaded = match self.backends.as_ref() {
+            Some(backends) => backends.find_system_config_values(&cold_keys).await?,
+            None => BTreeMap::new(),
         };
-        backends.find_system_config_values(keys).await
+        for key in cold_keys {
+            let value = loaded.get(key).cloned();
+            self.system_config_cache.insert(
+                key.to_string(),
+                value.clone(),
+                SYSTEM_CONFIG_CACHE_TTL,
+            );
+            if let Some(value) = value {
+                resolved.insert(key.to_string(), value);
+            }
+        }
+        Ok(resolved)
     }
 
     pub(crate) async fn upsert_system_config_value(
@@ -477,20 +526,30 @@ impl GatewayDataState {
             values.insert(key.to_string(), entry.clone());
             return Ok(entry);
         }
-        if let Some(backends) = self.backends.as_ref() {
-            if let Some(entry) = backends
+        let _reload = self.system_config_cache.lock_reload().await;
+        let entry = match self.backends.as_ref() {
+            Some(backends) => backends
                 .upsert_system_config_entry(key, value, description)
                 .await?
-            {
-                return Ok(entry);
-            }
-        }
-        Ok(StoredSystemConfigEntry {
-            key: key.to_string(),
-            value: value.clone(),
-            description: description.map(ToOwned::to_owned),
-            updated_at_unix_secs: Some(current_system_config_updated_at_unix_secs()),
-        })
+                .unwrap_or_else(|| StoredSystemConfigEntry {
+                    key: key.to_string(),
+                    value: value.clone(),
+                    description: description.map(ToOwned::to_owned),
+                    updated_at_unix_secs: Some(current_system_config_updated_at_unix_secs()),
+                }),
+            None => StoredSystemConfigEntry {
+                key: key.to_string(),
+                value: value.clone(),
+                description: description.map(ToOwned::to_owned),
+                updated_at_unix_secs: Some(current_system_config_updated_at_unix_secs()),
+            },
+        };
+        self.system_config_cache.insert(
+            key.to_string(),
+            Some(entry.value.clone()),
+            SYSTEM_CONFIG_CACHE_TTL,
+        );
+        Ok(entry)
     }
 
     pub(crate) async fn delete_system_config_value(
@@ -504,10 +563,14 @@ impl GatewayDataState {
                 .remove(key)
                 .is_some());
         }
-        let Some(backends) = self.backends.as_ref() else {
-            return Ok(false);
+        let _reload = self.system_config_cache.lock_reload().await;
+        let deleted = match self.backends.as_ref() {
+            Some(backends) => backends.delete_system_config_value(key).await?,
+            None => false,
         };
-        backends.delete_system_config_value(key).await
+        self.system_config_cache
+            .insert(key.to_string(), None, SYSTEM_CONFIG_CACHE_TTL);
+        Ok(deleted)
     }
 
     pub(crate) async fn read_admin_system_stats(
@@ -537,10 +600,23 @@ impl GatewayDataState {
                 return Ok(summary);
             }
         }
-        match self.backends.as_ref() {
+        let config_purge = matches!(
+            target,
+            aether_data::repository::system::AdminSystemPurgeTarget::Config
+        );
+        let _reload = if config_purge {
+            Some(self.system_config_cache.lock_reload().await)
+        } else {
+            None
+        };
+        let summary = match self.backends.as_ref() {
             Some(backends) => backends.purge_admin_system_data(target).await,
             None => Ok(aether_data::repository::system::AdminSystemPurgeSummary::default()),
+        }?;
+        if config_purge {
+            self.system_config_cache.clear();
         }
+        Ok(summary)
     }
 
     pub(crate) async fn export_admin_system_usage_aggregates(

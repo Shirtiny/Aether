@@ -1279,6 +1279,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
     let codex_ws_usage_reporter = state.spawn_codex_ws_usage_reporter()?;
+    let shutdown_state = state.clone();
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     let public_base_url = resolve_local_http_base_url(app_port)?;
     let frontdoor_health_url = format!("{public_base_url}/_gateway/health");
@@ -1322,6 +1323,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(background_tasks) = background_tasks {
         background_tasks.shutdown().await;
+    }
+    if let Err(error) = shutdown_state
+        .flush_usage_prompt_capture_observations()
+        .await
+    {
+        warn!(
+            event_name = "usage_prompt_capture_shutdown_flush_failed",
+            log_type = "ops",
+            error = %error,
+            "gateway could not flush prompt capture observations during shutdown"
+        );
     }
     serve_result?;
     Ok(())

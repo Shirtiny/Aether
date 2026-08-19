@@ -1040,6 +1040,15 @@ impl GatewayDataState {
         }
     }
 
+    pub(crate) async fn flush_usage_prompt_capture_observations(
+        &self,
+    ) -> Result<(), DataLayerError> {
+        match &self.usage_writer {
+            Some(repository) => repository.flush_usage_prompt_capture_observations().await,
+            None => Ok(()),
+        }
+    }
+
     pub(crate) async fn cleanup_processed_usage_counter_deltas(
         &self,
         cutoff_unix_secs: u64,

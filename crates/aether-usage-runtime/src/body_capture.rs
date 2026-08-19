@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io::{self, Write};
 
 use aether_data_contracts::repository::usage::{
@@ -127,12 +128,14 @@ impl UsageBodyCaptureEngine {
     }
 
     fn apply_to_payload(self, payload: UsageBodyCapturePayloadMut<'_>) {
-        append_prompt_capture_metadata(
-            payload.request_metadata,
-            self.policy.prompt_capture,
-            payload.request_body.as_ref(),
-            payload.provider_request_body.as_ref(),
-        );
+        if !metadata_has_prompt_capture(payload.request_metadata.as_ref()) {
+            append_prompt_capture_metadata(
+                payload.request_metadata,
+                self.policy.prompt_capture,
+                payload.request_body.as_ref(),
+                payload.provider_request_body.as_ref(),
+            );
+        }
 
         if matches!(self.policy.record_level, UsageRequestRecordLevel::Basic) {
             disable_usage_body_capture_field(
@@ -741,7 +744,34 @@ struct CapturedPrompt {
     source: String,
     index: Option<usize>,
     role: PromptCaptureRole,
-    text: String,
+    sha256: [u8; 32],
+    chars: usize,
+    preview: String,
+    truncated: bool,
+}
+
+#[derive(Debug)]
+struct PromptTextSummary {
+    sha256: [u8; 32],
+    chars: usize,
+    preview: String,
+    truncated: bool,
+}
+
+pub(crate) fn build_prompt_capture_metadata(
+    policy: UsagePromptCapturePolicy,
+    request_body: Option<&Value>,
+    provider_request_body: Option<&Value>,
+) -> Option<Value> {
+    let mut metadata = None;
+    append_prompt_capture_metadata(&mut metadata, policy, request_body, provider_request_body);
+    metadata
+}
+
+fn metadata_has_prompt_capture(metadata: Option<&Value>) -> bool {
+    metadata
+        .and_then(Value::as_object)
+        .is_some_and(|object| object.contains_key("prompt_capture"))
 }
 
 fn append_prompt_capture_metadata(
@@ -754,14 +784,12 @@ fn append_prompt_capture_metadata(
         return;
     }
 
-    let mut prompts = Vec::new();
-    if let Some(body) = request_body {
-        collect_prompt_capture_items("request", body, policy, &mut prompts);
-    }
+    let mut prompts = request_body
+        .map(|body| collect_prompt_capture_items("request", body, policy))
+        .unwrap_or_default();
     if prompts.len() < policy.max_items {
         if let Some(body) = provider_request_body {
-            let mut provider_prompts = Vec::new();
-            collect_prompt_capture_items("provider_request", body, policy, &mut provider_prompts);
+            let provider_prompts = collect_prompt_capture_items("provider_request", body, policy);
             append_supplemental_prompt_capture_items(
                 &mut prompts,
                 provider_prompts,
@@ -776,7 +804,7 @@ fn append_prompt_capture_metadata(
     prompts.truncate(policy.max_items);
     let items = prompts
         .iter()
-        .map(|prompt| prompt_capture_item_value(prompt, policy.preview_chars))
+        .map(prompt_capture_item_value)
         .collect::<Vec<_>>();
     let mut role_counts = Map::new();
     for prompt in &prompts {
@@ -819,10 +847,12 @@ fn append_supplemental_prompt_capture_items(
         if selected.len() >= remaining {
             break;
         }
-        if output.iter().any(|prompt| prompt.text == candidate.text)
+        if output
+            .iter()
+            .any(|prompt| prompt.sha256 == candidate.sha256)
             || selected
                 .iter()
-                .any(|prompt: &CapturedPrompt| prompt.text == candidate.text)
+                .any(|prompt: &CapturedPrompt| prompt.sha256 == candidate.sha256)
         {
             continue;
         }
@@ -832,77 +862,122 @@ fn append_supplemental_prompt_capture_items(
     output.extend(selected);
 }
 
-fn collect_prompt_capture_items(
+fn collect_prompt_capture_items<'a>(
     source: &str,
-    value: &Value,
+    value: &'a Value,
     policy: UsagePromptCapturePolicy,
-    output: &mut Vec<CapturedPrompt>,
-) {
-    collect_top_level_prompt_fields(source, value, policy, output);
-    collect_message_prompts(source, value, policy, output);
+) -> Vec<CapturedPrompt> {
+    let mut output = Vec::with_capacity(policy.max_items.min(32));
+    let mut seen = HashSet::with_capacity(policy.max_items.min(32));
+    let mut seen_raw_texts = Vec::with_capacity(policy.max_items.min(32));
+    collect_message_prompts_reverse(
+        source,
+        value,
+        policy,
+        &mut output,
+        &mut seen,
+        &mut seen_raw_texts,
+    );
+    collect_top_level_prompt_fields_reverse(
+        source,
+        value,
+        policy,
+        &mut output,
+        &mut seen,
+        &mut seen_raw_texts,
+    );
+    output.reverse();
+    output
 }
 
-fn collect_top_level_prompt_fields(
+fn collect_top_level_prompt_fields_reverse<'a>(
     source: &str,
-    value: &Value,
+    value: &'a Value,
     policy: UsagePromptCapturePolicy,
     output: &mut Vec<CapturedPrompt>,
+    seen: &mut HashSet<[u8; 32]>,
+    seen_raw_texts: &mut Vec<&'a str>,
 ) {
     let Some(object) = value.as_object() else {
         return;
     };
-    for key in [
-        "instructions",
-        "system",
-        "system_instruction",
-        "systemInstruction",
-    ] {
-        collect_text_values_for_role(
-            format!("{source}.{key}"),
-            object.get(key),
-            PromptCaptureRole::System,
-            policy,
-            output,
-            None,
-        );
-    }
     if object.get("input").is_some_and(Value::is_string) {
-        collect_text_values_for_role(
+        collect_text_values_for_role_reverse(
             format!("{source}.input"),
             object.get("input"),
             PromptCaptureRole::User,
             policy,
             output,
+            seen,
+            seen_raw_texts,
+            None,
+        );
+    }
+    for key in [
+        "systemInstruction",
+        "system_instruction",
+        "system",
+        "instructions",
+    ] {
+        if output.len() >= policy.max_items {
+            return;
+        }
+        collect_text_values_for_role_reverse(
+            format!("{source}.{key}"),
+            object.get(key),
+            PromptCaptureRole::System,
+            policy,
+            output,
+            seen,
+            seen_raw_texts,
             None,
         );
     }
 }
 
-fn collect_message_prompts(
+fn collect_message_prompts_reverse<'a>(
     source: &str,
-    value: &Value,
+    value: &'a Value,
     policy: UsagePromptCapturePolicy,
     output: &mut Vec<CapturedPrompt>,
+    seen: &mut HashSet<[u8; 32]>,
+    seen_raw_texts: &mut Vec<&'a str>,
 ) {
     let Some(object) = value.as_object() else {
         return;
     };
-    for key in ["input", "messages", "contents"] {
-        collect_message_array(source, key, object.get(key), policy, output);
+    for key in ["contents", "messages", "input"] {
+        if output.len() >= policy.max_items {
+            return;
+        }
+        collect_message_array_reverse(
+            source,
+            key,
+            object.get(key),
+            policy,
+            output,
+            seen,
+            seen_raw_texts,
+        );
     }
 }
 
-fn collect_message_array(
+fn collect_message_array_reverse<'a>(
     source: &str,
     array_key: &str,
-    value: Option<&Value>,
+    value: Option<&'a Value>,
     policy: UsagePromptCapturePolicy,
     output: &mut Vec<CapturedPrompt>,
+    seen: &mut HashSet<[u8; 32]>,
+    seen_raw_texts: &mut Vec<&'a str>,
 ) {
     let Some(Value::Array(items)) = value else {
         return;
     };
-    for (message_index, item) in items.iter().enumerate() {
+    for (message_index, item) in items.iter().enumerate().rev() {
+        if output.len() >= policy.max_items {
+            return;
+        }
         let Some(object) = item.as_object() else {
             continue;
         };
@@ -916,43 +991,64 @@ fn collect_message_array(
         if !prompt_capture_role_enabled(policy, role) {
             continue;
         }
-        for key in ["content", "text", "parts"] {
-            collect_text_values_for_role(
+        for key in ["parts", "text", "content"] {
+            if output.len() >= policy.max_items {
+                return;
+            }
+            collect_text_values_for_role_reverse(
                 format!("{source}.{array_key}[{message_index}].{key}"),
                 object.get(key),
                 role,
                 policy,
                 output,
+                seen,
+                seen_raw_texts,
                 Some(message_index),
             );
         }
     }
 }
 
-fn collect_text_values_for_role(
+fn collect_text_values_for_role_reverse<'a>(
     source: String,
-    value: Option<&Value>,
+    value: Option<&'a Value>,
     role: PromptCaptureRole,
     policy: UsagePromptCapturePolicy,
     output: &mut Vec<CapturedPrompt>,
+    seen: &mut HashSet<[u8; 32]>,
+    seen_raw_texts: &mut Vec<&'a str>,
     index: Option<usize>,
 ) {
-    if !prompt_capture_role_enabled(policy, role) {
+    if output.len() >= policy.max_items || !prompt_capture_role_enabled(policy, role) {
         return;
     }
     let Some(value) = value else {
         return;
     };
     match value {
-        Value::String(text) => push_prompt_text(source, index, role, text, policy, output),
+        Value::String(text) => push_prompt_text(
+            source,
+            index,
+            role,
+            text,
+            policy,
+            output,
+            seen,
+            seen_raw_texts,
+        ),
         Value::Array(items) => {
-            for (item_index, item) in items.iter().enumerate() {
-                collect_text_values_for_role(
+            for (item_index, item) in items.iter().enumerate().rev() {
+                if output.len() >= policy.max_items {
+                    return;
+                }
+                collect_text_values_for_role_reverse(
                     format!("{source}[{item_index}]"),
                     Some(item),
                     role,
                     policy,
                     output,
+                    seen,
+                    seen_raw_texts,
                     index,
                 );
             }
@@ -966,13 +1062,18 @@ fn collect_text_values_for_role(
             {
                 return;
             }
-            for key in ["text", "content", "input"] {
-                collect_text_values_for_role(
+            for key in ["input", "content", "text"] {
+                if output.len() >= policy.max_items {
+                    return;
+                }
+                collect_text_values_for_role_reverse(
                     format!("{source}.{key}"),
                     object.get(key),
                     role,
                     policy,
                     output,
+                    seen,
+                    seen_raw_texts,
                     index,
                 );
             }
@@ -981,32 +1082,38 @@ fn collect_text_values_for_role(
     }
 }
 
-fn push_prompt_text(
+#[allow(clippy::too_many_arguments)]
+fn push_prompt_text<'a>(
     source: String,
     index: Option<usize>,
     role: PromptCaptureRole,
-    text: &str,
+    text: &'a str,
     policy: UsagePromptCapturePolicy,
     output: &mut Vec<CapturedPrompt>,
+    seen: &mut HashSet<[u8; 32]>,
+    seen_raw_texts: &mut Vec<&'a str>,
 ) {
-    if policy.max_items == 0 {
-        return;
-    }
-    let normalized = normalize_prompt_text(text);
-    if normalized.is_empty() {
-        return;
-    }
-    if let Some(existing_index) = output.iter().position(|prompt| prompt.text == normalized) {
-        output.remove(existing_index);
-    }
     if output.len() >= policy.max_items {
-        output.remove(0);
+        return;
     }
+    if seen_raw_texts.iter().any(|seen| *seen == text) {
+        return;
+    }
+    let Some(summary) = summarize_prompt_text(text, policy.preview_chars) else {
+        return;
+    };
+    if !seen.insert(summary.sha256) {
+        return;
+    }
+    seen_raw_texts.push(text);
     output.push(CapturedPrompt {
         source,
         index,
         role,
-        text: normalized,
+        sha256: summary.sha256,
+        chars: summary.chars,
+        preview: summary.preview,
+        truncated: summary.truncated,
     });
 }
 
@@ -1033,33 +1140,54 @@ fn prompt_capture_role_enabled(policy: UsagePromptCapturePolicy, role: PromptCap
     }
 }
 
-fn prompt_capture_item_value(prompt: &CapturedPrompt, preview_chars: usize) -> Value {
-    let normalized = &prompt.text;
-    let preview = truncate_chars(normalized, preview_chars);
+fn prompt_capture_item_value(prompt: &CapturedPrompt) -> Value {
     json!({
         "source": prompt.source,
         "index": prompt.index,
         "role": prompt.role.as_str(),
-        "sha256": sha256_hex(normalized.as_bytes()),
-        "chars": normalized.chars().count(),
-        "preview": preview,
-        "truncated": preview.chars().count() < normalized.chars().count()
+        "sha256": sha256_hex(&prompt.sha256),
+        "chars": prompt.chars,
+        "preview": prompt.preview,
+        "truncated": prompt.truncated
     })
 }
 
-fn normalize_prompt_text(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
+fn summarize_prompt_text(text: &str, preview_chars: usize) -> Option<PromptTextSummary> {
+    let mut hasher = Sha256::new();
+    let mut preview = String::new();
+    let mut normalized_chars = 0usize;
+    let mut preview_len = 0usize;
+    let mut has_token = false;
 
-fn truncate_chars(value: &str, max_chars: usize) -> String {
-    if max_chars == 0 {
-        return String::new();
+    for token in text.split_whitespace() {
+        if has_token {
+            hasher.update(b" ");
+            normalized_chars = normalized_chars.saturating_add(1);
+            if preview_len < preview_chars {
+                preview.push(' ');
+                preview_len += 1;
+            }
+        }
+        has_token = true;
+        hasher.update(token.as_bytes());
+        for character in token.chars() {
+            normalized_chars = normalized_chars.saturating_add(1);
+            if preview_len < preview_chars {
+                preview.push(character);
+                preview_len += 1;
+            }
+        }
     }
-    value.chars().take(max_chars).collect()
+
+    has_token.then(|| PromptTextSummary {
+        sha256: hasher.finalize().into(),
+        chars: normalized_chars,
+        truncated: preview_len < normalized_chars,
+        preview,
+    })
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
+fn sha256_hex(digest: &[u8; 32]) -> String {
     let mut hex = String::with_capacity(digest.len() * 2);
     for byte in digest {
         use std::fmt::Write as _;
@@ -1071,9 +1199,10 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_plan_body_capture_metadata, sync_usage_body_ref_metadata,
+        build_plan_body_capture_metadata, build_prompt_capture_metadata,
+        prompt_capture_role_enabled, prompt_capture_role_from_str, sync_usage_body_ref_metadata,
         trim_owned_non_empty_string, truncate_usage_body_string,
-        upsert_body_capture_metadata_value_entry,
+        upsert_body_capture_metadata_value_entry, PromptCaptureRole,
     };
     use crate::runtime::{UsageBodyCapturePolicy, UsagePromptCapturePolicy};
     use crate::{apply_usage_body_capture_policy_to_record, UsageRequestRecordLevel};
@@ -1081,6 +1210,8 @@ mod tests {
         UpsertUsageRecord, UsageBodyCaptureState, UsageBodyField,
     };
     use serde_json::{json, Map, Value};
+    use sha2::{Digest, Sha256};
+    use std::time::Instant;
 
     #[test]
     fn build_plan_body_capture_metadata_returns_none_without_base64_body() {
@@ -1232,6 +1363,48 @@ mod tests {
         assert!(prompt_capture["items"][0]["sha256"]
             .as_str()
             .is_some_and(|hash| hash.len() == 64));
+    }
+
+    #[test]
+    fn prompt_capture_metadata_reuses_precomputed_items() {
+        let mut record = sample_usage_record();
+        record.request_body = Some(json!({
+            "messages": [{"role": "user", "content": "body should not replace metadata"}]
+        }));
+        record.request_metadata = Some(json!({
+            "prompt_capture": {
+                "version": 1,
+                "item_count": 1,
+                "items": [{
+                    "source": "request.messages[0].content",
+                    "role": "user",
+                    "sha256": "a".repeat(64),
+                    "chars": 11,
+                    "preview": "precomputed",
+                    "truncated": false
+                }]
+            }
+        }));
+
+        apply_usage_body_capture_policy_to_record(
+            UsageBodyCapturePolicy {
+                record_level: UsageRequestRecordLevel::Basic,
+                prompt_capture: UsagePromptCapturePolicy {
+                    enabled: true,
+                    ..UsagePromptCapturePolicy::default()
+                },
+                ..UsageBodyCapturePolicy::default()
+            },
+            &mut record,
+        );
+
+        assert_eq!(
+            record
+                .request_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.pointer("/prompt_capture/items/0/preview")),
+            Some(&json!("precomputed"))
+        );
     }
 
     #[test]
@@ -1471,6 +1644,405 @@ mod tests {
             .expect("items should be an array")
             .iter()
             .any(|item| item["preview"] == json!("system prompt")));
+    }
+
+    #[derive(Debug, Clone)]
+    struct LegacyCapturedPrompt {
+        source: String,
+        index: Option<usize>,
+        role: PromptCaptureRole,
+        text: String,
+    }
+
+    fn legacy_prompt_capture_metadata(
+        policy: UsagePromptCapturePolicy,
+        request_body: Option<&Value>,
+        provider_request_body: Option<&Value>,
+    ) -> Option<Value> {
+        if !policy.enabled || policy.max_items == 0 {
+            return None;
+        }
+        let mut prompts = request_body
+            .map(|body| legacy_collect_prompt_capture_items("request", body, policy))
+            .unwrap_or_default();
+        if prompts.len() < policy.max_items {
+            if let Some(body) = provider_request_body {
+                let candidates =
+                    legacy_collect_prompt_capture_items("provider_request", body, policy);
+                let remaining = policy.max_items.saturating_sub(prompts.len());
+                let mut selected = Vec::new();
+                for candidate in candidates.into_iter().rev() {
+                    if selected.len() >= remaining {
+                        break;
+                    }
+                    if prompts.iter().any(|prompt| prompt.text == candidate.text)
+                        || selected
+                            .iter()
+                            .any(|prompt: &LegacyCapturedPrompt| prompt.text == candidate.text)
+                    {
+                        continue;
+                    }
+                    selected.push(candidate);
+                }
+                selected.reverse();
+                prompts.extend(selected);
+            }
+        }
+        if prompts.is_empty() {
+            return None;
+        }
+        prompts.truncate(policy.max_items);
+
+        let mut role_counts = Map::new();
+        for prompt in &prompts {
+            let role = prompt.role.as_str().to_string();
+            let count = role_counts
+                .get(&role)
+                .and_then(Value::as_u64)
+                .unwrap_or_default()
+                .saturating_add(1);
+            role_counts.insert(role, json!(count));
+        }
+        let items = prompts
+            .iter()
+            .map(|prompt| legacy_prompt_capture_item(prompt, policy.preview_chars))
+            .collect::<Vec<_>>();
+        Some(json!({
+            "prompt_capture": {
+                "version": 1,
+                "items": items,
+                "item_count": prompts.len(),
+                "role_counts": role_counts
+            }
+        }))
+    }
+
+    fn legacy_collect_prompt_capture_items(
+        source: &str,
+        value: &Value,
+        policy: UsagePromptCapturePolicy,
+    ) -> Vec<LegacyCapturedPrompt> {
+        let mut output = Vec::new();
+        let Some(object) = value.as_object() else {
+            return output;
+        };
+        for key in [
+            "instructions",
+            "system",
+            "system_instruction",
+            "systemInstruction",
+        ] {
+            legacy_collect_text_values(
+                format!("{source}.{key}"),
+                object.get(key),
+                PromptCaptureRole::System,
+                policy,
+                &mut output,
+                None,
+            );
+        }
+        if object.get("input").is_some_and(Value::is_string) {
+            legacy_collect_text_values(
+                format!("{source}.input"),
+                object.get("input"),
+                PromptCaptureRole::User,
+                policy,
+                &mut output,
+                None,
+            );
+        }
+        for array_key in ["input", "messages", "contents"] {
+            let Some(Value::Array(items)) = object.get(array_key) else {
+                continue;
+            };
+            for (message_index, item) in items.iter().enumerate() {
+                let Some(message) = item.as_object() else {
+                    continue;
+                };
+                let Some(role) = message
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .and_then(prompt_capture_role_from_str)
+                else {
+                    continue;
+                };
+                if !prompt_capture_role_enabled(policy, role) {
+                    continue;
+                }
+                for key in ["content", "text", "parts"] {
+                    legacy_collect_text_values(
+                        format!("{source}.{array_key}[{message_index}].{key}"),
+                        message.get(key),
+                        role,
+                        policy,
+                        &mut output,
+                        Some(message_index),
+                    );
+                }
+            }
+        }
+        output
+    }
+
+    fn legacy_collect_text_values(
+        source: String,
+        value: Option<&Value>,
+        role: PromptCaptureRole,
+        policy: UsagePromptCapturePolicy,
+        output: &mut Vec<LegacyCapturedPrompt>,
+        index: Option<usize>,
+    ) {
+        if !prompt_capture_role_enabled(policy, role) {
+            return;
+        }
+        let Some(value) = value else {
+            return;
+        };
+        match value {
+            Value::String(text) => {
+                let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                if normalized.is_empty() || policy.max_items == 0 {
+                    return;
+                }
+                if let Some(position) = output.iter().position(|prompt| prompt.text == normalized) {
+                    output.remove(position);
+                }
+                if output.len() >= policy.max_items {
+                    output.remove(0);
+                }
+                output.push(LegacyCapturedPrompt {
+                    source,
+                    index,
+                    role,
+                    text: normalized,
+                });
+            }
+            Value::Array(items) => {
+                for (item_index, item) in items.iter().enumerate() {
+                    legacy_collect_text_values(
+                        format!("{source}[{item_index}]"),
+                        Some(item),
+                        role,
+                        policy,
+                        output,
+                        index,
+                    );
+                }
+            }
+            Value::Object(object) => {
+                if object
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| kind.eq_ignore_ascii_case("tool_call"))
+                    && !policy.include_tools
+                {
+                    return;
+                }
+                for key in ["text", "content", "input"] {
+                    legacy_collect_text_values(
+                        format!("{source}.{key}"),
+                        object.get(key),
+                        role,
+                        policy,
+                        output,
+                        index,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn legacy_prompt_capture_item(prompt: &LegacyCapturedPrompt, preview_chars: usize) -> Value {
+        let digest = Sha256::digest(prompt.text.as_bytes());
+        let mut sha256 = String::with_capacity(64);
+        for byte in digest {
+            use std::fmt::Write as _;
+            let _ = write!(&mut sha256, "{byte:02x}");
+        }
+        let chars = prompt.text.chars().count();
+        let preview = prompt.text.chars().take(preview_chars).collect::<String>();
+        json!({
+            "source": prompt.source,
+            "index": prompt.index,
+            "role": prompt.role.as_str(),
+            "sha256": sha256,
+            "chars": chars,
+            "preview": preview,
+            "truncated": preview.chars().count() < chars
+        })
+    }
+
+    #[test]
+    fn bounded_prompt_capture_matches_legacy_reference_across_shapes_and_policies() {
+        let bodies = [
+            json!({
+                "instructions": "  system\n prompt  ",
+                "input": [
+                    {"role": "developer", "content": [{"type": "text", "text": "dev prompt"}]},
+                    {"role": "user", "content": "same\ttext"},
+                    {"role": "user", "content": [{"text": "same text"}, {"text": "latest user"}]}
+                ]
+            }),
+            json!({
+                "messages": [
+                    {"role": "system", "content": "chat system"},
+                    {"role": "tool", "content": {"type": "tool_call", "input": "tool input"}},
+                    {"role": "user", "content": ["first", {"text": "second"}]}
+                ]
+            }),
+            json!({
+                "system_instruction": {"parts": [{"text": "gemini system"}]},
+                "contents": [
+                    {"role": "user", "parts": [{"text": "gemini user"}]},
+                    {"role": "developer", "parts": ["unicode\u{2003}space"]}
+                ]
+            }),
+        ];
+
+        for request_index in 0..bodies.len() {
+            for max_items in [1, 2, 4, 8] {
+                for preview_chars in [0, 1, 7, 64] {
+                    for flags in 0_u8..16 {
+                        let policy = UsagePromptCapturePolicy {
+                            enabled: true,
+                            include_system: flags & 1 != 0,
+                            include_developer: flags & 2 != 0,
+                            include_user: flags & 4 != 0,
+                            include_tools: flags & 8 != 0,
+                            preview_chars,
+                            max_items,
+                        };
+                        let request = Some(&bodies[request_index]);
+                        let provider = Some(&bodies[(request_index + 1) % bodies.len()]);
+                        assert_eq!(
+                            build_prompt_capture_metadata(policy, request, provider),
+                            legacy_prompt_capture_metadata(policy, request, provider),
+                            "shape={request_index} max_items={max_items} preview={preview_chars} flags={flags}",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_prompt_capture_matches_legacy_reference_for_generated_histories() {
+        let roles = ["system", "developer", "user", "tool"];
+        let mut state = 0x9e37_79b9_u64;
+        for case in 0..128_usize {
+            let count = 1 + (next_test_random(&mut state) as usize % 48);
+            let mut messages = Vec::with_capacity(count);
+            for index in 0..count {
+                let role = roles[next_test_random(&mut state) as usize % roles.len()];
+                let text_id = next_test_random(&mut state) % 13;
+                let text = match next_test_random(&mut state) % 4 {
+                    0 => format!(" prompt  {text_id}\nvalue "),
+                    1 => format!("prompt\t{text_id}\u{2003}value"),
+                    2 => String::new(),
+                    _ => format!("unique-{case}-{index}"),
+                };
+                let content = match next_test_random(&mut state) % 3 {
+                    0 => Value::String(text),
+                    1 => json!([{"type": "text", "text": text}]),
+                    _ => json!({"text": text}),
+                };
+                messages.push(json!({"role": role, "content": content}));
+            }
+            let request = json!({
+                "instructions": format!("system-{}", next_test_random(&mut state) % 5),
+                "input": messages
+            });
+            let provider = json!({
+                "messages": request["input"]
+                    .as_array()
+                    .expect("generated messages")
+                    .iter()
+                    .rev()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            });
+            let policy = UsagePromptCapturePolicy {
+                enabled: true,
+                include_system: next_test_random(&mut state) & 1 != 0,
+                include_developer: next_test_random(&mut state) & 1 != 0,
+                include_user: next_test_random(&mut state) & 1 != 0,
+                include_tools: next_test_random(&mut state) & 1 != 0,
+                preview_chars: next_test_random(&mut state) as usize % 33,
+                max_items: 1 + (next_test_random(&mut state) as usize % 16),
+            };
+            assert_eq!(
+                build_prompt_capture_metadata(policy, Some(&request), Some(&provider)),
+                legacy_prompt_capture_metadata(policy, Some(&request), Some(&provider)),
+                "generated case {case}",
+            );
+        }
+    }
+
+    fn next_test_random(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        *state
+    }
+
+    #[test]
+    #[ignore = "manual 1/10/40 MiB prompt capture benchmark"]
+    fn prompt_capture_large_body_benchmark() {
+        let policy = UsagePromptCapturePolicy {
+            enabled: true,
+            include_system: true,
+            include_developer: true,
+            include_user: true,
+            include_tools: false,
+            preview_chars: 512,
+            max_items: 32,
+        };
+        for size_mib in [1_usize, 10, 40] {
+            for all_duplicate in [false, true] {
+                let body = benchmark_prompt_body(size_mib * 1024 * 1024, all_duplicate);
+                let legacy_started = Instant::now();
+                let legacy = legacy_prompt_capture_metadata(policy, Some(&body), None);
+                let legacy_elapsed = legacy_started.elapsed();
+                let bounded_started = Instant::now();
+                let bounded = build_prompt_capture_metadata(policy, Some(&body), None);
+                let bounded_elapsed = bounded_started.elapsed();
+                assert_eq!(bounded, legacy);
+                let speedup =
+                    legacy_elapsed.as_secs_f64() / bounded_elapsed.as_secs_f64().max(f64::EPSILON);
+                eprintln!(
+                    "prompt_capture_bench size_mib={size_mib} all_duplicate={all_duplicate} legacy_ms={:.3} bounded_ms={:.3} speedup={speedup:.2}x",
+                    legacy_elapsed.as_secs_f64() * 1000.0,
+                    bounded_elapsed.as_secs_f64() * 1000.0,
+                );
+                if size_mib == 40 && !all_duplicate {
+                    assert!(
+                        speedup >= 3.0,
+                        "40 MiB recent-32 scenario must be at least 3x faster; measured {speedup:.2}x"
+                    );
+                }
+            }
+        }
+    }
+
+    fn benchmark_prompt_body(target_bytes: usize, all_duplicate: bool) -> Value {
+        const PAYLOAD_BYTES: usize = 32 * 1024;
+        let message_count = target_bytes.div_ceil(PAYLOAD_BYTES).max(32);
+        let payload = "x".repeat(PAYLOAD_BYTES);
+        let messages = (0..message_count)
+            .map(|index| {
+                let label = if all_duplicate || index + 32 < message_count {
+                    "repeated".to_string()
+                } else {
+                    format!("recent-{index}")
+                };
+                json!({
+                    "role": "user",
+                    "content": format!("{label} {payload}")
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({"input": messages})
     }
 
     fn sample_usage_record() -> UpsertUsageRecord {

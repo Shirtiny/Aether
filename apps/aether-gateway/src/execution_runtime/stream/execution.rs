@@ -17,8 +17,8 @@ use aether_scheduler_core::{
 };
 use aether_usage_runtime::{
     build_lifecycle_usage_seed, build_stream_terminal_usage_payload_seed,
-    build_sync_terminal_usage_payload_seed, build_terminal_usage_context_seed, LifecycleUsageSeed,
-    UsageBodyCapturePolicy, UsageRequestRecordLevel, UsageRuntimeAccess,
+    build_sync_terminal_usage_payload_seed, build_terminal_usage_context_seed_with_policy,
+    LifecycleUsageSeed, UsageBodyCapturePolicy, UsageRequestRecordLevel,
     DEFAULT_USAGE_RESPONSE_BODY_CAPTURE_LIMIT_BYTES,
 };
 use async_stream::stream;
@@ -145,8 +145,10 @@ async fn record_sync_terminal_usage(
     plan: &ExecutionPlan,
     report_context: Option<&serde_json::Value>,
     payload: &GatewaySyncReportRequest,
+    body_capture_policy: UsageBodyCapturePolicy,
 ) {
-    let context_seed = build_terminal_usage_context_seed(plan, report_context);
+    let context_seed =
+        build_terminal_usage_context_seed_with_policy(plan, report_context, body_capture_policy);
     let payload_seed = build_sync_terminal_usage_payload_seed(payload);
     if let Err(err) = state
         .usage_runtime
@@ -238,8 +240,10 @@ async fn record_stream_terminal_usage(
     report_context: Option<&serde_json::Value>,
     payload: &GatewayStreamReportRequest,
     cancelled: bool,
+    body_capture_policy: UsageBodyCapturePolicy,
 ) {
-    let context_seed = build_terminal_usage_context_seed(plan, report_context);
+    let context_seed =
+        build_terminal_usage_context_seed_with_policy(plan, report_context, body_capture_policy);
     let payload_seed = build_stream_terminal_usage_payload_seed(payload);
     if let Err(err) = state
         .usage_runtime
@@ -941,6 +945,15 @@ pub(crate) async fn execute_execution_runtime_stream(
     let stream_started_at = Instant::now();
     ensure_execution_request_candidate_slot(state, &mut plan, &mut report_context).await;
     let lifecycle_seed = build_lifecycle_usage_seed(&plan, report_context.as_ref());
+    let body_capture_policy = state
+        .usage_runtime
+        .resolve_body_capture_policy(
+            state.data.as_ref(),
+            lifecycle_seed.user_id.as_deref(),
+            lifecycle_seed.request_id.as_str(),
+        )
+        .await;
+    let lifecycle_seed = lifecycle_seed.with_body_capture_policy(body_capture_policy);
     let request_candidate_status_snapshot =
         snapshot_local_request_candidate_status(&plan, report_context.as_ref());
     state
@@ -988,7 +1001,7 @@ pub(crate) async fn execute_execution_runtime_stream(
     .await;
     match maybe_execute_windsurf_stream(state, &plan, report_context.as_ref()).await {
         Ok(Some(windsurf_stream)) => {
-            return execute_stream_from_frame_stream(
+            return execute_stream_from_frame_stream_with_lifecycle_seed(
                 state,
                 plan,
                 trace_id,
@@ -996,6 +1009,7 @@ pub(crate) async fn execute_execution_runtime_stream(
                 plan_kind,
                 report_kind,
                 windsurf_stream.report_context.or(report_context),
+                lifecycle_seed.clone(),
                 candidate_started_unix_secs,
                 stream_started_at,
                 windsurf_stream.frame_stream,
@@ -1040,7 +1054,7 @@ pub(crate) async fn execute_execution_runtime_stream(
     }
     match maybe_execute_kiro_web_search_stream(state, &plan, report_context.as_ref()).await {
         Ok(Some(kiro_web_search)) => {
-            return execute_stream_from_frame_stream(
+            return execute_stream_from_frame_stream_with_lifecycle_seed(
                 state,
                 plan,
                 trace_id,
@@ -1048,6 +1062,7 @@ pub(crate) async fn execute_execution_runtime_stream(
                 plan_kind,
                 report_kind,
                 kiro_web_search.report_context.or(report_context),
+                lifecycle_seed.clone(),
                 candidate_started_unix_secs,
                 stream_started_at,
                 kiro_web_search.frame_stream,
@@ -1092,7 +1107,7 @@ pub(crate) async fn execute_execution_runtime_stream(
     }
     match maybe_execute_chatgpt_web_image_stream(state, &plan, report_context.as_ref()).await {
         Ok(Some(chatgpt_web_image)) => {
-            return execute_stream_from_frame_stream(
+            return execute_stream_from_frame_stream_with_lifecycle_seed(
                 state,
                 plan,
                 trace_id,
@@ -1100,6 +1115,7 @@ pub(crate) async fn execute_execution_runtime_stream(
                 plan_kind,
                 report_kind,
                 chatgpt_web_image.report_context.or(report_context),
+                lifecycle_seed.clone(),
                 candidate_started_unix_secs,
                 stream_started_at,
                 chatgpt_web_image.frame_stream,
@@ -1188,7 +1204,7 @@ pub(crate) async fn execute_execution_runtime_stream(
             }
         };
         let frame_stream = build_direct_execution_frame_stream(execution).boxed();
-        return execute_stream_from_frame_stream(
+        return execute_stream_from_frame_stream_with_lifecycle_seed(
             state,
             plan,
             trace_id,
@@ -1196,6 +1212,7 @@ pub(crate) async fn execute_execution_runtime_stream(
             plan_kind,
             report_kind,
             report_context,
+            lifecycle_seed.clone(),
             candidate_started_unix_secs,
             stream_started_at,
             frame_stream,
@@ -1253,7 +1270,7 @@ pub(crate) async fn execute_execution_runtime_stream(
                 }
             };
             let frame_stream = build_direct_execution_frame_stream(execution).boxed();
-            return execute_stream_from_frame_stream(
+            return execute_stream_from_frame_stream_with_lifecycle_seed(
                 state,
                 plan,
                 trace_id,
@@ -1261,6 +1278,7 @@ pub(crate) async fn execute_execution_runtime_stream(
                 plan_kind,
                 report_kind,
                 report_context,
+                lifecycle_seed.clone(),
                 candidate_started_unix_secs,
                 stream_started_at,
                 frame_stream,
@@ -1339,7 +1357,7 @@ pub(crate) async fn execute_execution_runtime_stream(
             .bytes_stream()
             .map_err(|err| IoError::other(err.to_string()))
             .boxed();
-        return execute_stream_from_frame_stream(
+        return execute_stream_from_frame_stream_with_lifecycle_seed(
             state,
             plan,
             trace_id,
@@ -1347,6 +1365,7 @@ pub(crate) async fn execute_execution_runtime_stream(
             plan_kind,
             report_kind,
             report_context,
+            lifecycle_seed,
             candidate_started_unix_secs,
             stream_started_at,
             frame_stream,
@@ -2341,6 +2360,7 @@ where
     Ok(None)
 }
 
+#[cfg(test)]
 async fn execute_stream_from_frame_stream(
     state: &AppState,
     plan: ExecutionPlan,
@@ -2354,13 +2374,54 @@ async fn execute_stream_from_frame_stream(
     frame_stream: BoxStream<'static, Result<Bytes, IoError>>,
     in_flight_guard: Option<ProviderPoolInFlightGuard>,
 ) -> Result<Option<Response<Body>>, GatewayError> {
+    let lifecycle_seed = build_lifecycle_usage_seed(&plan, report_context.as_ref());
+    let body_capture_policy = state
+        .usage_runtime
+        .resolve_body_capture_policy(
+            state.data.as_ref(),
+            lifecycle_seed.user_id.as_deref(),
+            lifecycle_seed.request_id.as_str(),
+        )
+        .await;
+    execute_stream_from_frame_stream_with_lifecycle_seed(
+        state,
+        plan,
+        trace_id,
+        decision,
+        plan_kind,
+        report_kind,
+        report_context,
+        lifecycle_seed.with_body_capture_policy(body_capture_policy),
+        candidate_started_unix_secs,
+        stream_started_at,
+        frame_stream,
+        in_flight_guard,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_stream_from_frame_stream_with_lifecycle_seed(
+    state: &AppState,
+    plan: ExecutionPlan,
+    trace_id: &str,
+    decision: &GatewayControlDecision,
+    plan_kind: &str,
+    report_kind: Option<String>,
+    report_context: Option<serde_json::Value>,
+    lifecycle_seed: LifecycleUsageSeed,
+    candidate_started_unix_secs: u64,
+    stream_started_at: Instant,
+    frame_stream: BoxStream<'static, Result<Bytes, IoError>>,
+    in_flight_guard: Option<ProviderPoolInFlightGuard>,
+) -> Result<Option<Response<Body>>, GatewayError> {
     let stream_lifecycle_timeouts = resolve_stream_lifecycle_timeouts(&plan);
     let request_id = plan.request_id.as_str();
     let request_id_for_log = short_request_id(request_id);
     let candidate_id = plan.candidate_id.as_deref();
     let provider_name = plan.provider_name.as_deref().unwrap_or("-");
     let model_name = plan.model_name.as_deref().unwrap_or("-");
-    let lifecycle_seed = build_lifecycle_usage_seed(&plan, report_context.as_ref());
+    let body_capture_policy = lifecycle_seed.body_capture_policy().unwrap_or_default();
     let request_candidate_status_snapshot =
         snapshot_local_request_candidate_status(&plan, report_context.as_ref());
     let candidate_index = parse_request_candidate_report_context(report_context.as_ref())
@@ -2744,7 +2805,14 @@ async fn execute_stream_from_frame_stream(
             payload_client_body_json,
             None,
         );
-        record_sync_terminal_usage(state, &plan, payload.report_context.as_ref(), &payload).await;
+        record_sync_terminal_usage(
+            state,
+            &plan,
+            payload.report_context.as_ref(),
+            &payload,
+            body_capture_policy,
+        )
+        .await;
         let terminal_unix_secs = current_request_candidate_unix_ms();
         record_local_request_candidate_status(
             state,
@@ -3025,6 +3093,7 @@ async fn execute_stream_from_frame_stream(
                         prefetched_usage_telemetry.clone(),
                         &provider_prefetched_body,
                         failure,
+                        body_capture_policy,
                     )
                     .await;
                 }
@@ -3050,6 +3119,7 @@ async fn execute_stream_from_frame_stream(
                         prefetched_usage_telemetry.clone(),
                         &provider_prefetched_body,
                         failure,
+                        body_capture_policy,
                     )
                     .await;
                 }
@@ -3093,6 +3163,7 @@ async fn execute_stream_from_frame_stream(
                                     prefetched_usage_telemetry.clone(),
                                     &prefetched_body,
                                     failure,
+                                    body_capture_policy,
                                 )
                                 .await;
                             }
@@ -3179,6 +3250,7 @@ async fn execute_stream_from_frame_stream(
                             &provider_prefetched_body,
                             error_status_code,
                             error_body_json,
+                            body_capture_policy,
                         )
                         .await;
                     }
@@ -3259,6 +3331,7 @@ async fn execute_stream_from_frame_stream(
                                 &provider_prefetched_body,
                                 error_status_code,
                                 body_json,
+                                body_capture_policy,
                             )
                             .await;
                         }
@@ -3318,6 +3391,7 @@ async fn execute_stream_from_frame_stream(
                                         prefetched_usage_telemetry.clone(),
                                         &provider_prefetched_body,
                                         failure,
+                                        body_capture_policy,
                                     )
                                     .await;
                                 }
@@ -3351,6 +3425,7 @@ async fn execute_stream_from_frame_stream(
                                     prefetched_usage_telemetry.clone(),
                                     &provider_prefetched_body,
                                     failure,
+                                    body_capture_policy,
                                 )
                                 .await;
                             }
@@ -3382,6 +3457,7 @@ async fn execute_stream_from_frame_stream(
                                     prefetched_usage_telemetry.clone(),
                                     &provider_prefetched_body,
                                     failure,
+                                    body_capture_policy,
                                 )
                                 .await;
                             }
@@ -3435,6 +3511,7 @@ async fn execute_stream_from_frame_stream(
                         prefetched_usage_telemetry.clone(),
                         &provider_prefetched_body,
                         build_stream_failure_from_execution_error(&error),
+                        body_capture_policy,
                     )
                     .await;
                 }
@@ -3560,30 +3637,6 @@ async fn execute_stream_from_frame_stream(
     let plan_for_report = plan;
     let emit_passthrough_sse_terminal_error =
         response_headers_are_sse && !is_openai_image_stream_for_report;
-    // Capture scopes are evaluated per authenticated user. Reading the global
-    // policy without this ID downgrades include_groups requests to Basic and
-    // disables provider/client stream response buffering.
-    let body_capture_policy = match UsageRuntimeAccess::body_capture_policy_for_user(
-        state.data.as_ref(),
-        lifecycle_seed_for_report.user_id.as_deref(),
-    )
-    .await
-    {
-        Ok(policy) => policy,
-        Err(err) => {
-            warn!(
-                event_name = "stream_execution_body_capture_policy_read_failed",
-                log_type = "ops",
-                trace_id = %trace_id,
-                request_id = %request_id_for_report_log,
-                candidate_id = ?candidate_id_for_report.as_deref(),
-                error = %err,
-                fallback_request_body_bytes = DEFAULT_USAGE_RESPONSE_BODY_CAPTURE_LIMIT_BYTES,
-                "gateway failed to read body capture policy; falling back to default stream capture limits"
-            );
-            UsageBodyCapturePolicy::default()
-        }
-    };
     let max_stream_body_buffer_bytes = if matches!(
         body_capture_policy.record_level,
         UsageRequestRecordLevel::Basic
@@ -4631,6 +4684,7 @@ async fn execute_stream_from_frame_stream(
                 usage_payload.report_context.as_ref(),
                 &usage_payload,
                 true,
+                body_capture_policy,
             )
             .await;
             record_local_request_candidate_status(
@@ -4682,6 +4736,7 @@ async fn execute_stream_from_frame_stream(
                 &provider_buffered_body,
                 candidate_started_unix_secs_for_report,
                 failure,
+                body_capture_policy,
             )
             .await;
             return;
@@ -4918,6 +4973,7 @@ async fn execute_stream_from_frame_stream(
             usage_payload.report_context.as_ref(),
             &usage_payload,
             false,
+            body_capture_policy,
         )
         .await;
         record_local_request_candidate_status(
@@ -5033,7 +5089,7 @@ mod tests {
         ProviderCatalogReadRepository, StoredProviderCatalogKey, StoredProviderCatalogProvider,
     };
     use aether_data_contracts::repository::usage::UsageReadRepository;
-    use aether_usage_runtime::UsageRuntimeConfig;
+    use aether_usage_runtime::{UsageBodyCapturePolicy, UsageRuntimeConfig};
     use async_stream::stream;
     use axum::body::{to_bytes, Body, Bytes};
     use axum::extract::ws::Message;
@@ -5336,6 +5392,7 @@ mod tests {
             br#"data: {"error":{"type":"service_unavailable_error","message":"Our servers are currently overloaded. Please try again later.","code":"503"}}"#,
             resolve_local_sync_error_status_code(200, &body_json),
             body_json,
+            UsageBodyCapturePolicy::default(),
         )
         .await
         .expect("prefetch embedded error handling should succeed");
@@ -5757,6 +5814,7 @@ mod tests {
                 "Our servers are currently overloaded. Please try again later.",
                 503,
             ),
+            UsageBodyCapturePolicy::default(),
         )
         .await
         .expect("prefetch failure handling should succeed");
@@ -5849,6 +5907,7 @@ mod tests {
                     "failed to transform execution runtime stream chunk",
                     502,
                 ),
+                UsageBodyCapturePolicy::default(),
             )
             .await
             .expect("prefetch failure handling should succeed")

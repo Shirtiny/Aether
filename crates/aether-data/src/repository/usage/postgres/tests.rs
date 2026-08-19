@@ -16,10 +16,11 @@ use super::{
     usage_http_audit_capture_mode, usage_metadata_has_prompt_capture, usage_metadata_is_ws_step,
     usage_routing_snapshot_from_usage, usage_settlement_pricing_snapshot_from_usage,
     AggregateRangeSplit, SqlxUsageReadRepository, UsageHttpAuditRefs, UsagePromptCaptureEntry,
-    UsageRoutingSnapshot, UsageSettlementPricingSnapshot, WsPromptCaptureScope,
-    COUNT_USAGE_AUDITS_WITH_CANDIDATE_PREFIX, FIND_WS_CONNECTION_PROMPT_CAPTURE_SQL,
-    FIND_WS_PROMPT_CAPTURE_SCOPE_SQL, FIND_WS_SESSION_PROMPT_CAPTURE_SQL,
-    FIND_WS_USAGE_SESSION_PROMPT_CAPTURE_SQL, MAX_INLINE_USAGE_BODY_BYTES,
+    UsagePromptCaptureObservation, UsagePromptCaptureObservationBuffer, UsageRoutingSnapshot,
+    UsageSettlementPricingSnapshot, WsPromptCaptureScope, COUNT_USAGE_AUDITS_WITH_CANDIDATE_PREFIX,
+    FIND_WS_CONNECTION_PROMPT_CAPTURE_SQL, FIND_WS_PROMPT_CAPTURE_SCOPE_SQL,
+    FIND_WS_SESSION_PROMPT_CAPTURE_SQL, FIND_WS_USAGE_SESSION_PROMPT_CAPTURE_SQL,
+    FLUSH_USAGE_PROMPT_CAPTURE_OBSERVATIONS_SQL, MAX_INLINE_USAGE_BODY_BYTES,
     UPSERT_USAGE_PROMPT_CAPTURE_ENTRIES_SQL,
 };
 use crate::driver::postgres::{PostgresPoolConfig, PostgresPoolFactory};
@@ -1520,8 +1521,91 @@ fn prompt_capture_batch_upsert_uses_fixed_shape_arrays() {
     assert!(UPSERT_USAGE_PROMPT_CAPTURE_ENTRIES_SQL.contains("FROM UNNEST("));
     assert!(UPSERT_USAGE_PROMPT_CAPTURE_ENTRIES_SQL.contains("$6::BIGINT[]"));
     assert!(UPSERT_USAGE_PROMPT_CAPTURE_ENTRIES_SQL.contains("ORDER BY incoming.sha256"));
-    assert!(UPSERT_USAGE_PROMPT_CAPTURE_ENTRIES_SQL
-        .contains("seen_count = stored.seen_count + EXCLUDED.seen_count"));
+    assert!(UPSERT_USAGE_PROMPT_CAPTURE_ENTRIES_SQL.contains("ON CONFLICT (sha256) DO NOTHING"));
+    assert!(UPSERT_USAGE_PROMPT_CAPTURE_ENTRIES_SQL.contains("stored.chars < incoming.chars"));
+    assert!(FLUSH_USAGE_PROMPT_CAPTURE_OBSERVATIONS_SQL
+        .contains("seen_count = stored.seen_count + incoming.seen_count"));
+}
+
+#[test]
+fn prompt_capture_observation_buffer_merges_counts_and_latest_timestamp() {
+    let first_at = Utc.timestamp_opt(1_700_000_000, 0).single().expect("time");
+    let second_at = Utc.timestamp_opt(1_700_000_005, 0).single().expect("time");
+    let mut buffer = UsagePromptCaptureObservationBuffer::default();
+    buffer.extend(BTreeMap::from([(
+        "a".repeat(64),
+        UsagePromptCaptureObservation {
+            seen_count: 2,
+            last_seen_at: first_at,
+        },
+    )]));
+    buffer.extend(BTreeMap::from([(
+        "a".repeat(64),
+        UsagePromptCaptureObservation {
+            seen_count: 3,
+            last_seen_at: second_at,
+        },
+    )]));
+
+    assert_eq!(
+        buffer.take_all(),
+        BTreeMap::from([(
+            "a".repeat(64),
+            UsagePromptCaptureObservation {
+                seen_count: 5,
+                last_seen_at: second_at,
+            },
+        )])
+    );
+}
+
+#[test]
+fn prompt_capture_observation_buffer_restores_failed_drain_without_losing_new_counts() {
+    let observed_at = Utc.timestamp_opt(1_700_000_000, 0).single().expect("time");
+    let sha256 = "b".repeat(64);
+    let mut buffer = UsagePromptCaptureObservationBuffer::default();
+    buffer.extend(BTreeMap::from([(
+        sha256.clone(),
+        UsagePromptCaptureObservation {
+            seen_count: 2,
+            last_seen_at: observed_at,
+        },
+    )]));
+    let failed_drain = buffer.take_all();
+    buffer.extend(BTreeMap::from([(
+        sha256.clone(),
+        UsagePromptCaptureObservation {
+            seen_count: 1,
+            last_seen_at: observed_at,
+        },
+    )]));
+    buffer.extend(failed_drain);
+
+    assert_eq!(
+        buffer
+            .take_all()
+            .get(&sha256)
+            .map(|observation| observation.seen_count),
+        Some(3)
+    );
+}
+
+#[test]
+fn empty_prompt_capture_flush_does_not_postpone_the_next_observation() {
+    let observed_at = Utc.timestamp_opt(1_700_000_000, 0).single().expect("time");
+    let mut buffer = UsagePromptCaptureObservationBuffer::default();
+    let due_at = buffer.last_flush + super::PROMPT_CAPTURE_OBSERVATION_FLUSH_INTERVAL;
+
+    assert!(buffer.take_if_due(due_at).is_empty());
+    buffer.extend(BTreeMap::from([(
+        "c".repeat(64),
+        UsagePromptCaptureObservation {
+            seen_count: 1,
+            last_seen_at: observed_at,
+        },
+    )]));
+
+    assert_eq!(buffer.take_if_due(due_at).len(), 1);
 }
 
 #[tokio::test]
@@ -1608,7 +1692,35 @@ async fn prompt_capture_batch_upsert_executes_when_postgres_url_is_set() {
     sync_usage_prompt_capture_entries(&mut conn, &[initial])
         .await
         .expect("initial prompt capture should insert");
-    sync_usage_prompt_capture_entries(
+    let ctid_before_repeat: String =
+        sqlx::query_scalar("SELECT ctid::TEXT FROM usage_prompt_capture_entries WHERE sha256 = $1")
+            .bind(&sha)
+            .fetch_one(&mut *conn)
+            .await
+            .expect("initial prompt capture tuple should read");
+    let repeated_observations = sync_usage_prompt_capture_entries(
+        &mut conn,
+        &[UsagePromptCaptureEntry {
+            sha256: sha.clone(),
+            role: "system".to_string(),
+            chars: 3,
+            preview: "😀😀😀".to_string(),
+            truncated: false,
+        }],
+    )
+    .await
+    .expect("unchanged prompt capture should be observed");
+    let ctid_after_repeat: String =
+        sqlx::query_scalar("SELECT ctid::TEXT FROM usage_prompt_capture_entries WHERE sha256 = $1")
+            .bind(&sha)
+            .fetch_one(&mut *conn)
+            .await
+            .expect("repeated prompt capture tuple should read");
+    assert_eq!(ctid_after_repeat, ctid_before_repeat);
+    super::flush_usage_prompt_capture_observations(&mut conn, &repeated_observations)
+        .await
+        .expect("repeated prompt capture observation should flush");
+    let observations = sync_usage_prompt_capture_entries(
         &mut conn,
         &[
             UsagePromptCaptureEntry {
@@ -1629,6 +1741,9 @@ async fn prompt_capture_batch_upsert_executes_when_postgres_url_is_set() {
     )
     .await
     .expect("existing prompt capture should update");
+    super::flush_usage_prompt_capture_observations(&mut conn, &observations)
+        .await
+        .expect("prompt capture observations should flush");
     let row: (String, i32, String, bool, i64) = sqlx::query_as(
         "SELECT role, chars, preview, truncated, seen_count FROM usage_prompt_capture_entries WHERE sha256 = $1",
     )
@@ -1636,10 +1751,7 @@ async fn prompt_capture_batch_upsert_executes_when_postgres_url_is_set() {
     .fetch_one(&mut *conn)
     .await
     .expect("updated prompt capture should read");
-    assert_eq!(
-        row,
-        ("unknown".to_string(), 20, "abcd".to_string(), true, 3)
-    );
+    assert_eq!(row, ("system".to_string(), 20, "abcd".to_string(), true, 4));
 
     let sha_a = format!(
         "{}{}",
@@ -1685,30 +1797,37 @@ async fn prompt_capture_batch_upsert_executes_when_postgres_url_is_set() {
     ];
     let left_pool = pool.clone();
     let right_pool = pool.clone();
-    tokio::time::timeout(Duration::from_secs(30), async move {
-        tokio::join!(
-            async move {
-                let mut conn = left_pool
-                    .acquire()
-                    .await
-                    .expect("left postgres connection should acquire");
-                sync_usage_prompt_capture_entries(&mut conn, &left_entries)
-                    .await
-                    .expect("left prompt capture batch should execute");
-            },
-            async move {
-                let mut conn = right_pool
-                    .acquire()
-                    .await
-                    .expect("right postgres connection should acquire");
-                sync_usage_prompt_capture_entries(&mut conn, &right_entries)
-                    .await
-                    .expect("right prompt capture batch should execute");
-            }
-        );
-    })
-    .await
-    .expect("overlapping prompt capture batches should not deadlock");
+    let (left_observations, right_observations) =
+        tokio::time::timeout(Duration::from_secs(30), async move {
+            tokio::join!(
+                async move {
+                    let mut conn = left_pool
+                        .acquire()
+                        .await
+                        .expect("left postgres connection should acquire");
+                    sync_usage_prompt_capture_entries(&mut conn, &left_entries)
+                        .await
+                        .expect("left prompt capture batch should execute")
+                },
+                async move {
+                    let mut conn = right_pool
+                        .acquire()
+                        .await
+                        .expect("right postgres connection should acquire");
+                    sync_usage_prompt_capture_entries(&mut conn, &right_entries)
+                        .await
+                        .expect("right prompt capture batch should execute")
+                }
+            )
+        })
+        .await
+        .expect("overlapping prompt capture batches should not deadlock");
+    let mut observation_buffer = UsagePromptCaptureObservationBuffer::default();
+    observation_buffer.extend(left_observations);
+    observation_buffer.extend(right_observations);
+    super::flush_usage_prompt_capture_observations(&mut conn, &observation_buffer.take_all())
+        .await
+        .expect("overlapping prompt capture observations should flush");
     let seen_counts = sqlx::query_as::<_, (String, i64)>(
         "SELECT sha256, seen_count FROM usage_prompt_capture_entries WHERE sha256 = ANY($1::TEXT[]) ORDER BY sha256",
     )

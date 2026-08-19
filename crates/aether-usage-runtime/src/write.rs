@@ -9,8 +9,8 @@ use serde_json::{json, Map, Value};
 
 use crate::body_capture::{
     append_runtime_body_capture_metadata, build_payload_body_capture_metadata,
-    build_plan_body_capture_metadata, build_runtime_body_capture_states, decoded_base64_len_hint,
-    RuntimeBodyCaptureMetadataInput,
+    build_plan_body_capture_metadata, build_prompt_capture_metadata,
+    build_runtime_body_capture_states, decoded_base64_len_hint, RuntimeBodyCaptureMetadataInput,
 };
 use crate::request_metadata::{
     attach_cafecode_identity_metadata, attach_provider_request_body_metadata,
@@ -20,10 +20,10 @@ use crate::request_metadata::{
 };
 use crate::{
     map_usage_from_response, stream_capture_terminal_state, GatewayStreamReportRequest,
-    GatewaySyncReportRequest, StandardizedUsage, StreamCapturedTerminalState, UsageEvent,
-    UsageEventData, UsageEventType, STREAM_MISSING_TERMINAL_EVENT_CATEGORY,
-    STREAM_MISSING_TERMINAL_EVENT_MESSAGE, STREAM_TERMINAL_ERROR_CATEGORY,
-    STREAM_TERMINAL_ERROR_MESSAGE,
+    GatewaySyncReportRequest, StandardizedUsage, StreamCapturedTerminalState,
+    UsageBodyCapturePolicy, UsageEvent, UsageEventData, UsageEventType,
+    STREAM_MISSING_TERMINAL_EVENT_CATEGORY, STREAM_MISSING_TERMINAL_EVENT_MESSAGE,
+    STREAM_TERMINAL_ERROR_CATEGORY, STREAM_TERMINAL_ERROR_MESSAGE,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,6 +96,18 @@ pub struct LifecycleUsageSeed {
     routing: UsageRoutingSeed,
     body_states: UsageBodyStatesSeed,
     pub request_metadata: Option<Value>,
+    body_capture_policy: Option<UsageBodyCapturePolicy>,
+}
+
+impl LifecycleUsageSeed {
+    pub fn with_body_capture_policy(mut self, policy: UsageBodyCapturePolicy) -> Self {
+        self.body_capture_policy = Some(policy);
+        self
+    }
+
+    pub fn body_capture_policy(&self) -> Option<UsageBodyCapturePolicy> {
+        self.body_capture_policy
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,6 +145,13 @@ pub struct TerminalUsageContextSeed {
     body_states: UsageBodyStatesSeed,
     routing: UsageRoutingSeed,
     pub request_metadata: Option<Value>,
+    body_capture_policy: Option<UsageBodyCapturePolicy>,
+}
+
+impl TerminalUsageContextSeed {
+    pub fn body_capture_policy(&self) -> Option<UsageBodyCapturePolicy> {
+        self.body_capture_policy
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -306,6 +325,7 @@ pub fn build_lifecycle_usage_seed(
         routing: build_runtime_routing_seed(plan, context),
         body_states: build_runtime_body_states_seed(plan, context),
         request_metadata: build_runtime_request_metadata_seed(plan, context),
+        body_capture_policy: None,
     }
 }
 
@@ -658,8 +678,32 @@ pub fn build_terminal_usage_context_seed(
     plan: &ExecutionPlan,
     report_context: Option<&Value>,
 ) -> TerminalUsageContextSeed {
+    build_terminal_usage_context_seed_impl(plan, report_context, None)
+}
+
+pub fn build_terminal_usage_context_seed_with_policy(
+    plan: &ExecutionPlan,
+    report_context: Option<&Value>,
+    body_capture_policy: UsageBodyCapturePolicy,
+) -> TerminalUsageContextSeed {
+    build_terminal_usage_context_seed_impl(plan, report_context, Some(body_capture_policy))
+}
+
+fn build_terminal_usage_context_seed_impl(
+    plan: &ExecutionPlan,
+    report_context: Option<&Value>,
+    body_capture_policy: Option<UsageBodyCapturePolicy>,
+) -> TerminalUsageContextSeed {
     let context = report_context.and_then(Value::as_object);
-    let request_capture = build_runtime_request_capture_seed(plan, context);
+    let prompt_capture_metadata = body_capture_policy.and_then(|policy| {
+        build_prompt_capture_metadata(
+            policy.prompt_capture,
+            runtime_request_body_value_ref(context),
+            runtime_provider_request_body_value_ref(plan, context),
+        )
+    });
+    let request_capture =
+        build_runtime_request_capture_seed_with_policy(plan, context, body_capture_policy);
     let client_contract = context_string(context, "client_contract")
         .or_else(|| context_string(context, "client_api_format"))
         .or_else(|| non_empty_str(Some(plan.client_api_format.as_str())))
@@ -723,9 +767,13 @@ pub fn build_terminal_usage_context_seed(
         },
         body_states: request_capture.body_states,
         request_metadata: merge_usage_request_metadata_owned(
-            build_usage_request_metadata_seed(plan, context),
-            build_plan_body_capture_metadata(plan.body.body_bytes_b64.as_deref()),
+            merge_usage_request_metadata_owned(
+                build_usage_request_metadata_seed(plan, context),
+                build_plan_body_capture_metadata(plan.body.body_bytes_b64.as_deref()),
+            ),
+            prompt_capture_metadata,
         ),
+        body_capture_policy,
     }
 }
 
@@ -1523,16 +1571,33 @@ pub fn build_usage_event_data_seed(
     plan: &ExecutionPlan,
     report_context: Option<&Value>,
 ) -> UsageEventData {
-    build_usage_event_data_seed_with_detail(plan, report_context)
+    build_usage_event_data_seed_with_detail(plan, report_context, None)
+}
+
+pub fn build_usage_event_data_seed_with_policy(
+    plan: &ExecutionPlan,
+    report_context: Option<&Value>,
+    body_capture_policy: UsageBodyCapturePolicy,
+) -> UsageEventData {
+    build_usage_event_data_seed_with_detail(plan, report_context, Some(body_capture_policy))
 }
 
 fn build_usage_event_data_seed_with_detail(
     plan: &ExecutionPlan,
     report_context: Option<&Value>,
+    body_capture_policy: Option<UsageBodyCapturePolicy>,
 ) -> UsageEventData {
     let context = report_context.and_then(Value::as_object);
     let routing = build_runtime_routing_seed(plan, context);
-    let request_capture = build_runtime_request_capture_seed(plan, context);
+    let prompt_capture_metadata = body_capture_policy.and_then(|policy| {
+        build_prompt_capture_metadata(
+            policy.prompt_capture,
+            runtime_request_body_value_ref(context),
+            runtime_provider_request_body_value_ref(plan, context),
+        )
+    });
+    let request_capture =
+        build_runtime_request_capture_seed_with_policy(plan, context, body_capture_policy);
     let api_format = context_string(context, "client_api_format")
         .or_else(|| non_empty_str(Some(plan.client_api_format.as_str())));
     let endpoint_api_format = context_string(context, "provider_api_format")
@@ -1563,13 +1628,16 @@ fn build_usage_event_data_seed_with_detail(
         .as_deref()
         .and_then(infer_endpoint_kind)
         .map(ToOwned::to_owned);
-    let request_metadata = build_runtime_request_metadata_seed_from_parts(
-        context,
-        request_capture.request_body.is_some(),
-        request_capture.request_body_ref.as_deref(),
-        request_capture.provider_request.is_some(),
-        request_capture.provider_request_body_ref.as_deref(),
-        plan.body.body_bytes_b64.as_deref(),
+    let request_metadata = merge_usage_request_metadata_owned(
+        build_runtime_request_metadata_seed_from_parts(
+            context,
+            runtime_request_body_value_ref(context).is_some(),
+            request_capture.request_body_ref.as_deref(),
+            runtime_provider_request_body_value_ref(plan, context).is_some(),
+            request_capture.provider_request_body_ref.as_deref(),
+            plan.body.body_bytes_b64.as_deref(),
+        ),
+        prompt_capture_metadata,
     );
     sanitize_usage_event_data(UsageEventData {
         user_id: context_string(context, "user_id"),
@@ -1848,6 +1916,54 @@ fn build_runtime_request_capture_seed(
         provider_request_body_ref,
         body_states,
     }
+}
+
+fn build_runtime_request_capture_seed_with_policy(
+    plan: &ExecutionPlan,
+    context: Option<&Map<String, Value>>,
+    policy: Option<UsageBodyCapturePolicy>,
+) -> RuntimeRequestCaptureSeed {
+    if !policy
+        .is_some_and(|policy| matches!(policy.record_level, crate::UsageRequestRecordLevel::Basic))
+    {
+        return build_runtime_request_capture_seed(plan, context);
+    }
+
+    let request_body_ref = context_string(context, "request_body_ref");
+    let provider_request_body_ref = context_string(context, "provider_request_body_ref")
+        .or_else(|| non_empty_str(plan.body.body_ref.as_deref()));
+    let body_states = build_runtime_body_states_seed_from_parts(
+        runtime_request_body_value_ref(context).is_some(),
+        request_body_ref.as_deref(),
+        runtime_provider_request_body_value_ref(plan, context).is_some(),
+        provider_request_body_ref.as_deref(),
+        plan.body.body_bytes_b64.is_some(),
+    );
+
+    RuntimeRequestCaptureSeed {
+        request_body: None,
+        request_body_ref,
+        provider_request: None,
+        provider_request_body_ref,
+        body_states,
+    }
+}
+
+fn runtime_request_body_value_ref(context: Option<&Map<String, Value>>) -> Option<&Value> {
+    context_value_ref(context, "original_request_body").filter(|value| !value.is_null())
+}
+
+fn runtime_provider_request_body_value_ref<'a>(
+    plan: &'a ExecutionPlan,
+    context: Option<&'a Map<String, Value>>,
+) -> Option<&'a Value> {
+    context_value_ref(context, "provider_request_body")
+        .filter(|value| !value.is_null())
+        .or_else(|| {
+            (plan.body.body_ref.is_none() && plan.body.body_bytes_b64.is_none())
+                .then_some(plan.body.json_body.as_ref())
+                .flatten()
+        })
 }
 
 fn build_runtime_request_metadata_seed(
@@ -3145,16 +3261,19 @@ mod tests {
         build_stream_terminal_usage_event, build_streaming_usage_record,
         build_sync_terminal_usage_event, build_sync_terminal_usage_payload_seed,
         build_sync_terminal_usage_seed, build_terminal_usage_context_seed,
-        build_terminal_usage_event_from_seed, build_usage_event_data_seed, decode_body_for_storage,
-        extract_token_counts_from_json, extract_token_counts_from_value, headers_to_json,
-        mask_header_value, mask_sensitive_body_fields, mask_sensitive_headers_in_json_value,
-        parse_sse_body_for_storage, resolve_error_message, trim_owned_non_empty_string,
-        LifecycleUsageSeed, TerminalUsageSeed, UsageBodyRefsSeed, UsageBodyStatesSeed,
-        UsageRoutingSeed, UsageTerminalState, MAX_USAGE_CAPTURE_BYTES, MAX_USAGE_CAPTURE_DEPTH,
+        build_terminal_usage_context_seed_with_policy, build_terminal_usage_event_from_seed,
+        build_usage_event_data_seed, build_usage_event_data_seed_with_policy,
+        decode_body_for_storage, extract_token_counts_from_json, extract_token_counts_from_value,
+        headers_to_json, mask_header_value, mask_sensitive_body_fields,
+        mask_sensitive_headers_in_json_value, parse_sse_body_for_storage, resolve_error_message,
+        trim_owned_non_empty_string, LifecycleUsageSeed, TerminalUsageSeed, UsageBodyRefsSeed,
+        UsageBodyStatesSeed, UsageRoutingSeed, UsageTerminalState, MAX_USAGE_CAPTURE_BYTES,
+        MAX_USAGE_CAPTURE_DEPTH,
     };
     use crate::{
         build_upsert_usage_record_from_event, GatewayStreamReportRequest, GatewaySyncReportRequest,
-        UsageEvent, UsageEventData, UsageEventType,
+        UsageBodyCapturePolicy, UsageEvent, UsageEventData, UsageEventType,
+        UsagePromptCapturePolicy, UsageRequestRecordLevel,
     };
     use aether_contracts::{
         ExecutionPlan, ExecutionStreamTerminalSummary, RequestBody, StandardizedUsage,
@@ -5993,6 +6112,7 @@ mod tests {
                         "payload": "x".repeat(32 * 1024)
                     }
                 })),
+                body_capture_policy: None,
             },
             1_700_000_000,
         )
@@ -6064,6 +6184,90 @@ mod tests {
                 "payload": "x".repeat(MAX_USAGE_CAPTURE_BYTES + 1)
             }))
         );
+    }
+
+    #[test]
+    fn basic_terminal_context_precomputes_bounded_prompts_without_cloning_bodies() {
+        let plan = ExecutionPlan {
+            request_id: "req-basic-prompt-seed-1".to_string(),
+            candidate_id: Some("cand-basic-prompt-seed-1".to_string()),
+            provider_name: Some("OpenAI".to_string()),
+            provider_id: "provider-1".to_string(),
+            endpoint_id: "endpoint-1".to_string(),
+            key_id: "key-1".to_string(),
+            method: "POST".to_string(),
+            url: "https://example.com/v1/chat/completions".to_string(),
+            headers: BTreeMap::new(),
+            content_type: Some("application/json".to_string()),
+            content_encoding: None,
+            body: RequestBody::from_json(json!({
+                "messages": [{
+                    "role": "user",
+                    "content": "provider prompt",
+                    "password": "provider-secret"
+                }]
+            })),
+            stream: false,
+            client_api_format: "openai:chat".to_string(),
+            provider_api_format: "openai:chat".to_string(),
+            model_name: Some("gpt-5".to_string()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        };
+        let context = json!({
+            "user_id": "user-1",
+            "original_request_body": {
+                "messages": [{
+                    "role": "user",
+                    "content": format!("latest {} prompt", "x".repeat(256 * 1024)),
+                    "api_key": "request-secret"
+                }]
+            }
+        });
+        let policy = UsageBodyCapturePolicy {
+            record_level: UsageRequestRecordLevel::Basic,
+            prompt_capture: UsagePromptCapturePolicy {
+                enabled: true,
+                preview_chars: 16,
+                max_items: 2,
+                ..UsagePromptCapturePolicy::default()
+            },
+            ..UsageBodyCapturePolicy::default()
+        };
+
+        let seed = build_terminal_usage_context_seed_with_policy(&plan, Some(&context), policy);
+
+        assert!(seed.request_body.is_none());
+        assert!(seed.provider_request.is_none());
+        assert_eq!(seed.body_capture_policy(), Some(policy));
+        let items = seed
+            .request_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("prompt_capture"))
+            .and_then(|capture| capture.get("items"))
+            .and_then(Value::as_array)
+            .expect("prompt capture items should be precomputed");
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().all(|item| {
+            item.get("preview")
+                .and_then(Value::as_str)
+                .is_some_and(|preview| preview.chars().count() <= 16)
+        }));
+        let metadata_json = serde_json::to_string(&seed.request_metadata)
+            .expect("prompt capture metadata should serialize");
+        assert!(!metadata_json.contains("request-secret"));
+        assert!(!metadata_json.contains("provider-secret"));
+
+        let data = build_usage_event_data_seed_with_policy(&plan, Some(&context), policy);
+        assert!(data.request_body.is_none());
+        assert!(data.provider_request_body.is_none());
+        assert!(data
+            .request_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.pointer("/prompt_capture/items"))
+            .and_then(Value::as_array)
+            .is_some_and(|items| items.len() == 2));
     }
 
     #[test]

@@ -143,6 +143,8 @@ use aether_data_contracts::repository::video_tasks::{
 };
 use aether_runtime_state::RuntimeQueueStore;
 
+use crate::cache::SystemConfigCache;
+
 pub(crate) use self::referrals::{
     ReferralAdminStats, ReferralMutationStatus, ReferralRelationshipListQuery,
     ReferralRelationshipRecord, ReferralRewardConfig, ReferralRewardListQuery,
@@ -194,6 +196,7 @@ pub(crate) struct GatewayDataState {
     wallet_writer: Option<Arc<dyn WalletWriteRepository>>,
     settlement_writer: Option<Arc<dyn SettlementWriteRepository>>,
     system_config_values: Option<Arc<RwLock<BTreeMap<String, StoredSystemConfigEntry>>>>,
+    system_config_cache: Arc<SystemConfigCache>,
 }
 
 impl fmt::Debug for GatewayDataState {

@@ -32,8 +32,11 @@ use sqlx::{
     query::Query,
     PgPool, Postgres, QueryBuilder, Row,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::{Read, Write};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use tracing::warn;
 use uuid::Uuid;
 
 use super::{
@@ -59,47 +62,82 @@ pub mod cleanup;
 // newly captured bodies always spill to usage_body_blobs and resolve through usage_http_audits.
 const MAX_INLINE_USAGE_BODY_BYTES: usize = 0;
 const MAX_SUPPORTED_UNIX_SECS: u64 = 253_402_300_799;
+const PROMPT_CAPTURE_OBSERVATION_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 const FIND_USAGE_BODY_BLOB_BY_REF_SQL: &str =
     r#"SELECT payload_gzip FROM usage_body_blobs WHERE body_ref = $1 LIMIT 1"#;
 const UPSERT_USAGE_PROMPT_CAPTURE_ENTRIES_SQL: &str = r#"
-INSERT INTO usage_prompt_capture_entries AS stored (
-  sha256,
-  role,
-  chars,
-  preview,
-  truncated,
-  first_seen_at,
-  last_seen_at,
-  seen_count
-) SELECT
-  incoming.sha256,
-  incoming.role,
-  incoming.chars,
-  incoming.preview,
-  incoming.truncated,
-  NOW(),
-  NOW(),
-  incoming.seen_count
-FROM UNNEST(
-  $1::TEXT[],
-  $2::TEXT[],
-  $3::INTEGER[],
-  $4::TEXT[],
-  $5::BOOLEAN[],
-  $6::BIGINT[]
-) AS incoming (sha256, role, chars, preview, truncated, seen_count)
-ORDER BY incoming.sha256
-ON CONFLICT (sha256)
-DO UPDATE SET
-  role = COALESCE(NULLIF(EXCLUDED.role, ''), stored.role),
-  chars = GREATEST(stored.chars, EXCLUDED.chars),
-  preview = CASE
-    WHEN char_length(stored.preview) < char_length(EXCLUDED.preview) THEN EXCLUDED.preview
-    ELSE stored.preview
-  END,
-  truncated = stored.truncated OR EXCLUDED.truncated,
-  last_seen_at = NOW(),
-  seen_count = stored.seen_count + EXCLUDED.seen_count
+WITH incoming AS (
+  SELECT *
+  FROM UNNEST(
+    $1::TEXT[],
+    $2::TEXT[],
+    $3::INTEGER[],
+    $4::TEXT[],
+    $5::BOOLEAN[],
+    $6::BIGINT[]
+  ) AS rows (sha256, role, chars, preview, truncated, seen_count)
+), inserted AS (
+  INSERT INTO usage_prompt_capture_entries (
+    sha256,
+    role,
+    chars,
+    preview,
+    truncated,
+    first_seen_at,
+    last_seen_at,
+    seen_count
+  ) SELECT
+    incoming.sha256,
+    incoming.role,
+    incoming.chars,
+    incoming.preview,
+    incoming.truncated,
+    NOW(),
+    NOW(),
+    incoming.seen_count
+  FROM incoming
+  ORDER BY incoming.sha256
+  ON CONFLICT (sha256) DO NOTHING
+  RETURNING sha256
+), improved AS (
+  UPDATE usage_prompt_capture_entries AS stored
+  SET
+    chars = GREATEST(stored.chars, incoming.chars),
+    preview = CASE
+      WHEN char_length(stored.preview) < char_length(incoming.preview) THEN incoming.preview
+      ELSE stored.preview
+    END,
+    truncated = stored.truncated OR incoming.truncated
+  FROM incoming
+  WHERE stored.sha256 = incoming.sha256
+    AND NOT EXISTS (
+      SELECT 1 FROM inserted WHERE inserted.sha256 = incoming.sha256
+    )
+    AND (
+      stored.chars < incoming.chars
+      OR char_length(stored.preview) < char_length(incoming.preview)
+      OR (NOT stored.truncated AND incoming.truncated)
+    )
+  RETURNING stored.sha256
+)
+SELECT sha256 FROM inserted ORDER BY sha256
+"#;
+const FLUSH_USAGE_PROMPT_CAPTURE_OBSERVATIONS_SQL: &str = r#"
+WITH incoming AS (
+  SELECT *
+  FROM UNNEST(
+    $1::TEXT[],
+    $2::BIGINT[],
+    $3::TIMESTAMPTZ[]
+  ) AS rows (sha256, seen_count, last_seen_at)
+  ORDER BY sha256
+)
+UPDATE usage_prompt_capture_entries AS stored
+SET
+  seen_count = stored.seen_count + incoming.seen_count,
+  last_seen_at = GREATEST(stored.last_seen_at, incoming.last_seen_at)
+FROM incoming
+WHERE stored.sha256 = incoming.sha256
 "#;
 const FIND_WS_CONNECTION_PROMPT_CAPTURE_SQL: &str = r#"
 SELECT
@@ -2121,16 +2159,75 @@ WHERE request_id = $1
   AND status IN ('pending', 'streaming')
 "#;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UsagePromptCaptureObservation {
+    seen_count: i64,
+    last_seen_at: DateTime<Utc>,
+}
+
+#[derive(Debug)]
+struct UsagePromptCaptureObservationBuffer {
+    pending: BTreeMap<String, UsagePromptCaptureObservation>,
+    last_flush: Instant,
+}
+
+impl Default for UsagePromptCaptureObservationBuffer {
+    fn default() -> Self {
+        Self {
+            pending: BTreeMap::new(),
+            last_flush: Instant::now(),
+        }
+    }
+}
+
+impl UsagePromptCaptureObservationBuffer {
+    fn extend(&mut self, observations: BTreeMap<String, UsagePromptCaptureObservation>) {
+        for (sha256, observation) in observations {
+            match self.pending.get_mut(&sha256) {
+                Some(pending) => {
+                    pending.seen_count = pending.seen_count.saturating_add(observation.seen_count);
+                    pending.last_seen_at = pending.last_seen_at.max(observation.last_seen_at);
+                }
+                None => {
+                    self.pending.insert(sha256, observation);
+                }
+            }
+        }
+    }
+
+    fn take_if_due(&mut self, now: Instant) -> BTreeMap<String, UsagePromptCaptureObservation> {
+        if self.pending.is_empty()
+            || now.duration_since(self.last_flush) < PROMPT_CAPTURE_OBSERVATION_FLUSH_INTERVAL
+        {
+            return BTreeMap::new();
+        }
+        self.last_flush = now;
+        std::mem::take(&mut self.pending)
+    }
+
+    fn take_all(&mut self) -> BTreeMap<String, UsagePromptCaptureObservation> {
+        self.last_flush = Instant::now();
+        std::mem::take(&mut self.pending)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SqlxUsageReadRepository {
     pool: PgPool,
     tx_runner: PostgresTransactionRunner,
+    prompt_capture_observations: Arc<Mutex<UsagePromptCaptureObservationBuffer>>,
 }
 
 impl SqlxUsageReadRepository {
     pub fn new(pool: PgPool) -> Self {
         let tx_runner = PostgresTransactionRunner::new(pool.clone());
-        Self { pool, tx_runner }
+        Self {
+            pool,
+            tx_runner,
+            prompt_capture_observations: Arc::new(Mutex::new(
+                UsagePromptCaptureObservationBuffer::default(),
+            )),
+        }
     }
 
     pub fn pool(&self) -> &PgPool {
@@ -2139,6 +2236,52 @@ impl SqlxUsageReadRepository {
 
     pub fn transaction_runner(&self) -> &PostgresTransactionRunner {
         &self.tx_runner
+    }
+
+    fn remember_prompt_capture_observations(
+        &self,
+        observations: BTreeMap<String, UsagePromptCaptureObservation>,
+    ) -> bool {
+        if observations.is_empty() {
+            return false;
+        }
+        self.prompt_capture_observations
+            .lock()
+            .expect("prompt capture observation buffer lock")
+            .extend(observations);
+        true
+    }
+
+    async fn flush_prompt_capture_observations(&self, force: bool) -> Result<(), DataLayerError> {
+        let observations = {
+            let mut buffer = self
+                .prompt_capture_observations
+                .lock()
+                .expect("prompt capture observation buffer lock");
+            if force {
+                buffer.take_all()
+            } else {
+                buffer.take_if_due(Instant::now())
+            }
+        };
+        if observations.is_empty() {
+            return Ok(());
+        }
+
+        let flush_result = async {
+            let mut conn = self.pool.acquire().await.map_postgres_err()?;
+            flush_usage_prompt_capture_observations(&mut conn, &observations).await
+        }
+        .await;
+        if let Err(err) = flush_result {
+            let _ = self.remember_prompt_capture_observations(observations);
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    pub async fn flush_usage_prompt_capture_observations(&self) -> Result<(), DataLayerError> {
+        self.flush_prompt_capture_observations(true).await
     }
 
     async fn read_stats_daily_cutoff_date(&self) -> Result<Option<DateTime<Utc>>, DataLayerError> {
@@ -8200,7 +8343,8 @@ ORDER BY "usage".user_id ASC
     ) -> Result<StoredRequestUsageAudit, DataLayerError> {
         usage.validate()?;
         let usage = strip_deprecated_usage_display_fields(usage);
-        self.tx_runner
+        let (stored, prompt_capture_observations) = self
+            .tx_runner
             .run_read_write(|tx| {
                 Box::pin(async move {
                     lock_usage_request_id_in_tx(tx, &usage.request_id).await?;
@@ -8223,6 +8367,10 @@ ORDER BY "usage".user_id ASC
 
                     let previous_usage =
                         find_usage_by_request_id_in_tx(tx, &usage.request_id).await?;
+                    let should_count_prompt_capture =
+                        !previous_usage.as_ref().is_some_and(|previous| {
+                            usage_metadata_has_prompt_capture(previous.request_metadata.as_ref())
+                        });
 
                     let request_headers_json = json_bind_text(usage.request_headers.as_ref())?;
                     let request_body_storage =
@@ -8320,7 +8468,9 @@ ORDER BY "usage".user_id ASC
                         &usage,
                         request_metadata_value.as_ref(),
                     )?;
-                    sync_usage_prompt_capture_entries(&mut **tx, &prompt_capture_entries).await?;
+                    let prompt_capture_observations =
+                        sync_usage_prompt_capture_entries(&mut **tx, &prompt_capture_entries)
+                            .await?;
                     let request_metadata_json = json_bind_text(request_metadata_value.as_ref())?;
                     let _row = sqlx::query(UPSERT_SQL)
                         .bind(Uuid::new_v4().to_string())
@@ -8652,10 +8802,40 @@ ORDER BY "usage".user_id ASC
                             }
                         }
                     }
-                    Ok(stored)
-                }) as BoxFuture<'_, Result<StoredRequestUsageAudit, DataLayerError>>
+                    Ok((
+                        stored,
+                        if should_count_prompt_capture {
+                            prompt_capture_observations
+                        } else {
+                            BTreeMap::new()
+                        },
+                    ))
+                })
+                    as BoxFuture<
+                        '_,
+                        Result<
+                            (
+                                StoredRequestUsageAudit,
+                                BTreeMap<String, UsagePromptCaptureObservation>,
+                            ),
+                            DataLayerError,
+                        >,
+                    >
             })
-            .await
+            .await?;
+        let observations_added =
+            self.remember_prompt_capture_observations(prompt_capture_observations);
+        if observations_added {
+            if let Err(err) = self.flush_prompt_capture_observations(false).await {
+                warn!(
+                    event_name = "usage_prompt_capture_observation_flush_failed",
+                    log_type = "ops",
+                    error = %err,
+                    "prompt capture observation flush failed after usage commit; buffered deltas will be retried"
+                );
+            }
+        }
+        Ok(stored)
     }
 
     pub async fn flush_usage_counter_deltas(
@@ -8671,7 +8851,8 @@ ORDER BY "usage".user_id ASC
             ))
         })?;
 
-        self.tx_runner
+        let summary = self
+            .tx_runner
             .run_read_write(|tx| {
                 Box::pin(async move {
                     if !try_lock_usage_counter_flush_in_tx(tx).await? {
@@ -8726,7 +8907,9 @@ ORDER BY "usage".user_id ASC
                 })
                     as BoxFuture<'_, Result<UsageCounterFlushSummary, DataLayerError>>
             })
-            .await
+            .await?;
+        self.flush_prompt_capture_observations(false).await?;
+        Ok(summary)
     }
 
     pub async fn enqueue_proxy_node_counter_delta(
@@ -9438,6 +9621,10 @@ impl UsageWriteRepository for SqlxUsageReadRepository {
         batch_size: usize,
     ) -> Result<UsageCounterFlushSummary, DataLayerError> {
         Self::flush_usage_counter_deltas(self, batch_size).await
+    }
+
+    async fn flush_usage_prompt_capture_observations(&self) -> Result<(), DataLayerError> {
+        Self::flush_usage_prompt_capture_observations(self).await
     }
 
     async fn enqueue_proxy_node_counter_delta(
@@ -10956,10 +11143,10 @@ fn prepare_prompt_capture_metadata(
 async fn sync_usage_prompt_capture_entries(
     conn: &mut PgConnection,
     entries: &[UsagePromptCaptureEntry],
-) -> Result<(), DataLayerError> {
+) -> Result<BTreeMap<String, UsagePromptCaptureObservation>, DataLayerError> {
     let entries = aggregate_usage_prompt_capture_entries(entries)?;
     if entries.is_empty() {
-        return Ok(());
+        return Ok(BTreeMap::new());
     }
 
     let mut sha256s = Vec::with_capacity(entries.len());
@@ -10986,13 +11173,57 @@ async fn sync_usage_prompt_capture_entries(
     .into_iter()
     .all(|len| len == sha256s.len()));
 
-    sqlx::query(UPSERT_USAGE_PROMPT_CAPTURE_ENTRIES_SQL)
+    let inserted = sqlx::query(UPSERT_USAGE_PROMPT_CAPTURE_ENTRIES_SQL)
         .bind(&sha256s)
         .bind(&roles)
         .bind(&chars)
         .bind(&previews)
         .bind(&truncated)
         .bind(&seen_counts)
+        .fetch_all(&mut *conn)
+        .await
+        .map_postgres_err()?
+        .into_iter()
+        .map(|row| row.try_get::<String, _>("sha256").map_postgres_err())
+        .collect::<Result<HashSet<_>, _>>()?;
+
+    let observed_at = Utc::now();
+    Ok(sha256s
+        .into_iter()
+        .zip(seen_counts)
+        .filter(|(sha256, _)| !inserted.contains(sha256))
+        .map(|(sha256, seen_count)| {
+            (
+                sha256,
+                UsagePromptCaptureObservation {
+                    seen_count,
+                    last_seen_at: observed_at,
+                },
+            )
+        })
+        .collect())
+}
+
+async fn flush_usage_prompt_capture_observations(
+    conn: &mut PgConnection,
+    observations: &BTreeMap<String, UsagePromptCaptureObservation>,
+) -> Result<(), DataLayerError> {
+    if observations.is_empty() {
+        return Ok(());
+    }
+    let sha256s = observations.keys().cloned().collect::<Vec<_>>();
+    let seen_counts = observations
+        .values()
+        .map(|observation| observation.seen_count)
+        .collect::<Vec<_>>();
+    let last_seen_at = observations
+        .values()
+        .map(|observation| observation.last_seen_at)
+        .collect::<Vec<_>>();
+    sqlx::query(FLUSH_USAGE_PROMPT_CAPTURE_OBSERVATIONS_SQL)
+        .bind(&sha256s)
+        .bind(&seen_counts)
+        .bind(&last_seen_at)
         .execute(&mut *conn)
         .await
         .map_postgres_err()?;

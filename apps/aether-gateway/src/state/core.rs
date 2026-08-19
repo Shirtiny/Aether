@@ -33,7 +33,7 @@ use super::super::async_task::{
 use super::super::cache::{
     AuthApiKeyLastUsedCache, AuthContextCache, DashboardResponseCache, DirectPlanBypassCache,
     ProxyNodeCache, SchedulerAffinityCache, SchedulerAffinitySnapshotEntry,
-    SchedulerAffinityTarget, SystemConfigCache,
+    SchedulerAffinityTarget,
 };
 use super::super::data::{GatewayDataConfig, GatewayDataState};
 use super::super::fallback_metrics;
@@ -75,10 +75,6 @@ use crate::maintenance::spawn_usage_cleanup_worker;
 use crate::maintenance::spawn_usage_counter_flush_worker;
 use crate::maintenance::spawn_wallet_daily_usage_aggregation_worker;
 
-// Writes go through `remember_system_config_write`, which refreshes the cache
-// entry directly, so the TTL only bounds staleness for changes made outside the
-// gateway process. A short TTL cost ~54 `system_configs` reads per request.
-const SYSTEM_CONFIG_CACHE_TTL: Duration = Duration::from_secs(30);
 // Transport resolution reads a proxy node per candidate, so a single request
 // repeats the same handful of lookups tens of times. Node rows back routing
 // decisions and are rewritten by heartbeats and tunnel connect/disconnect, so
@@ -216,7 +212,6 @@ impl AppState {
         self.clear_provider_transport_snapshot_cache();
         self.invalidate_scheduler_affinity_cache();
         self.invalidate_auth_context_cache();
-        self.system_config_cache.clear();
         self.proxy_node_cache.clear();
         self.codex_ws_feature_flags.clear();
         self.frontdoor_user_rpm.clear_system_default_cache();
@@ -225,6 +220,7 @@ impl AppState {
                 .clone()
                 .with_usage_worker_queue(Self::usage_worker_queue_for(&self.runtime_state)),
         );
+        data.clear_system_config_cache();
         self.tunnel = crate::tunnel::EmbeddedTunnelState::with_data_and_runtime_state(
             Arc::clone(&data),
             self.runtime_state.clone(),
@@ -294,7 +290,6 @@ impl AppState {
             scheduler_affinity_epoch: Arc::new(AtomicU64::new(0)),
             codex_ws_catalog_snapshot_generation: Arc::new(StdMutex::new(None)),
             dashboard_response_cache: Arc::new(DashboardResponseCache::default()),
-            system_config_cache: Arc::new(SystemConfigCache::default()),
             proxy_node_cache: Arc::new(ProxyNodeCache::default()),
             codex_ws_feature_flags: Arc::new(
                 crate::codex_ws_config::CodexWsFeatureFlagsSnapshot::default(),
@@ -652,18 +647,10 @@ impl AppState {
         &self,
         key: &str,
     ) -> Result<Option<serde_json::Value>, GatewayError> {
-        if let Some(value) = self.system_config_cache.get(key, SYSTEM_CONFIG_CACHE_TTL) {
-            return Ok(value);
-        }
-
-        let value = self
-            .data
+        self.data
             .find_system_config_value(key)
             .await
-            .map_err(|err| GatewayError::Internal(err.to_string()))?;
-        self.system_config_cache
-            .insert(key.to_string(), value.clone(), SYSTEM_CONFIG_CACHE_TTL);
-        Ok(value)
+            .map_err(|err| GatewayError::Internal(err.to_string()))
     }
 
     pub(crate) async fn upsert_system_config_json_value(
@@ -689,7 +676,7 @@ impl AppState {
             None => None,
         };
         let written = write_result.map_err(|err| GatewayError::Internal(err.to_string()))?;
-        self.remember_system_config_write(
+        self.apply_system_config_write_effects(
             key,
             authoritative.unwrap_or_else(|| Some(written.clone())),
         );
@@ -728,7 +715,7 @@ impl AppState {
             None => None,
         };
         let entry = write_result.map_err(|err| GatewayError::Internal(err.to_string()))?;
-        self.remember_system_config_write(
+        self.apply_system_config_write_effects(
             entry.key.as_str(),
             authoritative.unwrap_or_else(|| Some(entry.value.clone())),
         );
@@ -751,10 +738,7 @@ impl AppState {
         };
         let deleted = write_result.map_err(|err| GatewayError::Internal(err.to_string()))?;
         if let Some(authoritative) = authoritative {
-            self.remember_system_config_write(key, authoritative);
-        } else {
-            self.system_config_cache
-                .insert(key.to_string(), None, SYSTEM_CONFIG_CACHE_TTL);
+            self.apply_system_config_write_effects(key, authoritative);
         }
         if deleted && system_config_key_affects_scheduler(key) {
             self.invalidate_scheduler_affinity_cache();
@@ -789,14 +773,12 @@ impl AppState {
         self.auth_context_cache.invalidation_epoch()
     }
 
-    fn remember_system_config_write(&self, key: &str, value: Option<serde_json::Value>) {
+    fn apply_system_config_write_effects(&self, key: &str, value: Option<serde_json::Value>) {
         if key == crate::codex_ws_config::CODEX_WS_SYSTEM_CONFIG_KEY {
             self.codex_ws_feature_flags.store(
                 crate::codex_ws_config::parse_codex_ws_feature_flags(value.as_ref()),
             );
         }
-        self.system_config_cache
-            .insert(key.to_string(), value, SYSTEM_CONFIG_CACHE_TTL);
         if system_config_key_affects_scheduler(key) {
             self.invalidate_scheduler_affinity_cache();
         }
@@ -833,7 +815,7 @@ impl AppState {
                 | aether_data::repository::system::AdminSystemPurgeTarget::Usage
                 | aether_data::repository::system::AdminSystemPurgeTarget::Stats
         ) {
-            self.system_config_cache.clear();
+            self.data.clear_system_config_cache();
             self.proxy_node_cache.clear();
             self.codex_ws_feature_flags.clear();
             self.invalidate_provider_routing_caches();
@@ -1697,6 +1679,13 @@ impl AppState {
 
         supervisor
     }
+
+    pub async fn flush_usage_prompt_capture_observations(&self) -> Result<(), String> {
+        self.data
+            .flush_usage_prompt_capture_observations()
+            .await
+            .map_err(|err| err.to_string())
+    }
 }
 
 fn should_preserve_runtime_miss_diagnostic(
@@ -1935,7 +1924,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn system_config_reads_use_short_lived_cache_until_app_invalidation() {
+    async fn in_memory_system_config_store_reads_reflect_direct_data_writes() {
         let state = AppState::new()
             .expect("app state should build")
             .with_data_state_for_tests(
@@ -1961,8 +1950,8 @@ mod tests {
             state
                 .read_system_config_json_value("site_name")
                 .await
-                .expect("cached system config read should succeed"),
-            Some(json!("old"))
+                .expect("updated system config read should succeed"),
+            Some(json!("bypassed"))
         );
 
         state

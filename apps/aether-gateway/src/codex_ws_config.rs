@@ -477,7 +477,7 @@ mod tests {
             )
             .await
             .expect("direct test data update should succeed");
-        state.system_config_cache.clear();
+        state.data.clear_system_config_cache();
 
         assert_eq!(read_codex_ws_feature_flags(&state).await, flags);
     }

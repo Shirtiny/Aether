@@ -57,6 +57,7 @@ impl GatewayDataState {
             wallet_writer: None,
             settlement_writer: None,
             system_config_values: None,
+            system_config_cache: std::sync::Arc::new(crate::cache::SystemConfigCache::default()),
         }
     }
 
@@ -115,6 +116,7 @@ impl GatewayDataState {
             wallet_writer: None,
             settlement_writer: None,
             system_config_values: None,
+            system_config_cache: std::sync::Arc::new(crate::cache::SystemConfigCache::default()),
         }
     }
 
@@ -170,6 +172,7 @@ impl GatewayDataState {
             wallet_writer: None,
             settlement_writer: None,
             system_config_values: None,
+            system_config_cache: std::sync::Arc::new(crate::cache::SystemConfigCache::default()),
         }
     }
 
@@ -229,6 +232,7 @@ impl GatewayDataState {
             wallet_writer: None,
             settlement_writer: None,
             system_config_values: None,
+            system_config_cache: std::sync::Arc::new(crate::cache::SystemConfigCache::default()),
         }
     }
 
@@ -292,6 +296,7 @@ impl GatewayDataState {
             wallet_writer: None,
             settlement_writer: None,
             system_config_values: None,
+            system_config_cache: std::sync::Arc::new(crate::cache::SystemConfigCache::default()),
         }
     }
 
@@ -364,6 +369,7 @@ impl GatewayDataState {
             wallet_writer: None,
             settlement_writer: None,
             system_config_values: None,
+            system_config_cache: std::sync::Arc::new(crate::cache::SystemConfigCache::default()),
         }
     }
 }

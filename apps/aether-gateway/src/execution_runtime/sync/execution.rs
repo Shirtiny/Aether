@@ -15,7 +15,8 @@ use aether_scheduler_core::{
 };
 use aether_usage_runtime::{
     build_lifecycle_usage_seed, build_sync_terminal_usage_payload_seed,
-    build_terminal_usage_context_seed, build_usage_event_data_seed, UsageEvent, UsageEventType,
+    build_terminal_usage_context_seed_with_policy, build_usage_event_data_seed_with_policy,
+    UsageBodyCapturePolicy, UsageEvent, UsageEventType,
 };
 use async_stream::stream;
 use axum::body::{to_bytes, Body, Bytes};
@@ -116,6 +117,7 @@ struct SyncAttemptTerminalGuard {
     plan: ExecutionPlan,
     report_context: Option<Value>,
     candidate_started_unix_ms: u64,
+    body_capture_policy: UsageBodyCapturePolicy,
     armed: bool,
 }
 
@@ -125,12 +127,14 @@ impl SyncAttemptTerminalGuard {
         plan: &ExecutionPlan,
         report_context: Option<Value>,
         candidate_started_unix_ms: u64,
+        body_capture_policy: UsageBodyCapturePolicy,
     ) -> Self {
         Self {
             state: state.clone(),
             plan: plan.clone(),
             report_context,
             candidate_started_unix_ms,
+            body_capture_policy,
             armed: true,
         }
     }
@@ -149,6 +153,7 @@ impl SyncAttemptTerminalGuard {
             self.plan.clone(),
             self.report_context.clone(),
             self.candidate_started_unix_ms,
+            self.body_capture_policy,
             UsageEventType::Failed,
             RequestCandidateStatus::Failed,
             StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
@@ -169,6 +174,7 @@ impl Drop for SyncAttemptTerminalGuard {
         let plan = self.plan.clone();
         let report_context = self.report_context.clone();
         let candidate_started_unix_ms = self.candidate_started_unix_ms;
+        let body_capture_policy = self.body_capture_policy;
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 record_sync_attempt_forced_terminal_state(
@@ -176,6 +182,7 @@ impl Drop for SyncAttemptTerminalGuard {
                     plan,
                     report_context,
                     candidate_started_unix_ms,
+                    body_capture_policy,
                     UsageEventType::Cancelled,
                     RequestCandidateStatus::Cancelled,
                     499,
@@ -202,6 +209,7 @@ async fn record_sync_attempt_forced_terminal_state(
     plan: ExecutionPlan,
     report_context: Option<Value>,
     candidate_started_unix_ms: u64,
+    body_capture_policy: UsageBodyCapturePolicy,
     usage_event_type: UsageEventType,
     candidate_status: RequestCandidateStatus,
     status_code: u16,
@@ -231,7 +239,11 @@ async fn record_sync_attempt_forced_terminal_state(
         return;
     }
 
-    let mut usage_data = build_usage_event_data_seed(&plan, report_context.as_ref());
+    let mut usage_data = build_usage_event_data_seed_with_policy(
+        &plan,
+        report_context.as_ref(),
+        body_capture_policy,
+    );
     usage_data.status_code = Some(status_code);
     usage_data.error_message = Some(error_message.clone());
     usage_data.error_category = Some(
@@ -256,9 +268,10 @@ async fn record_sync_attempt_forced_terminal_state(
 
     state
         .usage_runtime
-        .record_terminal_event_direct(
+        .record_terminal_event_direct_with_policy(
             state.data.as_ref(),
             UsageEvent::new(usage_event_type, plan.request_id.clone(), usage_data),
+            body_capture_policy,
         )
         .await;
 }
@@ -295,8 +308,10 @@ async fn record_sync_terminal_usage(
     plan: &ExecutionPlan,
     report_context: Option<&serde_json::Value>,
     payload: &GatewaySyncReportRequest,
+    body_capture_policy: UsageBodyCapturePolicy,
 ) {
-    let context_seed = build_terminal_usage_context_seed(plan, report_context);
+    let context_seed =
+        build_terminal_usage_context_seed_with_policy(plan, report_context, body_capture_policy);
     let payload_seed = build_sync_terminal_usage_payload_seed(payload);
     if let Err(err) = state
         .usage_runtime
@@ -320,7 +335,14 @@ async fn record_sync_terminal_usage_and_disarm_guard(
     payload: &GatewaySyncReportRequest,
     terminal_guard: &mut SyncAttemptTerminalGuard,
 ) {
-    record_sync_terminal_usage(state, plan, report_context, payload).await;
+    record_sync_terminal_usage(
+        state,
+        plan,
+        report_context,
+        payload,
+        terminal_guard.body_capture_policy,
+    )
+    .await;
     terminal_guard.disarm();
 }
 
@@ -1524,6 +1546,15 @@ async fn execute_execution_runtime_sync_impl(
         .unwrap_or_else(|| "-".to_string());
     let candidate_started_unix_secs = current_request_candidate_unix_ms();
     let lifecycle_seed = build_lifecycle_usage_seed(&plan, report_context.as_ref());
+    let body_capture_policy = state
+        .usage_runtime
+        .resolve_body_capture_policy(
+            state.data.as_ref(),
+            lifecycle_seed.user_id.as_deref(),
+            lifecycle_seed.request_id.as_str(),
+        )
+        .await;
+    let lifecycle_seed = lifecycle_seed.with_body_capture_policy(body_capture_policy);
     state
         .usage_runtime
         .record_pending(state.data.as_ref(), lifecycle_seed);
@@ -1547,6 +1578,7 @@ async fn execute_execution_runtime_sync_impl(
         &plan,
         report_context.clone(),
         candidate_started_unix_secs,
+        body_capture_policy,
     );
     let result = (async {
     let _provider_pool_in_flight_guard = acquire_provider_pool_in_flight_guard(
@@ -2850,8 +2882,13 @@ mod tests {
         .await;
 
         {
-            let _guard =
-                SyncAttemptTerminalGuard::new(&state, &plan, report_context.clone(), started_at);
+            let _guard = SyncAttemptTerminalGuard::new(
+                &state,
+                &plan,
+                report_context.clone(),
+                started_at,
+                UsageBodyCapturePolicy::default(),
+            );
         }
 
         let mut stored_usage = None;

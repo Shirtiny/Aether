@@ -1850,6 +1850,10 @@ pub trait UsageWriteRepository: Send + Sync {
         Ok(UsageCounterFlushSummary::default())
     }
 
+    async fn flush_usage_prompt_capture_observations(&self) -> Result<(), crate::DataLayerError> {
+        Ok(())
+    }
+
     async fn enqueue_proxy_node_counter_delta(
         &self,
         delta: ProxyNodeCounterDelta,
