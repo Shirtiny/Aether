@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -61,6 +61,7 @@ const MAX_TERMINAL_ID_BYTES: usize = 256;
 const MAX_TERMINAL_MODEL_BYTES: usize = 256;
 const MAX_HANDSHAKE_ERROR_BODY_BYTES: usize = 8 * 1024;
 const STEP_PERMIT_RELEASE_TIMEOUT: Duration = Duration::from_millis(100);
+const MAX_TURN_AUTH_REFRESH_ATTEMPTS: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CodexWsRouteKind {
@@ -599,12 +600,11 @@ pub(crate) struct GatewayCodexWsRuntime {
     state: AppState,
     request_headers: HeaderMap,
     request_uri: Uri,
-    decision: GatewayControlDecision,
+    decision: tokio::sync::RwLock<GatewayControlDecision>,
     trace_id: String,
     shared_global: super::hot_state::CodexWsHotLease,
     remote_ip: std::net::IpAddr,
-    auth_context_epoch: u64,
-    cold_policy_validated: AtomicBool,
+    auth_context_epoch: AtomicU64,
     usage_report_tx: tokio::sync::mpsc::Sender<CodexWsUsageCommit>,
     settlement_tx: tokio::sync::mpsc::Sender<CodexWsSettlementCommit>,
     connector: CodexWebSocketConnector,
@@ -652,35 +652,154 @@ impl Drop for ConnectAttemptCancellationGuard {
     }
 }
 
+fn sanitize_runtime_request_headers(mut headers: HeaderMap) -> HeaderMap {
+    let connection_scoped_names = headers
+        .get_all(http::header::CONNECTION)
+        .iter()
+        .flat_map(|value| value.as_bytes().split(|byte| *byte == b','))
+        .filter_map(|name| HeaderName::from_bytes(name.trim_ascii()).ok())
+        .collect::<Vec<_>>();
+    for name in connection_scoped_names {
+        headers.remove(name);
+    }
+
+    for name in [
+        http::header::AUTHORIZATION.as_str(),
+        "x-api-key",
+        "api-key",
+        "x-goog-api-key",
+        http::header::COOKIE.as_str(),
+        http::header::PROXY_AUTHORIZATION.as_str(),
+        http::header::CONNECTION.as_str(),
+        http::header::UPGRADE.as_str(),
+        super::protocol::ROUTE_CONTROL_ACCEPT_HEADER,
+        super::protocol::ROUTE_CONTROL_SELECTED_HEADER,
+        super::protocol::ROUTE_CONTROL_CAPABILITIES_HEADER,
+    ] {
+        headers.remove(name);
+    }
+    let websocket_managed_names = headers
+        .keys()
+        .filter(|name| name.as_str().starts_with("sec-websocket-"))
+        .cloned()
+        .collect::<Vec<_>>();
+    for name in websocket_managed_names {
+        headers.remove(name);
+    }
+    headers
+}
+
+fn sanitize_runtime_request_uri(uri: Uri) -> Result<Uri, PeerError> {
+    let Some(query) = uri.query() else {
+        return Ok(uri);
+    };
+    let pairs = url::form_urlencoded::parse(query.as_bytes()).collect::<Vec<_>>();
+    if !pairs.iter().any(|(name, _)| name == "key") {
+        return Ok(uri);
+    }
+
+    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    for (name, value) in pairs {
+        if name != "key" {
+            serializer.append_pair(&name, &value);
+        }
+    }
+    let query = serializer.finish();
+    let path = uri.path().to_string();
+    let path_and_query = if query.is_empty() {
+        path
+    } else {
+        format!("{path}?{query}")
+    };
+    let mut parts = uri.into_parts();
+    parts.path_and_query = Some(
+        path_and_query
+            .parse()
+            .map_err(|_| PeerError("Responses WebSocket request URI is invalid".into()))?,
+    );
+    Uri::from_parts(parts)
+        .map_err(|_| PeerError("Responses WebSocket request URI is invalid".into()))
+}
+
 impl GatewayCodexWsRuntime {
     pub(crate) fn new(
         state: AppState,
         request_headers: HeaderMap,
         request_uri: Uri,
-        decision: GatewayControlDecision,
+        mut decision: GatewayControlDecision,
         trace_id: String,
         shared_global: super::hot_state::CodexWsHotLease,
         remote_ip: std::net::IpAddr,
         auth_context_epoch: u64,
     ) -> Result<Self, PeerError> {
+        if decision.auth_context.is_none() {
+            return Err(PeerError(
+                "Responses WebSocket runtime auth context is missing".into(),
+            ));
+        }
         let connector = CodexWebSocketConnector::new()
             .map_err(|_| PeerError("failed to initialize pinned Codex WS connector".into()))?;
+        let request_headers = sanitize_runtime_request_headers(request_headers);
+        let request_uri = sanitize_runtime_request_uri(request_uri)?;
+        decision.public_query_string = request_uri.query().map(ToOwned::to_owned);
         let usage_report_tx = state.codex_ws_usage_reporter.sender();
         let settlement_tx = state.codex_ws_usage_reporter.settlement_sender();
         Ok(Self {
             state,
             request_headers,
             request_uri,
-            decision,
+            decision: tokio::sync::RwLock::new(decision),
             trace_id,
             shared_global,
             remote_ip,
-            auth_context_epoch,
-            cold_policy_validated: AtomicBool::new(false),
+            auth_context_epoch: AtomicU64::new(auth_context_epoch),
             usage_report_tx,
             settlement_tx,
             connector,
         })
+    }
+
+    /// Refresh the mutable request authorization context before every
+    /// response.create. The Upgrade-time decision remains the route identity,
+    /// while auth state, model permissions, wallet access, and IP rules are
+    /// re-read for each turn.
+    async fn refresh_turn_decision(&self) -> Result<GatewayControlDecision, StepPreparationError> {
+        for _ in 0..MAX_TURN_AUTH_REFRESH_ATTEMPTS {
+            let refresh_epoch = self.state.auth_context_invalidation_epoch();
+            let snapshot = self.decision.read().await.clone();
+            let auth_context = crate::control::resolve_execution_runtime_auth_context(
+                &self.state,
+                &snapshot,
+                &self.request_headers,
+                &self.request_uri,
+                &self.trace_id,
+            )
+            .await
+            .map_err(|_| StepPreparationError::retain("step_auth_refresh_failed"))?;
+
+            if self.state.auth_context_invalidation_epoch() != refresh_epoch {
+                continue;
+            }
+
+            let mut refreshed = snapshot;
+            refreshed.auth_context = auth_context;
+            refreshed.local_auth_rejection = refreshed
+                .auth_context
+                .as_ref()
+                .and_then(|auth_context| auth_context.local_rejection.clone());
+
+            *self.decision.write().await = refreshed.clone();
+            self.auth_context_epoch
+                .store(refresh_epoch, Ordering::Release);
+            return Ok(refreshed);
+        }
+        Err(StepPreparationError::retain(
+            "step_principal_snapshot_invalidated",
+        ))
+    }
+
+    async fn decision_snapshot(&self) -> GatewayControlDecision {
+        self.decision.read().await.clone()
     }
 
     fn request_parts(&self) -> Result<http::request::Parts, PeerError> {
@@ -832,7 +951,9 @@ impl GatewayCodexWsRuntime {
 #[async_trait]
 impl CodexWsRuntimePort for GatewayCodexWsRuntime {
     fn validate_runtime_fences(&self) -> Result<(), StepPreparationError> {
-        if self.state.auth_context_invalidation_epoch() != self.auth_context_epoch {
+        if self.state.auth_context_invalidation_epoch()
+            != self.auth_context_epoch.load(Ordering::Acquire)
+        {
             return Err(StepPreparationError::retain(
                 "step_principal_snapshot_invalidated",
             ));
@@ -841,9 +962,9 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
     }
 
     async fn validate_step(&self, step: &ResponseCreateStep) -> Result<(), StepPreparationError> {
+        let decision = self.refresh_turn_decision().await?;
         self.validate_runtime_fences()?;
-        let decision = &self.decision;
-        if crate::control::trusted_auth_local_rejection(Some(decision), &self.request_headers)
+        if crate::control::trusted_auth_local_rejection(Some(&decision), &self.request_headers)
             .is_some()
         {
             return Err(StepPreparationError::retain("step_auth_rejected"));
@@ -860,25 +981,22 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
         {
             return Err(StepPreparationError::retain("step_access_rejected"));
         }
-        if !self.cold_policy_validated.load(Ordering::Acquire) {
-            if crate::control::request_model_local_rejection_from_json(
-                &self.state,
-                Some(decision),
-                &self.request_uri,
-                &step.value,
-            )
-            .await
-            .map_err(|_| StepPreparationError::retain("step_policy_lookup_failed"))?
-            .is_some()
-            {
-                return Err(StepPreparationError::retain("step_policy_rejected"));
-            }
-            self.cold_policy_validated.store(true, Ordering::Release);
+        if crate::control::request_model_local_rejection_from_json(
+            &self.state,
+            Some(&decision),
+            &self.request_uri,
+            &step.value,
+        )
+        .await
+        .map_err(|_| StepPreparationError::retain("step_policy_lookup_failed"))?
+        .is_some()
+        {
+            return Err(StepPreparationError::retain("step_policy_rejected"));
         }
         match self
             .state
             .frontdoor_user_rpm()
-            .check_and_consume(&self.state, Some(decision))
+            .check_and_consume(&self.state, Some(&decision))
             .await
             .map_err(|_| StepPreparationError::retain("step_rate_limit_unavailable"))?
         {
@@ -895,6 +1013,7 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
         first_step: &ResponseCreateStep,
     ) -> Result<Vec<CodexWsCandidate>, StepPreparationError> {
         self.validate_runtime_fences()?;
+        let decision = self.decision_snapshot().await;
         let shared_global = self.shared_global.clone();
         let shared_catalog = super::hot_state::ensure_catalog_hot_lease(&self.state)
             .await
@@ -925,7 +1044,7 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
             &self.state,
             &parts,
             &self.trace_id,
-            &self.decision,
+            &decision,
             &first_step.value,
             OPENAI_RESPONSES_STREAM_PLAN_KIND,
             &required_capabilities,
@@ -3038,8 +3157,225 @@ impl Sink<RelayFrame> for OfficialPeer {
 
 #[cfg(test)]
 mod tests {
+    use aether_data::repository::auth::{
+        AuthApiKeyWriteRepository, InMemoryAuthApiKeySnapshotRepository, StoredAuthApiKeySnapshot,
+    };
+
     use super::*;
     use crate::codex_ws::protocol::StepFence;
+    use crate::data::GatewayDataState;
+
+    #[test]
+    fn runtime_requires_upgrade_time_authorization_before_credentials_are_discarded() {
+        let decision = GatewayControlDecision::synthetic(
+            "/v1/responses",
+            Some("ai_public".to_string()),
+            Some("openai".to_string()),
+            Some("responses_websocket".to_string()),
+            Some("openai:responses".to_string()),
+        );
+        let result = GatewayCodexWsRuntime::new(
+            AppState::new().expect("test state should build"),
+            HeaderMap::new(),
+            Uri::from_static("/v1/responses"),
+            decision,
+            "trace-missing-auth".to_string(),
+            super::super::hot_state::CodexWsHotLease {
+                generation: "generation-1".to_string(),
+                eligible: false,
+            },
+            std::net::IpAddr::from([127, 0, 0, 1]),
+            0,
+        );
+
+        let Err(error) = result else {
+            panic!("missing auth context must fail");
+        };
+        assert_eq!(
+            error.0,
+            "Responses WebSocket runtime auth context is missing"
+        );
+    }
+
+    #[test]
+    fn runtime_request_headers_drop_downstream_credentials_and_websocket_hops() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            "Bearer secret".parse().unwrap(),
+        );
+        headers.insert("x-api-key", "secret-key".parse().unwrap());
+        headers.insert(http::header::COOKIE, "session=secret".parse().unwrap());
+        headers.insert(
+            http::header::CONNECTION,
+            "upgrade, x-private-hop".parse().unwrap(),
+        );
+        headers.insert("x-private-hop", "private".parse().unwrap());
+        headers.insert("sec-websocket-key", "socket-secret".parse().unwrap());
+        headers.insert(
+            super::super::protocol::ROUTE_CONTROL_ACCEPT_HEADER,
+            super::super::protocol::ROUTE_CONTROL_VERSION
+                .parse()
+                .unwrap(),
+        );
+        headers.insert("x-client-feature", "retained".parse().unwrap());
+
+        let sanitized = sanitize_runtime_request_headers(headers);
+
+        for name in [
+            "authorization",
+            "x-api-key",
+            "cookie",
+            "connection",
+            "x-private-hop",
+            "sec-websocket-key",
+            super::super::protocol::ROUTE_CONTROL_ACCEPT_HEADER,
+        ] {
+            assert!(!sanitized.contains_key(name), "header survived: {name}");
+        }
+        assert_eq!(
+            sanitized
+                .get("x-client-feature")
+                .and_then(|value| value.to_str().ok()),
+            Some("retained")
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_decision_refresh_reloads_a_revoked_api_key_and_authorization_epoch() {
+        let api_key = "sk-ws-turn-refresh";
+        let key_hash = format!("{:x}", Sha256::digest(api_key.as_bytes()));
+        let auth_repository = Arc::new(InMemoryAuthApiKeySnapshotRepository::seed([(
+            Some(key_hash),
+            StoredAuthApiKeySnapshot::new(
+                "user-1".to_string(),
+                "alice".to_string(),
+                None,
+                "user".to_string(),
+                "local".to_string(),
+                true,
+                false,
+                Some(json!(["openai"])),
+                Some(json!(["openai:responses"])),
+                Some(json!(["gpt-test"])),
+                "key-1".to_string(),
+                Some("WS key".to_string()),
+                true,
+                false,
+                true,
+                None,
+                None,
+                Some(4_102_444_800),
+                Some(json!(["openai"])),
+                Some(json!(["openai:responses"])),
+                Some(json!(["gpt-test"])),
+            )
+            .expect("auth snapshot should build"),
+        )]));
+        let data =
+            GatewayDataState::with_auth_api_key_repository_for_tests(Arc::clone(&auth_repository));
+        let state = AppState::new()
+            .expect("test state should build")
+            .with_data_state_for_tests(data);
+        let initial_auth_epoch = state.auth_context_invalidation_epoch();
+        let request_uri = Uri::from_static(
+            "/v1/responses?key=query-credential-must-not-survive&client_feature=retained",
+        );
+        let mut decision = GatewayControlDecision::synthetic(
+            "/v1/responses",
+            Some("ai_public".to_string()),
+            Some("openai".to_string()),
+            Some("responses_websocket".to_string()),
+            Some("openai:responses".to_string()),
+        );
+        decision.public_query_string = request_uri.query().map(ToOwned::to_owned);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", api_key.parse().expect("API key header"));
+        let auth_context = crate::control::resolve_execution_runtime_auth_context(
+            &state,
+            &decision,
+            &headers,
+            &request_uri,
+            "trace-refresh-test",
+        )
+        .await
+        .expect("initial auth resolution should succeed")
+        .expect("initial auth context should exist");
+        decision.local_auth_rejection = auth_context.local_rejection.clone();
+        decision.auth_context = Some(auth_context);
+        let runtime = GatewayCodexWsRuntime::new(
+            state.clone(),
+            headers,
+            request_uri,
+            decision,
+            "trace-refresh-test".to_string(),
+            super::super::hot_state::CodexWsHotLease {
+                generation: "generation-1".to_string(),
+                eligible: false,
+            },
+            std::net::IpAddr::from([127, 0, 0, 1]),
+            initial_auth_epoch,
+        )
+        .expect("Codex WS runtime should build");
+        assert!(!runtime.request_headers.contains_key("x-api-key"));
+        assert_eq!(runtime.request_uri.query(), Some("client_feature=retained"));
+        assert_eq!(
+            runtime
+                .decision_snapshot()
+                .await
+                .public_query_string
+                .as_deref(),
+            Some("client_feature=retained")
+        );
+
+        let initial = runtime
+            .refresh_turn_decision()
+            .await
+            .expect("initial turn decision should refresh");
+        assert!(runtime.validate_runtime_fences().is_ok());
+        assert_eq!(
+            initial
+                .auth_context
+                .as_ref()
+                .and_then(|context| context.allowed_models.as_deref())
+                .and_then(|models| models.first())
+                .map(String::as_str),
+            Some("gpt-test")
+        );
+        assert!(initial
+            .auth_context
+            .as_ref()
+            .is_some_and(|context| context.access_allowed));
+
+        auth_repository
+            .set_standalone_api_key_active("key-1", false)
+            .await
+            .expect("API key update should succeed")
+            .expect("API key should exist");
+        state.invalidate_auth_context_cache();
+        assert!(runtime.validate_runtime_fences().is_err());
+
+        let revoked = runtime
+            .refresh_turn_decision()
+            .await
+            .expect("revoked turn decision should refresh");
+        assert!(runtime.validate_runtime_fences().is_ok());
+        assert!(revoked
+            .auth_context
+            .as_ref()
+            .is_some_and(|context| !context.access_allowed));
+        assert_eq!(
+            revoked
+                .auth_context
+                .as_ref()
+                .and_then(|context| context.local_rejection.as_ref()),
+            Some(&crate::control::GatewayLocalAuthRejection::InvalidApiKey)
+        );
+        assert_eq!(
+            runtime.decision_snapshot().await.local_auth_rejection,
+            Some(crate::control::GatewayLocalAuthRejection::InvalidApiKey)
+        );
+    }
 
     #[test]
     fn official_close_error_preserves_code_and_reason() {

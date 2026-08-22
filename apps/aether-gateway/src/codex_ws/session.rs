@@ -4396,6 +4396,7 @@ mod tests {
 
         run_codex_ws_session(Box::new(client), &runtime).await;
 
+        assert_eq!(runtime.validate_calls.load(Ordering::Relaxed), 2);
         assert_eq!(runtime.select_calls.load(Ordering::Relaxed), 2);
         assert_eq!(runtime.connect_calls.load(Ordering::Relaxed), 1);
         assert_eq!(runtime.prepare_calls.load(Ordering::Relaxed), 2);
