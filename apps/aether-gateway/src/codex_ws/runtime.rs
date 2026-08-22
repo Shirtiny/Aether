@@ -766,7 +766,29 @@ impl GatewayCodexWsRuntime {
     async fn refresh_turn_decision(&self) -> Result<GatewayControlDecision, StepPreparationError> {
         for _ in 0..MAX_TURN_AUTH_REFRESH_ATTEMPTS {
             let refresh_epoch = self.state.auth_context_invalidation_epoch();
-            let snapshot = self.decision.read().await.clone();
+            let mut snapshot = self.decision.read().await.clone();
+            // The shared HTTP refresh helper intentionally short-circuits an
+            // already denied context. A long-lived WS must be able to recover
+            // after a key is re-enabled or a wallet is replenished, so use
+            // only the stable identity fields as the refresh seed and always
+            // read current authorization state from the repository.
+            let can_force_repository_refresh = self.state.has_auth_api_key_reader()
+                && snapshot
+                    .auth_endpoint_signature
+                    .as_deref()
+                    .is_some_and(|signature| !signature.trim().is_empty())
+                && snapshot.auth_context.as_ref().is_some_and(|context| {
+                    !context.user_id.trim().is_empty() && !context.api_key_id.trim().is_empty()
+                });
+            if can_force_repository_refresh {
+                let auth_context = snapshot
+                    .auth_context
+                    .as_mut()
+                    .expect("refresh identity was checked above");
+                auth_context.access_allowed = true;
+                auth_context.balance_remaining = None;
+                auth_context.local_rejection = None;
+            }
             let auth_context = crate::control::resolve_execution_runtime_auth_context(
                 &self.state,
                 &snapshot,
@@ -3375,6 +3397,25 @@ mod tests {
             runtime.decision_snapshot().await.local_auth_rejection,
             Some(crate::control::GatewayLocalAuthRejection::InvalidApiKey)
         );
+
+        auth_repository
+            .set_standalone_api_key_active("key-1", true)
+            .await
+            .expect("API key restore should succeed")
+            .expect("API key should exist");
+        state.invalidate_auth_context_cache();
+        let restored = runtime
+            .refresh_turn_decision()
+            .await
+            .expect("restored turn decision should refresh");
+        assert!(restored
+            .auth_context
+            .as_ref()
+            .is_some_and(|context| context.access_allowed));
+        assert!(restored
+            .auth_context
+            .as_ref()
+            .is_some_and(|context| context.local_rejection.is_none()));
     }
 
     #[test]
