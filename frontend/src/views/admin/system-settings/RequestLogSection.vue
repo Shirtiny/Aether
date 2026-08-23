@@ -166,7 +166,7 @@
                 for="prompt-max-items"
                 class="block text-sm font-medium"
               >
-                单请求最大条目
+                最近条目保留数
               </Label>
               <Input
                 id="prompt-max-items"

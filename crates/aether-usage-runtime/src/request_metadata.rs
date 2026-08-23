@@ -9,12 +9,14 @@ use aether_data_contracts::repository::usage::{
 };
 use serde_json::{json, Map, Value};
 
+use crate::runtime::USAGE_PROMPT_CAPTURE_INITIAL_ITEMS;
+
 const MAX_USAGE_REQUEST_METADATA_DEPTH: usize = 32;
 const MAX_USAGE_REQUEST_METADATA_NODES: usize = 4_000;
 const MAX_USAGE_REQUEST_METADATA_BYTES: usize = 16 * 1024;
 const MAX_USAGE_REQUEST_METADATA_STRING_BYTES: usize = 1_024;
 const MAX_USAGE_PROMPT_CAPTURE_ROLE_COUNTS: usize = 32;
-const MAX_USAGE_PROMPT_CAPTURE_ITEMS: usize = 256;
+const MAX_USAGE_PROMPT_CAPTURE_ITEMS: usize = 256 + USAGE_PROMPT_CAPTURE_INITIAL_ITEMS;
 const MAX_USAGE_PROMPT_CAPTURE_PREVIEW_BYTES: usize = 8 * 1024;
 const USAGE_PROMPT_CAPTURE_PREVIEW_BYTE_BUDGETS: [usize; 8] =
     [4 * 1024, 2 * 1024, 1024, 512, 256, 128, 64, 0];
@@ -436,15 +438,28 @@ fn copy_prompt_capture_items(source: &Map<String, Value>, target: &mut Map<Strin
     let Some(items) = source.get("items").and_then(Value::as_array) else {
         return;
     };
-    let mut items = items
-        .iter()
-        .rev()
-        .filter_map(sanitize_prompt_capture_item)
-        .take(MAX_USAGE_PROMPT_CAPTURE_ITEMS)
-        .collect::<Vec<_>>();
-    items.reverse();
-    if !items.is_empty() {
-        target.insert("items".to_string(), Value::Array(items));
+    let mut sanitized = Vec::with_capacity(items.len().min(MAX_USAGE_PROMPT_CAPTURE_ITEMS));
+    if items.len() <= MAX_USAGE_PROMPT_CAPTURE_ITEMS {
+        sanitized.extend(items.iter().filter_map(sanitize_prompt_capture_item));
+    } else {
+        sanitized.extend(
+            items
+                .iter()
+                .take(USAGE_PROMPT_CAPTURE_INITIAL_ITEMS)
+                .filter_map(sanitize_prompt_capture_item),
+        );
+        sanitized.extend(
+            items
+                .iter()
+                .skip(
+                    items.len()
+                        - (MAX_USAGE_PROMPT_CAPTURE_ITEMS - USAGE_PROMPT_CAPTURE_INITIAL_ITEMS),
+                )
+                .filter_map(sanitize_prompt_capture_item),
+        );
+    }
+    if !sanitized.is_empty() {
+        target.insert("items".to_string(), Value::Array(sanitized));
     }
 }
 
@@ -555,6 +570,10 @@ fn retain_prompt_capture_items(capture: &mut Value, max_items: usize) {
     let Some(items) = capture.get_mut("items").and_then(Value::as_array_mut) else {
         return;
     };
+    retain_prompt_capture_items_in_order(items, max_items);
+}
+
+fn retain_prompt_capture_items_in_order(items: &mut Vec<Value>, max_items: usize) {
     if items.len() <= max_items {
         return;
     }
@@ -562,8 +581,16 @@ fn retain_prompt_capture_items(capture: &mut Value, max_items: usize) {
         items.clear();
         return;
     }
-    let start = items.len().saturating_sub(max_items);
-    *items = items.split_off(start);
+
+    let initial_count = USAGE_PROMPT_CAPTURE_INITIAL_ITEMS.min(max_items);
+    let recent_count = max_items.saturating_sub(initial_count);
+    let recent_start = items.len().saturating_sub(recent_count);
+    let mut retained = Vec::with_capacity(max_items);
+    retained.extend(items.iter().take(initial_count).cloned());
+    if recent_count > 0 {
+        retained.extend(items.iter().skip(recent_start).cloned());
+    }
+    *items = retained;
 }
 
 fn prompt_capture_string(
@@ -790,9 +817,9 @@ mod tests {
         attach_provider_request_body_metadata, build_usage_request_metadata_seed,
         merge_usage_request_metadata, merge_usage_request_metadata_owned,
         sanitize_usage_request_metadata, sanitize_usage_request_metadata_ref,
-        usage_request_metadata_within_limits, MAX_USAGE_PROMPT_CAPTURE_PREVIEW_BYTES,
-        MAX_USAGE_REQUEST_METADATA_BYTES, MAX_USAGE_REQUEST_METADATA_DEPTH,
-        MAX_USAGE_REQUEST_METADATA_NODES,
+        usage_request_metadata_within_limits, MAX_USAGE_PROMPT_CAPTURE_ITEMS,
+        MAX_USAGE_PROMPT_CAPTURE_PREVIEW_BYTES, MAX_USAGE_REQUEST_METADATA_BYTES,
+        MAX_USAGE_REQUEST_METADATA_DEPTH, MAX_USAGE_REQUEST_METADATA_NODES,
     };
 
     fn sample_plan() -> ExecutionPlan {
@@ -1061,16 +1088,15 @@ mod tests {
             .expect("items should remain");
 
         assert_eq!(capture.get("item_count"), Some(&json!(300)));
-        assert!(items.len() < 256);
-        let expected_first = format!("{:064x}", 300 - items.len());
+        assert!(items.len() < MAX_USAGE_PROMPT_CAPTURE_ITEMS);
+        for (index, item) in items.iter().take(10).enumerate() {
+            let expected = format!("{index:064x}");
+            assert_eq!(
+                item.get("sha256").and_then(Value::as_str),
+                Some(expected.as_str())
+            );
+        }
         let expected_last = format!("{:064x}", 299);
-        assert_eq!(
-            items
-                .first()
-                .and_then(|item| item.get("sha256"))
-                .and_then(Value::as_str),
-            Some(expected_first.as_str())
-        );
         assert_eq!(
             items
                 .last()

@@ -49,6 +49,11 @@ pub struct UsagePromptCapturePolicy {
     pub max_items: usize,
 }
 
+/// Prompt captures retain a small chronological prefix in addition to the
+/// configurable recent-item window so that the request's initial context is
+/// still available for inspection.
+pub(crate) const USAGE_PROMPT_CAPTURE_INITIAL_ITEMS: usize = 10;
+
 impl Default for UsagePromptCapturePolicy {
     fn default() -> Self {
         Self {

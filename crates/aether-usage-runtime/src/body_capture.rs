@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io::{self, Write};
 
 use aether_data_contracts::repository::usage::{
@@ -8,7 +9,10 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
 use crate::event::UsageEvent;
-use crate::runtime::{UsageBodyCapturePolicy, UsagePromptCapturePolicy, UsageRequestRecordLevel};
+use crate::runtime::{
+    UsageBodyCapturePolicy, UsagePromptCapturePolicy, UsageRequestRecordLevel,
+    USAGE_PROMPT_CAPTURE_INITIAL_ITEMS,
+};
 
 const TRUNCATED_BODY_STRING_SUFFIX: &str = "...[truncated]";
 
@@ -736,12 +740,57 @@ impl PromptCaptureRole {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct CapturedPrompt {
     source: String,
     index: Option<usize>,
     role: PromptCaptureRole,
     text: String,
+}
+
+/// Keeps the chronological prefix and the most recent unique prompts without
+/// retaining the full request history in memory.
+#[derive(Debug)]
+struct PromptCaptureSelection {
+    initial: Vec<CapturedPrompt>,
+    recent: VecDeque<CapturedPrompt>,
+    max_recent: usize,
+}
+
+impl PromptCaptureSelection {
+    fn new(max_recent: usize) -> Self {
+        Self {
+            initial: Vec::with_capacity(USAGE_PROMPT_CAPTURE_INITIAL_ITEMS),
+            recent: VecDeque::with_capacity(max_recent),
+            max_recent,
+        }
+    }
+
+    fn push(&mut self, candidate: CapturedPrompt) {
+        let text = candidate.text.as_str();
+
+        if self.initial.iter().any(|prompt| prompt.text == text) {
+            return;
+        }
+        if self.initial.len() < USAGE_PROMPT_CAPTURE_INITIAL_ITEMS {
+            self.initial.push(candidate);
+            return;
+        }
+
+        if let Some(index) = self.recent.iter().position(|prompt| prompt.text == text) {
+            self.recent.remove(index);
+        }
+        self.recent.push_back(candidate);
+        while self.recent.len() > self.max_recent {
+            self.recent.pop_front();
+        }
+    }
+
+    fn into_items(self) -> Vec<CapturedPrompt> {
+        let mut items = self.initial;
+        items.extend(self.recent);
+        items
+    }
 }
 
 fn append_prompt_capture_metadata(
@@ -754,26 +803,31 @@ fn append_prompt_capture_metadata(
         return;
     }
 
-    let mut prompts = Vec::new();
+    let mut request_selection = PromptCaptureSelection::new(policy.max_items);
     if let Some(body) = request_body {
-        collect_prompt_capture_items("request", body, policy, &mut prompts);
+        collect_prompt_capture_items("request", body, policy, &mut request_selection);
     }
+    let mut prompts = request_selection.into_items();
     if prompts.len() < policy.max_items {
         if let Some(body) = provider_request_body {
-            let mut provider_prompts = Vec::new();
-            collect_prompt_capture_items("provider_request", body, policy, &mut provider_prompts);
-            append_supplemental_prompt_capture_items(
-                &mut prompts,
-                provider_prompts,
-                policy.max_items,
-            );
+            let mut provider_selection = PromptCaptureSelection::new(policy.max_items);
+            collect_prompt_capture_items("provider_request", body, policy, &mut provider_selection);
+            let provider_prompts = provider_selection.into_items();
+            if prompts.is_empty() {
+                prompts = provider_prompts;
+            } else {
+                append_supplemental_prompt_capture_items(
+                    &mut prompts,
+                    provider_prompts,
+                    policy.max_items,
+                );
+            }
         }
     }
     if prompts.is_empty() {
         return;
     }
 
-    prompts.truncate(policy.max_items);
     let items = prompts
         .iter()
         .map(|prompt| prompt_capture_item_value(prompt, policy.preview_chars))
@@ -836,7 +890,7 @@ fn collect_prompt_capture_items(
     source: &str,
     value: &Value,
     policy: UsagePromptCapturePolicy,
-    output: &mut Vec<CapturedPrompt>,
+    output: &mut PromptCaptureSelection,
 ) {
     collect_top_level_prompt_fields(source, value, policy, output);
     collect_message_prompts(source, value, policy, output);
@@ -846,7 +900,7 @@ fn collect_top_level_prompt_fields(
     source: &str,
     value: &Value,
     policy: UsagePromptCapturePolicy,
-    output: &mut Vec<CapturedPrompt>,
+    output: &mut PromptCaptureSelection,
 ) {
     let Some(object) = value.as_object() else {
         return;
@@ -882,7 +936,7 @@ fn collect_message_prompts(
     source: &str,
     value: &Value,
     policy: UsagePromptCapturePolicy,
-    output: &mut Vec<CapturedPrompt>,
+    output: &mut PromptCaptureSelection,
 ) {
     let Some(object) = value.as_object() else {
         return;
@@ -897,7 +951,7 @@ fn collect_message_array(
     array_key: &str,
     value: Option<&Value>,
     policy: UsagePromptCapturePolicy,
-    output: &mut Vec<CapturedPrompt>,
+    output: &mut PromptCaptureSelection,
 ) {
     let Some(Value::Array(items)) = value else {
         return;
@@ -934,7 +988,7 @@ fn collect_text_values_for_role(
     value: Option<&Value>,
     role: PromptCaptureRole,
     policy: UsagePromptCapturePolicy,
-    output: &mut Vec<CapturedPrompt>,
+    output: &mut PromptCaptureSelection,
     index: Option<usize>,
 ) {
     if !prompt_capture_role_enabled(policy, role) {
@@ -987,7 +1041,7 @@ fn push_prompt_text(
     role: PromptCaptureRole,
     text: &str,
     policy: UsagePromptCapturePolicy,
-    output: &mut Vec<CapturedPrompt>,
+    output: &mut PromptCaptureSelection,
 ) {
     if policy.max_items == 0 {
         return;
@@ -995,12 +1049,6 @@ fn push_prompt_text(
     let normalized = normalize_prompt_text(text);
     if normalized.is_empty() {
         return;
-    }
-    if let Some(existing_index) = output.iter().position(|prompt| prompt.text == normalized) {
-        output.remove(existing_index);
-    }
-    if output.len() >= policy.max_items {
-        output.remove(0);
     }
     output.push(CapturedPrompt {
         source,
@@ -1347,7 +1395,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_capture_metadata_prefers_latest_duplicate_message_source() {
+    fn prompt_capture_metadata_keeps_initial_duplicate_message_source() {
         let mut record = sample_usage_record();
         record.request_body = Some(json!({
             "input": [
@@ -1376,14 +1424,18 @@ mod tests {
             .expect("prompt capture metadata should exist");
         assert_eq!(prompt_capture["item_count"], json!(2));
         assert_eq!(
-            prompt_capture["items"][1]["preview"],
+            prompt_capture["items"][0]["preview"],
             json!("Repeat this prompt.")
         );
         assert_eq!(
-            prompt_capture["items"][1]["source"],
-            json!("request.input[2].content")
+            prompt_capture["items"][0]["source"],
+            json!("request.input[0].content")
         );
-        assert_eq!(prompt_capture["items"][1]["index"], json!(2));
+        assert_eq!(prompt_capture["items"][0]["index"], json!(0));
+        assert_eq!(
+            prompt_capture["items"][1]["preview"],
+            json!("Unique request prompt.")
+        );
     }
 
     #[test]
@@ -1419,11 +1471,10 @@ mod tests {
     }
 
     #[test]
-    fn prompt_capture_metadata_keeps_recent_messages_when_history_exceeds_limit() {
-        let mut history = (1..=31)
+    fn prompt_capture_metadata_keeps_initial_and_recent_messages_when_history_exceeds_limit() {
+        let history = (1..=60)
             .map(|index| json!({"role": "user", "content": format!("old prompt {index}")}))
             .collect::<Vec<_>>();
-        history.push(json!({"role": "user", "content": "current request prompt"}));
 
         let mut record = sample_usage_record();
         record.request_body = Some(json!({
@@ -1448,29 +1499,65 @@ mod tests {
             .as_ref()
             .and_then(|value| value.get("prompt_capture"))
             .expect("prompt capture metadata should exist");
-        assert_eq!(prompt_capture["item_count"], json!(32));
-        assert!(prompt_capture["role_counts"]["system"].is_null());
-        assert_eq!(prompt_capture["role_counts"]["user"], json!(32));
-        assert_eq!(prompt_capture["items"][0]["preview"], json!("old prompt 1"));
+        assert_eq!(prompt_capture["item_count"], json!(42));
+        assert_eq!(prompt_capture["role_counts"]["system"], json!(1));
+        assert_eq!(prompt_capture["role_counts"]["user"], json!(41));
         assert_eq!(
-            prompt_capture["items"][0]["source"],
-            json!("request.input[0].content")
+            prompt_capture["items"][0]["preview"],
+            json!("system prompt")
         );
-        assert_eq!(prompt_capture["items"][0]["index"], json!(0));
+        assert_eq!(prompt_capture["items"][1]["preview"], json!("old prompt 1"));
+        assert_eq!(prompt_capture["items"][9]["preview"], json!("old prompt 9"));
         assert_eq!(
-            prompt_capture["items"][31]["preview"],
-            json!("current request prompt")
+            prompt_capture["items"][10]["preview"],
+            json!("old prompt 29")
         );
         assert_eq!(
-            prompt_capture["items"][31]["source"],
-            json!("request.input[31].content")
+            prompt_capture["items"][41]["preview"],
+            json!("old prompt 60")
         );
-        assert_eq!(prompt_capture["items"][31]["index"], json!(31));
+        assert_eq!(
+            prompt_capture["items"][41]["source"],
+            json!("request.input[59].content")
+        );
         assert!(!prompt_capture["items"]
             .as_array()
             .expect("items should be an array")
             .iter()
-            .any(|item| item["preview"] == json!("system prompt")));
+            .any(|item| item["preview"] == json!("old prompt 10")));
+    }
+
+    #[test]
+    fn prompt_capture_metadata_keeps_initial_prefix_even_when_recent_limit_is_smaller() {
+        let history = (1..=20)
+            .map(|index| json!({"role": "user", "content": format!("prompt {index}")}))
+            .collect::<Vec<_>>();
+        let mut record = sample_usage_record();
+        record.request_body = Some(json!({"input": history}));
+
+        apply_usage_body_capture_policy_to_record(
+            UsageBodyCapturePolicy {
+                prompt_capture: UsagePromptCapturePolicy {
+                    enabled: true,
+                    max_items: 4,
+                    ..UsagePromptCapturePolicy::default()
+                },
+                ..UsageBodyCapturePolicy::default()
+            },
+            &mut record,
+        );
+
+        let items = record
+            .request_metadata
+            .as_ref()
+            .and_then(|value| value.pointer("/prompt_capture/items"))
+            .and_then(Value::as_array)
+            .expect("prompt capture items should exist");
+        assert_eq!(items.len(), 14);
+        assert_eq!(items[0]["preview"], json!("prompt 1"));
+        assert_eq!(items[9]["preview"], json!("prompt 10"));
+        assert_eq!(items[10]["preview"], json!("prompt 17"));
+        assert_eq!(items[13]["preview"], json!("prompt 20"));
     }
 
     fn sample_usage_record() -> UpsertUsageRecord {
