@@ -5,6 +5,7 @@ use serde_json::{json, Map, Value};
 use crate::{
     formats::{
         context::FormatContext,
+        gemini::schema::clean_gemini_tool_schema,
         openai::shared::{
             map_openai_reasoning_effort_to_gemini_budget,
             map_thinking_budget_to_openai_reasoning_effort,
@@ -477,7 +478,7 @@ fn apply_response_format_to_gemini_generation_config(
                 .or_else(|| response_format.json_schema.clone())
             {
                 let mut schema = schema;
-                clean_gemini_schema(&mut schema);
+                ensure_gemini_schema_object_properties(&mut schema);
                 generation_config.insert("responseSchema".to_string(), schema);
             }
         }
@@ -681,7 +682,7 @@ fn canonical_tool_to_gemini_declaration(tool: &CanonicalToolDefinition) -> Value
         tool.parameters
             .clone()
             .map(|mut schema| {
-                clean_gemini_schema(&mut schema);
+                clean_gemini_tool_schema(&mut schema);
                 schema
             })
             .unwrap_or_else(|| json!({})),
@@ -781,11 +782,11 @@ fn insert_f64(output: &mut Map<String, Value>, key: &str, value: Option<f64>) {
     }
 }
 
-fn clean_gemini_schema(value: &mut Value) {
+fn ensure_gemini_schema_object_properties(value: &mut Value) {
     match value {
         Value::Object(object) => {
             for inner in object.values_mut() {
-                clean_gemini_schema(inner);
+                ensure_gemini_schema_object_properties(inner);
             }
             if object.get("type").and_then(Value::as_str) == Some("object")
                 && !object.contains_key("properties")
@@ -795,7 +796,7 @@ fn clean_gemini_schema(value: &mut Value) {
         }
         Value::Array(items) => {
             for item in items {
-                clean_gemini_schema(item);
+                ensure_gemini_schema_object_properties(item);
             }
         }
         _ => {}

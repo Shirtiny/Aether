@@ -49,61 +49,90 @@ pub fn apply_transport_request_body_semantics(
 fn apply_vertex_gemini_generate_content_body_semantics(
     provider_request_body: &mut Value,
 ) -> Result<(), TransportRequestBodySemanticsError> {
-    // Vertex's `parameters` field is a restricted protobuf Schema; the JSON
-    // Schema field preserves keywords used by Claude Code and MCP tools.
+    // Vertex's `parameters` field is a restricted protobuf Schema. Use its
+    // JSON Schema field after cross-format compatibility normalization.
     let object = provider_request_body.as_object_mut().ok_or_else(|| {
         TransportRequestBodySemanticsError::new(
             "Vertex Gemini generate-content request body must be a JSON object",
         )
     })?;
-    let Some(tools) = object.get_mut("tools") else {
-        return Ok(());
-    };
-    let tools = tools.as_array_mut().ok_or_else(|| {
-        TransportRequestBodySemanticsError::new(
-            "Vertex Gemini generate-content tools must be an array",
-        )
-    })?;
-
-    for tool in tools {
-        let Some(tool) = tool.as_object_mut() else {
-            continue;
-        };
-        let declarations_key = if tool.contains_key("functionDeclarations") {
-            "functionDeclarations"
-        } else {
-            "function_declarations"
-        };
-        let declarations = tool.get_mut(declarations_key);
-        let Some(declarations) = declarations else {
-            continue;
-        };
-        let declarations = declarations.as_array_mut().ok_or_else(|| {
+    if let Some(tools) = object.get_mut("tools") {
+        let tools = tools.as_array_mut().ok_or_else(|| {
             TransportRequestBodySemanticsError::new(
-                "Vertex Gemini function declarations must be an array",
+                "Vertex Gemini generate-content tools must be an array",
             )
         })?;
 
-        for declaration in declarations {
-            let Some(declaration) = declaration.as_object_mut() else {
+        for tool in tools {
+            let Some(tool) = tool.as_object_mut() else {
                 continue;
             };
-            move_schema_to_json_schema_field(
-                declaration,
-                "parameters",
-                "parametersJsonSchema",
-                "parameters_json_schema",
-            );
-            move_schema_to_json_schema_field(
-                declaration,
-                "response",
-                "responseJsonSchema",
-                "response_json_schema",
-            );
+            let declarations_key = if tool.contains_key("functionDeclarations") {
+                "functionDeclarations"
+            } else {
+                "function_declarations"
+            };
+            let declarations = tool.get_mut(declarations_key);
+            let Some(declarations) = declarations else {
+                continue;
+            };
+            let declarations = declarations.as_array_mut().ok_or_else(|| {
+                TransportRequestBodySemanticsError::new(
+                    "Vertex Gemini function declarations must be an array",
+                )
+            })?;
+
+            for declaration in declarations {
+                let Some(declaration) = declaration.as_object_mut() else {
+                    continue;
+                };
+                move_schema_to_json_schema_field(
+                    declaration,
+                    "parameters",
+                    "parametersJsonSchema",
+                    "parameters_json_schema",
+                );
+                move_schema_to_json_schema_field(
+                    declaration,
+                    "response",
+                    "responseJsonSchema",
+                    "response_json_schema",
+                );
+            }
         }
     }
 
+    move_vertex_response_schema_to_json_schema(object);
+
     Ok(())
+}
+
+fn move_vertex_response_schema_to_json_schema(object: &mut Map<String, Value>) {
+    let generation_config_key = if object.contains_key("generationConfig") {
+        "generationConfig"
+    } else {
+        "generation_config"
+    };
+    let Some(generation_config) = object
+        .get_mut(generation_config_key)
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+
+    if generation_config.contains_key("responseJsonSchema")
+        || generation_config.contains_key("response_json_schema")
+    {
+        generation_config.remove("responseSchema");
+        generation_config.remove("response_schema");
+        return;
+    }
+    let schema = generation_config
+        .remove("responseSchema")
+        .or_else(|| generation_config.remove("response_schema"));
+    if let Some(schema) = schema {
+        generation_config.insert("responseJsonSchema".to_string(), schema);
+    }
 }
 
 fn move_schema_to_json_schema_field(
@@ -459,7 +488,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_tools_keep_full_json_schema_for_vertex_gemini() {
+    fn claude_tools_use_cpa_compatible_json_schema_for_vertex_gemini() {
         let transport = sample_transport("vertex_ai", "https://aiplatform.googleapis.com");
         let input_schema = json!({
             "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -491,14 +520,21 @@ mod tests {
         .expect("Claude request should convert to Gemini");
 
         let converted_schema = body["tools"][0]["functionDeclarations"][0]["parameters"].clone();
+        assert!(converted_schema.get("$schema").is_none());
+        assert!(converted_schema["properties"]["environment"]
+            .get("propertyNames")
+            .is_none());
+        assert_eq!(converted_schema["properties"]["mode"]["type"], "string");
         assert_eq!(
-            converted_schema["properties"]["environment"]["propertyNames"]["pattern"],
-            "^[A-Z_]+$"
+            converted_schema["properties"]["mode"]["enum"],
+            json!(["apply"])
         );
-        assert_eq!(converted_schema["properties"]["mode"]["const"], "apply");
+        assert!(converted_schema["properties"]["retries"]
+            .get("exclusiveMinimum")
+            .is_none());
         assert_eq!(
-            converted_schema["properties"]["retries"]["exclusiveMinimum"],
-            0
+            converted_schema["properties"]["retries"]["description"],
+            "exclusiveMinimum: 0"
         );
 
         apply_transport_request_body_semantics(&mut body, &transport, "gemini:generate_content")
@@ -523,7 +559,14 @@ mod tests {
                         "properties": {"path": {"type": "string"}}
                     }
                 }]
-            }]
+            }],
+            "generationConfig": {
+                "responseSchema": {"type": "string"},
+                "responseJsonSchema": {
+                    "type": "object",
+                    "additionalProperties": false
+                }
+            }
         });
 
         apply_transport_request_body_semantics(&mut body, &transport, "gemini:generate_content")
@@ -534,6 +577,40 @@ mod tests {
         assert_eq!(
             declaration["parametersJsonSchema"]["properties"]["path"]["type"],
             "string"
+        );
+        assert!(body["generationConfig"].get("responseSchema").is_none());
+        assert_eq!(
+            body["generationConfig"]["responseJsonSchema"]["additionalProperties"],
+            false
+        );
+    }
+
+    #[test]
+    fn vertex_gemini_generate_content_uses_json_schema_for_structured_output_without_tools() {
+        let transport = sample_transport("vertex_ai", "https://aiplatform.googleapis.com");
+        let response_schema = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+                "result": {"type": "string", "const": "ok"}
+            },
+            "additionalProperties": false
+        });
+        let mut body = json!({
+            "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+            "generationConfig": {
+                "responseMimeType": "application/json",
+                "responseSchema": response_schema.clone()
+            }
+        });
+
+        apply_transport_request_body_semantics(&mut body, &transport, "gemini:generate_content")
+            .expect("Vertex structured-output body semantics should apply");
+
+        assert!(body["generationConfig"].get("responseSchema").is_none());
+        assert_eq!(
+            body["generationConfig"]["responseJsonSchema"],
+            response_schema
         );
     }
 
