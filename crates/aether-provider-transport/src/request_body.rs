@@ -32,10 +32,93 @@ pub fn apply_transport_request_body_semantics(
     provider_api_format: &str,
 ) -> Result<(), TransportRequestBodySemanticsError> {
     let provider_api_format = aether_ai_formats::normalize_api_format_alias(provider_api_format);
-    if provider_api_format == "gemini:embedding" && is_vertex_transport_context(transport) {
-        apply_vertex_gemini_embedding_body_semantics(provider_request_body)?;
+    if is_vertex_transport_context(transport) {
+        match provider_api_format.as_str() {
+            "gemini:generate_content" => {
+                apply_vertex_gemini_generate_content_body_semantics(provider_request_body)?;
+            }
+            "gemini:embedding" => {
+                apply_vertex_gemini_embedding_body_semantics(provider_request_body)?;
+            }
+            _ => {}
+        }
     }
     Ok(())
+}
+
+fn apply_vertex_gemini_generate_content_body_semantics(
+    provider_request_body: &mut Value,
+) -> Result<(), TransportRequestBodySemanticsError> {
+    // Vertex's `parameters` field is a restricted protobuf Schema; the JSON
+    // Schema field preserves keywords used by Claude Code and MCP tools.
+    let object = provider_request_body.as_object_mut().ok_or_else(|| {
+        TransportRequestBodySemanticsError::new(
+            "Vertex Gemini generate-content request body must be a JSON object",
+        )
+    })?;
+    let Some(tools) = object.get_mut("tools") else {
+        return Ok(());
+    };
+    let tools = tools.as_array_mut().ok_or_else(|| {
+        TransportRequestBodySemanticsError::new(
+            "Vertex Gemini generate-content tools must be an array",
+        )
+    })?;
+
+    for tool in tools {
+        let Some(tool) = tool.as_object_mut() else {
+            continue;
+        };
+        let declarations_key = if tool.contains_key("functionDeclarations") {
+            "functionDeclarations"
+        } else {
+            "function_declarations"
+        };
+        let declarations = tool.get_mut(declarations_key);
+        let Some(declarations) = declarations else {
+            continue;
+        };
+        let declarations = declarations.as_array_mut().ok_or_else(|| {
+            TransportRequestBodySemanticsError::new(
+                "Vertex Gemini function declarations must be an array",
+            )
+        })?;
+
+        for declaration in declarations {
+            let Some(declaration) = declaration.as_object_mut() else {
+                continue;
+            };
+            move_schema_to_json_schema_field(
+                declaration,
+                "parameters",
+                "parametersJsonSchema",
+                "parameters_json_schema",
+            );
+            move_schema_to_json_schema_field(
+                declaration,
+                "response",
+                "responseJsonSchema",
+                "response_json_schema",
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn move_schema_to_json_schema_field(
+    declaration: &mut Map<String, Value>,
+    schema_key: &str,
+    json_schema_key: &str,
+    json_schema_alias: &str,
+) {
+    if declaration.contains_key(json_schema_key) || declaration.contains_key(json_schema_alias) {
+        declaration.remove(schema_key);
+        return;
+    }
+    if let Some(schema) = declaration.remove(schema_key) {
+        declaration.insert(json_schema_key.to_string(), schema);
+    }
 }
 
 fn apply_vertex_gemini_embedding_body_semantics(
@@ -332,6 +415,148 @@ mod tests {
             .expect("developer API body should pass through");
 
         assert_eq!(body["model"], "gemini-embedding-2");
+    }
+
+    #[test]
+    fn vertex_gemini_generate_content_uses_json_schema_function_declarations() {
+        let transport = sample_transport("vertex_ai", "https://aiplatform.googleapis.com");
+        let parameters = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+                "filters": {
+                    "type": "object",
+                    "propertyNames": {"pattern": "^[a-z]+$"}
+                },
+                "mode": {"const": "fast"},
+                "limit": {"type": "integer", "exclusiveMinimum": 0}
+            }
+        });
+        let response = json!({
+            "type": "object",
+            "properties": {"ok": {"const": true}}
+        });
+        let mut body = json!({
+            "model": "gemini-3.7-flash",
+            "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+            "tools": [{
+                "functionDeclarations": [{
+                    "name": "run_task",
+                    "parameters": parameters.clone(),
+                    "response": response.clone()
+                }]
+            }]
+        });
+
+        apply_transport_request_body_semantics(&mut body, &transport, "gemini:generate_content")
+            .expect("Vertex generate-content body semantics should apply");
+
+        let declaration = &body["tools"][0]["functionDeclarations"][0];
+        assert!(declaration.get("parameters").is_none());
+        assert!(declaration.get("response").is_none());
+        assert_eq!(declaration["parametersJsonSchema"], parameters);
+        assert_eq!(declaration["responseJsonSchema"], response);
+    }
+
+    #[test]
+    fn claude_tools_keep_full_json_schema_for_vertex_gemini() {
+        let transport = sample_transport("vertex_ai", "https://aiplatform.googleapis.com");
+        let input_schema = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+                "environment": {
+                    "type": "object",
+                    "propertyNames": {"pattern": "^[A-Z_]+$"}
+                },
+                "mode": {"const": "apply"},
+                "retries": {"type": "integer", "exclusiveMinimum": 0}
+            }
+        });
+        let claude_body = json!({
+            "model": "gemini-3.7-flash",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "run it"}],
+            "tools": [{
+                "name": "run_task",
+                "input_schema": input_schema.clone()
+            }]
+        });
+        let mut body = aether_ai_formats::convert_request(
+            "claude:messages",
+            "gemini:generate_content",
+            &claude_body,
+            &aether_ai_formats::FormatContext::default().with_mapped_model("gemini-3.7-flash"),
+        )
+        .expect("Claude request should convert to Gemini");
+
+        let converted_schema = body["tools"][0]["functionDeclarations"][0]["parameters"].clone();
+        assert_eq!(
+            converted_schema["properties"]["environment"]["propertyNames"]["pattern"],
+            "^[A-Z_]+$"
+        );
+        assert_eq!(converted_schema["properties"]["mode"]["const"], "apply");
+        assert_eq!(
+            converted_schema["properties"]["retries"]["exclusiveMinimum"],
+            0
+        );
+
+        apply_transport_request_body_semantics(&mut body, &transport, "gemini:generate_content")
+            .expect("Vertex generate-content body semantics should apply");
+
+        let declaration = &body["tools"][0]["functionDeclarations"][0];
+        assert!(declaration.get("parameters").is_none());
+        assert_eq!(declaration["parametersJsonSchema"], converted_schema);
+    }
+
+    #[test]
+    fn vertex_gemini_generate_content_does_not_emit_mutually_exclusive_schema_fields() {
+        let transport = sample_transport("vertex_ai", "https://aiplatform.googleapis.com");
+        let mut body = json!({
+            "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+            "tools": [{
+                "functionDeclarations": [{
+                    "name": "run_task",
+                    "parameters": {"type": "object"},
+                    "parametersJsonSchema": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}}
+                    }
+                }]
+            }]
+        });
+
+        apply_transport_request_body_semantics(&mut body, &transport, "gemini:generate_content")
+            .expect("existing JSON Schema declaration should be accepted");
+
+        let declaration = &body["tools"][0]["functionDeclarations"][0];
+        assert!(declaration.get("parameters").is_none());
+        assert_eq!(
+            declaration["parametersJsonSchema"]["properties"]["path"]["type"],
+            "string"
+        );
+    }
+
+    #[test]
+    fn gemini_developer_generate_content_keeps_openapi_schema_field() {
+        let transport =
+            sample_transport("gemini", "https://generativelanguage.googleapis.com/v1beta");
+        let mut body = json!({
+            "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+            "tools": [{
+                "functionDeclarations": [{
+                    "name": "run_task",
+                    "parameters": {"type": "object", "properties": {}}
+                }]
+            }]
+        });
+
+        apply_transport_request_body_semantics(&mut body, &transport, "gemini:generate_content")
+            .expect("Developer API body should pass through");
+
+        let declaration = &body["tools"][0]["functionDeclarations"][0];
+        assert!(declaration.get("parametersJsonSchema").is_none());
+        assert_eq!(declaration["parameters"]["type"], "object");
     }
 
     #[test]

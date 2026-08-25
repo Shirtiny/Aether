@@ -221,6 +221,29 @@ pub(crate) async fn resolve_local_same_format_provider_candidate_payload_parts(
         prepared.transport.provider.provider_type.as_str(),
         prepared.provider_api_format.as_str(),
     );
+    if let Err(err) = crate::ai_serving::transport::apply_transport_request_body_semantics(
+        &mut base_provider_request_body,
+        &prepared.transport,
+        prepared.provider_api_format.as_str(),
+    ) {
+        mark_skipped_local_same_format_provider_candidate_with_failure_diagnostic(
+            state,
+            input,
+            trace_id,
+            candidate,
+            attempt.candidate_index,
+            &attempt.candidate_id,
+            "transport_request_body_semantics_failed",
+            CandidateFailureDiagnostic::request_conversion_failed(
+                spec.api_format,
+                prepared.provider_api_format.as_str(),
+                "same_format_provider_transport_body_semantics",
+                err.to_string(),
+            ),
+        )
+        .await;
+        return Ok(None);
+    }
 
     let antigravity_auth = if prepared.is_antigravity {
         match classify_local_antigravity_request_support(
