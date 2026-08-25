@@ -203,11 +203,19 @@ fn flatten_union(object: &mut Map<String, Value>) {
         let _ = clean_schema_node(branch);
     }
     let types = branches.iter().map(schema_type_name).collect::<Vec<_>>();
-    let Some(best) = branches
-        .into_iter()
-        .max_by_key(schema_branch_score)
-        .and_then(|value| value.as_object().cloned())
-    else {
+    let mut branches = branches.into_iter();
+    let Some(mut best) = branches.next() else {
+        return;
+    };
+    let mut best_score = schema_branch_score(&best);
+    for branch in branches {
+        let score = schema_branch_score(&branch);
+        if score > best_score {
+            best = branch;
+            best_score = score;
+        }
+    }
+    let Some(best) = best.as_object().cloned() else {
         return;
     };
 
@@ -487,6 +495,37 @@ mod tests {
         assert!(schema["properties"]["config"]["description"]
             .as_str()
             .is_some_and(|value| value.contains("Accepts: string | object")));
+    }
+
+    #[test]
+    fn union_ties_keep_the_first_branch_like_cpa() {
+        for union_key in ["anyOf", "oneOf"] {
+            let mut schema = json!({
+                "type": "object",
+                "properties": {
+                    "choice": {}
+                }
+            });
+            schema["properties"]["choice"][union_key] = json!([
+                {
+                    "type": "object",
+                    "properties": {"first": {"type": "string"}},
+                    "required": ["first"]
+                },
+                {
+                    "type": "object",
+                    "properties": {"second": {"type": "string"}},
+                    "required": ["second"]
+                }
+            ]);
+
+            clean_gemini_tool_schema(&mut schema);
+
+            let choice = &schema["properties"]["choice"];
+            assert!(choice["properties"].get("first").is_some());
+            assert!(choice["properties"].get("second").is_none());
+            assert_eq!(choice["required"], json!(["first"]));
+        }
     }
 
     #[test]

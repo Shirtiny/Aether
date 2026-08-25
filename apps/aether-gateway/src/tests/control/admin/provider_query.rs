@@ -1540,6 +1540,140 @@ async fn gateway_handles_admin_provider_query_vertex_gemini_embedding_model_test
 }
 
 #[tokio::test]
+async fn gateway_applies_vertex_json_schema_semantics_to_model_test_requests() {
+    let execution_runtime = Router::new().route(
+        "/v1/execute/sync",
+        any(move |Json(plan): Json<ExecutionPlan>| async move {
+            assert_eq!(plan.provider_id, "provider-vertex-tools");
+            assert_eq!(plan.endpoint_id, "endpoint-vertex-tools");
+            assert_eq!(plan.provider_api_format, "gemini:generate_content");
+            assert_eq!(
+                plan.url,
+                "https://aiplatform.googleapis.com/v1/publishers/google/models/gemini-3.7-flash:generateContent?key=sk-vertex-tools"
+            );
+
+            let body = plan.body.json_body.as_ref().expect("json body");
+            let declaration = &body["tools"][0]["functionDeclarations"][0];
+            assert!(declaration.get("parameters").is_none());
+            assert!(declaration["parametersJsonSchema"].get("$schema").is_none());
+            assert_eq!(
+                declaration["parametersJsonSchema"]["properties"]["mode"]["enum"],
+                json!(["apply"])
+            );
+            assert_eq!(
+                declaration["parametersJsonSchema"]["properties"]["retries"]["description"],
+                json!("exclusiveMinimum: 0")
+            );
+            assert!(body["generationConfig"].get("responseSchema").is_none());
+            assert_eq!(
+                body["generationConfig"]["responseJsonSchema"]["additionalProperties"],
+                json!(false)
+            );
+
+            Json(json!({
+                "request_id": plan.request_id,
+                "candidate_id": plan.candidate_id,
+                "status_code": 200,
+                "headers": {"content-type": "application/json"},
+                "body": {
+                    "json_body": {
+                        "candidates": [{
+                            "content": {
+                                "role": "model",
+                                "parts": [{"text": "{\"result\":\"ok\"}"}]
+                            },
+                            "finishReason": "STOP"
+                        }],
+                        "modelVersion": "gemini-3.7-flash"
+                    }
+                }
+            }))
+        }),
+    );
+
+    let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
+    let mut provider = sample_provider("provider-vertex-tools", "Vertex AI", 10);
+    provider.provider_type = "vertex_ai".to_string();
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        vec![sample_endpoint(
+            "endpoint-vertex-tools",
+            "provider-vertex-tools",
+            "gemini:generate_content",
+            "https://aiplatform.googleapis.com",
+        )],
+        vec![sample_key(
+            "key-vertex-tools",
+            "provider-vertex-tools",
+            "gemini:generate_content",
+            "sk-vertex-tools",
+        )],
+    ));
+
+    let gateway = build_router_with_state(
+        build_state_with_execution_runtime_override(execution_runtime_url)
+            .with_data_state_for_tests(GatewayDataState::with_provider_transport_reader_for_tests(
+                provider_catalog_repository,
+                DEVELOPMENT_ENCRYPTION_KEY.to_string(),
+            )),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/api/admin/provider-query/test-model"))
+        .header(GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&json!({
+            "provider_id": "provider-vertex-tools",
+            "endpoint_id": "endpoint-vertex-tools",
+            "model": "gemini-3.7-flash",
+            "api_format": "gemini:generate_content",
+            "request_body": {
+                "model": "gemini-3.7-flash",
+                "messages": [{"role": "user", "content": "run it"}],
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "run_task",
+                        "parameters": {
+                            "$schema": "https://json-schema.org/draft/2020-12/schema",
+                            "type": "object",
+                            "properties": {
+                                "mode": {"const": "apply"},
+                                "retries": {"type": "integer", "exclusiveMinimum": 0}
+                            }
+                        }
+                    }
+                }],
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "result",
+                        "schema": {
+                            "type": "object",
+                            "properties": {"result": {"type": "string"}},
+                            "additionalProperties": false
+                        }
+                    }
+                }
+            }
+        }))
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(payload["success"], json!(true));
+    assert_eq!(payload["attempts"][0]["status"], json!("success"));
+
+    gateway_handle.abort();
+    execution_runtime_handle.abort();
+}
+
+#[tokio::test]
 async fn gateway_handles_admin_provider_query_jina_embedding_model_test() {
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
