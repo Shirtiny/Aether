@@ -2172,11 +2172,7 @@ impl GatewayCodexWsRuntime {
                 "handshake_settlement_reservation_missing",
             ));
         };
-        if !candidate
-            .lifecycle
-            .queue_handshake_failure(&self.state)
-            .await
-        {
+        if !candidate.lifecycle.claim_handshake_failure_settlement() {
             drop(permit);
             return Err(StepPreparationError::retain(
                 "handshake_terminal_claim_unavailable",
@@ -2190,6 +2186,10 @@ impl GatewayCodexWsRuntime {
             error_message: failure.error_message.clone(),
             error_body: failure.error_body.clone(),
         });
+        candidate
+            .lifecycle
+            .prepare_failover_after_handshake_failure(&self.state)
+            .await;
         Ok(())
     }
 
@@ -2305,7 +2305,7 @@ fn classify_codex_ws_handshake_failure(
             )),
         ),
         WebSocketError::Url(error) => {
-            let (error_type, error_message, route_reason) = match error {
+            let (error_type, error_message, route_reason) = match &error {
                 WebSocketUrlError::ProxyConnect(_) => (
                     "codex_ws_handshake_proxy_connect_error",
                     "official Codex WebSocket proxy CONNECT failed",
@@ -2317,12 +2317,11 @@ fn classify_codex_ws_handshake_failure(
                     "official_ws_handshake_url_failed",
                 ),
             };
-            transport_handshake_failure(
-                error_type,
-                error_message,
-                route_reason,
-                Some(format!("url_kind={}", url_error_kind_name(&error))),
-            )
+            let diagnostic_detail = match &error {
+                WebSocketUrlError::ProxyConnect(detail) => Some(proxy_connect_diagnostic(detail)),
+                _ => Some(format!("url_kind={}", url_error_kind_name(&error))),
+            };
+            transport_handshake_failure(error_type, error_message, route_reason, diagnostic_detail)
         }
         WebSocketError::HttpFormat(_) => transport_handshake_failure(
             "codex_ws_handshake_http_format_error",
@@ -2577,6 +2576,29 @@ fn url_error_kind_name(error: &WebSocketUrlError) -> &'static str {
         WebSocketUrlError::InvalidProxyConfig(_) => "invalid_proxy_config",
         WebSocketUrlError::ProxyConnect(_) => "proxy_connect",
     }
+}
+
+fn proxy_connect_diagnostic(detail: &str) -> String {
+    const HTTP_STATUS_PREFIX: &str = "HTTP CONNECT failed with status ";
+    if let Some(status) = detail
+        .strip_prefix(HTTP_STATUS_PREFIX)
+        .and_then(|status| status.parse::<u16>().ok())
+        .filter(|status| (100..=599).contains(status))
+    {
+        return format!("proxy_connect_http_status={status}");
+    }
+
+    let reason = match detail {
+        "HTTP CONNECT response too large" => "response_too_large",
+        "SOCKS5: proxy requested auth, but none provided" => "auth_required",
+        "SOCKS5: no acceptable authentication method" => "no_acceptable_auth_method",
+        "SOCKS5: unsupported authentication method" => "unsupported_auth_method",
+        "SOCKS5 authentication failed" => "authentication_failed",
+        "SOCKS5: invalid response version" => "invalid_response_version",
+        "SOCKS5: invalid address type" => "invalid_address_type",
+        _ => return "url_kind=proxy_connect".to_string(),
+    };
+    format!("proxy_connect_reason={reason}")
 }
 
 pub(crate) fn step_usage_request_id(step: &ResponseCreateStep) -> String {
@@ -3961,6 +3983,22 @@ mod tests {
         );
         assert_eq!(failure.error_body, failure.diagnostic_detail);
         assert!(!failure.error_body.unwrap().contains("password"));
+    }
+
+    #[test]
+    fn handshake_proxy_connect_classification_retains_safe_http_status() {
+        let failure = classify_codex_ws_handshake_failure(
+            WebSocketError::Url(WebSocketUrlError::ProxyConnect(
+                "HTTP CONNECT failed with status 407".into(),
+            )),
+            CodexWsRouteKind::Proxy,
+        );
+
+        assert_eq!(
+            failure.diagnostic_detail.as_deref(),
+            Some("proxy_connect_http_status=407")
+        );
+        assert_eq!(failure.error_body, failure.diagnostic_detail);
     }
 
     #[test]

@@ -8,11 +8,12 @@ use aether_scheduler_core::SchedulerRequestCandidateStatusUpdate;
 
 use crate::orchestration::{
     apply_local_execution_effect, apply_local_pool_terminal_effect_after_lease_release,
-    release_local_pool_key_lease_for_attempt_strict, resolve_local_failover_analysis_for_attempt,
-    stop_local_pool_sticky_init_renewer_for_attempt, LocalAdaptiveRateLimitEffect,
-    LocalAdaptiveSuccessEffect, LocalAttemptFailureEffect, LocalExecutionEffect,
-    LocalExecutionEffectContext, LocalFailoverClassification, LocalHealthFailureEffect,
-    LocalHealthSuccessEffect, LocalOAuthInvalidationEffect, LocalPoolErrorEffect,
+    prepare_pool_failover_after_candidate_failure, release_local_pool_key_lease_for_attempt_strict,
+    resolve_local_failover_analysis_for_attempt, stop_local_pool_sticky_init_renewer_for_attempt,
+    LocalAdaptiveRateLimitEffect, LocalAdaptiveSuccessEffect, LocalAttemptFailureEffect,
+    LocalExecutionEffect, LocalExecutionEffectContext, LocalFailoverClassification,
+    LocalHealthFailureEffect, LocalHealthSuccessEffect, LocalOAuthInvalidationEffect,
+    LocalPoolErrorEffect,
 };
 use crate::request_candidate_runtime::record_local_request_candidate_status;
 use crate::usage::GatewayStreamReportRequest;
@@ -378,10 +379,9 @@ impl CodexWsCandidateLifecycle {
             .await;
     }
 
-    /// Claims terminal ownership before failover and releases the hot scheduling lease. The
-    /// remaining status, health, OAuth, and persistence effects run from the bounded settlement
-    /// worker after the next candidate is already free to connect.
-    pub(crate) async fn queue_handshake_failure(&self, state: &AppState) -> bool {
+    /// Claims terminal ownership before the reserved settlement commit is sent. This step must
+    /// not await so cancellation cannot strand the lifecycle after its cleanup permit is taken.
+    pub(crate) fn claim_handshake_failure_settlement(&self) -> bool {
         if self
             .settlement_progress
             .terminal_state
@@ -396,8 +396,21 @@ impl CodexWsCandidateLifecycle {
             return false;
         }
         self.stop_pool_sticky_renewer();
-        let _ = self.release_pool_lease_once(state).await;
         true
+    }
+
+    /// Releases scheduling state needed by the next candidate. The full failure settlement has
+    /// already been queued, so cancellation during this fast path cannot lose terminal cleanup.
+    pub(crate) async fn prepare_failover_after_handshake_failure(&self, state: &AppState) {
+        let _ = self.release_pool_lease_once(state).await;
+        prepare_pool_failover_after_candidate_failure(
+            state,
+            LocalExecutionEffectContext {
+                plan: self.plan(),
+                report_context: self.report_context(),
+            },
+        )
+        .await;
     }
 
     async fn settle_first_dispatch(
@@ -531,7 +544,7 @@ impl CodexWsCandidateLifecycle {
                 apply_local_pool_terminal_effect_after_lease_release(
                     state,
                     context,
-                    LocalExecutionEffect::PoolAttemptAborted,
+                    LocalExecutionEffect::PoolStreamTimeout,
                 )
                 .await;
             }
@@ -829,7 +842,17 @@ async fn resolve_step_failure_classification(
             .await
             .classification,
         ),
-        CodexWsStepDisposition::StreamTimeout { .. } => None,
+        CodexWsStepDisposition::StreamTimeout { .. } => Some(
+            resolve_local_failover_analysis_for_attempt(
+                state,
+                plan,
+                report_context,
+                http::StatusCode::GATEWAY_TIMEOUT.as_u16(),
+                None,
+            )
+            .await
+            .classification,
+        ),
         CodexWsStepDisposition::Completed | CodexWsStepDisposition::Cancelled { .. } => None,
     }
 }
@@ -893,7 +916,21 @@ async fn apply_step_health_effects(
                 return false;
             }
         }
-        CodexWsStepDisposition::StreamTimeout { .. } => {}
+        CodexWsStepDisposition::StreamTimeout { .. } => {
+            if !apply_failure_health_effects(
+                state,
+                context,
+                payload,
+                http::StatusCode::GATEWAY_TIMEOUT.as_u16(),
+                failure_classification.unwrap_or(LocalFailoverClassification::RetryUpstreamFailure),
+                None,
+                progress,
+            )
+            .await
+            {
+                return false;
+            }
+        }
         CodexWsStepDisposition::Cancelled { .. } => {}
     }
     true
@@ -1105,6 +1142,17 @@ pub(crate) fn compact_report_context_template(
             .saturating_add(value_bytes);
         compact.insert((*field).to_string(), value.clone());
     }
+    if let Some(proxy) = compact_safe_proxy_context(object.get("proxy")) {
+        if let Some(value_bytes) = bounded_json_upper_size(&proxy, MAX_FIELD_BYTES, 0) {
+            if retained_bytes
+                .saturating_add("proxy".len())
+                .saturating_add(value_bytes)
+                <= MAX_CONTEXT_BYTES
+            {
+                compact.insert("proxy".to_string(), proxy);
+            }
+        }
+    }
     if let Some(serde_json::Value::Object(identity)) =
         aether_usage_runtime::attach_cafecode_identity_metadata(
             None,
@@ -1118,6 +1166,26 @@ pub(crate) fn compact_report_context_template(
         }
     }
     Some(serde_json::Value::Object(compact))
+}
+
+fn compact_safe_proxy_context(value: Option<&serde_json::Value>) -> Option<serde_json::Value> {
+    let object = value?.as_object()?;
+    let mut compact = serde_json::Map::new();
+    for field in ["node_id", "node_name", "source"] {
+        let Some(value) = object
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && value.len() <= 512)
+        else {
+            continue;
+        };
+        compact.insert(
+            field.to_string(),
+            serde_json::Value::String(value.to_string()),
+        );
+    }
+    (!compact.is_empty()).then_some(serde_json::Value::Object(compact))
 }
 
 fn bounded_json_upper_size(
@@ -1282,6 +1350,21 @@ mod tests {
         assert!(lifecycle.claim_terminal().is_none());
     }
 
+    #[test]
+    fn handshake_failure_claim_is_synchronous_and_reserved_for_settlement() {
+        let lifecycle = CodexWsCandidateLifecycle::new(&plan_with_large_body(), None);
+
+        assert!(lifecycle.claim_handshake_failure_settlement());
+        assert!(lifecycle.is_terminal_claimed());
+        assert!(!lifecycle.claim_handshake_failure_settlement());
+
+        lifecycle
+            .claim_terminal()
+            .expect("queued settlement should claim terminal ownership")
+            .complete();
+        assert!(lifecycle.claim_terminal().is_none());
+    }
+
     #[tokio::test]
     async fn cancelled_settlement_phase_retries_only_the_unconfirmed_phase() {
         let phase = AtomicU8::new(TERMINAL_IDLE);
@@ -1420,6 +1503,12 @@ mod tests {
             "header_rules": {"blob": "z".repeat(1024 * 1024)},
             "body_rules": {"blob": "z".repeat(1024 * 1024)},
             "ranking": {"blob": "z".repeat(1024 * 1024)},
+            "proxy": {
+                "node_id": "node-1",
+                "node_name": "proxy-one",
+                "source": "key",
+                "url": "https://proxy.example:443"
+            },
         });
         let compact_context = compact_report_context_template(Some(&context)).expect("context");
         let encoded = serde_json::to_vec(&compact_context).expect("compact context JSON");
@@ -1429,5 +1518,8 @@ mod tests {
         assert!(!encoded.contains("upstream-secret"));
         assert!(!encoded.contains("client-secret"));
         assert!(!encoded.contains(&"z".repeat(64 * 1024)));
+        assert_eq!(compact_context["proxy"]["node_id"], "node-1");
+        assert_eq!(compact_context["proxy"]["source"], "key");
+        assert!(compact_context["proxy"].get("url").is_none());
     }
 }

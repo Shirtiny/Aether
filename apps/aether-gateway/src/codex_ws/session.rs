@@ -1717,14 +1717,14 @@ enum StepOutcome {
 }
 
 impl StepOutcome {
-    fn poisoned() -> Self {
+    fn provider_failure(error_type: &'static str, error_message: &'static str) -> Self {
         Self::Poisoned {
             terminal_event: None,
             terminal_kind: None,
             disposition: CodexWsStepDisposition::ProviderFailure {
                 status_code: http::StatusCode::BAD_GATEWAY.as_u16(),
-                error_type: "codex_ws_official_protocol_error".to_string(),
-                error_message: "official Codex WebSocket protocol failed".to_string(),
+                error_type: error_type.to_string(),
+                error_message: error_message.to_string(),
                 error_body: None,
             },
             terminal_frames: None,
@@ -1915,6 +1915,7 @@ where
                             client,
                             step,
                             key_id,
+                            "codex_ws_upstream_eof_before_terminal",
                             "official connection ended before a terminal event",
                             Some("official WebSocket stream ended without a frame"),
                             deadlines,
@@ -1922,11 +1923,14 @@ where
                         .await;
                     }
                     Err(error) => {
+                        let (error_type, error_message) =
+                            classify_upstream_receive_failure(error.0.as_str());
                         return fail_upstream_protocol(
                             client,
                             step,
                             key_id,
-                            "official connection ended before a terminal event",
+                            error_type,
+                            error_message,
                             Some(error.0.as_str()),
                             deadlines,
                         )
@@ -1940,6 +1944,7 @@ where
                                 client,
                                 step,
                                 key_id,
+                                "codex_ws_frame_too_large",
                                 "official Codex frame exceeds the public relay limit",
                                 None,
                                 deadlines,
@@ -1959,7 +1964,13 @@ where
                                     reason,
                                 );
                                 return fail_upstream_protocol(
-                                    client, step, key_id, reason, None, deadlines,
+                                    client,
+                                    step,
+                                    key_id,
+                                    "codex_ws_invalid_server_frame",
+                                    reason,
+                                    None,
+                                    deadlines,
                                 )
                                 .await;
                             }
@@ -1998,6 +2009,7 @@ where
                                     client,
                                     step,
                                     key_id,
+                                    "codex_ws_created_id_missing",
                                     "response.created omitted response.id",
                                     None,
                                     deadlines,
@@ -2015,6 +2027,7 @@ where
                                     client,
                                     step,
                                     key_id,
+                                    "codex_ws_event_provenance_mismatch",
                                     "response.created provenance mismatch",
                                     None,
                                     deadlines,
@@ -2033,6 +2046,7 @@ where
                                         client,
                                         step,
                                         key_id,
+                                        "codex_ws_event_provenance_mismatch",
                                         "official event provenance mismatch",
                                         None,
                                         deadlines,
@@ -2053,6 +2067,7 @@ where
                                         client,
                                         step,
                                         key_id,
+                                        "codex_ws_terminal_id_missing",
                                         "response.completed omitted response.id",
                                         None,
                                         deadlines,
@@ -2065,6 +2080,7 @@ where
                                         client,
                                         step,
                                         key_id,
+                                        "codex_ws_event_provenance_mismatch",
                                         "response terminal provenance mismatch",
                                         None,
                                         deadlines,
@@ -2078,6 +2094,7 @@ where
                                     client,
                                     step,
                                     key_id,
+                                    "codex_ws_event_provenance_mismatch",
                                     "response terminal provenance mismatch",
                                     None,
                                     deadlines,
@@ -2141,6 +2158,7 @@ where
                                 client,
                                 step,
                                 key_id,
+                                "codex_ws_upstream_pong_failed",
                                 "official WebSocket pong failed",
                                 Some(error.detail()),
                                 deadlines,
@@ -2154,6 +2172,7 @@ where
                             client,
                             step,
                             key_id,
+                            "codex_ws_binary_business_frame",
                             "official Codex emitted a binary business frame",
                             None,
                             deadlines,
@@ -2165,6 +2184,7 @@ where
                             client,
                             step,
                             key_id,
+                            "codex_ws_upstream_closed_before_terminal",
                             "official connection closed before a terminal event",
                             Some("official peer emitted a close frame without close details"),
                             deadlines,
@@ -2355,7 +2375,8 @@ async fn fail_upstream_protocol(
     client: &mut Box<dyn RelayPeer>,
     step: &ResponseCreateStep,
     key_id: &str,
-    message: &'static str,
+    error_type: &'static str,
+    error_message: &'static str,
     transport_detail: Option<&str>,
     deadlines: &StepDeadlines,
 ) -> StepOutcome {
@@ -2365,13 +2386,33 @@ async fn fail_upstream_protocol(
         key_id,
         step.model.as_str(),
         "response",
-        message,
+        error_message,
         transport_detail,
     );
-    let event = upstream_protocol_error_event(message);
+    let event = upstream_protocol_error_event(error_message);
     best_effort_step_send(client.as_mut(), RelayFrame::Text(event.into()), deadlines).await;
     best_effort_step_send(client.as_mut(), RelayFrame::Close, deadlines).await;
-    StepOutcome::poisoned()
+    StepOutcome::provider_failure(error_type, error_message)
+}
+
+fn classify_upstream_receive_failure(detail: &str) -> (&'static str, &'static str) {
+    let normalized = detail.to_ascii_lowercase();
+    if normalized.contains("reset without closing handshake") {
+        return (
+            "codex_ws_upstream_reset_without_close",
+            "official Codex WebSocket reset without a closing handshake",
+        );
+    }
+    if normalized.contains("official codex ws closed") {
+        return (
+            "codex_ws_upstream_closed_before_terminal",
+            "official Codex WebSocket closed before a terminal event",
+        );
+    }
+    (
+        "codex_ws_upstream_receive_failed",
+        "official Codex WebSocket receive failed before a terminal event",
+    )
 }
 
 async fn fail_upstream_timeout(
@@ -2740,6 +2781,7 @@ mod tests {
         report_calls: AtomicUsize,
         report_after_release: AtomicUsize,
         report_terminal_kinds: Mutex<Vec<Option<TerminalKind>>>,
+        report_dispositions: Mutex<Vec<CodexWsStepDisposition>>,
         report_first_byte_ms: Mutex<Vec<Option<u64>>>,
         started_candidates: Mutex<Vec<String>>,
         aborted_candidates: Mutex<Vec<String>>,
@@ -2790,6 +2832,7 @@ mod tests {
                 report_calls: AtomicUsize::new(0),
                 report_after_release: AtomicUsize::new(0),
                 report_terminal_kinds: Mutex::new(Vec::new()),
+                report_dispositions: Mutex::new(Vec::new()),
                 report_first_byte_ms: Mutex::new(Vec::new()),
                 started_candidates: Mutex::new(Vec::new()),
                 aborted_candidates: Mutex::new(Vec::new()),
@@ -3119,7 +3162,7 @@ mod tests {
             _step: &ResponseCreateStep,
             _terminal_event: Option<TerminalEventSummary>,
             terminal_kind: Option<TerminalKind>,
-            _disposition: CodexWsStepDisposition,
+            disposition: CodexWsStepDisposition,
             _first_dispatch: bool,
             first_byte_elapsed: Option<Duration>,
             _elapsed: Duration,
@@ -3130,6 +3173,10 @@ mod tests {
                 .lock()
                 .expect("terminal kinds should lock")
                 .push(terminal_kind);
+            self.report_dispositions
+                .lock()
+                .expect("terminal dispositions should lock")
+                .push(disposition);
             self.report_first_byte_ms
                 .lock()
                 .expect("terminal first-byte values should lock")
@@ -3449,8 +3496,8 @@ mod tests {
         let writer = SharedLogBuffer::default();
         let dispatch = json_log_dispatch(writer.clone());
         let _guard = tracing::dispatcher::set_default(&dispatch);
-        let transport_detail =
-            "official Codex WS receive failed: WebSocket protocol error: connection reset";
+        let transport_detail = "official Codex WS receive failed: WebSocket protocol error: \
+                                Connection reset without closing handshake";
         let (official, _) =
             ScriptedPeer::new_results([(Duration::ZERO, Err(PeerError(transport_detail.into())))]);
         let runtime = TestRuntime::new(Box::new(official), false);
@@ -3472,7 +3519,7 @@ mod tests {
         assert_eq!(log["protocol_phase"], "response");
         assert_eq!(
             log["protocol_reason"],
-            "official connection ended before a terminal event"
+            "official Codex WebSocket reset without a closing handshake"
         );
         assert_eq!(log["transport_detail"], transport_detail);
         assert_eq!(log["key_id"], "key-1");
@@ -3480,6 +3527,48 @@ mod tests {
         assert!(log["request_id"]
             .as_str()
             .is_some_and(|request_id| request_id.starts_with("ws-")));
+        assert!(matches!(
+            runtime
+                .report_dispositions
+                .lock()
+                .expect("terminal dispositions should lock")
+                .as_slice(),
+            [CodexWsStepDisposition::ProviderFailure {
+                error_type,
+                error_message,
+                ..
+            }] if error_type == "codex_ws_upstream_reset_without_close"
+                && error_message == "official Codex WebSocket reset without a closing handshake"
+        ));
+    }
+
+    #[test]
+    fn upstream_receive_failure_classification_is_bounded_and_structured() {
+        assert_eq!(
+            classify_upstream_receive_failure(
+                "official Codex WS receive failed: Connection reset without closing handshake"
+            ),
+            (
+                "codex_ws_upstream_reset_without_close",
+                "official Codex WebSocket reset without a closing handshake"
+            )
+        );
+        assert_eq!(
+            classify_upstream_receive_failure(
+                "official Codex WS closed: code=1012, reason=\"service restart\""
+            ),
+            (
+                "codex_ws_upstream_closed_before_terminal",
+                "official Codex WebSocket closed before a terminal event"
+            )
+        );
+        assert_eq!(
+            classify_upstream_receive_failure("arbitrary secret-bearing transport failure"),
+            (
+                "codex_ws_upstream_receive_failed",
+                "official Codex WebSocket receive failed before a terminal event"
+            )
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

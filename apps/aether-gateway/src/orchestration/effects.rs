@@ -802,6 +802,60 @@ pub(crate) async fn prepare_pool_attempt_started_effect(
     try_claim_pool_sticky_init_for_attempt(state, context, &pool_context, sticky_init_owner).await
 }
 
+const POOL_FAILOVER_STICKY_CLEANUP_TIMEOUT: Duration = Duration::from_millis(100);
+
+pub(crate) async fn prepare_pool_failover_after_candidate_failure(
+    state: &AppState,
+    context: LocalExecutionEffectContext<'_>,
+) {
+    let metadata = local_execution_candidate_metadata_from_report_context(context.report_context);
+    let Some(sticky_session_token) =
+        pool_feedback_sticky_session_token(context.plan, context.report_context)
+    else {
+        return;
+    };
+    let provider_id = context.plan.provider_id.clone();
+    let key_id = context.plan.key_id.clone();
+    let owner = metadata.pool_sticky_init_owner;
+    let runtime = std::sync::Arc::clone(&state.runtime_state);
+    let cleanup = async move {
+        let (_, _, _) = tokio::join!(
+            clear_admin_provider_pool_sticky_session_if_bound_to_key(
+                runtime.as_ref(),
+                &provider_id,
+                &key_id,
+                Some(sticky_session_token.as_str()),
+            ),
+            clear_admin_provider_pool_sticky_session_prebind_if_owner(
+                runtime.as_ref(),
+                &provider_id,
+                &key_id,
+                Some(sticky_session_token.as_str()),
+                owner.as_deref(),
+            ),
+            release_admin_provider_pool_sticky_session_init_if_owner(
+                runtime.as_ref(),
+                &provider_id,
+                Some(sticky_session_token.as_str()),
+                owner.as_deref(),
+            ),
+        );
+    };
+    if tokio::time::timeout(POOL_FAILOVER_STICKY_CLEANUP_TIMEOUT, cleanup)
+        .await
+        .is_err()
+    {
+        warn!(
+            event_name = "codex_ws_pool_failover_sticky_cleanup_timeout",
+            log_type = "ops",
+            provider_id = %context.plan.provider_id,
+            key_id = %context.plan.key_id,
+            timeout_ms = POOL_FAILOVER_STICKY_CLEANUP_TIMEOUT.as_millis(),
+            "Codex WebSocket failover sticky cleanup exceeded its bounded deadline"
+        );
+    }
+}
+
 pub(crate) struct PoolAttemptStartCleanupGuard {
     cleanup_permit: Option<mpsc::OwnedPermit<PoolAttemptStartCleanupJob>>,
     cleanup_job: Option<PoolAttemptStartCleanupJob>,
@@ -1375,14 +1429,11 @@ async fn record_pool_error_effect(
             effect.error_body,
         );
     let Some(pool_context) = resolve_pool_feedback_context(state, context).await else {
-        let terminal_error_reason =
-            admin_provider_pool_key_terminal_error_reason(effect.status_code, effect.error_body);
-        let should_record_pool_error = terminal_error_reason.is_some()
-            || local_candidate_failure_should_record_pool_error(
-                effect.classification,
-                effect.status_code,
-            )
-            || sticky_collateral_account_invalid;
+        let should_record_pool_error = local_pool_failure_should_clear_sticky(
+            effect.status_code,
+            effect.error_body,
+            effect.classification,
+        );
         cleanup_pool_sticky_initialization_without_feedback_context(
             state,
             context,
@@ -1394,14 +1445,11 @@ async fn record_pool_error_effect(
         }
         return;
     };
-    let terminal_error_reason =
-        admin_provider_pool_key_terminal_error_reason(effect.status_code, effect.error_body);
-    let should_record_pool_error = terminal_error_reason.is_some()
-        || local_candidate_failure_should_record_pool_error(
-            effect.classification,
-            effect.status_code,
-        )
-        || sticky_collateral_account_invalid;
+    let should_record_pool_error = local_pool_failure_should_clear_sticky(
+        effect.status_code,
+        effect.error_body,
+        effect.classification,
+    );
     if !should_record_pool_error {
         let metadata =
             local_execution_candidate_metadata_from_report_context(context.report_context);
@@ -1673,6 +1721,16 @@ fn local_candidate_failure_should_record_pool_error(
     local_candidate_failure_should_invalidate_affinity(classification, status_code)
 }
 
+fn local_pool_failure_should_clear_sticky(
+    status_code: u16,
+    error_body: Option<&str>,
+    classification: LocalFailoverClassification,
+) -> bool {
+    admin_provider_pool_key_terminal_error_reason(status_code, error_body).is_some()
+        || local_candidate_failure_should_record_pool_error(classification, status_code)
+        || pool_sticky_collateral_failure_status_is_account_invalid(status_code, error_body)
+}
+
 fn pool_sticky_collateral_failure_status_is_account_invalid(
     status_code: u16,
     error_body: Option<&str>,
@@ -1851,10 +1909,11 @@ mod tests {
     use super::{
         apply_local_execution_effect, local_candidate_failure_should_record_pool_error,
         pool_score_hard_state_for_status, pool_sticky_collateral_failure_status_is_account_invalid,
-        prepare_pool_attempt_started_effect, LocalAdaptiveRateLimitEffect,
-        LocalAdaptiveSuccessEffect, LocalAttemptFailureEffect, LocalExecutionEffect,
-        LocalExecutionEffectContext, LocalHealthFailureEffect, LocalHealthSuccessEffect,
-        LocalOAuthInvalidationEffect, LocalPoolErrorEffect, PoolAttemptStartCleanupGuard,
+        prepare_pool_attempt_started_effect, prepare_pool_failover_after_candidate_failure,
+        LocalAdaptiveRateLimitEffect, LocalAdaptiveSuccessEffect, LocalAttemptFailureEffect,
+        LocalExecutionEffect, LocalExecutionEffectContext, LocalHealthFailureEffect,
+        LocalHealthSuccessEffect, LocalOAuthInvalidationEffect, LocalPoolErrorEffect,
+        PoolAttemptStartCleanupGuard,
     };
     use crate::data::{GatewayDataConfig, GatewayDataState};
     use crate::handlers::shared::provider_pool::{
@@ -3545,6 +3604,108 @@ mod tests {
                 Some("session-1"),
             )
             .await
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_candidate_clears_sticky_before_deferred_settlement() {
+        let provider_config = json!({
+            "pool_advanced": {
+                "sticky_session_ttl_seconds": 120
+            }
+        });
+        let pool_config = admin_provider_pool_config_from_config_value(Some(&provider_config))
+            .expect("pool config should parse");
+        let mut key_2 = sample_health_key();
+        key_2.id = "key-2".to_string();
+        key_2.name = "key-2".to_string();
+        let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![sample_health_provider().with_transport_fields(
+                true,
+                false,
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(provider_config),
+            )],
+            vec![sample_health_endpoint()],
+            vec![sample_health_key(), key_2],
+        ));
+        let state = AppState::new()
+            .expect("gateway state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(repository)
+                    .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+            );
+        let mut failed_plan = sample_plan();
+        failed_plan.key_id = "key-1".to_string();
+        failed_plan.body = RequestBody::from_json(json!({
+            "model": "gpt-5",
+            "session_id": "session-1"
+        }));
+        let failed_report_context = json!({
+            "candidate_index": 0,
+            "retry_index": 0,
+            "original_request_body": {
+                "model": "gpt-5",
+                "session_id": "session-1"
+            }
+        });
+        let mut fallback_plan = failed_plan.clone();
+        fallback_plan.key_id = "key-2".to_string();
+        let fallback_report_context = json!({
+            "pool_sticky_init_owner": "owner-key-2",
+            "original_request_body": {
+                "model": "gpt-5",
+                "session_id": "session-1"
+            }
+        });
+
+        record_admin_provider_pool_success(
+            state.runtime_state.as_ref(),
+            &failed_plan.provider_id,
+            &failed_plan.key_id,
+            &pool_config,
+            Some("session-1"),
+            None,
+            false,
+            None,
+            0,
+            None,
+        )
+        .await;
+
+        prepare_pool_failover_after_candidate_failure(
+            &state,
+            LocalExecutionEffectContext {
+                plan: &failed_plan,
+                report_context: Some(&failed_report_context),
+            },
+        )
+        .await;
+
+        let runtime_after_failure = read_admin_provider_pool_runtime_state(
+            state.runtime_state.as_ref(),
+            &failed_plan.provider_id,
+            &["key-1".to_string(), "key-2".to_string()],
+            &pool_config,
+            Some("session-1"),
+        )
+        .await;
+        assert_eq!(runtime_after_failure.sticky_bound_key_id, None);
+        assert!(
+            prepare_pool_attempt_started_effect(
+                &state,
+                LocalExecutionEffectContext {
+                    plan: &fallback_plan,
+                    report_context: Some(&fallback_report_context),
+                },
+            )
+            .await,
+            "fallback must be able to claim the session before slow failure settlement runs"
         );
     }
 

@@ -33,12 +33,13 @@ pub(crate) use self::classifier::{
 };
 pub(crate) use self::effects::{
     apply_local_execution_effect, apply_local_pool_terminal_effect_after_lease_release,
-    prepare_pool_attempt_started_effect, release_local_pool_key_lease_for_attempt,
-    release_local_pool_key_lease_for_attempt_strict, release_pool_sticky_initialization_for_owner,
-    stop_local_pool_sticky_init_renewer_for_attempt, LocalAdaptiveRateLimitEffect,
-    LocalAdaptiveSuccessEffect, LocalAttemptFailureEffect, LocalExecutionEffect,
-    LocalExecutionEffectContext, LocalHealthFailureEffect, LocalHealthSuccessEffect,
-    LocalOAuthInvalidationEffect, LocalPoolErrorEffect, PoolAttemptStartCleanupGuard,
+    prepare_pool_attempt_started_effect, prepare_pool_failover_after_candidate_failure,
+    release_local_pool_key_lease_for_attempt, release_local_pool_key_lease_for_attempt_strict,
+    release_pool_sticky_initialization_for_owner, stop_local_pool_sticky_init_renewer_for_attempt,
+    LocalAdaptiveRateLimitEffect, LocalAdaptiveSuccessEffect, LocalAttemptFailureEffect,
+    LocalExecutionEffect, LocalExecutionEffectContext, LocalHealthFailureEffect,
+    LocalHealthSuccessEffect, LocalOAuthInvalidationEffect, LocalPoolErrorEffect,
+    PoolAttemptStartCleanupGuard,
 };
 pub(crate) use self::health::{
     project_local_failure_health, project_local_key_circuit_closed,
