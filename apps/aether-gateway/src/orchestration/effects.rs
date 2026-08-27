@@ -46,6 +46,7 @@ use crate::handlers::shared::provider_pool::{
     release_admin_provider_pool_sticky_session_init_if_owner,
     renew_admin_provider_pool_sticky_session_init_if_owner, AdminProviderPoolConfig,
 };
+use crate::maintenance::spawn_codex_quota_refresh_after_rate_limit;
 use crate::orchestration::{
     local_execution_candidate_metadata_from_report_context, LocalExecutionCandidateMetadata,
 };
@@ -1532,6 +1533,17 @@ async fn record_pool_error_effect(
         }),
     )
     .await;
+    if pool_error_should_trigger_codex_quota_refresh(
+        &pool_context.provider_type,
+        effect.status_code,
+    ) {
+        let _ = spawn_codex_quota_refresh_after_rate_limit(
+            state.clone(),
+            context.plan.provider_id.clone(),
+            context.plan.endpoint_id.clone(),
+            context.plan.key_id.clone(),
+        );
+    }
 }
 
 async fn remember_pool_sticky_collateral_block_for_context(
@@ -1867,6 +1879,10 @@ fn pool_score_hard_state_for_status(
     }
 }
 
+fn pool_error_should_trigger_codex_quota_refresh(provider_type: &str, status_code: u16) -> bool {
+    status_code == 429 && provider_type.trim().eq_ignore_ascii_case("codex")
+}
+
 fn pool_score_hard_state_for_terminal_error_reason(reason: &str) -> PoolMemberHardState {
     if reason.starts_with("payment_required_") {
         PoolMemberHardState::QuotaExhausted
@@ -1908,7 +1924,8 @@ mod tests {
 
     use super::{
         apply_local_execution_effect, local_candidate_failure_should_record_pool_error,
-        pool_score_hard_state_for_status, pool_sticky_collateral_failure_status_is_account_invalid,
+        pool_error_should_trigger_codex_quota_refresh, pool_score_hard_state_for_status,
+        pool_sticky_collateral_failure_status_is_account_invalid,
         prepare_pool_attempt_started_effect, prepare_pool_failover_after_candidate_failure,
         LocalAdaptiveRateLimitEffect, LocalAdaptiveSuccessEffect, LocalAttemptFailureEffect,
         LocalExecutionEffect, LocalExecutionEffectContext, LocalHealthFailureEffect,
@@ -4655,6 +4672,16 @@ mod tests {
             ),
             Some(PoolMemberHardState::QuotaExhausted)
         );
+    }
+
+    #[test]
+    fn only_codex_rate_limits_trigger_quota_refresh() {
+        assert!(pool_error_should_trigger_codex_quota_refresh("codex", 429));
+        assert!(pool_error_should_trigger_codex_quota_refresh(
+            " CODEX ", 429
+        ));
+        assert!(!pool_error_should_trigger_codex_quota_refresh("codex", 402));
+        assert!(!pool_error_should_trigger_codex_quota_refresh("grok", 429));
     }
 
     #[tokio::test]

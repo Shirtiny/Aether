@@ -47,6 +47,8 @@ const POOL_QUOTA_PROBE_BURST_RETRY_GUARD_SECONDS: u64 = 15;
 const POOL_QUOTA_PROBE_AUTO_MIN_INTERVAL_SECONDS: u64 = 30;
 const POOL_QUOTA_PROBE_AUTO_MAX_INTERVAL_SECONDS: u64 = 10 * 60;
 const POOL_QUOTA_PROBE_AUTO_MAX_PRESSURE: u64 = 64;
+const CODEX_RATE_LIMIT_QUOTA_REFRESH_GUARD_PREFIX: &str = "ap:quota_probe:codex_429";
+const CODEX_RATE_LIMIT_QUOTA_REFRESH_GUARD_SECONDS: u64 = 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PoolQuotaProbeMode {
@@ -508,6 +510,36 @@ pub(crate) fn select_pool_quota_probe_ids_for_active_target(
 
 fn probe_stamp_key(provider_id: &str, key_id: &str) -> String {
     format!("{POOL_QUOTA_PROBE_REDIS_PREFIX}:{provider_id}:{key_id}")
+}
+
+fn codex_rate_limit_quota_refresh_guard_key(provider_id: &str, key_id: &str) -> String {
+    format!("{CODEX_RATE_LIMIT_QUOTA_REFRESH_GUARD_PREFIX}:{provider_id}:{key_id}")
+}
+
+async fn claim_codex_rate_limit_quota_refresh(
+    runtime: &RuntimeState,
+    provider_id: &str,
+    key_id: &str,
+) -> bool {
+    match runtime
+        .kv_set_if_absent(
+            &codex_rate_limit_quota_refresh_guard_key(provider_id, key_id),
+            now_unix_secs().to_string(),
+            Duration::from_secs(CODEX_RATE_LIMIT_QUOTA_REFRESH_GUARD_SECONDS),
+        )
+        .await
+    {
+        Ok(claimed) => claimed,
+        Err(err) => {
+            warn!(
+                provider_id,
+                key_id,
+                error = ?err,
+                "gateway Codex 429 quota refresh guard failed"
+            );
+            false
+        }
+    }
 }
 
 fn prune_pool_quota_probe_active_member_ids(
@@ -1082,7 +1114,10 @@ async fn record_score_probe_results_from_payload(
                 continue;
             };
             recorded.insert(key_id.to_string());
-            if probe_result_succeeded(item) {
+            let hard_state = probe_result_hard_state(item);
+            if probe_result_succeeded(item)
+                && hard_state != Some(PoolMemberHardState::QuotaExhausted)
+            {
                 succeeded.insert(key_id.to_string());
             }
             record_score_probe_result_for_key(
@@ -1091,7 +1126,7 @@ async fn record_score_probe_results_from_payload(
                 key_id,
                 attempted_at,
                 probe_result_succeeded(item),
-                probe_result_hard_state(item).or_else(|| {
+                hard_state.or_else(|| {
                     (!probe_result_succeeded(item)).then_some(PoolMemberHardState::Cooldown)
                 }),
                 serde_json::json!({
@@ -1197,6 +1232,14 @@ fn probe_result_succeeded(item: &Value) -> bool {
 }
 
 fn probe_result_hard_state(item: &Value) -> Option<PoolMemberHardState> {
+    if item
+        .get("quota_snapshot")
+        .and_then(|quota| quota.get("exhausted"))
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        return Some(PoolMemberHardState::QuotaExhausted);
+    }
     if probe_result_succeeded(item) {
         return Some(PoolMemberHardState::Available);
     }
@@ -1610,6 +1653,115 @@ pub(crate) async fn perform_pool_quota_probe_once_for_provider_with_config(
     .await
 }
 
+async fn refresh_codex_quota_after_rate_limit(
+    state: &AppState,
+    provider_id: &str,
+    endpoint_id: &str,
+    key_id: &str,
+) -> Result<(), GatewayError> {
+    let Some(provider) = state
+        .read_provider_catalog_providers_by_ids(&[provider_id.to_string()])
+        .await?
+        .into_iter()
+        .next()
+        .filter(|provider| {
+            provider.is_active && provider.provider_type.trim().eq_ignore_ascii_case("codex")
+        })
+    else {
+        return Ok(());
+    };
+    if admin_provider_pool_config(&provider).is_none() {
+        return Ok(());
+    }
+    let Some(endpoint) = state
+        .read_provider_catalog_endpoints_by_ids(&[endpoint_id.to_string()])
+        .await?
+        .into_iter()
+        .next()
+        .filter(|endpoint| endpoint.provider_id == provider.id)
+    else {
+        return Ok(());
+    };
+    let Some(key) = state
+        .read_provider_catalog_keys_by_ids(&[key_id.to_string()])
+        .await?
+        .into_iter()
+        .next()
+        .filter(|key| key.is_active && key.provider_id == provider.id)
+    else {
+        return Ok(());
+    };
+
+    let admin_state = AdminAppState::new(state);
+    let payload =
+        refresh_provider_probe_keys(&admin_state, &provider, &endpoint, "codex", vec![key]).await?;
+    let refresh_succeeded = payload
+        .as_ref()
+        .and_then(|value| value.get("success"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        > 0;
+    if !refresh_succeeded {
+        debug!(
+            provider_id,
+            key_id, "gateway Codex 429 quota refresh returned no successful result"
+        );
+        return Ok(());
+    }
+
+    record_score_probe_results_from_payload(
+        state,
+        &provider.id,
+        &[key_id.to_string()],
+        payload.as_ref(),
+        now_unix_secs(),
+    )
+    .await;
+    info!(
+        provider_id,
+        key_id, "gateway refreshed Codex quota after upstream 429"
+    );
+    Ok(())
+}
+
+pub(crate) fn spawn_codex_quota_refresh_after_rate_limit(
+    state: AppState,
+    provider_id: String,
+    endpoint_id: String,
+    key_id: String,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if provider_id.trim().is_empty()
+        || endpoint_id.trim().is_empty()
+        || key_id.trim().is_empty()
+        || !state.has_provider_catalog_data_reader()
+        || !state.has_provider_catalog_data_writer()
+    {
+        return None;
+    }
+
+    Some(tokio::spawn(async move {
+        if !claim_codex_rate_limit_quota_refresh(
+            state.runtime_state.as_ref(),
+            &provider_id,
+            &key_id,
+        )
+        .await
+        {
+            return;
+        }
+        if let Err(err) =
+            refresh_codex_quota_after_rate_limit(&state, &provider_id, &endpoint_id, &key_id).await
+        {
+            warn!(
+                provider_id,
+                key_id,
+                error = ?err,
+                "gateway failed to refresh Codex quota after upstream 429"
+            );
+        }
+    }))
+}
+
 pub(crate) fn spawn_pool_quota_probe_replenish_for_request(
     state: AppState,
     provider_id: String,
@@ -1703,6 +1855,7 @@ pub(crate) fn spawn_pool_quota_probe_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aether_runtime_state::MemoryRuntimeStateConfig;
     use serde_json::json;
 
     fn key(
@@ -1748,6 +1901,36 @@ mod tests {
         let selected = select_pool_quota_probe_key_ids(&keys, "codex", 2_000, 600, &stamps, 2);
 
         assert_eq!(selected, vec!["never".to_string(), "old".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn codex_rate_limit_quota_refresh_guard_deduplicates_per_account() {
+        let runtime = RuntimeState::memory(MemoryRuntimeStateConfig::default());
+
+        assert!(claim_codex_rate_limit_quota_refresh(&runtime, "provider-1", "key-1").await);
+        assert!(!claim_codex_rate_limit_quota_refresh(&runtime, "provider-1", "key-1").await);
+        assert!(claim_codex_rate_limit_quota_refresh(&runtime, "provider-1", "key-2").await);
+    }
+
+    #[test]
+    fn successful_quota_probe_preserves_exhausted_hard_state() {
+        let exhausted = json!({
+            "status": "success",
+            "quota_snapshot": { "exhausted": true }
+        });
+        let available = json!({
+            "status": "success",
+            "quota_snapshot": { "exhausted": false }
+        });
+
+        assert_eq!(
+            probe_result_hard_state(&exhausted),
+            Some(PoolMemberHardState::QuotaExhausted)
+        );
+        assert_eq!(
+            probe_result_hard_state(&available),
+            Some(PoolMemberHardState::Available)
+        );
     }
 
     fn score(
