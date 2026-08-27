@@ -5072,6 +5072,7 @@ mod tests {
         DEFAULT_STREAM_DOWNSTREAM_WRITE_TIMEOUT, DEFAULT_STREAM_UPSTREAM_IDLE_TIMEOUT,
         REWRITTEN_STREAM_PREFETCH_TIMEOUT, SSE_KEEPALIVE_BYTES,
     };
+    use crate::constants::STREAM_IDLE_TIMEOUT_MS_HEADER;
     use crate::control::GatewayControlDecision;
     use crate::handlers::shared::provider_pool::{
         admin_provider_pool_config_from_config_value,
