@@ -13,6 +13,7 @@ import {
   LOCAL_PROBE_INTERCEPT_DEFAULT_DELAY_MAX_MS,
   LOCAL_PROBE_INTERCEPT_DEFAULT_DELAY_MIN_MS,
   LOCAL_PROBE_INTERCEPT_DEFAULT_RULES,
+  LOCAL_PROBE_INTERCEPT_DEFAULT_USAGE,
   type ModuleStatus,
 } from '@/api/modules'
 
@@ -963,6 +964,11 @@ export const MOCK_SYSTEM_CONFIGS: Array<{ key: string; value: unknown; descripti
     key: 'module.local_probe_intercept.rules',
     value: LOCAL_PROBE_INTERCEPT_DEFAULT_RULES.map(rule => ({ ...rule })),
     description: '测活拦截提示词与回复规则',
+  },
+  {
+    key: 'module.local_probe_intercept.usage',
+    value: { ...LOCAL_PROBE_INTERCEPT_DEFAULT_USAGE },
+    description: '测活拦截响应 usage',
   },
   {
     key: 'module.local_probe_intercept.delay_min_ms',

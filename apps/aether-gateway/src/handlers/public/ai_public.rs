@@ -8,7 +8,7 @@ use crate::image_capabilities::{
 };
 use crate::local_probe_intercept::{
     local_probe_intercept_answer, local_probe_intercept_delay, local_probe_intercept_enabled,
-    LocalProbeInterceptKind,
+    local_probe_intercept_usage, LocalProbeInterceptKind, LocalProbeInterceptUsage,
 };
 use crate::{AppState, GatewayError};
 use aether_data_contracts::repository::video_tasks::{
@@ -983,6 +983,7 @@ async fn maybe_build_local_openai_probe_response(
         .and_then(value_as_bool)
         .unwrap_or(false);
     let answer = probe.answer();
+    let usage = local_probe_intercept_usage(state).await.ok().flatten()?;
     let delay_ms = local_probe_intercept_delay(state)
         .await
         .ok()
@@ -999,6 +1000,7 @@ async fn maybe_build_local_openai_probe_response(
         started_at,
         model,
         &answer,
+        usage,
         stream,
         is_compaction,
     )
@@ -1009,6 +1011,7 @@ async fn maybe_build_local_openai_probe_response(
             model,
             &answer.text,
             answer.kind,
+            usage,
             stream,
             is_compaction,
         ),
@@ -1017,6 +1020,7 @@ async fn maybe_build_local_openai_probe_response(
             model,
             &answer.text,
             answer.kind,
+            usage,
             stream,
         ),
     })
@@ -1258,15 +1262,22 @@ fn build_openai_responses_local_probe_response(
     model: &str,
     text: &str,
     kind: LocalProbeKind,
+    usage: LocalProbeInterceptUsage,
     stream: bool,
     is_compaction: bool,
 ) -> Response<Body> {
     let response_id = local_probe_response_id(&request_context.trace_id);
     let created_at = chrono::Utc::now().timestamp().max(0);
     let response = if is_compaction {
-        openai_responses_local_compaction_probe_payload(&response_id, model, text, created_at)
+        openai_responses_local_compaction_probe_payload(
+            &response_id,
+            model,
+            text,
+            created_at,
+            usage,
+        )
     } else {
-        openai_responses_local_probe_payload(&response_id, model, text, created_at)
+        openai_responses_local_probe_payload(&response_id, model, text, created_at, usage)
     };
     if stream {
         let body = if is_compaction {
@@ -1299,12 +1310,13 @@ fn build_openai_chat_local_probe_response(
     model: &str,
     text: &str,
     kind: LocalProbeKind,
+    usage: LocalProbeInterceptUsage,
     stream: bool,
 ) -> Response<Body> {
     let response_id = local_probe_chat_response_id(&request_context.trace_id);
     let created_at = chrono::Utc::now().timestamp().max(0);
     if stream {
-        let body = openai_chat_local_probe_sse_body(&response_id, model, text, created_at);
+        let body = openai_chat_local_probe_sse_body(&response_id, model, text, created_at, usage);
         return Response::builder()
             .status(http::StatusCode::OK)
             .header(http::header::CONTENT_TYPE, "text/event-stream")
@@ -1315,7 +1327,7 @@ fn build_openai_chat_local_probe_response(
             .expect("local chat probe stream response should build");
     }
 
-    let response = openai_chat_local_probe_payload(&response_id, model, text, created_at);
+    let response = openai_chat_local_probe_payload(&response_id, model, text, created_at, usage);
     Response::builder()
         .status(http::StatusCode::OK)
         .header(http::header::CONTENT_TYPE, "application/json")
@@ -1331,6 +1343,7 @@ fn openai_chat_local_probe_payload(
     model: &str,
     text: &str,
     created_at: i64,
+    usage: LocalProbeInterceptUsage,
 ) -> Value {
     json!({
         "id": response_id,
@@ -1345,10 +1358,17 @@ fn openai_chat_local_probe_payload(
             },
             "finish_reason": "stop"
         }],
-        "usage": {
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0
+        "usage": openai_chat_local_probe_usage_payload(usage)
+    })
+}
+
+fn openai_chat_local_probe_usage_payload(usage: LocalProbeInterceptUsage) -> Value {
+    json!({
+        "prompt_tokens": usage.input_tokens,
+        "completion_tokens": usage.output_tokens,
+        "total_tokens": usage.total_tokens(),
+        "prompt_tokens_details": {
+            "cached_tokens": usage.cached_tokens
         }
     })
 }
@@ -1358,6 +1378,7 @@ fn openai_chat_local_probe_sse_body(
     model: &str,
     text: &str,
     created_at: i64,
+    usage: LocalProbeInterceptUsage,
 ) -> Vec<u8> {
     let events = [
         json!({
@@ -1393,6 +1414,14 @@ fn openai_chat_local_probe_sse_body(
                 "finish_reason": "stop"
             }]
         }),
+        json!({
+            "id": response_id,
+            "object": "chat.completion.chunk",
+            "created": created_at,
+            "model": model,
+            "choices": [],
+            "usage": openai_chat_local_probe_usage_payload(usage)
+        }),
     ];
 
     let mut body = String::new();
@@ -1412,6 +1441,7 @@ fn openai_responses_local_probe_payload(
     model: &str,
     text: &str,
     created_at: i64,
+    usage: LocalProbeInterceptUsage,
 ) -> Value {
     let message_id = build_openai_responses_message_item_id(response_id, 0);
     let message = json!({
@@ -1433,16 +1463,20 @@ fn openai_responses_local_probe_payload(
         "model": model,
         "output": [message],
         "output_text": text,
-        "usage": {
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "total_tokens": 0,
-            "input_tokens_details": {
-                "cached_tokens": 0
-            },
-            "output_tokens_details": {
-                "reasoning_tokens": 0
-            }
+        "usage": openai_responses_local_probe_usage_payload(usage)
+    })
+}
+
+fn openai_responses_local_probe_usage_payload(usage: LocalProbeInterceptUsage) -> Value {
+    json!({
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "total_tokens": usage.total_tokens(),
+        "input_tokens_details": {
+            "cached_tokens": usage.cached_tokens
+        },
+        "output_tokens_details": {
+            "reasoning_tokens": 0
         }
     })
 }
@@ -1452,6 +1486,7 @@ fn openai_responses_local_compaction_probe_payload(
     model: &str,
     encrypted_content: &str,
     created_at: i64,
+    usage: LocalProbeInterceptUsage,
 ) -> Value {
     let compaction = json!({
         "type": "compaction",
@@ -1464,17 +1499,7 @@ fn openai_responses_local_compaction_probe_payload(
         "status": "completed",
         "model": model,
         "output": [compaction],
-        "usage": {
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "total_tokens": 0,
-            "input_tokens_details": {
-                "cached_tokens": 0
-            },
-            "output_tokens_details": {
-                "reasoning_tokens": 0
-            }
-        }
+        "usage": openai_responses_local_probe_usage_payload(usage)
     })
 }
 
@@ -1693,6 +1718,7 @@ async fn record_local_openai_probe_usage(
     started_at: Option<&Instant>,
     model: &str,
     answer: &LocalProbeAnswer,
+    usage: LocalProbeInterceptUsage,
     stream: bool,
     is_compaction: bool,
 ) {
@@ -1798,9 +1824,10 @@ async fn record_local_openai_probe_usage(
         provider_endpoint_kind: local_probe_endpoint_kind(api_format).map(ToOwned::to_owned),
         has_format_conversion: Some(false),
         is_stream: Some(false),
-        input_tokens: Some(0),
-        output_tokens: Some(0),
-        total_tokens: Some(0),
+        input_tokens: Some(usage.input_tokens),
+        output_tokens: Some(usage.output_tokens),
+        total_tokens: Some(usage.total_tokens()),
+        cache_read_input_tokens: Some(usage.cached_tokens),
         total_cost_usd: Some(0.0),
         actual_total_cost_usd: Some(0.0),
         status_code: Some(http::StatusCode::OK.as_u16()),
@@ -2622,13 +2649,22 @@ mod tests {
     use crate::control::{GatewayControlDecision, GatewayPublicRequestContext};
     use crate::data::GatewayDataState;
     use crate::local_probe_intercept::{
-        LOCAL_PROBE_INTERCEPT_DELAY_MAX_MS_KEY, LOCAL_PROBE_INTERCEPT_DELAY_MIN_MS_KEY,
-        LOCAL_PROBE_INTERCEPT_ENABLED_KEY, LOCAL_PROBE_INTERCEPT_RULES_KEY,
+        LocalProbeInterceptUsage, LOCAL_PROBE_INTERCEPT_DELAY_MAX_MS_KEY,
+        LOCAL_PROBE_INTERCEPT_DELAY_MIN_MS_KEY, LOCAL_PROBE_INTERCEPT_ENABLED_KEY,
+        LOCAL_PROBE_INTERCEPT_RULES_KEY, LOCAL_PROBE_INTERCEPT_USAGE_KEY,
     };
     use crate::AppState;
     use axum::body::Bytes;
     use axum::http::{HeaderMap, HeaderValue};
     use serde_json::json;
+
+    fn configured_probe_usage() -> LocalProbeInterceptUsage {
+        LocalProbeInterceptUsage {
+            input_tokens: 120,
+            output_tokens: 8,
+            cached_tokens: 40,
+        }
+    }
 
     fn probe_test_state() -> AppState {
         AppState::new()
@@ -2658,6 +2694,14 @@ mod tests {
                                 "system": true,
                             },
                         ]),
+                    ),
+                    (
+                        LOCAL_PROBE_INTERCEPT_USAGE_KEY.to_string(),
+                        json!({
+                            "input_tokens": 120,
+                            "output_tokens": 8,
+                            "cached_tokens": 40,
+                        }),
                     ),
                     (LOCAL_PROBE_INTERCEPT_DELAY_MIN_MS_KEY.to_string(), json!(0)),
                     (LOCAL_PROBE_INTERCEPT_DELAY_MAX_MS_KEY.to_string(), json!(0)),
@@ -3040,6 +3084,14 @@ mod tests {
             response.headers().get(LOCAL_PROBE_RESPONSE_HEADER),
             Some(&HeaderValue::from_static("ping"))
         );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("local probe stream body should read");
+        let body = String::from_utf8(body.to_vec()).expect("local probe body should be utf-8");
+        assert!(body.contains("\"choices\":[]"));
+        assert!(body.contains("\"prompt_tokens\":120"));
+        assert!(body.contains("\"completion_tokens\":8"));
+        assert!(body.contains("\"cached_tokens\":40"));
     }
 
     #[tokio::test]
@@ -3077,7 +3129,13 @@ mod tests {
 
     #[test]
     fn local_probe_sse_contains_completed_response() {
-        let response = openai_responses_local_probe_payload("resp_probe", "gpt-5.4-mini", "21", 1);
+        let response = openai_responses_local_probe_payload(
+            "resp_probe",
+            "gpt-5.4-mini",
+            "21",
+            1,
+            configured_probe_usage(),
+        );
         let body = String::from_utf8(openai_responses_local_probe_sse_body(&response))
             .expect("sse body should be utf-8");
 
@@ -3085,6 +3143,13 @@ mod tests {
         assert_eq!(response["output"][0]["id"], json!("msg_probe"));
         assert!(body.contains("\"item_id\":\"msg_probe\""));
         assert!(body.contains("\"output_text\":\"21\""));
+        assert_eq!(response["usage"]["input_tokens"], json!(120));
+        assert_eq!(response["usage"]["output_tokens"], json!(8));
+        assert_eq!(response["usage"]["total_tokens"], json!(128));
+        assert_eq!(
+            response["usage"]["input_tokens_details"]["cached_tokens"],
+            json!(40)
+        );
         assert!(body.ends_with("data: [DONE]\n\n"));
     }
 
@@ -3119,6 +3184,7 @@ mod tests {
             "gpt-5.6-sol",
             "OK",
             1,
+            configured_probe_usage(),
         );
         assert_eq!(response["output"].as_array().map(Vec::len), Some(1));
         assert_eq!(response["output"][0]["type"], json!("compaction"));
@@ -3147,12 +3213,48 @@ mod tests {
             "gpt-5.4-mini",
             "pong",
             1,
+            configured_probe_usage(),
         ))
         .expect("sse body should be utf-8");
 
         assert!(body.contains("\"object\":\"chat.completion.chunk\""));
         assert!(body.contains("pong"));
+        let usage_chunks = body
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter(|line| *line != "[DONE]")
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|chunk| chunk.get("usage").is_some())
+            .collect::<Vec<_>>();
+        assert_eq!(usage_chunks.len(), 1);
+        assert_eq!(usage_chunks[0]["choices"], json!([]));
+        assert_eq!(usage_chunks[0]["usage"]["prompt_tokens"], json!(120));
+        assert_eq!(usage_chunks[0]["usage"]["completion_tokens"], json!(8));
+        assert_eq!(usage_chunks[0]["usage"]["total_tokens"], json!(128));
+        assert_eq!(
+            usage_chunks[0]["usage"]["prompt_tokens_details"]["cached_tokens"],
+            json!(40)
+        );
         assert!(body.ends_with("data: [DONE]\n\n"));
+    }
+
+    #[test]
+    fn local_chat_probe_payload_contains_configured_usage() {
+        let response = super::openai_chat_local_probe_payload(
+            "chatcmpl_probe",
+            "gpt-5.5",
+            "OK",
+            1,
+            configured_probe_usage(),
+        );
+
+        assert_eq!(response["usage"]["prompt_tokens"], json!(120));
+        assert_eq!(response["usage"]["completion_tokens"], json!(8));
+        assert_eq!(response["usage"]["total_tokens"], json!(128));
+        assert_eq!(
+            response["usage"]["prompt_tokens_details"]["cached_tokens"],
+            json!(40)
+        );
     }
 
     #[test]

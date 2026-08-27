@@ -58,7 +58,7 @@
             />
           </div>
         </div>
-        <div class="mt-5 grid gap-4 sm:grid-cols-2 lg:max-w-xl">
+        <div class="mt-5 grid gap-4 sm:grid-cols-2 xl:grid-cols-5">
           <label class="space-y-2">
             <span class="text-sm font-medium text-foreground">最小延迟（ms）</span>
             <Input
@@ -81,6 +81,42 @@
               step="1"
               class="h-9"
               @update:model-value="(value) => updateDelay('delay_max_ms', value)"
+            />
+          </label>
+          <label class="space-y-2">
+            <span class="text-sm font-medium text-foreground">输入 Token（含缓存）</span>
+            <Input
+              :model-value="config.usage.input_tokens"
+              type="number"
+              min="0"
+              :max="LOCAL_PROBE_INTERCEPT_MAX_USAGE_TOKENS"
+              step="1"
+              class="h-9"
+              @update:model-value="(value) => updateUsage('input_tokens', value)"
+            />
+          </label>
+          <label class="space-y-2">
+            <span class="text-sm font-medium text-foreground">输出 Token</span>
+            <Input
+              :model-value="config.usage.output_tokens"
+              type="number"
+              min="0"
+              :max="LOCAL_PROBE_INTERCEPT_MAX_USAGE_TOKENS - config.usage.input_tokens"
+              step="1"
+              class="h-9"
+              @update:model-value="(value) => updateUsage('output_tokens', value)"
+            />
+          </label>
+          <label class="space-y-2">
+            <span class="text-sm font-medium text-foreground">缓存 Token</span>
+            <Input
+              :model-value="config.usage.cached_tokens"
+              type="number"
+              min="0"
+              :max="config.usage.input_tokens"
+              step="1"
+              class="h-9"
+              @update:model-value="(value) => updateUsage('cached_tokens', value)"
             />
           </label>
         </div>
@@ -241,12 +277,15 @@ import SelectValue from '@/components/ui/select-value.vue'
 import {
   LOCAL_PROBE_INTERCEPT_DEFAULT_DELAY_MAX_MS,
   LOCAL_PROBE_INTERCEPT_DEFAULT_DELAY_MIN_MS,
+  LOCAL_PROBE_INTERCEPT_DEFAULT_USAGE,
   LOCAL_PROBE_INTERCEPT_MAX_DELAY_MS,
+  LOCAL_PROBE_INTERCEPT_MAX_USAGE_TOKENS,
   LOCAL_PROBE_INTERCEPT_DEFAULT_RULES,
   modulesApi,
   type LocalProbeInterceptConfig,
   type LocalProbeInterceptKind,
   type LocalProbeInterceptRule,
+  type LocalProbeInterceptUsage,
 } from '@/api/modules'
 import { parseNumberInput } from '@/utils/form'
 import { useModuleStore } from '@/stores/modules'
@@ -257,6 +296,7 @@ import { log } from '@/utils/logger'
 const defaultConfig: LocalProbeInterceptConfig = {
   enabled: true,
   rules: LOCAL_PROBE_INTERCEPT_DEFAULT_RULES.map(rule => ({ ...rule })),
+  usage: { ...LOCAL_PROBE_INTERCEPT_DEFAULT_USAGE },
   delay_min_ms: LOCAL_PROBE_INTERCEPT_DEFAULT_DELAY_MIN_MS,
   delay_max_ms: LOCAL_PROBE_INTERCEPT_DEFAULT_DELAY_MAX_MS,
 }
@@ -281,6 +321,7 @@ function cloneConfig(value: LocalProbeInterceptConfig): LocalProbeInterceptConfi
   return {
     enabled: value.enabled,
     rules: value.rules.map(rule => ({ ...rule })),
+    usage: { ...value.usage },
     delay_min_ms: value.delay_min_ms,
     delay_max_ms: value.delay_max_ms,
   }
@@ -292,6 +333,13 @@ function updateDelay(field: LocalProbeDelayKey, value: string | number) {
   config.value[field] = Math.floor(parseNumberInput(value, {
     min: 0,
     max: LOCAL_PROBE_INTERCEPT_MAX_DELAY_MS,
+  }) ?? 0)
+}
+
+function updateUsage(field: keyof LocalProbeInterceptUsage, value: string | number) {
+  config.value.usage[field] = Math.floor(parseNumberInput(value, {
+    min: 0,
+    max: LOCAL_PROBE_INTERCEPT_MAX_USAGE_TOKENS,
   }) ?? 0)
 }
 
@@ -402,6 +450,39 @@ function sanitizeDelayRange(): Pick<LocalProbeInterceptConfig, 'delay_min_ms' | 
   }
 }
 
+function sanitizeUsage(): LocalProbeInterceptUsage | null {
+  const inputTokens = Math.floor(Number(config.value.usage.input_tokens))
+  const outputTokens = Math.floor(Number(config.value.usage.output_tokens))
+  const cachedTokens = Math.floor(Number(config.value.usage.cached_tokens))
+  if (
+    !Number.isFinite(inputTokens)
+    || !Number.isFinite(outputTokens)
+    || !Number.isFinite(cachedTokens)
+    || inputTokens < 0
+    || outputTokens < 0
+    || cachedTokens < 0
+    || inputTokens > LOCAL_PROBE_INTERCEPT_MAX_USAGE_TOKENS
+    || outputTokens > LOCAL_PROBE_INTERCEPT_MAX_USAGE_TOKENS
+    || cachedTokens > LOCAL_PROBE_INTERCEPT_MAX_USAGE_TOKENS
+  ) {
+    error(`Token 数必须是 0 到 ${LOCAL_PROBE_INTERCEPT_MAX_USAGE_TOKENS} 之间的整数`)
+    return null
+  }
+  if (inputTokens + outputTokens > LOCAL_PROBE_INTERCEPT_MAX_USAGE_TOKENS) {
+    error(`输入与输出 Token 总和不能大于 ${LOCAL_PROBE_INTERCEPT_MAX_USAGE_TOKENS}`)
+    return null
+  }
+  if (cachedTokens > inputTokens) {
+    error('缓存 Token 不能大于输入 Token')
+    return null
+  }
+  return {
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    cached_tokens: cachedTokens,
+  }
+}
+
 function normalizeRuleId(raw: string, index: number): string {
   const normalized = raw.trim().replace(/[^A-Za-z0-9_.-]/g, '_').replace(/^_+|_+$/g, '')
   return normalized ? normalized.slice(0, 64) : `custom_${index + 1}`
@@ -429,11 +510,14 @@ async function saveConfig() {
   if (!rules) return
   const delayRange = sanitizeDelayRange()
   if (!delayRange) return
+  const usage = sanitizeUsage()
+  if (!usage) return
   saving.value = true
   try {
     const saved = await modulesApi.updateLocalProbeInterceptConfig({
       enabled: config.value.enabled,
       rules,
+      usage,
       ...delayRange,
     })
     config.value = cloneConfig(saved)

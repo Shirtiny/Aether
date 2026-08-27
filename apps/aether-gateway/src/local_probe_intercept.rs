@@ -10,11 +10,13 @@ pub(crate) const LOCAL_PROBE_INTERCEPT_DELAY_MIN_MS_KEY: &str =
     "module.local_probe_intercept.delay_min_ms";
 pub(crate) const LOCAL_PROBE_INTERCEPT_DELAY_MAX_MS_KEY: &str =
     "module.local_probe_intercept.delay_max_ms";
+pub(crate) const LOCAL_PROBE_INTERCEPT_USAGE_KEY: &str = "module.local_probe_intercept.usage";
 
 const MAX_PROBE_TEXT_CHARS: usize = 512;
 const DEFAULT_DELAY_MIN_MS: u64 = 900;
 const DEFAULT_DELAY_MAX_MS: u64 = 2_000;
 const MAX_DELAY_MS: u64 = 60_000;
+const MAX_USAGE_TOKENS: u64 = i32::MAX as u64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LocalProbeInterceptKind {
@@ -42,6 +44,19 @@ pub(crate) struct LocalProbeInterceptAnswer {
 pub(crate) struct LocalProbeInterceptDelay {
     pub(crate) min_ms: u64,
     pub(crate) max_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct LocalProbeInterceptUsage {
+    pub(crate) input_tokens: u64,
+    pub(crate) output_tokens: u64,
+    pub(crate) cached_tokens: u64,
+}
+
+impl LocalProbeInterceptUsage {
+    pub(crate) fn total_tokens(self) -> u64 {
+        self.input_tokens.saturating_add(self.output_tokens)
+    }
 }
 
 impl LocalProbeInterceptDelay {
@@ -104,6 +119,42 @@ pub(crate) async fn local_probe_intercept_delay(
     .await?;
 
     Ok(LocalProbeInterceptDelay::from_bounds(min_ms, max_ms))
+}
+
+pub(crate) async fn local_probe_intercept_usage(
+    state: &AppState,
+) -> Result<Option<LocalProbeInterceptUsage>, GatewayError> {
+    let value = state
+        .read_system_config_json_value(LOCAL_PROBE_INTERCEPT_USAGE_KEY)
+        .await?
+        .or_else(|| {
+            aether_admin::system::admin_system_config_default_value(LOCAL_PROBE_INTERCEPT_USAGE_KEY)
+        })
+        .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+    Ok(parse_local_probe_intercept_usage(&value))
+}
+
+fn parse_local_probe_intercept_usage(value: &Value) -> Option<LocalProbeInterceptUsage> {
+    let usage = value.as_object()?;
+    let input_tokens = local_probe_usage_tokens(usage.get("input_tokens"))?;
+    let output_tokens = local_probe_usage_tokens(usage.get("output_tokens"))?;
+    let cached_tokens = local_probe_usage_tokens(usage.get("cached_tokens"))?;
+    if cached_tokens > input_tokens || input_tokens.saturating_add(output_tokens) > MAX_USAGE_TOKENS
+    {
+        return None;
+    }
+    Some(LocalProbeInterceptUsage {
+        input_tokens,
+        output_tokens,
+        cached_tokens,
+    })
+}
+
+fn local_probe_usage_tokens(value: Option<&Value>) -> Option<u64> {
+    match value {
+        None | Some(Value::Null) => Some(0),
+        Some(value) => value.as_u64().filter(|tokens| *tokens <= MAX_USAGE_TOKENS),
+    }
 }
 
 async fn read_local_probe_delay_ms(
@@ -300,5 +351,57 @@ mod tests {
             assert!((900..=2_000).contains(&delay_ms));
         }
         assert_eq!(random_delay_ms(1_234, 1_234), 1_234);
+    }
+
+    #[test]
+    fn usage_parsing_accepts_valid_values_and_rejects_invalid_values() {
+        assert_eq!(
+            parse_local_probe_intercept_usage(&serde_json::json!({})),
+            Some(LocalProbeInterceptUsage::default())
+        );
+        assert_eq!(
+            parse_local_probe_intercept_usage(&serde_json::json!({
+                "input_tokens": 120,
+                "output_tokens": 8,
+                "cached_tokens": 40
+            })),
+            Some(LocalProbeInterceptUsage {
+                input_tokens: 120,
+                output_tokens: 8,
+                cached_tokens: 40,
+            })
+        );
+        assert_eq!(
+            parse_local_probe_intercept_usage(&serde_json::json!({
+                "input_tokens": 12,
+                "output_tokens": 3,
+                "cached_tokens": 99
+            })),
+            None
+        );
+        assert_eq!(
+            parse_local_probe_intercept_usage(&serde_json::json!({
+                "input_tokens": MAX_USAGE_TOKENS,
+                "output_tokens": 1
+            })),
+            None
+        );
+        assert_eq!(
+            parse_local_probe_intercept_usage(&serde_json::json!({
+                "input_tokens": "120"
+            })),
+            None
+        );
+    }
+
+    #[test]
+    fn configured_usage_total_uses_inclusive_openai_input_tokens() {
+        let usage = LocalProbeInterceptUsage {
+            input_tokens: 120,
+            output_tokens: 8,
+            cached_tokens: 40,
+        };
+
+        assert_eq!(usage.total_tokens(), 128);
     }
 }

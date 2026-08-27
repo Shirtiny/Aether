@@ -52,6 +52,7 @@ pub const ADMIN_SYSTEM_USERS_SUPPORTED_VERSIONS: &[&str] =
 const LOCAL_PROBE_INTERCEPT_DEFAULT_DELAY_MIN_MS: u64 = 900;
 const LOCAL_PROBE_INTERCEPT_DEFAULT_DELAY_MAX_MS: u64 = 2_000;
 const LOCAL_PROBE_INTERCEPT_MAX_DELAY_MS: u64 = 60_000;
+const LOCAL_PROBE_INTERCEPT_MAX_USAGE_TOKENS: u64 = i32::MAX as u64;
 pub const ADMIN_SYSTEM_PROVIDER_OPS_SENSITIVE_CREDENTIAL_FIELDS: &[&str] = &[
     "api_key",
     "password",
@@ -403,6 +404,14 @@ fn local_probe_intercept_default_rules() -> serde_json::Value {
             })
             .collect(),
     )
+}
+
+fn local_probe_intercept_default_usage() -> serde_json::Value {
+    json!({
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cached_tokens": 0,
+    })
 }
 
 fn notification_service_default_items() -> serde_json::Value {
@@ -2050,6 +2059,7 @@ pub fn admin_system_config_default_value(key: &str) -> Option<serde_json::Value>
         "enable_oauth_token_refresh" => Some(json!(true)),
         "module.local_probe_intercept.enabled" => Some(json!(true)),
         "module.local_probe_intercept.rules" => Some(local_probe_intercept_default_rules()),
+        "module.local_probe_intercept.usage" => Some(local_probe_intercept_default_usage()),
         "module.local_probe_intercept.delay_min_ms" => {
             Some(json!(LOCAL_PROBE_INTERCEPT_DEFAULT_DELAY_MIN_MS))
         }
@@ -2252,6 +2262,35 @@ fn normalize_local_probe_intercept_delay_ms_value(
         Some(_) => Err(()),
         None if value.is_null() => Ok(json!(default_ms)),
         None => Err(()),
+    }
+}
+
+fn normalize_local_probe_intercept_usage_value(
+    value: serde_json::Value,
+) -> Result<serde_json::Value, ()> {
+    let usage = value.as_object().ok_or(())?;
+    let input_tokens = normalize_local_probe_intercept_usage_tokens(usage.get("input_tokens"))?;
+    let output_tokens = normalize_local_probe_intercept_usage_tokens(usage.get("output_tokens"))?;
+    let cached_tokens = normalize_local_probe_intercept_usage_tokens(usage.get("cached_tokens"))?;
+    if cached_tokens > input_tokens
+        || input_tokens.saturating_add(output_tokens) > LOCAL_PROBE_INTERCEPT_MAX_USAGE_TOKENS
+    {
+        return Err(());
+    }
+    Ok(json!({
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cached_tokens": cached_tokens,
+    }))
+}
+
+fn normalize_local_probe_intercept_usage_tokens(value: Option<&Value>) -> Result<u64, ()> {
+    match value {
+        None | Some(Value::Null) => Ok(0),
+        Some(value) => value
+            .as_u64()
+            .filter(|tokens| *tokens <= LOCAL_PROBE_INTERCEPT_MAX_USAGE_TOKENS)
+            .ok_or(()),
     }
 }
 
@@ -2626,6 +2665,18 @@ pub fn parse_admin_system_config_update(
                 value = local_probe_intercept_default_rules();
             } else {
                 value = normalize_local_probe_intercept_rules_value(value).map_err(|_| {
+                    (
+                        http::StatusCode::BAD_REQUEST,
+                        json!({ "detail": "请求数据验证失败" }),
+                    )
+                })?;
+            }
+        }
+        "module.local_probe_intercept.usage" => {
+            if value.is_null() {
+                value = local_probe_intercept_default_usage();
+            } else {
+                value = normalize_local_probe_intercept_usage_value(value).map_err(|_| {
                     (
                         http::StatusCode::BAD_REQUEST,
                         json!({ "detail": "请求数据验证失败" }),
@@ -3978,6 +4029,14 @@ mod tests {
             admin_system_config_default_value("module.local_probe_intercept.delay_max_ms"),
             Some(json!(2_000))
         );
+        assert_eq!(
+            admin_system_config_default_value("module.local_probe_intercept.usage"),
+            Some(json!({
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cached_tokens": 0,
+            }))
+        );
         let rules = admin_system_config_default_value("module.local_probe_intercept.rules")
             .expect("local probe rules should have defaults");
         let rules = rules.as_array().expect("rules should be an array");
@@ -4106,6 +4165,53 @@ mod tests {
         )
         .expect_err("delay should reject values above the cap");
         assert_eq!(err.0, http::StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn local_probe_intercept_usage_is_normalized_and_bounded() {
+        let update = parse_admin_system_config_update(
+            "module.local_probe_intercept.usage",
+            r#"{
+                "value": {
+                    "input_tokens": 120,
+                    "output_tokens": 8,
+                    "cached_tokens": 40
+                }
+            }"#
+            .as_bytes(),
+        )
+        .expect("local probe usage should parse");
+
+        assert_eq!(
+            update.value,
+            json!({
+                "input_tokens": 120,
+                "output_tokens": 8,
+                "cached_tokens": 40,
+            })
+        );
+
+        let update = parse_admin_system_config_update(
+            "module.local_probe_intercept.usage",
+            r#"{ "value": null }"#.as_bytes(),
+        )
+        .expect("null usage should use defaults");
+        assert_eq!(update.value, local_probe_intercept_default_usage());
+
+        for invalid in [
+            r#"{ "value": { "input_tokens": -1 } }"#,
+            r#"{ "value": { "input_tokens": "120" } }"#,
+            r#"{ "value": { "input_tokens": 12, "cached_tokens": 13 } }"#,
+            r#"{ "value": { "output_tokens": 2147483648 } }"#,
+            r#"{ "value": { "input_tokens": 2147483647, "output_tokens": 1 } }"#,
+        ] {
+            let err = parse_admin_system_config_update(
+                "module.local_probe_intercept.usage",
+                invalid.as_bytes(),
+            )
+            .expect_err("invalid local probe usage should fail");
+            assert_eq!(err.0, http::StatusCode::BAD_REQUEST);
+        }
     }
 
     #[test]
