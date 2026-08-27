@@ -24,6 +24,7 @@ pub(super) fn map_provider(
         proxy: normalize_optional_json(provider.proxy),
         request_timeout_secs: provider.request_timeout_secs,
         stream_first_byte_timeout_secs: provider.stream_first_byte_timeout_secs,
+        stream_idle_timeout_secs: provider.stream_idle_timeout_secs,
         config: normalize_optional_json(provider.config),
     }
 }

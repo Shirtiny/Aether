@@ -215,6 +215,16 @@ pub(crate) async fn build_admin_update_provider_record(
         };
     }
 
+    if fields.contains("stream_idle_timeout") {
+        updated.stream_idle_timeout_secs = match payload.stream_idle_timeout {
+            Some(value) if (1.0..=600.0).contains(&value) => Some(value),
+            Some(_) => {
+                return Err("stream_idle_timeout 必须是 1 到 600 之间的数字".to_string());
+            }
+            None => None,
+        };
+    }
+
     if fields.contains("request_timeout") {
         updated.request_timeout_secs = match payload.request_timeout {
             Some(value) if (1.0..=600.0).contains(&value) => Some(value),

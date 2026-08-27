@@ -247,6 +247,7 @@ fn websocket_transport_timeouts(
 ) -> Option<aether_contracts::ExecutionTimeouts> {
     let mut timeouts = plan.timeouts.clone()?;
     timeouts.read_ms = None;
+    timeouts.stream_idle_ms = None;
     timeouts.first_byte_ms = None;
     timeouts.total_ms = None;
     Some(timeouts)

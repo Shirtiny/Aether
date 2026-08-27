@@ -22,6 +22,7 @@ pub struct StoredProviderCatalogProvider {
     pub proxy: Option<serde_json::Value>,
     pub request_timeout_secs: Option<f64>,
     pub stream_first_byte_timeout_secs: Option<f64>,
+    pub stream_idle_timeout_secs: Option<f64>,
     pub config: Option<serde_json::Value>,
     pub created_at_unix_ms: Option<u64>,
     pub updated_at_unix_secs: Option<u64>,
@@ -66,6 +67,7 @@ impl StoredProviderCatalogProvider {
             proxy: None,
             request_timeout_secs: None,
             stream_first_byte_timeout_secs: None,
+            stream_idle_timeout_secs: None,
             config: None,
             created_at_unix_ms: None,
             updated_at_unix_secs: None,
@@ -94,6 +96,11 @@ impl StoredProviderCatalogProvider {
         self.request_timeout_secs = request_timeout_secs;
         self.stream_first_byte_timeout_secs = stream_first_byte_timeout_secs;
         self.config = config;
+        self
+    }
+
+    pub fn with_stream_idle_timeout_secs(mut self, stream_idle_timeout_secs: Option<f64>) -> Self {
+        self.stream_idle_timeout_secs = stream_idle_timeout_secs;
         self
     }
 

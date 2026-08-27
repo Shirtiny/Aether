@@ -22,6 +22,7 @@ fn sample_openai_image_transport(provider_type: &str) -> AdminGatewayProviderTra
             proxy: None,
             request_timeout_secs: None,
             stream_first_byte_timeout_secs: None,
+            stream_idle_timeout_secs: None,
             config: None,
         },
         endpoint: crate::provider_transport::snapshot::GatewayProviderTransportEndpoint {

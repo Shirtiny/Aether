@@ -104,6 +104,7 @@ pub(super) fn sample_plan(url: &str, provider_api_format: &str) -> ExecutionPlan
         timeouts: Some(ExecutionTimeouts {
             connect_ms: Some(10_000),
             read_ms: Some(30_000),
+            stream_idle_ms: None,
             first_byte_ms: None,
             write_ms: Some(30_000),
             pool_ms: Some(10_000),

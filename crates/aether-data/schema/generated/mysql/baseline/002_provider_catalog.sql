@@ -59,6 +59,7 @@ CREATE TABLE IF NOT EXISTS providers (
     `proxy` JSON,
     `request_timeout` DOUBLE,
     `stream_first_byte_timeout` DOUBLE,
+    `stream_idle_timeout` DOUBLE,
     `config` JSON,
     `created_at` BIGINT NOT NULL,
     `updated_at` BIGINT NOT NULL,

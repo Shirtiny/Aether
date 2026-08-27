@@ -209,6 +209,12 @@ pub(crate) fn build_admin_provider_summary_value(
         "created_at": endpoint_timestamp_or_now(provider.created_at_unix_ms, now_unix_secs),
         "updated_at": endpoint_timestamp_or_now(provider.updated_at_unix_secs, now_unix_secs),
     });
+    if let Some(object) = summary.as_object_mut() {
+        object.insert(
+            "stream_idle_timeout".to_string(),
+            json!(provider.stream_idle_timeout_secs),
+        );
+    }
     summary
         .as_object_mut()
         .expect("provider summary is an object")

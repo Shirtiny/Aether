@@ -218,6 +218,7 @@ pub(crate) async fn build_admin_system_export_providers_payload(
                 concurrent_limit: provider.concurrent_limit,
                 max_retries: provider.max_retries,
                 stream_first_byte_timeout: provider.stream_first_byte_timeout_secs,
+                stream_idle_timeout: provider.stream_idle_timeout_secs,
                 request_timeout: provider.request_timeout_secs,
                 proxy: provider.proxy.clone(),
                 config: decrypt_admin_system_export_provider_config(

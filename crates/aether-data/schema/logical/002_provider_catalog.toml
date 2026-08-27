@@ -257,6 +257,11 @@ type = "float64"
 nullable = true
 
 [[table.providers.columns]]
+name = "stream_idle_timeout"
+type = "float64"
+nullable = true
+
+[[table.providers.columns]]
 name = "config"
 type = "json"
 nullable = true

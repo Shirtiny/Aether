@@ -16,6 +16,8 @@ pub struct ExecutionTimeouts {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub read_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_idle_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub first_byte_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub write_ms: Option<u64>,
@@ -197,6 +199,7 @@ mod tests {
             timeouts: Some(ExecutionTimeouts {
                 connect_ms: Some(30_000),
                 read_ms: Some(3_600_000),
+                stream_idle_ms: Some(300_000),
                 first_byte_ms: Some(30_000),
                 ..ExecutionTimeouts::default()
             }),
@@ -206,6 +209,7 @@ mod tests {
         assert_eq!(raw["body"]["json_body"]["model"], "gpt-test");
         assert_eq!(raw["content_encoding"], "gzip");
         assert_eq!(raw["stream"], true);
+        assert_eq!(raw["timeouts"]["stream_idle_ms"], 300_000);
     }
 
     #[test]
@@ -257,6 +261,12 @@ mod tests {
                 .as_ref()
                 .and_then(|timeouts| timeouts.total_ms),
             Some(300_000)
+        );
+        assert_eq!(
+            plan.timeouts
+                .as_ref()
+                .and_then(|timeouts| timeouts.stream_idle_ms),
+            None
         );
     }
 }

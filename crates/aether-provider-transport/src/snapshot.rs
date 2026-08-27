@@ -33,6 +33,7 @@ pub struct GatewayProviderTransportProvider {
     pub proxy: Option<serde_json::Value>,
     pub request_timeout_secs: Option<f64>,
     pub stream_first_byte_timeout_secs: Option<f64>,
+    pub stream_idle_timeout_secs: Option<f64>,
     pub config: Option<serde_json::Value>,
 }
 
@@ -453,6 +454,7 @@ mod tests {
                     proxy: Some(serde_json::json!({"url":"http://provider-proxy"})),
                     request_timeout_secs: Some(20.0),
                     stream_first_byte_timeout_secs: Some(8.0),
+                    stream_idle_timeout_secs: Some(90.0),
                     config: Some(serde_json::json!({"region":"global"})),
                 },
                 endpoint: super::GatewayProviderTransportEndpoint {

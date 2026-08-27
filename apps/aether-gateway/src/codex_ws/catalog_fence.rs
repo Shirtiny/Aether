@@ -101,6 +101,7 @@ struct ProviderHardProjection<'a> {
     proxy: &'a Option<Value>,
     request_timeout_secs: Option<f64>,
     stream_first_byte_timeout_secs: Option<f64>,
+    stream_idle_timeout_secs: Option<f64>,
     config: Option<Value>,
 }
 
@@ -167,6 +168,7 @@ fn provider_hard_projection(
         proxy: &provider.proxy,
         request_timeout_secs: provider.request_timeout_secs,
         stream_first_byte_timeout_secs: provider.stream_first_byte_timeout_secs,
+        stream_idle_timeout_secs: provider.stream_idle_timeout_secs,
         config,
     }
 }

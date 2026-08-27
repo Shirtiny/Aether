@@ -106,6 +106,7 @@ fn sample_system_import_payload() -> Value {
             "max_retries": 2,
             "request_timeout": 30.0,
             "stream_first_byte_timeout": 15.0,
+            "stream_idle_timeout": 90.0,
             "config": {
                 "provider_ops": {
                     "connector": {
@@ -1666,6 +1667,7 @@ async fn gateway_imports_admin_system_config_with_numeric_string_prices() {
     payload["global_models"][0]["default_price_per_request"] = json!("1.80000000");
     payload["providers"][0]["request_timeout"] = json!("30");
     payload["providers"][0]["stream_first_byte_timeout"] = json!("15");
+    payload["providers"][0]["stream_idle_timeout"] = json!("90");
     payload["providers"][0]["models"][0]["price_per_request"] = json!("0.70000000");
 
     let response = reqwest::Client::new()
@@ -1710,6 +1712,7 @@ async fn gateway_imports_admin_system_config_with_numeric_string_prices() {
     assert_eq!(provider_models[0].price_per_request, Some(0.7));
     assert_eq!(providers[0].request_timeout_secs, Some(30.0));
     assert_eq!(providers[0].stream_first_byte_timeout_secs, Some(15.0));
+    assert_eq!(providers[0].stream_idle_timeout_secs, Some(90.0));
 
     gateway_handle.abort();
 }

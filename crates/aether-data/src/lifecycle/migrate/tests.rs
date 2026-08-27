@@ -480,6 +480,7 @@ fn empty_database_snapshot_sql_includes_usage_body_blobs_and_audit_admin_role() 
     assert!(EMPTY_DATABASE_SNAPSHOT_SQL.contains("idx_video_tasks_due_poll"));
     assert!(EMPTY_DATABASE_SNAPSHOT_SQL.contains("request_count bigint DEFAULT 0"));
     assert!(EMPTY_DATABASE_SNAPSHOT_SQL.contains("usage_count bigint DEFAULT 0 NOT NULL"));
+    assert!(EMPTY_DATABASE_SNAPSHOT_SQL.contains("stream_idle_timeout double precision"));
 }
 
 #[test]

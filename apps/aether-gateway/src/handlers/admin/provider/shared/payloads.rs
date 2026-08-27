@@ -158,6 +158,11 @@ pub(crate) struct AdminProviderCreateRequest {
         default,
         deserialize_with = "deserialize_optional_f64_from_number_or_string"
     )]
+    pub(crate) stream_idle_timeout: Option<f64>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_f64_from_number_or_string"
+    )]
     pub(crate) request_timeout: Option<f64>,
     #[serde(default)]
     pub(crate) pool_advanced: Option<serde_json::Value>,
@@ -211,6 +216,11 @@ pub(crate) struct AdminProviderUpdateRequest {
         deserialize_with = "deserialize_optional_f64_from_number_or_string"
     )]
     pub(crate) stream_first_byte_timeout: Option<f64>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_f64_from_number_or_string"
+    )]
+    pub(crate) stream_idle_timeout: Option<f64>,
     #[serde(
         default,
         deserialize_with = "deserialize_optional_f64_from_number_or_string"

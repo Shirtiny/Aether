@@ -106,7 +106,7 @@ impl CodexWsTimeouts {
                 DEFAULT_FIRST_BYTE_TIMEOUT_MS,
             ),
             read: timeout_duration(
-                configured.and_then(|timeouts| timeouts.read_ms),
+                configured.and_then(|timeouts| timeouts.stream_idle_ms.or(timeouts.read_ms)),
                 DEFAULT_READ_TIMEOUT_MS,
             ),
             total: timeout_duration(

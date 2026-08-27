@@ -836,8 +836,9 @@ export interface ProviderWithEndpointsSummary {
   // 请求配置（从 Endpoint 迁移）
   max_retries?: number  // 最大重试次数
   proxy?: ProxyConfig | null  // 代理配置
-  // 超时配置（秒），为空时使用全局配置
+  // 超时配置（秒），为空时使用协议默认值
   stream_first_byte_timeout?: number  // 流式请求首字节超时
+  stream_idle_timeout?: number  // 流式请求上游帧空闲超时
   request_timeout?: number  // 非流式请求整体超时
   is_active: boolean
   total_endpoints: number

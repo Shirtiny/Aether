@@ -172,7 +172,7 @@
         </div>
 
         <!-- 超时配置 -->
-        <div class="grid grid-cols-2 gap-4">
+        <div class="grid grid-cols-1 gap-4 sm:grid-cols-3">
           <div class="space-y-1.5">
             <Label>
               流式首字节超时
@@ -186,6 +186,21 @@
               step="1"
               placeholder="30"
               @update:model-value="(v) => form.stream_first_byte_timeout = parseNumberInput(v)"
+            />
+          </div>
+          <div class="space-y-1.5">
+            <Label>
+              流式空闲超时
+              <span class="text-xs text-muted-foreground">(秒)</span>
+            </Label>
+            <Input
+              :model-value="form.stream_idle_timeout ?? ''"
+              type="number"
+              min="1"
+              max="600"
+              step="1"
+              placeholder="默认 120"
+              @update:model-value="(v) => form.stream_idle_timeout = parseNumberInput(v)"
             />
           </div>
           <div class="space-y-1.5">
@@ -479,6 +494,7 @@ const form = ref({
   max_retries: undefined as number | undefined,
   // 超时配置（秒）
   stream_first_byte_timeout: undefined as number | undefined,
+  stream_idle_timeout: undefined as number | undefined,
   request_timeout: undefined as number | undefined,
   // 号池模式
   pool_mode_enabled: false,
@@ -511,6 +527,7 @@ function resetForm() {
     max_retries: undefined,
     // 超时配置
     stream_first_byte_timeout: undefined,
+    stream_idle_timeout: undefined,
     request_timeout: undefined,
     // 号池模式
     pool_mode_enabled: false,
@@ -547,6 +564,7 @@ function loadProviderData() {
     max_retries: props.provider.max_retries ?? undefined,
     // 超时配置
     stream_first_byte_timeout: props.provider.stream_first_byte_timeout ?? undefined,
+    stream_idle_timeout: props.provider.stream_idle_timeout ?? undefined,
     request_timeout: props.provider.request_timeout ?? undefined,
     // 号池模式
     pool_mode_enabled: poolAdvanced !== null,
@@ -639,8 +657,9 @@ const handleSubmit = async () => {
       is_active: form.value.is_active,
       // 请求配置
       max_retries: form.value.max_retries ?? undefined,
-      // 超时配置（null 表示清除，使用全局配置）
+      // 超时配置（null 表示清除，使用代码默认值）
       stream_first_byte_timeout: form.value.stream_first_byte_timeout ?? null,
+      stream_idle_timeout: form.value.stream_idle_timeout ?? null,
       request_timeout: form.value.request_timeout ?? null,
       pool_advanced: nextPoolAdvanced,
       config: providerConfig,

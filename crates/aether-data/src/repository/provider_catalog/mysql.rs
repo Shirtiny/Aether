@@ -70,7 +70,7 @@ SELECT
   quota_expires_at AS quota_expires_at_unix_secs,
   provider_priority, is_active, keep_priority_on_conversion,
   enable_format_conversion, concurrent_limit, max_retries, proxy,
-  request_timeout, stream_first_byte_timeout, config,
+  request_timeout, stream_first_byte_timeout, stream_idle_timeout, config,
   created_at AS created_at_unix_ms,
   updated_at AS updated_at_unix_secs
 FROM providers
@@ -158,9 +158,9 @@ INSERT INTO providers (
   quota_last_reset_at, quota_expires_at, provider_priority,
   is_active, keep_priority_on_conversion, enable_format_conversion,
   concurrent_limit, max_retries, proxy, request_timeout,
-  stream_first_byte_timeout, config, created_at, updated_at
+  stream_first_byte_timeout, stream_idle_timeout, config, created_at, updated_at
 )
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 "#,
         )
         .bind(&provider.id)
@@ -197,6 +197,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         .bind(optional_json_to_string(&provider.proxy, "providers.proxy")?)
         .bind(provider.request_timeout_secs)
         .bind(provider.stream_first_byte_timeout_secs)
+        .bind(provider.stream_idle_timeout_secs)
         .bind(optional_json_to_string(
             &provider.config,
             "providers.config",
@@ -242,6 +243,7 @@ SET
   proxy = ?,
   request_timeout = ?,
   stream_first_byte_timeout = ?,
+  stream_idle_timeout = ?,
   config = ?,
   updated_at = ?
 WHERE id = ?
@@ -280,6 +282,7 @@ WHERE id = ?
         .bind(optional_json_to_string(&provider.proxy, "providers.proxy")?)
         .bind(provider.request_timeout_secs)
         .bind(provider.stream_first_byte_timeout_secs)
+        .bind(provider.stream_idle_timeout_secs)
         .bind(optional_json_to_string(
             &provider.config,
             "providers.config",
@@ -1429,6 +1432,7 @@ fn map_provider_row(row: &MySqlRow) -> Result<StoredProviderCatalogProvider, Dat
         row.try_get("stream_first_byte_timeout").map_sql_err()?,
         optional_json_from_string(row.try_get("config").map_sql_err()?, "providers.config")?,
     )
+    .with_stream_idle_timeout_secs(row.try_get("stream_idle_timeout").map_sql_err()?)
     .with_timestamps(
         optional_u64(
             row.try_get("created_at_unix_ms").map_sql_err()?,

@@ -743,6 +743,8 @@ pub struct AdminSystemConfigProvider {
     #[serde(default, deserialize_with = "deserialize_optional_f64_from_number")]
     pub stream_first_byte_timeout: Option<f64>,
     #[serde(default, deserialize_with = "deserialize_optional_f64_from_number")]
+    pub stream_idle_timeout: Option<f64>,
+    #[serde(default, deserialize_with = "deserialize_optional_f64_from_number")]
     pub request_timeout: Option<f64>,
     #[serde(default)]
     pub proxy: Option<Value>,
@@ -3729,6 +3731,7 @@ mod tests {
                     "name": "undyapi",
                     "monthly_quota_usd": "12.50",
                     "stream_first_byte_timeout": "60",
+                    "stream_idle_timeout": "90",
                     "request_timeout": "120",
                     "models": [{
                         "global_model_name": "veo3.1",
@@ -3749,6 +3752,7 @@ mod tests {
         let provider = &parsed.request.document.providers[0];
         assert_eq!(provider.monthly_quota_usd, Some(12.5));
         assert_eq!(provider.stream_first_byte_timeout, Some(60.0));
+        assert_eq!(provider.stream_idle_timeout, Some(90.0));
         assert_eq!(provider.request_timeout, Some(120.0));
         assert_eq!(provider.models[0].price_per_request, Some(0.7));
     }

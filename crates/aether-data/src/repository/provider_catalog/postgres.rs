@@ -43,6 +43,7 @@ SELECT
   proxy,
   request_timeout,
   stream_first_byte_timeout,
+  stream_idle_timeout,
   config,
   EXTRACT(EPOCH FROM created_at)::bigint AS created_at_unix_ms,
   EXTRACT(EPOCH FROM updated_at)::bigint AS updated_at_unix_secs
@@ -783,6 +784,7 @@ INSERT INTO providers (
   proxy,
   request_timeout,
   stream_first_byte_timeout,
+  stream_idle_timeout,
   config,
   created_at,
   updated_at
@@ -814,13 +816,14 @@ INSERT INTO providers (
   $19,
   $20,
   $21,
-  CASE
-    WHEN $22::double precision IS NULL THEN NOW()
-    ELSE TO_TIMESTAMP($22::double precision)
-  END,
+  $22,
   CASE
     WHEN $23::double precision IS NULL THEN NOW()
     ELSE TO_TIMESTAMP($23::double precision)
+  END,
+  CASE
+    WHEN $24::double precision IS NULL THEN NOW()
+    ELSE TO_TIMESTAMP($24::double precision)
   END
 )
 "#,
@@ -858,6 +861,7 @@ INSERT INTO providers (
         .bind(&provider.proxy)
         .bind(provider.request_timeout_secs)
         .bind(provider.stream_first_byte_timeout_secs)
+        .bind(provider.stream_idle_timeout_secs)
         .bind(&provider.config)
         .bind(provider.created_at_unix_ms.map(|value| value as f64))
         .bind(provider.updated_at_unix_secs.map(|value| value as f64))
@@ -938,10 +942,11 @@ SET
   proxy = $18,
   request_timeout = $19,
   stream_first_byte_timeout = $20,
-  config = $21,
+  stream_idle_timeout = $21,
+  config = $22,
   updated_at = CASE
-    WHEN $22::double precision IS NULL THEN NOW()
-    ELSE TO_TIMESTAMP($22::double precision)
+    WHEN $23::double precision IS NULL THEN NOW()
+    ELSE TO_TIMESTAMP($23::double precision)
   END
 WHERE id = $1
 "#,
@@ -979,6 +984,7 @@ WHERE id = $1
         .bind(&provider.proxy)
         .bind(provider.request_timeout_secs)
         .bind(provider.stream_first_byte_timeout_secs)
+        .bind(provider.stream_idle_timeout_secs)
         .bind(&provider.config)
         .bind(provider.updated_at_unix_secs.map(|value| value as f64))
         .execute(&self.pool)
@@ -2295,6 +2301,7 @@ fn map_provider_row(row: &PgRow) -> Result<StoredProviderCatalogProvider, DataLa
         row_get(row, "stream_first_byte_timeout")?,
         row_get(row, "config")?,
     )
+    .with_stream_idle_timeout_secs(row_get(row, "stream_idle_timeout")?)
     .with_timestamps(created_at_unix_ms, updated_at_unix_secs))
 }
 

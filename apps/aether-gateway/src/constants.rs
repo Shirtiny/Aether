@@ -13,6 +13,7 @@ pub(crate) const DEPENDENCY_REASON_HEADER: &str = "x-aether-dependency-reason";
 // report Aether's own number instead of one inflated by the hop and by however
 // long Aether held the stream for prefetch inspection.
 pub(crate) const UPSTREAM_TTFB_MS_HEADER: &str = "x-aether-ttfb-ms";
+pub(crate) const STREAM_IDLE_TIMEOUT_MS_HEADER: &str = "x-aether-stream-idle-timeout-ms";
 // How long the stream sat buffered after its first upstream data frame arrived,
 // and why the prefetch released. This is latency the gateway added, measured
 // from the first frame rather than from prefetch start so that time the upstream

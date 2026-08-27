@@ -61,7 +61,7 @@ use crate::api::response::{
 use crate::clock::current_unix_ms as current_request_candidate_unix_ms;
 use crate::constants::{
     CONTROL_CANDIDATE_ID_HEADER, CONTROL_REQUEST_ID_HEADER, PREFETCH_HOLD_MS_HEADER,
-    PREFETCH_RELEASE_HEADER, UPSTREAM_TTFB_MS_HEADER,
+    PREFETCH_RELEASE_HEADER, STREAM_IDLE_TIMEOUT_MS_HEADER, UPSTREAM_TTFB_MS_HEADER,
 };
 use crate::control::GatewayControlDecision;
 use crate::execution_runtime::build_direct_execution_frame_stream;
@@ -126,7 +126,7 @@ const SSE_CONTROL_FILTER_MAX_BUFFER_BYTES: usize = 1024 * 1024;
 const SSE_TERMINAL_DETECTOR_MAX_LINE_BYTES: usize = 1024 * 1024;
 const STREAM_IDLE_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const STREAM_IDLE_LOG_INTERVAL_MS: u64 = 60_000;
-const DEFAULT_STREAM_UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+const DEFAULT_STREAM_UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const STREAM_CLIENT_PROGRESS_IDLE_MULTIPLIER: u32 = 2;
 const DEFAULT_STREAM_DOWNSTREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_STREAM_DOWNSTREAM_DRAIN_GRACE: Duration = Duration::from_secs(30);
@@ -1553,7 +1553,7 @@ fn resolve_stream_lifecycle_timeouts(plan: &ExecutionPlan) -> StreamLifecycleTim
     let upstream_idle = plan
         .timeouts
         .as_ref()
-        .and_then(|timeouts| timeouts.read_ms)
+        .and_then(|timeouts| timeouts.stream_idle_ms.or(timeouts.read_ms))
         .map(|timeout_ms| Duration::from_millis(timeout_ms.max(1)))
         .unwrap_or(DEFAULT_STREAM_UPSTREAM_IDLE_TIMEOUT);
     let client_progress_idle = upstream_idle
@@ -3527,6 +3527,13 @@ async fn execute_stream_from_frame_stream(
     headers.insert(
         PREFETCH_RELEASE_HEADER.to_string(),
         prefetch_release_reason.to_string(),
+    );
+    headers.insert(
+        STREAM_IDLE_TIMEOUT_MS_HEADER.to_string(),
+        stream_lifecycle_timeouts
+            .upstream_idle
+            .as_millis()
+            .to_string(),
     );
 
     let request_id = request_id.to_string();
@@ -6974,9 +6981,10 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"type":"s
     }
 
     #[test]
-    fn stream_lifecycle_timeouts_default_and_follow_plan_read_timeout() {
+    fn stream_lifecycle_timeouts_default_and_follow_plan_stream_idle_timeout() {
         let mut plan =
             test_responses_stream_plan("req-lifecycle-timeouts", "cand-lifecycle-timeouts");
+        assert_eq!(DEFAULT_STREAM_UPSTREAM_IDLE_TIMEOUT, Duration::from_secs(120));
         assert_eq!(
             resolve_stream_lifecycle_timeouts(&plan),
             super::StreamLifecycleTimeouts {
@@ -6988,7 +6996,7 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"type":"s
         );
 
         plan.timeouts = Some(ExecutionTimeouts {
-            read_ms: Some(25),
+            stream_idle_ms: Some(25),
             write_ms: Some(15),
             ..ExecutionTimeouts::default()
         });
@@ -7082,7 +7090,7 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"type":"s
         let mut plan =
             test_responses_stream_plan("req-upstream-idle-timeout", "cand-upstream-idle-timeout");
         plan.timeouts = Some(ExecutionTimeouts {
-            read_ms: Some(40),
+            stream_idle_ms: Some(40),
             ..ExecutionTimeouts::default()
         });
         let frame_stream = stream! {
@@ -7132,6 +7140,13 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"type":"s
         .await
         .expect("stream execution should succeed")
         .expect("stream execution should return a response");
+        assert_eq!(
+            response
+                .headers()
+                .get(STREAM_IDLE_TIMEOUT_MS_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("40")
+        );
 
         let body = tokio::time::timeout(
             Duration::from_secs(1),

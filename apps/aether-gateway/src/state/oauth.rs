@@ -1956,6 +1956,7 @@ mod tests {
                 proxy: None,
                 request_timeout_secs: None,
                 stream_first_byte_timeout_secs: None,
+                stream_idle_timeout_secs: None,
                 config: None,
             },
             endpoint: crate::provider_transport::snapshot::GatewayProviderTransportEndpoint {

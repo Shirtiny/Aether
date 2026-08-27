@@ -113,6 +113,9 @@ export async function updateProvider(
     proxy: ProxyConfig | null
     cache_ttl_minutes: number  // 0表示不支持缓存，>0表示支持缓存并设置TTL(分钟)
     max_probe_interval_minutes: number
+    stream_first_byte_timeout: number | null
+    stream_idle_timeout: number | null
+    request_timeout: number | null
     enable_format_conversion: boolean  // 是否允许格式转换（提供商级别开关）
     is_active: boolean
     claude_code_advanced: ClaudeCodeAdvancedConfig | null
@@ -146,6 +149,7 @@ export async function createProvider(
     is_active?: boolean
     max_retries?: number
     stream_first_byte_timeout?: number | null
+    stream_idle_timeout?: number | null
     request_timeout?: number | null
     proxy?: ProxyConfig | null
     claude_code_advanced?: ClaudeCodeAdvancedConfig | null

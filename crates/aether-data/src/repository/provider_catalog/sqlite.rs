@@ -41,6 +41,7 @@ SELECT
   proxy,
   request_timeout,
   stream_first_byte_timeout,
+  stream_idle_timeout,
   config,
   created_at AS created_at_unix_ms,
   updated_at AS updated_at_unix_secs
@@ -582,9 +583,9 @@ INSERT INTO providers (
   quota_last_reset_at, quota_expires_at, provider_priority,
   is_active, keep_priority_on_conversion, enable_format_conversion,
   concurrent_limit, max_retries, proxy, request_timeout,
-  stream_first_byte_timeout, config, created_at, updated_at
+  stream_first_byte_timeout, stream_idle_timeout, config, created_at, updated_at
 )
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 "#,
         )
         .bind(&provider.id)
@@ -621,6 +622,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         .bind(optional_json_to_string(&provider.proxy, "providers.proxy")?)
         .bind(provider.request_timeout_secs)
         .bind(provider.stream_first_byte_timeout_secs)
+        .bind(provider.stream_idle_timeout_secs)
         .bind(optional_json_to_string(
             &provider.config,
             "providers.config",
@@ -666,6 +668,7 @@ SET
   proxy = ?,
   request_timeout = ?,
   stream_first_byte_timeout = ?,
+  stream_idle_timeout = ?,
   config = ?,
   updated_at = ?
 WHERE id = ?
@@ -704,6 +707,7 @@ WHERE id = ?
         .bind(optional_json_to_string(&provider.proxy, "providers.proxy")?)
         .bind(provider.request_timeout_secs)
         .bind(provider.stream_first_byte_timeout_secs)
+        .bind(provider.stream_idle_timeout_secs)
         .bind(optional_json_to_string(
             &provider.config,
             "providers.config",
@@ -1874,6 +1878,7 @@ fn map_provider_row(row: &SqliteRow) -> Result<StoredProviderCatalogProvider, Da
         row.try_get("stream_first_byte_timeout").map_sql_err()?,
         optional_json_from_string(row.try_get("config").map_sql_err()?, "providers.config")?,
     )
+    .with_stream_idle_timeout_secs(row.try_get("stream_idle_timeout").map_sql_err()?)
     .with_timestamps(
         optional_u64(
             row.try_get("created_at_unix_ms").map_sql_err()?,
@@ -2247,18 +2252,21 @@ mod tests {
             Some(30.0),
             Some(2.5),
             Some(json!({"region":"us"})),
-        );
+        )
+        .with_stream_idle_timeout_secs(Some(90.0));
         let created_provider = repository
             .create_provider(&provider, None)
             .await
             .expect("provider should create");
         assert_eq!(created_provider.provider_priority, 20);
         assert_eq!(created_provider.proxy, Some(json!({"http":"proxy"})));
+        assert_eq!(created_provider.stream_idle_timeout_secs, Some(90.0));
 
         let mut updated_provider = created_provider.clone();
         updated_provider.description = Some("updated provider".to_string());
         updated_provider.provider_priority = 30;
         updated_provider.is_active = false;
+        updated_provider.stream_idle_timeout_secs = Some(120.0);
         let updated_provider = repository
             .update_provider(&updated_provider)
             .await
@@ -2268,6 +2276,7 @@ mod tests {
             Some("updated provider".to_string())
         );
         assert!(!updated_provider.is_active);
+        assert_eq!(updated_provider.stream_idle_timeout_secs, Some(120.0));
 
         let endpoint = StoredProviderCatalogEndpoint::new(
             "endpoint-write-1".to_string(),

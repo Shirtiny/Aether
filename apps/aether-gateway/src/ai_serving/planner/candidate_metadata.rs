@@ -153,6 +153,7 @@ mod tests {
                 proxy: Some(json!({"enabled": true, "mode": "node", "node_id": "proxy-node-1"})),
                 request_timeout_secs: None,
                 stream_first_byte_timeout_secs: None,
+                stream_idle_timeout_secs: None,
                 config: None,
             },
             endpoint: GatewayProviderTransportEndpoint {
@@ -220,6 +221,7 @@ mod tests {
                 proxy: None,
                 request_timeout_secs: None,
                 stream_first_byte_timeout_secs: None,
+                stream_idle_timeout_secs: None,
                 config: None,
             },
             endpoint: GatewayProviderTransportEndpoint {

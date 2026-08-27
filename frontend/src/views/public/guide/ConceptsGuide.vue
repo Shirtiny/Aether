@@ -81,6 +81,7 @@ import { BookOpen } from 'lucide-vue-next'
             <strong class="text-[#262624] dark:text-[#f1ead8] font-medium">超时时间：</strong>
             <ul class="list-disc pl-5 mt-1 space-y-1">
               <li>流式首字超时时间：流式请求收到首字前的超时时间</li>
+              <li>流式空闲超时时间：流开始后连续未收到上游帧的超时时间；留空默认 120 秒</li>
               <li>非流请求超时时间：非流请求的总超时时间</li>
             </ul>
           </li>

@@ -61,6 +61,7 @@ CREATE TABLE IF NOT EXISTS public.providers (
     proxy jsonb,
     request_timeout double precision,
     stream_first_byte_timeout double precision,
+    stream_idle_timeout double precision,
     config jsonb,
     created_at bigint NOT NULL,
     updated_at bigint NOT NULL

@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS providers (
     proxy TEXT,
     request_timeout REAL,
     stream_first_byte_timeout REAL,
+    stream_idle_timeout REAL,
     config TEXT,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,

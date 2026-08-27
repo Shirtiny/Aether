@@ -116,6 +116,11 @@ pub(crate) async fn build_admin_create_provider_record(
         Some(_) => return Err("stream_first_byte_timeout 必须是 1 到 300 之间的数字".to_string()),
         None => None,
     };
+    let stream_idle_timeout_secs = match payload.stream_idle_timeout {
+        Some(value) if (1.0..=600.0).contains(&value) => Some(value),
+        Some(_) => return Err("stream_idle_timeout 必须是 1 到 600 之间的数字".to_string()),
+        None => None,
+    };
     let request_timeout_secs = match payload.request_timeout {
         Some(value) if (1.0..=600.0).contains(&value) => Some(value),
         Some(_) => return Err("request_timeout 必须是 1 到 600 之间的数字".to_string()),
@@ -198,6 +203,7 @@ pub(crate) async fn build_admin_create_provider_record(
         stream_first_byte_timeout_secs,
         config,
     )
+    .with_stream_idle_timeout_secs(stream_idle_timeout_secs)
     .with_timestamps(Some(now_unix_secs), Some(now_unix_secs));
 
     Ok((record, shift_existing_priorities_from))

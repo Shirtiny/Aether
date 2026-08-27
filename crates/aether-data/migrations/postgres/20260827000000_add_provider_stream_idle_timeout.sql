@@ -1,0 +1,2 @@
+ALTER TABLE providers
+ADD COLUMN IF NOT EXISTS stream_idle_timeout DOUBLE PRECISION;

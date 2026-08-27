@@ -834,6 +834,7 @@ async fn gateway_updates_admin_provider_locally_with_trusted_admin_principal() {
             "max_retries": 6,
             "request_timeout": 55.0,
             "stream_first_byte_timeout": 11.0,
+            "stream_idle_timeout": 90.0,
             "enable_format_conversion": false,
             "config": {
                 "provider_ops": {"architecture_id": "cubence"},
@@ -862,6 +863,7 @@ async fn gateway_updates_admin_provider_locally_with_trusted_admin_principal() {
     assert_eq!(payload["max_retries"], 6);
     assert_eq!(payload["request_timeout"], 55.0);
     assert_eq!(payload["stream_first_byte_timeout"], 11.0);
+    assert_eq!(payload["stream_idle_timeout"], 90.0);
     assert_eq!(payload["proxy"], json!({"url": "https://proxy.example"}));
     assert_eq!(payload["claude_code_advanced"], json!({"pool_size": 2}));
     assert_eq!(payload["pool_advanced"], json!({}));

@@ -274,6 +274,7 @@ export interface ProviderExport {
   concurrent_limit?: number | null
   max_retries?: number | null
   stream_first_byte_timeout?: number | null
+  stream_idle_timeout?: number | null
   request_timeout?: number | null
   proxy?: Record<string, unknown>
   config?: Record<string, unknown>

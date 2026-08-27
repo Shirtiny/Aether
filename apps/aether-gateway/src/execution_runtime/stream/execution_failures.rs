@@ -271,17 +271,6 @@ async fn apply_stream_failure_effects(
     error_body: Option<&str>,
 ) {
     let error_type = stream_failure_body_field(payload, "type").unwrap_or("internal");
-    if matches!(error_type, "first_byte_timeout" | "read_timeout") {
-        apply_local_execution_effect(
-            state,
-            LocalExecutionEffectContext {
-                plan,
-                report_context,
-            },
-            LocalExecutionEffect::PoolStreamTimeout,
-        )
-        .await;
-    }
     apply_local_execution_effect(
         state,
         LocalExecutionEffectContext {
@@ -345,6 +334,22 @@ async fn apply_stream_failure_effects(
         }),
     )
     .await;
+    if matches!(
+        error_type,
+        "first_byte_timeout" | "read_timeout" | "stream_idle_timeout"
+    ) {
+        // Apply the dedicated timeout cooldown last so the generic 504
+        // overload cooldown cannot replace it with a shorter TTL.
+        apply_local_execution_effect(
+            state,
+            LocalExecutionEffectContext {
+                plan,
+                report_context,
+            },
+            LocalExecutionEffect::PoolStreamTimeout,
+        )
+        .await;
+    }
 }
 
 async fn record_stream_sync_failure(

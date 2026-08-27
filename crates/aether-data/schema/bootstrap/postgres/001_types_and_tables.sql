@@ -739,6 +739,7 @@ CREATE TABLE IF NOT EXISTS public.providers (
     max_retries integer,
     proxy jsonb,
     stream_first_byte_timeout double precision,
+    stream_idle_timeout double precision,
     request_timeout double precision,
     keep_priority_on_conversion boolean DEFAULT false NOT NULL,
     enable_format_conversion boolean DEFAULT true NOT NULL,

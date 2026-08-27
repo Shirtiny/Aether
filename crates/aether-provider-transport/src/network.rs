@@ -46,6 +46,11 @@ pub fn resolve_transport_execution_timeouts(
                 .filter(|value| value.is_finite() && *value > 0.0)
                 .unwrap_or(DEFAULT_PROVIDER_STREAM_FIRST_BYTE_TIMEOUT_SECS),
         )),
+        stream_idle_ms: transport
+            .provider
+            .stream_idle_timeout_secs
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .map(timeout_secs_to_ms),
         ..ExecutionTimeouts::default()
     })
 }
@@ -399,6 +404,7 @@ mod tests {
                 proxy: Some(json!({"url":"http://provider-proxy:8080"})),
                 request_timeout_secs: None,
                 stream_first_byte_timeout_secs: None,
+                stream_idle_timeout_secs: None,
                 config: None,
             },
             endpoint: GatewayProviderTransportEndpoint {
@@ -450,6 +456,7 @@ mod tests {
 
         assert_eq!(timeouts.total_ms, None);
         assert_eq!(timeouts.first_byte_ms, Some(30_000));
+        assert_eq!(timeouts.stream_idle_ms, None);
     }
 
     #[test]
@@ -462,6 +469,7 @@ mod tests {
 
         assert_eq!(timeouts.total_ms, Some(12_000));
         assert_eq!(timeouts.first_byte_ms, Some(30_000));
+        assert_eq!(timeouts.stream_idle_ms, None);
     }
 
     #[test]
@@ -474,6 +482,20 @@ mod tests {
 
         assert_eq!(timeouts.total_ms, None);
         assert_eq!(timeouts.first_byte_ms, Some(7_500));
+        assert_eq!(timeouts.stream_idle_ms, None);
+    }
+
+    #[test]
+    fn transport_execution_timeouts_preserve_configured_stream_idle_value() {
+        let mut transport = sample_transport();
+        transport.provider.stream_idle_timeout_secs = Some(90.5);
+
+        let timeouts = resolve_transport_execution_timeouts(&transport)
+            .expect("provider timeouts should resolve");
+
+        assert_eq!(timeouts.stream_idle_ms, Some(90_500));
+        assert_eq!(timeouts.total_ms, None);
+        assert_eq!(timeouts.first_byte_ms, Some(30_000));
     }
 
     #[test]

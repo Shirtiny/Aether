@@ -288,6 +288,7 @@ mod tests {
                 proxy: None,
                 request_timeout_secs: Some(30.0),
                 stream_first_byte_timeout_secs: Some(5.0),
+                stream_idle_timeout_secs: None,
                 config: None,
             },
             endpoint: GatewayProviderTransportEndpoint {
