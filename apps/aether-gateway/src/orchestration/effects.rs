@@ -581,7 +581,14 @@ async fn remember_successful_local_scheduler_affinity(
     state: &AppState,
     context: LocalExecutionEffectContext<'_>,
 ) {
-    if !scheduler_cache_affinity_enabled(state).await {
+    // Opaque search references must stay on the successful provider/key even
+    // when ordinary scheduler cache affinity is disabled.
+    let search_requires_affinity = context
+        .plan
+        .client_api_format
+        .trim()
+        .eq_ignore_ascii_case("openai:search");
+    if !search_requires_affinity && !scheduler_cache_affinity_enabled(state).await {
         return;
     }
     let Some(cache_key) = local_scheduler_affinity_cache_key(context.report_context) else {
@@ -4489,6 +4496,80 @@ mod tests {
         assert!(state
             .read_scheduler_affinity_target(cache_key.as_str(), SCHEDULER_AFFINITY_TTL)
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn fixed_order_search_only_remembers_final_successful_candidate() {
+        let state = AppState::new()
+            .expect("gateway state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::disabled().with_system_config_values_for_tests(vec![(
+                    "scheduling_mode".to_string(),
+                    json!("fixed_order"),
+                )]),
+            );
+        let mut failed_plan = sample_plan();
+        failed_plan.client_api_format = "openai:search".to_string();
+        failed_plan.provider_api_format = "openai:search".to_string();
+        let mut success_plan = failed_plan.clone();
+        success_plan.provider_id = "prov-final".to_string();
+        success_plan.endpoint_id = "ep-final".to_string();
+        success_plan.key_id = "key-final".to_string();
+        let search_affinity = ClientSessionAffinity::new(
+            Some("codex".to_string()),
+            Some("session=search-session-1".to_string()),
+        );
+        let report_context = json!({
+            "api_key_id": "api-key-1",
+            "client_api_format": "openai:search",
+            "model": "gpt-5",
+            "client_session_affinity": {
+                "client_family": "codex",
+                "session_key": "session=search-session-1"
+            }
+        });
+        let cache_key = build_scheduler_affinity_cache_key_for_api_key_id_with_client_session(
+            "api-key-1",
+            "openai:search",
+            "gpt-5",
+            Some(&search_affinity),
+        )
+        .expect("search affinity cache key should build");
+
+        apply_local_execution_effect(
+            &state,
+            LocalExecutionEffectContext {
+                plan: &failed_plan,
+                report_context: Some(&report_context),
+            },
+            LocalExecutionEffect::AttemptFailure(LocalAttemptFailureEffect {
+                status_code: 429,
+                classification: LocalFailoverClassification::RetryUpstreamFailure,
+            }),
+        )
+        .await;
+        assert!(state
+            .read_scheduler_affinity_target(cache_key.as_str(), SCHEDULER_AFFINITY_TTL)
+            .is_none());
+
+        apply_local_execution_effect(
+            &state,
+            LocalExecutionEffectContext {
+                plan: &success_plan,
+                report_context: Some(&report_context),
+            },
+            LocalExecutionEffect::HealthSuccess(LocalHealthSuccessEffect),
+        )
+        .await;
+
+        assert_eq!(
+            state.read_scheduler_affinity_target(cache_key.as_str(), SCHEDULER_AFFINITY_TTL),
+            Some(SchedulerAffinityTarget {
+                provider_id: "prov-final".to_string(),
+                endpoint_id: "ep-final".to_string(),
+                key_id: "key-final".to_string(),
+            })
+        );
     }
 
     #[tokio::test]
