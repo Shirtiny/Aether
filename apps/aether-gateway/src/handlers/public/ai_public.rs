@@ -7,8 +7,8 @@ use crate::image_capabilities::{
     openai_image_gateway_max_generation_count, openai_image_gateway_max_generation_count_for_model,
 };
 use crate::local_probe_intercept::{
-    local_probe_intercept_answer, local_probe_intercept_delay, local_probe_intercept_enabled,
-    local_probe_intercept_usage, LocalProbeInterceptKind, LocalProbeInterceptUsage,
+    local_probe_intercept_config, LocalProbeInterceptConfig, LocalProbeInterceptKind,
+    LocalProbeInterceptUsage,
 };
 use crate::{AppState, GatewayError};
 use aether_data_contracts::repository::video_tasks::{
@@ -945,7 +945,8 @@ async fn maybe_build_local_openai_probe_response(
     {
         return None;
     }
-    if !local_probe_intercept_enabled(state).await.ok()? {
+    let probe_config = local_probe_intercept_config(state).await.ok().flatten()?;
+    if !probe_config.enabled {
         return None;
     }
 
@@ -961,11 +962,12 @@ async fn maybe_build_local_openai_probe_response(
         (
             Some("responses") | Some("responses:compact"),
             "/v1/responses" | "/v1/responses/compact",
-        ) => OpenAiLocalProbeRequest::Responses(
-            openai_responses_local_probe_answer(state, &payload).await?,
-        ),
+        ) => OpenAiLocalProbeRequest::Responses(openai_responses_local_probe_answer(
+            &probe_config,
+            &payload,
+        )?),
         (Some("chat"), "/v1/chat/completions") => {
-            OpenAiLocalProbeRequest::Chat(openai_chat_local_probe_answer(state, &payload).await?)
+            OpenAiLocalProbeRequest::Chat(openai_chat_local_probe_answer(&probe_config, &payload)?)
         }
         _ => return None,
     };
@@ -983,12 +985,8 @@ async fn maybe_build_local_openai_probe_response(
         .and_then(value_as_bool)
         .unwrap_or(false);
     let answer = probe.answer();
-    let usage = local_probe_intercept_usage(state).await.ok().flatten()?;
-    let delay_ms = local_probe_intercept_delay(state)
-        .await
-        .ok()
-        .map(|delay| delay.random_ms())
-        .unwrap_or(0);
+    let usage = probe_config.usage;
+    let delay_ms = probe_config.delay.random_ms();
     if delay_ms > 0 {
         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
     }
@@ -1026,26 +1024,20 @@ async fn maybe_build_local_openai_probe_response(
     })
 }
 
-async fn openai_responses_local_probe_answer(
-    state: &AppState,
+fn openai_responses_local_probe_answer(
+    config: &LocalProbeInterceptConfig,
     payload: &Value,
 ) -> Option<LocalProbeAnswer> {
     let text = extract_openai_responses_last_user_text(payload)?;
-    local_probe_answer_from_text(state, &text)
-        .await
-        .ok()
-        .flatten()
+    local_probe_answer_from_text(config, &text)
 }
 
-async fn openai_chat_local_probe_answer(
-    state: &AppState,
+fn openai_chat_local_probe_answer(
+    config: &LocalProbeInterceptConfig,
     payload: &Value,
 ) -> Option<LocalProbeAnswer> {
     let text = extract_openai_chat_last_user_text(payload)?;
-    local_probe_answer_from_text(state, &text)
-        .await
-        .ok()
-        .flatten()
+    local_probe_answer_from_text(config, &text)
 }
 
 #[derive(Debug)]
@@ -1184,25 +1176,23 @@ fn openai_chat_content_part_text(value: &Value) -> Option<String> {
     }
 }
 
-async fn local_probe_answer_from_text(
-    state: &AppState,
+fn local_probe_answer_from_text(
+    config: &LocalProbeInterceptConfig,
     text: &str,
-) -> Result<Option<LocalProbeAnswer>, GatewayError> {
-    if !local_probe_intercept_enabled(state).await? {
-        return Ok(None);
+) -> Option<LocalProbeAnswer> {
+    if !config.enabled {
+        return None;
     }
     if let Some(text) = arithmetic_probe_answer(text) {
-        return Ok(Some(LocalProbeAnswer {
+        return Some(LocalProbeAnswer {
             text,
             kind: LocalProbeKind::Arithmetic,
-        }));
+        });
     }
-    Ok(local_probe_intercept_answer(state, text)
-        .await?
-        .map(|answer| LocalProbeAnswer {
-            text: answer.text,
-            kind: answer.kind.into(),
-        }))
+    config.answer(text).map(|answer| LocalProbeAnswer {
+        text: answer.text,
+        kind: answer.kind.into(),
+    })
 }
 
 fn arithmetic_probe_answer(text: &str) -> Option<String> {
@@ -2649,9 +2639,10 @@ mod tests {
     use crate::control::{GatewayControlDecision, GatewayPublicRequestContext};
     use crate::data::GatewayDataState;
     use crate::local_probe_intercept::{
-        LocalProbeInterceptUsage, LOCAL_PROBE_INTERCEPT_DELAY_MAX_MS_KEY,
-        LOCAL_PROBE_INTERCEPT_DELAY_MIN_MS_KEY, LOCAL_PROBE_INTERCEPT_ENABLED_KEY,
-        LOCAL_PROBE_INTERCEPT_RULES_KEY, LOCAL_PROBE_INTERCEPT_USAGE_KEY,
+        local_probe_intercept_config, LocalProbeInterceptUsage, LOCAL_PROBE_INTERCEPT_CONFIG_KEY,
+        LOCAL_PROBE_INTERCEPT_DELAY_MAX_MS_KEY, LOCAL_PROBE_INTERCEPT_DELAY_MIN_MS_KEY,
+        LOCAL_PROBE_INTERCEPT_ENABLED_KEY, LOCAL_PROBE_INTERCEPT_RULES_KEY,
+        LOCAL_PROBE_INTERCEPT_USAGE_KEY,
     };
     use crate::AppState;
     use axum::body::Bytes;
@@ -2664,6 +2655,15 @@ mod tests {
             output_tokens: 8,
             cached_tokens: 40,
         }
+    }
+
+    async fn probe_config(
+        state: &AppState,
+    ) -> crate::local_probe_intercept::LocalProbeInterceptConfig {
+        local_probe_intercept_config(state)
+            .await
+            .expect("local probe config should load")
+            .expect("local probe config should be valid")
     }
 
     fn probe_test_state() -> AppState {
@@ -2717,6 +2717,70 @@ mod tests {
                     LOCAL_PROBE_INTERCEPT_ENABLED_KEY.to_string(),
                     json!(false),
                 )]),
+            )
+    }
+
+    fn probe_combined_config_test_state() -> AppState {
+        AppState::new()
+            .expect("gateway state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::disabled().with_system_config_values_for_tests([
+                    (LOCAL_PROBE_INTERCEPT_ENABLED_KEY.to_string(), json!(false)),
+                    (
+                        LOCAL_PROBE_INTERCEPT_CONFIG_KEY.to_string(),
+                        json!({
+                            "enabled": true,
+                            "rules": [{
+                                "id": "ping",
+                                "name": "Ping",
+                                "prompt": "ping",
+                                "response": "combined-pong",
+                                "kind": "ping",
+                                "enabled": true,
+                                "system": true,
+                            }],
+                            "usage": {
+                                "input_tokens": 120,
+                                "output_tokens": 8,
+                                "cached_tokens": 40,
+                            },
+                            "delay_min_ms": 0,
+                            "delay_max_ms": 0,
+                        }),
+                    ),
+                ]),
+            )
+    }
+
+    fn probe_invalid_combined_config_test_state() -> AppState {
+        AppState::new()
+            .expect("gateway state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::disabled().with_system_config_values_for_tests([
+                    (LOCAL_PROBE_INTERCEPT_ENABLED_KEY.to_string(), json!(true)),
+                    (
+                        LOCAL_PROBE_INTERCEPT_CONFIG_KEY.to_string(),
+                        json!({
+                            "enabled": true,
+                            "rules": [{
+                                "id": "ping",
+                                "name": "Ping",
+                                "prompt": "ping",
+                                "response": "pong",
+                                "kind": "ping",
+                                "enabled": true,
+                                "system": true,
+                            }],
+                            "usage": {
+                                "input_tokens": 12,
+                                "output_tokens": 3,
+                                "cached_tokens": 13,
+                            },
+                            "delay_min_ms": 0,
+                            "delay_max_ms": 0,
+                        }),
+                    ),
+                ]),
             )
     }
 
@@ -2811,7 +2875,7 @@ mod tests {
         });
 
         assert_eq!(
-            openai_responses_local_probe_answer(&state, &payload).await,
+            openai_responses_local_probe_answer(&probe_config(&state).await, &payload),
             Some(super::LocalProbeAnswer {
                 text: "21".to_string(),
                 kind: LocalProbeKind::Arithmetic,
@@ -2833,7 +2897,7 @@ mod tests {
         });
 
         assert_eq!(
-            openai_responses_local_probe_answer(&state, &payload).await,
+            openai_responses_local_probe_answer(&probe_config(&state).await, &payload),
             Some(super::LocalProbeAnswer {
                 text: "4".to_string(),
                 kind: LocalProbeKind::Arithmetic,
@@ -2856,7 +2920,7 @@ mod tests {
         });
 
         assert_eq!(
-            openai_chat_local_probe_answer(&state, &payload).await,
+            openai_chat_local_probe_answer(&probe_config(&state).await, &payload),
             Some(super::LocalProbeAnswer {
                 text: "pong".to_string(),
                 kind: LocalProbeKind::Ping,
@@ -2876,12 +2940,39 @@ mod tests {
         });
 
         assert_eq!(
-            openai_chat_local_probe_answer(&state, &payload).await,
+            openai_chat_local_probe_answer(&probe_config(&state).await, &payload),
             Some(super::LocalProbeAnswer {
                 text: "OK".to_string(),
                 kind: LocalProbeKind::Health,
             })
         );
+    }
+
+    #[tokio::test]
+    async fn local_probe_combined_config_takes_precedence_over_legacy_keys() {
+        let state = probe_combined_config_test_state();
+        let payload = json!({
+            "model": "gpt-5.5",
+            "messages": [{"role": "user", "content": "ping"}]
+        });
+
+        assert_eq!(
+            openai_chat_local_probe_answer(&probe_config(&state).await, &payload),
+            Some(super::LocalProbeAnswer {
+                text: "combined-pong".to_string(),
+                kind: LocalProbeKind::Ping,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_combined_config_does_not_fall_back_to_legacy_interception() {
+        let state = probe_invalid_combined_config_test_state();
+
+        assert!(local_probe_intercept_config(&state)
+            .await
+            .expect("local probe config read should succeed")
+            .is_none());
     }
 
     #[tokio::test]
@@ -3105,7 +3196,10 @@ mod tests {
             }]
         });
 
-        assert_eq!(openai_chat_local_probe_answer(&state, &payload).await, None);
+        assert_eq!(
+            openai_chat_local_probe_answer(&probe_config(&state).await, &payload),
+            None
+        );
     }
 
     #[tokio::test]
@@ -3122,7 +3216,7 @@ mod tests {
         });
 
         assert_eq!(
-            openai_responses_local_probe_answer(&state, &payload).await,
+            openai_responses_local_probe_answer(&probe_config(&state).await, &payload),
             None
         );
     }

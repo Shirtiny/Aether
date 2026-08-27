@@ -8320,7 +8320,7 @@ ORDER BY "usage".user_id ASC
                         &usage,
                         request_metadata_value.as_ref(),
                     )?;
-                    sync_usage_prompt_capture_entries(&mut **tx, &prompt_capture_entries).await?;
+                    sync_usage_prompt_capture_entries(tx, &prompt_capture_entries).await?;
                     let request_metadata_json = json_bind_text(request_metadata_value.as_ref())?;
                     let _row = sqlx::query(UPSERT_SQL)
                         .bind(Uuid::new_v4().to_string())
@@ -11025,10 +11025,10 @@ fn attach_ws_session_prompt_capture_metadata(
     let Value::Object(mut prompt_capture) = prompt_capture else {
         return metadata;
     };
-    if !prompt_capture
+    if prompt_capture
         .get("items")
         .and_then(Value::as_array)
-        .is_some_and(|items| !items.is_empty())
+        .is_none_or(|items| items.is_empty())
     {
         return metadata;
     }

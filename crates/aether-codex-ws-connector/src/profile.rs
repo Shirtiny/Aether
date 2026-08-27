@@ -89,21 +89,19 @@ pub fn codex_ws_profile_manifest() -> &'static CodexWsProfileManifest {
 
 pub fn codex_websocket_config() -> WebSocketConfig {
     static TEMPLATE: OnceLock<WebSocketConfig> = OnceLock::new();
-    TEMPLATE
-        .get_or_init(|| {
-            let mut extensions = ExtensionsConfig::default();
-            extensions.permessage_deflate = Some(DeflateConfig::default());
+    *TEMPLATE.get_or_init(|| {
+        let mut extensions = ExtensionsConfig::default();
+        extensions.permessage_deflate = Some(DeflateConfig::default());
 
-            let mut config = WebSocketConfig::default();
-            config.extensions = extensions;
-            config.write_buffer_size = WRITE_BUFFER_SIZE_BYTES;
-            config.max_write_buffer_size = MAX_WRITE_BUFFER_SIZE_BYTES;
-            config.max_retained_write_buffer_capacity = MAX_RETAINED_WRITE_BUFFER_CAPACITY_BYTES;
-            config.max_frame_size = Some(MAX_FRAME_SIZE_BYTES);
-            config.max_message_size = Some(MAX_MESSAGE_SIZE_BYTES);
-            config
-        })
-        .clone()
+        let mut config = WebSocketConfig::default();
+        config.extensions = extensions;
+        config.write_buffer_size = WRITE_BUFFER_SIZE_BYTES;
+        config.max_write_buffer_size = MAX_WRITE_BUFFER_SIZE_BYTES;
+        config.max_retained_write_buffer_capacity = MAX_RETAINED_WRITE_BUFFER_CAPACITY_BYTES;
+        config.max_frame_size = Some(MAX_FRAME_SIZE_BYTES);
+        config.max_message_size = Some(MAX_MESSAGE_SIZE_BYTES);
+        config
+    })
 }
 
 #[cfg(test)]

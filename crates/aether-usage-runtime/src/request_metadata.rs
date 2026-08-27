@@ -554,7 +554,7 @@ fn truncate_prompt_capture_items_to_fit(capture: &mut Value) {
     let mut low = 0usize;
     let mut high = original_len;
     while low < high {
-        let mid = (low + high + 1) / 2;
+        let mid = low + (high - low).div_ceil(2);
         let mut candidate = capture.clone();
         retain_prompt_capture_items(&mut candidate, mid);
         if usage_request_metadata_within_limits(&candidate) {

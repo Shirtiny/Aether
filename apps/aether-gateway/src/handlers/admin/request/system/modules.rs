@@ -84,14 +84,44 @@ impl<'a> AdminAppState<'a> {
             }
         }
 
-        let enabled_config_key = admin_system_modules::admin_module_enabled_config_key(module);
-        let _ = self
-            .upsert_system_config_json_value(
-                &enabled_config_key,
-                &json!(payload.enabled),
-                Some(&format!("模块 [{}] 启用状态", module.display_name)),
-            )
-            .await?;
+        if module.name == "local_probe_intercept" {
+            let combined_key = aether_admin::system::LOCAL_PROBE_INTERCEPT_CONFIG_KEY;
+            if let Some(config) = self.read_system_config_json_value(combined_key).await? {
+                let Ok(mut config) =
+                    aether_admin::system::normalize_local_probe_intercept_config_value(config)
+                else {
+                    return Ok(Err((
+                        http::StatusCode::BAD_REQUEST,
+                        json!({ "detail": "测活拦截组合配置无效" }),
+                    )));
+                };
+                config["enabled"] = json!(payload.enabled);
+                let _ = self
+                    .upsert_system_config_json_value(
+                        combined_key,
+                        &config,
+                        Some("测活拦截完整配置"),
+                    )
+                    .await?;
+            } else {
+                let _ = self
+                    .upsert_system_config_json_value(
+                        &admin_system_modules::admin_module_enabled_config_key(module),
+                        &json!(payload.enabled),
+                        Some(&format!("模块 [{}] 启用状态", module.display_name)),
+                    )
+                    .await?;
+            }
+        } else {
+            let enabled_config_key = admin_system_modules::admin_module_enabled_config_key(module);
+            let _ = self
+                .upsert_system_config_json_value(
+                    &enabled_config_key,
+                    &json!(payload.enabled),
+                    Some(&format!("模块 [{}] 启用状态", module.display_name)),
+                )
+                .await?;
+        }
         let updated_runtime = admin_system_modules::build_admin_module_runtime_state(self).await?;
         Ok(Ok(admin_system_modules::build_admin_module_status_payload(
             self,

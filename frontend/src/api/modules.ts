@@ -156,6 +156,7 @@ const CHAT_PII_REDACTION_CONFIG_KEYS = {
 } as const
 
 const LOCAL_PROBE_INTERCEPT_CONFIG_KEYS = {
+  config: 'module.local_probe_intercept.config',
   enabled: 'module.local_probe_intercept.enabled',
   rules: 'module.local_probe_intercept.rules',
   usage: 'module.local_probe_intercept.usage',
@@ -171,6 +172,13 @@ export const LOCAL_PROBE_INTERCEPT_DEFAULT_USAGE: LocalProbeInterceptUsage = {
   input_tokens: 0,
   output_tokens: 0,
   cached_tokens: 0,
+}
+export const LOCAL_PROBE_INTERCEPT_DEFAULT_CONFIG: LocalProbeInterceptConfig = {
+  enabled: true,
+  rules: LOCAL_PROBE_INTERCEPT_DEFAULT_RULES.map(rule => ({ ...rule })),
+  usage: { ...LOCAL_PROBE_INTERCEPT_DEFAULT_USAGE },
+  delay_min_ms: LOCAL_PROBE_INTERCEPT_DEFAULT_DELAY_MIN_MS,
+  delay_max_ms: LOCAL_PROBE_INTERCEPT_DEFAULT_DELAY_MAX_MS,
 }
 
 const CHAT_PII_REDACTION_DEFAULT_CONFIG: ChatPiiRedactionConfig = {
@@ -298,45 +306,48 @@ function normalizeLocalProbeInterceptRules(value: unknown): LocalProbeInterceptR
     .filter((item): item is LocalProbeInterceptRule => item !== null)
 }
 
-function normalizeLocalProbeInterceptDelayMs(value: unknown, fallback: number): number {
-  if (value === null || value === undefined || value === '') return fallback
-  const parsed = typeof value === 'number' ? value : Number(value)
-  if (!Number.isInteger(parsed) || parsed < 0 || parsed > LOCAL_PROBE_INTERCEPT_MAX_DELAY_MS) {
-    return fallback
-  }
-  return parsed
-}
-
-function normalizeLocalProbeInterceptUsageTokens(value: unknown): number {
-  if (value === null || value === undefined || value === '') return 0
-  const parsed = typeof value === 'number' ? value : Number(value)
+function parseLocalProbeInterceptDelayMs(value: unknown, field: string): number {
   if (
-    !Number.isInteger(parsed)
-    || parsed < 0
-    || parsed > LOCAL_PROBE_INTERCEPT_MAX_USAGE_TOKENS
+    typeof value !== 'number'
+    || !Number.isInteger(value)
+    || value < 0
+    || value > LOCAL_PROBE_INTERCEPT_MAX_DELAY_MS
   ) {
-    return 0
+    throw new Error(`测活拦截配置无效：${field} 必须是有效的非负整数`)
   }
-  return parsed
+  return value
 }
 
-function normalizeLocalProbeInterceptUsage(value: unknown): LocalProbeInterceptUsage {
+function parseLocalProbeInterceptUsageTokens(value: unknown, field: string): number {
+  if (
+    typeof value !== 'number'
+    || !Number.isInteger(value)
+    || value < 0
+    || value > LOCAL_PROBE_INTERCEPT_MAX_USAGE_TOKENS
+  ) {
+    throw new Error(`测活拦截 usage 配置无效：${field} 必须是有效的非负整数`)
+  }
+  return value
+}
+
+export function parseLocalProbeInterceptUsage(value: unknown): LocalProbeInterceptUsage {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    return { ...LOCAL_PROBE_INTERCEPT_DEFAULT_USAGE }
+    throw new Error('测活拦截 usage 配置无效：usage 必须是对象')
   }
   const usage = value as Record<string, unknown>
-  const inputTokens = normalizeLocalProbeInterceptUsageTokens(usage.input_tokens)
-  const outputTokens = normalizeLocalProbeInterceptUsageTokens(usage.output_tokens)
+  const inputTokens = parseLocalProbeInterceptUsageTokens(usage.input_tokens, 'input_tokens')
+  const outputTokens = parseLocalProbeInterceptUsageTokens(usage.output_tokens, 'output_tokens')
+  const cachedTokens = parseLocalProbeInterceptUsageTokens(usage.cached_tokens, 'cached_tokens')
+  if (inputTokens + outputTokens > LOCAL_PROBE_INTERCEPT_MAX_USAGE_TOKENS) {
+    throw new Error('测活拦截 usage 配置无效：输入与输出 Token 总和超出限制')
+  }
+  if (cachedTokens > inputTokens) {
+    throw new Error('测活拦截 usage 配置无效：缓存 Token 不能大于输入 Token')
+  }
   return {
     input_tokens: inputTokens,
-    output_tokens: Math.min(
-      outputTokens,
-      LOCAL_PROBE_INTERCEPT_MAX_USAGE_TOKENS - inputTokens,
-    ),
-    cached_tokens: Math.min(
-      normalizeLocalProbeInterceptUsageTokens(usage.cached_tokens),
-      inputTokens,
-    ),
+    output_tokens: outputTokens,
+    cached_tokens: cachedTokens,
   }
 }
 
@@ -347,26 +358,43 @@ function normalizeLocalProbeInterceptConfig(values: {
   delay_min_ms: unknown
   delay_max_ms: unknown
 }): LocalProbeInterceptConfig {
-  const delayMinMs = normalizeLocalProbeInterceptDelayMs(
-    values.delay_min_ms,
-    LOCAL_PROBE_INTERCEPT_DEFAULT_DELAY_MIN_MS,
-  )
-  const delayMaxMs = normalizeLocalProbeInterceptDelayMs(
-    values.delay_max_ms,
-    LOCAL_PROBE_INTERCEPT_DEFAULT_DELAY_MAX_MS,
-  )
+  if (typeof values.enabled !== 'boolean') {
+    throw new Error('测活拦截配置无效：enabled 必须是布尔值')
+  }
+  if (!Array.isArray(values.rules)) {
+    throw new Error('测活拦截配置无效：rules 必须是数组')
+  }
+  const rules = normalizeLocalProbeInterceptRules(values.rules)
+  if (rules.length !== values.rules.length) {
+    throw new Error('测活拦截配置无效：存在无效规则')
+  }
+  const delayMinMs = parseLocalProbeInterceptDelayMs(values.delay_min_ms, 'delay_min_ms')
+  const delayMaxMs = parseLocalProbeInterceptDelayMs(values.delay_max_ms, 'delay_max_ms')
+  if (delayMinMs > delayMaxMs) {
+    throw new Error('测活拦截配置无效：最小延迟不能大于最大延迟')
+  }
   return {
-    enabled: values.enabled !== false,
-    rules: normalizeLocalProbeInterceptRules(values.rules),
-    usage: normalizeLocalProbeInterceptUsage(values.usage),
-    delay_min_ms: Math.min(delayMinMs, delayMaxMs),
-    delay_max_ms: Math.max(delayMinMs, delayMaxMs),
+    enabled: values.enabled,
+    rules,
+    usage: parseLocalProbeInterceptUsage(values.usage),
+    delay_min_ms: delayMinMs,
+    delay_max_ms: delayMaxMs,
   }
 }
 
 async function getSystemConfigValue(key: string): Promise<unknown> {
   const response = await apiClient.get<{ key: string; value: unknown }>(`/api/admin/system/configs/${key}`)
   return response.data.value
+}
+
+async function getOptionalSystemConfigValue(key: string): Promise<unknown | undefined> {
+  try {
+    return await getSystemConfigValue(key)
+  } catch (err) {
+    const status = (err as { response?: { status?: number } }).response?.status
+    if (status === 404) return undefined
+    throw err
+  }
 }
 
 async function updateSystemConfigValue(key: string, value: unknown, description: string) {
@@ -467,10 +495,28 @@ export const modulesApi = {
   },
 
   async getLocalProbeInterceptConfig(): Promise<LocalProbeInterceptConfig> {
+    try {
+      const config = await getSystemConfigValue(LOCAL_PROBE_INTERCEPT_CONFIG_KEYS.config)
+      if (!config || typeof config !== 'object' || Array.isArray(config)) {
+        throw new Error('测活拦截组合配置无效')
+      }
+      const value = config as Record<string, unknown>
+      return normalizeLocalProbeInterceptConfig({
+        enabled: value.enabled,
+        rules: value.rules,
+        usage: value.usage,
+        delay_min_ms: value.delay_min_ms,
+        delay_max_ms: value.delay_max_ms,
+      })
+    } catch (err) {
+      const status = (err as { response?: { status?: number } }).response?.status
+      if (status !== 404) throw err
+    }
+
     const [enabled, rules, usage, delayMinMs, delayMaxMs] = await Promise.all([
       getSystemConfigValue(LOCAL_PROBE_INTERCEPT_CONFIG_KEYS.enabled),
       getSystemConfigValue(LOCAL_PROBE_INTERCEPT_CONFIG_KEYS.rules),
-      getSystemConfigValue(LOCAL_PROBE_INTERCEPT_CONFIG_KEYS.usage),
+      getOptionalSystemConfigValue(LOCAL_PROBE_INTERCEPT_CONFIG_KEYS.usage),
       getSystemConfigValue(LOCAL_PROBE_INTERCEPT_CONFIG_KEYS.delay_min_ms),
       getSystemConfigValue(LOCAL_PROBE_INTERCEPT_CONFIG_KEYS.delay_max_ms),
     ])
@@ -478,27 +524,28 @@ export const modulesApi = {
     return normalizeLocalProbeInterceptConfig({
       enabled,
       rules,
-      usage,
+      usage: usage ?? { ...LOCAL_PROBE_INTERCEPT_DEFAULT_USAGE },
       delay_min_ms: delayMinMs,
       delay_max_ms: delayMaxMs,
     })
   },
 
   async updateLocalProbeInterceptConfig(config: LocalProbeInterceptConfig): Promise<LocalProbeInterceptConfig> {
-    const [enabled, rules, usage, delayMinMs, delayMaxMs] = await Promise.all([
-      updateSystemConfigValue(LOCAL_PROBE_INTERCEPT_CONFIG_KEYS.enabled, config.enabled, '测活拦截总开关'),
-      updateSystemConfigValue(LOCAL_PROBE_INTERCEPT_CONFIG_KEYS.rules, config.rules, '测活拦截提示词与回复规则'),
-      updateSystemConfigValue(LOCAL_PROBE_INTERCEPT_CONFIG_KEYS.usage, config.usage, '测活拦截响应 usage'),
-      updateSystemConfigValue(LOCAL_PROBE_INTERCEPT_CONFIG_KEYS.delay_min_ms, config.delay_min_ms, '测活拦截随机延迟最小毫秒数'),
-      updateSystemConfigValue(LOCAL_PROBE_INTERCEPT_CONFIG_KEYS.delay_max_ms, config.delay_max_ms, '测活拦截随机延迟最大毫秒数'),
-    ])
-
+    const saved = await updateSystemConfigValue(
+      LOCAL_PROBE_INTERCEPT_CONFIG_KEYS.config,
+      config,
+      '测活拦截完整配置',
+    )
+    if (!saved || typeof saved !== 'object' || Array.isArray(saved)) {
+      throw new Error('服务端返回了无效的测活拦截配置')
+    }
+    const value = saved as Record<string, unknown>
     return normalizeLocalProbeInterceptConfig({
-      enabled,
-      rules,
-      usage,
-      delay_min_ms: delayMinMs,
-      delay_max_ms: delayMaxMs,
+      enabled: value.enabled,
+      rules: value.rules,
+      usage: value.usage,
+      delay_min_ms: value.delay_min_ms,
+      delay_max_ms: value.delay_max_ms,
     })
   },
 

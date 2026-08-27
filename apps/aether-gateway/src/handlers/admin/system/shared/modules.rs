@@ -364,26 +364,48 @@ pub(crate) async fn build_admin_module_status_payload(
     runtime: &AdminModuleRuntimeState,
 ) -> Result<serde_json::Value, GatewayError> {
     let available = admin_module_available(module);
+    let local_probe_combined_config = if module.name == "local_probe_intercept" {
+        state
+            .read_system_config_json_value(aether_admin::system::LOCAL_PROBE_INTERCEPT_CONFIG_KEY)
+            .await?
+    } else {
+        None
+    };
+    let normalized_local_probe_config = local_probe_combined_config
+        .clone()
+        .map(aether_admin::system::normalize_local_probe_intercept_config_value)
+        .transpose();
     let enabled = if available {
-        let enabled_value = state
-            .read_system_config_json_value(&admin_module_enabled_config_key(module))
-            .await?;
-        let enabled_value = if module.name == "important_notification" && enabled_value.is_none() {
-            state
-                .read_system_config_json_value(LEGACY_NOTIFICATION_EMAIL_ENABLED_KEY)
-                .await?
+        if let Ok(Some(config)) = normalized_local_probe_config.as_ref() {
+            config
+                .get("enabled")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
         } else {
-            enabled_value
-        };
-        system_config_bool(enabled_value.as_ref(), admin_module_enabled_default(module))
+            let enabled_value = state
+                .read_system_config_json_value(&admin_module_enabled_config_key(module))
+                .await?;
+            let enabled_value =
+                if module.name == "important_notification" && enabled_value.is_none() {
+                    state
+                        .read_system_config_json_value(LEGACY_NOTIFICATION_EMAIL_ENABLED_KEY)
+                        .await?
+                } else {
+                    enabled_value
+                };
+            system_config_bool(enabled_value.as_ref(), admin_module_enabled_default(module))
+        }
     } else {
         false
     };
-    let (config_validated, config_error) = if available {
-        build_admin_module_validation_result(module, runtime)
-    } else {
-        (false, None)
-    };
+    let (config_validated, config_error) =
+        if local_probe_combined_config.is_some() && normalized_local_probe_config.is_err() {
+            (false, Some("测活拦截组合配置无效".to_string()))
+        } else if available {
+            build_admin_module_validation_result(module, runtime)
+        } else {
+            (false, None)
+        };
     let health = if available {
         build_admin_module_health(module, runtime)
     } else {

@@ -16,6 +16,7 @@ use aether_crypto::encrypt_python_fernet_plaintext;
 use axum::body::Bytes;
 use axum::http;
 use serde_json::json;
+use tracing::warn;
 
 fn normalize_admin_system_config_key(requested_key: &str) -> String {
     normalize_admin_system_config_key_pure(requested_key)
@@ -106,6 +107,23 @@ pub(crate) async fn apply_admin_system_config_update(
     let updated = state
         .upsert_system_config_entry(&normalized_key, &value, description.as_deref())
         .await?;
+    if normalized_key == aether_admin::system::LOCAL_PROBE_INTERCEPT_CONFIG_KEY {
+        for legacy_key in aether_admin::system::LOCAL_PROBE_INTERCEPT_LEGACY_CONFIG_KEYS {
+            if let Err(err) = state.delete_system_config_value(legacy_key).await {
+                warn!(
+                    legacy_key,
+                    error = ?err,
+                    "gateway failed to remove superseded local probe config key"
+                );
+            }
+        }
+    } else if aether_admin::system::LOCAL_PROBE_INTERCEPT_LEGACY_CONFIG_KEYS
+        .contains(&normalized_key.as_str())
+    {
+        state
+            .delete_system_config_value(aether_admin::system::LOCAL_PROBE_INTERCEPT_CONFIG_KEY)
+            .await?;
+    }
     let display_value = if is_sensitive_admin_system_config_key(&normalized_key) {
         json!("********")
     } else {

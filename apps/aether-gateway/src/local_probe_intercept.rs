@@ -11,6 +11,8 @@ pub(crate) const LOCAL_PROBE_INTERCEPT_DELAY_MIN_MS_KEY: &str =
 pub(crate) const LOCAL_PROBE_INTERCEPT_DELAY_MAX_MS_KEY: &str =
     "module.local_probe_intercept.delay_max_ms";
 pub(crate) const LOCAL_PROBE_INTERCEPT_USAGE_KEY: &str = "module.local_probe_intercept.usage";
+pub(crate) const LOCAL_PROBE_INTERCEPT_CONFIG_KEY: &str =
+    aether_admin::system::LOCAL_PROBE_INTERCEPT_CONFIG_KEY;
 
 const MAX_PROBE_TEXT_CHARS: usize = 512;
 const DEFAULT_DELAY_MIN_MS: u64 = 900;
@@ -85,26 +87,37 @@ struct LocalProbeInterceptRule {
     kind: LocalProbeInterceptKind,
 }
 
-pub(crate) async fn local_probe_intercept_answer(
-    state: &AppState,
-    text: &str,
-) -> Result<Option<LocalProbeInterceptAnswer>, GatewayError> {
-    Ok(local_probe_intercept_answer_from_rules(
-        text,
-        &load_local_probe_intercept_rules(state).await?,
-    ))
+#[derive(Debug, Clone)]
+pub(crate) struct LocalProbeInterceptConfig {
+    pub(crate) enabled: bool,
+    pub(crate) delay: LocalProbeInterceptDelay,
+    pub(crate) usage: LocalProbeInterceptUsage,
+    rules: Vec<LocalProbeInterceptRule>,
 }
 
-pub(crate) async fn local_probe_intercept_enabled(state: &AppState) -> Result<bool, GatewayError> {
-    let value = state
+impl LocalProbeInterceptConfig {
+    pub(crate) fn answer(&self, text: &str) -> Option<LocalProbeInterceptAnswer> {
+        local_probe_intercept_answer_from_rules(text, &self.rules)
+    }
+}
+
+pub(crate) async fn local_probe_intercept_config(
+    state: &AppState,
+) -> Result<Option<LocalProbeInterceptConfig>, GatewayError> {
+    if let Some(value) = state
+        .read_system_config_json_value(LOCAL_PROBE_INTERCEPT_CONFIG_KEY)
+        .await?
+    {
+        let Ok(value) = aether_admin::system::normalize_local_probe_intercept_config_value(value)
+        else {
+            return Ok(None);
+        };
+        return Ok(parse_local_probe_intercept_config(&value));
+    }
+
+    let enabled = state
         .read_system_config_json_value(LOCAL_PROBE_INTERCEPT_ENABLED_KEY)
         .await?;
-    Ok(system_config_bool(value.as_ref(), true))
-}
-
-pub(crate) async fn local_probe_intercept_delay(
-    state: &AppState,
-) -> Result<LocalProbeInterceptDelay, GatewayError> {
     let min_ms = read_local_probe_delay_ms(
         state,
         LOCAL_PROBE_INTERCEPT_DELAY_MIN_MS_KEY,
@@ -117,21 +130,37 @@ pub(crate) async fn local_probe_intercept_delay(
         DEFAULT_DELAY_MAX_MS,
     )
     .await?;
-
-    Ok(LocalProbeInterceptDelay::from_bounds(min_ms, max_ms))
-}
-
-pub(crate) async fn local_probe_intercept_usage(
-    state: &AppState,
-) -> Result<Option<LocalProbeInterceptUsage>, GatewayError> {
-    let value = state
+    let usage = state
         .read_system_config_json_value(LOCAL_PROBE_INTERCEPT_USAGE_KEY)
         .await?
         .or_else(|| {
             aether_admin::system::admin_system_config_default_value(LOCAL_PROBE_INTERCEPT_USAGE_KEY)
         })
         .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
-    Ok(parse_local_probe_intercept_usage(&value))
+    let Some(usage) = parse_local_probe_intercept_usage(&usage) else {
+        return Ok(None);
+    };
+    let rules = load_legacy_local_probe_intercept_rules(state).await?;
+
+    Ok(Some(LocalProbeInterceptConfig {
+        enabled: system_config_bool(enabled.as_ref(), true),
+        delay: LocalProbeInterceptDelay::from_bounds(min_ms, max_ms),
+        usage,
+        rules,
+    }))
+}
+
+fn parse_local_probe_intercept_config(value: &Value) -> Option<LocalProbeInterceptConfig> {
+    let config = value.as_object()?;
+    Some(LocalProbeInterceptConfig {
+        enabled: config.get("enabled")?.as_bool()?,
+        delay: LocalProbeInterceptDelay::from_bounds(
+            config.get("delay_min_ms")?.as_u64()?,
+            config.get("delay_max_ms")?.as_u64()?,
+        ),
+        usage: parse_local_probe_intercept_usage(config.get("usage")?)?,
+        rules: parse_local_probe_intercept_rules(config.get("rules")?),
+    })
 }
 
 fn parse_local_probe_intercept_usage(value: &Value) -> Option<LocalProbeInterceptUsage> {
@@ -170,7 +199,7 @@ async fn read_local_probe_delay_ms(
         .min(MAX_DELAY_MS))
 }
 
-async fn load_local_probe_intercept_rules(
+async fn load_legacy_local_probe_intercept_rules(
     state: &AppState,
 ) -> Result<Vec<LocalProbeInterceptRule>, GatewayError> {
     let value = state

@@ -1525,7 +1525,9 @@ fn build_grok_quota_status_snapshot(
     // whose billing was just probed still reads as stale, and the
     // `recent_refresh` scheduling preset orders it as if nothing happened.
     let observed_at_unix_secs = [
-        metadata.get("observed_at").or_else(|| metadata.get("updated_at")),
+        metadata
+            .get("observed_at")
+            .or_else(|| metadata.get("updated_at")),
         metadata
             .get("billing")
             .and_then(Value::as_object)

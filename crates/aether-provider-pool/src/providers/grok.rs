@@ -479,10 +479,12 @@ pub fn parse_grok_billing_payload(body: &Value, observed_at_unix_secs: u64) -> O
     let mut period_type = resolve_grok_billing_period_type(period);
     let billing_start = billing_string(config.get("billingPeriodStart"));
     let billing_end = billing_string(config.get("billingPeriodEnd"));
-    let period_start =
-        period.and_then(|period| billing_string(period.get("start"))).or_else(|| billing_start.clone());
-    let period_end =
-        period.and_then(|period| billing_string(period.get("end"))).or_else(|| billing_end.clone());
+    let period_start = period
+        .and_then(|period| billing_string(period.get("start")))
+        .or_else(|| billing_start.clone());
+    let period_end = period
+        .and_then(|period| billing_string(period.get("end")))
+        .or_else(|| billing_end.clone());
 
     let products = config
         .get("productUsage")
@@ -616,7 +618,10 @@ pub fn merge_grok_billing_snapshot(
                 merged.insert(field.to_string(), value.clone());
             }
         }
-        merged.insert("weekly_updated_at".to_string(), json!(observed_at_unix_secs));
+        merged.insert(
+            "weekly_updated_at".to_string(),
+            json!(observed_at_unix_secs),
+        );
     }
     if let Some(monthly) = monthly.and_then(Value::as_object) {
         for field in [
@@ -652,10 +657,7 @@ pub fn merge_grok_billing_snapshot(
     }
     merged.insert("partial".to_string(), json!(!failed_windows.is_empty()));
     merged.insert("failed_windows".to_string(), json!(failed_windows));
-    merged.insert(
-        "weekly_status_code".to_string(),
-        json!(weekly_status_code),
-    );
+    merged.insert("weekly_status_code".to_string(), json!(weekly_status_code));
     merged.insert(
         "monthly_status_code".to_string(),
         json!(monthly_status_code),
@@ -672,8 +674,14 @@ pub fn grok_billing_has_authoritative_quota(billing: Option<&Value>) -> bool {
     let Some(billing) = billing.and_then(Value::as_object) else {
         return false;
     };
-    billing.get("usage_percent").and_then(Value::as_f64).is_some()
-        || billing.get("used_percent").and_then(Value::as_f64).is_some()
+    billing
+        .get("usage_percent")
+        .and_then(Value::as_f64)
+        .is_some()
+        || billing
+            .get("used_percent")
+            .and_then(Value::as_f64)
+            .is_some()
         || billing
             .get("monthly_limit_cents")
             .and_then(Value::as_f64)
@@ -1265,8 +1273,9 @@ mod tests {
         // follow the binding window rather than average them.
         let weekly = parse_grok_billing_payload(&weekly_billing_body(), 1000).expect("weekly");
         let monthly = parse_grok_billing_payload(&monthly_billing_body(), 1000).expect("monthly");
-        let billing = merge_grok_billing_snapshot(None, Some(&weekly), Some(&monthly), 200, 200, 1000)
-            .expect("billing");
+        let billing =
+            merge_grok_billing_snapshot(None, Some(&weekly), Some(&monthly), 200, 200, 1000)
+                .expect("billing");
         assert!(grok_billing_has_authoritative_quota(Some(&billing)));
 
         let merged = merge_grok_quota_snapshot(None, &json!({"billing": billing}));
@@ -1389,15 +1398,9 @@ mod tests {
         // overwrite it with its own narrower dates.
         assert_eq!(full["billing_period_start"], "2026-07-01T00:00:00+00:00");
 
-        let weekly_only = merge_grok_billing_snapshot(
-            Some(&full),
-            Some(&weekly),
-            None,
-            200,
-            503,
-            1100,
-        )
-        .expect("partial observation");
+        let weekly_only =
+            merge_grok_billing_snapshot(Some(&full), Some(&weekly), None, 200, 503, 1100)
+                .expect("partial observation");
         assert_eq!(weekly_only["partial"], true);
         assert_eq!(weekly_only["failed_windows"], json!(["monthly"]));
         assert_eq!(weekly_only["monthly_status_code"], 503);

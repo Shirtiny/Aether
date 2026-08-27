@@ -814,13 +814,9 @@ pub(super) async fn build_admin_pool_list_keys_response(
         }
         _ => AdminProviderPoolRuntimeState::default(),
     };
-    let window_usage_by_key = read_admin_pool_window_usage_by_key(
-        state,
-        &provider.provider_type,
-        &keys,
-        now_unix_secs,
-    )
-    .await?;
+    let window_usage_by_key =
+        read_admin_pool_window_usage_by_key(state, &provider.provider_type, &keys, now_unix_secs)
+            .await?;
 
     let items = keys
         .into_iter()

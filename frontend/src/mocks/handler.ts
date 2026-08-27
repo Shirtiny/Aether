@@ -2088,6 +2088,17 @@ registerDynamicRoute('PUT', '/api/admin/system/configs/:configKey', async (confi
   if (key.startsWith('backup_s3_')) {
     refreshMockS3BackupModuleStatus()
   }
+  if (key === 'module.local_probe_intercept.config' && body.value && typeof body.value === 'object') {
+    const moduleStatus = MOCK_MODULE_STATUSES.local_probe_intercept
+    const enabled = (body.value as { enabled?: unknown }).enabled === true
+    if (moduleStatus) {
+      MOCK_MODULE_STATUSES.local_probe_intercept = {
+        ...moduleStatus,
+        enabled,
+        active: moduleStatus.available && enabled,
+      }
+    }
+  }
   return createMockResponse(entry)
 })
 

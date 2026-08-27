@@ -289,7 +289,7 @@ pub(crate) async fn resolve_local_openai_chat_candidate_payload_parts(
             &mut provider_request_headers,
             &mut provider_request_body,
             transport,
-            provider_api_format.as_ref(),
+            provider_api_format,
         );
         let (execution_strategy, conversion_mode) =
             ai_local_execution_contract_for_formats("openai:chat", "openai:chat");
@@ -667,7 +667,7 @@ pub(crate) async fn resolve_local_openai_chat_candidate_payload_parts(
         &mut provider_request_headers,
         &mut provider_request_body,
         transport,
-        provider_api_format.as_ref(),
+        provider_api_format.as_str(),
     );
     request_identity_response_encoding_when_redacted(
         &mut provider_request_headers,
@@ -825,7 +825,7 @@ async fn build_gemini_cli_openai_chat_cross_format_payload_parts(
         &mut provider_request_headers,
         &mut provider_request_body,
         &resolved.transport,
-        provider_api_format.as_ref(),
+        provider_api_format,
     );
     request_identity_response_encoding_when_redacted(
         &mut provider_request_headers,
@@ -1012,7 +1012,7 @@ async fn resolve_openai_chat_to_openai_image_payload_parts(
             &mut provider_request_headers,
             &mut provider_request_body,
             transport,
-            provider_api_format.as_ref(),
+            provider_api_format,
         );
     }
 

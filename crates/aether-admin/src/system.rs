@@ -49,6 +49,24 @@ pub const ADMIN_SYSTEM_CONFIG_SUPPORTED_VERSIONS: &[&str] =
 pub const ADMIN_SYSTEM_USERS_EXPORT_VERSION: &str = "1.5";
 pub const ADMIN_SYSTEM_USERS_SUPPORTED_VERSIONS: &[&str] =
     &["1.3", "1.4", ADMIN_SYSTEM_USERS_EXPORT_VERSION];
+pub const LOCAL_PROBE_INTERCEPT_CONFIG_KEY: &str = "module.local_probe_intercept.config";
+pub const LOCAL_PROBE_INTERCEPT_LEGACY_CONFIG_KEYS: &[&str] = &[
+    "module.local_probe_intercept.enabled",
+    "module.local_probe_intercept.rules",
+    "module.local_probe_intercept.usage",
+    "module.local_probe_intercept.delay_min_ms",
+    "module.local_probe_intercept.delay_max_ms",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalProbeInterceptConfigValidationError;
+
+impl From<()> for LocalProbeInterceptConfigValidationError {
+    fn from(_: ()) -> Self {
+        Self
+    }
+}
+
 const LOCAL_PROBE_INTERCEPT_DEFAULT_DELAY_MIN_MS: u64 = 900;
 const LOCAL_PROBE_INTERCEPT_DEFAULT_DELAY_MAX_MS: u64 = 2_000;
 const LOCAL_PROBE_INTERCEPT_MAX_DELAY_MS: u64 = 60_000;
@@ -411,6 +429,16 @@ fn local_probe_intercept_default_usage() -> serde_json::Value {
         "input_tokens": 0,
         "output_tokens": 0,
         "cached_tokens": 0,
+    })
+}
+
+pub fn local_probe_intercept_default_config_value() -> serde_json::Value {
+    json!({
+        "enabled": true,
+        "rules": local_probe_intercept_default_rules(),
+        "usage": local_probe_intercept_default_usage(),
+        "delay_min_ms": LOCAL_PROBE_INTERCEPT_DEFAULT_DELAY_MIN_MS,
+        "delay_max_ms": LOCAL_PROBE_INTERCEPT_DEFAULT_DELAY_MAX_MS,
     })
 }
 
@@ -2294,6 +2322,39 @@ fn normalize_local_probe_intercept_usage_tokens(value: Option<&Value>) -> Result
     }
 }
 
+pub fn normalize_local_probe_intercept_config_value(
+    value: serde_json::Value,
+) -> Result<serde_json::Value, LocalProbeInterceptConfigValidationError> {
+    let config = value.as_object().ok_or(())?;
+    let enabled = config.get("enabled").and_then(Value::as_bool).ok_or(())?;
+    let rules =
+        normalize_local_probe_intercept_rules_value(config.get("rules").cloned().ok_or(())?)?;
+    let usage =
+        normalize_local_probe_intercept_usage_value(config.get("usage").cloned().ok_or(())?)?;
+    let delay_min_ms = normalize_local_probe_intercept_delay_ms_value(
+        config.get("delay_min_ms").cloned().ok_or(())?,
+        LOCAL_PROBE_INTERCEPT_DEFAULT_DELAY_MIN_MS,
+    )?
+    .as_u64()
+    .ok_or(())?;
+    let delay_max_ms = normalize_local_probe_intercept_delay_ms_value(
+        config.get("delay_max_ms").cloned().ok_or(())?,
+        LOCAL_PROBE_INTERCEPT_DEFAULT_DELAY_MAX_MS,
+    )?
+    .as_u64()
+    .ok_or(())?;
+    if delay_min_ms > delay_max_ms {
+        return Err(LocalProbeInterceptConfigValidationError);
+    }
+    Ok(json!({
+        "enabled": enabled,
+        "rules": rules,
+        "usage": usage,
+        "delay_min_ms": delay_min_ms,
+        "delay_max_ms": delay_max_ms,
+    }))
+}
+
 fn normalize_local_probe_intercept_rule_id(raw: &str, index: usize) -> String {
     let normalized = raw
         .chars()
@@ -2653,6 +2714,18 @@ pub fn parse_admin_system_config_update(
                 value = notification_service_default_items();
             } else {
                 value = normalize_notification_service_items_value(value).map_err(|_| {
+                    (
+                        http::StatusCode::BAD_REQUEST,
+                        json!({ "detail": "请求数据验证失败" }),
+                    )
+                })?;
+            }
+        }
+        LOCAL_PROBE_INTERCEPT_CONFIG_KEY => {
+            if value.is_null() {
+                value = local_probe_intercept_default_config_value();
+            } else {
+                value = normalize_local_probe_intercept_config_value(value).map_err(|_| {
                     (
                         http::StatusCode::BAD_REQUEST,
                         json!({ "detail": "请求数据验证失败" }),
@@ -4018,6 +4091,11 @@ mod tests {
     #[test]
     fn local_probe_intercept_config_defaults_are_available() {
         assert_eq!(
+            admin_system_config_default_value(LOCAL_PROBE_INTERCEPT_CONFIG_KEY),
+            None,
+            "the combined key must stay absent until legacy values are migrated"
+        );
+        assert_eq!(
             admin_system_config_default_value("module.local_probe_intercept.enabled"),
             Some(json!(true))
         );
@@ -4210,6 +4288,49 @@ mod tests {
                 invalid.as_bytes(),
             )
             .expect_err("invalid local probe usage should fail");
+            assert_eq!(err.0, http::StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[test]
+    fn local_probe_intercept_combined_config_is_validated_as_one_value() {
+        let mut config = local_probe_intercept_default_config_value();
+        config["enabled"] = json!(false);
+        config["usage"] = json!({
+            "input_tokens": 120,
+            "output_tokens": 8,
+            "cached_tokens": 40,
+        });
+        config["delay_min_ms"] = json!(100);
+        config["delay_max_ms"] = json!(200);
+        let update = parse_admin_system_config_update(
+            LOCAL_PROBE_INTERCEPT_CONFIG_KEY,
+            serde_json::to_vec(&json!({ "value": config }))
+                .unwrap()
+                .as_slice(),
+        )
+        .expect("combined local probe config should parse");
+
+        assert_eq!(update.normalized_key, LOCAL_PROBE_INTERCEPT_CONFIG_KEY);
+        assert_eq!(update.value["enabled"], json!(false));
+        assert_eq!(update.value["usage"]["cached_tokens"], json!(40));
+        assert_eq!(update.value["delay_min_ms"], json!(100));
+        assert_eq!(update.value["delay_max_ms"], json!(200));
+    }
+
+    #[test]
+    fn local_probe_intercept_combined_config_rejects_cross_field_errors() {
+        for invalid_patch in [
+            json!({ "usage": { "input_tokens": 12, "output_tokens": 3, "cached_tokens": 13 } }),
+            json!({ "delay_min_ms": 201, "delay_max_ms": 200 }),
+        ] {
+            let mut config = local_probe_intercept_default_config_value();
+            for (key, value) in invalid_patch.as_object().unwrap() {
+                config[key] = value.clone();
+            }
+            let body = serde_json::to_vec(&json!({ "value": config })).unwrap();
+            let err = parse_admin_system_config_update(LOCAL_PROBE_INTERCEPT_CONFIG_KEY, &body)
+                .expect_err("invalid combined local probe config should fail");
             assert_eq!(err.0, http::StatusCode::BAD_REQUEST);
         }
     }

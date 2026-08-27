@@ -500,6 +500,7 @@ pub fn build_openai_chat_finish_chunk(id: &str, model: &str, finish_reason: Opti
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn build_openai_chat_usage_chunk(
     id: &str,
     model: &str,

@@ -371,10 +371,9 @@ pub(crate) fn provider_pool_quota_snapshot_exhausted_decision(
                     return Some(top_level_reset_active);
                 }
             }
-        } else if top_level_reset_elapsed {
-            return Some(false);
-        } else if matches!(policy, ProviderQuotaSnapshotPolicy::GrokDeadlineBounded)
-            && top_level_reset_at.is_none()
+        } else if top_level_reset_elapsed
+            || (matches!(policy, ProviderQuotaSnapshotPolicy::GrokDeadlineBounded)
+                && top_level_reset_at.is_none())
         {
             return Some(false);
         }

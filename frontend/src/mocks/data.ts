@@ -12,6 +12,7 @@ import type { ProviderWithEndpointsSummary, GlobalModelResponse } from '@/api/en
 import {
   LOCAL_PROBE_INTERCEPT_DEFAULT_DELAY_MAX_MS,
   LOCAL_PROBE_INTERCEPT_DEFAULT_DELAY_MIN_MS,
+  LOCAL_PROBE_INTERCEPT_DEFAULT_CONFIG,
   LOCAL_PROBE_INTERCEPT_DEFAULT_RULES,
   LOCAL_PROBE_INTERCEPT_DEFAULT_USAGE,
   type ModuleStatus,
@@ -960,6 +961,15 @@ export const MOCK_SYSTEM_CONFIGS: Array<{ key: string; value: unknown; descripti
     description: '通知服务通知项和模板',
   },
   { key: 'module.local_probe_intercept.enabled', value: true, description: '测活拦截总开关' },
+  {
+    key: 'module.local_probe_intercept.config',
+    value: {
+      ...LOCAL_PROBE_INTERCEPT_DEFAULT_CONFIG,
+      rules: LOCAL_PROBE_INTERCEPT_DEFAULT_CONFIG.rules.map(rule => ({ ...rule })),
+      usage: { ...LOCAL_PROBE_INTERCEPT_DEFAULT_CONFIG.usage },
+    },
+    description: '测活拦截完整配置',
+  },
   {
     key: 'module.local_probe_intercept.rules',
     value: LOCAL_PROBE_INTERCEPT_DEFAULT_RULES.map(rule => ({ ...rule })),

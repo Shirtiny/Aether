@@ -6985,7 +6985,10 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"type":"s
     fn stream_lifecycle_timeouts_default_and_follow_plan_stream_idle_timeout() {
         let mut plan =
             test_responses_stream_plan("req-lifecycle-timeouts", "cand-lifecycle-timeouts");
-        assert_eq!(DEFAULT_STREAM_UPSTREAM_IDLE_TIMEOUT, Duration::from_secs(120));
+        assert_eq!(
+            DEFAULT_STREAM_UPSTREAM_IDLE_TIMEOUT,
+            Duration::from_secs(120)
+        );
         assert_eq!(
             resolve_stream_lifecycle_timeouts(&plan),
             super::StreamLifecycleTimeouts {
