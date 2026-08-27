@@ -362,6 +362,7 @@ mod tests {
             Some(8.0),
             Some(serde_json::json!({"region":"global"})),
         )
+        .with_stream_idle_timeout_secs(Some(90.0))
     }
 
     fn sample_endpoint() -> StoredProviderCatalogEndpoint {
