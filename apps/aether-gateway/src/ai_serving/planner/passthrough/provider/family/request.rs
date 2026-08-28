@@ -153,22 +153,25 @@ pub(crate) async fn resolve_local_same_format_provider_candidate_payload_parts(
     let body_json = redaction.body_json.as_ref();
     let mut transport = Arc::clone(&prepared.transport);
 
-    let Some(mut base_provider_request_body) =
-        super::super::request::build_same_format_provider_request_body(
-            body_json,
-            prepared.transport.provider.provider_type.as_str(),
-            prepared.provider_api_format.as_str(),
-            &prepared.mapped_model,
-            spec,
-            prepared.transport.endpoint.body_rules.as_ref(),
-            Some(effective_headers),
-            prepared.upstream_is_stream,
-            prepared.force_body_stream_field,
-            prepared.kiro_auth.as_ref(),
-            prepared.is_claude_code,
-            enable_model_directives,
-        )
-    else {
+    let build_request_body = if prepared.is_vertex {
+        super::super::request::build_same_format_provider_request_body_with_gemini_schema
+    } else {
+        super::super::request::build_same_format_provider_request_body
+    };
+    let Some(mut base_provider_request_body) = build_request_body(
+        body_json,
+        prepared.transport.provider.provider_type.as_str(),
+        prepared.provider_api_format.as_str(),
+        &prepared.mapped_model,
+        spec,
+        prepared.transport.endpoint.body_rules.as_ref(),
+        Some(effective_headers),
+        prepared.upstream_is_stream,
+        prepared.force_body_stream_field,
+        prepared.kiro_auth.as_ref(),
+        prepared.is_claude_code,
+        enable_model_directives,
+    ) else {
         mark_skipped_local_same_format_provider_candidate_with_extra_data(
             state,
             input,

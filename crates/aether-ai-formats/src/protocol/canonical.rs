@@ -3479,13 +3479,18 @@ pub(crate) fn gemini_response_format_to_canonical(
     if response_mime_type != "application/json" {
         return None;
     }
-    let json_schema = gemini_value_by_case(generation_config, "responseSchema", "response_schema")
-        .map(|schema| {
-            json!({
-                "name": "response_schema",
-                "schema": schema,
-            })
-        });
+    let json_schema = gemini_value_by_case(
+        generation_config,
+        "responseJsonSchema",
+        "response_json_schema",
+    )
+    .or_else(|| gemini_value_by_case(generation_config, "responseSchema", "response_schema"))
+    .map(|schema| {
+        json!({
+            "name": "response_schema",
+            "schema": schema,
+        })
+    });
     Some(CanonicalResponseFormat {
         format_type: if json_schema.is_some() {
             "json_schema".to_string()
@@ -3653,10 +3658,20 @@ pub(crate) fn gemini_tools_to_canonical(value: Option<&Value>) -> Option<GeminiC
                     .get("description")
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned),
-                parameters: declaration_object.get("parameters").cloned(),
+                parameters: declaration_object
+                    .get("parametersJsonSchema")
+                    .or_else(|| declaration_object.get("parameters_json_schema"))
+                    .or_else(|| declaration_object.get("parameters"))
+                    .cloned(),
                 extensions: gemini_extensions(
                     declaration_object,
-                    &["name", "description", "parameters"],
+                    &[
+                        "name",
+                        "description",
+                        "parameters",
+                        "parametersJsonSchema",
+                        "parameters_json_schema",
+                    ],
                 ),
             });
         }
@@ -5277,6 +5292,8 @@ const GEMINI_MAPPED_GENERATION_CONFIG_KEYS: &[&str] = &[
     "response_mime_type",
     "responseSchema",
     "response_schema",
+    "responseJsonSchema",
+    "response_json_schema",
     "responseModalities",
     "response_modalities",
 ];
@@ -6792,6 +6809,54 @@ mod tests {
         assert_eq!(rebuilt["cachedContent"], "cached/abc");
         assert_eq!(rebuilt["tools"], request["tools"]);
         assert_eq!(rebuilt["toolConfig"], request["toolConfig"]);
+    }
+
+    #[test]
+    fn gemini_request_adapter_prefers_vertex_json_schema_fields() {
+        let request = json!({
+            "contents": [{"role": "user", "parts": [{"text": "Run it"}]}],
+            "generationConfig": {
+                "responseMimeType": "application/json",
+                "responseSchema": {"type": "string"},
+                "responseJsonSchema": {
+                    "type": "object",
+                    "properties": {"result": {"const": "ok"}}
+                }
+            },
+            "tools": [{
+                "functionDeclarations": [{
+                    "name": "run_task",
+                    "parameters": {"type": "string"},
+                    "parametersJsonSchema": {
+                        "type": "object",
+                        "properties": {"mode": {"const": "apply"}}
+                    }
+                }]
+            }]
+        });
+
+        let canonical =
+            from_gemini_to_canonical_request(&request, "").expect("Vertex request should parse");
+
+        assert_eq!(
+            canonical.tools[0].parameters.as_ref().expect("tool schema")["properties"]["mode"]
+                ["const"],
+            "apply"
+        );
+        assert_eq!(
+            canonical
+                .response_format
+                .as_ref()
+                .and_then(|format| format.json_schema.as_ref())
+                .expect("response schema")["schema"]["properties"]["result"]["const"],
+            "ok"
+        );
+        assert!(canonical
+            .extensions
+            .get("gemini")
+            .and_then(|value| value.get("generation_config_extra"))
+            .and_then(Value::as_object)
+            .is_none_or(|extra| !extra.contains_key("responseJsonSchema")));
     }
 
     #[test]

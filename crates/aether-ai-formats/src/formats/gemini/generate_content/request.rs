@@ -30,11 +30,14 @@ pub fn from(body: &Value, ctx: &FormatContext) -> Option<CanonicalRequest> {
 }
 
 pub fn to(request: &CanonicalRequest, ctx: &FormatContext) -> Option<Value> {
-    to_raw(
+    let mut output = canonical_to_gemini_request_body(
         request,
         ctx.mapped_model_or(request.model.as_str()),
         ctx.upstream_is_stream,
-    )
+        ctx.preserve_gemini_json_schema,
+    )?;
+    apply_gemini_request_extensions(&mut output, &request.extensions)?;
+    Some(output)
 }
 
 pub fn from_raw(body_json: &Value, request_path: &str) -> Option<CanonicalRequest> {
@@ -190,7 +193,8 @@ pub fn to_raw(
     mapped_model: &str,
     upstream_is_stream: bool,
 ) -> Option<Value> {
-    let mut output = canonical_to_gemini_request_body(canonical, mapped_model, upstream_is_stream)?;
+    let mut output =
+        canonical_to_gemini_request_body(canonical, mapped_model, upstream_is_stream, false)?;
     apply_gemini_request_extensions(&mut output, &canonical.extensions)?;
     Some(output)
 }
@@ -199,6 +203,7 @@ fn canonical_to_gemini_request_body(
     canonical: &CanonicalRequest,
     mapped_model: &str,
     _upstream_is_stream: bool,
+    preserve_gemini_json_schema: bool,
 ) -> Option<Value> {
     let mut output = Map::new();
     if !mapped_model.trim().is_empty() {
@@ -221,7 +226,7 @@ fn canonical_to_gemini_request_body(
     {
         output.insert("generationConfig".to_string(), generation_config);
     }
-    if let Some(tools) = canonical_tools_to_gemini(canonical) {
+    if let Some(tools) = canonical_tools_to_gemini(canonical, preserve_gemini_json_schema) {
         output.insert("tools".to_string(), tools);
     }
     if let Some(tool_config) = canonical_tool_choice_to_gemini(canonical.tool_choice.as_ref()) {
@@ -492,7 +497,10 @@ fn apply_response_format_to_gemini_generation_config(
     }
 }
 
-fn canonical_tools_to_gemini(canonical: &CanonicalRequest) -> Option<Value> {
+fn canonical_tools_to_gemini(
+    canonical: &CanonicalRequest,
+    preserve_gemini_json_schema: bool,
+) -> Option<Value> {
     let mut declarations = Vec::new();
     let mut tools = Vec::new();
     let mut google_search = canonical
@@ -538,7 +546,10 @@ fn canonical_tools_to_gemini(canonical: &CanonicalRequest) -> Option<Value> {
             google_search = true;
             continue;
         }
-        declarations.push(canonical_tool_to_gemini_declaration(tool));
+        declarations.push(canonical_tool_to_gemini_declaration(
+            tool,
+            preserve_gemini_json_schema,
+        ));
     }
     let mut emitted_google_search = false;
     let mut emitted_code_execution = false;
@@ -668,7 +679,10 @@ fn gemini_unhandled_builtin_tool_portion(tool_object: &Map<String, Value>) -> Op
     (!builtin.is_empty()).then_some(Value::Object(builtin))
 }
 
-fn canonical_tool_to_gemini_declaration(tool: &CanonicalToolDefinition) -> Value {
+fn canonical_tool_to_gemini_declaration(
+    tool: &CanonicalToolDefinition,
+    preserve_gemini_json_schema: bool,
+) -> Value {
     let mut declaration = Map::new();
     declaration.insert("name".to_string(), Value::String(tool.name.clone()));
     if let Some(description) = &tool.description {
@@ -682,7 +696,9 @@ fn canonical_tool_to_gemini_declaration(tool: &CanonicalToolDefinition) -> Value
         tool.parameters
             .clone()
             .map(|mut schema| {
-                clean_gemini_tool_schema(&mut schema);
+                if !preserve_gemini_json_schema {
+                    clean_gemini_tool_schema(&mut schema);
+                }
                 schema
             })
             .unwrap_or_else(|| json!({})),

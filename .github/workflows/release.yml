@@ -99,6 +99,7 @@ jobs:
           RUST_MIN_STACK: "16777216"
         run: |
           cargo test --locked -p aether-ai-formats --lib
+          cargo test --locked -p aether-data --lib
           cargo test --locked -p aether-provider-transport --lib
           cargo check --locked -p aether-gateway --tests
           cargo test --locked -p aether-gateway --lib openai_local_probe

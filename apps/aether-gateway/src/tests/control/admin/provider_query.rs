@@ -1555,14 +1555,18 @@ async fn gateway_applies_vertex_json_schema_semantics_to_model_test_requests() {
             let body = plan.body.json_body.as_ref().expect("json body");
             let declaration = &body["tools"][0]["functionDeclarations"][0];
             assert!(declaration.get("parameters").is_none());
-            assert!(declaration["parametersJsonSchema"].get("$schema").is_none());
             assert_eq!(
-                declaration["parametersJsonSchema"]["properties"]["mode"]["enum"],
-                json!(["apply"])
+                declaration["parametersJsonSchema"]["$schema"],
+                json!("https://json-schema.org/draft/2020-12/schema")
             );
             assert_eq!(
-                declaration["parametersJsonSchema"]["properties"]["retries"]["description"],
-                json!("exclusiveMinimum: 0")
+                declaration["parametersJsonSchema"]["properties"]["mode"]["const"],
+                json!("apply")
+            );
+            assert_eq!(
+                declaration["parametersJsonSchema"]["properties"]["retries"]
+                    ["exclusiveMinimum"],
+                json!(0)
             );
             assert!(body["generationConfig"].get("responseSchema").is_none());
             assert_eq!(

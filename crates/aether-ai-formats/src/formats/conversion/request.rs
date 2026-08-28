@@ -27,11 +27,29 @@ pub fn convert_openai_chat_request_to_gemini_request(
     mapped_model: &str,
     upstream_is_stream: bool,
 ) -> Option<Value> {
+    convert_openai_chat_request_to_gemini_request_with_schema_mode(
+        body_json,
+        mapped_model,
+        upstream_is_stream,
+        false,
+    )
+}
+
+pub(crate) fn convert_openai_chat_request_to_gemini_request_with_schema_mode(
+    body_json: &Value,
+    mapped_model: &str,
+    upstream_is_stream: bool,
+    preserve_gemini_json_schema: bool,
+) -> Option<Value> {
     registry::convert_request(
         "openai:chat",
         "gemini:generate_content",
         body_json,
-        &request_context(mapped_model, upstream_is_stream),
+        &request_context_with_gemini_schema(
+            mapped_model,
+            upstream_is_stream,
+            preserve_gemini_json_schema,
+        ),
     )
     .ok()
 }
@@ -155,6 +173,15 @@ fn request_context(mapped_model: &str, upstream_is_stream: bool) -> FormatContex
         .with_upstream_stream(upstream_is_stream)
 }
 
+fn request_context_with_gemini_schema(
+    mapped_model: &str,
+    upstream_is_stream: bool,
+    preserve_gemini_json_schema: bool,
+) -> FormatContext {
+    request_context(mapped_model, upstream_is_stream)
+        .with_preserve_gemini_json_schema(preserve_gemini_json_schema)
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::{json, Value};
@@ -163,6 +190,8 @@ mod tests {
 
     use super::{
         convert_openai_chat_request_to_claude_request,
+        convert_openai_chat_request_to_gemini_request,
+        convert_openai_chat_request_to_gemini_request_with_schema_mode,
         convert_openai_chat_request_to_openai_responses_request,
         normalize_claude_request_to_openai_chat_request,
         normalize_gemini_request_to_openai_chat_request,
@@ -224,6 +253,56 @@ mod tests {
 
         assert_eq!(converted["model"], "claude-target");
         assert_eq!(converted["messages"][0]["role"], "user");
+    }
+
+    #[test]
+    fn gemini_schema_mode_preserves_vertex_json_schema_without_changing_default() {
+        let body = json!({
+            "model": "gpt-source",
+            "messages": [{"role": "user", "content": "run it"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "run_task",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "mode": {"const": "apply"},
+                            "retries": {"type": "integer", "exclusiveMinimum": 0},
+                            "choice": {"anyOf": [
+                                {"type": "string"},
+                                {"type": "object", "properties": {"id": {"type": "string"}}}
+                            ]}
+                        }
+                    }
+                }
+            }]
+        });
+
+        let regular = convert_openai_chat_request_to_gemini_request(&body, "gemini-regular", false)
+            .expect("regular Gemini request");
+        assert_eq!(
+            regular["tools"][0]["functionDeclarations"][0]["parameters"]["properties"]["mode"]
+                ["type"],
+            "string"
+        );
+        assert!(
+            regular["tools"][0]["functionDeclarations"][0]["parameters"]["properties"]["choice"]
+                .get("anyOf")
+                .is_none()
+        );
+
+        let vertex = convert_openai_chat_request_to_gemini_request_with_schema_mode(
+            &body,
+            "gemini-vertex",
+            false,
+            true,
+        )
+        .expect("Vertex Gemini request");
+        let schema = &vertex["tools"][0]["functionDeclarations"][0]["parameters"];
+        assert_eq!(schema["properties"]["mode"]["const"], "apply");
+        assert_eq!(schema["properties"]["retries"]["exclusiveMinimum"], 0);
+        assert!(schema["properties"]["choice"].get("anyOf").is_some());
     }
 
     #[test]

@@ -199,7 +199,7 @@
               min="1"
               max="600"
               step="1"
-              placeholder="默认 120"
+              placeholder="默认 300"
               @update:model-value="(v) => form.stream_idle_timeout = parseNumberInput(v)"
             />
           </div>

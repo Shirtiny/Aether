@@ -90,10 +90,42 @@ pub fn build_standard_request_body_with_model_directives_and_request_headers(
     request_headers: Option<&http::HeaderMap>,
     enable_model_directives: bool,
 ) -> Option<Value> {
+    build_standard_request_body_with_model_directives_and_request_headers_and_gemini_schema(
+        body_json,
+        client_api_format,
+        mapped_model,
+        provider_type,
+        provider_api_format,
+        request_path,
+        upstream_is_stream,
+        body_rules,
+        user_api_key_id,
+        request_headers,
+        enable_model_directives,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_standard_request_body_with_model_directives_and_request_headers_and_gemini_schema(
+    body_json: &Value,
+    client_api_format: &str,
+    mapped_model: &str,
+    provider_type: &str,
+    provider_api_format: &str,
+    request_path: &str,
+    upstream_is_stream: bool,
+    body_rules: Option<&Value>,
+    user_api_key_id: Option<&str>,
+    request_headers: Option<&http::HeaderMap>,
+    enable_model_directives: bool,
+    preserve_gemini_json_schema: bool,
+) -> Option<Value> {
     let format_context = FormatContext::default()
         .with_mapped_model(mapped_model)
         .with_request_path(request_path)
-        .with_upstream_stream(upstream_is_stream);
+        .with_upstream_stream(upstream_is_stream)
+        .with_preserve_gemini_json_schema(preserve_gemini_json_schema);
     let source_api_format = compatible_source_format_for_standard_request(
         body_json,
         client_api_format,

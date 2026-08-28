@@ -2676,12 +2676,23 @@ async fn provider_query_execute_standard_test_candidate(
         }
         "claude:messages" | "gemini:generate_content" => {
             let Some(mut provider_request_body) =
-                crate::ai_serving::build_cross_format_openai_chat_request_body(
-                    &request_body,
-                    request_model,
-                    normalized_provider_api_format.as_str(),
-                    upstream_is_stream,
-                )
+                (if crate::provider_transport::is_vertex_transport_context(&transport) {
+                    crate::ai_serving::build_cross_format_openai_chat_request_body_with_model_directives_and_gemini_schema(
+                        &request_body,
+                        request_model,
+                        normalized_provider_api_format.as_str(),
+                        upstream_is_stream,
+                        false,
+                        true,
+                    )
+                } else {
+                    crate::ai_serving::build_cross_format_openai_chat_request_body(
+                        &request_body,
+                        request_model,
+                        normalized_provider_api_format.as_str(),
+                        upstream_is_stream,
+                    )
+                })
             else {
                 return Ok(provider_query_skipped_execution_outcome(
                     request_body.clone(),

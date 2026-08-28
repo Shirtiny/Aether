@@ -96,6 +96,7 @@ pub use crate::formats::shared::request::{
 pub use crate::formats::shared::request_matrix::{
     build_standard_request_body_from_canonical,
     build_standard_request_body_from_canonical_with_model_directives,
+    build_standard_request_body_with_model_directives_and_request_headers_and_gemini_schema,
 };
 pub use crate::formats::shared::response::{
     build_generated_tool_call_id, build_local_success_background_report,
@@ -177,8 +178,10 @@ pub use crate::formats::{
         standard_normalize::{
             build_cross_format_openai_chat_request_body,
             build_cross_format_openai_chat_request_body_with_model_directives,
+            build_cross_format_openai_chat_request_body_with_model_directives_and_gemini_schema,
             build_cross_format_openai_responses_request_body,
             build_cross_format_openai_responses_request_body_with_model_directives,
+            build_cross_format_openai_responses_request_body_with_model_directives_and_gemini_schema,
             build_local_openai_chat_request_body,
             build_local_openai_chat_request_body_with_model_directives,
             build_local_openai_responses_request_body,

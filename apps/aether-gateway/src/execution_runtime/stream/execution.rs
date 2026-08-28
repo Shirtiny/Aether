@@ -126,7 +126,9 @@ const SSE_CONTROL_FILTER_MAX_BUFFER_BYTES: usize = 1024 * 1024;
 const SSE_TERMINAL_DETECTOR_MAX_LINE_BYTES: usize = 1024 * 1024;
 const STREAM_IDLE_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const STREAM_IDLE_LOG_INTERVAL_MS: u64 = 60_000;
-const DEFAULT_STREAM_UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+// Keep the pre-configured behavior for existing providers. New providers can
+// opt into a shorter/longer bound through stream_idle_timeout.
+const DEFAULT_STREAM_UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const STREAM_CLIENT_PROGRESS_IDLE_MULTIPLIER: u32 = 2;
 const DEFAULT_STREAM_DOWNSTREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_STREAM_DOWNSTREAM_DRAIN_GRACE: Duration = Duration::from_secs(30);
@@ -6987,7 +6989,7 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"type":"s
             test_responses_stream_plan("req-lifecycle-timeouts", "cand-lifecycle-timeouts");
         assert_eq!(
             DEFAULT_STREAM_UPSTREAM_IDLE_TIMEOUT,
-            Duration::from_secs(120)
+            Duration::from_secs(300)
         );
         assert_eq!(
             resolve_stream_lifecycle_timeouts(&plan),

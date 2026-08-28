@@ -159,6 +159,23 @@ pub fn classify_same_format_provider_request_behavior(
 pub fn build_same_format_provider_request_body(
     input: SameFormatProviderRequestBodyInput<'_>,
 ) -> Option<Value> {
+    build_same_format_provider_request_body_inner(input, false)
+}
+
+/// Same-format request builder variant for Vertex Gemini transports.  When a
+/// request still needs a family-level conversion (for example Claude/OpenAI
+/// input to a Gemini endpoint), preserve JSON Schema keywords so the caller
+/// can move the declaration to Vertex's `parametersJsonSchema` field.
+pub fn build_same_format_provider_request_body_with_gemini_schema(
+    input: SameFormatProviderRequestBodyInput<'_>,
+) -> Option<Value> {
+    build_same_format_provider_request_body_inner(input, true)
+}
+
+fn build_same_format_provider_request_body_inner(
+    input: SameFormatProviderRequestBodyInput<'_>,
+    preserve_gemini_json_schema: bool,
+) -> Option<Value> {
     if let Some(kiro_auth_config) = input.kiro_auth_config {
         return build_kiro_provider_request_body(
             input.body_json,
@@ -192,7 +209,9 @@ pub fn build_same_format_provider_request_body(
             input.client_api_format,
             input.provider_api_format,
             input.body_json,
-            &aether_ai_formats::FormatContext::default().with_mapped_model(input.mapped_model),
+            &aether_ai_formats::FormatContext::default()
+                .with_mapped_model(input.mapped_model)
+                .with_preserve_gemini_json_schema(preserve_gemini_json_schema),
         )
         .ok()?
         .as_object()?

@@ -7,6 +7,12 @@ pub struct FormatContext {
     pub mapped_model: Option<String>,
     pub request_path: Option<String>,
     pub upstream_is_stream: bool,
+    /// Keep the original JSON Schema when emitting Gemini function
+    /// declarations.  The regular Gemini API uses the restricted `Schema`
+    /// shape, while Vertex can carry the richer `parametersJsonSchema` field.
+    /// This is opt-in so the existing Gemini compatibility normalization is
+    /// unchanged for non-Vertex transports.
+    pub preserve_gemini_json_schema: bool,
     pub report_context: Option<Value>,
 }
 
@@ -23,6 +29,11 @@ impl FormatContext {
 
     pub fn with_upstream_stream(mut self, upstream_is_stream: bool) -> Self {
         self.upstream_is_stream = upstream_is_stream;
+        self
+    }
+
+    pub fn with_preserve_gemini_json_schema(mut self, preserve: bool) -> Self {
+        self.preserve_gemini_json_schema = preserve;
         self
     }
 

@@ -27,8 +27,10 @@ pub(crate) use self::family::{
     build_local_sync_attempt_source, build_local_sync_plan_and_reports,
 };
 pub(crate) use self::normalize::{
-    build_cross_format_openai_chat_request_body, build_cross_format_openai_chat_upstream_url,
-    build_cross_format_openai_responses_request_body,
+    build_cross_format_openai_chat_request_body,
+    build_cross_format_openai_chat_request_body_with_gemini_schema,
+    build_cross_format_openai_chat_upstream_url, build_cross_format_openai_responses_request_body,
+    build_cross_format_openai_responses_request_body_with_gemini_schema,
     build_cross_format_openai_responses_upstream_url, build_local_openai_chat_request_body,
     build_local_openai_chat_upstream_url, build_local_openai_responses_request_body,
     build_local_openai_responses_upstream_url, build_owned_local_openai_responses_request_body,
@@ -63,6 +65,7 @@ pub(crate) use crate::ai_serving::{
 pub(crate) use crate::ai_serving::{
     build_standard_request_body, build_standard_request_body_with_model_directives,
     build_standard_request_body_with_model_directives_and_request_headers,
+    build_standard_request_body_with_model_directives_and_request_headers_and_gemini_schema,
     convert_openai_chat_request_to_claude_request, convert_openai_chat_request_to_gemini_request,
     convert_openai_chat_request_to_openai_responses_request, extract_openai_text_content,
     normalize_openai_responses_request_to_openai_chat_request, parse_openai_tool_result_content,

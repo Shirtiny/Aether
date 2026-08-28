@@ -1446,7 +1446,12 @@ async fn record_pool_error_effect(
         }
         return;
     };
-    let should_record_pool_error = local_pool_failure_should_clear_sticky(
+    let should_refresh_codex_quota = pool_error_should_trigger_codex_quota_refresh(
+        &pool_context.provider_type,
+        effect.status_code,
+    );
+    let should_record_pool_error = pool_error_should_record_or_refresh_quota(
+        &pool_context.provider_type,
         effect.status_code,
         effect.error_body,
         effect.classification,
@@ -1533,10 +1538,7 @@ async fn record_pool_error_effect(
         }),
     )
     .await;
-    if pool_error_should_trigger_codex_quota_refresh(
-        &pool_context.provider_type,
-        effect.status_code,
-    ) {
+    if should_refresh_codex_quota {
         let _ = spawn_codex_quota_refresh_after_rate_limit(
             state.clone(),
             context.plan.provider_id.clone(),
@@ -1883,6 +1885,16 @@ fn pool_error_should_trigger_codex_quota_refresh(provider_type: &str, status_cod
     status_code == 429 && provider_type.trim().eq_ignore_ascii_case("codex")
 }
 
+fn pool_error_should_record_or_refresh_quota(
+    provider_type: &str,
+    status_code: u16,
+    error_body: Option<&str>,
+    classification: LocalFailoverClassification,
+) -> bool {
+    local_pool_failure_should_clear_sticky(status_code, error_body, classification)
+        || pool_error_should_trigger_codex_quota_refresh(provider_type, status_code)
+}
+
 fn pool_score_hard_state_for_terminal_error_reason(reason: &str) -> PoolMemberHardState {
     if reason.starts_with("payment_required_") {
         PoolMemberHardState::QuotaExhausted
@@ -1924,8 +1936,8 @@ mod tests {
 
     use super::{
         apply_local_execution_effect, local_candidate_failure_should_record_pool_error,
-        pool_error_should_trigger_codex_quota_refresh, pool_score_hard_state_for_status,
-        pool_sticky_collateral_failure_status_is_account_invalid,
+        pool_error_should_record_or_refresh_quota, pool_error_should_trigger_codex_quota_refresh,
+        pool_score_hard_state_for_status, pool_sticky_collateral_failure_status_is_account_invalid,
         prepare_pool_attempt_started_effect, prepare_pool_failover_after_candidate_failure,
         LocalAdaptiveRateLimitEffect, LocalAdaptiveSuccessEffect, LocalAttemptFailureEffect,
         LocalExecutionEffect, LocalExecutionEffectContext, LocalHealthFailureEffect,
@@ -4682,6 +4694,22 @@ mod tests {
         ));
         assert!(!pool_error_should_trigger_codex_quota_refresh("codex", 402));
         assert!(!pool_error_should_trigger_codex_quota_refresh("grok", 429));
+    }
+
+    #[test]
+    fn codex_stop_status_rate_limit_still_records_pool_error_for_refresh() {
+        assert!(pool_error_should_record_or_refresh_quota(
+            "codex",
+            429,
+            None,
+            LocalFailoverClassification::StopStatusCode,
+        ));
+        assert!(!pool_error_should_record_or_refresh_quota(
+            "grok",
+            429,
+            None,
+            LocalFailoverClassification::StopStatusCode,
+        ));
     }
 
     #[tokio::test]

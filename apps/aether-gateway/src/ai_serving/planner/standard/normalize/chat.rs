@@ -5,6 +5,7 @@ use crate::ai_serving::{
     apply_codex_openai_responses_chat_body_edits,
     apply_openai_responses_compact_special_body_edits,
     build_cross_format_openai_chat_request_body_with_model_directives as surface_build_cross_format_openai_chat_request_body,
+    build_cross_format_openai_chat_request_body_with_model_directives_and_gemini_schema as surface_build_cross_format_openai_chat_request_body_with_gemini_schema,
     build_local_openai_chat_request_body_with_model_directives as surface_build_local_openai_chat_request_body,
     GatewayProviderTransportSnapshot,
 };
@@ -61,13 +62,43 @@ pub(crate) fn build_cross_format_openai_chat_request_body(
     request_headers: &http::HeaderMap,
     enable_model_directives: bool,
 ) -> Option<Value> {
-    let provider_request_body = surface_build_cross_format_openai_chat_request_body(
+    build_cross_format_openai_chat_request_body_with_gemini_schema(
         body_json,
         mapped_model,
+        provider_type,
         provider_api_format,
         upstream_is_stream,
+        force_body_stream_field,
+        body_rules,
+        user_api_key_id,
+        request_headers,
         enable_model_directives,
-    )?;
+        false,
+    )
+}
+
+pub(crate) fn build_cross_format_openai_chat_request_body_with_gemini_schema(
+    body_json: &Value,
+    mapped_model: &str,
+    provider_type: &str,
+    provider_api_format: &str,
+    upstream_is_stream: bool,
+    force_body_stream_field: bool,
+    body_rules: Option<&Value>,
+    user_api_key_id: Option<&str>,
+    request_headers: &http::HeaderMap,
+    enable_model_directives: bool,
+    preserve_gemini_json_schema: bool,
+) -> Option<Value> {
+    let provider_request_body =
+        surface_build_cross_format_openai_chat_request_body_with_gemini_schema(
+            body_json,
+            mapped_model,
+            provider_api_format,
+            upstream_is_stream,
+            enable_model_directives,
+            preserve_gemini_json_schema,
+        )?;
     let mut provider_request_body =
         apply_standard_provider_request_body_rules_with_request_headers(
             provider_request_body,

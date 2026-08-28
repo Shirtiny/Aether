@@ -1,7 +1,8 @@
 use std::borrow::Cow;
 
 use aether_ai_formats::formats::conversion::request::{
-    convert_openai_chat_request_to_claude_request, convert_openai_chat_request_to_gemini_request,
+    convert_openai_chat_request_to_claude_request,
+    convert_openai_chat_request_to_gemini_request_with_schema_mode,
     convert_openai_chat_request_to_openai_responses_request,
     normalize_claude_request_to_openai_chat_request,
     normalize_gemini_request_to_openai_chat_request,
@@ -168,6 +169,24 @@ pub fn build_cross_format_openai_chat_request_body_with_model_directives(
     upstream_is_stream: bool,
     enable_model_directives: bool,
 ) -> Option<Value> {
+    build_cross_format_openai_chat_request_body_with_model_directives_and_gemini_schema(
+        body_json,
+        mapped_model,
+        provider_api_format,
+        upstream_is_stream,
+        enable_model_directives,
+        false,
+    )
+}
+
+pub fn build_cross_format_openai_chat_request_body_with_model_directives_and_gemini_schema(
+    body_json: &Value,
+    mapped_model: &str,
+    provider_api_format: &str,
+    upstream_is_stream: bool,
+    enable_model_directives: bool,
+    preserve_gemini_json_schema: bool,
+) -> Option<Value> {
     let conversion_kind = request_conversion_kind("openai:chat", provider_api_format)?;
     let provider_request_body = match conversion_kind {
         RequestConversionKind::ToClaudeStandard => {
@@ -177,6 +196,7 @@ pub fn build_cross_format_openai_chat_request_body_with_model_directives(
                     mapped_model,
                     provider_api_format,
                     upstream_is_stream,
+                    preserve_gemini_json_schema,
                 )?
             } else {
                 let chat_body = chat_compatible_body_for_openai_chat_endpoint(body_json)?;
@@ -189,10 +209,11 @@ pub fn build_cross_format_openai_chat_request_body_with_model_directives(
         }
         RequestConversionKind::ToGeminiStandard => {
             let chat_body = chat_compatible_body_for_openai_chat_endpoint(body_json)?;
-            convert_openai_chat_request_to_gemini_request(
+            convert_openai_chat_request_to_gemini_request_with_schema_mode(
                 chat_body.as_ref(),
                 mapped_model,
                 upstream_is_stream,
+                preserve_gemini_json_schema,
             )?
         }
         RequestConversionKind::ToOpenAiResponses => {
@@ -239,6 +260,7 @@ fn convert_claude_compatible_chat_endpoint_request(
     mapped_model: &str,
     provider_api_format: &str,
     upstream_is_stream: bool,
+    preserve_gemini_json_schema: bool,
 ) -> Option<Value> {
     aether_ai_formats::convert_request(
         "claude:messages",
@@ -246,7 +268,8 @@ fn convert_claude_compatible_chat_endpoint_request(
         body_json,
         &FormatContext::default()
             .with_mapped_model(mapped_model)
-            .with_upstream_stream(upstream_is_stream),
+            .with_upstream_stream(upstream_is_stream)
+            .with_preserve_gemini_json_schema(preserve_gemini_json_schema),
     )
     .ok()
 }
@@ -367,6 +390,26 @@ pub fn build_cross_format_openai_responses_request_body_with_model_directives(
     upstream_is_stream: bool,
     enable_model_directives: bool,
 ) -> Option<Value> {
+    build_cross_format_openai_responses_request_body_with_model_directives_and_gemini_schema(
+        body_json,
+        mapped_model,
+        client_api_format,
+        provider_api_format,
+        upstream_is_stream,
+        enable_model_directives,
+        false,
+    )
+}
+
+pub fn build_cross_format_openai_responses_request_body_with_model_directives_and_gemini_schema(
+    body_json: &Value,
+    mapped_model: &str,
+    client_api_format: &str,
+    provider_api_format: &str,
+    upstream_is_stream: bool,
+    enable_model_directives: bool,
+    preserve_gemini_json_schema: bool,
+) -> Option<Value> {
     let chat_like_request = chat_compatible_body_for_standard_source(body_json, client_api_format)?;
     let conversion_kind = request_conversion_kind(client_api_format, provider_api_format)?;
     let provider_request_body = match conversion_kind {
@@ -391,11 +434,14 @@ pub fn build_cross_format_openai_responses_request_body_with_model_directives(
             mapped_model,
             upstream_is_stream,
         )?,
-        RequestConversionKind::ToGeminiStandard => convert_openai_chat_request_to_gemini_request(
-            chat_like_request.as_ref(),
-            mapped_model,
-            upstream_is_stream,
-        )?,
+        RequestConversionKind::ToGeminiStandard => {
+            convert_openai_chat_request_to_gemini_request_with_schema_mode(
+                chat_like_request.as_ref(),
+                mapped_model,
+                upstream_is_stream,
+                preserve_gemini_json_schema,
+            )?
+        }
     };
     let mut provider_request_body = with_model_directive_overrides(
         provider_request_body,

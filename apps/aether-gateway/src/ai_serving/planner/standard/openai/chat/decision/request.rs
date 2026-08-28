@@ -24,9 +24,9 @@ use crate::ai_serving::planner::standard::{
     apply_codex_openai_responses_special_body_edits, apply_codex_openai_responses_special_headers,
     apply_codex_pool_concrete_account_profile_for_api_format,
     apply_deepseek_tool_call_thinking_compat, apply_openai_responses_stable_prompt_cache_key,
-    build_cross_format_openai_chat_request_body, build_cross_format_openai_chat_upstream_url,
-    build_local_openai_chat_request_body, build_local_openai_chat_upstream_url,
-    request_body_build_failure_extra_data,
+    build_cross_format_openai_chat_request_body_with_gemini_schema,
+    build_cross_format_openai_chat_upstream_url, build_local_openai_chat_request_body,
+    build_local_openai_chat_upstream_url, request_body_build_failure_extra_data,
 };
 use crate::ai_serving::transport::auth::resolve_local_openai_bearer_auth;
 use crate::ai_serving::transport::kiro::{
@@ -457,22 +457,25 @@ pub(crate) async fn resolve_local_openai_chat_candidate_payload_parts(
         }
     };
 
-    let Some(mut provider_request_body) = build_cross_format_openai_chat_request_body(
-        body_json,
-        &prepared_candidate.mapped_model,
-        transport.provider.provider_type.as_str(),
-        provider_api_format.as_str(),
-        upstream_is_stream,
-        force_body_stream_field,
-        if is_kiro_claude_cli {
-            None
-        } else {
-            transport.endpoint.body_rules.as_ref()
-        },
-        None,
-        effective_headers,
-        enable_model_directives,
-    ) else {
+    let Some(mut provider_request_body) =
+        build_cross_format_openai_chat_request_body_with_gemini_schema(
+            body_json,
+            &prepared_candidate.mapped_model,
+            transport.provider.provider_type.as_str(),
+            provider_api_format.as_str(),
+            upstream_is_stream,
+            force_body_stream_field,
+            if is_kiro_claude_cli {
+                None
+            } else {
+                transport.endpoint.body_rules.as_ref()
+            },
+            None,
+            effective_headers,
+            enable_model_directives,
+            crate::provider_transport::is_vertex_transport_context(transport),
+        )
+    else {
         mark_skipped_local_openai_chat_candidate_with_extra_data(
             state,
             input,
@@ -490,6 +493,29 @@ pub(crate) async fn resolve_local_openai_chat_candidate_payload_parts(
         .await;
         return Ok(None);
     };
+    if let Err(err) = crate::provider_transport::apply_transport_request_body_semantics(
+        &mut provider_request_body,
+        transport,
+        provider_api_format.as_str(),
+    ) {
+        mark_skipped_local_openai_chat_candidate_with_failure_diagnostic(
+            state,
+            input,
+            trace_id,
+            candidate,
+            candidate_index,
+            candidate_id,
+            "transport_request_body_semantics_failed",
+            CandidateFailureDiagnostic::request_conversion_failed(
+                "openai:chat",
+                provider_api_format.as_str(),
+                "openai_chat_cross_format_transport_body_semantics",
+                err.to_string(),
+            ),
+        )
+        .await;
+        return Ok(None);
+    }
     if let Some(mapping) =
         crate::system_features::reasoning_model_directive_mapping_for_api_format_and_model(
             state,
@@ -510,6 +536,29 @@ pub(crate) async fn resolve_local_openai_chat_candidate_payload_parts(
             upstream_is_stream,
             request_requires_body_stream_field(body_json, force_body_stream_field),
         );
+        if let Err(err) = crate::provider_transport::apply_transport_request_body_semantics(
+            &mut provider_request_body,
+            transport,
+            provider_api_format.as_str(),
+        ) {
+            mark_skipped_local_openai_chat_candidate_with_failure_diagnostic(
+                state,
+                input,
+                trace_id,
+                candidate,
+                candidate_index,
+                candidate_id,
+                "transport_request_body_semantics_failed",
+                CandidateFailureDiagnostic::request_conversion_failed(
+                    "openai:chat",
+                    provider_api_format.as_str(),
+                    "openai_chat_cross_format_transport_body_semantics_after_model_directives",
+                    err.to_string(),
+                ),
+            )
+            .await;
+            return Ok(None);
+        }
     }
     apply_deepseek_tool_call_thinking_compat(
         &mut provider_request_body,

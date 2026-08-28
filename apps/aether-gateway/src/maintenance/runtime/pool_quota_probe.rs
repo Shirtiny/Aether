@@ -16,9 +16,10 @@ use serde_json::Value;
 use tracing::{debug, info, warn};
 
 use crate::admin_api::{
-    admin_provider_pool_config, provider_quota_refresh_endpoint_for_provider,
-    provider_type_supports_quota_refresh, reconcile_admin_fixed_provider_template_endpoints,
-    refresh_provider_pool_quota_locally, AdminAppState,
+    admin_provider_pool_config, clear_admin_provider_pool_cooldown_if_reason_runtime,
+    provider_quota_refresh_endpoint_for_provider, provider_type_supports_quota_refresh,
+    reconcile_admin_fixed_provider_template_endpoints, refresh_provider_pool_quota_locally,
+    AdminAppState,
 };
 use crate::{AppState, GatewayError};
 
@@ -1032,6 +1033,22 @@ fn endpoint_for_probe(
     provider_quota_refresh_endpoint_for_provider(provider_type, endpoints, true)
 }
 
+fn codex_quota_refresh_endpoint_after_rate_limit(
+    endpoints: &[StoredProviderCatalogEndpoint],
+    requested_endpoint_id: &str,
+) -> Option<StoredProviderCatalogEndpoint> {
+    let requested_endpoint = endpoints
+        .iter()
+        .find(|endpoint| endpoint.id == requested_endpoint_id);
+    requested_endpoint
+        .filter(|endpoint| {
+            aether_ai_formats::normalize_api_format_alias(&endpoint.api_format)
+                == "openai:responses"
+        })
+        .cloned()
+        .or_else(|| provider_quota_refresh_endpoint_for_provider("codex", endpoints, true))
+}
+
 async fn endpoint_for_probe_with_reconcile(
     state: &AppState,
     admin_state: &AdminAppState<'_>,
@@ -1097,6 +1114,7 @@ async fn record_score_probe_results_from_payload(
     selected_key_ids: &[String],
     payload: Option<&Value>,
     attempted_at: u64,
+    clear_rate_limit_cooldown: bool,
 ) -> BTreeSet<String> {
     let mut recorded = std::collections::BTreeSet::new();
     let mut succeeded = BTreeSet::new();
@@ -1115,10 +1133,19 @@ async fn record_score_probe_results_from_payload(
             };
             recorded.insert(key_id.to_string());
             let hard_state = probe_result_hard_state(item);
-            if probe_result_succeeded(item)
-                && hard_state != Some(PoolMemberHardState::QuotaExhausted)
-            {
+            let available = probe_result_succeeded(item)
+                && hard_state != Some(PoolMemberHardState::QuotaExhausted);
+            if available {
                 succeeded.insert(key_id.to_string());
+            }
+            if available && clear_rate_limit_cooldown {
+                let _ = clear_admin_provider_pool_cooldown_if_reason_runtime(
+                    state.runtime_state.as_ref(),
+                    provider_id,
+                    key_id,
+                    "rate_limited_429",
+                )
+                .await;
             }
             record_score_probe_result_for_key(
                 state,
@@ -1424,6 +1451,7 @@ async fn perform_pool_quota_probe_for_provider(
                     std::slice::from_ref(&key_id),
                     payload.as_ref(),
                     now_ts,
+                    false,
                 )
                 .await;
                 add_active_probe_member_ids(
@@ -1673,12 +1701,10 @@ async fn refresh_codex_quota_after_rate_limit(
     if admin_provider_pool_config(&provider).is_none() {
         return Ok(());
     }
-    let Some(endpoint) = state
-        .read_provider_catalog_endpoints_by_ids(&[endpoint_id.to_string()])
-        .await?
-        .into_iter()
-        .next()
-        .filter(|endpoint| endpoint.provider_id == provider.id)
+    let endpoints = state
+        .list_provider_catalog_endpoints_by_provider_ids(std::slice::from_ref(&provider.id))
+        .await?;
+    let Some(endpoint) = codex_quota_refresh_endpoint_after_rate_limit(&endpoints, endpoint_id)
     else {
         return Ok(());
     };
@@ -1715,6 +1741,7 @@ async fn refresh_codex_quota_after_rate_limit(
         &[key_id.to_string()],
         payload.as_ref(),
         now_unix_secs(),
+        true,
     )
     .await;
     info!(
@@ -1876,6 +1903,18 @@ mod tests {
         key
     }
 
+    fn endpoint(id: &str, api_format: &str) -> StoredProviderCatalogEndpoint {
+        StoredProviderCatalogEndpoint::new(
+            id.to_string(),
+            "provider-1".to_string(),
+            api_format.to_string(),
+            None,
+            None,
+            true,
+        )
+        .expect("endpoint should build")
+    }
+
     #[test]
     fn selects_stale_probe_keys_by_oldest_anchor() {
         let keys = vec![
@@ -1901,6 +1940,30 @@ mod tests {
         let selected = select_pool_quota_probe_key_ids(&keys, "codex", 2_000, 600, &stamps, 2);
 
         assert_eq!(selected, vec!["never".to_string(), "old".to_string()]);
+    }
+
+    #[test]
+    fn codex_rate_limit_refresh_uses_canonical_quota_endpoint() {
+        let endpoints = vec![
+            endpoint("compact", "openai:responses:compact"),
+            endpoint("responses", "openai:responses"),
+        ];
+
+        assert_eq!(
+            codex_quota_refresh_endpoint_after_rate_limit(&endpoints, "compact")
+                .map(|endpoint| endpoint.id),
+            Some("responses".to_string())
+        );
+        assert_eq!(
+            codex_quota_refresh_endpoint_after_rate_limit(&endpoints, "responses")
+                .map(|endpoint| endpoint.id),
+            Some("responses".to_string())
+        );
+        assert!(codex_quota_refresh_endpoint_after_rate_limit(
+            &[endpoint("compact", "openai:responses:compact")],
+            "compact",
+        )
+        .is_none());
     }
 
     #[tokio::test]

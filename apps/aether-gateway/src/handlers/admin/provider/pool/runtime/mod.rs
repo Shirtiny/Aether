@@ -7,7 +7,8 @@ mod writes;
 
 pub(crate) use self::leases::release_admin_provider_pool_key_lease;
 pub(crate) use self::mutations::{
-    clear_admin_provider_pool_cooldown, reset_admin_provider_pool_cost,
+    clear_admin_provider_pool_cooldown, clear_admin_provider_pool_cooldown_if_reason_runtime,
+    reset_admin_provider_pool_cost,
 };
 pub(crate) use self::reads::{
     read_admin_provider_pool_cooldown_count, read_admin_provider_pool_cooldown_counts,

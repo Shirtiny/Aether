@@ -448,7 +448,7 @@ pub(crate) async fn resolve_local_standard_candidate_payload_parts(
     .await?;
     let body_json = redaction.body_json.as_ref();
     let mut provider_request_body =
-        match crate::ai_serving::planner::standard::build_standard_request_body_with_model_directives_and_request_headers(
+        match crate::ai_serving::planner::standard::build_standard_request_body_with_model_directives_and_request_headers_and_gemini_schema(
             body_json,
             spec_metadata.api_format,
             &prepared_candidate.mapped_model,
@@ -464,6 +464,7 @@ pub(crate) async fn resolve_local_standard_candidate_payload_parts(
             None,
             Some(effective_headers),
             enable_model_directives,
+            crate::provider_transport::is_vertex_transport_context(transport),
         ) {
             Some(body) => body,
             None => {

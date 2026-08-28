@@ -489,7 +489,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_tools_use_cpa_compatible_json_schema_for_vertex_gemini() {
+    fn claude_tools_keep_full_json_schema_for_vertex_gemini() {
         let transport = sample_transport("vertex_ai", "https://aiplatform.googleapis.com");
         let input_schema = json!({
             "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -516,26 +516,21 @@ mod tests {
             "claude:messages",
             "gemini:generate_content",
             &claude_body,
-            &aether_ai_formats::FormatContext::default().with_mapped_model("gemini-3.7-flash"),
+            &aether_ai_formats::FormatContext::default()
+                .with_mapped_model("gemini-3.7-flash")
+                .with_preserve_gemini_json_schema(true),
         )
         .expect("Claude request should convert to Gemini");
 
         let converted_schema = body["tools"][0]["functionDeclarations"][0]["parameters"].clone();
-        assert!(converted_schema.get("$schema").is_none());
-        assert!(converted_schema["properties"]["environment"]
-            .get("propertyNames")
-            .is_none());
-        assert_eq!(converted_schema["properties"]["mode"]["type"], "string");
         assert_eq!(
-            converted_schema["properties"]["mode"]["enum"],
-            json!(["apply"])
+            converted_schema["properties"]["environment"]["propertyNames"]["pattern"],
+            "^[A-Z_]+$"
         );
-        assert!(converted_schema["properties"]["retries"]
-            .get("exclusiveMinimum")
-            .is_none());
+        assert_eq!(converted_schema["properties"]["mode"]["const"], "apply");
         assert_eq!(
-            converted_schema["properties"]["retries"]["description"],
-            "exclusiveMinimum: 0"
+            converted_schema["properties"]["retries"]["exclusiveMinimum"],
+            0
         );
 
         apply_transport_request_body_semantics(&mut body, &transport, "gemini:generate_content")
