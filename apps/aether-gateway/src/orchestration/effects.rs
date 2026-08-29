@@ -115,6 +115,7 @@ pub(crate) enum LocalExecutionEffect<'a> {
     },
     PoolAttemptStarted,
     PoolAttemptAborted,
+    PoolNonAccountFailure,
     PoolError(LocalPoolErrorEffect<'a>),
     PoolStreamTimeout,
 }
@@ -176,6 +177,10 @@ pub(crate) async fn apply_local_execution_effect(
             record_pool_attempt_aborted_effect(state, context).await;
             release_pool_key_lease_effect(state, context).await;
         }
+        LocalExecutionEffect::PoolNonAccountFailure => {
+            record_pool_non_account_failure_effect(state, context).await;
+            release_pool_key_lease_effect(state, context).await;
+        }
         LocalExecutionEffect::PoolError(effect) => {
             record_pool_error_effect(state, context, effect).await;
             release_pool_key_lease_effect(state, context).await;
@@ -229,6 +234,9 @@ pub(crate) async fn apply_local_pool_terminal_effect_after_lease_release(
         }
         LocalExecutionEffect::PoolAttemptAborted => {
             record_pool_attempt_aborted_effect(state, context).await;
+        }
+        LocalExecutionEffect::PoolNonAccountFailure => {
+            record_pool_non_account_failure_effect(state, context).await;
         }
         LocalExecutionEffect::PoolError(effect) => {
             record_pool_error_effect(state, context, effect).await;
@@ -803,11 +811,12 @@ pub(crate) async fn prepare_pool_attempt_started_effect(
     try_claim_pool_sticky_init_for_attempt(state, context, &pool_context, sticky_init_owner).await
 }
 
-const POOL_FAILOVER_STICKY_CLEANUP_TIMEOUT: Duration = Duration::from_millis(100);
+const POOL_HANDSHAKE_STICKY_CLEANUP_TIMEOUT: Duration = Duration::from_millis(100);
 
-pub(crate) async fn prepare_pool_failover_after_candidate_failure(
+pub(crate) async fn prepare_pool_after_handshake_failure(
     state: &AppState,
     context: LocalExecutionEffectContext<'_>,
+    clear_bound_sticky: bool,
 ) {
     let metadata = local_execution_candidate_metadata_from_report_context(context.report_context);
     let Some(sticky_session_token) =
@@ -820,13 +829,19 @@ pub(crate) async fn prepare_pool_failover_after_candidate_failure(
     let owner = metadata.pool_sticky_init_owner;
     let runtime = std::sync::Arc::clone(&state.runtime_state);
     let cleanup = async move {
+        let clear_bound_sticky = async {
+            if clear_bound_sticky {
+                clear_admin_provider_pool_sticky_session_if_bound_to_key(
+                    runtime.as_ref(),
+                    &provider_id,
+                    &key_id,
+                    Some(sticky_session_token.as_str()),
+                )
+                .await;
+            }
+        };
         let (_, _, _) = tokio::join!(
-            clear_admin_provider_pool_sticky_session_if_bound_to_key(
-                runtime.as_ref(),
-                &provider_id,
-                &key_id,
-                Some(sticky_session_token.as_str()),
-            ),
+            clear_bound_sticky,
             clear_admin_provider_pool_sticky_session_prebind_if_owner(
                 runtime.as_ref(),
                 &provider_id,
@@ -842,17 +857,17 @@ pub(crate) async fn prepare_pool_failover_after_candidate_failure(
             ),
         );
     };
-    if tokio::time::timeout(POOL_FAILOVER_STICKY_CLEANUP_TIMEOUT, cleanup)
+    if tokio::time::timeout(POOL_HANDSHAKE_STICKY_CLEANUP_TIMEOUT, cleanup)
         .await
         .is_err()
     {
         warn!(
-            event_name = "codex_ws_pool_failover_sticky_cleanup_timeout",
+            event_name = "codex_ws_pool_handshake_sticky_cleanup_timeout",
             log_type = "ops",
             provider_id = %context.plan.provider_id,
             key_id = %context.plan.key_id,
-            timeout_ms = POOL_FAILOVER_STICKY_CLEANUP_TIMEOUT.as_millis(),
-            "Codex WebSocket failover sticky cleanup exceeded its bounded deadline"
+            timeout_ms = POOL_HANDSHAKE_STICKY_CLEANUP_TIMEOUT.as_millis(),
+            "Codex WebSocket handshake sticky cleanup exceeded its bounded deadline"
         );
     }
 }
@@ -1124,6 +1139,17 @@ async fn record_pool_attempt_aborted_effect(
     }
 
     finish_pool_sticky_initialization(state, context, sticky_session_token.as_deref(), true).await;
+}
+
+async fn record_pool_non_account_failure_effect(
+    state: &AppState,
+    context: LocalExecutionEffectContext<'_>,
+) {
+    let metadata = local_execution_candidate_metadata_from_report_context(context.report_context);
+    let sticky_session_token = metadata
+        .pool_sticky_session_token
+        .or_else(|| pool_feedback_sticky_session_token(context.plan, context.report_context));
+    finish_pool_sticky_initialization(state, context, sticky_session_token.as_deref(), false).await;
 }
 
 async fn record_adaptive_rate_limit_effect(
@@ -1938,7 +1964,7 @@ mod tests {
         apply_local_execution_effect, local_candidate_failure_should_record_pool_error,
         pool_error_should_record_or_refresh_quota, pool_error_should_trigger_codex_quota_refresh,
         pool_score_hard_state_for_status, pool_sticky_collateral_failure_status_is_account_invalid,
-        prepare_pool_attempt_started_effect, prepare_pool_failover_after_candidate_failure,
+        prepare_pool_after_handshake_failure, prepare_pool_attempt_started_effect,
         LocalAdaptiveRateLimitEffect, LocalAdaptiveSuccessEffect, LocalAttemptFailureEffect,
         LocalExecutionEffect, LocalExecutionEffectContext, LocalHealthFailureEffect,
         LocalHealthSuccessEffect, LocalOAuthInvalidationEffect, LocalPoolErrorEffect,
@@ -3637,7 +3663,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_candidate_clears_sticky_before_deferred_settlement() {
+    async fn handshake_failure_preserves_or_clears_sticky_before_deferred_settlement() {
         let provider_config = json!({
             "pool_advanced": {
                 "sticky_session_ttl_seconds": 120
@@ -3707,12 +3733,38 @@ mod tests {
         )
         .await;
 
-        prepare_pool_failover_after_candidate_failure(
+        prepare_pool_after_handshake_failure(
             &state,
             LocalExecutionEffectContext {
                 plan: &failed_plan,
                 report_context: Some(&failed_report_context),
             },
+            false,
+        )
+        .await;
+
+        let runtime_after_transport_failure = read_admin_provider_pool_runtime_state(
+            state.runtime_state.as_ref(),
+            &failed_plan.provider_id,
+            &["key-1".to_string(), "key-2".to_string()],
+            &pool_config,
+            Some("session-1"),
+        )
+        .await;
+        assert_eq!(
+            runtime_after_transport_failure
+                .sticky_bound_key_id
+                .as_deref(),
+            Some("key-1")
+        );
+
+        prepare_pool_after_handshake_failure(
+            &state,
+            LocalExecutionEffectContext {
+                plan: &failed_plan,
+                report_context: Some(&failed_report_context),
+            },
+            true,
         )
         .await;
 

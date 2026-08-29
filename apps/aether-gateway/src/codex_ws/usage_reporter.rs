@@ -119,6 +119,7 @@ pub(crate) enum CodexWsSettlementCommit {
         status_code: Option<u16>,
         error_type: &'static str,
         error_message: &'static str,
+        preserve_sticky_binding: bool,
     },
     HandshakeFailure {
         lifecycle: Arc<super::CodexWsCandidateLifecycle>,
@@ -127,6 +128,7 @@ pub(crate) enum CodexWsSettlementCommit {
         error_type: String,
         error_message: String,
         error_body: Option<String>,
+        penalize_account: bool,
     },
     UnusedCandidates {
         attempts: Vec<crate::ai_serving::AiStreamAttempt>,
@@ -549,9 +551,17 @@ async fn process_settlement_commit(
                 status_code,
                 error_type,
                 error_message,
+                preserve_sticky_binding,
             } => {
                 lifecycle
-                    .abort_before_write(&state, status, status_code, error_type, error_message)
+                    .abort_before_write(
+                        &state,
+                        status,
+                        status_code,
+                        error_type,
+                        error_message,
+                        preserve_sticky_binding,
+                    )
                     .await;
             }
             CodexWsSettlementCommit::HandshakeFailure {
@@ -561,6 +571,7 @@ async fn process_settlement_commit(
                 error_type,
                 error_message,
                 error_body,
+                penalize_account,
             } => {
                 lifecycle
                     .settle_handshake_failure(
@@ -570,6 +581,7 @@ async fn process_settlement_commit(
                         error_type,
                         error_message,
                         error_body,
+                        penalize_account,
                     )
                     .await;
             }

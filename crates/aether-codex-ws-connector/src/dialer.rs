@@ -10,8 +10,8 @@ use futures_util::StreamExt;
 use rustls::pki_types::ServerName;
 use rustls::ClientConfig;
 use tokio::net::TcpStream;
-use tokio::time::sleep_until;
 use tokio::time::Instant;
+use tokio::time::{sleep, sleep_until};
 use tokio_rustls::TlsConnector;
 use tokio_tungstenite::client_async_tls_with_config;
 use tokio_tungstenite::connect_async_tls_with_config;
@@ -28,15 +28,18 @@ use tungstenite::Error as WebSocketError;
 use crate::AsyncIo;
 use crate::ConnectionInner;
 use crate::OutboundRoute;
+use crate::ProxyTunnelRetryKind;
 
 const HAPPY_EYEBALLS_DELAY: Duration = Duration::from_millis(250);
+const PROXY_CONNECT_RETRY_BACKOFF: Duration = Duration::from_millis(25);
 
 pub(crate) async fn connect(
     request: Request,
     config: WebSocketConfig,
     tls_config: Arc<ClientConfig>,
     route: OutboundRoute,
-) -> Result<(ConnectionInner, Response), WebSocketError> {
+) -> Result<(ConnectionInner, Response, Option<ProxyTunnelRetryKind>), WebSocketError> {
+    let mut proxy_retry_kind = None;
     let stream: Box<dyn AsyncIo> = match route {
         OutboundRoute::TransportDefault => {
             let (stream, response) = connect_async_tls_with_config(
@@ -46,7 +49,7 @@ pub(crate) async fn connect(
                 Some(Connector::Rustls(tls_config)),
             )
             .await?;
-            return Ok((ConnectionInner::TransportDefault(stream), response));
+            return Ok((ConnectionInner::TransportDefault(stream), response, None));
         }
         OutboundRoute::Direct => {
             let host = websocket_host(&request)?;
@@ -61,21 +64,11 @@ pub(crate) async fn connect(
             let proxy = ProxyEndpoint::parse(&url)?;
             let host = websocket_host(&request)?;
             let port = websocket_port(&request)?;
-            let stream = connect_tcp(proxy.config.authority())
-                .await
-                .map_err(WebSocketError::Io)?;
-            let stream: Box<dyn AsyncIo> = if proxy.tls {
-                let server_name = ServerName::try_from(proxy.config.host.clone())
-                    .map_err(|_| WebSocketError::Tls(TlsError::InvalidDnsName))?;
-                let stream = TlsConnector::from(Arc::clone(&tls_config))
-                    .connect(server_name, stream)
-                    .await
-                    .map_err(WebSocketError::Io)?;
-                Box::new(stream)
-            } else {
-                Box::new(stream)
-            };
-            connect_via_proxy(stream, &proxy.config, host, port).await?
+            let (stream, retry_kind) =
+                connect_proxy_with_retry(|| connect_proxy_tunnel(&proxy, &tls_config, host, port))
+                    .await?;
+            proxy_retry_kind = retry_kind;
+            stream
         }
     };
 
@@ -86,7 +79,63 @@ pub(crate) async fn connect(
         Some(Connector::Rustls(tls_config)),
     )
     .await?;
-    Ok((ConnectionInner::Routed(stream), response))
+    Ok((ConnectionInner::Routed(stream), response, proxy_retry_kind))
+}
+
+async fn connect_proxy_tunnel(
+    proxy: &ProxyEndpoint,
+    tls_config: &Arc<ClientConfig>,
+    host: &str,
+    port: u16,
+) -> Result<Box<dyn AsyncIo>, WebSocketError> {
+    let stream = connect_tcp(proxy.config.authority())
+        .await
+        .map_err(WebSocketError::Io)?;
+    let stream: Box<dyn AsyncIo> = if proxy.tls {
+        let server_name = ServerName::try_from(proxy.config.host.clone())
+            .map_err(|_| WebSocketError::Tls(TlsError::InvalidDnsName))?;
+        let stream = TlsConnector::from(Arc::clone(tls_config))
+            .connect(server_name, stream)
+            .await
+            .map_err(WebSocketError::Io)?;
+        Box::new(stream)
+    } else {
+        Box::new(stream)
+    };
+    connect_via_proxy(stream, &proxy.config, host, port).await
+}
+
+pub(crate) async fn connect_proxy_with_retry<T, F, Fut>(
+    mut connect: F,
+) -> Result<(T, Option<ProxyTunnelRetryKind>), WebSocketError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, WebSocketError>>,
+{
+    match connect().await {
+        Err(error) if is_retryable_proxy_tunnel_error(&error) => {
+            let retry_kind = proxy_tunnel_retry_kind(&error);
+            sleep(PROXY_CONNECT_RETRY_BACKOFF).await;
+            connect().await.map(|value| (value, Some(retry_kind)))
+        }
+        Ok(value) => Ok((value, None)),
+        Err(error) => Err(error),
+    }
+}
+
+fn proxy_tunnel_retry_kind(error: &WebSocketError) -> ProxyTunnelRetryKind {
+    match error {
+        WebSocketError::Io(_) => ProxyTunnelRetryKind::Io,
+        WebSocketError::Url(UrlError::ProxyConnect(_)) => ProxyTunnelRetryKind::ProxyConnect,
+        _ => unreachable!("only retryable proxy tunnel errors are classified"),
+    }
+}
+
+fn is_retryable_proxy_tunnel_error(error: &WebSocketError) -> bool {
+    matches!(
+        error,
+        WebSocketError::Io(_) | WebSocketError::Url(UrlError::ProxyConnect(_))
+    )
 }
 
 #[derive(Debug, PartialEq, Eq)]

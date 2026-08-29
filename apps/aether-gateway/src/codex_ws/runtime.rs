@@ -39,8 +39,9 @@ use crate::codex_profile::{
     CodexProfileRequestBodyPolicy,
 };
 use crate::orchestration::{
-    apply_local_execution_effect, prepare_pool_attempt_started_effect, LocalExecutionEffect,
-    LocalExecutionEffectContext, LocalFailoverClassification,
+    apply_local_execution_effect, local_execution_candidate_metadata_from_report_context,
+    prepare_pool_attempt_started_effect, LocalExecutionEffect, LocalExecutionEffectContext,
+    LocalFailoverClassification,
 };
 use crate::request_candidate_runtime::record_local_request_candidate_status;
 use crate::{AppState, GatewayError};
@@ -176,6 +177,7 @@ pub(crate) struct CodexWsCandidate {
     /// provider's physical WebSocket has connected.
     pub(crate) connect_plan: Option<aether_contracts::ExecutionPlan>,
     pub(crate) route: OutboundRoute,
+    pub(crate) sticky_binding_established: bool,
     pub(crate) timeouts: CodexWsTimeouts,
     pub(crate) lifecycle: Arc<CodexWsCandidateLifecycle>,
     /// Snapshot of the generic scheduler-affinity epoch used only to drain a
@@ -255,6 +257,17 @@ struct CodexWsHandshakeFailure {
     error_body: Option<String>,
     diagnostic_detail: Option<String>,
     route_reason: &'static str,
+    penalize_account: bool,
+}
+
+impl CodexWsHandshakeFailure {
+    const fn preparation_error(&self, sticky_binding_established: bool) -> StepPreparationError {
+        StepPreparationError {
+            reason: self.route_reason,
+            middle_route_disposition: MiddleRouteDisposition::Retain,
+            allow_candidate_failover: self.penalize_account || !sticky_binding_established,
+        }
+    }
 }
 
 impl CodexWsCandidate {
@@ -469,6 +482,9 @@ impl UsageReportReservation {
 pub(crate) struct StepPreparationError {
     pub(crate) reason: &'static str,
     pub(crate) middle_route_disposition: MiddleRouteDisposition,
+    /// Whether another account candidate may be tried before returning this error. Non-account
+    /// failures stop failover only when this request started from an established sticky binding.
+    pub(crate) allow_candidate_failover: bool,
 }
 
 impl StepPreparationError {
@@ -476,6 +492,7 @@ impl StepPreparationError {
         Self {
             reason,
             middle_route_disposition: MiddleRouteDisposition::Retain,
+            allow_candidate_failover: true,
         }
     }
 
@@ -483,6 +500,15 @@ impl StepPreparationError {
         Self {
             reason,
             middle_route_disposition: MiddleRouteDisposition::Exclude,
+            allow_candidate_failover: true,
+        }
+    }
+
+    pub(crate) const fn preserve_sticky(reason: &'static str) -> Self {
+        Self {
+            reason,
+            middle_route_disposition: MiddleRouteDisposition::Retain,
+            allow_candidate_failover: false,
         }
     }
 }
@@ -613,6 +639,7 @@ pub(crate) struct GatewayCodexWsRuntime {
 struct ConnectAttemptCancellationGuard {
     lifecycle: Arc<CodexWsCandidateLifecycle>,
     cleanup_permit: Option<tokio::sync::mpsc::OwnedPermit<CodexWsSettlementCommit>>,
+    preserve_sticky_binding: bool,
 }
 
 impl ConnectAttemptCancellationGuard {
@@ -620,6 +647,7 @@ impl ConnectAttemptCancellationGuard {
         Self {
             lifecycle: Arc::clone(&candidate.lifecycle),
             cleanup_permit: candidate.take_prewrite_cleanup_permit(),
+            preserve_sticky_binding: candidate.sticky_binding_established,
         }
     }
 
@@ -647,6 +675,7 @@ impl Drop for ConnectAttemptCancellationGuard {
                 status_code: None,
                 error_type: "codex_ws_candidate_future_cancelled",
                 error_message: "Codex WS candidate future was cancelled",
+                preserve_sticky_binding: self.preserve_sticky_binding,
             });
         }
     }
@@ -945,6 +974,7 @@ impl GatewayCodexWsRuntime {
                 record_health_failure.then_some(http::StatusCode::BAD_GATEWAY.as_u16()),
                 error_type,
                 error_message,
+                candidate.sticky_binding_established && !record_health_failure,
             )
             .await;
     }
@@ -1362,6 +1392,11 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
                 .report_kind
                 .clone()
                 .unwrap_or_else(|| "openai_responses_stream_success".to_string());
+            let sticky_metadata = local_execution_candidate_metadata_from_report_context(
+                attempt.report_context.as_ref(),
+            );
+            let sticky_binding_established = !sticky_metadata.pool_sticky_bound_key_ineligible
+                && sticky_metadata.pool_sticky_bound_key_id.as_deref() == Some(key_id.as_str());
             let report_context = compact_report_context_template(attempt.report_context.as_ref());
             let mapped_model = report_context
                 .as_ref()
@@ -1440,6 +1475,7 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
                 identity: first_step.official_identity.clone(),
                 connect_plan,
                 route: preflight.route,
+                sticky_binding_established,
                 timeouts,
                 lifecycle,
                 selected_scheduler_epoch,
@@ -1537,15 +1573,25 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
                     .expect("Codex candidate request was materialized before pool start");
                 let route = take_outbound_route_for_connect(&mut candidate.route);
                 let route_kind = CodexWsRouteKind::from_route(&route);
+                let proxy_endpoint = redacted_proxy_endpoint(&route);
+                let proxy_node_id = candidate
+                    .lifecycle
+                    .plan()
+                    .proxy
+                    .as_ref()
+                    .and_then(|proxy| proxy.node_id.as_deref())
+                    .unwrap_or("none");
                 let connect_result = tokio::time::timeout(
                     candidate.timeouts().connect,
                     self.connector.connect(request, route),
                 )
                 .await;
-                let (connection, response) = match connect_result {
+                let (connection, response, proxy_retry_kind) = match connect_result {
                     Ok(Ok(connected)) => connected,
                     Ok(Err(error)) => {
                         let failure = classify_codex_ws_handshake_failure(error, route_kind);
+                        let preparation_error =
+                            failure.preparation_error(candidate.sticky_binding_established);
                         tracing::warn!(
                             event_name = "codex_ws_handshake_failed",
                             log_type = "ops",
@@ -1561,7 +1607,7 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
                         )
                         .await?;
                         cancellation_guard.disarm();
-                        return Err(StepPreparationError::retain(failure.route_reason));
+                        return Err(preparation_error);
                     }
                     Err(_) => {
                         let failure = CodexWsHandshakeFailure {
@@ -1572,7 +1618,10 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
                             error_body: None,
                             diagnostic_detail: None,
                             route_reason: "official_ws_connect_timeout",
+                            penalize_account: false,
                         };
+                        let preparation_error =
+                            failure.preparation_error(candidate.sticky_binding_established);
                         self.enqueue_handshake_failure(
                             &candidate,
                             &mut cancellation_guard,
@@ -1580,9 +1629,26 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
                         )
                         .await?;
                         cancellation_guard.disarm();
-                        return Err(StepPreparationError::retain("official_ws_connect_timeout"));
+                        return Err(preparation_error);
                     }
                 };
+                if let Some(retry_kind) = proxy_retry_kind {
+                    tracing::warn!(
+                        event_name = "codex_ws_proxy_tunnel_retry",
+                        log_type = "ops",
+                        request_id = %candidate.lifecycle.original_request_id(),
+                        candidate_id = candidate.lifecycle.plan().candidate_id.as_deref().unwrap_or("none"),
+                        provider_id = %candidate.provider_id,
+                        endpoint_id = %candidate.endpoint_id,
+                        key_id = %candidate.key_id,
+                        proxy_node_id,
+                        proxy_endpoint = proxy_endpoint.as_deref().unwrap_or("none"),
+                        retry_error_kind = retry_kind.as_str(),
+                        retry_attempt = 2,
+                        retry_succeeded = true,
+                        "Codex WebSocket connected after retrying the proxy tunnel"
+                    );
+                }
                 let handshake_turn_state = response
                     .headers()
                     .get("x-codex-turn-state")
@@ -1622,6 +1688,8 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
                     }
                     Ok(Err(error)) => {
                         let failure = classify_standard_ws_handshake_failure(error);
+                        let preparation_error =
+                            failure.preparation_error(candidate.sticky_binding_established);
                         tracing::warn!(
                             event_name = "responses_websocket_handshake_failed",
                             log_type = "ops",
@@ -1637,7 +1705,7 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
                         )
                         .await?;
                         cancellation_guard.disarm();
-                        return Err(StepPreparationError::retain(failure.route_reason));
+                        return Err(preparation_error);
                     }
                     Err(_) => {
                         let failure = CodexWsHandshakeFailure {
@@ -1649,7 +1717,10 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
                             error_body: None,
                             diagnostic_detail: None,
                             route_reason: "responses_websocket_connect_timeout",
+                            penalize_account: false,
                         };
+                        let preparation_error =
+                            failure.preparation_error(candidate.sticky_binding_established);
                         self.enqueue_handshake_failure(
                             &candidate,
                             &mut cancellation_guard,
@@ -1657,7 +1728,7 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
                         )
                         .await?;
                         cancellation_guard.disarm();
-                        return Err(StepPreparationError::retain(failure.route_reason));
+                        return Err(preparation_error);
                     }
                 }
             }
@@ -1782,6 +1853,7 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
             status_code: None,
             error_type: "codex_ws_candidate_future_cancelled",
             error_message: "Codex WS candidate future was cancelled",
+            preserve_sticky_binding: candidate.sticky_binding_established,
         });
     }
 
@@ -2185,10 +2257,11 @@ impl GatewayCodexWsRuntime {
             error_type: failure.error_type.clone(),
             error_message: failure.error_message.clone(),
             error_body: failure.error_body.clone(),
+            penalize_account: failure.penalize_account,
         });
         candidate
             .lifecycle
-            .prepare_failover_after_handshake_failure(&self.state)
+            .prepare_after_handshake_failure(&self.state, failure.penalize_account)
             .await;
         Ok(())
     }
@@ -2273,6 +2346,7 @@ fn classify_codex_ws_handshake_failure(
                 error_body,
                 diagnostic_detail: Some(format!("http_status={status_code}")),
                 route_reason,
+                penalize_account: handshake_status_should_penalize_account(status_code),
             }
         }
         WebSocketError::Io(error) => {
@@ -2412,6 +2486,7 @@ fn classify_standard_ws_handshake_failure(
                 error_body,
                 diagnostic_detail: Some(format!("http_status={status_code}")),
                 route_reason,
+                penalize_account: handshake_status_should_penalize_account(status_code),
             }
         }
         super::standard_transport::StandardWebSocketConnectError::Transport(error) => {
@@ -2423,6 +2498,7 @@ fn classify_standard_ws_handshake_failure(
                 error_body: None,
                 diagnostic_detail: Some(error.0),
                 route_reason: "responses_websocket_handshake_failed",
+                penalize_account: false,
             }
         }
     }
@@ -2442,7 +2518,12 @@ fn transport_handshake_failure(
         error_body: diagnostic_detail.clone(),
         diagnostic_detail,
         route_reason,
+        penalize_account: false,
     }
+}
+
+const fn handshake_status_should_penalize_account(status_code: u16) -> bool {
+    matches!(status_code, 401 | 402 | 403 | 409 | 429)
 }
 
 fn handshake_utf8_diagnostic(error: &str) -> String {
@@ -2580,6 +2661,7 @@ fn url_error_kind_name(error: &WebSocketUrlError) -> &'static str {
 
 fn proxy_connect_diagnostic(detail: &str) -> String {
     const HTTP_STATUS_PREFIX: &str = "HTTP CONNECT failed with status ";
+    const SOCKS5_REPLY_PREFIX: &str = "SOCKS5: connection failed with code ";
     if let Some(status) = detail
         .strip_prefix(HTTP_STATUS_PREFIX)
         .and_then(|status| status.parse::<u16>().ok())
@@ -2588,13 +2670,37 @@ fn proxy_connect_diagnostic(detail: &str) -> String {
         return format!("proxy_connect_http_status={status}");
     }
 
+    if let Some(code) = detail
+        .strip_prefix(SOCKS5_REPLY_PREFIX)
+        .and_then(|code| code.parse::<u8>().ok())
+    {
+        let reason = match code {
+            1 => "general_failure",
+            2 => "connection_not_allowed",
+            3 => "network_unreachable",
+            4 => "host_unreachable",
+            5 => "connection_refused",
+            6 => "ttl_expired",
+            7 => "command_not_supported",
+            8 => "address_type_not_supported",
+            _ => return format!("proxy_connect_socks5_reply_code={code}"),
+        };
+        return format!("proxy_connect_reason=socks5_{reason}");
+    }
+
     let reason = match detail {
         "HTTP CONNECT response too large" => "response_too_large",
+        "HTTP CONNECT response not valid UTF-8" => "invalid_response_encoding",
+        "HTTP CONNECT response missing status line" => "missing_status_line",
+        "HTTP CONNECT response missing status code" => "missing_status_code",
+        "HTTP CONNECT response invalid status code" => "invalid_status_code",
         "SOCKS5: proxy requested auth, but none provided" => "auth_required",
         "SOCKS5: no acceptable authentication method" => "no_acceptable_auth_method",
         "SOCKS5: unsupported authentication method" => "unsupported_auth_method",
+        "SOCKS5 auth credentials too long" => "auth_credentials_too_long",
         "SOCKS5 authentication failed" => "authentication_failed",
         "SOCKS5: invalid response version" => "invalid_response_version",
+        "SOCKS5 domain name too long" => "domain_name_too_long",
         "SOCKS5: invalid address type" => "invalid_address_type",
         _ => return "url_kind=proxy_connect".to_string(),
     };
@@ -3047,6 +3153,22 @@ fn outbound_route(proxy: Option<&aether_contracts::ProxySnapshot>) -> Option<Out
     let scheme = url::Url::parse(url).ok()?.scheme().to_ascii_lowercase();
     matches!(scheme.as_str(), "http" | "https" | "socks5" | "socks5h")
         .then(|| OutboundRoute::proxy(url))
+}
+
+fn redacted_proxy_endpoint(route: &OutboundRoute) -> Option<String> {
+    let OutboundRoute::Proxy { url } = route else {
+        return None;
+    };
+    let parsed = url::Url::parse(url).ok()?;
+    let host = match parsed.host()? {
+        url::Host::Domain(host) => host.to_string(),
+        url::Host::Ipv4(host) => host.to_string(),
+        url::Host::Ipv6(host) => format!("[{host}]"),
+    };
+    Some(match parsed.port_or_known_default() {
+        Some(port) => format!("{}://{host}:{port}", parsed.scheme()),
+        None => format!("{}://{host}", parsed.scheme()),
+    })
 }
 
 fn compact_proxy_for_plan(
@@ -3704,9 +3826,18 @@ mod tests {
                 StepPreparationError {
                     reason,
                     middle_route_disposition: MiddleRouteDisposition::Retain,
+                    allow_candidate_failover: true,
                 }
             );
         }
+        assert_eq!(
+            StepPreparationError::preserve_sticky("transport_failure"),
+            StepPreparationError {
+                reason: "transport_failure",
+                middle_route_disposition: MiddleRouteDisposition::Retain,
+                allow_candidate_failover: false,
+            }
+        );
     }
 
     fn usage_plan_with_body() -> aether_contracts::ExecutionPlan {
@@ -3885,6 +4016,17 @@ mod tests {
     }
 
     #[test]
+    fn proxy_retry_endpoint_redacts_credentials_path_and_query() {
+        let route =
+            OutboundRoute::proxy("socks5h://user:secret@proxy.example:1080/private?token=secret");
+
+        assert_eq!(
+            redacted_proxy_endpoint(&route).as_deref(),
+            Some("socks5h://proxy.example:1080")
+        );
+    }
+
+    #[test]
     fn handshake_http_classification_keeps_body_out_of_diagnostics() {
         let secret_body = br#"{"error":{"message":"provider-secret"}}"#.to_vec();
         let response = http::Response::builder()
@@ -3897,6 +4039,7 @@ mod tests {
         );
 
         assert_eq!(failure.error_type, "codex_ws_handshake_unauthorized");
+        assert!(failure.penalize_account);
         assert!(failure
             .error_body
             .as_deref()
@@ -3923,6 +4066,7 @@ mod tests {
         );
 
         assert_eq!(failure.status_code, 429);
+        assert!(failure.penalize_account);
         assert_eq!(
             failure.error_type,
             "responses_websocket_handshake_rate_limited"
@@ -3959,6 +4103,9 @@ mod tests {
         );
 
         assert_eq!(failure.error_type, "codex_ws_handshake_proxy_io_error");
+        assert!(!failure.penalize_account);
+        assert!(!failure.preparation_error(true).allow_candidate_failover);
+        assert!(failure.preparation_error(false).allow_candidate_failover);
         assert_eq!(
             failure.diagnostic_detail.as_deref(),
             Some("io_kind=connection_reset")
@@ -3977,6 +4124,9 @@ mod tests {
         );
 
         assert_eq!(failure.error_type, "codex_ws_handshake_proxy_connect_error");
+        assert!(!failure.penalize_account);
+        assert!(!failure.preparation_error(true).allow_candidate_failover);
+        assert!(failure.preparation_error(false).allow_candidate_failover);
         assert_eq!(
             failure.diagnostic_detail.as_deref(),
             Some("url_kind=proxy_connect")
@@ -3999,6 +4149,93 @@ mod tests {
             Some("proxy_connect_http_status=407")
         );
         assert_eq!(failure.error_body, failure.diagnostic_detail);
+    }
+
+    #[test]
+    fn handshake_proxy_connect_classification_retains_safe_socks5_reply() {
+        let failure = classify_codex_ws_handshake_failure(
+            WebSocketError::Url(WebSocketUrlError::ProxyConnect(
+                "SOCKS5: connection failed with code 4".into(),
+            )),
+            CodexWsRouteKind::Proxy,
+        );
+
+        assert_eq!(
+            failure.diagnostic_detail.as_deref(),
+            Some("proxy_connect_reason=socks5_host_unreachable")
+        );
+        assert_eq!(failure.error_body, failure.diagnostic_detail);
+    }
+
+    #[test]
+    fn handshake_failover_respects_failure_kind_and_existing_sticky_binding() {
+        let upstream = http::Response::builder()
+            .status(http::StatusCode::BAD_GATEWAY)
+            .body(None::<Vec<u8>>)
+            .expect("HTTP response should build");
+        let proxy_failure = classify_codex_ws_handshake_failure(
+            WebSocketError::Http(Box::new(upstream)),
+            CodexWsRouteKind::Proxy,
+        );
+        assert!(!proxy_failure.penalize_account);
+        assert!(
+            !proxy_failure
+                .preparation_error(true)
+                .allow_candidate_failover
+        );
+        assert!(
+            proxy_failure
+                .preparation_error(false)
+                .allow_candidate_failover
+        );
+
+        let account = http::Response::builder()
+            .status(http::StatusCode::TOO_MANY_REQUESTS)
+            .body(None::<Vec<u8>>)
+            .expect("HTTP response should build");
+        let account_failure = classify_codex_ws_handshake_failure(
+            WebSocketError::Http(Box::new(account)),
+            CodexWsRouteKind::Proxy,
+        );
+        assert!(account_failure.penalize_account);
+        assert!(
+            account_failure
+                .preparation_error(true)
+                .allow_candidate_failover
+        );
+
+        let direct_failure = classify_codex_ws_handshake_failure(
+            WebSocketError::Io(std::io::Error::other("connection reset")),
+            CodexWsRouteKind::Direct,
+        );
+        assert!(!direct_failure.penalize_account);
+        assert!(
+            !direct_failure
+                .preparation_error(true)
+                .allow_candidate_failover
+        );
+        assert!(
+            direct_failure
+                .preparation_error(false)
+                .allow_candidate_failover
+        );
+
+        let standard_failure = classify_standard_ws_handshake_failure(
+            crate::codex_ws::standard_transport::StandardWebSocketConnectError::Transport(
+                PeerError("connection reset".to_string()),
+            ),
+        );
+        assert!(!standard_failure.penalize_account);
+        assert!(
+            !standard_failure
+                .preparation_error(true)
+                .allow_candidate_failover
+        );
+        assert!(
+            standard_failure
+                .preparation_error(false)
+                .allow_candidate_failover
+        );
     }
 
     #[test]

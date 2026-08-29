@@ -19,8 +19,7 @@ pub(crate) use self::adaptive::{
 };
 pub(crate) use self::attempt::{
     attempt_identity_from_report_context, build_local_attempt_identities,
-    insert_pool_key_lease_report_context_fields,
-    insert_pool_sticky_bound_key_ineligible_report_context_field,
+    insert_pool_key_lease_report_context_fields, insert_pool_sticky_binding_report_context_fields,
     insert_pool_sticky_init_owner_report_context_field,
     insert_pool_sticky_session_token_report_context_field, local_attempt_slot_count,
     local_execution_candidate_metadata_from_report_context, ExecutionAttemptIdentity,
@@ -33,7 +32,7 @@ pub(crate) use self::classifier::{
 };
 pub(crate) use self::effects::{
     apply_local_execution_effect, apply_local_pool_terminal_effect_after_lease_release,
-    prepare_pool_attempt_started_effect, prepare_pool_failover_after_candidate_failure,
+    prepare_pool_after_handshake_failure, prepare_pool_attempt_started_effect,
     release_local_pool_key_lease_for_attempt, release_local_pool_key_lease_for_attempt_strict,
     release_pool_sticky_initialization_for_owner, stop_local_pool_sticky_init_renewer_for_attempt,
     LocalAdaptiveRateLimitEffect, LocalAdaptiveSuccessEffect, LocalAttemptFailureEffect,

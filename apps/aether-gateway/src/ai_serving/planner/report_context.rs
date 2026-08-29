@@ -21,8 +21,7 @@ use crate::client_session_affinity::{
     client_session_affinity_report_context_value, CLIENT_SESSION_AFFINITY_REPORT_CONTEXT_FIELD,
 };
 use crate::orchestration::{
-    insert_pool_key_lease_report_context_fields,
-    insert_pool_sticky_bound_key_ineligible_report_context_field,
+    insert_pool_key_lease_report_context_fields, insert_pool_sticky_binding_report_context_fields,
     insert_pool_sticky_init_owner_report_context_field,
     insert_pool_sticky_session_token_report_context_field, ExecutionAttemptIdentity,
     SCHEDULER_AFFINITY_EPOCH_REPORT_FIELD,
@@ -156,7 +155,7 @@ pub(crate) fn build_local_execution_report_context(
         &mut extra_fields,
         parts.pool_sticky_session_token,
     );
-    insert_pool_sticky_bound_key_ineligible_report_context_field(
+    insert_pool_sticky_binding_report_context_fields(
         &mut extra_fields,
         parts.pool_sticky_bound_key_ineligible,
         parts.pool_sticky_bound_key_id,

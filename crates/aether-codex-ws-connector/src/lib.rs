@@ -73,6 +73,25 @@ impl OutboundRoute {
     }
 }
 
+/// The first proxy-tunnel failure that triggered the connector's bounded retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyTunnelRetryKind {
+    /// TCP, proxy TLS, or tunnel I/O failed.
+    Io,
+    /// The HTTP CONNECT or SOCKS5 negotiation was rejected.
+    ProxyConnect,
+}
+
+impl ProxyTunnelRetryKind {
+    /// Returns the stable value used by gateway telemetry.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Io => "io",
+            Self::ProxyConnect => "proxy_connect",
+        }
+    }
+}
+
 impl fmt::Debug for OutboundRoute {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -115,14 +134,14 @@ impl CodexWebSocketConnector {
         &self,
         request: Request,
         route: OutboundRoute,
-    ) -> Result<(WebSocketConnection, Response), WebSocketError> {
+    ) -> Result<(WebSocketConnection, Response, Option<ProxyTunnelRetryKind>), WebSocketError> {
         validate_handshake_header_values(&request)?;
         let tls_config = self
             .fresh_tls_config()
             .map_err(|error| WebSocketError::Io(std::io::Error::other(error)))?;
-        let (inner, response) =
+        let (inner, response, proxy_retry_kind) =
             dialer::connect(request, codex_websocket_config(), tls_config, route).await?;
-        Ok((WebSocketConnection { inner }, response))
+        Ok((WebSocketConnection { inner }, response, proxy_retry_kind))
     }
 
     fn fresh_tls_config(&self) -> Result<Arc<ClientConfig>, ConnectorBuildError> {

@@ -26,6 +26,7 @@ use tungstenite::Message;
 
 use super::*;
 use crate::dialer::connect_happy_eyeballs;
+use crate::dialer::connect_proxy_with_retry;
 use crate::dialer::ProxyEndpoint;
 
 const TEST_CERTIFICATE_DER_BASE64: &str = concat!(
@@ -108,10 +109,11 @@ async fn public_connector_negotiates_permessage_deflate_and_exposes_stream_and_s
     let connector = CodexWebSocketConnector::with_root_store(RootCertStore::empty())
         .expect("connector should build");
 
-    let (mut websocket, _) = connector
+    let (mut websocket, _, retry_kind) = connector
         .connect(request, OutboundRoute::Direct)
         .await
         .expect("websocket handshake should succeed");
+    assert_eq!(retry_kind, None);
     let expected = Message::Text("hello".into());
     websocket
         .send(expected.clone())
@@ -141,7 +143,7 @@ async fn direct_route_connects_secure_websocket() {
         .into_client_request()
         .expect("websocket request should build");
 
-    let (websocket, _) = connector
+    let (websocket, _, _) = connector
         .connect(request, OutboundRoute::Direct)
         .await
         .expect("direct websocket handshake should succeed");
@@ -168,6 +170,69 @@ async fn socks5_proxy_tunnels_secure_websocket_before_handshake() {
 #[tokio::test]
 async fn authenticated_socks5_proxy_tunnels_secure_websocket_before_handshake() {
     assert_socks5_tunnels_secure_websocket(true).await;
+}
+
+#[tokio::test]
+async fn proxy_connect_failure_is_retried_once_before_websocket_handshake() {
+    let mut attempts = 0;
+    let result = connect_proxy_with_retry(|| {
+        attempts += 1;
+        let attempt = attempts;
+        async move {
+            if attempt == 1 {
+                Err(WebSocketError::Url(WebSocketUrlError::ProxyConnect(
+                    "SOCKS5: connection failed with code 4".into(),
+                )))
+            } else {
+                Ok("connected")
+            }
+        }
+    })
+    .await;
+
+    let (connected, retry_kind) = result.expect("the bounded proxy retry should succeed");
+    assert_eq!(connected, "connected");
+    assert_eq!(retry_kind, Some(ProxyTunnelRetryKind::ProxyConnect));
+    assert_eq!(attempts, 2);
+}
+
+#[tokio::test]
+async fn non_retryable_proxy_tunnel_failure_is_not_retried() {
+    let mut attempts = 0;
+    let result = connect_proxy_with_retry(|| {
+        attempts += 1;
+        async { Err::<(), _>(WebSocketError::Tls(WebSocketTlsError::InvalidDnsName)) }
+    })
+    .await;
+
+    assert!(matches!(
+        result,
+        Err(WebSocketError::Tls(WebSocketTlsError::InvalidDnsName))
+    ));
+    assert_eq!(attempts, 1);
+}
+
+#[tokio::test]
+async fn proxy_io_failure_is_retried_once() {
+    let mut attempts = 0;
+    let result = connect_proxy_with_retry(|| {
+        attempts += 1;
+        let attempt = attempts;
+        async move {
+            if attempt == 1 {
+                Err(WebSocketError::Io(std::io::Error::other(
+                    "connection reset",
+                )))
+            } else {
+                Ok(())
+            }
+        }
+    })
+    .await;
+
+    let ((), retry_kind) = result.expect("the bounded proxy retry should succeed");
+    assert_eq!(retry_kind, Some(ProxyTunnelRetryKind::Io));
+    assert_eq!(attempts, 2);
 }
 
 #[test]
@@ -377,7 +442,7 @@ async fn assert_proxy_tunnels_secure_websocket(proxy_tls: bool) {
     let request = format!("wss://{target_authority}/v1/responses")
         .into_client_request()
         .expect("websocket request should build");
-    let (websocket, _) = connector
+    let (websocket, _, _) = connector
         .connect(
             request,
             OutboundRoute::proxy(format!("{proxy_scheme}://localhost:{}", proxy_addr.port())),
@@ -522,7 +587,7 @@ async fn assert_socks5_tunnels_secure_websocket(authenticated: bool) {
     } else {
         format!("socks5h://localhost:{}", proxy_addr.port())
     };
-    let (websocket, _) = connector
+    let (websocket, _, _) = connector
         .connect(request, OutboundRoute::proxy(proxy_url))
         .await
         .expect("SOCKS5-proxied websocket handshake should succeed");

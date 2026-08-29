@@ -8,7 +8,7 @@ use aether_scheduler_core::SchedulerRequestCandidateStatusUpdate;
 
 use crate::orchestration::{
     apply_local_execution_effect, apply_local_pool_terminal_effect_after_lease_release,
-    prepare_pool_failover_after_candidate_failure, release_local_pool_key_lease_for_attempt_strict,
+    prepare_pool_after_handshake_failure, release_local_pool_key_lease_for_attempt_strict,
     resolve_local_failover_analysis_for_attempt, stop_local_pool_sticky_init_renewer_for_attempt,
     LocalAdaptiveRateLimitEffect, LocalAdaptiveSuccessEffect, LocalAttemptFailureEffect,
     LocalExecutionEffect, LocalExecutionEffectContext, LocalFailoverClassification,
@@ -39,6 +39,9 @@ pub(crate) enum CodexWsStepDisposition {
         error_type: String,
         error_message: String,
         error_body: Option<String>,
+        /// False for pre-write transport/provider-path failures that are not evidence against
+        /// the selected account.
+        penalize_account: bool,
     },
     StreamTimeout {
         error_type: String,
@@ -283,6 +286,7 @@ impl CodexWsCandidateLifecycle {
         status_code: Option<u16>,
         error_type: &'static str,
         error_message: &str,
+        preserve_sticky_binding: bool,
     ) -> bool {
         let Some(terminal_claim) = self.claim_terminal() else {
             return false;
@@ -297,7 +301,11 @@ impl CodexWsCandidateLifecycle {
             apply_local_pool_terminal_effect_after_lease_release(
                 state,
                 context,
-                LocalExecutionEffect::PoolAttemptAborted,
+                if preserve_sticky_binding {
+                    LocalExecutionEffect::PoolNonAccountFailure
+                } else {
+                    LocalExecutionEffect::PoolAttemptAborted
+                },
             ),
         )
         .await
@@ -325,21 +333,23 @@ impl CodexWsCandidateLifecycle {
         {
             return false;
         }
-        if let Some(status_code) = status_code {
-            if !run_settlement_phase(
-                &self.settlement_progress.health_state,
-                apply_local_execution_effect(
-                    state,
-                    context,
-                    LocalExecutionEffect::HealthFailure(LocalHealthFailureEffect {
-                        status_code,
-                        classification: LocalFailoverClassification::RetryUpstreamFailure,
-                    }),
-                ),
-            )
-            .await
-            {
-                return false;
+        if !preserve_sticky_binding {
+            if let Some(status_code) = status_code {
+                if !run_settlement_phase(
+                    &self.settlement_progress.health_state,
+                    apply_local_execution_effect(
+                        state,
+                        context,
+                        LocalExecutionEffect::HealthFailure(LocalHealthFailureEffect {
+                            status_code,
+                            classification: LocalFailoverClassification::RetryUpstreamFailure,
+                        }),
+                    ),
+                )
+                .await
+                {
+                    return false;
+                }
             }
         }
         terminal_claim.complete();
@@ -354,12 +364,14 @@ impl CodexWsCandidateLifecycle {
         error_type: String,
         error_message: String,
         error_body: Option<String>,
+        penalize_account: bool,
     ) {
         let disposition = CodexWsStepDisposition::ProviderFailure {
             status_code,
             error_type,
             error_message,
             error_body: error_body.clone(),
+            penalize_account,
         };
         let payload = GatewayStreamReportRequest {
             trace_id: self.original_request_id().to_string(),
@@ -399,16 +411,21 @@ impl CodexWsCandidateLifecycle {
         true
     }
 
-    /// Releases scheduling state needed by the next candidate. The full failure settlement has
-    /// already been queued, so cancellation during this fast path cannot lose terminal cleanup.
-    pub(crate) async fn prepare_failover_after_handshake_failure(&self, state: &AppState) {
+    /// Releases the attempt lease after a handshake failure. Only explicit account failures clear
+    /// an established sticky binding; other failures only release this attempt's initialization.
+    pub(crate) async fn prepare_after_handshake_failure(
+        &self,
+        state: &AppState,
+        penalize_account: bool,
+    ) {
         let _ = self.release_pool_lease_once(state).await;
-        prepare_pool_failover_after_candidate_failure(
+        prepare_pool_after_handshake_failure(
             state,
             LocalExecutionEffectContext {
                 plan: self.plan(),
                 report_context: self.report_context(),
             },
+            penalize_account,
         )
         .await;
     }
@@ -525,20 +542,30 @@ impl CodexWsCandidateLifecycle {
             CodexWsStepDisposition::ProviderFailure {
                 status_code,
                 error_body,
+                penalize_account,
                 ..
             } => {
-                apply_local_pool_terminal_effect_after_lease_release(
-                    state,
-                    context,
-                    LocalExecutionEffect::PoolError(LocalPoolErrorEffect {
-                        status_code: *status_code,
-                        classification: failure_classification
-                            .unwrap_or(LocalFailoverClassification::UseDefault),
-                        headers: &payload.headers,
-                        error_body: error_body.as_deref().or(terminal_error_body),
-                    }),
-                )
-                .await;
+                if *penalize_account {
+                    apply_local_pool_terminal_effect_after_lease_release(
+                        state,
+                        context,
+                        LocalExecutionEffect::PoolError(LocalPoolErrorEffect {
+                            status_code: *status_code,
+                            classification: failure_classification
+                                .unwrap_or(LocalFailoverClassification::UseDefault),
+                            headers: &payload.headers,
+                            error_body: error_body.as_deref().or(terminal_error_body),
+                        }),
+                    )
+                    .await;
+                } else {
+                    apply_local_pool_terminal_effect_after_lease_release(
+                        state,
+                        context,
+                        LocalExecutionEffect::PoolNonAccountFailure,
+                    )
+                    .await;
+                }
             }
             CodexWsStepDisposition::StreamTimeout { .. } => {
                 apply_local_pool_terminal_effect_after_lease_release(
@@ -830,6 +857,7 @@ async fn resolve_step_failure_classification(
         CodexWsStepDisposition::ProviderFailure {
             status_code,
             error_body,
+            penalize_account: true,
             ..
         } => Some(
             resolve_local_failover_analysis_for_attempt(
@@ -842,6 +870,10 @@ async fn resolve_step_failure_classification(
             .await
             .classification,
         ),
+        CodexWsStepDisposition::ProviderFailure {
+            penalize_account: false,
+            ..
+        } => None,
         CodexWsStepDisposition::StreamTimeout { .. } => Some(
             resolve_local_failover_analysis_for_attempt(
                 state,
@@ -900,6 +932,7 @@ async fn apply_step_health_effects(
         CodexWsStepDisposition::ProviderFailure {
             status_code,
             error_body,
+            penalize_account: true,
             ..
         } => {
             if !apply_failure_health_effects(
@@ -916,6 +949,10 @@ async fn apply_step_health_effects(
                 return false;
             }
         }
+        CodexWsStepDisposition::ProviderFailure {
+            penalize_account: false,
+            ..
+        } => {}
         CodexWsStepDisposition::StreamTimeout { .. } => {
             if !apply_failure_health_effects(
                 state,

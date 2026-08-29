@@ -1209,6 +1209,7 @@ async fn connect_candidates_for_step(
         let Some(candidate) = remaining_candidates.next() else {
             break;
         };
+        let preserve_sticky_on_timeout = candidate.sticky_binding_established;
         step_usage.bind(&candidate, step);
         let connect_result = match tokio::time::timeout_at(
             connect_deadline,
@@ -1219,9 +1220,11 @@ async fn connect_candidates_for_step(
             Ok(Some(connect_result)) => connect_result,
             Ok(None) => return Err(CandidateConnectionError::ClientClosed),
             Err(_) => {
-                last_connect_error = Some(StepPreparationError::retain(
-                    "initial_connect_budget_exhausted",
-                ));
+                last_connect_error = Some(if preserve_sticky_on_timeout {
+                    StepPreparationError::preserve_sticky("initial_connect_budget_exhausted")
+                } else {
+                    StepPreparationError::retain("initial_connect_budget_exhausted")
+                });
                 break;
             }
         };
@@ -1230,7 +1233,15 @@ async fn connect_candidates_for_step(
                 remaining_candidates.finish();
                 return Ok(connected);
             }
-            Err(error) => last_connect_error = Some(error),
+            Err(error) => {
+                // Non-account failures preserve an established sticky account. A candidate that
+                // was only being initialized may still fail over before any provider write.
+                let allow_candidate_failover = error.allow_candidate_failover;
+                last_connect_error = Some(error);
+                if !allow_candidate_failover {
+                    break;
+                }
+            }
         }
     }
     let error = runtime
@@ -1726,6 +1737,7 @@ impl StepOutcome {
                 error_type: error_type.to_string(),
                 error_message: error_message.to_string(),
                 error_body: None,
+                penalize_account: true,
             },
             terminal_frames: None,
         }
@@ -1811,6 +1823,7 @@ fn terminal_outcome(
                 error_type,
                 error_message,
                 error_body,
+                penalize_account: true,
             },
             terminal_frames: Some(terminal_frames),
         }
@@ -2763,6 +2776,7 @@ mod tests {
     struct TestRuntime {
         official: Mutex<VecDeque<Box<dyn RelayPeer>>>,
         fail_first_connect: bool,
+        sticky_binding_established: AtomicBool,
         connect_delays: Mutex<VecDeque<Duration>>,
         handshake_turn_state: Mutex<Option<String>>,
         prepare_delay: Mutex<Option<Duration>>,
@@ -2814,6 +2828,7 @@ mod tests {
             Self {
                 official: Mutex::new(VecDeque::from([official])),
                 fail_first_connect,
+                sticky_binding_established: AtomicBool::new(false),
                 connect_delays: Mutex::new(VecDeque::new()),
                 handshake_turn_state: Mutex::new(None),
                 prepare_delay: Mutex::new(None),
@@ -2860,6 +2875,11 @@ mod tests {
                 .push_back(delay);
         }
 
+        fn use_established_sticky_binding(&self) {
+            self.sticky_binding_established
+                .store(true, Ordering::Release);
+        }
+
         fn push_official(&self, official: Box<dyn RelayPeer>) {
             self.official
                 .lock()
@@ -2887,6 +2907,8 @@ mod tests {
             provider_id: &str,
         ) -> CodexWsCandidate {
             let mut candidate = candidate(first_step, provider_id);
+            candidate.sticky_binding_established =
+                self.sticky_binding_established.load(Ordering::Acquire);
             if let Some(timeouts) = self.timeouts.lock().expect("timeouts should lock").clone() {
                 let attempt = candidate
                     .attempt
@@ -2974,7 +2996,11 @@ mod tests {
                     .lock()
                     .expect("aborted candidates should lock")
                     .push(candidate.provider_id.clone());
-                return Err(StepPreparationError::exclude("planned_handshake_failure"));
+                return Err(if candidate.sticky_binding_established {
+                    StepPreparationError::preserve_sticky("planned_handshake_failure")
+                } else {
+                    StepPreparationError::exclude("planned_handshake_failure")
+                });
             }
             let peer = self
                 .official
@@ -3329,6 +3355,7 @@ mod tests {
             identity: step.official_identity.clone(),
             connect_plan: None,
             route: OutboundRoute::Direct,
+            sticky_binding_established: false,
             timeouts,
             lifecycle,
             selected_scheduler_epoch: 7,
@@ -3422,6 +3449,7 @@ mod tests {
                 error_type: "codex_ws_official_rate_limit_exceeded".into(),
                 error_message: "retry later".into(),
                 error_body: Some(r#"{"error":{"code":"rate_limit_exceeded"}}"#.into()),
+                penalize_account: true,
             }
         );
     }
@@ -3852,6 +3880,34 @@ mod tests {
             .lock()
             .expect("client frames should lock")
             .contains(&relay_text(terminal)));
+    }
+
+    #[tokio::test]
+    async fn established_sticky_transport_failure_does_not_try_another_candidate() {
+        let (official, _) = ScriptedPeer::new([]);
+        let runtime = TestRuntime::new(Box::new(official), true);
+        runtime.use_established_sticky_binding();
+        let (client, _) = ScriptedPeer::new([(Duration::ZERO, relay_text(request()))]);
+
+        run_codex_ws_session(Box::new(client), &runtime).await;
+
+        assert_eq!(runtime.connect_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(runtime.prepare_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(runtime.rejected_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            *runtime
+                .rejected_reasons
+                .lock()
+                .expect("rejected reasons should lock"),
+            vec!["planned_handshake_failure"]
+        );
+        assert_eq!(
+            *runtime
+                .unused_candidates
+                .lock()
+                .expect("unused candidates should lock"),
+            vec!["provider-selected", "provider-unused"]
+        );
     }
 
     #[tokio::test]

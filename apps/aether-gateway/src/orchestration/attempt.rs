@@ -34,6 +34,7 @@ pub(crate) struct LocalExecutionCandidateMetadata {
     pub(crate) pool_sticky_init_owner: Option<String>,
     pub(crate) pool_sticky_session_token: Option<String>,
     pub(crate) pool_sticky_bound_key_ineligible: bool,
+    /// The selected existing binding, or the previous binding when `ineligible` is true.
     pub(crate) pool_sticky_bound_key_id: Option<String>,
     pub(crate) pool_sticky_bound_key_ineligible_reason: Option<String>,
     pub(crate) scheduler_affinity_epoch: Option<u64>,
@@ -142,26 +143,26 @@ pub(crate) fn insert_pool_sticky_session_token_report_context_field(
     );
 }
 
-pub(crate) fn insert_pool_sticky_bound_key_ineligible_report_context_field(
+pub(crate) fn insert_pool_sticky_binding_report_context_fields(
     extra_fields: &mut serde_json::Map<String, Value>,
     ineligible: bool,
     bound_key_id: Option<&str>,
     reason: Option<&str>,
 ) {
+    if let Some(bound_key_id) = bound_key_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        extra_fields.insert(
+            POOL_STICKY_BOUND_KEY_ID_REPORT_FIELD.to_string(),
+            Value::String(bound_key_id.to_string()),
+        );
+    }
     if ineligible {
         extra_fields.insert(
             POOL_STICKY_BOUND_KEY_INELIGIBLE_REPORT_FIELD.to_string(),
             Value::Bool(true),
         );
-        if let Some(bound_key_id) = bound_key_id
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            extra_fields.insert(
-                POOL_STICKY_BOUND_KEY_ID_REPORT_FIELD.to_string(),
-                Value::String(bound_key_id.to_string()),
-            );
-        }
         if let Some(reason) = reason.map(str::trim).filter(|value| !value.is_empty()) {
             extra_fields.insert(
                 POOL_STICKY_BOUND_KEY_INELIGIBLE_REASON_REPORT_FIELD.to_string(),
@@ -286,8 +287,10 @@ mod tests {
 
     use super::{
         attempt_identity_from_report_context, build_local_attempt_identities,
+        insert_pool_sticky_binding_report_context_fields,
         local_execution_candidate_metadata_from_report_context, ExecutionAttemptIdentity,
-        LocalExecutionCandidateMetadata,
+        LocalExecutionCandidateMetadata, POOL_STICKY_BOUND_KEY_ID_REPORT_FIELD,
+        POOL_STICKY_BOUND_KEY_INELIGIBLE_REPORT_FIELD,
     };
     use crate::provider_transport::snapshot::{
         GatewayProviderTransportEndpoint, GatewayProviderTransportKey,
@@ -611,5 +614,20 @@ mod tests {
                 scheduler_affinity_epoch: None,
             }
         );
+    }
+
+    #[test]
+    fn sticky_bound_key_id_is_recorded_without_marking_the_key_ineligible() {
+        let mut fields = serde_json::Map::new();
+
+        insert_pool_sticky_binding_report_context_fields(&mut fields, false, Some("key-1"), None);
+
+        assert_eq!(
+            fields
+                .get(POOL_STICKY_BOUND_KEY_ID_REPORT_FIELD)
+                .and_then(serde_json::Value::as_str),
+            Some("key-1")
+        );
+        assert!(!fields.contains_key(POOL_STICKY_BOUND_KEY_INELIGIBLE_REPORT_FIELD));
     }
 }

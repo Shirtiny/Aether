@@ -230,6 +230,7 @@ Aether Tunnel 是配套的正向代理节点，部署在海外 VPS 上，为墙�
 ## 功能与运维文档
 
 - [Codex 官方 WebSocket：配置、账号控制、TLS profile、调度与上线门禁](docs/codex-websocket.md)
+- [Codex Pro 请求失败调查与处置记录（2026-08-28）](docs/operations/codex-pro-request-failures-2026-08-28.md)
 - [Grok 迁移到 xAI OAuth](docs/grok-xai-oauth-migration.md)
 - [Redis runtime 运维手册](docs/operations/redis-runtime-runbook.md)
 

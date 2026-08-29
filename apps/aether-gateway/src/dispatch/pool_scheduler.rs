@@ -1334,6 +1334,8 @@ impl<'a> PoolKeyCursor<'a> {
             candidate.orchestration.pool_key_index = Some(self.next_pool_key_index);
             if origin == QueuedPoolCandidateOrigin::StickyHit {
                 self.prepare_deferred_sticky_reinitializer();
+                candidate.orchestration.pool_sticky_bound_key_id =
+                    Some(candidate.candidate.key_id.clone());
             } else if candidate.orchestration.pool_sticky_init_owner.is_none() {
                 candidate.orchestration.pool_sticky_init_owner = self.sticky_init_owner.clone();
             }
@@ -4145,6 +4147,10 @@ mod tests {
             .expect("cursor should return the sticky-bound key first");
         assert_eq!(sticky.candidate.key_id, "key-00000");
         assert!(!sticky.orchestration.pool_sticky_bound_key_ineligible);
+        assert_eq!(
+            sticky.orchestration.pool_sticky_bound_key_id.as_deref(),
+            Some("key-00000")
+        );
 
         let fallback = cursor
             .next_key()
