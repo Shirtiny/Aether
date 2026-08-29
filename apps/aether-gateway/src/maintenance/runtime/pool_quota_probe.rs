@@ -1042,7 +1042,7 @@ fn codex_quota_refresh_endpoint_after_rate_limit(
         .find(|endpoint| endpoint.id == requested_endpoint_id);
     requested_endpoint
         .filter(|endpoint| {
-            aether_ai_formats::normalize_api_format_alias(&endpoint.api_format)
+            crate::ai_serving::normalize_api_format_alias(&endpoint.api_format)
                 == "openai:responses"
         })
         .cloned()
