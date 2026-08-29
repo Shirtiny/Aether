@@ -959,6 +959,7 @@ pub(crate) async fn record_admin_provider_pool_stream_timeout(
 #[cfg(test)]
 mod tests {
     use super::{
+        admin_provider_pool_key_error_is_account_invalid,
         admin_provider_pool_key_terminal_error_reason,
         admin_provider_pool_sticky_session_init_exists,
         claim_admin_provider_pool_sticky_session_init,
