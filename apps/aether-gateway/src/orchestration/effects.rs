@@ -33,6 +33,7 @@ use crate::client_session_affinity::{
 use crate::clock::current_unix_secs;
 use crate::handlers::shared::provider_pool::admin_provider_pool_config_from_config_value;
 use crate::handlers::shared::provider_pool::{
+    admin_provider_pool_key_error_is_account_invalid,
     admin_provider_pool_key_terminal_error_reason, admin_provider_pool_sticky_session_init_exists,
     admin_provider_pool_sticky_session_init_owner_matches,
     claim_admin_provider_pool_sticky_session_init,
@@ -1451,10 +1452,7 @@ async fn record_pool_error_effect(
     effect: LocalPoolErrorEffect<'_>,
 ) {
     let sticky_collateral_account_invalid =
-        pool_sticky_collateral_failure_status_is_account_invalid(
-            effect.status_code,
-            effect.error_body,
-        );
+        admin_provider_pool_key_error_is_account_invalid(effect.status_code, effect.error_body);
     let Some(pool_context) = resolve_pool_feedback_context(state, context).await else {
         let should_record_pool_error = local_pool_failure_should_clear_sticky(
             effect.status_code,
@@ -1768,31 +1766,7 @@ fn local_pool_failure_should_clear_sticky(
 ) -> bool {
     admin_provider_pool_key_terminal_error_reason(status_code, error_body).is_some()
         || local_candidate_failure_should_record_pool_error(classification, status_code)
-        || pool_sticky_collateral_failure_status_is_account_invalid(status_code, error_body)
-}
-
-fn pool_sticky_collateral_failure_status_is_account_invalid(
-    status_code: u16,
-    error_body: Option<&str>,
-) -> bool {
-    if let Some(reason) = admin_provider_pool_key_terminal_error_reason(status_code, error_body) {
-        return !reason.starts_with("payment_required_");
-    }
-    if matches!(status_code, 401 | 403) {
-        return true;
-    }
-    let body = error_body.unwrap_or_default().to_ascii_lowercase();
-    let account_related = body.contains("account")
-        || body.contains("user")
-        || body.contains("workspace")
-        || body.contains("organization");
-    (body.contains("invalid") && body.contains("token"))
-        || body.contains("banned")
-        || body.contains("suspended")
-        || (account_related
-            && (body.contains("blocked")
-                || body.contains("disabled")
-                || body.contains("deactivated")))
+        || admin_provider_pool_key_error_is_account_invalid(status_code, error_body)
 }
 
 async fn record_pool_stream_timeout_effect(
@@ -1961,14 +1935,14 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::{
-        apply_local_execution_effect, local_candidate_failure_should_record_pool_error,
+        admin_provider_pool_key_error_is_account_invalid, apply_local_execution_effect,
+        local_candidate_failure_should_record_pool_error,
         pool_error_should_record_or_refresh_quota, pool_error_should_trigger_codex_quota_refresh,
-        pool_score_hard_state_for_status, pool_sticky_collateral_failure_status_is_account_invalid,
-        prepare_pool_after_handshake_failure, prepare_pool_attempt_started_effect,
-        LocalAdaptiveRateLimitEffect, LocalAdaptiveSuccessEffect, LocalAttemptFailureEffect,
-        LocalExecutionEffect, LocalExecutionEffectContext, LocalHealthFailureEffect,
-        LocalHealthSuccessEffect, LocalOAuthInvalidationEffect, LocalPoolErrorEffect,
-        PoolAttemptStartCleanupGuard,
+        pool_score_hard_state_for_status, prepare_pool_after_handshake_failure,
+        prepare_pool_attempt_started_effect, LocalAdaptiveRateLimitEffect,
+        LocalAdaptiveSuccessEffect, LocalAttemptFailureEffect, LocalExecutionEffect,
+        LocalExecutionEffectContext, LocalHealthFailureEffect, LocalHealthSuccessEffect,
+        LocalOAuthInvalidationEffect, LocalPoolErrorEffect, PoolAttemptStartCleanupGuard,
     };
     use crate::data::{GatewayDataConfig, GatewayDataState};
     use crate::handlers::shared::provider_pool::{
@@ -4687,18 +4661,16 @@ mod tests {
 
     #[test]
     fn pool_sticky_collateral_failure_detects_account_invalid_statuses() {
-        assert!(pool_sticky_collateral_failure_status_is_account_invalid(
-            401, None
-        ));
-        assert!(pool_sticky_collateral_failure_status_is_account_invalid(
+        assert!(admin_provider_pool_key_error_is_account_invalid(401, None));
+        assert!(admin_provider_pool_key_error_is_account_invalid(
             403,
             Some("forbidden")
         ));
-        assert!(pool_sticky_collateral_failure_status_is_account_invalid(
+        assert!(admin_provider_pool_key_error_is_account_invalid(
             400,
             Some("invalid token")
         ));
-        assert!(pool_sticky_collateral_failure_status_is_account_invalid(
+        assert!(admin_provider_pool_key_error_is_account_invalid(
             400,
             Some("workspace deactivated")
         ));
@@ -4706,15 +4678,15 @@ mod tests {
 
     #[test]
     fn pool_sticky_collateral_failure_ignores_quota_and_cooldown_statuses() {
-        assert!(!pool_sticky_collateral_failure_status_is_account_invalid(
+        assert!(!admin_provider_pool_key_error_is_account_invalid(
             402,
             Some("quota exceeded")
         ));
-        assert!(!pool_sticky_collateral_failure_status_is_account_invalid(
+        assert!(!admin_provider_pool_key_error_is_account_invalid(
             429,
             Some("rate limited")
         ));
-        assert!(!pool_sticky_collateral_failure_status_is_account_invalid(
+        assert!(!admin_provider_pool_key_error_is_account_invalid(
             503,
             Some("upstream overloaded")
         ));

@@ -24,7 +24,7 @@ use crate::control::GatewayControlDecision;
 use crate::execution_runtime::{execute_execution_runtime_stream, execute_execution_runtime_sync};
 use crate::executor::{build_local_execution_exhaustion, LocalExecutionRequestOutcome};
 use crate::handlers::shared::provider_pool::{
-    admin_provider_pool_key_terminal_error_reason, release_admin_provider_pool_key_lease,
+    admin_provider_pool_key_error_is_account_invalid, release_admin_provider_pool_key_lease,
 };
 use crate::log_ids::short_request_id;
 use crate::orchestration::local_execution_candidate_metadata_from_report_context;
@@ -393,31 +393,7 @@ fn candidate_matches_pool_sticky_collateral_failure(candidate: &StoredRequestCan
     }
     let status_code = candidate.status_code.unwrap_or(0);
     let error_text = candidate_pool_error_text(candidate);
-    pool_sticky_collateral_failure_status_is_account_invalid(status_code, error_text.as_deref())
-}
-
-fn pool_sticky_collateral_failure_status_is_account_invalid(
-    status_code: u16,
-    error_body: Option<&str>,
-) -> bool {
-    if let Some(reason) = admin_provider_pool_key_terminal_error_reason(status_code, error_body) {
-        return !reason.starts_with("payment_required_");
-    }
-    if matches!(status_code, 401 | 403) {
-        return true;
-    }
-    let body = error_body.unwrap_or_default().to_ascii_lowercase();
-    let account_related = body.contains("account")
-        || body.contains("user")
-        || body.contains("workspace")
-        || body.contains("organization");
-    (body.contains("invalid") && body.contains("token"))
-        || body.contains("banned")
-        || body.contains("suspended")
-        || (account_related
-            && (body.contains("blocked")
-                || body.contains("disabled")
-                || body.contains("deactivated")))
+    admin_provider_pool_key_error_is_account_invalid(status_code, error_text.as_deref())
 }
 
 fn candidate_pool_error_text(candidate: &StoredRequestCandidate) -> Option<String> {
@@ -1726,18 +1702,16 @@ mod tests {
 
     #[test]
     fn pool_sticky_collateral_failure_detects_account_invalid_statuses() {
-        assert!(pool_sticky_collateral_failure_status_is_account_invalid(
-            401, None
-        ));
-        assert!(pool_sticky_collateral_failure_status_is_account_invalid(
+        assert!(admin_provider_pool_key_error_is_account_invalid(401, None));
+        assert!(admin_provider_pool_key_error_is_account_invalid(
             403,
             Some("forbidden")
         ));
-        assert!(pool_sticky_collateral_failure_status_is_account_invalid(
+        assert!(admin_provider_pool_key_error_is_account_invalid(
             400,
             Some("invalid token")
         ));
-        assert!(pool_sticky_collateral_failure_status_is_account_invalid(
+        assert!(admin_provider_pool_key_error_is_account_invalid(
             400,
             Some("account suspended")
         ));
@@ -1745,15 +1719,15 @@ mod tests {
 
     #[test]
     fn pool_sticky_collateral_failure_ignores_quota_and_cooldown_statuses() {
-        assert!(!pool_sticky_collateral_failure_status_is_account_invalid(
+        assert!(!admin_provider_pool_key_error_is_account_invalid(
             402,
             Some("quota exceeded")
         ));
-        assert!(!pool_sticky_collateral_failure_status_is_account_invalid(
+        assert!(!admin_provider_pool_key_error_is_account_invalid(
             429,
             Some("rate limited")
         ));
-        assert!(!pool_sticky_collateral_failure_status_is_account_invalid(
+        assert!(!admin_provider_pool_key_error_is_account_invalid(
             503,
             Some("upstream overloaded")
         ));

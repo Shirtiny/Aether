@@ -21,6 +21,7 @@ pub(crate) use self::status::build_admin_provider_pool_status_payload;
 #[cfg(test)]
 pub(crate) use self::writes::release_admin_provider_pool_sticky_session_init_for_tests;
 pub(crate) use self::writes::{
+    admin_provider_pool_key_error_is_account_invalid,
     admin_provider_pool_key_terminal_error_reason, admin_provider_pool_sticky_session_init_exists,
     admin_provider_pool_sticky_session_init_owner_matches,
     claim_admin_provider_pool_sticky_session_init,

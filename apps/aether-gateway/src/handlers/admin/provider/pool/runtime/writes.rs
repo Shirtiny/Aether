@@ -262,6 +262,31 @@ pub(crate) fn admin_provider_pool_key_terminal_error_reason(
     }
 }
 
+pub(crate) fn admin_provider_pool_key_error_is_account_invalid(
+    status_code: u16,
+    error_body: Option<&str>,
+) -> bool {
+    if let Some(reason) = admin_provider_pool_key_terminal_error_reason(status_code, error_body) {
+        return !reason.starts_with("payment_required_");
+    }
+    if matches!(status_code, 401 | 403) {
+        return true;
+    }
+
+    let body = error_body.unwrap_or_default().to_ascii_lowercase();
+    let account_related = body.contains("account")
+        || body.contains("user")
+        || body.contains("workspace")
+        || body.contains("organization");
+    (body.contains("invalid") && body.contains("token"))
+        || body.contains("banned")
+        || body.contains("suspended")
+        || (account_related
+            && (body.contains("blocked")
+                || body.contains("disabled")
+                || body.contains("deactivated")))
+}
+
 fn resolve_transient_cooldown_ttl(
     status_code: u16,
     retry_after_seconds: Option<u64>,
@@ -1145,6 +1170,26 @@ mod tests {
             .as_deref(),
             Some("account_locked_423")
         );
+    }
+
+    #[test]
+    fn account_invalid_classification_uses_status_and_error_body() {
+        assert!(admin_provider_pool_key_error_is_account_invalid(
+            400,
+            Some(r#"{"error":{"message":"invalid token"}}"#),
+        ));
+        assert!(admin_provider_pool_key_error_is_account_invalid(
+            423,
+            Some(r#"{"error":{"message":"account access denied"}}"#),
+        ));
+        assert!(!admin_provider_pool_key_error_is_account_invalid(
+            400,
+            Some(r#"{"error":{"message":"invalid input item"}}"#),
+        ));
+        assert!(!admin_provider_pool_key_error_is_account_invalid(
+            402,
+            Some(r#"{"error":{"message":"payment required"}}"#),
+        ));
     }
 
     #[tokio::test]

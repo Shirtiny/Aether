@@ -754,14 +754,18 @@ struct CapturedPrompt {
 struct PromptCaptureSelection {
     initial: Vec<CapturedPrompt>,
     recent: VecDeque<CapturedPrompt>,
+    max_initial: usize,
     max_recent: usize,
 }
 
 impl PromptCaptureSelection {
-    fn new(max_recent: usize) -> Self {
+    fn new(max_items: usize) -> Self {
+        let max_initial = USAGE_PROMPT_CAPTURE_INITIAL_ITEMS.min(max_items);
+        let max_recent = max_items.saturating_sub(max_initial);
         Self {
-            initial: Vec::with_capacity(USAGE_PROMPT_CAPTURE_INITIAL_ITEMS),
+            initial: Vec::with_capacity(max_initial),
             recent: VecDeque::with_capacity(max_recent),
+            max_initial,
             max_recent,
         }
     }
@@ -772,7 +776,7 @@ impl PromptCaptureSelection {
         if self.initial.iter().any(|prompt| prompt.text == text) {
             return;
         }
-        if self.initial.len() < USAGE_PROMPT_CAPTURE_INITIAL_ITEMS {
+        if self.initial.len() < self.max_initial {
             self.initial.push(candidate);
             return;
         }
@@ -1499,9 +1503,9 @@ mod tests {
             .as_ref()
             .and_then(|value| value.get("prompt_capture"))
             .expect("prompt capture metadata should exist");
-        assert_eq!(prompt_capture["item_count"], json!(42));
+        assert_eq!(prompt_capture["item_count"], json!(32));
         assert_eq!(prompt_capture["role_counts"]["system"], json!(1));
-        assert_eq!(prompt_capture["role_counts"]["user"], json!(41));
+        assert_eq!(prompt_capture["role_counts"]["user"], json!(31));
         assert_eq!(
             prompt_capture["items"][0]["preview"],
             json!("system prompt")
@@ -1510,14 +1514,14 @@ mod tests {
         assert_eq!(prompt_capture["items"][9]["preview"], json!("old prompt 9"));
         assert_eq!(
             prompt_capture["items"][10]["preview"],
-            json!("old prompt 29")
+            json!("old prompt 39")
         );
         assert_eq!(
-            prompt_capture["items"][41]["preview"],
+            prompt_capture["items"][31]["preview"],
             json!("old prompt 60")
         );
         assert_eq!(
-            prompt_capture["items"][41]["source"],
+            prompt_capture["items"][31]["source"],
             json!("request.input[59].content")
         );
         assert!(!prompt_capture["items"]
@@ -1528,7 +1532,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_capture_metadata_keeps_initial_prefix_even_when_recent_limit_is_smaller() {
+    fn prompt_capture_metadata_respects_small_total_item_limit() {
         let history = (1..=20)
             .map(|index| json!({"role": "user", "content": format!("prompt {index}")}))
             .collect::<Vec<_>>();
@@ -1553,11 +1557,9 @@ mod tests {
             .and_then(|value| value.pointer("/prompt_capture/items"))
             .and_then(Value::as_array)
             .expect("prompt capture items should exist");
-        assert_eq!(items.len(), 14);
+        assert_eq!(items.len(), 4);
         assert_eq!(items[0]["preview"], json!("prompt 1"));
-        assert_eq!(items[9]["preview"], json!("prompt 10"));
-        assert_eq!(items[10]["preview"], json!("prompt 17"));
-        assert_eq!(items[13]["preview"], json!("prompt 20"));
+        assert_eq!(items[3]["preview"], json!("prompt 4"));
     }
 
     fn sample_usage_record() -> UpsertUsageRecord {

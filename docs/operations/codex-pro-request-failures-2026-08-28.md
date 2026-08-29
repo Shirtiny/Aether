@@ -18,7 +18,15 @@
 2. **按发生频率，首要问题是 Responses WebSocket 通过代理建立连接失败。** 原始原因出现 25 次，占全部请求 `0.0579%`、服务端失败 `31.25%`；其中 24 次集中在 key 前缀 `9c7f126e`，并指向代理节点 `netcup-ipv6`。
 3. **按单次用户体验，最严重的是“600 秒没有客户端可见内容”的流式请求。** 该类有 14 次、均为 `504`；它会让用户等待约 10 分钟后才得到错误。请求 `059c8d0e-027f-44e4-8465-b0fc068b82f3` 是其中的代表案例。
 4. 另外还有上游 chunked body 意外 EOF、WebSocket 协议失败、候选池/绑定状态/大帧 CPU 容量不足、上游过载和输入错误。下面保留数据库中的**完整原始错误文本**，不以概括性标签替代原因。
-5. `backend-v0.7.89` 尚未上线；其 Release Actions（run `33148192421`）在 Rust release-critical tests 阶段失败，因此没有可用的新生产镜像。即使后续上线，现有代码仍保留 600 秒 client-progress 上限，不能承诺自动消除长流停滞类 504。
+5. `backend-v0.7.90` 尚未上线；其 Release Actions（run `33241849251`）在 Rust release tests 阶段失败，后端二进制和 Docker 构建均被跳过，因此没有可用的新生产镜像。该 tag 仍保留 600 秒 client-progress 上限；后续工作区已将未配置专用值时的客户端无可见内容上限收紧为 120 秒，但尚未构建、打 tag 或上线。
+
+### 1.1 2026-08-29 后续修复状态
+
+- 代理隧道有界重试、脱敏代理观测和“网络失败保留已有 sticky”已进入 `backend-v0.7.90` 源码，但该 tag 未成功产出镜像。
+- Codex WS 账号失败判断改为复用统一的状态码加响应正文分类：`400` 的 invalid token/account/workspace disabled 和 `423` account locked 会清除失效 sticky 并允许切换账号；普通 `400` 输入错误仍不会惩罚账号。
+- 显式 `stream_idle_timeout` 同时约束上游无帧和客户端无可见内容；未配置时分别使用 300 秒上游读取兼容值和 120 秒客户端可见进度上限，不再由控制帧把用户等待放大到 600 秒。
+- prompt capture 的 `max_items` 恢复为总条目硬上限；仍优先保留最初上下文，但不会在配置值之外额外写入 10 条。
+- Release Rust 命令拆为独立步骤，后续失败会直接显示具体 crate/检查项。上述工作区修改遵循暂停本地编译测试的要求，尚待远端 CI 验证。
 
 ## 2. 总体统计
 
@@ -119,12 +127,12 @@ client disconnected while provider response was in flight
 - `netcup-ipv6` 实际是无认证的手动 `socks5h` 节点，不是 Aether tunnel，因此没有 tunnel 心跳和 `proxy_node_metrics_1m` 指标。不能用 `tunnel_connected=false` 判断它离线。
 - 2026-08-28 16:32 CST 通过同一代理对 `chatgpt.com/backend-api/codex/responses` 做了 10 次无认证 GET 探测，10 次 CONNECT/TLS 均成功，上游均返回预期的 HTTP 405；TLS 建立耗时约 113–130 ms。这说明节点调查时已恢复，但不能否定高峰期的间歇失败。
 
-本地处置（尚未发布、未上线）：
+源码处置（已进入 `backend-v0.7.90`，但未产出镜像、未上线）：
 
 - 在 WebSocket 请求尚未发送的代理隧道阶段，对 `ProxyConnect`/代理 I/O 做一次 25 ms 退避后的有界重试；代理连接超时也按非账号故障处理。该阶段没有 Provider write，不会引入重复生成风险。重试后成功建立 WebSocket 时会记录 `codex_ws_proxy_tunnel_retry`，包含 request/candidate/provider/key、代理节点 ID、去除凭据和路径的代理端点以及首错类型；重试仍失败则沿用最终握手失败记录。
 - 重试仍失败时，已有 sticky 绑定不会切号；尚未建立正式绑定的首次请求可继续使用备用候选。代理持续故障时不通过破坏已有会话绑定来掩盖问题，应单独做代理节点健康摘除或同账号换代理路由。
 - 将 SOCKS5 reply code `1–8` 映射为有限的脱敏原因，例如 `proxy_connect_reason=socks5_host_unreachable`，并补齐 HTTP CONNECT 响应格式、SOCKS5 认证/地址等有限分类。未知文本仍只保存为 `url_kind=proxy_connect`，不会记录代理 URL 或凭据。
-- `baa1c013f` 的原始行为对所有握手失败都先释放 sticky，这会把传输瞬时故障误当成账号故障；本地工作区已按失败性质和绑定状态拆分：已有 sticky 遇到非账号握手失败时保留绑定并停止切号；首次初始化的候选可在 Provider write 前继续回退；账号明确拒绝（`401/402/403/409/429`）才清除 sticky 并计入账号健康。该规则同时适用于 Codex 直连、代理和 Standard Responses WebSocket。新增的一次代理 CONNECT 重试也在该 tag 之后，当前尚未提交或打 tag。
+- `baa1c013f` 的原始行为对所有握手失败都先释放 sticky，这会把传输瞬时故障误当成账号故障；`backend-v0.7.90` 已按失败性质和绑定状态拆分：已有 sticky 遇到非账号握手失败时保留绑定并停止切号；首次初始化的候选可在 Provider write 前继续回退；明确账号拒绝才清除 sticky 并计入账号健康。后续工作区又补齐了 `400/423` 等依赖响应正文的账号失效分类。该规则同时适用于 Codex 直连、代理和 Standard Responses WebSocket。
 
 ### 5.2 `059c8d0e`：600 秒没有客户端可见内容
 
@@ -148,12 +156,18 @@ client disconnected while provider response was in flight
 
 当前代码的相关语义：
 
-- 生产 `backend-v0.7.83` 与最新已打 tag 的 `backend-v0.7.89` 默认 upstream idle 都是 300 秒；`client_progress_idle` 为其 2 倍，即 600 秒。中间的 `backend-v0.7.86`–`backend-v0.7.88` 曾短暂使用 120/240 秒默认值，但未上线，`backend-v0.7.89` 已恢复兼容行为。
+- 生产 `backend-v0.7.83` 与最新已打 tag 的 `backend-v0.7.90` 默认 upstream idle 都是 300 秒；tag 内的 `client_progress_idle` 为其 2 倍，即 600 秒。中间的 `backend-v0.7.86`–`backend-v0.7.88` 曾短暂使用 120/240 秒默认值，但未上线。后续工作区保留 upstream 300 秒兼容值，并为未显式配置 `stream_idle_timeout` 的请求设置独立的 120 秒客户端可见进度上限。
 - `stream_execution_client_progress_idle_timeout` 在 600 秒触发时写入 `stream_progress_timeout` 和上述原始错误。
 - SSE 控制块/keepalive 可用于维持传输连接，但 `client-visible` 计时器会过滤控制块；控制帧不能冒充业务进度，也不能掩盖永久停滞。
-- `backend-v0.7.89` 没有改变默认 600 秒 client-progress 上限。因此该版本即使成功构建并上线，也只能保留边界和诊断，不能保证不再出现同类 504。
+- `backend-v0.7.90` 没有改变默认 600 秒 client-progress 上限；后续工作区会在 120 秒终止未配置专用值的同类停滞。它缩短等待时间，但仍不能替代最后公开事件/转换阶段观测，也不能承诺消除上游或转换器停滞本身。
 
 后续应优先补充低成本、脱敏的观测字段：最后一个上游 frame 分类、最后一个公开 Responses 事件、最后一个客户端可见事件、转换器是否产出，以及代理/连接 ID。不要默认保存完整 prompt 或 token。
+
+#### 5.2.1 2026-08-29 同类实时样本
+
+请求 `c05335cd-8bb8-4345-87a9-4eb348338ef4` 再次复现了同一路径：`gpt-5.6-sol`、`claude:messages` → `openai:responses`、本地流转换器启用。客户端可见输出在流开始约 4.2 秒后停在 814 字节，但上游仍持续发送数据；到约 303 秒时累计上游字节已超过 4.65 MB。请求最终在 316.6 秒由上游以 `400 upstream_error / stream_read_error` 结束，未产生 token 或费用。
+
+这个样本确认：HTTP 200 和首字节成功不代表转换后的客户端流仍有进展；持续增长的上游字节也不能作为用户可见进度。它不是额度、Sticky 或候选池故障。现有脱敏捕获无法恢复全部上游事件类型，因此不能仅凭字节增长断言是上游控制事件还是转换器丢弃；120 秒客户端可见进度上限用于先控制用户等待和资源占用，事件级根因仍需后续观测字段验证。后续工作区同时把 HTTP 200 流内的 `upstream_error / stream_read_error` 从误导性的客户端 400 归类改为 502 上游失败。
 
 ### 5.3 chunked body EOF
 
@@ -174,13 +188,13 @@ error decoding response body: error reading a body from connection: unexpected E
 - `bound_provider_changed`：2
 - `large_frame_cpu_unavailable`：3
 
-这些错误的共同点是系统可以证明尚未执行 Provider write。账号/绑定状态确实不可用时可以换候选；非账号握手失败不会降低账号健康，已有 sticky 时保留绑定，尚未正式绑定时仍可安全尝试备用候选。`backend-v0.7.85`（`baa1c013f`）加强了 Codex failover settlement 和候选清理，但原始范围过宽，本地工作区已按上述边界收窄；需要发布后按同一错误文本复核。
+这些错误的共同点是系统可以证明尚未执行 Provider write。账号/绑定状态确实不可用时可以换候选；非账号握手失败不会降低账号健康，已有 sticky 时保留绑定，尚未正式绑定时仍可安全尝试备用候选。`backend-v0.7.85`（`baa1c013f`）加强了 Codex failover settlement 和候选清理，但原始范围过宽；`backend-v0.7.90` 源码已按上述边界收窄，需要成功发布后按同一错误文本复核。
 
 ## 6. 与额度/429 问题的边界
 
 此前调查的问题是：官方返回 429 后，号池中的额度状态没有及时更新为耗尽，导致同一账号可能继续被选中，用户表现为无法请求、重开会话也无法请求。
 
-- 该问题的修复提交包括 `13948a5d`（`fix(codex): refresh quota after upstream 429`），并包含在待发布的 `backend-v0.7.89`。
+- 该问题的修复提交包括 `13948a5d`（`fix(codex): refresh quota after upstream 429`），并包含在尚未上线的 `backend-v0.7.89`/`backend-v0.7.90` 源码中。
 - 本次快照中 Codex Pro 请求的 `401/402/403/429` 数量均为 **0**。
 - 因此本次 80 个失败不能归因于额度状态不同步；把代理 CONNECT、EOF 或 600 秒流停滞错误标记为“额度耗尽”会误导处置。
 
@@ -193,13 +207,13 @@ error decoding response body: error reading a body from connection: unexpected E
 | 项目 | 状态 |
 | --- | --- |
 | 生产 | `backend-v0.7.83`，`aether-app` healthy |
-| 最新已打 tag | `backend-v0.7.89`，commit `f6849a890b9b366f35d9c7fe4e074e513abbc13e` |
-| P0 代理 CONNECT 本地修复 | 位于 `backend-v0.7.89` 之后的未提交工作区；尚无 tag/镜像，未上线 |
+| 最新已打 tag | `backend-v0.7.90`，commit `6649345949e6a2d982a7c380b2099c466352aacb` |
+| P0 代理 CONNECT 修复 | 已进入 `backend-v0.7.90` 源码；该 tag 构建失败，无镜像，未上线 |
 | 主要关联修复 | 429 后刷新额度；Codex WS failover settlement；流超时字段/兼容性修订 |
-| Release Actions | run `33148192421` 失败，Rust release-critical tests 退出码 101 |
+| Release Actions | run `33241849251` 失败，Rust release tests 退出码 101 |
 | 产物 | 未生成可确认的新生产镜像/摘要 |
 
-因此本文的线上统计仍对应 `backend-v0.7.83`，不能把待发布代码的测试通过或源码行为当成生产现状。Release run 链接：<https://github.com/Shirtiny/Aether/actions/runs/33148192421>。
+因此本文的线上统计仍对应 `backend-v0.7.83`，不能把待发布源码行为当成生产现状。Release run 链接：<https://github.com/Shirtiny/Aether/actions/runs/33241849251>。
 
 ### 7.2 当前不应做的处理
 

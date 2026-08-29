@@ -424,6 +424,20 @@ pub(crate) fn resolve_local_sync_error_status_code(
 
     let raw_code = first_non_empty_error_text(error_object, body_object, &["code"]);
     let raw_status = first_non_empty_error_text(error_object, body_object, &["status"]);
+    let raw_type = first_non_empty_error_text(error_object, body_object, &["type", "__type"]);
+    let message = first_non_empty_error_text(
+        error_object,
+        body_object,
+        &["message", "detail", "reason", "status", "type", "__type"],
+    )
+    .unwrap_or_else(|| "HTTP 400".to_string());
+    if raw_type
+        .as_deref()
+        .is_some_and(|value| value.eq_ignore_ascii_case("upstream_error"))
+        && message.eq_ignore_ascii_case("stream_read_error")
+    {
+        return 502;
+    }
     for numeric_hint in [raw_code.as_deref(), raw_status.as_deref()]
         .into_iter()
         .flatten()
@@ -435,13 +449,6 @@ pub(crate) fn resolve_local_sync_error_status_code(
         }
     }
 
-    let raw_type = first_non_empty_error_text(error_object, body_object, &["type", "__type"]);
-    let message = first_non_empty_error_text(
-        error_object,
-        body_object,
-        &["message", "detail", "reason", "status", "type", "__type"],
-    )
-    .unwrap_or_else(|| "HTTP 400".to_string());
     let kind = classify_local_sync_error_kind(
         status_code,
         raw_type.as_deref(),
@@ -776,7 +783,10 @@ mod tests {
     use axum::body::to_bytes;
     use serde_json::json;
 
-    use super::{maybe_build_local_core_error_response, submit_local_core_error_or_sync_finalize};
+    use super::{
+        maybe_build_local_core_error_response, resolve_local_sync_error_status_code,
+        submit_local_core_error_or_sync_finalize,
+    };
     use crate::control::GatewayControlDecision;
     use crate::usage::GatewaySyncReportRequest;
     use crate::AppState;
@@ -813,6 +823,20 @@ mod tests {
             body_base64: None,
             telemetry: None,
         }
+    }
+
+    #[test]
+    fn embedded_stream_read_error_is_an_upstream_failure() {
+        let body = json!({
+            "error": {
+                "type": "upstream_error",
+                "code": 400,
+                "message": "stream_read_error"
+            }
+        });
+
+        assert_eq!(resolve_local_sync_error_status_code(200, &body), 502);
+        assert_eq!(resolve_local_sync_error_status_code(400, &body), 400);
     }
 
     #[tokio::test]

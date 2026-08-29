@@ -38,6 +38,7 @@ use crate::codex_profile::{
     normalize_codex_turn_metadata_for_profile, CodexConcreteAccountProfile,
     CodexProfileRequestBodyPolicy,
 };
+use crate::handlers::shared::provider_pool::admin_provider_pool_key_error_is_account_invalid;
 use crate::orchestration::{
     apply_local_execution_effect, local_execution_candidate_metadata_from_report_context,
     prepare_pool_attempt_started_effect, LocalExecutionEffect, LocalExecutionEffectContext,
@@ -2338,6 +2339,8 @@ fn classify_codex_ws_handshake_failure(
                     "official_ws_handshake_rejected",
                 ),
             };
+            let penalize_account =
+                handshake_should_penalize_account(status_code, error_body.as_deref());
             CodexWsHandshakeFailure {
                 status_code,
                 response_headers,
@@ -2346,7 +2349,7 @@ fn classify_codex_ws_handshake_failure(
                 error_body,
                 diagnostic_detail: Some(format!("http_status={status_code}")),
                 route_reason,
-                penalize_account: handshake_status_should_penalize_account(status_code),
+                penalize_account,
             }
         }
         WebSocketError::Io(error) => {
@@ -2478,6 +2481,8 @@ fn classify_standard_ws_handshake_failure(
                     "responses_websocket_handshake_rejected",
                 ),
             };
+            let penalize_account =
+                handshake_should_penalize_account(status_code, error_body.as_deref());
             CodexWsHandshakeFailure {
                 status_code,
                 response_headers,
@@ -2486,7 +2491,7 @@ fn classify_standard_ws_handshake_failure(
                 error_body,
                 diagnostic_detail: Some(format!("http_status={status_code}")),
                 route_reason,
-                penalize_account: handshake_status_should_penalize_account(status_code),
+                penalize_account,
             }
         }
         super::standard_transport::StandardWebSocketConnectError::Transport(error) => {
@@ -2522,8 +2527,9 @@ fn transport_handshake_failure(
     }
 }
 
-const fn handshake_status_should_penalize_account(status_code: u16) -> bool {
-    matches!(status_code, 401 | 402 | 403 | 409 | 429)
+fn handshake_should_penalize_account(status_code: u16, error_body: Option<&str>) -> bool {
+    matches!(status_code, 402 | 409 | 429)
+        || admin_provider_pool_key_error_is_account_invalid(status_code, error_body)
 }
 
 fn handshake_utf8_diagnostic(error: &str) -> String {
@@ -4056,6 +4062,39 @@ mod tests {
     }
 
     #[test]
+    fn handshake_http_classification_uses_account_error_body() {
+        let disabled = http::Response::builder()
+            .status(http::StatusCode::BAD_REQUEST)
+            .body(Some(
+                br#"{"error":{"message":"workspace has been deactivated"}}"#.to_vec(),
+            ))
+            .expect("HTTP response should build");
+        let disabled = classify_codex_ws_handshake_failure(
+            WebSocketError::Http(Box::new(disabled)),
+            CodexWsRouteKind::Proxy,
+        );
+        assert!(disabled.penalize_account);
+        assert!(disabled.preparation_error(true).allow_candidate_failover);
+
+        let invalid_input = http::Response::builder()
+            .status(http::StatusCode::BAD_REQUEST)
+            .body(Some(
+                br#"{"error":{"message":"Invalid input item id"}}"#.to_vec(),
+            ))
+            .expect("HTTP response should build");
+        let invalid_input = classify_codex_ws_handshake_failure(
+            WebSocketError::Http(Box::new(invalid_input)),
+            CodexWsRouteKind::Proxy,
+        );
+        assert!(!invalid_input.penalize_account);
+        assert!(
+            !invalid_input
+                .preparation_error(true)
+                .allow_candidate_failover
+        );
+    }
+
+    #[test]
     fn standard_handshake_http_classification_preserves_provider_rejection() {
         let failure = classify_standard_ws_handshake_failure(
             crate::codex_ws::standard_transport::StandardWebSocketConnectError::Rejected {
@@ -4090,6 +4129,20 @@ mod tests {
             failure.diagnostic_detail.as_deref(),
             Some("http_status=429")
         );
+    }
+
+    #[test]
+    fn standard_handshake_classification_detects_locked_account_body() {
+        let failure = classify_standard_ws_handshake_failure(
+            crate::codex_ws::standard_transport::StandardWebSocketConnectError::Rejected {
+                status_code: http::StatusCode::LOCKED.as_u16(),
+                response_headers: BTreeMap::new(),
+                error_body: Some(r#"{"error":{"message":"account access denied"}}"#.into()),
+            },
+        );
+
+        assert!(failure.penalize_account);
+        assert!(failure.preparation_error(true).allow_candidate_failover);
     }
 
     #[test]

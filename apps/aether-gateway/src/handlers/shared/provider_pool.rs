@@ -4,6 +4,7 @@ pub(crate) use super::super::admin::provider::pool::config::{
 #[cfg(test)]
 pub(crate) use super::super::admin::provider::pool::runtime::release_admin_provider_pool_sticky_session_init_for_tests;
 pub(crate) use super::super::admin::provider::pool::runtime::{
+    admin_provider_pool_key_error_is_account_invalid,
     admin_provider_pool_key_terminal_error_reason, admin_provider_pool_sticky_session_init_exists,
     admin_provider_pool_sticky_session_init_owner_matches,
     claim_admin_provider_pool_sticky_session_init,

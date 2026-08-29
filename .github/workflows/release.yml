@@ -82,6 +82,8 @@ jobs:
     name: Rust release tests
     needs: preflight
     runs-on: ubuntu-latest
+    env:
+      RUST_MIN_STACK: "16777216"
     steps:
       - uses: actions/checkout@v5
 
@@ -94,20 +96,35 @@ jobs:
           shared-key: release-tests
           workspaces: . -> target
 
-      - name: Test release-critical crates
-        env:
-          RUST_MIN_STACK: "16777216"
-        run: |
-          cargo test --locked -p aether-ai-formats --lib
-          cargo test --locked -p aether-data --lib
-          cargo test --locked -p aether-provider-transport --lib
-          cargo check --locked -p aether-gateway --tests
-          cargo test --locked -p aether-gateway --lib openai_local_probe
-          cargo test --locked -p aether-gateway --lib grok_report_context
-          cargo test --locked -p aether-gateway --lib grok_static_full_headers
-          cargo test --locked -p aether-gateway --lib grok_authoritative_decrementing_headers
-          cargo test --locked -p aether-gateway --lib gateway_routes_grok_responses_admin_pool_model_test
-          cargo test --locked -p aether-gateway --lib tests::architecture::ai_serving::ai_serving_crate_api_is_confined_to_root_seams -- --exact
+      - name: Test aether-ai-formats
+        run: cargo test --locked -p aether-ai-formats --lib
+
+      - name: Test aether-data
+        run: cargo test --locked -p aether-data --lib
+
+      - name: Test aether-provider-transport
+        run: cargo test --locked -p aether-provider-transport --lib
+
+      - name: Check aether-gateway test targets
+        run: cargo check --locked -p aether-gateway --tests
+
+      - name: Test gateway local probes
+        run: cargo test --locked -p aether-gateway --lib openai_local_probe
+
+      - name: Test Grok report context
+        run: cargo test --locked -p aether-gateway --lib grok_report_context
+
+      - name: Test Grok static headers
+        run: cargo test --locked -p aether-gateway --lib grok_static_full_headers
+
+      - name: Test Grok decrementing headers
+        run: cargo test --locked -p aether-gateway --lib grok_authoritative_decrementing_headers
+
+      - name: Test Grok admin pool model route
+        run: cargo test --locked -p aether-gateway --lib gateway_routes_grok_responses_admin_pool_model_test
+
+      - name: Test AI serving architecture seam
+        run: cargo test --locked -p aether-gateway --lib tests::architecture::ai_serving::ai_serving_crate_api_is_confined_to_root_seams -- --exact
 
   frontend:
     name: Build frontend

@@ -129,7 +129,7 @@ const STREAM_IDLE_LOG_INTERVAL_MS: u64 = 60_000;
 // Keep the pre-configured behavior for existing providers. New providers can
 // opt into a shorter/longer bound through stream_idle_timeout.
 const DEFAULT_STREAM_UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
-const STREAM_CLIENT_PROGRESS_IDLE_MULTIPLIER: u32 = 2;
+const DEFAULT_STREAM_CLIENT_PROGRESS_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const DEFAULT_STREAM_DOWNSTREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_STREAM_DOWNSTREAM_DRAIN_GRACE: Duration = Duration::from_secs(30);
 const REWRITTEN_STREAM_PREFETCH_TIMEOUT: Duration = Duration::from_millis(750);
@@ -1552,15 +1552,24 @@ struct StreamLifecycleTimeouts {
 }
 
 fn resolve_stream_lifecycle_timeouts(plan: &ExecutionPlan) -> StreamLifecycleTimeouts {
-    let upstream_idle = plan
+    let configured_stream_idle = plan
         .timeouts
         .as_ref()
-        .and_then(|timeouts| timeouts.stream_idle_ms.or(timeouts.read_ms))
-        .map(|timeout_ms| Duration::from_millis(timeout_ms.max(1)))
+        .and_then(|timeouts| timeouts.stream_idle_ms)
+        .map(|timeout_ms| Duration::from_millis(timeout_ms.max(1)));
+    let upstream_idle = configured_stream_idle
+        .or_else(|| {
+            plan.timeouts
+                .as_ref()
+                .and_then(|timeouts| timeouts.read_ms)
+                .map(|timeout_ms| Duration::from_millis(timeout_ms.max(1)))
+        })
         .unwrap_or(DEFAULT_STREAM_UPSTREAM_IDLE_TIMEOUT);
-    let client_progress_idle = upstream_idle
-        .checked_mul(STREAM_CLIENT_PROGRESS_IDLE_MULTIPLIER)
-        .unwrap_or(Duration::MAX);
+    // Legacy request_timeout remains the upstream read fallback, but must not
+    // also extend the client-visible progress wait. An explicit
+    // stream_idle_timeout still controls both bounds.
+    let client_progress_idle =
+        configured_stream_idle.unwrap_or(DEFAULT_STREAM_CLIENT_PROGRESS_IDLE_TIMEOUT);
     let downstream_write = plan
         .timeouts
         .as_ref()
@@ -3932,6 +3941,11 @@ async fn execute_stream_from_frame_stream(
                             request_id = %request_id_for_report_log,
                             candidate_id = ?candidate_id_for_report.as_deref(),
                             client_progress_idle_timeout_ms = stream_lifecycle_timeouts.client_progress_idle.as_millis() as u64,
+                            provider_bytes = provider_stream_bytes.load(Ordering::Relaxed),
+                            client_bytes = client_stream_bytes.load(Ordering::Relaxed),
+                            last_upstream_frame_elapsed_ms = last_upstream_frame_elapsed_ms.load(Ordering::Relaxed),
+                            last_client_chunk_elapsed_ms = last_client_chunk_elapsed_ms.load(Ordering::Relaxed),
+                            local_stream_rewriter = local_stream_rewriter.is_some(),
                             "gateway terminated a stream that produced no client-visible data within the progress timeout"
                         );
                         terminal_failure = Some(build_stream_failure_report(
@@ -5070,9 +5084,10 @@ mod tests {
         stream_terminal_summary_represents_failure_with_requirement,
         ClientVisibleStreamCompletionTracker, SseControlBlockFilter,
         StreamTerminalEventDiagnosticsTracker, CODEX_RESPONSES_KEEPALIVE_BYTES,
-        CONTROL_STREAM_PREFETCH_EXTENSION_TIMEOUT, DEFAULT_STREAM_DOWNSTREAM_DRAIN_GRACE,
-        DEFAULT_STREAM_DOWNSTREAM_WRITE_TIMEOUT, DEFAULT_STREAM_UPSTREAM_IDLE_TIMEOUT,
-        REWRITTEN_STREAM_PREFETCH_TIMEOUT, SSE_KEEPALIVE_BYTES,
+        CONTROL_STREAM_PREFETCH_EXTENSION_TIMEOUT, DEFAULT_STREAM_CLIENT_PROGRESS_IDLE_TIMEOUT,
+        DEFAULT_STREAM_DOWNSTREAM_DRAIN_GRACE, DEFAULT_STREAM_DOWNSTREAM_WRITE_TIMEOUT,
+        DEFAULT_STREAM_UPSTREAM_IDLE_TIMEOUT, REWRITTEN_STREAM_PREFETCH_TIMEOUT,
+        SSE_KEEPALIVE_BYTES,
     };
     use crate::constants::STREAM_IDLE_TIMEOUT_MS_HEADER;
     use crate::control::GatewayControlDecision;
@@ -6995,7 +7010,7 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"type":"s
             resolve_stream_lifecycle_timeouts(&plan),
             super::StreamLifecycleTimeouts {
                 upstream_idle: DEFAULT_STREAM_UPSTREAM_IDLE_TIMEOUT,
-                client_progress_idle: DEFAULT_STREAM_UPSTREAM_IDLE_TIMEOUT * 2,
+                client_progress_idle: DEFAULT_STREAM_CLIENT_PROGRESS_IDLE_TIMEOUT,
                 downstream_write: DEFAULT_STREAM_DOWNSTREAM_WRITE_TIMEOUT,
                 downstream_drain: DEFAULT_STREAM_DOWNSTREAM_DRAIN_GRACE,
             }
@@ -7010,7 +7025,22 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"type":"s
             resolve_stream_lifecycle_timeouts(&plan),
             super::StreamLifecycleTimeouts {
                 upstream_idle: Duration::from_millis(25),
-                client_progress_idle: Duration::from_millis(50),
+                client_progress_idle: Duration::from_millis(25),
+                downstream_write: Duration::from_millis(15),
+                downstream_drain: Duration::from_millis(25),
+            }
+        );
+
+        plan.timeouts = Some(ExecutionTimeouts {
+            read_ms: Some(25),
+            write_ms: Some(15),
+            ..ExecutionTimeouts::default()
+        });
+        assert_eq!(
+            resolve_stream_lifecycle_timeouts(&plan),
+            super::StreamLifecycleTimeouts {
+                upstream_idle: Duration::from_millis(25),
+                client_progress_idle: DEFAULT_STREAM_CLIENT_PROGRESS_IDLE_TIMEOUT,
                 downstream_write: Duration::from_millis(15),
                 downstream_drain: Duration::from_millis(25),
             }
