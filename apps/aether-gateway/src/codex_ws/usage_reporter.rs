@@ -54,7 +54,7 @@ const SLOW_SETTLEMENT_TIMEOUT_ENV: &str = "AETHER_CODEX_WS_SLOW_SETTLEMENT_TIMEO
 // settlement path. The relay loop deliberately does not tokenize or retain
 // response frames.
 const CANCELLED_INPUT_ESTIMATE_MAX_TOKENS: u64 = 8_000_000;
-const CANCELLED_INPUT_ESTIMATE_SOURCE: &str = "gateway_input_estimate";
+const CANCELLED_INPUT_ESTIMATE_SOURCE: &str = "gateway_cached_input_floor";
 
 type ReporterFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 type ReporterHandler<T> = Arc<dyn Fn(T) -> ReporterFuture + Send + Sync + 'static>;
@@ -731,6 +731,12 @@ fn apply_cancelled_input_estimate(
     // the missing input side without discarding the observed output count.
     if usage.input_tokens <= 0 {
         usage.input_tokens = i64::try_from(input_tokens).unwrap_or(i64::MAX);
+        // The provider did not disclose whether the prompt cache hit. Price
+        // the estimate at the cheaper cache-read rate as a conservative floor
+        // instead of treating the entire context as fresh input.
+        if usage.cache_read_tokens <= 0 && usage.cache_creation_tokens <= 0 {
+            usage.cache_read_tokens = usage.input_tokens;
+        }
     } else {
         summary.standardized_usage = Some(usage);
         return;
@@ -741,7 +747,7 @@ fn apply_cancelled_input_estimate(
     );
     usage
         .dimensions
-        .insert("usage_confidence".to_string(), json!("estimated"));
+        .insert("usage_confidence".to_string(), json!("billing_floor"));
     summary.standardized_usage = Some(usage);
 }
 
@@ -1109,6 +1115,14 @@ mod tests {
                 .terminal_summary
                 .as_ref()
                 .and_then(|summary| summary.standardized_usage.as_ref())
+                .map(|usage| usage.cache_read_tokens),
+            Some(estimated_input)
+        );
+        assert_eq!(
+            cancelled
+                .terminal_summary
+                .as_ref()
+                .and_then(|summary| summary.standardized_usage.as_ref())
                 .and_then(|usage| usage.dimensions.get("usage_source"))
                 .and_then(Value::as_str),
             Some(CANCELLED_INPUT_ESTIMATE_SOURCE)
@@ -1191,6 +1205,7 @@ mod tests {
             .expect("usage should remain present");
         assert!(usage.input_tokens > 0);
         assert_eq!(usage.output_tokens, 7);
+        assert_eq!(usage.cache_read_tokens, usage.input_tokens);
     }
 
     #[test]
