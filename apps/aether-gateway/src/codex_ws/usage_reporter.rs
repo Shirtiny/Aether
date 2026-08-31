@@ -1154,7 +1154,11 @@ mod tests {
         let mut cancelled = crate::usage::GatewayStreamReportRequest {
             trace_id: plan.request_id.clone(),
             report_kind: "openai_responses_stream_cancelled".into(),
-            report_context: None,
+            report_context: Some(json!({
+                "user_id": "user-1",
+                "api_key_id": "api-key-1",
+                "provider_api_format": "openai:responses"
+            })),
             status_code: 499,
             headers: BTreeMap::new(),
             provider_body_base64: None,
@@ -1194,6 +1198,26 @@ mod tests {
             .standardized_usage
             .as_ref()
             .is_some_and(|usage| usage.input_tokens > 0));
+        let estimated_event =
+            aether_usage_runtime::build_terminal_usage_event_from_outcome(estimated_outcome)
+                .expect("cancelled usage event should build");
+        assert_eq!(
+            estimated_event.event_type,
+            aether_usage_runtime::UsageEventType::Cancelled
+        );
+        assert_eq!(estimated_event.data.user_id.as_deref(), Some("user-1"));
+        assert_eq!(
+            estimated_event.data.api_key_id.as_deref(),
+            Some("api-key-1")
+        );
+        assert!(estimated_event.data.input_tokens.unwrap_or_default() > 0);
+        assert!(
+            estimated_event
+                .data
+                .cache_read_input_tokens
+                .unwrap_or_default()
+                > 0
+        );
 
         // The helper is called only for cancelled settlement commits. A normal
         // completed turn never receives this fallback estimate.
