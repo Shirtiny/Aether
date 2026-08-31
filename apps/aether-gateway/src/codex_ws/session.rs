@@ -1757,6 +1757,18 @@ fn cancelled_cached_input_floor_terminal_event(tokens: i64, model: &str) -> Term
 
 fn next_response_context_token_floor(event: &TerminalEventSummary) -> Option<i64> {
     let usage = event.standardized_usage.as_ref()?;
+    if let Some(total_tokens) = usage
+        .dimensions
+        .get("total_tokens")
+        .and_then(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_u64().and_then(|tokens| i64::try_from(tokens).ok()))
+        })
+        .filter(|tokens| *tokens > 0)
+    {
+        return Some(total_tokens);
+    }
     let tokens = usage
         .input_tokens
         .max(0)
@@ -2195,9 +2207,12 @@ where
                             if let Some(response_id) = terminal_response_id.clone() {
                                 binding.last_completed_response_id = Some(response_id);
                             }
-                            binding.last_completed_context_tokens = terminal_event
+                            if let Some(context_tokens) = terminal_event
                                 .as_ref()
-                                .and_then(next_response_context_token_floor);
+                                .and_then(next_response_context_token_floor)
+                            {
+                                binding.last_completed_context_tokens = Some(context_tokens);
+                            }
                         }
                         if let Some((kind, event)) = terminal.zip(terminal_event) {
                             return terminal_outcome(kind, event, close_after_terminal, relay_frames);
@@ -3537,16 +3552,19 @@ mod tests {
         usage.input_tokens = 120_000;
         usage.output_tokens = 500;
         usage.reasoning_output_tokens = 20;
+        usage
+            .dimensions
+            .insert("total_tokens".into(), serde_json::json!(120_500));
         let terminal = TerminalEventSummary {
             standardized_usage: Some(usage),
             ..Default::default()
         };
 
-        assert_eq!(next_response_context_token_floor(&terminal), Some(120_520));
-        let floor = cancelled_cached_input_floor_terminal_event(120_520, "gpt-5.6-sol");
+        assert_eq!(next_response_context_token_floor(&terminal), Some(120_500));
+        let floor = cancelled_cached_input_floor_terminal_event(120_500, "gpt-5.6-sol");
         let usage = floor.standardized_usage.expect("floor usage");
-        assert_eq!(usage.input_tokens, 120_520);
-        assert_eq!(usage.cache_read_tokens, 120_520);
+        assert_eq!(usage.input_tokens, 120_500);
+        assert_eq!(usage.cache_read_tokens, 120_500);
         assert_eq!(
             usage
                 .dimensions
