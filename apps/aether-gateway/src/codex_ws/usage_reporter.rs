@@ -768,6 +768,30 @@ fn apply_cancelled_input_estimate(
     usage
         .dimensions
         .insert("usage_confidence".to_string(), json!("billing_floor"));
+    let estimated_total = usage
+        .input_tokens
+        .max(0)
+        .saturating_add(usage.output_tokens.max(0))
+        .saturating_add(
+            usage
+                .reasoning_output_tokens
+                .max(usage.reasoning_tokens)
+                .max(0),
+        );
+    let explicit_total = usage
+        .dimensions
+        .get("total_tokens")
+        .and_then(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_u64().and_then(|tokens| i64::try_from(tokens).ok()))
+        })
+        .unwrap_or_default();
+    if estimated_total > explicit_total {
+        usage
+            .dimensions
+            .insert("total_tokens".to_string(), json!(estimated_total));
+    }
     summary.standardized_usage = Some(usage);
 }
 
@@ -1244,6 +1268,10 @@ mod tests {
         assert!(usage.input_tokens > 0);
         assert_eq!(usage.output_tokens, 7);
         assert_eq!(usage.cache_read_tokens, usage.input_tokens);
+        assert_eq!(
+            usage.dimensions.get("total_tokens").and_then(Value::as_i64),
+            Some(usage.input_tokens + usage.output_tokens)
+        );
 
         let mut claude_plan = plan.clone();
         claude_plan.client_api_format = "claude:messages".into();
@@ -1348,6 +1376,10 @@ mod tests {
             .expect("floor usage should remain present");
         assert!(usage.input_tokens > 100);
         assert_eq!(usage.cache_read_tokens, 100);
+        assert_eq!(
+            usage.dimensions.get("total_tokens").and_then(Value::as_i64),
+            Some(usage.input_tokens)
+        );
     }
 
     #[test]
