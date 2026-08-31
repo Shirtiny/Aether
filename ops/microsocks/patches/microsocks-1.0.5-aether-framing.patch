@@ -1,0 +1,174 @@
+--- microsocks-1.0.5/sockssrv.c.orig
++++ microsocks-1.0.5/sockssrv.c
+@@ -249,18 +249,29 @@
+ 	return AM_INVALID;
+ }
+ 
++static void send_full(int fd, const void *data, size_t len) {
++	const unsigned char *buf = data;
++	size_t sent = 0;
++	while(sent < len) {
++		ssize_t n = write(fd, buf + sent, len - sent);
++		if(n < 0 && errno == EINTR) continue;
++		if(n <= 0) return;
++		sent += (size_t) n;
++	}
++}
++
+ static void send_auth_response(int fd, int version, enum authmethod meth) {
+ 	unsigned char buf[2];
+ 	buf[0] = version;
+ 	buf[1] = meth;
+-	write(fd, buf, 2);
++	send_full(fd, buf, sizeof buf);
+ }
+ 
+ static void send_error(int fd, enum errorcode ec) {
+ 	/* position 4 contains ATYP, the address type, which is the same as used in the connect
+ 	   request. we're lazy and return always IPV4 address type in errors. */
+ 	char buf[10] = { 5, ec, 0, 1 /*AT_IPV4*/, 0,0,0,0, 0,0 };
+-	write(fd, buf, 10);
++	send_full(fd, buf, sizeof buf);
+ }
+ 
+ static void copyloop(int fd1, int fd2) {
+@@ -314,44 +325,108 @@
+ 	return EC_NOT_ALLOWED;
+ }
+ 
++/* SOCKS5 runs over a byte stream, so a single recv() is not guaranteed to
++   return a complete protocol frame. Read exactly the requested number of
++   bytes before parsing a field-sized frame. */
++static int recv_full(int fd, unsigned char *buf, size_t len) {
++	size_t received = 0;
++	while(received < len) {
++		ssize_t n = recv(fd, buf + received, len - received, 0);
++		if(n == 0) return -1;
++		if(n < 0) {
++			if(errno == EINTR) continue;
++			return -1;
++		}
++		received += (size_t) n;
++	}
++	return 0;
++}
++
++static int recv_auth_methods(int fd, unsigned char *buf, size_t cap, size_t *len) {
++	if(cap < 2 || recv_full(fd, buf, 2)) return -1;
++	size_t total = 2 + (size_t) buf[1];
++	if(buf[1] == 0 || total > cap) return -1;
++	if(recv_full(fd, buf + 2, total - 2)) return -1;
++	*len = total;
++	return 0;
++}
++
++static int recv_credentials(int fd, unsigned char *buf, size_t cap, size_t *len) {
++	if(cap < 2 || recv_full(fd, buf, 2)) return -1;
++	size_t username_len = buf[1];
++	size_t password_len_offset = 2 + username_len;
++	if(password_len_offset + 1 > cap) return -1;
++	if(recv_full(fd, buf + 2, username_len + 1)) return -1;
++	size_t total = password_len_offset + 1 + (size_t) buf[password_len_offset];
++	if(total > cap) return -1;
++	if(recv_full(fd, buf + password_len_offset + 1,
++	             total - password_len_offset - 1)) return -1;
++	*len = total;
++	return 0;
++}
++
++static int recv_connect_request(int fd, unsigned char *buf, size_t cap, size_t *len) {
++	if(cap < 4 || recv_full(fd, buf, 4)) return -1;
++	size_t total;
++	switch(buf[3]) {
++		case 1: /* IPv4 address plus port */
++			total = 4 + 4 + 2;
++			break;
++		case 4: /* IPv6 address plus port */
++			total = 4 + 16 + 2;
++			break;
++		case 3: /* one-byte domain length, domain, and port */
++			if(cap < 5 || recv_full(fd, buf + 4, 1)) return -1;
++			total = 4 + 1 + (size_t) buf[4] + 2;
++			break;
++		default:
++			/* The parser will return EC_ADDRESSTYPE_NOT_SUPPORTED. */
++			buf[4] = 0;
++			*len = 5;
++			return 0;
++	}
++	if(total > cap) return -1;
++	size_t received = buf[3] == 3 ? 5 : 4;
++	if(recv_full(fd, buf + received, total - received)) return -1;
++	*len = total;
++	return 0;
++}
++
+ static int handshake(struct thread *t) {
+ 	unsigned char buf[1024];
+-	ssize_t n;
++	size_t n;
+ 	int ret;
+ 	enum authmethod am;
++
+ 	t->state = SS_1_CONNECTED;
+-	while((n = recv(t->client.fd, buf, sizeof buf, 0)) > 0) {
+-		switch(t->state) {
+-			case SS_1_CONNECTED:
+-				am = check_auth_method(buf, n, &t->client);
+-				if(am == AM_NO_AUTH) t->state = SS_3_AUTHED;
+-				else if (am == AM_USERNAME) t->state = SS_2_NEED_AUTH;
+-				send_auth_response(t->client.fd, 5, am);
+-				if(am == AM_INVALID) return -1;
+-				break;
+-			case SS_2_NEED_AUTH:
+-				ret = check_credentials(buf, n);
+-				send_auth_response(t->client.fd, 1, ret);
+-				if(ret != EC_SUCCESS)
+-					return -1;
+-				t->state = SS_3_AUTHED;
+-				if(auth_ips && !pthread_rwlock_wrlock(&auth_ips_lock)) {
+-					if(!is_in_authed_list(&t->client.addr))
+-						add_auth_ip(&t->client.addr);
+-					pthread_rwlock_unlock(&auth_ips_lock);
+-				}
+-				break;
+-			case SS_3_AUTHED:
+-				ret = connect_socks_target(buf, n, &t->client);
+-				if(ret < 0) {
+-					send_error(t->client.fd, ret*-1);
+-					return -1;
+-				}
+-				send_error(t->client.fd, EC_SUCCESS);
+-				return ret;
++	if(recv_auth_methods(t->client.fd, buf, sizeof buf, &n)) return -1;
++	am = check_auth_method(buf, n, &t->client);
++	if(am == AM_NO_AUTH) t->state = SS_3_AUTHED;
++	else if(am == AM_USERNAME) t->state = SS_2_NEED_AUTH;
++	send_auth_response(t->client.fd, 5, am);
++	if(am == AM_INVALID) return -1;
++
++	if(t->state == SS_2_NEED_AUTH) {
++		if(recv_credentials(t->client.fd, buf, sizeof buf, &n)) return -1;
++		ret = check_credentials(buf, n);
++		send_auth_response(t->client.fd, 1, ret);
++		if(ret != EC_SUCCESS) return -1;
++		t->state = SS_3_AUTHED;
++		if(auth_ips && !pthread_rwlock_wrlock(&auth_ips_lock)) {
++			if(!is_in_authed_list(&t->client.addr))
++				add_auth_ip(&t->client.addr);
++			pthread_rwlock_unlock(&auth_ips_lock);
+ 		}
+ 	}
+-	return -1;
++
++	if(recv_connect_request(t->client.fd, buf, sizeof buf, &n)) return -1;
++	ret = connect_socks_target(buf, n, &t->client);
++	if(ret < 0) {
++		send_error(t->client.fd, ret*-1);
++		return -1;
++	}
++	send_error(t->client.fd, EC_SUCCESS);
++	return ret;
+ }
+ 
+ static void* clientthread(void *data) {
